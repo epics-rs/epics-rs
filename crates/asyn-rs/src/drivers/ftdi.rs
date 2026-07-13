@@ -148,6 +148,11 @@ impl DrvAsynFtdiPort {
         );
         base.init_connected(false);
         base.auto_connect = !no_auto_connect;
+        // C passes `interruptProcess = 1` to `pasynOctetBase->initialize`
+        // (drvAsynFTDIPort.cpp:616): every successful octet read on this port fans out to
+        // its octet interrupt users, which is what drives a SCAN="I/O Intr"
+        // record. See `PortDriverBase::octet_interrupt_process`.
+        base.octet_interrupt_process = true;
         // C drvAsynFTDIPort.cpp:622-623: install asynInterposeEos by default
         // (empty terminator until setInputEos/OEOS), suppressed by
         // noProcessEos.

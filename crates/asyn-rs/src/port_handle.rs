@@ -1284,7 +1284,7 @@ mod tests {
         let mut base = PortDriverBase::new("enbl_prop", 1, PortFlags::default());
         base.create_param("VAL", ParamType::Int32).unwrap();
         let exc_mgr = Arc::new(ExceptionManager::new());
-        base.exception_sink = Some(exc_mgr.clone());
+        base.bind_exception_sink(exc_mgr.clone());
         let hits = Arc::new(AtomicUsize::new(0));
         let hits2 = hits.clone();
         exc_mgr.add_callback(move |event| {
@@ -1416,7 +1416,7 @@ mod tests {
         let mut base = PortDriverBase::new("auct_prop", 1, PortFlags::default());
         base.create_param("VAL", ParamType::Int32).unwrap();
         let exc_mgr = Arc::new(ExceptionManager::new());
-        base.exception_sink = Some(exc_mgr.clone());
+        base.bind_exception_sink(exc_mgr.clone());
         let hits = Arc::new(AtomicUsize::new(0));
         let hits2 = hits.clone();
         exc_mgr.add_callback(move |event| {

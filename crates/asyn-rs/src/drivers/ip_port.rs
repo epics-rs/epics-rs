@@ -62,6 +62,22 @@ pub enum IpProtocol {
     Com,
 }
 
+impl IpProtocol {
+    /// C's `FLAG_BROADCAST` (drvAsynIPPort.c:372-374) — the `udp*` suffix.
+    fn broadcast(self) -> bool {
+        matches!(self, Self::UdpBroadcast | Self::UdpBroadcastReusePort)
+    }
+
+    /// C's `FLAG_SO_REUSEPORT` (drvAsynIPPort.c:360-363, :375-378) — the `&`
+    /// suffix, on TCP or UDP.
+    fn reuse_port(self) -> bool {
+        matches!(
+            self,
+            Self::TcpReusePort | Self::UdpReusePort | Self::UdpBroadcastReusePort
+        )
+    }
+}
+
 /// Configuration for an IP port connection.
 #[derive(Debug, Clone)]
 pub struct IpPortConfig {
@@ -867,7 +883,7 @@ impl DrvAsynIPPort {
             self.connect(&AsynUser::default())?;
         }
         self.base.check_ready()?;
-        let result = self.with_base_link(|stack, link| stack.dispatch_read(user, buf, link));
+        let result = self.with_base_link(|link| link.read(user, buf));
         match result {
             Ok(r) => {
                 asyn_trace_io!(
@@ -945,6 +961,11 @@ impl DrvAsynIPPort {
         );
         base.init_connected(false);
         base.auto_connect = true;
+        // C passes `interruptProcess = 1` to `pasynOctetBase->initialize`
+        // (drvAsynIPPort.c:1055): every successful octet read on this port fans out to
+        // its octet interrupt users, which is what drives a SCAN="I/O Intr"
+        // record. See `PortDriverBase::octet_interrupt_process`.
+        base.octet_interrupt_process = true;
 
         // C `drvAsynIPPortConfigure` (:1061): `if (tty->isCom) asynInterposeCOM(...)`
         // — installed at configure time, before the port ever connects, so the
@@ -966,27 +987,25 @@ impl DrvAsynIPPort {
         })
     }
 
-    /// Dispatch through the interpose stack onto the port's base octet link.
+    /// Run one transfer against the port's raw octet link — the **bottom** of
+    /// the port's interpose chain, which the port itself runs on top of this
+    /// driver ([`crate::port::octet_read_chain`], C asynManager.c:2190-2220).
     ///
-    /// Single owner of what the chain terminates at: the raw socket, or — for a
+    /// Single owner of what that chain terminates at: the raw socket, or — for a
     /// COM port — the socket wrapped in the IAC layer, which is what puts COM
     /// beneath every stack layer by construction (see [`ComState::octet`]). Every
     /// octet path goes through here, so read, write and flush cannot disagree
     /// about where the chain ends.
-    fn with_base_link<T>(
-        &mut self,
-        f: impl FnOnce(&mut crate::interpose::OctetInterposeStack, &mut dyn OctetNext) -> T,
-    ) -> T {
-        let stack = &mut self.base.interpose_octet;
+    fn with_base_link<T>(&mut self, f: impl FnOnce(&mut dyn OctetNext) -> T) -> T {
         match self.com.as_mut() {
             Some(com) => {
                 let mut link = ComLink {
                     io: &mut self.io,
                     com: &mut com.octet,
                 };
-                f(stack, &mut link)
+                f(&mut link)
             }
-            None => f(stack, &mut self.io),
+            None => f(&mut self.io),
         }
     }
 
@@ -1048,100 +1067,110 @@ impl DrvAsynIPPort {
         self.base.install_octet_interpose(layer);
     }
 
-    fn connect_tcp(&mut self) -> AsynResult<TcpStream> {
-        let addr_str = format!("{}:{}", self.config.host, self.config.port);
-
-        if let Some(local_port) = self.config.local_port {
-            use std::net::ToSocketAddrs;
-            // Resolve the remote like the no-local-port branch — the old
-            // code used `SocketAddr::parse`, which only accepts literal
-            // IPs, so a hostname target (valid per the config parser)
-            // failed, as did any IPv6 target (domain was forced to IPV4).
-            let addrs: Vec<std::net::SocketAddr> = addr_str
-                .to_socket_addrs()
+    /// Create the socket C's `connectIt` creates: fresh fd, then every option
+    /// the protocol suffix asked for — `SO_BROADCAST` (drvAsynIPPort.c:448-459)
+    /// and `SO_REUSEPORT` (:461-477) — applied **before** the socket is bound or
+    /// connected, because that is the only time the kernel honours them. Binding
+    /// first and setting `SO_REUSEPORT` afterwards, as this driver used to, left
+    /// `udp&` with a local port failing `EADDRINUSE` where C binds.
+    ///
+    /// Single owner of socket creation for both transports, so a new option
+    /// cannot be added to one and forgotten on the other.
+    fn new_socket(
+        &self,
+        domain: socket2::Domain,
+        ty: socket2::Type,
+        protocol: socket2::Protocol,
+    ) -> AsynResult<socket2::Socket> {
+        let socket = socket2::Socket::new(domain, ty, Some(protocol))?;
+        if self.config.protocol.broadcast() {
+            socket.set_broadcast(true).map_err(|e| AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!("Can't set {} socket BROADCAST option: {e}", self.host_info),
+            })?;
+        }
+        if self.config.protocol.reuse_port() {
+            // C picks SO_REUSEADDR when `USE_SO_REUSEADDR` is defined for the
+            // target and SO_REUSEPORT otherwise (:465-469); socket2 exposes
+            // `set_reuse_port` only where the option exists.
+            #[cfg(unix)]
+            socket.set_reuse_port(true).map_err(|e| AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!(
+                    "Can't set {} socket SO_REUSEPORT option: {e}",
+                    self.host_info
+                ),
+            })?;
+            #[cfg(not(unix))]
+            socket
+                .set_reuse_address(true)
                 .map_err(|e| AsynError::Status {
                     status: AsynStatus::Error,
-                    message: format!("failed to resolve '{addr_str}': {e}"),
-                })?
-                .collect();
+                    message: format!(
+                        "Can't set {} socket SO_REUSEPORT option: {e}",
+                        self.host_info
+                    ),
+                })?;
+        }
+        Ok(socket)
+    }
 
-            let mut last_err: Option<AsynError> = None;
-            for remote_addr in &addrs {
-                let (domain, local_str) = if remote_addr.is_ipv6() {
-                    (socket2::Domain::IPV6, format!("[::]:{local_port}"))
-                } else {
-                    (socket2::Domain::IPV4, format!("0.0.0.0:{local_port}"))
-                };
-                let socket = match socket2::Socket::new(
-                    domain,
-                    socket2::Type::STREAM,
-                    Some(socket2::Protocol::TCP),
-                ) {
+    fn connect_tcp(&mut self) -> AsynResult<TcpStream> {
+        use std::net::ToSocketAddrs;
+        let addr_str = format!("{}:{}", self.config.host, self.config.port);
+        // Resolve the remote first: C delays the lookup to connect time too, in
+        // case the device has just appeared in DNS (drvAsynIPPort.c:479-493).
+        let addrs: Vec<std::net::SocketAddr> = addr_str
+            .to_socket_addrs()
+            .map_err(|e| AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!("failed to resolve '{addr_str}': {e}"),
+            })?
+            .collect();
+
+        let mut last_err: Option<AsynError> = None;
+        for remote_addr in &addrs {
+            let domain = if remote_addr.is_ipv6() {
+                socket2::Domain::IPV6
+            } else {
+                socket2::Domain::IPV4
+            };
+            let socket =
+                match self.new_socket(domain, socket2::Type::STREAM, socket2::Protocol::TCP) {
                     Ok(s) => s,
                     Err(e) => {
-                        last_err = Some(AsynError::Io(e));
+                        last_err = Some(e);
                         continue;
                     }
                 };
+            // C binds the local address only when one was configured — "a very
+            // unusual configuration" (:495-506).
+            if let Some(local_port) = self.config.local_port {
+                let local_addr: std::net::SocketAddr = if remote_addr.is_ipv6() {
+                    (std::net::Ipv6Addr::UNSPECIFIED, local_port).into()
+                } else {
+                    (std::net::Ipv4Addr::UNSPECIFIED, local_port).into()
+                };
+                // Not C's: a fixed local port would otherwise be unusable for the
+                // TIME_WAIT lifetime of the previous connection.
                 if let Err(e) = socket.set_reuse_address(true) {
                     last_err = Some(AsynError::Io(e));
                     continue;
                 }
-                let local_addr: std::net::SocketAddr = match local_str.parse() {
-                    Ok(a) => a,
-                    Err(_) => {
-                        last_err = Some(AsynError::Status {
-                            status: AsynStatus::Error,
-                            message: format!("invalid local address: {local_str}"),
-                        });
-                        continue;
-                    }
-                };
                 if let Err(e) = socket.bind(&local_addr.into()) {
                     last_err = Some(AsynError::Io(e));
                     continue;
                 }
-                match socket.connect_timeout(&(*remote_addr).into(), self.config.connect_timeout) {
-                    Ok(()) => return Ok(TcpStream::from(socket)),
-                    Err(e) => last_err = Some(AsynError::Io(e)),
-                }
             }
-            Err(last_err.unwrap_or_else(|| AsynError::Status {
-                status: AsynStatus::Error,
-                message: format!("no addresses found for '{addr_str}'"),
-            }))
-        } else {
-            use std::net::ToSocketAddrs;
-            let addrs: Vec<std::net::SocketAddr> = addr_str
-                .to_socket_addrs()
-                .map_err(|e| AsynError::Status {
-                    status: AsynStatus::Error,
-                    message: format!("failed to resolve '{addr_str}': {e}"),
-                })?
-                .collect();
-
-            let mut last_err = None;
-            let mut connected_stream = None;
-            for addr in &addrs {
-                match TcpStream::connect_timeout(addr, self.config.connect_timeout) {
-                    Ok(s) => {
-                        connected_stream = Some(s);
-                        break;
-                    }
-                    Err(e) => last_err = Some(e),
-                }
+            match socket.connect_timeout(&(*remote_addr).into(), self.config.connect_timeout) {
+                Ok(()) => return Ok(TcpStream::from(socket)),
+                Err(e) => last_err = Some(AsynError::Io(e)),
             }
-            connected_stream.ok_or_else(|| {
-                if let Some(e) = last_err {
-                    AsynError::Io(e)
-                } else {
-                    AsynError::Status {
-                        status: AsynStatus::Error,
-                        message: format!("no addresses found for '{addr_str}'"),
-                    }
-                }
-            })
         }
+        Err(last_err.unwrap_or_else(|| AsynError::Status {
+            status: AsynStatus::Error,
+            message: format!("no addresses found for '{addr_str}'"),
+        }))
     }
 
     fn connect_udp(&mut self) -> AsynResult<(UdpSocket, std::net::SocketAddr)> {
@@ -1163,42 +1192,28 @@ impl DrvAsynIPPort {
                 message: format!("UDP resolve '{remote}': no addresses"),
             })?;
         let local_port = self.config.local_port.unwrap_or(0);
-        let bind_addr = if peer.is_ipv6() {
-            format!("[::]:{local_port}")
+        let (domain, local_addr): (socket2::Domain, std::net::SocketAddr) = if peer.is_ipv6() {
+            (
+                socket2::Domain::IPV6,
+                (std::net::Ipv6Addr::UNSPECIFIED, local_port).into(),
+            )
         } else {
-            format!("0.0.0.0:{local_port}")
+            (
+                socket2::Domain::IPV4,
+                (std::net::Ipv4Addr::UNSPECIFIED, local_port).into(),
+            )
         };
-        let socket = UdpSocket::bind(&bind_addr)?;
-        Ok((socket, peer))
-    }
-
-    /// UDP variant builder — applies any combination of `SO_BROADCAST`
-    /// and `SO_REUSEPORT` requested by the protocol suffix. Mirrors C
-    /// asyn `connectIt` UDP socket option flow (drvAsynIPPort.c
-    /// branches on `tty->flags & FLAG_BROADCAST` and `FLAG_SO_REUSEPORT`).
-    fn connect_udp_with_options(
-        &mut self,
-        broadcast: bool,
-        reuse_port: bool,
-    ) -> AsynResult<(UdpSocket, std::net::SocketAddr)> {
-        let (socket, peer) = self.connect_udp()?;
-        if broadcast {
-            socket.set_broadcast(true)?;
-        }
-        if reuse_port {
-            #[cfg(unix)]
-            {
-                // SockRef borrows the std socket's fd without taking
-                // ownership — set_reuse_port goes through socket2's
-                // setsockopt(SO_REUSEPORT) wrapper.
-                let sref = socket2::SockRef::from(&socket);
-                sref.set_reuse_port(true).map_err(|e| AsynError::Status {
-                    status: AsynStatus::Error,
-                    message: format!("UDP SO_REUSEPORT failed: {e}"),
-                })?;
-            }
-        }
-        Ok((socket, peer))
+        // The options go on the fresh socket, before the bind — the whole point
+        // of `udp&` is two ports sharing one local port, and the kernel only
+        // honours SO_REUSEPORT on an unbound socket (C :461-477, then :495-506).
+        let socket = self.new_socket(domain, socket2::Type::DGRAM, socket2::Protocol::UDP)?;
+        socket
+            .bind(&local_addr.into())
+            .map_err(|e| AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!("UDP bind '{local_addr}' failed: {e}"),
+            })?;
+        Ok((UdpSocket::from(socket), peer))
     }
 
     #[cfg(unix)]
@@ -1249,35 +1264,18 @@ impl PortDriver for DrvAsynIPPort {
                 if self.config.no_delay {
                     stream.set_nodelay(true)?;
                 }
-                if self.config.protocol == IpProtocol::TcpReusePort {
-                    // tcp& in C asyn = TCP + SO_REUSEPORT (NOT
-                    // non-blocking). Apply via SockRef on the std
-                    // TcpStream so we don't churn the socket type.
-                    #[cfg(unix)]
-                    {
-                        let sref = socket2::SockRef::from(&stream);
-                        sref.set_reuse_port(true).map_err(|e| AsynError::Status {
-                            status: AsynStatus::Error,
-                            message: format!("TCP SO_REUSEPORT failed: {e}"),
-                        })?;
-                    }
-                }
+                // `tcp&` = TCP + SO_REUSEPORT (C :360-363, :461-477). The option
+                // is set by `new_socket` on the unconnected socket, which is the
+                // only place it means anything.
                 self.io.inner = Some(IpIoInner::Tcp(stream));
             }
-            IpProtocol::Udp => {
-                let (socket, peer) = self.connect_udp_with_options(false, false)?;
-                self.io.inner = Some(IpIoInner::Udp(socket, peer));
-            }
-            IpProtocol::UdpReusePort => {
-                let (socket, peer) = self.connect_udp_with_options(false, true)?;
-                self.io.inner = Some(IpIoInner::Udp(socket, peer));
-            }
-            IpProtocol::UdpBroadcast => {
-                let (socket, peer) = self.connect_udp_with_options(true, false)?;
-                self.io.inner = Some(IpIoInner::Udp(socket, peer));
-            }
-            IpProtocol::UdpBroadcastReusePort => {
-                let (socket, peer) = self.connect_udp_with_options(true, true)?;
+            IpProtocol::Udp
+            | IpProtocol::UdpReusePort
+            | IpProtocol::UdpBroadcast
+            | IpProtocol::UdpBroadcastReusePort => {
+                // BROADCAST / SO_REUSEPORT are the socket's, applied by
+                // `new_socket` before the bind — they are not a post-bind fixup.
+                let (socket, peer) = self.connect_udp()?;
                 self.io.inner = Some(IpIoInner::Udp(socket, peer));
             }
             #[cfg(unix)]
@@ -1371,7 +1369,7 @@ impl PortDriver for DrvAsynIPPort {
             data,
             "write"
         );
-        match self.with_base_link(|stack, link| stack.dispatch_write(user, data, link)) {
+        match self.with_base_link(|link| link.write(user, data)) {
             Ok(n) => Ok(n),
             Err(e) => {
                 // C parity: drvAsynIPPort.c::writeIt closes the connection
@@ -1395,25 +1393,14 @@ impl PortDriver for DrvAsynIPPort {
     }
 
     fn io_flush(&mut self, user: &mut AsynUser) -> AsynResult<()> {
-        // C parity: asynOctetSyncIO::writeRead (asynOctetSyncIO.c:~250)
-        // calls flushIt before write+read so the post-write read
-        // returns only the response to *this* command.
-        //
-        // The flush MUST traverse the interpose chain, not just the OS
-        // socket. C `asynInterposeEos.c::flushIt` resets the EOS
-        // interpose's persistent input buffer
-        // (`inBufHead/inBufTail/eosInMatch`) and then calls the
-        // lower-level `flush`. An earlier Rust version drained the OS
-        // socket directly and never reset the `EosInterpose`'s
-        // `in_buf` — so bytes already buffered *inside* the interpose
-        // from a prior read leaked into the next response after an
-        // `OctetWriteRead`.
-        //
-        // Routing through `dispatch_flush` runs every interpose layer's
-        // `flush` (resetting `EosInterpose::in_buf` etc.) and finally
-        // reaches `IpIoState::flush`, which drains the OS socket's
-        // receive buffer.
-        self.with_base_link(|stack, link| stack.dispatch_flush(user, link))
+        // The driver end of the flush: drain the OS socket's receive buffer
+        // (C `drvAsynIPPort.c::flushIt`). The layers above — the EOS interpose's
+        // read-ahead buffer among them, C `asynInterposeEos.c::flushIt` resetting
+        // `inBufHead`/`inBufTail`/`eosInMatch` — are flushed by the port before
+        // it reaches here ([`crate::port::octet_flush_chain`]), which is what
+        // stops a byte buffered *inside* the interpose from leaking into the next
+        // `OctetWriteRead` response.
+        self.with_base_link(|link| link.flush(user))
     }
 
     fn set_option(&mut self, user: &mut AsynUser, key: &str, value: &str) -> AsynResult<()> {
@@ -1560,6 +1547,28 @@ mod tests {
     use super::*;
     use std::net::TcpListener;
     use std::thread;
+
+    /// Enter the port's octet interface the way a caller does — through the
+    /// interpose chain, with the driver at the bottom of it. C `findInterface`
+    /// hands the caller the *topmost* interpose (asynManager.c:1493-1501,
+    /// 2190-2220); the driver's own `read`/`write`/`flush` are the base the chain
+    /// ends at, so a test that wants the EOS layer must enter above it, exactly
+    /// as `PortActor` does.
+    fn chain_read(drv: &mut DrvAsynIPPort, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+        crate::port::octet_read_chain(drv, user, buf).map(|(n, _eom)| n)
+    }
+
+    fn chain_read_eom(
+        drv: &mut DrvAsynIPPort,
+        user: &AsynUser,
+        buf: &mut [u8],
+    ) -> AsynResult<(usize, EomReason)> {
+        crate::port::octet_read_chain(drv, user, buf)
+    }
+
+    fn chain_flush(drv: &mut DrvAsynIPPort, user: &mut AsynUser) -> AsynResult<()> {
+        crate::port::octet_flush_chain(drv, user)
+    }
 
     // --- Config parsing tests ---
 
@@ -2143,7 +2152,7 @@ mod tests {
 
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(2));
         let mut buf = [0u8; 32];
-        let n = drv.read_octet(&user, &mut buf).unwrap();
+        let n = chain_read(&mut drv, &user, &mut buf).unwrap();
         assert_eq!(&buf[..n], b"OK");
 
         handle.join().unwrap();
@@ -3078,7 +3087,7 @@ mod tests {
 
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(2));
         let mut buf = [0u8; 3];
-        let (n, _eom) = drv.io_read_octet_eom(&user, &mut buf).unwrap();
+        let (n, _eom) = chain_read_eom(&mut drv, &user, &mut buf).unwrap();
         assert_eq!(
             &buf[..n],
             &[b'A', IAC, b'B'],
@@ -3275,12 +3284,12 @@ mod tests {
         // interpose.
         let ruser = AsynUser::new(0).with_timeout(Duration::from_secs(2));
         let mut small = [0u8; 4];
-        let n = drv.read_octet(&ruser, &mut small).unwrap();
+        let n = chain_read(&mut drv, &ruser, &mut small).unwrap();
         assert_eq!(&small[..n], b"OLD_");
 
         // Flush must clear BOTH the socket AND the interpose buffer.
         let mut fuser = AsynUser::new(0).with_timeout(Duration::from_secs(2));
-        drv.io_flush(&mut fuser).unwrap();
+        chain_flush(&mut drv, &mut fuser).unwrap();
 
         // Command + response cycle. If the interpose buffer was not
         // reset, this read returns the leftover "LINE" instead of "NEW".
@@ -3288,7 +3297,7 @@ mod tests {
         drv.write_octet(&mut wuser, b"CMD").unwrap();
         let ruser2 = AsynUser::new(0).with_timeout(Duration::from_secs(2));
         let mut buf = [0u8; 64];
-        let n = drv.read_octet(&ruser2, &mut buf).unwrap();
+        let n = chain_read(&mut drv, &ruser2, &mut buf).unwrap();
         assert_eq!(
             &buf[..n],
             b"NEW",

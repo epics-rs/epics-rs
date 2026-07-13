@@ -8,12 +8,17 @@ use crate::exception::ExceptionManager;
 use crate::port::PortDriver;
 use crate::port_handle::PortHandle;
 use crate::runtime::{PortRuntimeHandle, RuntimeConfig, create_port_runtime};
+use crate::services::PortServices;
 use crate::trace::TraceManager;
 
 /// Registry of named port drivers with global exception management.
 pub struct PortManager {
-    exceptions: Arc<ExceptionManager>,
-    trace: Arc<TraceManager>,
+    /// The trace configuration and exception list handed to every port this
+    /// manager registers — see [`PortServices`]. The manager does not inject
+    /// them itself: it puts them in the [`RuntimeConfig`] and
+    /// `create_port_runtime` binds them, the same way the iocsh
+    /// `drvAsyn*PortConfigure` commands do.
+    services: PortServices,
     /// Actor-based port handles.
     port_handles: Mutex<HashMap<String, PortHandle>>,
     /// Runtime handles.
@@ -33,17 +38,23 @@ impl PortManager {
     /// hand that same instance here, or those commands would mutate a trace
     /// manager nothing reads and silently do nothing.
     pub fn with_trace_manager(trace: Arc<TraceManager>) -> Self {
-        let exceptions = Arc::new(ExceptionManager::new());
-        // Wire the exception sink so `setTrace*` setters announce
-        // `asynExceptionTrace*` to subscribers, matching C
-        // asynManager.c:2790/2832/2874/2923/2956.
-        trace.set_exception_sink(exceptions.clone());
+        Self::with_services(PortServices::new(trace))
+    }
+
+    /// Build a manager on an existing [`PortServices`] — the form that shares
+    /// one trace configuration *and* one exception list with ports created
+    /// elsewhere (the iocsh `drvAsyn*PortConfigure` commands).
+    pub fn with_services(services: PortServices) -> Self {
         Self {
-            exceptions,
-            trace,
+            services,
             port_handles: Mutex::new(HashMap::new()),
             runtime_handles: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The services every port this manager registers is bound to.
+    pub fn services(&self) -> &PortServices {
+        &self.services
     }
 
     /// Register a port driver.
@@ -72,8 +83,8 @@ impl PortManager {
     /// See [`Self::register_port`] for the duplicate-name error contract.
     pub fn register_port_with_config<D: PortDriver>(
         &self,
-        mut driver: D,
-        config: RuntimeConfig,
+        driver: D,
+        mut config: RuntimeConfig,
     ) -> AsynResult<PortRuntimeHandle> {
         let name = driver.base().port_name.clone();
         // Pre-flight: refuse before we spawn the runtime thread, so a
@@ -91,8 +102,10 @@ impl PortManager {
         if crate::asyn_record::get_port(&name).is_some() {
             return Err(AsynError::PortAlreadyRegistered(name));
         }
-        driver.base_mut().exception_sink = Some(self.exceptions.clone());
-        driver.base_mut().trace = Some(self.trace.clone());
+        // The manager's services, not the config's default global ones — a
+        // caller-supplied `RuntimeConfig` cannot detach a port from the trace
+        // manager whose `asynSetTrace*` commands are the ones bound to this IOC.
+        config.services = self.services.clone();
 
         let (handle, _jh) = create_port_runtime(driver, config);
 
@@ -106,7 +119,7 @@ impl PortManager {
         if let Err(e) = crate::asyn_record::register_port(
             &name,
             handle.port_handle().clone(),
-            self.trace.clone(),
+            self.services.trace().clone(),
         ) {
             handle.shutdown();
             return Err(e);
@@ -196,12 +209,12 @@ impl PortManager {
 
     /// Get a reference to the global exception manager (for registering callbacks).
     pub fn exception_manager(&self) -> &Arc<ExceptionManager> {
-        &self.exceptions
+        self.services.exceptions()
     }
 
     /// Get a reference to the global trace manager.
     pub fn trace_manager(&self) -> &Arc<TraceManager> {
-        &self.trace
+        self.services.trace()
     }
 
     /// Names of every port this IOC can act on, in sorted order.

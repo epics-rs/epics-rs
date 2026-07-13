@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+use crate::services::PortServices;
+
 /// Configuration for a port runtime.
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
@@ -11,6 +13,21 @@ pub struct RuntimeConfig {
     pub connect_backoff: BackoffConfig,
     /// Supervision policy.
     pub supervision: SupervisionPolicy,
+    /// How long port creation waits for an `auto_connect` port to come up
+    /// before returning — C `waitConnect(pport->pconnectUser,
+    /// pasynBase->autoConnectTimeout)` at the end of registration
+    /// (asynManager.c:2135), with `DEFAULT_AUTOCONNECT_TIMEOUT` = 0.5 s (:49,
+    /// :507). It bounds the wait; it does not decide the outcome — a port that
+    /// has not connected by then keeps retrying on its own timer, exactly as C's
+    /// does, and registration still succeeds.
+    pub auto_connect_timeout: Duration,
+    /// The trace configuration and exception list the port is created with —
+    /// C's `pasynBase`. Defaults to the process-wide
+    /// [`PortServices::global()`], so a port built with a default config is
+    /// still traceable and still announces exceptions; a
+    /// [`crate::manager::PortManager`] carrying its own `TraceManager`
+    /// substitutes its own here.
+    pub services: PortServices,
 }
 
 impl Default for RuntimeConfig {
@@ -20,6 +37,8 @@ impl Default for RuntimeConfig {
             auto_connect: true,
             connect_backoff: BackoffConfig::default(),
             supervision: SupervisionPolicy::default(),
+            auto_connect_timeout: Duration::from_millis(500),
+            services: PortServices::global(),
         }
     }
 }

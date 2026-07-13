@@ -91,7 +91,9 @@ pub fn eos_device_key(multi_device: bool, addr: i32) -> i32 {
 use crate::error::{AsynError, AsynResult, AsynStatus};
 use crate::exception::{AsynException, ExceptionEvent, ExceptionManager};
 use crate::interfaces::InterfaceType;
-use crate::interpose::{EomReason, OctetInterpose, OctetInterposeStack};
+use crate::interpose::{
+    EomReason, OctetInterpose, OctetInterposeStack, OctetNext, OctetReadResult,
+};
 use crate::interrupt::{InterruptManager, InterruptValue};
 use crate::param::{EnumEntry, InterruptReason, ParamList, ParamType, ParamValue};
 use crate::trace::TraceManager;
@@ -224,8 +226,13 @@ pub struct PortDriverBase {
     /// build a port that is defunct but still enabled, so no gate needs to ask
     /// about defunct to refuse it (R15-50).
     defunct: bool,
-    /// Exception sink injected by [`crate::manager::PortManager`] on registration.
-    pub exception_sink: Option<Arc<ExceptionManager>>,
+    /// This port's announcement channel — C `dpCommon.exceptionUserList` plus
+    /// the `notifyPortThread` signal that `announceExceptionOccurred` ends with
+    /// (asynManager.c:611-637). Detachable ([`Self::exception_announcer`]) so a
+    /// worker thread the driver owns — the IP-server accept loop — announces
+    /// through the same counter and the same list as the actor does, instead of
+    /// reaching around them.
+    pub(crate) announcer: ExceptionAnnouncer,
     pub options: HashMap<String, String>,
     /// The EOS terminators, keyed per device the way C keys them: an `eosPvt`
     /// is created per `asynInterposeEosConfig(portName, addr, ...)`
@@ -238,7 +245,20 @@ pub struct PortDriverBase {
     /// `findDpCommon`/`findInterface` resolve any addr to the port itself).
     eos: HashMap<i32, DeviceEos>,
     pub interpose_octet: OctetInterposeStack,
-    pub trace: Option<Arc<TraceManager>>,
+    /// Trace configuration — C `dpCommon.trace` (asynManager.c:503). Same
+    /// owner as [`Self::announcer`]: bound by
+    /// [`crate::services::PortServices::bind`] at port creation.
+    pub(crate) trace: Option<Arc<TraceManager>>,
+    /// C `octetPvt.interruptProcess` — the last argument of
+    /// `pasynOctetBase->initialize` (asynOctetBase.c:161-169). When set, every
+    /// successful octet read fans the data out to the port's octet interrupt
+    /// users (`readIt` → `callInterruptUsers`, :224-238). The stream drivers set
+    /// it — drvAsynIPPort.c:1055, drvAsynSerialPort.c:1125,
+    /// drvAsynSerialPortWin32.c:798, drvAsynFTDIPort.cpp:616 — and it is what
+    /// makes a `stringin`/`waveform` with `SCAN="I/O Intr"` on such a port
+    /// process at all. Parameter-cache ports (echoDriver, USBTMC, GPIB,
+    /// IP-server) pass 0 and are unaffected.
+    pub octet_interrupt_process: bool,
     /// Per-address device state for multi-device ports.
     pub device_states: HashMap<i32, DeviceState>,
     /// Timestamp source callback for custom timestamps.
@@ -269,19 +289,55 @@ pub struct PortDriverBase {
     /// [`Self::sync_connection_edge`], the same edge owner that raises the
     /// exception, so a connect that was never published is never counted.
     pub number_connects: u64,
-    /// How many exceptions this port has announced — the Rust form of C's
-    /// `epicsEventSignal(pport->notifyPortThread)` at the tail of
-    /// `announceExceptionOccurred` (asynManager.c:635-636), which is one of the
-    /// five things that wake C's `portThread`.
-    ///
-    /// A signal has no state to read back, so the actor cannot poll one; a
-    /// monotonic count can be, and it says the same thing: the number changed,
-    /// therefore an exception was announced since the actor last looked
-    /// ([`crate::port_actor::PortActor::take_port_thread_wake`]). Counting here —
-    /// in the one method every announcement goes through — is what keeps the wake
-    /// source tied to the announcement rather than to an enumeration of the ops
-    /// that happen to announce today.
-    exceptions_announced: AtomicU64,
+}
+
+/// The one way to announce a port exception — C `announceExceptionOccurred`
+/// (asynManager.c:611-637): fan the event out over the port's exception list and
+/// signal `notifyPortThread` (:635-636).
+///
+/// It is a detachable handle rather than a method on [`PortDriverBase`] because
+/// the announcement is not the actor thread's private business: a driver-owned
+/// worker (the IP-server accept loop) also transitions a device, and C's
+/// `connectionListener` thread announces the same way the port thread does. A
+/// clone of this handle is that capability; it carries the wake counter with it,
+/// so an off-thread announcement still wakes the actor
+/// ([`PortDriverBase::exceptions_announced`]).
+#[derive(Clone)]
+pub struct ExceptionAnnouncer {
+    port_name: String,
+    /// Set once by [`crate::services::PortServices::bind`] at port creation, so
+    /// every clone taken afterwards carries the IOC's exception list.
+    sink: Option<Arc<ExceptionManager>>,
+    /// Shared so a clone's announcement is visible to the actor's count.
+    announced: Arc<AtomicU64>,
+}
+
+impl ExceptionAnnouncer {
+    fn new(port_name: &str) -> Self {
+        Self {
+            port_name: port_name.to_string(),
+            sink: None,
+            announced: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Announce. A port with no sink still counts the announcement — C's
+    /// fan-out over an empty list still signals the port thread — so the count
+    /// moves before the sink is consulted.
+    pub fn announce(&self, exception: AsynException, addr: i32) {
+        self.announced.fetch_add(1, Ordering::Release);
+        if let Some(ref sink) = self.sink {
+            sink.announce(&ExceptionEvent {
+                port_name: self.port_name.clone(),
+                exception,
+                addr,
+            });
+        }
+    }
+
+    fn count(&self) -> u64 {
+        self.announced.load(Ordering::Acquire)
+    }
 }
 
 impl PortDriverBase {
@@ -297,18 +353,18 @@ impl PortDriverBase {
             enabled: true,
             auto_connect: true,
             defunct: false,
-            exception_sink: None,
+            announcer: ExceptionAnnouncer::new(port_name),
             options: HashMap::new(),
             eos: HashMap::new(),
             interpose_octet: OctetInterposeStack::new(flags.multi_device),
             trace: None,
+            octet_interrupt_process: false,
             device_states: HashMap::new(),
             timestamp_source: None,
             last_connect_disconnect: None,
             connect_retry_at: None,
             seconds_between_port_connect: DEFAULT_SECONDS_BETWEEN_PORT_CONNECT,
             number_connects: 0,
-            exceptions_announced: AtomicU64::new(0),
         }
     }
 
@@ -351,21 +407,36 @@ impl PortDriverBase {
     /// exception sink still announced (C's fan-out over an empty list still
     /// signals), so the count is bumped before the sink is even consulted.
     pub fn announce_exception(&self, exception: AsynException, addr: i32) {
-        self.exceptions_announced.fetch_add(1, Ordering::Release);
-        if let Some(ref sink) = self.exception_sink {
-            sink.announce(&ExceptionEvent {
-                port_name: self.port_name.clone(),
-                exception,
-                addr,
-            });
-        }
+        self.announcer.announce(exception, addr);
+    }
+
+    /// A clone of this port's announcement capability, for a worker thread the
+    /// driver owns. See [`ExceptionAnnouncer`].
+    pub fn exception_announcer(&self) -> ExceptionAnnouncer {
+        self.announcer.clone()
+    }
+
+    /// Bind the IOC's exception list. [`crate::services::PortServices::bind`] is
+    /// the production caller; tests that drive a driver without a runtime use it
+    /// to stand in for that binding.
+    pub(crate) fn bind_exception_sink(&mut self, sink: Arc<ExceptionManager>) {
+        self.announcer.sink = Some(sink);
     }
 
     /// How many exceptions this port has announced. Monotonic; the actor compares
     /// it against the value it last saw to decide whether C would have signalled
     /// `notifyPortThread` (asynManager.c:635-636).
     pub fn exceptions_announced(&self) -> u64 {
-        self.exceptions_announced.load(Ordering::Acquire)
+        self.announcer.count()
+    }
+
+    /// How many callbacks are registered on this port's exception list — C
+    /// `asynReport`'s `exceptionUsers` count (asynManager.c:1063).
+    pub fn exception_callback_count(&self) -> usize {
+        self.announcer
+            .sink
+            .as_ref()
+            .map_or(0, |m| m.callback_count())
     }
 
     /// Query whether the port is connected — the truth, wherever it lives.
@@ -2068,6 +2139,104 @@ pub trait PortDriver: Send + Sync + 'static {
     }
 }
 
+/// The driver sitting at the **bottom** of a port's octet interpose chain — C's
+/// driver-registered `asynOctet` interface, the one `interposeInterface` keeps
+/// as `pPrev` when it pushes a layer on top (asynManager.c:2190-2220).
+///
+/// A driver never knows it is being interposed in C: `findInterface` hands the
+/// caller the topmost layer, and the layer calls down. The Rust equivalent of
+/// "the caller" is the port actor, so the chain runs there
+/// ([`octet_read_chain`] and friends) and the driver's `io_*_octet` are the raw
+/// device transfer, nothing more.
+struct DriverOctetLink<'a> {
+    driver: &'a mut dyn PortDriver,
+}
+
+impl OctetNext for DriverOctetLink<'_> {
+    fn read(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<OctetReadResult> {
+        let (nbytes_transferred, eom_reason) = self.driver.io_read_octet_eom(user, buf)?;
+        Ok(OctetReadResult {
+            nbytes_transferred,
+            eom_reason,
+        })
+    }
+
+    fn write(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+        self.driver.io_write_octet(user, data)
+    }
+
+    fn flush(&mut self, user: &mut AsynUser) -> AsynResult<()> {
+        self.driver.io_flush(user)
+    }
+}
+
+/// Run `f` with the port's chain and the driver below it, both borrowed at once.
+///
+/// The chain lives inside the driver (`base.interpose_octet`) while the driver
+/// is the chain's base, so the two are lifted apart for the duration of one
+/// transfer and the chain is put straight back. The actor owns the driver and is
+/// the only caller, so no other code can observe the port between the take and
+/// the restore.
+fn with_octet_chain<T>(
+    driver: &mut dyn PortDriver,
+    f: impl FnOnce(&mut OctetInterposeStack, &mut DriverOctetLink<'_>) -> T,
+) -> T {
+    let multi_device = driver.base().flags.multi_device;
+    let mut chain = std::mem::replace(
+        &mut driver.base_mut().interpose_octet,
+        OctetInterposeStack::new(multi_device),
+    );
+    let result = {
+        let mut link = DriverOctetLink {
+            driver: &mut *driver,
+        };
+        f(&mut chain, &mut link)
+    };
+    driver.base_mut().interpose_octet = chain;
+    result
+}
+
+/// One octet read on the port: through every interpose layer installed on the
+/// addressed device, ending at the driver.
+///
+/// C `asynOctet::read` on the interface `findInterface` resolves — which is the
+/// outermost interpose whenever one is installed. The chain belongs to the
+/// **port**, not to the driver: `asynInterposeEos` / `asynInterposeEcho` /
+/// `asynInterposeDelay` are pushed by the manager (asynManager.c:2190-2220) and
+/// the driver below is not consulted and cannot opt out. Dispatching inside each
+/// driver instead — as this crate did — made the chain per-driver opt-in, so the
+/// EOS layer `drvAsynFTDIPortConfigure` installs (drvAsynFTDIPort.cpp:622-623,
+/// ftdi.rs) was never run by anything.
+pub(crate) fn octet_read_chain(
+    driver: &mut dyn PortDriver,
+    user: &AsynUser,
+    buf: &mut [u8],
+) -> AsynResult<(usize, EomReason)> {
+    with_octet_chain(driver, |chain, link| chain.dispatch_read(user, buf, link))
+        .map(|r| (r.nbytes_transferred, r.eom_reason))
+}
+
+/// One octet write on the port, through the addressed device's chain
+/// (see [`octet_read_chain`]).
+pub(crate) fn octet_write_chain(
+    driver: &mut dyn PortDriver,
+    user: &mut AsynUser,
+    data: &[u8],
+) -> AsynResult<usize> {
+    with_octet_chain(driver, |chain, link| chain.dispatch_write(user, data, link))
+}
+
+/// One octet flush on the port, through the addressed device's chain — C
+/// `asynInterposeEos::flushIt` resets the layer's read-ahead buffer and then
+/// flushes the layer below (asynInterposeEos.c:259-274), which only happens if
+/// the flush enters the chain at the top (see [`octet_read_chain`]).
+pub(crate) fn octet_flush_chain(
+    driver: &mut dyn PortDriver,
+    user: &mut AsynUser,
+) -> AsynResult<()> {
+    with_octet_chain(driver, |chain, link| chain.dispatch_flush(user, link))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3039,7 +3208,7 @@ mod tests {
         base.create_param("V", ParamType::Int32).unwrap();
 
         let exc_mgr = Arc::new(crate::exception::ExceptionManager::new());
-        base.exception_sink = Some(exc_mgr.clone());
+        base.bind_exception_sink(exc_mgr.clone());
 
         let last_addr = Arc::new(AtomicI32::new(-99));
         let last_addr2 = last_addr.clone();
@@ -3075,7 +3244,7 @@ mod tests {
         );
         base.create_param("V", ParamType::Int32).unwrap();
         let exc_mgr = Arc::new(crate::exception::ExceptionManager::new());
-        base.exception_sink = Some(exc_mgr.clone());
+        base.bind_exception_sink(exc_mgr.clone());
 
         let connect_hits = Arc::new(AtomicUsize::new(0));
         let hits2 = connect_hits.clone();
@@ -3121,7 +3290,7 @@ mod tests {
 
         let mut base = PortDriverBase::new("ac", 1, PortFlags::default());
         let exc_mgr = Arc::new(crate::exception::ExceptionManager::new());
-        base.exception_sink = Some(exc_mgr.clone());
+        base.bind_exception_sink(exc_mgr.clone());
         let hits = Arc::new(AtomicUsize::new(0));
         let hits2 = hits.clone();
         exc_mgr.add_callback(move |event| {
@@ -3213,7 +3382,7 @@ mod tests {
         };
         let mut base = PortDriverBase::new("def", 1, flags);
         let exc_mgr = Arc::new(crate::exception::ExceptionManager::new());
-        base.exception_sink = Some(exc_mgr.clone());
+        base.bind_exception_sink(exc_mgr.clone());
         let enable_hits = Arc::new(AtomicUsize::new(0));
         let h = enable_hits.clone();
         exc_mgr.add_callback(move |event| {
@@ -3250,7 +3419,7 @@ mod tests {
         };
         let mut base = PortDriverBase::new("def", 4, flags);
         let exc_mgr = Arc::new(crate::exception::ExceptionManager::new());
-        base.exception_sink = Some(exc_mgr.clone());
+        base.bind_exception_sink(exc_mgr.clone());
         let enable_hits = Arc::new(AtomicUsize::new(0));
         let h = enable_hits.clone();
         exc_mgr.add_callback(move |event| {

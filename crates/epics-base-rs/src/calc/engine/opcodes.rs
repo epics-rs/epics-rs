@@ -148,6 +148,18 @@ pub enum StringOp {
     ///
     /// It IS in C's `USES_STRING` list (`sCalcPostfix.c:461`).
     DynSFetch,
+    /// sCalc `@n:=v` — C `A_STORE` (`sCalcPerform.c:440-450` no-string,
+    /// `:897-906` string). The mirror of [`DynFetch`](Self::DynFetch): it pops
+    /// the VALUE and then the INDEX (the index expression was emitted first),
+    /// rounds the index with `myNINT`, and writes the scalar argument it names.
+    /// Out of range prints and stores nothing — it is not an error, exactly as
+    /// for the fetch. It pushes NOTHING back.
+    DynStore,
+    /// sCalc `@@n:=v` — C `A_SSTORE` (`sCalcPerform.c:909-918`). The same, for
+    /// the STRING argument (`toString` on the value first). aCalc's `@@:=` is a
+    /// different opcode, [`ArrayOp::DynAStore`], as its `@@` is a different
+    /// fetch.
+    DynSStore,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -207,6 +219,15 @@ pub enum ArrayOp {
     /// `@@` A_AFETCH (`aCalcPerform.c:1479-1494`) — the same for arrays: `@@1`
     /// is BB. Out of range is an all-zero array.
     DynAFetch,
+    /// `@n:=v` A_STORE (`aCalcPerform.c:494-504`) — pop the value, pop and round
+    /// the index, write that scalar argument. Out of range prints and stores
+    /// nothing. Pushes nothing.
+    DynStore,
+    /// `@@n:=v` A_ASTORE (`aCalcPerform.c:506-525`) — the same for the ARRAY
+    /// argument: an array value is copied element-wise, a SCALAR value is
+    /// broadcast to every element, and the store sets `amask` bit `n` so the
+    /// record posts the field it wrote.
+    DynAStore,
     /// aCalc `LEN` (`aCalcPostfix.c:199`) — in the element table, so it LEXES and
     /// COMPILES, but `aCalcPerform` has no `case LEN` and no `default`, so the
     /// opcode falls straight through the switch and the operand is left on the

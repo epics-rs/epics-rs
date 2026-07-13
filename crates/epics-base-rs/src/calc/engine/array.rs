@@ -861,6 +861,47 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                         ArrayStackValue::Array(ArrayCell::new(arr, inputs.array_size)),
                     );
                 }
+                ArrayOp::DynStore => {
+                    // C `A_STORE` (`:494-504`) — the mirror of `A_FETCH`:
+                    //
+                    // ```c
+                    // toDouble(ps);  ps1 = ps;  DEC(ps);            /* value */
+                    // toDouble(ps);  i = myNINT(ps->d);  DEC(ps);   /* index */
+                    // if (i >= num_dArgs || i < 0) printf(...); else p_dArg[i] = ps1->d;
+                    // ```
+                    //
+                    // The index was emitted first, so it is the deeper operand. Both
+                    // go; nothing is pushed. Out of range stores nothing and is not
+                    // an error. No `amask` bit: this writes a SCALAR arg.
+                    let value = pop_f64(&mut stack)?;
+                    let idx = my_nint(pop_f64(&mut stack)?);
+                    if let Some(slot) = usize::try_from(idx)
+                        .ok()
+                        .and_then(|i| inputs.num_vars.get_mut(i))
+                    {
+                        *slot = value;
+                    }
+                }
+                ArrayOp::DynAStore => {
+                    // C `A_ASTORE` (`:506-525`) — `@@n := v`, the ARRAY arg n names.
+                    // It is `STORE_AA`'s rule with a computed index: an array value
+                    // is copied element-wise, a SCALAR is BROADCAST across the whole
+                    // arraySize buffer (`:519`, not `toArray`, so a NaN scalar stores
+                    // NaN), and the store sets `*amask |= 1<<i` so the record posts
+                    // the field it wrote. C allocates the field if the record never
+                    // did; the port's arrays are always present.
+                    let value = pop(&mut stack)?.v;
+                    let idx = my_nint(pop_f64(&mut stack)?);
+                    if let Ok(i) = usize::try_from(idx) {
+                        if i < inputs.arrays.len() {
+                            inputs.arrays[i] = match value {
+                                ArrayStackValue::Array(cell) => cell.into_buf(),
+                                Double(d) => vec![d; inputs.array_size],
+                            };
+                            inputs.amask |= 1 << i;
+                        }
+                    }
+                }
                 ArrayOp::LenNoop => {
                     // C has no `case LEN` and no `default:` in aCalcPerform's
                     // switch (`aCalcPostfix.c:199`: "Array length not

@@ -62,10 +62,7 @@ enum StackEntry {
         nargs: u8,
     },
     CondEnd,
-    Store {
-        var_idx: u8,
-        is_double: bool,
-    },
+    Store(StoreTarget),
     /// C's `UNTIL_END` element (`sCalcPostfix.c:779-783`): reading `UNTIL` PUSHES
     /// one of these onto the OPERATOR stack, carrying the in-stack priority of
     /// the `UNTIL` element itself (0) and an explicit `runtime_effect = 0`. It is
@@ -86,6 +83,30 @@ enum StackEntry {
     },
 }
 
+/// What a `:=` on the operator stack will store into — C's four STORE codes,
+/// and the whole of what `STORE_OPERATOR` can produce.
+///
+/// C reaches them by TWO routes and both are here, which is the point of the
+/// enum: `A:=`/`AA:=` RETRACT the fetch already written to the postfix and turn
+/// it into a `STORE_x` (`sCalcPostfix.c:544-557`), while `@n:=`/`@@n:=` rewrite
+/// the pending `A_FETCH`/`A_SFETCH` operator IN PLACE on the stack (`:516-529`)
+/// — the index expression it was going to consume stays in the postfix, and the
+/// store pops it at run time. Same element, same runtime_effect -1, two shapes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoreTarget {
+    /// `STORE_A`..`STORE_P` — a named scalar arg.
+    Var(u8),
+    /// `STORE_AA`..`STORE_LL` — a named doubled-letter arg (a STRING in sCalc,
+    /// an ARRAY in aCalc, a second numeric bank in base).
+    DoubleVar(u8),
+    /// `A_STORE` — `@n := v`, the scalar arg `n` indexes. sCalc and aCalc.
+    Dyn,
+    /// `A_SSTORE` (sCalc) / `A_ASTORE` (aCalc) — `@@n := v`, the doubled-letter
+    /// arg `n` indexes. Which of the two it compiles to is the engine's business
+    /// (`flush_stack_entry`), as with `[` and `{`.
+    DynDouble,
+}
+
 impl StackEntry {
     fn in_stack_pri(&self) -> u8 {
         match self {
@@ -95,7 +116,7 @@ impl StackEntry {
             StackEntry::Subrange { .. } => 0,
             StackEntry::VarargFunc { in_stack_pri, .. } => *in_stack_pri,
             StackEntry::CondEnd => 0,
-            StackEntry::Store { .. } => 1,
+            StackEntry::Store(_) => 1,
             // C: `{"UNTIL", 0, 10, 0, UNTIL_OPERATOR, UNTIL}` — in_stack_pri 0,
             // so no incoming operator ever pops it off the stack.
             StackEntry::UntilEnd { .. } => 0,
@@ -367,12 +388,24 @@ fn flush_stack_entry(entry: &StackEntry, output: &mut Vec<Opcode>, kind: ExprKin
             output.push(Opcode::Control(ControlOp::UntilEnd(*until_pc)));
             output[*until_pc] = Opcode::Control(ControlOp::Until(end_pc));
         }
-        StackEntry::Store { var_idx, is_double } => {
-            if *is_double {
-                output.push(Opcode::Core(CoreOp::StoreDoubleVar(*var_idx)));
-            } else {
-                output.push(Opcode::Core(CoreOp::StoreVar(*var_idx)));
-            }
+        StackEntry::Store(target) => {
+            use super::opcodes::{ArrayOp, StringOp};
+            output.push(match target {
+                StoreTarget::Var(idx) => Opcode::Core(CoreOp::StoreVar(*idx)),
+                StoreTarget::DoubleVar(idx) => Opcode::Core(CoreOp::StoreDoubleVar(*idx)),
+                // `A_STORE` is spelled once per engine, like every other opcode
+                // the two synApps evaluators share.
+                StoreTarget::Dyn => match kind {
+                    ExprKind::Array => Opcode::Array(ArrayOp::DynStore),
+                    _ => Opcode::String(StringOp::DynStore),
+                },
+                // `@@n:=` is A_SSTORE in sCalc (a string arg) and A_ASTORE in
+                // aCalc (an array arg) — the same split as `{`.
+                StoreTarget::DynDouble => match kind {
+                    ExprKind::Array => Opcode::Array(ArrayOp::DynAStore),
+                    _ => Opcode::String(StringOp::DynSStore),
+                },
+            });
         }
         StackEntry::LParen => {}
     }
@@ -684,26 +717,81 @@ pub fn compile(tokens: &[Token], kind: ExprKind) -> Result<CompiledExpr, CalcErr
                     operand_needed = true;
                 }
 
-                // C `STORE_OPERATOR` (`sCalcPostfix.c:539-565`): retract the fetch
-                // that was already emitted, turn it into a store, and park the store
-                // on the operator stack — ONE code path, whether the fetch was a
-                // number (FETCH_A..FETCH_P) or a string (FETCH_AA..FETCH_LL). It
-                // flushes nothing: a store left on the stack by an earlier `:=` in a
-                // chain stays there, which is how `A:=B:=5` reaches the end at depth
-                // -1 and is rejected as CALC_ERR_INCOMPLETE rather than underflowing
-                // mid-parse.
+                // C `STORE_OPERATOR` (`sCalcPostfix.c:515-567`, `aCalcPostfix.c:483-...`).
+                // It has TWO shapes, and C tries them in this order:
+                //
+                //  1. A DYNAMIC store. Search the operator stack for a pending
+                //     `A_FETCH` (`@`) or `A_SFETCH`/`A_AFETCH` (`@@`) — the unary
+                //     operator whose index expression has already been emitted —
+                //     and rewrite THAT entry in place into `A_STORE` / `A_SSTORE`
+                //     (`A_ASTORE` in aCalc). Nothing is retracted from the output:
+                //     the index stays, the value follows it, and the store opcode
+                //     pops both. Operators sitting ABOVE the rewritten entry are
+                //     flushed (`:531-546`), since `:=` has in_coming_pri 0.
+                //
+                //  2. Otherwise the STATIC store: retract the fetch just emitted
+                //     (FETCH_A..FETCH_P or FETCH_AA..FETCH_LL) and park a STORE on
+                //     the stack. Anything else is CALC_ERR_BAD_ASSIGNMENT.
+                //
+                // Either way the store is left ON the operator stack, so a store
+                // from an earlier `:=` in a chain stays there — which is how
+                // `A:=B:=5` reaches the end at depth -1 and is CALC_ERR_INCOMPLETE
+                // rather than underflowing mid-parse.
                 Token::Assign => {
-                    let (idx, is_double) = match output.last() {
-                        Some(Opcode::Core(CoreOp::PushVar(idx))) => (*idx, false),
-                        Some(Opcode::Core(CoreOp::PushDoubleVar(idx))) => (*idx, true),
-                        _ => return Err(CalcError::BadAssignment),
-                    };
-                    output.pop();
-                    runtime_depth -= 1;
-                    stack.push(StackEntry::Store {
-                        var_idx: idx,
-                        is_double,
+                    let pending_dyn = stack.iter().rposition(|e| {
+                        matches!(
+                            e,
+                            StackEntry::Op {
+                                token: Token::Func(
+                                    FuncName::SDynFetch
+                                        | FuncName::SDynSFetch
+                                        | FuncName::DynFetch
+                                        | FuncName::DynAFetch
+                                ),
+                                ..
+                            }
+                        )
                     });
+                    match pending_dyn {
+                        Some(at) => {
+                            // C: "Move operators of >= priority to the output, but
+                            // stop before ps1" — `:=` has in_coming_pri 0, so every
+                            // entry above the fetch goes.
+                            while stack.len() > at + 1 {
+                                let entry = stack.pop().unwrap();
+                                runtime_depth += stack_effect(&entry);
+                                flush_stack_entry(&entry, &mut output, kind);
+                            }
+                            let StackEntry::Op {
+                                token: Token::Func(f),
+                                ..
+                            } = &stack[at]
+                            else {
+                                unreachable!("rposition matched a Func entry")
+                            };
+                            let target = match f {
+                                FuncName::SDynFetch | FuncName::DynFetch => StoreTarget::Dyn,
+                                _ => StoreTarget::DynDouble,
+                            };
+                            stack[at] = StackEntry::Store(target);
+                        }
+                        None => {
+                            let target = match output.last() {
+                                Some(Opcode::Core(CoreOp::PushVar(idx))) => StoreTarget::Var(*idx),
+                                Some(Opcode::Core(CoreOp::PushDoubleVar(idx))) => {
+                                    StoreTarget::DoubleVar(*idx)
+                                }
+                                _ => return Err(CalcError::BadAssignment),
+                            };
+                            output.pop();
+                            stack.push(StackEntry::Store(target));
+                        }
+                    }
+                    // The `:=` element's own runtime_effect, -1, charged on both
+                    // paths (`sCalcPostfix.c:566`). On the static path it cancels
+                    // the fetch that was just retracted; on the dynamic path it
+                    // accounts for the index the store will pop.
+                    runtime_depth -= 1;
                     operand_needed = true;
                 }
 
@@ -903,7 +991,7 @@ fn stack_effect(entry: &StackEntry) -> i32 {
         StackEntry::Op { .. } => -1,
         StackEntry::VarargFunc { nargs, .. } => 1 - (*nargs as i32),
         StackEntry::CondEnd => 0,
-        StackEntry::Store { .. } => -1,
+        StackEntry::Store(_) => -1,
         StackEntry::LParen => 0,
         // The effect C accumulated on the `[` / `{` entry itself: -1 from the
         // table plus -1 per `,`.

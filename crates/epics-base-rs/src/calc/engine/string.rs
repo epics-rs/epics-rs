@@ -760,6 +760,38 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                         .unwrap_or_default();
                     stack.push(StackValue::Str(s));
                 }
+                StringOp::DynStore => {
+                    // C `A_STORE` — the string path (`sCalcPerform.c:897-906`) and
+                    // the no-string one (`:440-450`) are the same three steps:
+                    //
+                    // ```c
+                    // toDouble(ps);  ps1 = ps;  DEC(ps);     /* the value  */
+                    // toDouble(ps);  i = myNINT(ps->d);  DEC(ps);  /* the index */
+                    // if (i >= numArgs || i < 0) printf(...); else parg[i] = ps1->d;
+                    // ```
+                    //
+                    // The index was emitted BEFORE the value, so it is the deeper of
+                    // the two. Both are popped and nothing is pushed — an assignment
+                    // is not an expression in C's calc. Out of range stores nothing
+                    // and is not an error, exactly as for `@`.
+                    let value = pop1(&mut stack)?.to_double();
+                    let idx = my_nint(pop1(&mut stack)?.to_double());
+                    if let Some(slot) = f64_to_index(idx).and_then(|i| inputs.num_vars.get_mut(i)) {
+                        *slot = value;
+                    }
+                }
+                StringOp::DynSStore => {
+                    // C `A_SSTORE` (`sCalcPerform.c:909-918`) — the same, with
+                    // `toString(ps)` on the value and the STRING args as the target.
+                    // (It has no case on the no-string path, but it cannot get
+                    // there: `@@` is `A_SFETCH`, which IS in the USES_STRING list,
+                    // so a program containing one always runs this evaluator.)
+                    let value = pop1(&mut stack)?.into_string_value();
+                    let idx = my_nint(pop1(&mut stack)?.to_double());
+                    if let Some(slot) = f64_to_index(idx).and_then(|i| inputs.str_vars.get_mut(i)) {
+                        *slot = value;
+                    }
+                }
             },
 
             Opcode::Control(ctrl) => match ctrl {

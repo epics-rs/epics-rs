@@ -206,9 +206,23 @@ impl PortActor {
     /// Run the actor loop with a dedicated shutdown channel.
     /// Calls `shutdown()` on the driver before returning.
     ///
-    /// Returns when either:
-    /// - The main request channel is closed (all senders dropped)
-    /// - The shutdown channel is closed (shutdown signaled)
+    /// A port stops for exactly two reasons, and dropping a
+    /// [`PortRuntimeHandle`](crate::runtime::port::PortRuntimeHandle) is
+    /// neither of them:
+    ///
+    /// - **Someone asked it to.** An explicit shutdown *sends* `()` on the
+    ///   shutdown channel (`PortRuntimeHandle::shutdown`). It outranks every
+    ///   outstanding handle: the port stops even while other `PortHandle`s
+    ///   could still reach it.
+    /// - **Nobody can reach it any more.** The request channel closed, i.e.
+    ///   the last `PortHandle` was dropped. No request can ever arrive again,
+    ///   so stopping is unobservable.
+    ///
+    /// The shutdown channel *closing* (every `PortRuntimeHandle` dropped) is
+    /// deliberately NOT a stop condition. It used to be — closing was the only
+    /// shutdown signal — which conflated "the creator dropped its handle" with
+    /// "shut this port down" and killed ports that the registry still held a
+    /// live `PortHandle` for.
     pub fn run_with_shutdown(mut self, mut shutdown_rx: mpsc::Receiver<()>) {
         // Publish our identity for the whole life of the actor thread: every
         // `PortDriver` method we dispatch below runs on this thread, so a
@@ -223,20 +237,34 @@ impl PortActor {
             .build()
             .unwrap();
         rt.block_on(async {
+            // Once every PortRuntimeHandle is gone no explicit shutdown can
+            // ever arrive, so the (now permanently ready) shutdown branch is
+            // disabled rather than spun on.
+            let mut can_be_shut_down = true;
             loop {
                 // Drain all pending messages into the heap
                 self.drain_channel();
 
                 if self.heap.is_empty() {
-                    // Wait for either a message or shutdown
+                    // Wait for a request, or for an explicit shutdown
                     tokio::select! {
                         msg = self.rx.recv() => {
                             match msg {
                                 Some(m) => self.enqueue_message(m),
+                                // Unreachable: the last PortHandle is gone.
                                 None => break,
                             }
                         }
-                        _ = shutdown_rx.recv() => break,
+                        signal = shutdown_rx.recv(), if can_be_shut_down => {
+                            match signal {
+                                // Explicit shutdown.
+                                Some(()) => break,
+                                // Every PortRuntimeHandle was dropped. Not a
+                                // shutdown — keep serving whoever still holds
+                                // a PortHandle.
+                                None => can_be_shut_down = false,
+                            }
+                        }
                     }
                     // Drain any more that arrived
                     self.drain_channel();

@@ -844,9 +844,9 @@ impl EpicsValue {
     }
 
     /// Extract every element of an array variant as `f64`. Returns
-    /// `None` for scalar variants. `StringArray`/`CharArray` are not
-    /// covered here — their cross-type conversion is handled
-    /// separately in `convert_to`.
+    /// `None` for scalar variants. `CharArray` is not covered here —
+    /// its signed-`epicsInt8` conversion is handled separately in
+    /// `convert_to`.
     fn as_f64_array(&self) -> Option<Vec<f64>> {
         match self {
             Self::ShortArray(a) => Some(a.iter().map(|&v| v as f64).collect()),
@@ -862,6 +862,19 @@ impl EpicsValue {
             // numeric view here — unlike the signed `CharArray`, which needs
             // the epicsInt8 sign-reinterpret arm in `convert_to`.
             Self::UCharArray(a) => Some(a.iter().map(|&v| v as f64).collect()),
+            // DBR_STRING → numeric IS an array conversion in C: the
+            // `putString*` family (`dbConvert.c:941-1148`) runs the SAME
+            // per-element scalar parse (`epicsParseInt32`/`epicsParseFloat64`,
+            // `dbConvertBase` = 0 so `"0x10"` is 16) over all `nRequest`
+            // elements. Taking the numeric view here makes the array path
+            // element-wise-identical to the scalar `String` tail below —
+            // one definition of string→numeric, not two. Without it a
+            // `caput -a WV 3 7 8 9` collapsed to a single `0.0`.
+            Self::StringArray(a) => Some(
+                a.iter()
+                    .map(|s| parse_string_to_f64(&s.as_str_lossy()).unwrap_or(0.0))
+                    .collect(),
+            ),
             _ => None,
         }
     }
@@ -947,10 +960,10 @@ impl EpicsValue {
 
         // Array → array conversion: map each element through the
         // numeric-array view, then materialize the target variant.
-        // CharArray is also handled here: as a byte array it converts
-        // element-wise to numeric arrays, and to String it decodes as
-        // text. StringArray falls through to the scalar path (its
-        // cross-type semantics are not numeric).
+        // StringArray takes this path too — C's string→numeric is a
+        // per-element array conversion (`putStringLong` and siblings),
+        // not a scalar one. CharArray does NOT: it needs the signed
+        // `epicsInt8` reinterpret, and to String it decodes as text.
         if let Some(nums) = self.as_f64_array() {
             // Integer-family arrays also expose a lossless `i64` element
             // view; route integer targets through it so narrowing truncates

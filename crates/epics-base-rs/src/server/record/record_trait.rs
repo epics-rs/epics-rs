@@ -353,21 +353,6 @@ pub enum ProcessAction {
         value: EpicsValue,
     },
 
-    /// Write an OUT link whose BUFFER the destination picks: the framework
-    /// resolves the target ([`OutTarget`] — C `dbGetLinkDBFtype` /
-    /// `dbGetNelements`) and asks the record for the value through
-    /// [`Record::typed_output_buffer`]. `None` from the record skips the put
-    /// entirely (C `sseqRecord.c::processCallback`'s `default: break`).
-    ///
-    /// The destination-typed sibling of [`Self::WriteDbLink`], which carries
-    /// a buffer the SOURCE already chose. sseq's `LNKn` needs this one: C
-    /// forwards the step's string view or its double view depending on the
-    /// LNKn target's DBF class, decided at fire time, not on what `DOLn`
-    /// delivered.
-    ///
-    /// Executed with (and exactly like) [`Self::WriteDbLink`].
-    WriteDbLinkTyped { link_field: &'static str },
-
     /// Resolve an OUT link's TARGET ([`OutTarget`]) and hand it to the record
     /// through [`Record::set_resolved_out_target`], BEFORE `process()` runs.
     ///
@@ -2107,9 +2092,7 @@ pub trait Record: Send + Sync + 'static {
 
     /// The buffer to put on an OUT link the record drives itself, chosen from
     /// the RESOLVED TARGET — the no-staged-value sibling of
-    /// [`Self::multi_output_buffer`], asked for by
-    /// [`ProcessAction::WriteDbLinkTyped`] and
-    /// [`AsyncDbHandle::put_link_notify_typed`](crate::server::database::AsyncDbHandle::put_link_notify_typed).
+    /// [`Self::multi_output_buffer`].
     ///
     /// C `sseqRecord.c::processCallback` (706-793) is the case: the value a
     /// step forwards is not one field but a *switch on the destination*
@@ -2117,16 +2100,17 @@ pub trait Record: Send + Sync + 'static {
     /// time — the string view `s` for a string-class target, the double view
     /// `dov` for a numeric one, `s`'s bytes for a `CHAR`/`UCHAR` array, and
     /// **no put at all** for a target whose type does not resolve (C's
-    /// `default: break`). `None` is that no-put; the framework skips the
-    /// write and, on the notify path, completes immediately.
+    /// `default: break`). `None` is that no-put: the caller issues no write.
     ///
-    /// Default: `None`. Only a record that emits one of the two typed-write
-    /// seams reaches this, and it must override.
+    /// The record calls this ITSELF, on the target
+    /// [`ProcessAction::ResolveOutTarget`] handed it before `process()` — one
+    /// decision, made before anything is issued, because the same switch
+    /// decides more than the buffer (sseq: whether a `WAITn` put-callback goes
+    /// out, and hence whether `WTGn` is raised). See
+    /// [`Self::set_resolved_out_target`].
     ///
-    /// A record that must know the ANSWER before its `process()` runs — because
-    /// the same switch decides something else as well — asks for the target
-    /// ahead of time with [`ProcessAction::ResolveOutTarget`] and calls this
-    /// itself; see [`Self::set_resolved_out_target`].
+    /// Default: `None`. Only a record that resolves its own OUT target reaches
+    /// this, and it must override.
     fn typed_output_buffer(&self, link_field: &str, target: &OutTarget) -> Option<EpicsValue> {
         let _ = (link_field, target);
         None

@@ -1323,10 +1323,11 @@ impl Record for SseqRecord {
 
     // `SseqRecord` does NOT implement `Record::multi_output_links`: the
     // per-step `LNKn` writes are driven here, in `process()` — a no-wait step
-    // via `WriteDbLinkTyped`, a `WAITn` step via the `put_link_notify_typed`
-    // seam (C `sseqRecord.c::processCallback`) — not by the generic
-    // multi-output block. The retired `dispatch_multi_output` `MultiOut::Sseq`
-    // arm was the old all-at-once path and no longer exists.
+    // via `WriteDbLink`, a `WAITn` step via the `put_link_notify` seam, both
+    // carrying the buffer `fire_current_step` already decided on (C
+    // `sseqRecord.c::processCallback`) — not by the generic multi-output block.
+    // The retired `dispatch_multi_output` `MultiOut::Sseq` arm was the old
+    // all-at-once path and no longer exists.
 
     /// C `processCallback`'s SOURCE switch (sseqRecord.c:640-705) — the read
     /// twin of the destination switch below. The step reads `DOLn` with the DBR

@@ -206,6 +206,20 @@ const ASYN_FMT_HYBRID: i32 = 1;
 /// suppresses escape translation (`asynRecord.c:1496-1502`).
 const ASYN_FMT_BINARY: i32 = 2;
 
+/// The record's two `SPC_DBADDR` byte-array fields — the ones C's `cvt_dbaddr`
+/// hands `dbPut` a buffer for, and therefore the ones whose element count
+/// `put_array_info` records (asynRecord.c:940-993). Naming them keeps
+/// [`AsynRecord::put_array_field`] — the single writer of buffer *and* count —
+/// exhaustive: a third array field cannot be added without deciding which count
+/// it carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AsynArrayField {
+    /// BOUT, whose count is NOWT.
+    Bout,
+    /// BINP, whose count is NORD.
+    Binp,
+}
+
 /// Capacity of the `AINP` input string, in bytes — `sizeof(pasynRec->ainp)`.
 /// `AINP` is a `DBF_STRING` (`asynRecord.dbd:261`), i.e. EPICS
 /// `MAX_STRING_SIZE` = 40 including the NUL terminator. C `performOctetIO`
@@ -3415,6 +3429,37 @@ impl AsynRecord {
     /// in the field untouched; mirrored here. The `max(0)` guards at the buffer
     /// arithmetic keep the negative out of the slice math without rewriting the
     /// field.
+    /// The one owner of a client put into an array field — C's `put_array_info`
+    /// (asynRecord.c:983-993), which `dbPut` calls for every `SPC_DBADDR` field
+    /// it writes (`dbAccess.c:1366-1369`) with `nNew` = the element count that
+    /// arrived:
+    ///
+    /// ```c
+    /// if (fieldIndex == asynRecordBOUT)      pasynRec->nowt = nNew;
+    /// else if (fieldIndex == asynRecordBINP) pasynRec->nord = nNew;
+    /// ```
+    ///
+    /// In C, **writing the array *is* how the count gets set** — NOWT is not an
+    /// independent field a client is expected to put alongside BOUT, and
+    /// `monitor()` posts it right after (`POST_IF_NEW(nowt)`, :1022). Making the
+    /// buffer and its count move together in one method is what keeps them from
+    /// diverging: a `caput -a` of 120 bytes into BOUT used to leave NOWT at its
+    /// stale value, and [`Self::octet_output_buffer`] then sent `bout[..NOWT]`
+    /// — 80 bytes on the wire where C sends 120.
+    fn put_array_field(&mut self, field: AsynArrayField, data: Vec<u8>) {
+        let n_new = data.len().min(i32::MAX as usize) as i32;
+        match field {
+            AsynArrayField::Bout => {
+                self.bout = data;
+                self.nowt = n_new;
+            }
+            AsynArrayField::Binp => {
+                self.binp = data;
+                self.nord = n_new;
+            }
+        }
+    }
+
     fn clamp_transfer_sizes(&mut self, in_len: usize) {
         if self.ofmt == ASYN_FMT_BINARY && self.nowt > self.omax {
             self.nowt = self.omax;
@@ -3950,7 +3995,7 @@ impl Record for AsynRecord {
                 self.oeos = to_str(&value);
             }
             "BOUT" => {
-                self.bout = to_bytes(&value);
+                self.put_array_field(AsynArrayField::Bout, to_bytes(&value));
             }
             "OMAX" => {
                 self.omax = to_i32(&value);
@@ -3974,7 +4019,7 @@ impl Record for AsynRecord {
                 self.ieos = to_str(&value);
             }
             "BINP" => {
-                self.binp = to_bytes(&value);
+                self.put_array_field(AsynArrayField::Binp, to_bytes(&value));
             }
             "IMAX" => {
                 self.imax = to_i32(&value);
@@ -8203,6 +8248,45 @@ mod tests {
         rec.clamp_transfer_sizes(AINP_SIZE);
         assert_eq!(rec.nowt, 3);
         assert_eq!(rec.octet_output_buffer(), vec![b'\\', b'r', 0x00]);
+    }
+
+    /// R18-83: C's `put_array_info` (asynRecord.c:983-993) sets NOWT from the
+    /// element count of the BOUT put, and NORD from the count of a BINP put —
+    /// `dbPut` calls it on every array put (`dbAccess.c:1366-1369`). Writing the
+    /// array *is* how the count gets set; a client does not put NOWT alongside.
+    ///
+    /// Without it, a `caput -a` of 120 bytes into BOUT left NOWT at its default
+    /// 80 and the record sent 80 bytes to the device — the wrong byte count on
+    /// the wire, silently.
+    #[test]
+    fn an_array_put_sets_its_element_count() {
+        let mut rec = AsynRecord::default();
+        assert_eq!(rec.nowt, 80, "default NOWT (asynRecord.dbd)");
+
+        let payload: Vec<u8> = (0..120u32).map(|i| (i % 251) as u8).collect();
+        rec.omax = 1000;
+        rec.ofmt = ASYN_FMT_BINARY;
+        rec.put_field("BOUT", EpicsValue::CharArray(payload.clone()))
+            .unwrap();
+
+        assert_eq!(rec.nowt, 120, "BOUT put must set NOWT = nNew");
+        assert_eq!(
+            rec.octet_output_buffer(),
+            payload,
+            "every byte the client put must reach the device"
+        );
+
+        // The same C function serves BINP: its count is NORD.
+        rec.put_field("BINP", EpicsValue::CharArray(vec![1, 2, 3]))
+            .unwrap();
+        assert_eq!(rec.nord, 3, "BINP put must set NORD = nNew");
+
+        // A shorter put shrinks the count — nNew is the count that arrived, not
+        // a high-water mark.
+        rec.put_field("BOUT", EpicsValue::CharArray(vec![9, 9]))
+            .unwrap();
+        assert_eq!(rec.nowt, 2);
+        assert_eq!(rec.octet_output_buffer(), vec![9, 9]);
     }
 
     /// R8-54: C `performOctetIO` writes the clamped transfer sizes back into

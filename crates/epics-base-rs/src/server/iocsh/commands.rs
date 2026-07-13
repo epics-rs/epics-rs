@@ -1020,6 +1020,12 @@ fn cmd_db_load_records() -> CommandDef {
 
             let count = defs.len();
 
+            // One `dbLoadRecords` file is ONE database load: a record's link
+            // status is classified against the file's FINAL record set, so a
+            // link that forward-references a record defined further down still
+            // resolves to a local PV — C's `iocInit`-time `init_record`.
+            let _load = ctx.db().begin_load();
+
             for mut def in defs {
                 // Resolve a `LINR` field naming a loaded breakpoint table to its
                 // menuConvert index (shared with the IocBuilder load path).

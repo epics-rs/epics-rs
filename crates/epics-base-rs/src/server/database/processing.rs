@@ -204,6 +204,14 @@ impl AsyncDbHandle {
         }
     }
 
+    /// Await the end of a database LOAD phase ([`PvDatabase::begin_load`]).
+    /// Returns immediately when no load is in progress or the database is gone.
+    pub async fn wait_for_load(&self) {
+        if let Some(db) = self.db() {
+            db.wait_for_load().await;
+        }
+    }
+
     /// Read a link's value WITHOUT processing its source record — the C
     /// `dbGetLink` semantics. Parses `link` and reads it via
     /// [`PvDatabase::read_link_value_no_process`]; `None` if the link is

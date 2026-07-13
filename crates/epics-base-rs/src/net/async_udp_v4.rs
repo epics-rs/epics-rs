@@ -1233,21 +1233,25 @@ fn bind_one_at(
     // reach the server, and reconnect after IOC restart silently
     // fails.
     //
-    // libcom commit 19146a5: Windows SO_REUSEADDR has dangerous
-    // socket-hijack semantics (any process can rebind), and Windows
-    // releases ports immediately on close anyway, so the flag is
-    // skipped on Windows. The Windows-idiomatic alternative is
-    // SO_EXCLUSIVEADDRUSE, but plain bind() already prevents reuse.
+    // The fanout helper carries no `#ifdef _WIN32` — it sets SO_REUSEADDR
+    // on every platform, Windows included. (The Windows carve-out in
+    // libcom commit 19146a5 belongs to the *other* helper,
+    // `epicsSocketEnableAddressReuseDuringTimeWaitState`, which guards TCP
+    // time-wait rebinding; WINSOCK's SO_REUSEADDR has port-hijack
+    // semantics, and C accepts that cost for datagram fanout but not for
+    // TCP.) Skipping it on Windows breaks the co-bind this socket exists
+    // to support.
     //
     // Only for a *well-known* port — the co-bind case the flags exist
-    // for. A client socket asking for an ephemeral port (0) has nothing
-    // to share, and the flags then do harm: Linux may satisfy bind(0)
-    // with a port already held by a reuse-compatible socket, joining its
-    // SO_REUSEPORT group, after which the kernel load-balances arriving
-    // datagrams across the group — this socket's search replies can be
-    // delivered to the unrelated socket and dropped. With the flags off,
-    // bind(0) yields a port this socket exclusively owns.
-    #[cfg(not(windows))]
+    // for, and what C does: udpiiu.cpp:248 binds the client search socket
+    // to PORT_ANY and enables no reuse on it. A socket asking for an
+    // ephemeral port has nothing to share, and the flags then do harm:
+    // Linux may satisfy bind(0) with a port already held by a
+    // reuse-compatible socket, joining its SO_REUSEPORT group, after which
+    // the kernel load-balances arriving datagrams across the group — this
+    // socket's search replies can be delivered to the unrelated socket and
+    // dropped. With the flags off, bind(0) yields a port this socket
+    // exclusively owns.
     if port != 0 {
         sock.set_reuse_address(true)?;
         #[cfg(unix)]

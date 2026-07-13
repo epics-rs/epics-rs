@@ -300,22 +300,32 @@ async fn run_single_responder(
 /// sockets share identical socket-option setup.
 fn bind_responder_socket(bind_ip: Ipv4Addr, port: u16) -> CaResult<UdpSocket> {
     let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-    // libcom commits 19146a5 + 5064931 + 65ef6e9: SO_REUSEADDR has dangerous
-    // hijack semantics on Windows (any process can rebind), so it's POSIX-only.
-    // For UDP datagram fanout (caRepeater + CA server sharing a port) Linux
-    // requires BOTH SO_REUSEADDR and SO_REUSEPORT (different reuse classes
-    // don't share); BSD/macOS need SO_REUSEPORT. Mirror libcom
-    // epicsSocketEnableAddressUseForDatagramFanout and set both on Unix.
+    // This is a *datagram fanout* socket, so it mirrors libcom's
+    // `epicsSocketEnableAddressUseForDatagramFanout`
+    // (osdSockAddrReuse.cpp), which the C CA server applies to exactly
+    // these sockets — the UDP name receiver and its broadcast companion
+    // (caservertask.c:628, :698). That helper sets SO_REUSEPORT (where
+    // it exists) followed by SO_REUSEADDR on *every* platform: it has no
+    // `#ifdef _WIN32`. Windows must set SO_REUSEADDR too, or a second IOC
+    // on the host cannot bind the CA port and never receives a broadcast
+    // SEARCH.
+    //
+    // Do not confuse this with `epicsSocketEnableAddressReuseDuringTimeWaitState`
+    // (the TCP time-wait helper), which *is* a Windows no-op because
+    // WINSOCK's SO_REUSEADDR has port-hijack semantics there. That rule
+    // governs the TCP listener and caRepeater's exclusive bind, not this
+    // socket.
     //
     // Only for a *well-known* port, which is the case the fanout exists
-    // for. On an ephemeral bind (port 0) there is nothing to share, and
-    // the flags are actively harmful: Linux may hand bind(0) a port that
-    // already belongs to a reuse-compatible socket, silently joining its
-    // SO_REUSEPORT group — the kernel then load-balances arriving
-    // datagrams across the group, so SEARCHes for this server land on an
-    // unrelated socket and go unanswered. Leaving the flags off makes the
-    // kernel pick a port this socket exclusively owns.
-    #[cfg(not(windows))]
+    // for — C likewise leaves its PORT_ANY sockets bare (udpiiu.cpp:248
+    // binds the client search socket to PORT_ANY and enables no reuse).
+    // On an ephemeral bind the flags are actively harmful: Linux may hand
+    // bind(0) a port that already belongs to a reuse-compatible socket,
+    // silently joining its SO_REUSEPORT group — the kernel then
+    // load-balances arriving datagrams across the group, so SEARCHes for
+    // this server land on an unrelated socket and go unanswered. Leaving
+    // the flags off makes the kernel pick a port this socket exclusively
+    // owns.
     if port != 0 {
         sock.set_reuse_address(true)?;
         #[cfg(unix)]
@@ -1037,13 +1047,14 @@ mod responder_bind_tests {
     }
 
     /// Boundary — a fixed port keeps the datagram-fanout reuse flags, so
-    /// the well-known CA port can still be co-bound (caRepeater parity).
+    /// the well-known CA port can still be co-bound (multiple IOCs on one
+    /// host must all receive a broadcast SEARCH).
     ///
-    /// Unix only: `bind_responder_socket` sets no reuse flag at all on
-    /// Windows (its `SO_REUSEADDR` has socket-hijack semantics — see the
-    /// `cfg(not(windows))` gate there), so co-binding is *correctly*
-    /// refused on Windows and there is no fanout to assert.
-    #[cfg(unix)]
+    /// Runs on Windows too: libcom's fanout helper sets SO_REUSEADDR on
+    /// every platform, so the co-bind must work there as well. This test
+    /// is what pins that — it failed on Windows while
+    /// `bind_responder_socket` was (wrongly) applying the TCP time-wait
+    /// helper's Windows carve-out.
     #[test]
     fn fixed_responder_port_still_allows_datagram_fanout() {
         let rt = tokio::runtime::Builder::new_current_thread()

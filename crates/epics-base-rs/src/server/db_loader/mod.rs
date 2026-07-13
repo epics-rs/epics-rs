@@ -140,7 +140,7 @@ pub fn parse_db_with_breaktables(
         // are accepted and skipped rather than erroring out.
         if word == "path" || word == "addpath" {
             skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-            let _dir = read_quoted_string(&chars, &mut pos, &mut line, &mut col)?;
+            let _dir = read_token_string(&chars, &mut pos, &mut line, &mut col)?;
             continue;
         }
 
@@ -152,7 +152,7 @@ pub fn parse_db_with_breaktables(
         // layer's job.
         if word == "include" {
             skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-            let _file = read_quoted_string(&chars, &mut pos, &mut line, &mut col)?;
+            let _file = read_token_string(&chars, &mut pos, &mut line, &mut col)?;
             continue;
         }
 
@@ -165,11 +165,11 @@ pub fn parse_db_with_breaktables(
             skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
             expect_char(&chars, &mut pos, &mut col, '(', line)?;
             skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-            let target = read_quoted_string(&chars, &mut pos, &mut line, &mut col)?;
+            let target = read_token_string(&chars, &mut pos, &mut line, &mut col)?;
             skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
             expect_char(&chars, &mut pos, &mut col, ',', line)?;
             skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-            let alias_name = read_quoted_string(&chars, &mut pos, &mut line, &mut col)?;
+            let alias_name = read_token_string(&chars, &mut pos, &mut line, &mut col)?;
             validate_record_name(&alias_name, line, col)?;
             skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
             expect_char(&chars, &mut pos, &mut col, ')', line)?;
@@ -186,12 +186,7 @@ pub fn parse_db_with_breaktables(
             skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
             expect_char(&chars, &mut pos, &mut col, '(', line)?;
             skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-            // The name is a quoted string or a bare identifier (C accepts both).
-            let bt_name = if pos < chars.len() && chars[pos] == '"' {
-                read_quoted_string(&chars, &mut pos, &mut line, &mut col)?
-            } else {
-                read_word(&chars, &mut pos, &mut col)
-            };
+            let bt_name = read_token_string(&chars, &mut pos, &mut line, &mut col)?;
             skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
             expect_char(&chars, &mut pos, &mut col, ')', line)?;
             skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
@@ -278,13 +273,13 @@ pub fn parse_db_with_breaktables(
         expect_char(&chars, &mut pos, &mut col, '(', line)?;
 
         skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-        let rec_type = read_word(&chars, &mut pos, &mut col);
+        let rec_type = read_token_string(&chars, &mut pos, &mut line, &mut col)?;
 
         skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
         expect_char(&chars, &mut pos, &mut col, ',', line)?;
 
         skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-        let name = read_quoted_string(&chars, &mut pos, &mut line, &mut col)?;
+        let name = read_token_string(&chars, &mut pos, &mut line, &mut col)?;
         validate_record_name(&name, line, col)?;
 
         skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
@@ -325,7 +320,7 @@ pub fn parse_db_with_breaktables(
                 skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
                 expect_char(&chars, &mut pos, &mut col, '(', line)?;
                 skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-                let alias_name = read_quoted_string(&chars, &mut pos, &mut line, &mut col)?;
+                let alias_name = read_token_string(&chars, &mut pos, &mut line, &mut col)?;
                 validate_record_name(&alias_name, line, col)?;
                 skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
                 expect_char(&chars, &mut pos, &mut col, ')', line)?;
@@ -365,7 +360,7 @@ pub fn parse_db_with_breaktables(
             expect_char(&chars, &mut pos, &mut col, '(', line)?;
 
             skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-            let field_name = read_word(&chars, &mut pos, &mut col);
+            let field_name = read_token_string(&chars, &mut pos, &mut line, &mut col)?;
 
             skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
             expect_char(&chars, &mut pos, &mut col, ',', line)?;
@@ -1080,9 +1075,27 @@ fn read_json_value(
     })
 }
 
-/// A C `tokenSTRING` in a position that also allows a bareword — the `info`
-/// tag. Quoted: RAW, escapes untranslated, exactly as a record name is read
-/// ([`read_quoted_string`]). Unquoted: the bareword itself.
+/// A C `tokenSTRING` — the ONE reader for every grammar position `dbYacc.y`
+/// spells that way (record type, record name, field name, info tag, alias
+/// names, breaktable name, path/include).
+///
+/// `dbLex.l:88-97` gives `tokenSTRING` two lexical forms and the grammar never
+/// distinguishes them:
+///
+/// * a bareword — `[a-zA-Z0-9_\-+:.\[\]<>;]+` (`dbLex.l:21`);
+/// * a double-quoted string — taken RAW, the lexer only strips the quotes; no
+///   escape translation happens in the INITIAL start condition (that is the
+///   `JSON` condition's job, and it applies to VALUES only — see
+///   [`read_field_value`]).
+///
+/// So `record("ai", "QT1") { field("VAL", "5") }` and `record(ai, QT2)` are the
+/// same grammar to C, and softIoc loads both. The port used to read the type
+/// and the field name with [`read_word`] (bareword only, and a narrower charset
+/// at that) and the record/alias names with [`read_quoted_string`] (quoted
+/// only) — so each position accepted one of C's two forms and refused the
+/// other, turning a legal `.db` into a hard startup failure. Reading them all
+/// through here is what makes the two forms indistinguishable to the caller,
+/// as they are to C.
 fn read_token_string(
     chars: &[char],
     pos: &mut usize,
@@ -1092,7 +1105,28 @@ fn read_token_string(
     if matches!(chars.get(*pos), Some('"')) {
         return read_quoted_string(chars, pos, line, col);
     }
-    read_field_value(chars, pos, line, col)
+
+    let mut s = String::new();
+    while let Some(&c) = chars.get(*pos) {
+        if c.is_ascii_alphanumeric()
+            || matches!(c, '_' | '-' | '+' | ':' | '.' | '[' | ']' | '<' | '>' | ';')
+        {
+            s.push(c);
+            *pos += 1;
+            *col += 1;
+        } else {
+            break;
+        }
+    }
+    if s.is_empty() {
+        let got = chars.get(*pos).map_or("EOF".to_string(), |c| c.to_string());
+        return Err(CaError::DbParseError {
+            line: *line,
+            column: *col,
+            message: format!("expected a name (bareword or quoted string), got '{got}'"),
+        });
+    }
+    Ok(s)
 }
 
 /// A field or info VALUE — C's `json_value` (dbYacc.y:256-267): the parser

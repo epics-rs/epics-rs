@@ -4481,6 +4481,20 @@ Category C (PVA/gateway):
   reproduced; for CONN_TMO in ~[6.92e18, 9.22e18] pvxs falls back to
   40 s idle, port keeps ~1.2e19 s. runtime.rs:480-483,
   server_conn.rs:65.
+- **R17-35** High — group scalar-member PUT never unwraps the NTScalar
+  wrapper: for a `+type:"scalar"` member the client sends the NTScalar
+  structure and qsrv/group.rs::convert_member_value hands that whole
+  structure to pv_field_to_epics instead of dereferencing its `value`
+  leaf, so EVERY scalar-mapped member PUT (numeric included) is
+  rejected ("member 'x' value is not convertible to backing field").
+  Found by the wave-15 R17-31 group-PUT test; filed post-audit from the
+  fixer's UNFIXED report.
+- **R17-36** Low — client echo cadence has no upper cap:
+  heartbeat_interval() is configured/2, pvxs uses
+  max(1, min(15, tcpTimeout*3/8)) (clientconn.cpp:163), so a large
+  CONN_TMO pushes the echo period far past C's 15 s ceiling. Distinct
+  from R17-34 (idle-timeout VALUE vs echo CADENCE). Filed post-audit
+  from the wave-15 fixer's UNFIXED report.
 
 Category D (asyn):
 - **R17-46** Medium — trace ESCAPE form hardwires escaped_from_raw; C's

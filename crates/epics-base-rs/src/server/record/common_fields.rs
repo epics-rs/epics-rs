@@ -160,7 +160,14 @@ impl Default for CommonFields {
             inp: String::new(),
             out: String::new(),
             dtyp: String::new(),
-            time: SystemTime::UNIX_EPOCH,
+            // An `epicsTimeStamp {0,0}` — C's never-processed `dbCommon.time`
+            // — is the EPICS epoch, not the Unix epoch. Seeding this with
+            // `UNIX_EPOCH` made a never-processed record publish
+            // `timeStamp.secondsPastEpoch = 0` on PVA where pvxs publishes
+            // 631152000 (`iocsource.cpp:240` adds POSIX_TIME_AT_EPICS_EPOCH
+            // to the record's raw EPICS seconds). See
+            // [`crate::runtime::general_time::epics_epoch`].
+            time: crate::runtime::general_time::epics_epoch(),
             tse: 0,
             tsel: String::new(),
             utag: 0,

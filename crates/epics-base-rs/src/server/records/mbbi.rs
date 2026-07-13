@@ -388,12 +388,10 @@ impl Record for MbbiRecord {
     /// dset masks only when MASK is non-zero). `read_mbbi` returns 0, so the
     /// record's `RVAL >> SHFT` → state-index convert then runs.
     fn raw_soft_input(&mut self, entry: RawSoftEntry, value: EpicsValue) -> Option<CaResult<()>> {
-        let Some(rval) = value.to_f64().map(crate::types::c_cast::f64_to_u32) else {
-            return Some(Err(CaError::TypeMismatch(
-                "mbbi Raw Soft Channel: INP value not numeric".into(),
-            )));
+        self.rval = match super::raw_soft_rval_u32("mbbi", &value) {
+            Ok(rval) => rval,
+            Err(e) => return Some(Err(e)),
         };
-        self.rval = rval;
         if entry == RawSoftEntry::Read {
             self.rval &= self.raw_soft_mask();
         }

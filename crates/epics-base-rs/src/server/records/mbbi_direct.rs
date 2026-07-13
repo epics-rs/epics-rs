@@ -181,12 +181,10 @@ impl Record for MbbiDirectRecord {
     /// `prec->rval &= prec->mask` (`:60-61`). `read_mbbi` returns 0, so the
     /// record's `RVAL >> SHFT` → VAL/bit-field convert runs.
     fn raw_soft_input(&mut self, entry: RawSoftEntry, value: EpicsValue) -> Option<CaResult<()>> {
-        let Some(rval) = value.to_f64().map(crate::types::c_cast::f64_to_u32) else {
-            return Some(Err(CaError::TypeMismatch(
-                "mbbiDirect Raw Soft Channel: INP value not numeric".into(),
-            )));
+        self.rval = match super::raw_soft_rval_u32("mbbiDirect", &value) {
+            Ok(rval) => rval,
+            Err(e) => return Some(Err(e)),
         };
-        self.rval = rval;
         if entry == RawSoftEntry::Read {
             // The dset's init builds the mask: `if (nobt == 0) mask =
             // 0xffffffff;` (overriding a configured MASK) then `mask <<= shft`.

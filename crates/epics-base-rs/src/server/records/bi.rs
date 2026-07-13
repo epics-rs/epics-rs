@@ -203,31 +203,10 @@ impl Record for BiRecord {
     /// `f2fe9d12`). The mask is in `read_bi` ONLY, so the init constant load is
     /// unmasked.
     fn raw_soft_input(&mut self, entry: RawSoftEntry, value: EpicsValue) -> Option<CaResult<()>> {
-        // `dbGetLink(.., DBR_ULONG, ..)` lands in a conversion routine chosen by
-        // the SOURCE type: an integer source reaches `getLongUlong` and wraps
-        // modulo 2^32 (DEFINED in C — 6.3.1.3p2, so `0xdeadbeef` read as a signed
-        // `DBF_LONG` still lands in RVAL as `0xdeadbeef`), a float source reaches
-        // `getDoubleUlong` and hits the UB cast that CBUG-E2 saturates.
-        // `convert_to` is the owner of that split; `c_cast::f64_to_u32(to_f64())`
-        // bypasses it and applies the float rule to integer sources.
-        //
-        // `convert_to` coerces rather than fails, so the not-numeric rejection
-        // stays explicit: without this gate a non-numeric source would land in
-        // RVAL as a silent 0.
-        if value.to_f64().is_none() {
-            return Some(Err(CaError::TypeMismatch(
-                "bi Raw Soft Channel: INP value not numeric".into(),
-            )));
-        }
-        let rval = match value.convert_to(crate::types::DbFieldType::ULong) {
-            EpicsValue::ULong(v) => v,
-            other => {
-                return Some(Err(CaError::TypeMismatch(
-                    format!("bi Raw Soft Channel: INP value not a scalar ({other:?})").into(),
-                )));
-            }
+        self.rval = match super::raw_soft_rval_u32("bi", &value) {
+            Ok(rval) => rval,
+            Err(e) => return Some(Err(e)),
         };
-        self.rval = rval;
         if entry == RawSoftEntry::Read && self.mask != 0 {
             self.rval &= self.mask;
         }

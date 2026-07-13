@@ -560,14 +560,12 @@ impl Record for AiRecord {
     /// so the record's own `RVAL → VAL` convert (ROFF/ASLO/AOFF/LINR/SMOO) runs.
     /// `ai` has no MASK, so both entry points store the same word.
     fn raw_soft_input(&mut self, _entry: RawSoftEntry, value: EpicsValue) -> Option<CaResult<()>> {
-        // RVAL is epicsInt32 and the link is read as DBR_LONG: C's cast, owned
-        // by `c_cast`.
-        let Some(rval) = value.to_f64().map(crate::types::c_cast::f64_to_i32) else {
-            return Some(Err(CaError::TypeMismatch(
-                "ai Raw Soft Channel: INP value not numeric".into(),
-            )));
+        // RVAL is epicsInt32 and the link is read as DBR_LONG; the conversion is
+        // owned by `raw_soft_rval_i32`, not by a bare `c_cast` of `to_f64()`.
+        self.rval = match super::raw_soft_rval_i32("ai", &value) {
+            Ok(rval) => rval,
+            Err(e) => return Some(Err(e)),
         };
-        self.rval = rval;
         Some(Ok(()))
     }
 

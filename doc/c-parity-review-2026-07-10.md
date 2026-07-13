@@ -5185,3 +5185,113 @@ in.
   caget_prints_nothing_when_one_pv_of_many_never_connects,
   client::transport::flow_control_tests::r6_17_events_off_at_the_
   contiguous_frame_boundary (wall-clock sleeps in its harness).
+
+---
+
+## Round 16 re-audit (2026-07-13)
+
+Six reused auditor panels (round `01KXD31D8FAXFBET4SWW4JDK7J`), run
+after the wave-13 + aai/aao merges AND the origin/main merge `ef260e30`
+(PR #25-27). Methods: A compiled-C head-to-head at each caller's counts
++ 1500-case differential sweep; B a 2217-input bit-exact epicsParseDouble
+battery + ~60 live softIoc head-to-heads; C full post-state read of the
+framing refactor + pvxs source; D three compiled probes (connect-attempt
+counting, report block, param library); E source verification of all six
+alarm-path owners; aai/aao compiled softIoc transcripts vs probe crate.
+
+### Wave-13 + aai/aao fix verification — ALL 28 HOLD
+A: R15-1, R15-2 HOLD (every R15-1 proof case now agrees with compiled C;
+R15-2's link/client bound split traced end-to-end — a foreign OUT link
+into acalcout.AA correctly takes the client bound because C routes
+dbPutLink through dbPut). B: R15-16..18 HOLD (client crash and server
+DoS both gone live; diagnostics byte-identical; scan_double 2165/2217
+bit-exact — the 52 diffs are one corner, R16-16). C: R15-31..35 HOLD
+(EventMark is Skip/Marked only; gate==wire on every monitor path;
+read_leaf_paths reproduces initialize+get(Everything); subscripted
+collapse matches Value::mark; the group seed correctly does NOT reuse
+GET stamping — queueSize is seed-only, groupsource.cpp:404-405 vs :485).
+D: R15-46..51 HOLD (R15-46's first probe "failure" was C's own 2 s
+throttle; R15-51 carried over two pre-existing non-C lines → R16-48/49).
+E: R15-61..65 HOLD (pending/committed constructors are the only two;
+phase gate un-bypassable — dispatch reads the record's own phase).
+aai/aao: R15-76..82 HOLD (R15-77 verified byte-for-byte incl. the
+pending-not-committed alarm half; R15-78 INCOMPLETE for subArray only —
+C's documented exception, filed as R16-76).
+
+### Merge verification
+- `ef260e30` conflict resolutions (adapter.rs init, asyn_record
+  connect_device, sync_io drv_user_create): all three compositions
+  CORRECT vs devAsynInt32.c:263-277, asynRecord.c:1242-1261,
+  asynOctetSyncIO.c:141-156. Adjudicated NOT-REAL along the way:
+  failed create zeroing resolved_reason (C's effective reason is also
+  0 — the field is copied only in special(), asynRecord.c:488); missing
+  empty-drvInfo skip in sync_io (C guards a NULL pointer; no caller
+  passes ""); param library addr collapse (validate_addr mirrors C's
+  getAddr -1 → 0); Int32 @asynMask applied twice (idempotent).
+- PR #25-27 surface: no regressions (convert.rs round-trips iface as
+  Option; @asynMask applied on both input paths as C).
+- `fff4e685` (UDP SO_REUSEADDR on Windows): HOLDS —
+  epicsSocketEnableAddressUseForDatagramFanout has no platform guard in
+  C; family complete across all five datagram sockets.
+- aai/aao ↔ wave-13 E merge composition in processing.rs/links.rs:
+  correct (read_db_link_into_field single owner serves both consumers;
+  rec_gbl_init_constant_inp init-only; phase gate and aao DOL disjoint).
+
+### Lead adjudications
+- Gateway cooked-path overrun: **NOT-REAL as a pvxs divergence** — the
+  port's server IS a pvxs server and pvxs never sets overrun bits
+  (servermon.cpp:171-177 unconditional to_wire(0), "TODO: placeholder");
+  emitting a computed set would flip pvxs's client servSquash flag
+  (clientmon.cpp:554-563). pva2pva is NOT on this machine and is not
+  cited. Raw path already forwards upstream bits. Superset decision, not
+  a parity fix; needs pva2pva source on disk if ever wanted.
+- pva env doubles: **REAL** → R16-32 (pvxs's parse_timeout has a range
+  gate the port lacks).
+- epid's constant CVL: UNVERIFIED (registered by crates/std-rs, outside
+  the probe's link graph) — shares R16-77's anchor; check when fixing.
+
+### Open Findings — Round 16 (24 findings)
+
+### R16-1: sseq forwards each step's value typed by the SOURCE, not by the destination LNKn field type — **High**. sseq.rs:338-353 (step_value branches on dol_kind/str_val) + :539 vs sseqRecord.c:714-793 (processCallback switches on lnk_field_type from dbGetLinkDBFtype: string-class → dbPutLink(DBR_STRING, s) with s = cvtDoubleToString(dov, sseq's PREC); numeric → DBR_DOUBLE with dov = atof(s); CHAR/UCHAR n_elements>1 → the 40-byte s as char array; default → NO put). Port stores lnk_field_type (:1409-1414, posted as LTn) and never routes on it. PREC=2, 1.23456789 → C "1.23", port "1.23456789"; string "abc" → numeric: C 0.0 + PP process, port errored put, nothing written; numeric → CHAR waveform (long-string idiom): C string bytes, port one double; unresolved LNKn: C nothing, port always writes. sseq twin of R14-61; structural fix the same — route on lnk_field_type.
+### R16-2: sseq DOn/STRn are two views of one value; port syncs only on the link-read path — Medium. sseq.rs:1358-1375 (put_field DO/STR arms write one side), :993-1092 (special has no DOn/STRn arm), :908-914 (init quantizes DLY only) vs sseqRecord.c:1098-1117 (special DOn → cvtDoubleToString into s), :1119-1132 (STRn → atof into dov), :242-250 (init reconciles). caput DO1 3.7 leaves STR1 stale; caput STR1 "5" leaves DO1 0; after STR1="abc" then DO1=3.7 the port forwards "abc" where C forwards "3.70"; .db field(DO1,"3") leaves STR1 empty where C shows "3".
+### R16-3: WAITn on a non-CA link — port blocks the sequence; C cannot wait and flags it — Medium. sseq.rs:543-553 (wait gate ignores link type), :783-787 (werr) vs sseqRecord.c:717/:739/:763 (put-with-completion only if usePutCallback && lnk.type==CA_LINK; DB_LINK takes plain dbPutLink, never waits) + :912-933 (checkLinks: waitConfigErr=1 exactly for DB_LINK with usePutCallback, RESCINDED for CONSTANT). Port's WAITn on a local DB link stalls the sequence where C fires-and-forgets; WERRn inverted vs C (raised for CONSTANT which C clears; 0 for the DB-link case C warns about).
+### R16-4: transform discards the non-finite result C stores in the channel — Medium, compiled repro. transform.rs:709-737 (Err(_) leaves vals[i] stale; engine returns Err(NonFiniteResult) before yielding) vs sCalcPerform.c:2034-2056 (epilogue writes *presult FIRST, then returns -1 on nan/inf) + transformRecord.c:593-597 (raises CALC/INVALID + UDF but leaves *pval = inf, fanned through OUTA). C harness: 1e308*10 → stat=-1 d=inf. Transform-only (scalcout overwrites VAL=-1/"***ERROR***" on any nonzero status). Structural: CalcError::NonFiniteResult cannot carry the value C's contract pairs with the -1. Distinct: 1/0 and LOG(-1) return -1 WITHOUT writing *presult in C (./ht '1/0' → d=0) — port already matches.
+### R16-16: estdlib hex-float parsing diverges from glibc strtod for subnormal magnitudes — Low. estdlib.rs:138-139 (mant * 2.0f64.powi(exp) underflows via inf reciprocal → 0.0 → classified ERANGE) vs epicsStdlib.c:160 (glibc strtod returns the exact subnormal, no ERANGE). 52/2217 battery diffs, all subnormal-range hex (0x1p-1074: C OK|…0001, port Underflow; 0x1p-1023: C OK, port Overflow). Decimal path bit-exact across the whole subnormal boundary. Module doc's "accepts what glibc accepts" is refuted for this corner; parses_hex_floats tests only normal range.
+### R16-17: EPICS_CA_MAX_SEARCH_PERIOD has no high-range clamp or diagnostic — Low. search.rs:184-208 (low clamp only) vs udpiiu.cpp:96-111 (getNTimers caps at 18 timers → effective 4194.304 s, prints "out of range (high)" pair ≈ above 8389 s). =100000: C caps + 2 stderr lines, port raw 3333 s tick, silent. (The port's search cadence redesign note covers the RTT ladder, not this missing diagnostic/cap.)
+### R16-18: EPICS_CAS_BEACON_PERIOD diagnostic prints 3× at server startup; C prints once — Low. addr_list.rs:258-275 (from_env prints every call; invoked ≥3× during startup, no OnceLock — unlike the R15-17 client resolvers) vs online_notify.c:52-64 (single beacon thread reads once). Text byte-identical, value correct; count differs.
+### R16-19: EPICS_CA_CONN_TMO ≤ 0 silently forced to 30 s; C uses the raw value — Low. transport.rs:187-191 (secs > 0.0 else 30 s) vs cac.cpp:188-194 (stores whatever envGetDoubleConfigParam returns; negative → watchdog fires immediately, "Virtual circuit unresponsive" flood). =-5: C floods stderr, port silent clean read. C's behaviour is degenerate; filed for completeness.
+### R16-31: display.form.index published and marked for non-VAL field channels — Low. pvif.rs:247-258 (read_leaf_paths marks choices+index unconditionally for Scalar) + :1123 (build_display writes per-record Q:form for any numeric field) vs iocsource.cpp:41-64 (Q:form applied to form.index only if dbIsValueField(chan) — dbAccess.c:463-469, true for VAL only; choices always). GET/seed of rec.RVAL with info(Q:form,"Hex"): port sends one changed bit + 4 bytes pvxs does not, reports Hex where pvxs reports default. Both QSRV sources; untested (every form assertion uses VAL).
+### R16-32: EPICS_PVA_CONN_TMO large value panics client AND server at startup; pvxs logs and defaults — **High**. config/env.rs:765-770 + server_native/runtime.rs:482 + client_native/server_conn.rs:56,65 (finite-positive filter then Duration::from_secs_f64) vs config.cpp:211-227 (parse_timeout: !isfinite || <0 || > time_t::max → log_err_printf + default) + util.cpp:769-783 (parseTo<double> = std::stod + trailing-ws-tolerant extraneous check). =1e300 passes is_finite && >0 then PANICS ("cannot convert float seconds to Duration"). Same unguarded chain at runtime.rs:468 (EPICS_PVAS_SEND_TMO), :471 (TLS_HANDSHAKE_TMO), env.rs:678/691 (BEACON_PERIOD[_LONG]) — port-only vars, same defect. Also: stod skips leading ws and parseTo trailing (" 45" works in pvxs, port falls back to 30 s); stod accepts hex floats. PVA half of the R15-16 family; the needed resolver REJECTS out-of-range (pvxs semantics), not saturate-to-MAX (CA semantics).
+### R16-46: a pure status query or asynReport initiates a hardware connect attempt — Medium. port_actor.rs:328-410 (every pass ends in port_thread_auto_connect :491-493, including GetConnected/GetEnable/GetAutoConnect/Report) vs asynManager.c (notifyPortThread signalled from exactly five places: queueRequest :1626, announceExceptionOccurred :636, queue-timeout tail :700, cancelRequest :1688, unblockProcessCallback :1772; isConnected :2326-2337 / isEnabled :2340 / report :1136 are plain reads, never wake). Probe: isConnected → 1 attempt, asynReport 1 → 1 attempt, idle window → 0; C gives 0 for both. Status polling pulls a dead port's reconnect cadence from secondsBetweenPortConnect (20 s) to one per 2 s; asynReport becomes an action. Fix direction: gate the tail on queued dispatch / exception / queue-timeout.
+### R16-47: report's parameter block one detail level late — asynReport 1 prints no parameter values — Medium. port.rs:1501 (level.saturating_sub(1) into report_params, whose thresholds: <1 count, >=1 names, >=2 values) vs asynPortDriver.cpp:3692 (reportParams(fp, details) UNCHANGED) + :1799-1809 + paramVal.cpp:296-330 (every param prints name+type+value+status regardless of details). Probe: report 1 → count only (C: both params with values); report 2 → names, no values; values only at 3. Line format also diverges ("Number of parameters is: %u" + "Parameter list %d" vs "param[i] name=…").
+### R16-48: report's EOS escaping handles only \r and \n — Low. port.rs:1487-1499 (ad-hoc esc closure) vs asynPortDriver.cpp:3687,3690 (epicsStrPrintEscaped: \a\b\f\n\r\t\v\\'" + \x%02x for non-isprint). Binary terminator (\x03, ESC, \t, NUL) written raw into stdout. A correct port exists privately: iocsh.rs:160-180 escaped_from_raw (differs only on NUL: \0 vs C's \x00).
+### R16-49: report prints "option: k = v" lines with no C source — Low. port.rs:1503-1507 (details >= 2) vs asynPortDriver.cpp:3677-3710 (never options; asynOption has no enumeration to walk). Both R16-48/49 pre-date 170fd865 (carried over from the eprintln version): retire or record as documented deviations.
+### R16-61: the ReadDbLink input path drops MS/MSI/MSS severity inheritance — Medium. processing.rs:3694 (read_db_link_into_field → read_link_value, returns value alone; parsed monitor_switch never consumed; inherit_sevr_msg called from exactly two places: links.rs:915 put, processing.rs:2432 declared-input stage) vs dbDbLink.c:228-232 (dbDbGetValue ends with recGblInheritSevrMsg on EVERY healthy read). Affected: compress INP (compressRecord.c:342), aao closed-loop DOL (aaoRecord.c:366), epid/optics/motor links emitting the action. field(INP,"SRC MS") on compress leaves reader NO_ALARM while C raises to source severity. Failure path unaffected (LINK/INVALID still raised) — this is the healthy-link/alarming-source case MS exists for.
+### R16-62: a self-referencing input link inherits the record's own committed alarm — C excludes it — Low. links.rs:526-531 (read_link_with_alarm builds committed for ANY local target) vs dbDbLink.c:228 (guard: precord != dbChannelRecord(chan)). Self MS input link folds the previous cycle's committed severity into this cycle's pending → reset_alarms re-commits → self-sustaining latch (once MAJOR, never NO_ALARM). Runtime reachability of the self-link in the port unverified (read-only round) — Low pending that.
+### R16-76: subArray never re-loads/re-subsets a constant or empty INP at process — INDX inert on the standard configuration — **High**. waveform.rs:1326-1398 (set_val is the only slicing site, runs on link delivery) + links.rs:702-733 (Constant arm returns None after R15-78) vs devSASoft.c:92-123 (read_sa re-runs dbLoadLinkArray EVERY process; empty INP → nRequest=nord and STILL calls subset :118-120; subset :40-56 shifts by INDX, sets NORD, clears UDF unconditionally). subArray is C's documented exception to R15-78. (1) INP="[1,2,3,4]": C restores the slice every process (client put of 50 → still [1,2,3]); port keeps client data. (2) unset INP: C re-slices VAL by INDX each process (the "client writes, record slices" pattern); port does nothing. Port's DB-link path re-verified correct (INDX/MALM/clamp/runtime-INDX all exact).
+### R16-77: constant links on the multi-input / SELL / DOLn readers are re-applied every cycle and never seeded at init — **High**. links.rs:533 (read_link_with_alarm Constant arm → constant_value() every read), called from processing.rs:1790/1799/1807/1958/2079/2926; no init-seed owner (rec_gbl_init_constant_inp covers only soft-DTYP single INP) vs recGblInitConstantLink at init in calcRecord.c:103, calcoutRecord.c:163,374, subRecord.c:104, selRecord.c:99,105, aSubRecord.c:126, seqRecord.c:121,125, dfanoutRecord.c:102,105, fanoutRecord.c:88 + dbConstLink.c:220-226 (dbConstGetValue delivers NOTHING at process). field(INPA,"5") + caput A=99 → destroyed next process (C keeps 99). Pre-first-process reads 0/NaN instead of the constant. Verified affected: calc, calcout, sub, sel (INPA..L + NVL), aSub, scalcout, acalcout, seq (SELL + DOL1..N). Same reader unprobed: fanout/dfanout SELL, printf INP0..9; epid CVL unverified (std-rs). ao/longout/mbbo/dfanout DOL NOT affected (verified — port keeps client VAL). Same family as R15-78; the init-seed owner must generalize.
+### R16-78: parse_link_v2 isolates modifiers before the constant test — "<number> <modifier>" becomes Constant where C yields a PV_LINK — **High**. link.rs:1074 (split_link_modifiers first), :1096-1099 (numeric test on link_part only) vs dbStaticLib.c:2346-2360 (epicsParseDouble on the WHOLE string — rejects trailing garbage; then bracket test requiring trailing ']'; only then strchr ' '). Compiled C: INP="5 PP" → CA_LINK (process: VAL=0 INVALID/LINK); port: Constant("5") (VAL=5, NO_ALARM — broken link masked). SDIS="3 NPP" DISV=3: port DISA=3 → record PERMANENTLY DISABLED; C DISA=0, runs. OUT/FLNK: write silently dropped, C attempts CA put and alarms. "[1,2,3] PP" correctly a link in BOTH (bracket test needs trailing ']') — do not "fix" that arm.
+### R16-79: SPC_NOMOD enforced only on the CA route; the dbPut owner used by DB-link writes has no gate — a link can truncate a waveform — **High**. field_io.rs:1065-1072 (read-only gate, CA route) vs field_io.rs:307-360 (put_pv_inner, no check) vs dbAccess.c:1330-1332 → :123-126 (dbPut → dbPutSpecial: SPC_NOMOD && pass==0 → S_db_noMod; dbPut sits below BOTH dbPutField and dbPutLink). record(ao){field(OUT,"WF.NELM PP")}: C refuses + writer INVALID/LINK; port truncates NELM AND the data, writer NO_ALARM. Same hole for subArray.MALM. caput WF.NELM correctly refused (descriptors right; the gate is missing from the one owner every internal write crosses).
+### R16-80: subArray NELM/INDX are pp(TRUE) — a put must process; the port stores without processing (NELM put empties VAL) — Medium. waveform.rs:1008-1015 (NELM → zeroed realloc), :1059-1071 (INDX store only), nothing routes to put_driven_process vs subArrayRecord.dbd.pod pp(TRUE) → dbPutField → process → read_sa re-slices. C: NELM=2 → NORD=2 VAL=[1,2]; INDX=5 → VAL=[6,7]. Port: NELM=2 → NORD=0 VAL=[]; INDX=5 → stale window.
+### R16-81: histogram has no SVL input link — C's only soft input path — and uses a nonexistent INP instead — **High**. histogram.rs:158-215 (HISTOGRAM_FIELDS lacks SVL; driven from common INP, processing.rs:4911-4950) vs histogramRecord.dbd.pod:212 (field(SVL,DBF_INLINK); NO INP field) + devHistogramSoft.c:44 (constant SVL seeds SGNL at init), :51-55 (dbGetLink(&prec->svl) every process). record(histogram){field(SVL,"MYSIG")} → stderr "field not found: SVL", record inert (only external caput to SGNL feeds it); port's INP form rejected by C's dbd — databases unportable both directions.
+### R16-82: the initial UDF severity is never applied — every never-processed record advertises NO_ALARM; MS propagates nothing at startup — **High**. No port equivalent of iocInit.c:521-523 (initRecordInstance: if (udf && stat==UDF_ALARM) sevr = udfs) + dbCommon.dbd.pod:296-301 (STAT initial("UDF"), UDFS default INVALID). Fresh record: C STAT=UDF SEVR=INVALID; port 0/0 with UDF=1. Consumer linked MS to a not-yet-processed record inherits INVALID/LINK in C, NOTHING in the port — the IOC-startup ordering case MS exists for. Control verified: MS itself works once the source has processed.
+### R16-83: a constant DOL seeds VAL but does not clear UDF at init — Low. Constant-DOL seed lands VAL for ao/longout/mbbo/dfanout but leaves UDF=1 vs aoRecord.c:112-113, longoutRecord.c:113, mbboRecord.c:133, int64outRecord.c:110, dfanoutRecord.c:105 (if (recGblInitConstantLink) prec->udf = FALSE). Confined to the pre-first-process window (port clears UDF at process, no UDF alarm raised — verified); combined with R16-82 it is what a client sees at startup.
+
+### Notes
+- Not filed (Round 16 NOT-REAL adjudications): sseq SELM/SELN + active
+  list + abort machine match C; R15-77 "un-alarmed" (C also leaves
+  SEVR/STAT uncommitted); subArray NELM=1 seeding (C does not seed);
+  "[1,2,3] PP" as array constant (C: CA_LINK — bracket test needs
+  trailing ']'); stringout DOL="hi" seeding (C: PV_LINK, never seeds);
+  ao/longout/mbbo/dfanout constant-DOL re-apply (port matches C);
+  SPC_NOMOD for CA clients (enforced); swait INPA (swait has INAN..INLN
+  — auditor's own probe error); sync_io empty-drvInfo skip, failed-create
+  reason zeroing, param addr collapse, double @asynMask (all D, above).
+- B's housekeeping: stray softIoc/softioc-rs test processes may hold
+  port 5064 (timeout-bounded; B stopped kill attempts after pgrep kept
+  matching its own shell wrapper).
+- Thematic cluster: 9 of 24 findings (R16-61/62/76/77/78/79/80/82/83)
+  sit in the LINK layer's init/read/write ownership — the same
+  structural seam waves 12-13 worked. The link classifier (R16-78), the
+  init-seed owner (R16-77/76/83), and the dbPut owner (R16-79) are the
+  three primitives to close.

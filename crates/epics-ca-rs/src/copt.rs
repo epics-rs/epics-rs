@@ -389,16 +389,20 @@ pub fn scan_u64(s: &str) -> Option<u64> {
 
 /// C `epicsScanDouble` (`epicsStdlib.h:203`) = `!epicsParseDouble(str, to, NULL)`.
 ///
-/// `epicsParseDouble` (`epicsStdlib.c`) skips leading whitespace, runs
-/// `strtod`, skips trailing whitespace, and REJECTS any extraneous
+/// `epicsParseDouble` (`epicsStdlib.c:149-176`) skips leading whitespace,
+/// runs `strtod`, skips trailing whitespace, and REJECTS any extraneous
 /// character. So — unlike the digit scanners above — `"3x"` is a FAILURE
 /// here, while `" 3 "` succeeds. `-w` is the only option that uses it.
+///
+/// It is `strtod`, not `str::parse::<f64>()`, and the two differ at both
+/// ends: `strtod` ACCEPTS C99 hex floats (`caget -w 0x10` is a 16 s
+/// timeout in C; the port used to reject it, fall back to 1 s, and print a
+/// spurious warning) and REJECTS `ERANGE` (`caget -w 1e400` warns "not a
+/// valid timeout" in C; the port used to accept the infinity and swallow it
+/// downstream). Both come from the shared [`crate::estdlib`] core, which
+/// is also what every env-derived double goes through.
 pub fn scan_double(s: &str) -> Option<f64> {
-    let t = s.trim_matches(|c: char| c.is_ascii_whitespace());
-    if t.is_empty() {
-        return None;
-    }
-    t.parse::<f64>().ok()
+    crate::estdlib::epics_scan_double(s)
 }
 
 /// The outcome of C's `-0<base>` / `-l<base>` getopt case: the base that
@@ -1043,7 +1047,9 @@ mod tests {
     }
 
     /// `epicsParseDouble` rejects extraneous characters — the ONE scanner
-    /// that is stricter than `sscanf`.
+    /// that is stricter than `sscanf` — and is `strtod`, so it takes hex
+    /// floats and rejects ERANGE. Every row probed against the compiled C
+    /// `caget -w`.
     #[test]
     fn scan_double_matches_epics_parse_double() {
         assert_eq!(scan_double(" 2.5 "), Some(2.5));
@@ -1054,6 +1060,23 @@ mod tests {
         );
         assert_eq!(scan_double("abc"), None);
         assert_eq!(scan_double(""), None);
+
+        // strtod takes C99 hex floats: `caget -w 0x10` waits 16 s in C.
+        assert_eq!(scan_double("0x10"), Some(16.0));
+        assert_eq!(scan_double("0X1p4"), Some(16.0));
+        assert_eq!(scan_double("-0x10"), Some(-16.0));
+
+        // ERANGE is a rejection, so `caget -w 1e400` WARNS in C rather than
+        // silently taking an infinite deadline.
+        assert_eq!(scan_double("1e400"), None, "epicsParseDouble: overflow");
+        assert_eq!(scan_double("-1e400"), None, "epicsParseDouble: overflow");
+        assert_eq!(scan_double("1e-400"), None, "epicsParseDouble: underflow");
+
+        // The `inf` / `nan` words leave errno clear, so C ACCEPTS them here
+        // (`-w inf` hangs; `-w nan` hangs). `cli::timeout_duration` holds
+        // the port's documented deviation for what to DO with them.
+        assert_eq!(scan_double("inf"), Some(f64::INFINITY));
+        assert!(scan_double("nan").unwrap().is_nan());
     }
 
     /// Observed on the compiled C `caget`: `-p -1` and `-p 500` both clamp

@@ -1,0 +1,114 @@
+//! Regression tests (R15-17): a `double`-valued EPICS env var that
+//! `epicsScanDouble` rejects is DIAGNOSED, not silently defaulted.
+//!
+//! C prints two lines from the call site on top of the one
+//! `envGetDoubleConfigParam` itself prints (`envSubr.c:205-206`):
+//!
+//! ```text
+//! Unable to find a real number in EPICS_CA_CONN_TMO=abc     <- envSubr.c
+//! EPICS "EPICS_CA_CONN_TMO" double fetch failed             <- cac.cpp:192
+//! Defaulting "EPICS_CA_CONN_TMO" = 30.000000                <- cac.cpp:193
+//! ```
+//!
+//! and, for the search period (`udpiiu.cpp:86-89`):
+//!
+//! ```text
+//! Unable to find a real number in EPICS_CA_MAX_SEARCH_PERIOD=abc
+//! EPICS "EPICS_CA_MAX_SEARCH_PERIOD" wasn't a real number
+//! Setting "EPICS_CA_MAX_SEARCH_PERIOD" = 300.000000 seconds
+//! ```
+//!
+//! The port resolved both silently. The values themselves (default on
+//! reject, `0x10` → 16, `1e400` → reject) are pinned by the per-boundary
+//! unit tests in `client::transport` and `server::tcp`.
+
+use std::process::Command;
+
+/// stderr of `caget-rs` for a PV that does not exist — the tool still
+/// builds its client, which is where both variables are resolved. `-w 0.1`
+/// keeps the failed search short.
+fn caget_stderr(var: &str, value: &str) -> String {
+    let out = Command::new(env!("CARGO_BIN_EXE_caget-rs"))
+        .args(["-w", "0.1", "R15-17:NO-SUCH-PV"])
+        .env(var, value)
+        // Keep the run off any real network: no broadcast, no name server.
+        .env("EPICS_CA_AUTO_ADDR_LIST", "NO")
+        .env("EPICS_CA_ADDR_LIST", "127.0.0.1")
+        .output()
+        .expect("spawn caget-rs");
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+#[test]
+fn conn_tmo_reject_prints_cs_three_lines() {
+    let err = caget_stderr("EPICS_CA_CONN_TMO", "abc");
+    for line in [
+        "Unable to find a real number in EPICS_CA_CONN_TMO=abc",
+        "EPICS \"EPICS_CA_CONN_TMO\" double fetch failed",
+        "Defaulting \"EPICS_CA_CONN_TMO\" = 30.000000",
+    ] {
+        assert!(err.contains(line), "missing {line:?} in stderr:\n{err}");
+    }
+}
+
+/// An ERANGE value is a reject too — `strtod("1e400")` sets `errno`, so
+/// `epicsParseDouble` fails where the bare `inf` word succeeds.
+#[test]
+fn conn_tmo_erange_prints_the_same_lines() {
+    let err = caget_stderr("EPICS_CA_CONN_TMO", "1e400");
+    assert!(
+        err.contains("Unable to find a real number in EPICS_CA_CONN_TMO=1e400")
+            && err.contains("EPICS \"EPICS_CA_CONN_TMO\" double fetch failed"),
+        "stderr:\n{err}"
+    );
+}
+
+/// `inf` is a value C ACCEPTS (errno stays clear), so it must be silent —
+/// and must not abort the tool, which is what it used to do.
+#[test]
+fn conn_tmo_inf_is_accepted_silently() {
+    let err = caget_stderr("EPICS_CA_CONN_TMO", "inf");
+    assert!(
+        !err.contains("double fetch failed") && !err.contains("Unable to find a real number"),
+        "inf is a valid double for strtod; no diagnostic is due:\n{err}"
+    );
+    assert!(
+        !err.contains("cannot convert float seconds to Duration"),
+        "the from_secs_f64 panic must be gone:\n{err}"
+    );
+}
+
+/// Hex floats are `strtod`'s to accept: no diagnostic for `0x10`.
+#[test]
+fn conn_tmo_hex_float_is_accepted_silently() {
+    let err = caget_stderr("EPICS_CA_CONN_TMO", "0x10");
+    assert!(
+        !err.contains("Unable to find a real number"),
+        "strtod(\"0x10\") is 16.0:\n{err}"
+    );
+}
+
+#[test]
+fn max_search_period_reject_prints_cs_lines() {
+    let err = caget_stderr("EPICS_CA_MAX_SEARCH_PERIOD", "abc");
+    for line in [
+        "Unable to find a real number in EPICS_CA_MAX_SEARCH_PERIOD=abc",
+        "EPICS \"EPICS_CA_MAX_SEARCH_PERIOD\" wasn't a real number",
+        "Setting \"EPICS_CA_MAX_SEARCH_PERIOD\" = 300.000000 seconds",
+    ] {
+        assert!(err.contains(line), "missing {line:?} in stderr:\n{err}");
+    }
+}
+
+/// C `udpiiu.cpp:78-83`: a value under the 60 s lower limit is named and
+/// clamped, not silently raised.
+#[test]
+fn max_search_period_below_lower_limit_is_named() {
+    let err = caget_stderr("EPICS_CA_MAX_SEARCH_PERIOD", "30");
+    for line in [
+        "\"EPICS_CA_MAX_SEARCH_PERIOD\" out of range (low)",
+        "Setting \"EPICS_CA_MAX_SEARCH_PERIOD\" = 60.000000 seconds",
+    ] {
+        assert!(err.contains(line), "missing {line:?} in stderr:\n{err}");
+    }
+}

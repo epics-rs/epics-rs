@@ -170,17 +170,40 @@ const MAX_SEARCH_PERIOD_LOWER_LIMIT_SECS: f64 = 60.0;
 /// C does not reject negative or zero values — they pass `parse` and
 /// are caught by the `< 60` lower-limit clamp — so this mirrors C by
 /// clamping rather than filtering.
+///
+/// Resolved once per process (C `udpiiu`'s constructor calls `getMaxPeriod`
+/// once and keeps the result): a second read could pick up a mutated
+/// environment and would repeat the diagnostics below.
 fn max_search_period_secs() -> f64 {
-    match epics_base_rs::runtime::env::get("EPICS_CA_MAX_SEARCH_PERIOD") {
-        Some(raw) => match raw.parse::<f64>() {
-            // Parsed: honour it, clamped up to C's 60 s lower limit.
-            Ok(v) => v.max(MAX_SEARCH_PERIOD_LOWER_LIMIT_SECS),
-            // Not a real number: C keeps the default, no clamp.
-            Err(_) => MAX_SEARCH_PERIOD_DEFAULT_SECS,
-        },
-        // Unset: documented C default.
-        None => MAX_SEARCH_PERIOD_DEFAULT_SECS,
+    static RESOLVED: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *RESOLVED.get_or_init(resolve_max_search_period_secs)
+}
+
+/// The uncached resolution behind [`max_search_period_secs`].
+fn resolve_max_search_period_secs() -> f64 {
+    const NAME: &str = "EPICS_CA_MAX_SEARCH_PERIOD";
+    let v = match crate::estdlib::env_double(NAME) {
+        Ok(v) => v,
+        // Unset: C reads the compiled "300.0" default string, silently.
+        Err(crate::estdlib::EnvDoubleError::Unset) => return MAX_SEARCH_PERIOD_DEFAULT_SECS,
+        // C `getMaxPeriod` (`udpiiu.cpp:85-90`), verbatim.
+        Err(crate::estdlib::EnvDoubleError::Invalid(_)) => {
+            eprintln!("EPICS \"{NAME}\" wasn't a real number");
+            eprintln!("Setting \"{NAME}\" = {MAX_SEARCH_PERIOD_DEFAULT_SECS:.6} seconds");
+            return MAX_SEARCH_PERIOD_DEFAULT_SECS;
+        }
+    };
+    // C `udpiiu.cpp:78-83`: below the 60 s lower limit, say so and clamp.
+    // NaN takes this branch too — C's `maxPeriod < lowerLimit` is false for
+    // it and C then drives its timer wheel off a NaN period; clamping is the
+    // one deviation here, because a NaN tick would stop the client searching
+    // altogether.
+    if v.is_nan() || v < MAX_SEARCH_PERIOD_LOWER_LIMIT_SECS {
+        eprintln!("\"{NAME}\" out of range (low)");
+        eprintln!("Setting \"{NAME}\" = {MAX_SEARCH_PERIOD_LOWER_LIMIT_SECS:.6} seconds");
+        return MAX_SEARCH_PERIOD_LOWER_LIMIT_SECS;
     }
+    v
 }
 
 /// Normal tick cadence. Rust's search model is structurally
@@ -214,8 +237,13 @@ fn max_search_period_secs() -> f64 {
 /// becomes a goal, the fix is an RTT-derived early-retry path for
 /// `Initial` searches, not a change to this normal-cadence tick.
 fn normal_tick() -> Duration {
-    let period_secs = max_search_period_secs();
-    Duration::from_secs_f64(period_secs / N_SEARCH_BUCKETS as f64)
+    normal_tick_for(max_search_period_secs())
+}
+
+/// `tick = period / N_SEARCH_BUCKETS`, split out so the env-boundary tests
+/// can drive it from an uncached period.
+fn normal_tick_for(period_secs: f64) -> Duration {
+    crate::estdlib::duration_from_secs(period_secs / N_SEARCH_BUCKETS as f64)
 }
 
 /// Fast-mode tick cadence after a beacon poke. One full bucket
@@ -1619,35 +1647,44 @@ mod tests {
         // historical Rust 30 s). tick = 300/30 = 10 s.
         unsafe { std::env::remove_var("EPICS_CA_MAX_SEARCH_PERIOD") };
         assert_eq!(
-            max_search_period_secs(),
+            resolve_max_search_period_secs(),
             300.0,
             "unset env must default to C's 300 s, not the old 30 s"
         );
-        assert_eq!(normal_tick(), Duration::from_secs(10));
+        assert_eq!(
+            normal_tick_for(resolve_max_search_period_secs()),
+            Duration::from_secs(10)
+        );
 
         // Configured value below the 60 s lower limit → clamped up
         // to 60 s (C `maxPeriod < maxSearchPeriodLowerLimit`).
         unsafe { std::env::set_var("EPICS_CA_MAX_SEARCH_PERIOD", "45") };
         assert_eq!(
-            max_search_period_secs(),
+            resolve_max_search_period_secs(),
             60.0,
             "a configured 45 s must clamp UP to C's 60 s lower bound"
         );
-        assert_eq!(normal_tick(), Duration::from_secs(2));
+        assert_eq!(
+            normal_tick_for(resolve_max_search_period_secs()),
+            Duration::from_secs(2)
+        );
 
         // Configured value at/above the lower limit → honoured.
         unsafe { std::env::set_var("EPICS_CA_MAX_SEARCH_PERIOD", "120") };
-        assert_eq!(max_search_period_secs(), 120.0);
-        assert_eq!(normal_tick(), Duration::from_secs(4));
+        assert_eq!(resolve_max_search_period_secs(), 120.0);
+        assert_eq!(
+            normal_tick_for(resolve_max_search_period_secs()),
+            Duration::from_secs(4)
+        );
 
         // The documented C default expressed explicitly.
         unsafe { std::env::set_var("EPICS_CA_MAX_SEARCH_PERIOD", "300") };
-        assert_eq!(max_search_period_secs(), 300.0);
+        assert_eq!(resolve_max_search_period_secs(), 300.0);
 
         // Non-numeric value → C keeps the default (longStatus != 0).
         unsafe { std::env::set_var("EPICS_CA_MAX_SEARCH_PERIOD", "not-a-number") };
         assert_eq!(
-            max_search_period_secs(),
+            resolve_max_search_period_secs(),
             300.0,
             "a non-numeric value must fall back to the 300 s default"
         );
@@ -1656,12 +1693,12 @@ mod tests {
         // parse and are caught by the lower-bound clamp.
         unsafe { std::env::set_var("EPICS_CA_MAX_SEARCH_PERIOD", "-5") };
         assert_eq!(
-            max_search_period_secs(),
+            resolve_max_search_period_secs(),
             60.0,
             "a negative value must clamp to the 60 s lower bound, not default"
         );
         unsafe { std::env::set_var("EPICS_CA_MAX_SEARCH_PERIOD", "0") };
-        assert_eq!(max_search_period_secs(), 60.0);
+        assert_eq!(resolve_max_search_period_secs(), 60.0);
 
         // Restore the environment for any later serial test.
         match restore {

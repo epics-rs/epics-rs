@@ -30,6 +30,10 @@ pub struct CasUdpConfig {
     pub mcast_addrs: Vec<Ipv4Addr>,
 }
 
+/// C `online_notify.c:59` — the beacon period RSRV falls back to, and the
+/// number its diagnostic prints. Same 15 s as [`CasUdpConfig::default`].
+const DEFAULT_BEACON_PERIOD_SECS: f64 = 15.0;
+
 impl Default for CasUdpConfig {
     fn default() -> Self {
         Self {
@@ -238,13 +242,36 @@ pub fn from_env() -> CaResult<CasUdpConfig> {
     // in a soak test) gets raised against the operator's wishes.
     // Match C: accept any strictly-positive parsed value as-is;
     // fall back to default for parse-failure or non-positive.
-    let raw_period = epics_base_rs::runtime::env::get("EPICS_CAS_BEACON_PERIOD")
-        .or_else(|| epics_base_rs::runtime::env::get("EPICS_CA_BEACON_PERIOD"));
-    if let Some(period) = raw_period.and_then(|s| s.parse::<f64>().ok()) {
-        if period > 0.0 && period.is_finite() {
-            cfg.beacon_period = Duration::from_secs_f64(period);
+    //
+    // The fallback is C's `envGetConfigParamPtr` PRESENCE test, not a
+    // parse-success test: an invalid `EPICS_CAS_BEACON_PERIOD` does not
+    // silently promote the legacy var. Parsing and the `Duration`
+    // conversion are `crate::estdlib` (C `epicsScanDouble`), so `inf` is
+    // an accepted — never-firing — period rather than a panic, and NaN
+    // (which fails `> 0.0`, like every C comparison against it) keeps
+    // the default.
+    let name = if crate::estdlib::env_raw("EPICS_CAS_BEACON_PERIOD").is_some() {
+        "EPICS_CAS_BEACON_PERIOD"
+    } else {
+        "EPICS_CA_BEACON_PERIOD"
+    };
+    match crate::estdlib::env_double(name) {
+        Ok(period) if period > 0.0 => {
+            cfg.beacon_period = crate::estdlib::duration_from_secs(period);
         }
-        // else: keep default (15s) — matches C's `maxPeriod <= 0.0` branch.
+        // Unset: C reads the compiled "15.0" default of the legacy var,
+        // silently. Keep the default period, print nothing.
+        Err(crate::estdlib::EnvDoubleError::Unset) => {}
+        // Parse failure OR `<= 0.0` — C `online_notify.c:58-64`. C names
+        // EPICS_CAS_BEACON_PERIOD in both lines even when the value it
+        // fetched came from the deprecated var, so this does too.
+        _ => {
+            eprintln!("EPICS \"EPICS_CAS_BEACON_PERIOD\" float fetch failed");
+            eprintln!(
+                "Setting \"EPICS_CAS_BEACON_PERIOD\" = {:.6}",
+                DEFAULT_BEACON_PERIOD_SECS
+            );
+        }
     }
 
     Ok(cfg)

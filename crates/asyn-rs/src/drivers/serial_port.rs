@@ -793,10 +793,12 @@ impl PortDriver for DrvAsynSerialPort {
         Ok(())
     }
 
-    fn report(&self, level: i32) {
+    fn report(&self, out: &mut dyn std::fmt::Write, level: i32) {
+        use std::fmt::Write as _;
         // C parity (drvAsynSerialPort.c:666-680): report the connection state,
         // and at details>=1 the fd plus cumulative bytes written/read.
-        eprintln!(
+        let _ = writeln!(
+            out,
             "Serial line {}: {}",
             self.device,
             if self.base.is_connected() {
@@ -806,10 +808,10 @@ impl PortDriver for DrvAsynSerialPort {
             }
         );
         if level >= 1 {
-            eprintln!("                    fd: {}", self.io.fd.unwrap_or(-1));
-            eprintln!("    Characters written: {}", self.io.n_written);
-            eprintln!("       Characters read: {}", self.io.n_read);
-            self.base.report_params(level.saturating_sub(1));
+            let _ = writeln!(out, "                    fd: {}", self.io.fd.unwrap_or(-1));
+            let _ = writeln!(out, "    Characters written: {}", self.io.n_written);
+            let _ = writeln!(out, "       Characters read: {}", self.io.n_read);
+            self.base.report_params(out, level.saturating_sub(1));
         }
     }
 
@@ -2779,7 +2781,8 @@ mod tests {
         assert_eq!(drv.io.n_read, n as u64, "n_read must track bytes read");
 
         // report() must not panic at any level.
-        drv.report(0);
-        drv.report(2);
+        let mut out = String::new();
+        drv.report(&mut out, 0);
+        drv.report(&mut out, 2);
     }
 }

@@ -581,13 +581,21 @@ impl PortActor {
     /// interfaces are gone. Disabled and disconnected are *not* such states: they
     /// report, as `enabled:No` / `connected:No`.
     fn report_port(&self, details: i32) {
-        eprint!("{}", self.manager_report(details));
+        use std::io::Write as _;
+        let mut out = self.manager_report(details);
         // C ends by calling the port's `asynCommon->report` (:1113-1122) — the
         // driver's own detail, and only that. A destroyed port's interfaces are
         // gone, so C never reaches it (:1038-1042).
         if !self.driver.base().is_defunct() {
-            self.driver.report(details.abs());
+            self.driver.report(&mut out, details.abs());
         }
+        // The one place the report picks a stream, and it picks the one C picks:
+        // `asynReport` passes `stdout` to `pasynManager->report`
+        // (asynShellCommands.c:589). The report is an answer to an operator's
+        // iocsh question, so it belongs on the shell's output stream, where a
+        // `>` redirect captures it — not on stderr with the diagnostics.
+        print!("{out}");
+        let _ = std::io::stdout().flush();
     }
 
     /// The text of C's manager block — [`Self::report_port`] is what prints it.
@@ -700,7 +708,12 @@ impl PortActor {
                         out,
                         "    addr {} autoConnect {} enabled {} connected {} exceptionActive {}",
                         addr,
-                        yn(base.auto_connect),
+                        // The *device's* autoConnect, which is what C prints here
+                        // (`pdpc = &pdevice->dpc`, asynManager.c:1084-1089) — the
+                        // port's own is on the header line. `asynAutoConnect(port,
+                        // addr, 0)` turns off one device's auto-connect, and the
+                        // report has to be able to say so.
+                        yn(ds.auto_connect),
                         yn(ds.enabled),
                         yn(ds.connected),
                         yn(false)
@@ -1785,6 +1798,18 @@ mod tests {
     /// Take a port through C's `shutdownPort` (asynManager.c:2251-2308) — the
     /// only way to reach the defunct state, which is what keeps the invariant
     /// `defunct ⟹ !enabled` true by construction (R15-50).
+    /// A driver that is nothing but its base — for the tests that assert on what
+    /// the *manager* prints or checks, where the driver's own behaviour is noise.
+    struct TestDriverBase(PortDriverBase);
+    impl PortDriver for TestDriverBase {
+        fn base(&self) -> &PortDriverBase {
+            &self.0
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.0
+        }
+    }
+
     fn shut_down(base: &mut PortDriverBase) {
         base.flags.destructible = true;
         base.shutdown_lifecycle().unwrap();
@@ -3638,7 +3663,7 @@ mod tests {
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.base
             }
-            fn report(&self, _level: i32) {
+            fn report(&self, _out: &mut dyn std::fmt::Write, _level: i32) {
                 self.reports
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
@@ -3684,6 +3709,177 @@ mod tests {
             reports.load(std::sync::atomic::Ordering::SeqCst),
             0,
             "a destroyed port prints \"<name> destroyed\"; its driver is not called"
+        );
+    }
+
+    /// R15-51: the per-address line prints the *device's* autoConnect. C reads it
+    /// from the device's own dpCommon (`pdpc = &pdevice->dpc`, asynManager.c:1084-1089);
+    /// the port's is on the header line. Printing the port's on both makes
+    /// `asynAutoConnect(port, addr, 0)` invisible to the report.
+    ///
+    /// Two boundaries: a device whose auto-connect was turned off individually, and
+    /// a device created on a port that has auto-connect off — C seeds a new device
+    /// from the port (`dpCommonInit(pport, pdevice, pport->dpc.autoConnect)`, :584).
+    #[test]
+    fn the_per_address_line_prints_the_devices_auto_connect() {
+        let build = |port_auto_connect: bool| {
+            let mut base = PortDriverBase::new(
+                "ac_rep",
+                4,
+                PortFlags {
+                    multi_device: true,
+                    ..PortFlags::default()
+                },
+            );
+            base.auto_connect = port_auto_connect;
+            base.device_state(0);
+            base.device_state(1);
+            let (_tx, rx) = mpsc::channel(1);
+            (PortActor::new(Box::new(TestDriverBase(base)), rx), _tx)
+        };
+
+        // Boundary 1: the port auto-connects, one device does not.
+        let (mut actor, _tx) = build(true);
+        actor.driver.base_mut().set_auto_connect_addr(1, false);
+        let r = actor.manager_report(1);
+        assert!(
+            r.lines().next().unwrap().ends_with("autoConnect:Yes"),
+            "the header line is the port's autoConnect: {r}"
+        );
+        assert!(
+            r.contains("addr 0 autoConnect Yes"),
+            "addr 0 still auto-connects: {r}"
+        );
+        assert!(
+            r.contains("addr 1 autoConnect No"),
+            "addr 1's own autoConnect must print, not the port's: {r}"
+        );
+
+        // Boundary 2: a manual-connect port — every device it creates inherits No.
+        let (actor, _tx) = build(false);
+        let r = actor.manager_report(1);
+        assert!(
+            r.contains("addr 0 autoConnect No") && r.contains("addr 1 autoConnect No"),
+            "a device of a manual-connect port must not claim autoConnect Yes: {r}"
+        );
+    }
+
+    /// R15-51: the driver block is C++ `asynPortDriver::report`
+    /// (asynPortDriver.cpp:3676-3710) — a Timestamp line, the EOS pair *only* when
+    /// the driver registered `asynOctet` (:3685), and at `details >= 3` the
+    /// interrupt clients (:3695-3708).
+    #[test]
+    fn the_default_driver_block_is_asyn_port_drivers() {
+        use crate::interfaces::{Capability, InterfaceType};
+        use crate::interrupt::InterruptFilter;
+
+        struct Drv(PortDriverBase, Vec<Capability>);
+        impl PortDriver for Drv {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+            fn capabilities(&self) -> Vec<Capability> {
+                self.1.clone()
+            }
+        }
+
+        let build = |caps: Vec<Capability>| {
+            let mut base = PortDriverBase::new("drv_rep", 1, PortFlags::default());
+            base.create_param("VAL", ParamType::Int32).unwrap();
+            let mut drv = Drv(base, caps);
+            drv.set_input_eos(&AsynUser::default(), b"\r\n").unwrap();
+            drv
+        };
+
+        // No octet interface → no EOS lines. C reads them off
+        // `pasynStdInterfaces->octet.pinterface`, which such a port never set.
+        let int32_only = build(vec![Capability::Int32Read]);
+        let mut out = String::new();
+        int32_only.report(&mut out, 1);
+        assert!(out.starts_with("Port: drv_rep\n"), "{out}");
+        assert!(
+            out.contains("  Timestamp: "),
+            "C prints the port's timestamp at details >= 1 (:3682-3684): {out}"
+        );
+        assert!(
+            !out.contains("EOS["),
+            "a port with no octet interface has no EOS to report: {out}"
+        );
+        assert!(out.contains("  Number of parameters is 1"), "{out}");
+
+        // details 0: the port line and nothing else (C :3678-3679).
+        let mut out0 = String::new();
+        int32_only.report(&mut out0, 0);
+        assert_eq!(out0, "Port: drv_rep\n");
+
+        // An octet port reports the terminators it actually has.
+        let octet = build(crate::interfaces::octet_transport_capabilities());
+        let mut out = String::new();
+        octet.report(&mut out, 1);
+        assert!(
+            out.contains("  Input EOS[2]: \\r\\n") && out.contains("  Output EOS[0]: "),
+            "an octet port prints its EOS pair: {out}"
+        );
+
+        // details >= 3: one line per interrupt client, and none below 3.
+        let with_client = build(vec![Capability::Int32Read]);
+        let (_sub, _rx) = with_client
+            .0
+            .interrupts
+            .register_interrupt_user(InterruptFilter {
+                reason: Some(0),
+                addr: Some(0),
+                iface: Some(InterfaceType::Int32),
+                ..InterruptFilter::default()
+            });
+        let mut out2 = String::new();
+        with_client.report(&mut out2, 2);
+        assert!(
+            !out2.contains("callback client"),
+            "C gates the interrupt block on details >= 3: {out2}"
+        );
+        let mut out3 = String::new();
+        with_client.report(&mut out3, 3);
+        assert!(
+            out3.contains("    int32 callback client addr=0, reason=0"),
+            "C's reportInterrupt line for the registered client: {out3}"
+        );
+    }
+
+    /// R15-51: `asynReport` writes to stdout. C's `asynReport` passes `stdout` to
+    /// `pasynManager->report` (asynShellCommands.c:589) — it is an answer to an
+    /// iocsh question, so `asynReport 1 port > file` captures it. The Rust actor
+    /// printed it to stderr, where a shell redirect misses it.
+    #[cfg(unix)]
+    #[test]
+    fn asyn_report_writes_to_stdout() {
+        use std::os::fd::AsRawFd as _;
+
+        let base = PortDriverBase::new("stdout_rep", 1, PortFlags::default());
+        let (_tx, rx) = mpsc::channel(1);
+        let actor = PortActor::new(Box::new(TestDriverBase(base)), rx);
+
+        // nextest runs each test in its own process, so redirecting fd 1 for the
+        // duration of the call cannot disturb another test.
+        let path = std::env::temp_dir().join(format!("asyn_report_stdout_{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        unsafe {
+            let saved = libc::dup(1);
+            assert!(saved >= 0);
+            assert!(libc::dup2(file.as_raw_fd(), 1) >= 0);
+            actor.report_port(0);
+            assert!(libc::dup2(saved, 1) >= 0);
+            libc::close(saved);
+        }
+        drop(file);
+        let captured = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            captured.contains("stdout_rep multiDevice:No") && captured.contains("Port: stdout_rep"),
+            "the manager block and the driver block both belong on stdout: {captured:?}"
         );
     }
 

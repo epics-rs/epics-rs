@@ -104,6 +104,28 @@ impl InterfaceType {
             Self::Common => "asynCommon",
         }
     }
+
+    /// The name C's `reportInterrupt` prints for this interface's client list
+    /// (asynPortDriver.cpp:3697-3708) — the short label, not the interface name.
+    /// The interfaces C keeps no interrupt list for fall back to the interface
+    /// name, since there is no C text to be faithful to.
+    pub fn interrupt_label(&self) -> &'static str {
+        match self {
+            Self::Int32 => "int32",
+            Self::Int64 => "int64",
+            Self::UInt32Digital => "uint32",
+            Self::Float64 => "float64",
+            Self::Octet => "octet",
+            Self::Int8Array => "int8Array",
+            Self::Int16Array => "int16Array",
+            Self::Int32Array => "int32Array",
+            Self::Float32Array => "float32Array",
+            Self::Float64Array => "float64Array",
+            Self::GenericPointer => "genericPointer",
+            Self::Enum => "Enum",
+            other => other.asyn_name(),
+        }
+    }
 }
 
 impl std::fmt::Display for InterfaceType {

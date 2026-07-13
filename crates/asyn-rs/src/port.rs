@@ -812,8 +812,21 @@ impl PortDriverBase {
     }
 
     /// Get or create a device state for the given address.
+    ///
+    /// A device created here inherits the port's `auto_connect`, as C's
+    /// `locateDevice` does: `dpCommonInit(pport, pdevice, pport->dpc.autoConnect)`
+    /// (asynManager.c:584). Defaulting it to `true` on a manual-connect port
+    /// would make `asynReport`'s per-device `autoConnect Yes` a lie, and would
+    /// hand `autoConnectDevice` a device it may reconnect on a port whose
+    /// operator turned auto-connect off.
     pub fn device_state(&mut self, addr: i32) -> &mut DeviceState {
-        self.device_states.entry(addr).or_default()
+        let port_auto_connect = self.auto_connect;
+        self.device_states
+            .entry(addr)
+            .or_insert_with(|| DeviceState {
+                auto_connect: port_auto_connect,
+                ..DeviceState::default()
+            })
     }
 
     /// Check if a specific device address is connected.
@@ -1026,9 +1039,11 @@ impl PortDriverBase {
         self.params.get_param_status(index, addr)
     }
 
-    /// Detailed parameter report matching C asynPortDriver::reportParams.
-    pub fn report_params(&self, level: i32) {
-        eprintln!("  Number of parameters is {}", self.params.len());
+    /// Detailed parameter report matching C asynPortDriver::reportParams, written
+    /// to the stream the caller names (C's `FILE *fp`).
+    pub fn report_params(&self, out: &mut dyn std::fmt::Write, level: i32) {
+        use std::fmt::Write as _;
+        let _ = writeln!(out, "  Number of parameters is {}", self.params.len());
         if level < 1 {
             return;
         }
@@ -1050,12 +1065,13 @@ impl PortDriverBase {
                         .params
                         .get_param_status(i, addr as i32)
                         .unwrap_or((AsynStatus::Success, 0, 0));
-                    eprintln!(
+                    let _ = writeln!(
+                        out,
                         "  param[{i}] name={name} type={ptype} addr={addr} val={val} status={status:?} alarm=({alarm_st},{alarm_sev})"
                     );
                 }
             } else {
-                eprintln!("  param[{i}] name={name} type={ptype}");
+                let _ = writeln!(out, "  param[{i}] name={name} type={ptype}");
             }
         }
     }
@@ -1276,6 +1292,42 @@ impl DrvUserInfo {
 /// the port is always behind `Arc<Mutex<dyn PortDriver>>`, so callers hold the
 /// parking_lot mutex directly. For multi-request exclusive access, use
 /// `BlockProcess`/`UnblockProcess` via the worker queue.
+/// C `epicsTimeToStrftime(buff, ..., "%Y/%m/%d %H:%M:%S.%03f", &timeStamp)` —
+/// the port timestamp line of `asynPortDriver::report` (asynPortDriver.cpp:3682-3684).
+/// Local time, as `epicsTimeToStrftime` renders it.
+fn format_timestamp(ts: SystemTime) -> String {
+    chrono::DateTime::<chrono::Local>::from(ts)
+        .format("%Y/%m/%d %H:%M:%S%.3f")
+        .to_string()
+}
+
+/// C's `details >= 3` block: one line per registered interrupt client
+/// (`reportInterrupt`, asynPortDriver.cpp:1870-1894, called once per interface at
+/// :3695-3708). C prints the callback and userPvt pointers with each client; Rust
+/// mailboxes have no such pointers, so the line carries what identifies a client
+/// here — the interface it bound, the address and reason it filtered on, and the
+/// uint32 mask when it set one.
+fn report_interrupt_clients(out: &mut dyn std::fmt::Write, base: &PortDriverBase) {
+    use std::fmt::Write as _;
+    for f in base.interrupts.clients() {
+        let iface = f
+            .iface
+            .map_or("any", |i: crate::interfaces::InterfaceType| {
+                i.interrupt_label()
+            });
+        let addr = f.addr.map_or("any".to_string(), |a| a.to_string());
+        let reason = f.reason.map_or("any".to_string(), |r| r.to_string());
+        let _ = write!(
+            out,
+            "    {iface} callback client addr={addr}, reason={reason}"
+        );
+        if let Some(mask) = f.uint32_mask {
+            let _ = write!(out, ", mask=0x{mask:x}");
+        }
+        let _ = writeln!(out);
+    }
+}
+
 pub trait PortDriver: Send + Sync + 'static {
     fn base(&self) -> &PortDriverBase;
     fn base_mut(&mut self) -> &mut PortDriverBase;
@@ -1354,33 +1406,64 @@ pub trait PortDriver: Send + Sync + 'static {
     /// here would give the operator two answers to the same question, from two
     /// owners, with no rule for which one wins.
     ///
-    /// The default is C++ `asynPortDriver::report` (asynPortDriver.cpp:3677-3694):
-    /// the port name, and at `details >= 1` the EOS terminators and the parameter
-    /// library.
-    fn report(&self, level: i32) {
+    /// The default is C++ `asynPortDriver::report` (asynPortDriver.cpp:3676-3710):
+    /// the port name; at `details >= 1` the timestamp, the EOS terminators *if the
+    /// driver registered the octet interface* (`pasynStdInterfaces->octet.pinterface`,
+    /// :3685) and the parameter library; at `details >= 3` the interrupt clients
+    /// (:3695-3708).
+    ///
+    /// The report goes to `out`, C's `FILE *fp` — the driver never picks the
+    /// stream. [`crate::port_actor::PortActor::report_port`] is the one owner that
+    /// does, and it picks stdout, as `asynReport` does (asynShellCommands.c:589).
+    fn report(&self, out: &mut dyn std::fmt::Write, level: i32) {
+        use std::fmt::Write as _;
         let base = self.base();
-        eprintln!("Port: {}", base.port_name);
+        let _ = writeln!(out, "Port: {}", base.port_name);
         if level >= 1 {
-            let esc = |eos: &[u8]| {
-                eos.iter()
-                    .map(|b| match b {
-                        b'\r' => "\\r".to_string(),
-                        b'\n' => "\\n".to_string(),
-                        c => (*c as char).to_string(),
-                    })
-                    .collect::<String>()
-            };
-            let input = base.input_eos(0);
-            let output = base.output_eos(0);
-            eprintln!("  Input EOS[{}]: {}", input.len(), esc(input));
-            eprintln!("  Output EOS[{}]: {}", output.len(), esc(output));
-            base.report_params(level.saturating_sub(1));
+            let _ = writeln!(
+                out,
+                "  Timestamp: {}",
+                format_timestamp(base.current_timestamp())
+            );
+            // C prints the EOS pair only when the driver registered `asynOctet`
+            // (:3685) — on a port with no octet interface the two terminators are
+            // the constructor's zeroed fields, and reporting them invents an EOS
+            // the port cannot have.
+            if self.has_octet_interface() {
+                let esc = |eos: &[u8]| {
+                    eos.iter()
+                        .map(|b| match b {
+                            b'\r' => "\\r".to_string(),
+                            b'\n' => "\\n".to_string(),
+                            c => (*c as char).to_string(),
+                        })
+                        .collect::<String>()
+                };
+                let input = base.input_eos(0);
+                let output = base.output_eos(0);
+                let _ = writeln!(out, "  Input EOS[{}]: {}", input.len(), esc(input));
+                let _ = writeln!(out, "  Output EOS[{}]: {}", output.len(), esc(output));
+            }
+            base.report_params(out, level.saturating_sub(1));
         }
         if level >= 2 {
             for (k, v) in &base.options {
-                eprintln!("  option: {k} = {v}");
+                let _ = writeln!(out, "  option: {k} = {v}");
             }
         }
+        if level >= 3 {
+            report_interrupt_clients(out, base);
+        }
+    }
+
+    /// Whether this driver registered `asynOctet` — C's
+    /// `pasynStdInterfaces->octet.pinterface != NULL`, which is set from the
+    /// constructor's `interfaceMask` (asynPortDriver.cpp:1990). The Rust analogue
+    /// of that mask is [`Self::capabilities`].
+    fn has_octet_interface(&self) -> bool {
+        self.capabilities()
+            .iter()
+            .any(|c| c.interface_type() == crate::interfaces::InterfaceType::Octet)
     }
 
     // --- Scalar I/O (cache-based defaults, timeout not applicable) ---
@@ -2171,7 +2254,8 @@ mod tests {
             .unwrap();
         drv.base_mut().set_int32_param(0, 0, 42).unwrap();
         for level in 0..=3 {
-            drv.report(level);
+            let mut out = String::new();
+            drv.report(&mut out, level);
         }
     }
 

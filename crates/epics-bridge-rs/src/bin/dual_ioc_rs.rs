@@ -46,13 +46,15 @@ struct Args {
     #[arg(long = "macro", short = 'm')]
     macros: Vec<String>,
 
-    /// CA TCP port. Default: 5064.
-    #[arg(long, default_value_t = 5064)]
-    ca_port: u16,
+    /// CA TCP port. Omit to take `EPICS_CAS_SERVER_PORT`, then
+    /// `EPICS_CA_SERVER_PORT`, then 5064. `--ca-port 0` binds ephemeral.
+    #[arg(long)]
+    ca_port: Option<u16>,
 
-    /// PVA TCP port. Default: 5075.
-    #[arg(long, default_value_t = 5075)]
-    pva_port: u16,
+    /// PVA TCP port. Omit to take `EPICS_PVAS_SERVER_PORT`, then
+    /// `EPICS_PVA_SERVER_PORT`, then 5075. `--pva-port 0` binds ephemeral.
+    #[arg(long)]
+    pva_port: Option<u16>,
 
     /// Disable CA serving (PVA only).
     #[arg(long)]
@@ -170,19 +172,27 @@ async fn main() -> ExitCode {
     };
     let _ = autosave_cfg;
 
+    // Flag > EPICS environment > compiled default. `from_parts` takes a
+    // literal port, so the environment fallback is resolved here.
+    let ca_port = args
+        .ca_port
+        .unwrap_or_else(epics_base_rs::runtime::net::cas_server_port);
+    let pva_port = args
+        .pva_port
+        .unwrap_or_else(epics_pva_rs::config::env::pvas_server_port);
+
     let ca_handle = if args.no_ca {
         None
     } else {
-        let server =
-            match CaServer::from_parts(db.clone(), args.ca_port, None, None, None, None).await {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("error binding CA server on port {}: {e}", args.ca_port);
-                    return ExitCode::FAILURE;
-                }
-            };
+        let server = match CaServer::from_parts(db.clone(), ca_port, None, None, None, None).await {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("error binding CA server on port {ca_port}: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
         Some(tokio::spawn(async move {
-            tracing::info!(port = args.ca_port, "CA listener starting");
+            tracing::info!(port = ca_port, "CA listener starting");
             server.run().await
         }))
     };
@@ -190,9 +200,9 @@ async fn main() -> ExitCode {
     let pva_handle = if args.no_pva {
         None
     } else {
-        let server = PvaServer::from_parts(db.clone(), args.pva_port, None, None, None);
+        let server = PvaServer::from_parts(db.clone(), pva_port, None, None, None);
         Some(tokio::spawn(async move {
-            tracing::info!(port = args.pva_port, "PVA listener starting");
+            tracing::info!(port = pva_port, "PVA listener starting");
             server.run().await
         }))
     };
@@ -221,5 +231,40 @@ fn format_join(which: &str, r: Result<CaResult<()>, tokio::task::JoinError>) -> 
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err(format!("{which} server exited: {e}")),
         Err(e) => Err(format!("{which} task panicked: {e}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Args;
+    use clap::Parser;
+
+    /// R19-22 boundary: an omitted port flag must reach the resolver as
+    /// `None`, so the EPICS environment decides the bind port. A clap
+    /// literal (`default_value_t = 5064` / `5075`) shadows
+    /// `EPICS_CAS_SERVER_PORT` / `EPICS_PVAS_SERVER_PORT` and pins the
+    /// IOC to the production ports.
+    #[test]
+    fn omitted_ports_defer_to_the_epics_environment() {
+        let args = Args::parse_from(["dual-ioc-rs", "--db", "x.db"]);
+        assert_eq!(args.ca_port, None);
+        assert_eq!(args.pva_port, None);
+    }
+
+    /// The flags still win, and `0` stays a representable request for an
+    /// ephemeral bind — distinct from "unset".
+    #[test]
+    fn explicit_ports_override_and_zero_means_ephemeral() {
+        let args = Args::parse_from([
+            "dual-ioc-rs",
+            "--db",
+            "x.db",
+            "--ca-port",
+            "15064",
+            "--pva-port",
+            "0",
+        ]);
+        assert_eq!(args.ca_port, Some(15064));
+        assert_eq!(args.pva_port, Some(0));
     }
 }

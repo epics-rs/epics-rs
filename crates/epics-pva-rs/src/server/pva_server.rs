@@ -23,7 +23,12 @@ use super::native_source::PvDatabaseSource;
 /// Builder for constructing a [`PvaServer`] with simple PVs and/or records.
 pub struct PvaServerBuilder {
     ioc: ioc_builder::IocBuilder,
-    port: u16,
+    /// `None` = nobody named a port, so the EPICS environment decides
+    /// (`PvaServerConfig::with_env`, whose `PickOne` order is pvxs's:
+    /// `EPICS_PVAS_SERVER_PORT` before `EPICS_PVA_SERVER_PORT`). `Some(p)`
+    /// is an explicit request, and `Some(0)` an ephemeral bind — the two
+    /// meanings a literal 5075 default could not tell apart.
+    port: Option<u16>,
     acf: Option<access_security::AccessSecurityConfig>,
 }
 
@@ -31,14 +36,14 @@ impl PvaServerBuilder {
     pub fn new() -> Self {
         Self {
             ioc: ioc_builder::IocBuilder::new(),
-            port: epics_base_rs::runtime::net::PVA_SERVER_PORT,
+            port: None,
             acf: None,
         }
     }
 
-    /// Set the TCP port (UDP = port + 1).
+    /// Set the TCP port (UDP = port + 1), overriding the environment.
     pub fn port(mut self, port: u16) -> Self {
-        self.port = port;
+        self.port = Some(port);
         self
     }
 
@@ -82,7 +87,9 @@ impl PvaServerBuilder {
 
 pub struct PvaServer {
     db: Arc<PvDatabase>,
-    port: u16,
+    /// `None` = the EPICS environment decides the bind port; see
+    /// [`PvaServerBuilder::port`].
+    port: Option<u16>,
     /// Access Security configuration. Forwarded to the default
     /// `PvDatabaseSource` in `run()` so PVA PUTs are gated through
     /// `check_access_method`. Callers that supply their own
@@ -119,7 +126,7 @@ impl PvaServer {
     ) -> Self {
         Self {
             db,
-            port,
+            port: Some(port),
             acf: Arc::new(tokio::sync::RwLock::new(acf)),
             acl_version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             autosave_config,
@@ -219,11 +226,14 @@ impl PvaServer {
         source: Arc<S>,
         report_tx: Option<watch::Sender<Option<ServerReportHandle>>>,
     ) -> CaResult<()> {
-        let config = PvaServerConfig {
-            tcp_port: self.port,
-            udp_port: self.port + 1,
-            ..Default::default()
-        };
+        // The environment is the base (pvxs `Config::applyEnv`); an
+        // explicit `.port(p)` overrides it, keeping the port/port+1
+        // derivation this builder has always used.
+        let mut config = PvaServerConfig::default().with_env();
+        if let Some(port) = self.port {
+            config.tcp_port = port;
+            config.udp_port = port + 1;
+        }
 
         let scanner = ScanScheduler::new(self.db.clone());
 

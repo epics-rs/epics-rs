@@ -1872,16 +1872,15 @@ mod tests {
     /// only the comment at `bhe.cpp:248-253` that a false trigger costs
     /// nothing because the echo response proves the server is alive.
     ///
-    /// Concretely this fires when a *peer* client connects to an
-    /// `epics-ca-rs` server: our `server/tcp.rs` notifies `beacon_reset`
-    /// on every accept, restarting the 20 ms ramp-up, while our own
-    /// circuit stays up (so no `BeaconControl::ResetServer` for us).
-    /// That reset-on-accept is itself a divergence — rsrv restarts the
-    /// beacon ramp only at startup and after `ctlPause`
-    /// (`online_notify.c:66,128`), never on connect — and it is what
-    /// makes this benign-but-noisy path reachable at all against an
-    /// all-Rust deployment. The client side follows C here; the
-    /// server-side reset-on-accept is tracked separately.
+    /// Concretely this fires whenever a server restarts its beacon ramp
+    /// while our own circuit to it stays up (so no
+    /// `BeaconControl::ResetServer` for us): a server reboot, a
+    /// `ctlPause` resume, or — for an `epics-ca-rs` server — a
+    /// `trigger_beacon_anomaly` pulse from the ca_gateway. A client
+    /// connect no longer does it: the port's old reset-on-accept, which
+    /// made every peer connect land in this band, was removed as a
+    /// divergence (R6-30; rsrv restarts the ramp only at startup and
+    /// after `ctlPause`, `online_notify.c:66,128`).
     #[test]
     fn peer_connect_ramp_up_fires_the_short_period_band() {
         let mut servers: HashMap<SocketAddr, BeaconState> = HashMap::new();

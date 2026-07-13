@@ -1273,6 +1273,28 @@ impl PvDatabase {
                     };
                     instance.notify_field(sf, mask);
                 }
+
+                // The same `special()` posts, but named by the WRITER instead of
+                // by a static table: a record whose put handler re-derived a
+                // partner field marks it — with the mask of the C call site that
+                // posts it, and only when that field's own comparison moved
+                // (sseq `special()` posts the re-rendered `STRn` after a `DOn`
+                // put, `DBE_VALUE`, `only if (strcmp(str, plinkGroup->s))`,
+                // sseqRecord.c:1108-1116). A static field-name list cannot
+                // express "only if it changed", so it over-posts; the mark can.
+                for (sf, cycle_mask) in instance.record.take_cycle_posted_fields() {
+                    use crate::server::record::{CyclePostMask, EventMask};
+                    let mask = match cycle_mask {
+                        CyclePostMask::Value => EventMask::VALUE,
+                        // No `monitor_mask` exists on a put path (no alarm
+                        // transition is being resolved), so both LOG-carrying
+                        // variants reduce to C's literal `DBE_VALUE|DBE_LOG`.
+                        CyclePostMask::ValueLog | CyclePostMask::MonitorValueLog => {
+                            EventMask::VALUE | EventMask::LOG
+                        }
+                    };
+                    instance.notify_field(sf, mask);
+                }
             }
 
             common_result

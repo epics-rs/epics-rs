@@ -210,6 +210,12 @@ pub enum ValuePostGate {
 /// variant carried with each mark is what keeps them distinguishable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CyclePostMask {
+    /// A literal `DBE_VALUE` — no LOG bit, no alarm bits. C's shape for a
+    /// field the record re-DERIVED from the one it was given: sseq re-renders
+    /// `STRn` after a `DOn` write and posts it with a bare `DBE_VALUE`
+    /// (`sseqRecord.c:679`, `:1115`), while the view actually written carries
+    /// `DBE_VALUE|DBE_LOG`.
+    Value,
     /// A literal `DBE_VALUE | DBE_LOG` — the alarm-transition bits are NOT
     /// folded in, because this C call site does not have `monitor_mask` in
     /// scope (aCalcout `afterCalc`, `aCalcoutRecord.c:296`).

@@ -5159,6 +5159,13 @@ pub(crate) fn seed_constant_links(instance: &mut RecordInstance) {
     //    that may or may not remember it (the iocsh `dbLoadRecords` path did
     //    not).
     instance.record.seed_deadband_tracking();
+
+    // C's init-time `db_post_events` run during iocInit, before any client can
+    // subscribe, so they are observable by nobody. A seed put that made the
+    // record MARK a field (sseq: seeding `STRn` re-derives `DOn`) must not leave
+    // that mark standing for the first process cycle to emit — that would turn a
+    // no-op C post into a real, late event. Drop the init-time marks.
+    let _ = instance.record.take_cycle_posted_fields();
 }
 
 impl PvDatabase {

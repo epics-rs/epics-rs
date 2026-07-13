@@ -2579,6 +2579,7 @@ impl RecordInstance {
                 // twice, exactly as C posts it from both loops.
                 for (_, cycle_mask) in cycle_posted.iter().filter(|(name, _)| *name == field) {
                     let mask = match cycle_mask {
+                        CyclePostMask::Value => EventMask::VALUE,
                         CyclePostMask::ValueLog => EventMask::VALUE | EventMask::LOG,
                         CyclePostMask::MonitorValueLog => aux_mask,
                     };

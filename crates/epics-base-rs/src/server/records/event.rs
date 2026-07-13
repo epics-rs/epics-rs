@@ -33,6 +33,13 @@ pub struct EventRecord {
     /// &prec->sval)`, eventRecord.c:185) before publishing `val = sval`.
     pub sval: PvString,
     pub sims: i16,
+    /// SDLY — "Sim. Mode Async Delay" (`DBF_DOUBLE`, `initial("-1.0")`,
+    /// eventRecord.dbd.pod:171-177). A non-negative SDLY makes the simulated
+    /// SIOL read asynchronous: C's `readValue` arms
+    /// `callbackRequestProcessCallbackDelayed(..., prec->sdly)` and holds PACT
+    /// across the delay (eventRecord.c:184-201). The framework reads the delay
+    /// via `get_field("SDLY")`, so the field must exist for a `.db` to set it.
+    pub sdly: f64,
 }
 
 static EVENT_FIELDS: &[FieldDesc] = &[
@@ -61,6 +68,11 @@ static EVENT_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         read_only: false,
     },
+    FieldDesc {
+        name: "SDLY",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
 ];
 
 impl Default for EventRecord {
@@ -72,6 +84,9 @@ impl Default for EventRecord {
             siol: String::new(),
             sval: PvString::new(),
             sims: 0,
+            // C `field(SDLY,DBF_DOUBLE) { initial("-1.0") }` — negative means
+            // "synchronous simulation".
+            sdly: -1.0,
         }
     }
 }
@@ -99,6 +114,16 @@ fn put_string(slot: &mut String, value: EpicsValue, field: &str) -> CaResult<()>
 fn put_short(slot: &mut i16, value: EpicsValue, field: &str) -> CaResult<()> {
     match value {
         EpicsValue::Short(v) => {
+            *slot = v;
+            Ok(())
+        }
+        _ => Err(CaError::TypeMismatch(field.to_string())),
+    }
+}
+
+fn put_double(slot: &mut f64, value: EpicsValue, field: &str) -> CaResult<()> {
+    match value {
+        EpicsValue::Double(v) => {
             *slot = v;
             Ok(())
         }
@@ -153,6 +178,7 @@ impl Record for EventRecord {
             "SIML" => Some(EpicsValue::String(self.siml.clone().into())),
             "SIOL" => Some(EpicsValue::String(self.siol.clone().into())),
             "SIMS" => Some(EpicsValue::Short(self.sims)),
+            "SDLY" => Some(EpicsValue::Double(self.sdly)),
             _ => None,
         }
     }
@@ -167,6 +193,7 @@ impl Record for EventRecord {
             "SIOL" => put_string(&mut self.siol, value, name)?,
             "SIMM" => put_short(&mut self.simm, value, name)?,
             "SIMS" => put_short(&mut self.sims, value, name)?,
+            "SDLY" => put_double(&mut self.sdly, value, name)?,
             _ => return Err(CaError::FieldNotFound(name.to_string())),
         }
         self.on_put(name);

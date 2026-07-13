@@ -83,6 +83,15 @@ pub struct WaveformRecord {
     pub siml: String,
     pub siol: String,
     pub sims: i16,
+    /// SDLY — "Sim. Mode Async Delay" (`DBF_DOUBLE`, `initial("-1.0")`;
+    /// aaiRecord.dbd.pod:409-415, aaoRecord.dbd.pod:442-448,
+    /// waveformRecord.dbd.pod:510-516). A non-negative SDLY makes the
+    /// simulated SIOL round-trip asynchronous: C's `readValue`/`writeValue`
+    /// arms the `callbackRequestProcessCallbackDelayed(..., prec->sdly)`
+    /// watchdog and holds PACT across the delay (aaiRecord.c:365-374). The
+    /// framework reads it via `get_field("SDLY")`, so the field must exist —
+    /// an absent SDLY defaults to -1.0 (synchronous) there.
+    pub sdly: f64,
     /// aao-only: output mode select, `menu(menuOmsl)` (0=supervisory,
     /// 1=closed_loop). When `closed_loop`, aao sources VAL from `DOL`
     /// before each write (C `aaoRecord.c::fetchValue`, 357). waveform/aai/
@@ -180,6 +189,10 @@ impl Default for WaveformRecord {
             siml: String::new(),
             siol: String::new(),
             sims: 0,
+            // C `field(SDLY,DBF_DOUBLE) { initial("-1.0") }` — negative means
+            // "synchronous simulation", the default on all three sim-bearing
+            // array kinds.
+            sdly: -1.0,
             // C `aaoRecord.dbd.pod` declares OMSL `menu(menuOmsl)` and DOL
             // `DBF_INLINK` with no `initial(...)`, so both default to the
             // zero value: OMSL=supervisory (no DOL fetch), DOL=constant/empty.
@@ -205,6 +218,14 @@ impl WaveformRecord {
     /// no SIMM/SIML/SIOL/SIMS/OLDSIMM fields (`subArrayRecord.dbd.pod`), so
     /// it must not answer those names.
     fn has_sim_block(&self) -> bool {
+        !matches!(self.kind, ArrayKind::SubArray)
+    }
+
+    /// True for the kinds whose `.dbd` declares the monitor/archive posting-mode
+    /// block MPST/APST + the HASH they drive (waveform/aai/aao). `subArray` has
+    /// no On-Change posting mechanism at all (`subArrayRecord.dbd.pod` declares
+    /// none of the three), so it must not answer those names.
+    fn has_post_block(&self) -> bool {
         !matches!(self.kind, ArrayKind::SubArray)
     }
 }
@@ -352,456 +373,20 @@ impl WaveformRecord {
     }
 }
 
-static WAVEFORM_FIELDS_CHAR: &[FieldDesc] = &[
-    FieldDesc {
-        name: "VAL",
-        dbf_type: DbFieldType::Char,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "NELM",
-        dbf_type: DbFieldType::Long,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "NORD",
-        dbf_type: DbFieldType::Long,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "FTVL",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-    // Display/control metadata fields. Typed storage + get_field/put_field
-    // already back these; they MUST be in field_list so the db loader applies
-    // field(EGU/HOPR/LOPR/PREC, ...) to that storage rather than routing them
-    // to common fields (where the record's own get_field shadows them with
-    // defaults, zeroing DBR_GR/DBR_CTRL limits). waveformRecord.c declares
-    // EGU/HOPR/LOPR/PREC as record fields.
-    FieldDesc {
-        name: "EGU",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "HOPR",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LOPR",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "PREC",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    // Waveform-only TimeSeries acquisition control (devAsynXXXTimeSeries):
-    // RARM `pp(TRUE)` client-settable, BUSY `special(SPC_NOMOD)` device-set.
-    // aai/aao/subArray do not declare these (they use their own field sets).
-    // waveformRecord.dbd.pod:411,461.
-    FieldDesc {
-        name: "RARM",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "BUSY",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-];
-
-static WAVEFORM_FIELDS_SHORT: &[FieldDesc] = &[
-    FieldDesc {
-        name: "VAL",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "NELM",
-        dbf_type: DbFieldType::Long,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "NORD",
-        dbf_type: DbFieldType::Long,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "FTVL",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-    // Display/control metadata fields. Typed storage + get_field/put_field
-    // already back these; they MUST be in field_list so the db loader applies
-    // field(EGU/HOPR/LOPR/PREC, ...) to that storage rather than routing them
-    // to common fields (where the record's own get_field shadows them with
-    // defaults, zeroing DBR_GR/DBR_CTRL limits). waveformRecord.c declares
-    // EGU/HOPR/LOPR/PREC as record fields.
-    FieldDesc {
-        name: "EGU",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "HOPR",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LOPR",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "PREC",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    // Waveform-only TimeSeries acquisition control (devAsynXXXTimeSeries):
-    // RARM `pp(TRUE)` client-settable, BUSY `special(SPC_NOMOD)` device-set.
-    // aai/aao/subArray do not declare these (they use their own field sets).
-    // waveformRecord.dbd.pod:411,461.
-    FieldDesc {
-        name: "RARM",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "BUSY",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-];
-
-static WAVEFORM_FIELDS_LONG: &[FieldDesc] = &[
-    FieldDesc {
-        name: "VAL",
-        dbf_type: DbFieldType::Long,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "NELM",
-        dbf_type: DbFieldType::Long,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "NORD",
-        dbf_type: DbFieldType::Long,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "FTVL",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-    // Display/control metadata fields. Typed storage + get_field/put_field
-    // already back these; they MUST be in field_list so the db loader applies
-    // field(EGU/HOPR/LOPR/PREC, ...) to that storage rather than routing them
-    // to common fields (where the record's own get_field shadows them with
-    // defaults, zeroing DBR_GR/DBR_CTRL limits). waveformRecord.c declares
-    // EGU/HOPR/LOPR/PREC as record fields.
-    FieldDesc {
-        name: "EGU",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "HOPR",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LOPR",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "PREC",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    // Waveform-only TimeSeries acquisition control (devAsynXXXTimeSeries):
-    // RARM `pp(TRUE)` client-settable, BUSY `special(SPC_NOMOD)` device-set.
-    // aai/aao/subArray do not declare these (they use their own field sets).
-    // waveformRecord.dbd.pod:411,461.
-    FieldDesc {
-        name: "RARM",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "BUSY",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-];
-
-static WAVEFORM_FIELDS_INT64: &[FieldDesc] = &[
-    FieldDesc {
-        name: "VAL",
-        dbf_type: DbFieldType::Int64,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "NELM",
-        dbf_type: DbFieldType::Long,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "NORD",
-        dbf_type: DbFieldType::Long,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "FTVL",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-    // Display/control metadata fields. Typed storage + get_field/put_field
-    // already back these; they MUST be in field_list so the db loader applies
-    // field(EGU/HOPR/LOPR/PREC, ...) to that storage rather than routing them
-    // to common fields (where the record's own get_field shadows them with
-    // defaults, zeroing DBR_GR/DBR_CTRL limits). waveformRecord.c declares
-    // EGU/HOPR/LOPR/PREC as record fields.
-    FieldDesc {
-        name: "EGU",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "HOPR",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LOPR",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "PREC",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    // Waveform-only TimeSeries acquisition control (devAsynXXXTimeSeries):
-    // RARM `pp(TRUE)` client-settable, BUSY `special(SPC_NOMOD)` device-set.
-    // aai/aao/subArray do not declare these (they use their own field sets).
-    // waveformRecord.dbd.pod:411,461.
-    FieldDesc {
-        name: "RARM",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "BUSY",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-];
-
-static WAVEFORM_FIELDS_UINT64: &[FieldDesc] = &[
-    FieldDesc {
-        name: "VAL",
-        dbf_type: DbFieldType::UInt64,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "NELM",
-        dbf_type: DbFieldType::Long,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "NORD",
-        dbf_type: DbFieldType::Long,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "FTVL",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-    // Display/control metadata fields. Typed storage + get_field/put_field
-    // already back these; they MUST be in field_list so the db loader applies
-    // field(EGU/HOPR/LOPR/PREC, ...) to that storage rather than routing them
-    // to common fields (where the record's own get_field shadows them with
-    // defaults, zeroing DBR_GR/DBR_CTRL limits). waveformRecord.c declares
-    // EGU/HOPR/LOPR/PREC as record fields.
-    FieldDesc {
-        name: "EGU",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "HOPR",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LOPR",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "PREC",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    // Waveform-only TimeSeries acquisition control (devAsynXXXTimeSeries):
-    // RARM `pp(TRUE)` client-settable, BUSY `special(SPC_NOMOD)` device-set.
-    // aai/aao/subArray do not declare these (they use their own field sets).
-    // waveformRecord.dbd.pod:411,461.
-    FieldDesc {
-        name: "RARM",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "BUSY",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-];
-
-static WAVEFORM_FIELDS_FLOAT: &[FieldDesc] = &[
-    FieldDesc {
-        name: "VAL",
-        dbf_type: DbFieldType::Float,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "NELM",
-        dbf_type: DbFieldType::Long,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "NORD",
-        dbf_type: DbFieldType::Long,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "FTVL",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-    // Display/control metadata fields. Typed storage + get_field/put_field
-    // already back these; they MUST be in field_list so the db loader applies
-    // field(EGU/HOPR/LOPR/PREC, ...) to that storage rather than routing them
-    // to common fields (where the record's own get_field shadows them with
-    // defaults, zeroing DBR_GR/DBR_CTRL limits). waveformRecord.c declares
-    // EGU/HOPR/LOPR/PREC as record fields.
-    FieldDesc {
-        name: "EGU",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "HOPR",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LOPR",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "PREC",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    // Waveform-only TimeSeries acquisition control (devAsynXXXTimeSeries):
-    // RARM `pp(TRUE)` client-settable, BUSY `special(SPC_NOMOD)` device-set.
-    // aai/aao/subArray do not declare these (they use their own field sets).
-    // waveformRecord.dbd.pod:411,461.
-    FieldDesc {
-        name: "RARM",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "BUSY",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-];
-
-static WAVEFORM_FIELDS_DOUBLE: &[FieldDesc] = &[
-    FieldDesc {
-        name: "VAL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "NELM",
-        dbf_type: DbFieldType::Long,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "NORD",
-        dbf_type: DbFieldType::Long,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "FTVL",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-    // Display/control metadata fields. Typed storage + get_field/put_field
-    // already back these; they MUST be in field_list so the db loader applies
-    // field(EGU/HOPR/LOPR/PREC, ...) to that storage rather than routing them
-    // to common fields (where the record's own get_field shadows them with
-    // defaults, zeroing DBR_GR/DBR_CTRL limits). waveformRecord.c declares
-    // EGU/HOPR/LOPR/PREC as record fields.
-    FieldDesc {
-        name: "EGU",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "HOPR",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LOPR",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "PREC",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    // Waveform-only TimeSeries acquisition control (devAsynXXXTimeSeries):
-    // RARM `pp(TRUE)` client-settable, BUSY `special(SPC_NOMOD)` device-set.
-    // aai/aao/subArray do not declare these (they use their own field sets).
-    // waveformRecord.dbd.pod:411,461.
-    FieldDesc {
-        name: "RARM",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "BUSY",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-];
-
-// subArray field set. subArray shares the `WaveformRecord` struct but its C dbd
-// differs from waveform/aai/aao: NELM is `pp(TRUE)` (runtime-writable) instead of
-// `special(SPC_NOMOD)`, and MALM (`special(SPC_NOMOD)`) / INDX (`pp(TRUE)`) exist.
-// FTVL/NORD stay `special(SPC_NOMOD)` (load-settable, runtime-immutable) as in
-// every kind. `field_list()` returns this set when `kind == SubArray`, so the
-// FieldDesc `read_only` flag is kind-correct by construction — it stays the single
-// source the field_io runtime gate reads, with no per-kind runtime override.
-macro_rules! subarray_field_list {
-    ($valty:expr) => {
+// Field sets for the four array kinds. One macro emits the shape the C `.dbd`
+// files share — VAL/NELM/NORD/FTVL plus the EGU/HOPR/LOPR/PREC display block —
+// and each kind passes the extra `FieldDesc`s its own `.dbd` declares. Building
+// every set from the one macro is what keeps a field from being declared for one
+// kind and silently forgotten for its siblings (the `.db` loader gates
+// `field(...)` on `field_list` membership, so an omission there is a silently
+// dropped field at load, not a compile error).
+//
+// `$nelm_ro` is the only shape difference in the shared part: waveform/aai/aao
+// declare NELM `special(SPC_NOMOD)` (load-settable, runtime-immutable), subArray
+// declares it `pp(TRUE)` (runtime-writable). FTVL/NORD are `special(SPC_NOMOD)`
+// in all four.
+macro_rules! array_field_list {
+    ($valty:expr, $nelm_ro:expr $(, $extra:expr)* $(,)?) => {
         &[
             FieldDesc {
                 name: "VAL",
@@ -811,7 +396,7 @@ macro_rules! subarray_field_list {
             FieldDesc {
                 name: "NELM",
                 dbf_type: DbFieldType::Long,
-                read_only: false,
+                read_only: $nelm_ro,
             },
             FieldDesc {
                 name: "NORD",
@@ -823,6 +408,11 @@ macro_rules! subarray_field_list {
                 dbf_type: DbFieldType::Short,
                 read_only: true,
             },
+            // Display/control metadata fields. Typed storage + get_field/put_field
+            // already back these; they MUST be in field_list so the db loader applies
+            // field(EGU/HOPR/LOPR/PREC, ...) to that storage rather than routing them
+            // to common fields (where the record's own get_field shadows them with
+            // defaults, zeroing DBR_GR/DBR_CTRL limits).
             FieldDesc {
                 name: "EGU",
                 dbf_type: DbFieldType::String,
@@ -843,6 +433,149 @@ macro_rules! subarray_field_list {
                 dbf_type: DbFieldType::Short,
                 read_only: false,
             },
+            $($extra),*
+        ]
+    };
+}
+
+// waveform/aai/aao field set: the shared shape plus the two blocks all three
+// `.dbd`s declare and subArray does not —
+//
+//  * the simulation block SIML/SIMM/SIOL/SIMS/SDLY (`aaiRecord.dbd.pod:374-415`,
+//    `aaoRecord.dbd.pod:407-448`, `waveformRecord.dbd.pod:475-516`). Membership
+//    here is what lets a `.db` configure simulation at all: `apply_fields` routes
+//    a field NOT in `field_list` to the common fields, where it is rejected
+//    (`FieldNotFound`, logged and skipped) — so `field(SIMM,"YES")` on an aai was
+//    silently dropped at load. SIMPVT is `DBF_NOACCESS` (C's callback struct) and
+//    has no port equivalent;
+//  * the posting-mode block MPST/APST (`aaiRecord.dbd.pod:422-433` etc.), read by
+//    `array_monitor_post`. Same load-time story: without membership every array
+//    record posted its full VAL every cycle whatever the `.db` asked for.
+//
+// The extra per-kind fields follow (`$extra`).
+macro_rules! array_sim_field_list {
+    ($valty:expr $(, $extra:expr)* $(,)?) => {
+        array_field_list!(
+            $valty,
+            true,
+            FieldDesc {
+                name: "SIML",
+                dbf_type: DbFieldType::String,
+                read_only: false,
+            },
+            FieldDesc {
+                name: "SIMM",
+                dbf_type: DbFieldType::Short,
+                read_only: false,
+            },
+            FieldDesc {
+                name: "SIOL",
+                dbf_type: DbFieldType::String,
+                read_only: false,
+            },
+            FieldDesc {
+                name: "SIMS",
+                dbf_type: DbFieldType::Short,
+                read_only: false,
+            },
+            FieldDesc {
+                name: "SDLY",
+                dbf_type: DbFieldType::Double,
+                read_only: false,
+            },
+            FieldDesc {
+                name: "MPST",
+                dbf_type: DbFieldType::Short,
+                read_only: false,
+            },
+            FieldDesc {
+                name: "APST",
+                dbf_type: DbFieldType::Short,
+                read_only: false,
+            },
+            $($extra),*
+        )
+    };
+}
+
+// waveform: the common+sim shape plus the TimeSeries acquisition-control fields
+// (devAsynXXXTimeSeries) — RARM `pp(TRUE)` client-settable, BUSY
+// `special(SPC_NOMOD)` device-set. waveformRecord.dbd.pod:411,461. aai/aao/
+// subArray do not declare them.
+macro_rules! waveform_field_list {
+    ($valty:expr) => {
+        array_sim_field_list!(
+            $valty,
+            FieldDesc {
+                name: "RARM",
+                dbf_type: DbFieldType::Short,
+                read_only: false,
+            },
+            FieldDesc {
+                name: "BUSY",
+                dbf_type: DbFieldType::Short,
+                read_only: true,
+            },
+        )
+    };
+}
+
+static WAVEFORM_FIELDS_CHAR: &[FieldDesc] = waveform_field_list!(DbFieldType::Char);
+static WAVEFORM_FIELDS_SHORT: &[FieldDesc] = waveform_field_list!(DbFieldType::Short);
+static WAVEFORM_FIELDS_LONG: &[FieldDesc] = waveform_field_list!(DbFieldType::Long);
+static WAVEFORM_FIELDS_INT64: &[FieldDesc] = waveform_field_list!(DbFieldType::Int64);
+static WAVEFORM_FIELDS_UINT64: &[FieldDesc] = waveform_field_list!(DbFieldType::UInt64);
+static WAVEFORM_FIELDS_FLOAT: &[FieldDesc] = waveform_field_list!(DbFieldType::Float);
+static WAVEFORM_FIELDS_DOUBLE: &[FieldDesc] = waveform_field_list!(DbFieldType::Double);
+
+// aai: the bare common+sim shape — no RARM/BUSY (waveform-only) and no OMSL/DOL
+// (aao-only) (aaiRecord.dbd.pod).
+static AAI_FIELDS_CHAR: &[FieldDesc] = array_sim_field_list!(DbFieldType::Char);
+static AAI_FIELDS_SHORT: &[FieldDesc] = array_sim_field_list!(DbFieldType::Short);
+static AAI_FIELDS_LONG: &[FieldDesc] = array_sim_field_list!(DbFieldType::Long);
+static AAI_FIELDS_INT64: &[FieldDesc] = array_sim_field_list!(DbFieldType::Int64);
+static AAI_FIELDS_UINT64: &[FieldDesc] = array_sim_field_list!(DbFieldType::UInt64);
+static AAI_FIELDS_FLOAT: &[FieldDesc] = array_sim_field_list!(DbFieldType::Float);
+static AAI_FIELDS_DOUBLE: &[FieldDesc] = array_sim_field_list!(DbFieldType::Double);
+
+// aao: the common+sim shape plus OMSL `menu(menuOmsl)` and DOL `DBF_INLINK`
+// (`aaoRecord.dbd.pod:355-360`) — the desired-output mode + link that none of
+// the other three array types declare.
+macro_rules! aao_field_list {
+    ($valty:expr) => {
+        array_sim_field_list!(
+            $valty,
+            FieldDesc {
+                name: "OMSL",
+                dbf_type: DbFieldType::Short,
+                read_only: false,
+            },
+            FieldDesc {
+                name: "DOL",
+                dbf_type: DbFieldType::String,
+                read_only: false,
+            },
+        )
+    };
+}
+
+static AAO_FIELDS_CHAR: &[FieldDesc] = aao_field_list!(DbFieldType::Char);
+static AAO_FIELDS_SHORT: &[FieldDesc] = aao_field_list!(DbFieldType::Short);
+static AAO_FIELDS_LONG: &[FieldDesc] = aao_field_list!(DbFieldType::Long);
+static AAO_FIELDS_INT64: &[FieldDesc] = aao_field_list!(DbFieldType::Int64);
+static AAO_FIELDS_UINT64: &[FieldDesc] = aao_field_list!(DbFieldType::UInt64);
+static AAO_FIELDS_FLOAT: &[FieldDesc] = aao_field_list!(DbFieldType::Float);
+static AAO_FIELDS_DOUBLE: &[FieldDesc] = aao_field_list!(DbFieldType::Double);
+
+// subArray: NELM is `pp(TRUE)` (runtime-writable), and MALM
+// (`special(SPC_NOMOD)`) / INDX (`pp(TRUE)`) exist. It declares NO simulation
+// block and NO MPST/APST/HASH (`subArrayRecord.dbd.pod:324-398`), so it must not
+// answer those names.
+macro_rules! subarray_field_list {
+    ($valty:expr) => {
+        array_field_list!(
+            $valty,
+            false,
             FieldDesc {
                 name: "MALM",
                 dbf_type: DbFieldType::Long,
@@ -853,7 +586,7 @@ macro_rules! subarray_field_list {
                 dbf_type: DbFieldType::Long,
                 read_only: false,
             },
-        ]
+        )
     };
 }
 
@@ -892,140 +625,6 @@ fn dol_is_constant(dol: &str) -> bool {
         .split_whitespace()
         .all(|tok| tok.parse::<f64>().is_ok())
 }
-
-// aao field set. aao shares the `WaveformRecord` struct and the
-// waveform/aai field shape (NELM `special(SPC_NOMOD)` read_only, FTVL/NORD
-// load-settable-runtime-immutable), but its C dbd ALSO declares OMSL
-// `menu(menuOmsl)` and DOL `DBF_INLINK` (`aaoRecord.dbd.pod:355-360`) — the
-// desired-output mode + link absent from the other three array types.
-// `field_list()` returns this set only when `kind == Aao`, so OMSL/DOL are
-// loadable (apply_fields gates on field_list membership) for aao alone.
-macro_rules! aao_field_list {
-    ($valty:expr) => {
-        &[
-            FieldDesc {
-                name: "VAL",
-                dbf_type: $valty,
-                read_only: false,
-            },
-            FieldDesc {
-                name: "NELM",
-                dbf_type: DbFieldType::Long,
-                read_only: true,
-            },
-            FieldDesc {
-                name: "NORD",
-                dbf_type: DbFieldType::Long,
-                read_only: true,
-            },
-            FieldDesc {
-                name: "FTVL",
-                dbf_type: DbFieldType::Short,
-                read_only: true,
-            },
-            FieldDesc {
-                name: "EGU",
-                dbf_type: DbFieldType::String,
-                read_only: false,
-            },
-            FieldDesc {
-                name: "HOPR",
-                dbf_type: DbFieldType::Double,
-                read_only: false,
-            },
-            FieldDesc {
-                name: "LOPR",
-                dbf_type: DbFieldType::Double,
-                read_only: false,
-            },
-            FieldDesc {
-                name: "PREC",
-                dbf_type: DbFieldType::Short,
-                read_only: false,
-            },
-            FieldDesc {
-                name: "OMSL",
-                dbf_type: DbFieldType::Short,
-                read_only: false,
-            },
-            FieldDesc {
-                name: "DOL",
-                dbf_type: DbFieldType::String,
-                read_only: false,
-            },
-        ]
-    };
-}
-
-static AAO_FIELDS_CHAR: &[FieldDesc] = aao_field_list!(DbFieldType::Char);
-static AAO_FIELDS_SHORT: &[FieldDesc] = aao_field_list!(DbFieldType::Short);
-static AAO_FIELDS_LONG: &[FieldDesc] = aao_field_list!(DbFieldType::Long);
-static AAO_FIELDS_INT64: &[FieldDesc] = aao_field_list!(DbFieldType::Int64);
-static AAO_FIELDS_UINT64: &[FieldDesc] = aao_field_list!(DbFieldType::UInt64);
-static AAO_FIELDS_FLOAT: &[FieldDesc] = aao_field_list!(DbFieldType::Float);
-static AAO_FIELDS_DOUBLE: &[FieldDesc] = aao_field_list!(DbFieldType::Double);
-
-// aai field set. aai shares the `WaveformRecord` struct and the
-// waveform/aao field shape (NELM `special(SPC_NOMOD)` read_only, FTVL/NORD
-// load-settable-runtime-immutable), but unlike waveform it does NOT declare
-// RARM/BUSY (those are waveform-only TimeSeries control fields), and unlike
-// aao it has no OMSL/DOL. So aai gets its own set — the bare common shape —
-// rather than sharing the `WAVEFORM_FIELDS_*` set, keeping the FieldDesc
-// `read_only`/membership kind-correct by construction (aaiRecord.dbd.pod).
-macro_rules! aai_field_list {
-    ($valty:expr) => {
-        &[
-            FieldDesc {
-                name: "VAL",
-                dbf_type: $valty,
-                read_only: false,
-            },
-            FieldDesc {
-                name: "NELM",
-                dbf_type: DbFieldType::Long,
-                read_only: true,
-            },
-            FieldDesc {
-                name: "NORD",
-                dbf_type: DbFieldType::Long,
-                read_only: true,
-            },
-            FieldDesc {
-                name: "FTVL",
-                dbf_type: DbFieldType::Short,
-                read_only: true,
-            },
-            FieldDesc {
-                name: "EGU",
-                dbf_type: DbFieldType::String,
-                read_only: false,
-            },
-            FieldDesc {
-                name: "HOPR",
-                dbf_type: DbFieldType::Double,
-                read_only: false,
-            },
-            FieldDesc {
-                name: "LOPR",
-                dbf_type: DbFieldType::Double,
-                read_only: false,
-            },
-            FieldDesc {
-                name: "PREC",
-                dbf_type: DbFieldType::Short,
-                read_only: false,
-            },
-        ]
-    };
-}
-
-static AAI_FIELDS_CHAR: &[FieldDesc] = aai_field_list!(DbFieldType::Char);
-static AAI_FIELDS_SHORT: &[FieldDesc] = aai_field_list!(DbFieldType::Short);
-static AAI_FIELDS_LONG: &[FieldDesc] = aai_field_list!(DbFieldType::Long);
-static AAI_FIELDS_INT64: &[FieldDesc] = aai_field_list!(DbFieldType::Int64);
-static AAI_FIELDS_UINT64: &[FieldDesc] = aai_field_list!(DbFieldType::UInt64);
-static AAI_FIELDS_FLOAT: &[FieldDesc] = aai_field_list!(DbFieldType::Float);
-static AAI_FIELDS_DOUBLE: &[FieldDesc] = aai_field_list!(DbFieldType::Double);
 
 impl Record for WaveformRecord {
     fn record_type(&self) -> &'static str {
@@ -1075,7 +674,7 @@ impl Record for WaveformRecord {
     /// (`menu(menuFtype)`) is a shared menu resolved centrally.
     fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
         match field {
-            "MPST" | "APST" => Some(WAVEFORM_POST),
+            "MPST" | "APST" if self.has_post_block() => Some(WAVEFORM_POST),
             // SIMM is menu(menuYesNo) (NO/YES) on the array records. SIMS
             // (menuAlarmSevr) and OLDSIMM (menuSimm) resolve via the shared
             // menu registry. Only the kinds that carry a sim block answer.
@@ -1147,13 +746,11 @@ impl Record for WaveformRecord {
             "NELM" => Some(EpicsValue::Long(self.nelm)),
             "NORD" => Some(EpicsValue::Long(self.nord)),
             "FTVL" => Some(EpicsValue::Short(self.ftvl)),
-            "MPST" => Some(EpicsValue::Short(self.mpst)),
-            "APST" => Some(EpicsValue::Short(self.apst)),
+            "MPST" if self.has_post_block() => Some(EpicsValue::Short(self.mpst)),
+            "APST" if self.has_post_block() => Some(EpicsValue::Short(self.apst)),
             // HASH (DBF_ULONG) — the On Change content hash. Only the
             // waveform/aai/aao kinds declare it; subArray has no such field.
-            "HASH" if !matches!(self.kind, ArrayKind::SubArray) => {
-                Some(EpicsValue::ULong(self.hash))
-            }
+            "HASH" if self.has_post_block() => Some(EpicsValue::ULong(self.hash)),
             // subArray-specific INDX/MALM fields. Other array record
             // kinds expose them as zero (matches C dbpr output for a
             // record type that doesn't declare the field).
@@ -1177,6 +774,7 @@ impl Record for WaveformRecord {
             "SIML" if self.has_sim_block() => Some(EpicsValue::String(self.siml.clone().into())),
             "SIOL" if self.has_sim_block() => Some(EpicsValue::String(self.siol.clone().into())),
             "SIMS" if self.has_sim_block() => Some(EpicsValue::Short(self.sims)),
+            "SDLY" if self.has_sim_block() => Some(EpicsValue::Double(self.sdly)),
             // aao-only output-mode / desired-output link (aaoRecord.dbd.pod).
             "OMSL" if matches!(self.kind, ArrayKind::Aao) => Some(EpicsValue::Short(self.omsl)),
             "DOL" if matches!(self.kind, ArrayKind::Aao) => {
@@ -1291,7 +889,7 @@ impl Record for WaveformRecord {
                     )))
                 }
             }
-            "MPST" => {
+            "MPST" if self.has_post_block() => {
                 if let EpicsValue::Short(v) = value {
                     self.mpst = v;
                     Ok(())
@@ -1299,7 +897,7 @@ impl Record for WaveformRecord {
                     Err(CaError::TypeMismatch("MPST".into()))
                 }
             }
-            "APST" => {
+            "APST" if self.has_post_block() => {
                 if let EpicsValue::Short(v) = value {
                     self.apst = v;
                     Ok(())
@@ -1405,6 +1003,13 @@ impl Record for WaveformRecord {
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("SIMS".into())),
+            },
+            "SDLY" if self.has_sim_block() => match value {
+                EpicsValue::Double(v) => {
+                    self.sdly = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("SDLY".into())),
             },
             // aao-only OMSL (menu, resolved to a Short index by the central
             // shared_menu_choices("OMSL") path) and DOL link string. The

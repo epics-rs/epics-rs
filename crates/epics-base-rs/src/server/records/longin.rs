@@ -68,6 +68,13 @@ pub struct LonginRecord {
     pub sval: i32,
     #[field(type = "Short")]
     pub sims: i16,
+    // SDLY — "Sim. Mode Async Delay" (`DBF_DOUBLE`, `initial("-1.0")`,
+    // longinRecord.dbd.pod:497-503). A non-negative SDLY makes the simulated SIOL read asynchronous:
+    // C's `readValue` arms `callbackRequestProcessCallbackDelayed(..., sdly)`
+    // and holds PACT across the delay (longinRecord.c:405-412). The framework reads the delay
+    // via `get_field("SDLY")`, so the field must exist for a `.db` to set it.
+    #[field(type = "Double")]
+    pub sdly: f64,
 }
 
 impl Default for LonginRecord {
@@ -98,6 +105,9 @@ impl Default for LonginRecord {
             siol: String::new(),
             sval: 0,
             sims: 0,
+            // C `field(SDLY,DBF_DOUBLE) { initial("-1.0") }` — negative means
+            // "synchronous simulation".
+            sdly: -1.0,
         }
     }
 }

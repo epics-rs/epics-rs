@@ -55,6 +55,13 @@ pub struct Int64inRecord {
     pub sval: i64,
     #[field(type = "Short")]
     pub sims: i16,
+    // SDLY — "Sim. Mode Async Delay" (`DBF_DOUBLE`, `initial("-1.0")`,
+    // int64inRecord.dbd.pod:301-307). A non-negative SDLY makes the simulated SIOL read asynchronous:
+    // C's `readValue` arms `callbackRequestProcessCallbackDelayed(..., sdly)`
+    // and holds PACT across the delay (int64inRecord.c:398-405). The framework reads the delay
+    // via `get_field("SDLY")`, so the field must exist for a `.db` to set it.
+    #[field(type = "Double")]
+    pub sdly: f64,
 }
 
 impl Default for Int64inRecord {
@@ -77,6 +84,9 @@ impl Default for Int64inRecord {
             siol: String::new(),
             sval: 0,
             sims: 0,
+            // C `field(SDLY,DBF_DOUBLE) { initial("-1.0") }` — negative means
+            // "synchronous simulation".
+            sdly: -1.0,
         }
     }
 }

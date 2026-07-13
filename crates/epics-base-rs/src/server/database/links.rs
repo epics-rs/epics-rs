@@ -657,7 +657,18 @@ impl PvDatabase {
                 let alarm = self.external_link_alarm(&name).await;
                 (value, alarm)
             }
-            _ => (None, None),
+            // A `lnkCalc` link computes its value from its own inputs; the
+            // jlink has no source record whose alarm could be inherited
+            // (`lnkCalc`'s lset implements no `getAlarm`), so it reads as a
+            // value with no alarm.
+            crate::server::record::ParsedLink::Calc(calc) => {
+                (self.evaluate_calc_link(calc).await, None)
+            }
+            // Hardware links carry no generic readable value; `None` links
+            // deliver nothing.
+            crate::server::record::ParsedLink::Hw(_) | crate::server::record::ParsedLink::None => {
+                (None, None)
+            }
         }
     }
 
@@ -1692,7 +1703,7 @@ impl PvDatabase {
                     // once, at init (`fanoutRecord.c:88`, `dfanoutRecord.c:102`,
                     // `seqRecord.c:121` `recGblInitConstantLink(&sell,
                     // DBF_USHORT, &seln)`), so a `caput REC.SELN` STAYS put.
-                    if let Some(val) = self.fetch_link(&parsed).await.value() {
+                    if let Some(val) = self.fetch_link(rec, &parsed).await.value() {
                         // C reads SELL with `dbGetLink(&prec->sell,
                         // DBR_USHORT, &prec->seln, 0, 0)`; the dbConvert GET
                         // macro stores `*pdst = (epicsUInt16) *psrc`

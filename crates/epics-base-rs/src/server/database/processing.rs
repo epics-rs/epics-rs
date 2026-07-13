@@ -1407,7 +1407,7 @@ impl PvDatabase {
             // for SDIS, so DISA keeps its `initial(0)`: `field(SDIS,"3")` with
             // `DISV=3` does NOT disable the record in C (softIoc-verified).
             // Handing back the constant here disabled it forever.
-            if let Some(val) = self.fetch_link(&sdis_link).await.value() {
+            if let Some(val) = self.fetch_link(&rec, &sdis_link).await.value() {
                 let disa_val = val.to_f64().unwrap_or(0.0) as i16;
                 let mut instance = rec.write().await;
                 instance.common.disa = disa_val;
@@ -1568,7 +1568,7 @@ impl PvDatabase {
                     instance.common.utag = src_utag;
                     instance.common.tse = -2;
                 }
-            } else if let Some(val) = self.fetch_link(&tsel_link).await.value() {
+            } else if let Some(val) = self.fetch_link(&rec, &tsel_link).await.value() {
                 // Non-`.TIME` TSEL: C `dbGetLink(&tsel, DBR_SHORT,
                 // &prec->tse)` loads TSE from the link regardless of its
                 // type. The pre-fix port only read a `ParsedLink::Db`
@@ -1875,9 +1875,17 @@ impl PvDatabase {
             None => None,
         };
 
-        // Read DOL value
+        // Read DOL value. Through the input-fetch owner, so C's
+        // `dbDbGetValue` inheritance tail runs on it like every other
+        // process-time read: `field(DOL,"SRC MS")` on an OMSL=closed_loop
+        // ao/bo/dfanout raises the READER to the source's severity
+        // (softIoc: SRC in MAJOR -> A1 SEVR MAJOR, STAT LINK). A constant DOL
+        // never reaches here (`dol_info` excludes it — the constant is seeded
+        // once at init), so the PP-aware fetch is the right one.
         let dol_value = if let Some((ref dol_parsed, _oif)) = dol_info {
-            self.read_link_value(dol_parsed, visited, depth).await
+            self.fetch_input_link(&rec, dol_parsed, visited, depth)
+                .await
+                .value()
         } else {
             None
         };
@@ -1919,7 +1927,7 @@ impl PvDatabase {
                     drop(instance); // release read lock before async read
                     let parsed =
                         crate::server::record::parse_link_v2(nvl_str.as_str_lossy().as_ref());
-                    let fetch = self.fetch_input_link(&parsed, visited, depth).await;
+                    let fetch = self.fetch_input_link(&rec, &parsed, visited, depth).await;
                     sel_nvl_read_failed = !fetch.is_ok();
                     fetch.value()
                 } else {
@@ -4806,36 +4814,62 @@ impl PvDatabase {
     /// hangs off that distinction, so every one of them reads through here and
     /// the constant reaches the record only through the init-seed owner
     /// ([`Self::rec_gbl_init_constant_links`] / [`Self::rec_gbl_init_simm`]).
+    /// The read CARRIES the source alarm: C's `dbGetLink` on a DB link ends in
+    /// `dbDbGetValue`'s inheritance tail (`dbDbLink.c:228-232`), so every link a
+    /// record reads at process time — INP, DOL, SDIS, TSEL, SELL, SIML, SIOL —
+    /// folds an `MS` source's severity into the reader. That tail runs HERE, in
+    /// the read primitive itself, through the single inheritance owner
+    /// ([`Self::input_link_inheritance`]): a caller cannot drop it, because a
+    /// caller never sees the alarm. Dropping it is exactly how DOL, SIML and
+    /// SIOL came to lose MS while INP kept it.
+    ///
+    /// softIoc (`SRC0` in MAJOR): `SDIS="SRC0 MS"`, `TSEL="SRC0 MS"`,
+    /// `SIML="SRC0 MS"`, `SIOL="SRC0 MS"` and `DOL="SRC0 MS"` (closed-loop) all
+    /// leave the reader MAJOR/LINK; without `MS`, all leave it NO_ALARM. The
+    /// one read C does NOT run the tail on is the `TSEL="SRC.TIME"` form
+    /// (`recGbl.c:313-320` calls `dbGetTimeStamp`, not `dbGetLink`) — and that
+    /// branch does not come through here.
     pub(crate) async fn fetch_link(
         &self,
+        reader: &Arc<RwLock<RecordInstance>>,
         link: &crate::server::record::ParsedLink,
     ) -> crate::server::recgbl::simm::LinkFetch {
-        use crate::server::recgbl::simm::LinkFetch;
-        if crate::server::recgbl::simm::is_constant(link) {
-            return LinkFetch::NoData;
-        }
-        match self.read_link_value_no_process(link).await {
-            Some(v) => LinkFetch::Value(v),
-            None => LinkFetch::Failed,
-        }
+        let (fetch, alarm) = self.read_link_with_alarm(link).await;
+        self.inherit_link_severity(reader, link, alarm).await;
+        fetch
     }
 
-    /// [`Self::fetch_link`] for an INPUT link — same classification, but the
-    /// PP rule applies: C `dbGetLink` on a `ProcessPassive` DB link processes
-    /// the passive source before reading it. Used by sel's NVL→SELN read.
+    /// [`Self::fetch_link`] for an INPUT link — same classification and the same
+    /// inheritance tail, but the PP rule applies first: C `dbGetLink` on a
+    /// `ProcessPassive` DB link processes the passive source before reading it.
+    /// Used by sel's NVL→SELN read and the closed-loop DOL read.
     pub(crate) async fn fetch_input_link(
         &self,
+        reader: &Arc<RwLock<RecordInstance>>,
         link: &crate::server::record::ParsedLink,
         visited: &mut HashSet<String>,
         depth: usize,
     ) -> crate::server::recgbl::simm::LinkFetch {
-        use crate::server::recgbl::simm::LinkFetch;
-        if crate::server::recgbl::simm::is_constant(link) {
-            return LinkFetch::NoData;
+        if let crate::server::record::ParsedLink::Db(db) = link {
+            self.process_passive_db_source(db, visited, depth).await;
         }
-        match self.read_link_value(link, visited, depth).await {
-            Some(v) => LinkFetch::Value(v),
-            None => LinkFetch::Failed,
+        self.fetch_link(reader, link).await
+    }
+
+    /// C `dbDbGetValue`'s tail, applied to the reader: the ONE place a
+    /// process-time link read folds its source's alarm in. Computes the
+    /// `(MS class, source alarm)` pair through the inheritance owner with no
+    /// record lock held, then applies it under a brief write lock.
+    async fn inherit_link_severity(
+        &self,
+        reader: &Arc<RwLock<RecordInstance>>,
+        link: &crate::server::record::ParsedLink,
+        alarm: Option<super::links::LinkAlarm>,
+    ) {
+        let reader_name = reader.read().await.name.clone();
+        if let Some((ms, src)) = self.input_link_inheritance(&reader_name, link, alarm).await {
+            let mut instance = reader.write().await;
+            super::links::inherit_sevr_msg(&mut instance.common, ms, &src);
         }
     }
 
@@ -4875,7 +4909,7 @@ impl PvDatabase {
         // YES; re-reading the constant every cycle (the pre-fix behaviour of
         // `read_link_value_no_process`) would stomp the operator's put back to
         // the constant on the very next process.
-        let fetch = self.fetch_link(siml).await;
+        let fetch = self.fetch_link(rec, siml).await;
         let failed = matches!(fetch, LinkFetch::Failed);
         match fetch {
             LinkFetch::Value(v) => {
@@ -5463,7 +5497,7 @@ impl PvDatabase {
         // the PENDING alarm (`rec_gbl_set_sevr` is C's MAXIMIZE) before the body
         // runs, so a body-raised alarm maximizes against it exactly as in C.
         if input_stage {
-            let fetch = self.fetch_link(&siol_link).await;
+            let fetch = self.fetch_link(rec, &siol_link).await;
             let mut instance = rec.write().await;
             // C `:416` reads SIOL with a plain `dbGetLink`, so a FAILED read
             // runs `setLinkAlarm` (dbLink.c:322) — LINK_ALARM/INVALID with
@@ -5568,7 +5602,7 @@ impl PvDatabase {
             // (C `dbGetLink`), which keeps C's three outcomes apart: a value,
             // a CONSTANT link's "status 0 with the buffer untouched", and a
             // failure.
-            let fetch = self.fetch_link(&siol_link).await;
+            let fetch = self.fetch_link(rec, &siol_link).await;
             let mut instance = rec.write().await;
 
             // C reads SIOL with a plain `dbGetLink`, whose failure path is

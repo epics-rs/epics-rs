@@ -3,6 +3,7 @@
 //! [`PortHandle`] is a lightweight, cloneable handle that sends requests to the
 //! actor via an mpsc channel and receives replies via oneshot channels.
 
+use crate::param::ParamValue;
 use std::future::Future;
 use std::pin::pin;
 use std::sync::Arc;
@@ -635,8 +636,8 @@ impl PortHandle {
     /// # Example
     /// ```ignore
     /// port_handle.set_params_and_notify(0, vec![
-    ///     ParamSetValue::Int32 { reason: acquire_busy, addr: 0, value: 0 },
-    ///     ParamSetValue::Int32 { reason: status, addr: 0, value: ADStatus::Idle as i32 },
+    ///     ParamSetValue::new(acquire_busy, 0, ParamValue::Int32(0)),
+    ///     ParamSetValue::new(status, 0, ParamValue::Int32(ADStatus::Idle as i32)),
     /// ]).await?;
     /// ```
     ///
@@ -1130,5 +1131,201 @@ mod tests {
         handle.set_auto_connect_blocking(false).unwrap();
         handle.set_auto_connect_blocking(false).unwrap();
         assert_eq!(hits.load(Ordering::Relaxed), 3);
+    }
+
+    /// Every parameter type the store supports must survive the actor path.
+    ///
+    /// `ParamSetValue` used to enumerate its own subset (Int32/Float64/Octet/
+    /// Int32Array/Float64Array/UInt32Digital), so a driver's background thread
+    /// pushing an `Int64`, `Int8Array`, `Int16Array`, `Int64Array`,
+    /// `Float32Array` or `Enum` — all of which `ParamList` stores and records
+    /// bind — had no variant to carry it, and the update was simply lost. The
+    /// carrier now holds a `ParamValue`, so the store's type set *is* the
+    /// request's type set.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn actor_path_carries_every_settable_param_type() {
+        use crate::param::{EnumEntry, ParamValue};
+        use crate::request::ParamSetValue;
+
+        struct TypedDriver {
+            base: PortDriverBase,
+        }
+        impl PortDriver for TypedDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            // Serve the array reasons from the parameter cache, as a real driver
+            // does — this is what a bound waveform record reads.
+            fn read_int8_array(&mut self, user: &AsynUser, buf: &mut [i8]) -> AsynResult<usize> {
+                let a = self.base.params.get_int8_array(user.reason, user.addr)?;
+                let n = a.len().min(buf.len());
+                buf[..n].copy_from_slice(&a[..n]);
+                Ok(n)
+            }
+            fn read_int16_array(&mut self, user: &AsynUser, buf: &mut [i16]) -> AsynResult<usize> {
+                let a = self.base.params.get_int16_array(user.reason, user.addr)?;
+                let n = a.len().min(buf.len());
+                buf[..n].copy_from_slice(&a[..n]);
+                Ok(n)
+            }
+            fn read_int64_array(&mut self, user: &AsynUser, buf: &mut [i64]) -> AsynResult<usize> {
+                let a = self.base.params.get_int64_array(user.reason, user.addr)?;
+                let n = a.len().min(buf.len());
+                buf[..n].copy_from_slice(&a[..n]);
+                Ok(n)
+            }
+            fn read_float32_array(
+                &mut self,
+                user: &AsynUser,
+                buf: &mut [f32],
+            ) -> AsynResult<usize> {
+                let a = self.base.params.get_float32_array(user.reason, user.addr)?;
+                let n = a.len().min(buf.len());
+                buf[..n].copy_from_slice(&a[..n]);
+                Ok(n)
+            }
+        }
+        let mut base = PortDriverBase::new("handle_test", 1, PortFlags::default());
+        // reason 0..=5, in the order pushed below.
+        base.create_param("I64", ParamType::Int64).unwrap();
+        base.create_param("I8A", ParamType::Int8Array).unwrap();
+        base.create_param("I16A", ParamType::Int16Array).unwrap();
+        base.create_param("I64A", ParamType::Int64Array).unwrap();
+        base.create_param("F32A", ParamType::Float32Array).unwrap();
+        base.create_param("ENUM", ParamType::Enum).unwrap();
+        let handle = make_handle(TypedDriver { base });
+
+        handle
+            .set_params_and_notify(
+                0,
+                vec![
+                    ParamSetValue::new(0, 0, ParamValue::Int64(-9_000_000_000)),
+                    ParamSetValue::new(1, 0, ParamValue::Int8Array(vec![-1i8, 2].into())),
+                    ParamSetValue::new(2, 0, ParamValue::Int16Array(vec![7i16, -8].into())),
+                    ParamSetValue::new(3, 0, ParamValue::Int64Array(vec![1i64 << 40].into())),
+                    ParamSetValue::new(4, 0, ParamValue::Float32Array(vec![1.5f32].into())),
+                    ParamSetValue::new(
+                        5,
+                        0,
+                        ParamValue::Enum {
+                            index: 1,
+                            choices: vec![
+                                EnumEntry {
+                                    string: "Off".into(),
+                                    value: 0,
+                                    severity: 0,
+                                },
+                                EnumEntry {
+                                    string: "On".into(),
+                                    value: 1,
+                                    severity: 0,
+                                },
+                            ]
+                            .into(),
+                        },
+                    ),
+                ],
+            )
+            .await
+            .unwrap();
+
+        // Int64 lands in the store (read back through the actor, FIFO-ordered
+        // behind the update).
+        assert_eq!(
+            handle.read_int64(0, 0).await.unwrap(),
+            -9_000_000_000,
+            "an Int64 pushed through the actor path must reach the store"
+        );
+        // Enum lands too.
+        assert_eq!(handle.read_enum(5, 0).await.unwrap(), 1);
+
+        // The four array types land in the store — read each back through the
+        // actor, exactly as a bound waveform record would.
+        let rd = |op, reason| {
+            let h = handle.clone();
+            async move {
+                h.submit_async(op, AsynUser::new(reason).with_addr(0))
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(
+            rd(RequestOp::Int8ArrayRead { max_elements: 8 }, 1)
+                .await
+                .int8_array
+                .unwrap(),
+            vec![-1i8, 2]
+        );
+        assert_eq!(
+            rd(RequestOp::Int16ArrayRead { max_elements: 8 }, 2)
+                .await
+                .int16_array
+                .unwrap(),
+            vec![7i16, -8]
+        );
+        assert_eq!(
+            rd(RequestOp::Int64ArrayRead { max_elements: 8 }, 3)
+                .await
+                .int64_array
+                .unwrap(),
+            vec![1i64 << 40]
+        );
+        assert_eq!(
+            rd(RequestOp::Float32ArrayRead { max_elements: 8 }, 4)
+                .await
+                .float32_array
+                .unwrap(),
+            vec![1.5f32]
+        );
+    }
+
+    /// A param set that FAILS must be reported, not swallowed. The actor used to
+    /// apply every update as `let _ = base.set_xxx_param(..)`, so pushing a value
+    /// the parameter cannot hold (here: an Int32 into a Float64 parameter)
+    /// returned success while the value went nowhere.
+    ///
+    /// The failing update is reported (C `setIntegerParam` asynPrints the
+    /// paramList error at ASYN_TRACE_ERROR and returns the status); the other
+    /// updates in the batch still land and the callbacks still fire.
+    #[test]
+    fn failed_param_set_is_reported_not_swallowed() {
+        use crate::param::ParamValue;
+        use crate::request::ParamSetValue;
+
+        let handle = make_handle(TestDriver::new());
+        // TestDriver: reason 0 = VAL (Int32), 1 = F64 (Float64), 2 = MSG (Octet).
+        let err = handle
+            .submit_blocking(
+                RequestOp::CallParamCallbacks {
+                    addr: 0,
+                    updates: vec![
+                        // Int32 into a Float64 param: the store cannot hold it.
+                        ParamSetValue::new(1, 0, ParamValue::Int32(7)),
+                        // A good update in the same batch must still land.
+                        ParamSetValue::new(0, 0, ParamValue::Int32(42)),
+                    ],
+                },
+                AsynUser::new(0),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, AsynError::TypeMismatch { .. }),
+            "a set the parameter cannot hold must surface, got {err:?}"
+        );
+        assert_eq!(
+            handle.read_int32_blocking(0, 0).unwrap(),
+            42,
+            "the good update in the batch still lands"
+        );
+        assert!(
+            matches!(
+                handle.read_float64_blocking(1, 0),
+                Err(AsynError::ParamUndefined(1))
+            ),
+            "the failed update stored nothing: the Float64 param is still undefined"
+        );
     }
 }

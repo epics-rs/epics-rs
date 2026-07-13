@@ -29,6 +29,7 @@ use asyn_rs::port_handle::PortHandle;
 use crate::ndarray::NDArray;
 use crate::ndarray_pool::NDArrayPool;
 use crate::params::ndarray_driver::NDArrayDriverParams;
+use asyn_rs::param::ParamValue;
 
 use super::channel::{
     NDArrayOutput, NDArrayReceiver, NDArraySender, PublishOutcome, ndarray_channel,
@@ -691,21 +692,21 @@ impl<P: NDPluginProcess> SharedProcessorInner<P> {
         let sort_free = self.sort_size - self.sort_buffer.len();
         ParamBatch {
             addr0: vec![
-                ParamSetValue::Int32 {
-                    reason: self.plugin_params.sort_free,
-                    addr: 0,
-                    value: sort_free,
-                },
-                ParamSetValue::Int32 {
-                    reason: self.plugin_params.disordered_arrays,
-                    addr: 0,
-                    value: self.sort_buffer.disordered_arrays,
-                },
-                ParamSetValue::Int32 {
-                    reason: self.plugin_params.dropped_output_arrays,
-                    addr: 0,
-                    value: self.sort_buffer.dropped_output_arrays,
-                },
+                ParamSetValue::new(
+                    self.plugin_params.sort_free,
+                    0,
+                    ParamValue::Int32(sort_free),
+                ),
+                ParamSetValue::new(
+                    self.plugin_params.disordered_arrays,
+                    0,
+                    ParamValue::Int32(self.sort_buffer.disordered_arrays),
+                ),
+                ParamSetValue::new(
+                    self.plugin_params.dropped_output_arrays,
+                    0,
+                    ParamValue::Int32(self.sort_buffer.dropped_output_arrays),
+                ),
             ],
             extra: std::collections::HashMap::new(),
         }
@@ -716,13 +717,14 @@ impl<P: NDPluginProcess> SharedProcessorInner<P> {
     fn build_status_params_batch(&self) -> ParamBatch {
         use asyn_rs::request::ParamSetValue;
         let mut batch = self.build_sort_params_batch();
-        batch.addr0.push(ParamSetValue::Int32 {
-            reason: self.plugin_params.dropped_arrays,
-            addr: 0,
-            value: self
-                .dropped_arrays
-                .load(std::sync::atomic::Ordering::Acquire),
-        });
+        batch.addr0.push(ParamSetValue::new(
+            self.plugin_params.dropped_arrays,
+            0,
+            ParamValue::Int32(
+                self.dropped_arrays
+                    .load(std::sync::atomic::Ordering::Acquire),
+            ),
+        ));
         batch
     }
 
@@ -872,71 +874,71 @@ impl<P: NDPluginProcess> SharedProcessorInner<P> {
             }
 
             addr0.extend([
-                ParamSetValue::Int32 {
-                    reason: self.ndarray_params.array_counter,
-                    addr: 0,
-                    value: self.array_counter,
-                },
-                ParamSetValue::Int32 {
-                    reason: self.ndarray_params.unique_id,
-                    addr: 0,
-                    value: report_arr.unique_id,
-                },
-                ParamSetValue::Int32 {
-                    reason: self.ndarray_params.n_dimensions,
-                    addr: 0,
-                    value: report_arr.dims.len() as i32,
-                },
-                ParamSetValue::Int32 {
-                    reason: self.ndarray_params.array_size_x,
-                    addr: 0,
-                    value: info.x_size as i32,
-                },
-                ParamSetValue::Int32 {
-                    reason: self.ndarray_params.array_size_y,
-                    addr: 0,
-                    value: info.y_size as i32,
-                },
-                ParamSetValue::Int32 {
-                    reason: self.ndarray_params.array_size_z,
-                    addr: 0,
-                    value: info.color_size as i32,
-                },
-                ParamSetValue::Int32 {
-                    reason: self.ndarray_params.array_size,
-                    addr: 0,
-                    value: info.total_bytes as i32,
-                },
-                ParamSetValue::Int32 {
-                    reason: self.ndarray_params.data_type,
-                    addr: 0,
-                    value: report_arr.data.data_type() as i32,
-                },
-                ParamSetValue::Int32 {
-                    reason: self.ndarray_params.color_mode,
-                    addr: 0,
-                    value: color_mode,
-                },
-                ParamSetValue::Int32 {
-                    reason: self.ndarray_params.bayer_pattern,
-                    addr: 0,
-                    value: bayer_pattern,
-                },
-                ParamSetValue::Float64 {
-                    reason: self.ndarray_params.timestamp_rbv,
-                    addr: 0,
-                    value: report_arr.timestamp.as_f64(),
-                },
-                ParamSetValue::Int32 {
-                    reason: self.ndarray_params.epics_ts_sec,
-                    addr: 0,
-                    value: report_arr.timestamp.sec as i32,
-                },
-                ParamSetValue::Int32 {
-                    reason: self.ndarray_params.epics_ts_nsec,
-                    addr: 0,
-                    value: report_arr.timestamp.nsec as i32,
-                },
+                ParamSetValue::new(
+                    self.ndarray_params.array_counter,
+                    0,
+                    ParamValue::Int32(self.array_counter),
+                ),
+                ParamSetValue::new(
+                    self.ndarray_params.unique_id,
+                    0,
+                    ParamValue::Int32(report_arr.unique_id),
+                ),
+                ParamSetValue::new(
+                    self.ndarray_params.n_dimensions,
+                    0,
+                    ParamValue::Int32(report_arr.dims.len() as i32),
+                ),
+                ParamSetValue::new(
+                    self.ndarray_params.array_size_x,
+                    0,
+                    ParamValue::Int32(info.x_size as i32),
+                ),
+                ParamSetValue::new(
+                    self.ndarray_params.array_size_y,
+                    0,
+                    ParamValue::Int32(info.y_size as i32),
+                ),
+                ParamSetValue::new(
+                    self.ndarray_params.array_size_z,
+                    0,
+                    ParamValue::Int32(info.color_size as i32),
+                ),
+                ParamSetValue::new(
+                    self.ndarray_params.array_size,
+                    0,
+                    ParamValue::Int32(info.total_bytes as i32),
+                ),
+                ParamSetValue::new(
+                    self.ndarray_params.data_type,
+                    0,
+                    ParamValue::Int32(report_arr.data.data_type() as i32),
+                ),
+                ParamSetValue::new(
+                    self.ndarray_params.color_mode,
+                    0,
+                    ParamValue::Int32(color_mode),
+                ),
+                ParamSetValue::new(
+                    self.ndarray_params.bayer_pattern,
+                    0,
+                    ParamValue::Int32(bayer_pattern),
+                ),
+                ParamSetValue::new(
+                    self.ndarray_params.timestamp_rbv,
+                    0,
+                    ParamValue::Float64(report_arr.timestamp.as_f64()),
+                ),
+                ParamSetValue::new(
+                    self.ndarray_params.epics_ts_sec,
+                    0,
+                    ParamValue::Int32(report_arr.timestamp.sec as i32),
+                ),
+                ParamSetValue::new(
+                    self.ndarray_params.epics_ts_nsec,
+                    0,
+                    ParamValue::Int32(report_arr.timestamp.nsec as i32),
+                ),
             ]);
 
             // NDCodec / NDCompressedSize — C++ beginProcessCallbacks
@@ -946,37 +948,37 @@ impl<P: NDPluginProcess> SharedProcessorInner<P> {
             // driver-base path in ndarray_driver::prepare_array).
             match &report_arr.codec {
                 Some(codec) => {
-                    addr0.push(ParamSetValue::Octet {
-                        reason: self.ndarray_params.codec,
-                        addr: 0,
-                        value: codec.name.as_str().to_string(),
-                    });
-                    addr0.push(ParamSetValue::Int32 {
-                        reason: self.ndarray_params.compressed_size,
-                        addr: 0,
-                        value: codec.compressed_size as i32,
-                    });
+                    addr0.push(ParamSetValue::new(
+                        self.ndarray_params.codec,
+                        0,
+                        ParamValue::Octet(codec.name.as_str().to_string()),
+                    ));
+                    addr0.push(ParamSetValue::new(
+                        self.ndarray_params.compressed_size,
+                        0,
+                        ParamValue::Int32(codec.compressed_size as i32),
+                    ));
                 }
                 None => {
-                    addr0.push(ParamSetValue::Octet {
-                        reason: self.ndarray_params.codec,
-                        addr: 0,
-                        value: String::new(),
-                    });
-                    addr0.push(ParamSetValue::Int32 {
-                        reason: self.ndarray_params.compressed_size,
-                        addr: 0,
-                        value: info.total_bytes as i32,
-                    });
+                    addr0.push(ParamSetValue::new(
+                        self.ndarray_params.codec,
+                        0,
+                        ParamValue::Octet(String::new()),
+                    ));
+                    addr0.push(ParamSetValue::new(
+                        self.ndarray_params.compressed_size,
+                        0,
+                        ParamValue::Int32(info.total_bytes as i32),
+                    ));
                 }
             }
         }
 
-        addr0.push(ParamSetValue::Float64 {
-            reason: self.plugin_params.execution_time,
-            addr: 0,
-            value: elapsed_ms,
-        });
+        addr0.push(ParamSetValue::new(
+            self.plugin_params.execution_time,
+            0,
+            ParamValue::Float64(elapsed_ms),
+        ));
 
         // ArrayRate_RBV is computed by a calc record in the DB template
         // (SCAN "1 second", reading ArrayCounter_RBV delta), not in Rust.
@@ -989,11 +991,7 @@ impl<P: NDPluginProcess> SharedProcessorInner<P> {
                     addr,
                     value,
                 } => {
-                    let pv = ParamSetValue::Int32 {
-                        reason: *reason,
-                        addr: *addr,
-                        value: *value,
-                    };
+                    let pv = ParamSetValue::new(*reason, *addr, ParamValue::Int32(*value));
                     if *addr == 0 {
                         addr0.push(pv);
                     } else {
@@ -1005,11 +1003,7 @@ impl<P: NDPluginProcess> SharedProcessorInner<P> {
                     addr,
                     value,
                 } => {
-                    let pv = ParamSetValue::Float64 {
-                        reason: *reason,
-                        addr: *addr,
-                        value: *value,
-                    };
+                    let pv = ParamSetValue::new(*reason, *addr, ParamValue::Float64(*value));
                     if *addr == 0 {
                         addr0.push(pv);
                     } else {
@@ -1021,11 +1015,7 @@ impl<P: NDPluginProcess> SharedProcessorInner<P> {
                     addr,
                     value,
                 } => {
-                    let pv = ParamSetValue::Octet {
-                        reason: *reason,
-                        addr: *addr,
-                        value: value.clone(),
-                    };
+                    let pv = ParamSetValue::new(*reason, *addr, ParamValue::Octet(value.clone()));
                     if *addr == 0 {
                         addr0.push(pv);
                     } else {
@@ -1037,11 +1027,11 @@ impl<P: NDPluginProcess> SharedProcessorInner<P> {
                     addr,
                     value,
                 } => {
-                    let pv = ParamSetValue::Float64Array {
-                        reason: *reason,
-                        addr: *addr,
-                        value: value.clone(),
-                    };
+                    let pv = ParamSetValue::new(
+                        *reason,
+                        *addr,
+                        ParamValue::Float64Array(value.clone().into()),
+                    );
                     if *addr == 0 {
                         addr0.push(pv);
                     } else {
@@ -1798,16 +1788,12 @@ fn queue_status_batch(
     use asyn_rs::request::ParamSetValue;
     ParamBatch {
         addr0: vec![
-            ParamSetValue::Int32 {
-                reason: plugin_params.queue_size,
-                addr: 0,
-                value: max_capacity as i32,
-            },
-            ParamSetValue::Int32 {
-                reason: plugin_params.queue_use,
-                addr: 0,
-                value: free,
-            },
+            ParamSetValue::new(
+                plugin_params.queue_size,
+                0,
+                ParamValue::Int32(max_capacity as i32),
+            ),
+            ParamSetValue::new(plugin_params.queue_use, 0, ParamValue::Int32(free)),
         ],
         extra: std::collections::HashMap::new(),
     }
@@ -1820,11 +1806,11 @@ async fn clamp_writeback(port: &PortHandle, reason: usize, value: i32) {
     let _ = port
         .set_params_and_notify(
             0,
-            vec![ParamSetValue::Int32 {
+            vec![ParamSetValue::new(
                 reason,
-                addr: 0,
-                value,
-            }],
+                0,
+                asyn_rs::param::ParamValue::Int32(value),
+            )],
         )
         .await;
 }

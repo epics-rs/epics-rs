@@ -555,7 +555,8 @@ impl TraceManager {
                 data
             };
 
-            let formatted = format_io_data(data, cfg.trace_io_mask, cfg.trace_buffer_size);
+            let formatted =
+                format_io_data(data, cfg.trace_io_mask, &cfg.file, cfg.trace_buffer_size);
             let line = format!("{prefix}{label} {formatted}\n");
             cfg.file.write_line(&line);
         });
@@ -923,14 +924,15 @@ fn mask_label(mask: TraceMask) -> &'static str {
 
 /// Format I/O data according to the trace I/O mask.
 ///
-/// `buf_size` is the C destination bound of the ESCAPE form — the trace port's
-/// `tracePvt.traceBuffer` (asynManager.c:3159), i.e.
-/// [`TraceConfig::trace_buffer_size`].
-pub fn format_io_data(data: &[u8], mask: TraceIoMask, buf_size: usize) -> String {
+/// The ESCAPE form depends on the trace *destination* — see [`format_escape`]:
+/// `dest` is the sink C's `getTraceFile` would return a `FILE *` for, and
+/// `buf_size` is [`TraceConfig::trace_buffer_size`], the bound that applies on
+/// the errlog branch alone.
+pub fn format_io_data(data: &[u8], mask: TraceIoMask, dest: &TraceFile, buf_size: usize) -> String {
     if mask.contains(TraceIoMask::HEX) {
         format_hex(data)
     } else if mask.contains(TraceIoMask::ESCAPE) {
-        format_escape(data, buf_size)
+        format_escape(data, dest, buf_size)
     } else {
         // ASCII (default)
         format_ascii(data)
@@ -949,14 +951,31 @@ fn format_ascii(data: &[u8]) -> String {
         .collect()
 }
 
-/// `ASYN_TRACEIO_ESCAPE`, which C prints with the libCom escape table
-/// (`epicsStrSnPrintEscaped` into `tracePvt.traceBuffer`, asynManager.c:3159).
-/// The buffer is the bound: a trace line whose escaped form does not fit is
-/// truncated at `traceBufferSize - 1` characters, dangling backslash included.
-/// Its own four-case table left `\a`, `\b`, `\f`, `\v`, `'` and `"` unescaped
-/// or hexed, which no C caller does (R16-48).
-fn format_escape(data: &[u8], buf_size: usize) -> String {
-    crate::escape::escaped_from_raw(data, buf_size)
+/// `ASYN_TRACEIO_ESCAPE`. Which of libCom's *two* escape entry points runs is a
+/// property of the trace **destination**, not of the mask
+/// (`traceVprintIOSource`, asynManager.c:3153-3165):
+///
+/// ```text
+/// fp != NULL   epicsStrPrintEscaped(fp, buffer, nBytes)   stdout/stderr/file
+/// fp == NULL   epicsStrSnPrintEscaped(traceBuffer, ...)   errlog
+/// ```
+///
+/// and `getTraceFile` (:2928-2941) returns `NULL` for `traceFileErrlog` alone —
+/// every other sink, including the `traceFileStderr` a port is born with
+/// (`tracePvtInit`, :458), takes the `FILE *` branch. The two differ: the stream
+/// form has no destination bound and no `case '\0'`, so a NUL prints as `\x00`
+/// (and a first-byte NUL prints nothing at all — R17-49). Hardwiring
+/// `escaped_from_raw` gave every sink the errlog form.
+///
+/// The table itself is one table: its own four-case copy left `\a`, `\b`, `\f`,
+/// `\v`, `'` and `"` unescaped or hexed, which no C caller does (R16-48).
+fn format_escape(data: &[u8], dest: &TraceFile, buf_size: usize) -> String {
+    match dest {
+        TraceFile::Errlog => crate::escape::escaped_from_raw(data, buf_size),
+        TraceFile::Stderr | TraceFile::Stdout | TraceFile::File(_) => {
+            crate::escape::print_escaped(data)
+        }
+    }
 }
 
 fn format_hex(data: &[u8]) -> String {
@@ -1227,21 +1246,54 @@ mod tests {
     #[test]
     fn test_format_escape() {
         let n = DEFAULT_TRACE_BUFFER_SIZE;
-        assert_eq!(format_escape(b"OK\r\n", n), "OK\\r\\n");
-        assert_eq!(format_escape(b"\t\\", n), "\\t\\\\");
-        assert_eq!(format_escape(&[0x01], n), "\\x01");
-        assert_eq!(format_escape(b"hi", n), "hi");
+        let errlog = TraceFile::Errlog;
+        assert_eq!(format_escape(b"OK\r\n", &errlog, n), "OK\\r\\n");
+        assert_eq!(format_escape(b"\t\\", &errlog, n), "\\t\\\\");
+        assert_eq!(format_escape(&[0x01], &errlog, n), "\\x01");
+        assert_eq!(format_escape(b"hi", &errlog, n), "hi");
     }
 
     /// The ESCAPE form's destination is C's `tracePvt.traceBuffer`
     /// (asynManager.c:3159), 80 bytes until `setTraceIOTruncateSize` grows it
-    /// (:2947-2953) — so an escape-heavy line is cut at `traceBufferSize - 1`.
+    /// (:2947-2953) — so an escape-heavy errlog line is cut at
+    /// `traceBufferSize - 1`. The stream branch has no such buffer.
     #[test]
-    fn format_escape_is_bounded_by_the_trace_buffer() {
+    fn format_escape_is_bounded_by_the_trace_buffer_on_the_errlog_branch_only() {
         let crlf: Vec<u8> = b"\r\n".repeat(50);
-        let out = format_escape(&crlf, DEFAULT_TRACE_BUFFER_SIZE);
+        let out = format_escape(&crlf, &TraceFile::Errlog, DEFAULT_TRACE_BUFFER_SIZE);
         assert_eq!(out.len(), DEFAULT_TRACE_BUFFER_SIZE - 1);
         assert!(out.ends_with(r"\r\n\r\"), "cut mid-pair, as C does: {out}");
+
+        let out = format_escape(&crlf, &TraceFile::Stderr, DEFAULT_TRACE_BUFFER_SIZE);
+        assert_eq!(out.len(), 200, "epicsStrPrintEscaped writes to a stream");
+    }
+
+    /// R17-46. C picks the escape entry point by *destination*
+    /// (asynManager.c:3153-3165): `fp != NULL` → `epicsStrPrintEscaped`,
+    /// errlog → `epicsStrSnPrintEscaped`. `getTraceFile` (:2928-2941) hands back
+    /// `NULL` for errlog alone, and a port's default sink is stderr
+    /// (`tracePvtInit`, :458) — so the *default* trace line takes the stream
+    /// form, which prints a NUL as `\x00` where the errlog form prints `\0`.
+    #[test]
+    fn the_escape_entry_point_is_chosen_by_the_trace_destination() {
+        let n = DEFAULT_TRACE_BUFFER_SIZE;
+        let data = b"a\0b";
+
+        // errlog: epicsStrSnPrintEscaped — has `case '\0'` (epicsString.c:145).
+        assert_eq!(format_escape(data, &TraceFile::Errlog, n), r"a\0b");
+
+        // Every FILE* sink, the stderr default included: epicsStrPrintEscaped,
+        // whose switch has no NUL case (:255-260).
+        assert_eq!(format_escape(data, &TraceFile::Stderr, n), r"a\x00b");
+        assert_eq!(format_escape(data, &TraceFile::Stdout, n), r"a\x00b");
+        let f = TraceFile::File(Arc::new(Mutex::new(
+            std::fs::File::create(std::env::temp_dir().join("asyn_r17_46.txt")).unwrap(),
+        )));
+        assert_eq!(format_escape(data, &f, n), r"a\x00b");
+        let _ = std::fs::remove_file(std::env::temp_dir().join("asyn_r17_46.txt"));
+
+        // And the default TraceConfig is one of the FILE* sinks, not errlog.
+        assert!(matches!(TraceConfig::default().file, TraceFile::Stderr));
     }
 
     /// C `setTraceIOTruncateSize` reallocates `traceBuffer` to the new size when
@@ -1276,9 +1328,16 @@ mod tests {
     fn test_format_io_data_dispatch() {
         let data = b"OK\r\n";
         let n = DEFAULT_TRACE_BUFFER_SIZE;
-        assert_eq!(format_io_data(data, TraceIoMask::ASCII, n), "OK..");
-        assert_eq!(format_io_data(data, TraceIoMask::ESCAPE, n), "OK\\r\\n");
-        assert_eq!(format_io_data(data, TraceIoMask::HEX, n), "4f 4b 0d 0a");
+        let dest = TraceFile::Stderr;
+        assert_eq!(format_io_data(data, TraceIoMask::ASCII, &dest, n), "OK..");
+        assert_eq!(
+            format_io_data(data, TraceIoMask::ESCAPE, &dest, n),
+            "OK\\r\\n"
+        );
+        assert_eq!(
+            format_io_data(data, TraceIoMask::HEX, &dest, n),
+            "4f 4b 0d 0a"
+        );
     }
 
     #[test]

@@ -3975,6 +3975,113 @@ silently edited above.
   1-based formulation and is **correct**. The divergence was in the port's 0-based
   translation (`saturating_sub` clamping at 0), since fixed. Nothing to report upstream.
 
+### Batch C (appended 2026-07-13, from the Round-13 candidate list — 6 entries: 1 REPRODUCED, 5 NOT-REPRODUCED)
+
+### CBUG-C1: sCalc `LRC`/`AMODBUS` on an empty operand is an unbounded read — segfaults the IOC
+Bucket: NOT-REPRODUCED · Severity: High
+C: `sCalcPerform.c:247` — the LRC loop bound is `i < strlen(rawInput)-1` with `strlen` returning
+`size_t`: for an empty operand `strlen-1` wraps to `SIZE_MAX` and the loop reads two bytes per
+step past the end of a zero-length string.
+Defect: no emptiness guard anywhere on the LRC path (`LRC(...)`, and `AMODBUS(...)` which
+prepends `":"` *after* the LRC is computed). The read runs until it faults.
+Port: `crates/epics-base-rs/src/calc/engine/checksum.rs:47-49` — an empty operand returns
+`None` and the checksum owner yields the empty string; the site's doc block records that this
+is a refusal of C UB, not a divergence.
+Impact: any scalcout whose string input can be momentarily empty — a fresh record before its
+first input fetch, a cleared field, an operator typo — crashes the **whole IOC** from a
+reachable record state.
+Proof: compiled upstream (Round-13 category-A harness) SEGFAULTS on `LRC("")`, `AMODBUS("")`,
+and `LRC(AA)` with an empty `AA`.
+
+---
+
+### CBUG-C2: pvxs QSRV resets the whole TCP circuit when one channel's request options fail to parse
+Bucket: REPRODUCED · Severity: Medium
+C: `pvxs/ioc/singlesource.cpp:147` / `pvxs/ioc/groupsource.cpp:399` — `onSubscribe` calls a
+bare `connect()`; the `NoConvert` its DBE/options parse can throw propagates uncaught into the
+connection layer, which tears the circuit down.
+Defect: a per-operation failure (one client's malformed `record._options`, e.g. a DBE
+selector naming a non-array element kind) is escalated to a transport-level reset, killing
+every other channel multiplexed on that TCP connection.
+Port: `crates/epics-bridge-rs/src/qsrv/pva_adapter.rs:389-420` (`check_monitor_request`)
+reproduces the reset for exactly pvxs's DBE `NoConvert` case (bug-for-bug, W10-C1/R10-37);
+`crates/epics-pva-rs/src/server_native/tcp.rs:9997`
+(`init_empty_selector_descriptor_only_registers_op`) pins that other malformed INITs degrade
+per-op instead of resetting.
+Impact: through a gateway, one downstream user's field typo drops every downstream user's
+channels on that gateway connection — the blast radius is the shared circuit, not the
+offending op.
+Proof: W10-C1 adjudicated REAL in the Round-13 re-audit (pinned line re-read); the port's
+reproduction and its scope are tested at the two sites above.
+
+---
+
+### CBUG-C3: sCalc `FETCH_AA` leaves the 40-byte local string unterminated when the source is exactly `SCALC_STRING_SIZE` long
+Bucket: NOT-REPRODUCED · Severity: Low
+C: `sCalcPerform.c:866-872` — `ps->s = &(ps->local_string[0]); strncpy(ps->s, psarg[op -
+FETCH_AA], SCALC_STRING_SIZE);` — `strncpy` writes no terminator when the source length is ≥
+`SCALC_STRING_SIZE` (40), and every later reader of `ps->s` (`atof`, `strlen`, string ops)
+runs past the 40-byte `local_string` into adjacent stack-cell memory.
+Defect: missing forced termination after the bounded copy (the idiomatic `s[SIZE-1]='\0'` is
+absent here, though present in other paths).
+Port: `crates/epics-base-rs/src/calc/engine/string.rs:47-50` — the string evaluator's fetch
+clones the length-carrying `PvString`; there is no fixed buffer and no terminator to lose.
+Impact: LATENT — a real scalcout supplies `char[40]` fields whose own copy paths terminate, so
+the ≥40-byte psarg cannot arise from record state; only a device-support caller handing longer
+strings to `sCalcPerform` directly is exposed.
+Proof: the copy site quoted; not compiled-driven (unreachable from record state — the reason
+it is Low and latent).
+
+---
+
+### CBUG-C4: `caget -w nan` waits forever — a NaN timeout never expires
+Bucket: NOT-REPRODUCED · Severity: Low
+C: `tool_lib.c:628` (`connect_pvs` → `ca_pend_io(caTimeout)`) — `epicsScanDouble` at caget's
+`-w` case accepts `"nan"`, and inside libca every deadline comparison against a NaN timeout is
+false, so the pend never times out.
+Defect: no finiteness check between the lenient scanner and the pend deadline.
+Port: `crates/epics-ca-rs/src/cli.rs:100-104` — a non-finite `-w` resolves to
+`DEFAULT_CLI_TIMEOUT_SECS` (C's 1 s default); a negative `-w` is an already-expired deadline
+(W10-B1).
+Impact: a scripted `caget -w $computed` whose arithmetic goes NaN blocks the script forever on
+any unanswered search instead of failing after the timeout.
+Proof: decisive path quoted; surfaced during the Round-13 category-B compiled head-to-head
+runs.
+
+---
+
+### CBUG-C5: sCalc `PRINTF` with more conversions than arguments reads a missing vararg — undefined behaviour
+Bucket: NOT-REPRODUCED · Severity: Low
+C: `sCalcPerform.c:1546-1564` — `PRINTF` pops exactly ONE operand and calls `snprintf` with
+exactly one vararg; a format containing a second conversion makes `snprintf` fetch a variadic
+argument that was never passed (undefined behaviour; in practice it reads whatever the
+register/stack slot holds).
+Defect: the conversion count in the user-supplied format is never validated against the fixed
+one-argument call shape.
+Port: `crates/epics-base-rs/src/calc/engine/string.rs:578-583` → `simple_printf` (`:1050-1058`)
+— renders the single popped value through the port's own formatter; there is no vararg
+machinery to over-read.
+Impact: `PRINTF("%d %d", A)` in any scalcout prints A followed by garbage (content
+compiler/ABI-dependent), silently corrupting the string result.
+Proof: the one-vararg call shape quoted; UB by C99 7.19.6.1p2 (too few variadic arguments).
+
+---
+
+### CBUG-C6: sCalc `UNTIL` with a string condition tests an uninitialised double
+Bucket: NOT-REPRODUCED · Severity: Low
+C: `sCalcPerform.c:1999` — `if (ps->d == 0)` with no `toDouble(ps)` in front, while
+`LITERAL_STRING`'s push (`:1493-1499`) sets `ps->s` and never touches `ps->d`: a string-valued
+loop condition tests whatever double the stack cell last held.
+Defect: the condition read skips the type settle every other numeric consumer performs.
+Port: `crates/epics-base-rs/src/calc/engine/string.rs:796-800` — the condition is read through
+`to_double` (the `atof` coercion every other numeric context applies); the site's doc block
+records this as the adopted R13-8 disposition (do not port UB), and aCalc's `UNTIL_END`
+carries the same documented deviation for an array condition.
+Impact: `UNTIL(...;"0")` exits or loops depending on unrelated stack history — the same
+expression behaves differently under a different evaluation prefix.
+Proof: compiled upstream exits after ONE iteration for both `UNTIL(A:=A+1;"0")` and
+`UNTIL(A:=A+1;"1")` (stale `d` non-zero both times); probes quoted in the port's doc block.
+
 ---
 
 ## Fix wave 10 — dispositions (2026-07-13)
@@ -4304,21 +4411,170 @@ Category E (records/framework):
 ### R13-62: the ACKS event is gated on a value change; C posts whenever the ack rule fires — Low, compiled repro. `recgbl.rs:221-226` requires acks != sevr; C recGbl.c:214-217 posts DBE_VALUE unconditionally inside the rule. Stat-only transition at constant severity (LINK→CALC at INVALID, ACKT=1): C posts stat+amsg+acks, port omits acks.
 ### R13-63: transform's LA..LP fields are not served — Low. transformRecord.dbd:505-584 declares them; transformRecord.c:797,804 uses them as previously-posted cells. `caget T.LA` → C value, port "Invalid record field name". Readback-only gap (port's change detection uses last_posted).
 
-### Upstream C defect candidates (for the next CBUG catalogue pass)
-- CBUG-cand: LRC/AMODBUS on an empty string is an unbounded read — sCalcPerform.c:247 `i<strlen(rawInput)-1` wraps to SIZE_MAX; compiled upstream SEGFAULTS on `LRC("")`, `AMODBUS("")`, `LRC(AA)` with empty AA. Port returns "" and is safe. High (crash from a reachable record state).
-- CBUG-cand: W10-C1 CONFIRMED — QSRV singlesource.cpp:147 / groupsource.cpp:399 bare `connect()`; a client field typo resets the whole TCP circuit; through a gateway, every downstream user's channels. Medium.
-- CBUG-cand: FETCH_AA `strncpy(ps->s, psarg[i], SCALC_STRING_SIZE)` (sCalcPerform.c:872) leaves the local string unterminated at exactly 40 bytes and atof reads past it — latent, unreachable from a real char[40] field. Low.
-- CBUG-cand: `caget -w nan` hangs forever — ca_pend_io(NaN) never expires (tool_lib.c:628 path). Low.
-- CBUG-cand: sCalc PRINTF with more conversions than arguments reads garbage off the stack (sCalcPerform.c:1546-1564, snprintf with one vararg). Low.
-- CBUG-cand: sCalc UNTIL with a string condition tests uninitialised `ps->d` (sCalcPerform.c:1999). Low. Port disposition recorded at R13-8.
+### Upstream C defect candidates — FILED 2026-07-13 as CBUG-C1..C6 (batch C, catalogue above)
+- CBUG-cand → **CBUG-C1**: LRC/AMODBUS on an empty string is an unbounded read — sCalcPerform.c:247 `i<strlen(rawInput)-1` wraps to SIZE_MAX; compiled upstream SEGFAULTS on `LRC("")`, `AMODBUS("")`, `LRC(AA)` with empty AA. Port returns "" and is safe. High (crash from a reachable record state).
+- CBUG-cand → **CBUG-C2**: W10-C1 CONFIRMED — QSRV singlesource.cpp:147 / groupsource.cpp:399 bare `connect()`; a client field typo resets the whole TCP circuit; through a gateway, every downstream user's channels. Medium.
+- CBUG-cand → **CBUG-C3**: FETCH_AA `strncpy(ps->s, psarg[i], SCALC_STRING_SIZE)` (sCalcPerform.c:872) leaves the local string unterminated at exactly 40 bytes and atof reads past it — latent, unreachable from a real char[40] field. Low.
+- CBUG-cand → **CBUG-C4**: `caget -w nan` hangs forever — ca_pend_io(NaN) never expires (tool_lib.c:628 path). Low.
+- CBUG-cand → **CBUG-C5**: sCalc PRINTF with more conversions than arguments reads garbage off the stack (sCalcPerform.c:1546-1564, snprintf with one vararg). Low.
+- CBUG-cand → **CBUG-C6**: sCalc UNTIL with a string condition tests uninitialised `ps->d` (sCalcPerform.c:1999). Low. Port disposition recorded at R13-8.
 
-### User-decision queue (updated)
-Awaiting instruction, code untouched: ARANDOM seeding; W10-D1 (CNCT waiver —
-auditor recommends matching C; the port's Waived behaviour would need to be a
-documented opt-in deviation to survive); W10-E3 (IVOV substitution — both
-halves move together if C parity is wanted; module doc declares the deviation
-deliberate); R13-21 (out-of-range float→int display — recommend defined
-saturating rule + documented deviation); long-form `--options` superset on
-the CA tools (deliberate superset — keep or gate); W10-E7 (port aai/aao or
-leave declared-inert). Adopted without ballot (recommendation = only sane
-option): R13-8 do-not-port-UB.
+### User-decision queue (resolved 2026-07-13, wave 11)
+Five of the six ballots came back; each landed as its own commit:
+- **ARANDOM seeding** → ADOPTED as C parity: RNDM/ARNDM/NRNDM replay C's
+  fixed-seed (`0xa3bf`) thread-private 16-bit LCG deterministically; the three
+  per-engine copies were unified into one shared `calc/engine/random.rs`, and
+  time-seeding is an explicit opt-in extension
+  (`seed_random_from_time`, documented deviation). Commit `9677b68a`.
+- **W10-D1 (CNCT waiver)** → ADOPTED as C parity: Connect-queue ops take
+  exactly C's `checkPortConnect` waiver (`addr == -1` or
+  `ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED`, asynManager.c:1520,1535-1538) —
+  asynRecord CNCT at a device address is refused on a disconnected port, the C
+  wart reproduced by decision. Commit `1897513e`.
+- **W10-E3 (IVOV substitution)** → ADOPTED as C parity, both halves together:
+  Set_output_to_IVOV sets the scalar `OVAL` only (aCalcoutRecord.c:924), and
+  the OUT write buffer is chosen by the resolved target element count
+  (devaCalcoutSoft.c:75-87; scalar target ⇒ VAL/OVAL, array target ⇒ AVAL/OAV,
+  disconnected-CA default ⇒ scalar). Module-doc deviation retracted; one test
+  per invariant boundary. Commit `9d083975`.
+- **R13-21 (out-of-range float→int display)** → ADOPTED as documented
+  deviation with a defined rule: round half-away-from-zero, then saturate at
+  the int32 boundary (`+Inf`/overflow → `0x7FFFFFFF`, `−Inf`/underflow →
+  `0x80000000`, NaN → 0) — C's cast is UB and x86-64's uniform `0x80000000`
+  is not a contract. Commit `3fc1628d`.
+- **long-form `--options` superset** → KEPT as documented deviation: every
+  C-valid command line parses identically; the long forms only admit
+  invocations C refuses. Recorded at the parse-contract owner
+  (`epics-ca-rs/src/copt.rs` module doc). Commit `3714dfc3`.
+
+Still awaiting: **W10-E7** (port aai/aao or leave declared-inert).
+Adopted without ballot earlier (recommendation = only sane option):
+R13-8 do-not-port-UB.
+
+---
+
+## Fix wave 11 — dispositions (2026-07-13)
+
+Five opus fixer panels, one worktree per category; main merged and verified
+by the coordinator. Scope: the 32 Round-13 findings plus the 29 assigned W10
+candidates (R13-21/W10-D1/W10-E3 + two more went to the user-decision ballot
+instead — resolved below). Verification on the merged tree at the time of
+merge: `cargo clippy --workspace --all-targets -- -D warnings` clean,
+`cargo nextest run --workspace` 8548/8549 (the one failure is
+`epics-pva-rs::stability r12_33`, the user's own in-progress test infra —
+passes isolated, untouched by the wave), doctests clean. After the
+decision-item commits below: **8560 passed / 0 failed / 2 skipped**,
+workspace clippy clean.
+
+### Category A — calc engines (merge `73b735ed`)
+- R13-1 FIXED `9c333a96` — AND/OR are the BITWISE operators in all three engines.
+- R13-2 FIXED `9df03af8` — the function is deferred past a following `[..]`/`{..}`.
+- R13-3 FIXED `c876a6f4` — sCalc string literals are raw bytes; $T is the only translator.
+- R13-4 FIXED `1e95fa72` — sCalc `>?`/`<?` settle their types like every other binary op.
+- R13-5 FIXED `ed0abb19` — sCalc has `@`/`@@`, the dynamic-argument fetches.
+- R13-6 FIXED `bc8ba6a2` — sCalc enforces the end-of-expression stack-depth invariant.
+- R13-7 FIXED `92175f20` — the UNTIL ceiling is C's static pre-scan, not a runtime counter.
+- R13-8 DOCUMENTED `41678b34` — the UNTIL string-condition deviation from C (adopted; filed as CBUG-C6).
+- W10-A1 FIXED `f00b1839` — sCalc MAX/MIN settle their types by C's pre-scan.
+- W10-A2 FIXED `8a76ad0f` — sCalc `|-` is subtraction when either operand is a double.
+- W10-A3 FIXED `b763bbe8` — aCalc runs UNTIL loops (the array evaluator had no Control arm).
+- W10-A4 FIXED `6b85f8b0` — the dead `StringOp::PushStringVar` is deleted.
+- W10-A7 FIXED `269c8fc2` — sseq's internal put ends in `put_field_internal_default`.
+- W10-A8 FIXED `210887a3` — an acalcout array input is spliced into, never replaced.
+
+### Category B — CA tools (merge `3240e1b5`)
+- R13-16 FIXED `ff4fc509` — only a VALID `-0<base>` re-enters the `-d` type race.
+- R13-17 FIXED `00c2463f` — every C option is repeatable, last one wins (structural: `assert_repeatable` refuses non-Append/Count specs).
+- R13-18 FIXED `766dad06` — every unknown `-t` character warns.
+- R13-19 FIXED `c9ae882b` — the field separator belongs to the value, not the timestamp.
+- R13-20 FIXED `977a5350` — a non-finite double is spelled the way C printf spells it.
+- R13-22 FIXED `6d9ee5d8` — caput validates the value before the `Old :` readback.
+- R13-23 FIXED `8219ff5a` — an out-of-range enum index warns but still puts.
+- R13-24 FIXED `fdb82010` — a server-rejected put prints libca's CA.Client.Exception block.
+- R13-25 FIXED `15c59dd1` — cainfo `-n` is C's `default:` arm, not an unknown option.
+- R13-26 FIXED `1cecf272` — the getopt loop runs in argv order, and `-h`/`-V` end it there.
+- W10-B1 FIXED `6fc13c86` — a negative `-w` is an already-expired deadline.
+- W10-B2 FIXED `15741cf4` — `-e`/`-f`/`-g` is the last VALID occurrence in getopt order.
+- W10-B3 FIXED `9d6be264` — an all-zero stamp prints `<undefined>`, not the EPICS epoch.
+- W10-B4 FIXED `a150343f` — ns→µs rounds with C's clamp in one shared time formatter.
+- W10-B5 FIXED `88c10c82` — the host a client names is the resolved one, not the dotted IP.
+- W11-B6 FIXED `83160d5b` — an option-argument that starts with `-` belongs to the option.
+- W11-B7 FIXED `1b252bd2` — a later `-t` resets the source, never the kind.
+
+### Category C — PVA (merge `23b9f499`)
+- R13-31/R13-32 FIXED `a529d571` — the wire changed-bitset is leaf-enumerated.
+- R13-33 FIXED `abaf0e57` — a DBE_PROPERTY event marks pvxs's leaves, not the parent structs.
+- R13-34 FIXED `d5dc0c84` — a terminal monitor post is push_back'd past limit, never squashed.
+- W10-C2 PINNED `9d2c52bf` — the connect-time monitor seed frame, byte-for-byte.
+- W10-C3 RELABELED `873fde25` — `put_get_masks`' parity citation (no pvxs counterpart; pvAccessCPP/pvDatabaseCPP extension).
+
+### Category D — asyn (merge `d0242f3c`)
+- R13-46 FIXED `4f26bfe9` — `queue_gate` answers "does C queue this?" per op, no wildcard.
+- R13-47 FIXED `03cf3e1b` — a driver's parameter publish is not queue-gated.
+- R13-48 FIXED `9a138055` — `drvUser->create` is a direct table lookup, not a queued request.
+- R13-49 FIXED `8eded27b` — the EOS shell commands carry C's 2 s I/O timeout.
+- R13-50 FIXED `6d24cb79` — a reused client slot revives the child subport.
+- R13-51 FIXED `175296f6` — a waived request is followed by C's port auto-connect (+ test-order deflake `0a148e3e`: counter asserts sequence behind an actor probe barrier, the auto-connect tail runs after the reply).
+- W10-D2 FIXED `09a782e6` — every asynCallbackSpecial arm ends in monitorStatus.
+- W10-D3 FIXED `ff212582` — connectDevice reads the EOS back from the driver.
+- W10-D5 FIXED `24ab7c74` — the IP-server child port honours disconnectOnReadTimeout.
+- W10-D6 FIXED `56288d66` — asynReport works on a disabled or disconnected port.
+
+### Category E — records/framework (merge `44cb6508`)
+- R13-61 FIXED `a0a8cd73` — AMSG keeps the last alarm text after the alarm clears.
+- R13-62 FIXED `3e532964` — ACKS posts whenever the ack rule fires, not only on a change.
+- R13-63 FIXED `81968d39` — transform serves LA..LP, the previous-value readbacks.
+- W10-E1 FIXED `356d3d09` — `.ACKS` must not double-post.
+- W10-E2 FIXED `9db78b3d` — the scaler DLY watchdog is what starts a delayed count.
+- W10-E4 FIXED `20ac8a5c` — a failed SIOL read raises LINK_ALARM.
+- W10-E5 FIXED `82c3deb1` — busy's failed SIML read returns before the output write.
+- W10-E8 FIXED `974bcbcd` — a simulated histogram lands SIOL in SGNL and bins it.
+- W10-A5 FIXED `af4fc41a` — acalcout: one post per C call site, with that call site's mask.
+- W10-A6 FIXED `e92e3c4a` — acalcout AA..LL never post from change detection.
+- (docs `61fd1d23` — the SIMM-scan-swap docs point at the predicate that exists.)
+
+### Post-merge (coordinator, this branch directly)
+- Merge of main `8f6343fc` — PRs #12-#24 (v0.23.0): BoundTcp
+  readiness-by-construction kept WITHOUT re-introducing the TCP-path beacon
+  reset (C rsrv resets the ramp only on ctlPause, online_notify.c:126-129 —
+  the anomaly path stays `CaServer::trigger_beacon_anomaly` only);
+  `PortHandle` actor-id plumbing and `register_port → Result` fallout
+  resolved; `await_reply`'s queue-timeout timer is armed only under a tokio
+  reactor (`Handle::try_current`), the deadline still enforced at actor
+  dequeue for blocking callers; bridge `AccessControl::can_write` async_trait
+  fallout in tests.
+- Decision items (ballot results above): `9677b68a` ARANDOM, `1897513e`
+  W10-D1, `9d083975` W10-E3, `3fc1628d` R13-21, `3714dfc3` long-form
+  `--options`.
+- CBUG catalogue batch C filed (CBUG-C1..C6, this commit).
+
+## Open Findings — surfaced during fix wave 11 (reported by fixers, pending independent verify)
+
+Leads the wave-11 fixers reported outside their assignments; none verified
+against compiled C yet — Round-14 adjudication input, NOT findings.
+
+- sCalc double-only no-ops: `BYTE`, `SUBLAST` (`|-`), `TO_DOUBLE` (`DBL`),
+  and the string-var STORES (`AA:=`) are absent from C's `uses_string`
+  allowlist (sCalcPostfix.c:461 area), so an expression using only them runs
+  the no-string evaluator — the port mirrors the list, but the *evaluator
+  behaviour* for these ops in the numeric path was flagged as unproven.
+- Dynamic STORE `@n:=` / `@@n:=` — R13-5 added the dynamic FETCHes; whether C
+  also compiles dynamic STOREs (and the port's answer) is unresolved.
+- `loop_pairs` in the sCalc compiler is reported dead after R13-7's pre-scan.
+- SIOL write path: LINK_ALARM ordering vs the value write (sibling of the
+  W10-E4 read-side fix) flagged as unaudited.
+- `alarm_field_posts` may emit duplicate posts for fields covered by both an
+  alarm mask and change detection (adjacent to W10-E1's ACKS double-post).
+- asyn `connect_device` posts connect state unconditionally; C's
+  `post_if_new` semantics flagged as possibly narrower.
+- `asynSetEos` (iocsh) drops the addr argument on one path.
+- The EOS driver hooks are not asynUser-aware (C threads pasynUser through;
+  the port's driver trait does not).
+- catools `-h`/`-V`: C prints usage to stderr in some tools and stdout in
+  others; the port's uniform choice was flagged for a per-tool check.
+- scalcout OUT drives `OVAL` unconditionally; C `devsCalcoutSoft.c:66-115`
+  picks the buffer by the TARGET FIELD TYPE via `dbCaGetLinkDBFtype` —
+  string-class target gets `OSV` (DBR_STRING), char-array target gets `OSV`
+  as DBF_CHAR bytes, numeric target gets `OVAL` (DBR_DOUBLE). Surfaced during
+  the W10-E3 family widening (the acalcout target-NELM analogue); port site
+  `scalcout.rs:1200` (`multi_output_links`).

@@ -7549,6 +7549,84 @@ async fn test_histogram_csta_is_no_mod() {
     );
 }
 
+/// C `dbConvert.c`'s `PUT(epicsFloat64, epicsInt32)` / `(epicsInt16)` is a bare
+/// cast (`*pdst = (typeb) *psrc`, :96-113) — undefined by the standard, but the
+/// compiled x86-64 IOC is the parity target (the HexSignificand / shift-mask
+/// precedent). Rust's `as` saturates instead, so the port answered 2147483647
+/// and 32767 where a C IOC answers INT_MIN and a wrapped low half.
+///
+/// softIoc transcript (the audit's two cases, reproduced here verbatim):
+///
+/// ```text
+/// record(calcout,"CO") { field(CALC,"3.0e9") field(OUT,"LO.VAL PP") }
+/// dbpf CO.PROC 1 ; dbgf LO.VAL   -> DBF_LONG: -2147483648 = 0x80000000
+///
+/// record(aao,"AAO") { field(DOL,"[1.7,2.2,-3.9,70000,5,6]") field(OUT,"WFS.VAL") }
+/// (WFS: NELM=4 FTVL=SHORT)
+/// dbpf AAO.PROC 1 ; dbgf WFS.VAL -> DBF_SHORT[4]: 1  2  -3  4464
+///
+/// dbpf LO2.VAL 70000.9 -> 70000     dbpf LO2.VAL -3.9 -> -3
+/// ```
+#[tokio::test]
+async fn test_double_to_int_narrowing_matches_compiled_c() {
+    use epics_base_rs::server::records::longout::LongoutRecord;
+    use epics_base_rs::server::records::waveform::WaveformRecord;
+    use epics_base_rs::types::DbFieldType;
+
+    let db = PvDatabase::new();
+    db.add_record("CVT_LO", Box::new(LongoutRecord::new(0)))
+        .await
+        .unwrap();
+    db.add_record(
+        "CVT_WFS",
+        Box::new(WaveformRecord::new(4, DbFieldType::Short)),
+    )
+    .await
+    .unwrap();
+
+    // DBF_LONG destination: `(epicsInt32) 3.0e9` is the 32-bit cvttsd2si's
+    // integer indefinite, NOT a clamp to i32::MAX.
+    db.put_record_field_from_ca("CVT_LO", "VAL", EpicsValue::Double(3.0e9))
+        .await
+        .unwrap();
+    assert_eq!(
+        db.get_pv("CVT_LO.VAL").await.unwrap(),
+        EpicsValue::Long(-2147483648),
+        "C: dbgf LO.VAL -> -2147483648 = 0x80000000"
+    );
+
+    // In-range doubles still truncate toward zero.
+    db.put_record_field_from_ca("CVT_LO", "VAL", EpicsValue::Double(70000.9))
+        .await
+        .unwrap();
+    assert_eq!(
+        db.get_pv("CVT_LO.VAL").await.unwrap(),
+        EpicsValue::Long(70000)
+    );
+    db.put_record_field_from_ca("CVT_LO", "VAL", EpicsValue::Double(-3.9))
+        .await
+        .unwrap();
+    assert_eq!(db.get_pv("CVT_LO.VAL").await.unwrap(), EpicsValue::Long(-3));
+
+    // FTVL=SHORT destination: each element converts through the 32-bit
+    // cvttsd2si and is then truncated to 16 bits — 70000 -> 4464, not 32767.
+    db.put_record_field_from_ca(
+        "CVT_WFS",
+        "VAL",
+        EpicsValue::DoubleArray(vec![1.7, 2.2, -3.9, 70000.0, 5.0, 6.0]),
+    )
+    .await
+    .unwrap();
+    match db.get_pv("CVT_WFS.VAL").await.unwrap() {
+        EpicsValue::ShortArray(v) => assert_eq!(
+            v,
+            vec![1, 2, -3, 4464],
+            "C: dbgf WFS.VAL -> DBF_SHORT[4]: 1 2 -3 4464"
+        ),
+        other => panic!("expected ShortArray, got {other:?}"),
+    }
+}
+
 /// epics-base PR `dabcf89` (2021) regression: when an mbboDirect
 /// record initialises with no VAL set (UDF=true on the framework
 /// side) but with at least one B0..B1F bit set in the .db file,

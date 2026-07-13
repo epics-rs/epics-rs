@@ -3,6 +3,7 @@ use std::fmt;
 
 use super::DbFieldType;
 use super::PvString;
+use super::c_cast;
 
 /// Runtime value from an EPICS PV
 #[derive(Debug, Clone, PartialEq)]
@@ -962,45 +963,45 @@ impl EpicsValue {
             return match target {
                 DbFieldType::Short => EpicsValue::ShortArray(match &ints {
                     Some(v) => v.iter().map(|&x| x as i16).collect(),
-                    None => nums.iter().map(|&v| v as i16).collect(),
+                    None => nums.iter().map(|&v| c_cast::f64_to_i16(v)).collect(),
                 }),
                 DbFieldType::Float => {
                     EpicsValue::FloatArray(nums.iter().map(|&v| v as f32).collect())
                 }
                 DbFieldType::Enum => EpicsValue::EnumArray(match &ints {
                     Some(v) => v.iter().map(|&x| x as u16).collect(),
-                    None => nums.iter().map(|&v| v as u16).collect(),
+                    None => nums.iter().map(|&v| c_cast::f64_to_u16(v)).collect(),
                 }),
                 DbFieldType::Long => EpicsValue::LongArray(match &ints {
                     Some(v) => v.iter().map(|&x| x as i32).collect(),
-                    None => nums.iter().map(|&v| v as i32).collect(),
+                    None => nums.iter().map(|&v| c_cast::f64_to_i32(v)).collect(),
                 }),
                 DbFieldType::Double => EpicsValue::DoubleArray(nums),
                 DbFieldType::Int64 => EpicsValue::Int64Array(match &ints {
                     Some(v) => v.clone(),
-                    None => nums.iter().map(|&v| v as i64).collect(),
+                    None => nums.iter().map(|&v| c_cast::f64_to_i64(v)).collect(),
                 }),
                 DbFieldType::UInt64 => EpicsValue::UInt64Array(match &ints {
                     Some(v) => v.iter().map(|&x| x as u64).collect(),
-                    None => nums.iter().map(|&v| v as u64).collect(),
+                    None => nums.iter().map(|&v| c_cast::f64_to_u64(v)).collect(),
                 }),
                 DbFieldType::UShort => EpicsValue::UShortArray(match &ints {
                     Some(v) => v.iter().map(|&x| x as u16).collect(),
-                    None => nums.iter().map(|&v| v as u16).collect(),
+                    None => nums.iter().map(|&v| c_cast::f64_to_u16(v)).collect(),
                 }),
                 DbFieldType::ULong => EpicsValue::ULongArray(match &ints {
                     Some(v) => v.iter().map(|&x| x as u32).collect(),
-                    None => nums.iter().map(|&v| v as u32).collect(),
+                    None => nums.iter().map(|&v| c_cast::f64_to_u32(v)).collect(),
                 }),
                 DbFieldType::Char => EpicsValue::CharArray(match &ints {
                     Some(v) => v.iter().map(|&x| x as u8).collect(),
-                    None => nums.iter().map(|&v| v as u8).collect(),
+                    None => nums.iter().map(|&v| c_cast::f64_to_u8(v)).collect(),
                 }),
                 // DBF_UCHAR[] narrows off the integer view (low 8 bits), the
                 // unsigned twin of the Char target.
                 DbFieldType::UChar => EpicsValue::UCharArray(match &ints {
                     Some(v) => v.iter().map(|&x| x as u8).collect(),
-                    None => nums.iter().map(|&v| v as u8).collect(),
+                    None => nums.iter().map(|&v| c_cast::f64_to_u8(v)).collect(),
                 }),
                 DbFieldType::String => {
                     EpicsValue::StringArray(nums.iter().map(|v| v.to_string().into()).collect())
@@ -1077,12 +1078,12 @@ impl EpicsValue {
             DbFieldType::String => EpicsValue::String(format!("{self}").into()),
             DbFieldType::Short => EpicsValue::Short(match self.as_int_i64() {
                 Some(i) => i as i16,
-                None => self.to_f64().unwrap_or(0.0) as i16,
+                None => c_cast::f64_to_i16(self.to_f64().unwrap_or(0.0)),
             }),
             DbFieldType::Float => EpicsValue::Float(self.to_f64().unwrap_or(0.0) as f32),
             DbFieldType::Enum => EpicsValue::Enum(match self.as_int_i64() {
                 Some(i) => i as u16,
-                None => self.to_f64().unwrap_or(0.0) as u16,
+                None => c_cast::f64_to_u16(self.to_f64().unwrap_or(0.0)),
             }),
             DbFieldType::Char => {
                 // String → CharArray (for waveform FTVL=CHAR)
@@ -1091,13 +1092,13 @@ impl EpicsValue {
                 } else {
                     EpicsValue::Char(match self.as_int_i64() {
                         Some(i) => i as u8,
-                        None => self.to_f64().unwrap_or(0.0) as u8,
+                        None => c_cast::f64_to_u8(self.to_f64().unwrap_or(0.0)),
                     })
                 }
             }
             DbFieldType::Long => EpicsValue::Long(match self.as_int_i64() {
                 Some(i) => i as i32,
-                None => self.to_f64().unwrap_or(0.0) as i32,
+                None => c_cast::f64_to_i32(self.to_f64().unwrap_or(0.0)),
             }),
             DbFieldType::Double => EpicsValue::Double(self.to_f64().unwrap_or(0.0)),
             DbFieldType::Int64 => {
@@ -1109,7 +1110,7 @@ impl EpicsValue {
                     // not an f64 round-trip (lossy above 2^53).
                     EpicsValue::Int64(*v as i64)
                 } else {
-                    EpicsValue::Int64(self.to_f64().unwrap_or(0.0) as i64)
+                    EpicsValue::Int64(c_cast::f64_to_i64(self.to_f64().unwrap_or(0.0)))
                 }
             }
             DbFieldType::UInt64 => {
@@ -1119,7 +1120,7 @@ impl EpicsValue {
                 } else if let EpicsValue::Int64(v) = self {
                     EpicsValue::UInt64(*v as u64)
                 } else {
-                    EpicsValue::UInt64(self.to_f64().unwrap_or(0.0) as u64)
+                    EpicsValue::UInt64(c_cast::f64_to_u64(self.to_f64().unwrap_or(0.0)))
                 }
             }
             // Unsigned narrowing mirrors the signed targets: integer sources
@@ -1127,11 +1128,11 @@ impl EpicsValue {
             // sources fall back to the f64 round-trip.
             DbFieldType::UShort => EpicsValue::UShort(match self.as_int_i64() {
                 Some(i) => i as u16,
-                None => self.to_f64().unwrap_or(0.0) as u16,
+                None => c_cast::f64_to_u16(self.to_f64().unwrap_or(0.0)),
             }),
             DbFieldType::ULong => EpicsValue::ULong(match self.as_int_i64() {
                 Some(i) => i as u32,
-                None => self.to_f64().unwrap_or(0.0) as u32,
+                None => c_cast::f64_to_u32(self.to_f64().unwrap_or(0.0)),
             }),
             DbFieldType::UChar => {
                 // String → UCharArray (for waveform FTVL=UCHAR), the unsigned
@@ -1141,7 +1142,7 @@ impl EpicsValue {
                 } else {
                     EpicsValue::UChar(match self.as_int_i64() {
                         Some(i) => i as u8,
-                        None => self.to_f64().unwrap_or(0.0) as u8,
+                        None => c_cast::f64_to_u8(self.to_f64().unwrap_or(0.0)),
                     })
                 }
             }

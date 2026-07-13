@@ -1408,7 +1408,9 @@ impl PvDatabase {
             // `DISV=3` does NOT disable the record in C (softIoc-verified).
             // Handing back the constant here disabled it forever.
             if let Some(val) = self.fetch_link(&sdis_link).await.value() {
-                let disa_val = val.to_f64().unwrap_or(0.0) as i16;
+                // C `dbGetLink(&prec->sdis, DBR_SHORT, &prec->disa)` — `getDoubleShort`'s
+                // bare cast, whose compiled-C narrowing lives in `c_cast`.
+                let disa_val = crate::types::c_cast::f64_to_i16(val.to_f64().unwrap_or(0.0));
                 let mut instance = rec.write().await;
                 instance.common.disa = disa_val;
             }
@@ -1577,7 +1579,8 @@ impl PvDatabase {
                 // never does: `recGblGetTimeStampSimm` (`recGbl.c:315`) is
                 // wrapped in `if (!dbLinkIsConstant(plink))`, so a constant
                 // TSEL is skipped outright and TSE keeps its own value.
-                let tse_val = val.to_f64().unwrap_or(0.0) as i16;
+                // `getDoubleShort`'s bare cast (see `c_cast`).
+                let tse_val = crate::types::c_cast::f64_to_i16(val.to_f64().unwrap_or(0.0));
                 let mut instance = rec.write().await;
                 instance.common.tse = tse_val;
             }
@@ -4879,7 +4882,9 @@ impl PvDatabase {
         let failed = matches!(fetch, LinkFetch::Failed);
         match fetch {
             LinkFetch::Value(v) => {
-                let simm = v.to_f64().unwrap_or(0.0) as i16;
+                // `dbGetLink(&prec->siml, DBR_USHORT, &prec->simm)` — the same bare
+                // cast; SIMM's storage here is the i16 carrier.
+                let simm = crate::types::c_cast::f64_to_i16(v.to_f64().unwrap_or(0.0));
                 let mut instance = rec.write().await;
                 let _ = instance
                     .record

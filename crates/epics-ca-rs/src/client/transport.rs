@@ -184,10 +184,33 @@ fn resolve_connection_timeout() -> Duration {
             DEFAULT_SECS
         }
     };
+    // DOCUMENTED DEVIATION — a non-positive (or NaN) period does not become a
+    // zero-period watchdog here.
+    //
+    // C stores whatever `envGetDoubleConfigParam` parsed (`cac.cpp:188-194`:
+    // the default is applied ONLY when the fetch fails, never when it succeeds
+    // with a useless number) and hands it to the circuit's connection-verify
+    // watchdog. With `EPICS_CA_CONN_TMO=-5` or `=0` the deadline is already in
+    // the past on every check, so the compiled `camonitor` — still delivering
+    // updates, so the client is not "broken" — emitted 177_182 stderr lines in
+    // 3 seconds on this platform, a "Virtual circuit unresponsive" flood
+    // spinning a core. That is a degenerate behaviour with no operational
+    // meaning, and reproducing it faithfully would hand any operator with a
+    // typo'd env var a livelocked client.
+    //
+    // So the non-positive value is refused rather than obeyed, and — unlike
+    // the silent guard this replaces — the operator is told that the value
+    // they set is not the one in force. C prints nothing here because C obeys
+    // it; this line is the port's, not libca's.
     if secs > 0.0 {
         crate::estdlib::duration_from_secs(secs)
     } else {
-        Duration::from_secs(30)
+        eprintln!(
+            "Warning: \"EPICS_CA_CONN_TMO\" = {secs} is not a positive period; \
+             using {DEFAULT_SECS:.6} (a non-positive period fires the connection \
+             watchdog continuously)"
+        );
+        crate::estdlib::duration_from_secs(DEFAULT_SECS)
     }
 }
 /// Legacy seconds accessor kept for call sites that need a coarse
@@ -4161,7 +4184,10 @@ mod conn_tmo_env_tests {
             (Some("abc"), default),
             (Some("10x"), default),
             (Some("   "), default),
-            // NaN and non-positive values fail the `> 0.0` gate.
+            // NaN and non-positive values fail the `> 0.0` gate. C obeys them
+            // and spins its connection watchdog; this is the documented
+            // deviation at `resolve_connection_timeout`, and it is announced on
+            // stderr rather than applied silently.
             (Some("nan"), default),
             (Some("0"), default),
             (Some("-5"), default),

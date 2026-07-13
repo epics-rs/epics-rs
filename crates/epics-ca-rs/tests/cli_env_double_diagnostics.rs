@@ -180,3 +180,32 @@ fn beacon_period_reject_is_diagnosed_once_per_process() {
         );
     }
 }
+
+/// R16-19: a non-positive `EPICS_CA_CONN_TMO` is refused, and SAID so.
+///
+/// This is the port's one documented deviation on this knob. C stores the raw
+/// value (`cac.cpp:188-194`) and its connection watchdog then fires on every
+/// check — the compiled `camonitor` wrote 177_182 stderr lines in 3 s with
+/// `=-5`. The port keeps the 30 s default instead, and tells the operator that
+/// the value they set is not the one in force. The test stays bounded: `caget`
+/// with `-w 0.1` never reaches a circuit, so nothing can flood.
+#[test]
+fn conn_tmo_non_positive_is_refused_out_loud() {
+    for value in ["-5", "0"] {
+        let err = caget_stderr("EPICS_CA_CONN_TMO", value);
+        assert!(
+            err.contains("\"EPICS_CA_CONN_TMO\"") && err.contains("not a positive period"),
+            "EPICS_CA_CONN_TMO={value} must be diagnosed, not silently overridden:\n{err}"
+        );
+    }
+}
+
+/// The flip side: a period C accepts and the port honours is silent.
+#[test]
+fn conn_tmo_positive_period_is_silent() {
+    let err = caget_stderr("EPICS_CA_CONN_TMO", "10.5");
+    assert!(
+        !err.contains("not a positive period") && !err.contains("double fetch failed"),
+        "10.5 s is a valid period; no diagnostic is due:\n{err}"
+    );
+}

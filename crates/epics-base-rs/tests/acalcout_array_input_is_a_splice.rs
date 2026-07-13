@@ -146,6 +146,55 @@ fn aval_and_oav_take_the_same_client_put_rule() {
     }
 }
 
+/// R14-7 — the write is BOUNDED at the window, not at NELM. C asks the link for
+/// exactly `nRequest = acalcGetNumElements(pcalc)` elements (`:1096-1097`), so a
+/// source longer than the NUSE window is truncated at it and CANNOT reach the
+/// hidden `[numElements, nelm)` — the region the splice exists to preserve. The
+/// port spliced up to NELM, so an over-long INAA source overwrote the tail.
+#[test]
+fn an_over_long_link_fetch_stops_at_the_window() {
+    let mut rec = record_with_full_aa();
+    rec.put_field("NUSE", EpicsValue::ULong(3)).unwrap();
+
+    // Eight elements offered into a three-element window.
+    rec.put_field_internal(
+        "AA",
+        EpicsValue::DoubleArray(vec![90.0, 91.0, 92.0, 93.0, 94.0, 95.0, 96.0, 97.0]),
+    )
+    .unwrap();
+
+    assert_eq!(aa(&rec), vec![90.0, 91.0, 92.0]);
+
+    // 93..97 were never written: the buffer past the window still holds 4..10.
+    rec.put_field("NUSE", EpicsValue::ULong(10)).unwrap();
+    assert_eq!(
+        aa(&rec),
+        vec![90.0, 91.0, 92.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
+    );
+}
+
+/// The same bound on the client path — `dbPut` clamps its request to
+/// `paddr->no_elements` (`dbAccess.c:1361-1362`), which `cvt_dbaddr` set to
+/// `acalcGetNumElements` (`:628`).
+#[test]
+fn an_over_long_client_put_stops_at_the_window() {
+    let mut rec = record_with_full_aa();
+    rec.put_field("NUSE", EpicsValue::ULong(3)).unwrap();
+
+    rec.put_field(
+        "AA",
+        EpicsValue::DoubleArray(vec![90.0, 91.0, 92.0, 93.0, 94.0, 95.0]),
+    )
+    .unwrap();
+
+    assert_eq!(aa(&rec), vec![90.0, 91.0, 92.0]);
+    rec.put_field("NUSE", EpicsValue::ULong(10)).unwrap();
+    assert_eq!(
+        aa(&rec),
+        vec![90.0, 91.0, 92.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
+    );
+}
+
 /// A full-length write still replaces every element — the splice is not a merge.
 #[test]
 fn a_full_length_write_replaces_the_whole_buffer() {

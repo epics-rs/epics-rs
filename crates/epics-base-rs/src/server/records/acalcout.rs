@@ -383,26 +383,36 @@ impl AcalcoutRecord {
         }
     }
 
-    /// The ONE owner of a client `dbPut` into an SPC_DBADDR array field — AA..LL,
-    /// AVAL and OAV, the three that C's `put_array_info` serves
-    /// (`aCalcoutRecord.c:677-731`). It splices the new elements into the record's
-    /// permanent `calloc(nelm)` buffer and then zeroes the rest of the window.
+    /// The ONE owner of every write into an SPC_DBADDR array field — AA..LL, AVAL
+    /// and OAV, the three that C's `put_array_info` serves
+    /// (`aCalcoutRecord.c:677-731`), whether the writer is a client `dbPut` or an
+    /// input link.
     ///
-    /// Both halves matter and neither is the caller's business: the splice is why
-    /// the hidden tail `[numElements, nelm)` survives a put, and the zero-fill is
-    /// why the VISIBLE tail does not. A caller that did one without the other is
-    /// exactly the bug this function exists to make unwritable.
+    /// The whole rule, and it is ONE rule: a write touches `[0, numElements)` and
+    /// nothing else. It splices its elements into the record's permanent
+    /// `calloc(nelm)` buffer, is BOUNDED at the window, and zeroes the rest of the
+    /// window behind it. Three halves of one invariant, none of them the caller's
+    /// business — a caller that did any without the others is exactly the bug this
+    /// function exists to make unwritable.
     ///
-    /// The splice half: C allocates each array field ONCE, at
-    /// `calloc(pcalc->nelm, sizeof(double))` (`:695-698`, `:1084-1086`), and that
-    /// buffer lives for the record's lifetime — nothing ever replaces it, so a
-    /// write is always INTO it and never a swap of it.
+    /// * SPLICE: C allocates each array field ONCE, at `calloc(pcalc->nelm,
+    ///   sizeof(double))` (`:695-698`, `:1084-1086`), and that buffer lives for the
+    ///   record's lifetime — nothing ever replaces it, so a write is always INTO it
+    ///   and never a swap of it.
+    /// * BOUND: both writers ask for exactly `numElements` and can deliver no more.
+    ///   The link reads `nRequest = acalcGetNumElements(pcalc)` elements
+    ///   (`:1096-1097`), and `dbPut` clamps its request to `paddr->no_elements`
+    ///   (`dbAccess.c:1361-1362`), which `cvt_dbaddr` set to the same
+    ///   `acalcGetNumElements` (`:628`). A source LONGER than the window is
+    ///   truncated at it — it cannot reach into `[numElements, nelm)`, which is the
+    ///   region the splice exists to preserve.
+    /// * ZERO-FILL: [`Self::zero_fill_window`], `[nNew, numElements)`.
     fn client_put_array(&mut self, src: &[f64], select: impl FnOnce(&mut Self) -> &mut Vec<f64>) {
         let nelm = (self.nelm as usize).max(1);
         let window = self.num_elements();
         let buf = select(self);
         buf.resize(nelm, 0.0);
-        let n = src.len().min(nelm);
+        let n = src.len().min(window);
         buf[..n].copy_from_slice(&src[..n]);
         Self::zero_fill_window(buf, n, window);
     }

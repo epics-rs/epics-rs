@@ -66,7 +66,7 @@ use crate::error::{AsynError, AsynResult, AsynStatus};
 use crate::exception::AsynException;
 use crate::interfaces::InterfaceType;
 use crate::interpose::{EomReason, OctetReadResult};
-use crate::interrupt::{InterruptManager, InterruptValue};
+use crate::interrupt::{InterruptManager, InterruptValue, OctetFanOut};
 use crate::param::ParamValue;
 use crate::port::{ExceptionAnnouncer, PortDriver, PortDriverBase, PortFlags};
 use crate::trace::{TraceManager, TraceMask};
@@ -605,15 +605,22 @@ impl Acceptor {
                     "new connection from {peer} on {child}"
                 );
                 // C :374-383 — the octet callbacks carry the child port name,
-                // not the payload.
-                self.interrupts.notify(InterruptValue {
-                    reason: 0,
-                    addr: i as i32,
-                    value: ParamValue::Octet(child),
-                    timestamp: SystemTime::now(),
-                    iface: Some(InterfaceType::Octet),
-                    ..Default::default()
-                });
+                // not the payload. The listener walks the interrupt list and
+                // calls EVERY node unconditionally: there is no addr test here
+                // (unlike asynOctetBase.c:203-215, which does test addr). A
+                // client landing in slot 3 must be announced to a listener that
+                // registered on addr 0, because "which slot" is the news.
+                self.interrupts.notify_octet(
+                    OctetFanOut::EveryUser,
+                    InterruptValue {
+                        reason: 0,
+                        addr: i as i32,
+                        value: ParamValue::Octet(child),
+                        timestamp: SystemTime::now(),
+                        iface: Some(InterfaceType::Octet),
+                        ..Default::default()
+                    },
+                );
                 return Ok(Some(i));
             }
         }
@@ -2214,6 +2221,63 @@ mod tests {
         // included — C's octetBase fan-out sits below the EOS layer.
         let got = seen.lock().unwrap().concat();
         assert_eq!(got, "line1\nline2\n", "raw chunks fanned out, got {got:?}");
+
+        srv.disconnect(&AsynUser::default()).unwrap();
+    }
+
+    /// R19-109 boundary: the new-connection announcement reaches EVERY octet
+    /// interrupt user, whatever addr it registered on.
+    ///
+    /// C `connectionListener` (drvAsynIPServerPort.c:372-383) walks the octet
+    /// interrupt list and calls every node with the child port's name — there
+    /// is no addr test, unlike `asynOctetBase.c:203-215`. The boundary is
+    /// "announcement addr == subscriber addr" (slot 0) vs "announcement addr !=
+    /// subscriber addr" (slot 1): both must be delivered. An addr filter here
+    /// would silently hide every client after the first.
+    #[test]
+    fn every_octet_user_hears_a_new_connection_whatever_slot_it_lands_in() {
+        use crate::interrupt::{InterruptFilter, InterruptValue};
+        use std::net::TcpStream as ClientStream;
+        use std::sync::Mutex as StdMutex;
+
+        let mut srv = DrvAsynIPServerPort::with_config(
+            "srv_announce",
+            IpServerConfig {
+                max_clients: 2,
+                ..IpServerConfig::parse("127.0.0.1:0").unwrap()
+            },
+        )
+        .unwrap();
+        srv.connect(&AsynUser::default()).unwrap();
+        let port = srv.local_port();
+
+        let seen: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        let seen_cb = seen.clone();
+        // A device-support user bound to addr 0 — C registers on the SERVER
+        // port, and the payload it wants is which child port to talk to.
+        let _cb = srv.base().interrupts.register_sync_callback(
+            InterruptFilter {
+                addr: Some(0),
+                ..InterruptFilter::default()
+            },
+            move |iv: &InterruptValue| {
+                if let ParamValue::Octet(s) = &iv.value {
+                    seen_cb.lock().unwrap().push(s.clone());
+                }
+            },
+        );
+
+        let _c0 = ClientStream::connect(("127.0.0.1", port)).unwrap();
+        wait_for_slot(&srv, 0);
+        let _c1 = ClientStream::connect(("127.0.0.1", port)).unwrap();
+        wait_for_slot(&srv, 1);
+
+        let got = seen.lock().unwrap().clone();
+        assert_eq!(
+            got,
+            vec!["srv_announce:0".to_string(), "srv_announce:1".to_string()],
+            "the addr-0 user must hear about the slot-1 client too"
+        );
 
         srv.disconnect(&AsynUser::default()).unwrap();
     }

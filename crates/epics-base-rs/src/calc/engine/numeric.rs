@@ -1,6 +1,7 @@
 use super::cast::{c_int, d2i, d2ui};
 use super::error::CalcError;
 use super::opcodes::{CoreOp, Opcode};
+use super::random::local_random;
 use super::{CompiledExpr, NumericInputs};
 
 pub fn eval(expr: &CompiledExpr, inputs: &mut NumericInputs) -> Result<f64, CalcError> {
@@ -47,7 +48,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut NumericInputs) -> Result<f64, Calc
 
                 // Random
                 CoreOp::Random => {
-                    stack.push(simple_random());
+                    stack.push(local_random());
                 }
                 CoreOp::FetchVal => {
                     // C calcPerform.c:74-76 — FETCH_VAL pushes *presult, the
@@ -63,8 +64,8 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut NumericInputs) -> Result<f64, Calc
                     return Err(CalcError::Internal);
                 }
                 CoreOp::NormalRandom => {
-                    let u1 = simple_random();
-                    let u2 = simple_random();
+                    let u1 = local_random();
+                    let u2 = local_random();
                     let n = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
                     stack.push(n);
                 }
@@ -430,26 +431,6 @@ fn cond_search(code: &[Opcode], start: usize, find_else: bool) -> Result<usize, 
     }
 
     Err(CalcError::Conditional)
-}
-
-fn simple_random() -> f64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEED: AtomicU64 = AtomicU64::new(0);
-
-    let mut s = SEED.load(Ordering::Relaxed);
-    if s == 0 {
-        s = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
-    }
-    s = s
-        .wrapping_mul(6364136223846793005)
-        .wrapping_add(1442695040888963407);
-    SEED.store(s, Ordering::Relaxed);
-    // C calcRandom() returns (double)rand()/RAND_MAX — a closed [0,1] range
-    // (both endpoints reachable). Map 53 random bits onto [0,1] inclusive.
-    (s >> 11) as f64 / ((1u64 << 53) - 1) as f64
 }
 
 #[cfg(test)]

@@ -2,6 +2,7 @@ use super::cast::{c_int, c_long, d2ui};
 use super::cvt;
 use super::error::CalcError;
 use super::opcodes::{CoreOp, Opcode, StringOp};
+use super::random::local_random;
 use super::value::{ScalcString, StackValue};
 use super::{CompiledExpr, StringInputs};
 
@@ -65,11 +66,11 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                 }
 
                 CoreOp::Random => {
-                    stack.push(StackValue::Double(simple_random()));
+                    stack.push(StackValue::Double(local_random()));
                 }
                 CoreOp::NormalRandom => {
-                    let u1 = simple_random();
-                    let u2 = simple_random();
+                    let u1 = local_random();
+                    let u2 = local_random();
                     let n = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
                     stack.push(StackValue::Double(n));
                 }
@@ -1963,25 +1964,6 @@ fn cond_search(code: &[Opcode], start: usize, find_else: bool) -> Result<usize, 
     }
 
     Err(CalcError::Conditional)
-}
-
-fn simple_random() -> f64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEED: AtomicU64 = AtomicU64::new(0);
-
-    let mut s = SEED.load(Ordering::Relaxed);
-    if s == 0 {
-        s = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
-    }
-    s = s
-        .wrapping_mul(6364136223846793005)
-        .wrapping_add(1442695040888963407);
-    SEED.store(s, Ordering::Relaxed);
-    // C calcRandom() returns (double)rand()/RAND_MAX — a closed [0,1] range.
-    (s >> 11) as f64 / ((1u64 << 53) - 1) as f64
 }
 
 #[cfg(test)]

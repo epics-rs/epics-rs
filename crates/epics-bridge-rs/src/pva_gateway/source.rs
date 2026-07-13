@@ -29,7 +29,6 @@ use epics_pva_rs::pvdata::{FieldDesc, PvField, RpcReply};
 use epics_pva_rs::server::native_source::AcfCell;
 use epics_pva_rs::server_native::source::{
     AccessChecked, ChannelContext, ChannelInvalidator, ChannelSource, OpError, SourceRead,
-    WatermarkEvent, WatermarkKind,
 };
 
 use super::channel_cache::{
@@ -144,30 +143,6 @@ fn value_overrun_paths(value: &PvField) -> Vec<String> {
         PvField::Structure(s) => s.fields.iter().map(|(k, _)| k.clone()).collect(),
         _ => Vec::new(),
     }
-}
-
-/// one downstream→upstream pause/resume command queued to
-/// the gateway's single watermark applier (spawned in
-/// [`GatewayChannelSource::new`]).
-///
-/// * `cache` is the *single* cache layer the firing subscription's
-///   upstream lives in — resolved from the downstream credential
-///   context in the callback ([`GatewayChannelSource::upstream_cache_peek_for`]),
-///   so one credential's backpressure never pauses another
-///   credential's separate upstream for the same PV name (Finding 2).
-/// * `op_id` identifies the downstream subscriber op casting this vote;
-///   `seq` is the server's strictly-monotonic per-op watermark crossing
-///   token. The applier folds `(op_id, seq, kind)` into the entry via
-///   [`super::channel_cache::UpstreamEntry::apply_watermark_vote`], which
-///   orders an op's own re-ordered transitions by `seq` (Finding 1) and
-///   reference-counts pause votes across co-subscribers so the shared
-///   upstream pauses only when every live op wants pause.
-struct WmCommand {
-    cache: Arc<ChannelCache>,
-    name: String,
-    op_id: u64,
-    seq: u64,
-    kind: WatermarkKind,
 }
 
 /// PV-name → ASG-name resolver. Returns the ASG that the gateway
@@ -388,16 +363,6 @@ pub struct GatewayChannelSource {
     ///
     /// bounded via `BoundedPool` (same cap as `upstream_pool`).
     upstream_caches: Arc<Mutex<BoundedPool<UpstreamIdentityKey, Arc<ChannelCache>>>>,
-    /// feeds the single watermark pause/resume applier
-    /// task spawned in [`Self::new`]. The sync `notify_watermark_*`
-    /// callbacks push a [`WmCommand`] here with NO per-callback
-    /// `tokio::spawn`, so there is exactly one totally-ordered owner of
-    /// each upstream's pause state — the detached-spawn reorder that
-    /// could otherwise leave an upstream wedged paused after a resume
-    /// cannot happen. Cloning the source clones the sender (all clones
-    /// feed the one applier); the applier exits when the last clone
-    /// drops.
-    wm_tx: mpsc::UnboundedSender<WmCommand>,
     /// Server-wide channel invalidator, wired once by
     /// the native server through [`ChannelSource::set_channel_invalidator`].
     /// Stored so it reaches not only the shared [`Self::cache`] but every
@@ -416,12 +381,6 @@ impl GatewayChannelSource {
         let acf: AcfCell = Arc::new(RwLock::new(None));
         let asg_resolver = Arc::new(RwLock::new(default_asg_resolver()));
         let gate = Self::build_gate(acf.clone(), asg_resolver.clone());
-        // one ordered watermark applier per logical
-        // source. `new` is the only constructor and `Clone` just copies
-        // the sender, so exactly one applier task exists no matter how
-        // many `Arc<dyn ChannelSourceObj>` handles the runtime holds.
-        let (wm_tx, wm_rx) = mpsc::unbounded_channel::<WmCommand>();
-        Self::spawn_watermark_applier(wm_rx);
         Self {
             cache,
             connect_timeout: Duration::from_secs(5),
@@ -436,7 +395,6 @@ impl GatewayChannelSource {
             asg_resolver,
             gate,
             upstream_caches: Arc::new(Mutex::new(BoundedPool::new(256))),
-            wm_tx,
             channel_invalidator: Arc::new(OnceLock::new()),
         }
     }
@@ -713,90 +671,6 @@ impl GatewayChannelSource {
             total += c.entry_count().await;
         }
         total
-    }
-
-    /// the single ordered owner of upstream pause/resume.
-    /// Draining one mpsc with one task means every vote for a given entry
-    /// is folded in one total order via
-    /// [`super::channel_cache::UpstreamEntry::apply_watermark_vote`], which
-    /// orders each op's own re-ordered transitions by `seq` (Finding 1)
-    /// and reference-counts pause votes across co-subscribers — pausing
-    /// the shared upstream only when every live downstream op wants pause
-    /// and resuming as soon as one has room. `apply_..`
-    /// returns `Some(_)` only on a real aggregate edge; on an edge the
-    /// applier calls `reconcile_pause`, which re-reads the level and drives
-    /// the installed `Pauser` through the entry's single serialized owner.
-    /// That owner is shared with the reconnect loop's Pauser re-install.
-    /// pvxs monitor pause is per-connection (`clientmon.cpp:379-414`,
-    /// `:633-635`): a reconnect installs against an empty aggregate (the
-    /// prior connection's votes were dropped at disconnect) and the fresh
-    /// subscription runs, so this applier re-pauses only on a fresh HIGH from
-    /// a live downstream op. Because this is the sole writer of the entry's
-    /// votes, the fold has no competing writer.
-    fn spawn_watermark_applier(mut rx: mpsc::UnboundedReceiver<WmCommand>) {
-        tokio::spawn(async move {
-            while let Some(cmd) = rx.recv().await {
-                let Some(entry) = cmd.cache.peek(&cmd.name).await else {
-                    continue;
-                };
-                if entry
-                    .apply_watermark_vote(cmd.op_id, cmd.seq, cmd.kind)
-                    .is_none()
-                {
-                    // No aggregate edge — the shared pause-state is
-                    // unchanged by this vote, so the installed Pauser
-                    // already matches and needs no drive.
-                    continue;
-                }
-                // Drive on the edge, but through the single serialized
-                // owner: `reconcile_pause` re-reads the level and is
-                // mutually serialized with the reconnect loop's
-                // re-install, so the installed Pauser always settles to
-                // the current aggregate (no two-driver strand race).
-                entry.reconcile_pause().await;
-            }
-        });
-    }
-
-    /// the cache layer the subscription identified by
-    /// `ctx` monitors through, WITHOUT creating one. Anonymous /
-    /// empty-account peers ride the shared `cache`; a credentialed peer
-    /// rides its per-credential cache iff one already exists. Returns
-    /// `None` for a credentialed peer with no live per-credential cache
-    /// (nothing to pause). Mirrors the layer selection of
-    /// [`Self::upstream_cache_for`] but is side-effect-free — a
-    /// watermark crossing must not mint a new cache. Scoping the
-    /// pause/resume to this one layer is what stops one credential's
-    /// backpressure from throttling another credential's separate
-    /// upstream for the same PV name (Finding 2).
-    fn upstream_cache_peek_for(&self, ctx: &ChannelContext) -> Option<Arc<ChannelCache>> {
-        if ctx.account.is_empty() || ctx.method == "anonymous" {
-            return Some(self.cache.clone());
-        }
-        let key = UpstreamIdentityKey::from_ctx(ctx);
-        self.upstream_caches.lock().get(&key).cloned()
-    }
-
-    /// resolve the firing subscription's single cache
-    /// layer (per-credential targeting) and enqueue a pause vote to the
-    /// ordered applier. Synchronous and non-blocking
-    /// (`UnboundedSender::send`) — no per-callback spawn — so two
-    /// near-simultaneous votes cannot be re-ordered by the runtime; their
-    /// per-op `seq` (minted at the server's crossing) settles each op's
-    /// state in the applier, and the applier reference-counts across ops.
-    fn queue_watermark(&self, name: &str, ev: &WatermarkEvent, ctx: &ChannelContext) {
-        let Some(cache) = self.upstream_cache_peek_for(ctx) else {
-            // Credentialed peer with no live upstream cache — nothing to
-            // pause/resume.
-            return;
-        };
-        let _ = self.wm_tx.send(WmCommand {
-            cache,
-            name: name.to_string(),
-            op_id: ev.op_id,
-            seq: ev.seq,
-            kind: ev.kind,
-        });
     }
 
     /// Diagnostic: live subscribe-bridge tasks.
@@ -2044,67 +1918,30 @@ impl ChannelSource for GatewayChannelSource {
         })
     }
 
-    /// expose pipeline-window watermark levels so the
-    /// server's monitor loop drives pause/resume on the feeding upstream
-    /// monitor. Pre-FR-11 `GatewayChannelSource` did NOT override this,
-    /// so the trait default `None` made the pause/resume callbacks
-    /// unreachable — the `Pauser` plumbing existed but nothing could fire
-    /// it.
+    /// The gateway declares NO pipeline-window watermarks, and therefore
+    /// never asks the server for pause/resume callbacks (the trait default
+    /// `notify_watermark` is a no-op).
     ///
-    /// `(low, high) = (0, 0)`: pause the upstream when the downstream
-    /// pipeline window is fully drained (0 credit — the gateway cannot
-    /// emit anyway) and resume as soon as a client ACK returns any
-    /// credit. The `(0, 0)` choice is independent of the client-
-    /// negotiated queue size and therefore deadlock-free for any window:
-    /// `high == 0` guarantees the ACK path can always re-cross it
-    /// (`w_now > 0`) and resume a paused upstream. (A non-zero `high`
-    /// could exceed a small client window and never re-fire after a
-    /// pause.) Name-independent: the gateway applies the same `(0, 0)`
-    /// pipeline-window policy to every monitor it serves. The composite
-    /// resolves the owning source via `has_pv` before reading levels, so
-    /// this is consulted only for names the gateway actually owns —
-    /// returning `Some` for every name no longer shadows a co-registered
-    /// name-scoped source's real per-PV levels.
+    /// A downstream monitor must not throttle the upstream: that upstream is
+    /// shared with every co-subscriber of the same (PV, credential), and a
+    /// pause is not divisible. pva2pva does not throttle either — its
+    /// `MonitorCacheEntry::notify` polls the upstream dry with a bare
+    /// `//TODO: flow control` where an upstream throttle would go
+    /// (`moncache.cpp:133-137`) and absorbs a slow downstream in that
+    /// downstream's OWN `overflowElement`, counting the coalesced updates in
+    /// `ndropped` (`:151-174`).
+    ///
+    /// Declaring `Some((0, 0))` here is what made the R18-25 starvation
+    /// reachable: it turned every downstream DATA emission into a pause vote
+    /// on the shared upstream, and an op became a *voter* only by crossing LOW
+    /// itself — so a non-pipelined co-subscriber could neither vote nor undo
+    /// the pause, and starved. The overflow absorption the gateway already has
+    /// (broadcast lag → `pending_overrun` → the overrun mark on the next body,
+    /// see `subscribe_raw_inner` / `subscribe_inner`) IS pva2pva's mechanism,
+    /// and it needs no upstream throttle.
     async fn monitor_watermarks(&self, name: &str) -> Option<(usize, usize)> {
         let _ = name;
-        Some((0, 0))
-    }
-
-    /// Forward downstream pipeline-window flow control into upstream
-    /// pause/resume. pvxs pipeline-window semantics
-    /// (`servermon.cpp`/`source.h`): `Resume` means a client ACK refilled
-    /// the window above the high mark — the downstream is keeping up, so
-    /// its pause vote is dropped; `Pause` means a DATA emission drained the
-    /// window to/below low — the client is falling behind, so it votes to
-    /// pause the feeding upstream. `Withdraw` (the op's subscriber task
-    /// ended) removes its vote so a torn-down op cannot strand the shared
-    /// upstream paused for its co-subscribers. The per-PV `Pauser` is
-    /// installed by the auto-restart task in
-    /// `channel_cache.rs::spawn_upstream_monitor`.
-    ///
-    /// The vote is resolved to the *single* cache
-    /// layer this credential monitors through (per-credential targeting)
-    /// and queued to the single ordered applier with the
-    /// server's per-op crossing `seq` (deadlock-free ordering)
-    /// and `op_id` (cross-op reference counting). Best
-    /// effort: if the entry isn't currently connected upstream the
-    /// pause/resume is a no-op in the applier.
-    fn notify_watermark(&self, name: &str, ctx: &ChannelContext, ev: WatermarkEvent) {
-        match ev.kind {
-            WatermarkKind::Pause => tracing::warn!(
-                pv = %name, op_id = ev.op_id, seq = ev.seq,
-                "pva-gateway: downstream pipeline window drained below low — voting pause"
-            ),
-            WatermarkKind::Resume => tracing::debug!(
-                pv = %name, op_id = ev.op_id, seq = ev.seq,
-                "pva-gateway: downstream pipeline window refilled above high — releasing pause vote"
-            ),
-            WatermarkKind::Withdraw => tracing::debug!(
-                pv = %name, op_id = ev.op_id,
-                "pva-gateway: downstream monitor op ended — withdrawing pause vote"
-            ),
-        }
-        self.queue_watermark(name, &ev, ctx);
+        None
     }
 }
 
@@ -2230,72 +2067,21 @@ mod tests {
             "gateway list_pvs must not masquerade the cache as channelList (pva2pva parity)"
         );
     }
-
-    /// the gateway source MUST expose pipeline-window
-    /// watermark levels so the server's monitor loop drives upstream
-    /// pause/resume. Pre-FR-11 it inherited the trait default `None`,
-    /// leaving the `Pauser` callbacks unreachable. `(0, 0)` is the
-    /// deadlock-free choice (HIGH always re-crosses on the first ACK
-    /// credit regardless of the client's negotiated window).
+    /// R18-25: the gateway declares NO pipeline watermarks, so the server
+    /// never asks it to pause a shared upstream. pva2pva does not throttle
+    /// upstream either (`moncache.cpp:133-137`, the `//TODO: flow control`);
+    /// a slow downstream is absorbed in its own overflow element.
+    ///
+    /// Pre-fix this returned `Some((0, 0))`, which turned every downstream
+    /// DATA emission into a pause vote on the shared upstream and let one slow
+    /// pipelined client starve every co-subscriber.
     #[tokio::test]
-    async fn fr11_gateway_exposes_watermark_levels() {
+    async fn r18_25_gateway_declares_no_pipeline_watermarks() {
         let src = make_source();
         assert_eq!(
             <GatewayChannelSource as ChannelSource>::monitor_watermarks(&src, "ANY:PV").await,
-            Some((0, 0)),
-            "gateway must expose watermark levels so pause/resume is reachable"
-        );
-    }
-
-    /// A watermark crossing must
-    /// pause/resume ONLY the cache layer the firing credential monitors
-    /// through. `upstream_cache_peek_for` resolves that single layer
-    /// (and never creates one), so one credential's backpressure cannot
-    /// reach another credential's separate upstream for the same PV
-    /// name — the over-throttle the pre-review all-layers walk caused.
-    #[tokio::test]
-    async fn fr11_watermark_targets_only_the_firing_credentials_cache() {
-        let src = make_source();
-
-        // Anonymous peers ride the shared cache.
-        let anon = make_ctx("h", "", "anonymous");
-        let shared = src
-            .upstream_cache_peek_for(&anon)
-            .expect("anonymous always resolves to the shared cache");
-        assert!(
-            Arc::ptr_eq(&shared, &src.cache),
-            "anonymous peers ride the shared cache"
-        );
-
-        // A credentialed peer with no live per-credential cache resolves
-        // to None — a watermark must not mint a cache (side-effect-free).
-        let alice = make_ctx("h", "alice", "ca");
-        assert!(
-            src.upstream_cache_peek_for(&alice).is_none(),
-            "no live per-credential cache yet → nothing to pause"
-        );
-
-        // Once alice's and bob's per-credential caches exist, alice's
-        // crossing resolves to alice's OWN cache — never the shared
-        // cache and never bob's.
-        let alice_cache = src.upstream_cache_for_test(&alice);
-        let bob = make_ctx("h", "bob", "ca");
-        let bob_cache = src.upstream_cache_for_test(&bob);
-
-        let alice_resolved = src
-            .upstream_cache_peek_for(&alice)
-            .expect("alice's cache now exists");
-        assert!(
-            Arc::ptr_eq(&alice_resolved, &alice_cache),
-            "alice's backpressure targets alice's own upstream cache"
-        );
-        assert!(
-            !Arc::ptr_eq(&alice_resolved, &bob_cache),
-            "alice's backpressure must NOT reach bob's separate upstream"
-        );
-        assert!(
-            !Arc::ptr_eq(&alice_resolved, &src.cache),
-            "a credentialed peer's upstream is not the shared cache"
+            None,
+            "a downstream monitor must never throttle the shared upstream"
         );
     }
 

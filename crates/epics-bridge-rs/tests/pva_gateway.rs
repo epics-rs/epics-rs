@@ -1384,6 +1384,126 @@ async fn gw60_slow_pipelined_downstream_converges_to_latest_under_overflow() {
     );
 }
 
+/// R18-25: one slow pipelined downstream must not starve its co-subscribers.
+///
+/// Two downstream monitors share ONE upstream monitor (same PV, same
+/// credential). One is pipelined and never keeps up; the other is a plain
+/// monitor that consumes everything instantly. The healthy one must keep
+/// receiving updates while the slow one is stuck.
+///
+/// Pre-fix the gateway declared `monitor_watermarks = Some((0, 0))`, so the
+/// slow op's every DATA emission drained its window to LOW and cast a *pause*
+/// vote on the shared upstream. The aggregate rule ("pause iff every VOTING op
+/// wants pause") counted only ops that had themselves crossed LOW — and a
+/// non-pipelined op never crosses anything, so it never votes and its Resume
+/// can never come. The slow client's single vote paused the upstream and the
+/// healthy client stopped receiving: it saw the seed and nothing after.
+///
+/// pva2pva never throttles upstream (`moncache.cpp:133-137` polls the upstream
+/// dry, with a bare `//TODO: flow control` where a throttle would go); a slow
+/// downstream is absorbed in its own `overflowElement` and counted in
+/// `ndropped` (`:151-174`). The gateway now does the same and declares no
+/// watermarks at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r18_25_slow_pipelined_downstream_does_not_starve_co_subscribers() {
+    use epics_pva_rs::client_native::ops_v2::{MonitorEvent, MonitorEventMask};
+    use epics_pva_rs::pv_request::PvRequestExpr;
+
+    fn extract_double(v: &PvField) -> Option<f64> {
+        if let PvField::Structure(s) = v {
+            for (name, f) in &s.fields {
+                if name == "value"
+                    && let PvField::Scalar(ScalarValue::Double(d)) = f
+                {
+                    return Some(*d);
+                }
+            }
+        }
+        None
+    }
+
+    let (_us, us_addr, us_pv) = spawn_upstream("GW:STARVE:PV", 0.0);
+    let upstream_client = Arc::new(
+        PvaClient::builder()
+            .server_addr(us_addr)
+            .timeout(Duration::from_secs(2))
+            .build(),
+    );
+    let gw = PvaGateway::start(gateway_cfg(upstream_client)).expect("gateway start");
+
+    // The slow one: pipelined with a tiny window, and it never returns from its
+    // callback quickly enough to ACK. Its window closes and stays closed.
+    let slow_client = gw.client_config();
+    let slow_req = PvRequestExpr::parse("record[pipeline=true,queueSize=2]").expect("pvRequest");
+    let h_slow = tokio::spawn(async move {
+        let _ = slow_client
+            .pvmonitor_events(
+                "GW:STARVE:PV",
+                Some(&slow_req),
+                MonitorEventMask::default(),
+                move |ev| {
+                    // Wedged for longer than the whole test: the window closes
+                    // on its first delivery and never reopens.
+                    if let MonitorEvent::Data { .. } = ev {
+                        std::thread::sleep(Duration::from_secs(5));
+                    }
+                },
+            )
+            .await;
+    });
+
+    // The healthy one: a plain monitor on the same PV, consuming instantly.
+    let fast_client = gw.client_config();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<f64>::new()));
+    let seen_cb = seen.clone();
+    let h_fast = tokio::spawn(async move {
+        let _ = fast_client
+            .pvmonitor_events(
+                "GW:STARVE:PV",
+                None,
+                MonitorEventMask::default(),
+                move |ev| {
+                    if let MonitorEvent::Data { value, .. } = ev
+                        && let Some(d) = extract_double(&value)
+                    {
+                        seen_cb.lock().unwrap().push(d);
+                    }
+                },
+            )
+            .await;
+    });
+
+    // Both subscriptions establish and take their seed; the slow one is now
+    // wedged inside its first callback with a closed window.
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    let before = seen.lock().unwrap().len();
+
+    // Upstream keeps posting. Every one of these must reach the healthy
+    // downstream — the slow one's backpressure is its own problem.
+    for i in 1..=20i64 {
+        us_pv.try_post(nt_double_value(i as f64));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(700)).await;
+
+    let seen_final = seen.lock().unwrap().clone();
+    h_slow.abort();
+    h_fast.abort();
+
+    assert!(
+        seen_final.len() > before,
+        "the healthy co-subscriber received nothing after the slow pipelined \
+         client stalled: the gateway paused the SHARED upstream on that \
+         client's vote (saw {seen_final:?}, {before} of them before the posts)"
+    );
+    assert_eq!(
+        seen_final.last().copied(),
+        Some(20.0),
+        "the healthy co-subscriber must track the upstream to its latest value, \
+         saw {seen_final:?}"
+    );
+}
+
 // ---------------------------------------------------------------------
 // PUT_GET leg: the gateway must forward a
 // downstream PUT_GET as ONE upstream PUT_GET — preserving the downstream

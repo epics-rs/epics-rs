@@ -19,10 +19,13 @@ use epics_base_rs::server::iocsh::registry::{
     ArgDesc, ArgType, ArgValue, CommandContext, CommandDef, CommandOutcome, CommandResult,
 };
 
+use crate::drivers::ftdi::DrvAsynFtdiPort;
 use crate::drivers::ip_port::DrvAsynIPPort;
 use crate::drivers::ip_server_port::{DrvAsynIPServerPort, IpServerConfig};
 use crate::drivers::prologix::DrvAsynPrologixPort;
 use crate::drivers::serial_port::DrvAsynSerialPort;
+use crate::drivers::usbtmc::DrvAsynUsbtmcPort;
+use crate::drivers::vxi11::DrvVxi11Port;
 use crate::error::AsynResult;
 use crate::escape::escaped_from_raw;
 use crate::manager::PortManager;
@@ -1343,6 +1346,9 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
     out.push(drv_asyn_ip_port_configure_command(services.clone()));
     out.push(drv_asyn_ip_server_port_configure_command(services.clone()));
     out.push(drv_asyn_serial_port_configure_command(services.clone()));
+    out.push(drv_asyn_ftdi_port_configure_command(services.clone()));
+    out.push(vxi11_configure_command(services.clone()));
+    out.push(usbtmc_configure_command(services.clone()));
     out.push(drv_asyn_prologix_port_configure_command(services));
 
     out
@@ -1800,6 +1806,251 @@ pub fn drv_asyn_prologix_port_configure_command(services: PortServices) -> Comma
     )
 }
 
+/// The single path a `*Configure` shell command uses to turn a freshly built
+/// driver into a live, named, traceable port — C's `registerPort`, which is the
+/// sole entry into the port list (asynManager.c:503, :611-637). Returns `false`
+/// when the name is already taken, having already printed C's diagnostic and
+/// torn the half-built actor down; the caller then has nothing to clean up.
+fn publish_configured_port<D: PortDriver>(
+    command: &str,
+    port: &str,
+    driver: D,
+    services: &PortServices,
+    ctx: &CommandContext,
+) -> bool {
+    let config = RuntimeConfig {
+        services: services.clone(),
+        ..RuntimeConfig::default()
+    };
+    let (handle, _jh) = create_port_runtime(driver, config);
+    if let Err(e) = crate::asyn_record::register_port(
+        port,
+        handle.port_handle().clone(),
+        services.trace().clone(),
+    ) {
+        ctx.println(&format!("{command}: {e}"));
+        handle.shutdown();
+        return false;
+    }
+    // The registry above holds a live `PortHandle` for this port, which is what
+    // keeps its actor alive; the `PortRuntimeHandle` may drop here.
+    drop(handle);
+    true
+}
+
+/// Build the `drvAsynFTDIPortConfigure` iocsh command.
+///
+/// C parity: `drvAsynFTDIPort.cpp:641-660` — nine positional args
+/// (`portName`, `vendorID`, `productID`, `baudrate`, `latency`, `priority`,
+/// `noAutoConnect`, `noProcessEos`, `mode`), all but the name integers.
+/// `priority` is accepted for startup-script compatibility but has no effect
+/// (the Rust runtime schedules port actors uniformly).
+pub fn drv_asyn_ftdi_port_configure_command(services: PortServices) -> CommandDef {
+    let int_args = [
+        "vendorID",
+        "productID",
+        "baudrate",
+        "latency",
+        "priority",
+        "noAutoConnect",
+        "noProcessEos",
+        "mode",
+    ];
+    let mut arg_descs = vec![ArgDesc {
+        name: "portName",
+        arg_type: ArgType::String,
+        optional: false,
+    }];
+    arg_descs.extend(int_args.into_iter().map(|name| ArgDesc {
+        name,
+        arg_type: ArgType::Int,
+        optional: true,
+    }));
+    CommandDef::new(
+        "drvAsynFTDIPortConfigure",
+        arg_descs,
+        "drvAsynFTDIPortConfigure portName vendorID productID baudrate latency [priority] \
+         [noAutoConnect] [noProcessEos] [mode] - create an FTDI octet port",
+        move |args: &[ArgValue], ctx: &CommandContext| {
+            let port = arg_str(args, 0)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| "portName required".to_string())?;
+            let driver = match DrvAsynFtdiPort::configure(
+                &port,
+                arg_int(args, 1).unwrap_or(0) as i32,
+                arg_int(args, 2).unwrap_or(0) as i32,
+                arg_int(args, 3).unwrap_or(0) as i32,
+                arg_int(args, 4).unwrap_or(0) as i32,
+                arg_int(args, 5).unwrap_or(0) as u32,
+                arg_int(args, 6).unwrap_or(0) != 0,
+                arg_int(args, 7).unwrap_or(0) != 0,
+                arg_int(args, 8).unwrap_or(0) as i32,
+            ) {
+                Ok(d) => d,
+                Err(e) => {
+                    ctx.println(&format!("drvAsynFTDIPortConfigure: {e}"));
+                    return Ok(CommandOutcome::Continue);
+                }
+            };
+            if publish_configured_port("drvAsynFTDIPortConfigure", &port, driver, &services, ctx) {
+                ctx.println(&format!(
+                    "drvAsynFTDIPortConfigure: FTDI port '{port}' created"
+                ));
+            }
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// Build the `vxi11Configure` iocsh command.
+///
+/// C parity: `drvVxi11.c:1789-1802` — seven positional args (`portName`,
+/// `host name`, `flags`, `default timeout`, `vxiName`, `priority`,
+/// `disable auto-connect`). `default timeout` is a *string* in C, parsed by the
+/// driver, so it is a string here too. `priority` has no effect in the Rust
+/// runtime.
+pub fn vxi11_configure_command(services: PortServices) -> CommandDef {
+    CommandDef::new(
+        "vxi11Configure",
+        vec![
+            ArgDesc {
+                name: "portName",
+                arg_type: ArgType::String,
+                optional: false,
+            },
+            ArgDesc {
+                name: "hostName",
+                arg_type: ArgType::String,
+                optional: false,
+            },
+            ArgDesc {
+                name: "flags",
+                arg_type: ArgType::Int,
+                optional: true,
+            },
+            ArgDesc {
+                name: "defaultTimeout",
+                arg_type: ArgType::String,
+                optional: true,
+            },
+            ArgDesc {
+                name: "vxiName",
+                arg_type: ArgType::String,
+                optional: true,
+            },
+            ArgDesc {
+                name: "priority",
+                arg_type: ArgType::Int,
+                optional: true,
+            },
+            ArgDesc {
+                name: "noAutoConnect",
+                arg_type: ArgType::Int,
+                optional: true,
+            },
+        ],
+        "vxi11Configure portName hostName [flags] [defaultTimeout] [vxiName] [priority] \
+         [noAutoConnect] - create a VXI-11 port",
+        move |args: &[ArgValue], ctx: &CommandContext| {
+            let port = arg_str(args, 0)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| "portName required".to_string())?;
+            let host = arg_str(args, 1)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| "hostName required".to_string())?;
+            let driver = match DrvVxi11Port::configure(
+                &port,
+                &host,
+                arg_int(args, 2).unwrap_or(0) as i32,
+                &arg_str(args, 3).unwrap_or_default(),
+                &arg_str(args, 4).unwrap_or_default(),
+                arg_int(args, 5).unwrap_or(0) as i32,
+                arg_int(args, 6).unwrap_or(0) != 0,
+            ) {
+                Ok(d) => d,
+                Err(e) => {
+                    ctx.println(&format!("vxi11Configure: {e}"));
+                    return Ok(CommandOutcome::Continue);
+                }
+            };
+            if publish_configured_port("vxi11Configure", &port, driver, &services, ctx) {
+                ctx.println(&format!("vxi11Configure: VXI-11 port '{port}' -> {host}"));
+            }
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// Build the `usbtmcConfigure` iocsh command.
+///
+/// C parity: `drvAsynUSBTMC.c:1332-1345` — six positional args (`port name`,
+/// `vendor ID number`, `product ID number`, `serial string`, `priority`,
+/// `flags`). A vendor/product of 0 is C's "take the first USBTMC device found",
+/// and an empty serial string is "any serial number". `priority` has no effect
+/// in the Rust runtime.
+pub fn usbtmc_configure_command(services: PortServices) -> CommandDef {
+    CommandDef::new(
+        "usbtmcConfigure",
+        vec![
+            ArgDesc {
+                name: "portName",
+                arg_type: ArgType::String,
+                optional: false,
+            },
+            ArgDesc {
+                name: "vendorID",
+                arg_type: ArgType::Int,
+                optional: true,
+            },
+            ArgDesc {
+                name: "productID",
+                arg_type: ArgType::Int,
+                optional: true,
+            },
+            ArgDesc {
+                name: "serialNumber",
+                arg_type: ArgType::String,
+                optional: true,
+            },
+            ArgDesc {
+                name: "priority",
+                arg_type: ArgType::Int,
+                optional: true,
+            },
+            ArgDesc {
+                name: "flags",
+                arg_type: ArgType::Int,
+                optional: true,
+            },
+        ],
+        "usbtmcConfigure portName [vendorID] [productID] [serialNumber] [priority] [flags] \
+         - create a USBTMC port",
+        move |args: &[ArgValue], ctx: &CommandContext| {
+            let port = arg_str(args, 0)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| "portName required".to_string())?;
+            let driver = match DrvAsynUsbtmcPort::configure(
+                &port,
+                arg_int(args, 1).unwrap_or(0) as i32,
+                arg_int(args, 2).unwrap_or(0) as i32,
+                &arg_str(args, 3).unwrap_or_default(),
+                arg_int(args, 4).unwrap_or(0) as i32,
+                arg_int(args, 5).unwrap_or(0) as i32,
+            ) {
+                Ok(d) => d,
+                Err(e) => {
+                    ctx.println(&format!("usbtmcConfigure: {e}"));
+                    return Ok(CommandOutcome::Continue);
+                }
+            };
+            if publish_configured_port("usbtmcConfigure", &port, driver, &services, ctx) {
+                ctx.println(&format!("usbtmcConfigure: USBTMC port '{port}' created"));
+            }
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1990,6 +2241,9 @@ mod tests {
             "drvAsynIPPortConfigure",
             "drvAsynIPServerPortConfigure",
             "drvAsynSerialPortConfigure",
+            "drvAsynFTDIPortConfigure",
+            "vxi11Configure",
+            "usbtmcConfigure",
             "prologixGPIBConfigure",
         ];
         expected.sort_unstable();
@@ -3204,5 +3458,107 @@ mod tests {
         );
         assert!(result.is_err());
         assert!(crate::asyn_record::get_port("iocsh_prologix_cfg_nohost").is_none());
+    }
+
+    /// R19-111: `drvAsynFTDIPortConfigure` exists with C's nine args
+    /// (drvAsynFTDIPort.cpp:641-660) and publishes the port under its name.
+    /// `noAutoConnect=1` here so the boundary under test is creation, not the
+    /// absent USB device.
+    #[test]
+    fn iocsh_ftdi_port_configure_creates_the_port_an_st_cmd_names() {
+        let cmd =
+            drv_asyn_ftdi_port_configure_command(PortServices::new(Arc::new(TraceManager::new())));
+        assert_eq!(cmd.name, "drvAsynFTDIPortConfigure");
+        assert_eq!(cmd.args.len(), 9);
+
+        let ctx = make_ctx();
+        let result = cmd.handler.call(
+            &[
+                ArgValue::String("iocsh_ftdi_cfg_test".into()),
+                ArgValue::Int(0x0403),
+                ArgValue::Int(0x6001),
+                ArgValue::Int(9600),
+                ArgValue::Int(1),
+                ArgValue::Int(0),
+                ArgValue::Int(1), // noAutoConnect
+            ],
+            &ctx,
+        );
+        assert!(result.is_ok(), "command failed: {:?}", result.err());
+        assert!(
+            crate::asyn_record::get_port("iocsh_ftdi_cfg_test").is_some(),
+            "port must be resolvable via the asyn_record registry"
+        );
+    }
+
+    /// R19-111: `vxi11Configure` exists with C's seven args
+    /// (drvVxi11.c:1789-1802) and publishes the port under its name.
+    #[test]
+    fn iocsh_vxi11_configure_creates_the_port_an_st_cmd_names() {
+        let cmd = vxi11_configure_command(PortServices::new(Arc::new(TraceManager::new())));
+        assert_eq!(cmd.name, "vxi11Configure");
+        assert_eq!(cmd.args.len(), 7);
+
+        let ctx = make_ctx();
+        let result = cmd.handler.call(
+            &[
+                ArgValue::String("iocsh_vxi11_cfg_test".into()),
+                ArgValue::String("127.0.0.1".into()),
+                ArgValue::Int(0),
+                ArgValue::String("1.0".into()),
+                ArgValue::String("inst0".into()),
+                ArgValue::Int(0),
+                ArgValue::Int(1), // noAutoConnect: no VXI-11 instrument here
+            ],
+            &ctx,
+        );
+        assert!(result.is_ok(), "command failed: {:?}", result.err());
+        assert!(
+            crate::asyn_record::get_port("iocsh_vxi11_cfg_test").is_some(),
+            "port must be resolvable via the asyn_record registry"
+        );
+    }
+
+    /// `vxi11Configure` without a host creates nothing — C dereferences
+    /// `hostName` in `vxiInit` and cannot proceed without it.
+    #[test]
+    fn iocsh_vxi11_configure_rejects_missing_host() {
+        let cmd = vxi11_configure_command(PortServices::new(Arc::new(TraceManager::new())));
+        let ctx = make_ctx();
+        let result = cmd
+            .handler
+            .call(&[ArgValue::String("iocsh_vxi11_cfg_nohost".into())], &ctx);
+        assert!(result.is_err());
+        assert!(crate::asyn_record::get_port("iocsh_vxi11_cfg_nohost").is_none());
+    }
+
+    /// R19-111: `usbtmcConfigure` exists with C's six args
+    /// (drvAsynUSBTMC.c:1332-1345) and publishes the port under its name. C has
+    /// no `noAutoConnect` arg here, so the port comes up auto-connecting and
+    /// fails to find a device — which is exactly C's behaviour with no
+    /// instrument plugged in, and does not stop the port from existing.
+    #[test]
+    fn iocsh_usbtmc_configure_creates_the_port_an_st_cmd_names() {
+        let cmd = usbtmc_configure_command(PortServices::new(Arc::new(TraceManager::new())));
+        assert_eq!(cmd.name, "usbtmcConfigure");
+        assert_eq!(cmd.args.len(), 6);
+
+        let ctx = make_ctx();
+        let result = cmd.handler.call(
+            &[
+                ArgValue::String("iocsh_usbtmc_cfg_test".into()),
+                ArgValue::Int(0x0699),
+                ArgValue::Int(0x0368),
+                ArgValue::String(String::new()),
+                ArgValue::Int(0),
+                ArgValue::Int(0),
+            ],
+            &ctx,
+        );
+        assert!(result.is_ok(), "command failed: {:?}", result.err());
+        assert!(
+            crate::asyn_record::get_port("iocsh_usbtmc_cfg_test").is_some(),
+            "port must be resolvable via the asyn_record registry"
+        );
     }
 }

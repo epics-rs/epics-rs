@@ -3127,7 +3127,7 @@ impl PvDatabase {
                 }
                 self.dispatch_multi_output_values(&rec, src, visited, depth)
                     .await;
-                self.write_simulated_output_siol(&rec, &sim_output, skip_out)
+                self.write_simulated_output_siol(&rec, &sim_output, skip_out, src, visited, depth)
                     .await;
                 self.execute_process_actions(name, &rec, link_writes, visited, depth)
                     .await;
@@ -4518,85 +4518,22 @@ impl PvDatabase {
         }
     }
 
-    /// Write a simulation value to an output record's SIOL link,
-    /// dispatching by link type and locality exactly as C `dbPutLink`
-    /// (reached from `writeValue` for a SIMM-mode output record):
-    ///
-    /// - a **local DB** target uses the already-locked write — writing
-    ///   VAL is an internal step of this record's processing chain,
-    ///   which already holds the entry record's advisory write gate, so
-    ///   a SIOL pointing back at a chain record must not re-acquire the
-    ///   non-reentrant gate (same reasoning as `write_db_link_value`);
-    /// - a **non-local DB** target (`dbInitLink` made it a CA link) and
-    ///   an explicit **`Ca`/`Pva`** link route through the lset put path;
-    /// - constant / hardware / none SIOL targets are not writable — no-op
-    ///   (C `dbPutLink` -> `S_db_noLSET`).
-    async fn write_sim_siol_value(
-        &self,
-        siol: &crate::server::record::ParsedLink,
-        value: EpicsValue,
-    ) -> bool {
-        match siol {
-            crate::server::record::ParsedLink::Db(link) => {
-                let pv_name = if link.field == "VAL" {
-                    link.record.clone()
-                } else {
-                    format!("{}.{}", link.record, link.field)
-                };
-                if self.has_name_no_resolve(&link.record).await {
-                    match self.put_pv_already_locked(&pv_name, value).await {
-                        Ok(()) => false,
-                        Err(e) => {
-                            eprintln!("SIOL simulation write to '{pv_name}' failed: {e}");
-                            true
-                        }
-                    }
-                } else {
-                    match self
-                        .write_external_pv(
-                            &pv_name,
-                            value,
-                            crate::server::database::LinkPutOp::Plain,
-                        )
-                        .await
-                    {
-                        Ok(()) => false,
-                        Err(e) => {
-                            eprintln!(
-                                "SIOL simulation write to external PV '{pv_name}' failed: {e}"
-                            );
-                            true
-                        }
-                    }
-                }
-            }
-            crate::server::record::ParsedLink::Ca(_)
-            | crate::server::record::ParsedLink::Pva(_)
-            | crate::server::record::ParsedLink::PvaJson(_) => {
-                let name = siol
-                    .external_pv_name()
-                    .expect("Ca/Pva/PvaJson link carries a PV name");
-                match self
-                    .write_external_pv(&name, value, crate::server::database::LinkPutOp::Plain)
-                    .await
-                {
-                    Ok(()) => false,
-                    Err(e) => {
-                        eprintln!("SIOL simulation write to external PV '{name}' failed: {e}");
-                        true
-                    }
-                }
-            }
-            // Not a writable target — C `dbPutLink` → `S_db_noLSET`, which
-            // does NOT alarm.
-            _ => false,
-        }
-    }
-
     /// Apply the SIMM-mode OUTPUT redirect (the `writeValue` half of
     /// simulation). C `writeValue` substitutes the device write with
-    /// `dbPutLink(&prec->siol, ..., &prec->oval)` at the END of `process()`,
-    /// so this runs from the OUT epilogue after the body computed OVAL/RVAL.
+    /// `dbPutLink(&prec->siol, DBR_DOUBLE, &prec->oval, 1)` (aoRecord.c:574,
+    /// `DBR_LONG`/`&prec->rval` in SIMM=RAW at :577), so this runs from the OUT
+    /// epilogue after the body computed OVAL/RVAL.
+    ///
+    /// SIOL is a `DBF_OUTLINK` (aoRecord.dbd) driven by the SAME `dbPutLink`
+    /// as the record's OUT: it is not a bare field poke. Routing it through
+    /// [`Self::write_out_link_value`] — the put owner — is what gives the
+    /// simulated write everything C's `dbDbPutValue` (dbDbLink.c:372-393) does
+    /// and the old open-coded `put_pv_already_locked` did not: MS-class alarm
+    /// inheritance into the SIOL target, `PP`/`.PROC` `processTarget`, PUTF and
+    /// put-notify propagation — and the failed-put `LINK_ALARM`/`INVALID`
+    /// raised BY the owner rather than by this caller (which violated
+    /// `write_out_link_value`'s own single-raise invariant).
+    ///
     /// `sim_output` is `None` for a non-simulated record or a simulated INPUT
     /// (whose `readValue` ran up-front); `skip_out` carries the IVOA
     /// Don't_drive veto so the SIOL write is suppressed exactly as the real
@@ -4611,6 +4548,9 @@ impl PvDatabase {
         rec: &Arc<RwLock<RecordInstance>>,
         sim_output: &Option<(crate::server::record::ParsedLink, i16, bool)>,
         skip_out: bool,
+        src: super::links::OutLinkSrc<'_>,
+        visited: &mut std::collections::HashSet<String>,
+        depth: usize,
     ) {
         let Some((siol, _sims, raw_mode)) = sim_output else {
             return;
@@ -4636,15 +4576,18 @@ impl PvDatabase {
             }
         };
         if let Some(value) = value {
-            // C `writeValue` performs the SIOL redirect through `dbPutLink`,
-            // whose `setLinkAlarm` raises LINK_ALARM/INVALID on THIS record
-            // when the put fails (dbLink.c:444-446) — the simulated write is
-            // not exempt. It runs pre-commit like every other output of the
-            // cycle, so the alarm reaches this cycle's committed SEVR.
-            if self.write_sim_siol_value(siol, value).await {
-                let mut instance = rec.write().await;
-                crate::server::recgbl::rec_gbl_set_link_alarm(&mut instance.common, "SIOL");
-            }
+            self.write_out_link_value(
+                rec,
+                siol,
+                value,
+                super::links::OutLinkSrc {
+                    field: "SIOL",
+                    ..src
+                },
+                visited,
+                depth,
+            )
+            .await;
         }
     }
 

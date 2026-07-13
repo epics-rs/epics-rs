@@ -138,15 +138,35 @@ fn caput_without_a_value_reports_no_value_specified() {
     assert_eq!(stderr, "No value specified. ('caput -h' for help.)\n");
 }
 
-/// `-h`/`-V` are not usage errors: clap owns them and they exit 0, like C's
-/// `usage()` / version paths. The exit-1 mapping must not swallow them.
+/// `-h`/`-V` are not usage errors: they exit 0, like C's `usage()` / version
+/// paths. The exit-1 mapping must not swallow them.
+///
+/// The STREAMS differ, and C picks them per call: `usage()` is one
+/// `fprintf(stderr, ...)` (`caget.c:55-58`, `camonitor.c:45-47`,
+/// `caput.c:60-62`, `cainfo.c:37-39`), while `case 'V'` is a `printf`
+/// (`caget.c:403`). So `-h` writes stderr and `-V` writes stdout — R14-16;
+/// the port used to send the exit-0 help block to stdout because that is
+/// clap's stream.
 #[test]
-fn help_and_version_still_exit_0() {
+fn help_goes_to_stderr_and_version_to_stdout_both_exit_0() {
     for (bin, tool) in TOOLS {
-        for flag in ["-h", "-V"] {
-            let (code, stdout, _) = run(bin, &[flag]);
-            assert_eq!(code, 0, "{tool} {flag}: status");
-            assert!(!stdout.is_empty(), "{tool} {flag}: stdout");
-        }
+        let (code, stdout, stderr) = run(bin, &["-h"]);
+        assert_eq!(code, 0, "{tool} -h: status");
+        assert!(
+            stderr.contains("Usage:"),
+            "{tool} -h: C's usage() writes stderr; stderr was:\n{stderr}"
+        );
+        assert!(
+            stdout.is_empty(),
+            "{tool} -h: nothing goes to stdout; stdout was:\n{stdout}"
+        );
+
+        let (code, stdout, stderr) = run(bin, &["-V"]);
+        assert_eq!(code, 0, "{tool} -V: status");
+        assert!(!stdout.is_empty(), "{tool} -V: the banner is a printf");
+        assert!(
+            stderr.is_empty(),
+            "{tool} -V: nothing goes to stderr; stderr was:\n{stderr}"
+        );
     }
 }

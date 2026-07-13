@@ -58,13 +58,15 @@ fn a_warning_before_help_survives_it() {
 }
 
 /// `case 'h'` returns from `main`, so an option AFTER it is never scanned and
-/// cannot warn — the same fact seen from the other side.
+/// cannot warn — the same fact seen from the other side. (The usage block
+/// itself shares this stream: C's `usage()` is an `fprintf(stderr, ...)`, so
+/// what must be absent here is the WARNING, not all output — R14-16.)
 #[test]
 fn an_option_after_help_is_never_scanned() {
     for (bin, tool) in tools() {
         let stderr = stderr_of(bin, &["-h", "-w", "abc"]);
         assert!(
-            stderr.is_empty(),
+            !stderr.contains(TIMEOUT_WARNING),
             "{tool} -h -w abc: `case 'h'` returns before the loop ever reaches '-w'; \
              stderr was:\n{stderr}"
         );

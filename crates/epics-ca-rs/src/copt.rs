@@ -146,12 +146,15 @@ pub enum Terminal {
     /// `default:` arm that a declared-but-unhandled option letter falls into
     /// returns 1.
     ///
-    /// C writes the block to stderr in both cases. This port writes the
-    /// exit-0 (help was ASKED for) block to stdout, which is where clap has
-    /// always put it and what the tools' own tests pin; the exit-1 (the user
-    /// got it wrong) block goes to stderr, as every other diagnostic here
-    /// does. The block's WORDING is clap's, not C's — a standing, separate
-    /// divergence.
+    /// The block goes to STDERR at either status, because that is the only
+    /// stream C's `usage()` ever writes: all four tools open it with
+    /// `fprintf (stderr, "\nUsage: ...")` (`caget.c:55-58`, `camonitor.c:45-47`,
+    /// `caput.c:60-62`, `cainfo.c:37-39`), and the `-h` case just calls that
+    /// same function. One block, one stream, both statuses — the port used to
+    /// split it, sending the exit-0 half to stdout because that is where clap
+    /// puts help. The block's WORDING is still clap's, not C's — a standing,
+    /// separate divergence. `-V` keeps stdout: C prints the version banner with
+    /// `printf` (`caget.c:403`).
     Usage(i32),
     /// C `case 'V'`: the version banner on stdout, `return 0`.
     Version,
@@ -285,12 +288,9 @@ impl<'m> Scan<'m> {
                 std::process::exit(0)
             }
             Some((_, Terminal::Usage(status))) => {
-                let mut cmd = cmd.clone();
-                if status == 0 {
-                    let _ = cmd.print_help();
-                } else {
-                    let _ = cmd.write_help(&mut std::io::stderr());
-                }
+                // C's `usage()` writes to stderr whatever brought it here —
+                // `-h`, or the `default:` arm's exit-1 path.
+                let _ = cmd.clone().write_help(&mut std::io::stderr());
                 std::process::exit(status)
             }
         }

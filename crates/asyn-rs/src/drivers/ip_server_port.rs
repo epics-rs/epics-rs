@@ -939,9 +939,12 @@ impl DrvAsynIPServerPort {
         let cache_t = Arc::clone(&self.udp_cache);
         let shutdown_t = Arc::clone(&self.udp_shutdown);
         let port_name = self.base.port_name.clone();
+        // The worker fires this port's octet interrupts (C :312-321), so it
+        // needs the same interrupt source the driver publishes on.
+        let interrupts_t = InterruptManager::from_shared_state(self.base.interrupts.shared_state());
         let handle = std::thread::Builder::new()
             .name(format!("udp-server-{port_name}"))
-            .spawn(move || udp_recv_loop(socket_t, cache_t, shutdown_t, port_name))
+            .spawn(move || udp_recv_loop(socket_t, cache_t, shutdown_t, port_name, interrupts_t))
             .map_err(|e| AsynError::Status {
                 status: AsynStatus::Error,
                 message: format!("UDP recv thread spawn failed: {e}"),
@@ -1449,6 +1452,7 @@ fn udp_recv_loop(
     cache: Arc<Mutex<UdpCache>>,
     shutdown: Arc<AtomicBool>,
     port_name: String,
+    interrupts: InterruptManager,
 ) {
     let mut buf = vec![0u8; UDP_MAX_DATAGRAM];
     loop {
@@ -1466,10 +1470,33 @@ fn udp_recv_loop(
         }
         match socket.recv(&mut buf) {
             Ok(n) => {
-                let mut c = cache.lock();
-                c.data.clear();
-                c.data.extend_from_slice(&buf[..n]);
-                c.pos = 0;
+                {
+                    let mut c = cache.lock();
+                    c.data.clear();
+                    c.data.extend_from_slice(&buf[..n]);
+                    c.pos = 0;
+                }
+                // C :312-321 — every registered octet callback gets the
+                // datagram, unconditionally (no addr test, exactly as for the
+                // TCP announcement at :372-383). A datagram is a whole message,
+                // so C passes ASYN_EOM_END; InterruptValue carries no eom
+                // because no consumer reads one (C's own octet consumer,
+                // devAsynOctet.c:476-478, ignores the eomReason argument).
+                //
+                // Fired with the cache lock released: a subscriber's callback
+                // runs inline here, and a callback that reads the port back
+                // would otherwise deadlock against the lock we still held.
+                interrupts.notify_octet(
+                    OctetFanOut::EveryUser,
+                    InterruptValue {
+                        reason: 0,
+                        addr: 0,
+                        value: ParamValue::Octet(String::from_utf8_lossy(&buf[..n]).into_owned()),
+                        timestamp: SystemTime::now(),
+                        iface: Some(InterfaceType::Octet),
+                        ..Default::default()
+                    },
+                );
             }
             // DRV-56: a non-fatal recv error (200 ms read-timeout wake, or an
             // EINTR signal interruption) must NOT exit the worker — loop and
@@ -2372,6 +2399,63 @@ mod tests {
             Ok(0) => {}
             other => panic!("expected drained (timeout / 0 bytes), got {other:?}"),
         }
+
+        srv.disconnect(&AsynUser::default()).unwrap();
+    }
+
+    /// R19-110 boundary: a datagram fans out to every octet interrupt user,
+    /// with no consumer polling `read_octet`.
+    ///
+    /// C's UDP branch (drvAsynIPServerPort.c:309-322) calls every registered
+    /// octet callback with the payload straight from `recvfrom` — that is the
+    /// only delivery path a UDP server port has for an I/O-Intr scanned record.
+    /// The boundary that matters is the same one as R19-109: the subscriber's
+    /// addr (here 3) does not match the emission's, and C tests neither.
+    #[test]
+    fn a_udp_datagram_fans_out_to_every_octet_user() {
+        use crate::interrupt::{InterruptFilter, InterruptValue};
+        use std::net::UdpSocket as ClientSock;
+        use std::sync::Mutex as StdMutex;
+
+        let mut srv = DrvAsynIPServerPort::new("udp_intr", "127.0.0.1:0 UDP").unwrap();
+        srv.connect(&AsynUser::default()).unwrap();
+        let server_addr = srv
+            .udp_socket
+            .lock()
+            .as_ref()
+            .unwrap()
+            .local_addr()
+            .unwrap();
+
+        let seen: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        let seen_cb = seen.clone();
+        let _cb = srv.base().interrupts.register_sync_callback(
+            InterruptFilter {
+                addr: Some(3),
+                ..InterruptFilter::default()
+            },
+            move |iv: &InterruptValue| {
+                if let ParamValue::Octet(s) = &iv.value {
+                    seen_cb.lock().unwrap().push(s.clone());
+                }
+            },
+        );
+
+        let client = ClientSock::bind("127.0.0.1:0").unwrap();
+        client.send_to(b"telemetry", server_addr).unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if !seen.lock().unwrap().is_empty() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no octet interrupt for the datagram (C: drvAsynIPServerPort.c:312-321)"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(seen.lock().unwrap().as_slice(), ["telemetry".to_string()]);
 
         srv.disconnect(&AsynUser::default()).unwrap();
     }

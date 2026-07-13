@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use std::any::Any;
@@ -269,6 +269,19 @@ pub struct PortDriverBase {
     /// [`Self::sync_connection_edge`], the same edge owner that raises the
     /// exception, so a connect that was never published is never counted.
     pub number_connects: u64,
+    /// How many exceptions this port has announced — the Rust form of C's
+    /// `epicsEventSignal(pport->notifyPortThread)` at the tail of
+    /// `announceExceptionOccurred` (asynManager.c:635-636), which is one of the
+    /// five things that wake C's `portThread`.
+    ///
+    /// A signal has no state to read back, so the actor cannot poll one; a
+    /// monotonic count can be, and it says the same thing: the number changed,
+    /// therefore an exception was announced since the actor last looked
+    /// ([`crate::port_actor::PortActor::take_port_thread_wake`]). Counting here —
+    /// in the one method every announcement goes through — is what keeps the wake
+    /// source tied to the announcement rather than to an enumeration of the ops
+    /// that happen to announce today.
+    exceptions_announced: AtomicU64,
 }
 
 impl PortDriverBase {
@@ -295,6 +308,7 @@ impl PortDriverBase {
             connect_retry_at: None,
             seconds_between_port_connect: DEFAULT_SECONDS_BETWEEN_PORT_CONNECT,
             number_connects: 0,
+            exceptions_announced: AtomicU64::new(0),
         }
     }
 
@@ -328,7 +342,16 @@ impl PortDriverBase {
     }
 
     /// Announce an exception through the global exception manager (if injected).
+    ///
+    /// C `announceExceptionOccurred` (asynManager.c:611-637) ends by signalling
+    /// `notifyPortThread` on a CANBLOCK port (:635-636) — the announcement *is* a
+    /// port-thread wake, which is why `asynEnable(port,1)` on a down port ends in
+    /// a connect attempt. [`Self::exceptions_announced`] is how the actor sees
+    /// that signal, so the count moves here and nowhere else: a port with no
+    /// exception sink still announced (C's fan-out over an empty list still
+    /// signals), so the count is bumped before the sink is even consulted.
     pub fn announce_exception(&self, exception: AsynException, addr: i32) {
+        self.exceptions_announced.fetch_add(1, Ordering::Release);
         if let Some(ref sink) = self.exception_sink {
             sink.announce(&ExceptionEvent {
                 port_name: self.port_name.clone(),
@@ -336,6 +359,13 @@ impl PortDriverBase {
                 addr,
             });
         }
+    }
+
+    /// How many exceptions this port has announced. Monotonic; the actor compares
+    /// it against the value it last saw to decide whether C would have signalled
+    /// `notifyPortThread` (asynManager.c:635-636).
+    pub fn exceptions_announced(&self) -> u64 {
+        self.exceptions_announced.load(Ordering::Acquire)
     }
 
     /// Query whether the port is connected — the truth, wherever it lives.

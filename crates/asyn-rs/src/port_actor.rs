@@ -249,10 +249,45 @@ pub(crate) struct PortActor {
     /// device); *not* by a re-park, which is what keeps the loop from spinning on
     /// a request whose device is still disabled.
     rescan_parked: bool,
+    /// C `pport->notifyPortThread` (asynManager.c:229) — the binary event C's
+    /// `portThread` waits on. It is signalled from exactly five places
+    /// (`queueRequest` :1626, `announceExceptionOccurred` :636,
+    /// `queueTimeoutCallback` :700, `cancelRequest` :1688,
+    /// `unblockProcessCallback` :1772) and everything the woken thread does —
+    /// draining the queues, and the port-level auto-connect at :856-861 — is
+    /// downstream of one of them.
+    ///
+    /// The actor's loop is woken by *any* message, status queries included, so
+    /// "a pass ran" is not "C's thread was signalled": a `GetConnected` or an
+    /// `asynReport` dialled the hardware, and a poller pulled a dead port's
+    /// reconnect cadence from 20 s down to its own period (R16-46). This latch is
+    /// the missing half — the pass runs, but only a pass C would have signalled
+    /// reaches the auto-connect tail.
+    ///
+    /// The exception source is *not* here: it is counted on the port itself
+    /// (`PortDriverBase::exceptions_announced`), because an exception can be
+    /// announced from inside a driver call, where the actor has no hook.
+    /// [`Self::take_port_thread_wake`] is the one reader of both halves.
+    ///
+    /// Four of C's five signal sites set this or the exception count; the fifth,
+    /// `cancelRequest` (:1688), has no actor-side site to set it from — a cancel
+    /// is a [`CancelToken`] flip on the *caller's* thread, and the actor learns
+    /// of it when it pops the request. It sends no message, so it wakes nothing,
+    /// which is the same end state C's woken thread reaches: it rescans a queue
+    /// that lost one entry.
+    woken: bool,
+    /// The port's announced-exception count as of the last
+    /// [`Self::take_port_thread_wake`] — the memory that turns a monotonic
+    /// counter back into C's edge-triggered signal.
+    seen_exceptions: u64,
 }
 
 impl PortActor {
     pub fn new(driver: Box<dyn PortDriver>, rx: mpsc::Receiver<ActorMessage>) -> Self {
+        // Whatever the driver announced before the actor existed (registration's
+        // own connect edge, say) is not a signal *this* thread ever waited on —
+        // C's port thread is started with the event unsignalled.
+        let seen_exceptions = driver.base().exceptions_announced();
         Self {
             id: ActorId::new(),
             driver,
@@ -262,6 +297,8 @@ impl PortActor {
             pending_while_blocked: Vec::new(),
             parked: Vec::new(),
             rescan_parked: false,
+            woken: false,
+            seen_exceptions,
         }
     }
 
@@ -430,6 +467,12 @@ impl PortActor {
             Some(at) if at <= Instant::now() => {}
             _ => return,
         }
+        // C's timer callback reaches the port thread through `queueRequest`
+        // (:3258), so the retry is one of the five wakes — the pass it starts is
+        // allowed to end in the port-level auto-connect
+        // ([`Self::port_thread_auto_connect`]) even with no traffic on the port.
+        self.woken = true;
+
         // Disarm first: `connect()` re-arms via `set_connected` on either
         // edge, and a stale deadline left behind here would spin the loop.
         self.driver.base_mut().connect_retry_at = None;
@@ -483,13 +526,40 @@ impl PortActor {
     /// an autonomous connect path, so a port disabled while down stayed down
     /// after re-enable until some I/O request forced a connect (R15-46).
     ///
-    /// The rule is uniform — every pass of the actor loop ends here — because
-    /// every decision it could special-case already lives inside
-    /// [`Self::auto_connect_port`]: [`Self::connect_gate`] refuses on a disabled
-    /// or defunct port, and the 2 s throttle bounds an exception storm to one
-    /// attempt per window.
+    /// What it does *not* run on is a pass C's thread would never have taken. C
+    /// waits on `notifyPortThread` and only the five signal sites listed on
+    /// [`Self::woken`] reach it; `isConnected` (:2326-2337), `isEnabled` (:2340),
+    /// `isAutoConnect` (:2348) and `report` (:1136) are plain reads under
+    /// `asynManagerLock` and signal nothing. Here every one of them is a message,
+    /// and a message wakes the actor — so the wake latch, not the message, is
+    /// what gates this tail (R16-46). Without it a status poller dials the
+    /// hardware on its own period and `asynReport` becomes an action.
+    ///
+    /// Beyond the latch the rule is uniform, because every decision it could
+    /// special-case already lives inside [`Self::auto_connect_port`]:
+    /// [`Self::connect_gate`] refuses on a disabled or defunct port, and the 2 s
+    /// throttle bounds an exception storm to one attempt per window.
     fn port_thread_auto_connect(&mut self) {
+        if !self.take_port_thread_wake() {
+            return;
+        }
         self.auto_connect_port();
+    }
+
+    /// C `epicsEventMustWait(pport->notifyPortThread)` (asynManager.c:805) —
+    /// consume the wake and say whether there was one. The two halves are the
+    /// latch the actor sets at C's signal sites ([`Self::woken`]) and the port's
+    /// announced-exception count, which catches the announcements C signals for
+    /// but the actor cannot see from the outside (a driver's own `set_connected`,
+    /// an interpose's, an IP-server listener's).
+    ///
+    /// Like C's binary event, a burst collapses: N requests queued between two
+    /// passes are one wake, and one port-level auto-connect attempt.
+    fn take_port_thread_wake(&mut self) -> bool {
+        let announced = self.driver.base().exceptions_announced();
+        let exception = announced != self.seen_exceptions;
+        self.seen_exceptions = announced;
+        std::mem::take(&mut self.woken) || exception
     }
 
     fn drain_channel(&mut self) {
@@ -530,6 +600,11 @@ impl PortActor {
             .into_iter()
             .partition(|msg| msg.queue_deadline.is_some_and(|at| now >= at));
         self.parked = kept;
+        // C `queueTimeoutCallback` ends by signalling the port thread (:700): the
+        // request left the queue, so the thread must look at what is left.
+        if !expired.is_empty() {
+            self.woken = true;
+        }
         for msg in expired {
             // The token settles which outcome wins, exactly as at the dequeue
             // gate: if the caller's own timer got there first it already
@@ -882,6 +957,16 @@ impl PortActor {
         // thread (asynManager.c:1614, 1626) — the queue changed, so anything the
         // thread had skipped is looked at again.
         self.rescan_parked = true;
+        // …and the signal is `queueRequest`'s, so only what C *queues* raises it.
+        // A `pasynManager` direct call — `isConnected`, `isEnabled`,
+        // `isAutoConnect`, `report`, `enable`, `blockProcessCallback` — takes
+        // `asynManagerLock`, acts and returns without touching the event
+        // ([`CDispatch::Direct`]). Those that nonetheless end in an exception
+        // (`enable` → `exceptionOccurred`, :2247) wake the thread through the
+        // exception count, not through here.
+        if Self::c_dispatch(&msg.op) != CDispatch::Direct {
+            self.woken = true;
+        }
         if let Some((owner, _)) = self.blocked_by {
             let is_owner = msg.block_token == Some(owner);
             // C parity: lifecycle/state ops are not queued, so the block
@@ -1476,6 +1561,11 @@ impl PortActor {
                         self.blocked_by = Some((owner, count - 1));
                     } else {
                         self.blocked_by = None;
+                        // C `unblockProcessCallback` signals the port thread only
+                        // when the block was actually released (`wasOwner`,
+                        // asynManager.c:1772) — the nested decrement above leaves
+                        // the port blocked and signals nothing.
+                        self.woken = true;
                         let pending = std::mem::take(&mut self.pending_while_blocked);
                         for msg in pending {
                             self.heap.push(msg);
@@ -3312,6 +3402,91 @@ mod tests {
             calls.load(Ordering::SeqCst),
             1,
             "an exception storm is throttled to one connect attempt per 2 s window"
+        );
+    }
+
+    /// R16-46: a status query is a plain read and must not dial the hardware.
+    ///
+    /// C's `portThread` runs a pass only when `notifyPortThread` is signalled, and
+    /// `isConnected` (asynManager.c:2326-2337), `isEnabled` (:2340),
+    /// `isAutoConnect` (:2348) and `report` (:1136) signal nothing — they take
+    /// `asynManagerLock`, read a flag and return. Here every one of them is a
+    /// message that wakes the actor, so before the wake latch each of them ended
+    /// in `autoConnectDevice(pport,0)`: a status poller pulled a dead port's
+    /// reconnect cadence from `secondsBetweenPortConnect` down to its own period,
+    /// and `asynReport` became an action.
+    ///
+    /// One case per boundary: each of the four plain reads (no attempt), the idle
+    /// pass (no attempt), and a real wake source (one attempt) — the control that
+    /// keeps the latch from being a blanket "never auto-connect".
+    #[test]
+    fn a_status_query_makes_no_connect_attempt() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct StatusDriver {
+            base: PortDriverBase,
+            connect_calls: Arc<AtomicUsize>,
+        }
+        impl PortDriver for StatusDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {
+                // The link never comes up, so the counter measures *attempts*:
+                // one connect that succeeded would hide every later query behind
+                // `is_connected()`.
+                self.connect_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut base = PortDriverBase::new("status_test", 1, PortFlags::default());
+        base.create_param("VAL", ParamType::Int32).unwrap();
+        // Down, enabled, auto-connect, and with no throttle window running
+        // (`init_connected` stamps no transition) — so the *first* attempt any
+        // pass wanted to make would be permitted. No transition means no retry
+        // timer either, so nothing but a wake can produce an attempt.
+        base.init_connected(false);
+        base.auto_connect = true;
+        let tx = spawn_actor(StatusDriver {
+            base,
+            connect_calls: calls.clone(),
+        });
+
+        for op in [
+            RequestOp::GetConnected,
+            RequestOp::GetEnable,
+            RequestOp::GetAutoConnect,
+            RequestOp::Report { level: 1 },
+        ] {
+            let label = format!("{op:?}");
+            send_and_wait(&tx, op, AsynUser::default()).unwrap();
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "{label} is a plain read in C and must not reach the driver's connect"
+            );
+        }
+
+        // The idle pass: no message, no timer, no attempt.
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "an idle port with no armed retry timer must not dial the hardware"
+        );
+
+        // The control — `enable` ends in `exceptionOccurred` (:2247), which *is* a
+        // wake (:635-636), so this pass reaches the auto-connect tail.
+        send_and_wait(&tx, RequestOp::SetEnable { yes: true }, AsynUser::default()).unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "an exception is a port-thread wake and a woken pass does attempt one connect"
         );
     }
 

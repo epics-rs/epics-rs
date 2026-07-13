@@ -3482,7 +3482,14 @@ mod tests {
 
         // The control — `enable` ends in `exceptionOccurred` (:2247), which *is* a
         // wake (:635-636), so this pass reaches the auto-connect tail.
+        //
+        // The reply is sent from inside the dispatch, *before* the pass's
+        // auto-connect tail runs, so a second request is what makes the tail
+        // observable: its own reply cannot be sent until the actor has come back
+        // round the loop. It is a plain read, so it adds no attempt of its own —
+        // which is the point of the test.
         send_and_wait(&tx, RequestOp::SetEnable { yes: true }, AsynUser::default()).unwrap();
+        send_and_wait(&tx, RequestOp::GetEnable, AsynUser::default()).unwrap();
         assert_eq!(
             calls.load(Ordering::SeqCst),
             1,

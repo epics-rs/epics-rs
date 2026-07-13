@@ -1799,6 +1799,16 @@ pub trait Record: Send + Sync + 'static {
     /// declares NO INP — its DBF_INLINK is `SVL` (:212), read into SGNL by
     /// `devHistogramSoft.c` — so a histogram driven from INP is a database that
     /// no C IOC can load. Default `true`.
+    ///
+    /// This is the whole namespace gate, not just the loader's: in C the dbd
+    /// also decides which `.FIELD` channels exist, so a histogram's INP is not
+    /// resolvable at all (`dbgf HI.INP` → `PV 'HI.INP' not found`). Both
+    /// [`RecordInstance::get_common_field`] and
+    /// [`RecordInstance::put_common_field`] consult this, so the field cannot
+    /// be readable on one route while refused on the other.
+    ///
+    /// [`RecordInstance::get_common_field`]: crate::server::record::RecordInstance::get_common_field
+    /// [`RecordInstance::put_common_field`]: crate::server::record::RecordInstance::put_common_field
     fn declares_inp_link(&self) -> bool {
         true
     }

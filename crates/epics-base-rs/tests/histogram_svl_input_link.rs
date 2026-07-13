@@ -27,6 +27,7 @@
 
 use std::collections::HashSet;
 
+use epics_base_rs::error::CaError;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
 
@@ -198,4 +199,78 @@ record(histogram, "H:INP") {
         "INP must not feed SGNL"
     );
     assert_eq!(bins(&db, "H:INP").await, vec![1, 0, 0, 0]);
+}
+
+/// R17-83: the dbd is the whole namespace, not just the loader. A field the C
+/// record type does not declare has no `.FIELD` channel either — softIoc, on a
+/// loaded histogram:
+///
+/// ```text
+/// dbgf HI.INP  -> PV 'HI.INP' not found
+/// dbgf HI.SVL  -> DBF_STRING: ""
+/// ```
+///
+/// The port refused `field(INP,...)` at load and at `dbPut`, but `.INP` still
+/// resolved as a readable (empty) channel. Both routes now consult the same
+/// `declares_inp_link()` declaration.
+#[tokio::test]
+async fn histogram_inp_does_not_resolve_as_a_channel() {
+    let db = IocBuilder::new()
+        .db_string(
+            r#"
+record(histogram, "H:NS") {
+    field(NELM, "4")
+    field(LLIM, "0")
+    field(ULIM, "4")
+}
+"#,
+            &std::collections::HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap()
+        .0;
+
+    let err = db
+        .get_pv("H:NS.INP")
+        .await
+        .expect_err("histogram declares no INP — the channel must not exist");
+    assert!(
+        matches!(err, CaError::FieldNotFound(_) | CaError::ChannelNotFound(_)),
+        "expected a not-found error for H:NS.INP, got {err:?}"
+    );
+
+    // A caput is refused on the same declaration...
+    let err = db
+        .put_record_field_from_ca("H:NS", "INP", EpicsValue::String("SRC2".into()))
+        .await
+        .expect_err("histogram declares no INP — a put must not land");
+    assert!(
+        matches!(err, CaError::FieldNotFound(_)),
+        "expected FieldNotFound on a put to H:NS.INP, got {err:?}"
+    );
+
+    // ...while SVL, the DBF_INLINK a histogram DOES declare, resolves.
+    assert_eq!(
+        db.get_pv("H:NS.SVL").await.unwrap(),
+        EpicsValue::String("".into()),
+        "SVL (histogramRecord.dbd.pod:212) is the histogram's input link"
+    );
+
+    // The gate is per record type: an ai declares INP, so its channel resolves.
+    let db2 = IocBuilder::new()
+        .db_string(
+            r#"record(ai, "A:INP") { field(INP, "1.5") }"#,
+            &std::collections::HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap()
+        .0;
+    assert_eq!(
+        db2.get_pv("A:INP.INP").await.unwrap(),
+        EpicsValue::String("1.5".into())
+    );
 }

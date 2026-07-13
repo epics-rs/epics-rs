@@ -1388,7 +1388,16 @@ impl RecordInstance {
             "TPRO" => Some(EpicsValue::Char(if self.common.tpro { 1 } else { 0 })),
             "BKPT" => Some(EpicsValue::Char(self.common.bkpt)),
             "FLNK" => Some(EpicsValue::String(self.common.flnk.clone().into())),
-            "INP" => Some(EpicsValue::String(self.common.inp.clone().into())),
+            // A record type whose C `.dbd` has no INP has no `.INP` channel
+            // either — C's dbChannel resolution is the dbd, so `dbgf HI.INP` on
+            // a histogram answers "PV 'HI.INP' not found". The port keeps INP on
+            // `CommonFields` for every record, so `declares_inp_link()` is what
+            // stands in for the dbd, and it must gate the read side as well as
+            // the write side (`put_common_field`) — otherwise the field is
+            // unloadable and unwritable yet still resolves as a channel.
+            "INP" if self.record.declares_inp_link() => {
+                Some(EpicsValue::String(self.common.inp.clone().into()))
+            }
             "OUT" => Some(EpicsValue::String(self.common.out.clone().into())),
             "DTYP" => Some(EpicsValue::String(self.common.dtyp.clone().into())),
             "TSE" => Some(EpicsValue::Short(self.common.tse)),

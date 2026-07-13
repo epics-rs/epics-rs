@@ -2942,14 +2942,34 @@ impl CaChannel {
         EventWatcher { handle }
     }
 
-    /// Server's IP address as a string (e.g. `"10.0.0.5:5064"`).
-    /// Mirrors libca `ca_host_name(chid)` (oldChannelNotify.cpp:189).
+    /// The server's host NAME, as libca `ca_host_name(chid)`
+    /// (`oldChannelNotify.cpp:189` → `tcpiiu::getHostName` → `hostNameCache`)
+    /// reports it: reverse-resolved, with the port appended
+    /// (`"ioc1.lab:5064"`), and only the dotted IP when the address has no
+    /// PTR record. This used to hand back the raw `SocketAddr`, which is what
+    /// put a dotted IP on `cainfo`'s `Host:` line where C prints a name
+    /// (W10-B5) — the resolution belongs here, at the `ca_host_name` analog,
+    /// not in the tool.
+    ///
+    /// The lookup is [`crate::hostname::ip_addr_to_a`] on a blocking thread:
+    /// this is an `async fn` a caller awaits, so it can wait for the resolver
+    /// exactly as C's `cainfo` does, and no other channel's progress is behind
+    /// it.
+    ///
     /// Returns `Err` if the channel hasn't connected yet — pvxs
     /// returns `"<disconnected>"` for the same case; we surface
     /// the typed error instead so callers can decide.
     pub async fn host_name(&self) -> CaResult<String> {
         let info = self.info().await?;
-        Ok(info.server_addr.to_string())
+        let addr = info.server_addr;
+        Ok(
+            tokio::task::spawn_blocking(move || crate::hostname::ip_addr_to_a(addr))
+                .await
+                // A join failure is a runtime shutdown, not a channel error, and
+                // C's `ipAddrToA` has a well-defined answer for "no name": the
+                // dotted IP. Give that rather than failing a connected channel.
+                .unwrap_or_else(|_| addr.to_string()),
+        )
     }
 
     /// Server's CA minor protocol version, parsed from the
@@ -4057,13 +4077,24 @@ async fn run_coordinator(
                             .flatten()
                             .map(|ch| ch.pv_name.to_string());
                         // `cac::defaultExcep` folds the host into the ctx
-                        // text itself (`host=%s ctx=%.400s`) before raising;
-                        // the channel path passes the server's diagnostic
-                        // through untouched.
+                        // text itself (`host=%s ctx=%.400s`, `cac.cpp:1006-1016`)
+                        // before raising; the channel path passes the server's
+                        // diagnostic through untouched.
+                        //
+                        // C's host there is `iiu.getHostName` — the circuit's
+                        // `hostNameCache`, i.e. the reverse-resolved NAME, the
+                        // same source `ca_host_name` reads (W10-B5). This
+                        // arm runs on the coordinator task, so it takes the
+                        // NON-blocking half of that cache: a `getnameinfo` here
+                        // would park every channel's progress behind one DNS
+                        // timeout.
                         let message = if is_channel_exception {
                             message
                         } else {
-                            format!("host={server_addr} ctx={message}")
+                            format!(
+                                "host={host} ctx={message}",
+                                host = crate::hostname::cached_name(server_addr)
+                            )
                         };
                         types::dispatch_exception(
                             &exception_slot,

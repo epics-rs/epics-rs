@@ -125,6 +125,12 @@ async fn main() {
                 // `State:` / `Host:` etc. keep working.
                 let read_prefix = if info.access_rights.read { "" } else { "no " };
                 let write_prefix = if info.access_rights.write { "" } else { "no " };
+                // C `cainfo.c:101` prints `ca_host_name(chid)` — the
+                // reverse-resolved name, not the dotted IP (W10-B5). The
+                // resolution lives behind `Channel::host_name`, the
+                // `ca_host_name` analog; `info.server_addr` is the raw peer
+                // address and must not reach this line.
+                let host = ch.host_name().await.unwrap_or_default();
                 println!(
                     "{name}\n    \
                      State:            connected\n    \
@@ -134,7 +140,6 @@ async fn main() {
                      Request type:     {dbr}\n    \
                      Element count:    {n}",
                     name = info.pv_name,
-                    host = info.server_addr,
                     rp = read_prefix,
                     wp = write_prefix,
                     dbf = dbf_name(info.native_type),

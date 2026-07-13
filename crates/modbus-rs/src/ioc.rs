@@ -44,7 +44,7 @@ use asyn_rs::error::{AsynError, AsynResult, AsynStatus};
 use asyn_rs::interfaces::InterfaceType;
 use asyn_rs::interpose::EomReason;
 use asyn_rs::param::{ParamType, ParamValue};
-use asyn_rs::port::{DrvUserInfo, PortDriver, PortDriverBase, PortFlags};
+use asyn_rs::port::{DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::runtime::config::RuntimeConfig;
 use asyn_rs::runtime::port::create_port_runtime;
 use asyn_rs::sync_io::SyncIOHandle;
@@ -808,7 +808,12 @@ impl PortDriver for ModbusPortDriver {
         &mut self.base
     }
 
-    fn drv_user_create(&mut self, drv_info: &str, addr: i32) -> AsynResult<DrvUserInfo> {
+    fn drv_user_create(&mut self, req: &DrvUserRequest) -> AsynResult<DrvUserInfo> {
+        // The modbus drvInfo names the data type (`INT16`, `FLOAT32LE`, …), so
+        // the parameter type comes from the drvInfo, not from the bound record's
+        // interface (`req.iface`): a record whose DTYP disagrees with the
+        // configured data type is a configuration error, not a retype request.
+        let (drv_info, addr) = (req.drv_info.as_str(), req.addr);
         // C `drvUserCreate` (drvModbusAsyn.cpp:368-433) strips everything after
         // the first '=' to resolve the data-type name, then validates the
         // optional `=N` string-length suffix: it is legal ONLY for the eight
@@ -1813,24 +1818,70 @@ mod tests {
         )
         .expect("relative config must build");
         // Accepted.
-        assert!(driver.drv_user_create("STRING_HIGH", 0).is_ok());
-        assert!(driver.drv_user_create("STRING_HIGH=5", 0).is_ok());
-        assert!(driver.drv_user_create("STRING_HIGH=0x10", 0).is_ok());
-        assert!(driver.drv_user_create("STRING_HIGH=010", 0).is_ok());
         assert!(
-            driver.drv_user_create("STRING_HIGH=", 0).is_ok(),
+            driver
+                .drv_user_create(&DrvUserRequest::new("STRING_HIGH", 0))
+                .is_ok()
+        );
+        assert!(
+            driver
+                .drv_user_create(&DrvUserRequest::new("STRING_HIGH=5", 0))
+                .is_ok()
+        );
+        assert!(
+            driver
+                .drv_user_create(&DrvUserRequest::new("STRING_HIGH=0x10", 0))
+                .is_ok()
+        );
+        assert!(
+            driver
+                .drv_user_create(&DrvUserRequest::new("STRING_HIGH=010", 0))
+                .is_ok()
+        );
+        assert!(
+            driver
+                .drv_user_create(&DrvUserRequest::new("STRING_HIGH=", 0))
+                .is_ok(),
             "empty length parses as 0, which C accepts"
         );
-        assert!(driver.drv_user_create("INT16", 0).is_ok());
+        assert!(
+            driver
+                .drv_user_create(&DrvUserRequest::new("INT16", 0))
+                .is_ok()
+        );
         // Rejected: garbage / negative length on a string type.
-        assert!(driver.drv_user_create("STRING_HIGH=abc", 0).is_err());
-        assert!(driver.drv_user_create("STRING_HIGH=5x", 0).is_err());
-        assert!(driver.drv_user_create("STRING_HIGH=-3", 0).is_err());
+        assert!(
+            driver
+                .drv_user_create(&DrvUserRequest::new("STRING_HIGH=abc", 0))
+                .is_err()
+        );
+        assert!(
+            driver
+                .drv_user_create(&DrvUserRequest::new("STRING_HIGH=5x", 0))
+                .is_err()
+        );
+        assert!(
+            driver
+                .drv_user_create(&DrvUserRequest::new("STRING_HIGH=-3", 0))
+                .is_err()
+        );
         // Rejected: a length suffix on a non-string type.
-        assert!(driver.drv_user_create("INT16=5", 0).is_err());
-        assert!(driver.drv_user_create("UINT16=0", 0).is_err());
+        assert!(
+            driver
+                .drv_user_create(&DrvUserRequest::new("INT16=5", 0))
+                .is_err()
+        );
+        assert!(
+            driver
+                .drv_user_create(&DrvUserRequest::new("UINT16=0", 0))
+                .is_err()
+        );
         // Still rejected: an unknown type name.
-        assert!(driver.drv_user_create("NOPE", 0).is_err());
+        assert!(
+            driver
+                .drv_user_create(&DrvUserRequest::new("NOPE", 0))
+                .is_err()
+        );
     }
 
     /// R52: `connect_addr` rejects an out-of-range register offset (the asyn
@@ -1905,17 +1956,29 @@ mod tests {
         )
         .expect("relative config must build");
         // In-range data offset binds.
-        assert!(driver.drv_user_create("INT16", 5).is_ok());
+        assert!(
+            driver
+                .drv_user_create(&DrvUserRequest::new("INT16", 5))
+                .is_ok()
+        );
         // Out-of-range data offset fails at bind, not per-I/O.
         assert!(
-            driver.drv_user_create("INT16", 16).is_err(),
+            driver
+                .drv_user_create(&DrvUserRequest::new("INT16", 16))
+                .is_err(),
             "offset == length is out of range in relative mode"
         );
-        assert!(driver.drv_user_create("INT16", 99).is_err());
+        assert!(
+            driver
+                .drv_user_create(&DrvUserRequest::new("INT16", 99))
+                .is_err()
+        );
         // A non-data (statistics) reason carries no offset → C skips
         // `checkOffset`, so an out-of-range addr must NOT reject it.
         assert!(
-            driver.drv_user_create("READ_OK", 99).is_ok(),
+            driver
+                .drv_user_create(&DrvUserRequest::new("READ_OK", 99))
+                .is_ok(),
             "statistics params fall through to the base class with no offset check"
         );
     }
@@ -1935,21 +1998,21 @@ mod tests {
         .expect("relative config must build");
         assert_eq!(
             driver
-                .drv_user_create("STRING_HIGH=5", 0)
+                .drv_user_create(&DrvUserRequest::new("STRING_HIGH=5", 0))
                 .unwrap()
                 .max_octet_len,
             Some(5)
         );
         assert_eq!(
             driver
-                .drv_user_create("STRING_HIGH=0x10", 0)
+                .drv_user_create(&DrvUserRequest::new("STRING_HIGH=0x10", 0))
                 .unwrap()
                 .max_octet_len,
             Some(16)
         );
         assert_eq!(
             driver
-                .drv_user_create("STRING_HIGH", 0)
+                .drv_user_create(&DrvUserRequest::new("STRING_HIGH", 0))
                 .unwrap()
                 .max_octet_len,
             None,
@@ -1957,14 +2020,17 @@ mod tests {
         );
         assert_eq!(
             driver
-                .drv_user_create("STRING_HIGH=", 0)
+                .drv_user_create(&DrvUserRequest::new("STRING_HIGH=", 0))
                 .unwrap()
                 .max_octet_len,
             Some(0),
             "TYPE= caps to 0 (C strtol(\"\") == 0)"
         );
         assert_eq!(
-            driver.drv_user_create("INT16", 0).unwrap().max_octet_len,
+            driver
+                .drv_user_create(&DrvUserRequest::new("INT16", 0))
+                .unwrap()
+                .max_octet_len,
             None,
             "a non-string type never carries an octet cap"
         );

@@ -85,9 +85,10 @@ impl From<&RequestOp> for PortCommand {
             RequestOp::GetAutoConnect => Self::GetAutoConnect,
             RequestOp::BlockProcess => Self::BlockProcess,
             RequestOp::UnblockProcess => Self::UnblockProcess,
-            RequestOp::DrvUserCreate { drv_info, addr } => Self::DrvUserCreate {
-                drv_info: drv_info.clone(),
-                addr: *addr,
+            RequestOp::DrvUserCreate(req) => Self::DrvUserCreate {
+                drv_info: req.drv_info.clone(),
+                addr: req.addr,
+                iface: req.iface.map(|i| i.asyn_name().to_string()),
             },
             RequestOp::CallParamCallbacks { addr, .. } => Self::CallParamCallbacks { addr: *addr },
             RequestOp::GetOption { key } => Self::GetOption { key: key.clone() },
@@ -185,10 +186,17 @@ impl From<&PortCommand> for RequestOp {
             PortCommand::GetAutoConnect => Self::GetAutoConnect,
             PortCommand::BlockProcess => Self::BlockProcess,
             PortCommand::UnblockProcess => Self::UnblockProcess,
-            PortCommand::DrvUserCreate { drv_info, addr } => Self::DrvUserCreate {
-                drv_info: drv_info.clone(),
-                addr: *addr,
-            },
+            PortCommand::DrvUserCreate {
+                drv_info,
+                addr,
+                iface,
+            } => Self::DrvUserCreate(
+                crate::port::DrvUserRequest::new(drv_info.clone(), *addr).with_iface(
+                    iface
+                        .as_deref()
+                        .and_then(crate::interfaces::InterfaceType::from_asyn_name),
+                ),
+            ),
             PortCommand::CallParamCallbacks { addr } => Self::CallParamCallbacks {
                 addr: *addr,
                 updates: vec![],
@@ -343,10 +351,10 @@ mod tests {
             RequestOp::Disconnect,
             RequestOp::BlockProcess,
             RequestOp::UnblockProcess,
-            RequestOp::DrvUserCreate {
-                drv_info: "INFO".into(),
-                addr: 0,
-            },
+            RequestOp::DrvUserCreate(
+                crate::port::DrvUserRequest::new("INFO", 0)
+                    .with_iface(crate::interfaces::InterfaceType::Float64),
+            ),
             RequestOp::GetOption { key: "baud".into() },
             RequestOp::SetOption {
                 key: "baud".into(),

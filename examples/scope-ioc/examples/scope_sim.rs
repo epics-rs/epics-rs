@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use asyn_rs::port::DrvUserRequest;
 use asyn_rs::runtime::sync::Notify;
 
 use asyn_rs::runtime::config::RuntimeConfig;
@@ -90,7 +91,7 @@ async fn main() {
     // 7. Change vertical gain to x10
     println!("\nSwitching vertical gain to x10...");
     let vgs_idx = port_handle
-        .drv_user_create("P_VertGainSelect", 0)
+        .drv_user_create(&DrvUserRequest::new("P_VertGainSelect", 0))
         .await
         .unwrap();
     port_handle.write_int32(vgs_idx, 0, 3).await.unwrap(); // x10

@@ -25,16 +25,6 @@ use epics_ca_rs::client::{CaClient, MonitorHandle};
 use epics_ca_rs::server::CaServer;
 use serial_test::serial;
 
-/// Reserve and immediately release a free localhost TCP port so the
-/// `CaServer` can bind it. Mirrors the pattern used across
-/// `protocol_tests.rs`.
-fn free_port() -> u16 {
-    let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve free CA server port");
-    let p = probe.local_addr().unwrap().port();
-    drop(probe);
-    p
-}
-
 /// Point a soon-to-be-constructed `CaClient` at exactly this server so
 /// it skips UDP search.
 ///
@@ -98,15 +88,14 @@ async fn recv_value(mon: &mut MonitorHandle) -> EpicsValue {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn ca_fr_8_record_field_read_notify_applies_arr() {
-    let port = free_port();
     let server = CaServer::builder()
-        .port(port)
+        .port(0)
         .record("CAFR8:WF:R1", WaveformRecord::new(10, DbFieldType::Double))
         .build()
         .await
         .expect("build CA server");
+    let port = server.udp_port();
     let _h = tokio::spawn(async move { server.run().await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     point_client_at(port);
     let client = CaClient::new().await.expect("client");
@@ -163,15 +152,14 @@ async fn ca_fr_8_record_field_read_notify_applies_arr() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn ca_fr_8_record_field_monitor_applies_arr_on_updates() {
-    let port = free_port();
     let server = CaServer::builder()
-        .port(port)
+        .port(0)
         .record("CAFR8:WF:R2", WaveformRecord::new(10, DbFieldType::Double))
         .build()
         .await
         .expect("build CA server");
+    let port = server.udp_port();
     let _h = tokio::spawn(async move { server.run().await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     point_client_at(port);
     let client = CaClient::new().await.expect("client");
@@ -217,15 +205,14 @@ async fn ca_fr_8_record_field_monitor_applies_arr_on_updates() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn ca_fr_8_simplepv_monitor_applies_arr() {
-    let port = free_port();
     let server = CaServer::builder()
-        .port(port)
+        .port(0)
         .pv("CAFR8:SP:R3", EpicsValue::DoubleArray(ramp(0.0, 10)))
         .build()
         .await
         .expect("build CA server");
+    let port = server.udp_port();
     let _h = tokio::spawn(async move { server.run().await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     point_client_at(port);
     let client = CaClient::new().await.expect("client");
@@ -276,15 +263,14 @@ async fn ca_fr_8_simplepv_monitor_applies_arr() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn ca_fr_8_arr_on_scalar_channel_is_noop() {
-    let port = free_port();
     let server = CaServer::builder()
-        .port(port)
+        .port(0)
         .pv("CAFR8:SP:SCALAR", EpicsValue::Double(42.0))
         .build()
         .await
         .expect("build CA server");
+    let port = server.udp_port();
     let _h = tokio::spawn(async move { server.run().await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     point_client_at(port);
     let client = CaClient::new().await.expect("client");
@@ -319,15 +305,14 @@ async fn ca_fr_8_arr_on_scalar_channel_is_noop() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn ca_fr_8_malformed_suffix_rejects_channel_create() {
-    let port = free_port();
     let server = CaServer::builder()
-        .port(port)
+        .port(0)
         .record("CAFR8:WF:R4", WaveformRecord::new(10, DbFieldType::Double))
         .build()
         .await
         .expect("build CA server");
+    let port = server.udp_port();
     let _h = tokio::spawn(async move { server.run().await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     point_client_at(port);
     let client = CaClient::new().await.expect("client");
@@ -385,15 +370,14 @@ async fn ca_fr_8_malformed_suffix_rejects_channel_create() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn ca_fr_8_dotted_filter_suffix_resolves_at_search() {
-    let port = free_port();
     let server = CaServer::builder()
-        .port(port)
+        .port(0)
         .record("CAFR8:DOT:R5", WaveformRecord::new(10, DbFieldType::Double))
         .build()
         .await
         .expect("build CA server");
+    let port = server.udp_port();
     let _h = tokio::spawn(async move { server.run().await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     point_client_at(port);
     let client = CaClient::new().await.expect("client");

@@ -26,6 +26,7 @@ record(throttle, "THR") {
 "#;
     let macros = HashMap::new();
     let server = CaServerBuilder::new()
+        .port(0)
         .register_record_type("throttle", || Box::new(std_rs::ThrottleRecord::default()))
         .register_record_type("ao", || Box::new(AoRecord::default()))
         .db_string(db_str, &macros)
@@ -68,6 +69,7 @@ record(throttle, "THR2") {
 "#;
     let macros = HashMap::new();
     let server = CaServerBuilder::new()
+        .port(0)
         .register_record_type("throttle", || Box::new(std_rs::ThrottleRecord::default()))
         .register_record_type("ao", || Box::new(AoRecord::default()))
         .db_string(db_str, &macros)
@@ -134,6 +136,7 @@ record(scaler, "SC") {
 "#;
     let macros = HashMap::new();
     let server = CaServerBuilder::new()
+        .port(0)
         .register_record_type("scaler", || Box::new(scaler_rs::ScalerRecord::default()))
         .register_record_type("ao", || Box::new(AoRecord::default()))
         .db_string(db_str, &macros)
@@ -330,6 +333,7 @@ record(epid, "TEST:PID") {
 }
 "#;
     let server = CaServerBuilder::new()
+        .port(0)
         .register_record_type("epid", || Box::new(std_rs::EpidRecord::default()))
         .db_string(db_str, &HashMap::new())
         .unwrap()
@@ -433,6 +437,7 @@ record(epid, "PID") {
 "#;
     let macros = HashMap::new();
     let server = CaServerBuilder::new()
+        .port(0)
         .register_record_type("epid", || Box::new(std_rs::EpidRecord::default()))
         .register_record_type("ao", || Box::new(AoRecord::default()))
         .db_string(db_str, &macros)
@@ -517,6 +522,7 @@ record(epid, "PID") {
 "#;
     let macros = HashMap::new();
     let server = CaServerBuilder::new()
+        .port(0)
         .register_record_type("epid", || Box::new(std_rs::EpidRecord::default()))
         .register_record_type("ao", || Box::new(AoRecord::default()))
         .register_device_support("Epid Async Soft", || {

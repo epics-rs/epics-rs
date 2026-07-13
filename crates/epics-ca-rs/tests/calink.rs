@@ -18,7 +18,10 @@ use epics_ca_rs::client::{CaClient, CaClientConfig};
 use epics_ca_rs::server::CaServer;
 use serial_test::serial;
 
-/// Reserve a free TCP port by binding ephemeral then dropping.
+/// A port with nothing bound to it — for the tests that want an
+/// unreachable upstream. A test that *hosts* a server must not use this:
+/// it asks the server for port 0 and reads back the port it bound, so
+/// the port cannot be taken between the probe and the bind.
 fn free_port() -> u16 {
     let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve free CA port");
     probe.local_addr().unwrap().port()
@@ -53,15 +56,14 @@ fn pin_env(port: u16) {
 #[tokio::test(flavor = "multi_thread")]
 #[serial(epics_env)]
 async fn ca_link_resolves_remote_value() {
-    let port = free_port();
     let server = CaServer::builder()
-        .port(port)
+        .port(0)
         .pv("CALINK:SRC", EpicsValue::Double(73.5))
         .build()
         .await
         .expect("CA server");
+    let port = server.udp_port();
     let _server = tokio::spawn(async move { server.run().await });
-    tokio::time::sleep(Duration::from_millis(300)).await;
 
     let client = Arc::new(pinned_client(port).await);
     let resolver = CaLinkResolver::with_client(client, tokio::runtime::Handle::current());
@@ -94,15 +96,14 @@ async fn ca_link_resolves_remote_value() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial(epics_env)]
 async fn ca_link_resolves_with_scheme_prefix() {
-    let port = free_port();
     let server = CaServer::builder()
-        .port(port)
+        .port(0)
         .pv("CALINK:SCHEME", EpicsValue::Long(404))
         .build()
         .await
         .expect("CA server");
+    let port = server.udp_port();
     let _server = tokio::spawn(async move { server.run().await });
-    tokio::time::sleep(Duration::from_millis(300)).await;
 
     let client = Arc::new(pinned_client(port).await);
     let resolver = CaLinkResolver::with_client(client, tokio::runtime::Handle::current());
@@ -129,15 +130,14 @@ async fn ca_link_resolves_with_scheme_prefix() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial(epics_env)]
 async fn record_with_ca_inp_link_reads_remote_value() {
-    let port = free_port();
     let server = CaServer::builder()
-        .port(port)
+        .port(0)
         .pv("CALINK:INP:SRC", EpicsValue::Double(19.25))
         .build()
         .await
         .expect("CA server");
+    let port = server.udp_port();
     let _server = tokio::spawn(async move { server.run().await });
-    tokio::time::sleep(Duration::from_millis(300)).await;
 
     let client = Arc::new(pinned_client(port).await);
     let db = PvDatabase::new();
@@ -200,15 +200,14 @@ async fn record_with_ca_inp_link_reads_remote_value() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial(epics_env)]
 async fn ca_cp_holder_processes_on_remote_change() {
-    let port = free_port();
     let server = CaServer::builder()
-        .port(port)
+        .port(0)
         .pv("CALINK:CP:SRC", EpicsValue::Double(5.0))
         .build()
         .await
         .expect("CA server");
+    let port = server.udp_port();
     let _server = tokio::spawn(async move { server.run().await });
-    tokio::time::sleep(Duration::from_millis(300)).await;
 
     pin_env(port);
     let db = PvDatabase::new();
@@ -305,15 +304,14 @@ async fn ca_cp_holder_processes_on_remote_change() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial(epics_env)]
 async fn ca_link_out_write_updates_remote_pv() {
-    let port = free_port();
     let server = CaServer::builder()
-        .port(port)
+        .port(0)
         .pv("CALINK:OUT:DST", EpicsValue::Double(1.0))
         .build()
         .await
         .expect("CA server");
+    let port = server.udp_port();
     let _server = tokio::spawn(async move { server.run().await });
-    tokio::time::sleep(Duration::from_millis(300)).await;
 
     let client = Arc::new(pinned_client(port).await);
     let resolver = CaLinkResolver::with_client(client, tokio::runtime::Handle::current());
@@ -382,15 +380,14 @@ async fn ca_link_out_write_updates_remote_pv() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial(epics_env)]
 async fn ca_link_out_write_async_waits_for_completion() {
-    let port = free_port();
     let server = CaServer::builder()
-        .port(port)
+        .port(0)
         .pv("CALINK:OUT:ASYNC", EpicsValue::Double(1.0))
         .build()
         .await
         .expect("CA server");
+    let port = server.udp_port();
     let _server = tokio::spawn(async move { server.run().await });
-    tokio::time::sleep(Duration::from_millis(300)).await;
 
     let client = Arc::new(pinned_client(port).await);
     let resolver = CaLinkResolver::with_client(client, tokio::runtime::Handle::current());
@@ -434,15 +431,14 @@ async fn ca_link_out_write_async_waits_for_completion() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial(epics_env)]
 async fn ca_link_out_write_accepts_scheme_prefix() {
-    let port = free_port();
     let server = CaServer::builder()
-        .port(port)
+        .port(0)
         .pv("CALINK:OUT:SCHEME", EpicsValue::Long(7))
         .build()
         .await
         .expect("CA server");
+    let port = server.udp_port();
     let _server = tokio::spawn(async move { server.run().await });
-    tokio::time::sleep(Duration::from_millis(300)).await;
 
     let client = Arc::new(pinned_client(port).await);
     let resolver = CaLinkResolver::with_client(client, tokio::runtime::Handle::current());
@@ -487,7 +483,6 @@ async fn ca_link_out_write_accepts_scheme_prefix() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial(epics_env)]
 async fn ca_link_exposes_remote_metadata() {
-    let port = free_port();
     // ai record with real display/control metadata so the upstream CTRL
     // get returns non-default limits/precision/units.
     let mut src = AiRecord::new(50.0);
@@ -496,13 +491,13 @@ async fn ca_link_exposes_remote_metadata() {
     src.lopr = -50.0;
     src.prec = 3;
     let server = CaServer::builder()
-        .port(port)
+        .port(0)
         .record("CALINK:META:SRC", src)
         .build()
         .await
         .expect("CA server");
+    let port = server.udp_port();
     let _server = tokio::spawn(async move { server.run().await });
-    tokio::time::sleep(Duration::from_millis(300)).await;
 
     let client = Arc::new(pinned_client(port).await);
     let resolver = CaLinkResolver::with_client(client, tokio::runtime::Handle::current());
@@ -607,15 +602,14 @@ fn ca_modifier_link_classifies_as_ca() {
 async fn calink_warms_cp_holder_via_iocapplication_run_seam() {
     use epics_base_rs::server::ioc_app::IocApplication;
 
-    let port = free_port();
     let server = CaServer::builder()
-        .port(port)
+        .port(0)
         .pv("CALINK:SEAM:SRC", EpicsValue::Double(5.0))
         .build()
         .await
         .expect("CA server");
+    let port = server.udp_port();
     let _server = tokio::spawn(async move { server.run().await });
-    tokio::time::sleep(Duration::from_millis(300)).await;
 
     pin_env(port);
 

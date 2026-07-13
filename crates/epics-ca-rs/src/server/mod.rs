@@ -121,7 +121,8 @@ pub async fn run_ca_ioc(config: IocRunConfig) -> CaResult<()> {
         config.acf,
         config.autosave_config,
         config.autosave_manager,
-    );
+    )
+    .await?;
     server.set_after_init_hooks(config.after_init_hooks);
     let casr = iocsh::casr_command(server.stats());
     server

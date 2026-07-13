@@ -2335,15 +2335,14 @@ ASG(NewGroup) {
     #[serial(epics_env)]
     async fn br_2026_111_reload_updates_live_acl_on_admitted_pv() {
         let name = "AS:reload:pv";
-        let port = free_port();
         let server = CaServer::builder()
-            .port(port)
+            .port(0)
             .pv(name, EpicsValue::Double(1.0))
             .build()
             .await
             .expect("CA server");
+        let port = server.udp_port();
         let _server = tokio::spawn(async move { server.run().await });
-        tokio::time::sleep(Duration::from_millis(300)).await;
 
         pin_env(port);
         let db = Arc::new(PvDatabase::new());
@@ -2395,13 +2394,13 @@ ASG(NewGroup) {
         use epics_base_rs::server::snapshot::{DisplayInfo, Snapshot};
 
         let name = "GW23:seed:pv";
-        let port = free_port();
         let server = CaServer::builder()
-            .port(port)
+            .port(0)
             .pv(name, EpicsValue::Double(1.0))
             .build()
             .await
             .expect("CA server");
+        let port = server.udp_port();
 
         // Grab the upstream db before `server` moves into the run task, so
         // we can give the UPSTREAM PV real display metadata (units="mm").
@@ -2409,7 +2408,6 @@ ASG(NewGroup) {
         // negotiation GET seeds only value, never display (upstream.rs:577).
         let up_db = server.database().clone();
         let _server = tokio::spawn(async move { server.run().await });
-        tokio::time::sleep(Duration::from_millis(300)).await;
 
         let mut ctrl = Snapshot::new(
             EpicsValue::Double(1.0),
@@ -2499,15 +2497,14 @@ ASG(NewGroup) {
         let served = "Beam:current";
         let real = "SR:DCCT:current";
 
-        let port = free_port();
         let server = CaServer::builder()
-            .port(port)
+            .port(0)
             .pv(real, EpicsValue::Double(1.0))
             .build()
             .await
             .expect("CA server");
+        let port = server.udp_port();
         let _server = tokio::spawn(async move { server.run().await });
-        tokio::time::sleep(Duration::from_millis(300)).await;
 
         pin_env(port);
         let db = Arc::new(PvDatabase::new());
@@ -2550,15 +2547,14 @@ ASG(NewGroup) {
     async fn br_fr2_non_alias_keys_shadow_pv_by_same_name() {
         let name = "Plain:pv";
 
-        let port = free_port();
         let server = CaServer::builder()
-            .port(port)
+            .port(0)
             .pv(name, EpicsValue::Double(2.0))
             .build()
             .await
             .expect("CA server");
+        let port = server.udp_port();
         let _server = tokio::spawn(async move { server.run().await });
-        tokio::time::sleep(Duration::from_millis(300)).await;
 
         pin_env(port);
         let db = Arc::new(PvDatabase::new());
@@ -2624,15 +2620,14 @@ ASG(NewGroup) {
         const UPSTREAM: f64 = 3.0;
         const SENTINEL: f64 = 999.0;
 
-        let port = free_port();
         let server = CaServer::builder()
-            .port(port)
+            .port(0)
             .pv(name, EpicsValue::Double(UPSTREAM))
             .build()
             .await
             .expect("CA server");
+        let port = server.udp_port();
         let _server = tokio::spawn(async move { server.run().await });
-        tokio::time::sleep(Duration::from_millis(300)).await;
 
         pin_env(port);
         let db = Arc::new(PvDatabase::new());
@@ -2678,15 +2673,14 @@ ASG(NewGroup) {
         let name = "C:get";
         const SENTINEL: f64 = 999.0;
 
-        let port = free_port();
         let server = CaServer::builder()
-            .port(port)
+            .port(0)
             .pv(name, EpicsValue::Double(3.0))
             .build()
             .await
             .expect("CA server");
+        let port = server.udp_port();
         let _server = tokio::spawn(async move { server.run().await });
-        tokio::time::sleep(Duration::from_millis(300)).await;
 
         pin_env(port);
         let db = Arc::new(PvDatabase::new());
@@ -2719,15 +2713,14 @@ ASG(NewGroup) {
     async fn br24_no_cache_monitor_is_lazy() {
         let name = "NC:mon";
 
-        let port = free_port();
         let server = CaServer::builder()
-            .port(port)
+            .port(0)
             .pv(name, EpicsValue::Double(1.0))
             .build()
             .await
             .expect("CA server");
+        let port = server.udp_port();
         let _server = tokio::spawn(async move { server.run().await });
-        tokio::time::sleep(Duration::from_millis(300)).await;
 
         pin_env(port);
         let db = Arc::new(PvDatabase::new());
@@ -2801,15 +2794,14 @@ ASG(NewGroup) {
     async fn br24_cached_monitor_eager_ensure_release_noop() {
         let name = "C:mon";
 
-        let port = free_port();
         let server = CaServer::builder()
-            .port(port)
+            .port(0)
             .pv(name, EpicsValue::Double(1.0))
             .build()
             .await
             .expect("CA server");
+        let port = server.udp_port();
         let _server = tokio::spawn(async move { server.run().await });
-        tokio::time::sleep(Duration::from_millis(300)).await;
 
         pin_env(port);
         let db = Arc::new(PvDatabase::new());
@@ -2864,6 +2856,8 @@ ASG(NewGroup) {
     #[tokio::test(flavor = "multi_thread")]
     #[serial(epics_env)]
     async fn br_2026_22_lazy_connect_honors_configured_timeout() {
+        // Deliberately a dead port: nothing is served here, so the
+        // configured connect timeout is what ends the search.
         let port = free_port();
         pin_env(port);
         let db = Arc::new(PvDatabase::new());

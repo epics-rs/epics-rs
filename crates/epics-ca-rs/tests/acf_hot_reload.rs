@@ -13,6 +13,7 @@ async fn reload_acf_swaps_in_new_rules() {
     std::fs::write(&acf_path, "ASG(DEFAULT) { RULE(1, READ) }").expect("write acf v1");
 
     let server = CaServer::builder()
+        .port(0)
         .pv("HOT:VAL", epics_base_rs::types::EpicsValue::Long(0))
         .acf_file(acf_path.to_str().unwrap())
         .expect("acf v1")
@@ -34,7 +35,9 @@ async fn reload_acf_swaps_in_new_rules() {
 
     // No source path → reload_acf_from must work but reload_acf would
     // fail on a server constructed without acf_file.
-    let bare = CaServer::from_parts(server.database().clone(), 0, None, None, None, None);
+    let bare = CaServer::from_parts(server.database().clone(), 0, None, None, None, None)
+        .await
+        .expect("build bare server");
     assert!(bare.reload_acf().await.is_err());
     assert!(
         bare.reload_acf_from(acf_path.to_str().unwrap())

@@ -23,6 +23,7 @@ record(throttle, "TEST:THR") {
 "#;
     let macros = HashMap::new();
     let server = CaServerBuilder::new()
+        .port(0)
         .register_record_type("throttle", || Box::new(std_rs::ThrottleRecord::default()))
         .register_record_type("ao", || Box::new(AoRecord::default()))
         .db_string(db_str, &macros)
@@ -115,6 +116,7 @@ record(throttle, "TEST:THR2") {
 "#;
     let macros = HashMap::new();
     let server = CaServerBuilder::new()
+        .port(0)
         .register_record_type("throttle", || Box::new(std_rs::ThrottleRecord::default()))
         .register_record_type("ao", || Box::new(AoRecord::default()))
         .db_string(db_str, &macros)
@@ -160,6 +162,7 @@ record(throttle, "TEST:THR3") {
 "#;
     let macros = HashMap::new();
     let server = CaServerBuilder::new()
+        .port(0)
         .register_record_type("throttle", || Box::new(std_rs::ThrottleRecord::default()))
         .register_record_type("ao", || Box::new(AoRecord::default()))
         .db_string(db_str, &macros)
@@ -219,6 +222,7 @@ record(epid, "TEST:PID") {
 "#;
     let macros = HashMap::new();
     let server = CaServerBuilder::new()
+        .port(0)
         .register_record_type("epid", || Box::new(std_rs::EpidRecord::default()))
         .db_string(db_str, &macros)
         .unwrap()
@@ -289,6 +293,7 @@ record(epid, "TEST:PID2") {
 "#;
     let macros = HashMap::new();
     let server = CaServerBuilder::new()
+        .port(0)
         .register_record_type("epid", || Box::new(std_rs::EpidRecord::default()))
         .db_string(db_str, &macros)
         .unwrap()
@@ -354,6 +359,7 @@ record(epid, "TEST:PIDSUP") {
 "#;
     let macros = HashMap::new();
     let server = CaServerBuilder::new()
+        .port(0)
         .register_record_type("epid", || Box::new(std_rs::EpidRecord::default()))
         .db_string(db_str, &macros)
         .unwrap()
@@ -432,6 +438,7 @@ record(epid, "TEST:PIDCL") {
 "#;
     let macros = HashMap::new();
     let server = CaServerBuilder::new()
+        .port(0)
         .register_record_type("epid", || Box::new(std_rs::EpidRecord::default()))
         .db_string(db_str, &macros)
         .unwrap()
@@ -516,6 +523,7 @@ record(epid, "TEST:PIDCLF") {
 "#;
     let macros = HashMap::new();
     let server = CaServerBuilder::new()
+        .port(0)
         .register_record_type("epid", || Box::new(std_rs::EpidRecord::default()))
         .db_string(db_str, &macros)
         .unwrap()
@@ -567,6 +575,7 @@ record(timestamp, "TEST:TS") {
 "#;
     let macros = HashMap::new();
     let server = CaServerBuilder::new()
+        .port(0)
         .register_record_type("timestamp", || Box::new(std_rs::TimestampRecord::default()))
         .db_string(db_str, &macros)
         .unwrap()
@@ -620,6 +629,7 @@ record(timestamp, "TEST:TSNP") {
 "#;
     let macros = HashMap::new();
     let server = CaServerBuilder::new()
+        .port(0)
         .register_record_type("timestamp", || Box::new(std_rs::TimestampRecord::default()))
         .db_string(db_str, &macros)
         .unwrap()
@@ -705,6 +715,7 @@ record(epid, "PID") {
 "#;
     let macros = HashMap::new();
     let server = CaServerBuilder::new()
+        .port(0)
         .register_record_type("epid", || Box::new(std_rs::EpidRecord::default()))
         .register_record_type("calc", || {
             Box::new(epics_base_rs::server::records::calc::CalcRecord::new("A+1"))
@@ -772,6 +783,7 @@ record(throttle, "TEST:THRSYNC") {
 "#;
     let macros = HashMap::new();
     let server = CaServerBuilder::new()
+        .port(0)
         .register_record_type("throttle", || Box::new(std_rs::ThrottleRecord::default()))
         .register_record_type("ao", || Box::new(AoRecord::default()))
         .db_string(db_str, &macros)
@@ -851,6 +863,7 @@ record(throttle, "TEST:THROV2") {
 "#;
     let macros = HashMap::new();
     let server = CaServerBuilder::new()
+        .port(0)
         .register_record_type("throttle", || Box::new(std_rs::ThrottleRecord::default()))
         .register_record_type("ao", || Box::new(AoRecord::default()))
         .db_string(db_str, &macros)
@@ -905,6 +918,7 @@ record(throttle, "TEST:THRPP") {
 "#;
     let macros = HashMap::new();
     let server = CaServerBuilder::new()
+        .port(0)
         .register_record_type("throttle", || Box::new(std_rs::ThrottleRecord::default()))
         .register_record_type("ao", || Box::new(AoRecord::default()))
         .db_string(db_str, &macros)
@@ -971,6 +985,7 @@ record(epid, "TEST:PIDNV") {
 "#;
     let macros = HashMap::new();
     let server = CaServerBuilder::new()
+        .port(0)
         .register_record_type("epid", || Box::new(std_rs::EpidRecord::default()))
         .register_record_type("ao", || Box::new(AoRecord::default()))
         .db_string(db_str, &macros)

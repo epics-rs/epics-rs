@@ -15,13 +15,6 @@ use epics_ca_rs::client::{CaClient, CaClientConfig};
 use epics_ca_rs::discovery::DiscoveryConfig;
 use epics_ca_rs::server::CaServer;
 
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let p = l.local_addr().unwrap().port();
-    drop(l);
-    p
-}
-
 /// Smoke test that may be flaky on hosts without working multicast
 /// (some CI containers) — annotated `#[ignore]` so it's opt-in via
 /// `cargo test -- --ignored`. Real LAN hosts run it cleanly.
@@ -38,17 +31,16 @@ async fn mdns_server_announce_to_client_discover() {
             .unwrap()
             .as_micros()
     );
-    let port = free_port();
-
     let server = CaServer::builder()
         .pv("MDNS:VAL", epics_base_rs::types::EpicsValue::Long(7777))
-        .port(port)
+        .port(0)
         .announce_mdns(&instance)
         .announce_txt("version", "test")
         .build()
         .await
         .expect("build");
 
+    let port = server.udp_port();
     let server_arc = Arc::new(server);
     let server_clone = server_arc.clone();
     let server_task = tokio::spawn(async move {

@@ -6194,3 +6194,77 @@ measured against something real.
   epics-modbus-rs, optics-rs, scaler-rs, std-rs, mqtt-rs) — under
   `doc/strategy-2026-07-13.md` these are **no longer audited against C source** and
   need a simulator/hardware strategy instead.
+
+## Fix wave 19 dispositions — merged 2026-07-14 onto `review/parity-r6`
+
+Three fixer panels (r3 records/calc, r4 pva/qsrv, r5 asyn). Every branch was
+**git-verified by the main agent before merge** — a panel's own report that it
+committed is not proof.
+
+### Merged
+- **r3** (`caucus/.../fixer-r3-records-3c108a32-1`) — R19-3, R19-4, R19-5,
+  R19-92, R19-122, plus the raw-soft source-type family.
+- **r4** (`caucus/.../fixer-r4-pva-825d5f20-1`) — R19-22, R19-41, R19-43,
+  R19-44, R19-45, R19-46.
+- **r5** (`caucus/.../fixer-r5-asyn-0b1197e1-1`) — R19-106..R19-121 (15
+  findings), incl. the DBF_MENU/DBF_ULONG asynRecord field-type corrections.
+
+### CBUG adjudications applied this wave
+- **CBUG-E2** — decided **saturate, no alarm** (`651bf392`). The cast is UB, so
+  compiled C is not single-valued (x86-64 `cvttsd2si` → INT_MIN; aarch64
+  `fcvtzs` → saturate). The port now saturates, matching a compiled aarch64 IOC.
+  The oracle's allowlist row for E2 is live (`87999c3a`).
+- **CBUG-D4** — closed **keep both** (`b3b9df1d`); the port was already correct
+  and the entry's "two implementations of one escape table" premise was wrong.
+
+### Defects found DURING the merge, not by any auditor
+1. **The coercion-owner bypass family** (`0299eb37`, completed by `9fa29c7d`).
+   C's `dbFastGetConvertRoutine` is a 2-D table (source DBF × dest DBR): an
+   integer source takes C's DEFINED modular conversion, only a float source
+   takes the UB cast. Seven sites called `c_cast::f64_to_*(v.to_f64())` directly,
+   forcing the float rule onto integer sources — so under E2's saturation a
+   negative integer read would silently become 0 instead of wrapping. Closed
+   structurally: `EpicsValue::to_dbf_i16`/`to_dbf_i32` project onto `convert_to`
+   (the single coercion owner), and no site outside the owner performs the
+   conversion any more. **This is the finding that E2 would otherwise have turned
+   into a data-corruption regression.**
+2. **PROC put deadlock** (`07e6fb23`) — a merge-only defect. Resolving r4's
+   R19-43 conflict by passing `acquire_gate` through re-acquired a non-reentrant
+   gate already held at that call site; every PROC test TIMEOUTed. r4's
+   unconditional already-locked entry was right.
+3. **`inst.processing` poked directly** by R19-43's test (`07e6fb23`) — the field
+   is private precisely so no site outside the PACT owner can open/close the
+   window. Routed through `enter_pact()`/`leave_pact()`.
+
+### Verified after merge
+`cargo nextest run --workspace` 9225/9225; workspace clippy clean;
+`-p epics-bridge-rs --features pva-gateway` clippy clean + 783/783; doctests clean.
+`epics-pva-rs::stability r12_33_stalled_pipeline_squashes_at_the_negotiated_limit`
+flakes under full-workspace parallel load (1260/1260 for that crate alone) — a
+load flake, not a regression, and it is on the open list below.
+
+### Carried UNFIXED out of wave 19
+- **Codegen's declared field types still do not reach the wire.** The CA type
+  served is derived from the stored *value* (`client_field_value`), not from
+  `FieldDesc.dbf_type`. The tables are right; the storage behind them is not.
+  **Biggest single open item** — it is why the oracle's `native_type` defects
+  persist after the codegen landed.
+- CA put-callback does not process after a **failed `special()`**, where C's
+  `dbProcessNotify` processes anyway (5 oracle rows, `STAT: C=CALC / port=UDF`).
+- ~311 calc/calcout oracle put-sweep defects: `put_accepted C=false/port=true`,
+  `value 0 vs inf`, and the native-type family above.
+- QSRV group **long-string `$` members** unimplemented; R19-46 refuses such a
+  group rather than serving one that fails every operation (stated deviation).
+- `ProcessMode::Force` + `block`: the port's notify path does not implement C's
+  notify-RESTART PACT rule.
+- `alarm.severity` init divergence: pvxs reports 0 on a never-processed record,
+  the port reports 3 (UDF/INVALID). Observed in A/B, untouched by any finding.
+- asyn: the interactive octet I/O shell set (`asynOctetConnect`/`Read`/`Write`/
+  `WriteRead`/`Flush`/`Disconnect`), `asynShutdownPort`,
+  `asynSetQueueLockPortTimeout`, and the vendor reboot RPCs — each needs a
+  primitive built, not a command registered.
+- `mbbo_direct::process` masks RVAL where C's `convert()` does not;
+  `db_loader` `EpicsValue::parse(Enum, "Busy")` silently yields 0; string puts to
+  numeric DBF types yield 0 where C errors; `scanf.rs` `v as i32/u32` narrowing.
+- R19-43 was not measured live against a C IOC (read from `iocsource.cpp`
+  and proven by a boundary test that fails pre-fix).

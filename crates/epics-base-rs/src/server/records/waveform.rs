@@ -641,15 +641,33 @@ impl Record for WaveformRecord {
         Some(self)
     }
 
-    /// subArray finalisation, mirroring C `subArrayRecord.c::init_record`
-    /// pass 0 (lines 96-104): MALM is floored to 1 (never 0), then NELM is
-    /// clamped down to MALM. This runs after the loader has applied every
-    /// field put, so the .db order of NELM/MALM/INDX no longer affects the
-    /// result. Process-time clamping in `set_val` (the readValue equivalent)
-    /// re-applies the same bounds each cycle. Non-subArray kinds have no MALM
-    /// and are untouched.
+    /// Pass-0 finalisation, mirroring each kind's C `init_record` pass 0. It
+    /// runs after the loader has applied every field put, which is what NELM
+    /// (`.db`-supplied) needs — a `Default`/`new()` seed would be computed
+    /// before NELM exists.
+    ///
+    /// * waveform/aai/aao: `prec->nord = (prec->nelm == 1)` (waveformRecord.c:100,
+    ///   aaiRecord.c:113, aaoRecord.c:116-120). A one-element array record is
+    ///   fully populated by construction — its single element IS the value — so
+    ///   it serves NORD=1 from load. The port seeded NORD=0 always, and
+    ///   `get_field("VAL")` truncates to NORD, so a NELM=1 record served a
+    ///   ZERO-length array to every client until its first process.
+    /// * subArray: `prec->nord = 0` (subArrayRecord.c:101 — never the NELM=1
+    ///   seed), MALM floored to 1, then NELM clamped down to MALM
+    ///   (subArrayRecord.c:95-103). Process-time clamping in `set_val` (the
+    ///   readValue equivalent) re-applies the same bounds each cycle, so the
+    ///   .db order of NELM/MALM/INDX cannot matter.
+    ///
+    /// The NORD seed is skipped when NORD is already non-zero — i.e. when
+    /// element data was put into VAL before init. C cannot reach that state
+    /// (VAL is `DBF_NOACCESS` on all four `.dbd`s, so no `.db` can fill it),
+    /// but an in-process `record()` build can, and zeroing NORD there would
+    /// discard the caller's array.
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
-        if pass == 0 && matches!(self.kind, ArrayKind::SubArray) {
+        if pass != 0 {
+            return Ok(());
+        }
+        if matches!(self.kind, ArrayKind::SubArray) {
             if self.malm < 1 {
                 self.malm = 1;
             }
@@ -657,6 +675,10 @@ impl Record for WaveformRecord {
                 self.nelm = self.malm;
                 self.reallocate_val();
             }
+            return Ok(());
+        }
+        if self.nord == 0 && self.nelm == 1 {
+            self.nord = 1;
         }
         Ok(())
     }

@@ -71,6 +71,34 @@ const LT_FIELDS: [&str; NUM_STEPS] = [
 const WERR_FIELDS: [&str; NUM_STEPS] = [
     "WERR1", "WERR2", "WERR3", "WERR4", "WERR5", "WERR6", "WERR7", "WERR8", "WERR9", "WERRA",
 ];
+/// The partner view each half of a step's value pair posts when it is written
+/// (C `special()` posts `s` after a `DOn` put and `dov` after a `STRn` put) —
+/// one single-element slice per step, so `monitor_side_effect_fields` can
+/// return a `&'static [&'static str]`.
+const STR_SIDE_EFFECT: [&[&str]; NUM_STEPS] = [
+    &["STR1"],
+    &["STR2"],
+    &["STR3"],
+    &["STR4"],
+    &["STR5"],
+    &["STR6"],
+    &["STR7"],
+    &["STR8"],
+    &["STR9"],
+    &["STRA"],
+];
+const DO_SIDE_EFFECT: [&[&str]; NUM_STEPS] = [
+    &["DO1"],
+    &["DO2"],
+    &["DO3"],
+    &["DO4"],
+    &["DO5"],
+    &["DO6"],
+    &["DO7"],
+    &["DO8"],
+    &["DO9"],
+    &["DOA"],
+];
 
 /// State of the sseq async sequence machine.
 ///
@@ -146,6 +174,32 @@ struct SseqStep {
     dol_field_type: i16, // DTn — DOL target field type (C dbStatic DBF_* / -1)
     lnk_field_type: i16, // LTn — LNK target field type (C dbStatic DBF_* / -1)
     wait_err: i16,       // WERRn — wait-config error (see refresh_link_status)
+}
+
+impl SseqStep {
+    /// Write the step's value FROM its numeric view, re-deriving the string
+    /// view — the single owner of `dov → s` (C `cvtDoubleToString(dov, s,
+    /// pR->prec)`).
+    ///
+    /// `DOn` and `STRn` are two views of ONE value, and C reconciles them at
+    /// every write site: `special()` on a `DOn` put (sseqRecord.c:1108-1116),
+    /// `special()` on a `STRn` put (:1128-1131), `init_record` (:242-249), and
+    /// the `processCallback` link read (:657-661, :676-680). A write that
+    /// updates one view and leaves the other stale is the defect — so no site
+    /// assigns `dov`/`str_val` directly; every one goes through this pair.
+    fn set_numeric(&mut self, dov: f64, prec: i16) {
+        self.dov = dov;
+        self.str_val = PvString::from(crate::types::cvt_double_to_string(dov, prec.max(0) as u16));
+    }
+
+    /// Write the step's value FROM its string view, re-deriving the numeric
+    /// view — the single owner of `s → dov` (C `dov = atof(s)`). The string
+    /// is kept byte-exact; a non-numeric string is `0.0`, exactly as `atof`
+    /// reports it.
+    fn set_string(&mut self, s: PvString) {
+        self.dov = EpicsValue::String(s.clone()).to_f64().unwrap_or(0.0);
+        self.str_val = s;
+    }
 }
 
 impl Default for SseqStep {
@@ -860,22 +914,41 @@ impl Record for SseqRecord {
     /// are the same rounded number. (C's `db_post_events` here runs during
     /// iocInit, before any client can subscribe, so it has no observable
     /// effect; the rounded field value does.)
+    ///
+    /// The same loop then reconciles each step's value pair
+    /// (sseqRecord.c:242-249): a `.db` file may set `DOn`, `STRn`, or
+    /// neither, and C makes the two views agree before the record can run —
+    /// a configured `STRn` wins (`dov = atof(s)`), otherwise `STRn` is
+    /// rendered from `DOn` at the record's PREC. Without it a
+    /// `field(DO1,"3")` record starts with an empty `STR1`.
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
         if pass == 0 {
+            let prec = self.prec;
             for step in &mut self.steps {
                 step.dly = crate::runtime::time::quantize_to_sleep_quantum(step.dly);
+                if step.str_val.is_empty() {
+                    step.set_numeric(step.dov, prec);
+                } else {
+                    step.set_string(step.str_val.clone());
+                }
             }
         }
         Ok(())
     }
 
-    /// A put to any `DLYn` re-quantizes and posts DLY1 — see `special()` for
-    /// the C quirk that makes it DLY1 and not the field written.
+    /// The partner view a put to one half of a step's value pair refreshes.
+    ///
+    /// C `special()` writes the other view and posts it: a `DOn` put renders
+    /// `STRn` (sseqRecord.c:1108-1116), a `STRn` put re-reads `DOn`
+    /// (:1128-1131). A put to any `DLYn` re-quantizes and posts DLY1 — see
+    /// `special()` for the C quirk that makes it DLY1 and not the field
+    /// written.
     fn monitor_side_effect_fields(&self, put_field: &str) -> &'static [&'static str] {
-        if Self::step_index_from_suffix(put_field).is_some_and(|(_, p)| p == "DLY") {
-            &["DLY1"]
-        } else {
-            &[]
+        match Self::step_index_from_suffix(put_field) {
+            Some((_, "DLY")) => &["DLY1"],
+            Some((i, "DO")) => STR_SIDE_EFFECT[i],
+            Some((i, "STR")) => DO_SIDE_EFFECT[i],
+            _ => &[],
         }
     }
 
@@ -1210,30 +1283,21 @@ impl Record for SseqRecord {
         // choice, not the source's — see `typed_output_buffer`.
         if let Some((idx, "DO")) = Self::step_index_from_suffix(name) {
             match value {
+                // C `processCallback` string arm (:657-661): the bytes are kept
+                // exactly and `dov` follows as `atof(s)`.
                 EpicsValue::String(s) => {
-                    // Numeric view tracks C's `dov = atof(s)`; `str_val` keeps
-                    // the bytes exactly (no lossy conversion on the value).
-                    let dov = EpicsValue::String(s.clone()).to_f64().unwrap_or(0.0);
-                    let step = &mut self.steps[idx];
-                    step.dov = dov;
-                    step.str_val = s;
+                    self.steps[idx].set_string(s);
                     return Ok(());
                 }
+                // C `processCallback` numeric arm (:676-680): after reading
+                // `dov` it renders `s` with `cvtDoubleToString(dov, str, prec)`
+                // rather than leaving the prior string stale.
                 other => {
                     let dov = other
                         .to_f64()
                         .ok_or_else(|| CaError::TypeMismatch(name.into()))?;
-                    // C `processCallback` numeric arm: after reading `dov` it
-                    // runs `cvtDoubleToString(dov, str, prec)` and copies the
-                    // formatted value back into `s`/`STRn`, posting it when it
-                    // changed (sseqRecord.c:676-679). Mirror that so a numeric
-                    // `DOLn` refreshes `STRn` with the record-PREC rendering of
-                    // the value rather than leaving the prior string stale.
-                    let prec = self.prec.max(0) as u16;
-                    let s = crate::types::cvt_double_to_string(dov, prec);
-                    let step = &mut self.steps[idx];
-                    step.dov = dov;
-                    step.str_val = PvString::from(s);
+                    let prec = self.prec;
+                    self.steps[idx].set_numeric(dov, prec);
                     return Ok(());
                 }
             }
@@ -1352,6 +1416,7 @@ impl Record for SseqRecord {
                     return Ok(());
                 }
                 if let Some((idx, prefix)) = Self::step_index_from_suffix(name) {
+                    let prec = self.prec;
                     let step = &mut self.steps[idx];
                     return match prefix {
                         "DLY" => {
@@ -1367,10 +1432,14 @@ impl Record for SseqRecord {
                             }
                             _ => Err(CaError::TypeMismatch(name.into())),
                         },
+                        // C `special()` on a `DOn` put (sseqRecord.c:1108-1116)
+                        // re-renders `STRn` from the new `DOn` at the record's
+                        // PREC — the two are one value, never independent.
                         "DO" => {
-                            step.dov = value
+                            let dov = value
                                 .to_f64()
                                 .ok_or_else(|| CaError::TypeMismatch(name.into()))?;
+                            step.set_numeric(dov, prec);
                             Ok(())
                         }
                         "LNK" => match value {
@@ -1380,9 +1449,11 @@ impl Record for SseqRecord {
                             }
                             _ => Err(CaError::TypeMismatch(name.into())),
                         },
+                        // C `special()` on a `STRn` put (sseqRecord.c:1128-1131)
+                        // re-reads `DOn` as `atof(s)`.
                         "STR" => match value {
                             EpicsValue::String(s) => {
-                                step.str_val = s;
+                                step.set_string(s);
                                 Ok(())
                             }
                             _ => Err(CaError::TypeMismatch(name.into())),
@@ -1499,7 +1570,9 @@ mod tests {
         rec.put_field("WAIT1", EpicsValue::Short(1)).unwrap();
 
         assert_eq!(rec.get_field("DLY1"), Some(EpicsValue::Double(1.5)));
-        assert_eq!(rec.get_field("DO1"), Some(EpicsValue::Double(42.0)));
+        // DO1/STR1 are ONE value (C `special()`): the later `STR1="hello"` put
+        // re-read DO1 as `atof("hello")` = 0.0, dropping the earlier 42.0.
+        assert_eq!(rec.get_field("DO1"), Some(EpicsValue::Double(0.0)));
         assert_eq!(
             rec.get_field("STR1"),
             Some(EpicsValue::String("hello".into()))
@@ -1526,7 +1599,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(rec.get_field("DLYA"), Some(EpicsValue::Double(2.0)));
-        assert_eq!(rec.get_field("DOA"), Some(EpicsValue::Double(99.0)));
+        // As above: the `STRA="step10"` put re-read DOA as `atof` = 0.0.
+        assert_eq!(rec.get_field("DOA"), Some(EpicsValue::Double(0.0)));
         assert_eq!(
             rec.get_field("STRA"),
             Some(EpicsValue::String("step10".into()))
@@ -1666,6 +1740,92 @@ mod tests {
         // The internal status post-back path stores what the refresh computes.
         rec.put_field("WERR1", EpicsValue::Short(1)).unwrap();
         assert_eq!(rec.get_field("WERR1"), Some(EpicsValue::Short(1)));
+    }
+
+    /// R16-2 — `DOn` and `STRn` are two views of ONE value, reconciled at
+    /// every write. C does it at four sites; the port had only the link-read
+    /// one. Boundaries: numeric put → string view re-rendered at PREC; string
+    /// put → numeric view re-read as `atof`; a non-numeric string → 0.0; the
+    /// pair does not go stale across a put to the other half.
+    #[test]
+    fn test_sseq_do_str_are_one_value() {
+        let mut rec = SseqRecord::new();
+        rec.put_field("PREC", EpicsValue::Short(2)).unwrap();
+
+        // C special(DOn): cvtDoubleToString(dov, s, prec).
+        rec.put_field("DO1", EpicsValue::Double(3.7)).unwrap();
+        assert_eq!(rec.get_field("DO1"), Some(EpicsValue::Double(3.7)));
+        assert_eq!(
+            rec.get_field("STR1"),
+            Some(EpicsValue::String("3.70".into())),
+            "a DOn put must re-render STRn at the record's PREC"
+        );
+
+        // C special(STRn): dov = atof(s).
+        rec.put_field("STR1", EpicsValue::String("5".into()))
+            .unwrap();
+        assert_eq!(rec.get_field("STR1"), Some(EpicsValue::String("5".into())));
+        assert_eq!(
+            rec.get_field("DO1"),
+            Some(EpicsValue::Double(5.0)),
+            "a STRn put must re-read DOn as atof(STRn)"
+        );
+
+        // A non-numeric string is atof → 0.0, and the string stays byte-exact.
+        rec.put_field("STRA", EpicsValue::String("abc".into()))
+            .unwrap();
+        assert_eq!(rec.get_field("DOA"), Some(EpicsValue::Double(0.0)));
+        assert_eq!(
+            rec.get_field("STRA"),
+            Some(EpicsValue::String("abc".into()))
+        );
+
+        // STRn="abc" then DOn=3.7 → the string follows the LAST write, so the
+        // step forwards "3.70", not the stale "abc".
+        rec.put_field("DOA", EpicsValue::Double(3.7)).unwrap();
+        assert_eq!(
+            rec.get_field("STRA"),
+            Some(EpicsValue::String("3.70".into())),
+            "the later DOn put must overwrite the earlier STRn"
+        );
+    }
+
+    /// R16-2, init boundary — C `init_record` (sseqRecord.c:242-249)
+    /// reconciles the pair before the record can run: a `.db`-configured
+    /// `STRn` wins (`dov = atof(s)`), otherwise `STRn` is rendered from `DOn`.
+    #[test]
+    fn test_sseq_init_reconciles_the_value_pair() {
+        // field(DO1,"3") with no STR1 → C renders STR1 = "3.00" at PREC=2.
+        let mut rec = SseqRecord::new();
+        rec.put_field("PREC", EpicsValue::Short(2)).unwrap();
+        rec.steps[0].dov = 3.0;
+        rec.init_record(0).unwrap();
+        assert_eq!(
+            rec.get_field("STR1"),
+            Some(EpicsValue::String("3.00".into()))
+        );
+
+        // field(STR2,"7.5") with no DO2 → C takes dov = atof(s) = 7.5.
+        let mut rec = SseqRecord::new();
+        rec.steps[1].str_val = PvString::from("7.5");
+        rec.init_record(0).unwrap();
+        assert_eq!(rec.get_field("DO2"), Some(EpicsValue::Double(7.5)));
+        assert_eq!(
+            rec.get_field("STR2"),
+            Some(EpicsValue::String("7.5".into())),
+            "the configured string is kept byte-exact, not re-rendered"
+        );
+    }
+
+    /// R16-2 — a put to one view posts the other (C `special()`'s
+    /// `db_post_events` on the partner field).
+    #[test]
+    fn test_sseq_value_pair_posts_its_partner() {
+        let rec = SseqRecord::new();
+        assert_eq!(rec.monitor_side_effect_fields("DO1"), &["STR1"]);
+        assert_eq!(rec.monitor_side_effect_fields("STRA"), &["DOA"]);
+        assert_eq!(rec.monitor_side_effect_fields("DLY3"), &["DLY1"]);
+        assert!(rec.monitor_side_effect_fields("LNK1").is_empty());
     }
 
     #[test]

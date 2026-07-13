@@ -144,6 +144,9 @@ impl HistogramRecord {
         if !self.csta {
             return;
         }
+        // Inverted limits: count nothing. C also raises SOFT/INVALID here and
+        // then erases it in the same cycle — see `check_alarms`, which raises it
+        // for real (CBUG-F12).
         if self.llim >= self.ulim || self.nelm <= 0 {
             return;
         }
@@ -320,11 +323,40 @@ impl Record for HistogramRecord {
         false
     }
 
-    /// `histogramRecord.c` has NO `checkAlarms` at all — its `process` goes
+    /// `histogramRecord.c` has no UDF alarm test anywhere — its `process` goes
     /// straight from `readValue` to `monitor`, so the UDF=1 it carries raises
     /// nothing (softIoc: UDF=1, SEVR NO_ALARM, STAT NO_ALARM).
     fn raises_udf_alarm(&self) -> bool {
         false
+    }
+
+    /// The invalid-limits alarm C intends to raise but erases.
+    ///
+    /// DEVIATION from C, deliberate — CBUG-F12. C's `add_count`
+    /// (histogramRecord.c:328-334) refuses to count when `LLIM >= ULIM` and
+    /// raises SOFT_ALARM / INVALID for it — but it writes `prec->stat` and
+    /// `prec->sevr` DIRECTLY instead of `nsta`/`nsev` via `recGblSetSevr`. The
+    /// same process cycle then calls `monitor()`, whose `recGblResetAlarms()`
+    /// copies `nsta/nsev → stat/sevr` and overwrites the write before any client
+    /// can observe it. The alarm is dead code: C's INTENT is to alarm, C's
+    /// BEHAVIOUR is NO_ALARM (verified on compiled softIoc: `LLIM=10 ULIM=5`,
+    /// process → STAT=NO_ALARM SEVR=NO_ALARM).
+    ///
+    /// Raised here through `rec_gbl_set_sevr`, which is `recGblSetSevr` — it
+    /// writes `nsta`/`nsev`, so `recGblResetAlarms` promotes it instead of
+    /// erasing it, and it keeps only the highest severity, which is what C's
+    /// hand-rolled `if (prec->nsev < INVALID_ALARM)` guard was for. Gated on
+    /// `csta` because C's is: `add_count` returns before the limits test when
+    /// counting is stopped, so a stopped histogram with inverted limits raises
+    /// nothing.
+    fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
+        if self.csta && self.llim >= self.ulim {
+            crate::server::recgbl::rec_gbl_set_sevr(
+                common,
+                crate::server::recgbl::alarm_status::SOFT_ALARM,
+                crate::server::record::AlarmSeverity::Invalid,
+            );
+        }
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {

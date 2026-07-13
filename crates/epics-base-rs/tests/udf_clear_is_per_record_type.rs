@@ -8,9 +8,11 @@
 //! * `dfanout` — UDF is written only inside the closed-loop DOL branch
 //!   (`dfanoutRecord.c:118-122`). With no DOL the record stays undefined and its
 //!   `checkAlarms` (`recGblCheckUdf`) publishes INVALID/UDF *every cycle*.
-//! * `histogram` — UDF is written only by `clear_histogram`; there is no
-//!   `checkAlarms` at all, so an undefined histogram publishes NO_ALARM.
-//! * `event` — same shape: no UDF clear, no `checkAlarms`.
+//! * `histogram` — UDF is written only by `clear_histogram`, and no code path
+//!   tests it, so an undefined histogram publishes NO_ALARM. (It does have one
+//!   alarm of its own — the invalid-limits alarm of CBUG-F12 — but that fires
+//!   on `LLIM >= ULIM`, never on UDF; the histograms here have valid limits.)
+//! * `event` — same shape: no UDF clear, no `checkAlarms` at all.
 //!
 //! The port cleared UDF unconditionally in the shared process epilogue, so a
 //! DOL-less dfanout came up NO_ALARM where C alarms, and histogram/event lost
@@ -112,10 +114,11 @@ async fn dfanout_with_closed_loop_dol_is_defined() {
     );
 }
 
-/// histogram and event never clear UDF either — but they have no
-/// `checkAlarms`, so UDF=1 publishes NO_ALARM. Both halves matter: a blanket
-/// UDF clear hides the flag, a blanket UDF *alarm* invents an alarm C does not
-/// raise.
+/// histogram and event never clear UDF either — and neither tests it, so UDF=1
+/// publishes NO_ALARM. Both halves matter: a blanket UDF clear hides the flag, a
+/// blanket UDF *alarm* invents an alarm C does not raise. (Histogram's limits are
+/// valid here, so its CBUG-F12 invalid-limits alarm stays silent — that alarm is
+/// about `LLIM >= ULIM`, not about UDF.)
 #[tokio::test]
 async fn histogram_and_event_keep_udf_without_alarming() {
     let db = PvDatabase::new();
@@ -132,7 +135,7 @@ async fn histogram_and_event_keep_udf_without_alarming() {
     assert_eq!(
         state(&db, "H1").await,
         (true, AlarmSeverity::NoAlarm, alarm_status::NO_ALARM),
-        "histogram: UDF stays 1 and there is no checkAlarms (softIoc: H1)"
+        "histogram: UDF stays 1 and nothing tests it (softIoc: H1)"
     );
     assert_eq!(
         state(&db, "E2").await,

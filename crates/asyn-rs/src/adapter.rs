@@ -920,30 +920,6 @@ fn asyn_error_to_alarm(e: &AsynError) -> (u16, u16) {
     asyn_error_to_alarm_with_default(e, epics_base_rs::server::recgbl::alarm_status::READ_ALARM)
 }
 
-/// Convert an asyn ParamValue to an EpicsValue.
-fn param_value_to_epics_value(pv: &crate::param::ParamValue) -> Option<EpicsValue> {
-    use crate::param::ParamValue;
-    match pv {
-        ParamValue::Int32(v) => Some(EpicsValue::Long(*v)),
-        ParamValue::Int64(v) => Some(EpicsValue::Double(*v as f64)),
-        ParamValue::Float64(v) => Some(EpicsValue::Double(*v)),
-        ParamValue::Octet(s) => Some(EpicsValue::String(s.clone().into())),
-        ParamValue::UInt32Digital(v) => Some(EpicsValue::Long(*v as i32)),
-        ParamValue::Enum { index, .. } => Some(EpicsValue::Enum(*index as u16)),
-        ParamValue::Int8Array(a) => {
-            Some(EpicsValue::CharArray(a.iter().map(|&x| x as u8).collect()))
-        }
-        ParamValue::Int16Array(a) => Some(EpicsValue::ShortArray(a.to_vec())),
-        ParamValue::Int32Array(a) => Some(EpicsValue::LongArray(a.to_vec())),
-        ParamValue::Int64Array(a) => {
-            Some(EpicsValue::LongArray(a.iter().map(|&x| x as i32).collect()))
-        }
-        ParamValue::Float32Array(a) => Some(EpicsValue::FloatArray(a.to_vec())),
-        ParamValue::Float64Array(a) => Some(EpicsValue::DoubleArray(a.to_vec())),
-        _ => None,
-    }
-}
-
 /// Convert a native-typed array interrupt to the element type of the consuming
 /// record's asyn array interface.
 ///
@@ -1224,6 +1200,67 @@ impl AsynDeviceSupport {
     /// when no nbits was configured (`int32_mask == None`).
     fn apply_int32_mask(&self, value: i32) -> i32 {
         self.int32_mask.map_or(value, |m| m.apply(value))
+    }
+
+    /// Derive the record's value from an interrupt sample **through the interface
+    /// the record is bound on** — the I/O-Intr twin of the polled
+    /// [`AsynDeviceSupport::result_to_value`], which reads the driver's reply
+    /// through that same interface (`asynFloat64` takes `float_val`, `asynInt32`
+    /// takes `int_val`, …).
+    ///
+    /// The scalar rules are the interface read rules themselves ([`ParamValue::as_int32`]
+    /// and friends), the very ones [`crate::param::ParamList::get_int32`] applies when the
+    /// polled path reads the same parameter — one owner, so the two paths cannot
+    /// disagree about what an `asynFloat64` record may be handed.
+    ///
+    /// A sample the record's interface cannot read is an [`AsynError::TypeMismatch`],
+    /// exactly as it is on the polled path, and the caller alarms the record.
+    /// Coercing it instead (what a variant-directed mapping does) hands the record a
+    /// value of the wrong `EpicsValue` kind, which then misses its conversion arm in
+    /// [`AsynDeviceSupport::store_read_value`] and lands on raw `set_val` — silently
+    /// bypassing ai ASLO/AOFF/SMOO, asynInt32 ai ESLO/EOFF, and bi/mbbi RVAL state
+    /// tables. C cannot reach that state at all: it keeps one interrupt list per
+    /// interface, so a record is only ever handed a value of its own type.
+    ///
+    /// Arrays keep the per-interface `convert` of [`convert_param_array_to_iface`]
+    /// (C fires all six array interfaces, each with its own converted copy).
+    /// `Ok(None)` for an interface with no value mapping (e.g. `asynGenericPointer`),
+    /// which stores nothing — as before.
+    ///
+    /// Takes `&self` for the same reason `result_to_value` does: `asynInt32` reads
+    /// are masked and sign-extended by the record's `@asynMask` nbits, and C applies
+    /// that in the interrupt path too (`interruptCallbackInput`, devAsynInt32.c:537-539,
+    /// the same `value &= mask` + bipolar sign-extend as `processCallbackInput` at
+    /// :485-488). A free function could not reach `int32_mask`, and the two paths
+    /// would silently disagree again — this time about the mask instead of the type.
+    fn param_value_for_iface(
+        &self,
+        pv: &crate::param::ParamValue,
+    ) -> Result<Option<EpicsValue>, AsynError> {
+        let iface_type = self.iface_type.as_str();
+        if let Some(arr) = convert_param_array_to_iface(iface_type, pv) {
+            return Ok(Some(arr));
+        }
+        let val = match iface_type {
+            "asynInt32" => EpicsValue::Long(self.apply_int32_mask(pv.as_int32()?)),
+            "asynInt64" => EpicsValue::Double(pv.as_int64()? as f64),
+            "asynFloat64" => EpicsValue::Double(pv.as_float64()?),
+            "asynOctet" => EpicsValue::String(pv.as_octet()?.into()),
+            "asynUInt32Digital" => EpicsValue::Long(pv.as_uint32()? as i32),
+            "asynEnum" => EpicsValue::Enum(pv.as_enum()?.0 as u16),
+            // An array interface reached here only because the sample is not an
+            // array (`convert_param_array_to_iface` handles every array sample):
+            // the record's interface cannot read it, same as the scalar mismatches.
+            "asynInt8Array" | "asynInt16Array" | "asynInt32Array" | "asynInt64Array"
+            | "asynFloat32Array" | "asynFloat64Array" => {
+                return Err(AsynError::TypeMismatch {
+                    expected: "Array",
+                    actual: pv.type_name(),
+                });
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(val))
     }
 
     /// Extract an EpicsValue from a RequestResult based on interface type.
@@ -2188,16 +2225,31 @@ impl DeviceSupport for AsynDeviceSupport {
                 // `skip_convert` stays true so the record skips the RVAL→VAL
                 // convert and keeps its previous value = C return -1.
                 if ci.aux_status == crate::error::AsynStatus::Success {
-                    // Array interrupts carry the native element type; convert to
-                    // this record's interface type so a mismatched FTVL gets the
-                    // same per-type `convert` the polled path applies (C fires
-                    // all six array interfaces, NDPluginStdArrays.cpp:169-197).
-                    // Scalar interfaces fall back to the verbatim mapping.
-                    let val = convert_param_array_to_iface(&self.iface_type, &ci.value)
-                        .or_else(|| param_value_to_epics_value(&ci.value))
-                        .map(|v| self.cap_octet_read_value(v));
-                    if let Some(val) = val {
-                        skip_convert = self.store_read_value(record, val);
+                    // Derive the value through THIS record's interface, the same
+                    // way the polled path does (`result_to_value`): an array
+                    // interrupt gets the per-interface `convert` (C fires all six
+                    // array interfaces, NDPluginStdArrays.cpp:169-197) and a
+                    // scalar gets its interface's read rule.
+                    match self.param_value_for_iface(&ci.value) {
+                        Ok(Some(val)) => {
+                            let val = self.cap_octet_read_value(val);
+                            skip_convert = self.store_read_value(record, val);
+                        }
+                        Ok(None) => {}
+                        // The driver fired a value this record's interface cannot
+                        // read. C cannot deliver that (one interrupt list per
+                        // interface); here it means the parameter's type and the
+                        // record's DTYP disagree. Alarm it — the same
+                        // TypeMismatch the polled read raises through
+                        // `asyn_error_to_alarm` — and keep the prior value.
+                        // Coercing it instead would bypass the record's
+                        // conversions silently.
+                        Err(e) => {
+                            let (status, severity) =
+                                asyn_error_to_alarm_with_default(&e, default_stat);
+                            self.last_alarm_status = status;
+                            self.last_alarm_severity = severity;
+                        }
                     }
                 }
             }
@@ -3398,6 +3450,48 @@ mod tests {
             AsynDeviceSupport::from_handle(handle, link, "asynInt32").with_mask((-8i32) as u32);
         let result = RequestResult::int32_read(0xFF);
         assert_eq!(ads.result_to_value(&result), Some(EpicsValue::Long(-1)));
+    }
+
+    /// The I/O-Intr twin of `result_to_value_masks_and_sign_extends_int32`.
+    ///
+    /// C applies `@asynMask` in BOTH input paths — `processCallbackInput`
+    /// (devAsynInt32.c:485-488) and `interruptCallbackInput` (:537-539) run the
+    /// same `value &= mask` + bipolar sign-extend. A mask on one path only is the
+    /// same defect class this module's `param_value_for_iface` exists to close:
+    /// the polled read and the interrupt read of one parameter deriving the
+    /// record's value by different rules.
+    #[test]
+    fn io_intr_masks_and_sign_extends_int32_like_the_polled_read() {
+        use crate::param::ParamValue;
+
+        let interrupts = Arc::new(InterruptManager::new(256));
+        let (tx, _rx) = tokio::sync::mpsc::channel(256);
+        let handle = PortHandle::new(tx, "p".into(), interrupts, ActorId::new());
+        let link = AsynLink {
+            port_name: "p".into(),
+            addr: 0,
+            timeout: Duration::from_secs(1),
+            drv_info: String::new(),
+        };
+        let ads =
+            AsynDeviceSupport::from_handle(handle, link, "asynInt32").with_mask((-8i32) as u32);
+
+        // Same raw sample down both paths of the same adapter: they must agree.
+        let polled = ads.result_to_value(&RequestResult::int32_read(0xF0));
+        let io_intr = ads
+            .param_value_for_iface(&ParamValue::Int32(0xF0))
+            .expect("an Int32 sample is readable through asynInt32");
+
+        assert_eq!(
+            polled,
+            Some(EpicsValue::Long(-16)),
+            "bipolar 8-bit: 0xF0 masks and sign-extends to -16"
+        );
+        assert_eq!(
+            io_intr, polled,
+            "the interrupt read must apply the same @asynMask as the polled read \
+             (C interruptCallbackInput, devAsynInt32.c:537-539)"
+        );
     }
 
     #[test]
@@ -6572,6 +6666,74 @@ mod tests {
             rec.val(),
             Some(EpicsValue::Double(21.0)),
             "VAL = raw*ASLO + AOFF = 10*2 + 1 = 21"
+        );
+    }
+
+    /// An I/O-Intr sample the record's interface cannot read must alarm the
+    /// record, never be coerced into it.
+    ///
+    /// The driver's parameter is `Float64` (what this `asynFloat64` ai binds),
+    /// but a driver that fires a differently-typed value for the same reason —
+    /// an on-demand driver that created the parameter as Int32, say — used to
+    /// have that value mapped by its *variant*, not by the record's interface:
+    /// `ParamValue::Int32` became `EpicsValue::Long`, which misses every
+    /// `asynFloat64` arm of `store_read_value` and lands on raw `set_val`,
+    /// silently bypassing the ai ASLO/AOFF/SMOO conversion the record is
+    /// configured for.
+    ///
+    /// The polled read of that same mismatched parameter fails loudly
+    /// (`AsynError::TypeMismatch` from `ParamList::get_float64` → READ/INVALID);
+    /// the I/O-Intr read must do the same.
+    #[test]
+    fn io_intr_sample_of_the_wrong_type_alarms_instead_of_coercing() {
+        use epics_base_rs::server::recgbl::alarm_status::READ_ALARM;
+        use epics_base_rs::server::record::AlarmSeverity;
+        use epics_base_rs::server::records::ai::AiRecord;
+
+        let mut ads = make_float64_io_intr_adapter();
+        let mut rec = AiRecord::new(0.0);
+        ads.init(&mut rec).unwrap();
+        ads.set_record_info("TEST:AI", ScanType::IoIntr);
+        rec.aslo = 2.0;
+        rec.aoff = 1.0;
+
+        // A correctly-typed sample: the ai conversion runs. VAL = 5*2 + 1 = 11.
+        push_f64(&ads, 5.0);
+        ads.read(&mut rec).unwrap();
+        assert_eq!(
+            rec.val(),
+            Some(EpicsValue::Double(11.0)),
+            "asynFloat64 ai applies ASLO/AOFF: 5*2 + 1 = 11"
+        );
+        assert_eq!(
+            ads.last_alarm(),
+            None,
+            "a well-typed sample raises no alarm"
+        );
+
+        // Same reason, a value this record's interface cannot read.
+        {
+            let mut g = ads.interrupt_fifo.lock().unwrap();
+            g.push_with_overflow(CachedInterrupt {
+                value: crate::param::ParamValue::Int32(5),
+                timestamp: SystemTime::UNIX_EPOCH,
+                alarm_status: 0,
+                alarm_severity: 0,
+                aux_status: crate::error::AsynStatus::Success,
+            });
+        }
+        ads.read(&mut rec).unwrap();
+        assert_eq!(
+            ads.last_alarm(),
+            Some((READ_ALARM, AlarmSeverity::Invalid as u16)),
+            "an Int32 sample on an asynFloat64 record is a TypeMismatch: READ/INVALID, \
+             the same alarm the polled read raises"
+        );
+        assert_eq!(
+            rec.val(),
+            Some(EpicsValue::Double(11.0)),
+            "the prior value is kept; the raw 5 must NOT be coerced into VAL \
+             (which would bypass ASLO/AOFF and read 5 instead of 11)"
         );
     }
 

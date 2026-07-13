@@ -1836,17 +1836,17 @@ static FIELD_LIST: &[FieldDesc] = &[
     },
     FieldDesc {
         name: "UI32INP",
-        dbf_type: DbFieldType::Long,
+        dbf_type: DbFieldType::ULong,
         read_only: true,
     },
     FieldDesc {
         name: "UI32OUT",
-        dbf_type: DbFieldType::Long,
+        dbf_type: DbFieldType::ULong,
         read_only: false,
     },
     FieldDesc {
         name: "UI32MASK",
-        dbf_type: DbFieldType::Long,
+        dbf_type: DbFieldType::ULong,
         read_only: false,
     },
     FieldDesc {
@@ -3885,9 +3885,9 @@ impl Record for AsynRecord {
             "EOMR" => Some(EpicsValue::Enum(self.eomr as u16)),
             "I32INP" => Some(EpicsValue::Long(self.i32inp)),
             "I32OUT" => Some(EpicsValue::Long(self.i32out)),
-            "UI32INP" => Some(EpicsValue::Long(self.ui32inp as i32)),
-            "UI32OUT" => Some(EpicsValue::Long(self.ui32out as i32)),
-            "UI32MASK" => Some(EpicsValue::Long(self.ui32mask as i32)),
+            "UI32INP" => Some(EpicsValue::ULong(self.ui32inp)),
+            "UI32OUT" => Some(EpicsValue::ULong(self.ui32out)),
+            "UI32MASK" => Some(EpicsValue::ULong(self.ui32mask)),
             "F64INP" => Some(EpicsValue::Double(self.f64inp)),
             "F64OUT" => Some(EpicsValue::Double(self.f64out)),
             "BAUD" => Some(EpicsValue::Enum(self.baud as u16)),
@@ -4883,6 +4883,40 @@ mod tests {
         assert_eq!(baud.len(), 16);
         assert_eq!(baud[0], "Unknown");
         assert_eq!(baud[15], "1152000");
+    }
+
+    /// UI32INP / UI32OUT / UI32MASK are C `DBF_ULONG` (asynRecord.dbd:335,
+    /// :340, :346). Measured on the compiled C IOC, a DBF_ULONG field's native
+    /// CA type is DBF_DOUBLE — CA has no unsigned-long wire type, so the IOC
+    /// promotes it — which is exactly what `DbFieldType::ULong` serves. The
+    /// boundary the previous signed `Long` declaration could not represent is
+    /// the top bit: it read back as -1.
+    #[test]
+    fn ui32_fields_are_unsigned_long() {
+        let mut rec = AsynRecord::default();
+        for f in ["UI32INP", "UI32OUT", "UI32MASK"] {
+            let desc = rec.field_list().iter().find(|d| d.name == f).unwrap();
+            assert_eq!(desc.dbf_type, DbFieldType::ULong, "{f}");
+        }
+        // The default mask is all-ones: 4294967295, not -1.
+        assert_eq!(
+            rec.get_field("UI32MASK"),
+            Some(EpicsValue::ULong(0xFFFF_FFFF))
+        );
+        // A top-bit-set value survives the round trip...
+        rec.put_field("UI32OUT", EpicsValue::ULong(0x8000_0001))
+            .unwrap();
+        assert_eq!(
+            rec.get_field("UI32OUT"),
+            Some(EpicsValue::ULong(0x8000_0001))
+        );
+        // ...including from the DBR_DOUBLE form a CA client actually puts.
+        rec.put_field("UI32MASK", EpicsValue::Double(4294967295.0))
+            .unwrap();
+        assert_eq!(
+            rec.get_field("UI32MASK"),
+            Some(EpicsValue::ULong(0xFFFF_FFFF))
+        );
     }
 
     /// Plain numeric / string fields (text-entry widgets) must NOT be

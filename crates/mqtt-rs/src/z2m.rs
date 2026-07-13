@@ -73,16 +73,17 @@ fn load_records(prefix: &str, dev: &str, port: &str, records: &[RecordDef], ctx:
                             eprintln!("z2m: apply_fields for {}: {e}", def.name);
                             continue;
                         }
+                        // Record + loaded common fields in one call: the sink
+                        // runs the `iocInit` passes against the final field
+                        // set, not a pre-load one (see `ioc.rs`).
+                        let load = epics_base_rs::server::database::RecordLoad::from_common_fields(
+                            common_fields,
+                        );
                         ctx.block_on(async {
-                            if let Err(e) = ctx.db().add_record(&def.name, record).await {
+                            if let Err(e) =
+                                ctx.db().add_loaded_record(&def.name, record, load).await
+                            {
                                 eprintln!("z2m: register '{}' skipped: {e}", def.name);
-                                return;
-                            }
-                            if let Some(rec_arc) = ctx.db().get_record(&def.name).await {
-                                let mut instance = rec_arc.write().await;
-                                for (name, value) in common_fields {
-                                    let _ = instance.put_common_field(&name, value);
-                                }
                             }
                         });
                     }

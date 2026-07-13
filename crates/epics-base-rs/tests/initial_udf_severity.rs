@@ -107,6 +107,103 @@ async fn ms_inherits_the_initial_udf_severity_from_an_unprocessed_source() {
     );
 }
 
+/// R19-23, the other half of the rule: a `.db` `field(VAL,…)` DEFINES the
+/// record at load, so the seed above must NOT fire for it.
+///
+/// C `dbStaticLib.c:2653-2661` — `dbPutString` ends every successful put to a
+/// field named `VAL` with `dbPutString(&udf_entry, "0")`, and that runs inside
+/// `dbLoadRecords`, i.e. BEFORE `iocInit`'s `if (udf && stat == UDF_ALARM)`.
+/// Measured, softIoc 7.0 (linux-x86_64), `record(ai,"QT1"){field(VAL,"3.14")}`
+/// + `record(ai,"QT2"){}`, right after `iocInit`:
+///
+/// ```text
+/// dbgf QT1.UDF -> 0   QT1.STAT -> UDF   QT1.SEVR -> NO_ALARM
+/// dbgf QT2.UDF -> 1   QT2.STAT -> UDF   QT2.SEVR -> INVALID
+/// ```
+///
+/// STAT stays UDF in both: `iocInit` lowers nothing, it only raises SEVR.
+#[tokio::test]
+async fn a_db_val_defines_the_record_so_the_seed_does_not_fire() {
+    let db = build(
+        r#"
+        record(ai, "QT1") { field(VAL, "3.14") }
+        record(bi, "QB1") { field(VAL, "1") }
+        record(stringin, "QS1") { field(VAL, "hi") }
+        record(calc, "QC1") { field(CALC, "1") field(VAL, "7") }
+        record(ai, "QT2") {}
+        "#,
+    )
+    .await;
+
+    for name in ["QT1", "QB1", "QS1", "QC1"] {
+        let rec = db.get_record(name).await.unwrap();
+        let inst = rec.read().await;
+        assert!(
+            !inst.common.udf,
+            "{name}: field(VAL,…) clears UDF at load (C dbPutString)"
+        );
+        assert_eq!(
+            inst.common.stat,
+            alarm_status::UDF_ALARM,
+            "{name}: STAT is still born UDF — iocInit lowers nothing"
+        );
+        assert_eq!(
+            inst.common.sevr,
+            AlarmSeverity::NoAlarm,
+            "{name}: the seed's `udf &&` precondition is false, so NO_ALARM"
+        );
+    }
+
+    // The control: the same load, no VAL, still INVALID.
+    let rec = db.get_record("QT2").await.unwrap();
+    let inst = rec.read().await;
+    assert!(inst.common.udf);
+    assert_eq!(inst.common.sevr, AlarmSeverity::Invalid);
+}
+
+/// The same rule on the runtime `dbLoadRecords` path — the second `.db` loader.
+/// The seed is evaluated by the creation sink, which both loaders now hand
+/// their complete field set to, so neither can init a half-loaded record.
+#[tokio::test]
+async fn the_runtime_db_loader_applies_the_val_udf_rule_too() {
+    use epics_base_rs::server::iocsh::IocShell;
+
+    let dir = std::env::temp_dir().join(format!("r19_23_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db_file = dir.join("r19_23.db");
+    std::fs::write(
+        &db_file,
+        "record(ai, \"RT1\") { field(VAL, \"2.5\") }\nrecord(ai, \"RT2\") {}\n",
+    )
+    .unwrap();
+
+    let db = std::sync::Arc::new(PvDatabase::new());
+    {
+        // iocsh commands block on the runtime, so they run off the async thread.
+        let (db, handle) = (db.clone(), tokio::runtime::Handle::current());
+        let line = format!("dbLoadRecords(\"{}\")", db_file.display());
+        std::thread::spawn(move || {
+            IocShell::new(db, handle).execute_line(&line).unwrap();
+        })
+        .join()
+        .unwrap();
+    }
+    db.ioc_init().await;
+
+    let rec = db.get_record("RT1").await.unwrap();
+    let inst = rec.read().await;
+    assert!(!inst.common.udf, "RT1: field(VAL,…) clears UDF at load");
+    assert_eq!(inst.common.sevr, AlarmSeverity::NoAlarm);
+    drop(inst);
+
+    let rec = db.get_record("RT2").await.unwrap();
+    let inst = rec.read().await;
+    assert!(inst.common.udf);
+    assert_eq!(inst.common.sevr, AlarmSeverity::Invalid);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// UDFS is the severity the rule uses — a record that declares
 /// `field(UDFS,"MINOR")` starts MINOR, not INVALID.
 #[tokio::test]

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use super::registry::*;
 use crate::error::CaResult;
-use crate::server::database::parse_pv_name;
+use crate::server::database::{RecordLoad, parse_pv_name};
 use crate::server::db_loader;
 use crate::types::EpicsValue;
 
@@ -1063,10 +1063,7 @@ fn cmd_db_load_records() -> CommandDef {
                     let is_merge = existing.is_some();
                     let rec_arc = if let Some(rec_arc) = existing {
                         // Merge: apply field overrides directly to the
-                        // existing record instance. Init_record stays
-                        // skipped on merge — it was already run during
-                        // the first load, and re-running would clobber
-                        // state populated by intervening processing.
+                        // existing record instance.
                         {
                             let mut inst = rec_arc.write().await;
                             if let Err(e) = db_loader::apply_fields(
@@ -1081,15 +1078,24 @@ fn cmd_db_load_records() -> CommandDef {
                     } else {
                         let mut record = db_loader::create_record(&def.record_type)
                             .map_err(|e| format!("{e}"))?;
-                        // The breakpoint-table registry is installed by
-                        // `add_record` (the single creation sink); apply_fields
-                        // only needs the LINR index, already resolved above.
+                        // The breakpoint-table registry is installed by the
+                        // creation sink; apply_fields only needs the LINR
+                        // index, already resolved above.
                         if let Err(e) =
                             db_loader::apply_fields(&mut record, &def.fields, &mut common_fields)
                         {
                             return Err(format!("{e}"));
                         }
-                        if let Err(e) = ctx.db().add_record(&def.name, record).await {
+                        // Record + its whole loaded field set in one call: the
+                        // sink applies the common fields and info tags, THEN
+                        // runs C's `iocInit` passes, so the initial UDF
+                        // severity sees the `.db`'s final UDF (a
+                        // `field(VAL,…)` clears it — `dbStaticLib.c:2653`).
+                        let load = RecordLoad {
+                            common_fields: std::mem::take(&mut common_fields),
+                            info_tags: def.info_tags.clone(),
+                        };
+                        if let Err(e) = ctx.db().add_loaded_record(&def.name, record, load).await {
                             return Err(format!("dbLoadRecords: '{}' rejected: {e}", def.name));
                         }
                         ctx.db().get_record(&def.name).await.ok_or_else(|| {
@@ -1114,7 +1120,13 @@ fn cmd_db_load_records() -> CommandDef {
                         }
                     }
 
-                    {
+                    // A MERGE re-applies the new block's fields to a record that
+                    // is already in the database and already initialised, so
+                    // the load-then-init ordering the creation sink guarantees
+                    // has to be re-created by hand here: fields first, passes
+                    // after. A fresh record took that ordering from the sink
+                    // and must not run the passes twice.
+                    if is_merge {
                         let mut instance = rec_arc.write().await;
                         // info(key, value) directives — last write
                         // wins. Populated before common-field application
@@ -1177,18 +1189,18 @@ fn cmd_db_load_records() -> CommandDef {
                         // alternative (skip init on merge) silently
                         // ignored field overrides that affect init —
                         // worse for typical use.
-                        let _ = is_merge;
                         instance.run_init_passes(&def.name);
+                    }
+                    {
                         // Hand the record its resolved common link fields so
                         // a link-classifying record (calcout INAV..INUV/OUTV)
                         // runs its C `init_record` checkLinks step at load —
-                        // the common OUT link was applied above, after
-                        // `set_async_context` ran at `add_record`. Defaulted
-                        // no-op for records that do not classify common links.
-                        {
-                            let inst = &mut *instance;
-                            inst.record.init_links(&inst.common);
-                        }
+                        // the common OUT link is applied by the sink, after
+                        // `set_async_context`. Defaulted no-op for records
+                        // that do not classify common links.
+                        let mut instance = rec_arc.write().await;
+                        let inst = &mut *instance;
+                        inst.record.init_links(&inst.common);
                     }
                     // C `recGblInitConstantLink(&prec->inp, …)` /
                     // `dbLoadLinkArray` from every soft INPUT dev support's

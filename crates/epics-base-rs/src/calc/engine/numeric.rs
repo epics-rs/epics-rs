@@ -1,7 +1,7 @@
 use super::cast::{c_int, d2i, d2ui};
 use super::error::CalcError;
 use super::opcodes::{CoreOp, Opcode};
-use super::random::local_random;
+use super::random::calc_random;
 use super::{CompiledExpr, NumericInputs};
 
 pub fn eval(expr: &CompiledExpr, inputs: &mut NumericInputs) -> Result<f64, CalcError> {
@@ -46,9 +46,12 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut NumericInputs) -> Result<f64, Calc
                     return Err(CalcError::Internal);
                 }
 
-                // Random
+                // Random. BASE's generator, not synApps' — `calcRandom`
+                // (`calcPerform.c:518-523`) maps the shared Knuth LCG with
+                // `seed / 65535.0`, where sCalc/aCalc use `(seed+1) / 65536.0`.
+                // Every draw differs, from the first one on.
                 CoreOp::Random => {
-                    stack.push(local_random());
+                    stack.push(calc_random());
                 }
                 CoreOp::FetchVal => {
                     // C calcPerform.c:74-76 — FETCH_VAL pushes *presult, the
@@ -64,10 +67,14 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut NumericInputs) -> Result<f64, Calc
                     return Err(CalcError::Internal);
                 }
                 CoreOp::NormalRandom => {
-                    let u1 = local_random();
-                    let u2 = local_random();
-                    let n = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
-                    stack.push(n);
+                    // `NRNDM` is synApps-only (`sCalcPostfix.c:169`,
+                    // `aCalcPostfix.c:133`); base's element table has RNDM and
+                    // nothing else (`postfix.c:133`), so `calcPerform` has no
+                    // NORMAL_RNDM case to run. Unreachable here for the same
+                    // shared-tokenizer reason as `FetchSval` and S2R/R2S — and
+                    // it must NOT draw, since base's generator is `calcRandom`
+                    // and its `[0, 1]` range would let `log(0)` through.
+                    return Err(CalcError::Internal);
                 }
 
                 // Arithmetic
@@ -459,8 +466,7 @@ mod parity_tests {
                 Opcode::Core(CoreOp::PushConst(2.0)),
                 Opcode::Core(CoreOp::End),
             ],
-            kind: ExprKind::Numeric,
-            loop_pairs: Vec::new(),
+            ..CompiledExpr::empty(ExprKind::Numeric)
         };
         let mut inp = NumericInputs::new();
         assert_eq!(eval(&prog, &mut inp), Err(CalcError::Internal));
@@ -715,6 +721,45 @@ mod parity_tests {
             let r = run("RNDM");
             assert!((0.0..=1.0).contains(&r), "RNDM out of range: {r}");
         }
+    }
+
+    /// base RNDM replays `calcRandom` (`calcPerform.c:518-523`), NOT sCalc's
+    /// `local_random`: the first draw of compiled C is 49156/65535
+    /// (0.75007248…), where synApps' is 49157/65536 (0.75007629…).
+    /// A fresh thread, because the seed is thread-private.
+    #[test]
+    fn l4_random_first_draws_are_base_c_not_synapps() {
+        let got = std::thread::spawn(|| (0..3).map(|_| run("RNDM")).collect::<Vec<_>>())
+            .join()
+            .unwrap();
+        let mut s: u16 = 0xa3bf;
+        let expected: Vec<f64> = (0..3)
+            .map(|_| {
+                s = s.wrapping_mul(1533).wrapping_add(0x3141);
+                f64::from(s) / 65535.0
+            })
+            .collect();
+        assert_eq!(got, expected);
+        assert_eq!(got[0], 49156.0 / 65535.0);
+    }
+
+    /// NRNDM is not in base's element table, so it cannot compile — and if one
+    /// were hand-assembled, the evaluator refuses it rather than drawing from
+    /// base's `[0, 1]` generator (`log(0)`).
+    #[test]
+    fn l4_normal_random_is_not_a_base_operator() {
+        use crate::calc::engine::opcodes::{CoreOp, Opcode};
+        use crate::calc::{CompiledExpr, ExprKind};
+        assert_eq!(compile("NRNDM").unwrap_err(), CalcError::Syntax);
+        let mut hand_built = CompiledExpr::empty(ExprKind::Numeric);
+        hand_built.code = vec![
+            Opcode::Core(CoreOp::NormalRandom),
+            Opcode::Core(CoreOp::End),
+        ];
+        assert_eq!(
+            eval(&hand_built, &mut NumericInputs::new()).unwrap_err(),
+            CalcError::Internal
+        );
     }
 
     // L-5: VAL token reads the previous result, not the stack top.

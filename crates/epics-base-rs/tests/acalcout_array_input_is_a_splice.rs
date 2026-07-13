@@ -18,12 +18,23 @@
 //! ```
 //! (`fetch_values`, `aCalcoutRecord.c:1078-1102`.)
 //!
-//! Three regions, three rules:
+//! Three regions, three rules — and R14-6 corrects what W10-A8 wrote here about
+//! the middle one:
 //!
-//! * `[0, nRequest)` — what the link delivered.
-//! * `[nRequest, numElements)` — zeroed, but ONLY on the link path. This is
-//!   `fetch_values`' own step; a client `dbPut` has no counterpart.
-//! * `[numElements, nelm)` — NEVER written. `numElements` is
+//! * `[0, nNew)` — what the writer delivered.
+//! * `[nNew, numElements)` — ZEROED, on BOTH paths. The link's zero-fill is the
+//!   `fetch_values` code above; the client's is `put_array_info`
+//!   (`aCalcoutRecord.c:726-731`), which `dbPut` calls for every SPC_DBADDR field
+//!   it writes (`dbAccess.c:1366-1369`):
+//!
+//!   ```c
+//!   if ( pd && (nNew < numElements) )
+//!       for (i=nNew; i<numElements; i++) pd[i] = 0.;
+//!   ```
+//!
+//!   W10-A8 asserted the client path had "no counterpart" and left the tail
+//!   alone. It has one, and it does not.
+//! * `[numElements, nelm)` — NEVER written, by either. `numElements` is
 //!   `acalcGetNumElements()`, i.e. NUSE when NUSE < NELM, so this is the part of the
 //!   buffer NUSE currently hides. It keeps its contents and REAPPEARS when NUSE
 //!   grows again.
@@ -77,11 +88,12 @@ fn a_short_link_fetch_zeroes_the_window_and_preserves_the_hidden_tail() {
     );
 }
 
-/// The client-put path. `dbPut` copies the elements it brought into the same
-/// `calloc(nelm)` buffer and does NOT zero anything after them — so a two-element
-/// put over a full buffer leaves 3..10 exactly as they were.
+/// The client-put path (R14-6). `dbPut` copies the elements it brought into the
+/// same `calloc(nelm)` buffer and then calls `put_array_info`, which ZEROES
+/// `[nNew, numElements)` — so a two-element put over a full ten-element window
+/// leaves eight zeros behind it, not the eight values that were there.
 #[test]
-fn a_short_client_put_preserves_everything_it_did_not_write() {
+fn a_short_client_put_zeroes_the_rest_of_the_window() {
     let mut rec = record_with_full_aa();
 
     rec.put_field("AA", EpicsValue::DoubleArray(vec![7.0, 8.0]))
@@ -89,7 +101,97 @@ fn a_short_client_put_preserves_everything_it_did_not_write() {
 
     assert_eq!(
         aa(&rec),
-        vec![7.0, 8.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
+        vec![7.0, 8.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    );
+}
+
+/// …and it stops at the WINDOW, not at NELM: the same put with NUSE = 5 zeroes
+/// `[2,5)` and leaves the hidden `[5,10)` intact, which is the splice invariant
+/// the client path shares with the link path (R14-6 + R14-7).
+#[test]
+fn a_short_client_put_preserves_the_hidden_tail() {
+    let mut rec = record_with_full_aa();
+    rec.put_field("NUSE", EpicsValue::ULong(5)).unwrap();
+
+    rec.put_field("AA", EpicsValue::DoubleArray(vec![7.0, 8.0]))
+        .unwrap();
+    assert_eq!(aa(&rec), vec![7.0, 8.0, 0.0, 0.0, 0.0]);
+
+    rec.put_field("NUSE", EpicsValue::ULong(10)).unwrap();
+    assert_eq!(
+        aa(&rec),
+        vec![7.0, 8.0, 0.0, 0.0, 0.0, 6.0, 7.0, 8.0, 9.0, 10.0]
+    );
+}
+
+/// AVAL and OAV are SPC_DBADDR array fields too (`aCalcoutRecord.c:702`, `:711`),
+/// so `put_array_info` serves them as well — a client put into either splices and
+/// zeroes the rest of the window, exactly as into AA.
+#[test]
+fn aval_and_oav_take_the_same_client_put_rule() {
+    for field in ["AVAL", "OAV"] {
+        let mut rec = AcalcoutRecord::new();
+        rec.put_field("NELM", EpicsValue::ULong(6)).unwrap();
+        rec.put_field(field, EpicsValue::DoubleArray(vec![1.0; 6]))
+            .unwrap();
+
+        rec.put_field(field, EpicsValue::DoubleArray(vec![9.0, 9.0]))
+            .unwrap();
+
+        assert_eq!(
+            rec.get_field(field),
+            Some(EpicsValue::DoubleArray(vec![9.0, 9.0, 0.0, 0.0, 0.0, 0.0])),
+            "{field}"
+        );
+    }
+}
+
+/// R14-7 — the write is BOUNDED at the window, not at NELM. C asks the link for
+/// exactly `nRequest = acalcGetNumElements(pcalc)` elements (`:1096-1097`), so a
+/// source longer than the NUSE window is truncated at it and CANNOT reach the
+/// hidden `[numElements, nelm)` — the region the splice exists to preserve. The
+/// port spliced up to NELM, so an over-long INAA source overwrote the tail.
+#[test]
+fn an_over_long_link_fetch_stops_at_the_window() {
+    let mut rec = record_with_full_aa();
+    rec.put_field("NUSE", EpicsValue::ULong(3)).unwrap();
+
+    // Eight elements offered into a three-element window.
+    rec.put_field_internal(
+        "AA",
+        EpicsValue::DoubleArray(vec![90.0, 91.0, 92.0, 93.0, 94.0, 95.0, 96.0, 97.0]),
+    )
+    .unwrap();
+
+    assert_eq!(aa(&rec), vec![90.0, 91.0, 92.0]);
+
+    // 93..97 were never written: the buffer past the window still holds 4..10.
+    rec.put_field("NUSE", EpicsValue::ULong(10)).unwrap();
+    assert_eq!(
+        aa(&rec),
+        vec![90.0, 91.0, 92.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
+    );
+}
+
+/// The same bound on the client path — `dbPut` clamps its request to
+/// `paddr->no_elements` (`dbAccess.c:1361-1362`), which `cvt_dbaddr` set to
+/// `acalcGetNumElements` (`:628`).
+#[test]
+fn an_over_long_client_put_stops_at_the_window() {
+    let mut rec = record_with_full_aa();
+    rec.put_field("NUSE", EpicsValue::ULong(3)).unwrap();
+
+    rec.put_field(
+        "AA",
+        EpicsValue::DoubleArray(vec![90.0, 91.0, 92.0, 93.0, 94.0, 95.0]),
+    )
+    .unwrap();
+
+    assert_eq!(aa(&rec), vec![90.0, 91.0, 92.0]);
+    rec.put_field("NUSE", EpicsValue::ULong(10)).unwrap();
+    assert_eq!(
+        aa(&rec),
+        vec![90.0, 91.0, 92.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
     );
 }
 

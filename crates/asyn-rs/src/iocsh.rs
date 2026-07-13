@@ -152,6 +152,34 @@ fn raw_from_escaped(src: &str) -> Vec<u8> {
     out
 }
 
+/// Rust port of EPICS `epicsStrnEscapedFromRaw` (libcom `epicsString.c:120`) —
+/// the inverse of [`raw_from_escaped`], and what C `asynShowEos` prints the
+/// terminator through (`asynShellCommands.c:305`). The C escapes, `\0` for NUL,
+/// `\xNN` (lower-case) for anything else unprintable, and the byte itself when
+/// `isprint`.
+fn escaped_from_raw(src: &[u8]) -> String {
+    let mut out = String::with_capacity(src.len());
+    for &c in src {
+        match c {
+            0x07 => out.push_str("\\a"),
+            0x08 => out.push_str("\\b"),
+            0x0c => out.push_str("\\f"),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b'\t' => out.push_str("\\t"),
+            0x0b => out.push_str("\\v"),
+            b'\\' => out.push_str("\\\\"),
+            b'\'' => out.push_str("\\'"),
+            b'"' => out.push_str("\\\""),
+            0 => out.push_str("\\0"),
+            // C `isprint` in the C locale: the printable ASCII range.
+            0x20..=0x7e => out.push(c as char),
+            _ => out.push_str(&format!("\\x{c:02x}")),
+        }
+    }
+    out
+}
+
 /// The I/O deadline every asyn *shell* command puts on the `asynUser` it
 /// builds: C sets `pasynUser->timeout = 2` in `asynSetOption`
 /// (asynShellCommands.c:119), `asynSetEos` (:239) and `asynShowEos` (:288),
@@ -159,27 +187,35 @@ fn raw_from_escaped(src: &str) -> Vec<u8> {
 /// drift apart again.
 const SHELL_IO_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// The `asynUser` C's `asynSetEos` builds (asynShellCommands.c:239-241).
+/// The `asynUser` C's `asynSetEos` / `asynShowEos` build
+/// (asynShellCommands.c:239-241, :288-290).
 ///
-/// Two fields matter and both come from C: the 2 s I/O deadline
-/// ([`SHELL_IO_TIMEOUT`]) and `ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED`, which
-/// is what lets an `st.cmd` set a line's EOS before the device is powered on.
-/// No queue-wait deadline: C passes `queueRequest(..., 0.0)` (:244).
-fn shell_eos_user() -> AsynUser {
+/// Three fields matter and all come from C: the device the command names —
+/// `findInterface(portName, addr, ...)` `connectDevice`s the user to it
+/// (:79-80), which is what makes the EOS hook land on that device's terminator
+/// — the 2 s I/O deadline ([`SHELL_IO_TIMEOUT`]), and
+/// `ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED`, which is what lets an `st.cmd`
+/// set a line's EOS before the device is powered on. No queue-wait deadline: C
+/// passes `queueRequest(..., 0.0)` (:244).
+fn shell_eos_user(addr: i32) -> AsynUser {
     AsynUser::default()
+        .with_addr(addr)
         .with_timeout(SHELL_IO_TIMEOUT)
         .queue_even_if_not_connected()
 }
 
 /// Shared body of `asynOctetSetInputEos` / `asynOctetSetOutputEos`.
 ///
-/// C parity: `asynShellCommands.c::asynSetEos` escape-decodes the `eos`
-/// argument and routes it to `pasynOctet->setInputEos`/`setOutputEos`. Here
-/// the EOS is port-wide (the interpose stack owns it), so the C `addr` is
-/// accepted for command-line compatibility but not routed — single-address
-/// octet ports (serial/IP/prologix) address 0. The driver enforces the
-/// 2-byte terminator limit and reports `illegal eoslen N`, so no length
-/// check is duplicated here (single owner of the limit).
+/// C parity: `asynShellCommands.c::asynSetEos` (:222-260) escape-decodes the
+/// `eos` argument, `connectDevice`s its `asynUser` to `(portName, addr)` through
+/// `findInterface` (:79-80, :233-234) and routes the bytes to
+/// `pasynOctet->setInputEos`/`setOutputEos` — which read the addr off that user
+/// to pick the device's terminator. The addr is threaded here for the same
+/// reason: EOS is per device (see [`crate::port::eos_device_key`]).
+///
+/// The driver enforces the 2-byte terminator limit and reports
+/// `illegal eoslen N`, so no length check is duplicated here (single owner of
+/// the limit).
 fn asyn_set_eos(
     mgr: &Arc<PortManager>,
     ctx: &CommandContext,
@@ -192,15 +228,15 @@ fn asyn_set_eos(
         "asynOctetSetOutputEos"
     };
     let port = arg_str(args, 0).ok_or_else(|| "portName required".to_string())?;
-    let _addr = arg_int(args, 1).unwrap_or(0);
+    let addr = arg_int(args, 1).unwrap_or(0) as i32;
     let eos = raw_from_escaped(&arg_str(args, 2).unwrap_or_default());
     match mgr.find_port_handle(&port) {
         Ok(handle) => {
-            // The shell's own user ([`shell_eos_user`]). This is the *shell*
-            // command; the record's IEOS/OEOS put is queued at Low priority with
-            // no waiver (asynRecord.c:1296) and stays refused on a disconnected
-            // port. (`_addr` stays unused here, as before.)
-            let user = shell_eos_user();
+            // The shell's own user ([`shell_eos_user`]), carrying the device the
+            // command named. This is the *shell* command; the record's IEOS/OEOS
+            // put is queued at Low priority with no waiver (asynRecord.c:1296)
+            // and stays refused on a disconnected port.
+            let user = shell_eos_user(addr);
             let res = if set_input {
                 handle.set_input_eos_blocking(user, &eos)
             } else {
@@ -208,6 +244,42 @@ fn asyn_set_eos(
             };
             if let Err(e) = res {
                 ctx.println(&format!("{cmd}: {e}"));
+            }
+        }
+        Err(e) => ctx.println(&format!("{cmd}: {e}")),
+    }
+    Ok(CommandOutcome::Continue)
+}
+
+/// Shared body of `asynOctetGetInputEos` / `asynOctetGetOutputEos` — C
+/// `asynShowEos` (asynShellCommands.c:283-309), the readback twin of
+/// [`asyn_set_eos`]: same `(portName, addr)` device selection, same shell user,
+/// and on success it prints the terminator back escaped and quoted (:303-307).
+fn asyn_show_eos(
+    mgr: &Arc<PortManager>,
+    ctx: &CommandContext,
+    args: &[ArgValue],
+    get_input: bool,
+) -> CommandResult {
+    let cmd = if get_input {
+        "asynOctetGetInputEos"
+    } else {
+        "asynOctetGetOutputEos"
+    };
+    let port = arg_str(args, 0).ok_or_else(|| "portName required".to_string())?;
+    let addr = arg_int(args, 1).unwrap_or(0) as i32;
+    match mgr.find_port_handle(&port) {
+        Ok(handle) => {
+            let user = shell_eos_user(addr);
+            let res = if get_input {
+                handle.get_input_eos_blocking(user)
+            } else {
+                handle.get_output_eos_blocking(user)
+            };
+            match res {
+                // C `printf("\"%s\"\n", cbuf)` over the escaped terminator.
+                Ok(eos) => ctx.println(&format!("\"{}\"", escaped_from_raw(&eos))),
+                Err(e) => ctx.println(&format!("Get EOS failed: {e}")),
             }
         }
         Err(e) => ctx.println(&format!("{cmd}: {e}")),
@@ -413,6 +485,54 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
             ],
             "asynOctetSetOutputEos portName addr eos - set the port output EOS (e.g. \"\\r\\n\")",
             move |args: &[ArgValue], ctx: &CommandContext| asyn_set_eos(&mgr_r, ctx, args, false),
+        ));
+    }
+
+    // asynOctetGetInputEos portName addr ----------------------------------
+    //
+    // C `asynOctetGetInputEos` (asynShellCommands.c:532-536) → `asynShowEos`,
+    // the readback the operator uses to see which terminator a device actually
+    // ended up with. It answers per (port, addr), like the setter.
+    {
+        let mgr_r = mgr.clone();
+        out.push(CommandDef::new(
+            "asynOctetGetInputEos",
+            vec![
+                ArgDesc {
+                    name: "portName",
+                    arg_type: ArgType::String,
+                    optional: false,
+                },
+                ArgDesc {
+                    name: "addr",
+                    arg_type: ArgType::Int,
+                    optional: false,
+                },
+            ],
+            "asynOctetGetInputEos portName addr - print the device's input EOS",
+            move |args: &[ArgValue], ctx: &CommandContext| asyn_show_eos(&mgr_r, ctx, args, true),
+        ));
+    }
+
+    // asynOctetGetOutputEos portName addr ---------------------------------
+    {
+        let mgr_r = mgr.clone();
+        out.push(CommandDef::new(
+            "asynOctetGetOutputEos",
+            vec![
+                ArgDesc {
+                    name: "portName",
+                    arg_type: ArgType::String,
+                    optional: false,
+                },
+                ArgDesc {
+                    name: "addr",
+                    arg_type: ArgType::Int,
+                    optional: false,
+                },
+            ],
+            "asynOctetGetOutputEos portName addr - print the device's output EOS",
+            move |args: &[ArgValue], ctx: &CommandContext| asyn_show_eos(&mgr_r, ctx, args, false),
         ));
     }
 
@@ -1101,11 +1221,11 @@ mod tests {
         // succeeds) — we count one CommandDef per C-side function.
         assert_eq!(
             cmds.len(),
-            13,
+            15,
             "asyn iocsh command set: asynReport, asynSetOption, \
-             asynOctetSet{{Input,Output}}Eos, asynInterposeEcho, \
-             asynInterposeDelay, the four trace mutators, and the three \
-             drvAsyn*PortConfigure port-creation commands"
+             asynOctetSet{{Input,Output}}Eos, asynOctetGet{{Input,Output}}Eos, \
+             asynInterposeEcho, asynInterposeDelay, the four trace mutators, \
+             and the three drvAsyn*PortConfigure port-creation commands"
         );
         assert!(set_trace_mask.args.len() == 3);
 
@@ -1186,7 +1306,7 @@ mod tests {
     /// the single owner of the value, so the two cannot disagree again.
     #[test]
     fn the_eos_shell_commands_carry_cs_two_second_io_timeout() {
-        let user = shell_eos_user();
+        let user = shell_eos_user(0);
         assert_eq!(
             user.timeout,
             Duration::from_secs(2),
@@ -1293,6 +1413,118 @@ mod tests {
             Some(&[b'\n'][..]),
             "output EOS must reach the driver as decoded LF"
         );
+    }
+
+    /// R14-48: the `addr` argument names the device whose terminator is being
+    /// set. C threads it into `findInterface(portName, addr, ...)`, which
+    /// `connectDevice`s the queued `asynUser` to that device
+    /// (asynShellCommands.c:79-80, :233-234) — so `setInputEos` lands on that
+    /// device's EOS. iocsh parsed the addr and dropped it, so every
+    /// `asynOctetSetInputEos port <addr> ...` wrote device 0's.
+    ///
+    /// Driven end to end through the real EOS storage (no recording stub): set
+    /// two addrs, read both back with the `asynOctetGetInputEos` twin
+    /// (C `asynShowEos`, :283-309).
+    #[test]
+    fn iocsh_eos_commands_address_the_device_the_addr_names() {
+        struct MultiPort {
+            base: PortDriverBase,
+        }
+        impl PortDriver for MultiPort {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+        }
+
+        let mgr = Arc::new(PortManager::new());
+        mgr.register_port(MultiPort {
+            base: PortDriverBase::new(
+                "eos_multi",
+                4,
+                PortFlags {
+                    multi_device: true,
+                    ..PortFlags::default()
+                },
+            ),
+        })
+        .unwrap();
+
+        let ctx = make_ctx();
+        let cmds = build_asyn_commands(mgr.clone());
+        let run = |name: &str, args: Vec<ArgValue>| {
+            cmds.iter()
+                .find(|c| c.name == name)
+                .unwrap_or_else(|| panic!("{name} must be registered"))
+                .handler
+                .call(&args, &ctx)
+                .expect("handler returns Ok");
+        };
+
+        run(
+            "asynOctetSetInputEos",
+            vec![
+                ArgValue::String("eos_multi".into()),
+                ArgValue::Int(1),
+                ArgValue::String(r"\r\n".into()),
+            ],
+        );
+        run(
+            "asynOctetSetInputEos",
+            vec![
+                ArgValue::String("eos_multi".into()),
+                ArgValue::Int(2),
+                ArgValue::String(r"\n".into()),
+            ],
+        );
+
+        // Each device holds the terminator its own command named. With the addr
+        // dropped, both writes landed on one entry and addr 2 would report
+        // "\r\n" (or addr 1 would report "\n" — whichever ran last).
+        let handle = mgr.find_port_handle("eos_multi").unwrap();
+        let eos_at = |addr: i32| {
+            handle
+                .get_input_eos_blocking(shell_eos_user(addr))
+                .expect("readback")
+        };
+        assert_eq!(eos_at(1), b"\r\n");
+        assert_eq!(eos_at(2), b"\n");
+        assert!(
+            eos_at(3).is_empty(),
+            "a device nobody configured has no terminator"
+        );
+
+        // The readback command (C `asynShowEos`) runs against the same device.
+        // Its escaped output goes to the shell's stdout, which the test harness
+        // cannot capture; `escaped_from_raw` is covered on its own below.
+        run(
+            "asynOctetGetInputEos",
+            vec![ArgValue::String("eos_multi".into()), ArgValue::Int(1)],
+        );
+        run(
+            "asynOctetGetOutputEos",
+            vec![ArgValue::String("eos_multi".into()), ArgValue::Int(2)],
+        );
+    }
+
+    /// C `asynShowEos` prints the terminator back through
+    /// `epicsStrnEscapedFromRaw` (asynShellCommands.c:305) — so an EOS set as
+    /// `"\r\n"` reads back as `"\r\n"`, not as two invisible control bytes.
+    #[test]
+    fn escaped_from_raw_is_the_inverse_of_raw_from_escaped() {
+        assert_eq!(escaped_from_raw(b"\r\n"), r"\r\n");
+        assert_eq!(escaped_from_raw(b"\x01"), r"\x01");
+        assert_eq!(escaped_from_raw(b"ab"), "ab");
+        assert_eq!(escaped_from_raw(b""), "");
+        for s in [r"\r\n", r"\t", r"\x1b", "ab"] {
+            assert_eq!(
+                escaped_from_raw(&raw_from_escaped(s)),
+                s,
+                "escape/unescape must round-trip"
+            );
+        }
     }
 
     /// R8-49: C registers `asynInterposeEcho` with iocsh

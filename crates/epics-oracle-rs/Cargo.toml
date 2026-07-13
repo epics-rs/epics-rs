@@ -1,0 +1,29 @@
+[package]
+name = "epics-oracle-rs"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Differential oracle harness: boots the C softIoc and the Rust IOC on the same .db and diffs observable CA behavior"
+publish = false
+
+[dependencies]
+epics-base-rs = { workspace = true }
+epics-ca-rs = { workspace = true }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+
+[[bin]]
+name = "oracle"
+path = "src/bin/oracle.rs"
+
+# The Rust side of the differential pair: loads a .db, binds CA on :0, prints
+# the bound port on stdout. Spawned as a subprocess by the harness so both
+# IOCs are driven through the identical external instrument (the C CA tools).
+[[bin]]
+name = "oracle-ioc"
+path = "src/bin/oracle_ioc.rs"

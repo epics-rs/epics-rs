@@ -1010,13 +1010,14 @@ impl PvDatabase {
         };
         let (src_putf, src_alarm) = {
             let instance = rec.read().await;
+            // sseq's WAITn puts run from its async machine while the record
+            // is still PACT — C `sseqRecord.c` issues `dbPutLink` in
+            // `processCallback` (:734/756/787) and commits the alarm only in
+            // `asyncFinish` (`recGblResetAlarms`, :471). The put therefore
+            // inherits the source's PENDING alarm.
             (
                 instance.common.putf,
-                super::links::LinkAlarm {
-                    stat: instance.common.stat,
-                    sevr: instance.common.sevr,
-                    amsg: instance.common.amsg.clone(),
-                },
+                super::links::LinkAlarm::pending(&instance.common),
             )
         };
         let (waitset, completion) = Self::new_put_notify();
@@ -2737,31 +2738,6 @@ impl PvDatabase {
                 instance.common.tse = -2;
             }
 
-            // dfanout drives its OUT links HERE — C `dfanoutRecord.c:127-146`
-            // runs `push_values` between `checkAlarms` and (in `monitor`)
-            // `recGblResetAlarms`, gating the push on the pending `nsev`. A
-            // failed `dbPutLink` raises LINK_ALARM/MAJOR (line 312), and a
-            // Specified `seln` out of range raises SOFT_ALARM/INVALID (line
-            // 317), both into that pending `nsev` — so the write alarm folds
-            // into THIS cycle's committed SEVR and its VAL monitor post. The
-            // fanout/seq multi-out dispatch stays in the forward-link tail:
-            // they drive no value and raise no write alarm. The OUT writes
-            // need this record's lock released (a self/cyclic OUT link would
-            // otherwise deadlock on the non-reentrant gate, exactly as the
-            // tail dispatch already runs unlocked), so release `instance`,
-            // dispatch, then re-acquire before the commit below.
-            if instance.record.record_type() == "dfanout" {
-                let pending_sevr = instance.common.nsev;
-                drop(instance);
-                let push_alarm = self
-                    .dispatch_multi_output(&rec, Some(pending_sevr), visited, depth)
-                    .await;
-                instance = rec.write().await;
-                if let Some((stat, sevr)) = push_alarm {
-                    crate::server::recgbl::rec_gbl_set_sevr(&mut instance.common, stat, sevr);
-                }
-            }
-
             // IVOA gate severity for a redirected SIMM output. C decides
             // `if (prec->nsev < INVALID_ALARM)` at the `writeValue` call
             // (aoRecord.c:197) using the severity `checkAlarms` produced —
@@ -2829,12 +2805,27 @@ impl PvDatabase {
                 );
             }
 
-            // IVOA check for output records with INVALID alarm. Gate on the
-            // real (pre-SIMM) severity `real_sev` snapshotted above — C decides
-            // IVOA from `prec->nsev` at the `writeValue` call, before
-            // `writeValue` raises SIMM_ALARM, so a `SIMS=INVALID` simulation
-            // severity does not trigger the veto (the committed `sevr` may be
-            // INVALID from SIMM while the record's own alarm is not).
+            // **The IVOA owner** — the single site that decides what an INVALID
+            // cycle does with its outputs, for EVERY output path of this
+            // record: its own OUT, the SIOL redirect, the generic multi-output
+            // pairs, and the dfanout `OUTn` push. Each of those consumes the
+            // decision (`skip_out`, plus the IVOV the record has by then
+            // stored in its own output field); none re-derives it.
+            //
+            // C makes the decision exactly once, BEFORE any output — at the
+            // `writeValue` call (`if (prec->nsev < INVALID_ALARM)`,
+            // aoRecord.c:197) and at dfanout's push (`dfanoutRecord.c:128`).
+            // An output path that re-reads `nsev` after the writes have begun
+            // reads an alarm the writes THEMSELVES raised (a failed put's
+            // LINK_ALARM/INVALID, dbLink.c:444-446) and acts on a decision C
+            // never made — e.g. overwriting VAL with IVOV on a cycle whose only
+            // INVALID came from the failed push.
+            //
+            // Gate on the real (pre-SIMM) severity `real_sev` snapshotted above
+            // — C decides IVOA before `writeValue` raises SIMM_ALARM, so a
+            // `SIMS=INVALID` simulation severity does not trigger the veto (the
+            // committed `sevr` may be INVALID from SIMM while the record's own
+            // alarm is not).
             let skip_out = if real_sev == crate::server::record::AlarmSeverity::Invalid {
                 let ivoa = instance
                     .record
@@ -3099,11 +3090,7 @@ impl PvDatabase {
                 // is the point in the cycle C reads them, before the commit.
                 let src_putf = instance.common.putf;
                 let src_notify = instance.notify.clone();
-                let src_alarm = super::links::LinkAlarm {
-                    stat: instance.common.nsta,
-                    sevr: instance.common.nsev,
-                    amsg: instance.common.namsg.clone(),
-                };
+                let src_alarm = super::links::LinkAlarm::pending(&instance.common);
                 drop(instance);
                 let src = super::links::OutLinkSrc {
                     putf: src_putf,
@@ -3119,13 +3106,34 @@ impl PvDatabase {
                     let mut inst = rec.write().await;
                     inst.record.on_output_complete();
                 }
-                self.dispatch_multi_output_values(&rec, src, visited, depth)
+                self.dispatch_multi_output_values(&rec, src, skip_out, visited, depth)
                     .await;
-                self.write_simulated_output_siol(&rec, &sim_output, skip_out)
+                // The value-putting multi-output records — dfanout `OUTn`, seq
+                // `LNKn` — push HERE, with the record's other outputs, so the
+                // whole output stage sits between `checkAlarms` and the alarm
+                // commit exactly as C's does (`dfanoutRecord.c:128-146`
+                // push_values → monitor; `seqRecord.c:264` dbPutLink →
+                // asyncFinish's `recGblResetAlarms`, :227). A failed put's
+                // LINK_ALARM therefore folds into THIS cycle's committed SEVR,
+                // and the push reads the VAL the IVOA owner already settled.
+                // The fanout dispatch stays in the forward-link tail: its
+                // `LNKn` are `DBF_FWDLINK` (dbScanFwdLink), driving no value.
+                let push_alarm = self
+                    .dispatch_multi_output(
+                        &rec,
+                        super::links::MultiOutPhase::Output { skip_out },
+                        visited,
+                        depth,
+                    )
+                    .await;
+                self.write_simulated_output_siol(&rec, &sim_output, skip_out, src, visited, depth)
                     .await;
                 self.execute_process_actions(name, &rec, link_writes, visited, depth)
                     .await;
                 instance = rec.write().await;
+                if let Some((stat, sevr)) = push_alarm {
+                    crate::server::recgbl::rec_gbl_set_sevr(&mut instance.common, stat, sevr);
+                }
             }
 
             // C `monitor()`: `recGblResetAlarms` transfers nsta/nsev ->
@@ -3449,12 +3457,21 @@ impl PvDatabase {
         visited: &mut std::collections::HashSet<String>,
         depth: usize,
     ) {
-        // 4.5. Multi-output dispatch (fanout/seq). dfanout dispatches
-        // pre-commit in `process_record_with_links_inner` so its OUT-link
-        // write failure folds LINK_ALARM/MAJOR into the same-cycle SEVR
-        // (C `dfanoutRecord.c` push_values runs before `recGblResetAlarms`);
-        // the `None` phase argument skips dfanout here.
-        let _ = self.dispatch_multi_output(rec, None, visited, depth).await;
+        // 4.5. Multi-output dispatch, forward-link phase: fanout only. Its
+        // `LNK0..LNKF` are `DBF_FWDLINK` — `dbScanFwdLink`, no value, no put
+        // status, so the tail is where they belong. dfanout `OUTn` and seq
+        // `LNKn` carry a value through `dbPutLink` and dispatch pre-commit in
+        // `process_record_with_links_inner`, so a failed put's LINK_ALARM
+        // folds into the same cycle's SEVR; the `ForwardLink` phase argument
+        // skips them here (`multi_out_phase_of`).
+        let _ = self
+            .dispatch_multi_output(
+                rec,
+                super::links::MultiOutPhase::ForwardLink,
+                visited,
+                depth,
+            )
+            .await;
 
         // 4.55. event record: post the named software event.
         self.dispatch_event_record(rec).await;
@@ -3711,8 +3728,11 @@ impl PvDatabase {
                 ProcessAction::WriteDbLink { link_field, value } => {
                     // 1. Get the link string (record fields → common fields)
                     // and the source PUTF for processTarget propagation,
-                    // plus the committed alarm for `recGblInheritSevrMsg`
-                    // MS-class propagation into the OUT-link target.
+                    // plus the PENDING alarm for `recGblInheritSevrMsg`
+                    // MS-class propagation into the OUT-link target — this
+                    // write stage runs before the cycle's
+                    // `rec_gbl_reset_alarms`, exactly where C reads
+                    // `psrce->nsta/nsev/namsg` ([`LinkAlarm::pending`]).
                     let (link_str, src_putf, src_notify, src_alarm) = {
                         let instance = rec.read().await;
                         let link = instance
@@ -3729,11 +3749,7 @@ impl PvDatabase {
                             link,
                             instance.common.putf,
                             instance.notify.clone(),
-                            super::links::LinkAlarm {
-                                stat: instance.common.stat,
-                                sevr: instance.common.sevr,
-                                amsg: instance.common.amsg.clone(),
-                            },
+                            super::links::LinkAlarm::pending(&instance.common),
                         )
                     };
                     if link_str.is_empty() {
@@ -3842,11 +3858,7 @@ impl PvDatabase {
                         (
                             link,
                             instance.common.putf,
-                            super::links::LinkAlarm {
-                                stat: instance.common.stat,
-                                sevr: instance.common.sevr,
-                                amsg: instance.common.amsg.clone(),
-                            },
+                            super::links::LinkAlarm::pending(&instance.common),
                         )
                     };
                     // Mint the re-entry token BEFORE issuing the put so a
@@ -4101,11 +4113,7 @@ impl PvDatabase {
                 // the non-reentrant gate) and re-taken for the commit.
                 let src_putf = instance.common.putf;
                 let src_notify = instance.notify.clone();
-                let src_alarm = super::links::LinkAlarm {
-                    stat: instance.common.nsta,
-                    sevr: instance.common.nsev,
-                    amsg: instance.common.namsg.clone(),
-                };
+                let src_alarm = super::links::LinkAlarm::pending(&instance.common);
                 drop(instance);
                 let src = super::links::OutLinkSrc {
                     putf: src_putf,
@@ -4117,7 +4125,7 @@ impl PvDatabase {
                     self.write_out_link_value(&rec, link, out_val.clone(), src, visited, depth)
                         .await;
                 }
-                self.dispatch_multi_output_values(&rec, src, visited, depth)
+                self.dispatch_multi_output_values(&rec, src, skip_out, visited, depth)
                     .await;
                 instance = rec.write().await;
             }
@@ -4298,13 +4306,20 @@ impl PvDatabase {
         // (dbLink.c:434-448). Only the fanout/seq dispatch and the FLNK tail
         // remain here.
 
-        // Multi-output dispatch (fanout/seq). This is the async-device
-        // write-completion path; dfanout has no device support so it never
-        // completes async — its OUT links are driven pre-commit on the
-        // synchronous process path. Pass `None` (tail phase): a dfanout
-        // reaching here would be skipped, which is correct (it has already
-        // dispatched, or never had a value to push).
-        let _ = self.dispatch_multi_output(&rec, None, visited, depth).await;
+        // Multi-output dispatch, forward-link phase (fanout). This is the
+        // async-device write-completion path; neither dfanout nor seq has
+        // device support, so neither completes async — their value-carrying
+        // links are driven pre-commit on the synchronous process path. The
+        // `ForwardLink` phase skips them here, which is correct: they have
+        // already dispatched.
+        let _ = self
+            .dispatch_multi_output(
+                &rec,
+                super::links::MultiOutPhase::ForwardLink,
+                visited,
+                depth,
+            )
+            .await;
 
         // event record: post the named software event.
         self.dispatch_event_record(&rec).await;
@@ -4505,85 +4520,22 @@ impl PvDatabase {
         }
     }
 
-    /// Write a simulation value to an output record's SIOL link,
-    /// dispatching by link type and locality exactly as C `dbPutLink`
-    /// (reached from `writeValue` for a SIMM-mode output record):
-    ///
-    /// - a **local DB** target uses the already-locked write — writing
-    ///   VAL is an internal step of this record's processing chain,
-    ///   which already holds the entry record's advisory write gate, so
-    ///   a SIOL pointing back at a chain record must not re-acquire the
-    ///   non-reentrant gate (same reasoning as `write_db_link_value`);
-    /// - a **non-local DB** target (`dbInitLink` made it a CA link) and
-    ///   an explicit **`Ca`/`Pva`** link route through the lset put path;
-    /// - constant / hardware / none SIOL targets are not writable — no-op
-    ///   (C `dbPutLink` -> `S_db_noLSET`).
-    async fn write_sim_siol_value(
-        &self,
-        siol: &crate::server::record::ParsedLink,
-        value: EpicsValue,
-    ) -> bool {
-        match siol {
-            crate::server::record::ParsedLink::Db(link) => {
-                let pv_name = if link.field == "VAL" {
-                    link.record.clone()
-                } else {
-                    format!("{}.{}", link.record, link.field)
-                };
-                if self.has_name_no_resolve(&link.record).await {
-                    match self.put_pv_already_locked(&pv_name, value).await {
-                        Ok(()) => false,
-                        Err(e) => {
-                            eprintln!("SIOL simulation write to '{pv_name}' failed: {e}");
-                            true
-                        }
-                    }
-                } else {
-                    match self
-                        .write_external_pv(
-                            &pv_name,
-                            value,
-                            crate::server::database::LinkPutOp::Plain,
-                        )
-                        .await
-                    {
-                        Ok(()) => false,
-                        Err(e) => {
-                            eprintln!(
-                                "SIOL simulation write to external PV '{pv_name}' failed: {e}"
-                            );
-                            true
-                        }
-                    }
-                }
-            }
-            crate::server::record::ParsedLink::Ca(_)
-            | crate::server::record::ParsedLink::Pva(_)
-            | crate::server::record::ParsedLink::PvaJson(_) => {
-                let name = siol
-                    .external_pv_name()
-                    .expect("Ca/Pva/PvaJson link carries a PV name");
-                match self
-                    .write_external_pv(&name, value, crate::server::database::LinkPutOp::Plain)
-                    .await
-                {
-                    Ok(()) => false,
-                    Err(e) => {
-                        eprintln!("SIOL simulation write to external PV '{name}' failed: {e}");
-                        true
-                    }
-                }
-            }
-            // Not a writable target — C `dbPutLink` → `S_db_noLSET`, which
-            // does NOT alarm.
-            _ => false,
-        }
-    }
-
     /// Apply the SIMM-mode OUTPUT redirect (the `writeValue` half of
     /// simulation). C `writeValue` substitutes the device write with
-    /// `dbPutLink(&prec->siol, ..., &prec->oval)` at the END of `process()`,
-    /// so this runs from the OUT epilogue after the body computed OVAL/RVAL.
+    /// `dbPutLink(&prec->siol, DBR_DOUBLE, &prec->oval, 1)` (aoRecord.c:574,
+    /// `DBR_LONG`/`&prec->rval` in SIMM=RAW at :577), so this runs from the OUT
+    /// epilogue after the body computed OVAL/RVAL.
+    ///
+    /// SIOL is a `DBF_OUTLINK` (aoRecord.dbd) driven by the SAME `dbPutLink`
+    /// as the record's OUT: it is not a bare field poke. Routing it through
+    /// [`Self::write_out_link_value`] — the put owner — is what gives the
+    /// simulated write everything C's `dbDbPutValue` (dbDbLink.c:372-393) does
+    /// and the old open-coded `put_pv_already_locked` did not: MS-class alarm
+    /// inheritance into the SIOL target, `PP`/`.PROC` `processTarget`, PUTF and
+    /// put-notify propagation — and the failed-put `LINK_ALARM`/`INVALID`
+    /// raised BY the owner rather than by this caller (which violated
+    /// `write_out_link_value`'s own single-raise invariant).
+    ///
     /// `sim_output` is `None` for a non-simulated record or a simulated INPUT
     /// (whose `readValue` ran up-front); `skip_out` carries the IVOA
     /// Don't_drive veto so the SIOL write is suppressed exactly as the real
@@ -4598,6 +4550,9 @@ impl PvDatabase {
         rec: &Arc<RwLock<RecordInstance>>,
         sim_output: &Option<(crate::server::record::ParsedLink, i16, bool)>,
         skip_out: bool,
+        src: super::links::OutLinkSrc<'_>,
+        visited: &mut std::collections::HashSet<String>,
+        depth: usize,
     ) {
         let Some((siol, _sims, raw_mode)) = sim_output else {
             return;
@@ -4623,15 +4578,18 @@ impl PvDatabase {
             }
         };
         if let Some(value) = value {
-            // C `writeValue` performs the SIOL redirect through `dbPutLink`,
-            // whose `setLinkAlarm` raises LINK_ALARM/INVALID on THIS record
-            // when the put fails (dbLink.c:444-446) — the simulated write is
-            // not exempt. It runs pre-commit like every other output of the
-            // cycle, so the alarm reaches this cycle's committed SEVR.
-            if self.write_sim_siol_value(siol, value).await {
-                let mut instance = rec.write().await;
-                crate::server::recgbl::rec_gbl_set_link_alarm(&mut instance.common, "SIOL");
-            }
+            self.write_out_link_value(
+                rec,
+                siol,
+                value,
+                super::links::OutLinkSrc {
+                    field: "SIOL",
+                    ..src
+                },
+                visited,
+                depth,
+            )
+            .await;
         }
     }
 

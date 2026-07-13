@@ -69,6 +69,43 @@ pub(crate) struct LinkAlarm {
     pub amsg: String,
 }
 
+impl LinkAlarm {
+    /// The record's PENDING alarm (`nsta`/`nsev`/`namsg`) — what an OUT-link
+    /// put inherits into its target. C `dbDbPutValue` calls
+    /// `recGblInheritSevrMsg(..., pdest, psrce->nsta, psrce->nsev,
+    /// psrce->namsg)` (dbDbLink.c:382-383): `dbPutLink` runs from inside the
+    /// source's `process()`, BEFORE `recGblResetAlarms` commits the cycle, so
+    /// the alarm the source raised THIS cycle is still only pending. Reading
+    /// the committed `stat`/`sevr` here would carry the PREVIOUS cycle's
+    /// severity to every MS-class target.
+    ///
+    /// EVERY OUT-link put site uses this: the record's own OUT, the generic
+    /// multi-output pairs, the fanout/dfanout/seq dispatch, the `WriteDbLink`
+    /// / `WriteDbLinkNotify` process actions, and sseq's `put_link_notify`
+    /// (sseqRecord.c: `dbPutLink` in `processCallback`, `recGblResetAlarms` in
+    /// `asyncFinish` — the puts still precede the commit).
+    pub(crate) fn pending(common: &crate::server::record::CommonFields) -> Self {
+        LinkAlarm {
+            stat: common.nsta,
+            sevr: common.nsev,
+            amsg: common.namsg.clone(),
+        }
+    }
+
+    /// The record's COMMITTED alarm (`stat`/`sevr`/`amsg`) — what an INPUT
+    /// link read inherits from the record it read. C `dbDbGetValue` calls
+    /// `recGblInheritSevrMsg(..., dbChannelRecord(chan)->stat, ->sevr,
+    /// ->amsg)` (dbDbLink.c:229-232): the source there is a foreign record
+    /// that finished its own cycle, so its alarm is the committed one.
+    pub(crate) fn committed(common: &crate::server::record::CommonFields) -> Self {
+        LinkAlarm {
+            stat: common.stat,
+            sevr: common.sevr,
+            amsg: common.amsg.clone(),
+        }
+    }
+}
+
 /// Apply C `recGblInheritSevrMsg` (recGbl.c:263-281) for one MS-class
 /// link: fold the link source's alarm (`src`) into the destination
 /// record's PENDING alarm (`dest`) per the maximize-severity mode `ms`.
@@ -205,6 +242,56 @@ impl MultiOut {
 /// removed at one call site.
 pub(crate) fn multi_output_dispatch_owned(record_type: &str) -> bool {
     matches!(record_type, "fanout" | "dfanout" | "seq")
+}
+
+/// Which phase of a process cycle a multi-output record's links belong to.
+///
+/// The phase follows from what the links ARE, not from the record's name:
+///
+/// * A record whose links carry a VALUE (`dbPutLink`) — dfanout `OUTn`
+///   (`dfanoutRecord.c:323`), seq `LNKn` (`seqRecord.c:264`) — dispatches
+///   PRE-commit, because C issues those puts from inside `process()` /
+///   `processCallback`, before `recGblResetAlarms` commits the cycle
+///   (dfanout: `monitor()`, seq: `asyncFinish`, seqRecord.c:227). A failed
+///   put's `LINK_ALARM`/`INVALID` and a `SELN`-out-of-range
+///   `SOFT_ALARM`/`INVALID` must therefore land in the alarm THIS cycle
+///   commits and posts.
+/// * A record whose links only SCAN a target — fanout `LNK0..LNKF` are
+///   `DBF_FWDLINK` (`fanoutRecord.dbd`), dispatched via `dbScanFwdLink`
+///   (`fanoutRecord.c:110/121/138`) — dispatches in the post-commit
+///   forward-link tail: no value, no put status, no alarm to fold.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MultiOutPhaseKind {
+    Output,
+    ForwardLink,
+}
+
+/// The phase argument of [`PvDatabase::dispatch_multi_output`]. The `Output`
+/// variant carries `skip_out` — the IVOA=Don't_drive veto as decided by the
+/// cycle's single IVOA owner (`process_record_with_links_inner`), on the
+/// severity `checkAlarms` produced. That is the one decision C makes
+/// (`dfanoutRecord.c:128`: `if (prec->nsev < INVALID_ALARM) push_values();
+/// else switch (ivoa)`), taken before ANY output runs; the IVOA=IVOV arm has
+/// already stored IVOV in the record's own value field
+/// ([`Record::apply_invalid_output_value`] — C `prec->val = prec->ivov`,
+/// dfanoutRecord.c:137), so the push here just reads VAL, as C's `push_values`
+/// does.
+#[derive(Clone, Copy)]
+pub(crate) enum MultiOutPhase {
+    Output { skip_out: bool },
+    ForwardLink,
+}
+
+/// The phase a record type's multi-output links belong to — see
+/// [`MultiOutPhaseKind`]. Both call sites (the pre-commit output stage and
+/// the forward-link tail) run `dispatch_multi_output` unconditionally and
+/// this single classifier decides which types act, so a record cannot be
+/// dispatched in both phases or in neither.
+pub(crate) fn multi_out_phase_of(record_type: &str) -> MultiOutPhaseKind {
+    match record_type {
+        "dfanout" | "seq" => MultiOutPhaseKind::Output,
+        _ => MultiOutPhaseKind::ForwardLink,
+    }
 }
 
 impl PvDatabase {
@@ -438,11 +525,7 @@ impl PvDatabase {
                 // an alias still propagates MS/NMS alarm correctly.
                 let alarm = if let Some(rec) = self.get_record(&db.record).await {
                     let inst = rec.read().await;
-                    Some(LinkAlarm {
-                        stat: inst.common.stat,
-                        sevr: inst.common.sevr,
-                        amsg: inst.common.amsg.clone(),
-                    })
+                    Some(LinkAlarm::committed(&inst.common))
                 } else {
                     None
                 };
@@ -797,12 +880,13 @@ impl PvDatabase {
 
         // C `dbDbPutValue` (dbDbLink.c:382-383) folds the SOURCE
         // record's alarm into the destination via `recGblInheritSevrMsg`,
-        // AFTER the `dbPut` and BEFORE `processTarget`. In this port the
-        // source's per-cycle alarm has already been committed by
-        // `rec_gbl_reset_alarms` before the OUT link dispatches, so
-        // `src_alarm` carries the source's *committed* stat/sevr/amsg —
-        // the same values C reads from the still-pending nsta/nsev/namsg
-        // at its (earlier) synchronous `writeValue` point. The inherited
+        // AFTER the `dbPut` and BEFORE `processTarget`. The fields C reads
+        // there are `psrce->nsta/nsev/namsg` — the source's PENDING alarm,
+        // because the put runs inside the source's `process()`, before its
+        // `recGblResetAlarms`. Every OUT-put site in this port drives its
+        // writes in that same pre-commit window and hands them
+        // [`LinkAlarm::pending`]; a committed snapshot would carry the
+        // PREVIOUS cycle's severity. The inherited
         // severity lands in the dest's PENDING nsev/nsta(/namsg for MSS);
         // the dest commits it on its next `rec_gbl_reset_alarms` — its
         // own process cycle, reached below for a `.PROC`/`PP` link, or a
@@ -1051,11 +1135,23 @@ impl PvDatabase {
     ) -> OutTarget {
         let external = |name: String| async move {
             match self.external_link_metadata(&name).await {
-                Some(m) => OutTarget {
-                    field_type: m.dbf_type.map(link_dbf_to_field_type),
-                    element_count: m.element_count.unwrap_or(1).max(1),
-                    is_ca_link: true,
-                },
+                Some(m) => {
+                    let field_type = m.dbf_type.map(link_dbf_to_field_type);
+                    OutTarget {
+                        field_type,
+                        element_count: m.element_count.unwrap_or(1).max(1),
+                        is_ca_link: true,
+                        // A remote channel reports the DBR type its DBF class
+                        // is served as (`dbCaGetLinkDBFtype` → the channel's
+                        // type): a remote `DBF_MENU`/`DBF_DEVICE`/link field
+                        // arrives as `DBR_ENUM`/`DBR_STRING`, so the two wire
+                        // types ARE the string class over a CA link.
+                        puts_as_string: matches!(
+                            field_type,
+                            Some(DbFieldType::String) | Some(DbFieldType::Enum)
+                        ),
+                    }
+                }
                 None => OutTarget {
                     is_ca_link: true,
                     ..OutTarget::UNRESOLVED
@@ -1097,6 +1193,11 @@ impl PvDatabase {
                     field_type,
                     element_count: element_count.max(1),
                     is_ca_link: false,
+                    // C's `dbNameToAddr` gives the target field's DBF CLASS,
+                    // which includes `DBF_MENU` / `DBF_DEVICE` — classes the
+                    // port's DBR-typed `field_type` cannot name. The target
+                    // record classifies its own field.
+                    puts_as_string: guard.field_puts_as_string(&db.field),
                 }
             }
             crate::server::record::ParsedLink::Ca(_)
@@ -1155,29 +1256,24 @@ impl PvDatabase {
         &self,
         rec: &Arc<RwLock<RecordInstance>>,
         src: OutLinkSrc<'_>,
+        skip_out: bool,
         visited: &mut HashSet<String>,
         depth: usize,
     ) {
         let pairs = {
             let instance = rec.read().await;
-            // Framework IVOA=Don't_drive veto for the multi-output OUT path,
-            // mirroring the single-OUT `skip_out` gate: on an INVALID cycle
-            // with IVOA=Don't_drive the OUT write is suppressed (execOutput
-            // `nsev >= INVALID` → Don't_drive `break`, sCalcoutRecord.c:794).
-            // The severity C tests there is the PENDING `nsev` — this dispatch
-            // runs before the commit, so `nsev` is what it reads.
-            let ivoa_dont_drive = instance.common.nsev
-                == crate::server::record::AlarmSeverity::Invalid
-                && matches!(
-                    instance.record.get_field("IVOA"),
-                    Some(EpicsValue::Short(1))
-                );
-            let links =
-                if ivoa_dont_drive || multi_output_dispatch_owned(instance.record.record_type()) {
-                    &[][..]
-                } else {
-                    instance.record.multi_output_links()
-                };
+            // IVOA=Don't_drive veto (execOutput `nsev >= INVALID` →
+            // Don't_drive `break`, sCalcoutRecord.c:794). `skip_out` is the
+            // decision the cycle's single IVOA owner already made, on the
+            // severity `checkAlarms` produced — re-deriving it here from
+            // `nsev` would read an alarm the OUT write above may have raised
+            // itself (a failed put's LINK_ALARM/INVALID), acting on a veto C
+            // never applied.
+            let links = if skip_out || multi_output_dispatch_owned(instance.record.record_type()) {
+                &[][..]
+            } else {
+                instance.record.multi_output_links()
+            };
             let mut pairs = Vec::new();
             for &(link_field, val_field) in links {
                 let link_str = match instance.record.get_field(link_field) {
@@ -1383,59 +1479,47 @@ impl PvDatabase {
     /// (the pre-fix encoding could mis-split a link string that
     /// happened to contain an embedded NUL).
     ///
-    /// `dfanout_pending_sevr` selects the dispatch phase and carries the
-    /// severity the dfanout `push_values` decision needs:
+    /// `phase` selects the dispatch phase — see [`MultiOutPhase`]. A record
+    /// whose links do not belong to the calling phase is skipped, so each
+    /// type dispatches exactly once per cycle.
     ///
-    /// * `Some(nsev)` — the **dfanout pre-commit** phase. C
-    ///   `dfanoutRecord.c:128-146` runs `push_values` between `checkAlarms`
-    ///   and `recGblResetAlarms`, gating the push on the *pending* `nsev`
-    ///   (`if nsev < INVALID push else switch(ivoa)`), and a failed
-    ///   `dbPutLink` raises `LINK_ALARM/MAJOR` into that same `nsev`. The
-    ///   caller runs this before the alarm commit and folds the returned
-    ///   failure flag into the record's `nsev`, so the write alarm lands in
-    ///   THIS cycle's committed SEVR and its VAL monitor post.
-    /// * `None` — the **fanout/seq tail** phase (post-commit forward-link
-    ///   tail). These drive no value and raise no write alarm.
-    ///
-    /// A dfanout reached with `None`, or a fanout/seq reached with `Some`,
-    /// is skipped: each type dispatches in exactly one phase. Returns the
-    /// single pending alarm `(stat, sevr)` C `push_values` would raise this
-    /// cycle — `LINK_ALARM/MAJOR` for a failed OUT write or
-    /// `SOFT_ALARM/INVALID` for a Specified `seln` out of range — for the
-    /// caller to fold into `nsev` before the alarm commit. Always `None` for
-    /// fanout/seq (they raise their own range alarm directly, post-commit).
+    /// In the [`MultiOutPhase::Output`] phase this returns the pending alarm
+    /// `(stat, sevr)` the C record raises alongside its puts — a failed
+    /// `dbPutLink` (dfanout's own `LINK_ALARM/MAJOR`,
+    /// `dfanoutRecord.c:311-312`) or a `SELN` out of range
+    /// (`SOFT_ALARM/INVALID`, `dfanoutRecord.c:317` / `seqRecord.c:157`) —
+    /// for the caller to fold into `nsev` before the alarm commit. The
+    /// [`MultiOutPhase::ForwardLink`] phase returns `None`: a fanout raises
+    /// its range alarm directly into the already-committed SEVR.
     pub(crate) async fn dispatch_multi_output(
         &self,
         rec: &Arc<RwLock<RecordInstance>>,
-        dfanout_pending_sevr: Option<AlarmSeverity>,
+        phase: MultiOutPhase,
         visited: &mut HashSet<String>,
         depth: usize,
     ) -> Option<(u16, AlarmSeverity)> {
-        // Phase gate: dfanout drives its OUT links pre-commit (so a write
-        // failure folds into the same cycle's SEVR), fanout/seq in the
-        // forward-link tail. Skip the type that does not belong to the
-        // calling phase so each dispatches exactly once per cycle.
-        let is_dfanout = rec.read().await.record.record_type() == "dfanout";
-        if is_dfanout != dfanout_pending_sevr.is_some() {
+        // Phase gate, keyed on what the record's links ARE (see
+        // `multi_out_phase_of`), not on which argument the caller passed.
+        let record_type = rec.read().await.record.record_type().to_string();
+        let is_value_phase = matches!(phase, MultiOutPhase::Output { .. });
+        if matches!(multi_out_phase_of(&record_type), MultiOutPhaseKind::Output) != is_value_phase {
             return None;
         }
 
         // Snapshot the source record's PUTF bit + put-notify wait-set so
         // every write_db_link_value call below propagates them to its
         // target — C `dbDbLink.c::processTarget` PUTF and `dbNotifyAdd`
-        // wait-set invariants (see write_db_link_value doc). The
-        // committed alarm travels the same way for `recGblInheritSevrMsg`
-        // MS-class propagation into each OUT-link target.
+        // wait-set invariants (see write_db_link_value doc). The PENDING
+        // alarm travels the same way for `recGblInheritSevrMsg` MS-class
+        // propagation into each OUT-link target: the OUTn/LNKn puts precede
+        // the source's `recGblResetAlarms`, so C reads `psrce->nsta/nsev`
+        // here ([`LinkAlarm::pending`], dbDbLink.c:382-383).
         let (src_putf, src_notify, src_alarm) = {
             let guard = rec.read().await;
             (
                 guard.common.putf,
                 guard.notify.clone(),
-                LinkAlarm {
-                    stat: guard.common.stat,
-                    sevr: guard.common.sevr,
-                    amsg: guard.common.amsg.clone(),
-                },
+                LinkAlarm::pending(&guard.common),
             )
         };
         // One snapshot threaded to every OUT-link write below; each arm
@@ -1534,41 +1618,30 @@ impl PvDatabase {
                 "dfanout" => {
                     let selm = Self::field_i16(&instance, "SELM");
                     let seln = Self::field_u16(&instance, "SELN");
-                    // IVOA / IVOV — invalid output handling, mirrors
-                    // epics-base PR #688. When the record's pending
-                    // severity is INVALID, IVOA selects: 0 = continue (use
-                    // VAL as before), 1 = don't drive (suppress all OUT*),
-                    // 2 = set outputs to IVOV.
+                    // C `push_values` pushes `prec->val` — nothing else
+                    // (`dfanoutRecord.c:309/321/331`: `dbPutLink(plink,
+                    // DBR_DOUBLE, &prec->val, 1)`). IVOA is not re-decided
+                    // here: the cycle's IVOA owner already ran
                     //
-                    // C `dfanoutRecord.c:128` gates the push on the
-                    // *pending* `nsev` (`if (prec->nsev < INVALID_ALARM)
-                    // push_values(); else switch(ivoa)`), evaluated after
-                    // `checkAlarms` but before `recGblResetAlarms` commits
-                    // it. This dispatch runs in that same pre-commit window,
-                    // so the gate reads the caller-supplied pending
-                    // severity, not the still-stale committed `common.sevr`.
-                    let push_sevr = dfanout_pending_sevr
-                        .expect("dfanout dispatch carries the pending severity (phase gate)");
-                    let raw_val = instance.record.val();
-                    let val = if push_sevr == crate::server::record::AlarmSeverity::Invalid {
-                        let ivoa = instance
-                            .record
-                            .get_field("IVOA")
-                            .and_then(|v| {
-                                if let EpicsValue::Short(s) = v {
-                                    Some(s)
-                                } else {
-                                    None
-                                }
-                            })
-                            .unwrap_or(0);
-                        match ivoa {
-                            1 => None, // suppress drive
-                            2 => instance.record.get_field("IVOV").or(raw_val),
-                            _ => raw_val, // 0 or unknown — Continue
-                        }
-                    } else {
-                        raw_val
+                    //     case menuIvoaSet_output_to_IVOV:
+                    //         prec->val = prec->ivov;      /* :137 */
+                    //         push_values(prec);
+                    //
+                    // through `Record::apply_invalid_output_value`, so VAL
+                    // already IS IVOV when that arm was taken — and VAL, not a
+                    // second read of IVOV, is what the record posts to its own
+                    // monitors. `skip_out` is the Don't_drive veto (`:139`,
+                    // `break` — no push) from that same decision.
+                    //
+                    // Reading `nsev` here instead would re-derive the decision
+                    // AFTER the record's other outputs ran, off an alarm they
+                    // may have raised themselves.
+                    let val = match phase {
+                        MultiOutPhase::Output { skip_out: true } => None,
+                        MultiOutPhase::Output { skip_out: false } => instance.record.val(),
+                        // Unreachable: the phase gate above already returned
+                        // for a dfanout reached in the forward-link tail.
+                        MultiOutPhase::ForwardLink => return None,
                     };
                     let links: Vec<String> = DFANOUT_LINK_FIELDS
                         .iter()
@@ -1647,15 +1720,15 @@ impl PvDatabase {
 
         // C raises SOFT_ALARM/INVALID_ALARM when SELN/OFFS/SHFT resolve
         // out of range (fanoutRecord.c:116, dfanoutRecord.c:317,
-        // seqRecord.c:157). fanout/seq dispatch in the post-commit tail, so
-        // they raise it directly into the committed SEVR and post SEVR/STAT
-        // immediately (apply_selm_alarm). dfanout dispatches PRE-commit, so
-        // its out-of-range alarm must instead fold into the pending nsev the
-        // caller commits THIS cycle — captured here and returned below, not
+        // seqRecord.c:157). The value-put phase (dfanout/seq) runs PRE-commit,
+        // so its out-of-range alarm must fold into the pending nsev the caller
+        // commits THIS cycle — captured here and returned below, not
         // raised+posted now (a direct SEVR raise would be clobbered by the
-        // caller's `recGblResetAlarms`).
-        let dfanout_selm_alarm = sel.alarm;
-        if !is_dfanout {
+        // caller's `recGblResetAlarms`). A fanout dispatches in the
+        // post-commit tail and raises it directly into the committed SEVR,
+        // posting SEVR/STAT immediately (apply_selm_alarm).
+        let pending_selm_alarm = sel.alarm;
+        if !is_value_phase {
             Self::apply_selm_alarm(rec, sel.alarm).await;
         }
         let indices = sel.indices;
@@ -1863,16 +1936,18 @@ impl PvDatabase {
             }
         }
 
-        // dfanout (pre-commit phase): return the single pending alarm C
-        // `push_values` would have raised this cycle for the caller to fold
-        // into `nsev` before `recGblResetAlarms`. C raises at most one:
-        // SOFT_ALARM/INVALID for a Specified `seln` out of range (line 317,
-        // no push) OR LINK_ALARM/MAJOR for a failed dbPutLink (line
-        // 312/324/333). They are mutually exclusive in C's control flow; if
-        // both were somehow set, fold the higher severity (recGblSetSevr is
-        // raise-only). fanout/seq already applied their range alarm directly
-        // above and drive no value, so they return None.
-        if is_dfanout {
+        // Value-put phase (dfanout / seq): return the pending alarm the C
+        // record raises alongside its puts, for the caller to fold into `nsev`
+        // before `recGblResetAlarms`. C raises at most one: SOFT_ALARM/INVALID
+        // for a `seln` out of range (dfanoutRecord.c:317, seqRecord.c:157 — no
+        // push at all) OR dfanout's own LINK_ALARM/MAJOR for a failed
+        // dbPutLink (dfanoutRecord.c:312/324/333). They are mutually exclusive
+        // in C's control flow; if both were somehow set, fold the higher
+        // severity (recGblSetSevr is raise-only). `link_failed` is dfanout-only
+        // — seq's failed LNKn put raises LINK_ALARM/INVALID from inside the put
+        // owner (`write_out_link_value`), into the same pending alarm, and
+        // seqRecord.c adds nothing on top of it.
+        if is_value_phase {
             let link_alarm = if link_failed {
                 Some((
                     crate::server::recgbl::alarm_status::LINK_ALARM,
@@ -1881,7 +1956,7 @@ impl PvDatabase {
             } else {
                 None
             };
-            return match (dfanout_selm_alarm, link_alarm) {
+            return match (pending_selm_alarm, link_alarm) {
                 (Some(a), Some(b)) => Some(if (a.1 as u16) >= (b.1 as u16) { a } else { b }),
                 (a, b) => a.or(b),
             };

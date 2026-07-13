@@ -22,6 +22,23 @@ use super::record_trait::{
 };
 use super::scan::{ScanType, SimModeScan};
 
+/// Every client-visible `special(SPC_NOMOD)` field of `dbCommon.dbd:13-190`.
+///
+/// These are common fields — no record's `field_list` declares them — so the
+/// declaration names them here. The remaining `SPC_NOMOD` entries in
+/// `dbCommon.dbd` (MLOK, MLIS, BKLNK, ASP, PPN, PPNR, SPVT, RSET, DSET, DPVT,
+/// RDES, LSET, BKPT) are `DBF_NOACCESS`: they have no field API in this port at
+/// all, and C refuses them one level earlier, at `dbNameToAddr`.
+///
+/// TIME is `DBF_NOACCESS` in C too (`dbpf REC.TIME` → "failed"), but this port
+/// resolves `.TIME`, so the declaration must cover it.
+///
+/// Read only through [`RecordInstance::is_no_mod`].
+const DBCOMMON_NOMOD: &[&str] = &[
+    "NAME", "STAT", "SEVR", "AMSG", "NSTA", "NSEV", "NAMSG", "ACKS", "ACKT", "LCNT", "PACT",
+    "PUTF", "RPRO", "TIME", "UTAG",
+];
+
 /// Put-notify completion wait-set — the C `dbNotify.c` `processNotify`
 /// waitList analogue (`dbNotifyAdd` / `dbNotifyCompletion`).
 ///
@@ -747,6 +764,51 @@ impl RecordInstance {
             *guard = Some(meta.clone());
         }
         meta
+    }
+
+    /// C `dbChannelSpecial(chan) == SPC_NOMOD` — **the single owner of the
+    /// no-modify declaration**, for every consumer that needs to know whether a
+    /// field can be written.
+    ///
+    /// C declares it once, in the `.dbd`, and reads it in two unrelated places:
+    ///
+    /// * `dbPut` (`dbAccess.c:123-126`, via `dbPutSpecial(paddr, 0)`) refuses
+    ///   the write — the port's `check_no_mod` gate;
+    /// * `rsrvCheckPut` (`rsrv/camessage.c:2540-2551`) — `if
+    ///   (dbChannelSpecial(pciu->dbch) == SPC_NOMOD) return 0;` — which feeds
+    ///   the CA `ACCESS_RIGHTS` write bit (`camessage.c:1123-1124`) as well as
+    ///   both put paths, so a client sees `Access: read, no write` and never
+    ///   sends the doomed write.
+    ///
+    /// Only the first consumer existed in the port, so every dbCommon NOMOD
+    /// field advertised WRITE on the wire (`caput N1.SEVR 2` was refused
+    /// server-side, after the client had already sent it, with an async
+    /// exception instead of C's clean client-side "Write access denied").
+    ///
+    /// Three sources, one answer:
+    ///
+    /// 1. the dbCommon `SPC_NOMOD` set below — common fields, so no record's
+    ///    `field_list` declares them;
+    /// 2. [`FieldDesc::read_only`] — a record field its `.dbd` marks SPC_NOMOD;
+    /// 3. [`Record::field_no_mod`] — an SPC_NOMOD a record's `cvt_dbaddr`
+    ///    raises from its own state (compress VAL under BALG=LIFO,
+    ///    `compressRecord.c:398-407`), which a static `FieldDesc` cannot
+    ///    express.
+    ///
+    /// `field` may be any case.
+    pub fn is_no_mod(&self, field: &str) -> bool {
+        if DBCOMMON_NOMOD.iter().any(|f| f.eq_ignore_ascii_case(field)) {
+            return true;
+        }
+        if self
+            .record
+            .field_list()
+            .iter()
+            .any(|f| f.name.eq_ignore_ascii_case(field) && f.read_only)
+        {
+            return true;
+        }
+        self.record.field_no_mod(field)
     }
 
     /// Check if the record is currently processing (PACT equivalent).

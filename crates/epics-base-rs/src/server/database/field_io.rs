@@ -29,22 +29,8 @@ fn check_put_disabled(
     Ok(())
 }
 
-/// Every client-visible `special(SPC_NOMOD)` field of `dbCommon.dbd:13-190`.
-///
-/// These are common fields — no record's `field_list` declares them — so the
-/// gate names them here. The remaining `SPC_NOMOD` entries in `dbCommon.dbd`
-/// (MLOK, MLIS, BKLNK, ASP, PPN, PPNR, SPVT, RSET, DSET, DPVT, RDES, LSET,
-/// BKPT) are `DBF_NOACCESS`: they have no field API in this port at all, and C
-/// refuses them one level earlier, at `dbNameToAddr`.
-///
-/// TIME is `DBF_NOACCESS` in C too (`dbpf REC.TIME` → "failed"), but this port
-/// resolves `.TIME`, so the gate must cover it.
-const DBCOMMON_NOMOD: &[&str] = &[
-    "NAME", "STAT", "SEVR", "AMSG", "NSTA", "NSEV", "NAMSG", "ACKS", "ACKT", "LCNT", "PACT",
-    "PUTF", "RPRO", "TIME", "UTAG",
-];
-
-/// C's `dbPut` no-modify gate — **the single owner of field immutability**.
+/// C's `dbPut` no-modify gate — the put-side consumer of the SPC_NOMOD
+/// declaration.
 ///
 /// Two C rejections, both inside `dbPut` and therefore BELOW every put entry
 /// point (`dbPutField` for CA/`dbpf`, `dbPutLink` for a record's OUT link,
@@ -59,16 +45,18 @@ const DBCOMMON_NOMOD: &[&str] = &[
 ///
 /// INVARIANT: a field declared `special(SPC_NOMOD)` (or `SPC_ATTRIBUTE`) MUST
 /// NOT be modified by ANY runtime write, whatever route it arrives on — CA put,
-/// `dbpf`, QSRV, an internal `put_pv`, or a record's OUT link. The declaration
-/// is [`FieldDesc::read_only`] for a field the `.dbd` marks SPC_NOMOD, and
-/// [`Record::field_no_mod`] for one a `cvt_dbaddr` raises from record state
-/// (plus the dbCommon `SPC_NOMOD` set below, which no record's `field_list`
-/// declares); this function is the only enforcer of all three. A record's own
-/// `put_field` is NOT a gate: the
-/// hand-written array records write NELM/FTVL/NORD there because the *load*
-/// path (`dbLoadRecords` → `Record::put_field`) must set them — C likewise
-/// writes them through `dbStaticLib`'s `dbPutString`, which never crosses
-/// `dbPut`.
+/// `dbpf`, QSRV, an internal `put_pv`, or a record's OUT link. A record's own
+/// `put_field` is NOT a gate: the hand-written array records write
+/// NELM/FTVL/NORD there because the *load* path (`dbLoadRecords` →
+/// `Record::put_field`) must set them — C likewise writes them through
+/// `dbStaticLib`'s `dbPutString`, which never crosses `dbPut`.
+///
+/// The declaration itself lives in [`RecordInstance::is_no_mod`], which C
+/// exposes as `dbChannelSpecial(...) == SPC_NOMOD` and reads from TWO places:
+/// this gate (`dbPut`, dbAccess.c:123-126) and `rsrvCheckPut`
+/// (camessage.c:2540-2551), which feeds the CA ACCESS_RIGHTS write bit. This
+/// function is the first consumer; `epics-ca-rs`'s `compute_access` is the
+/// second.
 ///
 /// The one thing that legitimately changes ACKS/ACKT is C's alarm
 /// acknowledgement, and it does NOT come through here: `dbPut` dispatches on the
@@ -79,23 +67,7 @@ const DBCOMMON_NOMOD: &[&str] = &[
 ///
 /// `field` must already be upper-cased.
 fn check_no_mod(instance: &crate::server::record::RecordInstance, field: &str) -> CaResult<()> {
-    if DBCOMMON_NOMOD.contains(&field) {
-        return Err(CaError::ReadOnlyField(field.to_string()));
-    }
-    if instance
-        .record
-        .field_list()
-        .iter()
-        .any(|f| f.name.eq_ignore_ascii_case(field) && f.read_only)
-    {
-        return Err(CaError::ReadOnlyField(field.to_string()));
-    }
-    // The dynamic half of the declaration: an SPC_NOMOD a record's `cvt_dbaddr`
-    // raises from its own state rather than from the `.dbd`
-    // (`Record::field_no_mod`; compress VAL under BALG=LIFO,
-    // compressRecord.c:398-407). Same gate, same refusal — a static
-    // `FieldDesc` cannot express a per-record-state NOMOD.
-    if instance.record.field_no_mod(field) {
+    if instance.is_no_mod(field) {
         return Err(CaError::ReadOnlyField(field.to_string()));
     }
     Ok(())

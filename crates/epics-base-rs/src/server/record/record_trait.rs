@@ -1874,6 +1874,22 @@ pub trait Record: Send + Sync + 'static {
         false
     }
 
+    /// Does a soft-channel device support load this record's INP into VAL ONCE,
+    /// at init — C's `recGblInitConstantLink(&prec->inp, ...)` inside a
+    /// `devXxxSoft::init_record` (`devAiSoft.c:44-49` and siblings)?
+    ///
+    /// True for every record that HAS a dset, which is the default. `compress`
+    /// returns false: `compressRecord` declares no DTYP and ships no device
+    /// support at all, so nothing runs `recGblInitConstantLink` on its INP. C
+    /// touches that link in exactly one place — `dbGetLink` inside `process()`
+    /// (`compressRecord.c:341`), behind a `dbIsLinkConnected` gate a constant
+    /// never passes — so a constant INP reaches the record's value never, not
+    /// once. The seed owner ([`crate::server::database::processing`]'s
+    /// `seed_constant_links`) asks this before running the soft-dset load.
+    fn soft_dset_loads_inp_at_init(&self) -> bool {
+        true
+    }
+
     /// Whether this record type raises UDF_ALARM at all.
     ///
     /// C has no framework-level UDF alarm: every record that reports one does

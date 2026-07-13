@@ -5168,7 +5168,15 @@ pub(crate) fn seed_constant_links(instance: &mut RecordInstance) {
     }
 
     // 1. The soft-channel device support's INP → VAL/RVAL load.
-    if crate::server::device_support::is_soft_dtyp(&instance.common.dtyp) {
+    //
+    // Gated on the record HAVING that device support: this seed is
+    // `recGblInitConstantLink` inside a `devXxxSoft::init_record`, so a record
+    // type with no dset (`compress`) never runs it. Keying only on "the DTYP
+    // string is soft-or-empty" seeded records C leaves untouched, because a
+    // record type that declares no DTYP at all has an empty one.
+    if crate::server::device_support::is_soft_dtyp(&instance.common.dtyp)
+        && instance.record.soft_dset_loads_inp_at_init()
+    {
         let inp = crate::server::record::parse_link_v2(&instance.common.inp);
         if let Some(value) = crate::server::recgbl::simm::constant_load_value(&inp) {
             // Same sink the per-cycle soft-input apply uses, so the constant

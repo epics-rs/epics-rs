@@ -20,14 +20,13 @@ use crate::types::{DbFieldType, EpicsValue, PvString};
 /// Circular-Buffer code path.
 pub struct CompressRecord {
     pub val: Vec<f64>,
-    pub nsam: i32,   // Number of samples (buffer size)
-    pub inp: String, // input link
-    pub alg: i16,    // See top-of-struct doc — matches menuCompressALG
-    pub n: i32,      // Number of values to compress
-    pub nuse: i32,   // Number of elements used
-    pub off: i32,    // Current write offset (see `put_one` for BALG-dependent role)
-    pub res: i16,    // Reset flag
-    pub balg: i16,   // 0=FIFO, 1=LIFO — `menuBufferingALG`
+    pub nsam: i32, // Number of samples (buffer size)
+    pub alg: i16,  // See top-of-struct doc — matches menuCompressALG
+    pub n: i32,    // Number of values to compress
+    pub nuse: i32, // Number of elements used
+    pub off: i32,  // Current write offset (see `put_one` for BALG-dependent role)
+    pub res: i16,  // Reset flag
+    pub balg: i16, // 0=FIFO, 1=LIFO — `menuBufferingALG`
     /// `ILIL` (input low limit). When `ILIL < IHIL`, samples outside
     /// `[ILIL, IHIL]` are dropped before compression (C
     /// `compress_array` skip loop, compressRecord.c:163-170).
@@ -124,7 +123,6 @@ impl Default for CompressRecord {
             // there is no load-order dependency.
             val: vec![0.0; 1],
             nsam: 1,
-            inp: String::new(),
             // C `compressRecord.dbd.pod` `field(ALG,DBF_MENU){ menu(compressALG) }`
             // has no `initial(...)`, so an unset ALG defaults to menu index 0 =
             // `compressALG_N_to_1_Low_Value`, not Circular Buffer.
@@ -742,7 +740,6 @@ impl Record for CompressRecord {
                 // client sees on read.
                 Some(EpicsValue::DoubleArray(self.linearise_val()))
             }
-            "INP" => Some(EpicsValue::String(self.inp.clone().into())),
             "NSAM" => Some(EpicsValue::Long(self.nsam)),
             "NUSE" => Some(EpicsValue::Long(self.nuse)),
             "OUSE" => Some(EpicsValue::Long(self.ouse)),
@@ -945,30 +942,88 @@ impl Record for CompressRecord {
         "VAL"
     }
 
-    /// C `compressRecord.c::process` calls `dbGetLink(&prec->inp, ...)`
-    /// every cycle and feeds the result to the algorithm. The Rust
-    /// record cannot read links itself; it asks the framework to pull
-    /// `INP` into `VAL` before `process()`. The `VAL` put routes
-    /// through `push_array`, so the data is ingested by the configured
-    /// compression algorithm (NOT a raw buffer overwrite).
-    fn pre_process_actions(&mut self) -> Vec<crate::server::record::ProcessAction> {
-        // Reset the per-cycle completion gate before the INP read below feeds
-        // `push_value`/`push_array`. If the read never happens (no INP, or a
-        // link error that skips the put), both stay false and `process()`
-        // publishes — mirroring C, which forces `status = 0` on those paths.
+    /// C `compressRecord.c:326-343` — the INP ingest, and the one gate on it:
+    ///
+    /// ```c
+    /// if (!dbIsLinkConnected(&prec->inp) || dbGetNelements(...) || nelements <= 0)
+    ///     recGblSetSevr(prec, LINK_ALARM, INVALID_ALARM);   /* nothing ingested */
+    /// else { ... dbGetLink(&prec->inp, DBF_DOUBLE, prec->wptr, ...) ... }
+    /// ```
+    ///
+    /// The port does not read links from inside a record: the framework's
+    /// soft-input stage performs the `dbGetLink` and delivers the value through
+    /// [`Record::set_val`], which is why THAT is the ingest owner here. The
+    /// per-cycle gates are therefore reset in `pre_input_link_actions` — the
+    /// only hook that runs BEFORE that input stage. Resetting them in
+    /// `pre_process_actions`, which runs after it, would clear the very flags
+    /// the ingest had just set.
+    ///
+    /// compress emits no link action of its own. It used to emit a `ReadDbLink`
+    /// reading a link string off a `CompressRecord::inp` field the loader never
+    /// populates (a `.db`'s `field(INP,...)` lands in `common.inp`, since
+    /// `COMPRESS_FIELDS` declares no INP, matching `compressRecord.dbd.pod`).
+    /// That field was a second, always-empty INP: the action never fired for a
+    /// loaded record, and a `caget CMP.INP` answered `""` where softIoc answers
+    /// the link text. It is gone; INP has one source.
+    fn pre_input_link_actions(&mut self) -> Vec<crate::server::record::ProcessAction> {
+        // The per-cycle ingest/emit facts, cleared before the framework's input
+        // stage can set them. If no value arrives (link not connected, or a
+        // failed read), both stay false: `check_alarms` raises LINK/INVALID and
+        // `process()` publishes — mirroring C, which forces `status = 0` on
+        // those paths.
         self.cycle_ingested = false;
         self.cycle_emitted = false;
-        if self.inp.is_empty() {
-            return Vec::new();
-        }
-        // Mark the upcoming INP read so `push_array` knows this ingest is the
-        // INP-driven one that may trigger the element-count reset (vs a direct
-        // VAL put). Cleared in `process` if the read never reaches `push_array`.
+        Vec::new()
+    }
+
+    /// The framework's soft-input stage delivering this cycle's INP value —
+    /// C's `dbGetLink(&prec->inp, DBF_DOUBLE, prec->wptr, 0, &nelements)`
+    /// inside `process()` (:341).
+    ///
+    /// It is the ONLY INP-driven ingest, which is what `inp_read_pending`
+    /// records: C's element-count reset (`nelements != prec->inpn` frees WPTR
+    /// and `reset()`s, :334-340) lives in `process` and keys on WPTR, the INP
+    /// read buffer — a CA put to VAL reaches `put_field` directly, never
+    /// `set_val`, and must NOT reset. Marking the ingest here instead of in
+    /// `pre_process_actions` is what makes the mark fire for a LOADED record:
+    /// the old mark rode on the dead `ReadDbLink` above.
+    fn set_val(&mut self, value: EpicsValue) -> CaResult<()> {
         self.inp_read_pending = true;
-        vec![crate::server::record::ProcessAction::ReadDbLink {
-            link_field: "INP",
-            target_field: "VAL",
-        }]
+        self.put_field_internal("VAL", value)
+    }
+
+    /// C `compressRecord.c:328-343` — the record's only alarm. A cycle that
+    /// took NO sample from INP latches LINK/INVALID, and C has three ways to
+    /// take none: the link is unset, the link is CONSTANT (a literal has no
+    /// lset, so `dbIsLinkConnected` is FALSE and C refuses to sample it), or
+    /// the `dbGetLink` failed. All three land here as "nothing was ingested
+    /// this cycle" — `cycle_ingested`, set by the `push_value`/`push_array`
+    /// ingest owner and cleared by `pre_process_actions` — so ONE test covers
+    /// them, and it cannot disagree with what the buffer actually took.
+    ///
+    /// Without it, an unset or dead INP left the record in NO_ALARM forever and
+    /// operators lost the "my compression source is dead" signal entirely.
+    fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
+        if !self.cycle_ingested {
+            crate::server::recgbl::rec_gbl_set_sevr(
+                common,
+                crate::server::recgbl::alarm_status::LINK_ALARM,
+                crate::server::record::AlarmSeverity::Invalid,
+            );
+        }
+    }
+
+    /// `compressRecord` has NO device support — `compressRecord.dbd.pod`
+    /// declares no DTYP and the record ships no dset. So there is no
+    /// `devXxxSoft::init_record` to run `recGblInitConstantLink(&prec->inp, ...)`,
+    /// and a `field(INP,"5")` is loaded into VAL neither at init nor ever: C
+    /// reads INP only inside `process()`, where a constant is not connected.
+    ///
+    /// The port seeded it at init like any soft-DTYP record, so a compress with
+    /// a constant INP came up with one fabricated sample already in the buffer
+    /// (`NUSE = 1`) that no source ever produced.
+    fn soft_dset_loads_inp_at_init(&self) -> bool {
+        false
     }
 }
 

@@ -27,7 +27,6 @@
 //! ```
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -56,7 +55,7 @@ record(ai, "ASY") {{
 
     // C's ODLY window: the target is genuinely PACT when the FLNK fires.
     let asy = db.get_record("ASY").await.unwrap();
-    asy.write().await.processing.store(true, Ordering::Release);
+    asy.write().await.enter_pact();
     db
 }
 

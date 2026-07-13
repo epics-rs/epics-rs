@@ -128,6 +128,69 @@ pub struct DeferredNotifyPut {
     pub completion: crate::runtime::sync::oneshot::Sender<()>,
 }
 
+/// The PACT→idle transition, as a value.
+///
+/// # Invariant
+///
+/// `RecordInstance::deferred_notify_put.is_some()` ⟹ PACT is held. A
+/// put-notify is parked ONLY on the `is_processing()` arm of the put entry
+/// ([`RecordInstance::park_notify_put`]), and PACT can be released ONLY by
+/// [`RecordInstance::leave_pact`], which takes the park with it. So the
+/// deferral cannot outlive the PACT window it was parked in — the strand is
+/// unrepresentable rather than guarded against.
+///
+/// The token is `#[must_use]`: a release site cannot silently drop the parked
+/// put. Its single consumer is `PvDatabase::apply_pact_exit`, called from the
+/// released cycle's `recGblFwdLink` tail — C `recGbl.c:295` (`if (pdbc->ppn)
+/// dbNotifyCompletion(pdbc)`), which is where C queues the restart callback
+/// (`dbNotify.c:466-469`, state `notifyRestartInProgress`). Holding the token
+/// to the tail rather than replaying at the `pact = FALSE` store is what keeps
+/// the replay behind the rest of the cycle, exactly as C's queued callback is.
+#[must_use = "a put-notify parked on this record is stranded unless the PactExit \
+              reaches PvDatabase::apply_pact_exit"]
+pub struct PactExit(Option<DeferredNotifyPut>);
+
+impl Drop for PactExit {
+    /// Last-resort canary. Every release site hands its token to
+    /// `PvDatabase::apply_pact_exit`; a token reaching here still holding a
+    /// parked put means a PACT release path was added without a tail. The
+    /// client is not left hanging (dropping `completion` errors its receiver),
+    /// but the put's value IS lost, so say so.
+    fn drop(&mut self) {
+        if self.0.is_some() {
+            tracing::error!(
+                "PactExit dropped with a put-notify still parked: a PACT release \
+                 path is not routed through PvDatabase::apply_pact_exit"
+            );
+        }
+    }
+}
+
+impl PactExit {
+    /// The put-notify this release freed, if one was parked.
+    pub(crate) fn into_deferred(mut self) -> Option<DeferredNotifyPut> {
+        self.0.take()
+    }
+
+    /// Fold two releases of the same cycle into one token.
+    ///
+    /// A simulated SDLY continuation releases PACT inside `check_simulation_mode`
+    /// and again at the `is_continuation` arm; the second release finds PACT
+    /// already clear and carries nothing, because the first took the park.
+    pub(crate) fn merge(mut self, mut other: PactExit) -> PactExit {
+        debug_assert!(
+            self.0.is_none() || other.0.is_none(),
+            "a parked put-notify can be released only once per cycle"
+        );
+        PactExit(self.0.take().or_else(|| other.0.take()))
+    }
+
+    /// A cycle that released no PACT (and therefore freed no put-notify).
+    pub(crate) fn none() -> PactExit {
+        PactExit(None)
+    }
+}
+
 /// Cached metadata for a record.
 ///
 /// Stores the result of `populate_display_info` / `populate_control_info` /
@@ -368,8 +431,15 @@ pub struct RecordInstance {
     pub device: Option<Box<dyn super::super::device_support::DeviceSupport>>,
     // Subroutine (for sub records)
     pub subroutine: Option<Arc<SubroutineFn>>,
-    // Re-entrancy guard
-    pub processing: AtomicBool,
+    /// PACT (C `precord->pact`) — the re-entrancy guard, and the record's
+    /// "busy" state for every put that lands on it.
+    ///
+    /// PRIVATE by construction: entered through [`RecordInstance::enter_pact`]
+    /// and released ONLY through [`RecordInstance::leave_pact`], which hands
+    /// back the [`PactExit`] carrying any put-notify parked on this PACT window.
+    /// A `pact.store(false)` open-coded at a release site is what stranded the
+    /// deferral on the ODLY/SDLY paths; it is no longer expressible.
+    pact: AtomicBool,
     // Put-notify wait-set this record currently belongs to (C
     // `precord->ppn`). Set when the record joins an active put-notify
     // (originating put target, or a FLNK/OUT PP target via `dbNotifyAdd`);
@@ -384,7 +454,11 @@ pub struct RecordInstance {
     /// the async cycle completes. See [`DeferredNotifyPut`] and
     /// `PvDatabase::restart_deferred_notify_put`, the single owner that applies
     /// it. `None` outside that window.
-    pub deferred_notify_put: Option<DeferredNotifyPut>,
+    ///
+    /// PRIVATE, and paired with [`Self::pact`] by the [`PactExit`] invariant:
+    /// parked only by [`Self::park_notify_put`] (reachable only from the
+    /// PACT arm of the put entry), taken only by [`Self::leave_pact`].
+    deferred_notify_put: Option<DeferredNotifyPut>,
     /// The value of each subscribed field as ALREADY PUBLISHED to that
     /// field's `DBE_VALUE`/`DBE_LOG` subscribers. The generic
     /// change-detection loop in every snapshot builder posts a field only
@@ -591,7 +665,7 @@ impl RecordInstance {
             parsed_tsel: ParsedLink::None,
             device: None,
             subroutine: None,
-            processing: AtomicBool::new(false),
+            pact: AtomicBool::new(false),
             notify: None,
             deferred_notify_put: None,
             last_posted: HashMap::new(),
@@ -631,11 +705,16 @@ impl RecordInstance {
     ///
     /// `name` is used only for the init-failure diagnostics C sends to errlog.
     pub fn run_init_passes(&mut self, name: &str) {
-        // C's `precord->pact = FALSE` — the port's PACT is the `processing`
-        // flag, released by the process owner; a record cannot be mid-process
-        // at init, so nothing to reset.
-        self.processing
-            .store(false, std::sync::atomic::Ordering::Release);
+        // C's `precord->pact = FALSE` — a record cannot be mid-process at init,
+        // so this release provably frees nothing: no client put has run, so the
+        // `PactExit` invariant (`deferred_notify_put.is_some()` ⟹ PACT) makes a
+        // parked put-notify here unreachable.
+        let deferred = self.leave_pact().into_deferred();
+        debug_assert!(
+            deferred.is_none(),
+            "a record cannot hold a parked put-notify at init"
+        );
+        drop(deferred);
         if self.common.udf && self.common.stat == crate::server::recgbl::alarm_status::UDF_ALARM {
             self.common.sevr = self.common.udfs;
         }
@@ -832,7 +911,54 @@ impl RecordInstance {
 
     /// Check if the record is currently processing (PACT equivalent).
     pub fn is_processing(&self) -> bool {
-        self.processing.load(std::sync::atomic::Ordering::Acquire)
+        self.pact.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// C `prec->pact = TRUE` — the record goes busy for an async device
+    /// round-trip, an SDLY simulation defer, or an ODLY reprocess window.
+    pub fn enter_pact(&self) {
+        self.pact.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// C `prec->pact = FALSE` — the ONLY release of PACT.
+    ///
+    /// Every PACT→idle transition takes the put-notify parked on that window
+    /// with it (C `dbNotifyCompletion`, reached from `recGblFwdLink` on every
+    /// path that ends a cycle). The returned [`PactExit`] is `#[must_use]`, so
+    /// a release site cannot strand the deferral the way the open-coded
+    /// `processing.store(false)` at the ODLY continuation and the three SIM/SDLY
+    /// releases did.
+    pub fn leave_pact(&mut self) -> PactExit {
+        self.pact.store(false, std::sync::atomic::Ordering::Release);
+        PactExit(self.deferred_notify_put.take())
+    }
+
+    /// True when a put-notify already owns this record — an in-flight wait-set
+    /// (C `precord->ppn`) or a park from a previous PACT arm. C
+    /// `processNotifyCommon` (dbNotify.c:213-217) queues a second notify on the
+    /// record's restart list; the port refuses it (`S_db_Blocked` /
+    /// `ECA_PUTCBINPROG`) — see [`Self::park_notify_put`].
+    pub fn put_notify_busy(&self) -> bool {
+        self.notify.is_some() || self.deferred_notify_put.is_some()
+    }
+
+    /// Park a put-notify that landed on a PACT record (C `processNotifyCommon`,
+    /// dbNotify.c:225-231). `Err(put)` hands the put back when another
+    /// put-notify already owns the record.
+    ///
+    /// The [`PactExit`] invariant — `deferred_notify_put.is_some()` ⟹ PACT —
+    /// is established here: this is the only park, and it is only reachable
+    /// from the caller's `is_processing()` arm.
+    pub fn park_notify_put(&mut self, put: DeferredNotifyPut) -> Result<(), DeferredNotifyPut> {
+        debug_assert!(
+            self.is_processing(),
+            "a put-notify may be parked only on a PACT record"
+        );
+        if self.put_notify_busy() {
+            return Err(put);
+        }
+        self.deferred_notify_put = Some(put);
+        Ok(())
     }
 
     /// Unified field resolution: record fields → common fields → virtual fields.
@@ -1657,13 +1783,7 @@ impl RecordInstance {
             "DISP" => Some(EpicsValue::Char(if self.common.disp { 1 } else { 0 })),
             "PUTF" => Some(EpicsValue::Char(if self.common.putf { 1 } else { 0 })),
             "RPRO" => Some(EpicsValue::Char(if self.common.rpro { 1 } else { 0 })),
-            "PACT" => Some(EpicsValue::Char(
-                if self.processing.load(std::sync::atomic::Ordering::Acquire) {
-                    1
-                } else {
-                    0
-                },
-            )),
+            "PACT" => Some(EpicsValue::Char(if self.is_processing() { 1 } else { 0 })),
             "PROC" => Some(EpicsValue::Char(0)), // Always 0 (trigger-only)
             // Analog alarm fields
             "HIHI" => self
@@ -2816,10 +2936,7 @@ impl RecordInstance {
         use crate::server::recgbl::{self, EventMask};
         const LCNT_ALARM_THRESHOLD: i16 = 10;
 
-        if self
-            .processing
-            .swap(true, std::sync::atomic::Ordering::AcqRel)
-        {
+        if self.pact.swap(true, std::sync::atomic::Ordering::AcqRel) {
             // C `dbProcess` PACT-active guard (dbAccess.c:544-557):
             //
             //   if ((precord->stat == SCAN_ALARM) ||
@@ -2894,11 +3011,23 @@ impl RecordInstance {
             return Ok((ProcessSnapshot { changed_fields }, Vec::new()));
         }
         self.common.lcnt = 0;
-        // RAII guard that resets `self.processing` to false on drop —
-        // both for the normal exit path and for any `?` early return.
-        // The guard holds a raw pointer rather than a reference because
-        // we still need `self` mutably while the guard is alive (the
-        // record body below mutates other `self` fields).
+        // RAII guard that resets `self.pact` to false on drop — both for the
+        // normal exit path and for any `?` early return. The guard holds a raw
+        // pointer rather than a reference because we still need `self` mutably
+        // while the guard is alive (the record body below mutates other `self`
+        // fields).
+        //
+        // This is the one PACT release that does not go through `leave_pact`,
+        // and it provably frees nothing: `process_local` holds `&mut self` for
+        // the whole PACT window, and a put-notify is parked only through
+        // `park_notify_put`, which needs that same `&mut`. So no deferral can
+        // be created inside the window, and the `swap(true)` above proved none
+        // existed on entry (`deferred_notify_put.is_some()` ⟹ PACT).
+        debug_assert!(
+            self.deferred_notify_put.is_none(),
+            "PactExit invariant: a parked put-notify implies PACT, which the \
+             swap above proved was clear"
+        );
         struct ProcessGuard(*const AtomicBool);
         // SAFETY: AtomicBool is Sync; raw pointers don't auto-derive
         // Send. We hand-roll Send because the ptr targets a field of
@@ -2910,7 +3039,7 @@ impl RecordInstance {
         impl Drop for ProcessGuard {
             fn drop(&mut self) {
                 // SAFETY: `self.0` was constructed from
-                // `&self.processing as *const AtomicBool` below, where
+                // `&self.pact as *const AtomicBool` below, where
                 // `self` is the live RecordInstance whose lifetime
                 // strictly outlives `_guard`. RecordInstance is
                 // !Unpin-equivalent in practice (we never move it
@@ -2919,7 +3048,7 @@ impl RecordInstance {
                 unsafe { &*self.0 }.store(false, std::sync::atomic::Ordering::Release);
             }
         }
-        let _guard = ProcessGuard(&self.processing as *const AtomicBool);
+        let _guard = ProcessGuard(&self.pact as *const AtomicBool);
 
         // Call subroutine if registered (for sub/aSub records). Single owner
         // shared with the main engine path — see `run_registered_subroutine`.

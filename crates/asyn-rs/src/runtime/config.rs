@@ -1,6 +1,30 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::services::PortServices;
+
+/// C `pasynBase->autoConnectTimeout` (asynManager.c:110), initialised to
+/// `DEFAULT_AUTOCONNECT_TIMEOUT` = 0.5 s (:49, :507) and rewritten by
+/// `asynSetAutoConnectTimeout` (:2370-2377).
+///
+/// Process-global on purpose: C has exactly one `pasynBase`, and each port
+/// registration reads the value that is current *then* (:2135). Microseconds,
+/// so the shell's `double` seconds survives the round trip.
+static AUTO_CONNECT_TIMEOUT_US: AtomicU64 = AtomicU64::new(500_000);
+
+/// The registration connect-wait every new port gets — C's
+/// `pasynBase->autoConnectTimeout` read at :2135.
+pub fn auto_connect_timeout() -> Duration {
+    Duration::from_micros(AUTO_CONNECT_TIMEOUT_US.load(Ordering::Relaxed))
+}
+
+/// C `pasynManager->setAutoConnectTimeout(double)` — the iocsh
+/// `asynSetAutoConnectTimeout`. Applies to ports registered after this call,
+/// exactly as in C. A negative or NaN value collapses to zero (no wait), which
+/// is what C's `epicsEventWaitWithTimeout` does with one.
+pub fn set_auto_connect_timeout(timeout: Duration) {
+    AUTO_CONNECT_TIMEOUT_US.store(timeout.as_micros() as u64, Ordering::Relaxed);
+}
 
 /// Configuration for a port runtime.
 #[derive(Debug, Clone)]
@@ -37,7 +61,7 @@ impl Default for RuntimeConfig {
             auto_connect: true,
             connect_backoff: BackoffConfig::default(),
             supervision: SupervisionPolicy::default(),
-            auto_connect_timeout: Duration::from_millis(500),
+            auto_connect_timeout: auto_connect_timeout(),
             services: PortServices::global(),
         }
     }

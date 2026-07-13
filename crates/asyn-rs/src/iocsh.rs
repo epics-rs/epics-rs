@@ -283,6 +283,17 @@ fn asyn_show_eos(
 /// only) and calls `PortDriver::report(level)`. C asyn's `asynReport`
 /// loops through `pasynManager`'s port list and calls each driver's
 /// `report` interface (`asynManager.c::asynReport`).
+/// A shell `double` seconds argument as a `Duration`. C hands the value to
+/// `epicsEventWaitWithTimeout`, which treats a non-positive timeout as "do not
+/// wait"; NaN cannot be represented at all. Both collapse to zero here.
+fn duration_from_secs(secs: f64) -> Duration {
+    if secs.is_finite() && secs > 0.0 {
+        Duration::from_secs_f64(secs)
+    } else {
+        Duration::ZERO
+    }
+}
+
 /// `portName addr yesNo` — the argument list C gives both `asynEnable` and
 /// `asynAutoConnect` (asynShellCommands.c:944-948, 976-982).
 fn enable_style_args() -> Vec<ArgDesc> {
@@ -689,6 +700,77 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
             },
         ));
     }
+
+    // asynWaitConnect portName timeout ------------------------------------
+    // C asynShellCommands.c (asynWaitConnect) → pasynManager->waitConnect
+    // (asynManager.c:3292-3336). The st.cmd line that follows a
+    // drvAsynIPPortConfigure for a slow device: block here until the port is up
+    // rather than let the next line's I/O fail on a still-connecting port.
+    {
+        let mgr_r = mgr.clone();
+        let services_wait = services.clone();
+        out.push(CommandDef::new(
+            "asynWaitConnect",
+            vec![
+                ArgDesc {
+                    name: "portName",
+                    arg_type: ArgType::String,
+                    optional: false,
+                },
+                ArgDesc {
+                    name: "timeout",
+                    arg_type: ArgType::Double,
+                    optional: false,
+                },
+            ],
+            "asynWaitConnect portName timeout - block until the port is connected",
+            move |args: &[ArgValue], ctx: &CommandContext| {
+                let port = arg_str(args, 0)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| "portName required".to_string())?;
+                let timeout = duration_from_secs(arg_f64(args, 1).unwrap_or(0.0));
+                let handle = match mgr_r.find_port_handle(&port) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        ctx.println(&format!("asynWaitConnect: {e}"));
+                        return Ok(CommandOutcome::Continue);
+                    }
+                };
+                // Arm before the check: a connect landing between the two would
+                // be lost the other way round (C :3313-3316 registers the
+                // exception handler before it waits).
+                let waiter = crate::runtime::port::ConnectWaiter::arm(&services_wait, &port);
+                if handle.is_connected_blocking().unwrap_or(false) {
+                    return Ok(CommandOutcome::Continue);
+                }
+                if !waiter.wait(timeout) {
+                    ctx.println(&format!("asynWaitConnect: {port} not connected"));
+                }
+                Ok(CommandOutcome::Continue)
+            },
+        ));
+    }
+
+    // asynSetAutoConnectTimeout timeout -----------------------------------
+    out.push(CommandDef::new(
+        "asynSetAutoConnectTimeout",
+        vec![ArgDesc {
+            name: "timeout",
+            arg_type: ArgType::Double,
+            optional: false,
+        }],
+        "asynSetAutoConnectTimeout timeout - seconds a new port waits for its first connect \
+         (C default 0.5)",
+        move |args: &[ArgValue], _ctx: &CommandContext| {
+            // C `setAutoConnectTimeout` (asynManager.c:2370-2377) writes the
+            // process-global `pasynBase->autoConnectTimeout`; every port
+            // registered after this line reads the new value (:2135).
+            crate::runtime::config::set_auto_connect_timeout(duration_from_secs(
+                arg_f64(args, 0).unwrap_or(0.0),
+            ));
+            Ok(CommandOutcome::Continue)
+        },
+    ));
 
     // asynInterposeEosConfig portName addr processIn processOut ------------
     // C asynInterposeEos.c:393-410. The layer `drvAsynIPPortConfigure`
@@ -1562,6 +1644,17 @@ mod tests {
     }
 
     impl DummyDriver {
+        /// A port whose link starts DOWN — what a real transport looks like
+        /// before its first connect (`init_connected`, C's `dpc.connected = 0`
+        /// until the driver reports otherwise).
+        fn disconnected(name: &str) -> Self {
+            let mut d = Self::new(name);
+            d.base.init_connected(false);
+            // ...and nothing brings it up on its own: C's `noAutoConnect`.
+            d.base.set_auto_connect(false);
+            d
+        }
+
         /// A multi-device port — the other half of C's `findDpCommon` split.
         fn multi_device(name: &str, max_addr: usize) -> Self {
             let mut base = PortDriverBase::new(
@@ -1691,6 +1784,8 @@ mod tests {
             "asynSetTraceFile",
             "asynEnable",
             "asynAutoConnect",
+            "asynWaitConnect",
+            "asynSetAutoConnectTimeout",
             "asynOctetSetInputEos",
             "asynOctetGetInputEos",
             "asynOctetSetOutputEos",
@@ -1708,6 +1803,126 @@ mod tests {
         ];
         expected.sort_unstable();
         assert_eq!(names, expected);
+    }
+
+    /// R19-117 boundary: `asynWaitConnect` returns as soon as the port is
+    /// connected — whether it was connected before the call or connects during
+    /// it — and gives up after the timeout otherwise.
+    ///
+    /// C `waitConnect` (asynManager.c:3292-3336) arms the connect exception
+    /// handler and only then reads the connected flag, so the connect that
+    /// lands in between is not lost. The three boundaries here are exactly
+    /// that: already-connected, connects-during-the-wait, never-connects.
+    #[test]
+    fn iocsh_wait_connect_covers_before_during_and_never() {
+        use std::time::Instant;
+
+        let mgr = Arc::new(PortManager::new());
+        let cfg = RuntimeConfig {
+            auto_connect: false,
+            services: mgr.services().clone(),
+            ..RuntimeConfig::default()
+        };
+        let _ = mgr
+            .register_port_with_config(DummyDriver::disconnected("wc_late"), cfg.clone())
+            .unwrap();
+        let _ = mgr
+            .register_port_with_config(DummyDriver::disconnected("wc_never"), cfg)
+            .unwrap();
+
+        let cmds = build_asyn_commands(mgr.clone());
+        let ctx = make_ctx();
+        let wait = |port: &str, timeout: f64| {
+            let t0 = Instant::now();
+            cmds.iter()
+                .find(|c| c.name == "asynWaitConnect")
+                .expect("asynWaitConnect must be registered")
+                .handler
+                .call(
+                    &[ArgValue::String(port.into()), ArgValue::Double(timeout)],
+                    &ctx,
+                )
+                .unwrap();
+            t0.elapsed()
+        };
+
+        // Never connects: the wait runs to the timeout and returns.
+        let elapsed = wait("wc_never", 0.1);
+        assert!(
+            elapsed >= Duration::from_millis(100),
+            "must have waited the full timeout, waited {elapsed:?}"
+        );
+        assert!(
+            !mgr.find_port_handle("wc_never")
+                .unwrap()
+                .is_connected_blocking()
+                .unwrap()
+        );
+
+        // Connects during the wait: returns on the connect exception, well
+        // inside the timeout.
+        let late = mgr.find_port_handle("wc_late").unwrap();
+        let connector = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            late.connect_blocking().unwrap();
+        });
+        let elapsed = wait("wc_late", 5.0);
+        connector.join().unwrap();
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "must have returned on the connect, not on the timeout ({elapsed:?})"
+        );
+        let late = mgr.find_port_handle("wc_late").unwrap();
+        assert!(late.is_connected_blocking().unwrap());
+
+        // Already connected: returns immediately, without waiting on an
+        // exception that will never fire again.
+        let elapsed = wait("wc_late", 5.0);
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "an already-connected port must not wait ({elapsed:?})"
+        );
+    }
+
+    /// R19-117: `asynSetAutoConnectTimeout` rewrites the value a newly
+    /// registered port waits for its first connect — C's process-global
+    /// `pasynBase->autoConnectTimeout` (asynManager.c:2370-2377), read at every
+    /// port registration (:2135). It was hard-coded at 0.5 s, which is too
+    /// short for a slow device and was the reason C exposes the knob.
+    #[test]
+    fn iocsh_set_auto_connect_timeout_rewrites_the_registration_wait() {
+        assert_eq!(
+            RuntimeConfig::default().auto_connect_timeout,
+            Duration::from_millis(500),
+            "C DEFAULT_AUTOCONNECT_TIMEOUT (asynManager.c:49)"
+        );
+
+        let mgr = Arc::new(PortManager::new());
+        let cmds = build_asyn_commands(mgr);
+        let ctx = make_ctx();
+        cmds.iter()
+            .find(|c| c.name == "asynSetAutoConnectTimeout")
+            .expect("asynSetAutoConnectTimeout must be registered")
+            .handler
+            .call(&[ArgValue::Double(2.5)], &ctx)
+            .unwrap();
+
+        assert_eq!(
+            RuntimeConfig::default().auto_connect_timeout,
+            Duration::from_millis(2500)
+        );
+
+        // A negative timeout is "do not wait", as C's event wait treats it.
+        cmds.iter()
+            .find(|c| c.name == "asynSetAutoConnectTimeout")
+            .unwrap()
+            .handler
+            .call(&[ArgValue::Double(-1.0)], &ctx)
+            .unwrap();
+        assert_eq!(
+            RuntimeConfig::default().auto_connect_timeout,
+            Duration::ZERO
+        );
     }
 
     /// R19-118 boundary: `asynInterposeEosConfig` installs the EOS layer from

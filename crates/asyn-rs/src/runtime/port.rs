@@ -95,6 +95,56 @@ impl PortRuntimeHandle {
     }
 }
 
+/// The one way to wait for a port's connect — C `waitConnect`
+/// (asynManager.c:3292-3336), which arms an exception handler and only then
+/// blocks on the event.
+///
+/// Arming first is the whole point: a connect that lands between "am I
+/// connected?" and "start waiting" would be missed by any caller that checked
+/// the flag first. So [`Self::arm`] registers the callback, the caller may then
+/// short-circuit on an already-connected port (C :3308-3311), and
+/// [`Self::wait`] blocks for the rest. Both waiters in the crate — port
+/// registration and the iocsh `asynWaitConnect` — go through it, so neither can
+/// grow its own race.
+pub struct ConnectWaiter {
+    rx: std::sync::mpsc::Receiver<()>,
+    services: crate::services::PortServices,
+    callback: crate::exception::ExceptionCallbackId,
+}
+
+impl ConnectWaiter {
+    /// Register for `port_name`'s connect exception. From here on the connect
+    /// cannot be missed, only waited for.
+    pub fn arm(services: &crate::services::PortServices, port_name: &str) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let waited_on = port_name.to_string();
+        let callback = services.exceptions().add_callback(move |event| {
+            if event.exception == crate::exception::AsynException::Connect
+                && event.port_name == waited_on
+            {
+                let _ = tx.send(());
+            }
+        });
+        Self {
+            rx,
+            services: services.clone(),
+            callback,
+        }
+    }
+
+    /// Block until the connect exception arrives or `timeout` elapses.
+    /// `true` = connected.
+    pub fn wait(self, timeout: std::time::Duration) -> bool {
+        self.rx.recv_timeout(timeout).is_ok()
+    }
+}
+
+impl Drop for ConnectWaiter {
+    fn drop(&mut self) {
+        self.services.exceptions().remove_callback(self.callback);
+    }
+}
+
 /// Create a port runtime from a driver.
 ///
 /// Returns:
@@ -174,20 +224,10 @@ pub fn create_port_runtime_boxed(
     // C's `waitConnect` (asynManager.c:2135, :3288-3336): registration waits on
     // the port's *connect exception* for at most `autoConnectTimeout`, so the
     // line of st.cmd after `drvAsynIPPortConfigure` already sees a live port.
-    // The exception callback is registered before the actor thread exists, so
-    // the connect it waits for cannot fire ahead of it.
-    let connect_wait = connect_at_registration.then(|| {
-        let (tx, rx) = std::sync::mpsc::channel::<()>();
-        let waited_on = port_name.clone();
-        let id = config.services.exceptions().add_callback(move |event| {
-            if event.exception == crate::exception::AsynException::Connect
-                && event.port_name == waited_on
-            {
-                let _ = tx.send(());
-            }
-        });
-        (rx, id)
-    });
+    // The waiter is armed before the actor thread exists, so the connect it
+    // waits for cannot fire ahead of it.
+    let connect_wait =
+        connect_at_registration.then(|| ConnectWaiter::arm(&config.services, &port_name));
 
     let join_handle = std::thread::Builder::new()
         .name(format!("asyn-runtime-{port_name}"))
@@ -203,11 +243,10 @@ pub fn create_port_runtime_boxed(
         })
         .expect("failed to spawn port runtime thread");
 
-    if let Some((connected, callback)) = connect_wait {
+    if let Some(waiter) = connect_wait {
         // A timeout is not a failure: C ignores `waitConnect`'s status here and
         // the port's own retry timer carries on (asynManager.c:2135, :3281).
-        let _ = connected.recv_timeout(config.auto_connect_timeout);
-        config.services.exceptions().remove_callback(callback);
+        let _ = waiter.wait(config.auto_connect_timeout);
     }
 
     let mut port_handle = PortHandle::new(tx, port_name.clone(), handle_interrupts, actor_id);

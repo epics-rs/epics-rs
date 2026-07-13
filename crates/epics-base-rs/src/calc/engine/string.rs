@@ -2073,8 +2073,9 @@ impl Extremum {
 fn subrange_bounds(subject: &[u8], start: &StackValue, end: &StackValue) -> (i64, i64) {
     let k = subject.len() as i64;
     let i = match start {
-        // C `i = (int)ps1->d` (`sCalcPerform.c:1876`) — [`c_int`], not Rust's
-        // saturating `as`, exactly as in aCalc's `[` (`pop_subrange_bounds`).
+        // C `i = (int)ps1->d` (`sCalcPerform.c:1876`) — a narrowing of a stack
+        // double, so it belongs to the engine's cast owner [`c_int`] and not to
+        // an open-coded `as`, exactly as in aCalc's `[` (`pop_subrange_bounds`).
         StackValue::Double(d) => {
             let i = i64::from(c_int(*d));
             if i < 0 { i + k } else { i }

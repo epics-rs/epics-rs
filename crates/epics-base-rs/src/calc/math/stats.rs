@@ -132,10 +132,30 @@ pub fn smooth(data: &[f64]) -> Vec<f64> {
 /// over the array the previous one left behind (C loops `for (k=firstEl; k<j+firstEl;
 /// k++)` around the very same in-place body). Border preservation compounds: a
 /// border element that SMOOTH keeps is a border element the next pass reads.
+///
+/// The pass count comes from the expression, so it is unbounded: `NSMOO(AA,2e9)`
+/// asks for two billion passes, and C's own `int j` happily holds that. Running
+/// them is pointless — [`smooth`] is a pure function of its input, so the moment a
+/// pass hands back the bits it was given, every remaining pass is a no-op and the
+/// buffer is already the value all `n` passes would have left. Stopping there is
+/// therefore result-preserving, not a cap: no reachable count changes the answer,
+/// and an absurd one returns instead of running for hours.
+///
+/// The comparison is over `to_bits`, not `==`: a buffer holding NaN is never `==`
+/// itself, and a NaN is exactly the input for which the count would otherwise be
+/// run out in full.
 pub fn nsmooth(data: &[f64], n: usize) -> Vec<f64> {
     let mut result = data.to_vec();
     for _ in 0..n {
-        result = smooth(&result);
+        let next = smooth(&result);
+        let fixed_point = next
+            .iter()
+            .zip(&result)
+            .all(|(a, b)| a.to_bits() == b.to_bits());
+        result = next;
+        if fixed_point {
+            break;
+        }
     }
     result
 }

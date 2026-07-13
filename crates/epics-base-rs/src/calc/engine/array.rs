@@ -639,12 +639,24 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                     })?
                 }
                 ArrayOp::NSmooth => {
-                    // C `int j; ... j = ps->d;` (`aCalcPerform.c:581`) — an
-                    // implicit `(int)` conversion, i.e. [`c_int`], and the pass
-                    // loop `for (k=firstEl; k<j+firstEl; k++)` then runs `max(j,0)`
-                    // times. Rust's `as usize` instead SATURATES: `NSMOO(AA,1e30)`
-                    // asked for `usize::MAX` passes and hung the engine, where C
-                    // gets `INT32_MIN` and makes zero.
+                    // The pass count is a narrowing of a stack double like any
+                    // other — C is `int j; ... j = ps->d;` (`aCalcPerform.c:304`
+                    // declares `j`, `:581` assigns it), an implicit `(int)`, and
+                    // the loop `for (k=firstEl; k<j+firstEl; k++)` then runs
+                    // `max(j,0)` passes. So it goes through the cast owner
+                    // [`c_int`], not an open-coded `as usize`.
+                    //
+                    // A count no `int` can hold is not a count, and neither
+                    // compiled C target gives a usable answer for one (x86-64
+                    // yields `INT32_MIN` -> zero passes; aarch64 saturates ->
+                    // `INT32_MAX` passes, which does not return). The port does not
+                    // pick between those: `NSMOO(AA,2e9)` is an unbounded loop with
+                    // a PERFECT cast, so the count is not what bounds this — see
+                    // [`stats::nsmooth`], which stops as soon as a pass stops
+                    // changing the buffer. That is exactly the value the full count
+                    // would have left, because `smooth` is a pure function of its
+                    // input: once it reproduces its own input, every later pass is
+                    // a no-op.
                     let n = c_int(pop_f64(&mut stack)?).max(0) as usize;
                     // NSMOOTH is NOT in C's unary switch — it is its own case
                     // (`aCalcPerform.c:579-592`) and it indexes `ps->a[]` with no
@@ -1625,11 +1637,18 @@ fn shift_elements(a: &mut [f64], e: f64) {
 
 /// Pop the two bounds of an aCalc subrange. C `toDouble`s both
 /// (`aCalcPerform.c:1526,1530`) — so an ARRAY bound collapses to its first
-/// element — and casts each into an `int` with a truncating `(int)`, not
-/// `myNINT`. That cast is [`c_int`], NOT Rust's `as`: the two agree only inside
-/// the 32-bit range. `AA[2,3e9]` is C's `j = INT32_MIN`, which wraps far
-/// negative and selects NOTHING; Rust's saturating `as i64` made it `3e9`, which
-/// clamps to `arraySize` and selects the whole tail — the opposite answer.
+/// element — and narrows each into an `int` with a truncating `(int)`, not
+/// `myNINT`.
+///
+/// That `(int)` is [`c_int`], the engine's cast owner, and this site used to
+/// open-code `as i64` instead. An out-of-range narrowing is C UB and the two
+/// compiled targets EPICS ships on disagree (x86-64 `cvttsd2si` gives
+/// `INT32_MIN`; aarch64 `fcvtzs` saturates), so there is no C answer to be
+/// faithful to — [`crate::types::c_cast`] owns the one value the port picks,
+/// and every narrowing of a stack double must ask it rather than decide for
+/// itself. Under the owner's saturating rule the bound clamps to `arraySize`
+/// exactly as the open-coded `as i64` did, so this is a routing change with no
+/// observable effect: `AA[2,3e9]` selects the tail, before and after.
 ///
 /// The rest of the rule is [`super::subrange_bounds`], shared with sCalc.
 fn pop_subrange_bounds(stack: &mut Vec<Cell>, array_size: i64) -> Result<(i64, i64), CalcError> {

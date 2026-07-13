@@ -495,6 +495,37 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                 }
             },
 
+            // C has TWO evaluators, and the no-string one is not a subset of the
+            // string one: three opcodes reach it with NO case of their own —
+            // `SUBLAST`, `TO_DOUBLE` and `BYTE`, the three string operators that
+            // are absent from `sCalcPostfix`'s USES_STRING list
+            // (`sCalcPostfix.c:449-471`) and so do not switch C to the string
+            // evaluator. They fall to the double-only switch's
+            //
+            // ```c
+            // default:
+            //     break;      /* sCalcPerform.c:816-818 */
+            // ```
+            //
+            // which does not touch the stack AT ALL — no pop, no push. That is
+            // not the same as evaluating them on doubles, and the difference is
+            // observable:
+            //
+            //   - `A|-B` (both numeric) leaves BOTH operands on the stack, so C's
+            //     closing depth check (`pd != topd`) fails and the WHOLE
+            //     expression errors: stat -1, VAL/SVAL untouched, CALC_ALARM.
+            //     The port used to compute `A-B`.
+            //   - `DBL(A)` and `BYTE(A)` leave their one operand in place, which
+            //     is the identity — the same value either evaluator would answer,
+            //     by a different route.
+            //
+            // So the rule is one rule, applied to all three: on the no-string
+            // path these opcodes DO NOTHING. `StackLeak` at the bottom of this
+            // function is the same check C makes, and it is what turns SUBLAST's
+            // untouched operands into the expression-level error.
+            Opcode::String(StringOp::SubLast | StringOp::ToDouble | StringOp::Byte)
+                if !string_path => {}
+
             Opcode::String(sop) => match sop {
                 StringOp::PushString(s) => {
                     // C LITERAL_STRING (sCalcPerform.c:1493-1502) copies the

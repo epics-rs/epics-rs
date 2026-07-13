@@ -2649,6 +2649,24 @@ impl AsynRecord {
     /// Without a database handle / runtime — a record driven outside a database,
     /// as in the unit tests — the field values are still refreshed; only the
     /// monitor post is unavailable.
+    /// Run a driver readback inside C's `REMEMBER_STATE … POST_IF_NEW` bracket
+    /// (asynRecord.c:210-214): snapshot the fields it may write, run it, post the
+    /// ones that changed.
+    ///
+    /// The single owner of "a readback that moved a field fires its monitor".
+    /// Every place that re-reads record fields from the port goes through it —
+    /// `getOptions` (:1850-1938), `getEos` (:1999-2024), `monitorStatus`
+    /// (:1042-1141) — because C posts from *inside* each of those, not from the
+    /// caller. `connectDevice` refreshed all three and posted none of them
+    /// (R14-47): the operator's screen kept the previous port's BAUD/IEOS/CNCT
+    /// until something else happened to fire a monitor.
+    fn posting<T>(&mut self, fields: &[&str], readback: impl FnOnce(&mut Self) -> T) -> T {
+        let before = self.field_snapshot(fields);
+        let out = readback(self);
+        self.post_if_new(&before);
+        out
+    }
+
     fn post_if_new(&self, before: &[(String, EpicsValue)]) {
         let changed: Vec<(String, EpicsValue)> = before
             .iter()
@@ -2732,13 +2750,13 @@ impl AsynRecord {
             }
             self.errs = format!("Error setting option, {}", e.message());
         }
-        let before = self.field_snapshot(OPTION_READBACK_FIELDS);
         // The re-read runs *inside* the request the put queued (C's `setOption`
         // callback falls through to `getOptions`, asynRecord.c:845-849), so it
         // is queued under the same class: a HOSTINFO put that reached a
         // disconnected driver reads the new host:port back off it.
-        self.read_options_from_driver(&entry.handle, queue);
-        self.post_if_new(&before);
+        self.posting(OPTION_READBACK_FIELDS, |this| {
+            this.read_options_from_driver(&entry.handle, queue);
+        });
         SpecialRan::Yes
     }
 
@@ -2998,9 +3016,9 @@ impl AsynRecord {
             let which = if output { "output" } else { "input" };
             self.errs = format!("Error setting {which} eos, {}", e.message());
         }
-        let before = self.field_snapshot(EOS_READBACK_FIELDS);
-        self.read_eos_from_driver(&entry.handle);
-        self.post_if_new(&before);
+        self.posting(EOS_READBACK_FIELDS, |this| {
+            this.read_eos_from_driver(&entry.handle);
+        });
         SpecialRan::Yes
     }
 
@@ -3069,11 +3087,24 @@ impl AsynRecord {
         // asynDrvUser->create()"`) is what stays in ERRS.
         self.reset_error();
 
+        // C's `REMEMBER_STATE` cache is what its two `monitorStatus` calls
+        // (:1270, :1319) post against, and it is seeded before `connectDevice`
+        // touches a field — so *everything* the attach changes (the interface
+        // flags, REASON, DRVINFO, PCNCT, and the port's ENBL/AUCT/CNCT) is posted,
+        // not just the fields `monitorStatus` itself re-reads. The snapshot goes
+        // here, above the first assignment, for the same reason (R14-47).
+        let before_status = self.field_snapshot(MONITOR_STATUS_FIELDS);
+
         if self.port.is_empty() {
             self.pcnct = 0;
             self.port_entry = None;
-            self.refresh_connected_state();
             self.clear_exception_callback();
+            // C's failure path is not silent: `bad:` falls into `done:`, which is
+            // `cancelIOInterruptScan` + `monitorStatus` (:1310-1319) — the same
+            // tail the success path takes, so the operator sees PCNCT and CNCT go
+            // to 0 on the record that just lost its port.
+            self.monitor_status();
+            self.post_if_new(&before_status);
             self.publish_io_intr_binding();
             return Err(self.report_connect_error(
                 "asynManager:connectDevice no port name provided".to_string(),
@@ -3151,8 +3182,12 @@ impl AsynRecord {
                 // `asynQueuePriorityConnect` carrying
                 // `ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED` (asynRecord.c:1277-1280),
                 // so a record attaching to a *down* serial or IP port still shows
-                // its BAUD/PRTY/HOSTINFO/… instead of "Unknown".
-                self.read_options_from_driver(&entry.handle, OptionQueue::EvenIfNotConnected);
+                // its BAUD/PRTY/HOSTINFO/… instead of "Unknown". C's `getOptions`
+                // posts every field it re-read (:1926-1938), so the readback goes
+                // in the post bracket.
+                self.posting(OPTION_READBACK_FIELDS, |this| {
+                    this.read_options_from_driver(&entry.handle, OptionQueue::EvenIfNotConnected);
+                });
 
                 // …and the EOS readback C queues right after it, gated on the port
                 // having asynOctet (`if(pasynRec->octetiv)`, asynRecord.c:1289-1300)
@@ -3166,7 +3201,10 @@ impl AsynRecord {
                 // no waiver — on a *disconnected* port the queue gate refuses it
                 // (asynManager.c:1547-1552) and IEOS/OEOS stay blank, while the
                 // options still fill in.
-                self.read_eos_from_driver(&entry.handle);
+                // C's `getEos` posts IEOS/OEOS the same way (:2016-2024).
+                self.posting(EOS_READBACK_FIELDS, |this| {
+                    this.read_eos_from_driver(&entry.handle);
+                });
 
                 // Attached to the port (C `connectDevice` sets PCNCT=1,
                 // asynRecord.c:1305).
@@ -3177,8 +3215,11 @@ impl AsynRecord {
                 // AUCT / CNCT. They must not be forced to 1, which would discard
                 // a user who configured ENBL=0 or a port registered
                 // noAutoConnect, and would claim a live wire on a port whose
-                // transport is down.
+                // transport is down. `monitorStatus` posts what it re-imported,
+                // and `before_status` (taken at the top) is the `old` cache it
+                // posts against.
                 self.monitor_status();
+                self.post_if_new(&before_status);
                 // C `connectDevice` adds `exceptCallback` (asynRecord.c:1269) so
                 // any later exception on the port — a trace change, a dropped
                 // link, an enable — refreshes the readback fields out of band.
@@ -3199,8 +3240,10 @@ impl AsynRecord {
             None => {
                 self.pcnct = 0;
                 self.port_entry = None;
-                self.refresh_connected_state();
                 self.clear_exception_callback();
+                // C's `bad:` → `done:` tail, as above (:1310-1319).
+                self.monitor_status();
+                self.post_if_new(&before_status);
                 self.publish_io_intr_binding();
                 Err(self.report_connect_error(format!(
                     "asynManager:connectDevice port {} not found",
@@ -4245,8 +4288,11 @@ impl Record for AsynRecord {
                     self.port_entry = None;
                     self.clear_exception_callback();
                     // Detached: `isConnected` has no device to report on, which
-                    // is C's CNCT=0 (monitorStatus, :1091-1093).
-                    self.refresh_connected_state();
+                    // is C's CNCT=0 (monitorStatus, :1091-1093). The refresh goes
+                    // in the post bracket like every other one — a field that
+                    // moves without its monitor is a field the operator's screen
+                    // never learns about (R14-47).
+                    self.posting(&["CNCT"], |this| this.refresh_connected_state());
                     self.cancel_io_interrupt_scan();
                     self.publish_io_intr_binding();
                 }
@@ -8552,12 +8598,31 @@ mod tests {
 
         let db = PvDatabase::new();
         let rec_name = "TRACE_POSTIFNEW_REC";
-        let mut rec = AsynRecord::default();
-        rec.port = port_name.to_string();
-        rec.set_async_context(rec_name.to_string(), db.async_handle());
-        let _ = rec.connect_device();
-        assert_eq!(rec.cnct, 1, "record must connect to the registered port");
+        let rec = AsynRecord::default();
         db.add_record(rec_name, Box::new(rec)).await.unwrap();
+        // Connect from *inside* the database — `add_record` is what hands a record
+        // its db handle, so this is the order production runs in, and the only one
+        // in which `connectDevice`'s own posts (R14-47) are observable at all.
+        {
+            let inst = db.get_record(rec_name).await.unwrap();
+            let mut g = inst.write().await;
+            let rec = g
+                .record
+                .as_any_mut()
+                .unwrap()
+                .downcast_mut::<AsynRecord>()
+                .unwrap();
+            // Seed the record's trace readbacks with the port's baseline, so the
+            // attach itself posts no TMSK/TIOM: `connectDevice` POST_IF_NEWs what
+            // it re-imports (R14-47), and an attach that *changed* TMSK would post
+            // it — correctly, but that is the other test's subject. Here the port
+            // must start out already showing what it will read back.
+            rec.tmsk = TraceMask::ERROR.bits() as i32;
+            rec.update_trace_bits_from_mask();
+            rec.port = port_name.to_string();
+            rec.special("PORT", true).unwrap();
+            assert_eq!(rec.cnct, 1, "record must connect to the registered port");
+        }
 
         let mut tmsk_sub = DbSubscription::subscribe(&db, &format!("{rec_name}.TMSK"))
             .await
@@ -8602,6 +8667,123 @@ mod tests {
         assert!(
             reposted.is_err(),
             "unchanged TMSK must not be re-posted on an IO-mask-only change, got {reposted:?}"
+        );
+    }
+
+    /// R14-47: `connectDevice` posts every readback it refreshes.
+    ///
+    /// C posts from three places inside the attach, and they are what put the new
+    /// port's state on the operator's screen without a `process()`:
+    /// `monitorStatus` (asynRecord.c:1270 and again at :1319) POST_IF_NEWs the
+    /// trace masks, AUCT/CNCT/ENBL, PCNCT, REASON, DRVINFO and the interface
+    /// flags; the queued `getOptions` callback posts BAUD…DRTO and HOSTINFO
+    /// (:1926-1938); the queued `getEos` callback posts IEOS/OEOS (:2016-2024).
+    ///
+    /// The port refreshed all three sets and posted none of them: a PORT put
+    /// silently re-pointed the record, and every readback field on the operator's
+    /// screen kept the *previous* port's value until some other event fired a
+    /// monitor.
+    ///
+    /// One case per posting site: an option field (BAUD), an EOS field (IEOS),
+    /// and a monitorStatus field (PCNCT).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn connect_device_posts_every_readback_it_refreshes() {
+        use crate::interrupt::InterruptManager;
+        use crate::port::{PortDriver, PortDriverBase, PortFlags};
+        use crate::port_actor::PortActor;
+        use crate::trace::TraceManager;
+        use epics_base_rs::server::database::PvDatabase;
+        use epics_base_rs::server::database::db_access::DbSubscription;
+        use tokio::sync::mpsc;
+
+        /// A serial-shaped port: 19200 baud and an input EOS the driver already
+        /// holds (st.cmd's `asynOctetSetInputEos`).
+        struct Serialish(PortDriverBase);
+        impl PortDriver for Serialish {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+            fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
+                crate::interfaces::octet_transport_capabilities()
+            }
+            fn get_option(&self, key: &str) -> crate::error::AsynResult<String> {
+                match key {
+                    "baud" => Ok("19200".to_string()),
+                    _ => Err(crate::error::AsynError::Status {
+                        status: AsynStatus::Error,
+                        message: format!("unsupported option {key}"),
+                    }),
+                }
+            }
+        }
+
+        let port_name = "r14_47_connect_posts";
+        let mut drv = Serialish(PortDriverBase::new(port_name, 1, PortFlags::default()));
+        drv.set_input_eos(&AsynUser::default(), b"\r\n").unwrap();
+        let (tx, rx) = mpsc::channel(64);
+        let actor = PortActor::new(Box::new(drv), rx);
+        let actor_id = actor.id();
+        std::thread::spawn(move || actor.run());
+        let handle = PortHandle::new(
+            tx,
+            port_name.into(),
+            Arc::new(InterruptManager::new(64)),
+            actor_id,
+        );
+        register_port(port_name, handle, Arc::new(TraceManager::new())).unwrap();
+
+        // A record in the database with no port yet: BAUD/IEOS/PCNCT are at their
+        // defaults, and the operator is watching them.
+        let db = PvDatabase::new();
+        let rec_name = "R14_47_REC";
+        let rec = AsynRecord::default();
+        db.add_record(rec_name, Box::new(rec)).await.unwrap();
+
+        let mut baud_sub = DbSubscription::subscribe(&db, &format!("{rec_name}.BAUD"))
+            .await
+            .expect("subscribe BAUD");
+        let mut ieos_sub = DbSubscription::subscribe(&db, &format!("{rec_name}.IEOS"))
+            .await
+            .expect("subscribe IEOS");
+        let mut pcnct_sub = DbSubscription::subscribe(&db, &format!("{rec_name}.PCNCT"))
+            .await
+            .expect("subscribe PCNCT");
+
+        // The operator puts PORT — C `special()` :502-517 runs `connectDevice`.
+        {
+            let inst = db.get_record(rec_name).await.unwrap();
+            let mut g = inst.write().await;
+            let rec = g
+                .record
+                .as_any_mut()
+                .unwrap()
+                .downcast_mut::<AsynRecord>()
+                .unwrap();
+            rec.port = port_name.to_string();
+            rec.special("PORT", true).unwrap();
+            assert_eq!(rec.baud, baud_choice_index("19200"), "the field refreshed");
+            assert_eq!(rec.ieos, "\\r\\n", "…and the EOS with it");
+            assert_eq!(rec.pcnct, 1, "…and the record attached");
+        }
+
+        // …and each of the three posting sites fired its monitor.
+        assert_eq!(
+            baud_sub.recv().await,
+            Some(EpicsValue::Enum(baud_choice_index("19200") as u16)),
+            "getOptions posts BAUD (asynRecord.c:1926)"
+        );
+        assert_eq!(
+            ieos_sub.recv().await,
+            Some(EpicsValue::String("\\r\\n".into())),
+            "getEos posts IEOS (asynRecord.c:2016-2020)"
+        );
+        assert_eq!(
+            pcnct_sub.recv().await,
+            Some(EpicsValue::Enum(1)),
+            "monitorStatus posts PCNCT (asynRecord.c:1128)"
         );
     }
 

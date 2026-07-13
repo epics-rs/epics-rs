@@ -3240,7 +3240,7 @@ mod tests {
         }"#;
         let provider = Arc::new(BridgeProvider::new(db.clone()));
         provider.load_group_config(GROUP_JSON).expect("load group");
-        provider.process_groups();
+        provider.process_groups().await;
         assert!(
             provider.has_group_pv("LOCAL:GROUP"),
             "group PV must be registered in the provider"

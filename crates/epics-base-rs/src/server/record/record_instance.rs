@@ -7,7 +7,7 @@ use crate::error::{CaError, CaResult};
 use crate::server::event_queue::{EventReader, EventUser};
 use crate::server::pv::{MonitorEvent, Subscriber};
 use crate::server::recgbl::EventMask;
-use crate::server::snapshot::{ControlInfo, DisplayInfo, EnumInfo};
+use crate::server::snapshot::{ControlInfo, DisplayInfo, EnumInfo, PropertySupport};
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
 use super::alarm::{AlarmSeverity, AnalogAlarmConfig};
@@ -1245,6 +1245,11 @@ impl RecordInstance {
         // strings.
         self.attach_menu_enum(field, &mut snap);
 
+        // The metadata VALUES and the mask that says which of them this
+        // channel actually supplies are assigned by the same owner, from the
+        // settled value, so they cannot disagree.
+        self.assign_property_support(field, &mut snap);
+
         // apply `info(Q:time:tag, "nsec:lsb:N")` — pvxs
         // `iocsource.cpp:239-248` publishes `nanoseconds & ~nsecMask` and
         // moves `nanoseconds & nsecMask` into `timeStamp.userTag`. The
@@ -1322,6 +1327,163 @@ impl RecordInstance {
             .iter()
             .position(|name| name == tag)
             .map(|i| i as i16)
+    }
+
+    /// Stamp a built snapshot with the property mask THIS channel supplies —
+    /// [`Self::property_support`] narrowed to the addressed field by C's
+    /// second gate ([`PropertySupport::narrowed_to_field`]). Called by both
+    /// snapshot builders once the value has settled (after
+    /// [`Self::attach_menu_enum`] promoted a `DBF_MENU` field to its
+    /// `DBR_ENUM` form), so the mask is read off the same value the client
+    /// receives and no consumer has to re-derive either gate.
+    fn assign_property_support(&self, field: &str, snap: &mut super::super::snapshot::Snapshot) {
+        snap.properties = Self::property_support(self.record.record_type()).narrowed_to_field(
+            snap.value.db_field_type(),
+            self.menu_choices_for(field).is_some(),
+        );
+    }
+
+    /// The property mask a channel on `field` supplies, without building a
+    /// snapshot — what a PVA server needs to decide which NT leaves it may
+    /// MARK for a channel it has not read yet (QSRV resolves a group's member
+    /// masks once, at monitor start, rather than per event).
+    ///
+    /// Same two gates, same owner as [`Self::assign_property_support`]: an
+    /// unknown field supplies nothing.
+    pub fn property_support_for_field(&self, field: &str) -> PropertySupport {
+        let Some(value) = self.client_field_value(field) else {
+            return PropertySupport::NONE;
+        };
+        Self::property_support(self.record.record_type()).narrowed_to_field(
+            value.db_field_type(),
+            self.menu_choices_for(field).is_some(),
+        )
+    }
+
+    /// The record type's RSET metadata slots — which of C's six nullable
+    /// `get_*` property functions the record type implements.
+    ///
+    /// This is the port's `rset` property table, transcribed slot by slot
+    /// from the `#define get_xxx NULL` lines of each C record's `.c`. It is
+    /// what `dbGet` consults to *narrow* the caller's `options` mask
+    /// (`dbAccess.c:336-430`), and therefore what decides whether QSRV marks
+    /// an NT leaf at all (pvxs `ioc/iocsource.cpp:263-305`). Without it the
+    /// port fabricated every leaf it could name and marked it as supplied —
+    /// telling the client a made-up `display.precision = 0` on a `longout`,
+    /// or `valueAlarm` bands at zero on a `waveform`, were authoritative.
+    ///
+    /// A slot counts as supplied when the C function pointer is non-NULL,
+    /// even if the function writes nothing for the field in question — C
+    /// leaves the option bit set either way (e.g. `boRecord.c:294-299`,
+    /// whose `get_units` writes `"s"` only for `HIGH`, yet `DBR_UNITS`
+    /// survives for every `bo` field).
+    fn property_support(rtype: &str) -> PropertySupport {
+        use PropertySupport as P;
+        match rtype {
+            // Every numeric slot, no enum strings.
+            // aiRecord.c:68-87, aoRecord.c:67-86, calcRecord.c:63-82,
+            // calcoutRecord.c:67-86, selRecord.c:58-77, subRecord.c:62-81,
+            // dfanoutRecord.c:66-85, seqRecord.c:56-75.
+            "ai" | "ao" | "calc" | "calcout" | "sel" | "sub" | "dfanout" | "seq" => P::NUMERIC,
+
+            // Integer scalars: `#define get_precision NULL`
+            // (longinRecord.c, longoutRecord.c, int64inRecord.c,
+            // int64outRecord.c). This is the measured `longout` case —
+            // pvxs leaves `display.precision` absent, the port sent 0.
+            "longin" | "longout" | "int64in" | "int64out" => P {
+                precision: false,
+                ..P::NUMERIC
+            },
+
+            // Arrays and compress: `#define get_alarm_double NULL`
+            // (waveformRecord.c, aaiRecord.c, aaoRecord.c,
+            // subArrayRecord.c, compressRecord.c, histogramRecord.c).
+            // This is the measured `waveform` case — pvxs leaves all four
+            // `valueAlarm.*Limit` absent, the port sent four zeros.
+            "waveform" | "aai" | "aao" | "subArray" | "compress" | "histogram" => P {
+                alarm_double: false,
+                ..P::NUMERIC
+            },
+
+            // No property slots at all: every `get_*` is `#define`d NULL.
+            // stringinRecord.c:62-81, stringoutRecord.c:64-83,
+            // lsiRecord.c:287-306, lsoRecord.c:328-347,
+            // eventRecord.c:62-81, permissiveRecord.c:56-75,
+            // stateRecord.c:58-77, printfRecord.c:456-475,
+            // fanoutRecord.c:60-79, timestampRecord (std-rs).
+            // This is the measured `stringout` case — pvxs leaves
+            // `display.units` absent, the port sent "".
+            "stringin" | "stringout" | "lsi" | "lso" | "event" | "permissive" | "state"
+            | "printf" | "fanout" | "timestamp" => P::NONE,
+
+            // Enum records. `biRecord.c:61-80` and `mbbiRecord.c:65-84` /
+            // `mbboRecord.c:64-83` NULL every numeric slot and supply only
+            // `get_enum_strs`. `boRecord.c:59-61` keeps `get_units`,
+            // `get_precision` and `get_control_double` (they serve the
+            // `HIGH` field) but NULLs `get_graphic_double` and
+            // `get_alarm_double`.
+            "bi" | "mbbi" | "mbbo" => P {
+                enum_strs: true,
+                ..P::NONE
+            },
+            "bo" => P {
+                units: true,
+                precision: true,
+                control_double: true,
+                enum_strs: true,
+                ..P::NONE
+            },
+            // busyRecord.c (synApps busy): units/graphic/control/alarm NULL,
+            // get_precision and get_enum_strs present.
+            "busy" => P {
+                precision: true,
+                enum_strs: true,
+                ..P::NONE
+            },
+            // mbbiDirectRecord.c:63-81 / mbboDirectRecord.c:63-81 — only
+            // `get_precision` survives, and C's DBF_FLOAT/DOUBLE gate
+            // (`dbAccess.c:388-395`) drops it again for their DBF_ENUM/LONG
+            // value, so nothing is marked. `Snapshot::precision` applies
+            // that gate.
+            "mbbiDirect" | "mbboDirect" => P {
+                precision: true,
+                ..P::NONE
+            },
+
+            // synApps, transcribed the same way.
+            // sCalcoutRecord.c / aCalcoutRecord.c / sseqRecord.c /
+            // motorRecord.cc: full numeric set, no enum strings.
+            "scalcout" | "acalcout" | "sseq" | "motor" | "epid" | "aSub" | "scaler" => P::NUMERIC,
+            // tableRecord.cc (optics): `#define get_alarm_double NULL`.
+            "table" => P {
+                alarm_double: false,
+                ..P::NUMERIC
+            },
+            // swaitRecord.c: get_units and get_control_double are NULL.
+            "swait" => P {
+                units: false,
+                control_double: false,
+                ..P::NUMERIC
+            },
+            // transformRecord.c and std-rs throttle: only get_precision
+            // (transform) / get_precision+get_graphic_double (throttle)
+            // survive.
+            "transform" => P {
+                precision: true,
+                ..P::NONE
+            },
+            "throttle" => P {
+                precision: true,
+                graphic_double: true,
+                ..P::NONE
+            },
+
+            // A record type whose C rset the port has not transcribed keeps
+            // the pre-existing "supplies what it populated" behaviour rather
+            // than silently losing metadata. Add an arm above — with the C
+            // file and line — when porting a new record type.
+            _ => P::NUMERIC,
+        }
     }
 
     fn populate_display_info(&self, snap: &mut super::super::snapshot::Snapshot) {
@@ -3531,6 +3693,8 @@ impl RecordInstance {
         // choice labels as the GET path, so a `camonitor`/`pvmonitor`
         // update shows the menu label, not a bare index.
         self.attach_menu_enum(field, &mut snap);
+        // Same owner, same settled value, same mask as the GET path.
+        self.assign_property_support(field, &mut snap);
         snap
     }
 
@@ -4320,6 +4484,61 @@ mod metadata_cache_tests {
         // Second snapshot: mV (rebuilt)
         let snap2 = inst.snapshot_for_field("VAL").unwrap();
         assert_eq!(snap2.display.unwrap().units, "mV");
+    }
+
+    /// R19-41: every snapshot carries the mask of which properties the
+    /// channel SUPPLIES — C's `rset` slots (`dbAccess.c:336-430` clears the
+    /// option bit of each NULL slot) narrowed to the addressed field. One
+    /// case per gate boundary; the three record types are the ones measured
+    /// against pvxs, which marks none of these leaves.
+    #[test]
+    fn property_support_masks_what_the_record_type_does_not_supply() {
+        use crate::server::records::longout::LongoutRecord;
+        use crate::server::records::stringout::StringoutRecord;
+        use crate::server::records::waveform::WaveformRecord;
+
+        // ai VAL (DBF_DOUBLE): every numeric slot, no enum strings.
+        let ai = ai_instance();
+        let p = ai.snapshot_for_field("VAL").unwrap().properties;
+        assert_eq!(p, PropertySupport::NUMERIC);
+        assert_eq!(
+            ai.snapshot_for_field("VAL").unwrap().precision(),
+            Some(2),
+            "an ai supplies get_precision and VAL is DBF_DOUBLE"
+        );
+
+        // ai RVAL (DBF_LONG): the SAME rset, but C keeps DBR_PRECISION only
+        // for DBF_FLOAT/DBF_DOUBLE (`dbAccess.c:386-395`).
+        let rval = ai.snapshot_for_field("RVAL").unwrap();
+        assert!(
+            !rval.properties.precision && rval.precision().is_none(),
+            "a non-float field supplies no precision even when the rset does"
+        );
+        assert!(
+            rval.properties.units,
+            "the other slots are unaffected by the field's type"
+        );
+
+        // longout: `#define get_precision NULL`.
+        let lo = RecordInstance::new("LO".to_string(), LongoutRecord::default());
+        let lo = lo.snapshot_for_field("VAL").unwrap();
+        assert!(!lo.properties.precision && lo.precision().is_none());
+        assert!(lo.properties.units && lo.properties.graphic_double);
+
+        // stringout: no property slot at all.
+        let so = RecordInstance::new("SO".to_string(), StringoutRecord::default());
+        let so = so.snapshot_for_field("VAL").unwrap();
+        assert_eq!(so.properties, PropertySupport::NONE);
+        assert!(so.units().is_none(), "a stringout supplies no EGU");
+
+        // waveform: `#define get_alarm_double NULL`.
+        let wf = RecordInstance::new("WF".to_string(), WaveformRecord::default());
+        let wf = wf.snapshot_for_field("VAL").unwrap();
+        assert!(
+            !wf.properties.alarm_double && wf.alarm_limits().is_none(),
+            "a waveform supplies no alarm limits — a GUI must not draw bands at zero"
+        );
+        assert!(wf.properties.units && wf.properties.graphic_double);
     }
 
     #[test]

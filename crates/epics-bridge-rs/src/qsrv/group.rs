@@ -11,6 +11,7 @@ use std::sync::Arc;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::database::db_access::{DbSubscription, SubscriptionActivation};
 use epics_base_rs::server::recgbl::EventMask as DbeMask;
+use epics_base_rs::server::snapshot::PropertySupport;
 use epics_base_rs::types::{DbFieldType, dbf_link_class};
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, VariantValue};
 use epics_pva_rs::server_native::source::RemoteLog;
@@ -1387,20 +1388,26 @@ impl GroupChannel {
         if !process_it {
             return Ok(());
         }
-        // The link-aware entry: `dbProcess` runs INP/OUT/FLNK side effects, so
-        // the value-only `process_record` (process_local + notify) is not the
-        // equivalent. `_already_locked` inside an atomic PUT — that transaction
-        // owns every member-record gate via `lock_records`, and the gate
-        // `Mutex` is not reentrant.
-        let mut visited = std::collections::HashSet::new();
+        // The DECISION is the group's (pvxs asks it in `doPostProcessing`); the
+        // TRANSITION is the database's. `put_driven_process` is its declared
+        // single owner — C `dbPutField:1264-1277` and pvxs
+        // `iocsource.cpp:404-419` split identically on PACT: an async-active
+        // record takes `rpro = TRUE` and is NOT processed (`recGblFwdLink`
+        // re-queues it when the device round trip lands), an idle one takes
+        // `putf = TRUE` and processes. Reaching for `process_record_with_links`
+        // here instead set neither flag and dropped a group PUT into
+        // `dbProcess`'s own PACT guard — the LCNT bump and the SCAN_ALARM /
+        // INVALID after MAX_LOCK that C's `doPostProcessing` exists to avoid,
+        // while losing the deferred reprocess: two rapid group PUTs to a Passive
+        // async output wrote one value to the device where C writes both.
+        //
+        // `_already_locked` inside an atomic PUT — that transaction owns every
+        // member-record gate via `lock_records`, and the gate `Mutex` is not
+        // reentrant.
         if already_locked {
-            self.db
-                .process_record_with_links_already_locked(record_name, &mut visited, 0)
-                .await
+            self.db.put_driven_process_already_locked(record_name).await
         } else {
-            self.db
-                .process_record_with_links(record_name, &mut visited, 0)
-                .await
+            self.db.put_driven_process(record_name).await
         }
         .map_err(|e| BridgeError::PutRejected(e.to_string()))
     }
@@ -2121,6 +2128,14 @@ pub struct GroupMonitor {
     activation_handles: Vec<SubscriptionActivation>,
     /// Access control context propagated from the parent GroupChannel.
     access: super::provider::AccessContext,
+    /// Which NT property leaves each member's channel actually SUPPLIES —
+    /// `member_props[i]` belongs to `def.members[i]`, resolved once in
+    /// [`start`] (the record type's rset slots narrowed to the member's
+    /// field, exactly as `dbChannelGet` narrows `getProperties`'s option
+    /// mask). Resolved there rather than per event because it cannot change
+    /// while the monitor runs: a record's type is fixed at load. Empty until
+    /// `start`, which is the only state in which no event can arrive.
+    member_props: Vec<PropertySupport>,
     /// The NEGOTIATED monitor queue limit the PVA server resolved for this
     /// operation (`MonitorOptions::queue_size` == pvxs `stats.limitQueue`).
     /// Stamped into every monitor value's `record._options.queueSize` via
@@ -2156,6 +2171,7 @@ impl GroupMonitor {
             _tasks: Vec::new(),
             activation_handles: Vec::new(),
             access: super::provider::AccessContext::allow_all(),
+            member_props: Vec::new(),
             queue_limit: epics_pva_rs::server_native::source::DEFAULT_MONITOR_QUEUE_LIMIT,
         }
     }
@@ -2240,7 +2256,12 @@ impl GroupMonitor {
     /// unmasked post carries no classification) falls back to
     /// `Value | Alarm`, the same default pvxs uses when no field log is
     /// available (pre-7.0.6 builds).
-    fn value_event_mark(def: &GroupPvDef, source_idx: usize, event_mask: DbeMask) -> EventMark {
+    fn value_event_mark(
+        def: &GroupPvDef,
+        props: &[PropertySupport],
+        source_idx: usize,
+        event_mask: DbeMask,
+    ) -> EventMark {
         let Some(source) = def.members.get(source_idx) else {
             return EventMark::Skip;
         };
@@ -2258,10 +2279,10 @@ impl GroupMonitor {
                 trigger_change
             }
         };
-        let targets: Vec<(&GroupMember, DbeMask)> = match &source.triggers {
+        let targets: Vec<(usize, &GroupMember, DbeMask)> = match &source.triggers {
             TriggerDef::None => return EventMark::Skip,
             // Self-trigger inside a mixed group marks only its own field.
-            TriggerDef::SelfOnly => vec![(source, self_change)],
+            TriggerDef::SelfOnly => vec![(source_idx, source, self_change)],
             // `"*"` marks every member field WITH A CHANNEL. pvxs drops
             // channel-less Const/Structure targets from the `*` expansion
             // (`groupconfigprocessor.cpp:387-388`: `if(!…channel.empty())`)
@@ -2273,7 +2294,7 @@ impl GroupMonitor {
                 .iter()
                 .enumerate()
                 .filter(|(_, m)| !m.channel.is_empty())
-                .map(|(i, m)| (m, change_for(i)))
+                .map(|(i, m)| (i, m, change_for(i)))
                 .collect(),
             // Named targets: pvxs resolves only references that name an
             // existing field WITH A CHANNEL (`groupconfigprocessor.cpp:
@@ -2285,10 +2306,10 @@ impl GroupMonitor {
                 .iter()
                 .enumerate()
                 .filter(|(_, m)| !m.channel.is_empty() && refs.iter().any(|r| r == &m.field_name))
-                .map(|(i, m)| (m, change_for(i)))
+                .map(|(i, m)| (i, m, change_for(i)))
                 .collect(),
         };
-        Self::marked_leaves(targets)
+        Self::marked_leaves(props, targets)
     }
 
     /// a *property* event marks only the source field's
@@ -2300,14 +2321,18 @@ impl GroupMonitor {
     /// and marking timeStamp/alarm here (as the snapshot diff did) is
     /// exactly the divergence `getTimeAlarm`'s `change & (Value | Alarm)`
     /// gate rules out (`iocsource.cpp:330-332`).
-    fn property_event_mark(def: &GroupPvDef, source_idx: usize) -> EventMark {
+    fn property_event_mark(
+        def: &GroupPvDef,
+        props: &[PropertySupport],
+        source_idx: usize,
+    ) -> EventMark {
         let Some(source) = def.members.get(source_idx) else {
             return EventMark::Skip;
         };
         // pvxs passes `UpdateType::Property` unconditionally for a
         // property event (`groupsource.cpp:378`) — the event's own DBE
         // mask is not consulted.
-        Self::marked_leaves(vec![(source, DbeMask::PROPERTY)])
+        Self::marked_leaves(props, vec![(source_idx, source, DbeMask::PROPERTY)])
     }
 
     /// Expand each `(member, change)` pair into the wire leaves its
@@ -2339,13 +2364,17 @@ impl GroupMonitor {
     /// The per-mapping leaf set is [`pvif::change_leaf_paths`] — the one
     /// owner of pvxs `IOCSource::get`'s assignment, shared with the
     /// single-record monitor.
-    fn marked_leaves(targets: Vec<(&GroupMember, DbeMask)>) -> EventMark {
+    fn marked_leaves(
+        props: &[PropertySupport],
+        targets: Vec<(usize, &GroupMember, DbeMask)>,
+    ) -> EventMark {
         let mut leaves = Vec::new();
-        for (m, change) in targets {
+        for (idx, m, change) in targets {
             leaves.extend(super::pvif::change_leaf_paths(
                 &m.field_name,
                 m.mapping,
                 change,
+                props.get(idx).copied().unwrap_or(PropertySupport::NONE),
             ));
         }
         if leaves.is_empty() {
@@ -2369,6 +2398,21 @@ impl super::provider::PvaMonitor for GroupMonitor {
                 self.def.name, self.access.user, self.access.host
             )));
         }
+
+        // Resolve every member's property mask once, before the first event
+        // can arrive — which leaves that member's channel actually supplies
+        // (`dbChannelGet`'s narrowing of `getProperties`'s option mask). Built
+        // by mapping over `def.members`, so the index correspondence
+        // `member_props[i] <-> def.members[i]` holds by construction.
+        self.member_props = {
+            let mut props = Vec::with_capacity(self.def.members.len());
+            for member in &self.def.members {
+                props.push(
+                    super::provider::channel_property_support(&self.db, &member.channel).await,
+                );
+            }
+            props
+        };
 
         // Create fan-in channel for member events. Capacity scales
         // with member count so a many-record group with simultaneous
@@ -2552,11 +2596,14 @@ impl super::provider::PvaMonitor for GroupMonitor {
             // the marked set is what the PVA layer turns into the wire
             // changed-bitset.
             let mark = match event.kind {
-                MemberEventKind::Value => {
-                    Self::value_event_mark(&self.def, event.member_index, event.mask)
-                }
+                MemberEventKind::Value => Self::value_event_mark(
+                    &self.def,
+                    &self.member_props,
+                    event.member_index,
+                    event.mask,
+                ),
                 MemberEventKind::Property => {
-                    Self::property_event_mark(&self.def, event.member_index)
+                    Self::property_event_mark(&self.def, &self.member_props, event.member_index)
                 }
             };
             // Every posted group event carries its marked leaves — there is
@@ -2859,6 +2906,22 @@ mod tests {
     use crate::qsrv::provider::Channel;
     use std::time::Duration;
 
+    /// Every member supplies every property — the mask a channel on an
+    /// `mbbi`/`ai` VAL field resolves to. The leaf-narrowing cases below are
+    /// about the DBE CHANGE CLASSES (which leaves a value / property event
+    /// marks); the rset narrowing that decides which of those leaves the
+    /// record type supplies at all is a separate boundary, covered by the
+    /// `property_support` cases in `pvif` and `record_instance`.
+    fn full_props(def: &GroupPvDef) -> Vec<PropertySupport> {
+        vec![
+            PropertySupport {
+                enum_strs: true,
+                ..PropertySupport::NUMERIC
+            };
+            def.members.len()
+        ]
+    }
+
     #[test]
     fn nested_field_set_simple() {
         let mut pv = PvStructure::new("test");
@@ -2941,7 +3004,12 @@ mod tests {
             "meta": { "+type": "structure", "+id": "x/v1" }
         } }"#;
         let def = parse_group_config(star).unwrap().pop().unwrap();
-        match GroupMonitor::value_event_mark(&def, src_idx(&def), DbeMask::VALUE | DbeMask::ALARM) {
+        match GroupMonitor::value_event_mark(
+            &def,
+            &full_props(&def),
+            src_idx(&def),
+            DbeMask::VALUE | DbeMask::ALARM,
+        ) {
             EventMark::Marked(paths) => {
                 assert!(
                     paths.iter().any(|p| p == "chan" || p.starts_with("chan.")),
@@ -2962,7 +3030,12 @@ mod tests {
             "meta": { "+type": "structure", "+id": "x/v1" }
         } }"#;
         let def = parse_group_config(named).unwrap().pop().unwrap();
-        match GroupMonitor::value_event_mark(&def, src_idx(&def), DbeMask::VALUE | DbeMask::ALARM) {
+        match GroupMonitor::value_event_mark(
+            &def,
+            &full_props(&def),
+            src_idx(&def),
+            DbeMask::VALUE | DbeMask::ALARM,
+        ) {
             EventMark::Marked(paths) => {
                 assert!(
                     paths.iter().any(|p| p == "chan" || p.starts_with("chan.")),
@@ -3007,9 +3080,12 @@ mod tests {
 
         // Value event: value/alarm/timeStamp of every channeled member,
         // never the property-metadata leaves.
-        let EventMark::Marked(v) =
-            GroupMonitor::value_event_mark(&def, src, DbeMask::VALUE | DbeMask::ALARM)
-        else {
+        let EventMark::Marked(v) = GroupMonitor::value_event_mark(
+            &def,
+            &full_props(&def),
+            src,
+            DbeMask::VALUE | DbeMask::ALARM,
+        ) else {
             panic!("expected Marked from a `*` value event");
         };
         for member in ["a", "b"] {
@@ -3031,24 +3107,25 @@ mod tests {
         // (`iocsource.cpp:252-310`) assigns on the source member — never
         // value/alarm/timeStamp, never the triggered member `b`, and never
         // the parent `display` / `control` / `valueAlarm` structures.
-        let EventMark::Marked(p) = GroupMonitor::property_event_mark(&def, src) else {
+        let EventMark::Marked(p) = GroupMonitor::property_event_mark(&def, &full_props(&def), src)
+        else {
             panic!("expected Marked from a property event");
         };
         assert_eq!(
             p,
             vec![
                 "a.display.units",
+                "a.value.choices",
                 "a.display.limitLow",
                 "a.display.limitHigh",
                 "a.display.precision",
-                "a.display.description",
                 "a.control.limitLow",
                 "a.control.limitHigh",
                 "a.valueAlarm.lowAlarmLimit",
                 "a.valueAlarm.lowWarningLimit",
                 "a.valueAlarm.highWarningLimit",
                 "a.valueAlarm.highAlarmLimit",
-                "a.value.choices",
+                "a.display.description",
             ],
             "pvxs getProperties leaf list (iocsource.cpp:252-310)"
         );
@@ -3127,7 +3204,8 @@ mod tests {
 
         // Property boundary: exactly the `getProperties` leaves of the
         // source member — no timeStamp, no alarm, no value, no other member.
-        let EventMark::Marked(p) = GroupMonitor::property_event_mark(&def, src) else {
+        let EventMark::Marked(p) = GroupMonitor::property_event_mark(&def, &full_props(&def), src)
+        else {
             panic!("a pure self-trigger property event must mark leaves, not derive");
         };
         assert!(
@@ -3149,9 +3227,12 @@ mod tests {
         // marked assigned-not-changed — carried whether or not they differ
         // from the last snapshot. Property leaves stay out (getProperties is
         // gated on `change & Property`).
-        let EventMark::Marked(v) =
-            GroupMonitor::value_event_mark(&def, src, DbeMask::VALUE | DbeMask::ALARM)
-        else {
+        let EventMark::Marked(v) = GroupMonitor::value_event_mark(
+            &def,
+            &full_props(&def),
+            src,
+            DbeMask::VALUE | DbeMask::ALARM,
+        ) else {
             panic!("a pure self-trigger value event must mark leaves, not derive");
         };
         assert_eq!(
@@ -3162,11 +3243,15 @@ mod tests {
 
         // An ALARM-only self post carries no value leaf; a VALUE-only one
         // carries no alarm leaf (`getTimeAlarm`'s `change & Alarm` gate).
-        let EventMark::Marked(v) = GroupMonitor::value_event_mark(&def, src, DbeMask::ALARM) else {
+        let EventMark::Marked(v) =
+            GroupMonitor::value_event_mark(&def, &full_props(&def), src, DbeMask::ALARM)
+        else {
             panic!("expected Marked from an alarm-only event");
         };
         assert_eq!(v, vec!["a.timeStamp", "a.alarm"], "no value leaf: {v:?}");
-        let EventMark::Marked(v) = GroupMonitor::value_event_mark(&def, src, DbeMask::VALUE) else {
+        let EventMark::Marked(v) =
+            GroupMonitor::value_event_mark(&def, &full_props(&def), src, DbeMask::VALUE)
+        else {
             panic!("expected Marked from a value-only event");
         };
         assert_eq!(v, vec!["a.timeStamp", "a.value"], "no alarm leaf: {v:?}");
@@ -3191,9 +3276,12 @@ mod tests {
             .position(|m| m.field_name == "m")
             .unwrap();
 
-        let EventMark::Marked(v) =
-            GroupMonitor::value_event_mark(&def, src, DbeMask::VALUE | DbeMask::ALARM)
-        else {
+        let EventMark::Marked(v) = GroupMonitor::value_event_mark(
+            &def,
+            &full_props(&def),
+            src,
+            DbeMask::VALUE | DbeMask::ALARM,
+        ) else {
             panic!("expected Marked");
         };
         // meta member: alarm + timeStamp, no value leaf.
@@ -3216,7 +3304,7 @@ mod tests {
         // Property event on the meta source contributes nothing → Skip.
         assert!(
             matches!(
-                GroupMonitor::property_event_mark(&def, src),
+                GroupMonitor::property_event_mark(&def, &full_props(&def), src),
                 EventMark::Skip
             ),
             "meta member carries no property-metadata leaves"
@@ -3259,9 +3347,12 @@ mod tests {
         // Value event: the root member's own leaves are the ROOT `timeStamp`
         // / `alarm` (no member prefix), and the `*` trigger still narrows the
         // other member to its Value|Alarm leaves.
-        let EventMark::Marked(v) =
-            GroupMonitor::value_event_mark(&def, root, DbeMask::VALUE | DbeMask::ALARM)
-        else {
+        let EventMark::Marked(v) = GroupMonitor::value_event_mark(
+            &def,
+            &full_props(&def),
+            root,
+            DbeMask::VALUE | DbeMask::ALARM,
+        ) else {
             panic!("a root-meta value event must mark leaves");
         };
         assert!(
@@ -3283,7 +3374,7 @@ mod tests {
         // Scalar-only, so nothing is assigned and pvxs posts nothing.
         assert!(
             matches!(
-                GroupMonitor::property_event_mark(&def, root),
+                GroupMonitor::property_event_mark(&def, &full_props(&def), root),
                 EventMark::Skip
             ),
             "DBE_PROPERTY on a root-meta member marks nothing → no post"
@@ -3323,9 +3414,12 @@ mod tests {
             .position(|m| m.field_name == "a[0].x")
             .expect("subscripted member");
 
-        let EventMark::Marked(v) =
-            GroupMonitor::value_event_mark(&def, src, DbeMask::VALUE | DbeMask::ALARM)
-        else {
+        let EventMark::Marked(v) = GroupMonitor::value_event_mark(
+            &def,
+            &full_props(&def),
+            src,
+            DbeMask::VALUE | DbeMask::ALARM,
+        ) else {
             panic!("an array-member value event must mark leaves, not skip");
         };
         // Both subscripted members collapse onto the one array field; no
@@ -3395,7 +3489,9 @@ mod tests {
 
         // ALARM-only event: self re-sends alarm + timeStamp but NOT its
         // value; the triggered member keeps the full Value|Alarm refresh.
-        let EventMark::Marked(v) = GroupMonitor::value_event_mark(&def, src, DbeMask::ALARM) else {
+        let EventMark::Marked(v) =
+            GroupMonitor::value_event_mark(&def, &full_props(&def), src, DbeMask::ALARM)
+        else {
             panic!("expected Marked from an ALARM-only event");
         };
         assert!(v.contains(&"a.alarm".to_string()), "{v:?}");
@@ -3408,7 +3504,9 @@ mod tests {
         assert!(v.contains(&"b.alarm".to_string()), "{v:?}");
 
         // VALUE-only event: self marks value + timeStamp but NOT alarm.
-        let EventMark::Marked(v) = GroupMonitor::value_event_mark(&def, src, DbeMask::VALUE) else {
+        let EventMark::Marked(v) =
+            GroupMonitor::value_event_mark(&def, &full_props(&def), src, DbeMask::VALUE)
+        else {
             panic!("expected Marked from a VALUE-only event");
         };
         assert!(v.contains(&"a.value".to_string()), "{v:?}");
@@ -3444,7 +3542,7 @@ mod tests {
             .unwrap();
         assert!(
             matches!(
-                GroupMonitor::value_event_mark(&def, src, DbeMask::LOG),
+                GroupMonitor::value_event_mark(&def, &full_props(&def), src, DbeMask::LOG),
                 EventMark::Skip
             ),
             "an ARCHIVE-only self-trigger event must be suppressed"
@@ -3457,7 +3555,9 @@ mod tests {
             .iter()
             .position(|m| m.field_name == "b")
             .unwrap();
-        let EventMark::Marked(v) = GroupMonitor::value_event_mark(&def, src_b, DbeMask::LOG) else {
+        let EventMark::Marked(v) =
+            GroupMonitor::value_event_mark(&def, &full_props(&def), src_b, DbeMask::LOG)
+        else {
             panic!("expected Marked: the non-self target still refreshes");
         };
         assert!(
@@ -3488,7 +3588,9 @@ mod tests {
             .iter()
             .position(|m| m.field_name == "a")
             .unwrap();
-        let EventMark::Marked(v) = GroupMonitor::value_event_mark(&def, src, DbeMask::NONE) else {
+        let EventMark::Marked(v) =
+            GroupMonitor::value_event_mark(&def, &full_props(&def), src, DbeMask::NONE)
+        else {
             panic!("expected Marked from an unmasked event");
         };
         assert!(v.contains(&"a.value".to_string()), "{v:?}");
@@ -3889,6 +3991,88 @@ mod tests {
                 1,
                 "proc member without +putorder must process its record (atomic={atomic})"
             );
+        }
+    }
+
+    /// R19-43: a group PUT that decides to process routes the transition
+    /// through the database's `put_driven_process` owner, so it splits on PACT
+    /// exactly as pvxs `doPostProcessing` does (`iocsource.cpp:404-419`):
+    ///
+    /// * **record ACTIVE** — `rpro = TRUE`, and `dbProcess` is NOT called.
+    ///   `recGblFwdLink` re-queues the record when the device round trip lands,
+    ///   so the put still reaches the device one cycle later. The port used to
+    ///   call `dbProcess` here, landing in its own PACT guard: LCNT bumped, and
+    ///   after MAX_LOCK the record takes a SCAN_ALARM/INVALID that C never
+    ///   raises for a client put — while the deferred reprocess was lost.
+    /// * **record IDLE** — `putf = TRUE` and the record processes.
+    ///
+    /// Both gate modes (atomic ⇒ the caller owns the record gates; non-atomic ⇒
+    /// the owner takes them) must reach the same owner.
+    #[tokio::test]
+    async fn group_put_defers_to_rpro_on_an_active_record() {
+        use epics_base_rs::server::records::ai::AiRecord;
+
+        for atomic in [false, true] {
+            let db = Arc::new(PvDatabase::new());
+            db.add_record("PACT:rec", Box::new(AiRecord::new(0.0)))
+                .await
+                .unwrap();
+            let cfg = format!(
+                r#"{{ "PACT:GRP": {{ "+atomic": {atomic},
+                    "go": {{ "+type": "proc", "+channel": "PACT:rec" }} }} }}"#
+            );
+            let mut defs = super::super::group_config::parse_group_config(&cfg).unwrap();
+            let channel = GroupChannel::new(db.clone(), defs.pop().unwrap());
+
+            // ACTIVE (PACT=1) — the async-device boundary.
+            {
+                let rec = db.get_record("PACT:rec").await.unwrap();
+                let inst = rec.write().await;
+                inst.processing
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+            channel
+                .put(&PvStructure::new("structure"))
+                .await
+                .expect("a group PUT onto an active record is not an error");
+            {
+                let rec = db.get_record("PACT:rec").await.unwrap();
+                let inst = rec.read().await;
+                assert!(
+                    inst.common.rpro,
+                    "an active record takes the RPRO deferral (atomic={atomic})"
+                );
+                assert!(
+                    !inst.common.putf,
+                    "PUTF marks a cycle that actually ran (atomic={atomic})"
+                );
+                assert_eq!(
+                    inst.common.lcnt, 0,
+                    "the deferral must not re-enter dbProcess's PACT guard \
+                     — an LCNT bump is the SCAN_ALARM path C avoids (atomic={atomic})"
+                );
+            }
+
+            // IDLE — the other side of the same boundary.
+            {
+                let rec = db.get_record("PACT:rec").await.unwrap();
+                let mut inst = rec.write().await;
+                inst.processing
+                    .store(false, std::sync::atomic::Ordering::Release);
+                inst.common.rpro = false;
+            }
+            channel
+                .put(&PvStructure::new("structure"))
+                .await
+                .expect("group PUT on an idle record processes");
+            {
+                let rec = db.get_record("PACT:rec").await.unwrap();
+                let inst = rec.read().await;
+                assert!(
+                    !inst.common.rpro,
+                    "an idle record processes now, it does not defer (atomic={atomic})"
+                );
+            }
         }
     }
 

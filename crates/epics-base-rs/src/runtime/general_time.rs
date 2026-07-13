@@ -10,18 +10,24 @@ type EventTimeFn = Box<dyn Fn(i32) -> Option<SystemTime> + Send + Sync>;
 
 /// Seconds between the Unix epoch (1970-01-01) and the EPICS epoch
 /// (1990-01-01 00:00:00 UTC).
-const EPICS_EPOCH_UNIX_SECS: u64 = 631_152_000;
+pub const EPICS_EPOCH_UNIX_SECS: u64 = 631_152_000;
 
 /// The EPICS epoch (1990-01-01 00:00:00 UTC) expressed as a Unix
 /// `SystemTime`.
 ///
+/// This is the value of an all-zero `epicsTimeStamp`, and therefore the
+/// single owner of "a time nobody has set yet" everywhere in the port —
+/// a record's `TIME` before its first `process()`, the general-time
+/// ratchet's seed. Seeding such a field with `SystemTime::UNIX_EPOCH`
+/// instead is a 20-year error that survives every conversion: C's
+/// `epicsTimeToTimespec` adds `POSIX_TIME_AT_EPICS_EPOCH`, so the wire
+/// value C derives from `{0,0}` is 631152000, not 0.
+///
 /// C parity: `epicsGeneralTime.c:66` zero-initialises `lastProvidedTime`
-/// to `epicsTimeStamp {0,0}`, whose semantic value is the EPICS epoch,
-/// not the Unix epoch. EPICS time is "seconds past 1990-01-01"; seeding
-/// the ratchet here keeps the raw `last_provided_time` conceptually
-/// comparable to an EPICS timestamp. (Functionally either far-past
-/// value works — the first real sample always ratchets forward.)
-fn epics_epoch() -> SystemTime {
+/// to `epicsTimeStamp {0,0}`; `dbCommon.time` is likewise zeroed by
+/// `calloc` in `dbStaticLib` and never touched until the record first
+/// processes.
+pub fn epics_epoch() -> SystemTime {
     SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(EPICS_EPOCH_UNIX_SECS)
 }
 

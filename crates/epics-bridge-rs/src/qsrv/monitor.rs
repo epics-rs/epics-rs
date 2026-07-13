@@ -355,7 +355,12 @@ impl PvaMonitor for BridgeMonitor {
             // `MappingInfo` — `MappingInfo::Scalar` — for every single
             // record (`singlesource.cpp` never sets another type), so the
             // leaf set is the Scalar one for NTScalar and NTEnum alike.
-            let marked = super::pvif::change_leaf_paths("", FieldMapping::Scalar, change);
+            let marked = super::pvif::change_leaf_paths(
+                "",
+                FieldMapping::Scalar,
+                change,
+                snapshot.properties,
+            );
             if marked.is_empty() {
                 // The event's classes assign no leaf, so `IOCSource::get`
                 // writes nothing, `testmask` fails and `doPost` drops the
@@ -500,6 +505,10 @@ mod tests {
             .marked
             .as_ref()
             .expect("a property event carries its marked leaves");
+        // R19-41: the record is an `ai`, whose rset has no `get_enum_strs`
+        // (`aiRecord.c:68-87`), so `dbChannelGet` clears `DBR_ENUM_STRS` and
+        // pvxs assigns no `value.choices` — the leaf is not even in an
+        // NTScalar. This case used to assert the port marked it.
         assert_eq!(
             marked,
             &vec![
@@ -507,14 +516,13 @@ mod tests {
                 "display.limitLow".to_string(),
                 "display.limitHigh".to_string(),
                 "display.precision".to_string(),
-                "display.description".to_string(),
                 "control.limitLow".to_string(),
                 "control.limitHigh".to_string(),
                 "valueAlarm.lowAlarmLimit".to_string(),
                 "valueAlarm.lowWarningLimit".to_string(),
                 "valueAlarm.highWarningLimit".to_string(),
                 "valueAlarm.highAlarmLimit".to_string(),
-                "value.choices".to_string(),
+                "display.description".to_string(),
             ],
             "a PROPERTY event marks exactly pvxs getProperties' leaves"
         );

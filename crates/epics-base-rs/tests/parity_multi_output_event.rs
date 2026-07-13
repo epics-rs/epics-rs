@@ -188,24 +188,19 @@ async fn event_scan_routes_by_event_number() {
     db.update_scan_index("REC7", ScanType::Passive, ScanType::Event, 0, 0)
         .await;
 
-    // Post event 5 — only REC5 should process. We detect processing
-    // via the record's timestamp moving off the UNIX_EPOCH default.
+    // Post event 5 — only REC5 should process. We detect processing via
+    // the record's timestamp moving off its never-processed value, which
+    // is the EPICS epoch (an all-zero `epicsTimeStamp`), not the Unix
+    // epoch — see `general_time::epics_epoch`.
     db.post_event_named("5").await;
 
+    let unprocessed = epics_base_rs::runtime::general_time::epics_epoch();
     let r5 = db.get_record("REC5").await.unwrap();
     let r7 = db.get_record("REC7").await.unwrap();
     let t5 = r5.read().await.common.time;
     let t7 = r7.read().await.common.time;
-    assert_ne!(
-        t5,
-        std::time::SystemTime::UNIX_EPOCH,
-        "REC5 (EVNT=5) must process on event 5"
-    );
-    assert_eq!(
-        t7,
-        std::time::SystemTime::UNIX_EPOCH,
-        "REC7 (EVNT=7) must NOT process on event 5"
-    );
+    assert_ne!(t5, unprocessed, "REC5 (EVNT=5) must process on event 5");
+    assert_eq!(t7, unprocessed, "REC7 (EVNT=7) must NOT process on event 5");
 }
 
 /// UDF stays true when the processed value is NaN, so the

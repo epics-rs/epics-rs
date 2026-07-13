@@ -284,6 +284,7 @@ async fn read_marks(
                     &m.field_name,
                     m.mapping,
                     super::channel::channel_is_value_field(&m.channel),
+                    provider.channel_property_support(&m.channel).await,
                 ));
             }
             paths
@@ -294,6 +295,7 @@ async fn read_marks(
             "",
             super::FieldMapping::Scalar,
             super::channel::channel_is_value_field(name),
+            provider.channel_property_support(name).await,
         ),
     };
     let PvField::Structure(root) = value else {
@@ -1492,8 +1494,8 @@ async fn load_qsrv_groups(
     }
 
     // 3. Finalize (pvxs resolveTriggerReferences / createGroups).
-    let n = provider.process_groups();
-    tracing::info!("qsrv: processGroups finalized {n} group(s)");
+    let n = provider.process_groups().await;
+    tracing::info!("qsrv: processGroups created {n} group(s)");
 }
 
 #[cfg(test)]
@@ -1891,7 +1893,7 @@ mod tests {
             .unwrap();
         let provider = Arc::new(BridgeProvider::new(db));
         provider.load_group_config(GROUP_JSON).expect("load group");
-        provider.process_groups();
+        provider.process_groups().await;
         let store = QsrvPvStore::new(provider);
 
         let mut query = PvStructure::new("");
@@ -2357,6 +2359,11 @@ mod tests {
 
         let db = Arc::new(PvDatabase::new());
         db.add_record("SP:rec", Box::new(AiRecord::new(1.0)))
+            .await
+            .unwrap();
+        // `SP:grp`'s `+channel` must resolve, or the group is refused at
+        // creation and the shadow rule under test is never exercised.
+        db.add_record("OTHER", Box::new(AiRecord::new(2.0)))
             .await
             .unwrap();
         let provider = Arc::new(BridgeProvider::new(db));

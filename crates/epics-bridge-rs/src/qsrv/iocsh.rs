@@ -604,17 +604,20 @@ fn mac_top_level_comma(body: &[char]) -> Option<usize> {
 }
 
 /// `processGroups` — finalize group config after `dbLoadGroup` calls
-/// and (typically) `iocInit`. Validates trigger references and
-/// reports counts. Mirrors pvxs `processGroups`
-/// (groupsourcehooks.cpp:192).
+/// and (typically) `iocInit`. Validates trigger references and creates
+/// the groups whose every `+channel` resolves, reporting the rest as
+/// `"<group>: Error Group not created: <why>"`. Mirrors pvxs
+/// `processGroups` (groupsourcehooks.cpp:192) → `createGroups`
+/// (groupconfigprocessor.cpp:429-444).
 pub fn process_groups_command(provider: Arc<BridgeProvider>) -> CommandDef {
     CommandDef::new(
         "processGroups",
         vec![],
         "processGroups",
         move |_args: &[ArgValue], ctx: &CommandContext| {
-            let n = provider.process_groups();
-            ctx.println(&format!("processGroups: finalized {n} group(s)"));
+            let provider = provider.clone();
+            let n = ctx.block_on(async move { provider.process_groups().await });
+            ctx.println(&format!("processGroups: created {n} group(s)"));
             Ok(CommandOutcome::Continue)
         },
     )
@@ -1002,6 +1005,14 @@ mod tests {
     #[tokio::test]
     async fn db_load_group_then_process_succeeds() {
         let db = Arc::new(PvDatabase::new());
+        // `processGroups` creates only groups whose every `+channel`
+        // resolves (pvxs `createGroups`), so the backing record must exist.
+        db.add_record(
+            "TEST:val",
+            Box::new(epics_base_rs::server::records::ai::AiRecord::new(1.0)),
+        )
+        .await
+        .unwrap();
         let provider = Arc::new(BridgeProvider::new(db));
         let json = r#"{
             "TEST:grp": {
@@ -1016,7 +1027,7 @@ mod tests {
         provider.load_group_file(path.to_str().unwrap()).unwrap();
         assert_eq!(provider.group_count(), 1);
 
-        let n = provider.process_groups();
+        let n = provider.process_groups().await;
         assert_eq!(n, 1);
 
         let _ = std::fs::remove_file(&path);

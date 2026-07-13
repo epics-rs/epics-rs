@@ -1,4 +1,4 @@
-use crate::types::{EpicsValue, PvString, WallTime};
+use crate::types::{DbFieldType, EpicsValue, PvString, WallTime};
 
 /// Alarm status and severity.
 #[derive(Debug, Clone, Default)]
@@ -76,6 +76,12 @@ pub struct Snapshot {
     pub display: Option<DisplayInfo>,
     pub control: Option<ControlInfo>,
     pub enums: Option<EnumInfo>,
+    /// Which of the six metadata properties THIS channel actually supplies
+    /// — the record type's `rset` slots, narrowed to the addressed field
+    /// ([`PropertySupport::narrowed_to_field`]). Read `Snapshot::units` and
+    /// friends rather than reaching into `display` / `control` directly
+    /// when the consumer must not invent a value.
+    pub properties: PropertySupport,
     /// Timestamp user tag (from Q:time:tag info, nsec LSB splitting).
     pub user_tag: i32,
     /// IOC record-type class name. Populated by the server before
@@ -142,8 +148,137 @@ impl Snapshot {
             display: None,
             control: None,
             enums: None,
+            properties: PropertySupport::NONE,
             user_tag: 0,
             class_name: None,
+        }
+    }
+
+    /// Engineering units, or `None` when the record type has no
+    /// `get_units` slot. See [`PropertySupport`].
+    pub fn units(&self) -> Option<&PvString> {
+        let d = self.display.as_ref()?;
+        self.properties.units.then_some(&d.units)
+    }
+
+    /// Display precision, or `None` when this channel does not supply it —
+    /// the record type has no `get_precision` slot, or the addressed field
+    /// is not a float/double ([`PropertySupport::narrowed_to_field`]).
+    pub fn precision(&self) -> Option<i16> {
+        let d = self.display.as_ref()?;
+        self.properties.precision.then_some(d.precision)
+    }
+
+    /// `(lower, upper)` display limits, or `None` when the record type has
+    /// no `get_graphic_double` slot.
+    pub fn graphic_limits(&self) -> Option<(f64, f64)> {
+        let d = self.display.as_ref()?;
+        self.properties
+            .graphic_double
+            .then_some((d.lower_disp_limit, d.upper_disp_limit))
+    }
+
+    /// `(lower, upper)` control limits, or `None` when the record type has
+    /// no `get_control_double` slot.
+    pub fn control_limits(&self) -> Option<(f64, f64)> {
+        let c = self.control.as_ref()?;
+        self.properties
+            .control_double
+            .then_some((c.lower_ctrl_limit, c.upper_ctrl_limit))
+    }
+
+    /// `(lolo, low, high, hihi)` alarm limits, or `None` when the record
+    /// type has no `get_alarm_double` slot — the `waveform` case that made
+    /// a GUI draw alarm bands at zero.
+    pub fn alarm_limits(&self) -> Option<(f64, f64, f64, f64)> {
+        let d = self.display.as_ref()?;
+        self.properties.alarm_double.then_some((
+            d.lower_alarm_limit,
+            d.lower_warning_limit,
+            d.upper_warning_limit,
+            d.upper_alarm_limit,
+        ))
+    }
+}
+
+/// Which metadata properties a record TYPE supplies — the six nullable
+/// `get_*` slots of C's `rset`.
+///
+/// This is the primitive the port was missing. `dbGet` asks for every
+/// property, then **clears** the `DBR_*` option bit of each slot the record
+/// type left NULL (`dbAccess.c:336-430`: `*options ^= DBR_UNITS`,
+/// `^= DBR_PRECISION`, `^= DBR_GR_DOUBLE`, `^= DBR_CTRL_DOUBLE`,
+/// `^= DBR_AL_DOUBLE`, `^= DBR_ENUM_STRS`). QSRV then assigns each NT leaf
+/// only under the surviving bit (pvxs `ioc/iocsource.cpp:263-305`), so a
+/// record type with a NULL slot leaves that leaf **unmarked**.
+///
+/// Marking a fabricated default is worse than omitting it: the mark tells
+/// the client the value is authoritative. A GUI reading alarm limits off a
+/// `waveform` — whose C rset has no `get_alarm_double` — must see "not
+/// provided", not bands drawn at zero.
+///
+/// The CA wire is deliberately unaffected: C also `memset`s the property
+/// struct to zero and sends it, because the DBR layout is fixed-size. Only
+/// consumers that inspect the narrowed `options` — i.e. QSRV/PVA — can see
+/// the difference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PropertySupport {
+    /// `rset.get_units`
+    pub units: bool,
+    /// `rset.get_precision`
+    pub precision: bool,
+    /// `rset.get_graphic_double`
+    pub graphic_double: bool,
+    /// `rset.get_control_double`
+    pub control_double: bool,
+    /// `rset.get_alarm_double`
+    pub alarm_double: bool,
+    /// `rset.get_enum_strs`
+    pub enum_strs: bool,
+}
+
+impl PropertySupport {
+    /// No slot implemented — a record type that supplies no metadata at all
+    /// (C `stringin`, `stringout`, `lsi`, `lso`, `event`, `printf`, …).
+    pub const NONE: Self = Self {
+        units: false,
+        precision: false,
+        graphic_double: false,
+        control_double: false,
+        alarm_double: false,
+        enum_strs: false,
+    };
+
+    /// Every numeric slot, no enum strings — the `ai`/`ao`/`calc` shape.
+    pub const NUMERIC: Self = Self {
+        units: true,
+        precision: true,
+        graphic_double: true,
+        control_double: true,
+        alarm_double: true,
+        enum_strs: false,
+    };
+
+    /// The record type's slots narrowed to ONE addressed field — C's second
+    /// gate, applied by the same `getOptions`:
+    ///
+    /// * `DBR_PRECISION` survives only for `DBF_FLOAT`/`DBF_DOUBLE`
+    ///   (`dbAccess.c:386-395`), so an `ai`'s `.RVAL` (`DBF_LONG`) supplies
+    ///   no precision even though the `ai` rset has `get_precision`;
+    /// * `DBR_ENUM_STRS` is supplied by `DBF_MENU`/`DBF_DEVICE` fields from
+    ///   the menu itself (no rset slot needed), by a `DBF_ENUM` field only
+    ///   when the rset has `get_enum_strs`, and by nothing else
+    ///   (`get_enum_strs`, `dbAccess.c:196-248`).
+    ///
+    /// A [`Snapshot`]'s `properties` is always the narrowed mask, so a
+    /// consumer never has to re-apply either gate — "which leaves does THIS
+    /// channel supply" has exactly one answer.
+    pub fn narrowed_to_field(self, field_type: DbFieldType, is_menu_field: bool) -> Self {
+        Self {
+            precision: self.precision
+                && matches!(field_type, DbFieldType::Float | DbFieldType::Double),
+            enum_strs: matches!(field_type, DbFieldType::Enum) && (self.enum_strs || is_menu_field),
+            ..self
         }
     }
 }

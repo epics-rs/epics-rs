@@ -67,60 +67,70 @@ pub struct RawEvent {
     pub type_changed: bool,
 }
 
-/// OR a bridge-local overrun signal into a raw MONITOR DATA body.
+/// The frame a subscriber gets after the gateway fanout dropped events under
+/// its OWN backpressure (a tokio `broadcast::Lagged`) — a **re-frame** of the
+/// channel's merged snapshot, never the next delta.
 ///
-/// `body` is the wire `changed | value | overrun` triplet. When the
-/// gateway fanout drops events under one downstream subscriber's own
-/// backpressure (a tokio `broadcast::Lagged`), pva2pva does not silently
-/// swallow the loss: the downstream `MonitorUser` enters overflow, ORs the
-/// upstream and downstream overrun information into a coalesced element and
-/// accumulates the changed set (`moncache.cpp:156-174`), and on the next
-/// `MonitorUser::release()` delivers that element with the accumulated
-/// overrun bitset (`moncache.cpp:354-365`). The downstream client reads the
-/// overrun bitset to learn that intermediate values were lost.
+/// pva2pva does not forward a delta across a downstream overflow. The
+/// `MonitorUser` enters overflow and folds every dropped event into one
+/// coalesced element (`moncache.cpp:156-174`):
 ///
-/// The broadcast ring has already overwritten the dropped events, so we do
-/// not have their changed bitsets to reproduce pva2pva's exact accumulation.
-/// We instead OR the *delivered* (coalesced latest) event's own changed
-/// leaves into its overrun bitset: every field changing in the value the
-/// subscriber is about to see is flagged as having had at least one
-/// unobserved intermediate value across the dropped range. This is a
-/// conservative over-approximation in the safe direction (it can only
-/// over-report "you may have missed a value", never hide a real loss).
-/// Upstream overrun bits already present in the body are preserved — the new
-/// bitset is the union, never a replacement.
+/// ```text
+/// overrun |= lastelem->overrun            // upstream overflows
+/// overrun |= changed & lastelem->changed  // downstream overflows
+/// changed |= lastelem->changed            // ACCUMULATE the changed bits
+/// value.copyUnchecked(lastelem->value, lastelem->changed)
+/// ```
 ///
-/// Returns the rewritten body, or `None` when the body cannot be decoded
-/// against `desc` (the caller then forwards the original bytes unchanged).
-fn mark_raw_body_local_overrun(
-    body: &bytes::Bytes,
+/// The changed BITS accumulate and the VALUES come from the merged element,
+/// so a transition that happened only in a dropped event — an alarm going
+/// MAJOR — still reaches the client. Forwarding the next event's delta
+/// unchanged loses exactly that: the next event marks only ITS OWN leaves, and
+/// on the raw path carries only its own bytes, so the alarm transition is gone
+/// from the wire for good.
+///
+/// The broadcast ring has overwritten the dropped events, so their individual
+/// changed bitsets are unrecoverable — but their EFFECT is not: the channel
+/// cache's `latest` is the merge of every upstream event
+/// ([`ChannelEntry::snapshot`], the same whole-structure element a monitor seed
+/// is built from). Re-framing from it delivers every accumulated value with
+/// every leaf marked changed — a superset of pva2pva's accumulated bitset, and
+/// the same values. No transition can be lost, and the subscriber needs no
+/// "next delta is special" state to carry the loss forward.
+///
+/// The overrun bitset flags every leaf: after a drop, any leaf may have taken
+/// an intermediate value the subscriber never saw. That is pva2pva's
+/// `overrun |= changed & lastelem->changed` under a full changed set, and the
+/// conservative direction — it can over-report "you may have missed a value",
+/// never hide a real loss.
+fn reframe_raw_body_after_lag(
+    value: &PvField,
     desc: &FieldDesc,
     order: epics_pva_rs::proto::ByteOrder,
 ) -> Option<bytes::Bytes> {
     use epics_pva_rs::proto::BitSet;
-    let mut cur = std::io::Cursor::new(body.as_ref());
-    let changed = BitSet::decode(&mut cur, order).ok()?;
-    // Advance the cursor past the value region so it lands on the trailing
-    // overrun bitset; the decoded value itself is discarded — we only need
-    // the `changed | value` / `overrun` split offset.
-    epics_pva_rs::pvdata::encode::decode_pv_field_with_bitset(desc, &changed, 0, &mut cur, order)
-        .ok()?;
-    let value_end = cur.position() as usize;
-    let mut overrun = BitSet::decode(&mut cur, order).ok()?;
-    // Union the delivered event's changed leaves into the (preserved)
-    // upstream overrun bitset.
-    for b in changed.iter() {
-        overrun.set(b);
+    // pva2pva's "all changed" is the root bit (`elem->changedBitSet->set(0)`,
+    // moncache.cpp:304-312). Our encoder cannot emit bit 0 (it trims to leaves,
+    // as pvxs's `Value::mark` does), so the decodable equivalent is the
+    // canonical FULL leaf set — the identical rule `SourceRead { marked: None }`
+    // frames a seed with. Select every bit, canonicalise to the leaves.
+    let mut all = BitSet::new();
+    for b in 0..desc.total_bits() {
+        all.set(b);
     }
-    if overrun.is_empty() {
-        // Nothing changed and nothing was overrun — leave the body byte-
-        // identical so the dedup/ptr fast paths upstream stay valid.
+    let changed = epics_pva_rs::pvdata::encode::canonical_changed_bitset(desc, &all);
+    if changed.is_empty() {
         return None;
     }
-    let mut out = Vec::with_capacity(value_end + 8);
-    out.extend_from_slice(&body[..value_end]);
-    overrun.write_into(order, &mut out);
-    Some(bytes::Bytes::from(out))
+    let mut body = Vec::new();
+    changed.write_into(order, &mut body);
+    epics_pva_rs::pvdata::encode::encode_pv_field_with_bitset(
+        value, desc, &changed, 0, order, &mut body,
+    );
+    // overrun == changed: every leaf of the re-framed structure may have had an
+    // unobserved intermediate value across the dropped range.
+    changed.write_into(order, &mut body);
+    Some(bytes::Bytes::from(body))
 }
 
 /// Lost-leaf paths to record in a cooked [`MonitorUpdate::overrun`] after a
@@ -809,6 +819,10 @@ impl GatewayChannelSource {
         // first upstream event, so introspection is populated; `None` only on
         // the degenerate not-yet-decoded case, where we forward unmarked.
         let desc = entry.introspection();
+        let initial_order = initial_raw
+            .as_ref()
+            .map(|e| e.byte_order)
+            .unwrap_or(epics_pva_rs::proto::ByteOrder::Little);
         let (mpsc_tx, mpsc_rx) =
             mpsc::channel::<epics_pva_rs::server_native::RawMonitorEvent>(self.subscriber_queue);
         let counter = self.subscriber_count.clone();
@@ -825,12 +839,11 @@ impl GatewayChannelSource {
             // skips the first broadcast event that duplicates that
             // snapshot (the subscribe_raw()/snapshot_raw() race window).
             let mut dedup = dedup_body;
-            // Set when this subscriber's broadcast receiver lagged (events
-            // dropped under its own backpressure). pva2pva marks the
-            // coalesced overflow element's overrun bitset on the next
-            // delivery (moncache.cpp:354-365); we mirror that by flagging the
-            // next forwarded body via `mark_raw_body_local_overrun`.
-            let mut pending_overrun = false;
+            // The byte order the re-frame after a lag is encoded in: the one
+            // the upstream is speaking. Seeded from the cached snapshot and
+            // refreshed on every event, so a synthesized frame never
+            // contradicts the bodies around it.
+            let mut order = initial_order;
             loop {
                 match bcast.recv().await {
                     Ok(ev) => {
@@ -840,23 +853,9 @@ impl GatewayChannelSource {
                             }
                         }
                         let type_changed = ev.type_changed;
-                        let mut body = ev.body;
-                        // After a drop, this (latest) event is the coalesced
-                        // element pva2pva would deliver marked overrun. A
-                        // type-change marker carries an empty body and is
-                        // never a value event, so it is left untouched.
-                        if pending_overrun && !type_changed {
-                            if let Some(d) = desc.as_ref() {
-                                if let Some(marked) =
-                                    mark_raw_body_local_overrun(&body, d, ev.byte_order)
-                                {
-                                    body = marked;
-                                }
-                            }
-                            pending_overrun = false;
-                        }
+                        order = ev.byte_order;
                         let out = epics_pva_rs::server_native::RawMonitorEvent {
-                            body_bytes: body,
+                            body_bytes: ev.body,
                             byte_order: ev.byte_order,
                             type_changed,
                         };
@@ -869,15 +868,29 @@ impl GatewayChannelSource {
                         }
                     }
                     // Events dropped under this receiver's own backpressure.
-                    // pva2pva enters overflow and ORs the overrun bitset
-                    // (moncache.cpp:156-174) rather than silently swallowing
-                    // the loss; we accumulate a pending overrun to be flagged
-                    // on the next delivered body (see `pending_overrun`
-                    // above), so a slow downstream client sees the same
-                    // overrun signal it would behind pva2pva instead of a
-                    // deceptively clean stream.
+                    // Close the loss HERE, from the channel's merged snapshot —
+                    // the delta that arrives next carries neither the dropped
+                    // events' changed bits nor (on this raw path) their bytes,
+                    // so forwarding it loses an alarm transition that happened
+                    // only in a dropped event. See [`reframe_raw_body_after_lag`].
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        pending_overrun = true;
+                        let (Some(d), Some(snap)) = (desc.as_ref(), entry.snapshot()) else {
+                            // No descriptor / no value has been decoded yet ⟹
+                            // no value event has reached any subscriber, so
+                            // nothing was lost to re-frame.
+                            continue;
+                        };
+                        let Some(body) = reframe_raw_body_after_lag(&snap.value, d, order) else {
+                            continue;
+                        };
+                        let out = epics_pva_rs::server_native::RawMonitorEvent {
+                            body_bytes: body,
+                            byte_order: order,
+                            type_changed: false,
+                        };
+                        if mpsc_tx.send(out).await.is_err() {
+                            return;
+                        }
                         continue;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
@@ -940,30 +953,14 @@ impl GatewayChannelSource {
             // returned as the SubscriptionSeed seed and emitted by the
             // server, NOT replayed into this stream (double-seed fix).
             //
-            // Set when this subscriber's broadcast receiver lagged (events
-            // dropped under its own backpressure); the next delivered update
-            // carries the lost leaves in its `overrun` set, parallel to the
-            // raw forwarder's `pending_overrun` / `mark_raw_body_local_overrun`.
-            let mut pending_overrun = false;
             loop {
                 match bcast_rx.recv().await {
-                    Ok(mut update) => {
+                    Ok(update) => {
                         // A `type_changed` boundary is the last event
                         // the decoded stream carries: forward it so the server
                         // emits MONITOR FINISH, then end the forwarder —
                         // mirroring the raw forwarder's `type_changed` return.
                         let is_boundary = update.type_changed;
-                        // After a lag, this surviving snapshot is the coalesced
-                        // element pva2pva would deliver marked overrun
-                        // (moncache.cpp:160-168). Record the lost leaves in the
-                        // cooked `overrun` set — server-side accounting only:
-                        // the cooked DATA frame's trailing overrun bitset is
-                        // hard-empty, as pvxs's is (servermon.cpp:174-176). A
-                        // type-change marker carries no value and is untouched.
-                        if pending_overrun && !is_boundary {
-                            update.overrun = value_overrun_paths(&update.value);
-                            pending_overrun = false;
-                        }
                         if mpsc_tx.send(update).await.is_err() {
                             return;
                         }
@@ -971,18 +968,33 @@ impl GatewayChannelSource {
                             return;
                         }
                     }
-                    // Drops under this receiver's backpressure. pva2pva enters
-                    // overflow and ORs the overrun bitset (moncache.cpp:156-174)
-                    // rather than silently swallowing the loss; the raw
-                    // forwarder mirrors this on the wire via `pending_overrun` +
-                    // `mark_raw_body_local_overrun`. The cooked path records the
-                    // same loss in `MonitorUpdate.overrun`, but that set is
-                    // server-side only — the cooked wire frame keeps pvxs's
-                    // hard-empty overrun bitset, so a downstream client behind
-                    // EPICS_PVA_GW_RAW_FRAMES=NO does not see the overrun bits
-                    // the raw path would have carried.
+                    // Drops under this receiver's backpressure. Close the loss
+                    // HERE, by re-framing the channel's merged snapshot — the
+                    // same rule as the raw path ([`reframe_raw_body_after_lag`]),
+                    // and the same rule a monitor seed follows: a frame built
+                    // from `latest` declares the WHOLE structure. The next
+                    // event's delta marks only its own leaves, so forwarding it
+                    // would drop the changed bits of everything the dropped
+                    // events moved — an alarm transition among them.
+                    //
+                    // The lost leaves are also recorded in the cooked `overrun`
+                    // set, which stays SERVER-SIDE: the cooked DATA frame ends in
+                    // pvxs's hard-empty overrun bitset (`servermon.cpp:174-176`),
+                    // so only a downstream on the raw path sees overrun bits.
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        pending_overrun = true;
+                        let Some(snap) = entry.snapshot() else {
+                            continue;
+                        };
+                        let overrun = value_overrun_paths(&snap.value);
+                        let update = epics_pva_rs::server_native::MonitorUpdate {
+                            value: snap.value,
+                            marked: None,
+                            type_changed: false,
+                            overrun,
+                        };
+                        if mpsc_tx.send(update).await.is_err() {
+                            return;
+                        }
                         continue;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
@@ -2851,72 +2863,20 @@ ASG(DEFAULT) {
         );
     }
 
-    // ---- bridge-local overrun marking on fanout lag --------------------
+    // ---- re-framing a lagged subscriber from the merged snapshot -------
 
     use epics_pva_rs::proto::{BitSet, ByteOrder};
-    use epics_pva_rs::pvdata::encode::{decode_pv_field_with_bitset, encode_pv_field_with_bitset};
+    use epics_pva_rs::pvdata::encode::decode_pv_field_with_bitset;
     use epics_pva_rs::pvdata::{ScalarType, ScalarValue};
 
-    /// Encode a full wire MONITOR DATA body `changed | value | overrun`.
-    fn full_body(
-        desc: &FieldDesc,
-        value: &PvField,
-        changed_bits: &[usize],
-        overrun_bits: &[usize],
-    ) -> bytes::Bytes {
-        let mut changed = BitSet::new();
-        for &b in changed_bits {
-            changed.set(b);
-        }
-        let mut overrun = BitSet::new();
-        for &b in overrun_bits {
-            overrun.set(b);
-        }
-        let mut body = Vec::new();
-        changed.write_into(ByteOrder::Little, &mut body);
-        encode_pv_field_with_bitset(value, desc, &changed, 0, ByteOrder::Little, &mut body);
-        overrun.write_into(ByteOrder::Little, &mut body);
-        bytes::Bytes::from(body)
-    }
-
-    /// Decode the trailing overrun bitset back out of a marked body so a
-    /// test can assert the exact bits a downstream client would observe.
-    fn decode_overrun(body: &bytes::Bytes, desc: &FieldDesc) -> BitSet {
-        let mut cur = std::io::Cursor::new(body.as_ref());
-        let changed = BitSet::decode(&mut cur, ByteOrder::Little).expect("changed");
-        decode_pv_field_with_bitset(desc, &changed, 0, &mut cur, ByteOrder::Little).expect("value");
-        BitSet::decode(&mut cur, ByteOrder::Little).expect("overrun")
-    }
-
-    /// A scalar body whose changed bit is set but whose overrun bitset is
-    /// empty (the common case) must come back with the changed leaf ORed
-    /// into the overrun bitset, while the `changed | value` prefix bytes are
-    /// preserved byte-for-byte.
+    /// R19-44: the frame a lagged subscriber gets is a RE-FRAME of the merged
+    /// snapshot — every leaf present, every leaf marked changed — not the next
+    /// delta. This is the boundary the defect lived on: a leaf that moved ONLY
+    /// in a dropped event (an alarm going MAJOR) must still reach the client,
+    /// and a delta cannot carry it (pva2pva accumulates the changed bits and
+    /// copies the merged values instead, `moncache.cpp:156-174`).
     #[test]
-    fn lag_marks_scalar_changed_leaf_as_overrun() {
-        let desc = FieldDesc::Scalar(ScalarType::Double);
-        let value = PvField::Scalar(ScalarValue::Double(42.0));
-        let body = full_body(&desc, &value, &[0], &[]);
-
-        let marked =
-            mark_raw_body_local_overrun(&body, &desc, ByteOrder::Little).expect("marked body");
-
-        let overrun = decode_overrun(&marked, &desc);
-        assert!(overrun.get(0), "changed leaf must be flagged overrun");
-        assert_eq!(overrun.count(), 1, "only the changed leaf is overrun");
-
-        // The decoded value is unchanged: the prefix bytes were preserved.
-        let mut cur = std::io::Cursor::new(marked.as_ref());
-        let changed = BitSet::decode(&mut cur, ByteOrder::Little).unwrap();
-        let v =
-            decode_pv_field_with_bitset(&desc, &changed, 0, &mut cur, ByteOrder::Little).unwrap();
-        assert_eq!(v, value, "value bytes preserved across overrun marking");
-    }
-
-    /// Upstream overrun bits already present in the body must be preserved —
-    /// the marking is a UNION with the changed leaves, never a replacement.
-    #[test]
-    fn lag_preserves_upstream_overrun_and_unions_changed() {
+    fn lag_reframes_every_leaf_of_the_merged_snapshot() {
         // Structure { a: Int, b: Int }: bit 0 = struct, bit 1 = a, bit 2 = b.
         let desc = FieldDesc::Structure {
             struct_id: String::new(),
@@ -2925,7 +2885,8 @@ ASG(DEFAULT) {
                 ("b".to_string(), FieldDesc::Scalar(ScalarType::Int)),
             ],
         };
-        let value = {
+        // The merged snapshot: `b` moved in an event this subscriber never saw.
+        let merged = {
             let mut s = epics_pva_rs::pvdata::PvStructure::new("");
             s.fields
                 .push(("a".to_string(), PvField::Scalar(ScalarValue::Int(7))));
@@ -2933,49 +2894,50 @@ ASG(DEFAULT) {
                 .push(("b".to_string(), PvField::Scalar(ScalarValue::Int(9))));
             PvField::Structure(s)
         };
-        // This event changes `a` (bit 1); the upstream already flagged `b`
-        // (bit 2) as overrun from its own squashing.
-        let body = full_body(&desc, &value, &[1], &[2]);
 
-        let marked =
-            mark_raw_body_local_overrun(&body, &desc, ByteOrder::Little).expect("marked body");
+        let body =
+            reframe_raw_body_after_lag(&merged, &desc, ByteOrder::Little).expect("re-framed body");
 
-        let overrun = decode_overrun(&marked, &desc);
-        assert!(overrun.get(1), "bridge-local changed leaf `a` flagged");
-        assert!(overrun.get(2), "upstream overrun bit `b` preserved");
-        assert_eq!(overrun.count(), 2, "exactly the union of both");
-    }
-
-    /// A body with nothing changed and no upstream overrun has no loss to
-    /// signal — the helper returns `None` so the caller forwards the bytes
-    /// untouched (keeps the dedup pointer fast path valid).
-    #[test]
-    fn lag_noop_when_nothing_changed_or_overrun() {
-        let desc = FieldDesc::Scalar(ScalarType::Double);
-        let value = PvField::Scalar(ScalarValue::Double(1.0));
-        let body = full_body(&desc, &value, &[], &[]);
+        let mut cur = std::io::Cursor::new(body.as_ref());
+        let changed = BitSet::decode(&mut cur, ByteOrder::Little).expect("changed");
         assert!(
-            mark_raw_body_local_overrun(&body, &desc, ByteOrder::Little).is_none(),
-            "empty changed + empty overrun is a no-op"
+            changed.get(1) && changed.get(2),
+            "every leaf is marked changed"
+        );
+        let decoded =
+            decode_pv_field_with_bitset(&desc, &changed, 0, &mut cur, ByteOrder::Little).unwrap();
+        assert_eq!(
+            decoded, merged,
+            "the dropped events' values ride the re-frame; a delta would carry only its own leaf"
+        );
+
+        // Loss is still signalled: after a drop any leaf may have taken an
+        // intermediate value the subscriber never observed.
+        let overrun = BitSet::decode(&mut cur, ByteOrder::Little).expect("overrun");
+        assert!(
+            overrun.get(1) && overrun.get(2),
+            "every re-framed leaf is flagged overrun: {overrun:?}"
         );
     }
 
-    /// A truncated / undecodable body must not panic and must fall back to
-    /// forwarding the original bytes (helper returns `None`).
+    /// A scalar channel has one leaf and no struct bit — the same rule, on the
+    /// degenerate shape.
     #[test]
-    fn lag_undecodable_body_returns_none() {
+    fn lag_reframes_a_scalar_channel() {
         let desc = FieldDesc::Scalar(ScalarType::Double);
-        // Only a changed bitset, no value/overrun — decode of the value
-        // region fails.
-        let mut body = Vec::new();
-        let mut changed = BitSet::new();
-        changed.set(0);
-        changed.write_into(ByteOrder::Little, &mut body);
-        let body = bytes::Bytes::from(body);
-        assert!(
-            mark_raw_body_local_overrun(&body, &desc, ByteOrder::Little).is_none(),
-            "undecodable body falls back to None"
-        );
+        let value = PvField::Scalar(ScalarValue::Double(42.0));
+
+        let body =
+            reframe_raw_body_after_lag(&value, &desc, ByteOrder::Little).expect("re-framed body");
+
+        let mut cur = std::io::Cursor::new(body.as_ref());
+        let changed = BitSet::decode(&mut cur, ByteOrder::Little).expect("changed");
+        assert!(changed.get(0), "the scalar leaf is marked changed");
+        let decoded =
+            decode_pv_field_with_bitset(&desc, &changed, 0, &mut cur, ByteOrder::Little).unwrap();
+        assert_eq!(decoded, value);
+        let overrun = BitSet::decode(&mut cur, ByteOrder::Little).expect("overrun");
+        assert!(overrun.get(0), "the lost intermediate values are flagged");
     }
 
     #[test]
@@ -3003,14 +2965,13 @@ ASG(DEFAULT) {
     /// (servermon.cpp:174-176) — only the raw forwarder puts overrun bits on
     /// the wire.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cooked_fanout_marks_overrun_on_subscriber_lag() {
+    async fn cooked_fanout_reframes_the_snapshot_on_subscriber_lag() {
         let mut src = make_source();
         // Single-slot subscriber queue: the forwarder buffers one update then
         // blocks on the second send, so it cannot drain the broadcast and a
         // burst overflows the entry's broadcast buffer deterministically.
         src.subscriber_queue = 1;
         src.cache.insert_test_entry("OV:PV").await;
-        let tx = src.cache.test_broadcast_sender("OV:PV").await;
 
         let (_seed, mut rx) = src
             .subscribe_inner(src.cache.clone(), "OV:PV", None)
@@ -3018,38 +2979,68 @@ ASG(DEFAULT) {
             .expect("subscribe to parked test entry");
 
         // Burst far past the broadcast buffer capacity BEFORE draining, so the
-        // stalled forwarder lags and drops intermediate updates.
+        // stalled forwarder lags and drops intermediate updates. Each value is
+        // FOLDED into the entry, so `latest` is the merged snapshot a live
+        // upstream would leave behind — 63.0, the value of the last event, most
+        // of which this subscriber never saw.
         let mk = |v: f64| {
             let mut s = epics_pva_rs::pvdata::PvStructure::new("epics:nt/NTScalar:1.0");
             s.fields
                 .push(("value".to_string(), PvField::Scalar(ScalarValue::Double(v))));
-            epics_pva_rs::server_native::MonitorUpdate::from(PvField::Structure(s))
+            PvField::Structure(s)
         };
         for i in 0..64 {
-            let _ = tx.send(mk(i as f64));
+            src.cache.test_publish("OV:PV", mk(i as f64)).await;
         }
 
-        // At least one delivered update must carry a non-empty overrun set
-        // naming the lost leaf, proving the lag is no longer silent.
-        let mut saw_overrun = false;
+        // R19-44: the post-lag update is a RE-FRAME of the merged snapshot —
+        // whole structure (`marked: None`), carrying the value of an event the
+        // subscriber never received — and it names the lost leaves in `overrun`.
+        // Forwarding the next delta instead would have shipped only that
+        // event's own leaves, losing every transition inside the dropped range.
+        let val = |u: &epics_pva_rs::server_native::MonitorUpdate| match &u.value {
+            PvField::Structure(s) => match &s.fields[0].1 {
+                PvField::Scalar(ScalarValue::Double(v)) => *v,
+                other => panic!("unexpected value shape: {other:?}"),
+            },
+            other => panic!("unexpected value shape: {other:?}"),
+        };
+        let mut last_before = None;
+        let mut reframed = None;
         for _ in 0..8 {
             match tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
                 Ok(Some(u)) if !u.overrun.is_empty() => {
-                    assert!(
-                        u.overrun.iter().any(|p| p == "value"),
-                        "overrun must name the value leaf, got {:?}",
-                        u.overrun
-                    );
-                    saw_overrun = true;
+                    reframed = Some(u);
                     break;
                 }
-                Ok(Some(_)) => continue,
+                Ok(Some(u)) => {
+                    last_before = Some(val(&u));
+                    continue;
+                }
                 Ok(None) | Err(_) => break,
             }
         }
+        let u = reframed.expect("a post-lag cooked update must be delivered");
         assert!(
-            saw_overrun,
-            "a post-lag cooked update must carry overrun leaves"
+            u.overrun.iter().any(|p| p == "value"),
+            "overrun must name the lost leaf, got {:?}",
+            u.overrun
+        );
+        assert!(
+            u.marked.is_none(),
+            "a re-frame declares the WHOLE structure, not the last delta's leaves"
+        );
+        // The forwarder may lag before OR after delivering the first event, so
+        // the baseline is "the newest value this subscriber could have seen" —
+        // 0.0 when the lag beat every delivery. A lag means the 4-slot broadcast
+        // overflowed, so the merged snapshot is several events ahead of it
+        // either way.
+        let before = last_before.unwrap_or(0.0);
+        assert!(
+            val(&u) > before + 1.0,
+            "the re-frame must carry the snapshot AS OF THE LAG — a value from an event this \
+             subscriber never received (last seen {before}, re-framed {})",
+            val(&u)
         );
     }
 }

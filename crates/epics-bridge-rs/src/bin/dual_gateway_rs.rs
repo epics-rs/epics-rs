@@ -90,9 +90,11 @@ struct Args {
     #[arg(long, conflicts_with = "ca_report")]
     ca_no_report: bool,
 
-    /// CA server port (downstream side). 0 = use default 5064.
-    #[arg(long, default_value_t = 0)]
-    ca_port: u16,
+    /// CA server port (downstream side). Omit to take
+    /// `EPICS_CAS_SERVER_PORT`, then `EPICS_CA_SERVER_PORT`, then 5064.
+    /// `--ca-port 0` binds an ephemeral port.
+    #[arg(long)]
+    ca_port: Option<u16>,
 
     /// CA gateway: downstream listen-interface list (C `-sip`), sets
     /// `EPICS_CAS_INTF_ADDR_LIST`. Space-separated.
@@ -186,26 +188,32 @@ struct Args {
     #[arg(long, default_value = "0.0.0.0")]
     pva_bind: IpAddr,
 
-    /// Downstream PVA TCP port (default 5075).
-    #[arg(long, default_value_t = 5075)]
-    pva_tcp_port: u16,
+    /// Downstream PVA TCP port. Omit to take `EPICS_PVAS_SERVER_PORT`,
+    /// then `EPICS_PVA_SERVER_PORT`, then 5075.
+    #[arg(long)]
+    pva_tcp_port: Option<u16>,
 
-    /// Downstream PVA UDP search port (default 5076).
-    #[arg(long, default_value_t = 5076)]
-    pva_udp_port: u16,
+    /// Downstream PVA UDP search port. Omit to take
+    /// `EPICS_PVAS_BROADCAST_PORT`, then `EPICS_PVA_BROADCAST_PORT`,
+    /// then 5076.
+    #[arg(long)]
+    pva_udp_port: Option<u16>,
 
-    /// Per-PV upstream connect timeout in seconds (PVA gateway).
-    #[arg(long, default_value_t = 5)]
-    pva_connect_timeout_secs: u64,
+    /// Per-PV upstream connect timeout in seconds (PVA gateway). Omit to
+    /// take `EPICS_PVA_GW_CONNECT_TMO`, then the 5 s default.
+    #[arg(long)]
+    pva_connect_timeout_secs: Option<u64>,
 
-    /// PVA cache cleanup interval in seconds.
-    #[arg(long, default_value_t = 30)]
-    pva_cleanup_interval_secs: u64,
+    /// PVA cache cleanup interval in seconds. Omit to take
+    /// `EPICS_PVA_GW_CLEANUP_INTERVAL`, then the 30 s default.
+    #[arg(long)]
+    pva_cleanup_interval_secs: Option<u64>,
 
-    /// PVA control_prefix for runtime-diagnostic PVs. Empty
-    /// disables the feature.
-    #[arg(long, default_value = "")]
-    pva_control_prefix: String,
+    /// PVA control_prefix for runtime-diagnostic PVs. An explicit empty
+    /// string disables the feature; omit to take
+    /// `EPICS_PVA_GW_CONTROL_PREFIX`.
+    #[arg(long)]
+    pva_control_prefix: Option<String>,
 
     /// Pre-warm the PVA cache with these names (comma-separated).
     #[arg(long = "pva-prefetch", num_args = 1.., value_delimiter = ',')]
@@ -415,25 +423,42 @@ async fn run_ca_gateway(args: &Args) -> Result<(), String> {
 }
 
 async fn run_pva_gateway(args: &Args) -> Result<(), String> {
+    // Precedence is flag > TOML > EPICS env > compiled default. The TOML
+    // layer has already been merged into `args` (`merge_config`), so a
+    // still-`None` field means neither source spoke and the environment
+    // decides.
+    //
     // PR #205 IPv6 Stage 1: PvaServerConfig::bind_ip is `IpAddr`.
     let server_config = PvaServerConfig {
-        tcp_port: args.pva_tcp_port,
-        udp_port: args.pva_udp_port,
+        tcp_port: args
+            .pva_tcp_port
+            .unwrap_or_else(epics_pva_rs::config::env::pvas_server_port),
+        udp_port: args
+            .pva_udp_port
+            .unwrap_or_else(epics_pva_rs::config::env::server_broadcast_port),
         bind_ip: args.pva_bind,
         ..PvaServerConfig::default()
     };
-    let control_prefix = if args.pva_control_prefix.trim().is_empty() {
-        None
-    } else {
-        Some(args.pva_control_prefix.clone())
+    let base = PvaGatewayConfig::default().with_env();
+    let control_prefix = match args.pva_control_prefix.as_deref() {
+        // An explicit empty string is the operator disabling the feature.
+        Some(s) if s.trim().is_empty() => None,
+        Some(s) => Some(s.to_string()),
+        None => base.control_prefix.clone(),
     };
     let cfg = PvaGatewayConfig {
         upstream_client: None,
         server_config,
-        cleanup_interval: Duration::from_secs(args.pva_cleanup_interval_secs),
-        connect_timeout: Duration::from_secs(args.pva_connect_timeout_secs),
+        cleanup_interval: args
+            .pva_cleanup_interval_secs
+            .map(Duration::from_secs)
+            .unwrap_or(base.cleanup_interval),
+        connect_timeout: args
+            .pva_connect_timeout_secs
+            .map(Duration::from_secs)
+            .unwrap_or(base.connect_timeout),
         control_prefix,
-        ..PvaGatewayConfig::default()
+        ..base
     };
     tracing::info!("dual-gateway-rs: starting PVA gateway");
     let gateway = PvaGateway::start(cfg).map_err(|e| format!("PVA start failed: {e}"))?;
@@ -522,7 +547,7 @@ fn merge_config(args: &mut Args, cfg: &ConfigFile, matches: &ArgMatches) {
     }
     if !cli_set("ca_port") {
         if let Some(v) = cfg.ca.port {
-            args.ca_port = v;
+            args.ca_port = Some(v);
         }
     }
     if !cli_set("ca_sip") {
@@ -614,27 +639,27 @@ fn merge_config(args: &mut Args, cfg: &ConfigFile, matches: &ArgMatches) {
     }
     if !cli_set("pva_tcp_port") {
         if let Some(v) = cfg.pva.tcp_port {
-            args.pva_tcp_port = v;
+            args.pva_tcp_port = Some(v);
         }
     }
     if !cli_set("pva_udp_port") {
         if let Some(v) = cfg.pva.udp_port {
-            args.pva_udp_port = v;
+            args.pva_udp_port = Some(v);
         }
     }
     if !cli_set("pva_connect_timeout_secs") {
         if let Some(v) = cfg.pva.connect_timeout_secs {
-            args.pva_connect_timeout_secs = v;
+            args.pva_connect_timeout_secs = Some(v);
         }
     }
     if !cli_set("pva_cleanup_interval_secs") {
         if let Some(v) = cfg.pva.cleanup_interval_secs {
-            args.pva_cleanup_interval_secs = v;
+            args.pva_cleanup_interval_secs = Some(v);
         }
     }
     if !cli_set("pva_control_prefix") {
         if let Some(s) = &cfg.pva.control_prefix {
-            args.pva_control_prefix = s.clone();
+            args.pva_control_prefix = Some(s.clone());
         }
     }
     if !cli_set("pva_prefetch") {
@@ -807,7 +832,7 @@ mod tests {
             args.ca_pvlist.as_deref(),
             Some(std::path::Path::new("/etc/gw.pvlist"))
         );
-        assert_eq!(args.pva_tcp_port, 6000);
+        assert_eq!(args.pva_tcp_port, Some(6000));
     }
 
     #[test]
@@ -822,7 +847,7 @@ mod tests {
         let c = cfg("[ca]\ndead_timeout = 45\n[pva]\ntcp_port = 6000\n");
         merge_config(&mut args, &c, &matches);
         assert_eq!(args.ca_dead_timeout, 999);
-        assert_eq!(args.pva_tcp_port, 7000);
+        assert_eq!(args.pva_tcp_port, Some(7000));
     }
 
     #[test]
@@ -842,7 +867,22 @@ mod tests {
         let (mut args, matches) = args_and_matches(&["dual-gateway-rs"]);
         merge_config(&mut args, &cfg(""), &matches);
         assert_eq!(args.ca_dead_timeout, 120);
-        assert_eq!(args.pva_tcp_port, 5075);
+    }
+
+    /// A port neither the CLI nor the TOML set must stay `None` all the
+    /// way through `merge_config`, so the EPICS environment — not a clap
+    /// literal — decides the bind port. Asserting a concrete 5064/5075
+    /// here is exactly what pinned R19-22: the literal shadowed
+    /// `EPICS_CAS_SERVER_PORT` / `EPICS_PVAS_SERVER_PORT`.
+    #[test]
+    fn unset_ports_stay_none_for_the_environment_to_resolve() {
+        let (mut args, matches) = args_and_matches(&["dual-gateway-rs"]);
+        merge_config(&mut args, &cfg(""), &matches);
+        assert_eq!(args.ca_port, None);
+        assert_eq!(args.pva_tcp_port, None);
+        assert_eq!(args.pva_udp_port, None);
+        assert_eq!(args.pva_connect_timeout_secs, None);
+        assert_eq!(args.pva_cleanup_interval_secs, None);
     }
 
     #[test]

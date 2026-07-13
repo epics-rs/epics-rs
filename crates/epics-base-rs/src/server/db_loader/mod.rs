@@ -3,7 +3,7 @@ use std::sync::{Mutex, OnceLock};
 
 use crate::error::{CaError, CaResult};
 use crate::server::record::Record;
-use crate::types::EpicsValue;
+use crate::types::{EpicsValue, PvString};
 
 mod include;
 mod substitution;
@@ -39,7 +39,11 @@ pub fn register_record_type(name: &str, factory: RecordFactory) {
 pub struct DbRecordDef {
     pub record_type: String,
     pub name: String,
-    pub fields: Vec<(String, String)>,
+    /// The record's fields, in file order. A `.db` value is a BYTE STRING, not
+    /// text: C's escape translation writes one byte per `\xHH`
+    /// (`epicsString.c:106`), and a DBF_STRING's budget is 40 BYTES. Modelling
+    /// the value as a Rust `String` made `\xff` two bytes (R19-68).
+    pub fields: Vec<(String, PvString)>,
     /// Aliases declared inside the record body (`alias("name")`).
     /// Mirrors epics-base PR #336 — alias names are validated with
     /// the same rules as record names.
@@ -352,7 +356,7 @@ pub fn parse_db_with_breaktables(
                 let value = read_field_value(&chars, &mut pos, &mut line, &mut col)?;
                 skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
                 expect_char(&chars, &mut pos, &mut col, ')', line)?;
-                info_tags.push((tag, value));
+                info_tags.push((tag, value.as_str_lossy().into_owned()));
                 continue;
             }
 
@@ -927,7 +931,7 @@ fn read_json_string(
     pos: &mut usize,
     line: &mut usize,
     col: &mut usize,
-) -> CaResult<String> {
+) -> CaResult<PvString> {
     let quote = match chars.get(*pos) {
         Some(&c @ ('"' | '\'')) => c,
         _ => {
@@ -1016,7 +1020,9 @@ fn read_json_string(
         *col += 1;
     }
 
-    Ok(crate::runtime::epics_string::raw_from_escaped(&escaped))
+    Ok(PvString::from_bytes(
+        crate::runtime::epics_string::raw_from_escaped(&escaped),
+    ))
 }
 
 /// A brace-delimited JSON field value, returned verbatim (braces included).
@@ -1139,7 +1145,7 @@ fn read_field_value(
     pos: &mut usize,
     line: &mut usize,
     col: &mut usize,
-) -> CaResult<String> {
+) -> CaResult<PvString> {
     if matches!(chars.get(*pos), Some('"' | '\'')) {
         return read_json_string(chars, pos, line, col);
     }
@@ -1150,7 +1156,9 @@ fn read_field_value(
     // `dbJLinkParse` (dbStaticLib.c:2280-2285). Keep the text verbatim — the
     // link parser is the one that interprets it.
     if *pos < chars.len() && chars[*pos] == '{' {
-        return read_json_value(chars, pos, line, col);
+        // The brace text is JSON source — ASCII/UTF-8 by construction, and the
+        // escapes inside it belong to yajl, not to the `.db` lexer (R19-67).
+        return read_json_value(chars, pos, line, col).map(PvString::from);
     }
 
     // Unquoted value: a C `bareword` (dbLex.l:21) —
@@ -1193,7 +1201,7 @@ fn read_field_value(
             ),
         });
     }
-    Ok(s)
+    Ok(PvString::from(s))
 }
 
 fn expect_char(
@@ -1314,7 +1322,7 @@ pub fn create_record_with_factories(
 /// and `dbLoadRecords` load paths so both resolve table names identically.
 pub fn resolve_linr_breaktable_names(
     record_type: &str,
-    fields: &mut [(String, String)],
+    fields: &mut [(String, PvString)],
     registry: &crate::server::cvt_bpt::BreakTableRegistry,
 ) {
     if registry.is_empty() || !matches!(record_type, "ai" | "ao") {
@@ -1322,8 +1330,9 @@ pub fn resolve_linr_breaktable_names(
     }
     for (fname, fvalue) in fields.iter_mut() {
         if fname.eq_ignore_ascii_case("LINR") {
-            if let Some(idx) = registry.linr_index_of(fvalue) {
-                *fvalue = idx.to_string();
+            // A breakpoint-table NAME is an identifier — ASCII.
+            if let Some(idx) = registry.linr_index_of(&fvalue.as_str_lossy()) {
+                *fvalue = PvString::from(idx.to_string());
             }
         }
     }
@@ -1340,11 +1349,15 @@ fn is_common_link_field(upper_name: &str) -> bool {
 
 pub fn apply_fields(
     record: &mut Box<dyn Record>,
-    fields: &[(String, String)],
+    fields: &[(String, PvString)],
     common_fields: &mut Vec<(String, EpicsValue)>,
 ) -> CaResult<()> {
-    for (name, value_str) in fields {
+    for (name, value) in fields {
         let upper_name = name.to_uppercase();
+        // Menu labels, numbers and link text are ASCII by construction; only a
+        // DBF_STRING can carry a byte outside it, and that one goes to
+        // `EpicsValue::parse_bytes` below, which keeps the bytes.
+        let value_str = &value.as_str_lossy();
 
         // Try record-specific field first
         let field_desc = record
@@ -1359,7 +1372,7 @@ pub fn apply_fields(
             // `dbPutStringNum`. Using the field's choices, not a cross-menu
             // global table, is what keeps a menu-specific label from being
             // dropped or mis-mapped (e.g. `field(SELM,"Specified")`).
-            let value = if let Some(choices) = record
+            let parsed = if let Some(choices) = record
                 .menu_field_choices(&upper_name)
                 .or_else(|| crate::server::record::shared_menu_choices(&upper_name))
             {
@@ -1370,13 +1383,15 @@ pub fn apply_fields(
                     value_str,
                 )?
             } else {
-                EpicsValue::parse(dbf_type, value_str).map_err(|e| {
+                // BYTES, not text: a DBF_STRING is a byte string with a 40-byte
+                // budget, and `field(VAL,"h\xffz")` is 3 bytes in C (R19-68).
+                EpicsValue::parse_bytes(dbf_type, value.as_bytes()).map_err(|e| {
                     CaError::InvalidValue(format!(
                         "field {upper_name} (type {dbf_type:?}): cannot parse '{value_str}': {e}"
                     ))
                 })?
             };
-            record.put_field(&upper_name, value)?;
+            record.put_field(&upper_name, parsed)?;
             // A record type may declare INP/OUT in its own `field_list`,
             // mirroring its C `.dbd` (`scalerRecord`, `motorRecord`,
             // `acalcout`, …). The value is then stored by the record — but in
@@ -1395,17 +1410,12 @@ pub fn apply_fields(
             // `parsed_out`) only for a record that does NOT declare the field,
             // so a record driving its own link is not driven twice.
             if is_common_link_field(&upper_name) {
-                common_fields.push((
-                    upper_name.clone(),
-                    EpicsValue::String(value_str.clone().into()),
-                ));
+                common_fields.push((upper_name.clone(), EpicsValue::String(value.clone())));
             }
         } else {
-            // Store as common field for RecordInstance to handle
-            common_fields.push((
-                upper_name.clone(),
-                EpicsValue::String(value_str.clone().into()),
-            ));
+            // Store as common field for RecordInstance to handle. The BYTES: a
+            // common DBF_STRING (DESC, EGU, …) has the same 40-byte budget.
+            common_fields.push((upper_name.clone(), EpicsValue::String(value.clone())));
         }
 
         // C `dbPutString` (`dbStaticLib.c:2653-2660`): writing VAL through the
@@ -1685,7 +1695,7 @@ mod tests {
         let macros = HashMap::new();
         let records = parse_db(input, &macros).unwrap();
         // With undefined macro and default="", the field gets the raw default
-        assert!(records[0].fields[0].1.contains("CP MS"));
+        assert!(records[0].fields[0].1.as_str_lossy().contains("CP MS"));
     }
 
     #[test]
@@ -1969,11 +1979,7 @@ mod tests {
         let apply = |rt: &str, field: &str, value: &str| -> CaResult<Box<dyn Record>> {
             let mut rec = create_record(rt).unwrap();
             let mut common = Vec::new();
-            apply_fields(
-                &mut rec,
-                &[(field.to_string(), value.to_string())],
-                &mut common,
-            )?;
+            apply_fields(&mut rec, &[(field.to_string(), value.into())], &mut common)?;
             Ok(rec)
         };
 
@@ -2052,17 +2058,17 @@ record(ai, "T") { field(LINR, "typeJdegC") }
         // A registered non-standard table name on an ai/ao LINR is rewritten to
         // its index — the first user-table slot (15), since the standard
         // menuConvert names reserve 3..=14.
-        let mut fields = vec![("LINR".to_string(), "alpha".to_string())];
+        let mut fields = vec![("LINR".to_string(), PvString::from("alpha"))];
         resolve_linr_breaktable_names("ai", &mut fields, &reg);
         assert_eq!(fields[0].1, "15");
 
         // A fixed menuConvert label matches no table name and is untouched.
-        let mut fixed = vec![("LINR".to_string(), "LINEAR".to_string())];
+        let mut fixed = vec![("LINR".to_string(), PvString::from("LINEAR"))];
         resolve_linr_breaktable_names("ai", &mut fixed, &reg);
         assert_eq!(fixed[0].1, "LINEAR");
 
         // A non-ai/ao record's field is never rewritten.
-        let mut other = vec![("LINR".to_string(), "alpha".to_string())];
+        let mut other = vec![("LINR".to_string(), PvString::from("alpha"))];
         resolve_linr_breaktable_names("bo", &mut other, &reg);
         assert_eq!(other[0].1, "alpha");
     }
@@ -2426,7 +2432,7 @@ record(ao, "$(P)_noDtyp") {
             rec.fields
                 .iter()
                 .find(|(n, _)| n == "DTYP")
-                .map(|(_, v)| v.clone())
+                .map(|(_, v)| v.as_str_lossy().into_owned())
         };
 
         // Literal DTYP: untouched by the macro. Force-override used to corrupt

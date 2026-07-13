@@ -11,6 +11,7 @@
 
 pub mod drivers;
 pub mod error;
+pub(crate) mod escape;
 pub(crate) mod exception;
 pub mod interfaces;
 pub mod interpose;

@@ -1503,19 +1503,24 @@ pub trait PortDriver: Send + Sync + 'static {
             // the constructor's zeroed fields, and reporting them invents an EOS
             // the port cannot have.
             if self.has_octet_interface() {
-                let esc = |eos: &[u8]| {
-                    eos.iter()
-                        .map(|b| match b {
-                            b'\r' => "\\r".to_string(),
-                            b'\n' => "\\n".to_string(),
-                            c => (*c as char).to_string(),
-                        })
-                        .collect::<String>()
-                };
+                // C escapes the terminator with `epicsStrPrintEscaped` (:3687,
+                // :3690) — the whole libCom table, not just CR and LF. A private
+                // two-case table wrote a binary terminator (`\x03`, ESC, TAB, NUL)
+                // raw into stdout (R16-48); [`crate::escape`] is the one owner.
                 let input = base.input_eos(0);
                 let output = base.output_eos(0);
-                let _ = writeln!(out, "  Input EOS[{}]: {}", input.len(), esc(input));
-                let _ = writeln!(out, "  Output EOS[{}]: {}", output.len(), esc(output));
+                let _ = writeln!(
+                    out,
+                    "  Input EOS[{}]: {}",
+                    input.len(),
+                    crate::escape::print_escaped(input)
+                );
+                let _ = writeln!(
+                    out,
+                    "  Output EOS[{}]: {}",
+                    output.len(),
+                    crate::escape::print_escaped(output)
+                );
             }
             // C hands its own level straight to `reportParams` (:3692).
             base.report_params(out, level);
@@ -3521,6 +3526,51 @@ mod tests {
         assert!(
             out.contains("Parameter 0 type=asynInt32, name=N, value is undefined\n"),
             "an unset parameter prints C's undefined line (paramVal.cpp:304): {out}"
+        );
+    }
+
+    /// R16-48: the report escapes a terminator the way C does — the whole libCom
+    /// table, not just CR and LF.
+    ///
+    /// C prints the EOS pair with `epicsStrPrintEscaped` (asynPortDriver.cpp:3687,
+    /// 3690), whose table is `\a \b \f \n \r \t \v \\ \' \"`, the byte itself
+    /// when `isprint`, and `\xNN` otherwise (epicsString.c:230-262). The report's
+    /// own two-case table wrote a binary terminator raw into stdout.
+    #[test]
+    fn report_escapes_the_eos_with_the_c_table() {
+        struct Drv {
+            base: PortDriverBase,
+        }
+        impl PortDriver for Drv {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
+                crate::interfaces::octet_transport_capabilities()
+            }
+        }
+
+        let mut drv = Drv {
+            base: PortDriverBase::new("eos_rep", 1, PortFlags::default()),
+        };
+        // A real binary terminator (C caps an EOS at two bytes): ESC, then NUL —
+        // neither of which the old two-case table escaped.
+        drv.set_input_eos(&AsynUser::default(), b"\x1b\0").unwrap();
+        // …and the named escapes beyond CR/LF: TAB and BEL.
+        drv.set_output_eos(&AsynUser::default(), b"\t\x07").unwrap();
+
+        let mut out = String::new();
+        drv.report(&mut out, 1);
+        assert!(
+            out.contains("  Input EOS[2]: \\x1b\\x00\n"),
+            "C's epicsStrPrintEscaped prints NUL as \\x00 — it has no `case 0` (epicsString.c:255-260): {out}"
+        );
+        assert!(
+            out.contains("  Output EOS[2]: \\t\\a\n"),
+            "BEL is `\\a` in C's table, not `\\x07` (epicsString.c:245): {out}"
         );
     }
 }

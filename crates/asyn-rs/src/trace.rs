@@ -927,21 +927,13 @@ fn format_ascii(data: &[u8]) -> String {
         .collect()
 }
 
+/// `ASYN_TRACEIO_ESCAPE`, which C prints with the libCom escape table
+/// (`epicsStrSnPrintEscaped`, asynManager.c:3159) — the same table `asynRecord`
+/// builds TINP with (asynRecord.c:725,1629) and `asynInterposeEcho` reports a
+/// mismatch with. Its own four-case table left `\a`, `\b`, `\f`, `\v`, `'` and
+/// `"` unescaped or hexed, which none of those three C callers do (R16-48).
 fn format_escape(data: &[u8]) -> String {
-    let mut s = String::with_capacity(data.len() * 2);
-    for &b in data {
-        match b {
-            b'\r' => s.push_str("\\r"),
-            b'\n' => s.push_str("\\n"),
-            b'\t' => s.push_str("\\t"),
-            b'\\' => s.push_str("\\\\"),
-            0x20..=0x7e => s.push(b as char),
-            _ => {
-                s.push_str(&format!("\\x{b:02x}"));
-            }
-        }
-    }
-    s
+    crate::escape::escaped_from_raw(data)
 }
 
 fn format_hex(data: &[u8]) -> String {

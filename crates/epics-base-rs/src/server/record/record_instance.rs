@@ -80,6 +80,37 @@ impl NotifyWaitSet {
     }
 }
 
+/// A put-notify (`dbPutNotify` — CA WRITE_NOTIFY, `caput -c`) that landed on a
+/// PACT record and was therefore deferred WHOLE.
+///
+/// C `processNotifyCommon` (dbNotify.c:225-231) tests `precord->pact` above
+/// `ppn->putCallback`, so nothing is written and nothing is marked: the record
+/// joins the notify's wait list in state `notifyRestartInProgress`, and when the
+/// async cycle completes the put is replayed against a record that is no longer
+/// active — value written, record processed, callback fired only after THAT
+/// process finishes. So a client's "callback returned" still means "the value I
+/// sent has been processed".
+///
+/// softIoc 7.0.10.1-DEV, `ASY` (calcout, `ODLY=4`, `A=5`), `caput -c ASY.A 7`
+/// issued 1 s into the async cycle:
+///
+/// ```text
+/// t=1s  A=5  PACT=1                      <- cycle in flight
+/// t=2s  A=5  PACT=1  RPRO=0              <- put-notify pending: nothing written
+/// t=4s  A=7  PACT=1                      <- cycle done; the put is replayed
+/// callback returns at t=6.9s: A=7 VAL=7  <- after the RESTARTED process
+/// ```
+pub struct DeferredNotifyPut {
+    /// The field the client wrote (already upper-cased).
+    pub field: String,
+    /// The value it wrote — held here, unwritten, until the restart.
+    pub value: crate::types::EpicsValue,
+    /// The client's completion channel. The replayed put builds its wait-set
+    /// around this sender, so the callback fires on the restarted process, not
+    /// on the in-flight cycle.
+    pub completion: crate::runtime::sync::oneshot::Sender<()>,
+}
+
 /// Cached metadata for a record.
 ///
 /// Stores the result of `populate_display_info` / `populate_control_info` /
@@ -320,6 +351,15 @@ pub struct RecordInstance {
     // taken + `leave`d when the record's processing completes. `None`
     // outside any put-notify. See [`NotifyWaitSet`].
     pub notify: Option<Arc<NotifyWaitSet>>,
+    /// A put-notify that arrived while this record was PACT, deferred WHOLE —
+    /// C `processNotifyCommon` (dbNotify.c:225-231) tests `precord->pact`
+    /// ABOVE `putCallback`, so a `dbPutNotify` onto a busy record writes
+    /// nothing: no value, no RPRO. The record is parked on the notify's wait
+    /// list and the entire put — value, process, callback — is restarted once
+    /// the async cycle completes. See [`DeferredNotifyPut`] and
+    /// `PvDatabase::restart_deferred_notify_put`, the single owner that applies
+    /// it. `None` outside that window.
+    pub deferred_notify_put: Option<DeferredNotifyPut>,
     /// The value of each subscribed field as ALREADY PUBLISHED to that
     /// field's `DBE_VALUE`/`DBE_LOG` subscribers. The generic
     /// change-detection loop in every snapshot builder posts a field only
@@ -517,6 +557,7 @@ impl RecordInstance {
             subroutine: None,
             processing: AtomicBool::new(false),
             notify: None,
+            deferred_notify_put: None,
             last_posted: HashMap::new(),
             array_hash_changed: false,
             suppress_subroutine_run: false,

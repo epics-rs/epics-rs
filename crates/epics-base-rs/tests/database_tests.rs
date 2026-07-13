@@ -3910,9 +3910,38 @@ async fn test_fire_and_forget_put_parks_no_notify_write_notify_stays_legal() {
         .expect("WRITE_NOTIFY after a fire-and-forget put must be accepted")
         .expect("record is still async-pending → completion is deferred");
 
+    // The record is PACT, so C `processNotifyCommon` (dbNotify.c:225-231) writes
+    // nothing and puts the whole put on the restart list; the first completion
+    // replays it. `AsyncRecord` goes async on EVERY process, so the replayed put
+    // makes the record PACT again — and the callback belongs to THAT cycle, the
+    // first one that actually saw 2.0.
+    db.complete_async_record("PN_FF").await.unwrap();
+    for _ in 0..2000 {
+        let rec = db.get_record("PN_FF").await.unwrap();
+        let inst = rec.read().await;
+        if inst.is_processing() && inst.record.get_field("VAL") == Some(EpicsValue::Double(2.0)) {
+            break;
+        }
+        drop(inst);
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+    {
+        let rec = db.get_record("PN_FF").await.unwrap();
+        let inst = rec.read().await;
+        assert_eq!(
+            inst.record.get_field("VAL"),
+            Some(EpicsValue::Double(2.0)),
+            "the restart replayed the deferred put into the now-idle record"
+        );
+        assert!(
+            inst.is_processing(),
+            "and drove a real process cycle, which went async again"
+        );
+    }
+
     db.complete_async_record("PN_FF").await.unwrap();
     rx.await
-        .expect("deferred WRITE_NOTIFY completion must fire at async completion");
+        .expect("the WRITE_NOTIFY completes at the end of the cycle its value drove");
 }
 
 /// Boundary (other direction): a fire-and-forget put on a record with

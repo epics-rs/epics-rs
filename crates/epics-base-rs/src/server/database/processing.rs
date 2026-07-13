@@ -4639,9 +4639,25 @@ impl PvDatabase {
         // motor re-entering `complete_async_record_inner` over several
         // device cycles leaves exactly once — matching the old fire site,
         // which `take`d its oneshot.
-        {
+        let deferred_put = {
             let mut guard = rec.write().await;
             complete_put_notify(&mut guard);
+            // C `dbNotifyCompletion` (dbNotify.c:207-231): a put-notify that
+            // arrived while this record was PACT wrote nothing and parked here.
+            // PACT is clear (:4382) and this cycle's wait-set has drained, so
+            // the record is now the idle record that put was meant to see —
+            // replay it whole (value + process + callback).
+            guard.deferred_notify_put.take()
+        };
+        if let Some(put) = deferred_put {
+            // Queued, not recursed — the same `scanOnce` shape as the RPRO
+            // restart above. The replay takes the record's advisory write gate,
+            // which this completion path does not hold.
+            let db = self.clone();
+            let put_name = name.to_string();
+            crate::runtime::task::spawn(async move {
+                db.restart_deferred_notify_put(&put_name, put).await;
+            });
         }
 
         Ok(())

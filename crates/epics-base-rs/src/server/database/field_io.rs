@@ -267,6 +267,48 @@ fn set_empty_request_alarm(instance: &mut crate::server::record::RecordInstance)
     );
 }
 
+/// What the put entry point owes the caller in the way of completion — the
+/// `dbPutField` / `dbPutNotify` split, plus the restart C's `dbNotify` state
+/// machine performs on a put-notify that had to wait for a PACT record.
+///
+/// The completion *sender* travels with the request: a restarted put must
+/// signal the ORIGINAL caller's receiver, which was handed out when the put
+/// first arrived and was deferred, so the restart cannot mint a fresh channel.
+enum NotifyRequest {
+    /// C `dbPutField` — process the record, build no `putNotify`.
+    None,
+    /// C `dbPutNotify` arriving fresh from a client: mint the wait-set channel.
+    New,
+    /// C `dbNotify.c:207-231` restart: the client's receiver already exists,
+    /// this replay carries its sender.
+    Deferred(crate::runtime::sync::oneshot::Sender<()>),
+}
+
+impl NotifyRequest {
+    fn wants_notify(&self) -> bool {
+        !matches!(self, NotifyRequest::None)
+    }
+
+    /// The completion sender, plus the receiver to hand back — `Some` only for
+    /// a fresh request; a restart's receiver went to the client at deferral.
+    #[allow(clippy::type_complexity)]
+    fn into_completion(
+        self,
+    ) -> Option<(
+        crate::runtime::sync::oneshot::Sender<()>,
+        Option<crate::runtime::sync::oneshot::Receiver<()>>,
+    )> {
+        match self {
+            NotifyRequest::None => None,
+            NotifyRequest::New => {
+                let (tx, rx) = crate::runtime::sync::oneshot::channel();
+                Some((tx, Some(rx)))
+            }
+            NotifyRequest::Deferred(tx) => Some((tx, None)),
+        }
+    }
+}
+
 impl PvDatabase {
     /// Get a PV value synchronously, from a thread that cannot `await`.
     ///
@@ -835,7 +877,7 @@ impl PvDatabase {
         field: &str,
         value: EpicsValue,
     ) -> CaResult<Option<crate::runtime::sync::oneshot::Receiver<()>>> {
-        self.put_record_field_from_ca_inner(record_name, field, value, true, true)
+        self.put_record_field_from_ca_inner(record_name, field, value, true, NotifyRequest::New)
             .await
     }
 
@@ -852,7 +894,7 @@ impl PvDatabase {
         field: &str,
         value: EpicsValue,
     ) -> CaResult<Option<crate::runtime::sync::oneshot::Receiver<()>>> {
-        self.put_record_field_from_ca_inner(record_name, field, value, false, true)
+        self.put_record_field_from_ca_inner(record_name, field, value, false, NotifyRequest::New)
             .await
     }
 
@@ -871,7 +913,7 @@ impl PvDatabase {
         field: &str,
         value: EpicsValue,
     ) -> CaResult<()> {
-        self.put_record_field_from_ca_inner(record_name, field, value, true, false)
+        self.put_record_field_from_ca_inner(record_name, field, value, true, NotifyRequest::None)
             .await
             .map(|_| ())
     }
@@ -935,9 +977,46 @@ impl PvDatabase {
         field: &str,
         value: EpicsValue,
     ) -> CaResult<()> {
-        self.put_record_field_from_ca_inner(record_name, field, value, false, false)
+        self.put_record_field_from_ca_inner(record_name, field, value, false, NotifyRequest::None)
             .await
             .map(|_| ())
+    }
+
+    /// C `processNotifyCommon`'s PACT arm (dbNotify.c:225-231): the put-notify
+    /// landed on a busy record, so the WHOLE put is deferred — no value
+    /// written, no RPRO raised, no join of the in-flight cycle's wait-set (that
+    /// join is what completed the callback an entire cycle too early). The
+    /// record's async completion replays it through
+    /// [`Self::restart_deferred_notify_put`].
+    ///
+    /// A second put-notify onto a record that already owns one is C's
+    /// "another processNotify owns the record" (dbNotify.c:213-217); the port
+    /// reports it to the client as `PutCallbackInProgress` (C `S_db_Blocked` /
+    /// `ECA_PUTCBINPROG`) rather than queueing a restart list.
+    async fn defer_notify_put(
+        &self,
+        record_name: &str,
+        rec: &std::sync::Arc<crate::runtime::sync::RwLock<crate::server::record::RecordInstance>>,
+        field: String,
+        value: EpicsValue,
+        notify_request: NotifyRequest,
+    ) -> CaResult<Option<crate::runtime::sync::oneshot::Receiver<()>>> {
+        let Some((completion, completion_rx)) = notify_request.into_completion() else {
+            // Fire-and-forget never reaches here: `dbPutField` on a PACT record
+            // DOES write the value and set RPRO (dbAccess.c:1263-1277). Only
+            // `dbPutNotify` defers.
+            return Ok(None);
+        };
+        let mut guard = rec.write().await;
+        if guard.notify.is_some() || guard.deferred_notify_put.is_some() {
+            return Err(CaError::PutCallbackInProgress(record_name.to_string()));
+        }
+        guard.deferred_notify_put = Some(crate::server::record::DeferredNotifyPut {
+            field,
+            value,
+            completion,
+        });
+        Ok(completion_rx)
     }
 
     /// Process a record UNCONDITIONALLY with a put-notify wait-set, returning
@@ -1040,15 +1119,48 @@ impl PvDatabase {
             .await;
     }
 
+    /// C `dbNotifyCompletion` → restart (dbNotify.c:207-231, state
+    /// `notifyRestartInProgress`): replay a put-notify that landed on a PACT
+    /// record, now that the record is idle. The single owner that consumes a
+    /// [`DeferredNotifyPut`]; called only from the async-completion tail.
+    ///
+    /// The replay goes back through the ordinary put entry, so if the record
+    /// has ALREADY gone active again (a scan fired between the completion and
+    /// this replay), the same PACT test defers it once more rather than writing
+    /// into a busy record — the deferral is closed under its own restart.
+    pub(crate) async fn restart_deferred_notify_put(
+        &self,
+        record_name: &str,
+        put: crate::server::record::DeferredNotifyPut,
+    ) {
+        let crate::server::record::DeferredNotifyPut {
+            field,
+            value,
+            completion,
+        } = put;
+        // The client already holds the receiver; a failure here (record gone,
+        // field refused) must still release it, which dropping the sender does.
+        let _ = self
+            .put_record_field_from_ca_inner(
+                record_name,
+                &field,
+                value,
+                true,
+                NotifyRequest::Deferred(completion),
+            )
+            .await;
+    }
+
     async fn put_record_field_from_ca_inner(
         &self,
         record_name: &str,
         field: &str,
         value: EpicsValue,
         acquire_gate: bool,
-        want_notify: bool,
+        notify_request: NotifyRequest,
     ) -> CaResult<Option<crate::runtime::sync::oneshot::Receiver<()>>> {
         let field = field.to_ascii_uppercase();
+        let want_notify = notify_request.wants_notify();
 
         // Get record Arc — alias-aware (epics-base PR #336) so a CA
         // client that connects via an alias name can put fields on
@@ -1101,6 +1213,24 @@ impl PvDatabase {
             // below. One gate owner for every route ([`check_no_mod`]).
             check_no_mod(&instance, &field)?;
 
+            // C `processNotifyCommon` (dbNotify.c:225-231) tests PACT ABOVE the
+            // put — `if (precord->pact) { ... pnotify->state =
+            // notifyRestartCallbackRequested; ... return; }` — so a put-notify
+            // that lands on a busy record writes NOTHING: no value, no RPRO, no
+            // join of the in-flight cycle's wait-set. The whole put is replayed
+            // from `dbNotifyCompletion` when the record goes idle. Joining the
+            // running cycle instead completed the callback one cycle early, on
+            // work that never saw this value.
+            //
+            // A fire-and-forget `dbPutField` is NOT deferred: it writes and
+            // raises RPRO (dbAccess.c:1263-1277). Only the notify route waits.
+            if want_notify && instance.is_processing() {
+                drop(instance);
+                return self
+                    .defer_notify_put(record_name, &rec, field, value, notify_request)
+                    .await;
+            }
+
             // PROC intercept: trigger processing on any SCAN.
             // Falls through to the put_notify_tx registration below
             // so async records (motor, asyn-backed AO) signal real
@@ -1118,8 +1248,9 @@ impl PvDatabase {
                 // itself isn't stored; PROC is a trigger). A
                 // fire-and-forget caller parks nothing — C `dbPutField`
                 // on PROC processes the record with no putNotify.
-                let parked = if want_notify {
-                    let (completion_tx, completion_rx) = crate::runtime::sync::oneshot::channel();
+                let parked = if let Some((completion_tx, completion_rx)) =
+                    notify_request.into_completion()
+                {
                     let notify = crate::server::record::NotifyWaitSet::new(completion_tx);
                     {
                         // Collect-then-act: clone the handle under a brief map
@@ -1157,7 +1288,7 @@ impl PvDatabase {
                         if notify.completed() {
                             Ok(None)
                         } else {
-                            Ok(Some(completion_rx))
+                            Ok(completion_rx)
                         }
                     }
                     None => Ok(None),
@@ -1427,8 +1558,8 @@ impl PvDatabase {
         // only in `dbPutNotify`; `dbPutField` processes the record with
         // no notify state at all. It therefore neither conflicts with
         // nor disturbs a WRITE_NOTIFY already parked on the record.
-        let parked = if want_notify {
-            let (completion_tx, completion_rx) = crate::runtime::sync::oneshot::channel();
+        let parked = if let Some((completion_tx, completion_rx)) = notify_request.into_completion()
+        {
             let notify = crate::server::record::NotifyWaitSet::new(completion_tx);
             {
                 // Collect-then-act: clone the handle under a brief map read,
@@ -1549,7 +1680,7 @@ impl PvDatabase {
                 if notify.completed() {
                     Ok(None)
                 } else {
-                    Ok(Some(completion_rx))
+                    Ok(completion_rx)
                 }
             }
             None => Ok(None),

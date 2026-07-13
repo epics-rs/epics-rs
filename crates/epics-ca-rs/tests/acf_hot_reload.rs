@@ -13,6 +13,7 @@ async fn reload_acf_swaps_in_new_rules() {
     std::fs::write(&acf_path, "ASG(DEFAULT) { RULE(1, READ) }").expect("write acf v1");
 
     let server = CaServer::builder()
+        .port(0)
         .pv("HOT:VAL", epics_base_rs::types::EpicsValue::Long(0))
         .acf_file(acf_path.to_str().unwrap())
         .expect("acf v1")

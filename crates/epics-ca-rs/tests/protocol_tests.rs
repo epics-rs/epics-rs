@@ -198,6 +198,7 @@ fn header_set_payload_count_boundary_at_0xffff() {
 #[tokio::test]
 async fn server_builder_with_simple_pvs() {
     let server = CaServer::builder()
+        .port(0)
         .pv("TEST:DOUBLE", EpicsValue::Double(3.15))
         .pv("TEST:STRING", EpicsValue::String("hello".into()))
         .pv("TEST:SHORT", EpicsValue::Short(42))
@@ -229,6 +230,7 @@ async fn server_builder_with_simple_pvs() {
 #[tokio::test]
 async fn server_put_and_get_double() {
     let server = CaServer::builder()
+        .port(0)
         .pv("SRV:D", EpicsValue::Double(0.0))
         .build()
         .await
@@ -241,6 +243,7 @@ async fn server_put_and_get_double() {
 #[tokio::test]
 async fn server_put_and_get_string() {
     let server = CaServer::builder()
+        .port(0)
         .pv("SRV:S", EpicsValue::String("initial".into()))
         .build()
         .await
@@ -259,6 +262,7 @@ async fn server_put_and_get_string() {
 #[tokio::test]
 async fn server_put_and_get_short() {
     let server = CaServer::builder()
+        .port(0)
         .pv("SRV:I", EpicsValue::Short(0))
         .build()
         .await
@@ -271,6 +275,7 @@ async fn server_put_and_get_short() {
 #[tokio::test]
 async fn server_put_and_get_enum() {
     let server = CaServer::builder()
+        .port(0)
         .pv("SRV:E", EpicsValue::Enum(0))
         .build()
         .await
@@ -283,6 +288,7 @@ async fn server_put_and_get_enum() {
 #[tokio::test]
 async fn server_put_and_get_float() {
     let server = CaServer::builder()
+        .port(0)
         .pv("SRV:F", EpicsValue::Float(0.0))
         .build()
         .await
@@ -295,6 +301,7 @@ async fn server_put_and_get_float() {
 #[tokio::test]
 async fn server_put_and_get_long() {
     let server = CaServer::builder()
+        .port(0)
         .pv("SRV:L", EpicsValue::Long(0))
         .build()
         .await
@@ -313,6 +320,7 @@ async fn server_put_and_get_long() {
 #[tokio::test]
 async fn server_put_and_get_char() {
     let server = CaServer::builder()
+        .port(0)
         .pv("SRV:C", EpicsValue::Char(0))
         .build()
         .await
@@ -329,6 +337,7 @@ async fn server_put_and_get_char() {
 #[tokio::test]
 async fn server_get_nonexistent_pv_returns_error() {
     let server = CaServer::builder()
+        .port(0)
         .pv("REAL:PV", EpicsValue::Double(1.0))
         .build()
         .await
@@ -473,6 +482,7 @@ async fn server_stats_subscription_counters_track_camonitor_lifecycle() {
 #[tokio::test]
 async fn server_put_nonexistent_pv_returns_error() {
     let server = CaServer::builder()
+        .port(0)
         .pv("REAL:PV", EpicsValue::Double(1.0))
         .build()
         .await
@@ -488,7 +498,7 @@ async fn server_put_nonexistent_pv_returns_error() {
 
 #[tokio::test]
 async fn server_add_pv_at_runtime() {
-    let server = CaServer::builder().build().await.unwrap();
+    let server = CaServer::builder().port(0).build().await.unwrap();
 
     // PV does not exist yet
     assert!(server.get("RUNTIME:PV").await.is_err());
@@ -513,6 +523,7 @@ async fn server_add_pv_at_runtime() {
 #[tokio::test]
 async fn server_multiple_pv_types_coexist() {
     let server = CaServer::builder()
+        .port(0)
         .pv("MULTI:D", EpicsValue::Double(1.1))
         .pv("MULTI:S", EpicsValue::String("abc".into()))
         .pv("MULTI:I", EpicsValue::Short(7))
@@ -552,6 +563,7 @@ record(ai, "TEMP:READING") {
 "#;
     let macros = HashMap::new();
     let server = CaServer::builder()
+        .port(0)
         .db_string(db_text, &macros)
         .unwrap()
         .build()
@@ -572,6 +584,7 @@ record(ai, "$(PREFIX):SETPOINT") {
     let mut macros = HashMap::new();
     macros.insert("PREFIX".to_string(), "MTR01".to_string());
     let server = CaServer::builder()
+        .port(0)
         .db_string(db_text, &macros)
         .unwrap()
         .build()
@@ -597,6 +610,7 @@ record(ai, "SENSOR:TEMP") {
 "#;
     let macros = HashMap::new();
     let server = CaServer::builder()
+        .port(0)
         .db_string(db_text, &macros)
         .unwrap()
         .build()
@@ -654,6 +668,7 @@ record(stringout, "SO:VAL") {
 "#;
     let macros = HashMap::new();
     let server = CaServer::builder()
+        .port(0)
         .db_string(db_text, &macros)
         .unwrap()
         .build()
@@ -687,6 +702,7 @@ record(ao, "CTRL:SP") {
 "#;
     let macros = HashMap::new();
     let server = CaServer::builder()
+        .port(0)
         .db_string(db_text, &macros)
         .unwrap()
         .build()
@@ -723,6 +739,7 @@ record(ai, "REC:AI") {
 "#;
     let macros = HashMap::new();
     let server = CaServer::builder()
+        .port(0)
         .pv("SIMPLE:PV", EpicsValue::Double(20.0))
         .db_string(db_text, &macros)
         .unwrap()
@@ -768,6 +785,7 @@ async fn server_builder_custom_port() {
 #[tokio::test]
 async fn server_database_accessor() {
     let server = CaServer::builder()
+        .port(0)
         .pv("DB:ACCESS", EpicsValue::Double(7.7))
         .build()
         .await

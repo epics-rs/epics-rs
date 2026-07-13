@@ -25,12 +25,6 @@ use epics_base_rs::server::snapshot::DbrClass;
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 use serial_test::serial;
 
-/// Pick a free ephemeral port by briefly binding and releasing.
-fn free_port() -> u16 {
-    let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-    sock.local_addr().unwrap().port()
-}
-
 /// Spin up an ephemeral-port server with the given PVs, return
 /// a connected `CaClient` whose ADDR_LIST points at that server.
 async fn setup(pvs: Vec<(&str, EpicsValue)>) -> CaResult<epics_ca_rs::client::CaClient> {
@@ -69,16 +63,18 @@ async fn setup(pvs: Vec<(&str, EpicsValue)>) -> CaResult<epics_ca_rs::client::Ca
         .await;
     });
 
-    // Bind the UDP search responder on a known free port. Bound here,
-    // so a SEARCH sent immediately below is queued by the kernel rather
-    // than lost — no sleep needed.
-    let udp_port = free_port();
+    // Bind the UDP search responder on a kernel-assigned port and read the
+    // port back — never probe a port and re-bind the number, which races
+    // any other socket in this process. Bound here, so a SEARCH sent
+    // immediately below is queued by the kernel rather than lost — no
+    // sleep needed.
     let responders = epics_ca_rs::server::udp::bind_udp_responders(
-        udp_port,
+        0,
         vec![std::net::Ipv4Addr::UNSPECIFIED],
         &[],
     )
     .expect("UDP responder bound");
+    let udp_port = responders.port();
     let db_udp = db.clone();
     tokio::spawn(async move {
         let _ = epics_ca_rs::server::udp::run_udp_search_responder(

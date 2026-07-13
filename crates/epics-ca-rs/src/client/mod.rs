@@ -3732,24 +3732,7 @@ async fn run_coordinator(
                     } => {
                         types::dispatch_exception(
                             &exception_slot,
-                            types::CaException {
-                                kind: types::CaExceptionKind::ServerError,
-                                message: format!(
-                                    "Channel: \"{}\", Connecting to: {}, Ignored: {}",
-                                    pv_name, prev_addr, new_addr,
-                                ),
-                                server_addr: Some(new_addr),
-                                pv_name: Some(pv_name),
-                                status: Some(crate::protocol::ECA_DBLCHNL),
-                                // C raises this one through the plain
-                                // `ca_client_context::exception` overload
-                                // (`cac.cpp:1323`): no chid, no type/count —
-                                // so the block prints the ctx text verbatim.
-                                op: types::CaOp::Other,
-                                data_type: None,
-                                count: None,
-                                source: None,
-                            },
+                            types::multiply_defined_pv_exception(pv_name, prev_addr, new_addr),
                         );
                     }
                 }
@@ -4135,11 +4118,14 @@ async fn run_coordinator(
                                 data_type: is_channel_exception.then_some(data_type).flatten(),
                                 count: is_channel_exception.then_some(count).flatten(),
                                 // `cac::defaultExcep` (`cac.cpp:1006-1016`)
-                                // passes a null file, which suppresses the
-                                // `Source File:` line; only the channel-write
-                                // exception carries one.
-                                source: is_channel_exception
-                                    .then_some(types::LIBCA_WRITE_EXCEPTION_SITE),
+                                // is libca's one null-file producer, so it is
+                                // the one block with no `Source File:` line;
+                                // the channel-write exception carries its own.
+                                source: if is_channel_exception {
+                                    types::LIBCA_WRITE_EXCEPTION_SITE
+                                } else {
+                                    types::ExceptionSite::NullFile
+                                },
                             },
                         );
                     }
@@ -4173,35 +4159,22 @@ async fn run_coordinator(
                         tracing::warn!(server = %server_addr, priority, "circuit unresponsive (echo timeout)");
                         metrics::counter!("ca_client_unresponsive_total", "server" => server_addr.to_string()).increment(1);
                         // C `tcpiiu::unresponsiveCircuitNotify`
-                        // (`libca/tcpiiu.cpp:899-941`) fires the global
-                        // exception hook with ECA_UNRESPTMO, then walks
-                        // every connected channel and calls
-                        // `pChan->unresponsiveCircuitNotify` which in
-                        // `nciu.cpp:161-182` triggers
-                        // `disconnectAllIO()` (ECA_DISCONN per IO) +
-                        // `accessRightsNotify(noRights)`. Pre-fix Rust
-                        // only flipped state and emitted
-                        // `ConnectionEvent::Unresponsive` — in-flight
-                        // get/put/subscribe waiters kept hanging,
-                        // access-rights subscribers got no signal.
-                        types::dispatch_exception(
-                            &exception_slot,
-                            types::CaException {
-                                kind: types::CaExceptionKind::ServerError,
-                                message: format!(
-                                    "circuit unresponsive: {server_addr} (matches libca ECA_UNRESPTMO)"
-                                ),
-                                server_addr: Some(server_addr),
-                                pv_name: None,
-                                status: Some(crate::protocol::ECA_UNRESPTMO),
-                                // libca `tcpiiu::unresponsiveCircuitNotify`
-                                // raises this with a plain ctx string too.
-                                op: types::CaOp::Other,
-                                data_type: None,
-                                count: None,
-                                source: None,
-                            },
-                        );
+                        // (`tcpiiu.cpp:899-941`) fires the global exception
+                        // hook with ECA_UNRESPTMO — gated, like the
+                        // circuit-gone raise, on the circuit still having
+                        // connected channels (`tcpiiu.cpp:922`
+                        // `connectedList.count()`) — and then walks each of
+                        // them through `nciu::unresponsiveCircuitNotify`.
+                        if channels.values().any(|ch| {
+                            ch.server_addr == Some(server_addr)
+                                && ch.priority == priority
+                                && ch.state == ChannelState::Connected
+                        }) {
+                            types::dispatch_exception(
+                                &exception_slot,
+                                types::unresponsive_circuit_exception(server_addr),
+                            );
+                        }
                         // Same owner as the two circuit-gone paths: the
                         // ECA_DISCONN fan-out to in-flight reads / writes /
                         // subscriptions and the no-rights transition are the
@@ -4318,6 +4291,13 @@ async fn run_coordinator(
                         server_minor_version.insert((server_addr, priority), minor_version);
                     }
                     TransportEvent::ServerConnected { server_addr } => {
+                        // C hands the peer address to `ipAddrToAsciiEngine` in
+                        // the `tcpiiu` constructor, so the name is resolved
+                        // long before anything prints it. Warm the same cache
+                        // here — otherwise the first ask is the exception block
+                        // of a circuit that just died, and it would print the
+                        // dotted IP where C prints `localhost:5064`.
+                        crate::hostname::warm(server_addr);
                         // libca bhe-on-connect parity: tell the beacon
                         // monitor to drop its per-server EMA so the
                         // next beacon reseeds `period_estimate` from
@@ -4506,7 +4486,11 @@ fn handle_server_disconnect(
             op: types::CaOp::Other,
             data_type: None,
             count: None,
-            source: None,
+            // No C site to name: `CA_PROTO_SERVER_DISCONN` never reaches
+            // `vSignal` at all (`cac::verifyAndDisconnectChan` takes it out
+            // through the channel's connection callback), so this kind renders
+            // to nothing. The field is unread here.
+            source: types::ExceptionSite::NullFile,
         },
     );
 }
@@ -6182,7 +6166,7 @@ mod disconnect_transition_tests {
             let in_flight = types::InFlightOps::new();
             let snapshots: ChannelSnapshots = Arc::new(dashmap::DashMap::new());
 
-            let raised: Arc<parking_lot::Mutex<Vec<(u32, String, Option<(&str, u32)>)>>> =
+            let raised: Arc<parking_lot::Mutex<Vec<(u32, String, types::ExceptionSite)>>> =
                 Arc::new(parking_lot::Mutex::new(Vec::new()));
             let sink = raised.clone();
             let slot: types::CaExceptionSlot = Arc::new(parking_lot::RwLock::new(Some(Arc::new(
@@ -6220,7 +6204,7 @@ mod disconnect_transition_tests {
                     !ctx.is_empty() && !ctx.contains("circuit"),
                     "context: {ctx}"
                 );
-                assert_eq!(*source, Some(types::LIBCA_CIRCUIT_DISCONNECT_SITE));
+                assert_eq!(*source, types::LIBCA_CIRCUIT_DISCONNECT_SITE);
             }
         }
     }

@@ -244,9 +244,19 @@ pub struct PortDriverBase {
     eos: HashMap<i32, DeviceEos>,
     pub interpose_octet: OctetInterposeStack,
     /// Trace configuration — C `dpCommon.trace` (asynManager.c:503). Same
-    /// owner as [`Self::exception_sink`]: bound by
+    /// owner as [`Self::announcer`]: bound by
     /// [`crate::services::PortServices::bind`] at port creation.
     pub(crate) trace: Option<Arc<TraceManager>>,
+    /// C `octetPvt.interruptProcess` — the last argument of
+    /// `pasynOctetBase->initialize` (asynOctetBase.c:161-169). When set, every
+    /// successful octet read fans the data out to the port's octet interrupt
+    /// users (`readIt` → `callInterruptUsers`, :224-238). The stream drivers set
+    /// it — drvAsynIPPort.c:1055, drvAsynSerialPort.c:1125,
+    /// drvAsynSerialPortWin32.c:798, drvAsynFTDIPort.cpp:616 — and it is what
+    /// makes a `stringin`/`waveform` with `SCAN="I/O Intr"` on such a port
+    /// process at all. Parameter-cache ports (echoDriver, USBTMC, GPIB,
+    /// IP-server) pass 0 and are unaffected.
+    pub octet_interrupt_process: bool,
     /// Per-address device state for multi-device ports.
     pub device_states: HashMap<i32, DeviceState>,
     /// Timestamp source callback for custom timestamps.
@@ -346,6 +356,7 @@ impl PortDriverBase {
             eos: HashMap::new(),
             interpose_octet: OctetInterposeStack::new(flags.multi_device),
             trace: None,
+            octet_interrupt_process: false,
             device_states: HashMap::new(),
             timestamp_source: None,
             last_connect_disconnect: None,

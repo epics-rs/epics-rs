@@ -555,6 +555,11 @@ impl DrvAsynSerialPort {
         );
         base.init_connected(false);
         base.auto_connect = true;
+        // C passes `interruptProcess = 1` to `pasynOctetBase->initialize`
+        // (drvAsynSerialPort.c:1125): every successful octet read on this port fans out to
+        // its octet interrupt users, which is what drives a SCAN="I/O Intr"
+        // record. See `PortDriverBase::octet_interrupt_process`.
+        base.octet_interrupt_process = true;
 
         Ok(Self {
             base,

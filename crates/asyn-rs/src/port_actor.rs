@@ -11,11 +11,15 @@ use std::cell::Cell;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::{AsynError, AsynResult, AsynStatus};
+use crate::interfaces::InterfaceType;
+use crate::interpose::EomReason;
+use crate::interrupt::InterruptValue;
+use crate::param::ParamValue;
 use crate::port::{PortDriver, QueuePriority};
 use crate::request::{CancelToken, RequestOp, RequestResult};
 use crate::user::{AsynUser, ConnectCheck};
@@ -1272,6 +1276,53 @@ impl PortActor {
         self.driver.base().is_device_connected(addr)
     }
 
+    /// The octet read every request op goes through — C `asynOctetBase::readIt`
+    /// (asynOctetBase.c:224-238), which sits between the caller and the driver's
+    /// own `read` exactly as this does:
+    ///
+    /// ```c
+    /// status = pasynOctet->read(poctetPvt->drvPvt, pasynUser, data, maxchars,
+    ///                           nbytesTransfered, eomReason);
+    /// if (status != asynSuccess) return status;
+    /// if (poctetPvt->interruptProcess)
+    ///     callInterruptUsers(pasynUser, poctetPvt->pasynPvt, data,
+    ///                        nbytesTransfered, eomReason);
+    /// ```
+    ///
+    /// The fan-out lives here rather than in each driver because in C it is not
+    /// the driver's: `octetBase` is interposed on the port, so *every* read on a
+    /// port that enabled `interruptProcess` fans out, whichever request brought
+    /// it. That is what makes a `stringin`/`waveform` with `SCAN="I/O Intr"` on
+    /// an IP or serial port process — before this, no driver notified after a
+    /// read and such a record never ran.
+    ///
+    /// A failed read fans out nothing (C returns before `callInterruptUsers`).
+    fn octet_read(
+        &mut self,
+        user: &AsynUser,
+        buf_size: usize,
+    ) -> AsynResult<(Vec<u8>, usize, EomReason)> {
+        let mut buf = vec![0u8; buf_size];
+        let (n, eom) = self.driver.io_read_octet_eom(user, &mut buf)?;
+        buf.truncate(n);
+        if self.driver.base().octet_interrupt_process {
+            // C filters the list by addr (:203-215); `InterruptFilter` does that
+            // here. The value type is the port's octet payload — a `String` — so
+            // a non-UTF-8 device read is replacement-charactered on this path;
+            // that is the octet-param type, not this fan-out, and it is the same
+            // on every other octet path in the crate.
+            self.driver.base().interrupts.notify(InterruptValue {
+                reason: user.reason,
+                addr: user.addr,
+                value: ParamValue::Octet(String::from_utf8_lossy(&buf).into_owned()),
+                timestamp: SystemTime::now(),
+                iface: Some(InterfaceType::Octet),
+                ..Default::default()
+            });
+        }
+        Ok((buf, n, eom))
+    }
+
     fn dispatch_io(&mut self, user: &mut AsynUser, op: &RequestOp) -> AsynResult<RequestResult> {
         let is_read = matches!(
             op,
@@ -1297,9 +1348,7 @@ impl PortActor {
                 Ok(RequestResult::write_n(n))
             }
             RequestOp::OctetRead { buf_size } => {
-                let mut buf = vec![0u8; *buf_size];
-                let (n, eom) = self.driver.io_read_octet_eom(user, &mut buf)?;
-                buf.truncate(n);
+                let (buf, n, eom) = self.octet_read(user, *buf_size)?;
                 Ok(RequestResult::octet_read_eom(buf, n, eom.bits()))
             }
             RequestOp::OctetWriteBinary { data } => {
@@ -1323,11 +1372,9 @@ impl PortActor {
                 // payload.
                 let saved = self.driver.get_input_eos(user);
                 self.driver.set_input_eos(user, &[])?;
-                let mut buf = vec![0u8; *buf_size];
-                let res = self.driver.io_read_octet_eom(user, &mut buf);
+                let res = self.octet_read(user, *buf_size);
                 let _ = self.driver.set_input_eos(user, &saved);
-                let (n, eom) = res?;
-                buf.truncate(n);
+                let (buf, n, eom) = res?;
                 Ok(RequestResult::octet_read_eom(buf, n, eom.bits()))
             }
             RequestOp::OctetWriteRead {
@@ -1353,9 +1400,7 @@ impl PortActor {
                     self.driver.io_flush(user)?;
                 }
                 self.driver.io_write_octet(user, data)?;
-                let mut buf = vec![0u8; *buf_size];
-                let (n, eom) = self.driver.io_read_octet_eom(user, &mut buf)?;
-                buf.truncate(n);
+                let (buf, n, eom) = self.octet_read(user, *buf_size)?;
                 Ok(RequestResult::octet_read_eom(buf, n, eom.bits()))
             }
             RequestOp::Int32Write { value } => {

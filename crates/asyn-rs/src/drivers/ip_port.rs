@@ -945,6 +945,11 @@ impl DrvAsynIPPort {
         );
         base.init_connected(false);
         base.auto_connect = true;
+        // C passes `interruptProcess = 1` to `pasynOctetBase->initialize`
+        // (drvAsynIPPort.c:1055): every successful octet read on this port fans out to
+        // its octet interrupt users, which is what drives a SCAN="I/O Intr"
+        // record. See `PortDriverBase::octet_interrupt_process`.
+        base.octet_interrupt_process = true;
 
         // C `drvAsynIPPortConfigure` (:1061): `if (tty->isCom) asynInterposeCOM(...)`
         // — installed at configure time, before the port ever connects, so the

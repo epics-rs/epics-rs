@@ -1,4 +1,54 @@
-use crate::types::EpicsValue;
+use crate::error::{CaError, CaResult};
+use crate::types::{DbFieldType, EpicsValue};
+
+/// The `RVAL` store behind every `DTYP="Raw Soft Channel"` INPUT dset — ai,
+/// bi, mbbi, mbbiDirect.
+///
+/// C reads the link straight into the raw word: `dbGetLink(&prec->inp,
+/// DBR_LONG|DBR_ULONG, &prec->rval, ...)`. `dbGetLink` picks its conversion
+/// routine from BOTH ends (`dbFastGetConvertRoutine`, `dbConvert.c:1571-1638`),
+/// so what happens to an out-of-range value depends on the SOURCE type: an
+/// integer source reaches `getLongUlong` and converts MODULO 2^32, which C
+/// defines (C17 6.3.1.3p2) — `0xdeadbeef` read from a signed `DBF_LONG` lands in
+/// RVAL as `0xdeadbeef` — while a float source reaches `getDoubleUlong` and hits
+/// the UB cast that CBUG-E2 saturates.
+///
+/// [`EpicsValue::convert_to`] is the owner of that split. Reaching for
+/// `c_cast::f64_to_*(value.to_f64())` instead — as all four dsets once did —
+/// forces the FLOAT rule onto integer sources and saturates what C wraps.
+///
+/// `convert_to` coerces rather than fails, so the not-numeric rejection has to
+/// stay explicit: without this gate a string INP would land in RVAL as a silent
+/// 0 instead of C's `S_db_badDbrtype`.
+fn raw_soft_rval(record: &str, value: &EpicsValue, rval_type: DbFieldType) -> CaResult<EpicsValue> {
+    if value.to_f64().is_none() {
+        return Err(CaError::TypeMismatch(
+            format!("{record} Raw Soft Channel: INP value not numeric").into(),
+        ));
+    }
+    Ok(value.convert_to(rval_type))
+}
+
+/// [`raw_soft_rval`] for the dsets whose `RVAL` is `epicsInt32` (ai).
+pub(crate) fn raw_soft_rval_i32(record: &str, value: &EpicsValue) -> CaResult<i32> {
+    match raw_soft_rval(record, value, DbFieldType::Long)? {
+        EpicsValue::Long(v) => Ok(v),
+        other => Err(CaError::TypeMismatch(
+            format!("{record} Raw Soft Channel: INP value not a scalar ({other:?})").into(),
+        )),
+    }
+}
+
+/// [`raw_soft_rval`] for the dsets whose `RVAL` is `epicsUInt32` (bi, mbbi,
+/// mbbiDirect).
+pub(crate) fn raw_soft_rval_u32(record: &str, value: &EpicsValue) -> CaResult<u32> {
+    match raw_soft_rval(record, value, DbFieldType::ULong)? {
+        EpicsValue::ULong(v) => Ok(v),
+        other => Err(CaError::TypeMismatch(
+            format!("{record} Raw Soft Channel: INP value not a scalar ({other:?})").into(),
+        )),
+    }
+}
 
 /// A put into one of the array records' bookkeeping counters — waveform/aai/aao
 /// NELM, subArray NELM/MALM/INDX, compress NSAM/N, histogram NELM/MDEL — which C

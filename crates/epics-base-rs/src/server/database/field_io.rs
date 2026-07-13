@@ -99,6 +99,28 @@ pub(crate) fn put_drives_processing_of(
             && instance.record.processes_after_put(field))
 }
 
+/// Drain the record's per-cycle post marks ([`Record::take_cycle_posted_fields`])
+/// into monitor posts — the put-path counterpart of the `db_post_events` calls a
+/// C `special()` makes by hand.
+///
+/// One owner, so the two put-path drains (the normal tail, and the failing
+/// `special()` above) cannot disagree about the mask mapping.
+fn emit_cycle_posts(instance: &mut crate::server::record::RecordInstance) {
+    use crate::server::record::{CyclePostMask, EventMask};
+    for (sf, cycle_mask) in instance.record.take_cycle_posted_fields() {
+        let mask = match cycle_mask {
+            CyclePostMask::Value => EventMask::VALUE,
+            // No `monitor_mask` exists on a put path (no alarm transition is
+            // being resolved), so both LOG-carrying variants reduce to C's
+            // literal `DBE_VALUE|DBE_LOG`.
+            CyclePostMask::ValueLog | CyclePostMask::MonitorValueLog => {
+                EventMask::VALUE | EventMask::LOG
+            }
+        };
+        instance.notify_field(sf, mask);
+    }
+}
+
 /// C `dbPutSpecial(paddr, 1)` — the after-put `special()`, paired with the drain
 /// of the link writes it queued ([`Record::take_special_actions`]).
 ///
@@ -122,7 +144,39 @@ fn special_after_put(
 ) -> CaResult<crate::server::record::CommonFieldPutResult> {
     let status = instance.record.special(field, true);
     out.extend(instance.record.take_special_actions());
+    if status.is_err() {
+        // The POSTS `special()` made are drained on the failing path for the same
+        // reason its ACTIONS are: C's `special()` calls `db_post_events` BEFORE it
+        // returns nonzero — aCalcout's NUSE arm posts the clamped value with
+        // `DBE_VALUE` and only then `return (-1)` (`aCalcoutRecord.c:495-499`) —
+        // and `dbPut`'s `goto done` skips only dbPut's OWN post. A refused put
+        // that repaired a field must still tell the subscribers what it repaired.
+        emit_cycle_posts(instance);
+    }
     status?;
+
+    // C `special()`'s CONSTANT-link re-seed (`calcoutRecord.c:367-378`,
+    // `sCalcoutRecord.c:512-517`, `aCalcoutRecord.c:534-540`,
+    // `transformRecord.c:714-719` — the four records whose C `special()` calls
+    // `recGblInitConstantLink`): a put that leaves an input link constant
+    // re-runs the load into that input's value field and posts it. Without it a
+    // constant link is load-once dead state — the link layer delivers nothing
+    // for a constant at process time, so `caput CO.INPB 7` would store the text
+    // and leave `B` at its `.db` value forever.
+    //
+    // The record only DECLARES the pairs (`special_reseed_input_links`); the
+    // load itself is the shared `rec_gbl_init_constant_link` owner, the same one
+    // the init seed uses. Records whose C `special()` does not re-seed (calc,
+    // sub, sel, aSub, swait, …) declare nothing and are untouched.
+    if let Some(value_field) =
+        crate::server::record::reseed_constant_input_link(&mut *instance.record, field)
+    {
+        // The mask is the C call site's, and they disagree — calcout posts a
+        // literal DBE_VALUE, transform DBE_VALUE|DBE_LOG. The record carries it.
+        let mask = instance.record.special_reseed_post_mask();
+        instance.notify_field(value_field, mask);
+    }
+
     // C `special(SPC_MOD)` pass 1 on SIMM (`longinRecord.c:171-177` and the
     // identical arm in all 21 SSCN-bearing records):
     //   `recGblCheckSimm((dbCommon *)prec, &prec->sscn, prec->oldsimm, prec->simm);`
@@ -148,33 +202,23 @@ fn special_before_put(instance: &mut crate::server::record::RecordInstance, fiel
     }
 }
 
-/// Coerce a write `value` to a record field's stored `target` type.
+/// Coerce a write `value` to a record field's stored `target` type — C
+/// `dbConvert.c`'s `dbFastPutConvertRoutine[dbrType][field_type]` table.
 ///
-/// A `DBR_STRING` write to a `DBF_MENU` field belongs to ONE converter — C
-/// `dbConvert.c::putStringMenu` (an exact label, else an index below
-/// `nChoice`), ported in `resolve_menu_field_string`. That converter's failure
-/// is `S_db_badChoice` and it FAILS the put; it must not fall through to
-/// `EpicsValue::convert_to`, which is field-blind and would both mis-map a
-/// menu-specific label (`SELM "Specified"`) and turn any unrecognised string
-/// into index 0 (`to_f64().unwrap_or(0.0) as u16`) — C stores nothing at all.
-/// Every non-menu field, and every already-typed value, goes to the single
-/// value-coercion owner `EpicsValue::convert_to`.
+/// The client-`dbPut` half of the shared converter
+/// [`crate::server::record::coerce_put_value`]; the internal-delivery half is
+/// `put_field_internal_default`. A `DBR_STRING` write to a `DBF_MENU` or
+/// `DBF_ENUM` field has a converter of its own in C (`putStringMenu`,
+/// `putStringEnum`) and must not fall through to `EpicsValue::convert_to`,
+/// which is field-blind and turns any unrecognised string into index 0 —
+/// C stores nothing and fails the put with `S_db_badChoice`.
 fn coerce_write_value(
     record: &dyn crate::server::record::Record,
     field: &str,
     target: crate::types::DbFieldType,
     value: EpicsValue,
 ) -> CaResult<EpicsValue> {
-    if let EpicsValue::String(s) = &value {
-        if let Some(choices) = record
-            .menu_field_choices(field)
-            .or_else(|| crate::server::record::shared_menu_choices(field))
-        {
-            let s = s.as_str_lossy();
-            return crate::server::record::resolve_menu_field_string(field, choices, target, &s);
-        }
-    }
-    Ok(value.convert_to(target))
+    crate::server::record::coerce_put_value(record, field, target, value)
 }
 
 /// What a `dbPut` of a given value means for a given field — the single owner
@@ -1526,19 +1570,7 @@ impl PvDatabase {
             // put, `DBE_VALUE`, `only if (strcmp(str, plinkGroup->s))`,
             // sseqRecord.c:1108-1116). A static field-name list cannot
             // express "only if it changed", so it over-posts; the mark can.
-            for (sf, cycle_mask) in instance.record.take_cycle_posted_fields() {
-                use crate::server::record::{CyclePostMask, EventMask};
-                let mask = match cycle_mask {
-                    CyclePostMask::Value => EventMask::VALUE,
-                    // No `monitor_mask` exists on a put path (no alarm
-                    // transition is being resolved), so both LOG-carrying
-                    // variants reduce to C's literal `DBE_VALUE|DBE_LOG`.
-                    CyclePostMask::ValueLog | CyclePostMask::MonitorValueLog => {
-                        EventMask::VALUE | EventMask::LOG
-                    }
-                };
-                instance.notify_field(sf, mask);
-            }
+            emit_cycle_posts(&mut instance);
 
             common_result
         };

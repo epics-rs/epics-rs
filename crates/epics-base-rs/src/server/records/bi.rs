@@ -1,5 +1,7 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, MENU_SIMM, ProcessOutcome, Record, dbd_generated};
+use crate::server::record::{
+    FieldDesc, MENU_SIMM, ProcessOutcome, RawSoftEntry, Record, dbd_generated,
+};
 use crate::types::{EpicsValue, PvString};
 
 /// Binary input record matching C biRecord behavior.
@@ -188,46 +190,27 @@ impl Record for BiRecord {
         }
     }
 
-    fn accepts_raw_soft_input(&self) -> bool {
-        true
+    /// C rset `get_enum_strs`/`put_enum_str` (biRecord.c:275-298) — ZNAM/ONAM.
+    fn enum_state_strings(&self) -> Option<Vec<PvString>> {
+        Some(crate::server::record::binary_enum_states(
+            &self.znam, &self.onam,
+        ))
     }
 
-    /// `DTYP="Raw Soft Channel"` reads the link value into `RVAL` and
-    /// applies `MASK` (epics-base f2fe9d12, devBiSoftRaw): a non-zero
-    /// MASK gates which bits of the source contribute to the
-    /// subsequent RVAL→VAL conversion.
-    fn apply_raw_input(&mut self, value: EpicsValue) -> CaResult<()> {
-        // C `devBiSoftRaw` reads the link with `dbGetLink(.., DBR_ULONG,
-        // &prec->rval, ..)`, which lands in a conversion routine chosen by the
-        // SOURCE type: an integer source reaches `getLongUlong` and wraps
-        // modulo 2^32 (DEFINED in C — 6.3.1.3p2, so `0xdeadbeef` read as a
-        // signed `DBF_LONG` still lands in RVAL as `0xdeadbeef`), a float
-        // source reaches `getDoubleUlong` and hits the UB cast that CBUG-E2
-        // saturates. `convert_to` is the owner of that split; calling
-        // `c_cast::f64_to_u32(value.to_f64())` here bypassed it and applied
-        // the float rule to integer sources, zeroing every negative RVAL.
-        //
-        // `convert_to` coerces rather than fails, so the not-numeric rejection
-        // stays explicit: without this gate a non-numeric source would land in
-        // RVAL as a silent 0.
-        if value.to_f64().is_none() {
-            return Err(CaError::TypeMismatch(
-                "bi Raw Soft Channel: INP value not numeric".into(),
-            ));
-        }
-        let rval = match value.convert_to(crate::types::DbFieldType::ULong) {
-            EpicsValue::ULong(v) => v,
-            other => {
-                return Err(CaError::TypeMismatch(
-                    format!("bi Raw Soft Channel: INP value not a scalar ({other:?})").into(),
-                ));
-            }
+    /// C `devBiSoftRaw` — `recGblInitConstantLink(&prec->inp, DBF_ULONG,
+    /// &prec->rval)` at init, `dbGetLink(.., DBR_ULONG, &prec->rval, ..)` +
+    /// `if (prec->mask) prec->rval &= prec->mask;` per read (epics-base
+    /// `f2fe9d12`). The mask is in `read_bi` ONLY, so the init constant load is
+    /// unmasked.
+    fn raw_soft_input(&mut self, entry: RawSoftEntry, value: EpicsValue) -> Option<CaResult<()>> {
+        self.rval = match super::raw_soft_rval_u32("bi", &value) {
+            Ok(rval) => rval,
+            Err(e) => return Some(Err(e)),
         };
-        self.rval = rval;
-        if self.mask != 0 {
+        if entry == RawSoftEntry::Read && self.mask != 0 {
             self.rval &= self.mask;
         }
-        Ok(())
+        Some(Ok(()))
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
@@ -267,22 +250,21 @@ impl Record for BiRecord {
                     self.val = v as u16;
                     Ok(())
                 }
-                // epics-base PR/issue #183 — DBF_MENU ↔ DBF_STRING.
-                // Accept the ZNAM/ONAM string and convert to the
-                // enum index. Mirrors the upstream fix that lets a
-                // bi VAL be written from a string-typed source link.
-                EpicsValue::String(s) => {
-                    if s == self.znam {
-                        self.val = 0;
-                        Ok(())
-                    } else if s == self.onam {
-                        self.val = 1;
-                        Ok(())
-                    } else {
-                        Err(CaError::TypeMismatch(format!(
-                            "bi VAL: '{s}' matches neither ZNAM nor ONAM"
-                        )))
+                // C rset `put_enum_str` (biRecord.c:290-298), reached from
+                // `dbConvert.c::putStringEnum`. The framework's put paths
+                // already resolve a DBR_STRING against `enum_state_strings`
+                // before they reach here; a direct caller takes the same
+                // converter, so there is one string→state rule.
+                EpicsValue::String(ref s) => {
+                    let resolved = crate::server::record::resolve_enum_state_string(
+                        "VAL",
+                        self.enum_state_strings().as_deref(),
+                        s,
+                    )?;
+                    if let EpicsValue::Enum(v) = resolved {
+                        self.val = v;
                     }
+                    Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },

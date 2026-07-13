@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::error::{CaError, CaResult};
 use crate::runtime::sync::RwLock;
 use crate::server::record::{
-    AuxPostMask, InputFetchPolicy, NotifyWaitSet, PactExit, RecordInstance,
+    AuxPostMask, InputFetchPolicy, NotifyWaitSet, PactExit, RawSoftEntry, RecordInstance,
 };
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
@@ -2283,23 +2283,35 @@ impl PvDatabase {
 
             // Apply INP value. "Soft Channel" sets VAL directly
             // (C `read_xxx` return 2, skip RVAL→VAL conversion).
-            // "Raw Soft Channel" routes the value into RVAL and lets
-            // the record's RVAL→VAL convert run (epics-base
-            // f2fe9d12: devBiSoftRaw applies MASK after the read).
-            // Records opt into the raw path via
-            // `Record::accepts_raw_soft_input` so DTYPs on records
-            // that haven't wired raw soft channel stay on the legacy
-            // VAL-direct path.
-            let is_raw_soft = instance.common.dtyp == "Raw Soft Channel"
-                && instance.record.accepts_raw_soft_input();
-            let mut soft_inp_applied = inp_value.is_some() && !is_raw_soft;
+            // "Raw Soft Channel" is a DIFFERENT DSET (`devXxxSoftRaw.c`): its
+            // `read_xxx` puts the value in RVAL, applies the dset's MASK and
+            // returns 0, so the record's own RVAL→VAL convert runs. Whether
+            // that dset exists is the record type's answer, given by
+            // `Record::raw_soft_input` returning `Some` — the dset table, not a
+            // separate boolean that could disagree with it.
+            let had_inp_value = inp_value.is_some();
+            let mut soft_inp_applied = false;
             if let Some(inp_val) = inp_value {
-                if is_raw_soft {
-                    let _ = instance.record.apply_raw_input(inp_val);
+                let raw = if instance.common.dtyp == "Raw Soft Channel" {
+                    instance
+                        .record
+                        .raw_soft_input(RawSoftEntry::Read, inp_val.clone())
                 } else {
-                    let _ = instance.record.set_val(inp_val);
+                    None
+                };
+                match raw {
+                    // SoftRaw: value landed in RVAL; the record's RVAL->VAL
+                    // convert runs in `process()`, so VAL was NOT set here.
+                    Some(res) => {
+                        let _ = res;
+                    }
+                    None => {
+                        let _ = instance.record.set_val(inp_val);
+                        soft_inp_applied = true;
+                    }
                 }
-            } else if is_soft && crate::server::recgbl::simm::is_constant(&inp_parsed) {
+            }
+            if !had_inp_value && is_soft && crate::server::recgbl::simm::is_constant(&inp_parsed) {
                 // C `dbLinkIsConstant(&prec->inp)` at process. The load-once
                 // rule (a constant delivers nothing here — it was loaded at
                 // init) is the default and stays the default; the ONE soft
@@ -2312,7 +2324,8 @@ impl PvDatabase {
                 if instance.record.read_constant_inp(constant) {
                     soft_inp_applied = true;
                 }
-            } else if is_soft
+            } else if !had_inp_value
+                && is_soft
                 && matches!(
                     inp_parsed,
                     crate::server::record::ParsedLink::Db(_)
@@ -2430,9 +2443,9 @@ impl PvDatabase {
             // INP would run `convert()` and clobber a preset VAL — e.g.
             // a preset NaN would be rewritten to 0.0, then the framework
             // UDF check (`value_is_undefined()`) would see a defined 0.0
-            // and wrongly clear UDF. `is_raw_soft`
-            // (Raw Soft Channel, `devAiSoftRaw` returns 0) is excluded —
-            // it deliberately wants the RVAL→VAL convert.
+            // and wrongly clear UDF. "Raw Soft Channel" is a different
+            // DTYP and so already fails `is_soft` here — `devAiSoftRaw`
+            // returns 0 and deliberately wants the RVAL→VAL convert.
             //
             // Gated on `soft_channel_skips_convert()` so this only
             // suppresses an `RVAL → VAL` convert step. Records such as
@@ -2440,10 +2453,8 @@ impl PvDatabase {
             // as "skip the whole built-in compute" (the PID loop); they
             // return `false` here so a Soft-Channel `epid` still runs
             // `do_pid()` in `process()`.
-            let soft_input_skips_convert = is_soft
-                && !is_output
-                && !is_raw_soft
-                && instance.record.soft_channel_skips_convert();
+            let soft_input_skips_convert =
+                is_soft && !is_output && instance.record.soft_channel_skips_convert();
             let mut device_did_compute = (soft_inp_applied && is_soft) || soft_input_skips_convert;
             // Input records read every cycle (`!is_output`). An OUTPUT record
             // reads only on a driver-callback (`asyn:READBACK`) cycle: it pulls
@@ -3118,8 +3129,10 @@ impl PvDatabase {
             // Must run BEFORE check_deadband_ext so MLST is not prematurely
             // updated for async writes that return early.
             let can_dev_write = instance.record.can_device_write();
-            let is_soft_out =
-                instance.common.dtyp.is_empty() || instance.common.dtyp == "Soft Channel";
+            // The soft OUT-link value THIS DTYP's dset would put — VAL/OVAL for
+            // "Soft Channel", RVAL for "Raw Soft Channel". `None` = not a soft
+            // output dset. See `RecordInstance::soft_output_value`.
+            let soft_out = instance.soft_output_value();
             let record_should_output = instance.record.should_output();
             let out_info = if sim_output.is_some() {
                 // Simulated OUTPUT record: C `writeValue` redirects the output
@@ -3148,7 +3161,7 @@ impl PvDatabase {
                 } else {
                     None
                 }
-            } else if is_soft_out {
+            } else if let Some(out_val) = soft_out {
                 if !record_should_output {
                     // epics-base 7.0.8 OOPT: gate the soft OUT-link
                     // write on the record's `should_output()`. For
@@ -3157,7 +3170,6 @@ impl PvDatabase {
                     // write without disturbing alarms / monitors.
                     None
                 } else if instance.parsed_out.is_writable_out_link() {
-                    let out_val = instance.record.output_link_value();
                     out_val.map(|v| (instance.parsed_out.clone(), v))
                 } else {
                     None
@@ -4402,8 +4414,9 @@ impl PvDatabase {
             }
 
             let can_dev_write = instance.record.can_device_write();
-            let is_soft_out =
-                instance.common.dtyp.is_empty() || instance.common.dtyp == "Soft Channel";
+            // Same single owner of the DTYP -> soft dset mapping as the
+            // synchronous OUT stage (`RecordInstance::soft_output_value`).
+            let soft_out = instance.soft_output_value();
             let record_should_output = instance.record.should_output();
             let out_info = if skip_out {
                 None
@@ -4416,9 +4429,8 @@ impl PvDatabase {
                 } else {
                     None
                 }
-            } else if is_soft_out {
+            } else if let Some(out_val) = soft_out {
                 if instance.parsed_out.is_writable_out_link() {
-                    let out_val = instance.record.output_link_value();
                     out_val.map(|v| (instance.parsed_out.clone(), v))
                 } else {
                     None
@@ -5108,8 +5120,8 @@ impl PvDatabase {
     /// `devWfSoft.c:42`, `devSASoft.c` (arrays, via `dbLoadLinkArray`). The
     /// raw variants (`devAiSoftRaw.c`, `devBiSoftRaw.c`, `devMbbiSoftRaw.c`)
     /// load into RVAL instead and let the record's own RVAL→VAL conversion
-    /// run — hence the `apply_raw_input` arm, the same sink the process-time
-    /// path uses for `Raw Soft Channel`.
+    /// run — hence the [`Record::raw_soft_input`] arm, the same sink the
+    /// process-time path uses for `Raw Soft Channel`.
     ///
     /// This is the other half of the rule
     /// [`super::links::PvDatabase::read_link_value_soft`] enforces (a constant
@@ -5142,44 +5154,6 @@ impl PvDatabase {
         let mut instance = rec.write().await;
         seed_constant_links(&mut instance);
     }
-}
-
-/// Load a CONSTANT link's value into a field of `target` type, with C's
-/// constant-link conversion rules (`dbConstLink.c`'s `cvt_st_*` family). The
-/// number itself was already parsed by the one owner of "link text → number",
-/// [`crate::server::record::parse_c_double`] (hex included).
-fn constant_to_field_type(value: EpicsValue, target: DbFieldType, raw: &str) -> EpicsValue {
-    use DbFieldType as T;
-    // `cvt_st_st` is a plain `strncpy` of the link TEXT, so a stringout with
-    // `field(DOL,"1.50")` holds "1.50" — not the "1.5" an f64 round-trip would
-    // render (softIoc-verified).
-    if target == T::String {
-        return EpicsValue::String(PvString::from(raw));
-    }
-    let integral = matches!(
-        target,
-        T::Char
-            | T::UChar
-            | T::Short
-            | T::UShort
-            | T::Enum
-            | T::Long
-            | T::ULong
-            | T::Int64
-            | T::UInt64
-    );
-    // C truncates the parsed number into the (possibly unsigned) target with a
-    // plain integer cast, so `-1` into a DBF_USHORT is 65535. The generic
-    // float→unsigned conversion SATURATES (Rust `as`), which would make it 0 —
-    // go through the integer view instead.
-    if integral {
-        if let Some(v) = value.to_f64() {
-            if v.is_finite() {
-                return EpicsValue::Int64(v.trunc() as i64).convert_to(target);
-            }
-        }
-    }
-    value.convert_to(target)
 }
 
 /// The body of the init-seed owner, over a locked record — shared by
@@ -5231,12 +5205,19 @@ pub(crate) fn seed_constant_links(instance: &mut RecordInstance) {
             // Same sink the per-cycle soft-input apply uses, so the constant
             // lands in the field the link would have written: RVAL for `Raw
             // Soft Channel` (the record converts RVAL→VAL), VAL otherwise.
-            let is_raw_soft = instance.common.dtyp == "Raw Soft Channel"
-                && instance.record.accepts_raw_soft_input();
-            let loaded = if is_raw_soft {
-                instance.record.apply_raw_input(value).is_ok()
+            // `RawSoftEntry::InitConstant` — the SoftRaw dsets do NOT mask the
+            // init load (`devBiSoftRaw.c:57` calls `recGblInitConstantLink`
+            // straight into RVAL; only `read_bi` applies MASK).
+            let raw = if instance.common.dtyp == "Raw Soft Channel" {
+                instance
+                    .record
+                    .raw_soft_input(RawSoftEntry::InitConstant, value.clone())
             } else {
-                instance.record.set_val(value).is_ok()
+                None
+            };
+            let loaded = match raw {
+                Some(res) => res.is_ok(),
+                None => instance.record.set_val(value).is_ok(),
             };
             // C: `if (recGblInitConstantLink(...)) prec->udf = FALSE;` — a
             // record whose value came from a constant link is DEFINED.
@@ -5246,38 +5227,15 @@ pub(crate) fn seed_constant_links(instance: &mut RecordInstance) {
         }
     }
 
-    // 2. The record's own `recGblInitConstantLink` table.
+    // 2. The record's own `recGblInitConstantLink` table, through the shared
+    //    owner of "a CONSTANT link's text becomes the target field's value"
+    //    (`record::rec_gbl_init_constant_link`) — the SAME load a runtime put to
+    //    the link field re-runs from `special()`, so the two cannot drift.
     for seed in instance.record.constant_init_links() {
-        let Some(EpicsValue::String(link_str)) = instance.record.get_field(seed.link_field) else {
+        let Some(value) =
+            crate::server::record::rec_gbl_init_constant_link(&mut *instance.record, &seed)
+        else {
             continue;
-        };
-        let parsed = crate::server::record::parse_link_v2(link_str.as_str_lossy().as_ref());
-        let Some(value) = crate::server::recgbl::simm::constant_load_value(&parsed) else {
-            continue;
-        };
-        let raw = match &parsed {
-            crate::server::record::ParsedLink::Constant(s) => s.clone(),
-            _ => continue,
-        };
-        // C loads into the target field's own DBF type
-        // (`recGblInitConstantLink(plink, DBF_USHORT, &prec->seln)`), so coerce
-        // through the field's descriptor before the put.
-        let target_type = instance
-            .record
-            .field_list()
-            .iter()
-            .find(|f| f.name == seed.target_field)
-            .map(|f| f.dbf_type);
-        let value = match target_type {
-            Some(t) => constant_to_field_type(value, t, &raw),
-            None => value,
-        };
-        // bo loads into a temporary and stores the BOOLEAN of it
-        // (`boRecord.c:146-148`: `prec->val = !!ival`), so DOL="5" leaves VAL=1.
-        let value = if seed.normalize_bool {
-            EpicsValue::Enum(u16::from(value.to_f64().is_some_and(|v| v != 0.0)))
-        } else {
-            value
         };
         // C's UDF rule for a successful constant load is per record, and the two
         // shapes differ only in the NaN case:
@@ -5288,8 +5246,7 @@ pub(crate) fn seed_constant_links(instance: &mut RecordInstance) {
         // isnan test covers both: the value that reached the field is defined
         // unless it is NaN.
         let is_nan = value.to_f64().is_some_and(f64::is_nan);
-        if instance.record.put_field(seed.target_field, value).is_ok() && seed.clears_udf && !is_nan
-        {
+        if seed.clears_udf && !is_nan {
             instance.common.udf = false;
         }
     }

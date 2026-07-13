@@ -120,6 +120,16 @@ impl Record for BoRecord {
         "bo"
     }
 
+    /// C `devBoSoftRaw::write_bo` (`devBoSoftRaw.c:47-54`):
+    /// `dbPutLink(&prec->out, DBR_LONG, &prec->rval, 1)` — the RAW word
+    /// (`VAL ? MASK : 0`), not the `VAL` that `devBoSoft` writes.
+    /// C `devBoSoftRaw.c::write_bo` (65): `dbPutLink(&prec->out, DBR_LONG,
+    /// &prec->rval, 1)`. RVAL is DBF_ULONG; C hands its bit pattern to a
+    /// DBR_LONG put, so the cast is C's reinterpretation, not a range clamp.
+    fn raw_soft_output_value(&self) -> Option<EpicsValue> {
+        Some(EpicsValue::Long(self.rval as i32))
+    }
+
     // C recBo.c IVOA=set_to_IVOV: val = ivov; rval = ivov.
     fn apply_invalid_output_value(&mut self, ivov: EpicsValue) -> CaResult<()> {
         // IVOV is DBF_USHORT (boRecord.dbd.pod:372); VAL is the binary enum
@@ -303,19 +313,19 @@ impl Record for BoRecord {
                     self.val = v as u16;
                     Ok(())
                 }
-                // PR/issue #183 — accept ZNAM/ONAM string.
-                EpicsValue::String(s) => {
-                    if s == self.znam {
-                        self.val = 0;
-                        Ok(())
-                    } else if s == self.onam {
-                        self.val = 1;
-                        Ok(())
-                    } else {
-                        Err(CaError::TypeMismatch(format!(
-                            "bo VAL: '{s}' matches neither ZNAM nor ONAM"
-                        )))
+                // C rset `put_enum_str` (boRecord.c), reached from
+                // `dbConvert.c::putStringEnum` — one converter, shared with the
+                // framework's put paths (see `Record::enum_state_strings`).
+                EpicsValue::String(ref s) => {
+                    let resolved = crate::server::record::resolve_enum_state_string(
+                        "VAL",
+                        self.enum_state_strings().as_deref(),
+                        s,
+                    )?;
+                    if let EpicsValue::Enum(v) = resolved {
+                        self.val = v;
                     }
+                    Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
@@ -494,6 +504,13 @@ impl Record for BoRecord {
             "SIMM" => Some(MENU_SIMM),
             _ => None,
         }
+    }
+
+    /// C rset `get_enum_strs`/`put_enum_str` (boRecord.c) — ZNAM/ONAM.
+    fn enum_state_strings(&self) -> Option<Vec<PvString>> {
+        Some(crate::server::record::binary_enum_states(
+            &self.znam, &self.onam,
+        ))
     }
 
     /// VAL posts DBE_VALUE|DBE_LOG

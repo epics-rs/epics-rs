@@ -1228,9 +1228,110 @@ fn expect_char(
     Ok(())
 }
 
+/// C `dbStaticLib`'s record PROTOTYPE — the `initial("…")` directive.
+///
+/// `dbReadDatabase` builds one zeroed prototype per record type and writes each
+/// field's `.dbd` `initial(...)` into it (`dbLexRoutines.c:1150-1163`,
+/// `dbPutStringNum`); `dbCreateRecord` then copies that prototype, and the
+/// `.db`'s own `field(...)` lines overwrite it. So a `.dbd` initial is the
+/// record's default, and a `record(calc,"X") {}` with no CALC line still has
+/// `CALC="0"` — not the empty string.
+///
+/// The port had no such step: every record hand-wrote a Rust `Default`, and
+/// nothing tied it to the `.dbd`. calc, calcout and swait all forgot
+/// `initial("0")` on their CALC/OCAL (`calcRecord.dbd:26`,
+/// `calcoutRecord.dbd:62,382`, `swaitRecord.dbd:424`), so a default record
+/// carried the EMPTY expression — which base's `postfix()` refuses
+/// (`CALC_ERR_NULL_ARG`) and every evaluation then fails, putting a plain
+/// `record(calc,"X") {}` into CALC/INVALID on its first process where C sits at
+/// NO_ALARM.
+///
+/// This is the single owner of that step, so the `.dbd` is the only place a
+/// default can be stated. A record's `Default` supplies the zeroed struct; the
+/// `.dbd` supplies the initial value. The store is [`Record::put_field_internal`]
+/// — dbStatic writes the prototype directly, with no `special()` and no
+/// `SPC_NOMOD` gate, so a read-only field's initial lands too (its record's
+/// `init_record` overwrites it afterwards, exactly as in C).
+///
+/// A field the record does not own carries its default in `CommonFields`
+/// instead; there is no record storage here to write it into, and
+/// `tests/dbd_initial_parity.rs` is what holds those to the `.dbd`.
+fn apply_dbd_initials(record: &mut Box<dyn Record>) -> CaResult<()> {
+    // The `.dbd` is the source, so the initials come from the GENERATED tables —
+    // `crate::server::record::dbd_generated`, which `tools/dbd-codegen` emits
+    // from the vendored `.dbd` files — and not from `record.field_list()`, which
+    // a record may still answer with a hand-written table (swait does, and its
+    // hand-written CALC entry has no `initial` precisely because a human wrote
+    // it). Asking the `.dbd` directly is what makes the default impossible to
+    // get wrong by hand.
+    let Some(fields) = crate::server::record::dbd_generated::record_fields(record.record_type())
+    else {
+        return Ok(()); // a record type no vendored `.dbd` declares
+    };
+    let initials: Vec<(&'static str, &'static str)> = fields
+        .iter()
+        .filter(|f| record.implements_field(f.name))
+        .filter_map(|f| f.initial.map(|v| (f.name, v)))
+        .collect();
+
+    for (name, initial) in initials {
+        let spec = fields.iter().find(|f| f.name == name);
+        // The `.db` load path's coercion, reused verbatim: a `menu()` field's
+        // initial is a LABEL (`initial("Passive")`), everything else parses to
+        // the field's stored type — which is what the record already holds, the
+        // `.dbd` type being the fallback for a field it cannot yet produce.
+        let dbf_type = match record
+            .get_field(name)
+            .map(|v| v.db_field_type())
+            .or_else(|| spec.map(|f| f.dbf_type))
+        {
+            Some(t) => t,
+            None => continue,
+        };
+        let parsed = if let Some(choices) = spec
+            .and_then(|f| f.menu)
+            .or_else(|| record.menu_field_choices(name))
+            .or_else(|| crate::server::record::shared_menu_choices(name))
+        {
+            crate::server::record::resolve_menu_field_string_db_load(
+                name, choices, dbf_type, initial,
+            )?
+        } else {
+            EpicsValue::parse_bytes(dbf_type, initial.as_bytes()).map_err(|e| {
+                CaError::InvalidValue(format!(
+                    "{}.{name}: cannot parse .dbd initial(\"{initial}\") as {dbf_type:?}: {e}",
+                    record.record_type()
+                ))
+            })?
+        };
+        // A field whose zeroed Rust default already IS the `.dbd` initial needs
+        // no store — and must not get one: a `SPC_NOMOD` field the record serves
+        // but has no store arm for (`sseq.IX1`, C's read-only step index, whose
+        // initial is the 0 it already holds) would fail the write. The write is
+        // therefore driven by the DIFFERENCE, which is the thing this step exists
+        // to remove.
+        if record.get_field(name).as_ref() == Some(&parsed) {
+            continue;
+        }
+        record.put_field_internal(name, parsed)?;
+    }
+    Ok(())
+}
+
 /// Create a record from a type name.
 /// Checks the external factory registry first, then falls back to built-in types.
+///
+/// The record comes back holding its `.dbd` initial values — see
+/// [`apply_dbd_initials`]. Every load path (`IocBuilder`, `dbLoadRecords`,
+/// `dbCreateRecord`) goes through here, so no record can reach the database
+/// disagreeing with its `.dbd` about a default.
 pub fn create_record(record_type: &str) -> CaResult<Box<dyn Record>> {
+    let mut record = create_record_raw(record_type)?;
+    apply_dbd_initials(&mut record)?;
+    Ok(record)
+}
+
+fn create_record_raw(record_type: &str) -> CaResult<Box<dyn Record>> {
     // Check external registry first (allows overrides from e.g. asyn-rs)
     if let Ok(reg) = get_registry().lock() {
         if let Some(factory) = reg.get(record_type) {
@@ -1305,7 +1406,9 @@ pub fn create_record_with_factories(
     extra_factories: &std::collections::HashMap<String, super::RecordFactory>,
 ) -> CaResult<Box<dyn Record>> {
     if let Some(factory) = extra_factories.get(record_type) {
-        return Ok(factory());
+        let mut record = factory();
+        apply_dbd_initials(&mut record)?;
+        return Ok(record);
     }
     create_record(record_type)
 }

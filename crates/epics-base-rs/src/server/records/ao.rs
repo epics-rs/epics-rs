@@ -324,6 +324,15 @@ impl Record for AoRecord {
         "ao"
     }
 
+    /// C `devAoSoftRaw::write_ao` (`devAoSoftRaw.c:43-50`):
+    /// `dbPutLink(&prec->out, DBR_LONG, &prec->rval, 1)` — the RAW word, not the
+    /// engineering `OVAL` that `devAoSoft` writes.
+    /// C `devAoSoftRaw.c::write_ao` (44): `dbPutLink(&prec->out, DBR_LONG,
+    /// &prec->rval, 1)` — the raw word, unmasked, as DBR_LONG.
+    fn raw_soft_output_value(&self) -> Option<EpicsValue> {
+        Some(EpicsValue::Long(self.rval))
+    }
+
     /// C `aoRecord.c:112-113`:
     /// `if (recGblInitConstantLink(&prec->dol, DBF_DOUBLE, &prec->val))
     ///      prec->udf = isnan(prec->val);`

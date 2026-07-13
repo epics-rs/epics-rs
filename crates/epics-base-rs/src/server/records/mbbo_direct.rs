@@ -170,6 +170,23 @@ impl Record for MbboDirectRecord {
         "mbboDirect"
     }
 
+    /// C `devMbboDirectSoftRaw::write_mbbo` (`devMbboDirectSoftRaw.c:40-46`):
+    /// `data = prec->rval & prec->mask; dbPutLink(&prec->out, DBR_ULONG, &data,
+    /// 1)`, with the same dset-init mask (`nobt == 0` ⇒ `0xffffffff`, then
+    /// `<<= shft`).
+    /// C `devMbboDirectSoftRaw.c::write_mbbo` (71-75): `data = prec->rval &
+    /// prec->mask; dbPutLink(&prec->out, DBR_ULONG, &data, 1)`, with the dset's
+    /// `init_record` mask rule (`nobt == 0 -> 0xffffffff`, then `<<= shft`).
+    fn raw_soft_output_value(&self) -> Option<EpicsValue> {
+        let base = if self.nobt == 0 {
+            0xffff_ffff
+        } else {
+            self.mask
+        };
+        let mask = base.checked_shl(u32::from(self.shft)).unwrap_or(0);
+        Some(EpicsValue::ULong(self.rval & mask))
+    }
+
     fn field_list(&self) -> &'static [FieldDesc] {
         mbbo_direct_fields()
     }

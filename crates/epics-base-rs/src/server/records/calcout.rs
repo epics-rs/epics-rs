@@ -1160,6 +1160,16 @@ impl Record for CalcoutRecord {
         crate::server::record::seed_input_links(self.multi_input_links())
     }
 
+    /// C `calcoutRecord.c::special` (367-378) — a runtime put to INPA..INPU that
+    /// leaves the link CONSTANT re-runs `recGblInitConstantLink(plink,
+    /// DBF_DOUBLE, pvalue)`, posts the value field with `DBE_VALUE` and sets
+    /// `INAV = CON`. Declared here, run by the put path's one
+    /// `special(field, true)` owner — see `Record::special_reseed_input_links`.
+    /// Every calcout input is a DBF_DOUBLE scalar, so the whole table re-seeds.
+    fn special_reseed_input_links(&self) -> &[(&'static str, &'static str)] {
+        self.multi_input_links()
+    }
+
     fn multi_input_links(&self) -> &[(&'static str, &'static str)] {
         &[
             ("INPA", "A"),

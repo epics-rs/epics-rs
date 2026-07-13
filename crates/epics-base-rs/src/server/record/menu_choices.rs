@@ -36,7 +36,7 @@
 //! Each table cites its source.
 
 use crate::error::{CaError, CaResult};
-use crate::types::{DbFieldType, EpicsValue};
+use crate::types::{DbFieldType, EpicsValue, PvString};
 
 /// `menu(menuAlarmSevr)` — `menuAlarmSevr.dbd.pod:21-24`.
 pub const MENU_ALARM_SEVR: &[&str] = &["NO_ALARM", "MINOR", "MAJOR", "INVALID"];
@@ -345,6 +345,88 @@ pub fn resolve_menu_field_string_db_load(
     s: &str,
 ) -> CaResult<EpicsValue> {
     resolve_menu_field_string_bounded(field, choices, dbf_type, s, MenuBound::DbLoad)
+}
+
+/// C `get_enum_strs` for the two-state records (`bi`/`bo`/`busy`): ZNAM, ONAM.
+///
+/// C trims `no_str` to 1 when ZNAM is set and ONAM is empty
+/// (`boRecord.c:342-352`), so a `bo` with only a ZNAM advertises — and accepts —
+/// exactly one state.
+pub fn binary_enum_states(znam: &PvString, onam: &PvString) -> Vec<PvString> {
+    if !znam.is_empty() && onam.is_empty() {
+        vec![znam.clone()]
+    } else {
+        vec![znam.clone(), onam.clone()]
+    }
+}
+
+/// C `get_enum_strs` for the 16-state records (`mbbi`/`mbbo`): ZRST..FFST cut at
+/// the last non-empty state — C's high-water `no_str` (`mbbiRecord.c:262-269`).
+pub fn multibit_enum_states(states: [&PvString; 16]) -> Vec<PvString> {
+    let no_str = states
+        .iter()
+        .rposition(|s| !s.is_empty())
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    states[..no_str].iter().map(|s| (*s).clone()).collect()
+}
+
+/// C `dbConvert.c::putStringEnum` (lines 1149-1190) — a `DBR_STRING` write to a
+/// `DBF_ENUM` field, i.e. `caput MY:VALVE Open`.
+///
+/// C routes it through the record's `put_enum_str` rset slot (an exact
+/// `strncmp` against the state strings — `boRecord.c::put_enum_str` ZNAM/ONAM,
+/// `mbboRecord.c:354-371` ZRST..FFST) and, when no state matched, falls back to
+/// `epicsParseUInt16` + the `get_enum_strs` bound (`val < no_str`). Both slots
+/// read the SAME state table, so the port takes it once, from
+/// [`Record::enum_state_strings`](crate::server::record::Record::enum_state_strings) —
+/// a name the record advertises to a client is exactly a name a client may put,
+/// by construction.
+///
+/// A record whose `enum_state_strings` is `None` leaves both rset slots NULL in
+/// C (`mbbiDirect`/`mbboDirect`), and `putStringEnum` fails the put with
+/// `S_db_noRSET`. The caller passes `None` for that case; the put is REJECTED,
+/// never coerced — C stores nothing on either failure path.
+///
+/// Deviation from C (Tier 2, `doc/strategy-2026-07-13.md`): C's `put_enum_str`
+/// scans all 16 raw state slots, so on a record with states `["a","b"]` a put of
+/// the EMPTY string matches the first undefined slot and stores `VAL=2` — a
+/// state the record's own `get_enum_strs` does not advertise. The port matches
+/// against the advertised (highwater-trimmed) table only, so an unmatched name
+/// is `S_db_badChoice` in every case.
+pub fn resolve_enum_state_string(
+    field: &str,
+    states: Option<&[PvString]>,
+    s: &PvString,
+) -> CaResult<EpicsValue> {
+    let Some(states) = states else {
+        return Err(CaError::TypeMismatch(format!(
+            "{field}: DBF_ENUM field whose record supplies no enum-state table \
+             (C put_enum_str == NULL: S_db_noRSET)"
+        )));
+    };
+    // C `strncmp` is byte-exact and case-SENSITIVE.
+    let index = states
+        .iter()
+        .position(|state| state.as_bytes() == s.as_bytes())
+        .map(|i| i as u16)
+        // C's `get_enum_strs` fallback: `epicsParseUInt16` + `val < no_str`.
+        .or_else(|| {
+            let value = epics_parse_uint16(&s.as_str_lossy())?;
+            (value < states.len() as u16).then_some(value)
+        })
+        .ok_or_else(|| {
+            CaError::BadChoice(format!(
+                "{field}: '{}' is not one of {:?} nor an index below {}",
+                s.as_str_lossy(),
+                states
+                    .iter()
+                    .map(|st| st.as_str_lossy().into_owned())
+                    .collect::<Vec<_>>(),
+                states.len()
+            ))
+        })?;
+    Ok(EpicsValue::Enum(index))
 }
 
 /// The one string→menu-index converter. Both public entry points are this

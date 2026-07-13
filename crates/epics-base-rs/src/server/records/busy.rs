@@ -385,15 +385,21 @@ impl Record for BusyRecord {
                     EpicsValue::Short(v) => v as u16,
                     EpicsValue::Long(v) => v as u16,
                     EpicsValue::Double(v) => v as u16,
+                    // C rset `put_enum_str` (`busyRecord.c`): an EXACT,
+                    // case-sensitive `strncmp` against ZNAM/ONAM, else
+                    // `S_db_badChoice` — the put fails and nothing is stored.
+                    // This arm used to match case-insensitively and then coerce
+                    // any unmatched name to state 0, so `caput BUSY Opne` drove
+                    // the record to Done and reported success.
                     EpicsValue::String(ref s) => {
-                        // Match ZNAM/ONAM case-insensitively on raw bytes so a
-                        // non-UTF-8 state name still resolves to its index.
-                        if s.as_bytes().eq_ignore_ascii_case(self.znam.as_bytes()) {
-                            0
-                        } else if s.as_bytes().eq_ignore_ascii_case(self.onam.as_bytes()) {
-                            1
-                        } else {
-                            s.as_str_lossy().parse::<u16>().unwrap_or(0)
+                        let resolved = crate::server::record::resolve_enum_state_string(
+                            "VAL",
+                            self.enum_state_strings().as_deref(),
+                            s,
+                        )?;
+                        match resolved {
+                            EpicsValue::Enum(v) => v,
+                            _ => return Err(CaError::TypeMismatch(name.to_string())),
                         }
                     }
                     _ => return Err(CaError::TypeMismatch(name.to_string())),
@@ -556,6 +562,14 @@ impl Record for BusyRecord {
         }
     }
 
+    /// C rset `get_enum_strs`/`put_enum_str` (`busyRecord.c`, the bo pair
+    /// verbatim) — ZNAM/ONAM.
+    fn enum_state_strings(&self) -> Option<Vec<PvString>> {
+        Some(crate::server::record::binary_enum_states(
+            &self.znam, &self.onam,
+        ))
+    }
+
     /// VAL posts DBE_VALUE|DBE_LOG
     /// only when it changed (C busyRecord.c:365-369 `mlst != val`), not every
     /// process cycle. The comparison is captured in the monitor() owner; see
@@ -703,30 +717,55 @@ mod tests {
         }
     }
 
+    /// C `busyRecord.c::put_enum_str` is an exact, case-SENSITIVE `strncmp`
+    /// against ZNAM/ONAM and returns `S_db_badChoice` on no match — the put
+    /// FAILS and nothing is stored.
+    ///
+    /// This test previously asserted the opposite on both counts (a
+    /// case-insensitive match, and — through `parse::<u16>().unwrap_or(0)` —
+    /// silent coercion of an unmatched name to state 0), so it was green over
+    /// the defect R19-24 names: `caput BUSY <typo>` drove the record to Done
+    /// and reported success.
     #[test]
-    fn test_enum_str() {
+    fn put_enum_str_is_exact_case_sensitive_and_rejects_unknown_names() {
         let mut rec = BusyRecord::new();
 
-        // String "Done" → val=0
         rec.put_field("VAL", EpicsValue::String("Done".into()))
             .unwrap();
         assert_eq!(rec.val, 0);
 
-        // String "Busy" → val=1
         rec.put_field("VAL", EpicsValue::String("Busy".into()))
             .unwrap();
         assert_eq!(rec.val, 1);
 
-        // Case insensitive
-        rec.put_field("VAL", EpicsValue::String("done".into()))
-            .unwrap();
-        assert_eq!(rec.val, 0);
+        // Wrong case is NOT a state name: C `strncmp` fails, the put is
+        // rejected, VAL keeps its previous value.
+        assert!(
+            rec.put_field("VAL", EpicsValue::String("done".into()))
+                .is_err(),
+            "C put_enum_str is case-sensitive"
+        );
+        assert_eq!(rec.val, 1, "a rejected put stores nothing");
 
-        rec.put_field("VAL", EpicsValue::String("busy".into()))
-            .unwrap();
+        // An unmatched name is S_db_badChoice, never state 0.
+        assert!(
+            rec.put_field("VAL", EpicsValue::String("Opne".into()))
+                .is_err()
+        );
         assert_eq!(rec.val, 1);
 
-        // Custom ZNAM/ONAM
+        // The numeric fallback C's `putStringEnum` applies after badChoice:
+        // an index below `no_str` is accepted.
+        rec.put_field("VAL", EpicsValue::String("0".into()))
+            .unwrap();
+        assert_eq!(rec.val, 0);
+        assert!(
+            rec.put_field("VAL", EpicsValue::String("2".into()))
+                .is_err(),
+            "index >= no_str (2) is badChoice"
+        );
+
+        // Custom ZNAM/ONAM.
         rec.znam = "Off".into();
         rec.onam = "On".into();
         rec.put_field("VAL", EpicsValue::String("Off".into()))

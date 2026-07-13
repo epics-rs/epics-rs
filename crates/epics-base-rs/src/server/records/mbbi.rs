@@ -1,5 +1,7 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, MENU_SIMM, ProcessOutcome, Record, dbd_generated};
+use crate::server::record::{
+    FieldDesc, MENU_SIMM, ProcessOutcome, RawSoftEntry, Record, dbd_generated,
+};
 use crate::types::{EpicsValue, PvString};
 
 /// Multi-bit binary input record — manual Record impl for raw↔index conversion.
@@ -210,6 +212,27 @@ impl MbbiRecord {
         65535
     }
 
+    /// The mask `devMbbiSoftRaw::read_mbbi` ANDs the raw word with.
+    ///
+    /// C builds it in the dset's `init_record` (`devMbbiSoftRaw.c:44-49`):
+    /// `if (prec->nobt == 0) prec->mask = 0xffffffff;` — which OVERRIDES an
+    /// explicitly configured MASK — `prec->mask <<= prec->shft;`. The record's
+    /// own `init_record` has already set `mask = (1 << nobt) - 1` when MASK was
+    /// left at 0 (`mbbiRecord.c:154-155`).
+    ///
+    /// C stores the shifted mask back into the MASK *field*; the port applies
+    /// the shift here instead and leaves MASK as the record declared it, because
+    /// the record's `process()` reads MASK on the (shared) device-readback path
+    /// where it must stay unshifted.
+    fn raw_soft_mask(&self) -> u32 {
+        let base = if self.nobt == 0 {
+            0xffff_ffff
+        } else {
+            self.mask
+        };
+        base.checked_shl(u32::from(self.shft)).unwrap_or(0)
+    }
+
     /// Per-state severity fields ZRSV..FFSV indexed by state 0..15.
     fn state_severities(&self) -> [i16; 16] {
         [
@@ -321,6 +344,15 @@ macro_rules! mbb_put_field {
                     EpicsValue::Enum(v) => { $self.val = v; }
                     EpicsValue::Long(v) => { $self.val = v as u16; }
                     EpicsValue::Short(v) => { $self.val = v as u16; }
+                    // C rset `put_enum_str` — the one string→state converter.
+                    EpicsValue::String(ref s) => {
+                        let resolved = crate::server::record::resolve_enum_state_string(
+                            "VAL",
+                            $self.enum_state_strings().as_deref(),
+                            s,
+                        )?;
+                        if let EpicsValue::Enum(v) = resolved { $self.val = v; }
+                    }
                     _ => return Err(CaError::TypeMismatch("VAL".into())),
                 }
             }
@@ -347,6 +379,33 @@ impl Record for MbbiRecord {
             "SIMM" => Some(MENU_SIMM),
             _ => None,
         }
+    }
+
+    /// C `devMbbiSoftRaw` — `recGblInitConstantLink(&prec->inp, DBF_ULONG,
+    /// &prec->rval)` at init (`devMbbiSoftRaw.c:42`, unmasked), and per read
+    /// `dbGetLink(pinp, DBR_LONG, &prec->rval, 0, 0)` followed by
+    /// `prec->rval &= prec->mask` (`:78-79`, UNCONDITIONAL — unlike `bi`, whose
+    /// dset masks only when MASK is non-zero). `read_mbbi` returns 0, so the
+    /// record's `RVAL >> SHFT` → state-index convert then runs.
+    fn raw_soft_input(&mut self, entry: RawSoftEntry, value: EpicsValue) -> Option<CaResult<()>> {
+        self.rval = match super::raw_soft_rval_u32("mbbi", &value) {
+            Ok(rval) => rval,
+            Err(e) => return Some(Err(e)),
+        };
+        if entry == RawSoftEntry::Read {
+            self.rval &= self.raw_soft_mask();
+        }
+        Some(Ok(()))
+    }
+
+    /// C rset `get_enum_strs`/`put_enum_str` (mbbiRecord.c:251-291) — ZRST..FFST
+    /// cut at the last non-empty state.
+    fn enum_state_strings(&self) -> Option<Vec<PvString>> {
+        Some(crate::server::record::multibit_enum_states([
+            &self.zrst, &self.onst, &self.twst, &self.thst, &self.frst, &self.fvst, &self.sxst,
+            &self.svst, &self.eist, &self.nist, &self.test, &self.elst, &self.tvst, &self.ttst,
+            &self.ftst, &self.ffst,
+        ]))
     }
 
     /// VAL posts DBE_VALUE|DBE_LOG
@@ -533,20 +592,17 @@ impl Record for MbbiRecord {
             EpicsValue::ULong(v) => self.val = v as u16,
             EpicsValue::Long(v) => self.val = v as u16,
             EpicsValue::Short(v) => self.val = v as u16,
-            // epics-base PR/issue #183 — DBF_MENU ↔ DBF_STRING. Match the
-            // string against ZRST..FFST and store the corresponding index.
-            EpicsValue::String(s) => {
-                let strs: [&PvString; 16] = [
-                    &self.zrst, &self.onst, &self.twst, &self.thst, &self.frst, &self.fvst,
-                    &self.sxst, &self.svst, &self.eist, &self.nist, &self.test, &self.elst,
-                    &self.tvst, &self.ttst, &self.ftst, &self.ffst,
-                ];
-                if let Some(idx) = strs.iter().position(|st| **st == s) {
-                    self.val = idx as u16;
-                } else {
-                    return Err(CaError::TypeMismatch(format!(
-                        "mbbi VAL: '{s}' matches no ZRST..FFST state string"
-                    )));
+            // C rset `put_enum_str` (mbbiRecord.c:273-291), reached from
+            // `dbConvert.c::putStringEnum` — the one string→state converter,
+            // over `enum_state_strings` (the same table `get_enum_strs` serves).
+            EpicsValue::String(ref s) => {
+                let resolved = crate::server::record::resolve_enum_state_string(
+                    "VAL",
+                    self.enum_state_strings().as_deref(),
+                    s,
+                )?;
+                if let EpicsValue::Enum(v) = resolved {
+                    self.val = v;
                 }
             }
             _ => return Err(CaError::TypeMismatch("VAL".into())),

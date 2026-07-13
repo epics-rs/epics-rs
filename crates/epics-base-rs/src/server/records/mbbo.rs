@@ -355,6 +355,16 @@ macro_rules! mbb_put_field {
                     EpicsValue::Enum(v) => { $self.val = v; }
                     EpicsValue::Long(v) => { $self.val = v as u16; }
                     EpicsValue::Short(v) => { $self.val = v as u16; }
+                    // C rset `put_enum_str` (mbboRecord.c:354-371) — the one
+                    // string→state converter, over `enum_state_strings`.
+                    EpicsValue::String(ref s) => {
+                        let resolved = crate::server::record::resolve_enum_state_string(
+                            "VAL",
+                            $self.enum_state_strings().as_deref(),
+                            s,
+                        )?;
+                        if let EpicsValue::Enum(v) = resolved { $self.val = v; }
+                    }
                     _ => return Err(CaError::TypeMismatch("VAL".into())),
                 }
             }
@@ -367,6 +377,26 @@ macro_rules! mbb_put_field {
 impl Record for MbboRecord {
     fn record_type(&self) -> &'static str {
         "mbbo"
+    }
+
+    /// C `devMbboSoftRaw::write_mbbo` (`devMbboSoftRaw.c:40-46`):
+    /// `data = prec->rval & prec->mask; dbPutLink(&prec->out, DBR_ULONG, &data,
+    /// 1)` — the RAW word, not the state index `devMbboSoft` writes. The dset's
+    /// `init_record` built the mask: `if (nobt == 0) mask = 0xffffffff;` (which
+    /// overrides a configured MASK) then `mask <<= shft`.
+    /// C `devMbboSoftRaw.c::write_mbbo` (71-75): `data = prec->rval &
+    /// prec->mask; dbPutLink(&prec->out, DBR_ULONG, &data, 1)`. The dset's
+    /// `init_record` (62-67) is what makes MASK usable — `if (nobt == 0) mask =
+    /// 0xffffffff; mask <<= shft` — so the shifted mask is computed here rather
+    /// than written back into the MASK field (see the commit note).
+    fn raw_soft_output_value(&self) -> Option<EpicsValue> {
+        let base = if self.nobt == 0 {
+            0xffff_ffff
+        } else {
+            self.mask
+        };
+        let mask = base.checked_shl(u32::from(self.shft)).unwrap_or(0);
+        Some(EpicsValue::ULong(self.rval & mask))
     }
     fn field_list(&self) -> &'static [FieldDesc] {
         MBBO_FIELDS
@@ -381,6 +411,16 @@ impl Record for MbboRecord {
             "SIMM" => Some(MENU_SIMM),
             _ => None,
         }
+    }
+
+    /// C rset `get_enum_strs`/`put_enum_str` (mbboRecord.c:330-371) — ZRST..FFST
+    /// cut at the last non-empty state.
+    fn enum_state_strings(&self) -> Option<Vec<PvString>> {
+        Some(crate::server::record::multibit_enum_states([
+            &self.zrst, &self.onst, &self.twst, &self.thst, &self.frst, &self.fvst, &self.sxst,
+            &self.svst, &self.eist, &self.nist, &self.test, &self.elst, &self.tvst, &self.ttst,
+            &self.ftst, &self.ffst,
+        ]))
     }
 
     // C recMbbo.c IVOA=set_to_IVOV: val = ivov; rval = ivov. IVOV is

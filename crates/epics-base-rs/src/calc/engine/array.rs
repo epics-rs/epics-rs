@@ -360,7 +360,10 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                 CoreOp::CondEnd => {}
 
                 // Unary math functions (element-wise)
-                CoreOp::Abs => unary_op(&mut stack, |a| a.map(f64::abs))?,
+                // C `aCalcPerform.c:771` (array branch) / `:1040` (scalar) — a
+                // conditional negate, NOT `fabs`, and element-wise over the whole
+                // buffer. See [`super::abs_val`].
+                CoreOp::Abs => unary_op(&mut stack, |a| a.map(super::abs_val))?,
                 CoreOp::Sqrt => {
                     unary_op(&mut stack, |a| domain_guarded(a, f64::sqrt, &mut status))?
                 }
@@ -636,7 +639,25 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                     })?
                 }
                 ArrayOp::NSmooth => {
-                    let n = pop_f64(&mut stack)? as usize;
+                    // The pass count is a narrowing of a stack double like any
+                    // other — C is `int j; ... j = ps->d;` (`aCalcPerform.c:304`
+                    // declares `j`, `:581` assigns it), an implicit `(int)`, and
+                    // the loop `for (k=firstEl; k<j+firstEl; k++)` then runs
+                    // `max(j,0)` passes. So it goes through the cast owner
+                    // [`c_int`], not an open-coded `as usize`.
+                    //
+                    // A count no `int` can hold is not a count, and neither
+                    // compiled C target gives a usable answer for one (x86-64
+                    // yields `INT32_MIN` -> zero passes; aarch64 saturates ->
+                    // `INT32_MAX` passes, which does not return). The port does not
+                    // pick between those: `NSMOO(AA,2e9)` is an unbounded loop with
+                    // a PERFECT cast, so the count is not what bounds this — see
+                    // [`stats::nsmooth`], which stops as soon as a pass stops
+                    // changing the buffer. That is exactly the value the full count
+                    // would have left, because `smooth` is a pure function of its
+                    // input: once it reproduces its own input, every later pass is
+                    // a no-op.
+                    let n = c_int(pop_f64(&mut stack)?).max(0) as usize;
                     // NSMOOTH is NOT in C's unary switch — it is its own case
                     // (`aCalcPerform.c:579-592`) and it indexes `ps->a[]` with no
                     // `toArray` first, so a scalar operand dereferences a NULL array
@@ -1616,11 +1637,23 @@ fn shift_elements(a: &mut [f64], e: f64) {
 
 /// Pop the two bounds of an aCalc subrange. C `toDouble`s both
 /// (`aCalcPerform.c:1526,1530`) — so an ARRAY bound collapses to its first
-/// element — and casts each with a truncating `(int)`, not `myNINT`. The rest of
-/// the rule is [`super::subrange_bounds`], shared with sCalc.
+/// element — and narrows each into an `int` with a truncating `(int)`, not
+/// `myNINT`.
+///
+/// That `(int)` is [`c_int`], the engine's cast owner, and this site used to
+/// open-code `as i64` instead. An out-of-range narrowing is C UB and the two
+/// compiled targets EPICS ships on disagree (x86-64 `cvttsd2si` gives
+/// `INT32_MIN`; aarch64 `fcvtzs` saturates), so there is no C answer to be
+/// faithful to — [`crate::types::c_cast`] owns the one value the port picks,
+/// and every narrowing of a stack double must ask it rather than decide for
+/// itself. Under the owner's saturating rule the bound clamps to `arraySize`
+/// exactly as the open-coded `as i64` did, so this is a routing change with no
+/// observable effect: `AA[2,3e9]` selects the tail, before and after.
+///
+/// The rest of the rule is [`super::subrange_bounds`], shared with sCalc.
 fn pop_subrange_bounds(stack: &mut Vec<Cell>, array_size: i64) -> Result<(i64, i64), CalcError> {
-    let j = pop_f64(stack)? as i64;
-    let i = pop_f64(stack)? as i64;
+    let j = i64::from(c_int(pop_f64(stack)?));
+    let i = i64::from(c_int(pop_f64(stack)?));
     Ok(super::subrange_bounds(i, j, array_size))
 }
 

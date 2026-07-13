@@ -1,5 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, MENU_SIMM, ProcessOutcome, Record};
+use crate::server::record::{FieldDesc, MENU_SIMM, ProcessOutcome, RawSoftEntry, Record};
 use crate::types::{DbFieldType, EpicsValue};
 
 // Multi-bit binary input direct record.
@@ -173,6 +173,29 @@ impl Record for MbbiDirectRecord {
 
     fn uses_monitor_deadband(&self) -> bool {
         false
+    }
+
+    /// C `devMbbiDirectSoftRaw` — `recGblInitConstantLink(&prec->inp,
+    /// DBF_ULONG, &prec->rval)` at init (`devMbbiDirectSoftRaw.c:42`, unmasked),
+    /// and per read `dbGetLink(&prec->inp, DBR_ULONG, &prec->rval, 0, 0)` then
+    /// `prec->rval &= prec->mask` (`:60-61`). `read_mbbi` returns 0, so the
+    /// record's `RVAL >> SHFT` → VAL/bit-field convert runs.
+    fn raw_soft_input(&mut self, entry: RawSoftEntry, value: EpicsValue) -> Option<CaResult<()>> {
+        self.rval = match super::raw_soft_rval_u32("mbbiDirect", &value) {
+            Ok(rval) => rval,
+            Err(e) => return Some(Err(e)),
+        };
+        if entry == RawSoftEntry::Read {
+            // The dset's init builds the mask: `if (nobt == 0) mask =
+            // 0xffffffff;` (overriding a configured MASK) then `mask <<= shft`.
+            let base = if self.nobt == 0 {
+                0xffff_ffff
+            } else {
+                self.mask
+            };
+            self.rval &= base.checked_shl(u32::from(self.shft)).unwrap_or(0);
+        }
+        Some(Ok(()))
     }
 
     /// VAL posts DBE_VALUE|DBE_LOG

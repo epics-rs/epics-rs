@@ -127,6 +127,42 @@ struct CalcPass {
 const ARR_NAMES: [&str; 12] = [
     "AA", "BB", "CC", "DD", "EE", "FF", "GG", "HH", "II", "JJ", "KK", "LL",
 ];
+
+/// Number of NUMERIC (scalar `double`) inputs — C's `fieldIndex <=
+/// acalcoutRecordINPL` boundary. The scalar inputs come first in
+/// [`ACALCOUT_INPUT_LINKS`], so this is the length of the prefix that C's
+/// `special()` constant re-seed applies to.
+const ACALCOUT_NUMERIC_INPUTS: usize = 12;
+
+/// `(link_field, value_field)` for every input, scalars A..L first (C's
+/// `INPA..INPL`), then the arrays AA..LL (`INAA..INLL`) — the order
+/// `aCalcoutRecord.c::fetch_values` reads them in.
+const ACALCOUT_INPUT_LINKS: &[(&str, &str)] = &[
+    ("INPA", "A"),
+    ("INPB", "B"),
+    ("INPC", "C"),
+    ("INPD", "D"),
+    ("INPE", "E"),
+    ("INPF", "F"),
+    ("INPG", "G"),
+    ("INPH", "H"),
+    ("INPI", "I"),
+    ("INPJ", "J"),
+    ("INPK", "K"),
+    ("INPL", "L"),
+    ("INAA", "AA"),
+    ("INBB", "BB"),
+    ("INCC", "CC"),
+    ("INDD", "DD"),
+    ("INEE", "EE"),
+    ("INFF", "FF"),
+    ("INGG", "GG"),
+    ("INHH", "HH"),
+    ("INII", "II"),
+    ("INJJ", "JJ"),
+    ("INKK", "KK"),
+    ("INLL", "LL"),
+];
 const INP_NAMES: [&str; 12] = [
     "INPA", "INPB", "INPC", "INPD", "INPE", "INPF", "INPG", "INPH", "INPI", "INPJ", "INPK", "INPL",
 ];
@@ -157,7 +193,19 @@ pub struct AcalcoutRecord {
 
     // --- array sizing ---
     nelm: u32,
+    /// `NUSE` — how many elements of each array the expression uses. The
+    /// record's ONE invariant on it is `nuse <= nelm`, and it is re-established
+    /// only through [`AcalcoutRecord::clamp_nuse`]; nothing else may write this
+    /// field down.
     nuse: u32,
+    /// Set by [`AcalcoutRecord::clamp_nuse`] when it actually clamped, drained by
+    /// `take_cycle_posted_fields`. It is C's `db_post_events(&pcalc->nuse, ...)`
+    /// waiting for the framework's post point — and it lives INSIDE the clamp
+    /// owner so that no site can correct NUSE without telling the subscribers.
+    /// It carries the MASK of the C call site that made it: the `init_record` and
+    /// `process` clamps post `DBE_VALUE|DBE_LOG` (`:189`, `:376`), the
+    /// `special(NUSE)` clamp a bare `DBE_VALUE` (`:497`).
+    nuse_post_pending: Option<CyclePostMask>,
 
     // --- CALC ---
     pub calc: String,
@@ -254,6 +302,7 @@ impl Default for AcalcoutRecord {
             pval: 0.0,
             nelm: 1, // dbd initial("1")
             nuse: 0, // dbd initial("0")
+            nuse_post_pending: None,
             calc: String::new(),
             compiled_calc: CompiledExpr::empty(ExprKind::Array),
             clcv: 0,
@@ -322,6 +371,38 @@ impl Default for AcalcoutRecord {
 impl AcalcoutRecord {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The ONE place `NUSE > NELM` is corrected — C does it identically at each
+    /// of its three sites, and each time it POSTS:
+    ///
+    /// ```c
+    /// if (pcalc->nuse > pcalc->nelm) {
+    ///     pcalc->nuse = pcalc->nelm;
+    ///     db_post_events(pcalc, &pcalc->nuse, DBE_VALUE|DBE_LOG);
+    /// }
+    /// ```
+    /// `init_record` pass 0 (`aCalcoutRecord.c:188-190`), `process`
+    /// (`:374-377`), `special(NUSE)` (`:495-497`, `DBE_VALUE` there).
+    ///
+    /// The comment C leaves at the process site names the trigger: *"Make sure.
+    /// Autosave is capable of setting NUSE to an illegal value."* — a restore
+    /// writes NUSE and NELM in whatever order the .sav file lists them, so the
+    /// record can legitimately be handed `NUSE > NELM` and must repair it. The
+    /// repair is only half done without the post: the client that wrote the
+    /// illegal value, and every monitor, would keep reading it back while the
+    /// record used the clamped one.
+    ///
+    /// Clamping and posting are therefore ONE operation. The pending post lives
+    /// in this owner's own cell and is drained by `take_cycle_posted_fields`, so
+    /// a caller cannot perform the clamp and forget the post.
+    fn clamp_nuse(&mut self, mask: CyclePostMask) -> bool {
+        if self.nuse > self.nelm {
+            self.nuse = self.nelm;
+            self.nuse_post_pending = Some(mask);
+            return true;
+        }
+        false
     }
 
     /// Current array element count (C `acalcGetNumElements`,
@@ -700,6 +781,10 @@ impl Record for AcalcoutRecord {
     /// does.
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
         if pass == 0 {
+            // C `init_record` pass 0 (`aCalcoutRecord.c:188-190`) — a .db or an
+            // autosave restore can name NUSE > NELM, and the record must not
+            // enter its first cycle holding it.
+            self.clamp_nuse(CyclePostMask::ValueLog);
             self.recompile_calc();
             self.recompile_ocal();
         }
@@ -716,6 +801,28 @@ impl Record for AcalcoutRecord {
         match field {
             "CALC" => self.recompile_calc(),
             "OCAL" => self.recompile_ocal(),
+            // C `aCalcoutRecord.c:494-501`:
+            //
+            //   case acalcoutRecordNUSE:
+            //       if (pcalc->nuse > pcalc->nelm) {
+            //           pcalc->nuse = pcalc->nelm;
+            //           db_post_events(pcalc,&pcalc->nuse,DBE_VALUE);
+            //           return(-1);
+            //       }
+            //       return(0);
+            //
+            // The clamped value STAYS and is posted — and the put still FAILS.
+            // C's `dbPut` propagates the nonzero `dbPutSpecial` status
+            // (`dbAccess.c:1399-1405`), so the client is told its NUSE was
+            // illegal, the record does not run its `pp(TRUE)` cycle, and dbPut
+            // makes no post of its own. The port silently accepted the put.
+            "NUSE" => {
+                if self.clamp_nuse(CyclePostMask::Value) {
+                    return Err(CaError::InvalidValue(
+                        "NUSE exceeds NELM; clamped to NELM".into(),
+                    ));
+                }
+            }
             _ => {}
         }
         Ok(())
@@ -748,10 +855,9 @@ impl Record for AcalcoutRecord {
 
         let n = self.num_elements();
 
-        // C `process` line 374-377: clamp a stale NUSE > NELM.
-        if self.nuse > self.nelm {
-            self.nuse = self.nelm;
-        }
+        // C `process` line 374-377 — through the one owner, so the post C makes
+        // here cannot be dropped.
+        self.clamp_nuse(CyclePostMask::ValueLog);
 
         // C `process` line 393-395: snapshot scalar inputs (so PA..PL track
         // the values used in this calc). The framework fetches inputs before
@@ -1176,15 +1282,18 @@ impl Record for AcalcoutRecord {
                     as u32;
                 Ok(())
             }
+            // The RAW store, C's `dbPut`. The `nuse <= nelm` invariant is NOT
+            // enforced here: `put_field` is also how a `.db` field and an
+            // autosave restore land, and C's loader stores those verbatim — a
+            // `field(NUSE,"5")` written BEFORE `field(NELM,"10")` would
+            // otherwise be clamped against the DEFAULT nelm of 1 and silently
+            // become 1. C repairs the invariant in `special()` and in
+            // `init_record`, once every value is in.
             "NUSE" => {
                 self.nuse = value
                     .to_f64()
                     .ok_or_else(|| CaError::TypeMismatch("NUSE".into()))?
                     as u32;
-                // C special(NUSE) line 494-501 clamps NUSE to NELM.
-                if self.nuse > self.nelm {
-                    self.nuse = self.nelm;
-                }
                 Ok(())
             }
             // C `dbPut` stores the string; `special()` compiles it and records
@@ -1543,32 +1652,17 @@ impl Record for AcalcoutRecord {
     }
 
     fn multi_input_links(&self) -> &[(&'static str, &'static str)] {
-        &[
-            ("INPA", "A"),
-            ("INPB", "B"),
-            ("INPC", "C"),
-            ("INPD", "D"),
-            ("INPE", "E"),
-            ("INPF", "F"),
-            ("INPG", "G"),
-            ("INPH", "H"),
-            ("INPI", "I"),
-            ("INPJ", "J"),
-            ("INPK", "K"),
-            ("INPL", "L"),
-            ("INAA", "AA"),
-            ("INBB", "BB"),
-            ("INCC", "CC"),
-            ("INDD", "DD"),
-            ("INEE", "EE"),
-            ("INFF", "FF"),
-            ("INGG", "GG"),
-            ("INHH", "HH"),
-            ("INII", "II"),
-            ("INJJ", "JJ"),
-            ("INKK", "KK"),
-            ("INLL", "LL"),
-        ]
+        ACALCOUT_INPUT_LINKS
+    }
+
+    /// C `aCalcoutRecord.c::special` (534-540) — the constant re-seed, under C's
+    /// `if (fieldIndex <= acalcoutRecordINPL)` guard: only the NUMERIC inputs
+    /// A..L are re-loaded. The ARRAY inputs AA..LL are not — C's
+    /// `pvalue = &pcalc->a + lnkIndex` is a scalar `double *`, so an array link
+    /// gets `INAV = CON` (the link-status refresh below) and nothing else. That
+    /// guard is this slice: the first twelve entries of `multi_input_links`.
+    fn special_reseed_input_links(&self) -> &[(&'static str, &'static str)] {
+        &ACALCOUT_INPUT_LINKS[..ACALCOUT_NUMERIC_INPUTS]
     }
 
     /// C `aCalcoutRecord.c::fetch_values` (1068-1071, 1097) `return`s at the
@@ -1737,6 +1831,11 @@ impl Record for AcalcoutRecord {
         let (amask, newm) = (self.amask, self.newm);
         self.newm = 0;
         let mut marks = Vec::new();
+        // C's NUSE clamp post, with the mask of whichever C site made it. Marked
+        // by `clamp_nuse`, the only site that can clamp.
+        if let Some(mask) = self.nuse_post_pending.take() {
+            marks.push(("NUSE", mask));
+        }
         for (i, name) in ARR_NAMES.iter().enumerate() {
             let bit = 1u32 << i;
             // C `afterCalc` (`:296`) runs first, and with a LITERAL mask — the
@@ -2027,12 +2126,71 @@ mod tests {
         );
     }
 
+    /// C repairs `NUSE > NELM` in `special()`, NOT in the field store: `dbPut`
+    /// writes the value the client sent and `dbPutSpecial(paddr,1)` then clamps
+    /// it, posts it, and RETURNS -1 so the put fails (`aCalcoutRecord.c:494-501`).
+    /// The store itself must stay raw — it is also the `.db` / autosave load path,
+    /// where NELM may not have arrived yet.
     #[test]
-    fn test_acalcout_nuse_clamped_to_nelm() {
+    fn test_acalcout_nuse_special_clamps_posts_and_refuses_the_put() {
         let mut rec = AcalcoutRecord::new();
         rec.put_field("NELM", EpicsValue::ULong(4)).unwrap();
+
         rec.put_field("NUSE", EpicsValue::ULong(10)).unwrap();
+        assert_eq!(
+            rec.get_field("NUSE"),
+            Some(EpicsValue::ULong(10)),
+            "the raw store keeps what the client sent; special() has not run yet"
+        );
+
+        let status = rec.special("NUSE", true);
+        assert!(status.is_err(), "C returns -1, so the put must fail");
+        assert_eq!(
+            rec.get_field("NUSE"),
+            Some(EpicsValue::ULong(4)),
+            "and the clamped value stays"
+        );
+        assert_eq!(
+            rec.take_cycle_posted_fields(),
+            vec![("NUSE", CyclePostMask::Value)],
+            "posted with C's literal DBE_VALUE (:497)"
+        );
+    }
+
+    /// The load-order case the raw store protects: a `.db` that lists NUSE before
+    /// NELM. C stores both, then `init_record` pass 0 clamps once with the final
+    /// NELM (`:188-190`) — NUSE=5 is legal under NELM=10 and survives. Clamping
+    /// inside the store would have measured it against the DEFAULT nelm of 1.
+    #[test]
+    fn nuse_is_clamped_at_init_against_the_final_nelm_not_the_default() {
+        let mut rec = AcalcoutRecord::new();
+        rec.put_field("NUSE", EpicsValue::ULong(5)).unwrap();
+        rec.put_field("NELM", EpicsValue::ULong(10)).unwrap();
+
+        rec.init_record(0).unwrap();
+
+        assert_eq!(rec.get_field("NUSE"), Some(EpicsValue::ULong(5)));
+        assert!(
+            rec.take_cycle_posted_fields().is_empty(),
+            "nothing was clamped, so nothing is posted"
+        );
+    }
+
+    /// ...and the same init pass DOES repair a genuinely illegal restore.
+    #[test]
+    fn init_clamps_an_illegal_restored_nuse_and_posts_it() {
+        let mut rec = AcalcoutRecord::new();
+        rec.put_field("NELM", EpicsValue::ULong(4)).unwrap();
+        rec.put_field("NUSE", EpicsValue::ULong(99)).unwrap();
+
+        rec.init_record(0).unwrap();
+
         assert_eq!(rec.get_field("NUSE"), Some(EpicsValue::ULong(4)));
+        assert_eq!(
+            rec.take_cycle_posted_fields(),
+            vec![("NUSE", CyclePostMask::ValueLog)],
+            "C's init post is DBE_VALUE|DBE_LOG (:189)"
+        );
     }
 
     #[test]

@@ -1,7 +1,28 @@
 use crate::error::CaResult;
-use crate::types::{DbFieldType, EpicsValue};
+use crate::types::{DbFieldType, EpicsValue, PvString};
 
 use super::scan::ScanType;
+
+/// Which of a `devXxxSoftRaw` dset's two entry points is delivering a value to
+/// [`Record::raw_soft_input`]. They are not the same function in C, and they do
+/// not agree about `MASK`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RawSoftEntry {
+    /// `devXxxSoftRaw::init_record` — `recGblInitConstantLink(&prec->inp,
+    /// DBF_x, &prec->rval)` (`devAiSoftRaw.c:41`, `devBiSoftRaw.c:42`,
+    /// `devMbbiSoftRaw.c:42`, `devMbbiDirectSoftRaw.c:42`). A CONSTANT `INP`
+    /// (`field(INP,"12")`) is loaded ONCE, at iocInit, straight into `RVAL`.
+    ///
+    /// `recGblInitConstantLink` is a plain typed store — **no MASK**. The mask
+    /// lives in `read_xxx`, which a constant INP never reaches (a constant link
+    /// delivers nothing at process).
+    InitConstant,
+    /// `devXxxSoftRaw::read_xxx` — the per-cycle `dbGetLink(&prec->inp, ...)`
+    /// followed by the dset's own masking (`devBiSoftRaw.c:56-57` `if
+    /// (prec->mask) prec->rval &= prec->mask;`, `devMbbiSoftRaw.c:78-79`
+    /// unconditionally).
+    Read,
+}
 
 /// The `special(SPC_*)` dispatch code a field declares — C `special.h`.
 ///
@@ -1066,6 +1087,28 @@ pub trait Record: Send + Sync + 'static {
             .any(|f| f.eq_ignore_ascii_case(field))
     }
 
+    /// The record's `DBF_ENUM` state strings — the C rset slot pair
+    /// `get_enum_strs` / `put_enum_str`, which in C read the same fields and
+    /// are therefore ONE table here.
+    ///
+    /// It is what a client reads as the `DBR_ENUM` choice list AND the set of
+    /// names a `DBR_STRING` put to the record's `DBF_ENUM` `VAL` may name
+    /// (`dbConvert.c::putStringEnum` → [`resolve_enum_state_string`]). Taking
+    /// both from one table is the point: a name the record advertises is a name
+    /// a client may put, by construction — the two cannot drift.
+    ///
+    /// The table is already trimmed to C's `no_str`: `bi`/`bo`/`busy` drop
+    /// `ONAM` when `ZNAM` is set and `ONAM` is empty (`boRecord.c:342-352`);
+    /// `mbbi`/`mbbo` cut at the last non-empty state (`mbbiRecord.c:262-269`).
+    ///
+    /// `None` — the record type leaves both rset slots NULL. That is every
+    /// record whose `VAL` is not `DBF_ENUM`, and `mbbiDirect`/`mbboDirect`
+    /// (`mbbiDirectRecord.c:58` `#define put_enum_str NULL`), whose `VAL` is
+    /// `DBF_LONG`. C then fails a `DBR_STRING` put with `S_db_noRSET`.
+    fn enum_state_strings(&self) -> Option<Vec<PvString>> {
+        None
+    }
+
     /// Validate a put before it is applied. Return Err to reject.
     fn validate_put(&self, _field: &str, _value: &EpicsValue) -> CaResult<()> {
         Ok(())
@@ -1104,18 +1147,6 @@ pub trait Record: Send + Sync + 'static {
         self.put_field_internal(field, value)
     }
 
-    /// Whether this record implements the `DTYP="Raw Soft Channel"`
-    /// read path via [`Record::apply_raw_input`]. Records that return
-    /// `true` opt into framework routing of the INP link value through
-    /// `apply_raw_input` (RVAL + MASK) instead of the default
-    /// soft-channel `VAL` direct write.
-    ///
-    /// Default `false` keeps any record that has not been wired for
-    /// raw soft channel on the legacy path (which sets VAL directly).
-    fn accepts_raw_soft_input(&self) -> bool {
-        false
-    }
-
     /// Whether this record's `INP` is read by DEVICE SUPPORT (a C `DSET`), as
     /// opposed to by the record body itself.
     ///
@@ -1132,18 +1163,45 @@ pub trait Record: Send + Sync + 'static {
         true
     }
 
-    /// Apply a value read from a `DTYP="Raw Soft Channel"` INP link.
+    /// The `DTYP="Raw Soft Channel"` INPUT dset — C's four `devXxxSoftRaw.c`
+    /// read supports (`devAiSoftRaw`, `devBiSoftRaw`, `devMbbiSoftRaw`,
+    /// `devMbbiDirectSoftRaw`).
     ///
-    /// Mirrors the C `devXxxSoftRaw.c` `read_xxx()` convention: the
-    /// raw value goes to `RVAL` (so the record's `process()` then runs
-    /// the standard `RVAL → VAL` conversion). Records that expose a
-    /// `MASK` field must apply it here, matching epics-base
-    /// `f2fe9d12` (devBiSoftRaw: `prec->rval &= prec->mask`).
+    /// The value read from the INP link goes to **`RVAL`**, not `VAL`: the
+    /// record's own `RVAL → VAL` convert then runs (that is the whole
+    /// difference from `"Soft Channel"`, whose `read_xxx` returns 2 and writes
+    /// `VAL` directly).
     ///
-    /// Only invoked by the framework when
-    /// [`Record::accepts_raw_soft_input`] returns `true`.
-    fn apply_raw_input(&mut self, value: EpicsValue) -> CaResult<()> {
-        self.set_val(value)
+    /// **`Some`/`None` IS the dset table.** A record type that implements this
+    /// is one for which C ships a SoftRaw input dset; a record type that does
+    /// not, C has no such dset for, so `DTYP="Raw Soft Channel"` on it is a
+    /// configuration C rejects at iocInit. There is no separate boolean saying
+    /// whether the record "accepts" raw input — that boolean existed, defaulted
+    /// to `false`, had ONE override in the workspace, and silently sent the
+    /// other three input records' raw values into `VAL`, where their own convert
+    /// then overwrote them from an unseeded `RVAL=0` (R19-66). A capability
+    /// answer that can disagree with the implementation is the bug.
+    fn raw_soft_input(&mut self, entry: RawSoftEntry, value: EpicsValue) -> Option<CaResult<()>> {
+        let _ = (entry, value);
+        None
+    }
+
+    /// The `DTYP="Raw Soft Channel"` OUTPUT dset — C's four `devXxxSoftRaw.c`
+    /// write supports: the value `write_xxx()` puts to the OUT link.
+    ///
+    /// `devAoSoftRaw.c` / `devBoSoftRaw.c` put `RVAL` (`dbPutLink(&prec->out,
+    /// DBR_LONG, &prec->rval, 1)`); `devMbboSoftRaw.c` /
+    /// `devMbboDirectSoftRaw.c` put `RVAL & MASK` as `DBR_ULONG`. All four
+    /// write the RAW word — never the engineering `OVAL` that
+    /// [`Record::output_link_value`] (the `"Soft Channel"` dset) puts.
+    ///
+    /// Same rule as [`Record::raw_soft_input`]: `Some`/`None` IS the dset
+    /// table. Before this hook existed, a `DTYP="Raw Soft Channel"` output
+    /// record matched neither the soft-OUT arm (which tests for `"Soft
+    /// Channel"`) nor the device arm (it has no device), so it wrote **nothing
+    /// at all** to OUT.
+    fn raw_soft_output_value(&self) -> Option<EpicsValue> {
+        None
     }
 
     /// Apply a raw device value read *back* from an output record's device
@@ -2120,6 +2178,54 @@ pub trait Record: Send + Sync + 'static {
         &[]
     }
 
+    /// The `(link_field, value_field)` pairs whose CONSTANT value this record's
+    /// C `special()` RE-SEEDS on a runtime put to the link field —
+    /// `recGblInitConstantLink(plink, DBF_DOUBLE, pvalue)` +
+    /// `db_post_events(prec, pvalue, DBE_VALUE)` + `INAV = CON`
+    /// (`calcoutRecord.c:367-378`, `sCalcoutRecord.c:512-517`,
+    /// `aCalcoutRecord.c:534-540`).
+    ///
+    /// Without it a constant link is load-once dead state: `caput CO.INPB 7`
+    /// stores the link text, the link layer then delivers nothing at process
+    /// time (a constant link is not read), and `B` keeps its `.db`-load value
+    /// forever.
+    ///
+    /// Declaring the pair is all a record does — the put path
+    /// (`database::field_io::special_after_put`, the one `special(field, true)`
+    /// owner) runs the load through
+    /// [`crate::server::record::rec_gbl_init_constant_link`], the same owner the
+    /// init seed uses, and posts the value field. A record cannot declare the
+    /// pair and forget to implement the re-seed.
+    ///
+    /// Default: EMPTY — and that is the correct answer for every record whose C
+    /// `special()` does NOT re-seed. `recGblInitConstantLink` appears inside a
+    /// `special()` body in exactly FOUR record types across base and synApps
+    /// calc — calcout, sCalcout, aCalcout, transform. Everywhere else (calc,
+    /// sub, sel, aSub, seq, fanout, dfanout, swait, sseq, ao/bo/longout/…) it is
+    /// called only from `init_record`, so those records seed once and never
+    /// again, and they inherit this empty default.
+    ///
+    /// The overriding records list only the inputs C actually re-seeds:
+    /// sCalcout/aCalcout guard with `fieldIndex <= INPL` (their string/array
+    /// inputs are init-load only) and transform with
+    /// `fieldIndex < transformRecordOUTA` (its OUT half is not an input).
+    fn special_reseed_input_links(&self) -> &[(&'static str, &'static str)] {
+        &[]
+    }
+
+    /// The event mask of the `db_post_events` call in that record's `special()`
+    /// re-seed arm — the C call sites do not agree:
+    ///
+    ///  * calcout (`calcoutRecord.c:376`), sCalcout (`:516`), aCalcout (`:537`)
+    ///    post a literal `DBE_VALUE`.
+    ///  * transform (`transformRecord.c:718`) posts `DBE_VALUE | DBE_LOG`.
+    ///
+    /// Default: `DBE_VALUE`, the majority shape. Only consulted for the fields
+    /// named by [`Self::special_reseed_input_links`].
+    fn special_reseed_post_mask(&self) -> crate::server::recgbl::EventMask {
+        crate::server::recgbl::EventMask::VALUE
+    }
+
     /// Every CONSTANT input link this record seeds ONCE, at `init_record` —
     /// the record's own `recGblInitConstantLink` / `dbLoadLinkArray` table,
     /// transcribed from its C.
@@ -2690,7 +2796,7 @@ pub fn put_field_internal_default<R: Record + ?Sized>(
         Some(target)
             if is_enum_carrier || (value.db_field_type() != target && !value.is_empty_array()) =>
         {
-            value.convert_to(target)
+            coerce_put_value(record, name, target, value)?
         }
         // Carrier with no known target field: collapse to a bare index (the prior
         // fallback) rather than letting it reach storage.
@@ -2698,6 +2804,49 @@ pub fn put_field_internal_default<R: Record + ?Sized>(
         _ => value,
     };
     record.put_field(name, value)
+}
+
+/// Coerce a written value to a field's stored type — the single owner of C
+/// `dbConvert.c`'s `dbFastPutConvertRoutine[dbrType][field_type]` table, shared
+/// by the two paths a value can enter a record's field through: a client
+/// `dbPut` ([`crate::server::database::field_io`]) and an internal link /
+/// device-support delivery ([`put_field_internal_default`]).
+///
+/// The three `DBR_STRING` rows C does NOT route through a numeric parse are the
+/// point of the shared owner:
+///
+/// * `DBF_MENU` → `putStringMenu` — exact label, else an index below `nChoice`
+///   ([`resolve_menu_field_string`]).
+/// * `DBF_ENUM` → `putStringEnum` — the record's state strings, else an index
+///   below `no_str` ([`resolve_enum_state_string`]).
+/// * every other type → `EpicsValue::convert_to`, the value-coercion owner.
+///
+/// Both string rows FAIL the put on no match (`S_db_badChoice`); C stores
+/// nothing. `convert_to` cannot express that — it is field-blind and maps any
+/// unparseable string to `0` — which is how `caput MY:VALVE Open` became a
+/// silent no-op that drove `VAL` to state 0.
+pub fn coerce_put_value<R: Record + ?Sized>(
+    record: &R,
+    field: &str,
+    target: DbFieldType,
+    value: EpicsValue,
+) -> CaResult<EpicsValue> {
+    if let EpicsValue::String(s) = &value {
+        if let Some(choices) = record
+            .menu_field_choices(field)
+            .or_else(|| super::shared_menu_choices(field))
+        {
+            return super::resolve_menu_field_string(field, choices, target, &s.as_str_lossy());
+        }
+        if target == DbFieldType::Enum {
+            return super::resolve_enum_state_string(
+                field,
+                record.enum_state_strings().as_deref(),
+                s,
+            );
+        }
+    }
+    Ok(value.convert_to(target))
 }
 
 /// Subroutine function type for `sub`/`aSub` records.

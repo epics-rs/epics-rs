@@ -27,6 +27,7 @@ pub mod cli;
 pub mod client;
 pub mod copt;
 pub mod discovery;
+pub mod hostname;
 pub mod observability;
 pub mod protocol;
 pub mod repeater;

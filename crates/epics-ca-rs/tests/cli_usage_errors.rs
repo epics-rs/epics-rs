@@ -68,6 +68,37 @@ fn unknown_option_is_status_1_with_the_c_diagnostic() {
     }
 }
 
+/// C getopt `default:` — the arm an option that IS in the optstring but has no
+/// `case` of its own falls into (R13-25).
+///
+/// `cainfo`'s optstring is `":nhVw:s:p:"` (`cainfo.c:146`) and there is no
+/// `case 'n'`, so `cainfo -n` reaches `default: usage(); return 1`
+/// (`cainfo.c:194-196`): the full usage block on stderr, status 1. It is NOT
+/// `Unrecognized option` — that is `case '?'`, which only a letter *outside* the
+/// optstring gets, and the two are distinguishable by their text and by the fact
+/// that `-n` prints the whole block.
+///
+/// (The block's wording is clap's, not C's — a standing divergence of this port,
+/// pinned by `help_and_version_still_exit_0` below. What this test pins is the
+/// ARM: usage block, status 1, and no `case '?'` diagnostic.)
+#[test]
+fn cainfo_dash_n_is_the_c_default_arm_not_an_unknown_option() {
+    let (code, stdout, stderr) = run(env!("CARGO_BIN_EXE_cainfo-rs"), &["-n", "PV"]);
+    assert_eq!(code, 1, "cainfo -n: C's `default:` arm returns 1");
+    assert!(
+        !stderr.contains("Unrecognized option"),
+        "'-n' is in cainfo's optstring, so it is never `case '?'`; stderr was:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Usage:"),
+        "C's `default:` arm prints the usage block on stderr; stderr was:\n{stderr}"
+    );
+    assert!(
+        stdout.is_empty(),
+        "the exit-1 usage block goes to stderr, not stdout; stdout was:\n{stdout}"
+    );
+}
+
 /// C getopt `':'`. Note the argv: a trailing `PV` would become `-w`'s
 /// *argument* (in C too — getopt takes the next token), so the missing-value
 /// case is `-w` as the last token.

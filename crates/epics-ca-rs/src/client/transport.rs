@@ -2109,11 +2109,39 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                         msg = %msg,
                         "CA server error",
                     );
+                    // The echoed request's DBR type and element count —
+                    // libca's `caHdrLargeArray.m_dataType` / `m_count`, which
+                    // every exception stub forwards and the default handler
+                    // prints (`type=DBR_STRING, count=1`). The extended form
+                    // (`m_count == 0`, postsize `0xFFFF`) carries the real
+                    // count in the 8-byte annex, same place `echo_hdr_size`
+                    // already accounts for.
+                    let (echo_type, echo_count) = if actual_post >= 16 {
+                        let e = &accumulated[data_start..data_start + 16];
+                        let ty = u16::from_be_bytes([e[4], e[5]]);
+                        let short_count = u16::from_be_bytes([e[6], e[7]]);
+                        let count = if echo_hdr_size == 24 {
+                            let a = &accumulated[data_start + 16..data_start + 24];
+                            u32::from_be_bytes([a[4], a[5], a[6], a[7]])
+                        } else {
+                            u32::from(short_count)
+                        };
+                        (Some(ty), Some(count))
+                    } else {
+                        (None, None)
+                    };
+                    // rsrv stamps the outer `m_cid` with the client's cid for
+                    // channel-scoped commands and `0xFFFF_FFFF` otherwise
+                    // (`rsrv/camessage.c:155-182`).
+                    let err_cid = (hdr.cid != 0xFFFF_FFFF).then_some(hdr.cid);
                     let _ = event_tx.send(TransportEvent::ServerError {
                         eca_status,
                         original_request: orig_cmd,
                         message: msg,
                         server_addr,
+                        cid: err_cid,
+                        data_type: echo_type,
+                        count: echo_count,
                     });
                 }
                 CA_PROTO_SERVER_DISCONN => {

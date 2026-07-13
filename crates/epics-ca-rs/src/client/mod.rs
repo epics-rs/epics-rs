@@ -2942,14 +2942,34 @@ impl CaChannel {
         EventWatcher { handle }
     }
 
-    /// Server's IP address as a string (e.g. `"10.0.0.5:5064"`).
-    /// Mirrors libca `ca_host_name(chid)` (oldChannelNotify.cpp:189).
+    /// The server's host NAME, as libca `ca_host_name(chid)`
+    /// (`oldChannelNotify.cpp:189` → `tcpiiu::getHostName` → `hostNameCache`)
+    /// reports it: reverse-resolved, with the port appended
+    /// (`"ioc1.lab:5064"`), and only the dotted IP when the address has no
+    /// PTR record. This used to hand back the raw `SocketAddr`, which is what
+    /// put a dotted IP on `cainfo`'s `Host:` line where C prints a name
+    /// (W10-B5) — the resolution belongs here, at the `ca_host_name` analog,
+    /// not in the tool.
+    ///
+    /// The lookup is [`crate::hostname::ip_addr_to_a`] on a blocking thread:
+    /// this is an `async fn` a caller awaits, so it can wait for the resolver
+    /// exactly as C's `cainfo` does, and no other channel's progress is behind
+    /// it.
+    ///
     /// Returns `Err` if the channel hasn't connected yet — pvxs
     /// returns `"<disconnected>"` for the same case; we surface
     /// the typed error instead so callers can decide.
     pub async fn host_name(&self) -> CaResult<String> {
         let info = self.info().await?;
-        Ok(info.server_addr.to_string())
+        let addr = info.server_addr;
+        Ok(
+            tokio::task::spawn_blocking(move || crate::hostname::ip_addr_to_a(addr))
+                .await
+                // A join failure is a runtime shutdown, not a channel error, and
+                // C's `ipAddrToA` has a well-defined answer for "no name": the
+                // dotted IP. Give that rather than failing a connected channel.
+                .unwrap_or_else(|_| addr.to_string()),
+        )
     }
 
     /// Server's CA minor protocol version, parsed from the
@@ -3694,6 +3714,14 @@ async fn run_coordinator(
                                 server_addr: Some(new_addr),
                                 pv_name: Some(pv_name),
                                 status: Some(crate::protocol::ECA_DBLCHNL),
+                                // C raises this one through the plain
+                                // `ca_client_context::exception` overload
+                                // (`cac.cpp:1323`): no chid, no type/count —
+                                // so the block prints the ctx text verbatim.
+                                op: types::CaOp::Other,
+                                data_type: None,
+                                count: None,
+                                source: None,
                             },
                         );
                     }
@@ -3997,30 +4025,94 @@ async fn run_coordinator(
                         original_request,
                         message,
                         server_addr,
+                        cid,
+                        data_type,
+                        count,
                     } => {
-                        // Already logged in transport layer; surface
-                        // through the exception handler if registered.
-                        // CaException.status is the ECA code (libca
-                        // parity); the original request cmd goes into
-                        // the message text as diagnostic context.
-                        let annotated = match original_request {
-                            Some(cmd) => {
-                                if message.is_empty() {
-                                    format!("(while processing cmd={cmd})")
-                                } else {
-                                    format!("{message} (while processing cmd={cmd})")
-                                }
-                            }
-                            None => message,
+                        // Already logged in the transport layer; this is the
+                        // libca exception path (`cac::exceptionRespAction` →
+                        // the per-command stub). `message` stays RAW — it is
+                        // C's `pCtx`, and the default handler prints it as
+                        // `ctx="..."`; the request command is carried
+                        // structurally (op / type / count), not smuggled into
+                        // the text.
+                        //
+                        // libca's exception jump table (`cac.cpp:93-124`) sends
+                        // READ / READ_NOTIFY / WRITE_NOTIFY / EVENT_ADD to the
+                        // stubs that complete the pending IO or the
+                        // subscription callback — the exception HOOK never
+                        // fires for those, and the tool prints its own
+                        // per-operation diagnostic instead. The transport has
+                        // already completed those waiters above, so they are
+                        // done here.
+                        let routed_to_a_callback = matches!(
+                            original_request,
+                            Some(
+                                crate::protocol::CA_PROTO_READ
+                                    | crate::protocol::CA_PROTO_READ_NOTIFY
+                                    | crate::protocol::CA_PROTO_WRITE_NOTIFY
+                                    | crate::protocol::CA_PROTO_EVENT_ADD
+                            )
+                        );
+                        if routed_to_a_callback {
+                            continue;
+                        }
+                        // What is left is `cac::writeExcep` (a plain
+                        // CA_PROTO_WRITE has no callback to complete, so libca
+                        // takes it to `oldChannelNotify::writeException`,
+                        // `cac.cpp:1049-1061`) and `cac::defaultExcep` for
+                        // every other command.
+                        let op = if original_request == Some(crate::protocol::CA_PROTO_WRITE) {
+                            types::CaOp::Put
+                        } else if original_request == Some(crate::protocol::CA_PROTO_EVENT_CANCEL) {
+                            types::CaOp::ClearEvent
+                        } else if original_request == Some(crate::protocol::CA_PROTO_CREATE_CHAN) {
+                            types::CaOp::CreateChannel
+                        } else {
+                            types::CaOp::Other
+                        };
+                        let is_channel_exception = op == types::CaOp::Put;
+                        let pv_name = is_channel_exception
+                            .then(|| cid.and_then(|c| channels.get(&c)))
+                            .flatten()
+                            .map(|ch| ch.pv_name.to_string());
+                        // `cac::defaultExcep` folds the host into the ctx
+                        // text itself (`host=%s ctx=%.400s`, `cac.cpp:1006-1016`)
+                        // before raising; the channel path passes the server's
+                        // diagnostic through untouched.
+                        //
+                        // C's host there is `iiu.getHostName` — the circuit's
+                        // `hostNameCache`, i.e. the reverse-resolved NAME, the
+                        // same source `ca_host_name` reads (W10-B5). This
+                        // arm runs on the coordinator task, so it takes the
+                        // NON-blocking half of that cache: a `getnameinfo` here
+                        // would park every channel's progress behind one DNS
+                        // timeout.
+                        let message = if is_channel_exception {
+                            message
+                        } else {
+                            format!(
+                                "host={host} ctx={message}",
+                                host = crate::hostname::cached_name(server_addr)
+                            )
                         };
                         types::dispatch_exception(
                             &exception_slot,
                             types::CaException {
                                 kind: types::CaExceptionKind::ServerError,
-                                message: annotated,
+                                message,
                                 server_addr: Some(server_addr),
-                                pv_name: None,
+                                pv_name,
                                 status: Some(eca_status),
+                                op,
+                                data_type: is_channel_exception.then_some(data_type).flatten(),
+                                count: is_channel_exception.then_some(count).flatten(),
+                                // `cac::defaultExcep` (`cac.cpp:1006-1016`)
+                                // passes a null file, which suppresses the
+                                // `Source File:` line; only the channel-write
+                                // exception carries one.
+                                source: is_channel_exception
+                                    .then_some(types::LIBCA_WRITE_EXCEPTION_SITE),
                             },
                         );
                     }
@@ -4075,6 +4167,12 @@ async fn run_coordinator(
                                 server_addr: Some(server_addr),
                                 pv_name: None,
                                 status: Some(crate::protocol::ECA_UNRESPTMO),
+                                // libca `tcpiiu::unresponsiveCircuitNotify`
+                                // raises this with a plain ctx string too.
+                                op: types::CaOp::Other,
+                                data_type: None,
+                                count: None,
+                                source: None,
                             },
                         );
                         // Same owner as the two circuit-gone paths: the
@@ -4367,6 +4465,10 @@ fn handle_server_disconnect(
             server_addr: Some(server_addr),
             pv_name: Some(pv_name),
             status: None,
+            op: types::CaOp::Other,
+            data_type: None,
+            count: None,
+            source: None,
         },
     );
 }

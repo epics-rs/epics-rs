@@ -24,6 +24,25 @@ pub const DEFAULT_CLI_TIMEOUT_SECS: f64 = 1.0;
 pub const INDEFINITE_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(10 * 365 * 24 * 60 * 60);
 
+/// Deadline meaning "already expired", which is what a NEGATIVE `-w` (or
+/// `EPICS_CLI_TIMEOUT`) is in C (W10-B1).
+///
+/// C hands `caTimeout` straight to `ca_pend_io`, which turns it into a
+/// deadline `now + caTimeout`. A negative value puts that deadline in the
+/// PAST, so `ca_pend_io` returns `ECA_TIMEOUT` without ever waiting, and
+/// `connect_pvs` (`tool_lib.c:628-638`) reports the connect failure and exits
+/// 1 — even for a PV that is right there:
+///
+/// ```text
+/// caget -w -1 TST:AO   C: Channel connect timed out: 'TST:AO' not found.  (exit 1)
+/// ```
+///
+/// A zero-length `Duration` reproduces that exactly (an armed `tokio::timeout`
+/// with it elapses at once) and cannot be confused with `-w 0`, which means
+/// wait FOREVER and resolves to [`INDEFINITE_TIMEOUT`]. Naming it keeps
+/// "expired" a state a reader can see, rather than a magic zero.
+pub const EXPIRED_TIMEOUT: std::time::Duration = std::time::Duration::ZERO;
+
 /// Read `EPICS_CLI_TIMEOUT` from the environment, falling back to
 /// [`DEFAULT_CLI_TIMEOUT_SECS`] when unset, unparsable, or non-finite.
 /// Mirrors C `tool_lib.c:use_ca_timeout_env` (commit 1d056c6): it sets
@@ -31,29 +50,54 @@ pub const INDEFINITE_TIMEOUT: std::time::Duration =
 /// back to the default on a parse failure — the env var is consulted
 /// only when the caller did not pass `-w`/`--wait`. A value of `0` is a
 /// valid timeout meaning "wait forever" (see [`INDEFINITE_TIMEOUT`]), so
-/// it is passed through here and resolved by [`timeout_duration`];
-/// negatives and non-finite values stay clamped to the default.
+/// it is passed through here and resolved by [`timeout_duration`], and so is
+/// a NEGATIVE value, which C treats as an already-expired deadline
+/// ([`EXPIRED_TIMEOUT`], W10-B1). Only the non-finite values stay clamped to
+/// the default.
 pub fn env_default_timeout() -> f64 {
     std::env::var("EPICS_CLI_TIMEOUT")
         .ok()
         .and_then(|s| s.parse::<f64>().ok())
-        .filter(|v| v.is_finite() && *v >= 0.0)
+        // C `use_ca_timeout_env` accepts ANY value `epicsScanDouble` parses,
+        // negatives included — `EPICS_CLI_TIMEOUT=-1 caget TST:AO` reports a
+        // connect timeout and exits 1, exactly as `-w -1` does. Clamping the
+        // negative here hid the same defect [`timeout_duration`] had (W10-B1).
+        // Only the non-finite values are held back (see `timeout_duration`).
+        .filter(|v| v.is_finite())
         .unwrap_or(DEFAULT_CLI_TIMEOUT_SECS)
 }
 
 /// Convert a user-supplied timeout (CLI `-w` or env var) into a
 /// `std::time::Duration`.
 ///
-/// A value of `0` means "wait indefinitely", matching C `ca_pend_io(0)`
-/// / `ca_pend_event(0)` (see [`INDEFINITE_TIMEOUT`]) — NOT the 1 s
-/// default. `Duration::from_secs_f64` panics on NaN / infinity /
-/// negative values; clap accepts those literally so this guard clamps
-/// them to [`DEFAULT_CLI_TIMEOUT_SECS`] (defensive, epics-base 1655d68e).
+/// Three states, because C has three (W10-B1):
+///
+/// * `0` means wait INDEFINITELY — C `ca_pend_io(0)` / `ca_pend_event(0)`,
+///   see [`INDEFINITE_TIMEOUT`]. NOT the 1 s default.
+/// * a NEGATIVE value is a deadline in the past, i.e. already
+///   [`EXPIRED_TIMEOUT`]: C waits not at all and reports a connect timeout.
+///   The port used to clamp it to the default and connect happily, which is
+///   the opposite outcome.
+/// * anything positive and finite is that many seconds.
+///
+/// `Duration::from_secs_f64` panics on NaN and infinity, and clap hands those
+/// through literally, so the guard against them stays — they resolve to
+/// [`DEFAULT_CLI_TIMEOUT_SECS`].
+///
+/// DEVIATION, deliberate: C's `-w nan` reaches `ca_pend_io(nan)`, where every
+/// deadline comparison is false and the tool HANGS forever. We treat NaN as
+/// the default instead. An infinite `-w inf` is likewise treated as the
+/// default rather than as a ~forever wait.
 pub fn timeout_duration(secs: f64) -> std::time::Duration {
     if secs == 0.0 {
+        // Covers -0.0 too: C's `caTimeout == 0` test is numeric, and -0.0 is
+        // not negative for it either.
         return INDEFINITE_TIMEOUT;
     }
-    let s = if secs.is_finite() && secs > 0.0 {
+    if secs < 0.0 {
+        return EXPIRED_TIMEOUT;
+    }
+    let s = if secs.is_finite() {
         secs
     } else {
         DEFAULT_CLI_TIMEOUT_SECS
@@ -234,6 +278,64 @@ pub const NO_DATA_MARKER: &str = "*** no data available (timeout)";
 /// `-l` modes print for a timed-out synchronous readback (see
 /// [`zero_dbr_snapshot`]).
 pub const EPICS_EPOCH_UNIX_SECS: u64 = 631_152_000;
+
+/// C `tool_lib.c:52` `timeFormatStr` — the ONE format every CA tool passes to
+/// `epicsTimeToStrftime` for an absolute stamp (`caget -a`, `caget -d
+/// DBR_TIME_*`, `caput -l`, every `camonitor` line, and the `*** disconnected`
+/// / `*** CA error` lines at `tool_lib.c:515-529`).
+///
+/// This is the single owner of that rendering. The fractional field is NOT
+/// what `chrono`'s `%.6f` produces: C ROUNDS the nanoseconds into the
+/// requested width, and clamps so the rounding can never carry into the whole
+/// seconds (`epicsTime.cpp:233-238`, W10-B4):
+///
+/// ```c
+/// unsigned long frac = pTS->nsec + div[fracWid] / 2;   /* div[6] == 1000 */
+/// if (frac >= nSecPerSec)
+///     frac = nSecPerSec - 1;                           /* never carries */
+/// frac /= div[fracWid];
+/// ```
+///
+/// so `nsec = 1_500` prints `.000002` (chrono truncated it to `.000001`), and
+/// `nsec = 999_999_600` prints `.999999` on the SAME second rather than
+/// rolling the clock forward.
+pub fn format_time(ts: WallTime) -> String {
+    use chrono::{DateTime, Local, TimeZone};
+
+    // C treats an all-zero `epicsTimeStamp` as UNINITIALIZED and prints a
+    // sentinel instead of a date (`epicsTime.cpp:174-179`, W10-B3):
+    //
+    //     // presume that EPOCH date is an uninitialized time stamp
+    //     if ( pTS->secPastEpoch == 0 && pTS->nsec == 0u ) {
+    //         strncpy ( pBuff, "<undefined>", bufLength );
+    //
+    // The test is on the stamp AS IT ARRIVED — seconds past the EPICS epoch,
+    // before any timezone applies — which is why it lives here and not at a
+    // call site holding a local `DateTime`. A never-processed record
+    // (`caget -a TST:NEVER`) and every timed-out synchronous readback (see
+    // `zero_dbr_snapshot`) carry exactly this stamp.
+    if ts.unix_secs() == EPICS_EPOCH_UNIX_SECS && ts.subsec_nanos() == 0 {
+        return "<undefined>".to_string();
+    }
+
+    // Round to microseconds the way C does, then clamp: `frac` can reach
+    // 1e9 only by rounding up, and C refuses to let that touch the seconds.
+    let frac = u64::from(ts.subsec_nanos()) + 500;
+    let usec = frac.min(999_999_999) / 1_000;
+
+    // The whole seconds are formatted from the stamp with a ZERO fraction:
+    // C runs `strftime` on the `tm` and prints the fraction itself, so the
+    // seconds field must never see the rounded-up value.
+    let secs = i64::try_from(ts.unix_secs()).unwrap_or(i64::MAX);
+    let dt: DateTime<Local> = match Local.timestamp_opt(secs, 0).single() {
+        Some(dt) => dt,
+        // Unrepresentable instant: C's `strftime` would print garbage rather
+        // than fail. Nothing on the CA wire can produce one (a u32
+        // `secPastEpoch` tops out in 2106), so fall back to the epoch.
+        None => Local.timestamp_opt(0, 0).unwrap(),
+    };
+    format!("{}.{usec:06}", dt.format("%Y-%m-%d %H:%M:%S"))
+}
 
 /// The value carrier of a CA request DBR code — the type C's
 /// `dbr_size_n(dbrType, nElems)` sizes its buffer from (`db_access.h`).
@@ -512,6 +614,54 @@ pub fn format_value(
     }
 }
 
+/// C `print_time_val_sts`'s VALUE SEGMENT (`tool_lib.c:481-489`) — everything
+/// between the timestamp and the trailing alarm fields, separator included.
+///
+/// This is not the loop [`format_value`] renders. The plain/terse loops write
+/// the count with a TRAILING separator and then JOIN the elements
+/// (`printf("%lu%c", ...)`, then `if (i) printf("%c", ...)`, `caget.c:286-289`).
+/// `print_time_val_sts` instead writes every item — the optional count, each
+/// element, the `-S` long string — as `printf("%c%s", fieldSeparator, item)`:
+/// the separator is a PREFIX.
+///
+/// Two consequences the joined form cannot express, and both are divergences
+/// the port shipped (R13-19):
+///
+/// * the separator belongs to the VALUE, not to the timestamp before it, so an
+///   ABSENT timestamp (`camonitor -t n`) must not swallow it — C prints the
+///   name, then an unconditional separator, then the (possibly empty)
+///   timestamp, then `sep`+value, giving two adjacent separators;
+/// * a value with NO items prints NO separator at all (a never-processed
+///   waveform reports `nElems == 0`, and C's element loop then runs zero
+///   times).
+pub fn format_value_segment(
+    v: &EpicsValue,
+    fmt: &ValueFormat,
+    enum_strings: Option<&[PvString]>,
+    count_prefix: CountPrefix,
+) -> String {
+    let sep = fmt.field_separator;
+    let total = v.count() as usize;
+    let leads = count_prefix.leads(fmt.req_elems != 0, total);
+
+    if total == 0 {
+        return if leads {
+            // `-#` on an empty array: C prints `%c%lu` and the element loop
+            // then runs zero times, so nothing trails the count.
+            format!("{sep}{total}")
+        } else {
+            // No count, no elements: C's loop prints nothing whatsoever.
+            String::new()
+        };
+    }
+    // With at least one item, `sep + join(items, sep)` is byte-for-byte C's
+    // `concat(sep + item)`.
+    format!(
+        "{sep}{body}",
+        body = format_value(v, fmt, enum_strings, count_prefix)
+    )
+}
+
 /// C's element loop alone: every element of the value, capped at `reqElems`
 /// and joined by the `-F` separator. The leading count is NOT emitted here —
 /// [`format_value`] owns it, so scalar and array carriers cannot disagree
@@ -743,13 +893,31 @@ const C_DEFAULT_PRECISION: usize = 6;
 /// (`tool_lib.c:138,150`), so they never reach a limit: `caget -d
 /// DBR_CTRL_DOUBLE -f 9` still prints every limit at 6 significant digits.
 ///
-/// Non-finite limits fall through to C `printf`'s `inf` / `nan` spelling, the
-/// same escape [`format_float`] takes.
+/// Non-finite limits fall through to [`format_non_finite`], the same escape
+/// [`format_float`] takes.
 pub fn format_c_g(x: f64) -> String {
     if !x.is_finite() {
-        return format!("{x}");
+        return format_non_finite(x);
     }
     format_g(x, C_DEFAULT_PRECISION)
+}
+
+/// C `printf`'s spelling of a non-finite double, shared by EVERY conversion —
+/// `%g`, `%f` and `%e` all print the same three words (verified against glibc,
+/// R13-20).
+///
+/// Rust's `{}` agrees on `inf` and `-inf` but prints `NaN` where C prints
+/// `nan`, so `caget` on a NaN-valued `ao` printed `NaN` against C's `nan`.
+/// glibc also carries the SIGN BIT through, printing `-nan` for a negative
+/// NaN; `f64::is_sign_negative` reports exactly that bit.
+///
+/// Every float the tools print — value, array element, and each graphic /
+/// control limit — reaches C's `printf` through one of the two callers here,
+/// so this is the only place the spelling is decided.
+fn format_non_finite(x: f64) -> String {
+    let sign = if x.is_sign_negative() { "-" } else { "" };
+    let word = if x.is_nan() { "nan" } else { "inf" };
+    format!("{sign}{word}")
 }
 
 fn format_float(x: f64, fmt: &ValueFormat) -> String {
@@ -764,9 +932,7 @@ fn format_float(x: f64, fmt: &ValueFormat) -> String {
         return format_int_i64(rounded, fmt.float_style);
     }
     if !x.is_finite() {
-        // C printf prints "nan" / "inf" / "-inf"; Rust matches by
-        // default (`{}` on f64 yields the same lowercase forms).
-        return format!("{x}");
+        return format_non_finite(x);
     }
     let p = fmt.float.precision as usize;
     match fmt.float.style {
@@ -1268,20 +1434,39 @@ mod tests {
         assert_eq!(PV_NAME_WIDTH, 30);
     }
 
-    /// `Duration::from_secs_f64` panics on NaN / +Inf / negative.
-    /// `timeout_duration` must clamp those to the safe default rather
-    /// than panic — the user-supplied value reaches us via clap which
-    /// happily parses "NaN", "inf", "-1" as f64.
+    /// W10-B1. `-w` has THREE states in C, and the port had two: it clamped a
+    /// negative timeout to the default and connected happily, where C's
+    /// deadline is already in the past and the connect fails at once. The
+    /// boundaries of `secs`, one case each:
     #[test]
-    fn timeout_duration_clamps_pathological_floats() {
-        let d = timeout_duration(f64::NAN);
-        assert_eq!(d.as_secs_f64(), DEFAULT_CLI_TIMEOUT_SECS);
-        let d = timeout_duration(f64::INFINITY);
-        assert_eq!(d.as_secs_f64(), DEFAULT_CLI_TIMEOUT_SECS);
-        let d = timeout_duration(f64::NEG_INFINITY);
-        assert_eq!(d.as_secs_f64(), DEFAULT_CLI_TIMEOUT_SECS);
-        let d = timeout_duration(-1.0);
-        assert_eq!(d.as_secs_f64(), DEFAULT_CLI_TIMEOUT_SECS);
+    fn timeout_duration_has_c_s_three_states() {
+        // < 0 — the deadline is in the PAST. C: `ca_pend_io` returns
+        // ECA_TIMEOUT without waiting → `Channel connect timed out`, exit 1.
+        assert_eq!(timeout_duration(-1.0), EXPIRED_TIMEOUT);
+        assert_eq!(timeout_duration(-0.5), EXPIRED_TIMEOUT);
+        assert_eq!(timeout_duration(-1e9), EXPIRED_TIMEOUT);
+        assert_eq!(
+            timeout_duration(f64::NEG_INFINITY),
+            EXPIRED_TIMEOUT,
+            "an infinitely-past deadline is still just past"
+        );
+        // == 0 — wait FOREVER (`ca_pend_io(0)`), not the 1 s default.
+        assert_eq!(timeout_duration(0.0), INDEFINITE_TIMEOUT);
+        assert_eq!(timeout_duration(-0.0), INDEFINITE_TIMEOUT, "C: `-0.0 == 0`");
+        // > 0 — that many seconds.
+        assert_eq!(timeout_duration(2.5).as_secs_f64(), 2.5);
+
+        // `Duration::from_secs_f64` panics on NaN and +Inf and clap hands both
+        // through literally ("-w nan"), so the guard stays. DEVIATION: C's
+        // `-w nan` hangs forever inside `ca_pend_io`; we use the default.
+        assert_eq!(
+            timeout_duration(f64::NAN).as_secs_f64(),
+            DEFAULT_CLI_TIMEOUT_SECS
+        );
+        assert_eq!(
+            timeout_duration(f64::INFINITY).as_secs_f64(),
+            DEFAULT_CLI_TIMEOUT_SECS
+        );
     }
 
     /// Sane positive values pass through unchanged.
@@ -1313,20 +1498,31 @@ mod tests {
         assert_eq!(r.unwrap(), 7);
     }
 
-    /// Env-var path must reject the same pathological set so a
-    /// misconfigured `EPICS_CLI_TIMEOUT` doesn't propagate. Serialised
-    /// because env-var mutation races every other test that consults
-    /// `EPICS_CLI_TIMEOUT` (none today, but #[serial] is cheap insurance).
+    /// The env path is the SAME timeout as `-w` and must fold the same way
+    /// (W10-B1). C `use_ca_timeout_env` sets `caTimeout` to any value
+    /// `epicsScanDouble` accepts, so a negative `EPICS_CLI_TIMEOUT` reaches
+    /// `ca_pend_io` as an expired deadline exactly as `-w -1` does — observed
+    /// on the compiled C: `EPICS_CLI_TIMEOUT=-1 caget TST:AO` prints
+    /// `Channel connect timed out: 'TST:AO' not found.` and exits 1.
+    ///
+    /// Only NaN / inf are held back, and only because
+    /// `Duration::from_secs_f64` panics on them (see `timeout_duration`).
+    /// Serialised because env-var mutation races any other reader.
     #[serial_test::serial]
     #[test]
-    fn env_default_timeout_rejects_nan_inf() {
+    fn env_default_timeout_passes_negatives_through_and_holds_back_nan_inf() {
         // SAFETY: serial_test::serial guarantees no concurrent env access.
         unsafe { std::env::set_var("EPICS_CLI_TIMEOUT", "NaN") };
         assert_eq!(env_default_timeout(), DEFAULT_CLI_TIMEOUT_SECS);
         unsafe { std::env::set_var("EPICS_CLI_TIMEOUT", "inf") };
         assert_eq!(env_default_timeout(), DEFAULT_CLI_TIMEOUT_SECS);
         unsafe { std::env::set_var("EPICS_CLI_TIMEOUT", "-3") };
-        assert_eq!(env_default_timeout(), DEFAULT_CLI_TIMEOUT_SECS);
+        assert_eq!(env_default_timeout(), -3.0, "C keeps the negative");
+        assert_eq!(
+            timeout_duration(env_default_timeout()),
+            EXPIRED_TIMEOUT,
+            "and it resolves to an already-expired deadline"
+        );
         unsafe { std::env::set_var("EPICS_CLI_TIMEOUT", "2.5") };
         assert!((env_default_timeout() - 2.5).abs() < 1e-9);
         unsafe { std::env::remove_var("EPICS_CLI_TIMEOUT") };
@@ -1450,5 +1646,142 @@ mod tests {
             "1 200",
             "C: `caget -# -3 TST:LO` → `1 200`"
         );
+    }
+
+    /// W10-B4. C rounds the nanoseconds into the fractional field and CLAMPS
+    /// so the rounding can never carry into the whole seconds
+    /// (`epicsTime.cpp:233-238`); `chrono`'s `%.6f` truncates. Boundary cases
+    /// of `frac = nsec + 500`, one per boundary rather than one per scenario:
+    #[test]
+    fn microseconds_round_with_c_and_never_carry_into_the_seconds() {
+        // A fixed second whose local rendering we do not depend on: assert
+        // only the fractional field, which is timezone-independent.
+        let frac = |nsec: u32| {
+            let s = format_time(WallTime::from_unix(EPICS_EPOCH_UNIX_SECS + 1, nsec));
+            s.rsplit_once('.')
+                .expect("a fractional field")
+                .1
+                .to_string()
+        };
+        let secs = |nsec: u32| {
+            let s = format_time(WallTime::from_unix(EPICS_EPOCH_UNIX_SECS + 1, nsec));
+            s.rsplit_once('.')
+                .expect("a whole-seconds field")
+                .0
+                .to_string()
+        };
+
+        // Below / at / above the half-microsecond rounding boundary.
+        assert_eq!(frac(1_000), "000001");
+        assert_eq!(frac(1_499), "000001", "rounds down");
+        assert_eq!(frac(1_500), "000002", "rounds up; truncation gave 000001");
+        assert_eq!(frac(1_501), "000002");
+        // Zero and the exact microsecond.
+        assert_eq!(frac(0), "000000");
+        assert_eq!(frac(499), "000000");
+        assert_eq!(frac(500), "000001");
+        // The clamp: rounding up out of range must NOT advance the second.
+        assert_eq!(frac(999_999_499), "999999");
+        assert_eq!(
+            frac(999_999_500),
+            "999999",
+            "C clamps to nSecPerSec-1 rather than carrying"
+        );
+        assert_eq!(frac(999_999_999), "999999");
+        assert_eq!(
+            secs(999_999_999),
+            secs(0),
+            "the whole second is the same on both sides of the clamp"
+        );
+
+        // The rendering this replaced, pinned so the divergence stays visible:
+        // every tool formatted the stamp with `chrono`'s `%.6f`, which
+        // TRUNCATES. On the boundary above it printed one microsecond less
+        // than C.
+        let dt: chrono::DateTime<chrono::Local> =
+            std::time::SystemTime::from(WallTime::from_unix(EPICS_EPOCH_UNIX_SECS + 1, 1_500))
+                .into();
+        assert_eq!(
+            dt.format("%.6f").to_string(),
+            ".000001",
+            "chrono truncates; C rounds to .000002"
+        );
+    }
+
+    /// R13-20. C `printf` spells a non-finite double `nan` / `-nan` / `inf` /
+    /// `-inf` in EVERY conversion (`%g`, `%f`, `%e` — probed against glibc).
+    /// Rust's `{}` agrees on the infinities but prints `NaN`, so the port
+    /// printed `NaN` where C prints `nan`.
+    #[test]
+    fn a_non_finite_double_is_spelled_the_way_c_printf_spells_it() {
+        let plain = ValueFormat::default();
+        let styles = [
+            ("g", FloatStyle::G),
+            ("f", FloatStyle::F),
+            ("e", FloatStyle::E),
+        ];
+        for (name, style) in styles {
+            let fmt = ValueFormat {
+                float: FloatFormat {
+                    style,
+                    precision: 3,
+                },
+                ..plain.clone()
+            };
+            assert_eq!(
+                format_value(
+                    &EpicsValue::Double(f64::NAN),
+                    &fmt,
+                    None,
+                    CountPrefix::Never
+                ),
+                "nan",
+                "-{name}: C prints `nan`, not Rust's `NaN`"
+            );
+            assert_eq!(
+                format_value(
+                    &EpicsValue::Double(f64::INFINITY),
+                    &fmt,
+                    None,
+                    CountPrefix::Never
+                ),
+                "inf",
+                "-{name}"
+            );
+            assert_eq!(
+                format_value(
+                    &EpicsValue::Double(f64::NEG_INFINITY),
+                    &fmt,
+                    None,
+                    CountPrefix::Never
+                ),
+                "-inf",
+                "-{name}"
+            );
+        }
+        // glibc carries the NaN sign bit through: `printf("%g", -NAN)` → `-nan`.
+        assert_eq!(
+            format_value(
+                &EpicsValue::Double(-f64::NAN),
+                &plain,
+                None,
+                CountPrefix::Never
+            ),
+            "-nan"
+        );
+        // A FLOAT reaches the same formatter.
+        assert_eq!(
+            format_value(
+                &EpicsValue::Float(f32::NAN),
+                &plain,
+                None,
+                CountPrefix::Never
+            ),
+            "nan"
+        );
+        // So does every graphic / control limit (`caget -a`, `caget -d
+        // DBR_CTRL_DOUBLE`), which C prints with its own literal `%g`.
+        assert_eq!(format_c_g(f64::NAN), "nan");
+        assert_eq!(format_c_g(f64::NEG_INFINITY), "-inf");
     }
 }

@@ -1,0 +1,155 @@
+//! Peer address → the text libca shows for it.
+//!
+//! Everywhere a CA client names the server it is talking to — `cainfo`'s
+//! `Host:` line (`ca_host_name`), the `host=%s ctx=%s` an exception block
+//! carries — libca prints a REVERSE-RESOLVED host name, not the dotted IP.
+//! The port printed the dotted IP at every one of those sites (W10-B5), so
+//! the divergence is not one line in `cainfo`; it is "the port has no
+//! `ipAddrToA`". This module is that missing function, and the single owner
+//! of the address → text direction.
+//!
+//! Two entry points, because libca has two:
+//!
+//! * [`ip_addr_to_a`] is libcom's `ipAddrToA` (`osiSock.c:92-114`) — a
+//!   synchronous `getnameinfo` that BLOCKS on the resolver. Correct for a
+//!   one-shot tool, which is exactly what C's `ca_host_name` gives a
+//!   connected `cainfo`; must never run on a task that other channels'
+//!   progress depends on, since an IP with no PTR record stalls for the
+//!   resolver's full timeout.
+//! * [`cached_name`] is libca's `hostNameCache` + the process-wide
+//!   `ipAddrToAsciiEngine` singleton (`hostNameCache.cpp`,
+//!   `ipAddrToAsciiEngine.cpp`) — it NEVER blocks: it answers from the cache,
+//!   and on a miss it answers with the dotted IP and resolves in the
+//!   background so the next caller has the name. libca's own asynchronous
+//!   paths (`cac::defaultExcep` → `tcpiiu::getHostName`) print exactly that:
+//!   the dotted IP until the engine has answered, the name afterwards.
+
+use std::net::SocketAddr;
+use std::sync::OnceLock;
+
+use dashmap::DashMap;
+
+/// libcom `ipAddrToA` (`osiSock.c:92-114`): reverse-resolve the address and
+/// return `<name>:<port>`; on ANY resolver failure fall back to
+/// `ipAddrToDottedIP`'s `<a.b.c.d>:<port>`, which is what `SocketAddr`'s
+/// `Display` already writes.
+///
+/// The lookup is libcom's `ipAddrToHostName` (`os/posix/osdSock.c:229-248`):
+/// `getnameinfo` with `NI_NAMEREQD`, so an address with no PTR record is a
+/// failure rather than a stringified IP — that flag is what makes C's
+/// fallback branch reachable at all.
+///
+/// BLOCKING. See the module docs before calling this from a task.
+pub fn ip_addr_to_a(addr: SocketAddr) -> String {
+    match ip_addr_to_host_name(addr) {
+        Some(name) => format!("{name}:{}", addr.port()),
+        None => addr.to_string(),
+    }
+}
+
+/// libcom `ipAddrToHostName`. `None` is C's `return 0` — "no name", which is
+/// the only thing the caller is allowed to distinguish.
+fn ip_addr_to_host_name(addr: SocketAddr) -> Option<String> {
+    // `socket2` owns the `SocketAddr` → `sockaddr` conversion (and its
+    // length), so this module does not hand-roll a `sockaddr_in`.
+    let sa = socket2::SockAddr::from(addr);
+    let mut buf = [0 as libc::c_char; 256];
+    // SAFETY: `sa` outlives the call and reports its own length; `buf` is
+    // `buf.len()` bytes of writable storage. `getnameinfo` NUL-terminates
+    // within that bound or returns non-zero.
+    let rc = unsafe {
+        libc::getnameinfo(
+            sa.as_ptr(),
+            sa.len(),
+            buf.as_mut_ptr(),
+            buf.len() as libc::socklen_t,
+            std::ptr::null_mut(),
+            0,
+            libc::NI_NAMEREQD,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    // SAFETY: `getnameinfo` returned 0, so `buf` holds a NUL-terminated name.
+    let name = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) };
+    let name = name.to_str().ok()?;
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// The resolved names libca's `ipAddrToAsciiEngine` has answered so far.
+/// Process-wide, as it is in libca — the engine is a singleton shared by
+/// every `hostNameCache` in the process.
+fn cache() -> &'static DashMap<SocketAddr, String> {
+    static CACHE: OnceLock<DashMap<SocketAddr, String>> = OnceLock::new();
+    CACHE.get_or_init(DashMap::new)
+}
+
+/// libca `hostNameCache::getName` — the NON-blocking half of this module.
+///
+/// Returns the resolved `<name>:<port>` once the engine has answered, and the
+/// dotted `<ip>:<port>` before that, scheduling the lookup off-task on the
+/// first miss. Never blocks the caller, which is the whole point: the CA
+/// coordinator raises exceptions from the same task that drives every other
+/// channel, and a `getnameinfo` on an address with no PTR record parks that
+/// task for the resolver's full timeout.
+///
+/// Outside a Tokio runtime there is nothing to schedule the lookup on, so the
+/// answer stays the dotted IP — the same degradation libca shows before its
+/// engine has run.
+pub(crate) fn cached_name(addr: SocketAddr) -> String {
+    if let Some(name) = cache().get(&addr) {
+        return name.clone();
+    }
+    if let Ok(rt) = tokio::runtime::Handle::try_current() {
+        rt.spawn(async move {
+            if let Ok(name) = tokio::task::spawn_blocking(move || ip_addr_to_a(addr)).await {
+                cache().insert(addr, name);
+            }
+        });
+    }
+    addr.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `127.0.0.1` reverse-resolves through `/etc/hosts` on every platform the
+    /// CA tools run on, and C's `cainfo` prints `Host: localhost:5064` for a
+    /// softIoc on the loopback. The port must produce the same shape:
+    /// the NAME, then `:`, then the port — never the dotted IP.
+    #[test]
+    fn loopback_resolves_to_a_name_and_keeps_the_port() {
+        let a: SocketAddr = "127.0.0.1:5064".parse().unwrap();
+        let got = ip_addr_to_a(a);
+        let (name, port) = got.rsplit_once(':').expect("`<host>:<port>`");
+        assert_eq!(port, "5064");
+        // Not asserting `localhost` literally: the PTR for 127.0.0.1 is the
+        // host's own `/etc/hosts`, and a machine is free to name it otherwise.
+        // What C guarantees — and the port broke — is that it is a NAME.
+        assert_ne!(
+            name, "127.0.0.1",
+            "reverse resolution did not happen: {got}"
+        );
+        assert!(!name.is_empty());
+    }
+
+    /// C's fallback: `ipAddrToHostName` fails (`NI_NAMEREQD` with no PTR) and
+    /// `ipAddrToA` falls back to `ipAddrToDottedIP`, port included. `192.0.2.0/24`
+    /// is TEST-NET-1 (RFC 5737) — reserved for documentation, so it has no PTR
+    /// record anywhere.
+    #[test]
+    fn an_unresolvable_address_falls_back_to_the_dotted_ip() {
+        let a: SocketAddr = "192.0.2.1:5064".parse().unwrap();
+        assert_eq!(ip_addr_to_a(a), "192.0.2.1:5064");
+    }
+
+    /// The non-blocking half answers immediately on a cold cache — with the
+    /// dotted IP, as libca does before its engine replies.
+    #[tokio::test]
+    async fn the_cache_answers_without_blocking_on_a_miss() {
+        let a: SocketAddr = "192.0.2.2:5064".parse().unwrap();
+        assert_eq!(cached_name(a), "192.0.2.2:5064");
+    }
+}

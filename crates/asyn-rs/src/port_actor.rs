@@ -851,6 +851,7 @@ impl PortActor {
             | RequestOp::PushDelayInterpose { .. }
             | RequestOp::PushEosInterpose { .. }
             | RequestOp::PushFlushInterpose { .. }
+            | RequestOp::SetTimeStampSource { .. }
             | RequestOp::BlockProcess
             | RequestOp::UnblockProcess
             | RequestOp::ShutdownPort
@@ -1554,6 +1555,32 @@ impl PortActor {
                     )),
                 );
                 Ok(RequestResult::write_ok())
+            }
+            RequestOp::SetTimeStampSource { name } => {
+                // C `registerTimeStampSource` / `unregisterTimeStampSource`
+                // (asynManager.c:333-334). The actor owns the driver, so the
+                // swap lands between transfers — a value being stamped right
+                // now finishes on the source it started with.
+                match name {
+                    Some(n) => match crate::timestamp::find_time_stamp_source(n) {
+                        Some(source) => {
+                            self.driver
+                                .base_mut()
+                                .register_timestamp_source(move || source());
+                            Ok(RequestResult::write_ok())
+                        }
+                        // C prints "cannot find function %s" and refuses
+                        // (asynShellCommands.c:1198-1201).
+                        None => Err(AsynError::Status {
+                            status: AsynStatus::Error,
+                            message: format!("cannot find time-stamp source '{n}'"),
+                        }),
+                    },
+                    None => {
+                        self.driver.base_mut().unregister_timestamp_source();
+                        Ok(RequestResult::write_ok())
+                    }
+                }
             }
             RequestOp::GetConnected => {
                 // C `pasynManager->isConnected`: the transport state the driver

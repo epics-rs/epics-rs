@@ -297,6 +297,17 @@ pub enum RequestOp {
         process_in: bool,
         process_out: bool,
     },
+    /// Set (or clear) the port's time-stamp source by NAME. C parity:
+    /// `asynRegisterTimeStampSource(portName, functionName)` /
+    /// `asynUnregisterTimeStampSource(portName)` (asynShellCommands.c:1181-1223)
+    /// — C resolves the name through `registryFunctionFind` and hands the
+    /// function to `pasynManager->registerTimeStampSource`. The NAME travels,
+    /// not the function: that is what makes it resolvable on the far side of a
+    /// remote port, exactly as C resolves it in the IOC's own registry.
+    /// `None` = unregister (back to the driver's default clock).
+    SetTimeStampSource {
+        name: Option<String>,
+    },
     /// Install the flush-timeout interpose on the addressed device's octet
     /// stack. C parity: `asynInterposeFlushConfig(portName, addr, timeout)`
     /// (`asynInterposeFlush.c:66-91`); C's shell argument is in milliseconds

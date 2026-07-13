@@ -701,6 +701,192 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
         ));
     }
 
+    // asynShowOption portName addr key ------------------------------------
+    // C asynShellCommands.c:154-190 — the read half of asynSetOption. It prints
+    // `key=value` (:184) and reaches the driver through the same queued option
+    // call, so a port whose device is not up yet still answers.
+    {
+        let mgr_r = mgr.clone();
+        out.push(CommandDef::new(
+            "asynShowOption",
+            vec![
+                ArgDesc {
+                    name: "portName",
+                    arg_type: ArgType::String,
+                    optional: false,
+                },
+                ArgDesc {
+                    name: "addr",
+                    arg_type: ArgType::Int,
+                    optional: false,
+                },
+                ArgDesc {
+                    name: "key",
+                    arg_type: ArgType::String,
+                    optional: false,
+                },
+            ],
+            "asynShowOption portName addr key - print one driver option",
+            move |args: &[ArgValue], ctx: &CommandContext| {
+                let port = arg_str(args, 0).ok_or_else(|| "portName required".to_string())?;
+                let addr = arg_int(args, 1).unwrap_or(0) as i32;
+                let Some(key) = arg_str(args, 2) else {
+                    // C: "Missing key argument" (:160-163).
+                    ctx.println("Missing key argument");
+                    return Ok(CommandOutcome::Continue);
+                };
+                let user = AsynUser::default()
+                    .with_addr(addr)
+                    .with_timeout(SHELL_IO_TIMEOUT)
+                    .queue_even_if_not_connected();
+                match mgr_r.find_port_handle(&port) {
+                    Ok(handle) => match handle.get_option_blocking(user, &key) {
+                        Ok(value) => ctx.println(&format!("{key}={value}")),
+                        Err(e) => ctx.println(&format!("getOption failed {e}")),
+                    },
+                    Err(e) => ctx.println(&format!("asynShowOption: {e}")),
+                }
+                Ok(CommandOutcome::Continue)
+            },
+        ));
+    }
+
+    // asynSetTraceIOTruncateSize portName addr size -----------------------
+    {
+        let mgr_r = mgr.clone();
+        out.push(CommandDef::new(
+            "asynSetTraceIOTruncateSize",
+            vec![
+                ArgDesc {
+                    name: "portName",
+                    arg_type: ArgType::String,
+                    optional: false,
+                },
+                ArgDesc {
+                    name: "addr",
+                    arg_type: ArgType::Int,
+                    optional: false,
+                },
+                ArgDesc {
+                    name: "size",
+                    arg_type: ArgType::Int,
+                    optional: false,
+                },
+            ],
+            "asynSetTraceIOTruncateSize portName addr size - bytes of each I/O to trace",
+            move |args: &[ArgValue], _ctx: &CommandContext| {
+                let port = arg_str(args, 0).filter(|s| !s.is_empty());
+                let addr = arg_int(args, 1).unwrap_or(-1) as i32;
+                let size = arg_int(args, 2).unwrap_or(0).max(0) as usize;
+                let trace = mgr_r.trace_manager();
+                // Same addr routing as the trace-mask setters: C connects the
+                // asynUser to (port, addr) first, so `addr >= 0` writes the
+                // device's dpCommon and `addr < 0` the port's
+                // (asynManager.c:2929-2957 via findTracePvt).
+                match port.as_deref() {
+                    Some(p) if addr >= 0 => trace.set_device_io_truncate_size(p, addr, size),
+                    Some(p) => trace.set_io_truncate_size(Some(p), size),
+                    None => trace.set_io_truncate_size(None, size),
+                }
+                Ok(CommandOutcome::Continue)
+            },
+        ));
+    }
+
+    // asynRegisterTimeStampSource portName functionName --------------------
+    {
+        let mgr_r = mgr.clone();
+        out.push(CommandDef::new(
+            "asynRegisterTimeStampSource",
+            vec![
+                ArgDesc {
+                    name: "portName",
+                    arg_type: ArgType::String,
+                    optional: false,
+                },
+                ArgDesc {
+                    name: "functionName",
+                    arg_type: ArgType::String,
+                    optional: false,
+                },
+            ],
+            "asynRegisterTimeStampSource portName functionName - stamp this port's values with \
+             the named source",
+            move |args: &[ArgValue], ctx: &CommandContext| {
+                let (Some(port), Some(function)) = (
+                    arg_str(args, 0).filter(|s| !s.is_empty()),
+                    arg_str(args, 1).filter(|s| !s.is_empty()),
+                ) else {
+                    // C's usage line (asynShellCommands.c:1187-1190).
+                    ctx.println("Usage: asynRegisterTimeStampSource portName functionName");
+                    return Ok(CommandOutcome::Continue);
+                };
+                match mgr_r.find_port_handle(&port) {
+                    Ok(handle) => {
+                        if let Err(e) = handle.set_time_stamp_source_blocking(Some(&function)) {
+                            ctx.println(&format!("asynRegisterTimeStampSource: {e}"));
+                        }
+                    }
+                    Err(_) => ctx.println(&format!(
+                        "asynRegisterTimeStampSource, cannot connect to port {port}"
+                    )),
+                }
+                Ok(CommandOutcome::Continue)
+            },
+        ));
+    }
+
+    // asynUnregisterTimeStampSource portName -------------------------------
+    {
+        let mgr_r = mgr.clone();
+        out.push(CommandDef::new(
+            "asynUnregisterTimeStampSource",
+            vec![ArgDesc {
+                name: "portName",
+                arg_type: ArgType::String,
+                optional: false,
+            }],
+            "asynUnregisterTimeStampSource portName - back to the port's default clock",
+            move |args: &[ArgValue], ctx: &CommandContext| {
+                let Some(port) = arg_str(args, 0).filter(|s| !s.is_empty()) else {
+                    ctx.println("Usage: asynUnregisterTimeStampSource portName");
+                    return Ok(CommandOutcome::Continue);
+                };
+                match mgr_r.find_port_handle(&port) {
+                    Ok(handle) => {
+                        if let Err(e) = handle.set_time_stamp_source_blocking(None) {
+                            ctx.println(&format!("asynUnregisterTimeStampSource: {e}"));
+                        }
+                    }
+                    Err(_) => ctx.println(&format!(
+                        "asynUnregisterTimeStampSource, cannot connect to port {port}"
+                    )),
+                }
+                Ok(CommandOutcome::Continue)
+            },
+        ));
+    }
+
+    // asynSetMinTimerPeriod period ----------------------------------------
+    // C implements this only under `_WIN32` (asynShellCommands.c:1226-1257,
+    // `timeBeginPeriod`); on every other OS the body is a single printf saying
+    // so and a -1 return (:1259-1263). The command must still EXIST — an
+    // st.cmd that carries the line has to keep running — so it is registered
+    // with C's message. Not a stub: it is what C does on this platform.
+    out.push(CommandDef::new(
+        "asynSetMinTimerPeriod",
+        vec![ArgDesc {
+            name: "minimum period",
+            arg_type: ArgType::Double,
+            optional: false,
+        }],
+        "asynSetMinTimerPeriod period - Windows-only timer resolution (no effect here)",
+        move |_args: &[ArgValue], ctx: &CommandContext| {
+            ctx.println("asynSetMinTimerPeriod is not currently supported on this OS");
+            Ok(CommandOutcome::Continue)
+        },
+    ));
+
     // asynWaitConnect portName timeout ------------------------------------
     // C asynShellCommands.c (asynWaitConnect) → pasynManager->waitConnect
     // (asynManager.c:3292-3336). The st.cmd line that follows a
@@ -1786,6 +1972,11 @@ mod tests {
             "asynAutoConnect",
             "asynWaitConnect",
             "asynSetAutoConnectTimeout",
+            "asynShowOption",
+            "asynSetTraceIOTruncateSize",
+            "asynRegisterTimeStampSource",
+            "asynUnregisterTimeStampSource",
+            "asynSetMinTimerPeriod",
             "asynOctetSetInputEos",
             "asynOctetGetInputEos",
             "asynOctetSetOutputEos",
@@ -1803,6 +1994,137 @@ mod tests {
         ];
         expected.sort_unstable();
         assert_eq!(names, expected);
+    }
+
+    /// R19-120: `asynSetTraceIOTruncateSize` routes `addr` the way every other
+    /// trace setter does — device dpCommon when `addr >= 0`, port when `addr <
+    /// 0` (C asynManager.c:2929-2957 via `findTracePvt`).
+    #[test]
+    fn iocsh_set_trace_io_truncate_size_routes_addr_to_the_device() {
+        let mgr = fresh_mgr_with_port("trunc_port");
+        let trace = mgr.trace_manager().clone();
+        let cmds = build_asyn_commands(mgr);
+        let ctx = make_ctx();
+        let set = |addr: i64, size: i64| {
+            cmds.iter()
+                .find(|c| c.name == "asynSetTraceIOTruncateSize")
+                .expect("asynSetTraceIOTruncateSize must be registered")
+                .handler
+                .call(
+                    &[
+                        ArgValue::String("trunc_port".into()),
+                        ArgValue::Int(addr),
+                        ArgValue::Int(size),
+                    ],
+                    &ctx,
+                )
+                .unwrap();
+        };
+
+        set(-1, 40);
+        assert_eq!(trace.snapshot("trunc_port", None).io_truncate_size, 40);
+
+        // addr >= 0 writes the device, not the port.
+        set(2, 4096);
+        assert_eq!(trace.snapshot("trunc_port", Some(2)).io_truncate_size, 4096);
+        assert_eq!(trace.snapshot("trunc_port", None).io_truncate_size, 40);
+    }
+
+    /// R19-120: `asynShowOption` prints `key=value` for a driver option
+    /// (C asynShellCommands.c:184), and reports the driver's error otherwise.
+    #[test]
+    fn iocsh_show_option_reads_back_what_set_option_wrote() {
+        let mgr = fresh_mgr_with_port("show_opt");
+        let handle = mgr.find_port_handle("show_opt").unwrap();
+        handle
+            .set_option_blocking(AsynUser::default(), "baud", "115200")
+            .unwrap();
+
+        let cmds = build_asyn_commands(mgr);
+        let ctx = make_ctx();
+        cmds.iter()
+            .find(|c| c.name == "asynShowOption")
+            .expect("asynShowOption must be registered")
+            .handler
+            .call(
+                &[
+                    ArgValue::String("show_opt".into()),
+                    ArgValue::Int(0),
+                    ArgValue::String("baud".into()),
+                ],
+                &ctx,
+            )
+            .unwrap();
+
+        // The option really is readable through the same path the command uses.
+        assert_eq!(
+            handle
+                .get_option_blocking(AsynUser::default(), "baud")
+                .unwrap(),
+            "115200"
+        );
+    }
+
+    /// R19-120 boundary: `asynRegisterTimeStampSource` installs a source that
+    /// was published under that name, refuses one that was not, and
+    /// `asynUnregisterTimeStampSource` puts the port back on its default clock.
+    ///
+    /// C resolves the name through `registryFunctionFind` and refuses when it
+    /// is not there (asynShellCommands.c:1197-1201) — an unknown name must not
+    /// silently install nothing.
+    #[test]
+    fn iocsh_time_stamp_source_is_installed_by_name_and_refused_when_unknown() {
+        use crate::timestamp::{find_time_stamp_source, register_time_stamp_source};
+        use std::time::{Duration as StdDuration, UNIX_EPOCH};
+
+        let fixed = UNIX_EPOCH + StdDuration::from_secs(1_234_567);
+        register_time_stamp_source("iocsh_fixed_clock", move || fixed);
+
+        let mgr = fresh_mgr_with_port("ts_port");
+        let handle = mgr.find_port_handle("ts_port").unwrap();
+        let cmds = build_asyn_commands(mgr);
+        let ctx = make_ctx();
+        let register = |name: &str| {
+            cmds.iter()
+                .find(|c| c.name == "asynRegisterTimeStampSource")
+                .expect("asynRegisterTimeStampSource must be registered")
+                .handler
+                .call(
+                    &[
+                        ArgValue::String("ts_port".into()),
+                        ArgValue::String(name.into()),
+                    ],
+                    &ctx,
+                )
+                .unwrap();
+        };
+
+        // A name nobody published does not resolve — the command reports it and
+        // the port keeps its default clock.
+        assert!(find_time_stamp_source("no_such_clock").is_none());
+        register("no_such_clock");
+        assert!(
+            handle
+                .set_time_stamp_source_blocking(Some("no_such_clock"))
+                .is_err()
+        );
+
+        // A published name installs.
+        register("iocsh_fixed_clock");
+        assert!(
+            handle
+                .set_time_stamp_source_blocking(Some("iocsh_fixed_clock"))
+                .is_ok()
+        );
+
+        // And unregistering is accepted (back to the driver's own clock).
+        cmds.iter()
+            .find(|c| c.name == "asynUnregisterTimeStampSource")
+            .expect("asynUnregisterTimeStampSource must be registered")
+            .handler
+            .call(&[ArgValue::String("ts_port".into())], &ctx)
+            .unwrap();
+        assert!(handle.set_time_stamp_source_blocking(None).is_ok());
     }
 
     /// R19-117 boundary: `asynWaitConnect` returns as soon as the port is

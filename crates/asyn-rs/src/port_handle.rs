@@ -1091,6 +1091,21 @@ impl PortHandle {
         Ok(())
     }
 
+    /// Set the port's time-stamp source to the named one, or clear it with
+    /// `None` — C `asynRegisterTimeStampSource` /
+    /// `asynUnregisterTimeStampSource`. The name must have been published with
+    /// [`crate::timestamp::register_time_stamp_source`], C's
+    /// `registryFunctionAdd`.
+    pub fn set_time_stamp_source_blocking(&self, name: Option<&str>) -> AsynResult<()> {
+        self.submit_blocking(
+            RequestOp::SetTimeStampSource {
+                name: name.map(str::to_string),
+            },
+            AsynUser::default(),
+        )?;
+        Ok(())
+    }
+
     // --- asynGpib convenience methods ---
     //
     // C's `pasynGpib` is a global vtable a gpib-aware user calls after

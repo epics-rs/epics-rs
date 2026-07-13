@@ -115,6 +115,9 @@ impl From<&RequestOp> for PortCommand {
             RequestOp::Report { level } => Self::Report { level: *level },
             RequestOp::SetInputEos { eos } => Self::SetInputEos { eos: eos.clone() },
             RequestOp::SetOutputEos { eos } => Self::SetOutputEos { eos: eos.clone() },
+            RequestOp::SetTimeStampSource { name } => {
+                Self::SetTimeStampSource { name: name.clone() }
+            }
             RequestOp::GetInputEos => Self::GetInputEos,
             RequestOp::GetOutputEos => Self::GetOutputEos,
             RequestOp::GpibUniversalCmd { cmd } => Self::GpibUniversalCmd { cmd: *cmd },
@@ -250,6 +253,9 @@ impl From<&PortCommand> for RequestOp {
             PortCommand::Report { level } => Self::Report { level: *level },
             PortCommand::SetInputEos { eos } => Self::SetInputEos { eos: eos.clone() },
             PortCommand::SetOutputEos { eos } => Self::SetOutputEos { eos: eos.clone() },
+            PortCommand::SetTimeStampSource { name } => {
+                Self::SetTimeStampSource { name: name.clone() }
+            }
             PortCommand::GetInputEos => Self::GetInputEos,
             PortCommand::GetOutputEos => Self::GetOutputEos,
             PortCommand::GpibUniversalCmd { cmd } => Self::GpibUniversalCmd { cmd: *cmd },

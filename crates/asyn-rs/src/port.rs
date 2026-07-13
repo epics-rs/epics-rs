@@ -979,6 +979,12 @@ impl PortDriverBase {
         self.timestamp_source = Some(Arc::new(source));
     }
 
+    /// Drop a registered source — C `unregisterTimeStampSource`
+    /// (asynManager.c:334), which restores `defaultTimeStampSource` (:332).
+    pub fn unregister_timestamp_source(&mut self) {
+        self.timestamp_source = None;
+    }
+
     /// Get current timestamp from the registered source, or SystemTime::now().
     pub fn current_timestamp(&self) -> SystemTime {
         self.timestamp_source

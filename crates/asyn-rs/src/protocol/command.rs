@@ -178,6 +178,11 @@ pub enum PortCommand {
     PushFlushInterpose {
         flush_timeout_secs: f64,
     },
+    /// Set or clear the port's time-stamp source by name — C
+    /// `asynRegisterTimeStampSource` / `asynUnregisterTimeStampSource`.
+    SetTimeStampSource {
+        name: Option<String>,
+    },
     /// Read back the driver's input EOS — C `pasynOctet->getInputEos`.
     /// Appended last: the variant order is the wire encoding.
     GetInputEos,
@@ -273,6 +278,9 @@ mod tests {
             },
             PortCommand::PushFlushInterpose {
                 flush_timeout_secs: 0.05,
+            },
+            PortCommand::SetTimeStampSource {
+                name: Some("myTimeStamp".into()),
             },
             PortCommand::GetInputEos,
             PortCommand::GetOutputEos,

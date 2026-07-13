@@ -577,42 +577,46 @@ struct TimestampSpec {
     kind: TimestampKind,
 }
 
-/// Parse a `-t <key>`. C `case 't'` resets both sources to 0 then sets
-/// them from the letters; `s`/`c` pick source(s), `r`/`i`/`I` pick the
-/// kind, `n` and unknown letters are no-ops (a kind with no source prints
-/// nothing — the usage note "'r','i','I' require 's' or 'c'"). With no
-/// `-t` at all the C globals default to server + absolute.
+/// Parse a `-t <key>`. `s`/`c` pick the source(s), `r`/`i`/`I` the kind, `n` is
+/// silent, an unknown letter warns (R13-18); a kind with no source prints
+/// nothing — the usage note "'r','i','I' require 's' or 'c'".
+///
+/// The two axes have DIFFERENT lifetimes in C, because they are two separate
+/// globals and `case 't'` resets only one pair (`camonitor.c:236-237`):
+///
+/// * `tsSrcServer`/`tsSrcClient` — zeroed at the top of EVERY `-t`, so only the
+///   letters of the last occurrence choose the source(s);
+/// * `tsType` — never reset, so a kind survives every later `-t` that does not
+///   name a kind of its own. `camonitor -t r -t s` is a SERVER RELATIVE stamp
+///   (`tool_lib.c:45-47` are the initial values: server, absolute).
 fn parse_timestamp_spec(scan: &mut copt::Scan, id: &str) -> TimestampSpec {
-    // C's globals before the loop: server source, absolute kind.
-    let mut spec = TimestampSpec {
-        server: true,
-        client: false,
-        kind: TimestampKind::Absolute,
-    };
-    // EVERY occurrence re-runs the case (both sources reset to 0 first), so the
-    // last one decides — and each is scanned, which is what makes its warnings
-    // appear at its own position.
+    // C `tool_lib.c:45-47`, the globals as they stand before the getopt loop.
+    let mut server = true;
+    let mut client = false;
+    // Declared OUTSIDE the occurrence loop, exactly as C declares it outside the
+    // getopt loop: no `-t` resets it, so its value is sticky.
+    let mut kind = TimestampKind::Absolute;
+
     for (at, k) in scan
         .occurrences(id)
         .into_iter()
         .map(|(at, s)| (at, s.to_string()))
         .collect::<Vec<_>>()
     {
-        spec = TimestampSpec {
-            server: false,
-            client: false,
-            kind: TimestampKind::Absolute,
-        };
+        // The whole of `case 't'`'s reset (`camonitor.c:236-237`) — the sources,
+        // and nothing else.
+        server = false;
+        client = false;
         for c in k.chars() {
             match c {
-                's' => spec.server = true,
-                'c' => spec.client = true,
+                's' => server = true,
+                'c' => client = true,
                 // `case 'n': break;` — the ONLY letter C accepts silently
                 // without acting on it (`camonitor.c:246`).
                 'n' => {}
-                'r' => spec.kind = TimestampKind::Relative,
-                'i' => spec.kind = TimestampKind::IncrAll,
-                'I' => spec.kind = TimestampKind::IncrChan,
+                'r' => kind = TimestampKind::Relative,
+                'i' => kind = TimestampKind::IncrAll,
+                'I' => kind = TimestampKind::IncrChan,
                 // C's `default:` inside the per-character switch
                 // (`camonitor.c:249-251`): every letter it does not know warns
                 // and is skipped — the scan continues, so `-t xsy` still selects
@@ -624,7 +628,11 @@ fn parse_timestamp_spec(scan: &mut copt::Scan, id: &str) -> TimestampSpec {
             }
         }
     }
-    spec
+    TimestampSpec {
+        server,
+        client,
+        kind,
+    }
 }
 
 /// Mutable timestamp state threaded through [`render_timestamp`], one
@@ -849,6 +857,45 @@ mod tests {
         // last one decides — `-t c -t s` is server-only, not both.
         let s = spec_of(&["-t", "c", "-t", "s"]);
         assert!(s.server && !s.client, "the last -t resets and re-sets");
+    }
+
+    /// W11-B7: `case 't'` resets the two SOURCE globals and nothing else
+    /// (`camonitor.c:236-237`). `tsType` is a third global that no `-t` ever
+    /// zeroes (`tool_lib.c:45`), so a kind chosen by one occurrence survives
+    /// every later occurrence that does not name a kind of its own — the two
+    /// axes have different lifetimes, and the port used to reset them together.
+    #[test]
+    fn a_later_t_resets_the_source_but_never_the_kind() {
+        // The kind survives a later `-t` that only names a source.
+        let s = spec_of(&["-t", "r", "-t", "s"]);
+        assert!(
+            s.server && !s.client && matches!(s.kind, TimestampKind::Relative),
+            "`-t r -t s` is a SERVER RELATIVE stamp: 's' reset the sources, \
+             `tsType` was left alone"
+        );
+
+        // ... and so does an incremental kind, through two later occurrences.
+        let s = spec_of(&["-t", "I", "-t", "c", "-t", "s"]);
+        assert!(
+            s.server && !s.client && matches!(s.kind, TimestampKind::IncrChan),
+            "no `-t` resets `tsType`, however many follow"
+        );
+
+        // A later occurrence that DOES name a kind overwrites it, as its
+        // `case 'r'`/`'i'`/`'I'` assignment would.
+        let s = spec_of(&["-t", "r", "-t", "si"]);
+        assert!(
+            s.server && matches!(s.kind, TimestampKind::IncrAll),
+            "the later kind wins where one is given"
+        );
+
+        // The sources, by contrast, ARE zeroed by every occurrence: the 'c' of
+        // the first `-t` does not survive the second.
+        let s = spec_of(&["-t", "c", "-t", "r"]);
+        assert!(
+            !s.server && !s.client && matches!(s.kind, TimestampKind::Relative),
+            "`-t c -t r` leaves NO source selected (C prints no stamp column)"
+        );
     }
 
     /// R13-18: `case 't'` switches on EVERY character of `optarg` and its

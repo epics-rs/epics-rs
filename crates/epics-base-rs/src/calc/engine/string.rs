@@ -603,10 +603,6 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     // time.
                     stack.push(StackValue::str(s));
                 }
-                StringOp::StoreStringVar(idx) => {
-                    let v = pop1(&mut stack)?;
-                    inputs.str_vars[*idx as usize] = v.into_string_value();
-                }
                 StringOp::ToString => {
                     // C TO_STRING (sCalcPerform.c:1516-1519) is `toString(ps)`,
                     // no more — the one conversion, not a formatter of its own.

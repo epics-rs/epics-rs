@@ -33,7 +33,6 @@ pub enum ExprKind {
 pub struct CompiledExpr {
     pub code: Vec<Opcode>,
     pub kind: ExprKind,
-    pub loop_pairs: Vec<(usize, usize)>,
     /// C's `USES_STRING` marker — the byte `sCalcPostfix` writes at the head of
     /// the postfix, and the ONLY thing `sCalcPerform` looks at to choose between
     /// its two evaluators (`sCalcPerform.c:399`).
@@ -70,7 +69,6 @@ impl CompiledExpr {
         Self {
             code: Vec::new(),
             kind,
-            loop_pairs: Vec::new(),
             // C writes `NO_STRING` first and only overwrites it when an element
             // says otherwise (`sCalcPostfix.c:437`); the empty program has no
             // elements. It is refused before the marker is ever read, anyway.

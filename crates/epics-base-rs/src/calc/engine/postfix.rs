@@ -919,7 +919,6 @@ pub fn compile(tokens: &[Token], kind: ExprKind) -> Result<CompiledExpr, CalcErr
     Ok(CompiledExpr {
         code: output,
         kind,
-        loop_pairs: Vec::new(),
         uses_string,
     })
 }

@@ -111,11 +111,10 @@ pub enum StringOp {
     /// verbatim (`sCalcPostfix.c:808`) — raw, un-decoded, backslashes intact.
     /// `$T` / `TR_ESC` is the only translator.
     PushString(Vec<u8>),
-    StoreStringVar(u8), // AA..LL string store
-    ToString,           // STR: number→string
-    ToDouble,           // DBL: string→number
-    Len,                // string length
-    Byte,               // first char ASCII value
+    ToString, // STR: number→string
+    ToDouble, // DBL: string→number
+    Len,      // string length
+    Byte,     // first char ASCII value
     // Phase 2B: Advanced
     TrEsc,
     Esc,

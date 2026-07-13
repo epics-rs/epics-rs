@@ -43,10 +43,18 @@ pub fn last(occurrences: &[String]) -> Option<&str> {
     occurrences.last().map(String::as_str)
 }
 
-/// Every option a C tool declares must survive a repeat, because `getopt(3)`
-/// cannot fail one. This walks the clap spec and rejects any option that
-/// would: a `Set`/`SetTrue` action makes the second occurrence a clap usage
-/// error, which is a divergence no test of the option's *value* can catch.
+/// Every option a C tool declares must survive two things `getopt(3)` cannot
+/// fail: a repeat, and an option-argument that begins with `-`. This walks the
+/// clap spec and rejects any option that would.
+///
+/// A `Set`/`SetTrue` action makes the second occurrence a clap usage error. A
+/// value option without `allow_hyphen_values` makes `-s -1` one: clap reads the
+/// `-1` as an unknown option and exits 2, where `getopt` hands the next `argv`
+/// entry over verbatim, `-` and all, and the `case` arm decides what it means
+/// (`cainfo.c:167-172` scans `-1` with `%u` and gets a status level;
+/// `caget.c:486-494` and `camonitor.c:285-300` reject the string with a warning
+/// and carry on). Either way the tool must reach its own resolver, so clap may
+/// never type-check an option's argument — that job belongs to this module.
 ///
 /// It panics rather than warns because the failure is a DECLARATION bug, not
 /// a user input: every binary and every `cli_*` integration test runs
@@ -57,6 +65,17 @@ fn assert_repeatable(cmd: &clap::Command) {
     for a in cmd.get_arguments() {
         if a.is_positional() {
             continue;
+        }
+        let takes_value = matches!(a.get_action(), ArgAction::Set | ArgAction::Append);
+        if takes_value && !a.is_allow_hyphen_values_set() {
+            panic!(
+                "option '{id}' takes a value but is not declared \
+                 `allow_hyphen_values = true`, so clap would reject an argument that begins \
+                 with '-' before the tool ever sees it; C's getopt passes it through. Declare \
+                 it `allow_hyphen_values = true` and let the resolver in epics_ca_rs::copt \
+                 decide whether the value is valid.",
+                id = a.get_id()
+            );
         }
         match a.get_action() {
             // Repeatable: the resolvers here fold the occurrence list.
@@ -823,7 +842,23 @@ mod tests {
         let cmd = clap::Command::new("caget").arg(
             clap::Arg::new("wait")
                 .short('w')
+                .allow_hyphen_values(true)
                 .action(clap::ArgAction::Set),
+        );
+        assert_repeatable(&cmd);
+    }
+
+    /// `getopt(3)` never inspects `optarg`: `caget -w -1` gives `case 'w'` the
+    /// string `"-1"`. Without `allow_hyphen_values` clap reads the `-1` as an
+    /// option of its own and the tool dies on an unrecognized-option error it
+    /// should never reach, so the spec must refuse that declaration too.
+    #[test]
+    #[should_panic(expected = "clap would reject an argument that begins with '-'")]
+    fn a_value_option_that_clap_can_type_check_is_rejected_at_the_spec() {
+        let cmd = clap::Command::new("caget").arg(
+            clap::Arg::new("wait")
+                .short('w')
+                .action(clap::ArgAction::Append),
         );
         assert_repeatable(&cmd);
     }
@@ -835,6 +870,7 @@ mod tests {
             .arg(
                 clap::Arg::new("wait")
                     .short('w')
+                    .allow_hyphen_values(true)
                     .action(clap::ArgAction::Append),
             )
             .arg(

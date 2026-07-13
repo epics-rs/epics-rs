@@ -48,7 +48,13 @@ struct Args {
     /// CA event mask `<msk>`: any combination of `v` (value), `a`
     /// (alarm), `l` (log/archive), `p` (property). The subscription is
     /// issued with the resulting DBE_* mask; absent → value+log+alarm.
-    #[arg(short = 'm', long, value_name = "MASK", action = clap::ArgAction::Append)]
+    #[arg(
+        short = 'm',
+        long,
+        value_name = "MASK",
+        allow_hyphen_values = true,
+        action = clap::ArgAction::Append
+    )]
     event_mask: Vec<String>,
 
     /// CA priority (`sscanf("%u")`, clamped to `CA_PRIORITY_MAX`; `-p -1`
@@ -61,7 +67,13 @@ struct Args {
     /// Kind: `n`=none, `r`=relative since program start, `i`=incremental
     /// across all channels, `I`=incremental per channel. `r`/`i`/`I`
     /// require `s` or `c`. Sources combine, e.g. `-t sc`, `-t cr`.
-    #[arg(short = 't', long = "timestamp", value_name = "KEY", action = clap::ArgAction::Append)]
+    #[arg(
+        short = 't',
+        long = "timestamp",
+        value_name = "KEY",
+        allow_hyphen_values = true,
+        action = clap::ArgAction::Append
+    )]
     timestamp_key: Vec<String>,
 
     #[arg(short = 'n', long = "num-enum", action = clap::ArgAction::Count)]
@@ -117,14 +129,24 @@ struct Args {
     /// getopt option TAKING AN ARGUMENT (`camonitor.c:224`
     /// `"...g:l:#:0:w:..."`), so it is `-0` with an attached or separate
     /// `<base>` — never a `--0x`-style flag, which no C script can pass.
-    #[arg(short = '0', value_name = "BASE", action = clap::ArgAction::Append)]
+    #[arg(
+        short = '0',
+        value_name = "BASE",
+        allow_hyphen_values = true,
+        action = clap::ArgAction::Append
+    )]
     int_base: Vec<String>,
 
     /// `-l<base>`: round a float to a long and print it in base `x`/`o`/`b`
     /// (C `outTypeF`). Same option shape as `-0` (`camonitor.c:224`).
     /// Unlike `caget`, `camonitor` has no `-d`, so `-0` here forces no DBR
     /// type (`camonitor.c:337`).
-    #[arg(short = 'l', value_name = "BASE", action = clap::ArgAction::Append)]
+    #[arg(
+        short = 'l',
+        value_name = "BASE",
+        allow_hyphen_values = true,
+        action = clap::ArgAction::Append
+    )]
     float_base: Vec<String>,
 
     /// Alternate output field separator: C takes `(char) *optarg`, the FIRST

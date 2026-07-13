@@ -35,7 +35,13 @@ struct Args {
     /// `:202-205`); `-s 0` (and an unparseable value, C `:167-173`) is
     /// normal per-PV mode. Kept as a raw string so the C "invalid →
     /// ignored, reset to 0" rule is reproduced rather than clap erroring.
-    #[arg(short = 's', long = "stat-level", value_name = "LEVEL", action = clap::ArgAction::Append)]
+    #[arg(
+        short = 's',
+        long = "stat-level",
+        value_name = "LEVEL",
+        allow_hyphen_values = true,
+        action = clap::ArgAction::Append
+    )]
     stat_level: Vec<String>,
 
     /// CA priority (`sscanf("%u")`, clamped to `CA_PRIORITY_MAX`; `-p -1`

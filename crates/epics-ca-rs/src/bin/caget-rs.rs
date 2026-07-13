@@ -204,7 +204,12 @@ struct Args {
     /// Request a specific DBR type by name (e.g. `DOUBLE`,
     /// `DBR_TIME_DOUBLE`) or numeric DBR id. The named family selects
     /// the GET request class (STS/TIME/GR/CTRL or plain value).
-    #[arg(short = 'd', long = "dbr-type", action = clap::ArgAction::Append)]
+    #[arg(
+        short = 'd',
+        long = "dbr-type",
+        allow_hyphen_values = true,
+        action = clap::ArgAction::Append
+    )]
     dbr_type: Vec<String>,
 
     /// Print enums as numeric index (default is enum string when
@@ -272,12 +277,22 @@ struct Args {
     /// so it is `-0` with an attached or separate `<base>` — never a
     /// `--0x`-style flag, which no C script can pass. Repeats are folded by
     /// [`CTool::base`], which keeps C's "last VALID wins" rule.
-    #[arg(short = '0', value_name = "BASE", action = clap::ArgAction::Append)]
+    #[arg(
+        short = '0',
+        value_name = "BASE",
+        allow_hyphen_values = true,
+        action = clap::ArgAction::Append
+    )]
     int_base: Vec<String>,
 
     /// `-l<base>`: round a float to a long and print it in base `x`/`o`/`b`
     /// (C `outTypeF`). Same option shape as `-0` (`caget.c:398`).
-    #[arg(short = 'l', value_name = "BASE", action = clap::ArgAction::Append)]
+    #[arg(
+        short = 'l',
+        value_name = "BASE",
+        allow_hyphen_values = true,
+        action = clap::ArgAction::Append
+    )]
     float_base: Vec<String>,
 
     /// Alternate output field separator: C takes `(char) *optarg`, the FIRST

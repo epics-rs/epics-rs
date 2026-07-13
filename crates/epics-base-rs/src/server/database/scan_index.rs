@@ -94,7 +94,12 @@ impl PvDatabase {
             .unwrap_or_default()
     }
 
-    /// Get all record names that have PINI=true.
+    /// Get all record names that have PINI=true, in database load order.
+    ///
+    /// C `initialProcess` (`dbAccess.c`) walks the record lists with
+    /// `dbFirstRecord`/`dbNextRecord`, so PINI processing follows load
+    /// order; the order comes from [`PvDatabase::all_record_names`], the
+    /// single owner of whole-database iteration order.
     ///
     /// Snapshot the records map under the outer
     /// read lock, then drop it before fanning out per-record reads.
@@ -104,11 +109,12 @@ impl PvDatabase {
     /// records.write()), startup could stall while every PINI
     /// record was inspected serially.
     pub async fn pini_records(&self) -> Vec<String> {
+        let ordered = self.all_record_names().await;
         let snapshot: Vec<_> = {
             let records = self.inner.records.read().await;
-            records
-                .iter()
-                .map(|(n, r)| (n.clone(), r.clone()))
+            ordered
+                .into_iter()
+                .filter_map(|n| records.get(&n).map(|r| (n, r.clone())))
                 .collect()
         };
         let mut result = Vec::new();

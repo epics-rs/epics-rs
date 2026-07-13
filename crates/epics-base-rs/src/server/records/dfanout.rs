@@ -1,6 +1,6 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, ProcessOutcome, Record};
-use crate::types::{DbFieldType, EpicsValue};
+use crate::server::record::{FieldDesc, ProcessOutcome, Record, dbd_generated};
+use crate::types::EpicsValue;
 
 /// Choice labels for the SELM link-selection menu, in index order.
 /// C `menu(dfanoutSELM)`: 0=All, 1=Specified, 2=Mask.
@@ -171,48 +171,7 @@ impl DfanoutRecord {
     }
 }
 
-static DFANOUT_FIELDS: &[FieldDesc] = &[
-    FieldDesc::new("VAL", DbFieldType::Double, false),
-    // SELM is DBF_MENU menu(dfanoutSELM) (dfanoutRecord.dbd.pod) — served
-    // as DBR_ENUM with the menu's choice labels, see DFANOUT_SELM_CHOICES.
-    FieldDesc::new("SELM", DbFieldType::Enum, false),
-    FieldDesc::new("SELN", DbFieldType::UShort, false),
-    FieldDesc::new("OUTA", DbFieldType::String, false),
-    FieldDesc::new("OUTB", DbFieldType::String, false),
-    FieldDesc::new("OUTC", DbFieldType::String, false),
-    FieldDesc::new("OUTD", DbFieldType::String, false),
-    FieldDesc::new("OUTE", DbFieldType::String, false),
-    FieldDesc::new("OUTF", DbFieldType::String, false),
-    FieldDesc::new("OUTG", DbFieldType::String, false),
-    FieldDesc::new("OUTH", DbFieldType::String, false),
-    FieldDesc::new("OUTI", DbFieldType::String, false),
-    FieldDesc::new("OUTJ", DbFieldType::String, false),
-    FieldDesc::new("OUTK", DbFieldType::String, false),
-    FieldDesc::new("OUTL", DbFieldType::String, false),
-    FieldDesc::new("OUTM", DbFieldType::String, false),
-    FieldDesc::new("OUTN", DbFieldType::String, false),
-    FieldDesc::new("OUTO", DbFieldType::String, false),
-    FieldDesc::new("OUTP", DbFieldType::String, false),
-    FieldDesc::new("DOL", DbFieldType::String, false),
-    FieldDesc::new("OMSL", DbFieldType::Short, false),
-    FieldDesc::new("SELL", DbFieldType::String, false),
-    FieldDesc::new("IVOA", DbFieldType::Short, false),
-    FieldDesc::new("IVOV", DbFieldType::Double, false),
-    FieldDesc::new("HIHI", DbFieldType::Double, false),
-    FieldDesc::new("HIGH", DbFieldType::Double, false),
-    FieldDesc::new("LOW", DbFieldType::Double, false),
-    FieldDesc::new("LOLO", DbFieldType::Double, false),
-    FieldDesc::new("HHSV", DbFieldType::Short, false),
-    FieldDesc::new("HSV", DbFieldType::Short, false),
-    FieldDesc::new("LSV", DbFieldType::Short, false),
-    FieldDesc::new("LLSV", DbFieldType::Short, false),
-    FieldDesc::new("HYST", DbFieldType::Double, false),
-    FieldDesc::new("LALM", DbFieldType::Double, true),
-    FieldDesc::new("MDEL", DbFieldType::Double, false),
-    FieldDesc::new("ADEL", DbFieldType::Double, false),
-    FieldDesc::new("MLST", DbFieldType::Double, true),
-    FieldDesc::new("ALST", DbFieldType::Double, true),
-];
+static DFANOUT_FIELDS: &[FieldDesc] = dbd_generated::DFANOUT_FIELDS;
 
 impl Record for DfanoutRecord {
     fn record_type(&self) -> &'static str {

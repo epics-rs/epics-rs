@@ -1,6 +1,6 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, ProcessOutcome, Record};
-use crate::types::{DbFieldType, EpicsValue};
+use crate::server::record::{FieldDesc, ProcessOutcome, Record, dbd_generated};
+use crate::types::EpicsValue;
 
 /// Number of input signals A..L (C `selRecord.c::SEL_MAX`).
 const SEL_MAX: usize = 12;
@@ -126,48 +126,7 @@ impl SelRecord {
     }
 }
 
-static SEL_FIELDS: &[FieldDesc] = &[
-    FieldDesc::new("VAL", DbFieldType::Double, false),
-    // SELM is DBF_MENU menu(selSELM) (selRecord.dbd.pod:290) — served as
-    // DBR_ENUM with the menu's choice labels, see SELM_CHOICES.
-    FieldDesc::new("SELM", DbFieldType::Enum, false),
-    FieldDesc::new("SELN", DbFieldType::UShort, false),
-    FieldDesc::new("NVL", DbFieldType::String, false),
-    FieldDesc::new("INPA", DbFieldType::String, false),
-    FieldDesc::new("INPB", DbFieldType::String, false),
-    FieldDesc::new("INPC", DbFieldType::String, false),
-    FieldDesc::new("INPD", DbFieldType::String, false),
-    FieldDesc::new("INPE", DbFieldType::String, false),
-    FieldDesc::new("INPF", DbFieldType::String, false),
-    FieldDesc::new("INPG", DbFieldType::String, false),
-    FieldDesc::new("INPH", DbFieldType::String, false),
-    FieldDesc::new("INPI", DbFieldType::String, false),
-    FieldDesc::new("INPJ", DbFieldType::String, false),
-    FieldDesc::new("INPK", DbFieldType::String, false),
-    FieldDesc::new("INPL", DbFieldType::String, false),
-    FieldDesc::new("A", DbFieldType::Double, false),
-    FieldDesc::new("B", DbFieldType::Double, false),
-    FieldDesc::new("C", DbFieldType::Double, false),
-    FieldDesc::new("D", DbFieldType::Double, false),
-    FieldDesc::new("E", DbFieldType::Double, false),
-    FieldDesc::new("F", DbFieldType::Double, false),
-    FieldDesc::new("G", DbFieldType::Double, false),
-    FieldDesc::new("H", DbFieldType::Double, false),
-    FieldDesc::new("I", DbFieldType::Double, false),
-    FieldDesc::new("J", DbFieldType::Double, false),
-    FieldDesc::new("K", DbFieldType::Double, false),
-    FieldDesc::new("L", DbFieldType::Double, false),
-    FieldDesc::new("HIHI", DbFieldType::Double, false),
-    FieldDesc::new("HIGH", DbFieldType::Double, false),
-    FieldDesc::new("LOW", DbFieldType::Double, false),
-    FieldDesc::new("LOLO", DbFieldType::Double, false),
-    FieldDesc::new("HHSV", DbFieldType::Short, false),
-    FieldDesc::new("HSV", DbFieldType::Short, false),
-    FieldDesc::new("LSV", DbFieldType::Short, false),
-    FieldDesc::new("LLSV", DbFieldType::Short, false),
-    FieldDesc::new("HYST", DbFieldType::Double, false),
-    FieldDesc::new("LALM", DbFieldType::Double, true),
-];
+static SEL_FIELDS: &[FieldDesc] = dbd_generated::SEL_FIELDS;
 
 impl Record for SelRecord {
     fn record_type(&self) -> &'static str {

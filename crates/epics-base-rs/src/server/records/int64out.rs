@@ -1,6 +1,6 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, MENU_YES_NO, ProcessOutcome, Record};
-use crate::types::{DbFieldType, EpicsValue, PvString};
+use crate::server::record::{FieldDesc, MENU_YES_NO, ProcessOutcome, Record, dbd_generated};
+use crate::types::{EpicsValue, PvString};
 
 // int64out: 64-bit integer output.
 // CA limitation: served as DBR_DOUBLE over Channel Access (precision loss for |val|>2^53).
@@ -74,29 +74,7 @@ impl Int64outRecord {
     }
 }
 
-static INT64OUT_FIELDS: &[FieldDesc] = &[
-    FieldDesc::new("VAL", DbFieldType::Int64, false),
-    FieldDesc::new("EGU", DbFieldType::String, false),
-    FieldDesc::new("HOPR", DbFieldType::Double, false),
-    FieldDesc::new("LOPR", DbFieldType::Double, false),
-    FieldDesc::new("DRVH", DbFieldType::Double, false),
-    FieldDesc::new("DRVL", DbFieldType::Double, false),
-    FieldDesc::new("HYST", DbFieldType::Double, false),
-    FieldDesc::new("LALM", DbFieldType::Double, false),
-    FieldDesc::new("IVOA", DbFieldType::Short, false),
-    FieldDesc::new("IVOV", DbFieldType::Double, false),
-    FieldDesc::new("ADEL", DbFieldType::Double, false),
-    FieldDesc::new("MDEL", DbFieldType::Double, false),
-    FieldDesc::new("ALST", DbFieldType::Double, false),
-    FieldDesc::new("MLST", DbFieldType::Double, false),
-    FieldDesc::new("OMSL", DbFieldType::Short, false),
-    FieldDesc::new("DOL", DbFieldType::String, false),
-    FieldDesc::new("SIMM", DbFieldType::Short, false),
-    FieldDesc::new("SIML", DbFieldType::String, false),
-    FieldDesc::new("SIOL", DbFieldType::String, false),
-    FieldDesc::new("SIMS", DbFieldType::Short, false),
-    FieldDesc::new("SDLY", DbFieldType::Double, false),
-];
+static INT64OUT_FIELDS: &[FieldDesc] = dbd_generated::INT64OUT_FIELDS;
 
 impl Record for Int64outRecord {
     fn record_type(&self) -> &'static str {

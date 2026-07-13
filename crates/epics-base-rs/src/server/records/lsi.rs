@@ -1,6 +1,8 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, MENU_POST, MENU_YES_NO, ProcessOutcome, Record};
-use crate::types::{DbFieldType, EpicsValue, PvString};
+use crate::server::record::{
+    FieldDesc, MENU_POST, MENU_YES_NO, ProcessOutcome, Record, dbd_generated,
+};
+use crate::types::{EpicsValue, PvString};
 
 /// EPICS `MAX_STRING_SIZE` — DBR_STRING buffers are 40 bytes.
 const MAX_STRING_SIZE: usize = 40;
@@ -103,28 +105,7 @@ impl LsiRecord {
     }
 }
 
-static LSI_FIELDS: &[FieldDesc] = &[
-    FieldDesc::new("VAL", DbFieldType::Char, false),
-    FieldDesc::new("OVAL", DbFieldType::Char, true),
-    // C declares SIZV as DBF_USHORT (lsiRecord.dbd.pod:75): the VAL buffer
-    // size is an unsigned 16-bit count (clamped to [16, 0x7fff] at init).
-    FieldDesc::new("SIZV", DbFieldType::UShort, false),
-    // C declares LEN as DBF_ULONG (lsiRecord.dbd.pod:82): the current
-    // string byte length is an unsigned 32-bit count.
-    FieldDesc::new("LEN", DbFieldType::ULong, true),
-    // C declares OLEN as DBF_ULONG (lsiRecord.dbd.pod:86): the previously
-    // posted byte length is an unsigned 32-bit count.
-    FieldDesc::new("OLEN", DbFieldType::ULong, true),
-    FieldDesc::new("SIMM", DbFieldType::Short, false),
-    FieldDesc::new("SIML", DbFieldType::String, false),
-    FieldDesc::new("SIOL", DbFieldType::String, false),
-    FieldDesc::new("SIMS", DbFieldType::Short, false),
-    FieldDesc::new("SDLY", DbFieldType::Double, false),
-    // `menuPost` menu fields (DBF_MENU). Exposed as Short, matching the
-    // record's other menu field (SIMM); C `lsiRecord.dbd.pod:107/113`.
-    FieldDesc::new("MPST", DbFieldType::Short, false),
-    FieldDesc::new("APST", DbFieldType::Short, false),
-];
+static LSI_FIELDS: &[FieldDesc] = dbd_generated::LSI_FIELDS;
 
 impl Record for LsiRecord {
     fn record_type(&self) -> &'static str {

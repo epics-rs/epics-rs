@@ -1,6 +1,6 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, MENU_YES_NO, Record};
-use crate::types::{DbFieldType, EpicsValue, PvString};
+use crate::server::record::{FieldDesc, MENU_YES_NO, Record, dbd_generated};
+use crate::types::{EpicsValue, PvString};
 
 /// `event` record — software-event source.
 ///
@@ -42,14 +42,7 @@ pub struct EventRecord {
     pub sdly: f64,
 }
 
-static EVENT_FIELDS: &[FieldDesc] = &[
-    FieldDesc::new("VAL", DbFieldType::String, false),
-    FieldDesc::new("SIMM", DbFieldType::Short, false),
-    FieldDesc::new("SIML", DbFieldType::String, false),
-    FieldDesc::new("SIOL", DbFieldType::String, false),
-    FieldDesc::new("SIMS", DbFieldType::Short, false),
-    FieldDesc::new("SDLY", DbFieldType::Double, false),
-];
+static EVENT_FIELDS: &[FieldDesc] = dbd_generated::EVENT_FIELDS;
 
 impl Default for EventRecord {
     fn default() -> Self {

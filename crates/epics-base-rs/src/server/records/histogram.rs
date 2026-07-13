@@ -1,6 +1,6 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, MENU_YES_NO, ProcessOutcome, Record};
-use crate::types::{DbFieldType, EpicsValue};
+use crate::server::record::{FieldDesc, MENU_YES_NO, ProcessOutcome, Record, dbd_generated};
+use crate::types::EpicsValue;
 
 /// Histogram record — counts values into buckets.
 ///
@@ -185,47 +185,7 @@ impl HistogramRecord {
     }
 }
 
-static HISTOGRAM_FIELDS: &[FieldDesc] = &[
-    // C `cvt_dbaddr` (histogramRecord.c:299-308) sets
-    // `field_type = dbr_field_type = DBF_ULONG`. CA promotes that to
-    // DBR_DOUBLE, PVA serves it as uint32[] — both projections follow
-    // from this one declared type.
-    FieldDesc::new("VAL", DbFieldType::ULong, false),
-    // C `field(NELM,DBF_USHORT)` (histogramRecord.dbd.pod:163) — histogram's
-    // bin count is USHORT, not the ULONG the array records use.
-    FieldDesc::new("NELM", DbFieldType::UShort, true),
-    FieldDesc::new("ULIM", DbFieldType::Double, false),
-    FieldDesc::new("LLIM", DbFieldType::Double, false),
-    FieldDesc::new("WDTH", DbFieldType::Double, true),
-    FieldDesc::new("SGNL", DbFieldType::Double, false),
-    // C `field(SVL,DBF_INLINK)` (histogramRecord.dbd.pod:212) — the record's
-    // only input link. Membership here is what makes `field(SVL,"MYSIG")` load:
-    // `apply_fields` routes a name NOT in `field_list` to the common fields,
-    // where it is rejected and skipped.
-    FieldDesc::new("SVL", DbFieldType::String, false),
-    FieldDesc::new("CMD", DbFieldType::Short, false),
-    // C `field(CSTA,DBF_SHORT){ special(SPC_NOMOD) initial("1") }`
-    // (histogramRecord.dbd.pod:170-175). The collection state is the record's
-    // own — it is toggled ONLY through CMD's SPC_CALC `special()`
-    // (histogramRecord.c:246-259: `cmd == 2` → `csta = TRUE`, `cmd == 3` →
-    // `csta = FALSE`) — so a client put is refused: softIoc `dbpf HI.CSTA 0` →
-    // "dbPut Attempt to modify noMod field PV: HI.CSTA". Runtime-immutable via
-    // the field_io `read_only` gate; the `put_field` arm below still serves the
-    // load path, which in C bypasses SPC_NOMOD through dbStaticLib.
-    FieldDesc::new("CSTA", DbFieldType::Short, true),
-    FieldDesc::new("SDEL", DbFieldType::Double, false),
-    // C `field(MDEL,DBF_SHORT)` (histogramRecord.dbd.pod:229) — the COUNT
-    // deadband, and `field(MCNT,DBF_SHORT)` (:234), counts since the last
-    // posted VAL. Both are SHORT, not LONG.
-    FieldDesc::new("MDEL", DbFieldType::Short, false),
-    FieldDesc::new("MCNT", DbFieldType::Short, true),
-    FieldDesc::new("SIMM", DbFieldType::Short, false),
-    FieldDesc::new("SIOL", DbFieldType::String, false),
-    FieldDesc::new("SVAL", DbFieldType::Double, false),
-    FieldDesc::new("SIML", DbFieldType::String, false),
-    FieldDesc::new("SIMS", DbFieldType::Short, false),
-    FieldDesc::new("SDLY", DbFieldType::Double, false),
-];
+static HISTOGRAM_FIELDS: &[FieldDesc] = dbd_generated::HISTOGRAM_FIELDS;
 
 /// Choice labels for the histogram command menu, in index order.
 /// C `menu(histogramCMD)` (`histogramRecord.dbd.pod`): 0=Read, 1=Clear,
@@ -693,6 +653,7 @@ impl Record for HistogramRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::DbFieldType;
 
     // C `histogramRecord.dbd.pod` `field(NELM,DBF_USHORT){ initial("1") }` —
     // a histogram built without an explicit NELM defaults to 1 bucket (and a

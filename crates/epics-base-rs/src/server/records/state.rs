@@ -1,7 +1,7 @@
 use crate::error::{CaError, CaResult};
 use crate::server::database::AsyncDbHandle;
-use crate::server::record::{FieldDesc, ProcessOutcome, Record};
-use crate::types::{DbFieldType, EpicsValue, PvString};
+use crate::server::record::{FieldDesc, ProcessOutcome, Record, dbd_generated};
+use crate::types::{EpicsValue, PvString};
 
 /// `VAL`/`OVAL` are `size(20)` `char[20]` buffers in C
 /// (`stateRecord.dbd.pod`): 19 payload bytes + an implicit NUL.
@@ -64,10 +64,7 @@ impl StateRecord {
     }
 }
 
-static STATE_FIELDS: &[FieldDesc] = &[
-    FieldDesc::new("VAL", DbFieldType::String, false),
-    FieldDesc::new("OVAL", DbFieldType::String, true),
-];
+static STATE_FIELDS: &[FieldDesc] = dbd_generated::STATE_FIELDS;
 
 impl Record for StateRecord {
     fn record_type(&self) -> &'static str {

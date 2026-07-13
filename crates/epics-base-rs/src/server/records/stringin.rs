@@ -1,6 +1,8 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, MENU_POST, MENU_YES_NO, ProcessOutcome, Record};
-use crate::types::{DbFieldType, EpicsValue, PvString};
+use crate::server::record::{
+    FieldDesc, MENU_POST, MENU_YES_NO, ProcessOutcome, Record, dbd_generated,
+};
+use crate::types::{EpicsValue, PvString};
 
 /// EPICS `MAX_STRING_SIZE` — `val`/`oval`/`sval` are fixed 40-byte
 /// buffers in C `stringinRecord.c`; every copy truncates at 40.
@@ -71,17 +73,7 @@ impl StringinRecord {
     }
 }
 
-static STRINGIN_FIELDS: &[FieldDesc] = &[
-    FieldDesc::new("VAL", DbFieldType::String, false),
-    FieldDesc::new("OVAL", DbFieldType::String, true),
-    FieldDesc::new("SIMM", DbFieldType::Short, false),
-    FieldDesc::new("SIML", DbFieldType::String, false),
-    FieldDesc::new("SIOL", DbFieldType::String, false),
-    FieldDesc::new("SIMS", DbFieldType::Short, false),
-    FieldDesc::new("SDLY", DbFieldType::Double, false),
-    FieldDesc::new("MPST", DbFieldType::Short, false),
-    FieldDesc::new("APST", DbFieldType::Short, false),
-];
+static STRINGIN_FIELDS: &[FieldDesc] = dbd_generated::STRINGIN_FIELDS;
 
 impl Record for StringinRecord {
     fn record_type(&self) -> &'static str {

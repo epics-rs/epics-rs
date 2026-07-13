@@ -1,6 +1,6 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, MENU_SIMM, ProcessOutcome, Record};
-use crate::types::{DbFieldType, EpicsValue, PvString};
+use crate::server::record::{FieldDesc, MENU_SIMM, ProcessOutcome, Record, dbd_generated};
+use crate::types::{EpicsValue, PvString};
 
 /// Multi-bit binary input record — manual Record impl for raw↔index conversion.
 pub struct MbbiRecord {
@@ -219,78 +219,7 @@ impl MbbiRecord {
     }
 }
 
-static MBBI_FIELDS: &[FieldDesc] = &[
-    FieldDesc::new("VAL", DbFieldType::Enum, false),
-    FieldDesc::new("RVAL", DbFieldType::ULong, false),
-    FieldDesc::new("ORAW", DbFieldType::ULong, true),
-    FieldDesc::new("MASK", DbFieldType::ULong, false),
-    FieldDesc::new("SHFT", DbFieldType::UShort, false),
-    // Simulation-mode fields. `mbbiRecord.c:125-126` declares SIML/SIOL
-    // and `mbbiRecord.c:379-396` reads SIOL when SIMM != NO. These were
-    // missing from the field table / get_field / put_field, so the
-    // database simulation path (`check_simulation_mode`) could never
-    // observe SIMM on an mbbi.
-    FieldDesc::new("SIMM", DbFieldType::Short, false),
-    FieldDesc::new("SIML", DbFieldType::String, false),
-    FieldDesc::new("SIOL", DbFieldType::String, false),
-    FieldDesc::new("SIMS", DbFieldType::Short, false),
-    FieldDesc::new("SDLY", DbFieldType::Double, false),
-    FieldDesc::new("MLST", DbFieldType::UShort, true),
-    FieldDesc::new("LALM", DbFieldType::UShort, true),
-    FieldDesc::new("NOBT", DbFieldType::UShort, false),
-    FieldDesc::new("ZRSV", DbFieldType::Short, false),
-    FieldDesc::new("ONSV", DbFieldType::Short, false),
-    FieldDesc::new("TWSV", DbFieldType::Short, false),
-    FieldDesc::new("THSV", DbFieldType::Short, false),
-    FieldDesc::new("FRSV", DbFieldType::Short, false),
-    FieldDesc::new("FVSV", DbFieldType::Short, false),
-    FieldDesc::new("SXSV", DbFieldType::Short, false),
-    FieldDesc::new("SVSV", DbFieldType::Short, false),
-    FieldDesc::new("EISV", DbFieldType::Short, false),
-    FieldDesc::new("NISV", DbFieldType::Short, false),
-    FieldDesc::new("TESV", DbFieldType::Short, false),
-    FieldDesc::new("ELSV", DbFieldType::Short, false),
-    FieldDesc::new("TVSV", DbFieldType::Short, false),
-    FieldDesc::new("TTSV", DbFieldType::Short, false),
-    FieldDesc::new("FTSV", DbFieldType::Short, false),
-    FieldDesc::new("FFSV", DbFieldType::Short, false),
-    FieldDesc::new("UNSV", DbFieldType::Short, false),
-    FieldDesc::new("COSV", DbFieldType::Short, false),
-    FieldDesc::new("AFTC", DbFieldType::Double, false),
-    FieldDesc::new("AFVL", DbFieldType::Double, true),
-    FieldDesc::new("ZRVL", DbFieldType::ULong, false),
-    FieldDesc::new("ONVL", DbFieldType::ULong, false),
-    FieldDesc::new("TWVL", DbFieldType::ULong, false),
-    FieldDesc::new("THVL", DbFieldType::ULong, false),
-    FieldDesc::new("FRVL", DbFieldType::ULong, false),
-    FieldDesc::new("FVVL", DbFieldType::ULong, false),
-    FieldDesc::new("SXVL", DbFieldType::ULong, false),
-    FieldDesc::new("SVVL", DbFieldType::ULong, false),
-    FieldDesc::new("EIVL", DbFieldType::ULong, false),
-    FieldDesc::new("NIVL", DbFieldType::ULong, false),
-    FieldDesc::new("TEVL", DbFieldType::ULong, false),
-    FieldDesc::new("ELVL", DbFieldType::ULong, false),
-    FieldDesc::new("TVVL", DbFieldType::ULong, false),
-    FieldDesc::new("TTVL", DbFieldType::ULong, false),
-    FieldDesc::new("FTVL", DbFieldType::ULong, false),
-    FieldDesc::new("FFVL", DbFieldType::ULong, false),
-    FieldDesc::new("ZRST", DbFieldType::String, false),
-    FieldDesc::new("ONST", DbFieldType::String, false),
-    FieldDesc::new("TWST", DbFieldType::String, false),
-    FieldDesc::new("THST", DbFieldType::String, false),
-    FieldDesc::new("FRST", DbFieldType::String, false),
-    FieldDesc::new("FVST", DbFieldType::String, false),
-    FieldDesc::new("SXST", DbFieldType::String, false),
-    FieldDesc::new("SVST", DbFieldType::String, false),
-    FieldDesc::new("EIST", DbFieldType::String, false),
-    FieldDesc::new("NIST", DbFieldType::String, false),
-    FieldDesc::new("TEST", DbFieldType::String, false),
-    FieldDesc::new("ELST", DbFieldType::String, false),
-    FieldDesc::new("TVST", DbFieldType::String, false),
-    FieldDesc::new("TTST", DbFieldType::String, false),
-    FieldDesc::new("FTST", DbFieldType::String, false),
-    FieldDesc::new("FFST", DbFieldType::String, false),
-];
+static MBBI_FIELDS: &[FieldDesc] = dbd_generated::MBBI_FIELDS;
 
 /// True for the mbbi/mbbo state-table fields whose modification must
 /// trigger an `sdef` recompute — the 16 state values (ZRVL..FFVL) and

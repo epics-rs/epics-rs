@@ -1,6 +1,6 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, MENU_SIMM, ProcessOutcome, Record};
-use crate::types::{DbFieldType, EpicsValue, PvString};
+use crate::server::record::{FieldDesc, MENU_SIMM, ProcessOutcome, Record, dbd_generated};
+use crate::types::{EpicsValue, PvString};
 
 /// Binary input record matching C biRecord behavior.
 /// RVAL from device support is converted to VAL (0 or 1).
@@ -76,24 +76,7 @@ impl BiRecord {
     }
 }
 
-static FIELDS: &[FieldDesc] = &[
-    FieldDesc::new("VAL", DbFieldType::Enum, false),
-    FieldDesc::new("RVAL", DbFieldType::ULong, false),
-    FieldDesc::new("ORAW", DbFieldType::ULong, true),
-    FieldDesc::new("MASK", DbFieldType::ULong, false),
-    FieldDesc::new("ZNAM", DbFieldType::String, false),
-    FieldDesc::new("ONAM", DbFieldType::String, false),
-    FieldDesc::new("ZSV", DbFieldType::Short, false),
-    FieldDesc::new("OSV", DbFieldType::Short, false),
-    FieldDesc::new("COSV", DbFieldType::Short, false),
-    FieldDesc::new("LALM", DbFieldType::UShort, true),
-    FieldDesc::new("MLST", DbFieldType::UShort, true),
-    FieldDesc::new("SIMM", DbFieldType::Short, false),
-    FieldDesc::new("SIML", DbFieldType::String, false),
-    FieldDesc::new("SIOL", DbFieldType::String, false),
-    FieldDesc::new("SIMS", DbFieldType::Short, false),
-    FieldDesc::new("SDLY", DbFieldType::Double, false),
-];
+static FIELDS: &[FieldDesc] = dbd_generated::BI_FIELDS;
 
 impl Record for BiRecord {
     fn record_type(&self) -> &'static str {

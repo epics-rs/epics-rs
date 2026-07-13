@@ -1,6 +1,6 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, ProcessOutcome, Record};
-use crate::types::{DbFieldType, EpicsValue, PvString};
+use crate::server::record::{FieldDesc, ProcessOutcome, Record, dbd_generated};
+use crate::types::{EpicsValue, PvString};
 
 // printf record (EPICS 7).
 // Evaluates FMT as a printf format string with up to 10 inputs (INP0-INP9, values A-J).
@@ -512,38 +512,7 @@ fn strip_trailing_zeros_sci(s: &str, upper: bool) -> String {
     }
 }
 
-static PRINTF_FIELDS: &[FieldDesc] = &[
-    FieldDesc::new("VAL", DbFieldType::Char, true),
-    // C declares LEN as DBF_ULONG (printfRecord.dbd.pod:209): the formatted
-    // byte count including the terminating NUL is an unsigned 32-bit count.
-    FieldDesc::new("LEN", DbFieldType::ULong, true),
-    // C declares SIZV as DBF_USHORT (printfRecord.dbd.pod:202): the VAL
-    // buffer size is an unsigned 16-bit count (clamped to [16, 0x7fff]
-    // at init because dbAddr::field_size is signed, printfRecord.c:341).
-    FieldDesc::new("SIZV", DbFieldType::UShort, false),
-    FieldDesc::new("FMT", DbFieldType::String, false),
-    FieldDesc::new("IVLS", DbFieldType::String, false),
-    FieldDesc::new("INP0", DbFieldType::String, false),
-    FieldDesc::new("INP1", DbFieldType::String, false),
-    FieldDesc::new("INP2", DbFieldType::String, false),
-    FieldDesc::new("INP3", DbFieldType::String, false),
-    FieldDesc::new("INP4", DbFieldType::String, false),
-    FieldDesc::new("INP5", DbFieldType::String, false),
-    FieldDesc::new("INP6", DbFieldType::String, false),
-    FieldDesc::new("INP7", DbFieldType::String, false),
-    FieldDesc::new("INP8", DbFieldType::String, false),
-    FieldDesc::new("INP9", DbFieldType::String, false),
-    FieldDesc::new("A", DbFieldType::Double, false),
-    FieldDesc::new("B", DbFieldType::Double, false),
-    FieldDesc::new("C", DbFieldType::Double, false),
-    FieldDesc::new("D", DbFieldType::Double, false),
-    FieldDesc::new("E", DbFieldType::Double, false),
-    FieldDesc::new("F", DbFieldType::Double, false),
-    FieldDesc::new("G", DbFieldType::Double, false),
-    FieldDesc::new("H", DbFieldType::Double, false),
-    FieldDesc::new("I", DbFieldType::Double, false),
-    FieldDesc::new("J", DbFieldType::Double, false),
-];
+static PRINTF_FIELDS: &[FieldDesc] = dbd_generated::PRINTF_FIELDS;
 
 impl Record for PrintfRecord {
     fn record_type(&self) -> &'static str {

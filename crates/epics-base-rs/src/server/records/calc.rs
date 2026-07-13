@@ -1,7 +1,7 @@
 use super::calc_compile;
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, InputFetchPolicy, ProcessOutcome, Record};
-use crate::types::{DbFieldType, EpicsValue, PvString};
+use crate::server::record::{FieldDesc, InputFetchPolicy, ProcessOutcome, Record, dbd_generated};
+use crate::types::{EpicsValue, PvString};
 
 /// Calc record — evaluates CALC expression with inputs A-U.
 ///
@@ -341,84 +341,7 @@ impl CalcRecord {
     }
 }
 
-static CALC_FIELDS: &[FieldDesc] = &[
-    FieldDesc::new("VAL", DbFieldType::Double, false),
-    FieldDesc::new("CALC", DbFieldType::String, false),
-    FieldDesc::new("EGU", DbFieldType::String, false),
-    FieldDesc::new("PREC", DbFieldType::Short, false),
-    FieldDesc::new("HOPR", DbFieldType::Double, false),
-    FieldDesc::new("LOPR", DbFieldType::Double, false),
-    FieldDesc::new("ADEL", DbFieldType::Double, false),
-    FieldDesc::new("MDEL", DbFieldType::Double, false),
-    FieldDesc::new("AFTC", DbFieldType::Double, false),
-    FieldDesc::new("AFVL", DbFieldType::Double, true),
-    FieldDesc::new("LALM", DbFieldType::Double, true),
-    FieldDesc::new("ALST", DbFieldType::Double, true),
-    FieldDesc::new("MLST", DbFieldType::Double, true),
-    FieldDesc::new("INPA", DbFieldType::String, false),
-    FieldDesc::new("INPB", DbFieldType::String, false),
-    FieldDesc::new("INPC", DbFieldType::String, false),
-    FieldDesc::new("INPD", DbFieldType::String, false),
-    FieldDesc::new("INPE", DbFieldType::String, false),
-    FieldDesc::new("INPF", DbFieldType::String, false),
-    FieldDesc::new("INPG", DbFieldType::String, false),
-    FieldDesc::new("INPH", DbFieldType::String, false),
-    FieldDesc::new("INPI", DbFieldType::String, false),
-    FieldDesc::new("INPJ", DbFieldType::String, false),
-    FieldDesc::new("INPK", DbFieldType::String, false),
-    FieldDesc::new("INPL", DbFieldType::String, false),
-    FieldDesc::new("INPM", DbFieldType::String, false),
-    FieldDesc::new("INPN", DbFieldType::String, false),
-    FieldDesc::new("INPO", DbFieldType::String, false),
-    FieldDesc::new("INPP", DbFieldType::String, false),
-    FieldDesc::new("INPQ", DbFieldType::String, false),
-    FieldDesc::new("INPR", DbFieldType::String, false),
-    FieldDesc::new("INPS", DbFieldType::String, false),
-    FieldDesc::new("INPT", DbFieldType::String, false),
-    FieldDesc::new("INPU", DbFieldType::String, false),
-    FieldDesc::new("A", DbFieldType::Double, false),
-    FieldDesc::new("B", DbFieldType::Double, false),
-    FieldDesc::new("C", DbFieldType::Double, false),
-    FieldDesc::new("D", DbFieldType::Double, false),
-    FieldDesc::new("E", DbFieldType::Double, false),
-    FieldDesc::new("F", DbFieldType::Double, false),
-    FieldDesc::new("G", DbFieldType::Double, false),
-    FieldDesc::new("H", DbFieldType::Double, false),
-    FieldDesc::new("I", DbFieldType::Double, false),
-    FieldDesc::new("J", DbFieldType::Double, false),
-    FieldDesc::new("K", DbFieldType::Double, false),
-    FieldDesc::new("L", DbFieldType::Double, false),
-    FieldDesc::new("M", DbFieldType::Double, false),
-    FieldDesc::new("N", DbFieldType::Double, false),
-    FieldDesc::new("O", DbFieldType::Double, false),
-    FieldDesc::new("P", DbFieldType::Double, false),
-    FieldDesc::new("Q", DbFieldType::Double, false),
-    FieldDesc::new("R", DbFieldType::Double, false),
-    FieldDesc::new("S", DbFieldType::Double, false),
-    FieldDesc::new("T", DbFieldType::Double, false),
-    FieldDesc::new("U", DbFieldType::Double, false),
-    FieldDesc::new("LA", DbFieldType::Double, true),
-    FieldDesc::new("LB", DbFieldType::Double, true),
-    FieldDesc::new("LC", DbFieldType::Double, true),
-    FieldDesc::new("LD", DbFieldType::Double, true),
-    FieldDesc::new("LE", DbFieldType::Double, true),
-    FieldDesc::new("LF", DbFieldType::Double, true),
-    FieldDesc::new("LG", DbFieldType::Double, true),
-    FieldDesc::new("LH", DbFieldType::Double, true),
-    FieldDesc::new("LI", DbFieldType::Double, true),
-    FieldDesc::new("LJ", DbFieldType::Double, true),
-    FieldDesc::new("LK", DbFieldType::Double, true),
-    FieldDesc::new("LL", DbFieldType::Double, true),
-    FieldDesc::new("LM", DbFieldType::Double, true),
-    FieldDesc::new("LN", DbFieldType::Double, true),
-    FieldDesc::new("LO", DbFieldType::Double, true),
-    FieldDesc::new("LP", DbFieldType::Double, true),
-    FieldDesc::new("LQ", DbFieldType::Double, true),
-    FieldDesc::new("LR", DbFieldType::Double, true),
-    FieldDesc::new("LS", DbFieldType::Double, true),
-    FieldDesc::new("LT", DbFieldType::Double, true),
-    FieldDesc::new("LU", DbFieldType::Double, true),
-];
+static CALC_FIELDS: &[FieldDesc] = dbd_generated::CALC_FIELDS;
 
 impl Record for CalcRecord {
     fn record_type(&self) -> &'static str {

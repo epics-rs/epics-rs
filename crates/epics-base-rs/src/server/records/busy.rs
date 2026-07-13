@@ -1,6 +1,8 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, MENU_YES_NO, ProcessAction, ProcessOutcome, Record};
-use crate::types::{DbFieldType, EpicsValue, PvString};
+use crate::server::record::{
+    FieldDesc, MENU_YES_NO, ProcessAction, ProcessOutcome, Record, dbd_generated,
+};
+use crate::types::{EpicsValue, PvString};
 
 // --- Busy-specific types (inlined from busy-rs/types.rs) ---
 
@@ -229,31 +231,7 @@ impl BusyRecord {
     }
 }
 
-static FIELDS: &[FieldDesc] = &[
-    FieldDesc::new("VAL", DbFieldType::Enum, false),
-    FieldDesc::new("OVAL", DbFieldType::Enum, true),
-    FieldDesc::new("ZNAM", DbFieldType::String, false),
-    FieldDesc::new("ONAM", DbFieldType::String, false),
-    FieldDesc::new("HIGH", DbFieldType::Double, false),
-    FieldDesc::new("ZSV", DbFieldType::Short, false),
-    FieldDesc::new("OSV", DbFieldType::Short, false),
-    FieldDesc::new("COSV", DbFieldType::Short, false),
-    FieldDesc::new("LALM", DbFieldType::Enum, true),
-    FieldDesc::new("IVOA", DbFieldType::Short, false),
-    FieldDesc::new("IVOV", DbFieldType::Enum, false),
-    FieldDesc::new("OMSL", DbFieldType::Short, false),
-    FieldDesc::new("DOL", DbFieldType::String, false),
-    FieldDesc::new("MLST", DbFieldType::Enum, true),
-    FieldDesc::new("RVAL", DbFieldType::ULong, true),
-    FieldDesc::new("ORAW", DbFieldType::ULong, true),
-    FieldDesc::new("MASK", DbFieldType::ULong, false),
-    FieldDesc::new("RBV", DbFieldType::ULong, true),
-    FieldDesc::new("ORBV", DbFieldType::ULong, true),
-    FieldDesc::new("SIMM", DbFieldType::Short, false),
-    FieldDesc::new("SIML", DbFieldType::String, false),
-    FieldDesc::new("SIOL", DbFieldType::String, false),
-    FieldDesc::new("SIMS", DbFieldType::Short, false),
-];
+static FIELDS: &[FieldDesc] = dbd_generated::BUSY_FIELDS;
 
 impl Record for BusyRecord {
     fn record_type(&self) -> &'static str {
@@ -594,6 +572,7 @@ impl Record for BusyRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::DbFieldType;
 
     #[test]
     fn test_default() {

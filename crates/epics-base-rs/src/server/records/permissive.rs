@@ -1,6 +1,6 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, ProcessOutcome, Record};
-use crate::types::{DbFieldType, EpicsValue, PvString};
+use crate::server::record::{FieldDesc, ProcessOutcome, Record, dbd_generated};
+use crate::types::{EpicsValue, PvString};
 
 /// `LABL` is a `size(20)` `char[20]` in C (`permissiveRecord.dbd.pod`):
 /// the button label holds 19 payload bytes + an implicit NUL.
@@ -63,13 +63,7 @@ impl Default for PermissiveRecord {
     }
 }
 
-static PERMISSIVE_FIELDS: &[FieldDesc] = &[
-    FieldDesc::new("VAL", DbFieldType::UShort, false),
-    FieldDesc::new("OVAL", DbFieldType::UShort, true),
-    FieldDesc::new("WFLG", DbFieldType::UShort, false),
-    FieldDesc::new("OFLG", DbFieldType::UShort, true),
-    FieldDesc::new("LABL", DbFieldType::String, false),
-];
+static PERMISSIVE_FIELDS: &[FieldDesc] = dbd_generated::PERMISSIVE_FIELDS;
 
 impl Record for PermissiveRecord {
     fn record_type(&self) -> &'static str {

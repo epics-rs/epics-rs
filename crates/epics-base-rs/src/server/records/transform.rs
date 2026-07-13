@@ -1,8 +1,8 @@
 use crate::error::{CaError, CaResult};
 use crate::server::record::{
-    AlarmSeverity, FieldDesc, ProcessAction, ProcessContext, ProcessOutcome, Record,
+    AlarmSeverity, FieldDesc, ProcessAction, ProcessContext, ProcessOutcome, Record, dbd_generated,
 };
-use crate::types::{DbFieldType, EpicsValue};
+use crate::types::EpicsValue;
 
 use crate::calc::{CompiledExpr, StringInputs, scalc_compile, scalc_perform};
 
@@ -170,98 +170,7 @@ impl TransformRecord {
     }
 }
 
-static TRANSFORM_FIELDS: &[FieldDesc] = &[
-    FieldDesc::new("VAL", DbFieldType::Double, false),
-    FieldDesc::new("COPT", DbFieldType::Short, false),
-    FieldDesc::new("IVLA", DbFieldType::Short, false),
-    FieldDesc::new("PREC", DbFieldType::Short, false),
-    // CLCA-CLCP
-    FieldDesc::new("CLCA", DbFieldType::String, false),
-    FieldDesc::new("CLCB", DbFieldType::String, false),
-    FieldDesc::new("CLCC", DbFieldType::String, false),
-    FieldDesc::new("CLCD", DbFieldType::String, false),
-    FieldDesc::new("CLCE", DbFieldType::String, false),
-    FieldDesc::new("CLCF", DbFieldType::String, false),
-    FieldDesc::new("CLCG", DbFieldType::String, false),
-    FieldDesc::new("CLCH", DbFieldType::String, false),
-    FieldDesc::new("CLCI", DbFieldType::String, false),
-    FieldDesc::new("CLCJ", DbFieldType::String, false),
-    FieldDesc::new("CLCK", DbFieldType::String, false),
-    FieldDesc::new("CLCL", DbFieldType::String, false),
-    FieldDesc::new("CLCM", DbFieldType::String, false),
-    FieldDesc::new("CLCN", DbFieldType::String, false),
-    FieldDesc::new("CLCO", DbFieldType::String, false),
-    FieldDesc::new("CLCP", DbFieldType::String, false),
-    // INPA-INPP
-    FieldDesc::new("INPA", DbFieldType::String, false),
-    FieldDesc::new("INPB", DbFieldType::String, false),
-    FieldDesc::new("INPC", DbFieldType::String, false),
-    FieldDesc::new("INPD", DbFieldType::String, false),
-    FieldDesc::new("INPE", DbFieldType::String, false),
-    FieldDesc::new("INPF", DbFieldType::String, false),
-    FieldDesc::new("INPG", DbFieldType::String, false),
-    FieldDesc::new("INPH", DbFieldType::String, false),
-    FieldDesc::new("INPI", DbFieldType::String, false),
-    FieldDesc::new("INPJ", DbFieldType::String, false),
-    FieldDesc::new("INPK", DbFieldType::String, false),
-    FieldDesc::new("INPL", DbFieldType::String, false),
-    FieldDesc::new("INPM", DbFieldType::String, false),
-    FieldDesc::new("INPN", DbFieldType::String, false),
-    FieldDesc::new("INPO", DbFieldType::String, false),
-    FieldDesc::new("INPP", DbFieldType::String, false),
-    // OUTA-OUTP
-    FieldDesc::new("OUTA", DbFieldType::String, false),
-    FieldDesc::new("OUTB", DbFieldType::String, false),
-    FieldDesc::new("OUTC", DbFieldType::String, false),
-    FieldDesc::new("OUTD", DbFieldType::String, false),
-    FieldDesc::new("OUTE", DbFieldType::String, false),
-    FieldDesc::new("OUTF", DbFieldType::String, false),
-    FieldDesc::new("OUTG", DbFieldType::String, false),
-    FieldDesc::new("OUTH", DbFieldType::String, false),
-    FieldDesc::new("OUTI", DbFieldType::String, false),
-    FieldDesc::new("OUTJ", DbFieldType::String, false),
-    FieldDesc::new("OUTK", DbFieldType::String, false),
-    FieldDesc::new("OUTL", DbFieldType::String, false),
-    FieldDesc::new("OUTM", DbFieldType::String, false),
-    FieldDesc::new("OUTN", DbFieldType::String, false),
-    FieldDesc::new("OUTO", DbFieldType::String, false),
-    FieldDesc::new("OUTP", DbFieldType::String, false),
-    // A-P values
-    FieldDesc::new("A", DbFieldType::Double, false),
-    FieldDesc::new("B", DbFieldType::Double, false),
-    FieldDesc::new("C", DbFieldType::Double, false),
-    FieldDesc::new("D", DbFieldType::Double, false),
-    FieldDesc::new("E", DbFieldType::Double, false),
-    FieldDesc::new("F", DbFieldType::Double, false),
-    FieldDesc::new("G", DbFieldType::Double, false),
-    FieldDesc::new("H", DbFieldType::Double, false),
-    FieldDesc::new("I", DbFieldType::Double, false),
-    FieldDesc::new("J", DbFieldType::Double, false),
-    FieldDesc::new("K", DbFieldType::Double, false),
-    FieldDesc::new("L", DbFieldType::Double, false),
-    FieldDesc::new("M", DbFieldType::Double, false),
-    FieldDesc::new("N", DbFieldType::Double, false),
-    FieldDesc::new("O", DbFieldType::Double, false),
-    FieldDesc::new("P", DbFieldType::Double, false),
-    // LA-LP — the previous value of each channel (`transformRecord.dbd:505-584`:
-    // DBF_DOUBLE, `special(SPC_NOMOD)`, so no client may write them).
-    FieldDesc::new("LA", DbFieldType::Double, true),
-    FieldDesc::new("LB", DbFieldType::Double, true),
-    FieldDesc::new("LC", DbFieldType::Double, true),
-    FieldDesc::new("LD", DbFieldType::Double, true),
-    FieldDesc::new("LE", DbFieldType::Double, true),
-    FieldDesc::new("LF", DbFieldType::Double, true),
-    FieldDesc::new("LG", DbFieldType::Double, true),
-    FieldDesc::new("LH", DbFieldType::Double, true),
-    FieldDesc::new("LI", DbFieldType::Double, true),
-    FieldDesc::new("LJ", DbFieldType::Double, true),
-    FieldDesc::new("LK", DbFieldType::Double, true),
-    FieldDesc::new("LL", DbFieldType::Double, true),
-    FieldDesc::new("LM", DbFieldType::Double, true),
-    FieldDesc::new("LN", DbFieldType::Double, true),
-    FieldDesc::new("LO", DbFieldType::Double, true),
-    FieldDesc::new("LP", DbFieldType::Double, true),
-];
+static TRANSFORM_FIELDS: &[FieldDesc] = dbd_generated::TRANSFORM_FIELDS;
 
 /// Choice labels for the calculation-option menu, in index order.
 /// C `menu(transformCOPT)` (synApps `transformRecord.dbd`): 0=Conditional

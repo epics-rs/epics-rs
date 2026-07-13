@@ -1,6 +1,6 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, MENU_SIMM, ProcessOutcome, Record};
-use crate::types::{DbFieldType, EpicsValue, PvString};
+use crate::server::record::{FieldDesc, MENU_SIMM, ProcessOutcome, Record, dbd_generated};
+use crate::types::{EpicsValue, PvString};
 
 /// Choice labels for the output-increment-format menu, in index order.
 /// C `menu(aoOIF)` (`aoRecord.dbd.pod`): 0=Full, 1=Incremental. Selects
@@ -317,46 +317,7 @@ impl AoRecord {
     }
 }
 
-static FIELDS: &[FieldDesc] = &[
-    FieldDesc::new("VAL", DbFieldType::Double, false),
-    FieldDesc::new("EGU", DbFieldType::String, false),
-    FieldDesc::new("HOPR", DbFieldType::Double, false),
-    FieldDesc::new("LOPR", DbFieldType::Double, false),
-    FieldDesc::new("PREC", DbFieldType::Short, false),
-    FieldDesc::new("DRVH", DbFieldType::Double, false),
-    FieldDesc::new("DRVL", DbFieldType::Double, false),
-    FieldDesc::new("RVAL", DbFieldType::Long, false),
-    FieldDesc::new("ORAW", DbFieldType::Long, true),
-    FieldDesc::new("RBV", DbFieldType::Long, true),
-    FieldDesc::new("ORBV", DbFieldType::Long, true),
-    FieldDesc::new("OVAL", DbFieldType::Double, false),
-    FieldDesc::new("LINR", DbFieldType::Short, false),
-    FieldDesc::new("EGUF", DbFieldType::Double, false),
-    FieldDesc::new("EGUL", DbFieldType::Double, false),
-    FieldDesc::new("ESLO", DbFieldType::Double, false),
-    FieldDesc::new("EOFF", DbFieldType::Double, false),
-    FieldDesc::new("ROFF", DbFieldType::Long, false),
-    FieldDesc::new("ASLO", DbFieldType::Double, false),
-    FieldDesc::new("AOFF", DbFieldType::Double, false),
-    FieldDesc::new("OMSL", DbFieldType::Short, false),
-    FieldDesc::new("DOL", DbFieldType::String, false),
-    FieldDesc::new("OIF", DbFieldType::Short, false),
-    FieldDesc::new("OROC", DbFieldType::Double, false),
-    FieldDesc::new("PVAL", DbFieldType::Double, true),
-    FieldDesc::new("IVOA", DbFieldType::Short, false),
-    FieldDesc::new("IVOV", DbFieldType::Double, false),
-    FieldDesc::new("ADEL", DbFieldType::Double, false),
-    FieldDesc::new("MDEL", DbFieldType::Double, false),
-    FieldDesc::new("LALM", DbFieldType::Double, false),
-    FieldDesc::new("ALST", DbFieldType::Double, false),
-    FieldDesc::new("MLST", DbFieldType::Double, false),
-    FieldDesc::new("INIT", DbFieldType::Char, true),
-    FieldDesc::new("SIMM", DbFieldType::Short, false),
-    FieldDesc::new("SIML", DbFieldType::String, false),
-    FieldDesc::new("SIOL", DbFieldType::String, false),
-    FieldDesc::new("SIMS", DbFieldType::Short, false),
-    FieldDesc::new("SDLY", DbFieldType::Double, false),
-];
+static FIELDS: &[FieldDesc] = dbd_generated::AO_FIELDS;
 
 impl Record for AoRecord {
     fn record_type(&self) -> &'static str {

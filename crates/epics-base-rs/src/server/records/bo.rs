@@ -1,6 +1,8 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, MENU_SIMM, ProcessAction, ProcessOutcome, Record};
-use crate::types::{DbFieldType, EpicsValue, PvString};
+use crate::server::record::{
+    FieldDesc, MENU_SIMM, ProcessAction, ProcessOutcome, Record, dbd_generated,
+};
+use crate::types::{EpicsValue, PvString};
 
 /// Binary output record matching C boRecord behavior.
 /// VAL is converted to RVAL using MASK before writing to hardware.
@@ -111,31 +113,7 @@ impl BoRecord {
     }
 }
 
-static FIELDS: &[FieldDesc] = &[
-    FieldDesc::new("VAL", DbFieldType::Enum, false),
-    FieldDesc::new("RVAL", DbFieldType::ULong, false),
-    FieldDesc::new("ORAW", DbFieldType::ULong, true),
-    FieldDesc::new("RBV", DbFieldType::ULong, true),
-    FieldDesc::new("ORBV", DbFieldType::ULong, true),
-    FieldDesc::new("MASK", DbFieldType::ULong, false),
-    FieldDesc::new("ZNAM", DbFieldType::String, false),
-    FieldDesc::new("ONAM", DbFieldType::String, false),
-    FieldDesc::new("ZSV", DbFieldType::Short, false),
-    FieldDesc::new("OSV", DbFieldType::Short, false),
-    FieldDesc::new("COSV", DbFieldType::Short, false),
-    FieldDesc::new("LALM", DbFieldType::UShort, true),
-    FieldDesc::new("MLST", DbFieldType::UShort, true),
-    FieldDesc::new("OMSL", DbFieldType::Short, false),
-    FieldDesc::new("DOL", DbFieldType::String, false),
-    FieldDesc::new("HIGH", DbFieldType::Double, false),
-    FieldDesc::new("IVOA", DbFieldType::Short, false),
-    FieldDesc::new("IVOV", DbFieldType::UShort, false),
-    FieldDesc::new("SIMM", DbFieldType::Short, false),
-    FieldDesc::new("SIML", DbFieldType::String, false),
-    FieldDesc::new("SIOL", DbFieldType::String, false),
-    FieldDesc::new("SIMS", DbFieldType::Short, false),
-    FieldDesc::new("SDLY", DbFieldType::Double, false),
-];
+static FIELDS: &[FieldDesc] = dbd_generated::BO_FIELDS;
 
 impl Record for BoRecord {
     fn record_type(&self) -> &'static str {

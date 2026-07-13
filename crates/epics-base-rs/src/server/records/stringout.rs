@@ -1,6 +1,8 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, MENU_POST, MENU_YES_NO, ProcessOutcome, Record};
-use crate::types::{DbFieldType, EpicsValue, PvString};
+use crate::server::record::{
+    FieldDesc, MENU_POST, MENU_YES_NO, ProcessOutcome, Record, dbd_generated,
+};
+use crate::types::{EpicsValue, PvString};
 
 /// EPICS `MAX_STRING_SIZE` — `val`/`oval`/`ivov` are fixed 40-byte
 /// buffers in C `stringoutRecord.c`.
@@ -82,21 +84,7 @@ impl StringoutRecord {
     }
 }
 
-static STRINGOUT_FIELDS: &[FieldDesc] = &[
-    FieldDesc::new("VAL", DbFieldType::String, false),
-    FieldDesc::new("OVAL", DbFieldType::String, true),
-    FieldDesc::new("IVOA", DbFieldType::Short, false),
-    FieldDesc::new("IVOV", DbFieldType::String, false),
-    FieldDesc::new("OMSL", DbFieldType::Short, false),
-    FieldDesc::new("DOL", DbFieldType::String, false),
-    FieldDesc::new("SIMM", DbFieldType::Short, false),
-    FieldDesc::new("SIML", DbFieldType::String, false),
-    FieldDesc::new("SIOL", DbFieldType::String, false),
-    FieldDesc::new("SIMS", DbFieldType::Short, false),
-    FieldDesc::new("SDLY", DbFieldType::Double, false),
-    FieldDesc::new("MPST", DbFieldType::Short, false),
-    FieldDesc::new("APST", DbFieldType::Short, false),
-];
+static STRINGOUT_FIELDS: &[FieldDesc] = dbd_generated::STRINGOUT_FIELDS;
 
 impl Record for StringoutRecord {
     fn record_type(&self) -> &'static str {

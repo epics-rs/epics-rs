@@ -398,6 +398,11 @@ pub fn compile(tokens: &[Token], kind: ExprKind) -> Result<CompiledExpr, CalcErr
     let mut runtime_depth: i32 = 0;
     let mut cond_count: i32 = 0;
     let mut pos = 0;
+    // C `*ppostfix = USES_STRING` (`sCalcPostfix.c:447-471`) — latched as each
+    // element is LOOKED UP, which is the only moment the retract-and-rewrite of
+    // `:=` has not yet erased the evidence. sCalc's marker only; the numeric and
+    // array compilers have none.
+    let mut uses_string = false;
     // No `bracket_depth` / `brace_depth` counters: the open `[` / `{` IS a
     // `StackEntry::Subrange` on the operator stack, exactly as in C, so the stack
     // already answers "is one open, and which". A side counter was a second
@@ -406,6 +411,10 @@ pub fn compile(tokens: &[Token], kind: ExprKind) -> Result<CompiledExpr, CalcErr
     while pos < tokens.len() {
         let token = &tokens[pos];
         pos += 1;
+
+        if kind == ExprKind::String && token_is_string_element(token) {
+            uses_string = true;
+        }
 
         if operand_needed {
             match token {
@@ -823,7 +832,50 @@ pub fn compile(tokens: &[Token], kind: ExprKind) -> Result<CompiledExpr, CalcErr
         code: output,
         kind,
         loop_pairs: Vec::new(),
+        uses_string,
     })
+}
+
+/// C's USES_STRING test, applied where C applies it: to the ELEMENT the lexer
+/// just looked up (`sCalcPostfix.c:447-471`), not to the opcode that survives
+/// compilation.
+///
+/// The two are not the same set. `:=` RETRACTS the fetch it follows and emits a
+/// store instead (`:552-557`), so `AA:="x"` compiles to a program with no
+/// string-typed opcode in it — yet C has already stamped it USES_STRING, from
+/// the `FETCH_AA` it looked up a moment earlier, and runs the string evaluator.
+/// Recording the flag here, at the lookup, is the only place that can see it.
+///
+/// The list is C's, symbol for symbol — an ALLOWLIST, and a narrower one than
+/// "mentions a string": `DBL`, `BYTE`, `|-` and `@` are all absent from it, so a
+/// program whose only string element is one of those keeps the double-only
+/// evaluator (which is R14-2's subject).
+fn token_is_string_element(token: &Token) -> bool {
+    match token {
+        // FETCH_AA..FETCH_LL, FETCH_SVAL, LITERAL_STRING.
+        Token::DoubleVar(_) | Token::FetchSval | Token::StringLiteral(_) => true,
+        // SUBRANGE (`[`) and REPLACE (`{`) — the sCalc table's codes for them.
+        Token::LBracket | Token::LBrace => true,
+        Token::Func(f) => matches!(
+            f,
+            FuncName::Str           // TO_STRING
+                | FuncName::Printf  // PRINTF
+                | FuncName::BinWrite // BIN_WRITE
+                | FuncName::Sscanf  // SSCANF
+                | FuncName::BinRead // BIN_READ
+                | FuncName::SDynSFetch // A_SFETCH (`@@`)
+                | FuncName::TrEsc   // TR_ESC
+                | FuncName::Esc     // ESC
+                | FuncName::Crc16   // CRC16
+                | FuncName::ModBus  // MODBUS
+                | FuncName::Lrc     // LRC
+                | FuncName::AModBus // AMODBUS
+                | FuncName::Xor8    // XOR8
+                | FuncName::AddXor8 // ADD_XOR8
+                | FuncName::Len // LEN
+        ),
+        _ => false,
+    }
 }
 
 fn stack_effect(entry: &StackEntry) -> i32 {

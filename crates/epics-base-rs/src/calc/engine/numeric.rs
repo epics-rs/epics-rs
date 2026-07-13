@@ -466,8 +466,7 @@ mod parity_tests {
                 Opcode::Core(CoreOp::PushConst(2.0)),
                 Opcode::Core(CoreOp::End),
             ],
-            kind: ExprKind::Numeric,
-            loop_pairs: Vec::new(),
+            ..CompiledExpr::empty(ExprKind::Numeric)
         };
         let mut inp = NumericInputs::new();
         assert_eq!(eval(&prog, &mut inp), Err(CalcError::Internal));

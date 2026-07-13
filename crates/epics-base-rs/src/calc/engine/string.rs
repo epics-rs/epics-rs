@@ -29,8 +29,10 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
     let mut until_marks: Vec<(usize, usize)> = Vec::new();
     let mut loops_done: i32 = 0;
     // C compiles the USES_STRING marker into the postfix and `sCalcPerform`
-    // switches on it ONCE (`sCalcPerform.c:399`) to pick a whole evaluator.
-    let string_path = uses_string(code);
+    // switches on it ONCE (`sCalcPerform.c:399`) to pick a whole evaluator. The
+    // marker is the compiler's — `CompiledExpr::uses_string`, latched at element
+    // lookup — never re-derived from the finished opcodes here.
+    let string_path = expr.uses_string;
 
     while pc < code.len() {
         let op = &code[pc];
@@ -1678,7 +1680,7 @@ pub struct ScalcResult {
 /// (`lenSresult > 15` always holds: scalcout's buffer is `STRING_SIZE` = 40.)
 pub fn epilogue(expr: &CompiledExpr, top: &StackValue, precision: i16) -> ScalcResult {
     let val = top.to_double();
-    if uses_string(&expr.code) {
+    if expr.uses_string {
         ScalcResult {
             val,
             sval: top.clone().into_string_value(),
@@ -1695,59 +1697,6 @@ pub fn epilogue(expr: &CompiledExpr, top: &StackValue, precision: i16) -> ScalcR
         };
         ScalcResult { val, sval }
     }
-}
-
-/// Whether `sCalcPostfix` would have stamped this program `USES_STRING`
-/// (`sCalcPostfix.c:447-475`), which is what makes `sCalcPerform` run its
-/// string evaluator (`:2057`) instead of the plain double one (`:399`).
-///
-/// The two evaluators differ arithmetically in exactly one place — MODULO's
-/// cast width, `(int)` vs `(long)` — so the marker is not cosmetic.
-///
-/// C's list is an opcode allowlist, and it is narrower than "mentions a
-/// string": `TO_DOUBLE` (`DBL`), `BYTE`, `SUBLAST` (`|-`) and the string-var
-/// STORES (`A_SSTORE`, i.e. `AA:=`) are all absent from it, so an expression
-/// using only those keeps the no-string evaluator. That asymmetry is C's, and
-/// this list mirrors it case for case.
-fn uses_string(code: &[Opcode]) -> bool {
-    code.iter().any(|op| match op {
-        // FETCH_AA..FETCH_LL — C's first twelve cases, and the commonest trigger
-        // by far. `AA` compiles to `PushDoubleVar` in every engine (`postfix.rs`,
-        // `Token::DoubleVar`); which of the two things it means — a string in the
-        // string evaluator, a numeric AA elsewhere — is the EVALUATOR's business,
-        // not the compiler's, so there is one opcode and this is where it is
-        // recognised.
-        Opcode::Core(CoreOp::PushDoubleVar(_)) => true,
-        // FETCH_SVAL.
-        Opcode::Core(CoreOp::FetchSval) => true,
-        Opcode::String(s) => match s {
-            StringOp::ToString           // TO_STRING
-            | StringOp::Printf           // PRINTF
-            | StringOp::BinWrite         // BIN_WRITE
-            | StringOp::Sscanf           // SSCANF
-            | StringOp::BinRead          // BIN_READ
-            | StringOp::PushString(_)    // LITERAL_STRING
-            | StringOp::Subrange         // SUBRANGE
-            | StringOp::Replace          // REPLACE
-            | StringOp::TrEsc            // TR_ESC
-            | StringOp::Esc              // ESC
-            | StringOp::Crc16            // CRC16
-            | StringOp::Crc16Append      // MODBUS
-            | StringOp::Lrc              // LRC
-            | StringOp::LrcAppend        // AMODBUS
-            | StringOp::Xor8             // XOR8
-            | StringOp::Xor8Append       // ADD_XOR8
-            | StringOp::Len              // LEN
-            | StringOp::DynSFetch => true, // A_SFETCH (`sCalcPostfix.c:461`)
-            // Absent from C's list, deliberately — `A_FETCH` (`@`) among them: it
-            // answers a double, so an expression whose only "string" element is a
-            // `@` keeps the no-string evaluator.
-            StringOp::ToDouble | StringOp::Byte | StringOp::SubLast
-            | StringOp::DynFetch
-            | StringOp::StoreStringVar(_) => false,
-        },
-        _ => false,
-    })
 }
 
 fn pop1(stack: &mut Vec<StackValue>) -> Result<StackValue, CalcError> {
@@ -2071,8 +2020,18 @@ mod stack_depth_invariant {
     fn run(code: Vec<Opcode>) -> Result<StackValue, CalcError> {
         let expr = CompiledExpr {
             code,
-            kind: ExprKind::String,
-            loop_pairs: Vec::new(),
+            ..CompiledExpr::empty(ExprKind::String)
+        };
+        eval(&expr, &mut StringInputs::new())
+    }
+
+    /// The same, on the evaluator C picks for a USES_STRING program — the marker
+    /// is the compiler's, so a hand-built program must state it.
+    fn run_string(code: Vec<Opcode>) -> Result<StackValue, CalcError> {
+        let expr = CompiledExpr {
+            code,
+            uses_string: true,
+            ..CompiledExpr::empty(ExprKind::String)
         };
         eval(&expr, &mut StringInputs::new())
     }
@@ -2113,7 +2072,7 @@ mod stack_depth_invariant {
             Opcode::String(StringOp::PushString(b"b".to_vec())),
             Opcode::Core(CoreOp::End),
         ];
-        assert_eq!(run(leaked), Err(CalcError::StackLeak));
+        assert_eq!(run_string(leaked), Err(CalcError::StackLeak));
     }
 
     #[test]

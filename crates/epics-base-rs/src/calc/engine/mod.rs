@@ -34,6 +34,25 @@ pub struct CompiledExpr {
     pub code: Vec<Opcode>,
     pub kind: ExprKind,
     pub loop_pairs: Vec<(usize, usize)>,
+    /// C's `USES_STRING` marker — the byte `sCalcPostfix` writes at the head of
+    /// the postfix, and the ONLY thing `sCalcPerform` looks at to choose between
+    /// its two evaluators (`sCalcPerform.c:399`).
+    ///
+    /// It is a property of the SOURCE, not of the compiled code: C sets it while
+    /// looking each element up (`sCalcPostfix.c:447-471`), so it latches on the
+    /// element the lexer FOUND — before the compiler has had a chance to rewrite
+    /// it. `AA:="x";1` is the case that pins the difference: `AA` is looked up as
+    /// `FETCH_AA` (string-typed → marker set) and only afterwards retracted and
+    /// rewritten to `STORE_AA` (`:552-557`), which is NOT in the marker's list.
+    /// So the program is USES_STRING even though no string-typed opcode survives
+    /// in it, and C runs the string evaluator — the one whose STORE_AA writes the
+    /// string args.
+    ///
+    /// A re-scan of the finished opcodes cannot see that, which is why the flag is
+    /// recorded once, at the lookup, by its single owner (`postfix::compile`) and
+    /// carried here. Always `false` for the numeric and array engines, which have
+    /// no such marker.
+    pub uses_string: bool,
 }
 
 impl CompiledExpr {
@@ -52,6 +71,10 @@ impl CompiledExpr {
             code: Vec::new(),
             kind,
             loop_pairs: Vec::new(),
+            // C writes `NO_STRING` first and only overwrites it when an element
+            // says otherwise (`sCalcPostfix.c:437`); the empty program has no
+            // elements. It is refused before the marker is ever read, anyway.
+            uses_string: false,
         }
     }
 

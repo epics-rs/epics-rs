@@ -1690,8 +1690,7 @@ mod stack_depth_invariant {
     fn run(code: Vec<Opcode>) -> Result<ArrayStackValue, CalcError> {
         let expr = CompiledExpr {
             code,
-            kind: ExprKind::Array,
-            loop_pairs: Vec::new(),
+            ..CompiledExpr::empty(ExprKind::Array)
         };
         eval(&expr, &mut ArrayInputs::new(4))
     }

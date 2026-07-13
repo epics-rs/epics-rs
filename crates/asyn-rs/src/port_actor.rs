@@ -1276,27 +1276,16 @@ impl PortActor {
         self.driver.base().is_device_connected(addr)
     }
 
-    /// The octet read every request op goes through — C `asynOctetBase::readIt`
-    /// (asynOctetBase.c:224-238), which sits between the caller and the driver's
-    /// own `read` exactly as this does:
+    /// The octet read every request op goes through: the port's interpose chain,
+    /// ending at the driver (C `asynOctet::read` on the interface `findInterface`
+    /// resolves — [`crate::port::octet_read_chain`]).
     ///
-    /// ```c
-    /// status = pasynOctet->read(poctetPvt->drvPvt, pasynUser, data, maxchars,
-    ///                           nbytesTransfered, eomReason);
-    /// if (status != asynSuccess) return status;
-    /// if (poctetPvt->interruptProcess)
-    ///     callInterruptUsers(pasynUser, poctetPvt->pasynPvt, data,
-    ///                        nbytesTransfered, eomReason);
-    /// ```
-    ///
-    /// The fan-out lives here rather than in each driver because in C it is not
-    /// the driver's: `octetBase` is interposed on the port, so *every* read on a
-    /// port that enabled `interruptProcess` fans out, whichever request brought
-    /// it. That is what makes a `stringin`/`waveform` with `SCAN="I/O Intr"` on
-    /// an IP or serial port process — before this, no driver notified after a
-    /// read and such a record never ran.
-    ///
-    /// A failed read fans out nothing (C returns before `callInterruptUsers`).
+    /// The octet interrupt fan-out is NOT here. In C it lives in
+    /// `asynOctetBase::readIt` (asynOctetBase.c:224-238), which is interposed
+    /// directly on the driver and therefore sits *below* the EOS layer — so it
+    /// runs per lower-level read, on the raw driver chunk. That position is
+    /// [`crate::port::DriverOctetLink::read`]; firing it here instead handed
+    /// interrupt users the post-EOS message and the EOS eomReason (R19-112).
     fn octet_read(
         &mut self,
         user: &AsynUser,
@@ -1305,21 +1294,6 @@ impl PortActor {
         let mut buf = vec![0u8; buf_size];
         let (n, eom) = crate::port::octet_read_chain(&mut *self.driver, user, &mut buf)?;
         buf.truncate(n);
-        if self.driver.base().octet_interrupt_process {
-            // C filters the list by addr (:203-215); `InterruptFilter` does that
-            // here. The value type is the port's octet payload — a `String` — so
-            // a non-UTF-8 device read is replacement-charactered on this path;
-            // that is the octet-param type, not this fan-out, and it is the same
-            // on every other octet path in the crate.
-            self.driver.base().interrupts.notify(InterruptValue {
-                reason: user.reason,
-                addr: user.addr,
-                value: ParamValue::Octet(String::from_utf8_lossy(&buf).into_owned()),
-                timestamp: SystemTime::now(),
-                iface: Some(InterfaceType::Octet),
-                ..Default::default()
-            });
-        }
         Ok((buf, n, eom))
     }
 

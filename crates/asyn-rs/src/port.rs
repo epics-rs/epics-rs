@@ -2153,8 +2153,32 @@ struct DriverOctetLink<'a> {
 }
 
 impl OctetNext for DriverOctetLink<'_> {
+    /// C `asynOctetBase::readIt` (asynOctetBase.c:224-238): call the driver's
+    /// own `read`, and on success fan the result out to the port's octet
+    /// interrupt users.
+    ///
+    /// This is *below* the EOS layer by construction, and that is the whole
+    /// point. C interposes `octetBase` directly on the driver
+    /// (asynOctetBase.c:156-159) and only then pushes `asynInterposeEos` on top
+    /// of it (:169-171), so the stack is `EOS → octetBase → driver`: every
+    /// interrupt user sees the RAW DRIVER CHUNK — terminator included, with the
+    /// driver's own CNT/END eomReason — and gets one callback per lower-level
+    /// read, not one per EOS-completed message. Firing above the chain (as the
+    /// port actor used to) handed an I/O-Intr record `"abc"`/EOMR=EOS where C
+    /// hands it `"abc\r\n"`/EOMR=CNT|END.
     fn read(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<OctetReadResult> {
         let (nbytes_transferred, eom_reason) = self.driver.io_read_octet_eom(user, buf)?;
+        if self.driver.base().octet_interrupt_process {
+            let raw = &buf[..nbytes_transferred];
+            self.driver.base().interrupts.notify(InterruptValue {
+                reason: user.reason,
+                addr: user.addr,
+                value: ParamValue::Octet(String::from_utf8_lossy(raw).into_owned()),
+                timestamp: SystemTime::now(),
+                iface: Some(InterfaceType::Octet),
+                ..Default::default()
+            });
+        }
         Ok(OctetReadResult {
             nbytes_transferred,
             eom_reason,
@@ -2240,6 +2264,105 @@ pub(crate) fn octet_flush_chain(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A driver whose `io_read_octet_eom` hands back one scripted chunk per
+    /// call, with the driver-level eomReason C would report (CNT when the
+    /// caller's buffer filled, END never — a stream driver has no message
+    /// boundary). The EOS layer above it is what turns chunks into messages.
+    struct ChunkDriver {
+        base: PortDriverBase,
+        chunks: Vec<Vec<u8>>,
+        next: usize,
+    }
+
+    impl ChunkDriver {
+        fn new(chunks: Vec<&[u8]>) -> Self {
+            let mut base = PortDriverBase::new("chunk", 1, PortFlags::default());
+            base.octet_interrupt_process = true;
+            base.init_connected(true);
+            Self {
+                base,
+                chunks: chunks.into_iter().map(|c| c.to_vec()).collect(),
+                next: 0,
+            }
+        }
+    }
+
+    impl PortDriver for ChunkDriver {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+        fn io_read_octet_eom(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> AsynResult<(usize, EomReason)> {
+            let chunk = self.chunks.get(self.next).cloned().unwrap_or_default();
+            self.next += 1;
+            let n = chunk.len().min(buf.len());
+            buf[..n].copy_from_slice(&chunk[..n]);
+            let eom = if n == buf.len() {
+                EomReason::CNT
+            } else {
+                EomReason::empty()
+            };
+            Ok((n, eom))
+        }
+    }
+
+    /// The octet interrupt fan-out runs BELOW the interpose chain, at the
+    /// driver link — C's `asynOctetBase::readIt` (asynOctetBase.c:224-238),
+    /// which is interposed directly on the driver (:156-159) with the EOS layer
+    /// pushed on top of it (:169-171).
+    ///
+    /// Two boundaries, both invisible when the fan-out ran above the chain:
+    /// (1) the payload an interrupt user receives is the RAW driver chunk —
+    /// terminator included — not the EOS-stripped message the caller gets; and
+    /// (2) a message assembled from two lower-level reads fires TWO callbacks,
+    /// one per driver read, not one per completed message.
+    #[test]
+    fn octet_interrupt_fans_out_below_the_interpose_chain() {
+        use crate::interpose::eos::EosInterpose;
+        use crate::interrupt::{InterruptFilter, InterruptValue};
+        use std::sync::{Arc, Mutex};
+
+        // The message "abc\r\n" arrives split across two driver reads.
+        let mut drv = ChunkDriver::new(vec![b"ab", b"c\r\n"]);
+        drv.base_mut()
+            .install_octet_interpose(Box::new(EosInterpose::default()));
+        drv.set_input_eos(&AsynUser::default(), b"\r\n").unwrap();
+
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_cb = seen.clone();
+        let _sub = drv.base().interrupts.register_sync_callback(
+            InterruptFilter::default(),
+            move |iv: &InterruptValue| {
+                if let ParamValue::Octet(s) = &iv.value {
+                    seen_cb.lock().unwrap().push(s.clone());
+                }
+            },
+        );
+
+        let user = AsynUser::default();
+        let mut buf = [0u8; 32];
+        let (n, eom) = octet_read_chain(&mut drv, &user, &mut buf).unwrap();
+
+        // The CALLER gets the EOS-terminated message, terminator stripped.
+        assert_eq!(&buf[..n], b"abc");
+        assert!(eom.contains(EomReason::EOS), "caller sees EOS, got {eom:?}");
+
+        // The INTERRUPT USERS get the raw driver chunks, terminator included,
+        // one callback per lower-level read.
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["ab".to_string(), "c\r\n".to_string()],
+            "each driver read fans out its raw chunk"
+        );
+    }
+
     struct TestDriver {
         base: PortDriverBase,
     }

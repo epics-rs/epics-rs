@@ -99,6 +99,28 @@ pub(crate) fn put_drives_processing_of(
             && instance.record.processes_after_put(field))
 }
 
+/// Drain the record's per-cycle post marks ([`Record::take_cycle_posted_fields`])
+/// into monitor posts — the put-path counterpart of the `db_post_events` calls a
+/// C `special()` makes by hand.
+///
+/// One owner, so the two put-path drains (the normal tail, and the failing
+/// `special()` above) cannot disagree about the mask mapping.
+fn emit_cycle_posts(instance: &mut crate::server::record::RecordInstance) {
+    use crate::server::record::{CyclePostMask, EventMask};
+    for (sf, cycle_mask) in instance.record.take_cycle_posted_fields() {
+        let mask = match cycle_mask {
+            CyclePostMask::Value => EventMask::VALUE,
+            // No `monitor_mask` exists on a put path (no alarm transition is
+            // being resolved), so both LOG-carrying variants reduce to C's
+            // literal `DBE_VALUE|DBE_LOG`.
+            CyclePostMask::ValueLog | CyclePostMask::MonitorValueLog => {
+                EventMask::VALUE | EventMask::LOG
+            }
+        };
+        instance.notify_field(sf, mask);
+    }
+}
+
 /// C `dbPutSpecial(paddr, 1)` — the after-put `special()`, paired with the drain
 /// of the link writes it queued ([`Record::take_special_actions`]).
 ///
@@ -122,6 +144,15 @@ fn special_after_put(
 ) -> CaResult<crate::server::record::CommonFieldPutResult> {
     let status = instance.record.special(field, true);
     out.extend(instance.record.take_special_actions());
+    if status.is_err() {
+        // The POSTS `special()` made are drained on the failing path for the same
+        // reason its ACTIONS are: C's `special()` calls `db_post_events` BEFORE it
+        // returns nonzero — aCalcout's NUSE arm posts the clamped value with
+        // `DBE_VALUE` and only then `return (-1)` (`aCalcoutRecord.c:495-499`) —
+        // and `dbPut`'s `goto done` skips only dbPut's OWN post. A refused put
+        // that repaired a field must still tell the subscribers what it repaired.
+        emit_cycle_posts(instance);
+    }
     status?;
 
     // C `special()`'s CONSTANT-link re-seed (`calcoutRecord.c:367-378`,
@@ -1543,19 +1574,7 @@ impl PvDatabase {
             // put, `DBE_VALUE`, `only if (strcmp(str, plinkGroup->s))`,
             // sseqRecord.c:1108-1116). A static field-name list cannot
             // express "only if it changed", so it over-posts; the mark can.
-            for (sf, cycle_mask) in instance.record.take_cycle_posted_fields() {
-                use crate::server::record::{CyclePostMask, EventMask};
-                let mask = match cycle_mask {
-                    CyclePostMask::Value => EventMask::VALUE,
-                    // No `monitor_mask` exists on a put path (no alarm
-                    // transition is being resolved), so both LOG-carrying
-                    // variants reduce to C's literal `DBE_VALUE|DBE_LOG`.
-                    CyclePostMask::ValueLog | CyclePostMask::MonitorValueLog => {
-                        EventMask::VALUE | EventMask::LOG
-                    }
-                };
-                instance.notify_field(sf, mask);
-            }
+            emit_cycle_posts(&mut instance);
 
             common_result
         };

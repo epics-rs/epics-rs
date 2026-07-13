@@ -29,6 +29,7 @@ pub mod request;
 pub mod runtime;
 pub mod services;
 pub mod sync_io;
+pub mod timestamp;
 pub mod trace;
 pub(crate) mod transport;
 pub mod user;

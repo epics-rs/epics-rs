@@ -90,17 +90,39 @@ pub struct EosInterpose {
     /// The terminators a device starts with — the config this layer was
     /// installed with, C's `asynInterposeEosConfig` arguments.
     initial: EosConfig,
+    /// C `eosPvt::processEosIn` (asynInterposeEos.c:42, set from the
+    /// `asynInterposeEosConfig` argument at :128). When false the layer is not
+    /// in the input path at all: `readIt` delegates straight to the driver
+    /// (:191-193) and the terminator setters are the driver's (:260, :293).
+    process_in: bool,
+    /// C `eosPvt::processEosOut` (:50, :134) — same, for the write path (:161).
+    process_out: bool,
     /// The port's device model, set at install ([`OctetInterpose::attach_port`]).
     multi_device: bool,
     devices: HashMap<i32, EosDevice>,
 }
 
 impl EosInterpose {
+    /// The `drvAsynIPPortConfigure` install: C passes `processEosIn = 1,
+    /// processEosOut = 1` (drvAsynIPPort.c:1065-1066), so both halves run.
     pub fn new(config: EosConfig) -> Self {
         Self {
             initial: config,
+            process_in: true,
+            process_out: true,
             multi_device: false,
             devices: HashMap::new(),
+        }
+    }
+
+    /// The `asynInterposeEosConfig portName addr processIn processOut` install:
+    /// the shell chooses which half of the layer is live
+    /// (asynInterposeEos.c:84-140).
+    pub fn with_processing(config: EosConfig, process_in: bool, process_out: bool) -> Self {
+        Self {
+            process_in,
+            process_out,
+            ..Self::new(config)
         }
     }
 
@@ -164,6 +186,13 @@ impl OctetInterpose for EosInterpose {
         // `in_buf`, stranding read-ahead bytes left by a prior EOS read when
         // the terminator is later cleared (binary I/O or a runtime IEOS
         // clear) — bytes C delivers from `inBuf` first.
+        // C `readIt` (:191-193): a layer installed with `processEosIn == 0` is
+        // not in the input path — the read is the driver's, unbuffered and
+        // unterminated. `in_buf` is never allocated in that case (:129-132), so
+        // there is nothing here that could strand bytes either.
+        if !self.process_in {
+            return next.read(user, buf);
+        }
         let maxchars = buf.len();
         if maxchars == 0 {
             // A zero-length destination buffer can store nothing — return
@@ -304,6 +333,12 @@ impl OctetInterpose for EosInterpose {
         data: &[u8],
         next: &mut dyn OctetNext,
     ) -> AsynResult<usize> {
+        // C `writeIt` (:161): no terminator is appended when the layer was
+        // installed with `processEosOut == 0`, or when this device has no
+        // output terminator.
+        if !self.process_out {
+            return next.write(user, data);
+        }
         let out_eos = self.device(user.addr).config.output_eos.clone();
         if out_eos.is_empty() {
             return next.write(user, data);
@@ -341,6 +376,12 @@ impl OctetInterpose for EosInterpose {
     }
 
     fn set_input_eos(&mut self, addr: i32, eos: &[u8]) {
+        // C :260 — with `processEosIn == 0` the terminator belongs to the
+        // driver, not to this layer; taking it here would make `read` (which
+        // delegates) and the stored terminator disagree.
+        if !self.process_in {
+            return;
+        }
         let dev = self.device(addr);
         dev.config.input_eos = eos.to_vec();
         // Reset the resync state machine — a mid-stream terminator change
@@ -349,6 +390,9 @@ impl OctetInterpose for EosInterpose {
     }
 
     fn set_output_eos(&mut self, addr: i32, eos: &[u8]) {
+        if !self.process_out {
+            return;
+        }
         self.device(addr).config.output_eos = eos.to_vec();
     }
 

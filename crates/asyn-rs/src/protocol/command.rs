@@ -105,6 +105,11 @@ pub enum PortCommand {
     SetAutoConnect {
         yes: bool,
     },
+    /// Per-device auto-connect toggle — the `addr` half of the same C call,
+    /// selected by `findDpCommon` (asynManager.c:496-509).
+    SetAutoConnectAddr {
+        yes: bool,
+    },
     GetBoundsInt32,
     GetBoundsInt64,
     /// Query whether the port is currently enabled.
@@ -161,6 +166,22 @@ pub enum PortCommand {
     /// wire encoding.
     PushDelayInterpose {
         delay_secs: f64,
+    },
+    /// Install the EOS interpose — C `asynInterposeEosConfig`. Appended last:
+    /// the variant order is the wire encoding.
+    PushEosInterpose {
+        process_in: bool,
+        process_out: bool,
+    },
+    /// Install the flush-timeout interpose — C `asynInterposeFlushConfig`. The
+    /// timeout travels as seconds; C's shell argument is milliseconds.
+    PushFlushInterpose {
+        flush_timeout_secs: f64,
+    },
+    /// Set or clear the port's time-stamp source by name — C
+    /// `asynRegisterTimeStampSource` / `asynUnregisterTimeStampSource`.
+    SetTimeStampSource {
+        name: Option<String>,
     },
     /// Read back the driver's input EOS — C `pasynOctet->getInputEos`.
     /// Appended last: the variant order is the wire encoding.
@@ -230,6 +251,7 @@ mod tests {
             PortCommand::DisableAddr,
             PortCommand::SetEnable { yes: true },
             PortCommand::SetAutoConnect { yes: false },
+            PortCommand::SetAutoConnectAddr { yes: true },
             PortCommand::GetBoundsInt32,
             PortCommand::GetBoundsInt64,
             PortCommand::GetEnable,
@@ -250,6 +272,16 @@ mod tests {
             PortCommand::GetConnected,
             PortCommand::PushEchoInterpose,
             PortCommand::PushDelayInterpose { delay_secs: 0.001 },
+            PortCommand::PushEosInterpose {
+                process_in: true,
+                process_out: false,
+            },
+            PortCommand::PushFlushInterpose {
+                flush_timeout_secs: 0.05,
+            },
+            PortCommand::SetTimeStampSource {
+                name: Some("myTimeStamp".into()),
+            },
             PortCommand::GetInputEos,
             PortCommand::GetOutputEos,
             PortCommand::GpibUniversalCmd { cmd: 0x14 },

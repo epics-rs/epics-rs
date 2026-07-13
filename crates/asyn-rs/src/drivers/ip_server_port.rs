@@ -58,13 +58,15 @@ use std::time::{Duration, SystemTime};
 use parking_lot::Mutex;
 
 use crate::asyn_trace;
-use crate::drivers::ip_port::{is_nonfatal_read_timeout, maxchars_zero_error, socket_poll_timeout};
+use crate::drivers::ip_port::{
+    DrvAsynIPPort, is_nonfatal_read_timeout, maxchars_zero_error, socket_poll_timeout,
+};
 use crate::drivers::option_parse::parse_yn_option;
 use crate::error::{AsynError, AsynResult, AsynStatus};
 use crate::exception::AsynException;
 use crate::interfaces::InterfaceType;
 use crate::interpose::{EomReason, OctetReadResult};
-use crate::interrupt::{InterruptManager, InterruptValue};
+use crate::interrupt::{InterruptManager, InterruptValue, OctetFanOut};
 use crate::param::ParamValue;
 use crate::port::{ExceptionAnnouncer, PortDriver, PortDriverBase, PortFlags};
 use crate::trace::{TraceManager, TraceMask};
@@ -119,6 +121,13 @@ pub struct IpServerConfig {
     /// Slot table cap — see [`DEFAULT_MAX_CLIENTS`]. Ignored in UDP
     /// mode (no per-peer slots).
     pub max_clients: usize,
+    /// C `tty->noProcessEos` — the sixth `drvAsynIPServerPortConfigure`
+    /// argument, whose ONLY use in C is to be handed to each child port's
+    /// `drvAsynIPPortConfigure` (drvAsynIPServerPort.c:688-694). It lives on the
+    /// server's config because that is what it governs: whether the ports the
+    /// server creates get C's default EOS interpose. A server therefore cannot
+    /// exist without having decided its children's EOS policy.
+    pub no_process_eos: bool,
     /// Per-accepted-connection read timeout. Affects the worker
     /// task's `set_read_timeout`; defaults to no timeout (block until
     /// data or EOF).
@@ -222,6 +231,9 @@ impl IpServerConfig {
             bind_port: port,
             protocol,
             max_clients: DEFAULT_MAX_CLIENTS,
+            // C's default: `drvAsynIPServerPortConfigure` with a zero/omitted
+            // noProcessEos gives every child the EOS interpose.
+            no_process_eos: false,
             read_timeout: None,
         })
     }
@@ -552,6 +564,14 @@ struct Acceptor {
 }
 
 impl Acceptor {
+    /// Copy the parent's trace masks onto the child port that just took a
+    /// connection — C `drvAsynIPServerPort.c:367-369`.
+    fn seed_child_trace(&self, child: &str) {
+        let Some(trace) = &self.trace else { return };
+        trace.set_trace_mask(Some(child), trace.get_trace_mask(Some(&self.port_name)));
+        trace.set_trace_io_mask(Some(child), trace.get_trace_io_mask(Some(&self.port_name)));
+    }
+
     /// Accept one pending connection and assign it to a free slot. Returns the
     /// slot index used, or `None` when no connection is pending.
     ///
@@ -586,6 +606,14 @@ impl Acceptor {
                 slot.assign(stream, peer);
                 self.announcer.announce(AsynException::Connect, i as i32);
                 let child = format!("{}:{}", self.port_name, i);
+                // C :367-369 — "Set the new port to initially have the same
+                // trace mask that we have". The connection is what makes the
+                // child a live port, so the accept is where it inherits the
+                // parent's tracing; `asynSetTraceMask SERVER -1 0x9` in an
+                // st.cmd, before any client exists, must therefore reach the
+                // client that later connects. Initially: a later change to the
+                // parent does not follow (C copies once, here too).
+                self.seed_child_trace(&child);
                 asyn_trace!(
                     Some(self.trace),
                     &self.port_name,
@@ -593,15 +621,22 @@ impl Acceptor {
                     "new connection from {peer} on {child}"
                 );
                 // C :374-383 — the octet callbacks carry the child port name,
-                // not the payload.
-                self.interrupts.notify(InterruptValue {
-                    reason: 0,
-                    addr: i as i32,
-                    value: ParamValue::Octet(child),
-                    timestamp: SystemTime::now(),
-                    iface: Some(InterfaceType::Octet),
-                    ..Default::default()
-                });
+                // not the payload. The listener walks the interrupt list and
+                // calls EVERY node unconditionally: there is no addr test here
+                // (unlike asynOctetBase.c:203-215, which does test addr). A
+                // client landing in slot 3 must be announced to a listener that
+                // registered on addr 0, because "which slot" is the news.
+                self.interrupts.notify_octet(
+                    OctetFanOut::EveryUser,
+                    InterruptValue {
+                        reason: 0,
+                        addr: i as i32,
+                        value: ParamValue::Octet(child),
+                        timestamp: SystemTime::now(),
+                        iface: Some(InterfaceType::Octet),
+                        ..Default::default()
+                    },
+                );
                 return Ok(Some(i));
             }
         }
@@ -904,9 +939,12 @@ impl DrvAsynIPServerPort {
         let cache_t = Arc::clone(&self.udp_cache);
         let shutdown_t = Arc::clone(&self.udp_shutdown);
         let port_name = self.base.port_name.clone();
+        // The worker fires this port's octet interrupts (C :312-321), so it
+        // needs the same interrupt source the driver publishes on.
+        let interrupts_t = InterruptManager::from_shared_state(self.base.interrupts.shared_state());
         let handle = std::thread::Builder::new()
             .name(format!("udp-server-{port_name}"))
-            .spawn(move || udp_recv_loop(socket_t, cache_t, shutdown_t, port_name))
+            .spawn(move || udp_recv_loop(socket_t, cache_t, shutdown_t, port_name, interrupts_t))
             .map_err(|e| AsynError::Status {
                 status: AsynStatus::Error,
                 message: format!("UDP recv thread spawn failed: {e}"),
@@ -1093,7 +1131,11 @@ impl DrvAsynIPServerPort {
             });
         }
         let name = self.child_port_name(idx);
-        Ok(DrvAsynIPSubport::new(name, Arc::clone(&self.slots[idx])))
+        Ok(DrvAsynIPSubport::new(
+            name,
+            Arc::clone(&self.slots[idx]),
+            self.config.no_process_eos,
+        ))
     }
 }
 
@@ -1410,6 +1452,7 @@ fn udp_recv_loop(
     cache: Arc<Mutex<UdpCache>>,
     shutdown: Arc<AtomicBool>,
     port_name: String,
+    interrupts: InterruptManager,
 ) {
     let mut buf = vec![0u8; UDP_MAX_DATAGRAM];
     loop {
@@ -1427,10 +1470,33 @@ fn udp_recv_loop(
         }
         match socket.recv(&mut buf) {
             Ok(n) => {
-                let mut c = cache.lock();
-                c.data.clear();
-                c.data.extend_from_slice(&buf[..n]);
-                c.pos = 0;
+                {
+                    let mut c = cache.lock();
+                    c.data.clear();
+                    c.data.extend_from_slice(&buf[..n]);
+                    c.pos = 0;
+                }
+                // C :312-321 — every registered octet callback gets the
+                // datagram, unconditionally (no addr test, exactly as for the
+                // TCP announcement at :372-383). A datagram is a whole message,
+                // so C passes ASYN_EOM_END; InterruptValue carries no eom
+                // because no consumer reads one (C's own octet consumer,
+                // devAsynOctet.c:476-478, ignores the eomReason argument).
+                //
+                // Fired with the cache lock released: a subscriber's callback
+                // runs inline here, and a callback that reads the port back
+                // would otherwise deadlock against the lock we still held.
+                interrupts.notify_octet(
+                    OctetFanOut::EveryUser,
+                    InterruptValue {
+                        reason: 0,
+                        addr: 0,
+                        value: ParamValue::Octet(String::from_utf8_lossy(&buf[..n]).into_owned()),
+                        timestamp: SystemTime::now(),
+                        iface: Some(InterfaceType::Octet),
+                        ..Default::default()
+                    },
+                );
             }
             // DRV-56: a non-fatal recv error (200 ms read-timeout wake, or an
             // EINTR signal interruption) must NOT exit the worker — loop and
@@ -1484,7 +1550,7 @@ pub struct DrvAsynIPSubport {
 }
 
 impl DrvAsynIPSubport {
-    fn new(port_name: String, slot: Arc<ClientSlot>) -> Self {
+    fn new(port_name: String, slot: Arc<ClientSlot>, no_process_eos: bool) -> Self {
         let mut base = PortDriverBase::new(
             &port_name,
             1,
@@ -1502,7 +1568,19 @@ impl DrvAsynIPSubport {
         // call `connectDevice` on the child the moment it hands it the socket
         // (drvAsynIPServerPort.c:357-367).
         base.share_connection(slot.connection_cell());
-        base.auto_connect = false; // C uses noAutoConnect=1 for the child ports
+        // C's child IS a `drvAsynIPPortConfigure`d port — the listener creates it
+        // with exactly that call (drvAsynIPServerPort.c:688-694), passing
+        // noAutoConnect=1 and the server's own noProcessEos. So it gets the
+        // configure-time shape through the same owner the client port does:
+        // interruptProcess=1 (so an I/O-Intr record on `<parent>:<N>` processes)
+        // and, unless suppressed, the EOS interpose (so a `\n`-terminated line
+        // from a dialled-in device actually terminates a read). Building the
+        // child's base by hand is how it came to have neither (R19-107, R19-108).
+        DrvAsynIPPort::apply_ip_port_configure(
+            &mut base,
+            /* noAutoConnect */ true,
+            no_process_eos,
+        );
         Self { base, slot }
     }
 
@@ -1701,6 +1779,7 @@ mod tests {
             bind_port: 0,
             protocol: IpServerProtocol::Tcp,
             max_clients: 0,
+            no_process_eos: false,
             read_timeout: None,
         };
         match DrvAsynIPServerPort::with_config("zero_clients", cfg) {
@@ -1720,6 +1799,7 @@ mod tests {
             bind_port: 0,
             protocol: IpServerProtocol::Tcp,
             max_clients: 1,
+            no_process_eos: false,
             read_timeout: None,
         };
         assert!(DrvAsynIPServerPort::with_config("one_client", ok).is_ok());
@@ -2124,6 +2204,169 @@ mod tests {
         srv.io_flush(&mut bcast).unwrap();
     }
 
+    /// The canonical `drvAsynIPServerPort` use, end to end: a device dials into
+    /// the IOC and sends `\n`-terminated lines. C's child port is a real
+    /// `drvAsynIPPort` with the EOS interpose, so the read terminates on the
+    /// terminator and fans the raw chunk out to the port's I/O-Intr users.
+    ///
+    /// Before the child went through `apply_ip_port_configure` it had an empty
+    /// interpose chain and `octet_interrupt_process == false`: the read ran to
+    /// the buffer bound (here: it would have returned "line1\nline2\n" in one
+    /// go), and no interrupt user ever heard from it.
+    #[test]
+    fn a_child_port_terminates_a_read_on_the_terminator_and_fans_it_out() {
+        use crate::interrupt::{InterruptFilter, InterruptValue};
+        use std::io::Write as _;
+        use std::net::TcpStream as ClientStream;
+        use std::sync::Mutex as StdMutex;
+
+        let mut srv = DrvAsynIPServerPort::new("srv_eos", "127.0.0.1:0").unwrap();
+        srv.connect(&AsynUser::default()).unwrap();
+        let port = srv.local_port();
+
+        let mut client = ClientStream::connect(("127.0.0.1", port)).unwrap();
+        let idx = wait_for_slot(&srv, 0);
+        let mut sub = srv.make_subport(idx).unwrap();
+        sub.connect(&AsynUser::default()).unwrap();
+
+        let seen: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        let seen_cb = seen.clone();
+        let _sub_cb = sub.base().interrupts.register_sync_callback(
+            InterruptFilter::default(),
+            move |iv: &InterruptValue| {
+                if let ParamValue::Octet(s) = &iv.value {
+                    seen_cb.lock().unwrap().push(s.clone());
+                }
+            },
+        );
+
+        // The IEOS an st.cmd sets on the child port: `asynOctetSetInputEos
+        // srv_eos:0 0 "\n"`.
+        sub.set_input_eos(&AsynUser::default(), b"\n").unwrap();
+
+        client.write_all(b"line1\nline2\n").unwrap();
+        client.flush().unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+
+        let user = AsynUser::default().with_timeout(Duration::from_millis(500));
+        let mut buf = [0u8; 64];
+        // First read stops at the terminator — it does NOT run to the buffer
+        // bound and swallow line2.
+        let (n, eom) = crate::port::octet_read_chain(&mut sub, &user, &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"line1");
+        assert!(eom.contains(EomReason::EOS), "eom = {eom:?}");
+        // Second read returns the buffered second line, no further socket read.
+        let (n, eom) = crate::port::octet_read_chain(&mut sub, &user, &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"line2");
+        assert!(eom.contains(EomReason::EOS), "eom = {eom:?}");
+
+        // The interrupt user saw the RAW chunk the socket delivered, terminators
+        // included — C's octetBase fan-out sits below the EOS layer.
+        let got = seen.lock().unwrap().concat();
+        assert_eq!(got, "line1\nline2\n", "raw chunks fanned out, got {got:?}");
+
+        srv.disconnect(&AsynUser::default()).unwrap();
+    }
+
+    /// R19-109 boundary: the new-connection announcement reaches EVERY octet
+    /// interrupt user, whatever addr it registered on.
+    ///
+    /// C `connectionListener` (drvAsynIPServerPort.c:372-383) walks the octet
+    /// interrupt list and calls every node with the child port's name — there
+    /// is no addr test, unlike `asynOctetBase.c:203-215`. The boundary is
+    /// "announcement addr == subscriber addr" (slot 0) vs "announcement addr !=
+    /// subscriber addr" (slot 1): both must be delivered. An addr filter here
+    /// would silently hide every client after the first.
+    #[test]
+    fn every_octet_user_hears_a_new_connection_whatever_slot_it_lands_in() {
+        use crate::interrupt::{InterruptFilter, InterruptValue};
+        use std::net::TcpStream as ClientStream;
+        use std::sync::Mutex as StdMutex;
+
+        let mut srv = DrvAsynIPServerPort::with_config(
+            "srv_announce",
+            IpServerConfig {
+                max_clients: 2,
+                ..IpServerConfig::parse("127.0.0.1:0").unwrap()
+            },
+        )
+        .unwrap();
+        srv.connect(&AsynUser::default()).unwrap();
+        let port = srv.local_port();
+
+        let seen: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        let seen_cb = seen.clone();
+        // A device-support user bound to addr 0 — C registers on the SERVER
+        // port, and the payload it wants is which child port to talk to.
+        let _cb = srv.base().interrupts.register_sync_callback(
+            InterruptFilter {
+                addr: Some(0),
+                ..InterruptFilter::default()
+            },
+            move |iv: &InterruptValue| {
+                if let ParamValue::Octet(s) = &iv.value {
+                    seen_cb.lock().unwrap().push(s.clone());
+                }
+            },
+        );
+
+        let _c0 = ClientStream::connect(("127.0.0.1", port)).unwrap();
+        wait_for_slot(&srv, 0);
+        let _c1 = ClientStream::connect(("127.0.0.1", port)).unwrap();
+        wait_for_slot(&srv, 1);
+
+        let got = seen.lock().unwrap().clone();
+        assert_eq!(
+            got,
+            vec!["srv_announce:0".to_string(), "srv_announce:1".to_string()],
+            "the addr-0 user must hear about the slot-1 client too"
+        );
+
+        srv.disconnect(&AsynUser::default()).unwrap();
+    }
+
+    /// R19-121 boundary: a child port inherits the parent's trace masks at the
+    /// accept, and only at the accept.
+    ///
+    /// C `drvAsynIPServerPort.c:367-369` copies both masks onto the child when
+    /// the connection lands — *"Set the new port to initially have the same
+    /// trace mask that we have"*. The two boundaries: a mask set on the parent
+    /// BEFORE the client connects (the st.cmd case: `asynSetTraceMask SERVER -1
+    /// 0x9`) must reach the child; a mask set AFTER it connects must not (C
+    /// copies once, it does not track).
+    #[test]
+    fn a_child_port_inherits_the_parents_trace_masks_at_the_accept() {
+        use crate::services::PortServices;
+        use crate::trace::TraceIoMask;
+        use std::net::TcpStream as ClientStream;
+
+        let trace = Arc::new(TraceManager::new());
+        let services = PortServices::new(trace.clone());
+        let mut srv = DrvAsynIPServerPort::new("srv_trace", "127.0.0.1:0").unwrap();
+        services.bind(srv.base_mut());
+
+        // st.cmd, before any client exists.
+        let parent_mask = TraceMask::ERROR | TraceMask::FLOW | TraceMask::IO_DRIVER;
+        let parent_io = TraceIoMask::ASCII | TraceIoMask::HEX;
+        trace.set_trace_mask(Some("srv_trace"), parent_mask);
+        trace.set_trace_io_mask(Some("srv_trace"), parent_io);
+
+        srv.connect(&AsynUser::default()).unwrap();
+        let port = srv.local_port();
+        let _client = ClientStream::connect(("127.0.0.1", port)).unwrap();
+        wait_for_slot(&srv, 0);
+
+        assert_eq!(trace.get_trace_mask(Some("srv_trace:0")), parent_mask);
+        assert_eq!(trace.get_trace_io_mask(Some("srv_trace:0")), parent_io);
+
+        // A later change to the parent does not follow the already-connected
+        // child: C copies at the accept, it does not keep them linked.
+        trace.set_trace_mask(Some("srv_trace"), TraceMask::ERROR);
+        assert_eq!(trace.get_trace_mask(Some("srv_trace:0")), parent_mask);
+
+        srv.disconnect(&AsynUser::default()).unwrap();
+    }
+
     /// DRV-20 (TCP sibling): the child subport's flush drains its slot's
     /// socket through the same shared owner as the parent.
     #[test]
@@ -2156,6 +2399,63 @@ mod tests {
             Ok(0) => {}
             other => panic!("expected drained (timeout / 0 bytes), got {other:?}"),
         }
+
+        srv.disconnect(&AsynUser::default()).unwrap();
+    }
+
+    /// R19-110 boundary: a datagram fans out to every octet interrupt user,
+    /// with no consumer polling `read_octet`.
+    ///
+    /// C's UDP branch (drvAsynIPServerPort.c:309-322) calls every registered
+    /// octet callback with the payload straight from `recvfrom` — that is the
+    /// only delivery path a UDP server port has for an I/O-Intr scanned record.
+    /// The boundary that matters is the same one as R19-109: the subscriber's
+    /// addr (here 3) does not match the emission's, and C tests neither.
+    #[test]
+    fn a_udp_datagram_fans_out_to_every_octet_user() {
+        use crate::interrupt::{InterruptFilter, InterruptValue};
+        use std::net::UdpSocket as ClientSock;
+        use std::sync::Mutex as StdMutex;
+
+        let mut srv = DrvAsynIPServerPort::new("udp_intr", "127.0.0.1:0 UDP").unwrap();
+        srv.connect(&AsynUser::default()).unwrap();
+        let server_addr = srv
+            .udp_socket
+            .lock()
+            .as_ref()
+            .unwrap()
+            .local_addr()
+            .unwrap();
+
+        let seen: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        let seen_cb = seen.clone();
+        let _cb = srv.base().interrupts.register_sync_callback(
+            InterruptFilter {
+                addr: Some(3),
+                ..InterruptFilter::default()
+            },
+            move |iv: &InterruptValue| {
+                if let ParamValue::Octet(s) = &iv.value {
+                    seen_cb.lock().unwrap().push(s.clone());
+                }
+            },
+        );
+
+        let client = ClientSock::bind("127.0.0.1:0").unwrap();
+        client.send_to(b"telemetry", server_addr).unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if !seen.lock().unwrap().is_empty() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no octet interrupt for the datagram (C: drvAsynIPServerPort.c:312-321)"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(seen.lock().unwrap().as_slice(), ["telemetry".to_string()]);
 
         srv.disconnect(&AsynUser::default()).unwrap();
     }
@@ -2495,6 +2795,7 @@ mod tests {
             bind_port: 0,
             protocol: IpServerProtocol::Tcp,
             max_clients: 2,
+            no_process_eos: false,
             read_timeout: None,
         };
         let mut srv = DrvAsynIPServerPort::with_config("srv2", cfg).unwrap();
@@ -2527,6 +2828,7 @@ mod tests {
             bind_port: 0,
             protocol: IpServerProtocol::Tcp,
             max_clients: 1,
+            no_process_eos: false,
             read_timeout: None,
         };
         let mut srv = DrvAsynIPServerPort::with_config("srv3", cfg).unwrap();
@@ -2556,6 +2858,7 @@ mod tests {
             bind_port: 0,
             protocol: IpServerProtocol::Tcp,
             max_clients: 3,
+            no_process_eos: false,
             read_timeout: None,
         };
         let srv = DrvAsynIPServerPort::with_config("parent", cfg).unwrap();
@@ -2572,6 +2875,81 @@ mod tests {
         );
     }
 
+    /// A child port IS a `drvAsynIPPortConfigure`d port (C creates it with
+    /// exactly that call, drvAsynIPServerPort.c:688-694), so it carries the same
+    /// configure-time shape as the client IP port the same command builds:
+    ///
+    /// - `octet_interrupt_process` — `pasynOctetBase->initialize(..., 1)`
+    ///   (drvAsynIPPort.c:1055): without it a `stringin` with SCAN="I/O Intr" on
+    ///   `<parent>:<N>` never processes (R19-108).
+    /// - one EOS interpose — `asynInterposeEosConfig` unless `noProcessEos`
+    ///   (drvAsynIPPort.c:1065-1066): without it an IEOS on the child terminates
+    ///   nothing (R19-107).
+    /// - `auto_connect == false` — C passes `noAutoConnect = 1` for the child;
+    ///   the listener connects it by handing it the accepted fd.
+    ///
+    /// Boundary: `noProcessEos` 0 vs 1 — the ONLY thing that may change is the
+    /// EOS layer.
+    #[test]
+    fn a_child_port_has_the_shape_drv_asyn_ip_port_configure_gives_it() {
+        let build = |name: &str, no_process_eos: bool| {
+            let cfg = IpServerConfig {
+                bind_host: "127.0.0.1".into(),
+                bind_port: 0,
+                protocol: IpServerProtocol::Tcp,
+                max_clients: 2,
+                no_process_eos,
+                read_timeout: None,
+            };
+            DrvAsynIPServerPort::with_config(name, cfg).unwrap()
+        };
+
+        let srv = build("child_eos_on", false);
+        let child = srv.make_subport(1).unwrap();
+        assert_eq!(child.base().port_name, "child_eos_on:1");
+        assert!(
+            child.base().octet_interrupt_process,
+            "a child fans its reads out to interrupt users, like every drvAsynIPPort"
+        );
+        assert_eq!(
+            child.base().interpose_octet.len(),
+            1,
+            "a child gets the default EOS interpose"
+        );
+        assert!(!child.base().auto_connect, "C passes noAutoConnect=1");
+
+        // noProcessEos=1 suppresses the EOS layer and NOTHING else.
+        let srv = build("child_eos_off", true);
+        let child = srv.make_subport(0).unwrap();
+        assert!(child.base().octet_interrupt_process);
+        assert_eq!(
+            child.base().interpose_octet.len(),
+            0,
+            "noProcessEos must suppress the EOS interpose"
+        );
+        assert!(!child.base().auto_connect);
+    }
+
+    /// The parent's own EOS state is not the child's: C's parent server port
+    /// registers `pasynOctetBase->initialize(..., 0)` — no EOS processing, no
+    /// interruptProcess flag on its own octet interface
+    /// (drvAsynIPServerPort.c:655-661) — and it is the CHILDREN that are real
+    /// IP ports. Pins the asymmetry so a future "make them consistent" does not
+    /// hand the parent an EOS layer C never gives it.
+    #[test]
+    fn the_server_port_itself_gets_no_eos_interpose() {
+        let cfg = IpServerConfig {
+            bind_host: "127.0.0.1".into(),
+            bind_port: 0,
+            protocol: IpServerProtocol::Tcp,
+            max_clients: 1,
+            no_process_eos: false,
+            read_timeout: None,
+        };
+        let srv = DrvAsynIPServerPort::with_config("srv_no_eos", cfg).unwrap();
+        assert_eq!(srv.base().interpose_octet.len(), 0);
+    }
+
     /// make_subport on an out-of-range index errors rather than panic.
     #[test]
     fn make_subport_rejects_out_of_range_idx() {
@@ -2580,6 +2958,7 @@ mod tests {
             bind_port: 0,
             protocol: IpServerProtocol::Tcp,
             max_clients: 2,
+            no_process_eos: false,
             read_timeout: None,
         };
         let srv = DrvAsynIPServerPort::with_config("p2", cfg).unwrap();
@@ -2607,6 +2986,7 @@ mod tests {
             bind_port: 0,
             protocol: IpServerProtocol::Tcp,
             max_clients: 1,
+            no_process_eos: false,
             read_timeout: None,
         };
         let mut srv = DrvAsynIPServerPort::with_config("psh", cfg).unwrap();

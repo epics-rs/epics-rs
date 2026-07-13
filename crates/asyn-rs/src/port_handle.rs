@@ -935,6 +935,16 @@ impl PortHandle {
         Ok(())
     }
 
+    /// Enable or disable auto-connect for ONE device of a multi-device port —
+    /// the addressed half of [`Self::set_auto_connect_blocking`], symmetric
+    /// with [`Self::enable_addr_blocking`]. C picks between the two inside
+    /// `pasynManager->autoConnect` via `findDpCommon` (asynManager.c:496-509).
+    pub fn set_auto_connect_addr_blocking(&self, addr: i32, yes: bool) -> AsynResult<()> {
+        let user = AsynUser::new(0).with_addr(addr);
+        self.submit_blocking(RequestOp::SetAutoConnectAddr { yes }, user)?;
+        Ok(())
+    }
+
     // --- Bounds convenience methods ---
 
     pub fn get_bounds_int32_blocking(&self, reason: usize, addr: i32) -> AsynResult<(i64, i64)> {
@@ -1045,6 +1055,53 @@ impl PortHandle {
         self.submit_blocking(
             RequestOp::PushDelayInterpose { delay },
             AsynUser::new(0).with_addr(addr),
+        )?;
+        Ok(())
+    }
+
+    /// Install the EOS interpose on `addr`'s octet stack — C
+    /// `asynInterposeEosConfig(portName, addr, processEosIn, processEosOut)`.
+    pub fn push_eos_interpose_blocking(
+        &self,
+        addr: i32,
+        process_in: bool,
+        process_out: bool,
+    ) -> AsynResult<()> {
+        self.submit_blocking(
+            RequestOp::PushEosInterpose {
+                process_in,
+                process_out,
+            },
+            AsynUser::new(0).with_addr(addr),
+        )?;
+        Ok(())
+    }
+
+    /// Install the flush-timeout interpose on `addr`'s octet stack — C
+    /// `asynInterposeFlushConfig(portName, addr, timeout)`.
+    pub fn push_flush_interpose_blocking(
+        &self,
+        addr: i32,
+        flush_timeout: std::time::Duration,
+    ) -> AsynResult<()> {
+        self.submit_blocking(
+            RequestOp::PushFlushInterpose { flush_timeout },
+            AsynUser::new(0).with_addr(addr),
+        )?;
+        Ok(())
+    }
+
+    /// Set the port's time-stamp source to the named one, or clear it with
+    /// `None` — C `asynRegisterTimeStampSource` /
+    /// `asynUnregisterTimeStampSource`. The name must have been published with
+    /// [`crate::timestamp::register_time_stamp_source`], C's
+    /// `registryFunctionAdd`.
+    pub fn set_time_stamp_source_blocking(&self, name: Option<&str>) -> AsynResult<()> {
+        self.submit_blocking(
+            RequestOp::SetTimeStampSource {
+                name: name.map(str::to_string),
+            },
+            AsynUser::default(),
         )?;
         Ok(())
     }

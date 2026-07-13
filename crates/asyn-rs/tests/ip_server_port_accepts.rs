@@ -108,9 +108,20 @@ fn an_iocsh_configured_server_port_accepts_a_client() {
             "no bytes reached the child port — the server never accepted the client \
              (C: connectionListener, drvAsynIPServerPort.c:326)"
         );
+        // C parity: a child port is built by `drvAsynIPPortConfigure`
+        // (drvAsynIPServerPort.c:688-694), so it carries the EOS interpose
+        // (drvAsynIPPort.c:1065). `asynInterposeEos.c::readIt` keeps reading
+        // until a terminator arrives; an un-terminated payload therefore comes
+        // back as asynTimeout WITH the bytes already transferred attached
+        // (readIt:242-253 runs the same tail on error as on success). The
+        // bytes are delivered — the status is a timeout only because no
+        // terminator followed them.
         match io.read_octet(0, 32) {
             Ok(data) => got.extend_from_slice(&data),
-            Err(_) => std::thread::sleep(Duration::from_millis(10)),
+            Err(e) => match e.partial_read() {
+                Some(partial) if !partial.data.is_empty() => got.extend_from_slice(&partial.data),
+                _ => std::thread::sleep(Duration::from_millis(10)),
+            },
         }
     }
     assert_eq!(got, b"hello-server");
@@ -123,4 +134,43 @@ fn an_iocsh_configured_server_port_accepts_a_client() {
         .unwrap();
     let n = client.read(&mut buf).unwrap();
     assert_eq!(&buf[..n], b"hello-client");
+}
+
+/// R19-114: `maxClients = 0` is refused at the st.cmd boundary — no listening
+/// port, no child ports.
+///
+/// C rejects it before it parses the protocol: *"No clients."*, return -1
+/// (drvAsynIPServerPort.c:545-548). A server with zero slots would bind the
+/// socket and destroy every connection it accepted.
+#[test]
+fn an_iocsh_server_port_with_zero_max_clients_is_not_created() {
+    let services = PortServices::new(Arc::new(TraceManager::new()));
+    let mgr = Arc::new(PortManager::with_services(services));
+    let cmds = build_asyn_commands(mgr);
+    let ctx = make_ctx();
+
+    let port = free_port();
+    find(&cmds, "drvAsynIPServerPortConfigure")
+        .handler
+        .call(
+            &[
+                ArgValue::String("R19114".into()),
+                ArgValue::String(format!("127.0.0.1:{port} TCP")),
+                ArgValue::Int(0),
+            ],
+            &ctx,
+        )
+        .expect("the command reports the error on the shell, it does not fail the shell");
+
+    assert!(
+        asyn_rs::asyn_record::get_port("R19114").is_none(),
+        "maxClients=0 must not produce a listening port"
+    );
+    assert!(
+        asyn_rs::asyn_record::get_port("R19114:0").is_none(),
+        "maxClients=0 must not produce a child port"
+    );
+    // Nothing bound the address, so it is still free.
+    std::net::TcpListener::bind(("127.0.0.1", port))
+        .expect("the socket must not have been bound by a zero-slot server");
 }

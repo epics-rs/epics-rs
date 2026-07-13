@@ -136,6 +136,15 @@ pub enum RequestOp {
     SetAutoConnect {
         yes: bool,
     },
+    /// Enable / disable auto-connect for ONE device of a multi-device port —
+    /// the `user.addr` variant of [`RequestOp::SetAutoConnect`], symmetric with
+    /// [`RequestOp::EnableAddr`]. C reaches both through a single
+    /// `pasynManager->autoConnect`, which picks device-vs-port state via
+    /// `findDpCommon` (asynManager.c:496-509, 2314); the caller of the shell
+    /// command `asynAutoConnect portName addr yesNo` is what supplies the addr.
+    SetAutoConnectAddr {
+        yes: bool,
+    },
     /// Query int32 bounds (low, high).
     GetBoundsInt32,
     /// Query int64 bounds (low, high).
@@ -279,6 +288,33 @@ pub enum RequestOp {
     /// [`RequestOp::PushEchoInterpose`].
     PushDelayInterpose {
         delay: std::time::Duration,
+    },
+    /// Install the EOS interpose on the addressed device's octet stack. C
+    /// parity: `asynInterposeEosConfig(portName, addr, processEosIn,
+    /// processEosOut)` (`asynInterposeEos.c:84-140`), registered with iocsh at
+    /// :393-410. The two flags select which half of the layer is live.
+    PushEosInterpose {
+        process_in: bool,
+        process_out: bool,
+    },
+    /// Set (or clear) the port's time-stamp source by NAME. C parity:
+    /// `asynRegisterTimeStampSource(portName, functionName)` /
+    /// `asynUnregisterTimeStampSource(portName)` (asynShellCommands.c:1181-1223)
+    /// — C resolves the name through `registryFunctionFind` and hands the
+    /// function to `pasynManager->registerTimeStampSource`. The NAME travels,
+    /// not the function: that is what makes it resolvable on the far side of a
+    /// remote port, exactly as C resolves it in the IOC's own registry.
+    /// `None` = unregister (back to the driver's default clock).
+    SetTimeStampSource {
+        name: Option<String>,
+    },
+    /// Install the flush-timeout interpose on the addressed device's octet
+    /// stack. C parity: `asynInterposeFlushConfig(portName, addr, timeout)`
+    /// (`asynInterposeFlush.c:66-91`); C's shell argument is in milliseconds
+    /// and `<= 0` means 1 ms (:78-79), so the conversion happens at the shell
+    /// and the op carries a real duration.
+    PushFlushInterpose {
+        flush_timeout: std::time::Duration,
     },
     /// Send a GPIB universal command byte — C `asynGpib::universalCmd`
     /// (asynGpib.c:480-484). asynRecord's UCMD dispatch

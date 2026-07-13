@@ -4647,3 +4647,156 @@ above plus arrays: histogram CA type, u32 counters, compress N NOMOD,
 DB-link gate coverage, subArray NELM/INDX post-598e9b3a, val_capacity
 MALM (all refuted with evidence). Flakes: none observed this round
 (B re-ran the three known-flaky CLI tests: all pass).
+
+## Fix wave 15 — dispositions (2026-07-14)
+
+Scope: 27 of the 33 Round-17 findings (R17-1..4, 16, 31..36, 46..49,
+61..69, 76..84), plus one seam cleanup and one test-infra defect family
+found by the gate itself. Six opus fixer panels, one worktree each; main
+merged and verified every commit with git. Merge commits: A/B/C/D
+category merges, then the a-follow-up seam removal, `9236330c` (E),
+the F merge, the C follow-up merge (R17-35/36), and the test-infra
+merge (`1d35eea7` lineage). Not fixed by design: R17-37 (filed this
+wave, open), R17-85 (documented deviation, user sign-off pending),
+estdlib subnormal-exact (documented deviation, Round-17 adjudication).
+
+**Per-finding dispositions:**
+
+- R17-1 `bf677a8c` FIXED — typed DOLn READ seam (ReadDbLinkTyped mirror
+  of R16-1's write side); a silent `let _ =` discard closed with it.
+- R17-2 `061e9849` FIXED — `prec as u16` at sseq::set_numeric AND the
+  same defect at types/codec.rs:98 (rg-widened).
+- R17-3 `e74637d0` FIXED (structural) — ResolveOutTarget resolves the
+  destination BEFORE process, so "no put" ⟹ "no wait" by construction.
+- R17-4 `2c04a643` FIXED — CyclePostMask::Value: the WRITER decides the
+  partner post mask (sseq special() posts STRn with literal DBE_VALUE).
+- R17-16 `1b237aea` FIXED — runtime::env::env_inet_port is the one owner
+  of envGetInetPortConfigParam (sscanf leniency, 5000<port<=65535 gate,
+  byte-identical stderr vs compiled caget, 16 head-to-head cases). TWO
+  SEMANTIC CHANGES flagged: CAS_* selection is a presence test
+  (caservertask.c:491-508), and the repeater port resolves ONCE per
+  process (udpiiu::repeaterPort).
+- R17-31 `52fe221b` FIXED — nt_type_for_channel single NT owner; Q:form
+  String long-strings. SEMANTIC CHANGE: lsi/lso VAL PUTs now SIZV-bounded.
+- R17-32 `c05a56f6` FIXED (structural) — gateway cache stores SourceRead,
+  value + accumulated mark union inseparable; no-event ⟹ no seed frame.
+- R17-33 `55960fd7` FIXED — all-45-method middleware forwarding audit;
+  same swallow class closed in revalidate_read / check_monitor_request /
+  subscribe_checked_opts.
+- R17-34 `db9738f5` FIXED — env::effective_tcp_timeout_secs one owner
+  (enforceTimeout on the SCALED value).
+- R17-35 `aabdf2d8` FIXED — GroupChannel::put_leaf ports pvxs
+  IOCSource::put's switch(info.type); FieldMapping::is_client_writable
+  names the no-write arms; the group long-string PUT leaf (reachable
+  now) takes the same putLongString char image — closes R17-31's group
+  half. Fails-pre-fix regression tests for numeric/string/NTEnum/
+  long-string members, atomic and non-atomic.
+- R17-36 `a81df980` FIXED — config::env::echo_period_secs one owner:
+  max(1, min(15, tcpTimeout*3/8)), composed with R17-34's owner.
+- R17-37 OPEN (filed this wave from the R17-35 fixer's UNFIXED) — Meta
+  member with +putorder: pvxs runs doPostProcessing, port's PUT loop
+  silently skips. No shipped config exhibits it.
+- R17-46 `5dc96c18` FIXED — destination-keyed trace escape (C's default
+  trace destination is stderr → print_escaped branch).
+- R17-47 `6e73ac29` FIXED — traceIOMask bitfield; DEFAULT TRACE OUTPUT
+  CHANGED to NODATA per tracePvtInit (asynManager.c:449-459); 3
+  pre-existing tests corrected against C, not silenced.
+- R17-48 `016a5774` FIXED — escaped_from_raw carries C's
+  (dst,dstlen,src,srclen) signature, truncating mid-escape-pair;
+  TraceConfig::trace_buffer_size is grow-never-shrink.
+- R17-49 `5c4a8498` FIXED — empty-string early return.
+- R17-61 `526726b9` FIXED — parse_c_double IS epicsParseDouble (one
+  parse shared with the R16-83 seed path).
+- R17-62 `c34591c2` FIXED — dbCommon SPC_NOMOD covers C's whole set
+  (NAME/STAT/SEVR/AMSG/NSTA/NSEV/NAMSG/ACKS/ACKT/LCNT/PACT/PUTF/RPRO/
+  TIME/UTAG); alarm ack is a DBR *request type* dispatched ABOVE the
+  gate (put_alarm_ack_from_ca), not a common-field put.
+- R17-63 `2644e581` FIXED — UDF clear is per-record-type, not a
+  processing rule.
+- R17-64 `25aa52f7` FIXED — the link READ carries the source alarm on
+  every path (fetch_link takes the reading record; MS/MSI/MSS applied
+  where C's dbGetLink does).
+- R17-65 `65e24034` FIXED — lso/lsi constant DOL loads through
+  dbLoadLinkLS.
+- R17-66 `62429573` FIXED — post-init UDF tail lives in the init-pass
+  owner (mbboDirect B0..B1F fold, histogram constant SVL verified
+  against softIoc).
+- R17-67 `ddc899b2` FIXED — add_record runs the init passes it already
+  assumed (AO DOL="5" → UDF 0 / SEVR INVALID / STAT UDF oracle-matched).
+- R17-68 `cddea284` FIXED — a quoted string is a PV link, not a
+  constant (CA_LINK "hello", UDF 1).
+- R17-69 `dd5e0af3` FIXED (structural) — PvDatabase::begin_load returns
+  an RAII DbLoadGuard; classify_link awaits the database-load boundary,
+  which IS C's init_record-after-load ordering. Forward references are
+  deterministically Local; no sleeps, no re-poll. Family closed through
+  the one classifier (calcout/sseq/swait/throttle all funnel).
+- R17-76 `22dd6403` FIXED — one reset owner for all five compress
+  SPC_RESET fields.
+- R17-77 `b0125fe3` FIXED — Record::field_no_mod dynamic SPC_NOMOD hook
+  (cvt_dbaddr-raised state): LIFO VAL refuses client puts; the
+  check_no_mod gate is still the single enforcer.
+- R17-78 `05268579` FIXED — histogram CSTA SPC_NOMOD.
+- R17-79 `51435dc8` FIXED — types::c_cast single owner of double→int
+  narrowing, reproducing compiled x86-64 (cvttsd2si integer-indefinite:
+  70000.9→i16 4464, 3.0e9→i32 INT_MIN); Rust's saturating `as` was a
+  silent divergence from every compiled IOC. C's UB filed as CBUG-E2.
+  rg-widened into processing.rs's SDIS DISA narrowing at merge.
+- R17-80 `f6ce1657` FIXED — histogram SDEL watchdog (ArmWatchdog action
+  + wdogCallback posting VAL every SDEL seconds while mcnt>0).
+- R17-81 `531daed9` FIXED — compress OUSE (NUSE post-on-change latch)
+  and INPN served, both noMod. PARTIAL: INPN latches the length
+  ReadDbLink delivered, not C's dbGetNelements source *capacity*
+  (softIoc: waveform NELM=3/NORD=1 → INPN 3, port → 1); closing it
+  needs capacity plumbed through ReadDbLink — framework change, open.
+- R17-82 `7b600b1e` FIXED — subArray BUSY; declares_busy() owns kind
+  membership.
+- R17-83 `c078e93d` FIXED — histogram INP not resolvable as a channel.
+- R17-84 `043c11dd` FIXED — histogram VAL is DBF_ULONG → PVA uint32[].
+  ORACLE OVERRIDE: the finding said "CA unaffected"; compiled cainfo
+  reports DBF_DOUBLE for a ULONG field (C promotes ULONG→DOUBLE on CA),
+  so the port's CA native type flips LONG→DOUBLE — wire-visible, per
+  compiled C.
+- Seam cleanup `a213af07` — orphaned ProcessAction::WriteDbLinkTyped +
+  put_link_notify_typed removed (zero callers, rg-proven);
+  typed_output_buffer stays as the destination-switch owner.
+- Test-infra family `1d35eea7` FIXED — probe-then-rebind free_port()
+  feeding a live CaServer build (13 server builds across 13 files →
+  .port(0) + udp_port()/tcp_port() readback; the recurring gate flakes
+  acf_host_identity and cli_caput_enum_order were this family; 5
+  consecutive full -p epics-ca-rs runs green). cli_cainfo_host's Host:
+  assertion moved to tcp_port() — C's ca_host_name is the circuit peer.
+  Legitimate dead-address free_port uses kept: calink.rs,
+  ca_gateway/upstream.rs, and the MITM proxy ports (renamed
+  free_proxy_port, documented).
+
+**UNFIXED (carried open):**
+- R17-37 (above) — Meta member +putorder doPostProcessing divergence.
+- R17-81 INPN capacity (above) — needs ReadDbLink capacity plumbing.
+- R17-85 — documented deviation (C's dbPut-through-READ-offset is the
+  defect, CBUG-E1); port keeps append-at-write-cursor. USER SIGN-OFF
+  PENDING.
+- .db lexer keeps raw \" escapes inside quoted field values where C's
+  dbTranslateEscape unescapes them (fixer-e observation, not an R17
+  finding; `field(DESC, "a \"b\" c")` carries backslashes C strips).
+- ca_gateway/upstream.rs:2033 still names its dead-address helper
+  free_port() — behavior correct, name advertises the banned idiom;
+  left because renaming pulls a second crate into the test-infra commit.
+
+**Gate accounting (scope: full workspace + `-p epics-bridge-rs
+--features pva-gateway`, clippy -D warnings + nextest + doctests):**
+final state 8893/8893 workspace (two consecutive complete runs, zero
+flakes) + 780/780 gateway; clippy clean (gate proven live with a
+planted warning); doctests clean. During the wave, three gate runs each
+failed exactly one test that passed isolated: acf_host_identity::
+unlisted_host_name_is_denied_write, stability::r12_33 (user infra),
+cli_caput_enum_order::a_rejected_enum_string_prints_no_old_value
+(AddrInUse) — the first and third were the probe-then-rebind family,
+root-caused and FIXED (`1d35eea7`). One gateway nextest run failed once
+under fail-fast and passed 780/780 on three immediate reruns; the
+failing test's NAME WAS LOST because the run was piped through tail —
+unnamed flake, unresolved. Piping nextest destroys exit codes and
+failure names; bare runs only.
+
+**CBUG batch E** (`752797f9`, standalone catalogue): CBUG-E1 compress
+dbPut read-start slot (NOT-REPRODUCED, = R17-85), CBUG-E2 dbConvert
+bare-cast UB (REPRODUCED via types::c_cast).

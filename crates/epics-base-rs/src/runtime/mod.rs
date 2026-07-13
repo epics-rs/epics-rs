@@ -1,4 +1,5 @@
 pub mod env;
+pub mod epics_string;
 pub mod general_time;
 pub mod log;
 pub mod net;

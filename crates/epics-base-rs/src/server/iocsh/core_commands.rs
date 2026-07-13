@@ -42,7 +42,10 @@ fn cmd_comment() -> CommandDef {
     )
 }
 
-/// `echo [text]` — print the argument. Mirrors C `echo`.
+/// `echo [text]` — print the argument, with its escape sequences translated.
+/// C `libComRegister.c:84-91` runs `dbTranslateEscape(str, str)` before the
+/// `printf`, so `echo "a\tb"` prints a real tab — the same translation the
+/// `.db` loader owes its field values (R18-91), through the same owner.
 fn cmd_echo() -> CommandDef {
     CommandDef::new(
         "echo",
@@ -54,7 +57,9 @@ fn cmd_echo() -> CommandDef {
         "echo [text] — Print text to the console.",
         |args: &[ArgValue], ctx: &CommandContext| {
             match &args[0] {
-                ArgValue::String(s) => ctx.println(s),
+                ArgValue::String(s) => {
+                    ctx.println(&crate::runtime::epics_string::raw_from_escaped(s))
+                }
                 _ => ctx.println(""),
             }
             Ok(CommandOutcome::Continue)

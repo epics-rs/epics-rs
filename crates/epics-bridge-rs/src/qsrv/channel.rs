@@ -657,7 +657,7 @@ impl BridgeChannel {
         // the matched rule's TRAPWRITE flag (`WriteGrant`). The grant is
         // the single source of "is this a trapped write" — the PUT below
         // routes through it and never re-derives the trap flag.
-        let grant = self.access.write_grant(&self.pv_name);
+        let grant = self.access.write_grant(&self.pv_name).await;
         if !grant.allowed {
             // pvxs `doFieldPreProcessing` (iocsource.cpp:385) — the wire
             // carries "Put not permitted"; identity goes to the log.
@@ -836,7 +836,7 @@ impl Channel for BridgeChannel {
     }
 
     async fn get(&self, request: &PvStructure) -> BridgeResult<PvStructure> {
-        if !self.access.can_read(&self.pv_name) {
+        if !self.access.can_read(&self.pv_name).await {
             return Err(BridgeError::PutRejected(format!(
                 "read denied for {} (user='{}' host='{}')",
                 self.pv_name, self.access.user, self.access.host
@@ -916,7 +916,7 @@ impl BridgeChannel {
         // Check read permission up front so a denied client cannot
         // even obtain a monitor handle. start() also re-checks (defense
         // in depth: handles created via with_access elsewhere).
-        if !self.access.can_read(&self.pv_name) {
+        if !self.access.can_read(&self.pv_name).await {
             return Err(BridgeError::PutRejected(format!(
                 "monitor create denied for {} (user='{}' host='{}')",
                 self.pv_name, self.access.user, self.access.host
@@ -1847,8 +1847,9 @@ mod tests {
         use epics_base_rs::server::records::ai::AiRecord;
 
         struct DenyWrites;
+        #[async_trait::async_trait]
         impl AccessControl for DenyWrites {
-            fn can_write(&self, _: &str, _: &str, _: &str) -> bool {
+            async fn can_write(&self, _: &str, _: &str, _: &str) -> bool {
                 false
             }
         }

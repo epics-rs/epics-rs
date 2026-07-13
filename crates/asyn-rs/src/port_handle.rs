@@ -3,36 +3,130 @@
 //! [`PortHandle`] is a lightweight, cloneable handle that sends requests to the
 //! actor via an mpsc channel and receives replies via oneshot channels.
 
+use std::future::Future;
+use std::pin::pin;
 use std::sync::Arc;
+use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
 
+use tokio::runtime::RuntimeFlavor;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::{AsynError, AsynResult, AsynStatus};
 use crate::interfaces::{Capability, InterfaceType};
 use crate::interrupt::InterruptManager;
 use crate::port::DrvUserInfo;
-use crate::port_actor::ActorMessage;
+use crate::port_actor::{ActorId, ActorMessage};
 use crate::request::{CancelToken, RequestOp, RequestResult};
 use crate::user::AsynUser;
+
+/// Park the calling thread until `fut` resolves, from *any* context.
+///
+/// Deliberately not one of tokio's blocking shims. Every one of them vetoes
+/// some context this framework actually runs in:
+///
+/// - `Handle::block_on`, `mpsc::blocking_send` and `oneshot::blocking_recv`
+///   panic when called from inside a runtime;
+/// - `task::block_in_place` panics unless the runtime is *multi-threaded* —
+///   and the framework's own runtimes are not. Both `PortActor` (port_actor.rs)
+///   and `ad_core_rs::runtime::run_thread_named` build `new_current_thread`
+///   runtimes, so every blocking device-I/O call made from a driver's own task
+///   panicked that thread.
+///
+/// The futures driven here are `tokio::sync` primitives (an mpsc send and a
+/// oneshot receive), which are documented as runtime-agnostic: polling them
+/// needs no reactor and no timer, so a bare parking executor is both sufficient
+/// and incapable of panicking on a runtime-flavour check.
+fn park_on<F: Future>(fut: F) -> F::Output {
+    struct ParkWaker(std::thread::Thread);
+    impl Wake for ParkWaker {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+
+    let mut fut = pin!(fut);
+    let waker = Waker::from(Arc::new(ParkWaker(std::thread::current())));
+    let mut cx = Context::from_waker(&waker);
+    loop {
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(value) => return value,
+            // A spurious unpark just re-polls, which is always sound.
+            Poll::Pending => std::thread::park(),
+        }
+    }
+}
+
+/// Block the calling thread on a reply that only the port actor can produce.
+///
+/// The actor runs on its own OS thread, so the reply arrives no matter what the
+/// caller's runtime is doing — parking the caller can stall the caller's own
+/// runtime, but never the thread that owes us the answer. The one context where
+/// that reasoning fails (the caller *is* the actor) is refused up front by
+/// [`guard_reentrant`], never reached here.
+fn block_on_reply<F: Future>(fut: F) -> F::Output {
+    match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
+        // A multi-threaded worker: hand this worker's other tasks to a sibling
+        // before we park it. Purely a scheduling courtesy — correctness does
+        // not depend on it.
+        Ok(RuntimeFlavor::MultiThread) => tokio::task::block_in_place(|| park_on(fut)),
+        // A current-thread runtime, or no runtime at all. `block_in_place` is
+        // unavailable here (it panics), and parking directly is correct.
+        _ => park_on(fut),
+    }
+}
+
+/// Refuse a blocking wait the calling thread could never be woken from.
+///
+/// **Invariant:** a blocking call MUST NOT park a thread whose progress the
+/// reply depends on. Exactly one thread produces the reply — port `port_name`'s
+/// actor — so the question is not *"am I inside a runtime?"* (the old, wrong
+/// predicate: it is neither necessary nor sufficient) but *"am I this port's
+/// actor?"*. If it is us, the request we would block on is the request we would
+/// have to run, and no amount of waiting can resolve that.
+///
+/// This is reported as an error rather than being made unrepresentable by the
+/// type system: a `PortHandle` reaches a driver through shared state
+/// (registries, `Arc`s, callbacks set up long after the port is built), so
+/// "this handle points at me" is not knowable at any call site the compiler can
+/// see. The error names the fix.
+fn guard_reentrant(actor: ActorId, port_name: &str, what: &str) -> AsynResult<()> {
+    if crate::port_actor::current_actor() == Some(actor) {
+        return Err(AsynError::Status {
+            status: AsynStatus::Error,
+            message: format!(
+                "{what} called on port {port_name} from that port's own actor thread: \
+                 a driver cannot make a blocking request to itself — the actor would \
+                 have to service the very request it is blocked on. Call the driver \
+                 method directly instead of going back through the port, or submit \
+                 the request from another thread or task."
+            ),
+        });
+    }
+    Ok(())
+}
 
 /// Async completion handle returned by [`PortHandle::try_submit`].
 ///
 /// Implements `Future` for async waiting, plus `wait_blocking()` for sync callers.
 pub struct AsyncCompletionHandle {
     rx: oneshot::Receiver<AsynResult<RequestResult>>,
+    /// The actor that owes this reply — see [`guard_reentrant`].
+    actor: ActorId,
+    port_name: Arc<str>,
 }
 
 impl AsyncCompletionHandle {
-    /// Block the current thread until the result arrives or timeout.
+    /// Block the current thread until the result arrives.
+    ///
+    /// Errors instead of deadlocking if called from the port's own actor
+    /// thread — that actor is the thread that would have to produce the reply.
     pub fn wait_blocking(self, _timeout: Duration) -> AsynResult<RequestResult> {
-        match self.rx.blocking_recv() {
-            Ok(result) => result,
-            Err(_) => Err(AsynError::Status {
-                status: AsynStatus::Error,
-                message: "actor dropped reply channel".into(),
-            }),
-        }
+        guard_reentrant(self.actor, &self.port_name, "wait_blocking")?;
+        block_on_reply(self)
     }
 }
 
@@ -61,7 +155,10 @@ impl std::future::Future for AsyncCompletionHandle {
 #[derive(Clone)]
 pub struct PortHandle {
     tx: mpsc::Sender<ActorMessage>,
-    port_name: String,
+    port_name: Arc<str>,
+    /// Identity of the actor on the receiving end of `tx`. Every blocking entry
+    /// point compares it against the calling thread — see [`guard_reentrant`].
+    actor: ActorId,
     interrupts: Arc<InterruptManager>,
     can_block: bool,
     multi_device: bool,
@@ -78,14 +175,19 @@ pub struct PortHandle {
 }
 
 impl PortHandle {
+    /// `actor` must be the id of the actor owning `tx`'s receiving end
+    /// (`PortActor::id`), so that a blocking caller can recognise a re-entrant
+    /// call from that actor's own thread.
     pub(crate) fn new(
         tx: mpsc::Sender<ActorMessage>,
         port_name: String,
         interrupts: Arc<InterruptManager>,
+        actor: ActorId,
     ) -> Self {
         Self {
             tx,
-            port_name,
+            port_name: port_name.into(),
+            actor,
             interrupts,
             can_block: false,
             multi_device: false,
@@ -190,40 +292,44 @@ impl PortHandle {
                 message: format!("actor channel {} for port {}", detail, self.port_name),
             }
         })?;
-        Ok(AsyncCompletionHandle { rx: reply_rx })
+        Ok(AsyncCompletionHandle {
+            rx: reply_rx,
+            actor: self.actor,
+            port_name: self.port_name.clone(),
+        })
+    }
+
+    /// The one gate every blocking entry point on this handle passes through.
+    ///
+    /// Refuses a re-entrant call from the port's own actor thread (which could
+    /// never complete), and otherwise parks the calling thread on the actor's
+    /// reply — correctly from a plain thread, from a current-thread runtime, or
+    /// from a multi-threaded worker.
+    fn blocking<T>(&self, what: &str, fut: impl Future<Output = AsynResult<T>>) -> AsynResult<T> {
+        guard_reentrant(self.actor, &self.port_name, what)?;
+        block_on_reply(fut)
     }
 
     /// Submit a request and block until completion (for sync callers).
     ///
-    /// Works both from plain threads and from within a tokio runtime context
-    /// (uses `block_in_place` when called from an async context). Inside a
-    /// runtime the request goes through [`Self::submit_async`], so a
-    /// [`AsynUser::queue_timeout`] wakes the caller at its deadline. On a plain
-    /// thread there is no timer service to wake it, and none is needed: the
-    /// deadline is still enforced — the actor refuses to run a request that
-    /// waited past it (`PortActor::process_one`) and replies
-    /// [`AsynError::QueueTimeout`] — and a thread parked on the reply has no
-    /// earlier action it could take, since it cannot report anything until it
-    /// returns.
+    /// Valid from a plain thread, from a current-thread runtime (an `ad-core`
+    /// driver task), and from a multi-threaded worker (device support under
+    /// `#[epics_main]`).
+    ///
+    /// Returns an error, rather than deadlocking, when called from the port's
+    /// own actor thread — i.e. when a `PortDriver` method calls back into its
+    /// own port. The actor cannot service a request it is itself blocked on.
+    ///
+    /// The request goes through [`Self::submit_cancellable`], so an
+    /// [`AsynUser::queue_timeout`] deadline is enforced on every path: the
+    /// reply wait wakes at the deadline where a timer service exists, and the
+    /// actor refuses to run a request that waited past it
+    /// (`PortActor::process_one`), replying [`AsynError::QueueTimeout`].
     pub fn submit_blocking(&self, op: RequestOp, user: AsynUser) -> AsynResult<RequestResult> {
-        if tokio::runtime::Handle::try_current().is_ok() {
-            // Inside a tokio runtime — use block_in_place to avoid panicking
-            tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(self.submit_async(op, user))
-            })
-        } else {
-            // Plain thread — use blocking_send/blocking_recv directly
-            let (reply_tx, reply_rx) = oneshot::channel();
-            let msg = ActorMessage::new(op, user, CancelToken::new(), reply_tx);
-            self.tx.blocking_send(msg).map_err(|_| AsynError::Status {
-                status: AsynStatus::Error,
-                message: format!("actor channel closed for port {}", self.port_name),
-            })?;
-            reply_rx.blocking_recv().map_err(|_| AsynError::Status {
-                status: AsynStatus::Error,
-                message: "actor dropped reply channel".into(),
-            })?
-        }
+        self.blocking(
+            "submit_blocking",
+            self.submit_cancellable(op, user, CancelToken::new()),
+        )
     }
 
     /// Submit a request and await completion (reliable, for async callers).
@@ -288,13 +394,20 @@ impl PortHandle {
             status: AsynStatus::Error,
             message: "actor dropped reply channel".into(),
         };
-        if let Some(limit) = queue_timeout {
+        // The caller-side timer needs a Tokio reactor to fire. A blocking
+        // caller polled by `park_on` (plain thread, no runtime) has none —
+        // and nothing to do at the deadline anyway: it cannot report until
+        // it returns. There the deadline is enforced solely by the actor's
+        // dequeue re-check (`PortActor::process_one`), matching C, where a
+        // blocked thread never runs `queueTimeoutCallback` work of its own.
+        let timer_available = tokio::runtime::Handle::try_current().is_ok();
+        if let Some(limit) = queue_timeout.filter(|_| timer_available) {
             match tokio::time::timeout(limit, &mut reply_rx).await {
                 Ok(reply) => return reply.map_err(|_| dropped())?,
                 Err(_elapsed) => {
                     if cancel.time_out_if_queued() {
                         return Err(AsynError::QueueTimeout {
-                            port: self.port_name.clone(),
+                            port: self.port_name.to_string(),
                         });
                     }
                     // Already running (C `!isQueued`): the timer fired too late.
@@ -642,25 +755,23 @@ impl PortHandle {
             .await
     }
 
-    /// Sync version of [`set_params_and_notify`] for non-async contexts
-    /// (std threads, acquisition tasks). Uses `blocking_send` internally.
+    /// Sync version of [`set_params_and_notify`](Self::set_params_and_notify)
+    /// for non-async contexts (std threads, acquisition tasks).
     ///
-    /// Returns an error if called from within a Tokio runtime — use the async
-    /// version instead.
+    /// Blocks only until the update is accepted into the actor's inbox. Valid
+    /// from a plain thread, from a current-thread runtime, and from a
+    /// multi-threaded worker; errors, rather than deadlocking, when called from
+    /// the port's own actor thread (a full inbox could only be drained by the
+    /// actor we would be blocking).
     pub fn set_params_and_notify_blocking(
         &self,
         addr: i32,
         updates: Vec<crate::request::ParamSetValue>,
     ) -> AsynResult<()> {
-        if tokio::runtime::Handle::try_current().is_ok() {
-            return Err(AsynError::Status {
-                status: AsynStatus::Error,
-                message: "set_params_and_notify_blocking called inside Tokio runtime; \
-                          use the async set_params_and_notify() instead"
-                    .into(),
-            });
-        }
-        self.enqueue_blocking(RequestOp::CallParamCallbacks { addr, updates }, addr)
+        self.blocking(
+            "set_params_and_notify_blocking",
+            self.enqueue(RequestOp::CallParamCallbacks { addr, updates }, addr),
+        )
     }
 
     /// Enqueue-only async helper: guaranteed delivery, no reply wait.
@@ -669,17 +780,6 @@ impl PortHandle {
         let (reply_tx, _) = oneshot::channel();
         let msg = ActorMessage::new(op, user, CancelToken::new(), reply_tx);
         self.tx.send(msg).await.map_err(|_| AsynError::Status {
-            status: AsynStatus::Error,
-            message: format!("actor channel closed for port {}", self.port_name),
-        })
-    }
-
-    /// Enqueue-only sync helper: guaranteed delivery, no reply wait.
-    fn enqueue_blocking(&self, op: RequestOp, addr: i32) -> AsynResult<()> {
-        let user = AsynUser::new(0).with_addr(addr);
-        let (reply_tx, _) = oneshot::channel();
-        let msg = ActorMessage::new(op, user, CancelToken::new(), reply_tx);
-        self.tx.blocking_send(msg).map_err(|_| AsynError::Status {
             status: AsynStatus::Error,
             message: format!("actor channel closed for port {}", self.port_name),
         })
@@ -1016,11 +1116,12 @@ mod tests {
         let interrupts = Arc::new(InterruptManager::new(256));
         let (tx, rx) = mpsc::channel(256);
         let actor = PortActor::new(Box::new(driver), rx);
+        let actor_id = actor.id();
         std::thread::Builder::new()
             .name("test-handle-actor".into())
             .spawn(move || actor.run())
             .unwrap();
-        PortHandle::new(tx, "handle_test".into(), interrupts)
+        PortHandle::new(tx, "handle_test".into(), interrupts, actor_id)
     }
 
     #[test]
@@ -1028,6 +1129,56 @@ mod tests {
         let handle = make_handle(TestDriver::new());
         handle.write_int32_blocking(0, 0, 42).unwrap();
         assert_eq!(handle.read_int32_blocking(0, 0).unwrap(), 42);
+    }
+
+    /// The blocking API must work from inside a **current-thread** runtime —
+    /// the flavour the framework builds for the port actor itself
+    /// (`PortActor::run_with_shutdown`) and for every `ad-core` driver thread
+    /// (`ad_core_rs::runtime::run_thread_named`). `#[tokio::test]` is
+    /// current-thread by default, so this test *is* that context.
+    ///
+    /// The old implementation reached for `tokio::task::block_in_place`, which
+    /// panics here: "can call blocking only when running on the multi-threaded
+    /// runtime".
+    #[tokio::test]
+    async fn handle_blocking_works_inside_current_thread_runtime() {
+        let handle = make_handle(TestDriver::new());
+        handle.write_int32_blocking(0, 0, 21).unwrap();
+        assert_eq!(handle.read_int32_blocking(0, 0).unwrap(), 21);
+        handle.call_param_callbacks_blocking(0).unwrap();
+        // Enqueue-only path: previously refused outright inside any runtime.
+        handle.set_params_and_notify_blocking(0, vec![]).unwrap();
+    }
+
+    /// The multi-threaded path (device support under `#[epics_main]`) keeps
+    /// working — `block_in_place` still yields the worker before we park it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn handle_blocking_works_inside_multi_thread_runtime() {
+        let handle = make_handle(TestDriver::new());
+        handle.write_int32_blocking(0, 0, 84).unwrap();
+        assert_eq!(handle.read_int32_blocking(0, 0).unwrap(), 84);
+    }
+
+    /// `try_submit` + `wait_blocking` is the same blocking wait by another
+    /// route: it too used a tokio shim (`oneshot::blocking_recv`) that panics
+    /// inside a runtime.
+    #[tokio::test]
+    async fn wait_blocking_works_inside_current_thread_runtime() {
+        let handle = make_handle(TestDriver::new());
+        let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
+        handle
+            .try_submit(RequestOp::Int32Write { value: 63 }, user)
+            .unwrap()
+            .wait_blocking(Duration::from_secs(1))
+            .unwrap();
+
+        let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
+        let result = handle
+            .try_submit(RequestOp::Int32Read, user)
+            .unwrap()
+            .wait_blocking(Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(result.int_val, Some(63));
     }
 
     #[test]

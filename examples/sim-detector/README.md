@@ -134,12 +134,9 @@ The sim-detector IOC includes full autosave support, matching the C EPICS autosa
 ### Configuration in st.cmd
 
 ```bash
-# Search paths for .req files (detector, plugins, calc, busy, autosave)
+# Search paths for .req files (detector, plugins)
 set_requestfile_path("$(ADSIMDETECTOR)/db")
 set_requestfile_path("$(ADCORE)/db")
-set_requestfile_path("$(CALC)/db")
-set_requestfile_path("$(BUSY)/db")
-set_requestfile_path("$(AUTOSAVE)/db")
 
 # Directory for .sav files
 set_savefile_path("$(ADSIMDETECTOR)/ioc/autosave")

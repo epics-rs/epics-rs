@@ -196,23 +196,24 @@ fn set_empty_request_alarm(instance: &mut crate::server::record::RecordInstance)
 }
 
 impl PvDatabase {
-    /// Get a PV value synchronously from a blocking thread.
+    /// Get a PV value synchronously, from a thread that cannot `await`.
     ///
-    /// Uses `block_in_place` + `Handle::block_on` to bridge the async
-    /// `get_pv` call. Safe to call from std::threads spawned within
-    /// a tokio runtime context.
+    /// Works from a plain thread with no runtime entered (an iocsh thread, a
+    /// driver's own thread) and from a multi-threaded runtime worker; see
+    /// [`crate::runtime::task::block_on_sync`] for which mechanism is used
+    /// where.
+    ///
+    /// Returns an error on a **current-thread** runtime, where blocking cannot
+    /// be made sound: parking that runtime's only thread halts the task holding
+    /// the database lock this call awaits. Such callers must `await`
+    /// [`Self::get_pv`] instead.
     pub fn get_pv_blocking(&self, name: &str) -> CaResult<EpicsValue> {
-        let db = self.clone();
-        let name = name.to_string();
-        if crate::runtime::task::RuntimeHandle::try_current().is_ok() {
-            crate::__tokio::task::block_in_place(|| {
-                crate::runtime::task::RuntimeHandle::current().block_on(db.get_pv(&name))
-            })
-        } else {
+        crate::runtime::task::block_on_sync(self.get_pv(name)).unwrap_or_else(|_| {
             Err(CaError::InvalidValue(
-                "no runtime for get_pv_blocking".into(),
+                "get_pv_blocking cannot block a current-thread runtime; await get_pv() instead"
+                    .into(),
             ))
-        }
+        })
     }
 
     /// Get the current value of a PV or record field.

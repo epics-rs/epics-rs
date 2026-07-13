@@ -37,6 +37,10 @@
 /// being ported.
 pub const EPICS_BASE_VERSION: &str = "7.0.10.1-DEV";
 
+/// `LinkSet` is an `#[async_trait]` trait: re-exported so an out-of-tree lset
+/// can annotate its impl without taking its own `async-trait` dependency.
+pub use async_trait::async_trait;
+
 pub mod calc;
 pub mod error;
 pub mod net;

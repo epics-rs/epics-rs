@@ -14,12 +14,24 @@ use super::config::RuntimeConfig;
 use super::event::RuntimeEvent;
 
 /// Handle to a running PortRuntime. Provides shutdown and event subscription.
+///
+/// **Dropping this handle does not stop the port.** A port stops only when it
+/// is explicitly shut down ([`Self::shutdown`], [`Self::shutdown_and_wait`]) or
+/// when nothing can reach it any more — that is, when its last [`PortHandle`]
+/// is dropped. So publishing a port's `PortHandle` (to the
+/// [`crate::asyn_record`] registry, a [`crate::manager::PortManager`], a
+/// driver) is by itself enough to keep the port alive for as long as that
+/// publication lives; no caller has to park the runtime handle in a static to
+/// stop the actor thread from dying underneath it.
 #[derive(Clone)]
 pub struct PortRuntimeHandle {
     port_handle: PortHandle,
     client: InProcessClient,
     event_tx: broadcast::Sender<RuntimeEvent>,
-    /// Dropping this sender closes the shutdown channel, signaling the actor to exit.
+    /// Carries an explicit shutdown *request* to the actor. The actor stops on
+    /// a `()` **sent** here — never on this channel closing, which merely means
+    /// the last `PortRuntimeHandle` went away (see
+    /// `PortActor::run_with_shutdown`).
     shutdown_tx: Arc<std::sync::Mutex<Option<mpsc::Sender<()>>>>,
     /// Receives a single () when the actor thread exits. Used by shutdown_and_wait().
     completion_rx: Arc<std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>>,
@@ -44,15 +56,24 @@ impl PortRuntimeHandle {
 
     /// Signal the runtime to shut down (non-blocking).
     ///
-    /// Closes the shutdown channel, causing the actor thread to exit after
-    /// completing any in-progress request. Does not wait for the thread to stop.
+    /// Sends an explicit shutdown request; the actor thread exits after
+    /// completing any in-progress request. Does not wait for the thread to
+    /// stop. This outranks reachability: the port stops even while other
+    /// `PortHandle`s (a registry entry, a device-support binding) could still
+    /// submit to it, and those submissions then fail — which is the point of
+    /// asking for a shutdown.
+    ///
+    /// Repeated calls are harmless: the request is already queued (or the actor
+    /// has already gone), and both are a no-op.
     pub fn shutdown(&self) {
         // Poison-tolerant: shutdown must stay infallible even if a thread
         // panicked while holding the lock.
-        self.shutdown_tx
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
+        let guard = self.shutdown_tx.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(tx) = guard.as_ref() {
+            // Capacity-1 channel: `Full` means a shutdown is already queued,
+            // `Closed` means the actor has already stopped. Neither is an error.
+            let _ = tx.try_send(());
+        }
     }
 
     /// Signal shutdown and wait for the actor thread to exit.
@@ -119,6 +140,7 @@ pub fn create_port_runtime_boxed(
     // Actor channel
     let (tx, rx) = mpsc::channel(config.channel_capacity);
     let actor = PortActor::new(driver, rx);
+    let actor_id = actor.id();
 
     let event_tx_clone = event_tx.clone();
     let name_clone = port_name.clone();
@@ -137,7 +159,7 @@ pub fn create_port_runtime_boxed(
         })
         .expect("failed to spawn port runtime thread");
 
-    let mut port_handle = PortHandle::new(tx, port_name.clone(), handle_interrupts);
+    let mut port_handle = PortHandle::new(tx, port_name.clone(), handle_interrupts, actor_id);
     port_handle.set_can_block(can_block);
     port_handle.set_capabilities(multi_device, max_addr);
     port_handle.set_interfaces(interfaces);

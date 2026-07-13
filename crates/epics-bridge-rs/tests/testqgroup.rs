@@ -757,8 +757,9 @@ async fn group_put_member_acf_denial_rejects_entire_put() {
     /// Deny writes to a specific record (matching by full PV name as
     /// stored on the GroupMember.channel — `record.FIELD`).
     struct DenySpecific(String);
+    #[async_trait::async_trait]
     impl AccessControl for DenySpecific {
-        fn can_write(&self, channel: &str, _: &str, _: &str) -> bool {
+        async fn can_write(&self, channel: &str, _: &str, _: &str) -> bool {
             channel != self.0
         }
     }
@@ -1547,8 +1548,9 @@ async fn trapped_group_put_emits_per_member_astrapwrite() {
 
     /// Grant every write with the `TRAPWRITE` flag set.
     struct TrapAll;
+    #[async_trait::async_trait]
     impl AccessControl for TrapAll {
-        fn write_grant(&self, _channel: &str, _creds: &ClientCreds) -> WriteGrant {
+        async fn write_grant(&self, _channel: &str, _creds: &ClientCreds) -> WriteGrant {
             WriteGrant {
                 allowed: true,
                 rule_was_trap: true,

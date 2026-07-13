@@ -888,53 +888,49 @@ impl ClientState {
     }
 }
 
-/// Run the TCP listener for CA connections.
-/// Tries to bind to the configured port first; falls back to an ephemeral port
-/// (port 0) if the configured port is already in use.
+/// TCP listeners that are already bound and listening, one per
+/// `EPICS_CAS_INTF_ADDR_LIST` entry, all sharing one port.
 ///
-/// The TCP path does NOT touch the beacon ramp. C `rsrv` sets the ramp's
-/// initial period once, when `rsrv_online_notify_task` starts
-/// (`online_notify.c:68` `delay = 0.02`), and restarts it in exactly one other
-/// place: the `beacon_ctl == ctlPause` wait loop (`online_notify.c:126-129`).
-/// A client connect or disconnect never restarts it — accepting a connection
-/// is not a server state change other clients need to hear about. This port has
-/// no `ctlPause` equivalent (no `iocPause` lifecycle), so the ramp's only reset
-/// is its own start, and the beacon-reset signal is reachable solely through
-/// [`CaServer::trigger_beacon_anomaly`](super::ca_server::CaServer::trigger_beacon_anomaly)
-/// — the ca-gateway's `generateBeaconAnomaly` analogue.
-#[allow(clippy::too_many_arguments)]
-pub async fn run_tcp_listener(
-    db: Arc<PvDatabase>,
+/// This type is the server's readiness guarantee: it can only be
+/// produced by [`bind_tcp_listeners`], and every `CaServer`
+/// construction path produces one before handing the server back. A
+/// bound-and-listening socket already completes TCP handshakes in the
+/// kernel, so a client that connects before `CaServer::run()` is even
+/// polled is queued rather than refused — owning a `CaServer` implies
+/// "listening", with no readiness handshake for the caller to get
+/// wrong.
+#[derive(Clone)]
+pub struct BoundTcp {
+    listeners: Vec<(Arc<TcpListener>, std::net::Ipv4Addr)>,
     port: u16,
-    acf: Arc<tokio::sync::RwLock<Option<AccessSecurityConfig>>>,
-    acf_reload_tx: broadcast::Sender<()>,
-    tcp_port_tx: tokio::sync::oneshot::Sender<u16>,
-    conn_events: Option<broadcast::Sender<ServerConnectionEvent>>,
-    audit: Option<crate::audit::AuditLogger>,
-    drain: Arc<std::sync::atomic::AtomicBool>,
-    // PR #592 dbServerStats: per-connection byte counters feed the
-    // `casr` iocsh command's `bytes in=… out=…` line. Optional so unit
-    // tests of the TCP path don't need a full ServerStats wired up.
-    stats: Option<Arc<super::ca_server::ServerStats>>,
-    #[cfg(feature = "experimental-rust-tls")] tls: Option<
-        Arc<std::sync::RwLock<Arc<tokio_rustls::rustls::ServerConfig>>>,
-    >,
-    #[cfg(feature = "cap-tokens")] cap_token_verifier: Option<Arc<crate::cap_token::TokenVerifier>>,
-) -> CaResult<()> {
-    // honour every interface in `EPICS_CAS_INTF_ADDR_LIST`,
-    // not just the first. C `rsrv_init` (caservertask.c:603-712) iterates
-    // `casIntfAddrList` and spawns one `CAS-TCP` accept thread per
-    // entry, all bound to the same TCP port. Binding to a *specific*
-    // interface IP (vs `INADDR_ANY`) and binding to a *different*
-    // specific IP on the same port is allowed by POSIX; only two
-    // 0.0.0.0 binds collide. Empty list → single `0.0.0.0` listener
-    // (default), preserving the current single-NIC behaviour.
-    //
-    // First successful bind decides `actual_port` (honouring the
-    // existing AddrInUse → ephemeral-fallback path). All subsequent
-    // binds must use that same port; if a per-interface bind fails
-    // it is logged and skipped (matches C `cleanup:` / `continue;` in
-    // `caservertask.c:744-749`, which frees the conf and proceeds).
+}
+
+impl BoundTcp {
+    /// The port every listener in this set is bound to. This is the
+    /// port SEARCH replies and beacons advertise — it differs from the
+    /// requested port when the ephemeral fallback fired.
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+}
+
+/// Bind one TCP listener per `EPICS_CAS_INTF_ADDR_LIST` interface.
+///
+/// Tries the configured port first; falls back to an ephemeral port
+/// (port 0) if it is already in use.
+///
+/// C `rsrv_init` (caservertask.c:603-712) iterates `casIntfAddrList`
+/// and spawns one `CAS-TCP` accept thread per entry, all bound to the
+/// same TCP port. Binding to a *specific* interface IP (vs
+/// `INADDR_ANY`) and binding to a *different* specific IP on the same
+/// port is allowed by POSIX; only two 0.0.0.0 binds collide. Empty
+/// list → single `0.0.0.0` listener (default).
+///
+/// The first successful bind decides the port. All subsequent binds
+/// must use that same port; if a per-interface bind fails it is logged
+/// and skipped (matches C `cleanup:` / `continue;` in
+/// `caservertask.c:744-749`, which frees the conf and proceeds).
+pub async fn bind_tcp_listeners(port: u16) -> CaResult<BoundTcp> {
     let intf_addrs: Vec<std::net::Ipv4Addr> = {
         let cfg = super::addr_list::from_env()?;
         if cfg.intf_addrs.is_empty() {
@@ -944,7 +940,7 @@ pub async fn run_tcp_listener(
         }
     };
 
-    let mut listeners: Vec<(TcpListener, std::net::Ipv4Addr)> = Vec::new();
+    let mut listeners: Vec<(Arc<TcpListener>, std::net::Ipv4Addr)> = Vec::new();
     let mut actual_port: Option<u16> = None;
     for ip in &intf_addrs {
         let target_port = actual_port.unwrap_or(port);
@@ -979,22 +975,58 @@ pub async fn run_tcp_listener(
         if actual_port.is_none() {
             actual_port = Some(chosen);
         }
-        listeners.push((listener, *ip));
+        listeners.push((Arc::new(listener), *ip));
     }
 
-    let actual_port = match actual_port {
-        Some(p) => p,
+    match actual_port {
+        Some(port) => Ok(BoundTcp { listeners, port }),
         None => {
             // C `cantProceed("CAS: No TCP server started\n")` at
             // `caservertask.c:752`. Every configured interface failed
             // to bind — there's nothing to serve.
-            return Err(epics_base_rs::error::CaError::Io(std::io::Error::new(
+            Err(epics_base_rs::error::CaError::Io(std::io::Error::new(
                 std::io::ErrorKind::AddrNotAvailable,
                 "CAS: No TCP server started — all configured interfaces failed to bind",
-            )));
+            )))
         }
-    };
-    let _ = tcp_port_tx.send(actual_port);
+    }
+}
+
+/// Serve CA connections on listeners already bound by
+/// [`bind_tcp_listeners`].
+///
+/// The TCP path does NOT touch the beacon ramp. C `rsrv` sets the ramp's
+/// initial period once, when `rsrv_online_notify_task` starts
+/// (`online_notify.c:68` `delay = 0.02`), and restarts it in exactly one other
+/// place: the `beacon_ctl == ctlPause` wait loop (`online_notify.c:126-129`).
+/// A client connect or disconnect never restarts it — accepting a connection
+/// is not a server state change other clients need to hear about. This port has
+/// no `ctlPause` equivalent (no `iocPause` lifecycle), so the ramp's only reset
+/// is its own start, and the beacon-reset signal is reachable solely through
+/// [`CaServer::trigger_beacon_anomaly`](super::ca_server::CaServer::trigger_beacon_anomaly)
+/// — the ca-gateway's `generateBeaconAnomaly` analogue.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_tcp_listener(
+    db: Arc<PvDatabase>,
+    bound: BoundTcp,
+    acf: Arc<tokio::sync::RwLock<Option<AccessSecurityConfig>>>,
+    acf_reload_tx: broadcast::Sender<()>,
+    conn_events: Option<broadcast::Sender<ServerConnectionEvent>>,
+    audit: Option<crate::audit::AuditLogger>,
+    drain: Arc<std::sync::atomic::AtomicBool>,
+    // PR #592 dbServerStats: per-connection byte counters feed the
+    // `casr` iocsh command's `bytes in=… out=…` line. Optional so unit
+    // tests of the TCP path don't need a full ServerStats wired up.
+    stats: Option<Arc<super::ca_server::ServerStats>>,
+    #[cfg(feature = "experimental-rust-tls")] tls: Option<
+        Arc<std::sync::RwLock<Arc<tokio_rustls::rustls::ServerConfig>>>,
+    >,
+    #[cfg(feature = "cap-tokens")] cap_token_verifier: Option<Arc<crate::cap_token::TokenVerifier>>,
+) -> CaResult<()> {
+    let BoundTcp {
+        listeners,
+        port: actual_port,
+    } = bound;
 
     // One accept-loop task per bound interface. When the parent
     // `run_tcp_listener` future is dropped (CaServer shutdown via
@@ -1109,10 +1141,10 @@ pub async fn run_tcp_listener(
 /// `intf` is the bound interface IP; recorded on accept-error logs so
 /// multi-NIC hosts can tell which listener saw the failure. The
 /// `actual_port` parameter is the TCP port shared across all
-/// listeners (decided in `run_tcp_listener`).
+/// listeners (decided in `bind_tcp_listeners`).
 #[allow(clippy::too_many_arguments)]
 async fn accept_loop(
-    listener: TcpListener,
+    listener: Arc<TcpListener>,
     intf: std::net::Ipv4Addr,
     actual_port: u16,
     db: Arc<PvDatabase>,
@@ -6169,24 +6201,25 @@ mod multi_nic_listener_tests {
     use std::sync::atomic::AtomicBool;
     use std::time::Duration;
     use tokio::net::TcpStream;
-    use tokio::sync::{broadcast, oneshot};
+    use tokio::sync::broadcast;
 
-    /// Spawn `run_tcp_listener` against a per-test database, return the
-    /// (port, abort-handle). Honours whatever EPICS_CAS_INTF_ADDR_LIST
-    /// is currently set in the process env (caller manages it).
+    /// Bind an ephemeral listener set and spawn `run_tcp_listener` on it
+    /// against a per-test database; return the (port, abort-handle).
+    /// Honours whatever EPICS_CAS_INTF_ADDR_LIST is currently set in the
+    /// process env (caller manages it).
     async fn start_listener() -> (u16, tokio::task::JoinHandle<()>) {
         let db = Arc::new(PvDatabase::new());
         let acf = Arc::new(tokio::sync::RwLock::new(None));
         let (acf_reload_tx, _) = broadcast::channel::<()>(4);
-        let (tcp_tx, tcp_rx) = oneshot::channel::<u16>();
         let drain = Arc::new(AtomicBool::new(false));
+        let bound = bind_tcp_listeners(0).await.expect("listener bound");
+        let port = bound.port();
         let handle = tokio::spawn(async move {
             let _ = run_tcp_listener(
                 db,
-                0, // ephemeral
+                bound,
                 acf,
                 acf_reload_tx,
-                tcp_tx,
                 None,
                 None,
                 drain,
@@ -6198,7 +6231,6 @@ mod multi_nic_listener_tests {
             )
             .await;
         });
-        let port = tcp_rx.await.expect("listener bound");
         (port, handle)
     }
 

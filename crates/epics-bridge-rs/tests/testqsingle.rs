@@ -1006,8 +1006,9 @@ struct CapturedTrap {
 struct TrapStub {
     rule_was_trap: bool,
 }
+#[async_trait::async_trait]
 impl AccessControl for TrapStub {
-    fn write_grant(&self, _channel: &str, _creds: &ClientCreds) -> WriteGrant {
+    async fn write_grant(&self, _channel: &str, _creds: &ClientCreds) -> WriteGrant {
         WriteGrant {
             allowed: true,
             rule_was_trap: self.rule_was_trap,
@@ -1145,8 +1146,9 @@ async fn non_trap_single_put_emits_nothing() {
 #[tokio::test]
 async fn denied_single_put_emits_nothing() {
     struct DenyAll;
+    #[async_trait::async_trait]
     impl AccessControl for DenyAll {
-        fn can_write(&self, _: &str, _: &str, _: &str) -> bool {
+        async fn can_write(&self, _: &str, _: &str, _: &str) -> bool {
             false
         }
     }

@@ -89,6 +89,26 @@ mod tests {
         Arc::new(arr)
     }
 
+    /// Fence: `write_*_blocking` only queues param changes for the data
+    /// thread; the barrier ack proves they have been applied.
+    fn params_applied(handle: &PluginRuntimeHandle) {
+        assert!(
+            handle.wait_params_applied(std::time::Duration::from_secs(10)),
+            "data thread did not apply queued param changes"
+        );
+    }
+
+    fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !cond() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
     #[test]
     fn test_processor_stores_and_passes_through() {
         let mut proc = StdArraysProcessor::new();
@@ -114,18 +134,16 @@ mod tests {
             .port_handle()
             .write_int32_blocking(handle.plugin_params.enable_callbacks, 0, 1)
             .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        params_applied(&handle);
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         rt.block_on(handle.array_sender().publish(make_array(42)));
-        std::thread::sleep(std::time::Duration::from_millis(100));
-
-        let latest = data.lock().clone();
-        assert!(latest.is_some());
-        assert_eq!(latest.unwrap().unique_id, 42);
+        wait_until("StdArrays to store the published array", || {
+            data.lock().as_ref().is_some_and(|a| a.unique_id == 42)
+        });
     }
 
     #[test]
@@ -180,7 +198,6 @@ mod tests {
         // must still update with NDArrayCallbacks=0. This guards against the
         // STD_ARRAY_DATA interrupt being gated by the downstream-delivery flag.
         use asyn_rs::param::ParamValue;
-        use std::time::Duration;
 
         let pool = Arc::new(NDArrayPool::new(1_000_000));
         let wiring = Arc::new(WiringRegistry::new());
@@ -193,7 +210,7 @@ mod tests {
         // waveform output must still fire.
         port.write_int32_blocking(handle.ndarray_params.array_callbacks, 0, 0)
             .unwrap();
-        std::thread::sleep(Duration::from_millis(20));
+        params_applied(&handle);
 
         let mut rx = port.interrupts().subscribe_async();
 
@@ -202,7 +219,12 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(handle.array_sender().publish(make_array(7)));
-        std::thread::sleep(Duration::from_millis(100));
+        // ArrayCounter==1 ⟹ the frame was processed and its param batch
+        // (including the waveform interrupts) flushed.
+        wait_until("StdArrays to process the frame", || {
+            port.read_int32_blocking(handle.ndarray_params.array_counter, 0)
+                .is_ok_and(|v| v == 1)
+        });
 
         // make_array(7) is a 4-element UInt8 array → the STD_ARRAY_DATA
         // interrupt carries it as an Int8Array; the dimensions interrupt carries
@@ -232,7 +254,6 @@ mod tests {
         // MaxByteRate throttle drops the waveform output, so a throttled frame
         // leaves ArrayCounter unchanged (ImageJ etc. see no new data) while
         // DroppedArrays advances.
-        use std::time::Duration;
 
         let pool = Arc::new(NDArrayPool::new(1_000_000));
         let wiring = Arc::new(WiringRegistry::new());
@@ -245,7 +266,7 @@ mod tests {
         // (sent before a meaningful refill) is throttled.
         port.write_float64_blocking(handle.plugin_params.max_byte_rate, 0, 4.0)
             .unwrap();
-        std::thread::sleep(Duration::from_millis(20));
+        params_applied(&handle);
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -253,13 +274,21 @@ mod tests {
             .unwrap();
 
         rt.block_on(handle.array_sender().publish(make_array(1)));
-        std::thread::sleep(Duration::from_millis(40));
+        wait_until("first frame to be served and counted", || {
+            port.read_int32_blocking(handle.ndarray_params.array_counter, 0)
+                .is_ok_and(|v| v == 1)
+        });
         let counter_after_first = port
             .read_int32_blocking(handle.ndarray_params.array_counter, 0)
             .unwrap();
 
         rt.block_on(handle.array_sender().publish(make_array(2)));
-        std::thread::sleep(Duration::from_millis(40));
+        // The throttled frame leaves ArrayCounter unchanged, so wait on the
+        // observable it DOES advance: DroppedArrays.
+        wait_until("throttled frame to advance DroppedArrays", || {
+            port.read_int32_blocking(handle.plugin_params.dropped_output_arrays, 0)
+                .is_ok_and(|v| v == 1)
+        });
         let counter_after_second = port
             .read_int32_blocking(handle.ndarray_params.array_counter, 0)
             .unwrap();

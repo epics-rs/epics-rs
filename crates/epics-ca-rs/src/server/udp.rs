@@ -50,30 +50,99 @@ fn plan_responder_specs(
         .collect()
 }
 
-/// Run UDP search responders bound to one or more local interfaces.
+/// A UDP search responder whose sockets are already bound (and whose
+/// multicast groups are already joined).
 ///
-/// Each interface gets its own task — having a dedicated socket per
+/// Counterpart of [`super::tcp::BoundTcp`]: only [`bind_udp_responders`]
+/// can produce one, and every `CaServer` construction path does so
+/// before returning the server. A bound UDP socket already queues
+/// datagrams in the kernel, so a SEARCH that arrives before
+/// `CaServer::run()` is polled is answered once the recv loop starts
+/// rather than dropped.
+#[derive(Clone)]
+pub struct BoundResponder {
+    bind_ip: Ipv4Addr,
+    /// Primary socket, bound to the interface entry's address.
+    socket: Arc<UdpSocket>,
+    /// Secondary socket bound to the interface's broadcast address —
+    /// see the comment in [`bind_udp_responders`]. `None` on Windows
+    /// and for wildcard interfaces.
+    bcast: Option<Arc<UdpSocket>>,
+}
+
+/// The UDP search responders of one server, all bound to one port.
+#[derive(Clone)]
+pub struct BoundUdp {
+    responders: Vec<BoundResponder>,
+    port: u16,
+}
+
+impl BoundUdp {
+    /// The UDP port every responder is bound to. With a requested port
+    /// of 0 this is the ephemeral port the kernel chose — the value a
+    /// client must put in `EPICS_CA_ADDR_LIST` to reach this server.
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+}
+
+/// Bind one UDP search responder per `EPICS_CAS_INTF_ADDR_LIST`
+/// interface, joining every configured multicast group on it.
+///
+/// Each interface gets its own socket — having a dedicated socket per
 /// interface lets the OS keep the broadcast routing straight on multi-NIC
 /// hosts (matching C EPICS osiSockDiscoverInterfaces behaviour).
+///
+/// A requested `port` of 0 means "any free UDP port": the first
+/// responder's kernel-assigned port is then imposed on the remaining
+/// interfaces, since a CA server answers SEARCHes on one port and its
+/// clients are pointed at exactly one. This is the race-free way to
+/// take a port — a caller that probes for a free port first and passes
+/// the number can still lose it to another socket in between.
+pub fn bind_udp_responders(
+    port: u16,
+    intf_addrs: Vec<Ipv4Addr>,
+    mcast_addrs: &[Ipv4Addr],
+) -> CaResult<BoundUdp> {
+    let mut responders = Vec::new();
+    let mut actual_port = if port == 0 { None } else { Some(port) };
+    for (bind_ip, mcast_groups) in plan_responder_specs(intf_addrs, mcast_addrs) {
+        let responder = bind_single_responder(bind_ip, actual_port.unwrap_or(0), &mcast_groups)?;
+        if actual_port.is_none() {
+            actual_port = Some(responder.socket.local_addr()?.port());
+        }
+        responders.push(responder);
+    }
+    // `plan_responder_specs` always yields at least one spec (an empty
+    // interface list becomes the wildcard entry), so the port is set.
+    let port = actual_port.ok_or_else(|| {
+        epics_base_rs::error::CaError::Io(std::io::Error::new(
+            std::io::ErrorKind::AddrNotAvailable,
+            "CAS: no UDP search responder bound",
+        ))
+    })?;
+    Ok(BoundUdp { responders, port })
+}
+
+/// Run the recv loops of responders already bound by
+/// [`bind_udp_responders`].
 ///
 /// `ignore_addrs` filters out source addresses that should never receive
 /// search replies (EPICS_CAS_IGNORE_ADDR_LIST).
 pub async fn run_udp_search_responder(
     db: Arc<PvDatabase>,
-    port: u16,
+    bound: BoundUdp,
     tcp_port: u16,
-    intf_addrs: Vec<Ipv4Addr>,
     ignore_addrs: Vec<Ipv4Addr>,
-    mcast_addrs: Vec<Ipv4Addr>,
 ) -> CaResult<()> {
-    let specs = plan_responder_specs(intf_addrs, &mcast_addrs);
-    let mut handles = Vec::with_capacity(specs.len());
+    let responders = bound.responders;
+    let mut handles = Vec::with_capacity(responders.len());
 
-    for (bind_ip, mcast_for_intf) in specs {
+    for responder in responders {
         let db_t = db.clone();
         let ignore_t = ignore_addrs.clone();
         let handle = epics_base_rs::runtime::task::spawn(async move {
-            run_single_responder(db_t, bind_ip, port, tcp_port, ignore_t, mcast_for_intf).await
+            run_single_responder(db_t, responder, tcp_port, ignore_t).await
         });
         handles.push(handle);
     }
@@ -97,15 +166,17 @@ pub async fn run_udp_search_responder(
     result
 }
 
-async fn run_single_responder(
-    db: Arc<PvDatabase>,
+fn bind_single_responder(
     bind_ip: Ipv4Addr,
     port: u16,
-    tcp_port: u16,
-    ignore_addrs: Vec<Ipv4Addr>,
-    mcast_groups: Vec<Ipv4Addr>,
-) -> CaResult<()> {
+    mcast_groups: &[Ipv4Addr],
+) -> CaResult<BoundResponder> {
     let socket = bind_responder_socket(bind_ip, port)?;
+    // The port the primary actually took — identical to `port`, except
+    // for an ephemeral (0) request, where the kernel chose it. Every
+    // other socket of this responder must bind that same port: a CA
+    // server answers SEARCHes on exactly one port.
+    let port = socket.local_addr()?.port();
     // Join each multicast group on this
     // responder's own socket via `IP_ADD_MEMBERSHIP` with
     // `imr_interface = bind_ip`. C `caservertask.c:633-665` joins
@@ -120,7 +191,7 @@ async fn run_single_responder(
     // request is answered exactly once. Per-(intf, group) failures
     // are logged and skipped — `caservertask.c:659-660`
     // `errlogPrintf`s and continues; the IOC stays up.
-    for group in &mcast_groups {
+    for group in mcast_groups {
         match socket.join_multicast_v4(*group, bind_ip) {
             Ok(()) => tracing::debug!(
                 target: "epics_ca_rs::server::udp",
@@ -158,7 +229,7 @@ async fn run_single_responder(
     // socket receives broadcasts), so C `caservertask.c:670, 728`
     // guards the secondary socket with `#if !(_WIN32 || __CYGWIN__)`.
     // Mirror that gate.
-    let bcast_socket: Option<Arc<UdpSocket>> = {
+    let bcast: Option<Arc<UdpSocket>> = {
         #[cfg(any(windows, target_os = "windows"))]
         {
             None
@@ -184,9 +255,27 @@ async fn run_single_responder(
         }
     };
 
+    Ok(BoundResponder {
+        bind_ip,
+        socket,
+        bcast,
+    })
+}
+
+async fn run_single_responder(
+    db: Arc<PvDatabase>,
+    responder: BoundResponder,
+    tcp_port: u16,
+    ignore_addrs: Vec<Ipv4Addr>,
+) -> CaResult<()> {
+    let BoundResponder {
+        bind_ip,
+        socket,
+        bcast,
+    } = responder;
     let udp_rl = Arc::new(UdpRateLimiter::from_env());
     let primary = recv_loop(
-        socket.clone(),
+        socket,
         db.clone(),
         bind_ip,
         tcp_port,
@@ -194,7 +283,7 @@ async fn run_single_responder(
         udp_rl.clone(),
     );
 
-    match bcast_socket {
+    match bcast {
         Some(bsock) => {
             let secondary = recv_loop(bsock, db, bind_ip, tcp_port, ignore_addrs, udp_rl);
             // First task to error wins; the other is dropped when this
@@ -217,8 +306,17 @@ fn bind_responder_socket(bind_ip: Ipv4Addr, port: u16) -> CaResult<UdpSocket> {
     // requires BOTH SO_REUSEADDR and SO_REUSEPORT (different reuse classes
     // don't share); BSD/macOS need SO_REUSEPORT. Mirror libcom
     // epicsSocketEnableAddressUseForDatagramFanout and set both on Unix.
+    //
+    // Only for a *well-known* port, which is the case the fanout exists
+    // for. On an ephemeral bind (port 0) there is nothing to share, and
+    // the flags are actively harmful: Linux may hand bind(0) a port that
+    // already belongs to a reuse-compatible socket, silently joining its
+    // SO_REUSEPORT group — the kernel then load-balances arriving
+    // datagrams across the group, so SEARCHes for this server land on an
+    // unrelated socket and go unanswered. Leaving the flags off makes the
+    // kernel pick a port this socket exclusively owns.
     #[cfg(not(windows))]
-    {
+    if port != 0 {
         sock.set_reuse_address(true)?;
         #[cfg(unix)]
         sock.set_reuse_port(true)?;
@@ -232,7 +330,16 @@ fn bind_responder_socket(bind_ip: Ipv4Addr, port: u16) -> CaResult<UdpSocket> {
         let _ = sock.set_multicast_all_v4(false);
     }
     sock.set_nonblocking(true)?;
-    sock.bind(&std::net::SocketAddrV4::new(bind_ip, port).into())?;
+    // Name the socket in the error: a CA server binds several, and
+    // "Address already in use" with no address is unactionable for an
+    // operator whose UDP search port is taken by another process.
+    sock.bind(&std::net::SocketAddrV4::new(bind_ip, port).into())
+        .map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("CA server UDP search responder bind {bind_ip}:{port}: {e}"),
+            )
+        })?;
     let socket = UdpSocket::from_std(sock.into())?;
     socket.set_broadcast(true)?;
     // EPICS_CA_MCAST_TTL (epics-base 3.16, f2a1834d). Only consulted by
@@ -292,7 +399,25 @@ async fn recv_loop(
     let mut peek_buf = vec![0u8; 64 * 1024];
 
     loop {
-        let (len, src, drops) = recv_from_with_drop_count_socket(&socket, &mut buf).await?;
+        // C `cast_server.c:171-179`: a UDP recv error never exits the cast
+        // server thread — it logs and sleeps 1 s, then keeps receiving. On
+        // Windows, `WSAECONNRESET` (os error 10054) surfaces here whenever an
+        // earlier send from this socket drew an ICMP port-unreachable
+        // (KB263823); on Linux a connected-socket ICMP shows as
+        // `ECONNREFUSED`. Propagating the error instead killed the SEARCH
+        // responder for the rest of the server's life.
+        let (len, src, drops) = match recv_from_with_drop_count_socket(&socket, &mut buf).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    target: "epics_ca_rs::server::udp",
+                    %bind_ip,
+                    "CAS: UDP recv error: {e}"
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                continue;
+            }
+        };
         if drops != 0 && drops != prev_drops {
             tracing::debug!(
                 target: "epics_ca_rs::server::udp",
@@ -871,5 +996,79 @@ mod mr_r8_responder_plan_tests {
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].0, Ipv4Addr::UNSPECIFIED);
         assert!(specs[0].1.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod responder_bind_tests {
+    use super::*;
+
+    /// Boundary — port 0: an ephemeral responder must own its port
+    /// exclusively. The reuse flags exist so a well-known CA port can be
+    /// co-bound (caRepeater, a second IOC); on an ephemeral bind they let
+    /// Linux hand out a port already held by a reuse-compatible socket,
+    /// joining its SO_REUSEPORT group. The kernel then load-balances
+    /// arriving datagrams across the group and SEARCHes for this server
+    /// vanish into the other socket. A second bind of the same port must
+    /// therefore be refused.
+    #[test]
+    fn ephemeral_responder_port_cannot_be_co_bound() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let _g = rt.enter();
+
+        let bound = bind_udp_responders(0, vec![Ipv4Addr::LOCALHOST], &[]).expect("bind ephemeral");
+        assert_ne!(bound.port(), 0, "an ephemeral bind reports its real port");
+
+        // A reuse-enabled datagram socket — exactly the kind the CA
+        // client and caRepeater open — must NOT be able to join it.
+        let intruder = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).expect("socket");
+        intruder.set_reuse_address(true).expect("reuse addr");
+        #[cfg(unix)]
+        intruder.set_reuse_port(true).expect("reuse port");
+        let addr = std::net::SocketAddrV4::new(Ipv4Addr::LOCALHOST, bound.port());
+        assert!(
+            intruder.bind(&addr.into()).is_err(),
+            "the responder's ephemeral port must be exclusively owned; a \
+             second socket co-binding it would steal half its SEARCHes"
+        );
+    }
+
+    /// Boundary — a fixed port keeps the datagram-fanout reuse flags, so
+    /// the well-known CA port can still be co-bound (caRepeater parity).
+    ///
+    /// Unix only: `bind_responder_socket` sets no reuse flag at all on
+    /// Windows (its `SO_REUSEADDR` has socket-hijack semantics — see the
+    /// `cfg(not(windows))` gate there), so co-binding is *correctly*
+    /// refused on Windows and there is no fanout to assert.
+    #[cfg(unix)]
+    #[test]
+    fn fixed_responder_port_still_allows_datagram_fanout() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let _g = rt.enter();
+
+        // Take an ephemeral port first, then re-bind that same number as
+        // a *fixed* port so the test never guesses at a free one.
+        let probe = bind_udp_responders(0, vec![Ipv4Addr::LOCALHOST], &[]).expect("probe bind");
+        let port = probe.port();
+        drop(probe);
+
+        let bound = bind_udp_responders(port, vec![Ipv4Addr::LOCALHOST], &[]).expect("fixed bind");
+        assert_eq!(bound.port(), port);
+
+        let peer = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).expect("socket");
+        peer.set_reuse_address(true).expect("reuse addr");
+        #[cfg(unix)]
+        peer.set_reuse_port(true).expect("reuse port");
+        let addr = std::net::SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
+        assert!(
+            peer.bind(&addr.into()).is_ok(),
+            "a well-known CA port must stay co-bindable (caRepeater fanout)"
+        );
     }
 }

@@ -453,6 +453,22 @@ impl PvDatabase {
     /// adopts the `userTag` into `common.utag`. The `userTag` is the
     /// remote `timeStamp.userTag` widened without sign extension, or `0`
     /// when the source carries none.
+    /// Every registered lset, as a snapshot.
+    ///
+    /// The bare-name link paths try each lset in turn, and every lset call is
+    /// now an await. Snapshotting the registry (rather than iterating it under
+    /// its read guard) keeps the registry lock off the await path, so an lset
+    /// that registers or unregisters another while resolving cannot deadlock
+    /// against the caller.
+    async fn registered_link_sets(&self) -> Vec<crate::server::database::DynLinkSet> {
+        let registry = self.inner.link_sets.read().await;
+        registry
+            .schemes()
+            .iter()
+            .filter_map(|s| registry.get(s))
+            .collect()
+    }
+
     pub(crate) async fn external_link_time(&self, name: &str) -> Option<(i64, i32, u64)> {
         let (scheme, body) = if let Some(rest) = name.strip_prefix("pva://") {
             ("pva", rest)
@@ -460,18 +476,15 @@ impl PvDatabase {
             ("ca", rest)
         } else {
             // Bare name — try every registered lset.
-            let registry = self.inner.link_sets.read().await;
-            for s in registry.schemes() {
-                if let Some(lset) = registry.get(&s) {
-                    if let Some(ts) = lset.time_stamp(name) {
-                        return Some(ts);
-                    }
+            for lset in self.registered_link_sets().await {
+                if let Some(ts) = lset.time_stamp(name).await {
+                    return Some(ts);
                 }
             }
             return None;
         };
         let lset = self.inner.link_sets.read().await.get(scheme)?;
-        lset.time_stamp(body)
+        lset.time_stamp(body).await
     }
 
     /// Build a [`LinkAlarm`] from the registered lset's alarm
@@ -490,35 +503,34 @@ impl PvDatabase {
         } else {
             // Bare name — try every registered lset until one reports
             // a severity (mirrors `resolve_external_pv`'s bare path).
-            let registry = self.inner.link_sets.read().await;
-            for s in registry.schemes() {
-                if let Some(lset) = registry.get(&s) {
-                    if let Some(sev) = lset.alarm_severity(name) {
-                        return Some(LinkAlarm {
-                            // prefer the remote STAT for MSS;
-                            // fall back to LINK_ALARM when the lset has none.
-                            stat: lset
-                                .alarm_status(name)
-                                .map(|s| s as u16)
-                                .unwrap_or(crate::server::recgbl::alarm_status::LINK_ALARM),
-                            sevr: crate::server::record::AlarmSeverity::from_u16(sev as u16),
-                            amsg: lset.alarm_message(name).unwrap_or_default(),
-                        });
-                    }
+            for lset in self.registered_link_sets().await {
+                if let Some(sev) = lset.alarm_severity(name).await {
+                    return Some(LinkAlarm {
+                        // prefer the remote STAT for MSS;
+                        // fall back to LINK_ALARM when the lset has none.
+                        stat: lset
+                            .alarm_status(name)
+                            .await
+                            .map(|s| s as u16)
+                            .unwrap_or(crate::server::recgbl::alarm_status::LINK_ALARM),
+                        sevr: crate::server::record::AlarmSeverity::from_u16(sev as u16),
+                        amsg: lset.alarm_message(name).await.unwrap_or_default(),
+                    });
                 }
             }
             return None;
         };
         let lset = self.inner.link_sets.read().await.get(scheme)?;
-        let sev = lset.alarm_severity(body)?;
+        let sev = lset.alarm_severity(body).await?;
         Some(LinkAlarm {
             // remote STAT for MSS, else LINK_ALARM.
             stat: lset
                 .alarm_status(body)
+                .await
                 .map(|s| s as u16)
                 .unwrap_or(crate::server::recgbl::alarm_status::LINK_ALARM),
             sevr: crate::server::record::AlarmSeverity::from_u16(sev as u16),
-            amsg: lset.alarm_message(body).unwrap_or_default(),
+            amsg: lset.alarm_message(body).await.unwrap_or_default(),
         })
     }
 
@@ -548,18 +560,15 @@ impl PvDatabase {
         } else if let Some(rest) = name.strip_prefix("ca://") {
             ("ca", rest)
         } else {
-            let registry = self.inner.link_sets.read().await;
-            for s in registry.schemes() {
-                if let Some(lset) = registry.get(&s) {
-                    if let Some(snap) = lset.remote_alarm(name) {
-                        return Some(snap);
-                    }
+            for lset in self.registered_link_sets().await {
+                if let Some(snap) = lset.remote_alarm(name).await {
+                    return Some(snap);
                 }
             }
             return None;
         };
         let lset = self.inner.link_sets.read().await.get(scheme)?;
-        lset.remote_alarm(body)
+        lset.remote_alarm(body).await
     }
 
     /// Remote display / control / valueAlarm metadata for an external
@@ -587,18 +596,15 @@ impl PvDatabase {
         } else if let Some(rest) = name.strip_prefix("ca://") {
             ("ca", rest)
         } else {
-            let registry = self.inner.link_sets.read().await;
-            for s in registry.schemes() {
-                if let Some(lset) = registry.get(&s) {
-                    if let Some(meta) = lset.link_metadata(name) {
-                        return Some(meta);
-                    }
+            for lset in self.registered_link_sets().await {
+                if let Some(meta) = lset.link_metadata(name).await {
+                    return Some(meta);
                 }
             }
             return None;
         };
         let lset = self.inner.link_sets.read().await.get(scheme)?;
-        lset.link_metadata(body)
+        lset.link_metadata(body).await
     }
 
     /// C `dbGetLink` PP rule: if a DB input link is `ProcessPassive`
@@ -883,27 +889,24 @@ impl PvDatabase {
             // Bare name — try every registered lset in turn, first
             // accepting write wins (mirrors `resolve_external_pv`'s
             // bare-name path).
-            let registry = self.inner.link_sets.read().await;
-            let schemes = registry.schemes();
-            if schemes.is_empty() {
+            let lsets = self.registered_link_sets().await;
+            if lsets.is_empty() {
                 return Err(format!("no link set registered for external link '{name}'"));
             }
             let mut last_err = String::new();
-            for s in schemes {
-                if let Some(lset) = registry.get(&s) {
-                    match lset.put_value(name, value.clone(), op) {
-                        Ok(()) => {
-                            // Production drain of any retry-queued OUT
-                            // writes on this lset now that a write has
-                            // reached it (the channel may have just
-                            // reconnected). pvxs replays the queued
-                            // put from record processing, not test code
-                            // (`pvalink_channel.cpp:220-263`).
-                            lset.flush_puts();
-                            return Ok(());
-                        }
-                        Err(e) => last_err = e,
+            for lset in lsets {
+                match lset.put_value(name, value.clone(), op).await {
+                    Ok(()) => {
+                        // Production drain of any retry-queued OUT
+                        // writes on this lset now that a write has
+                        // reached it (the channel may have just
+                        // reconnected). pvxs replays the queued
+                        // put from record processing, not test code
+                        // (`pvalink_channel.cpp:220-263`).
+                        lset.flush_puts().await;
+                        return Ok(());
                     }
+                    Err(e) => last_err = e,
                 }
             }
             return Err(last_err);
@@ -915,9 +918,9 @@ impl PvDatabase {
             .await
             .get(scheme)
             .ok_or_else(|| format!("no '{scheme}' link set registered for '{name}'"))?;
-        let result = lset.put_value(body, value, op);
+        let result = lset.put_value(body, value, op).await;
         if result.is_ok() {
-            lset.flush_puts();
+            lset.flush_puts().await;
         }
         result
     }
@@ -942,18 +945,15 @@ impl PvDatabase {
             // Bare name — try every registered lset in turn, first
             // accepting the forward wins (mirrors `write_external_pv`'s
             // bare-name path so FWD and OUT route a bare target alike).
-            let registry = self.inner.link_sets.read().await;
-            let schemes = registry.schemes();
-            if schemes.is_empty() {
+            let lsets = self.registered_link_sets().await;
+            if lsets.is_empty() {
                 return Err(format!("no link set registered for forward link '{name}'"));
             }
             let mut last_err = String::new();
-            for s in schemes {
-                if let Some(lset) = registry.get(&s) {
-                    match lset.scan_forward(name) {
-                        Ok(()) => return Ok(()),
-                        Err(e) => last_err = e,
-                    }
+            for lset in lsets {
+                match lset.scan_forward(name).await {
+                    Ok(()) => return Ok(()),
+                    Err(e) => last_err = e,
                 }
             }
             return Err(last_err);
@@ -965,7 +965,7 @@ impl PvDatabase {
             .await
             .get(scheme)
             .ok_or_else(|| format!("no '{scheme}' link set registered for '{name}'"))?;
-        lset.scan_forward(body)
+        lset.scan_forward(body).await
     }
 
     /// Map a record's put-completion wait-set to the external-link put
@@ -2068,14 +2068,20 @@ mod nonlocal_db_link_write_tests {
     struct RecordingLset {
         puts: Arc<Mutex<Vec<(String, EpicsValue)>>>,
     }
+    #[async_trait::async_trait]
     impl LinkSet for RecordingLset {
-        fn is_connected(&self, _: &str) -> bool {
+        async fn is_connected(&self, _: &str) -> bool {
             true
         }
-        fn get_value(&self, _: &str) -> Option<EpicsValue> {
+        async fn get_value(&self, _: &str) -> Option<EpicsValue> {
             None
         }
-        fn put_value(&self, name: &str, value: EpicsValue, _op: LinkPutOp) -> Result<(), String> {
+        async fn put_value(
+            &self,
+            name: &str,
+            value: EpicsValue,
+            _op: LinkPutOp,
+        ) -> Result<(), String> {
             self.puts.lock().unwrap().push((name.to_string(), value));
             Ok(())
         }
@@ -2187,14 +2193,15 @@ mod nonlocal_db_link_write_tests {
         forwards: Arc<Mutex<Vec<String>>>,
         connected: bool,
     }
+    #[async_trait::async_trait]
     impl LinkSet for ForwardingLset {
-        fn is_connected(&self, _: &str) -> bool {
+        async fn is_connected(&self, _: &str) -> bool {
             self.connected
         }
-        fn get_value(&self, _: &str) -> Option<EpicsValue> {
+        async fn get_value(&self, _: &str) -> Option<EpicsValue> {
             None
         }
-        fn scan_forward(&self, name: &str) -> Result<(), String> {
+        async fn scan_forward(&self, name: &str) -> Result<(), String> {
             self.forwards.lock().unwrap().push(name.to_string());
             if self.connected {
                 Ok(())
@@ -2433,11 +2440,14 @@ mod nonlocal_db_link_read_tests {
         let db = PvDatabase::new();
         // Stand-in for the calink/pvalink lset: resolve OTHER:PV remotely.
         db.set_external_resolver(Arc::new(|name: &str| {
-            if name == "OTHER:PV" {
-                Some(EpicsValue::Double(42.0))
-            } else {
-                None
-            }
+            let hit = name == "OTHER:PV";
+            Box::pin(async move {
+                if hit {
+                    Some(EpicsValue::Double(42.0))
+                } else {
+                    None
+                }
+            })
         }))
         .await;
 
@@ -2465,11 +2475,14 @@ mod nonlocal_db_link_read_tests {
     async fn nonlocal_db_link_value_and_alarm_via_external() {
         let db = PvDatabase::new();
         db.set_external_resolver(Arc::new(|name: &str| {
-            if name == "OTHER:PV" {
-                Some(EpicsValue::Double(5.0))
-            } else {
-                None
-            }
+            let hit = name == "OTHER:PV";
+            Box::pin(async move {
+                if hit {
+                    Some(EpicsValue::Double(5.0))
+                } else {
+                    None
+                }
+            })
         }))
         .await;
 
@@ -2497,8 +2510,10 @@ mod nonlocal_db_link_read_tests {
         db.add_pv("SRC", EpicsValue::Double(7.0)).await.unwrap();
         // A resolver returning a DIFFERENT value proves the local read
         // wins and the external path is not taken for a local target.
-        db.set_external_resolver(Arc::new(|_name: &str| Some(EpicsValue::Double(-1.0))))
-            .await;
+        db.set_external_resolver(Arc::new(|_name: &str| {
+            Box::pin(async { Some(EpicsValue::Double(-1.0)) })
+        }))
+        .await;
 
         let link = parse_link_v2("SRC");
         let mut visited = HashSet::new();

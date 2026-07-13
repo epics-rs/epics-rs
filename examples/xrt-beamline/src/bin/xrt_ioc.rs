@@ -75,10 +75,7 @@ async fn main() -> CaResult<()> {
     let args: Vec<String> = std::env::args().collect();
 
     epics_base_rs::runtime::env::set_default("XRT_BEAMLINE", env!("CARGO_MANIFEST_DIR"));
-    epics_base_rs::runtime::env::set_default(
-        "ADCORE",
-        concat!(env!("CARGO_MANIFEST_DIR"), "/../../crates/ad-core-rs"),
-    );
+    epics_base_rs::runtime::env::set_default("ADCORE", ad_core_rs::AD_CORE_DIR);
     epics_base_rs::runtime::env::set_default("MOTOR", motor_rs::MOTOR_IOC_DIR);
 
     let script = if args.len() > 1 && !args[1].starts_with('-') {
@@ -155,7 +152,8 @@ async fn main() -> CaResult<()> {
                         .map_err(|e| format!("failed to create XRT detector: {e}"))?;
 
                 let xrt_handle = xrt_rt.port_handle().clone();
-                asyn_rs::asyn_record::register_port("XRT", xrt_handle, h.trace.clone());
+                asyn_rs::asyn_record::register_port("XRT", xrt_handle, h.trace.clone())
+                    .map_err(|e| e.to_string())?;
 
                 mgr_c.set_driver(Arc::new(ad_core_rs::ioc::GenericDriverContext::new(
                     xrt_rt.pool().clone(),

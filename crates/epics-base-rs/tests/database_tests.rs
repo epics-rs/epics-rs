@@ -350,17 +350,18 @@ async fn test_pva_link_propagates_alarm_severity_into_link_alarm() {
 
     /// Stub lset: serves a value and a fixed (already gated) severity.
     struct AlarmingLset;
+    #[epics_base_rs::async_trait]
     impl LinkSet for AlarmingLset {
-        fn is_connected(&self, _: &str) -> bool {
+        async fn is_connected(&self, _: &str) -> bool {
             true
         }
-        fn get_value(&self, _: &str) -> Option<EpicsValue> {
+        async fn get_value(&self, _: &str) -> Option<EpicsValue> {
             Some(EpicsValue::Double(12.0))
         }
-        fn alarm_severity(&self, _: &str) -> Option<i32> {
+        async fn alarm_severity(&self, _: &str) -> Option<i32> {
             Some(2) // MAJOR — as if the link's MS mode let it through
         }
-        fn alarm_message(&self, _: &str) -> Option<String> {
+        async fn alarm_message(&self, _: &str) -> Option<String> {
             Some("remote major".into())
         }
     }
@@ -412,11 +413,12 @@ async fn test_pva_link_no_alarm_when_lset_reports_none() {
     use epics_base_rs::server::record::AlarmSeverity;
 
     struct QuietLset;
+    #[epics_base_rs::async_trait]
     impl LinkSet for QuietLset {
-        fn is_connected(&self, _: &str) -> bool {
+        async fn is_connected(&self, _: &str) -> bool {
             true
         }
-        fn get_value(&self, _: &str) -> Option<EpicsValue> {
+        async fn get_value(&self, _: &str) -> Option<EpicsValue> {
             Some(EpicsValue::Double(5.0))
         }
         // alarm_severity defaults to None.
@@ -468,14 +470,15 @@ struct CapturingLset {
         >,
     >,
 }
+#[epics_base_rs::async_trait]
 impl epics_base_rs::server::database::LinkSet for CapturingLset {
-    fn is_connected(&self, _: &str) -> bool {
+    async fn is_connected(&self, _: &str) -> bool {
         true
     }
-    fn get_value(&self, _: &str) -> Option<EpicsValue> {
+    async fn get_value(&self, _: &str) -> Option<EpicsValue> {
         None
     }
-    fn put_value(
+    async fn put_value(
         &self,
         name: &str,
         value: EpicsValue,
@@ -1937,11 +1940,12 @@ async fn test_sim_mode_output() {
 async fn test_sim_mode_input_nonlocal_db_siol() {
     use epics_base_rs::server::database::LinkSet;
     struct ValueCaLset(f64);
+    #[epics_base_rs::async_trait]
     impl LinkSet for ValueCaLset {
-        fn is_connected(&self, _: &str) -> bool {
+        async fn is_connected(&self, _: &str) -> bool {
             true
         }
-        fn get_value(&self, name: &str) -> Option<EpicsValue> {
+        async fn get_value(&self, name: &str) -> Option<EpicsValue> {
             // The bare non-local SIOL record name reaches the CA lset
             // via the read-locality fallback `resolve_external_pv`.
             (name == "REMOTE:SIM").then_some(EpicsValue::Double(self.0))
@@ -6299,14 +6303,15 @@ async fn test_tsel_ca_time_link_copies_source_time() {
         secs: i64,
         nsec: i32,
     }
+    #[epics_base_rs::async_trait]
     impl LinkSet for TimeCaLset {
-        fn is_connected(&self, _: &str) -> bool {
+        async fn is_connected(&self, _: &str) -> bool {
             true
         }
-        fn get_value(&self, _: &str) -> Option<EpicsValue> {
+        async fn get_value(&self, _: &str) -> Option<EpicsValue> {
             Some(EpicsValue::Double(1.0))
         }
-        fn time_stamp(&self, name: &str) -> Option<(i64, i32, u64)> {
+        async fn time_stamp(&self, name: &str) -> Option<(i64, i32, u64)> {
             // Only the source record name (with `.TIME` stripped) should
             // reach the lset, mirroring C `TSEL_modified` truncating the
             // pvname at `.TIME`.
@@ -6364,14 +6369,15 @@ async fn test_tsel_nonlocal_db_time_link_copies_remote_time() {
         secs: i64,
         nsec: i32,
     }
+    #[epics_base_rs::async_trait]
     impl LinkSet for TimeCaLset {
-        fn is_connected(&self, _: &str) -> bool {
+        async fn is_connected(&self, _: &str) -> bool {
             true
         }
-        fn get_value(&self, _: &str) -> Option<EpicsValue> {
+        async fn get_value(&self, _: &str) -> Option<EpicsValue> {
             Some(EpicsValue::Double(1.0))
         }
-        fn time_stamp(&self, name: &str) -> Option<(i64, i32, u64)> {
+        async fn time_stamp(&self, name: &str) -> Option<(i64, i32, u64)> {
             // The bare Db record name (`.TIME` already split into the link
             // field by the parser) reaches the CA lset via the non-local
             // fallback `external_link_time("ca://TSE_SRC")`.
@@ -7405,14 +7411,15 @@ async fn test_lnk_calc_nonlocal_input_resolves_externally() {
         secs: i64,
         nsec: i32,
     }
+    #[epics_base_rs::async_trait]
     impl LinkSet for CalcCaLset {
-        fn is_connected(&self, _: &str) -> bool {
+        async fn is_connected(&self, _: &str) -> bool {
             true
         }
-        fn get_value(&self, name: &str) -> Option<EpicsValue> {
+        async fn get_value(&self, name: &str) -> Option<EpicsValue> {
             (name == "REMOTE:A").then_some(EpicsValue::Double(10.0))
         }
-        fn time_stamp(&self, name: &str) -> Option<(i64, i32, u64)> {
+        async fn time_stamp(&self, name: &str) -> Option<(i64, i32, u64)> {
             (name == "REMOTE:A").then_some((self.secs, self.nsec, 0))
         }
     }
@@ -8045,19 +8052,20 @@ async fn br_fr3_ca_link_applies_maximize_switch_at_processing() {
         sevr: i32,
         stat: i32,
     }
+    #[epics_base_rs::async_trait]
     impl LinkSet for RawCaLset {
-        fn is_connected(&self, _: &str) -> bool {
+        async fn is_connected(&self, _: &str) -> bool {
             true
         }
-        fn get_value(&self, _: &str) -> Option<EpicsValue> {
+        async fn get_value(&self, _: &str) -> Option<EpicsValue> {
             Some(EpicsValue::Double(7.0))
         }
-        fn alarm_severity(&self, _: &str) -> Option<i32> {
+        async fn alarm_severity(&self, _: &str) -> Option<i32> {
             // Mirror the real CA resolver: only a non-zero severity is a
             // contribution worth returning.
             if self.sevr > 0 { Some(self.sevr) } else { None }
         }
-        fn alarm_status(&self, _: &str) -> Option<i32> {
+        async fn alarm_status(&self, _: &str) -> Option<i32> {
             Some(self.stat)
         }
     }

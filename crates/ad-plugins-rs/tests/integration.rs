@@ -7,10 +7,31 @@ use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
 use ad_core_rs::driver::ad_driver::ADDriverBase;
 use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
 use ad_core_rs::ndarray_pool::NDArrayPool;
-use ad_core_rs::plugin::runtime::NDPluginProcess;
+use ad_core_rs::plugin::runtime::{NDPluginProcess, PluginRuntimeHandle};
 use ad_core_rs::plugin::wiring::WiringRegistry;
 use ad_plugins_rs::stats::create_stats_runtime;
 use ad_plugins_rs::std_arrays::create_std_arrays_runtime;
+
+/// Fence: `write_*_blocking`/`submit_blocking` only queue param changes for
+/// the plugin's data thread; the barrier ack proves they have been applied
+/// (enable flips, ROI sizes, NDArrayPort rewires).
+fn params_applied(handle: &PluginRuntimeHandle) {
+    assert!(
+        handle.wait_params_applied(std::time::Duration::from_secs(10)),
+        "data thread did not apply queued param changes"
+    );
+}
+
+fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !cond() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
 
 #[test]
 fn test_driver_to_stats_pipeline() {
@@ -26,7 +47,7 @@ fn test_driver_to_stats_pipeline() {
         .port_handle()
         .write_int32_blocking(stats_handle.plugin_params.enable_callbacks, 0, 1)
         .unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(10));
+    params_applied(&stats_handle);
 
     let mut driver = ADDriverBase::new("SIM1", 64, 64, 10_000_000).unwrap();
     driver.connect_downstream(stats_handle.array_sender().clone());
@@ -52,7 +73,9 @@ fn test_driver_to_stats_pipeline() {
         .unwrap();
     rt.block_on(driver.array_output.publish(to_publish));
 
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    wait_until("stats to process the frame", || {
+        stats_data.lock().num_elements == 64 * 64
+    });
 
     let result = stats_data.lock().clone();
     assert_eq!(result.num_elements, 64 * 64);
@@ -72,7 +95,7 @@ fn test_driver_to_std_arrays_pipeline() {
         .port_handle()
         .write_int32_blocking(image_handle.plugin_params.enable_callbacks, 0, 1)
         .unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(10));
+    params_applied(&image_handle);
 
     let mut driver = ADDriverBase::new("SIM1", 32, 32, 10_000_000).unwrap();
     driver.connect_downstream(image_handle.array_sender().clone());
@@ -93,7 +116,12 @@ fn test_driver_to_std_arrays_pipeline() {
         .unwrap();
     rt.block_on(driver.array_output.publish(to_publish));
 
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    wait_until("StdArrays to store the published array", || {
+        image_data
+            .lock()
+            .as_ref()
+            .is_some_and(|a| a.unique_id == id)
+    });
 
     let latest = image_data.lock().clone().unwrap();
     assert_eq!(latest.unique_id, id);
@@ -181,18 +209,15 @@ fn test_rewire_ndarray_port_at_runtime() {
         .port_handle()
         .write_int32_blocking(handle.plugin_params.enable_callbacks, 0, 1)
         .unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(10));
+    params_applied(&handle);
 
     // Send array from SIM1
     let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
     arr.unique_id = 100;
     rt.block_on(sim_publisher.publish(Arc::new(arr)));
-    std::thread::sleep(std::time::Duration::from_millis(50));
-    assert_eq!(
-        *last_id.lock(),
-        100,
-        "STATS1 should receive array from SIM1"
-    );
+    wait_until("STATS1 to receive array from SIM1", || {
+        *last_id.lock() == 100
+    });
 
     // Now rewire STATS1 from SIM1 → ROI1 via OctetWrite
     handle
@@ -205,13 +230,14 @@ fn test_rewire_ndarray_port_at_runtime() {
             AsynUser::new(handle.plugin_params.nd_array_port),
         )
         .unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    params_applied(&handle);
 
-    // Send array from SIM1 — should NOT reach STATS1 anymore
+    // Send array from SIM1 — should NOT reach STATS1 anymore. The rewire is
+    // already applied (barrier above), so SIM1's output no longer carries
+    // STATS1's sender and delivery is impossible — no wait needed.
     let mut arr2 = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
     arr2.unique_id = 200;
     rt.block_on(sim_publisher.publish(Arc::new(arr2)));
-    std::thread::sleep(std::time::Duration::from_millis(50));
     assert_eq!(
         *last_id.lock(),
         100,
@@ -222,12 +248,9 @@ fn test_rewire_ndarray_port_at_runtime() {
     let mut arr3 = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
     arr3.unique_id = 300;
     rt.block_on(roi_publisher.publish(Arc::new(arr3)));
-    std::thread::sleep(std::time::Duration::from_millis(50));
-    assert_eq!(
-        *last_id.lock(),
-        300,
-        "STATS1 should receive from ROI1 after rewire"
-    );
+    wait_until("STATS1 to receive from ROI1 after rewire", || {
+        *last_id.lock() == 300
+    });
 }
 
 #[test]
@@ -288,7 +311,7 @@ fn test_rewire_through_real_roi_plugin() {
         .port_handle()
         .write_int32_blocking(roi_handle.plugin_params.enable_callbacks, 0, 1)
         .unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(10));
+    params_applied(&roi_handle);
 
     // Create STATS1 (tracking processor) initially wired to SIM1
     struct TrackingProcessor {
@@ -326,7 +349,7 @@ fn test_rewire_through_real_roi_plugin() {
         .port_handle()
         .write_int32_blocking(stats_handle.plugin_params.enable_callbacks, 0, 1)
         .unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(10));
+    params_applied(&stats_handle);
 
     // Send array from SIM1 → both ROI1 and STATS1 receive directly
     let mut arr = NDArray::new(
@@ -335,8 +358,9 @@ fn test_rewire_through_real_roi_plugin() {
     );
     arr.unique_id = 100;
     rt.block_on(sim_publisher.publish(Arc::new(arr)));
-    std::thread::sleep(std::time::Duration::from_millis(100));
-    assert_eq!(*last_id.lock(), 100, "STATS1 gets array from SIM1");
+    wait_until("STATS1 to get the array from SIM1", || {
+        *last_id.lock() == 100
+    });
 
     // Rewire STATS1 from SIM1 → ROI1
     stats_handle
@@ -349,7 +373,7 @@ fn test_rewire_through_real_roi_plugin() {
             AsynUser::new(stats_handle.plugin_params.nd_array_port),
         )
         .unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    params_applied(&stats_handle);
 
     // Send another array from SIM1
     // ROI1 gets it from SIM1, processes it, publishes to its output
@@ -360,13 +384,9 @@ fn test_rewire_through_real_roi_plugin() {
     );
     arr2.unique_id = 200;
     rt.block_on(sim_publisher.publish(Arc::new(arr2)));
-    std::thread::sleep(std::time::Duration::from_millis(200));
-
-    let received_id = *last_id.lock();
-    assert!(
-        received_id != 100,
-        "STATS1 should receive new array through ROI1, got {received_id}"
-    );
+    wait_until("STATS1 to receive the new array through ROI1", || {
+        *last_id.lock() != 100
+    });
 }
 
 #[test]
@@ -401,7 +421,7 @@ fn test_roi_param_change_enables_output() {
         .port_handle()
         .write_int32_blocking(roi_handle.plugin_params.enable_callbacks, 0, 1)
         .unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(10));
+    params_applied(&roi_handle);
 
     // Tracking processor downstream of ROI1
     struct TrackingProcessor {
@@ -436,7 +456,7 @@ fn test_roi_param_change_enables_output() {
         .port_handle()
         .write_int32_blocking(stats_handle.plugin_params.enable_callbacks, 0, 1)
         .unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(10));
+    params_applied(&stats_handle);
 
     // Send array — ROI1 has default size=0. Matching C++ NDPluginROI
     // (size = MAX(size, 1)), an enabled ROI dim with size 0 clamps to a
@@ -447,12 +467,10 @@ fn test_roi_param_change_enables_output() {
     );
     arr.unique_id = 100;
     rt.block_on(sim_publisher.publish(Arc::new(arr)));
-    std::thread::sleep(std::time::Duration::from_millis(100));
-    assert_eq!(
-        *last_id.lock(),
-        100,
-        "ROI size=0 clamps to a 1-pixel ROI (C++ MAX(size,1)) and still emits"
-    );
+    // ROI size=0 clamps to a 1-pixel ROI (C++ MAX(size,1)) and still emits.
+    wait_until("STATS1 to receive the 1-pixel ROI output", || {
+        *last_id.lock() == 100
+    });
 
     // Now set ROI size via param write (like PINI or user).
     let roi_ph = roi_handle.port_runtime().port_handle();
@@ -462,7 +480,7 @@ fn test_roi_param_change_enables_output() {
     roi_ph
         .write_int32_blocking(roi_params.dims[1].size, 0, 8)
         .unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(50));
+    params_applied(&roi_handle);
 
     // Send another array — now ROI1 has size=8x8, should produce output
     let mut arr2 = NDArray::new(
@@ -471,12 +489,9 @@ fn test_roi_param_change_enables_output() {
     );
     arr2.unique_id = 200;
     rt.block_on(sim_publisher.publish(Arc::new(arr2)));
-    std::thread::sleep(std::time::Duration::from_millis(200));
-    assert_eq!(
-        *last_id.lock(),
-        200,
-        "STATS1 should receive after ROI size set to 8x8"
-    );
+    wait_until("STATS1 to receive after ROI size set to 8x8", || {
+        *last_id.lock() == 200
+    });
 }
 
 // --- Phase 5: New integration tests ---
@@ -718,7 +733,7 @@ fn test_process_and_publish_writes_array_size_params() {
     let ph = image_handle.port_runtime().port_handle();
     ph.write_int32_blocking(image_handle.plugin_params.enable_callbacks, 0, 1)
         .unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(10));
+    params_applied(&image_handle);
 
     // Connect and send a 64x48 array
     let mut driver =
@@ -737,7 +752,12 @@ fn test_process_and_publish_writes_array_size_params() {
         .unwrap();
     rt.block_on(driver.array_output.publish(to_publish));
 
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    // The frame's params (sizes, counter, unique id) flush as one batch, so
+    // ArrayCounter==1 implies every param below is already readable.
+    wait_until("StdArrays to process the frame", || {
+        ph.read_int32_blocking(image_handle.ndarray_params.array_counter, 0)
+            .is_ok_and(|v| v == 1)
+    });
 
     // Verify the StdArrays data was stored
     let latest = image_data.lock().clone();

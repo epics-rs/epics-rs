@@ -7,6 +7,7 @@
 //! For `can_block=true` ports, the actor runs on `tokio::task::spawn_blocking`.
 //! For `can_block=false` ports, it runs on a normal `tokio::spawn` task.
 
+use std::cell::Cell;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -20,6 +21,60 @@ use crate::request::{CancelToken, RequestOp, RequestResult};
 use crate::user::{AsynUser, ConnectCheck};
 
 static ACTOR_SEQ: AtomicU64 = AtomicU64::new(0);
+static ACTOR_IDS: AtomicU64 = AtomicU64::new(0);
+
+/// Identity of a port actor.
+///
+/// Minted once per [`PortActor`] and carried by every
+/// [`PortHandle`](crate::port_handle::PortHandle) that targets it, so that a
+/// caller about to block can answer the one question that decides whether
+/// blocking is safe: *am I the thread that would have to service the request I
+/// am about to wait on?*
+///
+/// The actor publishes its own id on its thread for as long as it runs (see
+/// [`ActorScope`]); [`current_actor`] reads it back.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct ActorId(u64);
+
+impl ActorId {
+    /// Mint a fresh identity, distinct from every other actor's.
+    ///
+    /// A handle whose actor is never spawned (some unit-test fixtures hold the
+    /// receiving end and run no actor loop) gets an id that is never published
+    /// on any thread — which is the truth: no thread is that port's actor, so
+    /// no caller can be it.
+    pub(crate) fn new() -> Self {
+        Self(ACTOR_IDS.fetch_add(1, AtomicOrdering::Relaxed))
+    }
+}
+
+thread_local! {
+    /// The port actor running on this thread, if this thread is an actor thread.
+    static CURRENT_ACTOR: Cell<Option<ActorId>> = const { Cell::new(None) };
+}
+
+/// Publishes an actor's id on its own thread, and unpublishes it on every exit
+/// path (return, panic).
+struct ActorScope(Option<ActorId>);
+
+impl ActorScope {
+    fn enter(id: ActorId) -> Self {
+        Self(CURRENT_ACTOR.with(|cur| cur.replace(Some(id))))
+    }
+}
+
+impl Drop for ActorScope {
+    fn drop(&mut self) {
+        CURRENT_ACTOR.with(|cur| cur.set(self.0));
+    }
+}
+
+/// The port actor owning the calling thread, or `None` if the caller is not an
+/// actor thread (a device-support scan thread, an `ad-core` driver thread, a
+/// plain `std::thread`, a tokio worker).
+pub(crate) fn current_actor() -> Option<ActorId> {
+    CURRENT_ACTOR.with(|cur| cur.get())
+}
 
 /// Message sent from [`super::port_handle::PortHandle`] to the actor.
 pub(crate) struct ActorMessage {
@@ -166,6 +221,7 @@ enum CDispatch {
 
 /// The actor that exclusively owns a port driver instance.
 pub(crate) struct PortActor {
+    id: ActorId,
     driver: Box<dyn PortDriver>,
     rx: mpsc::Receiver<ActorMessage>,
     heap: BinaryHeap<ActorMessage>,
@@ -177,6 +233,7 @@ pub(crate) struct PortActor {
 impl PortActor {
     pub fn new(driver: Box<dyn PortDriver>, rx: mpsc::Receiver<ActorMessage>) -> Self {
         Self {
+            id: ActorId::new(),
             driver,
             rx,
             heap: BinaryHeap::new(),
@@ -185,10 +242,20 @@ impl PortActor {
         }
     }
 
+    /// This actor's identity. Hand it to every [`PortHandle`] built against
+    /// this actor's channel so blocking callers can detect a re-entrant call
+    /// from the actor's own thread.
+    ///
+    /// [`PortHandle`]: crate::port_handle::PortHandle
+    pub fn id(&self) -> ActorId {
+        self.id
+    }
+
     /// Run the actor loop. Returns when the channel is closed (all senders dropped).
     /// Calls `shutdown()` on the driver before returning.
     #[cfg(test)]
     pub fn run(mut self) {
+        let _scope = ActorScope::enter(self.id);
         loop {
             // Drain all pending messages into the heap
             self.drain_channel();
@@ -212,35 +279,73 @@ impl PortActor {
     /// Run the actor loop with a dedicated shutdown channel.
     /// Calls `shutdown()` on the driver before returning.
     ///
-    /// Returns when either:
-    /// - The main request channel is closed (all senders dropped)
-    /// - The shutdown channel is closed (shutdown signaled)
+    /// A port stops for exactly two reasons, and dropping a
+    /// [`PortRuntimeHandle`](crate::runtime::port::PortRuntimeHandle) is
+    /// neither of them:
+    ///
+    /// - **Someone asked it to.** An explicit shutdown *sends* `()` on the
+    ///   shutdown channel (`PortRuntimeHandle::shutdown`). It outranks every
+    ///   outstanding handle: the port stops even while other `PortHandle`s
+    ///   could still reach it.
+    /// - **Nobody can reach it any more.** The request channel closed, i.e.
+    ///   the last `PortHandle` was dropped. No request can ever arrive again,
+    ///   so stopping is unobservable.
+    ///
+    /// The shutdown channel *closing* (every `PortRuntimeHandle` dropped) is
+    /// deliberately NOT a stop condition. It used to be — closing was the only
+    /// shutdown signal — which conflated "the creator dropped its handle" with
+    /// "shut this port down" and killed ports that the registry still held a
+    /// live `PortHandle` for.
     pub fn run_with_shutdown(mut self, mut shutdown_rx: mpsc::Receiver<()>) {
+        // Publish our identity for the whole life of the actor thread: every
+        // `PortDriver` method we dispatch below runs on this thread, so a
+        // driver that calls back into its own port through a `PortHandle` can
+        // be detected and refused instead of deadlocking on itself.
+        let _scope = ActorScope::enter(self.id);
+        // A *current-thread* runtime is deliberate: the actor owns its driver
+        // exclusively and dispatches serially (C asyn's per-port `portThread`).
+        // Nothing here may assume a multi-threaded runtime — see
+        // `PortHandle::block_on_reply`.
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
             .unwrap();
         rt.block_on(async {
+            // Once every PortRuntimeHandle is gone no explicit shutdown can
+            // ever arrive, so the (now permanently ready) shutdown branch is
+            // disabled rather than spun on.
+            let mut can_be_shut_down = true;
             loop {
                 // Drain all pending messages into the heap
                 self.drain_channel();
 
                 if self.heap.is_empty() {
-                    // Wait for a message, shutdown, or the connect-retry
-                    // deadline. The timer arm is what makes the autonomous
-                    // reconnect work with NO queued traffic (C's connect timer
-                    // fires on its own timer queue and posts a Connect-priority
-                    // request to the port thread, asynManager.c:3252-3266); here
-                    // the actor IS the port thread, so it wakes itself.
+                    // Wait for a message, an explicit shutdown, or the
+                    // connect-retry deadline. The timer arm is what makes the
+                    // autonomous reconnect work with NO queued traffic (C's
+                    // connect timer fires on its own timer queue and posts a
+                    // Connect-priority request to the port thread,
+                    // asynManager.c:3252-3266); here the actor IS the port
+                    // thread, so it wakes itself.
                     let retry_at = self.driver.base().connect_retry_at;
                     tokio::select! {
                         msg = self.rx.recv() => {
                             match msg {
                                 Some(m) => self.enqueue_message(m),
+                                // Unreachable: the last PortHandle is gone.
                                 None => break,
                             }
                         }
-                        _ = shutdown_rx.recv() => break,
+                        signal = shutdown_rx.recv(), if can_be_shut_down => {
+                            match signal {
+                                // Explicit shutdown.
+                                Some(()) => break,
+                                // Every PortRuntimeHandle was dropped. Not a
+                                // shutdown — keep serving whoever still holds
+                                // a PortHandle.
+                                None => can_be_shut_down = false,
+                            }
+                        }
                         _ = sleep_until_opt(retry_at) => {}
                     }
                     // Drain any more that arrived

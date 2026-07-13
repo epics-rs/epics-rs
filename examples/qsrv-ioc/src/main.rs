@@ -91,7 +91,7 @@ async fn main() -> CaResult<()> {
     spawn_simulator(db.clone());
 
     // ── Build both servers from the same database ──
-    let ca_server = CaServer::from_parts(db.clone(), ca_port, None, None, None, None);
+    let ca_server = CaServer::from_parts(db.clone(), ca_port, None, None, None, None).await?;
     let pva_server = PvaServer::from_parts(db, pva_port, None, None, None);
 
     // CA runs in background, PVA runs with iocsh (shell exit stops everything)

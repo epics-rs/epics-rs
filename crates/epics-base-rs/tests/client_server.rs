@@ -25,12 +25,6 @@ use epics_base_rs::server::snapshot::DbrClass;
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 use serial_test::serial;
 
-/// Pick a free ephemeral port by briefly binding and releasing.
-fn free_port() -> u16 {
-    let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-    sock.local_addr().unwrap().port()
-}
-
 /// Spin up an ephemeral-port server with the given PVs, return
 /// a connected `CaClient` whose ADDR_LIST points at that server.
 async fn setup(pvs: Vec<(&str, EpicsValue)>) -> CaResult<epics_ca_rs::client::CaClient> {
@@ -41,21 +35,22 @@ async fn setup(pvs: Vec<(&str, EpicsValue)>) -> CaResult<epics_ca_rs::client::Ca
 
     let acf = Arc::new(tokio::sync::RwLock::new(None));
 
-    // Start TCP on port 0, get the real port via oneshot.
-    let (tcp_tx, tcp_rx) = tokio::sync::oneshot::channel();
+    // Bind TCP on port 0 — the listener is accepting from here on, and
+    // the chosen port is known without a start-up handshake.
+    let bound_tcp = epics_ca_rs::server::tcp::bind_tcp_listeners(0)
+        .await
+        .expect("TCP listener bound");
+    let tcp_port = bound_tcp.port();
     let db_tcp = db.clone();
     let acf_clone = acf.clone();
     tokio::spawn(async move {
-        let beacon_reset = std::sync::Arc::new(tokio::sync::Notify::new());
         let drain = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (acf_reload_tx, _) = tokio::sync::broadcast::channel::<()>(16);
         let _ = epics_ca_rs::server::tcp::run_tcp_listener(
             db_tcp,
-            0,
+            bound_tcp,
             acf_clone,
             acf_reload_tx,
-            tcp_tx,
-            beacon_reset,
             None, // conn_events: not subscribed in this test
             None, // audit
             drain,
@@ -65,24 +60,29 @@ async fn setup(pvs: Vec<(&str, EpicsValue)>) -> CaResult<epics_ca_rs::client::Ca
         )
         .await;
     });
-    let tcp_port = tcp_rx.await.expect("TCP listener started");
 
-    // Start UDP search responder on a known free port.
-    let udp_port = free_port();
+    // Bind the UDP search responder on a kernel-assigned port and read the
+    // port back — never probe a port and re-bind the number, which races
+    // any other socket in this process. Bound here, so a SEARCH sent
+    // immediately below is queued by the kernel rather than lost — no
+    // sleep needed.
+    let responders = epics_ca_rs::server::udp::bind_udp_responders(
+        0,
+        vec![std::net::Ipv4Addr::UNSPECIFIED],
+        &[],
+    )
+    .expect("UDP responder bound");
+    let udp_port = responders.port();
     let db_udp = db.clone();
     tokio::spawn(async move {
         let _ = epics_ca_rs::server::udp::run_udp_search_responder(
             db_udp,
-            udp_port,
+            responders,
             tcp_port,
-            vec![std::net::Ipv4Addr::UNSPECIFIED],
-            Vec::new(),
             Vec::new(),
         )
         .await;
     });
-    // Give UDP socket a moment to bind
-    tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Point the client at our server's UDP port.
     unsafe {

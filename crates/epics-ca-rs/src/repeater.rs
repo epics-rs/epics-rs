@@ -149,8 +149,27 @@ pub async fn run_repeater_with_debug(debug: u8) -> io::Result<()> {
     let mut prev_drops: u32 = 0;
 
     loop {
+        // C `repeater.cpp:589-605`: a recv error never exits the repeater —
+        // `ECONNREFUSED` (Linux ICMP bug) and `ECONNRESET` (Windows KB263823)
+        // are silently skipped, anything else is logged, and the loop always
+        // continues. A repeater client that vanished between our fan-out send
+        // and this recv otherwise killed the whole repeater.
         let (len, src, drops) =
-            epics_base_rs::net::recv_from_with_drop_count_socket(&socket, &mut buf).await?;
+            match epics_base_rs::net::recv_from_with_drop_count_socket(&socket, &mut buf).await {
+                Ok(v) => v,
+                Err(e) => {
+                    if !matches!(
+                        e.kind(),
+                        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::ConnectionReset
+                    ) {
+                        tracing::warn!(
+                            target: "epics_ca_rs::repeater",
+                            "CA Repeater: unexpected UDP recv err: {e}"
+                        );
+                    }
+                    continue;
+                }
+            };
         if drops != 0 && drops != prev_drops {
             tracing::debug!(
                 target: "epics_ca_rs::repeater",

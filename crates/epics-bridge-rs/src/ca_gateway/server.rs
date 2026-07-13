@@ -516,13 +516,14 @@ impl GatewayServer {
                         config.server_port,
                         tls.clone(),
                     )
+                    .await?
                 } else {
-                    DownstreamServer::new(shadow_db.clone(), config.server_port)
+                    DownstreamServer::new(shadow_db.clone(), config.server_port).await?
                 }
             }
             #[cfg(not(feature = "ca-gateway-tls"))]
             {
-                DownstreamServer::new(shadow_db.clone(), config.server_port)
+                DownstreamServer::new(shadow_db.clone(), config.server_port).await?
             }
         });
 

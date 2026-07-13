@@ -1002,14 +1002,14 @@ fn cmd_db_load_records() -> CommandDef {
                     p.to_path_buf()
                 }
             };
-            let (mut defs, breaktables) =
+            // C `dbLoadRecords` macros are pure text substitution (dbLexRoutines.c
+            // → macLib): a `DTYP=` macro reaches a record only where the file wrote
+            // `field(DTYP,"$(DTYP)")`. It does NOT rewrite a record that spells its
+            // DTYP literally. `parse_db_file_with_breaktables` already performs that
+            // substitution, so there is nothing further to do for DTYP here.
+            let (defs, breaktables) =
                 db_loader::parse_db_file_with_breaktables(&file_path, &macros, &config)
                     .map_err(|e| format!("parse error: {e}"))?;
-
-            // DTYP override: if macros contain DTYP, override existing DTYP fields
-            if let Some(dtyp) = macros.get("DTYP") {
-                db_loader::override_dtyp(&mut defs, dtyp);
-            }
 
             // Merge any `breaktable(...)` definitions into the database's shared
             // breakpoint-table registry (C `bptList`) and snapshot it for the
@@ -1747,6 +1747,70 @@ mod tests {
         let args = parse_args(&tokens, &cmd.args).unwrap();
         let result = cmd.handler.call(&args, &ctx);
         assert!(result.is_err());
+    }
+
+    /// End-to-end through the real `dbLoadRecords` command: a `DTYP=` macro is
+    /// pure text substitution (C `dbLexRoutines.c` runs macros through macLib
+    /// during lexing), so it reaches only the record that wrote
+    /// `field(DTYP,"$(DTYP)")` and must leave a literal DTYP alone.
+    ///
+    /// The db below is the shape of the vendored `scaler-rs/db/scaler.db`: two
+    /// `bo` helper records with a literal `Soft Channel` DTYP plus the counting
+    /// record referencing `$(DTYP)` (an `ai` here, since the built-in loader has no
+    /// `scaler` type). The old force-override rewrote all three,
+    /// leaving the soft helpers bound to a hardware DTYP.
+    #[test]
+    fn db_load_records_dtyp_macro_leaves_literal_dtyp_alone() {
+        use std::io::Write;
+
+        let (db, ctx) = make_ctx();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scaler_shaped.db");
+        let mut f = std::fs::File::create(&path).unwrap();
+        write!(
+            f,
+            r#"
+record(bo, "$(P)_calcEnable") {{
+    field(DTYP, "Soft Channel")
+    field(ZNAM, "ENABLE")
+}}
+record(ai, "$(P)") {{
+    field(DTYP, "$(DTYP)")
+}}
+record(bo, "$(P)_calc_ctrl") {{
+    field(DTYP, "Soft Channel")
+    field(ONAM, "Cts/sec")
+}}
+"#
+        )
+        .unwrap();
+        drop(f);
+
+        let mut registry = CommandRegistry::new();
+        register_builtins(&mut registry);
+        let cmd = registry.get("dbLoadRecords").unwrap();
+        let tokens = vec![
+            path.to_str().unwrap().to_string(),
+            "P=SCALER1,DTYP=Scaler-rs".to_string(),
+        ];
+        let args = parse_args(&tokens, &cmd.args).unwrap();
+        cmd.handler.call(&args, &ctx).unwrap();
+
+        let dtyp_of = |name: &str| -> String {
+            ctx.block_on(async {
+                let rec = db.get_record(name).await.expect("record loaded");
+                let inst = rec.read().await;
+                inst.common.dtyp.clone()
+            })
+        };
+
+        // Literal DTYP on the soft helpers: untouched. Force-override used to
+        // corrupt both into "Scaler-rs".
+        assert_eq!(dtyp_of("SCALER1_calcEnable"), "Soft Channel");
+        assert_eq!(dtyp_of("SCALER1_calc_ctrl"), "Soft Channel");
+        // The `$(DTYP)` reference: substituted.
+        assert_eq!(dtyp_of("SCALER1"), "Scaler-rs");
     }
 
     #[test]

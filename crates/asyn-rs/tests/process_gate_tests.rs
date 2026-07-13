@@ -32,6 +32,7 @@ record(calc, "TEST:ACNT") {
 "#;
     let macros = HashMap::new();
     let server = CaServerBuilder::new()
+        .port(0)
         .register_record_type("asyn", || {
             Box::new(asyn_rs::asyn_record::AsynRecord::default())
         })

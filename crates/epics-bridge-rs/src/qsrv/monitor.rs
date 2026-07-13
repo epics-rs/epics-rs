@@ -222,7 +222,7 @@ impl PvaMonitor for BridgeMonitor {
 
         // Read enforcement: a client without read permission must not be
         // allowed to subscribe to monitor events either.
-        if !self.access.can_read(&self.record_name) {
+        if !self.access.can_read(&self.record_name).await {
             return Err(BridgeError::PutRejected(format!(
                 "monitor read denied for {} (user='{}' host='{}')",
                 self.record_name, self.access.user, self.access.host

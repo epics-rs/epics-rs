@@ -35,19 +35,24 @@ use crate::user::AsynUser;
 /// command closure so the trace mutators reach the same
 /// [`crate::trace::TraceManager`] the drivers were registered with.
 ///
-/// C parity: the six `asynShellCommands.c` commands (`asynReport /
-/// asynSetOption / asynSetTraceMask / asynSetTraceIOMask /
-/// asynSetTraceInfoMask / asynSetTraceFile`) plus the port-creation
-/// command `drvAsynIPPort.c::drvAsynIPPortConfigure`, registered as a
-/// startup command so it runs before `iocInit`.
+/// C parity: the `asynShellCommands.c` set (`asynReport / asynSetOption /
+/// asynOctetSetInputEos / asynOctetSetOutputEos / asynSetTraceMask /
+/// asynSetTraceIOMask / asynSetTraceInfoMask / asynSetTraceFile`) plus the
+/// port-creation commands (`drvAsynIPPortConfigure`,
+/// `drvAsynSerialPortConfigure`, `drvAsynPrologixPortConfigure`).
+///
+/// Every one of them is registered on **both** shells: the startup shell that
+/// executes `st.cmd` before `iocInit`, and the interactive shell that follows
+/// it. In C these are plain iocsh commands, so a startup script may create a
+/// port and set its EOS before `iocInit` — the usual sequence for a socket
+/// detector. Registering the set as interactive-only would make every one of
+/// them an unknown command in `st.cmd`, which aborts the script.
 pub fn register_asyn_commands(mut app: IocApplication, mgr: Arc<PortManager>) -> IocApplication {
-    let trace = mgr.trace_manager().clone();
     for def in build_asyn_commands(mgr) {
+        app = app.register_startup_command(def.clone());
         app = app.register_shell_command(def);
     }
-    app = app.register_startup_command(drv_asyn_ip_port_configure_command(trace.clone()));
-    app = app.register_startup_command(drv_asyn_serial_port_configure_command(trace.clone()));
-    app.register_startup_command(drv_asyn_prologix_port_configure_command(trace))
+    app
 }
 
 fn arg_int(args: &[ArgValue], i: usize) -> Option<i64> {
@@ -246,25 +251,27 @@ pub fn register_asyn_commands_on_shell(
     shell: &epics_base_rs::server::iocsh::IocShell,
     mgr: Arc<PortManager>,
 ) {
-    let trace = mgr.trace_manager().clone();
     for def in build_asyn_commands(mgr) {
         shell.register(def);
     }
-    shell.register(drv_asyn_ip_port_configure_command(trace.clone()));
-    shell.register(drv_asyn_serial_port_configure_command(trace.clone()));
-    shell.register(drv_asyn_prologix_port_configure_command(trace));
 }
 
-/// Build the asyn iocsh `CommandDef`s without binding them to a specific
-/// carrier: `asynReport`, `asynSetOption`, `asynOctetSetInputEos`,
-/// `asynOctetSetOutputEos`, and the trace mutators (`asynSetTraceMask`,
-/// `asynSetTraceIOMask`, `asynSetTraceInfoMask`). Both
+/// Build the complete asyn iocsh `CommandDef` set without binding it to a
+/// specific carrier: `asynReport`, `asynSetOption`, `asynOctetSetInputEos`,
+/// `asynOctetSetOutputEos`, the trace mutators (`asynSetTraceMask`,
+/// `asynSetTraceIOMask`, `asynSetTraceInfoMask`, `asynSetTraceFile`) and the
+/// port-creation commands (`drvAsynIPPortConfigure`,
+/// `drvAsynSerialPortConfigure`, `drvAsynPrologixPortConfigure`).
+///
 /// [`register_asyn_commands`] (IocApplication path) and
-/// [`register_asyn_commands_on_shell`] (direct IocShell path) delegate
-/// here so the C-parity command set stays in lock step across both entry
-/// points.
+/// [`register_asyn_commands_on_shell`] (direct IocShell path) both delegate
+/// here, so every carrier gets the same set and the C-parity surface cannot
+/// drift between them. Keeping the port-creation commands in this one list is
+/// what stops a shell from being able to *create* a port it cannot then
+/// configure.
 pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
     let mut out = Vec::new();
+    let trace = mgr.trace_manager().clone();
 
     // asynReport ----------------------------------------------------------
     {
@@ -739,22 +746,14 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
         ));
     }
 
+    // Port-creation commands ----------------------------------------------
+    // Part of the same set: a shell that can create a port must be able to
+    // configure it in the next line of the same script.
+    out.push(drv_asyn_ip_port_configure_command(trace.clone()));
+    out.push(drv_asyn_serial_port_configure_command(trace.clone()));
+    out.push(drv_asyn_prologix_port_configure_command(trace));
+
     out
-}
-
-/// Keeps the [`PortRuntimeHandle`]s created by the port-configure iocsh
-/// commands (`drvAsynIPPortConfigure`, `drvAsynSerialPortConfigure`)
-/// alive for the process lifetime. Dropping a handle shuts the port's
-/// actor thread down, so a startup-script-created port must be parked
-/// somewhere with a 'static lifetime.
-static PORT_RUNTIMES: OnceLock<Mutex<Vec<PortRuntimeHandle>>> = OnceLock::new();
-
-fn keep_port_runtime(handle: PortRuntimeHandle) {
-    PORT_RUNTIMES
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push(handle);
 }
 
 /// Build the `drvAsynIPPortConfigure` iocsh command.
@@ -845,8 +844,18 @@ pub fn drv_asyn_ip_port_configure_command(trace: Arc<TraceManager>) -> CommandDe
                 };
 
             let (handle, _jh) = create_port_runtime(driver, RuntimeConfig::default());
-            crate::asyn_record::register_port(&port, handle.port_handle().clone(), trace.clone());
-            keep_port_runtime(handle);
+            if let Err(e) = crate::asyn_record::register_port(
+                &port,
+                handle.port_handle().clone(),
+                trace.clone(),
+            ) {
+                ctx.println(&format!("drvAsynIPPortConfigure: {e}"));
+                handle.shutdown();
+                return Ok(CommandOutcome::Continue);
+            }
+            // The registry above holds a live `PortHandle` for this port, which is
+            // what keeps its actor alive; the `PortRuntimeHandle` may drop here.
+            drop(handle);
             ctx.println(&format!(
                 "drvAsynIPPortConfigure: octet port '{port}' -> {host}"
             ));
@@ -921,8 +930,18 @@ pub fn drv_asyn_serial_port_configure_command(trace: Arc<TraceManager>) -> Comma
                 };
 
             let (handle, _jh) = create_port_runtime(driver, RuntimeConfig::default());
-            crate::asyn_record::register_port(&port, handle.port_handle().clone(), trace.clone());
-            keep_port_runtime(handle);
+            if let Err(e) = crate::asyn_record::register_port(
+                &port,
+                handle.port_handle().clone(),
+                trace.clone(),
+            ) {
+                ctx.println(&format!("drvAsynSerialPortConfigure: {e}"));
+                handle.shutdown();
+                return Ok(CommandOutcome::Continue);
+            }
+            // The registry above holds a live `PortHandle` for this port, which is
+            // what keeps its actor alive; the `PortRuntimeHandle` may drop here.
+            drop(handle);
             ctx.println(&format!(
                 "drvAsynSerialPortConfigure: octet port '{port}' -> {tty}"
             ));
@@ -991,8 +1010,18 @@ pub fn drv_asyn_prologix_port_configure_command(trace: Arc<TraceManager>) -> Com
             };
 
             let (handle, _jh) = create_port_runtime(driver, RuntimeConfig::default());
-            crate::asyn_record::register_port(&port, handle.port_handle().clone(), trace.clone());
-            keep_port_runtime(handle);
+            if let Err(e) = crate::asyn_record::register_port(
+                &port,
+                handle.port_handle().clone(),
+                trace.clone(),
+            ) {
+                ctx.println(&format!("prologixGPIBConfigure: {e}"));
+                handle.shutdown();
+                return Ok(CommandOutcome::Continue);
+            }
+            // The registry above holds a live `PortHandle` for this port, which is
+            // what keeps its actor alive; the `PortRuntimeHandle` may drop here.
+            drop(handle);
             ctx.println(&format!(
                 "prologixGPIBConfigure: GPIB port '{port}' -> {host}"
             ));
@@ -1072,10 +1101,11 @@ mod tests {
         // succeeds) — we count one CommandDef per C-side function.
         assert_eq!(
             cmds.len(),
-            10,
+            13,
             "asyn iocsh command set: asynReport, asynSetOption, \
              asynOctetSet{{Input,Output}}Eos, asynInterposeEcho, \
-             asynInterposeDelay, and the four trace mutators"
+             asynInterposeDelay, the four trace mutators, and the three \
+             drvAsyn*PortConfigure port-creation commands"
         );
         assert!(set_trace_mask.args.len() == 3);
 
@@ -1091,7 +1121,10 @@ mod tests {
     }
 
     /// `build_asyn_commands` exposes the C `asynShellCommands.c` functions
-    /// asyn-rs ports — guards against silent additions / removals.
+    /// asyn-rs ports, plus the `drvAsyn*PortConfigure` port-creation commands —
+    /// guards against silent additions / removals. The port-creation commands
+    /// belong to the same set: a shell that can create a port must be able to
+    /// configure it, so they cannot drift onto a different carrier.
     #[test]
     fn iocsh_registers_c_parity_commands() {
         let mgr = Arc::new(PortManager::new());
@@ -1108,6 +1141,9 @@ mod tests {
             "asynSetTraceIOMask",
             "asynSetTraceInfoMask",
             "asynSetTraceFile",
+            "drvAsynIPPortConfigure",
+            "drvAsynSerialPortConfigure",
+            "prologixGPIBConfigure",
         ] {
             assert!(
                 names.contains(&expected),

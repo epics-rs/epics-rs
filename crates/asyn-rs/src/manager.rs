@@ -22,8 +22,18 @@ pub struct PortManager {
 
 impl PortManager {
     pub fn new() -> Self {
+        Self::with_trace_manager(Arc::new(TraceManager::new()))
+    }
+
+    /// Build a manager that shares an existing [`TraceManager`].
+    ///
+    /// The `asynSetTrace*` iocsh commands mutate the trace manager reached
+    /// through [`Self::trace_manager`]. An IOC whose ports and drivers were
+    /// registered against a trace manager it built itself (e.g. `AdIoc`) must
+    /// hand that same instance here, or those commands would mutate a trace
+    /// manager nothing reads and silently do nothing.
+    pub fn with_trace_manager(trace: Arc<TraceManager>) -> Self {
         let exceptions = Arc::new(ExceptionManager::new());
-        let trace = Arc::new(TraceManager::new());
         // Wire the exception sink so `setTrace*` setters announce
         // `asynExceptionTrace*` to subscribers, matching C
         // asynManager.c:2790/2832/2874/2923/2956.
@@ -43,12 +53,16 @@ impl PortManager {
     /// and client access.
     ///
     /// **Errors with `PortAlreadyRegistered`** if a port with the same name
-    /// is already in the registry. Mirrors asyn upstream issue #34
-    /// (`asynPortDriver` segfault on duplicate port name): a silent
-    /// overwrite would orphan the prior `PortRuntimeHandle` (its runtime
-    /// thread would keep running on a now-unreachable handle, leaking
-    /// resources and silently shadowing legitimate I/O). To replace a
-    /// port, call [`Self::unregister_port`] first.
+    /// already exists anywhere in the process — this manager's map or the
+    /// process port registry (ports created by the `drvAsyn*PortConfigure`
+    /// iocsh commands, plugin ports, hand-registered ports). C parity:
+    /// `asynManager::registerPort` refuses duplicate names. Mirrors asyn
+    /// upstream issue #34 (`asynPortDriver` segfault on duplicate port
+    /// name): a silent overwrite would orphan the prior
+    /// `PortRuntimeHandle` (its runtime thread would keep running on a
+    /// now-unreachable handle, leaking resources and silently shadowing
+    /// legitimate I/O). To replace a port, call
+    /// [`Self::unregister_port`] first.
     pub fn register_port<D: PortDriver>(&self, driver: D) -> AsynResult<PortRuntimeHandle> {
         self.register_port_with_config(driver, RuntimeConfig::default())
     }
@@ -62,34 +76,45 @@ impl PortManager {
         config: RuntimeConfig,
     ) -> AsynResult<PortRuntimeHandle> {
         let name = driver.base().port_name.clone();
-        // Pre-flight under both locks: refuse before we spawn the
-        // runtime thread, so a rejected duplicate doesn't burn a
-        // thread + create a half-initialized PortRuntimeHandle.
+        // Pre-flight: refuse before we spawn the runtime thread, so a
+        // rejected duplicate doesn't burn a thread + create a
+        // half-initialized PortRuntimeHandle. The manager map catches a
+        // stale manager-owned entry whose registry entry was withdrawn
+        // externally; the registry check catches ports published by any
+        // other creator (drvAsyn*PortConfigure, plugins, hand-registered).
         {
             let ph = self.port_handles.lock();
             if ph.contains_key(&name) {
                 return Err(AsynError::PortAlreadyRegistered(name));
             }
         }
+        if crate::asyn_record::get_port(&name).is_some() {
+            return Err(AsynError::PortAlreadyRegistered(name));
+        }
         driver.base_mut().exception_sink = Some(self.exceptions.clone());
         driver.base_mut().trace = Some(self.trace.clone());
 
         let (handle, _jh) = create_port_runtime(driver, config);
 
-        // Re-check under the write lock to close the TOCTOU window
-        // between the pre-flight read and the actual insert. If a
-        // concurrent caller raced us in, drop the runtime we just
-        // built and report the duplicate.
+        // The process-registry insert is the atomic claim on the name —
+        // it is the single place every consumer resolves a name through
+        // (asyn iocsh commands, asynRecord device support, the asyn
+        // device-support adapter), and it refuses duplicates. Losing the
+        // claim means a concurrent registrant won between the pre-flight
+        // and here: drop the runtime we just built and report the
+        // duplicate.
+        if let Err(e) = crate::asyn_record::register_port(
+            &name,
+            handle.port_handle().clone(),
+            self.trace.clone(),
+        ) {
+            handle.shutdown();
+            return Err(e);
+        }
         let mut ph = self.port_handles.lock();
         let mut rh = self.runtime_handles.lock();
-        if ph.contains_key(&name) {
-            drop(rh);
-            drop(ph);
-            handle.shutdown();
-            return Err(AsynError::PortAlreadyRegistered(name));
-        }
         ph.insert(name.clone(), handle.port_handle().clone());
-        rh.insert(name, handle.clone());
+        rh.insert(name.clone(), handle.clone());
         drop(rh);
         drop(ph);
 
@@ -97,11 +122,19 @@ impl PortManager {
     }
 
     /// Find a port handle by name.
+    ///
+    /// Ports this manager registered itself resolve from its own map; any other
+    /// name falls through to the process port registry, which is where the
+    /// `drvAsyn*PortConfigure` iocsh commands, areaDetector plugins and
+    /// hand-registered driver ports publish. Without that fall-through the asyn
+    /// iocsh commands could not act on a port created from st.cmd — they would
+    /// report "port not found" for a port the IOC had just built.
     pub fn find_port_handle(&self, name: &str) -> AsynResult<PortHandle> {
-        self.port_handles
-            .lock()
-            .get(name)
-            .cloned()
+        if let Some(handle) = self.port_handles.lock().get(name).cloned() {
+            return Ok(handle);
+        }
+        crate::asyn_record::get_port(name)
+            .map(|entry| entry.handle)
             .ok_or_else(|| AsynError::PortNotFound(name.to_string()))
     }
 
@@ -147,10 +180,15 @@ impl PortManager {
     pub fn unregister_port(&self, name: &str) {
         let mut ph = self.port_handles.lock();
         let mut rh = self.runtime_handles.lock();
-        ph.remove(name);
+        let was_ours = ph.remove(name).is_some();
         let runtime = rh.remove(name);
         drop(rh);
         drop(ph);
+        // A port this manager published must not outlive it in the registry,
+        // or the name would keep resolving to a handle whose runtime is gone.
+        if was_ours {
+            crate::asyn_record::unregister_port(name);
+        }
         if let Some(runtime_handle) = runtime {
             runtime_handle.shutdown();
         }
@@ -166,15 +204,23 @@ impl PortManager {
         &self.trace
     }
 
-    /// Names of every currently-registered port, in arbitrary order.
+    /// Names of every port this IOC can act on, in sorted order.
     ///
     /// C parity: `asynManager::report` walks the global port list to
     /// emit one entry per port — iocsh `asynReport` exposes the same
     /// view (no port argument = all ports). Used by
     /// [`crate::iocsh::register_asyn_commands`] for the no-port-arg
     /// case; also useful for diagnostic tooling.
+    ///
+    /// This is the union of the ports this manager registered and the ports
+    /// published to the process registry (`drvAsyn*PortConfigure`, plugin and
+    /// driver ports), so `asynReport` sees the whole IOC rather than only the
+    /// ports that happened to be created through this manager.
     pub fn list_port_names(&self) -> Vec<String> {
-        self.port_handles.lock().keys().cloned().collect()
+        let mut names: std::collections::BTreeSet<String> =
+            self.port_handles.lock().keys().cloned().collect();
+        names.extend(crate::asyn_record::port_names());
+        names.into_iter().collect()
     }
 }
 
@@ -309,6 +355,42 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_against_process_registry_rejected() {
+        // A name already published to the process port registry (e.g. by a
+        // drvAsyn*PortConfigure command or a hand-registered driver port)
+        // must block manager registration too — the registry is the
+        // process-wide authority on port names, matching C
+        // asynManager::registerPort.
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        // Stands in for a port published by another creator; no actor loop
+        // runs behind it, so its `ActorId` is never current on any thread.
+        let ext = crate::port_handle::PortHandle::new(
+            tx,
+            "extowned".to_string(),
+            Arc::new(crate::interrupt::InterruptManager::new(4)),
+            crate::port_actor::ActorId::new(),
+        );
+        crate::asyn_record::register_port(
+            "extowned",
+            ext,
+            Arc::new(crate::trace::TraceManager::new()),
+        )
+        .unwrap();
+
+        let mgr = PortManager::new();
+        match mgr.register_port(DummyDriver::new("extowned")) {
+            Err(crate::error::AsynError::PortAlreadyRegistered(name)) => {
+                assert_eq!(name, "extowned")
+            }
+            Err(other) => panic!("expected PortAlreadyRegistered, got {other:?}"),
+            Ok(_) => panic!("registration over a process-registry name must fail"),
+        }
+        // The externally published entry survives the rejected attempt.
+        assert!(crate::asyn_record::get_port("extowned").is_some());
+        crate::asyn_record::unregister_port("extowned");
+    }
+
+    #[test]
     fn duplicate_after_unregister_succeeds() {
         // Replace-via-unregister must work cleanly.
         let mgr = PortManager::new();
@@ -345,7 +427,10 @@ mod tests {
     #[test]
     fn set_input_eos_via_actor_reaches_driver_base() {
         let mgr = PortManager::new();
-        let mut drv = DummyDriver::new("eos_port");
+        // "mgr_eos_port", not "eos_port": the iocsh EOS-command test
+        // registers "eos_port" in the same process-global registry, and
+        // duplicate names now error (C registerPort parity).
+        let mut drv = DummyDriver::new("mgr_eos_port");
         drv.base.create_param("VAL", ParamType::Int32).unwrap();
         let handle = mgr.register_port(drv).unwrap();
 

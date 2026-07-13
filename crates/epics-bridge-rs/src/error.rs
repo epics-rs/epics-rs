@@ -28,6 +28,12 @@ pub enum BridgeError {
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// A Channel Access error surfaced by the embedded CA client or
+    /// server — e.g. the downstream `CaServer` failing to bind its
+    /// port when the gateway starts.
+    #[error("channel access error: {0}")]
+    Ca(#[from] epics_base_rs::error::CaError),
 }
 
 pub type BridgeResult<T> = Result<T, BridgeError>;

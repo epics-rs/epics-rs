@@ -444,17 +444,14 @@ impl CaLinkResolver {
         self.links.read().len()
     }
 
-    /// Lazily resolve `name` to its cached [`CaLink`]. Opens the link
-    /// (blocking the worker thread on the runtime) when it is not yet
-    /// in the registry — the first-access slow path. Steady-state
-    /// reads hit the registry directly.
-    fn link_for(&self, name: &str) -> Option<Arc<CaLink>> {
+    /// Lazily resolve `name` to its cached [`CaLink`]. Opens the link when
+    /// it is not yet in the registry — the first-access slow path.
+    /// Steady-state reads hit the registry directly.
+    async fn link_for(&self, name: &str) -> Option<Arc<CaLink>> {
         if let Some(existing) = self.links.read().get(name).cloned() {
             return Some(existing);
         }
-        let resolver = self.clone();
-        let name = name.to_string();
-        block_in_place_or_warn(move || resolver.handle.block_on(resolver.open(&name)).ok())
+        self.open(name).await.ok()
     }
 }
 
@@ -709,8 +706,9 @@ fn map_dbf_type(t: DbFieldType) -> LinkDbfType {
     }
 }
 
+#[async_trait::async_trait]
 impl LinkSet for CaLinkResolver {
-    fn is_connected(&self, name: &str) -> bool {
+    async fn is_connected(&self, name: &str) -> bool {
         let name = strip_ca_scheme(name);
         match self.links.read().get(name) {
             Some(link) => link.is_connected(),
@@ -720,12 +718,12 @@ impl LinkSet for CaLinkResolver {
         }
     }
 
-    fn get_value(&self, name: &str) -> Option<EpicsValue> {
+    async fn get_value(&self, name: &str) -> Option<EpicsValue> {
         let name = strip_ca_scheme(name);
-        self.link_for(name)?.value()
+        self.link_for(name).await?.value()
     }
 
-    fn put_value(&self, name: &str, value: EpicsValue, op: LinkPutOp) -> Result<(), String> {
+    async fn put_value(&self, name: &str, value: EpicsValue, op: LinkPutOp) -> Result<(), String> {
         // Honour the C dbCore split between a plain link put and a
         // put-notify-aware put. `dbCaPutLink` (no callback) sets
         // `putType = CA_PUT`, and the CA task later issues a
@@ -746,44 +744,40 @@ impl LinkSet for CaLinkResolver {
         let name = strip_ca_scheme(name);
         let link = self
             .link_for(name)
+            .await
             .ok_or_else(|| format!("CA link {name} not open"))?;
         let channel = link.channel.clone();
-        block_in_place_or_warn(move || {
-            self.handle
-                .block_on(async move {
-                    match op {
-                        LinkPutOp::Plain => channel.put_nowait(&value).await,
-                        LinkPutOp::Async => channel.put(&value).await,
-                    }
-                })
-                .map_err(|e| e.to_string())
-        })
+        match op {
+            LinkPutOp::Plain => channel.put_nowait(&value).await,
+            LinkPutOp::Async => channel.put(&value).await,
+        }
+        .map_err(|e| e.to_string())
     }
 
-    fn alarm_severity(&self, name: &str) -> Option<i32> {
+    async fn alarm_severity(&self, name: &str) -> Option<i32> {
         let name = strip_ca_scheme(name);
-        let sev = self.link_for(name)?.alarm_severity()?;
+        let sev = self.link_for(name).await?.alarm_severity()?;
         // Mirror the lset contract: only a non-zero severity is a
         // contribution worth propagating into the owning record's
         // LINK_ALARM. `0` (NO_ALARM) means "do not propagate".
         if sev > 0 { Some(sev) } else { None }
     }
 
-    fn alarm_status(&self, name: &str) -> Option<i32> {
+    async fn alarm_status(&self, name: &str) -> Option<i32> {
         // surface the remote STAT for `MSS` propagation.
         // Record processing only consults this when the alarm is
         // actually propagated (severity > 0 via `alarm_severity`), so
         // no severity gate is needed here.
         let name = strip_ca_scheme(name);
-        self.link_for(name)?.alarm_status()
+        self.link_for(name).await?.alarm_status()
     }
 
-    fn time_stamp(&self, name: &str) -> Option<(i64, i32, u64)> {
+    async fn time_stamp(&self, name: &str) -> Option<(i64, i32, u64)> {
         let name = strip_ca_scheme(name);
-        self.link_for(name)?.time_stamp()
+        self.link_for(name).await?.time_stamp()
     }
 
-    fn link_metadata(&self, name: &str) -> Option<LinkMetadata> {
+    async fn link_metadata(&self, name: &str) -> Option<LinkMetadata> {
         // surface the remote display/control/alarm limits,
         // precision, units, DBF type and element count through the DB
         // link API so a record with a CA INP link inherits them, matching
@@ -791,10 +785,10 @@ impl LinkSet for CaLinkResolver {
         // no fresh GET — exactly as C `getControlLimits` &c. read
         // `pca->controlLimits`.
         let name = strip_ca_scheme(name);
-        self.link_for(name)?.link_metadata()
+        self.link_for(name).await?.link_metadata()
     }
 
-    fn link_names(&self) -> Vec<String> {
+    async fn link_names(&self) -> Vec<String> {
         self.links.read().keys().cloned().collect()
     }
 }
@@ -805,26 +799,6 @@ impl LinkSet for CaLinkResolver {
 /// so the resolver normalises to the bare PV name.
 fn strip_ca_scheme(name: &str) -> &str {
     name.strip_prefix("ca://").unwrap_or(name)
-}
-
-/// Run `f`, parking the tokio worker thread for the duration when on a
-/// multi-threaded runtime so an inner `block_on` does not deadlock the
-/// runtime. Mirrors the helper in the bridge `pvalink`'s integration
-/// module — the lset trait is synchronous but is invoked from inside
-/// `PvDatabase::resolve_external_pv`'s async context.
-fn block_in_place_or_warn<F, R>(f: F) -> R
-where
-    F: FnOnce() -> R,
-{
-    use tokio::runtime::{Handle, RuntimeFlavor};
-    if let Ok(handle) = Handle::try_current() {
-        match handle.runtime_flavor() {
-            RuntimeFlavor::MultiThread => tokio::task::block_in_place(f),
-            _ => f(),
-        }
-    } else {
-        f()
-    }
 }
 
 /// Install a [`CaLinkResolver`] on `db`, registered under the `"ca"`

@@ -1,5 +1,126 @@
 # Changelog
 
+## Unreleased
+
+### asyn-rs
+
+- **`PortHandle::submit_blocking` no longer panics inside the framework's own
+  runtimes.** It reached for `tokio::task::block_in_place`, which panics
+  unless the runtime is multi-threaded — but the port actor
+  (`PortActor::run_with_shutdown`) and every `ad-core` driver thread
+  (`ad_core_rs::runtime::run_thread_named`) build **current-thread** runtimes.
+  Any driver doing blocking device I/O from its own task therefore aborted
+  that thread on its first transfer: `can call blocking only when running on
+  the multi-threaded runtime`. Motor drivers escaped it only because
+  `#[epics_main]` happens to build a multi-threaded runtime.
+
+  The predicate "am I inside a runtime?" is replaced by the one that actually
+  decides whether blocking is safe: **"am I the thread that would have to
+  service this request?"**. Each port actor now carries an identity that it
+  publishes on its own thread, and every blocking entry point on `PortHandle`
+  (`submit_blocking`, `set_params_and_notify_blocking`,
+  `AsyncCompletionHandle::wait_blocking`, and so all of `SyncIOHandle`) goes
+  through a single gate:
+
+  - Called from the port's **own actor thread** — a `PortDriver` method
+    calling back into its own port — it returns an error naming the port.
+    Blocking there can never be woken: the actor is the thread that would have
+    to run the request it is waiting on.
+  - Called from **anywhere else** — a plain thread, a current-thread runtime,
+    a multi-threaded worker — it parks the caller on the actor's reply. The
+    actor owns its own OS thread, so the reply arrives regardless of what the
+    caller's runtime is doing.
+
+  **Behaviour change:** `set_params_and_notify_blocking` previously returned
+  an error whenever it was called from inside *any* tokio runtime. It now
+  succeeds there (which is what an acquisition task on an `ad-core` driver
+  thread needs) and errors only on the genuinely unserviceable case above.
+
+## v0.23.0 — 2026-07-12
+
+Minor release. The workspace version is bumped to `0.23.0` and the internal
+crate dependency requirements move from `0.22.0` to `0.23.0` in lockstep. The
+bump is owed by a **breaking** removal in the db loader; the rest is bug
+fixes (one commit per finding, PRs #11–#16) plus one additive test-sync API.
+
+### db loader (epics-base-rs) — **BREAKING**
+
+- **`dbLoadRecords` `DTYP=` is a plain macro, not a force-override.** In C,
+  `dbLoadRecords` macros are pure text substitution (`dbLexRoutines.c` runs
+  them through macLib during lexing) with no DTYP special case. The Rust
+  loader additionally rewrote the DTYP field of *every* record in the loaded
+  file that had one, corrupting any multi-record file whose helper records
+  carry a literal DTYP — the vendored synApps `scaler.db` family is exactly
+  that shape: loading with `DTYP=Scaler-rs` silently rebound the two
+  `Soft Channel` `bo` helpers to the hardware DTYP. The override is deleted
+  rather than gated, restoring the uniform rule: macros substitute only
+  where the file writes `$(DTYP)`.
+
+  **Removed:** `db_loader::override_dtyp` (the force-override's only
+  consumer was `dbLoadRecords` itself). (#14)
+
+- **Device-support init now receives the link text of record-owned
+  INP/OUT.** Record types that declare INP/OUT in their own `field_list`
+  (scaler, motor, acalcout, epid, throttle — mirroring their C `.dbd`)
+  routed the field to `Record::put_field` only, so the
+  `DeviceSupportContext` handed every dynamic device-support factory
+  `ctx.out == ""` — a factory that disambiguates hardware by parsing the
+  link (C `devScalerAsyn.c` picks its board from `prec->out`) could not
+  tell two boards apart. The two meanings the common link fields carried
+  are split: `common.inp`/`.out` is always the link *text* the `.db` wrote,
+  for every record type; `parsed_inp`/`parsed_out` is the framework's
+  dispatch of that link and stays unarmed when the record type owns the
+  field (the record drives the link itself — the framework must not drive
+  it twice). Ownership is derived from `field_list()`, so a new C-faithful
+  record type gets the correct behaviour by construction. (#12)
+
+### areaDetector (ad-core-rs, ad-plugins-rs)
+
+- **`NDFileNumCaptured` is published per frame in stream mode.** C++
+  `NDPluginFile::processCallbacks` sets it after every successful stream
+  write; the port pushed it only when the NumCapture target was reached, so
+  an unbounded stream (`NumCapture=0`, the ophyd-async writer convention)
+  reported `NumCaptured_RBV=0` forever and bounded streams showed no
+  progress until completion. (#11)
+
+- **`$(ADCORE)` resolves from ad-core-rs itself, not a sibling-directory
+  guess.** `AdIoc::new()` built asset paths out of ad-plugins-rs's own
+  `CARGO_MANIFEST_DIR` (`"../ad-core-rs"`, `"../calc"`, …) — under a
+  registry checkout the sibling is version-suffixed, so `$(ADCORE)` never
+  resolved and every AdIoc-based IOC died before `iocInit()` on
+  `< $(ADCORE)/ioc/commonPlugins.cmd`. ad-core-rs now exports
+  `AD_CORE_DIR` (the convention std-rs/scaler-rs/motor-rs already use) and
+  AdIoc, mini_ioc and xrt_ioc consume it. `CALC`/`BUSY`/`AUTOSAVE` pointed
+  at crates epics-rs does not ship and are dropped: AdIoc publishes a path
+  only for assets it actually owns. (#13)
+
+- **AdIoc st.cmd can now create and configure asyn ports.** AdIoc never
+  registered the asyn iocsh command set, and the commands it did have
+  resolved port names through a different registry than the one
+  `drvAsyn*PortConfigure` published into — so the socket-detector prologue
+  (Pilatus/marCCD-style `drvAsynIPPortConfigure` + EOS + trace setup) was
+  either an unknown command (fatal before `iocInit()`) or a silent
+  "port not found". The full asyn command set is now installed on both the
+  startup and interactive shells, and every port publishes into and
+  resolves through the one process registry. Additive API: `AdIoc::ports()`,
+  `AdIoc::app()`, `IocApplication::startup_commands()`,
+  `PortManager::with_trace_manager()`, asyn_record `port_names`/
+  `unregister_port`. (#15)
+
+- **Plugin tests no longer synchronize by sleeping.** The control→data
+  param channel now carries a `Barrier` message the data thread acks only
+  at full quiescence — every previously queued param change applied AND
+  the array queue drained — exposed as
+  `PluginRuntimeHandle::wait_params_applied(timeout)` (additive API). All
+  51 sleep-synchronized test sites across ad-core-rs and ad-plugins-rs are
+  converted to the barrier fence or to polling an observable the frame
+  flushes — the two tests that flaked on a loaded CI runner
+  (`test_rewire_ndarray_port_at_runtime`, `test_driver_to_stats_pipeline`)
+  among them. The array-queue condition exists because arrays travel a
+  separate channel: a param applied while an older array still waits in
+  the queue would retroactively change how that array is processed.
+  (#16, #17)
+
 ## v0.22.1 — 2026-07-08
 
 Patch release. The workspace version moves to `0.22.1`; the internal crate

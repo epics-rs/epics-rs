@@ -120,10 +120,17 @@ pub fn set_default(name: &str, value: &str) {
 
 /// Set an environment variable to a path relative to a crate's `CARGO_MANIFEST_DIR`.
 ///
+/// `manifest_dir` must be the manifest dir of the crate that *owns* the assets,
+/// and `relative` a path beneath it. Reaching out of the crate (`../other-crate`)
+/// produces a path that only exists in a sibling-checkout layout: under a
+/// registry checkout the sibling is version-suffixed (`ad-core-rs-0.22.1`) and
+/// the path never resolves. To point at another crate's assets, use the dir that
+/// crate exports (e.g. [`ad_core_rs::AD_CORE_DIR`], `motor_rs::MOTOR_IOC_DIR`).
+///
 /// Usage:
 /// ```ignore
-/// // In a binary crate, set ADCORE pointing to the ad-core crate:
-/// epics_base_rs::runtime::env::set_crate_path("ADCORE", env!("CARGO_MANIFEST_DIR"), "../../crates/ad-core-rs");
+/// // In a binary crate, expose that crate's own db/ directory:
+/// epics_base_rs::runtime::env::set_crate_path("MYIOC", env!("CARGO_MANIFEST_DIR"), "db");
 /// ```
 pub fn set_crate_path(name: &str, manifest_dir: &str, relative: &str) {
     set_default(name, &format!("{manifest_dir}/{relative}"));

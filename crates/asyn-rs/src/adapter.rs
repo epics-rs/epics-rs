@@ -3056,6 +3056,7 @@ pub fn register_asyn_device_support_for_builder(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::port_actor::ActorId;
 
     /// Every asyn read error maps to the C `asynStatusToEpicsAlarm` pair
     /// under the device-support READ-path defaults (READ_ALARM / INVALID).
@@ -3432,7 +3433,10 @@ mod tests {
         let mk_handle = |name: &str| {
             let interrupts = Arc::new(InterruptManager::new(256));
             let (tx, _rx) = tokio::sync::mpsc::channel(256);
-            (PortHandle::new(tx, name.into(), interrupts), _rx)
+            (
+                PortHandle::new(tx, name.into(), interrupts, ActorId::new()),
+                _rx,
+            )
         };
         let link = |port: &str| AsynLink {
             port_name: port.into(),
@@ -3459,7 +3463,7 @@ mod tests {
         // sign-extend (C processCallbackInput, devAsynInt32.c:485-488).
         let interrupts = Arc::new(InterruptManager::new(256));
         let (tx, _rx) = tokio::sync::mpsc::channel(256);
-        let handle = PortHandle::new(tx, "p".into(), interrupts);
+        let handle = PortHandle::new(tx, "p".into(), interrupts, ActorId::new());
         let link = AsynLink {
             port_name: "p".into(),
             addr: 0,
@@ -3572,11 +3576,12 @@ mod tests {
         let interrupts = Arc::new(InterruptManager::new(256));
         let (tx, rx) = tokio::sync::mpsc::channel(256);
         let actor = PortActor::new(Box::new(driver), rx);
+        let actor_id = actor.id();
         std::thread::Builder::new()
             .name("test-bounds-actor".into())
             .spawn(move || actor.run())
             .unwrap();
-        let handle = PortHandle::new(tx, "test_bounds".into(), interrupts);
+        let handle = PortHandle::new(tx, "test_bounds".into(), interrupts, actor_id);
         let link = AsynLink {
             port_name: "test_bounds".into(),
             addr: 0,
@@ -3593,11 +3598,12 @@ mod tests {
         let interrupts = Arc::new(InterruptManager::new(256));
         let (tx, rx) = tokio::sync::mpsc::channel(256);
         let actor = PortActor::new(Box::new(driver), rx);
+        let actor_id = actor.id();
         std::thread::Builder::new()
             .name("test-adapter-actor".into())
             .spawn(move || actor.run())
             .unwrap();
-        let handle = PortHandle::new(tx, "test".into(), interrupts);
+        let handle = PortHandle::new(tx, "test".into(), interrupts, actor_id);
 
         let link = AsynLink {
             port_name: "test".into(),
@@ -3628,11 +3634,12 @@ mod tests {
         let interrupts = Arc::new(InterruptManager::new(256));
         let (tx, rx) = tokio::sync::mpsc::channel(256);
         let actor = PortActor::new(Box::new(driver), rx);
+        let actor_id = actor.id();
         std::thread::Builder::new()
             .name("test-seeded-actor".into())
             .spawn(move || actor.run())
             .unwrap();
-        let handle = PortHandle::new(tx, "test".into(), interrupts);
+        let handle = PortHandle::new(tx, "test".into(), interrupts, actor_id);
         let link = AsynLink {
             port_name: "test".into(),
             addr: 0,
@@ -3655,11 +3662,12 @@ mod tests {
         let interrupts = Arc::new(InterruptManager::new(256));
         let (tx, rx) = tokio::sync::mpsc::channel(256);
         let actor = PortActor::new(Box::new(driver), rx);
+        let actor_id = actor.id();
         std::thread::Builder::new()
             .name("test-average-actor".into())
             .spawn(move || actor.run())
             .unwrap();
-        let handle = PortHandle::new(tx, "test".into(), interrupts);
+        let handle = PortHandle::new(tx, "test".into(), interrupts, actor_id);
         let link = AsynLink {
             port_name: "test".into(),
             addr: 0,
@@ -3692,11 +3700,12 @@ mod tests {
         let interrupts = Arc::new(InterruptManager::new(256));
         let (tx, rx) = tokio::sync::mpsc::channel(256);
         let actor = PortActor::new(Box::new(driver), rx);
+        let actor_id = actor.id();
         std::thread::Builder::new()
             .name("test-ts-actor".into())
             .spawn(move || actor.run())
             .unwrap();
-        let handle = PortHandle::new(tx, "test".into(), interrupts);
+        let handle = PortHandle::new(tx, "test".into(), interrupts, actor_id);
         let link = AsynLink {
             port_name: "test".into(),
             addr: 0,
@@ -4010,16 +4019,18 @@ mod tests {
         let interrupts = Arc::new(InterruptManager::new(256));
         let (tx, rx) = tokio::sync::mpsc::channel(256);
         let actor = PortActor::new(Box::new(driver), rx);
+        let actor_id = actor.id();
         std::thread::Builder::new()
             .name("ts-factory-actor".into())
             .spawn(move || actor.run())
             .unwrap();
-        let handle = PortHandle::new(tx, "ts_factory".into(), interrupts);
+        let handle = PortHandle::new(tx, "ts_factory".into(), interrupts, actor_id);
         crate::asyn_record::register_port(
             "ts_factory",
             handle,
             Arc::new(crate::trace::TraceManager::new()),
-        );
+        )
+        .unwrap();
 
         let ctx = DeviceSupportContext {
             dtyp: "asynInt32TimeSeries",
@@ -4060,11 +4071,12 @@ mod tests {
         let interrupts = Arc::new(InterruptManager::new(256));
         let (tx, rx) = tokio::sync::mpsc::channel(256);
         let actor = PortActor::new(Box::new(driver), rx);
+        let actor_id = actor.id();
         std::thread::Builder::new()
             .name("test-u32-actor".into())
             .spawn(move || actor.run())
             .unwrap();
-        let handle = PortHandle::new(tx, "test".into(), interrupts);
+        let handle = PortHandle::new(tx, "test".into(), interrupts, actor_id);
         let link = AsynLink {
             port_name: "test".into(),
             addr: 0,
@@ -4993,11 +5005,12 @@ mod tests {
         let interrupts = Arc::new(InterruptManager::new(256));
         let (tx, rx) = tokio::sync::mpsc::channel(256);
         let actor = PortActor::new(Box::new(driver), rx);
+        let actor_id = actor.id();
         std::thread::Builder::new()
             .name("test-enum-actor".into())
             .spawn(move || actor.run())
             .unwrap();
-        let handle = PortHandle::new(tx, "test_enum".into(), interrupts);
+        let handle = PortHandle::new(tx, "test_enum".into(), interrupts, actor_id);
         let link = AsynLink {
             port_name: "test_enum".into(),
             addr: 0,
@@ -5482,11 +5495,12 @@ mod tests {
             let interrupts = Arc::new(InterruptManager::new(256));
             let (tx, rx) = tokio::sync::mpsc::channel(256);
             let actor = PortActor::new(Box::new(driver), rx);
+            let actor_id = actor.id();
             std::thread::Builder::new()
                 .name("cap-actor".into())
                 .spawn(move || actor.run())
                 .unwrap();
-            let handle = PortHandle::new(tx, "capport".into(), interrupts);
+            let handle = PortHandle::new(tx, "capport".into(), interrupts, actor_id);
             let link = AsynLink {
                 port_name: "capport".into(),
                 addr: 0,
@@ -5912,11 +5926,12 @@ mod tests {
         let interrupts = Arc::new(InterruptManager::new(256));
         let (tx, rx) = tokio::sync::mpsc::channel(256);
         let actor = PortActor::new(Box::new(driver), rx);
+        let actor_id = actor.id();
         std::thread::Builder::new()
             .name("test-arr-actor".into())
             .spawn(move || actor.run())
             .unwrap();
-        let handle = PortHandle::new(tx, "test".into(), interrupts);
+        let handle = PortHandle::new(tx, "test".into(), interrupts, actor_id);
         let link = AsynLink {
             port_name: "test".into(),
             addr: 0,
@@ -6495,11 +6510,12 @@ mod tests {
         let interrupts = Arc::new(InterruptManager::new(256));
         let (tx, rx) = tokio::sync::mpsc::channel(256);
         let actor = PortActor::new(Box::new(driver), rx);
+        let actor_id = actor.id();
         std::thread::Builder::new()
             .name("test-f64-actor".into())
             .spawn(move || actor.run())
             .unwrap();
-        let handle = PortHandle::new(tx, "test_f64".into(), interrupts);
+        let handle = PortHandle::new(tx, "test_f64".into(), interrupts, actor_id);
         let link = AsynLink {
             port_name: "test_f64".into(),
             addr: 0,
@@ -6860,11 +6876,12 @@ mod tests {
         let interrupts = Arc::new(InterruptManager::new(256));
         let (tx, rx) = tokio::sync::mpsc::channel(256);
         let actor = PortActor::new(Box::new(port), rx);
+        let actor_id = actor.id();
         std::thread::Builder::new()
             .name("binwrite-actor".into())
             .spawn(move || actor.run())
             .unwrap();
-        let handle = PortHandle::new(tx, name.into(), interrupts);
+        let handle = PortHandle::new(tx, name.into(), interrupts, actor_id);
         (handle, writes)
     }
 
@@ -6882,7 +6899,8 @@ mod tests {
             "binwrite_wb",
             handle,
             Arc::new(crate::trace::TraceManager::new()),
-        );
+        )
+        .unwrap();
 
         let ctx = DeviceSupportContext {
             dtyp: "asynOctetWriteBinary",
@@ -6918,7 +6936,8 @@ mod tests {
             "binwrite_text",
             handle,
             Arc::new(crate::trace::TraceManager::new()),
-        );
+        )
+        .unwrap();
 
         let ctx = DeviceSupportContext {
             dtyp: "asynOctetWrite",
@@ -7065,11 +7084,12 @@ mod tests {
         let interrupts = Arc::new(InterruptManager::new(256));
         let (tx, rx) = tokio::sync::mpsc::channel(256);
         let actor = PortActor::new(Box::new(port), rx);
+        let actor_id = actor.id();
         std::thread::Builder::new()
             .name("cmdresp-actor".into())
             .spawn(move || actor.run())
             .unwrap();
-        let handle = PortHandle::new(tx, name.into(), interrupts);
+        let handle = PortHandle::new(tx, name.into(), interrupts, actor_id);
         (handle, (writes, sequence))
     }
 
@@ -7246,8 +7266,9 @@ mod tests {
             ))),
             rx,
         );
+        let actor_id = actor.id();
         std::thread::spawn(move || actor.run());
-        let handle = PortHandle::new(tx, "octet_partial".into(), interrupts);
+        let handle = PortHandle::new(tx, "octet_partial".into(), interrupts, actor_id);
 
         let link = AsynLink {
             port_name: "octet_partial".into(),
@@ -7292,7 +7313,8 @@ mod tests {
             "cmdresp_factory",
             handle,
             Arc::new(crate::trace::TraceManager::new()),
-        );
+        )
+        .unwrap();
 
         // The DRVINFO tail "*IDN?\r\n" is the literal command — the "\r\n" is two
         // escape sequences (four chars) in the link, decoded to 0x0D 0x0A.
@@ -7348,7 +7370,8 @@ mod tests {
             "cmdresp_nul",
             handle,
             Arc::new(crate::trace::TraceManager::new()),
-        );
+        )
+        .unwrap();
 
         // "AB\000CD": dbTranslateEscape yields A B 0x00 C D; C strlen stops at the
         // NUL, so only "AB" reaches the wire.
@@ -7386,7 +7409,8 @@ mod tests {
             "cmdresp_lnul",
             handle,
             Arc::new(crate::trace::TraceManager::new()),
-        );
+        )
+        .unwrap();
 
         // Raw DRVINFO "\000CD" is non-empty (C strlen != 0 -> no reject); it
         // escapes to [0x00,'C','D'] and truncates at the leading NUL -> empty

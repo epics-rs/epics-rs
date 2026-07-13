@@ -1379,6 +1379,25 @@ impl RecordInstance {
         }
     }
 
+    /// `true` when the record type declares `name` in its own `field_list`,
+    /// i.e. the record stores the field itself and owns whatever behaviour
+    /// hangs off it.
+    ///
+    /// This separates the two meanings a link field carries. `common.inp` /
+    /// `common.out` is the link *text* — always the value the `.db` file
+    /// wrote, for every record type, because C device support reads
+    /// `prec->inp` / `prec->out` at `init_record` no matter which layer owns
+    /// the field ([`crate::server::db_loader::apply_fields`] keeps it
+    /// populated). `parsed_inp` / `parsed_out` is the *framework's* dispatch
+    /// of that link, and is armed only for a record type that does NOT
+    /// declare the field: a record that declares it drives the link itself
+    /// (`multi_output_links` for `acalcout`/`scalcout`, device support for
+    /// `motorRecord`/`scalerRecord`, or its own `process`). Arming the
+    /// framework path for those too would write the link twice per cycle.
+    fn record_declares_field(&self, name: &str) -> bool {
+        self.record.field_list().iter().any(|f| f.name == name)
+    }
+
     /// Set a common field value from a runtime `dbPut` (CA/PVA/`dbpf`/link).
     /// Returns what scan index changes are needed.
     ///
@@ -1673,7 +1692,9 @@ impl RecordInstance {
             "INP" => {
                 if let EpicsValue::String(s) = value {
                     self.common.inp = s.as_str_lossy().into_owned();
-                    self.parsed_inp = parse_link_v2(&self.common.inp);
+                    if !self.record_declares_field("INP") {
+                        self.parsed_inp = parse_link_v2(&self.common.inp);
+                    }
                 }
             }
             "OUT" => {
@@ -1703,7 +1724,9 @@ impl RecordInstance {
                     // downgrades the modifier-less `ProcessPassive`
                     // default that `parse_link_v2` would otherwise
                     // apply.
-                    self.parsed_out = parse_output_link_v2(&self.common.out);
+                    if !self.record_declares_field("OUT") {
+                        self.parsed_out = parse_output_link_v2(&self.common.out);
+                    }
                     // C `longoutRecord.c::special` (PR #6c573b4 part 2)
                     // and similar OOCH-style hooks need `after=true`
                     // to fire after the link has actually moved. The

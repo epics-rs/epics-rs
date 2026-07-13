@@ -1323,7 +1323,8 @@ pub async fn run_ca_pva_qsrv_ioc(
         config.acf.clone(),
         config.autosave_config.clone(),
         config.autosave_manager.clone(),
-    );
+    )
+    .await?;
     epics_base_rs::runtime::task::spawn(async move {
         if let Err(e) = ca_server.run().await {
             eprintln!("CA server error: {e}");

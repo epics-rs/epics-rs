@@ -481,6 +481,19 @@ impl IocApplication {
         self
     }
 
+    /// The commands the startup script (`st.cmd`) may call, in registration
+    /// order.
+    ///
+    /// This is the surface a startup script is executed against — a command
+    /// missing here is a fatal unknown command in `st.cmd`, before `iocInit`.
+    /// Exposed so a pre-configured IOC (e.g. `AdIoc`) can be checked against
+    /// the script it promises to run without booting a server. `CommandDef` is
+    /// `Clone`, so a caller may also install these on an [`iocsh::IocShell`] of
+    /// its own to exercise a script.
+    pub fn startup_commands(&self) -> &[CommandDef] {
+        &self.startup_commands
+    }
+
     /// Register a callback to run after iocInit completes.
     ///
     /// Use this to start pollers and other periodic tasks that should

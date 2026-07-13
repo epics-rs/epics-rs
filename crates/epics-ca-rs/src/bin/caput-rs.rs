@@ -449,6 +449,35 @@ async fn main() {
     // gets its put, and a PV that dropped since the connect barrier prints
     // nothing at all (C returns from `!nConn` before its print loop) and lets
     // the PUT report the disconnect.
+    // Build (and VALIDATE) the value to write BEFORE the `Old :` read+print.
+    // C's order is not incidental: the enum/number parse sits at
+    // `caput.c:466-530` and every failure in it `return 1`s on the spot, so
+    // the `Old : ` block at `:531-535` is never reached (R13-22):
+    //
+    //     caput TST:MBBO Bogus
+    //       C:  Enum string value 'Bogus' invalid.                    (exit 1)
+    //       RS: Old : TST:MBBO   Zero
+    //           Enum string value 'Bogus' invalid.                    (exit 1)
+    //
+    // A rejected put must not leave a readback line on stdout. Value
+    // precedence inside the build is C's own — `-S` (long string) resolved
+    // before any native-type parse; see `build_write_value`.
+    let parsed_value = match build_write_value(
+        &args.values,
+        native_type,
+        force_numeric,
+        force_string,
+        long_string,
+        array_mode,
+        &enum_menu,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
+
     if !terse {
         print!("Old : ");
         let rb = classify_readback(
@@ -474,25 +503,6 @@ async fn main() {
             }
         }
     }
-
-    // build the value to write in C's precedence order — `-S`
-    // (long string) resolved before any native-type parse. See
-    // `build_write_value`.
-    let parsed_value = match build_write_value(
-        &args.values,
-        native_type,
-        force_numeric,
-        force_string,
-        long_string,
-        array_mode,
-        &enum_menu,
-    ) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("{e}");
-            std::process::exit(1);
-        }
-    };
 
     let result = match &parsed_value {
         WriteValue::Wire { dbr_type, value } => {

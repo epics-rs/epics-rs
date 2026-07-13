@@ -1531,10 +1531,18 @@ pub struct MonitorUpdate {
     /// leave it `false`.
     pub type_changed: bool,
     /// Dot-separated field paths whose intermediate transitions were
-    /// LOST before this event — the decoded-path counterpart of the
-    /// trailing **overrun bitset** in a raw `changed | value | overrun`
-    /// body. Empty (the default) means no loss: the cooked payload
-    /// builders then encode an empty overrun bitset exactly as before.
+    /// LOST before this event — the port's own loss accounting, NOT a
+    /// wire field.
+    ///
+    /// **It does not reach the cooked wire.** Every cooked MONITOR DATA
+    /// frame this server builds ends in a hard-empty overrun bitset,
+    /// because pvxs's does: `servermon.cpp:174-176` writes one
+    /// unconditionally (`// TODO: placeholder for overrun mask`), and a
+    /// pvxs client that sees overrun bits sets `servSquash` / bumps
+    /// `nSrvSquash` (`clientmon.cpp:554-564`), a counter that stays 0
+    /// against a real pvxs server. Only the RAW forwarder puts overrun
+    /// bits on the wire, and only the ones an UPSTREAM server's frame
+    /// already carried.
     ///
     /// The server's own queue overflow is one producer: when the
     /// monitor queue coalesces (squashes) a dropped intermediate into
@@ -1544,10 +1552,8 @@ pub struct MonitorUpdate {
     /// `moncache.cpp:160-168`
     /// (`overrun |= upstream_overrun | (changed & lastelem.changed)`).
     /// A fanout gateway is the other producer: it sets this when its
-    /// downstream broadcast receiver lags so the next cooked DATA frame
-    /// carries the lost leaves, matching the raw forwarder's
-    /// bridge-local overrun marking. Sources with no loss to report
-    /// leave it empty.
+    /// downstream broadcast receiver lags. Sources with no loss to
+    /// report leave it empty.
     pub overrun: Vec<String>,
 }
 

@@ -8001,17 +8001,24 @@ fn build_monitor_payload(
 /// squashes events under back-pressure or pause. The newer value wins;
 /// the marked-leaf sets union so the emitted frame still marks every
 /// field that changed across the coalesced burst. A `None` on either
-/// side means "no explicit set — derive by diff", which over-marks
-/// safely, so the union of `None` with anything stays `None`.
+/// side means "wholly assigned — every leaf the request selected", which
+/// over-marks safely, so the union of `None` with anything stays `None`.
 ///
-/// The squash also records OVERRUN: the dropped intermediate's distinct
-/// values are lost, so every leaf changed in BOTH the dropped older and
-/// the surviving newer update is added to the result's overrun set, and
-/// the two updates' own overrun sets union forward — pva2pva
-/// `moncache.cpp:160-168`. The cooked payload builders encode that set
-/// as the trailing overrun bitset so a lagging downstream learns it
-/// missed transitions (the decoded-path counterpart of the raw
-/// forwarder's bridge-local overrun marking).
+/// The squash also records OVERRUN in [`crate::server_native::MonitorUpdate`]:
+/// the dropped intermediate's distinct values are lost, so every leaf changed
+/// in BOTH the dropped older and the surviving newer update is added to the
+/// result's overrun set, and the two updates' own overrun sets union forward —
+/// pva2pva `moncache.cpp:160-168`.
+///
+/// That set does NOT reach the cooked wire, and must not: pvxs's server writes
+/// a hard-empty overrun bitset on every MONITOR data frame
+/// (`servermon.cpp:174-176`, `// TODO: placeholder for overrun mask`), so every
+/// cooked builder here writes one too — a server-computed overrun set makes a
+/// pvxs client set `servSquash` and bump `nSrvSquash` (`clientmon.cpp:554-564`),
+/// a counter that stays 0 against a real pvxs server. The only overrun bits the
+/// port puts on the wire are the ones the RAW forwarder decoded from an
+/// UPSTREAM server's frame (`build_raw_monitor_frame`), which it must carry
+/// through unchanged.
 ///
 /// A `type_changed` boundary must SURVIVE the squash: once the upstream
 /// descriptor changed, no value (squashed-old or post-boundary-new) may

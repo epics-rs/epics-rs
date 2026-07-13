@@ -116,11 +116,18 @@ const PROPERTY_LEAVES: &[&str] = &[
 ///   that against the concrete value.
 ///
 /// `timeStamp` and `alarm` stay as structure paths because `time_t` and
-/// `alarm_t` have no leaves pvxs leaves unassigned: `getTimeAlarm` writes
-/// all three of `alarm.{status,severity,message}` and all three of
-/// `timeStamp.{secondsPastEpoch,nanoseconds,userTag}`, so expanding either
-/// path yields exactly pvxs's set. The property structures are different —
-/// they carry leaves pvxs never touches (below).
+/// `alarm_t` have no leaf pvxs leaves unassigned on the base this port
+/// targets. `getTimeAlarm` (`iocsource.cpp:160-251`) requests
+/// `DBR_STATUS | DBR_AMSG | DBR_TIME | DBR_UTAG` and assigns each group under
+/// the option the DB actually returned — "as of base 7.0.6 time/alarm
+/// meta-data is always available" (`iocsource.cpp:181`), so all three of
+/// `alarm.{status,severity,message}` and both of
+/// `timeStamp.{secondsPastEpoch,nanoseconds}` land. `timeStamp.userTag` is the
+/// one conditional leaf: it is written under `DBR_UTAG` only
+/// (`iocsource.cpp:243-250`), a macro that compiles away on a pre-7.0.6 base —
+/// which the port's own record layer does not target. So expanding either path
+/// yields exactly pvxs's set. The property structures are different — they
+/// carry leaves pvxs never touches (below).
 pub fn change_leaves(mapping: FieldMapping, change: EventMask) -> Vec<&'static str> {
     let mut leaves = Vec::new();
     match mapping {

@@ -1193,6 +1193,11 @@ fn cmd_db_load_records() -> CommandDef {
                     // (pass 1) — the only site that loads a constant
                     // SIML/SIOL into SIMM/SVAL.
                     ctx.db().rec_gbl_init_simm(&rec_arc).await;
+                    // C `wdogInit(prec)` from `init_record` pass 1
+                    // (histogramRecord.c:168) — arms the SDEL monitor
+                    // watchdog; a re-arm supersedes the previous one, which is
+                    // what the merge re-init above needs.
+                    ctx.db().arm_watchdog(&def.name).await;
                     Ok(())
                 });
                 if let Err(e) = added {

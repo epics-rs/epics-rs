@@ -278,11 +278,17 @@ impl Record for BiRecord {
     /// MASK gates which bits of the source contribute to the
     /// subsequent RVAL→VAL conversion.
     fn apply_raw_input(&mut self, value: EpicsValue) -> CaResult<()> {
-        let rval = value.to_f64().map(|f| f as i32).ok_or_else(|| {
-            CaError::TypeMismatch("bi Raw Soft Channel: INP value not numeric".into())
-        })?;
-        // RVAL is DBF_ULONG; preserve the bit pattern of the i32 conversion.
-        self.rval = rval as u32;
+        // C `devBiSoftRaw` reads the link with `dbGetLink(.., DBR_ULONG,
+        // &prec->rval, ..)`: `getDoubleUlong`'s bare cast, owned by `c_cast`
+        // (RVAL is epicsUInt32, so it is the 64-bit-convert-then-truncate
+        // rule, not the signed i32 one).
+        let rval = value
+            .to_f64()
+            .map(crate::types::c_cast::f64_to_u32)
+            .ok_or_else(|| {
+                CaError::TypeMismatch("bi Raw Soft Channel: INP value not numeric".into())
+            })?;
+        self.rval = rval;
         if self.mask != 0 {
             self.rval &= self.mask;
         }

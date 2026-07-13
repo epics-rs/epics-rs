@@ -444,6 +444,21 @@ pub enum ProcessAction {
         value: EpicsValue,
     },
 
+    /// (Re)arm this record's monitor watchdog — C `histogramRecord.c::wdogInit`
+    /// (:126-152), whose `callbackRequestDelayed(&pcallback->callback,
+    /// prec->sdel)` starts (or restarts) the periodic
+    /// [`Record::watchdog_fire`] tick.
+    ///
+    /// Emitted from a record's `special()` when the put changed the watchdog's
+    /// period (histogram SDEL is `special(SPC_RESET)` precisely so it can
+    /// re-arm, `histogramRecord.c:266-268`). The framework also arms every
+    /// record's watchdog once at `iocInit`, which is C's other `wdogInit` call
+    /// site (`init_record` pass 1, `:168`).
+    ///
+    /// Arming supersedes any tick already pending for the record, exactly as
+    /// C's `callbackRequestDelayed` replaces an outstanding delayed callback.
+    ArmWatchdog,
+
     /// Cancel this record's outstanding async re-entry (C
     /// `callbackCancelDelayed`): the framework advances the record's
     /// re-entry generation so any pending `ReprocessAfter` timer or
@@ -770,6 +785,40 @@ pub trait Record: Send + Sync + 'static {
 
     /// Return the list of field descriptors.
     fn field_list(&self) -> &'static [FieldDesc];
+
+    /// `SPC_NOMOD` that a record's `cvt_dbaddr` decides **at runtime, from
+    /// record state** — the dynamic half of the no-modify declaration.
+    ///
+    /// [`FieldDesc::read_only`] is the static half: it carries the `.dbd`
+    /// `special(SPC_NOMOD)` of a field that is immutable for the record type,
+    /// full stop. But C lets a record's `cvt_dbaddr` *raise* SPC_NOMOD per
+    /// dbAddr, keyed on the record's own fields, and one record does:
+    ///
+    /// ```c
+    /// /* compressRecord.c:398-407 */
+    /// static long cvt_dbaddr(DBADDR *paddr) {
+    ///     ...
+    ///     if (prec->balg == bufferingALG_LIFO)
+    ///         paddr->special = SPC_NOMOD;
+    /// }
+    /// ```
+    ///
+    /// A compress VAL is writable under BALG=FIFO and refused under BALG=LIFO —
+    /// a per-record-state fact no static `FieldDesc` can express. The one gate
+    /// that owns field immutability (`field_io::check_no_mod`) consults this
+    /// hook alongside the static set, so the dynamic refusal reaches EVERY put
+    /// route exactly as the static one does.
+    ///
+    /// (C caches `paddr->special` in the DBADDR at name-resolution time, so a
+    /// CA channel opened while FIFO keeps writing after a switch to LIFO until
+    /// it reconnects; `dbpf`, which resolves fresh, is refused immediately. The
+    /// port evaluates live on every put — the invariant C's own `dbpf` path
+    /// shows, without the stale-cache hole.)
+    ///
+    /// `field` is upper-case. Default: no dynamic NOMOD.
+    fn field_no_mod(&self, _field: &str) -> bool {
+        false
+    }
 
     /// Choice strings for a record-specific `DBF_MENU` field served as
     /// `DBR_ENUM`, keyed by field name (uppercase, as declared).
@@ -1571,6 +1620,50 @@ pub trait Record: Send + Sync + 'static {
         Ok(())
     }
 
+    /// The period of this record's monitor watchdog, or `None` when it has
+    /// none — C `histogramRecord.c::wdogInit` (:126-152):
+    ///
+    /// ```c
+    /// static void wdogInit(histogramRecord *prec) {
+    ///     if (prec->sdel > 0) { ... callbackRequestDelayed(&pcallback->callback, prec->sdel); }
+    /// }
+    /// ```
+    ///
+    /// A watchdog is NOT a process cycle: it posts monitors for a record whose
+    /// value is changing but whose deadband (histogram MDEL) is holding the
+    /// posts back, so a slow accumulation still reaches a display. The
+    /// framework re-reads this on every tick, so clearing SDEL stops the
+    /// watchdog at the next fire without any separate cancel.
+    ///
+    /// histogram is the only base record with one. Default: no watchdog.
+    fn watchdog_interval(&self) -> Option<std::time::Duration> {
+        None
+    }
+
+    /// One watchdog tick — C `histogramRecord.c::wdogCallback` (:102-124):
+    ///
+    /// ```c
+    /// if (prec->mcnt > 0) {
+    ///     dbScanLock(prec);
+    ///     recGblGetTimeStamp(prec);
+    ///     db_post_events(prec, &prec->val, DBE_VALUE | DBE_LOG);
+    ///     prec->mcnt = 0;
+    ///     dbScanUnlock(prec);
+    /// }
+    /// ```
+    ///
+    /// The record performs its own state change (histogram: zero MCNT) and
+    /// returns the fields whose monitors the framework must post — the
+    /// `db_post_events` half, which a record cannot do itself. An empty slice
+    /// means "nothing changed since the last tick": no timestamp, no post. The
+    /// framework holds the record lock across the call (C `dbScanLock`) and
+    /// re-arms afterwards from [`Self::watchdog_interval`].
+    ///
+    /// Default: nothing to post.
+    fn watchdog_fire(&mut self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// Whether this record type's support reads SIML through the `recGbl`
     /// simulation helpers (`recGblGetSimm`/`recGblInitSimm`, and therefore
     /// `recGblSaveSimm`/`recGblCheckSimm`) rather than a bare `dbGetLink`.
@@ -1740,6 +1833,16 @@ pub trait Record: Send + Sync + 'static {
     /// declares NO INP — its DBF_INLINK is `SVL` (:212), read into SGNL by
     /// `devHistogramSoft.c` — so a histogram driven from INP is a database that
     /// no C IOC can load. Default `true`.
+    ///
+    /// This is the whole namespace gate, not just the loader's: in C the dbd
+    /// also decides which `.FIELD` channels exist, so a histogram's INP is not
+    /// resolvable at all (`dbgf HI.INP` → `PV 'HI.INP' not found`). Both
+    /// [`RecordInstance::get_common_field`] and
+    /// [`RecordInstance::put_common_field`] consult this, so the field cannot
+    /// be readable on one route while refused on the other.
+    ///
+    /// [`RecordInstance::get_common_field`]: crate::server::record::RecordInstance::get_common_field
+    /// [`RecordInstance::put_common_field`]: crate::server::record::RecordInstance::put_common_field
     fn declares_inp_link(&self) -> bool {
         true
     }

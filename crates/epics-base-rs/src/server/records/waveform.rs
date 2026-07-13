@@ -236,6 +236,17 @@ impl WaveformRecord {
         !matches!(self.kind, ArrayKind::SubArray)
     }
 
+    /// True for the kinds whose `.dbd` declares BUSY, the `special(SPC_NOMOD)`
+    /// acquisition-active indicator: waveform (`waveformRecord.dbd.pod:461`)
+    /// and subArray (`subArrayRecord.dbd.pod:390`). aai/aao declare none.
+    /// This is the single owner of BUSY's kind membership: both the get arm and
+    /// the put arm read it, so no kind can answer the field on one route and
+    /// deny it on the other. `waveform_busy_field_set_matches_declares_busy`
+    /// pins the static field sets to the same predicate.
+    fn declares_busy(&self) -> bool {
+        matches!(self.kind, ArrayKind::Waveform | ArrayKind::SubArray)
+    }
+
     /// True for the kinds whose `.dbd` declares the monitor/archive posting-mode
     /// block MPST/APST + the HASH they drive (waveform/aai/aao). `subArray` has
     /// no On-Change posting mechanism at all (`subArrayRecord.dbd.pod` declares
@@ -778,8 +789,9 @@ macro_rules! array_sim_field_list {
 
 // waveform: the common+sim shape plus the TimeSeries acquisition-control fields
 // (devAsynXXXTimeSeries) — RARM `pp(TRUE)` client-settable, BUSY
-// `special(SPC_NOMOD)` device-set. waveformRecord.dbd.pod:411,461. aai/aao/
-// subArray do not declare them.
+// `special(SPC_NOMOD)` device-set. waveformRecord.dbd.pod:411,461. RARM is
+// waveform-only; BUSY is also declared by subArray (see `subarray_field_list`).
+// aai/aao declare neither.
 macro_rules! waveform_field_list {
     ($valty:expr) => {
         array_sim_field_list!(
@@ -863,6 +875,13 @@ macro_rules! subarray_field_list {
                 name: "INDX",
                 dbf_type: DbFieldType::Long,
                 read_only: false,
+            },
+            // subArray declares BUSY too (`subArrayRecord.dbd.pod:390-393`),
+            // `special(SPC_NOMOD)` like waveform's. It has no RARM.
+            FieldDesc {
+                name: "BUSY",
+                dbf_type: DbFieldType::Short,
+                read_only: true,
             },
         )
     };
@@ -1101,15 +1120,14 @@ impl Record for WaveformRecord {
             // record type that doesn't declare the field).
             "INDX" if matches!(self.kind, ArrayKind::SubArray) => Some(EpicsValue::Long(self.indx)),
             "MALM" if matches!(self.kind, ArrayKind::SubArray) => Some(EpicsValue::Long(self.malm)),
-            // Waveform-only RARM (re-arm control) / BUSY (acquisition-active),
-            // used by waveform device support (devAsynXXXTimeSeries). aai/aao/
-            // subArray do not declare them, so they are not exposed there.
+            // RARM (re-arm control) is waveform-only, used by waveform device
+            // support (devAsynXXXTimeSeries); aai/aao/subArray do not declare it.
+            // BUSY (acquisition-active) is declared by waveform AND subArray —
+            // [`Self::declares_busy`] owns that membership.
             "RARM" if matches!(self.kind, ArrayKind::Waveform) => {
                 Some(EpicsValue::Short(self.rarm))
             }
-            "BUSY" if matches!(self.kind, ArrayKind::Waveform) => {
-                Some(EpicsValue::Short(self.busy as i16))
-            }
+            "BUSY" if self.declares_busy() => Some(EpicsValue::Short(self.busy as i16)),
             "EGU" => Some(EpicsValue::String(self.egu.clone())),
             "HOPR" => Some(EpicsValue::Double(self.hopr)),
             "LOPR" => Some(EpicsValue::Double(self.lopr)),
@@ -1236,9 +1254,10 @@ impl Record for WaveformRecord {
                 self.malm = v.max(1);
                 Ok(())
             }
-            // Waveform-only RARM (re-arm control, pp(TRUE) — client-settable) and
-            // BUSY (acquisition-active, special(SPC_NOMOD) — device-set, not
-            // client-writable). The device support reads RARM and resets it to 0.
+            // RARM (re-arm control, pp(TRUE) — client-settable) is waveform-only;
+            // the device support reads it and resets it to 0. BUSY
+            // (acquisition-active, special(SPC_NOMOD) — device-set, not
+            // client-writable) is waveform + subArray ([`Self::declares_busy`]).
             "RARM" if matches!(self.kind, ArrayKind::Waveform) => {
                 let v = match value {
                     EpicsValue::Short(v) => v,
@@ -1248,9 +1267,7 @@ impl Record for WaveformRecord {
                 self.rarm = v;
                 Ok(())
             }
-            "BUSY" if matches!(self.kind, ArrayKind::Waveform) => {
-                Err(CaError::ReadOnlyField(name.to_string()))
-            }
+            "BUSY" if self.declares_busy() => Err(CaError::ReadOnlyField(name.to_string())),
             "EGU" => {
                 if let EpicsValue::String(s) = value {
                     self.egu = s;
@@ -1338,7 +1355,7 @@ impl Record for WaveformRecord {
 
     // `field_list` is keyed first by `ArrayKind`, then by FTVL element type.
     // Each array kind selects its own field set, keyed then by FTVL element type:
-    // subArray -> `SUBARRAY_FIELDS_*` (NELM `pp(TRUE)`, plus MALM/INDX), aao ->
+    // subArray -> `SUBARRAY_FIELDS_*` (NELM `pp(TRUE)`, plus MALM/INDX/BUSY), aao ->
     // `AAO_FIELDS_*` (common shape + OMSL/DOL), aai -> `AAI_FIELDS_*` (bare common
     // shape), waveform -> `WAVEFORM_FIELDS_*` (common shape + RARM/BUSY). The sets
     // differ exactly where the C dbd does. Selecting the set by kind makes each
@@ -1663,10 +1680,17 @@ mod array_kind_tests {
         }
     }
 
-    /// RARM (re-arm, `pp(TRUE)` settable) and BUSY (acquisition-active,
-    /// `special(SPC_NOMOD)` read-only) are waveform-only TimeSeries control
-    /// fields. They appear in the waveform field set with the correct read_only
-    /// flags and nowhere else; aai/aao/subArray expose neither.
+    /// RARM (re-arm, `pp(TRUE)` settable) is waveform-only. BUSY
+    /// (acquisition-active, `special(SPC_NOMOD)` read-only) is declared by
+    /// waveform AND subArray (`subArrayRecord.dbd.pod:390-393`); softIoc on a
+    /// loaded `subArray` record:
+    ///
+    /// ```text
+    /// dbgf SUB.BUSY   -> DBF_SHORT: 0
+    /// dbpf SUB.BUSY 1 -> dbPut Attempt to modify noMod field PV: SUB.BUSY
+    /// ```
+    ///
+    /// aai/aao declare neither field.
     #[test]
     fn waveform_rarm_busy_fields_waveform_only() {
         let wf = WaveformRecord::with_kind(ArrayKind::Waveform);
@@ -1696,9 +1720,8 @@ mod array_kind_tests {
         wf.busy = true;
         assert_eq!(wf.get_field("BUSY"), Some(EpicsValue::Short(1)));
 
-        // aai/aao/subArray declare neither field: not in field_list, get None,
-        // put errors.
-        for kind in [ArrayKind::Aai, ArrayKind::Aao, ArrayKind::SubArray] {
+        // aai/aao declare neither field: not in field_list, get None, put errors.
+        for kind in [ArrayKind::Aai, ArrayKind::Aao] {
             let mut r = WaveformRecord::with_kind(kind);
             let names: Vec<&str> = r.field_list().iter().map(|f| f.name).collect();
             assert!(
@@ -1708,6 +1731,55 @@ mod array_kind_tests {
             assert_eq!(r.get_field("RARM"), None, "{kind:?} RARM get must be None");
             assert_eq!(r.get_field("BUSY"), None, "{kind:?} BUSY get must be None");
             assert!(r.put_field("RARM", EpicsValue::Short(1)).is_err());
+        }
+
+        // subArray declares BUSY (read-only) but no RARM.
+        let mut sub = WaveformRecord::with_kind(ArrayKind::SubArray);
+        let names: Vec<&str> = sub.field_list().iter().map(|f| f.name).collect();
+        assert!(
+            !names.contains(&"RARM"),
+            "subArray must not declare RARM (waveform-only)"
+        );
+        assert_eq!(sub.get_field("RARM"), None);
+        let busy = sub
+            .field_list()
+            .iter()
+            .find(|f| f.name == "BUSY")
+            .expect("subArray field_list must carry BUSY");
+        assert!(busy.read_only, "subArray BUSY is special(SPC_NOMOD)");
+        assert_eq!(sub.get_field("BUSY"), Some(EpicsValue::Short(0)));
+        assert!(
+            sub.put_field("BUSY", EpicsValue::Short(1)).is_err(),
+            "subArray BUSY must reject CA puts (SPC_NOMOD)"
+        );
+        sub.busy = true;
+        assert_eq!(sub.get_field("BUSY"), Some(EpicsValue::Short(1)));
+    }
+
+    /// The static field sets and the runtime get/put arms must agree on which
+    /// kinds declare BUSY — [`WaveformRecord::declares_busy`] is the one owner,
+    /// so no kind may carry the FieldDesc while the arms deny the name (or the
+    /// reverse: a name the arms answer but `field_list` never advertises).
+    #[test]
+    fn waveform_busy_field_set_matches_declares_busy() {
+        for kind in [
+            ArrayKind::Waveform,
+            ArrayKind::Aai,
+            ArrayKind::Aao,
+            ArrayKind::SubArray,
+        ] {
+            let r = WaveformRecord::with_kind(kind);
+            let in_set = r.field_list().iter().any(|f| f.name == "BUSY");
+            assert_eq!(
+                in_set,
+                r.declares_busy(),
+                "{kind:?}: field_list BUSY membership must match declares_busy()"
+            );
+            assert_eq!(
+                r.get_field("BUSY").is_some(),
+                r.declares_busy(),
+                "{kind:?}: BUSY get arm must match declares_busy()"
+            );
         }
     }
 

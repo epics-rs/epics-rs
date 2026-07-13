@@ -7364,6 +7364,456 @@ async fn test_compress_res_write_posts_val_monitor() {
     assert_eq!(res, 0, "RES must auto-clear after the reset");
 }
 
+/// C `compressRecord.c::special` (:377-393) runs `reset(); monitor();` for
+/// EVERY `special(SPC_RESET)` field — RES, ALG, PBUF, BALG and N
+/// (`compressRecord.dbd.pod:396-437`) — never RES alone. softIoc transcript
+/// (compress NSAM=4, ALG="Circular Buffer"), after three `dbpf CMP.VAL`:
+///
+/// ```text
+/// dbgf CMP.NUSE            -> 3
+/// dbpf CMP.BALG "LIFO Buffer"
+/// dbgf CMP.NUSE            -> 0      dbgf CMP.OFF -> 0
+/// (refill to NUSE=2) dbpf CMP.N 2
+/// dbgf CMP.NUSE            -> 0      dbgf CMP.OFF -> 0
+/// (refill to NUSE=1) dbpf CMP.ALG "N to 1 Low Value"
+/// dbgf CMP.NUSE            -> 0
+/// ```
+///
+/// Pre-fix the port reset only on RES, so a BALG FIFO→LIFO switch re-read the
+/// stale ring in the new order and an N put corrupted the next emitted sample.
+#[tokio::test]
+async fn test_compress_every_spc_reset_field_resets_the_buffer() {
+    use epics_base_rs::server::records::compress::CompressRecord;
+
+    // Each SPC_RESET field, with the value a client would write.
+    for (field, value) in [
+        ("BALG", EpicsValue::Short(1)),
+        ("ALG", EpicsValue::Short(0)),
+        ("PBUF", EpicsValue::Short(1)),
+        ("N", EpicsValue::Long(2)),
+        ("RES", EpicsValue::Short(1)),
+    ] {
+        let db = PvDatabase::new();
+        let name = format!("CMP_{field}");
+        db.add_record(&name, Box::new(CompressRecord::new(4, 4)))
+            .await
+            .unwrap();
+
+        // Fill the ring: NUSE=3, OFF=3 (the softIoc pre-put state).
+        {
+            let rec = db.get_record(&name).await.unwrap();
+            let mut inst = rec.write().await;
+            for v in [1.0, 2.0, 3.0] {
+                inst.record.put_field("VAL", EpicsValue::Double(v)).unwrap();
+            }
+            assert_eq!(inst.record.get_field("NUSE"), Some(EpicsValue::Long(3)));
+        }
+
+        db.put_record_field_from_ca(&name, field, value)
+            .await
+            .unwrap_or_else(|e| panic!("caput {field} rejected: {e:?}"));
+
+        let rec = db.get_record(&name).await.unwrap();
+        let inst = rec.read().await;
+        assert_eq!(
+            inst.record.get_field("NUSE"),
+            Some(EpicsValue::Long(0)),
+            "a put to SPC_RESET field {field} must zero NUSE"
+        );
+        assert_eq!(
+            inst.record.get_field("OFF"),
+            Some(EpicsValue::Long(0)),
+            "a put to SPC_RESET field {field} must zero OFF"
+        );
+        match inst.record.get_field("VAL") {
+            Some(EpicsValue::DoubleArray(v)) => assert!(
+                v.is_empty(),
+                "a put to SPC_RESET field {field} must empty VAL (NUSE=0); got {v:?}"
+            ),
+            other => panic!("VAL must be DoubleArray, got {other:?}"),
+        }
+        // C's `reset()` zeroes RES itself, so it reads back 0 whatever was
+        // written (softIoc: `dbpf CMP.RES 1` echoes `DBF_SHORT: 0`).
+        assert_eq!(
+            inst.record.get_field("RES"),
+            Some(EpicsValue::Short(0)),
+            "reset() zeroes RES after a put to {field}"
+        );
+    }
+}
+
+/// C `compressRecord.c::cvt_dbaddr` (:398-407) raises `SPC_NOMOD` on VAL when
+/// BALG is LIFO, so `dbPut` refuses the write on every route. softIoc, after
+/// `dbpf CMP.BALG "LIFO Buffer"`:
+///
+/// ```text
+/// dbpf CMP.VAL 7
+/// recGblDbaddrError: dbPut Attempt to modify noMod field PV: CMP.VAL
+/// ```
+///
+/// while the same put under BALG=FIFO succeeds. The port expressed NOMOD only
+/// as the static `FieldDesc::read_only`, which cannot depend on record state,
+/// so a LIFO compress accepted VAL puts.
+#[tokio::test]
+async fn test_compress_val_no_mod_under_lifo_balg() {
+    use epics_base_rs::server::records::compress::CompressRecord;
+
+    let db = PvDatabase::new();
+    db.add_record("CMP_LIFO", Box::new(CompressRecord::new(4, 4)))
+        .await
+        .unwrap();
+
+    // BALG=FIFO (the default): VAL is writable.
+    db.put_record_field_from_ca("CMP_LIFO", "VAL", EpicsValue::Double(1.0))
+        .await
+        .expect("FIFO compress VAL is writable");
+
+    // Switch to LIFO. (The SPC_RESET on BALG empties the ring — R17-76.)
+    db.put_record_field_from_ca("CMP_LIFO", "BALG", EpicsValue::Short(1))
+        .await
+        .unwrap();
+
+    let err = db
+        .put_record_field_from_ca("CMP_LIFO", "VAL", EpicsValue::Double(7.0))
+        .await
+        .expect_err("LIFO compress VAL is SPC_NOMOD — the put must be refused");
+    assert!(
+        matches!(err, CaError::ReadOnlyField(ref f) if f == "VAL"),
+        "expected S_db_noMod on VAL, got {err:?}"
+    );
+
+    // The refused put stored nothing.
+    let rec = db.get_record("CMP_LIFO").await.unwrap();
+    let inst = rec.read().await;
+    assert_eq!(
+        inst.record.get_field("NUSE"),
+        Some(EpicsValue::Long(0)),
+        "a refused put must not reach the ring"
+    );
+
+    // An internal (link) delivery is C's `dbGetLink` into `wptr`, not a
+    // `dbPut` on VAL — it must still ingest under LIFO.
+    drop(inst);
+    let mut inst = rec.write().await;
+    inst.record
+        .put_field_internal("VAL", EpicsValue::Double(7.0))
+        .expect("the INP-driven ingest is not a dbPut and is not gated");
+    assert_eq!(inst.record.get_field("NUSE"), Some(EpicsValue::Long(1)));
+}
+
+/// C `field(CSTA,DBF_SHORT){ special(SPC_NOMOD) }`
+/// (`histogramRecord.dbd.pod:170-175`): the collection state is toggled only
+/// through CMD (`histogramRecord.c:246-259`), never by a client put. softIoc:
+///
+/// ```text
+/// dbpf HI.CSTA 0
+/// recGblDbaddrError: dbPut Attempt to modify noMod field PV: HI.CSTA
+/// dbgf HI.CSTA -> 1
+/// ```
+///
+/// Pre-fix the port accepted the put on every route, so a caput silently
+/// stopped a live acquisition.
+#[tokio::test]
+async fn test_histogram_csta_is_no_mod() {
+    use epics_base_rs::server::records::histogram::HistogramRecord;
+
+    let db = PvDatabase::new();
+    db.add_record("HI_CSTA", Box::new(HistogramRecord::new(4, 0.0, 8.0)))
+        .await
+        .unwrap();
+
+    let err = db
+        .put_record_field_from_ca("HI_CSTA", "CSTA", EpicsValue::Short(0))
+        .await
+        .expect_err("CSTA is special(SPC_NOMOD) — the put must be refused");
+    assert!(
+        matches!(err, CaError::ReadOnlyField(ref f) if f == "CSTA"),
+        "expected S_db_noMod on CSTA, got {err:?}"
+    );
+
+    let rec = db.get_record("HI_CSTA").await.unwrap();
+    assert_eq!(
+        rec.read().await.record.get_field("CSTA"),
+        Some(EpicsValue::Short(1)),
+        "a refused put must leave the live acquisition counting"
+    );
+
+    // CMD=3 (Stop) is the only route that clears it.
+    db.put_record_field_from_ca("HI_CSTA", "CMD", EpicsValue::Short(3))
+        .await
+        .unwrap();
+    assert_eq!(
+        rec.read().await.record.get_field("CSTA"),
+        Some(EpicsValue::Short(0)),
+        "CMD=Stop is the owner of the counting state"
+    );
+}
+
+/// C `dbConvert.c`'s `PUT(epicsFloat64, epicsInt32)` / `(epicsInt16)` is a bare
+/// cast (`*pdst = (typeb) *psrc`, :96-113) — undefined by the standard, but the
+/// compiled x86-64 IOC is the parity target (the HexSignificand / shift-mask
+/// precedent). Rust's `as` saturates instead, so the port answered 2147483647
+/// and 32767 where a C IOC answers INT_MIN and a wrapped low half.
+///
+/// softIoc transcript (the audit's two cases, reproduced here verbatim):
+///
+/// ```text
+/// record(calcout,"CO") { field(CALC,"3.0e9") field(OUT,"LO.VAL PP") }
+/// dbpf CO.PROC 1 ; dbgf LO.VAL   -> DBF_LONG: -2147483648 = 0x80000000
+///
+/// record(aao,"AAO") { field(DOL,"[1.7,2.2,-3.9,70000,5,6]") field(OUT,"WFS.VAL") }
+/// (WFS: NELM=4 FTVL=SHORT)
+/// dbpf AAO.PROC 1 ; dbgf WFS.VAL -> DBF_SHORT[4]: 1  2  -3  4464
+///
+/// dbpf LO2.VAL 70000.9 -> 70000     dbpf LO2.VAL -3.9 -> -3
+/// ```
+#[tokio::test]
+async fn test_double_to_int_narrowing_matches_compiled_c() {
+    use epics_base_rs::server::records::longout::LongoutRecord;
+    use epics_base_rs::server::records::waveform::WaveformRecord;
+    use epics_base_rs::types::DbFieldType;
+
+    let db = PvDatabase::new();
+    db.add_record("CVT_LO", Box::new(LongoutRecord::new(0)))
+        .await
+        .unwrap();
+    db.add_record(
+        "CVT_WFS",
+        Box::new(WaveformRecord::new(4, DbFieldType::Short)),
+    )
+    .await
+    .unwrap();
+
+    // DBF_LONG destination: `(epicsInt32) 3.0e9` is the 32-bit cvttsd2si's
+    // integer indefinite, NOT a clamp to i32::MAX.
+    db.put_record_field_from_ca("CVT_LO", "VAL", EpicsValue::Double(3.0e9))
+        .await
+        .unwrap();
+    assert_eq!(
+        db.get_pv("CVT_LO.VAL").await.unwrap(),
+        EpicsValue::Long(-2147483648),
+        "C: dbgf LO.VAL -> -2147483648 = 0x80000000"
+    );
+
+    // In-range doubles still truncate toward zero.
+    db.put_record_field_from_ca("CVT_LO", "VAL", EpicsValue::Double(70000.9))
+        .await
+        .unwrap();
+    assert_eq!(
+        db.get_pv("CVT_LO.VAL").await.unwrap(),
+        EpicsValue::Long(70000)
+    );
+    db.put_record_field_from_ca("CVT_LO", "VAL", EpicsValue::Double(-3.9))
+        .await
+        .unwrap();
+    assert_eq!(db.get_pv("CVT_LO.VAL").await.unwrap(), EpicsValue::Long(-3));
+
+    // FTVL=SHORT destination: each element converts through the 32-bit
+    // cvttsd2si and is then truncated to 16 bits — 70000 -> 4464, not 32767.
+    db.put_record_field_from_ca(
+        "CVT_WFS",
+        "VAL",
+        EpicsValue::DoubleArray(vec![1.7, 2.2, -3.9, 70000.0, 5.0, 6.0]),
+    )
+    .await
+    .unwrap();
+    match db.get_pv("CVT_WFS.VAL").await.unwrap() {
+        EpicsValue::ShortArray(v) => assert_eq!(
+            v,
+            vec![1, 2, -3, 4464],
+            "C: dbgf WFS.VAL -> DBF_SHORT[4]: 1 2 -3 4464"
+        ),
+        other => panic!("expected ShortArray, got {other:?}"),
+    }
+}
+
+/// C `histogramRecord.c::wdogCallback` (:102-124), armed by `wdogInit`
+/// (:126-152) from `init_record` pass 1 (:168) and from the SDEL
+/// `special(SPC_RESET)` (:266-268):
+///
+/// ```c
+/// if (prec->mcnt > 0) {
+///     dbScanLock(prec);
+///     recGblGetTimeStamp(prec);
+///     db_post_events(prec, &prec->val, DBE_VALUE | DBE_LOG);
+///     prec->mcnt = 0;
+///     dbScanUnlock(prec);
+/// }
+/// if (prec->sdel > 0) callbackRequestDelayed(&pcallback->callback, prec->sdel);
+/// ```
+///
+/// MDEL can hold every process-time post back indefinitely (`monitor()` posts
+/// only when `mcnt > mdel`), so without the watchdog a slow accumulation never
+/// reaches a display. Pre-fix an SDEL put stored the number and nothing else.
+#[tokio::test]
+async fn test_histogram_sdel_watchdog_posts_val() {
+    use epics_base_rs::server::recgbl::EventMask;
+    use epics_base_rs::server::records::histogram::HistogramRecord;
+    use epics_base_rs::types::DbFieldType;
+
+    let db = PvDatabase::new();
+    let mut hist = HistogramRecord::new(2, 0.0, 10.0);
+    // MDEL far above the counts we will take: the process-time `monitor()`
+    // post is suppressed, so ONLY the watchdog can publish.
+    hist.mdel = 1000;
+    db.add_record("HI_WDOG", Box::new(hist)).await.unwrap();
+
+    let rec = db.get_record("HI_WDOG").await.unwrap();
+    let mut val_rx = rec
+        .write()
+        .await
+        .add_subscriber("VAL", 1, DbFieldType::Long, EventMask::VALUE.bits())
+        .expect("VAL subscription accepted");
+
+    // Accumulate a count (MCNT=1, well under MDEL — nothing is posted).
+    db.put_record_field_from_ca("HI_WDOG", "SGNL", EpicsValue::Double(1.0))
+        .await
+        .unwrap();
+    while val_rx.try_recv().is_ok() {}
+
+    // Arm the watchdog: SDEL is special(SPC_RESET) -> wdogInit.
+    db.put_record_field_from_ca("HI_WDOG", "SDEL", EpicsValue::Double(0.05))
+        .await
+        .unwrap();
+
+    // The tick must post VAL and zero MCNT.
+    let event = tokio::time::timeout(std::time::Duration::from_secs(2), val_rx.recv())
+        .await
+        .expect("SDEL watchdog must post VAL within one period")
+        .expect("subscription alive");
+    match &event.snapshot.value {
+        EpicsValue::ULongArray(v) => assert_eq!(
+            v,
+            &vec![1, 0],
+            "the watchdog posts the accumulated bin counts"
+        ),
+        other => panic!("VAL must be ULongArray (C DBF_ULONG), got {other:?}"),
+    }
+    assert_eq!(
+        rec.read().await.record.get_field("MCNT"),
+        Some(EpicsValue::Long(0)),
+        "wdogCallback zeroes MCNT after the post"
+    );
+
+    // It re-arms: a further count is posted on the next tick.
+    db.put_record_field_from_ca("HI_WDOG", "SGNL", EpicsValue::Double(6.0))
+        .await
+        .unwrap();
+    let event = tokio::time::timeout(std::time::Duration::from_secs(2), val_rx.recv())
+        .await
+        .expect("the watchdog re-arms itself (C: callbackRequestDelayed at the tail)")
+        .expect("subscription alive");
+    match &event.snapshot.value {
+        EpicsValue::ULongArray(v) => assert_eq!(v, &vec![1, 1]),
+        other => panic!("VAL must be ULongArray (C DBF_ULONG), got {other:?}"),
+    }
+}
+
+/// C `compressRecord` serves OUSE and INPN, both `special(SPC_NOMOD)`
+/// (`compressRecord.dbd.pod:481-484` / `:503-506`). OUSE is the latch behind
+/// `monitor()`'s "post NUSE only when it changed" rule
+/// (compressRecord.c:104-108); INPN is the INP element count that triggers the
+/// WPTR realloc. softIoc (compress NSAM=4 ALG="Circular Buffer" INP=SRC, a
+/// 3-element waveform):
+///
+/// ```text
+/// dbgf CMP2.OUSE -> 0      dbgf CMP2.INPN -> 0
+/// dbpf SRC.VAL 5 ; dbpf CMP2.PROC 1
+/// dbgf CMP2.NUSE -> 1      dbgf CMP2.OUSE -> 1
+/// dbpf CMP2.RES 1
+/// dbgf CMP2.NUSE -> 0      dbgf CMP2.OUSE -> 0
+/// dbpf CMP2.OUSE 9 -> dbPut Attempt to modify noMod field PV: CMP2.OUSE
+/// dbpf CMP2.INPN 9 -> dbPut Attempt to modify noMod field PV: CMP2.INPN
+/// ```
+///
+/// Both fields were absent from the port, so a caget on either failed.
+#[tokio::test]
+async fn test_compress_ouse_and_inpn_fields() {
+    use epics_base_rs::server::records::compress::CompressRecord;
+
+    let db = PvDatabase::new();
+    db.add_record("CMP_OUSE", Box::new(CompressRecord::new(4, 4)))
+        .await
+        .unwrap();
+    let rec = db.get_record("CMP_OUSE").await.unwrap();
+
+    assert_eq!(
+        db.get_pv("CMP_OUSE.OUSE").await.unwrap(),
+        EpicsValue::Long(0)
+    );
+    assert_eq!(
+        db.get_pv("CMP_OUSE.INPN").await.unwrap(),
+        EpicsValue::Long(0)
+    );
+
+    // Both are special(SPC_NOMOD): refused on every runtime route.
+    for field in ["OUSE", "INPN"] {
+        let err = db
+            .put_record_field_from_ca("CMP_OUSE", field, EpicsValue::Long(9))
+            .await
+            .expect_err("special(SPC_NOMOD) field must refuse a caput");
+        assert!(
+            matches!(err, CaError::ReadOnlyField(ref f) if f == field),
+            "expected S_db_noMod on {field}, got {err:?}"
+        );
+    }
+
+    // A publishing process cycle latches OUSE to NUSE (C `monitor()`).
+    {
+        let mut inst = rec.write().await;
+        inst.record
+            .put_field("VAL", EpicsValue::Double(5.0))
+            .unwrap();
+    }
+    db.process_record("CMP_OUSE").await.unwrap();
+    assert_eq!(
+        db.get_pv("CMP_OUSE.NUSE").await.unwrap(),
+        EpicsValue::Long(1)
+    );
+    assert_eq!(
+        db.get_pv("CMP_OUSE.OUSE").await.unwrap(),
+        EpicsValue::Long(1),
+        "monitor() latches OUSE = NUSE on a publishing cycle"
+    );
+
+    // RES resets, and the SPC_RESET monitor() latches OUSE back to 0.
+    db.put_record_field_from_ca("CMP_OUSE", "RES", EpicsValue::Short(1))
+        .await
+        .unwrap();
+    assert_eq!(
+        db.get_pv("CMP_OUSE.NUSE").await.unwrap(),
+        EpicsValue::Long(0)
+    );
+    assert_eq!(
+        db.get_pv("CMP_OUSE.OUSE").await.unwrap(),
+        EpicsValue::Long(0)
+    );
+
+    // The latch is what gates the NUSE post: that first RES moved NUSE 1 -> 0,
+    // so it posted NUSE alongside VAL...
+    {
+        let inst = rec.read().await;
+        assert_eq!(
+            inst.record.monitor_side_effect_fields("RES"),
+            &["NUSE", "VAL"],
+            "NUSE changed against OUSE -> C posts NUSE too"
+        );
+    }
+    // ...while a second RES on an already-empty buffer leaves NUSE == OUSE, so
+    // `monitor()` posts VAL alone.
+    db.put_record_field_from_ca("CMP_OUSE", "RES", EpicsValue::Short(1))
+        .await
+        .unwrap();
+    {
+        let inst = rec.read().await;
+        assert_eq!(
+            inst.record.monitor_side_effect_fields("RES"),
+            &["VAL"],
+            "NUSE unchanged against OUSE -> C posts VAL only"
+        );
+    }
+}
+
 /// epics-base PR `dabcf89` (2021) regression: when an mbboDirect
 /// record initialises with no VAL set (UDF=true on the framework
 /// side) but with at least one B0..B1F bit set in the .db file,
@@ -9661,8 +10111,10 @@ async fn promptgroup_config_fields_load_settable_runtime_immutable() {
         .expect("histogram NELM is .db-settable (promptgroup)");
     assert_eq!(hist.get_field("NELM"), Some(EpicsValue::Long(5)));
     match hist.get_field("VAL") {
-        Some(EpicsValue::LongArray(v)) => assert_eq!(v.len(), 5, "NELM load resizes the bin array"),
-        other => panic!("histogram VAL should be a 5-element LongArray, got {other:?}"),
+        Some(EpicsValue::ULongArray(v)) => {
+            assert_eq!(v.len(), 5, "NELM load resizes the bin array")
+        }
+        other => panic!("histogram VAL should be a 5-element ULongArray, got {other:?}"),
     }
 
     let mut comp = create_record("compress").expect("create compress");

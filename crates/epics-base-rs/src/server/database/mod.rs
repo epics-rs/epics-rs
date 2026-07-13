@@ -347,8 +347,14 @@ pub(crate) struct SelmResult {
 /// `65535` and `65536` becomes `0`. Used for fanout/dfanout/seq
 /// `SELL`→`SELN` so a constant, DB, CA, or PVA link source all convert
 /// by the one rule C applies through `dbFastGetConvertRoutine`.
+///
+/// The cast itself belongs to [`crate::types::c_cast`], the single owner of
+/// C's compiled `double -> integer` narrowing: routing an out-of-`i32`-range
+/// double through the `i64` path (the local shortcut this used to take) is the
+/// `u32` rule, not the `u16` one — compiled C converts a 16-bit destination
+/// through a 32-bit `cvttsd2si`, so `3.0e9` is `0` here, not `55296`.
 pub(crate) fn dbr_ushort_cast(value: &EpicsValue) -> u16 {
-    (value.to_f64().unwrap_or(0.0) as i64) as u16
+    crate::types::c_cast::f64_to_u16(value.to_f64().unwrap_or(0.0))
 }
 
 /// Select which link indices are active based on SELM/SELN, applying

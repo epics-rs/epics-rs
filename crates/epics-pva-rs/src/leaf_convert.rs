@@ -304,6 +304,37 @@ pub(crate) fn pv_leaf_to_epics_value(f: &PvField) -> Option<EpicsValue> {
 mod tests {
     use super::*;
 
+    /// R17-84: a `histogram`'s bins are C `epicsUInt32` — `cvt_dbaddr`
+    /// (`histogramRecord.c:299-308`) sets `field_type = dbr_field_type =
+    /// DBF_ULONG` — and pvxs serves DBF_ULONG natively as `uint32[]`
+    /// (`ioc/typeutils.cpp:43-44`: `DBR_ULONG -> TypeCode::UInt32`). The port
+    /// used to store the bins in an `i32` slot, so PVA introspected VAL as
+    /// `int32[]` and a count above `i32::MAX` reached the client negative.
+    #[test]
+    fn histogram_val_is_served_as_uint32_array() {
+        use epics_base_rs::server::record::Record;
+        use epics_base_rs::server::records::histogram::HistogramRecord;
+
+        let mut hist = HistogramRecord::new(2, 0.0, 10.0);
+        hist.val[0] = 3_000_000_000; // above i32::MAX — the bin that used to go negative
+        let val = hist.get_field("VAL").expect("histogram serves VAL");
+
+        assert_eq!(
+            epics_value_to_field_desc_leaf(&val),
+            FieldDesc::ScalarArray(ScalarType::UInt),
+            "DBF_ULONG bins introspect as uint32[]"
+        );
+        assert_eq!(
+            epics_value_to_pv_leaf(&val),
+            PvField::ScalarArray(
+                [ScalarValue::UInt(3_000_000_000), ScalarValue::UInt(0)]
+                    .into_iter()
+                    .collect()
+            ),
+            "the count crosses the wire unsigned"
+        );
+    }
+
     // The DBF_CHAR family: signed CHAR travels as `byte`/`byte[]`, unsigned
     // UCHAR as `ubyte`/`ubyte[]`, in every serve/monitor direction owned here.
     #[test]

@@ -46,7 +46,7 @@ fn c1_compress_val_array_put_does_not_panic_or_desync() {
 #[test]
 fn c2_histogram_counter_wraps_no_panic() {
     let mut rec = HistogramRecord::new(2, 0.0, 10.0);
-    rec.val[0] = u32::MAX as i32; // UINT_MAX bit pattern
+    rec.val[0] = u32::MAX; // the C epicsUInt32 counter at its max
     rec.put_field("SGNL", EpicsValue::Double(1.0)).unwrap();
     // SGNL put triggers add_count (C SPC_MOD); counter wraps to 0.
     assert_eq!(rec.val[0], 0);
@@ -238,16 +238,16 @@ fn h11_histogram_cmd_start_stop() {
     rec.put_field("SGNL", EpicsValue::Double(2.0)).unwrap();
     assert_eq!(
         rec.get_field("VAL"),
-        Some(EpicsValue::LongArray(vec![0, 0, 0, 0])),
+        Some(EpicsValue::ULongArray(vec![0, 0, 0, 0])),
         "stopped histogram does not count"
     );
     // CMD=2 resumes counting.
     rec.put_field("CMD", EpicsValue::Short(2)).unwrap();
     rec.put_field("SGNL", EpicsValue::Double(2.0)).unwrap();
-    if let Some(EpicsValue::LongArray(v)) = rec.get_field("VAL") {
-        assert_eq!(v.iter().sum::<i32>(), 1, "resumed histogram counts");
+    if let Some(EpicsValue::ULongArray(v)) = rec.get_field("VAL") {
+        assert_eq!(v.iter().sum::<u32>(), 1, "resumed histogram counts");
     } else {
-        panic!("expected LongArray");
+        panic!("expected ULongArray");
     }
 }
 

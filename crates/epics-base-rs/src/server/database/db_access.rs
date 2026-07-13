@@ -203,7 +203,8 @@ impl DbChannel {
             .ok()
             .and_then(|v| match v {
                 EpicsValue::Long(i) => Some(i),
-                other => other.to_f64().map(|f| f as i32),
+                // C `dbGetLink(.., DBR_LONG, ..)` — `getDoubleLong`'s bare cast.
+                other => other.to_f64().map(crate::types::c_cast::f64_to_i32),
             })
             .unwrap_or(0)
     }

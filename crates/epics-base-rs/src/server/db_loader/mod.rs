@@ -1550,7 +1550,7 @@ mod tests {
         rec.add_sample(-1.0); // below range
         rec.add_sample(10.0); // at upper limit (excluded)
         rec.add_sample(15.0); // above range
-        let total: i32 = rec.val.iter().sum();
+        let total: u32 = rec.val.iter().sum();
         assert_eq!(total, 0);
     }
 

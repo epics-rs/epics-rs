@@ -9,17 +9,23 @@ use crate::types::{DbFieldType, EpicsValue};
 /// explicitly at `UINT_MAX` (`add_count`: `if (*pdest == UINT_MAX)
 /// *pdest = 0; (*pdest)++;`).
 ///
-/// The counters are stored in an `i32` vector — the public field type
-/// is unchanged for callers — but each increment goes through
-/// `u32`-wrapping arithmetic (`(v as u32).wrapping_add(1) as i32`).
-/// The `i32` slot is treated as the two's-complement *bit container*
-/// for the C `epicsUInt32`: this wraps at `UINT_MAX` exactly as C
-/// does, and never panics on overflow the way a plain signed
-/// `i32 += 1` would at 2^31 counts. The CA wire has no unsigned-long
-/// DBR type, so `VAL` is exposed as `LongArray` — the same bit
-/// pattern a C client sees over `DBR_LONG`.
+/// The counters are `epicsUInt32` here too — [`DbFieldType::ULong`], served
+/// as an [`EpicsValue::ULongArray`]. The declared type is the one C declares,
+/// and each wire projects it the way C's does, so neither wire needs a
+/// per-record special case:
+///
+/// * CA has no unsigned-long DBR type and promotes `DBF_ULONG` to
+///   `DBR_DOUBLE` (`db_convert.h`: `6, /*DBR_ULONG to DBR_DOUBLE*/`) —
+///   `cainfo HI` on softIoc reports `Native data type: DBF_DOUBLE`, the same
+///   answer it gives for a `waveform` with `FTVL=ULONG`.
+/// * PVA serves it natively: pvxs `ioc/typeutils.cpp:43-44` maps `DBR_ULONG`
+///   to `TypeCode::UInt32`, so `VAL` is a `uint32[]`.
+///
+/// Counting wraps at `UINT_MAX` exactly as C does (`add_count`:
+/// `if (*pdest == UINT_MAX) *pdest = 0; (*pdest)++;`) — `u32::wrapping_add`,
+/// with no signed slot to reinterpret.
 pub struct HistogramRecord {
-    pub val: Vec<i32>, // Bucket counts (C epicsUInt32 bit pattern, wraps at UINT_MAX)
+    pub val: Vec<u32>, // Bucket counts (C epicsUInt32 — wraps at UINT_MAX)
     pub nelm: i32,     // Number of buckets
     pub ulim: f64,     // Upper limit
     pub llim: f64,     // Lower limit
@@ -62,6 +68,12 @@ pub struct HistogramRecord {
     /// reach, so the outcome is carried here and folded in by
     /// `post_init_finalize_undef` (the same shape aao uses for its constant DOL).
     constant_svl_loaded: bool,
+    /// A `special(SPC_RESET)` write to SDEL asked for `wdogInit`
+    /// (`histogramRecord.c:266-268`). `special()` has no database handle, so
+    /// the request is latched here and drained by `take_special_actions` as a
+    /// [`crate::server::record::ProcessAction::ArmWatchdog`] — the same shape
+    /// the scaler uses for the `dbPutLink` its `special()` performs.
+    rearm_watchdog: bool,
 }
 
 impl Default for HistogramRecord {
@@ -99,6 +111,7 @@ impl Default for HistogramRecord {
             sims: 0,
             sdly: -1.0,
             constant_svl_loaded: false,
+            rearm_watchdog: false,
         }
     }
 }
@@ -152,9 +165,7 @@ impl HistogramRecord {
         let bucket = ((i - 1).max(0) as usize).min(self.val.len().saturating_sub(1));
         if bucket < self.val.len() {
             // C: if (*pdest == UINT_MAX) *pdest = 0; (*pdest)++;
-            // The i32 slot holds the epicsUInt32 bit pattern — wrap
-            // through u32 so the rollover happens at UINT_MAX.
-            self.val[bucket] = (self.val[bucket] as u32).wrapping_add(1) as i32;
+            self.val[bucket] = self.val[bucket].wrapping_add(1);
             self.mcnt = self.mcnt.saturating_add(1);
         }
     }
@@ -177,9 +188,11 @@ impl HistogramRecord {
 static HISTOGRAM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
-        // CA wire has no DBR_ULONG; C `cvt_dbaddr` uses DBF_ULONG
-        // internally but a CA client reads it as DBR_LONG.
-        dbf_type: DbFieldType::Long,
+        // C `cvt_dbaddr` (histogramRecord.c:299-308) sets
+        // `field_type = dbr_field_type = DBF_ULONG`. CA promotes that to
+        // DBR_DOUBLE, PVA serves it as uint32[] — both projections follow
+        // from this one declared type.
+        dbf_type: DbFieldType::ULong,
         read_only: false,
     },
     FieldDesc {
@@ -221,10 +234,18 @@ static HISTOGRAM_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         read_only: false,
     },
+    // C `field(CSTA,DBF_SHORT){ special(SPC_NOMOD) initial("1") }`
+    // (histogramRecord.dbd.pod:170-175). The collection state is the record's
+    // own — it is toggled ONLY through CMD's SPC_CALC `special()`
+    // (histogramRecord.c:246-259: `cmd == 2` → `csta = TRUE`, `cmd == 3` →
+    // `csta = FALSE`) — so a client put is refused: softIoc `dbpf HI.CSTA 0` →
+    // "dbPut Attempt to modify noMod field PV: HI.CSTA". Runtime-immutable via
+    // the field_io `read_only` gate; the `put_field` arm below still serves the
+    // load path, which in C bypasses SPC_NOMOD through dbStaticLib.
     FieldDesc {
         name: "CSTA",
         dbf_type: DbFieldType::Short,
-        read_only: false,
+        read_only: true,
     },
     FieldDesc {
         name: "SDEL",
@@ -292,6 +313,74 @@ impl Record for HistogramRecord {
         Ok(ProcessOutcome::complete())
     }
 
+    /// C `histogramRecord.c::special` (:226-274), SPC_RESET arm:
+    ///
+    /// ```c
+    /// case SPC_RESET:
+    ///     if (dbGetFieldIndex(paddr) == histogramRecordSDEL) {
+    ///         wdogInit(prec);                       /* re-arm the monitor watchdog */
+    ///     } else {                                  /* ULIM / LLIM */
+    ///         prec->wdth = (prec->ulim - prec->llim) / prec->nelm;
+    ///         clear_histogram(prec);
+    ///     }
+    /// ```
+    ///
+    /// One owner for the record's three SPC_RESET fields
+    /// (`histogramRecord.dbd.pod`: ULIM :183-189, LLIM :190-196, SDEL
+    /// :239-244). The SDEL arm re-arms the watchdog through
+    /// [`ProcessAction::ArmWatchdog`] — `special()` has no database handle, so
+    /// the framework performs the `wdogInit` on its behalf, drained
+    /// immediately after this returns (`take_special_actions`).
+    ///
+    /// (SIMM's SPC_MOD pass is the framework's `recGblSaveSimm`/`CheckSimm`
+    /// owner; SGNL's SPC_MOD `add_count` stays on the `put_field` arm, which is
+    /// the only route C's `dbPutField` takes to it.)
+    fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
+        if !after {
+            return Ok(());
+        }
+        match field {
+            "SDEL" => self.rearm_watchdog = true,
+            "ULIM" | "LLIM" => {
+                self.recompute_wdth();
+                self.clear_histogram();
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn take_special_actions(&mut self) -> Vec<crate::server::record::ProcessAction> {
+        if std::mem::take(&mut self.rearm_watchdog) {
+            vec![crate::server::record::ProcessAction::ArmWatchdog]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// C `wdogInit` (:126-152): `if (prec->sdel > 0)` arm a delayed callback of
+    /// SDEL seconds. A non-positive SDEL means no watchdog at all.
+    fn watchdog_interval(&self) -> Option<std::time::Duration> {
+        (self.sdel > 0.0).then(|| std::time::Duration::from_secs_f64(self.sdel))
+    }
+
+    /// C `wdogCallback` (:102-124): when counts have accumulated since the last
+    /// post (`mcnt > 0`), force a VAL post and zero MCNT. MDEL can hold every
+    /// process-time post back indefinitely (`monitor()` posts only when
+    /// `mcnt > mdel`, :283-291) — the watchdog is what makes a slow
+    /// accumulation still reach a display, every SDEL seconds.
+    ///
+    /// The framework stamps the record (`recGblGetTimeStamp`) and posts
+    /// `DBE_VALUE | DBE_LOG` for the returned field, then re-arms.
+    fn watchdog_fire(&mut self) -> &'static [&'static str] {
+        if self.mcnt > 0 {
+            self.mcnt = 0;
+            &["VAL"]
+        } else {
+            &[]
+        }
+    }
+
     /// `histogramRecord.dbd.pod` declares NO `INP` — the record's DBF_INLINK is
     /// `SVL` (:212), read into SGNL by `devHistogramSoft.c`. C's dbd rejects
     /// `field(INP,...)` on a histogram ("field not found"), and so does the
@@ -346,6 +435,20 @@ impl Record for HistogramRecord {
     /// and the record is then DEFINED. No bin increment: `add_count` runs only
     /// from `process()` and from the SGNL `special()`.
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
+        if pass == 0 {
+            // C `init_record` pass 0 (histogramRecord.c:149-161): size the bin
+            // array, then `prec->wdth = (prec->ulim - prec->llim) / prec->nelm`.
+            // This is WDTH's owner at load — the ULIM/LLIM `put_field` arms
+            // only store, so a `.db` may declare NELM/ULIM/LLIM in any order.
+            if self.nelm <= 0 {
+                self.nelm = 1;
+            }
+            if self.val.len() != self.nelm as usize {
+                self.val = vec![0; self.nelm as usize];
+            }
+            self.recompute_wdth();
+            return Ok(());
+        }
         if pass != 1 {
             return Ok(());
         }
@@ -393,9 +496,8 @@ impl Record for HistogramRecord {
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
-            // Counters surfaced as-is (the i32 slot is the
-            // epicsUInt32 bit pattern C exposes over DBR_LONG).
-            "VAL" => Some(EpicsValue::LongArray(self.val.clone())),
+            // C's epicsUInt32 counters (DBF_ULONG), surfaced as-is.
+            "VAL" => Some(EpicsValue::ULongArray(self.val.clone())),
             "NELM" => Some(EpicsValue::Long(self.nelm)),
             "ULIM" => Some(EpicsValue::Double(self.ulim)),
             "LLIM" => Some(EpicsValue::Double(self.llim)),
@@ -420,18 +522,21 @@ impl Record for HistogramRecord {
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
         match name {
             "VAL" => match value {
-                EpicsValue::LongArray(arr) => {
+                EpicsValue::ULongArray(arr) => {
                     self.val = arr;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("VAL".into())),
             },
+            // ULIM/LLIM/SDEL are `special(SPC_RESET)` — the arms STORE ONLY.
+            // The side effects belong to `special()` (C runs them in
+            // `dbPutSpecial(paddr, 1)`, after `dbPut` stored the value), which
+            // is also what keeps the load path C-faithful: dbStaticLib never
+            // calls `special()`, and `init_record` pass 0 derives WDTH from the
+            // fields as loaded, in either order.
             "ULIM" => match value {
                 EpicsValue::Double(v) => {
                     self.ulim = v;
-                    // C SPC_RESET: recompute width and clear.
-                    self.recompute_wdth();
-                    self.clear_histogram();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("ULIM".into())),
@@ -439,8 +544,6 @@ impl Record for HistogramRecord {
             "LLIM" => match value {
                 EpicsValue::Double(v) => {
                     self.llim = v;
-                    self.recompute_wdth();
-                    self.clear_histogram();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("LLIM".into())),
@@ -479,6 +582,8 @@ impl Record for HistogramRecord {
                 }
                 _ => Err(CaError::TypeMismatch("CMD".into())),
             },
+            // `special(SPC_NOMOD)` — the load path only (see the FieldDesc).
+            // At runtime CSTA moves through CMD's `special()`, never here.
             "CSTA" => match value {
                 EpicsValue::Short(v) => {
                     self.csta = v != 0;
@@ -613,12 +718,57 @@ mod tests {
         assert_eq!(rec.wdth, 0.0, "WDTH = (ULIM-LLIM)/NELM = 0");
     }
 
-    /// a counter at the `UINT_MAX` bit pattern must wrap to 0,
-    /// never panic the way a signed `i32 += 1` would at overflow.
+    /// R17-84: the bins are C's `epicsUInt32` — `cvt_dbaddr`
+    /// (`histogramRecord.c:299-308`) sets `field_type = dbr_field_type =
+    /// DBF_ULONG`. Every wire then projects that ONE declared type its own way,
+    /// and both projections already exist in the port:
+    ///
+    /// * CA has no unsigned-long DBR type, so `DBF_ULONG` promotes to
+    ///   `DBR_DOUBLE`. softIoc (`cainfo`, EPICS 7 base):
+    ///
+    ///   ```text
+    ///   HI  (histogram VAL)        Native data type: DBF_DOUBLE
+    ///   WU  (waveform FTVL=ULONG)  Native data type: DBF_DOUBLE
+    ///   WL  (waveform FTVL=LONG)   Native data type: DBF_LONG
+    ///   ```
+    ///
+    /// * PVA serves it natively as `uint32[]` — pinned by
+    ///   `epics-pva-rs::leaf_convert::tests::histogram_val_is_served_as_uint32_array`.
+    ///
+    /// The port declared VAL `DBF_LONG` and stored the counts in an `i32` slot
+    /// "as a bit container", which made CA answer DBR_LONG and PVA `int32[]`.
+    #[test]
+    fn val_is_dbf_ulong_and_promotes_to_dbr_double_on_ca() {
+        let rec = HistogramRecord::new(2, 0.0, 10.0);
+
+        let val_desc = HISTOGRAM_FIELDS
+            .iter()
+            .find(|f| f.name == "VAL")
+            .expect("histogram declares VAL");
+        assert_eq!(
+            val_desc.dbf_type,
+            DbFieldType::ULong,
+            "C cvt_dbaddr: dbr_field_type = DBF_ULONG"
+        );
+
+        let val = rec.get_field("VAL").expect("histogram serves VAL");
+        assert!(
+            matches!(val, EpicsValue::ULongArray(_)),
+            "the bins are epicsUInt32, got {val:?}"
+        );
+        assert_eq!(
+            val.dbr_type(),
+            DbFieldType::Double,
+            "CA promotes DBF_ULONG to DBR_DOUBLE (cainfo HI: DBF_DOUBLE)"
+        );
+    }
+
+    /// C `add_count`: `if (*pdest == UINT_MAX) *pdest = 0; (*pdest)++;` — a
+    /// counter at `UINT_MAX` wraps to 0 and never panics on overflow.
     #[test]
     fn counter_wraps_at_u32_max_no_panic() {
         let mut rec = HistogramRecord::new(2, 0.0, 10.0);
-        rec.val[0] = u32::MAX as i32; // -1 i32, == UINT_MAX bit pattern
+        rec.val[0] = u32::MAX;
         rec.sgnl = 1.0;
         rec.add_count();
         assert_eq!(rec.val[0], 0, "epicsUInt32 counter wraps UINT_MAX -> 0");

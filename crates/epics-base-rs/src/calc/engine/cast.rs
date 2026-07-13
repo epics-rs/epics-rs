@@ -50,19 +50,19 @@ pub(crate) fn d2ui(x: f64) -> u32 {
 ///
 /// In range it truncates toward zero. Out of range (and for NaN/±Inf) the C
 /// standard calls it undefined, so there is no portable answer — what an EPICS
-/// IOC actually does is whatever its ISA's convert instruction does. This ports
-/// **x86-64** (`cvttsd2si` with a 32-bit destination), the reference platform:
-/// the result is the "integer indefinite" value `INT32_MIN`. On aarch64 `fcvtzs`
-/// saturates instead, so a C IOC there answers `INT32_MAX`; both differ from
-/// [`d2i`]'s wrap, which is the bug this owner exists to prevent.
+/// IOC actually does is whatever its ISA's convert instruction does. On
+/// **x86-64**, the reference platform, that is `cvttsd2si` with a 32-bit
+/// destination: the "integer indefinite" value `INT32_MIN`. (On aarch64
+/// `fcvtzs` saturates instead, so a C IOC there answers `INT32_MAX`.) Either
+/// way it differs from [`d2i`]'s wrap, which is the bug this module's split
+/// exists to prevent.
+///
+/// The cast itself is not calc's — it is the same bare C cast `dbConvert.c`
+/// performs on a `DBF_DOUBLE` → `DBF_LONG` put — so it is owned by
+/// [`crate::types::c_cast`] and merely named for calc here.
 #[inline]
 pub(crate) fn c_int(x: f64) -> i32 {
-    let t = x.trunc();
-    if t.is_nan() || t < i32::MIN as f64 || t > i32::MAX as f64 {
-        i32::MIN
-    } else {
-        t as i32
-    }
+    crate::types::c_cast::f64_to_i32(x)
 }
 
 /// C's plain `(long)` cast of a double on LP64 (what sCalc's operators use).
@@ -70,12 +70,7 @@ pub(crate) fn c_int(x: f64) -> i32 {
 /// destination yields `INT64_MIN` for NaN and for anything out of range.
 #[inline]
 pub(crate) fn c_long(x: f64) -> i64 {
-    let t = x.trunc();
-    if t.is_nan() || t < i64::MIN as f64 || t >= 9223372036854775808.0 {
-        i64::MIN
-    } else {
-        t as i64
-    }
+    crate::types::c_cast::f64_to_i64(x)
 }
 
 /// `(epicsInt32)x` where the value is already known to be in `epicsUInt32`

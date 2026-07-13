@@ -1273,14 +1273,16 @@ pub fn transmission(mat: &FilterMaterial, energy_kev: f64, thickness_cm: f64) ->
 /// Measured against the shipped Chantler table, C's version is +0.7% to +3.5% off
 /// at ordinary energies and +7.4% just below a Pb absorption edge.
 ///
-/// Returns `0.0` when the energy is outside the tabulated range, as C does
-/// (`:637-639`, `return 0.`) — see CBUG-B4 for what the caller makes of that.
-pub fn other_absorption_length_um(mat: &FilterMaterial, energy_kev: f64) -> f64 {
-    match interpolate_mu(mat, energy_kev) {
-        // C pf4.st:644-645 — absLen = 1/(matdensity[i]*mu), cm -> microns.
-        Some(mu) => (1.0 / (mat.density * mu)) * 1.0e4,
-        None => 0.0,
-    }
+/// **DEVIATION from C, deliberate — CBUG-B4.** `None` means *no absorption data
+/// at this energy*, and it is a distinct value from any absorption length. C
+/// returns `0.` for it (`:637-639`), which `RecalcFilters` (`:696`) then feeds
+/// to `exp(-x*1000./absLen)` = `exp(-inf)` = `0.0` — reporting the blade as
+/// perfectly opaque, silently. `0.` is C's "no data" sentinel and its only
+/// consumer is a divisor that cannot tell it from a real length. See
+/// [`crate::snl::pf4::calc_blade_transmission`] for what the port does instead.
+pub fn other_absorption_length_um(mat: &FilterMaterial, energy_kev: f64) -> Option<f64> {
+    // C pf4.st:644-645 — absLen = 1/(matdensity[i]*mu), cm -> microns.
+    interpolate_mu(mat, energy_kev).map(|mu| (1.0 / (mat.density * mu)) * 1.0e4)
 }
 
 #[cfg(test)]
@@ -1336,7 +1338,7 @@ mod tests {
         let mo = find_material("Mo").unwrap();
         let mu = interpolate_mu(mo, 20.0).expect("20 keV is in range for Mo");
         let expected = (1.0 / (10.22_f64 * mu)) * 1.0e4;
-        assert_eq!(other_absorption_length_um(mo, 20.0), expected);
+        assert_eq!(other_absorption_length_um(mo, 20.0), Some(expected));
         // The pre-fix value (f32 density widened) is a *different* double.
         let f32_density = (1.0 / (10.22_f32 as f64 * mu)) * 1.0e4;
         assert_ne!(expected, f32_density);
@@ -1454,7 +1456,7 @@ mod tests {
         for (kev, mu) in [(8.0, 50.8490020989), (10.0, 215.521099278)] {
             // `mu` is the value C's own `calcTrans` produces at this energy.
             assert_close(
-                other_absorption_length_um(cu, kev),
+                other_absorption_length_um(cu, kev).unwrap(),
                 1.0e4 / (rho * mu),
                 "Cu absLen",
             );
@@ -1469,11 +1471,11 @@ mod tests {
     #[test]
     fn test_b1_other_absorption_length_below_the_first_node_is_out_of_range() {
         let cu = find_material("Cu").unwrap();
-        assert_eq!(other_absorption_length_um(cu, 0.001), 0.0);
-        assert_eq!(other_absorption_length_um(cu, 0.005), 0.0);
+        assert_eq!(other_absorption_length_um(cu, 0.001), None);
+        assert_eq!(other_absorption_length_um(cu, 0.005), None);
         assert_eq!(
             other_absorption_length_um(cu, (cu.kev[0] as f64) - 1e-9),
-            0.0
+            None
         );
     }
 
@@ -1488,19 +1490,19 @@ mod tests {
         let e = (cu.kev[n - 2] as f64 + cu.kev[n - 1] as f64) / 2.0;
         // `interpolate_mu`'s own C-verified top-bin value (0.0916539989412).
         assert_close(
-            other_absorption_length_um(cu, e),
+            other_absorption_length_um(cu, e).unwrap(),
             1.0e4 / (cu.density * 0.0916539989412),
             "Cu top-bin absLen",
         );
     }
 
+    /// CBUG-B4 — "no absorption data" is `None`, not the `0.` that C returns
+    /// (`pf4.st:637-639`) and then divides by. This test used to assert `0.0`.
     #[test]
-    fn test_other_absorption_length_at_or_above_the_last_node_is_zero() {
+    fn test_b4_no_data_is_none_not_a_zero_length() {
         let cu = find_material("Cu").unwrap();
         let n = cu.kev.len();
-        // C pf4.st:637-639 — `j >= numEntries` -> `return 0.`. What the CALLER
-        // does with that 0 is CBUG-B4; the 0 itself is C's and is kept here.
-        assert_eq!(other_absorption_length_um(cu, cu.kev[n - 1] as f64), 0.0);
-        assert_eq!(other_absorption_length_um(cu, 500.0), 0.0);
+        assert_eq!(other_absorption_length_um(cu, cu.kev[n - 1] as f64), None);
+        assert_eq!(other_absorption_length_um(cu, 500.0), None);
     }
 }

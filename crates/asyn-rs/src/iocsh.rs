@@ -147,6 +147,25 @@ fn raw_from_escaped(src: &str) -> Vec<u8> {
     out
 }
 
+/// The I/O deadline every asyn *shell* command puts on the `asynUser` it
+/// builds: C sets `pasynUser->timeout = 2` in `asynSetOption`
+/// (asynShellCommands.c:119), `asynSetEos` (:239) and `asynShowEos` (:288),
+/// rather than leaving the default. One constant so the shell commands cannot
+/// drift apart again.
+const SHELL_IO_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The `asynUser` C's `asynSetEos` builds (asynShellCommands.c:239-241).
+///
+/// Two fields matter and both come from C: the 2 s I/O deadline
+/// ([`SHELL_IO_TIMEOUT`]) and `ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED`, which
+/// is what lets an `st.cmd` set a line's EOS before the device is powered on.
+/// No queue-wait deadline: C passes `queueRequest(..., 0.0)` (:244).
+fn shell_eos_user() -> AsynUser {
+    AsynUser::default()
+        .with_timeout(SHELL_IO_TIMEOUT)
+        .queue_even_if_not_connected()
+}
+
 /// Shared body of `asynOctetSetInputEos` / `asynOctetSetOutputEos`.
 ///
 /// C parity: `asynShellCommands.c::asynSetEos` escape-decodes the `eos`
@@ -172,17 +191,11 @@ fn asyn_set_eos(
     let eos = raw_from_escaped(&arg_str(args, 2).unwrap_or_default());
     match mgr.find_port_handle(&port) {
         Ok(handle) => {
-            // The shell's own user — no queue-wait deadline: `QUEUE_TIMEOUT` is
-            // asynRecord's, and every other C caller passes
-            // `queueRequest(..., 0.0)`. (`_addr` stays unused here, as before.)
-            //
-            // C `asynSetEos` queues at `asynQueuePriorityConnect` carrying
-            // `ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED` (asynShellCommands.c:240,
-            // :245) so an `st.cmd` can set a line's EOS before the device is
-            // powered on. This is the *shell* command; the record's IEOS/OEOS put
-            // is queued at Low priority with no waiver (asynRecord.c:1296) and
-            // stays refused on a disconnected port.
-            let user = crate::user::AsynUser::default().queue_even_if_not_connected();
+            // The shell's own user ([`shell_eos_user`]). This is the *shell*
+            // command; the record's IEOS/OEOS put is queued at Low priority with
+            // no waiver (asynRecord.c:1296) and stays refused on a disconnected
+            // port. (`_addr` stays unused here, as before.)
+            let user = shell_eos_user();
             let res = if set_input {
                 handle.set_input_eos_blocking(user, &eos)
             } else {
@@ -323,7 +336,7 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                 // not powered on yet.
                 let user = AsynUser::default()
                     .with_addr(addr)
-                    .with_timeout(Duration::from_secs(2))
+                    .with_timeout(SHELL_IO_TIMEOUT)
                     .queue_even_if_not_connected();
                 match mgr_r.find_port_handle(&port) {
                     Ok(handle) => match handle.set_option_blocking(user, &key, &value) {
@@ -1125,6 +1138,36 @@ mod tests {
         // ordinary input (C `goto input`).
         assert_eq!(raw_from_escaped(r"\xg"), vec![b'g']);
         assert!(raw_from_escaped("").is_empty());
+    }
+
+    /// The EOS shell commands hand their `asynUser` C's 2 s I/O deadline.
+    ///
+    /// C `asynSetEos` sets `pasynUser->timeout = 2` (asynShellCommands.c:239)
+    /// before queueing the `setEos` callback, and `asynShowEos` (:288) and
+    /// `asynSetOption` (:119) do the same — the shell never leaves this field at
+    /// the default. Rust's EOS handler built its user with the 1 s default while
+    /// its `asynSetOption` sibling already set 2 s; [`SHELL_IO_TIMEOUT`] is now
+    /// the single owner of the value, so the two cannot disagree again.
+    #[test]
+    fn the_eos_shell_commands_carry_cs_two_second_io_timeout() {
+        let user = shell_eos_user();
+        assert_eq!(
+            user.timeout,
+            Duration::from_secs(2),
+            "C asynSetEos sets pasynUser->timeout = 2 (asynShellCommands.c:239)"
+        );
+        // The other half C sets on the same user, kept under the same test so a
+        // future edit cannot drop the waiver while preserving the timeout.
+        assert_eq!(
+            user.reason,
+            crate::user::ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED,
+            "C asynSetEos stamps ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED \
+             (asynShellCommands.c:241)"
+        );
+        assert_eq!(
+            user.timeout, SHELL_IO_TIMEOUT,
+            "the EOS user takes its deadline from the shared shell constant"
+        );
     }
 
     /// `asynOctetSetInputEos` / `asynOctetSetOutputEos` escape-decode their

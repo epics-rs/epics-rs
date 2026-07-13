@@ -1426,6 +1426,19 @@ impl OptionQueue {
 /// EOS strings, whichever one was written.
 const EOS_READBACK_FIELDS: &[&str] = &["IEOS", "OEOS"];
 
+/// Did an `asynCallbackSpecial` body run? See [`AsynRecord::special_callback`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SpecialRan {
+    /// The queued request ran — C's switch falls out to `monitorStatus`
+    /// (asynRecord.c:897), including from an arm's error `break` and from
+    /// `setOption`'s "No asynOption interface" return.
+    Yes,
+    /// The request never left the queue, so `asynCallbackSpecial` never ran at
+    /// all: C dispatches `queueTimeoutCallbackSpecial` instead (:929-938), which
+    /// reports the timeout and frees the user without touching `monitorStatus`.
+    No,
+}
+
 /// C `monitorStatus`'s trace half (asynRecord.c:1066-1124), sampled once: the
 /// three masks, the I/O truncate size, and C's "another thread re-pointed the
 /// trace file" verdict.
@@ -2644,14 +2657,24 @@ impl AsynRecord {
     /// record severity. The port invented `"set_option({key}): {e}"`, which
     /// also prefixed the Rust status debug onto the driver text.
     fn write_option(&mut self, key: &str, value: &str) {
+        let (key, value) = (key.to_string(), value.to_string());
+        self.special_callback(|this| this.write_option_body(&key, &value));
+    }
+
+    /// The `setOption` arm of C's `asynCallbackSpecial` (asynRecord.c:843-849).
+    /// Its tail — `monitorStatus` — is [`Self::special_callback`]'s.
+    fn write_option_body(&mut self, key: &str, value: &str) -> SpecialRan {
         let Some(entry) = self.port_entry.clone() else {
-            return;
+            // No port: `special()` never queued the callback, so nothing ran.
+            return SpecialRan::No;
         };
         // C setOption (asynRecord.c:1766-1771): a port with no asynOption
-        // interface takes the same refusal as a missing I/O interface.
+        // interface takes the same refusal as a missing I/O interface. The
+        // `return` is out of `setOption`, not out of `asynCallbackSpecial` — the
+        // status repost still happens.
         if !self.port_has(crate::interfaces::InterfaceType::Option) {
             self.report_no_interface("asynOption");
-            return;
+            return SpecialRan::Yes;
         }
         // C `special()` queues every option put at `asynQueuePriorityLow` — with
         // one exception it calls out by name: HOSTINFO goes at
@@ -2674,7 +2697,7 @@ impl AsynRecord {
             // port never made.
             if e.is_queue_timeout() {
                 self.report_special_queue_timeout();
-                return;
+                return SpecialRan::No;
             }
             self.errs = format!("Error setting option, {}", e.message());
         }
@@ -2685,6 +2708,36 @@ impl AsynRecord {
         // disconnected driver reads the new host:port back off it.
         self.read_options_from_driver(&entry.handle, queue);
         self.post_if_new(&before);
+        SpecialRan::Yes
+    }
+
+    /// Whether an `asynCallbackSpecial` body actually ran, which is what decides
+    /// whether C's tail runs — see [`Self::special_callback`].
+    ///
+    /// C `asynCallbackSpecial` (asynRecord.c:788-900) is a switch whose every arm
+    /// falls out to one `monitorStatus` (:897). An arm's error `break` (:862,
+    /// :872, :886) leaves the *switch*, not the function, and `setOption`'s "No
+    /// asynOption interface" `return` (:1767-1771) leaves `setOption`, not the
+    /// callback — so a failed option write, a failed EOS write and a failed
+    /// connect all repost status. The only path that does not is a request that
+    /// never left the queue: `queueTimeoutCallbackSpecial` (:929-938) is a
+    /// different callback entirely and calls no `monitorStatus`.
+    ///
+    /// Run the body of an `asynCallbackSpecial` and then C's tail: `monitorStatus`
+    /// (asynRecord.c:897), POST_IF_NEW'd over [`MONITOR_STATUS_FIELDS`].
+    ///
+    /// The single owner of that tail. Every special callback goes through it, so
+    /// an arm cannot be written that quietly leaves CNCT / ENBL / AUCT / the trace
+    /// readbacks stale on the operator's screen — which is what the option, EOS
+    /// and CNCT arms each did (W10-D2). Most visibly on a *failed* CNCT put: the
+    /// field is snapped back to the wire's real state, and without the tail no
+    /// monitor fired, so the screen kept showing the value the operator typed.
+    fn special_callback(&mut self, body: impl FnOnce(&mut Self) -> SpecialRan) {
+        let before = self.field_snapshot(MONITOR_STATUS_FIELDS);
+        if body(self) == SpecialRan::Yes {
+            self.monitor_status();
+            self.post_if_new(&before);
+        }
     }
 
     /// C `resetError` (asynRecord.c:2050-2060): clear ERRS and post it if the
@@ -2851,13 +2904,20 @@ impl AsynRecord {
     /// `"Error setting output eos, %s"` / `"Error setting input eos, %s"` with
     /// `pasynUser->errorMessage` (asynRecord.c:1968-1983).
     fn write_eos(&mut self, output: bool) {
+        self.special_callback(|this| this.write_eos_body(output));
+    }
+
+    /// The `setEos` arm of C's `asynCallbackSpecial` (asynRecord.c:850-854). Its
+    /// tail — `monitorStatus` — is [`Self::special_callback`]'s.
+    fn write_eos_body(&mut self, output: bool) -> SpecialRan {
         let Some(entry) = self.port_entry.clone() else {
-            return;
+            return SpecialRan::No;
         };
-        // C setEos (asynRecord.c:1956-1961).
+        // C setEos (asynRecord.c:1956-1961). Same as `setOption`'s refusal: the
+        // return leaves `setEos`, and the callback's tail still runs.
         if !self.has_interface(InterfaceType::Octet) {
             self.report_no_interface(InterfaceType::Octet.c_asyn_name());
-            return;
+            return SpecialRan::Yes;
         }
         let field = if output { &self.oeos } else { &self.ieos };
         let bytes = translate_escape(field);
@@ -2875,7 +2935,7 @@ impl AsynRecord {
             // wrote nothing and runs no `getEos` fall-through (asynRecord.c:851-854).
             if e.is_queue_timeout() {
                 self.report_special_queue_timeout();
-                return;
+                return SpecialRan::No;
             }
             let which = if output { "output" } else { "input" };
             self.errs = format!("Error setting {which} eos, {}", e.message());
@@ -2883,6 +2943,7 @@ impl AsynRecord {
         let before = self.field_snapshot(EOS_READBACK_FIELDS);
         self.read_eos_from_driver(&entry.handle);
         self.post_if_new(&before);
+        SpecialRan::Yes
     }
 
     /// Refresh CNCT from the port's *transport* state — the single owner of
@@ -3032,11 +3093,22 @@ impl AsynRecord {
                 // `asynQueuePriorityConnect` carrying
                 // `ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED` (asynRecord.c:1277-1280),
                 // so a record attaching to a *down* serial or IP port still shows
-                // its BAUD/PRTY/HOSTINFO/… instead of "Unknown". C's asymmetry is
-                // deliberate and preserved: the EOS readback right below it is
-                // queued at Low priority with no waiver (:1296), so IEOS/OEOS do
-                // stay blank until the port connects.
+                // its BAUD/PRTY/HOSTINFO/… instead of "Unknown".
                 self.read_options_from_driver(&entry.handle, OptionQueue::EvenIfNotConnected);
+
+                // …and the EOS readback C queues right after it, gated on the port
+                // having asynOctet (`if(pasynRec->octetiv)`, asynRecord.c:1289-1300)
+                // — so a fresh record shows the EOS the *driver* holds instead of a
+                // blank IEOS/OEOS until someone happens to write one.
+                //
+                // C's asymmetry with the option readback above is deliberate and is
+                // preserved by the user this runs under: `callbackGetEos` is queued
+                // at `asynQueuePriorityLow` and never has its reason overwritten
+                // (`duplicateAsynUser` copies it, asynManager.c:1229), so it carries
+                // no waiver — on a *disconnected* port the queue gate refuses it
+                // (asynManager.c:1547-1552) and IEOS/OEOS stay blank, while the
+                // options still fill in.
+                self.read_eos_from_driver(&entry.handle);
 
                 // Attached to the port (C `connectDevice` sets PCNCT=1,
                 // asynRecord.c:1305).
@@ -4033,9 +4105,16 @@ impl Record for AsynRecord {
             // which left the driver's transport untouched: a CNCT=0 put
             // orphaned the record while the socket stayed open, and CNCT=1
             // could not bring a dropped link back up.
-            "CNCT" => {
-                let want = self.cnct != 0;
-                match self.port_entry {
+            // CNCT — the `callbackConnect` arm (asynRecord.c:857-889). Its tail is
+            // C's own: `monitorStatus` re-reads CNCT from `isConnected`
+            // (:1089-1093), so a refused or failed request snaps the field back to
+            // the wire's real state — *and posts it*, which is the half that was
+            // missing (W10-D2). Without the post the snap-back was invisible: the
+            // operator's screen kept showing the value they typed at a port that
+            // had refused it.
+            "CNCT" => self.special_callback(|this| {
+                let want = this.cnct != 0;
+                match this.port_entry {
                     Some(ref entry) => {
                         let handle = entry.handle.clone();
                         match handle.is_connected_blocking() {
@@ -4050,25 +4129,23 @@ impl Record for AsynRecord {
                                     _ => None,
                                 };
                                 if let Some((what, Err(e))) = res {
-                                    self.errs =
+                                    this.errs =
                                         format!("asynCallbackSpecial callbackConnect {what}: {e}");
                                 }
                             }
                             Err(e) => {
-                                self.errs = format!("asynCallbackSpecial isConnected error: {e}");
+                                this.errs = format!("asynCallbackSpecial isConnected error: {e}");
                             }
                         }
                     }
                     None => {
-                        self.errs = "asynCallbackSpecial isConnected error".to_string();
+                        this.errs = "asynCallbackSpecial isConnected error".to_string();
                     }
                 }
-                // C monitorStatus re-reads CNCT from isConnected right after
-                // (asynRecord.c:1089-1093), so a refused or failed request
-                // snaps the field back to the wire's real state instead of
-                // leaving the operator's value latched.
-                self.refresh_connected_state();
-            }
+                // Every one of those paths — including each error `break` — falls
+                // out of C's switch into `monitorStatus` (:897).
+                SpecialRan::Yes
+            }),
 
             // PCNCT — attach / detach *this record* to the port. C
             // asynRecord.c:519-527: `connectDevice` on 1;
@@ -4122,15 +4199,16 @@ impl Record for AsynRecord {
             // screen; it also re-imports the trace / enable / auto-connect /
             // connect readbacks, which is why the whole [`MONITOR_STATUS_FIELDS`]
             // set is what gets POST_IF_NEW'd here and not just DRVINFO.
-            "REASON" => {
-                self.resolved_reason = self.reason as usize;
-                let before = self.field_snapshot(MONITOR_STATUS_FIELDS);
-                self.drvinfo.clear();
-                self.cancel_io_interrupt_scan();
-                self.publish_io_intr_binding();
-                self.monitor_status();
-                self.post_if_new(&before);
-            }
+            "REASON" => self.special_callback(|this| {
+                this.resolved_reason = this.reason as usize;
+                this.drvinfo.clear();
+                this.cancel_io_interrupt_scan();
+                this.publish_io_intr_binding();
+                // C calls `monitorStatus` from `special()` itself here (:491)
+                // rather than from a callback tail, but it is the same statement
+                // over the same field set — so it is the same owner.
+                SpecialRan::Yes
+            }),
 
             // --- Serial options ---
             //
@@ -8799,6 +8877,128 @@ mod tests {
             rec.errs, "asynDrvUser not supported but drvInfo not blank",
             "C reportError text (asynRecord.c:1264-1265)"
         );
+    }
+
+    /// W10-D3: `connectDevice` reads the EOS back from the driver.
+    ///
+    /// C queues a `callbackGetEos` whenever the port has asynOctet
+    /// (asynRecord.c:1289-1300), right after the option readback, so a fresh
+    /// record shows the EOS the *driver* holds. The port queued only the option
+    /// readback, so IEOS/OEOS stayed blank until an operator wrote one — a record
+    /// on a port whose driver was configured with `asynOctetSetInputEos` in
+    /// st.cmd showed nothing.
+    ///
+    /// C's asymmetry with the option readback is real and is asserted here too:
+    /// `callbackGetEos` is queued at `asynQueuePriorityLow` with no
+    /// `ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED` (:1296), so on a *disconnected*
+    /// port the queue gate refuses it (asynManager.c:1547-1552) and the fields
+    /// stay blank, while the option readback — which does carry the waiver
+    /// (:1277-1280) — still fills in.
+    #[test]
+    fn connect_device_reads_the_eos_back_from_the_driver() {
+        use crate::port::{PortDriver, PortDriverBase, PortFlags};
+        use crate::runtime::{RuntimeConfig, create_port_runtime};
+
+        struct EosPort(PortDriverBase);
+        impl PortDriver for EosPort {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+            fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
+                crate::interfaces::octet_transport_capabilities()
+            }
+        }
+
+        for (port_name, connected) in [("w10_d3_eos_up", true), ("w10_d3_eos_down", false)] {
+            let mut base = PortDriverBase::new(port_name, 1, PortFlags::default());
+            // The driver already holds an EOS — st.cmd's `asynOctetSetInputEos`.
+            base.input_eos = b"\r\n".to_vec();
+            base.output_eos = b"\n".to_vec();
+            base.auto_connect = false;
+            base.init_connected(connected);
+            let (rt, jh) = create_port_runtime(EosPort(base), RuntimeConfig::default());
+            std::mem::forget(jh);
+            register_port(
+                port_name,
+                rt.port_handle().clone(),
+                Arc::new(TraceManager::new()),
+            );
+            std::mem::forget(rt);
+
+            let mut rec = AsynRecord::default();
+            rec.port = port_name.to_string();
+            rec.connect_device().unwrap();
+
+            if connected {
+                assert_eq!(
+                    rec.ieos, "\\r\\n",
+                    "connectDevice queues callbackGetEos (asynRecord.c:1289-1300)"
+                );
+                assert_eq!(rec.oeos, "\\n");
+            } else {
+                // The Low-priority readback carries no waiver: C's gate refuses it.
+                assert_eq!(
+                    rec.ieos, "",
+                    "a disconnected port's EOS readback is refused (asynRecord.c:1296)"
+                );
+                assert_eq!(rec.oeos, "");
+            }
+        }
+    }
+
+    /// W10-D2: every `asynCallbackSpecial` arm ends in `monitorStatus`
+    /// (asynRecord.c:897) — the option, EOS and CNCT arms too, not just REASON.
+    ///
+    /// `monitorStatus` re-imports the status readbacks from the port and
+    /// POST_IF_NEWs them: ENBL from `isEnabled` (:1094-1097), AUCT from
+    /// `isAutoConnect` (:1084-1088), CNCT from `isConnected` (:1089-1093). The
+    /// arms ran only their own narrow readback (option fields, EOS fields, CNCT
+    /// alone), so a port whose state moved underneath the record kept showing the
+    /// stale value — and after a *failed* CNCT put the snap-back fired no monitor,
+    /// leaving the operator's screen on the value they typed.
+    ///
+    /// Each arm is checked against a port that was disabled and disconnected
+    /// behind the record's back, so a missing `monitorStatus` is visible as a
+    /// stale ENBL/CNCT.
+    #[test]
+    fn every_special_callback_arm_ends_in_monitor_status() {
+        for (field, port_name) in [
+            ("BAUD", "w10_d2_option"),
+            ("IEOS", "w10_d2_eos"),
+            ("CNCT", "w10_d2_cnct"),
+        ] {
+            register_octet_transport(port_name);
+
+            let mut rec = AsynRecord::default();
+            rec.port = port_name.to_string();
+            rec.connect_device().unwrap();
+            assert_eq!(rec.enbl, 1, "{field}: the port starts enabled");
+            assert_eq!(rec.cnct, 1, "{field}: …and connected");
+
+            // The port moves underneath the record — another IOC thread, an
+            // `asynEnable` from the shell, a link that dropped. Nothing has told
+            // the record.
+            let handle = rec.port_entry.as_ref().unwrap().handle.clone();
+            handle.disconnect_blocking().unwrap();
+            handle.set_enable_blocking(false).unwrap();
+
+            // Now the operator puts the field. Whatever the arm does with it, C's
+            // callback ends in `monitorStatus`.
+            rec.special(field, true).unwrap();
+
+            assert_eq!(
+                rec.enbl, 0,
+                "{field}: monitorStatus re-imports ENBL from isEnabled \
+                 (asynRecord.c:1094-1097) at the tail of every arm (:897)"
+            );
+            assert_eq!(
+                rec.cnct, 0,
+                "{field}: …and CNCT from isConnected (asynRecord.c:1089-1093)"
+            );
+        }
     }
 
     /// R11-C8: a REASON put blanks DRVINFO — and that is what makes the put

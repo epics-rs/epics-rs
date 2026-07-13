@@ -236,7 +236,7 @@ impl DrvVxi11Port {
                 destructible: true,
             },
         );
-        base.connected = false;
+        base.init_connected(false);
         base.auto_connect = !no_auto_connect;
         Ok(Self { base, config })
     }

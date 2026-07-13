@@ -15,6 +15,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use std::any::Any;
@@ -130,13 +131,56 @@ impl Default for PortFlags {
 /// serializes interpose modifications with I/O dispatch — no additional
 /// synchronization is needed. **Callers must never modify the interpose stack
 /// without holding the port lock.**
+/// Where a port's `connected` truth lives.
+///
+/// `Own` — the port opens and closes its own link (every driver that dials out:
+/// IP, serial, USB-TMC, VXI-11, …), so its own cell is the truth.
+///
+/// `Shared` — the link belongs to another object and this port merely serves it.
+/// C models the case with a real child port whose `connectIt`/`closeConnection`
+/// the *owner* drives (`drvAsynIPServerPort.c:357-367` — the listener calls
+/// `pasynCommonSyncIO->connectDevice` on the child the moment it hands it a
+/// socket). Sharing the owner's cell is the same thing without the round trip,
+/// and it is what makes "the owner holds a live socket, the port says
+/// disconnected" unrepresentable rather than merely unlikely.
+#[derive(Debug, Clone)]
+enum Connection {
+    Own(bool),
+    Shared(Arc<AtomicBool>),
+}
+
+impl Connection {
+    fn get(&self) -> bool {
+        match self {
+            Connection::Own(c) => *c,
+            Connection::Shared(cell) => cell.load(Ordering::Acquire),
+        }
+    }
+}
+
 pub struct PortDriverBase {
     pub port_name: String,
     pub max_addr: usize,
     pub flags: PortFlags,
     pub params: ParamList,
     pub interrupts: InterruptManager,
-    pub connected: bool,
+    /// Whether the port's transport is up — read it with [`Self::is_connected`],
+    /// move it with [`Self::set_connected`].
+    ///
+    /// It is not a plain `bool` because not every port *owns* its link. An
+    /// IP-server child port serves a socket that lives in the parent's
+    /// [`crate::drivers::ip_server_port::ClientSlot`]: the listener assigns and
+    /// clears it, and the child cannot see either edge. A cached copy therefore
+    /// went stale in exactly the way that matters — the slot held a live client
+    /// while the child port still said `asynDisconnected` and refused every
+    /// read and write, forever (R13-50). Such a port shares the owner's cell
+    /// instead of copying it, so that state cannot be constructed.
+    connected: Connection,
+    /// The last value fanned out to listeners. Memory for the edge detector in
+    /// [`Self::sync_connection_edge`], never an answer to "is the port up?" —
+    /// [`Self::is_connected`] is the only thing that answers that, and it reads
+    /// the truth.
+    last_announced: bool,
     pub enabled: bool,
     pub auto_connect: bool,
     /// `defunct` — set by [`Self::shutdown_lifecycle`] when a
@@ -188,7 +232,8 @@ impl PortDriverBase {
             flags,
             params: ParamList::new(max_addr, flags.multi_device),
             interrupts: InterruptManager::new(256),
-            connected: true,
+            connected: Connection::Own(true),
+            last_announced: true,
             enabled: true,
             auto_connect: true,
             defunct: false,
@@ -217,9 +262,33 @@ impl PortDriverBase {
         }
     }
 
-    /// Query whether the port is connected.
+    /// Query whether the port is connected — the truth, wherever it lives.
     pub fn is_connected(&self) -> bool {
-        self.connected
+        self.connected.get()
+    }
+
+    /// The port's initial connection state, set while it is being constructed and
+    /// before it can have a listener. Not a transition: no exception fan-out, no
+    /// retry timer, no `lastConnectDisconnect` stamp. Every *transition* after
+    /// construction goes through [`Self::set_connected`].
+    ///
+    /// A port whose link is owned elsewhere has no initial state of its own to
+    /// set — the owner's cell already holds it — so this is a no-op there rather
+    /// than a silent overwrite of the owner's truth.
+    pub fn init_connected(&mut self, connected: bool) {
+        if let Connection::Own(c) = &mut self.connected {
+            *c = connected;
+            self.last_announced = connected;
+        }
+    }
+
+    /// Bind this port's connection to a cell owned by another object, making that
+    /// cell the port's truth from now on — see [`Connection::Shared`]. Called at
+    /// construction by a port that serves someone else's link (the IP-server
+    /// child port and its `ClientSlot`).
+    pub(crate) fn share_connection(&mut self, cell: Arc<AtomicBool>) {
+        self.last_announced = cell.load(Ordering::Acquire);
+        self.connected = Connection::Shared(cell);
     }
 
     /// Single owner-API for the port-level `connected` transition.
@@ -228,18 +297,43 @@ impl PortDriverBase {
     /// `exceptionDisconnect` (:2174-2185) fire
     /// `asynExceptionConnect` only when the state actually changes.
     /// All driver code that toggles connection state MUST go through
-    /// this helper — directly assigning `base.connected = ...`
-    /// followed by `announce_exception(Connect, -1)` bypasses the
-    /// edge guard and fans spurious duplicates out to listeners
-    /// (CA gateway shadow tasks, asynRecord, monitor relays).
+    /// this helper — the `connected` cell is private precisely so that a driver
+    /// cannot assign it and then hand-roll an `announce_exception(Connect, -1)`,
+    /// which bypasses the edge guard and fans spurious duplicates out to
+    /// listeners (CA gateway shadow tasks, asynRecord, monitor relays).
+    ///
+    /// On a port whose link is owned elsewhere ([`Connection::Shared`]) the write
+    /// is not this port's to make — the owner already moved the truth — so the
+    /// call reduces to publishing whatever edge that produced.
     ///
     /// Returns `true` if the state actually changed (a fan-out
     /// happened); `false` if the call was a no-op.
     pub fn set_connected(&mut self, connected: bool) -> bool {
-        if self.connected == connected {
+        if let Connection::Own(c) = &mut self.connected {
+            *c = connected;
+        }
+        self.sync_connection_edge()
+    }
+
+    /// Publish the port's connection edge if the truth has moved since the last
+    /// fan-out: the single owner of `exceptionConnect`/`exceptionDisconnect`
+    /// (asynManager.c:2151-2185), of the interpose stack's connection reset and of
+    /// the retry timer.
+    ///
+    /// [`Self::set_connected`] is one caller. The other is the actor, on a port
+    /// whose link is owned elsewhere: the owner (an IP-server listener assigning a
+    /// slot) moves the truth without this port's actor running, and C fans that
+    /// edge out from the owner's thread — `pasynCommonSyncIO->connectDevice` on
+    /// the child (drvAsynIPServerPort.c:357-367). Here it is published when the
+    /// child's actor next touches the port, which is the moment it can matter.
+    ///
+    /// Returns `true` if an edge was published.
+    pub fn sync_connection_edge(&mut self) -> bool {
+        let connected = self.connected.get();
+        if self.last_announced == connected {
             return false;
         }
-        self.connected = connected;
+        self.last_announced = connected;
         if !connected {
             // C `exceptionDisconnect` stamps `lastConnectDisconnect` on
             // every disconnect (asynManager.c:2184) so the auto-reconnect
@@ -492,7 +586,7 @@ impl PortDriverBase {
     /// (defunct => permanently disabled) otherwise.
     pub fn check_ready(&self) -> AsynResult<()> {
         self.check_enabled()?;
-        if !self.connected {
+        if !self.is_connected() {
             return Err(AsynError::Status {
                 status: AsynStatus::Disconnected,
                 message: format!("port {} is disconnected", self.port_name),
@@ -1086,7 +1180,7 @@ pub trait PortDriver: Send + Sync + 'static {
         eprintln!("Port: {}", base.port_name);
         eprintln!(
             "  connected: {}, max_addr: {}, params: {}, options: {}",
-            base.connected,
+            base.is_connected(),
             base.max_addr,
             base.params.len(),
             base.options.len()
@@ -1678,11 +1772,11 @@ mod tests {
     fn test_connect_disconnect() {
         let mut drv = TestDriver::new();
         let user = AsynUser::default();
-        assert!(drv.base().connected);
+        assert!(drv.base().is_connected());
         drv.disconnect(&user).unwrap();
-        assert!(!drv.base().connected);
+        assert!(!drv.base().is_connected());
         drv.connect(&user).unwrap();
-        assert!(drv.base().connected);
+        assert!(drv.base().is_connected());
     }
 
     #[test]

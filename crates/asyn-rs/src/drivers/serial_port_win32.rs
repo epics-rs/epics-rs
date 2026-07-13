@@ -387,7 +387,7 @@ impl DrvAsynSerialPort {
                 destructible: true,
             },
         );
-        base.connected = false;
+        base.init_connected(false);
         base.auto_connect = true;
 
         Ok(Self {
@@ -593,7 +593,7 @@ impl PortDriver for DrvAsynSerialPort {
         eprintln!(
             "Serial line {}: {}",
             self.config.device,
-            if self.base.connected {
+            if self.base.is_connected() {
                 "Connected"
             } else {
                 "Disconnected"
@@ -619,7 +619,7 @@ impl PortDriver for DrvAsynSerialPort {
         {
             Ok(r) => r,
             Err(e) => {
-                if e.is_fatal_transport() && self.base.connected {
+                if e.is_fatal_transport() && self.base.is_connected() {
                     asyn_trace!(
                         Some(self.base.trace),
                         &self.base.port_name,
@@ -657,7 +657,7 @@ impl PortDriver for DrvAsynSerialPort {
         {
             Ok(n) => Ok(n),
             Err(e) => {
-                if e.is_fatal_transport() && self.base.connected {
+                if e.is_fatal_transport() && self.base.is_connected() {
                     asyn_trace!(
                         Some(self.base.trace),
                         &self.base.port_name,
@@ -965,7 +965,7 @@ impl PortDriver for DrvAsynSerialPort {
 impl Drop for DrvAsynSerialPort {
     fn drop(&mut self) {
         let user = AsynUser::default();
-        if self.base.connected {
+        if self.base.is_connected() {
             let _ = self.disconnect(&user);
         }
     }

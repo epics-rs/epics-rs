@@ -206,7 +206,7 @@ impl DrvAsynUsbtmcPort {
                 destructible: true,
             },
         );
-        base.connected = false;
+        base.init_connected(false);
         base.auto_connect = !config.no_auto_connect();
         Ok(Self {
             base,

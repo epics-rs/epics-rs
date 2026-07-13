@@ -58,6 +58,7 @@ use std::time::Duration;
 use parking_lot::Mutex;
 
 use crate::drivers::ip_port::{is_nonfatal_read_timeout, maxchars_zero_error, socket_poll_timeout};
+use crate::drivers::option_parse::parse_yn_option;
 use crate::error::{AsynError, AsynResult, AsynStatus};
 use crate::exception::AsynException;
 use crate::interpose::{EomReason, OctetReadResult};
@@ -266,6 +267,23 @@ impl SlotFailure {
 pub struct ClientSlot {
     stream: Mutex<Option<TcpStream>>,
     peer: Mutex<Option<SocketAddr>>,
+    /// The slot's occupancy, and — because the child port shares this very cell
+    /// ([`PortDriverBase::share_connection`]) — the child port's `connected` flag.
+    /// They are one bit, so "the slot holds a live client while `parent:N` reports
+    /// `asynDisconnected`" cannot be constructed (R13-50).
+    ///
+    /// C reaches the same invariant by message: on slot reuse the listener sets
+    /// `pl->fd = clientFd` and calls `pasynCommonSyncIO->connectDevice(pl->pasynUser)`
+    /// on the child (drvAsynIPServerPort.c:357-367), and it is the child's own
+    /// `isConnected` that the listener's free-slot scan then reads (:342-350).
+    /// Assignment and connectivity are not allowed to disagree in C either.
+    occupied: Arc<AtomicBool>,
+    /// C `tty->disconnectOnReadTimeout` on this slot's child port
+    /// (drvAsynIPPort.c:924-935, set through `asynSetOption`). It lives on the
+    /// slot, not on a client, because C's child port outlives the connections it
+    /// serves: the option a startup script sets on `srv:0` still holds for the
+    /// next client that lands in slot 0.
+    disconnect_on_read_timeout: AtomicBool,
 }
 
 impl ClientSlot {
@@ -273,21 +291,43 @@ impl ClientSlot {
         Self {
             stream: Mutex::new(None),
             peer: Mutex::new(None),
+            occupied: Arc::new(AtomicBool::new(false)),
+            disconnect_on_read_timeout: AtomicBool::new(false),
         }
     }
 
+    /// C `tty->disconnectOnReadTimeout` for this slot's child port.
+    fn set_disconnect_on_read_timeout(&self, yes: bool) {
+        self.disconnect_on_read_timeout
+            .store(yes, Ordering::Release);
+    }
+
+    fn disconnect_on_read_timeout(&self) -> bool {
+        self.disconnect_on_read_timeout.load(Ordering::Acquire)
+    }
+
     fn is_occupied(&self) -> bool {
-        self.stream.lock().is_some()
+        self.occupied.load(Ordering::Acquire)
+    }
+
+    /// The cell the child port binds its `connected` flag to.
+    fn connection_cell(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.occupied)
     }
 
     fn assign(&self, stream: TcpStream, peer: SocketAddr) {
         *self.stream.lock() = Some(stream);
         *self.peer.lock() = Some(peer);
+        // Publish last: the socket and the peer are in place before any observer
+        // (the child port's actor, the parent's free-slot scan) can see the slot
+        // as occupied.
+        self.occupied.store(true, Ordering::Release);
     }
 
     fn clear(&self) {
         *self.stream.lock() = None;
         *self.peer.lock() = None;
+        self.occupied.store(false, Ordering::Release);
     }
 
     fn peer_addr(&self) -> Option<SocketAddr> {
@@ -356,7 +396,7 @@ impl ClientSlot {
                 }))
             }
             Ok(n) => Ok(n),
-            Err(e) => Err(self.classify_io_error(e, device, "read")),
+            Err(e) => Err(self.classify_read_error(e, device, timeout)),
         }
     }
 
@@ -382,16 +422,51 @@ impl ClientSlot {
         }
     }
 
-    /// C's `should_disconnect` for a slot's socket error, and the teardown it
-    /// implies, as one value — the branch that closes the socket is the branch
-    /// that reports `asynError` (drvAsynIPPort.c:797-806, :694-698). The
-    /// non-fatal set is [`is_nonfatal_read_timeout`], shared with the IP client
-    /// port; C excludes exactly `SOCK_EWOULDBLOCK` and `SOCK_EINTR` on both the
-    /// read (:798-800) and the write (:661) side.
+    /// C's `should_disconnect` for a failed *read* on a slot, both disjuncts
+    /// (drvAsynIPPort.c:797-799):
     ///
-    /// (C's other `should_disconnect` disjunct — `disconnectOnReadTimeout` — is
-    /// an option of the child `drvAsynIPPort` that this port does not model, so
-    /// a timeout never tears a slot down here.)
+    /// ```c
+    /// int should_disconnect = (((tty->disconnectOnReadTimeout) && (pasynUser->timeout > 0)) ||
+    ///                          ((SOCKERRNO != SOCK_EWOULDBLOCK) && (SOCKERRNO != SOCK_EINTR)));
+    /// ```
+    ///
+    /// The second disjunct is the fatal-errno rule ([`is_nonfatal_read_timeout`],
+    /// shared with the IP client port). The first is the per-child-port option
+    /// `disconnectOnReadTimeout`: with it on, a read that merely *times out* tears
+    /// the connection down — a live-looking socket whose peer has gone silent
+    /// stops holding a slot the server needs. C's child here is a real
+    /// `drvAsynIPPort` (drvAsynIPServerPort.c:690), so `asynSetOption("srv:0", 0,
+    /// "disconnectOnReadTimeout", "Y")` reaches exactly this statement (W10-D5).
+    ///
+    /// A zero-timeout request is a *poll*, not a wait, and C exempts it
+    /// (`pasynUser->timeout > 0`): expiring a 1 ms socket poll must not kill a
+    /// healthy client.
+    fn classify_read_error(
+        &self,
+        e: std::io::Error,
+        device: &str,
+        timeout: Duration,
+    ) -> SlotFailure {
+        if is_nonfatal_read_timeout(e.kind())
+            && !(self.disconnect_on_read_timeout() && timeout > Duration::ZERO)
+        {
+            return SlotFailure::kept(AsynError::Status {
+                status: AsynStatus::Timeout,
+                message: "read timeout".to_string(),
+            });
+        }
+        self.clear();
+        SlotFailure::closed(AsynError::Status {
+            status: AsynStatus::Error,
+            message: format!("{device} read error: {e}"),
+        })
+    }
+
+    /// C's `should_disconnect` for a failed *write* (drvAsynIPPort.c:694-698):
+    /// the fatal-errno disjunct only — `writeIt` has no `disconnectOnReadTimeout`
+    /// term, it retries `EWOULDBLOCK`/`EINTR` (:661-672) and reports
+    /// `asynTimeout` with the socket intact. The branch that closes the socket is
+    /// the branch that reports `asynError`.
     fn classify_io_error(&self, e: std::io::Error, device: &str, what: &str) -> SlotFailure {
         if is_nonfatal_read_timeout(e.kind()) {
             return SlotFailure::kept(AsynError::Status {
@@ -536,7 +611,7 @@ impl DrvAsynIPServerPort {
                 destructible: true,
             },
         );
-        base.connected = false;
+        base.init_connected(false);
         base.auto_connect = true;
         let mut slots = Vec::with_capacity(max);
         for _ in 0..max {
@@ -886,7 +961,7 @@ impl PortDriver for DrvAsynIPServerPort {
     }
 
     fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {
-        let already_up = self.base.connected
+        let already_up = self.base.is_connected()
             && (self.listener.lock().is_some() || self.udp_socket.lock().is_some());
         if already_up {
             return Ok(());
@@ -1257,7 +1332,14 @@ impl DrvAsynIPSubport {
                 destructible: true,
             },
         );
-        base.connected = slot.is_occupied();
+        // The child does not own its link — the slot does, and the parent's accept
+        // loop assigns and clears it without this port's actor ever running. Bind
+        // `connected` to the slot's own cell rather than caching a copy of it, so
+        // a reused slot cannot leave the child stuck at `asynDisconnected`
+        // (R13-50). C keeps the same two facts in agreement by having the listener
+        // call `connectDevice` on the child the moment it hands it the socket
+        // (drvAsynIPServerPort.c:357-367).
+        base.share_connection(slot.connection_cell());
         base.auto_connect = false; // C uses noAutoConnect=1 for the child ports
         Self { base, slot }
     }
@@ -1302,16 +1384,50 @@ impl PortDriver for DrvAsynIPSubport {
     }
 
     fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {
-        // Passive sync — child port's connection is driven by the
-        // parent's accept loop, not by an outbound dial.
-        self.base.set_connected(self.slot.is_occupied());
-        if !self.base.connected {
+        // The child has no link of its own to dial: its socket is the slot's, and
+        // the parent's accept loop is what puts one there. C's child `connectIt`
+        // is likewise driven by the listener (`connectDevice`,
+        // drvAsynIPServerPort.c:357-367) and does no dialling either. So this
+        // publishes the slot's state — it cannot change it.
+        self.base.sync_connection_edge();
+        if !self.base.is_connected() {
             return Err(AsynError::Status {
                 status: AsynStatus::Disconnected,
                 message: "no client assigned to this subport slot yet".into(),
             });
         }
         Ok(())
+    }
+
+    /// C's child port is a full `drvAsynIPPort` (drvAsynIPServerPort.c:690), so
+    /// `asynSetOption("<parent>:<n>", 0, "disconnectOnReadTimeout", "Y")` lands in
+    /// `drvAsynIPPort::setOption` (:924-935), which accepts only `"Y"`/`"N"`
+    /// (case-insensitive) and errors on anything else. The option then arms the
+    /// first disjunct of `readIt`'s `should_disconnect` (:797-799) — see
+    /// [`ClientSlot::classify_read_error`].
+    ///
+    /// The other key C's `setOption` takes, `hostInfo`, re-dials an outbound
+    /// connection; an accepted socket has nothing to re-dial, so it is not
+    /// modelled here.
+    fn set_option(&mut self, _user: &mut AsynUser, key: &str, value: &str) -> AsynResult<()> {
+        if key.eq_ignore_ascii_case("disconnectOnReadTimeout") {
+            let yes = parse_yn_option("disconnectOnReadTimeout", value)?;
+            self.slot.set_disconnect_on_read_timeout(yes);
+            return Ok(());
+        }
+        Err(AsynError::OptionNotFound(key.to_string()))
+    }
+
+    fn get_option(&self, key: &str) -> AsynResult<String> {
+        if key.eq_ignore_ascii_case("disconnectOnReadTimeout") {
+            // C prints the flag as "Y"/"N" (drvAsynIPPort.c:906-910).
+            return Ok(if self.slot.disconnect_on_read_timeout() {
+                "Y".to_string()
+            } else {
+                "N".to_string()
+            });
+        }
+        Err(AsynError::OptionNotFound(key.to_string()))
     }
 
     fn disconnect(&mut self, _user: &AsynUser) -> AsynResult<()> {
@@ -1655,6 +1771,169 @@ mod tests {
             .accept_one()
             .expect("the freed slot must accept the next client");
         assert_eq!(idx2, 0);
+
+        srv.disconnect(&AsynUser::default()).unwrap();
+    }
+
+    /// W10-D5: the child port honours `disconnectOnReadTimeout`.
+    ///
+    /// C serves each accepted connection with a full `drvAsynIPPort`
+    /// (drvAsynIPServerPort.c:690), so `asynSetOption("<parent>:<n>", 0,
+    /// "disconnectOnReadTimeout", "Y")` reaches `drvAsynIPPort::setOption`
+    /// (:924-935) and arms the *first* disjunct of `readIt`'s `should_disconnect`
+    /// (:797-799): a read that merely times out closes the connection. The port
+    /// modelled only the second (fatal-errno) disjunct, so a silent peer held its
+    /// slot forever and the server could not reclaim it.
+    ///
+    /// C's `pasynUser->timeout > 0` term is checked too: a zero-timeout *poll*
+    /// must not kill a healthy client.
+    #[test]
+    fn the_child_port_honours_disconnect_on_read_timeout() {
+        let mut config = IpServerConfig::parse("127.0.0.1:0 TCP").unwrap();
+        config.max_clients = 1;
+        let mut srv = DrvAsynIPServerPort::with_config("srv_drto", config).unwrap();
+        srv.connect(&AsynUser::default()).unwrap();
+        let port = srv.local_port();
+        let mut child = srv.make_subport(0).unwrap();
+
+        // Default is off (C `tty->disconnectOnReadTimeout` is 0 unless set): a
+        // silent peer times out and keeps its slot.
+        let _client = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        assert_eq!(srv.accept_one().unwrap(), 0);
+        let user = AsynUser::default().with_timeout(Duration::from_millis(50));
+        let mut buf = [0u8; 64];
+        let err = child.read_octet(&user, &mut buf).unwrap_err();
+        assert_eq!(err.status(), AsynStatus::Timeout, "got {err:?}");
+        assert!(
+            srv.slots[0].is_occupied(),
+            "with the option off a read timeout leaves the socket intact (C :810-811)"
+        );
+
+        // asynSetOption("srv_drto:0", 0, "disconnectOnReadTimeout", "Y").
+        let mut opt_user = AsynUser::default();
+        child
+            .set_option(&mut opt_user, "disconnectOnReadTimeout", "Y")
+            .unwrap();
+        assert_eq!(child.get_option("disconnectOnReadTimeout").unwrap(), "Y");
+
+        // A zero-timeout poll is exempt (C's `pasynUser->timeout > 0`).
+        let poll_user = AsynUser::default().with_timeout(Duration::ZERO);
+        let err = child.read_octet(&poll_user, &mut buf).unwrap_err();
+        assert_eq!(err.status(), AsynStatus::Timeout, "got {err:?}");
+        assert!(
+            srv.slots[0].is_occupied(),
+            "a zero-timeout poll is not a read timeout C tears down on (:797)"
+        );
+
+        // …but a real timed read now closes the connection, and C reports that
+        // branch as asynError, never as a retryable asynTimeout (:801-805).
+        let err = child.read_octet(&user, &mut buf).unwrap_err();
+        assert_eq!(err.status(), AsynStatus::Error, "got {err:?}");
+        assert!(
+            !srv.slots[0].is_occupied(),
+            "disconnectOnReadTimeout=Y frees the slot on a read timeout \
+             (drvAsynIPPort.c:797-799, first disjunct)"
+        );
+        assert!(!child.base().is_connected());
+
+        // The freed slot takes the next client (the point of the option).
+        let _client2 = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        assert_eq!(srv.accept_one().unwrap(), 0);
+        assert!(child.base().is_connected());
+        // …and the option survives the slot reuse, as C's child port does.
+        assert_eq!(child.get_option("disconnectOnReadTimeout").unwrap(), "Y");
+
+        srv.disconnect(&AsynUser::default()).unwrap();
+    }
+
+    /// R13-50: a reused slot must revive the child subport.
+    ///
+    /// C's listener does it explicitly: when the free-slot scan hands slot `i` to
+    /// a new client it sets `pl->fd = clientFd` and calls
+    /// `pasynCommonSyncIO->connectDevice(pl->pasynUser)` on the child port
+    /// (drvAsynIPServerPort.c:357-367), which drives the child's `connectIt` and
+    /// its `exceptionConnect`. It has to: the child's own `isConnected` is what
+    /// the *next* free-slot scan reads (:342-350), so C cannot leave a child
+    /// disconnected while its slot holds a live socket.
+    ///
+    /// The port cached the child's `connected` in its own `PortDriverBase`, which
+    /// only the child's actor could write and which the parent's accept loop never
+    /// reached. Any teardown — EOF, and after R11-C9 any fatal errno — latched it
+    /// false, and since the child is `noAutoConnect` nothing ever set it back: the
+    /// next client accepted into that slot was served by a port that refused every
+    /// read and write with `asynDisconnected`, forever, over a live socket.
+    #[test]
+    fn a_reused_client_slot_revives_the_child_subport() {
+        use socket2::{Domain, Socket, Type};
+
+        let mut config = IpServerConfig::parse("127.0.0.1:0 TCP").unwrap();
+        config.max_clients = 1;
+        let mut srv = DrvAsynIPServerPort::with_config("slot_revive", config).unwrap();
+        srv.connect(&AsynUser::default()).unwrap();
+        let port = srv.local_port();
+        let mut child = srv.make_subport(0).unwrap();
+
+        // First client, killed with an RST so the read tears the slot down through
+        // the fatal-errno path (C drvAsynIPPort.c:797-806).
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let victim = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+        victim.connect(&addr.into()).unwrap();
+        assert_eq!(srv.accept_one().unwrap(), 0);
+        // An explicit connect on the child for the *first* client — C's
+        // `connectDevice`, and the only route by which a cached flag could ever
+        // have become true. Handing it to the first client isolates the defect to
+        // the *reuse*: the second client gets no extra call here, exactly as in C,
+        // where the listener's own `connectDevice` on assignment is all there is.
+        child.connect(&AsynUser::default()).unwrap();
+        assert!(
+            child.base().is_connected(),
+            "the child serves the new client"
+        );
+
+        victim.set_linger(Some(Duration::ZERO)).unwrap();
+        drop(victim); // RST
+        std::thread::sleep(Duration::from_millis(50));
+
+        let read_user = AsynUser::default().with_timeout(Duration::from_millis(200));
+        let mut buf = [0u8; 64];
+        let err = child
+            .read_octet(&read_user, &mut buf)
+            .expect_err("a reset peer cannot deliver bytes");
+        assert_eq!(err.status(), AsynStatus::Error, "got {err:?}");
+        assert!(
+            !child.base().is_connected(),
+            "the child's own read tore the slot down (C closeConnection + exceptionDisconnect)"
+        );
+        assert!(!srv.slots[0].is_occupied());
+
+        // The next client takes the freed slot. C connects the child on assignment,
+        // so the child must serve it — the socket is live and the port must say so.
+        let mut client2 = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        assert_eq!(srv.accept_one().unwrap(), 0);
+        assert!(
+            child.base().is_connected(),
+            "a reused slot revives the child: C calls connectDevice on it \
+             (drvAsynIPServerPort.c:357-367)"
+        );
+
+        // …and the revival is real I/O, not just a flag: the child must talk to the
+        // new client over the slot's socket.
+        let mut write_user = AsynUser::default();
+        child
+            .write_octet(&mut write_user, b"hello\n")
+            .expect("the revived child must write to the new client's socket");
+        let mut got = [0u8; 6];
+        client2
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        client2.read_exact(&mut got).unwrap();
+        assert_eq!(&got, b"hello\n");
+
+        client2.write_all(b"world\n").unwrap();
+        let n = child
+            .read_octet(&read_user, &mut buf)
+            .expect("the revived child must read from the new client's socket");
+        assert_eq!(&buf[..n], b"world\n");
 
         srv.disconnect(&AsynUser::default()).unwrap();
     }

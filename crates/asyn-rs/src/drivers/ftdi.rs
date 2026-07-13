@@ -146,7 +146,7 @@ impl DrvAsynFtdiPort {
                 destructible: true,
             },
         );
-        base.connected = false;
+        base.init_connected(false);
         base.auto_connect = !no_auto_connect;
         // C drvAsynFTDIPort.cpp:622-623: install asynInterposeEos by default
         // (empty terminator until setInputEos/OEOS), suppressed by

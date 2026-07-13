@@ -278,11 +278,15 @@ impl AsyncDbHandle {
     pub async fn put_link_notify(
         &self,
         record_name: &str,
+        link_field: &str,
         link_str: &str,
         value: EpicsValue,
     ) -> Option<crate::runtime::sync::oneshot::Receiver<()>> {
         match self.db() {
-            Some(db) => db.put_link_notify(record_name, link_str, value).await,
+            Some(db) => {
+                db.put_link_notify(record_name, link_field, link_str, value)
+                    .await
+            }
             None => None,
         }
     }
@@ -396,10 +400,21 @@ fn ext_time_pair((secs, ns, utag): (i64, i32, u64)) -> (std::time::SystemTime, u
 /// * `ACKS` — `DBE_VALUE`, only when `stat_mask != 0` and `recGblResetAlarms`
 ///   raised it.
 ///
-/// The single owner of these masks: every process cycle that commits alarms —
-/// the full value-publication epilogue and the `CompleteAlarmOnly` cycle that
-/// skips it (transform IVLA="Do Nothing") — posts through this, so the two
-/// cannot drift.
+/// NOT the single owner of these masks, despite an earlier comment here that
+/// claimed so. Two of the five `recGblResetAlarms` post sites call this helper
+/// — the synchronous process epilogue (`process_record_with_links_inner`) and
+/// the `CompleteAlarmOnly` cycle that skips that epilogue (transform
+/// IVLA="Do Nothing"). The other three still open-code the identical mask
+/// arithmetic and can therefore drift from it:
+///
+/// * `complete_async_record_inner` — the async-completion epilogue;
+/// * `sim_process_tail` — the SIMM-mode input tail;
+/// * `RecordInstance::process_local` — the foreign-process / QSRV-group path.
+///
+/// (The SDIS-disable post in `process_record_with_links_inner` and the
+/// fanout/seq SELN post in `links::apply_selm_alarm` are NOT clients: they
+/// carry C's `dbAccess.c:586-593` and `fanoutRecord.c:116` masks, not
+/// `recGblResetAlarms`'.)
 fn alarm_field_posts(
     common: &crate::server::record::CommonFields,
     alarm_result: &crate::server::recgbl::AlarmResetResult,
@@ -985,14 +1000,15 @@ impl PvDatabase {
     pub async fn put_link_notify(
         &self,
         record_name: &str,
+        link_field: &str,
         link_str: &str,
         value: EpicsValue,
     ) -> Option<crate::runtime::sync::oneshot::Receiver<()>> {
+        let rec = {
+            let records = self.inner.records.read().await;
+            records.get(record_name)?.clone()
+        };
         let (src_putf, src_alarm) = {
-            let rec = {
-                let records = self.inner.records.read().await;
-                records.get(record_name)?.clone()
-            };
             let instance = rec.read().await;
             (
                 instance.common.putf,
@@ -1011,13 +1027,18 @@ impl PvDatabase {
             // does (`process_record_with_links_inner` inserts its own name).
             let mut visited = HashSet::new();
             visited.insert(record_name.to_string());
+            // Through the put owner: C `dbPutLinkAsync` raises the source's
+            // LINK_ALARM/INVALID on a failed put exactly as the synchronous
+            // `dbPutLink` does (dbLink.c:469-471).
             self.write_out_link_value(
+                &rec,
                 &parsed,
                 value,
                 super::links::OutLinkSrc {
                     putf: src_putf,
                     notify: Some(&waitset),
                     alarm: &src_alarm,
+                    field: link_field,
                 },
                 &mut visited,
                 0,
@@ -2079,15 +2100,7 @@ impl PvDatabase {
         let asub_dynamic = self.resolve_asub_dynamic_subroutine(&rec).await;
 
         // 2. Lock record, apply INP/DOL, process, evaluate alarms, build snapshot
-        let (
-            snapshot,
-            out_info,
-            flnk_name,
-            process_actions,
-            alarm_posts,
-            result_is_defer_output,
-            sim_skip_out,
-        ) = 'epilogue: {
+        let (snapshot, flnk_name, process_actions, alarm_posts, result_is_defer_output) = 'epilogue: {
             let mut instance = rec.write().await;
 
             // Apply DOL value for output records (OMSL=CLOSED_LOOP)
@@ -2778,10 +2791,9 @@ impl PvDatabase {
                 );
             }
 
-            // Transfer nsta/nsev -> sevr/stat, detect alarm change
-            let alarm_result = crate::server::recgbl::rec_gbl_reset_alarms(&mut instance.common);
-
-            // Apply timestamp based on TSE
+            // Apply timestamp based on TSE. BEFORE the output stage: C
+            // `aoRecord.c:190` stamps the record before `writeValue` "so it
+            // will be up to date if any downstream records fetch it via TSEL".
             apply_timestamp(&mut instance.common, is_soft);
             // NOTE: UDF was already updated before `evaluate_alarms`
             // above — keyed on `value_is_undefined()` so a NaN result
@@ -2798,18 +2810,22 @@ impl PvDatabase {
             // value fields are NOT posted and their last-posted trackers stay
             // put (C leaves `LA..LP` un-updated), so the next publishing cycle
             // re-detects the change.
+            //
+            // This is C's OTHER `recGblResetAlarms` call site — the record
+            // body's own, not `monitor()`'s — and the cycle performs no output,
+            // so the commit happens here and the path returns.
             if result_is_alarm_only {
+                let alarm_result =
+                    crate::server::recgbl::rec_gbl_reset_alarms(&mut instance.common);
                 let alarm_posts = alarm_field_posts(&instance.common, &alarm_result);
                 break 'epilogue (
                     crate::server::record::ProcessSnapshot {
                         changed_fields: Vec::new(),
                     },
                     None,
-                    None,
                     Vec::new(),
                     alarm_posts,
                     false,
-                    true,
                 );
             }
 
@@ -3012,10 +3028,18 @@ impl PvDatabase {
                             // No async support -- fall back to synchronous write
                             if let Err(e) = dev.write(&mut *instance.record) {
                                 eprintln!("device write error on {}: {e}", instance.name);
-                                instance.common.stat =
-                                    crate::server::recgbl::alarm_status::WRITE_ALARM;
-                                instance.common.sevr =
-                                    crate::server::record::AlarmSeverity::Invalid;
+                                // C device support raises the write failure
+                                // through `recGblSetSevr` (a PENDING alarm),
+                                // and `process()`'s `monitor()` commits it in
+                                // the same cycle — the commit now follows this
+                                // output stage, so the pending raise is what
+                                // reaches SEVR/STAT (a direct `stat`/`sevr`
+                                // poke would be overwritten by the commit).
+                                crate::server::recgbl::rec_gbl_set_sevr(
+                                    &mut instance.common,
+                                    crate::server::recgbl::alarm_status::WRITE_ALARM,
+                                    crate::server::record::AlarmSeverity::Invalid,
+                                );
                             } else {
                                 // OOPT 7.0.8: notify the record so it can
                                 // latch transition state (e.g. longout.pval)
@@ -3025,14 +3049,89 @@ impl PvDatabase {
                         }
                         Err(e) => {
                             eprintln!("device write_begin error on {}: {e}", instance.name);
-                            instance.common.stat = crate::server::recgbl::alarm_status::WRITE_ALARM;
-                            instance.common.sevr = crate::server::record::AlarmSeverity::Invalid;
+                            crate::server::recgbl::rec_gbl_set_sevr(
+                                &mut instance.common,
+                                crate::server::recgbl::alarm_status::WRITE_ALARM,
+                                crate::server::record::AlarmSeverity::Invalid,
+                            );
                         }
                     }
                     instance.device = Some(dev);
                 }
                 None
             };
+
+            // C `process()` runs every output of the cycle BEFORE `monitor()`,
+            // and `monitor()` is where `recGblResetAlarms` commits the cycle's
+            // alarm (aoRecord.c:196-232 → aoRecord.c `monitor`). A failed
+            // `dbPutLink` raises LINK_ALARM/INVALID from INSIDE the put
+            // (`setLinkAlarm`, dbLink.c:434-448) — so the write alarm must land
+            // in THIS cycle's committed SEVR and this cycle's monitor posts,
+            // not the next one. Every link-carried output of the cycle
+            // therefore runs here, before the commit below:
+            //
+            //   * the soft OUT link (`out_info`),
+            //   * the record's multi-output pairs (scalcout / acalcout OUT),
+            //   * the SIMM SIOL redirect,
+            //   * the record's own `WriteDbLink` actions (transform OUTn,
+            //     scaler COUTP, throttle OUT — C writes them before
+            //     `monitor()`/`recGblFwdLink` too).
+            //
+            // The record's write gate is released across the writes (a
+            // self/cyclic OUT link would otherwise dead-lock on the
+            // non-reentrant gate, exactly as the FLNK tail already runs
+            // unlocked) and re-acquired for the commit. The put owner raises
+            // the LINK_ALARM on the record itself, so nothing has to be
+            // threaded back here.
+            let (link_writes, deferred_actions): (Vec<_>, Vec<_>) =
+                process_actions.into_iter().partition(|a| {
+                    matches!(
+                        a,
+                        crate::server::record::ProcessAction::WriteDbLink { .. }
+                            | crate::server::record::ProcessAction::WriteDbLinkNotify { .. }
+                    )
+                });
+            let process_actions = deferred_actions;
+            {
+                // PUTF / put-notify wait-set / source alarm for every write of
+                // this cycle. C `dbDbPutValue` (dbDbLink.c:382-383) inherits
+                // the source's PENDING alarm (`psrce->nsta/nsev/namsg`) — this
+                // is the point in the cycle C reads them, before the commit.
+                let src_putf = instance.common.putf;
+                let src_notify = instance.notify.clone();
+                let src_alarm = super::links::LinkAlarm {
+                    stat: instance.common.nsta,
+                    sevr: instance.common.nsev,
+                    amsg: instance.common.namsg.clone(),
+                };
+                drop(instance);
+                let src = super::links::OutLinkSrc {
+                    putf: src_putf,
+                    notify: src_notify.as_ref(),
+                    alarm: &src_alarm,
+                    field: "OUT",
+                };
+                if let Some((ref link, ref out_val)) = out_info {
+                    self.write_out_link_value(&rec, link, out_val.clone(), src, visited, depth)
+                        .await;
+                    // OOPT 7.0.8: latch the record's post-output state so the
+                    // next cycle's `should_output` sees the right pval.
+                    let mut inst = rec.write().await;
+                    inst.record.on_output_complete();
+                }
+                self.dispatch_multi_output_values(&rec, src, visited, depth)
+                    .await;
+                self.write_simulated_output_siol(&rec, &sim_output, skip_out)
+                    .await;
+                self.execute_process_actions(name, &rec, link_writes, visited, depth)
+                    .await;
+                instance = rec.write().await;
+            }
+
+            // C `monitor()`: `recGblResetAlarms` transfers nsta/nsev ->
+            // sevr/stat and detects the alarm change — AFTER every output of
+            // the cycle, so a failed put's LINK_ALARM is committed here.
+            let alarm_result = crate::server::recgbl::rec_gbl_reset_alarms(&mut instance.common);
 
             // Compute per-field posting masks (after OUT stage so async
             // writes don't update MLST/ALST prematurely before returning
@@ -3120,18 +3219,13 @@ impl PvDatabase {
             // below. The `CompleteAlarmOnly` break above uses the same helper,
             // so the alarm-post masks have a single owner.
             let alarm_posts = alarm_field_posts(&instance.common, &alarm_result);
-            // UDF rides along whenever any monitored post fired this
-            // cycle, carrying the union of the cycle's posted classes.
-            let cycle_mask = changed_fields
-                .iter()
-                .fold(EventMask::NONE, |m, (_, _, fm)| m | *fm);
-            if !cycle_mask.is_empty() {
-                changed_fields.push((
-                    "UDF".to_string(),
-                    EpicsValue::Char(if instance.common.udf { 1 } else { 0 }),
-                    cycle_mask,
-                ));
-            }
+            // NO `.UDF` post. C `monitor()` never posts UDF, and neither does
+            // `recGblResetAlarms` (recGbl.c:204-216 posts SEVR/STAT/AMSG/ACKS
+            // only): `db_post_events(..., &prec->udf, ...)` appears nowhere in
+            // EPICS base or the modules. UDF reaches a `.UDF` subscriber only
+            // through the generic put path (C `dbPut` posts the field it
+            // wrote, dbAccess.c:1420-1430) — a processing cycle that redefines
+            // VAL emits no `.UDF` event.
             let snapshot = crate::server::record::ProcessSnapshot { changed_fields };
 
             let flnk_name = if instance.record.should_fire_forward_link() {
@@ -3156,12 +3250,10 @@ impl PvDatabase {
 
             (
                 snapshot,
-                out_info,
                 flnk_name,
                 process_actions,
                 alarm_posts,
                 result_is_defer_output,
-                skip_out,
             )
         };
 
@@ -3213,86 +3305,14 @@ impl PvDatabase {
 
         // Snapshot source PUTF + put-notify wait-set for the C
         // `processTarget` / `dbNotifyAdd` invariants (see
-        // `write_db_link_value` doc). Captured once here so every OUT /
-        // multi-OUT / FLNK dispatch in this cycle propagates the same
-        // bit and joins the same wait-set. The committed alarm is
-        // captured the same way for `recGblInheritSevrMsg` MS-class
-        // propagation into the OUT-link target.
-        let (src_putf, src_notify, src_alarm) = {
+        // `write_db_link_value` doc), for the FLNK tail below. The cycle's
+        // value-carrying writes already ran pre-commit (they must, so a failed
+        // put's LINK_ALARM lands in this cycle's alarm — see the output stage
+        // above); this is the forward-link half.
+        let (src_putf, src_notify) = {
             let guard = rec.read().await;
-            (
-                guard.common.putf,
-                guard.notify.clone(),
-                super::links::LinkAlarm {
-                    stat: guard.common.stat,
-                    sevr: guard.common.sevr,
-                    amsg: guard.common.amsg.clone(),
-                },
-            )
+            (guard.common.putf, guard.notify.clone())
         };
-
-        // 4. OUT link — DB *or* external `ca://`/`pva://`. C
-        // `dbLink.c::dbPutLink` (dbLink.c:434-448) routes every link
-        // write through the link set's `putValue`, so the OUTPUT side
-        // dispatches by scheme exactly as the INPUT side does (B
-        // `resolve_external_pv`). An external link with no registered
-        // lset fails gracefully inside `write_out_link_value`.
-        if let Some((ref link, ref out_val)) = out_info {
-            self.write_out_link_value(
-                link,
-                out_val.clone(),
-                super::links::OutLinkSrc {
-                    putf: src_putf,
-                    notify: src_notify.as_ref(),
-                    alarm: &src_alarm,
-                },
-                visited,
-                depth,
-            )
-            .await;
-            // OOPT 7.0.8: latch the record's post-output state so the
-            // next cycle's `should_output` sees the right pval.
-            {
-                let mut instance = rec.write().await;
-                instance.record.on_output_complete();
-            }
-        }
-
-        // Simulated OUTPUT record: apply the SIOL redirect. C `writeValue` does
-        // `dbPutLink(&prec->siol, ..., &prec->oval)` before `recGblFwdLink`, so
-        // it runs here — after the OUT-link write point, before the forward-link
-        // tail below. `out_info` is `None` for a simulated record (the device /
-        // soft-OUT write was suppressed above), so this is the record's single
-        // output this cycle. The read-of-OVAL + write lives in a dedicated
-        // helper so the `EpicsValue` it materialises stays out of this giant
-        // function's async state (which is polled MAX_LINK_DEPTH-deep on a FLNK
-        // chain — see the depth-limit tests).
-        self.write_simulated_output_siol(&rec, &sim_output, sim_skip_out)
-            .await;
-
-        // 7b. C record support performs a record's OUT/link writes BEFORE
-        // its forward link: `transformRecord` calls `dbPutLink()`
-        // (transformRecord.c:608-619) before `monitor()` +
-        // `recGblFwdLink()`, `scalerRecord` writes COUT/COUTP
-        // (scalerRecord.c:457-480) before its FLNK block, `throttleRecord`
-        // writes the selected OUT link (throttleRecord.c:562-580) before
-        // `recGblFwdLink()`, and `tableRecord` drives speed/drive links
-        // (tableRecord.c:573-597) before its final FLNK. The
-        // `ProcessAction::WriteDbLink` contract is documented as "before
-        // FLNK", so split the requested actions: link writes run now;
-        // delayed/reprocess and device-command actions (whose timing must
-        // stay after the FLNK tail) run afterward. A downstream FLNK
-        // target therefore reads the freshly written value, matching C.
-        let (link_writes, deferred_actions): (Vec<_>, Vec<_>) =
-            process_actions.into_iter().partition(|a| {
-                matches!(
-                    a,
-                    crate::server::record::ProcessAction::WriteDbLink { .. }
-                        | crate::server::record::ProcessAction::WriteDbLinkNotify { .. }
-                )
-            });
-        self.execute_process_actions(name, &rec, link_writes, visited, depth)
-            .await;
 
         // 4.5 - 7. Multi-output / event / generic-multi-out / FLNK /
         // CP / RPRO tail. Shared with the simulation-mode path so a
@@ -3322,8 +3342,12 @@ impl PvDatabase {
         // 8. Execute the deferred ProcessActions after the FLNK tail:
         // `ReprocessAfter` schedules a later reprocess (the current
         // cycle's FLNK must proceed first) and `DeviceCommand` posts its
-        // own monitors after this cycle's snapshot.
-        self.execute_process_actions(name, &rec, deferred_actions, visited, depth)
+        // own monitors after this cycle's snapshot. The record's link writes
+        // are NOT here — they ran pre-commit with the rest of the cycle's
+        // output (C `transformRecord.c:608-619` / `scalerRecord.c:457-480`
+        // put before `monitor()` + `recGblFwdLink()`), so a downstream FLNK
+        // target still reads the freshly written value.
+        self.execute_process_actions(name, &rec, process_actions, visited, depth)
             .await;
 
         // 9. C `recGbl.c::recGblFwdLink:302` clears `putf = FALSE` at the
@@ -3435,127 +3459,11 @@ impl PvDatabase {
         // 4.55. event record: post the named software event.
         self.dispatch_event_record(rec).await;
 
-        // 4.6. Generic multi-output links (scalcout / acalcout OUT->OVAL).
-        // Only scalcout + acalcout implement `Record::multi_output_links`
-        // (the trait default is empty), so they are the only record types
-        // that reach this dispatch.
-        //
-        // SINGLE-OWNER INVARIANT: a record type whose link groups are
-        // dispatched by `dispatch_multi_output` (§4.5 above) MUST be
-        // skipped here — otherwise its `LNKn`/`OUTn` would be written
-        // twice per cycle. `sseq` previously also implemented the
-        // `Record::multi_output_links` trait method, so this block
-        // re-dispatched every selected `LNKn` after §4.5 already drove
-        // it. The `multi_output_dispatch_owned` gate makes the
-        // double-dispatch structurally impossible — not just removed
-        // at the `SseqRecord` call site.
-        {
-            let multi_out = {
-                let instance = rec.read().await;
-                // Framework IVOA=Don't_drive veto for the multi-output OUT
-                // path, mirroring the single-OUT `skip_out` gate in the IVOA
-                // block: on an INVALID cycle with IVOA=Don't_drive the OUT
-                // write is suppressed. The parsed_out single-OUT path is
-                // already gated, but `multi_output_links` (scalcout/acalcout
-                // OUT) was not — so a non-calc-fail INVALID (INP LINK_ALARM,
-                // SIMM, NaN-VAL UDF, …) + Don't_drive wrote OUT where C
-                // suppresses (execOutput nsev>=INVALID → Don't_drive break,
-                // sCalcoutRecord.c:794). The record-level OOPT/calc-fail
-                // decision still gates via `multi_output_links()` itself; this
-                // is the framework IVOA layer on top, for every INVALID source.
-                let ivoa_dont_drive = instance.common.sevr
-                    == crate::server::record::AlarmSeverity::Invalid
-                    && matches!(
-                        instance.record.get_field("IVOA"),
-                        Some(EpicsValue::Short(1))
-                    );
-                let links = if ivoa_dont_drive
-                    || super::links::multi_output_dispatch_owned(instance.record.record_type())
-                {
-                    &[][..]
-                } else {
-                    instance.record.multi_output_links()
-                };
-                if links.is_empty() {
-                    None
-                } else {
-                    let mut pairs = Vec::new();
-                    for &(link_field, val_field) in links {
-                        let link_str = instance
-                            .record
-                            .get_field(link_field)
-                            .and_then(|v| {
-                                if let EpicsValue::String(s) = v {
-                                    Some(s)
-                                } else {
-                                    None
-                                }
-                            })
-                            .unwrap_or_default();
-                        if link_str.is_empty() {
-                            continue;
-                        }
-                        if let Some(val) = instance.record.get_field(val_field) {
-                            // Scalar companion for the target-nelm buffer
-                            // choice (devaCalcoutSoft.c:84-87) — resolved
-                            // per pair, applied after link parse below.
-                            let scalar = instance
-                                .record
-                                .multi_output_scalar_companion(link_field)
-                                .and_then(|f| instance.record.get_field(f));
-                            pairs.push((link_str, val, scalar));
-                        }
-                    }
-                    if pairs.is_empty() { None } else { Some(pairs) }
-                }
-            };
-            if let Some(pairs) = multi_out {
-                // Source committed alarm for `recGblInheritSevrMsg`
-                // MS-class propagation into each OUT-link target —
-                // captured once, same lifecycle as `src.putf`.
-                let src_alarm = {
-                    let guard = rec.read().await;
-                    super::links::LinkAlarm {
-                        stat: guard.common.stat,
-                        sevr: guard.common.sevr,
-                        amsg: guard.common.amsg.clone(),
-                    }
-                };
-                for (link_str, val, scalar) in pairs {
-                    // `multi_output_links` carries record OUT links
-                    // (sseq `LNKn`, scalcout `OUTn` — all `DBF_OUTLINK`)
-                    // driven via `dbPutLink` → `dbDbPutValue`
-                    // (`dbDbLink.c:388`): a bare DB link is NPP, the
-                    // value is written but the target is NOT processed.
-                    // `parse_output_link_v2` applies the
-                    // OUT-link-correct NPP default; `parse_link_v2` would
-                    // wrongly default a bare link to ProcessPassive and
-                    // re-process the target. An external `ca://`/`pva://`
-                    // OUT link is routed through the link set's
-                    // `putValue` (C `dbLink.c::dbPutLink`,
-                    // dbLink.c:434-448).
-                    let parsed = crate::server::record::parse_output_link_v2(
-                        link_str.as_str_lossy().as_ref(),
-                    );
-                    // Target-nelm buffer choice (devaCalcoutSoft.c:75-87):
-                    // a single-element destination gets the pair's scalar
-                    // companion instead of the array value.
-                    let val = self.multi_out_buffer_choice(&parsed, val, scalar).await;
-                    self.write_out_link_value(
-                        &parsed,
-                        val,
-                        super::links::OutLinkSrc {
-                            putf: src.putf,
-                            notify: src.notify,
-                            alarm: &src_alarm,
-                        },
-                        visited,
-                        depth,
-                    )
-                    .await;
-                }
-            }
-        }
+        // The generic multi-output OUT writes (scalcout / acalcout OUT->OVAL)
+        // are NOT part of this tail: C performs a record's output writes inside
+        // `process()` BEFORE `monitor()` commits the cycle's alarm, so they run
+        // pre-commit in `dispatch_multi_output_values` (see R14-62). This tail
+        // is C's `recGblFwdLink` equivalent only.
 
         // 5. FLNK -- only process if target is Passive (like C dbScanFwdLink).
         // FLNK goes through C `dbScanPassive` -> `processTarget`, which
@@ -3844,12 +3752,14 @@ impl PvDatabase {
                         link_str.as_str_lossy().as_ref(),
                     );
                     self.write_out_link_value(
+                        rec,
                         &parsed,
                         value,
                         super::links::OutLinkSrc {
                             putf: src_putf,
                             notify: src_notify.as_ref(),
                             alarm: &src_alarm,
+                            field: link_field,
                         },
                         visited,
                         depth,
@@ -3956,12 +3866,14 @@ impl PvDatabase {
                             link_str.as_str_lossy().as_ref(),
                         );
                         self.write_out_link_value(
+                            rec,
                             &parsed,
                             value,
                             super::links::OutLinkSrc {
                                 putf: src_putf,
                                 notify: Some(&waitset),
                                 alarm: &src_alarm,
+                                field: link_field,
                             },
                             visited,
                             depth,
@@ -4043,7 +3955,7 @@ impl PvDatabase {
             return Ok(()); // Cycle detected, skip
         }
 
-        let (snapshot, out_info, flnk_name, alarm_posts) = {
+        let (snapshot, flnk_name, alarm_posts) = {
             let mut instance = rec.write().await;
 
             // UDF update before alarm evaluation (C parity — see the
@@ -4091,10 +4003,127 @@ impl PvDatabase {
                 }
             }
 
-            let alarm_result = crate::server::recgbl::rec_gbl_reset_alarms(&mut instance.common);
-
+            // BEFORE the output stage — C `aoRecord.c:190` stamps the record
+            // ahead of `writeValue` so a downstream TSEL fetch sees this
+            // cycle's time.
             apply_timestamp(&mut instance.common, is_soft);
             // UDF was already updated before `evaluate_alarms` above.
+
+            // ---- Output stage. C `process()` performs the record's output
+            // BEFORE `monitor()`, and `monitor()` is where `recGblResetAlarms`
+            // commits the cycle's alarm — the async-completion re-entry runs
+            // that same `process()` body. A failed `dbPutLink` raises
+            // LINK_ALARM/INVALID inside the put (`setLinkAlarm`,
+            // dbLink.c:434-448), so the commit MUST follow the writes for the
+            // alarm to land in this cycle's SEVR and monitor posts.
+
+            // IVOA check — on the PENDING severity, which is what C's
+            // `writeValue` call site tests (`if (prec->nsev < INVALID_ALARM)`,
+            // aoRecord.c:196).
+            let skip_out = if instance.common.nsev == crate::server::record::AlarmSeverity::Invalid
+            {
+                let ivoa = instance
+                    .record
+                    .get_field("IVOA")
+                    .and_then(|v| {
+                        if let EpicsValue::Short(s) = v {
+                            Some(s)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0);
+                match ivoa {
+                    1 => true,
+                    2 => {
+                        // See the IVOA=2 comment in
+                        // `process_record_with_links_inner` — IVOA=2
+                        // delegates to the per-record
+                        // `apply_invalid_output_value` so OVAL/RVAL/VAL
+                        // get the C-convention values.
+                        if let Some(ivov) = instance.record.get_field("IVOV") {
+                            let _ = instance.record.apply_invalid_output_value(ivov);
+                        }
+                        false
+                    }
+                    _ => false,
+                }
+            } else {
+                false
+            };
+
+            // OEVT: queue the output event when the output fires — same
+            // IVOA-gated event-twin of the OUT write as
+            // `process_record_with_links_inner`.
+            if !skip_out {
+                if let Some(event_name) = instance.record.output_event() {
+                    let db = self.clone();
+                    crate::runtime::task::spawn(async move {
+                        db.post_event_named(&event_name).await;
+                    });
+                }
+            }
+
+            let can_dev_write = instance.record.can_device_write();
+            let is_soft_out =
+                instance.common.dtyp.is_empty() || instance.common.dtyp == "Soft Channel";
+            let record_should_output = instance.record.should_output();
+            let out_info = if skip_out {
+                None
+            } else if !can_dev_write {
+                // Non-output records (calcout, etc.) with soft OUT link
+                // (DB or external `ca://`/`pva://`).
+                if record_should_output && instance.parsed_out.is_writable_out_link() {
+                    let out_val = instance.record.output_link_value();
+                    out_val.map(|v| (instance.parsed_out.clone(), v))
+                } else {
+                    None
+                }
+            } else if is_soft_out {
+                if instance.parsed_out.is_writable_out_link() {
+                    let out_val = instance.record.output_link_value();
+                    out_val.map(|v| (instance.parsed_out.clone(), v))
+                } else {
+                    None
+                }
+            } else {
+                // Non-soft output: the async device write already completed
+                // (that's why we're in complete_async_record). Don't re-do
+                // write_begin -- it would start another async cycle.
+                None
+            };
+
+            {
+                // PUTF / put-notify wait-set / source PENDING alarm — the
+                // values C `dbDbPutValue` reads at the put (dbDbLink.c:382-383
+                // takes `psrce->nsta/nsev/namsg`). The write gate is released
+                // across the writes (a self/cyclic OUT link would dead-lock on
+                // the non-reentrant gate) and re-taken for the commit.
+                let src_putf = instance.common.putf;
+                let src_notify = instance.notify.clone();
+                let src_alarm = super::links::LinkAlarm {
+                    stat: instance.common.nsta,
+                    sevr: instance.common.nsev,
+                    amsg: instance.common.namsg.clone(),
+                };
+                drop(instance);
+                let src = super::links::OutLinkSrc {
+                    putf: src_putf,
+                    notify: src_notify.as_ref(),
+                    alarm: &src_alarm,
+                    field: "OUT",
+                };
+                if let Some((ref link, ref out_val)) = out_info {
+                    self.write_out_link_value(&rec, link, out_val.clone(), src, visited, depth)
+                        .await;
+                }
+                self.dispatch_multi_output_values(&rec, src, visited, depth)
+                    .await;
+                instance = rec.write().await;
+            }
+
+            // C `monitor()`: commit the cycle's alarm — after every output.
+            let alarm_result = crate::server::recgbl::rec_gbl_reset_alarms(&mut instance.common);
 
             // Clear PACT
             instance
@@ -4220,96 +4249,9 @@ impl PvDatabase {
                     changed_fields.push(("HASH".to_string(), h, EventMask::VALUE));
                 }
             }
-            // UDF rides along whenever any monitored post fired this
-            // cycle, carrying the union of the cycle's posted classes —
-            // same rule as the main process path.
-            let cycle_mask = changed_fields
-                .iter()
-                .fold(EventMask::NONE, |m, (_, _, fm)| m | *fm);
-            if !cycle_mask.is_empty() {
-                changed_fields.push((
-                    "UDF".to_string(),
-                    EpicsValue::Char(if instance.common.udf { 1 } else { 0 }),
-                    cycle_mask,
-                ));
-            }
+            // No `.UDF` post — see the main process path (C posts UDF from no
+            // monitor() and from no recGblResetAlarms).
             let snapshot = crate::server::record::ProcessSnapshot { changed_fields };
-
-            // IVOA check
-            let skip_out = if instance.common.sevr == crate::server::record::AlarmSeverity::Invalid
-            {
-                let ivoa = instance
-                    .record
-                    .get_field("IVOA")
-                    .and_then(|v| {
-                        if let EpicsValue::Short(s) = v {
-                            Some(s)
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or(0);
-                match ivoa {
-                    1 => true,
-                    2 => {
-                        // See the IVOA=2 comment in
-                        // `process_record_with_links_inner` — IVOA=2
-                        // delegates to the per-record
-                        // `apply_invalid_output_value` so OVAL/RVAL/VAL
-                        // get the C-convention values.
-                        if let Some(ivov) = instance.record.get_field("IVOV") {
-                            let _ = instance.record.apply_invalid_output_value(ivov);
-                        }
-                        false
-                    }
-                    _ => false,
-                }
-            } else {
-                false
-            };
-
-            // OEVT: queue the output event when the output fires — same
-            // IVOA-gated event-twin of the OUT write as
-            // `process_record_with_links_inner`. This is the async-completion
-            // path (`complete_async_record_inner`), where the §4.6
-            // multi-output OUT write also runs, so OEVT must post here too.
-            if !skip_out {
-                if let Some(event_name) = instance.record.output_event() {
-                    let db = self.clone();
-                    crate::runtime::task::spawn(async move {
-                        db.post_event_named(&event_name).await;
-                    });
-                }
-            }
-
-            let can_dev_write = instance.record.can_device_write();
-            let is_soft_out =
-                instance.common.dtyp.is_empty() || instance.common.dtyp == "Soft Channel";
-            let record_should_output = instance.record.should_output();
-            let out_info = if skip_out {
-                None
-            } else if !can_dev_write {
-                // Non-output records (calcout, etc.) with soft OUT link
-                // (DB or external `ca://`/`pva://`).
-                if record_should_output && instance.parsed_out.is_writable_out_link() {
-                    let out_val = instance.record.output_link_value();
-                    out_val.map(|v| (instance.parsed_out.clone(), v))
-                } else {
-                    None
-                }
-            } else if is_soft_out {
-                if instance.parsed_out.is_writable_out_link() {
-                    let out_val = instance.record.output_link_value();
-                    out_val.map(|v| (instance.parsed_out.clone(), v))
-                } else {
-                    None
-                }
-            } else {
-                // Non-soft output: the async device write already completed
-                // (that's why we're in complete_async_record). Don't re-do
-                // write_begin -- it would start another async cycle.
-                None
-            };
 
             let flnk_name = if instance.record.should_fire_forward_link() {
                 if let crate::server::record::ParsedLink::Db(ref l) = instance.parsed_flnk {
@@ -4321,7 +4263,7 @@ impl PvDatabase {
                 None
             };
 
-            (snapshot, out_info, flnk_name, alarm_posts)
+            (snapshot, flnk_name, alarm_posts)
         };
 
         // Notify subscribers
@@ -4342,40 +4284,19 @@ impl PvDatabase {
         // dbNotifyAdd propagation (see `write_db_link_value` doc). For the
         // async-completion path PUTF would have been set when the put
         // landed on the record; it (and wait-set membership) must
-        // propagate through the (now-completing) OUT / FLNK chain so an
-        // async target reached here also defers WRITE_NOTIFY completion.
-        // The committed alarm propagates the same way for
-        // `recGblInheritSevrMsg` MS-class inheritance.
-        let (src_putf, src_notify, src_alarm) = {
+        // propagate through the (now-completing) FLNK chain so an async
+        // target reached here also defers WRITE_NOTIFY completion.
+        let (src_putf, src_notify) = {
             let guard = rec.read().await;
-            (
-                guard.common.putf,
-                guard.notify.clone(),
-                super::links::LinkAlarm {
-                    stat: guard.common.stat,
-                    sevr: guard.common.sevr,
-                    amsg: guard.common.amsg.clone(),
-                },
-            )
+            (guard.common.putf, guard.notify.clone())
         };
 
-        // OUT link — DB *or* external `ca://`/`pva://`. Same scheme
-        // dispatch as the sync path (C `dbLink.c::dbPutLink`,
-        // dbLink.c:434-448).
-        if let Some((link, out_val)) = out_info {
-            self.write_out_link_value(
-                &link,
-                out_val,
-                super::links::OutLinkSrc {
-                    putf: src_putf,
-                    notify: src_notify.as_ref(),
-                    alarm: &src_alarm,
-                },
-                visited,
-                depth,
-            )
-            .await;
-        }
+        // The record's own OUT link and its generic multi-output pairs were
+        // written in the pre-commit output stage above — C `process()` runs
+        // `writeValue` before `monitor()`, and a failed `dbPutLink` must be
+        // able to raise LINK_ALARM into the alarm this cycle commits
+        // (dbLink.c:434-448). Only the fanout/seq dispatch and the FLNK tail
+        // remain here.
 
         // Multi-output dispatch (fanout/seq). This is the async-device
         // write-completion path; dfanout has no device support so it never
@@ -4387,101 +4308,6 @@ impl PvDatabase {
 
         // event record: post the named software event.
         self.dispatch_event_record(&rec).await;
-
-        // Generic multi-output links (transform OUTA..OUTP -> A..P,
-        // scalcout OUT->OVAL, epid OUTL).
-        //
-        // SINGLE-OWNER INVARIANT: skip any record type owned by
-        // `dispatch_multi_output` (called above) so its `LNKn`/`OUTn`
-        // is not dispatched twice — see the sync-path twin in
-        // `run_forward_link_tail_with_putf` §4.6.
-        {
-            let multi_out = {
-                let instance = rec.read().await;
-                // Framework IVOA=Don't_drive veto for the multi-output OUT
-                // path, mirroring the single-OUT `skip_out` gate in the IVOA
-                // block: on an INVALID cycle with IVOA=Don't_drive the OUT
-                // write is suppressed. The parsed_out single-OUT path is
-                // already gated, but `multi_output_links` (scalcout/acalcout
-                // OUT) was not — so a non-calc-fail INVALID (INP LINK_ALARM,
-                // SIMM, NaN-VAL UDF, …) + Don't_drive wrote OUT where C
-                // suppresses (execOutput nsev>=INVALID → Don't_drive break,
-                // sCalcoutRecord.c:794). The record-level OOPT/calc-fail
-                // decision still gates via `multi_output_links()` itself; this
-                // is the framework IVOA layer on top, for every INVALID source.
-                let ivoa_dont_drive = instance.common.sevr
-                    == crate::server::record::AlarmSeverity::Invalid
-                    && matches!(
-                        instance.record.get_field("IVOA"),
-                        Some(EpicsValue::Short(1))
-                    );
-                let links = if ivoa_dont_drive
-                    || super::links::multi_output_dispatch_owned(instance.record.record_type())
-                {
-                    &[][..]
-                } else {
-                    instance.record.multi_output_links()
-                };
-                if links.is_empty() {
-                    None
-                } else {
-                    let mut pairs = Vec::new();
-                    for &(link_field, val_field) in links {
-                        let link_str = instance
-                            .record
-                            .get_field(link_field)
-                            .and_then(|v| {
-                                if let EpicsValue::String(s) = v {
-                                    Some(s)
-                                } else {
-                                    None
-                                }
-                            })
-                            .unwrap_or_default();
-                        if link_str.is_empty() {
-                            continue;
-                        }
-                        if let Some(val) = instance.record.get_field(val_field) {
-                            // Scalar companion for the target-nelm buffer
-                            // choice — see the sync-path twin.
-                            let scalar = instance
-                                .record
-                                .multi_output_scalar_companion(link_field)
-                                .and_then(|f| instance.record.get_field(f));
-                            pairs.push((link_str, val, scalar));
-                        }
-                    }
-                    if pairs.is_empty() { None } else { Some(pairs) }
-                }
-            };
-            if let Some(pairs) = multi_out {
-                for (link_str, val, scalar) in pairs {
-                    // `multi_output_links` carries record OUT links
-                    // (sseq `LNKn`, scalcout `OUTn` — all `DBF_OUTLINK`):
-                    // a bare DB link is NPP (`dbDbLink.c:388`).
-                    // `parse_output_link_v2` applies the OUT-link-correct
-                    // NPP default; an external `ca://`/`pva://` link is
-                    // routed through the link set's `putValue` — see the
-                    // sync-path twin above.
-                    let parsed = crate::server::record::parse_output_link_v2(
-                        link_str.as_str_lossy().as_ref(),
-                    );
-                    let val = self.multi_out_buffer_choice(&parsed, val, scalar).await;
-                    self.write_out_link_value(
-                        &parsed,
-                        val,
-                        super::links::OutLinkSrc {
-                            putf: src_putf,
-                            notify: src_notify.as_ref(),
-                            alarm: &src_alarm,
-                        },
-                        visited,
-                        depth,
-                    )
-                    .await;
-                }
-            }
-        }
 
         // FLNK -- only process if target is Passive (C `dbScanFwdLink` ->
         // `dbScanPassive` -> `processTarget` propagates PUTF the same way
@@ -4696,7 +4522,7 @@ impl PvDatabase {
         &self,
         siol: &crate::server::record::ParsedLink,
         value: EpicsValue,
-    ) {
+    ) -> bool {
         match siol {
             crate::server::record::ParsedLink::Db(link) => {
                 let pv_name = if link.field == "VAL" {
@@ -4705,12 +4531,30 @@ impl PvDatabase {
                     format!("{}.{}", link.record, link.field)
                 };
                 if self.has_name_no_resolve(&link.record).await {
-                    let _ = self.put_pv_already_locked(&pv_name, value).await;
-                } else if let Err(e) = self
-                    .write_external_pv(&pv_name, value, crate::server::database::LinkPutOp::Plain)
-                    .await
-                {
-                    eprintln!("SIOL simulation write to external PV '{pv_name}' failed: {e}");
+                    match self.put_pv_already_locked(&pv_name, value).await {
+                        Ok(()) => false,
+                        Err(e) => {
+                            eprintln!("SIOL simulation write to '{pv_name}' failed: {e}");
+                            true
+                        }
+                    }
+                } else {
+                    match self
+                        .write_external_pv(
+                            &pv_name,
+                            value,
+                            crate::server::database::LinkPutOp::Plain,
+                        )
+                        .await
+                    {
+                        Ok(()) => false,
+                        Err(e) => {
+                            eprintln!(
+                                "SIOL simulation write to external PV '{pv_name}' failed: {e}"
+                            );
+                            true
+                        }
+                    }
                 }
             }
             crate::server::record::ParsedLink::Ca(_)
@@ -4719,14 +4563,20 @@ impl PvDatabase {
                 let name = siol
                     .external_pv_name()
                     .expect("Ca/Pva/PvaJson link carries a PV name");
-                if let Err(e) = self
+                match self
                     .write_external_pv(&name, value, crate::server::database::LinkPutOp::Plain)
                     .await
                 {
-                    eprintln!("SIOL simulation write to external PV '{name}' failed: {e}");
+                    Ok(()) => false,
+                    Err(e) => {
+                        eprintln!("SIOL simulation write to external PV '{name}' failed: {e}");
+                        true
+                    }
                 }
             }
-            _ => {}
+            // Not a writable target — C `dbPutLink` → `S_db_noLSET`, which
+            // does NOT alarm.
+            _ => false,
         }
     }
 
@@ -4773,7 +4623,15 @@ impl PvDatabase {
             }
         };
         if let Some(value) = value {
-            self.write_sim_siol_value(siol, value).await;
+            // C `writeValue` performs the SIOL redirect through `dbPutLink`,
+            // whose `setLinkAlarm` raises LINK_ALARM/INVALID on THIS record
+            // when the put fails (dbLink.c:444-446) — the simulated write is
+            // not exempt. It runs pre-commit like every other output of the
+            // cycle, so the alarm reaches this cycle's committed SEVR.
+            if self.write_sim_siol_value(siol, value).await {
+                let mut instance = rec.write().await;
+                crate::server::recgbl::rec_gbl_set_link_alarm(&mut instance.common, "SIOL");
+            }
         }
     }
 
@@ -5632,16 +5490,8 @@ fn sim_process_tail(instance: &mut RecordInstance, clear_udf: bool) {
             changed_fields.push(("HASH".to_string(), h, EventMask::VALUE));
         }
     }
-    let cycle_mask = changed_fields
-        .iter()
-        .fold(EventMask::NONE, |m, (_, _, fm)| m | *fm);
-    if !cycle_mask.is_empty() {
-        changed_fields.push((
-            "UDF".to_string(),
-            EpicsValue::Char(if instance.common.udf { 1 } else { 0 }),
-            cycle_mask,
-        ));
-    }
+    // No `.UDF` post — see the main process path (C posts UDF from no
+    // monitor() and from no recGblResetAlarms).
 
     let snapshot = crate::server::record::ProcessSnapshot { changed_fields };
     instance.notify_from_snapshot(&snapshot);

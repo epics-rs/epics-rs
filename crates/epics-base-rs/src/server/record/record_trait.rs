@@ -11,6 +11,47 @@ pub struct FieldDesc {
     pub read_only: bool,
 }
 
+/// Resolved metadata of an OUT-link TARGET, as C's soft device support
+/// obtains it before choosing its write buffer.
+///
+/// C's two sources, both mirrored by
+/// [`PvDatabase::resolve_out_target`](crate::server::database::PvDatabase):
+/// - `DB_LINK` — `dbNameToAddr` gives `field_type` and `no_elements`
+///   (`devsCalcoutSoft.c:127-131`, `devaCalcoutSoft.c:78-79`); an
+///   unresolvable name leaves the caller's initializers untouched.
+/// - `CA_LINK` — `dbCaGetLinkDBFtype` / `dbCaGetNelements`
+///   (`dbCa.c:662-704`), which both return `-1` on a disconnected link and
+///   likewise leave the initializers untouched.
+///
+/// A record reproduces its C device support's buffer switch on this in
+/// [`Record::multi_output_buffer`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutTarget {
+    /// Target field's DBF type. `None` = unresolved (disconnected CA link,
+    /// or a name this IOC cannot resolve) — C's `field_type` initializer.
+    pub field_type: Option<DbFieldType>,
+    /// Target field's element capacity — C `no_elements` / `dbCaGetNelements`.
+    /// `1` when unresolved, matching C's `n_elements = 1` initializer.
+    pub element_count: i64,
+    /// True when C would classify this link as a `CA_LINK`: an explicit
+    /// `ca://`/`pva://` link, or a DB-style name that is not a record of
+    /// this IOC (`dbInitLink` locality). Device support that splits its
+    /// buffer choice on sync-vs-async (`devsCalcoutSoft.c:76`, gated on
+    /// `plink->type == CA_LINK && pscalcout->wait`) reads this.
+    pub is_ca_link: bool,
+}
+
+impl OutTarget {
+    /// C's initializer state: `field_type = 0` is never *used* as a type by
+    /// the port (a `None` type routes to the device support's `default:`
+    /// arm), and `n_elements = 1`.
+    pub const UNRESOLVED: Self = Self {
+        field_type: None,
+        element_count: 1,
+        is_ca_link: false,
+    };
+}
+
 /// How C gates a secondary field named by
 /// [`Record::fields_posted_with_value_mask`] *inside* the guard that decides
 /// whether VAL posts at all.
@@ -1791,21 +1832,30 @@ pub trait Record: Send + Sync + 'static {
         &[]
     }
 
-    /// The scalar companion field of a multi-output pair whose C device
-    /// support picks its write buffer by the RESOLVED TARGET element
-    /// count — `devaCalcoutSoft.c::write_acalcout` (75-87): target nelm
-    /// from `dbCaGetNelements` (CA) / `dbNameToAddr` `no_elements` (DB,
-    /// default 1 when unresolvable), clamped by the source count, then
-    /// `pBuffer = nelm == 1 ? &scalar : array`.
+    /// The record's C soft device support write-buffer switch for a
+    /// multi-output pair: given the pair's staged value (the value field
+    /// named by [`Self::multi_output_links`]) and the RESOLVED TARGET
+    /// metadata, return the buffer C would actually put.
     ///
-    /// When this returns `Some(scalar_field)` for a pair's `link_field`,
-    /// the OUT dispatch writes the scalar field's value instead of the
-    /// pair's array value whenever the effective element count is 1 (see
-    /// `PvDatabase::multi_out_buffer_choice`). Default `None`: the
-    /// pair's value field is written as-is.
-    fn multi_output_scalar_companion(&self, link_field: &str) -> Option<&'static str> {
-        let _ = link_field;
-        None
+    /// C's soft device supports do not blindly write one field: they read
+    /// the target's DBF type and element count and pick a buffer from them —
+    /// `devaCalcoutSoft.c::write_acalcout` (75-87) picks
+    /// `nelm == 1 ? &scalar : array`, `devsCalcoutSoft.c::write_scalcout`
+    /// (66-144) routes a string-class target to the computed string, a
+    /// `CHAR`/`UCHAR` array to the string's bytes, and everything else to
+    /// the numeric. The framework resolves the target
+    /// ([`PvDatabase::resolve_out_target`](crate::server::database::PvDatabase))
+    /// and hands it here; the record reproduces its device support's switch.
+    ///
+    /// Default: write the staged value unchanged (no device-support switch).
+    fn multi_output_buffer(
+        &self,
+        link_field: &str,
+        staged: EpicsValue,
+        target: &OutTarget,
+    ) -> EpicsValue {
+        let _ = (link_field, target);
+        staged
     }
 
     /// Return the name of the output event (`OEVT`) to post this cycle, or

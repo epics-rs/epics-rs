@@ -27,8 +27,8 @@ pub use pini::PiniMode;
 pub use record_instance::{NotifyWaitSet, RecordInstance};
 pub use record_trait::{
     ArrayMonitorPost, CommonFieldPutResult, CyclePostMask, EPICS_TIME_EVENT_DEVICE_TIME, FieldDesc,
-    FieldMetadataOverride, InputFetchPolicy, ProcessAction, ProcessContext, ProcessOutcome,
-    ProcessSnapshot, Record, RecordProcessResult, SubroutineFn, ValuePostGate,
+    FieldMetadataOverride, InputFetchPolicy, OutTarget, ProcessAction, ProcessContext,
+    ProcessOutcome, ProcessSnapshot, Record, RecordProcessResult, SubroutineFn, ValuePostGate,
     put_field_internal_default,
 };
 pub(crate) use record_trait::{AuxPostMask, value_gate};

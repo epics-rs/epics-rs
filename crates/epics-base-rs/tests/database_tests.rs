@@ -857,33 +857,29 @@ async fn test_record_posts_carry_per_event_dbe_mask() {
     );
 }
 
-// BUG 2 regression — `process_record` (the foreign-process / QSRV-group
-// path) calls `process_local`. A recent fix excluded UDF from the
-// `process_local` `sub_updates` snapshot loop, citing "UDF via the
-// explicit UDF push above" — but `process_local` had NO such push (the
-// two `database/processing.rs` paths exclude UDF AND pair it with an
-// explicit push at `:1327` and `:1948`). Without the push a UDF change
-// driven through `process_record` was never delivered to `.UDF`
-// subscribers. The fix adds the `if !event_mask.is_empty()` UDF push to
-// `process_local`, mirroring `processing.rs`.
+// R14-63 — C posts `.UDF` from NO processing cycle. `recGblResetAlarms`
+// (recGbl.c:204-216) posts SEVR/STAT/AMSG/ACKS and nothing else, no record's
+// `monitor()` calls `db_post_events(..., &prec->udf, ...)` — the call appears
+// nowhere in EPICS base or the modules — and the `recGblCheckUDF` that the
+// port's justifying comment cited does not exist in C at all.
+//
+// The port pushed a synthesized `.UDF` event onto every posting cycle, with no
+// change detection and a mask made from the union of the cycle's other posts.
+// A `.UDF` subscriber must see an event only where C's generic `dbPut` posts
+// the field it wrote (dbAccess.c) — i.e. a caput to `.UDF` itself.
 #[tokio::test]
-async fn test_process_record_delivers_udf_monitor_event() {
+async fn test_process_cycle_posts_no_udf_event() {
     use epics_base_rs::server::recgbl::{EventMask, alarm_status};
     use epics_base_rs::server::record::AlarmSeverity;
     use epics_base_rs::types::DbFieldType;
 
     let db = PvDatabase::new();
-    // Soft-Channel ai with a defined VAL — `process_local`'s
-    // `value_is_undefined()` returns false, so processing clears UDF.
+    // Soft-Channel ai with a defined VAL — processing clears UDF (true→false)
+    // and the alarm (INVALID→NO_ALARM), so this cycle posts VAL/SEVR/STAT:
+    // the maximal case for the removed "UDF rides along with any post" rule.
     db.add_record("UDF_REC", Box::new(AiRecord::new(5.0)))
         .await
         .unwrap();
-
-    // Seed the prior UDF state: UDF=true with INVALID/UDF_ALARM, as a
-    // freshly-initialised record reads before its first process. The
-    // first `process_record` clears UDF (true→false) and the alarm
-    // (INVALID→NO_ALARM), so `event_mask` carries DBE_ALARM and the UDF
-    // push fires.
     {
         let rec = db.get_record("UDF_REC").await.unwrap();
         let mut inst = rec.write().await;
@@ -892,7 +888,6 @@ async fn test_process_record_delivers_udf_monitor_event() {
         inst.common.stat = alarm_status::UDF_ALARM;
     }
 
-    // Subscribe to UDF before processing.
     let mut udf_rx = {
         let rec = db.get_record("UDF_REC").await.unwrap();
         let mut inst = rec.write().await;
@@ -902,19 +897,66 @@ async fn test_process_record_delivers_udf_monitor_event() {
 
     // Foreign-process path — `process_record` → `process_local`.
     db.process_record("UDF_REC").await.unwrap();
-
     {
         let rec = db.get_record("UDF_REC").await.unwrap();
         let inst = rec.read().await;
-        assert!(!inst.common.udf, "process must have cleared UDF");
+        assert!(
+            !inst.common.udf,
+            "process must have cleared UDF in the record"
+        );
     }
+    assert!(
+        udf_rx.try_recv().is_err(),
+        "process_local must post no .UDF event — C posts UDF from no monitor()"
+    );
+
+    // The link/scan path (`process_record_with_links`) — the same rule.
+    {
+        let rec = db.get_record("UDF_REC").await.unwrap();
+        let mut inst = rec.write().await;
+        inst.common.udf = true;
+    }
+    let mut visited = HashSet::new();
+    db.process_record_with_links("UDF_REC", &mut visited, 0)
+        .await
+        .unwrap();
+    assert!(
+        udf_rx.try_recv().is_err(),
+        "process_record_with_links must post no .UDF event either"
+    );
+}
+
+/// The other side of the R14-63 boundary: a client caput to `.UDF` DOES post,
+/// because C's generic `dbPut` posts the field it wrote. Removing the
+/// synthesized processing-cycle posts must not take this one with it.
+#[tokio::test]
+async fn test_caput_to_udf_field_posts_udf_event() {
+    use epics_base_rs::server::recgbl::EventMask;
+    use epics_base_rs::types::DbFieldType;
+
+    let db = PvDatabase::new();
+    db.add_record("UDF_PUT", Box::new(AiRecord::new(5.0)))
+        .await
+        .unwrap();
+
+    let mut udf_rx = {
+        let rec = db.get_record("UDF_PUT").await.unwrap();
+        let mut inst = rec.write().await;
+        inst.common.udf = false;
+        inst.add_subscriber("UDF", 32, DbFieldType::Char, EventMask::VALUE.bits())
+    }
+    .expect("UDF subscription must be accepted");
+
+    db.put_record_field_from_ca("UDF_PUT", "UDF", EpicsValue::Char(1))
+        .await
+        .expect("caput to .UDF must be accepted");
 
     let event = udf_rx
         .try_recv()
-        .expect("a UDF change via process_record must deliver a UDF monitor event");
+        .expect("a caput to .UDF must deliver a .UDF monitor event");
     assert!(
-        matches!(event.snapshot.value, EpicsValue::Char(0)),
-        "UDF event payload should be the cleared value 0, got {:?}",
+        matches!(event.snapshot.value, EpicsValue::Char(1)),
+        "the .UDF event must carry the value the client wrote, got {:?}",
         event.snapshot.value
     );
 }
@@ -5241,18 +5283,24 @@ async fn test_dfanout_omsl_supervisory_ignores_dol() {
     );
 }
 
-/// C `dfanoutRecord.c:308-339` `push_values` raises
-/// `recGblSetSevr(LINK_ALARM, MAJOR_ALARM)` on every failed `dbPutLink`,
-/// and `process()` (127-147) runs `push_values` between `checkAlarms` and
+/// A failed dfanout OUT-link put raises the LINK alarm TWICE in C, and the
+/// stronger one wins:
+///
+/// * `dbPutLink` itself calls `setLinkAlarm` on a nonzero putValue status —
+///   `recGblSetSevrMsg(LINK_ALARM, INVALID_ALARM)` (dbLink.c:318-323,
+///   434-448); an OUT link naming no local record is a (never-connected) CA
+///   link, whose put fails exactly this way;
+/// * `push_values` then adds its own `recGblSetSevr(LINK_ALARM, MAJOR_ALARM)`
+///   (dfanoutRecord.c:311-312), which `recGblSetSevr` drops because the
+///   pending severity is already INVALID.
+///
+/// `process()` (127-147) runs `push_values` between `checkAlarms` and
 /// `recGblResetAlarms`, so the write-failure alarm folds into the SAME
-/// cycle's committed SEVR and the VAL monitor post. The Rust dispatch
-/// previously only logged the failure (no alarm), and drove the OUT links
-/// in the post-commit forward-link tail where any alarm could not fold
-/// into this cycle. After ONE process, a broken OUT link must leave
-/// SEVR=MAJOR / STAT=LINK — proving the same-cycle fold (a one-cycle-late
-/// latch would read NO_ALARM here).
+/// cycle's committed SEVR and the VAL monitor post. After ONE process, a
+/// broken OUT link must leave SEVR=INVALID / STAT=LINK — proving the
+/// same-cycle fold (a one-cycle-late latch would read NO_ALARM here).
 #[tokio::test]
-async fn test_dfanout_out_link_write_failure_raises_link_major() {
+async fn test_dfanout_out_link_write_failure_raises_link_alarm() {
     use epics_base_rs::server::recgbl::alarm_status;
     use epics_base_rs::server::records::dfanout::DfanoutRecord;
 
@@ -5277,8 +5325,9 @@ async fn test_dfanout_out_link_write_failure_raises_link_major() {
     let inst = rec.read().await;
     assert_eq!(
         inst.common.sevr,
-        AlarmSeverity::Major,
-        "failed dfanout OUT-link write must raise SEVR=MAJOR this cycle, got {:?}",
+        AlarmSeverity::Invalid,
+        "failed dfanout OUT-link write must raise SEVR=INVALID this cycle \
+         (dbPutLink's setLinkAlarm), got {:?}",
         inst.common.sevr
     );
     assert_eq!(

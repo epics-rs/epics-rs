@@ -1,12 +1,13 @@
 use super::calc_compile;
 use crate::error::{CaError, CaResult};
 use crate::server::record::{
-    FieldDesc, InputFetchPolicy, ProcessAction, ProcessOutcome, Record, RecordProcessResult,
+    FieldDesc, InputFetchPolicy, OutTarget, ProcessAction, ProcessOutcome, Record,
+    RecordProcessResult,
 };
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
 use crate::calc::StringInputs;
-use crate::calc::engine::value::ScalcString;
+use crate::calc::engine::value::{SCALC_STRING_SIZE, ScalcString};
 use crate::calc::{CompiledExpr, ExprKind, ScalcResult, scalc_perform};
 
 /// Scalcout record — string calc with output.
@@ -1205,6 +1206,52 @@ impl Record for ScalcoutRecord {
         }
     }
 
+    /// C `devsCalcoutSoft.c::write_scalcout` (66-144) routes the OUT put by
+    /// the TARGET field's DBF type — the staged `OVAL` is only one of three
+    /// buffers:
+    ///
+    /// - `DBF_STRING`/`ENUM`/`MENU`/`DEVICE`/`INLINK`/`OUTLINK`/`FWDLINK`
+    ///   (:83-89, :131-134) — `DBR_STRING` from `OSV`, the OCAL string
+    ///   result. In the port a link/menu/device field is a `DBF_STRING`
+    ///   and a menu is a `DBF_ENUM`, so those two types are the class.
+    /// - `DBF_CHAR`/`DBF_UCHAR` with `n_elements > 1` (:92-96, :136-138) —
+    ///   `DBF_CHAR` array of `min(n_elements, sizeof(sval)) = min(n, 40)`
+    ///   bytes. C reads that buffer from `OSV` on the ASYNCHRONOUS branch
+    ///   (CA link + `WAIT`, :94) but from `SVAL` — the CALC string, not the
+    ///   OCAL one — on the synchronous branch (:137). The asymmetry is C's;
+    ///   it is reproduced, not repaired.
+    /// - anything else, including an unresolved (disconnected CA) target
+    ///   whose `dbCaGetLinkDBFtype` returned `-1` (:99, :140) —
+    ///   `DBR_DOUBLE` from `OVAL`, the staged value.
+    fn multi_output_buffer(
+        &self,
+        link_field: &str,
+        staged: EpicsValue,
+        target: &OutTarget,
+    ) -> EpicsValue {
+        if link_field != "OUT" {
+            return staged;
+        }
+        match target.field_type {
+            Some(DbFieldType::String) | Some(DbFieldType::Enum) => {
+                EpicsValue::String(self.osv.clone())
+            }
+            Some(DbFieldType::Char) | Some(DbFieldType::UChar) if target.element_count > 1 => {
+                // `n_elements > sizeof(pscalcout->sval)` clamp — the C
+                // buffers are `char[SCALC_STRING_SIZE]` (40).
+                let n = target.element_count.min(SCALC_STRING_SIZE as i64) as usize;
+                // C puts `n` bytes straight out of the 40-byte field, so the
+                // string is NUL-padded out to the requested count.
+                let async_put = target.is_ca_link && self.wait != 0;
+                let src = if async_put { &self.osv } else { &self.sval };
+                let mut buf = src.as_bytes().to_vec();
+                buf.resize(n, 0);
+                EpicsValue::CharArray(buf)
+            }
+            _ => staged,
+        }
+    }
+
     /// `OEVT` ("Event To Issue"): post the numeric output event when output
     /// fires. C `sCalcoutRecord.c` `execOutput` does `if (pcalc->oevt > 0)
     /// post_event((int)pcalc->oevt);` right after `writeValue`, gated to the
@@ -1588,6 +1635,201 @@ mod tests {
         assert_eq!(
             rec.val, 3.0,
             "OCAL-fail must NOT touch VAL (C sets oval, not val)"
+        );
+    }
+
+    /// A scalcout whose CALC yields SVAL="calc-str" and whose OCAL yields
+    /// OSV="ocal-str", with OVAL=7 — the three C write buffers all distinct,
+    /// so `multi_output_buffer` cannot pass a boundary by coincidence.
+    fn three_buffer_scalcout() -> ScalcoutRecord {
+        let mut rec = ScalcoutRecord::new();
+        rec.put_field("CALC", EpicsValue::String("AA".into()))
+            .unwrap();
+        rec.special("CALC", true).unwrap();
+        rec.put_field("AA", EpicsValue::String("calc-str".into()))
+            .unwrap();
+        rec.put_field("DOPT", EpicsValue::Short(1)).unwrap(); // Use OCAL
+        rec.put_field("OCAL", EpicsValue::String("BB".into()))
+            .unwrap();
+        rec.special("OCAL", true).unwrap();
+        rec.put_field("BB", EpicsValue::String("ocal-str".into()))
+            .unwrap();
+        rec.process().unwrap();
+        assert_eq!(rec.sval, "calc-str");
+        assert_eq!(rec.osv, "ocal-str");
+        rec.oval = 7.0;
+        rec
+    }
+
+    fn out_target(
+        field_type: Option<DbFieldType>,
+        element_count: i64,
+        is_ca_link: bool,
+    ) -> OutTarget {
+        OutTarget {
+            field_type,
+            element_count,
+            is_ca_link,
+        }
+    }
+
+    /// R14-61 boundary: a `DBF_STRING` target takes the computed string OSV
+    /// (C `devsCalcoutSoft.c:83-89` / `:131-134` — `DBR_STRING` from `&osv`),
+    /// never the numeric OVAL.
+    #[test]
+    fn r14_61_string_target_gets_osv() {
+        let rec = three_buffer_scalcout();
+        let staged = EpicsValue::Double(rec.oval);
+        assert_eq!(
+            rec.multi_output_buffer(
+                "OUT",
+                staged,
+                &out_target(Some(DbFieldType::String), 1, false)
+            ),
+            EpicsValue::String("ocal-str".into())
+        );
+    }
+
+    /// A `DBF_ENUM`/`MENU` target is in the same C case list as `DBF_STRING`
+    /// — the enum's choice label is matched from the string.
+    #[test]
+    fn r14_61_enum_target_gets_osv() {
+        let rec = three_buffer_scalcout();
+        let staged = EpicsValue::Double(rec.oval);
+        assert_eq!(
+            rec.multi_output_buffer(
+                "OUT",
+                staged,
+                &out_target(Some(DbFieldType::Enum), 1, false)
+            ),
+            EpicsValue::String("ocal-str".into())
+        );
+    }
+
+    /// R14-61 boundary: a CHAR array target on the SYNCHRONOUS branch takes
+    /// SVAL — C `devsCalcoutSoft.c:137` puts `&pscalcout->sval` (the CALC
+    /// string), not OSV. The bytes are the 40-byte C buffer's first
+    /// `n_elements`, so the string is NUL-padded out to the target count.
+    #[test]
+    fn r14_61_char_array_target_sync_gets_sval_bytes() {
+        let rec = three_buffer_scalcout();
+        let staged = EpicsValue::Double(rec.oval);
+        let mut want = b"calc-str".to_vec();
+        want.resize(12, 0);
+        assert_eq!(
+            rec.multi_output_buffer(
+                "OUT",
+                staged,
+                &out_target(Some(DbFieldType::Char), 12, false)
+            ),
+            EpicsValue::CharArray(want)
+        );
+    }
+
+    /// R14-61 boundary: the ASYNCHRONOUS branch (CA link + WAIT) takes OSV
+    /// instead — C `devsCalcoutSoft.c:94`. This asymmetry is C's.
+    #[test]
+    fn r14_61_char_array_target_async_gets_osv_bytes() {
+        let mut rec = three_buffer_scalcout();
+        rec.put_field("WAIT", EpicsValue::Short(1)).unwrap();
+        let staged = EpicsValue::Double(rec.oval);
+        let mut want = b"ocal-str".to_vec();
+        want.resize(12, 0);
+        assert_eq!(
+            rec.multi_output_buffer(
+                "OUT",
+                staged,
+                &out_target(Some(DbFieldType::Char), 12, true)
+            ),
+            EpicsValue::CharArray(want)
+        );
+    }
+
+    /// WAIT only reaches the async branch on a CA link (C `:76`
+    /// `plink->type == CA_LINK && pscalcout->wait`): WAIT=1 on a DB link stays
+    /// synchronous, so the buffer is still SVAL.
+    #[test]
+    fn r14_61_char_array_target_wait_on_db_link_stays_sync() {
+        let mut rec = three_buffer_scalcout();
+        rec.put_field("WAIT", EpicsValue::Short(1)).unwrap();
+        let staged = EpicsValue::Double(rec.oval);
+        let mut want = b"calc-str".to_vec();
+        want.resize(12, 0);
+        assert_eq!(
+            rec.multi_output_buffer(
+                "OUT",
+                staged,
+                &out_target(Some(DbFieldType::Char), 12, false)
+            ),
+            EpicsValue::CharArray(want)
+        );
+    }
+
+    /// R14-61 boundary: `n_elements > sizeof(sval)` clamps to 40
+    /// (C `:91` / `:136`).
+    #[test]
+    fn r14_61_char_array_target_clamps_to_40() {
+        let rec = three_buffer_scalcout();
+        let staged = EpicsValue::Double(rec.oval);
+        let out = rec.multi_output_buffer(
+            "OUT",
+            staged,
+            &out_target(Some(DbFieldType::UChar), 100, false),
+        );
+        match out {
+            EpicsValue::CharArray(b) => assert_eq!(b.len(), 40),
+            other => panic!("expected a CHAR array, got {other:?}"),
+        }
+    }
+
+    /// A CHAR *scalar* target (`n_elements == 1`) fails C's `n_elements > 1`
+    /// test and falls through to the `DBR_DOUBLE` put of OVAL (`:96-99`).
+    #[test]
+    fn r14_61_char_scalar_target_gets_oval() {
+        let rec = three_buffer_scalcout();
+        let staged = EpicsValue::Double(rec.oval);
+        assert_eq!(
+            rec.multi_output_buffer(
+                "OUT",
+                staged.clone(),
+                &out_target(Some(DbFieldType::Char), 1, false)
+            ),
+            staged
+        );
+    }
+
+    /// A numeric target takes the staged OVAL (`DBR_DOUBLE`, C `:140`).
+    #[test]
+    fn r14_61_numeric_target_gets_oval() {
+        let rec = three_buffer_scalcout();
+        let staged = EpicsValue::Double(rec.oval);
+        assert_eq!(
+            rec.multi_output_buffer(
+                "OUT",
+                staged.clone(),
+                &out_target(Some(DbFieldType::Double), 1, false)
+            ),
+            staged
+        );
+    }
+
+    /// A disconnected CA target reports no type (`dbCaGetLinkDBFtype` → -1,
+    /// `dbCa.c:695-704`), which in C leaves the `default:` arm — `DBR_DOUBLE`
+    /// from OVAL.
+    #[test]
+    fn r14_61_disconnected_ca_target_gets_oval() {
+        let rec = three_buffer_scalcout();
+        let staged = EpicsValue::Double(rec.oval);
+        assert_eq!(
+            rec.multi_output_buffer(
+                "OUT",
+                staged.clone(),
+                &OutTarget {
+                    is_ca_link: true,
+                    ..OutTarget::UNRESOLVED
+                }
+            ),
+            staged
         );
     }
 }

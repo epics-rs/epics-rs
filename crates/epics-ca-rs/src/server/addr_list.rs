@@ -113,18 +113,10 @@ fn resolve_from_env() -> CaResult<CasUdpConfig> {
         }
     }
 
-    // Server-side beacon port: EPICS_CAS_BEACON_PORT takes precedence
-    // (matches rsrv/caservertask.c:501-507 lookup order). Falls back to
-    // EPICS_CA_REPEATER_PORT, then the compiled-in default. Operators
-    // who only set the server-side variable were previously seeing it
-    // silently ignored — beacons went to the repeater port.
-    let beacon_port = epics_base_rs::runtime::env::get("EPICS_CAS_BEACON_PORT")
-        .and_then(|s| s.parse::<u16>().ok())
-        .or_else(|| {
-            epics_base_rs::runtime::env::get("EPICS_CA_REPEATER_PORT")
-                .and_then(|s| s.parse::<u16>().ok())
-        })
-        .unwrap_or(CA_REPEATER_PORT);
+    // Server-side beacon port: EPICS_CAS_BEACON_PORT when configured,
+    // else EPICS_CA_REPEATER_PORT, each resolved by the one owner of
+    // C `envGetInetPortConfigParam` (rsrv/caservertask.c:501-508).
+    let beacon_port = epics_base_rs::runtime::net::cas_beacon_port();
 
     // Beacon addr list: only EPICS_CAS_BEACON_ADDR_LIST. The C IOC
     // server (rsrv/caservertask.c:413) calls

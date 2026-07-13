@@ -224,9 +224,7 @@ fn parse_static_addr(entry: &str) -> Option<SocketAddr> {
         return Some(addr);
     }
     if let Ok(ip) = entry.parse::<IpAddr>() {
-        let port = epics_base_rs::runtime::env::get("EPICS_CA_SERVER_PORT")
-            .and_then(|s| s.parse::<u16>().ok())
-            .unwrap_or(crate::protocol::CA_SERVER_PORT);
+        let port = epics_base_rs::runtime::net::ca_server_port();
         return Some(SocketAddr::new(ip, port));
     }
     tracing::warn!(entry = %entry, "EPICS_CA_DISCOVERY static: dropped unparseable address");

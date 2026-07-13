@@ -19,7 +19,7 @@ pub const PVA_BROADCAST_PORT: u16 = 5076;
 /// hosts both a client and a server (e.g. a gateway) does not get
 /// its client routing redirected by a server-side override.
 pub fn ca_server_port() -> u16 {
-    env::get_u16("EPICS_CA_SERVER_PORT", CA_SERVER_PORT)
+    env::env_inet_port("EPICS_CA_SERVER_PORT", CA_SERVER_PORT)
 }
 
 /// Server-side CA bind-port reader — where the server **binds** the
@@ -39,13 +39,36 @@ pub fn ca_server_port() -> u16 {
 /// TCP port *only*. The env-var path keeps strict C parity so a
 /// startup script that sets `EPICS_CAS_SERVER_PORT=6064` lands UDP
 /// and TCP on the same port, as it would under a C IOC.
+///
+/// The selection between the two variables is a *presence* test, as in
+/// C: whichever parameter is configured is then resolved against the
+/// **compiled** [`CA_SERVER_PORT`] default, so a rejected
+/// `EPICS_CAS_SERVER_PORT` lands on 5064 — it does not fall through to
+/// `EPICS_CA_SERVER_PORT`.
 pub fn cas_server_port() -> u16 {
-    env::get_u16("EPICS_CAS_SERVER_PORT", ca_server_port())
+    if env::config_param_ptr("EPICS_CAS_SERVER_PORT").is_some() {
+        env::env_inet_port("EPICS_CAS_SERVER_PORT", CA_SERVER_PORT)
+    } else {
+        env::env_inet_port("EPICS_CA_SERVER_PORT", CA_SERVER_PORT)
+    }
 }
 
 /// Returns the CA repeater port, allowing override via `EPICS_CA_REPEATER_PORT`.
 pub fn ca_repeater_port() -> u16 {
-    env::get_u16("EPICS_CA_REPEATER_PORT", CA_REPEATER_PORT)
+    env::env_inet_port("EPICS_CA_REPEATER_PORT", CA_REPEATER_PORT)
+}
+
+/// Server-side beacon port — C `caservertask.c:501-508`.
+///
+/// Presence-gated exactly like [`cas_server_port`]: `EPICS_CAS_BEACON_PORT`
+/// when it is configured, else `EPICS_CA_REPEATER_PORT`, each resolved
+/// against the compiled [`CA_REPEATER_PORT`] default.
+pub fn cas_beacon_port() -> u16 {
+    if env::config_param_ptr("EPICS_CAS_BEACON_PORT").is_some() {
+        env::env_inet_port("EPICS_CAS_BEACON_PORT", CA_REPEATER_PORT)
+    } else {
+        env::env_inet_port("EPICS_CA_REPEATER_PORT", CA_REPEATER_PORT)
+    }
 }
 
 /// IP TTL applied to CA multicast traffic.
@@ -76,12 +99,12 @@ pub fn ca_mcast_ttl() -> u32 {
 
 /// Returns the PVA broadcast port, allowing override via `EPICS_PVA_BROADCAST_PORT`.
 pub fn pva_broadcast_port() -> u16 {
-    env::get_u16("EPICS_PVA_BROADCAST_PORT", PVA_BROADCAST_PORT)
+    env::env_inet_port("EPICS_PVA_BROADCAST_PORT", PVA_BROADCAST_PORT)
 }
 
 /// Returns the PVA server port, allowing override via `EPICS_PVA_SERVER_PORT`.
 pub fn pva_server_port() -> u16 {
-    env::get_u16("EPICS_PVA_SERVER_PORT", PVA_SERVER_PORT)
+    env::env_inet_port("EPICS_PVA_SERVER_PORT", PVA_SERVER_PORT)
 }
 
 /// Parse a `"host:port"` string into a `SocketAddr`.
@@ -147,6 +170,47 @@ mod tests {
             "cas_server_port falls back to EPICS_CA_SERVER_PORT when CAS-specific unset"
         );
         unsafe { std::env::remove_var("EPICS_CA_SERVER_PORT") };
+    }
+
+    /// The CAS/CA selection is a *presence* test against the compiled
+    /// default (`caservertask.c:491-508`): a configured-but-rejected
+    /// `EPICS_CAS_SERVER_PORT` lands on 5064, it does NOT fall through to
+    /// `EPICS_CA_SERVER_PORT`. Same rule for the beacon port.
+    #[test]
+    #[serial(epics_env)]
+    fn test_cas_port_selection_is_presence_gated() {
+        unsafe {
+            std::env::set_var("EPICS_CA_SERVER_PORT", "6064");
+            std::env::set_var("EPICS_CAS_SERVER_PORT", "3000");
+        }
+        assert_eq!(
+            cas_server_port(),
+            CA_SERVER_PORT,
+            "rejected EPICS_CAS_SERVER_PORT falls back to the compiled default, not to EPICS_CA_SERVER_PORT"
+        );
+        // Empty is "not configured" — the generic variable is resolved.
+        unsafe { std::env::set_var("EPICS_CAS_SERVER_PORT", "") };
+        assert_eq!(cas_server_port(), 6064);
+
+        unsafe {
+            std::env::set_var("EPICS_CA_REPEATER_PORT", "6065");
+            std::env::set_var("EPICS_CAS_BEACON_PORT", "70000");
+        }
+        assert_eq!(
+            cas_beacon_port(),
+            CA_REPEATER_PORT,
+            "rejected EPICS_CAS_BEACON_PORT falls back to the compiled default"
+        );
+        unsafe { std::env::set_var("EPICS_CAS_BEACON_PORT", "6165") };
+        assert_eq!(cas_beacon_port(), 6165);
+        unsafe { std::env::remove_var("EPICS_CAS_BEACON_PORT") };
+        assert_eq!(cas_beacon_port(), 6065);
+
+        unsafe {
+            std::env::remove_var("EPICS_CA_SERVER_PORT");
+            std::env::remove_var("EPICS_CAS_SERVER_PORT");
+            std::env::remove_var("EPICS_CA_REPEATER_PORT");
+        }
     }
 
     #[test]

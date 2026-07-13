@@ -2,6 +2,20 @@ pub fn get(key: &str) -> Option<String> {
     std::env::var(key).ok()
 }
 
+/// The value of a configuration parameter whose compiled-in default is
+/// the empty string (`EPICS_CAS_SERVER_PORT`, `EPICS_CAS_BEACON_PORT`,
+/// … — see `configure/CONFIG_ENV`).
+///
+/// C parity: `envGetConfigParamPtr` (`envSubr.c:81-100`) returns the
+/// environment string, falling back to the parameter's compiled default,
+/// and maps an **empty** string to NULL. Callers such as
+/// `rsrv::caservertask` (`caservertask.c:491-508`) use exactly that
+/// NULL/non-NULL answer to pick *which* parameter to resolve, so the
+/// presence test must treat `FOO=` as "not configured".
+pub fn config_param_ptr(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|v| !v.is_empty())
+}
+
 pub fn get_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
@@ -45,50 +59,80 @@ fn sscanf_long(text: &str) -> Option<i64> {
     Some(if neg { -value } else { value })
 }
 
-/// Read an env var as a `u16`, matching C `envGetInetPortConfigParam`
-/// (`envSubr.c:397-424`) — used for port parameters.
+/// The single owner of every EPICS **inet port** environment parameter —
+/// C `envGetInetPortConfigParam` (`envSubr.c:397-424`) on top of
+/// `envGetLongConfigParam` (`envSubr.c:303-320`).
 ///
-/// C parity:
-/// - Parses with `sscanf("%ld")` semantics (leading whitespace, sign,
-///   trailing garbage tolerated) — see [`sscanf_long`].
-/// - When the value fails to parse, or is out of the legal port range
-///   (`<= IPPORT_USERRESERVED` (5000) or `> USHRT_MAX`), it logs a
-///   diagnostic and falls back to the compiled `default`.
-/// - C emits these via `errlogPrintf`; here they go through `tracing`
-///   at `warn`, which is the crate's logging path.
-pub fn get_u16(key: &str, default: u16) -> u16 {
-    let Some(raw) = std::env::var(key).ok() else {
+/// No caller may parse a port env var itself: the C semantics are not
+/// `parse::<u16>()`.
+///
+/// - Unset: the compiled-in default string is parsed instead, which for
+///   every port parameter is `default` itself — so the value is returned
+///   silently (`configure/CONFIG_ENV`: `EPICS_CA_SERVER_PORT=5064`, …).
+/// - Set: parsed with `sscanf("%ld")` leniency (leading whitespace, sign,
+///   trailing garbage tolerated — see [`sscanf_long`]) out of the first
+///   127 bytes, which is all C's `char text[128]` buffer keeps.
+/// - Empty (`FOO=`) or no integer found: the "integer fetch failed"
+///   diagnostics, then `default`.
+/// - `<= IPPORT_USERRESERVED` (5000) or `> USHRT_MAX`: the "out of range"
+///   diagnostics, then `default`.
+///
+/// The diagnostics are byte-identical to compiled C, which writes the
+/// first via `fprintf(stderr)` and the other two via `errlogPrintf`
+/// (console = stderr), once per resolution — there is no dedup in C:
+///
+/// ```text
+/// Unable to find an integer in EPICS_CA_SERVER_PORT=abc
+/// EPICS Environment "EPICS_CA_SERVER_PORT" integer fetch failed
+/// setting "EPICS_CA_SERVER_PORT" = 5064
+/// ```
+/// ```text
+/// EPICS Environment "EPICS_CA_SERVER_PORT" out of range
+/// Setting "EPICS_CA_SERVER_PORT" = 5064
+/// ```
+pub fn env_inet_port(key: &str, default: u16) -> u16 {
+    let Ok(raw) = std::env::var(key) else {
+        // Not in the environment: C parses the compiled-in default
+        // string, which round-trips to `default` with no diagnostic.
         return default;
     };
-    let parsed = match sscanf_long(&raw) {
+
+    // C `envGetConfigParam` copies into `char text[128]` with `strncpy`,
+    // so only the first 127 bytes ever reach `sscanf`.
+    let mut end = raw.len().min(127);
+    while !raw.is_char_boundary(end) {
+        end -= 1;
+    }
+    let text = &raw[..end];
+
+    // Empty value: `envGetConfigParamPtr` returns NULL, so
+    // `envGetLongConfigParam` fails *without* printing its own line.
+    let parsed = if text.is_empty() {
+        None
+    } else {
+        sscanf_long(text)
+    };
+
+    let mut port = match parsed {
         Some(v) => v,
         None => {
-            // C `envGetLongConfigParam`: "Unable to find an integer in ..."
-            // then `envGetInetPortConfigParam`: integer fetch failed.
-            tracing::warn!(
-                target: "epics_base_rs::env",
-                var = key,
-                value = %raw,
-                default,
-                "EPICS environment integer fetch failed; using default"
-            );
-            return default;
+            if !text.is_empty() {
+                eprintln!("Unable to find an integer in {key}={text}");
+            }
+            eprintln!("EPICS Environment \"{key}\" integer fetch failed");
+            eprintln!("setting \"{key}\" = {default}");
+            i64::from(default)
         }
     };
-    if parsed <= IPPORT_USERRESERVED as i64 || parsed > u16::MAX as i64 {
-        // C `envGetInetPortConfigParam`: "out of range" diagnostic +
-        // fall back to the compiled default.
-        tracing::warn!(
-            target: "epics_base_rs::env",
-            var = key,
-            value = parsed,
-            default,
-            "EPICS environment port out of range (must be > {IPPORT_USERRESERVED} and <= {}); using default",
-            u16::MAX
-        );
-        return default;
+
+    if port <= i64::from(IPPORT_USERRESERVED) || port > i64::from(u16::MAX) {
+        eprintln!("EPICS Environment \"{key}\" out of range");
+        port = i64::from(default);
+        eprintln!("Setting \"{key}\" = {default}");
     }
-    parsed as u16
+
+    // Range-checked above, so the cast cannot truncate.
+    port as u16
 }
 
 /// Read an env var as a boolean, matching C `envGetBoolConfigParam`
@@ -186,57 +230,101 @@ mod tests {
 
     #[test]
     #[serial(epics_env)]
-    fn test_get_u16_valid() {
+    fn test_env_inet_port_valid() {
         unsafe { std::env::set_var("_EPICS_RT_TEST_PORT", "8080") };
-        assert_eq!(get_u16("_EPICS_RT_TEST_PORT", 5064), 8080);
+        assert_eq!(env_inet_port("_EPICS_RT_TEST_PORT", 5064), 8080);
         unsafe { std::env::remove_var("_EPICS_RT_TEST_PORT") };
     }
 
     #[test]
     #[serial(epics_env)]
-    fn test_get_u16_invalid() {
+    fn test_env_inet_port_invalid() {
         unsafe { std::env::set_var("_EPICS_RT_TEST_PORT_BAD", "not_a_number") };
-        assert_eq!(get_u16("_EPICS_RT_TEST_PORT_BAD", 5064), 5064);
+        assert_eq!(env_inet_port("_EPICS_RT_TEST_PORT_BAD", 5064), 5064);
         unsafe { std::env::remove_var("_EPICS_RT_TEST_PORT_BAD") };
     }
 
     #[test]
     #[serial(epics_env)]
-    fn test_get_u16_missing() {
-        assert_eq!(get_u16("_EPICS_RT_NONEXISTENT_VAR_12345", 5064), 5064);
+    fn test_env_inet_port_missing() {
+        assert_eq!(env_inet_port("_EPICS_RT_NONEXISTENT_VAR_12345", 5064), 5064);
+    }
+
+    /// An empty value is "not configured" for `envGetConfigParamPtr`, so
+    /// `envGetLongConfigParam` fails and the port falls back to the default.
+    #[test]
+    #[serial(epics_env)]
+    fn test_env_inet_port_empty_value_is_a_failed_fetch() {
+        unsafe { std::env::set_var("_EPICS_RT_TEST_PORT_EMPTY", "") };
+        assert_eq!(env_inet_port("_EPICS_RT_TEST_PORT_EMPTY", 5064), 5064);
+        assert_eq!(config_param_ptr("_EPICS_RT_TEST_PORT_EMPTY"), None);
+        unsafe { std::env::remove_var("_EPICS_RT_TEST_PORT_EMPTY") };
     }
 
     #[test]
     #[serial(epics_env)]
-    fn test_get_u16_lenient_whitespace_and_suffix() {
+    fn test_env_inet_port_lenient_whitespace_and_suffix() {
         // C `sscanf("%ld")` accepts leading whitespace + trailing junk;
         // `u16::parse` would reject both.
         unsafe { std::env::set_var("_EPICS_RT_TEST_PORT_WS", " 6064") };
-        assert_eq!(get_u16("_EPICS_RT_TEST_PORT_WS", 5064), 6064);
+        assert_eq!(env_inet_port("_EPICS_RT_TEST_PORT_WS", 5064), 6064);
         unsafe { std::env::set_var("_EPICS_RT_TEST_PORT_WS", "6064abc") };
-        assert_eq!(get_u16("_EPICS_RT_TEST_PORT_WS", 5064), 6064);
+        assert_eq!(env_inet_port("_EPICS_RT_TEST_PORT_WS", 5064), 6064);
         unsafe { std::env::remove_var("_EPICS_RT_TEST_PORT_WS") };
+    }
+
+    /// C copies the value into `char text[128]`, so a digit run that only
+    /// starts past byte 127 is invisible to `sscanf`.
+    #[test]
+    #[serial(epics_env)]
+    fn test_env_inet_port_truncates_at_the_c_buffer_length() {
+        let long = format!("{}6064", " ".repeat(130));
+        unsafe { std::env::set_var("_EPICS_RT_TEST_PORT_LONG", &long) };
+        assert_eq!(env_inet_port("_EPICS_RT_TEST_PORT_LONG", 5064), 5064);
+        // The same digits inside the first 127 bytes are seen.
+        let short = format!("{}6064", " ".repeat(100));
+        unsafe { std::env::set_var("_EPICS_RT_TEST_PORT_LONG", &short) };
+        assert_eq!(env_inet_port("_EPICS_RT_TEST_PORT_LONG", 5064), 6064);
+        unsafe { std::env::remove_var("_EPICS_RT_TEST_PORT_LONG") };
     }
 
     #[test]
     #[serial(epics_env)]
-    fn test_get_u16_rejects_reserved_and_out_of_range_ports() {
+    fn test_env_inet_port_rejects_reserved_and_out_of_range_ports() {
         // C `envGetInetPortConfigParam` rejects port <= IPPORT_USERRESERVED
         // (5000) or > USHRT_MAX, falling back to the compiled default.
-        for bad in ["0", "1", "80", "443", "5000", "-1", "65536", "99999"] {
+        for bad in [
+            "0", "1", "80", "443", "3000", "5000", "-1", "65536", "70000", "99999",
+        ] {
             unsafe { std::env::set_var("_EPICS_RT_TEST_PORT_RANGE", bad) };
             assert_eq!(
-                get_u16("_EPICS_RT_TEST_PORT_RANGE", 5064),
+                env_inet_port("_EPICS_RT_TEST_PORT_RANGE", 5064),
                 5064,
                 "out-of-range port {bad:?} must fall back to default"
             );
         }
         // 5001 is the first acceptable port (> IPPORT_USERRESERVED).
         unsafe { std::env::set_var("_EPICS_RT_TEST_PORT_RANGE", "5001") };
-        assert_eq!(get_u16("_EPICS_RT_TEST_PORT_RANGE", 5064), 5001);
+        assert_eq!(env_inet_port("_EPICS_RT_TEST_PORT_RANGE", 5064), 5001);
         unsafe { std::env::set_var("_EPICS_RT_TEST_PORT_RANGE", "65535") };
-        assert_eq!(get_u16("_EPICS_RT_TEST_PORT_RANGE", 5064), 65535);
+        assert_eq!(env_inet_port("_EPICS_RT_TEST_PORT_RANGE", 5064), 65535);
         unsafe { std::env::remove_var("_EPICS_RT_TEST_PORT_RANGE") };
+    }
+
+    /// `envGetConfigParamPtr` presence test — the gate `caservertask.c`
+    /// uses to pick between the CAS-specific and the generic parameter.
+    #[test]
+    #[serial(epics_env)]
+    fn test_config_param_ptr_presence() {
+        assert_eq!(config_param_ptr("_EPICS_RT_NONEXISTENT_VAR_12345"), None);
+        unsafe { std::env::set_var("_EPICS_RT_TEST_PTR", "") };
+        assert_eq!(config_param_ptr("_EPICS_RT_TEST_PTR"), None);
+        unsafe { std::env::set_var("_EPICS_RT_TEST_PTR", "abc") };
+        assert_eq!(
+            config_param_ptr("_EPICS_RT_TEST_PTR"),
+            Some("abc".to_string())
+        );
+        unsafe { std::env::remove_var("_EPICS_RT_TEST_PTR") };
     }
 
     #[test]

@@ -79,6 +79,15 @@ pub struct ScalcoutRecord {
     /// On-Change/transition decision diverged; and PVAL, which C lets an
     /// operator write to force or suppress the next output, did not exist.
     pub pval: f64,
+    /// LALM — C `sCalcoutRecord.dbd:858` `field(LALM,DBF_DOUBLE)`,
+    /// `special(SPC_NOMOD)`.
+    ///
+    /// The level `checkAlarms` last alarmed at (`sCalcoutRecord.c:699-751`),
+    /// which is what makes HYST a per-level hysteresis rather than a plain
+    /// deadband. Written only by the framework's analog ladder — the single
+    /// owner of the ten-field alarm surface this record shares with
+    /// calc/calcout/ai/ao.
+    pub lalm: f64,
     /// PSVL — C `sCalcoutRecord.dbd:63` `field(PSVL,DBF_STRING)`,
     /// `special(SPC_NOMOD)`.
     ///
@@ -152,6 +161,7 @@ impl Default for ScalcoutRecord {
             num_vals: [0.0; 12],
             str_vals: Default::default(),
             pval: 0.0,
+            lalm: 0.0,
             psvl: PvString::new(),
             calc_alarm: false,
             fetch_gate_failed: false,
@@ -348,6 +358,17 @@ static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PSVL",
         dbf_type: DbFieldType::String,
+        read_only: true,
+    },
+    // sCalcoutRecord.dbd:858 — `field(LALM,DBF_DOUBLE) { special(SPC_NOMOD) }`:
+    // the level `checkAlarms` last alarmed at, written by the ladder and refused
+    // to clients. The other nine alarm fields (HIHI/LOLO/HIGH/LOW + their
+    // severities + HYST) are deliberately ABSENT from this list so they route to
+    // `RecordInstance::common.analog_alarm` / `common.hyst` — the same path
+    // calc/calcout/ai/ao take.
+    FieldDesc {
+        name: "LALM",
+        dbf_type: DbFieldType::Double,
         read_only: true,
     },
     FieldDesc {
@@ -968,6 +989,7 @@ impl Record for ScalcoutRecord {
             "VAL" => Some(EpicsValue::Double(self.val)),
             "SVAL" => Some(EpicsValue::String(self.sval.clone())),
             "PVAL" => Some(EpicsValue::Double(self.pval)),
+            "LALM" => Some(EpicsValue::Double(self.lalm)),
             "PSVL" => Some(EpicsValue::String(self.psvl.clone())),
             "CALC" => Some(EpicsValue::String(self.calc.clone().into())),
             "CLCV" => Some(EpicsValue::Long(self.clcv)),
@@ -1027,6 +1049,14 @@ impl Record for ScalcoutRecord {
                 self.pval = value
                     .to_f64()
                     .ok_or_else(|| CaError::TypeMismatch("PVAL".into()))?;
+                Ok(())
+            }
+            // SPC_NOMOD to a client (the field list refuses that put); this arm
+            // is the framework analog ladder's write, C `pcalc->lalm = <level>`.
+            "LALM" => {
+                self.lalm = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("LALM".into()))?;
                 Ok(())
             }
             // C `dbPut` stores the string; `special()` compiles it and records

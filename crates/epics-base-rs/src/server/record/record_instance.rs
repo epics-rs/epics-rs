@@ -252,6 +252,14 @@ fn coerce_common_field_string(
         "SCAN" | "SSCN" | "PINI" => DbFieldType::Enum,
         "TSE" | "PHAS" | "PRIO" | "DISV" | "DISA" | "DISS" | "LCNT" | "UDFS" | "ACKT" | "ACKS"
         | "SEVR" | "STAT" | "NSEV" | "NSTA" => DbFieldType::Short,
+        // The analog-alarm limits and the hysteresis margin — `DBF_DOUBLE` in
+        // every dbd that declares them (`aiRecord.dbd.pod:357-388`,
+        // `calcRecord.dbd.pod:716-744`, `sCalcoutRecord.dbd:479-531`). A field
+        // missing from this table reaches its arm as the loader's raw String,
+        // and an arm that binds a typed variant then drops it: that is how
+        // `field(HYST,"2")` silently became 0 on every record whose hysteresis
+        // lives in `common.hyst` (calc/calcout/scalcout/ai/ao/longin/int64in).
+        "HIHI" | "HIGH" | "LOW" | "LOLO" | "HYST" => DbFieldType::Double,
         "DISP" | "UDF" => DbFieldType::Char,
         _ => return Ok(value),
     };
@@ -496,8 +504,19 @@ impl RecordInstance {
             // calcoutRecord.dbd.pod:1103+ (same). `sub` carries the same
             // HIHI/HIGH/LOLO/LOW + HHSV/HSV/LSV/LLSV set
             // (subRecord.dbd.pod:569-642) and runs the analog `checkAlarms`.
+            // `scalcout` declares the identical set (`sCalcoutRecord.dbd:479-531`
+            // HIHI/LOLO/HIGH/LOW/HHSV/LLSV/HSV/LSV/HYST + `:858` LALM) and its
+            // `checkAlarms` (`sCalcoutRecord.c:699-751`) is the same ladder, run
+            // BEFORE the OOPT switch (`:371`) precisely so a limit excursion can
+            // drive IVOA. Without the slot the record had no alarm surface at
+            // all: `caput scalc.HIHI 5` was a `FieldNotFound` and a scalcout
+            // could never go MINOR/MAJOR on its own result.
+            //
+            // **This match is the single owner of "which records have the analog
+            // ladder"** — `evaluate_alarms` runs it off the slot's presence, so a
+            // record added here gets the ladder and one absent cannot.
             "ai" | "ao" | "longin" | "longout" | "int64in" | "int64out" | "calc" | "calcout"
-            | "sub" => Some(AnalogAlarmConfig::default()),
+            | "sub" | "scalcout" => Some(AnalogAlarmConfig::default()),
             _ => None,
         };
         let mut common = CommonFields::default();
@@ -2109,7 +2128,7 @@ impl RecordInstance {
                 }
             }
             "HYST" => {
-                if let EpicsValue::Double(v) = value {
+                if let Some(v) = value.to_f64() {
                     self.common.hyst = v;
                 }
             }
@@ -2131,57 +2150,28 @@ impl RecordInstance {
             }
             "PACT" => return Err(CaError::ReadOnlyField("PACT".into())),
             "PROC" => { /* Trigger handled by put_record_field_from_ca; no-op here */ }
-            // Analog alarm fields — accept Double, Long, or String (DB-load path sends String)
+            // Analog alarm limits. The DB-load String was already coerced to
+            // `Double` by `coerce_common_field_string` — the one owner of
+            // "what type does this common field hold" — so every writer
+            // (`.db` load, `caput`, a link) lands here with a numeric value.
             "HIHI" => {
-                if let Some(a) = &mut self.common.analog_alarm {
-                    if let Some(v) = value.to_f64().or_else(|| {
-                        if let EpicsValue::String(s) = &value {
-                            s.as_str_lossy().parse::<f64>().ok()
-                        } else {
-                            None
-                        }
-                    }) {
-                        a.hihi = v;
-                    }
+                if let (Some(v), Some(a)) = (value.to_f64(), self.common.analog_alarm.as_mut()) {
+                    a.hihi = v;
                 }
             }
             "HIGH" => {
-                if let Some(a) = &mut self.common.analog_alarm {
-                    if let Some(v) = value.to_f64().or_else(|| {
-                        if let EpicsValue::String(s) = &value {
-                            s.as_str_lossy().parse::<f64>().ok()
-                        } else {
-                            None
-                        }
-                    }) {
-                        a.high = v;
-                    }
+                if let (Some(v), Some(a)) = (value.to_f64(), self.common.analog_alarm.as_mut()) {
+                    a.high = v;
                 }
             }
             "LOW" => {
-                if let Some(a) = &mut self.common.analog_alarm {
-                    if let Some(v) = value.to_f64().or_else(|| {
-                        if let EpicsValue::String(s) = &value {
-                            s.as_str_lossy().parse::<f64>().ok()
-                        } else {
-                            None
-                        }
-                    }) {
-                        a.low = v;
-                    }
+                if let (Some(v), Some(a)) = (value.to_f64(), self.common.analog_alarm.as_mut()) {
+                    a.low = v;
                 }
             }
             "LOLO" => {
-                if let Some(a) = &mut self.common.analog_alarm {
-                    if let Some(v) = value.to_f64().or_else(|| {
-                        if let EpicsValue::String(s) = &value {
-                            s.as_str_lossy().parse::<f64>().ok()
-                        } else {
-                            None
-                        }
-                    }) {
-                        a.lolo = v;
-                    }
+                if let (Some(v), Some(a)) = (value.to_f64(), self.common.analog_alarm.as_mut()) {
+                    a.lolo = v;
                 }
             }
             "HHSV" => {
@@ -2289,25 +2279,24 @@ impl RecordInstance {
             recgbl::rec_gbl_check_udf(&mut self.common);
         }
 
-        let rtype = self.record.record_type();
-        match rtype {
-            "ai" | "ao" | "longin" | "longout" | "int64in" | "int64out" | "calc" | "calcout"
-            | "sub" => {
-                if let Some(ref alarm_cfg) = self.common.analog_alarm.clone() {
-                    let val = match self.record.val() {
-                        Some(EpicsValue::Double(v)) => v,
-                        Some(EpicsValue::Long(v)) => v as f64,
-                        Some(EpicsValue::Int64(v)) => v as f64,
-                        _ => return,
-                    };
-                    self.evaluate_analog_alarm(val, alarm_cfg);
-                }
-            }
-            // bi / bo / busy / mbbi / mbbo STATE+COS (and mbbo SOFT)
-            // alarm evaluation now lives in each record's
-            // `Record::check_alarms` hook (C `checkAlarms`). Keeping an
-            // arm here would double-raise.
-            _ => {} // no-op for other types
+        // The analog-alarm SLOT is the enumeration — a record has the ladder iff
+        // `new_boxed` gave it a config, which is the one place the C `.dbd`
+        // survey lives. A second `match rtype` here was the same list written
+        // twice, and the two could disagree: scalcout was in neither, so its ten
+        // C alarm fields could not even be put.
+        //
+        // bi / bo / busy / mbbi / mbbo STATE+COS (and mbbo SOFT) alarm evaluation
+        // lives in each record's `Record::check_alarms` hook (C `checkAlarms`);
+        // those records carry no analog config, so they never reach here and
+        // cannot double-raise.
+        if let Some(ref alarm_cfg) = self.common.analog_alarm.clone() {
+            let val = match self.record.val() {
+                Some(EpicsValue::Double(v)) => v,
+                Some(EpicsValue::Long(v)) => v as f64,
+                Some(EpicsValue::Int64(v)) => v as f64,
+                _ => return,
+            };
+            self.evaluate_analog_alarm(val, alarm_cfg);
         }
     }
 

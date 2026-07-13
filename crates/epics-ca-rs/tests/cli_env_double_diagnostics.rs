@@ -22,7 +22,7 @@
 //! reject, `0x10` → 16, `1e400` → reject) are pinned by the per-boundary
 //! unit tests in `client::transport` and `server::tcp`.
 
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 /// stderr of `caget-rs` for a PV that does not exist — the tool still
 /// builds its client, which is where both variables are resolved. `-w 0.1`
@@ -136,5 +136,47 @@ fn max_search_period_below_lower_limit_is_named() {
         "Setting \"EPICS_CA_MAX_SEARCH_PERIOD\" = 60.000000 seconds",
     ] {
         assert!(err.contains(line), "missing {line:?} in stderr:\n{err}");
+    }
+}
+
+/// R16-18: the beacon-period diagnostic is printed ONCE, as C prints it.
+///
+/// C reads `EPICS_CAS_BEACON_PERIOD` in the single beacon thread
+/// (`online_notify.c:52-64`), so the compiled `softIoc` prints one
+/// "float fetch failed" pair for a bad value. The port resolved the server's
+/// UDP config from three points in startup (`bind_tcp_listeners`,
+/// `bind_sockets`, `CaServer::run`) and so printed the pair three times.
+#[test]
+fn beacon_period_reject_is_diagnosed_once_per_process() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_softioc-rs"))
+        .args(["--pv", "R16-18:PV:double:1.0"])
+        // Keep the IOC off the network: loopback interface, loopback beacon
+        // target, and a port the harness picks nothing else on.
+        .env("EPICS_CAS_INTF_ADDR_LIST", "127.0.0.1")
+        .env("EPICS_CAS_BEACON_ADDR_LIST", "127.0.0.1")
+        .env("EPICS_CAS_SERVER_PORT", "0")
+        .env("EPICS_CAS_BEACON_PERIOD", "garbage")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn softioc-rs");
+
+    // Startup is what prints; give it room, then take the IOC down and read
+    // everything it wrote.
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    let _ = child.kill();
+    let out = child.wait_with_output().expect("wait softioc-rs");
+    let err = String::from_utf8_lossy(&out.stderr);
+
+    for line in [
+        "Unable to find a real number in EPICS_CAS_BEACON_PERIOD=garbage",
+        "EPICS \"EPICS_CAS_BEACON_PERIOD\" float fetch failed",
+        "Setting \"EPICS_CAS_BEACON_PERIOD\" = 15.000000",
+    ] {
+        assert_eq!(
+            err.matches(line).count(),
+            1,
+            "{line:?} must appear exactly once (C prints it once); stderr:\n{err}"
+        );
     }
 }

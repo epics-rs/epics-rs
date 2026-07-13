@@ -62,7 +62,32 @@ impl Default for CasUdpConfig {
 /// UNCONDITIONALLY, not just when `EPICS_CAS_AUTO_BEACON_ADDR_LIST=YES`
 /// — pre-fix Rust nested it under `if auto_on`, so the misconfig
 /// silently escaped detection when AUTO=NO.
+///
+/// Resolved ONCE per process. C reads this configuration once — `rsrv_init`
+/// builds the address lists, and the single beacon thread
+/// (`online_notify.c:52-64`) reads `EPICS_CAS_BEACON_PERIOD` on its way up —
+/// so each diagnostic below is printed exactly once by a C IOC. The port calls
+/// this from three points in server startup (`bind_tcp_listeners`,
+/// `bind_sockets`, `CaServer::run`), which tripled every one of them: the
+/// compiled `softIoc` prints "float fetch failed" once for a bad beacon period,
+/// this printed it three times. Memoizing the whole resolution — not just the
+/// beacon period — also stops the interface discovery and the empty-list
+/// warning from repeating, and is what `EPICS_CA_*` client-side resolution
+/// already does.
 pub fn from_env() -> CaResult<CasUdpConfig> {
+    static RESOLVED: std::sync::OnceLock<Result<CasUdpConfig, String>> = std::sync::OnceLock::new();
+    // `resolve_from_env`'s only failure is `CaError::Protocol`, so caching the
+    // message and rebuilding the error loses nothing. `CaError` is not `Clone`.
+    RESOLVED
+        .get_or_init(|| resolve_from_env().map_err(|e| e.to_string()))
+        .clone()
+        .map_err(CaError::Protocol)
+}
+
+/// The uncached resolution behind [`from_env`] — every env read, every
+/// diagnostic, every interface probe. Tests drive this directly; production
+/// code goes through the memoized [`from_env`].
+fn resolve_from_env() -> CaResult<CasUdpConfig> {
     let mut cfg = CasUdpConfig::default();
 
     if let Some(list) = epics_base_rs::runtime::env::get("EPICS_CAS_INTF_ADDR_LIST") {
@@ -565,7 +590,7 @@ mod tests {
             std::env::set_var("EPICS_CAS_AUTO_BEACON_ADDR_LIST", "NO");
         }
 
-        let cfg = from_env().expect("from_env in test");
+        let cfg = resolve_from_env().expect("resolve_from_env in test");
         let leaked = cfg
             .beacon_addrs
             .iter()
@@ -607,7 +632,7 @@ mod tests {
             std::env::set_var("EPICS_CAS_AUTO_BEACON_ADDR_LIST", "NO");
         }
 
-        let cfg = from_env().expect("from_env in test");
+        let cfg = resolve_from_env().expect("resolve_from_env in test");
         let hit = cfg.beacon_addrs.iter().any(|a| {
             matches!(a, SocketAddr::V4(v4)
                 if v4.ip().octets() == [198, 51, 100, 7] && v4.port() == 5099)
@@ -648,7 +673,7 @@ mod tests {
             std::env::set_var("EPICS_CAS_AUTO_BEACON_ADDR_LIST", "NO");
             std::env::set_var("EPICS_CAS_BEACON_PERIOD", "0");
         }
-        let cfg = from_env().expect("from_env in test");
+        let cfg = resolve_from_env().expect("resolve_from_env in test");
         assert_eq!(
             cfg.beacon_period,
             Duration::from_secs(15),
@@ -659,7 +684,7 @@ mod tests {
         unsafe {
             std::env::set_var("EPICS_CAS_BEACON_PERIOD", "-5");
         }
-        let cfg = from_env().expect("from_env in test");
+        let cfg = resolve_from_env().expect("resolve_from_env in test");
         assert_eq!(
             cfg.beacon_period,
             Duration::from_secs(15),
@@ -670,7 +695,7 @@ mod tests {
         unsafe {
             std::env::set_var("EPICS_CAS_BEACON_PERIOD", "garbage");
         }
-        let cfg = from_env().expect("from_env in test");
+        let cfg = resolve_from_env().expect("resolve_from_env in test");
         assert_eq!(
             cfg.beacon_period,
             Duration::from_secs(15),
@@ -682,7 +707,7 @@ mod tests {
         unsafe {
             std::env::set_var("EPICS_CAS_BEACON_PERIOD", "0.05");
         }
-        let cfg = from_env().expect("from_env in test");
+        let cfg = resolve_from_env().expect("resolve_from_env in test");
         assert_eq!(
             cfg.beacon_period,
             Duration::from_secs_f64(0.05),
@@ -724,7 +749,7 @@ mod tests {
             std::env::set_var("EPICS_CAS_AUTO_BEACON_ADDR_LIST", "NO");
         }
 
-        let cfg = from_env().expect("from_env in test");
+        let cfg = resolve_from_env().expect("resolve_from_env in test");
         assert!(
             cfg.beacon_addrs.is_empty(),
             "AUTO=NO with empty explicit list must yield empty beacon_addrs (C parity), got {:?}",

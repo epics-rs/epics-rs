@@ -23,6 +23,7 @@ use crate::drivers::ip_port::DrvAsynIPPort;
 use crate::drivers::prologix::DrvAsynPrologixPort;
 use crate::drivers::serial_port::DrvAsynSerialPort;
 use crate::error::AsynResult;
+use crate::escape::escaped_from_raw;
 use crate::manager::PortManager;
 use crate::port::PortDriver;
 use crate::runtime::config::RuntimeConfig;
@@ -152,33 +153,12 @@ fn raw_from_escaped(src: &str) -> Vec<u8> {
     out
 }
 
-/// Rust port of EPICS `epicsStrnEscapedFromRaw` (libcom `epicsString.c:120`) —
-/// the inverse of [`raw_from_escaped`], and what C `asynShowEos` prints the
-/// terminator through (`asynShellCommands.c:305`). The C escapes, `\0` for NUL,
-/// `\xNN` (lower-case) for anything else unprintable, and the byte itself when
-/// `isprint`.
-fn escaped_from_raw(src: &[u8]) -> String {
-    let mut out = String::with_capacity(src.len());
-    for &c in src {
-        match c {
-            0x07 => out.push_str("\\a"),
-            0x08 => out.push_str("\\b"),
-            0x0c => out.push_str("\\f"),
-            b'\n' => out.push_str("\\n"),
-            b'\r' => out.push_str("\\r"),
-            b'\t' => out.push_str("\\t"),
-            0x0b => out.push_str("\\v"),
-            b'\\' => out.push_str("\\\\"),
-            b'\'' => out.push_str("\\'"),
-            b'"' => out.push_str("\\\""),
-            0 => out.push_str("\\0"),
-            // C `isprint` in the C locale: the printable ASCII range.
-            0x20..=0x7e => out.push(c as char),
-            _ => out.push_str(&format!("\\x{c:02x}")),
-        }
-    }
-    out
-}
+// `escaped_from_raw` — EPICS `epicsStrnEscapedFromRaw` (libcom
+// `epicsString.c:120-160`), the inverse of `raw_from_escaped` above and what C
+// `asynShowEos` prints the terminator through (`asynShellCommands.c:305`) — is
+// imported from `crate::escape`, which is also where the report's
+// `epicsStrPrintEscaped` form lives. The two differ on the NUL byte alone, and a
+// second copy of the table is how they came to differ on more (R16-48).
 
 /// The I/O deadline every asyn *shell* command puts on the `asynUser` it
 /// builds: C sets `pasynUser->timeout = 2` in `asynSetOption`

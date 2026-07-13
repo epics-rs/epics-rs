@@ -609,7 +609,9 @@ impl PortDriver for DrvAsynSerialPort {
             );
             let _ = writeln!(out, "    Characters written: {}", self.io.n_written);
             let _ = writeln!(out, "       Characters read: {}", self.io.n_read);
-            self.base.report_params(out, level.saturating_sub(1));
+            // The level is passed through, as C's `asynPortDriver::report`
+            // passes it to `reportParams` (asynPortDriver.cpp:3692).
+            self.base.report_params(out, level);
         }
     }
 

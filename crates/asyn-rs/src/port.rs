@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use std::any::Any;
@@ -269,6 +269,19 @@ pub struct PortDriverBase {
     /// [`Self::sync_connection_edge`], the same edge owner that raises the
     /// exception, so a connect that was never published is never counted.
     pub number_connects: u64,
+    /// How many exceptions this port has announced — the Rust form of C's
+    /// `epicsEventSignal(pport->notifyPortThread)` at the tail of
+    /// `announceExceptionOccurred` (asynManager.c:635-636), which is one of the
+    /// five things that wake C's `portThread`.
+    ///
+    /// A signal has no state to read back, so the actor cannot poll one; a
+    /// monotonic count can be, and it says the same thing: the number changed,
+    /// therefore an exception was announced since the actor last looked
+    /// ([`crate::port_actor::PortActor::take_port_thread_wake`]). Counting here —
+    /// in the one method every announcement goes through — is what keeps the wake
+    /// source tied to the announcement rather than to an enumeration of the ops
+    /// that happen to announce today.
+    exceptions_announced: AtomicU64,
 }
 
 impl PortDriverBase {
@@ -295,6 +308,7 @@ impl PortDriverBase {
             connect_retry_at: None,
             seconds_between_port_connect: DEFAULT_SECONDS_BETWEEN_PORT_CONNECT,
             number_connects: 0,
+            exceptions_announced: AtomicU64::new(0),
         }
     }
 
@@ -328,7 +342,16 @@ impl PortDriverBase {
     }
 
     /// Announce an exception through the global exception manager (if injected).
+    ///
+    /// C `announceExceptionOccurred` (asynManager.c:611-637) ends by signalling
+    /// `notifyPortThread` on a CANBLOCK port (:635-636) — the announcement *is* a
+    /// port-thread wake, which is why `asynEnable(port,1)` on a down port ends in
+    /// a connect attempt. [`Self::exceptions_announced`] is how the actor sees
+    /// that signal, so the count moves here and nowhere else: a port with no
+    /// exception sink still announced (C's fan-out over an empty list still
+    /// signals), so the count is bumped before the sink is even consulted.
     pub fn announce_exception(&self, exception: AsynException, addr: i32) {
+        self.exceptions_announced.fetch_add(1, Ordering::Release);
         if let Some(ref sink) = self.exception_sink {
             sink.announce(&ExceptionEvent {
                 port_name: self.port_name.clone(),
@@ -336,6 +359,13 @@ impl PortDriverBase {
                 addr,
             });
         }
+    }
+
+    /// How many exceptions this port has announced. Monotonic; the actor compares
+    /// it against the value it last saw to decide whether C would have signalled
+    /// `notifyPortThread` (asynManager.c:635-636).
+    pub fn exceptions_announced(&self) -> u64 {
+        self.exceptions_announced.load(Ordering::Acquire)
     }
 
     /// Query whether the port is connected — the truth, wherever it lives.
@@ -1039,40 +1069,29 @@ impl PortDriverBase {
         self.params.get_param_status(index, addr)
     }
 
-    /// Detailed parameter report matching C asynPortDriver::reportParams, written
-    /// to the stream the caller names (C's `FILE *fp`).
-    pub fn report_params(&self, out: &mut dyn std::fmt::Write, level: i32) {
+    /// C `asynPortDriver::reportParams` (asynPortDriver.cpp:1799-1809) — the
+    /// parameter block of the driver's report.
+    ///
+    /// `details` is the level `report` was called with, **unshifted**: C hands
+    /// `reportParams` the same number it got (:3692), and the level decides one
+    /// thing only — how many address lists are printed (`details >= 2` → all
+    /// `maxAddr` of them, else list 0 alone, :1804). The values are *not* a
+    /// deeper level: `paramVal::report` prints name, type, value and status for
+    /// every parameter at every level (paramVal.cpp:296-330).
+    ///
+    /// Passing `level - 1` here put the whole block one level late — `asynReport
+    /// 1` printed a bare count where C prints every parameter with its value, and
+    /// values only appeared at 3 (R16-46/47).
+    pub fn report_params(&self, out: &mut dyn std::fmt::Write, details: i32) {
         use std::fmt::Write as _;
-        let _ = writeln!(out, "  Number of parameters is {}", self.params.len());
-        if level < 1 {
-            return;
-        }
-        for i in 0..self.params.len() {
-            let name = self.params.param_name(i).unwrap_or("?");
-            let ptype = self
-                .params
-                .param_type(i)
-                .map(|t| format!("{t:?}"))
-                .unwrap_or("?".into());
-            if level >= 2 {
-                for addr in 0..self.max_addr.max(1) {
-                    let val = self
-                        .params
-                        .get_value(i, addr as i32)
-                        .map(|v| format!("{v:?}"))
-                        .unwrap_or("undefined".into());
-                    let (status, alarm_st, alarm_sev) = self
-                        .params
-                        .get_param_status(i, addr as i32)
-                        .unwrap_or((AsynStatus::Success, 0, 0));
-                    let _ = writeln!(
-                        out,
-                        "  param[{i}] name={name} type={ptype} addr={addr} val={val} status={status:?} alarm=({alarm_st},{alarm_sev})"
-                    );
-                }
-            } else {
-                let _ = writeln!(out, "  param[{i}] name={name} type={ptype}");
-            }
+        let num_addr = if details >= 2 {
+            self.max_addr.max(1)
+        } else {
+            1
+        };
+        for addr in 0..num_addr {
+            let _ = writeln!(out, "Parameter list {addr}");
+            self.params.report(out, addr as i32);
         }
     }
 
@@ -1484,27 +1503,35 @@ pub trait PortDriver: Send + Sync + 'static {
             // the constructor's zeroed fields, and reporting them invents an EOS
             // the port cannot have.
             if self.has_octet_interface() {
-                let esc = |eos: &[u8]| {
-                    eos.iter()
-                        .map(|b| match b {
-                            b'\r' => "\\r".to_string(),
-                            b'\n' => "\\n".to_string(),
-                            c => (*c as char).to_string(),
-                        })
-                        .collect::<String>()
-                };
+                // C escapes the terminator with `epicsStrPrintEscaped` (:3687,
+                // :3690) — the whole libCom table, not just CR and LF. A private
+                // two-case table wrote a binary terminator (`\x03`, ESC, TAB, NUL)
+                // raw into stdout (R16-48); [`crate::escape`] is the one owner.
                 let input = base.input_eos(0);
                 let output = base.output_eos(0);
-                let _ = writeln!(out, "  Input EOS[{}]: {}", input.len(), esc(input));
-                let _ = writeln!(out, "  Output EOS[{}]: {}", output.len(), esc(output));
+                let _ = writeln!(
+                    out,
+                    "  Input EOS[{}]: {}",
+                    input.len(),
+                    crate::escape::print_escaped(input)
+                );
+                let _ = writeln!(
+                    out,
+                    "  Output EOS[{}]: {}",
+                    output.len(),
+                    crate::escape::print_escaped(output)
+                );
             }
-            base.report_params(out, level.saturating_sub(1));
+            // C hands its own level straight to `reportParams` (:3692).
+            base.report_params(out, level);
         }
-        if level >= 2 {
-            for (k, v) in &base.options {
-                let _ = writeln!(out, "  option: {k} = {v}");
-            }
-        }
+        // There is no options block: `asynPortDriver::report` never prints one
+        // (asynPortDriver.cpp:3677-3710), and it could not — `asynOption` is a
+        // get/set pair keyed by a string the *driver* defines, with nothing to
+        // enumerate. The `option: k = v` lines this printed at `details >= 2` had
+        // no C source and no fixed key set to be complete over: they listed
+        // whatever happened to have been written through `setOption`, which is not
+        // the port's option state (R16-49).
         if level >= 3 {
             report_interrupt_clients(out, base);
         }
@@ -3399,5 +3426,190 @@ mod tests {
                 .unwrap(),
             0x05
         );
+    }
+
+    /// R16-47: the parameter block is one level *late* no longer.
+    ///
+    /// C `asynPortDriver::report` hands `reportParams` the level it was given,
+    /// unchanged (asynPortDriver.cpp:3692); `reportParams` prints list 0 at any
+    /// level and all `maxAddr` lists at `details >= 2` (:1804); and
+    /// `paramVal::report` prints name, type, value and status for every parameter
+    /// at every level (paramVal.cpp:296-330). Passing `level - 1` made
+    /// `asynReport 1` print a bare count, and values appear only at 3.
+    ///
+    /// One case per threshold boundary: details 0 (no block), 1 (list 0, with
+    /// values), 2 (every address list).
+    #[test]
+    fn report_prints_the_parameter_block_at_the_c_detail_levels() {
+        struct Drv {
+            base: PortDriverBase,
+        }
+        impl PortDriver for Drv {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+        }
+
+        let mut base = PortDriverBase::new(
+            "rep",
+            2,
+            PortFlags {
+                multi_device: true,
+                ..PortFlags::default()
+            },
+        );
+        let n = base.params.create_param("N", ParamType::Int32).unwrap();
+        let x = base.params.create_param("X", ParamType::Float64).unwrap();
+        let s_idx = base.params.create_param("S", ParamType::Octet).unwrap();
+        let bits = base
+            .params
+            .create_param("BITS", ParamType::UInt32Digital)
+            .unwrap();
+        base.params.set_int32(n, 0, 7).unwrap();
+        base.params.set_float64(x, 0, 0.1 + 0.2).unwrap();
+        base.params
+            .set_string(s_idx, 0, "hello".to_string())
+            .unwrap();
+        base.params.set_uint32(bits, 0, 0xa5, 0xff, 0).unwrap();
+        base.params
+            .set_uint32_interrupt(bits, 0, 0x0f, InterruptReason::ZeroToOne)
+            .unwrap();
+        // Addr 1 is left untouched: its parameters must report as undefined.
+        let drv = Drv { base };
+
+        // details 0 — C prints the port line and stops (:3678-3680).
+        let mut out = String::new();
+        drv.report(&mut out, 0);
+        assert!(
+            !out.contains("Parameter"),
+            "details 0 has no parameter block: {out}"
+        );
+
+        // details 1 — list 0, the count, and every parameter WITH its value.
+        let mut out = String::new();
+        drv.report(&mut out, 1);
+        assert!(
+            out.contains("Parameter list 0\nNumber of parameters is: 4\n"),
+            "C's paramList::report header (asynPortDriver.cpp:887): {out}"
+        );
+        assert!(
+            out.contains("Parameter 0 type=asynInt32, name=N, value=7, status=0\n"),
+            "{out}"
+        );
+        // C's `%g`: six significant digits, so 0.1+0.2 is `0.3`, not
+        // `0.30000000000000004`.
+        assert!(
+            out.contains("Parameter 1 type=asynFloat64, name=X, value=0.3, status=0\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("Parameter 2 type=string, name=S, value=hello, status=0\n"),
+            "C calls an octet parameter `string` (paramVal.cpp:328): {out}"
+        );
+        assert!(
+            out.contains(
+                "Parameter 3 type=asynUInt32Digital, name=BITS, value=0xa5, status=0, \
+                 risingMask=0xf, fallingMask=0x0, callbackMask=0xa5\n"
+            ),
+            "C prints the three masks with the value (paramVal.cpp:314-316): {out}"
+        );
+        assert!(
+            !out.contains("Parameter list 1"),
+            "below details 2 C reports one address list (asynPortDriver.cpp:1804): {out}"
+        );
+
+        // details 2 — every address list, and addr 1 is undefined.
+        let mut out = String::new();
+        drv.report(&mut out, 2);
+        assert!(out.contains("Parameter list 1\n"), "{out}");
+        assert!(
+            out.contains("Parameter 0 type=asynInt32, name=N, value is undefined\n"),
+            "an unset parameter prints C's undefined line (paramVal.cpp:304): {out}"
+        );
+    }
+
+    /// R16-48: the report escapes a terminator the way C does — the whole libCom
+    /// table, not just CR and LF.
+    ///
+    /// C prints the EOS pair with `epicsStrPrintEscaped` (asynPortDriver.cpp:3687,
+    /// 3690), whose table is `\a \b \f \n \r \t \v \\ \' \"`, the byte itself
+    /// when `isprint`, and `\xNN` otherwise (epicsString.c:230-262). The report's
+    /// own two-case table wrote a binary terminator raw into stdout.
+    #[test]
+    fn report_escapes_the_eos_with_the_c_table() {
+        struct Drv {
+            base: PortDriverBase,
+        }
+        impl PortDriver for Drv {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
+                crate::interfaces::octet_transport_capabilities()
+            }
+        }
+
+        let mut drv = Drv {
+            base: PortDriverBase::new("eos_rep", 1, PortFlags::default()),
+        };
+        // A real binary terminator (C caps an EOS at two bytes): ESC, then NUL —
+        // neither of which the old two-case table escaped.
+        drv.set_input_eos(&AsynUser::default(), b"\x1b\0").unwrap();
+        // …and the named escapes beyond CR/LF: TAB and BEL.
+        drv.set_output_eos(&AsynUser::default(), b"\t\x07").unwrap();
+
+        let mut out = String::new();
+        drv.report(&mut out, 1);
+        assert!(
+            out.contains("  Input EOS[2]: \\x1b\\x00\n"),
+            "C's epicsStrPrintEscaped prints NUL as \\x00 — it has no `case 0` (epicsString.c:255-260): {out}"
+        );
+        assert!(
+            out.contains("  Output EOS[2]: \\t\\a\n"),
+            "BEL is `\\a` in C's table, not `\\x07` (epicsString.c:245): {out}"
+        );
+    }
+
+    /// R16-49: the report has no options block, at any level.
+    ///
+    /// C `asynPortDriver::report` (asynPortDriver.cpp:3677-3710) prints the port
+    /// name, the timestamp, the EOS pair, the parameter lists and — at
+    /// `details >= 3` — the interrupt clients. It never prints options, and it
+    /// could not: `asynOption` is a `getOption`/`setOption` pair keyed by a
+    /// driver-defined string, with no enumeration to walk.
+    #[test]
+    fn report_prints_no_options_block() {
+        struct Drv {
+            base: PortDriverBase,
+        }
+        impl PortDriver for Drv {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+        }
+
+        let mut drv = Drv {
+            base: PortDriverBase::new("opt_rep", 1, PortFlags::default()),
+        };
+        drv.set_option(&mut AsynUser::default(), "baud", "9600")
+            .unwrap();
+
+        for level in 0..=4 {
+            let mut out = String::new();
+            drv.report(&mut out, level);
+            assert!(
+                !out.contains("option") && !out.contains("baud"),
+                "asynReport {level} must print no options block: {out}"
+            );
+        }
     }
 }

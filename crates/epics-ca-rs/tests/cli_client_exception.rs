@@ -37,18 +37,10 @@
 //! about.)
 
 use std::process::Command;
-use std::time::Duration;
 
 use epics_base_rs::server::records::longout::LongoutRecord;
 use epics_ca_rs::server::CaServer;
 use serial_test::serial;
-
-fn free_port() -> u16 {
-    let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve free CA server port");
-    let p = probe.local_addr().unwrap().port();
-    drop(probe);
-    p
-}
 
 /// (stdout, stderr, exit code) of the real `caput-rs`.
 async fn caput(port: u16, args: &[&str]) -> (String, String, i32) {
@@ -71,16 +63,17 @@ async fn caput(port: u16, args: &[&str]) -> (String, String, i32) {
     )
 }
 
+/// The server TAKES its port by binding it (`.port(0)` → read back
+/// `udp_port()`); nothing probes a port and hands the number on.
 async fn server_with_longout(pv: &'static str, val: i32) -> u16 {
-    let port = free_port();
     let server = CaServer::builder()
-        .port(port)
+        .port(0)
         .record(pv, LongoutRecord::new(val))
         .build()
         .await
         .expect("build CA server");
+    let port = server.udp_port();
     tokio::spawn(async move { server.run().await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
     port
 }
 

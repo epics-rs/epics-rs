@@ -16,32 +16,23 @@
 //! `CaServer`, so they assert the observable contract: stdout, stderr and
 //! the exit code.
 
-use std::time::Duration;
-
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_ca_rs::server::CaServer;
 use tokio::process::Command;
 
-/// Reserve and immediately release a free localhost TCP port so the
-/// `CaServer` can bind it.
-fn free_port() -> u16 {
-    let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve free CA server port");
-    let p = probe.local_addr().unwrap().port();
-    drop(probe);
-    p
-}
-
 /// Bring up a server holding one scalar `ai` PV.
+///
+/// The server TAKES its port by binding it (`.port(0)` → read back
+/// `udp_port()`); nothing probes a port and hands the number on.
 async fn server_with_ai(pv: &'static str, val: f64) -> u16 {
-    let port = free_port();
     let server = CaServer::builder()
-        .port(port)
+        .port(0)
         .record(pv, AiRecord::new(val))
         .build()
         .await
         .expect("build CA server");
+    let port = server.udp_port();
     tokio::spawn(async move { server.run().await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
     port
 }
 

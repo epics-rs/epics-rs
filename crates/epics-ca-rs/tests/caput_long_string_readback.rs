@@ -11,32 +11,24 @@
 //! the readbacks with `ValueFormat::default()`, so `caput-rs -S` printed the
 //! CHAR waveform back as a numeric array (`6 104 101 108 108 111`).
 
-use std::time::Duration;
-
 use epics_base_rs::types::EpicsValue;
 use epics_ca_rs::server::CaServer;
 use tokio::process::Command;
 
-fn free_port() -> u16 {
-    let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve free port");
-    let p = probe.local_addr().expect("addr").port();
-    drop(probe);
-    p
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn caput_dash_s_prints_both_readbacks_as_long_strings() {
-    let port = free_port();
     let mut initial = b"before".to_vec();
     initial.resize(16, 0);
+    // The server TAKES its port by binding it (`.port(0)` → read back
+    // `udp_port()`); nothing probes a port and hands the number on.
     let server = CaServer::builder()
-        .port(port)
+        .port(0)
         .pv("R922:LSTR", EpicsValue::CharArray(initial))
         .build()
         .await
         .expect("build CA server");
+    let port = server.udp_port();
     tokio::spawn(async move { server.run().await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     let out = Command::new(env!("CARGO_BIN_EXE_caput-rs"))
         .args(["-w", "2", "-S", "R922:LSTR", "hello"])

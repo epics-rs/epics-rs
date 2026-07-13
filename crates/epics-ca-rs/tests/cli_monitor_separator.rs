@@ -26,13 +26,6 @@ use epics_base_rs::server::records::ao::AoRecord;
 use epics_ca_rs::server::CaServer;
 use serial_test::serial;
 
-fn free_port() -> u16 {
-    let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve free CA server port");
-    let p = probe.local_addr().unwrap().port();
-    drop(probe);
-    p
-}
-
 /// The first line the real `camonitor-rs` prints for `args`.
 ///
 /// camonitor never exits, so this kills it once the leading event is out. The
@@ -62,14 +55,16 @@ async fn first_line(port: u16, args: &[&str]) -> String {
         .to_string()
 }
 
+/// The server TAKES its port by binding it (`.port(0)` → read back
+/// `udp_port()`); nothing probes a port and hands the number on.
 async fn server_with_ao(pv: &'static str, val: f64) -> u16 {
-    let port = free_port();
     let server = CaServer::builder()
-        .port(port)
+        .port(0)
         .record(pv, AoRecord::new(val))
         .build()
         .await
         .expect("build CA server");
+    let port = server.udp_port();
     // Process once so the record is DEFINED: a never-processed record carries
     // the initial UDF severity (C `iocInit.c:521-523` — STAT=UDF SEVR=INVALID),
     // which would fill the two alarm columns this test wants empty.
@@ -80,7 +75,6 @@ async fn server_with_ao(pv: &'static str, val: f64) -> u16 {
         .await
         .expect("seed process");
     tokio::spawn(async move { server.run().await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
     port
 }
 

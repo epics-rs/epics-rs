@@ -29,7 +29,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::process::Command;
 
-fn free_port() -> u16 {
+/// A port number for the test's OWN proxy, which needs the same number on
+/// UDP and TCP and so cannot use the `.port(0)` + read-back pattern.
+///
+/// Never use this for a `CaServer`: a server TAKES its port by binding it
+/// (`.port(0)` → `udp_port()`), because a probed port is free only until
+/// the next socket in this process claims it.
+fn free_proxy_port() -> u16 {
     let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve free port");
     let p = probe.local_addr().unwrap().port();
     drop(probe);
@@ -70,13 +76,19 @@ async fn relay(mut from: tokio::net::tcp::OwnedReadHalf, mut to: tokio::net::tcp
     }
 }
 
-/// Stand a UDP+TCP proxy in front of `server_port`. The UDP half relays the
-/// name search and rewrites the TCP port the server advertises in its SEARCH
-/// reply (header `data_type`) to the proxy's own, so the client's data
-/// circuit lands here. Returns the proxy port.
-async fn read_dropping_proxy(server_port: u16) -> u16 {
-    let proxy_port = free_port();
-    let server: SocketAddr = format!("127.0.0.1:{server_port}").parse().unwrap();
+/// Stand a UDP+TCP proxy in front of the server. The UDP half relays the
+/// name search to `server_udp` and rewrites the TCP port the server
+/// advertises in its SEARCH reply (header `data_type`) to the proxy's own,
+/// so the client's data circuit lands here and is relayed to `server_tcp`.
+/// Returns the proxy port.
+///
+/// The two server ports are distinct: the server bound them itself from
+/// `.port(0)`, so the UDP search port and the TCP data port are separate
+/// ephemerals.
+async fn read_dropping_proxy(server_udp: u16, server_tcp: u16) -> u16 {
+    let proxy_port = free_proxy_port();
+    let search: SocketAddr = format!("127.0.0.1:{server_udp}").parse().unwrap();
+    let circuit: SocketAddr = format!("127.0.0.1:{server_tcp}").parse().unwrap();
 
     let udp = UdpSocket::bind(("127.0.0.1", proxy_port))
         .await
@@ -90,7 +102,7 @@ async fn read_dropping_proxy(server_port: u16) -> u16 {
             let Ok((n, client)) = udp.recv_from(&mut buf).await else {
                 return;
             };
-            if upstream.send_to(&buf[..n], server).await.is_err() {
+            if upstream.send_to(&buf[..n], search).await.is_err() {
                 continue;
             }
             let mut reply = [0u8; 4096];
@@ -122,7 +134,7 @@ async fn read_dropping_proxy(server_port: u16) -> u16 {
             let Ok((client, _)) = tcp.accept().await else {
                 return;
             };
-            let Ok(upstream) = TcpStream::connect(server).await else {
+            let Ok(upstream) = TcpStream::connect(circuit).await else {
                 continue;
             };
             let (cr, cw) = client.into_split();
@@ -139,17 +151,16 @@ async fn read_dropping_proxy(server_port: u16) -> u16 {
 /// the zeroed readback as `New :`, and exits 0.
 #[tokio::test(flavor = "multi_thread")]
 async fn caput_readback_timeout_prints_the_new_line_and_exits_zero() {
-    let server_port = free_port();
     let server = CaServer::builder()
-        .port(server_port)
+        .port(0)
         .record("R918:PUT", AiRecord::new(1.0))
         .build()
         .await
         .expect("build CA server");
+    let (server_udp, server_tcp) = (server.udp_port(), server.tcp_port());
     tokio::spawn(async move { server.run().await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
-    let proxy_port = read_dropping_proxy(server_port).await;
+    let proxy_port = read_dropping_proxy(server_udp, server_tcp).await;
 
     let out = Command::new(env!("CARGO_BIN_EXE_caput-rs"))
         .args(["-w", "0.5", "R918:PUT", "42"])

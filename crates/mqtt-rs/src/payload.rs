@@ -955,7 +955,7 @@ mod tests {
 
     /// BUG 5 — the FLAT INTARRAY decode path (already producing
     /// `Int32Array`) stays intact; the event loop now delivers it via
-    /// `ParamSetValue::Int32Array`.
+    /// `ParamSetValue::Value` carrying a `ParamValue::Int32Array`.
     #[test]
     fn decode_flat_int_array_for_inbound_delivery() {
         let addr = TopicAddress::parse("FLAT:INTARRAY test/arr").unwrap();

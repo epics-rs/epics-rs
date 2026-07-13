@@ -465,6 +465,19 @@ fn parse_monitor_line(line: &str) -> Option<MonitorEvent> {
     let mut it = line.split_whitespace().peekable();
     let pv = it.next()?.to_string();
 
+    // A disconnect is observable behavior and must be recorded, not dropped.
+    // Checked before the timestamp, because camonitor prints it as
+    // `PV <undefined> DISCONNECTED` — it carries the undefined-timestamp shape
+    // and would otherwise be parsed as an update whose value is the word
+    // DISCONNECTED.
+    if line.contains("DISCONNECTED") {
+        return Some(MonitorEvent {
+            pv,
+            value: "<DISCONNECTED>".into(),
+            alarm: None,
+        });
+    }
+
     // Consume the timestamp, whichever shape it took.
     let first = *it.peek()?;
     if first == "<undefined>" {
@@ -472,13 +485,6 @@ fn parse_monitor_line(line: &str) -> Option<MonitorEvent> {
     } else if first.len() == 10 && first.as_bytes()[4] == b'-' {
         it.next(); // date
         it.next()?; // time
-    } else if line.contains("DISCONNECTED") {
-        // A disconnect is observable behavior and must be recorded, not dropped.
-        return Some(MonitorEvent {
-            pv,
-            value: "<DISCONNECTED>".into(),
-            alarm: None,
-        });
     } else {
         return None;
     }

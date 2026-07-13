@@ -1038,6 +1038,12 @@ mod responder_bind_tests {
 
     /// Boundary — a fixed port keeps the datagram-fanout reuse flags, so
     /// the well-known CA port can still be co-bound (caRepeater parity).
+    ///
+    /// Unix only: `bind_responder_socket` sets no reuse flag at all on
+    /// Windows (its `SO_REUSEADDR` has socket-hijack semantics — see the
+    /// `cfg(not(windows))` gate there), so co-binding is *correctly*
+    /// refused on Windows and there is no fanout to assert.
+    #[cfg(unix)]
     #[test]
     fn fixed_responder_port_still_allows_datagram_fanout() {
         let rt = tokio::runtime::Builder::new_current_thread()

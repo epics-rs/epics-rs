@@ -6,8 +6,9 @@ use std::collections::HashMap;
 
 #[test]
 fn test_register_record_type() {
-    let builder =
-        CaServerBuilder::new().register_record_type("busy", || Box::new(BusyRecord::default()));
+    let builder = CaServerBuilder::new()
+        .port(0)
+        .register_record_type("busy", || Box::new(BusyRecord::default()));
     // Registration succeeds — builder is valid
     drop(builder);
 }
@@ -23,6 +24,7 @@ record(busy, "TEST:BUSY") {
 "#;
     let macros = HashMap::new();
     let server = CaServerBuilder::new()
+        .port(0)
         .register_record_type("busy", || Box::new(BusyRecord::default()))
         .db_string(db, &macros)
         .unwrap()

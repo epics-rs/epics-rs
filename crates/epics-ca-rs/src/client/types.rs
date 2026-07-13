@@ -185,6 +185,35 @@ pub enum CaExceptionKind {
     ServerDisconnect,
 }
 
+/// The operation an exception is about — libca `CA_OP_*` (`cadef.h:150-160`).
+/// The numeric code is what the default handler prints as `op=%u`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CaOp {
+    Get,
+    Put,
+    CreateChannel,
+    AddEvent,
+    ClearEvent,
+    /// libca `CA_OP_OTHER` — anything the exception table routes through
+    /// `cac::defaultExcep`.
+    Other,
+}
+
+impl CaOp {
+    /// The `CA_OP_*` constant (`cadef.h`).
+    pub fn code(self) -> u32 {
+        match self {
+            CaOp::Get => 0,
+            CaOp::Put => 1,
+            CaOp::CreateChannel => 2,
+            CaOp::AddEvent => 3,
+            CaOp::ClearEvent => 4,
+            CaOp::Other => 5,
+        }
+    }
+}
+
 /// Single OOB-error notification delivered to a registered handler.
 ///
 /// `#[non_exhaustive]` so additional context fields (e.g. timestamp,
@@ -201,7 +230,29 @@ pub struct CaException {
     pub pv_name: Option<String>,
     /// ECA status code when applicable (server-error path).
     pub status: Option<u32>,
+    /// Which operation failed. libca puts this in `exception_handler_args.op`
+    /// and prints it as `op=%u` in the default block.
+    pub op: CaOp,
+    /// DBR type of the failed request, echoed back inside the
+    /// `CA_PROTO_ERROR` payload. `None` when the error carried no request
+    /// echo.
+    pub data_type: Option<u16>,
+    /// Element count of the failed request, same source as `data_type`.
+    pub count: Option<u32>,
+    /// libca's `__FILE__` / `__LINE__` for the site that raises this
+    /// exception — reproduced verbatim (C++ path and all) because the block
+    /// this feeds is a user-facing diagnostic operators grep, and its text is
+    /// C's. `None` where libca passes a null file (`cac::defaultExcep`), which
+    /// suppresses the `Source File:` line.
+    pub source: Option<(&'static str, u32)>,
 }
+
+/// libca `oldChannelNotify::writeException` (`oldChannelNotify.cpp:158-159`) —
+/// the site a server-rejected **plain** `CA_PROTO_WRITE` reaches, since
+/// `cac::writeExcep` (`cac.cpp:1049-1061`) looks the channel up and there is no
+/// per-op callback to complete. This is what a C `caput` prints under
+/// `Source File:`.
+pub(crate) const LIBCA_WRITE_EXCEPTION_SITE: (&str, u32) = ("../oldChannelNotify.cpp", 159);
 
 /// Boxed handler. Returns `()`; logs are emitted regardless so a
 /// handler that panics or is slow can't suppress the existing
@@ -215,14 +266,126 @@ pub type CaExceptionHandler = Arc<dyn Fn(&CaException) + Send + Sync>;
 pub(crate) type CaExceptionSlot = Arc<parking_lot::RwLock<Option<CaExceptionHandler>>>;
 
 /// Best-effort dispatch — never panics, even if the handler does.
+///
+/// The slot is the ONLY gate: an exception either reaches the registered
+/// handler or the C-parity default one ([`print_default_exception`]). libca
+/// works the same way (`ca_client_context::exception`, `ca_client_context.cpp`
+/// :289-349: `if (pFunc) (*pFunc)(args); else this->signal(...)`), so a client
+/// that installs no handler still sees the `CA.Client.Exception` block. Rust
+/// used to drop the no-handler case on the floor, which is why a
+/// server-rejected `caput` printed nothing at all (R13-24).
 pub(crate) fn dispatch_exception(slot: &CaExceptionSlot, exc: CaException) {
     let handler = slot.read().clone();
-    if let Some(h) = handler {
+    match handler {
         // Catch panics so a buggy handler doesn't poison the
         // dispatching task. We can't recover the handler's bug but
         // we can keep the rest of the client functional.
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| h(&exc)));
+        Some(h) => {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| h(&exc)));
+        }
+        None => print_default_exception(&exc),
     }
+}
+
+/// libca's default exception handler: `ca_client_context::vSignal`
+/// (`ca_client_context.cpp:361-417`). Writes to stderr, in one `write` so two
+/// concurrent exceptions cannot interleave mid-block:
+///
+/// ```text
+/// CA.Client.Exception...............................................
+///     Warning: "Channel write request failed"
+///     Context: "op=1, channel=TST:LO, type=DBR_STRING, count=1, ctx="TST:LO""
+///     Source File: ../oldChannelNotify.cpp line 159
+///     Current Time: Mon Jul 13 2026 09:16:02.135621071
+/// ..................................................................
+/// ```
+///
+/// DEVIATION, deliberate: C ends `vSignal` with `abort()` for any status that
+/// is neither a success nor a `CA_K_WARNING` — a library aborting the host
+/// process on a server-side error is not something this port reproduces. We
+/// always print the closing rule and return.
+pub(crate) fn print_default_exception(exc: &CaException) {
+    use std::io::Write as _;
+
+    if let Some(block) = render_default_exception(exc, &exception_timestamp()) {
+        // One `write_all`: two exceptions racing must not interleave mid-block.
+        let _ = std::io::stderr().write_all(block.as_bytes());
+    }
+}
+
+/// The block itself, split out from the stderr write so the exact C text is
+/// testable. `None` means C prints nothing for this exception.
+pub(crate) fn render_default_exception(exc: &CaException, now: &str) -> Option<String> {
+    use std::fmt::Write as _;
+
+    // `CA_PROTO_SERVER_DISCONN` never reaches libca's `vSignal`: it goes to
+    // `cac::verifyAndDisconnectChan` and out through the channel's connection
+    // callback, so C prints nothing. The [`CaExceptionKind::ServerDisconnect`]
+    // notification is a port extension for library users who want a global
+    // stream, and printing it would put blocks on a C tool's stderr that C
+    // does not print.
+    if exc.kind == CaExceptionKind::ServerDisconnect {
+        return None;
+    }
+
+    // `ca_client_context.cpp:365-375`, indexed by CA_EXTRACT_SEVERITY.
+    const SEVERITY: [&str; 8] = [
+        "Warning", "Success", "Error", "Info", "Fatal", "Fatal", "Fatal", "Fatal",
+    ];
+
+    let status = exc.status.unwrap_or(crate::protocol::ECA_INTERNAL);
+    let severity = SEVERITY[(crate::protocol::eca_severity(status) & 0x7) as usize];
+
+    let mut block = String::with_capacity(320);
+    block.push_str("CA.Client.Exception...............................................\n");
+    let _ = writeln!(
+        block,
+        "    {severity}: \"{}\"",
+        crate::protocol::eca_message(status)
+    );
+    let _ = writeln!(block, "    Context: \"{}\"", exception_context(exc));
+    if let Some((file, line)) = exc.source {
+        let _ = writeln!(block, "    Source File: {file} line {line}");
+    }
+    let _ = writeln!(block, "    Current Time: {now}");
+    block.push_str("..................................................................\n");
+    Some(block)
+}
+
+/// The `Context:` payload. libca has exactly two shapes, one per
+/// `ca_client_context::exception` overload:
+///
+/// * channel-scoped (`ca_client_context.cpp:317-349`) — the args carry a
+///   chid/type/count, and `signal` renders
+///   `op=%u, channel=%s, type=%s, count=%lu, ctx="%s"`;
+/// * plain (`ca_client_context.cpp:289-315`) — the ctx text is printed as-is.
+///   Producers that want more in it put it there themselves, exactly as
+///   `cac::defaultExcep` does with its `host=%s ctx=%.400s`.
+///
+/// `data_type` is the discriminator because it is set only where libca has a
+/// `caHdrLargeArray` to take it from — a channel exception.
+fn exception_context(exc: &CaException) -> String {
+    match (&exc.pv_name, exc.data_type) {
+        (Some(pv), Some(dbr)) => format!(
+            "op={}, channel={pv}, type={}, count={}, ctx=\"{}\"",
+            exc.op.code(),
+            epics_base_rs::types::dbr_type_to_text(dbr),
+            exc.count.unwrap_or(0),
+            exc.message,
+        ),
+        _ => exc.message.clone(),
+    }
+}
+
+/// C `epicsTime::strftime("%a %b %d %Y %H:%M:%S.%f")` — local time, and `%f`
+/// is nine digits of nanoseconds (`epicsTime.cpp:243-262`).
+fn exception_timestamp() -> String {
+    let now = chrono::Local::now();
+    format!(
+        "{}.{:09}",
+        now.format("%a %b %d %Y %H:%M:%S"),
+        now.timestamp_subsec_nanos()
+    )
 }
 
 // --- Client identity (user / host advertised on circuit handshakes) ---
@@ -465,6 +628,100 @@ impl CidAllocator {
     #[cfg(test)]
     pub(crate) fn seed_next(&self, v: u32) {
         self.next.store(v, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod default_exception_tests {
+    use super::*;
+
+    fn put_failed() -> CaException {
+        CaException {
+            kind: CaExceptionKind::ServerError,
+            message: "TST:LO".to_string(),
+            server_addr: Some("127.0.0.1:5064".parse().unwrap()),
+            pv_name: Some("TST:LO".to_string()),
+            status: Some(crate::protocol::ECA_PUTFAIL),
+            op: CaOp::Put,
+            data_type: Some(0), // DBR_STRING
+            count: Some(1),
+            source: Some(LIBCA_WRITE_EXCEPTION_SITE),
+        }
+    }
+
+    /// Byte-for-byte the block the compiled C `caput` (EPICS 7.0.10.1-DEV)
+    /// wrote to stderr for `caput TST:LO abc` against a live softIoc, with the
+    /// clock pinned.
+    #[test]
+    fn a_rejected_write_renders_c_s_block() {
+        let got = render_default_exception(&put_failed(), "Mon Jul 13 2026 09:25:31.803490065")
+            .expect("C prints a block for a channel write exception");
+        assert_eq!(
+            got,
+            concat!(
+                "CA.Client.Exception...............................................\n",
+                "    Warning: \"Channel write request failed\"\n",
+                "    Context: \"op=1, channel=TST:LO, type=DBR_STRING, count=1, ctx=\"TST:LO\"\"\n",
+                "    Source File: ../oldChannelNotify.cpp line 159\n",
+                "    Current Time: Mon Jul 13 2026 09:25:31.803490065\n",
+                "..................................................................\n",
+            )
+        );
+    }
+
+    /// The severity word comes from the status, not from the kind
+    /// (`ca_client_context.cpp:365-375`).
+    #[test]
+    fn the_severity_word_tracks_the_eca_status() {
+        let mut exc = put_failed();
+        exc.status = Some(crate::protocol::ECA_BADTYPE); // CA_K_ERROR
+        let block = render_default_exception(&exc, "T").unwrap();
+        assert!(
+            block.contains("    Error: \"The data type specified is invalid\"\n"),
+            "{block}"
+        );
+    }
+
+    /// A non-channel exception takes libca's plain overload: the ctx text is
+    /// printed as-is and there is NO `Source File:` line
+    /// (`cac::defaultExcep` passes a null file).
+    #[test]
+    fn a_non_channel_exception_prints_the_bare_context() {
+        let exc = CaException {
+            kind: CaExceptionKind::ServerError,
+            message: "host=127.0.0.1:5064 ctx=whatever".to_string(),
+            server_addr: Some("127.0.0.1:5064".parse().unwrap()),
+            pv_name: None,
+            status: Some(crate::protocol::ECA_BADMASK),
+            op: CaOp::Other,
+            data_type: None,
+            count: None,
+            source: None,
+        };
+        let block = render_default_exception(&exc, "T").unwrap();
+        assert!(
+            block.contains("    Context: \"host=127.0.0.1:5064 ctx=whatever\"\n"),
+            "{block}"
+        );
+        assert!(!block.contains("Source File"), "{block}");
+    }
+
+    /// A server-initiated disconnect is a port-only notification: libca
+    /// delivers it through the connection callback and prints nothing.
+    #[test]
+    fn a_server_disconnect_prints_nothing() {
+        let exc = CaException {
+            kind: CaExceptionKind::ServerDisconnect,
+            message: "server-initiated channel close".to_string(),
+            server_addr: None,
+            pv_name: Some("TST:LO".to_string()),
+            status: None,
+            op: CaOp::Other,
+            data_type: None,
+            count: None,
+            source: None,
+        };
+        assert!(render_default_exception(&exc, "T").is_none());
     }
 }
 
@@ -767,6 +1024,16 @@ pub(crate) enum TransportEvent {
         original_request: Option<u16>,
         message: String,
         server_addr: SocketAddr,
+        /// Client cid of the channel the failed request was on. rsrv's
+        /// `vsend_err` (`rsrv/camessage.c:155-182`) stamps the outer error
+        /// header's `m_cid` with `pciu->cid` for every channel-scoped command
+        /// and with `0xFFFF_FFFF` otherwise, so this is `None` exactly when
+        /// the error is not about a channel.
+        cid: Option<u32>,
+        /// DBR type and element count of the echoed request header — libca's
+        /// `hdr.m_dataType` / `hdr.m_count`, which the exception block prints.
+        data_type: Option<u16>,
+        count: Option<u32>,
     },
     TcpClosed {
         server_addr: SocketAddr,

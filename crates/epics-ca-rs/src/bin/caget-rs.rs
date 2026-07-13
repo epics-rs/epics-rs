@@ -378,52 +378,11 @@ fn dbf_text(t: DbFieldType) -> &'static str {
     }
 }
 
-/// C `dbr_type_to_text`: DBR type code (0..=38) → `DBR_*` mnemonic
-/// (db_access.c `dbr_text[]`). Out-of-range codes mirror C's
-/// `"DBR_invalid"`.
+/// C `dbr_type_to_text`: DBR type code (0..=38) → `DBR_*` mnemonic.
+/// The table lives in `epics_base_rs` beside its inverse
+/// (`dbr_text_to_type`); this is the only caller left in the tools.
 fn dbr_text(code: u16) -> &'static str {
-    const NAMES: [&str; 39] = [
-        "DBR_STRING",
-        "DBR_SHORT",
-        "DBR_FLOAT",
-        "DBR_ENUM",
-        "DBR_CHAR",
-        "DBR_LONG",
-        "DBR_DOUBLE",
-        "DBR_STS_STRING",
-        "DBR_STS_SHORT",
-        "DBR_STS_FLOAT",
-        "DBR_STS_ENUM",
-        "DBR_STS_CHAR",
-        "DBR_STS_LONG",
-        "DBR_STS_DOUBLE",
-        "DBR_TIME_STRING",
-        "DBR_TIME_SHORT",
-        "DBR_TIME_FLOAT",
-        "DBR_TIME_ENUM",
-        "DBR_TIME_CHAR",
-        "DBR_TIME_LONG",
-        "DBR_TIME_DOUBLE",
-        "DBR_GR_STRING",
-        "DBR_GR_SHORT",
-        "DBR_GR_FLOAT",
-        "DBR_GR_ENUM",
-        "DBR_GR_CHAR",
-        "DBR_GR_LONG",
-        "DBR_GR_DOUBLE",
-        "DBR_CTRL_STRING",
-        "DBR_CTRL_SHORT",
-        "DBR_CTRL_FLOAT",
-        "DBR_CTRL_ENUM",
-        "DBR_CTRL_CHAR",
-        "DBR_CTRL_LONG",
-        "DBR_CTRL_DOUBLE",
-        "DBR_PUT_ACKT",
-        "DBR_PUT_ACKS",
-        "DBR_STSACK_STRING",
-        "DBR_CLASS_NAME",
-    ];
-    NAMES.get(code as usize).copied().unwrap_or("DBR_invalid")
+    epics_base_rs::types::dbr_type_to_text(code)
 }
 
 /// C `dbr2str` (tool_lib.c:335): the extended-metadata block printed

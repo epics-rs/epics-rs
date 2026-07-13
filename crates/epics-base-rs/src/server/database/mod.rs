@@ -1383,9 +1383,42 @@ impl PvDatabase {
         self.inner.records.read().await.get(name).cloned()
     }
 
-    /// Get all record names.
+    /// Every record name, in **database load order** — the single owner of
+    /// whole-database iteration order.
+    ///
+    /// C parity: `dbFirstRecord`/`dbNextRecord` walk the record list of each
+    /// record type in the order `dbReadDatabase` appended them, so every
+    /// whole-database pass a C IOC makes — `initDevSup`, `initDatabase`,
+    /// `initialProcess` (PINI), `dbl`/`dbgrep` dumps — visits records in load
+    /// order. Device support is written against that contract: a dynamic device
+    /// support whose record references another record (epics-modules/opcua's
+    /// element records require their `opcuaItem` record to have bound first,
+    /// linkParser.cpp:226-234) only boots if the referenced record was wired
+    /// first, which the `.db` guarantees by declaring it first.
+    ///
+    /// The names live in a `HashMap`, so returning `keys()` made that order the
+    /// hash order: neither load order nor even stable across runs of the same
+    /// binary (`RandomState` reseeds per process). Booting the same database
+    /// twice could wire records in two different orders — one boot succeeding
+    /// and the next failing. Ordering here, at the one accessor every
+    /// whole-database walk already goes through, makes every such pass
+    /// deterministic and load-ordered at once.
+    ///
+    /// The order key is the existing per-record `load_order` sequence (the
+    /// scan-index's secondary sort key), so this ordering and the scan lists'
+    /// ordering are the same fact, not two. A record with no sequence — none
+    /// exists; `add_record` is the only insertion path — would sort last by
+    /// name rather than nondeterministically.
     pub async fn all_record_names(&self) -> Vec<String> {
-        self.inner.records.read().await.keys().cloned().collect()
+        // Lock order records → load_order, matching `add_record`/`remove_record`.
+        let records = self.inner.records.read().await;
+        let load_order = self.inner.load_order.read().await;
+        let mut names: Vec<String> = records.keys().cloned().collect();
+        names.sort_by(|a, b| {
+            let seq = |n: &String| load_order.get(n).copied().unwrap_or(u64::MAX);
+            seq(a).cmp(&seq(b)).then_with(|| a.cmp(b))
+        });
+        names
     }
 
     /// Get all alias names registered against existing records.

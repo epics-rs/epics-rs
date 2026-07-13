@@ -1171,12 +1171,7 @@ fn cmd_db_load_records() -> CommandDef {
                         // ignored field overrides that affect init —
                         // worse for typical use.
                         let _ = is_merge;
-                        if let Err(e) = instance.record.init_record(0) {
-                            eprintln!("init_record(0) failed for {}: {e}", def.name);
-                        }
-                        if let Err(e) = instance.record.init_record(1) {
-                            eprintln!("init_record(1) failed for {}: {e}", def.name);
-                        }
+                        instance.run_init_passes(&def.name);
                         // Hand the record its resolved common link fields so
                         // a link-classifying record (calcout INAV..INUV/OUTV)
                         // runs its C `init_record` checkLinks step at load —
@@ -1192,7 +1187,7 @@ fn cmd_db_load_records() -> CommandDef {
                     // `dbLoadLinkArray` from every soft INPUT dev support's
                     // `init_record` — the only site that loads a constant INP
                     // into the record's value.
-                    ctx.db().rec_gbl_init_constant_inp(&rec_arc).await;
+                    ctx.db().rec_gbl_init_constant_links(&rec_arc).await;
                     // C `recGblInitSimm` + `recGblInitConstantLink(&siol, …,
                     // &sval)`, run from every SIML-bearing `init_record`
                     // (pass 1) — the only site that loads a constant

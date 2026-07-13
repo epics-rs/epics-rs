@@ -501,8 +501,99 @@ impl PvDatabase {
         Some((value, time))
     }
 
-    /// Read value + alarm from a DB link. Returns (value, alarm) for MS/NMS propagation.
+    /// **The single owner of a process-time link read that carries both a
+    /// value and an alarm** — the input-fetch readers (INPA..L, INAA..LL,
+    /// SUBL, output-time DOL) go through here.
+    ///
+    /// Returns C's `(status, buffer)` pair, not an `Option`: a CONSTANT link is
+    /// [`LinkFetch::NoData`] — SUCCESS with nothing delivered
+    /// (`dbConstLink.c:219-225` `dbConstGetValue`: `*pnRequest = 0; return 0`)
+    /// — which is NOT the same as [`LinkFetch::Failed`]. Collapsing the two
+    /// into `Option` is what made a constant input both re-apply its value on
+    /// every cycle (destroying a client's `caput A=99` on a
+    /// `field(INPA,"5")` calc) and, once it stopped delivering, look like a
+    /// failed read that gates `fetch_values`. The constant reaches the record
+    /// exactly once, at init, through
+    /// [`super::PvDatabase::rec_gbl_init_constant_links`].
     pub(crate) async fn read_link_with_alarm(
+        &self,
+        link: &crate::server::record::ParsedLink,
+    ) -> (crate::server::recgbl::simm::LinkFetch, Option<LinkAlarm>) {
+        use crate::server::recgbl::simm::LinkFetch;
+        let (value, alarm) = self.read_link_value_and_alarm(link).await;
+        let fetch = match value {
+            Some(v) => LinkFetch::Value(v),
+            // C `dbGetLink` on a CONSTANT (or unset) link: status 0, nothing
+            // written. Any other link that produced no value did FAIL.
+            None if crate::server::recgbl::simm::is_constant(link) => LinkFetch::NoData,
+            None => LinkFetch::Failed,
+        };
+        (fetch, alarm)
+    }
+
+    /// **The single owner of input-link severity inheritance** — C
+    /// `dbDbGetValue`'s tail (`dbDbLink.c:228-232`), which EVERY healthy
+    /// `dbGetLink` on a DB link runs:
+    ///
+    /// ```c
+    /// if (!status && precord != dbChannelRecord(chan))
+    ///     recGblInheritSevrMsg(plink->value.pv_link.pvlMask & pvlOptMsMode,
+    ///         plink->precord, dbChannelRecord(chan)->stat,
+    ///         dbChannelRecord(chan)->sevr, dbChannelRecord(chan)->amsg);
+    /// ```
+    ///
+    /// Given the reader, the link it just read and the source alarm that read
+    /// produced, it returns the `(MS class, source alarm)` pair the reader owes
+    /// its PENDING alarm — or `None` when C inherits nothing. Callers hand the
+    /// pair to [`inherit_sevr_msg`]; no caller decides for itself which links
+    /// inherit, which is how the `ReadDbLink` path came to drop MS entirely.
+    ///
+    /// Two rules live here and nowhere else:
+    ///
+    /// * **Self-exclusion** — C's `precord != dbChannelRecord(chan)` guard. A
+    ///   link that reads the reader's OWN field must not fold the reader's
+    ///   committed severity back into its pending one: `rec_gbl_reset_alarms`
+    ///   would re-commit it next cycle, so a single MAJOR would latch forever.
+    ///   Alias-aware, because C compares record pointers.
+    /// * **MS class per scheme** — DB and CA links carry their own parsed
+    ///   `MonitorSwitch`; a PVA link's lset has already applied the MS/NMS/MSI
+    ///   gate, so its (already final) severity folds as `MaximizeStatus` to keep
+    ///   the remote stat + message. Constant/Hw/Calc links inherit nothing.
+    pub(crate) async fn input_link_inheritance(
+        &self,
+        reader_name: &str,
+        link: &crate::server::record::ParsedLink,
+        alarm: Option<LinkAlarm>,
+    ) -> Option<(crate::server::record::MonitorSwitch, LinkAlarm)> {
+        let alarm = alarm?;
+        match link {
+            crate::server::record::ParsedLink::Db(db) => {
+                let target = self
+                    .resolve_alias(&db.record)
+                    .await
+                    .unwrap_or_else(|| db.record.clone());
+                let reader = self
+                    .resolve_alias(reader_name)
+                    .await
+                    .unwrap_or_else(|| reader_name.to_string());
+                if target == reader {
+                    return None;
+                }
+                Some((db.monitor_switch, alarm))
+            }
+            crate::server::record::ParsedLink::Ca(ca) => Some((ca.monitor_switch, alarm)),
+            crate::server::record::ParsedLink::Pva(_)
+            | crate::server::record::ParsedLink::PvaJson(_) => {
+                Some((crate::server::record::MonitorSwitch::MaximizeStatus, alarm))
+            }
+            _ => None,
+        }
+    }
+
+    /// The raw value+alarm read behind [`Self::read_link_with_alarm`]. Never
+    /// call this directly from a process path — it cannot tell "constant" from
+    /// "failed"; that is the classifier's job.
+    async fn read_link_value_and_alarm(
         &self,
         link: &crate::server::record::ParsedLink,
     ) -> (Option<EpicsValue>, Option<LinkAlarm>) {
@@ -536,7 +627,10 @@ impl PvDatabase {
                 };
                 (value, alarm)
             }
-            crate::server::record::ParsedLink::Constant(_) => (link.constant_value(), None),
+            // A CONSTANT link delivers nothing at process time; the classifier
+            // above turns this `None` into `LinkFetch::NoData` (success), not
+            // a failure.
+            crate::server::record::ParsedLink::Constant(_) => (None, None),
             // External Pva/Ca link: the value comes from the lset's
             // cached snapshot, the alarm from the lset's accessors.
             //
@@ -804,7 +898,7 @@ impl PvDatabase {
             // `if (dbLinkIsConstant(pinp)) return 0;`). The constant reaches
             // the record ONCE, at init, through the
             // `recGblInitConstantLink`/`dbLoadLinkArray` owner
-            // (`rec_gbl_init_constant_inp`).
+            // (`rec_gbl_init_constant_links`).
             //
             // Re-delivering it every cycle — as this arm did — made a constant
             // INP overwrite the record's VAL on every process, so a client
@@ -1593,7 +1687,12 @@ impl PvDatabase {
                     // sourced over CA/PVA or given as a constant never
                     // updated SELN.
                     let parsed = crate::server::record::parse_link_v2(&sell);
-                    if let Some(val) = self.read_link_value_no_process(&parsed).await {
+                    // Through the one classifier: a CONSTANT SELL delivers
+                    // NOTHING here (`dbConstGetValue`) — its value reached SELN
+                    // once, at init (`fanoutRecord.c:88`, `dfanoutRecord.c:102`,
+                    // `seqRecord.c:121` `recGblInitConstantLink(&sell,
+                    // DBF_USHORT, &seln)`), so a `caput REC.SELN` STAYS put.
+                    if let Some(val) = self.fetch_link(&parsed).await.value() {
                         // C reads SELL with `dbGetLink(&prec->sell,
                         // DBR_USHORT, &prec->seln, 0, 0)`; the dbConvert GET
                         // macro stores `*pdst = (epicsUInt16) *psrc`
@@ -2855,9 +2954,9 @@ mod nonlocal_db_link_read_tests {
         .await;
 
         let link = parse_link_v2("OTHER:PV");
-        let (value, alarm) = db.read_link_with_alarm(&link).await;
+        let (fetch, alarm) = db.read_link_with_alarm(&link).await;
         assert_eq!(
-            value,
+            fetch.value(),
             Some(EpicsValue::Double(5.0)),
             "non-local Db link value must come from the external resolver"
         );

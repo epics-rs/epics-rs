@@ -530,9 +530,11 @@ fn test_mbbo_zrvl_high_bit_round_trip() {
     rec.put_field("ZRVL", EpicsValue::ULong(0x8000_0000))
         .unwrap();
     assert_eq!(rec.get_field("ZRVL"), Some(EpicsValue::ULong(0x8000_0000)));
-    // With a defined state table and VAL=0, convert() copies ZRVL into
-    // RVAL; the high bit must not be lost to sign.
+    // With a defined state table and VAL=0, the init tail's convert() copies
+    // ZRVL into RVAL (C `mbboRecord.c:177`, after the constant-DOL load); the
+    // high bit must not be lost to sign.
     rec.init_record(0).unwrap();
+    rec.seed_deadband_tracking();
     assert_eq!(rec.get_field("RVAL"), Some(EpicsValue::ULong(0x8000_0000)));
 }
 
@@ -994,11 +996,15 @@ fn test_deadband_mdel() {
             .unwrap_or(EventMask::NONE)
     };
 
-    // Unchanged value: neither deadband fires, no VAL post.
+    // Unchanged value on the FIRST process: neither deadband fires, but the
+    // record leaves its born-UDF alarm (STAT=UDF, dbCommon.dbd `initial("UDF")`)
+    // for NO_ALARM, so `recGblResetAlarms` returns DBE_ALARM and C posts VAL
+    // with a non-zero monitor_mask anyway (`aiRecord.c::monitor`: `if
+    // (monitor_mask) db_post_events(prec, &prec->val, monitor_mask)`).
     instance.record.set_val(EpicsValue::Double(0.0)).unwrap();
     instance.record.set_device_did_compute(true);
     let (snap, _alarm_posts) = instance.process_local().unwrap();
-    assert_eq!(val_mask(&snap), EventMask::NONE);
+    assert_eq!(val_mask(&snap), EventMask::ALARM);
 
     // |3-0| < MDEL=5: VALUE throttled; ADEL=0 archives the change.
     instance.record.set_val(EpicsValue::Double(3.0)).unwrap();
@@ -1027,14 +1033,25 @@ fn test_deadband_mdel() {
 
 #[test]
 fn test_deadband_mdel_zero() {
+    use epics_base_rs::server::recgbl::EventMask;
     let mut rec = AiRecord::default();
     rec.mdel = 0.0;
     let mut instance = RecordInstance::new("TEST".into(), rec);
 
+    // MDEL=0 does not fire on a zero delta; the VAL post this first process
+    // does carry is the born-UDF -> NO_ALARM transition (DBE_ALARM), which C
+    // folds into the same `db_post_events(&prec->val, monitor_mask)`.
     instance.record.set_val(EpicsValue::Double(0.0)).unwrap();
     instance.record.set_device_did_compute(true);
     let (snap, _alarm_posts) = instance.process_local().unwrap();
-    assert!(!snap.changed_fields.iter().any(|(k, _, _)| k == "VAL"));
+    assert_eq!(
+        snap.changed_fields
+            .iter()
+            .find(|(k, _, _)| k == "VAL")
+            .map(|(_, _, m)| *m),
+        Some(EventMask::ALARM),
+        "no deadband fired — only the initial alarm transition"
+    );
 
     instance.record.set_val(EpicsValue::Double(0.001)).unwrap();
     instance.record.set_device_did_compute(true);
@@ -1347,6 +1364,19 @@ fn test_no_alarm_change_does_not_post_sevr_stat() {
     let mut rec = AiRecord::default();
     rec.mdel = 100.0;
     let mut instance = RecordInstance::new("TEST".into(), rec);
+    // The FIRST process is an alarm transition — a record is born
+    // `STAT=UDF` (dbCommon.dbd `initial("UDF")`) and clears it here — so it
+    // posts STAT/SEVR in C too. The no-transition cycle is the next one.
+    instance.record.set_val(EpicsValue::Double(1.0)).unwrap();
+    instance.record.set_device_did_compute(true);
+    let (_first, first_posts) = instance.process_local().unwrap();
+    assert!(
+        first_posts.iter().any(|(f, _)| *f == "STAT"),
+        "STAT moved UDF -> NO_ALARM, and C posts the field that changed \
+         (recGbl.c:206-207). SEVR did not move on this bare instance, so C \
+         posts no SEVR (recGbl.c:202-205)."
+    );
+
     instance.record.set_val(EpicsValue::Double(1.0)).unwrap();
     instance.record.set_device_did_compute(true);
     let (snap, alarm_posts) = instance.process_local().unwrap();

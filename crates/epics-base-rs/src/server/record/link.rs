@@ -377,7 +377,7 @@ impl ParsedLink {
             {
                 return Some(constant_array_value(inner));
             }
-            if let Ok(v) = s.parse::<f64>() {
+            if let Some(v) = parse_c_double(s) {
                 Some(EpicsValue::Double(v))
             } else {
                 Some(EpicsValue::String(s.clone().into()))
@@ -518,6 +518,38 @@ fn constant_array_value(inner: &str) -> EpicsValue {
         Some(nums) => EpicsValue::DoubleArray(nums),
         None => EpicsValue::StringArray(elements.into_iter().map(|e| e.into()).collect()),
     }
+}
+
+/// C `epicsParseDouble(pstr, &value, NULL)` — the ONE test that decides whether
+/// a link string is a number, and the ONE conversion that turns it into a value.
+/// `dbParseLink` uses it to classify (`dbStaticLib.c:2346-2349`) and
+/// `dbConstLink.c`'s `cvt_st_*` family uses the same C library parse to load, so
+/// the two must agree: whatever classifies as CONSTANT must also load.
+///
+/// It is `strtod` under the hood, which accepts a HEX literal — `dbConstLink.c:34`:
+/// *"constants may contain hex numbers, whereas database conversions can't"*.
+/// softIoc: `field(DOL,"0x1f")` reports `DOL : CONSTANT 0x1f` and comes up at
+/// VAL=31; `field(INP,"0x10")` on an ai loads VAL=16. Rust's `f64::from_str` has
+/// no hex form, so the hex branch is explicit here. Trailing text is rejected
+/// (C passes a NULL units pointer → `S_stdlib_extraneous`), which is what keeps
+/// `"5 PP"` a PV link rather than a constant.
+pub fn parse_c_double(s: &str) -> Option<f64> {
+    let t = s.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let (negative, magnitude) = match t.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
+    };
+    if let Some(hex) = magnitude
+        .strip_prefix("0x")
+        .or_else(|| magnitude.strip_prefix("0X"))
+    {
+        let v = u64::from_str_radix(hex, 16).ok()? as f64;
+        return Some(if negative { -v } else { v });
+    }
+    t.parse::<f64>().ok()
 }
 
 fn try_parse_json_link(s: &str) -> Option<ParsedLink> {
@@ -1050,6 +1082,28 @@ pub fn parse_link_field(s: &str, ftype: LinkFieldType) -> ParsedLink {
         return ParsedLink::Constant(inner.to_string());
     }
 
+    // Scalar numeric constant. C `dbParseLink` (`dbStaticLib.c:2346-2349`):
+    //
+    //     /* Link is a constant if empty or it holds just a number */
+    //     if (len == 0 || epicsParseDouble(pstr, &value, NULL) == 0) {
+    //         pinfo->ltype = CONSTANT;
+    //         return 0;
+    //     }
+    //
+    // The test runs on the WHOLE stripped string, *before* the modifier scan,
+    // and `epicsParseDouble` with a NULL `units` argument rejects any trailing
+    // text (`S_stdlib_extraneous`, `epicsStdlib.c`). So `"5 PP"` is NOT a
+    // constant in C — it is a PV_LINK to a record named `5` with the `PP`
+    // modifier (verified on softIoc: `INPA: CA_LINK 5 PP NMS`). Splitting the
+    // modifiers off first and then testing the head for a number turns every
+    // `"<number> <modifier>"` link into a constant: `SDIS="3 NPP"` with
+    // `DISV=3` would disable the record forever, and `OUT="5 PP"` would drop
+    // the write instead of alarming. Keep this test above
+    // `split_link_modifiers`.
+    if parse_c_double(s).is_some() {
+        return ParsedLink::Constant(s.to_string());
+    }
+
     // Array constant. C `dbParseLink` (`dbStaticLib.c:2354-2357`), right after
     // the scalar-constant test:
     //
@@ -1091,11 +1145,6 @@ pub fn parse_link_field(s: &str, ftype: LinkFieldType) -> ParsedLink {
             monitor_switch: ms,
             policy,
         });
-    }
-
-    // Numeric constant
-    if link_part.parse::<f64>().is_ok() {
-        return ParsedLink::Constant(link_part.to_string());
     }
 
     // DB link: split record from field exactly as C `dbNameToAddr`

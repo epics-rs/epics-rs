@@ -14,7 +14,18 @@ const SEQ_SELM_CHOICES: &[&str] = &["All", "Specified", "Mask"];
 /// 16 groups starting at `DOL0`. Per-group `DLYn` staggers the
 /// writes — that delayed sequencing is the record's purpose.
 #[derive(EpicsRecord)]
-#[record(type = "seq")]
+// C `seqRecord.c:121-126`: `recGblInitConstantLink(&prec->sell, DBF_USHORT,
+// &prec->seln)` and, per group, `recGblInitConstantLink(&grp->dol, DBF_DOUBLE,
+// &grp->dov)`. Every one of those links is init-only: `dbGetLink` on a constant
+// delivers nothing at process (`seqRecord.c:259` reads DOLn into DOn each
+// cycle, and a constant DOLn leaves DOn alone), so `field(DOL0,"4")` reaches
+// DO0 here or never.
+#[record(
+    type = "seq",
+    constant_init = "SELL:SELN,DOL0:DO0,DOL1:DO1,DOL2:DO2,DOL3:DO3,DOL4:DO4,\
+                     DOL5:DO5,DOL6:DO6,DOL7:DO7,DOL8:DO8,DOL9:DO9,DOLA:DOA,\
+                     DOLB:DOB,DOLC:DOC,DOLD:DOD,DOLE:DOE,DOLF:DOF"
+)]
 pub struct SeqRecord {
     #[field(type = "Enum")]
     pub val: u16,

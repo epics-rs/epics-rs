@@ -11,6 +11,78 @@ pub struct FieldDesc {
     pub read_only: bool,
 }
 
+/// One `recGblInitConstantLink(&prec->LINK, DBF_x, &prec->TARGET)` call from a
+/// record's C `init_record` — the seed of a CONSTANT input link.
+///
+/// Declared by [`Record::constant_init_links`] and applied by the single owner
+/// [`crate::server::database::PvDatabase::rec_gbl_init_constant_links`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConstantInitLink {
+    /// The link field holding the constant (`INPA`, `NVL`, `SELL`, `DOL1`,
+    /// `SUBL`, `DOL`, ...).
+    pub link_field: &'static str,
+    /// The value field the constant is loaded into (`A`, `SELN`, `DO1`,
+    /// `SNAM`, `VAL`, ...).
+    pub target_field: &'static str,
+    /// Whether a successful seed clears UDF — C's
+    /// `if (recGblInitConstantLink(&prec->dol, ...)) prec->udf = FALSE;`
+    /// (`aoRecord.c:112-113`, `longoutRecord.c:113`, `mbboRecord.c:133`,
+    /// `int64outRecord.c:110`, `dfanoutRecord.c:105`). The multi-input seeders
+    /// (calc/sub/sel/aSub/seq/fanout) do NOT clear UDF: they seed A..L, not
+    /// VAL.
+    pub clears_udf: bool,
+    /// Whether the loaded value is stored as its BOOLEAN — C `boRecord.c:146-148`
+    /// loads the constant into a temporary and stores `prec->val = !!ival`, so
+    /// `field(DOL,"5")` leaves a bo at VAL=1, not 5. The only seed whose stored
+    /// value differs from the loaded one.
+    pub normalize_bool: bool,
+}
+
+impl ConstantInitLink {
+    /// A seed that does not touch UDF — the INPA..L / SELL / NVL / DOLn form.
+    pub const fn new(link_field: &'static str, target_field: &'static str) -> Self {
+        Self {
+            link_field,
+            target_field,
+            clears_udf: false,
+            normalize_bool: false,
+        }
+    }
+
+    /// A DOL→VAL seed, which C follows with `prec->udf = FALSE`.
+    pub const fn dol_to_val(link_field: &'static str, target_field: &'static str) -> Self {
+        Self {
+            link_field,
+            target_field,
+            clears_udf: true,
+            normalize_bool: false,
+        }
+    }
+
+    /// bo's DOL→VAL seed: `prec->val = !!ival; prec->udf = FALSE;`
+    /// (`boRecord.c:146-149`).
+    pub const fn dol_to_bool_val(link_field: &'static str, target_field: &'static str) -> Self {
+        Self {
+            link_field,
+            target_field,
+            clears_udf: true,
+            normalize_bool: true,
+        }
+    }
+}
+
+/// The seed table for a record whose C seeds exactly the input links it
+/// fetches — the `for (i = 0; i < N; i++) recGblInitConstantLink(plink++,
+/// DBF_DOUBLE, pvalue++)` loop of calc / calcout / sub / sel / aSub /
+/// scalcout / acalcout / transform, expressed over the record's own
+/// [`Record::multi_input_links`] table.
+pub fn seed_input_links(pairs: &[(&'static str, &'static str)]) -> Vec<ConstantInitLink> {
+    pairs
+        .iter()
+        .map(|(link, value)| ConstantInitLink::new(link, value))
+        .collect()
+}
+
 /// Resolved metadata of an OUT-link TARGET, as C's soft device support
 /// obtains it before choosing its write buffer.
 ///
@@ -1400,10 +1472,12 @@ pub trait Record: Send + Sync + 'static {
     /// [`Record::multi_input_links`] fetches, before `process()`.
     ///
     /// `resolved` lists the `link_field` names (the first element of
-    /// each `multi_input_links` pair) whose fetch actually produced a
-    /// value this cycle — i.e. the link was non-empty and the read
-    /// succeeded. A link field absent from the slice either had no link
-    /// configured or its DB/CA fetch failed.
+    /// each `multi_input_links` pair) whose fetch SUCCEEDED this cycle —
+    /// C's `RTN_SUCCESS(dbGetLink(...))`, i.e. status 0. That includes a
+    /// CONSTANT link, which returns success having delivered nothing
+    /// (`dbConstGetValue`, `dbConstLink.c:219-225`) — `epidRecord.c:191`
+    /// clears UDF on exactly that. A link field absent from the slice
+    /// either had no link configured or its DB/CA fetch FAILED.
     ///
     /// This is the framework analogue of C device support inspecting
     /// `RTN_SUCCESS(dbGetLink(...))` — e.g. `epidRecord.c:191-193`
@@ -1730,6 +1804,36 @@ pub trait Record: Send + Sync + 'static {
     /// Override in calc, calcout, sel, sub to return INPA..INPL → A..L mappings.
     fn multi_input_links(&self) -> &[(&'static str, &'static str)] {
         &[]
+    }
+
+    /// Every CONSTANT input link this record seeds ONCE, at `init_record` —
+    /// the record's own `recGblInitConstantLink` / `dbLoadLinkArray` table,
+    /// transcribed from its C.
+    ///
+    /// This is the OTHER half of the one rule the link layer enforces: a
+    /// constant link delivers NOTHING at process time (`dbConstGetValue`,
+    /// `dbConstLink.c:219-225`), so the ONLY way a `field(INPA,"5")` ever
+    /// reaches `A` is this table, applied by the single init-seed owner
+    /// [`crate::server::database::PvDatabase::rec_gbl_init_constant_links`].
+    /// A record that fetches an input link but declares no seed for it (swait,
+    /// whose C uses `recDynLink` and seeds nothing) simply never sees the
+    /// constant — which is what its C does.
+    ///
+    /// Default: none.
+    fn constant_init_links(&self) -> Vec<ConstantInitLink> {
+        Vec::new()
+    }
+
+    /// Whether this record's CONSTANT input links deliver their value on
+    /// EVERY process cycle instead of only at init.
+    ///
+    /// `false` for every record that fetches with a plain `dbGetLink`. `printf`
+    /// is the one exception in the whole database: its `GET_PRINT` macro
+    /// (`printfRecord.c:49-52`) tests `dbLinkIsConstant` and re-runs
+    /// `recGblInitConstantLink` on every `doPrintf`, so a constant INP0..9
+    /// really is re-read each cycle.
+    fn constant_inputs_deliver_at_process(&self) -> bool {
+        false
     }
 
     /// The subset of [`Self::multi_input_links`] the framework should

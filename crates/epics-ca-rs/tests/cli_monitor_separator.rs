@@ -70,6 +70,15 @@ async fn server_with_ao(pv: &'static str, val: f64) -> u16 {
         .build()
         .await
         .expect("build CA server");
+    // Process once so the record is DEFINED: a never-processed record carries
+    // the initial UDF severity (C `iocInit.c:521-523` — STAT=UDF SEVR=INVALID),
+    // which would fill the two alarm columns this test wants empty.
+    let mut visited = std::collections::HashSet::new();
+    server
+        .database()
+        .process_record_with_links(pv, &mut visited, 0)
+        .await
+        .expect("seed process");
     tokio::spawn(async move { server.run().await });
     tokio::time::sleep(Duration::from_millis(200)).await;
     port

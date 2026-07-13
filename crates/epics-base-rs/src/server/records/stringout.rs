@@ -172,15 +172,16 @@ impl Record for StringoutRecord {
     /// constant text must be seeded here. A bare-numeric (`5`) or quoted
     /// (`"text"`) DOL parses to `ParsedLink::Constant`; its text is copied
     /// verbatim into the `DBF_STRING` VAL (truncated to the field size).
-    fn init_record(&mut self, pass: u8) -> CaResult<()> {
-        if pass == 0 {
-            if let crate::server::record::ParsedLink::Constant(s) =
-                crate::server::record::parse_link_v2(&self.dol)
-            {
-                self.val = truncate_string(PvString::from(s));
-            }
-        }
-        Ok(())
+    /// C `stringoutRecord.c:113-114`:
+    /// `if (recGblInitConstantLink(&prec->dol, DBF_STRING, prec->val))
+    ///      prec->udf = FALSE;`
+    /// The framework gate excludes a constant DOL from the per-cycle
+    /// closed-loop fetch, so the init-seed owner is the only place the constant
+    /// can reach VAL — and a record whose VAL came from it is DEFINED.
+    fn constant_init_links(&self) -> Vec<crate::server::record::ConstantInitLink> {
+        vec![crate::server::record::ConstantInitLink::dol_to_val(
+            "DOL", "VAL",
+        )]
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {

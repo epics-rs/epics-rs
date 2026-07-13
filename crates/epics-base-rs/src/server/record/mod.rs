@@ -15,8 +15,8 @@ pub use common_fields::CommonFields;
 pub use link::{
     CaLink, CalcLink, DbLink, HwLink, HwLinkKind, JlinkValue, LinkAddress, LinkFieldType,
     LinkProcessPolicy, LinkType, MonitorSwitch, PVAJSON_IDENTITY_SEP, ParsedLink, PvaJsonLink,
-    link_field_type, out_link_discards_cp, parse_forward_link_v2, parse_link, parse_link_field,
-    parse_link_v2, parse_output_link_v2, pvajson_identity_key,
+    link_field_type, out_link_discards_cp, parse_c_double, parse_forward_link_v2, parse_link,
+    parse_link_field, parse_link_v2, parse_output_link_v2, pvajson_identity_key,
 };
 pub use menu_choices::{
     MENU_ALARM_SEVR, MENU_ALARM_STAT, MENU_CONVERT, MENU_FTYPE, MENU_IVOA, MENU_OMSL, MENU_PINI,
@@ -26,10 +26,10 @@ pub use menu_choices::{
 pub use pini::PiniMode;
 pub use record_instance::{NotifyWaitSet, RecordInstance};
 pub use record_trait::{
-    ArrayMonitorPost, CommonFieldPutResult, CyclePostMask, EPICS_TIME_EVENT_DEVICE_TIME, FieldDesc,
-    FieldMetadataOverride, InputFetchPolicy, OutTarget, ProcessAction, ProcessContext,
-    ProcessOutcome, ProcessSnapshot, Record, RecordProcessResult, SubroutineFn, ValuePostGate,
-    put_field_internal_default,
+    ArrayMonitorPost, CommonFieldPutResult, ConstantInitLink, CyclePostMask,
+    EPICS_TIME_EVENT_DEVICE_TIME, FieldDesc, FieldMetadataOverride, InputFetchPolicy, OutTarget,
+    ProcessAction, ProcessContext, ProcessOutcome, ProcessSnapshot, Record, RecordProcessResult,
+    SubroutineFn, ValuePostGate, put_field_internal_default, seed_input_links,
 };
 pub(crate) use record_trait::{AuxPostMask, value_gate};
 pub use scan::{ScanType, SimModeScan};

@@ -14,7 +14,10 @@ const FANOUT_SELM_CHOICES: &[&str] = &["All", "Specified", "Mask"];
 /// fan-out target on `LNK0`. Omitting it shifts every link index
 /// by one and silently drops the `LNK0` target on `SELM=All`.
 #[derive(EpicsRecord)]
-#[record(type = "fanout")]
+// C `fanoutRecord.c:88`: `recGblInitConstantLink(&prec->sell, DBF_USHORT,
+// &prec->seln)` — a constant SELL loads SELN ONCE, at init. `dbGetLink` on it
+// at process delivers nothing, so a later `caput REC.SELN` is not stomped.
+#[record(type = "fanout", constant_init = "SELL:SELN")]
 pub struct FanoutRecord {
     #[field(type = "Enum")]
     pub val: u16,

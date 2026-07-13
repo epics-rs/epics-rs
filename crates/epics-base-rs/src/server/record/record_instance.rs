@@ -479,6 +479,49 @@ impl RecordInstance {
         }
     }
 
+    /// **The owner of a record's init passes** — C `iocInit.c::doInitRecord0`
+    /// (`:508-536`) and `doInitRecord1`. Nothing else may call
+    /// `Record::init_record`.
+    ///
+    /// C runs a prologue on EVERY record before pass 0, and it is the reason
+    /// this is one function instead of two `init_record` calls at each caller:
+    ///
+    /// ```c
+    /// /* Reset the process active field */
+    /// precord->pact = FALSE;
+    ///
+    /// /* Initial UDF severity */
+    /// if (precord->udf && precord->stat == UDF_ALARM)
+    ///     precord->sevr = precord->udfs;
+    /// ```
+    ///
+    /// A record is born `udf = 1`, `stat = UDF_ALARM` (dbCommon.dbd
+    /// `initial("UDF")`), `udfs = INVALID` — so after `iocInit` a record that
+    /// has NEVER processed advertises `STAT=UDF SEVR=INVALID`, not
+    /// `NO_ALARM`. That is what makes an `MS` consumer inherit
+    /// `LINK`/`INVALID` from a not-yet-processed source, the IOC-startup
+    /// ordering case MS exists for (softIoc-verified). A record whose
+    /// `init_record` or device support defines the value clears UDF and the
+    /// severity goes away on its first process.
+    ///
+    /// `name` is used only for the init-failure diagnostics C sends to errlog.
+    pub fn run_init_passes(&mut self, name: &str) {
+        // C's `precord->pact = FALSE` — the port's PACT is the `processing`
+        // flag, released by the process owner; a record cannot be mid-process
+        // at init, so nothing to reset.
+        self.processing
+            .store(false, std::sync::atomic::Ordering::Release);
+        if self.common.udf && self.common.stat == crate::server::recgbl::alarm_status::UDF_ALARM {
+            self.common.sevr = self.common.udfs;
+        }
+        if let Err(e) = self.record.init_record(0) {
+            eprintln!("init_record(0) failed for {name}: {e}");
+        }
+        if let Err(e) = self.record.init_record(1) {
+            eprintln!("init_record(1) failed for {name}: {e}");
+        }
+    }
+
     /// Set a single `info("key", "value")` tag on this record. Last
     /// write wins. Used by the .db loader (`info(...)` directive) and
     /// `dbpf`-style tools.

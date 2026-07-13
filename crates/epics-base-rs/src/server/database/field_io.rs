@@ -29,6 +29,48 @@ fn check_put_disabled(
     Ok(())
 }
 
+/// C's `dbPut` no-modify gate — **the single owner of field immutability**.
+///
+/// Two C rejections, both inside `dbPut` and therefore BELOW every put entry
+/// point (`dbPutField` for CA/`dbpf`, `dbPutLink` for a record's OUT link,
+/// `dbPutSpecial` for an internal one):
+///
+/// ```c
+/// /* dbAccess.c:1330-1332 */
+/// if (special == SPC_ATTRIBUTE) return S_db_noMod;
+/// /* dbAccess.c:123-126, via dbPut -> dbPutSpecial(paddr, 0) */
+/// if ((special == SPC_NOMOD) && (pass == 0)) return S_db_noMod;
+/// ```
+///
+/// INVARIANT: a field declared `special(SPC_NOMOD)` (or `SPC_ATTRIBUTE`) MUST
+/// NOT be modified by ANY runtime write, whatever route it arrives on — CA put,
+/// `dbpf`, QSRV, an internal `put_pv`, or a record's OUT link. The declaration
+/// lives in exactly one place, [`FieldDesc::read_only`] (plus the dbCommon
+/// `SPC_NOMOD` triple below, which no record's `field_list` declares), and this
+/// function is the only enforcer. A record's own `put_field` is NOT a gate: the
+/// hand-written array records write NELM/FTVL/NORD there because the *load*
+/// path (`dbLoadRecords` → `Record::put_field`) must set them — C likewise
+/// writes them through `dbStaticLib`'s `dbPutString`, which never crosses
+/// `dbPut`.
+///
+/// `field` must already be upper-cased.
+fn check_no_mod(instance: &crate::server::record::RecordInstance, field: &str) -> CaResult<()> {
+    // dbCommon.dbd `special(SPC_NOMOD)`: PACT, LCNT, PUTF. Not in any record's
+    // `field_list` (they are common fields), so they are named here.
+    if matches!(field, "PACT" | "LCNT" | "PUTF") {
+        return Err(CaError::ReadOnlyField(field.to_string()));
+    }
+    if instance
+        .record
+        .field_list()
+        .iter()
+        .any(|f| f.name.eq_ignore_ascii_case(field) && f.read_only)
+    {
+        return Err(CaError::ReadOnlyField(field.to_string()));
+    }
+    Ok(())
+}
+
 /// C `dbPutSpecial(paddr, 1)` — the after-put `special()`, paired with the drain
 /// of the link writes it queued ([`Record::take_special_actions`]).
 ///
@@ -283,21 +325,12 @@ impl PvDatabase {
             return Ok(());
         };
         let instance = rec.read().await;
-        // Read-only / SPC_NOMOD field
-        // (C: `special == SPC_ATTRIBUTE` → S_db_noMod) — same `read_only`
-        // flag the Passive route checks, so all three modes gate uniformly.
-        // C tests SPC_ATTRIBUTE *before* `disp` (iocsource.cpp:365-369), so a
-        // read-only field on a DISP=1 record reports S_db_noMod, not
-        // S_db_putDisabled; the two errors carry different wire text.
-        let is_read_only = instance
-            .record
-            .field_list()
-            .iter()
-            .find(|f| f.name.eq_ignore_ascii_case(&field_upper))
-            .is_some_and(|f| f.read_only);
-        if is_read_only {
-            return Err(CaError::ReadOnlyField(field_upper));
-        }
+        // Read-only / SPC_NOMOD field, through the one gate owner
+        // ([`check_no_mod`]). C tests SPC_ATTRIBUTE *before* `disp`
+        // (iocsource.cpp:365-369), so a read-only field on a DISP=1 record
+        // reports S_db_noMod, not S_db_putDisabled; the two errors carry
+        // different wire text.
+        check_no_mod(&instance, &field_upper)?;
         // DISP=1 blocks a put to any field except DISP itself — the shared
         // gate owner, identical to the one the CA route crosses.
         check_put_disabled(&instance, &field_upper)?;
@@ -337,6 +370,14 @@ impl PvDatabase {
                 None
             };
             let mut instance = rec.write().await;
+
+            // C `dbPut` refuses an SPC_NOMOD / SPC_ATTRIBUTE field before it
+            // converts anything (`dbAccess.c:1330-1332`). `put_pv` IS the
+            // `dbPut` analogue — it sits below `dbPutLink`, so this is what
+            // stops a record's OUT link from truncating a waveform's NELM.
+            // The refusal is returned to the caller; `write_out_link_value`
+            // (C `dbPutLink`) turns it into the writer's LINK/INVALID alarm.
+            check_no_mod(&instance, &field)?;
 
             let request = dbput_request(&*instance.record, &field, value)?;
 
@@ -567,6 +608,10 @@ impl PvDatabase {
             let _record_gate = self.lock_record(&canonical_base).await;
 
             let mut instance = rec.write().await;
+
+            // Same `dbPut` gate as `put_pv` — this is the third `dbPut` body
+            // (value + monitor post), and C has ONE.
+            check_no_mod(&instance, &field)?;
 
             let request = dbput_request(&*instance.record, &field, value)?;
 
@@ -971,14 +1016,10 @@ impl PvDatabase {
             // `S_db_putDisabled` and the record does not process.
             check_put_disabled(&instance, &field)?;
 
-            // SPC_NOMOD fields (dbCommon.dbd): rejected inside C's `dbPut`,
-            // i.e. after the DISP gate above.
-            match field.as_str() {
-                "PACT" => return Err(CaError::ReadOnlyField("PACT".into())),
-                "LCNT" => return Err(CaError::ReadOnlyField("LCNT".into())),
-                "PUTF" => return Err(CaError::ReadOnlyField("PUTF".into())),
-                _ => {}
-            }
+            // SPC_NOMOD / read-only fields: rejected inside C's `dbPut`, i.e.
+            // after the DISP gate above and before the PROC-driven process
+            // below. One gate owner for every route ([`check_no_mod`]).
+            check_no_mod(&instance, &field)?;
 
             // PROC intercept: trigger processing on any SCAN.
             // Falls through to the put_notify_tx registration below
@@ -1060,17 +1101,6 @@ impl PvDatabase {
             // This matches C EPICS db_put_field() which converts from the CA client's type
             // to the record field's native type.
             let request = dbput_request(&*instance.record, &field, value)?;
-
-            // SPC_NOMOD: reject writes to read-only fields (C EPICS S_db_noMod)
-            let is_read_only = instance
-                .record
-                .field_list()
-                .iter()
-                .find(|f| f.name.eq_ignore_ascii_case(&field))
-                .is_some_and(|f| f.read_only);
-            if is_read_only {
-                return Err(CaError::ReadOnlyField(field));
-            }
 
             // Pre-write special hook (C EPICS dbPutSpecial pass=0)
             instance.record.special(&field, false)?;

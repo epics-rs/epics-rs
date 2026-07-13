@@ -685,6 +685,18 @@ impl Record for SelRecord {
         }
     }
 
+    /// C `selRecord.c:99-105`: `recGblInitConstantLink(&prec->nvl, DBF_USHORT,
+    /// &prec->seln)` then the INPA..INPL loop. A constant NVL is what makes
+    /// `field(NVL,"2")` select INPC — at init, once; `dbGetLink` delivers
+    /// nothing for it at process, so a `caput REC.SELN` is not stomped.
+    fn constant_init_links(&self) -> Vec<crate::server::record::ConstantInitLink> {
+        let mut seeds = vec![crate::server::record::ConstantInitLink::new("NVL", "SELN")];
+        seeds.extend(crate::server::record::seed_input_links(
+            self.multi_input_links(),
+        ));
+        seeds
+    }
+
     fn multi_input_links(&self) -> &[(&'static str, &'static str)] {
         &[
             ("INPA", "A"),

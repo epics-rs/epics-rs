@@ -131,7 +131,13 @@ impl Default for CommonFields {
     fn default() -> Self {
         Self {
             sevr: AlarmSeverity::NoAlarm,
-            stat: 0,
+            // C dbd `field(STAT,DBF_MENU){ menu(menuAlarmStat) initial("UDF") }`
+            // (`dbCommon.dbd.pod:296-301`): a record is born UNDEFINED, not
+            // NO_ALARM. SEVR has no `initial()` — it starts NO_ALARM and is
+            // raised to UDFS by the init prologue
+            // (`RecordInstance::run_init_passes`, C `iocInit.c:521-523`), which
+            // keys off exactly this STAT value.
+            stat: crate::server::recgbl::alarm_status::UDF_ALARM,
             amsg: String::new(),
             nsev: AlarmSeverity::NoAlarm,
             nsta: 0,

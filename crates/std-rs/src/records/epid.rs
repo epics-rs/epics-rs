@@ -1465,6 +1465,28 @@ impl Record for EpidRecord {
         }
     }
 
+    /// C `epidRecord.c:158-164`:
+    ///
+    /// ```c
+    /// if (pepid->stpl.type == CONSTANT) {
+    ///     if (recGblInitConstantLink(&pepid->stpl, DBF_DOUBLE, &pepid->val))
+    ///         pepid->udf = FALSE;
+    /// }
+    /// ```
+    ///
+    /// The setpoint of a constant-STPL epid is loaded ONCE, here — at process
+    /// `dbGetLink(&prec->stpl, ...)` delivers nothing (it returns success, so
+    /// the closed-loop UDF clear at `:191` still fires), which is why an
+    /// operator `caput REC.VAL` on a constant-STPL epid holds.
+    ///
+    /// INP is NOT seeded: a constant INP means "nothing to control" in C —
+    /// `devEpidSoft.c` raises SOFT/INVALID rather than reading a value.
+    fn constant_init_links(&self) -> Vec<epics_base_rs::server::record::ConstantInitLink> {
+        vec![epics_base_rs::server::record::ConstantInitLink::dol_to_val(
+            "STPL", "VAL",
+        )]
+    }
+
     fn multi_input_links(&self) -> &[(&'static str, &'static str)] {
         // INP -> CVAL is always resolved.
         // STPL -> VAL is only resolved when SMSL == closed_loop (1).

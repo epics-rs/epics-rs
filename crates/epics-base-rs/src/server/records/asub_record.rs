@@ -558,6 +558,19 @@ impl Record for ASubRecord {
         None
     }
 
+    /// C `aSubRecord.c:126-136`: `recGblInitConstantLink(&prec->subl,
+    /// DBF_STRING, prec->snam)` followed by the `dbLoadLinkArray` loop over
+    /// INPA..INPU. Both are init-only: at process `dbGetLink` on a constant
+    /// delivers nothing, so SNAM and A..U keep what was seeded (or what a
+    /// client later put).
+    fn constant_init_links(&self) -> Vec<crate::server::record::ConstantInitLink> {
+        let mut seeds = vec![crate::server::record::ConstantInitLink::new("SUBL", "SNAM")];
+        seeds.extend(crate::server::record::seed_input_links(
+            self.multi_input_links(),
+        ));
+        seeds
+    }
+
     fn multi_input_links(&self) -> &[(&'static str, &'static str)] {
         use std::sync::OnceLock;
         static PAIRS: OnceLock<Vec<(&'static str, &'static str)>> = OnceLock::new();

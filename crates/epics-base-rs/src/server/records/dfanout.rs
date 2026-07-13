@@ -386,22 +386,24 @@ impl Record for DfanoutRecord {
         true
     }
 
-    /// C `dfanoutRecord.c::init_record` applies a constant DOL to VAL once
-    /// via `recGblInitConstantLink(&prec->dol, DBF_DOUBLE, &prec->val)`.
-    /// The framework gate (`processing.rs`) excludes a constant DOL from
-    /// the per-cycle closed-loop fetch (C `!dbLinkIsConstant`), so the
-    /// constant must be seeded here or it would never reach VAL.
-    fn init_record(&mut self, pass: u8) -> CaResult<()> {
-        if pass == 0 {
-            if let crate::server::record::ParsedLink::Constant(s) =
-                crate::server::record::parse_link_v2(&self.dol)
-            {
-                if let Ok(v) = s.trim().parse::<f64>() {
-                    self.val = v;
-                }
-            }
-        }
-        Ok(())
+    /// C `dfanoutRecord.c:102-105`:
+    ///
+    /// ```c
+    /// recGblInitConstantLink(&prec->sell, DBF_USHORT, &prec->seln);
+    /// if (recGblInitConstantLink(&prec->dol, DBF_DOUBLE, &prec->val))
+    ///     prec->udf = FALSE;
+    /// ```
+    ///
+    /// Both links are init-only — at process `dbGetLink` on a constant
+    /// delivers nothing — so this table is the only way a constant SELL or DOL
+    /// reaches SELN / VAL.
+    fn constant_init_links(&self) -> Vec<crate::server::record::ConstantInitLink> {
+        vec![
+            crate::server::record::ConstantInitLink::new("SELL", "SELN"),
+            // C `dfanoutRecord.c:105-106`: a successful DOL load also DEFINES
+            // the record — `prec->udf = isnan(prec->val)`.
+            crate::server::record::ConstantInitLink::dol_to_val("DOL", "VAL"),
+        ]
     }
 
     /// dfanout has no value computation in `process()` itself — VAL is

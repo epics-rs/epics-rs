@@ -147,8 +147,15 @@ async fn dead_dol_raises_a_pending_link_alarm() {
     assert_eq!(common.namsg, "field DOL", "C AMSG is the link's field name");
     assert_eq!(
         common.sevr,
-        AlarmSeverity::NoAlarm,
-        "the abort skips monitor(), so recGblResetAlarms never commits it this cycle"
+        AlarmSeverity::Invalid,
+        "the abort skips monitor(), so recGblResetAlarms never commits the LINK \
+         alarm this cycle — SEVR still carries the INIT-time UDF severity \
+         (iocInit.c:521-523), untouched by this process"
+    );
+    assert_eq!(
+        common.stat,
+        epics_base_rs::server::recgbl::alarm_status::UDF_ALARM,
+        "and STAT is still the born UDF, not the pending LINK"
     );
 }
 

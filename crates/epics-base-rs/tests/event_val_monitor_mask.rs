@@ -54,6 +54,14 @@ async fn r9_77_event_val_posts_dbe_value_without_dbe_log() {
         .unwrap();
     let mut rx = subscribe_val(&db, "EV", DbFieldType::String).await;
 
+    // The first process carries the born-UDF -> NO_ALARM transition
+    // (dbCommon.dbd STAT `initial("UDF")`), so `recGblResetAlarms` puts
+    // DBE_ALARM in `monitor_mask` there — in C too. The steady-state cycle,
+    // where no alarm moves, is the one this test is about.
+    process(&db, "EV").await;
+    let first = rx.try_recv().expect("event VAL posts on every process");
+    assert_eq!(first.mask, EventMask::VALUE | EventMask::ALARM);
+
     process(&db, "EV").await;
 
     let event = rx.try_recv().expect("event VAL posts on every process");

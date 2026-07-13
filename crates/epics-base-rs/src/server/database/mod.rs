@@ -441,20 +441,46 @@ pub(crate) struct SelmResult {
 }
 
 /// Convert a link value to `epicsUInt16` with C `dbGetLink(.., DBR_USHORT,
-/// ..)` cast semantics. The dbConvert GET macro stores `*pdst =
-/// (epicsUInt16) *psrc` (`dbConvert.c:63-70`) — a C cast that truncates
-/// toward zero then wraps modulo 2^16, NOT a clamp. So `-1` becomes
-/// `65535` and `65536` becomes `0`. Used for fanout/dfanout/seq
-/// `SELL`→`SELN` so a constant, DB, CA, or PVA link source all convert
-/// by the one rule C applies through `dbFastGetConvertRoutine`.
+/// ..)` semantics, for the fanout/dfanout/seq `SELL`→`SELN` read — so a
+/// constant, DB, CA, or PVA link source all convert by the one rule C applies
+/// through `dbFastGetConvertRoutine`.
 ///
-/// The cast itself belongs to [`crate::types::c_cast`], the single owner of
-/// C's compiled `double -> integer` narrowing: routing an out-of-`i32`-range
-/// double through the `i64` path (the local shortcut this used to take) is the
-/// `u32` rule, not the `u16` one — compiled C converts a 16-bit destination
-/// through a 32-bit `cvttsd2si`, so `3.0e9` is `0` here, not `55296`.
+/// # The source type decides the rule, because in C it decides the routine
+///
+/// `dbFastGetConvertRoutine` is a 2-D table indexed by *both* the source DBF
+/// and the destination DBR (`dbConvert.c:1571-1638`): a `DBF_LONG` source
+/// reaches `getLongUshort`, a `DBF_DOUBLE` source reaches `getDoubleUshort`.
+/// They are different functions, and C gives them different semantics:
+///
+/// * **Integer source** — `(epicsUInt16)(epicsInt32)v`. Conversion of an
+///   out-of-range *integer* to an unsigned type is **defined** in C
+///   (C17 6.3.1.3p2: reduce modulo `USHRT_MAX + 1`). Every compiler and
+///   every target agrees, so this is a real contract and the port keeps it:
+///   `SELL` pointing at a `DBF_LONG` field holding `-1` gives `SELN = 65535`.
+/// * **Float source** — `(epicsUInt16)d`. Conversion of an out-of-range
+///   *float* is **undefined** (C17 6.3.1.4p1), so compiled C is not
+///   single-valued: x86-64 wraps, aarch64 saturates. What the port does about
+///   that is [`crate::types::c_cast`]'s call — the single owner of the policy —
+///   and deliberately not restated here.
+///
+/// Both rules already live in [`EpicsValue::convert_to`], the single
+/// value-coercion owner: it takes the integer view (`as_int_i64`) when the
+/// source has one and falls back to `c_cast` only for a genuine float. So this
+/// is a thin projection onto that owner, NOT a second conversion table.
+///
+/// The previous revision called `c_cast::f64_to_u16(value.to_f64())` directly,
+/// bypassing the owner — which silently applied the float rule to integer
+/// sources too, losing the one wrap C actually defines.
 pub(crate) fn dbr_ushort_cast(value: &EpicsValue) -> u16 {
-    crate::types::c_cast::f64_to_u16(value.to_f64().unwrap_or(0.0))
+    match value.convert_to(crate::types::DbFieldType::UShort) {
+        EpicsValue::UShort(v) => v,
+        // A link that delivers an array converts element-wise; C's
+        // `dbGetLink(.., &prec->seln, 0, 0)` requests ONE element, so SELN
+        // takes the first (an empty array leaves it 0).
+        EpicsValue::UShortArray(v) => v.first().copied().unwrap_or(0),
+        // `convert_to(UShort)` returns no other variant.
+        _ => 0,
+    }
 }
 
 /// Select which link indices are active based on SELM/SELN, applying
@@ -465,9 +491,8 @@ pub(crate) fn dbr_ushort_cast(value: &EpicsValue) -> u16 {
 ///
 /// `seln` is the native `DBF_USHORT` value: C declares `SELN` as
 /// `epicsUInt16`, so every comparison below is unsigned, matching C's
-/// selection arithmetic. A `SELL=-1` link read therefore selects
-/// `65535` (out of range → INVALID for Specified, all-bits for Mask),
-/// not `-1`.
+/// selection arithmetic — never `-1`. What an out-of-range `SELL` converts
+/// *to* is [`dbr_ushort_cast`]'s decision, not this function's.
 ///
 /// C references:
 /// * fanout — `fanoutRecord.c:106-141`
@@ -1828,31 +1853,53 @@ mod tests {
         assert_eq!(r.indices, vec![0, 2]);
     }
 
+    /// `SELN` is unsigned, and the rule that makes it unsigned depends on the
+    /// SOURCE type — because in C the source type picks the conversion routine.
     #[test]
-    fn seln_is_unsigned_dbr_ushort_cast() {
-        use crate::server::record::AlarmSeverity;
-        // `dbr_ushort_cast` reproduces C's `(epicsUInt16)` cast
-        // (dbConvert.c:63-70): truncate toward zero, wrap mod 2^16, NOT a
-        // clamp. SELL=-1 → 65535, SELL=65536 → 0.
-        assert_eq!(dbr_ushort_cast(&EpicsValue::Double(-1.0)), 65535);
-        assert_eq!(dbr_ushort_cast(&EpicsValue::Double(65536.0)), 0);
-        assert_eq!(dbr_ushort_cast(&EpicsValue::Double(3.7)), 3);
+    fn seln_cast_follows_the_source_type() {
+        // Integer source -> `getLongUshort`, `(epicsUInt16)(epicsInt32)v`.
+        // C DEFINES this (C17 6.3.1.3p2, modulo 2^16), so we reproduce it.
         assert_eq!(dbr_ushort_cast(&EpicsValue::Long(-1)), 65535);
+        assert_eq!(dbr_ushort_cast(&EpicsValue::Long(65536)), 0);
+        assert_eq!(dbr_ushort_cast(&EpicsValue::Short(-1)), 65535);
+        assert_eq!(dbr_ushort_cast(&EpicsValue::Int64(-1)), 65535);
+        assert_eq!(dbr_ushort_cast(&EpicsValue::Long(3)), 3);
 
-        // SELL=-1 casts to the unsigned `DBF_USHORT` value 65535.
+        // Float source -> `getDoubleUshort`, `(epicsUInt16)d`. C leaves this
+        // UNDEFINED (C17 6.3.1.4p1), and whatever `types::c_cast` decides to do
+        // about that is a SEPARATE question from this one — the point here is
+        // only that the float source takes the float rule and the integer
+        // source does not.
+        assert_eq!(
+            dbr_ushort_cast(&EpicsValue::Double(-1.0)),
+            crate::types::c_cast::f64_to_u16(-1.0)
+        );
+        assert_eq!(
+            dbr_ushort_cast(&EpicsValue::Double(65536.0)),
+            crate::types::c_cast::f64_to_u16(65536.0)
+        );
+        // In range: no policy in play, both rules truncate toward zero.
+        assert_eq!(dbr_ushort_cast(&EpicsValue::Double(3.7)), 3);
+    }
+
+    /// Whatever produced it, a `SELN` of 65535 selects nothing under Specified
+    /// (out of range -> INVALID) and everything under Mask.
+    #[test]
+    fn seln_at_the_unsigned_maximum_selects_by_selm() {
+        use crate::server::record::AlarmSeverity;
         let seln_max = 65535u16;
-        // fanout/seq Specified: C `i = (epicsUInt16)seln + offs` =
-        // 65535 → out of range → INVALID. The old signed read clamped to
-        // 0 and drove link 0.
+        // fanout/seq Specified: C `i = (epicsUInt16)seln + offs` = 65535 →
+        // out of range → INVALID. A signed read would clamp to 0 and wrongly
+        // drive link 0.
         let r = select_link_indices_ex(SelmKind::FanoutSeq, 1, seln_max, 0, 0, 16);
         assert!(r.indices.is_empty());
         assert_eq!(r.alarm, Some((15, AlarmSeverity::Invalid)));
-        // fanout/seq Mask: 65535 → all 16 low bits set → every link. The
-        // old clamp produced an empty mask.
+        // fanout/seq Mask: 65535 → all 16 low bits set → every link. A signed
+        // read would produce an empty mask.
         let r = select_link_indices_ex(SelmKind::FanoutSeq, 2, seln_max, 0, 0, 16);
         assert_eq!(r.indices, (0..16).collect::<Vec<_>>());
-        // dfanout Specified: 65535 > count → INVALID. The old signed read
-        // saw -1 ≤ 0 → drove nothing with no alarm.
+        // dfanout Specified: 65535 > count → INVALID. A signed read would see
+        // -1 ≤ 0 → drive nothing, with no alarm.
         let r = select_link_indices_ex(SelmKind::Dfanout, 1, seln_max, 0, 0, 16);
         assert!(r.indices.is_empty());
         assert_eq!(r.alarm, Some((15, AlarmSeverity::Invalid)));

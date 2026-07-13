@@ -1,4 +1,4 @@
-//! C's `double -> integer` cast, as the compiler actually emits it on x86-64.
+//! C's `double -> integer` cast, saturated — the single owner of the conversion.
 //!
 //! `dbConvert.c` converts a `DBF_DOUBLE` value into an integer field with a
 //! bare C cast — the PUT/GET macros are literally `*pdst = (typeb) *psrc`
@@ -13,252 +13,203 @@
 //! ...                                        /* dbConvert.c:1631-1638 */
 //! ```
 //!
-//! An out-of-range cast is undefined behaviour by the C standard, so there is
-//! no portable answer — but **the compiled IOC is the parity target**, the same
-//! precedent the port already follows for HexSignificand and for the shift-mask
-//! UB. Rust's `as` is *not* that behaviour: it saturates
-//! (`3.0e9 as i32 == 2147483647`), while the compiled C yields `INT_MIN`. A
-//! client writing 3.0e9 to a `longout` gets `-2147483648` on a C IOC and
-//! `2147483647` on the pre-fix port; an `aao` DOL of `[1.7, 2.2, -3.9, 70000,
-//! 5, 6]` into an `FTVL=SHORT` waveform gives C `[1, 2, -3, 4464]`.
+//! # Why this does not reproduce a compiled C IOC
 //!
-//! This module is the SINGLE OWNER of that cast. Every `double -> integer`
-//! conversion that models a `dbConvert` cast calls it; no such site may use a
-//! bare `as`.
-//!
-//! # The model (x86-64 SysV, gcc/clang, verified against compiled output)
-//!
-//! - **32-bit and narrower signed/unsigned dests** (`i8`/`u8`/`i16`/`u16`/
-//!   `i32`/`u32`... except `u32`, see below): the compiler emits a *32-bit*
-//!   `cvttsd2si`, then truncates the `i32` to the destination width. A value
-//!   whose truncation does not fit in `i32` — and NaN — gives the "integer
-//!   indefinite" `INT_MIN` (`0x80000000`), which then truncates to 0 in the
-//!   narrower widths. Hence `70000.9 -> short 4464` (70000 & 0xFFFF) but
-//!   `3.0e9 -> short 0` (INT_MIN & 0xFFFF).
-//! - **`u32`**: the compiler emits a *64-bit* `cvttsd2si` and keeps the low 32
-//!   bits, so `3.0e9 -> 3000000000` (in range for the 64-bit convert) while
-//!   `1e19 -> 0` (INT64_MIN's low half).
-//! - **`i64`**: 64-bit `cvttsd2si`; out of range or NaN gives `INT64_MIN`.
-//! - **`u64`**: the compiler's branch sequence — below 2^63 a plain 64-bit
-//!   `cvttsd2si`, at or above it `cvttsd2si(d - 2^63)` with bit 63 flipped
-//!   back. NaN fails the `>= 2^63` test (every NaN comparison is false) and so
-//!   takes the low branch, yielding 2^63.
-//!
-//! Every value in the table below was produced by compiling the casts with the
-//! same gcc that builds the reference softIoc (`gcc -O2`, x86-64):
+//! An out-of-range `double -> integer` cast is **undefined behaviour**
+//! (C17 6.3.1.4p1), and the compiled IOC is therefore *not single-valued*.
+//! Compiling that exact macro body for the two targets EPICS actually ships on
+//! gives two different stored values:
 //!
 //! ```text
-//! double          char  uint8   int16  uint16        int32       uint32                int64                 uint64
-//! 1.7                1      1       1       1            1            1                    1                      1
-//! -3.9              -3    253      -3   65533           -3   4294967293                   -3   18446744073709551613
-//! 70000.9          112    112    4464    4464        70000        70000                70000                  70000
-//! 3e+09              0      0       0       0  -2147483648   3000000000           3000000000             3000000000
-//! -3e+09             0      0       0       0  -2147483648   1294967296          -3000000000   18446744070709551616
-//! 5e+09              0      0       0       0  -2147483648    705032704           5000000000             5000000000
-//! -1                -1    255      -1   65535           -1   4294967295                   -1   18446744073709551615
-//! 1e+19              0      0       0       0  -2147483648            0 -9223372036854775808   10000000000000000000
-//! 65535.7           -1    255      -1   65535        65535        65535                65535                  65535
-//! nan                0      0       0       0  -2147483648            0 -9223372036854775808    9223372036854775808
-//! inf                0      0       0       0  -2147483648            0 -9223372036854775808                      0
-//! -inf               0      0       0       0  -2147483648            0 -9223372036854775808    9223372036854775808
+//! x86_64    cvttsd2si (%rdi), %eax   out of range -> INT_MIN;  NaN -> INT_MIN
+//! aarch64   fcvtzs    w0, d0         out of range -> SATURATES; NaN -> 0
 //! ```
+//!
+//! So `3.0e9 -> i32` is `-2147483648` on an x86-64 IOC and `2147483647` on an
+//! ARM one (Raspberry Pi and Zynq IOCs are ordinary in EPICS). There is no
+//! "what C does" here to be bug-for-bug faithful *to*: the behaviour is UB, and
+//! UB is definitionally not a contract. An earlier revision of this module
+//! reproduced the x86-64 `INT_MIN`, which did not close a divergence so much as
+//! trade agreement-with-ARM for agreement-with-x86 while deliberately adopting
+//! the undefined value.
+//!
+//! Per `doc/strategy-2026-07-13.md` §2 — *C's bugs are not the contract; clean
+//! is the goal* — the port **saturates**: an out-of-range value clamps to the
+//! destination's range and NaN converts to 0. That is Rust's native `as`, and
+//! it is byte-identical to a compiled C IOC on aarch64. This is a Tier 2
+//! (semantics) decision, signed off 2026-07-14; Tier 1 is untouched, because a
+//! `DBF_LONG` field carries 32 bits on the wire regardless of which 32 bits we
+//! chose. Catalogued as CBUG-E2 in `doc/upstream-c-bugs.md`.
+//!
+//! No alarm is raised: `dbConvert`'s routines run on the put path, outside the
+//! record's own process cycle, so an alarm raised here would be erased by the
+//! next `recGblResetAlarms` unless routed through `nsta`/`nsev` — and even
+//! routed correctly it would flag a record whose stored value is now perfectly
+//! valid and in range.
+//!
+//! This module remains the SINGLE OWNER of the cast. Every `double -> integer`
+//! conversion that models a `dbConvert` cast calls it; no such site may use a
+//! bare `as`, so that the policy above is changeable in exactly one place.
 
-/// 2^31 as an `f64` — the exclusive upper bound of the 32-bit `cvttsd2si`.
-const TWO_POW_31: f64 = 2_147_483_648.0;
-/// 2^63 as an `f64` — the exclusive upper bound of the 64-bit `cvttsd2si`.
-const TWO_POW_63: f64 = 9_223_372_036_854_775_808.0;
-
-/// x86-64 `cvttsd2si r32` — truncate toward zero into `i32`, with the
-/// "integer indefinite" `i32::MIN` for NaN and for anything out of range.
-///
-/// The low-side bound is `<` rather than `<=`: `trunc(-2147483648.5)` is
-/// `-2147483648`, which fits, and the indefinite is that same bit pattern, so
-/// the two agree either way.
+/// C `(epicsInt32) d`, saturated: clamps to `i32`'s range, NaN -> 0.
 pub fn f64_to_i32(v: f64) -> i32 {
-    if v.is_nan() || v >= TWO_POW_31 || v < -TWO_POW_31 {
-        i32::MIN
-    } else {
-        v as i32
-    }
+    v as i32
 }
 
-/// x86-64 `cvttsd2si r64` — truncate toward zero into `i64`, indefinite
-/// (`i64::MIN`) for NaN and out of range.
+/// C `(epicsInt64) d`, saturated: clamps to `i64`'s range, NaN -> 0.
 pub fn f64_to_i64(v: f64) -> i64 {
-    if v.is_nan() || v >= TWO_POW_63 || v < -TWO_POW_63 {
-        i64::MIN
-    } else {
-        v as i64
-    }
+    v as i64
 }
 
-/// C `(char) d` / `(epicsInt8) d` — the 32-bit convert, truncated to 8 bits.
+/// C `(char) d` / `(epicsInt8) d`, saturated: clamps to `i8`'s range, NaN -> 0.
 pub fn f64_to_i8(v: f64) -> i8 {
-    f64_to_i32(v) as i8
+    v as i8
 }
 
-/// C `(epicsUInt8) d` — the same 8 bits as [`f64_to_i8`], unsigned carrier.
+/// C `(epicsUInt8) d`, saturated: clamps to `u8`'s range, negatives and NaN -> 0.
 pub fn f64_to_u8(v: f64) -> u8 {
-    f64_to_i32(v) as u8
+    v as u8
 }
 
-/// C `(epicsInt16) d` — the 32-bit convert, truncated to 16 bits.
-/// `70000.9 -> 4464`, not the saturating `32767`.
+/// C `(epicsInt16) d`, saturated: clamps to `i16`'s range, NaN -> 0.
 pub fn f64_to_i16(v: f64) -> i16 {
-    f64_to_i32(v) as i16
+    v as i16
 }
 
-/// C `(epicsUInt16) d` / `(epicsEnum16) d` — [`f64_to_i16`]'s bits, unsigned.
+/// C `(epicsUInt16) d` / `(epicsEnum16) d`, saturated: clamps to `u16`'s range,
+/// negatives and NaN -> 0.
 pub fn f64_to_u16(v: f64) -> u16 {
-    f64_to_i32(v) as u16
+    v as u16
 }
 
-/// C `(epicsUInt32) d` — the compiler uses the **64-bit** convert here and
-/// keeps the low half, so `3.0e9` survives as `3000000000` where the signed
-/// `i32` cast would have gone indefinite.
+/// C `(epicsUInt32) d`, saturated: clamps to `u32`'s range, negatives and
+/// NaN -> 0.
 pub fn f64_to_u32(v: f64) -> u32 {
-    f64_to_i64(v) as u32
+    v as u32
 }
 
-/// C `(epicsUInt64) d` — the compiler's two-branch sequence (see the module
-/// docs). NaN compares false against `2^63` and so takes the low branch.
+/// C `(epicsUInt64) d`, saturated: clamps to `u64`'s range, negatives and
+/// NaN -> 0.
 pub fn f64_to_u64(v: f64) -> u64 {
-    if v >= TWO_POW_63 {
-        (f64_to_i64(v - TWO_POW_63) as u64) ^ (1u64 << 63)
-    } else {
-        f64_to_i64(v) as u64
-    }
+    v as u64
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Every row of the module-doc table, straight from `gcc -O2` on x86-64.
-    /// Rust's `as` saturates and fails all of the out-of-range rows.
+    /// The conversion saturates at the destination's bounds and sends NaN to 0.
+    ///
+    /// The out-of-range rows are exactly where a compiled x86-64 IOC would store
+    /// the "integer indefinite" instead (`3.0e9 -> i32` = `INT_MIN` there). We
+    /// deliberately do not: see the module docs — that value is UB, an ARM IOC
+    /// saturates just as this does, and CBUG-E2 signed off on clean.
     #[test]
-    fn matches_compiled_c_x86_64() {
+    fn out_of_range_saturates_and_nan_is_zero() {
         #[allow(clippy::type_complexity)]
         let rows: &[(f64, i8, u8, i16, u16, i32, u32, i64, u64)] = &[
+            // In range for every destination — no policy in play, exact truncation.
             (1.7, 1, 1, 1, 1, 1, 1, 1, 1),
             (2.2, 2, 2, 2, 2, 2, 2, 2, 2),
-            (
-                -3.9,
-                -3,
-                253,
-                -3,
-                65533,
-                -3,
-                4294967293,
-                -3,
-                18446744073709551613,
-            ),
-            (70000.9, 112, 112, 4464, 4464, 70000, 70000, 70000, 70000),
+            (-0.5, 0, 0, 0, 0, 0, 0, 0, 0),
+            // Truncation is toward zero, as in C.
+            (-3.9, -3, 0, -3, 0, -3, 0, -3, 0),
+            // Boundary: exactly representable at each width's edge.
+            (127.0, 127, 127, 127, 127, 127, 127, 127, 127),
+            (255.9, 127, 255, 255, 255, 255, 255, 255, 255),
+            (32767.5, 127, 255, 32767, 32767, 32767, 32767, 32767, 32767),
+            (65535.7, 127, 255, 32767, 65535, 65535, 65535, 65535, 65535),
+            // Over an inner width, still inside a wider one: the narrow dest
+            // CLAMPS (C's x86 build would wrap here — 70000 & 0xFFFF = 4464).
+            (70000.9, 127, 255, 32767, 65535, 70000, 70000, 70000, 70000),
+            // Over i32, inside u32/i64/u64.
             (
                 3.0e9,
-                0,
-                0,
-                0,
-                0,
-                i32::MIN,
+                127,
+                255,
+                32767,
+                65535,
+                i32::MAX,
                 3000000000,
                 3000000000,
                 3000000000,
             ),
-            (
-                -3.0e9,
-                0,
-                0,
-                0,
-                0,
-                i32::MIN,
-                1294967296,
-                -3000000000,
-                18446744070709551616,
-            ),
-            (
-                5.0e9,
-                0,
-                0,
-                0,
-                0,
-                i32::MIN,
-                705032704,
-                5000000000,
-                5000000000,
-            ),
-            (-1.0, -1, 255, -1, 65535, -1, 4294967295, -1, u64::MAX),
-            (
-                1.0e19,
-                0,
-                0,
-                0,
-                0,
-                i32::MIN,
-                0,
-                i64::MIN,
-                10000000000000000000,
-            ),
-            (
-                -1.0e19,
-                0,
-                0,
-                0,
-                0,
-                i32::MIN,
-                0,
-                i64::MIN,
-                9223372036854775808,
-            ),
+            // Negative: every unsigned dest clamps to 0, not to a wrapped bit pattern.
+            (-1.0, -1, 0, -1, 0, -1, 0, -1, 0),
+            (-3.0e9, i8::MIN, 0, i16::MIN, 0, i32::MIN, 0, -3000000000, 0),
+            // At and beyond the i32 edge.
             (
                 2147483647.5,
-                -1,
+                127,
                 255,
-                -1,
+                32767,
                 65535,
-                2147483647,
+                i32::MAX,
                 2147483647,
                 2147483647,
                 2147483647,
             ),
             (
                 4294967295.5,
-                0,
-                0,
-                0,
-                0,
-                i32::MIN,
-                4294967295,
+                127,
+                255,
+                32767,
+                65535,
+                i32::MAX,
+                u32::MAX,
                 4294967295,
                 4294967295,
             ),
-            (65535.7, -1, 255, -1, 65535, 65535, 65535, 65535, 65535),
-            (255.9, -1, 255, 255, 255, 255, 255, 255, 255),
-            (-0.5, 0, 0, 0, 0, 0, 0, 0, 0),
-            (1.0e300, 0, 0, 0, 0, i32::MIN, 0, i64::MIN, 0),
+            // Beyond every 32-bit dest.
             (
-                f64::NAN,
-                0,
-                0,
-                0,
-                0,
-                i32::MIN,
-                0,
-                i64::MIN,
-                9223372036854775808,
+                1.0e19,
+                127,
+                255,
+                32767,
+                65535,
+                i32::MAX,
+                u32::MAX,
+                i64::MAX,
+                10000000000000000000,
             ),
-            (f64::INFINITY, 0, 0, 0, 0, i32::MIN, 0, i64::MIN, 0),
+            (-1.0e19, i8::MIN, 0, i16::MIN, 0, i32::MIN, 0, i64::MIN, 0),
+            // Beyond every dest, and the infinities: saturate, never indefinite.
+            (
+                1.0e300,
+                127,
+                255,
+                32767,
+                65535,
+                i32::MAX,
+                u32::MAX,
+                i64::MAX,
+                u64::MAX,
+            ),
+            (
+                f64::INFINITY,
+                127,
+                255,
+                32767,
+                65535,
+                i32::MAX,
+                u32::MAX,
+                i64::MAX,
+                u64::MAX,
+            ),
             (
                 f64::NEG_INFINITY,
+                i8::MIN,
                 0,
-                0,
-                0,
+                i16::MIN,
                 0,
                 i32::MIN,
                 0,
                 i64::MIN,
-                9223372036854775808,
+                0,
             ),
+            // NaN is 0 in every destination — an ARM IOC agrees; an x86 one stores
+            // INT_MIN.
+            (f64::NAN, 0, 0, 0, 0, 0, 0, 0, 0),
         ];
         for &(d, i8v, u8v, i16v, u16v, i32v, u32v, i64v, u64v) in rows {
             assert_eq!(f64_to_i8(d), i8v, "(char){d}");
@@ -270,5 +221,14 @@ mod tests {
             assert_eq!(f64_to_i64(d), i64v, "(epicsInt64){d}");
             assert_eq!(f64_to_u64(d), u64v, "(epicsUInt64){d}");
         }
+    }
+
+    /// The module's reason to exist: one place to change the policy. A bare `as`
+    /// at a call site would silently opt out of it.
+    #[test]
+    fn saturation_is_rusts_native_as() {
+        assert_eq!(f64_to_i32(3.0e9), 3.0e9 as i32);
+        assert_eq!(f64_to_i16(70000.9), 70000.9_f64 as i16);
+        assert_eq!(f64_to_u32(-1.0), -1.0_f64 as u32);
     }
 }

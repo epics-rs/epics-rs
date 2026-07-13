@@ -155,7 +155,10 @@ fn the_shift_width_follows_the_evaluator() {
     // `~` splits the same way (`:725-727` vs `:1441-1444`); `&` `|` `^` do not
     // — they are `(long)` on both paths.
     assert_eq!(num("~8589934592"), -8589934593.0);
-    assert_eq!(num(r#"~8589934592+0*LEN(AA)"#), 2147483647.0);
+    // The string path's `(int)` narrows 2^33 out of range, so what `~` inverts
+    // is CBUG-E2's saturated INT32_MAX -> INT32_MIN. A compiled x86-64 IOC
+    // narrows to INT32_MIN and so answers with the opposite end, 2147483647.
+    assert_eq!(num(r#"~8589934592+0*LEN(AA)"#), -2147483648.0);
     assert_eq!(num("8589934592&8589934592"), 8589934592.0);
     assert_eq!(num(r#"(8589934592&8589934592)+0*LEN(AA)"#), 8589934592.0);
 }

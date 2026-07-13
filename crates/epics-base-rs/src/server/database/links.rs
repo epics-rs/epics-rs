@@ -1913,15 +1913,13 @@ impl PvDatabase {
                     // DBF_USHORT, &seln)`), so a `caput REC.SELN` STAYS put.
                     if let Some(val) = self.fetch_link(rec, &parsed).await.value() {
                         // C reads SELL with `dbGetLink(&prec->sell,
-                        // DBR_USHORT, &prec->seln, 0, 0)`; the dbConvert GET
-                        // macro stores `*pdst = (epicsUInt16) *psrc`
-                        // (`dbConvert.c:63-70`) — a C cast (truncate-then-
-                        // wrap mod 2^16), NOT a clamp. `SELL=-1` therefore
-                        // yields `SELN=65535` (Specified → out-of-range
-                        // INVALID, Mask → all-bits), where the old clamp
-                        // produced `0` (drove link 0 / empty mask). SELN is
-                        // a `DBF_USHORT` (u16) field; `select_link_indices_ex`
-                        // consumes it as `u16`.
+                        // DBR_USHORT, &prec->seln, 0, 0)`, which lands in a
+                        // conversion routine chosen by the SOURCE type — an
+                        // integer source wraps mod 2^16, a float source is UB.
+                        // `dbr_ushort_cast` owns that split. SELN is a
+                        // `DBF_USHORT` (u16) field either way, and
+                        // `select_link_indices_ex` consumes it as `u16` —
+                        // never as a signed value that could clamp to 0.
                         let seln = dbr_ushort_cast(&val);
                         let mut instance = rec.write().await;
                         let _ = instance.record.put_field("SELN", EpicsValue::UShort(seln));

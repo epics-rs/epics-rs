@@ -1391,7 +1391,15 @@ impl Record for ScalerRecord {
     /// with `DBE_LOG` (`:771`). Both events fire on that one cycle, so the
     /// framework emits the sweep post in addition to the change post — the
     /// final counts are the only `Sn` value a `DBE_LOG`-only archiver ever
-    /// cares about. Slicing the static `SN_FIELD_NAMES` to `nch`
+    /// cares about.
+    ///
+    /// The framework posts this sweep with `DBE_LOG | <alarm-transition bits>`.
+    /// DEVIATION from C, deliberate — CBUG-B19: C's `monitor()` computes
+    /// `monitor_mask = recGblResetAlarms(pscal)` (`:764`), ORs `DBE_VALUE|DBE_LOG`
+    /// into it (`:766`), and then posts with a literal `DBE_LOG` (`:771`) —
+    /// `monitor_mask` is never read, so the alarm bit is dropped and a client
+    /// subscribed to `Sn` with `DBE_ALARM` receives nothing on a severity
+    /// transition. Slicing the static `SN_FIELD_NAMES` to `nch`
     /// avoids a per-call allocation; the unsafe `'static` re-view matches
     /// `field_list` above (the `LazyLock` lives for the program and
     /// `active_channels() <= SN_FIELD_NAMES.len()`).

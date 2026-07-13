@@ -2769,8 +2769,27 @@ impl RecordInstance {
             // cycle — DBE_VALUE, then DBE_LOG. Making this an `else if` on
             // `changed` dropped the DBE_LOG half exactly when it matters: a
             // DBE_LOG-only archiver would never receive the final counts.
+            //
+            // The sweep carries the ALARM-transition bits too. DEVIATION from C,
+            // deliberate — CBUG-B19. C's `monitor()` opens with
+            // `monitor_mask = recGblResetAlarms(pscal); monitor_mask |=
+            // (DBE_VALUE|DBE_LOG);` and then posts with a LITERAL `DBE_LOG`
+            // (scalerRecord.c:764-771) — `monitor_mask` is assigned, OR-ed, and
+            // never read. Those two lines are dead, and their only plausible use
+            // was as the third `db_post_events` argument.
+            // `recGblResetAlarms` returns the alarm-transition mask that every
+            // other record ORs into its value posts, so discarding it drops the
+            // alarm bit: a client subscribed to `Sn` with DBE_ALARM receives
+            // NOTHING on an alarm-severity transition of the record.
+            //
+            // The DBE_VALUE half of C's dead `|=` is deliberately NOT
+            // resurrected: this sweep is unconditional, so adding VALUE would
+            // fire a value event at every VALUE subscriber on every idle scan,
+            // changed or not — that would be a new defect, not a fix. The value
+            // path is separately served by the change post (C's `updateCounts()`
+            // DBE_VALUE at `:582`).
             if log_swept.contains(&field.as_str()) {
-                sub_updates.push((field.clone(), val, EventMask::LOG));
+                sub_updates.push((field.clone(), val, EventMask::LOG | alarm_bits));
             }
         }
         for (field, val, _) in &sub_updates {
@@ -4623,10 +4642,15 @@ mod metadata_cache_tests {
             "unchanged non-swept S2 must not re-post: {:?}",
             names(&snap1)
         );
+        // DBE_LOG, plus the DBE_ALARM of this cycle's transition: a record
+        // starts UDF/INVALID and its first process clears that, so cycle 1 IS an
+        // alarm transition (CBUG-B19 — C's sweep drops the alarm bit; this
+        // assertion used to require a bare DBE_LOG). No DBE_VALUE either way:
+        // the counts have not moved.
         assert_eq!(
             mask_of(&snap1, "S1").unwrap().bits(),
-            EventMask::LOG.bits(),
-            "idle sweep posts DBE_LOG only (no DBE_VALUE)"
+            (EventMask::LOG | EventMask::ALARM).bits(),
+            "idle sweep posts DBE_LOG + the alarm transition, never DBE_VALUE"
         );
 
         // Cycle 2: S1's count changed. Change-detection delivers it, and the
@@ -4663,6 +4687,132 @@ mod metadata_cache_tests {
             mask_of(&snap3, "S1").unwrap().bits(),
             EventMask::LOG.bits(),
             "unchanged-again S1 returns to the DBE_LOG-only sweep"
+        );
+    }
+
+    /// A log-swept record that can raise an alarm on demand — the scaler's
+    /// `do_alarm()` (scalerRecord.c:745-755) in miniature.
+    struct AlarmingLogSweepRecord {
+        s1: i32,
+        alarm: bool,
+    }
+
+    impl Record for AlarmingLogSweepRecord {
+        fn record_type(&self) -> &'static str {
+            "scaler"
+        }
+        fn process(&mut self) -> CaResult<crate::server::record::ProcessOutcome> {
+            Ok(crate::server::record::ProcessOutcome::complete())
+        }
+        fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
+            if self.alarm {
+                crate::server::recgbl::rec_gbl_set_sevr(
+                    common,
+                    crate::server::recgbl::alarm_status::UDF_ALARM,
+                    crate::server::record::AlarmSeverity::Invalid,
+                );
+            }
+        }
+        fn get_field(&self, name: &str) -> Option<EpicsValue> {
+            match name {
+                "S1" => Some(EpicsValue::Long(self.s1)),
+                _ => None,
+            }
+        }
+        fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
+            match (name, value) {
+                ("S1", EpicsValue::Long(v)) => {
+                    self.s1 = v;
+                    Ok(())
+                }
+                _ => Err(CaError::FieldNotFound(name.to_string())),
+            }
+        }
+        fn field_list(&self) -> &'static [crate::server::record::FieldDesc] {
+            &[]
+        }
+        fn log_swept_fields(&self) -> &'static [&'static str] {
+            &["S1"]
+        }
+        fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+            Some(self)
+        }
+    }
+
+    /// CBUG-B19 — the sweep post carries the alarm-transition bits.
+    ///
+    /// DEVIATION from C, deliberate. C's scaler `monitor()` computes
+    /// `monitor_mask = recGblResetAlarms(pscal)` (scalerRecord.c:764), ORs
+    /// `DBE_VALUE|DBE_LOG` into it (`:766`), and then posts every `Sn` with a
+    /// LITERAL `DBE_LOG` (`:771`) — `monitor_mask` is assigned, OR-ed, and never
+    /// read. The alarm bit that `recGblResetAlarms` returns is exactly what every
+    /// other record ORs into its value posts, so C drops it: a client subscribed
+    /// to `Sn` with DBE_ALARM receives NOTHING on a severity transition.
+    ///
+    /// The DBE_VALUE half of C's dead `|=` is deliberately not resurrected — the
+    /// sweep is unconditional, so a VALUE bit here would fire a value event on
+    /// every idle scan whether or not the counts moved. The first assertion pins
+    /// that.
+    #[test]
+    fn b19_log_swept_field_carries_the_alarm_transition_bits() {
+        use crate::server::recgbl::EventMask;
+        let mut inst = RecordInstance::new(
+            "SW".to_string(),
+            AlarmingLogSweepRecord {
+                s1: 7,
+                alarm: false,
+            },
+        );
+        let _s1_rx = inst
+            .add_subscriber(
+                "S1",
+                1,
+                crate::types::DbFieldType::Long,
+                (EventMask::LOG | EventMask::ALARM).bits(),
+            )
+            .expect("S1 subscriber");
+        let mask_of = |snap: &ProcessSnapshot, f: &str| {
+            snap.changed_fields
+                .iter()
+                .find(|(n, _, _)| n == f)
+                .map(|(_, _, m)| *m)
+        };
+
+        // Cycle 1 clears the record's initial UDF/INVALID alarm, which is itself
+        // a transition; cycle 2 is the quiet baseline. The sweep is then DBE_LOG
+        // alone — in particular NOT DBE_VALUE, since the counts have not moved.
+        let _ = inst.process_local().unwrap();
+        let (snap1, _) = inst.process_local().unwrap();
+        assert_eq!(
+            mask_of(&snap1, "S1").unwrap().bits(),
+            EventMask::LOG.bits(),
+            "no alarm transition → the sweep is DBE_LOG only"
+        );
+
+        // The alarm fires: severity moves NO_ALARM → INVALID, so this cycle's
+        // posts carry DBE_ALARM. C posts DBE_LOG here and the alarm subscriber
+        // learns nothing.
+        if let Some(r) = inst
+            .record
+            .as_any_mut()
+            .and_then(|a| a.downcast_mut::<AlarmingLogSweepRecord>())
+        {
+            r.alarm = true;
+        }
+        let (snap2, _) = inst.process_local().unwrap();
+        assert_eq!(
+            mask_of(&snap2, "S1").unwrap().bits(),
+            (EventMask::LOG | EventMask::ALARM).bits(),
+            "the severity transition must reach the swept field (C drops it)"
+        );
+
+        // Severity stays INVALID: no transition, so no alarm bit — the sweep is
+        // DBE_LOG again.
+        let (snap3, _) = inst.process_local().unwrap();
+        assert_eq!(
+            mask_of(&snap3, "S1").unwrap().bits(),
+            EventMask::LOG.bits(),
+            "a steady severity is not a transition"
         );
     }
 

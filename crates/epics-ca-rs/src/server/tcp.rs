@@ -3282,10 +3282,17 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 } else {
                     0
                 };
-                let field_name = if hdr.data_type == epics_base_rs::types::DBR_PUT_ACKT {
-                    "ACKT"
+                // C dispatches alarm acknowledgement on the DBR *request type*
+                // inside `dbPut` (`dbAccess.c:1331-1335`), ABOVE the SPC_NOMOD
+                // gate that refuses an ordinary put to ACKT/ACKS — the client
+                // acknowledges through its normal (VAL) channel, and the field
+                // the channel names only feeds the DISP gate. Routing this as a
+                // field put to "ACKT"/"ACKS" would now be refused with
+                // S_db_noMod, exactly as `caput REC.ACKS 2` is.
+                let ack = if hdr.data_type == epics_base_rs::types::DBR_PUT_ACKT {
+                    epics_base_rs::server::record::AlarmAck::Transient
                 } else {
-                    "ACKS"
+                    epics_base_rs::server::record::AlarmAck::Severity
                 };
                 // DBR_PUT_ACKT/ACKS WRITE_NOTIFY travels C
                 // `write_notify_action`, so it shares the same
@@ -3303,19 +3310,14 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     supersede_put_notify(prev, writer, state.client_minor_version).await?;
                 }
                 let result = match &entry.target {
-                    ChannelTarget::RecordField { record, .. } => {
+                    ChannelTarget::RecordField { record, field } => {
                         let name = record.read().await.name.clone();
                         // Alarm-ack puts are immediate in C even for the
                         // notify variant — `rsrv/camessage.c` writes ACKT/
                         // ACKS via `dbPutField` and replies straight away,
                         // never building a putNotify. Neither mode here
                         // awaits a completion receiver, so park nothing.
-                        db.put_record_field_from_ca_no_notify(
-                            &name,
-                            field_name,
-                            EpicsValue::Short(value_u16 as i16),
-                        )
-                        .await
+                        db.put_alarm_ack_from_ca(&name, field, ack, value_u16).await
                     }
                     ChannelTarget::SimplePv(_) => Err(epics_base_rs::error::CaError::Protocol(
                         "PUT_ACKT/PUT_ACKS only valid on record-backed channels".to_string(),

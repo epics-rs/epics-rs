@@ -24,7 +24,7 @@ pub use menu_choices::{
     resolve_menu_field_string_db_load, shared_menu_choices,
 };
 pub use pini::PiniMode;
-pub use record_instance::{NotifyWaitSet, RecordInstance};
+pub use record_instance::{AlarmAck, NotifyWaitSet, RecordInstance};
 pub use record_trait::{
     ArrayMonitorPost, CommonFieldPutResult, ConstantInitLink, CyclePostMask,
     EPICS_TIME_EVENT_DEVICE_TIME, FieldDesc, FieldMetadataOverride, InputFetchPolicy, OutTarget,

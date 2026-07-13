@@ -7931,6 +7931,13 @@ async fn test_fanout_dfanout_seq_seln_default_is_one() {
 /// against the current `sevr`; `putAckt` (C `dbAccess.c:1285-1301`)
 /// lowers `acks` down to `sevr` when ACKT is set false and
 /// `acks > sevr`.
+///
+/// R17-62 corrected the ROUTE this test drives: acknowledgement is a DBR
+/// request type (`DBR_PUT_ACKS`/`ACKT`) that `dbPut` intercepts above the
+/// `SPC_NOMOD` gate (`dbAccess.c:1331-1335`), not a put to the ACKS/ACKT
+/// fields — softIoc refuses `caput N1.ACKS 2` with "Write access denied".
+/// The handlers moved to `RecordInstance::put_acks` / `put_ackt`; the
+/// semantics asserted here are unchanged.
 #[tokio::test]
 async fn test_acks_put_compares_against_acks_and_ackt_lowers() {
     // putAcks: acks must be cleared when the written severity is >=
@@ -7943,7 +7950,7 @@ async fn test_acks_put_compares_against_acks_and_ackt_lowers() {
         inst.common.acks = AlarmSeverity::Major;
         inst.common.sevr = AlarmSeverity::Minor;
         // Acknowledge at MAJOR — written sev (2) >= acks (2) -> clear.
-        inst.put_common_field("ACKS", EpicsValue::Short(2)).unwrap();
+        inst.put_acks(2);
         assert_eq!(
             inst.common.acks,
             AlarmSeverity::NoAlarm,
@@ -7959,9 +7966,7 @@ async fn test_acks_put_compares_against_acks_and_ackt_lowers() {
         let mut inst2 = RecordInstance::new("ACKTEST2".into(), rec2);
         inst2.common.acks = AlarmSeverity::Major;
         inst2.common.sevr = AlarmSeverity::Minor;
-        inst2
-            .put_common_field("ACKS", EpicsValue::Short(1))
-            .unwrap();
+        inst2.put_acks(1);
         assert_eq!(
             inst2.common.acks,
             AlarmSeverity::Major,
@@ -7977,7 +7982,7 @@ async fn test_acks_put_compares_against_acks_and_ackt_lowers() {
         inst.common.ackt = true;
         inst.common.acks = AlarmSeverity::Major;
         inst.common.sevr = AlarmSeverity::Minor;
-        inst.put_common_field("ACKT", EpicsValue::Short(0)).unwrap();
+        inst.put_ackt(0);
         assert!(!inst.common.ackt, "ACKT must be cleared");
         assert_eq!(
             inst.common.acks,

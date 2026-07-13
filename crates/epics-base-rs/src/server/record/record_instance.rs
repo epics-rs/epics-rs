@@ -283,6 +283,19 @@ fn coerce_common_field_string(
     }
 }
 
+/// The alarm-acknowledge request types C's `dbPut` dispatches on
+/// (`dbAccess.c:1331-1335`): `DBR_PUT_ACKT` and `DBR_PUT_ACKS`.
+///
+/// Acknowledgement is a *request type*, not a field write — the two handlers
+/// run above the `SPC_NOMOD` gate that refuses every ordinary put to ACKT/ACKS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlarmAck {
+    /// `DBR_PUT_ACKT` → `putAckt`: set transient-alarm acknowledgement.
+    Transient,
+    /// `DBR_PUT_ACKS` → `putAcks`: acknowledge an alarm of this severity.
+    Severity,
+}
+
 /// A type-erased record instance stored in the database.
 pub struct RecordInstance {
     pub name: String,
@@ -1608,6 +1621,55 @@ impl RecordInstance {
         result
     }
 
+    /// C `dbAccess.c::putAckt` (`:1285-1300`) — the **only** writer of ACKT.
+    ///
+    /// Reached from `dbPut` for a `DBR_PUT_ACKT` request *type*
+    /// (`dbAccess.c:1331-1332`), ABOVE the `SPC_NOMOD` gate that refuses every
+    /// ordinary put to the field. Posts exactly what C posts: the ACKT change,
+    /// the ACKS it may lower, and the record-wide `DBE_ALARM` — and only when
+    /// `ackt` actually changed (C returns 0 early otherwise).
+    pub fn put_ackt(&mut self, value: u16) {
+        let new_ackt = value != 0;
+        if new_ackt == self.common.ackt {
+            return;
+        }
+        use crate::server::recgbl::EventMask;
+        let ack_mask = EventMask::VALUE | EventMask::ALARM;
+        self.common.ackt = new_ackt;
+        self.cleanup_subscribers();
+        self.notify_field("ACKT", ack_mask);
+        // C `:1294-1297`: turning transient acknowledgement off lowers a
+        // sticky ACKS down to the current SEVR — an alarm that has already
+        // cleared must not keep a higher unacknowledged severity.
+        if !new_ackt && self.common.acks > self.common.sevr {
+            self.common.acks = self.common.sevr;
+            self.notify_field("ACKS", ack_mask);
+        }
+        self.notify_record_alarm();
+    }
+
+    /// C `dbAccess.c::putAcks` (`:1302-1315`) — the **only** runtime writer of
+    /// ACKS. Reached from `dbPut` for a `DBR_PUT_ACKS` request type, ABOVE the
+    /// `SPC_NOMOD` gate.
+    ///
+    /// The acknowledged severity is compared against the STORED unacknowledged
+    /// severity `acks`, not the current `sevr`: an operator acknowledging at
+    /// the severity that was latched into ACKS clears it even after `sevr` has
+    /// since dropped. A too-low acknowledgement changes nothing and posts
+    /// nothing; an acknowledgement of an already-clear ACKS still posts, which
+    /// is C's literal `if (*psev >= precord->acks)` (0 >= 0 holds).
+    pub fn put_acks(&mut self, value: u16) {
+        let sev = AlarmSeverity::from_u16(value);
+        if sev < self.common.acks {
+            return;
+        }
+        use crate::server::recgbl::EventMask;
+        self.common.acks = AlarmSeverity::NoAlarm;
+        self.cleanup_subscribers();
+        self.notify_field("ACKS", EventMask::VALUE | EventMask::ALARM);
+        self.notify_record_alarm();
+    }
+
     /// Set a common field value from the `.db` loader, which in C is a
     /// different converter with a different out-of-menu bound
     /// (`dbStaticRun.c::dbPutStringNum`; see [`MenuBound::DbLoad`]). It is what
@@ -1673,41 +1735,25 @@ impl RecordInstance {
                     self.common.namsg = s.as_str_lossy().into_owned();
                 }
             }
+            // ACKS/ACKT carry NO acknowledgement semantics here. They are
+            // `special(SPC_NOMOD)` in `dbCommon.dbd:150-159`, so no runtime put
+            // reaches this arm — the gate refuses it. C's acknowledgement is
+            // driven by the DBR *request type* (`DBR_PUT_ACKS`/`ACKT`), which
+            // `dbPut` intercepts ABOVE the SPC_NOMOD gate and hands to
+            // [`Self::put_acks`] / [`Self::put_ackt`]. What is left here is the
+            // `dbLoadRecords` / `dbStaticLib` load path (`field(ACKT,"YES")`),
+            // which stores the value verbatim — C `dbPutString` never crosses
+            // `dbPut`.
             "ACKS" => {
                 if let EpicsValue::Short(v) = value {
-                    let sev = AlarmSeverity::from_u16(v as u16);
-                    // C `dbAccess.c:1309` putAcks:
-                    //   `if (*psev >= precord->acks) precord->acks = 0;`
-                    // The written severity is compared against the
-                    // STORED unacknowledged severity `acks` — NOT the
-                    // current `sevr`. An operator acknowledging an
-                    // alarm at the severity that was latched into ACKS
-                    // must clear it even after `sevr` has since
-                    // dropped; comparing against `sevr` instead would
-                    // leave a stale unacknowledged alarm stuck.
-                    if sev >= self.common.acks {
-                        self.common.acks = AlarmSeverity::NoAlarm;
-                    }
+                    self.common.acks = AlarmSeverity::from_u16(v as u16);
                 }
             }
-            "ACKT" => {
-                let new_ackt = match value {
-                    EpicsValue::Char(v) => v != 0,
-                    EpicsValue::Short(v) => v != 0,
-                    _ => return Ok(CommonFieldPutResult::NoChange),
-                };
-                self.common.ackt = new_ackt;
-                // C `dbAccess.c:1294-1297` putAckt: when ACKT is set
-                // false (transient acknowledgement disabled) and the
-                // stored unacknowledged severity is higher than the
-                // current `sevr`, lower `acks` down to `sevr` — a
-                // transient alarm that has already cleared should not
-                // keep a sticky higher-severity ACKS once transient
-                // acknowledgement is turned off.
-                if !new_ackt && self.common.acks > self.common.sevr {
-                    self.common.acks = self.common.sevr;
-                }
-            }
+            "ACKT" => match value {
+                EpicsValue::Char(v) => self.common.ackt = v != 0,
+                EpicsValue::Short(v) => self.common.ackt = v != 0,
+                _ => return Ok(CommonFieldPutResult::NoChange),
+            },
             "UDF" => {
                 if let EpicsValue::Char(v) = value {
                     self.common.udf = v != 0;

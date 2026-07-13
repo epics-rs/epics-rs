@@ -400,10 +400,21 @@ fn ext_time_pair((secs, ns, utag): (i64, i32, u64)) -> (std::time::SystemTime, u
 /// * `ACKS` — `DBE_VALUE`, only when `stat_mask != 0` and `recGblResetAlarms`
 ///   raised it.
 ///
-/// The single owner of these masks: every process cycle that commits alarms —
-/// the full value-publication epilogue and the `CompleteAlarmOnly` cycle that
-/// skips it (transform IVLA="Do Nothing") — posts through this, so the two
-/// cannot drift.
+/// NOT the single owner of these masks, despite an earlier comment here that
+/// claimed so. Two of the five `recGblResetAlarms` post sites call this helper
+/// — the synchronous process epilogue (`process_record_with_links_inner`) and
+/// the `CompleteAlarmOnly` cycle that skips that epilogue (transform
+/// IVLA="Do Nothing"). The other three still open-code the identical mask
+/// arithmetic and can therefore drift from it:
+///
+/// * `complete_async_record_inner` — the async-completion epilogue;
+/// * `sim_process_tail` — the SIMM-mode input tail;
+/// * `RecordInstance::process_local` — the foreign-process / QSRV-group path.
+///
+/// (The SDIS-disable post in `process_record_with_links_inner` and the
+/// fanout/seq SELN post in `links::apply_selm_alarm` are NOT clients: they
+/// carry C's `dbAccess.c:586-593` and `fanoutRecord.c:116` masks, not
+/// `recGblResetAlarms`'.)
 fn alarm_field_posts(
     common: &crate::server::record::CommonFields,
     alarm_result: &crate::server::recgbl::AlarmResetResult,

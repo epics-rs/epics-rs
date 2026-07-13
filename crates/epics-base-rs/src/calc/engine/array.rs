@@ -103,8 +103,15 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                     // C `FETCH_A..FETCH_P` (`:429-438`) — the ONE place that gives a
                     // cell its `sourceDouble`, which is what lets FITQ/FITMQ store a
                     // coefficient back into the argument the caller named.
+                    //
+                    // Bounded by the CALLER's `num_dArgs`: an arg the caller never
+                    // supplied pushes 0 and names NOTHING (`:436`, the else branch,
+                    // does not set `sourceDouble`).
                     let i = *idx as usize;
-                    push_src(&mut stack, Double(inputs.num_vars[i]), Some(i));
+                    match inputs.num_arg(i) {
+                        Some(v) => push_src(&mut stack, Double(v), Some(i)),
+                        None => push(&mut stack, Double(0.0)),
+                    }
                 }
                 CoreOp::PushDoubleVar(idx) => {
                     // In the array evaluator, double vars are array vars. C's
@@ -144,7 +151,11 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                     // C's fresh push also clears the window (`INC`: `ps->numEl = -1`,
                     // `:93`), which `ArrayCell::new` gives, and leaves `sourceDouble`
                     // at -1 — only the SCALAR fetches set it.
-                    let arr = inputs.arrays[*idx as usize].clone();
+                    //
+                    // The `if (num_aArgs > i)` guard is the same statement one level
+                    // up: an arg the CALLER never supplied is not distinguishable
+                    // from one the record never allocated — both are the zero buffer.
+                    let arr = inputs.array_arg(*idx as usize).cloned().unwrap_or_default();
                     push(
                         &mut stack,
                         ArrayStackValue::Array(ArrayCell::new(arr, inputs.array_size)),
@@ -437,9 +448,13 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
 
                 CoreOp::StoreVar(idx) => {
                     // C `STORE_A..STORE_P` (`:456-464`) — `p_dArg[i] = ps->d`, a write
-                    // straight into the record's A..P field.
+                    // straight into the record's A..P field, under `if (num_dArgs >
+                    // (op - STORE_A))`. Past the caller's count the value is popped
+                    // and dropped.
                     let v = pop_f64(&mut stack)?;
-                    inputs.num_vars[*idx as usize] = v;
+                    if let Some(slot) = inputs.num_arg_mut(*idx as usize) {
+                        *slot = v;
+                    }
                 }
                 CoreOp::StoreDoubleVar(idx) => {
                     // C `STORE_AA..STORE_LL` (`:466-491`): the WHOLE arraySize buffer
@@ -452,15 +467,16 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                     // else in aCalc — a NaN scalar stores NaN rather than zeros.
                     // The port used to write the scalar into the SCALAR variable of the
                     // same index instead, so `AA := 5` set A.
+                    //
+                    // Store and mask both sit under `if (num_aArgs > i)` — hence
+                    // [`ArrayInputs::store_array`], which owns the pair.
                     let i = *idx as usize;
                     let v = pop(&mut stack)?.v;
-                    if i < inputs.arrays.len() {
-                        inputs.arrays[i] = match v {
-                            ArrayStackValue::Array(cell) => cell.into_buf(),
-                            Double(d) => vec![d; inputs.array_size],
-                        };
-                        inputs.amask |= 1 << i;
-                    }
+                    let buf = match v {
+                        ArrayStackValue::Array(cell) => cell.into_buf(),
+                        Double(d) => vec![d; inputs.array_size],
+                    };
+                    inputs.store_array(i, buf);
                 }
             },
 
@@ -839,7 +855,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                     let idx = my_nint(pop_f64(&mut stack)?);
                     let found = usize::try_from(idx)
                         .ok()
-                        .and_then(|i| inputs.num_vars.get(i).map(|v| (i, *v)));
+                        .and_then(|i| inputs.num_arg(i).map(|v| (i, v)));
                     match found {
                         Some((i, v)) => push_src(&mut stack, Double(v), Some(i)),
                         None => push(&mut stack, Double(0.0)),
@@ -853,7 +869,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                     let idx = my_nint(pop_f64(&mut stack)?);
                     let arr = usize::try_from(idx)
                         .ok()
-                        .and_then(|i| inputs.arrays.get(i))
+                        .and_then(|i| inputs.array_arg(i))
                         .cloned()
                         .unwrap_or_default();
                     push(
@@ -877,7 +893,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                     let idx = my_nint(pop_f64(&mut stack)?);
                     if let Some(slot) = usize::try_from(idx)
                         .ok()
-                        .and_then(|i| inputs.num_vars.get_mut(i))
+                        .and_then(|i| inputs.num_arg_mut(i))
                     {
                         *slot = value;
                     }
@@ -889,17 +905,17 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                     // arraySize buffer (`:519`, not `toArray`, so a NaN scalar stores
                     // NaN), and the store sets `*amask |= 1<<i` so the record posts
                     // the field it wrote. C allocates the field if the record never
-                    // did; the port's arrays are always present.
+                    // did; the port's arrays are always present. `i >= num_aArgs` is
+                    // refused exactly as `STORE_AA` refuses it — same owner,
+                    // [`ArrayInputs::store_array`].
                     let value = pop(&mut stack)?.v;
                     let idx = my_nint(pop_f64(&mut stack)?);
                     if let Ok(i) = usize::try_from(idx) {
-                        if i < inputs.arrays.len() {
-                            inputs.arrays[i] = match value {
-                                ArrayStackValue::Array(cell) => cell.into_buf(),
-                                Double(d) => vec![d; inputs.array_size],
-                            };
-                            inputs.amask |= 1 << i;
-                        }
+                        let buf = match value {
+                            ArrayStackValue::Array(cell) => cell.into_buf(),
+                            Double(d) => vec![d; inputs.array_size],
+                        };
+                        inputs.store_array(i, buf);
                     }
                 }
                 ArrayOp::LenNoop => {
@@ -1222,13 +1238,15 @@ fn pop_fit_targets(
 
 /// C `:1226-1229` / `:1280-1283`: `p_dArg[arga] = d; p_dArg[argb] = e;
 /// p_dArg[argc] = f;` — the CONSTANT term goes to the argument the caller named
-/// first, the linear term to the second, the quadratic term to the third.
+/// first, the linear term to the second, the quadratic term to the third. Each
+/// write is `if ((arga != -1) && (arga < num_dArgs))`: the caller's count bounds
+/// the coefficient write-back too.
 fn store_fit_coefficients(inputs: &mut ArrayInputs, targets: FitTargets, coeffs: (f64, f64, f64)) {
     let (tc, tb, ta) = targets;
     let (c, b, a) = coeffs;
     for (target, value) in [(tc, c), (tb, b), (ta, a)] {
         if let Some(i) = target
-            && let Some(slot) = inputs.num_vars.get_mut(i)
+            && let Some(slot) = inputs.num_arg_mut(i)
         {
             *slot = value;
         }

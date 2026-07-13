@@ -693,7 +693,14 @@ impl Record for TransformRecord {
                 // `CLCx = "1/0"` yielded `inf` with NO_ALARM. `scalc_eval` is
                 // the port's `sCalcPerform`, and it already owns the
                 // non-finite rule (`CalcError::NonFiniteResult`).
-                let mut inputs = StringInputs::new();
+                // C `sCalcPerform(&ptran->a, 16, NULL, 0, pval, NULL, 0, ...)`
+                // (`transformRecord.c:593`): SIXTEEN numeric args — A..P, the
+                // record's channels — and ZERO string args, with a NULL `psarg` to
+                // match. transform has no string fields at all, so every guard on
+                // `numSArgs` refuses: `AA` reads as the empty string and `AA:=`
+                // stores nowhere. The count travels with the args ([`StringInputs`])
+                // so the engine cannot reach a field this record does not have.
+                let mut inputs = StringInputs::with_counts(NUM_CHANNELS, 0);
                 inputs.num_vars[..NUM_CHANNELS].copy_from_slice(&self.vals);
                 // `pval = &ptran->a + i` (`:564`, `:569`) is C's `presult`, and
                 // the `VAL` token (`FETCH_VAL`) pushes `*presult` — *this

@@ -264,16 +264,71 @@ pub struct StringInputs {
     /// Empty for a fresh evaluation, and for callers whose C counterpart
     /// passes no `psresult` (numeric `calcPerform`).
     pub prev_sval: ScalcString,
+
+    /// C's `numArgs` (`sCalcPerform.c:313`) — how many of the numeric args the
+    /// CALLER actually supplied, which is NOT the size of the engine's array.
+    /// C's `parg` is a bare `double *` into the caller's record, so every access
+    /// is guarded against this count and the slots past it do not exist: a fetch
+    /// gives 0 (`:421-427`, `:858-864`), a store is a silent no-op (`:432-438`,
+    /// `:882-886`), and the same bound covers the computed `@n` forms (`:444`,
+    /// `:732`, `:902`).
+    ///
+    /// The callers disagree, which is why the count has to travel with the args:
+    /// scalcout supplies 12 (`MAX_FIELDS`, `sCalcoutRecord.c:357,768`), transform
+    /// supplies 16 (`transformRecord.c:593`).
+    num_args: usize,
+    /// C's `numSArgs` — the same for the STRING args (`psarg`), guarding
+    /// `FETCH_AA..LL` (`:871`), `STORE_AA..LL` (`:891`) and `@@n` (`:914`,
+    /// `:1471`). scalcout supplies 12 (`STRING_MAX_FIELDS`); transform supplies
+    /// **zero** and a NULL `psarg` (`transformRecord.c:593`) — under transform,
+    /// no string arg exists at all, so `AA` reads empty and `AA:=` writes nowhere.
+    num_sargs: usize,
 }
 
 impl StringInputs {
+    /// Every arg present — the caller supplies all [`CALC_NARGS`] of both kinds.
     pub fn new() -> Self {
+        Self::with_counts(CALC_NARGS, CALC_NARGS)
+    }
+
+    /// C's `sCalcPerform(parg, numArgs, psarg, numSArgs, ...)` — the args and the
+    /// counts that bound them, handed over together.
+    ///
+    /// Counts above [`CALC_NARGS`] clamp to it: the engine's arrays are the whole
+    /// world it can reach, so a caller cannot promise more args than exist. That
+    /// clamp is what makes `num_args <= num_vars.len()` hold by construction, so
+    /// the accessors below need only the one test.
+    pub fn with_counts(num_args: usize, num_sargs: usize) -> Self {
         StringInputs {
             num_vars: [0.0; CALC_NARGS],
             str_vars: std::array::from_fn(|_| ScalcString::new()),
             prev_val: 0.0,
             prev_sval: ScalcString::new(),
+            num_args: num_args.min(CALC_NARGS),
+            num_sargs: num_sargs.min(CALC_NARGS),
         }
+    }
+
+    /// The one read path for a numeric arg. `None` is C's "caller didn't supply a
+    /// large enough array" — the engine turns it into 0.
+    pub(crate) fn num_arg(&self, i: usize) -> Option<f64> {
+        (i < self.num_args).then(|| self.num_vars[i])
+    }
+
+    /// The one write path for a numeric arg. `None` means the store is a no-op,
+    /// as C's un-taken `if (numArgs > ...)` branch is.
+    pub(crate) fn num_arg_mut(&mut self, i: usize) -> Option<&mut f64> {
+        (i < self.num_args).then(|| &mut self.num_vars[i])
+    }
+
+    /// The one read path for a string arg; `None` reads as the empty string.
+    pub(crate) fn str_arg(&self, i: usize) -> Option<&ScalcString> {
+        (i < self.num_sargs).then(|| &self.str_vars[i])
+    }
+
+    /// The one write path for a string arg; `None` stores nothing.
+    pub(crate) fn str_arg_mut(&mut self, i: usize) -> Option<&mut ScalcString> {
+        (i < self.num_sargs).then(|| &mut self.str_vars[i])
     }
 }
 
@@ -306,10 +361,28 @@ pub struct ArrayInputs {
     /// see a stale bit and a store cannot land without its bit. Read it AFTER the
     /// run, never set it before.
     pub amask: u32,
+
+    /// C's `num_dArgs` (`aCalcPerform.c:298`) — how many SCALAR args the caller
+    /// supplied. Guards `FETCH_A..P` (`:432`), `STORE_A..P` (`:462`), `@n`
+    /// (`:499`, `:1469`) and the FITQ/FITMQ coefficient write-back (`:1230-1232`,
+    /// `:1279-1281`). acalcout supplies 12 (`MAX_FIELDS`, `aCalcoutRecord.c:1283`).
+    num_dargs: usize,
+    /// C's `num_aArgs` — the same for the ARRAY args, guarding `FETCH_AA..LL`
+    /// (`:446`), `STORE_AA..LL` (`:471`) and `@@n` (`:510`, `:1485`). acalcout
+    /// supplies 12 (`ARRAY_MAX_FIELDS`).
+    num_aargs: usize,
 }
 
 impl ArrayInputs {
+    /// Every arg present — the caller supplies all [`CALC_NARGS`] of both kinds.
     pub fn new(array_size: usize) -> Self {
+        Self::with_counts(array_size, CALC_NARGS, CALC_NARGS)
+    }
+
+    /// C's `aCalcPerform(p_dArg, num_dArgs, pp_aArg, num_aArgs, arraySize, ...)`
+    /// — the args and the counts that bound them, handed over together. Counts
+    /// clamp to [`CALC_NARGS`] for the reason [`StringInputs::with_counts`] gives.
+    pub fn with_counts(array_size: usize, num_dargs: usize, num_aargs: usize) -> Self {
         ArrayInputs {
             num_vars: [0.0; CALC_NARGS],
             arrays: vec![Vec::new(); CALC_NARGS],
@@ -317,6 +390,39 @@ impl ArrayInputs {
             prev_val: 0.0,
             prev_aval: vec![0.0; array_size],
             amask: 0,
+            num_dargs: num_dargs.min(CALC_NARGS),
+            num_aargs: num_aargs.min(CALC_NARGS),
+        }
+    }
+
+    /// The one read path for a scalar arg; `None` is C's missing arg, which fetches 0.
+    pub(crate) fn num_arg(&self, i: usize) -> Option<f64> {
+        (i < self.num_dargs).then(|| self.num_vars[i])
+    }
+
+    /// The one write path for a scalar arg; `None` stores nothing.
+    pub(crate) fn num_arg_mut(&mut self, i: usize) -> Option<&mut f64> {
+        (i < self.num_dargs).then(|| &mut self.num_vars[i])
+    }
+
+    /// The one read path for an array arg. `None` is C's missing arg — which,
+    /// like an arg the record never allocated, reads as an `array_size` buffer of
+    /// zeros, not a scalar (`aCalcPerform.c:443-454`, `:1485-1493`).
+    pub(crate) fn array_arg(&self, i: usize) -> Option<&Vec<f64>> {
+        (i < self.num_aargs).then(|| &self.arrays[i])
+    }
+
+    /// The one write path for an array arg — `STORE_AA..LL` (`:466-491`) and
+    /// `@@n :=` (`:506-525`), which are the same store with a different index.
+    ///
+    /// It owns [`Self::amask`]: C sets `*amask |= 1<<i` INSIDE the `num_aArgs`
+    /// guard, so a refused store must not flag the field. Routing both opcodes
+    /// through here is what keeps "a store cannot land without its bit, and a bit
+    /// cannot be set without a store" true by construction.
+    pub(crate) fn store_array(&mut self, i: usize, buf: Vec<f64>) {
+        if i < self.num_aargs {
+            self.arrays[i] = buf;
+            self.amask |= 1 << i;
         }
     }
 }

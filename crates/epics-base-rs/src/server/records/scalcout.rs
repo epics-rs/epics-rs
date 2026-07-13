@@ -176,7 +176,11 @@ impl ScalcoutRecord {
     /// and for OCAL `&pcalc->oval, pcalc->osv` (`:768-769`) — in every case the
     /// *previous* result.
     fn build_inputs(&self, prev_val: f64, prev_sval: &PvString) -> StringInputs {
-        let mut inputs = StringInputs::new();
+        // C `sCalcPerform(&pcalc->a, MAX_FIELDS, (char **)(pcalc->strs),
+        // STRING_MAX_FIELDS, ...)` (`sCalcoutRecord.c:357`, `:768`) — both counts
+        // are 12 (`:191-192`). The engine can address more args than that; scalcout
+        // does not supply them, so `M`/`@12` and above fetch 0 and store nowhere.
+        let mut inputs = StringInputs::with_counts(12, 12);
         for i in 0..12 {
             inputs.num_vars[i] = self.num_vals[i];
             // C `FETCH_AA` copies the record's `char[40]` field into the 40-byte

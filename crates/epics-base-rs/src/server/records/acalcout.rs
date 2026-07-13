@@ -418,7 +418,11 @@ impl AcalcoutRecord {
     }
 
     fn build_inputs(&self, n: usize, prev_val: f64, prev_aval: &[f64]) -> ArrayInputs {
-        let mut inputs = ArrayInputs::new(n);
+        // C `aCalcPerform(&pcalc->a, MAX_FIELDS, &pcalc->aa, ARRAY_MAX_FIELDS,
+        // numElements, ...)` (`aCalcoutRecord.c:1283`, `:1288`) — both counts are 12
+        // (`:156-157`). Args past that are not the record's to write: `M`/`@12`
+        // fetch 0, `@@12 :=` stores nothing and flags no AMASK bit.
+        let mut inputs = ArrayInputs::with_counts(n, 12, 12);
         for i in 0..12 {
             inputs.num_vars[i] = self.num_vals[i];
         }

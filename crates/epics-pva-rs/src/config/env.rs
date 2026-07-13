@@ -1409,6 +1409,29 @@ fn enforce_timeout(tmo: &mut f64) {
     }
 }
 
+/// The ECHO cadence for an *effective* (already scaled + `enforceTimeout`d)
+/// TCP timeout: pvxs `max(1.0, min(15.0, tcpTimeout * 3.0/8.0))`
+/// (`clientconn.cpp:163`) — "tcpTimeout(40) -> 15 second echo period,
+/// bound echo to range [1, 15]".
+///
+/// SINGLE OWNER of "effective TCP timeout → echo period". Both the
+/// env-derived [`crate::client_native::heartbeat_interval`] and the
+/// per-connection heartbeat task (which uses the builder-supplied
+/// `tcp_timeout`) derive their cadence here, so a connection cannot echo on
+/// a different clock than the API says it does.
+///
+/// The 15 s CAP is the half C keeps and the port dropped: without it a
+/// large CONN_TMO stretched the echo period without bound (a 100 s CONN_TMO
+/// echoed every 50 s instead of C's 15 s), so a peer that had already
+/// stopped responding was probed far later than pvxs probes it (R17-36).
+///
+/// The input is always a finite, positive effective timeout — it comes from
+/// [`effective_tcp_timeout_secs`] (which maps NaN / non-positive to 40 s) or
+/// from a `Duration` — so `clamp`'s NaN caveat cannot be reached here.
+pub fn echo_period_secs(tcp_timeout_secs: f64) -> f64 {
+    (tcp_timeout_secs * 3.0 / 8.0).clamp(1.0, 15.0)
+}
+
 /// The EFFECTIVE TCP inactivity timeout for a *configured*
 /// `EPICS_PVA_CONN_TMO` value: the `tmoScale` (4/3) followed by pvxs
 /// `enforceTimeout` (`config.cpp:373-391`), which C applies to the SCALED
@@ -3010,6 +3033,24 @@ mod tests {
         nan.tcp_timeout = f64::NAN;
         nan.expand();
         assert_eq!(nan.tcp_timeout, 40.0);
+    }
+
+    /// `echo_period_secs` is pvxs's `max(1, min(15, tcpTimeout*3/8))`
+    /// (clientconn.cpp:163). Boundaries: the documented 40 s → 15 s pair,
+    /// the interior, and both bounds. The 15 s CAP is the half the port had
+    /// dropped (R17-36).
+    #[test]
+    fn echo_period_is_bounded_to_one_through_fifteen_seconds() {
+        // pvxs's own worked example: "tcpTimeout(40) -> 15 second echo".
+        assert_eq!(echo_period_secs(40.0), 15.0);
+        // Interior: the plain 3/8.
+        assert_eq!(echo_period_secs(8.0), 3.0);
+        // Upper bound: anything above 40 s stays at the 15 s cap.
+        assert_eq!(echo_period_secs(133.0), 15.0);
+        assert_eq!(echo_period_secs(1e18), 15.0);
+        // Lower bound: below 8/3 s the period floors at 1 s.
+        assert_eq!(echo_period_secs(2.0), 1.0);
+        assert_eq!(echo_period_secs(0.0), 1.0);
     }
 
     /// `effective_tcp_timeout_secs` is the single owner of "configured

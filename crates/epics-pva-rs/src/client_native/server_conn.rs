@@ -47,13 +47,16 @@ use super::decode::{
 
 /// How often we send the heartbeat application CMD_ECHO.
 ///
-/// Resolved at call time from `EPICS_PVA_CONN_TMO`: pvxs convention is
-/// ECHO every `CONN_TMO / 2` so two heartbeats fit inside the timeout
-/// window. Default 15 s when the env var is unset (CONN_TMO defaults
-/// to 30 s).
+/// Resolved at call time from `EPICS_PVA_CONN_TMO`, through the two owners
+/// that define the client's clock: the effective TCP timeout
+/// (`effective_tcp_timeout_secs`) and the echo cadence pvxs derives from it
+/// (`echo_period_secs` = `max(1, min(15, tcpTimeout*3/8))`,
+/// clientconn.cpp:163). Default 15 s, matching pvxs's "tcpTimeout(40) -> 15
+/// second echo period".
 pub fn heartbeat_interval() -> Duration {
-    let configured = crate::config::env::conn_timeout_secs();
-    Duration::from_secs_f64((configured / 2.0).max(1.0))
+    let effective =
+        crate::config::env::effective_tcp_timeout_secs(crate::config::env::conn_timeout_secs());
+    Duration::from_secs_f64(crate::config::env::echo_period_secs(effective))
 }
 
 /// Maximum time we'll wait between any incoming bytes before declaring
@@ -634,8 +637,9 @@ impl ServerConn {
         tokio::spawn(async move {
             // pvxs clientconn.cpp:163-165: echo interval = max(1, min(15, tcpTimeout * 3/8))
             // pvxs clientconn.cpp:73-74: socket inactivity timeout = tcpTimeout
-            let hb_interval =
-                Duration::from_secs_f64((tcp_timeout.as_secs_f64() * 3.0 / 8.0).clamp(1.0, 15.0));
+            let hb_interval = Duration::from_secs_f64(crate::config::env::echo_period_secs(
+                tcp_timeout.as_secs_f64(),
+            ));
             let hb_timeout = tcp_timeout;
             let mut tick = interval(hb_interval);
             tick.tick().await; // skip first immediate tick
@@ -1604,6 +1608,56 @@ mod tests {
             "anonymous",
             "must fall back to anonymous when no methods are advertised"
         );
+    }
+
+    /// R17-36: the ECHO cadence is pvxs's `max(1, min(15, tcpTimeout*3/8))`
+    /// on the EFFECTIVE tcpTimeout (clientconn.cpp:163), not `CONN_TMO/2`.
+    /// The two formulas coincide in the interior (4/3 × 3/8 = 1/2), so the
+    /// divergence is exactly the missing 15 s CAP: pre-fix a 100 s CONN_TMO
+    /// echoed every 50 s (C: 15 s), and an out-of-range CONN_TMO — whose
+    /// effective timeout resets to 40 s — echoed every ~3.5e18 s, i.e.
+    /// never.
+    #[test]
+    #[serial_test::serial(epics_env)]
+    fn heartbeat_interval_is_capped_at_fifteen_seconds() {
+        let prev = std::env::var("EPICS_PVA_CONN_TMO").ok();
+        let set = |v: &str| unsafe { std::env::set_var("EPICS_PVA_CONN_TMO", v) };
+
+        // Default 30 s → effective 40 s → pvxs's documented 15 s period.
+        set("30");
+        assert_eq!(heartbeat_interval(), Duration::from_secs_f64(15.0));
+
+        // Interior: 8 s → effective 10.667 s → 4 s.
+        set("8");
+        assert_eq!(heartbeat_interval(), Duration::from_secs_f64(4.0));
+
+        // Above the cap: pre-fix this was CONN_TMO/2 = 50 s.
+        set("100");
+        assert_eq!(
+            heartbeat_interval(),
+            Duration::from_secs_f64(15.0),
+            "echo period must be capped at 15s"
+        );
+
+        // Out-of-range CONN_TMO: effective timeout resets to 40 s, so the
+        // cadence is 15 s — pre-fix it was ~3.5e18 s.
+        set("7e18");
+        assert_eq!(
+            heartbeat_interval(),
+            Duration::from_secs_f64(15.0),
+            "an out-of-range CONN_TMO must still echo on C's 40s-derived clock"
+        );
+
+        // Floor: 1 s → effective 2 s → 0.75 s raw → floored at 1 s.
+        set("1");
+        assert_eq!(heartbeat_interval(), Duration::from_secs_f64(1.0));
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("EPICS_PVA_CONN_TMO", v),
+                None => std::env::remove_var("EPICS_PVA_CONN_TMO"),
+            }
+        }
     }
 
     /// pvxs `enforceTimeout` (config.cpp:373-391) runs on the SCALED

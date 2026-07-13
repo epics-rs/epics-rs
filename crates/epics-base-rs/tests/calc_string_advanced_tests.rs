@@ -378,42 +378,41 @@ fn test_checksum_operand_is_translated_first() {
     );
 }
 
-/// A byte ≥ 0x80 does NOT get the standard CRC-16/MODBUS: C's accumulator is a
-/// 32-bit `unsigned int` and its buffer is a SIGNED `char`, so
-/// `crc ^= (unsigned int)tranInput[i]` sign-extends the byte into bits 16-31,
-/// which the eight `crc >>= 1` steps then shift back down into the digest
-/// (`sCalcPerform.c:193-212`). Wire-compat with C IOCs beats the standard here —
-/// see [`crc16`](epics_base_rs::calc)'s doc for the adjudication.
+/// CBUG-F8 — a byte ≥ 0x80 gets the STANDARD CRC-16/MODBUS, deviating from C.
 ///
-/// Compiled sCalc (`gcc -O0`, x86-64): `CRC16("\x80")` = `\x41\x1f` — the
-/// standard answer is `\xbe\xe0`. XOR8 masks its own sign-extension away
-/// (`:279`) and is unaffected.
+/// C's accumulator is a 32-bit `unsigned int` and its buffer is a SIGNED `char`,
+/// so `crc ^= (unsigned int)tranInput[i]` (`sCalcPerform.c:193-212`)
+/// sign-extends the byte into bits 16-31, which the eight `crc >>= 1` steps
+/// shift back down into the digest. A real Modbus device validates against the
+/// standard CRC, so C is the one that is wire-broken on binary frames; the port
+/// emits the standard digest. This test previously pinned C's answers — the
+/// values it asserted are named below so the deviation is auditable.
+///
+/// XOR8 masks its own sign-extension away (`:279`) and was never affected.
 #[test]
-fn test_crc16_reproduces_c_sign_extension_of_high_bytes() {
+fn test_crc16_high_bytes_are_standard_not_c() {
     assert_eq!(
         eval_str(r#"CRC16("\x80")"#),
-        StackValue::Str(r"\x41\x1f".into()),
-        "standard CRC-16/MODBUS would be \\xbe\\xe0; compiled C says \\x41\\x1f"
+        StackValue::Str(r"\xbe\xe0".into()),
+        "standard CRC-16/MODBUS; compiled C says \\x41\\x1f"
     );
     assert_eq!(
         eval_str(r#"CRC16("\xff")"#),
-        StackValue::Str(r"\x00\xff".into())
+        StackValue::Str(r"\xff\x00".into()) // C: \x00\xff
     );
-    // The polluted high bits SURVIVE into the next byte — the accumulator is
-    // never masked back to 16 bits between iterations.
     assert_eq!(
         eval_str(r#"CRC16("\x80\x80")"#),
-        StackValue::Str(r"\x21\x90".into())
+        StackValue::Str(r"\x61\xd0".into()) // C: \x21\x90
     );
     // A real binary MODBUS frame: the case the operator exists for.
     assert_eq!(
         eval_str(r#"CRC16("\xf7\x03\x13\x89")"#),
-        StackValue::Str(r"\xc0\xb9".into())
+        StackValue::Str(r"\x0e\xc6".into()) // C: \xc0\xb9
     );
     // MODBUS appends the same digest, so it carries the same deviation.
     assert_eq!(
         eval_str(r#"MODBUS("\x80")"#),
-        StackValue::Str(r"\x80\x41\x1f".into())
+        StackValue::Str(r"\x80\xbe\xe0".into()) // C: \x80\x41\x1f
     );
     // XOR8 sign-extends too, but `sprintf`'s `xor8&0xff` throws it away.
     assert_eq!(eval_str(r#"XOR8("\x80")"#), StackValue::Str(r"\x80".into()));

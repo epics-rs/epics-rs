@@ -1087,6 +1087,10 @@ fn checksum_op(
 ///
 /// `dbTranslateEscape` returning 0 is C's `return(-1)`, and the caller then leaves
 /// the operand untouched.
+///
+/// The framing above is C's, byte for byte. The digest VALUE deviates for any
+/// payload byte ≥ 0x80 — see [`checksum::crc16`](super::checksum::crc16) and
+/// CBUG-F8.
 fn crc16_escaped(operand: &[u8]) -> Option<String> {
     let raw = raw_from_escaped(operand);
     if raw.is_empty() {

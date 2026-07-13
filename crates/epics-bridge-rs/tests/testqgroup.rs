@@ -1719,3 +1719,194 @@ async fn r17_31_group_scalar_member_serves_long_string() {
         other => panic!("long-string member must serve a scalar string, got {other:?}"),
     }
 }
+
+/// Build the NTScalar wrapper a real client sends for a `+type:"scalar"`
+/// member — the group type advertises the wrapper, so a PUT carries
+/// `member.value`, never a bare leaf (pvxs `IOCSource::put` reads
+/// `node["value"]`, iocsource.cpp:590-593).
+fn nt_scalar_put(value: PvField) -> PvField {
+    let mut st = PvStructure::new("epics:nt/NTScalar:1.0");
+    st.fields.push(("value".into(), value));
+    PvField::Structure(st)
+}
+
+/// The NTEnum wrapper: the writable leaf is `value.index`
+/// (`IOCSource::put`: `if(value.type()==TypeCode::Struct) value = value["index"]`).
+fn nt_enum_put(index: i32) -> PvField {
+    let mut inner = PvStructure::new("enum_t");
+    inner
+        .fields
+        .push(("index".into(), PvField::Scalar(ScalarValue::Int(index))));
+    let mut st = PvStructure::new("epics:nt/NTEnum:1.0");
+    st.fields.push(("value".into(), PvField::Structure(inner)));
+    PvField::Structure(st)
+}
+
+/// R17-35: a `+type:"scalar"` member is advertised as an NTScalar/NTEnum
+/// STRUCTURE, so the client PUTs that wrapper. `convert_member_value` must
+/// de-reference the wrapper's `value` leaf (and, for NTEnum, `value.index`)
+/// exactly as pvxs `IOCSource::put` does before converting to the backing
+/// DBF (iocsource.cpp:576-598). Pre-fix the wrapper itself reached
+/// `pv_field_to_epics`, which cannot convert a Structure — so EVERY
+/// scalar-mapped member PUT was rejected with "value is not convertible to
+/// backing field", numeric and string alike.
+///
+/// Both group paths (atomic and non-atomic) go through the same converter;
+/// run the case on both so neither can regress alone.
+#[tokio::test]
+async fn r17_35_group_scalar_member_put_derefs_the_nt_wrapper() {
+    use epics_base_rs::server::records::ao::AoRecord;
+    use epics_base_rs::server::records::mbbo::MbboRecord;
+    use epics_base_rs::server::records::stringout::StringoutRecord;
+
+    for atomic in [true, false] {
+        let json = format!(
+            r#"{{
+                "TEST:grpsc": {{
+                    "+atomic": {atomic},
+                    "num": {{ "+channel": "TEST:sc_ao.VAL",  "+type": "scalar", "+putorder": 0 }},
+                    "txt": {{ "+channel": "TEST:sc_so.VAL",  "+type": "scalar", "+putorder": 1 }},
+                    "sel": {{ "+channel": "TEST:sc_mb.VAL",  "+type": "scalar", "+putorder": 2 }}
+                }}
+            }}"#
+        );
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("TEST:sc_ao", Box::new(AoRecord::new(0.0)))
+            .await
+            .unwrap();
+        db.add_record("TEST:sc_so", Box::new(StringoutRecord::new("")))
+            .await
+            .unwrap();
+        db.add_record("TEST:sc_mb", Box::new(MbboRecord::new(0)))
+            .await
+            .unwrap();
+
+        let provider = Arc::new(BridgeProvider::new(db.clone()));
+        provider.load_group_config(&json).expect("load");
+        let def = provider
+            .groups()
+            .get("TEST:grpsc")
+            .cloned()
+            .expect("grp registered");
+        let ch = GroupChannel::new(db.clone(), def);
+
+        let mut put = PvStructure::new("structure");
+        put.fields.push((
+            "num".into(),
+            nt_scalar_put(PvField::Scalar(ScalarValue::Double(2.5))),
+        ));
+        put.fields.push((
+            "txt".into(),
+            nt_scalar_put(PvField::Scalar(ScalarValue::String("hello".into()))),
+        ));
+        put.fields.push(("sel".into(), nt_enum_put(1)));
+        ch.put(&put)
+            .await
+            .unwrap_or_else(|e| panic!("atomic={atomic}: scalar-member PUT rejected: {e}"));
+
+        assert_eq!(
+            db.get_pv("TEST:sc_ao.VAL").await.unwrap(),
+            EpicsValue::Double(2.5),
+            "atomic={atomic}: numeric scalar member must write the value leaf"
+        );
+        assert_eq!(
+            db.get_pv("TEST:sc_so.VAL").await.unwrap(),
+            EpicsValue::String("hello".into()),
+            "atomic={atomic}: string scalar member must write the value leaf"
+        );
+        assert_eq!(
+            db.get_pv("TEST:sc_mb.VAL").await.unwrap(),
+            EpicsValue::Enum(1),
+            "atomic={atomic}: enum scalar member must write value.index"
+        );
+    }
+}
+
+/// R17-35, `+type:"plain"` arm: a plain member's node IS the leaf (pvxs
+/// `IOCSource::put`: `case Plain: value = node;`), so the de-reference
+/// above must NOT be applied to it. Guards the fix against over-unwrapping
+/// — a bare scalar for a plain member still writes.
+#[tokio::test]
+async fn r17_35_plain_member_put_is_not_unwrapped() {
+    let db = make_db().await;
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+    provider.load_group_config(GROUP_JSON).expect("load");
+    let def = provider.groups().get("TEST:grp").cloned().expect("grp");
+    let ch = GroupChannel::new(db.clone(), def);
+
+    let mut put = PvStructure::new("structure");
+    put.fields
+        .push(("level".into(), PvField::Scalar(ScalarValue::Double(7.5))));
+    ch.put(&put).await.expect("plain member PUT");
+
+    assert_eq!(
+        db.get_pv("TEST:level.VAL").await.unwrap(),
+        EpicsValue::Double(7.5)
+    );
+}
+
+/// R17-35 + R17-31 (group PUT half): with the wrapper de-referenced, a
+/// string PUT to a `Q:form,"String"` `DBF_CHAR` waveform member reaches the
+/// long-string path — pvxs `putLongString`: `dbPut(DBR_CHAR, str,
+/// strlen+1)` (iocsource.cpp:601-606), i.e. the NUL-terminated char image,
+/// not a parse of the string as one integer. This case was unreachable
+/// while every scalar-member PUT was rejected, which is why R17-31 could
+/// only cover the group GET.
+#[tokio::test]
+async fn r17_35_group_long_string_member_put_writes_char_image() {
+    use epics_base_rs::server::records::waveform::WaveformRecord;
+    use epics_base_rs::types::DbFieldType;
+
+    const JSON: &str = r#"{
+        "TEST:grpls": {
+            "msg": { "+channel": "TEST:lstrwf.VAL", "+type": "scalar", "+putorder": 0 }
+        }
+    }"#;
+
+    let db = Arc::new(PvDatabase::new());
+    db.add_record(
+        "TEST:lstrwf",
+        Box::new(WaveformRecord::new(40, DbFieldType::Char)),
+    )
+    .await
+    .unwrap();
+    {
+        let rec = db.get_record("TEST:lstrwf").await.expect("record");
+        rec.write().await.set_info("Q:form", "String");
+    }
+
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+    provider.load_group_config(JSON).expect("load");
+    let def = provider.groups().get("TEST:grpls").cloned().expect("grp");
+    let ch = GroupChannel::new(db.clone(), def);
+
+    let mut put = PvStructure::new("structure");
+    put.fields.push((
+        "msg".into(),
+        nt_scalar_put(PvField::Scalar(ScalarValue::String("hello".into()))),
+    ));
+    ch.put(&put).await.expect("long-string member PUT");
+
+    assert_eq!(
+        db.get_pv("TEST:lstrwf.VAL").await.unwrap(),
+        EpicsValue::CharArray(b"hello\0".to_vec()),
+        "long-string member PUT must write the NUL-terminated char image"
+    );
+
+    // …and the member reads back through the same long-string view.
+    let got = ch.get(&empty_request()).await.expect("get");
+    let msg = got
+        .fields
+        .iter()
+        .find(|(n, _)| n == "msg")
+        .map(|(_, v)| v)
+        .expect("msg member");
+    match msg {
+        PvField::Structure(s) => match s.get_field("value") {
+            Some(PvField::Scalar(ScalarValue::String(s))) => assert_eq!(s, "hello"),
+            other => panic!("expected a scalar string, got {other:?}"),
+        },
+        other => panic!("expected an NTScalar member structure, got {other:?}"),
+    }
+}

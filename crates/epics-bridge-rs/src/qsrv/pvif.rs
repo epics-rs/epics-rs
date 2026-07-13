@@ -47,6 +47,20 @@ impl FieldMapping {
             FieldMapping::Const => "const",
         }
     }
+
+    /// True iff a client PUT of this member carries a leaf the server
+    /// writes to the database. pvxs `IOCSource::put` (iocsource.cpp:
+    /// 576-598) writes for `Scalar` / `Plain` / `Any`, and returns without
+    /// writing for `Meta`, `Proc`, `Structure` (explicitly "can't write")
+    /// and `Const` (the value comes from the group config, never the
+    /// client). `Proc` is separately routed to record processing by the
+    /// group PUT path.
+    pub fn is_client_writable(self) -> bool {
+        matches!(
+            self,
+            FieldMapping::Scalar | FieldMapping::Plain | FieldMapping::Any
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------

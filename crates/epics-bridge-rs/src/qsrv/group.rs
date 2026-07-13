@@ -1139,6 +1139,77 @@ impl GroupChannel {
         dbf_link_class(record_type, field_name).is_some()
     }
 
+    /// The node inside the member's incoming value that actually carries
+    /// the data to write — the port of `IOCSource::put`'s
+    /// `switch (info.type)` (pvxs `iocsource.cpp:576-598`), and the single
+    /// owner of "which leaf does a member PUT write".
+    ///
+    /// The mapping decides the shape, so the shape must be selected FROM
+    /// the mapping, never guessed from the incoming field:
+    ///
+    /// - `Scalar` — the member is advertised as an NTScalar/NTEnum
+    ///   structure, so the client PUTs that wrapper: write `node["value"]`,
+    ///   and for NTEnum (a `value` that is itself a structure)
+    ///   `node["value"]["index"]`. Without this de-reference the wrapper
+    ///   itself reached the converter and every `+type:"scalar"` member PUT
+    ///   was rejected as unconvertible (R17-35).
+    /// - `Plain` — the member is the bare leaf; write `node` (pvxs
+    ///   `value = node`). Do NOT unwrap: a plain member's node has no
+    ///   `value` child.
+    /// - `Any` — a PVA `any` slot; de-reference the Variant (`node["->"]`).
+    /// - `Meta` / `Proc` / `Structure` / `Const` — pvxs `IOCSource::put`
+    ///   returns without writing ("can't write"): a `Const` member's value
+    ///   comes from the config, and meta/proc/structure members have no
+    ///   client-writable leaf.
+    fn put_leaf(
+        mapping: FieldMapping,
+        node: &epics_pva_rs::pvdata::PvField,
+    ) -> Option<&epics_pva_rs::pvdata::PvField> {
+        use epics_pva_rs::pvdata::PvField;
+        match mapping {
+            FieldMapping::Plain => Some(node),
+            FieldMapping::Any => match node {
+                PvField::Variant(v) => Some(&v.value),
+                other => Some(other),
+            },
+            FieldMapping::Scalar => {
+                let PvField::Structure(st) = node else {
+                    // pvxs `node["value"]` on a non-structure yields an
+                    // empty Value and the put throws — the group type
+                    // always advertises the wrapper, so a bare leaf here is
+                    // a malformed PUT.
+                    return None;
+                };
+                match st.get_field("value")? {
+                    // NTEnum: the writable leaf is the index.
+                    PvField::Structure(inner) => inner.get_field("index"),
+                    leaf => Some(leaf),
+                }
+            }
+            FieldMapping::Meta
+            | FieldMapping::Proc
+            | FieldMapping::Structure
+            | FieldMapping::Const => None,
+        }
+    }
+
+    /// True iff the member's backing field stores a `DBF_CHAR` array — the
+    /// storage pvxs writes with `putLongString` when the incoming leaf is a
+    /// string (`dbChannelFinalFieldType == DBR_CHAR && value is String`,
+    /// iocsource.cpp:601-606).
+    async fn member_is_char_array(&self, member: &GroupMember) -> bool {
+        let (record_name, field_name) =
+            epics_base_rs::server::database::parse_pv_name(&member.channel);
+        let Some(rec) = self.db.get_record(record_name).await else {
+            return false;
+        };
+        let instance = rec.read().await;
+        matches!(
+            instance.resolve_field(&field_name.to_ascii_uppercase()),
+            Some(epics_base_rs::types::EpicsValue::CharArray(_))
+        )
+    }
+
     /// Convert an incoming PvField to an EpicsValue typed against the
     /// member's actual DBF field. This avoids context-free fallback
     /// conversions (e.g. ScalarValue::Long → EpicsValue::Double).
@@ -1150,17 +1221,21 @@ impl GroupChannel {
         pv_field: &epics_pva_rs::pvdata::PvField,
     ) -> Option<epics_base_rs::types::EpicsValue> {
         use epics_pva_rs::pvdata::PvField;
-        // A `+type:"any"` member is advertised as a PVA `any` slot, so a
-        // pvxs-compatible client PUTs a Variant wrapper. Dereference it
-        // (pvxs `IOCSource::put` does `node["->"]`, iocsource.cpp:575-586)
-        // and convert the inner concrete value; an unconvertible inner
-        // shape (Structure/Union/…) still returns None below and rejects
-        // the PUT, matching pvxs.
-        let pv_field = match pv_field {
-            PvField::Variant(v) => &v.value,
-            other => other,
-        };
+        // Select the writable leaf from the MEMBER'S MAPPING, exactly as
+        // `IOCSource::put` does; the incoming node's own shape never
+        // decides this.
+        let pv_field = Self::put_leaf(member.mapping, pv_field)?;
         match pv_field {
+            // A string into a `DBF_CHAR` array member is pvxs's
+            // `putLongString`: `dbPut(DBR_CHAR, str, strlen+1)`, the same
+            // NUL-terminated char image the single-record path writes. The
+            // typed scalar conversion below would instead try to parse the
+            // whole string as one integer and reject the PUT.
+            PvField::Scalar(epics_pva_rs::pvdata::ScalarValue::String(s))
+                if self.member_is_char_array(member).await =>
+            {
+                Some(pvif::long_string_put_image(s))
+            }
             PvField::Scalar(sv) => {
                 let target = self.member_dbf_type(member).await;
                 // A non-numeric string bound for a numeric member yields
@@ -1548,10 +1623,15 @@ impl GroupChannel {
                     writes.push((member, None));
                     continue;
                 }
-                if member.mapping == FieldMapping::Structure
-                    || member.mapping == FieldMapping::Const
-                {
-                    continue; // no backing channel, nothing to write
+                if !member.mapping.is_client_writable() {
+                    // pvxs `IOCSource::put` returns without writing for
+                    // Meta/Structure/Const ("can't write", iocsource.cpp:
+                    // 577-580,595): a const member's value comes from the
+                    // config and a meta/structure member has no writable
+                    // leaf. Skipping is what pvxs does — rejecting the whole
+                    // PUT (as the pre-R17-35 converter did for a supplied
+                    // meta member) is not.
+                    continue;
                 }
 
                 // Use nested lookup so members with dotted field paths
@@ -1628,14 +1708,21 @@ impl GroupChannel {
             // must run regardless of whether the request contains that field
             // (matches C++ pdbgroup.cpp:300+ allowProc semantics).
             for member in ordered {
-                if member.mapping == FieldMapping::Structure
-                    || member.mapping == FieldMapping::Const
-                {
-                    continue; // no backing channel, nothing to write
-                }
-
                 let (record_name, field_name) =
                     epics_base_rs::server::database::parse_pv_name(&member.channel);
+
+                if member.mapping != FieldMapping::Proc && !member.mapping.is_client_writable() {
+                    // pvxs `IOCSource::put` returns without writing for
+                    // Meta/Structure/Const ("can't write", iocsource.cpp:
+                    // 577-580,595): a const member's value comes from the
+                    // config and a meta/structure member has no writable
+                    // leaf. Skipping is what pvxs does — rejecting the whole
+                    // PUT (as the pre-R17-35 converter did for a supplied
+                    // meta member) is not. `Proc` is not client-writable
+                    // either, but it is routed to record processing just
+                    // below, so it must not be skipped here.
+                    continue;
+                }
 
                 if member.mapping == FieldMapping::Proc {
                     // Force a full record-processing cycle (INP/OUT/FLNK)

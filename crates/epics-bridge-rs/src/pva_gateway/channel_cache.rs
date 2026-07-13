@@ -37,7 +37,7 @@ use epics_pva_rs::client::PvaClient;
 use epics_pva_rs::client_native::ops_v2::Pauser;
 use epics_pva_rs::pvdata::{FieldDesc, PvField};
 use epics_pva_rs::server_native::MonitorUpdate;
-use epics_pva_rs::server_native::source::{ChannelInvalidator, WatermarkKind};
+use epics_pva_rs::server_native::source::{ChannelInvalidator, SourceRead, WatermarkKind};
 
 use super::error::{GwError, GwResult};
 
@@ -304,10 +304,37 @@ impl PauseControl {
 
 #[derive(Default)]
 struct EntryState {
-    /// Most recent value seen on the upstream monitor.
-    latest: Option<PvField>,
+    /// Most recent value seen on the upstream monitor, together with the
+    /// leaves the upstream has assigned in it — the UNION of every
+    /// upstream event's changed set since this snapshot began (a first
+    /// event, an introspection change, or a disconnect starts a new one).
+    ///
+    /// Value and marks are one field precisely because they are one fact:
+    /// the snapshot is a merge of upstream deltas (`fill_unmarked_from_prior`
+    /// carries unmarked leaves forward), so "which leaves does this snapshot
+    /// actually carry from upstream" is only answerable by accumulating the
+    /// marks alongside the value. A caller cannot take the value without
+    /// its marks and re-declare a full mask (R17-32).
+    ///
+    /// `SourceRead::marked == None` keeps its wire meaning — the whole
+    /// structure was assigned (upstream set the root bit).
+    latest: Option<SourceRead>,
     /// Type descriptor learned from the first INIT response.
     introspection: Option<FieldDesc>,
+}
+
+/// Accumulate an upstream event's changed leaves into the snapshot's mark
+/// union. `None` means "whole structure" on both sides and absorbs: once
+/// upstream has assigned everything, every leaf of the snapshot is real.
+fn union_marks(prior: Option<Vec<String>>, event: Option<Vec<String>>) -> Option<Vec<String>> {
+    match (prior, event) {
+        (Some(a), Some(b)) => {
+            let mut set: std::collections::BTreeSet<String> = a.into_iter().collect();
+            set.extend(b);
+            Some(set.into_iter().collect())
+        }
+        _ => None,
+    }
 }
 
 /// Result of folding one upstream monitor event into [`EntryState`].
@@ -403,15 +430,33 @@ fn apply_monitor_event(
     s.introspection = Some(desc.clone());
     match s.latest.take() {
         Some(prior) if !type_changed => {
-            s.latest = Some(epics_pva_rs::pvdata::encode::fill_unmarked_from_prior(
-                desc, &changed, 0, v, &prior,
-            ));
+            // The merged snapshot carries the union of what upstream has
+            // assigned: this event's leaves plus every leaf a prior event
+            // put there (`fill_unmarked_from_prior` keeps those values).
+            let value = epics_pva_rs::pvdata::encode::fill_unmarked_from_prior(
+                desc,
+                &changed,
+                0,
+                v,
+                &prior.value,
+            );
+            s.latest = Some(SourceRead {
+                value,
+                marked: union_marks(prior.marked, marked.clone()),
+            });
         }
-        _ => s.latest = Some(v),
+        // First event, or an introspection change that replaced the
+        // snapshot wholesale: the union starts over at this event's marks.
+        _ => {
+            s.latest = Some(SourceRead {
+                value: v,
+                marked: marked.clone(),
+            })
+        }
     }
     // Read merged value while still holding the write lock so callers
     // receive the exact value that was stored — no separate re-acquisition.
-    let value = s.latest.clone();
+    let value = s.latest.as_ref().map(|r| r.value.clone());
     MonitorEventOutcome {
         was_first,
         type_changed,
@@ -485,8 +530,18 @@ fn signal_disconnect_boundary(
 }
 
 impl UpstreamEntry {
-    /// Latest cached value; cheap clone of the `PvField` enum.
-    pub fn snapshot(&self) -> Option<PvField> {
+    /// Latest cached value AND the leaves upstream assigned in it (the
+    /// union of every upstream event's changed set since the snapshot
+    /// began). A monitor seed built from this declares exactly those
+    /// leaves downstream — never a synthesised full mask over leaves the
+    /// decoder merely zero-filled (R17-32; pva2pva `moncache.cpp:142,189`
+    /// forwards the upstream's own changed bitset).
+    ///
+    /// `None` ⟹ no upstream event yet, so there is nothing to seed with:
+    /// the seed is omitted and the downstream monitor's first frame is the
+    /// first upstream update (pva2pva delivers `lastelem` on `start()`
+    /// only when `havedata`).
+    pub fn snapshot(&self) -> Option<SourceRead> {
         self.state.read().latest.clone()
     }
 
@@ -1748,6 +1803,26 @@ mod tests {
     use epics_pva_rs::proto::{BitSet, ByteOrder};
     use epics_pva_rs::pvdata::{ScalarType, ScalarValue};
 
+    /// The cached snapshot's value alone, for the tests that only assert
+    /// the merge result. The marks it is stored with are asserted by
+    /// [`r17_32_snapshot_carries_the_union_of_upstream_marks`].
+    fn latest_value(state: &RwLock<EntryState>) -> Option<PvField> {
+        state.read().latest.as_ref().map(|r| r.value.clone())
+    }
+
+    /// The cached snapshot's marks — what a monitor seed declares. Panics
+    /// when there is no snapshot, so `None` here means only what it means on
+    /// the wire: the whole structure.
+    fn latest_marks(state: &RwLock<EntryState>) -> Option<Vec<String>> {
+        state
+            .read()
+            .latest
+            .as_ref()
+            .expect("a snapshot must exist")
+            .marked
+            .clone()
+    }
+
     /// The reconnect loop's re-subscribe delay must be applied on EVERY
     /// path — a clean MONITOR FINISH (Ok) as well as an error (Err) — so a
     /// completing upstream PV cannot tight-loop INIT→FINISH→resubscribe with
@@ -2111,7 +2186,7 @@ mod tests {
         let o1 = apply_monitor_event(&state, &desc, &body1, ByteOrder::Little);
         assert!(o1.was_first && o1.value.is_some() && !o1.type_changed);
         assert_eq!(
-            state.read().latest,
+            latest_value(&state),
             Some(PvField::Scalar(ScalarValue::Double(1.0)))
         );
 
@@ -2120,7 +2195,7 @@ mod tests {
         let body2 = encode_body(&desc, &PvField::Scalar(ScalarValue::Double(2.0)), &[0]);
         apply_monitor_event(&state, &desc, &body2, ByteOrder::Little);
         assert_eq!(
-            state.read().latest,
+            latest_value(&state),
             Some(PvField::Scalar(ScalarValue::Double(2.0))),
             "snapshot must reflect the 2nd monitor event, not freeze at the 1st"
         );
@@ -2129,7 +2204,7 @@ mod tests {
         let body3 = encode_body(&desc, &PvField::Scalar(ScalarValue::Double(3.0)), &[0]);
         apply_monitor_event(&state, &desc, &body3, ByteOrder::Little);
         assert_eq!(
-            state.read().latest,
+            latest_value(&state),
             Some(PvField::Scalar(ScalarValue::Double(3.0))),
             "snapshot must track the live value across many events"
         );
@@ -2177,7 +2252,7 @@ mod tests {
             "the first successfully-decoded event after a failed one is still first"
         );
         assert_eq!(
-            state.read().latest,
+            latest_value(&state),
             Some(PvField::Scalar(ScalarValue::Double(7.0)))
         );
     }
@@ -2211,14 +2286,14 @@ mod tests {
         // First event: full value a=10, b=20 (whole struct marked).
         let body1 = encode_body(&desc, &full(10, 20), &[0, 1, 2]);
         apply_monitor_event(&state, &desc, &body1, ByteOrder::Little);
-        assert_eq!(state.read().latest, Some(full(10, 20)));
+        assert_eq!(latest_value(&state), Some(full(10, 20)));
 
         // Delta event: only `a` changed → bit 1. `b` is unmarked and
         // arrives zero-filled; the merge must restore b=20.
         let body2 = encode_body(&desc, &full(99, 0), &[1]);
         apply_monitor_event(&state, &desc, &body2, ByteOrder::Little);
         assert_eq!(
-            state.read().latest,
+            latest_value(&state),
             Some(full(99, 20)),
             "delta merge must keep unmarked field `b` at its prior value"
         );
@@ -2275,6 +2350,78 @@ mod tests {
         let body3 = encode_body(&desc, &full(0, 77), &[2]);
         let o3 = apply_monitor_event(&state, &desc, &body3, ByteOrder::Little);
         assert_eq!(o3.marked, Some(vec!["b".to_string()]));
+    }
+
+    /// R17-32 regression: the SNAPSHOT (what a monitor seed forwards) must
+    /// carry the UNION of the upstream marks that built it. Pre-fix the
+    /// cache stored only the merged value, so every seed declared
+    /// `marked: None` and the server framed a canonical full bitset over
+    /// leaves the upstream had never assigned (the decoder's zero-fill).
+    ///
+    /// Boundaries: first event; delta accumulating a second leaf; a
+    /// re-marking of an already-marked leaf (no growth); a root-bit event
+    /// absorbing the union to "whole structure".
+    #[test]
+    fn r17_32_snapshot_carries_the_union_of_upstream_marks() {
+        let desc = FieldDesc::Structure {
+            struct_id: String::new(),
+            fields: vec![
+                ("a".to_string(), FieldDesc::Scalar(ScalarType::Int)),
+                ("b".to_string(), FieldDesc::Scalar(ScalarType::Int)),
+            ],
+        };
+        let full = |a: i32, b: i32| {
+            let mut s = epics_pva_rs::pvdata::PvStructure::new("");
+            s.fields
+                .push(("a".to_string(), PvField::Scalar(ScalarValue::Int(a))));
+            s.fields
+                .push(("b".to_string(), PvField::Scalar(ScalarValue::Int(b))));
+            PvField::Structure(s)
+        };
+        let state = RwLock::new(EntryState::default());
+
+        // First event marks only `a`: the snapshot carries `a` alone — `b`
+        // is a decoder zero, not an upstream value.
+        apply_monitor_event(
+            &state,
+            &desc,
+            &encode_body(&desc, &full(10, 0), &[1]),
+            ByteOrder::Little,
+        );
+        assert_eq!(latest_marks(&state), Some(vec!["a".to_string()]));
+
+        // Re-marking `a` does not grow the union.
+        apply_monitor_event(
+            &state,
+            &desc,
+            &encode_body(&desc, &full(11, 0), &[1]),
+            ByteOrder::Little,
+        );
+        assert_eq!(latest_marks(&state), Some(vec!["a".to_string()]));
+
+        // A `b` delta merges onto the snapshot: now BOTH leaves are real.
+        apply_monitor_event(
+            &state,
+            &desc,
+            &encode_body(&desc, &full(0, 20), &[2]),
+            ByteOrder::Little,
+        );
+        assert_eq!(
+            latest_marks(&state),
+            Some(vec!["a".to_string(), "b".to_string()]),
+            "the snapshot's marks accumulate across upstream deltas"
+        );
+        assert_eq!(latest_value(&state), Some(full(11, 20)));
+
+        // A root-bit event assigns the whole structure — the union absorbs
+        // to `None` (full mask), which is the honest answer from then on.
+        apply_monitor_event(
+            &state,
+            &desc,
+            &encode_body(&desc, &full(1, 2), &[0, 1, 2]),
+            ByteOrder::Little,
+        );
+        assert_eq!(latest_marks(&state), None);
     }
 
     /// `apply_monitor_event` flags a descriptor change so
@@ -2413,7 +2560,7 @@ mod tests {
         use crate::pva_gateway::source::RawEvent;
         use tokio::sync::broadcast;
         let state = RwLock::new(EntryState::default());
-        state.write().latest = Some(PvField::Scalar(ScalarValue::Double(1.0)));
+        state.write().latest = Some(SourceRead::from(PvField::Scalar(ScalarValue::Double(1.0))));
         let latest_raw = RwLock::new(Some(RawEvent {
             body: bytes::Bytes::from_static(&[1, 2, 3]),
             byte_order: ByteOrder::Big,

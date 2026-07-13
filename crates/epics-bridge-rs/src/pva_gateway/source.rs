@@ -853,7 +853,7 @@ impl GatewayChannelSource {
         name: &str,
         pv_request: Option<&PvField>,
     ) -> Option<(
-        Option<PvField>,
+        Option<SourceRead>,
         mpsc::Receiver<epics_pva_rs::server_native::RawMonitorEvent>,
     )> {
         // default ON — opt out via EPICS_PVA_GW_RAW_FRAMES=NO.
@@ -1003,7 +1003,7 @@ impl GatewayChannelSource {
         name: &str,
         pv_request: Option<&PvField>,
     ) -> Option<(
-        Option<PvField>,
+        Option<SourceRead>,
         mpsc::Receiver<epics_pva_rs::server_native::MonitorUpdate>,
     )> {
         // Gateway-wide subscriber cap.
@@ -1995,13 +1995,16 @@ impl ChannelSource for GatewayChannelSource {
         // `(name, ctx)` cache layer via `notify_monitor_start`, not per
         // downstream op, so no per-op `MonitorGate` here.
         Some(epics_pva_rs::server_native::source::SubscriptionSeed {
-            // The seed is the cache's merged upstream snapshot — every leaf
-            // of it carries a real upstream value (deltas are merged onto the
-            // prior snapshot, `fill_unmarked_from_prior`), so the gateway
-            // genuinely assigned the whole structure and frames the full
-            // request mask. Post-seed updates carry their own upstream marks
-            // through `MonitorUpdate::marked`.
-            initial: initial.map(SourceRead::from),
+            // The seed is the cache's merged upstream snapshot, and it carries
+            // the union of the marks UPSTREAM set on the events that built it
+            // — not a full mask. The merge never fabricates: a leaf upstream
+            // has never assigned is still a decoder zero, so declaring it
+            // assigned would put that zero on the wire as a value. pva2pva
+            // forwards the upstream's own changed bitset
+            // (`moncache.cpp:142,189`); the union is that bitset accumulated
+            // across the events the snapshot merged. Post-seed updates carry
+            // their own per-event marks through `MonitorUpdate::marked`.
+            initial,
             updates,
             on_start: None,
         })
@@ -2032,13 +2035,11 @@ impl ChannelSource for GatewayChannelSource {
             )
             .await?;
         Some(epics_pva_rs::server_native::source::SubscriptionSeed {
-            // The seed is the cache's merged upstream snapshot — every leaf
-            // of it carries a real upstream value (deltas are merged onto the
-            // prior snapshot, `fill_unmarked_from_prior`), so the gateway
-            // genuinely assigned the whole structure and frames the full
-            // request mask. Post-seed updates carry their own upstream marks
-            // through `MonitorUpdate::marked`.
-            initial: initial.map(SourceRead::from),
+            // Same contract as `subscribe_seeded`: the seed declares the union
+            // of the marks upstream set, never a synthesised full mask (the
+            // raw path's seed is encoded through the decoded path, so it goes
+            // on the wire with exactly this bitset).
+            initial,
             updates,
             on_start: None,
         })

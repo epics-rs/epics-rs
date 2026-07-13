@@ -2157,3 +2157,127 @@ async fn gateway_get_frames_upstream_marks_not_a_full_mask() {
         down.marked
     );
 }
+
+/// An upstream source whose MONITOR seed assigns only a SUBSET of its NT —
+/// the shape a real QSRV monitor has (its first post marks the fields the
+/// record actually filled). The `updates` sender is retained so the stream
+/// stays open with no post-seed events: the gateway's cache then holds
+/// exactly ONE upstream event, the seed with bits `[value]`.
+struct MarkedMonitorSource {
+    pv_name: String,
+    // Keeps the update streams alive (never posts) so the upstream monitor
+    // does not FINISH out from under the gateway.
+    updates: std::sync::Mutex<
+        Vec<tokio::sync::mpsc::Sender<epics_pva_rs::server_native::MonitorUpdate>>,
+    >,
+}
+
+impl ChannelSource for MarkedMonitorSource {
+    fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
+        let n = self.pv_name.clone();
+        async move { vec![n] }
+    }
+    fn has_pv(&self, n: &str) -> impl std::future::Future<Output = bool> + Send {
+        let want = self.pv_name.clone();
+        let got = n.to_string();
+        async move { got == want }
+    }
+    async fn get_introspection(&self, _: &str) -> Option<FieldDesc> {
+        Some(partial_desc())
+    }
+    async fn get_value(&self, _: &str) -> Option<PvField> {
+        Some(partial_value())
+    }
+    /// The monitor seed: `value` assigned, `spare` not.
+    async fn read_checked(
+        &self,
+        _checked: AccessChecked,
+        _ctx: ChannelContext,
+    ) -> Option<SourceRead> {
+        Some(SourceRead::marked(
+            partial_value(),
+            vec!["value".to_string()],
+        ))
+    }
+    async fn subscribe_checked_opts_marked(
+        &self,
+        _checked: AccessChecked,
+        _ctx: ChannelContext,
+        _opts: epics_pva_rs::server_native::MonitorOptions,
+    ) -> Option<tokio::sync::mpsc::Receiver<epics_pva_rs::server_native::MonitorUpdate>> {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        self.updates.lock().unwrap().push(tx);
+        Some(rx)
+    }
+    async fn put_value(&self, _: &str, _: PvField) -> Result<(), OpError> {
+        Err(OpError::denied("read-only fixture"))
+    }
+    async fn is_writable(&self, _: &str) -> bool {
+        false
+    }
+    async fn subscribe(&self, _: &str) -> Option<tokio::sync::mpsc::Receiver<PvField>> {
+        None
+    }
+}
+
+/// R17-32: the gateway's MONITOR seed must declare the leaves UPSTREAM
+/// assigned, not a full mask.
+///
+/// Wire shape reproduced: the upstream monitor's seed frames bits `[value]`
+/// only; the gateway's cache decodes it (zero-filling `spare`) and seeds its
+/// downstream monitor from that snapshot. Pre-fix the seed went out as
+/// `SourceRead { marked: None }` → the server framed the canonical full
+/// bitset `[value, spare]`, shipping a `spare` the upstream never sent.
+/// Post-fix the seed carries the snapshot's mark union, `[value]`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r17_32_gateway_monitor_seed_forwards_upstream_marks() {
+    let pv = "GW:MONMARK:PV";
+    let (_us, us_addr) = spawn_upstream_source(MarkedMonitorSource {
+        pv_name: pv.to_string(),
+        updates: std::sync::Mutex::new(Vec::new()),
+    });
+
+    let upstream_client = Arc::new(
+        PvaClient::builder()
+            .server_addr(us_addr)
+            .timeout(Duration::from_secs(2))
+            .build(),
+    );
+    let cache = ChannelCache::new(upstream_client, Duration::from_secs(60));
+    let mut src = GatewayChannelSource::new(cache);
+    src.connect_timeout = Duration::from_secs(5);
+
+    let ctx = ChannelContext {
+        peer: "127.0.0.1:1234".parse().unwrap(),
+        account: "tester".to_string(),
+        method: "anonymous".to_string(),
+        host: "localhost".to_string(),
+        authority: String::new(),
+        roles: Vec::new(),
+        pv_request: None,
+        log: Default::default(),
+    };
+    let checked = src
+        .revalidate_read(pv, ctx.clone())
+        .await
+        .expect("read must be allowed by the default gate");
+
+    let seed = src
+        .subscribe_seeded(
+            checked,
+            ctx,
+            epics_pva_rs::server_native::MonitorOptions::default(),
+        )
+        .await
+        .expect("the gateway must seed a monitor for a connectable upstream PV");
+    let initial = seed
+        .initial
+        .expect("the cached upstream seed must be forwarded as the downstream seed");
+
+    assert_eq!(
+        initial.marked,
+        Some(vec!["value".to_string()]),
+        "the monitor seed must declare the upstream's marks; a full mask \
+         (marked: None) frames `spare`, a leaf upstream never assigned"
+    );
+}

@@ -5,7 +5,7 @@ use epics_ca_rs::cli::{
     format_value_segment, sevr_to_str, stat_to_str, zero_dbr_snapshot, zero_dbr_value,
 };
 use epics_ca_rs::client::{CaChannel, CaClient, enum_string_readback_dbr};
-use epics_ca_rs::copt::CTool;
+use epics_ca_rs::copt::{self, CTool};
 use epics_ca_rs::{CaError, DbFieldType, EpicsValue};
 use std::time::SystemTime;
 
@@ -127,6 +127,14 @@ fn readback_line(
 /// [`epics_ca_rs::copt`]).
 const TOOL: CTool = CTool::new("caput");
 
+/// The getopt cases that `return` from C's `main` (`caput.c:291-297`), by clap
+/// id. `copt::Scan::finish` performs the FIRST one on the command line, after
+/// replaying the warnings the loop raised on its way there (R13-26).
+const TERMINALS: &[(&str, copt::Terminal)] = &[
+    ("help", copt::Terminal::Usage(0)),
+    ("version", copt::Terminal::Version),
+];
+
 const VERSION_INFO: &str = concat!(
     "\nEPICS Version epics-rs ",
     env!("CARGO_PKG_VERSION"),
@@ -146,12 +154,24 @@ const VERSION_INFO: &str = concat!(
 #[command(
     name = "caput-rs",
     about = "Write a value to an EPICS PV",
-    disable_version_flag = true
+    disable_version_flag = true,
+    disable_help_flag = true
 )]
 struct Args {
-    /// Every option below is `Append` (value option) or `Count` (flag):
-    /// C's getopt loop accepts every option any number of times, last one
-    /// winning (R13-17, see [`epics_ca_rs::copt`]).
+    // `-h` / `-V` are ordinary options, performed by `copt::Scan::finish` at
+    // their place in the getopt order so the warnings C prints before them
+    // survive (R13-26).
+    //
+    // Every option below is `Append` (value option) or `Count` (flag): C's
+    // getopt loop accepts every option any number of times, last one winning
+    // (R13-17, see `epics_ca_rs::copt`).
+    //
+    // Doc comments on these fields are the option's HELP TEXT, so the rationale
+    // above stays a plain comment.
+    /// Print this message
+    #[arg(short = 'h', long, action = clap::ArgAction::Count)]
+    help: u8,
+
     #[arg(short = 'V', long, hide = true, action = clap::ArgAction::Count)]
     version: u8,
 
@@ -255,12 +275,13 @@ impl Args {
     /// C `caput.c:336-343`: `-#` scans its argument with `sscanf("%d")` and,
     /// on failure, warns and falls back to `count = 0`. The count is dead
     /// either way (see [`Args::max_elements`]), so the warning is the flag's
-    /// ONLY observable effect — but it is emitted by the SAME owner every
-    /// other C-scanned option uses ([`CTool::req_elems_int`]), so `caput`
+    /// ONLY observable effect — but it is raised by the SAME owner every
+    /// other C-scanned option uses ([`copt::Scan::req_elems_int`]), so `caput`
     /// cannot drift from `caget` on what "not a valid array element count"
-    /// means. The returned count is deliberately discarded.
-    fn scan_dead_element_count(&self) {
-        let _ = TOOL.req_elems_int(&self.max_elements);
+    /// means, nor on WHERE the warning lands in the getopt order. The returned
+    /// count is deliberately discarded.
+    fn scan_dead_element_count(scan: &mut copt::Scan) {
+        let _ = scan.req_elems_int("max_elements");
     }
 }
 
@@ -291,10 +312,9 @@ fn last_of_pair(matches: &clap::ArgMatches, this_id: &str, that_id: &str) -> (bo
 
 #[tokio::main]
 async fn main() {
-    let matches = TOOL.get_matches(Args::command());
+    let cmd = Args::command();
+    let matches = TOOL.get_matches(cmd.clone());
     let args = Args::from_arg_matches(&matches).expect("clap validated the arguments");
-    // C warns inside its getopt loop, before any of the work below.
-    args.scan_dead_element_count();
 
     // The two mutually-clearing pairs, resolved in command-line order.
     let (force_numeric, force_string) = last_of_pair(&matches, "force_numeric", "force_string");
@@ -302,17 +322,17 @@ async fn main() {
     let terse = args.terse > 0;
     let callback = args.callback > 0;
 
-    if args.version > 0 {
-        println!("{VERSION_INFO}");
-        return;
-    }
-
     // C's ENTIRE getopt loop runs before the `nPvs < 1` / `nPvs < 2` checks
     // (`caput.c:290-455`, then `:457`), so every option argument is scanned —
-    // and every warning emitted — even when no PV name or value follows.
-    // `scan_dead_element_count` above is `-#`; these two are the rest.
-    let ca_timeout = TOOL.timeout(&args.timeout, epics_ca_rs::cli::env_default_timeout());
-    let priority = TOOL.priority(&args.priority);
+    // and every warning raised — even when no PV name or value follows.
+    let mut scan = TOOL.scan(&matches);
+    Args::scan_dead_element_count(&mut scan);
+    let ca_timeout = scan.timeout("timeout", epics_ca_rs::cli::env_default_timeout());
+    let priority = scan.priority("priority");
+    let field_separator = scan.field_separator("field_separator");
+    // End of C's getopt loop: warnings out in command-line order, then `-h` /
+    // `-V` if the loop reached one (R13-26).
+    scan.finish(&cmd, VERSION_INFO, TERMINALS);
 
     // -n / -s steer ENUM scalar handling below (force_numeric =
     // interpret as index; force_string = always send DBR_STRING for
@@ -422,7 +442,7 @@ async fn main() {
         char_array_as_string: long_string,
         ..ValueFormat::default()
     };
-    if let Some(c) = TOOL.field_separator(&args.field_separator) {
+    if let Some(c) = field_separator {
         fmt.field_separator = c;
     }
     let sep = fmt.field_separator;

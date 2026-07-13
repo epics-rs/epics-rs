@@ -9,11 +9,19 @@ use epics_ca_rs::cli::{
     format_value_segment, sevr_to_str, stat_to_str,
 };
 use epics_ca_rs::client::{CaChannel, CaClient, ConnectionEvent, EnumReadback};
-use epics_ca_rs::copt::CTool;
+use epics_ca_rs::copt::{self, CTool};
 
 /// Owner of every C-scanned option argument in this binary (see
 /// [`epics_ca_rs::copt`]).
 const TOOL: CTool = CTool::new("camonitor");
+
+/// The getopt cases that `return` from C's `main` (`camonitor.c:225-231`), by
+/// clap id. `copt::Scan::finish` performs the FIRST one on the command line,
+/// after replaying the warnings the loop raised on its way there (R13-26).
+const TERMINALS: &[(&str, copt::Terminal)] = &[
+    ("help", copt::Terminal::Usage(0)),
+    ("version", copt::Terminal::Version),
+];
 
 const VERSION_INFO: &str = concat!(
     "\nEPICS Version epics-rs ",
@@ -29,12 +37,24 @@ const VERSION_INFO: &str = concat!(
 #[command(
     name = "camonitor-rs",
     about = "Monitor EPICS PVs for changes",
-    disable_version_flag = true
+    disable_version_flag = true,
+    disable_help_flag = true
 )]
 struct Args {
-    /// Every option below is `Append` (value option) or `Count` (flag):
-    /// C's getopt loop accepts every option any number of times, last one
-    /// winning (R13-17, see [`epics_ca_rs::copt`]).
+    // `-h` / `-V` are ordinary options, performed by `copt::Scan::finish` at
+    // their place in the getopt order so the warnings C prints before them
+    // survive (R13-26).
+    //
+    // Every option below is `Append` (value option) or `Count` (flag): C's
+    // getopt loop accepts every option any number of times, last one winning
+    // (R13-17, see `epics_ca_rs::copt`).
+    //
+    // Doc comments on these fields are the option's HELP TEXT, so the rationale
+    // above stays a plain comment.
+    /// Print this message
+    #[arg(short = 'h', long, action = clap::ArgAction::Count)]
+    help: u8,
+
     #[arg(short = 'V', long, hide = true, action = clap::ArgAction::Count)]
     version: u8,
 
@@ -166,16 +186,16 @@ struct Args {
 }
 
 impl Args {
-    fn value_format(&self, matches: &clap::ArgMatches) -> ValueFormat {
+    fn value_format(&self, scan: &mut copt::Scan) -> ValueFormat {
         let mut fmt = ValueFormat::default();
         // W10-B2. `-e`/`-f`/`-g` are ONE getopt case writing ONE `dblFormatStr`
         // (`camonitor.c:310-324`), so the LAST VALID occurrence across the three letters wins
         // — in command-line order, not by an `e` > `f` > `g` precedence. The
-        // order lives in `matches`, which is why the three `Vec<String>` fields
+        // order lives in the scan, which is why the three `Vec<String>` fields
         // cannot resolve it themselves. Every occurrence is still scanned, so
         // each malformed precision emits its own warning as C's loop does.
         if let Some((letter, precision)) =
-            TOOL.float_precision(matches, &[('e', "fmt_e"), ('f', "fmt_f"), ('g', "fmt_g")])
+            scan.float_precision(&[('e', "fmt_e"), ('f', "fmt_f"), ('g', "fmt_g")])
         {
             fmt.float = FloatFormat {
                 style: match letter {
@@ -190,12 +210,12 @@ impl Args {
         // per occurrence: `-0<base>` sets `outTypeI` (integers), `-l<base>`
         // sets `outTypeF` (floats, via round-to-long). They never cross.
         // camonitor has no `-d`, so nothing races the `type` these also set.
-        fmt.int_style = TOOL.base('0', &self.int_base).style;
-        fmt.float_style = TOOL.base('l', &self.float_base).style;
+        fmt.int_style = scan.base('0', "int_base").style;
+        fmt.float_style = scan.base('l', "float_base").style;
         fmt.enum_as_number = self.enum_as_number > 0;
         fmt.char_array_as_string = self.char_array_as_string > 0;
-        fmt.req_elems = TOOL.req_elems_ulong(&self.max_elements);
-        if let Some(c) = TOOL.field_separator(&self.field_separator) {
+        fmt.req_elems = scan.req_elems_ulong("max_elements");
+        if let Some(c) = scan.field_separator("field_separator") {
             fmt.field_separator = c;
         }
         fmt
@@ -206,28 +226,28 @@ impl Args {
 async fn main() {
     // Parse via ArgMatches (not the plain derive) so the command-line order of
     // `-e`/`-f`/`-g` is recoverable for C's last-valid-wins rule (W10-B2).
-    let matches = TOOL.get_matches(Args::command());
+    let cmd = Args::command();
+    let matches = TOOL.get_matches(cmd.clone());
     let args = Args::from_arg_matches(&matches).expect("clap validated the arguments");
-
-    if args.version > 0 {
-        println!("{VERSION_INFO}");
-        return;
-    }
 
     // C's ENTIRE getopt loop runs before the `nPvs < 1` check
     // (`camonitor.c:224-600`, then `:604`), so every option argument is
-    // scanned — and every warning emitted — even when no PV name follows.
-    // `value_format` scans `-#`, `-e`/`-f`/`-g`, `-0`/`-l` and `-F`; the three
-    // below cover the rest. `-m` and `-t` are bare re-scans, so a repeat is
-    // plain last-wins (`copt::last`, R13-17).
-    let ca_timeout = TOOL.timeout(&args.timeout, epics_ca_rs::cli::env_default_timeout());
-    let priority = TOOL.priority(&args.priority);
-    let fmt = Arc::new(args.value_format(&matches));
+    // scanned — and every warning raised — even when no PV name follows.
+    // `value_format` scans `-#`, `-e`/`-f`/`-g`, `-0`/`-l` and `-F`; the four
+    // below cover the rest. `-m` and `-t` are bare re-scans: every occurrence
+    // re-runs the case (so every bad one warns) and the last one wins.
+    let mut scan = TOOL.scan(&matches);
+    let ca_timeout = scan.timeout("timeout", epics_ca_rs::cli::env_default_timeout());
+    let priority = scan.priority("priority");
+    let fmt = Arc::new(args.value_format(&mut scan));
     // The `-m <msk>` DBE_* mask + the `-t` timestamp mode, resolved once for
     // all PVs. `prev_all`/`start` back the relative and incremental timestamp
     // renderings.
-    let mask = parse_event_mask(epics_ca_rs::copt::last(&args.event_mask));
-    let spec = parse_timestamp_spec(epics_ca_rs::copt::last(&args.timestamp_key));
+    let mask = parse_event_mask(&mut scan, "event_mask");
+    let spec = parse_timestamp_spec(&mut scan, "timestamp_key");
+    // End of C's getopt loop: warnings out in command-line order, then `-h` /
+    // `-V` if the loop reached one (R13-26).
+    scan.finish(&cmd, VERSION_INFO, TERMINALS);
 
     if args.pv_names.is_empty() {
         TOOL.no_pv_name();
@@ -487,27 +507,47 @@ async fn monitor_pv(
 /// scanning the rest of the argument (C sets `err = 1`). An empty
 /// `-m ""` selects no events (mask 0), exactly as C's scan loop leaves
 /// `eventMask` at 0.
-fn parse_event_mask(m: Option<&str>) -> u16 {
+/// EVERY occurrence re-runs the case, so every bad one warns at its own
+/// position and the last one still decides the mask — the scan folds them all
+/// rather than looking only at the last (R13-26: a warning C prints is a
+/// warning the port prints, at the place C prints it).
+fn parse_event_mask(scan: &mut copt::Scan, id: &str) -> u16 {
     const DBE_VALUE: u16 = 1;
     const DBE_LOG: u16 = 2;
     const DBE_ALARM: u16 = 4;
     const DBE_PROPERTY: u16 = 8;
     const DEFAULT: u16 = DBE_VALUE | DBE_ALARM;
-    let Some(s) = m else { return DEFAULT };
-    let mut mask = 0u16;
-    for c in s.chars() {
-        match c {
-            'v' => mask |= DBE_VALUE,
-            'a' => mask |= DBE_ALARM,
-            'l' => mask |= DBE_LOG,
-            'p' => mask |= DBE_PROPERTY,
-            _ => {
-                eprintln!("Invalid argument '{s}' for option '-m' - ignored.");
-                return DEFAULT;
+
+    let mut effective = DEFAULT;
+    for (at, s) in scan
+        .occurrences(id)
+        .into_iter()
+        .map(|(at, s)| (at, s.to_string()))
+        .collect::<Vec<_>>()
+    {
+        let mut mask = 0u16;
+        let mut bad = false;
+        for c in s.chars() {
+            match c {
+                'v' => mask |= DBE_VALUE,
+                'a' => mask |= DBE_ALARM,
+                'l' => mask |= DBE_LOG,
+                'p' => mask |= DBE_PROPERTY,
+                // C sets `err = 1` here, so the rest of the argument is not
+                // scanned and only ONE warning fires per occurrence.
+                _ => {
+                    scan.warn(
+                        at,
+                        format!("Invalid argument '{s}' for option '-m' - ignored."),
+                    );
+                    bad = true;
+                    break;
+                }
             }
         }
+        effective = if bad { DEFAULT } else { mask };
     }
-    mask
+    effective
 }
 
 /// `camonitor -t <key>` rendering KIND — orthogonal to the
@@ -542,27 +582,36 @@ struct TimestampSpec {
 /// kind, `n` and unknown letters are no-ops (a kind with no source prints
 /// nothing — the usage note "'r','i','I' require 's' or 'c'"). With no
 /// `-t` at all the C globals default to server + absolute.
-fn parse_timestamp_spec(k: Option<&str>) -> TimestampSpec {
-    let Some(k) = k else {
-        return TimestampSpec {
-            server: true,
-            client: false,
-            kind: TimestampKind::Absolute,
-        };
-    };
+fn parse_timestamp_spec(scan: &mut copt::Scan, id: &str) -> TimestampSpec {
+    // C's globals before the loop: server source, absolute kind.
     let mut spec = TimestampSpec {
-        server: false,
+        server: true,
         client: false,
         kind: TimestampKind::Absolute,
     };
-    for c in k.chars() {
-        match c {
-            's' => spec.server = true,
-            'c' => spec.client = true,
-            'r' => spec.kind = TimestampKind::Relative,
-            'i' => spec.kind = TimestampKind::IncrAll,
-            'I' => spec.kind = TimestampKind::IncrChan,
-            _ => {} // 'n' and unknown letters: no-op (matches C)
+    // EVERY occurrence re-runs the case (both sources reset to 0 first), so the
+    // last one decides — and each is scanned, which is what makes its warnings
+    // appear at its own position.
+    for (_at, k) in scan
+        .occurrences(id)
+        .into_iter()
+        .map(|(at, s)| (at, s.to_string()))
+        .collect::<Vec<_>>()
+    {
+        spec = TimestampSpec {
+            server: false,
+            client: false,
+            kind: TimestampKind::Absolute,
+        };
+        for c in k.chars() {
+            match c {
+                's' => spec.server = true,
+                'c' => spec.client = true,
+                'r' => spec.kind = TimestampKind::Relative,
+                'i' => spec.kind = TimestampKind::IncrAll,
+                'I' => spec.kind = TimestampKind::IncrChan,
+                _ => {} // 'n' and unknown letters: no-op (matches C)
+            }
         }
     }
     spec
@@ -690,16 +739,34 @@ fn render_timestamp(
 #[cfg(test)]
 mod tests {
     use super::{
-        TimestampKind, TimestampSpec, TimestampState, parse_event_mask, parse_timestamp_spec,
-        render_timestamp,
+        Args, TOOL, TimestampKind, TimestampSpec, TimestampState, parse_event_mask,
+        parse_timestamp_spec, render_timestamp,
     };
+    use clap::CommandFactory;
     use std::time::{Duration, SystemTime};
+
+    /// The real command line, parsed by the real spec — the only way to reach a
+    /// resolver now, because a warning without its getopt position cannot be
+    /// ordered against the rest of the loop (R13-26).
+    fn matches_of(argv: &[&str]) -> clap::ArgMatches {
+        Args::command().no_binary_name(true).get_matches_from(argv)
+    }
+
+    fn mask_of(argv: &[&str]) -> u16 {
+        let m = matches_of(argv);
+        parse_event_mask(&mut TOOL.scan(&m), "event_mask")
+    }
+
+    fn spec_of(argv: &[&str]) -> TimestampSpec {
+        let m = matches_of(argv);
+        parse_timestamp_spec(&mut TOOL.scan(&m), "timestamp_key")
+    }
 
     #[test]
     fn mask_default_is_value_alarm() {
         // C `camonitor.c:40`: the no-`-m` default is VALUE|ALARM, NOT
         // value+log+alarm.
-        assert_eq!(parse_event_mask(None), 1 | 4);
+        assert_eq!(mask_of(&[]), 1 | 4);
     }
 
     #[test]
@@ -707,47 +774,71 @@ mod tests {
         // C `camonitor.c:298-300`: the first unrecognised letter reverts
         // to VALUE|ALARM and stops scanning (so a leading valid `v` is
         // discarded too).
-        assert_eq!(parse_event_mask(Some("xyz")), 1 | 4);
-        assert_eq!(parse_event_mask(Some("vx")), 1 | 4);
+        assert_eq!(mask_of(&["-m", "xyz"]), 1 | 4);
+        assert_eq!(mask_of(&["-m", "vx"]), 1 | 4);
     }
 
     #[test]
     fn mask_empty_selects_no_events() {
         // C scan loop never runs on an empty arg → eventMask stays 0.
-        assert_eq!(parse_event_mask(Some("")), 0);
+        assert_eq!(mask_of(&["-m", ""]), 0);
     }
 
     #[test]
     fn mask_parses_dbe_letters() {
-        assert_eq!(parse_event_mask(Some("a")), 4, "alarm-only");
-        assert_eq!(parse_event_mask(Some("v")), 1, "value-only");
-        assert_eq!(parse_event_mask(Some("p")), 8, "property-only");
-        assert_eq!(parse_event_mask(Some("val")), 1 | 4 | 2, "value+alarm+log");
+        assert_eq!(mask_of(&["-m", "a"]), 4, "alarm-only");
+        assert_eq!(mask_of(&["-m", "v"]), 1, "value-only");
+        assert_eq!(mask_of(&["-m", "p"]), 8, "property-only");
+        assert_eq!(mask_of(&["-m", "val"]), 1 | 4 | 2, "value+alarm+log");
+    }
+
+    /// R13-17/R13-26: `case 'm'` re-runs whole per occurrence, so the last one
+    /// decides the mask AND every bad one warns at its own position — the
+    /// earlier fold looked only at the last occurrence, so an invalid `-m`
+    /// followed by a valid one printed nothing where C prints its diagnostic.
+    #[test]
+    fn every_m_occurrence_is_scanned_and_the_last_decides() {
+        assert_eq!(mask_of(&["-m", "v", "-m", "a"]), 4, "last -m wins");
+        assert_eq!(
+            mask_of(&["-m", "xyz", "-m", "v"]),
+            1,
+            "the bad one still loses to the later good one"
+        );
+
+        let m = matches_of(&["-m", "xyz", "-m", "v"]);
+        let mut scan = TOOL.scan(&m);
+        let _ = parse_event_mask(&mut scan, "event_mask");
+        assert_eq!(
+            scan.ordered_warnings(),
+            vec!["Invalid argument 'xyz' for option '-m' - ignored."],
+            "C warns for the bad occurrence even though a later one wins"
+        );
     }
 
     #[test]
     fn timestamp_spec_parses_keys() {
-        let s = parse_timestamp_spec(None);
+        let s = spec_of(&[]);
         assert!(s.server && !s.client && matches!(s.kind, TimestampKind::Absolute));
-        let s = parse_timestamp_spec(Some("s"));
+        let s = spec_of(&["-t", "s"]);
         assert!(s.server && !s.client);
-        let s = parse_timestamp_spec(Some("c"));
+        let s = spec_of(&["-t", "c"]);
         assert!(!s.server && s.client);
-        let s = parse_timestamp_spec(Some("sc"));
+        let s = spec_of(&["-t", "sc"]);
         assert!(s.server && s.client);
         // 'n' (and unknown letters) select no source → no column.
-        let s = parse_timestamp_spec(Some("n"));
+        let s = spec_of(&["-t", "n"]);
         assert!(!s.server && !s.client, "n selects no source");
-        let s = parse_timestamp_spec(Some("cr"));
+        let s = spec_of(&["-t", "cr"]);
         assert!(!s.server && s.client && matches!(s.kind, TimestampKind::Relative));
+        assert!(matches!(spec_of(&["-t", "i"]).kind, TimestampKind::IncrAll));
         assert!(matches!(
-            parse_timestamp_spec(Some("i")).kind,
-            TimestampKind::IncrAll
-        ));
-        assert!(matches!(
-            parse_timestamp_spec(Some("I")).kind,
+            spec_of(&["-t", "I"]).kind,
             TimestampKind::IncrChan
         ));
+        // Every occurrence re-runs the case (both sources reset first), so the
+        // last one decides — `-t c -t s` is server-only, not both.
+        let s = spec_of(&["-t", "c", "-t", "s"]);
+        assert!(s.server && !s.client, "the last -t resets and re-sets");
     }
 
     /// Build a fresh `TimestampState` over caller-owned slots so each

@@ -346,47 +346,65 @@ impl AcalcoutRecord {
         EpicsValue::DoubleArray(out)
     }
 
-    /// The one owner of every write into an `AA`..`LL` buffer.
+    /// Zero `[from, numElements)` — the REST OF THE WINDOW after a writer that
+    /// delivered fewer elements than the window holds. `[numElements, nelm)`, the
+    /// part of the buffer NUSE currently hides, is NOT touched: it keeps whatever
+    /// was in it and reappears if NUSE grows again.
     ///
-    /// C allocates each array input ONCE, at `calloc(pcalc->nelm, sizeof(double))`
-    /// (`aCalcoutRecord.c:1084-1086`), and that buffer then lives for the record's
-    /// lifetime. Nothing ever replaces it — every write is a SPLICE into it, so
-    /// elements the writer did not reach keep their previous contents. The port
-    /// assigned `arr_vals[idx] = <whatever the link or the client delivered>`,
-    /// which throws the tail away.
+    /// Both of the record's array writers do this, in the same words:
     ///
-    /// Copies `src` into `[0, min(src.len(), nelm))` and leaves everything past it
-    /// alone. The buffer is grown to `nelm` on the way, which is where C's `calloc`
-    /// gets its length.
-    fn splice_array_field(&mut self, idx: usize, src: &[f64]) {
+    /// ```c
+    /// /* fetch_values, aCalcoutRecord.c:1100-1102 — the input link */
+    /// if (nRequest<numElements)
+    ///     for (j=nRequest; j<numElements; j++) (*pavalue)[j] = 0;
+    ///
+    /// /* put_array_info, aCalcoutRecord.c:726-731 — the client dbPut */
+    /// if ( pd && (nNew < numElements) )
+    ///     for (i=nNew; i<numElements; i++) pd[i] = 0.;
+    /// ```
+    ///
+    /// The client half is not optional and not the record's own idea: `dbPut`
+    /// calls `put_array_info` for every SPC_DBADDR field it writes
+    /// (`dbAccess.c:1366-1369`), with `nNew` = the element count that arrived.
+    /// So a caput of two elements into a ten-element window leaves eight zeros
+    /// behind it, not eight stale values — which is the opposite of what W10-A8
+    /// asserted here.
+    /// (C's `if (nNew < numElements)` / `if (nRequest<numElements)` is the guard
+    /// on both loops: a writer that filled the window, or overran it, zeroes
+    /// nothing.)
+    fn zero_fill_window(buf: &mut [f64], from: usize, window: usize) {
+        let len = buf.len();
+        let (from, window) = (from.min(len), window.min(len));
+        if from >= window {
+            return;
+        }
+        for v in &mut buf[from..window] {
+            *v = 0.0;
+        }
+    }
+
+    /// The ONE owner of a client `dbPut` into an SPC_DBADDR array field — AA..LL,
+    /// AVAL and OAV, the three that C's `put_array_info` serves
+    /// (`aCalcoutRecord.c:677-731`). It splices the new elements into the record's
+    /// permanent `calloc(nelm)` buffer and then zeroes the rest of the window.
+    ///
+    /// Both halves matter and neither is the caller's business: the splice is why
+    /// the hidden tail `[numElements, nelm)` survives a put, and the zero-fill is
+    /// why the VISIBLE tail does not. A caller that did one without the other is
+    /// exactly the bug this function exists to make unwritable.
+    ///
+    /// The splice half: C allocates each array field ONCE, at
+    /// `calloc(pcalc->nelm, sizeof(double))` (`:695-698`, `:1084-1086`), and that
+    /// buffer lives for the record's lifetime — nothing ever replaces it, so a
+    /// write is always INTO it and never a swap of it.
+    fn client_put_array(&mut self, src: &[f64], select: impl FnOnce(&mut Self) -> &mut Vec<f64>) {
         let nelm = (self.nelm as usize).max(1);
-        let buf = &mut self.arr_vals[idx];
+        let window = self.num_elements();
+        let buf = select(self);
         buf.resize(nelm, 0.0);
         let n = src.len().min(nelm);
         buf[..n].copy_from_slice(&src[..n]);
-    }
-
-    /// C `fetch_values`, and ONLY `fetch_values` (`aCalcoutRecord.c:1100-1102`):
-    ///
-    /// ```c
-    /// if (nRequest<numElements) {
-    ///     for (j=nRequest; j<numElements; j++) (*pavalue)[j] = 0;
-    /// }
-    /// ```
-    ///
-    /// A link that delivered fewer elements than the current window zeroes the
-    /// REST OF THE WINDOW — and stops there. `[numElements, nelm)`, the part of the
-    /// buffer NUSE currently hides, is not touched: it keeps whatever was in it and
-    /// reappears if NUSE grows again. A client `dbPut` has no such step; it writes
-    /// its elements and nothing else.
-    fn zero_fill_window(&mut self, idx: usize, from: usize) {
-        let window = self.num_elements();
-        let nelm = (self.nelm as usize).max(1);
-        let buf = &mut self.arr_vals[idx];
-        buf.resize(nelm, 0.0);
-        for v in &mut buf[from.min(nelm)..window.min(nelm)] {
-            *v = 0.0;
-        }
+        Self::zero_fill_window(buf, n, window);
     }
 
     fn build_inputs(&self, n: usize, prev_val: f64, prev_aval: &[f64]) -> ArrayInputs {
@@ -1714,13 +1732,12 @@ impl Record for AcalcoutRecord {
             return crate::server::record::put_field_internal_default(self, name, value);
         };
         let before = self.array_field_value(&self.arr_vals[i]);
-        // C `fetch_values` asks the link for exactly `nRequest =
-        // acalcGetNumElements()` elements and `dbGetLink` writes back how many it
-        // actually delivered (`aCalcoutRecord.c:1096-1099`). That count is what the
-        // zero-fill below starts from, so capture it before the value is consumed.
-        let delivered = value.count() as usize;
+        // The write itself — splice into the calloc(nelm) buffer, then zero the
+        // rest of the window — is [`Self::client_put_array`], reached through
+        // `put_field`. C's two writers do the same two things in the same order
+        // (`fetch_values:1096-1102` and `put_array_info:726-731`); the only thing
+        // that is this path's alone is NEWM, which only `fetch_values` sets.
         crate::server::record::put_field_internal_default(self, name, value)?;
-        self.zero_fill_window(i, delivered);
         if self.array_field_value(&self.arr_vals[i]) != before {
             self.newm |= 1 << i;
         }
@@ -1735,9 +1752,15 @@ impl Record for AcalcoutRecord {
                     .ok_or_else(|| CaError::TypeMismatch("VAL".into()))?;
                 Ok(())
             }
+            // AVAL and OAV are SPC_DBADDR array fields too (`aCalcoutRecord.c:702`,
+            // `:711`), so a client put into either takes the same
+            // `put_array_info` treatment as AA..LL: splice into the calloc(nelm)
+            // buffer, zero the rest of the window. Replacing the whole vector
+            // dropped both invariants at once.
             "AVAL" => {
-                self.aval = Self::coerce_array(value)
+                let src = Self::coerce_array(value)
                     .ok_or_else(|| CaError::TypeMismatch("AVAL".into()))?;
+                self.client_put_array(&src, |r| &mut r.aval);
                 Ok(())
             }
             "PVAL" => {
@@ -1808,8 +1831,9 @@ impl Record for AcalcoutRecord {
                 Ok(())
             }
             "OAV" => {
-                self.oav =
+                let src =
                     Self::coerce_array(value).ok_or_else(|| CaError::TypeMismatch("OAV".into()))?;
+                self.client_put_array(&src, |r| &mut r.oav);
                 Ok(())
             }
             "POVL" => {
@@ -2054,12 +2078,9 @@ impl Record for AcalcoutRecord {
                     return Ok(());
                 }
                 if let Some(idx) = Self::arr_index(name) {
-                    // A client `dbPut` writes the elements it brought and no more:
-                    // the buffer is C's `calloc(nelm)` and the tail it did not reach
-                    // keeps its previous contents.
                     let src = Self::coerce_array(value)
                         .ok_or_else(|| CaError::TypeMismatch(name.into()))?;
-                    self.splice_array_field(idx, &src);
+                    self.client_put_array(&src, |r| &mut r.arr_vals[idx]);
                     return Ok(());
                 }
                 if let Some(idx) = Self::inp_index(name) {

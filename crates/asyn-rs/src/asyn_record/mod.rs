@@ -1576,8 +1576,10 @@ const TFIL_UNKNOWN: &str = "Unknown";
 /// [`AsynRecord::update_info_bits_from_mask`] and reference the same
 /// `Trace*Mask` constants, so the out-of-band trace post and the
 /// `process()`-path re-import (`read_trace_state`) cannot diverge. Field DBF
-/// types match `get_field`: the mask fields are `Long`, the bit fields
-/// `Short`.
+/// types match `get_field`: the mask fields are `Long`, the bit fields are
+/// `DBF_MENU` (`menu(asynTRACE)`, asynRecord.dbd:481-577) and so are posted as
+/// `Enum` — a post must carry the field's native type or the monitor delivers a
+/// value the client cannot decode against the field's declared type.
 fn trace_readback_fields(rb: &TraceReadback) -> Vec<(String, EpicsValue)> {
     let TraceReadback {
         trace_mask,
@@ -1586,7 +1588,7 @@ fn trace_readback_fields(rb: &TraceReadback) -> Vec<(String, EpicsValue)> {
         truncate_size,
         file_changed,
     } = *rb;
-    let bit = |mask: u32, flag: u32| EpicsValue::Short(i16::from(mask & flag != 0));
+    let bit = |mask: u32, flag: u32| EpicsValue::Enum(u16::from(mask & flag != 0));
     let mut fields = vec![
         ("TMSK".to_string(), EpicsValue::Long(trace_mask as i32)),
         ("TB0".to_string(), bit(trace_mask, TraceMask::ERROR.bits())),
@@ -1648,7 +1650,7 @@ fn trace_readback_fields(rb: &TraceReadback) -> Vec<(String, EpicsValue)> {
 /// Sibling of [`trace_readback_fields`]: together they are everything
 /// `exceptCallback` refreshes, and the same list the `process()`-path
 /// [`AsynRecord::monitor_status`] writes. Field DBF types match `get_field`
-/// (all three are `Short`).
+/// (all three are `DBF_MENU`: asynRecord.dbd:599, :606, :613).
 fn connect_readback_fields(
     auto_connect: bool,
     connected: bool,
@@ -1657,10 +1659,10 @@ fn connect_readback_fields(
     vec![
         (
             "AUCT".to_string(),
-            EpicsValue::Short(i16::from(auto_connect)),
+            EpicsValue::Enum(u16::from(auto_connect)),
         ),
-        ("CNCT".to_string(), EpicsValue::Short(i16::from(connected))),
-        ("ENBL".to_string(), EpicsValue::Short(i16::from(enabled))),
+        ("CNCT".to_string(), EpicsValue::Enum(u16::from(connected))),
+        ("ENBL".to_string(), EpicsValue::Enum(u16::from(enabled))),
     ]
 }
 
@@ -1680,7 +1682,7 @@ static FIELD_LIST: &[FieldDesc] = &[
     },
     FieldDesc {
         name: "PCNCT",
-        dbf_type: DbFieldType::Short,
+        dbf_type: DbFieldType::Enum,
         read_only: false,
     },
     FieldDesc {
@@ -1696,7 +1698,7 @@ static FIELD_LIST: &[FieldDesc] = &[
     // I/O control
     FieldDesc {
         name: "TMOD",
-        dbf_type: DbFieldType::Short,
+        dbf_type: DbFieldType::Enum,
         read_only: false,
     },
     FieldDesc {
@@ -1706,7 +1708,7 @@ static FIELD_LIST: &[FieldDesc] = &[
     },
     FieldDesc {
         name: "IFACE",
-        dbf_type: DbFieldType::Short,
+        dbf_type: DbFieldType::Enum,
         read_only: false,
     },
     FieldDesc {
@@ -1772,7 +1774,7 @@ static FIELD_LIST: &[FieldDesc] = &[
     },
     FieldDesc {
         name: "OFMT",
-        dbf_type: DbFieldType::Short,
+        dbf_type: DbFieldType::Enum,
         read_only: false,
     },
     // Octet input
@@ -1813,12 +1815,12 @@ static FIELD_LIST: &[FieldDesc] = &[
     },
     FieldDesc {
         name: "IFMT",
-        dbf_type: DbFieldType::Short,
+        dbf_type: DbFieldType::Enum,
         read_only: false,
     },
     FieldDesc {
         name: "EOMR",
-        dbf_type: DbFieldType::Short,
+        dbf_type: DbFieldType::Enum,
         read_only: true,
     },
     // Int32/UInt32/Float64
@@ -1860,7 +1862,7 @@ static FIELD_LIST: &[FieldDesc] = &[
     // Serial
     FieldDesc {
         name: "BAUD",
-        dbf_type: DbFieldType::Short,
+        dbf_type: DbFieldType::Enum,
         read_only: false,
     },
     FieldDesc {
@@ -1870,42 +1872,42 @@ static FIELD_LIST: &[FieldDesc] = &[
     },
     FieldDesc {
         name: "PRTY",
-        dbf_type: DbFieldType::Short,
+        dbf_type: DbFieldType::Enum,
         read_only: false,
     },
     FieldDesc {
         name: "DBIT",
-        dbf_type: DbFieldType::Short,
+        dbf_type: DbFieldType::Enum,
         read_only: false,
     },
     FieldDesc {
         name: "SBIT",
-        dbf_type: DbFieldType::Short,
+        dbf_type: DbFieldType::Enum,
         read_only: false,
     },
     FieldDesc {
         name: "MCTL",
-        dbf_type: DbFieldType::Short,
+        dbf_type: DbFieldType::Enum,
         read_only: false,
     },
     FieldDesc {
         name: "FCTL",
-        dbf_type: DbFieldType::Short,
+        dbf_type: DbFieldType::Enum,
         read_only: false,
     },
     FieldDesc {
         name: "IXON",
-        dbf_type: DbFieldType::Short,
+        dbf_type: DbFieldType::Enum,
         read_only: false,
     },
     FieldDesc {
         name: "IXOFF",
-        dbf_type: DbFieldType::Short,
+        dbf_type: DbFieldType::Enum,
         read_only: false,
     },
     FieldDesc {
         name: "IXANY",
-        dbf_type: DbFieldType::Short,
+        dbf_type: DbFieldType::Enum,
         read_only: false,
     },
     // IP options
@@ -1916,18 +1918,18 @@ static FIELD_LIST: &[FieldDesc] = &[
     },
     FieldDesc {
         name: "DRTO",
-        dbf_type: DbFieldType::Short,
+        dbf_type: DbFieldType::Enum,
         read_only: false,
     },
     // GPIB
     FieldDesc {
         name: "UCMD",
-        dbf_type: DbFieldType::Short,
+        dbf_type: DbFieldType::Enum,
         read_only: false,
     },
     FieldDesc {
         name: "ACMD",
-        dbf_type: DbFieldType::Short,
+        dbf_type: DbFieldType::Enum,
         read_only: false,
     },
     FieldDesc {
@@ -1943,32 +1945,32 @@ static FIELD_LIST: &[FieldDesc] = &[
     },
     FieldDesc {
         name: "TB0",
-        dbf_type: DbFieldType::Short,
+        dbf_type: DbFieldType::Enum,
         read_only: false,
     },
     FieldDesc {
         name: "TB1",
-        dbf_type: DbFieldType::Short,
+        dbf_type: DbFieldType::Enum,
         read_only: false,
     },
     FieldDesc {
         name: "TB2",
-        dbf_type: DbFieldType::Short,
+        dbf_type: DbFieldType::Enum,
         read_only: false,
     },
     FieldDesc {
         name: "TB3",
-        dbf_type: DbFieldType::Short,
+        dbf_type: DbFieldType::Enum,
         read_only: false,
     },
     FieldDesc {
         name: "TB4",
-        dbf_type: DbFieldType::Short,
+        dbf_type: DbFieldType::Enum,
         read_only: false,
     },
     FieldDesc {
         name: "TB5",
-        dbf_type: DbFieldType::Short,
+        dbf_type: DbFieldType::Enum,
         read_only: false,
     },
     FieldDesc {
@@ -1978,17 +1980,17 @@ static FIELD_LIST: &[FieldDesc] = &[
     },
     FieldDesc {
         name: "TIB0",
-        dbf_type: DbFieldType::Short,
+        dbf_type: DbFieldType::Enum,
         read_only: false,
     },
     FieldDesc {
         name: "TIB1",
-        dbf_type: DbFieldType::Short,
+        dbf_type: DbFieldType::Enum,
         read_only: false,
     },
     FieldDesc {
         name: "TIB2",
-        dbf_type: DbFieldType::Short,
+        dbf_type: DbFieldType::Enum,
         read_only: false,
     },
     FieldDesc {
@@ -1998,22 +2000,22 @@ static FIELD_LIST: &[FieldDesc] = &[
     },
     FieldDesc {
         name: "TINB0",
-        dbf_type: DbFieldType::Short,
+        dbf_type: DbFieldType::Enum,
         read_only: false,
     },
     FieldDesc {
         name: "TINB1",
-        dbf_type: DbFieldType::Short,
+        dbf_type: DbFieldType::Enum,
         read_only: false,
     },
     FieldDesc {
         name: "TINB2",
-        dbf_type: DbFieldType::Short,
+        dbf_type: DbFieldType::Enum,
         read_only: false,
     },
     FieldDesc {
         name: "TINB3",
-        dbf_type: DbFieldType::Short,
+        dbf_type: DbFieldType::Enum,
         read_only: false,
     },
     FieldDesc {
@@ -2029,17 +2031,17 @@ static FIELD_LIST: &[FieldDesc] = &[
     // Connection management
     FieldDesc {
         name: "AUCT",
-        dbf_type: DbFieldType::Short,
+        dbf_type: DbFieldType::Enum,
         read_only: false,
     },
     FieldDesc {
         name: "CNCT",
-        dbf_type: DbFieldType::Short,
+        dbf_type: DbFieldType::Enum,
         read_only: false,
     },
     FieldDesc {
         name: "ENBL",
-        dbf_type: DbFieldType::Short,
+        dbf_type: DbFieldType::Enum,
         read_only: false,
     },
     // Misc
@@ -3853,12 +3855,12 @@ impl Record for AsynRecord {
         match name {
             "PORT" => Some(EpicsValue::String(self.port.clone().into())),
             "ADDR" => Some(EpicsValue::Long(self.addr)),
-            "PCNCT" => Some(EpicsValue::Short(self.pcnct as i16)),
+            "PCNCT" => Some(EpicsValue::Enum(self.pcnct as u16)),
             "DRVINFO" => Some(EpicsValue::String(self.drvinfo.clone().into())),
             "REASON" => Some(EpicsValue::Long(self.reason)),
-            "TMOD" => Some(EpicsValue::Short(self.tmod as i16)),
+            "TMOD" => Some(EpicsValue::Enum(self.tmod as u16)),
             "TMOT" => Some(EpicsValue::Double(self.tmot)),
-            "IFACE" => Some(EpicsValue::Short(self.iface as i16)),
+            "IFACE" => Some(EpicsValue::Enum(self.iface as u16)),
             "OCTETIV" => Some(EpicsValue::Long(self.octetiv)),
             "OPTIONIV" => Some(EpicsValue::Long(self.optioniv)),
             "GPIBIV" => Some(EpicsValue::Long(self.gpibiv)),
@@ -3871,7 +3873,7 @@ impl Record for AsynRecord {
             "OMAX" => Some(EpicsValue::Long(self.omax)),
             "NOWT" => Some(EpicsValue::Long(self.nowt)),
             "NAWT" => Some(EpicsValue::Long(self.nawt)),
-            "OFMT" => Some(EpicsValue::Short(self.ofmt as i16)),
+            "OFMT" => Some(EpicsValue::Enum(self.ofmt as u16)),
             "AINP" => Some(EpicsValue::String(self.ainp.clone().into())),
             "TINP" => Some(EpicsValue::String(self.tinp.clone().into())),
             "IEOS" => Some(EpicsValue::String(self.ieos.clone().into())),
@@ -3879,8 +3881,8 @@ impl Record for AsynRecord {
             "IMAX" => Some(EpicsValue::Long(self.imax)),
             "NRRD" => Some(EpicsValue::Long(self.nrrd)),
             "NORD" => Some(EpicsValue::Long(self.nord)),
-            "IFMT" => Some(EpicsValue::Short(self.ifmt as i16)),
-            "EOMR" => Some(EpicsValue::Short(self.eomr as i16)),
+            "IFMT" => Some(EpicsValue::Enum(self.ifmt as u16)),
+            "EOMR" => Some(EpicsValue::Enum(self.eomr as u16)),
             "I32INP" => Some(EpicsValue::Long(self.i32inp)),
             "I32OUT" => Some(EpicsValue::Long(self.i32out)),
             "UI32INP" => Some(EpicsValue::Long(self.ui32inp as i32)),
@@ -3888,42 +3890,42 @@ impl Record for AsynRecord {
             "UI32MASK" => Some(EpicsValue::Long(self.ui32mask as i32)),
             "F64INP" => Some(EpicsValue::Double(self.f64inp)),
             "F64OUT" => Some(EpicsValue::Double(self.f64out)),
-            "BAUD" => Some(EpicsValue::Short(self.baud as i16)),
+            "BAUD" => Some(EpicsValue::Enum(self.baud as u16)),
             "LBAUD" => Some(EpicsValue::Long(self.lbaud)),
-            "PRTY" => Some(EpicsValue::Short(self.prty as i16)),
-            "DBIT" => Some(EpicsValue::Short(self.dbit as i16)),
-            "SBIT" => Some(EpicsValue::Short(self.sbit as i16)),
-            "MCTL" => Some(EpicsValue::Short(self.mctl as i16)),
-            "FCTL" => Some(EpicsValue::Short(self.fctl as i16)),
-            "IXON" => Some(EpicsValue::Short(self.ixon as i16)),
-            "IXOFF" => Some(EpicsValue::Short(self.ixoff as i16)),
-            "IXANY" => Some(EpicsValue::Short(self.ixany as i16)),
+            "PRTY" => Some(EpicsValue::Enum(self.prty as u16)),
+            "DBIT" => Some(EpicsValue::Enum(self.dbit as u16)),
+            "SBIT" => Some(EpicsValue::Enum(self.sbit as u16)),
+            "MCTL" => Some(EpicsValue::Enum(self.mctl as u16)),
+            "FCTL" => Some(EpicsValue::Enum(self.fctl as u16)),
+            "IXON" => Some(EpicsValue::Enum(self.ixon as u16)),
+            "IXOFF" => Some(EpicsValue::Enum(self.ixoff as u16)),
+            "IXANY" => Some(EpicsValue::Enum(self.ixany as u16)),
             "HOSTINFO" => Some(EpicsValue::String(self.hostinfo.clone().into())),
-            "DRTO" => Some(EpicsValue::Short(self.drto as i16)),
-            "UCMD" => Some(EpicsValue::Short(self.ucmd as i16)),
-            "ACMD" => Some(EpicsValue::Short(self.acmd as i16)),
+            "DRTO" => Some(EpicsValue::Enum(self.drto as u16)),
+            "UCMD" => Some(EpicsValue::Enum(self.ucmd as u16)),
+            "ACMD" => Some(EpicsValue::Enum(self.acmd as u16)),
             "SPR" => Some(EpicsValue::Char(self.spr as u8)),
             "TMSK" => Some(EpicsValue::Long(self.tmsk)),
-            "TB0" => Some(EpicsValue::Short(self.tb0 as i16)),
-            "TB1" => Some(EpicsValue::Short(self.tb1 as i16)),
-            "TB2" => Some(EpicsValue::Short(self.tb2 as i16)),
-            "TB3" => Some(EpicsValue::Short(self.tb3 as i16)),
-            "TB4" => Some(EpicsValue::Short(self.tb4 as i16)),
-            "TB5" => Some(EpicsValue::Short(self.tb5 as i16)),
+            "TB0" => Some(EpicsValue::Enum(self.tb0 as u16)),
+            "TB1" => Some(EpicsValue::Enum(self.tb1 as u16)),
+            "TB2" => Some(EpicsValue::Enum(self.tb2 as u16)),
+            "TB3" => Some(EpicsValue::Enum(self.tb3 as u16)),
+            "TB4" => Some(EpicsValue::Enum(self.tb4 as u16)),
+            "TB5" => Some(EpicsValue::Enum(self.tb5 as u16)),
             "TIOM" => Some(EpicsValue::Long(self.tiom)),
-            "TIB0" => Some(EpicsValue::Short(self.tib0 as i16)),
-            "TIB1" => Some(EpicsValue::Short(self.tib1 as i16)),
-            "TIB2" => Some(EpicsValue::Short(self.tib2 as i16)),
+            "TIB0" => Some(EpicsValue::Enum(self.tib0 as u16)),
+            "TIB1" => Some(EpicsValue::Enum(self.tib1 as u16)),
+            "TIB2" => Some(EpicsValue::Enum(self.tib2 as u16)),
             "TINM" => Some(EpicsValue::Long(self.tinm)),
-            "TINB0" => Some(EpicsValue::Short(self.tinb0 as i16)),
-            "TINB1" => Some(EpicsValue::Short(self.tinb1 as i16)),
-            "TINB2" => Some(EpicsValue::Short(self.tinb2 as i16)),
-            "TINB3" => Some(EpicsValue::Short(self.tinb3 as i16)),
+            "TINB0" => Some(EpicsValue::Enum(self.tinb0 as u16)),
+            "TINB1" => Some(EpicsValue::Enum(self.tinb1 as u16)),
+            "TINB2" => Some(EpicsValue::Enum(self.tinb2 as u16)),
+            "TINB3" => Some(EpicsValue::Enum(self.tinb3 as u16)),
             "TSIZ" => Some(EpicsValue::Long(self.tsiz)),
             "TFIL" => Some(EpicsValue::String(self.tfil.clone().into())),
-            "AUCT" => Some(EpicsValue::Short(self.auct as i16)),
-            "CNCT" => Some(EpicsValue::Short(self.cnct as i16)),
-            "ENBL" => Some(EpicsValue::Short(self.enbl as i16)),
+            "AUCT" => Some(EpicsValue::Enum(self.auct as u16)),
+            "CNCT" => Some(EpicsValue::Enum(self.cnct as u16)),
+            "ENBL" => Some(EpicsValue::Enum(self.enbl as u16)),
             "VAL" => Some(EpicsValue::Long(self.val)),
             "ERRS" => Some(EpicsValue::String(self.errs.clone().into())),
             "AQR" => Some(EpicsValue::Char(self.aqr as u8)),
@@ -4807,14 +4809,16 @@ mod tests {
         assert_eq!(rec.field_list().len(), 76);
     }
 
-    /// Every asynRecord `DBF_MENU` field must (a) serve enum choice strings
-    /// and (b) hold its value as a `Short` menu index, so the framework
-    /// promotes it to `DBR_ENUM`. Regression guard for the blank
-    /// choice-button / menu widget symptom (field served as a plain `Short`
-    /// with no states). The 34 names are the full `field(...,DBF_MENU)` set
-    /// in asynRecord.dbd.
+    /// Every asynRecord `DBF_MENU` field must (a) serve enum choice strings,
+    /// (b) DECLARE its native type as `Enum`, and (c) serve its value as an
+    /// `Enum`. Measured against the compiled C IOC: a `DBF_MENU` field's native
+    /// CA type is `DBF_ENUM` and `caget` returns the label, so declaring the
+    /// field a `Short` makes `caget X.TMOD` answer `2` where C answers
+    /// `Write/Read` and leaves every menu widget on the shipped asynRecord OPI
+    /// screens unable to enumerate its states. The 34 names are the full
+    /// `field(...,DBF_MENU)` set in asynRecord.dbd.
     #[test]
-    fn menu_fields_have_choices_and_short_values() {
+    fn menu_fields_are_declared_and_served_as_enum() {
         let rec = AsynRecord::default();
         const MENU_FIELDS: &[&str] = &[
             "TMOD", "IFACE", "OFMT", "IFMT", "EOMR", "TB0", "TB1", "TB2", "TB3", "TB4", "TB5",
@@ -4830,10 +4834,29 @@ mod tests {
                 !choices.unwrap().is_empty(),
                 "{f} choices must be non-empty"
             );
-            assert!(
-                matches!(rec.get_field(f), Some(EpicsValue::Short(_))),
-                "{f} value must be a Short menu index for DBR_ENUM promotion"
+            let desc = rec
+                .field_list()
+                .iter()
+                .find(|d| d.name == *f)
+                .unwrap_or_else(|| panic!("{f} must be declared"));
+            assert_eq!(
+                desc.dbf_type,
+                DbFieldType::Enum,
+                "{f} is DBF_MENU: its native type must be Enum, as in C"
             );
+            assert!(
+                matches!(rec.get_field(f), Some(EpicsValue::Enum(_))),
+                "{f} must be served as an Enum so a client reads the label"
+            );
+        }
+        // No DBF_MENU field may be left declared as a bare Short — the
+        // declared-Enum set and the menu-choice set are the same 34 fields.
+        for desc in rec.field_list() {
+            if rec.menu_field_choices(desc.name).is_some() {
+                assert_eq!(desc.dbf_type, DbFieldType::Enum, "{}", desc.name);
+            } else {
+                assert_ne!(desc.dbf_type, DbFieldType::Enum, "{}", desc.name);
+            }
         }
     }
 
@@ -8758,17 +8781,17 @@ mod tests {
         assert_eq!(g.record.get_field("TMSK"), Some(EpicsValue::Long(want)));
         assert_eq!(
             g.record.get_field("TB0"),
-            Some(EpicsValue::Short(1)),
+            Some(EpicsValue::Enum(1)),
             "ERROR bit posted"
         );
         assert_eq!(
             g.record.get_field("TB4"),
-            Some(EpicsValue::Short(1)),
+            Some(EpicsValue::Enum(1)),
             "FLOW bit posted"
         );
         assert_eq!(
             g.record.get_field("TB1"),
-            Some(EpicsValue::Short(0)),
+            Some(EpicsValue::Enum(0)),
             "IO_DEVICE bit stays clear"
         );
     }
@@ -9247,7 +9270,7 @@ mod tests {
         for _ in 0..2000 {
             let inst = db.get_record(rec_name).await.unwrap();
             let got = inst.read().await.record.get_field("CNCT");
-            if got == Some(EpicsValue::Short(0)) {
+            if got == Some(EpicsValue::Enum(0)) {
                 posted = true;
                 break;
             }
@@ -9262,8 +9285,8 @@ mod tests {
         // POST_IF_NEW leaves them alone — the record still shows them true.
         let inst = db.get_record(rec_name).await.unwrap();
         let g = inst.read().await;
-        assert_eq!(g.record.get_field("ENBL"), Some(EpicsValue::Short(1)));
-        assert_eq!(g.record.get_field("AUCT"), Some(EpicsValue::Short(1)));
+        assert_eq!(g.record.get_field("ENBL"), Some(EpicsValue::Enum(1)));
+        assert_eq!(g.record.get_field("AUCT"), Some(EpicsValue::Enum(1)));
     }
 
     /// R8-55, the no-database fallback boundary: a record with no `async_ctx`

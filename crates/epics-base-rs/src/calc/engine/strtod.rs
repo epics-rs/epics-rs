@@ -22,6 +22,8 @@
 //! into CALC_ERR_BAD_LITERAL. Carrying it here means neither caller has to
 //! re-derive it from the value.
 
+use crate::runtime::stdlib::HexSignificand;
+
 /// C `strtod`'s three results: the value, how far it read, and `errno`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Strtod {
@@ -83,19 +85,25 @@ fn magnitude(s: &[u8]) -> Option<(f64, usize, bool)> {
         return Some((f64::NAN, 3 + nan_char_sequence(&s[3..]), false));
     }
     if s.len() > 2 && s[0] == b'0' && matches!(s[1], b'x' | b'X') && s[2].is_ascii_hexdigit() {
-        let (v, len, nonzero) = hex(s);
-        return Some((v, len, ranged_out(v, nonzero)));
+        return Some(hex(s));
     }
     decimal(s)
 }
 
-/// C `errno = ERANGE`: the conversion could not represent a nonzero number.
+/// C `errno = ERANGE` for the DECIMAL path: the conversion could not represent
+/// a nonzero number.
 ///
 /// Overflow gives an infinity; underflow gives a subnormal or a zero — glibc
 /// raises ERANGE for BOTH, which is why compiled base postfix rejects
 /// `2.2e-308` (subnormal) and accepts `2.3e-308` (the smallest normal decade),
 /// and why it accepts `0e999`: a zero significand names zero exactly, so there
 /// is nothing to round away.
+///
+/// Strictly, glibc's rule is tiny AND inexact, so a decimal literal naming a
+/// subnormal EXACTLY would leave errno clear here where this says ERANGE. That
+/// takes upwards of 750 significant digits to write (`2^-1074` in decimal), and
+/// no shorter literal can hit one; the hex path, where such a literal is three
+/// characters long, gets the exact test from [`HexSignificand::to_f64`].
 fn ranged_out(value: f64, significand_is_nonzero: bool) -> bool {
     significand_is_nonzero && (value.is_infinite() || value.abs() < f64::MIN_POSITIVE)
 }
@@ -118,35 +126,32 @@ fn nan_char_sequence(s: &[u8]) -> usize {
 }
 
 /// A C99 hexadecimal significand with an optional binary (`p`) exponent. The
-/// caller has already checked that `s` starts `0x<hexdigit>`. The third result
-/// is whether the significand names a nonzero number — the precondition for
-/// ERANGE.
+/// caller has already checked that `s` starts `0x<hexdigit>`. The second result
+/// is ERANGE, which [`HexSignificand`] knows exactly — the digits are kept as
+/// an exact integer and rounded to `f64` once, so a subnormal that IS
+/// representable (`0x1p-1074`) is not mistaken for an underflow.
 fn hex(s: &[u8]) -> (f64, usize, bool) {
     let mut i = 2;
-    let mut value = 0.0f64;
-    let mut nonzero = false;
+    let mut sig = HexSignificand::new();
     while i < s.len() && s[i].is_ascii_hexdigit() {
-        nonzero |= s[i] != b'0';
-        value = value * 16.0 + hex_digit(s[i]) as f64;
+        sig.push_digit(hex_digit(s[i]), false);
         i += 1;
     }
     if i < s.len() && s[i] == b'.' {
         i += 1;
-        let mut scale = 1.0 / 16.0;
         while i < s.len() && s[i].is_ascii_hexdigit() {
-            nonzero |= s[i] != b'0';
-            value += hex_digit(s[i]) as f64 * scale;
-            scale /= 16.0;
+            sig.push_digit(hex_digit(s[i]), true);
             i += 1;
         }
     }
     if i < s.len() && matches!(s[i], b'p' | b'P') {
         if let Some((exp, len)) = exponent(&s[i..]) {
-            value *= 2.0f64.powi(exp);
+            sig.apply_binary_exponent(exp);
             i += len;
         }
     }
-    (value, i, nonzero)
+    let (value, erange) = sig.to_f64();
+    (value, i, erange)
 }
 
 /// Digits with at most one `.`, then an optional decimal (`e`) exponent. The

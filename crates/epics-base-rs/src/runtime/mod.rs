@@ -2,6 +2,7 @@ pub mod env;
 pub mod general_time;
 pub mod log;
 pub mod net;
+pub mod stdlib;
 pub mod supervise;
 pub mod sync;
 pub mod task;

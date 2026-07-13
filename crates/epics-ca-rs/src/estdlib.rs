@@ -13,6 +13,7 @@
 //! now resolves through [`env_double`] + [`duration_from_secs`], so no
 //! environment string can panic the process.
 
+use epics_base_rs::runtime::stdlib::HexSignificand;
 use std::time::Duration;
 
 /// C `isspace()` in the "C" locale — `strtod`'s leading/trailing skip set.
@@ -41,12 +42,20 @@ enum Erange {
     Under,
 }
 
-/// ERANGE classification for a value `strtod` computed from digits.
+/// ERANGE classification for a value the DECIMAL path computed from digits.
 ///
 /// glibc raises ERANGE when the result overflows to infinity, when it
 /// underflows to zero, and when it is inexactly representable as a
 /// subnormal. It does NOT raise it for the `inf` / `nan` *words*, which
 /// is why those are classified separately at their parse site.
+///
+/// The "inexactly" is the whole rule in glibc — a subnormal it can name
+/// exactly leaves errno clear. Writing one in decimal takes some 750
+/// significant digits (`2^-1074`), so every decimal literal short enough to
+/// appear in an env var and land in the subnormal range is inexact, and this
+/// value-only test agrees with C on all of them. The hex path, where such a
+/// literal is three characters long, does NOT use this: it gets the exact
+/// inexactness from [`HexSignificand::to_f64`].
 fn classify(v: f64, mantissa_nonzero: bool) -> Erange {
     if v.is_infinite() {
         Erange::Over
@@ -86,13 +95,10 @@ fn strtod(s: &str) -> (f64, usize, Erange) {
     // C99 hex float: 0x <hexdigits> [. <hexdigits>] [p [+-] <digits>]
     if num + 1 < b.len() && b[num] == b'0' && (b[num + 1] | 0x20) == b'x' {
         let mut j = num + 2;
-        let mut mant = 0.0f64;
+        let mut sig = HexSignificand::new();
         let mut digits = 0usize;
-        let mut nonzero = false;
-        let mut exp: i32 = 0;
         while j < b.len() && b[j].is_ascii_hexdigit() {
-            mant = mant * 16.0 + hex_val(b[j]) as f64;
-            nonzero |= b[j] != b'0';
+            sig.push_digit(hex_val(b[j]), false);
             digits += 1;
             j += 1;
         }
@@ -100,9 +106,7 @@ fn strtod(s: &str) -> (f64, usize, Erange) {
             let mut k = j + 1;
             let mut frac = 0usize;
             while k < b.len() && b[k].is_ascii_hexdigit() {
-                mant = mant * 16.0 + hex_val(b[k]) as f64;
-                nonzero |= b[k] != b'0';
-                exp = exp.saturating_sub(4);
+                sig.push_digit(hex_val(b[k]), true);
                 frac += 1;
                 k += 1;
             }
@@ -129,21 +133,27 @@ fn strtod(s: &str) -> (f64, usize, Erange) {
                 k += 1;
             }
             if k > digits_at {
-                exp = exp.saturating_add(if eneg { -e } else { e });
+                sig.apply_binary_exponent(if eneg { -e } else { e });
                 j = k;
             }
         }
-        // `powi` saturates to inf / 0, so an absurd exponent lands as
-        // ERANGE rather than as garbage.
-        let mut v = if mant.is_finite() {
-            mant * 2.0f64.powi(exp.clamp(-5000, 5000))
-        } else {
-            f64::INFINITY
-        };
+        // The significand is exact and rounds to `f64` in one step, so ERANGE
+        // is known rather than guessed back from the value: an exactly
+        // representable subnormal (`0x1p-1074`, `0x1p-1023`) leaves errno
+        // clear, as it does in glibc.
+        let (mut v, erange) = sig.to_f64();
         if neg {
             v = -v;
         }
-        let erange = classify(v, nonzero);
+        // C derives underflow-vs-overflow from the value alone
+        // (`epicsStdlib.c:164`), and so does `epics_parse_double` below.
+        let erange = if !erange {
+            Erange::No
+        } else if v == 0.0 {
+            Erange::Under
+        } else {
+            Erange::Over
+        };
         return (v, j, erange);
     }
 
@@ -357,6 +367,61 @@ mod tests {
             epics_parse_double("0x"),
             Err(ParseDoubleError::Extraneous),
             "strtod consumes only the '0', so 'x' is extraneous"
+        );
+    }
+
+    /// The subnormal boundary, every row probed against the compiled glibc
+    /// `strtod`. A hex float names a subnormal EXACTLY in three characters,
+    /// and glibc returns it with errno clear — `mant * 2f64.powi(exp)` used to
+    /// scale by an infinite reciprocal here and report the whole range as an
+    /// underflow.
+    #[test]
+    fn parses_hex_floats_across_the_subnormal_boundary() {
+        // Exactly representable: a value, not an error.
+        assert_eq!(
+            epics_parse_double("0x1p-1074").map(f64::to_bits),
+            Ok(0x0000_0000_0000_0001),
+            "the smallest subnormal"
+        );
+        assert_eq!(
+            epics_parse_double("0x1p-1023").map(f64::to_bits),
+            Ok(0x0008_0000_0000_0000)
+        );
+        assert_eq!(
+            epics_parse_double("-0x1p-1074").map(f64::to_bits),
+            Ok(0x8000_0000_0000_0001)
+        );
+        assert_eq!(
+            epics_parse_double("0x1p-1022").map(f64::to_bits),
+            Ok(0x0010_0000_0000_0000),
+            "the smallest normal"
+        );
+        // A zero significand names zero exactly, at any exponent.
+        assert_eq!(epics_parse_double("0x0p-5000"), Ok(0.0));
+
+        // Tiny AND inexact: ERANGE. C reports a non-zero one as overflow and a
+        // zero one as underflow (`epicsStdlib.c:164`).
+        assert_eq!(
+            epics_parse_double("0x1.8p-1075"),
+            Err(ParseDoubleError::Overflow)
+        );
+        assert_eq!(
+            epics_parse_double("0x1.fffffffffffffp-1023"),
+            Err(ParseDoubleError::Overflow),
+            "tiny before rounding, though it rounds up to the smallest normal"
+        );
+        assert_eq!(
+            epics_parse_double("0x1p-1075"),
+            Err(ParseDoubleError::Underflow),
+            "exactly half of the smallest subnormal ties to even, i.e. to zero"
+        );
+        assert_eq!(
+            epics_parse_double("0x1p-2000"),
+            Err(ParseDoubleError::Underflow)
+        );
+        assert_eq!(
+            epics_parse_double("0x1p1024"),
+            Err(ParseDoubleError::Overflow)
         );
     }
 

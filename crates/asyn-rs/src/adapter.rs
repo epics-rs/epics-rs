@@ -9,6 +9,7 @@ use epics_base_rs::types::EpicsValue;
 use crate::error::AsynError;
 use crate::interfaces::InterfaceType;
 use crate::interrupt::{InterruptFilter, InterruptSubscription};
+use crate::port::DrvUserRequest;
 use crate::port_handle::{AsyncCompletionHandle, PortHandle};
 use crate::request::{RequestOp, RequestResult};
 use crate::user::AsynUser;
@@ -1641,11 +1642,12 @@ impl DeviceSupport for AsynDeviceSupport {
         if !self.reason_set {
             // Pass the record's asyn `addr`: a multi-device driver (e.g. modbus)
             // rejects an out-of-range offset here at bind time (C `drvUserCreate`
-            // `checkOffset`) instead of alarming on every I/O.
-            match self
-                .handle
-                .drv_user_create_blocking(&self.drv_info, self.addr)
-            {
+            // `checkOffset`) instead of alarming on every I/O. Pass the record's
+            // interface (from its DTYP): an on-demand driver must create the
+            // parameter with the type this record will read it as — C
+            // `adsAsynPortDriver::getRecordInfoFromDrvInfo`.
+            let req = DrvUserRequest::new(&self.drv_info, self.addr).with_iface(self.iface);
+            match self.handle.drv_user_create_blocking(&req) {
                 Ok(info) => {
                     self.reason = info.reason;
                     // Per-record octet cap (C `modbusDrvUser_t.len`); applied to
@@ -5444,8 +5446,7 @@ mod tests {
             }
             fn drv_user_create(
                 &mut self,
-                _drv_info: &str,
-                _addr: i32,
+                _req: &DrvUserRequest,
             ) -> crate::error::AsynResult<crate::port::DrvUserInfo> {
                 Ok(crate::port::DrvUserInfo {
                     reason: 0,
@@ -5499,6 +5500,117 @@ mod tests {
         let mut rec = LsiRecord::new("");
         ads.init(&mut rec).unwrap();
         assert_eq!(ads.octet_max_size, 256);
+    }
+
+    /// A record's bind carries the asyn interface it will read the parameter
+    /// through (from its DTYP), so an on-demand driver creates the parameter
+    /// with that type instead of guessing.
+    ///
+    /// C parity: `adsAsynPortDriver::getRecordInfoFromDrvInfo` derives each
+    /// parameter's asyn type from the bound record's DTYP — the same PLC symbol
+    /// may bind as `asynInt32` from one record and `asynFloat64` from another.
+    /// Without the interface at bind, a lazily-created parameter can only be
+    /// guessed from the drvInfo string, and a wrong guess feeds the record a
+    /// value of the wrong `ParamValue` variant on every I/O Intr callback.
+    #[test]
+    fn drv_user_create_receives_the_records_interface() {
+        /// What the driver saw and what it therefore created, per bind.
+        type Binds = Arc<std::sync::Mutex<Vec<(String, Option<InterfaceType>, ParamType)>>>;
+
+        /// An on-demand driver (C Autoparam lazy creation): it holds no
+        /// parameters up front and creates one per drvInfo as records bind,
+        /// typed by the interface the record announced.
+        struct OnDemandPort {
+            base: PortDriverBase,
+            binds: Binds,
+        }
+        impl PortDriver for OnDemandPort {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn drv_user_create(
+                &mut self,
+                req: &DrvUserRequest,
+            ) -> crate::error::AsynResult<crate::port::DrvUserInfo> {
+                let param_type = match req.iface {
+                    Some(InterfaceType::Float64) => ParamType::Float64,
+                    Some(InterfaceType::Int32) => ParamType::Int32,
+                    Some(InterfaceType::Octet) => ParamType::Octet,
+                    // No interface announced: the driver has nothing to honour.
+                    _ => ParamType::Int32,
+                };
+                self.binds
+                    .lock()
+                    .unwrap()
+                    .push((req.drv_info.clone(), req.iface, param_type));
+                let reason = self.base_mut().create_param(&req.drv_info, param_type)?;
+                Ok(crate::port::DrvUserInfo::from_reason(reason))
+            }
+        }
+
+        /// Bind one record on `iface_type` to the drvInfo `SYMBOL` and return
+        /// what the driver was told at bind.
+        fn bind(iface_type: &str, init: impl FnOnce(&mut AsynDeviceSupport)) -> Binds {
+            let binds: Binds = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let driver = OnDemandPort {
+                base: PortDriverBase::new("ondemand", 1, PortFlags::default()),
+                binds: Arc::clone(&binds),
+            };
+            let interrupts = Arc::new(InterruptManager::new(256));
+            let (tx, rx) = tokio::sync::mpsc::channel(256);
+            let actor = PortActor::new(Box::new(driver), rx);
+            let actor_id = actor.id();
+            std::thread::Builder::new()
+                .name("ondemand-actor".into())
+                .spawn(move || actor.run())
+                .unwrap();
+            let handle = PortHandle::new(tx, "ondemand".into(), interrupts, actor_id);
+            let link = AsynLink {
+                port_name: "ondemand".into(),
+                addr: 0,
+                timeout: Duration::from_secs(1),
+                drv_info: "SYMBOL".into(),
+            };
+            let mut ads = AsynDeviceSupport::from_handle(handle, link, iface_type);
+            ads.set_record_info("TEST:SYMBOL", ScanType::Passive);
+            init(&mut ads);
+            binds
+        }
+
+        use epics_base_rs::server::records::ai::AiRecord;
+        use epics_base_rs::server::records::longin::LonginRecord;
+
+        // The same drvInfo bound by an `ai` with DTYP=asynFloat64: the driver
+        // must be told Float64 and create a Float64 parameter.
+        let binds = bind("asynFloat64", |ads| {
+            let mut rec = AiRecord::new(0.0);
+            ads.init(&mut rec).unwrap();
+        });
+        assert_eq!(
+            binds.lock().unwrap().as_slice(),
+            [(
+                "SYMBOL".to_string(),
+                Some(InterfaceType::Float64),
+                ParamType::Float64
+            )]
+        );
+
+        // The same drvInfo bound by a `longin` with DTYP=asynInt32: Int32.
+        let binds = bind("asynInt32", |ads| {
+            let mut rec = LonginRecord::new(0);
+            ads.init(&mut rec).unwrap();
+        });
+        assert_eq!(
+            binds.lock().unwrap().as_slice(),
+            [(
+                "SYMBOL".to_string(),
+                Some(InterfaceType::Int32),
+                ParamType::Int32
+            )]
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6779,8 +6891,7 @@ mod tests {
         // the test need not pre-register params on the mock.
         fn drv_user_create(
             &mut self,
-            _drv_info: &str,
-            _addr: i32,
+            _req: &DrvUserRequest,
         ) -> AsynResult<crate::port::DrvUserInfo> {
             Ok(crate::port::DrvUserInfo::from_reason(0))
         }

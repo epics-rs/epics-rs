@@ -698,8 +698,8 @@ impl PortActor {
                 }
                 Ok(RequestResult::write_ok())
             }
-            RequestOp::DrvUserCreate { drv_info, addr } => {
-                let info = self.driver.drv_user_create(drv_info, *addr)?;
+            RequestOp::DrvUserCreate(req) => {
+                let info = self.driver.drv_user_create(req)?;
                 Ok(RequestResult::drv_user_create(
                     info.reason,
                     info.max_octet_len,

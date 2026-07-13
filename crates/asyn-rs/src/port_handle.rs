@@ -14,7 +14,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::error::{AsynError, AsynResult, AsynStatus};
 use crate::interrupt::InterruptManager;
-use crate::port::DrvUserInfo;
+use crate::port::{DrvUserInfo, DrvUserRequest};
 use crate::port_actor::{ActorId, ActorMessage};
 use crate::request::{CancelToken, RequestOp, RequestResult};
 use crate::user::AsynUser;
@@ -460,20 +460,14 @@ impl PortHandle {
         Ok(())
     }
 
-    /// Resolve a drvInfo (and asyn `addr`) to its shared reason index. The async
-    /// port-handle path needs only the reason; the per-record [`DrvUserInfo`]
+    /// Resolve a bind request ([`DrvUserRequest`]) to its shared reason index. The
+    /// async port-handle path needs only the reason; the per-record [`DrvUserInfo`]
     /// (string-length cap etc.) is surfaced on the record-binding blocking path
     /// [`drv_user_create_blocking`](Self::drv_user_create_blocking).
-    pub async fn drv_user_create(&self, drv_info: &str, addr: i32) -> AsynResult<usize> {
-        let user = AsynUser::default().with_addr(addr);
+    pub async fn drv_user_create(&self, req: &DrvUserRequest) -> AsynResult<usize> {
+        let user = AsynUser::default().with_addr(req.addr);
         let result = self
-            .submit_async(
-                RequestOp::DrvUserCreate {
-                    drv_info: drv_info.to_string(),
-                    addr,
-                },
-                user,
-            )
+            .submit_async(RequestOp::DrvUserCreate(req.clone()), user)
             .await?;
         result.reason.ok_or_else(|| AsynError::Status {
             status: AsynStatus::Error,
@@ -569,15 +563,9 @@ impl PortHandle {
 
     // --- Sync convenience methods ---
 
-    pub fn drv_user_create_blocking(&self, drv_info: &str, addr: i32) -> AsynResult<DrvUserInfo> {
-        let user = AsynUser::default().with_addr(addr);
-        let result = self.submit_blocking(
-            RequestOp::DrvUserCreate {
-                drv_info: drv_info.to_string(),
-                addr,
-            },
-            user,
-        )?;
+    pub fn drv_user_create_blocking(&self, req: &DrvUserRequest) -> AsynResult<DrvUserInfo> {
+        let user = AsynUser::default().with_addr(req.addr);
+        let result = self.submit_blocking(RequestOp::DrvUserCreate(req.clone()), user)?;
         let reason = result.reason.ok_or_else(|| AsynError::Status {
             status: AsynStatus::Error,
             message: "drv_user_create returned no reason".into(),

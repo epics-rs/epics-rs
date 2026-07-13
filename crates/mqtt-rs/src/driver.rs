@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use asyn_rs::error::{AsynError, AsynResult};
 use asyn_rs::param::ParamType;
-use asyn_rs::port::{DrvUserInfo, PortDriver, PortDriverBase, PortFlags};
+use asyn_rs::port::{DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::user::AsynUser;
 use tokio::sync::mpsc;
 
@@ -216,7 +216,11 @@ impl PortDriver for MqttDriver {
         &mut self.base
     }
 
-    fn drv_user_create(&mut self, drv_info: &str, _addr: i32) -> AsynResult<DrvUserInfo> {
+    fn drv_user_create(&mut self, req: &DrvUserRequest) -> AsynResult<DrvUserInfo> {
+        // The MQTT drvInfo names the payload type (`FLAT:INT`, `JSON:STRING`, …),
+        // so the on-demand parameter type comes from the drvInfo, not from the
+        // bound record's interface (`req.iface`).
+        let drv_info = req.drv_info.as_str();
         // C parity: `Autoparam::Driver::drvUserCreate` parses the reason into a
         // device address and creates the parameter on demand, reusing the
         // existing one for an equal address (`createParam` dedup by
@@ -390,7 +394,9 @@ mod tests {
         // would (`drv_user_create`).
         let mut driver = MqttDriver::new("TEST", &config, Vec::new(), tx, connected);
         for t in topics {
-            driver.drv_user_create(t, 0).expect("on-demand create");
+            driver
+                .drv_user_create(&DrvUserRequest::new(*t, 0))
+                .expect("on-demand create");
         }
         (driver, rx)
     }
@@ -406,7 +412,7 @@ mod tests {
         let connected = Arc::new(AtomicBool::new(false));
         let mut driver = MqttDriver::new("TEST", &config, Vec::new(), tx, connected.clone());
         let reason = driver
-            .drv_user_create("FLAT:INT test/int_topic", 0)
+            .drv_user_create(&DrvUserRequest::new("FLAT:INT test/int_topic", 0))
             .unwrap()
             .reason;
         let mut user = AsynUser::new(reason);
@@ -436,7 +442,7 @@ mod tests {
         let connected = Arc::new(AtomicBool::new(false));
         let mut driver = MqttDriver::new("TEST", &config, Vec::new(), tx, connected.clone());
         let reason = driver
-            .drv_user_create("FLAT:DIGITAL test/digital_topic", 0)
+            .drv_user_create(&DrvUserRequest::new("FLAT:DIGITAL test/digital_topic", 0))
             .unwrap()
             .reason;
         let mut user = AsynUser::new(reason);
@@ -483,17 +489,17 @@ mod tests {
         // same drvInfo returns the same reason; a different address gets its own.
         let (mut driver, _rx) = make_driver(&[]);
         let a1 = driver
-            .drv_user_create("FLAT:INT test/int_topic", 0)
+            .drv_user_create(&DrvUserRequest::new("FLAT:INT test/int_topic", 0))
             .unwrap()
             .reason;
         let a2 = driver
-            .drv_user_create("FLAT:INT test/int_topic", 0)
+            .drv_user_create(&DrvUserRequest::new("FLAT:INT test/int_topic", 0))
             .unwrap()
             .reason;
         assert_eq!(a1, a2, "same address must reuse the same parameter");
 
         let b = driver
-            .drv_user_create("FLAT:FLOAT test/float_topic", 0)
+            .drv_user_create(&DrvUserRequest::new("FLAT:FLOAT test/float_topic", 0))
             .unwrap()
             .reason;
         assert_ne!(a1, b, "a distinct address gets its own parameter");
@@ -504,10 +510,18 @@ mod tests {
         // Born-empty driver: a valid topic never pre-registered is created on
         // demand when a record binds (C: `Autoparam::Driver` lazy `createParam`).
         let (mut driver, _rx) = make_driver(&[]);
-        assert!(driver.drv_user_create("FLAT:FLOAT other/topic", 0).is_ok());
+        assert!(
+            driver
+                .drv_user_create(&DrvUserRequest::new("FLAT:FLOAT other/topic", 0))
+                .is_ok()
+        );
         // A drvInfo that is neither a valid topic address nor an internal param
         // name is rejected.
-        assert!(driver.drv_user_create("not a topic address", 0).is_err());
+        assert!(
+            driver
+                .drv_user_create(&DrvUserRequest::new("not a topic address", 0))
+                .is_err()
+        );
     }
 
     #[test]
@@ -524,7 +538,7 @@ mod tests {
         let mut driver = MqttDriver::new("TEST", &config, vec![overlaid], tx, connected);
 
         let on_demand = driver
-            .drv_user_create("JSON:STRING zigbee/x state", 0)
+            .drv_user_create(&DrvUserRequest::new("JSON:STRING zigbee/x state", 0))
             .unwrap()
             .reason;
         assert!(
@@ -537,7 +551,7 @@ mod tests {
 
         // A topic with no overlay entry uses the parsed address verbatim.
         let plain = driver
-            .drv_user_create("JSON:STRING zigbee/y state", 0)
+            .drv_user_create(&DrvUserRequest::new("JSON:STRING zigbee/y state", 0))
             .unwrap()
             .reason;
         assert!(
@@ -565,7 +579,7 @@ mod tests {
     fn write_int32_sends_publish_request() {
         let (mut driver, mut rx) = make_driver(&["FLAT:INT test/int_topic"]);
         let reason = driver
-            .drv_user_create("FLAT:INT test/int_topic", 0)
+            .drv_user_create(&DrvUserRequest::new("FLAT:INT test/int_topic", 0))
             .unwrap()
             .reason;
         let mut user = AsynUser::new(reason);
@@ -581,7 +595,7 @@ mod tests {
     fn write_float64_sends_publish_request() {
         let (mut driver, mut rx) = make_driver(&["FLAT:FLOAT test/float_topic"]);
         let reason = driver
-            .drv_user_create("FLAT:FLOAT test/float_topic", 0)
+            .drv_user_create(&DrvUserRequest::new("FLAT:FLOAT test/float_topic", 0))
             .unwrap()
             .reason;
         let mut user = AsynUser::new(reason);
@@ -598,7 +612,7 @@ mod tests {
     fn write_octet_sends_publish_request() {
         let (mut driver, mut rx) = make_driver(&["FLAT:STRING test/str_topic"]);
         let reason = driver
-            .drv_user_create("FLAT:STRING test/str_topic", 0)
+            .drv_user_create(&DrvUserRequest::new("FLAT:STRING test/str_topic", 0))
             .unwrap()
             .reason;
         let mut user = AsynUser::new(reason);
@@ -617,7 +631,7 @@ mod tests {
     fn write_octet_truncates_published_payload_at_first_nul() {
         let (mut driver, mut rx) = make_driver(&["FLAT:STRING test/str_topic"]);
         let reason = driver
-            .drv_user_create("FLAT:STRING test/str_topic", 0)
+            .drv_user_create(&DrvUserRequest::new("FLAT:STRING test/str_topic", 0))
             .unwrap()
             .reason;
         let mut user = AsynUser::new(reason);
@@ -638,7 +652,7 @@ mod tests {
     fn write_octet_flat_publishes_raw_non_utf8_bytes() {
         let (mut driver, mut rx) = make_driver(&["FLAT:STRING test/bin"]);
         let reason = driver
-            .drv_user_create("FLAT:STRING test/bin", 0)
+            .drv_user_create(&DrvUserRequest::new("FLAT:STRING test/bin", 0))
             .unwrap()
             .reason;
         let mut user = AsynUser::new(reason);
@@ -661,7 +675,7 @@ mod tests {
     fn masked_digital_write_rejected_when_value_uninitialized() {
         let (mut driver, mut rx) = make_driver(&["FLAT:DIGITAL test/bits"]);
         let reason = driver
-            .drv_user_create("FLAT:DIGITAL test/bits", 0)
+            .drv_user_create(&DrvUserRequest::new("FLAT:DIGITAL test/bits", 0))
             .unwrap()
             .reason;
         let mut user = AsynUser::new(reason);
@@ -686,7 +700,7 @@ mod tests {
     fn masked_digital_write_merges_against_inbound_value() {
         let (mut driver, mut rx) = make_driver(&["FLAT:DIGITAL test/bits"]);
         let reason = driver
-            .drv_user_create("FLAT:DIGITAL test/bits", 0)
+            .drv_user_create(&DrvUserRequest::new("FLAT:DIGITAL test/bits", 0))
             .unwrap()
             .reason;
         let mut user = AsynUser::new(reason);
@@ -720,7 +734,7 @@ mod tests {
     fn successful_write_does_not_commit_cache() {
         let (mut driver, mut rx) = make_driver(&["FLAT:DIGITAL test/bits"]);
         let reason = driver
-            .drv_user_create("FLAT:DIGITAL test/bits", 0)
+            .drv_user_create(&DrvUserRequest::new("FLAT:DIGITAL test/bits", 0))
             .unwrap()
             .reason;
         let mut user = AsynUser::new(reason);
@@ -750,7 +764,7 @@ mod tests {
     fn successful_scalar_write_does_not_commit_cache() {
         let (mut driver, mut rx) = make_driver(&["FLAT:INT test/int_topic"]);
         let reason = driver
-            .drv_user_create("FLAT:INT test/int_topic", 0)
+            .drv_user_create(&DrvUserRequest::new("FLAT:INT test/int_topic", 0))
             .unwrap()
             .reason;
         let mut user = AsynUser::new(reason);

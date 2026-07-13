@@ -2865,7 +2865,7 @@ impl AsynRecord {
     fn report_special_never_ran(&mut self, e: &AsynError) -> SpecialRan {
         if e.is_queue_refused() {
             // C splices `pasynUser->errorMessage` — the gate's own text, e.g.
-            // "port X is disconnected" — into ERRS (:575). No severity: C's
+            // "port X not connected" — into ERRS (:575). No severity: C's
             // `reportError` raises none.
             self.errs = e.message();
         } else {
@@ -5252,7 +5252,7 @@ mod tests {
         // `pasynUserSpecial->errorMessage` (asynRecord.c:571-576) — *not* the
         // "Error setting option, %s" text of a `setOption` that ran (R14-46).
         assert!(
-            rec.errs.contains("disconnected"),
+            rec.errs.contains("not connected"),
             "the gate's refusal message is what reaches ERRS: {}",
             rec.errs
         );
@@ -6973,7 +6973,7 @@ mod tests {
              port (C checkPortConnect)"
         );
         assert!(
-            rec.errs.contains("disconnected"),
+            rec.errs.contains("not connected"),
             "the gate's refusal message is what reaches ERRS: {}",
             rec.errs
         );
@@ -7224,7 +7224,7 @@ mod tests {
             "a refused EOS put must not reach the driver"
         );
         assert!(
-            rec.errs.contains("disconnected"),
+            rec.errs.contains("not connected"),
             "ERRS is the gate's errorMessage: {}",
             rec.errs
         );
@@ -7242,7 +7242,7 @@ mod tests {
             "a refused CNCT put must not touch the wire"
         );
         assert!(
-            rec.errs.contains("disconnected"),
+            rec.errs.contains("not connected"),
             "ERRS is the gate's errorMessage, not a callback-shaped text: {}",
             rec.errs
         );

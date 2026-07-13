@@ -657,7 +657,7 @@ impl PortDriverBase {
         if !self.enabled {
             return Err(AsynError::Status {
                 status: AsynStatus::Disabled,
-                message: format!("port {} is disabled", self.port_name),
+                message: format!("port {} disabled", self.port_name),
             });
         }
         Ok(())
@@ -671,7 +671,7 @@ impl PortDriverBase {
         if !self.is_connected() {
             return Err(AsynError::Status {
                 status: AsynStatus::Disconnected,
-                message: format!("port {} is disconnected", self.port_name),
+                message: format!("port {} not connected", self.port_name),
             });
         }
         Ok(())
@@ -721,13 +721,17 @@ impl PortDriverBase {
                 if !ds.enabled {
                     return Err(AsynError::Status {
                         status: AsynStatus::Disabled,
-                        message: format!("port {} addr {} is disabled", self.port_name, addr),
+                        // C's double space is verbatim (asynManager.c:1564).
+                        message: format!("port {}  or device {} not enabled", self.port_name, addr),
                     });
                 }
                 if !ds.connected {
                     return Err(AsynError::Status {
                         status: AsynStatus::Disconnected,
-                        message: format!("port {} addr {} is disconnected", self.port_name, addr),
+                        message: format!(
+                            "port {} or device {} not connected",
+                            self.port_name, addr
+                        ),
                     });
                 }
             }
@@ -2542,12 +2546,12 @@ mod tests {
         base.device_state(1).enabled = false;
         assert!(base.check_ready_addr(0).is_ok());
         let err = base.check_ready_addr(1).unwrap_err();
-        assert!(format!("{err}").contains("disabled"));
+        assert!(format!("{err}").contains("not enabled"));
 
         // Disconnect addr 2
         base.device_state(2).connected = false;
         let err = base.check_ready_addr(2).unwrap_err();
-        assert!(format!("{err}").contains("disconnected"));
+        assert!(format!("{err}").contains("not connected"));
     }
 
     #[test]
@@ -2714,7 +2718,7 @@ mod tests {
 
         base.disable_addr(2);
         let err = base.check_ready_addr(2).unwrap_err();
-        assert!(format!("{err}").contains("disabled"));
+        assert!(format!("{err}").contains("not enabled"));
 
         base.enable_addr(2);
         assert!(base.check_ready_addr(2).is_ok());

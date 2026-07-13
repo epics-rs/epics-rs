@@ -1473,71 +1473,17 @@ impl RecordInstance {
         }
     }
 
-    /// Populate EnumInfo from record fields if applicable.
+    /// Populate EnumInfo — C rset `get_enum_strs`.
+    ///
+    /// The table comes from [`Record::enum_state_strings`], the SAME slot the
+    /// string-put converter (`dbConvert.c::putStringEnum`) resolves against, so
+    /// the choice list a client reads and the names it may write are one table
+    /// by construction. It arrives already trimmed to C's `no_str` (bi/bo/busy
+    /// drop an empty ONAM behind a set ZNAM — `boRecord.c:342-352`; mbbi/mbbo
+    /// cut at the last non-empty state — `mbbiRecord.c:262-269`).
     fn populate_enum_info(&self, snap: &mut super::super::snapshot::Snapshot) {
-        let rtype = self.record.record_type();
-        match rtype {
-            // bi/bo/busy — C trims no_str to 1 when ZNAM set and ONAM empty (boRecord.c:342-352).
-            "bi" | "bo" | "busy" => {
-                let znam = self
-                    .record
-                    .get_field("ZNAM")
-                    .and_then(|v| {
-                        if let EpicsValue::String(s) = v {
-                            Some(s)
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or_default();
-                let onam = self
-                    .record
-                    .get_field("ONAM")
-                    .and_then(|v| {
-                        if let EpicsValue::String(s) = v {
-                            Some(s)
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or_default();
-                let no_str_1 = !znam.is_empty() && onam.is_empty();
-                let mut strings = vec![znam, onam];
-                if no_str_1 {
-                    strings.truncate(1);
-                }
-                snap.enums = Some(super::super::snapshot::EnumInfo { strings });
-            }
-            // mbbi/mbbo — C uses highwater mark: last non-empty index + 1 (mbbiRecord.c:262-269).
-            "mbbi" | "mbbo" => {
-                let state_fields = [
-                    "ZRST", "ONST", "TWST", "THST", "FRST", "FVST", "SXST", "SVST", "EIST", "NIST",
-                    "TEST", "ELST", "TVST", "TTST", "FTST", "FFST",
-                ];
-                let mut strings: Vec<PvString> = state_fields
-                    .iter()
-                    .map(|f| {
-                        self.record
-                            .get_field(f)
-                            .and_then(|v| {
-                                if let EpicsValue::String(s) = v {
-                                    Some(s)
-                                } else {
-                                    None
-                                }
-                            })
-                            .unwrap_or_default()
-                    })
-                    .collect();
-                let no_str = strings
-                    .iter()
-                    .rposition(|s| !s.is_empty())
-                    .map(|i| i + 1)
-                    .unwrap_or(0);
-                strings.truncate(no_str);
-                snap.enums = Some(super::super::snapshot::EnumInfo { strings });
-            }
-            _ => {}
+        if let Some(strings) = self.record.enum_state_strings() {
+            snap.enums = Some(super::super::snapshot::EnumInfo { strings });
         }
     }
 

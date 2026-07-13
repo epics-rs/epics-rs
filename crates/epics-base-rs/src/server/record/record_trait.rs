@@ -1,5 +1,5 @@
 use crate::error::CaResult;
-use crate::types::{DbFieldType, EpicsValue};
+use crate::types::{DbFieldType, EpicsValue, PvString};
 
 use super::scan::ScanType;
 
@@ -914,6 +914,28 @@ pub trait Record: Send + Sync + 'static {
         self.process_passive_fields()
             .iter()
             .any(|f| f.eq_ignore_ascii_case(field))
+    }
+
+    /// The record's `DBF_ENUM` state strings — the C rset slot pair
+    /// `get_enum_strs` / `put_enum_str`, which in C read the same fields and
+    /// are therefore ONE table here.
+    ///
+    /// It is what a client reads as the `DBR_ENUM` choice list AND the set of
+    /// names a `DBR_STRING` put to the record's `DBF_ENUM` `VAL` may name
+    /// (`dbConvert.c::putStringEnum` → [`resolve_enum_state_string`]). Taking
+    /// both from one table is the point: a name the record advertises is a name
+    /// a client may put, by construction — the two cannot drift.
+    ///
+    /// The table is already trimmed to C's `no_str`: `bi`/`bo`/`busy` drop
+    /// `ONAM` when `ZNAM` is set and `ONAM` is empty (`boRecord.c:342-352`);
+    /// `mbbi`/`mbbo` cut at the last non-empty state (`mbbiRecord.c:262-269`).
+    ///
+    /// `None` — the record type leaves both rset slots NULL. That is every
+    /// record whose `VAL` is not `DBF_ENUM`, and `mbbiDirect`/`mbboDirect`
+    /// (`mbbiDirectRecord.c:58` `#define put_enum_str NULL`), whose `VAL` is
+    /// `DBF_LONG`. C then fails a `DBR_STRING` put with `S_db_noRSET`.
+    fn enum_state_strings(&self) -> Option<Vec<PvString>> {
+        None
     }
 
     /// Validate a put before it is applied. Return Err to reject.
@@ -2520,7 +2542,7 @@ pub fn put_field_internal_default<R: Record + ?Sized>(
         Some(target)
             if is_enum_carrier || (value.db_field_type() != target && !value.is_empty_array()) =>
         {
-            value.convert_to(target)
+            coerce_put_value(record, name, target, value)?
         }
         // Carrier with no known target field: collapse to a bare index (the prior
         // fallback) rather than letting it reach storage.
@@ -2528,6 +2550,49 @@ pub fn put_field_internal_default<R: Record + ?Sized>(
         _ => value,
     };
     record.put_field(name, value)
+}
+
+/// Coerce a written value to a field's stored type — the single owner of C
+/// `dbConvert.c`'s `dbFastPutConvertRoutine[dbrType][field_type]` table, shared
+/// by the two paths a value can enter a record's field through: a client
+/// `dbPut` ([`crate::server::database::field_io`]) and an internal link /
+/// device-support delivery ([`put_field_internal_default`]).
+///
+/// The three `DBR_STRING` rows C does NOT route through a numeric parse are the
+/// point of the shared owner:
+///
+/// * `DBF_MENU` → `putStringMenu` — exact label, else an index below `nChoice`
+///   ([`resolve_menu_field_string`]).
+/// * `DBF_ENUM` → `putStringEnum` — the record's state strings, else an index
+///   below `no_str` ([`resolve_enum_state_string`]).
+/// * every other type → `EpicsValue::convert_to`, the value-coercion owner.
+///
+/// Both string rows FAIL the put on no match (`S_db_badChoice`); C stores
+/// nothing. `convert_to` cannot express that — it is field-blind and maps any
+/// unparseable string to `0` — which is how `caput MY:VALVE Open` became a
+/// silent no-op that drove `VAL` to state 0.
+pub fn coerce_put_value<R: Record + ?Sized>(
+    record: &R,
+    field: &str,
+    target: DbFieldType,
+    value: EpicsValue,
+) -> CaResult<EpicsValue> {
+    if let EpicsValue::String(s) = &value {
+        if let Some(choices) = record
+            .menu_field_choices(field)
+            .or_else(|| super::shared_menu_choices(field))
+        {
+            return super::resolve_menu_field_string(field, choices, target, &s.as_str_lossy());
+        }
+        if target == DbFieldType::Enum {
+            return super::resolve_enum_state_string(
+                field,
+                record.enum_state_strings().as_deref(),
+                s,
+            );
+        }
+    }
+    Ok(value.convert_to(target))
 }
 
 /// Subroutine function type for `sub`/`aSub` records.

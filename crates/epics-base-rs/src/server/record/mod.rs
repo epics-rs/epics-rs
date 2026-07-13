@@ -21,7 +21,8 @@ pub use link::{
 };
 pub use menu_choices::{
     MENU_ALARM_SEVR, MENU_ALARM_STAT, MENU_CONVERT, MENU_FTYPE, MENU_IVOA, MENU_OMSL, MENU_PINI,
-    MENU_POST, MENU_PRIORITY, MENU_SCAN, MENU_SIMM, MENU_YES_NO, resolve_menu_field_string,
+    MENU_POST, MENU_PRIORITY, MENU_SCAN, MENU_SIMM, MENU_YES_NO, binary_enum_states,
+    multibit_enum_states, resolve_enum_state_string, resolve_menu_field_string,
     resolve_menu_field_string_db_load, shared_menu_choices,
 };
 pub use pini::PiniMode;
@@ -31,7 +32,8 @@ pub use record_trait::{
     ArrayMonitorPost, CommonFieldPutResult, ConstantInitLink, CyclePostMask,
     EPICS_TIME_EVENT_DEVICE_TIME, FieldDesc, FieldMetadataOverride, InputFetchPolicy, LinkReadAs,
     OutTarget, ProcessAction, ProcessContext, ProcessOutcome, ProcessSnapshot, Record,
-    RecordProcessResult, SubroutineFn, ValuePostGate, put_field_internal_default, seed_input_links,
+    RecordProcessResult, SubroutineFn, ValuePostGate, coerce_put_value, put_field_internal_default,
+    seed_input_links,
 };
 pub(crate) use record_trait::{AuxPostMask, value_gate};
 pub use scan::{ScanType, SimModeScan};

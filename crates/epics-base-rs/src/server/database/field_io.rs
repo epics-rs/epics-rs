@@ -148,33 +148,23 @@ fn special_before_put(instance: &mut crate::server::record::RecordInstance, fiel
     }
 }
 
-/// Coerce a write `value` to a record field's stored `target` type.
+/// Coerce a write `value` to a record field's stored `target` type — C
+/// `dbConvert.c`'s `dbFastPutConvertRoutine[dbrType][field_type]` table.
 ///
-/// A `DBR_STRING` write to a `DBF_MENU` field belongs to ONE converter — C
-/// `dbConvert.c::putStringMenu` (an exact label, else an index below
-/// `nChoice`), ported in `resolve_menu_field_string`. That converter's failure
-/// is `S_db_badChoice` and it FAILS the put; it must not fall through to
-/// `EpicsValue::convert_to`, which is field-blind and would both mis-map a
-/// menu-specific label (`SELM "Specified"`) and turn any unrecognised string
-/// into index 0 (`to_f64().unwrap_or(0.0) as u16`) — C stores nothing at all.
-/// Every non-menu field, and every already-typed value, goes to the single
-/// value-coercion owner `EpicsValue::convert_to`.
+/// The client-`dbPut` half of the shared converter
+/// [`crate::server::record::coerce_put_value`]; the internal-delivery half is
+/// `put_field_internal_default`. A `DBR_STRING` write to a `DBF_MENU` or
+/// `DBF_ENUM` field has a converter of its own in C (`putStringMenu`,
+/// `putStringEnum`) and must not fall through to `EpicsValue::convert_to`,
+/// which is field-blind and turns any unrecognised string into index 0 —
+/// C stores nothing and fails the put with `S_db_badChoice`.
 fn coerce_write_value(
     record: &dyn crate::server::record::Record,
     field: &str,
     target: crate::types::DbFieldType,
     value: EpicsValue,
 ) -> CaResult<EpicsValue> {
-    if let EpicsValue::String(s) = &value {
-        if let Some(choices) = record
-            .menu_field_choices(field)
-            .or_else(|| crate::server::record::shared_menu_choices(field))
-        {
-            let s = s.as_str_lossy();
-            return crate::server::record::resolve_menu_field_string(field, choices, target, &s);
-        }
-    }
-    Ok(value.convert_to(target))
+    crate::server::record::coerce_put_value(record, field, target, value)
 }
 
 /// What a `dbPut` of a given value means for a given field — the single owner

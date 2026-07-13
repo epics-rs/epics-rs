@@ -652,6 +652,15 @@ macro_rules! mbb_put_field {
                     EpicsValue::Enum(v) => { $self.val = v; }
                     EpicsValue::Long(v) => { $self.val = v as u16; }
                     EpicsValue::Short(v) => { $self.val = v as u16; }
+                    // C rset `put_enum_str` — the one string→state converter.
+                    EpicsValue::String(ref s) => {
+                        let resolved = crate::server::record::resolve_enum_state_string(
+                            "VAL",
+                            $self.enum_state_strings().as_deref(),
+                            s,
+                        )?;
+                        if let EpicsValue::Enum(v) = resolved { $self.val = v; }
+                    }
                     _ => return Err(CaError::TypeMismatch("VAL".into())),
                 }
             }
@@ -678,6 +687,16 @@ impl Record for MbbiRecord {
             "SIMM" => Some(MENU_SIMM),
             _ => None,
         }
+    }
+
+    /// C rset `get_enum_strs`/`put_enum_str` (mbbiRecord.c:251-291) — ZRST..FFST
+    /// cut at the last non-empty state.
+    fn enum_state_strings(&self) -> Option<Vec<PvString>> {
+        Some(crate::server::record::multibit_enum_states([
+            &self.zrst, &self.onst, &self.twst, &self.thst, &self.frst, &self.fvst, &self.sxst,
+            &self.svst, &self.eist, &self.nist, &self.test, &self.elst, &self.tvst, &self.ttst,
+            &self.ftst, &self.ffst,
+        ]))
     }
 
     /// VAL posts DBE_VALUE|DBE_LOG
@@ -864,20 +883,17 @@ impl Record for MbbiRecord {
             EpicsValue::ULong(v) => self.val = v as u16,
             EpicsValue::Long(v) => self.val = v as u16,
             EpicsValue::Short(v) => self.val = v as u16,
-            // epics-base PR/issue #183 — DBF_MENU ↔ DBF_STRING. Match the
-            // string against ZRST..FFST and store the corresponding index.
-            EpicsValue::String(s) => {
-                let strs: [&PvString; 16] = [
-                    &self.zrst, &self.onst, &self.twst, &self.thst, &self.frst, &self.fvst,
-                    &self.sxst, &self.svst, &self.eist, &self.nist, &self.test, &self.elst,
-                    &self.tvst, &self.ttst, &self.ftst, &self.ffst,
-                ];
-                if let Some(idx) = strs.iter().position(|st| **st == s) {
-                    self.val = idx as u16;
-                } else {
-                    return Err(CaError::TypeMismatch(format!(
-                        "mbbi VAL: '{s}' matches no ZRST..FFST state string"
-                    )));
+            // C rset `put_enum_str` (mbbiRecord.c:273-291), reached from
+            // `dbConvert.c::putStringEnum` — the one string→state converter,
+            // over `enum_state_strings` (the same table `get_enum_strs` serves).
+            EpicsValue::String(ref s) => {
+                let resolved = crate::server::record::resolve_enum_state_string(
+                    "VAL",
+                    self.enum_state_strings().as_deref(),
+                    s,
+                )?;
+                if let EpicsValue::Enum(v) = resolved {
+                    self.val = v;
                 }
             }
             _ => return Err(CaError::TypeMismatch("VAL".into())),

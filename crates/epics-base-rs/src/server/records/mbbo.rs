@@ -705,6 +705,16 @@ macro_rules! mbb_put_field {
                     EpicsValue::Enum(v) => { $self.val = v; }
                     EpicsValue::Long(v) => { $self.val = v as u16; }
                     EpicsValue::Short(v) => { $self.val = v as u16; }
+                    // C rset `put_enum_str` (mbboRecord.c:354-371) — the one
+                    // string→state converter, over `enum_state_strings`.
+                    EpicsValue::String(ref s) => {
+                        let resolved = crate::server::record::resolve_enum_state_string(
+                            "VAL",
+                            $self.enum_state_strings().as_deref(),
+                            s,
+                        )?;
+                        if let EpicsValue::Enum(v) = resolved { $self.val = v; }
+                    }
                     _ => return Err(CaError::TypeMismatch("VAL".into())),
                 }
             }
@@ -731,6 +741,16 @@ impl Record for MbboRecord {
             "SIMM" => Some(MENU_SIMM),
             _ => None,
         }
+    }
+
+    /// C rset `get_enum_strs`/`put_enum_str` (mbboRecord.c:330-371) — ZRST..FFST
+    /// cut at the last non-empty state.
+    fn enum_state_strings(&self) -> Option<Vec<PvString>> {
+        Some(crate::server::record::multibit_enum_states([
+            &self.zrst, &self.onst, &self.twst, &self.thst, &self.frst, &self.fvst, &self.sxst,
+            &self.svst, &self.eist, &self.nist, &self.test, &self.elst, &self.tvst, &self.ttst,
+            &self.ftst, &self.ffst,
+        ]))
     }
 
     // C recMbbo.c IVOA=set_to_IVOV: val = ivov; rval = ivov. IVOV is

@@ -417,19 +417,19 @@ impl Record for BoRecord {
                     self.val = v as u16;
                     Ok(())
                 }
-                // PR/issue #183 — accept ZNAM/ONAM string.
-                EpicsValue::String(s) => {
-                    if s == self.znam {
-                        self.val = 0;
-                        Ok(())
-                    } else if s == self.onam {
-                        self.val = 1;
-                        Ok(())
-                    } else {
-                        Err(CaError::TypeMismatch(format!(
-                            "bo VAL: '{s}' matches neither ZNAM nor ONAM"
-                        )))
+                // C rset `put_enum_str` (boRecord.c), reached from
+                // `dbConvert.c::putStringEnum` — one converter, shared with the
+                // framework's put paths (see `Record::enum_state_strings`).
+                EpicsValue::String(ref s) => {
+                    let resolved = crate::server::record::resolve_enum_state_string(
+                        "VAL",
+                        self.enum_state_strings().as_deref(),
+                        s,
+                    )?;
+                    if let EpicsValue::Enum(v) = resolved {
+                        self.val = v;
                     }
+                    Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
@@ -608,6 +608,13 @@ impl Record for BoRecord {
             "SIMM" => Some(MENU_SIMM),
             _ => None,
         }
+    }
+
+    /// C rset `get_enum_strs`/`put_enum_str` (boRecord.c) — ZNAM/ONAM.
+    fn enum_state_strings(&self) -> Option<Vec<PvString>> {
+        Some(crate::server::record::binary_enum_states(
+            &self.znam, &self.onam,
+        ))
     }
 
     /// VAL posts DBE_VALUE|DBE_LOG

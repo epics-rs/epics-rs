@@ -1,3 +1,4 @@
+use asyn_rs::param::ParamValue;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -48,21 +49,17 @@ impl AcquisitionContext {
             .set_params_and_notify(
                 0,
                 vec![
-                    asyn_rs::request::ParamSetValue::Int32 {
-                        reason: self.ad.acquire_busy,
-                        addr: 0,
-                        value: 0,
-                    },
-                    asyn_rs::request::ParamSetValue::Int32 {
-                        reason: self.ad.status,
-                        addr: 0,
-                        value: ADStatus::Idle as i32,
-                    },
-                    asyn_rs::request::ParamSetValue::Int32 {
-                        reason: self.ad.acquire,
-                        addr: 0,
-                        value: 0,
-                    },
+                    asyn_rs::request::ParamSetValue::new(
+                        self.ad.acquire_busy,
+                        0,
+                        ParamValue::Int32(0),
+                    ),
+                    asyn_rs::request::ParamSetValue::new(
+                        self.ad.status,
+                        0,
+                        ParamValue::Int32(ADStatus::Idle as i32),
+                    ),
+                    asyn_rs::request::ParamSetValue::new(self.ad.acquire, 0, ParamValue::Int32(0)),
                 ],
             )
             .await
@@ -121,21 +118,21 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
             .set_params_and_notify(
                 0,
                 vec![
-                    asyn_rs::request::ParamSetValue::Int32 {
-                        reason: ctx.ad.num_images_counter,
-                        addr: 0,
-                        value: 0,
-                    },
-                    asyn_rs::request::ParamSetValue::Int32 {
-                        reason: ctx.ad.status,
-                        addr: 0,
-                        value: ADStatus::Acquire as i32,
-                    },
-                    asyn_rs::request::ParamSetValue::Int32 {
-                        reason: ctx.ad.acquire_busy,
-                        addr: 0,
-                        value: 1,
-                    },
+                    asyn_rs::request::ParamSetValue::new(
+                        ctx.ad.num_images_counter,
+                        0,
+                        ParamValue::Int32(0),
+                    ),
+                    asyn_rs::request::ParamSetValue::new(
+                        ctx.ad.status,
+                        0,
+                        ParamValue::Int32(ADStatus::Acquire as i32),
+                    ),
+                    asyn_rs::request::ParamSetValue::new(
+                        ctx.ad.acquire_busy,
+                        0,
+                        ParamValue::Int32(1),
+                    ),
                 ],
             )
             .await
@@ -266,46 +263,46 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
                 .set_params_and_notify(
                     0,
                     vec![
-                        asyn_rs::request::ParamSetValue::Int32 {
-                            reason: ctx.ad.base.array_counter,
-                            addr: 0,
-                            value: array_counter,
-                        },
-                        asyn_rs::request::ParamSetValue::Int32 {
-                            reason: ctx.ad.num_images_counter,
-                            addr: 0,
-                            value: num_counter,
-                        },
-                        asyn_rs::request::ParamSetValue::Int32 {
-                            reason: ctx.ad.base.array_size_x,
-                            addr: 0,
-                            value: info.x_size as i32,
-                        },
-                        asyn_rs::request::ParamSetValue::Int32 {
-                            reason: ctx.ad.base.array_size_y,
-                            addr: 0,
-                            value: info.y_size as i32,
-                        },
-                        asyn_rs::request::ParamSetValue::Int32 {
-                            reason: ctx.ad.base.array_size,
-                            addr: 0,
-                            value: info.total_bytes as i32,
-                        },
-                        asyn_rs::request::ParamSetValue::Float64 {
-                            reason: ctx.ad.base.timestamp_rbv,
-                            addr: 0,
-                            value: frame.timestamp.as_f64(),
-                        },
-                        asyn_rs::request::ParamSetValue::Int32 {
-                            reason: ctx.ad.base.epics_ts_sec,
-                            addr: 0,
-                            value: frame.timestamp.sec as i32,
-                        },
-                        asyn_rs::request::ParamSetValue::Int32 {
-                            reason: ctx.ad.base.epics_ts_nsec,
-                            addr: 0,
-                            value: frame.timestamp.nsec as i32,
-                        },
+                        asyn_rs::request::ParamSetValue::new(
+                            ctx.ad.base.array_counter,
+                            0,
+                            ParamValue::Int32(array_counter),
+                        ),
+                        asyn_rs::request::ParamSetValue::new(
+                            ctx.ad.num_images_counter,
+                            0,
+                            ParamValue::Int32(num_counter),
+                        ),
+                        asyn_rs::request::ParamSetValue::new(
+                            ctx.ad.base.array_size_x,
+                            0,
+                            ParamValue::Int32(info.x_size as i32),
+                        ),
+                        asyn_rs::request::ParamSetValue::new(
+                            ctx.ad.base.array_size_y,
+                            0,
+                            ParamValue::Int32(info.y_size as i32),
+                        ),
+                        asyn_rs::request::ParamSetValue::new(
+                            ctx.ad.base.array_size,
+                            0,
+                            ParamValue::Int32(info.total_bytes as i32),
+                        ),
+                        asyn_rs::request::ParamSetValue::new(
+                            ctx.ad.base.timestamp_rbv,
+                            0,
+                            ParamValue::Float64(frame.timestamp.as_f64()),
+                        ),
+                        asyn_rs::request::ParamSetValue::new(
+                            ctx.ad.base.epics_ts_sec,
+                            0,
+                            ParamValue::Int32(frame.timestamp.sec as i32),
+                        ),
+                        asyn_rs::request::ParamSetValue::new(
+                            ctx.ad.base.epics_ts_nsec,
+                            0,
+                            ParamValue::Int32(frame.timestamp.nsec as i32),
+                        ),
                     ],
                 )
                 .await

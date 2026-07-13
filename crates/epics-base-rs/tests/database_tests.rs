@@ -7682,12 +7682,12 @@ async fn test_histogram_sdel_watchdog_posts_val() {
         .expect("SDEL watchdog must post VAL within one period")
         .expect("subscription alive");
     match &event.snapshot.value {
-        EpicsValue::LongArray(v) => assert_eq!(
+        EpicsValue::ULongArray(v) => assert_eq!(
             v,
             &vec![1, 0],
             "the watchdog posts the accumulated bin counts"
         ),
-        other => panic!("VAL must be LongArray, got {other:?}"),
+        other => panic!("VAL must be ULongArray (C DBF_ULONG), got {other:?}"),
     }
     assert_eq!(
         rec.read().await.record.get_field("MCNT"),
@@ -7704,8 +7704,8 @@ async fn test_histogram_sdel_watchdog_posts_val() {
         .expect("the watchdog re-arms itself (C: callbackRequestDelayed at the tail)")
         .expect("subscription alive");
     match &event.snapshot.value {
-        EpicsValue::LongArray(v) => assert_eq!(v, &vec![1, 1]),
-        other => panic!("VAL must be LongArray, got {other:?}"),
+        EpicsValue::ULongArray(v) => assert_eq!(v, &vec![1, 1]),
+        other => panic!("VAL must be ULongArray (C DBF_ULONG), got {other:?}"),
     }
 }
 
@@ -10111,8 +10111,10 @@ async fn promptgroup_config_fields_load_settable_runtime_immutable() {
         .expect("histogram NELM is .db-settable (promptgroup)");
     assert_eq!(hist.get_field("NELM"), Some(EpicsValue::Long(5)));
     match hist.get_field("VAL") {
-        Some(EpicsValue::LongArray(v)) => assert_eq!(v.len(), 5, "NELM load resizes the bin array"),
-        other => panic!("histogram VAL should be a 5-element LongArray, got {other:?}"),
+        Some(EpicsValue::ULongArray(v)) => {
+            assert_eq!(v.len(), 5, "NELM load resizes the bin array")
+        }
+        other => panic!("histogram VAL should be a 5-element ULongArray, got {other:?}"),
     }
 
     let mut comp = create_record("compress").expect("create compress");

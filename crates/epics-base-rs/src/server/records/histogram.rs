@@ -9,17 +9,23 @@ use crate::types::{DbFieldType, EpicsValue};
 /// explicitly at `UINT_MAX` (`add_count`: `if (*pdest == UINT_MAX)
 /// *pdest = 0; (*pdest)++;`).
 ///
-/// The counters are stored in an `i32` vector — the public field type
-/// is unchanged for callers — but each increment goes through
-/// `u32`-wrapping arithmetic (`(v as u32).wrapping_add(1) as i32`).
-/// The `i32` slot is treated as the two's-complement *bit container*
-/// for the C `epicsUInt32`: this wraps at `UINT_MAX` exactly as C
-/// does, and never panics on overflow the way a plain signed
-/// `i32 += 1` would at 2^31 counts. The CA wire has no unsigned-long
-/// DBR type, so `VAL` is exposed as `LongArray` — the same bit
-/// pattern a C client sees over `DBR_LONG`.
+/// The counters are `epicsUInt32` here too — [`DbFieldType::ULong`], served
+/// as an [`EpicsValue::ULongArray`]. The declared type is the one C declares,
+/// and each wire projects it the way C's does, so neither wire needs a
+/// per-record special case:
+///
+/// * CA has no unsigned-long DBR type and promotes `DBF_ULONG` to
+///   `DBR_DOUBLE` (`db_convert.h`: `6, /*DBR_ULONG to DBR_DOUBLE*/`) —
+///   `cainfo HI` on softIoc reports `Native data type: DBF_DOUBLE`, the same
+///   answer it gives for a `waveform` with `FTVL=ULONG`.
+/// * PVA serves it natively: pvxs `ioc/typeutils.cpp:43-44` maps `DBR_ULONG`
+///   to `TypeCode::UInt32`, so `VAL` is a `uint32[]`.
+///
+/// Counting wraps at `UINT_MAX` exactly as C does (`add_count`:
+/// `if (*pdest == UINT_MAX) *pdest = 0; (*pdest)++;`) — `u32::wrapping_add`,
+/// with no signed slot to reinterpret.
 pub struct HistogramRecord {
-    pub val: Vec<i32>, // Bucket counts (C epicsUInt32 bit pattern, wraps at UINT_MAX)
+    pub val: Vec<u32>, // Bucket counts (C epicsUInt32 — wraps at UINT_MAX)
     pub nelm: i32,     // Number of buckets
     pub ulim: f64,     // Upper limit
     pub llim: f64,     // Lower limit
@@ -159,9 +165,7 @@ impl HistogramRecord {
         let bucket = ((i - 1).max(0) as usize).min(self.val.len().saturating_sub(1));
         if bucket < self.val.len() {
             // C: if (*pdest == UINT_MAX) *pdest = 0; (*pdest)++;
-            // The i32 slot holds the epicsUInt32 bit pattern — wrap
-            // through u32 so the rollover happens at UINT_MAX.
-            self.val[bucket] = (self.val[bucket] as u32).wrapping_add(1) as i32;
+            self.val[bucket] = self.val[bucket].wrapping_add(1);
             self.mcnt = self.mcnt.saturating_add(1);
         }
     }
@@ -184,9 +188,11 @@ impl HistogramRecord {
 static HISTOGRAM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
-        // CA wire has no DBR_ULONG; C `cvt_dbaddr` uses DBF_ULONG
-        // internally but a CA client reads it as DBR_LONG.
-        dbf_type: DbFieldType::Long,
+        // C `cvt_dbaddr` (histogramRecord.c:299-308) sets
+        // `field_type = dbr_field_type = DBF_ULONG`. CA promotes that to
+        // DBR_DOUBLE, PVA serves it as uint32[] — both projections follow
+        // from this one declared type.
+        dbf_type: DbFieldType::ULong,
         read_only: false,
     },
     FieldDesc {
@@ -490,9 +496,8 @@ impl Record for HistogramRecord {
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
-            // Counters surfaced as-is (the i32 slot is the
-            // epicsUInt32 bit pattern C exposes over DBR_LONG).
-            "VAL" => Some(EpicsValue::LongArray(self.val.clone())),
+            // C's epicsUInt32 counters (DBF_ULONG), surfaced as-is.
+            "VAL" => Some(EpicsValue::ULongArray(self.val.clone())),
             "NELM" => Some(EpicsValue::Long(self.nelm)),
             "ULIM" => Some(EpicsValue::Double(self.ulim)),
             "LLIM" => Some(EpicsValue::Double(self.llim)),
@@ -517,7 +522,7 @@ impl Record for HistogramRecord {
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
         match name {
             "VAL" => match value {
-                EpicsValue::LongArray(arr) => {
+                EpicsValue::ULongArray(arr) => {
                     self.val = arr;
                     Ok(())
                 }
@@ -713,12 +718,57 @@ mod tests {
         assert_eq!(rec.wdth, 0.0, "WDTH = (ULIM-LLIM)/NELM = 0");
     }
 
-    /// a counter at the `UINT_MAX` bit pattern must wrap to 0,
-    /// never panic the way a signed `i32 += 1` would at overflow.
+    /// R17-84: the bins are C's `epicsUInt32` — `cvt_dbaddr`
+    /// (`histogramRecord.c:299-308`) sets `field_type = dbr_field_type =
+    /// DBF_ULONG`. Every wire then projects that ONE declared type its own way,
+    /// and both projections already exist in the port:
+    ///
+    /// * CA has no unsigned-long DBR type, so `DBF_ULONG` promotes to
+    ///   `DBR_DOUBLE`. softIoc (`cainfo`, EPICS 7 base):
+    ///
+    ///   ```text
+    ///   HI  (histogram VAL)        Native data type: DBF_DOUBLE
+    ///   WU  (waveform FTVL=ULONG)  Native data type: DBF_DOUBLE
+    ///   WL  (waveform FTVL=LONG)   Native data type: DBF_LONG
+    ///   ```
+    ///
+    /// * PVA serves it natively as `uint32[]` — pinned by
+    ///   `epics-pva-rs::leaf_convert::tests::histogram_val_is_served_as_uint32_array`.
+    ///
+    /// The port declared VAL `DBF_LONG` and stored the counts in an `i32` slot
+    /// "as a bit container", which made CA answer DBR_LONG and PVA `int32[]`.
+    #[test]
+    fn val_is_dbf_ulong_and_promotes_to_dbr_double_on_ca() {
+        let rec = HistogramRecord::new(2, 0.0, 10.0);
+
+        let val_desc = HISTOGRAM_FIELDS
+            .iter()
+            .find(|f| f.name == "VAL")
+            .expect("histogram declares VAL");
+        assert_eq!(
+            val_desc.dbf_type,
+            DbFieldType::ULong,
+            "C cvt_dbaddr: dbr_field_type = DBF_ULONG"
+        );
+
+        let val = rec.get_field("VAL").expect("histogram serves VAL");
+        assert!(
+            matches!(val, EpicsValue::ULongArray(_)),
+            "the bins are epicsUInt32, got {val:?}"
+        );
+        assert_eq!(
+            val.dbr_type(),
+            DbFieldType::Double,
+            "CA promotes DBF_ULONG to DBR_DOUBLE (cainfo HI: DBF_DOUBLE)"
+        );
+    }
+
+    /// C `add_count`: `if (*pdest == UINT_MAX) *pdest = 0; (*pdest)++;` — a
+    /// counter at `UINT_MAX` wraps to 0 and never panics on overflow.
     #[test]
     fn counter_wraps_at_u32_max_no_panic() {
         let mut rec = HistogramRecord::new(2, 0.0, 10.0);
-        rec.val[0] = u32::MAX as i32; // -1 i32, == UINT_MAX bit pattern
+        rec.val[0] = u32::MAX;
         rec.sgnl = 1.0;
         rec.add_count();
         assert_eq!(rec.val[0], 0, "epicsUInt32 counter wraps UINT_MAX -> 0");

@@ -105,7 +105,7 @@ async fn sim_histogram_lands_siol_in_sgnl_and_bins_it() {
     // C `:219` `add_count(prec)`: 42.0 with WDTH=25 falls in bin 1.
     let val = db.get_pv("HGIN").await.unwrap();
     assert!(
-        matches!(val, EpicsValue::LongArray(ref a) if a.as_slice() == [0, 1, 0, 0]),
+        matches!(val, EpicsValue::ULongArray(ref a) if a.as_slice() == [0, 1, 0, 0]),
         "the simulated signal is binned exactly once, got {val:?}"
     );
 }
@@ -138,7 +138,7 @@ async fn sim_histogram_with_a_failed_siol_read_bins_nothing() {
     );
     let val = db.get_pv("HGF").await.unwrap();
     assert!(
-        matches!(val, EpicsValue::LongArray(ref a) if a.as_slice() == [0, 0, 0, 0]),
+        matches!(val, EpicsValue::ULongArray(ref a) if a.as_slice() == [0, 0, 0, 0]),
         "add_count is gated on the same status == 0, got {val:?}"
     );
 }

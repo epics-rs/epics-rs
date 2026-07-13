@@ -66,10 +66,11 @@ async fn process(db: &epics_base_rs::server::database::PvDatabase, rec: &str) {
         .unwrap();
 }
 
-async fn bins(db: &epics_base_rs::server::database::PvDatabase, rec: &str) -> Vec<i32> {
+async fn bins(db: &epics_base_rs::server::database::PvDatabase, rec: &str) -> Vec<u32> {
     match db.get_pv(rec).await.unwrap() {
-        EpicsValue::LongArray(v) => v,
-        other => panic!("{rec}.VAL must be a LongArray, got {other:?}"),
+        // C `cvt_dbaddr` declares the bins DBF_ULONG (histogramRecord.c:304).
+        EpicsValue::ULongArray(v) => v,
+        other => panic!("{rec}.VAL must be a ULongArray, got {other:?}"),
     }
 }
 

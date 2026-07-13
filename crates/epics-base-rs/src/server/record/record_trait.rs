@@ -140,6 +140,38 @@ impl OutTarget {
     };
 }
 
+/// The `dbrType` a record asks an INPUT link for — the second argument of C
+/// `dbGetLink(plink, dbrType, pbuffer, options, pnRequest)` (`dbLink.c:305`).
+///
+/// The READ twin of [`Record::typed_output_buffer`]'s destination switch. C's
+/// input-side switch is on the SOURCE's DBF class (`dbGetLinkDBFtype(&dol)`,
+/// `sseqRecord.c:640-705`) and each arm asks `dbGetLink` for a DIFFERENT
+/// `dbrType`, so the value a record receives is not the source's native one:
+/// a `DBF_ENUM`/`DBF_MENU` source read with `DBR_STRING` delivers its state
+/// LABEL, and a `DBF_CHAR` array read with `DBF_CHAR` delivers bytes, not a
+/// number. The record declares the request
+/// ([`Record::input_link_read_as`]); the framework, which is the side that
+/// can address the source, performs the conversion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkReadAs {
+    /// The source's NATIVE value, coerced (or preserved) by the target field's
+    /// own `put_field_internal`. The framework default: every record whose C
+    /// `dbGetLink` request does not switch on the source class (compress `INP`,
+    /// waveform `INP`, sseq `SELL`, epid, motor, table) reads this way.
+    Native,
+    /// C `dbGetLink(..., DBR_STRING, ...)`. An `ENUM`/`MENU` source delivers its
+    /// state LABEL (`dbConvert.c` `getEnumString` → the record's
+    /// `get_enum_str`), never the index; a link/`DTYP` field delivers its text.
+    String,
+    /// C `dbGetLink(..., DBR_DOUBLE, ...)`.
+    Double,
+    /// C `dbGetLink(..., DBF_CHAR|DBF_UCHAR, buf, 0, &n)` — up to `max_elements`
+    /// bytes of the source's char array, taken as the string they spell
+    /// (`sseqRecord.c:682-686`: `n_elements` clamped to the record's 40-byte
+    /// `s` buffer, then `strcmp`/`atof` read it as a C string).
+    CharArrayAsString { max_elements: usize },
+}
+
 /// How C gates a secondary field named by
 /// [`Record::fields_posted_with_value_mask`] *inside* the guard that decides
 /// whether VAL posts at all.
@@ -178,6 +210,12 @@ pub enum ValuePostGate {
 /// variant carried with each mark is what keeps them distinguishable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CyclePostMask {
+    /// A literal `DBE_VALUE` — no LOG bit, no alarm bits. C's shape for a
+    /// field the record re-DERIVED from the one it was given: sseq re-renders
+    /// `STRn` after a `DOn` write and posts it with a bare `DBE_VALUE`
+    /// (`sseqRecord.c:679`, `:1115`), while the view actually written carries
+    /// `DBE_VALUE|DBE_LOG`.
+    Value,
     /// A literal `DBE_VALUE | DBE_LOG` — the alarm-transition bits are NOT
     /// folded in, because this C call site does not have `monitor_mask` in
     /// scope (aCalcout `afterCalc`, `aCalcoutRecord.c:296`).
@@ -329,6 +367,17 @@ pub enum ProcessAction {
     ///
     /// Executed with (and exactly like) [`Self::WriteDbLink`].
     WriteDbLinkTyped { link_field: &'static str },
+
+    /// Resolve an OUT link's TARGET ([`OutTarget`]) and hand it to the record
+    /// through [`Record::set_resolved_out_target`], BEFORE `process()` runs.
+    ///
+    /// **Pre-process action** — the OUT-link twin of [`Self::ReadDbLink`],
+    /// and C's `checkLinks`-cached `lnk_field_type`: a record whose fire-time
+    /// branch depends on the target's DBF class (sseq decides the wire buffer
+    /// AND whether a `WAITn` put-callback is issued from the one switch,
+    /// `sseqRecord.c:714-792`) must have the class in hand when it decides, not
+    /// after the framework's put path has already been entered.
+    ResolveOutTarget { link_field: &'static str },
 
     /// Read a value from a DB link into a record field. The framework reads
     /// `link_field` from the record to get the source PV name, reads that PV,
@@ -2073,9 +2122,56 @@ pub trait Record: Send + Sync + 'static {
     ///
     /// Default: `None`. Only a record that emits one of the two typed-write
     /// seams reaches this, and it must override.
+    ///
+    /// A record that must know the ANSWER before its `process()` runs — because
+    /// the same switch decides something else as well — asks for the target
+    /// ahead of time with [`ProcessAction::ResolveOutTarget`] and calls this
+    /// itself; see [`Self::set_resolved_out_target`].
     fn typed_output_buffer(&self, link_field: &str, target: &OutTarget) -> Option<EpicsValue> {
         let _ = (link_field, target);
         None
+    }
+
+    /// Receive the RESOLVED target of an OUT link the record asked to have
+    /// resolved before this cycle's `process()`
+    /// ([`ProcessAction::ResolveOutTarget`]).
+    ///
+    /// C resolves an OUT link's DBF class OUTSIDE the put — `checkLinks` caches
+    /// it in the record (`sseqRecord.c:202-250`) — so `processCallback` can make
+    /// ONE decision from it: which view goes on the wire, AND whether a
+    /// put-callback is issued (hence whether `waiting` is raised). Its
+    /// `default:` arm (`:790`) does neither. A record that learns the class only
+    /// from inside the framework's put path cannot keep those two halves
+    /// together: it has to raise `waiting` first and find out afterwards that no
+    /// put was made. This hook is that cached class — the record decides, then
+    /// acts.
+    ///
+    /// Default: no-op. Only a record that emits the action reaches this.
+    fn set_resolved_out_target(&mut self, link_field: &str, target: OutTarget) {
+        let _ = (link_field, target);
+    }
+
+    /// The `dbrType` this record's [`ProcessAction::ReadDbLink`] on
+    /// `link_field` asks the SOURCE for — the READ twin of
+    /// [`Self::typed_output_buffer`], and C's `dbGetLink` second argument.
+    ///
+    /// `source` is the far end of the input link as C's
+    /// `dbGetLinkDBFtype`/`dbGetNelements` report it (the same lset accessors
+    /// the OUT side uses — sseq asks them of `dol` at `sseqRecord.c:641` and of
+    /// `lnk` at `:709`), resolved by the framework
+    /// ([`PvDatabase::resolve_out_target`](crate::server::database::PvDatabase)).
+    ///
+    /// `None` means C's `default: break` — **no read at all**, the arm a source
+    /// class the record's switch does not name falls to (an unresolvable /
+    /// constant / disconnected source, and sseq's un-cased `DBF_INT64`). The
+    /// link is left untouched and no LINK alarm is raised, exactly as C's
+    /// skipped `dbGetLink` call leaves `status` alone.
+    ///
+    /// Default: [`LinkReadAs::Native`] — the source's native value, coerced at
+    /// the target field's own put boundary.
+    fn input_link_read_as(&self, link_field: &str, source: &OutTarget) -> Option<LinkReadAs> {
+        let _ = (link_field, source);
+        Some(LinkReadAs::Native)
     }
 
     /// Return the name of the output event (`OEVT`) to post this cycle, or

@@ -3750,6 +3750,15 @@ impl PvDatabase {
     /// READER to the source's severity. That inheritance runs here too, through
     /// [`Database::input_link_inheritance`] — the same owner the multi-input
     /// fetch uses.
+    ///
+    /// The DBR class of the read is the RECORD's
+    /// ([`Record::input_link_read_as`], C's `dbGetLink` `dbrType` argument),
+    /// resolved from the SOURCE's metadata by the same owner the OUT side uses
+    /// ([`Self::resolve_out_target`]): a record that switches on the source's
+    /// DBF class (sseq `DOLn`, `sseqRecord.c:640-705`) gets the value C's
+    /// `dbGetLink` would deliver — an `ENUM`/`MENU` source's LABEL, a `CHAR`
+    /// array's bytes — instead of a native value it would have to guess at.
+    /// `None` from the record is C's `default: break`: no read, no alarm.
     async fn read_db_link_into_field(
         &self,
         rec: &Arc<crate::runtime::sync::RwLock<RecordInstance>>,
@@ -3777,7 +3786,23 @@ impl PvDatabase {
             return None;
         }
         let parsed = crate::server::record::parse_link_v2(link_str.as_str_lossy().as_ref());
-        match self.read_link_value(&parsed, visited, depth).await {
+        // The source's DBF class + element count (C `dbGetLinkDBFtype` /
+        // `dbGetNelements` — the same lset accessors the OUT side asks of a
+        // destination), resolved with NO record lock held: a self-referencing
+        // link would otherwise re-enter this record's own gate.
+        let source = self.resolve_out_target(&parsed).await;
+        let read_as = {
+            let instance = rec.read().await;
+            instance.record.input_link_read_as(link_field, &source)
+        };
+        // C's `default:` arm — the record's switch has no case for this source
+        // class, so `dbGetLink` is never called: nothing is attempted, and the
+        // untouched `status` raises no link alarm.
+        let read_as = read_as?;
+        match self
+            .read_link_value_as(&parsed, read_as, visited, depth)
+            .await
+        {
             Some(value) => {
                 // C `dbDbGetValue` tail (dbDbLink.c:228-232): a healthy read
                 // folds the SOURCE's committed alarm into the READER per the
@@ -3789,7 +3814,20 @@ impl PvDatabase {
                         .await
                 };
                 let mut instance = rec.write().await;
-                let _ = instance.record.put_field_internal(target_field, value);
+                // A value the target field REJECTS is a failed read, not a
+                // silent no-op: C `dbGetLink`'s conversion failure comes back as
+                // a non-zero status and takes the `setLinkAlarm` path
+                // (`dbLink.c:316-323`) exactly like a dead target. Discarding it
+                // left the target field holding its previous value with no
+                // alarm to say so.
+                let stored = instance
+                    .record
+                    .put_field_internal(target_field, value)
+                    .is_ok();
+                if !stored {
+                    crate::server::recgbl::rec_gbl_set_link_alarm(&mut instance.common, link_field);
+                    return Some(false);
+                }
                 if let Some((ms, alarm)) = inheritance {
                     super::links::inherit_sevr_msg(&mut instance.common, ms, &alarm);
                 }
@@ -3817,19 +3855,52 @@ impl PvDatabase {
         use crate::server::record::ProcessAction;
         let mut resolved = Vec::new();
         for action in actions {
-            if let ProcessAction::ReadDbLink {
-                link_field,
-                target_field,
-            } = action
-                && self
-                    .read_db_link_into_field(rec, link_field, target_field, visited, depth)
-                    .await
-                    == Some(true)
-            {
-                resolved.push(*link_field);
+            match action {
+                ProcessAction::ReadDbLink {
+                    link_field,
+                    target_field,
+                } => {
+                    if self
+                        .read_db_link_into_field(rec, link_field, target_field, visited, depth)
+                        .await
+                        == Some(true)
+                    {
+                        resolved.push(*link_field);
+                    }
+                }
+                // The OUT-link twin: resolve the target's class and hand it to
+                // the record, so its `process()` can branch on it (C's
+                // `checkLinks`-cached `lnk_field_type`).
+                ProcessAction::ResolveOutTarget { link_field } => {
+                    self.resolve_out_target_into_record(rec, link_field).await;
+                }
+                _ => {}
             }
         }
         resolved
+    }
+
+    /// Resolve one OUT link's TARGET and hand it to the record ahead of
+    /// `process()` — [`ProcessAction::ResolveOutTarget`].
+    ///
+    /// The record's own link string is the input, so an empty/constant `LNKn`
+    /// resolves to [`OutTarget::UNRESOLVED`] and the record sees "no target",
+    /// which is the answer C's `default:` arm acts on.
+    async fn resolve_out_target_into_record(
+        &self,
+        rec: &Arc<crate::runtime::sync::RwLock<RecordInstance>>,
+        link_field: &'static str,
+    ) {
+        let link_str = match rec.read().await.record.get_field(link_field) {
+            Some(EpicsValue::String(s)) => s.as_str_lossy().into_owned(),
+            _ => String::new(),
+        };
+        let parsed = crate::server::record::parse_output_link_v2(&link_str);
+        let target = self.resolve_out_target(&parsed).await;
+        rec.write()
+            .await
+            .record
+            .set_resolved_out_target(link_field, target);
     }
 
     /// Execute ProcessActions returned by a record's process() call.
@@ -3862,6 +3933,10 @@ impl PvDatabase {
                     self.read_db_link_into_field(rec, link_field, target_field, visited, depth)
                         .await;
                 }
+                // A pre-process action (the record asks for the target BEFORE it
+                // decides), so it is a no-op if it reaches the post-process
+                // stage — the resolve here would be too late to change anything.
+                ProcessAction::ResolveOutTarget { .. } => {}
                 ProcessAction::WriteDbLink { link_field, value } => {
                     // 1. Get the link string (record fields → common fields)
                     // and the source PUTF for processTarget propagation,
@@ -5121,6 +5196,13 @@ pub(crate) fn seed_constant_links(instance: &mut RecordInstance) {
     //    that may or may not remember it (the iocsh `dbLoadRecords` path did
     //    not).
     instance.record.seed_deadband_tracking();
+
+    // C's init-time `db_post_events` run during iocInit, before any client can
+    // subscribe, so they are observable by nobody. A seed put that made the
+    // record MARK a field (sseq: seeding `STRn` re-derives `DOn`) must not leave
+    // that mark standing for the first process cycle to emit — that would turn a
+    // no-op C post into a real, late event. Drop the init-time marks.
+    let _ = instance.record.take_cycle_posted_fields();
 }
 
 impl PvDatabase {

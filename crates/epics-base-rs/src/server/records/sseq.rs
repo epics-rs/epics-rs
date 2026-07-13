@@ -5,8 +5,8 @@ use super::link_status::{
 use crate::error::{CaError, CaResult};
 use crate::server::database::AsyncDbHandle;
 use crate::server::record::{
-    FieldDesc, LinkType, OutTarget, ProcessAction, ProcessOutcome, Record, RecordProcessResult,
-    parse_link_v2,
+    CyclePostMask, FieldDesc, LinkReadAs, LinkType, OutTarget, ProcessAction, ProcessOutcome,
+    Record, RecordProcessResult, parse_link_v2,
 };
 use crate::types::{DbFieldType, EpicsValue, PvString};
 use std::sync::Arc;
@@ -48,6 +48,9 @@ const DOL_FIELDS: [&str; NUM_STEPS] = [
 const DO_FIELDS: [&str; NUM_STEPS] = [
     "DO1", "DO2", "DO3", "DO4", "DO5", "DO6", "DO7", "DO8", "DO9", "DOA",
 ];
+const STR_FIELDS: [&str; NUM_STEPS] = [
+    "STR1", "STR2", "STR3", "STR4", "STR5", "STR6", "STR7", "STR8", "STR9", "STRA",
+];
 const LNK_FIELDS: [&str; NUM_STEPS] = [
     "LNK1", "LNK2", "LNK3", "LNK4", "LNK5", "LNK6", "LNK7", "LNK8", "LNK9", "LNKA",
 ];
@@ -88,34 +91,43 @@ fn wait_config_err(wait: i16, lnk_status: i16) -> i16 {
     i16::from(wait != 0 && lnk_status == LNKV_LOC)
 }
 
-/// The partner view each half of a step's value pair posts when it is written
-/// (C `special()` posts `s` after a `DOn` put and `dov` after a `STRn` put) —
-/// one single-element slice per step, so `monitor_side_effect_fields` can
-/// return a `&'static [&'static str]`.
-const STR_SIDE_EFFECT: [&[&str]; NUM_STEPS] = [
-    &["STR1"],
-    &["STR2"],
-    &["STR3"],
-    &["STR4"],
-    &["STR5"],
-    &["STR6"],
-    &["STR7"],
-    &["STR8"],
-    &["STR9"],
-    &["STRA"],
+/// Both halves of every step's value pair — the fields whose ONLY post path is
+/// the record's own mark ([`Record::fields_posted_only_when_marked`]).
+///
+/// C never change-detects `DOn`/`STRn`: every post of either is an explicit
+/// `db_post_events` made by the code that WROTE it, with that call site's mask
+/// and that call site's own comparison (`special()` :1108-1116/:1128-1131,
+/// `processCallback` :657-661/:676-680). Change detection cannot reproduce
+/// them — it knows neither which of the two views was written (so it cannot
+/// tell `DBE_VALUE|DBE_LOG` from a bare `DBE_VALUE`) nor that a client `caput`
+/// to `DOn` already posted `DOn` on the put path. So the record marks both, and
+/// the framework's change loop must not see them at all.
+static VALUE_PAIR_FIELDS: [&str; 2 * NUM_STEPS] = [
+    "DO1", "DO2", "DO3", "DO4", "DO5", "DO6", "DO7", "DO8", "DO9", "DOA", "STR1", "STR2", "STR3",
+    "STR4", "STR5", "STR6", "STR7", "STR8", "STR9", "STRA",
 ];
-const DO_SIDE_EFFECT: [&[&str]; NUM_STEPS] = [
-    &["DO1"],
-    &["DO2"],
-    &["DO3"],
-    &["DO4"],
-    &["DO5"],
-    &["DO6"],
-    &["DO7"],
-    &["DO8"],
-    &["DO9"],
-    &["DOA"],
-];
+
+/// Which half of a step's value pair a write came FROM — the other half is
+/// DERIVED from it, and the two post with different masks.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StepView {
+    /// The write set `DOn`; `STRn` was re-rendered from it.
+    Numeric,
+    /// The write set `STRn`; `DOn` was re-read from it as `atof(s)`.
+    String,
+}
+
+/// What a write to a step's value pair actually MOVED — the writer's report,
+/// and the only thing that decides what posts. C tests each view separately
+/// (`if (d != plinkGroup->dov)`, `if (strcmp(str, plinkGroup->s))`) and posts
+/// only the ones that moved, so a re-write of the same value posts nothing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+struct StepWrite {
+    /// `dov` differs from what it was before the write.
+    numeric_changed: bool,
+    /// `s` differs from what it was before the write.
+    string_changed: bool,
+}
 
 /// State of the sseq async sequence machine.
 ///
@@ -191,6 +203,14 @@ struct SseqStep {
     dol_field_type: i16, // DTn — DOL target field type (C dbStatic DBF_* / -1)
     lnk_field_type: i16, // LTn — LNK target field type (C dbStatic DBF_* / -1)
     wait_err: i16,       // WERRn — wait-config error (see refresh_link_status)
+    /// The `LNKn` TARGET as the framework resolved it for THIS cycle
+    /// (`ProcessAction::ResolveOutTarget`, requested in `pre_process_actions`
+    /// for the step about to fire) — C's `checkLinks`-cached `lnk_field_type`
+    /// plus the `dbGetNelements` C re-reads at fire time. `fire_current_step`
+    /// makes C's whole switch decision from it before anything is issued.
+    /// `UNRESOLVED` until the framework fills it, which is the same answer C's
+    /// `default:` arm acts on.
+    lnk_target: OutTarget,
 }
 
 impl SseqStep {
@@ -204,18 +224,37 @@ impl SseqStep {
     /// the `processCallback` link read (:657-661, :676-680). A write that
     /// updates one view and leaves the other stale is the defect — so no site
     /// assigns `dov`/`str_val` directly; every one goes through this pair.
-    fn set_numeric(&mut self, dov: f64, prec: i16) {
+    ///
+    /// `PREC` is `DBF_SHORT` and reaches C's
+    /// `cvtDoubleToString(double, char*, epicsUInt16 prec)` by implicit
+    /// conversion, which REINTERPRETS a negative value rather than clamping it:
+    /// `PREC=-1` arrives as 65535, takes `cvtFast.c:111`'s `precision > 8`
+    /// branch, caps at 17 and renders `%*.*e` — `STRn` of 3.7 becomes
+    /// ` 3.70000000000000018e+00`, not `4`. `as u16` is that reinterpretation.
+    fn set_numeric(&mut self, dov: f64, prec: i16) -> StepWrite {
+        let s = PvString::from(crate::types::cvt_double_to_string(dov, prec as u16));
+        let w = StepWrite {
+            numeric_changed: self.dov != dov,
+            string_changed: self.str_val != s,
+        };
         self.dov = dov;
-        self.str_val = PvString::from(crate::types::cvt_double_to_string(dov, prec.max(0) as u16));
+        self.str_val = s;
+        w
     }
 
     /// Write the step's value FROM its string view, re-deriving the numeric
     /// view — the single owner of `s → dov` (C `dov = atof(s)`). The string
     /// is kept byte-exact; a non-numeric string is `0.0`, exactly as `atof`
     /// reports it.
-    fn set_string(&mut self, s: PvString) {
-        self.dov = EpicsValue::String(s.clone()).to_f64().unwrap_or(0.0);
+    fn set_string(&mut self, s: PvString) -> StepWrite {
+        let dov = EpicsValue::String(s.clone()).to_f64().unwrap_or(0.0);
+        let w = StepWrite {
+            numeric_changed: self.dov != dov,
+            string_changed: self.str_val != s,
+        };
+        self.dov = dov;
         self.str_val = s;
+        w
     }
 }
 
@@ -236,6 +275,7 @@ impl Default for SseqStep {
             dol_field_type: DBF_UNKNOWN,
             lnk_field_type: DBF_UNKNOWN,
             wait_err: 0,
+            lnk_target: OutTarget::UNRESOLVED,
         }
     }
 }
@@ -288,6 +328,11 @@ pub struct SseqRecord {
     /// status posts (`BUSY`/`WTGn`/`ABORTING`) and the `ABORT` finish
     /// re-entry — the surfaces a `process()` cannot reach itself.
     async_ctx: Option<(String, AsyncDbHandle)>,
+    /// The `DOn`/`STRn` posts this cycle's writes OWE, each with the mask of
+    /// the C `db_post_events` call site that made it (see `mark_value_write`).
+    /// Drained by [`Record::take_cycle_posted_fields`] — on a put by the put
+    /// path, on a process cycle by the monitor loop.
+    pending_posts: Vec<(&'static str, CyclePostMask)>,
     /// Monotonic generation guarding `refresh_link_status`. Each refresh
     /// classifies a *snapshot* of the `DOLn`/`LNKn`/`WAITn` link state
     /// off-thread; a later refresh (a `special()` `DOLn`/`LNKn` re-point)
@@ -316,6 +361,7 @@ impl Default for SseqRecord {
             in_flight: Vec::new(),
             seq_wake: None,
             async_ctx: None,
+            pending_posts: Vec::new(),
             link_gen: LinkStatusGen::default(),
         }
     }
@@ -324,6 +370,51 @@ impl Default for SseqRecord {
 impl SseqRecord {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Record the posts a write to step `i`'s value pair owes, from the WRITER's
+    /// own report of what moved — the single owner of the `DOn`/`STRn` post
+    /// decision.
+    ///
+    /// C's rule is uniform across all four write sites: the view the write came
+    /// FROM posts `DBE_VALUE|DBE_LOG`, the view it DERIVED posts a bare
+    /// `DBE_VALUE`, and each posts only if its own comparison moved.
+    ///
+    /// ```c
+    /// /* processCallback, numeric arm (sseqRecord.c:672-683) */
+    /// if (d != plinkGroup->dov) db_post_events(pR, &plinkGroup->dov, DBE_VALUE|DBE_LOG);
+    /// cvtDoubleToString(plinkGroup->dov, str, pR->prec);
+    /// if (strcmp(str, plinkGroup->s)) { strcpy(...); db_post_events(pR, &plinkGroup->s, DBE_VALUE); }
+    /// /* special(), DOn put (sseqRecord.c:1112-1116) — dbPut already posted DOn */
+    /// cvtDoubleToString(plinkGroup->dov, str, pR->prec);
+    /// if (strcmp(str, plinkGroup->s)) { strcpy(...); db_post_events(pR, &plinkGroup->s, DBE_VALUE); }
+    /// ```
+    ///
+    /// `posts_direct` is that `dbPut` difference and nothing else: on a client
+    /// put the framework already posts the field written, so `special()` posts
+    /// the DERIVED view alone; on a `processCallback` link read there is no put
+    /// path, so the record owes BOTH.
+    fn mark_value_write(&mut self, i: usize, wrote: StepView, w: StepWrite, posts_direct: bool) {
+        let (direct, direct_changed, derived, derived_changed) = match wrote {
+            StepView::Numeric => (
+                DO_FIELDS[i],
+                w.numeric_changed,
+                STR_FIELDS[i],
+                w.string_changed,
+            ),
+            StepView::String => (
+                STR_FIELDS[i],
+                w.string_changed,
+                DO_FIELDS[i],
+                w.numeric_changed,
+            ),
+        };
+        if posts_direct && direct_changed {
+            self.pending_posts.push((direct, CyclePostMask::ValueLog));
+        }
+        if derived_changed {
+            self.pending_posts.push((derived, CyclePostMask::Value));
+        }
     }
 
     fn step_index_from_suffix(name: &str) -> Option<(usize, &str)> {
@@ -592,52 +683,71 @@ impl SseqRecord {
     /// machine — its put-callback joins `in_flight` and the sequence moves on,
     /// so several callbacks overlap exactly as C runs them.
     ///
-    /// The forwarded BUFFER is not chosen here: both put seams are the
-    /// destination-typed ones ([`ProcessAction::WriteDbLinkTyped`] /
-    /// `put_link_notify_typed`), so the framework resolves the `LNKn` target
-    /// and asks [`Self::typed_output_buffer`] — C's `processCallback` switch
-    /// on `dbGetLinkDBFtype(&lnk)` (sseqRecord.c:706-793).
+    /// C's `processCallback` switch (sseqRecord.c:714-792) is ONE decision with
+    /// two halves — the buffer that goes on the wire, and whether a
+    /// put-callback (hence `waiting`) is issued at all — and its `default:`
+    /// arm (:790) makes neither. So the buffer is decided FIRST, here, from the
+    /// `LNKn` target this cycle's [`ProcessAction::ResolveOutTarget`] put in
+    /// `lnk_target`; `None` is C's `default: break` and the step does nothing:
+    /// no put, no `WTGn`, no `in_flight` entry to strand the sequence.
+    ///
+    /// Both put seams then carry the buffer this one decision produced — the
+    /// framework never re-resolves the target and never makes a second,
+    /// possibly different, no-put call.
     fn fire_current_step(&mut self, live: &mut Vec<(String, EpicsValue)>) -> ProcessOutcome {
         let i = self.active[self.cursor];
-        let has_lnk = !self.steps[i].lnk.is_empty();
+        let buffer = self.typed_output_buffer(LNK_FIELDS[i], &self.steps[i].lnk_target);
         // C `processCallback` (sseqRecord.c:717,739,763) uses the
         // put-WITH-completion (`dbCaPutLinkCallback`, setting `waiting`) only
-        // when `usePutCallback && (plinkGroup->lnk.type == CA_LINK)`. A
-        // `WAITn` on a DB link takes the plain `dbPutLink` and never waits —
-        // C cannot attach a callback to it, and says so through `WERRn`
-        // (`checkLinks`, :915-927).
+        // when `usePutCallback && (plinkGroup->lnk.type == CA_LINK)` — and only
+        // INSIDE a class arm, i.e. only where a put is made at all. A `WAITn` on
+        // a DB link takes the plain `dbPutLink` and never waits — C cannot
+        // attach a callback to it, and says so through `WERRn` (`checkLinks`,
+        // :915-927).
         let waits = self.steps[i].wait != 0 && self.lnk_is_ca(i);
 
-        if waits && has_lnk {
-            // Non-blocking dispatch: the put-callback goes in flight and the
-            // machine advances. C `processCallback` increments `pcb->index`
-            // and calls `processNextLink` straight after firing, leaving the
-            // just-fired step `waiting` for the barrier scan to honour.
-            self.dispatch_waiting_step(i, live);
+        if let Some(value) = buffer {
+            if waits {
+                // Non-blocking dispatch: the put-callback goes in flight and the
+                // machine advances. C `processCallback` increments `pcb->index`
+                // and calls `processNextLink` straight after firing, leaving the
+                // just-fired step `waiting` for the barrier scan to honour.
+                self.dispatch_waiting_step(i, value, live);
+                self.cursor += 1;
+                return self.advance_sequence(live);
+            }
+
+            // No-wait step: a plain `dbPutLink`, then advance in the same cycle.
+            // The write rides ahead of the next step's scheduling action (or the
+            // drain / `Complete` tail), so `LNKn` lands before the sequence
+            // moves on.
+            let mut actions = vec![ProcessAction::WriteDbLink {
+                link_field: LNK_FIELDS[i],
+                value,
+            }];
             self.cursor += 1;
-            return self.advance_sequence(live);
+            let mut next = self.advance_sequence(live);
+            actions.append(&mut next.actions);
+            next.actions = actions;
+            return next;
         }
 
-        // No-wait step: a plain `dbPutLink` (`WriteDbLinkTyped`), then advance
-        // in the same cycle. The write rides ahead of the next step's
-        // scheduling action (or the drain / `Complete` tail), so `LNKn` lands
-        // before the sequence moves on.
-        let mut actions = Vec::new();
-        if has_lnk {
-            actions.push(ProcessAction::WriteDbLinkTyped {
-                link_field: LNK_FIELDS[i],
-            });
-        }
+        // C `default: break` — the target's class resolves to nothing this
+        // record can put (empty/constant `LNKn`, a name that resolves nowhere,
+        // an `INT64`/`UINT64` destination). No put, and therefore no wait.
         self.cursor += 1;
-        let mut next = self.advance_sequence(live);
-        actions.append(&mut next.actions);
-        next.actions = actions;
-        next
+        self.advance_sequence(live)
     }
 
     /// Dispatch a `WAITn` step's put-with-completion without blocking the
     /// machine: record it in `in_flight`, raise `WTGn`, and spawn a waiter
     /// that marks the entry done and wakes the machine on completion.
+    ///
+    /// Called ONLY with the buffer [`Self::fire_current_step`] already decided
+    /// on — C raises `waiting` inside the `dbCaPutLinkCallback` branch of a
+    /// class arm (sseqRecord.c:727-729, :748-750, :779-781), never before the
+    /// switch has said a put happens. `WTGn` up here and "no put" down there
+    /// cannot come apart, because there is no "down there" left to decide.
     ///
     /// The seam is `AsyncDbHandle::put_link_notify` (the non-blocking sibling
     /// of `ProcessAction::WriteDbLinkNotify`): it issues the same OUT-link
@@ -647,7 +757,12 @@ impl SseqRecord {
     /// sets `done` and notifies — so a waiter abandoned by a double `ABORT`
     /// cannot corrupt a later sequence (C `putCallbackCB`'s `waiting == 0`
     /// guard against abandoned callbacks, sseqRecord.c:540-560).
-    fn dispatch_waiting_step(&mut self, i: usize, live: &mut Vec<(String, EpicsValue)>) {
+    fn dispatch_waiting_step(
+        &mut self,
+        i: usize,
+        value: EpicsValue,
+        live: &mut Vec<(String, EpicsValue)>,
+    ) {
         self.steps[i].waiting = true;
         live.push((WTG_FIELDS[i].to_string(), EpicsValue::Short(1)));
         let done = Arc::new(AtomicBool::new(false));
@@ -663,7 +778,7 @@ impl SseqRecord {
             let link = self.steps[i].lnk.clone();
             tokio::spawn(async move {
                 if let Some(rx) = handle
-                    .put_link_notify_typed(&name, LNK_FIELDS[i], &link)
+                    .put_link_notify(&name, LNK_FIELDS[i], &link, value)
                     .await
                 {
                     // `Err` means the put vanished without firing — treat it as
@@ -961,6 +1076,8 @@ impl Record for SseqRecord {
             let prec = self.prec;
             for step in &mut self.steps {
                 step.dly = crate::runtime::time::quantize_to_sleep_quantum(step.dly);
+                // No mark: C's init-time `db_post_events` (:245, :248) run
+                // before any client can subscribe.
                 if step.str_val.is_empty() {
                     step.set_numeric(step.dov, prec);
                 } else {
@@ -971,20 +1088,31 @@ impl Record for SseqRecord {
         Ok(())
     }
 
-    /// The partner view a put to one half of a step's value pair refreshes.
+    /// C `special()` re-quantizes on a put to any `DLYn` and posts DLY1 — see
+    /// `special()` for the C quirk that makes it DLY1 and not the field written.
     ///
-    /// C `special()` writes the other view and posts it: a `DOn` put renders
-    /// `STRn` (sseqRecord.c:1108-1116), a `STRn` put re-reads `DOn`
-    /// (:1128-1131). A put to any `DLYn` re-quantizes and posts DLY1 — see
-    /// `special()` for the C quirk that makes it DLY1 and not the field
-    /// written.
+    /// The other `special()` side effect — the partner view of a `DOn`/`STRn`
+    /// put — is NOT here: a static field-name list cannot say "only if it
+    /// changed", and C posts the partner only when its own comparison moved. The
+    /// writer reports that instead (`mark_value_write` →
+    /// [`Record::take_cycle_posted_fields`]).
     fn monitor_side_effect_fields(&self, put_field: &str) -> &'static [&'static str] {
         match Self::step_index_from_suffix(put_field) {
             Some((_, "DLY")) => &["DLY1"],
-            Some((i, "DO")) => STR_SIDE_EFFECT[i],
-            Some((i, "STR")) => DO_SIDE_EFFECT[i],
             _ => &[],
         }
+    }
+
+    /// Every post of a `DOn`/`STRn` is one the record's own writer made
+    /// (`mark_value_write`), with that C call site's mask and comparison.
+    fn take_cycle_posted_fields(&mut self) -> Vec<(&'static str, CyclePostMask)> {
+        std::mem::take(&mut self.pending_posts)
+    }
+
+    /// C change-detects neither view of a step's value pair; see
+    /// [`VALUE_PAIR_FIELDS`].
+    fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
+        &VALUE_PAIR_FIELDS
     }
 
     /// C `sseqRecord.c:1155` posts the re-quantized DLY1 with a bare
@@ -1043,14 +1171,31 @@ impl Record for SseqRecord {
         // read is scoped to exactly that step here — not all steps up front.
         if self.phase == SeqPhase::Fire && self.cursor < self.active.len() {
             let i = self.active[self.cursor];
+            let mut actions = Vec::with_capacity(2);
             if !self.steps[i].dol.is_empty() {
-                return vec![ProcessAction::ReadDbLink {
+                actions.push(ProcessAction::ReadDbLink {
                     link_field: DOL_FIELDS[i],
                     target_field: DO_FIELDS[i],
-                }];
+                });
             }
+            // The step's OUT switch (sseqRecord.c:706-793) needs the `LNKn`
+            // target's class, and `fire_current_step` needs it BEFORE it decides
+            // anything — the same decision says which buffer goes out and
+            // whether a put-callback (and `WTGn`) is raised. Requested every
+            // fire, unconditionally: a step whose `LNKn` is empty or points
+            // nowhere must see THIS cycle's "no target", not a stale one.
+            actions.push(ProcessAction::ResolveOutTarget {
+                link_field: LNK_FIELDS[i],
+            });
+            return actions;
         }
         Vec::new()
+    }
+
+    fn set_resolved_out_target(&mut self, link_field: &str, target: OutTarget) {
+        if let Some((i, "LNK")) = Self::step_index_from_suffix(link_field) {
+            self.steps[i].lnk_target = target;
+        }
     }
 
     fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
@@ -1183,6 +1328,70 @@ impl Record for SseqRecord {
     // multi-output block. The retired `dispatch_multi_output` `MultiOut::Sseq`
     // arm was the old all-at-once path and no longer exists.
 
+    /// C `processCallback`'s SOURCE switch (sseqRecord.c:640-705) — the read
+    /// twin of the destination switch below. The step reads `DOLn` with the DBR
+    /// class the SOURCE's DBF class asks for, never the source's native value:
+    ///
+    /// - `DBF_STRING`/`ENUM`/`MENU`/`DEVICE`/`INLINK`/`OUTLINK`/`FWDLINK`
+    ///   (:644-661) — `DBR_STRING` into `s`/`STRn`, then `dov = atof(s)`. For an
+    ///   `ENUM`/`MENU` source that is the state LABEL ("Busy"), so `DOn` becomes
+    ///   `atof("Busy") == 0`, NOT the state index. The seven classes are the same
+    ///   set [`OutTarget::puts_as_string`] reports for the destination switch.
+    /// - `DBF_SHORT`..`DBF_DOUBLE` (:663-680) — `DBR_DOUBLE` into `dov`/`DOn`,
+    ///   then `STRn` is re-rendered at the record's PREC.
+    /// - `DBF_CHAR`/`DBF_UCHAR` (:682-700) — `min(n_elements, 40)` bytes into the
+    ///   40-byte `s`, then `dov = atof(s)`. The long-string idiom; a scalar
+    ///   `CHAR` source contributes its one byte, as C's `n_elements == 1` read
+    ///   does.
+    /// - anything else (:703, `default: break`) — **no read at all**: a CONSTANT
+    ///   `DOLn` (C's `init_record` pins it to `DBF_NOACCESS`, :206, so the switch
+    ///   never matches again — the constant is seeded once, at init, see
+    ///   [`Self::constant_init_links`]), a source whose type does not resolve,
+    ///   and `DBF_INT64`/`DBF_UINT64`, which the switch has no case for.
+    ///
+    /// `SELL` is not part of this switch: C reads it with a FIXED
+    /// `dbGetLink(&pR->sell, DBF_USHORT, &pR->seln, 0, 0)` (:314-317), so it
+    /// keeps the framework's native read and `SELN`'s own put coercion.
+    fn input_link_read_as(&self, link_field: &str, source: &OutTarget) -> Option<LinkReadAs> {
+        let Some((_, "DOL")) = Self::step_index_from_suffix(link_field) else {
+            return Some(LinkReadAs::Native);
+        };
+        if source.puts_as_string {
+            return Some(LinkReadAs::String);
+        }
+        match source.field_type? {
+            DbFieldType::String | DbFieldType::Enum => Some(LinkReadAs::String),
+            DbFieldType::Char | DbFieldType::UChar => Some(LinkReadAs::CharArrayAsString {
+                // C `if (n_elements>40) n_elements=40` against `char s[40]`.
+                max_elements: source.element_count.clamp(1, SSEQ_STRING_SIZE as i64) as usize,
+            }),
+            DbFieldType::Short
+            | DbFieldType::UShort
+            | DbFieldType::Long
+            | DbFieldType::ULong
+            | DbFieldType::Float
+            | DbFieldType::Double => Some(LinkReadAs::Double),
+            DbFieldType::Int64 | DbFieldType::UInt64 => None,
+        }
+    }
+
+    /// C `init_record` (sseqRecord.c:203-207): a CONSTANT `DOLn` is loaded ONCE,
+    /// here — `recGblInitConstantLink(&dol, DBF_DOUBLE, &dov)` then
+    /// `(&dol, DBF_STRING, s)`, followed by the `s[0] ? dov = atof(s)` tail
+    /// (:243-245), whose net effect is the record's own `set_string` of the link
+    /// TEXT. Seeding `STRn` (not `DOn`) reproduces both halves: the string view
+    /// keeps the constant's raw text ("1.50" stays "1.50", not the PREC
+    /// rendering of 1.5) and the numeric view follows as `atof`.
+    ///
+    /// The per-cycle read never sees a constant again — C pins its
+    /// `dol_field_type` to `DBF_NOACCESS`, which falls to `processCallback`'s
+    /// `default: break` ([`Self::input_link_read_as`]).
+    fn constant_init_links(&self) -> Vec<crate::server::record::ConstantInitLink> {
+        (0..NUM_STEPS)
+            .map(|i| crate::server::record::ConstantInitLink::new(DOL_FIELDS[i], STR_FIELDS[i]))
+            .collect()
+    }
+
     /// C `processCallback`'s destination switch (sseqRecord.c:706-793): the
     /// step forwards the view of its value that the `LNKn` TARGET's DBF class
     /// asks for, never the one its `DOLn` source happened to deliver.
@@ -1308,20 +1517,25 @@ impl Record for SseqRecord {
 
     fn put_field_internal(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
         // The framework's typed link read (`ProcessAction::ReadDbLink` →
-        // `DOn`) delivers the `DOLn` target's NATIVE value here. C
-        // `processCallback` reads `DOLn` by `dol_field_type`: a string-class
-        // source is read with `DBR_STRING` and kept byte-exact in `s`/`STRn`
-        // (then `dov = atof(s)`), NOT collapsed to a double
-        // (sseqRecord.c:643-705). A *client* put to `DOn` (`put_field`) is a
-        // plain `DBF_DOUBLE` convert, so this string-preserving capture is
-        // internal-only. Which view then reaches `LNKn` is the DESTINATION's
-        // choice, not the source's — see `typed_output_buffer`.
+        // `DOn`) delivers what C's `dbGetLink` delivered for the class the
+        // step's `DOLn` SOURCE resolved to (see `input_link_read_as`): a
+        // `DBR_STRING` for the string-class and `CHAR`-array arms, a
+        // `DBR_DOUBLE` for the numeric one. Both land in the step's value pair
+        // through its two owners below — a string keeps its bytes and `dov`
+        // follows as `atof(s)`; a double re-renders `STRn` at PREC. A *client*
+        // put to `DOn` (`put_field`) is a plain `DBF_DOUBLE` convert, so this
+        // string-preserving capture is internal-only. Which view then reaches
+        // `LNKn` is the DESTINATION's choice, not the source's — see
+        // `typed_output_buffer`.
         if let Some((idx, "DO")) = Self::step_index_from_suffix(name) {
             match value {
                 // C `processCallback` string arm (:657-661): the bytes are kept
                 // exactly and `dov` follows as `atof(s)`.
                 EpicsValue::String(s) => {
-                    self.steps[idx].set_string(s);
+                    let w = self.steps[idx].set_string(s);
+                    // Both views are the record's to post here: no put path ran,
+                    // so nothing else posts `STRn` (:661) or `DOn` (:665).
+                    self.mark_value_write(idx, StepView::String, w, true);
                     return Ok(());
                 }
                 // C `processCallback` numeric arm (:676-680): after reading
@@ -1332,7 +1546,8 @@ impl Record for SseqRecord {
                         .to_f64()
                         .ok_or_else(|| CaError::TypeMismatch(name.into()))?;
                     let prec = self.prec;
-                    self.steps[idx].set_numeric(dov, prec);
+                    let w = self.steps[idx].set_numeric(dov, prec);
+                    self.mark_value_write(idx, StepView::Numeric, w, true);
                     return Ok(());
                 }
             }
@@ -1474,7 +1689,10 @@ impl Record for SseqRecord {
                             let dov = value
                                 .to_f64()
                                 .ok_or_else(|| CaError::TypeMismatch(name.into()))?;
-                            step.set_numeric(dov, prec);
+                            let w = step.set_numeric(dov, prec);
+                            // The put path posts `DOn` itself (C `dbPut`), so
+                            // `special()` posts only the derived `STRn`.
+                            self.mark_value_write(idx, StepView::Numeric, w, false);
                             Ok(())
                         }
                         "LNK" => match value {
@@ -1488,7 +1706,8 @@ impl Record for SseqRecord {
                         // re-reads `DOn` as `atof(s)`.
                         "STR" => match value {
                             EpicsValue::String(s) => {
-                                step.set_string(s);
+                                let w = step.set_string(s);
+                                self.mark_value_write(idx, StepView::String, w, false);
                                 Ok(())
                             }
                             _ => Err(CaError::TypeMismatch(name.into())),
@@ -1888,15 +2107,69 @@ mod tests {
         );
     }
 
-    /// R16-2 — a put to one view posts the other (C `special()`'s
-    /// `db_post_events` on the partner field).
+    /// R16-2 / R17-4 — a put to one view posts the other, but the WRITER names
+    /// it, with C's mask (a bare `DBE_VALUE`) and C's change test. The static
+    /// list this test used to assert could express neither, so it over-posted:
+    /// it re-posted the partner even when C's `strcmp`/`!=` guard did not fire,
+    /// and it posted it with `DBE_VALUE|DBE_LOG`.
     #[test]
     fn test_sseq_value_pair_posts_its_partner() {
-        let rec = SseqRecord::new();
-        assert_eq!(rec.monitor_side_effect_fields("DO1"), &["STR1"]);
-        assert_eq!(rec.monitor_side_effect_fields("STRA"), &["DOA"]);
+        let mut rec = SseqRecord::new();
+        rec.put_field("PREC", EpicsValue::Short(2)).unwrap();
+
+        rec.put_field("DO1", EpicsValue::Double(3.7)).unwrap();
+        assert_eq!(
+            rec.take_cycle_posted_fields(),
+            vec![("STR1", CyclePostMask::Value)],
+            "a DOn put posts only the DERIVED STRn (dbPut posts DOn itself)"
+        );
+
+        rec.put_field("DO1", EpicsValue::Double(3.7)).unwrap();
+        assert!(
+            rec.take_cycle_posted_fields().is_empty(),
+            "STR1 still renders \"3.70\": C's strcmp guard posts nothing"
+        );
+
+        rec.put_field("STRA", EpicsValue::String("5".into()))
+            .unwrap();
+        assert_eq!(
+            rec.take_cycle_posted_fields(),
+            vec![("DOA", CyclePostMask::Value)],
+            "a STRn put posts only the derived DOn = atof(s)"
+        );
+
+        // The DLY quirk is a genuine static side effect and stays one.
         assert_eq!(rec.monitor_side_effect_fields("DLY3"), &["DLY1"]);
+        assert!(rec.monitor_side_effect_fields("DO1").is_empty());
         assert!(rec.monitor_side_effect_fields("LNK1").is_empty());
+    }
+
+    /// The `processCallback` link-read arms owe BOTH posts — no put path ran, so
+    /// nothing else posts the view that was read (sseqRecord.c:676-680).
+    #[test]
+    fn test_sseq_link_read_posts_both_views() {
+        let mut rec = SseqRecord::new();
+        rec.put_field("PREC", EpicsValue::Short(2)).unwrap();
+
+        rec.put_field_internal("DO1", EpicsValue::Double(3.7))
+            .unwrap();
+        assert_eq!(
+            rec.take_cycle_posted_fields(),
+            vec![
+                ("DO1", CyclePostMask::ValueLog),
+                ("STR1", CyclePostMask::Value)
+            ],
+            "numeric arm: dov with DBE_VALUE|DBE_LOG, the re-rendered s with DBE_VALUE"
+        );
+
+        rec.put_field_internal("DO2", EpicsValue::String("abc".into()))
+            .unwrap();
+        assert_eq!(
+            rec.take_cycle_posted_fields(),
+            vec![("STR2", CyclePostMask::ValueLog)],
+            "string arm: s with DBE_VALUE|DBE_LOG; dov stayed 0.0 (atof(\"abc\")), \
+             and C posts it only `if (d != plinkGroup->dov)`"
+        );
     }
 
     #[test]
@@ -1945,5 +2218,30 @@ mod tests {
             let f = fields.iter().find(|f| f.name == rw_name).unwrap();
             assert!(!f.read_only, "{rw_name} stays writable");
         }
+    }
+
+    /// R17-1: a NEGATIVE `PREC` reaches C's
+    /// `cvtDoubleToString(dov, s, epicsUInt16 prec)` REINTERPRETED, not clamped
+    /// — `PREC=-1` is 65535, so `STRn` is the 17-digit `%*.*e` rendering.
+    /// Ground truth, compiled libCom: `cvtDoubleToString(3.7, b, (short)-1)` →
+    /// ` 3.70000000000000018e+00`.
+    #[test]
+    fn negative_prec_renders_strn_as_seventeen_digit_exponential() {
+        let mut rec = SseqRecord::new();
+        rec.put_field("PREC", EpicsValue::Short(-1)).unwrap();
+        rec.put_field("DO1", EpicsValue::Double(3.7)).unwrap();
+        assert_eq!(
+            rec.get_field("STR1"),
+            Some(EpicsValue::String(" 3.70000000000000018e+00".into())),
+            "PREC=-1 is epicsUInt16 65535, not a clamp to 0 (which printed \"4\")"
+        );
+
+        // A non-negative PREC is untouched.
+        rec.put_field("PREC", EpicsValue::Short(2)).unwrap();
+        rec.put_field("DO1", EpicsValue::Double(3.7)).unwrap();
+        assert_eq!(
+            rec.get_field("STR1"),
+            Some(EpicsValue::String("3.70".into()))
+        );
     }
 }

@@ -92,10 +92,17 @@ fn convert_value_to_dbr_string(
 ) -> EpicsValue {
     // C precision = record `get_precision` (PREC field), default 6 when the
     // record exposes no `get_precision` RSET (here: no display metadata).
+    //
+    // A NEGATIVE PREC is not clamped: C hands the `long precision` straight to
+    // `cvtDoubleToString(double, char*, epicsUInt16 precision)`
+    // (`dbConvert.c:786`), and the implicit conversion REINTERPRETS it — PREC=-1
+    // arrives as 65535, which takes the `precision > 8` branch, caps at 17 and
+    // renders `%*.*e` (compiled: `caget -S` of a PREC=-1 ai gives
+    // ` 3.70000000000000018e+00`). Clamping to 0 printed `4` instead.
     let prec = snapshot
         .display
         .as_ref()
-        .map(|d| d.precision.max(0) as u16)
+        .map(|d| d.precision as u16)
         .unwrap_or(6);
     match value {
         EpicsValue::Double(v) => EpicsValue::String(cvt_double_to_string(*v, prec).into()),
@@ -1585,6 +1592,61 @@ mod r58_enum_label_tests {
         assert_eq!(
             convert_value_to_dbr_string(&s.value, &s),
             EpicsValue::String("1".into())
+        );
+    }
+}
+
+#[cfg(test)]
+mod r17_1_negative_precision_tests {
+    //! R17-1: a NEGATIVE `PREC` is REINTERPRETED as `epicsUInt16`, never
+    //! clamped. C `getDoubleString` (dbConvert.c:786) passes the `long
+    //! precision` its `get_precision` RSET returned straight into
+    //! `cvtDoubleToString(double, char*, epicsUInt16 precision)`, and the
+    //! implicit conversion makes `PREC=-1` a precision of 65535 — the
+    //! `precision > 8` branch (cvtFast.c:111), capped at 17, `%*.*e`.
+    //!
+    //! Ground truth, compiled libCom (`cvtDoubleToString(3.7, b, (short)-1)`):
+    //! ` 3.70000000000000018e+00`; `cvtFloatToString(3.7f, b, (short)-1)`:
+    //! `3.700000047684e+00` (its own cap is 12).
+    use super::{EpicsValue, convert_value_to_dbr_string};
+    use crate::server::snapshot::{DisplayInfo, Snapshot};
+    use std::time::SystemTime;
+
+    fn snap_with_prec(value: EpicsValue, precision: i16) -> Snapshot {
+        let mut s = Snapshot::new(value, 0, 0, SystemTime::UNIX_EPOCH);
+        s.display = Some(DisplayInfo {
+            precision,
+            ..Default::default()
+        });
+        s
+    }
+
+    #[test]
+    fn double_with_negative_prec_renders_seventeen_digit_exponential() {
+        let s = snap_with_prec(EpicsValue::Double(3.7), -1);
+        assert_eq!(
+            convert_value_to_dbr_string(&s.value, &s),
+            EpicsValue::String(" 3.70000000000000018e+00".into()),
+            "PREC=-1 is epicsUInt16 65535, not a clamp to 0"
+        );
+    }
+
+    #[test]
+    fn float_with_negative_prec_renders_twelve_digit_exponential() {
+        let s = snap_with_prec(EpicsValue::Float(3.7), -1);
+        assert_eq!(
+            convert_value_to_dbr_string(&s.value, &s),
+            EpicsValue::String("3.700000047684e+00".into()),
+            "cvtFloatToString caps the reinterpreted precision at 12"
+        );
+    }
+
+    #[test]
+    fn non_negative_prec_is_unchanged() {
+        let s = snap_with_prec(EpicsValue::Double(3.7), 2);
+        assert_eq!(
+            convert_value_to_dbr_string(&s.value, &s),
+            EpicsValue::String("3.70".into())
         );
     }
 }

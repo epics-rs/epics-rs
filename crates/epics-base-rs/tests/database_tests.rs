@@ -7501,6 +7501,54 @@ async fn test_compress_val_no_mod_under_lifo_balg() {
     assert_eq!(inst.record.get_field("NUSE"), Some(EpicsValue::Long(1)));
 }
 
+/// C `field(CSTA,DBF_SHORT){ special(SPC_NOMOD) }`
+/// (`histogramRecord.dbd.pod:170-175`): the collection state is toggled only
+/// through CMD (`histogramRecord.c:246-259`), never by a client put. softIoc:
+///
+/// ```text
+/// dbpf HI.CSTA 0
+/// recGblDbaddrError: dbPut Attempt to modify noMod field PV: HI.CSTA
+/// dbgf HI.CSTA -> 1
+/// ```
+///
+/// Pre-fix the port accepted the put on every route, so a caput silently
+/// stopped a live acquisition.
+#[tokio::test]
+async fn test_histogram_csta_is_no_mod() {
+    use epics_base_rs::server::records::histogram::HistogramRecord;
+
+    let db = PvDatabase::new();
+    db.add_record("HI_CSTA", Box::new(HistogramRecord::new(4, 0.0, 8.0)))
+        .await
+        .unwrap();
+
+    let err = db
+        .put_record_field_from_ca("HI_CSTA", "CSTA", EpicsValue::Short(0))
+        .await
+        .expect_err("CSTA is special(SPC_NOMOD) — the put must be refused");
+    assert!(
+        matches!(err, CaError::ReadOnlyField(ref f) if f == "CSTA"),
+        "expected S_db_noMod on CSTA, got {err:?}"
+    );
+
+    let rec = db.get_record("HI_CSTA").await.unwrap();
+    assert_eq!(
+        rec.read().await.record.get_field("CSTA"),
+        Some(EpicsValue::Short(1)),
+        "a refused put must leave the live acquisition counting"
+    );
+
+    // CMD=3 (Stop) is the only route that clears it.
+    db.put_record_field_from_ca("HI_CSTA", "CMD", EpicsValue::Short(3))
+        .await
+        .unwrap();
+    assert_eq!(
+        rec.read().await.record.get_field("CSTA"),
+        Some(EpicsValue::Short(0)),
+        "CMD=Stop is the owner of the counting state"
+    );
+}
+
 /// epics-base PR `dabcf89` (2021) regression: when an mbboDirect
 /// record initialises with no VAL set (UDF=true on the framework
 /// side) but with at least one B0..B1F bit set in the .db file,

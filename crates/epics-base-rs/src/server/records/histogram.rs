@@ -221,10 +221,18 @@ static HISTOGRAM_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         read_only: false,
     },
+    // C `field(CSTA,DBF_SHORT){ special(SPC_NOMOD) initial("1") }`
+    // (histogramRecord.dbd.pod:170-175). The collection state is the record's
+    // own — it is toggled ONLY through CMD's SPC_CALC `special()`
+    // (histogramRecord.c:246-259: `cmd == 2` → `csta = TRUE`, `cmd == 3` →
+    // `csta = FALSE`) — so a client put is refused: softIoc `dbpf HI.CSTA 0` →
+    // "dbPut Attempt to modify noMod field PV: HI.CSTA". Runtime-immutable via
+    // the field_io `read_only` gate; the `put_field` arm below still serves the
+    // load path, which in C bypasses SPC_NOMOD through dbStaticLib.
     FieldDesc {
         name: "CSTA",
         dbf_type: DbFieldType::Short,
-        read_only: false,
+        read_only: true,
     },
     FieldDesc {
         name: "SDEL",
@@ -479,6 +487,8 @@ impl Record for HistogramRecord {
                 }
                 _ => Err(CaError::TypeMismatch("CMD".into())),
             },
+            // `special(SPC_NOMOD)` — the load path only (see the FieldDesc).
+            // At runtime CSTA moves through CMD's `special()`, never here.
             "CSTA" => match value {
                 EpicsValue::Short(v) => {
                     self.csta = v != 0;

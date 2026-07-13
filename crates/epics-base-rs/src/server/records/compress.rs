@@ -144,17 +144,46 @@ impl CompressRecord {
         }
     }
 
-    /// Clear the running accumulator and output buffer — the body of C
-    /// `reset()` (compressRecord.c:85-99). Single owner shared by the
-    /// SPC_RESET path (`RES` write) and the INP element-count-change path in
-    /// `push_array`. Does NOT touch the C-1 completion gate
-    /// (`cycle_ingested`/`cycle_emitted`): a reset emits nothing, so the gate
-    /// stays whatever the surrounding cycle set it to.
-    fn reset_accumulators(&mut self) {
+    /// C `reset()` (compressRecord.c:85-99) — **the single owner of the
+    /// compress buffer reset**.
+    ///
+    /// ```c
+    /// prec->nuse = 0; prec->off = 0; prec->inx = 0;
+    /// prec->cvb = 0.0; prec->res = 0;
+    /// if (prec->alg == compressALG_Average && prec->sptr == NULL)
+    ///     prec->sptr = calloc(prec->nsam, sizeof(double));
+    /// if (prec->bptr && prec->nsam)
+    ///     memset(prec->bptr, 0, prec->nsam * sizeof(double));
+    /// ```
+    ///
+    /// INVARIANT: every C `SPC_RESET` write reaches exactly this body. C has
+    /// one caller shape — `special()` (compressRecord.c:377-393) runs
+    /// `reset(); monitor();` for the field index it was handed, whichever of
+    /// the five `special(SPC_RESET)` fields it is (RES, ALG, PBUF, BALG, N;
+    /// compressRecord.dbd.pod:396-437) — plus `init_record` pass 0 and the
+    /// INP element-count change in `process()`. The port's owners are
+    /// [`Record::special`], [`Record::init_record`] and `push_array`; no put
+    /// arm resets on its own.
+    ///
+    /// `res = 0` is part of the reset, not of the RES put arm: C stores the
+    /// written RES and `special()` then zeroes it, which is why `caput RES 1`
+    /// reads back 0 (softIoc: `dbpf CMP.RES 1` → `DBF_SHORT: 0`).
+    ///
+    /// The `accum` clear is C's summing-buffer handling: C only *allocates*
+    /// `sptr` (it does not zero an existing one), but it also sets `inx = 0`,
+    /// and `push_array_average` overwrites the accumulator wholesale at
+    /// `inx == 0`, so dropping the allocation is equivalent and re-allocates
+    /// lazily at the next Average cycle.
+    ///
+    /// Does NOT touch the C-1 completion gate (`cycle_ingested`/
+    /// `cycle_emitted`): a reset emits nothing, so the gate stays whatever the
+    /// surrounding cycle set it to.
+    fn reset(&mut self) {
         self.off = 0;
         self.nuse = 0;
         self.inx = 0;
         self.cvb = 0.0;
+        self.res = 0;
         self.accum.clear();
         for v in &mut self.val {
             *v = 0.0;
@@ -338,7 +367,7 @@ impl CompressRecord {
         if self.inp_read_pending {
             self.inp_read_pending = false;
             if self.inpn != 0 && input.len() != self.inpn {
-                self.reset_accumulators();
+                self.reset();
             }
             self.inpn = input.len();
         }
@@ -540,19 +569,61 @@ const COMPRESS_ALG_CHOICES: &[&str] = &[
 /// C `menu(bufferingALG)` (`compressRecord.dbd.pod:57-59`).
 const COMPRESS_BALG_CHOICES: &[&str] = &["FIFO Buffer", "LIFO Buffer"];
 
+/// The five fields `compressRecord.dbd.pod` declares `special(SPC_RESET)`:
+/// RES (:396-400), ALG (:402-408), PBUF (:409-416), BALG (:417-423) and
+/// N (:431-437). C's `special()` (compressRecord.c:377-393) does not
+/// discriminate between them — any SPC_RESET write runs `reset(); monitor();` —
+/// so this list is both the [`Record::special`] trigger set and the
+/// [`Record::monitor_side_effect_fields`] key set. None of the five is
+/// `pp(TRUE)`, so the side-effect post is the only monitor the put produces.
+const COMPRESS_SPC_RESET_FIELDS: &[&str] = &["RES", "ALG", "PBUF", "BALG", "N"];
+
 impl Record for CompressRecord {
     fn record_type(&self) -> &'static str {
         "compress"
     }
 
-    fn monitor_side_effect_fields(&self, put_field: &str) -> &'static [&'static str] {
-        // C `compressRecord.c::reset` posts NUSE and VAL on a SPC_RESET
-        // write to RES; RES is not pp(TRUE), so this is the only monitor
-        // the put produces.
-        match put_field {
-            "RES" => &["NUSE", "VAL"],
-            _ => &[],
+    /// C `compressRecord.c::special` (:377-393) — the SPC_RESET hook:
+    ///
+    /// ```c
+    /// if (special_type == SPC_RESET) { reset(prec); monitor(prec); return 0; }
+    /// ```
+    ///
+    /// The field index never enters the decision, so ALL FIVE SPC_RESET fields
+    /// ([`COMPRESS_SPC_RESET_FIELDS`]) reset the buffer, not RES alone. The
+    /// `monitor()` half is [`Record::monitor_side_effect_fields`].
+    fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
+        if after && COMPRESS_SPC_RESET_FIELDS.contains(&field) {
+            self.reset();
         }
+        Ok(())
+    }
+
+    fn monitor_side_effect_fields(&self, put_field: &str) -> &'static [&'static str] {
+        // The `monitor(prec)` half of C's SPC_RESET `special()`: NUSE and VAL
+        // (compressRecord.c:100-110). Keyed on the same five fields as the
+        // reset itself — none of them is pp(TRUE), so this is the only monitor
+        // such a put produces.
+        if COMPRESS_SPC_RESET_FIELDS.contains(&put_field) {
+            &["NUSE", "VAL"]
+        } else {
+            &[]
+        }
+    }
+
+    /// C `init_record` pass 0 (compressRecord.c:307-315): allocate the sample
+    /// buffer, then `reset(prec)`. The reset is what clears a `.db`-loaded
+    /// `field(RES,"1")` — the static loader bypasses `special()`, so without
+    /// this pass the record would come up with RES stuck at 1.
+    fn init_record(&mut self, pass: u8) -> CaResult<()> {
+        if pass == 0 {
+            if self.nsam < 1 {
+                self.nsam = 1;
+                self.val = vec![0.0; 1];
+            }
+            self.reset();
+        }
+        Ok(())
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
@@ -560,16 +631,10 @@ impl Record for CompressRecord {
         // reached `push_array` (no INP, empty/error read, scalar via
         // `push_value`), so a later direct VAL put cannot inherit a stale mark.
         self.inp_read_pending = false;
-        if self.res != 0 {
-            // C `reset` (compressRecord.c:85-99) clears the running
-            // accumulator state too — `inx`, `cvb` and the summing
-            // buffer — not just `off`/`nuse`.
-            self.reset_accumulators();
-            self.res = 0;
-            // A reset publishes the cleared buffer (C `reset` is followed by
-            // `monitor`); never suppress on a reset cycle.
-            return Ok(ProcessOutcome::complete());
-        }
+        // C's `process()` does NOT inspect RES: the reset is `special()`'s, and
+        // `special()` zeroes RES as part of `reset()`. A record can never enter
+        // `process()` with RES set.
+        //
         // C `compressRecord.c:365` `if (status != 1)`: when this cycle's
         // ingestion (run during the pre-process INP read) accumulated without
         // emitting a compressed sample (C `status == 1`), the framework must
@@ -652,22 +717,14 @@ impl Record for CompressRecord {
                 }
                 _ => Err(CaError::TypeMismatch("N".into())),
             },
+            // The four SPC_RESET arms below (RES/ALG/N/BALG/PBUF) STORE ONLY.
+            // The reset is `special()`'s — C stores the value in `dbPut` and
+            // then runs `dbPutSpecial(paddr, 1)`, which is where `reset()`
+            // lives. That is also why RES reads back 0: `reset()` zeroes it
+            // after this arm stored the 1.
             "RES" => match value {
-                EpicsValue::Short(_) => {
-                    // epics-base 8ac2c87 (2025): writing any value to
-                    // RES triggers SPC_RESET — clear the circular
-                    // buffer and acknowledge by zeroing RES itself.
-                    // The framework should post a monitor event so
-                    // CA clients see the empty array immediately.
-                    self.nuse = 0;
-                    self.off = 0;
-                    self.inx = 0;
-                    self.cvb = 0.0;
-                    self.res = 0;
-                    self.accum.clear();
-                    let nsam = self.nsam.max(0) as usize;
-                    self.val.clear();
-                    self.val.resize(nsam, 0.0);
+                EpicsValue::Short(v) => {
+                    self.res = v;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("RES".into())),

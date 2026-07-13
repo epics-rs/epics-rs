@@ -7364,6 +7364,84 @@ async fn test_compress_res_write_posts_val_monitor() {
     assert_eq!(res, 0, "RES must auto-clear after the reset");
 }
 
+/// C `compressRecord.c::special` (:377-393) runs `reset(); monitor();` for
+/// EVERY `special(SPC_RESET)` field — RES, ALG, PBUF, BALG and N
+/// (`compressRecord.dbd.pod:396-437`) — never RES alone. softIoc transcript
+/// (compress NSAM=4, ALG="Circular Buffer"), after three `dbpf CMP.VAL`:
+///
+/// ```text
+/// dbgf CMP.NUSE            -> 3
+/// dbpf CMP.BALG "LIFO Buffer"
+/// dbgf CMP.NUSE            -> 0      dbgf CMP.OFF -> 0
+/// (refill to NUSE=2) dbpf CMP.N 2
+/// dbgf CMP.NUSE            -> 0      dbgf CMP.OFF -> 0
+/// (refill to NUSE=1) dbpf CMP.ALG "N to 1 Low Value"
+/// dbgf CMP.NUSE            -> 0
+/// ```
+///
+/// Pre-fix the port reset only on RES, so a BALG FIFO→LIFO switch re-read the
+/// stale ring in the new order and an N put corrupted the next emitted sample.
+#[tokio::test]
+async fn test_compress_every_spc_reset_field_resets_the_buffer() {
+    use epics_base_rs::server::records::compress::CompressRecord;
+
+    // Each SPC_RESET field, with the value a client would write.
+    for (field, value) in [
+        ("BALG", EpicsValue::Short(1)),
+        ("ALG", EpicsValue::Short(0)),
+        ("PBUF", EpicsValue::Short(1)),
+        ("N", EpicsValue::Long(2)),
+        ("RES", EpicsValue::Short(1)),
+    ] {
+        let db = PvDatabase::new();
+        let name = format!("CMP_{field}");
+        db.add_record(&name, Box::new(CompressRecord::new(4, 4)))
+            .await
+            .unwrap();
+
+        // Fill the ring: NUSE=3, OFF=3 (the softIoc pre-put state).
+        {
+            let rec = db.get_record(&name).await.unwrap();
+            let mut inst = rec.write().await;
+            for v in [1.0, 2.0, 3.0] {
+                inst.record.put_field("VAL", EpicsValue::Double(v)).unwrap();
+            }
+            assert_eq!(inst.record.get_field("NUSE"), Some(EpicsValue::Long(3)));
+        }
+
+        db.put_record_field_from_ca(&name, field, value)
+            .await
+            .unwrap_or_else(|e| panic!("caput {field} rejected: {e:?}"));
+
+        let rec = db.get_record(&name).await.unwrap();
+        let inst = rec.read().await;
+        assert_eq!(
+            inst.record.get_field("NUSE"),
+            Some(EpicsValue::Long(0)),
+            "a put to SPC_RESET field {field} must zero NUSE"
+        );
+        assert_eq!(
+            inst.record.get_field("OFF"),
+            Some(EpicsValue::Long(0)),
+            "a put to SPC_RESET field {field} must zero OFF"
+        );
+        match inst.record.get_field("VAL") {
+            Some(EpicsValue::DoubleArray(v)) => assert!(
+                v.is_empty(),
+                "a put to SPC_RESET field {field} must empty VAL (NUSE=0); got {v:?}"
+            ),
+            other => panic!("VAL must be DoubleArray, got {other:?}"),
+        }
+        // C's `reset()` zeroes RES itself, so it reads back 0 whatever was
+        // written (softIoc: `dbpf CMP.RES 1` echoes `DBF_SHORT: 0`).
+        assert_eq!(
+            inst.record.get_field("RES"),
+            Some(EpicsValue::Short(0)),
+            "reset() zeroes RES after a put to {field}"
+        );
+    }
+}
+
 /// epics-base PR `dabcf89` (2021) regression: when an mbboDirect
 /// record initialises with no VAL set (UDF=true on the framework
 /// side) but with at least one B0..B1F bit set in the .db file,

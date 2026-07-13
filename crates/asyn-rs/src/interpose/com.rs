@@ -754,6 +754,35 @@ impl ComPortOptions {
         }
     }
 
+    /// The SET-CONTROL byte to transmit when `key_mode` is being turned OFF.
+    ///
+    /// **DEVIATION from C, deliberate — CBUG-B6.** C's `crtscts` and `ixon`
+    /// branches both implement "n" as `xBuf[1] = pinterposePvt->flow`
+    /// (`asynInterposeCom.c:575`, `:591`) — the value transmitted for "turn this
+    /// off" is the port's **current** flow-control mode. So if RTS/CTS is on and
+    /// you send `crtscts N`, C re-transmits SET-CONTROL HWFLOW, the server
+    /// confirms HWFLOW, `:578` writes it back into `flow`, and `getOption` still
+    /// answers "Y". Flow control can be turned on and never off; recovery needs
+    /// an IOC restart or a terminal-server power cycle.
+    ///
+    /// `CPO_CONTROL_NOFLOW` ("No flow control", `:53`) is defined and is decoded
+    /// in `getOption` (`:684`, `:695`) — it is simply never assigned to
+    /// `xBuf[1]` anywhere in the file. Transmitting it is the intended
+    /// behaviour, and it is what this does.
+    ///
+    /// The mode byte carries ONE flow-control mode, so the modes are mutually
+    /// exclusive (which is why C advises "XON/XOFF already set. Now using
+    /// RTS/CTS."). Disabling therefore means: if `key_mode` is what is currently
+    /// in effect, turn flow control off; if some other mode is in effect, this
+    /// key's mode is already off and the other one is not ours to touch.
+    fn flow_mode_off(&self, key_mode: u8) -> u8 {
+        if self.flow == key_mode {
+            CPO_CONTROL_NOFLOW
+        } else {
+            self.flow
+        }
+    }
+
     /// C `setOption` (:474-655) — negotiate `key`/`val` with the server over
     /// `next`, the octet driver *below* the interpose, bounded by `user`'s
     /// timeout.
@@ -894,9 +923,8 @@ impl ComPortOptions {
             }
             Ok(())
         } else if key.eq_ignore_ascii_case("crtscts") {
-            // :569-584 — "y" turns hardware flow control on; "n" re-sends the
-            // *current* flow mode rather than NOFLOW, so switching RTS/CTS off
-            // while XON/XOFF is on leaves XON/XOFF running.
+            // :569-584 — "y" turns hardware flow control on. C's "n" re-sends the
+            // *current* flow mode; see `flow_mode_for` — CBUG-B6.
             //
             // :571-573 — switching to RTS/CTS over a live XON/XOFF setting is
             // announced in the message slot and does *not* fail the call.
@@ -904,7 +932,7 @@ impl ComPortOptions {
                 link.advise("XON/XOFF already set. Now using RTS/CTS.");
             }
             let mode = if val.eq_ignore_ascii_case("n") {
-                self.flow
+                self.flow_mode_off(CPO_CONTROL_HWFLOW)
             } else if val.eq_ignore_ascii_case("y") {
                 CPO_CONTROL_HWFLOW
             } else {
@@ -920,7 +948,7 @@ impl ComPortOptions {
                 link.advise("RTS/CTS already set. Now using XON/XOFF.");
             }
             let mode = if val.eq_ignore_ascii_case("n") {
-                self.flow
+                self.flow_mode_off(CPO_CONTROL_IXON)
             } else if val.eq_ignore_ascii_case("y") {
                 CPO_CONTROL_IXON
             } else {
@@ -1418,13 +1446,17 @@ mod tests {
         }
     }
 
-    /// Negative control for C :575 / :591. "crtscts n" does **not** send NOFLOW —
-    /// it re-sends whatever flow mode is currently cached. So turning RTS/CTS off
-    /// while XON/XOFF is on re-asserts XON/XOFF rather than disabling flow
-    /// control, and there is no way to reach NOFLOW from either key once flow
-    /// control is on.
+    /// Turning OFF the mode that is *not* the one in effect leaves the other one
+    /// alone: XON/XOFF is on, `crtscts n` says "hardware flow control off", and
+    /// hardware flow control is already off — so the cached mode is re-sent and
+    /// XON/XOFF keeps running. This is C's byte for this case too (:575) and it
+    /// is the right one; the mode byte carries a single mutually-exclusive mode,
+    /// so disabling RTS/CTS is not a licence to disable XON/XOFF.
+    ///
+    /// The case C gets WRONG is the other one — see
+    /// [`each_key_can_turn_its_own_flow_control_back_off`].
     #[test]
-    fn crtscts_n_resends_the_current_flow_mode_rather_than_noflow() {
+    fn turning_off_the_mode_that_is_not_in_effect_leaves_the_other_running() {
         let mut server = FakeServer::new(&ack(CPO_SET_CONTROL, &[CPO_CONTROL_IXON]));
         let mut com = ComPortOptions::new();
         com.set_option(&mut AsynUser::default(), &mut server, "ixon", "y")
@@ -1432,7 +1464,6 @@ mod tests {
         assert_eq!(com.get_option("ixon").unwrap(), "Y");
         assert_eq!(com.get_option("crtscts").unwrap(), "N");
 
-        // Now ask for crtscts off. C sends the cached mode — IXON — not NOFLOW.
         let mut server = FakeServer::new(&ack(CPO_SET_CONTROL, &[CPO_CONTROL_IXON]));
         com.set_option(&mut AsynUser::default(), &mut server, "crtscts", "n")
             .unwrap();
@@ -1449,6 +1480,58 @@ mod tests {
             ]
         );
         assert_eq!(com.get_option("ixon").unwrap(), "Y");
+    }
+
+    /// CBUG-B6 — each key can turn ITS OWN flow control back off, by
+    /// transmitting `CPO_CONTROL_NOFLOW`.
+    ///
+    /// In C, `xBuf[1] = pinterposePvt->flow` on both "n" branches (:575, :591),
+    /// so `crtscts N` with RTS/CTS on re-transmits HWFLOW, the server confirms
+    /// it, `:578` caches it back, and `getOption` still answers "Y" — flow
+    /// control can be enabled and never disabled. `CPO_CONTROL_NOFLOW` is
+    /// defined and decoded but assigned to `xBuf[1]` nowhere in the file.
+    #[test]
+    fn each_key_can_turn_its_own_flow_control_back_off() {
+        for (key, on_mode) in [("crtscts", CPO_CONTROL_HWFLOW), ("ixon", CPO_CONTROL_IXON)] {
+            let mut com = ComPortOptions::new();
+            let mut server = FakeServer::new(&ack(CPO_SET_CONTROL, &[on_mode]));
+            com.set_option(&mut AsynUser::default(), &mut server, key, "y")
+                .unwrap();
+            assert_eq!(com.get_option(key).unwrap(), "Y", "{key} on");
+
+            // C would re-send `on_mode` here and stay "Y" forever.
+            let mut server = FakeServer::new(&ack(CPO_SET_CONTROL, &[CPO_CONTROL_NOFLOW]));
+            com.set_option(&mut AsynUser::default(), &mut server, key, "n")
+                .unwrap();
+            assert_eq!(
+                server.written,
+                vec![
+                    IAC,
+                    SB,
+                    SB_COM_PORT_OPTION,
+                    CPO_SET_CONTROL,
+                    CPO_CONTROL_NOFLOW,
+                    IAC,
+                    SE
+                ],
+                "{key} off must transmit NOFLOW"
+            );
+            assert_eq!(com.get_option(key).unwrap(), "N", "{key} reads back off");
+            // And neither key claims the other is on.
+            assert_eq!(com.get_option("crtscts").unwrap(), "N");
+            assert_eq!(com.get_option("ixon").unwrap(), "N");
+        }
+    }
+
+    /// "n" when flow control is already off is a no-op: NOFLOW is re-sent.
+    #[test]
+    fn turning_flow_control_off_when_it_is_already_off_sends_noflow() {
+        let mut com = ComPortOptions::new();
+        let mut server = FakeServer::new(&ack(CPO_SET_CONTROL, &[CPO_CONTROL_NOFLOW]));
+        com.set_option(&mut AsynUser::default(), &mut server, "crtscts", "n")
+            .unwrap();
+        assert_eq!(server.written[4], CPO_CONTROL_NOFLOW);
+        assert_eq!(com.get_option("crtscts").unwrap(), "N");
     }
 
     #[test]

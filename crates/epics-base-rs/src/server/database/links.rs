@@ -267,13 +267,18 @@ pub(crate) enum MultiOutPhaseKind {
 }
 
 /// The phase argument of [`PvDatabase::dispatch_multi_output`]. The `Output`
-/// variant carries the record's PENDING severity, which C reads at the push
-/// decision (`dfanoutRecord.c:128`: `if (prec->nsev < INVALID_ALARM)
-/// push_values(); else switch (ivoa)`) — before the commit, so it is `nsev`
-/// and not the still-stale committed `sevr`.
+/// variant carries `skip_out` — the IVOA=Don't_drive veto as decided by the
+/// cycle's single IVOA owner (`process_record_with_links_inner`), on the
+/// severity `checkAlarms` produced. That is the one decision C makes
+/// (`dfanoutRecord.c:128`: `if (prec->nsev < INVALID_ALARM) push_values();
+/// else switch (ivoa)`), taken before ANY output runs; the IVOA=IVOV arm has
+/// already stored IVOV in the record's own value field
+/// ([`Record::apply_invalid_output_value`] — C `prec->val = prec->ivov`,
+/// dfanoutRecord.c:137), so the push here just reads VAL, as C's `push_values`
+/// does.
 #[derive(Clone, Copy)]
 pub(crate) enum MultiOutPhase {
-    Output { pending_sevr: AlarmSeverity },
+    Output { skip_out: bool },
     ForwardLink,
 }
 
@@ -1234,29 +1239,24 @@ impl PvDatabase {
         &self,
         rec: &Arc<RwLock<RecordInstance>>,
         src: OutLinkSrc<'_>,
+        skip_out: bool,
         visited: &mut HashSet<String>,
         depth: usize,
     ) {
         let pairs = {
             let instance = rec.read().await;
-            // Framework IVOA=Don't_drive veto for the multi-output OUT path,
-            // mirroring the single-OUT `skip_out` gate: on an INVALID cycle
-            // with IVOA=Don't_drive the OUT write is suppressed (execOutput
-            // `nsev >= INVALID` → Don't_drive `break`, sCalcoutRecord.c:794).
-            // The severity C tests there is the PENDING `nsev` — this dispatch
-            // runs before the commit, so `nsev` is what it reads.
-            let ivoa_dont_drive = instance.common.nsev
-                == crate::server::record::AlarmSeverity::Invalid
-                && matches!(
-                    instance.record.get_field("IVOA"),
-                    Some(EpicsValue::Short(1))
-                );
-            let links =
-                if ivoa_dont_drive || multi_output_dispatch_owned(instance.record.record_type()) {
-                    &[][..]
-                } else {
-                    instance.record.multi_output_links()
-                };
+            // IVOA=Don't_drive veto (execOutput `nsev >= INVALID` →
+            // Don't_drive `break`, sCalcoutRecord.c:794). `skip_out` is the
+            // decision the cycle's single IVOA owner already made, on the
+            // severity `checkAlarms` produced — re-deriving it here from
+            // `nsev` would read an alarm the OUT write above may have raised
+            // itself (a failed put's LINK_ALARM/INVALID), acting on a veto C
+            // never applied.
+            let links = if skip_out || multi_output_dispatch_owned(instance.record.record_type()) {
+                &[][..]
+            } else {
+                instance.record.multi_output_links()
+            };
             let mut pairs = Vec::new();
             for &(link_field, val_field) in links {
                 let link_str = match instance.record.get_field(link_field) {
@@ -1601,45 +1601,30 @@ impl PvDatabase {
                 "dfanout" => {
                     let selm = Self::field_i16(&instance, "SELM");
                     let seln = Self::field_u16(&instance, "SELN");
-                    // IVOA / IVOV — invalid output handling, mirrors
-                    // epics-base PR #688. When the record's pending
-                    // severity is INVALID, IVOA selects: 0 = continue (use
-                    // VAL as before), 1 = don't drive (suppress all OUT*),
-                    // 2 = set outputs to IVOV.
+                    // C `push_values` pushes `prec->val` — nothing else
+                    // (`dfanoutRecord.c:309/321/331`: `dbPutLink(plink,
+                    // DBR_DOUBLE, &prec->val, 1)`). IVOA is not re-decided
+                    // here: the cycle's IVOA owner already ran
                     //
-                    // C `dfanoutRecord.c:128` gates the push on the
-                    // *pending* `nsev` (`if (prec->nsev < INVALID_ALARM)
-                    // push_values(); else switch(ivoa)`), evaluated after
-                    // `checkAlarms` but before `recGblResetAlarms` commits
-                    // it. This dispatch runs in that same pre-commit window,
-                    // so the gate reads the caller-supplied pending
-                    // severity, not the still-stale committed `common.sevr`.
-                    let push_sevr = match phase {
-                        MultiOutPhase::Output { pending_sevr } => pending_sevr,
+                    //     case menuIvoaSet_output_to_IVOV:
+                    //         prec->val = prec->ivov;      /* :137 */
+                    //         push_values(prec);
+                    //
+                    // through `Record::apply_invalid_output_value`, so VAL
+                    // already IS IVOV when that arm was taken — and VAL, not a
+                    // second read of IVOV, is what the record posts to its own
+                    // monitors. `skip_out` is the Don't_drive veto (`:139`,
+                    // `break` — no push) from that same decision.
+                    //
+                    // Reading `nsev` here instead would re-derive the decision
+                    // AFTER the record's other outputs ran, off an alarm they
+                    // may have raised themselves.
+                    let val = match phase {
+                        MultiOutPhase::Output { skip_out: true } => None,
+                        MultiOutPhase::Output { skip_out: false } => instance.record.val(),
                         // Unreachable: the phase gate above already returned
                         // for a dfanout reached in the forward-link tail.
                         MultiOutPhase::ForwardLink => return None,
-                    };
-                    let raw_val = instance.record.val();
-                    let val = if push_sevr == crate::server::record::AlarmSeverity::Invalid {
-                        let ivoa = instance
-                            .record
-                            .get_field("IVOA")
-                            .and_then(|v| {
-                                if let EpicsValue::Short(s) = v {
-                                    Some(s)
-                                } else {
-                                    None
-                                }
-                            })
-                            .unwrap_or(0);
-                        match ivoa {
-                            1 => None, // suppress drive
-                            2 => instance.record.get_field("IVOV").or(raw_val),
-                            _ => raw_val, // 0 or unknown — Continue
-                        }
-                    } else {
-                        raw_val
                     };
                     let links: Vec<String> = DFANOUT_LINK_FIELDS
                         .iter()

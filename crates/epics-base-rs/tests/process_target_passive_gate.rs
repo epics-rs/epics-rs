@@ -101,3 +101,94 @@ async fn flnk_to_busy_passive_target_still_sets_rpro() {
     assert!(rpro, "a busy PASSIVE target is marked for reprocessing");
     assert!(!putf, "and its PUTF is cleared, as C does");
 }
+
+/// R18-94: the OTHER gate. A DB link writing `TARGET.PROC` carries no scan test
+/// (dbDbLink.c:387), so it processes the target on ANY scan — the arm the port
+/// had ANDed with Passive, while its own CA put route already honoured it.
+///
+/// softIoc — `SRCO.OUT="TGT.PROC"`, `TGT` on `SCAN="10 second"`:
+///
+/// ```text
+/// epics> dbgf TGT.VAL      DBF_DOUBLE: 0
+/// epics> dbpf SRCO.PROC 1
+/// epics> dbgf TGT.VAL      DBF_DOUBLE: 1
+/// epics> dbpf SRCO.PROC 1
+/// epics> dbgf TGT.VAL      DBF_DOUBLE: 2
+/// ```
+#[tokio::test]
+async fn db_link_to_proc_field_processes_a_non_passive_target() {
+    const DB: &str = r#"
+record(calcout, "SRCO") {
+    field(CALC, "1")
+    field(OUT, "TGT.PROC")
+}
+record(calc, "TGT") {
+    field(SCAN, "10 second")
+    field(CALC, "VAL+1")
+}
+"#;
+    let (db, _) = IocBuilder::new()
+        .db_string(DB, &std::collections::HashMap::new())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+
+    let val = async |db: &PvDatabase| -> f64 {
+        let inst = db.get_record("TGT").await.unwrap();
+        let inst = inst.read().await;
+        match inst.record.get_field("VAL") {
+            Some(EpicsValue::Double(v)) => v,
+            other => panic!("TGT.VAL: {other:?}"),
+        }
+    };
+
+    assert_eq!(val(&db).await, 0.0);
+    db.put_record_field_from_ca("SRCO", "PROC", EpicsValue::Long(1))
+        .await
+        .unwrap();
+    assert_eq!(
+        val(&db).await,
+        1.0,
+        "a .PROC write processes a 10s-scan target"
+    );
+    db.put_record_field_from_ca("SRCO", "PROC", EpicsValue::Long(1))
+        .await
+        .unwrap();
+    assert_eq!(val(&db).await, 2.0, "and again on the next write");
+}
+
+/// The `.PROC` gate is the only one that ignores SCAN: an ordinary `PP` OUT
+/// link to the same non-Passive target still does NOT process it
+/// (dbDbLink.c:388 — `pvlOptPP && pdest->scan == 0`).
+#[tokio::test]
+async fn pp_link_to_a_non_passive_target_still_does_not_process_it() {
+    const DB: &str = r#"
+record(calcout, "SRCV") {
+    field(CALC, "1")
+    field(OUT, "TGT.A PP")
+}
+record(calc, "TGT") {
+    field(SCAN, "10 second")
+    field(CALC, "A+1")
+}
+"#;
+    let (db, _) = IocBuilder::new()
+        .db_string(DB, &std::collections::HashMap::new())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+
+    db.put_record_field_from_ca("SRCV", "PROC", EpicsValue::Long(1))
+        .await
+        .unwrap();
+
+    let inst = db.get_record("TGT").await.unwrap();
+    let inst = inst.read().await;
+    assert_eq!(
+        inst.record.get_field("VAL"),
+        Some(EpicsValue::Double(0.0)),
+        "the PP arm keeps its scan test: a non-Passive target is not processed"
+    );
+}

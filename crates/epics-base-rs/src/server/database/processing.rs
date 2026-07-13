@@ -3639,8 +3639,15 @@ impl PvDatabase {
         // 5. FLNK — C `dbScanFwdLink` → `dbScanPassive` → `processTarget`,
         // through the single owner that holds the Passive gate.
         if let Some(flnk) = flnk_name {
-            self.process_target(flnk, src.putf, src.notify, visited, depth)
-                .await;
+            self.process_target(
+                flnk,
+                super::links::ProcessTargetGate::ScanPassive,
+                src.putf,
+                src.notify,
+                visited,
+                depth,
+            )
+            .await;
         }
 
         // 5b. FLNK whose target is external (`pva://`/`ca://`): C
@@ -4564,8 +4571,15 @@ impl PvDatabase {
         // the same single owner (C `dbScanFwdLink` → `dbScanPassive` →
         // `processTarget`).
         if let Some(ref flnk) = flnk_name {
-            self.process_target(flnk, src_putf, src_notify.as_ref(), visited, depth)
-                .await;
+            self.process_target(
+                flnk,
+                super::links::ProcessTargetGate::ScanPassive,
+                src_putf,
+                src_notify.as_ref(),
+                visited,
+                depth,
+            )
+            .await;
         }
 
         // FLNK whose target is external (`pva://`/`ca://`): forwarded

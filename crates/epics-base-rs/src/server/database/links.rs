@@ -202,6 +202,36 @@ pub(crate) struct OutLinkSrc<'a> {
     pub field: &'a str,
 }
 
+/// Which of C's two gates a `processTarget` call is coming through — the two
+/// are NOT the same test (R18-94).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ProcessTargetGate {
+    /// C `dbScanPassive` (dbDbLink.c:427-434): `if (pto->scan != 0) return 0;`
+    /// A Passive target only. This is FLNK (`dbDbScanFwdLink`), fanout `LNKn`,
+    /// and the `pvlOptPP` arm of `dbDbPutValue` (:388, `pdest->scan == 0`).
+    ScanPassive,
+    /// C `dbDbPutValue`'s FIRST arm (dbDbLink.c:387): `dbChannelField(chan) ==
+    /// &pdest->proc` — the link addresses the target's `.PROC` field. It
+    /// carries NO scan test, so a DB link writing `TARGET.PROC` processes the
+    /// target on ANY scan, and is independent of the `PP` flag.
+    ///
+    /// softIoc: `SRCO.OUT="TGT.PROC"` with `TGT` on `SCAN="10 second"` —
+    /// each `dbpf SRCO.PROC 1` advances `TGT.VAL` immediately (0 → 1 → 2).
+    /// The port's CA put route already honours this (field_io.rs `.PROC`
+    /// handling); this makes the DB-link route agree with it.
+    ProcField,
+}
+
+impl ProcessTargetGate {
+    /// Does a target with this SCAN reach `processTarget` through this gate?
+    fn admits(self, target_scan: ScanType) -> bool {
+        match self {
+            Self::ScanPassive => target_scan == ScanType::Passive,
+            Self::ProcField => true,
+        }
+    }
+}
+
 /// One `seq` link group — C `linkGrp { dly, dol, dov, lnk }`.
 #[derive(Clone, Debug)]
 pub(crate) struct SeqGroup {
@@ -1037,12 +1067,9 @@ impl PvDatabase {
     /// transition.
     ///
     /// **Invariant:** `PUTF`/`RPRO` on a link target are written only by
-    /// `processTarget`, and `processTarget` runs only for a PASSIVE target.
-    /// C reaches it through exactly two gates, both of which return BEFORE it:
-    ///
-    /// * `dbScanPassive` (dbDbLink.c:427-434) — `if (pto->scan != 0) return 0;`
-    ///   — FLNK, fanout `LNKn`, and every `PP` output link;
-    /// * `dbDbPutValue` (:387-389) — `PP` and the target is Passive.
+    /// `processTarget`, and `processTarget` is reachable only for a PASSIVE
+    /// target or a `.PROC` write. C reaches it through exactly two gates, both
+    /// of which return BEFORE it otherwise — see [`ProcessTargetGate`].
     ///
     /// The port had five clones of the body, each applying the Passive test to
     /// the *process* call only and mutating PUTF/RPRO above it. So an FLNK to a
@@ -1067,6 +1094,7 @@ impl PvDatabase {
     pub(crate) async fn process_target(
         &self,
         target_name: &str,
+        gate: ProcessTargetGate,
         src_putf: bool,
         src_notify: Option<&Arc<NotifyWaitSet>>,
         visited: &mut HashSet<String>,
@@ -1077,10 +1105,11 @@ impl PvDatabase {
         };
         let process = {
             let mut tg = target_rec.write().await;
-            // The gate. A non-Passive target never reaches `processTarget`, so
-            // it gets no PUTF, no RPRO, and no put-notify join — the join in
-            // particular would `enter` the wait-set without ever `leave`ing it.
-            if tg.common.scan != ScanType::Passive {
+            // The gate. A target that does not pass it never reaches
+            // `processTarget`, so it gets no PUTF, no RPRO, and no put-notify
+            // join — the join in particular would `enter` the wait-set without
+            // ever `leave`ing it.
+            if !gate.admits(tg.common.scan) {
                 return;
             }
             let pact = tg.is_processing();
@@ -1205,21 +1234,27 @@ impl PvDatabase {
             return true;
         }
 
-        // C `dbDbPutValue` (`dbDbLink.c:387-390`) processes the target
-        // when the destination field is `.PROC` **or** the link carries
-        // `pvlOptPP` (an explicit ` PP` token → `ProcessPassive`). The
-        // `.PROC` arm is independent of the PP flag, so it is checked
-        // here in the write path rather than encoded as a parse-time
-        // policy: a modifier-less link now defaults to `NoProcess`
-        // uniformly (INPUT and OUTPUT alike), and writing a value into a
-        // record's `.PROC` field still forces a process.
-        if link.field == "PROC"
-            || link.policy == crate::server::record::LinkProcessPolicy::ProcessPassive
-        {
-            // Through the single `processTarget` owner, which holds C's Passive
-            // gate. Alias-aware: `process_target` resolves the name, as
+        // C `dbDbPutValue` (`dbDbLink.c:387-390`) processes the target when the
+        // destination field is `.PROC` **or** the link carries `pvlOptPP` (an
+        // explicit ` PP` token → `ProcessPassive`) and the target is Passive.
+        // The two arms are different gates, not one: the `.PROC` arm is
+        // independent of both the PP flag and the target's SCAN (R18-94). It is
+        // therefore checked here in the write path rather than encoded as a
+        // parse-time policy: a modifier-less link defaults to `NoProcess`
+        // uniformly (INPUT and OUTPUT alike), and writing into a record's
+        // `.PROC` field still forces a process.
+        let gate = if link.field == "PROC" {
+            Some(ProcessTargetGate::ProcField)
+        } else if link.policy == crate::server::record::LinkProcessPolicy::ProcessPassive {
+            Some(ProcessTargetGate::ScanPassive)
+        } else {
+            None
+        };
+        if let Some(gate) = gate {
+            // Through the single `processTarget` owner, which holds the gate.
+            // Alias-aware: `process_target` resolves the name, as
             // `process_record_with_links` does at entry.
-            self.process_target(&link.record, src.putf, src.notify, visited, depth)
+            self.process_target(&link.record, gate, src.putf, src.notify, visited, depth)
                 .await;
         }
         // Successful local write (C `dbPutLink` status 0).
@@ -2021,6 +2056,7 @@ impl PvDatabase {
                         // through the same single owner.
                         self.process_target(
                             &db.record,
+                            ProcessTargetGate::ScanPassive,
                             src_putf,
                             src_notify.as_ref(),
                             visited,

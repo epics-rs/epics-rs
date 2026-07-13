@@ -325,9 +325,53 @@ impl Record for HistogramRecord {
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         // C `process` → `add_count(prec)` then `monitor`. The signal
         // is read from the input link by the framework before
-        // process(); count it into the current bucket.
+        // process(); count it into the current bucket. `monitor()`'s
+        // count-deadband decision is `array_monitor_post` below.
         self.add_count();
         Ok(ProcessOutcome::complete())
+    }
+
+    /// C `histogramRecord.c::monitor` (:282-296) — the record's VAL-mask rule,
+    /// and the ONLY writer of MCNT on the monitor path:
+    ///
+    /// ```c
+    /// static void monitor(histogramRecord *prec) {
+    ///     unsigned short monitor_mask = recGblResetAlarms(prec);
+    ///     if (prec->mcnt > prec->mdel) {
+    ///         monitor_mask |= DBE_VALUE | DBE_LOG;
+    ///         prec->mcnt = 0;                    /* reset counts since monitor */
+    ///     }
+    ///     if (monitor_mask)
+    ///         db_post_events(prec, &prec->val, monitor_mask);
+    /// }
+    /// ```
+    ///
+    /// MDEL is a COUNT deadband, not an analog one: VAL posts only once more
+    /// than MDEL counts have landed since the last post. The port had no gate —
+    /// an array VAL has no `to_f64`, so the generic deadband answered
+    /// "always post" — which made MDEL inert (every process shipped the whole
+    /// bin array to every subscriber, the exact traffic MDEL exists to prevent)
+    /// and left MCNT a monotonically growing counter instead of "counts since
+    /// the last posted VAL".
+    ///
+    /// Zeroing MCNT here, at the post, is what gives it that one meaning on
+    /// every path — including the SDEL watchdog (`watchdog_fire`), which shares
+    /// the counter and whose `mcnt > 0` test was reading a number that never
+    /// went back down.
+    ///
+    /// `hash_changed: false` — histogram has no HASH field (that is the
+    /// waveform/aai/aao MPST/APST mechanism); this hook is simply the owner of
+    /// the VAL mask, and histogram's C `monitor()` fills it with its own rule.
+    fn array_monitor_post(&mut self) -> Option<crate::server::record::ArrayMonitorPost> {
+        let post = self.mcnt > self.mdel;
+        if post {
+            self.mcnt = 0;
+        }
+        Some(crate::server::record::ArrayMonitorPost {
+            post_value: post,
+            post_archive: post,
+            hash_changed: false,
+        })
     }
 
     /// C `histogramRecord.c::special` (:226-274), SPC_RESET arm:

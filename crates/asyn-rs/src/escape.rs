@@ -46,7 +46,19 @@ pub(crate) fn escaped_from_raw(src: &[u8], dstlen: usize) -> String {
 /// C `epicsStrPrintEscaped` (epicsString.c:230-262) — the `FILE *` form, whose
 /// `switch` has no NUL case, so a NUL takes the `\xNN` default: `\x00`. It
 /// writes to a stream, so it has no destination bound.
+///
+/// It takes an explicit `len`, yet guards on `strlen(s) == 0` (`:236-237`):
+/// a buffer whose **first byte** is NUL is "no work to do" and prints
+/// *nothing*, however many bytes follow it. A NUL anywhere later is escaped
+/// normally — `strlen` only looks at the first one. Compiled libCom:
+/// `epicsStrPrintEscaped(fp, "\0a", 2)` returns 0 and prints nothing, while
+/// `("a\0b", 3)` prints `a\x00b`. This is a C quirk, not a Rust convenience:
+/// the ESCAPE trace form on a `FILE *` sink prints an empty data line for a
+/// payload that starts with NUL.
 pub(crate) fn print_escaped(src: &[u8]) -> String {
+    if src.first().is_none_or(|&c| c == 0) {
+        return String::new();
+    }
     escape(src, "\\x00", usize::MAX)
 }
 
@@ -153,5 +165,32 @@ mod tests {
 
         // A four-character \xNN pair is cut the same way.
         assert_eq!(escaped_from_raw(b"\xff", 3), r"\x");
+    }
+
+    /// R17-49. `epicsStrPrintEscaped` early-returns on `strlen(s) == 0`
+    /// (epicsString.c:236-237) even though it was handed an explicit length: a
+    /// buffer whose first byte is NUL prints nothing at all. Against compiled
+    /// libCom:
+    ///
+    /// ```text
+    /// epicsStrPrintEscaped(fp, "\0a", 2)  -> ret 0, prints nothing
+    /// epicsStrPrintEscaped(fp, "a\0b", 3) -> ret 6, prints a\x00b
+    /// epicsStrPrintEscaped(fp, "",   0)   -> ret 0, prints nothing
+    /// ```
+    ///
+    /// `epicsStrnEscapedFromRaw` has no such guard — it loops on `srclen` and
+    /// escapes the leading NUL as `\0` (compiled: `"\0a"` → `\0a`).
+    #[test]
+    fn print_escaped_prints_nothing_when_the_first_byte_is_nul() {
+        assert_eq!(print_escaped(b"\0a"), "");
+        assert_eq!(print_escaped(b"\0"), "");
+        assert_eq!(print_escaped(b""), "");
+
+        // Only the FIRST byte: strlen stops there, and a later NUL still escapes.
+        assert_eq!(print_escaped(b"a\0b"), r"a\x00b");
+
+        // The bounded form keeps escaping — the guard is C's, and C put it in
+        // one function only.
+        assert_eq!(escaped_from_raw(b"\0a", 40), r"\0a");
     }
 }

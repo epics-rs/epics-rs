@@ -1384,6 +1384,25 @@ mod tests {
         );
     }
 
+    /// R17-49 on the trace line. The ESCAPE block runs (C gates it on
+    /// `nBytes > 0`, asynManager.c:3153) but `epicsStrPrintEscaped` writes
+    /// nothing for a payload whose first byte is NUL (epicsString.c:236-237),
+    /// so a `FILE *` sink gets an *empty* data line — the block's newline and
+    /// no bytes. The errlog sink escapes it as `\0…` instead.
+    #[test]
+    fn a_first_byte_nul_payload_escapes_to_an_empty_data_line_on_a_file_sink() {
+        assert_eq!(blocks(b"\0ab", TraceIoMask::ESCAPE, 80), b"\n");
+
+        let cfg = TraceConfig {
+            trace_io_mask: TraceIoMask::ESCAPE,
+            file: TraceFile::Errlog,
+            ..TraceConfig::default()
+        };
+        let mut out = Vec::new();
+        append_io_data(&mut out, b"\0ab", &cfg);
+        assert_eq!(out, b"\\0ab\n");
+    }
+
     #[test]
     fn test_format_escape() {
         let n = DEFAULT_TRACE_BUFFER_SIZE;

@@ -2641,12 +2641,27 @@ pub fn put_field_internal_default<R: Record + ?Sized>(
     name: &str,
     value: EpicsValue,
 ) -> CaResult<()> {
+    // Coerce to the type the record STORES, not the type it SERVES. The two are
+    // the same for most fields, but a `menu()` field is declared `DBF_MENU` and
+    // served as `DBR_ENUM` with its choices (`promote_menu_value`) while the
+    // record stores the bare choice index as a `Short` — and `put_field`'s arms
+    // match on what is stored. Coercing to the served type would hand every
+    // `put_field` an `Enum` its `Short` arm cannot match. This is the inverse of
+    // `promote_menu_value`, and asking the record what it holds keeps the rule
+    // uniform instead of special-casing menus here.
+    //
+    // The `.dbd` type is the fallback for a field the record cannot currently
+    // produce a value for (an uninitialised array, a port-internal field).
     let target_type = record
-        .field_list()
-        .iter()
-        .find(|f| f.name.eq_ignore_ascii_case(name))
-        .map(|f| f.dbf_type)
-        .or_else(|| record.get_field(name).map(|v| v.db_field_type()));
+        .get_field(name)
+        .map(|v| v.db_field_type())
+        .or_else(|| {
+            record
+                .field_list()
+                .iter()
+                .find(|f| f.name.eq_ignore_ascii_case(name))
+                .map(|f| f.dbf_type)
+        });
     // An array source into a SCALAR destination delivers element 0. C's link
     // layer asks for exactly one element (`dbGetLink(..., nRequest = NULL)`), so
     // `dbGet` converts the field at offset 0 and the record sees a scalar — a

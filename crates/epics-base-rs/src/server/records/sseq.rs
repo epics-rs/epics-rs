@@ -1222,7 +1222,16 @@ impl Record for SseqRecord {
                 }
             }
         }
-        self.put_field(name, value)
+        // Every OTHER field takes the framework's internal-put path, which is what
+        // applies C's `dbGetLink(DBF_<target>)` coercion: the target field's DBF
+        // type, an array source reduced to element 0 (C asks for one element, so
+        // `dbGet` converts offset 0), and a pvalink NTEnum carrier collapsed. Ending
+        // in `self.put_field` skipped all of it and left those writes at the mercy of
+        // whatever types each typed arm happened to accept — `SELN`, the target of
+        // the SELL link read, would reject an array source outright. acalcout's
+        // override (`acalcout.rs:1672`) already routes through here; this is the
+        // same rule.
+        crate::server::record::put_field_internal_default(self, name, value)
     }
 
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {

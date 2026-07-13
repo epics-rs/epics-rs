@@ -111,9 +111,17 @@ pub fn create_port_runtime<D: PortDriver>(
 
 /// Create a port runtime from a boxed driver.
 pub fn create_port_runtime_boxed(
-    driver: Box<dyn PortDriver>,
+    mut driver: Box<dyn PortDriver>,
     config: RuntimeConfig,
 ) -> (PortRuntimeHandle, std::thread::JoinHandle<()>) {
+    // The one site that binds a port to its trace configuration and exception
+    // list. C does it inside `registerPort` — the sole path into the port list
+    // — so no port can exist without them (asynManager.c:503, :611-637). Every
+    // port creator in this crate (`PortManager::register_port`, the
+    // `drvAsyn*PortConfigure` iocsh commands, driver-owned ports) funnels
+    // through here, so binding here is what makes that true for the port too.
+    config.services.bind(driver.base_mut());
+
     let port_name = driver.base().port_name.clone();
     let can_block = driver.base().flags.can_block;
     let multi_device = driver.base().flags.multi_device;

@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+use crate::services::PortServices;
+
 /// Configuration for a port runtime.
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
@@ -11,6 +13,13 @@ pub struct RuntimeConfig {
     pub connect_backoff: BackoffConfig,
     /// Supervision policy.
     pub supervision: SupervisionPolicy,
+    /// The trace configuration and exception list the port is created with —
+    /// C's `pasynBase`. Defaults to the process-wide
+    /// [`PortServices::global()`], so a port built with a default config is
+    /// still traceable and still announces exceptions; a
+    /// [`crate::manager::PortManager`] carrying its own `TraceManager`
+    /// substitutes its own here.
+    pub services: PortServices,
 }
 
 impl Default for RuntimeConfig {
@@ -20,6 +29,7 @@ impl Default for RuntimeConfig {
             auto_connect: true,
             connect_backoff: BackoffConfig::default(),
             supervision: SupervisionPolicy::default(),
+            services: PortServices::global(),
         }
     }
 }

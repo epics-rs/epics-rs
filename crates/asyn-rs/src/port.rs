@@ -224,8 +224,13 @@ pub struct PortDriverBase {
     /// build a port that is defunct but still enabled, so no gate needs to ask
     /// about defunct to refuse it (R15-50).
     defunct: bool,
-    /// Exception sink injected by [`crate::manager::PortManager`] on registration.
-    pub exception_sink: Option<Arc<ExceptionManager>>,
+    /// Exception list this port announces on — C `dpCommon.exceptionUserList`
+    /// (asynManager.c:611-625). Injected by
+    /// [`crate::services::PortServices::bind`], which
+    /// [`crate::runtime::create_port_runtime`] calls on every port it builds:
+    /// a *running* port always has one. Crate-private so no port creator
+    /// outside asyn can build a port that bypasses that binding.
+    pub(crate) exception_sink: Option<Arc<ExceptionManager>>,
     pub options: HashMap<String, String>,
     /// The EOS terminators, keyed per device the way C keys them: an `eosPvt`
     /// is created per `asynInterposeEosConfig(portName, addr, ...)`
@@ -238,7 +243,10 @@ pub struct PortDriverBase {
     /// `findDpCommon`/`findInterface` resolve any addr to the port itself).
     eos: HashMap<i32, DeviceEos>,
     pub interpose_octet: OctetInterposeStack,
-    pub trace: Option<Arc<TraceManager>>,
+    /// Trace configuration — C `dpCommon.trace` (asynManager.c:503). Same
+    /// owner as [`Self::exception_sink`]: bound by
+    /// [`crate::services::PortServices::bind`] at port creation.
+    pub(crate) trace: Option<Arc<TraceManager>>,
     /// Per-address device state for multi-device ports.
     pub device_states: HashMap<i32, DeviceState>,
     /// Timestamp source callback for custom timestamps.

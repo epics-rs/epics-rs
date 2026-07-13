@@ -28,6 +28,7 @@ use crate::manager::PortManager;
 use crate::port::PortDriver;
 use crate::runtime::config::RuntimeConfig;
 use crate::runtime::port::{PortRuntimeHandle, create_port_runtime};
+use crate::services::PortServices;
 use crate::trace::{TraceFile, TraceInfoMask, TraceIoMask, TraceManager, TraceMask};
 use crate::user::AsynUser;
 
@@ -333,7 +334,7 @@ pub fn register_asyn_commands_on_shell(
 /// configure.
 pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
     let mut out = Vec::new();
-    let trace = mgr.trace_manager().clone();
+    let services = mgr.services().clone();
 
     // asynReport ----------------------------------------------------------
     {
@@ -863,9 +864,9 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
     // Port-creation commands ----------------------------------------------
     // Part of the same set: a shell that can create a port must be able to
     // configure it in the next line of the same script.
-    out.push(drv_asyn_ip_port_configure_command(trace.clone()));
-    out.push(drv_asyn_serial_port_configure_command(trace.clone()));
-    out.push(drv_asyn_prologix_port_configure_command(trace));
+    out.push(drv_asyn_ip_port_configure_command(services.clone()));
+    out.push(drv_asyn_serial_port_configure_command(services.clone()));
+    out.push(drv_asyn_prologix_port_configure_command(services));
 
     out
 }
@@ -906,7 +907,7 @@ pub(crate) fn build_configured_ip_port(
     Ok(driver)
 }
 
-pub fn drv_asyn_ip_port_configure_command(trace: Arc<TraceManager>) -> CommandDef {
+pub fn drv_asyn_ip_port_configure_command(services: PortServices) -> CommandDef {
     CommandDef::new(
         "drvAsynIPPortConfigure",
         vec![
@@ -957,11 +958,20 @@ pub fn drv_asyn_ip_port_configure_command(trace: Arc<TraceManager>) -> CommandDe
                     }
                 };
 
-            let (handle, _jh) = create_port_runtime(driver, RuntimeConfig::default());
+            // C parity: `registerPort` is what gives the port its trace
+            // configuration and exception list (asynManager.c:503, :611-637), so
+            // a port an st.cmd builds is traceable from the moment it exists.
+            // Here that binding is `create_port_runtime`'s, driven by the
+            // services in the config.
+            let config = RuntimeConfig {
+                services: services.clone(),
+                ..RuntimeConfig::default()
+            };
+            let (handle, _jh) = create_port_runtime(driver, config);
             if let Err(e) = crate::asyn_record::register_port(
                 &port,
                 handle.port_handle().clone(),
-                trace.clone(),
+                services.trace().clone(),
             ) {
                 ctx.println(&format!("drvAsynIPPortConfigure: {e}"));
                 handle.shutdown();
@@ -992,7 +1002,7 @@ pub fn drv_asyn_ip_port_configure_command(trace: Arc<TraceManager>) -> CommandDe
 /// by default an EOS interpose is installed (C
 /// `drvAsynSerialPort.c:1126` enables EOS processing in octetBase),
 /// suppressed by a nonzero `noProcessEos`.
-pub fn drv_asyn_serial_port_configure_command(trace: Arc<TraceManager>) -> CommandDef {
+pub fn drv_asyn_serial_port_configure_command(services: PortServices) -> CommandDef {
     CommandDef::new(
         "drvAsynSerialPortConfigure",
         vec![
@@ -1043,11 +1053,20 @@ pub fn drv_asyn_serial_port_configure_command(trace: Arc<TraceManager>) -> Comma
                     }
                 };
 
-            let (handle, _jh) = create_port_runtime(driver, RuntimeConfig::default());
+            // C parity: `registerPort` is what gives the port its trace
+            // configuration and exception list (asynManager.c:503, :611-637), so
+            // a port an st.cmd builds is traceable from the moment it exists.
+            // Here that binding is `create_port_runtime`'s, driven by the
+            // services in the config.
+            let config = RuntimeConfig {
+                services: services.clone(),
+                ..RuntimeConfig::default()
+            };
+            let (handle, _jh) = create_port_runtime(driver, config);
             if let Err(e) = crate::asyn_record::register_port(
                 &port,
                 handle.port_handle().clone(),
-                trace.clone(),
+                services.trace().clone(),
             ) {
                 ctx.println(&format!("drvAsynSerialPortConfigure: {e}"));
                 handle.shutdown();
@@ -1079,7 +1098,7 @@ pub fn drv_asyn_serial_port_configure_command(trace: Arc<TraceManager>) -> Comma
 /// the prologix driver owns EOS itself (it passes `noProcessEos=1` to its
 /// inner `_TCP` IP port, mirroring C's `drvAsynIPPortConfigure(... 1)` at
 /// drvPrologixGPIB.c:575).
-pub fn drv_asyn_prologix_port_configure_command(trace: Arc<TraceManager>) -> CommandDef {
+pub fn drv_asyn_prologix_port_configure_command(services: PortServices) -> CommandDef {
     CommandDef::new(
         "prologixGPIBConfigure",
         vec![
@@ -1123,11 +1142,20 @@ pub fn drv_asyn_prologix_port_configure_command(trace: Arc<TraceManager>) -> Com
                 }
             };
 
-            let (handle, _jh) = create_port_runtime(driver, RuntimeConfig::default());
+            // C parity: `registerPort` is what gives the port its trace
+            // configuration and exception list (asynManager.c:503, :611-637), so
+            // a port an st.cmd builds is traceable from the moment it exists.
+            // Here that binding is `create_port_runtime`'s, driven by the
+            // services in the config.
+            let config = RuntimeConfig {
+                services: services.clone(),
+                ..RuntimeConfig::default()
+            };
+            let (handle, _jh) = create_port_runtime(driver, config);
             if let Err(e) = crate::asyn_record::register_port(
                 &port,
                 handle.port_handle().clone(),
-                trace.clone(),
+                services.trace().clone(),
             ) {
                 ctx.println(&format!("prologixGPIBConfigure: {e}"));
                 handle.shutdown();
@@ -1883,7 +1911,8 @@ mod tests {
     /// host info (no connect), so no live server is needed.
     #[test]
     fn drv_asyn_ip_port_configure_registers_port() {
-        let cmd = drv_asyn_ip_port_configure_command(Arc::new(TraceManager::new()));
+        let cmd =
+            drv_asyn_ip_port_configure_command(PortServices::new(Arc::new(TraceManager::new())));
         assert_eq!(cmd.name, "drvAsynIPPortConfigure");
         assert_eq!(cmd.args.len(), 5);
 
@@ -1928,7 +1957,9 @@ mod tests {
     /// only parses the tty path (no open), so no device is needed.
     #[test]
     fn drv_asyn_serial_port_configure_registers_port() {
-        let cmd = drv_asyn_serial_port_configure_command(Arc::new(TraceManager::new()));
+        let cmd = drv_asyn_serial_port_configure_command(PortServices::new(Arc::new(
+            TraceManager::new(),
+        )));
         assert_eq!(cmd.name, "drvAsynSerialPortConfigure");
         assert_eq!(cmd.args.len(), 5);
 
@@ -1950,7 +1981,8 @@ mod tests {
     /// A missing required argument is rejected without creating a port.
     #[test]
     fn drv_asyn_ip_port_configure_rejects_missing_host() {
-        let cmd = drv_asyn_ip_port_configure_command(Arc::new(TraceManager::new()));
+        let cmd =
+            drv_asyn_ip_port_configure_command(PortServices::new(Arc::new(TraceManager::new())));
         let ctx = make_ctx();
         let result = cmd
             .handler
@@ -1966,7 +1998,9 @@ mod tests {
     /// args (portName, host, priority, noAutoConnect); priority is dropped.
     #[test]
     fn drv_asyn_prologix_port_configure_registers_port() {
-        let cmd = drv_asyn_prologix_port_configure_command(Arc::new(TraceManager::new()));
+        let cmd = drv_asyn_prologix_port_configure_command(PortServices::new(Arc::new(
+            TraceManager::new(),
+        )));
         assert_eq!(cmd.name, "prologixGPIBConfigure");
         assert_eq!(cmd.args.len(), 4);
 
@@ -1988,7 +2022,9 @@ mod tests {
     /// A missing required argument is rejected without creating a port.
     #[test]
     fn drv_asyn_prologix_port_configure_rejects_missing_host() {
-        let cmd = drv_asyn_prologix_port_configure_command(Arc::new(TraceManager::new()));
+        let cmd = drv_asyn_prologix_port_configure_command(PortServices::new(Arc::new(
+            TraceManager::new(),
+        )));
         let ctx = make_ctx();
         let result = cmd.handler.call(
             &[ArgValue::String("iocsh_prologix_cfg_nohost".into())],

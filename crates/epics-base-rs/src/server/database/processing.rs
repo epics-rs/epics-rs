@@ -3496,14 +3496,7 @@ impl PvDatabase {
                             continue;
                         }
                         if let Some(val) = instance.record.get_field(val_field) {
-                            // Scalar companion for the target-nelm buffer
-                            // choice (devaCalcoutSoft.c:84-87) — resolved
-                            // per pair, applied after link parse below.
-                            let scalar = instance
-                                .record
-                                .multi_output_scalar_companion(link_field)
-                                .and_then(|f| instance.record.get_field(f));
-                            pairs.push((link_str, val, scalar));
+                            pairs.push((link_field, link_str, val));
                         }
                     }
                     if pairs.is_empty() { None } else { Some(pairs) }
@@ -3521,7 +3514,7 @@ impl PvDatabase {
                         amsg: guard.common.amsg.clone(),
                     }
                 };
-                for (link_str, val, scalar) in pairs {
+                for (link_field, link_str, val) in pairs {
                     // `multi_output_links` carries record OUT links
                     // (sseq `LNKn`, scalcout `OUTn` — all `DBF_OUTLINK`)
                     // driven via `dbPutLink` → `dbDbPutValue`
@@ -3537,10 +3530,13 @@ impl PvDatabase {
                     let parsed = crate::server::record::parse_output_link_v2(
                         link_str.as_str_lossy().as_ref(),
                     );
-                    // Target-nelm buffer choice (devaCalcoutSoft.c:75-87):
-                    // a single-element destination gets the pair's scalar
-                    // companion instead of the array value.
-                    let val = self.multi_out_buffer_choice(&parsed, val, scalar).await;
+                    // Device-support write-buffer switch: the resolved target's
+                    // DBF type / element count decides which of the record's
+                    // buffers C would actually put (`devsCalcoutSoft.c:66-144`,
+                    // `devaCalcoutSoft.c:75-87`).
+                    let val = self
+                        .multi_out_buffer_choice(rec, link_field, &parsed, val)
+                        .await;
                     self.write_out_link_value(
                         &parsed,
                         val,
@@ -4442,20 +4438,14 @@ impl PvDatabase {
                             continue;
                         }
                         if let Some(val) = instance.record.get_field(val_field) {
-                            // Scalar companion for the target-nelm buffer
-                            // choice — see the sync-path twin.
-                            let scalar = instance
-                                .record
-                                .multi_output_scalar_companion(link_field)
-                                .and_then(|f| instance.record.get_field(f));
-                            pairs.push((link_str, val, scalar));
+                            pairs.push((link_field, link_str, val));
                         }
                     }
                     if pairs.is_empty() { None } else { Some(pairs) }
                 }
             };
             if let Some(pairs) = multi_out {
-                for (link_str, val, scalar) in pairs {
+                for (link_field, link_str, val) in pairs {
                     // `multi_output_links` carries record OUT links
                     // (sseq `LNKn`, scalcout `OUTn` — all `DBF_OUTLINK`):
                     // a bare DB link is NPP (`dbDbLink.c:388`).
@@ -4466,7 +4456,11 @@ impl PvDatabase {
                     let parsed = crate::server::record::parse_output_link_v2(
                         link_str.as_str_lossy().as_ref(),
                     );
-                    let val = self.multi_out_buffer_choice(&parsed, val, scalar).await;
+                    // Device-support write-buffer switch — see the sync-path
+                    // twin above.
+                    let val = self
+                        .multi_out_buffer_choice(&rec, link_field, &parsed, val)
+                        .await;
                     self.write_out_link_value(
                         &parsed,
                         val,

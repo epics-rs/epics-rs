@@ -93,7 +93,7 @@
 
 use crate::error::{CaError, CaResult};
 use crate::server::record::{
-    CyclePostMask, FieldDesc, InputFetchPolicy, ProcessAction, ProcessOutcome, Record,
+    CyclePostMask, FieldDesc, InputFetchPolicy, OutTarget, ProcessAction, ProcessOutcome, Record,
     RecordProcessResult,
 };
 use crate::types::{DbFieldType, EpicsValue, PvString};
@@ -2168,17 +2168,30 @@ impl Record for AcalcoutRecord {
         }
     }
 
-    /// C `devaCalcoutSoft.c::write_acalcout` (84-87): when the effective
+    /// C `devaCalcoutSoft.c::write_acalcout` (75-87): when the effective
     /// element count resolves to 1, the write buffer is the scalar field
     /// — `&pcalc->val` under DOPT=Use CALC, `&pcalc->oval` under Use OCAL
-    /// — not element 0 of the array. The OUT dispatch resolves the target
-    /// count and makes the pick (`PvDatabase::multi_out_buffer_choice`).
-    fn multi_output_scalar_companion(&self, link_field: &str) -> Option<&'static str> {
-        if link_field == "OUT" {
-            Some(if self.dopt == 1 { "OVAL" } else { "VAL" })
-        } else {
-            None
+    /// — not element 0 of the array.
+    ///
+    /// The effective count is C's `nelm`: the target's `no_elements` /
+    /// `dbCaGetNelements` (resolved by the framework into `target`), clamped
+    /// by the source count `i = (nuse > 0) ? nuse : nelm` (:82-83) — the
+    /// staged array's served length here, so a 1-element source picks the
+    /// scalar whatever the target is.
+    fn multi_output_buffer(
+        &self,
+        link_field: &str,
+        staged: EpicsValue,
+        target: &OutTarget,
+    ) -> EpicsValue {
+        if link_field != "OUT" {
+            return staged;
         }
+        if staged.count() > 1 && target.element_count > 1 {
+            return staged;
+        }
+        let scalar = if self.dopt == 1 { "OVAL" } else { "VAL" };
+        self.get_field(scalar).unwrap_or(staged)
     }
 
     /// `OEVT` ("Event To Issue"): post the numeric output event when output

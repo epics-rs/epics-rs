@@ -2,11 +2,31 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::runtime::sync::RwLock;
-use crate::server::record::{AlarmSeverity, NotifyWaitSet, RecordInstance, ScanType};
-use crate::types::EpicsValue;
+use crate::server::record::{AlarmSeverity, NotifyWaitSet, OutTarget, RecordInstance, ScanType};
+use crate::types::{DbFieldType, EpicsValue};
 
+use super::link_set::LinkDbfType;
 use super::processing::join_put_notify;
 use super::{LinkPutOp, PvDatabase, SelmKind, SelmResult, dbr_ushort_cast, select_link_indices_ex};
+
+/// C `dbDBRoldToDBFnew[pca->dbrType]` (`dbCa.c:701`): the link set's cached
+/// remote type expressed as the DBF type a device support switches on.
+fn link_dbf_to_field_type(t: LinkDbfType) -> DbFieldType {
+    match t {
+        LinkDbfType::Char => DbFieldType::Char,
+        LinkDbfType::UChar => DbFieldType::UChar,
+        LinkDbfType::Short => DbFieldType::Short,
+        LinkDbfType::UShort => DbFieldType::UShort,
+        LinkDbfType::Long => DbFieldType::Long,
+        LinkDbfType::ULong => DbFieldType::ULong,
+        LinkDbfType::Int64 => DbFieldType::Int64,
+        LinkDbfType::UInt64 => DbFieldType::UInt64,
+        LinkDbfType::Float => DbFieldType::Float,
+        LinkDbfType::Double => DbFieldType::Double,
+        LinkDbfType::String => DbFieldType::String,
+        LinkDbfType::Enum => DbFieldType::Enum,
+    }
+}
 
 /// Record-specific input link fields that may carry a CP/CPP modifier:
 /// DOL (ao/bo/longout/mbbo), DOL0-DOLF (seq — 16 groups), DOL1-DOLA
@@ -983,6 +1003,120 @@ impl PvDatabase {
         }
     }
 
+    /// Resolve an OUT link's TARGET metadata — the DBF field type, the
+    /// element capacity, and whether C would classify the link as a
+    /// `CA_LINK`. Single owner of the target-metadata lookup every soft
+    /// device support's write-buffer switch reads
+    /// ([`Record::multi_output_buffer`]).
+    ///
+    /// C's resolution, mirrored branch for branch:
+    /// - local DB target — `dbNameToAddr` (`devsCalcoutSoft.c:127-131`):
+    ///   `field_type` = the target field's DBF type, `no_elements` = its
+    ///   capacity. An unresolvable name leaves C's initializers
+    ///   (`field_type = 0`, `n_elements = 1`) — the port reports
+    ///   [`OutTarget::UNRESOLVED`], whose `None` type routes to the device
+    ///   support's `default:` arm.
+    /// - external target (explicit `ca://`/`pva://` OR a DB-parsed name not
+    ///   in this IOC, which C classifies as a CA link) —
+    ///   `dbCaGetLinkDBFtype` / `dbCaGetNelements` (`dbCa.c:662-704`,
+    ///   both `-1` while disconnected): the lset's cached
+    ///   [`LinkMetadata`], `UNRESOLVED` when the link is down.
+    ///
+    /// `no_elements` is a field CAPACITY, which the port does not carry per
+    /// field: an array field reports its record's `NELM` when it has one and
+    /// its current length otherwise; a scalar field reports 1.
+    pub(crate) async fn resolve_out_target(
+        &self,
+        link: &crate::server::record::ParsedLink,
+    ) -> OutTarget {
+        let external = |name: String| async move {
+            match self.external_link_metadata(&name).await {
+                Some(m) => OutTarget {
+                    field_type: m.dbf_type.map(link_dbf_to_field_type),
+                    element_count: m.element_count.unwrap_or(1).max(1),
+                    is_ca_link: true,
+                },
+                None => OutTarget {
+                    is_ca_link: true,
+                    ..OutTarget::UNRESOLVED
+                },
+            }
+        };
+        match link {
+            crate::server::record::ParsedLink::Db(db) => {
+                if !self.has_name_no_resolve(&db.record).await {
+                    // Non-local ⇒ CA link in C (`dbInitLink` locality).
+                    let target_name = if db.field == "VAL" {
+                        db.record.clone()
+                    } else {
+                        format!("{}.{}", db.record, db.field)
+                    };
+                    return external(target_name).await;
+                }
+                let Some(target) = self.get_record(&db.record).await else {
+                    return OutTarget::UNRESOLVED;
+                };
+                let guard = target.read().await;
+                let field_type = guard
+                    .record
+                    .field_list()
+                    .iter()
+                    .find(|f| f.name.eq_ignore_ascii_case(&db.field))
+                    .map(|f| f.dbf_type)
+                    .or_else(|| guard.record.get_field(&db.field).map(|v| v.db_field_type()));
+                let element_count = match guard.record.get_field(&db.field) {
+                    Some(v) if v.is_array() => guard
+                        .record
+                        .get_field("NELM")
+                        .and_then(|n| n.as_int_i64())
+                        .filter(|n| *n > 0)
+                        .unwrap_or(v.count() as i64),
+                    _ => 1,
+                };
+                OutTarget {
+                    field_type,
+                    element_count: element_count.max(1),
+                    is_ca_link: false,
+                }
+            }
+            crate::server::record::ParsedLink::Ca(_)
+            | crate::server::record::ParsedLink::Pva(_)
+            | crate::server::record::ParsedLink::PvaJson(_) => {
+                let name = link
+                    .external_pv_name()
+                    .expect("Ca/Pva/PvaJson link carries a PV name");
+                external(name.to_string()).await
+            }
+            // Constant / Hw / Calc / None: not a writable target — the write
+            // path no-ops, so the metadata is never used.
+            _ => OutTarget::UNRESOLVED,
+        }
+    }
+
+    /// Apply the writing record's device-support write-buffer switch to a
+    /// multi-output pair: resolve the TARGET ([`Self::resolve_out_target`]),
+    /// then let the record pick the buffer C's `write_*` would put
+    /// ([`Record::multi_output_buffer`]).
+    ///
+    /// The record lock is NOT held across the target resolution — a
+    /// self-referencing OUT link would re-enter the source record's own
+    /// gate — so the target is resolved first and the record re-read to
+    /// make the pick, exactly as C's device support reads its own fields
+    /// after `dbNameToAddr` / `dbCaGet*`.
+    pub(crate) async fn multi_out_buffer_choice(
+        &self,
+        rec: &Arc<RwLock<RecordInstance>>,
+        link_field: &str,
+        link: &crate::server::record::ParsedLink,
+        staged: EpicsValue,
+    ) -> EpicsValue {
+        let target = self.resolve_out_target(link).await;
+        let guard = rec.read().await;
+        guard
+            .record
+            .multi_output_buffer(link_field, staged, &target)
+    }
+
     /// Write a value through a parsed OUT link, dispatching DB links
     /// to [`Self::write_db_link_value`] and external (`ca://`/`pva://`)
     /// links to [`Self::write_external_pv`].
@@ -997,91 +1131,6 @@ impl PvDatabase {
     /// `Constant`/`Hw`/`Calc`/`None` OUT links are not writable
     /// targets and are silently skipped (C `dbPutLink` returns
     /// `S_db_noLSET` for a link with no lset — the same no-op).
-    /// C `devaCalcoutSoft.c::write_acalcout` (65-88) buffer choice for a
-    /// multi-output pair that carries a scalar companion
-    /// ([`crate::server::record::Record::multi_output_scalar_companion`]):
-    /// resolve the TARGET element count and drive the scalar field when
-    /// the effective count is 1, the array field otherwise.
-    ///
-    /// C's resolution, mirrored branch for branch:
-    /// - source clamp `i = (nuse > 0) ? nuse : nelm` (:82-83) — already
-    ///   the served array length (`array_field_value` serves
-    ///   `num_elements()` elements), so a 1-element source picks the
-    ///   scalar regardless of the target;
-    /// - local DB target — `dbNameToAddr` `no_elements` (:78-79): the
-    ///   target field's array-ness (`EpicsValue::is_array`, the port's
-    ///   documented `no_elements > 1` stand-in). An unresolvable name
-    ///   leaves `nelm = 1` (:68), picking the scalar;
-    /// - external target (explicit `ca://`/`pva://` OR a DB-parsed name
-    ///   not in this IOC, which C classifies as a CA link) —
-    ///   `dbCaGetNelements` (:75-76): the lset's cached element count
-    ///   ([`LinkSet::link_metadata`]); a disconnected link reports none
-    ///   and leaves `nelm = 1`, exactly as C's failed `dbCaGetNelements`
-    ///   leaves the initializer.
-    ///
-    /// The target-side `min(target, source)` truncation for counts > 1
-    /// is the put path's own clamp (`dbAccess.c:1359` analogue in
-    /// `field_io.rs`); only the `nelm == 1 ⇒ &scalar` pick needs to
-    /// happen here, before the value is committed to the link write.
-    pub(crate) async fn multi_out_buffer_choice(
-        &self,
-        link: &crate::server::record::ParsedLink,
-        array_val: EpicsValue,
-        scalar_companion: Option<EpicsValue>,
-    ) -> EpicsValue {
-        let Some(scalar) = scalar_companion else {
-            return array_val;
-        };
-        // Source clamp: `i = (nuse>0 ? nuse : nelm); if (i < nelm) nelm = i;`
-        // — a single-element source picks the scalar buffer for any target.
-        if array_val.count() <= 1 {
-            return scalar;
-        }
-        // C dbCaGetNelements analogue: the lset's cached element count,
-        // defaulting to 1 when disconnected/uncached (C leaves the
-        // initializer untouched when dbCaGetNelements fails).
-        let external_nelements = |name: String| async move {
-            self.external_link_metadata(&name)
-                .await
-                .and_then(|m| m.element_count)
-                .unwrap_or(1)
-        };
-        let target_is_single = match link {
-            crate::server::record::ParsedLink::Db(db) => {
-                let target_name = if db.field == "VAL" {
-                    db.record.clone()
-                } else {
-                    format!("{}.{}", db.record, db.field)
-                };
-                if self.has_name_no_resolve(&db.record).await {
-                    // C dbNameToAddr → no_elements: scalar field ⇒ 1. A
-                    // resolvable record with an unknown field keeps C's
-                    // failed-dbNameToAddr default (nelm = 1).
-                    !self
-                        .get_pv(&target_name)
-                        .await
-                        .map(|v| v.is_array())
-                        .unwrap_or(false)
-                } else {
-                    // Non-local ⇒ CA link in C (`dbInitLink` locality).
-                    external_nelements(target_name).await <= 1
-                }
-            }
-            crate::server::record::ParsedLink::Ca(_)
-            | crate::server::record::ParsedLink::Pva(_)
-            | crate::server::record::ParsedLink::PvaJson(_) => {
-                let name = link
-                    .external_pv_name()
-                    .expect("Ca/Pva/PvaJson link carries a PV name");
-                external_nelements(name.to_string()).await <= 1
-            }
-            // Constant / Hw / Calc / None: not a writable target — the
-            // write path no-ops, the choice is irrelevant.
-            _ => return array_val,
-        };
-        if target_is_single { scalar } else { array_val }
-    }
-
     pub(crate) async fn write_out_link_value(
         &self,
         link: &crate::server::record::ParsedLink,

@@ -9669,7 +9669,17 @@ async fn promptgroup_config_fields_load_settable_runtime_immutable() {
         .expect("subArray INDX is pp(TRUE) — runtime caput must succeed");
     let rec = db.get_record("SARR").await.expect("SARR exists");
     let indx = rec.read().await.record.get_field("INDX");
-    assert_eq!(indx, Some(EpicsValue::Long(2)), "runtime INDX caput landed");
+    // INDX is pp(TRUE): the put PROCESSES the record, and `readValue` clamps
+    // `if (indx >= malm) indx = malm - 1` (subArrayRecord.c:313-314). This SARR
+    // is the bare `create_record` default — MALM=1 — so C reads INDX back as 0,
+    // not 2. Verified on a built softIoc: `caput SA:D.INDX 2` on a MALM=1
+    // subArray reads back `SA:D.INDX 0` (NORD 0, SEVR INVALID). The put landing
+    // (no `ReadOnlyField`) is what this assertion is about; the clamp is C's.
+    assert_eq!(
+        indx,
+        Some(EpicsValue::Long(0)),
+        "runtime INDX caput landed, then the pp(TRUE) process clamped it to MALM-1"
+    );
 }
 
 /// NELM/FTVL runtime-writability must follow each ArrayKind's C dbd, even though

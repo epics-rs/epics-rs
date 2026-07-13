@@ -1605,6 +1605,33 @@ pub trait Record: Send + Sync + 'static {
         false
     }
 
+    /// Process-time INP read when the INP link is CONSTANT (or unset) — the
+    /// per-record exception to the load-once rule.
+    ///
+    /// Nearly every soft input device support skips a constant INP at process:
+    /// `devWfSoft.c::read_wf` and `devAaiSoft.c::read_aai` open with
+    /// `if (dbLinkIsConstant(pinp)) return 0;`, and the scalar ones call
+    /// `dbGetLink`, whose `dbConstGetValue` (`dbConstLink.c:219-225`) writes
+    /// nothing. The constant reaches such a record ONCE, at init, through
+    /// `recGblInitConstantLink` / `dbLoadLinkArray`
+    /// (`PvDatabase::rec_gbl_init_constant_inp`), so a client's caput to VAL is
+    /// never clobbered by a re-delivered constant.
+    ///
+    /// `devSASoft.c::read_sa` (92-123) is the documented exception: it re-runs
+    /// `dbLoadLinkArray` on a constant INP EVERY process, and on an EMPTY INP
+    /// (`S_db_badField`) it sets `nRequest = prec->nord` and still subsets — so
+    /// the record re-slices the client-written VAL by INDX each cycle. C draws
+    /// that line at the device-support layer (`devSASoft` vs `devAaiSoft`), and
+    /// so does this hook.
+    ///
+    /// Called by the framework on a soft-DTYP cycle whose INP is constant, with
+    /// `value = Some(constant)` for a non-empty constant and `None` for an
+    /// empty/unset INP. Returns whether the record consumed the input stage.
+    /// Default `false` — the load-once rule.
+    fn read_constant_inp(&mut self, _value: Option<EpicsValue>) -> bool {
+        false
+    }
+
     /// Whether this record type raises UDF_ALARM at all.
     ///
     /// C has no framework-level UDF alarm: every record that reports one does

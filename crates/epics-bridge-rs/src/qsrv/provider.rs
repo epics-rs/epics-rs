@@ -1070,28 +1070,6 @@ impl BridgeProvider {
         self.groups.read().contains_key(name)
     }
 
-    /// true iff `name` is a registered group PV whose every
-    /// member uses the default self-trigger (`+trigger` absent →
-    /// [`crate::qsrv::group_config::TriggerDef::SelfOnly`]) or
-    /// explicit silence. Such a group's monitor events are *partial*
-    /// — each event re-reads only the member that processed — so the
-    /// PVA server narrows the wire changed-bitset by diffing
-    /// consecutive snapshots. Returns `false` for non-groups and for
-    /// groups carrying any explicit `+trigger` member (see
-    /// [`GroupPvDef::is_pure_self_trigger`]).
-    ///
-    /// Routed through the shadow gate ([`Self::servable_group`]): a group
-    /// name shadowed by a backing record is served as the record, whose
-    /// monitor is a single-record full-snapshot stream, not a
-    /// partial-trigger group stream — so this returns `false` for a
-    /// shadowed name to match the served channel.
-    pub async fn group_is_pure_self_trigger(&self, name: &str) -> bool {
-        self.servable_group(name)
-            .await
-            .map(|g| g.is_pure_self_trigger())
-            .unwrap_or(false)
-    }
-
     /// Whether this provider hosts `name` as any channel — a QSRV
     /// group composite PV *or* a single-record / simple PV in the
     /// backing database. This is the same name set
@@ -1491,10 +1469,10 @@ mod tests {
     /// The shadow invariant must hold on the per-group *predicate* paths,
     /// not only find/list/create. A group whose name collides with a
     /// record is served only as the record (pvxs `defineGroups`,
-    /// groupconfigprocessor.cpp:170-181), so `is_writable`,
-    /// `group_is_pure_self_trigger`, and the shared `is_servable_group`
-    /// gate must all resolve a shadowed name to the record. Before the fix
-    /// these read the raw registry and leaked group-derived behavior.
+    /// groupconfigprocessor.cpp:170-181), so `is_writable` and the shared
+    /// `is_servable_group` gate must both resolve a shadowed name to the
+    /// record. Before the fix these read the raw registry and leaked
+    /// group-derived behavior.
     #[tokio::test]
     async fn shadowed_group_predicates_resolve_to_record() {
         use epics_base_rs::server::database::PvDatabase;
@@ -1542,17 +1520,6 @@ mod tests {
         assert!(
             provider.is_writable("SH:grp").await,
             "a real servable group is writable"
-        );
-
-        // group_is_pure_self_trigger: false for the shadowed name (served
-        // as a record full-snapshot monitor), true for the real group.
-        assert!(
-            !provider.group_is_pure_self_trigger("SH:rec").await,
-            "shadowed name is a record monitor, not a partial group stream"
-        );
-        assert!(
-            provider.group_is_pure_self_trigger("SH:grp").await,
-            "the real pure-self-trigger group emits partial"
         );
     }
 

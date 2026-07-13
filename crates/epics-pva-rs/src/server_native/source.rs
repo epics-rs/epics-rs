@@ -1309,30 +1309,6 @@ pub trait ChannelSource: Send + Sync + 'static {
         }
     }
 
-    /// does this source emit *partial* monitor updates for
-    /// `name` — i.e. each event changes only a subset of the
-    /// structure's leaves, not the whole value?
-    ///
-    /// pvxs posts a monitor `Value` whose own marked-changed bitset
-    /// reflects exactly the leaves touched since the last `unmark()`
-    /// (`servermon.cpp:174` `to_wire_valid(R, ent, &self->pvMask)`
-    /// intersects that with the request mask). A QSRV *group* monitor
-    /// with the default `+trigger` (self-trigger) re-reads only the
-    /// triggered member on each event, so only that member's leaves
-    /// change — the wire changed-bitset must be narrowed accordingly
-    /// rather than always marking the whole request mask.
-    ///
-    /// When this returns `true` the server's decoded monitor loop
-    /// derives the per-event changed-bitset by structurally diffing
-    /// consecutive snapshots (intersected with the request mask),
-    /// matching pvxs's marked-leaf semantics. Default `false` keeps
-    /// the static-mask behaviour for single-record sources whose
-    /// every event already carries a full value.
-    fn monitor_emits_partial(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
-        let _ = name;
-        async { false }
-    }
-
     /// Notify the source that the per-connection monitor outbox for
     /// `name` just crossed UP through its high watermark. Producers
     /// can throttle their post() rate in response. Default impl is
@@ -1484,9 +1460,9 @@ pub trait ChannelSource: Send + Sync + 'static {
 /// a cooked MONITOR update — the new value plus an
 /// optional explicit set of changed field paths.
 ///
-/// `marked == None` means the server derives the wire changed-bitset
-/// itself: the full request mask for an ordinary source, or a
-/// value-diff for a partial-emitting source ([`ChannelSource::monitor_emits_partial`]).
+/// `marked == None` means the source declares no leaf set, so the server
+/// frames the full request mask — a source whose every event carries a
+/// whole value (pvxs's fully-marked `Value`).
 ///
 /// `marked == Some(paths)` carries an *explicit* marked-leaf set: the
 /// dot-separated field paths the source declares changed for this
@@ -1947,10 +1923,6 @@ pub trait ChannelSourceObj: Send + Sync {
         checked: AccessChecked,
         ctx: ChannelContext,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), OpError>> + Send + 'a>>;
-    fn monitor_emits_partial<'a>(
-        &'a self,
-        name: &'a str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>;
     fn notify_watermark(&self, name: &str, ctx: &ChannelContext, ev: WatermarkEvent);
     fn notify_monitor_start(&self, name: &str, ctx: &ChannelContext, start: bool);
     fn notify_channel_open(&self, name: &str, ctx: &ChannelContext);
@@ -2311,12 +2283,6 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
         ctx: ChannelContext,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), OpError>> + Send + 'a>> {
         Box::pin(<Self as ChannelSource>::process_checked(self, checked, ctx))
-    }
-    fn monitor_emits_partial<'a>(
-        &'a self,
-        name: &'a str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
-        Box::pin(<Self as ChannelSource>::monitor_emits_partial(self, name))
     }
     fn notify_watermark(&self, name: &str, ctx: &ChannelContext, ev: WatermarkEvent) {
         <Self as ChannelSource>::notify_watermark(self, name, ctx, ev);

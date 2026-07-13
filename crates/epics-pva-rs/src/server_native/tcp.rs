@@ -2157,9 +2157,6 @@ fn spawn_monitor_subscriber(
                     .store(live_v0, std::sync::atomic::Ordering::Release);
             }
         }
-        let emits_partial = src.monitor_emits_partial(&pv_name).await;
-        let mut prev_value: Option<PvField> = None;
-
         // Bounded FIFO, owned by [`MonitorQueue`] (pvxs `doPost`): the
         // connect-time seed is `pending[0]` (the consumer emits it first at
         // START, ahead of the accrued backlog) rather than an unconditional
@@ -2167,9 +2164,7 @@ fn spawn_monitor_subscriber(
         // `_filter` chain on every pending item (so the seed is filtered
         // exactly once, like epics-base `dbChannelRunPreChain`; a gating filter
         // that drops it suppresses the initial frame, a transform mismatch
-        // tears the monitor down with an error). `prev_value` is NOT set here —
-        // the seed must emit FULL (the consumer sets `prev_value` after
-        // emitting, so event #2 onward is partial).
+        // tears the monitor down with an error).
         let mut pending = MonitorQueue::new(queue_limit, &intro_clone, &mask_clone);
         if let Some(initial) = seed_initial {
             pending.seed(initial);
@@ -2283,20 +2278,19 @@ fn spawn_monitor_subscriber(
                     // is the only decrementer, so it is still there. No-op for a
                     // non-pipeline monitor.
                     credit.take();
+                    // A source that declares its marked leaves frames exactly
+                    // those (pvxs `to_wire_valid(R, ent, &pvMask)`); one that
+                    // declares none posts a wholly-changed value, which is
+                    // pvxs's fully-marked `Value` — the full request mask.
+                    // There is no third form: the port does not reconstruct a
+                    // marked set by diffing snapshots, which pvxs never does.
                     let payload = if let Some(paths) = marked.as_ref() {
                         build_monitor_payload_marked(
                             ioid, &intro_clone, &value, paths, &mask_clone, order_now(),
                         )
-                    } else if let Some(prev) = prev_value.as_ref() {
-                        build_monitor_payload_partial(
-                            ioid, &intro_clone, &value, prev, &mask_clone, order_now(),
-                        )
                     } else {
                         build_monitor_payload(ioid, &intro_clone, &value, &mask_clone, order_now())
                     };
-                    if emits_partial {
-                        prev_value = Some(value.clone());
-                    }
                     if tx_clone.send(payload).await.is_err() {
                         return;
                     }
@@ -7952,87 +7946,14 @@ fn build_monitor_payload(
     buf
 }
 
-/// build a MONITOR data frame whose wire changed-bitset is
-/// narrowed to exactly the leaves that differ between `prev` and
-/// `value`, intersected with the request `mask`.
-///
-/// This is the partial-update counterpart of [`build_monitor_payload`]
-/// — used for sources that emit partial updates (QSRV group monitor
-/// with a self-trigger). pvxs `servermon.cpp:174`
-/// `to_wire_valid(R, ent, &pvMask)` encodes the queued Value's own
-/// marked-changed bitset intersected with the request mask; here the
-/// marked set is reconstructed by structurally diffing consecutive
-/// snapshots ([`crate::pvdata::encode::diff_changed_bitset`]).
-///
-/// When the diff is empty (no leaf changed but the source still posted —
-/// e.g. an alarm-only re-post that decoded identically) the frame carries
-/// an empty changed-bitset and no value bytes. That is NOT what pvxs does
-/// and must not be read as parity: pvxs marks the source's leaves
-/// *assigned-not-changed*, so `testmask` passes and the frame carries those
-/// leaves. Only a source that hands up an explicit marked set
-/// ([`build_monitor_payload_marked`]) reproduces pvxs here — such a set is
-/// mask-tested at enqueue by [`MonitorQueue::real`], so an all-masked-out
-/// update never reaches a frame builder at all. This diff path is the
-/// port's own narrowing for sources that mark nothing, and it stays
-/// deliberately narrower than pvxs.
-fn build_monitor_payload_partial(
-    ioid: u32,
-    intro: &FieldDesc,
-    value: &PvField,
-    prev: &PvField,
-    mask: &BitSet,
-    order: ByteOrder,
-) -> Vec<u8> {
-    // Leaves that actually changed since the last emitted snapshot.
-    let diff = crate::pvdata::encode::diff_changed_bitset(intro, prev, value);
-    // Intersect the diff with the request selection mask so a client
-    // that subscribed to a field subset never sees leaves outside it
-    // (pvxs intersects with `pvMask`).
-    let mut selected = BitSet::new();
-    for bit in diff.iter() {
-        if mask.get(bit) {
-            selected.set(bit);
-        }
-    }
-
-    let mut payload = Vec::new();
-    payload.put_u32(ioid, order);
-    payload.put_u8(0x00);
-    // Canonicalize to the leaf-enumerated wire form exactly as
-    // `build_monitor_payload` does.
-    let changed = crate::pvdata::encode::canonical_changed_bitset(intro, &selected);
-    changed.write_into(order, &mut payload);
-    crate::pvdata::encode::encode_pv_field_with_bitset(
-        value,
-        intro,
-        &changed,
-        0,
-        order,
-        &mut payload,
-    );
-    // pvxs `servermon.cpp:174-176` always writes a single 0x00 (empty
-    // BitSet) for the trailing overrun mask — `// TODO: placeholder for
-    // overrun mask` — regardless of any server-side squash. Emit that
-    // exact wire form: a server-computed overrun set makes a pvxs client
-    // set `servSquash=true` and bump `nSrvSquash` (clientmon.cpp:554-564),
-    // a counter that stays 0 against a real pvxs server.
-    BitSet::new().write_into(order, &mut payload);
-    let h = PvaHeader::application(true, order, Command::Monitor.code(), payload.len() as u32);
-    let mut buf = Vec::with_capacity(8 + payload.len());
-    h.write_into(&mut buf);
-    buf.extend_from_slice(&payload);
-    buf
-}
-
 /// build a MONITOR data frame whose wire changed-bitset
 /// is the explicit set of `marked_paths` (a QSRV group `+trigger`
 /// target set), intersected with the request `mask`.
 ///
-/// Unlike [`build_monitor_payload_partial`], which reconstructs the
-/// marked set by diffing consecutive snapshots and so only marks
-/// leaves that *changed*, this marks each target field whether or not
-/// its value differs — pvxs `groupsource.cpp:288` refreshes and marks
-/// every `+trigger` target (assigned-not-changed).
+/// Each target field is marked whether or not its value differs from the
+/// previous post — pvxs `groupsource.cpp:288` refreshes and marks every
+/// `+trigger` target (assigned-not-changed), so a re-post of an unchanged
+/// leaf still carries it.
 fn build_monitor_payload_marked(
     ioid: u32,
     intro: &FieldDesc,
@@ -11517,9 +11438,9 @@ mod tests {
 
     /// Decode the field-`a` value of a MONITOR DATA frame (subcmd
     /// `0x00`), or `None` for any non-DATA frame (INIT reply `0x08`,
-    /// FINISH `0x10`). `SharedSource` emits FULL frames
-    /// (`monitor_emits_partial == false`), so every DATA frame carries
-    /// all three fields and `three_field_extract` applies.
+    /// FINISH `0x10`). `SharedSource` marks no leaves (`MonitorUpdate::
+    /// marked == None`), so every DATA frame carries all three fields and
+    /// `three_field_extract` applies.
     #[cfg(test)]
     fn pvx61_decode_data_a(resp: &[u8], intro: &FieldDesc, order: ByteOrder) -> Option<i32> {
         let (frame, _) = try_parse_frame(resp).ok()??;
@@ -14443,22 +14364,18 @@ mod tests {
         );
     }
 
-    /// Residual regression: `build_monitor_payload_partial`
-    /// narrows the wire changed-bitset to exactly the leaves that
-    /// differ from the previous snapshot, intersected with the
-    /// request mask — pvxs `servermon.cpp:174`
-    /// `to_wire_valid(R, ent, &pvMask)`. The previous QSRV group
-    /// monitor path always sent the full request mask, so a
-    /// self-trigger update on one member wrongly marked every member
-    /// changed on the wire.
+    /// The two surviving monitor frame builders: a source that declares its
+    /// marked leaves frames exactly those (pvxs `servermon.cpp:174`
+    /// `to_wire_valid(R, ent, &pvMask)`), and a source that declares none
+    /// frames the full request mask (pvxs's fully-marked `Value`). The port
+    /// has no third, snapshot-diffing form — pvxs never reconstructs a marked
+    /// set by comparing consecutive values, and the QSRV group monitor that
+    /// once needed it now hands up its marked leaves on every event.
     ///
-    /// This builds a two-member group value and an event in which
-    /// only member `a` changed; the decoded frame's changed-bitset
-    /// must mark `a`'s leaf and NOT `b`'s. The contrasting full-mask
-    /// `build_monitor_payload` marks both — proving the narrowing is
-    /// the partial builder's doing.
+    /// A two-member group value with only `a` marked: the frame must mark
+    /// `a`'s leaf and NOT `b`'s, while the full-mask builder marks both.
     #[test]
-    fn br_r29_partial_monitor_payload_narrows_changed_bitset() {
+    fn br_r29_marked_monitor_payload_narrows_changed_bitset() {
         let order = ByteOrder::Little;
         let ioid = 0x29;
         // Group structure: { a: Double, b: Double }.
@@ -14477,37 +14394,32 @@ mod tests {
                 .push(("b".into(), PvField::Scalar(ScalarValue::Double(b))));
             PvField::Structure(s)
         };
-        // Previous emitted snapshot, then an event where only `a`
-        // changed (self-trigger on member `a`).
-        let prev = mk(1.0, 2.0);
         let curr = mk(9.0, 2.0);
         let mask = BitSet::all_set(intro.total_bits());
 
-        // Partial builder: changed-bitset must mark only `a` (bit 1),
-        // not `b` (bit 2).
-        let partial = build_monitor_payload_partial(ioid, &intro, &curr, &prev, &mask, order);
-        let (frame, _) = try_parse_frame(&partial).unwrap().expect("complete frame");
+        // Marked builder: a self-trigger event on member `a` marks only `a`
+        // (bit 1), never `b` (bit 2).
+        let marked = vec!["a".to_string()];
+        let narrowed = build_monitor_payload_marked(ioid, &intro, &curr, &marked, &mask, order);
+        let (frame, _) = try_parse_frame(&narrowed).unwrap().expect("complete frame");
         let data = match decode_op_response(&frame, Some(&intro)).unwrap() {
             OpResponse::Data(d) => d,
             other => panic!("expected monitor data, got {other:?}"),
         };
         assert!(
             data.changed.get(1),
-            "member `a` (bit 1) changed — must be marked"
+            "member `a` (bit 1) is marked — must be set"
         );
         assert!(
             !data.changed.get(2),
-            "member `b` (bit 2) unchanged — must NOT be marked (narrowing)"
+            "member `b` (bit 2) is not marked — must NOT be set (narrowing)"
         );
 
         // Full builder: a wildcard (all-set) request mask enumerates every
         // LEAF — {1, 2}, never the root bit. pvxs `to_wire_valid`
         // (dataencode.cpp:414-439) sets a wire bit only where
         // `store[bit].valid`, and `Value::mark` (data.cpp:256-270) never
-        // validates a parent structure, so a root bit cannot appear. The
-        // contrast the residual gap describes still holds: the full builder
-        // marks every member {1,2}, the partial builder narrows to the
-        // changed leaf {1}.
+        // validates a parent structure, so a root bit cannot appear.
         let full = build_monitor_payload(ioid, &intro, &curr, &mask, order);
         let (full_frame, _) = try_parse_frame(&full).unwrap().expect("complete frame");
         let full_data = match decode_op_response(&full_frame, Some(&intro)).unwrap() {

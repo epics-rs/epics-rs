@@ -1957,14 +1957,9 @@ enum EventMark {
     /// Post the group, marking exactly these group field paths
     /// (the resolved `+trigger` target set, assigned-not-changed).
     Marked(Vec<String>),
-    /// Post the group and let the server derive the changed-bitset (the
-    /// snapshot diff for a partial-emitting source, else the full request
-    /// mask). Reached ONLY when a marked target has no addressable field
-    /// path — a root-flattened member (`field_name == ""`), whose leaves
-    /// cannot be named — where marking nothing would under-mark the post.
-    Derive,
-    /// No post — `TriggerDef::None`, or every named target dropped
-    /// (pvxs `subscriptionPost` `if(empty && !first) return`).
+    /// No post — `TriggerDef::None`, every named target dropped, or no
+    /// target's change classes assign a leaf (pvxs `subscriptionPost`
+    /// `if(empty && !first) return`).
     Skip,
 }
 
@@ -2042,7 +2037,7 @@ impl GroupMonitor {
     /// special: pvxs seeds `field.triggers` with the field itself
     /// (`groupconfigprocessor.cpp:317-339`), so the self-triggered member
     /// runs the very same `IOCSource::get` + mark loop as an explicit
-    /// `+trigger` target. Routing it through `leaves_or_derive` like every
+    /// `+trigger` target. Routing it through `marked_leaves` like every
     /// other trigger shape is what gives it the same leaf narrowing; the
     /// snapshot-diff path it used to take was two-sided divergence — WIDER
     /// (a property event diffed timeStamp/alarm leaves that pvxs's
@@ -2112,7 +2107,7 @@ impl GroupMonitor {
                 .map(|(i, m)| (m, change_for(i)))
                 .collect(),
         };
-        Self::leaves_or_derive(targets)
+        Self::marked_leaves(targets)
     }
 
     /// a *property* event marks only the source field's
@@ -2131,7 +2126,7 @@ impl GroupMonitor {
         // pvxs passes `UpdateType::Property` unconditionally for a
         // property event (`groupsource.cpp:378`) — the event's own DBE
         // mask is not consulted.
-        Self::leaves_or_derive(vec![(source, DbeMask::PROPERTY)])
+        Self::marked_leaves(vec![(source, DbeMask::PROPERTY)])
     }
 
     /// Expand each `(member, change)` pair into the wire leaves its
@@ -2141,11 +2136,20 @@ impl GroupMonitor {
     /// DBE_PROPERTY event re-sent value/alarm/timeStamp and a DBE_VALUE
     /// event re-sent the display/control limits.
     ///
-    /// An empty target list → [`EventMark::Skip`]. A target whose field
-    /// path is empty (a root-flattened `Meta` member that cannot be
-    /// addressed by a structure path) → [`EventMark::Derive`] (full
-    /// mask) rather than under-marking. A target whose change classes
-    /// contribute no leaf (a `Const`/`Structure`/`Proc` member, a
+    /// A root-flattened member (`field_name == ""`) is NOT special. The
+    /// only mapping allowed at the struct top is `+type:"meta"`
+    /// (`groupconfigprocessor.cpp:224-231`, mirrored in
+    /// `group_config::parse_group_config`), whose leaves land at the group
+    /// root as `alarm` / `timeStamp` (`set_member_field`) — both nameable,
+    /// so [`pvif::change_leaf_paths`] with an empty prefix addresses them
+    /// exactly. pvxs marks a root member through the same `Field::findIn`
+    /// mark loop as any other (`field.cpp:56-81` returns the root value
+    /// unchanged for an empty `fieldName`; `iocsource.cpp:312-352` runs the
+    /// identical assignment), so it neither forces a full-value post nor
+    /// widens the group's leaf narrowing.
+    ///
+    /// An empty target list → [`EventMark::Skip`]. A target whose change
+    /// classes contribute no leaf (a `Const`/`Structure`/`Proc` member, a
     /// `Meta`/`Plain`/`Any` member on a property change, or a
     /// self-trigger whose event was ARCHIVE-only) is dropped; if every
     /// target drops, the post carries nothing → [`EventMark::Skip`]
@@ -2154,13 +2158,7 @@ impl GroupMonitor {
     /// The per-mapping leaf set is [`pvif::change_leaf_paths`] — the one
     /// owner of pvxs `IOCSource::get`'s assignment, shared with the
     /// single-record monitor.
-    fn leaves_or_derive(targets: Vec<(&GroupMember, DbeMask)>) -> EventMark {
-        if targets.is_empty() {
-            return EventMark::Skip;
-        }
-        if targets.iter().any(|(m, _)| m.field_name.is_empty()) {
-            return EventMark::Derive;
-        }
+    fn marked_leaves(targets: Vec<(&GroupMember, DbeMask)>) -> EventMark {
         let mut leaves = Vec::new();
         for (m, change) in targets {
             leaves.extend(super::pvif::change_leaf_paths(
@@ -2380,10 +2378,13 @@ impl super::provider::PvaMonitor for GroupMonitor {
                     Self::property_event_mark(&self.def, event.member_index)
                 }
             };
+            // Every posted group event carries its marked leaves — there is
+            // no shape a group event can take that the leaf paths cannot
+            // address (see `marked_leaves`), so the group source never asks
+            // the server to derive a changed-bitset.
             let marked = match mark {
                 EventMark::Skip => continue,
-                EventMark::Derive => None,
-                EventMark::Marked(paths) => Some(paths),
+                EventMark::Marked(paths) => paths,
             };
 
             let group_channel = self.group_channel.as_ref()?;
@@ -2413,8 +2414,11 @@ impl super::provider::PvaMonitor for GroupMonitor {
             // only `value.index`, never the property-only `value.choices`
             // the whole-subtree `value` mark would otherwise re-send
             // (pvxs `iocsource.cpp:107-109,331-351`).
-            let marked = marked.map(|paths| super::pvif::narrow_enum_value_leaves(paths, &value));
-            return Some(super::provider::MonitorPoll { value, marked });
+            let marked = super::pvif::narrow_enum_value_leaves(marked, &value);
+            return Some(super::provider::MonitorPoll {
+                value,
+                marked: Some(marked),
+            });
         }
     }
 
@@ -2767,7 +2771,6 @@ mod tests {
                     "channel-less structure member must NOT be marked by `*`: {paths:?}"
                 );
             }
-            EventMark::Derive => panic!("expected Marked from a `*` trigger, got Derive"),
             EventMark::Skip => panic!("expected Marked from a `*` trigger, got Skip"),
         }
 
@@ -2789,7 +2792,6 @@ mod tests {
                     "named channel-less target must NOT be marked: {paths:?}"
                 );
             }
-            EventMark::Derive => panic!("expected Marked from named triggers, got Derive"),
             EventMark::Skip => panic!("expected Marked from named triggers, got Skip"),
         }
     }
@@ -3037,6 +3039,73 @@ mod tests {
                 EventMark::Skip
             ),
             "meta member carries no property-metadata leaves"
+        );
+    }
+
+    /// R15-31 — a ROOT-flattened `+type:meta` member (the empty key, the
+    /// only mapping pvxs permits at the struct top:
+    /// `groupconfigprocessor.cpp:224-231`) marks by field path like every
+    /// other member. pvxs has no special case for it — `Field::findIn`
+    /// returns the root value unchanged for an empty `fieldName`
+    /// (`field.cpp:56-81`) and `IOCSource::get` runs the same assignment
+    /// (`iocsource.cpp:312-352`) — and its leaves land at the group root as
+    /// `alarm` / `timeStamp` (`set_member_field`), both nameable.
+    ///
+    /// Two boundaries, both of which the old bail-to-full-mask broke:
+    ///
+    /// * a DBE_PROPERTY event on the root-meta member marks NOTHING (pvxs
+    ///   `getProperties` is `info.type == Scalar`-only), so there is no post
+    ///   at all — the old code emitted a full-value frame;
+    /// * a root-meta member inside a `+trigger:"*"` group does not widen the
+    ///   group's narrowing: the other members keep their per-UpdateType
+    ///   leaves instead of every post collapsing to the whole request mask.
+    #[test]
+    fn root_meta_member_marks_leaves_like_every_other_member() {
+        use crate::qsrv::group_config::parse_group_config;
+
+        // "" is the root-flattened meta member; `a` is an ordinary scalar.
+        let json = r#"{ "GRP": {
+            "":  { "+channel": "R:m", "+type": "meta", "+trigger": "*" },
+            "a": { "+channel": "R:a" }
+        } }"#;
+        let def = parse_group_config(json).unwrap().pop().unwrap();
+        let root = def
+            .members
+            .iter()
+            .position(|m| m.field_name.is_empty())
+            .expect("root meta member survives config parsing");
+
+        // Value event: the root member's own leaves are the ROOT `timeStamp`
+        // / `alarm` (no member prefix), and the `*` trigger still narrows the
+        // other member to its Value|Alarm leaves.
+        let EventMark::Marked(v) =
+            GroupMonitor::value_event_mark(&def, root, DbeMask::VALUE | DbeMask::ALARM)
+        else {
+            panic!("a root-meta value event must mark leaves");
+        };
+        assert!(
+            v.contains(&"timeStamp".to_string()) && v.contains(&"alarm".to_string()),
+            "root meta marks the root alarm/timeStamp: {v:?}"
+        );
+        assert_eq!(
+            v.iter().filter(|p| p.starts_with("a.")).collect::<Vec<_>>(),
+            vec!["a.timeStamp", "a.alarm", "a.value"],
+            "the co-triggered member keeps its leaf narrowing — a root-meta \
+             member must not collapse the group onto the full request mask: {v:?}"
+        );
+        assert!(
+            !v.iter().any(|p| p == "a.display.limitLow"),
+            "a value event never marks property leaves: {v:?}"
+        );
+
+        // Property event on the root-meta member: getProperties is
+        // Scalar-only, so nothing is assigned and pvxs posts nothing.
+        assert!(
+            matches!(
+                GroupMonitor::property_event_mark(&def, root),
+                EventMark::Skip
+            ),
+            "DBE_PROPERTY on a root-meta member marks nothing → no post"
         );
     }
 

@@ -1394,74 +1394,6 @@ pub fn canonical_changed_bitset(
     out
 }
 
-/// structural diff of two `PvField` snapshots against their
-/// shared `desc`, producing the per-event **changed bitset** — the
-/// leaves whose value differs between `prev` and `curr`.
-///
-/// pvxs posts a monitor `Value` whose marked bitset reflects exactly
-/// the leaves a source touched since the last `unmark()`
-/// (`servermon.cpp:174` then intersects with the request mask). A
-/// QSRV group monitor with the default self-trigger re-reads only the
-/// triggered member, so consecutive group snapshots differ in only
-/// that member's leaves — diffing them reproduces pvxs's marked-leaf
-/// set without the source having to track marks itself.
-///
-/// Bit numbering matches the rest of this module (pvData spec §5.4):
-/// root structure is bit 0, fields numbered depth-first in
-/// declaration order. Only **leaf** bits are set; structure bits stay
-/// clear so [`canonical_changed_bitset`] / the encoder treat the
-/// result as a partial update.
-///
-/// A leaf present in `desc` but missing from either snapshot is
-/// treated as changed (defensive: a shape mismatch must not silently
-/// drop the field from the wire delta).
-pub fn diff_changed_bitset(
-    desc: &FieldDesc,
-    prev: &PvField,
-    curr: &PvField,
-) -> crate::proto::BitSet {
-    fn walk(
-        desc: &FieldDesc,
-        bit_offset: usize,
-        prev: Option<&PvField>,
-        curr: Option<&PvField>,
-        out: &mut crate::proto::BitSet,
-    ) {
-        match desc {
-            FieldDesc::Structure { fields, .. } => {
-                let mut child_bit = bit_offset + 1;
-                for (name, child_desc) in fields {
-                    let prev_child = match prev {
-                        Some(PvField::Structure(s)) => s.get_field(name),
-                        _ => None,
-                    };
-                    let curr_child = match curr {
-                        Some(PvField::Structure(s)) => s.get_field(name),
-                        _ => None,
-                    };
-                    walk(child_desc, child_bit, prev_child, curr_child, out);
-                    child_bit += child_desc.total_bits();
-                }
-            }
-            _ => {
-                // Leaf node: mark changed when the values differ, or
-                // when either snapshot lacks the leaf entirely.
-                let changed = match (prev, curr) {
-                    (Some(p), Some(c)) => p != c,
-                    _ => true,
-                };
-                if changed {
-                    out.set(bit_offset);
-                }
-            }
-        }
-    }
-
-    let mut out = crate::proto::BitSet::new();
-    walk(desc, 0, Some(prev), Some(curr), &mut out);
-    out
-}
-
 /// build a wire *selection* bitset that marks every bit
 /// under each field path in `marked_paths`.
 ///
@@ -1470,14 +1402,14 @@ pub fn diff_changed_bitset(
 /// `field_name` paths. Marking a node sets its entire subtree, which
 /// reproduces pvxs's *assigned-not-changed* semantics
 /// (`groupsource.cpp:288` marks each `+trigger` target whether or not
-/// its value changed since the last post), unlike
-/// [`diff_changed_bitset`] which only marks leaves that differ.
+/// its value changed since the last post). The port has no
+/// value-diffing counterpart — pvxs never reconstructs a marked set by
+/// comparing consecutive values.
 ///
 /// The result is a *selection* mask in the same sense as
 /// [`request_to_mask`](crate::pv_request::request_to_mask): the caller
 /// intersects it with the request mask and runs it through
-/// [`canonical_changed_bitset`] before encoding, exactly as the diff
-/// path does.
+/// [`canonical_changed_bitset`] before encoding.
 ///
 /// Bit numbering matches the rest of this module (pvData §5.4): root is
 /// bit 0, fields depth-first in declaration order.
@@ -3795,41 +3727,6 @@ mod tests {
             assert_eq!(cur.get_i32(order).unwrap(), 0x7EAD, "cursor desync");
             assert_eq!(cur.remaining(), 0);
         }
-    }
-
-    /// `diff_changed_bitset` marks exactly the leaf bits
-    /// whose value differs between two snapshots, and leaves
-    /// structure bits clear. Bit numbering for `nested_alarm_desc`:
-    /// root=0, value=1, alarm(struct)=2, alarm.severity=3,
-    /// alarm.status=4.
-    #[test]
-    fn br_r29_diff_changed_bitset_marks_only_changed_leaves() {
-        let desc = nested_alarm_desc();
-
-        // Only `value` changed (1.0 → 9.0); alarm identical.
-        let prev = nested_alarm_value(1.0, 7, 3);
-        let curr = nested_alarm_value(9.0, 7, 3);
-        let diff = diff_changed_bitset(&desc, &prev, &curr);
-        assert!(diff.get(1), "value leaf changed → bit 1 set");
-        assert!(!diff.get(0), "root structure bit must stay clear");
-        assert!(!diff.get(2), "alarm structure bit must stay clear");
-        assert!(!diff.get(3), "alarm.severity unchanged → clear");
-        assert!(!diff.get(4), "alarm.status unchanged → clear");
-        assert_eq!(diff.count(), 1, "exactly one leaf changed");
-
-        // Only a nested leaf changed (severity 7 → 2).
-        let prev2 = nested_alarm_value(5.0, 7, 3);
-        let curr2 = nested_alarm_value(5.0, 2, 3);
-        let diff2 = diff_changed_bitset(&desc, &prev2, &curr2);
-        assert!(diff2.get(3), "alarm.severity changed → bit 3 set");
-        assert!(!diff2.get(1), "value unchanged → clear");
-        assert!(!diff2.get(4), "alarm.status unchanged → clear");
-        assert_eq!(diff2.count(), 1);
-
-        // Identical snapshots → empty diff.
-        let same = nested_alarm_value(5.0, 1, 1);
-        let diff3 = diff_changed_bitset(&desc, &same, &same.clone());
-        assert_eq!(diff3.count(), 0, "no change → empty changed-bitset");
     }
 
     /// `marked_changed_bitset` marks each named path's

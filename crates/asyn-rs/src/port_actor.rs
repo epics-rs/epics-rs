@@ -849,6 +849,8 @@ impl PortActor {
             | RequestOp::GetConnected
             | RequestOp::PushEchoInterpose
             | RequestOp::PushDelayInterpose { .. }
+            | RequestOp::PushEosInterpose { .. }
+            | RequestOp::PushFlushInterpose { .. }
             | RequestOp::BlockProcess
             | RequestOp::UnblockProcess
             | RequestOp::ShutdownPort
@@ -1521,6 +1523,35 @@ impl PortActor {
                 self.driver.base_mut().install_octet_interpose_addr(
                     user.addr,
                     Box::new(crate::interpose::delay::DelayInterpose::new(*delay)),
+                );
+                Ok(RequestResult::write_ok())
+            }
+            RequestOp::PushEosInterpose {
+                process_in,
+                process_out,
+            } => {
+                // C `asynInterposeEosConfig` (asynInterposeEos.c:84-140) pushes
+                // the EOS layer onto the addressed device's octet interface at
+                // any time after configure — the same actor-owned install point
+                // as the echo and delay layers. The terminators themselves
+                // arrive later, through `asynOctetSetInputEos`.
+                self.driver.base_mut().install_octet_interpose_addr(
+                    user.addr,
+                    Box::new(crate::interpose::eos::EosInterpose::with_processing(
+                        crate::interpose::eos::EosConfig::default(),
+                        *process_in,
+                        *process_out,
+                    )),
+                );
+                Ok(RequestResult::write_ok())
+            }
+            RequestOp::PushFlushInterpose { flush_timeout } => {
+                // C `asynInterposeFlushConfig` (asynInterposeFlush.c:66-91).
+                self.driver.base_mut().install_octet_interpose_addr(
+                    user.addr,
+                    Box::new(crate::interpose::flush::FlushTimeoutInterpose::new(
+                        *flush_timeout,
+                    )),
                 );
                 Ok(RequestResult::write_ok())
             }

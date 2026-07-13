@@ -690,6 +690,110 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
         ));
     }
 
+    // asynInterposeEosConfig portName addr processIn processOut ------------
+    // C asynInterposeEos.c:393-410. The layer `drvAsynIPPortConfigure`
+    // installs by default (:1065) is the same one, with both halves on; this
+    // command is how a port created WITHOUT it (noProcessEos=1, or a serial
+    // port) gets EOS processing back, and how a port gets one half only.
+    {
+        let mgr_r = mgr.clone();
+        out.push(CommandDef::new(
+            "asynInterposeEosConfig",
+            vec![
+                ArgDesc {
+                    name: "portName",
+                    arg_type: ArgType::String,
+                    optional: false,
+                },
+                ArgDesc {
+                    name: "addr",
+                    arg_type: ArgType::Int,
+                    optional: false,
+                },
+                ArgDesc {
+                    name: "processIn",
+                    arg_type: ArgType::Int,
+                    optional: false,
+                },
+                ArgDesc {
+                    name: "processOut",
+                    arg_type: ArgType::Int,
+                    optional: false,
+                },
+            ],
+            "asynInterposeEosConfig portName addr processIn processOut - install the EOS \
+             interpose (terminator handling) on the port",
+            move |args: &[ArgValue], ctx: &CommandContext| {
+                let port = arg_str(args, 0)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| "portName required".to_string())?;
+                let addr = arg_int(args, 1).unwrap_or(0) as i32;
+                let process_in = arg_int(args, 2).unwrap_or(0) != 0;
+                let process_out = arg_int(args, 3).unwrap_or(0) != 0;
+                match mgr_r.find_port_handle(&port) {
+                    Ok(handle) => {
+                        if let Err(e) =
+                            handle.push_eos_interpose_blocking(addr, process_in, process_out)
+                        {
+                            ctx.println(&format!("{port} interposeInterface failed: {e}"));
+                        }
+                    }
+                    Err(_) => ctx.println(&format!("{port} interposeInterface failed.")),
+                }
+                Ok(CommandOutcome::Continue)
+            },
+        ));
+    }
+
+    // asynInterposeFlushConfig portName addr timeout(ms) -------------------
+    {
+        let mgr_r = mgr.clone();
+        out.push(CommandDef::new(
+            "asynInterposeFlushConfig",
+            vec![
+                ArgDesc {
+                    name: "portName",
+                    arg_type: ArgType::String,
+                    optional: false,
+                },
+                ArgDesc {
+                    name: "addr",
+                    arg_type: ArgType::Int,
+                    optional: false,
+                },
+                ArgDesc {
+                    name: "timeout(msec)",
+                    arg_type: ArgType::Double,
+                    optional: false,
+                },
+            ],
+            "asynInterposeFlushConfig portName addr timeout(msec) - install the flush \
+             interpose (a read with this timeout drains the input before each write)",
+            move |args: &[ArgValue], ctx: &CommandContext| {
+                let port = arg_str(args, 0)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| "portName required".to_string())?;
+                let addr = arg_int(args, 1).unwrap_or(0) as i32;
+                // C `asynInterposeFlushConfig` (asynInterposeFlush.c:78-79):
+                // the shell argument is an integer number of MILLIseconds, and
+                // a non-positive one is coerced to 1 ms — a zero-timeout flush
+                // would drain nothing.
+                let ms = arg_f64(args, 2).unwrap_or(0.0) as i64;
+                let ms = if ms <= 0 { 1 } else { ms };
+                let timeout = Duration::from_millis(ms as u64);
+                match mgr_r.find_port_handle(&port) {
+                    Ok(handle) => {
+                        if let Err(e) = handle.push_flush_interpose_blocking(addr, timeout) {
+                            ctx.println(&format!("{port} interposeInterface failed: {e}"));
+                        }
+                    }
+                    Err(_) => ctx.println(&format!("{port} interposeInterface failed.")),
+                }
+                Ok(CommandOutcome::Continue)
+            },
+        ));
+    }
+
     // asynSetTraceMask ----------------------------------------------------
     {
         let mgr_r = mgr.clone();
@@ -1473,6 +1577,43 @@ mod tests {
         }
     }
 
+    /// A port with real octet I/O: reads serve a canned script, writes are
+    /// recorded. Enough to see what an interpose layer does to the bytes.
+    struct OctetDriver {
+        base: PortDriverBase,
+        input: Vec<u8>,
+        pos: usize,
+        written: Arc<Mutex<Vec<u8>>>,
+    }
+    impl OctetDriver {
+        fn new(name: &str, input: &[u8], written: Arc<Mutex<Vec<u8>>>) -> Self {
+            Self {
+                base: PortDriverBase::new(name, 1, PortFlags::default()),
+                input: input.to_vec(),
+                pos: 0,
+                written,
+            }
+        }
+    }
+    impl PortDriver for OctetDriver {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+            let n = (self.input.len() - self.pos).min(buf.len());
+            buf[..n].copy_from_slice(&self.input[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            self.written.lock().unwrap().extend_from_slice(data);
+            Ok(data.len())
+        }
+    }
+
     fn fresh_mgr_with_port(name: &str) -> Arc<PortManager> {
         let mgr = Arc::new(PortManager::new());
         let _ = mgr.register_port(DummyDriver::new(name)).unwrap();
@@ -1557,6 +1698,8 @@ mod tests {
             // interpose layers
             "asynInterposeEcho",
             "asynInterposeDelay",
+            "asynInterposeEosConfig",
+            "asynInterposeFlushConfig",
             // port creation
             "drvAsynIPPortConfigure",
             "drvAsynIPServerPortConfigure",
@@ -1565,6 +1708,143 @@ mod tests {
         ];
         expected.sort_unstable();
         assert_eq!(names, expected);
+    }
+
+    /// R19-118 boundary: `asynInterposeEosConfig` installs the EOS layer from
+    /// the shell, and its two flags each gate exactly one direction.
+    ///
+    /// C `asynInterposeEosConfig(portName, addr, processEosIn, processEosOut)`
+    /// (asynInterposeEos.c:84-140): `processEosIn == 0` makes `readIt` delegate
+    /// straight to the driver (:191-193), `processEosOut == 0` makes `writeIt`
+    /// append nothing (:161). The boundary tested here is processIn=1,
+    /// processOut=0: the read terminates on the input EOS, and the write goes
+    /// out with no terminator appended even though OEOS is set.
+    #[test]
+    fn iocsh_interpose_eos_config_gates_each_direction_on_its_flag() {
+        let mgr = Arc::new(PortManager::new());
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let _ = mgr
+            .register_port(OctetDriver::new(
+                "eos_cfg",
+                b"line1\nline2\n",
+                written.clone(),
+            ))
+            .unwrap();
+        let cmds = build_asyn_commands(mgr.clone());
+        let ctx = make_ctx();
+
+        cmds.iter()
+            .find(|c| c.name == "asynInterposeEosConfig")
+            .expect("asynInterposeEosConfig must be registered")
+            .handler
+            .call(
+                &[
+                    ArgValue::String("eos_cfg".into()),
+                    ArgValue::Int(0),
+                    ArgValue::Int(1), // processIn
+                    ArgValue::Int(0), // processOut
+                ],
+                &ctx,
+            )
+            .unwrap();
+
+        let handle = mgr.find_port_handle("eos_cfg").unwrap();
+        handle
+            .set_input_eos_blocking(shell_eos_user(0), b"\n")
+            .unwrap();
+        handle
+            .set_output_eos_blocking(shell_eos_user(0), b"\n")
+            .unwrap();
+
+        // processIn = 1: the read stops at the terminator and strips it.
+        let user = AsynUser::default()
+            .with_addr(0)
+            .with_timeout(SHELL_IO_TIMEOUT);
+        let first = handle
+            .submit_blocking(crate::request::RequestOp::OctetRead { buf_size: 32 }, user)
+            .unwrap();
+        assert_eq!(first.data.as_deref(), Some(&b"line1"[..]));
+
+        // processOut = 0: the write is handed to the driver verbatim — the
+        // output terminator is NOT appended, even though OEOS is set.
+        let user = AsynUser::default()
+            .with_addr(0)
+            .with_timeout(SHELL_IO_TIMEOUT);
+        handle
+            .submit_blocking(
+                crate::request::RequestOp::OctetWrite {
+                    data: b"CMD".to_vec(),
+                },
+                user,
+            )
+            .unwrap();
+        assert_eq!(written.lock().unwrap().as_slice(), b"CMD");
+    }
+
+    /// R19-118: `asynInterposeFlushConfig` installs the flush-timeout layer
+    /// from the shell (C asynInterposeFlush.c:66-91, iocsh at :195-205).
+    #[test]
+    fn iocsh_interpose_flush_config_installs_the_layer() {
+        let mgr = Arc::new(PortManager::new());
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let _ = mgr
+            .register_port(OctetDriver::new("flush_cfg", b"stale", written.clone()))
+            .unwrap();
+        let cmds = build_asyn_commands(mgr.clone());
+        let ctx = make_ctx();
+
+        cmds.iter()
+            .find(|c| c.name == "asynInterposeFlushConfig")
+            .expect("asynInterposeFlushConfig must be registered")
+            .handler
+            .call(
+                &[
+                    ArgValue::String("flush_cfg".into()),
+                    ArgValue::Int(0),
+                    // C coerces a non-positive millisecond timeout to 1 ms
+                    // (asynInterposeFlush.c:78).
+                    ArgValue::Double(0.0),
+                ],
+                &ctx,
+            )
+            .unwrap();
+
+        // The layer's whole job is `flushIt` (C :112-132): read the driver dry
+        // under the short timeout. Writes and reads pass through untouched
+        // (:95-110). Without the layer a flush on this driver is a no-op and
+        // the stale bytes survive.
+        let handle = mgr.find_port_handle("flush_cfg").unwrap();
+        let user = AsynUser::default()
+            .with_addr(0)
+            .with_timeout(SHELL_IO_TIMEOUT);
+        handle
+            .submit_blocking(crate::request::RequestOp::Flush, user)
+            .unwrap();
+
+        let user = AsynUser::default()
+            .with_addr(0)
+            .with_timeout(SHELL_IO_TIMEOUT);
+        let after = handle
+            .submit_blocking(crate::request::RequestOp::OctetRead { buf_size: 16 }, user)
+            .unwrap();
+        assert_eq!(
+            after.nbytes, 0,
+            "the flush layer must have drained the driver's stale input"
+        );
+
+        // And the write path is untouched by the layer.
+        let user = AsynUser::default()
+            .with_addr(0)
+            .with_timeout(SHELL_IO_TIMEOUT);
+        handle
+            .submit_blocking(
+                crate::request::RequestOp::OctetWrite {
+                    data: b"GO".to_vec(),
+                },
+                user,
+            )
+            .unwrap();
+        assert_eq!(written.lock().unwrap().as_slice(), b"GO");
     }
 
     /// R19-116: `asynEnable` / `asynAutoConnect` exist on the shell, and they

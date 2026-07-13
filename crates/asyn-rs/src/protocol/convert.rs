@@ -89,6 +89,16 @@ impl From<&RequestOp> for PortCommand {
             RequestOp::PushDelayInterpose { delay } => Self::PushDelayInterpose {
                 delay_secs: delay.as_secs_f64(),
             },
+            RequestOp::PushEosInterpose {
+                process_in,
+                process_out,
+            } => Self::PushEosInterpose {
+                process_in: *process_in,
+                process_out: *process_out,
+            },
+            RequestOp::PushFlushInterpose { flush_timeout } => Self::PushFlushInterpose {
+                flush_timeout_secs: flush_timeout.as_secs_f64(),
+            },
             RequestOp::BlockProcess => Self::BlockProcess,
             RequestOp::UnblockProcess => Self::UnblockProcess,
             RequestOp::DrvUserCreate(req) => Self::DrvUserCreate {
@@ -204,6 +214,16 @@ impl From<&PortCommand> for RequestOp {
             // and collapses those to C's "no delay".
             PortCommand::PushDelayInterpose { delay_secs } => Self::PushDelayInterpose {
                 delay: crate::interpose::delay::delay_from_secs(*delay_secs),
+            },
+            PortCommand::PushEosInterpose {
+                process_in,
+                process_out,
+            } => Self::PushEosInterpose {
+                process_in: *process_in,
+                process_out: *process_out,
+            },
+            PortCommand::PushFlushInterpose { flush_timeout_secs } => Self::PushFlushInterpose {
+                flush_timeout: std::time::Duration::from_secs_f64(*flush_timeout_secs),
             },
             PortCommand::BlockProcess => Self::BlockProcess,
             PortCommand::UnblockProcess => Self::UnblockProcess,

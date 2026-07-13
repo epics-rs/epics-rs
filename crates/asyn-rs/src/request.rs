@@ -289,6 +289,22 @@ pub enum RequestOp {
     PushDelayInterpose {
         delay: std::time::Duration,
     },
+    /// Install the EOS interpose on the addressed device's octet stack. C
+    /// parity: `asynInterposeEosConfig(portName, addr, processEosIn,
+    /// processEosOut)` (`asynInterposeEos.c:84-140`), registered with iocsh at
+    /// :393-410. The two flags select which half of the layer is live.
+    PushEosInterpose {
+        process_in: bool,
+        process_out: bool,
+    },
+    /// Install the flush-timeout interpose on the addressed device's octet
+    /// stack. C parity: `asynInterposeFlushConfig(portName, addr, timeout)`
+    /// (`asynInterposeFlush.c:66-91`); C's shell argument is in milliseconds
+    /// and `<= 0` means 1 ms (:78-79), so the conversion happens at the shell
+    /// and the op carries a real duration.
+    PushFlushInterpose {
+        flush_timeout: std::time::Duration,
+    },
     /// Send a GPIB universal command byte — C `asynGpib::universalCmd`
     /// (asynGpib.c:480-484). asynRecord's UCMD dispatch
     /// (`gpibUniversalCmd`, asynRecord.c:1638-1679).

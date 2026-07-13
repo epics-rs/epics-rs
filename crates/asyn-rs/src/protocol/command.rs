@@ -167,6 +167,17 @@ pub enum PortCommand {
     PushDelayInterpose {
         delay_secs: f64,
     },
+    /// Install the EOS interpose — C `asynInterposeEosConfig`. Appended last:
+    /// the variant order is the wire encoding.
+    PushEosInterpose {
+        process_in: bool,
+        process_out: bool,
+    },
+    /// Install the flush-timeout interpose — C `asynInterposeFlushConfig`. The
+    /// timeout travels as seconds; C's shell argument is milliseconds.
+    PushFlushInterpose {
+        flush_timeout_secs: f64,
+    },
     /// Read back the driver's input EOS — C `pasynOctet->getInputEos`.
     /// Appended last: the variant order is the wire encoding.
     GetInputEos,
@@ -256,6 +267,13 @@ mod tests {
             PortCommand::GetConnected,
             PortCommand::PushEchoInterpose,
             PortCommand::PushDelayInterpose { delay_secs: 0.001 },
+            PortCommand::PushEosInterpose {
+                process_in: true,
+                process_out: false,
+            },
+            PortCommand::PushFlushInterpose {
+                flush_timeout_secs: 0.05,
+            },
             PortCommand::GetInputEos,
             PortCommand::GetOutputEos,
             PortCommand::GpibUniversalCmd { cmd: 0x14 },

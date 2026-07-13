@@ -1059,6 +1059,38 @@ impl PortHandle {
         Ok(())
     }
 
+    /// Install the EOS interpose on `addr`'s octet stack — C
+    /// `asynInterposeEosConfig(portName, addr, processEosIn, processEosOut)`.
+    pub fn push_eos_interpose_blocking(
+        &self,
+        addr: i32,
+        process_in: bool,
+        process_out: bool,
+    ) -> AsynResult<()> {
+        self.submit_blocking(
+            RequestOp::PushEosInterpose {
+                process_in,
+                process_out,
+            },
+            AsynUser::new(0).with_addr(addr),
+        )?;
+        Ok(())
+    }
+
+    /// Install the flush-timeout interpose on `addr`'s octet stack — C
+    /// `asynInterposeFlushConfig(portName, addr, timeout)`.
+    pub fn push_flush_interpose_blocking(
+        &self,
+        addr: i32,
+        flush_timeout: std::time::Duration,
+    ) -> AsynResult<()> {
+        self.submit_blocking(
+            RequestOp::PushFlushInterpose { flush_timeout },
+            AsynUser::new(0).with_addr(addr),
+        )?;
+        Ok(())
+    }
+
     // --- asynGpib convenience methods ---
     //
     // C's `pasynGpib` is a global vtable a gpib-aware user calls after

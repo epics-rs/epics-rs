@@ -1995,15 +1995,14 @@ impl ChannelSource for GatewayChannelSource {
         // `(name, ctx)` cache layer via `notify_monitor_start`, not per
         // downstream op, so no per-op `MonitorGate` here.
         Some(epics_pva_rs::server_native::source::SubscriptionSeed {
-            // The seed is the cache's merged upstream snapshot, and it carries
-            // the union of the marks UPSTREAM set on the events that built it
-            // — not a full mask. The merge never fabricates: a leaf upstream
-            // has never assigned is still a decoder zero, so declaring it
-            // assigned would put that zero on the wire as a value. pva2pva
-            // forwards the upstream's own changed bitset
-            // (`moncache.cpp:142,189`); the union is that bitset accumulated
-            // across the events the snapshot merged. Post-seed updates carry
-            // their own per-event marks through `MonitorUpdate::marked`.
+            // The seed is the cache's merged upstream snapshot, declared
+            // whole-structure — pva2pva's `changedBitSet->set(0)` on the
+            // element it hands a starting MonitorUser (`moncache.cpp:304-312`),
+            // rendered as the canonical full leaf bitset because our encoder
+            // cannot emit the root bit. `channel_cache::monitor_seed` owns that
+            // rule; nothing here may re-declare it. Post-seed updates are the
+            // other rule — they carry the upstream event's own changed bitset
+            // through `MonitorUpdate::marked` (`moncache.cpp:142`).
             initial,
             updates,
             on_start: None,
@@ -2035,10 +2034,10 @@ impl ChannelSource for GatewayChannelSource {
             )
             .await?;
         Some(epics_pva_rs::server_native::source::SubscriptionSeed {
-            // Same contract as `subscribe_seeded`: the seed declares the union
-            // of the marks upstream set, never a synthesised full mask (the
-            // raw path's seed is encoded through the decoded path, so it goes
-            // on the wire with exactly this bitset).
+            // Same contract as `subscribe_seeded`: the seed is whole-structure
+            // (`channel_cache::monitor_seed`). The raw path's seed is encoded
+            // through the decoded path, so it goes on the wire with exactly
+            // that bitset.
             initial,
             updates,
             on_start: None,

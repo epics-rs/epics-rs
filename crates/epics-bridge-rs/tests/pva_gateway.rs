@@ -2220,17 +2220,23 @@ impl ChannelSource for MarkedMonitorSource {
     }
 }
 
-/// R17-32: the gateway's MONITOR seed must declare the leaves UPSTREAM
-/// assigned, not a full mask.
+/// R18-28: the gateway's MONITOR seed declares the WHOLE STRUCTURE, however
+/// the upstream marked the events that built the cached snapshot.
+///
+/// pva2pva — the C++ gateway this port's cache is modelled on — copies the
+/// merged element into the starting MonitorUser's buffer and sets the root
+/// bit: `elem->changedBitSet->set(0); // indicate all changed`
+/// (`moncache.cpp:304-312`). Our encoder cannot emit bit 0, so the decodable
+/// equivalent is the canonical full leaf bitset, i.e. `marked: None`.
 ///
 /// Wire shape reproduced: the upstream monitor's seed frames bits `[value]`
-/// only; the gateway's cache decodes it (zero-filling `spare`) and seeds its
-/// downstream monitor from that snapshot. Pre-fix the seed went out as
-/// `SourceRead { marked: None }` → the server framed the canonical full
-/// bitset `[value, spare]`, shipping a `spare` the upstream never sent.
-/// Post-fix the seed carries the snapshot's mark union, `[value]`.
+/// only; the gateway's cache decodes and merges it, then seeds its downstream
+/// monitor from that snapshot. R17-32 (`c05a56f6`) mistook pva2pva's UPDATE
+/// rule (`:142`, copy the upstream changed bitset) for its SEED rule and made
+/// the seed carry the upstream mark union — a seed that can omit `alarm` and
+/// `timeStamp`. This test fails against that commit (`marked == Some(["value"])`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn r17_32_gateway_monitor_seed_forwards_upstream_marks() {
+async fn r18_28_gateway_monitor_seed_declares_whole_structure() {
     let pv = "GW:MONMARK:PV";
     let (_us, us_addr) = spawn_upstream_source(MarkedMonitorSource {
         pv_name: pv.to_string(),
@@ -2274,10 +2280,11 @@ async fn r17_32_gateway_monitor_seed_forwards_upstream_marks() {
         .initial
         .expect("the cached upstream seed must be forwarded as the downstream seed");
 
-    assert_eq!(
-        initial.marked,
-        Some(vec!["value".to_string()]),
-        "the monitor seed must declare the upstream's marks; a full mask \
-         (marked: None) frames `spare`, a leaf upstream never assigned"
+    assert!(
+        initial.marked.is_none(),
+        "the monitor seed must declare the whole structure (pva2pva's root \
+         bit, moncache.cpp:304-312); declaring only the upstream's marks \
+         ({:?}) lets a seed omit alarm/timeStamp",
+        initial.marked
     );
 }

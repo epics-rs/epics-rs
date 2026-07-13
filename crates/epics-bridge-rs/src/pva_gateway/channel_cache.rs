@@ -304,37 +304,39 @@ impl PauseControl {
 
 #[derive(Default)]
 struct EntryState {
-    /// Most recent value seen on the upstream monitor, together with the
-    /// leaves the upstream has assigned in it — the UNION of every
-    /// upstream event's changed set since this snapshot began (a first
-    /// event, an introspection change, or a disconnect starts a new one).
+    /// Most recent value seen on the upstream monitor: the merge of every
+    /// upstream event since the snapshot began (a first event, an
+    /// introspection change, or a disconnect starts a new one). A delta
+    /// event is merged onto the prior snapshot by
+    /// `fill_unmarked_from_prior`, so this is always a whole structure.
     ///
-    /// Value and marks are one field precisely because they are one fact:
-    /// the snapshot is a merge of upstream deltas (`fill_unmarked_from_prior`
-    /// carries unmarked leaves forward), so "which leaves does this snapshot
-    /// actually carry from upstream" is only answerable by accumulating the
-    /// marks alongside the value. A caller cannot take the value without
-    /// its marks and re-declare a full mask (R17-32).
-    ///
-    /// `SourceRead::marked == None` keeps its wire meaning — the whole
-    /// structure was assigned (upstream set the root bit).
-    latest: Option<SourceRead>,
+    /// It carries no mark set of its own, because a monitor seed built from
+    /// it does not declare one: pva2pva's seed is `elem->changedBitSet->set(0)`
+    /// — the ROOT bit, "all changed" (`moncache.cpp:304-312`). See
+    /// [`monitor_seed`], the one owner of that rule.
+    latest: Option<PvField>,
     /// Type descriptor learned from the first INIT response.
     introspection: Option<FieldDesc>,
 }
 
-/// Accumulate an upstream event's changed leaves into the snapshot's mark
-/// union. `None` means "whole structure" on both sides and absorbs: once
-/// upstream has assigned everything, every leaf of the snapshot is real.
-fn union_marks(prior: Option<Vec<String>>, event: Option<Vec<String>>) -> Option<Vec<String>> {
-    match (prior, event) {
-        (Some(a), Some(b)) => {
-            let mut set: std::collections::BTreeSet<String> = a.into_iter().collect();
-            set.extend(b);
-            Some(set.into_iter().collect())
-        }
-        _ => None,
-    }
+/// The monitor seed for a cached snapshot — the ONE place the gateway
+/// decides what a downstream seed declares (R18-28).
+///
+/// pva2pva seeds a starting `MonitorUser` with the cache's merged element
+/// and marks the **root** bit: `elem->pvStructurePtr->copy(*lval);
+/// elem->changedBitSet->set(0); // indicate all changed`
+/// (`moncache.cpp:304-312`) — *not* the union of the upstream marks that
+/// built `lval`. Our encoder cannot emit bit 0 (`pvdata/encode.rs`
+/// trims to leaves), so the decodable equivalent is the canonical full leaf
+/// bitset, which is exactly what `SourceRead { marked: None }` frames.
+/// Routing every seed through this function makes "a seed is whole-structure"
+/// hold by construction: no caller can hand the server a partial mask.
+///
+/// A `None` return means no upstream event has arrived yet (pva2pva's
+/// `!havedata`, `moncache.cpp:285` + `:304`), so there is no seed frame at
+/// all: the downstream monitor's first frame is the first upstream update.
+fn monitor_seed(state: &RwLock<EntryState>) -> Option<SourceRead> {
+    state.read().latest.clone().map(SourceRead::from)
 }
 
 /// Result of folding one upstream monitor event into [`EntryState`].
@@ -352,8 +354,13 @@ struct MonitorEventOutcome {
     /// changed-bitset" — used for a whole-structure (root-bit) event and
     /// when the body could not be decoded. `Some(paths)` carries the real
     /// changed leaves so the downstream cooked monitor advertises the
-    /// upstream's actual changed-bitset, not a synthesised full mask
-    /// (pva2pva `p2pApp/moncache.cpp:142,189`).
+    /// upstream's actual changed-bitset, not a synthesised full mask.
+    ///
+    /// This is the UPDATE path, and only the update path: pva2pva copies the
+    /// upstream event's changed bitset onto each downstream element
+    /// (`moncache.cpp:142` `*lastelem->changedBitSet = *update->changedBitSet`,
+    /// `:189` the per-user copy). The SEED is a different rule entirely — the
+    /// root bit, see [`monitor_seed`].
     marked: Option<Vec<String>>,
 }
 
@@ -430,33 +437,15 @@ fn apply_monitor_event(
     s.introspection = Some(desc.clone());
     match s.latest.take() {
         Some(prior) if !type_changed => {
-            // The merged snapshot carries the union of what upstream has
-            // assigned: this event's leaves plus every leaf a prior event
-            // put there (`fill_unmarked_from_prior` keeps those values).
-            let value = epics_pva_rs::pvdata::encode::fill_unmarked_from_prior(
-                desc,
-                &changed,
-                0,
-                v,
-                &prior.value,
-            );
-            s.latest = Some(SourceRead {
-                value,
-                marked: union_marks(prior.marked, marked.clone()),
-            });
+            s.latest = Some(epics_pva_rs::pvdata::encode::fill_unmarked_from_prior(
+                desc, &changed, 0, v, &prior,
+            ));
         }
-        // First event, or an introspection change that replaced the
-        // snapshot wholesale: the union starts over at this event's marks.
-        _ => {
-            s.latest = Some(SourceRead {
-                value: v,
-                marked: marked.clone(),
-            })
-        }
+        _ => s.latest = Some(v),
     }
     // Read merged value while still holding the write lock so callers
     // receive the exact value that was stored — no separate re-acquisition.
-    let value = s.latest.as_ref().map(|r| r.value.clone());
+    let value = s.latest.clone();
     MonitorEventOutcome {
         was_first,
         type_changed,
@@ -530,19 +519,13 @@ fn signal_disconnect_boundary(
 }
 
 impl UpstreamEntry {
-    /// Latest cached value AND the leaves upstream assigned in it (the
-    /// union of every upstream event's changed set since the snapshot
-    /// began). A monitor seed built from this declares exactly those
-    /// leaves downstream — never a synthesised full mask over leaves the
-    /// decoder merely zero-filled (R17-32; pva2pva `moncache.cpp:142,189`
-    /// forwards the upstream's own changed bitset).
-    ///
-    /// `None` ⟹ no upstream event yet, so there is nothing to seed with:
-    /// the seed is omitted and the downstream monitor's first frame is the
-    /// first upstream update (pva2pva delivers `lastelem` on `start()`
-    /// only when `havedata`).
+    /// The downstream monitor seed for this entry's cached snapshot — the
+    /// merged upstream value, declared whole-structure, or `None` when no
+    /// upstream event has arrived yet. See [`monitor_seed`] for the rule and
+    /// its pva2pva citation; this is a thin accessor so that rule has exactly
+    /// one owner.
     pub fn snapshot(&self) -> Option<SourceRead> {
-        self.state.read().latest.clone()
+        monitor_seed(&self.state)
     }
 
     /// Cached introspection if known.
@@ -1803,24 +1786,11 @@ mod tests {
     use epics_pva_rs::proto::{BitSet, ByteOrder};
     use epics_pva_rs::pvdata::{ScalarType, ScalarValue};
 
-    /// The cached snapshot's value alone, for the tests that only assert
-    /// the merge result. The marks it is stored with are asserted by
-    /// [`r17_32_snapshot_carries_the_union_of_upstream_marks`].
+    /// The cached snapshot's merged value. What a monitor seed built from it
+    /// declares on the wire is asserted by
+    /// [`r18_28_monitor_seed_declares_the_whole_structure`].
     fn latest_value(state: &RwLock<EntryState>) -> Option<PvField> {
-        state.read().latest.as_ref().map(|r| r.value.clone())
-    }
-
-    /// The cached snapshot's marks — what a monitor seed declares. Panics
-    /// when there is no snapshot, so `None` here means only what it means on
-    /// the wire: the whole structure.
-    fn latest_marks(state: &RwLock<EntryState>) -> Option<Vec<String>> {
-        state
-            .read()
-            .latest
-            .as_ref()
-            .expect("a snapshot must exist")
-            .marked
-            .clone()
+        state.read().latest.clone()
     }
 
     /// The reconnect loop's re-subscribe delay must be applied on EVERY
@@ -2352,17 +2322,18 @@ mod tests {
         assert_eq!(o3.marked, Some(vec!["b".to_string()]));
     }
 
-    /// R17-32 regression: the SNAPSHOT (what a monitor seed forwards) must
-    /// carry the UNION of the upstream marks that built it. Pre-fix the
-    /// cache stored only the merged value, so every seed declared
-    /// `marked: None` and the server framed a canonical full bitset over
-    /// leaves the upstream had never assigned (the decoder's zero-fill).
+    /// R18-28 regression: the monitor SEED declares the whole structure,
+    /// whatever the upstream events that built the snapshot marked. pva2pva
+    /// hands a starting MonitorUser the merged element with the ROOT bit set
+    /// (`moncache.cpp:304-312`, "indicate all changed"); it does NOT replay
+    /// the union of the upstream changed bitsets — that rule (`:142`) belongs
+    /// to the update path. The R17-32 fix took the update rule for the seed
+    /// rule and shipped seeds that could omit `alarm`/`timeStamp`.
     ///
-    /// Boundaries: first event; delta accumulating a second leaf; a
-    /// re-marking of an already-marked leaf (no growth); a root-bit event
-    /// absorbing the union to "whole structure".
+    /// Boundaries: no upstream event (no seed at all); a partially-marked
+    /// first event; a delta on top of it; a root-bit event.
     #[test]
-    fn r17_32_snapshot_carries_the_union_of_upstream_marks() {
+    fn r18_28_monitor_seed_declares_the_whole_structure() {
         let desc = FieldDesc::Structure {
             struct_id: String::new(),
             fields: vec![
@@ -2380,48 +2351,46 @@ mod tests {
         };
         let state = RwLock::new(EntryState::default());
 
-        // First event marks only `a`: the snapshot carries `a` alone — `b`
-        // is a decoder zero, not an upstream value.
+        // No upstream event yet: pva2pva's `!havedata` — no seed element at
+        // all, so the downstream monitor's first frame is the first update.
+        assert!(monitor_seed(&state).is_none());
+
+        // First event marks only `a`. The seed still declares the whole
+        // structure: pva2pva sets the root bit on the merged element.
         apply_monitor_event(
             &state,
             &desc,
             &encode_body(&desc, &full(10, 0), &[1]),
             ByteOrder::Little,
         );
-        assert_eq!(latest_marks(&state), Some(vec!["a".to_string()]));
-
-        // Re-marking `a` does not grow the union.
-        apply_monitor_event(
-            &state,
-            &desc,
-            &encode_body(&desc, &full(11, 0), &[1]),
-            ByteOrder::Little,
+        let seed = monitor_seed(&state).expect("an upstream event ⟹ a seed");
+        assert_eq!(seed.value, full(10, 0));
+        assert!(
+            seed.marked.is_none(),
+            "a seed is whole-structure (root bit), not the upstream's marks"
         );
-        assert_eq!(latest_marks(&state), Some(vec!["a".to_string()]));
 
-        // A `b` delta merges onto the snapshot: now BOTH leaves are real.
+        // A `b` delta merges onto the snapshot; the seed is still whole.
         apply_monitor_event(
             &state,
             &desc,
             &encode_body(&desc, &full(0, 20), &[2]),
             ByteOrder::Little,
         );
-        assert_eq!(
-            latest_marks(&state),
-            Some(vec!["a".to_string(), "b".to_string()]),
-            "the snapshot's marks accumulate across upstream deltas"
-        );
-        assert_eq!(latest_value(&state), Some(full(11, 20)));
+        let seed = monitor_seed(&state).expect("an upstream event ⟹ a seed");
+        assert_eq!(seed.value, full(10, 20));
+        assert!(seed.marked.is_none());
 
-        // A root-bit event assigns the whole structure — the union absorbs
-        // to `None` (full mask), which is the honest answer from then on.
+        // A root-bit event — the same seed, no special case.
         apply_monitor_event(
             &state,
             &desc,
             &encode_body(&desc, &full(1, 2), &[0, 1, 2]),
             ByteOrder::Little,
         );
-        assert_eq!(latest_marks(&state), None);
+        let seed = monitor_seed(&state).expect("an upstream event ⟹ a seed");
+        assert_eq!(seed.value, full(1, 2));
+        assert!(seed.marked.is_none());
     }
 
     /// `apply_monitor_event` flags a descriptor change so
@@ -2560,7 +2529,7 @@ mod tests {
         use crate::pva_gateway::source::RawEvent;
         use tokio::sync::broadcast;
         let state = RwLock::new(EntryState::default());
-        state.write().latest = Some(SourceRead::from(PvField::Scalar(ScalarValue::Double(1.0))));
+        state.write().latest = Some(PvField::Scalar(ScalarValue::Double(1.0)));
         let latest_raw = RwLock::new(Some(RawEvent {
             body: bytes::Bytes::from_static(&[1, 2, 3]),
             byte_order: ByteOrder::Big,

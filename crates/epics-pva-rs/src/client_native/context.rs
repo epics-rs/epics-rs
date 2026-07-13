@@ -773,6 +773,50 @@ impl PvaClient {
         Ok(v)
     }
 
+    /// [`Self::pvget`] keeping the reply's marked leaves — the GET a PVA
+    /// gateway forwards, which must re-frame the readback downstream with
+    /// the leaves the UPSTREAM assigned rather than a synthesised full mask
+    /// (the decoder zero-fills the unmarked ones). See
+    /// [`crate::client_native::ops_v2::MarkedRead`].
+    pub async fn pvget_marked(
+        &self,
+        pv_name: &str,
+    ) -> PvaResult<crate::client_native::ops_v2::MarkedRead> {
+        let ch = self.channel(pv_name).await?;
+        crate::client_native::ops_v2::op_get_marked(&ch, &[], self.inner.timeout).await
+    }
+
+    /// [`Self::pvget_pv_field_with_request_value`] keeping the reply's marked
+    /// leaves. See [`Self::pvget_marked`].
+    pub async fn pvget_pv_field_with_request_value_marked(
+        &self,
+        pv_name: &str,
+        pv_request: &crate::pvdata::PvField,
+    ) -> PvaResult<crate::client_native::ops_v2::MarkedRead> {
+        let ch = self.channel(pv_name).await?;
+        let bytes = self.encode_pv_request(&ch, pv_request).await?;
+        crate::client_native::ops_v2::op_get_raw_marked(&ch, &bytes, self.inner.timeout).await
+    }
+
+    /// Serialize a decoded pvRequest in the channel connection's negotiated
+    /// byte order — the INIT-time encoding every request-carrying op shares.
+    async fn encode_pv_request(
+        &self,
+        ch: &std::sync::Arc<crate::client_native::channel::Channel>,
+        pv_request: &crate::pvdata::PvField,
+    ) -> PvaResult<Vec<u8>> {
+        let order =
+            crate::client_native::ops_v2::ensure_active_with_op_timeout(ch, self.inner.timeout)
+                .await?
+                .0
+                .byte_order();
+        let mut bytes = Vec::new();
+        let desc = pv_request.descriptor();
+        crate::pvdata::encode::encode_type_desc(&desc, order, &mut bytes);
+        crate::pvdata::encode::encode_pv_field(pv_request, &desc, order, &mut bytes);
+        Ok(bytes)
+    }
+
     /// GET carrying the caller's decoded pvRequest (e.g. a PVA gateway's
     /// preserved `ChannelContext.pv_request`) rather than the default
     /// value-only request, returning `(introspection, value)`. The
@@ -793,15 +837,7 @@ impl PvaClient {
         pv_request: &crate::pvdata::PvField,
     ) -> PvaResult<(FieldDesc, PvField)> {
         let ch = self.channel(pv_name).await?;
-        let order =
-            crate::client_native::ops_v2::ensure_active_with_op_timeout(&ch, self.inner.timeout)
-                .await?
-                .0
-                .byte_order();
-        let mut bytes = Vec::new();
-        let desc = pv_request.descriptor();
-        crate::pvdata::encode::encode_type_desc(&desc, order, &mut bytes);
-        crate::pvdata::encode::encode_pv_field(pv_request, &desc, order, &mut bytes);
+        let bytes = self.encode_pv_request(&ch, pv_request).await?;
         crate::client_native::ops_v2::op_get_raw(&ch, &bytes, self.inner.timeout).await
     }
 
@@ -2015,17 +2051,40 @@ impl PvaClient {
         value: &crate::pvdata::PvField,
     ) -> PvaResult<(FieldDesc, PvField)> {
         let ch = self.channel(pv_name).await?;
-        let order =
-            crate::client_native::ops_v2::ensure_active_with_op_timeout(&ch, self.inner.timeout)
-                .await?
-                .0
-                .byte_order();
-        let mut bytes = Vec::new();
-        let desc = pv_request.descriptor();
-        crate::pvdata::encode::encode_type_desc(&desc, order, &mut bytes);
-        crate::pvdata::encode::encode_pv_field(pv_request, &desc, order, &mut bytes);
+        let bytes = self.encode_pv_request(&ch, pv_request).await?;
         crate::client_native::ops_v2::op_put_get_value_raw(&ch, &bytes, value, self.inner.timeout)
             .await
+    }
+
+    /// [`Self::pvput_get_pv_field_with_request_value`] keeping the readback's
+    /// marked leaves — the PUT_GET a PVA gateway forwards. See
+    /// [`Self::pvget_marked`].
+    pub async fn pvput_get_pv_field_with_request_value_marked(
+        &self,
+        pv_name: &str,
+        pv_request: &crate::pvdata::PvField,
+        value: &crate::pvdata::PvField,
+    ) -> PvaResult<crate::client_native::ops_v2::MarkedRead> {
+        let ch = self.channel(pv_name).await?;
+        let bytes = self.encode_pv_request(&ch, pv_request).await?;
+        crate::client_native::ops_v2::op_put_get_value_raw_marked(
+            &ch,
+            &bytes,
+            value,
+            self.inner.timeout,
+        )
+        .await
+    }
+
+    /// [`Self::pvput_get_pv_field`] keeping the readback's marked leaves.
+    /// See [`Self::pvget_marked`].
+    pub async fn pvput_get_pv_field_marked(
+        &self,
+        pv_name: &str,
+        value: &crate::pvdata::PvField,
+    ) -> PvaResult<crate::client_native::ops_v2::MarkedRead> {
+        let ch = self.channel(pv_name).await?;
+        crate::client_native::ops_v2::op_put_get_value_marked(&ch, value, self.inner.timeout).await
     }
 
     /// PVA `PUT_GET` `getGet` subcommand (`QOS_GET`, 0x40) — read the

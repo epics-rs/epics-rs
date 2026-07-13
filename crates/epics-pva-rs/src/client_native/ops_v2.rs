@@ -400,12 +400,67 @@ impl Drop for IoidGuard {
 
 // ── GET ────────────────────────────────────────────────────────────────
 
+/// A GET / PUT_GET reply plus the leaves the SERVER marked in it.
+///
+/// A PVA data reply is `changed | value`: the server frames only the
+/// leaves it assigned (`to_wire_valid`, `serverget.cpp:104`), and the
+/// decoder zero-fills the rest. The zero-fill is invisible in the decoded
+/// [`PvField`], so a consumer that must re-publish the reply — a gateway
+/// forwarding an upstream read downstream — has to be told which leaves
+/// were real. `marked` is that fact, in the same dot-path form the server
+/// side uses ([`crate::server_native::source::SourceRead`]); dropping it
+/// and re-framing a full mask would put fabricated zeros on the wire for
+/// leaves the upstream never sent.
+#[derive(Debug, Clone)]
+pub struct MarkedRead {
+    /// Reply introspection (the GET-side descriptor).
+    pub desc: FieldDesc,
+    /// The decoded value.
+    pub value: PvField,
+    /// Field paths the reply's changed-bitset marked, or `None` when the
+    /// root bit (0) was set — the wire's way of saying "the whole
+    /// structure", which needs no per-leaf list.
+    pub marked: Option<Vec<String>>,
+}
+
+/// The changed-leaf paths of a reply bitset. Root bit ⇒ `None` (whole
+/// structure), matching the gateway's monitor-cache decode of the same
+/// wire field.
+fn reply_marks(desc: &FieldDesc, changed: &BitSet) -> Option<Vec<String>> {
+    if changed.get(0) {
+        None
+    } else {
+        Some(crate::pvdata::encode::changed_bitset_paths(desc, changed))
+    }
+}
+
 pub async fn op_get(
     channel: &Arc<Channel>,
     fields: &[&str],
     op_timeout: Duration,
 ) -> PvaResult<(FieldDesc, PvField)> {
+    op_get_inner(channel, fields, None, op_timeout)
+        .await
+        .map(|r| (r.desc, r.value))
+}
+
+/// [`op_get`] keeping the reply's marked leaves — for a caller that
+/// re-frames the value with a changed-bitset of its own (the PVA gateway).
+pub async fn op_get_marked(
+    channel: &Arc<Channel>,
+    fields: &[&str],
+    op_timeout: Duration,
+) -> PvaResult<MarkedRead> {
     op_get_inner(channel, fields, None, op_timeout).await
+}
+
+/// [`op_get_raw`] keeping the reply's marked leaves. See [`MarkedRead`].
+pub async fn op_get_raw_marked(
+    channel: &Arc<Channel>,
+    pv_req: &[u8],
+    op_timeout: Duration,
+) -> PvaResult<MarkedRead> {
+    op_get_inner(channel, &[], Some(pv_req), op_timeout).await
 }
 
 /// `op_get` variant accepting a pre-built pvRequest blob (bytes
@@ -420,7 +475,9 @@ pub async fn op_get_raw(
     pv_req: &[u8],
     op_timeout: Duration,
 ) -> PvaResult<(FieldDesc, PvField)> {
-    op_get_inner(channel, &[], Some(pv_req), op_timeout).await
+    op_get_inner(channel, &[], Some(pv_req), op_timeout)
+        .await
+        .map(|r| (r.desc, r.value))
 }
 
 /// Bound the search-and-connect phase by the operation's overall
@@ -463,7 +520,7 @@ async fn op_get_inner(
     fields: &[&str],
     raw_pv_req: Option<&[u8]>,
     op_timeout: Duration,
-) -> PvaResult<(FieldDesc, PvField)> {
+) -> PvaResult<MarkedRead> {
     let (server, sid) = ensure_active_with_op_timeout(channel, op_timeout).await?;
     let order = server.byte_order();
     let big_endian = matches!(order, ByteOrder::Big);
@@ -484,10 +541,15 @@ async fn op_get_inner(
             // to the cold path which re-establishes the cache.
             let warm_ioid = warm.ioid;
             match try_warm_get(&server, &codec, &warm, op_timeout).await {
-                Ok(Some(pv)) => {
+                Ok(Some((intro, value, changed))) => {
                     // Re-cache so the next call also takes the fast path.
                     *channel.cached_get.lock() = Some(warm);
-                    return Ok(((*pv.0).clone(), pv.1));
+                    let marked = reply_marks(&intro, &changed);
+                    return Ok(MarkedRead {
+                        desc: (*intro).clone(),
+                        value,
+                        marked,
+                    });
                 }
                 Ok(None) | Err(_) => {
                     // warm-GET failure abandoned the cached
@@ -570,7 +632,12 @@ async fn op_get_inner(
     let result = match decode_op_or_reset(&server, &data_frame, Some(&intro_arc))? {
         OpResponse::Data(d) => {
             if d.status.is_success() {
-                Ok(((*intro_arc).clone(), d.value))
+                let marked = reply_marks(&intro_arc, &d.changed);
+                Ok(MarkedRead {
+                    desc: (*intro_arc).clone(),
+                    value: d.value,
+                    marked,
+                })
             } else {
                 Err(PvaError::Protocol(format!("GET data: {:?}", d.status)))
             }
@@ -646,7 +713,7 @@ async fn try_warm_get(
     codec: &PvaCodec,
     warm: &super::channel::CachedGet,
     op_timeout: Duration,
-) -> PvaResult<Option<(Arc<FieldDesc>, PvField)>> {
+) -> PvaResult<Option<(Arc<FieldDesc>, PvField, BitSet)>> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     *warm.slot.lock() = Some(tx);
     let frame = codec.build_get(warm.sid, warm.ioid);
@@ -658,7 +725,7 @@ async fn try_warm_get(
     match decode_op_or_reset(server, &data_frame, Some(&warm.intro))? {
         OpResponse::Data(d) => {
             if d.status.is_success() {
-                Ok(Some((warm.intro.clone(), d.value)))
+                Ok(Some((warm.intro.clone(), d.value, d.changed)))
             } else {
                 // Server rejected — likely lost the binding (channel
                 // close / GC). Caller should retry cold.
@@ -3576,7 +3643,9 @@ pub async fn op_put_get(
     op_timeout: Duration,
 ) -> PvaResult<(FieldDesc, PvField)> {
     // Default putGet (data subcmd 0x00): write `value_str`, then read back.
-    op_put_get_data(channel, 0x00, None, PutGetPut::Str(value_str), op_timeout).await
+    op_put_get_data(channel, 0x00, None, PutGetPut::Str(value_str), op_timeout)
+        .await
+        .map(|r| (r.desc, r.value))
 }
 
 /// Atomic `PUT_GET` (cmd 12) writing a typed [`PvField`] with the default
@@ -3588,6 +3657,18 @@ pub async fn op_put_get_value(
     value: &PvField,
     op_timeout: Duration,
 ) -> PvaResult<(FieldDesc, PvField)> {
+    op_put_get_data(channel, 0x00, None, PutGetPut::Typed(value), op_timeout)
+        .await
+        .map(|r| (r.desc, r.value))
+}
+
+/// [`op_put_get_value`] keeping the readback's marked leaves. See
+/// [`MarkedRead`].
+pub async fn op_put_get_value_marked(
+    channel: &Arc<Channel>,
+    value: &PvField,
+    op_timeout: Duration,
+) -> PvaResult<MarkedRead> {
     op_put_get_data(channel, 0x00, None, PutGetPut::Typed(value), op_timeout).await
 }
 
@@ -3608,6 +3689,19 @@ pub async fn op_put_get_value_raw(
     value: &PvField,
     op_timeout: Duration,
 ) -> PvaResult<(FieldDesc, PvField)> {
+    op_put_get_value_raw_marked(channel, pv_req, value, op_timeout)
+        .await
+        .map(|r| (r.desc, r.value))
+}
+
+/// [`op_put_get_value_raw`] keeping the readback's marked leaves. See
+/// [`MarkedRead`].
+pub async fn op_put_get_value_raw_marked(
+    channel: &Arc<Channel>,
+    pv_req: &[u8],
+    value: &PvField,
+    op_timeout: Duration,
+) -> PvaResult<MarkedRead> {
     op_put_get_data(
         channel,
         0x00,
@@ -3626,7 +3720,9 @@ pub async fn op_get_get(
     channel: &Arc<Channel>,
     op_timeout: Duration,
 ) -> PvaResult<(FieldDesc, PvField)> {
-    op_put_get_data(channel, QosFlags::GET, None, PutGetPut::None, op_timeout).await
+    op_put_get_data(channel, QosFlags::GET, None, PutGetPut::None, op_timeout)
+        .await
+        .map(|r| (r.desc, r.value))
 }
 
 /// EPICS ChannelPutGet `getPut` (`QOS_GET_PUT`, 0x80): read the current
@@ -3643,6 +3739,7 @@ pub async fn op_get_put(
         op_timeout,
     )
     .await
+    .map(|r| (r.desc, r.value))
 }
 
 /// [`op_get_get`] carrying a caller-supplied pvRequest. The INIT pvRequest
@@ -3665,6 +3762,7 @@ pub async fn op_get_get_with_request(
         op_timeout,
     )
     .await
+    .map(|r| (r.desc, r.value))
 }
 
 /// [`op_get_put`] carrying a caller-supplied pvRequest. The INIT pvRequest
@@ -3685,6 +3783,7 @@ pub async fn op_get_put_with_request(
         op_timeout,
     )
     .await
+    .map(|r| (r.desc, r.value))
 }
 
 /// The put leg of a [`op_put_get_data`] round trip. The read-only
@@ -3712,7 +3811,7 @@ async fn op_put_get_data(
     req: Option<&[u8]>,
     put: PutGetPut<'_>,
     op_timeout: Duration,
-) -> PvaResult<(FieldDesc, PvField)> {
+) -> PvaResult<MarkedRead> {
     let (server, sid) = ensure_active_with_op_timeout(channel, op_timeout).await?;
     let order = server.byte_order();
     let big_endian = matches!(order, ByteOrder::Big);
@@ -3813,7 +3912,7 @@ async fn op_put_get_data(
     let result = {
         let resp_desc = if is_get_put { &put_if } else { &get_if };
         match decode_put_get_data(&resp_frame, resp_desc, &mut cache) {
-            Ok(Ok(value)) => Ok(value),
+            Ok(Ok(decoded)) => Ok(decoded),
             Ok(Err(status)) => Err(PvaError::Protocol(format!("PUT_GET: {status:?}"))),
             Err(e) => {
                 // Command mismatch or truncated data body is fatal.
@@ -3828,7 +3927,14 @@ async fn op_put_get_data(
     let _ = server.send_for_channel(sid, destroy).await;
     server.unregister_ioid(ioid);
     let resp_desc = if is_get_put { put_if } else { get_if };
-    result.map(|v| (resp_desc, v))
+    result.map(|(changed, value)| {
+        let marked = reply_marks(&resp_desc, &changed);
+        MarkedRead {
+            desc: resp_desc,
+            value,
+            marked,
+        }
+    })
 }
 
 /// Decode a `PUT_GET` INIT response: `ioid + subcmd + status + putIF +
@@ -3894,7 +4000,7 @@ fn decode_put_get_data(
     frame: &super::decode::Frame,
     intro: &FieldDesc,
     type_cache: &mut crate::pvdata::encode::TypeCache,
-) -> PvaResult<Result<PvField, crate::proto::Status>> {
+) -> PvaResult<Result<(BitSet, PvField), crate::proto::Status>> {
     if frame.header.command != Command::PutGet.code() {
         return Err(PvaError::Protocol(format!(
             "expected PUT_GET data, got command {}",
@@ -3917,7 +4023,7 @@ fn decode_put_get_data(
         intro, &changed, 0, &mut cur, order, type_cache,
     )
     .map_err(|e| PvaError::Decode(e.to_string()))?;
-    Ok(Ok(value))
+    Ok(Ok((changed, value)))
 }
 
 // ── ARRAY (cmd 14) — ChannelArray windowed-array operation ──────────────

@@ -31,7 +31,7 @@ use epics_pva_rs::proto::BitSet;
 use epics_pva_rs::pvdata::{
     FieldDesc, PvField, PvStructure, ScalarType, ScalarValue, TypedScalarArray,
 };
-use epics_pva_rs::server_native::source::{AccessChecked, ChannelContext, OpError};
+use epics_pva_rs::server_native::source::{AccessChecked, ChannelContext, OpError, SourceRead};
 use epics_pva_rs::server_native::{
     ChannelSource, PvaServer, PvaServerConfig, SharedPV, SharedSource,
 };
@@ -1831,7 +1831,7 @@ impl ChannelSource for RecordingDoublingSource {
         _changed: BitSet,
         delta: PvField,
         ctx: ChannelContext,
-    ) -> impl std::future::Future<Output = Result<Option<PvField>, OpError>> + Send {
+    ) -> impl std::future::Future<Output = Result<Option<SourceRead>, OpError>> + Send {
         let store = self.value.clone();
         let captured = self.captured_req.clone();
         async move {
@@ -1845,7 +1845,7 @@ impl ChannelSource for RecordingDoublingSource {
                 double_of(&delta).ok_or_else(|| OpError::failed("no double .value field"))?;
             let doubled = incoming * 2.0;
             *store.lock().unwrap() = doubled;
-            Ok(Some(nt_double_value(doubled)))
+            Ok(Some(SourceRead::from(nt_double_value(doubled))))
         }
     }
 }
@@ -1994,5 +1994,166 @@ async fn gateway_put_get_forwards_through_composite_with_control_prefix() {
     assert!(
         has_record_member(&captured),
         "the downstream pvRequest must reach upstream verbatim through CompositeSource: {captured:?}"
+    );
+}
+
+/// An upstream source that assigns only a SUBSET of its NT on a read —
+/// the shape every real QSRV PV has (`IOCSource::get` fills part of a
+/// `cloneEmpty()`, so `getProperties` never assigns
+/// `control.minStep` & co.). It declares that subset with
+/// [`SourceRead::marked`], which is what the upstream server frames.
+struct PartialReadSource {
+    pv_name: String,
+}
+
+/// `{double value, double spare}` — `spare` is the leaf the upstream
+/// never assigns, so it must never reach a downstream client.
+fn partial_desc() -> FieldDesc {
+    FieldDesc::Structure {
+        struct_id: "epics:nt/NTScalar:1.0".into(),
+        fields: vec![
+            ("value".into(), FieldDesc::Scalar(ScalarType::Double)),
+            ("spare".into(), FieldDesc::Scalar(ScalarType::Double)),
+        ],
+    }
+}
+
+fn partial_value() -> PvField {
+    let mut s = PvStructure::new("epics:nt/NTScalar:1.0");
+    s.fields
+        .push(("value".into(), PvField::Scalar(ScalarValue::Double(7.5))));
+    s.fields
+        .push(("spare".into(), PvField::Scalar(ScalarValue::Double(0.0))));
+    PvField::Structure(s)
+}
+
+impl ChannelSource for PartialReadSource {
+    fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
+        let n = self.pv_name.clone();
+        async move { vec![n] }
+    }
+    fn has_pv(&self, n: &str) -> impl std::future::Future<Output = bool> + Send {
+        let want = self.pv_name.clone();
+        let got = n.to_string();
+        async move { got == want }
+    }
+    async fn get_introspection(&self, _: &str) -> Option<FieldDesc> {
+        Some(partial_desc())
+    }
+    async fn get_value(&self, _: &str) -> Option<PvField> {
+        Some(partial_value())
+    }
+    async fn read_checked(
+        &self,
+        _checked: AccessChecked,
+        _ctx: ChannelContext,
+    ) -> Option<SourceRead> {
+        // Only `value` is assigned; `spare` is not.
+        Some(SourceRead::marked(
+            partial_value(),
+            vec!["value".to_string()],
+        ))
+    }
+    async fn put_value(&self, _: &str, _: PvField) -> Result<(), OpError> {
+        Err(OpError::denied("read-only fixture"))
+    }
+    async fn is_writable(&self, _: &str) -> bool {
+        false
+    }
+    async fn subscribe(&self, _: &str) -> Option<tokio::sync::mpsc::Receiver<PvField>> {
+        None
+    }
+}
+
+/// R16-33: a GET through the gateway must frame the leaves the UPSTREAM
+/// marked, not a full mask.
+///
+/// The gateway decodes the upstream reply into a fully-populated `PvField`
+/// — the decoder zero-fills every leaf the upstream did not send — so
+/// re-framing "everything" downstream would ship a `spare` the upstream
+/// never assigned (pva2pva forwards the upstream reply's own bitset,
+/// `p2pApp/channel.cpp:109-114`). The downstream changed-bitset must carry
+/// `value` and NOT `spare`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gateway_get_frames_upstream_marks_not_a_full_mask() {
+    let pv = "GW:PARTIAL:PV";
+    let pick = || {
+        let l = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        p
+    };
+    let pick_udp = || {
+        let l = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        p
+    };
+
+    let us_cfg = PvaServerConfig {
+        tcp_port: pick(),
+        udp_port: pick_udp(),
+        ..PvaServerConfig::isolated()
+    };
+    let us_addr = SocketAddr::new(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        us_cfg.tcp_port,
+    );
+    let _us = PvaServer::start(
+        Arc::new(PartialReadSource {
+            pv_name: pv.to_string(),
+        }),
+        us_cfg,
+    )
+    .expect("upstream must start");
+
+    let upstream_client = Arc::new(
+        PvaClient::builder()
+            .server_addr(us_addr)
+            .timeout(Duration::from_secs(2))
+            .build(),
+    );
+    let gw = PvaGateway::start(PvaGatewayConfig {
+        upstream_client: Some(upstream_client.clone()),
+        server_config: PvaServerConfig {
+            tcp_port: pick(),
+            udp_port: pick_udp(),
+            ..PvaServerConfig::isolated()
+        },
+        cleanup_interval: Duration::from_secs(60),
+        connect_timeout: Duration::from_secs(2),
+        max_cache_entries: 1024,
+        max_subscribers: 1024,
+        control_prefix: None,
+        read_only: false,
+        acl: None,
+        audit: None,
+        control_acf_path: None,
+        control_reload_acf_path: None,
+    })
+    .expect("gateway start");
+
+    // The upstream itself frames only `value` — the fact the gateway has to
+    // preserve.
+    let up = upstream_client
+        .pvget_marked(pv)
+        .await
+        .expect("upstream get must succeed");
+    assert_eq!(
+        up.marked,
+        Some(vec!["value".to_string()]),
+        "upstream must frame only the leaf it assigned"
+    );
+
+    let down = gw
+        .client_config()
+        .pvget_marked(pv)
+        .await
+        .expect("downstream get must succeed");
+    assert_eq!(
+        down.marked,
+        Some(vec!["value".to_string()]),
+        "the gateway must forward the upstream's marks, not a full mask: {:?}",
+        down.marked
     );
 }

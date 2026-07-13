@@ -24,17 +24,33 @@ use epics_base_rs::server::access_security::AccessSecurityConfig;
 // introspection helper, so the import is gated to match.
 #[cfg(test)]
 use epics_base_rs::server::access_security::AccessLevel;
-use epics_pva_rs::client::{AssertedIdentity, PvaClient};
+use epics_pva_rs::client::{AssertedIdentity, MarkedRead, PvaClient};
 use epics_pva_rs::pvdata::{FieldDesc, PvField, RpcReply};
 use epics_pva_rs::server::native_source::AcfCell;
 use epics_pva_rs::server_native::source::{
-    AccessChecked, ChannelContext, ChannelInvalidator, ChannelSource, OpError, WatermarkEvent,
-    WatermarkKind,
+    AccessChecked, ChannelContext, ChannelInvalidator, ChannelSource, OpError, SourceRead,
+    WatermarkEvent, WatermarkKind,
 };
 
 use super::channel_cache::{
     CacheStatus, ChannelCache, DEFAULT_CLEANUP_INTERVAL, DEFAULT_MAX_ENTRIES,
 };
+
+/// An upstream read (GET or PUT_GET readback) as the downstream framing
+/// contract sees it: the value plus the leaves the UPSTREAM marked.
+///
+/// `MarkedRead::marked` is `None` when the upstream set the root bit — it
+/// framed the whole structure — which is precisely what [`SourceRead`]'s
+/// `None` means downstream, so the two `None`s pass straight through. When
+/// the upstream marked a subset, the gateway declares that same subset: the
+/// decoder zero-filled every other leaf, and framing them as assigned would
+/// ship values the upstream never sent.
+fn upstream_read(read: MarkedRead) -> SourceRead {
+    match read.marked {
+        Some(marked) => SourceRead::marked(read.value, marked),
+        None => SourceRead::from(read.value),
+    }
+}
 
 /// Raw upstream MONITOR DATA body bytes flowing through the
 /// per-entry broadcast channel. `body` is the wire-format
@@ -1374,7 +1390,7 @@ impl ChannelSource for GatewayChannelSource {
         _changed: epics_pva_rs::proto::BitSet,
         delta: PvField,
         ctx: ChannelContext,
-    ) -> Result<Option<PvField>, OpError> {
+    ) -> Result<Option<SourceRead>, OpError> {
         if !checked.allows_write() {
             tracing::debug!(
                 pv = %checked.pv_name(),
@@ -1403,18 +1419,21 @@ impl ChannelSource for GatewayChannelSource {
         // One upstream PUT_GET carrying the downstream's preserved INIT
         // pvRequest (process/block) and the put value; the value targets the
         // `value` bit (typed pass-through, matching the plain-PUT path) and
-        // the upstream post-put readback is returned verbatim. Falls back to
-        // the default request when the downstream sent none.
-        let result = match ctx.pv_request.as_ref() {
+        // the upstream post-put readback is returned verbatim — INCLUDING the
+        // leaves the upstream marked in it (`MarkedRead::marked`), so the
+        // downstream reply frames the upstream's changed-bitset rather than a
+        // full mask over decoder-zero-filled leaves (pva2pva forwards the
+        // upstream readback's bitset, `p2pApp/channel.cpp:129-137`). Falls
+        // back to the default request when the downstream sent none.
+        let read = match ctx.pv_request.as_ref() {
             Some(req) => {
                 client
-                    .pvput_get_pv_field_with_request_value(name, req, &delta)
+                    .pvput_get_pv_field_with_request_value_marked(name, req, &delta)
                     .await
             }
-            None => client.pvput_get_pv_field(name, &delta).await,
+            None => client.pvput_get_pv_field_marked(name, &delta).await,
         };
-        result
-            .map(|(_desc, value)| Some(value))
+        read.map(|r| Some(upstream_read(r)))
             .map_err(|e| OpError::failed(e.to_string()))
     }
 
@@ -1785,6 +1804,39 @@ impl ChannelSource for GatewayChannelSource {
     /// served `entry.snapshot()` from the monitor cache, which returned
     /// stale cached state instead of forwarding a real upstream ChannelGet
     /// (see `get_value` for the pva2pva `channel.cpp:109-115` rationale).
+    /// The GET / PUT_GET-readback framing path: forward the upstream read
+    /// AND the leaves the upstream marked in it.
+    ///
+    /// The trait default wraps [`Self::get_value_checked`] as
+    /// `marked: None` — "the source assigned everything" — which for a
+    /// gateway is false: the upstream frames only the leaves ITS source
+    /// assigned (`to_wire_valid`), and the client decoder zero-fills the
+    /// rest. Re-framing a full mask downstream would put those fabricated
+    /// zeros on the wire (e.g. the seven `getProperties` never assigns).
+    /// pva2pva forwards the upstream reply's own bitset
+    /// (`p2pApp/channel.cpp:109-114`), which is what the upstream marks
+    /// carried here reproduce. A root-bit reply (upstream said "whole
+    /// structure") arrives as `None` and stays `None`.
+    async fn read_checked(
+        &self,
+        checked: AccessChecked,
+        ctx: ChannelContext,
+    ) -> Option<SourceRead> {
+        if !checked.allows_read() {
+            return None;
+        }
+        let client = self.upstream_client_for(&ctx);
+        let read = match ctx.pv_request.as_ref() {
+            Some(req) => {
+                client
+                    .pvget_pv_field_with_request_value_marked(checked.pv_name(), req)
+                    .await
+            }
+            None => client.pvget_marked(checked.pv_name()).await,
+        };
+        read.ok().map(upstream_read)
+    }
+
     async fn get_value_checked(
         &self,
         checked: AccessChecked,
@@ -1943,7 +1995,13 @@ impl ChannelSource for GatewayChannelSource {
         // `(name, ctx)` cache layer via `notify_monitor_start`, not per
         // downstream op, so no per-op `MonitorGate` here.
         Some(epics_pva_rs::server_native::source::SubscriptionSeed {
-            initial,
+            // The seed is the cache's merged upstream snapshot — every leaf
+            // of it carries a real upstream value (deltas are merged onto the
+            // prior snapshot, `fill_unmarked_from_prior`), so the gateway
+            // genuinely assigned the whole structure and frames the full
+            // request mask. Post-seed updates carry their own upstream marks
+            // through `MonitorUpdate::marked`.
+            initial: initial.map(SourceRead::from),
             updates,
             on_start: None,
         })
@@ -1974,7 +2032,13 @@ impl ChannelSource for GatewayChannelSource {
             )
             .await?;
         Some(epics_pva_rs::server_native::source::SubscriptionSeed {
-            initial,
+            // The seed is the cache's merged upstream snapshot — every leaf
+            // of it carries a real upstream value (deltas are merged onto the
+            // prior snapshot, `fill_unmarked_from_prior`), so the gateway
+            // genuinely assigned the whole structure and frames the full
+            // request mask. Post-seed updates carry their own upstream marks
+            // through `MonitorUpdate::marked`.
+            initial: initial.map(SourceRead::from),
             updates,
             on_start: None,
         })

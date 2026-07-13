@@ -27,7 +27,7 @@ use std::sync::Arc;
 use epics_pva_rs::pvdata::{FieldDesc, PvField, RpcReply};
 use epics_pva_rs::server_native::ChannelContext;
 use epics_pva_rs::server_native::source::{
-    ChannelSource, DynSource, OpError, OpErrorKind, RawMonitorEvent, WatermarkEvent,
+    ChannelSource, DynSource, OpError, OpErrorKind, RawMonitorEvent, SourceRead, WatermarkEvent,
 };
 use tokio::sync::mpsc;
 
@@ -133,7 +133,7 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
         _changed: epics_pva_rs::proto::BitSet,
         _delta: PvField,
         _ctx: ChannelContext,
-    ) -> Result<Option<PvField>, OpError> {
+    ) -> Result<Option<SourceRead>, OpError> {
         Err(OpError::denied("read-only mode: PUT rejected"))
     }
     // PROCESS mutates upstream record state — it is a WRITE-class op,
@@ -172,6 +172,21 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
         ctx: ChannelContext,
     ) -> Option<PvField> {
         self.inner.get_value_checked(checked, ctx).await
+    }
+    // Every layer that forwards `get_value_checked` MUST forward
+    // `read_checked` the same way: the read-FRAMING path (GET reply,
+    // PUT_GET readback, monitor seed) goes through `read_checked`, and its
+    // trait default re-derives the value from THIS layer's
+    // `get_value_checked` as `marked: None` — discarding the marked leaves
+    // the inner source declared and framing a full mask over them. For the
+    // gateway that means shipping leaves the upstream never assigned.
+    // Reads are permitted under read-only mode, so this is a plain forward.
+    async fn read_checked(
+        &self,
+        checked: epics_pva_rs::server_native::source::AccessChecked,
+        ctx: ChannelContext,
+    ) -> Option<SourceRead> {
+        self.inner.read_checked(checked, ctx).await
     }
     async fn subscribe_checked(
         &self,
@@ -638,6 +653,21 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
         }
         self.inner.get_value_checked(checked, ctx).await
     }
+    /// Same allowlist gate as `get_value_checked`, on the read-FRAMING path
+    /// (GET reply / PUT_GET readback / monitor seed). Without this override
+    /// the trait default would re-read through this layer's
+    /// `get_value_checked` and drop the inner's marked leaves — see the note
+    /// on `ReadOnlyLayer::read_checked`.
+    async fn read_checked(
+        &self,
+        checked: epics_pva_rs::server_native::source::AccessChecked,
+        ctx: ChannelContext,
+    ) -> Option<SourceRead> {
+        if !self.config.allowed(checked.pv_name()) {
+            return None;
+        }
+        self.inner.read_checked(checked, ctx).await
+    }
     async fn put_value_checked(
         &self,
         checked: epics_pva_rs::server_native::source::AccessChecked,
@@ -690,7 +720,7 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
         changed: epics_pva_rs::proto::BitSet,
         delta: PvField,
         ctx: ChannelContext,
-    ) -> Result<Option<PvField>, OpError> {
+    ) -> Result<Option<SourceRead>, OpError> {
         if !self.config.allowed(checked.pv_name()) {
             return Err(OpError::denied(format!(
                 "ACL: PV '{}' denied",
@@ -1366,7 +1396,7 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
         changed: epics_pva_rs::proto::BitSet,
         delta: PvField,
         ctx: ChannelContext,
-    ) -> Result<Option<PvField>, OpError> {
+    ) -> Result<Option<SourceRead>, OpError> {
         let pv = checked.pv_name().to_string();
         let user = ctx.account.clone();
         let host = ctx.host.clone();
@@ -1424,6 +1454,32 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
             // by refusing to mint a readable token, so a None reaching
             // here (after a permitted read) is operationally a miss
             // (Failed), not an access denial.
+            let outcome: Result<(), OpError> = if result.is_some() {
+                Ok(())
+            } else {
+                Err(OpError::failed(format!("PV '{pv}' not found")))
+            };
+            let mut ev = make_audit_event(&pv, &user, &host, &outcome);
+            ev.event = AuditEventKind::Get;
+            self.sink.record(ev);
+        }
+        result
+    }
+    /// The read-FRAMING path (GET reply / PUT_GET readback / monitor seed)
+    /// carries the same Get audit row as `get_value_checked` and forwards the
+    /// inner's marked leaves. Without this override the trait default would
+    /// re-read through this layer's `get_value_checked` — one extra upstream
+    /// GET, and the marks dropped (see `ReadOnlyLayer::read_checked`).
+    async fn read_checked(
+        &self,
+        checked: epics_pva_rs::server_native::source::AccessChecked,
+        ctx: ChannelContext,
+    ) -> Option<SourceRead> {
+        let pv = checked.pv_name().to_string();
+        let user = ctx.account.clone();
+        let host = ctx.host.clone();
+        let result = self.inner.read_checked(checked, ctx).await;
+        if self.audit_get {
             let outcome: Result<(), OpError> = if result.is_some() {
                 Ok(())
             } else {

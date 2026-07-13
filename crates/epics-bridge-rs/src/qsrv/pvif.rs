@@ -223,10 +223,15 @@ pub fn change_leaf_paths(prefix: &str, mapping: FieldMapping, change: EventMask)
 ///
 /// Over `change_leaf_paths(prefix, mapping, VALUE|ALARM|PROPERTY)` it adds:
 ///
-/// * `display.form.choices` and `display.form.index` — `IOCSource::
-///   initialize` (`iocsource.cpp:39-65`) fills the form enum for a `Scalar`
-///   mapping. Present in pvxs's own pinned delta (`testqsingle.cpp:129-149`)
-///   even though no DBE class assigns them;
+/// * `display.form.choices` — `IOCSource::initialize` (`iocsource.cpp:39-65`)
+///   fills the form menu for a `Scalar` mapping. Present in pvxs's own pinned
+///   delta (`testqsingle.cpp:129-149`) even though no DBE class assigns it;
+/// * `display.form.index` — assigned by the SAME initialize, but ONLY when
+///   the mapping's channel addresses the record's VAL field
+///   (`if(dbIsValueField(dbChannelFldDes(chan)))`, `iocsource.cpp:53`), which
+///   is what `is_value_field` carries here. A channel on `REC.RVAL` leaves the
+///   index unassigned, so marking it shipped one changed bit and four bytes
+///   pvxs never sends;
 /// * a `Const` member's own node — `IOCSource::get` assigns `info.cval`
 ///   (`iocsource.cpp:319-322`) on a read, where no runtime event ever fires
 ///   for it.
@@ -239,7 +244,7 @@ pub fn change_leaf_paths(prefix: &str, mapping: FieldMapping, change: EventMask)
 /// `control.minStep`, `valueAlarm.active`, the four `valueAlarm.*Severity`,
 /// `valueAlarm.hysteresis` — are absent here exactly as they are absent from
 /// pvxs's delta.
-pub fn read_leaf_paths(prefix: &str, mapping: FieldMapping) -> Vec<String> {
+pub fn read_leaf_paths(prefix: &str, mapping: FieldMapping, is_value_field: bool) -> Vec<String> {
     let everything = EventMask::VALUE | EventMask::ALARM | EventMask::PROPERTY;
     let mut paths = change_leaf_paths(prefix, mapping, everything);
     match mapping {
@@ -248,7 +253,11 @@ pub fn read_leaf_paths(prefix: &str, mapping: FieldMapping) -> Vec<String> {
             // A subscripted member already collapsed to its enclosing array
             // field, which marks the whole field; nothing to add under it.
             if enclosing_array_field(prefix).is_none() {
-                for form in ["display.form.choices", "display.form.index"] {
+                let mut forms = vec!["display.form.choices"];
+                if is_value_field {
+                    forms.push("display.form.index");
+                }
+                for form in forms {
                     paths.push(if prefix.is_empty() {
                         form.to_string()
                     } else {
@@ -2222,7 +2231,7 @@ mod tests {
     /// read-only-assigned `Const` node.
     #[test]
     fn read_leaf_paths_frames_pvxs_initialize_plus_get_everything() {
-        let scalar = read_leaf_paths("", FieldMapping::Scalar);
+        let scalar = read_leaf_paths("", FieldMapping::Scalar, true);
 
         // The seven leaves the port's NT carries and `getProperties` never
         // assigns. Absent from the read → absent from the wire.
@@ -2262,14 +2271,14 @@ mod tests {
         // `initialize` is `info.type == Scalar`-only: a Meta member carries
         // alarm + timeStamp and no form, and a value-only mapping is marked
         // whole with nothing under it.
-        let meta = read_leaf_paths("m", FieldMapping::Meta);
+        let meta = read_leaf_paths("m", FieldMapping::Meta, true);
         assert_eq!(
             meta,
             vec!["m.timeStamp".to_string(), "m.alarm".to_string()],
             "a `+type:meta` member assigns only the alarm/timeStamp pair"
         );
         assert_eq!(
-            read_leaf_paths("p", FieldMapping::Plain),
+            read_leaf_paths("p", FieldMapping::Plain, true),
             vec!["p".to_string()],
             "a value-only mapping is the value: marked whole, no metadata under it"
         );
@@ -2278,21 +2287,89 @@ mod tests {
         // (`iocsource.cpp:319-322`) — a read frames it, no event ever posts
         // it. Structure/Proc members are skipped on read as on post.
         assert_eq!(
-            read_leaf_paths("k", FieldMapping::Const),
+            read_leaf_paths("k", FieldMapping::Const, true),
             vec!["k".to_string()],
             "a const member is assigned on every read"
         );
         assert!(
-            read_leaf_paths("s", FieldMapping::Structure).is_empty(),
+            read_leaf_paths("s", FieldMapping::Structure, true).is_empty(),
             "pvxs skips a Structure member on a read (`iocsource.cpp:316-317`)"
         );
 
         // A subscripted member collapses to its enclosing array field on a
         // read exactly as on a post — that field is the only markable bit.
         assert_eq!(
-            read_leaf_paths("a[0].x", FieldMapping::Scalar),
+            read_leaf_paths("a[0].x", FieldMapping::Scalar, true),
             vec!["a".to_string()],
             "a subscripted member marks the enclosing array field, whole"
+        );
+    }
+
+    /// R16-31: `IOCSource::initialize` assigns `display.form.index` only when
+    /// the channel addresses the record's VAL field (`dbIsValueField`,
+    /// `iocsource.cpp:53`); `display.form.choices` is assigned for every
+    /// field. A non-VAL channel (`REC.RVAL`) that marked the index shipped a
+    /// changed bit and four bytes pvxs never sends.
+    #[test]
+    fn form_index_marked_for_val_channels_only() {
+        let val = read_leaf_paths("", FieldMapping::Scalar, true);
+        assert!(val.contains(&"display.form.choices".to_string()));
+        assert!(val.contains(&"display.form.index".to_string()));
+
+        let non_val = read_leaf_paths("", FieldMapping::Scalar, false);
+        assert!(
+            non_val.contains(&"display.form.choices".to_string()),
+            "the form menu is assigned for every field: {non_val:?}"
+        );
+        assert!(
+            !non_val.contains(&"display.form.index".to_string()),
+            "Q:form applies to form.index for VAL only: {non_val:?}"
+        );
+
+        // Same rule for a group member bound to a non-VAL field.
+        let member = read_leaf_paths("rval", FieldMapping::Scalar, false);
+        assert!(member.contains(&"rval.display.form.choices".to_string()));
+        assert!(
+            !member.contains(&"rval.display.form.index".to_string()),
+            "a group member on REC.RVAL must not mark its form index: {member:?}"
+        );
+    }
+
+    /// R16-31: the value side of the same rule — `build_display` writes the
+    /// index straight from `DisplayInfo::form`, which the snapshot producer
+    /// now narrows to the served field (0 = Default for a non-VAL field), so
+    /// a `Q:form` record never reports Hex on `REC.RVAL`.
+    #[test]
+    fn build_display_publishes_the_snapshots_form_index() {
+        let disp = DisplayInfo {
+            form: 4, // Hex — as the VAL channel of an info(Q:form,"Hex") record
+            ..Default::default()
+        };
+        let d = build_display(&disp, ScalarType::Int, true);
+        let PvField::Structure(form) = &d.fields.iter().find(|(n, _)| n == "form").unwrap().1
+        else {
+            panic!("display.form must be an enum_t structure");
+        };
+        assert_eq!(
+            form.fields.iter().find(|(n, _)| n == "index").unwrap().1,
+            PvField::Scalar(ScalarValue::Int(4))
+        );
+        let PvField::ScalarArray(choices) =
+            &form.fields.iter().find(|(n, _)| n == "choices").unwrap().1
+        else {
+            panic!("display.form.choices must be a string array");
+        };
+        assert_eq!(choices.len(), 7, "the menu is published regardless");
+
+        // The non-VAL snapshot carries form = 0 (Default).
+        let d = build_display(&DisplayInfo::default(), ScalarType::Int, true);
+        let PvField::Structure(form) = &d.fields.iter().find(|(n, _)| n == "form").unwrap().1
+        else {
+            panic!("display.form must be an enum_t structure");
+        };
+        assert_eq!(
+            form.fields.iter().find(|(n, _)| n == "index").unwrap().1,
+            PvField::Scalar(ScalarValue::Int(0))
         );
     }
 }

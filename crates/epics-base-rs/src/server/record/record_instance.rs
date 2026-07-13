@@ -1075,10 +1075,10 @@ impl RecordInstance {
         }
         // Apply the `Q:form` display-format hint. The match above builds
         // `snap.display` only for numeric record types — the same set for
-        // which pvxs emits `display.form.choices` — so a present `Q:form`
-        // tag maps to `display.form.index` exactly when pvxs applies it
-        // (`iocsource.cpp:42-62`, VAL-only; the per-record DisplayInfo here
-        // *is* the VAL field's metadata).
+        // which pvxs emits `display.form.choices`. This cache is
+        // record-level (it is the VAL field's metadata); the VAL-only rule
+        // pvxs applies to `display.form.index` (`iocsource.cpp:53`) is
+        // enforced per served field in `apply_field_metadata_override`.
         if let Some(display) = snap.display.as_mut() {
             if let Some(form) = self.q_form_index() {
                 display.form = form;
@@ -3094,11 +3094,28 @@ impl RecordInstance {
     /// monitor snapshot builders. Computed live on every call — never
     /// cached — so overrides derived from fields outside the
     /// `is_metadata_field` set cannot go stale.
+    ///
+    /// This is also where the record-level `Q:form` info tag is narrowed to
+    /// the served field: QSRV assigns `display.form.index` only when the
+    /// channel addresses the VAL field (`IOCSource::initialize` gates it on
+    /// `dbIsValueField(dbChannelFldDes(chan))`, `iocsource.cpp:53`; the form
+    /// *menu*, `form.choices`, is published for every field). The metadata
+    /// cache is per-record, so a channel on `REC.RVAL` of a record carrying
+    /// `info(Q:form, "Hex")` used to report Hex where pvxs reports Default.
+    /// Both `Snapshot` producers (`snapshot_for_field` for GET,
+    /// `make_monitor_snapshot` for updates) run this one owner, so
+    /// `DisplayInfo::form` means exactly one thing on every path: the form
+    /// index that applies to THIS field.
     fn apply_field_metadata_override(
         &self,
         field: &str,
         snap: &mut super::super::snapshot::Snapshot,
     ) {
+        if let Some(display) = snap.display.as_mut()
+            && !crate::server::database::is_value_field(field)
+        {
+            display.form = 0;
+        }
         let Some(ov) = self.record.field_metadata_override(field) else {
             return;
         };
@@ -3556,6 +3573,41 @@ mod metadata_cache_tests {
         let snap = inst.snapshot_for_field("VAL").unwrap();
         let display = snap.display.expect("ai snapshot must have display");
         assert_eq!(display.form, 4, "Q:form=Hex -> display.form index 4");
+    }
+
+    /// R16-31: `Q:form` is a record-level info tag, but QSRV assigns
+    /// `display.form.index` only when the channel addresses the VAL field
+    /// (`if(dbIsValueField(dbChannelFldDes(chan)))`, `iocsource.cpp:53`). A
+    /// snapshot of any other field of the same record reports the default
+    /// form, on both the GET and the monitor producer.
+    #[test]
+    fn q_form_applies_to_the_val_field_only() {
+        let mut inst = ai_instance();
+        inst.set_info("Q:form", "Hex");
+
+        let val = inst.snapshot_for_field("VAL").unwrap();
+        assert_eq!(val.display.expect("ai display").form, 4);
+
+        for non_val in ["RVAL", "SEVR", "HOPR"] {
+            let Some(snap) = inst.snapshot_for_field(non_val) else {
+                panic!("ai.{non_val} must resolve");
+            };
+            assert_eq!(
+                snap.display.expect("ai display").form,
+                0,
+                "Q:form must not reach ai.{non_val} — pvxs applies it to VAL only"
+            );
+        }
+
+        // The monitor producer shares the same per-field owner.
+        let update = inst.make_monitor_snapshot("RVAL", EpicsValue::Long(7));
+        assert_eq!(
+            update.display.expect("ai display").form,
+            0,
+            "a monitor update on a non-VAL field carries the default form too"
+        );
+        let update = inst.make_monitor_snapshot("VAL", EpicsValue::Double(1.0));
+        assert_eq!(update.display.expect("ai display").form, 4);
     }
 
     #[test]

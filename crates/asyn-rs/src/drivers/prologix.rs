@@ -342,14 +342,15 @@ impl PortDriver for DrvAsynPrologixPort {
 
     /// asynInt32 on a GPIB port is asynGpib's SRQ interrupt source, not a
     /// readable register: `read`/`write` are the asynInt32Base defaults and
-    /// fail. See [`crate::interfaces::gpib::int32_not_supported`].
+    /// fail. See [`crate::interfaces::gpib::int32_read_not_supported`], which
+    /// documents why the read reports the READ (CBUG-B10 — C says "write").
     fn read_int32(&mut self, _user: &AsynUser) -> AsynResult<i32> {
-        Err(crate::interfaces::gpib::int32_not_supported())
+        Err(crate::interfaces::gpib::int32_read_not_supported())
     }
 
     /// See [`Self::read_int32`].
     fn write_int32(&mut self, _user: &mut AsynUser, _value: i32) -> AsynResult<()> {
-        Err(crate::interfaces::gpib::int32_not_supported())
+        Err(crate::interfaces::gpib::int32_write_not_supported())
     }
 
     fn connect(&mut self, user: &AsynUser) -> AsynResult<()> {
@@ -934,9 +935,12 @@ mod tests {
         );
 
         let mut user = AsynUser::default();
+        // CBUG-B10: C's asynInt32Base `readDefault` reports "write is not
+        // supported" (a copy-paste from `writeDefault`); the read path here
+        // names the read.
         assert_eq!(
             drv.read_int32(&user).unwrap_err().message(),
-            "write is not supported"
+            "read is not supported"
         );
         assert_eq!(
             drv.write_int32(&mut user, 1).unwrap_err().message(),

@@ -90,10 +90,11 @@ impl IoIntrSample {
     /// mismatch is dropped, exactly as C's per-interface lists drop it.
     fn from_value(iface: InterfaceType, value: &ParamValue) -> Option<Self> {
         match (iface, value) {
-            // C `epicsStrSnPrintEscaped(pasynRec->tinp, ...)` (:725) — the same
-            // escaping the polled octet read applies to TINP.
+            // C `epicsStrSnPrintEscaped(pasynRec->tinp, sizeof(pasynRec->tinp),
+            // ...)` (:725) — the same escaping, under the same 40-byte TINP
+            // bound, that the polled octet read applies.
             (InterfaceType::Octet, ParamValue::Octet(s)) => Some(Self::Octet(
-                crate::trace::format_io_data(s.as_bytes(), TraceIoMask::ESCAPE),
+                crate::escape::escaped_from_raw(s.as_bytes(), super::TINP_SIZE),
             )),
             (InterfaceType::Int32, ParamValue::Int32(v)) => Some(Self::Int32(*v)),
             (InterfaceType::UInt32Digital, ParamValue::UInt32Digital(v)) => Some(Self::UInt32(*v)),

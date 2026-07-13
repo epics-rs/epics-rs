@@ -284,12 +284,22 @@ pub struct TraceSnapshot {
     pub file_id: usize,
 }
 
+/// C `DEFAULT_TRACE_BUFFER_SIZE` (asynManager.c:47) — the size `tracePvtInit`
+/// (:451) allocates `tracePvt.traceBuffer` with. That buffer is the destination
+/// `epicsStrSnPrintEscaped` writes the ESCAPE form into on the errlog branch
+/// (:3159), so it is the bound that truncates an errlog trace line.
+const DEFAULT_TRACE_BUFFER_SIZE: usize = 80;
+
 /// Per-port (or global) trace configuration.
 pub struct TraceConfig {
     pub trace_mask: TraceMask,
     pub trace_io_mask: TraceIoMask,
     pub trace_info_mask: TraceInfoMask,
     pub io_truncate_size: usize,
+    /// C `tracePvt.traceBufferSize`. Starts at [`DEFAULT_TRACE_BUFFER_SIZE`] and
+    /// is grown — never shrunk — by `setTraceIOTruncateSize` when the new
+    /// truncate size exceeds it (asynManager.c:2947-2953).
+    pub trace_buffer_size: usize,
     pub file: TraceFile,
 }
 
@@ -306,6 +316,7 @@ impl Default for TraceConfig {
             trace_io_mask: TraceIoMask::ASCII,
             trace_info_mask: TraceInfoMask::TIME | TraceInfoMask::PORT,
             io_truncate_size: 80,
+            trace_buffer_size: DEFAULT_TRACE_BUFFER_SIZE,
             file: TraceFile::default(),
         }
     }
@@ -544,7 +555,7 @@ impl TraceManager {
                 data
             };
 
-            let formatted = format_io_data(data, cfg.trace_io_mask);
+            let formatted = format_io_data(data, cfg.trace_io_mask, cfg.trace_buffer_size);
             let line = format!("{prefix}{label} {formatted}\n");
             cfg.file.write_line(&line);
         });
@@ -715,19 +726,25 @@ impl TraceManager {
 
     /// C parity: asynManager.c:2956 fires
     /// `asynExceptionTraceIOTruncateSize` after the mutation.
+    ///
+    /// C also re-allocates `traceBuffer` to `size` when the new truncate size
+    /// exceeds the current buffer (asynManager.c:2947-2953) — see
+    /// [`TraceConfig::trace_buffer_size`], which bounds the errlog ESCAPE form.
     pub fn set_io_truncate_size(&self, port: Option<&str>, size: usize) {
         match port {
             Some(name) => {
                 if let Ok(mut configs) = self.port_configs.lock() {
-                    configs
+                    let cfg = configs
                         .entry(name.to_string())
-                        .or_insert_with(TraceConfig::default)
-                        .io_truncate_size = size;
+                        .or_insert_with(TraceConfig::default);
+                    cfg.io_truncate_size = size;
+                    cfg.trace_buffer_size = cfg.trace_buffer_size.max(size);
                 }
             }
             None => {
                 if let Ok(mut cfg) = self.global_config.lock() {
                     cfg.io_truncate_size = size;
+                    cfg.trace_buffer_size = cfg.trace_buffer_size.max(size);
                 }
             }
         }
@@ -746,10 +763,11 @@ impl TraceManager {
     /// `asynExceptionTraceIOTruncateSize` per device.
     pub fn set_device_io_truncate_size(&self, port: &str, addr: i32, size: usize) {
         if let Ok(mut configs) = self.device_configs.lock() {
-            configs
+            let cfg = configs
                 .entry((port.to_string(), addr))
-                .or_insert_with(TraceConfig::default)
-                .io_truncate_size = size;
+                .or_insert_with(TraceConfig::default);
+            cfg.io_truncate_size = size;
+            cfg.trace_buffer_size = cfg.trace_buffer_size.max(size);
         }
         let sink = self.exception_sink.lock().ok().and_then(|g| g.clone());
         if let Some(sink) = sink {
@@ -904,11 +922,15 @@ fn mask_label(mask: TraceMask) -> &'static str {
 }
 
 /// Format I/O data according to the trace I/O mask.
-pub fn format_io_data(data: &[u8], mask: TraceIoMask) -> String {
+///
+/// `buf_size` is the C destination bound of the ESCAPE form — the trace port's
+/// `tracePvt.traceBuffer` (asynManager.c:3159), i.e.
+/// [`TraceConfig::trace_buffer_size`].
+pub fn format_io_data(data: &[u8], mask: TraceIoMask, buf_size: usize) -> String {
     if mask.contains(TraceIoMask::HEX) {
         format_hex(data)
     } else if mask.contains(TraceIoMask::ESCAPE) {
-        format_escape(data)
+        format_escape(data, buf_size)
     } else {
         // ASCII (default)
         format_ascii(data)
@@ -928,12 +950,13 @@ fn format_ascii(data: &[u8]) -> String {
 }
 
 /// `ASYN_TRACEIO_ESCAPE`, which C prints with the libCom escape table
-/// (`epicsStrSnPrintEscaped`, asynManager.c:3159) — the same table `asynRecord`
-/// builds TINP with (asynRecord.c:725,1629) and `asynInterposeEcho` reports a
-/// mismatch with. Its own four-case table left `\a`, `\b`, `\f`, `\v`, `'` and
-/// `"` unescaped or hexed, which none of those three C callers do (R16-48).
-fn format_escape(data: &[u8]) -> String {
-    crate::escape::escaped_from_raw(data)
+/// (`epicsStrSnPrintEscaped` into `tracePvt.traceBuffer`, asynManager.c:3159).
+/// The buffer is the bound: a trace line whose escaped form does not fit is
+/// truncated at `traceBufferSize - 1` characters, dangling backslash included.
+/// Its own four-case table left `\a`, `\b`, `\f`, `\v`, `'` and `"` unescaped
+/// or hexed, which no C caller does (R16-48).
+fn format_escape(data: &[u8], buf_size: usize) -> String {
+    crate::escape::escaped_from_raw(data, buf_size)
 }
 
 fn format_hex(data: &[u8]) -> String {
@@ -1203,10 +1226,36 @@ mod tests {
 
     #[test]
     fn test_format_escape() {
-        assert_eq!(format_escape(b"OK\r\n"), "OK\\r\\n");
-        assert_eq!(format_escape(b"\t\\"), "\\t\\\\");
-        assert_eq!(format_escape(&[0x01]), "\\x01");
-        assert_eq!(format_escape(b"hi"), "hi");
+        let n = DEFAULT_TRACE_BUFFER_SIZE;
+        assert_eq!(format_escape(b"OK\r\n", n), "OK\\r\\n");
+        assert_eq!(format_escape(b"\t\\", n), "\\t\\\\");
+        assert_eq!(format_escape(&[0x01], n), "\\x01");
+        assert_eq!(format_escape(b"hi", n), "hi");
+    }
+
+    /// The ESCAPE form's destination is C's `tracePvt.traceBuffer`
+    /// (asynManager.c:3159), 80 bytes until `setTraceIOTruncateSize` grows it
+    /// (:2947-2953) — so an escape-heavy line is cut at `traceBufferSize - 1`.
+    #[test]
+    fn format_escape_is_bounded_by_the_trace_buffer() {
+        let crlf: Vec<u8> = b"\r\n".repeat(50);
+        let out = format_escape(&crlf, DEFAULT_TRACE_BUFFER_SIZE);
+        assert_eq!(out.len(), DEFAULT_TRACE_BUFFER_SIZE - 1);
+        assert!(out.ends_with(r"\r\n\r\"), "cut mid-pair, as C does: {out}");
+    }
+
+    /// C `setTraceIOTruncateSize` reallocates `traceBuffer` to the new size when
+    /// it exceeds the current one, and never shrinks it back
+    /// (asynManager.c:2947-2953) — so a bigger truncate size widens the ESCAPE
+    /// bound, and a smaller one afterwards does not narrow it.
+    #[test]
+    fn a_bigger_truncate_size_grows_the_trace_buffer_and_a_smaller_one_does_not_shrink_it() {
+        let mgr = TraceManager::new();
+        mgr.set_io_truncate_size(None, 400);
+        assert_eq!(mgr.global_config.lock().unwrap().trace_buffer_size, 400);
+        mgr.set_io_truncate_size(None, 8);
+        assert_eq!(mgr.global_config.lock().unwrap().io_truncate_size, 8);
+        assert_eq!(mgr.global_config.lock().unwrap().trace_buffer_size, 400);
     }
 
     #[test]
@@ -1226,9 +1275,10 @@ mod tests {
     #[test]
     fn test_format_io_data_dispatch() {
         let data = b"OK\r\n";
-        assert_eq!(format_io_data(data, TraceIoMask::ASCII), "OK..");
-        assert_eq!(format_io_data(data, TraceIoMask::ESCAPE), "OK\\r\\n");
-        assert_eq!(format_io_data(data, TraceIoMask::HEX), "4f 4b 0d 0a");
+        let n = DEFAULT_TRACE_BUFFER_SIZE;
+        assert_eq!(format_io_data(data, TraceIoMask::ASCII, n), "OK..");
+        assert_eq!(format_io_data(data, TraceIoMask::ESCAPE, n), "OK\\r\\n");
+        assert_eq!(format_io_data(data, TraceIoMask::HEX, n), "4f 4b 0d 0a");
     }
 
     #[test]

@@ -5,14 +5,19 @@
 
 use crate::error::{AsynError, AsynResult, AsynStatus};
 use crate::interpose::{OctetInterpose, OctetNext, OctetReadResult};
-use crate::trace::{TraceIoMask, format_io_data};
 use crate::user::AsynUser;
 
+/// The `char outstr[16]` / `char echostr[16]` C escapes the two sides of the
+/// mismatch into (asynInterposeEcho.c:71-74). Both sides are a single byte, so
+/// the longest escaped form (`\xNN`, 4 chars) is nowhere near the bound — but
+/// the bound is C's and it is stated here rather than assumed away.
+const ECHO_STR_SIZE: usize = 16;
+
 /// Escape bytes for the diagnostics, C `epicsStrnEscapedFromRaw`
-/// (asynInterposeEcho.c:78-80). Routed through the trace formatter so the
-/// record's TINP and this message escape a byte the same way.
+/// (asynInterposeEcho.c:73-74) — the same libCom table the record's TINP goes
+/// through, with this call site's own destination bound.
 fn escaped(bytes: &[u8]) -> String {
-    format_io_data(bytes, TraceIoMask::ESCAPE)
+    crate::escape::escaped_from_raw(bytes, ECHO_STR_SIZE)
 }
 
 /// Interpose layer for echo-mode serial communication.

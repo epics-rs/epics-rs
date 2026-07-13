@@ -4419,7 +4419,7 @@ BROKEN (incomplete, not regressed):
   client uses iocinf.cpp:187-192 strstr("no"), not
   envGetBoolConfigParam; port matches identically.
 
-### Open findings R17-1..R17-85 (32)
+### Open findings R17-1..R17-85 (33)
 
 Category A (sseq/calc):
 - **R17-1** Medium — sseq STRn renders negative PREC clamped to 0; C
@@ -4495,6 +4495,17 @@ Category C (PVA/gateway):
   CONN_TMO pushes the echo period far past C's 15 s ceiling. Distinct
   from R17-34 (idle-timeout VALUE vs echo CADENCE). Filed post-audit
   from the wave-15 fixer's UNFIXED report.
+- **R17-37** Low — a marked Meta group member is a silent skip in the
+  port's PUT loop (FieldMapping::is_client_writable), but pvxs counts a
+  marked+putable field as `changing` and runs doPostProcessing on it
+  even though IOCSource::put writes nothing (groupsource.cpp:563-571):
+  a config that gives a Meta member a `+putorder` processes the record
+  in pvxs and does not in the port. No shipped config does (Meta
+  members carry no `+putorder` in any found), and the pre-R17-35
+  behavior (whole-PUT rejection) was further from pvxs than the skip.
+  Filed post-fix from the wave-15 fixer's UNFIXED report.
+  qsrv/group.rs (is_client_writable / put loops) vs
+  pvxs src/qsrv/groupsource.cpp:563-571.
 
 Category D (asyn):
 - **R17-46** Medium — trace ESCAPE form hardwires escaped_from_raw; C's

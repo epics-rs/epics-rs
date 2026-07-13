@@ -849,13 +849,31 @@ const C_DEFAULT_PRECISION: usize = 6;
 /// (`tool_lib.c:138,150`), so they never reach a limit: `caget -d
 /// DBR_CTRL_DOUBLE -f 9` still prints every limit at 6 significant digits.
 ///
-/// Non-finite limits fall through to C `printf`'s `inf` / `nan` spelling, the
-/// same escape [`format_float`] takes.
+/// Non-finite limits fall through to [`format_non_finite`], the same escape
+/// [`format_float`] takes.
 pub fn format_c_g(x: f64) -> String {
     if !x.is_finite() {
-        return format!("{x}");
+        return format_non_finite(x);
     }
     format_g(x, C_DEFAULT_PRECISION)
+}
+
+/// C `printf`'s spelling of a non-finite double, shared by EVERY conversion —
+/// `%g`, `%f` and `%e` all print the same three words (verified against glibc,
+/// R13-20).
+///
+/// Rust's `{}` agrees on `inf` and `-inf` but prints `NaN` where C prints
+/// `nan`, so `caget` on a NaN-valued `ao` printed `NaN` against C's `nan`.
+/// glibc also carries the SIGN BIT through, printing `-nan` for a negative
+/// NaN; `f64::is_sign_negative` reports exactly that bit.
+///
+/// Every float the tools print — value, array element, and each graphic /
+/// control limit — reaches C's `printf` through one of the two callers here,
+/// so this is the only place the spelling is decided.
+fn format_non_finite(x: f64) -> String {
+    let sign = if x.is_sign_negative() { "-" } else { "" };
+    let word = if x.is_nan() { "nan" } else { "inf" };
+    format!("{sign}{word}")
 }
 
 fn format_float(x: f64, fmt: &ValueFormat) -> String {
@@ -870,9 +888,7 @@ fn format_float(x: f64, fmt: &ValueFormat) -> String {
         return format_int_i64(rounded, fmt.float_style);
     }
     if !x.is_finite() {
-        // C printf prints "nan" / "inf" / "-inf"; Rust matches by
-        // default (`{}` on f64 yields the same lowercase forms).
-        return format!("{x}");
+        return format_non_finite(x);
     }
     let p = fmt.float.precision as usize;
     match fmt.float.style {
@@ -1616,5 +1632,82 @@ mod tests {
             ".000001",
             "chrono truncates; C rounds to .000002"
         );
+    }
+
+    /// R13-20. C `printf` spells a non-finite double `nan` / `-nan` / `inf` /
+    /// `-inf` in EVERY conversion (`%g`, `%f`, `%e` — probed against glibc).
+    /// Rust's `{}` agrees on the infinities but prints `NaN`, so the port
+    /// printed `NaN` where C prints `nan`.
+    #[test]
+    fn a_non_finite_double_is_spelled_the_way_c_printf_spells_it() {
+        let plain = ValueFormat::default();
+        let styles = [
+            ("g", FloatStyle::G),
+            ("f", FloatStyle::F),
+            ("e", FloatStyle::E),
+        ];
+        for (name, style) in styles {
+            let fmt = ValueFormat {
+                float: FloatFormat {
+                    style,
+                    precision: 3,
+                },
+                ..plain.clone()
+            };
+            assert_eq!(
+                format_value(
+                    &EpicsValue::Double(f64::NAN),
+                    &fmt,
+                    None,
+                    CountPrefix::Never
+                ),
+                "nan",
+                "-{name}: C prints `nan`, not Rust's `NaN`"
+            );
+            assert_eq!(
+                format_value(
+                    &EpicsValue::Double(f64::INFINITY),
+                    &fmt,
+                    None,
+                    CountPrefix::Never
+                ),
+                "inf",
+                "-{name}"
+            );
+            assert_eq!(
+                format_value(
+                    &EpicsValue::Double(f64::NEG_INFINITY),
+                    &fmt,
+                    None,
+                    CountPrefix::Never
+                ),
+                "-inf",
+                "-{name}"
+            );
+        }
+        // glibc carries the NaN sign bit through: `printf("%g", -NAN)` → `-nan`.
+        assert_eq!(
+            format_value(
+                &EpicsValue::Double(-f64::NAN),
+                &plain,
+                None,
+                CountPrefix::Never
+            ),
+            "-nan"
+        );
+        // A FLOAT reaches the same formatter.
+        assert_eq!(
+            format_value(
+                &EpicsValue::Float(f32::NAN),
+                &plain,
+                None,
+                CountPrefix::Never
+            ),
+            "nan"
+        );
+        // So does every graphic / control limit (`caget -a`, `caget -d
+        // DBR_CTRL_DOUBLE`), which C prints with its own literal `%g`.
+        assert_eq!(format_c_g(f64::NAN), "nan");
+        assert_eq!(format_c_g(f64::NEG_INFINITY), "-inf");
     }
 }

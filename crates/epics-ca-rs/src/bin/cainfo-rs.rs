@@ -97,8 +97,9 @@ struct Args {
 #[tokio::main]
 async fn main() {
     let cmd = Args::command();
-    let matches = TOOL.get_matches(cmd.clone());
-    let args = Args::from_arg_matches(&matches).expect("clap validated the arguments");
+    let parsed = TOOL.get_matches(cmd.clone());
+    let matches = parsed.matches();
+    let args = Args::from_arg_matches(matches).expect("clap validated the arguments");
 
     // C's ENTIRE getopt loop runs before the `nPvs < 1` check
     // (`cainfo.c:146-198`, then `:200`), so every option argument is scanned —
@@ -108,7 +109,7 @@ async fn main() {
     // client status dump *instead of* per-PV info and does not require PV
     // names. Zero (or an unparseable `-s`) is normal per-PV mode. `--diag` is
     // the Rust-only additive flag.
-    let mut scan = TOOL.scan(&matches);
+    let mut scan = parsed.scan();
     let stat_level = scan.stat_level("stat_level");
     let stat_mode = stat_level != 0;
     // C `-w`: `epicsScanDouble` overwrites the env-loaded `caTimeout` only on

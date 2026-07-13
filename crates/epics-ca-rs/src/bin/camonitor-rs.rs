@@ -227,8 +227,9 @@ async fn main() {
     // Parse via ArgMatches (not the plain derive) so the command-line order of
     // `-e`/`-f`/`-g` is recoverable for C's last-valid-wins rule (W10-B2).
     let cmd = Args::command();
-    let matches = TOOL.get_matches(cmd.clone());
-    let args = Args::from_arg_matches(&matches).expect("clap validated the arguments");
+    let parsed = TOOL.get_matches(cmd.clone());
+    let matches = parsed.matches();
+    let args = Args::from_arg_matches(matches).expect("clap validated the arguments");
 
     // C's ENTIRE getopt loop runs before the `nPvs < 1` check
     // (`camonitor.c:224-600`, then `:604`), so every option argument is
@@ -236,7 +237,7 @@ async fn main() {
     // `value_format` scans `-#`, `-e`/`-f`/`-g`, `-0`/`-l` and `-F`; the four
     // below cover the rest. `-m` and `-t` are bare re-scans: every occurrence
     // re-runs the case (so every bad one warns) and the last one wins.
-    let mut scan = TOOL.scan(&matches);
+    let mut scan = parsed.scan();
     let ca_timeout = scan.timeout("timeout", epics_ca_rs::cli::env_default_timeout());
     let priority = scan.priority("priority");
     let fmt = Arc::new(args.value_format(&mut scan));

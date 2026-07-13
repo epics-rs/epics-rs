@@ -1906,7 +1906,27 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                     // decoded here so the hot path does not allocate
                     // one payload Vec per response.
                     let ioid = hdr.available;
-                    if hdr.cid == ECA_NORMAL {
+                    if let Some(subid) = in_flight.take_sub_update(ioid) {
+                        // Circuit-recovery re-subscribe (C
+                        // `tcpiiu::subscriptionUpdateRequest`): the reply is
+                        // the subscription's post-recovery value, not a get
+                        // result — route it to the monitor callback exactly
+                        // as C does by issuing the request under the
+                        // subscription's own id.
+                        let _ = event_tx.send(if hdr.cid == ECA_NORMAL {
+                            TransportEvent::MonitorData {
+                                subid,
+                                data_type: hdr.data_type,
+                                count: hdr.actual_count(),
+                                data: accumulated[data_start..data_start + actual_post].to_vec(),
+                            }
+                        } else {
+                            TransportEvent::MonitorStatusError {
+                                subid,
+                                eca_status: hdr.cid,
+                            }
+                        });
+                    } else if hdr.cid == ECA_NORMAL {
                         let data = &accumulated[data_start..data_start + actual_post];
                         dispatch_read_reply_with(&in_flight, ioid, |mode| {
                             make_read_reply(mode, hdr.data_type, hdr.actual_count(), data)
@@ -3405,6 +3425,79 @@ mod recv_watchdog_tests {
             matches!(closed, Some(TransportEvent::TcpClosed { .. })),
             "a real socket error must still emit TcpClosed"
         );
+        let _ = tokio::time::timeout(Duration::from_secs(2), loop_handle).await;
+    }
+    /// R18-18: the `READ_NOTIFY` the coordinator issues when a circuit becomes
+    /// responsive again is C's `tcpiiu::subscriptionUpdateRequest`
+    /// (`tcpiiu.cpp:1636-1641`), which puts the *subscription's* id in the
+    /// request so the reply reaches the monitor callback. The port's `ioid`
+    /// space is separate, so `InFlightOps::register_sub_update` records the
+    /// owner; the reply must come out as `MonitorData`, not be dropped for
+    /// want of a get waiter (pre-fix: nothing was ever emitted, so a
+    /// `camonitor` never re-posted the value after the IOC un-hung).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recovery_read_notify_reply_posts_to_the_subscription() {
+        let server_addr: SocketAddr = "127.0.0.1:5064".parse().unwrap();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<TransportEvent>();
+        let (write_tx, _write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (_ba_tx, ba_rx) = mpsc::unbounded_channel::<bool>();
+        let in_flight = super::super::types::InFlightOps::new();
+        let last_rx_at: super::super::types::ServerLastRxAt = Arc::new(DashMap::new());
+        let (client_io, server_io) = tokio::io::duplex(1024);
+
+        let ioid = in_flight.register_sub_update(42, 7);
+
+        let loop_handle = tokio::spawn(read_loop(
+            server_io,
+            server_addr,
+            0,
+            event_tx,
+            write_tx,
+            ba_rx,
+            in_flight.clone(),
+            last_rx_at,
+            std::sync::Arc::new(UnresponsiveGate::new()),
+            drained_socket_probe(),
+            std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
+        ));
+
+        // DBR_DOUBLE, one element: the post-recovery value.
+        let mut hdr = CaHeader::new(CA_PROTO_READ_NOTIFY);
+        hdr.data_type = 6;
+        hdr.count = 1;
+        hdr.postsize = 8;
+        hdr.cid = crate::protocol::ECA_NORMAL;
+        hdr.available = ioid;
+        let mut frame = hdr.to_bytes().to_vec();
+        frame.extend_from_slice(&3.5f64.to_be_bytes());
+
+        let mut client = client_io;
+        client.write_all(&frame).await.expect("write");
+        client.flush().await.expect("flush");
+
+        let evt = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+            .await
+            .expect("a recovery re-read must produce an event")
+            .expect("channel open");
+        match evt {
+            TransportEvent::MonitorData {
+                subid,
+                data_type,
+                count,
+                data,
+            } => {
+                assert_eq!(subid, 7, "the reply belongs to the subscription");
+                assert_eq!((data_type, count), (6, 1));
+                assert_eq!(f64::from_be_bytes(data[..8].try_into().unwrap()), 3.5);
+            }
+            _ => panic!("the recovery re-read reply must be posted as MonitorData"),
+        }
+        assert!(
+            in_flight.sub_updates.is_empty(),
+            "the record is consumed by the reply"
+        );
+
+        drop(client);
         let _ = tokio::time::timeout(Duration::from_secs(2), loop_handle).await;
     }
 }

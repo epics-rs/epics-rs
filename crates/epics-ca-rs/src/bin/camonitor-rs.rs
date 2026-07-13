@@ -490,8 +490,17 @@ async fn monitor_pv(
                     );
                 }
             }
-            Err(e) => {
-                eprintln!("{pv_name}: {e}");
+            Err(_status) => {
+                // C `camonitor.c:108-124` `event_handler` records the status
+                // on the pv and prints ONLY when it is ECA_NORMAL — nothing in
+                // the tool ever reads that status back, so a non-normal event
+                // costs zero bytes of output. The port printed a line here,
+                // which meant every IOC restart emitted a diagnostic C does
+                // not emit (`TST:AI: server reported ECA status 0x00c0` once
+                // the disconnect fan-out started landing here). The lost IOC
+                // *is* reported — on stdout, as C's `*** disconnected` line,
+                // from the connection callback, which is the only place C
+                // reports it.
             }
         }
     }

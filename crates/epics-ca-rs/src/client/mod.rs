@@ -3732,24 +3732,7 @@ async fn run_coordinator(
                     } => {
                         types::dispatch_exception(
                             &exception_slot,
-                            types::CaException {
-                                kind: types::CaExceptionKind::ServerError,
-                                message: format!(
-                                    "Channel: \"{}\", Connecting to: {}, Ignored: {}",
-                                    pv_name, prev_addr, new_addr,
-                                ),
-                                server_addr: Some(new_addr),
-                                pv_name: Some(pv_name),
-                                status: Some(crate::protocol::ECA_DBLCHNL),
-                                // C raises this one through the plain
-                                // `ca_client_context::exception` overload
-                                // (`cac.cpp:1323`): no chid, no type/count —
-                                // so the block prints the ctx text verbatim.
-                                op: types::CaOp::Other,
-                                data_type: None,
-                                count: None,
-                                source: None,
-                            },
+                            types::multiply_defined_pv_exception(pv_name, prev_addr, new_addr),
                         );
                     }
                 }
@@ -4135,11 +4118,14 @@ async fn run_coordinator(
                                 data_type: is_channel_exception.then_some(data_type).flatten(),
                                 count: is_channel_exception.then_some(count).flatten(),
                                 // `cac::defaultExcep` (`cac.cpp:1006-1016`)
-                                // passes a null file, which suppresses the
-                                // `Source File:` line; only the channel-write
-                                // exception carries one.
-                                source: is_channel_exception
-                                    .then_some(types::LIBCA_WRITE_EXCEPTION_SITE),
+                                // is libca's one null-file producer, so it is
+                                // the one block with no `Source File:` line;
+                                // the channel-write exception carries its own.
+                                source: if is_channel_exception {
+                                    types::LIBCA_WRITE_EXCEPTION_SITE
+                                } else {
+                                    types::ExceptionSite::NullFile
+                                },
                             },
                         );
                     }
@@ -4153,7 +4139,7 @@ async fn run_coordinator(
                         metrics::counter!("ca_client_tcp_closed_total", "server" => server_addr.to_string()).increment(1);
                         last_rx_at.remove(&circuit);
                         server_minor_version.remove(&circuit);
-                        handle_disconnect(&mut channels, &mut subscriptions, &mut server_channels, &search_tx, circuit, &diag, &in_flight, &snapshots);
+                        handle_disconnect(&mut channels, &mut subscriptions, &mut server_channels, &search_tx, circuit, &diag, &in_flight, &snapshots, &exception_slot);
                     }
                     TransportEvent::ServerDisconnect { cid, server_addr } => {
                         handle_server_disconnect(
@@ -4173,35 +4159,22 @@ async fn run_coordinator(
                         tracing::warn!(server = %server_addr, priority, "circuit unresponsive (echo timeout)");
                         metrics::counter!("ca_client_unresponsive_total", "server" => server_addr.to_string()).increment(1);
                         // C `tcpiiu::unresponsiveCircuitNotify`
-                        // (`libca/tcpiiu.cpp:899-941`) fires the global
-                        // exception hook with ECA_UNRESPTMO, then walks
-                        // every connected channel and calls
-                        // `pChan->unresponsiveCircuitNotify` which in
-                        // `nciu.cpp:161-182` triggers
-                        // `disconnectAllIO()` (ECA_DISCONN per IO) +
-                        // `accessRightsNotify(noRights)`. Pre-fix Rust
-                        // only flipped state and emitted
-                        // `ConnectionEvent::Unresponsive` — in-flight
-                        // get/put/subscribe waiters kept hanging,
-                        // access-rights subscribers got no signal.
-                        types::dispatch_exception(
-                            &exception_slot,
-                            types::CaException {
-                                kind: types::CaExceptionKind::ServerError,
-                                message: format!(
-                                    "circuit unresponsive: {server_addr} (matches libca ECA_UNRESPTMO)"
-                                ),
-                                server_addr: Some(server_addr),
-                                pv_name: None,
-                                status: Some(crate::protocol::ECA_UNRESPTMO),
-                                // libca `tcpiiu::unresponsiveCircuitNotify`
-                                // raises this with a plain ctx string too.
-                                op: types::CaOp::Other,
-                                data_type: None,
-                                count: None,
-                                source: None,
-                            },
-                        );
+                        // (`tcpiiu.cpp:899-941`) fires the global exception
+                        // hook with ECA_UNRESPTMO — gated, like the
+                        // circuit-gone raise, on the circuit still having
+                        // connected channels (`tcpiiu.cpp:922`
+                        // `connectedList.count()`) — and then walks each of
+                        // them through `nciu::unresponsiveCircuitNotify`.
+                        if channels.values().any(|ch| {
+                            ch.server_addr == Some(server_addr)
+                                && ch.priority == priority
+                                && ch.state == ChannelState::Connected
+                        }) {
+                            types::dispatch_exception(
+                                &exception_slot,
+                                types::unresponsive_circuit_exception(server_addr),
+                            );
+                        }
                         // Same owner as the two circuit-gone paths: the
                         // ECA_DISCONN fan-out to in-flight reads / writes /
                         // subscriptions and the no-rights transition are the
@@ -4268,12 +4241,25 @@ async fn run_coordinator(
                                                     peer_minor,
                                                 ) {
                                                     Ok(count) => {
+                                                        // C issues this
+                                                        // READ_NOTIFY under
+                                                        // the subscription's
+                                                        // own id
+                                                        // (`tcpiiu.cpp:1636-1641`)
+                                                        // so the reply reaches
+                                                        // the monitor
+                                                        // callback. The port's
+                                                        // ioid space is
+                                                        // separate, so record
+                                                        // the reply's owner.
+                                                        let ioid = in_flight
+                                                            .register_sub_update(cid, sub_id);
                                                         let _ = transport_tx.send(
                                                             TransportCommand::ReadNotify {
                                                                 sid: ch.sid,
                                                                 data_type,
                                                                 count,
-                                                                ioid: in_flight.alloc_ioid(),
+                                                                ioid,
                                                                 server_addr: addr,
                                                                 priority: ch.priority,
                                                             },
@@ -4305,6 +4291,13 @@ async fn run_coordinator(
                         server_minor_version.insert((server_addr, priority), minor_version);
                     }
                     TransportEvent::ServerConnected { server_addr } => {
+                        // C hands the peer address to `ipAddrToAsciiEngine` in
+                        // the `tcpiiu` constructor, so the name is resolved
+                        // long before anything prints it. Warm the same cache
+                        // here — otherwise the first ask is the exception block
+                        // of a circuit that just died, and it would print the
+                        // dotted IP where C prints `localhost:5064`.
+                        crate::hostname::warm(server_addr);
                         // libca bhe-on-connect parity: tell the beacon
                         // monitor to drop its per-server EMA so the
                         // next beacon reseeds `period_estimate` from
@@ -4324,18 +4317,21 @@ async fn run_coordinator(
 }
 
 /// Which way a channel leaves the connected set. The two variants differ
-/// only in the terminal [`ChannelState`], the snapshot treatment and the
-/// [`ConnectionEvent`] the subscriber sees — every other step of the
-/// transition is identical, which is exactly why they share
-/// [`disconnect_channels`].
+/// only in the terminal [`ChannelState`] and the snapshot treatment — i.e.
+/// in how the channel *recovers*. What the application sees is identical
+/// and deliberately so: C reaches `nciu::disconnectNotify` (`CA_OP_CONN_DOWN`)
+/// from both, so [`ConnectionEvent::Disconnected`] is the only event either
+/// path can emit.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum DisconnectKind {
     /// The circuit is gone: the socket closed (`TcpClosed`,
     /// C `tcpiiu::disconnectAllChannels`) or the server retired this cid
-    /// (`CA_PROTO_SERVER_DISCONN`, C `cac::disconnectChannel`).
+    /// (`CA_PROTO_SERVER_DISCONN`, C `cac::disconnectChannel`). Recovery is
+    /// a fresh search.
     CircuitGone,
     /// Echo timeout: the socket is still up but the peer is silent.
-    /// C `tcpiiu::unresponsiveCircuitNotify`.
+    /// C `tcpiiu::unresponsiveCircuitNotify`. Recovery is
+    /// `tcpiiu::responsiveCircuitNotify` on the same socket — no re-search.
     Unresponsive,
 }
 
@@ -4344,13 +4340,6 @@ impl DisconnectKind {
         match self {
             Self::CircuitGone => ChannelState::Disconnected,
             Self::Unresponsive => ChannelState::Unresponsive,
-        }
-    }
-
-    fn connection_event(self) -> ConnectionEvent {
-        match self {
-            Self::CircuitGone => ConnectionEvent::Disconnected,
-            Self::Unresponsive => ConnectionEvent::Unresponsive,
         }
     }
 }
@@ -4433,8 +4422,10 @@ fn disconnect_channels(
         }
         // Steps 3 and 4 — C `disconnectNotify` then
         // `accessRightsNotify(noRights)` (`nciu.cpp:170-177`), in that
-        // order.
-        let _ = ch.conn_tx.send(kind.connection_event());
+        // order. Both kinds emit `Disconnected`: C has no third connection
+        // state, and an event only the port can emit is an event no
+        // consumer handles.
+        let _ = ch.conn_tx.send(ConnectionEvent::Disconnected);
         let _ = ch.conn_tx.send(ConnectionEvent::AccessRightsChanged {
             read: false,
             write: false,
@@ -4495,7 +4486,11 @@ fn handle_server_disconnect(
             op: types::CaOp::Other,
             data_type: None,
             count: None,
-            source: None,
+            // No C site to name: `CA_PROTO_SERVER_DISCONN` never reaches
+            // `vSignal` at all (`cac::verifyAndDisconnectChan` takes it out
+            // through the channel's connection callback), so this kind renders
+            // to nothing. The field is unread here.
+            source: types::ExceptionSite::NullFile,
         },
     );
 }
@@ -4510,9 +4505,26 @@ fn handle_disconnect(
     diag: &CaDiagnostics,
     in_flight: &types::InFlightOps,
     snapshots: &ChannelSnapshots,
+    exception_slot: &types::CaExceptionSlot,
 ) {
     let (server_addr, priority) = circuit;
     let now = std::time::Instant::now();
+
+    // C `cac::destroyIIU` (`cac.cpp:1236-1240`): a circuit that still carried
+    // channels when it died raises ECA_DISCONN on the global exception hook —
+    // and raises it *before* `disconnectAllChannels` (`cac.cpp:1251`), so a
+    // handler learns the circuit is gone ahead of the per-channel callbacks.
+    // It belongs here, in the circuit-gone owner, not at one call site: every
+    // path that destroys a circuit is a path C raises this on.
+    if server_channels
+        .get(&circuit)
+        .is_some_and(|cids| !cids.is_empty())
+    {
+        types::dispatch_exception(
+            exception_slot,
+            types::circuit_disconnect_exception(server_addr),
+        );
+    }
 
     // only channels on THIS circuit `(server_addr, priority)`
     // are torn down — a sibling circuit to the same server at another
@@ -4602,6 +4614,12 @@ pub(crate) fn drain_waiters_for_cids(cids: &HashSet<u32>, in_flight: &types::InF
             let _ = sender.send(Err(CaError::Disconnected));
         }
     }
+    // The recovery re-reads of a channel that just left the connected set
+    // will never be answered; their ECA_DISCONN reaches the subscriber via
+    // `mark_disconnected`, so drop the records rather than leak them.
+    in_flight
+        .sub_updates
+        .retain(|_, (cid, _)| !cids.contains(cid));
 }
 
 /// Decide which operational circuits should receive a
@@ -4785,55 +4803,14 @@ pub(crate) fn parse_addr_list_with_hostnames() -> CaResult<Vec<AddrEntry>> {
     // operates on server NAMES, not IPs — see epics_rs_client_ignore
     // docstring for the naming rationale).
     let ignore_ips = epics_rs_client_ignore();
-    if let Some(list) = epics_base_rs::runtime::env::get("EPICS_CA_ADDR_LIST") {
-        for entry in list.split_whitespace() {
-            let (host_raw, port) = if entry.contains(':') {
-                if let Some((h, p)) = entry.rsplit_once(':') {
-                    let port: u16 = match p.parse() {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
-                    (h.to_string(), port)
-                } else {
-                    (entry.to_string(), default_port)
-                }
-            } else {
-                (entry.to_string(), default_port)
-            };
-            // Pure-IP entry has no DNS to refresh.
-            let hostname = if host_raw.parse::<Ipv4Addr>().is_ok() {
-                None
-            } else {
-                Some(host_raw.clone())
-            };
-            match resolve_host(&host_raw, port) {
-                Ok(sock) => {
-                    if let SocketAddr::V4(v4) = sock {
-                        if ignore_ips.contains(v4.ip()) {
-                            tracing::debug!(
-                                target: "epics_ca_rs::client",
-                                token = %entry,
-                                ip = %v4.ip(),
-                                "EPICS_RS_CLIENT_IGNORE: dropping ADDR_LIST entry"
-                            );
-                            continue;
-                        }
-                    }
-                    addrs.push(AddrEntry::new(sock, hostname, port));
-                }
-                Err(e) => tracing::debug!(token = %entry, error = %e,
-                    "EPICS_CA_ADDR_LIST: dropped unresolvable entry"),
-            }
-        }
-    }
 
-    // Mirror the legacy `parse_addr_list`'s
-    // AUTO_ADDR_LIST + broadcast-fallback behaviour. Without these
-    // the new live caller would silently drop UDP broadcast
-    // discovery for multi-NIC clients and the limited-broadcast
-    // last-resort fallback. The added entries are IP literals
-    // (`hostname = None`) so the periodic refresh task short-
-    // circuits them.
+    // C `configureChannelAccessAddressList` (`iocinf.cpp:195-227`) builds this
+    // list in ONE order: the auto-discovered broadcasts first (deduped among
+    // themselves, silently), the operator's `EPICS_CA_ADDR_LIST` appended
+    // after them, and a single `removeDuplicateAddresses(…, silent=0)` over the
+    // result. The port had the two halves the other way round, so an operator
+    // entry that names a broadcast address C would report as a duplicate would
+    // instead have silenced the auto entry.
     // C `ca/src/client/iocinf.cpp:186-193` uses substring
     // semantics: `yes = true; if (strstr(pstr,"no") || strstr(pstr,
     // "NO")) yes = false`. Any value not containing "no"/"NO" keeps
@@ -4846,11 +4823,36 @@ pub(crate) fn parse_addr_list_with_hostnames() -> CaResult<Vec<AddrEntry>> {
     let auto_addr = epics_base_rs::runtime::env::get_or("EPICS_CA_AUTO_ADDR_LIST", "YES");
     let auto_addr_enabled = !(auto_addr.contains("no") || auto_addr.contains("NO"));
     if auto_addr_enabled {
-        let server_port = default_port;
         let bcasts = crate::server::addr_list::discover_broadcast_addrs();
-        append_auto_addr_entries(&mut addrs, &bcasts, server_port);
+        append_auto_addr_entries(&mut addrs, &bcasts, default_port);
     }
-    Ok(addrs)
+
+    if let Some(list) = epics_base_rs::runtime::env::get("EPICS_CA_ADDR_LIST") {
+        // C `iocinf.cpp:225`. The tokenizer owns the bad-token diagnostic; the
+        // only thing left to do here is the Rust-only IP quarantine.
+        for tok in crate::iocinf::add_addr_to_channel_access_address_list(
+            &list,
+            "EPICS_CA_ADDR_LIST",
+            default_port,
+        ) {
+            if let SocketAddr::V4(v4) = tok.sock {
+                if ignore_ips.contains(v4.ip()) {
+                    tracing::debug!(
+                        target: "epics_ca_rs::client",
+                        ip = %v4.ip(),
+                        "EPICS_RS_CLIENT_IGNORE: dropping ADDR_LIST entry"
+                    );
+                    continue;
+                }
+            }
+            addrs.push(AddrEntry::new(tok.sock, tok.hostname, tok.port));
+        }
+    }
+
+    // C `iocinf.cpp:227`: `removeDuplicateAddresses ( pList, &tmpList, 0 )`.
+    // The port kept every duplicate token, so `EPICS_CA_ADDR_LIST="A A"` sent
+    // two copies of every search datagram to A for the life of the client.
+    Ok(crate::iocinf::remove_duplicate_addresses(addrs, |e| e.sock))
 }
 
 /// AUTO_ADDR_LIST=YES expansion: append broadcast NICs, then a C-parity
@@ -5338,45 +5340,23 @@ pub(crate) fn parse_nameserver_list() -> Vec<(SocketAddr, Option<String>)> {
     // deployments. The `host:port` branch already honours the
     // explicit port; only the bare-hostname default changes here.
     let default_server_port: u16 = epics_base_rs::runtime::net::ca_server_port();
-    let mut out = Vec::new();
-    for entry in list.split_whitespace() {
-        if entry.contains(':') {
-            // Try as raw `IP:port` first — if it parses, no hostname.
-            if let Ok(addr) = entry.parse::<SocketAddr>() {
-                out.push((addr, None));
-                continue;
-            }
-            // Otherwise treat it as `host:port` and remember the host.
-            let Some((host, port_str)) = entry.rsplit_once(':') else {
-                continue;
-            };
-            let Ok(port) = port_str.parse::<u16>() else {
-                continue;
-            };
-            if let Ok(addr) = resolve_host(host, port) {
-                let hostname = if host.parse::<std::net::IpAddr>().is_ok() {
-                    None
-                } else {
-                    Some(host.to_string())
-                };
-                out.push((addr, hostname));
-            }
-        } else {
-            // Bare hostname (no port) — treat as DNS name even if it
-            // happens to look like an IP literal (caller intent is
-            // unambiguous when no port is specified). default
-            // port from EPICS_CA_SERVER_PORT (matches libca).
-            if let Ok(addr) = resolve_host(entry, default_server_port) {
-                let hostname = if entry.parse::<std::net::IpAddr>().is_ok() {
-                    None
-                } else {
-                    Some(entry.to_string())
-                };
-                out.push((addr, hostname));
-            }
-        }
-    }
-    out
+    // C `cac.cpp:259` — the SAME tokenizer the client address list is built
+    // with, which is why a bad token here is reported in exactly the same two
+    // lines, naming this variable.
+    let out: Vec<(SocketAddr, Option<String>)> =
+        crate::iocinf::add_addr_to_channel_access_address_list(
+            &list,
+            "EPICS_CA_NAME_SERVERS",
+            default_server_port,
+        )
+        .into_iter()
+        .map(|tok| (tok.sock, tok.hostname))
+        .collect();
+    // C `cac.cpp:260`: `removeDuplicateAddresses ( &dest, &tmpList, 0 )` — the
+    // name-server list is deduped by the SAME helper as `EPICS_CA_ADDR_LIST`,
+    // and warns about what it drops for the same reason: a repeated entry
+    // otherwise buys a second TCP circuit to that name server.
+    crate::iocinf::remove_duplicate_addresses(out, |(addr, _)| *addr)
 }
 
 // Legacy `parse_addr_list() -> Vec<SocketAddr>`
@@ -6126,6 +6106,71 @@ mod disconnect_transition_tests {
         out
     }
 
+    /// R18-19: a circuit that dies with channels on it raises ECA_DISCONN on
+    /// the global exception hook — C `cac::destroyIIU` (`cac.cpp:1236-1240`),
+    /// gated on `iiu.channelCount()`. Pre-fix the circuit-gone path dispatched
+    /// no exception at all, so a handler installed the way C library users do
+    /// it (to log IOC loss) saw nothing. An empty circuit raises nothing, same
+    /// gate as C.
+    #[tokio::test(flavor = "current_thread")]
+    async fn r18_19_circuit_death_raises_eca_disconn() {
+        for (channels_on_circuit, want) in [(1usize, 1usize), (0, 0)] {
+            let mut channels = HashMap::new();
+            let mut server_channels: HashMap<types::CircuitKey, HashSet<u32>> = HashMap::new();
+            if channels_on_circuit > 0 {
+                let (ch, _rx) = connected_channel(42, 0);
+                channels.insert(42u32, ch);
+                server_channels.insert((addr(), 0), HashSet::from([42u32]));
+            }
+            let mut subscriptions = SubscriptionRegistry::new();
+            let (search_tx, _search_rx) = mpsc::unbounded_channel();
+            let diag = CaDiagnostics::default();
+            let in_flight = types::InFlightOps::new();
+            let snapshots: ChannelSnapshots = Arc::new(dashmap::DashMap::new());
+
+            let raised: Arc<parking_lot::Mutex<Vec<(u32, String, types::ExceptionSite)>>> =
+                Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let sink = raised.clone();
+            let slot: types::CaExceptionSlot = Arc::new(parking_lot::RwLock::new(Some(Arc::new(
+                move |exc: &types::CaException| {
+                    sink.lock()
+                        .push((exc.status.unwrap_or(0), exc.message.clone(), exc.source));
+                },
+            ))));
+
+            handle_disconnect(
+                &mut channels,
+                &mut subscriptions,
+                &mut server_channels,
+                &search_tx,
+                (addr(), 0),
+                &diag,
+                &in_flight,
+                &snapshots,
+                &slot,
+            );
+
+            let got = raised.lock().clone();
+            assert_eq!(
+                got.len(),
+                want,
+                "channels on circuit = {channels_on_circuit}: C gates the \
+                 genLocalExcep on `iiu.channelCount()`"
+            );
+            if let Some((status, ctx, source)) = got.first() {
+                assert_eq!(*status, crate::protocol::ECA_DISCONN);
+                // Context is the resolved peer name, not a port-invented
+                // sentence; `Source File:` is present because `genLocalExcep`
+                // always passes `__FILE__`/`__LINE__`.
+                assert!(
+                    !ctx.is_empty() && !ctx.contains("circuit"),
+                    "context: {ctx}"
+                );
+                assert_eq!(*source, types::LIBCA_CIRCUIT_DISCONNECT_SITE);
+            }
+        }
+    }
+
     /// TCP circuit close (C `tcpiiu::disconnectAllChannels`,
     /// `tcpiiu.cpp:1848-1855`): the channel must drop to no-rights and the
     /// subscriber must see `AccessRightsChanged { false, false }` after
@@ -6152,6 +6197,7 @@ mod disconnect_transition_tests {
             &diag,
             &in_flight,
             &snapshots,
+            &types::CaExceptionSlot::default(),
         );
 
         let ch = channels.get(&42).expect("channel stays registered");
@@ -6233,11 +6279,13 @@ mod disconnect_transition_tests {
         assert!(drain_events(&mut other_rx).is_empty());
     }
 
-    /// The echo-timeout path was already correct; it must stay correct now
-    /// that it shares the owner (terminal state `Unresponsive`, event
-    /// `Unresponsive`, same no-rights transition).
+    /// R18-18: the echo-timeout path keeps its own *internal* terminal state
+    /// (`Unresponsive` selects the re-subscribe-on-the-live-socket recovery),
+    /// but the application sees the ordinary `Disconnected`: C's
+    /// `nciu::unresponsiveCircuitNotify` (`nciu.cpp:170`) calls the same
+    /// `disconnectNotify()` — `CA_OP_CONN_DOWN` — as a socket close.
     #[tokio::test(flavor = "current_thread")]
-    async fn r8_17_unresponsive_keeps_its_own_state_and_event() {
+    async fn r18_18_unresponsive_is_a_disconnect_for_the_application() {
         let mut channels = HashMap::new();
         let (ch, mut conn_rx) = connected_channel(42, 0);
         channels.insert(42u32, ch);
@@ -6261,7 +6309,7 @@ mod disconnect_transition_tests {
         assert_eq!(
             drain_events(&mut conn_rx),
             vec![
-                ConnectionEvent::Unresponsive,
+                ConnectionEvent::Disconnected,
                 ConnectionEvent::AccessRightsChanged {
                     read: false,
                     write: false

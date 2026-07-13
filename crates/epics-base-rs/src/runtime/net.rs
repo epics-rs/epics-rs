@@ -97,15 +97,16 @@ pub fn ca_mcast_ttl() -> u32 {
     }
 }
 
-/// Returns the PVA broadcast port, allowing override via `EPICS_PVA_BROADCAST_PORT`.
-pub fn pva_broadcast_port() -> u16 {
-    env::env_inet_port("EPICS_PVA_BROADCAST_PORT", PVA_BROADCAST_PORT)
-}
-
-/// Returns the PVA server port, allowing override via `EPICS_PVA_SERVER_PORT`.
-pub fn pva_server_port() -> u16 {
-    env::env_inet_port("EPICS_PVA_SERVER_PORT", PVA_SERVER_PORT)
-}
+// There is deliberately NO `pva_server_port()` / `pva_broadcast_port()` here.
+//
+// A PVA port is pvxs's to define, and pvxs's rules are not C's: `PickOne` reads
+// `EPICS_PVAS_SERVER_PORT` before `EPICS_PVA_SERVER_PORT` (`config.cpp:402-408`)
+// and `EPICS_PVA_SERVER_PORT=0` is a legitimate ephemeral-bind request
+// (`config.cpp:624-632`), where `envGetInetPortConfigParam` — the function every
+// helper in THIS module implements — rejects anything at or below 5000 and
+// prints two CA diagnostics saying so. Helpers that looked like the CA ones and
+// silently applied the CA rule to a PVA variable are a trap for the next caller;
+// `epics_pva_rs::config::env` is the owner, and the only owner, of these two.
 
 /// Parse a `"host:port"` string into a `SocketAddr`.
 pub fn parse_socket_addr(s: &str) -> Result<SocketAddr, std::net::AddrParseError> {
@@ -130,20 +131,6 @@ mod tests {
     fn test_default_ca_repeater_port() {
         unsafe { std::env::remove_var("EPICS_CA_REPEATER_PORT") };
         assert_eq!(ca_repeater_port(), 5065);
-    }
-
-    #[test]
-    #[serial(epics_env)]
-    fn test_default_pva_broadcast_port() {
-        unsafe { std::env::remove_var("EPICS_PVA_BROADCAST_PORT") };
-        assert_eq!(pva_broadcast_port(), 5076);
-    }
-
-    #[test]
-    #[serial(epics_env)]
-    fn test_default_pva_server_port() {
-        unsafe { std::env::remove_var("EPICS_PVA_SERVER_PORT") };
-        assert_eq!(pva_server_port(), 5075);
     }
 
     #[test]

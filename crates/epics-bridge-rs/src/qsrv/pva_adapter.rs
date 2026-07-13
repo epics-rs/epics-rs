@@ -1310,10 +1310,12 @@ pub async fn run_ca_pva_qsrv_ioc(
 
     let db = config.db.clone();
     let ca_port = config.port;
-    let pva_port: u16 = std::env::var("EPICS_PVA_SERVER_PORT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(5075);
+    // pvxs owns the PVA port, and it is NOT the CA rule: `PickOne` reads the
+    // server-specific `EPICS_PVAS_SERVER_PORT` before the shared
+    // `EPICS_PVA_SERVER_PORT` (config.cpp:402-408), and `0` is a legitimate
+    // ephemeral-bind request rather than a value to reject. A strict `parse()`
+    // here honoured neither.
+    let pva_port: u16 = epics_pva_rs::config::env::pvas_server_port();
 
     // ── QSRV2 enable gate (pvxs enable2(), iochooks.cpp:401-496) ──
     // Honor PVXS_QSRV_ENABLE / EPICS_IOC_IGNORE_SERVERS=qsrv2 before

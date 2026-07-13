@@ -101,6 +101,30 @@ pub(crate) fn cached_name(addr: SocketAddr) -> String {
     if let Some(name) = cache().get(&addr) {
         return name.clone();
     }
+    schedule(addr);
+    addr.to_string()
+}
+
+/// Start resolving `addr` now, so a later [`cached_name`] has an answer.
+///
+/// C builds the circuit's `hostNameCache` in the `tcpiiu` constructor
+/// (`tcpiiu.cpp:600`), which hands the address to `ipAddrToAsciiEngine`
+/// straight away — so by the time anything asks for the name (an exception
+/// block, `ca_host_name`), the engine has long since answered. The port
+/// resolved lazily on first ASK instead, and the first ask is usually the
+/// exception block of a circuit that just died: it got the dotted IP, C got
+/// `localhost:5064`. Warming at connect closes that by construction.
+pub(crate) fn warm(addr: SocketAddr) {
+    if cache().contains_key(&addr) {
+        return;
+    }
+    schedule(addr);
+}
+
+/// Off-task reverse lookup, cached on completion. Outside a Tokio runtime
+/// there is nothing to schedule on, so the name stays unresolved — the same
+/// degradation libca shows before its engine has run.
+fn schedule(addr: SocketAddr) {
     if let Ok(rt) = tokio::runtime::Handle::try_current() {
         rt.spawn(async move {
             if let Ok(name) = tokio::task::spawn_blocking(move || ip_addr_to_a(addr)).await {
@@ -108,12 +132,35 @@ pub(crate) fn cached_name(addr: SocketAddr) -> String {
             }
         });
     }
-    addr.to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R18-20: warming at circuit-connect is what makes the *first* ask — the
+    /// exception block of a circuit that just died — see the resolved name.
+    /// Pre-fix, `cached_name` scheduled the lookup only when first asked, so
+    /// that first ask always answered with the dotted IP and the ECA_DISCONN /
+    /// ECA_UNRESPTMO blocks printed `Context: "127.0.0.1:5064"` where C prints
+    /// `Context: "localhost:5064"`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn warming_at_connect_makes_the_first_ask_see_the_name() {
+        // A port no other test warms, so this exercises a genuine cache miss.
+        let a: SocketAddr = "127.0.0.1:5199".parse().unwrap();
+        warm(a);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while cache().get(&a).is_none() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let got = cached_name(a);
+        assert_ne!(
+            got, "127.0.0.1:5199",
+            "a warmed address answers with the resolved name, as C's \
+             `hostNameCache` does by the time anything prints it"
+        );
+        assert!(got.ends_with(":5199"), "{got}");
+    }
 
     /// `127.0.0.1` reverse-resolves through `/etc/hosts` on every platform the
     /// CA tools run on, and C's `cainfo` prints `Host: localhost:5064` for a

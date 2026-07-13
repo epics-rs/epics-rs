@@ -77,9 +77,15 @@ pub(crate) struct ChannelInner {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionEvent {
     Connected,
+    /// The channel left the connected set. CA has exactly two connection
+    /// states on the application side: `nciu::unresponsiveCircuitNotify`
+    /// (`nciu.cpp:161-181`) — the echo-timeout path — calls the very same
+    /// `disconnectNotify()` (`CA_OP_CONN_DOWN`) as a socket close, so an
+    /// unresponsive circuit *is* a disconnect for every consumer. The
+    /// distinction survives only internally, in [`ChannelState`], because
+    /// it selects the recovery path (re-subscribe on the live socket vs.
+    /// re-search).
     Disconnected,
-    /// Echo timed out — server may be hung but TCP is still up
-    Unresponsive,
     AccessRightsChanged {
         read: bool,
         write: bool,

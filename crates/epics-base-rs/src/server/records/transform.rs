@@ -713,7 +713,15 @@ impl Record for TransformRecord {
                 // the `VAL` token (`FETCH_VAL`) pushes `*presult` — *this
                 // channel's* current value, not a record-wide previous VAL.
                 inputs.prev_val = self.vals[i];
-                match scalc_perform(compiled, &mut inputs, self.prec) {
+                let outcome = scalc_perform(compiled, &mut inputs, self.prec);
+                // C's store opcodes write through `&ptran->a`
+                // (`sCalcPerform.c:429-433`), so `CLCB="A:=A+1"` mutates the
+                // record's A — before channel C's expression fetches it, and
+                // whether or not this channel's perform then failed. The engine
+                // works on an owned copy, so the copy is landed back here, ahead
+                // of the `*presult` write below (C's epilogue is last).
+                self.vals[..NUM_CHANNELS].copy_from_slice(&inputs.num_vars[..NUM_CHANNELS]);
+                match outcome {
                     Ok(result) => {
                         // C's epilogue with `psresult == NULL`: `*presult` takes
                         // the double, coercing a string result through `atof`.

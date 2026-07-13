@@ -258,6 +258,25 @@ impl CalcRecord {
         ]
     }
 
+    /// Land the calc pass's variable stores back in A..U — the inverse of
+    /// [`Self::get_vars`], and the record's ONLY write-back of an engine var set.
+    ///
+    /// C needs no such step: `calcPerform(&prec->a, &prec->val, rpcl)` is handed
+    /// a pointer INTO the record, so its store opcode (`calcPerform.c:101-123`,
+    /// `parg[op - STORE_A] = *ptop--`) IS the field write. The engine here
+    /// evaluates an owned copy, so `CALC="A:=A+1;A"` incremented a temporary and
+    /// dropped it — VAL climbed while A stayed 0 forever.
+    ///
+    /// Applied on the failure path too: C's stores go into the record as the
+    /// expression runs, so the ones a later failing operator did not reach still
+    /// stand.
+    fn apply_stores(&mut self, vars: &[f64; 21]) {
+        [
+            self.a, self.b, self.c, self.d, self.e, self.f, self.g, self.h, self.i, self.j, self.k,
+            self.l, self.m, self.n, self.o, self.p, self.q, self.r, self.s, self.t, self.u,
+        ] = *vars;
+    }
+
     pub fn get_inp_link(&self, idx: usize) -> &str {
         match idx {
             0 => &self.inpa,
@@ -785,7 +804,13 @@ impl Record for CalcRecord {
         // `self.val` before it is overwritten below; otherwise
         // `CALC="VAL+1"` reads 0 every cycle instead of incrementing.
         inputs.prev_val = self.val;
-        match crate::calc::eval(&self.rpcl, &mut inputs) {
+        let outcome = crate::calc::eval(&self.rpcl, &mut inputs);
+        // The stores land BEFORE the result and before LA..LU advance: C writes
+        // them through `&prec->a` during the perform, so `monitor()` sees the
+        // stored A against the old LA and posts it, exactly as it does for an
+        // input that changed.
+        self.apply_stores(&inputs.vars);
+        match outcome {
             Ok(v) => self.val = v,
             Err(_) => self.calc_alarm = true,
         }

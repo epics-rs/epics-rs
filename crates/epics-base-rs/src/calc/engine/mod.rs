@@ -207,6 +207,29 @@ pub(crate) fn subrange_bounds(i: i64, j: i64, k: i64) -> (i64, i64) {
     (wrap(i).clamp(0, k), wrap(j).min(k))
 }
 
+/// `ABS_VAL` as the two synApps engines implement it — NOT `fabs`.
+///
+/// All four sCalc/aCalc sites are the same conditional negate:
+///
+/// ```c
+/// case ABS_VAL: if (*pd < 0) *pd *= -1; break;   /* sCalcPerform.c:513-515 */
+/// case ABS_VAL: toDouble(ps); if (ps->d < 0) ps->d *= -1; break;  /* :1046-1049 */
+/// case ABS_VAL: for (i=0;i<arraySize;i++) {if (ps->a[i] < 0) ps->a[i] *= -1;}
+///                                                /* aCalcPerform.c:771 (array) */
+/// case ABS_VAL: if (ps->d < 0) {ps->d *= -1;}    /* aCalcPerform.c:1040 (scalar) */
+/// ```
+///
+/// `-0.0 < 0` is FALSE, so a negative zero is left alone: compiled sCalc/aCalc
+/// answer `ABS(0*(0-1))` with `-0.0`. `fabs` would clear the sign bit.
+///
+/// Base's `calc` is the dialect that genuinely calls `fabs` (`calcPerform.c:174-176`)
+/// and must keep doing so — the two C dialects disagree here, and this helper
+/// exists so the disagreement is stated once instead of being re-decided at each
+/// operator site.
+pub(crate) fn abs_val(x: f64) -> f64 {
+    if x < 0.0 { -x } else { x }
+}
+
 /// Number of named scalar inputs accepted by the calc engine.
 /// Mirrors `CALCPERFORM_NARGS` in epics-base after PR #655 (12 → 21,
 /// fields A..U). Doubled-letter previous-value slots (LA..LU) and any

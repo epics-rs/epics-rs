@@ -390,9 +390,11 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                 CoreOp::CondEnd => {}
 
                 // Math functions
+                // C `sCalcPerform.c:513-515` / `:1046-1049` — a conditional
+                // negate, NOT `fabs`. See [`super::abs_val`].
                 CoreOp::Abs => {
                     let a = pop1_f64(&mut stack)?;
-                    stack.push(StackValue::Double(a.abs()));
+                    stack.push(StackValue::Double(super::abs_val(a)));
                 }
                 CoreOp::Sqrt => {
                     let a = pop1_f64(&mut stack)?;

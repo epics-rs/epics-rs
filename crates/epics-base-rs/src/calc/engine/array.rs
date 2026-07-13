@@ -359,7 +359,10 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                 CoreOp::CondEnd => {}
 
                 // Unary math functions (element-wise)
-                CoreOp::Abs => unary_op(&mut stack, |a| a.map(f64::abs))?,
+                // C `aCalcPerform.c:771` (array branch) / `:1040` (scalar) — a
+                // conditional negate, NOT `fabs`, and element-wise over the whole
+                // buffer. See [`super::abs_val`].
+                CoreOp::Abs => unary_op(&mut stack, |a| a.map(super::abs_val))?,
                 CoreOp::Sqrt => {
                     unary_op(&mut stack, |a| domain_guarded(a, f64::sqrt, &mut status))?
                 }

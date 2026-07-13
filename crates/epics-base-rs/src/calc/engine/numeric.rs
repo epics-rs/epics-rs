@@ -205,6 +205,12 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut NumericInputs) -> Result<f64, Calc
                 }
 
                 // Math functions (1 arg)
+                //
+                // BASE's ABS is `fabs` (`calcPerform.c:174-176`) and stays that
+                // way: `ABS(-0.0)` is `+0.0` here. The synApps engines use a
+                // conditional negate and answer `-0.0` — a real dialect
+                // difference, not an oversight to unify (see [`super::abs_val`],
+                // which they, and only they, call).
                 CoreOp::Abs => {
                     let a = pop1(&mut stack)?;
                     stack.push(a.abs());

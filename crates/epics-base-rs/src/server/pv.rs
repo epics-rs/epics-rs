@@ -5,7 +5,7 @@ use crate::runtime::sync::{Mutex, RwLock};
 
 use crate::error::CaError;
 use crate::server::event_queue::{EventReader, EventSink, EventUser, PostOutcome};
-use crate::server::snapshot::{ControlInfo, DisplayInfo, EnumInfo, Snapshot};
+use crate::server::snapshot::{ControlInfo, DisplayInfo, EnumInfo, PropertySupport, Snapshot};
 use crate::types::{DbFieldType, EpicsValue, WallTime};
 
 /// Per-PV subscriber cap. Default 1024 — comfortably above
@@ -402,6 +402,22 @@ impl ProcessVariable {
         if snap.enums.is_none() {
             snap.enums = meta.enums.clone();
         }
+        // A bare PV has no `rset`, so "which properties does this channel
+        // supply" is answered by what metadata it actually HAS: a proxy that
+        // shadowed an upstream IOC's display/control/enum info supplies those
+        // properties, a mailbox PV that nobody gave metadata to supplies none.
+        // Assigned here, in the one owner of a bare PV's metadata, so the mask
+        // and the values it describes cannot disagree.
+        // See [`crate::server::snapshot::PropertySupport`].
+        snap.properties = PropertySupport {
+            units: snap.display.is_some(),
+            precision: snap.display.is_some(),
+            graphic_double: snap.display.is_some(),
+            alarm_double: snap.display.is_some(),
+            control_double: snap.control.is_some(),
+            enum_strs: snap.enums.is_some(),
+        }
+        .narrowed_to_field(snap.value.db_field_type(), false);
     }
 
     /// Install an access hook. Replaces any previously

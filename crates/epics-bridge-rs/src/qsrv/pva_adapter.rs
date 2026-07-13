@@ -284,6 +284,7 @@ async fn read_marks(
                     &m.field_name,
                     m.mapping,
                     super::channel::channel_is_value_field(&m.channel),
+                    provider.channel_property_support(&m.channel).await,
                 ));
             }
             paths
@@ -294,6 +295,7 @@ async fn read_marks(
             "",
             super::FieldMapping::Scalar,
             super::channel::channel_is_value_field(name),
+            provider.channel_property_support(name).await,
         ),
     };
     let PvField::Structure(root) = value else {

@@ -786,6 +786,23 @@ impl BridgeProvider {
         !inst.common.disp
     }
 
+    /// Which NT property leaves the channel `name` (`REC`, `REC.FIELD`, or a
+    /// group member's channel) actually SUPPLIES — the record type's rset
+    /// slots narrowed to the addressed field, as `dbChannelGet` narrows
+    /// `getProperties`'s option mask (`dbAccess.c:336-430`).
+    ///
+    /// This is the same mask every [`Snapshot`](epics_base_rs::server::snapshot::Snapshot)
+    /// carries; it is exposed separately for the paths that must decide which
+    /// leaves they may MARK before (or without) reading a snapshot: a group's
+    /// per-member masks, resolved once at monitor start, and the GET/seed
+    /// mark set. A name that resolves to no record supplies nothing.
+    pub async fn channel_property_support(
+        &self,
+        name: &str,
+    ) -> epics_base_rs::server::snapshot::PropertySupport {
+        channel_property_support(&self.db, name).await
+    }
+
     /// Snapshot of cumulative QSRV throughput counters (channels
     /// created, GET / PUT / SUBSCRIBE issued). Mirrors pvxs's
     /// `qStats` aggregate output. Per-channel breakdown is not
@@ -1409,6 +1426,22 @@ impl BridgeProvider {
 
         Err(BridgeError::ChannelNotFound(name.to_string()))
     }
+}
+
+/// Which NT property leaves the channel `name` supplies — see
+/// [`BridgeProvider::channel_property_support`]. The free form is the one
+/// owner of the lookup; the group monitor holds a `PvDatabase` rather than a
+/// provider and resolves its members' masks through this.
+pub async fn channel_property_support(
+    db: &PvDatabase,
+    name: &str,
+) -> epics_base_rs::server::snapshot::PropertySupport {
+    let (record, field) = epics_base_rs::server::database::parse_pv_name(name);
+    let Some(rec_arc) = db.get_record(record).await else {
+        return epics_base_rs::server::snapshot::PropertySupport::NONE;
+    };
+    let inst = rec_arc.read().await;
+    inst.property_support_for_field(field)
 }
 
 #[cfg(test)]

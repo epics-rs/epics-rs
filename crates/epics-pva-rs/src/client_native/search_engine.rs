@@ -807,7 +807,13 @@ fn bind_beacon_udp_v6(port: u16) -> Option<Arc<UdpSocket>> {
     // a server v6 SEARCH listener on `[::]:port` and a client v6 beacon
     // listener can coexist. The server emits beacons FROM a separate
     // ephemeral socket, so this REUSEPORT-shared listener only receives.
-    #[cfg(not(windows))]
+    //
+    // SO_REUSEADDR on every platform, Windows included: pvxs puts its UDP
+    // sockets through `epicsSocketEnableAddressUseForDatagramFanout`
+    // (udp_collector.cpp:136), and that libcom helper has no `#ifdef
+    // _WIN32` — the Windows carve-out belongs to the TCP time-wait helper,
+    // not this one. Skipping it here would stop a second PVA process on a
+    // Windows host from co-binding the beacon port.
     if let Err(e) = sock.set_reuse_address(true) {
         debug!("v6 beacon socket: set_reuse_address failed: {e}");
     }

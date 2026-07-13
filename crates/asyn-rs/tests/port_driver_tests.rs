@@ -13,7 +13,7 @@ use asyn_rs::error::{AsynError, AsynResult, AsynStatus};
 use asyn_rs::interrupt::InterruptFilter;
 use asyn_rs::manager::PortManager;
 use asyn_rs::param::{EnumEntry, ParamType, ParamValue};
-use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
+use asyn_rs::port::{DrvUserRequest, PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::user::AsynUser;
 
 // ============================================================
@@ -298,7 +298,10 @@ fn setup_error() -> (PortManager, asyn_rs::port_handle::PortHandle) {
 #[tokio::test]
 async fn test_int32_write_and_read() {
     let (_mgr, h) = setup_scope();
-    let reason = h.drv_user_create("Run", 0).await.unwrap();
+    let reason = h
+        .drv_user_create(&DrvUserRequest::new("Run", 0))
+        .await
+        .unwrap();
     h.write_int32(reason, 0, 1).await.unwrap();
     let val = h.read_int32(reason, 0).await.unwrap();
     assert_eq!(val, 1);
@@ -307,7 +310,10 @@ async fn test_int32_write_and_read() {
 #[tokio::test]
 async fn test_float64_write_and_read() {
     let (_mgr, h) = setup_scope();
-    let reason = h.drv_user_create("NoiseAmplitude", 0).await.unwrap();
+    let reason = h
+        .drv_user_create(&DrvUserRequest::new("NoiseAmplitude", 0))
+        .await
+        .unwrap();
     h.write_float64(reason, 0, 0.25).await.unwrap();
     let val = h.read_float64(reason, 0).await.unwrap();
     assert!((val - 0.25).abs() < 1e-10);
@@ -316,8 +322,14 @@ async fn test_float64_write_and_read() {
 #[tokio::test]
 async fn test_float64_array_after_run() {
     let (_mgr, h) = setup_scope();
-    let run = h.drv_user_create("Run", 0).await.unwrap();
-    let wf = h.drv_user_create("Waveform", 0).await.unwrap();
+    let run = h
+        .drv_user_create(&DrvUserRequest::new("Run", 0))
+        .await
+        .unwrap();
+    let wf = h
+        .drv_user_create(&DrvUserRequest::new("Waveform", 0))
+        .await
+        .unwrap();
     h.write_int32(run, 0, 1).await.unwrap();
     let data = h.read_float64_array(wf, 0, 256).await.unwrap();
     assert_eq!(data.len(), 128, "Default MaxPoints=128");
@@ -332,10 +344,22 @@ async fn test_float64_array_after_run() {
 #[tokio::test]
 async fn test_computed_statistics() {
     let (_mgr, h) = setup_scope();
-    let run = h.drv_user_create("Run", 0).await.unwrap();
-    let min_r = h.drv_user_create("MinValue", 0).await.unwrap();
-    let max_r = h.drv_user_create("MaxValue", 0).await.unwrap();
-    let mean_r = h.drv_user_create("MeanValue", 0).await.unwrap();
+    let run = h
+        .drv_user_create(&DrvUserRequest::new("Run", 0))
+        .await
+        .unwrap();
+    let min_r = h
+        .drv_user_create(&DrvUserRequest::new("MinValue", 0))
+        .await
+        .unwrap();
+    let max_r = h
+        .drv_user_create(&DrvUserRequest::new("MaxValue", 0))
+        .await
+        .unwrap();
+    let mean_r = h
+        .drv_user_create(&DrvUserRequest::new("MeanValue", 0))
+        .await
+        .unwrap();
     h.write_int32(run, 0, 1).await.unwrap();
     let min_val = h.read_float64(min_r, 0).await.unwrap();
     let max_val = h.read_float64(max_r, 0).await.unwrap();
@@ -347,7 +371,10 @@ async fn test_computed_statistics() {
 #[tokio::test]
 async fn test_enum_read_write() {
     let (_mgr, h) = setup_scope();
-    let reason = h.drv_user_create("VoltsPerDivSelect", 0).await.unwrap();
+    let reason = h
+        .drv_user_create(&DrvUserRequest::new("VoltsPerDivSelect", 0))
+        .await
+        .unwrap();
     h.write_enum(reason, 0, 2).await.unwrap();
     let idx = h.read_enum(reason, 0).await.unwrap();
     assert_eq!(idx, 2);
@@ -356,9 +383,18 @@ async fn test_enum_read_write() {
 #[tokio::test]
 async fn test_max_points_controls_waveform_size() {
     let (_mgr, h) = setup_scope();
-    let mp = h.drv_user_create("MaxPoints", 0).await.unwrap();
-    let run = h.drv_user_create("Run", 0).await.unwrap();
-    let wf = h.drv_user_create("Waveform", 0).await.unwrap();
+    let mp = h
+        .drv_user_create(&DrvUserRequest::new("MaxPoints", 0))
+        .await
+        .unwrap();
+    let run = h
+        .drv_user_create(&DrvUserRequest::new("Run", 0))
+        .await
+        .unwrap();
+    let wf = h
+        .drv_user_create(&DrvUserRequest::new("Waveform", 0))
+        .await
+        .unwrap();
     h.write_int32(mp, 0, 64).await.unwrap();
     h.write_int32(run, 0, 1).await.unwrap();
     let data = h.read_float64_array(wf, 0, 256).await.unwrap();
@@ -372,7 +408,10 @@ async fn test_max_points_controls_waveform_size() {
 #[tokio::test]
 async fn test_octet_write_read() {
     let (_mgr, h) = setup_echo();
-    let reason = h.drv_user_create("MSG", 0).await.unwrap();
+    let reason = h
+        .drv_user_create(&DrvUserRequest::new("MSG", 0))
+        .await
+        .unwrap();
     h.write_octet(reason, 0, b"Hello, EPICS!".to_vec())
         .await
         .unwrap();
@@ -383,7 +422,10 @@ async fn test_octet_write_read() {
 #[tokio::test]
 async fn test_octet_overwrite() {
     let (_mgr, h) = setup_echo();
-    let reason = h.drv_user_create("MSG", 0).await.unwrap();
+    let reason = h
+        .drv_user_create(&DrvUserRequest::new("MSG", 0))
+        .await
+        .unwrap();
     h.write_octet(reason, 0, b"first".to_vec()).await.unwrap();
     h.write_octet(reason, 0, b"second".to_vec()).await.unwrap();
     let data = h.read_octet(reason, 0, 64).await.unwrap();
@@ -397,7 +439,10 @@ async fn test_octet_overwrite() {
 #[tokio::test]
 async fn test_error_normal_read() {
     let (_mgr, h) = setup_error();
-    let val_r = h.drv_user_create("VAL", 0).await.unwrap();
+    let val_r = h
+        .drv_user_create(&DrvUserRequest::new("VAL", 0))
+        .await
+        .unwrap();
     h.write_int32(val_r, 0, 42).await.unwrap();
     let val = h.read_int32(val_r, 0).await.unwrap();
     assert_eq!(val, 42);
@@ -406,8 +451,14 @@ async fn test_error_normal_read() {
 #[tokio::test]
 async fn test_error_read_failure() {
     let (_mgr, h) = setup_error();
-    let val_r = h.drv_user_create("VAL", 0).await.unwrap();
-    let sts_r = h.drv_user_create("STATUS", 0).await.unwrap();
+    let val_r = h
+        .drv_user_create(&DrvUserRequest::new("VAL", 0))
+        .await
+        .unwrap();
+    let sts_r = h
+        .drv_user_create(&DrvUserRequest::new("STATUS", 0))
+        .await
+        .unwrap();
     h.write_int32(sts_r, 0, 1).await.unwrap();
     let result = h.read_int32(val_r, 0).await;
     assert!(result.is_err(), "Read should fail when STATUS=1");
@@ -416,8 +467,14 @@ async fn test_error_read_failure() {
 #[tokio::test]
 async fn test_error_recovery() {
     let (_mgr, h) = setup_error();
-    let val_r = h.drv_user_create("VAL", 0).await.unwrap();
-    let sts_r = h.drv_user_create("STATUS", 0).await.unwrap();
+    let val_r = h
+        .drv_user_create(&DrvUserRequest::new("VAL", 0))
+        .await
+        .unwrap();
+    let sts_r = h
+        .drv_user_create(&DrvUserRequest::new("STATUS", 0))
+        .await
+        .unwrap();
     h.write_int32(val_r, 0, 99).await.unwrap();
     h.write_int32(sts_r, 0, 1).await.unwrap();
     assert!(h.read_int32(val_r, 0).await.is_err());
@@ -433,7 +490,10 @@ async fn test_error_recovery() {
 #[tokio::test]
 async fn test_interrupt_on_param_change() {
     let (_mgr, h) = setup_scope();
-    let reason = h.drv_user_create("NoiseAmplitude", 0).await.unwrap();
+    let reason = h
+        .drv_user_create(&DrvUserRequest::new("NoiseAmplitude", 0))
+        .await
+        .unwrap();
     let (_sub, mut rx) = h.interrupts().register_interrupt_user(InterruptFilter {
         reason: Some(reason),
         addr: Some(0),
@@ -454,8 +514,14 @@ async fn test_interrupt_on_param_change() {
 #[tokio::test]
 async fn test_interrupt_filter_excludes_other_params() {
     let (_mgr, h) = setup_scope();
-    let noise_r = h.drv_user_create("NoiseAmplitude", 0).await.unwrap();
-    let update_r = h.drv_user_create("UpdateTime", 0).await.unwrap();
+    let noise_r = h
+        .drv_user_create(&DrvUserRequest::new("NoiseAmplitude", 0))
+        .await
+        .unwrap();
+    let update_r = h
+        .drv_user_create(&DrvUserRequest::new("UpdateTime", 0))
+        .await
+        .unwrap();
 
     // Flush initial changed state from constructor
     h.write_float64(noise_r, 0, 0.1).await.unwrap();
@@ -482,7 +548,10 @@ async fn test_interrupt_filter_excludes_other_params() {
 #[tokio::test]
 async fn test_multiple_interrupt_subscribers() {
     let (_mgr, h) = setup_scope();
-    let reason = h.drv_user_create("Run", 0).await.unwrap();
+    let reason = h
+        .drv_user_create(&DrvUserRequest::new("Run", 0))
+        .await
+        .unwrap();
     let (_sub1, mut rx1) = h.interrupts().register_interrupt_user(InterruptFilter {
         reason: Some(reason),
         addr: Some(0),
@@ -513,14 +582,19 @@ async fn test_multiple_interrupt_subscribers() {
 #[tokio::test]
 async fn test_drv_user_known_param() {
     let (_mgr, h) = setup_scope();
-    let reason = h.drv_user_create("Run", 0).await.unwrap();
+    let reason = h
+        .drv_user_create(&DrvUserRequest::new("Run", 0))
+        .await
+        .unwrap();
     assert_eq!(reason, 0);
 }
 
 #[tokio::test]
 async fn test_drv_user_unknown_param() {
     let (_mgr, h) = setup_scope();
-    let result = h.drv_user_create("NonExistent", 0).await;
+    let result = h
+        .drv_user_create(&DrvUserRequest::new("NonExistent", 0))
+        .await;
     assert!(result.is_err());
 }
 
@@ -532,7 +606,10 @@ async fn test_drv_user_unknown_param() {
 fn test_blocking_int32_roundtrip() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let (_mgr, h) = rt.block_on(async { setup_scope() });
-    let reason = h.drv_user_create_blocking("Run", 0).unwrap().reason;
+    let reason = h
+        .drv_user_create_blocking(&DrvUserRequest::new("Run", 0))
+        .unwrap()
+        .reason;
     h.write_int32_blocking(reason, 0, 1).unwrap();
     let val = h.read_int32_blocking(reason, 0).unwrap();
     assert_eq!(val, 1);
@@ -543,7 +620,7 @@ fn test_blocking_float64_roundtrip() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let (_mgr, h) = rt.block_on(async { setup_scope() });
     let reason = h
-        .drv_user_create_blocking("NoiseAmplitude", 0)
+        .drv_user_create_blocking(&DrvUserRequest::new("NoiseAmplitude", 0))
         .unwrap()
         .reason;
     h.write_float64_blocking(reason, 0, 3.15).unwrap();
@@ -558,7 +635,10 @@ fn test_blocking_float64_roundtrip() {
 #[tokio::test]
 async fn test_port_connected_by_default() {
     let (_mgr, h) = setup_scope();
-    let reason = h.drv_user_create("Run", 0).await.unwrap();
+    let reason = h
+        .drv_user_create(&DrvUserRequest::new("Run", 0))
+        .await
+        .unwrap();
     assert!(h.read_int32(reason, 0).await.is_ok());
 }
 
@@ -570,7 +650,10 @@ async fn test_port_connected_by_default() {
 async fn test_callback_flushes_multiple_changes() {
     let (_mgr, h) = setup_scope();
     let mut broadcast_rx = h.interrupts().subscribe_async();
-    let run = h.drv_user_create("Run", 0).await.unwrap();
+    let run = h
+        .drv_user_create(&DrvUserRequest::new("Run", 0))
+        .await
+        .unwrap();
     h.write_int32(run, 0, 1).await.unwrap();
 
     let mut received_reasons = std::collections::HashSet::new();

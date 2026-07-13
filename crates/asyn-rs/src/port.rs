@@ -1278,6 +1278,60 @@ impl DrvUserInfo {
     }
 }
 
+/// Everything a binding tells the driver when it resolves a drvInfo string —
+/// the asyn-rs analogue of the `pasynUser` C `drvUserCreate` receives.
+///
+/// This is one carrier rather than a widening argument list because the bind
+/// request has already grown once (`addr`, for C `checkOffset`) and is now
+/// growing again (`iface`): a driver that resolves a drvInfo needs to know
+/// *how the record will use the parameter*, not just its name. The struct is
+/// `#[non_exhaustive]` so the next field is additive — build it with
+/// [`DrvUserRequest::new`] and the builder methods.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DrvUserRequest {
+    /// The record's driver-info string (C `pasynUser->drvUser` input).
+    pub drv_info: String,
+    /// The record's asyn `addr`, so a multi-device driver can reject an
+    /// out-of-range address at bind time (C `drvUserCreate` `checkOffset`,
+    /// drvModbusAsyn.cpp:378-384).
+    pub addr: i32,
+    /// The asyn interface the record will actually read and write this
+    /// parameter through, derived from its DTYP (`asynFloat64` → [`InterfaceType::Float64`]).
+    ///
+    /// An on-demand driver (C Autoparam lazy creation) must create the
+    /// parameter with the type the record will read it as, or every value the
+    /// record takes from it is a coerced type mismatch: C
+    /// `adsAsynPortDriver::getRecordInfoFromDrvInfo` derives the parameter's
+    /// asyn type from the bound record's DTYP for exactly this reason — the
+    /// same PLC symbol may bind as `asynInt32` from one record and
+    /// `asynFloat64` from another.
+    ///
+    /// `None` when the bind has no record behind it (a port-level
+    /// [`crate::sync_io`] resolve, a driver-to-driver handle call): the driver
+    /// then has no record type to honour and falls back to its own default.
+    pub iface: Option<InterfaceType>,
+}
+
+impl DrvUserRequest {
+    /// A bind request for `drv_info` at `addr` with no record interface — the
+    /// port-level resolve.
+    pub fn new(drv_info: impl Into<String>, addr: i32) -> Self {
+        Self {
+            drv_info: drv_info.into(),
+            addr,
+            iface: None,
+        }
+    }
+
+    /// Attach the bound record's asyn interface. Accepts an
+    /// [`InterfaceType`] or an `Option<InterfaceType>`.
+    pub fn with_iface(mut self, iface: impl Into<Option<InterfaceType>>) -> Self {
+        self.iface = iface.into();
+        self
+    }
+}
+
 /// Port driver trait. All methods have default implementations that operate
 /// on the parameter cache (no actual I/O).
 ///
@@ -1944,22 +1998,28 @@ pub trait PortDriver: Send + Sync + 'static {
 
     // --- drvUser ---
 
-    /// Resolve a record's driver-info string (and its asyn `addr`) to a
-    /// [`DrvUserInfo`] at bind time — the asyn-rs analogue of C `drvUserCreate`.
+    /// Resolve a record's bind request ([`DrvUserRequest`]: drvInfo string, asyn
+    /// `addr`, and the record's asyn interface) to a [`DrvUserInfo`] — the
+    /// asyn-rs analogue of C `drvUserCreate`.
     ///
     /// Takes `&mut self` so a driver can register a parameter on demand from the
     /// resolved drvInfo (C Autoparam lazy creation) rather than requiring it be
-    /// declared up front, and `addr` so a multi-device driver can reject an
+    /// declared up front. Such a driver must create the parameter with the type
+    /// the record will read it as — [`DrvUserRequest::iface`] — the way C
+    /// `adsAsynPortDriver::getRecordInfoFromDrvInfo` derives the parameter's
+    /// asyn type from the bound record's DTYP.
+    ///
+    /// [`DrvUserRequest::addr`] lets a multi-device driver reject an
     /// out-of-range address at bind time (C `drvUserCreate` runs `checkOffset`,
     /// drvModbusAsyn.cpp:378-384) instead of alarming on every I/O.
     ///
-    /// Default: look up the shared reason by parameter name; ignore `addr`.
-    fn drv_user_create(&mut self, drv_info: &str, _addr: i32) -> AsynResult<DrvUserInfo> {
+    /// Default: look up the shared reason by parameter name; ignore the rest.
+    fn drv_user_create(&mut self, req: &DrvUserRequest) -> AsynResult<DrvUserInfo> {
         let reason = self
             .base()
             .params
-            .find_param(drv_info)
-            .ok_or_else(|| AsynError::ParamNotFound(drv_info.to_string()))?;
+            .find_param(&req.drv_info)
+            .ok_or_else(|| AsynError::ParamNotFound(req.drv_info.clone()))?;
         Ok(DrvUserInfo::from_reason(reason))
     }
 
@@ -2060,9 +2120,22 @@ mod tests {
     #[test]
     fn test_drv_user_create() {
         let mut drv = TestDriver::new();
-        assert_eq!(drv.drv_user_create("VAL", 0).unwrap().reason, 0);
-        assert_eq!(drv.drv_user_create("TEMP", 0).unwrap().reason, 1);
-        assert!(drv.drv_user_create("NOPE", 0).is_err());
+        assert_eq!(
+            drv.drv_user_create(&DrvUserRequest::new("VAL", 0))
+                .unwrap()
+                .reason,
+            0
+        );
+        assert_eq!(
+            drv.drv_user_create(&DrvUserRequest::new("TEMP", 0))
+                .unwrap()
+                .reason,
+            1
+        );
+        assert!(
+            drv.drv_user_create(&DrvUserRequest::new("NOPE", 0))
+                .is_err()
+        );
     }
 
     #[test]

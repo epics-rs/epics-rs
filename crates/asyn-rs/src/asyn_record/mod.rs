@@ -74,6 +74,18 @@ impl InterfaceType {
         }
     }
 
+    /// The asyn interface this IFACE selection performs I/O through — what the
+    /// driver must create the parameter as when it resolves this record's
+    /// drvInfo on demand.
+    fn as_asyn_iface(self) -> crate::interfaces::InterfaceType {
+        match self {
+            Self::Octet => crate::interfaces::InterfaceType::Octet,
+            Self::Int32 => crate::interfaces::InterfaceType::Int32,
+            Self::UInt32Digital => crate::interfaces::InterfaceType::UInt32Digital,
+            Self::Float64 => crate::interfaces::InterfaceType::Float64,
+        }
+    }
+
     /// The interface's name as C splices it into the register-handler ERRS
     /// diagnostics — `"Int32 write error, %s"` (asynRecord.c:1378) and its five
     /// siblings at :1391/:1414/:1429/:1450/:1463. C writes `UInt32`, not
@@ -3145,10 +3157,12 @@ impl AsynRecord {
                 {
                     // Resolve drvinfo → reason if specified (asynRecord.c:1248-1257).
                     if !self.drvinfo.is_empty() {
-                        match entry
-                            .handle
-                            .drv_user_create_blocking(&self.drvinfo, self.addr)
-                        {
+                        // Forward the interface this record performs I/O through
+                        // (its IFACE field) so an on-demand driver creates the
+                        // parameter with the type this record will read it as.
+                        let req = crate::port::DrvUserRequest::new(&self.drvinfo, self.addr)
+                            .with_iface(InterfaceType::from_u16(self.iface as u16).as_asyn_iface());
+                        match entry.handle.drv_user_create_blocking(&req) {
                             Ok(info) => {
                                 self.resolved_reason = info.reason;
                                 self.reason = info.reason as i32;

@@ -1484,8 +1484,8 @@ impl PortActor {
                 }
                 Ok(RequestResult::write_ok())
             }
-            RequestOp::DrvUserCreate { drv_info, addr } => {
-                let info = self.driver.drv_user_create(drv_info, *addr)?;
+            RequestOp::DrvUserCreate(req) => {
+                let info = self.driver.drv_user_create(req)?;
                 Ok(RequestResult::drv_user_create(
                     info.reason,
                     info.max_octet_len,
@@ -3495,10 +3495,7 @@ mod tests {
             let user = AsynUser::default().with_addr(0);
             let r = send_and_wait(
                 &tx,
-                RequestOp::DrvUserCreate {
-                    drv_info: "F64".into(),
-                    addr: 0,
-                },
+                RequestOp::DrvUserCreate(crate::port::DrvUserRequest::new("F64", 0)),
                 user,
             )
             .unwrap_or_else(|e| {

@@ -117,6 +117,12 @@ pub enum PortCommand {
         drv_info: String,
         /// The record's asyn `addr` (C `drvUserCreate` `checkOffset` input).
         addr: i32,
+        /// The bound record's asyn interface name (`"asynFloat64"`, …), so a
+        /// remote on-demand driver can create the parameter with the type the
+        /// record will read it as. `None` for a port-level resolve with no
+        /// record behind it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        iface: Option<String>,
     },
     CallParamCallbacks {
         addr: i32,
@@ -233,6 +239,7 @@ mod tests {
             PortCommand::DrvUserCreate {
                 drv_info: "MOTOR_STATUS".into(),
                 addr: 0,
+                iface: Some("asynFloat64".into()),
             },
             PortCommand::CallParamCallbacks { addr: 0 },
             PortCommand::GetOption { key: "baud".into() },

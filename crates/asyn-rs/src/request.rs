@@ -150,13 +150,11 @@ pub enum RequestOp {
     BlockProcess,
     /// Unblock the port.
     UnblockProcess,
-    /// Resolve a driver info string to a parameter reason index.
-    DrvUserCreate {
-        drv_info: String,
-        /// The record's asyn `addr`, so a multi-device driver can reject an
-        /// out-of-range address at bind time (C `drvUserCreate` `checkOffset`).
-        addr: i32,
-    },
+    /// Resolve a record's bind request to a parameter reason index. Carries the
+    /// full [`DrvUserRequest`] — drvInfo, asyn `addr`, and the record's asyn
+    /// interface — so an on-demand driver can create the parameter with the type
+    /// the record will read it as.
+    DrvUserCreate(crate::port::DrvUserRequest),
     /// Read an enum value (index + string choices).
     EnumRead,
     /// Write an enum index.

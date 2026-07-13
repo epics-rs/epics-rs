@@ -56,6 +56,14 @@ pub fn bind_loopback_mcast(port: u16) -> io::Result<UdpSocket> {
     // server and client on the same host can both join the group.
     // Windows: skip — its REUSEADDR has socket-hijack semantics and
     // bind() releases on close anyway. (libcom commit 19146a5.)
+    //
+    // Set unconditionally here, including for an ephemeral port —
+    // unlike the unicast sockets in `async_udp_v4`. Co-binding *is* the
+    // purpose of this helper (one listener takes an ephemeral port and
+    // publishes it, the others join that same port), and multicast group
+    // traffic is delivered to every joined socket rather than
+    // load-balanced across the reuse group, so sharing costs nothing
+    // here.
     #[cfg(not(windows))]
     sock.set_reuse_address(true)?;
     #[cfg(unix)]

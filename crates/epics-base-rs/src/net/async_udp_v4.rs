@@ -1238,10 +1238,21 @@ fn bind_one_at(
     // releases ports immediately on close anyway, so the flag is
     // skipped on Windows. The Windows-idiomatic alternative is
     // SO_EXCLUSIVEADDRUSE, but plain bind() already prevents reuse.
+    //
+    // Only for a *well-known* port — the co-bind case the flags exist
+    // for. A client socket asking for an ephemeral port (0) has nothing
+    // to share, and the flags then do harm: Linux may satisfy bind(0)
+    // with a port already held by a reuse-compatible socket, joining its
+    // SO_REUSEPORT group, after which the kernel load-balances arriving
+    // datagrams across the group — this socket's search replies can be
+    // delivered to the unrelated socket and dropped. With the flags off,
+    // bind(0) yields a port this socket exclusively owns.
     #[cfg(not(windows))]
-    sock.set_reuse_address(true)?;
-    #[cfg(unix)]
-    sock.set_reuse_port(true)?;
+    if port != 0 {
+        sock.set_reuse_address(true)?;
+        #[cfg(unix)]
+        sock.set_reuse_port(true)?;
+    }
     if broadcast {
         sock.set_broadcast(true)?;
     }

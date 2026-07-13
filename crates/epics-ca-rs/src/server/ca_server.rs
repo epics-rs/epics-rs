@@ -266,6 +266,13 @@ impl CaServerBuilder {
     }
 
     /// Build the server.
+    ///
+    /// The TCP listeners and UDP search-responder sockets are bound
+    /// here, so a returned `CaServer` is already listening: a client
+    /// may connect (or SEARCH) the instant `build()` returns, before
+    /// [`CaServer::run`] has been spawned or polled. Callers therefore
+    /// never need to sleep for a startup window — see
+    /// [`CaServer::tcp_port`] for the port actually bound.
     pub async fn build(self) -> CaResult<CaServer> {
         let (db, autosave_config) = self.ioc.build().await?;
         let acf = Arc::new(tokio::sync::RwLock::new(self.acf));
@@ -286,10 +293,13 @@ impl CaServerBuilder {
         // `EPICS_CAS_SERVER_PORT > EPICS_CA_SERVER_PORT` precedence
         // via cas_server_port() at builder construction.
         let tcp_port = self.tcp_port.unwrap_or(self.port);
+        let (tcp, udp) = bind_sockets(self.port, tcp_port).await?;
         Ok(CaServer {
             db,
-            port: self.port,
-            tcp_port,
+            port: udp.port(),
+            tcp_port: tcp.port(),
+            tcp,
+            udp,
             stats: Arc::new(ServerStats::default()),
             acf,
             acf_source_path: std::sync::Mutex::new(self.acf_path),
@@ -448,15 +458,44 @@ impl AccessRightsNotifier {
     }
 }
 
+/// Bind every socket the server serves on: the TCP listeners and the
+/// UDP search responders.
+///
+/// The single place a `CaServer`'s sockets come into existence — both
+/// construction paths ([`CaServerBuilder::build`] and
+/// [`CaServer::from_parts`]) go through it, so "a `CaServer` exists"
+/// implies "its ports are bound and listening". Binding is what makes
+/// a client's `connect()` / SEARCH succeed; `run()` only services what
+/// the kernel has already accepted or queued. There is consequently no
+/// window between construction and `run()` in which a client is
+/// refused, and no readiness sleep for a caller to guess at.
+async fn bind_sockets(
+    udp_port: u16,
+    tcp_port: u16,
+) -> CaResult<(crate::server::tcp::BoundTcp, crate::server::udp::BoundUdp)> {
+    let tcp = crate::server::tcp::bind_tcp_listeners(tcp_port).await?;
+    let cfg = addr_list::from_env()?;
+    let udp = crate::server::udp::bind_udp_responders(udp_port, cfg.intf_addrs, &cfg.mcast_addrs)?;
+    Ok((tcp, udp))
+}
+
 pub struct CaServer {
     db: Arc<PvDatabase>,
-    /// UDP discovery port. Bound by the search responder.
+    /// UDP discovery port actually bound by the search responders in
+    /// `udp` — the port clients SEARCH on. Equal to the configured port,
+    /// or the kernel-assigned one when 0 was requested.
     port: u16,
-    /// TCP listen port. Equal to `port` unless explicitly split via
-    /// [`CaServerBuilder::tcp_port`] or `EPICS_CAS_SERVER_PORT`
-    /// (epics-base PR #69). The UDP responder advertises this port in
-    /// SEARCH_REPLY frames so clients connect to the right listener.
+    /// TCP port actually bound by the listeners in `tcp` — the value
+    /// SEARCH replies and beacons advertise. Equal to the configured
+    /// port unless it was split via [`CaServerBuilder::tcp_port`] /
+    /// `EPICS_CAS_SERVER_PORT` (epics-base PR #69), or the configured
+    /// port was in use and the ephemeral fallback fired.
     tcp_port: u16,
+    /// TCP listeners, bound at construction. See [`tcp::BoundTcp`].
+    tcp: crate::server::tcp::BoundTcp,
+    /// UDP search responders, bound at construction. See
+    /// [`udp::BoundUdp`].
+    udp: crate::server::udp::BoundUdp,
     /// Shared stats counter — incremented by a task spawned in
     /// `start()` that subscribes to `conn_events`. Surfaced via
     /// [`Self::stats`] and the `casr` iocsh command.
@@ -564,14 +603,19 @@ impl CaServer {
     /// device support wiring. `tcp_port` carries the optional split-port
     /// TCP override (`EPICS_CAS_SERVER_PORT`); pass `None` to share the
     /// UDP discovery port with the TCP listener.
-    pub fn from_parts(
+    ///
+    /// Binds the TCP and UDP sockets, exactly as
+    /// [`CaServerBuilder::build`] does — the returned server is already
+    /// listening, and a bind failure is reported here rather than from
+    /// inside a spawned [`Self::run`] task.
+    pub async fn from_parts(
         db: Arc<PvDatabase>,
         port: u16,
         tcp_port: Option<u16>,
         acf: Option<access_security::AccessSecurityConfig>,
         autosave_config: Option<autosave::SaveSetConfig>,
         autosave_manager: Option<Arc<autosave::AutosaveManager>>,
-    ) -> Self {
+    ) -> CaResult<Self> {
         let stats = Arc::new(ServerStats::default());
         // Always-on connection broadcast so the stats counter task in
         // `run()` (and any external `connection_events()` subscriber)
@@ -580,10 +624,13 @@ impl CaServer {
         let (conn_tx, _) = tokio::sync::broadcast::channel(64);
         let (acf_reload_tx, _) = tokio::sync::broadcast::channel(16);
         let tcp_port = tcp_port.unwrap_or(port);
-        Self {
+        let (tcp, udp) = bind_sockets(port, tcp_port).await?;
+        Ok(Self {
             db,
-            port,
-            tcp_port,
+            port: udp.port(),
+            tcp_port: tcp.port(),
+            tcp,
+            udp,
             stats,
             acf: Arc::new(tokio::sync::RwLock::new(acf)),
             acf_source_path: std::sync::Mutex::new(None),
@@ -606,7 +653,22 @@ impl CaServer {
             #[cfg(feature = "cap-tokens")]
             cap_token_verifier: None,
             beacon_reset: Arc::new(tokio::sync::Notify::new()),
-        }
+        })
+    }
+
+    /// The TCP port the server is listening on.
+    ///
+    /// Known from construction (the listener is already bound), so a
+    /// caller that passed port 0 — or whose configured port was taken
+    /// and hit the ephemeral fallback — can read the real port without
+    /// waiting for [`Self::run`].
+    pub fn tcp_port(&self) -> u16 {
+        self.tcp_port
+    }
+
+    /// The UDP port the search responders are bound to.
+    pub fn udp_port(&self) -> u16 {
+        self.port
     }
 
     /// Re-read the ACF file the server was originally configured with
@@ -954,9 +1016,13 @@ impl CaServer {
         let db_scan = self.db.clone();
         let acf = self.acf.clone();
         let port = self.port;
-        // TCP listen port — equal to `port` unless split via
-        // EPICS_CAS_SERVER_PORT / `.tcp_port()` (epics-base PR #69).
-        let tcp_listen_port = self.tcp_port;
+        // Sockets were bound at construction (`bind_sockets`), so the
+        // TCP port is already final — no start-up handshake back from
+        // the listener task, and nothing downstream (beacon, SEARCH
+        // replies, mDNS, introspection) has to wait to learn it.
+        let tcp_port = self.tcp_port;
+        let bound_tcp = self.tcp.clone();
+        let bound_udp = self.udp.clone();
 
         let scanner = ScanScheduler::new(db_scan);
 
@@ -982,7 +1048,6 @@ impl CaServer {
             None
         };
 
-        let (tcp_tx, tcp_rx) = tokio::sync::oneshot::channel();
         // Use the externally-pulse-able handle held on the struct.
         // Bridge ca_gateway captures `beacon_anomaly_handle()` BEFORE
         // calling run() (which consumes self) and pulses it on
@@ -1037,10 +1102,9 @@ impl CaServer {
             {
                 tcp::run_tcp_listener(
                     db_tcp,
-                    tcp_listen_port,
+                    bound_tcp,
                     acf,
                     acf_reload_tx,
-                    tcp_tx,
                     beacon_reset_tcp,
                     conn_events,
                     audit_for_tcp,
@@ -1056,10 +1120,9 @@ impl CaServer {
             {
                 tcp::run_tcp_listener(
                     db_tcp,
-                    tcp_listen_port,
+                    bound_tcp,
                     acf,
                     acf_reload_tx,
-                    tcp_tx,
                     beacon_reset_tcp,
                     conn_events,
                     audit_for_tcp,
@@ -1149,13 +1212,6 @@ impl CaServer {
         #[cfg(not(unix))]
         let signal_handle: Option<tokio::task::JoinHandle<()>> = None;
         let tcp_abort = tcp_handle.abort_handle();
-
-        let tcp_port = tcp_rx.await.map_err(|_| {
-            CaError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "TCP listener failed to start",
-            ))
-        })?;
 
         let udp_cfg = addr_list::from_env()?;
         eprintln!(
@@ -1313,19 +1369,9 @@ impl CaServer {
         // Spawn UDP responder as its own task so its waker isn't multiplexed
         // through a select! branch (which can drop/replace wakers between polls
         // and miss edge-triggered epoll events).
-        let intf_addrs = udp_cfg.intf_addrs.clone();
         let ignore_addrs = udp_cfg.ignore_addrs.clone();
-        let mcast_addrs = udp_cfg.mcast_addrs.clone();
         let udp_handle = epics_base_rs::runtime::task::spawn(async move {
-            udp::run_udp_search_responder(
-                db_udp,
-                port,
-                tcp_port,
-                intf_addrs,
-                ignore_addrs,
-                mcast_addrs,
-            )
-            .await
+            udp::run_udp_search_responder(db_udp, bound_udp, tcp_port, ignore_addrs).await
         });
         let udp_abort = udp_handle.abort_handle();
 
@@ -1466,9 +1512,11 @@ fn drain_grace_from_env() -> u64 {
 mod access_notifier_tests {
     use super::*;
 
-    fn empty_server() -> CaServer {
+    async fn empty_server() -> CaServer {
         let db = Arc::new(PvDatabase::new());
         CaServer::from_parts(db, 0, None, None, None, None)
+            .await
+            .expect("bind ephemeral server")
     }
 
     // The detachable handle must keep firing after the CaServer value is
@@ -1476,7 +1524,7 @@ mod access_notifier_tests {
     // it long after `run()` has consumed the server.
     #[tokio::test]
     async fn access_rights_notifier_fires_after_server_dropped() {
-        let server = empty_server();
+        let server = empty_server().await;
         let mut rx = server.acf_reload_tx.subscribe();
         let notifier = server.access_rights_notifier();
         drop(server);
@@ -1491,7 +1539,7 @@ mod access_notifier_tests {
     // broadcast, so both re-push CA_PROTO_ACCESS_RIGHTS identically.
     #[tokio::test]
     async fn notify_access_change_and_handle_share_one_channel() {
-        let server = empty_server();
+        let server = empty_server().await;
         let mut rx = server.acf_reload_tx.subscribe();
         server.notify_access_change();
         assert!(rx.try_recv().is_ok(), "notify_access_change must send");

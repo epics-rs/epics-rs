@@ -33,6 +33,7 @@ record(calc, "TEST:TCNT") {
 "#;
     let macros = HashMap::new();
     let server = CaServerBuilder::new()
+        .port(0)
         .register_record_type("table", || Box::new(TableRecord::default()))
         .register_record_type("calc", || {
             Box::new(epics_base_rs::server::records::calc::CalcRecord::new("A+1"))

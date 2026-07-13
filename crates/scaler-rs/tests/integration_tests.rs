@@ -17,6 +17,7 @@ record(scaler, "TEST:SC") {
 "#;
     let macros = HashMap::new();
     let server = CaServerBuilder::new()
+        .port(0)
         .register_record_type("scaler", || Box::new(ScalerRecord::default()))
         .db_string(db_str, &macros)
         .unwrap()
@@ -77,6 +78,7 @@ record(scaler, "TEST:SC2") {
 "#;
     let macros = HashMap::new();
     let server = CaServerBuilder::new()
+        .port(0)
         .register_record_type("scaler", || Box::new(ScalerRecord::default()))
         .db_string(db_str, &macros)
         .unwrap()
@@ -104,6 +106,7 @@ record(scaler, "TEST:SC3") {
 "#;
     let macros = HashMap::new();
     let server = CaServerBuilder::new()
+        .port(0)
         .register_record_type("scaler", || Box::new(ScalerRecord::default()))
         .db_string(db_str, &macros)
         .unwrap()
@@ -158,6 +161,7 @@ record(scaler, "TEST:SC4") {
 "#;
     let macros = HashMap::new();
     let server = CaServerBuilder::new()
+        .port(0)
         .register_record_type("scaler", || Box::new(ScalerRecord::default()))
         .db_string(db_str, &macros)
         .unwrap()
@@ -194,6 +198,7 @@ record(scaler, "TEST:SC5") {
 "#;
     let macros = HashMap::new();
     let server = CaServerBuilder::new()
+        .port(0)
         .register_record_type("scaler", || Box::new(ScalerRecord::default()))
         .db_string(db_str, &macros)
         .unwrap()
@@ -600,6 +605,7 @@ record(scaler, "TEST:SCNP") {
 "#;
     let macros = HashMap::new();
     let server = CaServerBuilder::new()
+        .port(0)
         .register_record_type("scaler", || Box::new(ScalerRecord::default()))
         .db_string(db_str, &macros)
         .unwrap()

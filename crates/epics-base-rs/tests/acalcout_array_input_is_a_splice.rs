@@ -34,10 +34,22 @@
 //!
 //!   W10-A8 asserted the client path had "no counterpart" and left the tail
 //!   alone. It has one, and it does not.
-//! * `[numElements, nelm)` — NEVER written, by either. `numElements` is
-//!   `acalcGetNumElements()`, i.e. NUSE when NUSE < NELM, so this is the part of the
-//!   buffer NUSE currently hides. It keeps its contents and REAPPEARS when NUSE
-//!   grows again.
+//! * `[numElements, nelm)` — the part of the buffer NUSE currently hides. No
+//!   writer ever ZEROES it: it keeps its contents and REAPPEARS when NUSE grows
+//!   again. Whether a writer can REACH it is the writer's own bound, and R15-2
+//!   corrects what R14-7 wrote here — the two writers do not agree:
+//!
+//!   - the LINK cannot. It asks for `nRequest = acalcGetNumElements(pcalc)`
+//!     elements (`:1096-1097`), so the window is all that ever arrives.
+//!   - a CLIENT can. `dbPut` clamps at `paddr->no_elements` (`dbAccess.c:1322`,
+//!     `:1361-1362`), and `cvt_dbaddr` (`:627-631`) sets that to `pcalc->nelm`
+//!     unless SIZE is NUSE — and SIZE DEFAULTS to NELM, the first choice of the
+//!     menu (`aCalcoutRecord.dbd:32-35`). So by default a caput may fill the whole
+//!     buffer, hidden tail included.
+//!
+//!   R14-7 read `cvt_dbaddr:628` — the SIZE=NUSE branch — as if it were
+//!   unconditional and gave both writers the link's window, which made the tail
+//!   unwritable.
 //!
 //! The port did `arr_vals[idx] = <whatever was delivered>`, throwing the tail away
 //! on both paths. Reads clamp to `num_elements()` and pad with zeros, which is why
@@ -173,25 +185,88 @@ fn an_over_long_link_fetch_stops_at_the_window() {
     );
 }
 
-/// The same bound on the client path — `dbPut` clamps its request to
-/// `paddr->no_elements` (`dbAccess.c:1361-1362`), which `cvt_dbaddr` set to
-/// `acalcGetNumElements` (`:628`).
+/// R15-2 — the CLIENT's bound is NOT the link's. `dbPut` clamps at
+/// `paddr->no_elements` (`dbAccess.c:1322`, `:1361-1362`), which `cvt_dbaddr`
+/// sets to `pcalc->nelm` under the default SIZE=NELM (`:627-631`). So a caput of
+/// ten elements into a NUSE=4 window lands ALL TEN — the six past the window are
+/// written, they are just hidden until NUSE grows.
+///
+/// R14-7 window-clamped this path too, and `[4,10)` became unwritable.
 #[test]
-fn an_over_long_client_put_stops_at_the_window() {
+fn a_client_put_may_fill_the_whole_nelm_buffer_past_the_nuse_window() {
     let mut rec = record_with_full_aa();
-    rec.put_field("NUSE", EpicsValue::ULong(3)).unwrap();
+    rec.put_field("NUSE", EpicsValue::ULong(4)).unwrap();
 
-    rec.put_field(
-        "AA",
-        EpicsValue::DoubleArray(vec![90.0, 91.0, 92.0, 93.0, 94.0, 95.0]),
-    )
-    .unwrap();
+    let fresh: Vec<f64> = (0..10).map(|i| (90 + i) as f64).collect();
+    rec.put_field("AA", EpicsValue::DoubleArray(fresh)).unwrap();
 
-    assert_eq!(aa(&rec), vec![90.0, 91.0, 92.0]);
+    // The window shows four...
+    assert_eq!(aa(&rec), vec![90.0, 91.0, 92.0, 93.0]);
+
+    // ...and the six the client wrote past it are THERE, not the old 5..10.
     rec.put_field("NUSE", EpicsValue::ULong(10)).unwrap();
     assert_eq!(
         aa(&rec),
-        vec![90.0, 91.0, 92.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
+        vec![90.0, 91.0, 92.0, 93.0, 94.0, 95.0, 96.0, 97.0, 98.0, 99.0]
+    );
+}
+
+/// A client put SHORTER than the window still zero-fills `[nNew, numElements)` —
+/// `put_array_info`'s loop is bounded by `acalcGetNumElements` (`:724-731`), the
+/// window, whatever the request was allowed to be. The hidden tail is untouched:
+/// no writer ever zeroes it.
+#[test]
+fn a_short_client_put_zero_fills_the_window_and_leaves_the_hidden_tail() {
+    let mut rec = record_with_full_aa();
+    rec.put_field("NUSE", EpicsValue::ULong(4)).unwrap();
+
+    rec.put_field("AA", EpicsValue::DoubleArray(vec![90.0, 91.0]))
+        .unwrap();
+
+    // [2,4) zeroed inside the window.
+    assert_eq!(aa(&rec), vec![90.0, 91.0, 0.0, 0.0]);
+
+    // [4,10) kept its old contents.
+    rec.put_field("NUSE", EpicsValue::ULong(10)).unwrap();
+    assert_eq!(
+        aa(&rec),
+        vec![90.0, 91.0, 0.0, 0.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
+    );
+}
+
+/// NELM is the client's ceiling — `no_elements` is `pcalc->nelm` and `dbPut`
+/// clamps there (`dbAccess.c:1361-1362`). The surplus is dropped, not an error.
+#[test]
+fn a_client_put_longer_than_nelm_is_clamped_at_nelm() {
+    let mut rec = record_with_full_aa();
+    let fresh: Vec<f64> = (0..14).map(|i| (90 + i) as f64).collect();
+    rec.put_field("AA", EpicsValue::DoubleArray(fresh)).unwrap();
+
+    assert_eq!(
+        aa(&rec),
+        vec![90.0, 91.0, 92.0, 93.0, 94.0, 95.0, 96.0, 97.0, 98.0, 99.0]
+    );
+}
+
+/// SIZE=NUSE is the OTHER branch of `cvt_dbaddr` (`:627-628`): the record reports
+/// the window as its element count, so `dbPut` clamps the client there too. This
+/// is the case R14-7 mistook for the default.
+#[test]
+fn under_size_nuse_a_client_put_is_bounded_at_the_window() {
+    let mut rec = record_with_full_aa();
+    rec.put_field("NUSE", EpicsValue::ULong(4)).unwrap();
+    rec.put_field("SIZE", EpicsValue::Short(1)).unwrap(); // acalcoutSIZE_NUSE
+
+    let fresh: Vec<f64> = (0..10).map(|i| (90 + i) as f64).collect();
+    rec.put_field("AA", EpicsValue::DoubleArray(fresh)).unwrap();
+
+    assert_eq!(aa(&rec), vec![90.0, 91.0, 92.0, 93.0]);
+
+    // [4,10) is out of the client's reach under SIZE=NUSE — the old values stand.
+    rec.put_field("NUSE", EpicsValue::ULong(10)).unwrap();
+    assert_eq!(
+        aa(&rec),
+        vec![90.0, 91.0, 92.0, 93.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
     );
 }
 

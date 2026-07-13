@@ -336,6 +336,31 @@ impl AcalcoutRecord {
         (n as usize).max(1)
     }
 
+    /// C `cvt_dbaddr`'s `paddr->no_elements` (`aCalcoutRecord.c:627-631`) — the
+    /// CAPACITY the database layer sees for an SPC_DBADDR array field, and so the
+    /// bound `dbPut` clamps a client write to (`dbAccess.c:1322`, `:1361-1362`).
+    ///
+    /// ```c
+    /// if (pcalc->size == acalcoutSIZE_NUSE)
+    ///     paddr->no_elements = acalcGetNumElements( pcalc );  /* the NUSE window */
+    /// else
+    ///     paddr->no_elements = pcalc->nelm;                   /* the whole buffer */
+    /// ```
+    ///
+    /// This is NOT [`Self::num_elements`]. SIZE defaults to NELM — it is the first
+    /// choice of the `acalcoutSIZE` menu (`aCalcoutRecord.dbd:32-35`) — so by
+    /// default a client may write the WHOLE `nelm` buffer, including the tail
+    /// `[numElements, nelm)` that NUSE currently hides. Only SIZE=NUSE narrows the
+    /// client to the window, and that is the whole point of the field: it exists so
+    /// a client can be told the smaller size (`:618-625`).
+    fn dbaddr_no_elements(&self) -> usize {
+        if self.size == ACALCOUT_SIZE_NUSE {
+            self.num_elements()
+        } else {
+            (self.nelm as usize).max(1)
+        }
+    }
+
     /// Serve an internal `f64` array as a `DoubleArray` of the client-reported
     /// element count (C `get_array_info` → `acalcGetNumElements`), padding
     /// with 0 when the buffer is short.
@@ -388,37 +413,54 @@ impl AcalcoutRecord {
     /// (`aCalcoutRecord.c:677-731`), whether the writer is a client `dbPut` or an
     /// input link.
     ///
-    /// The whole rule, and it is ONE rule: a write touches `[0, numElements)` and
-    /// nothing else. It splices its elements into the record's permanent
-    /// `calloc(nelm)` buffer, is BOUNDED at the window, and zeroes the rest of the
-    /// window behind it. Three halves of one invariant, none of them the caller's
-    /// business — a caller that did any without the others is exactly the bug this
-    /// function exists to make unwritable.
+    /// A write SPLICES its elements into the record's permanent `calloc(nelm)`
+    /// buffer and zeroes the rest of the WINDOW behind them. Both halves belong to
+    /// this owner; a caller that did one without the other is the bug it exists to
+    /// make unwritable.
     ///
     /// * SPLICE: C allocates each array field ONCE, at `calloc(pcalc->nelm,
     ///   sizeof(double))` (`:695-698`, `:1084-1086`), and that buffer lives for the
     ///   record's lifetime — nothing ever replaces it, so a write is always INTO it
     ///   and never a swap of it.
-    /// * BOUND: both writers ask for exactly `numElements` and can deliver no more.
-    ///   The link reads `nRequest = acalcGetNumElements(pcalc)` elements
-    ///   (`:1096-1097`), and `dbPut` clamps its request to `paddr->no_elements`
-    ///   (`dbAccess.c:1361-1362`), which `cvt_dbaddr` set to the same
-    ///   `acalcGetNumElements` (`:628`). A source LONGER than the window is
-    ///   truncated at it — it cannot reach into `[numElements, nelm)`, which is the
-    ///   region the splice exists to preserve.
-    /// * ZERO-FILL: [`Self::zero_fill_window`], `[nNew, numElements)`.
-    fn client_put_array(&mut self, src: &[f64], select: impl FnOnce(&mut Self) -> &mut Vec<f64>) {
+    /// * ZERO-FILL: `[nNew, numElements)`, and `numElements` here is always the NUSE
+    ///   window — `acalcGetNumElements` in BOTH writers (`put_array_info:726-731`,
+    ///   `fetch_values:1100-1102`), whatever the writer's bound was. See
+    ///   [`Self::zero_fill_window`].
+    ///
+    /// `bound` is NOT part of the rule — it is the WRITER's, and the two writers do
+    /// not agree:
+    ///
+    /// * the input link asks `dbGetLink` for `nRequest = acalcGetNumElements(pcalc)`
+    ///   elements (`:1096-1097`), so it can never deliver more than the window;
+    /// * a client `dbPut` is clamped at `paddr->no_elements`
+    ///   (`dbAccess.c:1361-1362`) — [`Self::dbaddr_no_elements`], which is the whole
+    ///   `nelm` buffer under the default SIZE=NELM.
+    ///
+    /// So a client CAN write the tail `[numElements, nelm)` that NUSE hides, and a
+    /// link cannot. Taking the bound as a parameter is what stops the owner from
+    /// deciding for a writer whose rule it does not know: R14-7 gave both writers
+    /// the link's window, and the tail became unwritable.
+    fn write_array_field(
+        &mut self,
+        src: &[f64],
+        bound: usize,
+        select: impl FnOnce(&mut Self) -> &mut Vec<f64>,
+    ) {
         let nelm = (self.nelm as usize).max(1);
         let window = self.num_elements();
         let buf = select(self);
         buf.resize(nelm, 0.0);
-        let n = src.len().min(window);
+        let n = src.len().min(bound).min(nelm);
         buf[..n].copy_from_slice(&src[..n]);
         Self::zero_fill_window(buf, n, window);
     }
 
     fn build_inputs(&self, n: usize, prev_val: f64, prev_aval: &[f64]) -> ArrayInputs {
-        let mut inputs = ArrayInputs::new(n);
+        // C `aCalcPerform(&pcalc->a, MAX_FIELDS, &pcalc->aa, ARRAY_MAX_FIELDS,
+        // numElements, ...)` (`aCalcoutRecord.c:1283`, `:1288`) — both counts are 12
+        // (`:156-157`). Args past that are not the record's to write: `M`/`@12`
+        // fetch 0, `@@12 :=` stores nothing and flags no AMASK bit.
+        let mut inputs = ArrayInputs::with_counts(n, 12, 12);
         for i in 0..12 {
             inputs.num_vars[i] = self.num_vals[i];
         }
@@ -1309,6 +1351,11 @@ const ACALCOUT_WAIT_CHOICES: &[&str] = &["NoWait", "Wait"];
 /// `menu(acalcoutSIZE)`: 0=report NELM, 1=report NUSE to clients.
 const ACALCOUT_SIZE_CHOICES: &[&str] = &["NELM", "NUSE"];
 
+/// `acalcoutSIZE_NUSE` — the SECOND choice of the menu, so 1. The FIRST, and
+/// therefore the default a record gets when the .db says nothing, is
+/// `acalcoutSIZE_NELM` = 0 (`aCalcoutRecord.dbd:32-35`).
+const ACALCOUT_SIZE_NUSE: i16 = 1;
+
 /// `menu(acalcoutINAV)` — input-link PV status (`INAV..ILLV`, `OUTV`).
 const ACALCOUT_INAV_CHOICES: &[&str] = &["Ext PV NC", "Ext PV OK", "Local PV", "Constant"];
 
@@ -1742,8 +1789,22 @@ impl Record for AcalcoutRecord {
             return crate::server::record::put_field_internal_default(self, name, value);
         };
         let before = self.array_field_value(&self.arr_vals[i]);
+        // The LINK's bound, and it is this path's alone: C asks the link for exactly
+        // `nRequest = acalcGetNumElements(pcalc)` elements — the NUSE window
+        // (`aCalcoutRecord.c:1096-1097`) — so however long the source array is, no
+        // more than a window's worth ever arrives. The bound is at the REQUEST, so
+        // it belongs here, at the writer, and not in the shared owner: a client
+        // `dbPut` reaching that same owner is bounded at `paddr->no_elements`
+        // instead, which is the whole NELM buffer by default.
+        let value = match Self::coerce_array(value) {
+            Some(mut src) => {
+                src.truncate(self.num_elements());
+                EpicsValue::DoubleArray(src)
+            }
+            None => return Err(CaError::TypeMismatch(name.into())),
+        };
         // The write itself — splice into the calloc(nelm) buffer, then zero the
-        // rest of the window — is [`Self::client_put_array`], reached through
+        // rest of the window — is [`Self::write_array_field`], reached through
         // `put_field`. C's two writers do the same two things in the same order
         // (`fetch_values:1096-1102` and `put_array_info:726-731`); the only thing
         // that is this path's alone is NEWM, which only `fetch_values` sets.
@@ -1770,7 +1831,7 @@ impl Record for AcalcoutRecord {
             "AVAL" => {
                 let src = Self::coerce_array(value)
                     .ok_or_else(|| CaError::TypeMismatch("AVAL".into()))?;
-                self.client_put_array(&src, |r| &mut r.aval);
+                self.write_array_field(&src, self.dbaddr_no_elements(), |r| &mut r.aval);
                 Ok(())
             }
             "PVAL" => {
@@ -1843,7 +1904,7 @@ impl Record for AcalcoutRecord {
             "OAV" => {
                 let src =
                     Self::coerce_array(value).ok_or_else(|| CaError::TypeMismatch("OAV".into()))?;
-                self.client_put_array(&src, |r| &mut r.oav);
+                self.write_array_field(&src, self.dbaddr_no_elements(), |r| &mut r.oav);
                 Ok(())
             }
             "POVL" => {
@@ -2090,7 +2151,9 @@ impl Record for AcalcoutRecord {
                 if let Some(idx) = Self::arr_index(name) {
                     let src = Self::coerce_array(value)
                         .ok_or_else(|| CaError::TypeMismatch(name.into()))?;
-                    self.client_put_array(&src, |r| &mut r.arr_vals[idx]);
+                    self.write_array_field(&src, self.dbaddr_no_elements(), |r| {
+                        &mut r.arr_vals[idx]
+                    });
                     return Ok(());
                 }
                 if let Some(idx) = Self::inp_index(name) {

@@ -44,11 +44,20 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
 
                 CoreOp::PushConst(v) => stack.push(StackValue::Double(*v)),
                 CoreOp::PushVar(idx) => {
-                    stack.push(StackValue::Double(inputs.num_vars[*idx as usize]));
+                    // C `FETCH_A..P` (`sCalcPerform.c:858-864`) — bounded by the
+                    // CALLER's `numArgs`, not by the size of the engine's array. An
+                    // arg the caller never supplied is 0 (`:426`), not a phantom slot.
+                    let v = inputs.num_arg(*idx as usize).unwrap_or(0.0);
+                    stack.push(StackValue::Double(v));
                 }
                 CoreOp::PushDoubleVar(idx) => {
-                    // In string evaluator, double vars are string vars
-                    stack.push(StackValue::Str(inputs.str_vars[*idx as usize].clone()));
+                    // In the string evaluator, double vars are string vars —
+                    // C `FETCH_AA..LL` (`:866-876`), bounded by `numSArgs`. C empties
+                    // the cell BEFORE the range test, so an unsupplied string arg is
+                    // the empty string. Under transform, which passes `numSArgs == 0`
+                    // (`transformRecord.c:593`), that is EVERY string arg.
+                    let s = inputs.str_arg(*idx as usize).cloned().unwrap_or_default();
+                    stack.push(StackValue::Str(s));
                 }
 
                 CoreOp::Pi => stack.push(StackValue::Double(std::f64::consts::PI)),
@@ -546,8 +555,13 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
 
                 // Store
                 CoreOp::StoreVar(idx) => {
+                    // C `STORE_A..P` (`:878-886`) pops unconditionally and stores
+                    // only `if (numArgs > (op - STORE_A))` — an arg the caller never
+                    // supplied swallows the value silently.
                     let v = pop1_f64(&mut stack)?;
-                    inputs.num_vars[*idx as usize] = v;
+                    if let Some(slot) = inputs.num_arg_mut(*idx as usize) {
+                        *slot = v;
+                    }
                 }
                 CoreOp::StoreDoubleVar(idx) => {
                     // C STORE_AA..STORE_LL (`sCalcPerform.c:888-895`):
@@ -558,8 +572,14 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     // `AA:=` names a STRING field, so the value is coerced, not
                     // dispatched on: a double is converted and stored as text,
                     // and no store of `AA` ever reaches the numeric args.
+                    //
+                    // The `strncpy` sits under `if (numSArgs > (op - STORE_AA))`, so
+                    // under transform (`numSArgs == 0`, and `psarg` itself NULL) the
+                    // store lands nowhere — the value is still popped.
                     let v = pop1(&mut stack)?;
-                    inputs.str_vars[*idx as usize] = v.into_string_value();
+                    if let Some(slot) = inputs.str_arg_mut(*idx as usize) {
+                        *slot = v.into_string_value();
+                    }
                 }
             },
 
@@ -800,12 +820,11 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     //
                     // so the operand is the INDEX: `@0` is A, `@1` is B, and a
                     // string index goes through `atof` first (`@"1"` is B). Out of
-                    // range is 0, not an error. `numArgs` is the caller's argument
-                    // count, which here is the length of `num_vars`.
+                    // range is 0, not an error. `numArgs` is the CALLER's argument
+                    // count — [`StringInputs::num_arg`], not the array's length.
                     let idx = my_nint(pop1(&mut stack)?.to_double());
                     let v = f64_to_index(idx)
-                        .and_then(|i| inputs.num_vars.get(i))
-                        .copied()
+                        .and_then(|i| inputs.num_arg(i))
                         .unwrap_or(0.0);
                     stack.push(StackValue::Double(v));
                 }
@@ -817,7 +836,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     // string, still not an error).
                     let idx = my_nint(pop1(&mut stack)?.to_double());
                     let s = f64_to_index(idx)
-                        .and_then(|i| inputs.str_vars.get(i))
+                        .and_then(|i| inputs.str_arg(i))
                         .cloned()
                         .unwrap_or_default();
                     stack.push(StackValue::Str(s));
@@ -838,7 +857,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     // and is not an error, exactly as for `@`.
                     let value = pop1(&mut stack)?.to_double();
                     let idx = my_nint(pop1(&mut stack)?.to_double());
-                    if let Some(slot) = f64_to_index(idx).and_then(|i| inputs.num_vars.get_mut(i)) {
+                    if let Some(slot) = f64_to_index(idx).and_then(|i| inputs.num_arg_mut(i)) {
                         *slot = value;
                     }
                 }
@@ -850,7 +869,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     // so a program containing one always runs this evaluator.)
                     let value = pop1(&mut stack)?.into_string_value();
                     let idx = my_nint(pop1(&mut stack)?.to_double());
-                    if let Some(slot) = f64_to_index(idx).and_then(|i| inputs.str_vars.get_mut(i)) {
+                    if let Some(slot) = f64_to_index(idx).and_then(|i| inputs.str_arg_mut(i)) {
                         *slot = value;
                     }
                 }

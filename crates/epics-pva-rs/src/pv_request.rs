@@ -219,6 +219,15 @@ pub fn request_to_mask(
 /// Derive the distinct put-leg and get-leg field masks for a `ChannelPutGet`
 /// pvRequest, returned as `(put_mask, get_mask)`.
 ///
+/// **Not a pvxs behaviour.** pvxs does not implement PUT_GET at all:
+/// `ServerConn::handle_PUT_GET()` (`pvxs/src/serverconn.cpp:259-260`) is an
+/// empty body, so a client's PUT_GET INIT gets no reply whatsoever. There is
+/// no pvxs counterpart for this function to diverge from — the port's PUT_GET
+/// is a **pvAccessCPP / pvDatabaseCPP extension**, a strict superset of pvxs.
+/// Do not file a pvxs-parity finding against it; the references below are the
+/// authority instead, and they are NOT present on this machine, so the
+/// leg-mask derivation is unverified against its source.
+///
 /// pvDatabaseCPP `ChannelPutGetLocal::create` builds two separate copy views
 /// — `PVCopy::create(master, pvRequest, "putField")` for the writable leg and
 /// `PVCopy::create(master, pvRequest, "getField")` for the readback leg

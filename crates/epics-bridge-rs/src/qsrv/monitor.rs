@@ -490,7 +490,12 @@ mod tests {
         // The posted value is the full NT structure (pvxs merges into its
         // persistent `currentValue`), but the MARKED set is the property
         // leaves alone — `IOCSource::get` under `UpdateType::Property` runs
-        // getProperties and nothing else (`iocsource.cpp:327-334`).
+        // getProperties and nothing else (`iocsource.cpp:327-334`). The set
+        // is the exact leaf list `getProperties` assigns
+        // (`iocsource.cpp:252-310`), not the `display` / `control` /
+        // `valueAlarm` parent structures: those carry `display.form`,
+        // `control.minStep`, `valueAlarm.active`, the four `*Severity`
+        // fields and `valueAlarm.hysteresis`, none of which pvxs touches.
         let marked = snap
             .marked
             .as_ref()
@@ -498,12 +503,20 @@ mod tests {
         assert_eq!(
             marked,
             &vec![
-                "display".to_string(),
-                "control".to_string(),
-                "valueAlarm".to_string(),
+                "display.units".to_string(),
+                "display.limitLow".to_string(),
+                "display.limitHigh".to_string(),
+                "display.precision".to_string(),
+                "display.description".to_string(),
+                "control.limitLow".to_string(),
+                "control.limitHigh".to_string(),
+                "valueAlarm.lowAlarmLimit".to_string(),
+                "valueAlarm.lowWarningLimit".to_string(),
+                "valueAlarm.highWarningLimit".to_string(),
+                "valueAlarm.highAlarmLimit".to_string(),
                 "value.choices".to_string(),
             ],
-            "a PROPERTY event marks only the property leaves"
+            "a PROPERTY event marks exactly pvxs getProperties' leaves"
         );
         assert!(
             !snap.value.fields.is_empty(),

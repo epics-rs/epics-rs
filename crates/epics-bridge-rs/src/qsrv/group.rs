@@ -2792,10 +2792,15 @@ mod tests {
 
     /// a marked member is narrowed to the leaves its
     /// UpdateType actually assigns, not its whole subtree. A DBE_VALUE
-    /// event marks value/alarm/timeStamp; a DBE_PROPERTY event marks
-    /// display/control/valueAlarm — neither crosses into the other's
-    /// leaves, and a property event never marks triggered members. Mirrors
-    /// pvxs `IOCSource::get` (`iocsource.cpp:312-352`).
+    /// event marks value/alarm/timeStamp; a DBE_PROPERTY event marks the
+    /// individual property leaves `getProperties` assigns
+    /// (`iocsource.cpp:252-310`) — NOT the whole `display` / `control` /
+    /// `valueAlarm` structures, which carry leaves pvxs never touches
+    /// (`display.form`, `control.minStep`, `valueAlarm.active`, the four
+    /// `*Severity` fields, `valueAlarm.hysteresis`). Neither event class
+    /// crosses into the other's leaves, and a property event never marks
+    /// triggered members. Mirrors pvxs `IOCSource::get`
+    /// (`iocsource.cpp:312-352`).
     #[test]
     fn event_marks_narrow_to_update_type_leaves() {
         use crate::qsrv::group_config::parse_group_config;
@@ -2835,18 +2840,51 @@ mod tests {
             "value event must NOT mark property-metadata leaves: {v:?}"
         );
 
-        // Property event: only the source member's display/control/
-        // valueAlarm (+ enum value.choices), never value/alarm/timeStamp,
-        // never the triggered member `b`.
+        // Property event: exactly the leaves `getProperties`
+        // (`iocsource.cpp:252-310`) assigns on the source member — never
+        // value/alarm/timeStamp, never the triggered member `b`, and never
+        // the parent `display` / `control` / `valueAlarm` structures.
         let EventMark::Marked(p) = GroupMonitor::property_event_mark(&def, src) else {
             panic!("expected Marked from a property event");
         };
-        assert!(p.contains(&"a.display".to_string()), "display leaf: {p:?}");
-        assert!(p.contains(&"a.control".to_string()), "control leaf: {p:?}");
-        assert!(
-            p.contains(&"a.valueAlarm".to_string()),
-            "valueAlarm leaf: {p:?}"
+        assert_eq!(
+            p,
+            vec![
+                "a.display.units",
+                "a.display.limitLow",
+                "a.display.limitHigh",
+                "a.display.precision",
+                "a.display.description",
+                "a.control.limitLow",
+                "a.control.limitHigh",
+                "a.valueAlarm.lowAlarmLimit",
+                "a.valueAlarm.lowWarningLimit",
+                "a.valueAlarm.highWarningLimit",
+                "a.valueAlarm.highAlarmLimit",
+                "a.value.choices",
+            ],
+            "pvxs getProperties leaf list (iocsource.cpp:252-310)"
         );
+        // The leaves the port's NT carries but pvxs never assigns must NOT
+        // be marked — marking the parent structure would have marked them.
+        for never in [
+            "a.display",
+            "a.control",
+            "a.valueAlarm",
+            "a.display.form",
+            "a.control.minStep",
+            "a.valueAlarm.active",
+            "a.valueAlarm.lowAlarmSeverity",
+            "a.valueAlarm.lowWarningSeverity",
+            "a.valueAlarm.highWarningSeverity",
+            "a.valueAlarm.highAlarmSeverity",
+            "a.valueAlarm.hysteresis",
+        ] {
+            assert!(
+                !p.iter().any(|leaf| leaf == never),
+                "getProperties never assigns {never}: {p:?}"
+            );
+        }
         assert!(
             !p.iter()
                 .any(|leaf| leaf == "a.value" || leaf == "a.alarm" || leaf == "a.timeStamp"),

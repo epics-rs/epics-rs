@@ -1600,22 +1600,57 @@ impl Drop for MonitorStartControl {
     }
 }
 
+/// A monitor post that may be pvxs's **terminal** — its null `Value`.
+///
+/// pvxs's `doPost` (`servermon.cpp:270-283`) gates the append on
+/// `(mon->queue.size() < mon->limit) || force || !val`, so a terminal is
+/// ALWAYS `push_back`'d and grows the queue past `limit`; only a
+/// non-terminal post can reach the squash branch. Both FIFOs the port
+/// runs — the decoded [`crate::server_native::MonitorUpdate`] queue and
+/// the raw-forward [`crate::server_native::RawMonitorEvent`] queue —
+/// carry that boundary as `type_changed`, so the rule lives in
+/// [`push_squash_monitor`] behind this trait rather than at each call
+/// site: a caller cannot forget it.
+trait MonitorPost {
+    /// pvxs's `!val`.
+    fn is_terminal(&self) -> bool;
+}
+
+impl MonitorPost for crate::server_native::MonitorUpdate {
+    fn is_terminal(&self) -> bool {
+        self.type_changed
+    }
+}
+
+impl MonitorPost for crate::server_native::RawMonitorEvent {
+    fn is_terminal(&self) -> bool {
+        self.type_changed
+    }
+}
+
 /// Push one monitor event into the bounded FIFO, squashing the newest into the
 /// tail once the queue is full — the single producer rule covering both the
 /// INIT->START and STOP->START "Idle, accruing" windows AND the Executing
-/// burst. Models pvxs `servermon.cpp:271-287`: a post is appended as a DISTINCT
-/// queue entry while the queue holds fewer than `limit` entries; once full, the
-/// newest update is coalesced into the queue tail (unioning marked-leaf sets via
-/// [`coalesce_monitor_update`] on the decoded path). `limit` must be >= 1 so a
-/// tail always exists to squash into. Returns whether an overflow squash
-/// happened (diagnostic only).
-fn push_squash_monitor<T>(
+/// burst. Models pvxs `servermon.cpp:270-287`:
+///
+/// * a **terminal** post ([`MonitorPost::is_terminal`], pvxs's `!val`) is
+///   always appended, even past `limit` — pvxs delivers every queued update
+///   and *then* the FINISH, so the terminal must never destroy a real one;
+/// * otherwise a post is appended as a DISTINCT queue entry while the queue
+///   holds fewer than `limit` entries;
+/// * once full, a non-terminal post is coalesced into the queue tail
+///   (unioning marked-leaf sets via [`coalesce_monitor_update`] on the
+///   decoded path).
+///
+/// `limit` must be >= 1 so a tail always exists to squash into. Returns
+/// whether an overflow squash happened (diagnostic only).
+fn push_squash_monitor<T: MonitorPost>(
     pending: &mut std::collections::VecDeque<T>,
     ev: T,
     limit: usize,
     coalesce: impl Fn(T, T) -> T,
 ) -> bool {
-    if pending.len() < limit {
+    if ev.is_terminal() || pending.len() < limit {
         pending.push_back(ev);
         false
     } else {
@@ -7884,9 +7919,9 @@ fn build_monitor_payload(
     payload.put_u32(ioid, order);
     payload.put_u8(0x00);
     // PVA monitor data: changed bitset + partial value + overrun bitset.
-    // `mask` is a *selection* mask (request_to_mask) — canonicalize it
-    // into a wire changed-bitset so a partial field filter is not
-    // widened to the whole structure by a stray root/structure bit.
+    // `mask` is a *selection* mask (request_to_mask) whose structure bits
+    // are permission bits — canonicalize it into pvxs's leaf-enumerated
+    // wire changed-bitset (`to_wire_valid`, dataencode.cpp:414-439).
     let changed = crate::pvdata::encode::canonical_changed_bitset(intro, mask);
     changed.write_into(order, &mut payload);
     crate::pvdata::encode::encode_pv_field_with_bitset(
@@ -7957,8 +7992,8 @@ fn build_monitor_payload_partial(
     let mut payload = Vec::new();
     payload.put_u32(ioid, order);
     payload.put_u8(0x00);
-    // Canonicalize so a fully-selected subtree collapses to its
-    // structure bit exactly as `build_monitor_payload` does.
+    // Canonicalize to the leaf-enumerated wire form exactly as
+    // `build_monitor_payload` does.
     let changed = crate::pvdata::encode::canonical_changed_bitset(intro, &selected);
     changed.write_into(order, &mut payload);
     crate::pvdata::encode::encode_pv_field_with_bitset(
@@ -9007,6 +9042,40 @@ mod tests {
             "a descriptor boundary always queues"
         );
 
+        // R13-34: the terminal on a FULL FIFO. pvxs's append gate is
+        // `(mon->queue.size() < mon->limit) || force || !val`
+        // (servermon.cpp:270-283) — a terminal is ALWAYS push_back'd and
+        // grows the queue PAST `limit`. It must never reach the squash
+        // branch, which would pop the newest real update and coalesce the
+        // terminal over it (`coalesce_monitor_update` returns a bare
+        // `type_change()` whenever either side is `type_changed`).
+        //
+        // pvxs delivers all `limit` queued updates and THEN the FINISH;
+        // pre-fix the port delivered `limit - 1` and the FINISH.
+        let mut q = MonitorQueue::new(2, &intro, &mask);
+        q.seed(tag(0));
+        assert!(q.push(upd(1, &["value"])), "fills the FIFO to limit=2");
+        assert_eq!(tags(&q), vec![tag(0), tag(1)], "FIFO is full");
+        assert!(
+            q.push(crate::server_native::MonitorUpdate::type_change()),
+            "a terminal always queues, even on a full FIFO"
+        );
+        assert_eq!(
+            q.pending.len(),
+            3,
+            "the terminal grows the queue past limit=2 (pvxs push_back)"
+        );
+        assert_eq!(
+            tags(&q),
+            vec![tag(0), tag(1), PvField::Null],
+            "both real updates survive and the terminal trails them — it must \
+             not squash the newest one out of the tail"
+        );
+        assert!(
+            q.pending[2].type_changed,
+            "the terminal is the last entry, delivered after every real update"
+        );
+
         // Squash CONTENTS: with limit 2 and the FIFO already full, a
         // masked-out post must not coalesce the real tail. Pre-fix it took a
         // slot and overwrote `value=3` with `value=4`.
@@ -9084,23 +9153,58 @@ mod tests {
             "limit 1 collapses the burst to the single newest value"
         );
 
-        // A descriptor-change boundary is sticky through the squash: pushed
-        // into a full limit-1 FIFO it coalesces into the tail and stays
-        // type_changed, so the consumer detects it (MONITOR FINISH) rather
-        // than encoding a stale value.
+        // R13-34: a descriptor-change boundary (pvxs's terminal, `!val`)
+        // never squashes. pvxs's append gate is
+        // `(mon->queue.size() < mon->limit) || force || !val`
+        // (servermon.cpp:270-283), so the terminal is push_back'd PAST the
+        // limit. Pushed into a FULL limit-1 FIFO it must NOT pop the real
+        // update and coalesce over it — the real value survives and the
+        // terminal trails it, exactly as pvxs delivers every queued update
+        // and then the FINISH.
         let mut pending: VecDeque<crate::server_native::MonitorUpdate> = VecDeque::new();
         push_squash_monitor(&mut pending, upd(2), 1, coalesce_monitor_update);
-        push_squash_monitor(
+        let squashed = push_squash_monitor(
             &mut pending,
             crate::server_native::MonitorUpdate::type_change(),
             1,
             coalesce_monitor_update,
         );
-        assert_eq!(pending.len(), 1, "limit 1 keeps a single entry");
-        assert!(
-            pending[0].type_changed,
-            "a boundary post survives the limit-1 squash into the tail"
+        assert!(!squashed, "a terminal never reaches the squash branch");
+        assert_eq!(
+            pending.len(),
+            2,
+            "the terminal grows the queue past limit=1 (pvxs push_back)"
         );
+        assert_eq!(
+            pending[0].value,
+            val(2),
+            "the newest real update survives the terminal"
+        );
+        assert!(pending[1].type_changed, "the terminal trails it");
+
+        // Same rule on the RAW-forward FIFO: `RawMonitorEvent` carries the
+        // same `type_changed` boundary and coalesces with `|_old, new| new`,
+        // so pre-fix a terminal on a full raw queue replaced the newest raw
+        // frame outright.
+        let raw = |body: &[u8], terminal: bool| crate::server_native::RawMonitorEvent {
+            body_bytes: bytes::Bytes::copy_from_slice(body),
+            byte_order: ByteOrder::Little,
+            type_changed: terminal,
+        };
+        let mut raw_pending: VecDeque<crate::server_native::RawMonitorEvent> = VecDeque::new();
+        push_squash_monitor(&mut raw_pending, raw(b"a", false), 1, |_old, new| new);
+        push_squash_monitor(&mut raw_pending, raw(b"", true), 1, |_old, new| new);
+        assert_eq!(
+            raw_pending.len(),
+            2,
+            "the raw terminal is push_back'd past limit=1 too"
+        );
+        assert_eq!(
+            raw_pending[0].body_bytes.as_ref(),
+            b"a",
+            "the newest raw frame is not destroyed by the terminal"
+        );
+        assert!(raw_pending[1].type_changed, "the raw terminal trails it");
     }
 
     /// server pipeline parser accepts the typed-bool /
@@ -14282,33 +14386,28 @@ mod tests {
             "member `b` (bit 2) unchanged — must NOT be marked (narrowing)"
         );
 
-        // Full builder: a wildcard (all-set) request mask canonicalizes to
-        // the root structure bit alone. pvxs `to_wire_valid` compresses a
-        // fully-valid masked structure to its parent bit
-        // (`bit += desc.size()`), and the decoder expands that set root bit
-        // back to the whole structure (both members) — so the full builder
-        // still conveys every member while the partial builder narrows to
-        // the changed leaf. The contrast the residual gap describes holds:
-        // root/whole-struct {0} vs leaf-level {1}.
+        // Full builder: a wildcard (all-set) request mask enumerates every
+        // LEAF — {1, 2}, never the root bit. pvxs `to_wire_valid`
+        // (dataencode.cpp:414-439) sets a wire bit only where
+        // `store[bit].valid`, and `Value::mark` (data.cpp:256-270) never
+        // validates a parent structure, so a root bit cannot appear. The
+        // contrast the residual gap describes still holds: the full builder
+        // marks every member {1,2}, the partial builder narrows to the
+        // changed leaf {1}.
         let full = build_monitor_payload(ioid, &intro, &curr, &mask, order);
         let (full_frame, _) = try_parse_frame(&full).unwrap().expect("complete frame");
         let full_data = match decode_op_response(&full_frame, Some(&intro)).unwrap() {
             OpResponse::Data(d) => d,
             other => panic!("expected monitor data, got {other:?}"),
         };
-        assert!(
-            full_data.changed.get(0),
-            "full-mask builder emits the root structure bit (whole-struct \
-             compression) — pvxs to_wire_valid byte-exact"
-        );
-        assert!(
-            !full_data.changed.get(1) && !full_data.changed.get(2),
-            "descendant leaf bits are not emitted under the set root bit"
+        assert_eq!(
+            full_data.changed.iter().collect::<Vec<_>>(),
+            vec![1, 2],
+            "full-mask builder enumerates leaves, never the root structure \
+             bit — pvxs to_wire_valid byte-exact (testxcode.cpp:111-116)"
         );
         match &full_data.value {
             PvField::Structure(s) => {
-                // The whole structure is conveyed despite the compressed
-                // bitset: both members decode from the set root bit.
                 assert_eq!(
                     s.get_field("a"),
                     Some(&PvField::Scalar(ScalarValue::Double(9.0)))
@@ -14320,6 +14419,125 @@ mod tests {
             }
             other => panic!("expected structure, got {other:?}"),
         }
+    }
+
+    /// W10-C2: byte-level pin on the connect-time monitor **seed** frame.
+    ///
+    /// The seed is queued with `marked: None` and no previous snapshot
+    /// (`MonitorQueue::seed`), so the emitter dispatches it to
+    /// [`build_monitor_payload`] with the op's full pvRequest mask. Its
+    /// changed-bitset is therefore the leaf enumeration of that mask —
+    /// pvxs `to_wire_valid` (`dataencode.cpp:414-439`) sets a wire bit only
+    /// where `store[bit].valid`, and `Value::mark` (`data.cpp:256-270`)
+    /// never validates a parent structure, so neither the root bit (0) nor
+    /// the `alarm` (2) / `timeStamp` (6) bits can appear.
+    /// `test/testxcode.cpp:111-116` is the upstream regression for this.
+    ///
+    /// Asserted byte-for-byte so a future bitset change cannot silently
+    /// drift the seed frame.
+    #[test]
+    fn w10_c2_monitor_seed_frame_bytes_are_leaf_enumerated() {
+        let order = ByteOrder::Big; // pvxs testxcode serializes big-endian
+        let ioid = 1u32;
+        // NTScalar<UInt32> exactly as pvxs's nt::NTScalar{TypeCode::UInt32}:
+        // 0=root 1=value 2=alarm 3=.severity 4=.status 5=.message
+        // 6=timeStamp 7=.secondsPastEpoch 8=.nanoseconds 9=.userTag
+        let intro = FieldDesc::Structure {
+            struct_id: "epics:nt/NTScalar:1.0".into(),
+            fields: vec![
+                ("value".into(), FieldDesc::Scalar(ScalarType::UInt)),
+                (
+                    "alarm".into(),
+                    FieldDesc::Structure {
+                        struct_id: "alarm_t".into(),
+                        fields: vec![
+                            ("severity".into(), FieldDesc::Scalar(ScalarType::Int)),
+                            ("status".into(), FieldDesc::Scalar(ScalarType::Int)),
+                            ("message".into(), FieldDesc::Scalar(ScalarType::String)),
+                        ],
+                    },
+                ),
+                (
+                    "timeStamp".into(),
+                    FieldDesc::Structure {
+                        struct_id: "time_t".into(),
+                        fields: vec![
+                            (
+                                "secondsPastEpoch".into(),
+                                FieldDesc::Scalar(ScalarType::Long),
+                            ),
+                            ("nanoseconds".into(), FieldDesc::Scalar(ScalarType::Int)),
+                            ("userTag".into(), FieldDesc::Scalar(ScalarType::Int)),
+                        ],
+                    },
+                ),
+            ],
+        };
+        let mut alarm = PvStructure::new("alarm_t");
+        alarm
+            .fields
+            .push(("severity".into(), PvField::Scalar(ScalarValue::Int(1))));
+        alarm
+            .fields
+            .push(("status".into(), PvField::Scalar(ScalarValue::Int(2))));
+        alarm.fields.push((
+            "message".into(),
+            PvField::Scalar(ScalarValue::String("hi".into())),
+        ));
+        let mut ts = PvStructure::new("time_t");
+        ts.fields.push((
+            "secondsPastEpoch".into(),
+            PvField::Scalar(ScalarValue::Long(5)),
+        ));
+        ts.fields
+            .push(("nanoseconds".into(), PvField::Scalar(ScalarValue::Int(6))));
+        ts.fields
+            .push(("userTag".into(), PvField::Scalar(ScalarValue::Int(7))));
+        let mut root = PvStructure::new("epics:nt/NTScalar:1.0");
+        root.fields.push((
+            "value".into(),
+            PvField::Scalar(ScalarValue::UInt(0xdead_beef)),
+        ));
+        root.fields
+            .push(("alarm".into(), PvField::Structure(alarm)));
+        root.fields
+            .push(("timeStamp".into(), PvField::Structure(ts)));
+        let seed = PvField::Structure(root);
+
+        // A wildcard pvRequest: `request_to_mask` selects every bit.
+        let mask = BitSet::all_set(intro.total_bits());
+        // The seed goes through the FIFO as `marked: None`, which the
+        // emitter dispatches to `build_monitor_payload`.
+        let mut q = MonitorQueue::new(4, &intro, &mask);
+        q.seed(seed.clone());
+        let ev = q.pop().expect("seed queued");
+        assert!(ev.marked.is_none(), "the seed carries no explicit mark set");
+
+        let frame = build_monitor_payload(ioid, &intro, &ev.value, &mask, order);
+        // 8-byte PVA header, then the payload.
+        let payload = &frame[8..];
+
+        #[rustfmt::skip]
+        let expected: Vec<u8> = vec![
+            0x00, 0x00, 0x00, 0x01,             // ioid
+            0x00,                               // subcmd (monitor data)
+            // changed BitSet: 2 bytes, bits {1,3,4,5,7,8,9}.
+            // byte0 = 1<<1|1<<3|1<<4|1<<5|1<<7 = 0xBA; byte1 = 1<<0|1<<1 = 0x03.
+            0x02, 0xBA, 0x03,
+            0xde, 0xad, 0xbe, 0xef,             // value: UInt 0xdeadbeef
+            0x00, 0x00, 0x00, 0x01,             // alarm.severity = 1
+            0x00, 0x00, 0x00, 0x02,             // alarm.status   = 2
+            0x02, b'h', b'i',                   // alarm.message  = "hi"
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, // timeStamp.secondsPastEpoch = 5
+            0x00, 0x00, 0x00, 0x06,             // timeStamp.nanoseconds = 6
+            0x00, 0x00, 0x00, 0x07,             // timeStamp.userTag = 7
+            0x00,                               // overrun BitSet: empty (servermon.cpp:174-176)
+        ];
+        assert_eq!(
+            payload, expected,
+            "connect-time monitor seed frame bytes (leaf-enumerated \
+             changed-bitset; pvxs testxcode.cpp:111-116)"
+        );
     }
 
     /// pvxs `servermon.cpp:493` parity: when the client sets the

@@ -53,6 +53,43 @@ impl FieldMapping {
 // DBE event class -> wire leaves (pvxs `IOCSource::get`)
 // ---------------------------------------------------------------------------
 
+/// The leaves a DBE_PROPERTY event marks on a Scalar mapping — exactly the
+/// fields pvxs `getProperties` (`pvxs/ioc/iocsource.cpp:252-310`) assigns:
+///
+/// * `display.units` (`DBR_UNITS`),
+/// * `value.choices` (`DBR_ENUM_STRS`, enum mappings only),
+/// * `display.limitLow` / `display.limitHigh` (`DBR_GR_DOUBLE`) and
+///   `display.precision` (`DBR_PRECISION`),
+/// * `control.limitLow` / `control.limitHigh` (`DBR_CTRL_DOUBLE`),
+/// * `valueAlarm.{low,high}{Alarm,Warning}Limit` (`DBR_AL_DOUBLE`),
+/// * `display.description` (unconditional — `iocsource.cpp:307-310`).
+///
+/// `getProperties` assigns **none** of `display.form`, `control.minStep`,
+/// `valueAlarm.active`, the four `valueAlarm.*Severity` fields, or
+/// `valueAlarm.hysteresis`, even though the port's NT carries them (as
+/// hardcoded zeros / `false`). Naming the parent structures `display` /
+/// `control` / `valueAlarm` here would mark those extra leaves as freshly
+/// changed on every property event, so pvxs's leaf list is spelled out.
+///
+/// A path that the concrete descriptor does not have (e.g.
+/// `display.precision` on a string NT, or `value.choices` on a plain
+/// scalar) simply matches no bit in `marked_changed_bitset` — the same
+/// no-op as `getProperties`'s `if(auto x = node["…"])` guard.
+const PROPERTY_LEAVES: &[&str] = &[
+    "display.units",
+    "display.limitLow",
+    "display.limitHigh",
+    "display.precision",
+    "display.description",
+    "control.limitLow",
+    "control.limitHigh",
+    "valueAlarm.lowAlarmLimit",
+    "valueAlarm.lowWarningLimit",
+    "valueAlarm.highWarningLimit",
+    "valueAlarm.highAlarmLimit",
+    "value.choices",
+];
+
 /// The wire leaves one mapping contributes for one DBE change mask, as
 /// field-path suffixes relative to the mapped node (`""` = the node
 /// itself, for value-only mappings that carry no metadata sub-structure).
@@ -63,10 +100,11 @@ impl FieldMapping {
 /// the group monitor per triggered member, and the single-record monitor
 /// at the root of its NT (empty prefix).
 ///
-/// * properties (`display` + `control` + `valueAlarm` limits, plus enum
-///   `value.choices`) iff `change & Property` — `getProperties` is gated
-///   on `info.type == Scalar`, so only Scalar mappings carry property
-///   leaves;
+/// * properties iff `change & Property` — `getProperties`
+///   (`iocsource.cpp:252-310`) is gated on `info.type == Scalar`, so only
+///   Scalar mappings carry property leaves. It assigns exactly
+///   [`PROPERTY_LEAVES`]: the whole `display` / `control` / `valueAlarm`
+///   structures are NOT assigned;
 /// * `timeStamp` iff `change & (Value | Alarm)` — `getTimeAlarm` always
 ///   fills the timestamp when it runs, but its `alarm` leaves only under
 ///   `change & Alarm` (`iocsource.cpp:183-251`);
@@ -76,12 +114,19 @@ impl FieldMapping {
 ///   path to its whole subtree — so a bare `value` mark would re-send the
 ///   property-only `value.choices`. [`narrow_enum_value_leaves`] resolves
 ///   that against the concrete value.
+///
+/// `timeStamp` and `alarm` stay as structure paths because `time_t` and
+/// `alarm_t` have no leaves pvxs leaves unassigned: `getTimeAlarm` writes
+/// all three of `alarm.{status,severity,message}` and all three of
+/// `timeStamp.{secondsPastEpoch,nanoseconds,userTag}`, so expanding either
+/// path yields exactly pvxs's set. The property structures are different —
+/// they carry leaves pvxs never touches (below).
 pub fn change_leaves(mapping: FieldMapping, change: EventMask) -> Vec<&'static str> {
     let mut leaves = Vec::new();
     match mapping {
         FieldMapping::Scalar => {
             if change.intersects(EventMask::PROPERTY) {
-                leaves.extend_from_slice(&["display", "control", "valueAlarm", "value.choices"]);
+                leaves.extend_from_slice(PROPERTY_LEAVES);
             }
             if change.intersects(EventMask::VALUE | EventMask::ALARM) {
                 leaves.push("timeStamp");

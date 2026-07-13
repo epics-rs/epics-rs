@@ -64,11 +64,14 @@
 //!   non-calc-fail `INVALID` (NaN-VAL UDF, limit, MS link) suppresses the OUT
 //!   write for every severity source — not only a failed evaluation. The
 //!   record-level `cached_should_output` still gates the OOPT/calc-fail
-//!   decision; the framework layer is the IVOA backstop on top. SetIVOV writes
-//!   `IVOV` into the field OUT consumes — see `set_output_to_ivov`. Under `DOPT=Use
-//!   CALC`, SetIVOV drives `IVOV` to OUT; literal C sets only the unused
-//!   `oval` there and drives the failed `aval`, so its IVOV substitution is a
-//!   no-op — this port deliberately does NOT replicate that C quirk.
+//!   decision; the framework layer is the IVOA backstop on top. SetIVOV sets
+//!   only the scalar `OVAL` (C `aCalcoutRecord.c:924`), and the OUT write
+//!   buffer is chosen by the resolved target element count exactly as
+//!   `devaCalcoutSoft.c` does — scalar target ⇒ `VAL`/`OVAL`, array target
+//!   ⇒ `AVAL`/`OAV` — so IVOV reaches a scalar `DOPT=Use OCAL` target, an
+//!   array target gets the stale `OAV`, and under `DOPT=Use CALC` the
+//!   substitution is a no-op (C quirk, reproduced). See
+//!   `set_output_to_ivov` / `multi_output_scalar_companion`.
 //! - `SIZE` (NELM vs NUSE) is stored but does not gate the client-advertised
 //!   array capacity: the served element count is always
 //!   `acalcGetNumElements()` (C `get_array_info`), matching C's served data.
@@ -494,23 +497,17 @@ impl AcalcoutRecord {
     }
 
     /// menuIvoaSet_output_to_IVOV (C `execOutput`, `aCalcoutRecord.c:923-924`):
-    /// make the OUT link carry `IVOV`. C sets only the scalar `oval`;
-    /// `writeValue` then sends `val`/`aval` under `DOPT=Use CALC` or
-    /// `oval`/`oav` under `DOPT=Use OCAL` (`devaCalcoutSoft.c`). This port's
-    /// OUT model drives a single array field, so `IVOV` is written into
-    /// whichever field OUT consumes plus its scalar companion — a scalar OUT
-    /// target therefore also receives `IVOV` (sibling `scalcout` likewise sets
-    /// `VAL=ivov`). This drives `IVOV` uniformly across `DOPT`, whereas literal
-    /// C leaves the `DOPT=Use CALC` output as the failed `VAL`/`AVAL`.
+    /// `pcalc->oval = pcalc->ivov;` — the scalar `OVAL` ONLY. `writeValue`
+    /// then picks the buffer by DOPT and target nelm (`devaCalcoutSoft.c`),
+    /// so the substitution is observable exactly where C makes it so:
+    /// under `DOPT=Use OCAL` a scalar OUT target receives `IVOV` (the
+    /// `&oval` buffer) while an array target receives the stale `OAV`;
+    /// under `DOPT=Use CALC` the buffer is `VAL`/`AVAL`, which IVOV never
+    /// touches, so the substitution is a no-op — a C quirk this port
+    /// reproduces (aCalcPerform fills `OVAL`+`OAV` together, so IVOV is
+    /// the only point where `OVAL` and `OAV[0]` decouple).
     fn set_output_to_ivov(&mut self) {
-        let n = self.num_elements();
-        if self.dopt == 1 {
-            self.oval = self.ivov;
-            self.oav = vec![self.ivov; n];
-        } else {
-            self.val = self.ivov;
-            self.aval = vec![self.ivov; n];
-        }
+        self.oval = self.ivov;
     }
 
     /// C `aCalcoutRecord.c::special:471-478` — `pcalc->clcv =
@@ -1590,7 +1587,8 @@ impl Record for AcalcoutRecord {
 
     /// IVOA=SetIVOV severity hook. The framework calls this when SEVR is
     /// INVALID and IVOA=2. Overriding the trait default (which writes VAL via
-    /// `set_val`) targets the field OUT consumes, not VAL — see the module doc.
+    /// `set_val`) targets `OVAL` — C's `pcalc->oval = pcalc->ivov`, see
+    /// `set_output_to_ivov` and the module doc.
     ///
     /// The ONLY record-side gate is the output decision: C reaches the IVOA
     /// switch through `execOutput` (aCalcoutRecord.c:933-937), and `execOutput`
@@ -2155,9 +2153,11 @@ impl Record for AcalcoutRecord {
     }
 
     /// The OUT link receives the array result: AVAL when DOPT=Use CALC, OAV
-    /// when DOPT=Use OCAL (C `devaCalcoutSoft::write_acalcout`). `AVAL[0]==VAL`
-    /// and `OAV[0]==OVAL` by construction, so a scalar OUT target still sees
-    /// the scalar. Gated on the last cycle's OOPT/IVOA decision.
+    /// when DOPT=Use OCAL (C `devaCalcoutSoft::write_acalcout`). Gated on
+    /// the last cycle's OOPT/IVOA decision. The scalar companion below
+    /// supplies the `nelm == 1 ? &val : aval` / `nelm == 1 ? &oval : oav`
+    /// buffer choice — necessary since IVOA=Set_output_to_IVOV decouples
+    /// `OVAL` from `OAV[0]` (see `set_output_to_ivov`).
     fn multi_output_links(&self) -> &[(&'static str, &'static str)] {
         if !self.cached_should_output {
             &[]
@@ -2165,6 +2165,19 @@ impl Record for AcalcoutRecord {
             &[("OUT", "OAV")]
         } else {
             &[("OUT", "AVAL")]
+        }
+    }
+
+    /// C `devaCalcoutSoft.c::write_acalcout` (84-87): when the effective
+    /// element count resolves to 1, the write buffer is the scalar field
+    /// — `&pcalc->val` under DOPT=Use CALC, `&pcalc->oval` under Use OCAL
+    /// — not element 0 of the array. The OUT dispatch resolves the target
+    /// count and makes the pick (`PvDatabase::multi_out_buffer_choice`).
+    fn multi_output_scalar_companion(&self, link_field: &str) -> Option<&'static str> {
+        if link_field == "OUT" {
+            Some(if self.dopt == 1 { "OVAL" } else { "VAL" })
+        } else {
+            None
         }
     }
 
@@ -2553,17 +2566,20 @@ mod tests {
         rec.put_field("IVOA", EpicsValue::Short(2)).unwrap(); // Set to IVOV
         rec.put_field("IVOV", EpicsValue::Double(9.0)).unwrap();
         rec.process().unwrap();
+        let val_before = rec.val;
+        let aval_before = rec.get_field("AVAL");
         // IVOV substitution is owned by the framework IVOA dispatch via
-        // `apply_invalid_output_value` on the Complete path (matching C
-        // `execOutput`, aCalcoutRecord.c:923-924); `process()` no longer
-        // substitutes inline. Drive the hook as the framework does on an
-        // INVALID + IVOA=Set cycle.
+        // `apply_invalid_output_value` on the Complete path; C's arm is
+        // `pcalc->oval = pcalc->ivov;` ALONE (aCalcoutRecord.c:924) —
+        // VAL/AVAL/OAV keep the failed cycle's values.
         rec.apply_invalid_output_value(EpicsValue::Double(9.0))
             .unwrap();
-        assert_eq!(rec.val, 9.0);
+        assert_eq!(rec.oval, 9.0, "C sets only the scalar OVAL");
+        assert_eq!(rec.val, val_before, "VAL is not IVOV's target");
         assert_eq!(
             rec.get_field("AVAL"),
-            Some(EpicsValue::DoubleArray(vec![9.0, 9.0]))
+            aval_before,
+            "AVAL is not IVOV's target"
         );
     }
 

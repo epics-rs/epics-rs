@@ -1791,6 +1791,23 @@ pub trait Record: Send + Sync + 'static {
         &[]
     }
 
+    /// The scalar companion field of a multi-output pair whose C device
+    /// support picks its write buffer by the RESOLVED TARGET element
+    /// count — `devaCalcoutSoft.c::write_acalcout` (75-87): target nelm
+    /// from `dbCaGetNelements` (CA) / `dbNameToAddr` `no_elements` (DB,
+    /// default 1 when unresolvable), clamped by the source count, then
+    /// `pBuffer = nelm == 1 ? &scalar : array`.
+    ///
+    /// When this returns `Some(scalar_field)` for a pair's `link_field`,
+    /// the OUT dispatch writes the scalar field's value instead of the
+    /// pair's array value whenever the effective element count is 1 (see
+    /// `PvDatabase::multi_out_buffer_choice`). Default `None`: the
+    /// pair's value field is written as-is.
+    fn multi_output_scalar_companion(&self, link_field: &str) -> Option<&'static str> {
+        let _ = link_field;
+        None
+    }
+
     /// Return the name of the output event (`OEVT`) to post this cycle, or
     /// `None`. The event-subsystem twin of the OUT write: a downstream
     /// `SCAN="Event"` / `EVNT="<name>"` record is woken each time the record

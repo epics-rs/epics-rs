@@ -997,6 +997,91 @@ impl PvDatabase {
     /// `Constant`/`Hw`/`Calc`/`None` OUT links are not writable
     /// targets and are silently skipped (C `dbPutLink` returns
     /// `S_db_noLSET` for a link with no lset — the same no-op).
+    /// C `devaCalcoutSoft.c::write_acalcout` (65-88) buffer choice for a
+    /// multi-output pair that carries a scalar companion
+    /// ([`crate::server::record::Record::multi_output_scalar_companion`]):
+    /// resolve the TARGET element count and drive the scalar field when
+    /// the effective count is 1, the array field otherwise.
+    ///
+    /// C's resolution, mirrored branch for branch:
+    /// - source clamp `i = (nuse > 0) ? nuse : nelm` (:82-83) — already
+    ///   the served array length (`array_field_value` serves
+    ///   `num_elements()` elements), so a 1-element source picks the
+    ///   scalar regardless of the target;
+    /// - local DB target — `dbNameToAddr` `no_elements` (:78-79): the
+    ///   target field's array-ness (`EpicsValue::is_array`, the port's
+    ///   documented `no_elements > 1` stand-in). An unresolvable name
+    ///   leaves `nelm = 1` (:68), picking the scalar;
+    /// - external target (explicit `ca://`/`pva://` OR a DB-parsed name
+    ///   not in this IOC, which C classifies as a CA link) —
+    ///   `dbCaGetNelements` (:75-76): the lset's cached element count
+    ///   ([`LinkSet::link_metadata`]); a disconnected link reports none
+    ///   and leaves `nelm = 1`, exactly as C's failed `dbCaGetNelements`
+    ///   leaves the initializer.
+    ///
+    /// The target-side `min(target, source)` truncation for counts > 1
+    /// is the put path's own clamp (`dbAccess.c:1359` analogue in
+    /// `field_io.rs`); only the `nelm == 1 ⇒ &scalar` pick needs to
+    /// happen here, before the value is committed to the link write.
+    pub(crate) async fn multi_out_buffer_choice(
+        &self,
+        link: &crate::server::record::ParsedLink,
+        array_val: EpicsValue,
+        scalar_companion: Option<EpicsValue>,
+    ) -> EpicsValue {
+        let Some(scalar) = scalar_companion else {
+            return array_val;
+        };
+        // Source clamp: `i = (nuse>0 ? nuse : nelm); if (i < nelm) nelm = i;`
+        // — a single-element source picks the scalar buffer for any target.
+        if array_val.count() <= 1 {
+            return scalar;
+        }
+        // C dbCaGetNelements analogue: the lset's cached element count,
+        // defaulting to 1 when disconnected/uncached (C leaves the
+        // initializer untouched when dbCaGetNelements fails).
+        let external_nelements = |name: String| async move {
+            self.external_link_metadata(&name)
+                .await
+                .and_then(|m| m.element_count)
+                .unwrap_or(1)
+        };
+        let target_is_single = match link {
+            crate::server::record::ParsedLink::Db(db) => {
+                let target_name = if db.field == "VAL" {
+                    db.record.clone()
+                } else {
+                    format!("{}.{}", db.record, db.field)
+                };
+                if self.has_name_no_resolve(&db.record).await {
+                    // C dbNameToAddr → no_elements: scalar field ⇒ 1. A
+                    // resolvable record with an unknown field keeps C's
+                    // failed-dbNameToAddr default (nelm = 1).
+                    !self
+                        .get_pv(&target_name)
+                        .await
+                        .map(|v| v.is_array())
+                        .unwrap_or(false)
+                } else {
+                    // Non-local ⇒ CA link in C (`dbInitLink` locality).
+                    external_nelements(target_name).await <= 1
+                }
+            }
+            crate::server::record::ParsedLink::Ca(_)
+            | crate::server::record::ParsedLink::Pva(_)
+            | crate::server::record::ParsedLink::PvaJson(_) => {
+                let name = link
+                    .external_pv_name()
+                    .expect("Ca/Pva/PvaJson link carries a PV name");
+                external_nelements(name.to_string()).await <= 1
+            }
+            // Constant / Hw / Calc / None: not a writable target — the
+            // write path no-ops, the choice is irrelevant.
+            _ => return array_val,
+        };
+        if target_is_single { scalar } else { array_val }
+    }
+
     pub(crate) async fn write_out_link_value(
         &self,
         link: &crate::server::record::ParsedLink,

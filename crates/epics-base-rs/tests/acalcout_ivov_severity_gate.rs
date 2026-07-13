@@ -84,10 +84,17 @@ async fn r11_c15_a_limit_driven_invalid_still_substitutes_ivov() {
     // CALC="10" succeeds (no CALC_ALARM). HIHI=5 with HHSV=INVALID(3) drives the
     // record INVALID through checkAlarms' limit arm. IVOA=2 (Set_output_to_IVOV),
     // IVOV=42, OOPT=Every_Time (default), ODLY=0 → output fires this cycle.
+    // DOPT=Use OCAL: C's substitution is `pcalc->oval = pcalc->ivov` alone
+    // (aCalcoutRecord.c:924), so IVOV is observable at OUT only through the
+    // `&oval` buffer — the Use OCAL / scalar-target branch of
+    // devaCalcoutSoft.c:87.
     let mut a = AcalcoutRecord::default();
     a.put_field("CALC", EpicsValue::String("10".into()))
         .unwrap();
     a.special("CALC", true).unwrap();
+    a.put_field("DOPT", EpicsValue::Short(1)).unwrap();
+    a.put_field("OCAL", EpicsValue::String("7".into())).unwrap();
+    a.special("OCAL", true).unwrap();
     a.put_field("HIHI", EpicsValue::Double(5.0)).unwrap();
     a.put_field("HHSV", EpicsValue::Short(3)).unwrap();
     a.put_field("IVOA", EpicsValue::Short(2)).unwrap();
@@ -113,7 +120,7 @@ async fn r11_c15_a_limit_driven_invalid_still_substitutes_ivov() {
         *last.lock().unwrap(),
         Some(vec![42.0]),
         "C execOutput:915 tests nsev, not the calc status — a limit-driven INVALID \
-         with IVOA=Set_output_to_IVOV drives IVOV=42, not the calculated 10"
+         with IVOA=Set_output_to_IVOV drives IVOV=42 (via OVAL), not OCAL's 7"
     );
 }
 

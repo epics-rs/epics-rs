@@ -180,10 +180,16 @@ async fn acalcout_odly_ivov_substitutes_on_continuation_not_delaying_cycle() {
     // IEEE. C answers myMAXFLOAT/st=0 for aCalc `1/0` (aCalcPerform.c:690-696),
     // so it cannot drive the INVALID cycle this case needs; `1e300*1e300` is the
     // C-verified non-finite one (compiled aCalcPerform: st=-1 d=inf).
+    // DOPT=Use OCAL (W10-E3): C's substitution is `oval = ivov` alone
+    // (aCalcoutRecord.c:924), observable at OUT only through the `&oval`
+    // buffer a scalar target selects (devaCalcoutSoft.c:87).
     let mut a = AcalcoutRecord::default();
     a.put_field("CALC", EpicsValue::String("1e300*1e300".into()))
         .unwrap();
     a.special("CALC", true).unwrap();
+    a.put_field("DOPT", EpicsValue::Short(1)).unwrap();
+    a.put_field("OCAL", EpicsValue::String("3".into())).unwrap();
+    a.special("OCAL", true).unwrap();
     a.put_field("IVOA", EpicsValue::Short(2)).unwrap();
     a.put_field("IVOV", EpicsValue::Double(99.0)).unwrap();
     a.put_field("ODLY", EpicsValue::Double(100.0)).unwrap();
@@ -206,7 +212,7 @@ async fn acalcout_odly_ivov_substitutes_on_continuation_not_delaying_cycle() {
             "IVOA=Set + OOPT-fires + ODLY>0 must still defer"
         );
         assert_ne!(
-            guard.record.get_field("VAL"),
+            guard.record.get_field("OVAL"),
             Some(EpicsValue::Double(99.0)),
             "IVOV must NOT be substituted on the ODLY delaying cycle (C substitutes \
              oval=ivov inside execOutput, on the continuation)"

@@ -91,7 +91,14 @@ fn resolve_from_env() -> CaResult<CasUdpConfig> {
     let mut cfg = CasUdpConfig::default();
 
     if let Some(list) = epics_base_rs::runtime::env::get("EPICS_CAS_INTF_ADDR_LIST") {
-        let parsed = parse_ipv4_list(&list);
+        // C `caservertask.c:341-343` tokenizes with the server's UDP port and
+        // then runs the SAME `removeDuplicateAddresses(…, silent=0)` the client
+        // address list gets — a repeated interface would otherwise be bound (or
+        // its multicast group joined) twice, silently.
+        let udp_port = epics_base_rs::runtime::net::cas_server_port();
+        let parsed = crate::iocinf::remove_duplicate_addresses(parse_ipv4_list(&list), |ip| {
+            SocketAddr::V4(SocketAddrV4::new(*ip, udp_port))
+        });
         // C `rsrv/caservertask.c:367-371, 633-668` splits
         // multicast (224.0.0.0/4) entries off into
         // `casMCastAddrList` and joins each group via
@@ -210,12 +217,20 @@ fn resolve_from_env() -> CaResult<CasUdpConfig> {
         } else {
             discover_broadcast_addrs()
         };
+        // No `contains` guard: on the server C dedups the WHOLE beacon list —
+        // user entries and auto-discovered broadcasts together — with one
+        // `removeDuplicateAddresses(&beaconAddrList, &temp, 0)` at
+        // `caservertask.c:438`, which reports every repeat it drops. Two NICs on
+        // one subnet, or an operator who lists a broadcast the discovery already
+        // found, are exactly the cases C reports and the port swallowed.
         for bcast in bcast_iter {
-            let entry = SocketAddr::V4(SocketAddrV4::new(bcast, beacon_port));
-            if !beacon_addrs.contains(&entry) {
-                beacon_addrs.push(entry);
-            }
+            beacon_addrs.push(SocketAddr::V4(SocketAddrV4::new(bcast, beacon_port)));
         }
+    }
+    // C `caservertask.c:438` — outside the `if (autobeaconlist)`, so the user's
+    // own list is deduped and reported even when auto-discovery is off.
+    let mut beacon_addrs = crate::iocinf::remove_duplicate_addresses(beacon_addrs, |a| *a);
+    if auto_on {
         if beacon_addrs.is_empty() {
             // Last-resort fallback: limited broadcast.  C `rsrv_init`
             // does not add this — it warns and leaves the list empty
@@ -236,7 +251,13 @@ fn resolve_from_env() -> CaResult<CasUdpConfig> {
     cfg.beacon_addrs = beacon_addrs;
 
     if let Some(list) = epics_base_rs::runtime::env::get("EPICS_CAS_IGNORE_ADDR_LIST") {
-        cfg.ignore_addrs = parse_ipv4_list(&list);
+        // C `caservertask.c:450-451` builds this one with `port = 0`, so the
+        // duplicate it reports is dotted as `10.1.2.3:0` — captured from the
+        // compiled `softIoc`, which is why the port is not the server's here.
+        cfg.ignore_addrs =
+            crate::iocinf::remove_duplicate_addresses(parse_ipv4_list(&list), |ip| {
+                SocketAddr::V4(SocketAddrV4::new(*ip, 0))
+            });
     }
 
     // C `online_notify.c::rsrv_online_notify_task:52-57` reads

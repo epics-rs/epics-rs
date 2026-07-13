@@ -29,6 +29,7 @@ pub mod copt;
 pub mod discovery;
 pub mod estdlib;
 pub mod hostname;
+pub(crate) mod iocinf;
 pub mod observability;
 pub mod protocol;
 pub mod repeater;

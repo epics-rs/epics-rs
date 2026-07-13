@@ -4803,6 +4803,30 @@ pub(crate) fn parse_addr_list_with_hostnames() -> CaResult<Vec<AddrEntry>> {
     // operates on server NAMES, not IPs — see epics_rs_client_ignore
     // docstring for the naming rationale).
     let ignore_ips = epics_rs_client_ignore();
+
+    // C `configureChannelAccessAddressList` (`iocinf.cpp:195-227`) builds this
+    // list in ONE order: the auto-discovered broadcasts first (deduped among
+    // themselves, silently), the operator's `EPICS_CA_ADDR_LIST` appended
+    // after them, and a single `removeDuplicateAddresses(…, silent=0)` over the
+    // result. The port had the two halves the other way round, so an operator
+    // entry that names a broadcast address C would report as a duplicate would
+    // instead have silenced the auto entry.
+    // C `ca/src/client/iocinf.cpp:186-193` uses substring
+    // semantics: `yes = true; if (strstr(pstr,"no") || strstr(pstr,
+    // "NO")) yes = false`. Any value not containing "no"/"NO" keeps
+    // auto-discovery enabled — so `"1"`, `"true"`, `"on"`, `"bogus"`
+    // all enable on C. Pre-fix Rust used strict `eq_ignore_ascii_case
+    // ("YES")`, silently disabling auto-discovery on those values.
+    // Server-side `addr_list::from_env` keeps the strict semantic
+    // because the C server var uses `envGetBoolConfigParam` (strict);
+    // only the CLIENT var has the strstr quirk that Rust must mirror.
+    let auto_addr = epics_base_rs::runtime::env::get_or("EPICS_CA_AUTO_ADDR_LIST", "YES");
+    let auto_addr_enabled = !(auto_addr.contains("no") || auto_addr.contains("NO"));
+    if auto_addr_enabled {
+        let bcasts = crate::server::addr_list::discover_broadcast_addrs();
+        append_auto_addr_entries(&mut addrs, &bcasts, default_port);
+    }
+
     if let Some(list) = epics_base_rs::runtime::env::get("EPICS_CA_ADDR_LIST") {
         for entry in list.split_whitespace() {
             let (host_raw, port) = if entry.contains(':') {
@@ -4845,30 +4869,10 @@ pub(crate) fn parse_addr_list_with_hostnames() -> CaResult<Vec<AddrEntry>> {
         }
     }
 
-    // Mirror the legacy `parse_addr_list`'s
-    // AUTO_ADDR_LIST + broadcast-fallback behaviour. Without these
-    // the new live caller would silently drop UDP broadcast
-    // discovery for multi-NIC clients and the limited-broadcast
-    // last-resort fallback. The added entries are IP literals
-    // (`hostname = None`) so the periodic refresh task short-
-    // circuits them.
-    // C `ca/src/client/iocinf.cpp:186-193` uses substring
-    // semantics: `yes = true; if (strstr(pstr,"no") || strstr(pstr,
-    // "NO")) yes = false`. Any value not containing "no"/"NO" keeps
-    // auto-discovery enabled — so `"1"`, `"true"`, `"on"`, `"bogus"`
-    // all enable on C. Pre-fix Rust used strict `eq_ignore_ascii_case
-    // ("YES")`, silently disabling auto-discovery on those values.
-    // Server-side `addr_list::from_env` keeps the strict semantic
-    // because the C server var uses `envGetBoolConfigParam` (strict);
-    // only the CLIENT var has the strstr quirk that Rust must mirror.
-    let auto_addr = epics_base_rs::runtime::env::get_or("EPICS_CA_AUTO_ADDR_LIST", "YES");
-    let auto_addr_enabled = !(auto_addr.contains("no") || auto_addr.contains("NO"));
-    if auto_addr_enabled {
-        let server_port = default_port;
-        let bcasts = crate::server::addr_list::discover_broadcast_addrs();
-        append_auto_addr_entries(&mut addrs, &bcasts, server_port);
-    }
-    Ok(addrs)
+    // C `iocinf.cpp:227`: `removeDuplicateAddresses ( pList, &tmpList, 0 )`.
+    // The port kept every duplicate token, so `EPICS_CA_ADDR_LIST="A A"` sent
+    // two copies of every search datagram to A for the life of the client.
+    Ok(crate::iocinf::remove_duplicate_addresses(addrs, |e| e.sock))
 }
 
 /// AUTO_ADDR_LIST=YES expansion: append broadcast NICs, then a C-parity
@@ -5394,7 +5398,11 @@ pub(crate) fn parse_nameserver_list() -> Vec<(SocketAddr, Option<String>)> {
             }
         }
     }
-    out
+    // C `cac.cpp:260`: `removeDuplicateAddresses ( &dest, &tmpList, 0 )` — the
+    // name-server list is deduped by the SAME helper as `EPICS_CA_ADDR_LIST`,
+    // and warns about what it drops for the same reason: a repeated entry
+    // otherwise buys a second TCP circuit to that name server.
+    crate::iocinf::remove_duplicate_addresses(out, |(addr, _)| *addr)
 }
 
 // Legacy `parse_addr_list() -> Vec<SocketAddr>`

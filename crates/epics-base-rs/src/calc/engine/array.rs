@@ -1,6 +1,6 @@
 use super::array_value::ArrayStackValue::Double;
 use super::array_value::{ArrayCell, ArrayStackValue, zip_map};
-use super::cast::{c_int, c_long, d2ui};
+use super::cast::{c_int, c_long, d2ui, my_nint};
 use super::error::CalcError;
 use super::opcodes::{ArrayOp, ControlOp, CoreOp, Opcode};
 use super::random::local_random;
@@ -1551,12 +1551,6 @@ fn index_zero_crossing(arr: &[f64]) -> f64 {
         }
     }
     -1.0
-}
-
-/// C `myNINT` (`aCalcPerform.c:50`): `(int)(a >= 0 ? a+0.5 : a-0.5)` — a
-/// truncating cast, so it rounds half away from zero.
-fn my_nint(a: f64) -> i32 {
-    (if a >= 0.0 { a + 0.5 } else { a - 0.5 }) as i32
 }
 
 /// C `SMALL` (`aCalcPerform.c:56`).

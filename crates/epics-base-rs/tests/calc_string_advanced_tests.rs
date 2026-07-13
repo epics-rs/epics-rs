@@ -99,6 +99,60 @@ fn test_printf_hex_upper() {
     assert_eq!(result, StackValue::Str("FF".into()));
 }
 
+/// C's `myNINT` (`sCalcPerform.c:40`) casts to `int` INSIDE the macro:
+/// `#define myNINT(a) ((int)((a) >= 0 ? (a)+0.5 : (a)-0.5))`. So every integer
+/// conversion sees a value that has ALREADY been through the platform's
+/// double→int32 instruction — on x86-64 `cvttsd2si`, which answers with the
+/// indefinite value `INT32_MIN` for anything out of range, and for NaN.
+///
+/// The port's `my_nint` returned an `f64`, leaving each call site to invent its
+/// own narrowing: PRINTF wrapped (`as i64`) and BIN_WRITE saturated (`as i32`),
+/// so the two disagreed BITWISE on the same input. Compiled (`gcc -O0`, x86-64,
+/// runtime operand): `PRINTF("%d",3e9)` = `-2147483648` (port: `-1294967296`)
+/// and `$W("%i",3e9)` = `\x00\x00\x00\x80` (port: `\xff\xff\xff\x7f` — the exact
+/// bitwise opposite).
+#[test]
+fn test_my_nint_narrows_at_c_width_at_every_call_site() {
+    // PRINTF: out of int32 range, either sign, is the SAME indefinite value.
+    assert_eq!(
+        eval_str(r#"PRINTF("%d", 3e9)"#),
+        StackValue::Str("-2147483648".into())
+    );
+    assert_eq!(
+        eval_str(r#"PRINTF("%d", -3e9)"#),
+        StackValue::Str("-2147483648".into())
+    );
+    assert_eq!(
+        eval_str(r#"PRINTF("%x", 3e9)"#),
+        StackValue::Str("80000000".into())
+    );
+    // In range, `myNINT` still rounds half away from zero.
+    assert_eq!(
+        eval_str(r#"PRINTF("%d", 2.5)"#),
+        StackValue::Str("3".into())
+    );
+    assert_eq!(
+        eval_str(r#"PRINTF("%d", -2.5)"#),
+        StackValue::Str("-3".into())
+    );
+
+    // BIN_WRITE ($W) takes the low bytes of the SAME int — so it must agree with
+    // PRINTF bit for bit, which is what having one narrowing buys.
+    assert_eq!(
+        eval_str(r#"WRITE("%i", 3e9)"#),
+        StackValue::Str(r"\0\0\0\x80".into()),
+        "the four little-endian bytes of INT32_MIN, NUL escaped as \\0"
+    );
+    assert_eq!(
+        eval_str(r#"WRITE("%i", -3e9)"#),
+        StackValue::Str(r"\0\0\0\x80".into())
+    );
+    assert_eq!(
+        eval_str(r#"WRITE("%c", 3e9)"#),
+        StackValue::Str(r"\0".into())
+    );
+}
+
 // --- SSCANF ---
 //
 // Every value below is what compiled sCalc answers (`sCalcPerform.c:1635`,

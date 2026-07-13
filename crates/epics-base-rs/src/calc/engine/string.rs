@@ -1,4 +1,4 @@
-use super::cast::{c_int, c_long, d2ui};
+use super::cast::{c_int, c_long, d2ui, my_nint};
 use super::cvt;
 use super::error::CalcError;
 use super::opcodes::{CoreOp, Opcode, StringOp};
@@ -823,7 +823,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     // range is 0, not an error. `numArgs` is the CALLER's argument
                     // count — [`StringInputs::num_arg`], not the array's length.
                     let idx = my_nint(pop1(&mut stack)?.to_double());
-                    let v = f64_to_index(idx)
+                    let v = c_int_to_index(idx)
                         .and_then(|i| inputs.num_arg(i))
                         .unwrap_or(0.0);
                     stack.push(StackValue::Double(v));
@@ -835,7 +835,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     // test, so an out-of-range `@@` is the empty STRING (still a
                     // string, still not an error).
                     let idx = my_nint(pop1(&mut stack)?.to_double());
-                    let s = f64_to_index(idx)
+                    let s = c_int_to_index(idx)
                         .and_then(|i| inputs.str_arg(i))
                         .cloned()
                         .unwrap_or_default();
@@ -857,7 +857,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     // and is not an error, exactly as for `@`.
                     let value = pop1(&mut stack)?.to_double();
                     let idx = my_nint(pop1(&mut stack)?.to_double());
-                    if let Some(slot) = f64_to_index(idx).and_then(|i| inputs.num_arg_mut(i)) {
+                    if let Some(slot) = c_int_to_index(idx).and_then(|i| inputs.num_arg_mut(i)) {
                         *slot = value;
                     }
                 }
@@ -869,7 +869,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     // so a program containing one always runs this evaluator.)
                     let value = pop1(&mut stack)?.into_string_value();
                     let idx = my_nint(pop1(&mut stack)?.to_double());
-                    if let Some(slot) = f64_to_index(idx).and_then(|i| inputs.str_arg_mut(i)) {
+                    if let Some(slot) = c_int_to_index(idx).and_then(|i| inputs.str_arg_mut(i)) {
                         *slot = value;
                     }
                 }
@@ -1352,10 +1352,13 @@ fn render_spec(spec: &Spec, val: &StackValue) -> Vec<u8> {
             }
             return pad(b, spec.width, spec.minus, false);
         }
-        // C `l = myNINT(ps1->d)` and then a `%d`/`%x`/... conversion, which reads
-        // an INT out of the vararg: the value is the low 32 bits of that long.
+        // C `long l = myNINT(ps1->d)` and then a `%d`/`%x`/... conversion, which
+        // reads an INT out of the vararg. `myNINT` has ALREADY cast to `int`, so
+        // `l` is that 32-bit value sign-extended — never a 64-bit conversion of
+        // the double. (`PRINTF("%d",3e9)` is C's `-2147483648`, the indefinite
+        // value `cvttsd2si` yields, not `3e9`'s low 32 bits.)
         b'c' | b'd' | b'i' | b'o' | b'u' | b'x' | b'X' => {
-            let l = my_nint(val.to_double()) as i64;
+            let l = i64::from(my_nint(val.to_double()));
             return pad(render_int(spec, l), spec.width, spec.minus, spec.zero);
         }
         b'e' | b'E' => cvt::fmt_e(
@@ -1477,17 +1480,12 @@ fn pad(body: Vec<u8>, width: usize, minus: bool, zero: bool) -> Vec<u8> {
     out
 }
 
-/// C `myNINT` (sCalcPerform.c:40) — round half away from zero.
-fn my_nint(d: f64) -> f64 {
-    if d >= 0.0 { d + 0.5 } else { d - 0.5 }.trunc()
-}
-
-/// C's `i = myNINT(d); if (i >= numArgs || i < 0)` — the rounded index as a
-/// subscript, or `None` when it is negative (the `>= numArgs` half is the
-/// caller's `get`). NaN and the non-representable magnitudes take the `None`
-/// branch, which is where C's `(int)` cast would land them anyway.
-fn f64_to_index(d: f64) -> Option<usize> {
-    let i = super::cast::c_int(d);
+/// C's `i = myNINT(d); if (i >= numArgs || i < 0)` — the already-rounded index
+/// as a subscript, or `None` when it is negative (the `>= numArgs` half is the
+/// caller's `get`). NaN and the non-representable magnitudes arrive here as
+/// `INT32_MIN` from [`my_nint`]'s cast, so they take the `None` branch, which is
+/// where C's out-of-range test lands them too.
+fn c_int_to_index(i: i32) -> Option<usize> {
     usize::try_from(i).ok()
 }
 
@@ -1550,7 +1548,7 @@ fn bin_write(f: &[u8], val: &StackValue) -> Result<String, CalcError> {
     // `myNINT` casts to `int`, so the integer conversions see a 32-bit value
     // and `memcpy` then takes its low `width` bytes.
     let d = val.to_double();
-    let n = my_nint(d) as i32;
+    let n = my_nint(d);
     let raw: Vec<u8> = match field {
         BinField::Char => vec![n as u8],
         BinField::Int(w) | BinField::Uint(w) => n.to_le_bytes()[..w].to_vec(),
@@ -1677,7 +1675,7 @@ fn rfind_sub(h: &[u8], n: &[u8]) -> Option<usize> {
 fn shift_chars(bytes: &[u8], count: f64, right: bool) -> Vec<u8> {
     const N: usize = SCALC_STRING_SIZE;
     // C's `j` is an `int`: `myNINT` casts, and `myMIN(j, 40)` clamps only above.
-    let j = c_int(my_nint(count)).clamp(0, N as i32) as usize;
+    let j = my_nint(count).clamp(0, N as i32) as usize;
 
     let mut buf = [0u8; N];
     for (slot, b) in buf.iter_mut().zip(bytes.iter().take(N)) {

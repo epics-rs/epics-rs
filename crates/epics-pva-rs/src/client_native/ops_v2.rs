@@ -626,10 +626,7 @@ async fn op_get_inner(
     };
     if !init.status.is_success() {
         server.unregister_ioid(ioid);
-        return Err(PvaError::Protocol(format!(
-            "GET INIT failed: {:?}",
-            init.status
-        )));
+        return Err(PvaError::RemoteError(init.status));
     }
     ioid_guard.arm_destroy(sid);
     let intro = init.introspection;
@@ -651,14 +648,14 @@ async fn op_get_inner(
                     marked,
                 })
             } else {
-                Err(PvaError::Protocol(format!("GET data: {:?}", d.status)))
+                Err(PvaError::RemoteError(d.status))
             }
         }
         // a data-phase failure now arrives as a status-only
         // reply (server echoes the request data subcmd, no bitset/value),
         // so it decodes to OpResponse::Status. Surface the server status
         // instead of mislabelling it "expected GET data, got Status".
-        OpResponse::Status(s) => Err(PvaError::Protocol(format!("GET data: {:?}", s.status))),
+        OpResponse::Status(s) => Err(PvaError::RemoteError(s.status)),
         other => {
             // Wrong response kind for the GET data step == impossible op
             // state → connection-fatal (pvxs clientget.cpp:456-493).
@@ -782,10 +779,7 @@ pub async fn op_get_field(
     let frame = frame?;
     let resp = decode_get_field_or_reset(&server, &frame)?;
     if !resp.status.is_success() {
-        return Err(PvaError::Protocol(format!(
-            "GET_FIELD failed: {:?}",
-            resp.status
-        )));
+        return Err(PvaError::RemoteError(resp.status));
     }
     resp.introspection.ok_or_else(|| {
         PvaError::Protocol("GET_FIELD: no introspection in successful response".into())
@@ -920,10 +914,7 @@ pub async fn op_put_field(
     };
     if !init.status.is_success() {
         server.unregister_ioid(ioid);
-        return Err(PvaError::Protocol(format!(
-            "PUT INIT failed: {:?}",
-            init.status
-        )));
+        return Err(PvaError::RemoteError(init.status));
     }
     ioid_guard.arm_destroy(sid);
     let intro = init.introspection;
@@ -959,7 +950,7 @@ pub async fn op_put_field(
             if s.status.is_success() {
                 Ok(())
             } else {
-                Err(PvaError::Protocol(format!("PUT failed: {:?}", s.status)))
+                Err(PvaError::RemoteError(s.status))
             }
         }
         other => {
@@ -1100,10 +1091,7 @@ async fn op_put_fields_inner(
     };
     if !init.status.is_success() {
         server.unregister_ioid(ioid);
-        return Err(PvaError::Protocol(format!(
-            "PUT INIT failed: {:?}",
-            init.status
-        )));
+        return Err(PvaError::RemoteError(init.status));
     }
     ioid_guard.arm_destroy(sid);
     let intro = init.introspection;
@@ -1132,7 +1120,7 @@ async fn op_put_fields_inner(
             if s.status.is_success() {
                 Ok(())
             } else {
-                Err(PvaError::Protocol(format!("PUT failed: {:?}", s.status)))
+                Err(PvaError::RemoteError(s.status))
             }
         }
         other => {
@@ -1194,10 +1182,7 @@ pub async fn op_put_field_with_request(
     };
     if !init.status.is_success() {
         server.unregister_ioid(ioid);
-        return Err(PvaError::Protocol(format!(
-            "PUT INIT failed: {:?}",
-            init.status
-        )));
+        return Err(PvaError::RemoteError(init.status));
     }
     ioid_guard.arm_destroy(sid);
     let intro = init.introspection;
@@ -1230,7 +1215,7 @@ pub async fn op_put_field_with_request(
             if s.status.is_success() {
                 Ok(())
             } else {
-                Err(PvaError::Protocol(format!("PUT failed: {:?}", s.status)))
+                Err(PvaError::RemoteError(s.status))
             }
         }
         other => {
@@ -1298,10 +1283,7 @@ pub async fn op_put_value_field_with_request(
     };
     if !init.status.is_success() {
         server.unregister_ioid(ioid);
-        return Err(PvaError::Protocol(format!(
-            "PUT INIT failed: {:?}",
-            init.status
-        )));
+        return Err(PvaError::RemoteError(init.status));
     }
     ioid_guard.arm_destroy(sid);
     let intro = init.introspection;
@@ -1342,7 +1324,7 @@ pub async fn op_put_value_field_with_request(
             if s.status.is_success() {
                 Ok(())
             } else {
-                Err(PvaError::Protocol(format!("PUT failed: {:?}", s.status)))
+                Err(PvaError::RemoteError(s.status))
             }
         }
         other => {
@@ -1502,10 +1484,7 @@ pub async fn op_put_value(
         }
     };
     if !init.status.is_success() {
-        return Err(PvaError::Protocol(format!(
-            "PUT INIT failed: {:?}",
-            init.status
-        )));
+        return Err(PvaError::RemoteError(init.status));
     }
     ioid_guard.arm_destroy(sid);
     let intro = init.introspection;
@@ -1540,7 +1519,7 @@ pub async fn op_put_value(
             if s.status.is_success() {
                 Ok(())
             } else {
-                Err(PvaError::Protocol(format!("PUT failed: {:?}", s.status)))
+                Err(PvaError::RemoteError(s.status))
             }
         }
         other => {
@@ -1594,10 +1573,7 @@ pub async fn op_put_value_raw(
         }
     };
     if !init.status.is_success() {
-        return Err(PvaError::Protocol(format!(
-            "PUT INIT failed: {:?}",
-            init.status
-        )));
+        return Err(PvaError::RemoteError(init.status));
     }
     ioid_guard.arm_destroy(sid);
     let intro = init.introspection;
@@ -1629,7 +1605,7 @@ pub async fn op_put_value_raw(
             if s.status.is_success() {
                 Ok(())
             } else {
-                Err(PvaError::Protocol(format!("PUT failed: {:?}", s.status)))
+                Err(PvaError::RemoteError(s.status))
             }
         }
         other => {
@@ -1736,10 +1712,7 @@ where
     };
     if !init.status.is_success() {
         server.unregister_ioid(ioid);
-        return Err(PvaError::Protocol(format!(
-            "PUT INIT failed: {:?}",
-            init.status
-        )));
+        return Err(PvaError::RemoteError(init.status));
     }
     ioid_guard.arm_destroy(sid);
     let intro = init.introspection;
@@ -1800,7 +1773,7 @@ where
             if s.status.is_success() {
                 Ok(())
             } else {
-                Err(PvaError::Protocol(format!("PUT failed: {:?}", s.status)))
+                Err(PvaError::RemoteError(s.status))
             }
         }
         other => {
@@ -2257,9 +2230,9 @@ fn classify_raw_monitor_frame(payload: &[u8], order: ByteOrder) -> RawMonitorFra
         // degrade to a clean end-of-stream: that would hide an upstream
         // protocol error from a forwarding gateway.
         return match crate::client_native::decode::monitor_finish_body(payload, order) {
-            Ok((st, _)) if !st.is_success() => RawMonitorFrameKind::FinishError(
-                PvaError::Protocol(format!("MONITOR FINISH with non-success status: {st:?}")),
-            ),
+            Ok((st, _)) if !st.is_success() => {
+                RawMonitorFrameKind::FinishError(PvaError::RemoteError(st))
+            }
             Ok((_, Some(body_start))) => RawMonitorFrameKind::FinishData { body_start },
             Ok((_, None)) => RawMonitorFrameKind::FinishOk,
             Err(e) => RawMonitorFrameKind::Invalid(PvaError::Decode(e)),
@@ -2639,10 +2612,7 @@ where
         // A non-success INIT Status is data, not a wire fault: pvxs sets
         // `update.exc = RemoteError` and leaves the circuit alive
         // (clientmon.cpp:612-614).
-        return Err(td.remote(PvaError::Protocol(format!(
-            "MONITOR INIT failed: {:?}",
-            init.status
-        ))));
+        return Err(td.remote(PvaError::RemoteError(init.status)));
     }
     let intro = init.introspection;
     // raw-path Pauser support: honour the handle's prior
@@ -3306,10 +3276,7 @@ where
         // A non-success INIT Status is data, not a wire fault: pvxs sets
         // `update.exc = RemoteError` and leaves the circuit alive
         // (clientmon.cpp:612-614).
-        return Err(td.remote(PvaError::Protocol(format!(
-            "MONITOR INIT failed: {:?}",
-            init.status
-        ))));
+        return Err(td.remote(PvaError::RemoteError(init.status)));
     }
     let intro = init.introspection;
 
@@ -3451,7 +3418,7 @@ where
                 // A non-success Status on a well-formed frame is data, not a
                 // wire fault: pvxs delivers it as a per-subscription
                 // `RemoteError` and keeps the circuit (clientmon.cpp:612-614).
-                return Err(td.remote(PvaError::Protocol(format!("MONITOR error: {:?}", s.status))));
+                return Err(td.remote(PvaError::RemoteError(s.status)));
             }
             Ok(OpResponse::Init(_)) => {
                 // A second INIT while the monitor is already Running is a
@@ -3572,10 +3539,7 @@ pub async fn op_rpc(
     };
     if !init_resp.status.is_success() {
         server.unregister_ioid(ioid);
-        return Err(PvaError::Protocol(format!(
-            "RPC INIT: {:?}",
-            init_resp.status
-        )));
+        return Err(PvaError::RemoteError(init_resp.status));
     }
     ioid_guard.arm_destroy(sid);
     let response_intro = init_resp.introspection;
@@ -3612,10 +3576,10 @@ pub async fn op_rpc(
                     None => RpcReply::Empty,
                 })
             } else {
-                Err(PvaError::Protocol(format!("RPC: {:?}", d.status)))
+                Err(PvaError::RemoteError(d.status))
             }
         }
-        OpResponse::Status(s) => Err(PvaError::Protocol(format!("RPC: {:?}", s.status))),
+        OpResponse::Status(s) => Err(PvaError::RemoteError(s.status)),
         other => {
             // Wrong response kind for the RPC data step == impossible op
             // state → connection-fatal (pvxs clientget.cpp:456-493).
@@ -3873,9 +3837,7 @@ async fn op_put_get_data(
         Ok(Ok(descs)) => descs,
         Ok(Err(status)) => {
             server.unregister_ioid(ioid);
-            return Err(PvaError::Protocol(format!(
-                "PUT_GET INIT failed: {status:?}"
-            )));
+            return Err(PvaError::RemoteError(status));
         }
         Err(e) => {
             // Command/subcommand mismatch or truncated INIT body is fatal.
@@ -3925,7 +3887,7 @@ async fn op_put_get_data(
         let resp_desc = if is_get_put { &put_if } else { &get_if };
         match decode_put_get_data(&resp_frame, resp_desc, &mut cache) {
             Ok(Ok(decoded)) => Ok(decoded),
-            Ok(Err(status)) => Err(PvaError::Protocol(format!("PUT_GET: {status:?}"))),
+            Ok(Err(status)) => Err(PvaError::RemoteError(status)),
             Err(e) => {
                 // Command mismatch or truncated data body is fatal.
                 server.close();
@@ -4131,7 +4093,7 @@ async fn op_array_data(
         Ok(Ok(desc)) => desc,
         Ok(Err(status)) => {
             server.unregister_ioid(ioid);
-            return Err(PvaError::Protocol(format!("ARRAY INIT failed: {status:?}")));
+            return Err(PvaError::RemoteError(status));
         }
         Err(e) => {
             server.close();
@@ -4185,7 +4147,7 @@ async fn op_array_data(
     let resp_frame = await_frame(&mut stream, op_timeout).await?;
     let result = match decode_array_data(&resp_frame, &req, &array_desc, &mut cache) {
         Ok(Ok(resp)) => Ok(resp),
-        Ok(Err(status)) => Err(PvaError::Protocol(format!("ARRAY: {status:?}"))),
+        Ok(Err(status)) => Err(PvaError::RemoteError(status)),
         Err(e) => {
             server.close();
             Err(e)
@@ -4410,7 +4372,7 @@ pub async fn op_array_describe(
         Ok(Ok(desc)) => desc,
         Ok(Err(status)) => {
             server.unregister_ioid(ioid);
-            return Err(PvaError::Protocol(format!("ARRAY INIT failed: {status:?}")));
+            return Err(PvaError::RemoteError(status));
         }
         Err(e) => {
             server.close();
@@ -7110,8 +7072,10 @@ mod tests {
         let mut payload = vec![0u8, 0, 0, 0, 0x10];
         crate::proto::Status::error("boom".to_string()).write_into(ByteOrder::Little, &mut payload);
         match classify_raw_monitor_frame(&payload, ByteOrder::Little) {
-            RawMonitorFrameKind::FinishError(PvaError::Protocol(msg)) => {
-                assert!(msg.contains("non-success"), "msg: {msg}");
+            // The peer's own Status, not a rendering of it — a forwarding
+            // gateway sends it downstream unchanged (R18-27).
+            RawMonitorFrameKind::FinishError(PvaError::RemoteError(st)) => {
+                assert_eq!(st, crate::proto::Status::error("boom".to_string()));
             }
             other => panic!("non-success FINISH must be FinishError, got {other:?}"),
         }

@@ -2408,3 +2408,90 @@ async fn r18_28_gateway_monitor_seed_declares_whole_structure() {
         initial.marked
     );
 }
+
+/// An upstream IOC that refuses the write with a `Status` of its own —
+/// `Fatal`, with a message AND a stack. Everything the downstream client is
+/// owed is in that Status; the gateway's only job is not to touch it.
+struct RefusingUpstream;
+
+impl RefusingUpstream {
+    const PV: &'static str = "GW:R18_27:PV";
+    const MESSAGE: &'static str = "record is locked by another client";
+    const STACK: &'static str = "iocsource.cpp:397";
+
+    fn refusal() -> epics_pva_rs::proto::Status {
+        epics_pva_rs::proto::Status::Detailed {
+            kind: epics_pva_rs::proto::StatusKind::Fatal,
+            message: Self::MESSAGE.into(),
+            stack: Self::STACK.into(),
+        }
+    }
+}
+
+impl ChannelSource for RefusingUpstream {
+    async fn list_pvs(&self) -> Vec<String> {
+        vec![Self::PV.into()]
+    }
+    fn has_pv(&self, n: &str) -> impl std::future::Future<Output = bool> + Send {
+        let matches = n == Self::PV;
+        async move { matches }
+    }
+    async fn get_introspection(&self, _: &str) -> Option<FieldDesc> {
+        Some(nt_double_desc())
+    }
+    async fn get_value(&self, _: &str) -> Option<PvField> {
+        Some(nt_double_value(1.0))
+    }
+    async fn is_writable(&self, _: &str) -> bool {
+        true
+    }
+    async fn put_value(&self, _: &str, _: PvField) -> Result<(), OpError> {
+        Err(OpError::remote(Self::refusal()))
+    }
+    async fn subscribe(&self, _: &str) -> Option<tokio::sync::mpsc::Receiver<PvField>> {
+        None
+    }
+}
+
+/// R18-27: the gateway forwards the upstream `Status` VERBATIM.
+///
+/// The downstream client asked the upstream's question, so it is owed the
+/// upstream's answer: kind `Fatal`, the upstream message, the upstream stack.
+/// pva2pva cannot re-author it (the downstream requester is handed straight to
+/// the upstream channel — `p2pApp/channel.cpp:117-127`); the Rust gateway has
+/// two legs and must forward it explicitly.
+///
+/// Pre-fix the upstream reply was rendered with `format!("PUT INIT failed:
+/// {:?}", init.status)` (`ops_v2.rs:1289`) and re-authored as a local `Error`,
+/// so the wire carried a Rust `Debug` dump, the `Fatal` kind was downgraded to
+/// `Error`, and the stack was dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r18_27_gateway_forwards_the_upstream_status_verbatim() {
+    let (_us, us_addr) = spawn_upstream_source(RefusingUpstream);
+    let upstream_client = Arc::new(
+        PvaClient::builder()
+            .server_addr(us_addr)
+            .timeout(Duration::from_secs(2))
+            .build(),
+    );
+    let gw = PvaGateway::start(gateway_cfg(upstream_client)).expect("gateway start");
+    let client = gw.client_config();
+
+    let err = client
+        .pvput_pv_field(RefusingUpstream::PV, &nt_double_value(7.0))
+        .await
+        .expect_err("the upstream refuses this write, so the gateway PUT must fail");
+
+    let status = match err {
+        epics_pva_rs::error::PvaError::RemoteError(s) => s,
+        other => panic!(
+            "a non-success reply Status must reach the caller as RemoteError(Status), got: {other:?}"
+        ),
+    };
+    assert_eq!(
+        status,
+        RefusingUpstream::refusal(),
+        "the gateway must put the upstream's own Status on the downstream wire \
+         (kind/message/stack intact), not a rendering of it"
+    );
+}

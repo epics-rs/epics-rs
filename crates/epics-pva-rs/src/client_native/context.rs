@@ -2645,9 +2645,7 @@ impl PvaClient {
                 Ok(Ok(frame)) => match warm.server.upgrade() {
                     Some(_) => match super::decode::decode_op_response(&frame, Some(&intro)) {
                         Ok(OpResponse::Data(d)) if d.status.is_success() => Ok(d.value),
-                        Ok(OpResponse::Data(d)) => {
-                            Err(PvaError::Protocol(format!("warm GET data: {:?}", d.status)))
-                        }
+                        Ok(OpResponse::Data(d)) => Err(PvaError::RemoteError(d.status)),
                         Ok(other) => Err(PvaError::Protocol(format!(
                             "expected GET data, got {other:?}"
                         ))),

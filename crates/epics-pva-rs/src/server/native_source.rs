@@ -1077,7 +1077,7 @@ mod tests {
                 .await;
             self.put_value_checked(checked, value, ctx)
                 .await
-                .map_err(String::from)
+                .map_err(|e| e.message)
         }
         async fn get_value_ctx(&self, pv: &str, ctx: ChannelContext) -> Option<PvField> {
             let checked = self

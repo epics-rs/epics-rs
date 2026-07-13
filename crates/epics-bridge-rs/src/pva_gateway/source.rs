@@ -376,6 +376,28 @@ pub struct GatewayChannelSource {
     channel_invalidator: Arc<OnceLock<ChannelInvalidator>>,
 }
 
+/// The one place an upstream client-side failure becomes a downstream
+/// [`OpError`] — the gateway's whole error-forwarding contract (R18-27).
+///
+/// An upstream op that answered with a non-success `Status` gives us that
+/// `Status`; it goes downstream **as itself** — kind, message and stack —
+/// because the downstream client asked the upstream question and is owed the
+/// upstream answer. pva2pva gets this for free: it hands the downstream
+/// requester straight to the upstream channel (`p2pApp/channel.cpp:117-127`),
+/// so it has no opportunity to re-author the Status. Our two legs are separate
+/// operations, so the forwarding is explicit — but it must be lossless.
+/// Rendering it (`format!("{e}")`) is what put a Rust `Debug` dump on the PVA
+/// wire and coerced every upstream FATAL/WARN into a downstream ERROR.
+///
+/// Anything else (a timeout, a dropped circuit, a decode error) is OUR
+/// failure, not a forwarded one, and is authored here as a local error.
+fn upstream_op_error(e: epics_pva_rs::error::PvaError) -> OpError {
+    match e {
+        epics_pva_rs::error::PvaError::RemoteError(status) => OpError::remote(status),
+        other => OpError::failed(other.to_string()),
+    }
+}
+
 impl GatewayChannelSource {
     pub fn new(cache: Arc<ChannelCache>) -> Self {
         let acf: AcfCell = Arc::new(RwLock::new(None));
@@ -1167,7 +1189,7 @@ impl ChannelSource for GatewayChannelSource {
             .client()
             .pvput_pv_field(name, &value)
             .await
-            .map_err(|e| OpError::failed(e.to_string()))
+            .map_err(upstream_op_error)
     }
 
     /// Credential-aware PUT — migration to the
@@ -1236,7 +1258,7 @@ impl ChannelSource for GatewayChannelSource {
             }
             None => client.pvput_pv_field(name, &value).await,
         };
-        result.map_err(|e| OpError::failed(e.to_string()))
+        result.map_err(upstream_op_error)
     }
 
     /// Credential-aware atomic **PUT_GET** — forward the whole operation
@@ -1308,7 +1330,7 @@ impl ChannelSource for GatewayChannelSource {
             None => client.pvput_get_pv_field_marked(name, &delta).await,
         };
         read.map(|r| Some(upstream_read(r)))
-            .map_err(|e| OpError::failed(e.to_string()))
+            .map_err(upstream_op_error)
     }
 
     async fn is_writable(&self, name: &str) -> bool {
@@ -1361,7 +1383,7 @@ impl ChannelSource for GatewayChannelSource {
         .await;
         match result {
             Ok(Ok(pair)) => Ok(pair),
-            Ok(Err(e)) => Err(OpError::failed(e.to_string())),
+            Ok(Err(e)) => Err(upstream_op_error(e)),
             Err(_) => Err(OpError::failed(format!("upstream rpc timeout for {name}"))),
         }
     }
@@ -1430,7 +1452,7 @@ impl ChannelSource for GatewayChannelSource {
         let result = tokio::time::timeout(self.rpc_timeout, call).await;
         match result {
             Ok(Ok(pair)) => Ok(pair),
-            Ok(Err(e)) => Err(OpError::failed(e.to_string())),
+            Ok(Err(e)) => Err(upstream_op_error(e)),
             Err(_) => Err(OpError::failed(format!("upstream rpc timeout for {name}"))),
         }
     }
@@ -1449,7 +1471,7 @@ impl ChannelSource for GatewayChannelSource {
             .client()
             .pvprocess(name)
             .await
-            .map_err(|e| OpError::failed(e.to_string()))
+            .map_err(upstream_op_error)
     }
 
     /// Credential-aware PROCESS. pvxs treats PROCESS as a WRITE-class
@@ -1495,7 +1517,7 @@ impl ChannelSource for GatewayChannelSource {
             Some(req) => client.pvprocess_with_request_value(name, req).await,
             None => client.pvprocess(name).await,
         };
-        result.map_err(|e| OpError::failed(e.to_string()))
+        result.map_err(upstream_op_error)
     }
 
     // ── ChannelArray (cmd 14) — forward to the per-credential upstream ──
@@ -1528,7 +1550,7 @@ impl ChannelSource for GatewayChannelSource {
             Some(req) => client.pvarray_describe_with_request_value(name, req).await,
             None => client.pvarray_describe(name).await,
         };
-        result.map_err(|e| OpError::failed(e.to_string()))
+        result.map_err(upstream_op_error)
     }
 
     async fn channel_array_get(
@@ -1561,7 +1583,7 @@ impl ChannelSource for GatewayChannelSource {
         };
         result
             .map(|(_desc, value)| value)
-            .map_err(|e| OpError::failed(e.to_string()))
+            .map_err(upstream_op_error)
     }
 
     async fn channel_array_put(
@@ -1592,7 +1614,7 @@ impl ChannelSource for GatewayChannelSource {
             }
             None => client.pvarray_put(name, &value, offset, stride).await,
         };
-        result.map_err(|e| OpError::failed(e.to_string()))
+        result.map_err(upstream_op_error)
     }
 
     async fn channel_array_set_length(
@@ -1621,7 +1643,7 @@ impl ChannelSource for GatewayChannelSource {
             }
             None => client.pvarray_set_length(name, length).await,
         };
-        result.map_err(|e| OpError::failed(e.to_string()))
+        result.map_err(upstream_op_error)
     }
 
     async fn channel_array_get_length(
@@ -1649,7 +1671,7 @@ impl ChannelSource for GatewayChannelSource {
             }
             None => client.pvarray_get_length(name).await,
         };
-        result.map_err(|e| OpError::failed(e.to_string()))
+        result.map_err(upstream_op_error)
     }
 
     async fn subscribe_raw(

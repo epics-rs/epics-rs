@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
-use crate::proto::MessageType;
+use crate::proto::{MessageType, Status};
 use crate::pvdata::{FieldDesc, PvField, RpcReply};
 pub use epics_base_rs::server::access_security::{AccessChecked, AccessGate};
 
@@ -299,9 +299,16 @@ pub struct WatermarkEvent {
 pub struct OpError {
     /// Classification bucket — drives the audit Denied/Failed split.
     pub kind: OpErrorKind,
-    /// Human-readable message; this is the text serialised into the
-    /// PVA `Status` sent to the client.
+    /// Human-readable message; the text serialised into the PVA `Status`
+    /// sent to the client when this error carries no `status` of its own.
     pub message: String,
+    /// The `Status` a proxying source received from ITS upstream, to be sent
+    /// downstream unchanged. `None` for an error this server originated.
+    ///
+    /// Set only through [`OpError::remote`]; read only through
+    /// [`OpError::wire_status`], which is the single owner of "what Status
+    /// does a failed op put on the wire".
+    pub status: Option<Status>,
 }
 
 /// Outcome bucket for an [`OpError`]. Distinct from a free-text
@@ -323,6 +330,7 @@ impl OpError {
         Self {
             kind: OpErrorKind::Denied,
             message: message.into(),
+            status: None,
         }
     }
 
@@ -331,7 +339,38 @@ impl OpError {
         Self {
             kind: OpErrorKind::Failed,
             message: message.into(),
+            status: None,
         }
+    }
+
+    /// An upstream `Status`, to be forwarded downstream **verbatim** — the
+    /// error a proxying source (the PVA gateway) returns when its upstream
+    /// refused the operation.
+    ///
+    /// pva2pva does not re-author an upstream Status because it cannot: it
+    /// hands the downstream requester straight to the upstream channel
+    /// (`p2pApp/channel.cpp:117-127`), so the upstream's own reply reaches the
+    /// downstream client. Here the two legs are separate ops, so the Status is
+    /// carried across explicitly instead — kind, message, and stack intact.
+    /// The audit bucket stays `Failed`: a refusal by SOMEONE ELSE'S access
+    /// control is, to this server, an upstream failure, and its own ACL
+    /// denials are what the `Denied` bucket counts.
+    pub fn remote(status: Status) -> Self {
+        Self {
+            kind: OpErrorKind::Failed,
+            message: status.message().unwrap_or_default().to_string(),
+            status: Some(status),
+        }
+    }
+
+    /// The `Status` this error puts on the wire — the upstream's own when this
+    /// is a forwarded [`Self::remote`], else an `Error` status carrying the
+    /// message. Single owner: every server reply path for a failed op goes
+    /// through here, so no path can flatten a forwarded Status into text.
+    pub fn wire_status(&self) -> Status {
+        self.status
+            .clone()
+            .unwrap_or_else(|| Status::error(self.message.clone()))
     }
 }
 
@@ -359,15 +398,12 @@ impl From<&str> for OpError {
     }
 }
 
-/// Lossy back-conversion to the wire-status string: drops the kind,
-/// keeping only the message. The wire layer serialises only this
-/// human text into the PVA `Status`, so `Status::error(op_err)` works
-/// directly.
-impl From<OpError> for String {
-    fn from(e: OpError) -> Self {
-        e.message
-    }
-}
+// NOTE: no `impl From<OpError> for String`. It existed so that
+// `Status::error(op_err)` compiled — which is exactly the flattening R18-27
+// is about: it discarded a forwarded upstream `Status` (kind, stack) and
+// re-authored it as a local ERROR carrying the rendered text. The wire path
+// is [`OpError::wire_status`] and nothing else; removing the conversion makes
+// the lossy path fail to compile rather than fail on the wire.
 
 /// Server-wide channel-invalidation fan-out. An operator-driven cache
 /// removal (PVA gateway `<prefix>:drop` / `:flush`) publishes the set of

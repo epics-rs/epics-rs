@@ -267,6 +267,59 @@ fn set_empty_request_alarm(instance: &mut crate::server::record::RecordInstance)
     );
 }
 
+/// Snapshot NORD before a `dbPut` writes the value field — C `put_array_info`
+/// opens with `epicsUInt32 nord = prec->nord;` (`waveformRecord.c:202-216`).
+///
+/// `None` for a put to any field but VAL, and for a record type that has no
+/// NORD (the comparison in [`post_array_info`] then reduces to "unchanged").
+fn array_nord_before_put(
+    instance: &crate::server::record::RecordInstance,
+    field: &str,
+) -> Option<EpicsValue> {
+    if field == "VAL" {
+        instance.record.get_field("NORD")
+    } else {
+        None
+    }
+}
+
+/// The tail of C `put_array_info`, and the SINGLE owner of the NORD post:
+///
+/// ```c
+/// if (nord != prec->nord)
+///     db_post_events(prec, &prec->nord, DBE_VALUE | DBE_LOG);
+/// ```
+///
+/// `put_array_info` is called from `dbPut`, so it is reached by EVERY put
+/// route — CA, `dbPutLink`, internal — and by none of them conditionally. The
+/// port's array records (waveform/aai/aao/subArray) re-derive NORD inside
+/// `put_field("VAL")`; this is the post half, and every `dbPut` body in this
+/// module calls it after the value write, passing the snapshot taken by
+/// [`array_nord_before_put`].
+///
+/// Note this post is NOT the process cycle's monitor post: the compiled softIoc
+/// on a 10-second-SCAN waveform posts `NORD = 3` the instant `caput -a WP 3
+/// 1 2 3` lands, and posts no VAL at all (waveform VAL is `pp(TRUE)`, so C
+/// suppresses the value-field post in `dbPut` and the scan is 10 seconds away).
+fn post_array_info(
+    instance: &mut crate::server::record::RecordInstance,
+    old_nord: &Option<EpicsValue>,
+    origin: u64,
+) {
+    let Some(old) = old_nord else { return };
+    let moved = instance
+        .record
+        .get_field("NORD")
+        .is_some_and(|new| new != *old);
+    if moved {
+        instance.notify_field_with_origin(
+            "NORD",
+            crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::LOG,
+            origin,
+        );
+    }
+}
+
 impl PvDatabase {
     /// Get a PV value synchronously, from a thread that cannot `await`.
     ///
@@ -416,6 +469,7 @@ impl PvDatabase {
             // emission) can be skipped when the put is a no-op —
             // epics-base faac1df1.
             let prev_value = instance.record.get_field(&field);
+            let old_nord = array_nord_before_put(&instance, &field);
 
             // Link writes the record's `special()` makes itself (C runs them
             // inside `dbPut`); executed below, once the record lock is released.
@@ -456,6 +510,15 @@ impl PvDatabase {
             // Invalidate metadata cache only if the metadata-class
             // field's value actually changed (faac1df1).
             instance.notify_field_written_if_changed(&field, prev_value.as_ref());
+
+            // The one post this body makes. `put_pv` is the `dbPutLink` route's
+            // `dbPut`, and C's `put_array_info` is reached from every `dbPut` —
+            // an OUT link that shortens a waveform posts NORD in C even when the
+            // link is NPP and the target never processes. The value-field post
+            // stays absent here (C suppresses it for a `pp(TRUE)` value field,
+            // and the port's other callers of `put_pv` rely on the process cycle
+            // for it); NORD has no such second path.
+            post_array_info(&mut instance, &old_nord, 0);
 
             // The record lock must be down before the scan-index update and
             // before the `special()` link writes below, which re-enter the
@@ -648,16 +711,7 @@ impl PvDatabase {
             let old_value = instance.record.get_field(&field);
             let old_stat = instance.common.stat;
             let old_sevr = instance.common.sevr;
-            // Snapshot side-effect-prone fields BEFORE the put. The
-            // array-family records (waveform/aai/aao/subArray) update
-            // NORD as a side-effect of put_field("VAL"); other record
-            // types return None for "NORD" and the comparison reduces
-            // to None==None → unchanged.
-            let old_nord = if field == "VAL" {
-                instance.record.get_field("NORD")
-            } else {
-                None
-            };
+            let old_nord = array_nord_before_put(&instance, &field);
 
             // Link writes the record's `special()` makes itself (C runs them
             // inside `dbPut`); executed below, once the record lock is released.
@@ -715,12 +769,7 @@ impl PvDatabase {
             let value_changed = old_value != new_value;
             let alarm_changed =
                 old_stat != instance.common.stat || old_sevr != instance.common.sevr;
-            let new_nord = if field == "VAL" {
-                instance.record.get_field("NORD")
-            } else {
-                None
-            };
-            let nord_changed = field == "VAL" && old_nord != new_nord && new_nord.is_some();
+            let nord_changed = old_nord.is_some() && instance.record.get_field("NORD") != old_nord;
             if value_changed || alarm_changed || nord_changed {
                 // Update timestamp so the snapshot carries current time
                 instance.common.time = crate::runtime::general_time::get_current();
@@ -734,22 +783,14 @@ impl PvDatabase {
                         origin,
                     );
                 }
-                // Surface the implicit NORD update to NORD subscribers
-                // for waveform/aai/aao/subArray. Without this, a CA
+                // The NORD post, through the one owner. Without it a CA
                 // gateway forwarding upstream waveform monitors via
-                // put_pv_and_post would update VAL on the shadow PV
-                // but leave downstream NORD subscribers stuck at their
-                // last seen length — a frozen-element-count bug that
-                // surfaces in PyDM image views and similar consumers
-                // that compute height = element_count / width.
-                if nord_changed {
-                    instance.notify_field_with_origin(
-                        "NORD",
-                        crate::server::recgbl::EventMask::VALUE
-                            | crate::server::recgbl::EventMask::LOG,
-                        origin,
-                    );
-                }
+                // put_pv_and_post would update VAL on the shadow PV but
+                // leave downstream NORD subscribers stuck at their last
+                // seen length — a frozen-element-count bug that surfaces
+                // in PyDM image views and similar consumers that compute
+                // height = element_count / width.
+                post_array_info(&mut instance, &old_nord, origin);
             }
 
             // The `special()` link writes re-enter the database, so the record
@@ -1188,6 +1229,7 @@ impl PvDatabase {
 
             // Capture pre-put value for faac1df1 idempotent-write suppression.
             let prev_value = instance.record.get_field(&field);
+            let old_nord = array_nord_before_put(&instance, &field);
 
             // Try record-specific field first; fall back to common on FieldNotFound.
             // For record-owned fields, call on_put() and special() after successful put,
@@ -1297,6 +1339,15 @@ impl PvDatabase {
                     crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::LOG,
                 );
             }
+
+            // The NORD post, through the one owner — C reaches `put_array_info`
+            // from `dbPut`, so the CA route posts it exactly like the internal
+            // one. It is NOT covered by the value-field post above: for a
+            // waveform that post is suppressed (VAL is `pp(TRUE)`), and it is
+            // not covered by the process cycle either — a `caput -a` to a
+            // slow-scanned or passive-but-unprocessed waveform posts NORD now
+            // and VAL only at the next scan.
+            post_array_info(&mut instance, &old_nord, 0);
 
             // Fields a `special()` changed as a side effect of this put
             // (e.g. compress RES reset zeroing NUSE/VAL) get their monitors

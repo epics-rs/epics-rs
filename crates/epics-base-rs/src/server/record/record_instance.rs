@@ -1731,6 +1731,14 @@ impl RecordInstance {
                 }
             }
             "INP" => {
+                // A record type whose C `.dbd` has no INP must refuse it, the
+                // way C's dbd does ("field not found" at load, record inert) —
+                // `histogram`'s input link is SVL, not INP
+                // (histogramRecord.dbd.pod:212). Without this the port accepts a
+                // `field(INP,...)` no C IOC can load.
+                if !self.record.declares_inp_link() {
+                    return Err(CaError::FieldNotFound("INP".to_string()));
+                }
                 if let EpicsValue::String(s) = value {
                     self.common.inp = s.as_str_lossy().into_owned();
                     if !self.record_declares_field("INP") {

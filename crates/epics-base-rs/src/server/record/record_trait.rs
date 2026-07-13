@@ -1605,6 +1605,22 @@ pub trait Record: Send + Sync + 'static {
         false
     }
 
+    /// Whether this record type's `.dbd` declares an `INP` field at all.
+    ///
+    /// The port keeps INP on `CommonFields` for every record, which is right for
+    /// the input records (`aiRecord.dbd.pod` … all declare it) but wrong for the
+    /// ones whose C `.dbd` has no INP: C's dbd is the gate there, and
+    /// `field(INP,...)` on such a record is a load error ("field not found"),
+    /// leaving the record inert.
+    ///
+    /// `histogram` is the case this exists for: `histogramRecord.dbd.pod`
+    /// declares NO INP — its DBF_INLINK is `SVL` (:212), read into SGNL by
+    /// `devHistogramSoft.c` — so a histogram driven from INP is a database that
+    /// no C IOC can load. Default `true`.
+    fn declares_inp_link(&self) -> bool {
+        true
+    }
+
     /// Process-time INP read when the INP link is CONSTANT (or unset) — the
     /// per-record exception to the load-once rule.
     ///

@@ -45,7 +45,12 @@ pub(crate) const LNK_LINK_FIELDS: [&str; 16] = [
 
 /// Record-specific input link fields that may carry a CP/CPP modifier:
 /// DOL (ao/bo/longout/mbbo), DOL0-DOLF (seq — 16 groups), DOL1-DOLA
-/// (sseq — legacy 10 groups), NVL (sel), SELL (sseq), SGNL (histogram).
+/// (sseq — legacy 10 groups), NVL (sel), SELL (sseq), SVL (histogram).
+///
+/// `SVL` — not `SGNL`: `histogramRecord.dbd.pod:212` declares
+/// `field(SVL,DBF_INLINK)`, while SGNL is the `DBF_DOUBLE` value the link is
+/// read INTO (:202). The list named SGNL, which is not a link field, so a
+/// `field(SVL,"SRC CP")` histogram never got a CP monitor.
 ///
 /// Shared by [`PvDatabase::record_link_fields`] (the single owner of
 /// "which fields on a record are links") and consumed transitively by
@@ -53,7 +58,7 @@ pub(crate) const LNK_LINK_FIELDS: [&str; 16] = [
 /// install scan (PVA CP/CPP), so the two enumerations cannot diverge.
 pub(crate) const CP_INPUT_LINK_FIELDS: &[&str] = &[
     "DOL", "DOL0", "DOL1", "DOL2", "DOL3", "DOL4", "DOL5", "DOL6", "DOL7", "DOL8", "DOL9", "DOLA",
-    "DOLB", "DOLC", "DOLD", "DOLE", "DOLF", "NVL", "SELL", "SGNL",
+    "DOLB", "DOLC", "DOLD", "DOLE", "DOLF", "NVL", "SELL", "SVL",
 ];
 
 /// Alarm state from a link source, used for MS/NMS propagation.

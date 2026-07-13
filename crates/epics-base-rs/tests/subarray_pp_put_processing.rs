@@ -69,7 +69,7 @@ async fn nelm_put_narrows_the_slice_it_does_not_empty_val() {
     );
     assert_eq!(
         field(&db, "SA:CONST", "NELM").await,
-        Some(EpicsValue::Long(2))
+        Some(EpicsValue::ULong(2))
     );
 }
 
@@ -86,7 +86,7 @@ async fn nelm_put_above_malm_clamps_at_process() {
 
     assert_eq!(
         field(&db, "SA:CONST", "NELM").await,
-        Some(EpicsValue::Long(8))
+        Some(EpicsValue::ULong(8))
     );
     assert_eq!(
         field(&db, "SA:CONST", "NORD").await,

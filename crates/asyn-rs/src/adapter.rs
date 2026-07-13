@@ -1347,9 +1347,11 @@ impl AsynDeviceSupport {
             return self.write_op(val);
         };
         // Size by the record's NORD (C `pwf->nord`), clamped to the value length.
-        let nord = match record.get_field("NORD") {
-            Some(EpicsValue::Long(n)) => (n.max(0) as usize).min(data.len()),
-            _ => data.len(),
+        // NORD is DBF_ULONG on waveform/aai/aao and DBF_LONG on subArray, so read
+        // it through the numeric view rather than one variant.
+        let nord = match record.get_field("NORD").and_then(|v| v.to_f64()) {
+            Some(n) => (n.max(0.0) as usize).min(data.len()),
+            None => data.len(),
         };
         Some(RequestOp::OctetWrite {
             data: self.cap_octet_write(data[..nord].to_vec()),
@@ -1693,8 +1695,10 @@ impl DeviceSupport for AsynDeviceSupport {
         }
 
         // Read NELM from the record to set max_array_elements for array reads.
-        if let Some(EpicsValue::Long(nelm)) = record.get_field("NELM") {
-            if nelm > 0 {
+        // NELM is DBF_ULONG (waveform/aai/aao) and DBF_USHORT (histogram); take
+        // the numeric view so no declaration is missed.
+        if let Some(nelm) = record.get_field("NELM").and_then(|v| v.to_f64()) {
+            if nelm > 0.0 {
                 self.max_array_elements = nelm as usize;
             }
         }

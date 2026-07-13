@@ -505,12 +505,12 @@ fn waveform_put_get_array() {
     let mut rec = WaveformRecord::new(10, DbFieldType::Long);
 
     // Initially empty
-    assert_eq!(rec.get_field("NORD"), Some(EpicsValue::Long(0)));
+    assert_eq!(rec.get_field("NORD"), Some(EpicsValue::ULong(0)));
 
     // Put 3 values
     rec.put_field("VAL", EpicsValue::LongArray(vec![1, 2, 3]))
         .unwrap();
-    assert_eq!(rec.get_field("NORD"), Some(EpicsValue::Long(3)));
+    assert_eq!(rec.get_field("NORD"), Some(EpicsValue::ULong(3)));
 
     // Verify values
     if let Some(EpicsValue::LongArray(arr)) = rec.get_field("VAL") {
@@ -790,7 +790,7 @@ fn waveform_length_one() {
 
     wf.put_field("VAL", EpicsValue::DoubleArray(vec![2.0]))
         .unwrap();
-    assert_eq!(wf.get_field("NORD"), Some(EpicsValue::Long(1)));
+    assert_eq!(wf.get_field("NORD"), Some(EpicsValue::ULong(1)));
 
     if let Some(EpicsValue::DoubleArray(arr)) = wf.get_field("VAL") {
         assert_eq!(arr.len(), 1);
@@ -807,7 +807,7 @@ fn waveform_multi_element() {
 
     wf.put_field("VAL", EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0]))
         .unwrap();
-    assert_eq!(wf.get_field("NORD"), Some(EpicsValue::Long(3)));
+    assert_eq!(wf.get_field("NORD"), Some(EpicsValue::ULong(3)));
 
     // Put exactly NELM elements
     wf.put_field(
@@ -815,7 +815,7 @@ fn waveform_multi_element() {
         EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0, 5.0]),
     )
     .unwrap();
-    assert_eq!(wf.get_field("NORD"), Some(EpicsValue::Long(5)));
+    assert_eq!(wf.get_field("NORD"), Some(EpicsValue::ULong(5)));
 }
 
 /// C EPICS: testLinkSevr — alarm severity field access
@@ -1021,13 +1021,13 @@ fn waveform_ftvl_types() {
     let mut wf_d = WaveformRecord::new(5, DbFieldType::Double);
     wf_d.put_field("VAL", EpicsValue::DoubleArray(vec![1.0, 2.0]))
         .unwrap();
-    assert_eq!(wf_d.get_field("NORD"), Some(EpicsValue::Long(2)));
+    assert_eq!(wf_d.get_field("NORD"), Some(EpicsValue::ULong(2)));
 
     // Long array
     let mut wf_l = WaveformRecord::new(5, DbFieldType::Long);
     wf_l.put_field("VAL", EpicsValue::LongArray(vec![10, 20, 30]))
         .unwrap();
-    assert_eq!(wf_l.get_field("NORD"), Some(EpicsValue::Long(3)));
+    assert_eq!(wf_l.get_field("NORD"), Some(EpicsValue::ULong(3)));
 }
 
 // ============================================================

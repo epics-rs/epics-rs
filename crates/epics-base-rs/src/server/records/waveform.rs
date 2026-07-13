@@ -2,6 +2,7 @@ use crate::error::{CaError, CaResult};
 use crate::server::record::{
     FieldDesc, MENU_YES_NO, ProcessAction, ProcessOutcome, Record, parse_link_v2,
 };
+use crate::server::records::count_put;
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
 /// Which EPICS record-type name an [`ArrayRecord`] reports. The four
@@ -670,12 +671,18 @@ impl WaveformRecord {
 // `field(...)` on `field_list` membership, so an omission there is a silently
 // dropped field at load, not a compile error).
 //
-// `$nelm_ro` is the only shape difference in the shared part: waveform/aai/aao
-// declare NELM `special(SPC_NOMOD)` (load-settable, runtime-immutable), subArray
-// declares it `pp(TRUE)` (runtime-writable). FTVL/NORD are `special(SPC_NOMOD)`
-// in all four.
+// Two shape differences in the shared part, both straight from the `.dbd.pod`s:
+//
+// `$nelm_ro` — waveform/aai/aao declare NELM `special(SPC_NOMOD)` (load-settable,
+// runtime-immutable), subArray declares it `pp(TRUE)` (runtime-writable).
+// FTVL/NORD are `special(SPC_NOMOD)` in all four.
+//
+// `$nord_ty` — NORD is `DBF_ULONG` on waveform (:465), aai (:364) and aao (:397)
+// but `DBF_LONG` on subArray (`subArrayRecord.dbd.pod:394`). C really is
+// asymmetric here, and the type is wire-visible (CA promotes DBF_ULONG to
+// DBR_DOUBLE, PVA serves it as uint32), so each kind passes its own.
 macro_rules! array_field_list {
-    ($valty:expr, $nelm_ro:expr $(, $extra:expr)* $(,)?) => {
+    ($valty:expr, $nelm_ro:expr, $nord_ty:expr $(, $extra:expr)* $(,)?) => {
         &[
             FieldDesc {
                 name: "VAL",
@@ -683,13 +690,15 @@ macro_rules! array_field_list {
                 read_only: false,
             },
             FieldDesc {
+                // `DBF_ULONG` on all four (waveformRecord.dbd.pod:447,
+                // aaiRecord :349, aaoRecord :382, subArrayRecord :379).
                 name: "NELM",
-                dbf_type: DbFieldType::Long,
+                dbf_type: DbFieldType::ULong,
                 read_only: $nelm_ro,
             },
             FieldDesc {
                 name: "NORD",
-                dbf_type: DbFieldType::Long,
+                dbf_type: $nord_ty,
                 read_only: true,
             },
             FieldDesc {
@@ -747,6 +756,8 @@ macro_rules! array_sim_field_list {
         array_field_list!(
             $valty,
             true,
+            // waveform/aai/aao: NORD is DBF_ULONG.
+            DbFieldType::ULong,
             FieldDesc {
                 name: "SIML",
                 dbf_type: DbFieldType::String,
@@ -866,14 +877,18 @@ macro_rules! subarray_field_list {
         array_field_list!(
             $valty,
             false,
+            // subArray alone declares NORD `DBF_LONG` (subArrayRecord.dbd.pod:394).
+            DbFieldType::Long,
             FieldDesc {
+                // `DBF_ULONG` (subArrayRecord.dbd.pod:371).
                 name: "MALM",
-                dbf_type: DbFieldType::Long,
+                dbf_type: DbFieldType::ULong,
                 read_only: true,
             },
             FieldDesc {
+                // `DBF_ULONG` (subArrayRecord.dbd.pod:385).
                 name: "INDX",
-                dbf_type: DbFieldType::Long,
+                dbf_type: DbFieldType::ULong,
                 read_only: false,
             },
             // subArray declares BUSY too (`subArrayRecord.dbd.pod:390-393`),
@@ -1107,8 +1122,17 @@ impl Record for WaveformRecord {
                 val.truncate(self.nord.max(0) as usize);
                 Some(val)
             }
-            "NELM" => Some(EpicsValue::Long(self.nelm)),
-            "NORD" => Some(EpicsValue::Long(self.nord)),
+            // The DBF types are the `.dbd.pod`'s (see `array_field_list!`): NELM
+            // is DBF_ULONG on all four kinds, NORD is DBF_ULONG on
+            // waveform/aai/aao and DBF_LONG on subArray. The value variant is
+            // what CA and PVA project the native type from (CA promotes
+            // DBF_ULONG to DBR_DOUBLE per db_convert.h; PVA serves uint32), so
+            // it has to agree with the `FieldDesc` — as it does for VAL.
+            "NELM" => Some(EpicsValue::ULong(self.nelm as u32)),
+            "NORD" => Some(match self.kind {
+                ArrayKind::SubArray => EpicsValue::Long(self.nord),
+                _ => EpicsValue::ULong(self.nord as u32),
+            }),
             "FTVL" => Some(EpicsValue::Short(self.ftvl)),
             "MPST" if self.has_post_block() => Some(EpicsValue::Short(self.mpst)),
             "APST" if self.has_post_block() => Some(EpicsValue::Short(self.apst)),
@@ -1118,8 +1142,12 @@ impl Record for WaveformRecord {
             // subArray-specific INDX/MALM fields. Other array record
             // kinds expose them as zero (matches C dbpr output for a
             // record type that doesn't declare the field).
-            "INDX" if matches!(self.kind, ArrayKind::SubArray) => Some(EpicsValue::Long(self.indx)),
-            "MALM" if matches!(self.kind, ArrayKind::SubArray) => Some(EpicsValue::Long(self.malm)),
+            "INDX" if matches!(self.kind, ArrayKind::SubArray) => {
+                Some(EpicsValue::ULong(self.indx as u32))
+            }
+            "MALM" if matches!(self.kind, ArrayKind::SubArray) => {
+                Some(EpicsValue::ULong(self.malm as u32))
+            }
             // RARM (re-arm control) is waveform-only, used by waveform device
             // support (devAsynXXXTimeSeries); aai/aao/subArray do not declare it.
             // BUSY (acquisition-active) is declared by waveform AND subArray —
@@ -1162,7 +1190,7 @@ impl Record for WaveformRecord {
                 self.land_val_in_buffer(value)
             }
             "NELM" => {
-                if let EpicsValue::Long(n) = value {
+                if let Some(n) = count_put(&value) {
                     if n <= 0 {
                         return Err(CaError::InvalidValue(format!(
                             "NELM must be positive, got {n}"
@@ -1228,10 +1256,8 @@ impl Record for WaveformRecord {
             }
             "NORD" => Err(CaError::ReadOnlyField(name.to_string())),
             "INDX" if matches!(self.kind, ArrayKind::SubArray) => {
-                let v = match value {
-                    EpicsValue::Long(v) => v,
-                    EpicsValue::Short(v) => v as i32,
-                    _ => return Err(CaError::TypeMismatch("INDX".into())),
+                let Some(v) = count_put(&value) else {
+                    return Err(CaError::TypeMismatch("INDX".into()));
                 };
                 // Store INDX as given (floored at 0). NO MALM clamp here — C
                 // clamps INDX->MALM-1 at process (subArrayRecord.c:313-314),
@@ -1242,10 +1268,8 @@ impl Record for WaveformRecord {
                 Ok(())
             }
             "MALM" if matches!(self.kind, ArrayKind::SubArray) => {
-                let v = match value {
-                    EpicsValue::Long(v) => v,
-                    EpicsValue::Short(v) => v as i32,
-                    _ => return Err(CaError::TypeMismatch("MALM".into())),
+                let Some(v) = count_put(&value) else {
+                    return Err(CaError::TypeMismatch("MALM".into()));
                 };
                 // C floors MALM to 1 (subArrayRecord.c:96-97); it is never 0.
                 // No NELM/INDX re-clamp here — both are clamped against MALM at
@@ -2034,8 +2058,8 @@ mod array_kind_tests {
         let mut r = WaveformRecord::with_kind(ArrayKind::SubArray);
         r.put_field("INDX", EpicsValue::Long(5)).unwrap();
         r.put_field("MALM", EpicsValue::Long(100)).unwrap();
-        assert_eq!(r.get_field("INDX"), Some(EpicsValue::Long(5)));
-        assert_eq!(r.get_field("MALM"), Some(EpicsValue::Long(100)));
+        assert_eq!(r.get_field("INDX"), Some(EpicsValue::ULong(5)));
+        assert_eq!(r.get_field("MALM"), Some(EpicsValue::ULong(100)));
     }
 
     #[test]
@@ -2043,12 +2067,12 @@ mod array_kind_tests {
         // C `subArrayRecord.dbd` `initial("1")` + `init_record` floor
         // (subArrayRecord.c:96-97): MALM is never 0.
         let r = WaveformRecord::with_kind(ArrayKind::SubArray);
-        assert_eq!(r.get_field("MALM"), Some(EpicsValue::Long(1)));
+        assert_eq!(r.get_field("MALM"), Some(EpicsValue::ULong(1)));
         let mut z = WaveformRecord::with_kind(ArrayKind::SubArray);
         z.put_field("MALM", EpicsValue::Long(0)).unwrap();
         assert_eq!(
             z.get_field("MALM"),
-            Some(EpicsValue::Long(1)),
+            Some(EpicsValue::ULong(1)),
             "MALM put of 0 floors back to 1"
         );
     }

@@ -1457,6 +1457,12 @@ pub trait Record: Send + Sync + 'static {
     /// `DBE_LOG` should be on the VAL post this cycle and whether the hash
     /// changed (so the owner posts `HASH` with `DBE_VALUE`). Called by
     /// `check_deadband_ext` (the single owner of the VAL-mask decision).
+    ///
+    /// The hook is the VAL mask, not the MPST/APST rule specifically: any
+    /// record whose C `monitor()` decides the mask by its own rule implements
+    /// it. `histogram` is the other implementor — its rule is the MDEL COUNT
+    /// deadband (`mcnt > mdel`, histogramRecord.c:287-291), and like waveform's
+    /// it updates the state it keys on (there, `MCNT = 0`; here, `HASH`).
     fn array_monitor_post(&mut self) -> Option<ArrayMonitorPost> {
         None
     }

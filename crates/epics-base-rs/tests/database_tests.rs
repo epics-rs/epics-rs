@@ -6810,8 +6810,14 @@ async fn test_array_records_nord_monitor_uses_post_process_timestamp() {
         let event = nord_rx
             .try_recv()
             .unwrap_or_else(|_| panic!("NORD monitor event must be delivered for {name}"));
+        // NORD is DBF_ULONG on waveform/aai/aao and DBF_LONG on subArray
+        // (subArrayRecord.dbd.pod:394).
+        let nord_is_3 = match kind {
+            ArrayKind::SubArray => matches!(event.snapshot.value, EpicsValue::Long(3)),
+            _ => matches!(event.snapshot.value, EpicsValue::ULong(3)),
+        };
         assert!(
-            matches!(event.snapshot.value, EpicsValue::Long(3)),
+            nord_is_3,
             "{name}: NORD payload should reflect post-set_val length (3), got {:?}",
             event.snapshot.value
         );
@@ -6977,7 +6983,7 @@ async fn test_put_pv_and_post_propagates_nord_side_effect_on_waveform() {
         .try_recv()
         .expect("NORD event must be delivered after put_pv_and_post (side-effect of VAL)");
     assert!(
-        matches!(nord_event.snapshot.value, EpicsValue::Long(4)),
+        matches!(nord_event.snapshot.value, EpicsValue::ULong(4)),
         "NORD event should reflect post-put length (4), got {:?}",
         nord_event.snapshot.value
     );
@@ -7477,7 +7483,7 @@ async fn test_compress_every_spc_reset_field_resets_the_buffer() {
             for v in [1.0, 2.0, 3.0] {
                 inst.record.put_field("VAL", EpicsValue::Double(v)).unwrap();
             }
-            assert_eq!(inst.record.get_field("NUSE"), Some(EpicsValue::Long(3)));
+            assert_eq!(inst.record.get_field("NUSE"), Some(EpicsValue::ULong(3)));
         }
 
         db.put_record_field_from_ca(&name, field, value)
@@ -7488,12 +7494,12 @@ async fn test_compress_every_spc_reset_field_resets_the_buffer() {
         let inst = rec.read().await;
         assert_eq!(
             inst.record.get_field("NUSE"),
-            Some(EpicsValue::Long(0)),
+            Some(EpicsValue::ULong(0)),
             "a put to SPC_RESET field {field} must zero NUSE"
         );
         assert_eq!(
             inst.record.get_field("OFF"),
-            Some(EpicsValue::Long(0)),
+            Some(EpicsValue::ULong(0)),
             "a put to SPC_RESET field {field} must zero OFF"
         );
         match inst.record.get_field("VAL") {
@@ -7558,7 +7564,7 @@ async fn test_compress_val_no_mod_under_lifo_balg() {
     let inst = rec.read().await;
     assert_eq!(
         inst.record.get_field("NUSE"),
-        Some(EpicsValue::Long(0)),
+        Some(EpicsValue::ULong(0)),
         "a refused put must not reach the ring"
     );
 
@@ -7569,7 +7575,7 @@ async fn test_compress_val_no_mod_under_lifo_balg() {
     inst.record
         .put_field_internal("VAL", EpicsValue::Double(7.0))
         .expect("the INP-driven ingest is not a dbPut and is not gated");
-    assert_eq!(inst.record.get_field("NUSE"), Some(EpicsValue::Long(1)));
+    assert_eq!(inst.record.get_field("NUSE"), Some(EpicsValue::ULong(1)));
 }
 
 /// C `field(CSTA,DBF_SHORT){ special(SPC_NOMOD) }`
@@ -7762,7 +7768,7 @@ async fn test_histogram_sdel_watchdog_posts_val() {
     }
     assert_eq!(
         rec.read().await.record.get_field("MCNT"),
-        Some(EpicsValue::Long(0)),
+        Some(EpicsValue::Short(0)),
         "wdogCallback zeroes MCNT after the post"
     );
 
@@ -7810,7 +7816,7 @@ async fn test_compress_ouse_and_inpn_fields() {
 
     assert_eq!(
         db.get_pv("CMP_OUSE.OUSE").await.unwrap(),
-        EpicsValue::Long(0)
+        EpicsValue::ULong(0)
     );
     assert_eq!(
         db.get_pv("CMP_OUSE.INPN").await.unwrap(),
@@ -7839,11 +7845,11 @@ async fn test_compress_ouse_and_inpn_fields() {
     db.process_record("CMP_OUSE").await.unwrap();
     assert_eq!(
         db.get_pv("CMP_OUSE.NUSE").await.unwrap(),
-        EpicsValue::Long(1)
+        EpicsValue::ULong(1)
     );
     assert_eq!(
         db.get_pv("CMP_OUSE.OUSE").await.unwrap(),
-        EpicsValue::Long(1),
+        EpicsValue::ULong(1),
         "monitor() latches OUSE = NUSE on a publishing cycle"
     );
 
@@ -7853,11 +7859,11 @@ async fn test_compress_ouse_and_inpn_fields() {
         .unwrap();
     assert_eq!(
         db.get_pv("CMP_OUSE.NUSE").await.unwrap(),
-        EpicsValue::Long(0)
+        EpicsValue::ULong(0)
     );
     assert_eq!(
         db.get_pv("CMP_OUSE.OUSE").await.unwrap(),
-        EpicsValue::Long(0)
+        EpicsValue::ULong(0)
     );
 
     // The latch is what gates the NUSE post: that first RES moved NUSE 1 -> 0,
@@ -10207,7 +10213,7 @@ async fn promptgroup_config_fields_load_settable_runtime_immutable() {
     let mut common: Vec<(String, EpicsValue)> = Vec::new();
     apply_fields(&mut hist, &[("NELM".into(), "5".into())], &mut common)
         .expect("histogram NELM is .db-settable (promptgroup)");
-    assert_eq!(hist.get_field("NELM"), Some(EpicsValue::Long(5)));
+    assert_eq!(hist.get_field("NELM"), Some(EpicsValue::UShort(5)));
     match hist.get_field("VAL") {
         Some(EpicsValue::ULongArray(v)) => {
             assert_eq!(v.len(), 5, "NELM load resizes the bin array")
@@ -10219,7 +10225,7 @@ async fn promptgroup_config_fields_load_settable_runtime_immutable() {
     let mut common = Vec::new();
     apply_fields(&mut comp, &[("NSAM".into(), "7".into())], &mut common)
         .expect("compress NSAM is .db-settable (promptgroup)");
-    assert_eq!(comp.get_field("NSAM"), Some(EpicsValue::Long(7)));
+    assert_eq!(comp.get_field("NSAM"), Some(EpicsValue::ULong(7)));
 
     let mut sarr = create_record("subArray").expect("create subArray");
     let mut common = Vec::new();
@@ -10229,8 +10235,8 @@ async fn promptgroup_config_fields_load_settable_runtime_immutable() {
         &mut common,
     )
     .expect("subArray MALM/INDX are .db-settable (in field_list)");
-    assert_eq!(sarr.get_field("MALM"), Some(EpicsValue::Long(8)));
-    assert_eq!(sarr.get_field("INDX"), Some(EpicsValue::Long(3)));
+    assert_eq!(sarr.get_field("MALM"), Some(EpicsValue::ULong(8)));
+    assert_eq!(sarr.get_field("INDX"), Some(EpicsValue::ULong(3)));
 
     // --- RUNTIME half: a CA caput is rejected for the SPC_NOMOD fields by the
     //     field_io read_only gate, but accepted for the pp field (subArray INDX). ---
@@ -10283,7 +10289,7 @@ async fn promptgroup_config_fields_load_settable_runtime_immutable() {
     // (no `ReadOnlyField`) is what this assertion is about; the clamp is C's.
     assert_eq!(
         indx,
-        Some(EpicsValue::Long(0)),
+        Some(EpicsValue::ULong(0)),
         "runtime INDX caput landed, then the pp(TRUE) process clamped it to MALM-1"
     );
 }
@@ -10305,7 +10311,7 @@ async fn waveform_nelm_ftvl_runtime_immutable_subarray_nelm_writable() {
     let mut common: Vec<(String, EpicsValue)> = Vec::new();
     apply_fields(&mut wf, &[("NELM".into(), "4".into())], &mut common)
         .expect("waveform NELM is .db-settable at load");
-    assert_eq!(wf.get_field("NELM"), Some(EpicsValue::Long(4)));
+    assert_eq!(wf.get_field("NELM"), Some(EpicsValue::ULong(4)));
 
     let db = PvDatabase::new();
     db.add_record("WF", create_record("waveform").unwrap())

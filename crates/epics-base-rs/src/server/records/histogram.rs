@@ -196,8 +196,10 @@ static HISTOGRAM_FIELDS: &[FieldDesc] = &[
         read_only: false,
     },
     FieldDesc {
+        // C `field(NELM,DBF_USHORT)` (histogramRecord.dbd.pod:163) — histogram's
+        // bin count is USHORT, not the ULONG the array records use.
         name: "NELM",
-        dbf_type: DbFieldType::Long,
+        dbf_type: DbFieldType::UShort,
         read_only: true,
     },
     FieldDesc {
@@ -253,13 +255,16 @@ static HISTOGRAM_FIELDS: &[FieldDesc] = &[
         read_only: false,
     },
     FieldDesc {
+        // C `field(MDEL,DBF_SHORT)` (histogramRecord.dbd.pod:229) — the COUNT
+        // deadband, and `field(MCNT,DBF_SHORT)` (:234), counts since the last
+        // posted VAL. Both are SHORT, not LONG.
         name: "MDEL",
-        dbf_type: DbFieldType::Long,
+        dbf_type: DbFieldType::Short,
         read_only: false,
     },
     FieldDesc {
         name: "MCNT",
-        dbf_type: DbFieldType::Long,
+        dbf_type: DbFieldType::Short,
         read_only: true,
     },
     FieldDesc {
@@ -325,9 +330,53 @@ impl Record for HistogramRecord {
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         // C `process` → `add_count(prec)` then `monitor`. The signal
         // is read from the input link by the framework before
-        // process(); count it into the current bucket.
+        // process(); count it into the current bucket. `monitor()`'s
+        // count-deadband decision is `array_monitor_post` below.
         self.add_count();
         Ok(ProcessOutcome::complete())
+    }
+
+    /// C `histogramRecord.c::monitor` (:282-296) — the record's VAL-mask rule,
+    /// and the ONLY writer of MCNT on the monitor path:
+    ///
+    /// ```c
+    /// static void monitor(histogramRecord *prec) {
+    ///     unsigned short monitor_mask = recGblResetAlarms(prec);
+    ///     if (prec->mcnt > prec->mdel) {
+    ///         monitor_mask |= DBE_VALUE | DBE_LOG;
+    ///         prec->mcnt = 0;                    /* reset counts since monitor */
+    ///     }
+    ///     if (monitor_mask)
+    ///         db_post_events(prec, &prec->val, monitor_mask);
+    /// }
+    /// ```
+    ///
+    /// MDEL is a COUNT deadband, not an analog one: VAL posts only once more
+    /// than MDEL counts have landed since the last post. The port had no gate —
+    /// an array VAL has no `to_f64`, so the generic deadband answered
+    /// "always post" — which made MDEL inert (every process shipped the whole
+    /// bin array to every subscriber, the exact traffic MDEL exists to prevent)
+    /// and left MCNT a monotonically growing counter instead of "counts since
+    /// the last posted VAL".
+    ///
+    /// Zeroing MCNT here, at the post, is what gives it that one meaning on
+    /// every path — including the SDEL watchdog (`watchdog_fire`), which shares
+    /// the counter and whose `mcnt > 0` test was reading a number that never
+    /// went back down.
+    ///
+    /// `hash_changed: false` — histogram has no HASH field (that is the
+    /// waveform/aai/aao MPST/APST mechanism); this hook is simply the owner of
+    /// the VAL mask, and histogram's C `monitor()` fills it with its own rule.
+    fn array_monitor_post(&mut self) -> Option<crate::server::record::ArrayMonitorPost> {
+        let post = self.mcnt > self.mdel;
+        if post {
+            self.mcnt = 0;
+        }
+        Some(crate::server::record::ArrayMonitorPost {
+            post_value: post,
+            post_archive: post,
+            hash_changed: false,
+        })
     }
 
     /// C `histogramRecord.c::special` (:226-274), SPC_RESET arm:
@@ -515,7 +564,11 @@ impl Record for HistogramRecord {
         match name {
             // C's epicsUInt32 counters (DBF_ULONG), surfaced as-is.
             "VAL" => Some(EpicsValue::ULongArray(self.val.clone())),
-            "NELM" => Some(EpicsValue::Long(self.nelm)),
+            // The DBF types are the `.dbd.pod`'s: NELM is DBF_USHORT (:163),
+            // MDEL/MCNT are DBF_SHORT (:229,:234). The value variant is what CA
+            // and PVA project the native type from, so it must agree with the
+            // `FieldDesc` — as VAL's ULongArray does.
+            "NELM" => Some(EpicsValue::UShort(self.nelm as u16)),
             "ULIM" => Some(EpicsValue::Double(self.ulim)),
             "LLIM" => Some(EpicsValue::Double(self.llim)),
             "WDTH" => Some(EpicsValue::Double(self.wdth)),
@@ -524,8 +577,8 @@ impl Record for HistogramRecord {
             "CMD" => Some(EpicsValue::Short(self.cmd)),
             "CSTA" => Some(EpicsValue::Short(if self.csta { 1 } else { 0 })),
             "SDEL" => Some(EpicsValue::Double(self.sdel)),
-            "MDEL" => Some(EpicsValue::Long(self.mdel)),
-            "MCNT" => Some(EpicsValue::Long(self.mcnt)),
+            "MDEL" => Some(EpicsValue::Short(self.mdel as i16)),
+            "MCNT" => Some(EpicsValue::Short(self.mcnt as i16)),
             "SIMM" => Some(EpicsValue::Short(self.simm)),
             "SIOL" => Some(EpicsValue::String(self.siol.clone().into())),
             "SVAL" => Some(EpicsValue::Double(self.sval)),
@@ -615,12 +668,12 @@ impl Record for HistogramRecord {
                 }
                 _ => Err(CaError::TypeMismatch("SDEL".into())),
             },
-            "MDEL" => match value {
-                EpicsValue::Long(v) => {
+            "MDEL" => match crate::server::records::count_put(&value) {
+                Some(v) => {
                     self.mdel = v;
                     Ok(())
                 }
-                _ => Err(CaError::TypeMismatch("MDEL".into())),
+                None => Err(CaError::TypeMismatch("MDEL".into())),
             },
             "SIMM" => match value {
                 EpicsValue::Short(v) => {
@@ -670,15 +723,15 @@ impl Record for HistogramRecord {
             // FieldDesc carries `read_only: true`), so a CA/PVA caput is still
             // rejected; this arm serves only the load path (`apply_fields`),
             // sizing the bin array exactly like `new()`.
-            "NELM" => match value {
-                EpicsValue::Long(n) => {
+            "NELM" => match crate::server::records::count_put(&value) {
+                Some(n) => {
                     let n = n.max(1);
                     self.nelm = n as i32;
                     self.val = vec![0; n as usize];
                     self.recompute_wdth();
                     Ok(())
                 }
-                _ => Err(CaError::TypeMismatch("NELM".into())),
+                None => Err(CaError::TypeMismatch("NELM".into())),
             },
             // WDTH/MCNT are computed runtime fields (no promptgroup) — never
             // client-writable, even at load. (OLDSIMM is the SPC_NOMOD saved
@@ -721,7 +774,8 @@ mod tests {
         let rec = HistogramRecord::default();
         assert_eq!(rec.nelm, 1);
         assert_eq!(rec.val.len(), 1, "VAL is sized by NELM");
-        assert_eq!(rec.get_field("NELM"), Some(EpicsValue::Long(1)));
+        // NELM is C's DBF_USHORT (histogramRecord.dbd.pod:163).
+        assert_eq!(rec.get_field("NELM"), Some(EpicsValue::UShort(1)));
     }
 
     #[test]

@@ -65,12 +65,12 @@ async fn out_link_write_to_a_nomod_field_is_refused_and_alarms_the_writer() {
     let wf = wf.read().await;
     assert_eq!(
         wf.record.get_field("NELM").unwrap(),
-        EpicsValue::Long(10),
+        EpicsValue::ULong(10),
         "C: dbPut refuses the SPC_NOMOD NELM — the link cannot truncate a waveform"
     );
     assert_eq!(
         wf.record.get_field("NORD").unwrap(),
-        EpicsValue::Long(3),
+        EpicsValue::ULong(3),
         "and the data the waveform already holds is untouched"
     );
     drop(wf);
@@ -112,8 +112,8 @@ async fn every_put_route_is_refused_on_a_nomod_field() {
 
     let wf = db.get_record("WF").await.unwrap();
     let wf = wf.read().await;
-    assert_eq!(wf.record.get_field("NELM").unwrap(), EpicsValue::Long(10));
-    assert_eq!(wf.record.get_field("NORD").unwrap(), EpicsValue::Long(3));
+    assert_eq!(wf.record.get_field("NELM").unwrap(), EpicsValue::ULong(10));
+    assert_eq!(wf.record.get_field("NORD").unwrap(), EpicsValue::ULong(3));
 }
 
 /// The gate is a *runtime* gate: `dbLoadRecords` sets NELM through
@@ -129,7 +129,7 @@ async fn the_load_path_still_sets_nelm() {
     let rec = db.get_record("WF2").await.unwrap();
     assert_eq!(
         rec.read().await.record.get_field("NELM").unwrap(),
-        EpicsValue::Long(7)
+        EpicsValue::ULong(7)
     );
 }
 

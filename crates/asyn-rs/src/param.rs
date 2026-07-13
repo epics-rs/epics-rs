@@ -120,6 +120,84 @@ impl ParamValue {
         }
     }
 
+    /// Read this value through the **asynInt32** interface — the single owner
+    /// of that interface's read rule, shared by the parameter-store getters
+    /// ([`ParamList::get_int32`]) and the device-support I/O-Intr path, so a
+    /// value delivered to a record cannot be typed differently from the same
+    /// value read by a poll.
+    ///
+    /// A parameter whose type the interface cannot read is an
+    /// [`AsynError::TypeMismatch`], never a coercion: C keeps one interrupt
+    /// list per interface, so a record on `asynInt32` is only ever handed an
+    /// int32 (an enum's index included — asynInt32 reads an enum's index
+    /// transparently).
+    pub fn as_int32(&self) -> AsynResult<i32> {
+        match self {
+            Self::Int32(v) => Ok(*v),
+            Self::Enum { index, .. } => Ok(*index as i32),
+            other => Err(AsynError::TypeMismatch {
+                expected: "Int32",
+                actual: other.type_name(),
+            }),
+        }
+    }
+
+    /// Read this value through the **asynInt64** interface. See [`Self::as_int32`].
+    pub fn as_int64(&self) -> AsynResult<i64> {
+        match self {
+            Self::Int64(v) => Ok(*v),
+            other => Err(AsynError::TypeMismatch {
+                expected: "Int64",
+                actual: other.type_name(),
+            }),
+        }
+    }
+
+    /// Read this value through the **asynFloat64** interface. See [`Self::as_int32`].
+    pub fn as_float64(&self) -> AsynResult<f64> {
+        match self {
+            Self::Float64(v) => Ok(*v),
+            other => Err(AsynError::TypeMismatch {
+                expected: "Float64",
+                actual: other.type_name(),
+            }),
+        }
+    }
+
+    /// Read this value through the **asynOctet** interface. See [`Self::as_int32`].
+    pub fn as_octet(&self) -> AsynResult<&str> {
+        match self {
+            Self::Octet(s) => Ok(s),
+            other => Err(AsynError::TypeMismatch {
+                expected: "Octet",
+                actual: other.type_name(),
+            }),
+        }
+    }
+
+    /// Read this value through the **asynUInt32Digital** interface. See
+    /// [`Self::as_int32`].
+    pub fn as_uint32(&self) -> AsynResult<u32> {
+        match self {
+            Self::UInt32Digital(v) => Ok(*v),
+            other => Err(AsynError::TypeMismatch {
+                expected: "UInt32Digital",
+                actual: other.type_name(),
+            }),
+        }
+    }
+
+    /// Read this value through the **asynEnum** interface. See [`Self::as_int32`].
+    pub fn as_enum(&self) -> AsynResult<(usize, Arc<[EnumEntry]>)> {
+        match self {
+            Self::Enum { index, choices } => Ok((*index, choices.clone())),
+            other => Err(AsynError::TypeMismatch {
+                expected: "Enum",
+                actual: other.type_name(),
+            }),
+        }
+    }
+
     /// Whether this is an array or generic-pointer value. C asynPortDriver
     /// fires interrupts for these through the per-type doCallbacks*Array /
     /// doCallbacksGenericPointer paths, NOT `paramList::callCallbacks`
@@ -345,15 +423,7 @@ impl ParamList {
     /// `.unwrap_or(0)` convention used throughout the workspace and
     /// stays callable on never-set params.
     pub fn get_int32(&self, index: usize, addr: i32) -> AsynResult<i32> {
-        match &self.get_entry(index, addr)?.value {
-            ParamValue::Int32(v) => Ok(*v),
-            // C EPICS asyn: asynInt32 interface reads enum index transparently
-            ParamValue::Enum { index: idx, .. } => Ok(*idx as i32),
-            other => Err(AsynError::TypeMismatch {
-                expected: "Int32",
-                actual: other.type_name(),
-            }),
-        }
+        self.get_entry(index, addr)?.value.as_int32()
     }
 
     /// Strict variant of [`Self::get_int32`] — returns
@@ -365,24 +435,12 @@ impl ParamList {
     /// `ParamValNotDefined` to `asynParamUndefined`.
     pub fn get_int32_strict(&self, index: usize, addr: i32) -> AsynResult<i32> {
         let entry = self.get_entry(index, addr)?;
-        match &entry.value {
-            ParamValue::Int32(v) => {
-                if !entry.defined {
-                    return Err(AsynError::ParamUndefined(index));
-                }
-                Ok(*v)
-            }
-            ParamValue::Enum { index: idx, .. } => {
-                if !entry.defined {
-                    return Err(AsynError::ParamUndefined(index));
-                }
-                Ok(*idx as i32)
-            }
-            other => Err(AsynError::TypeMismatch {
-                expected: "Int32",
-                actual: other.type_name(),
-            }),
+        // C order: WrongType first (`as_int32`), then NotDefined.
+        let value = entry.value.as_int32()?;
+        if !entry.defined {
+            return Err(AsynError::ParamUndefined(index));
         }
+        Ok(value)
     }
 
     pub fn set_int32(&mut self, index: usize, addr: i32, value: i32) -> AsynResult<()> {
@@ -432,13 +490,7 @@ impl ParamList {
     /// Lax variant — returns `0.0` for an undefined Float64. Use
     /// [`Self::get_float64_strict`] for C parity.
     pub fn get_float64(&self, index: usize, addr: i32) -> AsynResult<f64> {
-        match &self.get_entry(index, addr)?.value {
-            ParamValue::Float64(v) => Ok(*v),
-            other => Err(AsynError::TypeMismatch {
-                expected: "Float64",
-                actual: other.type_name(),
-            }),
-        }
+        self.get_entry(index, addr)?.value.as_float64()
     }
 
     /// Strict variant — returns [`AsynError::ParamUndefined`] when the
@@ -447,18 +499,11 @@ impl ParamList {
     /// `paramList::getDouble` (`asynPortDriver.cpp:383-401`).
     pub fn get_float64_strict(&self, index: usize, addr: i32) -> AsynResult<f64> {
         let entry = self.get_entry(index, addr)?;
-        match &entry.value {
-            ParamValue::Float64(v) => {
-                if !entry.defined {
-                    return Err(AsynError::ParamUndefined(index));
-                }
-                Ok(*v)
-            }
-            other => Err(AsynError::TypeMismatch {
-                expected: "Float64",
-                actual: other.type_name(),
-            }),
+        let value = entry.value.as_float64()?;
+        if !entry.defined {
+            return Err(AsynError::ParamUndefined(index));
         }
+        Ok(value)
     }
 
     pub fn set_float64(&mut self, index: usize, addr: i32, value: f64) -> AsynResult<()> {
@@ -484,13 +529,7 @@ impl ParamList {
     /// Lax variant — returns `0` for an undefined Int64. Use
     /// [`Self::get_int64_strict`] for C parity.
     pub fn get_int64(&self, index: usize, addr: i32) -> AsynResult<i64> {
-        match &self.get_entry(index, addr)?.value {
-            ParamValue::Int64(v) => Ok(*v),
-            other => Err(AsynError::TypeMismatch {
-                expected: "Int64",
-                actual: other.type_name(),
-            }),
-        }
+        self.get_entry(index, addr)?.value.as_int64()
     }
 
     /// Strict variant — returns [`AsynError::ParamUndefined`] when the
@@ -499,18 +538,11 @@ impl ParamList {
     /// (`asynPortDriver.cpp:328-349`).
     pub fn get_int64_strict(&self, index: usize, addr: i32) -> AsynResult<i64> {
         let entry = self.get_entry(index, addr)?;
-        match &entry.value {
-            ParamValue::Int64(v) => {
-                if !entry.defined {
-                    return Err(AsynError::ParamUndefined(index));
-                }
-                Ok(*v)
-            }
-            other => Err(AsynError::TypeMismatch {
-                expected: "Int64",
-                actual: other.type_name(),
-            }),
+        let value = entry.value.as_int64()?;
+        if !entry.defined {
+            return Err(AsynError::ParamUndefined(index));
         }
+        Ok(value)
     }
 
     pub fn set_int64(&mut self, index: usize, addr: i32, value: i64) -> AsynResult<()> {
@@ -534,13 +566,7 @@ impl ParamList {
     /// Lax variant — returns the empty string for an undefined Octet.
     /// Use [`Self::get_string_strict`] for C parity.
     pub fn get_string(&self, index: usize, addr: i32) -> AsynResult<&str> {
-        match &self.get_entry(index, addr)?.value {
-            ParamValue::Octet(s) => Ok(s),
-            other => Err(AsynError::TypeMismatch {
-                expected: "Octet",
-                actual: other.type_name(),
-            }),
-        }
+        self.get_entry(index, addr)?.value.as_octet()
     }
 
     /// Strict variant — returns [`AsynError::ParamUndefined`] when the
@@ -549,18 +575,11 @@ impl ParamList {
     /// (`asynPortDriver.cpp:543-566`).
     pub fn get_string_strict(&self, index: usize, addr: i32) -> AsynResult<&str> {
         let entry = self.get_entry(index, addr)?;
-        match &entry.value {
-            ParamValue::Octet(s) => {
-                if !entry.defined {
-                    return Err(AsynError::ParamUndefined(index));
-                }
-                Ok(s)
-            }
-            other => Err(AsynError::TypeMismatch {
-                expected: "Octet",
-                actual: other.type_name(),
-            }),
+        let value = entry.value.as_octet()?;
+        if !entry.defined {
+            return Err(AsynError::ParamUndefined(index));
         }
+        Ok(value)
     }
 
     pub fn set_string(&mut self, index: usize, addr: i32, value: String) -> AsynResult<()> {
@@ -585,13 +604,7 @@ impl ParamList {
     /// Lax variant — returns `0` for an undefined UInt32Digital. Use
     /// [`Self::get_uint32_strict`] for C parity.
     pub fn get_uint32(&self, index: usize, addr: i32) -> AsynResult<u32> {
-        match &self.get_entry(index, addr)?.value {
-            ParamValue::UInt32Digital(v) => Ok(*v),
-            other => Err(AsynError::TypeMismatch {
-                expected: "UInt32Digital",
-                actual: other.type_name(),
-            }),
-        }
+        self.get_entry(index, addr)?.value.as_uint32()
     }
 
     /// Strict variant — returns [`AsynError::ParamUndefined`] when the
@@ -600,18 +613,11 @@ impl ParamList {
     /// (`asynPortDriver.cpp:355-376`).
     pub fn get_uint32_strict(&self, index: usize, addr: i32) -> AsynResult<u32> {
         let entry = self.get_entry(index, addr)?;
-        match &entry.value {
-            ParamValue::UInt32Digital(v) => {
-                if !entry.defined {
-                    return Err(AsynError::ParamUndefined(index));
-                }
-                Ok(*v)
-            }
-            other => Err(AsynError::TypeMismatch {
-                expected: "UInt32Digital",
-                actual: other.type_name(),
-            }),
+        let value = entry.value.as_uint32()?;
+        if !entry.defined {
+            return Err(AsynError::ParamUndefined(index));
         }
+        Ok(value)
     }
 
     pub fn set_uint32(
@@ -920,16 +926,7 @@ impl ParamList {
     // --- Enum getters/setters ---
 
     pub fn get_enum(&self, index: usize, addr: i32) -> AsynResult<(usize, Arc<[EnumEntry]>)> {
-        match &self.get_entry(index, addr)?.value {
-            ParamValue::Enum {
-                index: idx,
-                choices,
-            } => Ok((*idx, choices.clone())),
-            other => Err(AsynError::TypeMismatch {
-                expected: "Enum",
-                actual: other.type_name(),
-            }),
-        }
+        self.get_entry(index, addr)?.value.as_enum()
     }
 
     pub fn set_enum_index(&mut self, index: usize, addr: i32, value: usize) -> AsynResult<()> {

@@ -1286,6 +1286,63 @@ impl GroupChannel {
     /// atomic PUT (which owns every member gate via `lock_records`; the
     /// gate `Mutex` is not reentrant) vs the gate-acquiring variants for
     /// the non-atomic per-member path.
+    /// `IOCSource::doPostProcessing` (`iocsource.cpp:397-403`) — the single
+    /// owner of "does this group member's PUT process its backing record?".
+    ///
+    /// C asks three questions, in order: is the bound field the record's
+    /// `PROC`; did the client force processing (`record._options.process=true`);
+    /// otherwise, is the field `pp(TRUE)` on a `SCAN=Passive` record (and the
+    /// client neither forced nor inhibited). Only then `dbProcess`.
+    ///
+    /// The port used to process a `+type:"proc"` member's record
+    /// UNCONDITIONALLY — every group PUT, whatever the member's field, whatever
+    /// the record's SCAN, even under `process=false` (R18-30). The gate is not
+    /// specific to `proc` members: it is the gate for every member whose write
+    /// did not go through `dbPutField` — which is `proc` (no value to write) and
+    /// the `changing`-but-unwritable members (Meta, R17-37). One owner, so a
+    /// second such member class cannot re-open it.
+    async fn post_process_member(
+        &self,
+        member: &GroupMember,
+        process: super::channel::ProcessMode,
+        already_locked: bool,
+    ) -> BridgeResult<()> {
+        use super::channel::ProcessMode;
+        let (record_name, field_name) =
+            epics_base_rs::server::database::parse_pv_name(&member.channel);
+        let process_it = match process {
+            // `forceProcessing == True` — process regardless of field and SCAN.
+            ProcessMode::Force => true,
+            // `forceProcessing == False` — C's `doPostProcessing` still honors
+            // `pfield == &precord->proc`: a PROC-bound member processes even
+            // under process=false, because the disjunction's first term does
+            // not consult `forceProcessing`.
+            ProcessMode::Inhibit => field_name.eq_ignore_ascii_case("PROC"),
+            // `forceProcessing == Unset` — the record's own rule, asked of the
+            // database (`PROC`, or `pp(TRUE)` on a Passive record).
+            ProcessMode::Passive => self.db.put_drives_processing(record_name, field_name).await,
+        };
+        if !process_it {
+            return Ok(());
+        }
+        // The link-aware entry: `dbProcess` runs INP/OUT/FLNK side effects, so
+        // the value-only `process_record` (process_local + notify) is not the
+        // equivalent. `_already_locked` inside an atomic PUT — that transaction
+        // owns every member-record gate via `lock_records`, and the gate
+        // `Mutex` is not reentrant.
+        let mut visited = std::collections::HashSet::new();
+        if already_locked {
+            self.db
+                .process_record_with_links_already_locked(record_name, &mut visited, 0)
+                .await
+        } else {
+            self.db
+                .process_record_with_links(record_name, &mut visited, 0)
+                .await
+        }
+        .map_err(|e| BridgeError::PutRejected(e.to_string()))
+    }
+
     async fn apply_member_value(
         &self,
         record_name: &str,
@@ -1677,21 +1734,18 @@ impl GroupChannel {
                     epics_base_rs::server::database::parse_pv_name(&member.channel);
 
                 if member.mapping == FieldMapping::Proc {
-                    // A `+proc` member forces a full record-processing
-                    // cycle on every group PUT — pvxs's `doPostProcessing`
-                    // calls `dbProcess(precord)` for a proc field
-                    // (iocsource.cpp:397-417), the link-aware entry that
-                    // runs INP/OUT/FLNK side effects. Route through
-                    // `process_record_with_links`, not the value-only
-                    // `process_record` (process_local + notify) which
-                    // skips the link chain. `_already_locked` — this
-                    // atomic PUT owns every member-record gate via
-                    // `lock_records` (the gate `Mutex` is not reentrant).
-                    let mut visited = std::collections::HashSet::new();
-                    self.db
-                        .process_record_with_links_already_locked(record_name, &mut visited, 0)
-                        .await
-                        .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
+                    // A `+proc` member is a processing TRIGGER with no value:
+                    // pvxs skips `IOCSource::put` for it and goes straight to
+                    // `doPostProcessing` (groupsource.cpp:568), which decides
+                    // whether the record actually processes. The gate lives in
+                    // one owner — never inline here.
+                    self.post_process_member(member, opts.process, true).await?;
+                    // `didSomething` is set by pvxs for `changing ||
+                    // type==Proc` (groupsource.cpp:568-571) — the RETURN of
+                    // doPostProcessing, not the outcome of its gate. A proc
+                    // member whose record declined to process still counts as
+                    // participation, so the PUT does not fail "No fields
+                    // changed".
                     did_something = true;
                 } else if let Some(epics_val) = val {
                     // `_already_locked` — this atomic PUT owns every
@@ -1737,18 +1791,12 @@ impl GroupChannel {
                 }
 
                 if member.mapping == FieldMapping::Proc {
-                    // Force a full record-processing cycle (INP/OUT/FLNK)
-                    // through the link-aware owner, matching pvxs
-                    // `doPostProcessing` → `dbProcess` for a proc field
-                    // (iocsource.cpp:397-417). The non-atomic path holds
-                    // no member gate, so this is a foreign gate-acquiring
-                    // entry. The bare `process_record` would run only the
-                    // local record body and skip the link chain.
-                    let mut visited = std::collections::HashSet::new();
-                    self.db
-                        .process_record_with_links(record_name, &mut visited, 0)
-                        .await
-                        .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
+                    // Same owner as the atomic loop — the gate is C's
+                    // `doPostProcessing` (iocsource.cpp:397-403), not "a proc
+                    // member always processes". The non-atomic path holds no
+                    // member gate, so the owner takes the gate-acquiring entry.
+                    self.post_process_member(member, opts.process, false)
+                        .await?;
                     did_something = true;
                     continue;
                 }
@@ -3804,6 +3852,133 @@ mod tests {
                 init_flag(&db, "HOOK:rec").await,
                 1,
                 "proc member without +putorder must process its record (atomic={atomic})"
+            );
+        }
+    }
+
+    /// R18-30: a `+type:"proc"` member does not process its record
+    /// unconditionally — it goes through `IOCSource::doPostProcessing`
+    /// (`iocsource.cpp:397-403`), which processes only when the bound field is
+    /// the record's `PROC`, when the client forced processing, or when the
+    /// field is `pp(TRUE)` on a `SCAN=Passive` record.
+    ///
+    /// Here the backing record is `SCAN=1 second`, so the `pp && Passive` term
+    /// is false: a proc member bound to `VAL` must NOT process it, while one
+    /// bound to `PROC` must (the first term of C's disjunction ignores both
+    /// SCAN and forceProcessing). Pre-fix both processed, on every group PUT.
+    #[tokio::test]
+    async fn r18_30_proc_member_honors_the_dopostprocessing_gate() {
+        use epics_base_rs::server::record::ScanType;
+        use epics_base_rs::server::records::ai::AiRecord;
+        use epics_base_rs::types::EpicsValue;
+
+        async fn init_flag(db: &Arc<PvDatabase>, rec: &str) -> i64 {
+            match db.get_pv(&format!("{rec}.INIT")).await.unwrap() {
+                EpicsValue::Char(c) => c as i64,
+                EpicsValue::Long(v) => v as i64,
+                other => panic!("unexpected INIT type: {other:?}"),
+            }
+        }
+
+        // (bound field, must the record process?)
+        for (channel_field, expect_processed) in [("VAL", false), ("PROC", true)] {
+            for atomic in [false, true] {
+                let db = Arc::new(PvDatabase::new());
+                db.add_record("SCANNED:rec", Box::new(AiRecord::new(0.0)))
+                    .await
+                    .unwrap();
+                // Not Passive: the `pp(TRUE) && SCAN==Passive` term is false.
+                db.put_pv("SCANNED:rec.SCAN", EpicsValue::Enum(ScanType::Sec1 as u16))
+                    .await
+                    .unwrap();
+
+                let cfg = format!(
+                    r#"{{ "PROCGATE:GRP": {{ "+atomic": {atomic},
+                        "go": {{ "+type": "proc",
+                                 "+channel": "SCANNED:rec.{channel_field}" }} }} }}"#
+                );
+                let mut defs = super::super::group_config::parse_group_config(&cfg).unwrap();
+                let def = defs.pop().unwrap();
+                let channel = GroupChannel::new(db.clone(), def);
+
+                channel
+                    .put(&PvStructure::new("structure"))
+                    .await
+                    .expect("proc-only group PUT must succeed");
+
+                let processed = init_flag(&db, "SCANNED:rec").await == 1;
+                assert_eq!(
+                    processed, expect_processed,
+                    "+proc member bound to {channel_field} on a SCAN=1s record \
+                     (atomic={atomic}): processed={processed}, expected \
+                     {expect_processed} (iocsource.cpp:397-403)"
+                );
+            }
+        }
+    }
+
+    /// R18-30, the force term: `record._options.process=true` processes the
+    /// backing record whatever its SCAN and whatever field the `+proc` member
+    /// binds (`forceProcessing == True`, iocsource.cpp:399). `process=false`
+    /// (`Inhibit`) suppresses it — except for a PROC-bound member, whose term
+    /// in C's disjunction never consults `forceProcessing`.
+    #[tokio::test]
+    async fn r18_30_proc_member_force_and_inhibit_terms() {
+        use super::super::channel::{ProcessMode, PutOptions};
+        use epics_base_rs::server::record::ScanType;
+        use epics_base_rs::server::records::ai::AiRecord;
+        use epics_base_rs::types::EpicsValue;
+
+        async fn init_flag(db: &Arc<PvDatabase>, rec: &str) -> i64 {
+            match db.get_pv(&format!("{rec}.INIT")).await.unwrap() {
+                EpicsValue::Char(c) => c as i64,
+                EpicsValue::Long(v) => v as i64,
+                other => panic!("unexpected INIT type: {other:?}"),
+            }
+        }
+
+        // (bound field, process mode, must the record process?)
+        let cases = [
+            ("VAL", ProcessMode::Force, true),
+            ("VAL", ProcessMode::Inhibit, false),
+            ("PROC", ProcessMode::Inhibit, true),
+        ];
+        for (channel_field, process, expect_processed) in cases {
+            let db = Arc::new(PvDatabase::new());
+            db.add_record("FORCED:rec", Box::new(AiRecord::new(0.0)))
+                .await
+                .unwrap();
+            db.put_pv("FORCED:rec.SCAN", EpicsValue::Enum(ScanType::Sec1 as u16))
+                .await
+                .unwrap();
+
+            let cfg = format!(
+                r#"{{ "FORCE:GRP": {{
+                    "go": {{ "+type": "proc",
+                             "+channel": "FORCED:rec.{channel_field}" }} }} }}"#
+            );
+            let mut defs = super::super::group_config::parse_group_config(&cfg).unwrap();
+            let def = defs.pop().unwrap();
+            let channel = GroupChannel::new(db.clone(), def);
+
+            channel
+                .put_with_options(
+                    &PvStructure::new("structure"),
+                    PutOptions {
+                        process,
+                        block: false,
+                    },
+                    None,
+                    &RemoteLog::default(),
+                )
+                .await
+                .expect("proc-only group PUT must succeed");
+
+            let processed = init_flag(&db, "FORCED:rec").await == 1;
+            assert_eq!(
+                processed, expect_processed,
+                "+proc member bound to {channel_field} under {process:?}: \
+                 processed={processed}, expected {expect_processed}"
             );
         }
     }

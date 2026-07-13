@@ -48,6 +48,32 @@ const TOOL_TIMEOUT: Duration = Duration::from_secs(8);
 /// CA connect/read timeout handed to the tools via `-w`.
 const CA_TIMEOUT_SECS: &str = "2";
 
+/// The `caput` flags every put probe must carry. `-c` is the load-bearing one.
+///
+/// **A plain `ca_put` is fire-and-forget.** The server's rejection never reaches
+/// the client: `caput` prints a `CA.Client.Exception ... "Channel write request
+/// failed"` on stderr and still **exits 0**. A harness that scored acceptance
+/// from the exit code would therefore record *every* put as accepted, and would
+/// be structurally blind to the entire put-rejection surface — `SPC_NOMOD`
+/// fields, out-of-range enums, and records whose `special()` refuses the write.
+///
+/// `-c` uses `ca_put_callback` and waits for the server's completion status, so
+/// a refusal comes back as a non-zero exit. That is the only mode in which "did
+/// the put succeed" is actually observable.
+///
+/// This was not theoretical: the first put sweep ran without `-c`, reported all
+/// 1183 puts as accepted on both sides, and consequently reported CBUG-F6 (C
+/// rejects `calc.INPM`..`INPU`) as a STALE allowlist row. The stale-row check is
+/// what surfaced the bug — in the instrument, not the port.
+fn put_args() -> Vec<String> {
+    vec![
+        "-c".into(), // ca_put_callback: wait for the server's status
+        "-t".into(),
+        "-w".into(),
+        CA_TIMEOUT_SECS.into(),
+    ]
+}
+
 /// The C CA tools aimed at exactly one IOC.
 ///
 /// The env pins the client to `127.0.0.1:<port>` with `EPICS_CA_AUTO_ADDR_LIST=NO`,
@@ -260,16 +286,10 @@ impl CaTools {
     /// must refuse the write, an out-of-range enum must refuse it), so a
     /// rejection is a *reading*, not a failure of the harness.
     pub fn caput(&self, pv: &str, value: &str) -> PutOutcome {
-        match self.run(
-            "caput",
-            &[
-                "-t".into(),
-                "-w".into(),
-                CA_TIMEOUT_SECS.into(),
-                pv.to_string(),
-                value.to_string(),
-            ],
-        ) {
+        let mut args = put_args();
+        args.push(pv.to_string());
+        args.push(value.to_string());
+        match self.run("caput", &args) {
             Ok(_) => PutOutcome {
                 accepted: true,
                 error: None,
@@ -283,14 +303,10 @@ impl CaTools {
 
     /// `caput -a` — array put (`-a` takes a count then the elements).
     pub fn caput_array(&self, pv: &str, values: &[String]) -> PutOutcome {
-        let mut args: Vec<String> = vec![
-            "-t".into(),
-            "-a".into(),
-            "-w".into(),
-            CA_TIMEOUT_SECS.into(),
-            pv.to_string(),
-            values.len().to_string(),
-        ];
+        let mut args = put_args();
+        args.push("-a".into());
+        args.push(pv.to_string());
+        args.push(values.len().to_string());
         args.extend(values.iter().cloned());
         match self.run("caput", &args) {
             Ok(_) => PutOutcome {
@@ -663,6 +679,20 @@ T:AI
     fn error_normalization_keeps_the_reason_drops_the_endpoint() {
         let raw = "Write access denied, context \"127.0.0.1:33309\"";
         assert_eq!(normalize_ca_error(raw), "Write access denied");
+    }
+
+    /// Every put probe MUST go through `ca_put_callback`. Without `-c`, `caput`
+    /// exits 0 even when the server refused the write, and the harness would be
+    /// structurally blind to the whole put-rejection surface while reporting
+    /// 100% agreement on it. Pinned here because the failure is silent.
+    #[test]
+    fn put_probes_use_callback_mode_or_rejections_are_invisible() {
+        let args = put_args();
+        assert!(
+            args.iter().any(|a| a == "-c"),
+            "caput must use -c (ca_put_callback); a plain ca_put is fire-and-forget \
+             and exits 0 even when the server rejects the write"
+        );
     }
 
     #[test]

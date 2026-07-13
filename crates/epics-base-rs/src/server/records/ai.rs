@@ -459,21 +459,33 @@ impl Record for AiRecord {
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
             // SPC_LINCONV parity (aiRecord.c:181-200): LINR / EGUF / EGUL
-            // are tagged `special(SPC_LINCONV)` in aiRecord.dbd. Every put
-            // must (1) clear the smoothing-primed flag so the next
-            // process() reprimes the SMOO filter under the new linearisation,
-            // and (2) for LINR=LINEAR rebase `eoff` to `egul` (the C path
-            // sets eoff=egul before calling the device-support
-            // `special_linconv` callback; Rust ports usually don't carry
-            // such a callback, so the eoff-rebase is the only visible
-            // effect for soft-channel records).
+            // are tagged `special(SPC_LINCONV)` in aiRecord.dbd, and C's
+            // `special()` does exactly two things for them:
+            //
+            // ```c
+            // prec->init = TRUE;
+            // if ((prec->linr == menuConvertLINEAR) && pdset->special_linconv) {
+            //     prec->eoff = prec->egul;              /* <- INSIDE the gate */
+            //     status = (*pdset->special_linconv)(prec, after);
+            //     ...
+            // }
+            // return 0;
+            // ```
+            //
+            // The `eoff = egul` rebase belongs to the device support's
+            // `special_linconv` callback, and NO soft dset provides one:
+            // `devAiSoftRaw.c:32-34` is `{{6, NULL, NULL, init_record, NULL},
+            // read_ai, NULL}` — that trailing NULL *is* `special_linconv`. So
+            // on a soft record a put to LINR/EGUF/EGUL sets `init` and touches
+            // nothing else, and an operator retuning the display range EGUL
+            // does not silently re-scale the conversion.
+            //
+            // (`init` here is the port's inverted-polarity twin of C's
+            // `init = TRUE` — R18-102 — and drives the SMOO repriming.)
             "LINR" => match value {
                 EpicsValue::Short(v) => {
                     self.linr = v;
                     self.init = false;
-                    if self.linr == 2 {
-                        self.eoff = self.egul;
-                    }
                     // A LINR change re-selects the breakpoint table (C
                     // `special_linconv` sets `init=TRUE`, which makes the next
                     // `cvtRawToEngBpt` re-resolve via `findBrkTable`). Drop the
@@ -489,9 +501,6 @@ impl Record for AiRecord {
                 EpicsValue::Double(v) => {
                     self.eguf = v;
                     self.init = false;
-                    if self.linr == 2 {
-                        self.eoff = self.egul;
-                    }
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
@@ -500,9 +509,6 @@ impl Record for AiRecord {
                 EpicsValue::Double(v) => {
                     self.egul = v;
                     self.init = false;
-                    if self.linr == 2 {
-                        self.eoff = self.egul;
-                    }
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
@@ -737,22 +743,67 @@ mod tests {
         );
     }
 
-    /// SPC_LINCONV parity (aiRecord.c:188-198): in LINR=LINEAR mode, the
-    /// C path rebases `eoff = egul` before invoking the device-support
-    /// `special_linconv` callback. Rust soft-channel ports carry no such
-    /// callback, so the eoff-rebase is the only visible effect — but it
-    /// is the one users actually depend on when retuning LINR or EGUL
-    /// from CA/PVA.
+    /// SPC_LINCONV parity (aiRecord.c:188-198). This test previously asserted
+    /// the OPPOSITE — that an EGUL put under LINEAR rebases `eoff = egul` — and
+    /// so pinned the defect (R18-97). C's `prec->eoff = prec->egul;` sits INSIDE
+    /// `if ((prec->linr == menuConvertLINEAR) && pdset->special_linconv)`: the
+    /// rebase is the device support's, and `devAiSoftRaw.c:32-34` supplies no
+    /// `special_linconv` (the trailing NULL of `{{6, NULL, NULL, init_record,
+    /// NULL}, read_ai, NULL}`).
+    ///
+    /// Oracle (softIoc 7.0.10.1-DEV, `DTYP="Raw Soft Channel"`, `INP="12"`,
+    /// LINR=LINEAR, EOFF=0): `dbpf T:AI.EGUL 7.25` → EOFF stays **0** and VAL
+    /// stays **12**. Pre-fix the port gave EOFF=7.25 and VAL=19.25 — an
+    /// operator retuning the display range silently re-scaled the reading.
     #[test]
-    fn egul_put_rebases_eoff_under_linear_mode() {
+    fn egul_put_under_linear_does_not_rebase_eoff() {
         let mut rec = AiRecord::default();
         rec.linr = 2; // LINEAR
         rec.eoff = 1.5;
 
         rec.put_field("EGUL", EpicsValue::Double(7.25)).unwrap();
 
-        assert_eq!(rec.eoff, 7.25, "EGUL put under LINEAR must set eoff=egul");
-        assert_eq!(rec.egul, 7.25);
+        assert_eq!(
+            rec.eoff, 1.5,
+            "no soft dset provides special_linconv, so C leaves EOFF alone"
+        );
+        assert_eq!(rec.egul, 7.25, "the display range itself is written");
+    }
+
+    /// The other two `special(SPC_LINCONV)` fields take the same gate — it is
+    /// the dset that decides, not which field was written.
+    #[test]
+    fn linr_and_eguf_puts_do_not_rebase_eoff() {
+        let mut rec = AiRecord::default();
+        rec.eoff = 1.5;
+        rec.egul = 7.25;
+
+        rec.put_field("LINR", EpicsValue::Short(2)).unwrap();
+        assert_eq!(rec.eoff, 1.5, "LINR put: EOFF untouched");
+
+        rec.put_field("EGUF", EpicsValue::Double(100.0)).unwrap();
+        assert_eq!(rec.eoff, 1.5, "EGUF put: EOFF untouched");
+    }
+
+    /// The consequence the oracle measured: the raw→engineering conversion is
+    /// unchanged by an EGUL retune, so VAL does not move.
+    #[test]
+    fn egul_retune_does_not_move_val_under_linear() {
+        let mut rec = AiRecord::default();
+        rec.linr = 2; // LINEAR
+        rec.eslo = 1.0;
+        rec.eoff = 0.0;
+        rec.put_field("RVAL", EpicsValue::Long(12)).unwrap();
+        rec.process().unwrap();
+        assert_eq!(rec.val, 12.0, "RVAL 12 -> VAL 12 (eslo=1, eoff=0)");
+
+        rec.put_field("EGUL", EpicsValue::Double(7.25)).unwrap();
+        rec.process().unwrap();
+        assert_eq!(
+            rec.val, 12.0,
+            "the oracle's T:AI.VAL stays 12 after `dbpf T:AI.EGUL 7.25`; \
+             pre-fix the port reported 19.25"
+        );
     }
 
     /// SLOPE (LINR=1) preserves user-configured eoff/eslo across EGUL

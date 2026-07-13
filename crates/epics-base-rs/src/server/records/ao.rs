@@ -756,20 +756,18 @@ impl Record for AoRecord {
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
-            // SPC_LINCONV parity (aoRecord.c:242-267): LINR / EGUF / EGUL
-            // are tagged `special(SPC_LINCONV)` in aoRecord.dbd. C path
-            // rebases `eoff = egul` when LINR=LINEAR before invoking the
-            // device-support `special_linconv` callback. Rust soft-channel
-            // ports have no such callback, so the eoff rebase is the only
-            // visible effect. ao has no smoothing, so `init` is not reset
-            // here (mirroring that aoRecord.c does set init=TRUE but never
-            // consumes it from convert()).
+            // SPC_LINCONV parity (aoRecord.c:242-267): LINR / EGUF / EGUL are
+            // tagged `special(SPC_LINCONV)` in aoRecord.dbd. C's `special()`
+            // rebases `eoff = egul` INSIDE `if ((linr == menuConvertLINEAR) &&
+            // pdset->special_linconv)` — the rebase is the device support's,
+            // and no soft dset supplies `special_linconv` (`devAoSoftRaw.c`,
+            // like `devAiSoftRaw.c:32-34`, leaves that dset slot NULL). On an
+            // ao the ungated rebase was worse than on an ai: EOFF feeds the
+            // VAL→RVAL convert, so retuning the display range EGUL moved the
+            // hardware output. See `ai.rs` for the full C excerpt.
             "LINR" => match value {
                 EpicsValue::Short(v) => {
                     self.linr = v;
-                    if self.linr == 2 {
-                        self.eoff = self.egul;
-                    }
                     // A LINR change re-selects the breakpoint table (C
                     // `special_linconv`); drop the cached table + interval
                     // index so the next conversion resolves the new LINR.
@@ -782,9 +780,6 @@ impl Record for AoRecord {
             "EGUF" => match value {
                 EpicsValue::Double(v) => {
                     self.eguf = v;
-                    if self.linr == 2 {
-                        self.eoff = self.egul;
-                    }
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
@@ -792,9 +787,6 @@ impl Record for AoRecord {
             "EGUL" => match value {
                 EpicsValue::Double(v) => {
                     self.egul = v;
-                    if self.linr == 2 {
-                        self.eoff = self.egul;
-                    }
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
@@ -999,27 +991,49 @@ impl Record for AoRecord {
 mod tests {
     use super::*;
 
-    /// SPC_LINCONV parity (aoRecord.c:242-267): writing LINR / EGUF / EGUL
-    /// under LINR=LINEAR (2) must rebase `eoff = egul`. Without this fix
-    /// the C path's `eoff = egul` step (which the device-support
-    /// `special_linconv` callback then refines) was silently skipped on
-    /// the Rust port, so a user retuning EGUL via CA put kept the stale
-    /// eoff and computed `RVAL = (val - stale_eoff) / eslo` — the
-    /// hardware ended up driven by a constant offset the operator never
-    /// configured.
+    /// SPC_LINCONV parity (aoRecord.c:242-267). This test previously asserted
+    /// the OPPOSITE — that an EGUL put under LINR=LINEAR rebases `eoff = egul`
+    /// — and so pinned the defect (R18-97). C's rebase lives INSIDE
+    /// `if ((linr == menuConvertLINEAR) && pdset->special_linconv)`, and the
+    /// soft dsets supply no `special_linconv` (`devAiSoftRaw.c:32-34` leaves
+    /// that dset slot NULL), so on a soft record the rebase never runs.
+    ///
+    /// Oracle (softIoc 7.0.10.1-DEV, `DTYP="Raw Soft Channel"`, LINR=LINEAR,
+    /// EOFF=0): `dbpf T:AO.EGUL 3.5` → `dbgf T:AO.EOFF` = **0**. EGUL is a
+    /// display-range field; retuning it must not move the hardware output
+    /// through `RVAL = (val - eoff) / eslo`.
     #[test]
-    fn egul_put_under_linear_rebases_eoff() {
+    fn egul_put_under_linear_does_not_rebase_eoff() {
         let mut rec = AoRecord::default();
         rec.linr = 2; // LINEAR
         rec.eoff = 1.5;
 
         rec.put_field("EGUL", EpicsValue::Double(7.25)).unwrap();
 
-        assert_eq!(rec.eoff, 7.25, "EGUL put under LINEAR must set eoff=egul");
+        assert_eq!(
+            rec.eoff, 1.5,
+            "no soft dset provides special_linconv, so C leaves EOFF alone"
+        );
+        assert_eq!(rec.egul, 7.25, "the display range itself is written");
     }
 
-    /// SLOPE mode (LINR=1) preserves user-configured eoff/eslo across EGUL
-    /// edits — the C path only rebases eoff when LINR == menuConvertLINEAR.
+    /// The same holds for the other two `special(SPC_LINCONV)` fields — the
+    /// gate is the dset, not the field.
+    #[test]
+    fn linr_and_eguf_puts_do_not_rebase_eoff() {
+        let mut rec = AoRecord::default();
+        rec.eoff = 1.5;
+        rec.egul = 7.25;
+
+        rec.put_field("LINR", EpicsValue::Short(2)).unwrap();
+        assert_eq!(rec.eoff, 1.5, "LINR put: EOFF untouched");
+
+        rec.put_field("EGUF", EpicsValue::Double(100.0)).unwrap();
+        assert_eq!(rec.eoff, 1.5, "EGUF put: EOFF untouched");
+    }
+
+    /// SLOPE mode (LINR=1) likewise leaves user-configured eoff/eslo alone —
+    /// this arm was already correct, and stays a regression guard.
     #[test]
     fn egul_put_under_slope_does_not_touch_eoff() {
         let mut rec = AoRecord::default();

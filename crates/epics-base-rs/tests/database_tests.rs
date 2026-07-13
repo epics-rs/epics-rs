@@ -7627,25 +7627,31 @@ async fn test_histogram_csta_is_no_mod() {
 }
 
 /// C `dbConvert.c`'s `PUT(epicsFloat64, epicsInt32)` / `(epicsInt16)` is a bare
-/// cast (`*pdst = (typeb) *psrc`, :96-113) — undefined by the standard, but the
-/// compiled x86-64 IOC is the parity target (the HexSignificand / shift-mask
-/// precedent). Rust's `as` saturates instead, so the port answered 2147483647
-/// and 32767 where a C IOC answers INT_MIN and a wrapped low half.
+/// cast (`*pdst = (typeb) *psrc`, :96-113), which the standard leaves UNDEFINED
+/// once the value is out of the destination's range (C17 6.3.1.4p1). Compiled C
+/// is therefore not single-valued — an x86-64 IOC's `cvttsd2si` answers with the
+/// integer indefinite, an aarch64 IOC's `fcvtzs` saturates. Per CBUG-E2 the port
+/// saturates and NaN goes to 0, through the single owner `types::c_cast`.
 ///
-/// softIoc transcript (the audit's two cases, reproduced here verbatim):
+/// The values a compiled x86-64 softIoc gives, which the port DELIBERATELY does
+/// not reproduce, are recorded here so the divergence stays visible:
 ///
 /// ```text
 /// record(calcout,"CO") { field(CALC,"3.0e9") field(OUT,"LO.VAL PP") }
 /// dbpf CO.PROC 1 ; dbgf LO.VAL   -> DBF_LONG: -2147483648 = 0x80000000
+///                                  (port: 2147483647; aarch64 C agrees)
 ///
 /// record(aao,"AAO") { field(DOL,"[1.7,2.2,-3.9,70000,5,6]") field(OUT,"WFS.VAL") }
 /// (WFS: NELM=4 FTVL=SHORT)
 /// dbpf AAO.PROC 1 ; dbgf WFS.VAL -> DBF_SHORT[4]: 1  2  -3  4464
+///                                  (port: 1 2 -3 32767 — 4464 is 70000's low
+///                                   16 bits, a wrap no reader can interpret)
 ///
-/// dbpf LO2.VAL 70000.9 -> 70000     dbpf LO2.VAL -3.9 -> -3
+/// dbpf LO2.VAL 70000.9 -> 70000     dbpf LO2.VAL -3.9 -> -3   (port agrees:
+///                                   in range, no policy in play)
 /// ```
 #[tokio::test]
-async fn test_double_to_int_narrowing_matches_compiled_c() {
+async fn test_double_to_int_narrowing_saturates_per_cbug_e2() {
     use epics_base_rs::server::records::longout::LongoutRecord;
     use epics_base_rs::server::records::waveform::WaveformRecord;
     use epics_base_rs::types::DbFieldType;
@@ -7661,15 +7667,16 @@ async fn test_double_to_int_narrowing_matches_compiled_c() {
     .await
     .unwrap();
 
-    // DBF_LONG destination: `(epicsInt32) 3.0e9` is the 32-bit cvttsd2si's
-    // integer indefinite, NOT a clamp to i32::MAX.
+    // DBF_LONG destination: `(epicsInt32) 3.0e9` clamps to i32::MAX. An x86-64
+    // C IOC stores the integer indefinite (0x80000000) instead — UB, and the
+    // opposite end of the range from the value the user asked for.
     db.put_record_field_from_ca("CVT_LO", "VAL", EpicsValue::Double(3.0e9))
         .await
         .unwrap();
     assert_eq!(
         db.get_pv("CVT_LO.VAL").await.unwrap(),
-        EpicsValue::Long(-2147483648),
-        "C: dbgf LO.VAL -> -2147483648 = 0x80000000"
+        EpicsValue::Long(2147483647),
+        "CBUG-E2: saturate. x86-64 C: -2147483648"
     );
 
     // In-range doubles still truncate toward zero.
@@ -7685,8 +7692,9 @@ async fn test_double_to_int_narrowing_matches_compiled_c() {
         .unwrap();
     assert_eq!(db.get_pv("CVT_LO.VAL").await.unwrap(), EpicsValue::Long(-3));
 
-    // FTVL=SHORT destination: each element converts through the 32-bit
-    // cvttsd2si and is then truncated to 16 bits — 70000 -> 4464, not 32767.
+    // FTVL=SHORT destination: each element clamps at the ELEMENT's width, so
+    // 70000 -> 32767. A C IOC converts through a 32-bit instruction and then
+    // truncates to 16 bits, giving 70000's low half, 4464.
     db.put_record_field_from_ca(
         "CVT_WFS",
         "VAL",
@@ -7697,8 +7705,8 @@ async fn test_double_to_int_narrowing_matches_compiled_c() {
     match db.get_pv("CVT_WFS.VAL").await.unwrap() {
         EpicsValue::ShortArray(v) => assert_eq!(
             v,
-            vec![1, 2, -3, 4464],
-            "C: dbgf WFS.VAL -> DBF_SHORT[4]: 1 2 -3 4464"
+            vec![1, 2, -3, 32767],
+            "CBUG-E2: saturate. x86-64 C: 1 2 -3 4464"
         ),
         other => panic!("expected ShortArray, got {other:?}"),
     }

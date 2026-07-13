@@ -116,11 +116,13 @@ fn zero_divisor_disposition_is_per_dialect() {
     assert_eq!(a("A%0", 5.0), 1e35f32 as f64);
 }
 
-/// A denominator larger than the cast's range is NOT zero, and never was: C's
-/// cast yields INT32_MIN, so C's modulo branch runs and `5 % INT32_MIN == 5`.
-/// Un-narrowed, `5 % 2^32` is 5 as well. Same answer, and CBUG-A2 does not move
-/// it — the case is kept because pinning NaN here (the pre-R8-5 wrap model,
-/// where 2^32 truncated to 0) would be wrong under either rule.
+/// A denominator larger than the cast's range is NOT zero, and never was: every
+/// candidate rule for the out-of-range cast — C-on-x86's INT32_MIN, CBUG-E2's
+/// saturating INT32_MAX, or not narrowing at all — leaves a divisor whose
+/// magnitude exceeds 5, so `5 % divisor == 5` in all of them. Neither CBUG-A2
+/// nor CBUG-E2 moves this. The case is kept because pinning NaN here (the
+/// pre-R8-5 wrap model, where 2^32 truncated to 0) would be wrong under every
+/// one of those rules.
 #[test]
 fn a_denominator_past_the_cast_range_is_not_a_zero_divisor() {
     assert_eq!(nc("5 % 4294967296"), 5.0);
@@ -143,11 +145,15 @@ fn scalc_bitwise_is_long_wide() {
     assert_eq!(s("A&0xFFFFFFFF", 3e9), 3e9);
 }
 
-/// aCalc's bitwise ops are `(int)`, so an out-of-range operand becomes
-/// INT32_MIN — not `d2i`'s -1294967296.
+/// aCalc's bitwise ops are a plain `(int)` cast, NOT `d2i`'s uint32
+/// reinterpretation — so an out-of-range operand does not come back as
+/// -1294967296. Where it DOES come back is CBUG-E2's call: the `(int)` cast is
+/// UB on an out-of-range double, so compiled C answers INT32_MIN on x86-64 and
+/// INT32_MAX on aarch64. The port saturates.
 #[test]
 fn acalc_bitwise_is_a_plain_int_cast() {
-    assert_eq!(a("A|0", 3e9), i32::MIN as f64);
+    assert_ne!(a("A|0", 3e9), -1_294_967_296.0);
+    assert_eq!(a("A|0", 3e9), i32::MAX as f64);
 }
 
 /// CBUG-A2 — NINT rounds and does not narrow, in every dialect. C narrows at

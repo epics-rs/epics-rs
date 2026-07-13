@@ -101,6 +101,12 @@ pub struct WaveformRecord {
     /// process cycle when `omsl == closed_loop` and the link is a real
     /// (non-constant) link (C `aaoRecord.c::fetchValue` `dbGetLink`, 366).
     pub dol: String,
+    /// Did `init_record` pass 1 load a constant closed-loop DOL into the
+    /// buffer? C `fetchValue(prec, 1)` sets `prec->udf = FALSE` on success
+    /// (aaoRecord.c:371-374); UDF lives in the common fields, which
+    /// `init_record` cannot reach, so the outcome is carried here and folded
+    /// in by `post_init_finalize_undef`.
+    constant_dol_loaded: bool,
 }
 
 /// Type aliases for documentation / pattern-match clarity. All point
@@ -196,6 +202,7 @@ impl Default for WaveformRecord {
             // zero value: OMSL=supervisory (no DOL fetch), DOL=constant/empty.
             omsl: 0,
             dol: String::new(),
+            constant_dol_loaded: false,
         }
     }
 }
@@ -333,6 +340,47 @@ impl WaveformRecord {
             other => Err(CaError::TypeMismatch(format!(
                 "VAL: {other:?} does not convert to the FTVL element type"
             ))),
+        }
+    }
+
+    /// C `aaoRecord.c::fetchValue(prec, init=1)` (351-377), reached from
+    /// `init_record` pass 1 (aaoRecord.c:147):
+    ///
+    /// ```c
+    ///     if (prec->omsl != menuOmslclosed_loop) return 0;
+    ///     isConst = dbLinkIsConstant(&prec->dol);
+    ///     if (init && isConst) {
+    ///         status = dbLoadLinkArray(&prec->dol, prec->ftvl, prec->bptr, &nReq);
+    ///         if (!status) { prec->nord = nReq; prec->udf = FALSE; }
+    ///     }
+    /// ```
+    ///
+    /// The `init && isConst` arm is the ONLY path by which a constant
+    /// closed-loop DOL ever reaches an aao: the per-cycle arm is
+    /// `!init && !isConst`, so the constant is never re-fetched (that gate is
+    /// [`Self::pre_input_link_actions`]). Without this load a
+    /// `field(DOL,"[1,2,3]")` / `field(DOL,"5")` closed-loop aao wrote its
+    /// zero-filled buffer to OUT forever and stayed UDF — the constant was
+    /// simply dropped.
+    ///
+    /// The other three kinds have no OMSL/DOL, and a supervisory-mode aao does
+    /// not source VAL from DOL at all — both return before the load, as C's
+    /// first line does.
+    fn fetch_constant_dol(&mut self) {
+        if !matches!(self.kind, ArrayKind::Aao) || self.omsl != MENU_OMSL_CLOSED_LOOP {
+            return;
+        }
+        let dol = parse_link_v2(&self.dol);
+        let Some(value) = crate::server::recgbl::simm::constant_load_value(&dol) else {
+            // Not a constant (a real link — fetched per cycle instead), or an
+            // unset one: C `dbConstLoadArray` rejects an empty constant with
+            // `S_db_badField`, leaving NORD and UDF untouched.
+            return;
+        };
+        // `land_val_in_buffer` IS `dbLoadLinkArray`'s landing rule: convert
+        // into the FTVL-typed buffer, `NORD = nRequest`.
+        if self.land_val_in_buffer(value).is_ok() {
+            self.constant_dol_loaded = true;
         }
     }
 
@@ -738,7 +786,14 @@ impl Record for WaveformRecord {
     /// (VAL is `DBF_NOACCESS` on all four `.dbd`s, so no `.db` can fill it),
     /// but an in-process `record()` build can, and zeroing NORD there would
     /// discard the caller's array.
+    ///
+    /// Pass 1 runs the aao's `fetchValue(prec, 1)` (aaoRecord.c:147) — see
+    /// [`Self::fetch_constant_dol`].
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
+        if pass == 1 {
+            self.fetch_constant_dol();
+            return Ok(());
+        }
         if pass != 0 {
             return Ok(());
         }
@@ -754,6 +809,17 @@ impl Record for WaveformRecord {
         }
         if self.nord == 0 && self.nelm == 1 {
             self.nord = 1;
+        }
+        Ok(())
+    }
+
+    /// C `fetchValue(prec, 1)`'s `if (!status) { prec->nord = nReq;
+    /// prec->udf = FALSE; }` (aaoRecord.c:371-374) — the UDF half of the
+    /// constant-DOL load, which `init_record` cannot apply itself (UDF is a
+    /// common field). An aao whose value came from a constant DOL is DEFINED.
+    fn post_init_finalize_undef(&mut self, udf: &mut bool) -> CaResult<()> {
+        if self.constant_dol_loaded {
+            *udf = false;
         }
         Ok(())
     }

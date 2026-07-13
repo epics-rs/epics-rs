@@ -389,6 +389,49 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
     fn notify_channel_close(&self, name: &str, ctx: &ChannelContext) {
         self.inner.notify_channel_close(name, ctx);
     }
+    // R17-33: the delegation contract of a transparent layer — EVERY
+    // trait method whose behaviour an inner source can override must be
+    // forwarded, or the trait default silently replaces the inner's
+    // implementation. The server hands its ChannelInvalidator to the BOUND
+    // source (`runtime.rs`), which in a real gateway is this wrapper stack;
+    // the trait default drops it, so the gateway's cache never got a handle
+    // and an operator `<prefix>:drop` / `:flush` could not send
+    // DESTROY_CHANNEL to the live downstream channels (pva2pva
+    // `p2pApp/server.cpp:130-135`). Same class: `revalidate_read` (the
+    // per-event ACL re-check on policy reload), `check_monitor_request`
+    // (the INIT-time `record._options` validation a source may reject the
+    // circuit on), and `subscribe_checked_opts` (the negotiated
+    // MonitorOptions — the trait default re-routes to `subscribe_checked`
+    // and DROPS them).
+    fn set_channel_invalidator(
+        &self,
+        invalidator: epics_pva_rs::server_native::source::ChannelInvalidator,
+    ) {
+        self.inner.set_channel_invalidator(invalidator);
+    }
+    async fn revalidate_read(
+        &self,
+        pv_name: &str,
+        ctx: ChannelContext,
+    ) -> Option<epics_pva_rs::server_native::source::AccessChecked> {
+        // Read-only adds no READ policy — the inner's gate decides.
+        self.inner.revalidate_read(pv_name, ctx).await
+    }
+    async fn check_monitor_request(
+        &self,
+        checked: &epics_pva_rs::server_native::source::AccessChecked,
+        ctx: &ChannelContext,
+    ) -> Result<(), epics_pva_rs::server_native::source::MonitorRequestFatal> {
+        self.inner.check_monitor_request(checked, ctx).await
+    }
+    async fn subscribe_checked_opts(
+        &self,
+        checked: epics_pva_rs::server_native::source::AccessChecked,
+        ctx: ChannelContext,
+        opts: epics_pva_rs::server_native::MonitorOptions,
+    ) -> Option<mpsc::Receiver<PvField>> {
+        self.inner.subscribe_checked_opts(checked, ctx, opts).await
+    }
 }
 
 // ── AclLayer ─────────────────────────────────────────────────────
@@ -1003,6 +1046,43 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
     }
     fn notify_channel_close(&self, name: &str, ctx: &ChannelContext) {
         self.inner.notify_channel_close(name, ctx);
+    }
+    // R17-33 (see `ReadOnly`): forward every method whose inner override
+    // the trait default would mask — applying this layer's deny-list where
+    // the method is a READ gate, so forwarding never widens access.
+    fn set_channel_invalidator(
+        &self,
+        invalidator: epics_pva_rs::server_native::source::ChannelInvalidator,
+    ) {
+        self.inner.set_channel_invalidator(invalidator);
+    }
+    async fn revalidate_read(
+        &self,
+        pv_name: &str,
+        ctx: ChannelContext,
+    ) -> Option<epics_pva_rs::server_native::source::AccessChecked> {
+        if !self.config.allowed(pv_name) {
+            return None;
+        }
+        self.inner.revalidate_read(pv_name, ctx).await
+    }
+    async fn check_monitor_request(
+        &self,
+        checked: &epics_pva_rs::server_native::source::AccessChecked,
+        ctx: &ChannelContext,
+    ) -> Result<(), epics_pva_rs::server_native::source::MonitorRequestFatal> {
+        self.inner.check_monitor_request(checked, ctx).await
+    }
+    async fn subscribe_checked_opts(
+        &self,
+        checked: epics_pva_rs::server_native::source::AccessChecked,
+        ctx: ChannelContext,
+        opts: epics_pva_rs::server_native::MonitorOptions,
+    ) -> Option<mpsc::Receiver<PvField>> {
+        if !self.config.allowed(checked.pv_name()) {
+            return None;
+        }
+        self.inner.subscribe_checked_opts(checked, ctx, opts).await
     }
 }
 
@@ -1876,6 +1956,51 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
     }
     fn notify_channel_close(&self, name: &str, ctx: &ChannelContext) {
         self.inner.notify_channel_close(name, ctx);
+    }
+    // R17-33 (see `ReadOnly`): forward every method whose inner override
+    // the trait default would mask; the subscribe path keeps recording its
+    // audit row, so forwarding never loses an event.
+    fn set_channel_invalidator(
+        &self,
+        invalidator: epics_pva_rs::server_native::source::ChannelInvalidator,
+    ) {
+        self.inner.set_channel_invalidator(invalidator);
+    }
+    async fn revalidate_read(
+        &self,
+        pv_name: &str,
+        ctx: ChannelContext,
+    ) -> Option<epics_pva_rs::server_native::source::AccessChecked> {
+        self.inner.revalidate_read(pv_name, ctx).await
+    }
+    async fn check_monitor_request(
+        &self,
+        checked: &epics_pva_rs::server_native::source::AccessChecked,
+        ctx: &ChannelContext,
+    ) -> Result<(), epics_pva_rs::server_native::source::MonitorRequestFatal> {
+        self.inner.check_monitor_request(checked, ctx).await
+    }
+    async fn subscribe_checked_opts(
+        &self,
+        checked: epics_pva_rs::server_native::source::AccessChecked,
+        ctx: ChannelContext,
+        opts: epics_pva_rs::server_native::MonitorOptions,
+    ) -> Option<mpsc::Receiver<PvField>> {
+        let pv = checked.pv_name().to_string();
+        let user = ctx.account.clone();
+        let host = ctx.host.clone();
+        let result = self.inner.subscribe_checked_opts(checked, ctx, opts).await;
+        if self.audit_subscribe {
+            let outcome: Result<(), OpError> = if result.is_some() {
+                Ok(())
+            } else {
+                Err(OpError::failed(format!("PV '{pv}' not subscribable")))
+            };
+            let mut ev = make_audit_event(&pv, &user, &host, &outcome);
+            ev.event = AuditEventKind::Subscribe;
+            self.sink.record(ev);
+        }
+        result
     }
 }
 
@@ -2990,6 +3115,60 @@ mod tests {
                 opts_reached.load(Ordering::SeqCst),
                 "middleware stack must forward subscribe{}_checked_opts to the inner source",
                 if raw { "_raw" } else { "" },
+            );
+        }
+    }
+
+    /// R17-33 regression: the REAL downstream stack is
+    /// `Audit(ReadOnly(Acl(GatewayChannelSource)))`, and the server hands
+    /// its `ChannelInvalidator` to that stack — not to the bare gateway
+    /// source. Every layer must forward `set_channel_invalidator`, or the
+    /// handle stops at the outermost wrapper (trait default = drop it) and
+    /// the gateway's caches publish nothing: an operator `<prefix>:drop` /
+    /// `:flush` then ends the upstream entry while the live downstream
+    /// channels stay bound, never receiving the server-initiated
+    /// DESTROY_CHANNEL pva2pva sends (`p2pApp/server.cpp:130-135`).
+    ///
+    /// Pre-fix this fails at the first `try_recv` (no invalidator ever
+    /// reached the cache); the existing coverage passed only because it
+    /// wired the UNLAYERED source.
+    #[tokio::test]
+    async fn r17_33_layered_stack_forwards_set_channel_invalidator() {
+        use crate::pva_gateway::{ChannelCache, GatewayChannelSource};
+        use epics_pva_rs::client::PvaClient;
+        use epics_pva_rs::server_native::source::ChannelInvalidator;
+        use std::time::Duration;
+
+        // Both production chain shapes: read_only adds the ReadOnly layer,
+        // so the handle has to survive three wrappers in the longest one.
+        for read_only in [false, true] {
+            let client = Arc::new(PvaClient::builder().build());
+            let cache = ChannelCache::new(client, Duration::from_secs(60));
+            let gw = GatewayChannelSource::new(cache.clone());
+            let layered: DynSource = layer_access_control(
+                gw.clone(),
+                AclConfig::default(),
+                read_only,
+                Arc::new(NoopAudit) as Arc<dyn AuditSink>,
+            );
+
+            let inv = ChannelInvalidator::new();
+            let mut rx = inv.subscribe();
+            // The server calls this on the BOUND source — the layered stack.
+            layered.set_channel_invalidator(inv.clone());
+
+            cache.insert_test_entry("GW:LAYERED:PV").await;
+            assert!(
+                gw.drop_entry_all_caches("GW:LAYERED:PV").await,
+                "the entry must be dropped (read_only={read_only})"
+            );
+            assert_eq!(
+                rx.try_recv()
+                    .expect("the layered stack must forward the invalidator to the gateway cache")
+                    .to_vec(),
+                vec!["GW:LAYERED:PV".to_string()],
+                "an operator drop through a LAYERED gateway must publish the \
+                 invalidation (read_only={read_only})"
             );
         }
     }

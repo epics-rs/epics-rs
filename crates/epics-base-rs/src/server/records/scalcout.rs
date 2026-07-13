@@ -79,6 +79,15 @@ pub struct ScalcoutRecord {
     /// On-Change/transition decision diverged; and PVAL, which C lets an
     /// operator write to force or suppress the next output, did not exist.
     pub pval: f64,
+    /// LALM — C `sCalcoutRecord.dbd:858` `field(LALM,DBF_DOUBLE)`,
+    /// `special(SPC_NOMOD)`.
+    ///
+    /// The level `checkAlarms` last alarmed at (`sCalcoutRecord.c:699-751`),
+    /// which is what makes HYST a per-level hysteresis rather than a plain
+    /// deadband. Written only by the framework's analog ladder — the single
+    /// owner of the ten-field alarm surface this record shares with
+    /// calc/calcout/ai/ao.
+    pub lalm: f64,
     /// PSVL — C `sCalcoutRecord.dbd:63` `field(PSVL,DBF_STRING)`,
     /// `special(SPC_NOMOD)`.
     ///
@@ -152,6 +161,7 @@ impl Default for ScalcoutRecord {
             num_vals: [0.0; 12],
             str_vals: Default::default(),
             pval: 0.0,
+            lalm: 0.0,
             psvl: PvString::new(),
             calc_alarm: false,
             fetch_gate_failed: false,
@@ -193,6 +203,24 @@ impl ScalcoutRecord {
         inputs
     }
 
+    /// Land the cycle's variable stores back in A..L and AA..LL — the inverse of
+    /// [`Self::build_inputs`], and the record's ONLY write-back of an engine var
+    /// set.
+    ///
+    /// C `sCalcPerform(&pcalc->a, MAX_FIELDS, (char **)(pcalc->strs), …)`
+    /// (`sCalcoutRecord.c:357`) hands the engine pointers INTO the record, so
+    /// both store families write the record's fields directly:
+    /// `parg[op - STORE_A] = *pd--` (`sCalcPerform.c:429-433`) for A..L, and
+    /// `strncpy(psarg[op - STORE_AA], ps->s, …)` (`:888-894`) for AA..LL. The
+    /// engine here evaluates an owned copy, so `CALC="A:=A+1;A"` and
+    /// `CALC="AA:='x';…"` both stored into a temporary that was then dropped.
+    fn apply_stores(&mut self, inputs: &StringInputs) {
+        self.num_vals[..12].copy_from_slice(&inputs.num_vars[..12]);
+        for i in 0..12 {
+            self.str_vals[i] = PvString::from_bytes(inputs.str_vars[i].as_bytes().to_vec());
+        }
+    }
+
     /// C `sCalcoutRecord.c:357-359` — `sCalcPerform(..., &pcalc->val,
     /// pcalc->sval, ..., pcalc->prec)`: the record hands the engine the two
     /// cells and the engine fills both ([`scalc_perform`]). VAL and SVAL are
@@ -207,15 +235,23 @@ impl ScalcoutRecord {
     /// (:379) and nothing else: SVAL does not take part, so a cycle that changed
     /// only the string result does NOT drive OUT on C, and a numeric change
     /// inside MDEL does not either.
+    ///
+    /// The switch DECIDES an output; it does not veto one. C's `doOutput` is
+    /// initialised to 0 (`sCalcoutRecord.c:326`) and only a case that fires sets
+    /// it — so `Never` (menu index 6, `sCalcoutRecord.dbd:17`) is
+    /// `doOutput = 0` (`:393-395`), and so is any index the switch does not name.
+    /// A catch-all of `true` here inverted `OOPT="Never"` outright: `CALC="7"`
+    /// wrote 7.0 to the OUT target every cycle where C writes nothing.
     fn should_output(&self) -> bool {
         match self.oopt {
-            0 => true,
-            1 => (self.pval - self.val).abs() > self.mdel,
-            2 => self.val == 0.0,
-            3 => self.val != 0.0,
-            4 => self.pval != 0.0 && self.val == 0.0,
-            5 => self.pval == 0.0 && self.val != 0.0,
-            _ => true,
+            0 => true,                                     // Every Time
+            1 => (self.pval - self.val).abs() > self.mdel, // On Change
+            2 => self.val == 0.0,                          // When Zero
+            3 => self.val != 0.0,                          // When Non-zero
+            4 => self.pval != 0.0 && self.val == 0.0,      // Transition To Zero
+            5 => self.pval == 0.0 && self.val != 0.0,      // Transition To Non-zero
+            6 => false,                                    // Never
+            _ => false,                                    // C's `doOutput = 0` init
         }
     }
 
@@ -322,6 +358,17 @@ static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PSVL",
         dbf_type: DbFieldType::String,
+        read_only: true,
+    },
+    // sCalcoutRecord.dbd:858 — `field(LALM,DBF_DOUBLE) { special(SPC_NOMOD) }`:
+    // the level `checkAlarms` last alarmed at, written by the ladder and refused
+    // to clients. The other nine alarm fields (HIHI/LOLO/HIGH/LOW + their
+    // severities + HYST) are deliberately ABSENT from this list so they route to
+    // `RecordInstance::common.analog_alarm` / `common.hyst` — the same path
+    // calc/calcout/ai/ao take.
+    FieldDesc {
+        name: "LALM",
+        dbf_type: DbFieldType::Double,
         read_only: true,
     },
     FieldDesc {
@@ -787,6 +834,11 @@ impl Record for ScalcoutRecord {
         // that failed at run time" are one case here, exactly as in C: the
         // empty program fails (`sCalcPerform.c:396`) and the record alarms
         // every process.
+        // ONE var set for the whole cycle: C hands BOTH passes the same
+        // `&pcalc->a` and `pcalc->strs` (`sCalcoutRecord.c:357`, `:768`), so a
+        // CALC-pass store (`A:=A+1`, `AA:="x"`) is what the OCAL pass fetches,
+        // and both land in the record's A..L / AA..LL ([`Self::apply_stores`]).
+        let mut inputs = self.build_inputs(self.val, &self.sval);
         let calc_failed = if self.fetch_gate_failed {
             false
         } else {
@@ -794,7 +846,6 @@ impl Record for ScalcoutRecord {
             // psresult = pcalc->sval: the VAL/SVAL tokens read this cycle's
             // pre-evaluation VAL/SVAL, i.e. the cells the results are about to
             // overwrite. (PVAL/PSVL are a different pair — see their docs.)
-            let mut inputs = self.build_inputs(self.val, &self.sval);
             match scalc_perform(&self.compiled_calc, &mut inputs, self.prec) {
                 // C's two `-1`s are ONE failure to this record: `:357-364` tests
                 // the return code alone, so a non-finite result (cells written,
@@ -867,8 +918,10 @@ impl Record for ScalcoutRecord {
                 // C `sCalcoutRecord.c:768-770` — presult = &pcalc->oval,
                 // psresult = pcalc->osv, so the VAL/SVAL tokens in OCAL
                 // read the previous OVAL/OSV, not the VAL/SVAL this
-                // cycle just computed.
-                let mut inputs = self.build_inputs(self.oval, &self.osv);
+                // cycle just computed. Only the RESULT cells change between the
+                // passes; the arg set is the same one CALC stored into.
+                inputs.prev_val = self.oval;
+                inputs.prev_sval = ScalcString::from_c(self.osv.as_bytes());
                 match scalc_perform(&self.compiled_ocal, &mut inputs, self.prec) {
                     // As on the CALC side: a non-finite OCAL result is C's -1
                     // with the cells written, and `execOutput` reads only the
@@ -897,6 +950,10 @@ impl Record for ScalcoutRecord {
                 self.osv = self.sval.clone();
             }
         }
+        // Both passes' stores land here, before the ODLY early return — C wrote
+        // them into A..L / AA..LL through `&pcalc->a` / `pcalc->strs` as each
+        // pass ran, so a deferred output cycle carries them just the same.
+        self.apply_stores(&inputs);
 
         // ODLY (C `sCalcoutRecord.c::process` lines 399-408): when an output
         // should fire and ODLY > 0, defer the OUT-link write by ODLY seconds.
@@ -932,6 +989,7 @@ impl Record for ScalcoutRecord {
             "VAL" => Some(EpicsValue::Double(self.val)),
             "SVAL" => Some(EpicsValue::String(self.sval.clone())),
             "PVAL" => Some(EpicsValue::Double(self.pval)),
+            "LALM" => Some(EpicsValue::Double(self.lalm)),
             "PSVL" => Some(EpicsValue::String(self.psvl.clone())),
             "CALC" => Some(EpicsValue::String(self.calc.clone().into())),
             "CLCV" => Some(EpicsValue::Long(self.clcv)),
@@ -991,6 +1049,14 @@ impl Record for ScalcoutRecord {
                 self.pval = value
                     .to_f64()
                     .ok_or_else(|| CaError::TypeMismatch("PVAL".into()))?;
+                Ok(())
+            }
+            // SPC_NOMOD to a client (the field list refuses that put); this arm
+            // is the framework analog ladder's write, C `pcalc->lalm = <level>`.
+            "LALM" => {
+                self.lalm = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("LALM".into()))?;
                 Ok(())
             }
             // C `dbPut` stores the string; `special()` compiles it and records

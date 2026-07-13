@@ -436,6 +436,11 @@ pub fn compile(tokens: &[Token], kind: ExprKind) -> Result<CompiledExpr, CalcErr
     // `:=` has not yet erased the evidence. sCalc's marker only; the numeric and
     // array compilers have none.
     let mut uses_string = false;
+    // The ceiling this flavour's `*Perform` can actually hold, from its own
+    // element table (C `CALCPERFORM_STACK` 80 / `SCALC_STACKSIZE` 30 /
+    // `ACALC_STACKSIZE` 20). One shared compiler, three C limits: a literal here
+    // was right for sCalc and wrong in OPPOSITE directions for the other two.
+    let stack_size = super::token::runtime_stack_size(kind);
     // No `bracket_depth` / `brace_depth` counters: the open `[` / `{` IS a
     // `StackEntry::Subrange` on the operator stack, exactly as in C, so the stack
     // already answers "is one open, and which". A side counter was a second
@@ -865,7 +870,7 @@ pub fn compile(tokens: &[Token], kind: ExprKind) -> Result<CompiledExpr, CalcErr
         if runtime_depth < 0 {
             return Err(CalcError::Underflow);
         }
-        if runtime_depth >= 30 {
+        if runtime_depth >= stack_size {
             return Err(CalcError::Overflow);
         }
     }

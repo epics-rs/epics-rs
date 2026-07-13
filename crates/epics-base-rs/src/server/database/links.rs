@@ -9,6 +9,27 @@ use super::link_set::LinkDbfType;
 use super::processing::join_put_notify;
 use super::{LinkPutOp, PvDatabase, SelmKind, SelmResult, dbr_ushort_cast, select_link_indices_ex};
 
+/// **The one classifier of a process-time read that delivered no value.**
+///
+/// C `dbGetLink` reports `(status, buffer)`, and the two outcomes a `None`
+/// collapses are not the same: a CONSTANT (or unset) link is `dbConstGetValue`
+/// (`dbConstLink.c:219-225`) — status 0, `*pnRequest = 0`, buffer untouched —
+/// while any other link that produced nothing FAILED and owes the reader a LINK
+/// alarm. Every process-time reader ends here ([`PvDatabase::read_link_with_alarm`]
+/// for the input-fetch/control-link paths, [`PvDatabase::read_link_value_as`] for
+/// the `ReadDbLink` executor), so a constant cannot be no-data on one path and a
+/// live value on another.
+fn empty_read_fetch(
+    link: &crate::server::record::ParsedLink,
+) -> crate::server::recgbl::simm::LinkFetch {
+    use crate::server::recgbl::simm::LinkFetch;
+    if crate::server::recgbl::simm::is_constant(link) {
+        LinkFetch::NoData
+    } else {
+        LinkFetch::Failed
+    }
+}
+
 /// The string a `DBF_CHAR`/`DBF_UCHAR` source spells, for a reader that asked
 /// for [`LinkReadAs::CharArrayAsString`](crate::server::record::LinkReadAs) —
 /// C `dbGetLink(&dol, DBF_CHAR, &s, 0, &n_elements)` copying `n` bytes into the
@@ -394,7 +415,18 @@ impl PvDatabase {
             crate::server::record::ParsedLink::PvaJson(j) => {
                 self.resolve_external_pv(&j.link_identity_key()).await
             }
-            crate::server::record::ParsedLink::Constant(_) => link.constant_value(),
+            // A CONSTANT (or unset) link delivers NOTHING at process time —
+            // `dbConstGetValue` (`dbConstLink.c:219-225`) sets `*pnRequest = 0`
+            // and returns 0, so the reader's buffer keeps whatever it held. The
+            // constant reaches the record exactly once, at init, through
+            // [`super::PvDatabase::rec_gbl_init_constant_links`]. Handing the
+            // parsed text back here is what let the `ReadDbLink` executor
+            // re-apply a constant every cycle (sseq `SELL="3"` stomping a
+            // client's `caput SELN 5`, a compress with `INP="5"` filling its
+            // buffer with 5s). `None` here is classified as
+            // [`LinkFetch::NoData`] — success, nothing delivered — by
+            // [`empty_read_fetch`], never as a failed read.
+            crate::server::record::ParsedLink::Constant(_) => None,
             crate::server::record::ParsedLink::Db(db) => {
                 // PP: process source record if Passive before reading.
                 // Threads the caller's `visited`/`depth` so an A↔B PP
@@ -428,27 +460,41 @@ impl PvDatabase {
     /// would hand over a bare index, and a `DBF_CHAR` array read as
     /// `DBF_CHAR` delivers the bytes it spells (`:682-686`) where a native read
     /// would hand over an array no numeric target can absorb.
+    ///
+    /// Returns C's `(status, buffer)` pair through the same
+    /// [`LinkFetch`] classification [`Self::read_link_with_alarm`] uses — a
+    /// CONSTANT link is [`LinkFetch::NoData`] (success, nothing written), a
+    /// read or conversion that failed is [`LinkFetch::Failed`]. The two used to
+    /// be one `Option` here, which is how the `ReadDbLink` executor came to
+    /// re-deliver a constant on every cycle while the multi-input fetch (same
+    /// links, same records) correctly ignored it.
     pub(crate) async fn read_link_value_as(
         &self,
         link: &crate::server::record::ParsedLink,
         read_as: crate::server::record::LinkReadAs,
         visited: &mut HashSet<String>,
         depth: usize,
-    ) -> Option<EpicsValue> {
+    ) -> crate::server::recgbl::simm::LinkFetch {
+        use crate::server::recgbl::simm::LinkFetch;
         use crate::server::record::LinkReadAs;
-        let value = self.read_link_value(link, visited, depth).await?;
-        match read_as {
+        let Some(value) = self.read_link_value(link, visited, depth).await else {
+            return empty_read_fetch(link);
+        };
+        // A conversion the SOURCE cannot satisfy is C's non-zero `dbGetLink`
+        // status (`dbConvert.c`'s NULL conversion slot), i.e. a FAILED read —
+        // never a silent no-op.
+        let converted = match read_as {
             LinkReadAs::Native => Some(value),
             // C `dbGetLink(..., DBR_DOUBLE, ...)`: an array source contributes
             // its element 0 (C asks for one element, so `dbGet` converts offset
             // 0), the same rule the multi-input fetch applies.
             LinkReadAs::Double => {
                 let scalar = if value.is_array() {
-                    value.first_element()?
+                    value.first_element()
                 } else {
-                    value
+                    Some(value)
                 };
-                scalar.to_f64().map(EpicsValue::Double)
+                scalar.and_then(|s| s.to_f64()).map(EpicsValue::Double)
             }
             LinkReadAs::String => self
                 .dbr_string_of(link, &value)
@@ -457,6 +503,10 @@ impl PvDatabase {
             LinkReadAs::CharArrayAsString { max_elements } => {
                 char_bytes_as_string(&value, max_elements).map(EpicsValue::String)
             }
+        };
+        match converted {
+            Some(v) => LinkFetch::Value(v),
+            None => LinkFetch::Failed,
         }
     }
 
@@ -613,10 +663,7 @@ impl PvDatabase {
         let (value, alarm) = self.read_link_value_and_alarm(link).await;
         let fetch = match value {
             Some(v) => LinkFetch::Value(v),
-            // C `dbGetLink` on a CONSTANT (or unset) link: status 0, nothing
-            // written. Any other link that produced no value did FAIL.
-            None if crate::server::recgbl::simm::is_constant(link) => LinkFetch::NoData,
-            None => LinkFetch::Failed,
+            None => empty_read_fetch(link),
         };
         (fetch, alarm)
     }

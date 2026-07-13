@@ -966,6 +966,22 @@ pub trait Record: Send + Sync + 'static {
         false
     }
 
+    /// Whether this record's `INP` is read by DEVICE SUPPORT (a C `DSET`), as
+    /// opposed to by the record body itself.
+    ///
+    /// The init-time load of a CONSTANT `INP` into the record's value field is
+    /// soft device support's `init_record` (`devAiSoft.c`, `devLonginSoft.c`,
+    /// … each call `recGblInitConstantLink(&prec->inp, …)`), so it exists only
+    /// where a DSET exists. `compress` has no device support at all
+    /// (`compressRecord.c` declares no `dset`; its `process` calls `dbGetLink`
+    /// on `INP` itself), which is why C leaves a `field(INP,"5")` compress with
+    /// an EMPTY circular buffer — the constant is loaded nowhere and delivers
+    /// nothing at process (`dbConstGetValue`). Seeding it anyway put a phantom
+    /// sample in the buffer before the first scan.
+    fn input_read_by_device_support(&self) -> bool {
+        true
+    }
+
     /// Apply a value read from a `DTYP="Raw Soft Channel"` INP link.
     ///
     /// Mirrors the C `devXxxSoftRaw.c` `read_xxx()` convention: the

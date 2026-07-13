@@ -250,6 +250,22 @@ impl SwaitRecord {
         inputs
     }
 
+    /// Land the calc pass's variable stores back in A..L — the inverse of
+    /// [`Self::build_inputs`], and the record's ONLY write-back of an engine var
+    /// set.
+    ///
+    /// C `swaitRecord.c:409` is `calcPerform(&pwait->a, &pwait->val, pwait->rpcl)`
+    /// — a pointer INTO the record, so the store opcode
+    /// (`calcPerform.c:101-123`) IS the field write and `CALC="A:=A+1;A"`
+    /// increments the record's A. The engine here evaluates an owned copy, so
+    /// without this the store was dropped on the floor.
+    ///
+    /// Only the twelve args C supplies (`swaitRecord.c` passes `&pwait->a` over
+    /// A..L); the engine refuses a store past `numArgs` anyway.
+    fn apply_stores(&mut self, inputs: &NumericInputs) {
+        self.num_vals[..12].copy_from_slice(&inputs.vars[..12]);
+    }
+
     /// C `swaitRecord.c:425-450` — the OOPT switch, whose "old value" operand
     /// is `pwait->oval` (the previous cycle's VAL), passed in as `old` because
     /// C reads it BEFORE `:471` overwrites it with the new VAL.
@@ -1008,7 +1024,11 @@ impl Record for SwaitRecord {
             // alone. An empty or uncompilable CALC is the empty program and
             // fails here every cycle.
             let mut inputs = self.build_inputs(self.val);
-            match calc_eval(&self.compiled_calc, &mut inputs) {
+            let outcome = calc_eval(&self.compiled_calc, &mut inputs);
+            // C writes the stores through `&pwait->a` as the expression runs, so
+            // they stand whether or not a later operator failed the perform.
+            self.apply_stores(&inputs);
+            match outcome {
                 Ok(v) => {
                     self.val = v;
                     // C `:411` — `} else pwait->udf = FALSE;`. calcPerform's

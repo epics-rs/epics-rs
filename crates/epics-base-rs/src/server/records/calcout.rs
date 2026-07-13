@@ -302,6 +302,22 @@ impl CalcoutRecord {
         ]
     }
 
+    /// Land the cycle's variable stores back in A..U — the inverse of
+    /// [`Self::get_vars`], and the record's ONLY write-back of an engine var set.
+    ///
+    /// C hands `calcPerform` a pointer into the record (`&prec->a`), so a store
+    /// opcode (`calcPerform.c:101-123`) IS the field write. Both of the cycle's
+    /// passes are handed that SAME pointer — `calcPerform(&prec->a, &prec->val,
+    /// rpcl)` (`calcoutRecord.c:238`) and `calcPerform(&prec->a, &prec->oval,
+    /// orpc)` (`:621`) — so OCAL reads what CALC stored, and the two share one
+    /// var set here for the same reason.
+    fn apply_stores(&mut self, vars: &[f64; 21]) {
+        [
+            self.a, self.b, self.c, self.d, self.e, self.f, self.g, self.h, self.i, self.j, self.k,
+            self.l, self.m, self.n, self.o, self.p, self.q, self.r, self.s, self.t, self.u,
+        ] = *vars;
+    }
+
     fn should_output(&self) -> bool {
         match self.oopt {
             0 => true,                                     // Every Time
@@ -1072,13 +1088,18 @@ impl Record for CalcoutRecord {
         // UDF and raises no CALC_ALARM; the OOPT decision below then runs
         // against that frozen VAL (C leaves the switch OUTSIDE the gate), so an
         // OOPT of Every_Time still drives OUT with the previous value.
+        // ONE var set for the whole cycle — C hands BOTH passes the same
+        // `&prec->a`, so a CALC-pass store (`A:=A+1`) is what the OCAL pass
+        // fetches, and both land in the record's A..U. Two independent copies
+        // made CALC's stores invisible to OCAL and dropped them both.
+        let mut inputs = crate::calc::NumericInputs::with_vars(self.get_vars());
         if !self.fetch_gate_failed {
             // C `calcoutRecord.c:238-241` — `calcPerform` runs unconditionally
             // inside the fetch gate and a -1 is CALC_ALARM/INVALID with VAL
             // unchanged. RPCL is always a program: an empty or uncompilable
             // CALC is the empty one, and it fails here every cycle rather than
             // being silently skipped.
-            let mut inputs = crate::calc::NumericInputs::with_vars(self.get_vars());
+            //
             // C `calcPerform(&prec->a, &prec->val, rpcl)` (calcoutRecord.c:238)
             // passes `presult = &val`, so the CALC `VAL` token reads the
             // *previous* VAL. Seed before `self.val` is overwritten below.
@@ -1100,7 +1121,6 @@ impl Record for CalcoutRecord {
                 // unconditionally on this branch — an empty OCAL with DOPT=Use_OCAL
                 // is the empty program, so it fails and raises CALC_ALARM instead
                 // of leaving OVAL stale and silent.
-                let mut inputs = crate::calc::NumericInputs::with_vars(self.get_vars());
                 // C `calcPerform(&prec->a, &prec->oval, orpc)`
                 // (calcoutRecord.c:621) passes `presult = &oval`, so the
                 // OCAL `VAL` token reads the *previous* OVAL, not VAL.
@@ -1123,6 +1143,9 @@ impl Record for CalcoutRecord {
                 self.oval = self.val;
             }
         }
+        // Both passes' stores land here, before LA..LU advance — C wrote them
+        // into A..U through `&prec->a` as each pass ran.
+        self.apply_stores(&inputs.vars);
         // Update LA-LU. C `calcoutRecord.c::monitor` (lines 679-685)
         // advances `*pprev = *pnew` only inside the per-field change test
         // (`if (*pnew != *pprev || monitor_mask & DBE_ALARM)`), i.e. only

@@ -1,8 +1,43 @@
-/// CRC-16 with polynomial 0xA001 (MODBUS).
+/// C `crc16` (`sCalcPerform.c:192-229`) — polynomial 0xA001, seed 0xFFFF.
+///
+/// **This deliberately DEVIATES from the CRC-16/MODBUS standard for any byte
+/// ≥ 0x80, because compiled C does.** Reproducing C is the whole point of the
+/// operator: a `CRC16` frame exists to be accepted by a device that is already
+/// talking to a C IOC, so wire-compatibility with C beats agreement with the
+/// specification. On an ASCII-only payload the two coincide.
+///
+/// The deviation is C's, and it is unintentional:
+///
+/// ```c
+/// unsigned int crc;                  /* 32 bits, NOT 16 */
+/// char tranInput[SCALC_STRING_SIZE]; /* `char` — SIGNED on x86-64/ARM64 Linux */
+/// crc = 0xffff;
+/// for (i=0; i<len; i++) {
+///     /* crc = (crc&0x0ff00) | ((crc&0x0ff) ^ (unsigned int)tranInput[i]); */
+///     crc ^= (unsigned int)tranInput[i];
+///     for (j=0; j<8; j++) { ... crc >>= 1; crc ^= 0x0A001; ... }
+/// }
+/// sprintf(output, "\\x%02x\\x%02x", crc&0xff, (crc&0xff00)>>8);
+/// ```
+///
+/// `(unsigned int)tranInput[i]` sign-extends a byte ≥ 0x80 to `0xFFFFFF80..`,
+/// so the XOR pollutes bits 16-31 of a 32-bit accumulator that is never masked
+/// back to 16. The eight `crc >>= 1` steps then shift that garbage down into
+/// the CRC proper, and it survives into the next byte. The commented-out line
+/// directly above (`:211`) is the author's own masked version — evidence the
+/// standard behaviour was intended and the cast was the slip.
+///
+/// So the accumulator here is `u32` and the byte is sign-extended, exactly as C
+/// does it; only the final two bytes are taken. Compiled sCalc (`gcc -O0`,
+/// x86-64): `CRC16("\x80")` = `\x41\x1f`, `CRC16("\xff")` = `\x00\xff`,
+/// `CRC16("\x80\x80")` = `\x21\x90`, `CRC16("123456789")` = `\x37\x4b` (the
+/// standard 0x4B37 — ASCII agrees).
 pub fn crc16(data: &[u8]) -> u16 {
-    let mut crc: u16 = 0xFFFF;
+    let mut crc: u32 = 0xFFFF;
     for &byte in data {
-        crc ^= byte as u16;
+        // C `(unsigned int)(char)byte` — sign-extend through the platform's
+        // signed `char`, then reinterpret. This is the bug being reproduced.
+        crc ^= (byte as i8) as u32;
         for _ in 0..8 {
             if crc & 1 != 0 {
                 crc = (crc >> 1) ^ 0xA001;
@@ -11,7 +46,9 @@ pub fn crc16(data: &[u8]) -> u16 {
             }
         }
     }
-    crc
+    // C's `sprintf` takes `crc&0xff` and `(crc&0xff00)>>8` — the high garbage
+    // above bit 15 never reaches the wire, only the value below it.
+    crc as u16
 }
 
 /// C `lrc` (`sCalcPerform.c:242-256`) — the ASCII-MODBUS longitudinal
@@ -86,6 +123,22 @@ mod tests {
         // "123456789" -> 0x4B37 (standard MODBUS CRC-16)
         let data = b"123456789";
         assert_eq!(crc16(data), 0x4B37);
+    }
+
+    /// Compiled sCalc (`gcc -O0`, x86-64) — a byte ≥ 0x80 is sign-extended into
+    /// a 32-bit accumulator, so the digest is NOT the standard one. See
+    /// [`crc16`]'s doc: reproducing C is deliberate.
+    #[test]
+    fn test_crc16_sign_extends_high_bytes_like_c() {
+        // Standard CRC-16/MODBUS of a lone 0x80 is 0xE0BE; C says 0x1F41.
+        assert_eq!(crc16(&[0x80]), 0x1F41);
+        assert_eq!(crc16(&[0xFF]), 0xFF00);
+        // The pollution above bit 15 survives into the next byte.
+        assert_eq!(crc16(&[0x80, 0x80]), 0x9021);
+        assert_eq!(crc16(&[0xF7, 0x03, 0x13, 0x89]), 0xB9C0);
+        assert_eq!(crc16(&[0xC3, 0xA9]), 0x7ED1);
+        // One high byte after an ASCII one — the mixed frame.
+        assert_eq!(crc16(&[b'A', 0xC3]), 0x4E8E);
     }
 
     #[test]

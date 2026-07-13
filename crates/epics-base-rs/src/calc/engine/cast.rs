@@ -65,6 +65,32 @@ pub(crate) fn c_int(x: f64) -> i32 {
     crate::types::c_cast::f64_to_i32(x)
 }
 
+/// C `myNINT` — `sCalcPerform.c:40` and `aCalcPerform.c:50`, byte-identical:
+///
+/// ```c
+/// #define myNINT(a) ((int)((a) >= 0 ? (a)+0.5 : (a)-0.5))
+/// ```
+///
+/// Round half away from zero, **and then cast to `int`** — the narrowing is
+/// INSIDE the macro, which is the whole point of it living here. A caller that
+/// takes `myNINT`'s value into a `long` gets an already-narrowed `int`
+/// sign-extended, not a fresh 64-bit conversion of the double.
+///
+/// The port used to have two copies of this and neither narrowed like C: sCalc's
+/// returned a `double` (so each of its call sites invented its own narrowing —
+/// `as i64` wrapped, `as i32` saturated, and the two disagreed *bitwise* on the
+/// same input), and aCalc's used Rust's `as i32`, which saturates where C's
+/// `cvttsd2si` yields the indefinite value. One function, one narrowing.
+///
+/// Compiled (`gcc -O0`, x86-64, runtime operand — a *constant* operand is folded
+/// by gcc to `INT32_MAX` instead, which is why this must be probed at runtime):
+/// `myNINT(3e9)` = `myNINT(-3e9)` = `myNINT(1e18)` = `myNINT(NaN)` =
+/// `-2147483648`; `myNINT(2.5)` = 3; `myNINT(-2.5)` = -3.
+#[inline]
+pub(crate) fn my_nint(a: f64) -> i32 {
+    c_int(if a >= 0.0 { a + 0.5 } else { a - 0.5 })
+}
+
 /// C's plain `(long)` cast of a double on LP64 (what sCalc's operators use).
 /// Same story as [`c_int`], one width up: x86-64 `cvttsd2si` with a 64-bit
 /// destination yields `INT64_MIN` for NaN and for anything out of range.
@@ -112,6 +138,27 @@ mod tests {
         // The plain cast has no such route: 3e9 > INT32_MAX is out of range.
         assert_eq!(c_int(3e9), i32::MIN);
         assert_eq!(c_long(3e9), 3_000_000_000);
+    }
+
+    /// Compiled sCalc/aCalc (`gcc -O0`, x86-64, RUNTIME operand). The narrowing
+    /// is inside C's macro, so an out-of-range magnitude is `INT32_MIN` — the
+    /// same value for either sign — and not a saturation or a wrap.
+    #[test]
+    fn my_nint_rounds_then_casts_at_c_width() {
+        assert_eq!(my_nint(2.5), 3);
+        assert_eq!(my_nint(-2.5), -3);
+        assert_eq!(my_nint(2.4), 2);
+        assert_eq!(my_nint(-2.4), -2);
+        assert_eq!(my_nint(0.0), 0);
+        // Out of int32 range, either sign, and NaN: `cvttsd2si`'s indefinite value.
+        assert_eq!(my_nint(3e9), i32::MIN);
+        assert_eq!(my_nint(-3e9), i32::MIN);
+        assert_eq!(my_nint(1e18), i32::MIN);
+        assert_eq!(my_nint(f64::NAN), i32::MIN);
+        // The rounding happens BEFORE the cast, so INT32_MAX still fits.
+        assert_eq!(my_nint(2147483647.0), i32::MAX);
+        // Not d2i: the wrap that base's bitwise ops use would say -1294967296.
+        assert_ne!(my_nint(3e9), d2i(3e9));
     }
 
     #[test]

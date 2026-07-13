@@ -948,9 +948,10 @@ fn classify_enum_token(
     menu: &[epics_ca_rs::PvString],
 ) -> Result<EnumToken, String> {
     if force_numeric {
-        return parse_enum_double(token)
-            .map(EnumToken::Number)
-            .ok_or_else(|| format!("Enum index value '{token}' is not a number."));
+        let index = parse_enum_double(token)
+            .ok_or_else(|| format!("Enum index value '{token}' is not a number."))?;
+        warn_if_enum_index_too_large(token, index, menu); // caput.c:477-479
+        return Ok(EnumToken::Number(index));
     }
     // C escapes the value into a fixed EpicsStr buffer before comparing
     // it to the menu names (caput.c:487-488).
@@ -966,9 +967,33 @@ fn classify_enum_token(
     if force_string {
         return Err(format!("Enum string value '{escaped}' invalid."));
     }
-    parse_enum_double(&String::from_utf8_lossy(escaped.as_bytes()))
-        .map(EnumToken::Number)
-        .ok_or_else(|| format!("Enum string value '{escaped}' invalid."))
+    let text = String::from_utf8_lossy(escaped.as_bytes()).into_owned();
+    let index = parse_enum_double(&text)
+        .ok_or_else(|| format!("Enum string value '{escaped}' invalid."))?;
+    // C warns with `sbuf[i]` here — the ESCAPED text, not the raw argv token
+    // it warns with on the `-n` path above (caput.c:505-507 vs :477-479).
+    warn_if_enum_index_too_large(&text, index, menu);
+    Ok(EnumToken::Number(index))
+}
+
+/// C `caput.c:477-479` and `:505-507` — the same warning at both places an ENUM
+/// value ends up as a NUMBER (R13-23):
+///
+/// ```text
+/// Warning: enum index value '%s' may be too large.
+/// ```
+///
+/// `dbuf[i] >= bufGrEnum.no_str`: an index at or past the end of the menu is
+/// suspicious, but NOT fatal — C prints this and puts the value anyway (neither
+/// site `return`s, unlike every other diagnostic in the block). A negative index
+/// is below `no_str`, so it does not warn; an empty menu (`no_str == 0`) warns
+/// for every index, as C's comparison does.
+///
+/// A menu NAME never reaches here: C only compares the numeric `dbuf[i]`.
+fn warn_if_enum_index_too_large(token: &str, index: f64, menu: &[epics_ca_rs::PvString]) {
+    if index >= menu.len() as f64 {
+        eprintln!("Warning: enum index value '{token}' may be too large.");
+    }
 }
 
 /// Parse an ENUM value as a number, mirroring C `epicsStrtod`

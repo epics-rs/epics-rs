@@ -114,3 +114,58 @@ async fn a_rejected_numeric_enum_prints_no_old_value() {
         "a rejected put must leave nothing on stdout: {out:?}"
     );
 }
+
+/// R13-23: an enum index at or past the end of the menu WARNS but still puts.
+///
+/// C prints `"Warning: enum index value '%s' may be too large.\n"` at both
+/// places an ENUM value becomes a number — the `-n` path (caput.c:477-479) and
+/// the string path's numeric fallback (caput.c:505-507) — and neither site
+/// `return`s, unlike every other diagnostic in that block. The value is written
+/// regardless, so the tool exits 0 and prints its `Old :` / `New :` lines.
+///
+/// The menu here has three states (Zero/One/Two), so `no_str == 3` and index 3
+/// is the first that warns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn an_out_of_range_enum_index_warns_and_still_puts() {
+    let port = server_with_mbbo("TST:MBBO").await;
+    let warning = "Warning: enum index value '99' may be too large.";
+
+    // -n path (caput.c:477-479).
+    let (out, err, code) = caput(port, &["-n", "TST:MBBO", "99"]).await;
+    assert_eq!(code, 0, "the warning is not fatal: C puts the value anyway");
+    assert!(err.contains(warning), "-n path stderr was: {err:?}");
+    assert!(out.contains("Old : "), "the put still runs: {out:?}");
+    assert!(out.contains("New : "), "the put still runs: {out:?}");
+
+    // Numeric fallback of the string path (caput.c:505-507): '99' is not a menu
+    // name, so it is retried as an index — and warns from the other site.
+    let (out, err, code) = caput(port, &["TST:MBBO", "99"]).await;
+    assert_eq!(
+        code, 0,
+        "the warning is not fatal on the string path either"
+    );
+    assert!(err.contains(warning), "string-path stderr was: {err:?}");
+    assert!(out.contains("New : "), "the put still runs: {out:?}");
+
+    // The boundary: `dbuf[i] >= no_str`. With three states, 2 is in range and 3
+    // is not — the first index past the end is the first to warn.
+    let (_, err, code) = caput(port, &["-n", "TST:MBBO", "2"]).await;
+    assert_eq!(code, 0);
+    assert!(
+        !err.contains("may be too large"),
+        "index 2 is the last valid state of a 3-state menu: {err:?}"
+    );
+    let (_, err, code) = caput(port, &["-n", "TST:MBBO", "3"]).await;
+    assert_eq!(code, 0);
+    assert!(
+        err.contains("Warning: enum index value '3' may be too large."),
+        "index 3 is one past the end of a 3-state menu: {err:?}"
+    );
+
+    // A menu NAME is never compared against `no_str` — C only tests the numeric
+    // `dbuf[i]`, so the valid-name path stays silent.
+    let (_, err, code) = caput(port, &["TST:MBBO", "Two"]).await;
+    assert_eq!(code, 0);
+    assert!(!err.contains("may be too large"), "name path: {err:?}");
+}

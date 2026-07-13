@@ -10,9 +10,16 @@ const TOOL: CTool = CTool::new("cainfo");
 /// The getopt cases that `return` from C's `main` (`cainfo.c:147-152`), by clap
 /// id. `copt::Scan::finish` performs the FIRST one on the command line, after
 /// replaying the warnings the loop raised on its way there (R13-26).
+/// `-n` is the odd one (R13-25). It is in cainfo's optstring (`cainfo.c:146`
+/// `":nhVw:s:p:"`) but has no `case` arm, so getopt hands it to the loop and it
+/// falls straight into `default:` — `usage(); return 1` (`cainfo.c:194-196`).
+/// That makes it a terminal like `-h`, only with the failure status; it is NOT
+/// an unrecognized option (`case '?'`), which is what a letter *outside* the
+/// optstring gets.
 const TERMINALS: &[(&str, copt::Terminal)] = &[
     ("help", copt::Terminal::Usage(0)),
     ("version", copt::Terminal::Version),
+    ("dead_n", copt::Terminal::Usage(1)),
 ];
 
 const VERSION_INFO: &str = concat!(
@@ -45,6 +52,14 @@ struct Args {
 
     #[arg(short = 'V', long, hide = true, action = clap::ArgAction::Count)]
     version: u8,
+
+    // `-n` must be DECLARED for the same reason C declares it in the optstring:
+    // an option letter that is merely absent gets `case '?'` ("Unrecognized
+    // option"), a different diagnostic and a different exit path from the
+    // `default:` arm `-n` actually lands in (R13-25). It carries no value and is
+    // never read — `TERMINALS` performs it.
+    #[arg(short = 'n', hide = true, action = clap::ArgAction::Count)]
+    dead_n: u8,
 
     /// CA timeout in seconds. Mirrors C `tool_lib.c:use_ca_timeout_env`.
     #[arg(short = 'w', long = "wait", allow_hyphen_values = true, action = clap::ArgAction::Append)]

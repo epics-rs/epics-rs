@@ -1050,6 +1050,28 @@ pub fn parse_link_field(s: &str, ftype: LinkFieldType) -> ParsedLink {
         return ParsedLink::Constant(inner.to_string());
     }
 
+    // Scalar numeric constant. C `dbParseLink` (`dbStaticLib.c:2346-2349`):
+    //
+    //     /* Link is a constant if empty or it holds just a number */
+    //     if (len == 0 || epicsParseDouble(pstr, &value, NULL) == 0) {
+    //         pinfo->ltype = CONSTANT;
+    //         return 0;
+    //     }
+    //
+    // The test runs on the WHOLE stripped string, *before* the modifier scan,
+    // and `epicsParseDouble` with a NULL `units` argument rejects any trailing
+    // text (`S_stdlib_extraneous`, `epicsStdlib.c`). So `"5 PP"` is NOT a
+    // constant in C — it is a PV_LINK to a record named `5` with the `PP`
+    // modifier (verified on softIoc: `INPA: CA_LINK 5 PP NMS`). Splitting the
+    // modifiers off first and then testing the head for a number turns every
+    // `"<number> <modifier>"` link into a constant: `SDIS="3 NPP"` with
+    // `DISV=3` would disable the record forever, and `OUT="5 PP"` would drop
+    // the write instead of alarming. Keep this test above
+    // `split_link_modifiers`.
+    if s.parse::<f64>().is_ok() {
+        return ParsedLink::Constant(s.to_string());
+    }
+
     // Array constant. C `dbParseLink` (`dbStaticLib.c:2354-2357`), right after
     // the scalar-constant test:
     //
@@ -1091,11 +1113,6 @@ pub fn parse_link_field(s: &str, ftype: LinkFieldType) -> ParsedLink {
             monitor_switch: ms,
             policy,
         });
-    }
-
-    // Numeric constant
-    if link_part.parse::<f64>().is_ok() {
-        return ParsedLink::Constant(link_part.to_string());
     }
 
     // DB link: split record from field exactly as C `dbNameToAddr`

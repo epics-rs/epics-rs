@@ -188,11 +188,9 @@ async fn real_db_inp_still_reads_every_cycle() {
 /// only array constant there is — its text goes to `dbPutConvertJSON`.
 ///
 /// `"1 2 3"` is not an array constant in C: `epicsParseDouble` rejects the
-/// trailing garbage, so C makes it a PV_LINK to a record named `1`. (The port
-/// splits link modifiers off before its numeric test and so yields
-/// `Constant("1")` here rather than a PV link — a separate classifier-ordering
-/// divergence, reported on its own. What matters for the constant-array loader
-/// is that no whitespace-separated list is ever taken for the array [1,2,3].)
+/// trailing garbage, so C makes it a PV_LINK to a record named `1` — which the
+/// port now does too (see `link_modifier_split_runs_after_the_constant_test`).
+/// Only a bracketed literal loads as the constant array.
 #[test]
 fn only_a_bracketed_literal_is_a_constant_array() {
     use epics_base_rs::server::record::{ParsedLink, parse_link_v2};

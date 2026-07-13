@@ -1614,7 +1614,10 @@ mod array_kind_tests {
         let mut aao = WaveformRecord::with_kind(ArrayKind::Aao);
         aao.omsl = MENU_OMSL_CLOSED_LOOP;
 
-        aao.dol = "1 2 3".to_string(); // constant array literal
+        // Constant array literal. NOT `1 2 3`: `epicsParseDouble` rejects the
+        // trailing text, so C parses that as a PV_LINK to a record named `1`
+        // (`dbStaticLib.c:2346-2357`).
+        aao.dol = "[1,2,3]".to_string();
         assert!(aao.pre_input_link_actions().is_empty());
 
         aao.dol = "42".to_string(); // constant scalar literal

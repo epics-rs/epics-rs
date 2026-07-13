@@ -38,6 +38,7 @@ use epics_base_rs::types::EpicsValue;
 /// `menu(calcoutINAV)`: 0 = Ext PV NC, 1 = Ext PV OK, 2 = Local PV, 3 = Constant.
 const LINK_EXT_NC: u16 = 0;
 const LINK_LOC: u16 = 2;
+const LINK_CONST: u16 = 3;
 
 async fn inav(db: &PvDatabase, rec: &str) -> u16 {
     let inst = db.get_record(rec).await.unwrap();
@@ -168,6 +169,68 @@ async fn record_added_after_ioc_init_classifies_immediately() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     assert_eq!(inav(&db, "CO").await, LINK_LOC);
+}
+
+/// R19-62 — the lifecycle is ONE-WAY. `begin_load` after `iocInit` must not
+/// re-open the LOAD phase: the queue it would re-arm is drained by `ioc_init`
+/// alone, so everything pushed into it afterwards — every later record's
+/// classification — would sit there forever.
+///
+/// Measured on the port before the fix: `iocInit; dbLoadRecords(b.db); dbpf
+/// CO.INPA "9.5"` left `CO.INAV` at 0, where a plain `iocInit; dbpf CO.INPA
+/// "9.5"` gives 3 (Constant).
+#[tokio::test]
+async fn begin_load_after_ioc_init_does_not_re_open_the_load_phase() {
+    let db = Arc::new(PvDatabase::new());
+    db.begin_load();
+    db.add_record("TARGET", Box::new(AiRecord::new(1.0)))
+        .await
+        .unwrap();
+    db.ioc_init().await;
+
+    // A `dbLoadRecords` typed at the running iocsh prompt.
+    db.begin_load();
+
+    // Anything classified from here on must still run: the phase is terminal, so
+    // this is a spawn, not a push into a queue nothing drains.
+    add_calcout(&db, "CO", "TARGET.VAL").await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    assert_eq!(
+        inav(&db, "CO").await,
+        LINK_LOC,
+        "a post-iocInit begin_load re-armed the queue: the classification was stranded"
+    );
+}
+
+/// The same boundary from the other owner of `schedule_record_init` — the
+/// runtime `special()` link re-point (`calcout.rs`, `sseq.rs`, `swait.rs`,
+/// std-rs `throttle.rs`). A put to `INPA` re-classifies the link; after a
+/// post-iocInit `begin_load` it was stranded, freezing `INAV` at its old value.
+#[tokio::test]
+async fn runtime_link_re_point_still_classifies_after_a_post_init_load() {
+    let db = Arc::new(PvDatabase::new());
+    db.begin_load();
+    add_calcout(&db, "CO", "TARGET.VAL").await;
+    db.add_record("TARGET", Box::new(AiRecord::new(1.0)))
+        .await
+        .unwrap();
+    db.ioc_init().await;
+    assert_eq!(inav(&db, "CO").await, LINK_LOC);
+
+    db.begin_load();
+
+    // `dbpf CO.INPA "9.5"` — the link becomes a CONSTANT.
+    db.put_pv("CO.INPA", EpicsValue::String("9.5".into()))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    assert_eq!(
+        inav(&db, "CO").await,
+        LINK_CONST,
+        "the special() re-point must classify against the running database"
+    );
 }
 
 /// The `.db` path: `CO`'s `INPA` names `TARGET`, defined AFTER it in the same

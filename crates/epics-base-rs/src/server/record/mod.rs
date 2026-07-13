@@ -26,10 +26,10 @@ pub use menu_choices::{
 pub use pini::PiniMode;
 pub use record_instance::{NotifyWaitSet, RecordInstance};
 pub use record_trait::{
-    ArrayMonitorPost, CommonFieldPutResult, CyclePostMask, EPICS_TIME_EVENT_DEVICE_TIME, FieldDesc,
-    FieldMetadataOverride, InputFetchPolicy, OutTarget, ProcessAction, ProcessContext,
-    ProcessOutcome, ProcessSnapshot, Record, RecordProcessResult, SubroutineFn, ValuePostGate,
-    put_field_internal_default,
+    ArrayMonitorPost, CommonFieldPutResult, ConstantInitLink, CyclePostMask,
+    EPICS_TIME_EVENT_DEVICE_TIME, FieldDesc, FieldMetadataOverride, InputFetchPolicy, OutTarget,
+    ProcessAction, ProcessContext, ProcessOutcome, ProcessSnapshot, Record, RecordProcessResult,
+    SubroutineFn, ValuePostGate, put_field_internal_default, seed_input_links,
 };
 pub(crate) use record_trait::{AuxPostMask, value_gate};
 pub use scan::{ScanType, SimModeScan};

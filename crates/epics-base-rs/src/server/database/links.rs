@@ -496,8 +496,40 @@ impl PvDatabase {
         Some((value, time))
     }
 
-    /// Read value + alarm from a DB link. Returns (value, alarm) for MS/NMS propagation.
+    /// **The single owner of a process-time link read that carries both a
+    /// value and an alarm** — the input-fetch readers (INPA..L, INAA..LL,
+    /// SUBL, output-time DOL) go through here.
+    ///
+    /// Returns C's `(status, buffer)` pair, not an `Option`: a CONSTANT link is
+    /// [`LinkFetch::NoData`] — SUCCESS with nothing delivered
+    /// (`dbConstLink.c:219-225` `dbConstGetValue`: `*pnRequest = 0; return 0`)
+    /// — which is NOT the same as [`LinkFetch::Failed`]. Collapsing the two
+    /// into `Option` is what made a constant input both re-apply its value on
+    /// every cycle (destroying a client's `caput A=99` on a
+    /// `field(INPA,"5")` calc) and, once it stopped delivering, look like a
+    /// failed read that gates `fetch_values`. The constant reaches the record
+    /// exactly once, at init, through
+    /// [`super::PvDatabase::rec_gbl_init_constant_links`].
     pub(crate) async fn read_link_with_alarm(
+        &self,
+        link: &crate::server::record::ParsedLink,
+    ) -> (crate::server::recgbl::simm::LinkFetch, Option<LinkAlarm>) {
+        use crate::server::recgbl::simm::LinkFetch;
+        let (value, alarm) = self.read_link_value_and_alarm(link).await;
+        let fetch = match value {
+            Some(v) => LinkFetch::Value(v),
+            // C `dbGetLink` on a CONSTANT (or unset) link: status 0, nothing
+            // written. Any other link that produced no value did FAIL.
+            None if crate::server::recgbl::simm::is_constant(link) => LinkFetch::NoData,
+            None => LinkFetch::Failed,
+        };
+        (fetch, alarm)
+    }
+
+    /// The raw value+alarm read behind [`Self::read_link_with_alarm`]. Never
+    /// call this directly from a process path — it cannot tell "constant" from
+    /// "failed"; that is the classifier's job.
+    async fn read_link_value_and_alarm(
         &self,
         link: &crate::server::record::ParsedLink,
     ) -> (Option<EpicsValue>, Option<LinkAlarm>) {
@@ -531,7 +563,10 @@ impl PvDatabase {
                 };
                 (value, alarm)
             }
-            crate::server::record::ParsedLink::Constant(_) => (link.constant_value(), None),
+            // A CONSTANT link delivers nothing at process time; the classifier
+            // above turns this `None` into `LinkFetch::NoData` (success), not
+            // a failure.
+            crate::server::record::ParsedLink::Constant(_) => (None, None),
             // External Pva/Ca link: the value comes from the lset's
             // cached snapshot, the alarm from the lset's accessors.
             //
@@ -799,7 +834,7 @@ impl PvDatabase {
             // `if (dbLinkIsConstant(pinp)) return 0;`). The constant reaches
             // the record ONCE, at init, through the
             // `recGblInitConstantLink`/`dbLoadLinkArray` owner
-            // (`rec_gbl_init_constant_inp`).
+            // (`rec_gbl_init_constant_links`).
             //
             // Re-delivering it every cycle — as this arm did — made a constant
             // INP overwrite the record's VAL on every process, so a client
@@ -1588,7 +1623,12 @@ impl PvDatabase {
                     // sourced over CA/PVA or given as a constant never
                     // updated SELN.
                     let parsed = crate::server::record::parse_link_v2(&sell);
-                    if let Some(val) = self.read_link_value_no_process(&parsed).await {
+                    // Through the one classifier: a CONSTANT SELL delivers
+                    // NOTHING here (`dbConstGetValue`) — its value reached SELN
+                    // once, at init (`fanoutRecord.c:88`, `dfanoutRecord.c:102`,
+                    // `seqRecord.c:121` `recGblInitConstantLink(&sell,
+                    // DBF_USHORT, &seln)`), so a `caput REC.SELN` STAYS put.
+                    if let Some(val) = self.fetch_link(&parsed).await.value() {
                         // C reads SELL with `dbGetLink(&prec->sell,
                         // DBR_USHORT, &prec->seln, 0, 0)`; the dbConvert GET
                         // macro stores `*pdst = (epicsUInt16) *psrc`
@@ -2850,9 +2890,9 @@ mod nonlocal_db_link_read_tests {
         .await;
 
         let link = parse_link_v2("OTHER:PV");
-        let (value, alarm) = db.read_link_with_alarm(&link).await;
+        let (fetch, alarm) = db.read_link_with_alarm(&link).await;
         assert_eq!(
-            value,
+            fetch.value(),
             Some(EpicsValue::Double(5.0)),
             "non-local Db link value must come from the external resolver"
         );

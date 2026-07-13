@@ -1142,6 +1142,14 @@ impl Record for ScalcoutRecord {
         }
     }
 
+    /// C `sCalcoutRecord.c:258 (numeric INPA..L only — "Don't InitConstantLink the string links")`: every CONSTANT input link is loaded into its value
+    /// field ONCE, at `init_record` (`recGblInitConstantLink(plink,
+    /// DBF_DOUBLE, pvalue)`); `dbGetLink` then delivers nothing for it on
+    /// every later process, so a client's `caput REC.A 99` stands.
+    fn constant_init_links(&self) -> Vec<crate::server::record::ConstantInitLink> {
+        crate::server::record::seed_input_links(self.multi_input_links())
+    }
+
     fn multi_input_links(&self) -> &[(&'static str, &'static str)] {
         &[
             ("INPA", "A"),

@@ -1065,7 +1065,7 @@ impl PvDatabase {
         &self,
         rec: &Arc<RwLock<RecordInstance>>,
     ) -> Option<AsubDynamicSub> {
-        let (subl, onam) = {
+        let (subl, onam, snam) = {
             let inst = rec.read().await;
             if inst.record.record_type() != "aSub" {
                 return None;
@@ -1083,22 +1083,27 @@ impl PvDatabase {
                 Some(EpicsValue::String(s)) => s.as_str_lossy().into_owned(),
                 _ => String::new(),
             };
-            (read_str("SUBL"), read_str("ONAM"))
+            (read_str("SUBL"), read_str("ONAM"), read_str("SNAM"))
         };
 
-        // Read the current name from SUBL. A constant link's text IS the name
-        // (C `recGblInitConstantLink` / `dbGetLink` on a constant); a
-        // DB/CA/PVA link is read for its string value.
-        let name: Option<String> = if subl.is_empty() {
-            Some(String::new())
-        } else {
-            match crate::server::record::parse_link_v2(&subl) {
-                crate::server::record::ParsedLink::Constant(s) => Some(s),
-                other => self.read_link_with_alarm(&other).await.0.map(|v| match v {
-                    EpicsValue::String(s) => s.as_str_lossy().into_owned(),
-                    o => o.to_f64().map(|f| f.to_string()).unwrap_or_default(),
-                }),
-            }
+        // C `aSubRecord.c:256`: `dbGetLink(&prec->subl, DBR_STRING,
+        // prec->snam, 0, 0)` — a plain read into SNAM. A CONSTANT (or unset)
+        // SUBL delivers NOTHING here, so SNAM keeps the name
+        // `recGblInitConstantLink(&subl, DBF_STRING, prec->snam)`
+        // (`aSubRecord.c:126`) loaded at init — which is also what a `caput
+        // REC.SNAM other` leaves in place.
+        use crate::server::recgbl::simm::LinkFetch;
+        let name: Option<String> = match self
+            .read_link_with_alarm(&crate::server::record::parse_link_v2(&subl))
+            .await
+            .0
+        {
+            LinkFetch::Value(v) => Some(match v {
+                EpicsValue::String(s) => s.as_str_lossy().into_owned(),
+                o => o.to_f64().map(|f| f.to_string()).unwrap_or_default(),
+            }),
+            LinkFetch::NoData => Some(snam),
+            LinkFetch::Failed => None,
         };
 
         let Some(name) = name else {
@@ -1336,11 +1341,14 @@ impl PvDatabase {
             };
 
             // C `dbGetLink(&precord->sdis, DBR_SHORT, &precord->disa, 0, 0)`
-            // reads the SDIS link regardless of its type (DB / CA / PVA /
-            // constant) via the lset. The pre-fix port only refreshed
-            // `disa` from a `ParsedLink::Db` SDIS, so a remote-sourced
-            // (CA/PVA) or constant enable/disable was silently ignored.
-            if let Some(val) = self.read_link_value_no_process(&sdis_link).await {
+            // (`dbAccess.c:566`) reads the SDIS link regardless of its type
+            // (DB / CA / PVA / constant) via the lset — so it goes through the
+            // one classifier. A CONSTANT SDIS delivers NOTHING
+            // (`dbConstGetValue`), and dbCommon has no `recGblInitConstantLink`
+            // for SDIS, so DISA keeps its `initial(0)`: `field(SDIS,"3")` with
+            // `DISV=3` does NOT disable the record in C (softIoc-verified).
+            // Handing back the constant here disabled it forever.
+            if let Some(val) = self.fetch_link(&sdis_link).await.value() {
                 let disa_val = val.to_f64().unwrap_or(0.0) as i16;
                 let mut instance = rec.write().await;
                 instance.common.disa = disa_val;
@@ -1501,11 +1509,15 @@ impl PvDatabase {
                     instance.common.utag = src_utag;
                     instance.common.tse = -2;
                 }
-            } else if let Some(val) = self.read_link_value_no_process(&tsel_link).await {
+            } else if let Some(val) = self.fetch_link(&tsel_link).await.value() {
                 // Non-`.TIME` TSEL: C `dbGetLink(&tsel, DBR_SHORT,
                 // &prec->tse)` loads TSE from the link regardless of its
                 // type. The pre-fix port only read a `ParsedLink::Db`
-                // TSEL, ignoring a CA/PVA/constant TSE source.
+                // TSEL, ignoring a CA/PVA TSE source — and then over-corrected
+                // by handing back a CONSTANT TSEL's text every cycle, which C
+                // never does: `recGblGetTimeStampSimm` (`recGbl.c:315`) is
+                // wrapped in `if (!dbLinkIsConstant(plink))`, so a constant
+                // TSEL is skipped outright and TSE keeps its own value.
                 let tse_val = val.to_f64().unwrap_or(0.0) as i16;
                 let mut instance = rec.write().await;
                 instance.common.tse = tse_val;
@@ -1845,7 +1857,11 @@ impl PvDatabase {
         // (114) skips `do_sel` when `fetch_values` fails, and in
         // Specified mode a failed NVL read is one such failure.
         let mut sel_is_specified = false;
-        let mut sel_nvl_present = false;
+        // A CONSTANT NVL is not a failed read: C `selRecord.c:99` seeds SELN
+        // from it once at init (`recGblInitConstantLink(&nvl, DBF_USHORT,
+        // &seln)`) and `dbGetLink` then delivers nothing every cycle, so
+        // `fetch_values` succeeds and `do_sel` runs on the seeded SELN.
+        let mut sel_nvl_read_failed = false;
         let sel_nvl_value: Option<EpicsValue> = {
             let instance = rec.read().await;
             if instance.record.record_type() == "sel" {
@@ -1862,12 +1878,13 @@ impl PvDatabase {
                         }
                     })
                     .unwrap_or_default();
-                sel_nvl_present = !nvl_str.is_empty();
-                if sel_nvl_present {
+                if !nvl_str.is_empty() {
                     drop(instance); // release read lock before async read
                     let parsed =
                         crate::server::record::parse_link_v2(nvl_str.as_str_lossy().as_ref());
-                    self.read_link_value(&parsed, visited, depth).await
+                    let fetch = self.fetch_input_link(&parsed, visited, depth).await;
+                    sel_nvl_read_failed = !fetch.is_ok();
+                    fetch.value()
                 } else {
                     None
                 }
@@ -1912,11 +1929,21 @@ impl PvDatabase {
         // `RecordInstance::suppress_subroutine_run` for the two whose body is
         // the framework-dispatched subroutine (sub/aSub).
         let mut fetch_values_failed = false;
+        // Any input link that FAILED this cycle (C `dbGetLink` non-zero). A
+        // constant input is NOT a failure — it is a success that delivers
+        // nothing (`LinkFetch::NoData`).
+        let mut any_input_read_failed = false;
         {
             let input_fetch_policy;
+            // C `printfRecord.c:49-52` (`GET_PRINT`) is the ONE record whose
+            // input fetch re-runs `recGblInitConstantLink` on every process, so
+            // its constants DO deliver every cycle. Every other record fetches
+            // with a plain `dbGetLink`, where a constant delivers nothing.
+            let constants_deliver_at_process;
             let link_info: Vec<(String, &'static str, String)> = {
                 let instance = rec.read().await;
                 input_fetch_policy = instance.record.input_fetch_policy();
+                constants_deliver_at_process = instance.record.constant_inputs_deliver_at_process();
                 // Restrict to the record's active inputs this cycle (sel
                 // `Specified` → only INP[SELN]); `None` = fetch every link.
                 let links = instance
@@ -1955,10 +1982,33 @@ impl PvDatabase {
                     if let crate::server::record::ParsedLink::Db(ref db) = parsed {
                         self.process_passive_db_source(db, visited, depth).await;
                     }
-                    let (value, alarm) = self.read_link_with_alarm(&parsed).await;
-                    let read_failed = value.is_none();
+                    let (fetch, alarm) = self.read_link_with_alarm(&parsed).await;
+                    let read_failed = !fetch.is_ok();
+                    any_input_read_failed |= read_failed;
+                    // `NoData` (a CONSTANT link) delivers nothing — the value
+                    // field keeps what the init-seed owner
+                    // (`rec_gbl_init_constant_links`) loaded into it, so a
+                    // client's `caput REC.A 99` survives every later process.
+                    // printf is the declared exception (see above).
+                    let value = match fetch {
+                        crate::server::recgbl::simm::LinkFetch::Value(v) => Some(v),
+                        crate::server::recgbl::simm::LinkFetch::NoData
+                            if constants_deliver_at_process =>
+                        {
+                            crate::server::recgbl::simm::constant_load_value(&parsed)
+                        }
+                        _ => None,
+                    };
                     if let Some(value) = value {
                         results.push((val_field.clone(), value));
+                    }
+                    // "Resolved" is C's `RTN_SUCCESS(dbGetLink(...))` — status
+                    // 0 — which a CONSTANT link satisfies (it delivers nothing
+                    // and returns success). So a constant input counts as
+                    // resolved even though it wrote no value: `epidRecord.c:191`
+                    // clears UDF on exactly that, and `motorRecord.cc:1994`
+                    // does not fail its DOL pass on it.
+                    if !read_failed {
                         resolved_link_fields.push(link_field);
                     }
                     // B2 / multi-input alarm propagation
@@ -2019,18 +2069,15 @@ impl PvDatabase {
             }
             multi_input_values = results;
 
-            // Evaluate the Specified-mode fetch gate while
-            // `link_info` is in scope. A *configured* (non-empty) selected
-            // input that did not reach `resolved_link_fields`, or a
-            // configured NVL link that did not resolve, means C
-            // `fetch_values` returned failure. An empty selected link is
-            // NOT a failure — C `dbGetLink` on an unset constant link
-            // returns success and the NaN-initialised field flows into
-            // `do_sel`. High/Low/Median (`!sel_is_specified`) never gate.
-            sel_fetch_failed = sel_is_specified
-                && ((sel_nvl_present && sel_nvl_value.is_none())
-                    || (link_info.iter().any(|(s, _, _)| !s.is_empty())
-                        && resolved_link_fields.is_empty()));
+            // The Specified-mode fetch gate: C `selRecord.c::process` (114)
+            // skips `do_sel` when `fetch_values` returns non-zero, and in
+            // Specified mode the fetch list is exactly NVL + INP[SELN]. So the
+            // gate is "a link read FAILED" — never "a link delivered no
+            // value": `dbGetLink` on an unset OR constant link returns success
+            // (`dbConstGetValue`), and the field it would have written keeps
+            // its init-seeded / initial value, which then flows into `do_sel`.
+            // High/Low/Median (`!sel_is_specified`) never gate.
+            sel_fetch_failed = sel_is_specified && (sel_nvl_read_failed || any_input_read_failed);
         }
         // 1.6. String-input link fetch — C `sCalcoutRecord.c::fetch_values`'s
         // SECOND loop (890-941), over INAA..INLL → AA..LL. It is a separate
@@ -2076,7 +2123,7 @@ impl PvDatabase {
                 if let crate::server::record::ParsedLink::Db(ref db) = parsed {
                     self.process_passive_db_source(db, visited, depth).await;
                 }
-                let (value, alarm) = self.read_link_with_alarm(&parsed).await;
+                let (fetch, alarm) = self.read_link_with_alarm(&parsed).await;
                 if let Some(alarm) = alarm {
                     match &parsed {
                         crate::server::record::ParsedLink::Db(db) => {
@@ -2095,15 +2142,23 @@ impl PvDatabase {
                         _ => {}
                     }
                 }
-                let text = match value {
-                    Some(value) => string_link_text(&value),
+                let text = match fetch {
+                    crate::server::recgbl::simm::LinkFetch::Value(value) => {
+                        string_link_text(&value)
+                    }
+                    // C (:894-911) only reads a CA_LINK or a DB_LINK; a
+                    // CONSTANT string link is never read and never seeded
+                    // (`sCalcoutRecord.c:256-259`: "Don't InitConstantLink the
+                    // string links"), so `status` stays 0 and the string field
+                    // keeps what was last put to it — no diagnostic.
+                    crate::server::recgbl::simm::LinkFetch::NoData => continue,
                     // C (:939-940): `epicsSnprintf(*psvalue, STRING_SIZE-1,
                     // "%s:fetch(%s) failed", pcalc->name, sFldnames[i])` — the
                     // failed fetch REPLACES the value with the diagnostic; the
                     // previous string is not kept, and the record still computes.
-                    None => truncate_string_field(PvString::from(format!(
-                        "{name}:fetch({val_field}) failed"
-                    ))),
+                    crate::server::recgbl::simm::LinkFetch::Failed => truncate_string_field(
+                        PvString::from(format!("{name}:fetch({val_field}) failed")),
+                    ),
                 };
                 results.push((val_field.to_string(), EpicsValue::String(text)));
             }
@@ -2923,7 +2978,11 @@ impl PvDatabase {
                         // is a `recDynLink` (CA-style) input, which never
                         // process-passives its source.
                         let parsed = crate::server::record::parse_link_v2(&link);
-                        if let (Some(value), _) = self.read_link_with_alarm(&parsed).await {
+                        // `NoData` (constant DOL) writes nothing — the value
+                        // field keeps what it holds, as in C, where a swait DOL
+                        // that is not a PV name never registers a recDynLink
+                        // and so never delivers.
+                        if let Some(value) = self.read_link_with_alarm(&parsed).await.0.value() {
                             fetched.push((value_field, value));
                         }
                     }
@@ -4632,31 +4691,52 @@ impl PvDatabase {
         }
     }
 
-    /// C `dbGetLink` / `dbTryGetLink` on a SIMULATION link (SIML or SIOL),
-    /// classified into the three outcomes C's `(status, buffer)` pair can
-    /// carry — see [`crate::server::recgbl::simm::SimLinkFetch`].
+    /// **The single owner of a process-time link read that has no
+    /// value-and-alarm pair to deliver** — C `dbGetLink` / `dbTryGetLink` on
+    /// SIML, SIOL, SDIS, TSEL, SELL, classified into the three outcomes C's
+    /// `(status, buffer)` pair can carry (see
+    /// [`crate::server::recgbl::simm::LinkFetch`]).
     ///
-    /// The generic [`Self::read_link_value_no_process`] collapses two of them:
-    /// it hands back the CONSTANT link's parsed text as if the link had
-    /// delivered it this cycle, and `None` both for "constant with nothing to
-    /// give" and for "the read failed". C keeps them apart —
-    /// `dbConstGetValue` (`dbConstLink.c:219-225`) returns SUCCESS and writes
-    /// nothing, because a constant's value was already loaded into the
-    /// record's buffer at `init_record` — and every simulation-mode decision
-    /// hangs off that distinction. So the simulation path gets its own
-    /// classifier; the constant's value still reaches the record, through
-    /// [`Self::rec_gbl_init_simm`].
-    pub(crate) async fn fetch_sim_link(
+    /// The raw [`Self::read_link_value_no_process`] collapses two of them: it
+    /// hands back the CONSTANT link's parsed text as if the link had delivered
+    /// it this cycle, and `None` both for "constant with nothing to give" and
+    /// for "the read failed". C keeps them apart — `dbConstGetValue`
+    /// (`dbConstLink.c:219-225`) returns SUCCESS and writes nothing, because a
+    /// constant's value was already loaded into the record's buffer at
+    /// `init_record`. Every gate downstream (simulation mode, DISA, TSE, SELN)
+    /// hangs off that distinction, so every one of them reads through here and
+    /// the constant reaches the record only through the init-seed owner
+    /// ([`Self::rec_gbl_init_constant_links`] / [`Self::rec_gbl_init_simm`]).
+    pub(crate) async fn fetch_link(
         &self,
         link: &crate::server::record::ParsedLink,
-    ) -> crate::server::recgbl::simm::SimLinkFetch {
-        use crate::server::recgbl::simm::SimLinkFetch;
+    ) -> crate::server::recgbl::simm::LinkFetch {
+        use crate::server::recgbl::simm::LinkFetch;
         if crate::server::recgbl::simm::is_constant(link) {
-            return SimLinkFetch::NoData;
+            return LinkFetch::NoData;
         }
         match self.read_link_value_no_process(link).await {
-            Some(v) => SimLinkFetch::Value(v),
-            None => SimLinkFetch::Failed,
+            Some(v) => LinkFetch::Value(v),
+            None => LinkFetch::Failed,
+        }
+    }
+
+    /// [`Self::fetch_link`] for an INPUT link — same classification, but the
+    /// PP rule applies: C `dbGetLink` on a `ProcessPassive` DB link processes
+    /// the passive source before reading it. Used by sel's NVL→SELN read.
+    pub(crate) async fn fetch_input_link(
+        &self,
+        link: &crate::server::record::ParsedLink,
+        visited: &mut HashSet<String>,
+        depth: usize,
+    ) -> crate::server::recgbl::simm::LinkFetch {
+        use crate::server::recgbl::simm::LinkFetch;
+        if crate::server::recgbl::simm::is_constant(link) {
+            return LinkFetch::NoData;
+        }
+        match self.read_link_value(link, visited, depth).await {
+            Some(v) => LinkFetch::Value(v),
+            None => LinkFetch::Failed,
         }
     }
 
@@ -4683,7 +4763,7 @@ impl PvDatabase {
         rec: &Arc<RwLock<RecordInstance>>,
         siml: &crate::server::record::ParsedLink,
     ) -> bool {
-        use crate::server::recgbl::simm::SimLinkFetch;
+        use crate::server::recgbl::simm::LinkFetch;
         // `recGblSaveSimm(*psscn, poldsimm, *psimm)` — latch the outgoing mode
         // BEFORE the SIML read can move SIMM.
         {
@@ -4696,10 +4776,10 @@ impl PvDatabase {
         // YES; re-reading the constant every cycle (the pre-fix behaviour of
         // `read_link_value_no_process`) would stomp the operator's put back to
         // the constant on the very next process.
-        let fetch = self.fetch_sim_link(siml).await;
-        let failed = matches!(fetch, SimLinkFetch::Failed);
+        let fetch = self.fetch_link(siml).await;
+        let failed = matches!(fetch, LinkFetch::Failed);
         match fetch {
-            SimLinkFetch::Value(v) => {
+            LinkFetch::Value(v) => {
                 let simm = v.to_f64().unwrap_or(0.0) as i16;
                 let mut instance = rec.write().await;
                 let _ = instance
@@ -4707,10 +4787,10 @@ impl PvDatabase {
                     .put_field_internal("SIMM", EpicsValue::Short(simm));
             }
             // status 0, nothing written — SIMM keeps what init loaded.
-            SimLinkFetch::NoData => {}
+            LinkFetch::NoData => {}
             // The read FAILED. Two C shapes, keyed on which SIML reader the
             // record's support uses (`Record::uses_recgbl_simm_helpers`):
-            SimLinkFetch::Failed => {
+            LinkFetch::Failed => {
                 let mut instance = rec.write().await;
                 if instance.record.uses_recgbl_simm_helpers() {
                     // `recGblGetSimm` (recGbl.c:453-454):
@@ -4770,7 +4850,7 @@ impl PvDatabase {
     /// A CONSTANT link hands its value to the record exactly ONCE, here, via
     /// `dbLoadLink` — at process time `dbGetLink` on a constant delivers
     /// nothing. This is the other half of the rule
-    /// [`Self::fetch_sim_link`] enforces; without it a `field(SIOL, "42")`
+    /// [`Self::fetch_link`] enforces; without it a `field(SIOL, "42")`
     /// would never reach SVAL at all.
     ///
     /// Must be called once per record, after its fields are applied — the
@@ -4798,36 +4878,84 @@ impl PvDatabase {
     /// Gated on soft DTYP because a hardware record's INP is a device ADDRESS,
     /// not a value — C only ever loads it in soft dev support.
     ///
+    /// **This is THE init-seed owner.** Beyond the device-support INP above it
+    /// applies the record's own `recGblInitConstantLink` table,
+    /// [`Record::constant_init_links`] — calc/calcout/sub/sel/aSub/scalcout/
+    /// acalcout/transform `INPA..L → A..L`, sel `NVL → SELN`, fanout/dfanout/
+    /// seq `SELL → SELN`, seq `DOLn → DOn`, aSub `SUBL → SNAM`, and the
+    /// `DOL → VAL` seeds that also clear UDF. Every one of those links is
+    /// dead at process time (the link layer returns `LinkFetch::NoData` for a
+    /// constant), so this is the only place their values can arrive.
+    ///
     /// Must be called once per record, after its fields are applied and both
     /// `init_record` passes have run (the record needs its final NELM/FTVL
     /// buffer before an array constant can land in it) — the `init_record(1)`
-    /// sites (`ioc_builder`, `dbLoadRecords`).
-    pub(crate) async fn rec_gbl_init_constant_inp(&self, rec: &Arc<RwLock<RecordInstance>>) {
+    /// sites (`ioc_builder`, `dbLoadRecords`). It also runs from
+    /// `PvDatabase::add_record`, the creation sink every other path funnels
+    /// through, so a record built programmatically (no `IocBuilder`) still has
+    /// its constants seeded: in C there is no record in the database that
+    /// `init_record` did not touch. Seeding twice is a no-op — both calls
+    /// happen before any client can put.
+    pub(crate) async fn rec_gbl_init_constant_links(&self, rec: &Arc<RwLock<RecordInstance>>) {
         let mut instance = rec.write().await;
-        if !crate::server::device_support::is_soft_dtyp(&instance.common.dtyp) {
-            return;
-        }
+        seed_constant_links(&mut instance);
+    }
+}
+
+/// The body of the init-seed owner, over a locked record — shared by
+/// [`PvDatabase::rec_gbl_init_constant_links`] and `PvDatabase::add_record`.
+pub(crate) fn seed_constant_links(instance: &mut RecordInstance) {
+    // 1. The soft-channel device support's INP → VAL/RVAL load.
+    if crate::server::device_support::is_soft_dtyp(&instance.common.dtyp) {
         let inp = crate::server::record::parse_link_v2(&instance.common.inp);
-        let Some(value) = crate::server::recgbl::simm::constant_load_value(&inp) else {
-            return;
-        };
-        // Same sink the per-cycle soft-input apply uses, so the constant lands
-        // in the field the link would have written: RVAL for `Raw Soft
-        // Channel` (the record converts RVAL→VAL), VAL otherwise.
-        let is_raw_soft =
-            instance.common.dtyp == "Raw Soft Channel" && instance.record.accepts_raw_soft_input();
-        let loaded = if is_raw_soft {
-            instance.record.apply_raw_input(value).is_ok()
-        } else {
-            instance.record.set_val(value).is_ok()
-        };
-        // C: `if (recGblInitConstantLink(...)) prec->udf = FALSE;` — a record
-        // whose value came from a constant link is DEFINED.
-        if loaded {
-            instance.common.udf = false;
+        if let Some(value) = crate::server::recgbl::simm::constant_load_value(&inp) {
+            // Same sink the per-cycle soft-input apply uses, so the constant
+            // lands in the field the link would have written: RVAL for `Raw
+            // Soft Channel` (the record converts RVAL→VAL), VAL otherwise.
+            let is_raw_soft = instance.common.dtyp == "Raw Soft Channel"
+                && instance.record.accepts_raw_soft_input();
+            let loaded = if is_raw_soft {
+                instance.record.apply_raw_input(value).is_ok()
+            } else {
+                instance.record.set_val(value).is_ok()
+            };
+            // C: `if (recGblInitConstantLink(...)) prec->udf = FALSE;` — a
+            // record whose value came from a constant link is DEFINED.
+            if loaded {
+                instance.common.udf = false;
+            }
         }
     }
 
+    // 2. The record's own `recGblInitConstantLink` table.
+    for seed in instance.record.constant_init_links() {
+        let Some(EpicsValue::String(link_str)) = instance.record.get_field(seed.link_field) else {
+            continue;
+        };
+        let parsed = crate::server::record::parse_link_v2(link_str.as_str_lossy().as_ref());
+        let Some(value) = crate::server::recgbl::simm::constant_load_value(&parsed) else {
+            continue;
+        };
+        // C loads into the target field's own DBF type
+        // (`recGblInitConstantLink(plink, DBF_USHORT, &prec->seln)`), so coerce
+        // through the field's descriptor before the put.
+        let target_type = instance
+            .record
+            .field_list()
+            .iter()
+            .find(|f| f.name == seed.target_field)
+            .map(|f| f.dbf_type);
+        let value = match target_type {
+            Some(t) => value.convert_to(t),
+            None => value,
+        };
+        if instance.record.put_field(seed.target_field, value).is_ok() && seed.clears_udf {
+            instance.common.udf = false;
+        }
+    }
+}
+
+impl PvDatabase {
     pub(crate) async fn rec_gbl_init_simm(&self, rec: &Arc<RwLock<RecordInstance>>) {
         let mut instance = rec.write().await;
         // No SIMM field -> no simulation block -> nothing to init.
@@ -5167,7 +5295,7 @@ impl PvDatabase {
         // the PENDING alarm (`rec_gbl_set_sevr` is C's MAXIMIZE) before the body
         // runs, so a body-raised alarm maximizes against it exactly as in C.
         if input_stage {
-            let fetch = self.fetch_sim_link(&siol_link).await;
+            let fetch = self.fetch_link(&siol_link).await;
             let mut instance = rec.write().await;
             // C `:416` reads SIOL with a plain `dbGetLink`, so a FAILED read
             // runs `setLinkAlarm` (dbLink.c:322) — LINK_ALARM/INVALID with
@@ -5178,7 +5306,7 @@ impl PvDatabase {
             // `SIMS = INVALID` the LINK_ALARM raised first WINS the tie here
             // and swait publishes STAT=LINK/AMSG="field SIOL", where a longin
             // publishes STAT=SIMM. Compiled C confirms both.
-            if let crate::server::recgbl::simm::SimLinkFetch::Failed = fetch {
+            if let crate::server::recgbl::simm::LinkFetch::Failed = fetch {
                 crate::server::recgbl::rec_gbl_set_link_alarm(&mut instance.common, "SIOL");
             }
             // C `:417-420` — `if (status == 0) { val = sval; udf = FALSE; }`.
@@ -5187,7 +5315,7 @@ impl PvDatabase {
             // FAILED read changes neither VAL nor UDF. The SIMM_ALARM below is
             // unconditional either way.
             if fetch.is_ok() {
-                if let crate::server::recgbl::simm::SimLinkFetch::Value(v) = fetch {
+                if let crate::server::recgbl::simm::LinkFetch::Value(v) = fetch {
                     let sval = EpicsValue::Double(v.to_f64().unwrap_or(0.0));
                     let _ = instance.record.put_field_internal("SVAL", sval);
                 }
@@ -5268,11 +5396,11 @@ impl PvDatabase {
             }
 
             // Read from SIOL -> SVAL -> VAL/RVAL. Uniform across Db (with
-            // locality fallback) / Ca / Pva / constant via `fetch_sim_link`
+            // locality fallback) / Ca / Pva / constant via `fetch_link`
             // (C `dbGetLink`), which keeps C's three outcomes apart: a value,
             // a CONSTANT link's "status 0 with the buffer untouched", and a
             // failure.
-            let fetch = self.fetch_sim_link(&siol_link).await;
+            let fetch = self.fetch_link(&siol_link).await;
             let mut instance = rec.write().await;
 
             // C reads SIOL with a plain `dbGetLink`, whose failure path is
@@ -5281,7 +5409,7 @@ impl PvDatabase {
             // SIMM_ALARM, so under the default `SIMS = NO_ALARM` a broken
             // simulation link reported NO_ALARM — completely silent — where C
             // reports INVALID/LINK. Affects every SIOL-reading record.
-            if let crate::server::recgbl::simm::SimLinkFetch::Failed = fetch {
+            if let crate::server::recgbl::simm::LinkFetch::Failed = fetch {
                 crate::server::recgbl::rec_gbl_set_link_alarm(&mut instance.common, "SIOL");
             }
 
@@ -5299,7 +5427,7 @@ impl PvDatabase {
             // the operator wrote.
             let has_sval = instance.record.get_field("SVAL").is_some();
             let landed: Option<EpicsValue> = match &fetch {
-                crate::server::recgbl::simm::SimLinkFetch::Value(v) => {
+                crate::server::recgbl::simm::LinkFetch::Value(v) => {
                     if has_sval {
                         // `put_field_internal` is the DBR-coercion owner
                         // (C `dbGetLink(DBF_<sval>)`).
@@ -5309,14 +5437,14 @@ impl PvDatabase {
                         Some(v.clone())
                     }
                 }
-                crate::server::recgbl::simm::SimLinkFetch::NoData => {
+                crate::server::recgbl::simm::LinkFetch::NoData => {
                     if has_sval {
                         instance.record.get_field("SVAL")
                     } else {
                         None
                     }
                 }
-                crate::server::recgbl::simm::SimLinkFetch::Failed => None,
+                crate::server::recgbl::simm::LinkFetch::Failed => None,
             };
 
             if let Some(siol_val) = landed {

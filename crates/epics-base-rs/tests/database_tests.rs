@@ -2126,20 +2126,30 @@ async fn test_sdis_disable_skips_process() {
     );
 }
 
-/// C `dbGetLink(&precord->sdis, DBR_SHORT, &precord->disa, 0, 0)`
-/// reads the SDIS link for ANY type. The pre-fix port refreshed `disa`
-/// only for a `ParsedLink::Db` SDIS, so a constant (and CA/PVA) SDIS was
-/// silently ignored — `disa` stayed at its default and a record meant to
-/// be disabled by a constant SDIS kept processing. Boundary: constant
-/// value == DISV (disabled) vs != DISV (enabled).
+/// C `dbProcess` (`dbAccess.c:566`) reads SDIS with
+/// `dbGetLink(&precord->sdis, DBR_SHORT, &precord->disa, 0, 0)` — for ANY link
+/// type, through the lset. For a CONSTANT SDIS that lset is `dbConst_lset`,
+/// whose `dbConstGetValue` (`dbConstLink.c:219-225`) writes NOTHING and returns
+/// success, and dbCommon has no `recGblInitConstantLink` for SDIS. So a
+/// constant SDIS never reaches DISA at all: DISA keeps its `initial(0)` and the
+/// record RUNS. softIoc (EPICS 7):
+///
+/// ```text
+/// record(calc,"S1") { field(SDIS,"3") field(DISV,"3") }
+///   dbpf S1.PROC 1 ; dbgf S1.DISA  ->  DBF_SHORT: 0     (record processed)
+/// ```
+///
+/// The port used to hand the constant's text back as if the link had delivered
+/// it, which disabled the record permanently. A DB SDIS still refreshes DISA
+/// every cycle — that is the other half of the boundary, asserted below.
 #[tokio::test]
-async fn test_sdis_constant_link_refreshes_disa() {
+async fn test_constant_sdis_never_reaches_disa_but_db_sdis_does() {
     let db = PvDatabase::new();
     db.add_record("TARGET", Box::new(AoRecord::new(0.0)))
         .await
         .unwrap();
 
-    // Constant SDIS "1" — equals the default DISV (1) → disabled.
+    // Constant SDIS "1" — equal to the default DISV (1). C does NOT disable.
     if let Some(rec) = db.get_record("TARGET").await {
         let mut inst = rec.write().await;
         inst.put_common_field("SDIS", EpicsValue::String("1".into()))
@@ -2154,21 +2164,23 @@ async fn test_sdis_constant_link_refreshes_disa() {
         let rec = db.get_record("TARGET").await.unwrap();
         let inst = rec.read().await;
         assert_eq!(
-            inst.common.disa, 1,
-            "constant SDIS '1' must refresh disa to 1 (was ignored pre-fix)"
+            inst.common.disa, 0,
+            "a CONSTANT SDIS delivers nothing at process — DISA keeps initial(0)"
         );
-        assert_eq!(
+        assert_ne!(
             inst.common.stat,
             epics_base_rs::server::recgbl::alarm_status::DISABLE_ALARM,
-            "disa==disv must disable the record"
+            "so the record still processes"
         );
     }
 
-    // Constant SDIS "0" — differs from DISV (1) → re-enabled. Proves the
-    // refresh reads the actual constant value, not a hard-coded disable.
+    // A DB SDIS does refresh DISA every cycle — the link that really is read.
+    db.add_record("SRC", Box::new(AoRecord::new(1.0)))
+        .await
+        .unwrap();
     if let Some(rec) = db.get_record("TARGET").await {
         let mut inst = rec.write().await;
-        inst.put_common_field("SDIS", EpicsValue::String("0".into()))
+        inst.put_common_field("SDIS", EpicsValue::String("SRC.VAL".into()))
             .unwrap();
     }
     let mut visited = HashSet::new();
@@ -2178,14 +2190,11 @@ async fn test_sdis_constant_link_refreshes_disa() {
     {
         let rec = db.get_record("TARGET").await.unwrap();
         let inst = rec.read().await;
+        assert_eq!(inst.common.disa, 1, "a DB SDIS refreshes DISA from SRC.VAL");
         assert_eq!(
-            inst.common.disa, 0,
-            "constant SDIS '0' must refresh disa to 0"
-        );
-        assert_ne!(
             inst.common.stat,
             epics_base_rs::server::recgbl::alarm_status::DISABLE_ALARM,
-            "disa!=disv must leave the record enabled"
+            "disa == disv disables the record"
         );
     }
 }
@@ -9241,12 +9250,29 @@ async fn init_applies_constant_dol_across_record_types() {
     use epics_base_rs::server::records::mbbo::MbboRecord;
     use epics_base_rs::server::records::mbbo_direct::MbboDirectRecord;
 
-    // dfanout: DBF_DOUBLE.
+    // dfanout: DBF_DOUBLE. Its constant DOL (and SELL) are declared in
+    // `Record::constant_init_links` and applied by the init-seed owner, so the
+    // seed is asserted through the database rather than a bare `init_record`.
+    let db = PvDatabase::new();
     let mut df = DfanoutRecord::default();
     df.omsl = 1;
     df.dol = "3.5".to_string();
-    df.init_record(0).unwrap();
-    assert_eq!(df.val, 3.5, "dfanout constant DOL → VAL=3.5");
+    df.sell = "2".to_string();
+    db.add_record("DF_CONST", Box::new(df)).await.unwrap();
+    {
+        let rec = db.get_record("DF_CONST").await.unwrap();
+        let inst = rec.read().await;
+        assert_eq!(
+            inst.record.get_field("VAL"),
+            Some(EpicsValue::Double(3.5)),
+            "dfanout constant DOL → VAL=3.5 (dfanoutRecord.c:105)"
+        );
+        assert_eq!(
+            inst.record.get_field("SELN"),
+            Some(EpicsValue::UShort(2)),
+            "dfanout constant SELL → SELN=2 (dfanoutRecord.c:102)"
+        );
+    }
 
     // int64out: DBF_INT64.
     let mut i64o = Int64outRecord::default();

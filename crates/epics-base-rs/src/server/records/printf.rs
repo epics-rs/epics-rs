@@ -650,6 +650,24 @@ impl Record for PrintfRecord {
         "printf"
     }
 
+    /// printf is THE exception to "a constant link delivers nothing at
+    /// process". Its `GET_PRINT` macro (`printfRecord.c:49-52`) is
+    ///
+    /// ```c
+    /// if (dbLinkIsConstant(plink))
+    ///     ok = recGblInitConstantLink(plink++, DBRTYPE, &val);
+    /// else
+    ///     ok = ! dbGetLink(plink++, DBRTYPE, &val, 0, 0);
+    /// ```
+    ///
+    /// — it re-loads the constant on EVERY `doPrintf`, into a local, and never
+    /// seeds a value field at init (printf has no A..J storage in C; the port's
+    /// A..J are the framework's fetch sink). So its INP0..9 constants must keep
+    /// delivering every cycle, and it declares no `constant_init_links`.
+    fn constant_inputs_deliver_at_process(&self) -> bool {
+        true
+    }
+
     fn field_list(&self) -> &'static [FieldDesc] {
         PRINTF_FIELDS
     }

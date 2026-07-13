@@ -345,7 +345,7 @@ impl IocBuilder {
                 // `seed_deadband_tracking`, or the first process would post a
                 // spurious monitor for a value that was there since init.
                 drop(instance);
-                db.rec_gbl_init_constant_inp(&rec_arc).await;
+                db.rec_gbl_init_constant_links(&rec_arc).await;
                 let mut instance = rec_arc.write().await;
 
                 // Seed MLST/ALST/LALM from val (after any UDF/bit fold that

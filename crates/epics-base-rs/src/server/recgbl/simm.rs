@@ -111,17 +111,27 @@ pub fn resolve_sim_mode(record: &dyn crate::server::record::Record) -> SimMode {
     }
 }
 
-/// The outcome of a C `dbGetLink` / `dbTryGetLink` on a simulation link
-/// (SIML or SIOL) — the three things the C status + buffer pair can mean,
-/// kept apart so no caller can read "no data" as "failure".
+/// The outcome of a C `dbGetLink` / `dbTryGetLink` on ANY link at process
+/// time — the three things the C status + buffer pair can mean, kept apart so
+/// no caller can read "no data" as "failure".
+///
+/// This is the process-time link-read classification for the whole database,
+/// not just the simulation links: SIML/SIOL, SDIS, TSEL, SELL, SUBL, INPA..L,
+/// INAA..LL and DOL all cross it. The rule it encodes is one rule —
+/// `dbConstGetValue` (`dbConstLink.c:219-225`) sets `*pnRequest = 0` and
+/// returns SUCCESS, so a CONSTANT link delivers NOTHING on every process
+/// cycle, whatever field holds it. The constant's value reaches the record
+/// exactly once, at init, through the init-seed owner
+/// (`PvDatabase::rec_gbl_init_constant_links`).
 #[derive(Debug, Clone, PartialEq)]
-pub enum SimLinkFetch {
+pub enum LinkFetch {
     /// status 0, and the link wrote the buffer: a DB / CA / PVA / calc link
     /// that read successfully.
     Value(EpicsValue),
     /// status 0, and the link wrote NOTHING: a CONSTANT link (including an
     /// unset one) — `dbConstGetValue` (`dbConstLink.c:219-225`). The record's
-    /// buffer (SIMM, SVAL) keeps the value `init_record` loaded into it.
+    /// buffer (SIMM, SVAL, A..L, SELN, ...) keeps the value `init_record`
+    /// loaded into it.
     NoData,
     /// non-zero status: the link exists but the read failed (target missing,
     /// CA disconnected). C `dbGetLink` raises LINK_ALARM/INVALID through
@@ -130,11 +140,21 @@ pub enum SimLinkFetch {
     Failed,
 }
 
-impl SimLinkFetch {
+impl LinkFetch {
     /// C's `if (status == 0)` — true for both `Value` and `NoData`, which is
     /// the whole point of keeping them distinct from `Failed`.
     pub fn is_ok(&self) -> bool {
-        !matches!(self, SimLinkFetch::Failed)
+        !matches!(self, LinkFetch::Failed)
+    }
+
+    /// The delivered value, if the link delivered one. `None` for BOTH
+    /// `NoData` and `Failed` — only use where the two are already known to be
+    /// equivalent (a caller that just wants the value and has no gate).
+    pub fn value(self) -> Option<EpicsValue> {
+        match self {
+            LinkFetch::Value(v) => Some(v),
+            LinkFetch::NoData | LinkFetch::Failed => None,
+        }
     }
 }
 
@@ -258,8 +278,8 @@ mod tests {
 
     #[test]
     fn no_data_is_a_success_not_a_failure() {
-        assert!(SimLinkFetch::NoData.is_ok());
-        assert!(SimLinkFetch::Value(EpicsValue::Long(1)).is_ok());
-        assert!(!SimLinkFetch::Failed.is_ok());
+        assert!(LinkFetch::NoData.is_ok());
+        assert!(LinkFetch::Value(EpicsValue::Long(1)).is_ok());
+        assert!(!LinkFetch::Failed.is_ok());
     }
 }

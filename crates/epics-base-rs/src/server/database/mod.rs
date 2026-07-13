@@ -1058,6 +1058,17 @@ impl PvDatabase {
             }
         }
 
+        // The init-seed owner: every CONSTANT link the record declares
+        // (`Record::constant_init_links`) is loaded into its value field ONCE,
+        // here — a constant delivers NOTHING at process time
+        // (`dbConstLink.c:219-225`). `add_record` is the creation sink every
+        // path funnels through, so this covers a record built programmatically
+        // as well as one loaded from a .db; `IocBuilder`/`dbLoadRecords` call
+        // the owner again after `init_record(1)`, once the record's final
+        // NELM/FTVL buffer exists for an array constant to land in. Seeding
+        // twice is a no-op — both run before any client put.
+        super::database::processing::seed_constant_links(&mut instance);
+
         let scan = instance.common.scan;
         let phas = instance.common.phas;
         self.inner

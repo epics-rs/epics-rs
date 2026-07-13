@@ -203,6 +203,13 @@ pub fn derive_epics_record(input: TokenStream) -> TokenStream {
 struct RecordAttrs {
     record_type: String,
     crate_path: Option<String>,
+    /// `#[record(constant_init = "SELL:SELN,DOL0:DO0")]` — the record's C
+    /// `recGblInitConstantLink` table, as `LINK:TARGET` pairs. Emitted as
+    /// `Record::constant_init_links`, which the init-seed owner
+    /// (`PvDatabase::rec_gbl_init_constant_links`) applies; a record whose
+    /// `Record` impl is hand-written declares the same table by overriding that
+    /// method directly.
+    constant_init: Vec<(String, String)>,
 }
 
 struct FieldInfo {
@@ -342,8 +349,32 @@ fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
         }
     };
 
+    // `#[record(constant_init = "LINK:TARGET,...")]` — the record's C
+    // `recGblInitConstantLink` table. Omitted entirely when the record declares
+    // none, so the trait default (no constant seeds) applies.
+    let constant_init_method = if attrs.constant_init.is_empty() {
+        quote! {}
+    } else {
+        let seeds: Vec<_> = attrs
+            .constant_init
+            .iter()
+            .map(|(link, target)| {
+                quote! {
+                    #krate::server::record::ConstantInitLink::new(#link, #target)
+                }
+            })
+            .collect();
+        quote! {
+            fn constant_init_links(&self) -> Vec<#krate::server::record::ConstantInitLink> {
+                vec![#(#seeds),*]
+            }
+        }
+    };
+
     let expanded = quote! {
         impl #krate::server::record::Record for #name {
+            #constant_init_method
+
             fn record_type(&self) -> &'static str {
                 #record_type_str
             }
@@ -384,6 +415,7 @@ fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
 fn parse_record_attrs(input: &DeriveInput) -> syn::Result<RecordAttrs> {
     let mut record_type = None;
     let mut crate_path = None;
+    let mut constant_init: Vec<(String, String)> = Vec::new();
 
     for attr in &input.attrs {
         if attr.path().is_ident("record") {
@@ -402,8 +434,21 @@ fn parse_record_attrs(input: &DeriveInput) -> syn::Result<RecordAttrs> {
                         crate_path = Some(s.value());
                     }
                     Ok(())
+                } else if meta.path.is_ident("constant_init") {
+                    let value = meta.value()?;
+                    let lit: Lit = value.parse()?;
+                    if let Lit::Str(s) = lit {
+                        for pair in s.value().split(',').filter(|p| !p.trim().is_empty()) {
+                            let (link, target) = pair.trim().split_once(':').ok_or_else(|| {
+                                meta.error("constant_init entries are `LINK:TARGET` pairs")
+                            })?;
+                            constant_init
+                                .push((link.trim().to_string(), target.trim().to_string()));
+                        }
+                    }
+                    Ok(())
                 } else {
-                    Err(meta.error("expected `type` or `crate_path`"))
+                    Err(meta.error("expected `type`, `crate_path` or `constant_init`"))
                 }
             })?;
         }
@@ -415,6 +460,7 @@ fn parse_record_attrs(input: &DeriveInput) -> syn::Result<RecordAttrs> {
     Ok(RecordAttrs {
         record_type,
         crate_path,
+        constant_init,
     })
 }
 

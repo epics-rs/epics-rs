@@ -2023,6 +2023,54 @@ pub trait Record: Send + Sync + 'static {
         &[]
     }
 
+    /// The `(link_field, value_field)` pairs whose CONSTANT value this record's
+    /// C `special()` RE-SEEDS on a runtime put to the link field —
+    /// `recGblInitConstantLink(plink, DBF_DOUBLE, pvalue)` +
+    /// `db_post_events(prec, pvalue, DBE_VALUE)` + `INAV = CON`
+    /// (`calcoutRecord.c:367-378`, `sCalcoutRecord.c:512-517`,
+    /// `aCalcoutRecord.c:534-540`).
+    ///
+    /// Without it a constant link is load-once dead state: `caput CO.INPB 7`
+    /// stores the link text, the link layer then delivers nothing at process
+    /// time (a constant link is not read), and `B` keeps its `.db`-load value
+    /// forever.
+    ///
+    /// Declaring the pair is all a record does — the put path
+    /// (`database::field_io::special_after_put`, the one `special(field, true)`
+    /// owner) runs the load through
+    /// [`crate::server::record::rec_gbl_init_constant_link`], the same owner the
+    /// init seed uses, and posts the value field. A record cannot declare the
+    /// pair and forget to implement the re-seed.
+    ///
+    /// Default: EMPTY — and that is the correct answer for every record whose C
+    /// `special()` does NOT re-seed. `recGblInitConstantLink` appears inside a
+    /// `special()` body in exactly FOUR record types across base and synApps
+    /// calc — calcout, sCalcout, aCalcout, transform. Everywhere else (calc,
+    /// sub, sel, aSub, seq, fanout, dfanout, swait, sseq, ao/bo/longout/…) it is
+    /// called only from `init_record`, so those records seed once and never
+    /// again, and they inherit this empty default.
+    ///
+    /// The overriding records list only the inputs C actually re-seeds:
+    /// sCalcout/aCalcout guard with `fieldIndex <= INPL` (their string/array
+    /// inputs are init-load only) and transform with
+    /// `fieldIndex < transformRecordOUTA` (its OUT half is not an input).
+    fn special_reseed_input_links(&self) -> &[(&'static str, &'static str)] {
+        &[]
+    }
+
+    /// The event mask of the `db_post_events` call in that record's `special()`
+    /// re-seed arm — the C call sites do not agree:
+    ///
+    ///  * calcout (`calcoutRecord.c:376`), sCalcout (`:516`), aCalcout (`:537`)
+    ///    post a literal `DBE_VALUE`.
+    ///  * transform (`transformRecord.c:718`) posts `DBE_VALUE | DBE_LOG`.
+    ///
+    /// Default: `DBE_VALUE`, the majority shape. Only consulted for the fields
+    /// named by [`Self::special_reseed_input_links`].
+    fn special_reseed_post_mask(&self) -> crate::server::recgbl::EventMask {
+        crate::server::recgbl::EventMask::VALUE
+    }
+
     /// Every CONSTANT input link this record seeds ONCE, at `init_record` —
     /// the record's own `recGblInitConstantLink` / `dbLoadLinkArray` table,
     /// transcribed from its C.

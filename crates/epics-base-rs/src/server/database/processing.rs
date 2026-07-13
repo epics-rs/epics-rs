@@ -5090,44 +5090,6 @@ impl PvDatabase {
     }
 }
 
-/// Load a CONSTANT link's value into a field of `target` type, with C's
-/// constant-link conversion rules (`dbConstLink.c`'s `cvt_st_*` family). The
-/// number itself was already parsed by the one owner of "link text → number",
-/// [`crate::server::record::parse_c_double`] (hex included).
-fn constant_to_field_type(value: EpicsValue, target: DbFieldType, raw: &str) -> EpicsValue {
-    use DbFieldType as T;
-    // `cvt_st_st` is a plain `strncpy` of the link TEXT, so a stringout with
-    // `field(DOL,"1.50")` holds "1.50" — not the "1.5" an f64 round-trip would
-    // render (softIoc-verified).
-    if target == T::String {
-        return EpicsValue::String(PvString::from(raw));
-    }
-    let integral = matches!(
-        target,
-        T::Char
-            | T::UChar
-            | T::Short
-            | T::UShort
-            | T::Enum
-            | T::Long
-            | T::ULong
-            | T::Int64
-            | T::UInt64
-    );
-    // C truncates the parsed number into the (possibly unsigned) target with a
-    // plain integer cast, so `-1` into a DBF_USHORT is 65535. The generic
-    // float→unsigned conversion SATURATES (Rust `as`), which would make it 0 —
-    // go through the integer view instead.
-    if integral {
-        if let Some(v) = value.to_f64() {
-            if v.is_finite() {
-                return EpicsValue::Int64(v.trunc() as i64).convert_to(target);
-            }
-        }
-    }
-    value.convert_to(target)
-}
-
 /// The body of the init-seed owner, over a locked record — shared by
 /// [`PvDatabase::rec_gbl_init_constant_links`] and `PvDatabase::add_record`.
 pub(crate) fn seed_constant_links(instance: &mut RecordInstance) {
@@ -5199,38 +5161,15 @@ pub(crate) fn seed_constant_links(instance: &mut RecordInstance) {
         }
     }
 
-    // 2. The record's own `recGblInitConstantLink` table.
+    // 2. The record's own `recGblInitConstantLink` table, through the shared
+    //    owner of "a CONSTANT link's text becomes the target field's value"
+    //    (`record::rec_gbl_init_constant_link`) — the SAME load a runtime put to
+    //    the link field re-runs from `special()`, so the two cannot drift.
     for seed in instance.record.constant_init_links() {
-        let Some(EpicsValue::String(link_str)) = instance.record.get_field(seed.link_field) else {
+        let Some(value) =
+            crate::server::record::rec_gbl_init_constant_link(&mut *instance.record, &seed)
+        else {
             continue;
-        };
-        let parsed = crate::server::record::parse_link_v2(link_str.as_str_lossy().as_ref());
-        let Some(value) = crate::server::recgbl::simm::constant_load_value(&parsed) else {
-            continue;
-        };
-        let raw = match &parsed {
-            crate::server::record::ParsedLink::Constant(s) => s.clone(),
-            _ => continue,
-        };
-        // C loads into the target field's own DBF type
-        // (`recGblInitConstantLink(plink, DBF_USHORT, &prec->seln)`), so coerce
-        // through the field's descriptor before the put.
-        let target_type = instance
-            .record
-            .field_list()
-            .iter()
-            .find(|f| f.name == seed.target_field)
-            .map(|f| f.dbf_type);
-        let value = match target_type {
-            Some(t) => constant_to_field_type(value, t, &raw),
-            None => value,
-        };
-        // bo loads into a temporary and stores the BOOLEAN of it
-        // (`boRecord.c:146-148`: `prec->val = !!ival`), so DOL="5" leaves VAL=1.
-        let value = if seed.normalize_bool {
-            EpicsValue::Enum(u16::from(value.to_f64().is_some_and(|v| v != 0.0)))
-        } else {
-            value
         };
         // C's UDF rule for a successful constant load is per record, and the two
         // shapes differ only in the NaN case:
@@ -5241,8 +5180,7 @@ pub(crate) fn seed_constant_links(instance: &mut RecordInstance) {
         // isnan test covers both: the value that reached the field is defined
         // unless it is NaN.
         let is_nan = value.to_f64().is_some_and(f64::is_nan);
-        if instance.record.put_field(seed.target_field, value).is_ok() && seed.clears_udf && !is_nan
-        {
+        if seed.clears_udf && !is_nan {
             instance.common.udf = false;
         }
     }

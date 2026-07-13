@@ -127,6 +127,42 @@ struct CalcPass {
 const ARR_NAMES: [&str; 12] = [
     "AA", "BB", "CC", "DD", "EE", "FF", "GG", "HH", "II", "JJ", "KK", "LL",
 ];
+
+/// Number of NUMERIC (scalar `double`) inputs — C's `fieldIndex <=
+/// acalcoutRecordINPL` boundary. The scalar inputs come first in
+/// [`ACALCOUT_INPUT_LINKS`], so this is the length of the prefix that C's
+/// `special()` constant re-seed applies to.
+const ACALCOUT_NUMERIC_INPUTS: usize = 12;
+
+/// `(link_field, value_field)` for every input, scalars A..L first (C's
+/// `INPA..INPL`), then the arrays AA..LL (`INAA..INLL`) — the order
+/// `aCalcoutRecord.c::fetch_values` reads them in.
+const ACALCOUT_INPUT_LINKS: &[(&str, &str)] = &[
+    ("INPA", "A"),
+    ("INPB", "B"),
+    ("INPC", "C"),
+    ("INPD", "D"),
+    ("INPE", "E"),
+    ("INPF", "F"),
+    ("INPG", "G"),
+    ("INPH", "H"),
+    ("INPI", "I"),
+    ("INPJ", "J"),
+    ("INPK", "K"),
+    ("INPL", "L"),
+    ("INAA", "AA"),
+    ("INBB", "BB"),
+    ("INCC", "CC"),
+    ("INDD", "DD"),
+    ("INEE", "EE"),
+    ("INFF", "FF"),
+    ("INGG", "GG"),
+    ("INHH", "HH"),
+    ("INII", "II"),
+    ("INJJ", "JJ"),
+    ("INKK", "KK"),
+    ("INLL", "LL"),
+];
 const INP_NAMES: [&str; 12] = [
     "INPA", "INPB", "INPC", "INPD", "INPE", "INPF", "INPG", "INPH", "INPI", "INPJ", "INPK", "INPL",
 ];
@@ -2217,32 +2253,17 @@ impl Record for AcalcoutRecord {
     }
 
     fn multi_input_links(&self) -> &[(&'static str, &'static str)] {
-        &[
-            ("INPA", "A"),
-            ("INPB", "B"),
-            ("INPC", "C"),
-            ("INPD", "D"),
-            ("INPE", "E"),
-            ("INPF", "F"),
-            ("INPG", "G"),
-            ("INPH", "H"),
-            ("INPI", "I"),
-            ("INPJ", "J"),
-            ("INPK", "K"),
-            ("INPL", "L"),
-            ("INAA", "AA"),
-            ("INBB", "BB"),
-            ("INCC", "CC"),
-            ("INDD", "DD"),
-            ("INEE", "EE"),
-            ("INFF", "FF"),
-            ("INGG", "GG"),
-            ("INHH", "HH"),
-            ("INII", "II"),
-            ("INJJ", "JJ"),
-            ("INKK", "KK"),
-            ("INLL", "LL"),
-        ]
+        ACALCOUT_INPUT_LINKS
+    }
+
+    /// C `aCalcoutRecord.c::special` (534-540) — the constant re-seed, under C's
+    /// `if (fieldIndex <= acalcoutRecordINPL)` guard: only the NUMERIC inputs
+    /// A..L are re-loaded. The ARRAY inputs AA..LL are not — C's
+    /// `pvalue = &pcalc->a + lnkIndex` is a scalar `double *`, so an array link
+    /// gets `INAV = CON` (the link-status refresh below) and nothing else. That
+    /// guard is this slice: the first twelve entries of `multi_input_links`.
+    fn special_reseed_input_links(&self) -> &[(&'static str, &'static str)] {
+        &ACALCOUT_INPUT_LINKS[..ACALCOUT_NUMERIC_INPUTS]
     }
 
     /// C `aCalcoutRecord.c::fetch_values` (1068-1071, 1097) `return`s at the

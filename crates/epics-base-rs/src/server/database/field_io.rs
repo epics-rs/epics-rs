@@ -123,6 +123,29 @@ fn special_after_put(
     let status = instance.record.special(field, true);
     out.extend(instance.record.take_special_actions());
     status?;
+
+    // C `special()`'s CONSTANT-link re-seed (`calcoutRecord.c:367-378`,
+    // `sCalcoutRecord.c:512-517`, `aCalcoutRecord.c:534-540`,
+    // `transformRecord.c:714-719` — the four records whose C `special()` calls
+    // `recGblInitConstantLink`): a put that leaves an input link constant
+    // re-runs the load into that input's value field and posts it. Without it a
+    // constant link is load-once dead state — the link layer delivers nothing
+    // for a constant at process time, so `caput CO.INPB 7` would store the text
+    // and leave `B` at its `.db` value forever.
+    //
+    // The record only DECLARES the pairs (`special_reseed_input_links`); the
+    // load itself is the shared `rec_gbl_init_constant_link` owner, the same one
+    // the init seed uses. Records whose C `special()` does not re-seed (calc,
+    // sub, sel, aSub, swait, …) declare nothing and are untouched.
+    if let Some(value_field) =
+        crate::server::record::reseed_constant_input_link(&mut *instance.record, field)
+    {
+        // The mask is the C call site's, and they disagree — calcout posts a
+        // literal DBE_VALUE, transform DBE_VALUE|DBE_LOG. The record carries it.
+        let mask = instance.record.special_reseed_post_mask();
+        instance.notify_field(value_field, mask);
+    }
+
     // C `special(SPC_MOD)` pass 1 on SIMM (`longinRecord.c:171-177` and the
     // identical arm in all 21 SSCN-bearing records):
     //   `recGblCheckSimm((dbCommon *)prec, &prec->sscn, prec->oldsimm, prec->simm);`

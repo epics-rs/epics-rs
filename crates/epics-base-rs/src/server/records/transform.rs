@@ -1019,6 +1019,22 @@ impl Record for TransformRecord {
         crate::server::record::seed_input_links(self.multi_input_links())
     }
 
+    /// C `transformRecord.c::special` (714-719) — a runtime put to an INPn that
+    /// leaves the link CONSTANT re-runs `recGblInitConstantLink(plink,
+    /// DBF_DOUBLE, pvalue)` and posts the value field. C guards it with
+    /// `if (fieldIndex < transformRecordOUTA)`: the OUT half of the same
+    /// `&ptran->inpa + i` sweep is not an input and gets only `IAV/OAV = CON`.
+    /// `multi_input_links` IS that input half.
+    fn special_reseed_input_links(&self) -> &[(&'static str, &'static str)] {
+        self.multi_input_links()
+    }
+
+    /// C `transformRecord.c:718` posts the re-seeded value with
+    /// `DBE_VALUE | DBE_LOG` — unlike the calcout family's bare `DBE_VALUE`.
+    fn special_reseed_post_mask(&self) -> crate::server::recgbl::EventMask {
+        crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::LOG
+    }
+
     fn multi_input_links(&self) -> &[(&'static str, &'static str)] {
         &[
             ("INPA", "A"),

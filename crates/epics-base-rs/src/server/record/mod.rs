@@ -1,5 +1,6 @@
 mod alarm;
 mod common_fields;
+mod constant_link;
 mod link;
 mod menu_choices;
 mod pini;
@@ -12,6 +13,7 @@ mod scan;
 pub use crate::server::recgbl::EventMask;
 pub use alarm::{AlarmSeverity, AnalogAlarmConfig};
 pub use common_fields::CommonFields;
+pub use constant_link::{rec_gbl_init_constant_link, reseed_constant_input_link};
 pub use link::{
     CaLink, CalcLink, DbLink, HwLink, HwLinkKind, JlinkValue, LinkAddress, LinkFieldType,
     LinkProcessPolicy, LinkType, LsLoad, MonitorSwitch, PVAJSON_IDENTITY_SEP, ParsedLink,

@@ -1223,6 +1223,16 @@ impl Record for ScalcoutRecord {
         crate::server::record::seed_input_links(self.multi_input_links())
     }
 
+    /// C `sCalcoutRecord.c::special` (512-517) — same re-seed as calcout, under
+    /// C's `if (fieldIndex <= scalcoutRecordINPL)` guard: only the NUMERIC
+    /// inputs A..L are re-loaded (`INAA..INLL` still get `INAV = CON`, which the
+    /// link-status refresh below covers, but no constant re-load). The port's
+    /// `multi_input_links` IS that numeric table — the string inputs are not in
+    /// it — so it maps exactly.
+    fn special_reseed_input_links(&self) -> &[(&'static str, &'static str)] {
+        self.multi_input_links()
+    }
+
     fn multi_input_links(&self) -> &[(&'static str, &'static str)] {
         &[
             ("INPA", "A"),

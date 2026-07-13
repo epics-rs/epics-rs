@@ -1,4 +1,4 @@
-use super::cast::{c_int, c_long, d2ui, my_nint};
+use super::cast::{c_int, c_long, d2ui, imod, my_nint, nint};
 use super::cvt;
 use super::error::CalcError;
 use super::opcodes::{CoreOp, Opcode, StringOp};
@@ -148,25 +148,19 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                 CoreOp::Mod => {
                     let (a, b) = pop2_f64(&mut stack)?;
                     // sCalc, not base: a zero divisor is an ERROR
-                    // (`return(-1)`), never NaN, and the operands take a plain
-                    // C cast whose WIDTH depends on which evaluator C picked
-                    // for this program (see `uses_string`):
-                    //   no-string path (sCalcPerform.c:558-563): `(int)`
-                    //   string path    (sCalcPerform.c:1102-1110): `(long)`
-                    let value = if string_path {
-                        let den = c_long(b);
-                        if den == 0 {
-                            return Err(CalcError::DivisionByZero);
-                        }
-                        c_long(a).wrapping_rem(den) as f64
-                    } else {
-                        let den = c_int(b);
-                        if den == 0 {
-                            return Err(CalcError::DivisionByZero);
-                        }
-                        c_int(a).wrapping_rem(den) as f64
-                    };
-                    stack.push(StackValue::Double(value));
+                    // (`return(-1)`), never NaN. That rule is C's and is kept.
+                    //
+                    // C's operand narrowing is NOT kept — it is a plain cast
+                    // whose WIDTH even depends on which evaluator C picked for
+                    // this program (no-string path `(int)`,
+                    // `sCalcPerform.c:558-563`; string path `(long)`,
+                    // `:1102-1110`), so the same expression answers differently
+                    // depending on whether an unrelated string operand appears
+                    // in it. See `cast::imod` and CBUG-A2.
+                    if b.trunc() == 0.0 {
+                        return Err(CalcError::DivisionByZero);
+                    }
+                    stack.push(StackValue::Double(imod(a, b)));
                 }
                 CoreOp::Neg => {
                     let a = pop1_f64(&mut stack)?;
@@ -475,8 +469,8 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     let a = pop1_f64(&mut stack)?;
                     // C `sCalcPerform.c:716-719`:
                     //   *pd = (double)(long)(d >= 0 ? d+0.5 : d-0.5)
-                    let pre = if a >= 0.0 { a + 0.5 } else { a - 0.5 };
-                    stack.push(StackValue::Double(c_long(pre) as f64));
+                    // The `(long)` narrowing is dropped — `cast::nint`, CBUG-A2.
+                    stack.push(StackValue::Double(nint(a)));
                 }
                 CoreOp::IsNan(nargs) => {
                     let n = *nargs as usize;
@@ -492,7 +486,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                 }
                 CoreOp::IsInf => {
                     let a = pop1_f64(&mut stack)?;
-                    stack.push(StackValue::Double(super::c_isinf(a)));
+                    stack.push(StackValue::Double(super::isinf(a)));
                 }
                 CoreOp::Finite(nargs) => {
                     let n = *nargs as usize;
@@ -1087,6 +1081,10 @@ fn checksum_op(
 ///
 /// `dbTranslateEscape` returning 0 is C's `return(-1)`, and the caller then leaves
 /// the operand untouched.
+///
+/// The framing above is C's, byte for byte. The digest VALUE deviates for any
+/// payload byte ≥ 0x80 — see [`checksum::crc16`](super::checksum::crc16) and
+/// CBUG-F8.
 fn crc16_escaped(operand: &[u8]) -> Option<String> {
     let raw = raw_from_escaped(operand);
     if raw.is_empty() {

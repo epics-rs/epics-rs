@@ -421,7 +421,7 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
         &self,
         checked: &epics_pva_rs::server_native::source::AccessChecked,
         ctx: &ChannelContext,
-    ) -> Result<(), epics_pva_rs::server_native::source::MonitorRequestFatal> {
+    ) -> Result<(), epics_pva_rs::server_native::source::OpError> {
         self.inner.check_monitor_request(checked, ctx).await
     }
     async fn subscribe_checked_opts(
@@ -1070,7 +1070,7 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
         &self,
         checked: &epics_pva_rs::server_native::source::AccessChecked,
         ctx: &ChannelContext,
-    ) -> Result<(), epics_pva_rs::server_native::source::MonitorRequestFatal> {
+    ) -> Result<(), epics_pva_rs::server_native::source::OpError> {
         self.inner.check_monitor_request(checked, ctx).await
     }
     async fn subscribe_checked_opts(
@@ -1977,7 +1977,7 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
         &self,
         checked: &epics_pva_rs::server_native::source::AccessChecked,
         ctx: &ChannelContext,
-    ) -> Result<(), epics_pva_rs::server_native::source::MonitorRequestFatal> {
+    ) -> Result<(), epics_pva_rs::server_native::source::OpError> {
         self.inner.check_monitor_request(checked, ctx).await
     }
     async fn subscribe_checked_opts(

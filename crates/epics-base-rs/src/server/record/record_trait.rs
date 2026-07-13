@@ -1478,6 +1478,11 @@ pub trait Record: Send + Sync + 'static {
     /// while idle, empty while counting (a counting cycle never reaches C
     /// `monitor()`).
     ///
+    /// The sweep post carries `DBE_LOG` plus the cycle's ALARM-transition bits
+    /// (`recGblResetAlarms`). C's scaler computes that mask and then posts with a
+    /// literal `DBE_LOG`, dropping the alarm bit — CBUG-B19, a deliberate
+    /// deviation; see the post site in `collect_subscriber_posts`.
+    ///
     /// Default: empty — most record types have no LOG-only sweep.
     fn log_swept_fields(&self) -> &'static [&'static str] {
         &[]

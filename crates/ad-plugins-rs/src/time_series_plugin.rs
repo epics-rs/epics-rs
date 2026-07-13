@@ -107,58 +107,39 @@ fn sample_f64(data: &NDDataBuffer, idx: usize) -> f64 {
     }
 }
 
-/// Compute one averaged time-series point exactly as C
-/// `(epicsType)averageStore_[signal] / numAveraged_` (NDPluginTimeSeries.cpp:191).
+/// Compute one averaged time-series point: **divide, then narrow**.
 ///
-/// The double `sum` is cast to the element type **first** — narrowing with C
-/// wrapping semantics (gcc truncates the double toward zero into a 64-bit
-/// register, then the assignment narrows to the element width) — and **then**
-/// integer-divided in the element type's promoted domain. The result is the value
-/// that lands in the `epicsType` circular buffer and is later widened back to
-/// `double` for the waveform callback, so returning it as `f64` is exact.
+/// `averageStore_` is a `double` accumulator holding the SUM of `numAveraged_`
+/// samples, and the averaged point is that sum divided by the count, narrowed to
+/// the array's element type on its way into the `epicsType` circular buffer.
 ///
-/// For integer types narrower than 32 bits the wrap is reproduced via an `i64`
-/// intermediate (exact for every reachable sum). For 32/64-bit types the cast is
-/// taken directly; division follows C's promotion (signed for `int`-promoted
-/// types, unsigned for `u32`/`u64`). Float types do a plain (non-truncating)
-/// cast-then-divide.
+/// **DEVIATION from C, deliberate — CBUG-B25.** C writes
+/// (`NDPluginTimeSeries.cpp:191`):
+///
+/// ```c
+/// pTimeCircular[signal*numTimePoints_ + currentTimePoint_] =
+///     (epicsType)averageStore_[signal]/numAveraged_;
+/// ```
+///
+/// and C++ binds the cast tighter than the divide, so it parses as
+/// `((epicsType)averageStore_[signal]) / numAveraged_` — the SUM is truncated and
+/// wrapped into the narrow element type *before* the division. The parentheses
+/// are simply in the wrong place: three `UInt8` samples of 200 sum to 600, wrap
+/// to 88, and divide to **29** instead of 200. Every averaged integer point whose
+/// running sum exceeds the element range is wrong, and the sums routinely do.
+/// Float signals were never affected (no narrowing to overflow).
+///
+/// Dividing first, the mean of in-range samples is in range, so the narrowing is
+/// an ordinary truncation toward zero — the same one C's `(epicsType)` cast
+/// performs, and the same value C's integer division produces whenever its wrap
+/// did not fire.
 fn averaged_value(sum: f64, num_averaged: usize, dt: NDDataType) -> f64 {
-    let n = num_averaged.max(1);
+    let mean = sum / num_averaged.max(1) as f64;
     match dt {
-        NDDataType::Int8 => {
-            let c = sum.trunc() as i64 as i8;
-            ((c as i32) / (n as i32)) as i8 as f64
-        }
-        NDDataType::UInt8 => {
-            let c = sum.trunc() as i64 as u8;
-            ((c as i32) / (n as i32)) as u8 as f64
-        }
-        NDDataType::Int16 => {
-            let c = sum.trunc() as i64 as i16;
-            ((c as i32) / (n as i32)) as i16 as f64
-        }
-        NDDataType::UInt16 => {
-            let c = sum.trunc() as i64 as u16;
-            ((c as i32) / (n as i32)) as u16 as f64
-        }
-        NDDataType::Int32 => {
-            let c = sum.trunc() as i64 as i32;
-            (c / (n as i32)) as f64
-        }
-        NDDataType::UInt32 => {
-            let c = sum.trunc() as i64 as u32;
-            (c / (n as u32)) as f64
-        }
-        NDDataType::Int64 => {
-            let c = sum.trunc() as i64;
-            (c / (n as i64)) as f64
-        }
-        NDDataType::UInt64 => {
-            let c = sum.trunc() as u64;
-            (c / (n as u64)) as f64
-        }
-        NDDataType::Float32 => ((sum as f32) / (n as f32)) as f64,
-        NDDataType::Float64 => sum / (n as f64),
+        NDDataType::Float32 => mean as f32 as f64,
+        NDDataType::Float64 => mean,
+        // Every integer element type: C's `(epicsType)` cast of the mean.
+        _ => mean.trunc(),
     }
 }
 
@@ -552,26 +533,43 @@ mod tests {
     use ad_core_rs::ndarray::NDDimension;
     use asyn_rs::port::{PortDriverBase, PortFlags};
 
-    // ---- averaged_value: the parity-critical integer truncation ----
+    // ---- averaged_value: divide first, then narrow (CBUG-B25) ----
 
+    /// CBUG-B25 — the average of three UInt8 samples of 200 is **200**.
+    ///
+    /// This test was `test_averaged_value_uint8_truncates_not_f64_divide` and
+    /// pinned C's answer, 29: C narrows the running sum to the element type before
+    /// dividing (`(epicsType)averageStore_[signal]/numAveraged_`,
+    /// NDPluginTimeSeries.cpp:191), so 600 wraps to (u8)88 and 88/3 = 29. It even
+    /// asserted `!= 200.0` — the correct value — to prove the divergence.
     #[test]
-    fn test_averaged_value_uint8_truncates_not_f64_divide() {
-        // C NDPluginTimeSeries.cpp:191. 200*3 = 600; (u8)600 = 88; 88/3 = 29.
-        assert_eq!(averaged_value(600.0, 3, NDDataType::UInt8), 29.0);
-        // A plain f64 divide would yield 200 — prove we diverge from it.
-        assert_ne!(averaged_value(600.0, 3, NDDataType::UInt8), 200.0);
+    fn test_averaged_value_uint8_divides_before_narrowing() {
+        assert_eq!(averaged_value(600.0, 3, NDDataType::UInt8), 200.0); // C: 29
     }
 
+    /// CBUG-B25. Was `test_averaged_value_int8_negative_truncates_toward_zero`,
+    /// pinning C's -29: (i8)(-600) = -88, -88/3 = -29.
     #[test]
-    fn test_averaged_value_int8_negative_truncates_toward_zero() {
-        // -200*3 = -600; (i8)(-600) = -88; -88/3 = -29 (C integer division).
-        assert_eq!(averaged_value(-600.0, 3, NDDataType::Int8), -29.0);
+    fn test_averaged_value_int8_negative_divides_before_narrowing() {
+        assert_eq!(averaged_value(-600.0, 3, NDDataType::Int8), -200.0); // C: -29
     }
 
+    /// CBUG-B25. Was `test_averaged_value_uint16_wraps`, pinning C's 2232:
+    /// (u16)70000 = 4464, 4464/2 = 2232.
     #[test]
-    fn test_averaged_value_uint16_wraps() {
-        // 35000*2 = 70000; (u16)70000 = 4464; 4464/2 = 2232.
-        assert_eq!(averaged_value(70000.0, 2, NDDataType::UInt16), 2232.0);
+    fn test_averaged_value_uint16_does_not_wrap() {
+        assert_eq!(averaged_value(70000.0, 2, NDDataType::UInt16), 35000.0); // C: 2232
+    }
+
+    /// The narrowing itself is still C's `(epicsType)` cast — truncation toward
+    /// zero — applied to the MEAN, which for in-range samples is in range. This
+    /// is also the value C produced whenever its wrap did not fire.
+    #[test]
+    fn test_averaged_value_narrows_the_mean_toward_zero() {
+        // 7/2 = 3.5 -> 3;  -7/2 = -3.5 -> -3 (C integer division truncates too).
+        assert_eq!(averaged_value(7.0, 2, NDDataType::Int8), 3.0);
+        assert_eq!(averaged_value(-7.0, 2, NDDataType::Int8), -3.0);
+        assert_eq!(averaged_value(7.0, 2, NDDataType::UInt16), 3.0);
     }
 
     #[test]
@@ -579,10 +577,13 @@ mod tests {
         assert_eq!(averaged_value(600.0, 3, NDDataType::Int32), 200.0);
     }
 
+    /// Float signals were never affected by CBUG-B25 — no narrowing to overflow.
     #[test]
     fn test_averaged_value_float_types_exact() {
         assert_eq!(averaged_value(600.0, 3, NDDataType::Float64), 200.0);
         assert_eq!(averaged_value(600.0, 3, NDDataType::Float32), 200.0);
+        // ... and they do NOT truncate.
+        assert_eq!(averaged_value(7.0, 2, NDDataType::Float64), 3.5);
     }
 
     #[test]
@@ -620,8 +621,12 @@ mod tests {
         })
     }
 
+    /// CBUG-B25, end to end. Was
+    /// `test_process_array_uint8_truncating_average_per_signal`, which asserted
+    /// 29.0 — C's answer, because it narrowed the sum (600) to u8 (88) before
+    /// dividing by 3. The average of three 200s is 200.
     #[test]
-    fn test_process_array_uint8_truncating_average_per_signal() {
+    fn test_process_array_uint8_average_per_signal() {
         let mut proc = make_proc(2, "TST_TS_U8");
         // numAverage = 3 via timePerPoint=1, averagingTime=3.
         proc.time_per_point = 1.0;
@@ -638,10 +643,10 @@ mod tests {
         );
         let res = proc.process_array(&arr, &pool);
 
-        // One averaged output point per signal: (u8)600 / 3 = 29.
+        // One averaged output point per signal: 600 / 3 = 200 (C: 29).
         assert_eq!(proc.current_time_point, 1);
-        assert_eq!(proc.circular[0 * proc.num_time_points], 29.0);
-        assert_eq!(proc.circular[proc.num_time_points], 29.0); // signal 1, t0
+        assert_eq!(proc.circular[0 * proc.num_time_points], 200.0);
+        assert_eq!(proc.circular[proc.num_time_points], 200.0); // signal 1, t0
         // Current point posted; Fixed mode not full yet, so no waveform callback.
         assert_eq!(find_int(&res, proc.p.ts_current_point), Some(1));
         assert!(find_array(&res, proc.p.ts_time_series, 0).is_none());

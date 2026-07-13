@@ -12,7 +12,15 @@
 //! `epicsUInt32` (3e9 → -1294967296), which is what base wants for a BITWISE
 //! operand and is not a C cast at all.
 //!
-//! Every expected value below was verified by compiling the same C expression
+//! **The BITWISE half of that table is still C's and is pinned here. The MODULO
+//! column is NOT — CBUG-A2.** C's MODULO (and NINT) narrows its operands with a
+//! bare cast that is undefined out of range, so `3e9 % 7` is `-2` on a C IOC
+//! (`INT_MIN % 7`) and would be something else on another CPU. The port
+//! truncates the operands and takes the remainder without narrowing, so `3e9 %
+//! 7` is `4` — the true remainder — in all three dialects, and NINT rounds
+//! without narrowing. The C answers are named beside each case below.
+//!
+//! Every expected C value below was verified by compiling the same C expression
 //! with gcc -O2 on x86-64, the platform an EPICS IOC is built for:
 //!
 //! ```text
@@ -51,32 +59,42 @@ fn a(expr: &str, a0: f64) -> f64 {
     }
 }
 
-/// The finding's fingerprint. `A % 7` with `A = 3e9`:
-/// * base — `(epicsInt32)3e9` is out of range → x86-64 gives INT32_MIN → `-2`
-/// * sCalc — no string op in the expression, so C's no-string evaluator runs
-///   and casts with `(int)` → also `-2`
+/// CBUG-A2 — `A % 7` with `A = 3e9` is the TRUE remainder, `4`, in every
+/// dialect. This test used to pin C's answers, which were:
+/// * base — `(epicsInt32)3e9` overflows → x86-64 gives INT32_MIN → `-2`
+/// * sCalc — no string op, so C's no-string evaluator casts `(int)` → `-2`
+///   (its string evaluator casts `(long)` and answers `4`, on the same input)
 /// * aCalc — `(int)` → `-2`
 ///
-/// Pre-fix all three answered `0`, because `d2i(3e9) = -1294967296` happens to
-/// be an exact multiple of 7.
+/// The port truncates the operands and takes the f64 remainder, which IS C's
+/// truncated integer remainder for every operand pair the cast could represent,
+/// and stays correct past it.
 #[test]
-fn modulo_of_a_value_above_2_31() {
-    assert_eq!(n("A%7", 3e9), -2.0);
-    assert_eq!(s("A%7", 3e9), -2.0);
-    assert_eq!(a("A%7", 3e9), -2.0);
+fn modulo_of_a_value_above_2_31_is_the_true_remainder() {
+    assert_eq!(n("A%7", 3e9), 4.0); // C: -2
+    assert_eq!(s("A%7", 3e9), 4.0); // C: -2
+    assert_eq!(a("A%7", 3e9), 4.0); // C: -2
 }
 
-/// sCalc's C picks its evaluator from the compiled `USES_STRING` marker
-/// (`sCalcPostfix.c:447-475`, `sCalcPerform.c:399`), and the two evaluators
-/// cast MODULO differently: `(int)` vs `(long)`. Adding a string op to the
-/// SAME arithmetic therefore changes the answer — `(long)3e9 % 7 == 4`, since
-/// 3e9 fits in a long and needs no out-of-range cast at all.
+/// CBUG-A2, the second face of it. sCalc's C picks its evaluator from the
+/// compiled `USES_STRING` marker (`sCalcPostfix.c:447-475`,
+/// `sCalcPerform.c:399`) and the two evaluators cast MODULO at different widths
+/// — `(int)` vs `(long)` — so in C the SAME arithmetic answers differently
+/// depending on whether an unrelated string opcode appears anywhere in the
+/// expression (`A%7` → `-2`, `A%7+LEN('')` → `4`).
+///
+/// The port narrows neither, so the marker no longer perturbs the arithmetic:
+/// both are `4`. This test used to pin the split.
 #[test]
-fn scalc_modulo_width_follows_the_uses_string_marker() {
-    assert_eq!(s("A%7", 3e9), -2.0, "no string opcode → (int) path");
+fn scalc_modulo_no_longer_depends_on_the_uses_string_marker() {
+    assert_eq!(s("A%7", 3e9), 4.0, "C's no-string (int) evaluator says -2");
     // LEN("") is in C's USES_STRING opcode list, so the whole program switches
-    // to the string evaluator; the arithmetic is otherwise identical.
-    assert_eq!(s("A%7+LEN('')", 3e9), 4.0, "string opcode → (long) path");
+    // to C's string evaluator; the arithmetic is otherwise identical.
+    assert_eq!(
+        s("A%7+LEN('')", 3e9),
+        4.0,
+        "C's string (long) evaluator agrees"
+    );
 }
 
 /// A zero divisor is a THREE-way split, and the port had base's answer in all
@@ -98,11 +116,13 @@ fn zero_divisor_disposition_is_per_dialect() {
     assert_eq!(a("A%0", 5.0), 1e35f32 as f64);
 }
 
-/// A denominator that overflows the cast is NOT zero: C's cast yields
-/// INT32_MIN, so the modulo branch runs. Pinning the old behaviour (NaN) meant
-/// pinning the wrap model.
+/// A denominator larger than the cast's range is NOT zero, and never was: C's
+/// cast yields INT32_MIN, so C's modulo branch runs and `5 % INT32_MIN == 5`.
+/// Un-narrowed, `5 % 2^32` is 5 as well. Same answer, and CBUG-A2 does not move
+/// it — the case is kept because pinning NaN here (the pre-R8-5 wrap model,
+/// where 2^32 truncated to 0) would be wrong under either rule.
 #[test]
-fn out_of_range_denominator_is_int32_min_not_zero() {
+fn a_denominator_past_the_cast_range_is_not_a_zero_divisor() {
     assert_eq!(nc("5 % 4294967296"), 5.0);
     assert_eq!(n("A % 4294967296", 5.0), 5.0);
 }
@@ -130,16 +150,23 @@ fn acalc_bitwise_is_a_plain_int_cast() {
     assert_eq!(a("A|0", 3e9), i32::MIN as f64);
 }
 
-/// NINT is a plain cast in every dialect, at each dialect's width:
-/// base `(epicsInt32)` (calcPerform.c:292), sCalc/aCalc `(long)`
-/// (sCalcPerform.c:718, aCalcPerform.c:1085).
+/// CBUG-A2 — NINT rounds and does not narrow, in every dialect. C narrows at
+/// each dialect's own width — base `(epicsInt32)` (`calcPerform.c:292`),
+/// sCalc/aCalc `(long)` (`sCalcPerform.c:718`, `aCalcPerform.c:1085`) — so on a
+/// C IOC `NINT(3e9)` is `-2147483648` in base and `3e9` in the other two, purely
+/// because of the cast width. This test used to pin that split.
 #[test]
-fn nint_casts_at_each_dialects_width() {
-    assert_eq!(n("NINT(A)", 3e9), i32::MIN as f64);
+fn nint_does_not_narrow_in_any_dialect() {
+    assert_eq!(n("NINT(A)", 3e9), 3e9); // C base: i32::MIN
     assert_eq!(s("NINT(A)", 3e9), 3e9);
     assert_eq!(a("NINT(A)", 3e9), 3e9);
 
-    // In range, all three agree and round half away from zero.
+    // Past int64 too, where all three C dialects give their indefinite value.
+    assert_eq!(n("NINT(A)", 1e300), 1e300);
+    assert_eq!(s("NINT(A)", 1e300), 1e300);
+    assert_eq!(a("NINT(A)", 1e300), 1e300);
+
+    // In range, all three agree and round half away from zero — same as C.
     for expr_val in [(2.5, 3.0), (-2.5, -3.0), (2.4, 2.0)] {
         let (input, want) = expr_val;
         assert_eq!(n("NINT(A)", input), want);

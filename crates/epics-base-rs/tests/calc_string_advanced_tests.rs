@@ -378,42 +378,41 @@ fn test_checksum_operand_is_translated_first() {
     );
 }
 
-/// A byte ≥ 0x80 does NOT get the standard CRC-16/MODBUS: C's accumulator is a
-/// 32-bit `unsigned int` and its buffer is a SIGNED `char`, so
-/// `crc ^= (unsigned int)tranInput[i]` sign-extends the byte into bits 16-31,
-/// which the eight `crc >>= 1` steps then shift back down into the digest
-/// (`sCalcPerform.c:193-212`). Wire-compat with C IOCs beats the standard here —
-/// see [`crc16`](epics_base_rs::calc)'s doc for the adjudication.
+/// CBUG-F8 — a byte ≥ 0x80 gets the STANDARD CRC-16/MODBUS, deviating from C.
 ///
-/// Compiled sCalc (`gcc -O0`, x86-64): `CRC16("\x80")` = `\x41\x1f` — the
-/// standard answer is `\xbe\xe0`. XOR8 masks its own sign-extension away
-/// (`:279`) and is unaffected.
+/// C's accumulator is a 32-bit `unsigned int` and its buffer is a SIGNED `char`,
+/// so `crc ^= (unsigned int)tranInput[i]` (`sCalcPerform.c:193-212`)
+/// sign-extends the byte into bits 16-31, which the eight `crc >>= 1` steps
+/// shift back down into the digest. A real Modbus device validates against the
+/// standard CRC, so C is the one that is wire-broken on binary frames; the port
+/// emits the standard digest. This test previously pinned C's answers — the
+/// values it asserted are named below so the deviation is auditable.
+///
+/// XOR8 masks its own sign-extension away (`:279`) and was never affected.
 #[test]
-fn test_crc16_reproduces_c_sign_extension_of_high_bytes() {
+fn test_crc16_high_bytes_are_standard_not_c() {
     assert_eq!(
         eval_str(r#"CRC16("\x80")"#),
-        StackValue::Str(r"\x41\x1f".into()),
-        "standard CRC-16/MODBUS would be \\xbe\\xe0; compiled C says \\x41\\x1f"
+        StackValue::Str(r"\xbe\xe0".into()),
+        "standard CRC-16/MODBUS; compiled C says \\x41\\x1f"
     );
     assert_eq!(
         eval_str(r#"CRC16("\xff")"#),
-        StackValue::Str(r"\x00\xff".into())
+        StackValue::Str(r"\xff\x00".into()) // C: \x00\xff
     );
-    // The polluted high bits SURVIVE into the next byte — the accumulator is
-    // never masked back to 16 bits between iterations.
     assert_eq!(
         eval_str(r#"CRC16("\x80\x80")"#),
-        StackValue::Str(r"\x21\x90".into())
+        StackValue::Str(r"\x61\xd0".into()) // C: \x21\x90
     );
     // A real binary MODBUS frame: the case the operator exists for.
     assert_eq!(
         eval_str(r#"CRC16("\xf7\x03\x13\x89")"#),
-        StackValue::Str(r"\xc0\xb9".into())
+        StackValue::Str(r"\x0e\xc6".into()) // C: \xc0\xb9
     );
     // MODBUS appends the same digest, so it carries the same deviation.
     assert_eq!(
         eval_str(r#"MODBUS("\x80")"#),
-        StackValue::Str(r"\x80\x41\x1f".into())
+        StackValue::Str(r"\x80\xbe\xe0".into()) // C: \x80\x41\x1f
     );
     // XOR8 sign-extends too, but `sprintf`'s `xor8&0xff` throws it away.
     assert_eq!(eval_str(r#"XOR8("\x80")"#), StackValue::Str(r"\x80".into()));
@@ -816,20 +815,26 @@ fn test_replace_coerces_every_operand() {
 /// (a `StringOp::PushStringVar`, since deleted; `AA` compiles to
 /// `CoreOp::PushDoubleVar`), so no `AA`-reading program was marked.
 ///
-/// The two evaluators differ arithmetically in exactly one place, MODULO's cast
-/// width — `(int)` in the string evaluator, `(long)` in the numeric one — which
-/// is how the marker is observable without a string in sight. Compiled sCalc,
-/// with 2147483648 (2^31):
-///
-///     2147483648 % 7    -2      (numeric evaluator: the int cast overflows)
-///     AA % 7             2      (string evaluator, AA = "2147483648")
+/// The marker is observable without a string in sight because C's two
+/// evaluators cast their integer operands at different WIDTHS. MODULO used to be
+/// the observable used here; CBUG-A2 removed MODULO's narrowing entirely, so the
+/// probe is now `<<`, which C type-branches the same way: `(long)`
+/// (`sCalcPerform.c:623-631`) in the numeric evaluator, `(int)`
+/// (`:1270-1276`) in the string one. x86-64 masks the shift count to 6 bits at
+/// 64-bit width and to 5 at 32-bit, so `1 << 40` is 2^40 in one evaluator and
+/// 2^8 in the other — both in range, no out-of-range cast involved.
 #[test]
 fn test_fetch_aa_marks_the_program_uses_string() {
     let mut inputs = StringInputs::new();
-    inputs.str_vars[0] = "2147483648".into();
-    assert_eq!(scalc("AA%7", &mut inputs).unwrap(), StackValue::Double(2.0));
+    inputs.str_vars[0] = "0".into();
     assert_eq!(
-        scalc("2147483648 % 7", &mut inputs).unwrap(),
-        StackValue::Double(-2.0)
+        scalc("1<<40", &mut inputs).unwrap(),
+        StackValue::Double(1_099_511_627_776.0),
+        "no FETCH_AA → numeric evaluator → 64-bit shift"
+    );
+    assert_eq!(
+        scalc("(1<<40)+AA", &mut inputs).unwrap(),
+        StackValue::Double(256.0),
+        "FETCH_AA marks USES_STRING → string evaluator → 32-bit shift"
     );
 }

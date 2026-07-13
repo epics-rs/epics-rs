@@ -216,10 +216,27 @@ fn ack_at_from(
         // leaves `ackAt` default with NO logRemote (`:560-569` only logs the
         // `%` branch).
     }
-    // servermon.cpp:577-581.
-    if ack_at == 0 {
-        ack_at = queue_size / 2;
-    }
+    // servermon.cpp:581 — the requested threshold, clamped to what is
+    // representable: you cannot ack at 0, and not past the queue.
+    //
+    // DEVIATION from C++, deliberate — CBUG-B12. pvxs runs
+    // `if(op->ackAt==0u) op->ackAt = op->limit/2u;` (servermon.cpp:577-578)
+    // first, reading 0 as "the caller named no threshold". It cannot mean that:
+    // `MonitorOp::ackAt` is initialised to 1 (`:68`), so an ABSENT `ackAny`
+    // never reaches that line — the branch fires ONLY on a value the client did
+    // supply. And after `:564` (`clamp(percent,0,100)/100*limit`, truncating)
+    // that is the common case: with the default limit of 4, every percentage
+    // below 25% truncates to 0. The result is non-monotonic — `ackAny="25%"`
+    // acks at 1 while `ackAny="10%"` acks at 2, so a client asking to ack MORE
+    // eagerly gets a LAZIER threshold, and the flow-control window errs toward
+    // less back-pressure, the unsafe direction for a slow client. `ackAny="0%"`
+    // is not expressible at all.
+    //
+    // Dropping the sentinel is the whole fix: `ack_at` now means one thing (the
+    // threshold the client asked for), the clamp below maps the sub-representable
+    // request 0 to the minimum 1, and the percentage mapping is monotonic
+    // non-decreasing. An absent `ackAny` still yields 1 — the struct default,
+    // which this never touched.
     Ok((ack_at.clamp(1, queue_size), diag))
 }
 
@@ -6645,11 +6662,20 @@ async fn handle_op(
         // whose storage no `copyOut` arm converts raises `NoConvert`, nothing
         // catches it on the way out of `handle_MONITOR`, and
         // `conn.cpp:277-282` calls `bev.reset()`. The port opens the
-        // subscription at START, not INIT, so the throwing half of `onSubscribe`
-        // is its own INIT-time hook: `check_monitor_request`. Its `Err` is a
-        // fatal `PvaError` out of this read loop — the connection teardown that
-        // IS `bev.reset()`. Sources that read no such option (the default impl)
-        // return `Ok`, so nothing else changes. (R9-35.)
+        // subscription at START, not INIT, so the failing half of `onSubscribe`
+        // is its own INIT-time hook: `check_monitor_request`. (R9-35.)
+        //
+        // DEVIATION from C++, deliberate — CBUG-C2. QSRV's `bev.reset()` is a
+        // per-operation failure escalated to a transport reset: one client's
+        // malformed `record._options` drops the shared TCP circuit, and with it
+        // every OTHER channel multiplexed on it. Through a gateway that is one
+        // user's field typo disconnecting every other user. So the hook's `Err`
+        // is an `OpError`, answered here the same way as the pvRequest-mask
+        // failure above: an INIT reply carrying an error `Status`, the op left
+        // unregistered, the circuit and its other channels untouched. This is
+        // also what pvxs's OWN library source does for the same throw
+        // (`sharedpv.cpp:94-101` catches around `connect()` and calls
+        // `conn->error(msg)`); only QSRV's sources leave it bare.
         if kind == OpKind::Monitor {
             let init_ctx = crate::server_native::source::ChannelContext {
                 peer,
@@ -6673,10 +6699,8 @@ async fn handle_op(
                 )
                 .await;
             if let Err(e) = source.check_monitor_request(&checked, &init_ctx).await {
-                return Err(PvaError::Decode(format!(
-                    "MONITOR INIT for \"{}\": unconvertible record._options: {e}",
-                    ch.name
-                )));
+                send_chan_op_error(&chan_tx, kind, ioid, subcmd, e.wire_status(), order).await?;
+                return Ok(());
             }
             // R10-37: the source's `onSubscribe` diagnostics are INIT-time.
             // pvxs records them INSIDE `onSubscribe` — `singlesource.cpp:129`'s
@@ -6687,9 +6711,9 @@ async fn handle_op(
             // and re-parse at START to log there, putting the message AFTER the
             // INIT reply (and emitting it for group / native-PVA channels, whose
             // pvxs sources never read DBE at all). Draining here, before the
-            // reply is built, is pvxs's order. Only on the Ok path: a DBE that
-            // THROWS resets the circuit without a reply, and pvxs's throw
-            // happens before its logRemote.
+            // reply is built, is pvxs's order. Only on the Ok path: the failing
+            // DBE returns above with an error INIT reply, and pvxs's throw
+            // likewise happens before its logRemote, so it logs nothing either.
             flush_remote_log(&init_ctx.log, ioid, order, &chan_tx).await;
         }
 
@@ -9639,12 +9663,12 @@ mod tests {
             "ackAny percent is a fraction of the NEGOTIATED limit"
         );
 
-        // Pipeline ON, queueSize ABSENT, ackAny PRESENT but zero: pvxs's
-        // `if(ackAt==0) ackAt = op->limit/2` (servermon.cpp:578) — the half is
-        // of the negotiated limit (8), not of the hardcoded pipeline default
-        // (2). (An ABSENT ackAny never reaches that line: `ackAt` is
-        // initialised to `1u` at `:68`, so it is not 0 — see
-        // `ack_at_defaults_to_one_when_ack_any_absent`.)
+        // Pipeline ON, queueSize ABSENT, ackAny PRESENT but zero: 0 is below the
+        // representable minimum, so the [1, limit] clamp takes it to 1.
+        // CBUG-B12: pvxs runs `if(ackAt==0) ackAt = op->limit/2`
+        // (servermon.cpp:578) — this assertion used to read SERVER_DEFAULT / 2.
+        // What this case still pins for R11-31 is that the ack base is the
+        // NEGOTIATED limit, which the percentage case above covers.
         let req = make_options_request(&[
             ("pipeline", PvField::Scalar(ScalarValue::Boolean(true))),
             ("ackAny", PvField::Scalar(ScalarValue::UInt(0))),
@@ -9654,7 +9678,7 @@ mod tests {
             panic!("pipeline with a zero ackAny is a valid request");
         };
         assert_eq!(o.queue_size, SERVER_DEFAULT);
-        assert_eq!(o.ack_at, SERVER_DEFAULT / 2);
+        assert_eq!(o.ack_at, 1);
 
         // A valid client `queueSize` still wins over the server default, and it
         // is the ack base too (`ackAny=50%` of 8 → 4).
@@ -10372,13 +10396,19 @@ mod tests {
             let opts = parsed_opts(&req);
             assert_eq!(opts.ack_at, want, "ackAny={ack} with queueSize={q}");
         }
-        // Explicit 0 → queueSize/2 (servermon.cpp:577-578).
+        // Explicit 0 → the minimum representable threshold, 1. CBUG-B12: pvxs
+        // reads a supplied 0 as "the caller named nothing" and jumps it to
+        // queueSize/2 (servermon.cpp:577-578) — this test asserted that 8.
         let req = make_pipeline_request_ack(
             PvField::Scalar(ScalarValue::Boolean(true)),
             PvField::Scalar(ScalarValue::Int(q as i32)),
             PvField::Scalar(ScalarValue::Int(0)),
         );
-        assert_eq!(parsed_opts(&req).ack_at, q / 2, "ackAny=0 → queueSize/2");
+        assert_eq!(
+            parsed_opts(&req).ack_at,
+            1,
+            "ackAny=0 clamps up to the minimum (C++: queueSize/2)"
+        );
         // Above queueSize → clamps down to queueSize (servermon.cpp:581).
         let req = make_pipeline_request_ack(
             PvField::Scalar(ScalarValue::Boolean(true)),
@@ -10411,12 +10441,13 @@ mod tests {
             (PvField::Scalar(ScalarValue::Double(4.0)), 4u32),
             (PvField::Scalar(ScalarValue::Double(4.9)), 4),
             (PvField::Scalar(ScalarValue::Float(2.0)), 2),
-            // Bool storage: true → 1 (the pvxs default coincides, so the
-            // meaningful boundary is false → 0 → the queueSize/2 fallback).
+            // Bool storage: true → 1. The meaningful boundary is false → 0,
+            // which CBUG-B12 clamps up to 1; C++ jumped it to queueSize/2, and
+            // this case asserted that 8.
             (PvField::Scalar(ScalarValue::Boolean(true)), 1),
-            (PvField::Scalar(ScalarValue::Boolean(false)), q / 2),
-            // Real 0.0 hits the same `ackAt == 0` fallback.
-            (PvField::Scalar(ScalarValue::Double(0.0)), q / 2),
+            (PvField::Scalar(ScalarValue::Boolean(false)), 1),
+            // Real 0.0 lands on the same 0, so the same minimum.
+            (PvField::Scalar(ScalarValue::Double(0.0)), 1),
             // Unsigned/other integer widths were already handled; pin them so
             // the exhaustive match cannot regress one.
             (PvField::Scalar(ScalarValue::UByte(3)), 3),
@@ -10487,9 +10518,12 @@ mod tests {
             (ScalarValue::String("12".into()), 12),
             // strtoull skips leading whitespace; parseTo skips trailing.
             (ScalarValue::String("  12  ".into()), 12),
-            // A base-0 "0" converts to 0 and so takes the `ackAt == 0 →
-            // queueSize/2` fallback (servermon.cpp:577), NOT the default of 1.
-            (ScalarValue::String("0".into()), q / 2),
+            // A base-0 "0" converts to 0 — a threshold below the representable
+            // minimum, so the [1, limit] clamp takes it to 1. CBUG-B12: pvxs
+            // takes the `ackAt == 0 → queueSize/2` fallback (servermon.cpp:577)
+            // instead, which is the 16 this case used to assert. What it still
+            // pins for R9-34 is that "0" resolves in the INTEGER branch at all.
+            (ScalarValue::String("0".into()), 1),
         ];
         for (ack_any, want) in cases {
             let label = format!("{ack_any:?}");
@@ -10587,10 +10621,11 @@ mod tests {
             PvField::Scalar(ScalarValue::String("25%".into())),
         );
         assert_eq!(parsed_opts(&req).ack_at, 4, "25% of 16 → 4");
-        // A percent so small it truncates below one slot becomes 0,
-        // which hits the explicit `ackAt==0 → limit/2` fallback
-        // (pvxs `servermon.cpp:577`), NOT the `[1, limit]` floor:
-        // 0.5% of 16 = 0.08 → 0 → limit/2 = 8.
+        // A percent so small it truncates below one slot becomes 0, and 0 is
+        // simply below the representable minimum: the `[1, limit]` floor takes
+        // it to 1. CBUG-B12: pvxs instead reads that 0 as "no ackAny given" and
+        // jumps it to limit/2 = 8 (servermon.cpp:577), which is what this test
+        // used to assert.
         let req = make_pipeline_request_ack(
             PvField::Scalar(ScalarValue::Boolean(true)),
             PvField::Scalar(ScalarValue::Int(16)),
@@ -10598,9 +10633,35 @@ mod tests {
         );
         assert_eq!(
             parsed_opts(&req).ack_at,
-            8,
-            "0.5% of 16 = 0.08 → truncates to 0 → limit/2 fallback = 8"
+            1,
+            "0.5% of 16 = 0.08 → floors to the minimum 1 (C++: limit/2 = 8)"
         );
+    }
+
+    /// CBUG-B12 — the mapping from requested percentage to ACK threshold is
+    /// MONOTONIC NON-DECREASING. This is the property C++'s `ackAt==0` sentinel
+    /// destroys: with the default limit of 4 every percentage below 25%
+    /// truncates to 0 and is jumped to limit/2 = 2, so `ackAny="25%"` acks at 1
+    /// while `ackAny="10%"` acks at 2 — asking to ack MORE eagerly gets a LAZIER
+    /// threshold, and the flow-control window errs toward less back-pressure.
+    #[test]
+    fn b12_ack_at_is_monotonic_in_the_requested_percentage() {
+        let q = 4u32; // the pvxs default limit, where the bug is worst
+        let mut prev = 0u32;
+        for pct in ["0%", "1%", "10%", "24%", "25%", "50%", "75%", "100%"] {
+            let req = make_pipeline_request_ack(
+                PvField::Scalar(ScalarValue::Boolean(true)),
+                PvField::Scalar(ScalarValue::Int(q as i32)),
+                PvField::Scalar(ScalarValue::String(pct.into())),
+            );
+            let got = parsed_opts(&req).ack_at;
+            assert!(
+                got >= prev,
+                "ackAny={pct} → {got}, below the {prev} a smaller percentage got"
+            );
+            prev = got;
+        }
+        assert_eq!(prev, q, "100% → the full queue");
     }
 
     // pvxs `ServerConn::logRemote()` diagnostics for PRESENT-but-invalid

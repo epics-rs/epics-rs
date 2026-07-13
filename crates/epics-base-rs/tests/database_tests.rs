@@ -7709,6 +7709,111 @@ async fn test_histogram_sdel_watchdog_posts_val() {
     }
 }
 
+/// C `compressRecord` serves OUSE and INPN, both `special(SPC_NOMOD)`
+/// (`compressRecord.dbd.pod:481-484` / `:503-506`). OUSE is the latch behind
+/// `monitor()`'s "post NUSE only when it changed" rule
+/// (compressRecord.c:104-108); INPN is the INP element count that triggers the
+/// WPTR realloc. softIoc (compress NSAM=4 ALG="Circular Buffer" INP=SRC, a
+/// 3-element waveform):
+///
+/// ```text
+/// dbgf CMP2.OUSE -> 0      dbgf CMP2.INPN -> 0
+/// dbpf SRC.VAL 5 ; dbpf CMP2.PROC 1
+/// dbgf CMP2.NUSE -> 1      dbgf CMP2.OUSE -> 1
+/// dbpf CMP2.RES 1
+/// dbgf CMP2.NUSE -> 0      dbgf CMP2.OUSE -> 0
+/// dbpf CMP2.OUSE 9 -> dbPut Attempt to modify noMod field PV: CMP2.OUSE
+/// dbpf CMP2.INPN 9 -> dbPut Attempt to modify noMod field PV: CMP2.INPN
+/// ```
+///
+/// Both fields were absent from the port, so a caget on either failed.
+#[tokio::test]
+async fn test_compress_ouse_and_inpn_fields() {
+    use epics_base_rs::server::records::compress::CompressRecord;
+
+    let db = PvDatabase::new();
+    db.add_record("CMP_OUSE", Box::new(CompressRecord::new(4, 4)))
+        .await
+        .unwrap();
+    let rec = db.get_record("CMP_OUSE").await.unwrap();
+
+    assert_eq!(
+        db.get_pv("CMP_OUSE.OUSE").await.unwrap(),
+        EpicsValue::Long(0)
+    );
+    assert_eq!(
+        db.get_pv("CMP_OUSE.INPN").await.unwrap(),
+        EpicsValue::Long(0)
+    );
+
+    // Both are special(SPC_NOMOD): refused on every runtime route.
+    for field in ["OUSE", "INPN"] {
+        let err = db
+            .put_record_field_from_ca("CMP_OUSE", field, EpicsValue::Long(9))
+            .await
+            .expect_err("special(SPC_NOMOD) field must refuse a caput");
+        assert!(
+            matches!(err, CaError::ReadOnlyField(ref f) if f == field),
+            "expected S_db_noMod on {field}, got {err:?}"
+        );
+    }
+
+    // A publishing process cycle latches OUSE to NUSE (C `monitor()`).
+    {
+        let mut inst = rec.write().await;
+        inst.record
+            .put_field("VAL", EpicsValue::Double(5.0))
+            .unwrap();
+    }
+    db.process_record("CMP_OUSE").await.unwrap();
+    assert_eq!(
+        db.get_pv("CMP_OUSE.NUSE").await.unwrap(),
+        EpicsValue::Long(1)
+    );
+    assert_eq!(
+        db.get_pv("CMP_OUSE.OUSE").await.unwrap(),
+        EpicsValue::Long(1),
+        "monitor() latches OUSE = NUSE on a publishing cycle"
+    );
+
+    // RES resets, and the SPC_RESET monitor() latches OUSE back to 0.
+    db.put_record_field_from_ca("CMP_OUSE", "RES", EpicsValue::Short(1))
+        .await
+        .unwrap();
+    assert_eq!(
+        db.get_pv("CMP_OUSE.NUSE").await.unwrap(),
+        EpicsValue::Long(0)
+    );
+    assert_eq!(
+        db.get_pv("CMP_OUSE.OUSE").await.unwrap(),
+        EpicsValue::Long(0)
+    );
+
+    // The latch is what gates the NUSE post: that first RES moved NUSE 1 -> 0,
+    // so it posted NUSE alongside VAL...
+    {
+        let inst = rec.read().await;
+        assert_eq!(
+            inst.record.monitor_side_effect_fields("RES"),
+            &["NUSE", "VAL"],
+            "NUSE changed against OUSE -> C posts NUSE too"
+        );
+    }
+    // ...while a second RES on an already-empty buffer leaves NUSE == OUSE, so
+    // `monitor()` posts VAL alone.
+    db.put_record_field_from_ca("CMP_OUSE", "RES", EpicsValue::Short(1))
+        .await
+        .unwrap();
+    {
+        let inst = rec.read().await;
+        assert_eq!(
+            inst.record.monitor_side_effect_fields("RES"),
+            &["VAL"],
+            "NUSE unchanged against OUSE -> C posts VAL only"
+        );
+    }
+}
+
 /// epics-base PR `dabcf89` (2021) regression: when an mbboDirect
 /// record initialises with no VAL set (UDF=true on the framework
 /// side) but with at least one B0..B1F bit set in the .db file,

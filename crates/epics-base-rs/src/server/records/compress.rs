@@ -45,6 +45,11 @@ pub struct CompressRecord {
     /// `(inx*cvb + value)/(inx+1)`. Exposed as a readable field so a
     /// CA client can observe the partial accumulation mid-cycle.
     pub cvb: f64,
+    /// `OUSE` (old number used) — C `prec->ouse`, `special(SPC_NOMOD)`
+    /// (compressRecord.dbd.pod:481-484). The latch behind C `monitor()`'s
+    /// "post NUSE only when it changed" rule (compressRecord.c:104-108); see
+    /// [`Self::monitor`]. Readable, never client-writable.
+    pub ouse: i32,
     /// `PBUF` (partial buffer) — epics-base 7.0.8.
     /// `0 = NO` (default): VAL is read by clients as the whole NSAM
     /// vector; the leading `NUSE` elements are valid, the rest are
@@ -76,11 +81,30 @@ pub struct CompressRecord {
     // each cycle in `pre_process_actions`.
     cycle_ingested: bool,
     cycle_emitted: bool,
-    // C `prec->inpn`: the INP source's element count from the previous
-    // INP-driven ingest. When the count changes between cycles the
-    // accumulation buffer is reset and restarted at the new length
-    // (compressRecord.c:334-340).
+    /// `INPN` — C `prec->inpn`, `DBF_LONG special(SPC_NOMOD)`
+    /// (compressRecord.dbd.pod:503-506), "Number of elements in Working
+    /// Buffer": the INP source's element count from the previous INP-driven
+    /// ingest, and the trigger for C's WPTR reallocation — when it changes
+    /// between cycles C frees the working buffer and `reset()`s
+    /// (compressRecord.c:334-340).
+    ///
+    /// KNOWN DIVERGENCE in the value served. C latches
+    /// `dbGetNelements(&prec->inp, &nelements)` — the source's element
+    /// CAPACITY — before the read; the port latches the length the framework's
+    /// `ReadDbLink` actually delivered. For a `waveform` source with NELM=3 and
+    /// NORD=1, softIoc reads `CMP2.INPN = 3` where the port reads 1. Closing it
+    /// needs the source capacity plumbed through `ReadDbLink`, which no other
+    /// record needs; the reset trigger itself is unaffected in practice (a
+    /// source's capacity and its delivered length both change exactly when the
+    /// source array is re-shaped).
     inpn: usize,
+    /// What C `monitor()` (:100-110) decided to post for the SPC_RESET put now
+    /// in flight. Written by [`Self::monitor`] — the only place that makes the
+    /// decision, and the only writer of `ouse` — and read back by
+    /// `monitor_side_effect_fields`, which the put owner calls immediately
+    /// after `special()`, for the same put. One meaning on every path: "the
+    /// field set the last `monitor()` posted".
+    monitor_posts: &'static [&'static str],
     // True only while applying this cycle's INP read (set in
     // `pre_process_actions`, consumed in `push_array`, cleared in `process`).
     // C's element-count reset lives in `process` and keys on `prec->wptr` (the
@@ -107,6 +131,7 @@ impl Default for CompressRecord {
             alg: 0,
             n: 1,
             nuse: 0,
+            ouse: 0,
             off: 0,
             res: 0,
             balg: 0,
@@ -123,6 +148,7 @@ impl Default for CompressRecord {
             cycle_ingested: false,
             cycle_emitted: false,
             inpn: 0,
+            monitor_posts: &[],
             inp_read_pending: false,
         }
     }
@@ -187,6 +213,38 @@ impl CompressRecord {
         self.accum.clear();
         for v in &mut self.val {
             *v = 0.0;
+        }
+    }
+
+    /// C `compressRecord.c::monitor` (:100-110) — **the single owner of the
+    /// OUSE latch**:
+    ///
+    /// ```c
+    /// if (alarm_mask || prec->nuse != prec->ouse) {
+    ///     db_post_events(prec, &prec->nuse, monitor_mask);
+    ///     prec->ouse = prec->nuse;
+    /// }
+    /// db_post_events(prec, &prec->val, monitor_mask);
+    /// ```
+    ///
+    /// NUSE posts only when it CHANGED since the last post; VAL posts every
+    /// time. OUSE is the "last posted NUSE" latch that makes that decision, and
+    /// nothing else may write it.
+    ///
+    /// C calls `monitor()` from exactly two places, and so does the port: the
+    /// SPC_RESET `special()` ([`Record::special`]) and the publication epilogue
+    /// of `process()` (`:365-372`, skipped on an accumulate-only cycle — which
+    /// is why an accumulating compress does not re-post NUSE).
+    ///
+    /// Returns the fields to post; `special()` hands them to the framework
+    /// through [`Record::monitor_side_effect_fields`] (the alarm-mask term is
+    /// the framework's — it posts on an alarm transition regardless).
+    fn monitor(&mut self) -> &'static [&'static str] {
+        if self.nuse != self.ouse {
+            self.ouse = self.nuse;
+            &["NUSE", "VAL"]
+        } else {
+            &["VAL"]
         }
     }
 
@@ -491,6 +549,22 @@ static COMPRESS_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         read_only: true,
     },
+    // C `field(OUSE,DBF_ULONG){ special(SPC_NOMOD) }`
+    // (compressRecord.dbd.pod:481-484) — the "last posted NUSE" latch that
+    // gates C `monitor()`'s NUSE post. Record-owned runtime state.
+    FieldDesc {
+        name: "OUSE",
+        dbf_type: DbFieldType::Long,
+        read_only: true,
+    },
+    // C `field(INPN,DBF_LONG){ special(SPC_NOMOD) }`
+    // (compressRecord.dbd.pod:503-506) — "Number of elements in Working
+    // Buffer": the INP element count that triggers C's WPTR reallocation.
+    FieldDesc {
+        name: "INPN",
+        dbf_type: DbFieldType::Long,
+        read_only: true,
+    },
     FieldDesc {
         name: "RES",
         dbf_type: DbFieldType::Short,
@@ -595,17 +669,20 @@ impl Record for CompressRecord {
     fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
         if after && COMPRESS_SPC_RESET_FIELDS.contains(&field) {
             self.reset();
+            self.monitor_posts = self.monitor();
         }
         Ok(())
     }
 
     fn monitor_side_effect_fields(&self, put_field: &str) -> &'static [&'static str] {
-        // The `monitor(prec)` half of C's SPC_RESET `special()`: NUSE and VAL
-        // (compressRecord.c:100-110). Keyed on the same five fields as the
-        // reset itself — none of them is pp(TRUE), so this is the only monitor
-        // such a put produces.
+        // The `monitor(prec)` half of C's SPC_RESET `special()`. Which fields
+        // that is, is `monitor()`'s decision, not this hook's: VAL always, NUSE
+        // only when it changed against the OUSE latch (compressRecord.c:104-108)
+        // — so a second RES put on an already-empty buffer re-posts VAL alone,
+        // as C does. Keyed on the same five fields as the reset itself; none of
+        // them is pp(TRUE), so this is the only monitor such a put produces.
         if COMPRESS_SPC_RESET_FIELDS.contains(&put_field) {
-            &["NUSE", "VAL"]
+            self.monitor_posts
         } else {
             &[]
         }
@@ -642,8 +719,13 @@ impl Record for CompressRecord {
         // / FLNK). An emit, or no ingestion at all (link error / no INP — C
         // forces `status = 0`), publishes.
         if self.cycle_ingested && !self.cycle_emitted {
+            // C skips the epilogue entirely on `status == 1`, `monitor()`
+            // included — so OUSE does NOT latch and NUSE is not posted.
             return Ok(ProcessOutcome::complete_no_emit());
         }
+        // C `compressRecord.c:365-372`: the epilogue calls `monitor(prec)`,
+        // which is where OUSE latches on a publishing cycle.
+        self.monitor_posts = self.monitor();
         Ok(ProcessOutcome::complete())
     }
 
@@ -663,6 +745,8 @@ impl Record for CompressRecord {
             "INP" => Some(EpicsValue::String(self.inp.clone().into())),
             "NSAM" => Some(EpicsValue::Long(self.nsam)),
             "NUSE" => Some(EpicsValue::Long(self.nuse)),
+            "OUSE" => Some(EpicsValue::Long(self.ouse)),
+            "INPN" => Some(EpicsValue::Long(self.inpn as i32)),
             "RES" => Some(EpicsValue::Short(self.res)),
             "BALG" => Some(EpicsValue::Short(self.balg)),
             "ALG" => Some(EpicsValue::Short(self.alg)),
@@ -783,9 +867,12 @@ impl Record for CompressRecord {
                 }
                 _ => Err(CaError::TypeMismatch("NSAM".into())),
             },
-            // OFF/NUSE/INX/CVB are runtime buffer state (no promptgroup) —
-            // never client-writable.
-            "OFF" | "NUSE" | "INX" | "CVB" => Err(CaError::ReadOnlyField(name.to_string())),
+            // OFF/NUSE/OUSE/INPN/INX/CVB are `special(SPC_NOMOD)` runtime buffer
+            // state — never client-writable, and (unlike NSAM) not settable at
+            // load either: C gives them no promptgroup and the record owns each.
+            "OFF" | "NUSE" | "OUSE" | "INPN" | "INX" | "CVB" => {
+                Err(CaError::ReadOnlyField(name.to_string()))
+            }
             "EGU" => {
                 if let EpicsValue::String(s) = value {
                     self.egu = s;

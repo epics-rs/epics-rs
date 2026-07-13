@@ -529,27 +529,29 @@ fn constant_array_value(inner: &str) -> EpicsValue {
 /// It is `strtod` under the hood, which accepts a HEX literal — `dbConstLink.c:34`:
 /// *"constants may contain hex numbers, whereas database conversions can't"*.
 /// softIoc: `field(DOL,"0x1f")` reports `DOL : CONSTANT 0x1f` and comes up at
-/// VAL=31; `field(INP,"0x10")` on an ai loads VAL=16. Rust's `f64::from_str` has
-/// no hex form, so the hex branch is explicit here. Trailing text is rejected
+/// VAL=31; `field(INP,"0x10")` on an ai loads VAL=16. Trailing text is rejected
 /// (C passes a NULL units pointer → `S_stdlib_extraneous`), which is what keeps
 /// `"5 PP"` a PV link rather than a constant.
+///
+/// So this is [`epics_parse_double`] and nothing else — C's ONE
+/// `epicsParseDouble`, shared with the CA env-knob parser. A hand-rolled
+/// re-implementation drifted from it on three families, all probed on softIoc
+/// 7.0.10:
+///
+/// ```text
+/// field(INP,"0x1p4")                -> CONSTANT, VAL=16               (hex float)
+/// field(INP,"0xffffffffffffffffff") -> CONSTANT, VAL=4.72236648e+21   (wide hex)
+/// field(INP,"1e400")                -> CA_LINK, UDF=1                 (ERANGE)
+/// field(INP,"1e-320")               -> CA_LINK, UDF=1                 (ERANGE)
+/// ```
+///
+/// The ERANGE half is what makes the difference structural rather than
+/// cosmetic: `epicsParseDouble` returns a NON-ZERO status for `1e400`, so C's
+/// `dbParseLink` (`dbStaticLib.c:2346-2349`) never reaches CONSTANT — the
+/// literal becomes a PV link, and the record stays UDF. The pre-fix port made
+/// it a defined record holding `inf`.
 pub fn parse_c_double(s: &str) -> Option<f64> {
-    let t = s.trim();
-    if t.is_empty() {
-        return None;
-    }
-    let (negative, magnitude) = match t.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, t.strip_prefix('+').unwrap_or(t)),
-    };
-    if let Some(hex) = magnitude
-        .strip_prefix("0x")
-        .or_else(|| magnitude.strip_prefix("0X"))
-    {
-        let v = u64::from_str_radix(hex, 16).ok()? as f64;
-        return Some(if negative { -v } else { v });
-    }
-    t.parse::<f64>().ok()
+    crate::runtime::stdlib::epics_parse_double(s).ok()
 }
 
 fn try_parse_json_link(s: &str) -> Option<ParsedLink> {

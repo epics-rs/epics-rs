@@ -128,6 +128,263 @@ fn pow2(k: i32) -> f64 {
     }
 }
 
+/// C `isspace()` in the "C" locale — `strtod`'s leading/trailing skip set.
+fn is_c_space(c: u8) -> bool {
+    matches!(c, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
+}
+
+/// The `epicsParseDouble` failure codes (`epicsStdlib.h`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParseDoubleError {
+    /// `S_stdlib_noConversion` — `strtod` consumed nothing.
+    NoConversion,
+    /// `S_stdlib_overflow` — `errno == ERANGE` with a non-zero result.
+    Overflow,
+    /// `S_stdlib_underflow` — `errno == ERANGE` with a zero result.
+    Underflow,
+    /// `S_stdlib_extraneous` — non-space characters trail the number.
+    Extraneous,
+}
+
+/// `errno` after `strtod`: unset, or `ERANGE` on either side.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Erange {
+    No,
+    Over,
+    Under,
+}
+
+/// ERANGE classification for a value the DECIMAL path computed from digits.
+///
+/// glibc raises ERANGE when the result overflows to infinity, when it
+/// underflows to zero, and when it is inexactly representable as a
+/// subnormal. It does NOT raise it for the `inf` / `nan` *words*, which
+/// is why those are classified separately at their parse site.
+///
+/// The "inexactly" is the whole rule in glibc — a subnormal it can name
+/// exactly leaves errno clear. Writing one in decimal takes some 750
+/// significant digits (`2^-1074`), so every decimal literal short enough to
+/// appear in an env var and land in the subnormal range is inexact, and this
+/// value-only test agrees with C on all of them. The hex path, where such a
+/// literal is three characters long, does NOT use this: it gets the exact
+/// inexactness from [`HexSignificand::to_f64`].
+fn classify(v: f64, mantissa_nonzero: bool) -> Erange {
+    if v.is_infinite() {
+        Erange::Over
+    } else if v == 0.0 && mantissa_nonzero {
+        Erange::Under
+    } else if v != 0.0 && v.is_subnormal() {
+        // `epicsParseDouble` maps a non-zero ERANGE to overflow.
+        Erange::Over
+    } else {
+        Erange::No
+    }
+}
+
+/// C `strtod` (glibc; `epicsStrtod` is `#define`d to it on every platform
+/// with a working one — `osi/os/posix/osdStrtod.h`). Returns the value, the
+/// number of bytes consumed (0 == no conversion, C's `endp == str`), and the
+/// `errno` outcome.
+///
+/// Accepts what glibc accepts, verified against the compiled C: decimal and
+/// scientific notation, C99 hex floats (`0x10` → 16, `0X1p4` → 16), the
+/// `inf` / `infinity` / `nan` words (case-insensitive, optional `nan(...)`
+/// payload), each with an optional sign.
+fn strtod(s: &str) -> (f64, usize, Erange) {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() && is_c_space(b[i]) {
+        i += 1;
+    }
+    let sign_at = i;
+    let mut neg = false;
+    if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
+        neg = b[i] == b'-';
+        i += 1;
+    }
+    let num = i;
+
+    // C99 hex float: 0x <hexdigits> [. <hexdigits>] [p [+-] <digits>]
+    if num + 1 < b.len() && b[num] == b'0' && (b[num + 1] | 0x20) == b'x' {
+        let mut j = num + 2;
+        let mut sig = HexSignificand::new();
+        let mut digits = 0usize;
+        while j < b.len() && b[j].is_ascii_hexdigit() {
+            sig.push_digit(hex_val(b[j]), false);
+            digits += 1;
+            j += 1;
+        }
+        if j < b.len() && b[j] == b'.' {
+            let mut k = j + 1;
+            let mut frac = 0usize;
+            while k < b.len() && b[k].is_ascii_hexdigit() {
+                sig.push_digit(hex_val(b[k]), true);
+                frac += 1;
+                k += 1;
+            }
+            if digits > 0 || frac > 0 {
+                digits += frac;
+                j = k;
+            }
+        }
+        if digits == 0 {
+            // Bare "0x": glibc converts the leading "0" and stops at 'x'.
+            return (if neg { -0.0 } else { 0.0 }, num + 1, Erange::No);
+        }
+        if j < b.len() && (b[j] | 0x20) == b'p' {
+            let mut k = j + 1;
+            let mut eneg = false;
+            if k < b.len() && (b[k] == b'+' || b[k] == b'-') {
+                eneg = b[k] == b'-';
+                k += 1;
+            }
+            let digits_at = k;
+            let mut e: i32 = 0;
+            while k < b.len() && b[k].is_ascii_digit() {
+                e = e.saturating_mul(10).saturating_add((b[k] - b'0') as i32);
+                k += 1;
+            }
+            if k > digits_at {
+                sig.apply_binary_exponent(if eneg { -e } else { e });
+                j = k;
+            }
+        }
+        // The significand is exact and rounds to `f64` in one step, so ERANGE
+        // is known rather than guessed back from the value: an exactly
+        // representable subnormal (`0x1p-1074`, `0x1p-1023`) leaves errno
+        // clear, as it does in glibc.
+        let (mut v, erange) = sig.to_f64();
+        if neg {
+            v = -v;
+        }
+        // C derives underflow-vs-overflow from the value alone
+        // (`epicsStdlib.c:164`), and so does `epics_parse_double` below.
+        let erange = if !erange {
+            Erange::No
+        } else if v == 0.0 {
+            Erange::Under
+        } else {
+            Erange::Over
+        };
+        return (v, j, erange);
+    }
+
+    // The `inf` / `nan` words. glibc leaves errno clear for these, so an
+    // explicit `EPICS_CA_CONN_TMO=inf` is a VALID (never-expiring) timeout
+    // in C, not a parse failure.
+    let rest = &s[num..];
+    if starts_ci(rest, "infinity") {
+        return (inf(neg), num + 8, Erange::No);
+    }
+    if starts_ci(rest, "inf") {
+        return (inf(neg), num + 3, Erange::No);
+    }
+    if starts_ci(rest, "nan") {
+        let mut j = num + 3;
+        if j < b.len() && b[j] == b'(' {
+            let mut k = j + 1;
+            while k < b.len() && b[k] != b')' {
+                k += 1;
+            }
+            if k < b.len() {
+                j = k + 1;
+            }
+        }
+        return (f64::NAN, j, Erange::No);
+    }
+
+    // Decimal / scientific.
+    let mut j = num;
+    let mut digits = 0usize;
+    let mut nonzero = false;
+    while j < b.len() && b[j].is_ascii_digit() {
+        nonzero |= b[j] != b'0';
+        digits += 1;
+        j += 1;
+    }
+    if j < b.len() && b[j] == b'.' {
+        let mut k = j + 1;
+        let mut frac = 0usize;
+        while k < b.len() && b[k].is_ascii_digit() {
+            nonzero |= b[k] != b'0';
+            frac += 1;
+            k += 1;
+        }
+        if digits > 0 || frac > 0 {
+            digits += frac;
+            j = k;
+        }
+    }
+    if digits == 0 {
+        return (0.0, 0, Erange::No);
+    }
+    let mut end = j;
+    if j < b.len() && (b[j] | 0x20) == b'e' {
+        let mut k = j + 1;
+        if k < b.len() && (b[k] == b'+' || b[k] == b'-') {
+            k += 1;
+        }
+        let digits_at = k;
+        while k < b.len() && b[k].is_ascii_digit() {
+            k += 1;
+        }
+        if k > digits_at {
+            end = k;
+        }
+    }
+    // Rust's `f64::from_str` accepts exactly this grammar (sign, digits,
+    // optional point, optional exponent) and, like `strtod`, saturates to
+    // ±inf on overflow and to 0 on underflow — `classify` turns those into
+    // the ERANGE codes.
+    let v = s[sign_at..end].parse::<f64>().unwrap_or(f64::NAN);
+    let erange = classify(v, nonzero);
+    (v, end, erange)
+}
+
+fn hex_val(c: u8) -> u8 {
+    match c {
+        b'0'..=b'9' => c - b'0',
+        _ => (c | 0x20) - b'a' + 10,
+    }
+}
+
+fn inf(neg: bool) -> f64 {
+    if neg {
+        f64::NEG_INFINITY
+    } else {
+        f64::INFINITY
+    }
+}
+
+fn starts_ci(s: &str, word: &str) -> bool {
+    s.len() >= word.len() && s.as_bytes()[..word.len()].eq_ignore_ascii_case(word.as_bytes())
+}
+
+/// C `epicsParseDouble(str, to, NULL)` (`epicsStdlib.c:149-176`): skip
+/// leading whitespace, run `strtod`, reject `ERANGE`, skip trailing
+/// whitespace, reject anything left over.
+pub fn epics_parse_double(s: &str) -> Result<f64, ParseDoubleError> {
+    let (v, used, erange) = strtod(s);
+    if used == 0 {
+        return Err(ParseDoubleError::NoConversion);
+    }
+    match erange {
+        Erange::Over => return Err(ParseDoubleError::Overflow),
+        Erange::Under => return Err(ParseDoubleError::Underflow),
+        Erange::No => {}
+    }
+    if !s.as_bytes()[used..].iter().all(|&c| is_c_space(c)) {
+        return Err(ParseDoubleError::Extraneous);
+    }
+    Ok(v)
+}
+
+/// C `epicsScanDouble` (`epicsStdlib.h:203`) — `epicsParseDouble` with the
+/// status collapsed to a boolean.
+pub fn epics_scan_double(s: &str) -> Option<f64> {
+    epics_parse_double(s).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

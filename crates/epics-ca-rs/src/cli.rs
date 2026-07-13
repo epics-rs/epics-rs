@@ -928,7 +928,14 @@ fn format_float(x: f64, fmt: &ValueFormat) -> String {
         // `sprint_long(.., outTypeF)`. `f64::round` is the same
         // half-away-from-zero rule. The INTEGER base (`outTypeI`) plays no
         // part here.
-        let rounded = if x.is_nan() { 0i64 } else { x.round() as i64 };
+        //
+        // Out-of-int32-range, NaN and ±Inf are a DEFINED-BEHAVIOUR DEVIATION
+        // (R13-21, adopted): C's truncating cast is UB there — x86-64 happens
+        // to produce 0x80000000 for every such input, aarch64 would saturate.
+        // The port defines the rule instead of mirroring one platform's UB:
+        // saturate at the int32 boundary (+Inf/overflow → 0x7FFFFFFF,
+        // −Inf/underflow → 0x80000000) and NaN → 0 — Rust `as` cast semantics.
+        let rounded = i64::from(x.round() as i32);
         return format_int_i64(rounded, fmt.float_style);
     }
     if !x.is_finite() {
@@ -1332,6 +1339,31 @@ mod tests {
         fmt.float_style = IntStyle::Hex;
         // 1235 = 0x4D3 (sprint_long uses uppercase %X)
         assert_eq!(fv(&v, &fmt, None, false), "0x4D3");
+    }
+
+    /// R13-21 (adopted deviation): C's float→dbr_long_t cast is UB for
+    /// NaN/±Inf/out-of-range. The port's defined rule saturates at the
+    /// int32 boundary and maps NaN to 0. One case per boundary.
+    #[test]
+    fn float_as_int_saturates_at_the_int32_boundary() {
+        let mut fmt = fmt_default();
+        fmt.float_style = IntStyle::Hex;
+        let hex = |x: f64| fv(&EpicsValue::Double(x), &fmt, None, false);
+
+        assert_eq!(hex(f64::INFINITY), "0x7FFFFFFF", "+Inf saturates to MAX");
+        assert_eq!(hex(1.0e10), "0x7FFFFFFF", "overflow saturates to MAX");
+        assert_eq!(
+            hex(f64::from(i32::MAX)),
+            "0x7FFFFFFF",
+            "MAX itself is exact, not wrapped"
+        );
+        assert_eq!(
+            hex(f64::NEG_INFINITY),
+            "0x80000000",
+            "-Inf saturates to MIN"
+        );
+        assert_eq!(hex(-1.0e10), "0x80000000", "underflow saturates to MIN");
+        assert_eq!(hex(f64::NAN), "0x0", "NaN maps to 0");
     }
 
     /// C `val2str` routes DBR_CHAR through `sprintf("%d", ch)`

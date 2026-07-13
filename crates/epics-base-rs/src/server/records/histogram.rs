@@ -1,6 +1,6 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, MENU_YES_NO, ProcessOutcome, Record};
-use crate::types::{DbFieldType, EpicsValue};
+use crate::server::record::{FieldDesc, MENU_YES_NO, ProcessOutcome, Record, dbd_generated};
+use crate::types::EpicsValue;
 
 /// Histogram record — counts values into buckets.
 ///
@@ -144,6 +144,9 @@ impl HistogramRecord {
         if !self.csta {
             return;
         }
+        // Inverted limits: count nothing. C also raises SOFT/INVALID here and
+        // then erases it in the same cycle — see `check_alarms`, which raises it
+        // for real (CBUG-F12).
         if self.llim >= self.ulim || self.nelm <= 0 {
             return;
         }
@@ -185,119 +188,7 @@ impl HistogramRecord {
     }
 }
 
-static HISTOGRAM_FIELDS: &[FieldDesc] = &[
-    FieldDesc {
-        name: "VAL",
-        // C `cvt_dbaddr` (histogramRecord.c:299-308) sets
-        // `field_type = dbr_field_type = DBF_ULONG`. CA promotes that to
-        // DBR_DOUBLE, PVA serves it as uint32[] — both projections follow
-        // from this one declared type.
-        dbf_type: DbFieldType::ULong,
-        read_only: false,
-    },
-    FieldDesc {
-        // C `field(NELM,DBF_USHORT)` (histogramRecord.dbd.pod:163) — histogram's
-        // bin count is USHORT, not the ULONG the array records use.
-        name: "NELM",
-        dbf_type: DbFieldType::UShort,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "ULIM",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LLIM",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "WDTH",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "SGNL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    // C `field(SVL,DBF_INLINK)` (histogramRecord.dbd.pod:212) — the record's
-    // only input link. Membership here is what makes `field(SVL,"MYSIG")` load:
-    // `apply_fields` routes a name NOT in `field_list` to the common fields,
-    // where it is rejected and skipped.
-    FieldDesc {
-        name: "SVL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "CMD",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    // C `field(CSTA,DBF_SHORT){ special(SPC_NOMOD) initial("1") }`
-    // (histogramRecord.dbd.pod:170-175). The collection state is the record's
-    // own — it is toggled ONLY through CMD's SPC_CALC `special()`
-    // (histogramRecord.c:246-259: `cmd == 2` → `csta = TRUE`, `cmd == 3` →
-    // `csta = FALSE`) — so a client put is refused: softIoc `dbpf HI.CSTA 0` →
-    // "dbPut Attempt to modify noMod field PV: HI.CSTA". Runtime-immutable via
-    // the field_io `read_only` gate; the `put_field` arm below still serves the
-    // load path, which in C bypasses SPC_NOMOD through dbStaticLib.
-    FieldDesc {
-        name: "CSTA",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "SDEL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        // C `field(MDEL,DBF_SHORT)` (histogramRecord.dbd.pod:229) — the COUNT
-        // deadband, and `field(MCNT,DBF_SHORT)` (:234), counts since the last
-        // posted VAL. Both are SHORT, not LONG.
-        name: "MDEL",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "MCNT",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "SIMM",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIOL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SVAL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIML",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIMS",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SDLY",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-];
+static HISTOGRAM_FIELDS: &[FieldDesc] = dbd_generated::HISTOGRAM_FIELDS;
 
 /// Choice labels for the histogram command menu, in index order.
 /// C `menu(histogramCMD)` (`histogramRecord.dbd.pod`): 0=Read, 1=Clear,
@@ -320,11 +211,40 @@ impl Record for HistogramRecord {
         false
     }
 
-    /// `histogramRecord.c` has NO `checkAlarms` at all — its `process` goes
+    /// `histogramRecord.c` has no UDF alarm test anywhere — its `process` goes
     /// straight from `readValue` to `monitor`, so the UDF=1 it carries raises
     /// nothing (softIoc: UDF=1, SEVR NO_ALARM, STAT NO_ALARM).
     fn raises_udf_alarm(&self) -> bool {
         false
+    }
+
+    /// The invalid-limits alarm C intends to raise but erases.
+    ///
+    /// DEVIATION from C, deliberate — CBUG-F12. C's `add_count`
+    /// (histogramRecord.c:328-334) refuses to count when `LLIM >= ULIM` and
+    /// raises SOFT_ALARM / INVALID for it — but it writes `prec->stat` and
+    /// `prec->sevr` DIRECTLY instead of `nsta`/`nsev` via `recGblSetSevr`. The
+    /// same process cycle then calls `monitor()`, whose `recGblResetAlarms()`
+    /// copies `nsta/nsev → stat/sevr` and overwrites the write before any client
+    /// can observe it. The alarm is dead code: C's INTENT is to alarm, C's
+    /// BEHAVIOUR is NO_ALARM (verified on compiled softIoc: `LLIM=10 ULIM=5`,
+    /// process → STAT=NO_ALARM SEVR=NO_ALARM).
+    ///
+    /// Raised here through `rec_gbl_set_sevr`, which is `recGblSetSevr` — it
+    /// writes `nsta`/`nsev`, so `recGblResetAlarms` promotes it instead of
+    /// erasing it, and it keeps only the highest severity, which is what C's
+    /// hand-rolled `if (prec->nsev < INVALID_ALARM)` guard was for. Gated on
+    /// `csta` because C's is: `add_count` returns before the limits test when
+    /// counting is stopped, so a stopped histogram with inverted limits raises
+    /// nothing.
+    fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
+        if self.csta && self.llim >= self.ulim {
+            crate::server::recgbl::rec_gbl_set_sevr(
+                common,
+                crate::server::recgbl::alarm_status::SOFT_ALARM,
+                crate::server::record::AlarmSeverity::Invalid,
+            );
+        }
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
@@ -765,6 +685,7 @@ impl Record for HistogramRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::DbFieldType;
 
     // C `histogramRecord.dbd.pod` `field(NELM,DBF_USHORT){ initial("1") }` —
     // a histogram built without an explicit NELM defaults to 1 bucket (and a

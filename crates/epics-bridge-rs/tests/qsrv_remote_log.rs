@@ -748,22 +748,25 @@ async fn monitor_dbe_recognized_token_emits_no_message() {
 }
 
 // ---------------------------------------------------------------------------
-// R9-35 — array-typed record._options.DBE resets the circuit
+// R9-35 / CBUG-C2 — array-typed record._options.DBE fails THAT OP, not the circuit
 // ---------------------------------------------------------------------------
 
 /// pvxs `SingleSource::onSubscribe` dispatches DBE on the field's KIND and
 /// then CONVERTS (`ioc/singlesource.cpp:117-140`). Kind is the type-code class
 /// (`code & 0xe0`), so `Int32A` is `Kind::Integer` and reaches
 /// `fld.as<uint8_t>()` — but it STORES as an array, and `Value::copyOut` has no
-/// scalar arm for array storage (`data.cpp:466-499`). The `NoConvert` it raises
-/// escapes `onSubscribe`, escapes `servermon.cpp:590-594`, and lands in
-/// `conn.cpp:277-282`, which calls `bev.reset()`.
+/// scalar arm for array storage (`data.cpp:466-499`), so it raises `NoConvert`.
 ///
-/// So the wire contract is: NO CMD_MESSAGE, NO INIT reply, NO monitor — the
-/// server hangs the circuit up. The port used to serve the subscription with
-/// the VALUE|ALARM fallback mask.
+/// DEVIATION from C++, deliberate — CBUG-C2. In QSRV that `NoConvert` escapes
+/// `onSubscribe`, escapes `servermon.cpp:590-594`, and lands in
+/// `conn.cpp:277-282`, which calls `bev.reset()`: no INIT reply, no monitor,
+/// and the whole circuit gone. This test was
+/// `monitor_dbe_array_typed_resets_the_circuit` and asserted exactly that
+/// (`read_or_closed().is_none()`). A per-operation failure must not take down a
+/// shared transport, so the port answers the offending MONITOR with an error
+/// INIT reply and leaves the circuit up.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn monitor_dbe_array_typed_resets_the_circuit() {
+async fn monitor_dbe_array_typed_errors_the_op_not_the_circuit() {
     use epics_pva_rs::pvdata::TypedScalarArray;
 
     let db = db_with_two_records().await;
@@ -781,9 +784,54 @@ async fn monitor_dbe_array_typed_resets_the_circuit() {
     )]);
     c.send(&codec.build_monitor_init(sid, ioid, &req, None));
 
+    let frame = c
+        .read_or_closed()
+        .expect("an unconvertible DBE must be answered, not answered with a hangup");
+    assert_eq!(frame.header.command, Command::Monitor.code());
+    let mut cur = frame.cursor();
+    assert_eq!(cur.get_u32(ORDER).unwrap(), ioid);
+    let subcmd = cur.get_u8().unwrap();
+    assert!(subcmd & 0x08 != 0, "the error lands on the INIT reply");
+    let st = Status::decode(&mut cur, ORDER).unwrap();
+    assert!(!st.is_success(), "the offending MONITOR must fail: {st:?}");
+}
+
+/// The blast radius, which is the whole point of CBUG-C2: the circuit carries
+/// OTHER channels, and QSRV's `bev.reset()` kills every one of them for one
+/// client's field typo. Here the second channel — a plain, well-formed monitor
+/// opened on the same TCP connection right after the bad one — must still be
+/// served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_dbe_does_not_disturb_the_other_channels_on_the_circuit() {
+    use epics_pva_rs::pvdata::TypedScalarArray;
+
+    let db = db_with_two_records().await;
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+    let (_server, addr) = spawn_qsrv(provider);
+
+    let codec = PvaCodec { big_endian: false };
+    let mut c = FrameReader::connect(addr);
+    let bad_sid = c.create_channel("RLOG:a");
+    let good_sid = c.create_channel("RLOG:b");
+
+    // One client's typo: DBE as an array.
+    let bad_req = pv_request_with_options(&[(
+        "DBE",
+        PvField::ScalarArrayTyped(TypedScalarArray::Int(vec![1].into())),
+    )]);
+    c.send(&codec.build_monitor_init(bad_sid, 71, &bad_req, None));
+    let err = c.read_or_closed().expect("the bad op is answered");
+    assert_eq!(err.header.command, Command::Monitor.code());
+
+    // The neighbour on the same circuit is untouched.
+    let good_req =
+        pv_request_with_options(&[("DBE", PvField::Scalar(ScalarValue::String("VALUE".into())))]);
+    let frames = monitor_until_data(&mut c, &codec, good_sid, 72, &good_req);
     assert!(
-        c.read_or_closed().is_none(),
-        "an unconvertible DBE must reset the circuit: no CMD_MESSAGE, no INIT reply"
+        frames
+            .iter()
+            .any(|f| f.header.command == Command::Monitor.code()),
+        "the other channel on the circuit must keep working"
     );
 }
 

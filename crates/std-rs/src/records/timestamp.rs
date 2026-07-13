@@ -100,26 +100,10 @@ impl Default for TimestampRecord {
 }
 
 static FIELDS: &[FieldDesc] = &[
-    FieldDesc {
-        name: "VAL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OVAL",
-        dbf_type: DbFieldType::String,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "RVAL",
-        dbf_type: DbFieldType::Long,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "TST",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
+    FieldDesc::new("VAL", DbFieldType::String, false),
+    FieldDesc::new("OVAL", DbFieldType::String, true),
+    FieldDesc::new("RVAL", DbFieldType::Long, false),
+    FieldDesc::new("TST", DbFieldType::Short, false),
 ];
 
 impl TimestampRecord {

@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::error::{CaError, CaResult};
 use crate::runtime::sync::RwLock;
 use crate::server::record::{
-    AuxPostMask, InputFetchPolicy, NotifyWaitSet, RawSoftEntry, RecordInstance,
+    AuxPostMask, InputFetchPolicy, NotifyWaitSet, PactExit, RawSoftEntry, RecordInstance,
 };
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
@@ -1655,10 +1655,16 @@ impl PvDatabase {
         //   * a failed SIML read — `if (status) return status;`
         //     (`SimOutcome::AbortedBeforeWrite`, busyRecord.c:399-401)
         let mut sim_write_aborted = false;
-        let sim_output = match self.check_simulation_mode(&rec).await {
+        // The PACT the SDLY defer held, released by the SIM continuation arms —
+        // carried to whichever `recGblFwdLink` tail this cycle ends at, so the
+        // put-notify parked on that window is replayed there (C
+        // `dbNotifyCompletion`) instead of being stranded.
+        let (sim_outcome, sim_pact_exit) = self.check_simulation_mode(&rec).await;
+        let sim_output = match sim_outcome {
             SimOutcome::NotSimulated => None,
             SimOutcome::Simulated => {
                 self.run_forward_link_tail(name, &rec, visited, depth).await;
+                self.end_process_cycle(name, &rec, sim_pact_exit).await;
                 return Ok(());
             }
             SimOutcome::AbortedBeforeWrite => {
@@ -1685,6 +1691,7 @@ impl PvDatabase {
                         sim_process_tail(&mut instance, false);
                     }
                     self.run_forward_link_tail(name, &rec, visited, depth).await;
+                    self.end_process_cycle(name, &rec, sim_pact_exit).await;
                     return Ok(());
                 }
             }
@@ -1705,11 +1712,13 @@ impl PvDatabase {
                 // the `ReprocessAfter` ODLY defers.
                 {
                     let instance = rec.write().await;
-                    instance
-                        .processing
-                        .store(true, std::sync::atomic::Ordering::Release);
+                    instance.enter_pact();
                 }
                 self.schedule_delayed_reprocess(name, delay).await;
+                // This arm is reachable only with PACT clear on entry, so the
+                // exit is empty; consume it through the single owner anyway so
+                // no path drops a token blind.
+                self.apply_pact_exit(name, sim_pact_exit);
                 return Ok(());
             }
             SimOutcome::RedirectOutputToSiol {
@@ -2232,7 +2241,14 @@ impl PvDatabase {
         let asub_dynamic = self.resolve_asub_dynamic_subroutine(&rec).await;
 
         // 2. Lock record, apply INP/DOL, process, evaluate alarms, build snapshot
-        let (snapshot, flnk_name, process_actions, alarm_posts, result_is_defer_output) = 'epilogue: {
+        let (
+            snapshot,
+            flnk_name,
+            process_actions,
+            alarm_posts,
+            result_is_defer_output,
+            continuation_pact_exit,
+        ) = 'epilogue: {
             let mut instance = rec.write().await;
 
             // Apply DOL value for output records (OMSL=CLOSED_LOOP)
@@ -2538,9 +2554,7 @@ impl PvDatabase {
                     "[TPRO] {}: process (SCAN={:?}, PACT={})",
                     instance.name,
                     instance.common.scan,
-                    instance
-                        .processing
-                        .load(std::sync::atomic::Ordering::Relaxed)
+                    instance.is_processing()
                 );
             }
 
@@ -2638,9 +2652,7 @@ impl PvDatabase {
                 // `record.process()` directly — leaving `processing=false`.
                 // Mirrors `aiRecord.c:122` and similar: `prec->pact = TRUE;
                 // return 0;` before async work.
-                instance
-                    .processing
-                    .store(true, std::sync::atomic::Ordering::Release);
+                instance.enter_pact();
 
                 // PACT stays set; skip alarm/timestamp/snapshot/OUT/FLNK.
                 // But still execute any actions (e.g., ReprocessAfter for delayed re-entry).
@@ -2648,6 +2660,11 @@ impl PvDatabase {
                 drop(instance);
                 self.execute_process_actions(&rec_name, &rec, process_actions, visited, depth)
                     .await;
+                // The SIM continuation released the SDLY PACT and the body then
+                // went async again: replay the parked put through the single
+                // consumer, which re-parks it on the new PACT window (the
+                // deferral is closed under its own restart).
+                self.apply_pact_exit(name, sim_pact_exit);
                 return Ok(());
             }
             if process_result == crate::server::record::RecordProcessResult::CompleteNoEmit {
@@ -2670,6 +2687,9 @@ impl PvDatabase {
                     process_actions.is_empty(),
                     "CompleteNoEmit must carry no process actions"
                 );
+                // The record is idle (this path sets no PACT), so a put parked
+                // on a released SDLY window replays straight away.
+                self.apply_pact_exit(name, sim_pact_exit);
                 return Ok(());
             }
             if let crate::server::record::RecordProcessResult::AsyncPendingNotify(fields) =
@@ -2749,9 +2769,7 @@ impl PvDatabase {
                     .iter()
                     .any(|a| matches!(a, crate::server::record::ProcessAction::ReprocessAfter(_)));
                 if holds_pact_until_continuation {
-                    instance
-                        .processing
-                        .store(true, std::sync::atomic::Ordering::Release);
+                    instance.enter_pact();
                 }
                 let snapshot = crate::server::record::ProcessSnapshot { changed_fields };
                 let rec_name = instance.name.clone();
@@ -2778,6 +2796,9 @@ impl PvDatabase {
                 }
                 self.execute_process_actions(&rec_name, &rec, deferred_actions, visited, depth)
                     .await;
+                // Same as the `AsyncPending` arm: hand the parked put back to the
+                // single consumer, which re-parks it if this pass re-took PACT.
+                self.apply_pact_exit(name, sim_pact_exit);
                 return Ok(());
             }
 
@@ -2804,11 +2825,19 @@ impl PvDatabase {
             // SCAN_ALARM. Clearing here (record still write-locked,
             // before the OUT/FLNK tail) mirrors the C ordering where
             // `pact` is already `FALSE` when `recGblFwdLink` runs.
-            if is_continuation {
-                instance
-                    .processing
-                    .store(false, std::sync::atomic::Ordering::Release);
-            }
+            //
+            // The release hands back the put-notify parked on this PACT window
+            // (`PactExit`); it is carried to this cycle's `recGblFwdLink` tail
+            // below, where C queues the restart (`recGbl.c:295` →
+            // `dbNotifyCompletion`). Replaying it here instead — at the
+            // `pact = FALSE` store, before the OUT/FLNK tail — would let the
+            // replayed put process the record concurrently with the tail it is
+            // still running.
+            let continuation_pact_exit = if is_continuation {
+                instance.leave_pact()
+            } else {
+                crate::server::record::PactExit::none()
+            };
 
             // NOTE: the MS-class input-link alarm propagation
             // (`inherit_sevr_msg`) already ran BEFORE the record body — see the
@@ -2965,6 +2994,7 @@ impl PvDatabase {
                     Vec::new(),
                     alarm_posts,
                     false,
+                    continuation_pact_exit,
                 );
             }
 
@@ -3168,9 +3198,7 @@ impl PvDatabase {
                             // Async write submitted -- set PACT, return early.
                             // complete_async_record will handle deadband, snapshot,
                             // notification, and FLNK when the write completes.
-                            instance
-                                .processing
-                                .store(true, std::sync::atomic::Ordering::Release);
+                            instance.enter_pact();
                             instance.device = Some(dev);
                             let rec_name = instance.name.clone();
                             let timeout = std::time::Duration::from_secs(5);
@@ -3430,6 +3458,7 @@ impl PvDatabase {
                 process_actions,
                 alarm_posts,
                 result_is_defer_output,
+                continuation_pact_exit,
             )
         };
 
@@ -3473,9 +3502,7 @@ impl PvDatabase {
                 .any(|a| matches!(a, crate::server::record::ProcessAction::ReprocessAfter(_)));
             if holds_pact_until_continuation {
                 let instance = rec.write().await;
-                instance
-                    .processing
-                    .store(true, std::sync::atomic::Ordering::Release);
+                instance.enter_pact();
             }
         }
 
@@ -3538,32 +3565,78 @@ impl PvDatabase {
         // this clear: their FLNK / putf-clear happens later in
         // `complete_async_record_inner` once the device round-trip
         // completes.
-        {
-            let guard = rec.read().await;
-            if !guard.is_processing() {
-                drop(guard);
-                let mut guard = rec.write().await;
-                guard.common.putf = false;
-            }
-        }
+        // `sim_pact_exit` is the PACT release performed inside
+        // `check_simulation_mode` (the SDLY/SIM continuation);
+        // `continuation_pact_exit` the one at the `is_continuation` arm. At most
+        // one of them can carry the parked put.
+        self.end_process_cycle(name, &rec, sim_pact_exit.merge(continuation_pact_exit))
+            .await;
 
-        // Put-notify completion: the record `leave`s the wait-set only
-        // here, after its full OUT/FLNK/process-action tail has run — so
-        // every PP target it drove has already joined (`enter`ed). Gated
-        // on `is_put_complete`: a record reporting more work (e.g. motor
-        // mid-move via `is_put_complete()==false`) keeps its membership
-        // and leaves on the later cycle that completes the put — matching
-        // the old fire site's gate. An async-pending record returned
-        // earlier and is handled in `complete_async_record_inner`. The
-        // completion oneshot fires on the `leave` that empties the set.
+        Ok(())
+    }
+
+    /// The end of a synchronous process cycle — C `recGblFwdLink`'s tail
+    /// (`recGbl.c:295-302`), after `dbScanFwdLink`:
+    ///
+    /// ```c
+    /// if (pdbc->ppn) dbNotifyCompletion(pdbc);  /* leave the wait-set; queue the restart */
+    /// ...
+    /// pdbc->putf = FALSE;
+    /// ```
+    ///
+    /// The single owner of both halves, so no cycle end can skip them. Open-coded
+    /// at the tail of `process_record_with_links_inner` alone, it was jumped over
+    /// by the two simulation early-returns: a put-notify on a SIMM record never
+    /// left its wait-set (the callback never fired) and PUTF leaked into the next
+    /// scan.
+    async fn end_process_cycle(
+        &self,
+        name: &str,
+        rec: &Arc<RwLock<RecordInstance>>,
+        exit: PactExit,
+    ) {
         {
             let mut guard = rec.write().await;
+            // C `recGblFwdLink:302` clears `putf = FALSE` at the tail of every
+            // synchronous cycle, NOT just the foreign-entry path: a record driven
+            // through an OUT-link propagation (`write_db_link_value` set its
+            // putf) must clear it before returning. Async-pending records skip
+            // the clear — their FLNK / putf-clear happen later, in
+            // `complete_async_record_inner`, once the device round-trip
+            // completes.
+            if !guard.is_processing() {
+                guard.common.putf = false;
+            }
+            // The record `leave`s the wait-set only here, after its full
+            // OUT/FLNK/process-action tail has run — so every PP target it drove
+            // has already joined (`enter`ed). Gated on `is_put_complete`: a
+            // record reporting more work (e.g. motor mid-move via
+            // `is_put_complete()==false`) keeps its membership and leaves on the
+            // later cycle that completes the put. The completion oneshot fires on
+            // the `leave` that empties the set.
             if guard.record.is_put_complete() {
                 complete_put_notify(&mut guard);
             }
         }
+        self.apply_pact_exit(name, exit);
+    }
 
-        Ok(())
+    /// The single consumer of a [`PactExit`] — C `dbNotifyCompletion`'s restart
+    /// arm (`dbNotify.c:466-469`), reached from `recGblFwdLink` (`recGbl.c:295`)
+    /// at the tail of the cycle that released PACT.
+    ///
+    /// Queued, not recursed — the same `scanOnce` shape as the RPRO restart. The
+    /// replay takes the record's advisory write gate, which no process path
+    /// holds.
+    fn apply_pact_exit(&self, name: &str, exit: PactExit) {
+        let Some(put) = exit.into_deferred() else {
+            return;
+        };
+        let db = self.clone();
+        let put_name = name.to_string();
+        crate::runtime::task::spawn(async move {
+            db.restart_deferred_notify_put(&put_name, put).await;
+        });
     }
 
     /// Forward-link / CP / RPRO tail for the simulation-mode path.
@@ -4231,7 +4304,7 @@ impl PvDatabase {
             return Ok(()); // Cycle detected, skip
         }
 
-        let (snapshot, flnk_name, alarm_posts) = {
+        let (snapshot, flnk_name, alarm_posts, pact_exit) = {
             let mut instance = rec.write().await;
 
             // UDF update before alarm evaluation (C parity — see the
@@ -4397,10 +4470,11 @@ impl PvDatabase {
             // C `monitor()`: commit the cycle's alarm — after every output.
             let alarm_result = crate::server::recgbl::rec_gbl_reset_alarms(&mut instance.common);
 
-            // Clear PACT
-            instance
-                .processing
-                .store(false, std::sync::atomic::Ordering::Release);
+            // Clear PACT. The release hands back the put-notify parked on this
+            // window; it is carried to the tail below (C `recGblFwdLink` →
+            // `dbNotifyCompletion`), never replayed here — the OUT/FLNK chain
+            // this cycle still owes has not run yet.
+            let pact_exit = instance.leave_pact();
 
             // Put-notify completion is NOT fired here. The async device
             // round-trip has finished, but the OUT/FLNK/process-action
@@ -4535,7 +4609,7 @@ impl PvDatabase {
                 None
             };
 
-            (snapshot, flnk_name, alarm_posts)
+            (snapshot, flnk_name, alarm_posts, pact_exit)
         };
 
         // Notify subscribers
@@ -4660,26 +4734,18 @@ impl PvDatabase {
         // motor re-entering `complete_async_record_inner` over several
         // device cycles leaves exactly once — matching the old fire site,
         // which `take`d its oneshot.
-        let deferred_put = {
+        {
             let mut guard = rec.write().await;
             complete_put_notify(&mut guard);
-            // C `dbNotifyCompletion` (dbNotify.c:207-231): a put-notify that
-            // arrived while this record was PACT wrote nothing and parked here.
-            // PACT is clear (:4382) and this cycle's wait-set has drained, so
-            // the record is now the idle record that put was meant to see —
-            // replay it whole (value + process + callback).
-            guard.deferred_notify_put.take()
-        };
-        if let Some(put) = deferred_put {
-            // Queued, not recursed — the same `scanOnce` shape as the RPRO
-            // restart above. The replay takes the record's advisory write gate,
-            // which this completion path does not hold.
-            let db = self.clone();
-            let put_name = name.to_string();
-            crate::runtime::task::spawn(async move {
-                db.restart_deferred_notify_put(&put_name, put).await;
-            });
         }
+
+        // C `dbNotifyCompletion` (dbNotify.c:466-469): a put-notify that arrived
+        // while this record was PACT wrote nothing and parked on the window. The
+        // window's release handed it to us as the `PactExit`; PACT is clear and
+        // this cycle's wait-set has drained, so the record is now the idle record
+        // that put was meant to see — replay it whole (value + process +
+        // callback), through the single consumer.
+        self.apply_pact_exit(name, pact_exit);
 
         Ok(())
     }
@@ -4734,7 +4800,7 @@ impl PvDatabase {
                 // no RPRO. A CP link (`passive_only == false`) never
                 // takes this branch and always processes.
                 skip = true;
-            } else if tg.processing.load(std::sync::atomic::Ordering::Acquire) {
+            } else if tg.is_processing() {
                 tg.common.rpro = true;
                 skip = true;
             }
@@ -5253,7 +5319,17 @@ impl PvDatabase {
     /// `SimOutcome::RedirectOutputToSiol` when a simulated OUTPUT needs the
     /// uniform body to run first, or `SimOutcome::NotSimulated` when normal
     /// processing should proceed.
-    async fn check_simulation_mode(&self, rec: &Arc<RwLock<RecordInstance>>) -> SimOutcome {
+    ///
+    /// The SIM/SDLY continuation arms release the PACT the SDLY defer held (C
+    /// `readValue`/`writeValue` continue with `pact = FALSE`), so the call also
+    /// hands back the [`PactExit`] for that release — the put-notify parked on
+    /// the SDLY window. The caller carries it to the cycle's `recGblFwdLink`
+    /// tail; the release cannot silently drop it (`#[must_use]`), which is what
+    /// stranded it here before.
+    async fn check_simulation_mode(
+        &self,
+        rec: &Arc<RwLock<RecordInstance>>,
+    ) -> (SimOutcome, crate::server::record::PactExit) {
         // Read SIML, SIMM, SIOL, SIMS, SDLY from the record
         let (siml_link, siol_link, sims, sdly, _rtype, is_input, input_stage, pact_held) = {
             let instance = rec.read().await;
@@ -5381,7 +5457,7 @@ impl PvDatabase {
             // record, because an unset SIOL is exactly the case C serves from
             // SVAL (R12-61).
             if instance.record.get_field("SIMM").is_none() {
-                return SimOutcome::NotSimulated; // no simulation block
+                return (SimOutcome::NotSimulated, PactExit::none()); // no simulation block
             }
 
             let siml_parsed = crate::server::record::parse_link_v2(siml.as_str_lossy().as_ref());
@@ -5448,7 +5524,8 @@ impl PvDatabase {
                     instance.record.aborts_on_failed_siml_read()
                 };
                 if aborts {
-                    return SimOutcome::AbortedBeforeWrite;
+                    // Reachable only under `!pact_held`, so no PACT to release.
+                    return (SimOutcome::AbortedBeforeWrite, PactExit::none());
                 }
             }
         }
@@ -5462,7 +5539,9 @@ impl PvDatabase {
         };
 
         if !mode.is_simulated() {
-            return SimOutcome::NotSimulated; // menuSimmNO — proceed normally
+            // PACT, if held, belongs to the continuation arm of the uniform
+            // body — released there, with its park.
+            return (SimOutcome::NotSimulated, PactExit::none()); // menuSimmNO
         }
 
         // C `default:` arm — `recGblSetSevr(prec, SOFT_ALARM, INVALID_ALARM)`
@@ -5488,15 +5567,16 @@ impl PvDatabase {
             // but the record's `process()` ends with `prec->pact = FALSE` on the
             // way out. Release it here for the same reason the YES/RAW branches
             // do (below and at the `Simulated` tail): the cycle ends, so the
-            // record must be left idle.
-            if pact_held {
-                instance
-                    .processing
-                    .store(false, std::sync::atomic::Ordering::Release);
-            }
+            // record must be left idle. The release carries the put-notify
+            // parked on the SDLY window out to the caller's tail.
+            let exit = if pact_held {
+                instance.leave_pact()
+            } else {
+                PactExit::none()
+            };
             let is_output = !is_input;
             drop(instance);
-            return SimOutcome::IllegalMode { is_output };
+            return (SimOutcome::IllegalMode { is_output }, exit);
         }
 
         // epics-base 7.0.7 (SIMM menu):
@@ -5520,7 +5600,11 @@ impl PvDatabase {
         // and holds PACT; the resulting PACT-held continuation falls through to
         // the synchronous branch below.
         if !pact_held && sdly >= 0.0 {
-            return SimOutcome::DeferRead(std::time::Duration::from_secs_f64(sdly));
+            // Reachable only under `!pact_held`: this is the arm that TAKES PACT.
+            return (
+                SimOutcome::DeferRead(std::time::Duration::from_secs_f64(sdly)),
+                PactExit::none(),
+            );
         }
 
         // INPUT-STAGE record (swait). C `swaitRecord.c:415-421`:
@@ -5578,7 +5662,9 @@ impl PvDatabase {
                 crate::server::recgbl::alarm_status::SIMM_ALARM,
                 sev,
             );
-            return SimOutcome::SimulatedInputStage;
+            // swait keeps the cycle going through the uniform body; a held PACT
+            // is released at its continuation arm, with its park.
+            return (SimOutcome::SimulatedInputStage, PactExit::none());
         }
 
         // OUTPUT record: C `writeValue` substitutes the device write with the
@@ -5592,17 +5678,20 @@ impl PvDatabase {
         // SDLY-held PACT first (C `writeValue` sets `pact = FALSE` on the sync
         // continuation) so the body runs on an idle record.
         if !is_input {
-            if pact_held {
-                let instance = rec.write().await;
-                instance
-                    .processing
-                    .store(false, std::sync::atomic::Ordering::Release);
-            }
-            return SimOutcome::RedirectOutputToSiol {
-                siol: siol_link,
-                sims,
-                raw_mode,
+            let exit = if pact_held {
+                let mut instance = rec.write().await;
+                instance.leave_pact()
+            } else {
+                PactExit::none()
             };
+            return (
+                SimOutcome::RedirectOutputToSiol {
+                    siol: siol_link,
+                    sims,
+                    raw_mode,
+                },
+                exit,
+            );
         }
 
         // SIMM=YES(1) / SIMM=RAW(2): read the SIOL link into VAL/RVAL. C
@@ -5784,14 +5873,14 @@ impl PvDatabase {
         // FALSE). An entry that never held PACT (a fresh `sdly < 0` cycle, or a
         // `pact=FALSE` re-trigger) has nothing to release, so the clear is gated
         // on `pact_held` to avoid a needless write-lock there.
-        if pact_held {
-            let instance = rec.write().await;
-            instance
-                .processing
-                .store(false, std::sync::atomic::Ordering::Release);
-        }
+        let exit = if pact_held {
+            let mut instance = rec.write().await;
+            instance.leave_pact()
+        } else {
+            PactExit::none()
+        };
 
-        SimOutcome::Simulated
+        (SimOutcome::Simulated, exit)
     }
 }
 

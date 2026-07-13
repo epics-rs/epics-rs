@@ -798,23 +798,42 @@ impl NDPluginProcess for CircularBuffProcessor {
         } else if Some(reason) == self.params.flush_on_soft_trigger {
             self.buffer.set_flush_on_soft_trigger(params.value.as_i32());
         } else if Some(reason) == self.params.soft_trigger {
-            // C writeInt32(NDCircBuffSoftTrigger) (NDPluginCircularBuff.cpp:266-278)
-            // does NOT look at `value`: it stores it, then latches
-            // NDCircBuffTriggered = 1 unconditionally (:271). `caput SoftTrigger 0`
-            // therefore triggers on C exactly like `caput SoftTrigger 1` — the
-            // written value only decides whether processCallbacks re-asserts the
-            // latch on each frame (:124), and the latch is already set either way.
-            self.buffer.trigger();
-            if let Some(idx) = self.params.triggered {
-                updates.push(ParamUpdate::int32(idx, 1));
-            }
-            // C `:273-277`: when FlushOnSoftTrig > 0 the pre-buffer is flushed
-            // from the write itself, not lazily on the next frame — the ring
-            // reaches the downstream plugins before any post-trigger frame.
-            if self.buffer.flushes_on_soft_trigger() {
-                let flushed = self.buffer.flush_pre_buffer();
-                if !flushed.is_empty() {
-                    return ParamChangeResult::combined(flushed, updates);
+            // The write's job, beyond storing the parameter, is to make the soft
+            // trigger take effect IMMEDIATELY — latch Triggered and flush the ring
+            // — instead of waiting for the next frame, which `process_array` would
+            // do anyway from the stored level (C `processCallbacks:123-125`:
+            // `if (softTrigger) triggered = 1;`, re-asserted every frame).
+            //
+            // DEVIATION from C, deliberate — CBUG-B11. C's writeInt32 arm
+            // (NDPluginCircularBuff.cpp:266-278) stores `value` (:268) and then
+            // never tests it: it latches NDCircBuffTriggered = 1 (:271) and
+            // flushes (:276-278) UNCONDITIONALLY. So `caput SoftTrigger 0` — the
+            // natural way to disarm between acquisitions, and what an
+            // autosave/PINI restore writes at boot — fires the trigger on C
+            // exactly like `caput SoftTrigger 1`. 0 unambiguously means "not
+            // triggered" in this plugin's own vocabulary: the Control on and
+            // Control off paths both disarm by writing SoftTrigger = 0 alongside
+            // Triggered = 0 (:248-249, :257-258), and processCallbacks only
+            // asserts the trigger `if (softTrigger)`.
+            //
+            // Writing 0 is therefore a no-op here, which is exactly "stops
+            // asserting the trigger" — the same level semantics processCallbacks
+            // has. It does not clear an already-latched Triggered: C clears that
+            // only on a Control transition, and a latch set by the ATTRIBUTE
+            // trigger condition is not this parameter's to cancel.
+            if params.value.as_i32() != 0 {
+                self.buffer.trigger();
+                if let Some(idx) = self.params.triggered {
+                    updates.push(ParamUpdate::int32(idx, 1));
+                }
+                // C `:273-277`: when FlushOnSoftTrig > 0 the pre-buffer is flushed
+                // from the write itself, not lazily on the next frame — the ring
+                // reaches the downstream plugins before any post-trigger frame.
+                if self.buffer.flushes_on_soft_trigger() {
+                    let flushed = self.buffer.flush_pre_buffer();
+                    if !flushed.is_empty() {
+                        return ParamChangeResult::combined(flushed, updates);
+                    }
                 }
             }
         } else if Some(reason) == self.params.trigger_a {
@@ -1643,13 +1662,19 @@ mod tests {
         assert!(int32s(&r).contains(&(13, 0)));
     }
 
+    /// CBUG-B11 — a NONZERO SoftTrigger write latches the trigger and (with
+    /// FlushOnSoftTrig > 0) flushes the ring from the write itself
+    /// (NDPluginCircularBuff.cpp:271, :276-277), rather than waiting for the next
+    /// frame. Writing **0** does neither.
+    ///
+    /// This test used to be `test_soft_trigger_write_latches_for_any_value_and_flushes`
+    /// and pinned C's bug: C stores `value` (:268) and then never tests it, so
+    /// `caput SoftTrigger 0` — the natural way to disarm, and what an autosave/PINI
+    /// restore writes at boot — armed the plugin and flushed the pre-trigger ring
+    /// downstream. Both of the assertions below that now expect "no trigger, no
+    /// flush" were written the other way round.
     #[test]
-    fn test_soft_trigger_write_latches_for_any_value_and_flushes() {
-        // R8-72. C writeInt32(NDCircBuffSoftTrigger) (NDPluginCircularBuff.cpp:266-278)
-        // ignores `value` when latching: it sets NDCircBuffTriggered = 1
-        // unconditionally (:271), so `caput SoftTrigger 0` triggers too; and when
-        // FlushOnSoftTrig > 0 it calls flushPreBuffer() from the write itself
-        // (:276-277) rather than waiting for the next frame.
+    fn test_soft_trigger_write_latches_only_for_a_nonzero_value() {
         use ad_core_rs::ndarray::{NDDataType, NDDimension};
         use ad_core_rs::plugin::runtime::{ParamChangeValue, ParamUpdate, PluginParamSnapshot};
 
@@ -1682,22 +1707,34 @@ mod tests {
             p
         };
 
-        // FlushOnSoftTrig = 0: value 0 still latches the trigger, and the ring
-        // stays put (it flushes lazily with the first post-trigger frame).
-        let mut p = processor(0);
+        let latched = |r: &ad_core_rs::plugin::runtime::ParamChangeResult| {
+            r.param_updates.iter().any(|u| {
+                matches!(
+                    u,
+                    ParamUpdate::Int32 {
+                        reason: 21,
+                        value: 1,
+                        ..
+                    }
+                )
+            })
+        };
+
+        // Writing 0 with FlushOnSoftTrig = 1 — the disarm case, and the one C
+        // gets wrong: no trigger, no flush, the ring stays intact.
+        let mut p = processor(1);
         let r = soft_trigger_write(&mut p, 0);
-        assert!(
-            p.buffer().is_triggered(),
-            "C latches Triggered=1 for value 0"
-        );
-        assert!(r.param_updates.iter().any(|u| matches!(
-            u,
-            ParamUpdate::Int32 {
-                reason: 21,
-                value: 1,
-                ..
-            }
-        )));
+        assert!(!p.buffer().is_triggered(), "SoftTrigger 0 must not arm");
+        assert!(!latched(&r), "SoftTrigger 0 must not post Triggered=1");
+        assert!(r.output_arrays.is_empty(), "SoftTrigger 0 must not flush");
+        assert_eq!(p.buffer().pre_buffer_len(), 2);
+
+        // FlushOnSoftTrig = 0: a nonzero value latches, and the ring stays put
+        // (it flushes lazily with the first post-trigger frame).
+        let mut p = processor(0);
+        let r = soft_trigger_write(&mut p, 1);
+        assert!(p.buffer().is_triggered());
+        assert!(latched(&r));
         assert!(
             r.output_arrays.is_empty(),
             "no flush when FlushOnSoftTrig = 0"
@@ -1706,19 +1743,12 @@ mod tests {
 
         // FlushOnSoftTrig = 1: the write itself flushes the pre-buffer, in order.
         let mut p = processor(1);
-        let r = soft_trigger_write(&mut p, 0);
+        let r = soft_trigger_write(&mut p, 1);
         assert!(p.buffer().is_triggered());
         let ids: Vec<_> = r.output_arrays.iter().map(|a| a.unique_id).collect();
         assert_eq!(ids, vec![1, 2], "pre-buffer flushed from the write");
         assert_eq!(p.buffer().pre_buffer_len(), 0);
-        assert!(r.param_updates.iter().any(|u| matches!(
-            u,
-            ParamUpdate::Int32 {
-                reason: 21,
-                value: 1,
-                ..
-            }
-        )));
+        assert!(latched(&r));
 
         // The next frame is the first post-trigger frame; the ring is already
         // drained, so C's second flushPreBuffer() (:165) is a no-op and only the

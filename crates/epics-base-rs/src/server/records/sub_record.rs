@@ -1,6 +1,6 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, InputFetchPolicy, ProcessOutcome, Record};
-use crate::types::{DbFieldType, EpicsValue, PvString};
+use crate::server::record::{FieldDesc, InputFetchPolicy, ProcessOutcome, Record, dbd_generated};
+use crate::types::{EpicsValue, PvString};
 
 /// Number of subroutine input arguments. C `subRecord.c`:
 /// `#define INP_ARG_MAX 21` — fields `A..U` / `INPA..INPU`.
@@ -96,117 +96,7 @@ impl Default for SubRecord {
     }
 }
 
-static SUB_FIELDS: &[FieldDesc] = &[
-    FieldDesc {
-        name: "VAL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SNAM",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    // INAM: init-routine name, SPC_NOMOD (config; .db-load only).
-    FieldDesc {
-        name: "INAM",
-        dbf_type: DbFieldType::String,
-        read_only: true,
-    },
-    // Monitor/archive deadbands (client-writable) + last-posted/alarm
-    // trackers (SPC_NOMOD in C, read-only to clients).
-    FieldDesc {
-        name: "MDEL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ADEL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LALM",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "MLST",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "ALST",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    // Bad-return severity menu (menuAlarmSevr).
-    FieldDesc {
-        name: "BRSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    // INPA..INPU
-    field_str("INPA"),
-    field_str("INPB"),
-    field_str("INPC"),
-    field_str("INPD"),
-    field_str("INPE"),
-    field_str("INPF"),
-    field_str("INPG"),
-    field_str("INPH"),
-    field_str("INPI"),
-    field_str("INPJ"),
-    field_str("INPK"),
-    field_str("INPL"),
-    field_str("INPM"),
-    field_str("INPN"),
-    field_str("INPO"),
-    field_str("INPP"),
-    field_str("INPQ"),
-    field_str("INPR"),
-    field_str("INPS"),
-    field_str("INPT"),
-    field_str("INPU"),
-    // A..U
-    field_dbl("A"),
-    field_dbl("B"),
-    field_dbl("C"),
-    field_dbl("D"),
-    field_dbl("E"),
-    field_dbl("F"),
-    field_dbl("G"),
-    field_dbl("H"),
-    field_dbl("I"),
-    field_dbl("J"),
-    field_dbl("K"),
-    field_dbl("L"),
-    field_dbl("M"),
-    field_dbl("N"),
-    field_dbl("O"),
-    field_dbl("P"),
-    field_dbl("Q"),
-    field_dbl("R"),
-    field_dbl("S"),
-    field_dbl("T"),
-    field_dbl("U"),
-];
-
-const fn field_str(name: &'static str) -> FieldDesc {
-    FieldDesc {
-        name,
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    }
-}
-
-const fn field_dbl(name: &'static str) -> FieldDesc {
-    FieldDesc {
-        name,
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    }
-}
+static SUB_FIELDS: &[FieldDesc] = dbd_generated::SUB_FIELDS;
 
 impl Record for SubRecord {
     fn record_type(&self) -> &'static str {

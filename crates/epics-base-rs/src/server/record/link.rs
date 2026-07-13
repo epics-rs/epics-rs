@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 
+use crate::runtime::json_string::{decode_json_string, decode_json_string_token};
 use crate::types::EpicsValue;
 
 /// Link processing policy for input/output links.
@@ -509,9 +510,14 @@ fn constant_array_value(inner: &str) -> EpicsValue {
     if body.is_empty() {
         return EpicsValue::DoubleArray(Vec::new());
     }
-    let elements: Vec<&str> = body
+    // A quoted element is a yajl string: decoded through the one owner. A bare
+    // element (a number) carries no escapes.
+    let elements: Vec<String> = body
         .split(',')
-        .map(|e| e.trim().trim_matches('"').trim_matches('\''))
+        .map(|e| {
+            let e = e.trim();
+            decode_json_string_token(e).unwrap_or_else(|| e.to_string())
+        })
         .collect();
     let numbers: Option<Vec<f64>> = elements.iter().map(|e| e.parse::<f64>().ok()).collect();
     match numbers {
@@ -619,10 +625,14 @@ fn json_const_value(s: &str) -> Option<&str> {
     Some(rest.trim().trim_end_matches(',').trim())
 }
 
-/// The JSON string a `{const:…}` link carries, unquoted — `"hi"` and the
+/// The JSON string a `{const:…}` link carries, DECODED — `"hi"` and the
 /// string-array shorthand `["hi", …]` (C `ac40`, whose `loadLS` takes element 0).
 /// A numeric value is not a string: `lnkConst_loadLS`'s `default` arm returns
 /// `S_db_badField`, so nothing is loaded and LEN stays 0.
+///
+/// The decode is yajl's, not this function's: a `{…}` value's escapes are
+/// translated by `dbJLinkParse` → yajl, never by the `.db` lexer
+/// ([`decode_json_string_token`]).
 fn json_string_value(value: &str) -> Option<String> {
     let v = value.trim();
     let first = if let Some(rest) = v.strip_prefix('[') {
@@ -630,11 +640,7 @@ fn json_string_value(value: &str) -> Option<String> {
     } else {
         v
     };
-    let unquoted = first
-        .strip_prefix('"')
-        .and_then(|t| t.strip_suffix('"'))
-        .or_else(|| first.strip_prefix('\'').and_then(|t| t.strip_suffix('\'')))?;
-    Some(unquoted.to_string())
+    decode_json_string_token(first)
 }
 
 fn try_parse_json_link(s: &str) -> Option<ParsedLink> {
@@ -656,14 +662,21 @@ fn try_parse_json_link(s: &str) -> Option<ParsedLink> {
         .to_ascii_lowercase();
     match key.as_str() {
         "const" => {
-            // Constant: bare numeric, quoted string, or array.
-            // Strip outer quotes if present.
+            // Constant: bare numeric, quoted string, or array. A quoted string
+            // is a yajl string — its escapes are decoded here, by the one owner
+            // (`lnkConst.c:199` receives the DECODED bytes from
+            // `yajl_parser.c:273-281`); a bare token carries no escapes and is
+            // taken verbatim, as is an array (its elements are decoded by
+            // `constant_array_value`).
             let v = rest.trim_end_matches(',').trim();
-            let stripped = v.trim_matches('"').trim_matches('\'');
-            if stripped.is_empty() {
+            let decoded = match decode_json_string_token(v) {
+                Some(s) => s,
+                None => v.to_string(),
+            };
+            if decoded.is_empty() {
                 Some(ParsedLink::None)
             } else {
-                Some(ParsedLink::Constant(stripped.to_string()))
+                Some(ParsedLink::Constant(decoded))
             }
         }
         "ca" | "pva" => {
@@ -716,15 +729,16 @@ fn try_parse_json_link(s: &str) -> Option<ParsedLink> {
                 PvaRootValue::StringName(name) => {
                     // String shorthand: the contents are the verbatim channel
                     // name. Do NOT split `?` — it is link data (pvxs treats a
-                    // string pvalink as the channel name in full).
-                    let name = name.trim();
+                    // string pvalink as the channel name in full). It is still a
+                    // yajl string, so its escapes are decoded by the one owner.
+                    let name = decode_json_string(name.trim());
                     if name.is_empty() {
                         return None;
                     }
                     if key == "ca" {
-                        Some(ParsedLink::Ca(CaLink::new(name.to_string())))
+                        Some(ParsedLink::Ca(CaLink::new(name)))
                     } else {
-                        Some(ParsedLink::Pva(name.to_string()))
+                        Some(ParsedLink::Pva(name))
                     }
                 }
             }
@@ -820,10 +834,11 @@ fn extract_pv_and_opts_from_subobject(body: &str) -> Option<(String, Vec<(String
             continue;
         }
         if k_raw.eq_ignore_ascii_case("pv") {
-            // `pv` is always the channel-name string; strip its quotes.
-            let name = v_trimmed.trim_matches('"').trim_matches('\'');
+            // `pv` is always the channel-name string: dequoted AND decoded by
+            // the one JSON-string owner (yajl hands the jlif a decoded string).
+            let name = decode_json_string_token(v_trimmed).unwrap_or_else(|| v_trimmed.to_string());
             if !name.is_empty() {
-                pv = Some(name.to_string());
+                pv = Some(name);
             }
         } else if let Some(val) = classify_jlink_value(v_trimmed) {
             // Preserve original key case (case-sensitive for keys like
@@ -846,10 +861,8 @@ fn extract_pv_and_opts_from_subobject(body: &str) -> Option<(String, Vec<(String
 /// tokenizer that treated every bare value as text.
 fn classify_jlink_value(raw: &str) -> Option<JlinkValue> {
     let t = raw.trim();
-    if t.len() >= 2
-        && ((t.starts_with('"') && t.ends_with('"')) || (t.starts_with('\'') && t.ends_with('\'')))
-    {
-        return Some(JlinkValue::Str(t[1..t.len() - 1].to_string()));
+    if let Some(decoded) = decode_json_string_token(t) {
+        return Some(JlinkValue::Str(decoded));
     }
     match t {
         "" => None,

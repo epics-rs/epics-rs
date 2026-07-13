@@ -98,11 +98,12 @@ fn dbe_value_class_mask(raw: u16) -> u16 {
 /// `Int32A` is `Kind::Integer` but stores as an array, and `Value::copyOut` has
 /// no scalar arm for array storage (`data.cpp:466-499`). So an ARRAY-typed
 /// `DBE` of integer, real, or string element kind reaches the conversion and
-/// raises `NoConvert` — `Err` here, which the caller turns into the circuit
-/// reset pvxs performs (see
-/// [`epics_pva_rs::server_native::source::MonitorRequestFatal`]). A BOOLEAN
-/// array does not: `Kind::Bool` never reaches a conversion. (R9-35 — the port
-/// used to serve VALUE|ALARM for every array.)
+/// raises `NoConvert` — `Err` here, which the caller
+/// ([`ChannelSource::check_monitor_request`](epics_pva_rs::server_native::source::ChannelSource::check_monitor_request))
+/// turns into an op-level error reply. pvxs instead lets the throw reset the
+/// whole TCP circuit; that is CBUG-C2 and the port deliberately does not
+/// reproduce it. A BOOLEAN array does not throw: `Kind::Bool` never reaches a
+/// conversion. (R9-35 — the port used to serve VALUE|ALARM for every array.)
 ///
 /// String form mirrors pvxs's "sloppy" substring parse
 /// (singlesource.cpp:122-127): only `VALUE`, `ARCHIVE`, and `ALARM` are

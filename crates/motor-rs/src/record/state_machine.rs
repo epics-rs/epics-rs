@@ -810,11 +810,20 @@ impl MotorRecord {
         self.set_phase(MotionPhase::JogBacklash);
         self.stat.mip = MipFlags::JOG_BL1;
         self.internal.backlash_pending = true;
-        // C 973: CDIR derives from relpos = diff/mres, NOT from the
-        // takeout leg actually dispatched (relbpos/bpos). When the entry
-        // sync ran, relpos is 0 and CDIR reads forward — C verbatim (the
-        // sync at postProcess entry zeroes diff).
-        self.stat.cdir = (self.pos.dval - self.pos.drbv) / self.conv.mres >= 0.0;
+        // CDIR is the sign of the stroke this leg actually commands, in raw
+        // units — the same rule every other leg here follows.
+        //
+        // DEVIATION from C, deliberate — CBUG-B13. C 973 keys CDIR on
+        // `relpos = pmr->diff / pmr->mres`, but the JOG_STOP path reaches it
+        // through the "sync drive to readback" block at C 827-845, whose MIP
+        // predicate forgets to exclude MIP_JOG_STOP and so sets `pmr->diff = 0`
+        // first. `(0 < 0.0)` is false, so C publishes cdir = 1 (forward)
+        // unconditionally — regardless of which way the take-out leg it
+        // dispatches at C 943/945 (toward `dval - bdst`) actually runs. The
+        // sibling arms are self-consistent: MIP_MOVE is excluded from that sync
+        // so its relpos is live, and the fractional-retry arm re-derives relpos
+        // at C 960. Only JOG_STOP keys CDIR on the value it just zeroed.
+        self.stat.cdir = (pretarget - self.pos.drbv) / self.conv.mres >= 0.0;
         if self.use_relative_moves() {
             effects.commands.push(MotorCommand::MoveRelative {
                 distance: pretarget - self.pos.drbv,

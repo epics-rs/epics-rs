@@ -47,10 +47,25 @@ fn test_ai_string_field() {
 fn test_ai_field_list() {
     let rec = AiRecord::default();
     let fields = rec.field_list();
-    assert!(fields.len() >= 24); // 20 base + 4 sim fields
+
+    // The table is generated from `aiRecord.dbd`, so it is in the spec's
+    // declaration order (C's field order) and carries every field the record
+    // type declares — including the ones the framework, not the record, drives.
     assert_eq!(fields[0].name, "VAL");
     assert_eq!(fields[0].dbf_type, DbFieldType::Double);
-    assert_eq!(fields[1].name, "EGU");
+    for declared in ["INP", "EGU", "PREC", "LINR", "SIMM", "SIML", "SIOL"] {
+        assert!(
+            fields.iter().any(|f| f.name == declared),
+            "ai.{declared} is in aiRecord.dbd but not in field_list()"
+        );
+    }
+
+    // LINR is `DBF_MENU menu(menuConvert)`: served as DBR_ENUM *with* its
+    // choices, which is why `caget ai.LINR` on the C IOC answers
+    // "NO CONVERSION" and not "0".
+    let linr = fields.iter().find(|f| f.name == "LINR").unwrap();
+    assert_eq!(linr.dbf_type, DbFieldType::Enum);
+    assert_eq!(linr.menu.unwrap()[0], "NO CONVERSION");
 }
 
 #[test]
@@ -1709,9 +1724,7 @@ fn test_lcnt_zero_after_process() {
 #[test]
 fn test_lcnt_increments_on_reentrance() {
     let mut instance = RecordInstance::new("TEST".into(), AoRecord::new(0.0));
-    instance
-        .processing
-        .store(true, std::sync::atomic::Ordering::Release);
+    instance.enter_pact();
     let _ = instance.process_local().unwrap();
     assert_eq!(instance.common.lcnt, 1);
     let _ = instance.process_local().unwrap();
@@ -1724,9 +1737,7 @@ fn test_lcnt_alarm_threshold() {
     // the attempt whose PRE-increment lcnt equals MAX_LOCK=10 — i.e.
     // the 11th consecutive reentrant attempt, not the 10th.
     let mut instance = RecordInstance::new("TEST".into(), AoRecord::new(0.0));
-    instance
-        .processing
-        .store(true, std::sync::atomic::Ordering::Release);
+    instance.enter_pact();
     for _ in 0..10 {
         let _ = instance.process_local().unwrap();
     }
@@ -1755,9 +1766,7 @@ fn test_lcnt_alarm_posts_exactly_once() {
     // INVALID_ALARM` (dbAccess.c:545-547). The pre-fix guard re-posted
     // the unchanged SEVR/STAT/VAL on every attempt past the threshold.
     let mut instance = RecordInstance::new("TEST".into(), AoRecord::new(0.0));
-    instance
-        .processing
-        .store(true, std::sync::atomic::Ordering::Release);
+    instance.enter_pact();
     for _ in 0..10 {
         let _ = instance.process_local().unwrap();
     }
@@ -1848,11 +1857,7 @@ impl Record for HookTrackingRecord {
         }
     }
     fn field_list(&self) -> &'static [FieldDesc] {
-        static FIELDS: &[FieldDesc] = &[FieldDesc {
-            name: "VAL",
-            dbf_type: DbFieldType::Double,
-            read_only: false,
-        }];
+        static FIELDS: &[FieldDesc] = &[FieldDesc::new("VAL", DbFieldType::Double, false)];
         FIELDS
     }
     fn validate_put(&self, field: &str, _value: &EpicsValue) -> CaResult<()> {

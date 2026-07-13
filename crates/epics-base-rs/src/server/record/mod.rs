@@ -1,6 +1,7 @@
 mod alarm;
 mod common_fields;
 mod constant_link;
+pub mod dbd_generated;
 mod link;
 mod menu_choices;
 mod pini;
@@ -29,12 +30,12 @@ pub use menu_choices::{
 };
 pub use pini::PiniMode;
 pub(crate) use record_instance::value_as_dbr_string;
-pub use record_instance::{AlarmAck, DeferredNotifyPut, NotifyWaitSet, RecordInstance};
+pub use record_instance::{AlarmAck, DeferredNotifyPut, NotifyWaitSet, PactExit, RecordInstance};
 pub use record_trait::{
-    ArrayMonitorPost, CommonFieldPutResult, ConstantInitLink, CyclePostMask,
+    ArrayMonitorPost, Asl, CommonFieldPutResult, ConstantInitLink, CyclePostMask,
     EPICS_TIME_EVENT_DEVICE_TIME, FieldDesc, FieldMetadataOverride, InputFetchPolicy, LinkReadAs,
     OutTarget, ProcessAction, ProcessContext, ProcessOutcome, ProcessSnapshot, RawSoftEntry,
-    Record, RecordProcessResult, SubroutineFn, ValuePostGate, coerce_put_value,
+    Record, RecordProcessResult, Special, SubroutineFn, ValuePostGate, coerce_put_value,
     put_field_internal_default, seed_input_links,
 };
 pub(crate) use record_trait::{AuxPostMask, value_gate};

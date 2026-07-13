@@ -223,7 +223,8 @@ pub fn addressed_request(menu: i32, addr: i32) -> GpibAddressedRequest {
 /// asynGpib.c:140) through `pasynInt32Base->initialize`, which fills in the
 /// asynInt32Base defaults. It is registered for the SRQ interrupt source
 /// (asynGpib.c:620), so asynRecord's I32IV reads 1 on a GPIB port while an
-/// actual read or write reports [`int32_not_supported`].
+/// actual read reports [`int32_read_not_supported`] and an actual write
+/// [`int32_write_not_supported`].
 pub fn gpib_port_capabilities() -> Vec<super::Capability> {
     use super::Capability::*;
     vec![
@@ -231,16 +232,38 @@ pub fn gpib_port_capabilities() -> Vec<super::Capability> {
     ]
 }
 
-/// C's asynInt32Base default read/write for a port that registered `asynInt32`
-/// with a NULL vtable — `writeDefault` (asynInt32Base.c:52-68) and
-/// `readDefault` (:70-86) both set `errorMessage` to "write is not supported"
-/// (the read path's text is a C copy-paste, reproduced here) and return
-/// `asynError`. `getBounds` is the one default that succeeds (low = high = 0),
-/// which is already [`crate::port::PortDriver::get_bounds_int32`]'s default.
-pub fn int32_not_supported() -> crate::error::AsynError {
+/// C's asynInt32Base default WRITE for a port that registered `asynInt32` with a
+/// NULL vtable — `writeDefault` (asynInt32Base.c:52-68) sets `errorMessage` to
+/// "write is not supported" and returns `asynError`. `getBounds` is the one
+/// default that succeeds (low = high = 0), which is already
+/// [`crate::port::PortDriver::get_bounds_int32`]'s default.
+pub fn int32_write_not_supported() -> crate::error::AsynError {
     crate::error::AsynError::Status {
         status: crate::error::AsynStatus::Error,
         message: "write is not supported".into(),
+    }
+}
+
+/// The same default for a READ.
+///
+/// DEVIATION from C, deliberate — CBUG-B10. C's `readDefault`
+/// (asynInt32Base.c:70-86) sets `errorMessage` to **"write is not supported"** —
+/// a copy-paste from the `writeDefault` directly above it — while the
+/// `asynPrint` trace two lines down correctly says "read is not supported". The
+/// two adjacent lines contradict each other, which is what makes it a slip
+/// rather than a convention; the same shape appears in all six `asyn*Base.c`
+/// files (asynEnumBase.c:79, asynFloat64Base.c:78, asynGenericPointerBase.c:77,
+/// asynInt32Base.c:82, asynInt64Base.c:82, asynUInt32DigitalBase.c:91). The
+/// string lands in asynRecord's ERRS field, so an operator debugging a failed
+/// read is told the WRITE is unsupported. It is purely diagnostic — no client
+/// parses it, so this is not a wire contract — but it actively misdirects.
+///
+/// Two functions, not one with a flag: the direction is fixed at the call site,
+/// so a read path cannot reach for the write text.
+pub fn int32_read_not_supported() -> crate::error::AsynError {
+    crate::error::AsynError::Status {
+        status: crate::error::AsynStatus::Error,
+        message: "read is not supported".into(),
     }
 }
 

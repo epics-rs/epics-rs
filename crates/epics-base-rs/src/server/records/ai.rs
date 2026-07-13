@@ -1,8 +1,8 @@
 use crate::error::{CaError, CaResult};
 use crate::server::record::{
-    FieldDesc, MENU_SIMM, ProcessOutcome, RawSoftEntry, Record, ValuePostGate,
+    FieldDesc, MENU_SIMM, ProcessOutcome, RawSoftEntry, Record, ValuePostGate, dbd_generated,
 };
-use crate::types::{DbFieldType, EpicsValue, PvString};
+use crate::types::{EpicsValue, PvString};
 
 /// Analog input record with conversion support.
 /// LINR: 0=NO_CONVERSION, 1=SLOPE, 2=LINEAR
@@ -120,160 +120,6 @@ impl AiRecord {
         }
     }
 }
-
-static FIELDS: &[FieldDesc] = &[
-    FieldDesc {
-        name: "VAL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "EGU",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "HOPR",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LOPR",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "PREC",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "RVAL",
-        dbf_type: DbFieldType::Long,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ORAW",
-        dbf_type: DbFieldType::Long,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "LINR",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "EGUF",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "EGUL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ESLO",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "EOFF",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ROFF",
-        dbf_type: DbFieldType::Long,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ASLO",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "AOFF",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SMOO",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ADEL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "MDEL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "AFTC",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        // aiRecord.dbd.pod: AFVL is special(SPC_NOMOD) — read-only to clients.
-        name: "AFVL",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "LALM",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "ALST",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "MLST",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "INIT",
-        dbf_type: DbFieldType::Char,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "SIMM",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIML",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIOL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIMS",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SDLY",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SVAL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-];
 
 impl Record for AiRecord {
     fn record_type(&self) -> &'static str {
@@ -656,7 +502,7 @@ impl Record for AiRecord {
     }
 
     fn field_list(&self) -> &'static [FieldDesc] {
-        FIELDS
+        dbd_generated::AI_FIELDS
     }
 
     /// `SIMM` is `DBF_MENU menu(menuSimm)` (`aiRecord.dbd.pod`): the analog

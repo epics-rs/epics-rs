@@ -128,6 +128,69 @@ pub struct DeferredNotifyPut {
     pub completion: crate::runtime::sync::oneshot::Sender<()>,
 }
 
+/// The PACT→idle transition, as a value.
+///
+/// # Invariant
+///
+/// `RecordInstance::deferred_notify_put.is_some()` ⟹ PACT is held. A
+/// put-notify is parked ONLY on the `is_processing()` arm of the put entry
+/// ([`RecordInstance::park_notify_put`]), and PACT can be released ONLY by
+/// [`RecordInstance::leave_pact`], which takes the park with it. So the
+/// deferral cannot outlive the PACT window it was parked in — the strand is
+/// unrepresentable rather than guarded against.
+///
+/// The token is `#[must_use]`: a release site cannot silently drop the parked
+/// put. Its single consumer is `PvDatabase::apply_pact_exit`, called from the
+/// released cycle's `recGblFwdLink` tail — C `recGbl.c:295` (`if (pdbc->ppn)
+/// dbNotifyCompletion(pdbc)`), which is where C queues the restart callback
+/// (`dbNotify.c:466-469`, state `notifyRestartInProgress`). Holding the token
+/// to the tail rather than replaying at the `pact = FALSE` store is what keeps
+/// the replay behind the rest of the cycle, exactly as C's queued callback is.
+#[must_use = "a put-notify parked on this record is stranded unless the PactExit \
+              reaches PvDatabase::apply_pact_exit"]
+pub struct PactExit(Option<DeferredNotifyPut>);
+
+impl Drop for PactExit {
+    /// Last-resort canary. Every release site hands its token to
+    /// `PvDatabase::apply_pact_exit`; a token reaching here still holding a
+    /// parked put means a PACT release path was added without a tail. The
+    /// client is not left hanging (dropping `completion` errors its receiver),
+    /// but the put's value IS lost, so say so.
+    fn drop(&mut self) {
+        if self.0.is_some() {
+            tracing::error!(
+                "PactExit dropped with a put-notify still parked: a PACT release \
+                 path is not routed through PvDatabase::apply_pact_exit"
+            );
+        }
+    }
+}
+
+impl PactExit {
+    /// The put-notify this release freed, if one was parked.
+    pub(crate) fn into_deferred(mut self) -> Option<DeferredNotifyPut> {
+        self.0.take()
+    }
+
+    /// Fold two releases of the same cycle into one token.
+    ///
+    /// A simulated SDLY continuation releases PACT inside `check_simulation_mode`
+    /// and again at the `is_continuation` arm; the second release finds PACT
+    /// already clear and carries nothing, because the first took the park.
+    pub(crate) fn merge(mut self, mut other: PactExit) -> PactExit {
+        debug_assert!(
+            self.0.is_none() || other.0.is_none(),
+            "a parked put-notify can be released only once per cycle"
+        );
+        PactExit(self.0.take().or_else(|| other.0.take()))
+    }
+
+    /// A cycle that released no PACT (and therefore freed no put-notify).
+    pub(crate) fn none() -> PactExit {
+        PactExit(None)
+    }
+}
+
 /// Cached metadata for a record.
 ///
 /// Stores the result of `populate_display_info` / `populate_control_info` /
@@ -368,8 +431,15 @@ pub struct RecordInstance {
     pub device: Option<Box<dyn super::super::device_support::DeviceSupport>>,
     // Subroutine (for sub records)
     pub subroutine: Option<Arc<SubroutineFn>>,
-    // Re-entrancy guard
-    pub processing: AtomicBool,
+    /// PACT (C `precord->pact`) — the re-entrancy guard, and the record's
+    /// "busy" state for every put that lands on it.
+    ///
+    /// PRIVATE by construction: entered through [`RecordInstance::enter_pact`]
+    /// and released ONLY through [`RecordInstance::leave_pact`], which hands
+    /// back the [`PactExit`] carrying any put-notify parked on this PACT window.
+    /// A `pact.store(false)` open-coded at a release site is what stranded the
+    /// deferral on the ODLY/SDLY paths; it is no longer expressible.
+    pact: AtomicBool,
     // Put-notify wait-set this record currently belongs to (C
     // `precord->ppn`). Set when the record joins an active put-notify
     // (originating put target, or a FLNK/OUT PP target via `dbNotifyAdd`);
@@ -384,7 +454,11 @@ pub struct RecordInstance {
     /// the async cycle completes. See [`DeferredNotifyPut`] and
     /// `PvDatabase::restart_deferred_notify_put`, the single owner that applies
     /// it. `None` outside that window.
-    pub deferred_notify_put: Option<DeferredNotifyPut>,
+    ///
+    /// PRIVATE, and paired with [`Self::pact`] by the [`PactExit`] invariant:
+    /// parked only by [`Self::park_notify_put`] (reachable only from the
+    /// PACT arm of the put entry), taken only by [`Self::leave_pact`].
+    deferred_notify_put: Option<DeferredNotifyPut>,
     /// The value of each subscribed field as ALREADY PUBLISHED to that
     /// field's `DBE_VALUE`/`DBE_LOG` subscribers. The generic
     /// change-detection loop in every snapshot builder posts a field only
@@ -591,7 +665,7 @@ impl RecordInstance {
             parsed_tsel: ParsedLink::None,
             device: None,
             subroutine: None,
-            processing: AtomicBool::new(false),
+            pact: AtomicBool::new(false),
             notify: None,
             deferred_notify_put: None,
             last_posted: HashMap::new(),
@@ -630,12 +704,25 @@ impl RecordInstance {
     /// severity goes away on its first process.
     ///
     /// `name` is used only for the init-failure diagnostics C sends to errlog.
-    pub fn run_init_passes(&mut self, name: &str) {
-        // C's `precord->pact = FALSE` — the port's PACT is the `processing`
-        // flag, released by the process owner; a record cannot be mid-process
-        // at init, so nothing to reset.
-        self.processing
-            .store(false, std::sync::atomic::Ordering::Release);
+    ///
+    /// Crate-private on purpose: the passes must run against the record's FINAL
+    /// loaded field set (the initial UDF severity is a function of UDF/STAT/
+    /// UDFS, and a `.db` `field(VAL,…)` clears UDF at load — C
+    /// `dbStaticLib.c:2653-2661`). The one caller is the creation sink,
+    /// [`crate::server::database::PvDatabase::add_loaded_record`], which takes
+    /// the load and the record together so no path can init a half-loaded
+    /// record.
+    pub(crate) fn run_init_passes(&mut self, name: &str) {
+        // C's `precord->pact = FALSE` — a record cannot be mid-process at init,
+        // so this release provably frees nothing: no client put has run, so the
+        // `PactExit` invariant (`deferred_notify_put.is_some()` ⟹ PACT) makes a
+        // parked put-notify here unreachable.
+        let deferred = self.leave_pact().into_deferred();
+        debug_assert!(
+            deferred.is_none(),
+            "a record cannot hold a parked put-notify at init"
+        );
+        drop(deferred);
         if self.common.udf && self.common.stat == crate::server::recgbl::alarm_status::UDF_ALARM {
             self.common.sevr = self.common.udfs;
         }
@@ -867,7 +954,54 @@ impl RecordInstance {
 
     /// Check if the record is currently processing (PACT equivalent).
     pub fn is_processing(&self) -> bool {
-        self.processing.load(std::sync::atomic::Ordering::Acquire)
+        self.pact.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// C `prec->pact = TRUE` — the record goes busy for an async device
+    /// round-trip, an SDLY simulation defer, or an ODLY reprocess window.
+    pub fn enter_pact(&self) {
+        self.pact.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// C `prec->pact = FALSE` — the ONLY release of PACT.
+    ///
+    /// Every PACT→idle transition takes the put-notify parked on that window
+    /// with it (C `dbNotifyCompletion`, reached from `recGblFwdLink` on every
+    /// path that ends a cycle). The returned [`PactExit`] is `#[must_use]`, so
+    /// a release site cannot strand the deferral the way the open-coded
+    /// `processing.store(false)` at the ODLY continuation and the three SIM/SDLY
+    /// releases did.
+    pub fn leave_pact(&mut self) -> PactExit {
+        self.pact.store(false, std::sync::atomic::Ordering::Release);
+        PactExit(self.deferred_notify_put.take())
+    }
+
+    /// True when a put-notify already owns this record — an in-flight wait-set
+    /// (C `precord->ppn`) or a park from a previous PACT arm. C
+    /// `processNotifyCommon` (dbNotify.c:213-217) queues a second notify on the
+    /// record's restart list; the port refuses it (`S_db_Blocked` /
+    /// `ECA_PUTCBINPROG`) — see [`Self::park_notify_put`].
+    pub fn put_notify_busy(&self) -> bool {
+        self.notify.is_some() || self.deferred_notify_put.is_some()
+    }
+
+    /// Park a put-notify that landed on a PACT record (C `processNotifyCommon`,
+    /// dbNotify.c:225-231). `Err(put)` hands the put back when another
+    /// put-notify already owns the record.
+    ///
+    /// The [`PactExit`] invariant — `deferred_notify_put.is_some()` ⟹ PACT —
+    /// is established here: this is the only park, and it is only reachable
+    /// from the caller's `is_processing()` arm.
+    pub fn park_notify_put(&mut self, put: DeferredNotifyPut) -> Result<(), DeferredNotifyPut> {
+        debug_assert!(
+            self.is_processing(),
+            "a put-notify may be parked only on a PACT record"
+        );
+        if self.put_notify_busy() {
+            return Err(put);
+        }
+        self.deferred_notify_put = Some(put);
+        Ok(())
     }
 
     /// Unified field resolution: record fields → common fields → virtual fields.
@@ -910,9 +1044,25 @@ impl RecordInstance {
     /// ([`Record::menu_field_choices`](super::record_trait::Record::menu_field_choices)),
     /// else a shared menu keyed by field name
     /// ([`shared_menu_choices`](super::menu_choices::shared_menu_choices)).
+    /// The choices a `menu()` field serves as its `DBR_ENUM` labels.
+    ///
+    /// The `.dbd` declaration is the first and best answer: a generated
+    /// [`FieldDesc`] carries the field's own `menu(...)` choices, which is what
+    /// C's `dbGetFieldIndex` -> `pamapdbfType` -> menu lookup resolves. The two
+    /// hand-maintained fallbacks below are for record types still on a
+    /// hand-written table; they go away with the last of them.
+    ///
+    /// `shared_menu_choices` in particular keys on the field NAME alone, across
+    /// every record type — which is only correct while no two record types give
+    /// the same field name different menus. Asking the field's own descriptor
+    /// first removes that assumption.
     fn menu_choices_for(&self, field: &str) -> Option<&'static [&'static str]> {
         self.record
-            .menu_field_choices(field)
+            .field_list()
+            .iter()
+            .find(|f| f.name.eq_ignore_ascii_case(field))
+            .and_then(|f| f.menu)
+            .or_else(|| self.record.menu_field_choices(field))
             .or_else(|| super::menu_choices::shared_menu_choices(field))
     }
 
@@ -1622,13 +1772,7 @@ impl RecordInstance {
             "DISP" => Some(EpicsValue::Char(if self.common.disp { 1 } else { 0 })),
             "PUTF" => Some(EpicsValue::Char(if self.common.putf { 1 } else { 0 })),
             "RPRO" => Some(EpicsValue::Char(if self.common.rpro { 1 } else { 0 })),
-            "PACT" => Some(EpicsValue::Char(
-                if self.processing.load(std::sync::atomic::Ordering::Acquire) {
-                    1
-                } else {
-                    0
-                },
-            )),
+            "PACT" => Some(EpicsValue::Char(if self.is_processing() { 1 } else { 0 })),
             "PROC" => Some(EpicsValue::Char(0)), // Always 0 (trigger-only)
             // Analog alarm fields
             "HIHI" => self
@@ -1699,7 +1843,7 @@ impl RecordInstance {
     /// `motorRecord`/`scalerRecord`, or its own `process`). Arming the
     /// framework path for those too would write the link twice per cycle.
     fn record_declares_field(&self, name: &str) -> bool {
-        self.record.field_list().iter().any(|f| f.name == name)
+        self.record.implements_field(name)
     }
 
     /// Set a common field value from a runtime `dbPut` (CA/PVA/`dbpf`/link).
@@ -2750,8 +2894,27 @@ impl RecordInstance {
             // cycle — DBE_VALUE, then DBE_LOG. Making this an `else if` on
             // `changed` dropped the DBE_LOG half exactly when it matters: a
             // DBE_LOG-only archiver would never receive the final counts.
+            //
+            // The sweep carries the ALARM-transition bits too. DEVIATION from C,
+            // deliberate — CBUG-B19. C's `monitor()` opens with
+            // `monitor_mask = recGblResetAlarms(pscal); monitor_mask |=
+            // (DBE_VALUE|DBE_LOG);` and then posts with a LITERAL `DBE_LOG`
+            // (scalerRecord.c:764-771) — `monitor_mask` is assigned, OR-ed, and
+            // never read. Those two lines are dead, and their only plausible use
+            // was as the third `db_post_events` argument.
+            // `recGblResetAlarms` returns the alarm-transition mask that every
+            // other record ORs into its value posts, so discarding it drops the
+            // alarm bit: a client subscribed to `Sn` with DBE_ALARM receives
+            // NOTHING on an alarm-severity transition of the record.
+            //
+            // The DBE_VALUE half of C's dead `|=` is deliberately NOT
+            // resurrected: this sweep is unconditional, so adding VALUE would
+            // fire a value event at every VALUE subscriber on every idle scan,
+            // changed or not — that would be a new defect, not a fix. The value
+            // path is separately served by the change post (C's `updateCounts()`
+            // DBE_VALUE at `:582`).
             if log_swept.contains(&field.as_str()) {
-                sub_updates.push((field.clone(), val, EventMask::LOG));
+                sub_updates.push((field.clone(), val, EventMask::LOG | alarm_bits));
             }
         }
         for (field, val, _) in &sub_updates {
@@ -2781,10 +2944,7 @@ impl RecordInstance {
         use crate::server::recgbl::{self, EventMask};
         const LCNT_ALARM_THRESHOLD: i16 = 10;
 
-        if self
-            .processing
-            .swap(true, std::sync::atomic::Ordering::AcqRel)
-        {
+        if self.pact.swap(true, std::sync::atomic::Ordering::AcqRel) {
             // C `dbProcess` PACT-active guard (dbAccess.c:544-557):
             //
             //   if ((precord->stat == SCAN_ALARM) ||
@@ -2859,11 +3019,23 @@ impl RecordInstance {
             return Ok((ProcessSnapshot { changed_fields }, Vec::new()));
         }
         self.common.lcnt = 0;
-        // RAII guard that resets `self.processing` to false on drop —
-        // both for the normal exit path and for any `?` early return.
-        // The guard holds a raw pointer rather than a reference because
-        // we still need `self` mutably while the guard is alive (the
-        // record body below mutates other `self` fields).
+        // RAII guard that resets `self.pact` to false on drop — both for the
+        // normal exit path and for any `?` early return. The guard holds a raw
+        // pointer rather than a reference because we still need `self` mutably
+        // while the guard is alive (the record body below mutates other `self`
+        // fields).
+        //
+        // This is the one PACT release that does not go through `leave_pact`,
+        // and it provably frees nothing: `process_local` holds `&mut self` for
+        // the whole PACT window, and a put-notify is parked only through
+        // `park_notify_put`, which needs that same `&mut`. So no deferral can
+        // be created inside the window, and the `swap(true)` above proved none
+        // existed on entry (`deferred_notify_put.is_some()` ⟹ PACT).
+        debug_assert!(
+            self.deferred_notify_put.is_none(),
+            "PactExit invariant: a parked put-notify implies PACT, which the \
+             swap above proved was clear"
+        );
         struct ProcessGuard(*const AtomicBool);
         // SAFETY: AtomicBool is Sync; raw pointers don't auto-derive
         // Send. We hand-roll Send because the ptr targets a field of
@@ -2875,7 +3047,7 @@ impl RecordInstance {
         impl Drop for ProcessGuard {
             fn drop(&mut self) {
                 // SAFETY: `self.0` was constructed from
-                // `&self.processing as *const AtomicBool` below, where
+                // `&self.pact as *const AtomicBool` below, where
                 // `self` is the live RecordInstance whose lifetime
                 // strictly outlives `_guard`. RecordInstance is
                 // !Unpin-equivalent in practice (we never move it
@@ -2884,7 +3056,7 @@ impl RecordInstance {
                 unsafe { &*self.0 }.store(false, std::sync::atomic::Ordering::Release);
             }
         }
-        let _guard = ProcessGuard(&self.processing as *const AtomicBool);
+        let _guard = ProcessGuard(&self.pact as *const AtomicBool);
 
         // Call subroutine if registered (for sub/aSub records). Single owner
         // shared with the main engine path — see `run_registered_subroutine`.
@@ -4604,10 +4776,15 @@ mod metadata_cache_tests {
             "unchanged non-swept S2 must not re-post: {:?}",
             names(&snap1)
         );
+        // DBE_LOG, plus the DBE_ALARM of this cycle's transition: a record
+        // starts UDF/INVALID and its first process clears that, so cycle 1 IS an
+        // alarm transition (CBUG-B19 — C's sweep drops the alarm bit; this
+        // assertion used to require a bare DBE_LOG). No DBE_VALUE either way:
+        // the counts have not moved.
         assert_eq!(
             mask_of(&snap1, "S1").unwrap().bits(),
-            EventMask::LOG.bits(),
-            "idle sweep posts DBE_LOG only (no DBE_VALUE)"
+            (EventMask::LOG | EventMask::ALARM).bits(),
+            "idle sweep posts DBE_LOG + the alarm transition, never DBE_VALUE"
         );
 
         // Cycle 2: S1's count changed. Change-detection delivers it, and the
@@ -4644,6 +4821,132 @@ mod metadata_cache_tests {
             mask_of(&snap3, "S1").unwrap().bits(),
             EventMask::LOG.bits(),
             "unchanged-again S1 returns to the DBE_LOG-only sweep"
+        );
+    }
+
+    /// A log-swept record that can raise an alarm on demand — the scaler's
+    /// `do_alarm()` (scalerRecord.c:745-755) in miniature.
+    struct AlarmingLogSweepRecord {
+        s1: i32,
+        alarm: bool,
+    }
+
+    impl Record for AlarmingLogSweepRecord {
+        fn record_type(&self) -> &'static str {
+            "scaler"
+        }
+        fn process(&mut self) -> CaResult<crate::server::record::ProcessOutcome> {
+            Ok(crate::server::record::ProcessOutcome::complete())
+        }
+        fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
+            if self.alarm {
+                crate::server::recgbl::rec_gbl_set_sevr(
+                    common,
+                    crate::server::recgbl::alarm_status::UDF_ALARM,
+                    crate::server::record::AlarmSeverity::Invalid,
+                );
+            }
+        }
+        fn get_field(&self, name: &str) -> Option<EpicsValue> {
+            match name {
+                "S1" => Some(EpicsValue::Long(self.s1)),
+                _ => None,
+            }
+        }
+        fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
+            match (name, value) {
+                ("S1", EpicsValue::Long(v)) => {
+                    self.s1 = v;
+                    Ok(())
+                }
+                _ => Err(CaError::FieldNotFound(name.to_string())),
+            }
+        }
+        fn field_list(&self) -> &'static [crate::server::record::FieldDesc] {
+            &[]
+        }
+        fn log_swept_fields(&self) -> &'static [&'static str] {
+            &["S1"]
+        }
+        fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+            Some(self)
+        }
+    }
+
+    /// CBUG-B19 — the sweep post carries the alarm-transition bits.
+    ///
+    /// DEVIATION from C, deliberate. C's scaler `monitor()` computes
+    /// `monitor_mask = recGblResetAlarms(pscal)` (scalerRecord.c:764), ORs
+    /// `DBE_VALUE|DBE_LOG` into it (`:766`), and then posts every `Sn` with a
+    /// LITERAL `DBE_LOG` (`:771`) — `monitor_mask` is assigned, OR-ed, and never
+    /// read. The alarm bit that `recGblResetAlarms` returns is exactly what every
+    /// other record ORs into its value posts, so C drops it: a client subscribed
+    /// to `Sn` with DBE_ALARM receives NOTHING on a severity transition.
+    ///
+    /// The DBE_VALUE half of C's dead `|=` is deliberately not resurrected — the
+    /// sweep is unconditional, so a VALUE bit here would fire a value event on
+    /// every idle scan whether or not the counts moved. The first assertion pins
+    /// that.
+    #[test]
+    fn b19_log_swept_field_carries_the_alarm_transition_bits() {
+        use crate::server::recgbl::EventMask;
+        let mut inst = RecordInstance::new(
+            "SW".to_string(),
+            AlarmingLogSweepRecord {
+                s1: 7,
+                alarm: false,
+            },
+        );
+        let _s1_rx = inst
+            .add_subscriber(
+                "S1",
+                1,
+                crate::types::DbFieldType::Long,
+                (EventMask::LOG | EventMask::ALARM).bits(),
+            )
+            .expect("S1 subscriber");
+        let mask_of = |snap: &ProcessSnapshot, f: &str| {
+            snap.changed_fields
+                .iter()
+                .find(|(n, _, _)| n == f)
+                .map(|(_, _, m)| *m)
+        };
+
+        // Cycle 1 clears the record's initial UDF/INVALID alarm, which is itself
+        // a transition; cycle 2 is the quiet baseline. The sweep is then DBE_LOG
+        // alone — in particular NOT DBE_VALUE, since the counts have not moved.
+        let _ = inst.process_local().unwrap();
+        let (snap1, _) = inst.process_local().unwrap();
+        assert_eq!(
+            mask_of(&snap1, "S1").unwrap().bits(),
+            EventMask::LOG.bits(),
+            "no alarm transition → the sweep is DBE_LOG only"
+        );
+
+        // The alarm fires: severity moves NO_ALARM → INVALID, so this cycle's
+        // posts carry DBE_ALARM. C posts DBE_LOG here and the alarm subscriber
+        // learns nothing.
+        if let Some(r) = inst
+            .record
+            .as_any_mut()
+            .and_then(|a| a.downcast_mut::<AlarmingLogSweepRecord>())
+        {
+            r.alarm = true;
+        }
+        let (snap2, _) = inst.process_local().unwrap();
+        assert_eq!(
+            mask_of(&snap2, "S1").unwrap().bits(),
+            (EventMask::LOG | EventMask::ALARM).bits(),
+            "the severity transition must reach the swept field (C drops it)"
+        );
+
+        // Severity stays INVALID: no transition, so no alarm bit — the sweep is
+        // DBE_LOG again.
+        let (snap3, _) = inst.process_local().unwrap();
+        assert_eq!(
+            mask_of(&snap3, "S1").unwrap().bits(),
+            EventMask::LOG.bits(),
+            "a steady severity is not a transition"
         );
     }
 

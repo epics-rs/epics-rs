@@ -1,0 +1,12 @@
+# Generated file menuGlobal.dbd
+
+include "menuAlarmSevr.dbd"
+include "menuAlarmStat.dbd"
+include "menuFtype.dbd"
+include "menuIvoa.dbd"
+include "menuOmsl.dbd"
+include "menuPini.dbd"
+include "menuPost.dbd"
+include "menuPriority.dbd"
+include "menuYesNo.dbd"
+include "menuSimm.dbd"

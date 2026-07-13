@@ -58,7 +58,7 @@ fn cmd_echo() -> CommandDef {
         |args: &[ArgValue], ctx: &CommandContext| {
             match &args[0] {
                 ArgValue::String(s) => {
-                    ctx.println(&crate::runtime::epics_string::raw_from_escaped(s))
+                    ctx.println_bytes(&crate::runtime::epics_string::raw_from_escaped(s))
                 }
                 _ => ctx.println(""),
             }

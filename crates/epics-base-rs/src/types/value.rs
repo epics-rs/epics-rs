@@ -1302,6 +1302,27 @@ impl EpicsValue {
         }
     }
 
+    /// Parse a `.db` field value into an EpicsValue of the given type — the
+    /// BYTE-STRING form, which is what a `.db` value actually is.
+    ///
+    /// A `DBF_STRING` is a byte string with a 40-byte budget, not a sequence of
+    /// characters: C's escape translation writes ONE byte per `\xHH`
+    /// (`epicsString.c:106`, `OUT(u)` into a `char`), so `field(VAL,"h\xffz")`
+    /// is the three bytes `h`, `0xFF`, `z` — measured on softIoc, where `dbgf`
+    /// prints `"h\xffz"` (one escape, not the `\xc3\xbf` a UTF-8 encoding of
+    /// U+00FF would print). Going through [`Self::parse`] would force the value
+    /// through a Rust `String` and turn that one byte into two.
+    ///
+    /// Every other DBF type is a number or a menu label — ASCII by
+    /// construction, and a byte outside ASCII is a parse error either way — so
+    /// they are handed to [`Self::parse`] unchanged.
+    pub fn parse_bytes(dbr_type: DbFieldType, bytes: &[u8]) -> CaResult<Self> {
+        if dbr_type == DbFieldType::String {
+            return Ok(Self::String(PvString::from_bytes(bytes.trim_ascii())));
+        }
+        Self::parse(dbr_type, &String::from_utf8_lossy(bytes))
+    }
+
     /// Parse a string value into an EpicsValue of the given type
     pub fn parse(dbr_type: DbFieldType, s: &str) -> CaResult<Self> {
         // C EPICS treats empty/whitespace strings as zero for numeric fields

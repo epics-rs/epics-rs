@@ -99,6 +99,59 @@ pub(crate) fn c_long(x: f64) -> i64 {
     crate::types::c_cast::f64_to_i64(x)
 }
 
+/// `NINT` — round half away from zero, and **do not narrow**.
+///
+/// **DEVIATION from C, deliberate — CBUG-A2.** All three engines narrow the
+/// rounded double with a bare cast before pushing it back onto a `double` stack:
+/// base `(epicsInt32)(top >= 0 ? top+0.5 : top-0.5)` (`calcPerform.c:290-293`),
+/// sCalc `(long)` (`sCalcPerform.c:716-719`), aCalc `(long)` (`aCalcPerform.c:827`).
+/// Out of the destination's range that cast is undefined; on x86-64 it yields
+/// `cvttsd2si`'s indefinite value, so C answers `NINT(3e9) = -2147483648` and
+/// `NINT(NaN) = -2147483648`.
+///
+/// The narrowing serves no purpose here — the operand and the result are both
+/// `double`, the documented contract is "nearest integer"
+/// (`calcRecord.dbd.pod`), and C's own `d2i` comment (`:313-322`) says
+/// out-of-range double→int conversions "give very different results on different
+/// systems", which is why every sibling bitwise op was routed through a guard
+/// that NINT and MODULO never got. We round and stop: `NINT(3e9)` is `3e9`,
+/// `NINT(NaN)` is `NaN`, `NINT(inf)` is `inf`. Inside `[i32::MIN, i32::MAX]` this
+/// is bit-identical to C, which is every value a calc record actually rounds.
+///
+/// C's `(x >= 0 ? x+0.5 : x-0.5)` then truncate-toward-zero IS the rounding rule;
+/// only the width is dropped.
+#[inline]
+pub(crate) fn nint(x: f64) -> f64 {
+    if x.is_nan() {
+        x
+    } else if x >= 0.0 {
+        (x + 0.5).floor()
+    } else {
+        (x - 0.5).ceil()
+    }
+}
+
+/// `MODULO` — truncate both operands toward zero, then take the remainder,
+/// **without narrowing to an integer type**.
+///
+/// **DEVIATION from C, deliberate — CBUG-A2.** C narrows the dividend and the
+/// divisor with a bare cast first (base `(epicsInt32)`, `calcPerform.c:162-164`;
+/// sCalc `(int)`/`(long)`; aCalc `(int)`), so `3e9 % 7` is `INT_MIN % 7 = -2`
+/// instead of `4`, and the answer changes with the CPU. `f64`'s remainder is the
+/// same truncated remainder C's integer `%` computes, exactly, for every operand
+/// pair inside the cast's range — and it stays correct outside it.
+///
+/// This also removes the UB dividend that made CBUG-A1 (`INT_MIN % -1` SIGFPE)
+/// reachable at all.
+///
+/// The caller keeps its own engine's zero-divisor rule (base NaN, sCalc error,
+/// aCalc `myMAXFLOAT`) — that part of C is not a bug. The divisor is zero
+/// exactly when it truncates to zero, as in C.
+#[inline]
+pub(crate) fn imod(a: f64, b: f64) -> f64 {
+    a.trunc() % b.trunc()
+}
+
 /// `(epicsInt32)x` where the value is already known to be in `epicsUInt32`
 /// range — the tail of `d2i`/`d2ui`, i.e. a modular reduction, NOT a C cast.
 /// Private on purpose: an operator that wants a C cast wants [`c_int`].

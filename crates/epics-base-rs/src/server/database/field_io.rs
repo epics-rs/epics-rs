@@ -260,11 +260,23 @@ fn dbput_request(
     if value.is_empty_array() && !dest_is_array {
         return Ok(PutRequest::EmptyIntoScalar);
     }
+    // The coercion target is the type the record STORES, not the type it
+    // SERVES — `put_field`'s arms match on what is stored. A `menu()` field is
+    // declared `DBF_MENU` and served as `DBR_ENUM` with its choices, but held as
+    // a bare `Short` choice index; coercing an incoming `Short` up to `Enum`
+    // because the `.dbd` says `DBF_MENU` would make its `Short` arm unreachable.
+    // Same rule as `put_field_internal_default` and `db_loader::apply_fields`.
+    // The `.dbd` type is the fallback for a field with no current value.
     let target = record
-        .field_list()
-        .iter()
-        .find(|f| f.name.eq_ignore_ascii_case(field))
-        .map(|f| f.dbf_type);
+        .get_field(field)
+        .map(|v| v.db_field_type())
+        .or_else(|| {
+            record
+                .field_list()
+                .iter()
+                .find(|f| f.name.eq_ignore_ascii_case(field))
+                .map(|f| f.dbf_type)
+        });
 
     // C `dbPut` clamps the request to the destination's element count —
     // `if (no_elements < nRequest) nRequest = no_elements;` (dbAccess.c:1359),
@@ -1085,43 +1097,6 @@ impl PvDatabase {
             .map(|_| ())
     }
 
-    /// C `processNotifyCommon`'s PACT arm (dbNotify.c:225-231): the put-notify
-    /// landed on a busy record, so the WHOLE put is deferred — no value
-    /// written, no RPRO raised, no join of the in-flight cycle's wait-set (that
-    /// join is what completed the callback an entire cycle too early). The
-    /// record's async completion replays it through
-    /// [`Self::restart_deferred_notify_put`].
-    ///
-    /// A second put-notify onto a record that already owns one is C's
-    /// "another processNotify owns the record" (dbNotify.c:213-217); the port
-    /// reports it to the client as `PutCallbackInProgress` (C `S_db_Blocked` /
-    /// `ECA_PUTCBINPROG`) rather than queueing a restart list.
-    async fn defer_notify_put(
-        &self,
-        record_name: &str,
-        rec: &std::sync::Arc<crate::runtime::sync::RwLock<crate::server::record::RecordInstance>>,
-        field: String,
-        value: EpicsValue,
-        notify_request: NotifyRequest,
-    ) -> CaResult<Option<crate::runtime::sync::oneshot::Receiver<()>>> {
-        let Some((completion, completion_rx)) = notify_request.into_completion() else {
-            // Fire-and-forget never reaches here: `dbPutField` on a PACT record
-            // DOES write the value and set RPRO (dbAccess.c:1263-1277). Only
-            // `dbPutNotify` defers.
-            return Ok(None);
-        };
-        let mut guard = rec.write().await;
-        if guard.notify.is_some() || guard.deferred_notify_put.is_some() {
-            return Err(CaError::PutCallbackInProgress(record_name.to_string()));
-        }
-        guard.deferred_notify_put = Some(crate::server::record::DeferredNotifyPut {
-            field,
-            value,
-            completion,
-        });
-        Ok(completion_rx)
-    }
-
     /// Process a record UNCONDITIONALLY with a put-notify wait-set, returning
     /// the completion receiver — the QSRV `record[process=true,block=true]`
     /// (Force + block) barrier.
@@ -1315,88 +1290,109 @@ impl PvDatabase {
             // after the DISP gate above and before the PROC-driven process
             // below. One gate owner for every route ([`check_no_mod`]).
             check_no_mod(&instance, &field)?;
+        }
 
-            // C `processNotifyCommon` (dbNotify.c:225-231) tests PACT ABOVE the
-            // put — `if (precord->pact) { ... pnotify->state =
-            // notifyRestartCallbackRequested; ... return; }` — so a put-notify
-            // that lands on a busy record writes NOTHING: no value, no RPRO, no
-            // join of the in-flight cycle's wait-set. The whole put is replayed
-            // from `dbNotifyCompletion` when the record goes idle. Joining the
-            // running cycle instead completed the callback one cycle early, on
-            // work that never saw this value.
-            //
-            // A fire-and-forget `dbPutField` is NOT deferred: it writes and
-            // raises RPRO (dbAccess.c:1263-1277). Only the notify route waits.
-            if want_notify && instance.is_processing() {
-                drop(instance);
-                return self
-                    .defer_notify_put(record_name, &rec, field, value, notify_request)
-                    .await;
+        // C `processNotifyCommon` (dbNotify.c:225-231) tests PACT ABOVE the
+        // put — `if (precord->pact) { ... pnotify->state =
+        // notifyRestartCallbackRequested; ... return; }` — so a put-notify that
+        // lands on a busy record writes NOTHING: no value, no RPRO, no join of
+        // the in-flight cycle's wait-set. The whole put is replayed by the
+        // `PactExit` the record's PACT release hands to its `recGblFwdLink`
+        // tail (C `dbNotifyCompletion`). Joining the running cycle instead
+        // completed the callback one cycle early, on work that never saw this
+        // value.
+        //
+        // The PACT test and the park are ONE critical section (C holds
+        // `dbScanLock` across both): a park on a record that left PACT in
+        // between would sit in a slot no PACT release will ever take, which is
+        // precisely the strand the `PactExit` invariant forbids. A record that
+        // goes idle in the window falls through and takes the put the ordinary
+        // way.
+        //
+        // A second put-notify onto a record that already owns one is C's
+        // "another processNotify owns the record" (dbNotify.c:213-217); the port
+        // reports it to the client as `PutCallbackInProgress` (C `S_db_Blocked`
+        // / `ECA_PUTCBINPROG`) rather than queueing a restart list.
+        //
+        // A fire-and-forget `dbPutField` is NOT deferred: it writes and raises
+        // RPRO (dbAccess.c:1263-1277). Only the notify route waits.
+        if want_notify {
+            let mut guard = rec.write().await;
+            if guard.is_processing() {
+                let Some((completion, completion_rx)) = notify_request.into_completion() else {
+                    // Unreachable: `want_notify` is exactly "this request
+
+                    // carries a completion".
+                    return Ok(None);
+                };
+                guard
+                    .park_notify_put(crate::server::record::DeferredNotifyPut {
+                        field,
+                        value,
+                        completion,
+                    })
+                    .map_err(|_| CaError::PutCallbackInProgress(record_name.to_string()))?;
+                return Ok(completion_rx);
             }
+        }
 
-            // PROC intercept: trigger processing on any SCAN.
-            // Falls through to the put_notify_tx registration below
-            // so async records (motor, asyn-backed AO) signal real
-            // completion; otherwise WRITE_NOTIFY would return ECA_NORMAL
-            // before the device move actually finished.
-            if field == "PROC" {
-                // C `dbPutField` (dbAccess.c:1265) matches the proc field by
-                // pointer with NO value check: any write to PROC — including
-                // 0 — processes the record (when !pact). The standard
-                // `caput REC.PROC 0` / `dbpf REC.PROC 0` force-process idiom
-                // must therefore not be skipped for a zero value.
-                drop(instance);
-                // Continue to the put-notify setup + process below
-                // by jumping past the field-write step (the value
-                // itself isn't stored; PROC is a trigger). A
-                // fire-and-forget caller parks nothing — C `dbPutField`
-                // on PROC processes the record with no putNotify.
-                let parked = if let Some((completion_tx, completion_rx)) =
-                    notify_request.into_completion()
+        // PROC intercept: trigger processing on any SCAN.
+        // Falls through to the put_notify_tx registration below
+        // so async records (motor, asyn-backed AO) signal real
+        // completion; otherwise WRITE_NOTIFY would return ECA_NORMAL
+        // before the device move actually finished.
+        //
+        // C `dbPutField` (dbAccess.c:1265) matches the proc field by pointer
+        // with NO value check: any write to PROC — including 0 — processes the
+        // record (when !pact). The standard `caput REC.PROC 0` / `dbpf REC.PROC
+        // 0` force-process idiom must therefore not be skipped for a zero value.
+        if field == "PROC" {
+            // The value itself isn't stored; PROC is a trigger. A
+            // fire-and-forget caller parks nothing — C `dbPutField` on PROC
+            // processes the record with no putNotify.
+            let parked = if let Some((completion_tx, completion_rx)) =
+                notify_request.into_completion()
+            {
+                let notify = crate::server::record::NotifyWaitSet::new(completion_tx);
                 {
-                    let notify = crate::server::record::NotifyWaitSet::new(completion_tx);
-                    {
-                        // Collect-then-act: clone the handle under a brief map
-                        // read, drop the map lock before the per-record write.
-                        let rec_arc = {
-                            let recs = self.inner.records.read().await;
-                            recs.get(record_name).cloned()
-                        };
-                        if let Some(rec_arc) = rec_arc {
-                            let mut guard = rec_arc.write().await;
-                            if guard.notify.is_some() {
-                                return Err(CaError::PutCallbackInProgress(
-                                    record_name.to_string(),
-                                ));
-                            }
-                            guard.notify = Some(notify.clone());
+                    // Collect-then-act: clone the handle under a brief map
+                    // read, drop the map lock before the per-record write.
+                    let rec_arc = {
+                        let recs = self.inner.records.read().await;
+                        recs.get(record_name).cloned()
+                    };
+                    if let Some(rec_arc) = rec_arc {
+                        let mut guard = rec_arc.write().await;
+                        if guard.notify.is_some() {
+                            return Err(CaError::PutCallbackInProgress(record_name.to_string()));
                         }
+                        guard.notify = Some(notify.clone());
                     }
-                    Some((notify, completion_rx))
-                } else {
-                    None
-                };
-                // C `dbPutField:1265-1277`: PROC is one of the two fields that
-                // selects the record for the put-driven process — with the same
-                // PACT→RPRO deferral as a `pp` field. Both go through the single
-                // owner.
-                self.put_driven_process(record_name).await;
-                // The wait-set fires the oneshot only after the whole
-                // FLNK/OUT chain (sync + async) settles. If it has
-                // already completed the chain was fully synchronous —
-                // report immediate success; otherwise hand the receiver
-                // to the CA layer to await the deferred completion.
-                return match parked {
-                    Some((notify, completion_rx)) => {
-                        if notify.completed() {
-                            Ok(None)
-                        } else {
-                            Ok(completion_rx)
-                        }
+                }
+                Some((notify, completion_rx))
+            } else {
+                None
+            };
+            // C `dbPutField:1265-1277`: PROC is one of the two fields that
+            // selects the record for the put-driven process — with the same
+            // PACT→RPRO deferral as a `pp` field. Both go through the single
+            // owner.
+            self.put_driven_process(record_name).await;
+            // The wait-set fires the oneshot only after the whole
+            // FLNK/OUT chain (sync + async) settles. If it has
+            // already completed the chain was fully synchronous —
+            // report immediate success; otherwise hand the receiver
+            // to the CA layer to await the deferred completion.
+            return match parked {
+                Some((notify, completion_rx)) => {
+                    if notify.completed() {
+                        Ok(None)
+                    } else {
+                        Ok(completion_rx)
                     }
-                    None => Ok(None),
-                };
-            }
+                }
+                None => Ok(None),
+            };
         }
 
         // Normal field put (write lock) — C `dbPut`, which does NOT touch

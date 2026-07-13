@@ -1,0 +1,9 @@
+[package]
+name = "dbd-codegen"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "EPICS"
+description = "Offline generator: EPICS .dbd record declarations -> Rust field tables for epics-base-rs"
+
+[dependencies]

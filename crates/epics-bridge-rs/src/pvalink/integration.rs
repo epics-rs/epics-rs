@@ -2317,10 +2317,7 @@ mod tests {
         // Hold the record Arc and drive it into PACT (async in
         // progress) before the db moves into the forwarder slot.
         let dest = db.get_record("DEST").await.unwrap();
-        dest.write()
-            .await
-            .processing
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        dest.write().await.enter_pact();
 
         // CP target: scans on every event.
         let mut fanout = ScanFanout::default();

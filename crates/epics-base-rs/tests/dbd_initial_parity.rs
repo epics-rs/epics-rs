@@ -285,7 +285,7 @@ fn rust_record_defaults_match_c_dbd_initials() {
                 // comparison below.
                 if apply_fields(
                     &mut applied,
-                    &[(field.clone(), initial.clone())],
+                    &[(field.clone(), initial.as_str().into())],
                     &mut common,
                 )
                 .is_ok()

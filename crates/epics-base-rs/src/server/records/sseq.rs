@@ -1012,33 +1012,33 @@ async fn reenter_now(name: &str, handle: &AsyncDbHandle) {
 macro_rules! sseq_fields {
     ($($s:literal),+ $(,)?) => {
         &[
-            FieldDesc { name: "VAL", dbf_type: DbFieldType::Long, read_only: false },
+            FieldDesc::new("VAL", DbFieldType::Long, false),
             // SELM is DBF_MENU menu(sseqSELM) (sseqRecord.dbd:34) — served
             // as DBR_ENUM with the menu's choice labels (SSEQ_SELM_CHOICES).
-            FieldDesc { name: "SELM", dbf_type: DbFieldType::Enum, read_only: false },
-            FieldDesc { name: "SELN", dbf_type: DbFieldType::UShort, read_only: false },
-            FieldDesc { name: "SELL", dbf_type: DbFieldType::String, read_only: false },
-            FieldDesc { name: "PREC", dbf_type: DbFieldType::Short, read_only: false },
-            FieldDesc { name: "ABORT", dbf_type: DbFieldType::Short, read_only: false },
-            FieldDesc { name: "ABORTING", dbf_type: DbFieldType::Short, read_only: true },
-            FieldDesc { name: "BUSY", dbf_type: DbFieldType::Short, read_only: true },
+            FieldDesc::new("SELM", DbFieldType::Enum, false),
+            FieldDesc::new("SELN", DbFieldType::UShort, false),
+            FieldDesc::new("SELL", DbFieldType::String, false),
+            FieldDesc::new("PREC", DbFieldType::Short, false),
+            FieldDesc::new("ABORT", DbFieldType::Short, false),
+            FieldDesc::new("ABORTING", DbFieldType::Short, true),
+            FieldDesc::new("BUSY", DbFieldType::Short, true),
             $(
-                FieldDesc { name: concat!("DLY", $s), dbf_type: DbFieldType::Double, read_only: false },
-                FieldDesc { name: concat!("DOL", $s), dbf_type: DbFieldType::String, read_only: false },
-                FieldDesc { name: concat!("DO", $s), dbf_type: DbFieldType::Double, read_only: false },
-                FieldDesc { name: concat!("LNK", $s), dbf_type: DbFieldType::String, read_only: false },
-                FieldDesc { name: concat!("STR", $s), dbf_type: DbFieldType::String, read_only: false },
-                FieldDesc { name: concat!("DT", $s), dbf_type: DbFieldType::Short, read_only: true },
-                FieldDesc { name: concat!("LT", $s), dbf_type: DbFieldType::Short, read_only: true },
+                FieldDesc::new(concat!("DLY", $s), DbFieldType::Double, false),
+                FieldDesc::new(concat!("DOL", $s), DbFieldType::String, false),
+                FieldDesc::new(concat!("DO", $s), DbFieldType::Double, false),
+                FieldDesc::new(concat!("LNK", $s), DbFieldType::String, false),
+                FieldDesc::new(concat!("STR", $s), DbFieldType::String, false),
+                FieldDesc::new(concat!("DT", $s), DbFieldType::Short, true),
+                FieldDesc::new(concat!("LT", $s), DbFieldType::Short, true),
                 // WAITn is DBF_MENU menu(sseqWAIT) — see SSEQ_WAIT_CHOICES.
-                FieldDesc { name: concat!("WAIT", $s), dbf_type: DbFieldType::Short, read_only: false },
-                FieldDesc { name: concat!("WERR", $s), dbf_type: DbFieldType::Short, read_only: true },
-                FieldDesc { name: concat!("WTG", $s), dbf_type: DbFieldType::Short, read_only: true },
-                FieldDesc { name: concat!("IX", $s), dbf_type: DbFieldType::Short, read_only: true },
+                FieldDesc::new(concat!("WAIT", $s), DbFieldType::Short, false),
+                FieldDesc::new(concat!("WERR", $s), DbFieldType::Short, true),
+                FieldDesc::new(concat!("WTG", $s), DbFieldType::Short, true),
+                FieldDesc::new(concat!("IX", $s), DbFieldType::Short, true),
                 // DOLnV / LNKnV are DBF_MENU menu(sseqLNKV) — served as
                 // DBR_ENUM with SSEQ_LNKV_CHOICES.
-                FieldDesc { name: concat!("DOL", $s, "V"), dbf_type: DbFieldType::Enum, read_only: true },
-                FieldDesc { name: concat!("LNK", $s, "V"), dbf_type: DbFieldType::Enum, read_only: true },
+                FieldDesc::new(concat!("DOL", $s, "V"), DbFieldType::Enum, true),
+                FieldDesc::new(concat!("LNK", $s, "V"), DbFieldType::Enum, true),
             )+
         ]
     };

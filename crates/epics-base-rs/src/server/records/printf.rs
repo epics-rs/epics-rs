@@ -1,6 +1,6 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, ProcessOutcome, Record};
-use crate::types::{DbFieldType, EpicsValue, PvString};
+use crate::server::record::{FieldDesc, ProcessOutcome, Record, dbd_generated};
+use crate::types::{EpicsValue, PvString};
 
 // printf record (EPICS 7).
 // Evaluates FMT as a printf format string with up to 10 inputs (INP0-INP9, values A-J).
@@ -512,138 +512,7 @@ fn strip_trailing_zeros_sci(s: &str, upper: bool) -> String {
     }
 }
 
-static PRINTF_FIELDS: &[FieldDesc] = &[
-    FieldDesc {
-        name: "VAL",
-        dbf_type: DbFieldType::Char,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "LEN",
-        // C declares LEN as DBF_ULONG (printfRecord.dbd.pod:209): the formatted
-        // byte count including the terminating NUL is an unsigned 32-bit count.
-        dbf_type: DbFieldType::ULong,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "SIZV",
-        // C declares SIZV as DBF_USHORT (printfRecord.dbd.pod:202): the VAL
-        // buffer size is an unsigned 16-bit count (clamped to [16, 0x7fff]
-        // at init because dbAddr::field_size is signed, printfRecord.c:341).
-        dbf_type: DbFieldType::UShort,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "FMT",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "IVLS",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INP0",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INP1",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INP2",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INP3",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INP4",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INP5",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INP6",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INP7",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INP8",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INP9",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "A",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "B",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "C",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "D",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "E",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "F",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "G",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "H",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "I",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "J",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-];
+static PRINTF_FIELDS: &[FieldDesc] = dbd_generated::PRINTF_FIELDS;
 
 impl Record for PrintfRecord {
     fn record_type(&self) -> &'static str {

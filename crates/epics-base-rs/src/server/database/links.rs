@@ -526,6 +526,65 @@ impl PvDatabase {
         (fetch, alarm)
     }
 
+    /// **The single owner of input-link severity inheritance** — C
+    /// `dbDbGetValue`'s tail (`dbDbLink.c:228-232`), which EVERY healthy
+    /// `dbGetLink` on a DB link runs:
+    ///
+    /// ```c
+    /// if (!status && precord != dbChannelRecord(chan))
+    ///     recGblInheritSevrMsg(plink->value.pv_link.pvlMask & pvlOptMsMode,
+    ///         plink->precord, dbChannelRecord(chan)->stat,
+    ///         dbChannelRecord(chan)->sevr, dbChannelRecord(chan)->amsg);
+    /// ```
+    ///
+    /// Given the reader, the link it just read and the source alarm that read
+    /// produced, it returns the `(MS class, source alarm)` pair the reader owes
+    /// its PENDING alarm — or `None` when C inherits nothing. Callers hand the
+    /// pair to [`inherit_sevr_msg`]; no caller decides for itself which links
+    /// inherit, which is how the `ReadDbLink` path came to drop MS entirely.
+    ///
+    /// Two rules live here and nowhere else:
+    ///
+    /// * **Self-exclusion** — C's `precord != dbChannelRecord(chan)` guard. A
+    ///   link that reads the reader's OWN field must not fold the reader's
+    ///   committed severity back into its pending one: `rec_gbl_reset_alarms`
+    ///   would re-commit it next cycle, so a single MAJOR would latch forever.
+    ///   Alias-aware, because C compares record pointers.
+    /// * **MS class per scheme** — DB and CA links carry their own parsed
+    ///   `MonitorSwitch`; a PVA link's lset has already applied the MS/NMS/MSI
+    ///   gate, so its (already final) severity folds as `MaximizeStatus` to keep
+    ///   the remote stat + message. Constant/Hw/Calc links inherit nothing.
+    pub(crate) async fn input_link_inheritance(
+        &self,
+        reader_name: &str,
+        link: &crate::server::record::ParsedLink,
+        alarm: Option<LinkAlarm>,
+    ) -> Option<(crate::server::record::MonitorSwitch, LinkAlarm)> {
+        let alarm = alarm?;
+        match link {
+            crate::server::record::ParsedLink::Db(db) => {
+                let target = self
+                    .resolve_alias(&db.record)
+                    .await
+                    .unwrap_or_else(|| db.record.clone());
+                let reader = self
+                    .resolve_alias(reader_name)
+                    .await
+                    .unwrap_or_else(|| reader_name.to_string());
+                if target == reader {
+                    return None;
+                }
+                Some((db.monitor_switch, alarm))
+            }
+            crate::server::record::ParsedLink::Ca(ca) => Some((ca.monitor_switch, alarm)),
+            crate::server::record::ParsedLink::Pva(_)
+            | crate::server::record::ParsedLink::PvaJson(_) => {
+                Some((crate::server::record::MonitorSwitch::MaximizeStatus, alarm))
+            }
+            _ => None,
+        }
+    }
+
     /// The raw value+alarm read behind [`Self::read_link_with_alarm`]. Never
     /// call this directly from a process path — it cannot tell "constant" from
     /// "failed"; that is the classifier's job.

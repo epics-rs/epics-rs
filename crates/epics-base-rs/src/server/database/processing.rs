@@ -1797,30 +1797,8 @@ impl PvDatabase {
             crate::server::record::MonitorSwitch,
             super::links::LinkAlarm,
         )> = if is_soft {
-            match inp_parsed {
-                crate::server::record::ParsedLink::Db(ref db) => {
-                    let (_v, alarm) = self.read_link_with_alarm(&inp_parsed).await;
-                    alarm.map(|a| (db.monitor_switch, a))
-                }
-                crate::server::record::ParsedLink::Pva(_)
-                | crate::server::record::ParsedLink::PvaJson(_) => {
-                    // PVA: the lset already applied the MS/NMS/MSI gate,
-                    // so the returned severity is final — fold it as
-                    // MaximizeStatus to preserve the remote stat+msg
-                    // (pvxs `pvalink_lset.cpp`).
-                    let (_v, alarm) = self.read_link_with_alarm(&inp_parsed).await;
-                    alarm.map(|a| (crate::server::record::MonitorSwitch::MaximizeStatus, a))
-                }
-                crate::server::record::ParsedLink::Ca(ref ca) => {
-                    // CA: apply the link's own
-                    // MS/NMS/MSI/MSS gate at the fold boundary, uniform
-                    // with the Db arm above — the resolver returned the
-                    // *raw* remote alarm, not a gated one.
-                    let (_v, alarm) = self.read_link_with_alarm(&inp_parsed).await;
-                    alarm.map(|a| (ca.monitor_switch, a))
-                }
-                _ => None,
-            }
+            let (_v, alarm) = self.read_link_with_alarm(&inp_parsed).await;
+            self.input_link_inheritance(name, &inp_parsed, alarm).await
         } else {
             None
         };
@@ -2011,29 +1989,11 @@ impl PvDatabase {
                     if !read_failed {
                         resolved_link_fields.push(link_field);
                     }
-                    // B2 / multi-input alarm propagation
-                    // covers external links too. `Db` and `Ca` carry an
-                    // explicit `MonitorSwitch` (CA's was parsed from its
-                    // `MS`/`NMS`/`MSI`/`MSS` modifier); `Pva` is gated by
-                    // its lset, so its already-final severity folds as
-                    // `MaximizeStatus` (preserving remote stat+msg).
-                    if let Some(alarm) = alarm {
-                        match &parsed {
-                            crate::server::record::ParsedLink::Db(db) => {
-                                link_alarms.push((db.monitor_switch, alarm));
-                            }
-                            crate::server::record::ParsedLink::Ca(ca) => {
-                                link_alarms.push((ca.monitor_switch, alarm));
-                            }
-                            crate::server::record::ParsedLink::Pva(_)
-                            | crate::server::record::ParsedLink::PvaJson(_) => {
-                                link_alarms.push((
-                                    crate::server::record::MonitorSwitch::MaximizeStatus,
-                                    alarm,
-                                ));
-                            }
-                            _ => {}
-                        }
+                    // Multi-input alarm propagation, through the inheritance
+                    // owner (which applies the MS class and C's self-link
+                    // exclusion).
+                    if let Some(pair) = self.input_link_inheritance(name, &parsed, alarm).await {
+                        link_alarms.push(pair);
                     }
                     // The record's declared fetch shape decides what a failed
                     // read means. The failed link's own alarm is already folded
@@ -2124,23 +2084,8 @@ impl PvDatabase {
                     self.process_passive_db_source(db, visited, depth).await;
                 }
                 let (fetch, alarm) = self.read_link_with_alarm(&parsed).await;
-                if let Some(alarm) = alarm {
-                    match &parsed {
-                        crate::server::record::ParsedLink::Db(db) => {
-                            link_alarms.push((db.monitor_switch, alarm));
-                        }
-                        crate::server::record::ParsedLink::Ca(ca) => {
-                            link_alarms.push((ca.monitor_switch, alarm));
-                        }
-                        crate::server::record::ParsedLink::Pva(_)
-                        | crate::server::record::ParsedLink::PvaJson(_) => {
-                            link_alarms.push((
-                                crate::server::record::MonitorSwitch::MaximizeStatus,
-                                alarm,
-                            ));
-                        }
-                        _ => {}
-                    }
+                if let Some(pair) = self.input_link_inheritance(name, &parsed, alarm).await {
+                    link_alarms.push(pair);
                 }
                 let text = match fetch {
                     crate::server::recgbl::simm::LinkFetch::Value(value) => {
@@ -3724,6 +3669,13 @@ impl PvDatabase {
     ///   LINK/INVALID carrying the link's field name as the AMSG, right here,
     ///   as an effect of the read itself. Every caller inherits it; none can
     ///   forget it.
+    ///
+    /// A HEALTHY read is the other half of the same C function: `dbDbGetValue`
+    /// ends with `recGblInheritSevrMsg` (`dbDbLink.c:228-232`), so an
+    /// `field(INP,"SRC MS")` on a compress / aao-DOL / epid link raises the
+    /// READER to the source's severity. That inheritance runs here too, through
+    /// [`Database::input_link_inheritance`] — the same owner the multi-input
+    /// fetch uses.
     async fn read_db_link_into_field(
         &self,
         rec: &Arc<crate::runtime::sync::RwLock<RecordInstance>>,
@@ -3732,9 +3684,9 @@ impl PvDatabase {
         visited: &mut HashSet<String>,
         depth: usize,
     ) -> Option<bool> {
-        let link_str = {
+        let (reader_name, link_str) = {
             let instance = rec.read().await;
-            instance
+            let link_str = instance
                 .record
                 .get_field(link_field)
                 .and_then(|v| {
@@ -3744,7 +3696,8 @@ impl PvDatabase {
                         None
                     }
                 })
-                .unwrap_or_default()
+                .unwrap_or_default();
+            (instance.name.clone(), link_str)
         };
         if link_str.is_empty() {
             return None;
@@ -3752,8 +3705,20 @@ impl PvDatabase {
         let parsed = crate::server::record::parse_link_v2(link_str.as_str_lossy().as_ref());
         match self.read_link_value(&parsed, visited, depth).await {
             Some(value) => {
+                // C `dbDbGetValue` tail (dbDbLink.c:228-232): a healthy read
+                // folds the SOURCE's committed alarm into the READER per the
+                // link's MS class. The source has already been processed above
+                // (a PP link), so its alarm is the one this cycle sees.
+                let inheritance = {
+                    let alarm = self.read_link_with_alarm(&parsed).await.1;
+                    self.input_link_inheritance(&reader_name, &parsed, alarm)
+                        .await
+                };
                 let mut instance = rec.write().await;
                 let _ = instance.record.put_field_internal(target_field, value);
+                if let Some((ms, alarm)) = inheritance {
+                    super::links::inherit_sevr_msg(&mut instance.common, ms, &alarm);
+                }
                 Some(true)
             }
             None => {

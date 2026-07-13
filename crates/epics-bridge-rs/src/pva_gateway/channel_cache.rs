@@ -425,12 +425,14 @@ impl UpstreamEntry {
     ///
     /// Pure read — it does NOT consume the grace; only `cleanup_tick` resets
     /// `drop_poke`. The cache-full emergency sweep in [`Self::lookup`] used
-    /// `Arc::strong_count > 1`, but a live subscriber holds only a
-    /// `broadcast::Receiver`, never an `Arc<UpstreamEntry>`, so a
+    /// `Arc::strong_count > 1`, which does not mean "has a subscriber": a
     /// subscribed-but-not-mid-lookup entry had `strong_count == 1` and was
     /// wrongly swept — silently killing the shared upstream monitor for
-    /// every downstream subscriber. Routing both paths through this
-    /// predicate makes that divergence unrepresentable.
+    /// every downstream subscriber. Retention is the RECEIVER count, which is
+    /// what "monitor interest" actually is; routing both paths through this
+    /// predicate makes that divergence unrepresentable, whatever else happens
+    /// to hold an `Arc` (a forwarder task keeps one so it can re-frame from
+    /// `latest` after a fanout lag).
     fn is_retained(&self) -> bool {
         *self.drop_poke.lock() || self.subscriber_count() > 0
     }
@@ -1521,22 +1523,28 @@ impl ChannelCache {
         self.cleanup_tick().await;
     }
 
-    /// Test-only: clone the decoded-fanout broadcast sender of `pv_name`'s
-    /// default (empty-pvRequest) monitor variant, so a test can push
-    /// `MonitorUpdate`s into the fanout and drive subscriber backpressure /
-    /// lag without a live upstream IOC.
+    /// Test-only: publish one decoded value on `pv_name`'s default variant the
+    /// way the upstream monitor callback does — FOLD it into the entry's
+    /// `latest` (and its introspection), then fan it out. Pushing straight into
+    /// the broadcast sender instead would leave `latest` empty — a state no live
+    /// upstream can be in once it has delivered a value, and one in which there
+    /// is no merged snapshot to re-frame a lagged subscriber from
+    /// (`source::reframe_raw_body_after_lag`).
     #[cfg(test)]
-    pub(crate) async fn test_broadcast_sender(
-        &self,
-        pv_name: &str,
-    ) -> broadcast::Sender<MonitorUpdate> {
-        self.entries
+    pub(crate) async fn test_publish(&self, pv_name: &str, value: PvField) {
+        let entry = self
+            .entries
             .lock()
             .await
             .get(pv_name)
-            .and_then(|ch| ch.monitors.get(&Vec::new()))
-            .map(|e| e.tx.clone())
-            .expect("default test monitor variant must exist")
+            .and_then(|ch| ch.monitors.get(&Vec::new()).cloned())
+            .expect("default test monitor variant must exist");
+        {
+            let mut s = entry.state.write();
+            s.introspection = Some(value.descriptor());
+            s.latest = Some(value.clone());
+        }
+        let _ = entry.tx.send(MonitorUpdate::from(value));
     }
 }
 

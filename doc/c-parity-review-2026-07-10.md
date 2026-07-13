@@ -5666,3 +5666,39 @@ owner, one trait method, F's duplicate and its compress override removed.
   epics-bridge-rs` — pass (1 passed, 26 ignored)
 
 Nothing pushed.
+
+### CORRECTION to the wave-16 dispositions (2026-07-13)
+
+**Category B was not merged when the dispositions above were written.** The
+section claims six branches merged and reports a gate of 8990/8990. Both are
+wrong: only five categories (A, C, D, E, F) were merged at that point.
+Category B's eight commits sat unmerged on
+`caucus/WG0SFREHPX/fixer-b-catools-710a473a-4`, and the gate I reported was
+run without them. The fixes themselves were complete and correct on the
+branch — the error is mine, at the merge step, and the "6 branches
+git-verified before merge" line describes a verification I performed on the
+branches but did not follow with the merge for B.
+
+Corrected state:
+
+- **Category B merged** — R18-18 `777c86c1` (an unresponsive circuit IS a
+  disconnect) · R18-19 `34f3801e` (a dead circuit raises ECA_DISCONN on the
+  exception hook) · R18-20 `f9f166d6` (exception blocks carry C's Context and
+  Source File line) · R18-21 `c361550d` (camonitor prints no per-PV line for a
+  non-normal status) · R18-16 `6e881a65` (every address list dedups and reports
+  what it drops) · R18-17 `1a83d40c` (a bad address-list token is reported, not
+  swallowed) · R18-22 `ab115c16` (a TCP port fallback is announced, and
+  RSRV_SERVER_PORT is set) · **R18-23** `fe856785` (a PVA port is pvxs's to
+  define, not C's — B fixed this beyond its brief; it was on the Low list).
+
+- **Wave 16 therefore closed 39 findings, not 38** (R18-23 was not in the
+  assignment).
+
+- **Corrected gate, all six categories present:** `cargo fmt --all` clean ·
+  `cargo clippy --workspace --all-targets -- -D warnings` pass ·
+  `cargo nextest run --workspace --no-fail-fast` **9010 run, 9010 passed, 2
+  skipped** (bare) · gateway-feature clippy pass · `cargo nextest run -p
+  epics-bridge-rs --features pva-gateway` **781 run, 781 passed**.
+
+The 8990 figure in the section above should be read as "five of six
+categories". Nothing was pushed at either point.

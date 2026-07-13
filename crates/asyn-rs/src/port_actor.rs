@@ -585,7 +585,7 @@ impl PortActor {
         // C ends by calling the port's `asynCommon->report` (:1113-1122) — the
         // driver's own detail, and only that. A destroyed port's interfaces are
         // gone, so C never reaches it (:1038-1042).
-        if !self.driver.base().defunct {
+        if !self.driver.base().is_defunct() {
             self.driver.report(details.abs());
         }
     }
@@ -597,7 +597,7 @@ impl PortActor {
         use std::fmt::Write as _;
         let mut out = String::new();
         let base = self.driver.base();
-        if base.defunct {
+        if base.is_defunct() {
             let _ = writeln!(out, "{} destroyed", base.port_name);
             return out;
         }
@@ -1782,6 +1782,14 @@ mod tests {
         }
     }
 
+    /// Take a port through C's `shutdownPort` (asynManager.c:2251-2308) — the
+    /// only way to reach the defunct state, which is what keeps the invariant
+    /// `defunct ⟹ !enabled` true by construction (R15-50).
+    fn shut_down(base: &mut PortDriverBase) {
+        base.flags.destructible = true;
+        base.shutdown_lifecycle().unwrap();
+    }
+
     fn spawn_actor(driver: impl PortDriver) -> mpsc::Sender<ActorMessage> {
         let (tx, rx) = mpsc::channel(256);
         let actor = PortActor::new(Box::new(driver), rx);
@@ -2290,7 +2298,7 @@ mod tests {
         // port must answer SetEnable with asynDisabled, not silently
         // re-enable.
         let mut drv = TestDriver::new();
-        drv.base.defunct = true;
+        shut_down(&mut drv.base);
         let tx = spawn_actor(drv);
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
         let result = send_and_wait(&tx, RequestOp::SetEnable { yes: true }, user);
@@ -2299,7 +2307,10 @@ mod tests {
         // `asynDisabled` from the manager call itself rather than from
         // `queueRequest` (asynManager.c:2236-2241).
         match result {
-            Err(AsynError::Status { status, .. }) => assert_eq!(status, AsynStatus::Disabled),
+            Err(AsynError::Status { status, message }) => {
+                assert_eq!(status, AsynStatus::Disabled);
+                assert_eq!(message, "asynManager:enable: port has been shut down");
+            }
             other => panic!("expected a Status(Disabled), got {other:?}"),
         }
     }
@@ -2804,7 +2815,11 @@ mod tests {
             base.auto_connect = true;
             base.set_connected(false);
             base.enabled = enabled;
-            base.defunct = defunct;
+            if defunct {
+                // C `shutdownPort` clears `enabled` on its way to `defunct`
+                // (:2282-2283), so the gate refuses the port as a disabled one.
+                shut_down(&mut base);
+            }
             base.connect_retry_at = Some(Instant::now() - Duration::from_millis(1));
             let drv = CountingDriver {
                 base,
@@ -3213,7 +3228,9 @@ mod tests {
             base.init_connected(false);
             base.auto_connect = true;
             base.enabled = enabled;
-            base.defunct = defunct;
+            if defunct {
+                shut_down(&mut base);
+            }
             let tx = spawn_actor(EnableDriver {
                 base,
                 connect_calls: calls.clone(),
@@ -3656,7 +3673,7 @@ mod tests {
         // driver's interfaces (asynManager.c:1038-1042).
         let reports = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut base = PortDriverBase::new("gone", 1, PortFlags::default());
-        base.defunct = true;
+        shut_down(&mut base);
         let tx = spawn_actor(ReportSpy {
             base,
             reports: reports.clone(),

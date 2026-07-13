@@ -208,12 +208,22 @@ pub struct PortDriverBase {
     last_announced: bool,
     pub enabled: bool,
     pub auto_connect: bool,
-    /// `defunct` — set by [`Self::shutdown_lifecycle`] when a
-    /// destructible port is torn down via `shutdown_port`. Once true,
-    /// the port refuses every new request through [`Self::check_ready`].
-    /// Mirrors the `dpCommon.defunct` flag at C asynManager.c:2284
-    /// — once defunct, the port cannot be re-enabled.
-    pub defunct: bool,
+    /// C `dpCommon.defunct` (asynManager.c:2284) — the port was torn down via
+    /// `shutdownPort` and is gone for good. Read it with [`Self::is_defunct`].
+    ///
+    /// **Invariant: `defunct ⟹ !enabled`.** C establishes it in `shutdownPort`,
+    /// which clears `enabled` *and* sets `defunct` in the same breath (:2282-2283)
+    /// with the comment that disabling is what short-circuits `queueRequest` —
+    /// and indeed `queueRequest` has no defunct branch at all (:1539-1552): a
+    /// defunct port is refused as a *disabled* one, "port %s disabled". `defunct`
+    /// itself is only ever asked by `enable` (:2236, so the port cannot be
+    /// re-enabled) and by `findInterface` (:1487).
+    ///
+    /// The field is private so [`Self::shutdown_lifecycle`] is the only way to
+    /// set it, which is what makes the invariant hold by construction: nothing can
+    /// build a port that is defunct but still enabled, so no gate needs to ask
+    /// about defunct to refuse it (R15-50).
+    defunct: bool,
     /// Exception sink injected by [`crate::manager::PortManager`] on registration.
     pub exception_sink: Option<Arc<ExceptionManager>>,
     pub options: HashMap<String, String>,
@@ -546,10 +556,7 @@ impl PortDriverBase {
     /// the transition.
     pub fn set_enabled(&mut self, enabled: bool) -> AsynResult<()> {
         if self.defunct {
-            return Err(AsynError::Status {
-                status: AsynStatus::Disabled,
-                message: format!("port {} has been shut down (defunct)", self.port_name),
-            });
+            return Err(Self::shut_down_error());
         }
         self.enabled = enabled;
         self.announce_exception(AsynException::Enable, -1);
@@ -562,10 +569,7 @@ impl PortDriverBase {
     /// too, matching C's `dpCommon.defunct` check on the resolved device.
     pub fn set_addr_enabled(&mut self, addr: i32, enabled: bool) -> AsynResult<()> {
         if self.defunct {
-            return Err(AsynError::Status {
-                status: AsynStatus::Disabled,
-                message: format!("port {} has been shut down (defunct)", self.port_name),
-            });
+            return Err(Self::shut_down_error());
         }
         self.device_state(addr).enabled = enabled;
         self.announce_exception(AsynException::Enable, addr);
@@ -604,6 +608,16 @@ impl PortDriverBase {
     /// good, mirroring C asynManager.c:2266-2269.
     pub fn is_defunct(&self) -> bool {
         self.defunct
+    }
+
+    /// The one place a shut-down port is named in an error message, and the
+    /// only one C has: `enable` on a defunct device (asynManager.c:2236-2241).
+    /// Every other gate refuses a defunct port as a disabled one.
+    fn shut_down_error() -> AsynError {
+        AsynError::Status {
+            status: AsynStatus::Disabled,
+            message: "asynManager:enable: port has been shut down".to_string(),
+        }
     }
 
     /// C `queueRequest`'s gate (asynManager.c:1539-1552), and the single owner
@@ -668,19 +682,14 @@ impl PortDriverBase {
         Ok(())
     }
 
-    /// The unconditional half of the queue gate: a defunct or disabled port
-    /// refuses every request (asynManager.c:1541-1546).
+    /// The unconditional half of the queue gate: a disabled port refuses every
+    /// request (asynManager.c:1541-1546).
+    ///
+    /// There is no defunct branch here, and there is none in C's `queueRequest`
+    /// either: `shutdownPort` clears `enabled` alongside setting `defunct`
+    /// (:2282-2283) precisely so this one check answers for both. The invariant
+    /// `defunct ⟹ !enabled` (see the field doc) is what makes that sound.
     pub fn check_enabled(&self) -> AsynResult<()> {
-        // C asyn parity: a defunct port short-circuits queueRequest
-        // (asynManager.c:2283 comment). Reject *before* the enabled
-        // check so the error message names the lifecycle phase, not
-        // just "disabled".
-        if self.defunct {
-            return Err(AsynError::Status {
-                status: AsynStatus::Disabled,
-                message: format!("port {} has been shut down (defunct)", self.port_name),
-            });
-        }
         if !self.enabled {
             return Err(AsynError::Status {
                 status: AsynStatus::Disabled,
@@ -2744,12 +2753,24 @@ mod tests {
         // Idempotent — second call is Ok and leaves state unchanged.
         base.shutdown_lifecycle().unwrap();
         assert!(base.is_defunct());
-        // check_ready surfaces the defunct state for every request.
+        // A shut-down port is refused by the queue gate as a *disabled* one:
+        // C's `queueRequest` has no defunct branch (asynManager.c:1539-1552),
+        // it only sees the `enabled=FALSE` that `shutdownPort` left behind
+        // (:2282-2283). "port %s disabled" is the message an operator gets.
         match base.check_ready() {
-            Err(AsynError::Status { message, .. }) => {
-                assert!(message.contains("defunct"), "msg={message}");
+            Err(AsynError::Status { status, message }) => {
+                assert_eq!(status, AsynStatus::Disabled);
+                assert_eq!(message, "port p_destr disabled");
             }
-            other => panic!("expected defunct error, got {other:?}"),
+            other => panic!("expected the disabled refusal, got {other:?}"),
+        }
+        // The one place C names the shutdown is `enable` (:2236-2241).
+        match base.set_enabled(true) {
+            Err(AsynError::Status { status, message }) => {
+                assert_eq!(status, AsynStatus::Disabled);
+                assert_eq!(message, "asynManager:enable: port has been shut down");
+            }
+            other => panic!("expected the shut-down refusal, got {other:?}"),
         }
     }
 

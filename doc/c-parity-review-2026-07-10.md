@@ -4349,3 +4349,276 @@ adjudicated):
 
 **Flakes this cycle:** none in the merged-tree runs (8809/8809 first try;
 the previously listed CLI/stability flakes did not recur).
+
+## Round 17 — re-audit (2026-07-13)
+
+Six opus auditor panels, read-only, on HEAD `12e95832` (wave 14 fully
+merged). Every panel probed compiled C (softIoc 7.0.10.1-DEV, CA tools,
+libCom-linked harnesses); pvxs 1.5.1-42-gb568e93 read+probed for C.
+NOT convergence: 32 new findings (3 High), 2 wave-14 commits verified
+BROKEN-incomplete, 7 of 9 leads REAL.
+
+### Wave-14 commit verification
+
+HOLD (opened and probed, not trusted): `26266c5a` `d1cbd5fb` `c2554616`
+`2109120e` (A, incl. the sibling-engine check: acalcout keeps the value,
+base calcPerform has no non-finite tail so nothing owed); `9750afae`
+(206-case hex battery, strict match incl. exact ERANGE codes)
+`0d3f7090` (10-value head-to-head, byte-identical; `inf` = C aborts
+malloc — the documented deviation) `02dc3fc9` (warn once, byte-identical
+to softIoc -d) `994a2f94` (warn-once + 30 s default confirmed) (B);
+`9c42a06f` (both pvxs halves), `2c664fb2` (accept/reject boundary
+bit-identical to pvxs; upper `enforceTimeout` reset missing → R17-34)
+(C); `6f24725e` `06b1adae` `3b3ab909` `6bebdde2` (D — C's five
+notifyPortThread sites re-derived; connect-before-dispatch order
+confirmed NOT regressed); `c0551b16` `a5c7aebf` `00c56fec` `b23ccb24`
+(E); `a9fda800` `598e9b3a` `8986d51f` (arrays, side-by-side softIoc
+transcripts).
+
+BROKEN (incomplete, not regressed):
+- `f11710ef` (R16-79) — the check_no_mod GATE is the right owner and
+  covers all put routes (CA, put_pv, DB link — re-verified from the
+  array side), but its DECLARATION SET is incomplete: dbCommon's
+  SPC_NOMOD fields beyond PACT/LCNT/PUTF are client-writable → R17-62
+  (High); compress LIFO VAL dynamic NOMOD → R17-77; histogram CSTA →
+  R17-78.
+- `8440fafa` (R16-61/62) — input_link_inheritance is correct but not
+  yet the single owner: DOL closed-loop, SIML and SIOL reads bypass it
+  (fetch_link returns value, no alarm) → R17-64.
+- `e0a71007` (R16-48) — HOLD as a table; the call-site mapping and the
+  API around it are incomplete → R17-46/48/49.
+- `03ca4a4a` (R16-33) — HOLD on GET/PUT_GET/middleware; the monitor
+  seed's `marked: None` justification is false on the wire → R17-32.
+
+### Lead adjudications
+
+- sseq DOn/STRn partner post mask (A) — REAL → R17-4.
+- estdlib decimal ERANGE subnormal-exact (B) — REAL but Low/practically
+  unreachable (needs a ~751-digit exact literal; inexact subnormals
+  match): C accepts the exact expansion of 2^-1074, port returns
+  Overflow. DISPOSITION: documented deviation (matches the in-code
+  trade-off comment at estdlib.rs:52-58); no fix.
+- histogram UDF (E L1) — REAL, widened to dfanout (alarm-visible) and
+  event → R17-63.
+- refresh_link_status init race (E L4) — REAL (1-in-20 nondeterminism
+  measured) → R17-69.
+- classify_link EXT_NC absent-field local target (E L5) — NOT-REAL:
+  softIoc gives `Ext PV NC` and converts the link to CA_LINK; port
+  matches.
+- dbCommon SPC_NOMOD set (E L7) — REAL High → R17-62.
+- dbLoadRecords post_init_finalize_undef (E L8) — REAL narrowed (the
+  bit-fold happens on both paths; the UDF clear is what the iocsh path
+  loses) → R17-66.
+- lso constant DOL (E L9) — REAL, re-reasoned: "abc" is not a constant
+  in C at all (CA_LINK); the real rule is dbLoadLinkLS → dbLSConvertJSON
+  (bare number = JSON no-op: VAL="", LEN=1, UDF=0) → R17-65.
+- asyn trace escape mapping (D) — REAL: 8 C call sites mapped, 5 match,
+  2 not-ported (R6-47), 1 mismatch: traceVprintIOSource's fp branch →
+  R17-46.
+- AUTO_ADDR_LIST bool parse (B, self-generated) — NOT-REAL: the CA
+  client uses iocinf.cpp:187-192 strstr("no"), not
+  envGetBoolConfigParam; port matches identically.
+
+### Open findings R17-1..R17-85 (32)
+
+Category A (sseq/calc):
+- **R17-1** Medium — sseq STRn renders negative PREC clamped to 0; C
+  reinterprets as epicsUInt16 65535 → %e 17-digit. sseq.rs:209 vs
+  cvtFast.c:111 (compiled: `(unsigned short)(short)-1` → ` 3.70000000000000018e+00`).
+  Same defect second site: types/codec.rs:98 (DBR_STRING wire encoder,
+  caget -S of PREC=-1 ai). Counter-anchor (correct form):
+  calc/engine/string.rs:1887.
+- **R17-2** High — sseq reads DOLn with the port's native link type,
+  never C's dol_field_type switch (sseqRecord.c:640-705): ENUM/MENU
+  source should read DBR_STRING (state LABEL, dov=atof(label)); port
+  stores the index. CHAR/UCHAR array source: port's to_f64 fails and
+  the error is discarded (`let _ =`), DOn/STRn keep stale values
+  silently. The input twin of R16-1; structural fix is a typed READ
+  seam. sseq.rs:1044-1051, processing.rs:3780-3792, sseq.rs:1319-1338.
+- **R17-3** Low — WAITn raises WTGn + in_flight before the destination
+  switch decides there is no put (C sets waiting inside each successful
+  dbCaPutLinkCallback branch; default arm never touches it).
+  sseq.rs:609-616/650-677 vs sseqRecord.c:727-792.
+- **R17-4** Low — sseq partner post mask: partner view posts
+  DBE_VALUE|LOG, C posts bare DBE_VALUE (sseqRecord.c:1115/:1136/:245/
+  :248/:660/:679/:699); port also posts the partner unconditionally
+  where C posts only on change; on the process path which view is the
+  partner depends on dol_field_type — the mask must be decided by the
+  writer (set_numeric/set_string report the derived view), not a static
+  field-name list. field_io.rs:1263-1274, sseq.rs:981-994.
+
+Category B (CA tools):
+- **R17-16** Medium — EPICS_CA_SERVER_PORT / EPICS_CA_REPEATER_PORT
+  resolve with strict parse::<u16>(), dropping C's
+  envGetInetPortConfigParam: sscanf leniency, the
+  `<= IPPORT_USERRESERVED (5000)` / `> 65535` floor-to-default, and the
+  out-of-range diagnostics. Proven live: port 3000 reads on caget-rs
+  (exit 0), compiled caget refuses + defaults to 5064 (exit 1).
+  client/mod.rs:4771/:5331, discovery/mod.rs:227, beacon_monitor.rs:711,
+  protocol.rs:43-44, server/addr_list.rs:122-125 vs envSubr.c.
+
+Category C (PVA/gateway):
+- **R17-31** Medium — DBF_CHAR array VAL + info(Q:form,"String") (the
+  QSRV long-string idiom) served as NTScalarArray<byte>; pvxs serves
+  NTScalar<string> (getChannelValueType, iocsource.cpp:619-643 +
+  getArrayValue collapse + putLongString). Port has no Q:form reader
+  outside display. qsrv/channel.rs:565-585.
+- **R17-32** Medium — every gateway monitor's FIRST downstream frame
+  marks leaves the upstream never assigned: the seed snapshot maps to
+  `marked: None` → canonical full bitset. Proven on the wire: upstream
+  seed bits [1], gateway downstream seed bits [1,2]. The R16-33 defect
+  still live on the monitor seed; cache computes marks per event but
+  never accumulates the union. pva_gateway/source.rs:900/:1032/
+  :1998-2007/:2035-2043, tcp.rs:2056-2063.
+- **R17-33** Medium — the middleware chain swallows
+  set_channel_invalidator (none of ReadOnly/Acl/Audit implements it;
+  trait default drops it), so operator `:drop`/`:flush` never sends
+  DESTROY_CHANNEL downstream in a real gateway; the only test wires the
+  UNLAYERED source. runtime.rs:777-778, gateway.rs:300/:311,
+  source.rs:1129-1147, channel_cache.rs:1595-1598.
+- **R17-34** Low — enforceTimeout's upper reset (>= double(time_t::max)
+  → 40 s, config.cpp:373-391, applied to the SCALED tcpTimeout) not
+  reproduced; for CONN_TMO in ~[6.92e18, 9.22e18] pvxs falls back to
+  40 s idle, port keeps ~1.2e19 s. runtime.rs:480-483,
+  server_conn.rs:65.
+
+Category D (asyn):
+- **R17-46** Medium — trace ESCAPE form hardwires escaped_from_raw; C's
+  traceVprintIOSource chooses by destination (fp → epicsStrPrintEscaped,
+  errlog → epicsStrSnPrintEscaped) and the DEFAULT destination is
+  stderr → print_escaped. First-byte NUL: C prints an empty data line,
+  port prints the payload. Selection belongs at the trace-output site
+  keyed on cfg.file (TINP and echo interpose must keep
+  escaped_from_raw). trace.rs:936 vs asynManager.c:3153-3165/:2928-2941/
+  :458.
+- **R17-47** Medium — trace I/O mask treated as an enum: C emits one
+  line per enabled bit (three independent if blocks), mask 0 = no data;
+  port if/else-chains and defaults to ASCII where C defaults to NODATA;
+  the ASCII form substitutes '.' where C fprintf's raw bytes; the hex
+  form is unwrapped where C wraps every 20 bytes. trace.rs:907-944/:306
+  vs asynManager.c:3146-3190, asynDriver.h:219-222.
+- **R17-48** Medium — escaped_from_raw drops C's dstlen: TINP (40),
+  IEOS/OEOS (10), errlog traceBuffer (80) are never truncated; C
+  truncates mid-escape-pair leaving a dangling backslash (compiled
+  proof). Structural: give the function C's signature so every call
+  site states its C buffer bound. escape.rs:30-32, asyn_record/
+  mod.rs:1062/:2618-2620, trace.rs:936.
+- **R17-49** Low — print_escaped misses epicsStrPrintEscaped's
+  strlen-based empty-string early return: a first-byte-NUL EOS prints
+  nothing in C, `\x00` in the port. Distinct C quirk from CBUG-D4.
+  escape.rs:36-38 vs epicsString.c:236-237.
+
+Category E (records/links/init/dbPut):
+- **R17-61** Medium — parse_c_double is not epicsParseDouble: ERANGE
+  literals (1e400, 1e-320) classify CONSTANT in the port (defined
+  record holding inf!) vs PV-link/UDF=1 in C; wide-hex
+  (0xffffffffffffffffff) and hex-float (0x1p4) classify PV link in the
+  port vs CONSTANT in C (strtod accepts). link.rs:539-552/:1100 vs
+  epicsStdlib.c:150-176, dbStaticLib.c:2346-2349.
+- **R17-62** High — every dbCommon SPC_NOMOD field except
+  PACT/LCNT/PUTF is client-writable: STAT/SEVR/NSEV/ACKS/RPRO/UTAG
+  accepted (alarm state forgeable, permanent on a Passive record); C
+  refuses all with S_db_noMod. ACKS/ACKT are a semantic inversion: C
+  runs putAcks/putAckt only for dbrType DBR_PUT_ACKS/ACKT ABOVE the
+  gate, so the fix must plumb the DBR type before gating or
+  acknowledgement breaks. field_io.rs:57-72, record_instance.rs:
+  1646-1710/:1846/:1977 vs dbCommon.dbd:13-190, dbAccess.c:123-127/
+  :1331-1335.
+- **R17-63** Medium — UDF cleared at every process for record types
+  whose C process() never clears it: dfanout (alarm-visible: C is
+  INVALID/UDF every cycle with no DOL, port NO_ALARM), histogram,
+  event. Blanket `clears_udf` default needs per-record opt-out.
+  processing.rs:2764-2765/:4173-4174, record_trait.rs:1673.
+- **R17-64** Medium — MS inheritance still bypassed on DOL closed-loop,
+  SIML, SIOL (fetch_link returns value, no alarm): ao/bo
+  DOL="x MS", ai SIML/SIOL MS all NO_ALARM in the port, MAJOR/LINK in
+  C. input_link_inheritance is not yet the single owner.
+  processing.rs:1879-1883/:4878/:5466/:5571 vs dbDbLink.c:228-232.
+- **R17-65** Low — long-string constant links ignore dbLoadLinkLS/
+  dbLSConvertJSON (constant parsed as JSON; bare number = no callback:
+  VAL="", LEN=1, UDF=0; string form only as {const:"hello"}). lso seeds
+  the TEXT and leaves UDF=1; lsi seed fails TypeMismatch. Outside the
+  R16-77 owner. lso.rs:254-268, lsi.rs:274 vs lsoRecord.c:82-95,
+  dbConstLink.c:178-192, dbConvertJSON.c:191-236.
+- **R17-66** Medium — iocsh dbLoadRecords never runs
+  post_init_finalize_undef (IocBuilder does): mbboDirect/histogram/aao
+  come up UDF=1 on the path a real IOC uses, UDF=0 in C. The hook
+  belongs inside run_init_passes next to the 00c56fec prologue.
+  commands.rs:1174-1195, ioc_builder.rs:326.
+- **R17-67** Low — add_record (iocsh dbCreateRecord) seeds constants +
+  deadbands but never runs init_record or the UDF prologue — violates
+  the seed owner's own stated invariant. database/mod.rs:1076-1084.
+- **R17-68** Low — parse_link_field invents a quoted-string constant
+  form C does not have (C: only "parses as a number" and "[...]");
+  softIoc makes DOL="\"hello\"" a CA_LINK. The masking class R16-78
+  fixed, one arm above it. link.rs:1077-1082 vs dbStaticLib.c:2346-2356.
+- **R17-69** Low — calcout/sseq refresh_link_status races the record
+  load (spawned from add_record): 19/20 Local PV, 1/20 Ext PV NC for a
+  forward-referenced local link; C is deterministic (init at iocInit +
+  0.5 s checkLinks re-poll). Diagnostic fields only.
+  calcout.rs:377-411.
+
+Arrays (compress/histogram/subArray/waveform/conversion):
+- **R17-76** High — runtime put to compress ALG/BALG/PBUF/N does not
+  reset the buffer; C's special(SPC_RESET) zeroes NUSE/OFF/INX/CVB,
+  reallocates the sum buffer, memsets, posts (compressRecord.c:377-393,
+  :85-99; dbd declares five SPC_RESET fields). Port: FIFO→LIFO switch
+  reads the old ring in the new order (garbage); N put corrupts the
+  next emitted sample. compress.rs:548-556/:641-696/:562.
+- **R17-77** Medium — compress VAL writable under BALG=LIFO; C sets
+  SPC_NOMOD dynamically in cvt_dbaddr (compressRecord.c:398-407) —
+  per-dbAddr special, so the port's static FieldDesc read_only cannot
+  express it. compress.rs:436-440, field_io.rs:57-72.
+- **R17-78** Medium — histogram CSTA writable on every route; C
+  declares SPC_NOMOD (counting toggled only through CMD). A caput
+  silently stops a live acquisition. histogram.rs:224-228/:482-488 vs
+  histogramRecord.dbd.pod:170-173.
+- **R17-79** Medium — float→int narrowing saturates (Rust `as`); C's
+  dbPut convert is a bare cast: compiled x86-64 gives 70000→4464
+  (short), 3.0e9→INT_MIN (long); port gives 32767/2147483647. C's cast
+  is UB by the standard but compiled C is the parity target (the
+  HexSignificand/shift-mask precedent). DISPOSITION: fix to reproduce
+  compiled-C x86-64 narrowing (per-dest-width cvttsd2si semantics);
+  file the C UB as a CBUG batch-E candidate. types/value.rs:963-966/
+  :1079-1082 vs dbConvert.c:96-113/:1632-1634.
+- **R17-80** Medium — histogram has no SDEL watchdog: C's wdogCallback
+  posts VAL (DBE_VALUE|LOG) every SDEL seconds when mcnt>0 and re-arms
+  (init_record + special on SDEL). Port: SDEL put stores and nothing
+  else; slow-accumulation displays never update.
+  histogram.rs:489-494 vs histogramRecord.c:102-124/:168/:266-268.
+- **R17-81** Low — compress OUSE and INPN fields absent (both
+  SPC_NOMOD): OUSE is C's "post NUSE only on change" latch, INPN the
+  WPTR-realloc trigger. compress.rs:435-525 vs
+  compressRecord.dbd.pod:481-506.
+- **R17-82** Low — subArray has no BUSY field (subArrayRecord.dbd.pod:
+  390-393 declares it like waveform). waveform.rs:849-870.
+- **R17-83** Low — histogram INP channel still resolves
+  (get_pv("HI.INP") → Ok("")) though the .db load refuses it; C:
+  PV not found. declares_inp_link gates the loader, not the namespace.
+  histogram.rs:301-303.
+- **R17-84** Low — histogram VAL served to PVA as int32[]; C's
+  cvt_dbaddr sets DBF_ULONG → pvxs uint32[]. CA unaffected (no
+  DBR_ULONG on the wire). histogram.rs:177-184, convert.rs:16.
+- **R17-85** Medium — scalar put into a FIFO compress VAL: C's dbPut
+  writes through get_array_info's READ start, so during initial fill
+  every scalar put rewrites the same slot ([3,0,0] where the port has
+  [1,2,3]). The port's behavior is the intended one; C's is a design
+  defect. DISPOSITION: documented deviation (port keeps
+  append-at-write-cursor) + CBUG batch-E candidate; NOT in fix wave 15;
+  flagged for user sign-off. compress.rs:165-200 vs dbAccess.c:
+  1351-1362, compressRecord.c:408-431.
+
+### Review log
+
+Thematic clusters this round: (1) the SPC machinery — the R16-79 gate
+is sound but the port lacks C's full SPECIAL vocabulary (SPC_NOMOD
+static set R17-62/78/81/82, dynamic per-dbAddr NOMOD R17-77, SPC_RESET
+R17-76, watchdog-armed special R17-80); (2) typed link reads — R16-1
+fixed the write side, R17-2 is its input twin, R17-61/65/68 are the
+constant-classifier remainder; (3) single-owner erosion — R17-64
+(inheritance), R17-32 (marks), R17-66/67 (init passes) are each "the
+owner exists, a path bypasses it". NOT-REAL adjudications recorded
+above plus arrays: histogram CA type, u32 counters, compress N NOMOD,
+DB-link gate coverage, subArray NELM/INDX post-598e9b3a, val_capacity
+MALM (all refuted with evidence). Flakes: none observed this round
+(B re-ran the three known-flaky CLI tests: all pass).

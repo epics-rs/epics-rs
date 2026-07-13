@@ -363,111 +363,27 @@ impl ThrottleRecord {
 }
 
 static FIELDS: &[FieldDesc] = &[
-    FieldDesc {
-        name: "VAL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OVAL",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "SENT",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "OSENT",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "WAIT",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "HOPR",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LOPR",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DRVLH",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DRVLL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DRVLS",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "DRVLC",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "VER",
-        dbf_type: DbFieldType::String,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "STS",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "PREC",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DPREC",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DLY",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OUT",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OV",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "SINP",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIV",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "SYNC",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
+    FieldDesc::new("VAL", DbFieldType::Double, false),
+    FieldDesc::new("OVAL", DbFieldType::Double, true),
+    FieldDesc::new("SENT", DbFieldType::Double, true),
+    FieldDesc::new("OSENT", DbFieldType::Double, true),
+    FieldDesc::new("WAIT", DbFieldType::Short, true),
+    FieldDesc::new("HOPR", DbFieldType::Double, false),
+    FieldDesc::new("LOPR", DbFieldType::Double, false),
+    FieldDesc::new("DRVLH", DbFieldType::Double, false),
+    FieldDesc::new("DRVLL", DbFieldType::Double, false),
+    FieldDesc::new("DRVLS", DbFieldType::Short, true),
+    FieldDesc::new("DRVLC", DbFieldType::Short, false),
+    FieldDesc::new("VER", DbFieldType::String, true),
+    FieldDesc::new("STS", DbFieldType::Short, true),
+    FieldDesc::new("PREC", DbFieldType::Short, false),
+    FieldDesc::new("DPREC", DbFieldType::Short, false),
+    FieldDesc::new("DLY", DbFieldType::Double, false),
+    FieldDesc::new("OUT", DbFieldType::String, false),
+    FieldDesc::new("OV", DbFieldType::Short, true),
+    FieldDesc::new("SINP", DbFieldType::String, false),
+    FieldDesc::new("SIV", DbFieldType::Short, true),
+    FieldDesc::new("SYNC", DbFieldType::Short, false),
 ];
 
 impl Record for ThrottleRecord {

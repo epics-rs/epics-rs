@@ -1359,21 +1359,40 @@ pub fn apply_fields(
         // `EpicsValue::parse_bytes` below, which keeps the bytes.
         let value_str = &value.as_str_lossy();
 
-        // Try record-specific field first
-        let field_desc = record
+        // Two separate questions, and they must stay separate: *who owns* this
+        // field (the record, or the framework's dbCommon fallback), and *what
+        // type* the `.db` string parses as. `field_list()` is the spec and now
+        // carries every field the `.dbd` declares — including INP/OUT, which
+        // most record types leave to the framework — so ownership is asked of
+        // `implements_field()`, not of table membership.
+        let owned = record.implements_field(&upper_name);
+        let spec = record
             .field_list()
             .iter()
             .find(|f| f.name == upper_name.as_str());
 
-        if let Some(desc) = field_desc {
-            let dbf_type = desc.dbf_type;
+        if owned {
+            // Parse to the type the record STORES, exactly as
+            // `put_field_internal_default` coerces to it: `put_field`'s arms
+            // match on what is stored, and a `menu()` field is declared
+            // `DBF_MENU` but stored as a `Short` choice index. The `.dbd` type
+            // is the fallback for a field the record cannot yet produce a value
+            // for.
+            let dbf_type = record
+                .get_field(&upper_name)
+                .map(|v| v.db_field_type())
+                .or_else(|| spec.map(|f| f.dbf_type))
+                .ok_or_else(|| {
+                    CaError::InvalidValue(format!("field {upper_name}: no type to parse it as"))
+                })?;
             // A `DBF_MENU` field's `.db` value resolves against THAT field's
             // own menu (label-first, then a numeric index) — C dbStaticLib
             // `dbPutStringNum`. Using the field's choices, not a cross-menu
             // global table, is what keeps a menu-specific label from being
             // dropped or mis-mapped (e.g. `field(SELM,"Specified")`).
-            let parsed = if let Some(choices) = record
-                .menu_field_choices(&upper_name)
+            let parsed = if let Some(choices) = spec
+                .and_then(|f| f.menu)
+                .or_else(|| record.menu_field_choices(&upper_name))
                 .or_else(|| crate::server::record::shared_menu_choices(&upper_name))
             {
                 crate::server::record::resolve_menu_field_string_db_load(

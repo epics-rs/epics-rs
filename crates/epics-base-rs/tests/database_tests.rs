@@ -5618,11 +5618,11 @@ struct CountingTarget {
 /// from the DESTINATION's DBF type (C `dbNameToAddr` / `dbGetLinkDBFtype`),
 /// and a record whose field type does not resolve is not written at all
 /// (sseq `processCallback`'s `default: break`). C has no field-less record.
-static COUNTING_TARGET_FIELDS: &[FieldDesc] = &[FieldDesc {
-    name: "VAL",
-    dbf_type: epics_base_rs::types::DbFieldType::Double,
-    read_only: false,
-}];
+static COUNTING_TARGET_FIELDS: &[FieldDesc] = &[FieldDesc::new(
+    "VAL",
+    epics_base_rs::types::DbFieldType::Double,
+    false,
+)];
 
 impl Record for CountingTarget {
     fn record_type(&self) -> &'static str {

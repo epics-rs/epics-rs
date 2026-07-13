@@ -1,0 +1,156 @@
+# What the `.dbd` does not carry: the type AND the `special` of a
+# `special(SPC_DBADDR)` field.
+#
+# C resolves such a field at name-resolution time by calling the record's
+# `cvt_dbaddr(DBADDR *)`, which overwrites `paddr->field_type` — and, for some
+# fields, `paddr->special` — from the record's own state (`FTVL`, `SDEF`,
+# `FTA`..`FTU`, `SIZV`). The declaration in the `.dbd` is therefore a
+# placeholder: usually `DBF_NOACCESS`, because the C struct member is a bare
+# pointer. A generator that trusted it would drop `waveform.VAL` as
+# "C-internal" and serve `mbbo.VAL` at the wrong width.
+#
+# So SPC_DBADDR is the generator's ONE declared exception, and it is a closed
+# one: `dbd-codegen` requires an entry here for every SPC_DBADDR field it parses,
+# and rejects an entry that does not name one. A new `.dbd` cannot add a
+# dynamically-typed field without this file gaining a line.
+#
+# The `special` column matters as much as the type, and is why this file cannot
+# be derived from the `.dbd` at all. `lsiRecord.c:131-134` raises
+# `paddr->special = SPC_NOMOD` on OVAL (and SPC_MOD on VAL) inside `cvt_dbaddr`,
+# and `rsrv/camessage.c:2543-2545` — "SPC_NOMOD fields are always unwritable" —
+# turns that into a CA write-access denial. Taking `read_only` from the `.dbd`
+# alone would have made `lsi.OVAL` writable, which the C IOC refuses. Measured,
+# not assumed: `caput ORA:lsi.OVAL` -> "Write access denied".
+#
+# Every type below is what the compiled C softIoc actually SERVES, measured with
+# `cainfo` and pinned in `tests/fixtures/c_native_types.tsv`; the cite is the C
+# `cvt_dbaddr` that produces it. Where the type depends on record state, the
+# `dyn` column names the field that selects it — the record's own runtime hook
+# owns that answer, and the type here is the one C serves at the selector's
+# `.dbd` default.
+#
+# One special is NOT expressible here, because it is state-dependent rather than
+# per-field: `compressRecord.c:43` raises SPC_NOMOD on VAL only while
+# `BALG == LIFO`. That is the dynamic half of no-modify and belongs to
+# `Record::field_no_mod`, which already owns it; the static entry below is the
+# FIFO default.
+#
+# record.FIELD          DBF type        special     dyn         C source
+# ---------------------------------------------------------------------------
+
+# waveform/aai/aao: the VAL array's element type IS `FTVL`, its count `NELM`.
+waveform.VAL            DBF_DOUBLE      SPC_DBADDR  FTVL        waveformRecord.c:150-156
+aai.VAL                 DBF_DOUBLE      SPC_DBADDR  FTVL        aaiRecord.c:161-167
+aao.VAL                 DBF_DOUBLE      SPC_DBADDR  FTVL        aaoRecord.c:172-178
+
+# mbbo: VAL is DBF_ENUM only when state strings are defined. With no ZRST..FFST,
+# `sdef` is false and C re-types VAL to DBF_USHORT — which CA promotes to
+# DBR_LONG, so a default mbbo's VAL is served as a LONG, not an ENUM.
+mbbo.VAL                DBF_ENUM        SPC_DBADDR  SDEF        mbboRecord.c:300-312
+
+# compress: the circular buffer is always doubles, `NSAM` deep.
+compress.VAL            DBF_DOUBLE      SPC_DBADDR  -           compressRecord.c:398-410
+
+# histogram: the bin counts are epicsUInt32, `NBINS` deep. CA has no unsigned
+# long, so C serves them as DBR_DOUBLE — `DbFieldType::ULong` reproduces that
+# via `ca_wire_type`.
+histogram.VAL           DBF_ULONG       SPC_DBADDR  -           histogramRecord.c:378-386
+
+# lsi/lso/printf: a long string is a `char *` of `SIZV` bytes. Over plain CA the
+# field is served as a single DBF_STRING (truncated to MAX_STRING_SIZE); the
+# full value needs the `$` char-array channel view, which `dbChannel` builds
+# from the same field.
+lsi.VAL                 DBF_STRING      SPC_MOD     -           lsiRecord.c:214-222
+lsi.OVAL                DBF_STRING      SPC_NOMOD   -           lsiRecord.c:214-222
+lso.VAL                 DBF_STRING      SPC_MOD     -           lsoRecord.c:227-235
+lso.OVAL                DBF_STRING      SPC_NOMOD   -           lsoRecord.c:227-235
+printf.VAL              DBF_STRING      SPC_DBADDR  -           printfRecord.c:161-169
+
+# aSub: every input A..U and output VALA..VALU is a `void *` whose element type
+# is the matching `FTA`..`FTU` / `FTVA`..`FTVU` menu and whose count is
+# `NEA`..`NEU` / `NOA`..`NOU`. All twelve menus default to DOUBLE.
+aSub.A                  DBF_DOUBLE      SPC_DBADDR  FTA         aSubRecord.c:246-258
+aSub.B                  DBF_DOUBLE      SPC_DBADDR  FTB         aSubRecord.c:246-258
+aSub.C                  DBF_DOUBLE      SPC_DBADDR  FTC         aSubRecord.c:246-258
+aSub.D                  DBF_DOUBLE      SPC_DBADDR  FTD         aSubRecord.c:246-258
+aSub.E                  DBF_DOUBLE      SPC_DBADDR  FTE         aSubRecord.c:246-258
+aSub.F                  DBF_DOUBLE      SPC_DBADDR  FTF         aSubRecord.c:246-258
+aSub.G                  DBF_DOUBLE      SPC_DBADDR  FTG         aSubRecord.c:246-258
+aSub.H                  DBF_DOUBLE      SPC_DBADDR  FTH         aSubRecord.c:246-258
+aSub.I                  DBF_DOUBLE      SPC_DBADDR  FTI         aSubRecord.c:246-258
+aSub.J                  DBF_DOUBLE      SPC_DBADDR  FTJ         aSubRecord.c:246-258
+aSub.K                  DBF_DOUBLE      SPC_DBADDR  FTK         aSubRecord.c:246-258
+aSub.L                  DBF_DOUBLE      SPC_DBADDR  FTL         aSubRecord.c:246-258
+aSub.M                  DBF_DOUBLE      SPC_DBADDR  FTM         aSubRecord.c:246-258
+aSub.N                  DBF_DOUBLE      SPC_DBADDR  FTN         aSubRecord.c:246-258
+aSub.O                  DBF_DOUBLE      SPC_DBADDR  FTO         aSubRecord.c:246-258
+aSub.P                  DBF_DOUBLE      SPC_DBADDR  FTP         aSubRecord.c:246-258
+aSub.Q                  DBF_DOUBLE      SPC_DBADDR  FTQ         aSubRecord.c:246-258
+aSub.R                  DBF_DOUBLE      SPC_DBADDR  FTR         aSubRecord.c:246-258
+aSub.S                  DBF_DOUBLE      SPC_DBADDR  FTS         aSubRecord.c:246-258
+aSub.T                  DBF_DOUBLE      SPC_DBADDR  FTT         aSubRecord.c:246-258
+aSub.U                  DBF_DOUBLE      SPC_DBADDR  FTU         aSubRecord.c:246-258
+aSub.VALA               DBF_DOUBLE      SPC_DBADDR  FTVA        aSubRecord.c:246-258
+aSub.VALB               DBF_DOUBLE      SPC_DBADDR  FTVB        aSubRecord.c:246-258
+aSub.VALC               DBF_DOUBLE      SPC_DBADDR  FTVC        aSubRecord.c:246-258
+aSub.VALD               DBF_DOUBLE      SPC_DBADDR  FTVD        aSubRecord.c:246-258
+aSub.VALE               DBF_DOUBLE      SPC_DBADDR  FTVE        aSubRecord.c:246-258
+aSub.VALF               DBF_DOUBLE      SPC_DBADDR  FTVF        aSubRecord.c:246-258
+aSub.VALG               DBF_DOUBLE      SPC_DBADDR  FTVG        aSubRecord.c:246-258
+aSub.VALH               DBF_DOUBLE      SPC_DBADDR  FTVH        aSubRecord.c:246-258
+aSub.VALI               DBF_DOUBLE      SPC_DBADDR  FTVI        aSubRecord.c:246-258
+aSub.VALJ               DBF_DOUBLE      SPC_DBADDR  FTVJ        aSubRecord.c:246-258
+aSub.VALK               DBF_DOUBLE      SPC_DBADDR  FTVK        aSubRecord.c:246-258
+aSub.VALL               DBF_DOUBLE      SPC_DBADDR  FTVL        aSubRecord.c:246-258
+aSub.VALM               DBF_DOUBLE      SPC_DBADDR  FTVM        aSubRecord.c:246-258
+aSub.VALN               DBF_DOUBLE      SPC_DBADDR  FTVN        aSubRecord.c:246-258
+aSub.VALO               DBF_DOUBLE      SPC_DBADDR  FTVO        aSubRecord.c:246-258
+aSub.VALP               DBF_DOUBLE      SPC_DBADDR  FTVP        aSubRecord.c:246-258
+aSub.VALQ               DBF_DOUBLE      SPC_DBADDR  FTVQ        aSubRecord.c:246-258
+aSub.VALR               DBF_DOUBLE      SPC_DBADDR  FTVR        aSubRecord.c:246-258
+aSub.VALS               DBF_DOUBLE      SPC_DBADDR  FTVS        aSubRecord.c:246-258
+aSub.VALT               DBF_DOUBLE      SPC_DBADDR  FTVT        aSubRecord.c:246-258
+aSub.VALU               DBF_DOUBLE      SPC_DBADDR  FTVU        aSubRecord.c:246-258
+
+# --- synApps calc module -----------------------------------------------------
+# These record types are not in the base softIoc, so they carry no row in
+# `c_native_types.tsv`; the type is read from the module's own `cvt_dbaddr`.
+
+# aCalcout: the array inputs AA..LL and the array outputs AVAL/OAV are
+# `double *` of NUSE/NELM elements.
+acalcout.AVAL           DBF_DOUBLE      SPC_DBADDR  -           aCalcoutRecord.c cvt_dbaddr
+acalcout.OAV            DBF_DOUBLE      SPC_DBADDR  -           aCalcoutRecord.c cvt_dbaddr
+acalcout.AA             DBF_DOUBLE      SPC_DBADDR  -           aCalcoutRecord.c cvt_dbaddr
+acalcout.BB             DBF_DOUBLE      SPC_DBADDR  -           aCalcoutRecord.c cvt_dbaddr
+acalcout.CC             DBF_DOUBLE      SPC_DBADDR  -           aCalcoutRecord.c cvt_dbaddr
+acalcout.DD             DBF_DOUBLE      SPC_DBADDR  -           aCalcoutRecord.c cvt_dbaddr
+acalcout.EE             DBF_DOUBLE      SPC_DBADDR  -           aCalcoutRecord.c cvt_dbaddr
+acalcout.FF             DBF_DOUBLE      SPC_DBADDR  -           aCalcoutRecord.c cvt_dbaddr
+acalcout.GG             DBF_DOUBLE      SPC_DBADDR  -           aCalcoutRecord.c cvt_dbaddr
+acalcout.HH             DBF_DOUBLE      SPC_DBADDR  -           aCalcoutRecord.c cvt_dbaddr
+acalcout.II             DBF_DOUBLE      SPC_DBADDR  -           aCalcoutRecord.c cvt_dbaddr
+acalcout.JJ             DBF_DOUBLE      SPC_DBADDR  -           aCalcoutRecord.c cvt_dbaddr
+acalcout.KK             DBF_DOUBLE      SPC_DBADDR  -           aCalcoutRecord.c cvt_dbaddr
+acalcout.LL             DBF_DOUBLE      SPC_DBADDR  -           aCalcoutRecord.c cvt_dbaddr
+
+# sCalcout: the string inputs PAA..PLL are `char *` long strings, served as a
+# single DBF_STRING over plain CA exactly like lsi/lso.
+scalcout.PAA            DBF_STRING      SPC_DBADDR  -           sCalcoutRecord.c cvt_dbaddr
+scalcout.PBB            DBF_STRING      SPC_DBADDR  -           sCalcoutRecord.c cvt_dbaddr
+scalcout.PCC            DBF_STRING      SPC_DBADDR  -           sCalcoutRecord.c cvt_dbaddr
+scalcout.PDD            DBF_STRING      SPC_DBADDR  -           sCalcoutRecord.c cvt_dbaddr
+scalcout.PEE            DBF_STRING      SPC_DBADDR  -           sCalcoutRecord.c cvt_dbaddr
+scalcout.PFF            DBF_STRING      SPC_DBADDR  -           sCalcoutRecord.c cvt_dbaddr
+scalcout.PGG            DBF_STRING      SPC_DBADDR  -           sCalcoutRecord.c cvt_dbaddr
+scalcout.PHH            DBF_STRING      SPC_DBADDR  -           sCalcoutRecord.c cvt_dbaddr
+scalcout.PII            DBF_STRING      SPC_DBADDR  -           sCalcoutRecord.c cvt_dbaddr
+scalcout.PJJ            DBF_STRING      SPC_DBADDR  -           sCalcoutRecord.c cvt_dbaddr
+scalcout.PKK            DBF_STRING      SPC_DBADDR  -           sCalcoutRecord.c cvt_dbaddr
+scalcout.PLL            DBF_STRING      SPC_DBADDR  -           sCalcoutRecord.c cvt_dbaddr
+
+# --- asyn module -------------------------------------------------------------
+# asynRecord's BOUT/BINP are `epicsInt8[]` binary buffers of OMAX/IMAX bytes;
+# ERRS is a `char *` error string.
+asyn.BOUT               DBF_CHAR        SPC_DBADDR  -           asynRecord.c cvt_dbaddr
+asyn.BINP               DBF_CHAR        SPC_DBADDR  -           asynRecord.c cvt_dbaddr
+asyn.ERRS               DBF_CHAR        SPC_NOMOD   -           asynRecord.c cvt_dbaddr

@@ -36,16 +36,8 @@ struct OwnsOutRecord {
 }
 
 static OWNS_OUT_FIELDS: &[FieldDesc] = &[
-    FieldDesc {
-        name: "VAL",
-        dbf_type: DbFieldType::Long,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OUT",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
+    FieldDesc::new("VAL", DbFieldType::Long, false),
+    FieldDesc::new("OUT", DbFieldType::String, false),
 ];
 
 impl Record for OwnsOutRecord {

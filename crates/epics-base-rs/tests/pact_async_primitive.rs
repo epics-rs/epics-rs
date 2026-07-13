@@ -36,11 +36,7 @@ impl TestAsyncRecord {
     }
 }
 
-static TEST_FIELDS: &[FieldDesc] = &[FieldDesc {
-    name: "VAL",
-    dbf_type: DbFieldType::Long,
-    read_only: false,
-}];
+static TEST_FIELDS: &[FieldDesc] = &[FieldDesc::new("VAL", DbFieldType::Long, false)];
 
 impl Record for TestAsyncRecord {
     fn record_type(&self) -> &'static str {
@@ -360,16 +356,8 @@ struct NotifySourceRecord {
 }
 
 static NOTIFY_SRC_FIELDS: &[FieldDesc] = &[
-    FieldDesc {
-        name: "VAL",
-        dbf_type: DbFieldType::Long,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LNK",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
+    FieldDesc::new("VAL", DbFieldType::Long, false),
+    FieldDesc::new("LNK", DbFieldType::String, false),
 ];
 
 impl Record for NotifySourceRecord {

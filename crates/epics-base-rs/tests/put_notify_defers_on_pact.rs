@@ -61,11 +61,7 @@ struct AsyncOnceRecord {
     seen_by_process: Arc<std::sync::Mutex<Vec<i32>>>,
 }
 
-static FIELDS: &[FieldDesc] = &[FieldDesc {
-    name: "VAL",
-    dbf_type: DbFieldType::Long,
-    read_only: false,
-}];
+static FIELDS: &[FieldDesc] = &[FieldDesc::new("VAL", DbFieldType::Long, false)];
 
 impl Record for AsyncOnceRecord {
     fn record_type(&self) -> &'static str {

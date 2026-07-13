@@ -216,11 +216,23 @@ fn dbput_request(
     if value.is_empty_array() && !dest_is_array {
         return Ok(PutRequest::EmptyIntoScalar);
     }
+    // The coercion target is the type the record STORES, not the type it
+    // SERVES — `put_field`'s arms match on what is stored. A `menu()` field is
+    // declared `DBF_MENU` and served as `DBR_ENUM` with its choices, but held as
+    // a bare `Short` choice index; coercing an incoming `Short` up to `Enum`
+    // because the `.dbd` says `DBF_MENU` would make its `Short` arm unreachable.
+    // Same rule as `put_field_internal_default` and `db_loader::apply_fields`.
+    // The `.dbd` type is the fallback for a field with no current value.
     let target = record
-        .field_list()
-        .iter()
-        .find(|f| f.name.eq_ignore_ascii_case(field))
-        .map(|f| f.dbf_type);
+        .get_field(field)
+        .map(|v| v.db_field_type())
+        .or_else(|| {
+            record
+                .field_list()
+                .iter()
+                .find(|f| f.name.eq_ignore_ascii_case(field))
+                .map(|f| f.dbf_type)
+        });
 
     // C `dbPut` clamps the request to the destination's element count —
     // `if (no_elements < nRequest) nRequest = no_elements;` (dbAccess.c:1359),

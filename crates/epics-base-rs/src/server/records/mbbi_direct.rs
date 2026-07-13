@@ -86,11 +86,7 @@ fn bit_field_descs() -> &'static [FieldDesc] {
     // Const-evaluated table of the 32 bit fields.
     macro_rules! bf {
         ($name:literal) => {
-            FieldDesc {
-                name: $name,
-                dbf_type: DbFieldType::Char,
-                read_only: false,
-            }
+            FieldDesc::new($name, DbFieldType::Char, false)
         };
     }
     static BITS: [FieldDesc; 32] = [
@@ -131,66 +127,18 @@ fn bit_field_descs() -> &'static [FieldDesc] {
 }
 
 static MBBI_DIRECT_HEAD_FIELDS: &[FieldDesc] = &[
-    FieldDesc {
-        name: "VAL",
-        dbf_type: DbFieldType::Long,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "RVAL",
-        dbf_type: DbFieldType::ULong,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ORAW",
-        dbf_type: DbFieldType::ULong,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "MASK",
-        dbf_type: DbFieldType::ULong,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SHFT",
-        dbf_type: DbFieldType::UShort,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "NOBT",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "MLST",
-        dbf_type: DbFieldType::Long,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "SIMM",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIML",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIOL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIMS",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SDLY",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
+    FieldDesc::new("VAL", DbFieldType::Long, false),
+    FieldDesc::new("RVAL", DbFieldType::ULong, false),
+    FieldDesc::new("ORAW", DbFieldType::ULong, true),
+    FieldDesc::new("MASK", DbFieldType::ULong, false),
+    FieldDesc::new("SHFT", DbFieldType::UShort, false),
+    FieldDesc::new("NOBT", DbFieldType::Short, false),
+    FieldDesc::new("MLST", DbFieldType::Long, true),
+    FieldDesc::new("SIMM", DbFieldType::Short, false),
+    FieldDesc::new("SIML", DbFieldType::String, false),
+    FieldDesc::new("SIOL", DbFieldType::String, false),
+    FieldDesc::new("SIMS", DbFieldType::Short, false),
+    FieldDesc::new("SDLY", DbFieldType::Double, false),
 ];
 
 /// Full field table: the 11 scalar fields followed by the 32 bit fields.

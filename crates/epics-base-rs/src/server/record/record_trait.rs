@@ -3,12 +3,131 @@ use crate::types::{DbFieldType, EpicsValue};
 
 use super::scan::ScanType;
 
-/// Metadata describing a single field in a record.
+/// The `special(SPC_*)` dispatch code a field declares — C `special.h`.
+///
+/// C hands this to the record's `special(DBADDR *, int after)` on every put, and
+/// `dbAccess.c` acts on three of them itself before the record ever sees the
+/// write: `NoMod` refuses it (`S_db_noMod`), `DbAddr` means the field's type and
+/// element count come from the record's `cvt_dbaddr` rather than the `.dbd`, and
+/// `As` re-evaluates access security.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Special {
+    /// No `special()` declared.
+    None,
+    /// `SPC_NOMOD` (1) — the field must not be modified. Mirrored into
+    /// [`FieldDesc::read_only`], which is the bit the put gate reads.
+    NoMod,
+    /// `SPC_DBADDR` (2) — the record's `cvt_dbaddr` supplies the field's type
+    /// and element count. [`FieldDesc::dbf_type`] carries the type C serves at
+    /// the selector field's default; a record whose type is state-dependent
+    /// (`waveform.VAL` on `FTVL`, `mbbo.VAL` on `SDEF`) overrides it at runtime.
+    DbAddr,
+    /// `SPC_SCAN` (3) — a scan-related field; C re-registers the scan.
+    Scan,
+    /// `SPC_ALARMACK` (5) — an alarm acknowledgement.
+    AlarmAck,
+    /// `SPC_AS` (6) — access security; C re-computes the record's ASG.
+    As,
+    /// `SPC_ATTRIBUTE` (7) — a pseudo (attribute) field.
+    Attribute,
+    /// `SPC_MOD` (100) — the record's own `special()` runs on the put.
+    Mod,
+    /// `SPC_RESET` (101) — the `RES` field is being modified.
+    Reset,
+    /// `SPC_LINCONV` (102) — a linear-conversion field changed; C calls the
+    /// device support's `special_linconv`.
+    LinConv,
+    /// `SPC_CALC` (103) — the `CALC` expression changed; C recompiles it.
+    Calc,
+}
+
+/// A field's access-security level — C `.dbd` `asl(ASL0|ASL1)`.
+///
+/// `ASL1` is the `.dbd` default (`dbLexRoutines.c:570`); `asl(ASL0)` lowers a
+/// field to the level an operator may write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Asl {
+    Asl0,
+    Asl1,
+}
+
+/// The `.dbd` declaration of a single record field.
+///
+/// Every one of these is **generated** from the vendored EPICS `.dbd` by
+/// `tools/dbd-codegen` — see [`dbd_generated`](super::dbd_generated). They used
+/// to be hand-copied, which is what made a wrong `dbf_type` or a missed
+/// `special(SPC_NOMOD)` a recurring finding rather than an impossible state.
+///
+/// The struct carries the *whole* declaration, not just the three attributes the
+/// runtime consumes today: dropping the rest at the parser is how the port ended
+/// up unable to answer questions like "is this field `pp(TRUE)`?" without
+/// re-reading the `.dbd`.
 #[derive(Debug, Clone)]
 pub struct FieldDesc {
+    /// The field name, upper-case as declared.
     pub name: &'static str,
+    /// The `DBF_*` type. This is the *field* type; the CA wire type is derived
+    /// from it by [`DbFieldType::ca_wire_type`], which owns the promotions CA
+    /// has no type for (`ULong`/`Int64`/`UInt64` -> `DBR_DOUBLE`, `UShort` ->
+    /// `DBR_LONG`, `UChar` -> `DBR_CHAR`). Do not pre-promote here: PVA serves
+    /// the native width.
     pub dbf_type: DbFieldType,
+    /// `special(SPC_NOMOD)` — the field is immutable for this record type. The
+    /// static half of the no-modify declaration; see [`Record::field_no_mod`]
+    /// for the half a record decides at runtime.
     pub read_only: bool,
+    /// The full `special()` code, of which [`Self::read_only`] is one case.
+    pub special: Special,
+    /// `pp(TRUE)` — a put to this field processes the record.
+    pub pp: bool,
+    /// `asl(...)` — the access-security level.
+    pub asl: Asl,
+    /// `size(N)` — the declared byte size of a `DBF_STRING` field, or 0.
+    pub size: u16,
+    /// `menu(...)` choice strings, in index order, for a `DBF_MENU` field. The
+    /// index is the stored value and the strings are what `get_enum_strs` serves,
+    /// so a client sees `"NO CONVERSION"` rather than `0`.
+    pub menu: Option<&'static [&'static str]>,
+    /// `initial("...")` — the value C's dbd loader seeds the field with.
+    pub initial: Option<&'static str>,
+    /// `interest(N)` — the `dbpr` verbosity level at which C prints the field.
+    pub interest: u8,
+    /// `prop(YES)` — the field is a property: a change to it posts a
+    /// `DBE_PROPERTY` event.
+    pub prop: bool,
+}
+
+impl FieldDesc {
+    /// A hand-written descriptor carrying only the three attributes the port
+    /// used to model.
+    ///
+    /// **Transitional.** Every record type is migrating to the generated table
+    /// in [`dbd_generated`](super::dbd_generated), which carries the whole `.dbd`
+    /// declaration; this constructor exists only so the not-yet-migrated records
+    /// keep compiling, and it goes away with the last of them. It does NOT know
+    /// the field's `pp`/`asl`/`size`/`menu`/`initial`, so it reports the neutral
+    /// value for each — a record still on this constructor answers "no menu"
+    /// here and resolves its choices through the
+    /// [`Record::menu_field_choices`] fallback instead.
+    pub const fn new(name: &'static str, dbf_type: DbFieldType, read_only: bool) -> Self {
+        Self {
+            name,
+            dbf_type,
+            read_only,
+            special: if read_only {
+                Special::NoMod
+            } else {
+                Special::None
+            },
+            pp: false,
+            asl: Asl::Asl1,
+            size: 0,
+            menu: None,
+            initial: None,
+            interest: 0,
+            prop: false,
+        }
+    }
 }
 
 /// One `recGblInitConstantLink(&prec->LINK, DBF_x, &prec->TARGET)` call from a
@@ -783,8 +902,39 @@ pub trait Record: Send + Sync + 'static {
     /// Set a field value by name.
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()>;
 
-    /// Return the list of field descriptors.
+    /// Return the list of field descriptors — the record type's `.dbd`
+    /// declaration.
+    ///
+    /// This is a *spec*: it says what each field's type, menu and
+    /// `special(SPC_NOMOD)` are. It does NOT say who implements the field.
+    /// Ask [`Record::implements_field`] for that — see its docs for why the
+    /// two must not be the same question.
     fn field_list(&self) -> &'static [FieldDesc];
+
+    /// Does this record type implement `name` in its own `get_field` /
+    /// `put_field`, as opposed to leaving it to the framework's dbCommon
+    /// handling?
+    ///
+    /// This used to be answered by `field_list()` membership, which conflated
+    /// two questions: "what is this field?" and "who owns it?". They give
+    /// different answers for `INP`/`OUT`: every record type *declares* them in
+    /// the `.dbd`, but only some drive the link themselves
+    /// (`multi_output_links` for `acalcout`/`scalcout`, device support for
+    /// `motorRecord`/`scalerRecord`); for the rest the framework arms
+    /// `parsed_inp`/`parsed_out` and drives it. While `field_list()` was
+    /// hand-written and incomplete the conflation was invisible, because the
+    /// hand-written tables happened to omit exactly the fields the framework
+    /// owns. A complete, spec-derived `field_list()` makes membership true for
+    /// every record, so ownership needs its own predicate or the framework
+    /// would stop arming any link at all.
+    ///
+    /// The default answers it truthfully — a record implements the fields its
+    /// own `get_field` can produce. (Verified equivalent to the old
+    /// `field_list()` membership on all 1,757 fields of all 40 record types at
+    /// the time of the split, so the split changed no behaviour.)
+    fn implements_field(&self, name: &str) -> bool {
+        self.get_field(name).is_some()
+    }
 
     /// `SPC_NOMOD` that a record's `cvt_dbaddr` decides **at runtime, from
     /// record state** — the dynamic half of the no-modify declaration.
@@ -2491,12 +2641,27 @@ pub fn put_field_internal_default<R: Record + ?Sized>(
     name: &str,
     value: EpicsValue,
 ) -> CaResult<()> {
+    // Coerce to the type the record STORES, not the type it SERVES. The two are
+    // the same for most fields, but a `menu()` field is declared `DBF_MENU` and
+    // served as `DBR_ENUM` with its choices (`promote_menu_value`) while the
+    // record stores the bare choice index as a `Short` — and `put_field`'s arms
+    // match on what is stored. Coercing to the served type would hand every
+    // `put_field` an `Enum` its `Short` arm cannot match. This is the inverse of
+    // `promote_menu_value`, and asking the record what it holds keeps the rule
+    // uniform instead of special-casing menus here.
+    //
+    // The `.dbd` type is the fallback for a field the record cannot currently
+    // produce a value for (an uninitialised array, a port-internal field).
     let target_type = record
-        .field_list()
-        .iter()
-        .find(|f| f.name.eq_ignore_ascii_case(name))
-        .map(|f| f.dbf_type)
-        .or_else(|| record.get_field(name).map(|v| v.db_field_type()));
+        .get_field(name)
+        .map(|v| v.db_field_type())
+        .or_else(|| {
+            record
+                .field_list()
+                .iter()
+                .find(|f| f.name.eq_ignore_ascii_case(name))
+                .map(|f| f.dbf_type)
+        });
     // An array source into a SCALAR destination delivers element 0. C's link
     // layer asks for exactly one element (`dbGetLink(..., nRequest = NULL)`), so
     // `dbGet` converts the field at offset 0 and the record sees a scalar — a

@@ -235,110 +235,74 @@ impl ASubRecord {
     /// field plus VAL/SNAM/INAM).
     fn descriptors() -> Vec<FieldDesc> {
         let mut v = vec![
-            FieldDesc {
-                name: "VAL",
-                dbf_type: DbFieldType::Double,
-                read_only: false,
-            },
-            FieldDesc {
-                name: "SNAM",
-                dbf_type: DbFieldType::String,
-                read_only: false,
-            },
-            FieldDesc {
-                // INAM: init-routine name, SPC_NOMOD (config; .db-load only).
-                name: "INAM",
-                dbf_type: DbFieldType::String,
-                read_only: true,
-            },
-            FieldDesc {
-                name: "BRSV",
-                dbf_type: DbFieldType::Short,
-                read_only: false,
-            },
-            FieldDesc {
-                name: "PREC",
-                dbf_type: DbFieldType::Short,
-                read_only: false,
-            },
-            FieldDesc {
-                name: "EFLG",
-                dbf_type: DbFieldType::Short,
-                read_only: false,
-            },
-            FieldDesc {
-                name: "LFLG",
-                dbf_type: DbFieldType::Short,
-                read_only: false,
-            },
+            FieldDesc::new("VAL", DbFieldType::Double, false),
+            FieldDesc::new("SNAM", DbFieldType::String, false),
+            // INAM: init-routine name, SPC_NOMOD (config; .db-load only).
+            FieldDesc::new("INAM", DbFieldType::String, true),
+            FieldDesc::new("BRSV", DbFieldType::Short, false),
+            FieldDesc::new("PREC", DbFieldType::Short, false),
+            FieldDesc::new("EFLG", DbFieldType::Short, false),
+            FieldDesc::new("LFLG", DbFieldType::Short, false),
             // SUBL/ONAM are `special(SPC_NOMOD)` in C: client runtime puts are
             // blocked (read_only), but the `.db` loader and the framework's
             // own processing writes go through `put_field` directly.
-            FieldDesc {
-                name: "SUBL",
-                dbf_type: DbFieldType::String,
-                read_only: true,
-            },
-            FieldDesc {
-                name: "ONAM",
-                dbf_type: DbFieldType::String,
-                read_only: true,
-            },
+            FieldDesc::new("SUBL", DbFieldType::String, true),
+            FieldDesc::new("ONAM", DbFieldType::String, true),
         ];
         // Per-channel field families. Names are leaked to obtain the
         // 'static lifetime FieldDesc requires; the table is built once.
         for &c in SUFFIX.iter() {
             let mk = |s: String| -> &'static str { Box::leak(s.into_boxed_str()) };
-            v.push(FieldDesc {
-                name: mk(format!("INP{c}")),
-                dbf_type: DbFieldType::String,
-                read_only: false,
-            });
-            v.push(FieldDesc {
-                name: mk(c.to_string()),
-                dbf_type: DbFieldType::Double,
-                read_only: false,
-            });
-            v.push(FieldDesc {
-                name: mk(format!("VAL{c}")),
-                dbf_type: DbFieldType::Double,
-                read_only: false,
-            });
-            v.push(FieldDesc {
-                name: mk(format!("OUT{c}")),
-                dbf_type: DbFieldType::String,
-                read_only: false,
-            });
-            v.push(FieldDesc {
-                name: mk(format!("FT{c}")),
-                dbf_type: DbFieldType::Short,
-                read_only: false,
-            });
-            v.push(FieldDesc {
-                name: mk(format!("FTV{c}")),
-                dbf_type: DbFieldType::Short,
-                read_only: false,
-            });
-            v.push(FieldDesc {
-                name: mk(format!("NO{c}")),
-                dbf_type: DbFieldType::Long,
-                read_only: false,
-            });
-            v.push(FieldDesc {
-                name: mk(format!("NOV{c}")),
-                dbf_type: DbFieldType::Long,
-                read_only: false,
-            });
-            v.push(FieldDesc {
-                name: mk(format!("NE{c}")),
-                dbf_type: DbFieldType::Long,
-                read_only: true,
-            });
-            v.push(FieldDesc {
-                name: mk(format!("NEV{c}")),
-                dbf_type: DbFieldType::Long,
-                read_only: true,
-            });
+            v.push(FieldDesc::new(
+                mk(format!("INP{c}")),
+                DbFieldType::String,
+                false,
+            ));
+            v.push(FieldDesc::new(
+                mk(c.to_string()),
+                DbFieldType::Double,
+                false,
+            ));
+            v.push(FieldDesc::new(
+                mk(format!("VAL{c}")),
+                DbFieldType::Double,
+                false,
+            ));
+            v.push(FieldDesc::new(
+                mk(format!("OUT{c}")),
+                DbFieldType::String,
+                false,
+            ));
+            v.push(FieldDesc::new(
+                mk(format!("FT{c}")),
+                DbFieldType::Short,
+                false,
+            ));
+            v.push(FieldDesc::new(
+                mk(format!("FTV{c}")),
+                DbFieldType::Short,
+                false,
+            ));
+            v.push(FieldDesc::new(
+                mk(format!("NO{c}")),
+                DbFieldType::Long,
+                false,
+            ));
+            v.push(FieldDesc::new(
+                mk(format!("NOV{c}")),
+                DbFieldType::Long,
+                false,
+            ));
+            v.push(FieldDesc::new(
+                mk(format!("NE{c}")),
+                DbFieldType::Long,
+                true,
+            ));
+            v.push(FieldDesc::new(
+                mk(format!("NEV{c}")),
+                DbFieldType::Long,
+                true,
+            ));
         }
         v
     }

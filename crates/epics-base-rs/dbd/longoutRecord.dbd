@@ -1,0 +1,272 @@
+#*************************************************************************
+# Copyright (c) 2002 The University of Chicago, as Operator of Argonne
+#     National Laboratory.
+# Copyright (c) 2002 The Regents of the University of California, as
+#     Operator of Los Alamos National Laboratory.
+# EPICS BASE is distributed subject to a Software License Agreement found
+# in file LICENSE that is included with this distribution.
+#*************************************************************************
+
+
+menu(longoutOOPT) {
+	choice(longoutOOPT_Every_Time,"Every Time")
+	choice(longoutOOPT_On_Change,"On Change")
+	choice(longoutOOPT_When_Zero,"When Zero")
+	choice(longoutOOPT_When_Non_zero,"When Non-zero")
+	choice(longoutOOPT_Transition_To_Zero,"Transition To Zero")
+	choice(longoutOOPT_Transition_To_Non_zero,"Transition To Non-zero")
+}
+
+recordtype(longout) {
+
+
+	include "dbCommon.dbd"
+    %
+    %/* Declare Device Support Entry Table */
+    %struct longoutRecord;
+    %typedef struct longoutdset {
+    %    dset common; /*init_record returns: (-1,0)=>(failure,success)*/
+    %    long (*write_longout)(struct longoutRecord *prec); /*(-1,0)=>(failure,success*/
+    %} longoutdset;
+    %#define HAS_longoutdset
+    %
+	field(VAL,DBF_LONG) {
+		prompt("Desired Output")
+		promptgroup("50 - Output")
+		asl(ASL0)
+		pp(TRUE)
+	}
+	field(OUT,DBF_OUTLINK) {
+		prompt("Output Specification")
+		special(SPC_MOD)
+		promptgroup("50 - Output")
+		interest(1)
+	}
+	field(DOL,DBF_INLINK) {
+		prompt("Desired Output Link")
+		promptgroup("40 - Input")
+		interest(1)
+	}
+	field(OMSL,DBF_MENU) {
+		prompt("Output Mode Select")
+		promptgroup("50 - Output")
+		interest(1)
+		menu(menuOmsl)
+	}
+
+
+	field(EGU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup("80 - Display")
+		interest(1)
+		size(16)
+		prop(YES)		# get_units
+	}
+	field(DRVH,DBF_LONG) {
+		prompt("Drive High Limit")
+		promptgroup("30 - Action")
+		pp(TRUE)
+		interest(1)
+		prop(YES)		# get_control_double
+	}
+	field(DRVL,DBF_LONG) {
+		prompt("Drive Low Limit")
+		promptgroup("30 - Action")
+		pp(TRUE)
+		interest(1)
+		prop(YES)		# get_control_double
+	}
+	field(HOPR,DBF_LONG) {
+		prompt("High Operating Range")
+		promptgroup("80 - Display")
+		interest(1)
+		prop(YES)		# get_graphic_double, get_control_double
+	}
+	field(LOPR,DBF_LONG) {
+		prompt("Low Operating Range")
+		promptgroup("80 - Display")
+		interest(1)
+		prop(YES)		# get_graphic_double, get_control_double
+	}
+
+
+	field(HIHI,DBF_LONG) {
+		prompt("Hihi Alarm Limit")
+		promptgroup("70 - Alarm")
+		pp(TRUE)
+		interest(1)
+		prop(YES)		# get_alarm_double
+	}
+	field(LOLO,DBF_LONG) {
+		prompt("Lolo Alarm Limit")
+		promptgroup("70 - Alarm")
+		pp(TRUE)
+		interest(1)
+		prop(YES)		# get_alarm_double
+	}
+	field(HIGH,DBF_LONG) {
+		prompt("High Alarm Limit")
+		promptgroup("70 - Alarm")
+		pp(TRUE)
+		interest(1)
+		prop(YES)		# get_alarm_double
+	}
+	field(LOW,DBF_LONG) {
+		prompt("Low Alarm Limit")
+		promptgroup("70 - Alarm")
+		pp(TRUE)
+		interest(1)
+		prop(YES)		# get_alarm_double
+	}
+	field(HHSV,DBF_MENU) {
+		prompt("Hihi Severity")
+		promptgroup("70 - Alarm")
+		pp(TRUE)
+		interest(1)
+		prop(YES)		# get_alarm_double
+		menu(menuAlarmSevr)
+	}
+	field(LLSV,DBF_MENU) {
+		prompt("Lolo Severity")
+		promptgroup("70 - Alarm")
+		pp(TRUE)
+		interest(1)
+		prop(YES)		# get_alarm_double
+		menu(menuAlarmSevr)
+	}
+	field(HSV,DBF_MENU) {
+		prompt("High Severity")
+		promptgroup("70 - Alarm")
+		pp(TRUE)
+		interest(1)
+		prop(YES)		# get_alarm_double
+		menu(menuAlarmSevr)
+	}
+	field(LSV,DBF_MENU) {
+		prompt("Low Severity")
+		promptgroup("70 - Alarm")
+		pp(TRUE)
+		interest(1)
+		prop(YES)		# get_alarm_double
+		menu(menuAlarmSevr)
+	}
+	field(HYST,DBF_LONG) {
+		prompt("Alarm Deadband")
+		promptgroup("70 - Alarm")
+		interest(1)
+	}
+
+
+	field(ADEL,DBF_LONG) {
+		prompt("Archive Deadband")
+		promptgroup("80 - Display")
+		interest(1)
+	}
+	field(MDEL,DBF_LONG) {
+		prompt("Monitor Deadband")
+		promptgroup("80 - Display")
+		interest(1)
+	}
+	field(LALM,DBF_LONG) {
+		prompt("Last Value Alarmed")
+		special(SPC_NOMOD)
+		interest(3)
+	}
+	field(ALST,DBF_LONG) {
+		prompt("Last Value Archived")
+		special(SPC_NOMOD)
+		interest(3)
+	}
+	field(MLST,DBF_LONG) {
+		prompt("Last Val Monitored")
+		special(SPC_NOMOD)
+		interest(3)
+	}
+
+
+        field(SIOL,DBF_OUTLINK) {
+		prompt("Sim Output Specifctn")
+		promptgroup("90 - Simulate")
+		interest(1)
+	}
+	field(SIML,DBF_INLINK) {
+		prompt("Sim Mode Location")
+		promptgroup("90 - Simulate")
+		interest(1)
+	}
+	field(SIMM,DBF_MENU) {
+		prompt("Simulation Mode")
+		special(SPC_MOD)
+		interest(1)
+		menu(menuYesNo)
+	}
+	field(SIMS,DBF_MENU) {
+		prompt("Sim mode Alarm Svrty")
+		promptgroup("90 - Simulate")
+		interest(2)
+		menu(menuAlarmSevr)
+	}
+	field(OLDSIMM,DBF_MENU) {
+		prompt("Prev. Simulation Mode")
+		special(SPC_NOMOD)
+		interest(4)
+		menu(menuSimm)
+	}
+	field(SSCN,DBF_MENU) {
+		prompt("Sim. Mode Scan")
+		promptgroup("90 - Simulate")
+		interest(1)
+		menu(menuScan)
+		initial("65535")
+	}
+	field(SDLY,DBF_DOUBLE) {
+		prompt("Sim. Mode Async Delay")
+		promptgroup("90 - Simulate")
+		interest(2)
+		initial("-1.0")
+	}
+	%#include "callback.h"
+	field(SIMPVT,DBF_NOACCESS) {
+		prompt("Sim. Mode Private")
+		special(SPC_NOMOD)
+		interest(4)
+		extra("epicsCallback       *simpvt")
+	}
+	field(IVOA,DBF_MENU) {
+		prompt("INVALID output action")
+		promptgroup("50 - Output")
+		interest(2)
+		menu(menuIvoa)
+	}
+	field(IVOV,DBF_LONG) {
+		prompt("INVALID output value")
+		promptgroup("50 - Output")
+		interest(2)
+	}
+	field(PVAL,DBF_LONG) {
+		prompt("Previous Value")
+	}
+	field(OUTPVT,DBF_NOACCESS) {
+		prompt("Output Write Control Private")
+		special(SPC_NOMOD)
+		interest(4)
+		extra("epicsEnum16         outpvt")
+	}
+	field(OOCH,DBF_MENU) {
+		prompt("Output Exec. On Change (Opt)")
+		promptgroup("50 - Output")
+		interest(1)
+		menu(menuYesNo)
+		initial("1")
+	}
+	field(OOPT,DBF_MENU) {
+		prompt("Output Execute Opt")
+		promptgroup("50 - Output")
+		interest(1)
+		menu(longoutOOPT)
+		initial("0")
+	}
+
+
+
+} #end of the DBD file

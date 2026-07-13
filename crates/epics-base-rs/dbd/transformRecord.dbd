@@ -1,0 +1,990 @@
+menu(transformIAV) {
+        choice(transformIAV_EXT_NC,"Ext PV NC")
+        choice(transformIAV_EXT,"Ext PV OK")
+        choice(transformIAV_LOC,"Local PV")
+        choice(transformIAV_CON,"Constant")
+}
+menu(transformIVLA) {
+        choice(transformIVLA_IGNORE,"Ignore error")
+        choice(transformIVLA_DO_NOTHING,"Do Nothing")
+}
+menu(transformCOPT) {
+        choice(transformCOPT_CONDITIONAL,"Conditional")
+        choice(transformCOPT_ALWAYS,"Always")
+}
+recordtype(transform) {
+	include "dbCommon.dbd" 
+	field(VERS,DBF_FLOAT) {
+		prompt("Code Version")
+		special(SPC_NOMOD)
+		initial("1")
+	}
+	field(RPVT,DBF_NOACCESS) {
+		prompt("Record Private")
+		special(SPC_NOMOD)
+		interest(4)
+		size(4)
+		extra("void *         rpvt")
+	}
+	field(IVLA,DBF_MENU) {
+		prompt("Invalid link action")
+		promptgroup(GUI_COMMON)
+		interest(1)
+		menu(transformIVLA)
+		initial("0")
+	}
+	field(COPT,DBF_MENU) {
+		prompt("Calc option")
+		promptgroup(GUI_COMMON)
+		interest(1)
+		menu(transformCOPT)
+		initial("Conditional")
+	}
+	field(VAL,DBF_DOUBLE) {
+		prompt("Result")
+	}
+	field(CLCA,DBF_STRING) {
+		prompt("Calculation A")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		size(120)
+	}
+	field(CLCB,DBF_STRING) {
+		prompt("Calculation B")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		size(120)
+	}
+	field(CLCC,DBF_STRING) {
+		prompt("Calculation C")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		size(120)
+	}
+	field(CLCD,DBF_STRING) {
+		prompt("Calculation D")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		size(120)
+	}
+	field(CLCE,DBF_STRING) {
+		prompt("Calculation E")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		size(120)
+	}
+	field(CLCF,DBF_STRING) {
+		prompt("Calculation F")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		size(120)
+	}
+	field(CLCG,DBF_STRING) {
+		prompt("Calculation G")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		size(120)
+	}
+	field(CLCH,DBF_STRING) {
+		prompt("Calculation H")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		size(120)
+	}
+	field(CLCI,DBF_STRING) {
+		prompt("Calculation I")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		size(120)
+	}
+	field(CLCJ,DBF_STRING) {
+		prompt("Calculation J")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		size(120)
+	}
+	field(CLCK,DBF_STRING) {
+		prompt("Calculation K")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		size(120)
+	}
+	field(CLCL,DBF_STRING) {
+		prompt("Calculation L")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		size(120)
+	}
+	field(CLCM,DBF_STRING) {
+		prompt("Calculation M")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		size(120)
+	}
+	field(CLCN,DBF_STRING) {
+		prompt("Calculation N")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		size(120)
+	}
+	field(CLCO,DBF_STRING) {
+		prompt("Calculation O")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		size(120)
+	}
+	field(CLCP,DBF_STRING) {
+		prompt("Calculation P")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		size(120)
+	}
+	field(CAV,DBF_LONG) {
+		prompt("CALC Invalid")
+		interest(1)
+	}
+	field(CBV,DBF_LONG) {
+		prompt("CALC Invalid")
+		interest(1)
+	}
+	field(CCV,DBF_LONG) {
+		prompt("CALC Invalid")
+		interest(1)
+	}
+	field(CDV,DBF_LONG) {
+		prompt("CALC Invalid")
+		interest(1)
+	}
+	field(CEV,DBF_LONG) {
+		prompt("CALC Invalid")
+		interest(1)
+	}
+	field(CFV,DBF_LONG) {
+		prompt("CALC Invalid")
+		interest(1)
+	}
+	field(CGV,DBF_LONG) {
+		prompt("CALC Invalid")
+		interest(1)
+	}
+	field(CHV,DBF_LONG) {
+		prompt("CALC Invalid")
+		interest(1)
+	}
+	field(CIV,DBF_LONG) {
+		prompt("CALC Invalid")
+		interest(1)
+	}
+	field(CJV,DBF_LONG) {
+		prompt("CALC Invalid")
+		interest(1)
+	}
+	field(CKV,DBF_LONG) {
+		prompt("CALC Invalid")
+		interest(1)
+	}
+	field(CLV,DBF_LONG) {
+		prompt("CALC Invalid")
+		interest(1)
+	}
+	field(CMV,DBF_LONG) {
+		prompt("CALC Invalid")
+		interest(1)
+	}
+	field(CNV,DBF_LONG) {
+		prompt("CALC Invalid")
+		interest(1)
+	}
+	field(COV,DBF_LONG) {
+		prompt("CALC Invalid")
+		interest(1)
+	}
+	field(CPV,DBF_LONG) {
+		prompt("CALC Invalid")
+		interest(1)
+	}
+	field(INPA,DBF_INLINK) {
+		prompt("Input A")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		interest(1)
+	}
+	field(INPB,DBF_INLINK) {
+		prompt("Input B")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		interest(1)
+	}
+	field(INPC,DBF_INLINK) {
+		prompt("Input C")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		interest(1)
+	}
+	field(INPD,DBF_INLINK) {
+		prompt("Input D")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		interest(1)
+	}
+	field(INPE,DBF_INLINK) {
+		prompt("Input E")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		interest(1)
+	}
+	field(INPF,DBF_INLINK) {
+		prompt("Input F")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		interest(1)
+	}
+	field(INPG,DBF_INLINK) {
+		prompt("Input G")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		interest(1)
+	}
+	field(INPH,DBF_INLINK) {
+		prompt("Input H")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		interest(1)
+	}
+	field(INPI,DBF_INLINK) {
+		prompt("Input I")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		interest(1)
+	}
+	field(INPJ,DBF_INLINK) {
+		prompt("Input J")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		interest(1)
+	}
+	field(INPK,DBF_INLINK) {
+		prompt("Input K")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		interest(1)
+	}
+	field(INPL,DBF_INLINK) {
+		prompt("Input L")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		interest(1)
+	}
+	field(INPM,DBF_INLINK) {
+		prompt("Input M")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		interest(1)
+	}
+	field(INPN,DBF_INLINK) {
+		prompt("Input N")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		interest(1)
+	}
+	field(INPO,DBF_INLINK) {
+		prompt("Input O")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		interest(1)
+	}
+	field(INPP,DBF_INLINK) {
+		prompt("Input P")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		interest(1)
+	}
+	field(OUTA,DBF_OUTLINK) {
+		prompt("Output A")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		interest(1)
+	}
+	field(OUTB,DBF_OUTLINK) {
+		prompt("Output B")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		interest(1)
+	}
+	field(OUTC,DBF_OUTLINK) {
+		prompt("Output C")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		interest(1)
+	}
+	field(OUTD,DBF_OUTLINK) {
+		prompt("Output D")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		interest(1)
+	}
+	field(OUTE,DBF_OUTLINK) {
+		prompt("Output E")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		interest(1)
+	}
+	field(OUTF,DBF_OUTLINK) {
+		prompt("Output F")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		interest(1)
+	}
+	field(OUTG,DBF_OUTLINK) {
+		prompt("Output G")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		interest(1)
+	}
+	field(OUTH,DBF_OUTLINK) {
+		prompt("Output H")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		interest(1)
+	}
+	field(OUTI,DBF_OUTLINK) {
+		prompt("Output I")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		interest(1)
+	}
+	field(OUTJ,DBF_OUTLINK) {
+		prompt("Output J")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		interest(1)
+	}
+	field(OUTK,DBF_OUTLINK) {
+		prompt("Output K")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		interest(1)
+	}
+	field(OUTL,DBF_OUTLINK) {
+		prompt("Output L")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		interest(1)
+	}
+	field(OUTM,DBF_OUTLINK) {
+		prompt("Output M")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		interest(1)
+	}
+	field(OUTN,DBF_OUTLINK) {
+		prompt("Output N")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		interest(1)
+	}
+	field(OUTO,DBF_OUTLINK) {
+		prompt("Output O")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		interest(1)
+	}
+	field(OUTP,DBF_OUTLINK) {
+		prompt("Output P")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		interest(1)
+	}
+	field(EGU,DBF_STRING) {
+		prompt("Units Name")
+		promptgroup(GUI_COMMON)
+		interest(1)
+		size(16)
+	}
+	field(PREC,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_COMMON)
+		interest(1)
+	}
+	field(A,DBF_DOUBLE) {
+		prompt("Value of A")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		pp(TRUE)
+	}
+	field(B,DBF_DOUBLE) {
+		prompt("Value of B")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		pp(TRUE)
+	}
+	field(C,DBF_DOUBLE) {
+		prompt("Value of C")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		pp(TRUE)
+	}
+	field(D,DBF_DOUBLE) {
+		prompt("Value of D")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		pp(TRUE)
+	}
+	field(E,DBF_DOUBLE) {
+		prompt("Value of E")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		pp(TRUE)
+	}
+	field(F,DBF_DOUBLE) {
+		prompt("Value of F")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		pp(TRUE)
+	}
+	field(G,DBF_DOUBLE) {
+		prompt("Value of G")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		pp(TRUE)
+	}
+	field(H,DBF_DOUBLE) {
+		prompt("Value of H")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		pp(TRUE)
+	}
+	field(I,DBF_DOUBLE) {
+		prompt("Value of I")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		pp(TRUE)
+	}
+	field(J,DBF_DOUBLE) {
+		prompt("Value of J")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		pp(TRUE)
+	}
+	field(K,DBF_DOUBLE) {
+		prompt("Value of K")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		pp(TRUE)
+	}
+	field(L,DBF_DOUBLE) {
+		prompt("Value of L")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		pp(TRUE)
+	}
+	field(M,DBF_DOUBLE) {
+		prompt("Value of M")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		pp(TRUE)
+	}
+	field(N,DBF_DOUBLE) {
+		prompt("Value of N")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		pp(TRUE)
+	}
+	field(O,DBF_DOUBLE) {
+		prompt("Value of O")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		pp(TRUE)
+	}
+	field(P,DBF_DOUBLE) {
+		prompt("Value of P")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		pp(TRUE)
+	}
+	field(LA,DBF_DOUBLE) {
+		prompt("Prev Value of A")
+		special(SPC_NOMOD)
+		interest(3)
+	}
+	field(LB,DBF_DOUBLE) {
+		prompt("Prev Value of B")
+		special(SPC_NOMOD)
+		interest(3)
+	}
+	field(LC,DBF_DOUBLE) {
+		prompt("Prev Value of C")
+		special(SPC_NOMOD)
+		interest(3)
+	}
+	field(LD,DBF_DOUBLE) {
+		prompt("Prev Value of D")
+		special(SPC_NOMOD)
+		interest(3)
+	}
+	field(LE,DBF_DOUBLE) {
+		prompt("Prev Value of E")
+		special(SPC_NOMOD)
+		interest(3)
+	}
+	field(LF,DBF_DOUBLE) {
+		prompt("Prev Value of F")
+		special(SPC_NOMOD)
+		interest(3)
+	}
+	field(LG,DBF_DOUBLE) {
+		prompt("Prev Value of G")
+		special(SPC_NOMOD)
+		interest(3)
+	}
+	field(LH,DBF_DOUBLE) {
+		prompt("Prev Value of H")
+		special(SPC_NOMOD)
+		interest(3)
+	}
+	field(LI,DBF_DOUBLE) {
+		prompt("Prev Value of I")
+		special(SPC_NOMOD)
+		interest(3)
+	}
+	field(LJ,DBF_DOUBLE) {
+		prompt("Prev Value of J")
+		special(SPC_NOMOD)
+		interest(3)
+	}
+	field(LK,DBF_DOUBLE) {
+		prompt("Prev Value of K")
+		special(SPC_NOMOD)
+		interest(3)
+	}
+	field(LL,DBF_DOUBLE) {
+		prompt("Prev Value of L")
+		special(SPC_NOMOD)
+		interest(3)
+	}
+	field(LM,DBF_DOUBLE) {
+		prompt("Prev Value of M")
+		special(SPC_NOMOD)
+		interest(3)
+	}
+	field(LN,DBF_DOUBLE) {
+		prompt("Prev Value of N")
+		special(SPC_NOMOD)
+		interest(3)
+	}
+	field(LO,DBF_DOUBLE) {
+		prompt("Prev Value of O")
+		special(SPC_NOMOD)
+		interest(3)
+	}
+	field(LP,DBF_DOUBLE) {
+		prompt("Prev Value of P")
+		special(SPC_NOMOD)
+		interest(3)
+	}
+	field(RPCA,DBF_NOACCESS) {
+		prompt("Postfix Calc A")
+		special(SPC_NOMOD)
+		interest(4)
+		extra("unsigned char rpca[SCALC_INFIX_TO_POSTFIX_SIZE(120)]")
+	}
+	field(RPCB,DBF_NOACCESS) {
+		prompt("Postfix Calc B")
+		special(SPC_NOMOD)
+		interest(4)
+		extra("unsigned char rpcb[SCALC_INFIX_TO_POSTFIX_SIZE(120)]")
+	}
+	field(RPCC,DBF_NOACCESS) {
+		prompt("Postfix Calc C")
+		special(SPC_NOMOD)
+		interest(4)
+		extra("unsigned char rpcc[SCALC_INFIX_TO_POSTFIX_SIZE(120)]")
+	}
+	field(RPCD,DBF_NOACCESS) {
+		prompt("Postfix Calc D")
+		special(SPC_NOMOD)
+		interest(4)
+		extra("unsigned char rpcd[SCALC_INFIX_TO_POSTFIX_SIZE(120)]")
+	}
+	field(RPCE,DBF_NOACCESS) {
+		prompt("Postfix Calc E")
+		special(SPC_NOMOD)
+		interest(4)
+		extra("unsigned char rpce[SCALC_INFIX_TO_POSTFIX_SIZE(120)]")
+	}
+	field(RPCF,DBF_NOACCESS) {
+		prompt("Postfix Calc F")
+		special(SPC_NOMOD)
+		interest(4)
+		extra("unsigned char rpcf[SCALC_INFIX_TO_POSTFIX_SIZE(120)]")
+	}
+	field(RPCG,DBF_NOACCESS) {
+		prompt("Postfix Calc G")
+		special(SPC_NOMOD)
+		interest(4)
+		extra("unsigned char rpcg[SCALC_INFIX_TO_POSTFIX_SIZE(120)]")
+	}
+	field(RPCH,DBF_NOACCESS) {
+		prompt("Postfix Calc H")
+		special(SPC_NOMOD)
+		interest(4)
+		extra("unsigned char rpch[SCALC_INFIX_TO_POSTFIX_SIZE(120)]")
+	}
+	field(RPCI,DBF_NOACCESS) {
+		prompt("Postfix Calc I")
+		special(SPC_NOMOD)
+		interest(4)
+		extra("unsigned char rpci[SCALC_INFIX_TO_POSTFIX_SIZE(120)]")
+	}
+	field(RPCJ,DBF_NOACCESS) {
+		prompt("Postfix Calc J")
+		special(SPC_NOMOD)
+		interest(4)
+		extra("unsigned char rpcj[SCALC_INFIX_TO_POSTFIX_SIZE(120)]")
+	}
+	field(RPCK,DBF_NOACCESS) {
+		prompt("Postfix Calc K")
+		special(SPC_NOMOD)
+		interest(4)
+		extra("unsigned char rpck[SCALC_INFIX_TO_POSTFIX_SIZE(120)]")
+	}
+	field(RPCL,DBF_NOACCESS) {
+		prompt("Postfix Calc L")
+		special(SPC_NOMOD)
+		interest(4)
+		extra("unsigned char rpcl[SCALC_INFIX_TO_POSTFIX_SIZE(120)]")
+	}
+	field(RPCM,DBF_NOACCESS) {
+		prompt("Postfix Calc M")
+		special(SPC_NOMOD)
+		interest(4)
+		extra("unsigned char rpcm[SCALC_INFIX_TO_POSTFIX_SIZE(120)]")
+	}
+	field(RPCN,DBF_NOACCESS) {
+		prompt("Postfix Calc N")
+		special(SPC_NOMOD)
+		interest(4)
+		extra("unsigned char rpcn[SCALC_INFIX_TO_POSTFIX_SIZE(120)]")
+	}
+	field(RPCO,DBF_NOACCESS) {
+		prompt("Postfix Calc O")
+		special(SPC_NOMOD)
+		interest(4)
+		extra("unsigned char rpco[SCALC_INFIX_TO_POSTFIX_SIZE(120)]")
+	}
+	field(RPCP,DBF_NOACCESS) {
+		prompt("Postfix Calc P")
+		special(SPC_NOMOD)
+		interest(4)
+		extra("unsigned char rpcp[SCALC_INFIX_TO_POSTFIX_SIZE(120)]")
+	}
+	field(CMTA,DBF_STRING) {
+		prompt("Comment A")
+		promptgroup(GUI_COMMON)
+		size(39)
+	}
+	field(CMTB,DBF_STRING) {
+		prompt("Comment B")
+		promptgroup(GUI_COMMON)
+		size(39)
+	}
+	field(CMTC,DBF_STRING) {
+		prompt("Comment C")
+		promptgroup(GUI_COMMON)
+		size(39)
+	}
+	field(CMTD,DBF_STRING) {
+		prompt("Comment D")
+		promptgroup(GUI_COMMON)
+		size(39)
+	}
+	field(CMTE,DBF_STRING) {
+		prompt("Comment E")
+		promptgroup(GUI_COMMON)
+		size(39)
+	}
+	field(CMTF,DBF_STRING) {
+		prompt("Comment F")
+		promptgroup(GUI_COMMON)
+		size(39)
+	}
+	field(CMTG,DBF_STRING) {
+		prompt("Comment G")
+		promptgroup(GUI_COMMON)
+		size(39)
+	}
+	field(CMTH,DBF_STRING) {
+		prompt("Comment H")
+		promptgroup(GUI_COMMON)
+		size(39)
+	}
+	field(CMTI,DBF_STRING) {
+		prompt("Comment I")
+		promptgroup(GUI_COMMON)
+		size(39)
+	}
+	field(CMTJ,DBF_STRING) {
+		prompt("Comment J")
+		promptgroup(GUI_COMMON)
+		size(39)
+	}
+	field(CMTK,DBF_STRING) {
+		prompt("Comment K")
+		promptgroup(GUI_COMMON)
+		size(39)
+	}
+	field(CMTL,DBF_STRING) {
+		prompt("Comment L")
+		promptgroup(GUI_COMMON)
+		size(39)
+	}
+	field(CMTM,DBF_STRING) {
+		prompt("Comment M")
+		promptgroup(GUI_COMMON)
+		size(39)
+	}
+	field(CMTN,DBF_STRING) {
+		prompt("Comment N")
+		promptgroup(GUI_COMMON)
+		size(39)
+	}
+	field(CMTO,DBF_STRING) {
+		prompt("Comment O")
+		promptgroup(GUI_COMMON)
+		size(39)
+	}
+	field(CMTP,DBF_STRING) {
+		prompt("Comment P")
+		promptgroup(GUI_COMMON)
+		size(39)
+	}
+	field(MAP,DBF_SHORT) {
+		prompt("Input bitmap")
+		promptgroup(GUI_COMMON)
+		interest(3)
+	}
+	field(IAV,DBF_MENU) {
+		prompt("Input link valid")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(transformIAV)
+		initial("1")
+	}
+	field(IBV,DBF_MENU) {
+		prompt("Input link valid")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(transformIAV)
+		initial("1")
+	}
+	field(ICV,DBF_MENU) {
+		prompt("Input link valid")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(transformIAV)
+		initial("1")
+	}
+	field(IDV,DBF_MENU) {
+		prompt("Input link valid")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(transformIAV)
+		initial("1")
+	}
+	field(IEV,DBF_MENU) {
+		prompt("Input link valid")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(transformIAV)
+		initial("1")
+	}
+	field(IFV,DBF_MENU) {
+		prompt("Input link valid")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(transformIAV)
+		initial("1")
+	}
+	field(IGV,DBF_MENU) {
+		prompt("Input link valid")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(transformIAV)
+		initial("1")
+	}
+	field(IHV,DBF_MENU) {
+		prompt("Input link valid")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(transformIAV)
+		initial("1")
+	}
+	field(IIV,DBF_MENU) {
+		prompt("Input link valid")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(transformIAV)
+		initial("1")
+	}
+	field(IJV,DBF_MENU) {
+		prompt("Input link valid")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(transformIAV)
+		initial("1")
+	}
+	field(IKV,DBF_MENU) {
+		prompt("Input link valid")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(transformIAV)
+		initial("1")
+	}
+	field(ILV,DBF_MENU) {
+		prompt("Input link valid")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(transformIAV)
+		initial("1")
+	}
+	field(IMV,DBF_MENU) {
+		prompt("Input link valid")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(transformIAV)
+		initial("1")
+	}
+	field(INV,DBF_MENU) {
+		prompt("Input link valid")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(transformIAV)
+		initial("1")
+	}
+	field(IOV,DBF_MENU) {
+		prompt("Input link valid")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(transformIAV)
+		initial("1")
+	}
+	field(IPV,DBF_MENU) {
+		prompt("Input link valid")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(transformIAV)
+		initial("1")
+	}
+	field(OAV,DBF_MENU) {
+		prompt("Output link valid")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(transformIAV)
+		initial("1")
+	}
+	field(OBV,DBF_MENU) {
+		prompt("Output link valid")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(transformIAV)
+		initial("1")
+	}
+	field(OCV,DBF_MENU) {
+		prompt("Output link valid")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(transformIAV)
+		initial("1")
+	}
+	field(ODV,DBF_MENU) {
+		prompt("Output link valid")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(transformIAV)
+		initial("1")
+	}
+	field(OEV,DBF_MENU) {
+		prompt("Output link valid")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(transformIAV)
+		initial("1")
+	}
+	field(OFV,DBF_MENU) {
+		prompt("Output link valid")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(transformIAV)
+		initial("1")
+	}
+	field(OGV,DBF_MENU) {
+		prompt("Output link valid")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(transformIAV)
+		initial("1")
+	}
+	field(OHV,DBF_MENU) {
+		prompt("Output link valid")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(transformIAV)
+		initial("1")
+	}
+	field(OIV,DBF_MENU) {
+		prompt("Output link valid")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(transformIAV)
+		initial("1")
+	}
+	field(OJV,DBF_MENU) {
+		prompt("Output link valid")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(transformIAV)
+		initial("1")
+	}
+	field(OKV,DBF_MENU) {
+		prompt("Output link valid")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(transformIAV)
+		initial("1")
+	}
+	field(OLV,DBF_MENU) {
+		prompt("Output link valid")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(transformIAV)
+		initial("1")
+	}
+	field(OMV,DBF_MENU) {
+		prompt("Output link valid")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(transformIAV)
+		initial("1")
+	}
+	field(ONV,DBF_MENU) {
+		prompt("Output link valid")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(transformIAV)
+		initial("1")
+	}
+	field(OOV,DBF_MENU) {
+		prompt("Output link valid")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(transformIAV)
+		initial("1")
+	}
+	field(OPV,DBF_MENU) {
+		prompt("Output link valid")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(transformIAV)
+		initial("1")
+	}
+}

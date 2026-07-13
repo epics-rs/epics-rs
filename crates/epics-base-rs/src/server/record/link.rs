@@ -1150,22 +1150,23 @@ pub fn parse_link_field(s: &str, ftype: LinkFieldType) -> ParsedLink {
         return ParsedLink::Pva(rest.to_string());
     }
 
-    // Quoted string constant. Resolved BEFORE the modifier split because a
-    // quoted constant may legitimately contain a space (`"hello world"`), and
-    // the split isolates the target at the first one. C reaches the modifier
-    // scan only after its own constant tests (`dbStaticLib.c:2346-2356`).
+    // There is NO quoted-string constant. C's `dbParseLink` has exactly three
+    // tests — braces => JSON, `epicsParseDouble` => CONSTANT, otherwise PV link
+    // (`dbStaticLib.c:2280-2356`) — and a quote is not a number, so link text
+    // that still carries quotes after the .db lexer is a PV NAME with quotes in
+    // it. softIoc (EPICS 7.0.10), `dbpr X 2` after `iocInit`:
     //
-    // C parity (3b484f5): an empty quoted string `""` is equivalent to an
-    // unset link — dbConstLoadScalar/Array reject `""` the same as NULL with
-    // S_db_badField. Treat it as None here so callers don't see a meaningless
-    // empty Constant.
-    if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
-        let inner = &s[1..s.len() - 1];
-        if inner.is_empty() {
-            return ParsedLink::None;
-        }
-        return ParsedLink::Constant(inner.to_string());
-    }
+    // ```text
+    // record(ai,"QA"){field(INP,"\"hello\"")}        INP: CA_LINK "hello" NPP NMS
+    // record(stringin,"QS"){field(INP,"\"hello\"")}  INP: CA_LINK "hello" NPP NMS
+    // record(lso,"LQ"){field(DOL,"\"hello\"")}       DOL: CA_LINK "hello" NPP NMS
+    // record(ai,"QE"){field(INP,"\"\"")}             INP: CA_LINK "" NPP NMS
+    // record(ai,"QN"){field(INP,"")}                 INP: CONSTANT
+    // ```
+    //
+    // — a never-connected CA link, so the record stays UDF=1. Only the EMPTY
+    // text is an unset CONSTANT link. The string constant a long-string record
+    // takes is the JSON `{const:"hello"}` handled above ([`load_link_ls`]).
 
     // Scalar numeric constant. C `dbParseLink` (`dbStaticLib.c:2346-2349`):
     //
@@ -1593,16 +1594,21 @@ mod json_link_tests {
         assert_eq!(link_field_type("{const: 7}"), LinkType::Constant);
     }
 
+    /// A quoted string is NOT a constant: C's `dbParseLink` tests braces then
+    /// `epicsParseDouble`, and a quote is neither — softIoc makes
+    /// `field(INP,"\"hello\"")` a `CA_LINK "hello" NPP NMS`, and even
+    /// `field(INP,"\"\"")` a `CA_LINK ""`. Only the empty text is an unset
+    /// CONSTANT link.
     #[test]
-    fn link_type_constant_quoted_string() {
-        assert_eq!(link_field_type(r#""hello""#), LinkType::Constant);
+    fn link_type_quoted_string_is_a_pv_link() {
+        assert_eq!(link_field_type(r#""hello""#), LinkType::Db);
+        assert_eq!(link_field_type(r#""""#), LinkType::Db);
     }
 
     #[test]
     fn link_type_empty_is_empty() {
         assert_eq!(link_field_type(""), LinkType::Empty);
         assert_eq!(link_field_type("   "), LinkType::Empty);
-        assert_eq!(link_field_type(r#""""#), LinkType::Empty);
     }
 
     #[test]

@@ -9236,24 +9236,29 @@ async fn longout_constant_dol_seeded_at_init_not_reapplied_at_process() {
     );
 }
 
-/// The string path. A quoted constant DOL (`field(DOL,"\"hi\"")`) on a
-/// `stringout` is copied into VAL once at init (C
-/// `recGblInitConstantLink(..., DBF_STRING, ...)`); the gate keeps it out of
+/// The string path. A CONSTANT DOL on a `stringout` is copied into VAL once at
+/// init as TEXT (C `recGblInitConstantLink(..., DBF_STRING, ...)` →
+/// `cvt_st_st`, a plain `strncpy` of the link text); the gate keeps it out of
 /// process so a caput survives.
+///
+/// The link text has to be a NUMBER — that is what makes a plain link CONSTANT
+/// (`dbParseLink`, dbStaticLib.c:2346-2349). A quoted `"hi"` is not: softIoc
+/// makes `field(DOL,"\"hi\"")` a `CA_LINK "hi" NPP NMS` and leaves VAL empty /
+/// UDF=1, so this test used to encode a link type C does not have.
 #[tokio::test]
 async fn stringout_constant_dol_seeded_at_init_not_reapplied_at_process() {
     use epics_base_rs::server::records::stringout::StringoutRecord;
     let db = PvDatabase::new();
     let mut so = StringoutRecord::new("");
     so.omsl = 1; // closed_loop
-    so.dol = "\"hi\"".to_string(); // quoted string constant
+    so.dol = "1.50".to_string(); // CONSTANT — softIoc seeds VAL="1.50", UDF=0
     so.init_record(0).unwrap();
     db.add_record("SO_CONST", Box::new(so)).await.unwrap();
 
     let v0 = db.get_pv("SO_CONST").await.unwrap();
     assert!(
-        matches!(&v0, EpicsValue::String(s) if s.as_str_lossy() == "hi"),
-        "quoted constant DOL must seed VAL=\"hi\" at init, got {v0:?}"
+        matches!(&v0, EpicsValue::String(s) if s.as_str_lossy() == "1.50"),
+        "constant DOL must seed VAL=\"1.50\" at init (cvt_st_st copies the text), got {v0:?}"
     );
 
     {

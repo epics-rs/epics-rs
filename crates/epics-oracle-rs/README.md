@@ -119,6 +119,13 @@ was built to end.
   allowlist rather than present-and-never-firing.
 - **PVA.** CA only.
 
+## What the first run measured
+
+`FINDINGS.md` carries the numbers and every reproducer. In short: the
+denominator is **2551 CA-observable fields across 34 record types**, of which
+**2462 (96.5 %)** produced a reading on both sides and were diffed. 89 fields
+ERRORED — every one of them because the port does not serve a field C does.
+
 Coverage is reported as a percentage of the `.dbd`-derived denominator
 (record types the port implements × their CA-observable fields). `DBF_NOACCESS`
 fields are excluded from that denominator and counted separately — they are raw C

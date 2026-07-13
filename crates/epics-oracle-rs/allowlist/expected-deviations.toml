@@ -78,6 +78,29 @@ answer.
 Expect: C and port disagree on VAL contents/NORD after scalar puts into compress.
 """
 
+[[deviation]]
+id = "CBUG-E2"
+bucket = "NOT-REPRODUCED"
+upstream = "epics-base / dbConvert"
+fields = []
+surface = ["value_string", "value_numeric"]
+classes = ["over-max", "under-min", "over-double-max", "over-float-max", "nan"]
+why = """
+dbConvert's double->integer put is a bare C cast, which is UNDEFINED out of range
+(C17 6.3.1.4p1) -- so compiled C is not single-valued. The C softIoc this harness
+diffs against is x86-64, where cvttsd2si yields the integer indefinite
+(3.0e9 -> INT_MIN, NaN -> INT_MIN); an aarch64 IOC's fcvtzs SATURATES on the same
+input (3.0e9 -> INT_MAX, NaN -> 0). There is no single C answer to be faithful to.
+
+Adjudicated 2026-07-14 (commit 651bf392): the port SATURATES and sends NaN to 0
+(types::c_cast), which is byte-identical to a compiled aarch64 IOC. No alarm --
+the stored value is in range and valid, and dbConvert runs outside the record's
+process cycle where an alarm would be erased by the next recGblResetAlarms.
+
+Expect: on an out-of-range numeric put, the x86-64 C softIoc stores the indefinite
+value and the port stores the saturated one. In range, both agree exactly.
+"""
+
 # --------------------------------------------------------------------------
 # REPRODUCED entries that touch this surface.
 #
@@ -89,23 +112,6 @@ Expect: C and port disagree on VAL contents/NORD after scalar puts into compress
 # this surface would mean the port drifted off C without a decision, which is a
 # finding.
 # --------------------------------------------------------------------------
-
-[[deviation]]
-id = "CBUG-E2"
-bucket = "REPRODUCED"
-enabled = false
-upstream = "epics-base / dbConvert"
-fields = []
-surface = ["value_string", "value_numeric"]
-classes = ["over-max", "under-min", "over-double-max", "over-float-max", "nan"]
-why = """
-dbConvert's double->integer put is a bare C cast: undefined behaviour out of
-range, which on x86-64 yields INT_MIN / truncation garbage (3.0e9 -> -2147483648).
-The port reproduces the compiled-x86-64 semantics on purpose (types::c_cast), so
-TODAY the oracle must see AGREEMENT on out-of-range numeric puts.
-Strategy §4 flags this for re-adjudication (recommendation: saturate, and alarm).
-If that lands, flip enabled = true: the disagreement then becomes expected.
-"""
 
 [[deviation]]
 id = "CBUG-F12"

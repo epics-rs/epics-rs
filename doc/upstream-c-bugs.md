@@ -1224,17 +1224,53 @@ same cast in the read direction. A double outside the destination's range is und
 behaviour (C17 6.3.1.4p1) — no diagnostic, no clamp.
 Defect: an unguarded float→integer cast on client-supplied data, on every numeric put/get
 path in the IOC database.
-Port: `crates/epics-base-rs/src/types/c_cast.rs` (R17-79, merged `51435dc8`) — the single
-owner of the cast, emulating what gcc/clang actually emit on x86-64 (`cvttsd2si` integer-
-indefinite semantics) with defined Rust arithmetic: `70000.9 → i16 4464`,
-`3.0e9 → i32 -2147483648`, NaN → 0/INT_MIN by width. Rust's saturating `as` (the pre-fix
-behavior, `3.0e9 → 2147483647`) was a silent divergence from every compiled IOC.
-Impact: any CA/PVA client writing an out-of-range double to an integer field gets a
-compiler-dependent value — `-2147483648` on x86-64 today, but the C standard permits
-anything, so an upstream compiler upgrade or a new target silently changes stored values.
-Proof: compiled softIoc on this host: `calcout` 3.0e9 → `-2147483648`; `aao` DOL
-`[1.7, 2.2, -3.9, 70000, 5, 6]` into an `FTVL=SHORT` waveform → `[1, 2, -3, 4464]`
-(fixer-f oracle probes, wave 15); port pinned by `c_cast::matches_compiled_c_x86_64`.
+Port: `crates/epics-base-rs/src/types/c_cast.rs` — the single owner of the cast. It
+**SATURATES**: out-of-range clamps to the destination's range, NaN → 0. That is Rust's
+native `as`. Adjudicated 2026-07-14 (commit `651bf392`).
+
+**Adjudication — the port deliberately does NOT reproduce compiled C, because compiled C
+is not single-valued.** The cast is UB, and the two targets EPICS actually ships on
+disagree. Compiling the macro body for each:
+
+```text
+x86_64    cvttsd2si   out of range -> INT_MIN;   NaN -> INT_MIN
+aarch64   fcvtzs      out of range -> SATURATES; NaN -> 0
+```
+
+`3.0e9 → DBF_LONG` is `-2147483648` on an x86-64 IOC and `2147483647` on a Raspberry Pi
+or Zynq one — both ordinary EPICS platforms. There is no "what C does" here to be
+bug-for-bug faithful *to*. The earlier revision (R17-79, `51435dc8`) reproduced the x86-64
+value and pinned it as `c_cast::matches_compiled_c_x86_64`; that did not close a divergence
+so much as trade agreement-with-ARM for agreement-with-x86 while adopting the undefined
+value. Per `doc/strategy-2026-07-13.md` §2 (Tier 2 — *fix C where it is wrong*), the port
+now saturates, which is byte-identical to a compiled aarch64 IOC.
+
+No alarm is raised: `dbConvert` runs on the put path, outside the record's process cycle,
+so an alarm raised there is erased by the next `recGblResetAlarms` unless routed through
+`nsta`/`nsev` — and even routed correctly it would flag a record whose stored value is now
+in range and valid.
+
+Tier 1 (wire) is unaffected: a `DBF_LONG` field carries 32 bits regardless of which 32 bits
+were chosen.
+
+**Scope — what moves with the owner, and what does not.** `c_cast` is also the calc
+engines' narrowing owner, so `INT()`, `NINT()`, the bitwise/shift operands, `PRINTF` and
+`BIN_WRITE` saturate too. Two families are DEFINED C, not UB, and deliberately do not move:
+
+* base calc's `d2i`/`d2ui` (`calcPerform.c:324-325`) — `(epicsInt32)(epicsUInt32)d`, a
+  modular reinterpretation rather than a narrowing cast. `3e9 → -1294967296` still.
+* every **integer-source** conversion — C's `dbFastGetConvertRoutine` picks a different
+  routine per source type, and integer→unsigned is defined modular arithmetic
+  (C17 6.3.1.3p2). Those route through `EpicsValue::convert_to` (commit `0299eb37`), so a
+  `DBF_LONG` `-1` read into a `DBF_USHORT` `SELN` is still `65535`, not a saturated `0`.
+
+Impact (as filed, still true of C): any CA/PVA client writing an out-of-range double to an
+integer field of a **C** IOC gets a compiler- and target-dependent value.
+Proof: compiled softIoc on this host (x86-64): `calcout` 3.0e9 → `-2147483648`; `aao` DOL
+`[1.7, 2.2, -3.9, 70000, 5, 6]` into an `FTVL=SHORT` waveform → `[1, 2, -3, 4464]` (fixer-f
+oracle probes, wave 15). Those are recorded beside each corrected test as the values the
+port knowingly declines to produce. Port pinned by
+`c_cast::out_of_range_saturates_and_nan_is_zero`.
 
 ---
 

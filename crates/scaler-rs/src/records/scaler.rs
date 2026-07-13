@@ -80,6 +80,21 @@ pub const CMD_AUTOCOUNT: &str = "scaler_autocount";
 ///   `DeviceSupport::handle_command()` AFTER process().
 ///
 /// **DLY/DLY1:** Implemented via `ProcessAction::ReprocessAfter`.
+///
+/// An armed user-count start delay: C's `pdelayCallback` watchdog as data.
+#[derive(Clone, Copy, Debug)]
+struct CountDelay {
+    start: Instant,
+    /// The delay the timer was armed with, in seconds.
+    secs: f64,
+}
+
+impl CountDelay {
+    fn expired(&self) -> bool {
+        self.start.elapsed().as_secs_f64() >= self.secs
+    }
+}
+
 pub struct ScalerRecord {
     // --- Control/Status ---
     pub val: f64,
@@ -112,6 +127,17 @@ pub struct ScalerRecord {
     pub nm: [PvString; MAX_SCALER_CHANNELS],
 
     // --- Delay tracking ---
+    //
+    // C runs TWO independent delay callbacks with two timers, and the port
+    // gives each its own cell so neither can retime or cancel the other:
+    //
+    //   * `pdelayCallback` / `delayCallbackFunc` (scalerRecord.c:216-231) —
+    //     the USER count start delay (DLY), armed by `special(CNT)`; tracked
+    //     by `count_delay`.
+    //   * `pauto_callback` / `autoCallbackFunc` (:233-240) — the AUTOCOUNT
+    //     restart hold (DLY1), armed by `process()`; tracked by
+    //     `delay_start` + `autocount_delay`.
+    /// Start instant of the current SCALER_STATE_WAITING autocount hold.
     delay_start: Option<Instant>,
     /// The autocount hold time (seconds) the current SCALER_STATE_WAITING
     /// period was scheduled with. C scalerRecord.c computes `dly_sec`
@@ -120,6 +146,14 @@ pub struct ScalerRecord {
     /// must compare elapsed time against the scheduled value, not the
     /// live `dly1` (which the user may change mid-wait).
     autocount_delay: f64,
+    /// The armed user-count start delay: C's `pdelayCallback` watchdog.
+    /// `Some` exactly while `us == USER_STATE_WAITING` with a timer pending;
+    /// `special(CNT)` arms it (`callbackRequestDelayed(pdelayCallback,
+    /// pscal->dly)`, scalerRecord.c:658-660), cancels it on an abort
+    /// (`epicsTimerCancel`, :645), and `process()` consumes it when the
+    /// scheduled interval has elapsed. `secs` is the delay the timer was armed
+    /// WITH — as in C, a DLY written mid-wait cannot retime the armed wait.
+    count_delay: Option<CountDelay>,
 
     // --- Done flag (set by device support read, consumed by process) ---
     /// Set by device support's read() when counting has completed.
@@ -234,6 +268,7 @@ impl Default for ScalerRecord {
             nm: std::array::from_fn(|_| PvString::new()),
             delay_start: None,
             autocount_delay: 0.0,
+            count_delay: None,
             done_flag: false,
             reqstart_old_pr1: 0,
             special_actions: Vec::new(),
@@ -775,30 +810,28 @@ impl Record for ScalerRecord {
             }
         }
 
-        // DLY-wait bridge. C scalerRecord.c handles the DLY delay in a
-        // separate `delayCallbackFunc` (scalerRecord.c:216-231): when the
-        // delay expires it sets `us = USER_STATE_REQSTART` and scanOnce()s
-        // the record. The port collapses that callback into process():
-        // while still WAITING, schedule a reprocess and return — counting
-        // has not started, so the rest of process() (CNT block, autocount)
-        // has nothing to do (the autocount block requires us==IDLE anyway,
-        // and the CNT block requires REQSTART/WAITING + cnt — handled on
-        // the post-expiry cycle).
+        // C `delayCallbackFunc` (scalerRecord.c:216-231), the body of the
+        // watchdog `special(CNT)` armed:
+        //
+        //     if (pscal->us == USER_STATE_WAITING && pscal->cnt) {
+        //         pscal->us = USER_STATE_REQSTART;
+        //         (void)scanOnce((void *)pscal);
+        //     }
+        //
+        // The timer that brings us here is armed in `special()` as a
+        // `ProcessAction::ReprocessAfter` — the single owner of the delayed
+        // start, exactly as `pdelayCallback` is in C. So this runs the
+        // callback's state transition and nothing else: a process cycle that
+        // lands MID-wait (a periodic scan, a device-done interrupt) falls
+        // straight through, as it does in C, where such a cycle finds
+        // `us == WAITING` outside `(REQSTART || WAITING) && cnt`'s start arm
+        // (:381-382) and just runs `updateCounts` (:453). It must NOT
+        // re-schedule the wait: a second timer would double-process at expiry.
         if self.us == USER_STATE_WAITING && self.cnt != 0 {
-            if let Some(start) = self.delay_start {
-                let dly = self.dly.max(0.0) as f64;
-                let elapsed = start.elapsed().as_secs_f64();
-                if elapsed >= dly {
+            if let Some(delay) = self.count_delay {
+                if delay.expired() {
                     self.us = USER_STATE_REQSTART;
-                    self.delay_start = None;
-                } else {
-                    // updateCounts with us==WAITING zeroes the displayed
-                    // counts (C scalerRecord.c:571-575).
-                    self.update_counts();
-                    let remaining = std::time::Duration::from_secs_f64(dly - elapsed);
-                    return Ok(ProcessOutcome::complete_with(vec![
-                        ProcessAction::ReprocessAfter(remaining),
-                    ]));
+                    self.count_delay = None;
                 }
             }
         }
@@ -989,8 +1022,13 @@ impl Record for ScalerRecord {
                         match self.us {
                             USER_STATE_WAITING => {
                                 // C:643-647 — cancel the pending delay
-                                // watchdog (delayCallbackFunc).
-                                self.delay_start = None;
+                                // watchdog (`epicsTimerCancel`). The armed
+                                // `ReprocessAfter` still fires, but it finds
+                                // no `count_delay` and `us == IDLE`, so the
+                                // `delayCallbackFunc` transition below is a
+                                // no-op — C's own `us == WAITING && cnt`
+                                // guard is what makes a raced callback safe.
+                                self.count_delay = None;
                                 self.us = USER_STATE_IDLE;
                             }
                             USER_STATE_REQSTART => {
@@ -1013,9 +1051,28 @@ impl Record for ScalerRecord {
                     // when the delay expires.
                     self.special_actions.push(ProcessAction::ScanOnce);
                 } else {
-                    // C:657-661 — schedule the delayed start callback.
+                    // C:657-661 — schedule the delayed start callback:
+                    // `pscal->us = USER_STATE_WAITING;
+                    //  callbackRequestDelayed(pdelayCallback, pscal->dly);`
+                    //
+                    // The timer is the ONLY thing that starts the count. C's
+                    // `delayCallbackFunc` (:216-231) calls `scanOnce`
+                    // UNCONDITIONALLY on expiry — no `if (pscal->scan)` guard,
+                    // unlike the handle-it-now arm above — so a Passive scaler
+                    // AND a periodically-scanned one both start counting
+                    // exactly DLY seconds after the CNT write. Without this
+                    // action the port armed nothing: a non-Passive scaler got
+                    // no process from the put and sat in WAITING until its next
+                    // periodic scan (SCAN=I/O Intr / Event: forever).
                     self.us = USER_STATE_WAITING;
-                    self.delay_start = Some(Instant::now());
+                    let secs = dly as f64;
+                    self.count_delay = Some(CountDelay {
+                        start: Instant::now(),
+                        secs,
+                    });
+                    self.special_actions.push(ProcessAction::ReprocessAfter(
+                        std::time::Duration::from_secs_f64(secs),
+                    ));
                 }
             }
             // C scalerRecord.c:664-668 — CONT. The write changes auto-count

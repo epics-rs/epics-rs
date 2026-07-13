@@ -57,7 +57,7 @@ fn special_after_put(
     // identical arm in all 21 SSCN-bearing records):
     //   `recGblCheckSimm((dbCommon *)prec, &prec->sscn, prec->oldsimm, prec->simm);`
     // Paired with `special_before_put`'s pass 0 (`recGblSaveSimm`), and gated
-    // per record type by `Record::has_sim_mode_scan`.
+    // per record type by `Record::uses_recgbl_simm_helpers`.
     Ok(if field == "SIMM" {
         instance.rec_gbl_check_simm()
     } else {

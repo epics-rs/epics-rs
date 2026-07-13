@@ -90,7 +90,8 @@
 
 use crate::error::{CaError, CaResult};
 use crate::server::record::{
-    FieldDesc, InputFetchPolicy, ProcessAction, ProcessOutcome, Record, RecordProcessResult,
+    CyclePostMask, FieldDesc, InputFetchPolicy, ProcessAction, ProcessOutcome, Record,
+    RecordProcessResult,
 };
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
@@ -2222,15 +2223,40 @@ impl Record for AcalcoutRecord {
     /// `*amask = 0` at the head of aCalcPerform. NEWM does — it accumulates
     /// across `fetch_values` calls until `monitor()` zeroes it, which is why this
     /// hook TAKES.
-    fn take_cycle_posted_fields(&mut self) -> Vec<&'static str> {
-        let mask = self.amask | self.newm;
+    fn take_cycle_posted_fields(&mut self) -> Vec<(&'static str, CyclePostMask)> {
+        let (amask, newm) = (self.amask, self.newm);
         self.newm = 0;
-        ARR_NAMES
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| mask & (1u32 << i) != 0)
-            .map(|(_, name)| *name)
-            .collect()
+        let mut marks = Vec::new();
+        for (i, name) in ARR_NAMES.iter().enumerate() {
+            let bit = 1u32 << i;
+            // C `afterCalc` (`:296`) runs first, and with a LITERAL mask — the
+            // alarm bits are not in scope there.
+            if amask & bit != 0 {
+                marks.push((*name, CyclePostMask::ValueLog));
+            }
+            // C `monitor()` (`:1034`) runs after, with `monitor_mask` folded in.
+            // An array the expression STORED into and whose input link ALSO
+            // delivered a change is in both masks, and C posts it from both
+            // loops — two events, two masks.
+            if newm & bit != 0 {
+                marks.push((*name, CyclePostMask::MonitorValueLog));
+            }
+        }
+        marks
+    }
+
+    /// AA..LL post from AMASK/NEWM and from nothing else. C `monitor()` keeps a
+    /// previous copy of every SCALAR input (PA..PL, `aCalcoutRecord.c:1023-1029`)
+    /// and of OVAL (POVL, `:1039`) and compares them — but it keeps NO previous
+    /// copy of an array and compares no array anywhere. The only array
+    /// comparison in the record is inside `fetch_values` (`:1103-1105`), against
+    /// the link's own previous delivery, and its result IS the NEWM bit.
+    ///
+    /// (PAA exists, but it is `fetch_values`' scratch buffer for exactly that
+    /// comparison — one buffer reused for every link, not a per-field previous
+    /// value.)
+    fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
+        &ARR_NAMES
     }
 }
 

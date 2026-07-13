@@ -2282,15 +2282,20 @@ impl RecordInstance {
     ///
     /// The rules, in order:
     ///
-    /// * The deadband field (default VAL) and SEVR/STAT/AMSG/UDF are emitted by
-    ///   the caller with their own C masks and are skipped here.
+    /// * The deadband field (default VAL), the
+    ///   [`recgbl::RECGBL_POSTED_ALARM_FIELDS`](crate::server::recgbl::RECGBL_POSTED_ALARM_FIELDS)
+    ///   (SEVR/STAT/AMSG/ACKS) and UDF are emitted by the caller with their own
+    ///   C masks and are skipped here.
     /// * [`Record::event_posted_fields`] post from their own event path
     ///   (waveform HASH) — never from change detection.
     /// * [`Record::process_posted_fields`], when declared, is the closed set of
     ///   fields a process cycle may post at all.
     /// * A secondary value field ([`Record::fields_posted_with_value_mask`])
     ///   carries VAL's monitor mask, gated per its [`ValuePostGate`].
-    /// * A CHANGED field carries [`AuxPostMask::mask_for`].
+    /// * A CHANGED field carries [`AuxPostMask::mask_for`] — unless it is a
+    ///   [`Record::fields_posted_only_when_marked`] field, which C never
+    ///   change-detects (aCalcout AA..LL) and which therefore posts from its
+    ///   mark alone.
     /// * An UNCHANGED field posts only if the record marked it this cycle:
     ///   statically ([`Record::force_posted_fields`]), per-cycle
     ///   ([`Record::take_cycle_posted_fields`]), on the alarm transition
@@ -2304,7 +2309,7 @@ impl RecordInstance {
         aux_post: AuxPostMask,
         include_val: bool,
     ) -> Vec<(String, EpicsValue, EventMask)> {
-        use crate::server::record::{ValuePostGate, value_gate};
+        use crate::server::record::{CyclePostMask, ValuePostGate, value_gate};
 
         // C's default for a change-detected auxiliary post:
         // `monitor_mask | DBE_VALUE | DBE_LOG` (calcRecord.c:420, subRecord.c:400;
@@ -2320,6 +2325,10 @@ impl RecordInstance {
         // `pcalc->newm = 0`), which is why this loop may run only once per cycle.
         let cycle_posted = self.record.take_cycle_posted_fields();
         let log_swept = self.record.log_swept_fields();
+        // C change-detects nothing about these fields; only the record's own
+        // per-cycle mark may post them (aCalcout AA..LL — no PAA..PLL previous
+        // copy exists to compare against).
+        let marked_only = self.record.fields_posted_only_when_marked();
         let value_masked = self.record.fields_posted_with_value_mask();
         let event_posted = self.record.event_posted_fields();
         let process_posted = self.record.process_posted_fields();
@@ -2328,9 +2337,14 @@ impl RecordInstance {
         for (field, subs) in &self.subscribers {
             if subs.is_empty()
                 || field == deadband_field
-                || field == "SEVR"
-                || field == "STAT"
-                || field == "AMSG"
+                // SEVR/STAT/AMSG/ACKS are posted by `recGblResetAlarms` itself,
+                // each with its own C mask (recGbl.c:201-217) — the caller emits
+                // them from `alarm_field_posts`. A second, change-detected copy
+                // here would double-post with a mask C never uses for them
+                // (`alarm_bits | DBE_VALUE | DBE_LOG` instead of C's DBE_VALUE
+                // on ACKS). UDF is separate: the framework posts it from its own
+                // undefined-value rule, not from recGblResetAlarms.
+                || crate::server::recgbl::RECGBL_POSTED_ALARM_FIELDS.contains(&field.as_str())
                 || field == "UDF"
                 || event_posted.contains(&field.as_str())
                 || !process_posted.is_none_or(|allowed| allowed.contains(&field.as_str()))
@@ -2358,20 +2372,28 @@ impl RecordInstance {
                 if post {
                     sub_updates.push((field.clone(), val.clone(), deadband_mask));
                 }
-            } else if changed {
+            } else if changed && !marked_only.contains(&field.as_str()) {
                 sub_updates.push((
                     field.clone(),
                     val.clone(),
                     aux_post.mask_for(field, alarm_bits, deadband_mask),
                 ));
-            } else if force_fields.contains(&field.as_str())
-                || cycle_posted.contains(&field.as_str())
-            {
-                // C `monitor()` posts a re-marked field with
-                // `monitor_mask | DBE_VAL_LOG` even when unchanged — whether the
-                // mark is static (`force_posted_fields`) or this cycle's bit mask
-                // (`take_cycle_posted_fields`: aCalcout AMASK/NEWM).
+            } else if force_fields.contains(&field.as_str()) {
+                // C `monitor()` posts a statically re-marked field with
+                // `monitor_mask | DBE_VAL_LOG` even when unchanged.
                 sub_updates.push((field.clone(), val.clone(), aux_mask));
+            } else if cycle_posted.iter().any(|(name, _)| *name == field) {
+                // One event per MARK, each with the mask of the C call site that
+                // made it (`CyclePostMask`) — a field marked twice (aCalcout's
+                // AMASK `afterCalc` post AND its NEWM `monitor()` post) is posted
+                // twice, exactly as C posts it from both loops.
+                for (_, cycle_mask) in cycle_posted.iter().filter(|(name, _)| *name == field) {
+                    let mask = match cycle_mask {
+                        CyclePostMask::ValueLog => EventMask::VALUE | EventMask::LOG,
+                        CyclePostMask::MonitorValueLog => aux_mask,
+                    };
+                    sub_updates.push((field.clone(), val.clone(), mask));
+                }
             } else if alarm_fanout.contains(&field.as_str()) {
                 // C motor `monitor()` (motorRecord.cc:3513-3645) posts every listed
                 // field once `monitor_mask != 0`, so a DBE_ALARM-only subscriber
@@ -2748,9 +2770,10 @@ impl RecordInstance {
             // any alarm field moved.
             alarm_posts.push(("AMSG", stat_mask));
         }
-        // C parity (recGbl.c:216): ACKS is posted (DBE_VALUE) only when
-        // an alarm field moved (`stat_mask != 0`) AND it was raised.
-        if alarm_result.acks_changed && !stat_mask.is_empty() {
+        // C parity (recGbl.c:214-217): ACKS is posted (DBE_VALUE) whenever the
+        // alarm-acknowledge rule fires — `acks_posted` already folds in C's
+        // `if (stat_mask)` guard, and the post carries no value-change test.
+        if alarm_result.acks_posted {
             alarm_posts.push(("ACKS", EventMask::VALUE));
         }
 

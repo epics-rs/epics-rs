@@ -42,6 +42,7 @@ use epics_base_rs::types::EpicsValue;
 
 const SIMM_ALARM: u16 = 19; // alarm.h — the STAT a simulated cycle raises
 const READ_ALARM: u16 = 1;
+const LINK_ALARM: u16 = 14; // alarm.h — C `setLinkAlarm` (dbLink.c:320)
 
 /// W: CALC = "A+1" over INAN = SRC (10.0), OUT → DEST, OOPT = Every Time.
 /// SIOL reads SIM (42.0); `siml` and `simm` per argument.
@@ -101,6 +102,14 @@ async fn alarm(db: &PvDatabase) -> (AlarmSeverity, u16, bool) {
     let inst = db.get_record("W").await.unwrap();
     let g = inst.read().await;
     (g.common.sevr, g.common.stat, g.common.udf)
+}
+
+/// The record's committed alarm message — C's `amsg`, written by
+/// `recGblSetSevrMsg` (here: `setLinkAlarm`'s "field %s").
+async fn amsg(db: &PvDatabase) -> String {
+    let inst = db.get_record("W").await.unwrap();
+    let g = inst.read().await;
+    g.common.amsg.clone()
 }
 
 /// SIMM = YES: VAL comes from SIOL through SVAL, the calc does not run, and the
@@ -185,10 +194,24 @@ async fn r11_62_siml_refreshes_simm_every_cycle() {
     assert_eq!(stat, 0, "the SIMM alarm is per-cycle, not sticky");
 }
 
-/// A SIOL read that fails changes neither VAL nor UDF (C `:417` gates both on
-/// `status == 0`), but the SIMM_ALARM at `:421` is unconditional.
+/// W10-E4. A SIOL read that fails changes neither VAL nor UDF (C `:417` gates
+/// both on `status == 0`) — but it is a plain `dbGetLink`, so its failure path
+/// runs `setLinkAlarm` (dbLink.c:322) and raises LINK_ALARM/INVALID with
+/// AMSG "field SIOL".
+///
+/// `recGblSetSevr(SIMM_ALARM, sims)` at `:420` then runs unconditionally, but it
+/// only ever RAISES (strict-greater): with `SIMS = MINOR` it cannot beat the
+/// INVALID already pending, so it is a no-op and the record publishes
+/// LINK_ALARM/INVALID. Compiled C (`recGblSetSevrVMsg` verbatim, swait's order —
+/// `dbGetLink` at :416 then `recGblSetSevr` at :420):
+///
+/// ```text
+/// swait SIMS=MINOR, failed SIOL: nsev=3 nsta=14 namsg='field SIOL'
+/// ```
+///
+/// The port used to raise ONLY the SIMM_ALARM here, publishing MINOR/SIMM.
 #[tokio::test]
-async fn r11_62_a_failed_siol_read_still_raises_simm_alarm() {
+async fn w10_e4_a_failed_siol_read_raises_link_alarm() {
     let db = sim_db("MODE", 0, 1 /* MINOR */, "NOSUCHREC").await;
 
     // A real cycle first: VAL = 11 from the calc.
@@ -207,10 +230,37 @@ async fn r11_62_a_failed_siol_read_still_raises_simm_alarm() {
     let (sevr, stat, _) = alarm(&db).await;
     assert_eq!(
         sevr,
-        AlarmSeverity::Minor,
-        "C:421 runs regardless of status"
+        AlarmSeverity::Invalid,
+        "setLinkAlarm raises INVALID; SIMS=MINOR cannot beat it (strict-greater)"
     );
-    assert_eq!(stat, SIMM_ALARM);
+    assert_eq!(stat, LINK_ALARM, "STAT is LINK, not SIMM");
+    assert_eq!(
+        amsg(&db).await,
+        "field SIOL",
+        "C `setLinkAlarm`: \"field %s\""
+    );
+}
+
+/// The other side of W10-E4's ordering boundary on swait: with
+/// `SIMS = INVALID` the two alarms are EQUAL in severity, and swait raises
+/// LINK first (`dbGetLink` at `:416`) and SIMM second (`:420`) — so the
+/// strict-greater `recGblSetSevr` leaves LINK in place. (A base record reverses
+/// this: `longinRecord.c:414` raises SIMM BEFORE its read, so SIMM wins there.
+/// Same two alarms, opposite winner, decided purely by C's call order.)
+#[tokio::test]
+async fn w10_e4_swait_link_alarm_wins_the_tie_at_sims_invalid() {
+    let db = sim_db("MODE", 0, 3 /* INVALID */, "NOSUCHREC").await;
+
+    db.put_pv("MODE", EpicsValue::Double(1.0)).await.unwrap();
+    process(&db).await;
+
+    let (sevr, stat, _) = alarm(&db).await;
+    assert_eq!(sevr, AlarmSeverity::Invalid);
+    assert_eq!(
+        stat, LINK_ALARM,
+        "swait raises LINK before SIMM, so the equal-severity SIMM loses the tie"
+    );
+    assert_eq!(amsg(&db).await, "field SIOL");
 }
 
 /// Negative control: with SIMM = NO the record is untouched — the inputs are

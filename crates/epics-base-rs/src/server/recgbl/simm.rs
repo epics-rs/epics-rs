@@ -198,7 +198,7 @@ const RECORDS_WITH_SSCN: &[&str] = &[
 
 /// Whether a record type participates in the SIMM↔SSCN scan swap
 /// (`recGblCheckSimm`). The single source of truth behind
-/// [`crate::server::record::Record::has_sim_mode_scan`]; see
+/// [`crate::server::record::Record::uses_recgbl_simm_helpers`]; see
 /// [`RECORDS_WITH_SSCN`].
 pub fn record_type_has_sscn(record_type: &str) -> bool {
     RECORDS_WITH_SSCN.contains(&record_type)

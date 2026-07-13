@@ -26,6 +26,23 @@ pub struct TransformRecord {
     /// change — neither happens on C.
     pub val: f64,
     pub vals: [f64; NUM_CHANNELS],
+    /// `LA..LP` — "Prev Value of A".."Prev Value of P"
+    /// (`transformRecord.dbd:505-584`, DBF_DOUBLE, `special(SPC_NOMOD)`).
+    ///
+    /// C's `monitor()` (`transformRecord.c:797-804`) is the only writer: it
+    /// posts each changed channel and copies the posted value into its `l*`
+    /// cell, so once `monitor()` has run, `l* == *` for every channel. They
+    /// diverge only between cycles — a client writing `A` on a non-Passive
+    /// record, or a record that has never processed — and that window is what a
+    /// `caget .LA` is FOR.
+    ///
+    /// The port's change detection stays on the framework's `last_posted`
+    /// (`collect_subscriber_posts`), as before; these cells are the DB-visible
+    /// readback C exposes, committed at the same point C commits them, and they
+    /// feed nothing else. In particular they are NOT the conditional-calc gate:
+    /// C's `same` test (`:575`) reduces to `fresh_put` for the only channels it
+    /// can gate (see `process`).
+    lvals: [f64; NUM_CHANNELS],
     pub calcs: [String; NUM_CHANNELS],
     compiled: [Option<CompiledExpr>; NUM_CHANNELS],
     pub inp_links: [String; NUM_CHANNELS],
@@ -62,6 +79,7 @@ impl Default for TransformRecord {
         Self {
             val: 0.0,
             vals: [0.0; NUM_CHANNELS],
+            lvals: [0.0; NUM_CHANNELS],
             calcs: Default::default(),
             compiled: Default::default(),
             inp_links: Default::default(),
@@ -133,6 +151,18 @@ impl TransformRecord {
         if name.len() == 4 && name.starts_with("OUT") {
             let c = name.as_bytes()[3];
             if c >= b'A' && c <= b'P' {
+                return Some((c - b'A') as usize);
+            }
+        }
+        None
+    }
+
+    /// LA..LP — "Prev Value of A".."Prev Value of P"
+    /// (`transformRecord.dbd:505-584`).
+    fn last_value_index(name: &str) -> Option<usize> {
+        if name.len() == 2 && name.as_bytes()[0] == b'L' {
+            let c = name.as_bytes()[1];
+            if c.is_ascii_uppercase() && c <= b'P' {
                 return Some((c - b'A') as usize);
             }
         }
@@ -485,6 +515,88 @@ static TRANSFORM_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         read_only: false,
     },
+    // LA-LP — the previous value of each channel (`transformRecord.dbd:505-584`:
+    // DBF_DOUBLE, `special(SPC_NOMOD)`, so no client may write them).
+    FieldDesc {
+        name: "LA",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "LB",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "LC",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "LD",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "LE",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "LF",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "LG",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "LH",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "LI",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "LJ",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "LK",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "LL",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "LM",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "LN",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "LO",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "LP",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
+    },
 ];
 
 /// Choice labels for the calculation-option menu, in index order.
@@ -635,6 +747,17 @@ impl Record for TransformRecord {
                 value: EpicsValue::Double(self.vals[i]),
             });
         }
+
+        // C `monitor()` (`transformRecord.c:797-804`): every channel it posts,
+        // it copies into the channel's `l*` cell — and it posts exactly the
+        // channels that differ from it. So the state `monitor()` leaves behind
+        // is `l* == *` for ALL channels, which is this one assignment. It is
+        // deliberately NOT reached by the IVLA "Do Nothing" early return above:
+        // that path (`:544-549`) runs checkAlarms/recGblResetAlarms and returns
+        // WITHOUT calling `monitor()`, so LA..LP keep the values from the last
+        // cycle that did.
+        self.lvals = self.vals;
+
         Ok(ProcessOutcome::complete_with(actions))
     }
 
@@ -663,6 +786,9 @@ impl Record for TransformRecord {
         }
         if let Some(idx) = Self::out_field_index(name) {
             return Some(EpicsValue::String(self.out_links[idx].clone().into()));
+        }
+        if let Some(idx) = Self::last_value_index(name) {
+            return Some(EpicsValue::Double(self.lvals[idx]));
         }
         None
     }

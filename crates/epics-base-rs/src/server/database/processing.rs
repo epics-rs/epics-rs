@@ -426,7 +426,7 @@ fn alarm_field_posts(
         posts.push(("STAT", stat_mask));
         posts.push(("AMSG", stat_mask));
     }
-    if alarm_result.acks_changed && !stat_mask.is_empty() {
+    if alarm_result.acks_posted {
         posts.push(("ACKS", EventMask::VALUE));
     }
     posts
@@ -493,6 +493,23 @@ enum SimOutcome {
     /// the body is left to run), an OUTPUT's `writeValue` follows it (the body
     /// runs, only the write is suppressed).
     IllegalMode { is_output: bool },
+    /// The SIML read FAILED and the record's support ABORTS on it — C
+    /// `writeValue` returns before performing any I/O
+    /// ([`Record::aborts_on_failed_siml_read`]; `busy` is the only one):
+    ///
+    /// ```c
+    /// status=dbGetLink(&prec->siml,DBR_USHORT, &prec->simm,0,0);
+    /// if (status)
+    ///     return(status);      /* before write_busy AND before the SIOL dbPutLink */
+    /// ```
+    ///
+    /// Like [`Self::IllegalMode`] with `is_output`, this suppresses the cycle's
+    /// output and nothing else: the body runs and `process()` still does
+    /// `checkAlarms` / `monitor` / `recGblFwdLink`. It differs in the alarm — the
+    /// LINK_ALARM that `dbGetLink`'s `setLinkAlarm` already raised is the only
+    /// one; no SOFT_ALARM and no SIMM_ALARM is added, because C never reaches the
+    /// `switch (prec->simm)` that would raise them.
+    AbortedBeforeWrite,
     /// Simulated OUTPUT record (`SIMM`=YES/RAW, not deferring). C
     /// `writeValue` substitutes the device write with
     /// `dbPutLink(&prec->siol, ..., &prec->oval)` — but at the END of
@@ -1497,21 +1514,33 @@ impl PvDatabase {
         // that declares the input-stage shape (`false` included), so the flag
         // cannot outlive the cycle it belongs to.
         let mut sim_input_stage = false;
-        // C `switch (prec->simm)` `default:` on an OUTPUT record: the body runs
-        // (it is `writeValue`, at the END of `process()`, that refuses), but the
-        // device / OUT-link / SIOL write is suppressed. Set only by
-        // `SimOutcome::IllegalMode { is_output: true }`.
-        let mut sim_illegal_out = false;
+        // C `writeValue` returned before performing ANY output. `writeValue`
+        // runs at the END of C `process()`, so the body has already run and
+        // only the device / OUT-link / SIOL write is lost. Two C paths reach
+        // it, and both mean exactly this one thing:
+        //   * `switch (prec->simm)` `default:` — `recGblSetSevr(SOFT_ALARM,
+        //     INVALID_ALARM); return -1;`  (`SimOutcome::IllegalMode`)
+        //   * a failed SIML read — `if (status) return status;`
+        //     (`SimOutcome::AbortedBeforeWrite`, busyRecord.c:399-401)
+        let mut sim_write_aborted = false;
         let sim_output = match self.check_simulation_mode(&rec).await {
             SimOutcome::NotSimulated => None,
             SimOutcome::Simulated => {
                 self.run_forward_link_tail(name, &rec, visited, depth).await;
                 return Ok(());
             }
+            SimOutcome::AbortedBeforeWrite => {
+                // C busy `writeValue`: `status = dbGetLink(&prec->siml, ...);
+                // if (status) return status;` — the SIML read failed, so the
+                // routine returns before `write_busy` AND before the SIOL
+                // redirect. `dbGetLink` has already raised LINK_ALARM/INVALID.
+                sim_write_aborted = true;
+                None
+            }
             SimOutcome::IllegalMode { is_output } => {
                 if is_output {
                     // `writeValue` follows the body, so only the write is lost.
-                    sim_illegal_out = true;
+                    sim_write_aborted = true;
                     None
                 } else {
                     // `readValue` precedes the body and IS the body's input, so
@@ -1521,7 +1550,7 @@ impl PvDatabase {
                     // `monitor()` and `recGblFwdLink()` regardless of the -1.
                     {
                         let mut instance = rec.write().await;
-                        sim_process_tail(&mut instance, SimTailAlarm::None, false);
+                        sim_process_tail(&mut instance, false);
                     }
                     self.run_forward_link_tail(name, &rec, visited, depth).await;
                     return Ok(());
@@ -2110,21 +2139,17 @@ impl PvDatabase {
                         | crate::server::record::ParsedLink::PvaJson(_)
                 )
             {
-                // epics-base PR #4737901: soft-channel `read_xxx` must
-                // surface link-read failures via the alarm tree, not
-                // silently succeed. When the INP link is a real
-                // Db/Ca/Pva link (i.e. operator expected a value) and
-                // the read returned None, attach LINK_ALARM/INVALID
-                // so downstream consumers can react. ParsedLink::None
-                // and Constant don't fall into this branch — the
-                // former is "no link configured", the latter has its
-                // own None-as-no-value semantics.
-                use crate::server::recgbl::{alarm_status, rec_gbl_set_sevr};
-                rec_gbl_set_sevr(
-                    &mut instance.common,
-                    alarm_status::LINK_ALARM,
-                    crate::server::record::AlarmSeverity::Invalid,
-                );
+                // A soft-channel `read_xxx` is a plain `dbGetLink` on INP
+                // (`devAiSoft.c::read_ai` -> `dbGetLink(&prec->inp, ...)`), so a
+                // failed read runs `setLinkAlarm` (dbLink.c:322) —
+                // `recGblSetSevrMsg(LINK_ALARM, INVALID_ALARM, "field INP")`.
+                // Route it through the `setLinkAlarm` owner so it carries C's
+                // message: raising the severity without the AMSG text left the
+                // operator with an INVALID/LINK record and a blank `.AMSG`.
+                // ParsedLink::None and Constant don't reach this branch — the
+                // former is "no link configured", the latter has its own
+                // None-as-no-value semantics.
+                crate::server::recgbl::rec_gbl_set_link_alarm(&mut instance.common, "INP");
             }
 
             // Apply multi-input values (INPA..INPL -> A..L).
@@ -2911,11 +2936,12 @@ impl PvDatabase {
                 // (it reads the post-body OVAL/RVAL), so the normal device/OUT
                 // write is suppressed here.
                 None
-            } else if sim_illegal_out {
-                // C `writeValue` `default:` arm: `recGblSetSevr(SOFT_ALARM,
-                // INVALID_ALARM); status = -1;` — it returns BEFORE both the
-                // device write and the SIOL redirect, so this cycle performs no
-                // output at all.
+            } else if sim_write_aborted {
+                // C `writeValue` returned before writing — either the
+                // `default:` arm (`recGblSetSevr(SOFT_ALARM, INVALID_ALARM);
+                // status = -1;`) or a failed SIML read. Both return BEFORE the
+                // device write and BEFORE the SIOL redirect, so this cycle
+                // performs no output at all.
                 None
             } else if skip_out {
                 None
@@ -4154,9 +4180,11 @@ impl PvDatabase {
                 alarm_posts.push(("STAT", stat_mask));
                 alarm_posts.push(("AMSG", stat_mask));
             }
-            // C parity (recGbl.c:216): ACKS is posted (DBE_VALUE) only
-            // when an alarm field moved AND recGblResetAlarms raised it.
-            if alarm_result.acks_changed && !stat_mask.is_empty() {
+            // C parity (recGbl.c:214-217): ACKS is posted (DBE_VALUE) whenever
+            // the alarm-acknowledge rule fires — `acks_posted` already folds in
+            // C's `if (stat_mask)` guard, and the post carries no value-change
+            // test.
+            if alarm_result.acks_posted {
                 alarm_posts.push(("ACKS", EventMask::VALUE));
             }
             // The cycle's subscriber posts — assembled by the single owner
@@ -4772,11 +4800,16 @@ impl PvDatabase {
     ///
     /// Called from `check_simulation_mode` on every `pact == FALSE` entry —
     /// C's `if (!prec->pact)` guard around it (aiRecord.c:475).
+    ///
+    /// Returns the SIML-read status the record's `readValue`/`writeValue` sees:
+    /// `true` when the read FAILED. Only a record that declares
+    /// [`Record::aborts_on_failed_siml_read`] (busy) acts on it — see that hook
+    /// for why the other two families do not.
     pub(crate) async fn rec_gbl_get_simm(
         &self,
         rec: &Arc<RwLock<RecordInstance>>,
         siml: &crate::server::record::ParsedLink,
-    ) {
+    ) -> bool {
         use crate::server::recgbl::simm::SimLinkFetch;
         // `recGblSaveSimm(*psscn, poldsimm, *psimm)` — latch the outgoing mode
         // BEFORE the SIML read can move SIMM.
@@ -4790,7 +4823,9 @@ impl PvDatabase {
         // YES; re-reading the constant every cycle (the pre-fix behaviour of
         // `read_link_value_no_process`) would stomp the operator's put back to
         // the constant on the very next process.
-        match self.fetch_sim_link(siml).await {
+        let fetch = self.fetch_sim_link(siml).await;
+        let failed = matches!(fetch, SimLinkFetch::Failed);
+        match fetch {
             SimLinkFetch::Value(v) => {
                 let simm = v.to_f64().unwrap_or(0.0) as i16;
                 let mut instance = rec.write().await;
@@ -4817,21 +4852,18 @@ impl PvDatabase {
                 } else {
                     // `busyRecord.c:399` / `swaitRecord.c:402` read SIML with a
                     // plain `dbGetLink`, whose failure path calls `setLinkAlarm`
-                    // (dbLink.c:319-323) — a full
+                    // (dbLink.c:318-323) — a full
                     // `recGblSetSevrMsg(LINK_ALARM, INVALID_ALARM, "field %s")`.
-                    crate::server::recgbl::rec_gbl_set_sevr_msg(
-                        &mut instance.common,
-                        crate::server::recgbl::alarm_status::LINK_ALARM,
-                        crate::server::record::AlarmSeverity::Invalid,
-                        "field SIML",
-                    );
+                    crate::server::recgbl::rec_gbl_set_link_alarm(&mut instance.common, "SIML");
                 }
             }
         }
         // `recGblCheckSimm(pcommon, psscn, *poldsimm, *psimm)` — a SIML-driven
         // SIMM transition swaps SCAN with SSCN exactly like a `caput REC.SIMM`
-        // does.
+        // does. C runs it even on a FAILED read (recGbl.c:455 is past the
+        // LINK_ALARM line), so the swap is not conditional on the status.
         self.apply_simm_scan_swap(rec).await;
+        failed
     }
 
     /// Run C `recGblCheckSimm` on a record and hand the resulting scan move to
@@ -4956,13 +4988,11 @@ impl PvDatabase {
             // `histogramRecord.c:209`->`:384` `dbGetLink(&siol, DBR_DOUBLE,
             // &sval)`). They are classified as inputs so a simulated cycle
             // reads SIOL rather than running the real device read and writing
-            // VAL back out. `waveform` is exact: the SIOL array lands in VAL via
-            // `set_val`. `histogram` reads SIOL but lands the scalar in VAL via
-            // the shared `set_val` path, which no-ops against the bin-count
-            // array — so a simulated histogram is frozen (no SIOL->SVAL feed, no
-            // bin accumulation). That residual is pre-existing and unmodeled;
-            // the classification only ensures a simulated histogram no longer
-            // performs the real device read or corrupts the SIOL target.
+            // VAL back out. Each lands the value where its own C `readValue`
+            // lands it, through `Record::land_simulated_value`: `waveform` puts
+            // the SIOL array in VAL (the default `set_val`), `histogram` puts
+            // the scalar in SGNL and bins it (`histogramRecord.c:385` +
+            // `:219` `add_count`), because its VAL is the bin-count array.
             //
             // `aai` is also a SIOL-reading input, but the SIOL read lives in
             // its soft DEVICE support, not the record support. `aaiRecord.c::
@@ -5097,7 +5127,28 @@ impl PvDatabase {
         // (`rec_gbl_get_simm`, C `recGblGetSimm`), which is the ONLY site that
         // writes SIMM.
         if !pact_held {
-            self.rec_gbl_get_simm(rec, &siml_link).await;
+            let siml_read_failed = self.rec_gbl_get_simm(rec, &siml_link).await;
+            // W10-E5. `busyRecord.c:397-400` returns from `writeValue` on a
+            // failed SIML read — BEFORE `write_busy` and before the SIOL
+            // `dbPutLink`. So C never reaches the `switch (prec->simm)` below:
+            // no device write, no SIOL redirect, no SIMM_ALARM. The LINK_ALARM
+            // that `dbGetLink`'s `setLinkAlarm` raised inside `rec_gbl_get_simm`
+            // is the cycle's only simulation alarm.
+            //
+            // Only a record that declares it aborts takes this path — busy. The
+            // recGblGetSimm records' equivalent `if (status) return status;` is
+            // dead code (recGbl.c:456 always returns 0) and swait never tests
+            // the status (swaitRecord.c:402), so both fall through to the switch
+            // with SIMM at whatever value it already held.
+            if siml_read_failed {
+                let aborts = {
+                    let instance = rec.read().await;
+                    instance.record.aborts_on_failed_siml_read()
+                };
+                if aborts {
+                    return SimOutcome::AbortedBeforeWrite;
+                }
+            }
         }
 
         // Check SIMM. The dispatch is the record's own C `switch (prec->simm)`,
@@ -5192,6 +5243,18 @@ impl PvDatabase {
         if input_stage {
             let fetch = self.fetch_sim_link(&siol_link).await;
             let mut instance = rec.write().await;
+            // C `:416` reads SIOL with a plain `dbGetLink`, so a FAILED read
+            // runs `setLinkAlarm` (dbLink.c:322) — LINK_ALARM/INVALID with
+            // AMSG "field SIOL". Raised HERE, before the SIMM_ALARM below,
+            // because that is swait's order (`dbGetLink` at :416, then
+            // `recGblSetSevr(SIMM_ALARM, sims)` at :420) — the opposite of the
+            // base records. `rec_gbl_set_sevr*` is strict-greater, so with
+            // `SIMS = INVALID` the LINK_ALARM raised first WINS the tie here
+            // and swait publishes STAT=LINK/AMSG="field SIOL", where a longin
+            // publishes STAT=SIMM. Compiled C confirms both.
+            if let crate::server::recgbl::simm::SimLinkFetch::Failed = fetch {
+                crate::server::recgbl::rec_gbl_set_link_alarm(&mut instance.common, "SIOL");
+            }
             // C `:417-420` — `if (status == 0) { val = sval; udf = FALSE; }`.
             // A CONSTANT (or unset) SIOL is `status == 0` with SVAL untouched
             // (`dbConstGetValue`), so it still copies SVAL into VAL; only a
@@ -5203,7 +5266,7 @@ impl PvDatabase {
                     let _ = instance.record.put_field_internal("SVAL", sval);
                 }
                 if let Some(sval) = instance.record.get_field("SVAL") {
-                    let _ = instance.record.set_val(sval);
+                    let _ = instance.record.land_simulated_value(sval);
                 }
                 instance.common.udf = false;
             }
@@ -5256,6 +5319,28 @@ impl PvDatabase {
         // `readValue` precedes the body, so the SIOL read + convert are done
         // in place and the caller short-circuits.
         {
+            // C `readValue` raises the SIMM severity at the TOP of the
+            // `case menuYesNoYES:` arm — BEFORE the SIOL read
+            // (`longinRecord.c:414` `recGblSetSevr(prec, SIMM_ALARM, prec->sims)`,
+            // then `:416` `dbGetLink(&prec->siol, ...)`); likewise ai, mbbi,
+            // histogram, waveform. That ORDER is load-bearing, not cosmetic:
+            // `recGblSetSevr` is strict-greater, so when the SIOL read fails and
+            // raises LINK_ALARM/INVALID (below), an already-pending
+            // SIMM_ALARM/INVALID (`SIMS = INVALID`) WINS the tie and the record
+            // publishes STAT=SIMM_ALARM — while with the default
+            // `SIMS = NO_ALARM` nothing is pending, so LINK_ALARM/INVALID lands
+            // and the broken SIOL is reported. Raising SIMM in the tail (the
+            // pre-fix shape, after the read) inverted that tie.
+            {
+                let mut instance = rec.write().await;
+                let sev = crate::server::record::AlarmSeverity::from_u16(sims as u16);
+                crate::server::recgbl::rec_gbl_set_sevr(
+                    &mut instance.common,
+                    crate::server::recgbl::alarm_status::SIMM_ALARM,
+                    sev,
+                );
+            }
+
             // Read from SIOL -> SVAL -> VAL/RVAL. Uniform across Db (with
             // locality fallback) / Ca / Pva / constant via `fetch_sim_link`
             // (C `dbGetLink`), which keeps C's three outcomes apart: a value,
@@ -5263,6 +5348,16 @@ impl PvDatabase {
             // failure.
             let fetch = self.fetch_sim_link(&siol_link).await;
             let mut instance = rec.write().await;
+
+            // C reads SIOL with a plain `dbGetLink`, whose failure path is
+            // `setLinkAlarm` (dbLink.c:322) -> `recGblSetSevrMsg(LINK_ALARM,
+            // INVALID_ALARM, "field %s")`. The pre-fix port raised only
+            // SIMM_ALARM, so under the default `SIMS = NO_ALARM` a broken
+            // simulation link reported NO_ALARM — completely silent — where C
+            // reports INVALID/LINK. Affects every SIOL-reading record.
+            if let crate::server::recgbl::simm::SimLinkFetch::Failed = fetch {
+                crate::server::recgbl::rec_gbl_set_link_alarm(&mut instance.common, "SIOL");
+            }
 
             // C's SIOL read buffer is `&prec->sval` on every scalar SIML/SIOL
             // record (`longinRecord.c:416` `dbGetLink(&prec->siol, DBR_LONG,
@@ -5356,10 +5451,14 @@ impl PvDatabase {
                     instance.record.set_process_context(&ctx);
                     let _ = instance.record.process();
                 } else {
-                    // Records without RVAL fall back to SIMM=YES
-                    // semantics: the SIOL value goes straight into
-                    // VAL; no conversion to run.
-                    let _ = instance.record.set_val(siol_val);
+                    // Records without RVAL fall back to SIMM=YES semantics: the
+                    // SIOL value lands where C's `readValue` lands it — VAL for
+                    // the base records (`longinRecord.c:417` `val = sval`), SGNL
+                    // plus the bin increment for `histogram`
+                    // (`histogramRecord.c:385` + `:219`). `land_simulated_value`
+                    // is the single owner of that assignment; no conversion to
+                    // run either way.
+                    let _ = instance.record.land_simulated_value(siol_val);
                 }
             }
 
@@ -5372,7 +5471,7 @@ impl PvDatabase {
             // having landed (R12-61). UDF is the one part C does gate on the
             // read's status (`if (status == 0) prec->udf = FALSE`), and a
             // constant SIOL is status 0.
-            sim_process_tail(&mut instance, SimTailAlarm::Simm(sims), fetch.is_ok());
+            sim_process_tail(&mut instance, fetch.is_ok());
         }
 
         // C `readValue`/`writeValue` clears `pact` on the synchronous branch
@@ -5394,29 +5493,20 @@ impl PvDatabase {
     }
 }
 
-/// Which alarm the simulated cycle's tail raises before it commits.
-///
-/// C raises SIMM_ALARM at SIMS on the YES/RAW arms only
-/// (`recGblSetSevr(prec, SIMM_ALARM, prec->sims)`). The `default:` arm raises
-/// SOFT_ALARM/INVALID *instead*, and does so where it is detected — before the
-/// tail — so the tail has nothing left to raise.
-#[derive(Debug, Clone, Copy)]
-enum SimTailAlarm {
-    /// The YES/RAW arms: `recGblSetSevr(prec, SIMM_ALARM, prec->sims)`.
-    Simm(i16),
-    /// The `default:` arm: SOFT_ALARM/INVALID is already pending; raise nothing.
-    None,
-}
-
 /// Shared tail of a simulated (`SIMM` != NO) process cycle — the part of
 /// C `process()` that still runs when `readValue`/`writeValue` divert to
 /// the SIOL (`aiRecord.c` and every SIML/SIMM-bearing record):
-/// `recGblSetSevr(prec, SIMM_ALARM, prec->sims)` — a MAXIMIZE into the
-/// pending nsta/nsev raised first so it wins severity ties (C order:
-/// readValue before checkAlarms) — then `checkAlarms`,
-/// `recGblResetAlarms`, and `monitor()`, so the simulated value still
-/// trips its own limit/state alarms and the SIMM severity maximizes
-/// against them.
+/// `checkAlarms`, `recGblResetAlarms` and `monitor()`, so the simulated value
+/// still trips its own limit/state alarms and the alarms the SIMM branch
+/// already raised maximize against them.
+///
+/// The tail raises NO alarm of its own. Every alarm a simulated cycle can
+/// raise — SIMM_ALARM at SIMS on the YES/RAW arms, LINK_ALARM on a failed SIOL
+/// `dbGetLink`, SOFT_ALARM/INVALID on the `default:` arm — is raised by
+/// `check_simulation_mode` at the point C raises it, because
+/// `recGblSetSevr` is a strict-greater MAXIMIZE and the ORDER of those calls
+/// decides equal-severity ties (W10-E4). Folding the SIMM raise in here instead
+/// silently reordered it after the SIOL read.
 ///
 /// The posting masks are per-field, identical to the async-completion
 /// path (`complete_async_record`) and `process_local`:
@@ -5441,7 +5531,7 @@ enum SimTailAlarm {
 /// result — every simulated cycle re-sent unchanged alarm fields,
 /// stamped `DBE_ALARM` on cycles whose alarm state never moved, and
 /// bypassed the MDEL/ADEL deadband entirely.
-fn sim_process_tail(instance: &mut RecordInstance, alarm: SimTailAlarm, clear_udf: bool) {
+fn sim_process_tail(instance: &mut RecordInstance, clear_udf: bool) {
     use crate::server::recgbl::EventMask;
 
     apply_timestamp(&mut instance.common, true);
@@ -5451,14 +5541,6 @@ fn sim_process_tail(instance: &mut RecordInstance, alarm: SimTailAlarm, clear_ud
         instance.common.udf = false;
     }
 
-    if let SimTailAlarm::Simm(sims) = alarm {
-        let sev = crate::server::record::AlarmSeverity::from_u16(sims as u16);
-        crate::server::recgbl::rec_gbl_set_sevr(
-            &mut instance.common,
-            crate::server::recgbl::alarm_status::SIMM_ALARM,
-            sev,
-        );
-    }
     {
         let inst = &mut *instance;
         inst.record.check_alarms(&mut inst.common);
@@ -5552,7 +5634,7 @@ fn sim_process_tail(instance: &mut RecordInstance, alarm: SimTailAlarm, clear_ud
         instance.notify_field("STAT", stat_mask);
         instance.notify_field("AMSG", stat_mask);
     }
-    if alarm_result.acks_changed && !stat_mask.is_empty() {
+    if alarm_result.acks_posted {
         instance.notify_field("ACKS", EventMask::VALUE);
     }
 }

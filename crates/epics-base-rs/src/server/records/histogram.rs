@@ -264,6 +264,28 @@ impl Record for HistogramRecord {
         Ok(ProcessOutcome::complete())
     }
 
+    /// C `histogramRecord.c:384-387` — the simulated SIOL read lands in SGNL,
+    /// not in VAL (VAL is the bin-count array):
+    ///
+    /// ```c
+    /// status = dbGetLink(&prec->siol, DBR_DOUBLE, &prec->sval, 0, 0);
+    /// if (status == 0) {
+    ///     prec->sgnl = prec->sval;
+    ///     prec->udf = FALSE;
+    /// }
+    /// ```
+    ///
+    /// and `process()` (`:218-219`) then bins it: `if (status == 0)
+    /// add_count(prec);`. The framework calls this only on that same
+    /// `status == 0`, so the bin increment belongs here — the assignment is a
+    /// plain store, NOT the `put_field("SGNL")` path, whose `add_count` is C's
+    /// SPC_MOD `special()` hook (`:260-263`) and would count the sample twice.
+    fn land_simulated_value(&mut self, value: EpicsValue) -> CaResult<()> {
+        self.sgnl = value.to_f64().unwrap_or(0.0);
+        self.add_count();
+        Ok(())
+    }
+
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             // Counters surfaced as-is (the i32 slot is the

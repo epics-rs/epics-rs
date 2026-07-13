@@ -95,6 +95,75 @@ fn a_repeated_name_server_entry_is_reported() {
     );
 }
 
+/// R18-17: a token that does not resolve is REPORTED, and the rest of the list
+/// is still used. C `iocinf.cpp:70-74` — two lines, the second TAB-indented,
+/// the first naming the C source file and the variable being parsed. Captured
+/// from the compiled `caget`:
+///
+/// ```text
+/// ../iocinf.cpp: Parsing 'EPICS_CA_ADDR_LIST'
+/// <TAB>Bad internet address or host name: 'no.such.host.invalid'
+/// ```
+///
+/// (`<TAB>` is a literal U+0009 in C's output and in the assertion below; it is
+/// spelled out here only because a tab in a doc comment is a clippy error.)
+///
+/// The port swallowed the token with a bare `continue`, so a typo left the
+/// client searching a shorter list than the operator wrote, with nothing said.
+#[test]
+fn a_bad_addr_list_token_prints_cs_two_lines() {
+    let out = Command::new(env!("CARGO_BIN_EXE_caget-rs"))
+        .arg("-w")
+        .arg("0.2")
+        .arg("TST:NOSUCHPV")
+        .env(
+            "EPICS_CA_ADDR_LIST",
+            "no.such.host.invalid 127.0.0.1:15099 127.0.0.1:abc",
+        )
+        .env("EPICS_CA_AUTO_ADDR_LIST", "NO")
+        .output()
+        .expect("run caget-rs");
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        stderr.contains(
+            "../iocinf.cpp: Parsing 'EPICS_CA_ADDR_LIST'\n\
+             \tBad internet address or host name: 'no.such.host.invalid'\n"
+        ),
+        "stderr: {stderr:?}"
+    );
+    // C's `aToIPAddr` fails on a non-numeric port too — same two lines.
+    assert!(
+        stderr.contains(
+            "../iocinf.cpp: Parsing 'EPICS_CA_ADDR_LIST'\n\
+             \tBad internet address or host name: '127.0.0.1:abc'\n"
+        ),
+        "stderr: {stderr:?}"
+    );
+}
+
+/// The same two lines for `EPICS_CA_NAME_SERVERS`, naming THAT variable — C
+/// tokenizes both lists with `addAddrToChannelAccessAddressList`, which prints
+/// `pEnv->name`.
+#[test]
+fn a_bad_name_server_token_prints_cs_two_lines() {
+    let out = Command::new(env!("CARGO_BIN_EXE_caget-rs"))
+        .arg("-w")
+        .arg("0.2")
+        .arg("TST:NOSUCHPV")
+        .env("EPICS_CA_NAME_SERVERS", "no.such.host.invalid")
+        .env("EPICS_CA_AUTO_ADDR_LIST", "NO")
+        .output()
+        .expect("run caget-rs");
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        stderr.contains(
+            "../iocinf.cpp: Parsing 'EPICS_CA_NAME_SERVERS'\n\
+             \tBad internet address or host name: 'no.such.host.invalid'\n"
+        ),
+        "stderr: {stderr:?}"
+    );
+}
+
 /// A list with no repeats says nothing at all — the warning is not a
 /// "this list was processed" trace.
 #[test]

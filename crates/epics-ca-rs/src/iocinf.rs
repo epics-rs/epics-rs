@@ -17,7 +17,97 @@
 //! traffic for the life of the process, silently. This module is the missing C
 //! function, and the only place the port builds one of these lists.
 
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, ToSocketAddrs};
+
+/// One entry as `addAddrToChannelAccessAddressList` produced it: the resolved
+/// address, plus the DNS name it came from when it was not an IP literal.
+///
+/// C keeps only the resolved `osiSockAddr`; the port keeps the name as well so
+/// the search engine can re-resolve an entry whose IOC moved (epics-base#488).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AddrToken {
+    pub sock: SocketAddr,
+    /// `None` when the token was an IP literal — nothing to re-resolve.
+    pub hostname: Option<String>,
+    pub port: u16,
+}
+
+/// C `addAddrToChannelAccessAddressList` (`iocinf.cpp:45-100`): split the value
+/// on whitespace, run each token through `aToIPAddr` with the list's default
+/// port, and REPORT every token that does not resolve — then carry on with the
+/// rest of the list.
+///
+/// The port dropped bad tokens silently (a `continue`, or a `tracing::debug!`
+/// nobody sees), so a typo in `EPICS_CA_ADDR_LIST` left the client searching a
+/// shorter list than the operator wrote, with nothing on the terminal to say
+/// so. Every list C builds — client, name servers, server interface, beacon,
+/// ignore — is tokenized here, so the diagnostic is not a property of one
+/// variable and neither is this function.
+pub(crate) fn add_addr_to_channel_access_address_list(
+    list: &str,
+    env_name: &str,
+    default_port: u16,
+) -> Vec<AddrToken> {
+    let mut out = Vec::new();
+    // C tokenizes on `" \t\n\r"` (`epicsStrtok_r`), which is `split_whitespace`
+    // minus the Unicode spaces no `envDefs` value carries.
+    for token in list.split_whitespace() {
+        match a_to_ip_addr(token, default_port) {
+            Some(entry) => out.push(entry),
+            None => bad_address(env_name, token),
+        }
+    }
+    out
+}
+
+/// `iocinf.cpp:70-74`, byte for byte — `__FILE__` is the C source path as the
+/// build compiled it, `../iocinf.cpp`, and the second line is TAB-indented.
+/// Captured from the compiled `caget`:
+///
+/// ```text
+/// ../iocinf.cpp: Parsing 'EPICS_CA_ADDR_LIST'
+/// <TAB>Bad internet address or host name: 'no.such.host.invalid'
+/// ```
+///
+/// (`<TAB>` is a literal U+0009 in C's format string and in the output; it is
+/// spelled out here only because a tab in a doc comment is a clippy error.)
+fn bad_address(env_name: &str, token: &str) {
+    eprintln!("../iocinf.cpp: Parsing '{env_name}'");
+    eprintln!("\tBad internet address or host name: '{token}'");
+}
+
+/// libcom `aToIPAddr` (`osiSock.c:178-241`): `<host>` or `<host>:<port>`, where
+/// `<host>` is a dotted IPv4 literal or a name the resolver knows. Anything else
+/// — an unresolvable name, a non-numeric or out-of-range port, an empty host —
+/// is a failure, and C's caller reports it.
+///
+/// CA is IPv4-only (`sin_family = AF_INET`), so an IPv6-only name is a failure
+/// here as it is in C.
+fn a_to_ip_addr(token: &str, default_port: u16) -> Option<AddrToken> {
+    let (host, port) = match token.rsplit_once(':') {
+        Some((host, port)) => (host, port.parse::<u16>().ok()?),
+        None => (token, default_port),
+    };
+    if host.is_empty() {
+        return None;
+    }
+    if let Ok(ip) = host.parse::<Ipv4Addr>() {
+        return Some(AddrToken {
+            sock: SocketAddr::V4(SocketAddrV4::new(ip, port)),
+            hostname: None,
+            port,
+        });
+    }
+    let sock = format!("{host}:{port}")
+        .to_socket_addrs()
+        .ok()?
+        .find(SocketAddr::is_ipv4)?;
+    Some(AddrToken {
+        sock,
+        hostname: Some(host.to_string()),
+        port,
+    })
+}
 
 /// C `removeDuplicateAddresses(pDestList, pSrcList, silent=0)`
 /// (`iocinf.cpp:104-140`): keep the first entry for each `(ip, port)`, drop

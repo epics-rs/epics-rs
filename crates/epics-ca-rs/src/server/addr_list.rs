@@ -5,7 +5,7 @@
 //! parsed address lists for the IOC's UDP search responder and beacon
 //! emitter.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::Duration;
 
 use crate::protocol::CA_REPEATER_PORT;
@@ -91,14 +91,10 @@ fn resolve_from_env() -> CaResult<CasUdpConfig> {
     let mut cfg = CasUdpConfig::default();
 
     if let Some(list) = epics_base_rs::runtime::env::get("EPICS_CAS_INTF_ADDR_LIST") {
-        // C `caservertask.c:341-343` tokenizes with the server's UDP port and
-        // then runs the SAME `removeDuplicateAddresses(…, silent=0)` the client
-        // address list gets — a repeated interface would otherwise be bound (or
-        // its multicast group joined) twice, silently.
+        // C `caservertask.c:341-343` tokenizes with the server's UDP port —
+        // which is the port its duplicate warning dots the address with.
         let udp_port = epics_base_rs::runtime::net::cas_server_port();
-        let parsed = crate::iocinf::remove_duplicate_addresses(parse_ipv4_list(&list), |ip| {
-            SocketAddr::V4(SocketAddrV4::new(*ip, udp_port))
-        });
+        let parsed = parse_ipv4_list(&list, "EPICS_CAS_INTF_ADDR_LIST", udp_port);
         // C `rsrv/caservertask.c:367-371, 633-668` splits
         // multicast (224.0.0.0/4) entries off into
         // `casMCastAddrList` and joins each group via
@@ -143,7 +139,11 @@ fn resolve_from_env() -> CaResult<CasUdpConfig> {
     // fall back; that path lives in `repeater.rs` and is unaffected.
     let mut beacon_addrs: Vec<SocketAddr> = Vec::new();
     if let Some(list) = epics_base_rs::runtime::env::get("EPICS_CAS_BEACON_ADDR_LIST") {
-        beacon_addrs.extend(parse_addr_list(&list, beacon_port));
+        beacon_addrs.extend(parse_addr_list(
+            &list,
+            "EPICS_CAS_BEACON_ADDR_LIST",
+            beacon_port,
+        ));
     }
 
     // C parity (`caservertask.c:281-287, 415-427`):
@@ -254,10 +254,7 @@ fn resolve_from_env() -> CaResult<CasUdpConfig> {
         // C `caservertask.c:450-451` builds this one with `port = 0`, so the
         // duplicate it reports is dotted as `10.1.2.3:0` — captured from the
         // compiled `softIoc`, which is why the port is not the server's here.
-        cfg.ignore_addrs =
-            crate::iocinf::remove_duplicate_addresses(parse_ipv4_list(&list), |ip| {
-                SocketAddr::V4(SocketAddrV4::new(*ip, 0))
-            });
+        cfg.ignore_addrs = parse_ipv4_list(&list, "EPICS_CAS_IGNORE_ADDR_LIST", 0);
     }
 
     // C `online_notify.c::rsrv_online_notify_task:52-57` reads
@@ -315,49 +312,32 @@ fn resolve_from_env() -> CaResult<CasUdpConfig> {
     Ok(cfg)
 }
 
-/// Parse a whitespace-separated list of "host" or "host:port" tokens.
-/// Resolves DNS names if necessary. Unparseable entries are dropped.
-pub fn parse_addr_list(list: &str, default_port: u16) -> Vec<SocketAddr> {
-    let mut out = Vec::new();
-    for token in list.split_whitespace() {
-        if let Some(addr) = resolve_token(token, default_port) {
-            out.push(addr);
-        }
-    }
-    out
+/// One `EPICS_CAS_*` address list, tokenized and deduped exactly as C does it:
+/// `addAddrToChannelAccessAddressList` then
+/// `removeDuplicateAddresses(…, silent=0)` (`caservertask.c:341-343`,
+/// `:413-438`, `:450-451`). Both diagnostics — the bad token and the discarded
+/// duplicate — belong to those two functions and are printed by them.
+pub fn parse_addr_list(list: &str, env_name: &str, default_port: u16) -> Vec<SocketAddr> {
+    let tokens =
+        crate::iocinf::add_addr_to_channel_access_address_list(list, env_name, default_port);
+    crate::iocinf::remove_duplicate_addresses(tokens, |t| t.sock)
+        .into_iter()
+        .map(|t| t.sock)
+        .collect()
 }
 
-fn resolve_token(token: &str, default_port: u16) -> Option<SocketAddr> {
-    if let Ok(addr) = token.parse::<SocketAddr>() {
-        return Some(addr);
-    }
-    if let Ok(ip) = token.parse::<Ipv4Addr>() {
-        return Some(SocketAddr::V4(SocketAddrV4::new(ip, default_port)));
-    }
-    let (host, port) = match token.rsplit_once(':') {
-        Some((h, p)) => (h, p.parse::<u16>().ok()?),
-        None => (token, default_port),
-    };
-    let candidates = format!("{host}:{port}").to_socket_addrs().ok()?;
-    candidates.into_iter().find(|a| a.is_ipv4())
-}
-
-/// Parse a whitespace-separated list of IPv4 literals (no port).
-fn parse_ipv4_list(list: &str) -> Vec<Ipv4Addr> {
-    list.split_whitespace()
-        .filter_map(|tok| {
-            // Accept "ip" or "ip:port" (port ignored for ignore-list).
-            let (host, _) = tok.rsplit_once(':').unwrap_or((tok, ""));
-            host.parse::<Ipv4Addr>().ok().or_else(|| {
-                // Try DNS as a courtesy.
-                format!("{tok}:0")
-                    .to_socket_addrs()
-                    .ok()?
-                    .find_map(|sa| match sa {
-                        SocketAddr::V4(v4) => Some(*v4.ip()),
-                        _ => None,
-                    })
-            })
+/// The interface and ignore lists, which C builds through the same two
+/// functions and then uses only the IP half of: `casIntfAddrList` is bound per
+/// interface, `casIgnoreAddrs` is matched against a datagram's source IP. The
+/// port each entry carries still decides what counts as a duplicate and what
+/// the duplicate warning prints, which is why the list is deduped BEFORE the
+/// port is dropped.
+fn parse_ipv4_list(list: &str, env_name: &str, default_port: u16) -> Vec<Ipv4Addr> {
+    parse_addr_list(list, env_name, default_port)
+        .into_iter()
+        .filter_map(|a| match a {
+            SocketAddr::V4(v4) => Some(*v4.ip()),
+            SocketAddr::V6(_) => None,
         })
         .collect()
 }
@@ -539,7 +519,11 @@ mod tests {
 
     #[test]
     fn parse_addr_list_with_ports() {
-        let parsed = parse_addr_list("10.0.0.1 192.168.1.255:5066", 5065);
+        let parsed = parse_addr_list(
+            "10.0.0.1 192.168.1.255:5066",
+            "EPICS_CAS_BEACON_ADDR_LIST",
+            5065,
+        );
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0].port(), 5065);
         assert_eq!(parsed[1].port(), 5066);
@@ -547,7 +531,7 @@ mod tests {
 
     #[test]
     fn parse_ipv4_list_drops_garbage() {
-        let v = parse_ipv4_list("1.2.3.4 not-an-ip 5.6.7.8");
+        let v = parse_ipv4_list("1.2.3.4 not-an-ip 5.6.7.8", "EPICS_CAS_INTF_ADDR_LIST", 0);
         assert_eq!(
             v,
             vec![Ipv4Addr::new(1, 2, 3, 4), Ipv4Addr::new(5, 6, 7, 8)]
@@ -576,8 +560,8 @@ mod tests {
 
     #[test]
     fn empty_list_returns_empty() {
-        assert!(parse_addr_list("", 5065).is_empty());
-        assert!(parse_ipv4_list("   ").is_empty());
+        assert!(parse_addr_list("", "EPICS_CAS_BEACON_ADDR_LIST", 5065).is_empty());
+        assert!(parse_ipv4_list("   ", "EPICS_CAS_INTF_ADDR_LIST", 0).is_empty());
     }
 
     /// `from_env` MUST NOT fall back to `EPICS_CA_ADDR_LIST` for the

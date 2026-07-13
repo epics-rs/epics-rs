@@ -4828,44 +4828,24 @@ pub(crate) fn parse_addr_list_with_hostnames() -> CaResult<Vec<AddrEntry>> {
     }
 
     if let Some(list) = epics_base_rs::runtime::env::get("EPICS_CA_ADDR_LIST") {
-        for entry in list.split_whitespace() {
-            let (host_raw, port) = if entry.contains(':') {
-                if let Some((h, p)) = entry.rsplit_once(':') {
-                    let port: u16 = match p.parse() {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
-                    (h.to_string(), port)
-                } else {
-                    (entry.to_string(), default_port)
+        // C `iocinf.cpp:225`. The tokenizer owns the bad-token diagnostic; the
+        // only thing left to do here is the Rust-only IP quarantine.
+        for tok in crate::iocinf::add_addr_to_channel_access_address_list(
+            &list,
+            "EPICS_CA_ADDR_LIST",
+            default_port,
+        ) {
+            if let SocketAddr::V4(v4) = tok.sock {
+                if ignore_ips.contains(v4.ip()) {
+                    tracing::debug!(
+                        target: "epics_ca_rs::client",
+                        ip = %v4.ip(),
+                        "EPICS_RS_CLIENT_IGNORE: dropping ADDR_LIST entry"
+                    );
+                    continue;
                 }
-            } else {
-                (entry.to_string(), default_port)
-            };
-            // Pure-IP entry has no DNS to refresh.
-            let hostname = if host_raw.parse::<Ipv4Addr>().is_ok() {
-                None
-            } else {
-                Some(host_raw.clone())
-            };
-            match resolve_host(&host_raw, port) {
-                Ok(sock) => {
-                    if let SocketAddr::V4(v4) = sock {
-                        if ignore_ips.contains(v4.ip()) {
-                            tracing::debug!(
-                                target: "epics_ca_rs::client",
-                                token = %entry,
-                                ip = %v4.ip(),
-                                "EPICS_RS_CLIENT_IGNORE: dropping ADDR_LIST entry"
-                            );
-                            continue;
-                        }
-                    }
-                    addrs.push(AddrEntry::new(sock, hostname, port));
-                }
-                Err(e) => tracing::debug!(token = %entry, error = %e,
-                    "EPICS_CA_ADDR_LIST: dropped unresolvable entry"),
             }
+            addrs.push(AddrEntry::new(tok.sock, tok.hostname, tok.port));
         }
     }
 
@@ -5360,44 +5340,18 @@ pub(crate) fn parse_nameserver_list() -> Vec<(SocketAddr, Option<String>)> {
     // deployments. The `host:port` branch already honours the
     // explicit port; only the bare-hostname default changes here.
     let default_server_port: u16 = epics_base_rs::runtime::net::ca_server_port();
-    let mut out = Vec::new();
-    for entry in list.split_whitespace() {
-        if entry.contains(':') {
-            // Try as raw `IP:port` first — if it parses, no hostname.
-            if let Ok(addr) = entry.parse::<SocketAddr>() {
-                out.push((addr, None));
-                continue;
-            }
-            // Otherwise treat it as `host:port` and remember the host.
-            let Some((host, port_str)) = entry.rsplit_once(':') else {
-                continue;
-            };
-            let Ok(port) = port_str.parse::<u16>() else {
-                continue;
-            };
-            if let Ok(addr) = resolve_host(host, port) {
-                let hostname = if host.parse::<std::net::IpAddr>().is_ok() {
-                    None
-                } else {
-                    Some(host.to_string())
-                };
-                out.push((addr, hostname));
-            }
-        } else {
-            // Bare hostname (no port) — treat as DNS name even if it
-            // happens to look like an IP literal (caller intent is
-            // unambiguous when no port is specified). default
-            // port from EPICS_CA_SERVER_PORT (matches libca).
-            if let Ok(addr) = resolve_host(entry, default_server_port) {
-                let hostname = if entry.parse::<std::net::IpAddr>().is_ok() {
-                    None
-                } else {
-                    Some(entry.to_string())
-                };
-                out.push((addr, hostname));
-            }
-        }
-    }
+    // C `cac.cpp:259` — the SAME tokenizer the client address list is built
+    // with, which is why a bad token here is reported in exactly the same two
+    // lines, naming this variable.
+    let out: Vec<(SocketAddr, Option<String>)> =
+        crate::iocinf::add_addr_to_channel_access_address_list(
+            &list,
+            "EPICS_CA_NAME_SERVERS",
+            default_server_port,
+        )
+        .into_iter()
+        .map(|tok| (tok.sock, tok.hostname))
+        .collect();
     // C `cac.cpp:260`: `removeDuplicateAddresses ( &dest, &tmpList, 0 )` — the
     // name-server list is deduped by the SAME helper as `EPICS_CA_ADDR_LIST`,
     // and warns about what it drops for the same reason: a repeated entry

@@ -117,10 +117,17 @@ fn subarray_keeps_the_status_gated_udf_rules() {
     }
 }
 
-/// An UNDEFINED waveform must not report an alarm even when the framework's
-/// central UDF check runs: C has no UDF_ALARM guard for it at all.
+/// A never-processed waveform carries the INITIAL UDF severity — not a
+/// process-time UDF alarm.
+///
+/// The two are different mechanisms and only the second is waveform-specific:
+/// `iocInit.c:521-523` gives EVERY record `SEVR = UDFS` while `udf && stat ==
+/// UDF_ALARM` (and STAT is born `UDF`), whereas `recGblCheckUdf` — the
+/// process-time raise that `waveformRecord.c` never calls — is what this record
+/// type genuinely lacks. softIoc, `record(waveform,"UDFWF")` with no INP, never
+/// processed: `STAT=UDF SEVR=INVALID UDF=1`.
 #[tokio::test]
-async fn an_undefined_waveform_reports_no_alarm() {
+async fn an_undefined_waveform_carries_the_initial_udf_severity() {
     let (db, _) = IocBuilder::new()
         .db_string(
             r#"record(waveform, "UDF:WF") { field(FTVL, "DOUBLE") field(NELM, "4") }"#,
@@ -136,8 +143,15 @@ async fn an_undefined_waveform_reports_no_alarm() {
 
     assert_eq!(
         db.get_pv("UDF:WF.SEVR").await.unwrap().to_f64(),
-        Some(AlarmSeverity::NoAlarm as i32 as f64),
-        "a UDF waveform is NOT INVALID/UDF — C raises no UDF_ALARM for it"
+        Some(AlarmSeverity::Invalid as i32 as f64),
+        "iocInit gives every never-processed record SEVR = UDFS (INVALID)"
+    );
+    assert_eq!(
+        db.get_pv("UDF:WF.STAT").await.unwrap().to_f64(),
+        Some(f64::from(
+            epics_base_rs::server::recgbl::alarm_status::UDF_ALARM
+        )),
+        "STAT is born UDF (dbCommon.dbd initial(\"UDF\"))"
     );
     assert_eq!(
         db.get_pv("UDF:WF").await.unwrap(),

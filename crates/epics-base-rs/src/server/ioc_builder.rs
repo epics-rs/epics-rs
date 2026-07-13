@@ -217,12 +217,7 @@ impl IocBuilder {
             if let Some(rec_arc) = db.get_record(&name).await {
                 {
                     let mut instance = rec_arc.write().await;
-                    if let Err(e) = instance.record.init_record(0) {
-                        eprintln!("init_record(0) failed for {name}: {e}");
-                    }
-                    if let Err(e) = instance.record.init_record(1) {
-                        eprintln!("init_record(1) failed for {name}: {e}");
-                    }
+                    instance.run_init_passes(&name);
                     // Seed MLST/ALST/LALM from val so the first process posts a
                     // monitor only on a real change (C init_record invariant).
                     instance.record.seed_deadband_tracking();
@@ -309,13 +304,10 @@ impl IocBuilder {
                         }
                     }
                 }
-                // init_record passes
-                if let Err(e) = instance.record.init_record(0) {
-                    eprintln!("init_record(0) failed for {}: {e}", def.name);
-                }
-                if let Err(e) = instance.record.init_record(1) {
-                    eprintln!("init_record(1) failed for {}: {e}", def.name);
-                }
+                // init_record passes, through their owner (which also runs C's
+                // `doInitRecord0` prologue: pact=FALSE + the initial UDF
+                // severity).
+                instance.run_init_passes(&def.name);
                 // Hand the record its resolved common link fields so a
                 // link-classifying record (calcout INAV..INUV/OUTV) can run
                 // its C `init_record` checkLinks step now — the common OUT

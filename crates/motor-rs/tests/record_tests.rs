@@ -8881,7 +8881,12 @@ fn test_alarm_cycle_fans_out_alarm_mask_to_monitored_fields() {
     let mut rec = MotorRecord::new();
     rec.stat.msta = MstaFlags::DONE;
     let mut instance = RecordInstance::new("M1".into(), rec);
+    // A record is born UDF/`STAT=UDF` (dbCommon.dbd `initial("UDF")`), and
+    // clearing that on the first process IS an alarm transition. This test is
+    // about a QUIESCENT cycle, so start from the already-processed state:
+    // defined value, alarm committed at NO_ALARM.
     instance.common.udf = false;
+    instance.common.stat = epics_base_rs::server::recgbl::alarm_status::NO_ALARM;
 
     let _dmov_rx = instance
         .add_subscriber(

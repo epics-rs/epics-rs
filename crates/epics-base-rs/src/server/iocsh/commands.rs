@@ -1171,12 +1171,7 @@ fn cmd_db_load_records() -> CommandDef {
                         // ignored field overrides that affect init —
                         // worse for typical use.
                         let _ = is_merge;
-                        if let Err(e) = instance.record.init_record(0) {
-                            eprintln!("init_record(0) failed for {}: {e}", def.name);
-                        }
-                        if let Err(e) = instance.record.init_record(1) {
-                            eprintln!("init_record(1) failed for {}: {e}", def.name);
-                        }
+                        instance.run_init_passes(&def.name);
                         // Hand the record its resolved common link fields so
                         // a link-classifying record (calcout INAV..INUV/OUTV)
                         // runs its C `init_record` checkLinks step at load —

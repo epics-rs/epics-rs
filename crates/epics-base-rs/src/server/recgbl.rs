@@ -454,7 +454,14 @@ mod tests {
     #[test]
     fn test_reset_alarms_no_change() {
         let mut common = CommonFields::default();
-        // No alarm set, reset should show no change
+        // A record is BORN `stat = UDF_ALARM` (dbCommon.dbd `initial("UDF")`),
+        // so its FIRST reset is an alarm change: UDF -> NO_ALARM. C posts
+        // DBE_ALARM there (recGbl.c:202-207).
+        let first = rec_gbl_reset_alarms(&mut common);
+        assert!(first.alarm_changed);
+        assert_eq!(common.stat, alarm_status::NO_ALARM);
+
+        // No alarm set since — the second reset shows no change.
         let result = rec_gbl_reset_alarms(&mut common);
         assert!(!result.alarm_changed);
     }

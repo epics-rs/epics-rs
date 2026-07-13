@@ -66,7 +66,11 @@ pub(crate) fn raw_soft_rval_u32(record: &str, value: &EpicsValue) -> CaResult<u3
 /// put arm floors what it stores, so a stored counter is never negative and the
 /// `as u32` on the read side is exact.
 pub(crate) fn count_put(value: &EpicsValue) -> Option<i32> {
-    value.to_f64().map(crate::types::c_cast::f64_to_i32)
+    // Through the coercion owner, NOT `c_cast::f64_to_i32(v.to_f64())`: `to_f64`
+    // erases the source's integer-ness, and C picks its conversion routine BY the
+    // source type. A `ULong(0x8000_0000)` put would otherwise take the float rule
+    // and saturate to `i32::MAX`, where C's `putUlongLong` wraps.
+    value.to_dbf_i32()
 }
 
 pub mod acalcout;

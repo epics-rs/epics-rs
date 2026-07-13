@@ -1188,6 +1188,35 @@ impl EpicsValue {
         }
     }
 
+    /// Project this value onto a `DBF_SHORT` field, by C's rule.
+    ///
+    /// `None` means the value is not numeric at all — C's `S_db_badDbrtype`.
+    /// [`Self::convert_to`] coerces rather than fails, so the rejection has to be
+    /// made here or a non-numeric source lands in the field as a silent 0.
+    ///
+    /// Use this, never `c_cast::f64_to_i16(v.to_f64())`: `to_f64` erases the
+    /// source's integer-ness, and C picks its conversion routine BY the source
+    /// type (`dbFastGetConvertRoutine` is a 2-D table, `dbConvert.c:1571-1638`).
+    /// An integer source takes C's DEFINED modular conversion; only a float
+    /// source takes the UB cast that CBUG-E2 saturates. Going through `to_f64`
+    /// forces the float rule onto both.
+    pub(crate) fn to_dbf_i16(&self) -> Option<i16> {
+        self.to_f64()?;
+        match self.convert_to(DbFieldType::Short) {
+            Self::Short(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// [`Self::to_dbf_i16`] for a `DBF_LONG` field. Same rule, same reason.
+    pub(crate) fn to_dbf_i32(&self) -> Option<i32> {
+        self.to_f64()?;
+        match self.convert_to(DbFieldType::Long) {
+            Self::Long(v) => Some(v),
+            _ => None,
+        }
+    }
+
     pub fn to_f64(&self) -> Option<f64> {
         match self {
             Self::Double(v) => Some(*v),

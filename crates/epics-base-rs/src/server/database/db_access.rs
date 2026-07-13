@@ -203,8 +203,11 @@ impl DbChannel {
             .ok()
             .and_then(|v| match v {
                 EpicsValue::Long(i) => Some(i),
-                // C `dbGetLink(.., DBR_LONG, ..)` — `getDoubleLong`'s bare cast.
-                other => other.to_f64().map(crate::types::c_cast::f64_to_i32),
+                // C `dbGetLink(.., DBR_LONG, ..)` picks its conversion routine by
+                // the SOURCE type, so this goes through the coercion owner rather
+                // than `c_cast` direct: an integer source takes C's defined
+                // modular conversion, only a float source takes the UB cast.
+                other => other.to_dbf_i32(),
             })
             .unwrap_or(0)
     }

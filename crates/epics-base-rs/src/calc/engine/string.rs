@@ -766,6 +766,32 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     }
                     // C PEEKS the condition (`:1999`: `if (ps->d == 0)`); it pops
                     // nothing, which is why UNTIL_END has a runtime effect of 0.
+                    //
+                    // DELIBERATE DEVIATION — a STRING-valued condition.
+                    //
+                    // C's line is `if (ps->d==0)` with NO `toDouble(ps)` in front of
+                    // it, and `LITERAL_STRING`'s push (`:1493-1499`) sets `ps->s` and
+                    // never touches `ps->d`. So when the condition is a string, C
+                    // tests an UNINITIALISED double — whatever was last left in that
+                    // stack cell — and the string's own content is irrelevant.
+                    // Compiled upstream, both of these exit after ONE iteration
+                    // (A=1), because the stale `d` happened to be non-zero:
+                    //
+                    //     A:=0;UNTIL(A:=A+1;"0")   ->  A=1, result "0"
+                    //     A:=0;UNTIL(A:=A+1;"1")   ->  A=1, result "1"
+                    //
+                    // There is no C semantic here to match: the same expression under
+                    // a different stack history takes a different branch. The port
+                    // reads the condition through `to_double` (`atof`), the same
+                    // coercion every other numeric context applies to a string, so
+                    // `"0"` is false and loops to `sCalcLoopMax` while `"1"` is true
+                    // and exits. That is defined, and it is what an expression writing
+                    // `UNTIL(...; "0")` can only have meant.
+                    //
+                    // Ported UB would be worse than a documented difference, so this
+                    // is on the record as a divergence rather than reproduced.
+                    // aCalc's UNTIL_END (`array.rs`) carries the same deviation for
+                    // an array-valued condition, for the same reason.
                     let cond = match stack.last() {
                         Some(v) => v.to_double(),
                         None => return Err(CalcError::Underflow),

@@ -477,6 +477,82 @@ pub(crate) fn nt_type_for_channel(
     nt_type_for_field(resolved)
 }
 
+/// The bare leaf a `+type:"plain"` group member serves — **descriptor and
+/// value from one decision**, so they cannot disagree on the wire (R18-26).
+///
+/// pvxs builds a plain member's leaf `Member` straight from the channel's
+/// value type — `addMembersForPlainType` (`ioc/groupconfigprocessor.cpp:886-895`)
+/// is `TypeDef leaf(IOCSource::getChannelValueType(chan, true))` — and the read
+/// path then fills *that same* `Value`: `getArrayValue`
+/// (`ioc/iocsource.cpp:132-137`) collapses a `DBR_CHAR` buffer at the NUL
+/// exactly when the leaf it is filling is `TypeCode::String`. One type code,
+/// two renderings.
+///
+/// The port had them derived independently — a `match nt_type` in the group's
+/// introspection and `epics_to_pv_field` on the read path — so a long-string
+/// member advertised `Scalar(Byte)` and shipped `ScalarArray(bytes)`. Here the
+/// classification happens once, in [`BareLeaf::of_channel`]; [`BareLeaf::desc`]
+/// and [`BareLeaf::value`] are the two renderings of it.
+///
+/// Note this is NOT `build_field_desc_for_nt`: that emits the full NT wrapper
+/// (`NTScalar` with `alarm`/`timeStamp`/…), which is the `+type:"scalar"`
+/// shape. A plain member is the bare leaf, no wrapper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BareLeaf {
+    /// A `DBR_CHAR` array whose channel format is `String` — pvxs
+    /// `TypeCode::String` (`getChannelValueType`, `iocsource.cpp:634-636`).
+    LongString,
+    /// `dbChannelFinalElements() != 1` — pvxs `valueType.arrayOf()`.
+    Array(ScalarType),
+    /// A single element — pvxs `fromDbrType(final_field_type)`.
+    Scalar(ScalarType),
+}
+
+impl BareLeaf {
+    /// Classify the channel bound to `record.field`. `resolved` is the
+    /// field's resolved value (record → common → virtual); `field_dbf` is the
+    /// fallback DBF type when the field has no resolved value.
+    pub(crate) fn of_channel(
+        instance: &epics_base_rs::server::record::RecordInstance,
+        field_upper: &str,
+        resolved: Option<&EpicsValue>,
+        field_dbf: epics_base_rs::types::DbFieldType,
+    ) -> Self {
+        let scalar = crate::convert::dbf_to_scalar_type(
+            resolved.map(|v| v.db_field_type()).unwrap_or(field_dbf),
+        );
+        Self::from_nt(nt_type_for_channel(instance, field_upper, resolved), scalar)
+    }
+
+    /// The same classification, from an NT already resolved through
+    /// [`nt_type_for_channel`] (the group's introspection pass, which needs
+    /// the NT for its `+type:"scalar"` members anyway).
+    pub(crate) fn from_nt(nt_type: NtType, scalar: ScalarType) -> Self {
+        match nt_type {
+            NtType::LongString => BareLeaf::LongString,
+            NtType::ScalarArray => BareLeaf::Array(scalar),
+            NtType::Scalar | NtType::Enum => BareLeaf::Scalar(scalar),
+        }
+    }
+
+    /// The leaf's introspection.
+    pub(crate) fn desc(self) -> FieldDesc {
+        match self {
+            BareLeaf::LongString => FieldDesc::Scalar(ScalarType::String),
+            BareLeaf::Array(t) => FieldDesc::ScalarArray(t),
+            BareLeaf::Scalar(t) => FieldDesc::Scalar(t),
+        }
+    }
+
+    /// The leaf's value, rendered for the descriptor [`Self::desc`] emits.
+    pub(crate) fn value(self, value: &EpicsValue) -> PvField {
+        match self {
+            BareLeaf::LongString => PvField::Scalar(ScalarValue::String(long_string_value(value))),
+            BareLeaf::Array(_) | BareLeaf::Scalar(_) => epics_to_pv_field(value),
+        }
+    }
+}
+
 /// The port's `putLongString` (pvxs `ioc/iocsource.cpp:513-519`): the
 /// image a string PUT writes into a long-string channel's CHAR-array
 /// storage — the string's bytes plus the NUL terminator, which is what

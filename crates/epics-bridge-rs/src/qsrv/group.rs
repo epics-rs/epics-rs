@@ -981,13 +981,25 @@ impl GroupChannel {
                 )))
             }
             FieldMapping::Plain => {
-                let value = instance.resolve_field(field_name).ok_or_else(|| {
+                let field_upper = field_name.to_ascii_uppercase();
+                let value = instance.resolve_field(&field_upper).ok_or_else(|| {
                     BridgeError::FieldNotFound {
                         record: record_name.to_string(),
                         field: field_name.to_string(),
                     }
                 })?;
-                Ok(epics_to_pv_field(&value))
+                // The bare leaf renders through the same classifier the
+                // introspection uses, so the value can never be a shape the
+                // advertised descriptor does not describe (R18-26: a
+                // long-string member shipped `ScalarArray(bytes)` under a
+                // `Scalar(Byte)` descriptor).
+                Ok(pvif::BareLeaf::of_channel(
+                    instance,
+                    &field_upper,
+                    Some(&value),
+                    value.db_field_type(),
+                )
+                .value(&value))
             }
             FieldMapping::Meta => {
                 let snapshot = instance.snapshot_for_field(field_name).ok_or_else(|| {
@@ -1869,23 +1881,17 @@ impl super::provider::Channel for GroupChannel {
                     let (nt_type, scalar_type) = self.introspect_member(member).await?;
                     match member.mapping {
                         FieldMapping::Scalar => pvif::build_field_desc_for_nt(nt_type, scalar_type),
-                        // A `+type:"plain"` leaf carries the bare value with
-                        // no NT wrapper, but its array-ness must still follow
-                        // the bound field: pvxs `getChannelValueType`
-                        // (iocsource.cpp:632-643) returns `valueType.arrayOf()`
-                        // when `dbChannelFinalElements != 1`, and
-                        // `addMembersForPlainType`
+                        // A `+type:"plain"` leaf carries the bare value with no
+                        // NT wrapper. Its type is the channel's value type —
+                        // pvxs `addMembersForPlainType`
                         // (groupconfigprocessor.cpp:886-895) builds the leaf
-                        // from that type. `introspect_member` already resolved
-                        // the array-ness into `nt_type` (ScalarArray for every
-                        // array-variant value, length-independent), and the
-                        // read path serves `PvField::ScalarArray` for an array
-                        // backing field — so a scalar descriptor would
-                        // disagree with the wire bytes.
-                        FieldMapping::Plain => match nt_type {
-                            NtType::ScalarArray => FieldDesc::ScalarArray(scalar_type),
-                            _ => FieldDesc::Scalar(scalar_type),
-                        },
+                        // straight from `getChannelValueType`, which is
+                        // `valueType.arrayOf()` for an array field and
+                        // `TypeCode::String` for a long string. `BareLeaf` is
+                        // that one decision, and the read path renders its
+                        // value from the same variant, so the descriptor and
+                        // the wire bytes cannot disagree (R18-26).
+                        FieldMapping::Plain => pvif::BareLeaf::from_nt(nt_type, scalar_type).desc(),
                         FieldMapping::Meta => meta_desc(),
                         // pvxs advertises `+type:"any"` as `Member(TypeCode
                         // ::Any, …)` (groupconfigprocessor.cpp:904-910), an

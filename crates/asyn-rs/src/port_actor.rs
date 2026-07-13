@@ -733,9 +733,7 @@ impl PortActor {
             let _ = writeln!(
                 out,
                 "    exceptionActive:No exceptionUsers {} exceptionNotifys 0",
-                base.exception_sink
-                    .as_ref()
-                    .map_or(0, |m| m.callback_count())
+                base.exception_callback_count()
             );
             let (mask, io_mask, info_mask) = self.trace_masks(None);
             let _ = writeln!(

@@ -20,6 +20,7 @@ use epics_base_rs::server::iocsh::registry::{
 };
 
 use crate::drivers::ip_port::DrvAsynIPPort;
+use crate::drivers::ip_server_port::{DrvAsynIPServerPort, IpServerConfig};
 use crate::drivers::prologix::DrvAsynPrologixPort;
 use crate::drivers::serial_port::DrvAsynSerialPort;
 use crate::error::AsynResult;
@@ -865,6 +866,7 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
     // Part of the same set: a shell that can create a port must be able to
     // configure it in the next line of the same script.
     out.push(drv_asyn_ip_port_configure_command(services.clone()));
+    out.push(drv_asyn_ip_server_port_configure_command(services.clone()));
     out.push(drv_asyn_serial_port_configure_command(services.clone()));
     out.push(drv_asyn_prologix_port_configure_command(services));
 
@@ -1002,6 +1004,155 @@ pub fn drv_asyn_ip_port_configure_command(services: PortServices) -> CommandDef 
 /// by default an EOS interpose is installed (C
 /// `drvAsynSerialPort.c:1126` enables EOS processing in octetBase),
 /// suppressed by a nonzero `noProcessEos`.
+/// Build the `drvAsynIPServerPortConfigure` iocsh command.
+///
+/// C parity: `drvAsynIPServerPort.c::drvAsynIPServerPortConfigure(portName,
+/// serverInfo, maxClients, priority, noAutoConnect, noProcessEos)` (:640-722),
+/// registered as a 6-argument iocsh command (:766-776). Configure binds the
+/// listening socket, pre-creates one child port per client slot named
+/// `<parent>:<N>` (:681-708), and starts the `connectionListener` thread
+/// (:711-714) — so by the time `st.cmd` returns from this line, the server is
+/// accepting and every child port an IOC could bind device support to exists.
+///
+/// `priority` is accepted for startup-script compatibility but has no effect
+/// (the Rust runtime schedules port actors uniformly).
+pub fn drv_asyn_ip_server_port_configure_command(services: PortServices) -> CommandDef {
+    CommandDef::new(
+        "drvAsynIPServerPortConfigure",
+        vec![
+            ArgDesc {
+                name: "portName",
+                arg_type: ArgType::String,
+                optional: false,
+            },
+            ArgDesc {
+                name: "serverInfo",
+                arg_type: ArgType::String,
+                optional: false,
+            },
+            ArgDesc {
+                name: "maxClients",
+                arg_type: ArgType::Int,
+                optional: false,
+            },
+            ArgDesc {
+                name: "priority",
+                arg_type: ArgType::Int,
+                optional: true,
+            },
+            ArgDesc {
+                name: "noAutoConnect",
+                arg_type: ArgType::Int,
+                optional: true,
+            },
+            ArgDesc {
+                name: "noProcessEos",
+                arg_type: ArgType::Int,
+                optional: true,
+            },
+        ],
+        "drvAsynIPServerPortConfigure portName serverInfo maxClients [priority] \
+         [noAutoConnect] [noProcessEos] - create an IP server (listening) port",
+        move |args: &[ArgValue], ctx: &CommandContext| {
+            let port = arg_str(args, 0)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| "portName required".to_string())?;
+            let server_info = arg_str(args, 1)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| "serverInfo required".to_string())?;
+            let max_clients = arg_int(args, 2).unwrap_or(0);
+            let no_auto_connect = arg_int(args, 4).unwrap_or(0) != 0;
+
+            let mut config = match IpServerConfig::parse(&server_info) {
+                Ok(c) => c,
+                Err(e) => {
+                    ctx.println(&format!("drvAsynIPServerPortConfigure: {e}"));
+                    return Ok(CommandOutcome::Continue);
+                }
+            };
+            // C takes maxClients from the shell argument and rejects 0
+            // ("No clients.", drvAsynIPServerPort.c:545-548).
+            config.max_clients = max_clients.max(0) as usize;
+
+            let mut driver = match DrvAsynIPServerPort::with_config(&port, config) {
+                Ok(d) => d,
+                Err(e) => {
+                    ctx.println(&format!("drvAsynIPServerPortConfigure: {e}"));
+                    return Ok(CommandOutcome::Continue);
+                }
+            };
+            if no_auto_connect {
+                driver.base_mut().auto_connect = false;
+            }
+
+            // The child ports C pre-creates at configure (:681-708) — device
+            // support binds to `<parent>:<N>` before any client has connected.
+            let n_children = driver.child_port_names().len();
+            let children = (0..n_children)
+                .map(|i| driver.make_subport(i))
+                .collect::<AsynResult<Vec<_>>>();
+            let children = match children {
+                Ok(c) => c,
+                Err(e) => {
+                    ctx.println(&format!("drvAsynIPServerPortConfigure: {e}"));
+                    return Ok(CommandOutcome::Continue);
+                }
+            };
+
+            let config = RuntimeConfig {
+                services: services.clone(),
+                ..RuntimeConfig::default()
+            };
+            let (handle, _jh) = create_port_runtime(driver, config.clone());
+            if let Err(e) = crate::asyn_record::register_port(
+                &port,
+                handle.port_handle().clone(),
+                services.trace().clone(),
+            ) {
+                ctx.println(&format!("drvAsynIPServerPortConfigure: {e}"));
+                handle.shutdown();
+                return Ok(CommandOutcome::Continue);
+            }
+            // C binds the listening socket inside configure — `createServerSocket`
+            // at drvAsynIPServerPort.c:605, before `registerPort` and regardless
+            // of `noAutoConnect` (which governs the *child* ports' connect
+            // policy, :627/:693). So the server is listening when st.cmd moves to
+            // the next line, not when some record first pokes it.
+            if let Err(e) = handle.port_handle().connect_blocking() {
+                ctx.println(&format!(
+                    "drvAsynIPServerPortConfigure: cannot listen on {server_info}: {e}"
+                ));
+                crate::asyn_record::unregister_port(&port);
+                handle.shutdown();
+                return Ok(CommandOutcome::Continue);
+            }
+            drop(handle);
+
+            for child in children {
+                let name = child.base().port_name.clone();
+                let (child_handle, _cjh) = create_port_runtime(child, config.clone());
+                if let Err(e) = crate::asyn_record::register_port(
+                    &name,
+                    child_handle.port_handle().clone(),
+                    services.trace().clone(),
+                ) {
+                    // C traces and keeps going: a child that cannot be created
+                    // costs that slot, not the server (:694-697).
+                    ctx.println(&format!("drvAsynIPServerPortConfigure: {name}: {e}"));
+                    child_handle.shutdown();
+                    continue;
+                }
+                drop(child_handle);
+            }
+
+            ctx.println(&format!(
+                "drvAsynIPServerPortConfigure: server port '{port}' -> {server_info}"
+            ));
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
 pub fn drv_asyn_serial_port_configure_command(services: PortServices) -> CommandDef {
     CommandDef::new(
         "drvAsynSerialPortConfigure",
@@ -1243,11 +1394,13 @@ mod tests {
         // succeeds) — we count one CommandDef per C-side function.
         assert_eq!(
             cmds.len(),
-            15,
+            16,
             "asyn iocsh command set: asynReport, asynSetOption, \
              asynOctetSet{{Input,Output}}Eos, asynOctetGet{{Input,Output}}Eos, \
              asynInterposeEcho, asynInterposeDelay, the four trace mutators, \
-             and the three drvAsyn*PortConfigure port-creation commands"
+             and the four port-creation commands (drvAsynIPPortConfigure, \
+             drvAsynIPServerPortConfigure, drvAsynSerialPortConfigure, \
+             prologixGPIBConfigure)"
         );
         assert!(set_trace_mask.args.len() == 3);
 

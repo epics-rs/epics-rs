@@ -224,13 +224,13 @@ pub struct PortDriverBase {
     /// build a port that is defunct but still enabled, so no gate needs to ask
     /// about defunct to refuse it (R15-50).
     defunct: bool,
-    /// Exception list this port announces on — C `dpCommon.exceptionUserList`
-    /// (asynManager.c:611-625). Injected by
-    /// [`crate::services::PortServices::bind`], which
-    /// [`crate::runtime::create_port_runtime`] calls on every port it builds:
-    /// a *running* port always has one. Crate-private so no port creator
-    /// outside asyn can build a port that bypasses that binding.
-    pub(crate) exception_sink: Option<Arc<ExceptionManager>>,
+    /// This port's announcement channel — C `dpCommon.exceptionUserList` plus
+    /// the `notifyPortThread` signal that `announceExceptionOccurred` ends with
+    /// (asynManager.c:611-637). Detachable ([`Self::exception_announcer`]) so a
+    /// worker thread the driver owns — the IP-server accept loop — announces
+    /// through the same counter and the same list as the actor does, instead of
+    /// reaching around them.
+    pub(crate) announcer: ExceptionAnnouncer,
     pub options: HashMap<String, String>,
     /// The EOS terminators, keyed per device the way C keys them: an `eosPvt`
     /// is created per `asynInterposeEosConfig(portName, addr, ...)`
@@ -277,19 +277,55 @@ pub struct PortDriverBase {
     /// [`Self::sync_connection_edge`], the same edge owner that raises the
     /// exception, so a connect that was never published is never counted.
     pub number_connects: u64,
-    /// How many exceptions this port has announced — the Rust form of C's
-    /// `epicsEventSignal(pport->notifyPortThread)` at the tail of
-    /// `announceExceptionOccurred` (asynManager.c:635-636), which is one of the
-    /// five things that wake C's `portThread`.
-    ///
-    /// A signal has no state to read back, so the actor cannot poll one; a
-    /// monotonic count can be, and it says the same thing: the number changed,
-    /// therefore an exception was announced since the actor last looked
-    /// ([`crate::port_actor::PortActor::take_port_thread_wake`]). Counting here —
-    /// in the one method every announcement goes through — is what keeps the wake
-    /// source tied to the announcement rather than to an enumeration of the ops
-    /// that happen to announce today.
-    exceptions_announced: AtomicU64,
+}
+
+/// The one way to announce a port exception — C `announceExceptionOccurred`
+/// (asynManager.c:611-637): fan the event out over the port's exception list and
+/// signal `notifyPortThread` (:635-636).
+///
+/// It is a detachable handle rather than a method on [`PortDriverBase`] because
+/// the announcement is not the actor thread's private business: a driver-owned
+/// worker (the IP-server accept loop) also transitions a device, and C's
+/// `connectionListener` thread announces the same way the port thread does. A
+/// clone of this handle is that capability; it carries the wake counter with it,
+/// so an off-thread announcement still wakes the actor
+/// ([`PortDriverBase::exceptions_announced`]).
+#[derive(Clone)]
+pub struct ExceptionAnnouncer {
+    port_name: String,
+    /// Set once by [`crate::services::PortServices::bind`] at port creation, so
+    /// every clone taken afterwards carries the IOC's exception list.
+    sink: Option<Arc<ExceptionManager>>,
+    /// Shared so a clone's announcement is visible to the actor's count.
+    announced: Arc<AtomicU64>,
+}
+
+impl ExceptionAnnouncer {
+    fn new(port_name: &str) -> Self {
+        Self {
+            port_name: port_name.to_string(),
+            sink: None,
+            announced: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Announce. A port with no sink still counts the announcement — C's
+    /// fan-out over an empty list still signals the port thread — so the count
+    /// moves before the sink is consulted.
+    pub fn announce(&self, exception: AsynException, addr: i32) {
+        self.announced.fetch_add(1, Ordering::Release);
+        if let Some(ref sink) = self.sink {
+            sink.announce(&ExceptionEvent {
+                port_name: self.port_name.clone(),
+                exception,
+                addr,
+            });
+        }
+    }
+
+    fn count(&self) -> u64 {
+        self.announced.load(Ordering::Acquire)
+    }
 }
 
 impl PortDriverBase {
@@ -305,7 +341,7 @@ impl PortDriverBase {
             enabled: true,
             auto_connect: true,
             defunct: false,
-            exception_sink: None,
+            announcer: ExceptionAnnouncer::new(port_name),
             options: HashMap::new(),
             eos: HashMap::new(),
             interpose_octet: OctetInterposeStack::new(flags.multi_device),
@@ -316,7 +352,6 @@ impl PortDriverBase {
             connect_retry_at: None,
             seconds_between_port_connect: DEFAULT_SECONDS_BETWEEN_PORT_CONNECT,
             number_connects: 0,
-            exceptions_announced: AtomicU64::new(0),
         }
     }
 
@@ -359,21 +394,36 @@ impl PortDriverBase {
     /// exception sink still announced (C's fan-out over an empty list still
     /// signals), so the count is bumped before the sink is even consulted.
     pub fn announce_exception(&self, exception: AsynException, addr: i32) {
-        self.exceptions_announced.fetch_add(1, Ordering::Release);
-        if let Some(ref sink) = self.exception_sink {
-            sink.announce(&ExceptionEvent {
-                port_name: self.port_name.clone(),
-                exception,
-                addr,
-            });
-        }
+        self.announcer.announce(exception, addr);
+    }
+
+    /// A clone of this port's announcement capability, for a worker thread the
+    /// driver owns. See [`ExceptionAnnouncer`].
+    pub fn exception_announcer(&self) -> ExceptionAnnouncer {
+        self.announcer.clone()
+    }
+
+    /// Bind the IOC's exception list. [`crate::services::PortServices::bind`] is
+    /// the production caller; tests that drive a driver without a runtime use it
+    /// to stand in for that binding.
+    pub(crate) fn bind_exception_sink(&mut self, sink: Arc<ExceptionManager>) {
+        self.announcer.sink = Some(sink);
     }
 
     /// How many exceptions this port has announced. Monotonic; the actor compares
     /// it against the value it last saw to decide whether C would have signalled
     /// `notifyPortThread` (asynManager.c:635-636).
     pub fn exceptions_announced(&self) -> u64 {
-        self.exceptions_announced.load(Ordering::Acquire)
+        self.announcer.count()
+    }
+
+    /// How many callbacks are registered on this port's exception list — C
+    /// `asynReport`'s `exceptionUsers` count (asynManager.c:1063).
+    pub fn exception_callback_count(&self) -> usize {
+        self.announcer
+            .sink
+            .as_ref()
+            .map_or(0, |m| m.callback_count())
     }
 
     /// Query whether the port is connected — the truth, wherever it lives.
@@ -3047,7 +3097,7 @@ mod tests {
         base.create_param("V", ParamType::Int32).unwrap();
 
         let exc_mgr = Arc::new(crate::exception::ExceptionManager::new());
-        base.exception_sink = Some(exc_mgr.clone());
+        base.bind_exception_sink(exc_mgr.clone());
 
         let last_addr = Arc::new(AtomicI32::new(-99));
         let last_addr2 = last_addr.clone();
@@ -3083,7 +3133,7 @@ mod tests {
         );
         base.create_param("V", ParamType::Int32).unwrap();
         let exc_mgr = Arc::new(crate::exception::ExceptionManager::new());
-        base.exception_sink = Some(exc_mgr.clone());
+        base.bind_exception_sink(exc_mgr.clone());
 
         let connect_hits = Arc::new(AtomicUsize::new(0));
         let hits2 = connect_hits.clone();
@@ -3129,7 +3179,7 @@ mod tests {
 
         let mut base = PortDriverBase::new("ac", 1, PortFlags::default());
         let exc_mgr = Arc::new(crate::exception::ExceptionManager::new());
-        base.exception_sink = Some(exc_mgr.clone());
+        base.bind_exception_sink(exc_mgr.clone());
         let hits = Arc::new(AtomicUsize::new(0));
         let hits2 = hits.clone();
         exc_mgr.add_callback(move |event| {
@@ -3221,7 +3271,7 @@ mod tests {
         };
         let mut base = PortDriverBase::new("def", 1, flags);
         let exc_mgr = Arc::new(crate::exception::ExceptionManager::new());
-        base.exception_sink = Some(exc_mgr.clone());
+        base.bind_exception_sink(exc_mgr.clone());
         let enable_hits = Arc::new(AtomicUsize::new(0));
         let h = enable_hits.clone();
         exc_mgr.add_callback(move |event| {
@@ -3258,7 +3308,7 @@ mod tests {
         };
         let mut base = PortDriverBase::new("def", 4, flags);
         let exc_mgr = Arc::new(crate::exception::ExceptionManager::new());
-        base.exception_sink = Some(exc_mgr.clone());
+        base.bind_exception_sink(exc_mgr.clone());
         let enable_hits = Arc::new(AtomicUsize::new(0));
         let h = enable_hits.clone();
         exc_mgr.add_callback(move |event| {

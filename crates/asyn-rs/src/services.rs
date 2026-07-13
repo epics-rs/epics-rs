@@ -70,7 +70,7 @@ impl PortServices {
     /// on every port, so no port can run without them.
     pub(crate) fn bind(&self, base: &mut PortDriverBase) {
         base.trace = Some(self.trace.clone());
-        base.exception_sink = Some(self.exceptions.clone());
+        base.bind_exception_sink(self.exceptions.clone());
     }
 }
 

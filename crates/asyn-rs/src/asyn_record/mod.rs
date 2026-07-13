@@ -9210,7 +9210,7 @@ mod tests {
         trace.set_exception_sink(exceptions.clone());
 
         let mut base = PortDriverBase::new(port_name, 1, PortFlags::default());
-        base.exception_sink = Some(exceptions.clone());
+        base.bind_exception_sink(exceptions.clone());
         let (tx, rx) = mpsc::channel(256);
         let actor = PortActor::new(Box::new(PlainDriver(base)), rx);
         let actor_id = actor.id();
@@ -9296,7 +9296,7 @@ mod tests {
         trace.set_exception_sink(exceptions.clone());
 
         let mut base = PortDriverBase::new(port_name, 1, PortFlags::default());
-        base.exception_sink = Some(exceptions.clone());
+        base.bind_exception_sink(exceptions.clone());
         let (tx, rx) = mpsc::channel(256);
         let actor = PortActor::new(Box::new(PlainDriver(base)), rx);
         let actor_id = actor.id();

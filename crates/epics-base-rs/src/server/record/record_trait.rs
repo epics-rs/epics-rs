@@ -737,6 +737,40 @@ pub trait Record: Send + Sync + 'static {
     /// Return the list of field descriptors.
     fn field_list(&self) -> &'static [FieldDesc];
 
+    /// `SPC_NOMOD` that a record's `cvt_dbaddr` decides **at runtime, from
+    /// record state** — the dynamic half of the no-modify declaration.
+    ///
+    /// [`FieldDesc::read_only`] is the static half: it carries the `.dbd`
+    /// `special(SPC_NOMOD)` of a field that is immutable for the record type,
+    /// full stop. But C lets a record's `cvt_dbaddr` *raise* SPC_NOMOD per
+    /// dbAddr, keyed on the record's own fields, and one record does:
+    ///
+    /// ```c
+    /// /* compressRecord.c:398-407 */
+    /// static long cvt_dbaddr(DBADDR *paddr) {
+    ///     ...
+    ///     if (prec->balg == bufferingALG_LIFO)
+    ///         paddr->special = SPC_NOMOD;
+    /// }
+    /// ```
+    ///
+    /// A compress VAL is writable under BALG=FIFO and refused under BALG=LIFO —
+    /// a per-record-state fact no static `FieldDesc` can express. The one gate
+    /// that owns field immutability (`field_io::check_no_mod`) consults this
+    /// hook alongside the static set, so the dynamic refusal reaches EVERY put
+    /// route exactly as the static one does.
+    ///
+    /// (C caches `paddr->special` in the DBADDR at name-resolution time, so a
+    /// CA channel opened while FIFO keeps writing after a switch to LIFO until
+    /// it reconnects; `dbpf`, which resolves fresh, is refused immediately. The
+    /// port evaluates live on every put — the invariant C's own `dbpf` path
+    /// shows, without the stale-cache hole.)
+    ///
+    /// `field` is upper-case. Default: no dynamic NOMOD.
+    fn field_no_mod(&self, _field: &str) -> bool {
+        false
+    }
+
     /// Choice strings for a record-specific `DBF_MENU` field served as
     /// `DBR_ENUM`, keyed by field name (uppercase, as declared).
     ///

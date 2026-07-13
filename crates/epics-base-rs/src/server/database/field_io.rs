@@ -45,9 +45,11 @@ fn check_put_disabled(
 /// INVARIANT: a field declared `special(SPC_NOMOD)` (or `SPC_ATTRIBUTE`) MUST
 /// NOT be modified by ANY runtime write, whatever route it arrives on — CA put,
 /// `dbpf`, QSRV, an internal `put_pv`, or a record's OUT link. The declaration
-/// lives in exactly one place, [`FieldDesc::read_only`] (plus the dbCommon
-/// `SPC_NOMOD` triple below, which no record's `field_list` declares), and this
-/// function is the only enforcer. A record's own `put_field` is NOT a gate: the
+/// is [`FieldDesc::read_only`] for a field the `.dbd` marks SPC_NOMOD, and
+/// [`Record::field_no_mod`] for one a `cvt_dbaddr` raises from record state
+/// (plus the dbCommon `SPC_NOMOD` triple below, which no record's `field_list`
+/// declares); this function is the only enforcer of all three. A record's own
+/// `put_field` is NOT a gate: the
 /// hand-written array records write NELM/FTVL/NORD there because the *load*
 /// path (`dbLoadRecords` → `Record::put_field`) must set them — C likewise
 /// writes them through `dbStaticLib`'s `dbPutString`, which never crosses
@@ -66,6 +68,14 @@ fn check_no_mod(instance: &crate::server::record::RecordInstance, field: &str) -
         .iter()
         .any(|f| f.name.eq_ignore_ascii_case(field) && f.read_only)
     {
+        return Err(CaError::ReadOnlyField(field.to_string()));
+    }
+    // The dynamic half of the declaration: an SPC_NOMOD a record's `cvt_dbaddr`
+    // raises from its own state rather than from the `.dbd`
+    // (`Record::field_no_mod`; compress VAL under BALG=LIFO,
+    // compressRecord.c:398-407). Same gate, same refusal — a static
+    // `FieldDesc` cannot express a per-record-state NOMOD.
+    if instance.record.field_no_mod(field) {
         return Err(CaError::ReadOnlyField(field.to_string()));
     }
     Ok(())

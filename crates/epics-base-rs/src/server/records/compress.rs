@@ -821,6 +821,31 @@ impl Record for CompressRecord {
         COMPRESS_FIELDS
     }
 
+    /// C `compressRecord.c::cvt_dbaddr` (:398-407):
+    ///
+    /// ```c
+    /// if (prec->balg == bufferingALG_LIFO)
+    ///     paddr->special = SPC_NOMOD;
+    /// ```
+    ///
+    /// A LIFO compress's VAL is not client-writable — `put_value` walks the
+    /// ring backwards from `off`, so `put_array_info`'s forward write cursor
+    /// (which is what a `dbPut` to VAL feeds) has no meaning there, and C
+    /// refuses the put outright. FIFO leaves VAL writable. This is per-record
+    /// STATE, not a `.dbd` declaration, so it cannot live in `field_list`'s
+    /// static `read_only`; [`Record::field_no_mod`] is the dynamic half of the
+    /// same gate.
+    ///
+    /// The INP-driven ingest is unaffected: it lands through
+    /// `put_field_internal`, which is C's direct-to-memory `dbGetLink` write
+    /// into `wptr`, not a `dbPut` on VAL.
+    ///
+    /// softIoc: with BALG="LIFO Buffer", `dbpf CMP.VAL 7` →
+    /// `recGblDbaddrError: dbPut Attempt to modify noMod field PV: CMP.VAL`.
+    fn field_no_mod(&self, field: &str) -> bool {
+        field == "VAL" && self.balg == 1
+    }
+
     fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
         match field {
             "ALG" => Some(COMPRESS_ALG_CHOICES),

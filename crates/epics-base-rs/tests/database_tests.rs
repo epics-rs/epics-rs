@@ -7442,6 +7442,65 @@ async fn test_compress_every_spc_reset_field_resets_the_buffer() {
     }
 }
 
+/// C `compressRecord.c::cvt_dbaddr` (:398-407) raises `SPC_NOMOD` on VAL when
+/// BALG is LIFO, so `dbPut` refuses the write on every route. softIoc, after
+/// `dbpf CMP.BALG "LIFO Buffer"`:
+///
+/// ```text
+/// dbpf CMP.VAL 7
+/// recGblDbaddrError: dbPut Attempt to modify noMod field PV: CMP.VAL
+/// ```
+///
+/// while the same put under BALG=FIFO succeeds. The port expressed NOMOD only
+/// as the static `FieldDesc::read_only`, which cannot depend on record state,
+/// so a LIFO compress accepted VAL puts.
+#[tokio::test]
+async fn test_compress_val_no_mod_under_lifo_balg() {
+    use epics_base_rs::server::records::compress::CompressRecord;
+
+    let db = PvDatabase::new();
+    db.add_record("CMP_LIFO", Box::new(CompressRecord::new(4, 4)))
+        .await
+        .unwrap();
+
+    // BALG=FIFO (the default): VAL is writable.
+    db.put_record_field_from_ca("CMP_LIFO", "VAL", EpicsValue::Double(1.0))
+        .await
+        .expect("FIFO compress VAL is writable");
+
+    // Switch to LIFO. (The SPC_RESET on BALG empties the ring — R17-76.)
+    db.put_record_field_from_ca("CMP_LIFO", "BALG", EpicsValue::Short(1))
+        .await
+        .unwrap();
+
+    let err = db
+        .put_record_field_from_ca("CMP_LIFO", "VAL", EpicsValue::Double(7.0))
+        .await
+        .expect_err("LIFO compress VAL is SPC_NOMOD — the put must be refused");
+    assert!(
+        matches!(err, CaError::ReadOnlyField(ref f) if f == "VAL"),
+        "expected S_db_noMod on VAL, got {err:?}"
+    );
+
+    // The refused put stored nothing.
+    let rec = db.get_record("CMP_LIFO").await.unwrap();
+    let inst = rec.read().await;
+    assert_eq!(
+        inst.record.get_field("NUSE"),
+        Some(EpicsValue::Long(0)),
+        "a refused put must not reach the ring"
+    );
+
+    // An internal (link) delivery is C's `dbGetLink` into `wptr`, not a
+    // `dbPut` on VAL — it must still ingest under LIFO.
+    drop(inst);
+    let mut inst = rec.write().await;
+    inst.record
+        .put_field_internal("VAL", EpicsValue::Double(7.0))
+        .expect("the INP-driven ingest is not a dbPut and is not gated");
+    assert_eq!(inst.record.get_field("NUSE"), Some(EpicsValue::Long(1)));
+}
+
 /// epics-base PR `dabcf89` (2021) regression: when an mbboDirect
 /// record initialises with no VAL set (UDF=true on the framework
 /// side) but with at least one B0..B1F bit set in the .db file,

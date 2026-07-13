@@ -203,6 +203,14 @@ struct SseqStep {
     dol_field_type: i16, // DTn — DOL target field type (C dbStatic DBF_* / -1)
     lnk_field_type: i16, // LTn — LNK target field type (C dbStatic DBF_* / -1)
     wait_err: i16,       // WERRn — wait-config error (see refresh_link_status)
+    /// The `LNKn` TARGET as the framework resolved it for THIS cycle
+    /// (`ProcessAction::ResolveOutTarget`, requested in `pre_process_actions`
+    /// for the step about to fire) — C's `checkLinks`-cached `lnk_field_type`
+    /// plus the `dbGetNelements` C re-reads at fire time. `fire_current_step`
+    /// makes C's whole switch decision from it before anything is issued.
+    /// `UNRESOLVED` until the framework fills it, which is the same answer C's
+    /// `default:` arm acts on.
+    lnk_target: OutTarget,
 }
 
 impl SseqStep {
@@ -267,6 +275,7 @@ impl Default for SseqStep {
             dol_field_type: DBF_UNKNOWN,
             lnk_field_type: DBF_UNKNOWN,
             wait_err: 0,
+            lnk_target: OutTarget::UNRESOLVED,
         }
     }
 }
@@ -674,52 +683,71 @@ impl SseqRecord {
     /// machine — its put-callback joins `in_flight` and the sequence moves on,
     /// so several callbacks overlap exactly as C runs them.
     ///
-    /// The forwarded BUFFER is not chosen here: both put seams are the
-    /// destination-typed ones ([`ProcessAction::WriteDbLinkTyped`] /
-    /// `put_link_notify_typed`), so the framework resolves the `LNKn` target
-    /// and asks [`Self::typed_output_buffer`] — C's `processCallback` switch
-    /// on `dbGetLinkDBFtype(&lnk)` (sseqRecord.c:706-793).
+    /// C's `processCallback` switch (sseqRecord.c:714-792) is ONE decision with
+    /// two halves — the buffer that goes on the wire, and whether a
+    /// put-callback (hence `waiting`) is issued at all — and its `default:`
+    /// arm (:790) makes neither. So the buffer is decided FIRST, here, from the
+    /// `LNKn` target this cycle's [`ProcessAction::ResolveOutTarget`] put in
+    /// `lnk_target`; `None` is C's `default: break` and the step does nothing:
+    /// no put, no `WTGn`, no `in_flight` entry to strand the sequence.
+    ///
+    /// Both put seams then carry the buffer this one decision produced — the
+    /// framework never re-resolves the target and never makes a second,
+    /// possibly different, no-put call.
     fn fire_current_step(&mut self, live: &mut Vec<(String, EpicsValue)>) -> ProcessOutcome {
         let i = self.active[self.cursor];
-        let has_lnk = !self.steps[i].lnk.is_empty();
+        let buffer = self.typed_output_buffer(LNK_FIELDS[i], &self.steps[i].lnk_target);
         // C `processCallback` (sseqRecord.c:717,739,763) uses the
         // put-WITH-completion (`dbCaPutLinkCallback`, setting `waiting`) only
-        // when `usePutCallback && (plinkGroup->lnk.type == CA_LINK)`. A
-        // `WAITn` on a DB link takes the plain `dbPutLink` and never waits —
-        // C cannot attach a callback to it, and says so through `WERRn`
-        // (`checkLinks`, :915-927).
+        // when `usePutCallback && (plinkGroup->lnk.type == CA_LINK)` — and only
+        // INSIDE a class arm, i.e. only where a put is made at all. A `WAITn` on
+        // a DB link takes the plain `dbPutLink` and never waits — C cannot
+        // attach a callback to it, and says so through `WERRn` (`checkLinks`,
+        // :915-927).
         let waits = self.steps[i].wait != 0 && self.lnk_is_ca(i);
 
-        if waits && has_lnk {
-            // Non-blocking dispatch: the put-callback goes in flight and the
-            // machine advances. C `processCallback` increments `pcb->index`
-            // and calls `processNextLink` straight after firing, leaving the
-            // just-fired step `waiting` for the barrier scan to honour.
-            self.dispatch_waiting_step(i, live);
+        if let Some(value) = buffer {
+            if waits {
+                // Non-blocking dispatch: the put-callback goes in flight and the
+                // machine advances. C `processCallback` increments `pcb->index`
+                // and calls `processNextLink` straight after firing, leaving the
+                // just-fired step `waiting` for the barrier scan to honour.
+                self.dispatch_waiting_step(i, value, live);
+                self.cursor += 1;
+                return self.advance_sequence(live);
+            }
+
+            // No-wait step: a plain `dbPutLink`, then advance in the same cycle.
+            // The write rides ahead of the next step's scheduling action (or the
+            // drain / `Complete` tail), so `LNKn` lands before the sequence
+            // moves on.
+            let mut actions = vec![ProcessAction::WriteDbLink {
+                link_field: LNK_FIELDS[i],
+                value,
+            }];
             self.cursor += 1;
-            return self.advance_sequence(live);
+            let mut next = self.advance_sequence(live);
+            actions.append(&mut next.actions);
+            next.actions = actions;
+            return next;
         }
 
-        // No-wait step: a plain `dbPutLink` (`WriteDbLinkTyped`), then advance
-        // in the same cycle. The write rides ahead of the next step's
-        // scheduling action (or the drain / `Complete` tail), so `LNKn` lands
-        // before the sequence moves on.
-        let mut actions = Vec::new();
-        if has_lnk {
-            actions.push(ProcessAction::WriteDbLinkTyped {
-                link_field: LNK_FIELDS[i],
-            });
-        }
+        // C `default: break` — the target's class resolves to nothing this
+        // record can put (empty/constant `LNKn`, a name that resolves nowhere,
+        // an `INT64`/`UINT64` destination). No put, and therefore no wait.
         self.cursor += 1;
-        let mut next = self.advance_sequence(live);
-        actions.append(&mut next.actions);
-        next.actions = actions;
-        next
+        self.advance_sequence(live)
     }
 
     /// Dispatch a `WAITn` step's put-with-completion without blocking the
     /// machine: record it in `in_flight`, raise `WTGn`, and spawn a waiter
     /// that marks the entry done and wakes the machine on completion.
+    ///
+    /// Called ONLY with the buffer [`Self::fire_current_step`] already decided
+    /// on — C raises `waiting` inside the `dbCaPutLinkCallback` branch of a
+    /// class arm (sseqRecord.c:727-729, :748-750, :779-781), never before the
+    /// switch has said a put happens. `WTGn` up here and "no put" down there
+    /// cannot come apart, because there is no "down there" left to decide.
     ///
     /// The seam is `AsyncDbHandle::put_link_notify` (the non-blocking sibling
     /// of `ProcessAction::WriteDbLinkNotify`): it issues the same OUT-link
@@ -729,7 +757,12 @@ impl SseqRecord {
     /// sets `done` and notifies — so a waiter abandoned by a double `ABORT`
     /// cannot corrupt a later sequence (C `putCallbackCB`'s `waiting == 0`
     /// guard against abandoned callbacks, sseqRecord.c:540-560).
-    fn dispatch_waiting_step(&mut self, i: usize, live: &mut Vec<(String, EpicsValue)>) {
+    fn dispatch_waiting_step(
+        &mut self,
+        i: usize,
+        value: EpicsValue,
+        live: &mut Vec<(String, EpicsValue)>,
+    ) {
         self.steps[i].waiting = true;
         live.push((WTG_FIELDS[i].to_string(), EpicsValue::Short(1)));
         let done = Arc::new(AtomicBool::new(false));
@@ -745,7 +778,7 @@ impl SseqRecord {
             let link = self.steps[i].lnk.clone();
             tokio::spawn(async move {
                 if let Some(rx) = handle
-                    .put_link_notify_typed(&name, LNK_FIELDS[i], &link)
+                    .put_link_notify(&name, LNK_FIELDS[i], &link, value)
                     .await
                 {
                     // `Err` means the put vanished without firing — treat it as
@@ -1138,14 +1171,31 @@ impl Record for SseqRecord {
         // read is scoped to exactly that step here — not all steps up front.
         if self.phase == SeqPhase::Fire && self.cursor < self.active.len() {
             let i = self.active[self.cursor];
+            let mut actions = Vec::with_capacity(2);
             if !self.steps[i].dol.is_empty() {
-                return vec![ProcessAction::ReadDbLink {
+                actions.push(ProcessAction::ReadDbLink {
                     link_field: DOL_FIELDS[i],
                     target_field: DO_FIELDS[i],
-                }];
+                });
             }
+            // The step's OUT switch (sseqRecord.c:706-793) needs the `LNKn`
+            // target's class, and `fire_current_step` needs it BEFORE it decides
+            // anything — the same decision says which buffer goes out and
+            // whether a put-callback (and `WTGn`) is raised. Requested every
+            // fire, unconditionally: a step whose `LNKn` is empty or points
+            // nowhere must see THIS cycle's "no target", not a stale one.
+            actions.push(ProcessAction::ResolveOutTarget {
+                link_field: LNK_FIELDS[i],
+            });
+            return actions;
         }
         Vec::new()
+    }
+
+    fn set_resolved_out_target(&mut self, link_field: &str, target: OutTarget) {
+        if let Some((i, "LNK")) = Self::step_index_from_suffix(link_field) {
+            self.steps[i].lnk_target = target;
+        }
     }
 
     fn special(&mut self, field: &str, after: bool) -> CaResult<()> {

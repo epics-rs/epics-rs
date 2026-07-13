@@ -368,6 +368,17 @@ pub enum ProcessAction {
     /// Executed with (and exactly like) [`Self::WriteDbLink`].
     WriteDbLinkTyped { link_field: &'static str },
 
+    /// Resolve an OUT link's TARGET ([`OutTarget`]) and hand it to the record
+    /// through [`Record::set_resolved_out_target`], BEFORE `process()` runs.
+    ///
+    /// **Pre-process action** — the OUT-link twin of [`Self::ReadDbLink`],
+    /// and C's `checkLinks`-cached `lnk_field_type`: a record whose fire-time
+    /// branch depends on the target's DBF class (sseq decides the wire buffer
+    /// AND whether a `WAITn` put-callback is issued from the one switch,
+    /// `sseqRecord.c:714-792`) must have the class in hand when it decides, not
+    /// after the framework's put path has already been entered.
+    ResolveOutTarget { link_field: &'static str },
+
     /// Read a value from a DB link into a record field. The framework reads
     /// `link_field` from the record to get the source PV name, reads that PV,
     /// and writes the result into `target_field` via an internal put that
@@ -2111,9 +2122,33 @@ pub trait Record: Send + Sync + 'static {
     ///
     /// Default: `None`. Only a record that emits one of the two typed-write
     /// seams reaches this, and it must override.
+    ///
+    /// A record that must know the ANSWER before its `process()` runs — because
+    /// the same switch decides something else as well — asks for the target
+    /// ahead of time with [`ProcessAction::ResolveOutTarget`] and calls this
+    /// itself; see [`Self::set_resolved_out_target`].
     fn typed_output_buffer(&self, link_field: &str, target: &OutTarget) -> Option<EpicsValue> {
         let _ = (link_field, target);
         None
+    }
+
+    /// Receive the RESOLVED target of an OUT link the record asked to have
+    /// resolved before this cycle's `process()`
+    /// ([`ProcessAction::ResolveOutTarget`]).
+    ///
+    /// C resolves an OUT link's DBF class OUTSIDE the put — `checkLinks` caches
+    /// it in the record (`sseqRecord.c:202-250`) — so `processCallback` can make
+    /// ONE decision from it: which view goes on the wire, AND whether a
+    /// put-callback is issued (hence whether `waiting` is raised). Its
+    /// `default:` arm (`:790`) does neither. A record that learns the class only
+    /// from inside the framework's put path cannot keep those two halves
+    /// together: it has to raise `waiting` first and find out afterwards that no
+    /// put was made. This hook is that cached class — the record decides, then
+    /// acts.
+    ///
+    /// Default: no-op. Only a record that emits the action reaches this.
+    fn set_resolved_out_target(&mut self, link_field: &str, target: OutTarget) {
+        let _ = (link_field, target);
     }
 
     /// The `dbrType` this record's [`ProcessAction::ReadDbLink`] on

@@ -3855,19 +3855,52 @@ impl PvDatabase {
         use crate::server::record::ProcessAction;
         let mut resolved = Vec::new();
         for action in actions {
-            if let ProcessAction::ReadDbLink {
-                link_field,
-                target_field,
-            } = action
-                && self
-                    .read_db_link_into_field(rec, link_field, target_field, visited, depth)
-                    .await
-                    == Some(true)
-            {
-                resolved.push(*link_field);
+            match action {
+                ProcessAction::ReadDbLink {
+                    link_field,
+                    target_field,
+                } => {
+                    if self
+                        .read_db_link_into_field(rec, link_field, target_field, visited, depth)
+                        .await
+                        == Some(true)
+                    {
+                        resolved.push(*link_field);
+                    }
+                }
+                // The OUT-link twin: resolve the target's class and hand it to
+                // the record, so its `process()` can branch on it (C's
+                // `checkLinks`-cached `lnk_field_type`).
+                ProcessAction::ResolveOutTarget { link_field } => {
+                    self.resolve_out_target_into_record(rec, link_field).await;
+                }
+                _ => {}
             }
         }
         resolved
+    }
+
+    /// Resolve one OUT link's TARGET and hand it to the record ahead of
+    /// `process()` — [`ProcessAction::ResolveOutTarget`].
+    ///
+    /// The record's own link string is the input, so an empty/constant `LNKn`
+    /// resolves to [`OutTarget::UNRESOLVED`] and the record sees "no target",
+    /// which is the answer C's `default:` arm acts on.
+    async fn resolve_out_target_into_record(
+        &self,
+        rec: &Arc<crate::runtime::sync::RwLock<RecordInstance>>,
+        link_field: &'static str,
+    ) {
+        let link_str = match rec.read().await.record.get_field(link_field) {
+            Some(EpicsValue::String(s)) => s.as_str_lossy().into_owned(),
+            _ => String::new(),
+        };
+        let parsed = crate::server::record::parse_output_link_v2(&link_str);
+        let target = self.resolve_out_target(&parsed).await;
+        rec.write()
+            .await
+            .record
+            .set_resolved_out_target(link_field, target);
     }
 
     /// Execute ProcessActions returned by a record's process() call.
@@ -3900,6 +3933,10 @@ impl PvDatabase {
                     self.read_db_link_into_field(rec, link_field, target_field, visited, depth)
                         .await;
                 }
+                // A pre-process action (the record asks for the target BEFORE it
+                // decides), so it is a no-op if it reaches the post-process
+                // stage — the resolve here would be too late to change anything.
+                ProcessAction::ResolveOutTarget { .. } => {}
                 ProcessAction::WriteDbLink { link_field, value } => {
                     // 1. Get the link string (record fields → common fields)
                     // and the source PUTF for processTarget propagation,

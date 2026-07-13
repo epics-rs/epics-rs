@@ -342,6 +342,49 @@ impl AcalcoutRecord {
         EpicsValue::DoubleArray(out)
     }
 
+    /// The one owner of every write into an `AA`..`LL` buffer.
+    ///
+    /// C allocates each array input ONCE, at `calloc(pcalc->nelm, sizeof(double))`
+    /// (`aCalcoutRecord.c:1084-1086`), and that buffer then lives for the record's
+    /// lifetime. Nothing ever replaces it — every write is a SPLICE into it, so
+    /// elements the writer did not reach keep their previous contents. The port
+    /// assigned `arr_vals[idx] = <whatever the link or the client delivered>`,
+    /// which throws the tail away.
+    ///
+    /// Copies `src` into `[0, min(src.len(), nelm))` and leaves everything past it
+    /// alone. The buffer is grown to `nelm` on the way, which is where C's `calloc`
+    /// gets its length.
+    fn splice_array_field(&mut self, idx: usize, src: &[f64]) {
+        let nelm = (self.nelm as usize).max(1);
+        let buf = &mut self.arr_vals[idx];
+        buf.resize(nelm, 0.0);
+        let n = src.len().min(nelm);
+        buf[..n].copy_from_slice(&src[..n]);
+    }
+
+    /// C `fetch_values`, and ONLY `fetch_values` (`aCalcoutRecord.c:1100-1102`):
+    ///
+    /// ```c
+    /// if (nRequest<numElements) {
+    ///     for (j=nRequest; j<numElements; j++) (*pavalue)[j] = 0;
+    /// }
+    /// ```
+    ///
+    /// A link that delivered fewer elements than the current window zeroes the
+    /// REST OF THE WINDOW — and stops there. `[numElements, nelm)`, the part of the
+    /// buffer NUSE currently hides, is not touched: it keeps whatever was in it and
+    /// reappears if NUSE grows again. A client `dbPut` has no such step; it writes
+    /// its elements and nothing else.
+    fn zero_fill_window(&mut self, idx: usize, from: usize) {
+        let window = self.num_elements();
+        let nelm = (self.nelm as usize).max(1);
+        let buf = &mut self.arr_vals[idx];
+        buf.resize(nelm, 0.0);
+        for v in &mut buf[from.min(nelm)..window.min(nelm)] {
+            *v = 0.0;
+        }
+    }
+
     fn build_inputs(&self, n: usize, prev_val: f64, prev_aval: &[f64]) -> ArrayInputs {
         let mut inputs = ArrayInputs::new(n);
         for i in 0..12 {
@@ -1672,7 +1715,13 @@ impl Record for AcalcoutRecord {
             return crate::server::record::put_field_internal_default(self, name, value);
         };
         let before = self.array_field_value(&self.arr_vals[i]);
+        // C `fetch_values` asks the link for exactly `nRequest =
+        // acalcGetNumElements()` elements and `dbGetLink` writes back how many it
+        // actually delivered (`aCalcoutRecord.c:1096-1099`). That count is what the
+        // zero-fill below starts from, so capture it before the value is consumed.
+        let delivered = value.count() as usize;
         crate::server::record::put_field_internal_default(self, name, value)?;
+        self.zero_fill_window(i, delivered);
         if self.array_field_value(&self.arr_vals[i]) != before {
             self.newm |= 1 << i;
         }
@@ -2006,8 +2055,12 @@ impl Record for AcalcoutRecord {
                     return Ok(());
                 }
                 if let Some(idx) = Self::arr_index(name) {
-                    self.arr_vals[idx] = Self::coerce_array(value)
+                    // A client `dbPut` writes the elements it brought and no more:
+                    // the buffer is C's `calloc(nelm)` and the tail it did not reach
+                    // keeps its previous contents.
+                    let src = Self::coerce_array(value)
                         .ok_or_else(|| CaError::TypeMismatch(name.into()))?;
+                    self.splice_array_field(idx, &src);
                     return Ok(());
                 }
                 if let Some(idx) = Self::inp_index(name) {

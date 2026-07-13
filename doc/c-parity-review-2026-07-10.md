@@ -4693,3 +4693,132 @@ Category E (records/framework):
   sites call it) — fold into the wave-12 E batch as doc-only.
 - R13-24 stream-interleave observation (exception block position under 2>&1)
   examined and NOT filed: two independently-correct streams.
+
+## Fix wave 12 — dispositions (2026-07-13)
+
+All 23 Round-14 findings fixed, one commit per finding, on 5 worktree
+fixer branches, merged: A `caucus/WG0SFREHPX/fixer-a-calc-21bd43a5-1`
+(8 commits), B `…fixer-b-catools-710a473a-1` (4), C `…fixer-c-pva-2167e637-1`
+(2), D `…fixer-d-asyn-cec348ea-1` (6), E `…fixer-e-records-402d4f3e-1` (4).
+Post-merge full-workspace gate: clippy `-D warnings` clean, nextest
+8638/8638 (br24 flaked once under load, passes isolated — known list),
+doctests clean.
+
+- R14-1 `591acb98` — base engine gets its own `calc_random()`
+  (seed/65535.0, calcPerform.c:508-520); sCalc/aCalc keep local_random;
+  NRNDM errors on base (not in its element table); 9677b68a time-seed
+  opt-in reseeds both.
+- R14-2 `79ed4479` — family-widened: SUBLAST, DBL, BYTE all have no case
+  in C's double-only switch → no-op arm → StackLeak → stat -1 / "***ERROR***".
+- R14-3 `07c7c475` — structural: `CompiledExpr.uses_string` latched by
+  postfix::compile at element lookup (C allowlist); final-opcode re-scan
+  deleted.
+- R14-4 `0a0f1ef5` — dynamic stores @n:=/@@n:= via Assign look-back rewrite
+  (mirrors R13-5 fetch); 4 new opcodes; out-of-range stores nothing; aCalc
+  @@ broadcasts + amask; base still rejects @.
+- R14-5 `e6cddd6c` — >>/<< type-branch on left operand; string = character
+  shift over 40-byte buffer (myNINT clamp 40, space-fill/truncate).
+  DOCUMENTED DEVIATION: negative count clamps to 0 (identity) — C indexes
+  out of bounds (UB, no lower clamp at sCalcPerform.c:1263-1294).
+- R14-6 `4f189f20` — single owner `client_put_array` splices into the
+  persistent calloc(nelm) buffer and zeros [nNew, numElements); AA..LL,
+  AVAL, OAV all route through it; W10-A8's wrong doc + test corrected.
+- R14-7 `c5eff367` — splice bound moved NELM → numElements (NUSE window),
+  hidden tail [numElements, nelm) preserved.
+- R14-8 `7a8b0cfb` — StoreStringVar + loop_pairs removed; rg returns nothing.
+- R14-16 `7b4c7e19` — usage block to stderr at both statuses, one call
+  site; -V stays stdout.
+- R14-17 `afa18609` — env_default_timeout scans via copt::scan_double
+  (single owner), C's warning text at env-read time (before getopt loop);
+  " -1 " now an expired deadline.
+- R14-18 `8f02f5de` — structural: getopt error is a third loop exit owned
+  by Scan::finish; get_matches re-parses the longest accepted argv prefix
+  so resolvers run the same path as a clean line; warnings replay up to
+  the offending token only. (C caget not built on this box; contract from
+  caget.c:398-523 + live port behavior.)
+- R14-19 `2a3b4975` — beacon comment rewritten; same-defect second site
+  in client/beacon_monitor.rs test rationale fixed same commit.
+- R14-31 `d1496c9f` — new encode::marked_wire_changed_bitset
+  (marked ∩ mask → canonical) is the single owner; MonitorQueue::real
+  gates on it non-empty, build_monitor_payload_marked frames the same
+  value. Regression test proves the dropped frame would have been empty.
+- R14-32 `71095d9b` — both mark sites fall through to leaves_or_derive.
+  Verified-vs-C behavior change: ARCHIVE-only self post now marks nothing
+  and is dropped (groupsource.cpp:266-275,331-337);
+  testqgroup archive test re-pinned on the triggered-target path.
+  RETAINED: EventMark::Derive + monitor_emits_partial for root-flattened
+  members (field_name == "" has no addressable leaf paths) — removing
+  them would under-mark; nothing else uses them.
+- R14-50 `0d65de62` — PortActor::connect_gate() (check_queue(-1, Waived))
+  gates the retry timer AND auto_connect_port/device (family: the
+  auto-connect pair ran before check_queue); refused attempt does not
+  re-arm the timer (asynManager.c:3281).
+- R14-49 `a70cdf2b` — EOS keyed HashMap<i32, DeviceEos> by
+  eos_device_key(multi_device, addr); all four PortDriver EOS hooks take
+  &AsynUser; EosInterpose per-addr config/read-ahead/partial-match.
+  Distinct: prologix keeps one EOS (bus-wide ++eos register).
+- R14-48 `7a7cb085` — iocsh EOS commands .with_addr(addr); added missing
+  asynOctetGet*Eos (asynShowEos) with epicsStrnEscapedFromRaw port.
+- R14-46 `a02084a4` — root cause closed: gate refusals stamp new
+  AsynError::QueueRefused; never_ran() = refused ∪ queue-timeout asked by
+  every queued-request caller; option/EOS/CNCT arms report refusal +
+  SpecialRan::No; process path reports "queueRequest failed" with
+  STATE/MINOR. modbus ioc.rs decodes via AsynError::status().
+- R14-47 `2c4b2ae7` — AsynRecord::posting is the single owner of C's
+  REMEMBER_STATE…POST_IF_NEW bracket; connect-time option/EOS readbacks,
+  both monitorStatus calls (incl. bad:→done: failure tail), put readbacks,
+  PCNCT=0 detach all post through it. Regression test times out pre-fix.
+- R14-51 `30d5fe37` — reportPrintPort block replicated (state/queue/lock/
+  exception/trace at details≥1, interpose+interface lists at ≥2,
+  per-address block, negative-details suppression, "destroyed" for
+  defunct); number_connects counted by the connection-edge owner; default
+  PortDriver::report is now asynPortDriver::report.
+- R14-61 `29728d2f` — structural: W10-E3 mechanism generalized —
+  PvDatabase::resolve_out_target returns OutTarget { field_type,
+  element_count, is_ca_link } (dbNameToAddr / dbCaGetLinkDBFtype);
+  Record::multi_output_buffer reproduces each device support's switch.
+  scalcout = devsCalcoutSoft.c:66-144 verbatim incl. sync/async &sval/&osv
+  asymmetry + 40-byte clamp; acalcout = devaCalcoutSoft's. Distinct:
+  dfanout/seq/fanout put DBR_DOUBLE unconditionally in C.
+- R14-62 `9ab4fd2a` — invariant: every failing OUT/SIOL put MUST raise
+  LINK_ALARM/INVALID into the same cycle's alarm. Owner:
+  write_out_link_value → rec_gbl_set_link_alarm (C setLinkAlarm inside
+  dbPutLink, dbLink.c:434-448/:459-471). Bypass audit closed: record OUT
+  sync+async, dispatch_multi_output_values (extracted, both paths share
+  one copy), dfanout OUTA..P, seq LNK0..F, both ProcessAction write twins,
+  write_sim_siol_value now returns its failure. Both process paths run the
+  whole output stage BEFORE rec_gbl_reset_alarms (checkAlarms → writeValue
+  → monitor, aoRecord.c:196-232); IVOA veto tests pending nsev; write
+  guard dropped across writes (self-referencing OUT would deadlock).
+  dfanout failure test now expects INVALID (C: setLinkAlarm INVALID wins
+  over push_values' MAJOR).
+- R14-63 `cda7a05d` — all four synthetic .UDF pushes removed + false
+  recGblCheckUDF comment deleted (symbol does not exist in C; zero
+  db_post_events-on-udf matches); .UDF still posts via generic client put.
+- adjudication `dd4f00d2` — alarm_field_posts comment corrected (2 of 5
+  reset sites call it; 3 open-code the masks; SDIS/SELN not clients).
+
+### Documented deviations added this wave
+- R14-5: negative shift count = identity (C is UB).
+- R14-46/D: two asynReport lines have no C-identical source (no port
+  mutexes to sample; exception fan-out synchronous) — stated in place.
+
+### Open leads — surfaced during fix wave 12 (Round 15 input)
+- Library env-double config sites parse STRICTER than C's
+  envGetDoubleConfigParam (sscanf "%lf" accepts "300x" as 300; port
+  rejects): client/search.rs:175, client/transport.rs:150,985,
+  client/mod.rs:2519,2658,2709, server/tcp.rs:47,139,152,
+  server/addr_list.rs:243. Different scanner family from epicsScanDouble
+  — needs its own audit.
+- asynInterposeEcho/Delay iocsh commands still drop addr; the interpose
+  STACK is per-port, not per-(port,addr) as C — larger structural change
+  than R14-49's per-device EOS state.
+- Gate-refusal ERRS wording differs from C by an auxiliary verb ("port X
+  is disabled" vs C "port X disabled" / "port X not connected").
+- SIOL keeps a bare put path — no PP/processTarget semantics vs C's
+  dbPutLink(&prec->siol,…). R14-62 closed only the alarm gap.
+- Pre-existing broken intra-doc links in epics-ca-rs rustdoc (predate
+  wave 12): signed_beacon::SignedBeaconEmitter, install_calink_resolver,
+  ioc_app::IocApplication, tcp::ClientState, stat_to_str.
+- epics-ca-rs cainfo_prints_the_resolved_host_name flaked once in E's
+  full-workspace run (passes isolated; joins the known flake list).

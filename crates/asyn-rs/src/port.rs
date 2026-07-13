@@ -628,17 +628,44 @@ impl PortDriverBase {
     /// callback's readback and `monitorStatus` tail (asynRecord.c:571-576 vs
     /// :788-900). This is the only place that stamps it.
     pub fn check_queue(&self, addr: i32, connect: ConnectCheck) -> AsynResult<()> {
-        self.check_enabled()
-            .and_then(|()| match connect {
-                // C `checkPortConnect == FALSE`: neither the port's nor the
-                // device's connected flag is read — the port thread drains the
-                // Connect queue before it ever calls `autoConnectDevice`
-                // (asynManager.c:812-856), and the device-level checks live in
-                // the lower-priority loop it has not reached yet (:864-874).
-                ConnectCheck::Waived => Ok(()),
-                ConnectCheck::Required => self.check_ready_addr(addr),
-            })
+        self.check_queue_inner(addr, connect)
             .map_err(AsynError::into_queue_refusal)
+    }
+
+    /// The gate's body, before the refusal is stamped as a queue refusal.
+    ///
+    /// Three blocks, in C's order:
+    ///
+    /// 1. `!pport->dpc.enabled → asynDisabled` (:1541-1546) — port level,
+    ///    unconditional, reached by every request.
+    /// 2. `checkPortConnect && !pport->dpc.connected → asynDisconnected`
+    ///    (:1547-1552) — port level, waived by the request's own user. (C's
+    ///    `checkPortConnect == FALSE` reads *no* connected flag: the port thread
+    ///    drains the Connect queue before it ever calls `autoConnectDevice`,
+    ///    :812-856.)
+    /// 3. The **device** block (:1553-1575), which C runs only for a
+    ///    *synchronous* port: it sits bodily inside
+    ///    `if(!(pport->attributes & ASYN_CANBLOCK))` at :1553. A CANBLOCK port's
+    ///    device-level enabled/connected checks belong to the port THREAD
+    ///    (:874-884), which does something else entirely with them — a disabled
+    ///    device's request *waits in the queue* (`continue`), it is not refused
+    ///    — so applying them here refused requests C parks (R15-47). Every real
+    ///    transport port is CANBLOCK.
+    fn check_queue_inner(&self, addr: i32, connect: ConnectCheck) -> AsynResult<()> {
+        self.check_enabled()?;
+        if connect == ConnectCheck::Required {
+            self.check_port_connected()?;
+        }
+        if !self.flags.can_block {
+            // C :1561-1567 — the device-enabled refusal in the synchronous block
+            // is *not* conditioned on `checkPortConnect`; only the connected one
+            // below is (:1568).
+            self.check_device_enabled(addr)?;
+            if connect == ConnectCheck::Required {
+                self.check_device_connected(addr)?;
+            }
+        }
+        Ok(())
     }
 
     /// The unconditional half of the queue gate: a defunct or disabled port
@@ -663,11 +690,8 @@ impl PortDriverBase {
         Ok(())
     }
 
-    /// Check that the port is enabled, connected, and not defunct.
-    /// Returns `Err(Disabled)`, `Err(Disconnected)`, or `Err(Disabled)`
-    /// (defunct => permanently disabled) otherwise.
-    pub fn check_ready(&self) -> AsynResult<()> {
-        self.check_enabled()?;
+    /// The port-level connected refusal (asynManager.c:1547-1552).
+    pub fn check_port_connected(&self) -> AsynResult<()> {
         if !self.is_connected() {
             return Err(AsynError::Status {
                 status: AsynStatus::Disconnected,
@@ -675,6 +699,62 @@ impl PortDriverBase {
             });
         }
         Ok(())
+    }
+
+    /// The device-level enabled refusal, C's text verbatim
+    /// (asynManager.c:1561-1567). Its *use* differs by port class, which is why
+    /// it is a check and not a gate: `queueRequest` returns it on a synchronous
+    /// port, while on a CANBLOCK port the same condition makes `portThread` park
+    /// the request instead (:875). Both callers ask this one function.
+    ///
+    /// A port that is not `ASYN_MULTIDEVICE`, or an address with no device state,
+    /// resolves to the port's own `dpCommon` in C's `findDpCommon` — already
+    /// checked above — so there is nothing device-level left to refuse.
+    pub fn check_device_enabled(&self, addr: i32) -> AsynResult<()> {
+        if let Some(ds) = self.device(addr) {
+            if !ds.enabled {
+                return Err(AsynError::Status {
+                    status: AsynStatus::Disabled,
+                    // C's double space is verbatim (asynManager.c:1564).
+                    message: format!("port {}  or device {} not enabled", self.port_name, addr),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// The device-level connected refusal (asynManager.c:1568-1575). Same
+    /// split as [`Self::check_device_enabled`]: `queueRequest` returns it on a
+    /// synchronous port; on a CANBLOCK port `portThread` answers the same
+    /// condition with the request's timeout callback (:884-885).
+    pub fn check_device_connected(&self, addr: i32) -> AsynResult<()> {
+        if let Some(ds) = self.device(addr) {
+            if !ds.connected {
+                return Err(AsynError::Status {
+                    status: AsynStatus::Disconnected,
+                    message: format!("port {} or device {} not connected", self.port_name, addr),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// The device `addr` resolves to, or `None` when C's `findDpCommon` would
+    /// resolve it to the port's own `dpCommon` (not multi-device, or no device
+    /// created at that address).
+    fn device(&self, addr: i32) -> Option<&DeviceState> {
+        if !self.flags.multi_device {
+            return None;
+        }
+        self.device_states.get(&addr)
+    }
+
+    /// Check that the port is enabled, connected, and not defunct.
+    /// Returns `Err(Disabled)`, `Err(Disconnected)`, or `Err(Disabled)`
+    /// (defunct => permanently disabled) otherwise.
+    pub fn check_ready(&self) -> AsynResult<()> {
+        self.check_enabled()?;
+        self.check_port_connected()
     }
 
     /// Run the C `shutdownPort` lifecycle (asynManager.c:2251-2308):
@@ -712,31 +792,14 @@ impl PortDriverBase {
         Ok(())
     }
 
-    /// Check that port + device address are both ready.
-    /// For multi-device ports, checks per-address state in addition to port-level state.
+    /// Check that port + device address are both ready — the whole of C's
+    /// synchronous-port gate (asynManager.c:1539-1575) in one call. Drivers that
+    /// re-check inside their own I/O use it; the queue gate reaches the same
+    /// checks through [`Self::check_queue`], which splits them by port class.
     pub fn check_ready_addr(&self, addr: i32) -> AsynResult<()> {
         self.check_ready()?;
-        if self.flags.multi_device {
-            if let Some(ds) = self.device_states.get(&addr) {
-                if !ds.enabled {
-                    return Err(AsynError::Status {
-                        status: AsynStatus::Disabled,
-                        // C's double space is verbatim (asynManager.c:1564).
-                        message: format!("port {}  or device {} not enabled", self.port_name, addr),
-                    });
-                }
-                if !ds.connected {
-                    return Err(AsynError::Status {
-                        status: AsynStatus::Disconnected,
-                        message: format!(
-                            "port {} or device {} not connected",
-                            self.port_name, addr
-                        ),
-                    });
-                }
-            }
-        }
-        Ok(())
+        self.check_device_enabled(addr)?;
+        self.check_device_connected(addr)
     }
 
     /// Get or create a device state for the given address.

@@ -815,20 +815,26 @@ fn test_replace_coerces_every_operand() {
 /// (a `StringOp::PushStringVar`, since deleted; `AA` compiles to
 /// `CoreOp::PushDoubleVar`), so no `AA`-reading program was marked.
 ///
-/// The two evaluators differ arithmetically in exactly one place, MODULO's cast
-/// width — `(int)` in the string evaluator, `(long)` in the numeric one — which
-/// is how the marker is observable without a string in sight. Compiled sCalc,
-/// with 2147483648 (2^31):
-///
-///     2147483648 % 7    -2      (numeric evaluator: the int cast overflows)
-///     AA % 7             2      (string evaluator, AA = "2147483648")
+/// The marker is observable without a string in sight because C's two
+/// evaluators cast their integer operands at different WIDTHS. MODULO used to be
+/// the observable used here; CBUG-A2 removed MODULO's narrowing entirely, so the
+/// probe is now `<<`, which C type-branches the same way: `(long)`
+/// (`sCalcPerform.c:623-631`) in the numeric evaluator, `(int)`
+/// (`:1270-1276`) in the string one. x86-64 masks the shift count to 6 bits at
+/// 64-bit width and to 5 at 32-bit, so `1 << 40` is 2^40 in one evaluator and
+/// 2^8 in the other — both in range, no out-of-range cast involved.
 #[test]
 fn test_fetch_aa_marks_the_program_uses_string() {
     let mut inputs = StringInputs::new();
-    inputs.str_vars[0] = "2147483648".into();
-    assert_eq!(scalc("AA%7", &mut inputs).unwrap(), StackValue::Double(2.0));
+    inputs.str_vars[0] = "0".into();
     assert_eq!(
-        scalc("2147483648 % 7", &mut inputs).unwrap(),
-        StackValue::Double(-2.0)
+        scalc("1<<40", &mut inputs).unwrap(),
+        StackValue::Double(1_099_511_627_776.0),
+        "no FETCH_AA → numeric evaluator → 64-bit shift"
+    );
+    assert_eq!(
+        scalc("(1<<40)+AA", &mut inputs).unwrap(),
+        StackValue::Double(256.0),
+        "FETCH_AA marks USES_STRING → string evaluator → 32-bit shift"
     );
 }

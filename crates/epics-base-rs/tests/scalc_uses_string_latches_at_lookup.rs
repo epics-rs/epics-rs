@@ -8,7 +8,7 @@
 //! (`:552-557`), which is NOT in the list. So `AA:="x";1` is USES_STRING even
 //! though its finished postfix holds no string-typed opcode at all, and C runs
 //! the string evaluator — the one whose STORE_AA writes the record's string
-//! args and whose MODULO casts through `(long)`.
+//! args and whose `<<`/`>>` shift at 32 bits rather than 64.
 //!
 //! A port that re-derives the marker from the finished opcodes cannot see this:
 //! it sees only the store, concludes "no string", and runs the double-only
@@ -52,23 +52,23 @@ fn storing_a_double_into_a_string_field_latches_too() {
     assert_eq!(inputs.str_vars[0].as_str_lossy(), "12.00000000");
 }
 
-/// The distinguishing arithmetic between the two evaluators: MODULO casts
-/// through `(int)` on the double-only path (`sCalcPerform.c:558-563`) and
-/// `(long)` on the string path (`:1102-1110`). With a rewritten-away `AA` in
-/// the program, C is on the string path — so a value outside 32 bits keeps its
-/// magnitude instead of wrapping.
+/// The distinguishing arithmetic between the two evaluators. MODULO used to be
+/// the probe here; CBUG-A2 removed MODULO's operand narrowing, so the probe is
+/// now `<<`, which C branches the same way and which the port still reproduces:
+/// `(long)` on the double-only path (`sCalcPerform.c:623-631`), `(int)` on the
+/// string path (`:1270-1276`). x86-64 masks the shift count to 6 bits at 64-bit
+/// width and to 5 at 32-bit, so `1 << 40` is 2^40 in one evaluator and `1 << 8`
+/// = 256 in the other.
 #[test]
-fn the_marker_selects_the_evaluator_that_modulo_depends_on() {
-    // 2^33 % 10 on the string path: `(long)` keeps the dividend, 8589934592 %
-    // 10 = 2. The only string element is the `AA` that `:=` rewrote away.
-    let (_, top) = run(r#"AA:="x";8589934592 % 10"#, |_| {});
-    assert_eq!(top, StackValue::Double(2.0));
+fn the_marker_selects_the_evaluator_that_the_shift_width_depends_on() {
+    // The only string element is the `AA` that `:=` rewrote away — the program
+    // is still USES_STRING, so the 32-bit shift runs.
+    let (_, top) = run(r#"AA:="x";1 << 40"#, |_| {});
+    assert_eq!(top, StackValue::Double(256.0));
 
-    // The same expression with no string element anywhere takes the double-only
-    // path, whose `(int)` cast is out of range: x86 `cvttsd2si` answers the
-    // integer indefinite value INT_MIN, and -2147483648 % 10 = -8.
-    let (_, top) = run("8589934592 % 10", |_| {});
-    assert_eq!(top, StackValue::Double(-8.0));
+    // No string element anywhere: the double-only path, 64-bit shift.
+    let (_, top) = run("1 << 40", |_| {});
+    assert_eq!(top, StackValue::Double(1_099_511_627_776.0));
 }
 
 /// A string element that SURVIVES compilation latches as it always did — the

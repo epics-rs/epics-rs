@@ -1,4 +1,4 @@
-use super::cast::{c_int, d2i, d2ui};
+use super::cast::{d2i, d2ui, imod, nint};
 use super::error::CalcError;
 use super::opcodes::{CoreOp, Opcode};
 use super::random::calc_random;
@@ -101,13 +101,13 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut NumericInputs) -> Result<f64, Calc
                     //   itop = (epicsInt32) *ptop--;
                     //   if (itop) *ptop = (epicsInt32) *ptop % itop;
                     //   else      *ptop = epicsNAN;
-                    // A PLAIN cast, not `d2i` — `d2i`/`d2ui` (:324-325) exist
-                    // only for the bitwise/shift ops below.
-                    let den = c_int(b);
-                    if den == 0 {
+                    // The zero divisor is C's rule and is kept. The bare
+                    // `(epicsInt32)` narrowing of both operands is NOT — see
+                    // `cast::imod` and CBUG-A2.
+                    if b.trunc() == 0.0 {
                         stack.push(f64::NAN);
                     } else {
-                        stack.push(c_int(a).wrapping_rem(den) as f64);
+                        stack.push(imod(a, b));
                     }
                 }
                 CoreOp::Neg => {
@@ -273,9 +273,9 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut NumericInputs) -> Result<f64, Calc
                     let a = pop1(&mut stack)?;
                     // C `calcPerform.c:290-293`:
                     //   *ptop = (epicsInt32)(top >= 0 ? top+0.5 : top-0.5)
-                    // A plain cast, like MODULO — not `d2i`.
-                    let pre = if a >= 0.0 { a + 0.5 } else { a - 0.5 };
-                    stack.push(c_int(pre) as f64);
+                    // The `(epicsInt32)` narrowing is dropped — see `cast::nint`
+                    // and CBUG-A2.
+                    stack.push(nint(a));
                 }
 
                 // Test functions
@@ -608,15 +608,19 @@ mod parity_tests {
         assert!(run("MIN(5,0/0)").is_nan());
     }
 
-    // NINT is a plain `(epicsInt32)` cast (calcPerform.c:292), NOT `d2i`.
+    /// CBUG-A2 — NINT rounds and does NOT narrow. This test used to pin C's
+    /// `(epicsInt32)` cast (`calcPerform.c:292`), i.e. `i32::MIN`.
     #[test]
-    fn h3_nint_out_of_range_is_the_c_cast_not_a_wrap() {
-        // 3e9+0.5 is out of epicsInt32 range, so C's cast is undefined and the
-        // IOC gets whatever the ISA's convert gives: x86-64 `cvttsd2si` answers
-        // with the indefinite value INT32_MIN. Verified against gcc -O2 on
-        // x86-64. The old expectation here (-1294967296) was `d2i`'s
-        // uint32-reinterpretation, which NINT never performs.
-        assert_eq!(run("NINT(3000000000)"), i32::MIN as f64);
+    fn h3_nint_out_of_range_is_the_true_rounded_value() {
+        // Compiled C (x86-64) answers INT32_MIN here — `cvttsd2si`'s indefinite
+        // value for an out-of-range `(epicsInt32)` cast. The nearest integer to
+        // 3e9 is 3e9, and the stack cell is a double, so that is what we push.
+        assert_eq!(run("NINT(3000000000)"), 3_000_000_000.0);
+        assert_eq!(run("NINT(-3000000000)"), -3_000_000_000.0);
+        assert_eq!(run("NINT(2500000000.4)"), 2_500_000_000.0);
+        // NaN/Inf: C's cast answers INT32_MIN for both.
+        assert!(run("NINT(0/0)").is_nan());
+        assert_eq!(run("NINT(1/0)"), f64::INFINITY);
     }
 
     #[test]
@@ -624,23 +628,38 @@ mod parity_tests {
         assert_eq!(run("NINT(2.5)"), 3.0);
         assert_eq!(run("NINT(-2.5)"), -3.0);
         assert_eq!(run("NINT(2.4)"), 2.0);
+        // In-range values are bit-identical to C, including the int32 edges.
+        assert_eq!(run("NINT(2147483647)"), 2_147_483_647.0);
+        assert_eq!(run("NINT(-2147483648)"), -2_147_483_648.0);
     }
 
-    // MODULO uses a plain epicsInt32 cast (calcPerform.c:162-164).
+    /// CBUG-A2 — MODULO truncates its operands but does not narrow them. These
+    /// two cases used to pin C's `(epicsInt32)` cast (`calcPerform.c:162-164`):
+    /// `5 % 4294967296` was `5.0` because the divisor cast to INT32_MIN.
     #[test]
-    fn h4_mod_large_denominator_is_the_c_cast() {
-        // 2^32 is out of epicsInt32 range: C's cast gives INT32_MIN (x86-64
-        // cvttsd2si), which is NON-zero, so C takes the modulo branch and
-        // `5 % INT32_MIN` == 5. The old expectation (NaN) came from modelling
-        // the cast as `(epicsUInt32)` truncation, i.e. 2^32 -> 0 -> divide by
-        // zero. Verified against gcc -O2 on x86-64.
+    fn h4_mod_out_of_range_operands_are_not_narrowed() {
+        // Divisor 2^32: C casts it to INT32_MIN and answers 5. The true
+        // remainder of 5 by 2^32 is 5 as well — same answer, different reason.
         assert_eq!(run("5 % 4294967296"), 5.0);
+        // Dividend 3e9: C casts it to INT32_MIN and answers -2. True: 4.
+        assert_eq!(run("3000000000 % 7"), 4.0);
+        // A NaN dividend is INT32_MIN in C (and then CBUG-A1's SIGFPE vector
+        // with divisor -1); here it stays NaN.
+        assert!(run("(0/0) % 7").is_nan());
+        assert!(run("7 % (0/0)").is_nan());
     }
 
     #[test]
     fn h4_mod_normal() {
         assert_eq!(run("17 % 5"), 2.0);
         assert!(run("5 % 0").is_nan());
+        // The divisor is zero exactly when it TRUNCATES to zero, as in C.
+        assert!(run("5 % 0.5").is_nan());
+        // C's truncated remainder: the sign follows the dividend.
+        assert_eq!(run("-17 % 5"), -2.0);
+        assert_eq!(run("17 % -5"), 2.0);
+        // Operands truncate toward zero before the remainder, as in C.
+        assert_eq!(run("17.9 % 5.9"), 2.0);
     }
 
     // bitwise ops use d2i/d2ui (wrap), not saturating `as i32`.

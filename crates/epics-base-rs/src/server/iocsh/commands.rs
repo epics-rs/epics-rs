@@ -2230,4 +2230,81 @@ record(mbbo, "DUP:CM") {{
         assert_eq!(m.get("B").unwrap(), "2");
         assert!(!m.contains_key("DROP"));
     }
+
+    /// R17-66: `dbLoadRecords` is a record-creation path, so the records it
+    /// creates must come out of C's `iocInit` init passes in the same state as
+    /// every other path — including the UDF tail of pass 1
+    /// (`post_init_finalize_undef`), which this path used to skip.
+    ///
+    /// softIoc (EPICS 7.0.10, linux-x86_64), `dbLoadRecords` + `iocInit` then
+    /// `dbgf X.UDF`:
+    ///
+    /// ```text
+    /// record(histogram,"HG"){field(NELM,"8") field(SVL,"0")}  UDF 0
+    /// record(mbboDirect,"MBD"){field(B0,"1") field(B2,"1")}   UDF 0, VAL 5
+    /// record(mbboDirect,"MBD0"){}                             UDF 1
+    /// ```
+    ///
+    /// (`clear_histogram` at histogramRecord.c:361 and the B0..B1F fold at
+    /// mbboDirectRecord.c:142-158; a bare mbboDirect has neither, so it stays
+    /// undefined.)
+    #[test]
+    fn r17_66_db_load_records_runs_the_post_init_udf_tail() {
+        use std::io::Write;
+
+        let (db, ctx) = make_ctx();
+
+        let tmp = tempfile::Builder::new()
+            .suffix(".db")
+            .tempfile()
+            .expect("tempfile");
+        write!(
+            tmp.as_file(),
+            r#"
+record(histogram, "HG")   {{ field(NELM, "8") field(SVL, "0") }}
+record(mbboDirect, "MBD") {{ field(B0, "1") field(B2, "1") }}
+record(mbboDirect, "MBD0") {{ }}
+"#
+        )
+        .expect("write tempfile");
+
+        let mut registry = CommandRegistry::new();
+        register_builtins(&mut registry);
+        let cmd = registry.get("dbLoadRecords").unwrap();
+        let args = parse_args(&[tmp.path().to_string_lossy().to_string()], &cmd.args).unwrap();
+        assert!(matches!(
+            cmd.handler.call(&args, &ctx),
+            Ok(CommandOutcome::Continue)
+        ));
+
+        ctx.block_on(async {
+            let udf = |name: &'static str| {
+                let db = db.clone();
+                async move { db.get_record(name).await.unwrap().read().await.common.udf }
+            };
+            assert!(
+                !udf("HG").await,
+                "histogram: `clear_histogram` clears UDF at init (softIoc: UDF 0)"
+            );
+            assert!(
+                !udf("MBD").await,
+                "mbboDirect: the B0..B1F fold clears UDF at init (softIoc: UDF 0)"
+            );
+            assert_eq!(
+                db.get_record("MBD")
+                    .await
+                    .unwrap()
+                    .read()
+                    .await
+                    .record
+                    .get_field("VAL"),
+                Some(crate::types::EpicsValue::Long(5)),
+                "B0|B2 folds into VAL=5"
+            );
+            assert!(
+                udf("MBD0").await,
+                "a bare mbboDirect has no DOL and no bits: C leaves it UDF=1"
+            );
+        });
+    }
 }

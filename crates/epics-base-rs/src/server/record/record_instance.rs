@@ -533,6 +533,19 @@ impl RecordInstance {
         if let Err(e) = self.record.init_record(1) {
             eprintln!("init_record(1) failed for {name}: {e}");
         }
+        // The UDF tail of pass 1. `init_record` cannot reach UDF (a common
+        // field), so the record types whose C `init_record` ends in
+        // `prec->udf = FALSE` — histogram's `clear_histogram`, aao's constant
+        // DOL, mbboDirect's B0..B1F fold (epics-base dabcf89) — deliver it
+        // through this hook instead. It lives HERE, inside the init owner,
+        // because it is part of the same C pass: a creation path that ran the
+        // passes but skipped the tail (iocsh `dbLoadRecords` did) left those
+        // records UDF=1 where C has UDF=0.
+        let mut udf = self.common.udf;
+        if let Err(e) = self.record.post_init_finalize_undef(&mut udf) {
+            eprintln!("post_init_finalize_undef failed for {name}: {e}");
+        }
+        self.common.udf = udf;
     }
 
     /// Set a single `info("key", "value")` tag on this record. Last

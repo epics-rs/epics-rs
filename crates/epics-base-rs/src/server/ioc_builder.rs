@@ -318,16 +318,6 @@ impl IocBuilder {
                     let inst = &mut *instance;
                     inst.record.init_links(&inst.common);
                 }
-                // epics-base PR dabcf89 (mbboDirect): after both init
-                // passes, give the record a chance to finalise UDF —
-                // e.g. fold initialised B0..B1F bits into VAL and
-                // clear UDF when no DOL/initial-VAL was provided.
-                let mut udf = instance.common.udf;
-                if let Err(e) = instance.record.post_init_finalize_undef(&mut udf) {
-                    eprintln!("post_init_finalize_undef failed for {}: {e}", def.name);
-                }
-                instance.common.udf = udf;
-
                 // C: a soft-channel INPUT dev support's `init_record` loads a
                 // CONSTANT INP into the record's value
                 // (`recGblInitConstantLink` / `dbLoadLinkArray`) — and it runs

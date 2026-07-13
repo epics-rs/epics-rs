@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/*", "examples/*"]
+members = ["crates/*", "examples/*", "tools/*"]
 default-members = [
     "crates/ad-core-rs",
     "crates/ad-plugins-rs",

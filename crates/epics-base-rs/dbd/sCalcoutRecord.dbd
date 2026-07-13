@@ -1,0 +1,885 @@
+#*************************************************************************
+# Copyright (c) 2004 The University of Chicago, as Operator of Argonne
+#     National Laboratory.
+#*************************************************************************
+# Note hardwired postfix-buffer size 282 = 2+n*21/6, where n is infix size of 80
+# Hardwired for backward compatibility with streamDevice, which contains device
+# support that includes the header file that EPICS will generate from this file,
+# and which doesn't yet include sCalcPostfix.h, which defines the
+# SCALC_INFIX_TO_POSTFIX_SIZE macro we should be using for RCPx.
+menu(scalcoutOOPT) {
+	choice(scalcoutOOPT_Every_Time,"Every Time")
+	choice(scalcoutOOPT_On_Change,"On Change")
+	choice(scalcoutOOPT_When_Zero,"When Zero")
+	choice(scalcoutOOPT_When_Non_zero,"When Non-zero")
+	choice(scalcoutOOPT_Transition_To_Zero,"Transition To Zero")
+	choice(scalcoutOOPT_Transition_To_Non_zero,"Transition To Non-zero")
+	choice(scalcoutOOPT_Never,"Never")
+}
+menu(scalcoutDOPT) {
+	choice(scalcoutDOPT_Use_VAL,"Use CALC")
+	choice(scalcoutDOPT_Use_OVAL,"Use OCAL")
+}
+menu(scalcoutINAP) {
+	choice(scalcoutINAP_No,"No PROC on Change")
+	choice(scalcoutINAP_Yes,"PROC on Change")
+}
+menu(scalcoutINAV) {
+	choice(scalcoutINAV_EXT_NC,"Ext PV NC")
+	choice(scalcoutINAV_EXT,"Ext PV OK")
+	choice(scalcoutINAV_LOC,"Local PV")
+	choice(scalcoutINAV_CON,"Constant")
+}
+menu(scalcoutWAIT) {
+	choice(scalcoutWAIT_NoWait,"NoWait")
+	choice(scalcoutWAIT_Wait,"Wait")
+}
+recordtype(scalcout) {
+	include "dbCommon.dbd" 
+	field(VERS,DBF_DOUBLE) {
+		prompt("Code Version")
+		special(SPC_NOMOD)
+		initial("1")
+	}
+	field(RPVT,DBF_NOACCESS) {
+		prompt("Record Private")
+		special(SPC_NOMOD)
+		interest(4)
+		size(4)
+		extra("void *rpvt")
+	}
+	field(VAL,DBF_DOUBLE) {
+		prompt("Result")
+		asl(ASL0)
+	}
+	field(SVAL,DBF_STRING) {
+		prompt("String result")
+		asl(ASL0)
+		size(40)
+	}
+	field(PVAL,DBF_DOUBLE) {
+		prompt("Previous Value")
+	}
+	field(PSVL,DBF_STRING) {
+		prompt("Previous string result")
+		special(SPC_NOMOD)
+		size(40)
+	}
+	field(CALC,DBF_STRING) {
+		prompt("Calculation")
+		promptgroup(GUI_CALC)
+		special(SPC_MOD)
+		pp(TRUE)
+		size(80)
+	}
+	field(CLCV,DBF_LONG) {
+		prompt("CALC Valid")
+		interest(1)
+	}
+	field(INPA,DBF_INLINK) {
+		prompt("Input A")
+		special(SPC_MOD)
+		promptgroup(GUI_CALC)
+		interest(1)
+	}
+	field(INPB,DBF_INLINK) {
+		prompt("Input B")
+		special(SPC_MOD)
+		promptgroup(GUI_CALC)
+		interest(1)
+	}
+	field(INPC,DBF_INLINK) {
+		prompt("Input C")
+		special(SPC_MOD)
+		promptgroup(GUI_CALC)
+		interest(1)
+	}
+	field(INPD,DBF_INLINK) {
+		prompt("Input D")
+		special(SPC_MOD)
+		promptgroup(GUI_CALC)
+		interest(1)
+	}
+	field(INPE,DBF_INLINK) {
+		prompt("Input E")
+		special(SPC_MOD)
+		promptgroup(GUI_CALC)
+		interest(1)
+	}
+	field(INPF,DBF_INLINK) {
+		prompt("Input F")
+		special(SPC_MOD)
+		promptgroup(GUI_CALC)
+		interest(1)
+	}
+	field(INPG,DBF_INLINK) {
+		prompt("Input G")
+		special(SPC_MOD)
+		promptgroup(GUI_CALC)
+		interest(1)
+	}
+	field(INPH,DBF_INLINK) {
+		prompt("Input H")
+		special(SPC_MOD)
+		promptgroup(GUI_CALC)
+		interest(1)
+	}
+	field(INPI,DBF_INLINK) {
+		prompt("Input I")
+		special(SPC_MOD)
+		promptgroup(GUI_CALC)
+		interest(1)
+	}
+	field(INPJ,DBF_INLINK) {
+		prompt("Input J")
+		special(SPC_MOD)
+		promptgroup(GUI_CALC)
+		interest(1)
+	}
+	field(INPK,DBF_INLINK) {
+		prompt("Input K")
+		special(SPC_MOD)
+		promptgroup(GUI_CALC)
+		interest(1)
+	}
+	field(INPL,DBF_INLINK) {
+		prompt("Input L")
+		special(SPC_MOD)
+		promptgroup(GUI_CALC)
+		interest(1)
+	}
+	field(INAA,DBF_INLINK) {
+		prompt("String input AA")
+		special(SPC_MOD)
+		promptgroup(GUI_CALC)
+		interest(1)
+	}
+	field(INBB,DBF_INLINK) {
+		prompt("String input BB")
+		special(SPC_MOD)
+		promptgroup(GUI_CALC)
+		interest(1)
+	}
+	field(INCC,DBF_INLINK) {
+		prompt("String input CC")
+		special(SPC_MOD)
+		promptgroup(GUI_CALC)
+		interest(1)
+	}
+	field(INDD,DBF_INLINK) {
+		prompt("String input DD")
+		special(SPC_MOD)
+		promptgroup(GUI_CALC)
+		interest(1)
+	}
+	field(INEE,DBF_INLINK) {
+		prompt("String input EE")
+		special(SPC_MOD)
+		promptgroup(GUI_CALC)
+		interest(1)
+	}
+	field(INFF,DBF_INLINK) {
+		prompt("String input FF")
+		special(SPC_MOD)
+		promptgroup(GUI_CALC)
+		interest(1)
+	}
+	field(INGG,DBF_INLINK) {
+		prompt("String input GG")
+		special(SPC_MOD)
+		promptgroup(GUI_CALC)
+		interest(1)
+	}
+	field(INHH,DBF_INLINK) {
+		prompt("String input HH")
+		special(SPC_MOD)
+		promptgroup(GUI_CALC)
+		interest(1)
+	}
+	field(INII,DBF_INLINK) {
+		prompt("String input II")
+		special(SPC_MOD)
+		promptgroup(GUI_CALC)
+		interest(1)
+	}
+	field(INJJ,DBF_INLINK) {
+		prompt("String input JJ")
+		special(SPC_MOD)
+		promptgroup(GUI_CALC)
+		interest(1)
+	}
+	field(INKK,DBF_INLINK) {
+		prompt("String input KK")
+		special(SPC_MOD)
+		promptgroup(GUI_CALC)
+		interest(1)
+	}
+	field(INLL,DBF_INLINK) {
+		prompt("String input LL")
+		special(SPC_MOD)
+		promptgroup(GUI_CALC)
+		interest(1)
+	}
+	field(OUT,DBF_OUTLINK) {
+		prompt("Output Link")
+		special(SPC_MOD)
+		promptgroup(GUI_OUTPUT)
+		interest(1)
+	}
+	field(INAV,DBF_MENU) {
+		prompt("INPA PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(scalcoutINAV)
+		initial("1")
+	}
+	field(INBV,DBF_MENU) {
+		prompt("INPB PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(scalcoutINAV)
+		initial("1")
+	}
+	field(INCV,DBF_MENU) {
+		prompt("INPC PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(scalcoutINAV)
+		initial("1")
+	}
+	field(INDV,DBF_MENU) {
+		prompt("INPD PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(scalcoutINAV)
+		initial("1")
+	}
+	field(INEV,DBF_MENU) {
+		prompt("INPE PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(scalcoutINAV)
+		initial("1")
+	}
+	field(INFV,DBF_MENU) {
+		prompt("INPF PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(scalcoutINAV)
+		initial("1")
+	}
+	field(INGV,DBF_MENU) {
+		prompt("INPG PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(scalcoutINAV)
+		initial("1")
+	}
+	field(INHV,DBF_MENU) {
+		prompt("INPH PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(scalcoutINAV)
+		initial("1")
+	}
+	field(INIV,DBF_MENU) {
+		prompt("INPI PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(scalcoutINAV)
+		initial("1")
+	}
+	field(INJV,DBF_MENU) {
+		prompt("INPJ PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(scalcoutINAV)
+		initial("1")
+	}
+	field(INKV,DBF_MENU) {
+		prompt("INPK PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(scalcoutINAV)
+		initial("1")
+	}
+	field(INLV,DBF_MENU) {
+		prompt("INPL PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(scalcoutINAV)
+		initial("1")
+	}
+	field(IAAV,DBF_MENU) {
+		prompt("INAA PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(scalcoutINAV)
+		initial("1")
+	}
+	field(IBBV,DBF_MENU) {
+		prompt("INBB PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(scalcoutINAV)
+		initial("1")
+	}
+	field(ICCV,DBF_MENU) {
+		prompt("INCC PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(scalcoutINAV)
+		initial("1")
+	}
+	field(IDDV,DBF_MENU) {
+		prompt("INDD PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(scalcoutINAV)
+		initial("1")
+	}
+	field(IEEV,DBF_MENU) {
+		prompt("INEE PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(scalcoutINAV)
+		initial("1")
+	}
+	field(IFFV,DBF_MENU) {
+		prompt("INFF PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(scalcoutINAV)
+		initial("1")
+	}
+	field(IGGV,DBF_MENU) {
+		prompt("INGG PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(scalcoutINAV)
+		initial("1")
+	}
+	field(IHHV,DBF_MENU) {
+		prompt("INHH PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(scalcoutINAV)
+		initial("1")
+	}
+	field(IIIV,DBF_MENU) {
+		prompt("INII PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(scalcoutINAV)
+		initial("1")
+	}
+	field(IJJV,DBF_MENU) {
+		prompt("INJJ PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(scalcoutINAV)
+		initial("1")
+	}
+	field(IKKV,DBF_MENU) {
+		prompt("INKK PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(scalcoutINAV)
+		initial("1")
+	}
+	field(ILLV,DBF_MENU) {
+		prompt("INLL PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(scalcoutINAV)
+		initial("1")
+	}
+	field(OUTV,DBF_MENU) {
+		prompt("OUT PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(scalcoutINAV)
+	}
+	field(OOPT,DBF_MENU) {
+		prompt("Output Execute Opt")
+		promptgroup(GUI_CALC)
+		interest(1)
+		menu(scalcoutOOPT)
+	}
+	field(ODLY,DBF_DOUBLE) {
+		prompt("Output Execute Delay")
+		promptgroup(GUI_ALARMS)
+		asl(ASL0)
+		interest(1)
+	}
+	field(WAIT,DBF_MENU) {
+		prompt("Wait for completion?")
+		interest(1)
+		menu(scalcoutWAIT)
+	}
+	field(DLYA,DBF_USHORT) {
+		prompt("Output Delay Active")
+		special(SPC_NOMOD)
+		asl(ASL0)
+	}
+	field(DOPT,DBF_MENU) {
+		prompt("Output Data Opt")
+		promptgroup(GUI_CALC)
+		interest(1)
+		menu(scalcoutDOPT)
+	}
+	field(OCAL,DBF_STRING) {
+		prompt("Output Calculation")
+		promptgroup(GUI_CALC)
+		special(SPC_MOD)
+		pp(TRUE)
+		size(80)
+	}
+	field(OCLV,DBF_LONG) {
+		prompt("OCAL Valid")
+		interest(1)
+	}
+	field(OEVT,DBF_USHORT) {
+		prompt("Event To Issue")
+		promptgroup(GUI_CLOCK)
+		asl(ASL0)
+	}
+	field(IVOA,DBF_MENU) {
+		prompt("INVALID output action")
+		promptgroup(GUI_OUTPUT)
+		interest(2)
+		menu(menuIvoa)
+	}
+	field(IVOV,DBF_DOUBLE) {
+		prompt("INVALID output value")
+		promptgroup(GUI_OUTPUT)
+		interest(2)
+	}
+	field(EGU,DBF_STRING) {
+		prompt("Units Name")
+		promptgroup(GUI_DISPLAY)
+		interest(1)
+		size(16)
+	}
+	field(PREC,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_DISPLAY)
+		interest(1)
+	}
+	field(HOPR,DBF_DOUBLE) {
+		prompt("High Operating Rng")
+		promptgroup(GUI_DISPLAY)
+		interest(1)
+	}
+	field(LOPR,DBF_DOUBLE) {
+		prompt("Low Operating Range")
+		promptgroup(GUI_DISPLAY)
+		interest(1)
+	}
+	field(HIHI,DBF_DOUBLE) {
+		prompt("Hihi Alarm Limit")
+		promptgroup(GUI_ALARMS)
+		pp(TRUE)
+		interest(1)
+	}
+	field(LOLO,DBF_DOUBLE) {
+		prompt("Lolo Alarm Limit")
+		promptgroup(GUI_ALARMS)
+		pp(TRUE)
+		interest(1)
+	}
+	field(HIGH,DBF_DOUBLE) {
+		prompt("High Alarm Limit")
+		promptgroup(GUI_ALARMS)
+		pp(TRUE)
+		interest(1)
+	}
+	field(LOW,DBF_DOUBLE) {
+		prompt("Low Alarm Limit")
+		promptgroup(GUI_ALARMS)
+		pp(TRUE)
+		interest(1)
+	}
+	field(HHSV,DBF_MENU) {
+		prompt("Hihi Severity")
+		promptgroup(GUI_ALARMS)
+		pp(TRUE)
+		interest(1)
+		menu(menuAlarmSevr)
+	}
+	field(LLSV,DBF_MENU) {
+		prompt("Lolo Severity")
+		promptgroup(GUI_ALARMS)
+		pp(TRUE)
+		interest(1)
+		menu(menuAlarmSevr)
+	}
+	field(HSV,DBF_MENU) {
+		prompt("High Severity")
+		promptgroup(GUI_ALARMS)
+		pp(TRUE)
+		interest(1)
+		menu(menuAlarmSevr)
+	}
+	field(LSV,DBF_MENU) {
+		prompt("Low Severity")
+		promptgroup(GUI_ALARMS)
+		pp(TRUE)
+		interest(1)
+		menu(menuAlarmSevr)
+	}
+	field(HYST,DBF_DOUBLE) {
+		prompt("Alarm Deadband")
+		promptgroup(GUI_ALARMS)
+		interest(1)
+	}
+	field(ADEL,DBF_DOUBLE) {
+		prompt("Archive Deadband")
+		promptgroup(GUI_DISPLAY)
+		interest(1)
+	}
+	field(MDEL,DBF_DOUBLE) {
+		prompt("Monitor Deadband")
+		promptgroup(GUI_DISPLAY)
+		interest(1)
+	}
+	field(A,DBF_DOUBLE) {
+		prompt("Value of Input A")
+		promptgroup(GUI_COMMON)
+		pp(TRUE)
+	}
+	field(B,DBF_DOUBLE) {
+		prompt("Value of Input B")
+		promptgroup(GUI_COMMON)
+		pp(TRUE)
+	}
+	field(C,DBF_DOUBLE) {
+		prompt("Value of Input C")
+		promptgroup(GUI_COMMON)
+		pp(TRUE)
+	}
+	field(D,DBF_DOUBLE) {
+		prompt("Value of Input D")
+		promptgroup(GUI_COMMON)
+		pp(TRUE)
+	}
+	field(E,DBF_DOUBLE) {
+		prompt("Value of Input E")
+		promptgroup(GUI_COMMON)
+		pp(TRUE)
+	}
+	field(F,DBF_DOUBLE) {
+		prompt("Value of Input F")
+		promptgroup(GUI_COMMON)
+		pp(TRUE)
+	}
+	field(G,DBF_DOUBLE) {
+		prompt("Value of Input G")
+		promptgroup(GUI_COMMON)
+		pp(TRUE)
+	}
+	field(H,DBF_DOUBLE) {
+		prompt("Value of Input H")
+		promptgroup(GUI_COMMON)
+		pp(TRUE)
+	}
+	field(I,DBF_DOUBLE) {
+		prompt("Value of Input I")
+		promptgroup(GUI_COMMON)
+		pp(TRUE)
+	}
+	field(J,DBF_DOUBLE) {
+		prompt("Value of Input J")
+		promptgroup(GUI_COMMON)
+		pp(TRUE)
+	}
+	field(K,DBF_DOUBLE) {
+		prompt("Value of Input K")
+		promptgroup(GUI_COMMON)
+		pp(TRUE)
+	}
+	field(L,DBF_DOUBLE) {
+		prompt("Value of Input L")
+		promptgroup(GUI_COMMON)
+		pp(TRUE)
+	}
+	field(STRS,DBF_NOACCESS) {
+		prompt("Array of string pointers")
+		interest(4)
+		size(4)
+		extra("char **strs")
+	}
+	field(AA,DBF_STRING) {
+		prompt("Value of string input AA")
+		promptgroup(GUI_COMMON)
+		interest(4)
+		size(40)
+		pp(TRUE)
+	}
+	field(BB,DBF_STRING) {
+		prompt("Value of string input BB")
+		promptgroup(GUI_COMMON)
+		interest(4)
+		size(40)
+		pp(TRUE)
+	}
+	field(CC,DBF_STRING) {
+		prompt("Value of string input CC")
+		promptgroup(GUI_COMMON)
+		interest(4)
+		size(40)
+		pp(TRUE)
+	}
+	field(DD,DBF_STRING) {
+		prompt("Value of string input DD")
+		promptgroup(GUI_COMMON)
+		interest(4)
+		size(40)
+		pp(TRUE)
+	}
+	field(EE,DBF_STRING) {
+		prompt("Value of string input EE")
+		promptgroup(GUI_COMMON)
+		interest(4)
+		size(40)
+		pp(TRUE)
+	}
+	field(FF,DBF_STRING) {
+		prompt("Value of string input FF")
+		promptgroup(GUI_COMMON)
+		interest(4)
+		size(40)
+		pp(TRUE)
+	}
+	field(GG,DBF_STRING) {
+		prompt("Value of string input GG")
+		promptgroup(GUI_COMMON)
+		interest(4)
+		size(40)
+		pp(TRUE)
+	}
+	field(HH,DBF_STRING) {
+		prompt("Value of string input HH")
+		promptgroup(GUI_COMMON)
+		interest(4)
+		size(40)
+		pp(TRUE)
+	}
+	field(II,DBF_STRING) {
+		prompt("Value of string input II")
+		promptgroup(GUI_COMMON)
+		interest(4)
+		size(40)
+		pp(TRUE)
+	}
+	field(JJ,DBF_STRING) {
+		prompt("Value of string input JJ")
+		promptgroup(GUI_COMMON)
+		interest(4)
+		size(40)
+		pp(TRUE)
+	}
+	field(KK,DBF_STRING) {
+		prompt("Value of string input KK")
+		promptgroup(GUI_COMMON)
+		interest(4)
+		size(40)
+		pp(TRUE)
+	}
+	field(LL,DBF_STRING) {
+		prompt("Value of string input LL")
+		promptgroup(GUI_COMMON)
+		interest(4)
+		size(40)
+		pp(TRUE)
+	}
+	field(PAA,DBF_NOACCESS) {
+		prompt("Prev Value of AA")
+		special(SPC_DBADDR)
+		interest(4)
+		size(4)
+		extra("char *paa")
+	}
+	field(PBB,DBF_NOACCESS) {
+		prompt("Prev Value of BB")
+		special(SPC_DBADDR)
+		interest(4)
+		size(4)
+		extra("char *pbb")
+	}
+	field(PCC,DBF_NOACCESS) {
+		prompt("Prev Value of CC")
+		special(SPC_DBADDR)
+		interest(4)
+		size(4)
+		extra("char *pcc")
+	}
+	field(PDD,DBF_NOACCESS) {
+		prompt("Prev Value of DD")
+		special(SPC_DBADDR)
+		interest(4)
+		size(4)
+		extra("char *pdd")
+	}
+	field(PEE,DBF_NOACCESS) {
+		prompt("Prev Value of EE")
+		special(SPC_DBADDR)
+		interest(4)
+		size(4)
+		extra("char *pee")
+	}
+	field(PFF,DBF_NOACCESS) {
+		prompt("Prev Value of FF")
+		special(SPC_DBADDR)
+		interest(4)
+		size(4)
+		extra("char *pff")
+	}
+	field(PGG,DBF_NOACCESS) {
+		prompt("Prev Value of GG")
+		special(SPC_DBADDR)
+		interest(4)
+		size(4)
+		extra("char *pgg")
+	}
+	field(PHH,DBF_NOACCESS) {
+		prompt("Prev Value of HH")
+		special(SPC_DBADDR)
+		interest(4)
+		size(4)
+		extra("char *phh")
+	}
+	field(PII,DBF_NOACCESS) {
+		prompt("Prev Value of II")
+		special(SPC_DBADDR)
+		interest(4)
+		size(4)
+		extra("char *pii")
+	}
+	field(PJJ,DBF_NOACCESS) {
+		prompt("Prev Value of JJ")
+		special(SPC_DBADDR)
+		interest(4)
+		size(4)
+		extra("char *pjj")
+	}
+	field(PKK,DBF_NOACCESS) {
+		prompt("Prev Value of KK")
+		special(SPC_DBADDR)
+		interest(4)
+		size(4)
+		extra("char *pkk")
+	}
+	field(PLL,DBF_NOACCESS) {
+		prompt("Prev Value of LL")
+		special(SPC_DBADDR)
+		interest(4)
+		size(4)
+		extra("char *pll")
+	}
+	field(OVAL,DBF_DOUBLE) {
+		prompt("Output Value")
+		asl(ASL0)
+	}
+	field(OSV,DBF_STRING) {
+		prompt("Output string value")
+		asl(ASL0)
+		size(40)
+	}
+	field(POSV,DBF_STRING) {
+		prompt("Previous output string value")
+		special(SPC_NOMOD)
+		size(40)
+	}
+	field(PA,DBF_DOUBLE) {
+		prompt("Prev Value of A")
+		special(SPC_NOMOD)
+		interest(3)
+	}
+	field(PB,DBF_DOUBLE) {
+		prompt("Prev Value of B")
+		special(SPC_NOMOD)
+		interest(3)
+	}
+	field(PC,DBF_DOUBLE) {
+		prompt("Prev Value of C")
+		special(SPC_NOMOD)
+		interest(3)
+	}
+	field(PD,DBF_DOUBLE) {
+		prompt("Prev Value of D")
+		special(SPC_NOMOD)
+		interest(3)
+	}
+	field(PE,DBF_DOUBLE) {
+		prompt("Prev Value of E")
+		special(SPC_NOMOD)
+		interest(3)
+	}
+	field(PF,DBF_DOUBLE) {
+		prompt("Prev Value of F")
+		special(SPC_NOMOD)
+		interest(3)
+	}
+	field(PG,DBF_DOUBLE) {
+		prompt("Prev Value of G")
+		special(SPC_NOMOD)
+		interest(3)
+	}
+	field(PH,DBF_DOUBLE) {
+		prompt("Prev Value of H")
+		special(SPC_NOMOD)
+		interest(3)
+	}
+	field(PI,DBF_DOUBLE) {
+		prompt("Prev Value of I")
+		special(SPC_NOMOD)
+		interest(3)
+	}
+	field(PJ,DBF_DOUBLE) {
+		prompt("Prev Value of J")
+		special(SPC_NOMOD)
+		interest(3)
+	}
+	field(PK,DBF_DOUBLE) {
+		prompt("Prev Value of K")
+		special(SPC_NOMOD)
+		interest(3)
+	}
+	field(PL,DBF_DOUBLE) {
+		prompt("Prev Value of L")
+		special(SPC_NOMOD)
+		interest(3)
+	}
+	field(POVL,DBF_DOUBLE) {
+		prompt("Prev Value of OVAL")
+		asl(ASL0)
+	}
+	field(LALM,DBF_DOUBLE) {
+		prompt("Last Value Alarmed")
+		special(SPC_NOMOD)
+		interest(3)
+	}
+	field(ALST,DBF_DOUBLE) {
+		prompt("Last Value Archived")
+		special(SPC_NOMOD)
+		interest(3)
+	}
+	field(MLST,DBF_DOUBLE) {
+		prompt("Last Val Monitored")
+		special(SPC_NOMOD)
+		interest(3)
+	}
+	field(RPCL,DBF_NOACCESS) {
+		prompt("Postfix Calc")
+		special(SPC_NOMOD)
+		interest(4)
+		extra("unsigned char rpcl[282]")
+	}
+	field(ORPC,DBF_NOACCESS) {
+		prompt("Postfix OCalc")
+		special(SPC_NOMOD)
+		interest(4)
+		extra("unsigned char orpc[282]")
+	}
+}

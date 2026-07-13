@@ -62,6 +62,22 @@ pub enum IpProtocol {
     Com,
 }
 
+impl IpProtocol {
+    /// C's `FLAG_BROADCAST` (drvAsynIPPort.c:372-374) — the `udp*` suffix.
+    fn broadcast(self) -> bool {
+        matches!(self, Self::UdpBroadcast | Self::UdpBroadcastReusePort)
+    }
+
+    /// C's `FLAG_SO_REUSEPORT` (drvAsynIPPort.c:360-363, :375-378) — the `&`
+    /// suffix, on TCP or UDP.
+    fn reuse_port(self) -> bool {
+        matches!(
+            self,
+            Self::TcpReusePort | Self::UdpReusePort | Self::UdpBroadcastReusePort
+        )
+    }
+}
+
 /// Configuration for an IP port connection.
 #[derive(Debug, Clone)]
 pub struct IpPortConfig {
@@ -1051,100 +1067,110 @@ impl DrvAsynIPPort {
         self.base.install_octet_interpose(layer);
     }
 
-    fn connect_tcp(&mut self) -> AsynResult<TcpStream> {
-        let addr_str = format!("{}:{}", self.config.host, self.config.port);
-
-        if let Some(local_port) = self.config.local_port {
-            use std::net::ToSocketAddrs;
-            // Resolve the remote like the no-local-port branch — the old
-            // code used `SocketAddr::parse`, which only accepts literal
-            // IPs, so a hostname target (valid per the config parser)
-            // failed, as did any IPv6 target (domain was forced to IPV4).
-            let addrs: Vec<std::net::SocketAddr> = addr_str
-                .to_socket_addrs()
+    /// Create the socket C's `connectIt` creates: fresh fd, then every option
+    /// the protocol suffix asked for — `SO_BROADCAST` (drvAsynIPPort.c:448-459)
+    /// and `SO_REUSEPORT` (:461-477) — applied **before** the socket is bound or
+    /// connected, because that is the only time the kernel honours them. Binding
+    /// first and setting `SO_REUSEPORT` afterwards, as this driver used to, left
+    /// `udp&` with a local port failing `EADDRINUSE` where C binds.
+    ///
+    /// Single owner of socket creation for both transports, so a new option
+    /// cannot be added to one and forgotten on the other.
+    fn new_socket(
+        &self,
+        domain: socket2::Domain,
+        ty: socket2::Type,
+        protocol: socket2::Protocol,
+    ) -> AsynResult<socket2::Socket> {
+        let socket = socket2::Socket::new(domain, ty, Some(protocol))?;
+        if self.config.protocol.broadcast() {
+            socket.set_broadcast(true).map_err(|e| AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!("Can't set {} socket BROADCAST option: {e}", self.host_info),
+            })?;
+        }
+        if self.config.protocol.reuse_port() {
+            // C picks SO_REUSEADDR when `USE_SO_REUSEADDR` is defined for the
+            // target and SO_REUSEPORT otherwise (:465-469); socket2 exposes
+            // `set_reuse_port` only where the option exists.
+            #[cfg(unix)]
+            socket.set_reuse_port(true).map_err(|e| AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!(
+                    "Can't set {} socket SO_REUSEPORT option: {e}",
+                    self.host_info
+                ),
+            })?;
+            #[cfg(not(unix))]
+            socket
+                .set_reuse_address(true)
                 .map_err(|e| AsynError::Status {
                     status: AsynStatus::Error,
-                    message: format!("failed to resolve '{addr_str}': {e}"),
-                })?
-                .collect();
+                    message: format!(
+                        "Can't set {} socket SO_REUSEPORT option: {e}",
+                        self.host_info
+                    ),
+                })?;
+        }
+        Ok(socket)
+    }
 
-            let mut last_err: Option<AsynError> = None;
-            for remote_addr in &addrs {
-                let (domain, local_str) = if remote_addr.is_ipv6() {
-                    (socket2::Domain::IPV6, format!("[::]:{local_port}"))
-                } else {
-                    (socket2::Domain::IPV4, format!("0.0.0.0:{local_port}"))
-                };
-                let socket = match socket2::Socket::new(
-                    domain,
-                    socket2::Type::STREAM,
-                    Some(socket2::Protocol::TCP),
-                ) {
+    fn connect_tcp(&mut self) -> AsynResult<TcpStream> {
+        use std::net::ToSocketAddrs;
+        let addr_str = format!("{}:{}", self.config.host, self.config.port);
+        // Resolve the remote first: C delays the lookup to connect time too, in
+        // case the device has just appeared in DNS (drvAsynIPPort.c:479-493).
+        let addrs: Vec<std::net::SocketAddr> = addr_str
+            .to_socket_addrs()
+            .map_err(|e| AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!("failed to resolve '{addr_str}': {e}"),
+            })?
+            .collect();
+
+        let mut last_err: Option<AsynError> = None;
+        for remote_addr in &addrs {
+            let domain = if remote_addr.is_ipv6() {
+                socket2::Domain::IPV6
+            } else {
+                socket2::Domain::IPV4
+            };
+            let socket =
+                match self.new_socket(domain, socket2::Type::STREAM, socket2::Protocol::TCP) {
                     Ok(s) => s,
                     Err(e) => {
-                        last_err = Some(AsynError::Io(e));
+                        last_err = Some(e);
                         continue;
                     }
                 };
+            // C binds the local address only when one was configured — "a very
+            // unusual configuration" (:495-506).
+            if let Some(local_port) = self.config.local_port {
+                let local_addr: std::net::SocketAddr = if remote_addr.is_ipv6() {
+                    (std::net::Ipv6Addr::UNSPECIFIED, local_port).into()
+                } else {
+                    (std::net::Ipv4Addr::UNSPECIFIED, local_port).into()
+                };
+                // Not C's: a fixed local port would otherwise be unusable for the
+                // TIME_WAIT lifetime of the previous connection.
                 if let Err(e) = socket.set_reuse_address(true) {
                     last_err = Some(AsynError::Io(e));
                     continue;
                 }
-                let local_addr: std::net::SocketAddr = match local_str.parse() {
-                    Ok(a) => a,
-                    Err(_) => {
-                        last_err = Some(AsynError::Status {
-                            status: AsynStatus::Error,
-                            message: format!("invalid local address: {local_str}"),
-                        });
-                        continue;
-                    }
-                };
                 if let Err(e) = socket.bind(&local_addr.into()) {
                     last_err = Some(AsynError::Io(e));
                     continue;
                 }
-                match socket.connect_timeout(&(*remote_addr).into(), self.config.connect_timeout) {
-                    Ok(()) => return Ok(TcpStream::from(socket)),
-                    Err(e) => last_err = Some(AsynError::Io(e)),
-                }
             }
-            Err(last_err.unwrap_or_else(|| AsynError::Status {
-                status: AsynStatus::Error,
-                message: format!("no addresses found for '{addr_str}'"),
-            }))
-        } else {
-            use std::net::ToSocketAddrs;
-            let addrs: Vec<std::net::SocketAddr> = addr_str
-                .to_socket_addrs()
-                .map_err(|e| AsynError::Status {
-                    status: AsynStatus::Error,
-                    message: format!("failed to resolve '{addr_str}': {e}"),
-                })?
-                .collect();
-
-            let mut last_err = None;
-            let mut connected_stream = None;
-            for addr in &addrs {
-                match TcpStream::connect_timeout(addr, self.config.connect_timeout) {
-                    Ok(s) => {
-                        connected_stream = Some(s);
-                        break;
-                    }
-                    Err(e) => last_err = Some(e),
-                }
+            match socket.connect_timeout(&(*remote_addr).into(), self.config.connect_timeout) {
+                Ok(()) => return Ok(TcpStream::from(socket)),
+                Err(e) => last_err = Some(AsynError::Io(e)),
             }
-            connected_stream.ok_or_else(|| {
-                if let Some(e) = last_err {
-                    AsynError::Io(e)
-                } else {
-                    AsynError::Status {
-                        status: AsynStatus::Error,
-                        message: format!("no addresses found for '{addr_str}'"),
-                    }
-                }
-            })
         }
+        Err(last_err.unwrap_or_else(|| AsynError::Status {
+            status: AsynStatus::Error,
+            message: format!("no addresses found for '{addr_str}'"),
+        }))
     }
 
     fn connect_udp(&mut self) -> AsynResult<(UdpSocket, std::net::SocketAddr)> {
@@ -1166,42 +1192,28 @@ impl DrvAsynIPPort {
                 message: format!("UDP resolve '{remote}': no addresses"),
             })?;
         let local_port = self.config.local_port.unwrap_or(0);
-        let bind_addr = if peer.is_ipv6() {
-            format!("[::]:{local_port}")
+        let (domain, local_addr): (socket2::Domain, std::net::SocketAddr) = if peer.is_ipv6() {
+            (
+                socket2::Domain::IPV6,
+                (std::net::Ipv6Addr::UNSPECIFIED, local_port).into(),
+            )
         } else {
-            format!("0.0.0.0:{local_port}")
+            (
+                socket2::Domain::IPV4,
+                (std::net::Ipv4Addr::UNSPECIFIED, local_port).into(),
+            )
         };
-        let socket = UdpSocket::bind(&bind_addr)?;
-        Ok((socket, peer))
-    }
-
-    /// UDP variant builder — applies any combination of `SO_BROADCAST`
-    /// and `SO_REUSEPORT` requested by the protocol suffix. Mirrors C
-    /// asyn `connectIt` UDP socket option flow (drvAsynIPPort.c
-    /// branches on `tty->flags & FLAG_BROADCAST` and `FLAG_SO_REUSEPORT`).
-    fn connect_udp_with_options(
-        &mut self,
-        broadcast: bool,
-        reuse_port: bool,
-    ) -> AsynResult<(UdpSocket, std::net::SocketAddr)> {
-        let (socket, peer) = self.connect_udp()?;
-        if broadcast {
-            socket.set_broadcast(true)?;
-        }
-        if reuse_port {
-            #[cfg(unix)]
-            {
-                // SockRef borrows the std socket's fd without taking
-                // ownership — set_reuse_port goes through socket2's
-                // setsockopt(SO_REUSEPORT) wrapper.
-                let sref = socket2::SockRef::from(&socket);
-                sref.set_reuse_port(true).map_err(|e| AsynError::Status {
-                    status: AsynStatus::Error,
-                    message: format!("UDP SO_REUSEPORT failed: {e}"),
-                })?;
-            }
-        }
-        Ok((socket, peer))
+        // The options go on the fresh socket, before the bind — the whole point
+        // of `udp&` is two ports sharing one local port, and the kernel only
+        // honours SO_REUSEPORT on an unbound socket (C :461-477, then :495-506).
+        let socket = self.new_socket(domain, socket2::Type::DGRAM, socket2::Protocol::UDP)?;
+        socket
+            .bind(&local_addr.into())
+            .map_err(|e| AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!("UDP bind '{local_addr}' failed: {e}"),
+            })?;
+        Ok((UdpSocket::from(socket), peer))
     }
 
     #[cfg(unix)]
@@ -1252,35 +1264,18 @@ impl PortDriver for DrvAsynIPPort {
                 if self.config.no_delay {
                     stream.set_nodelay(true)?;
                 }
-                if self.config.protocol == IpProtocol::TcpReusePort {
-                    // tcp& in C asyn = TCP + SO_REUSEPORT (NOT
-                    // non-blocking). Apply via SockRef on the std
-                    // TcpStream so we don't churn the socket type.
-                    #[cfg(unix)]
-                    {
-                        let sref = socket2::SockRef::from(&stream);
-                        sref.set_reuse_port(true).map_err(|e| AsynError::Status {
-                            status: AsynStatus::Error,
-                            message: format!("TCP SO_REUSEPORT failed: {e}"),
-                        })?;
-                    }
-                }
+                // `tcp&` = TCP + SO_REUSEPORT (C :360-363, :461-477). The option
+                // is set by `new_socket` on the unconnected socket, which is the
+                // only place it means anything.
                 self.io.inner = Some(IpIoInner::Tcp(stream));
             }
-            IpProtocol::Udp => {
-                let (socket, peer) = self.connect_udp_with_options(false, false)?;
-                self.io.inner = Some(IpIoInner::Udp(socket, peer));
-            }
-            IpProtocol::UdpReusePort => {
-                let (socket, peer) = self.connect_udp_with_options(false, true)?;
-                self.io.inner = Some(IpIoInner::Udp(socket, peer));
-            }
-            IpProtocol::UdpBroadcast => {
-                let (socket, peer) = self.connect_udp_with_options(true, false)?;
-                self.io.inner = Some(IpIoInner::Udp(socket, peer));
-            }
-            IpProtocol::UdpBroadcastReusePort => {
-                let (socket, peer) = self.connect_udp_with_options(true, true)?;
+            IpProtocol::Udp
+            | IpProtocol::UdpReusePort
+            | IpProtocol::UdpBroadcast
+            | IpProtocol::UdpBroadcastReusePort => {
+                // BROADCAST / SO_REUSEPORT are the socket's, applied by
+                // `new_socket` before the bind — they are not a post-bind fixup.
+                let (socket, peer) = self.connect_udp()?;
                 self.io.inner = Some(IpIoInner::Udp(socket, peer));
             }
             #[cfg(unix)]

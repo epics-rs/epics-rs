@@ -829,9 +829,21 @@ impl BridgeChannel {
                             let _ = rx.await;
                         }
                     } else {
-                        let mut visited = std::collections::HashSet::new();
+                        // The non-blocking forced put is pvxs's
+                        // `doPostProcessing(forceProcessing==True)`
+                        // (`singlesource.cpp:382`) — the SAME owner the group
+                        // PUT reaches (`groupsource.cpp:570`), and it splits on
+                        // PACT: an async-active record takes `rpro = TRUE` and
+                        // is not processed, an idle one takes `putf = TRUE` and
+                        // processes (`iocsource.cpp:404-419`). Calling
+                        // `process_record_with_links` here set neither flag and
+                        // landed in the port's `dbProcess` PACT guard — the
+                        // LCNT bump and SCAN_ALARM/INVALID after MAX_LOCK that
+                        // `doPostProcessing` exists to avoid — while dropping
+                        // the deferred reprocess. `put_driven_process` is the
+                        // database's single owner of that transition.
                         self.db
-                            .process_record_with_links(&self.record_name, &mut visited, 0)
+                            .put_driven_process(&self.record_name)
                             .await
                             .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
                     }

@@ -1155,27 +1155,56 @@ impl PvDatabase {
     /// applies the same PACT→RPRO rule at its own targets (`processing.rs:3225`,
     /// `:4220`, `links.rs:829`).
     ///
-    /// The caller already holds `record_name`'s advisory write gate (the
-    /// `dbScanLock` analogue) — either `_record_gate`, or the QSRV atomic
-    /// group's `lock_records` epoch when entered via
-    /// `put_record_field_from_ca_already_locked`. The gate `Mutex` is not
-    /// reentrant, so processing MUST use the `_already_locked` entry.
-    async fn put_driven_process(&self, record_name: &str) {
+    /// Two entries, one rule. `put_driven_process` acquires `record_name`'s
+    /// advisory write gate (the `dbScanLock` analogue) itself;
+    /// [`Self::put_driven_process_already_locked`] is for a caller that
+    /// already owns it — `_record_gate` on the CA put path, or the QSRV
+    /// atomic group's `lock_records` epoch. The gate `Mutex` is not
+    /// reentrant, so a caller holding it MUST take the `_already_locked`
+    /// entry.
+    ///
+    /// QSRV's group PUT is the second external caller (pvxs
+    /// `IOCSource::doPostProcessing`, `iocsource.cpp:397-420`, whose PACT
+    /// branch is this same RPRO deferral): it reaches the decision by its own
+    /// route — `record._options.process`, a `+type:"proc"` member, a `pp` field
+    /// — but once the answer is "process", the transition is this owner's, in
+    /// both gate modes.
+    /// The PACT (RPRO) branch is success, as it is in C: `dbPutField` returns
+    /// the `dbProcess` status only on the branch that ran it.
+    pub async fn put_driven_process(&self, record_name: &str) -> CaResult<()> {
+        self.put_driven_process_inner(record_name, true).await
+    }
+
+    /// [`Self::put_driven_process`] for a caller that already owns the
+    /// record's advisory write gate.
+    pub async fn put_driven_process_already_locked(&self, record_name: &str) -> CaResult<()> {
+        self.put_driven_process_inner(record_name, false).await
+    }
+
+    async fn put_driven_process_inner(
+        &self,
+        record_name: &str,
+        acquire_gate: bool,
+    ) -> CaResult<()> {
         {
             let Some(rec) = self.get_record(record_name).await else {
-                return;
+                return Ok(());
             };
             let mut instance = rec.write().await;
             if instance.is_processing() {
                 instance.common.rpro = true;
-                return;
+                return Ok(());
             }
             instance.common.putf = true;
         }
         let mut visited = HashSet::new();
-        let _ = self
-            .process_record_with_links_already_locked(record_name, &mut visited, 0)
-            .await;
+        if acquire_gate {
+            self.process_record_with_links(record_name, &mut visited, 0)
+                .await
+        } else {
+            self.process_record_with_links_already_locked(record_name, &mut visited, 0)
+                .await
+        }
     }
 
     /// C `dbNotifyCompletion` → restart (dbNotify.c:207-231, state
@@ -1336,7 +1365,7 @@ impl PvDatabase {
                 // selects the record for the put-driven process — with the same
                 // PACT→RPRO deferral as a `pp` field. Both go through the single
                 // owner.
-                self.put_driven_process(record_name).await;
+                let _ = self.put_driven_process_already_locked(record_name).await;
                 // The wait-set fires the oneshot only after the whole
                 // FLNK/OUT chain (sync + async) settles. If it has
                 // already completed the chain was fully synchronous —
@@ -1687,7 +1716,7 @@ impl PvDatabase {
         // Process the record after field put — through the single owner of C's
         // `dbPutField:1269-1277` decision, so an async-active record takes the
         // RPRO deferral instead of a doomed re-entrant `dbProcess`.
-        self.put_driven_process(record_name).await;
+        let _ = self.put_driven_process_already_locked(record_name).await;
 
         // Is the ORIGINATING record itself still async-pending? Its
         // wait-set membership is taken + `leave`d at its own completion

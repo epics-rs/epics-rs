@@ -1388,20 +1388,26 @@ impl GroupChannel {
         if !process_it {
             return Ok(());
         }
-        // The link-aware entry: `dbProcess` runs INP/OUT/FLNK side effects, so
-        // the value-only `process_record` (process_local + notify) is not the
-        // equivalent. `_already_locked` inside an atomic PUT — that transaction
-        // owns every member-record gate via `lock_records`, and the gate
-        // `Mutex` is not reentrant.
-        let mut visited = std::collections::HashSet::new();
+        // The DECISION is the group's (pvxs asks it in `doPostProcessing`); the
+        // TRANSITION is the database's. `put_driven_process` is its declared
+        // single owner — C `dbPutField:1264-1277` and pvxs
+        // `iocsource.cpp:404-419` split identically on PACT: an async-active
+        // record takes `rpro = TRUE` and is NOT processed (`recGblFwdLink`
+        // re-queues it when the device round trip lands), an idle one takes
+        // `putf = TRUE` and processes. Reaching for `process_record_with_links`
+        // here instead set neither flag and dropped a group PUT into
+        // `dbProcess`'s own PACT guard — the LCNT bump and the SCAN_ALARM /
+        // INVALID after MAX_LOCK that C's `doPostProcessing` exists to avoid,
+        // while losing the deferred reprocess: two rapid group PUTs to a Passive
+        // async output wrote one value to the device where C writes both.
+        //
+        // `_already_locked` inside an atomic PUT — that transaction owns every
+        // member-record gate via `lock_records`, and the gate `Mutex` is not
+        // reentrant.
         if already_locked {
-            self.db
-                .process_record_with_links_already_locked(record_name, &mut visited, 0)
-                .await
+            self.db.put_driven_process_already_locked(record_name).await
         } else {
-            self.db
-                .process_record_with_links(record_name, &mut visited, 0)
-                .await
+            self.db.put_driven_process(record_name).await
         }
         .map_err(|e| BridgeError::PutRejected(e.to_string()))
     }
@@ -3985,6 +3991,88 @@ mod tests {
                 1,
                 "proc member without +putorder must process its record (atomic={atomic})"
             );
+        }
+    }
+
+    /// R19-43: a group PUT that decides to process routes the transition
+    /// through the database's `put_driven_process` owner, so it splits on PACT
+    /// exactly as pvxs `doPostProcessing` does (`iocsource.cpp:404-419`):
+    ///
+    /// * **record ACTIVE** — `rpro = TRUE`, and `dbProcess` is NOT called.
+    ///   `recGblFwdLink` re-queues the record when the device round trip lands,
+    ///   so the put still reaches the device one cycle later. The port used to
+    ///   call `dbProcess` here, landing in its own PACT guard: LCNT bumped, and
+    ///   after MAX_LOCK the record takes a SCAN_ALARM/INVALID that C never
+    ///   raises for a client put — while the deferred reprocess was lost.
+    /// * **record IDLE** — `putf = TRUE` and the record processes.
+    ///
+    /// Both gate modes (atomic ⇒ the caller owns the record gates; non-atomic ⇒
+    /// the owner takes them) must reach the same owner.
+    #[tokio::test]
+    async fn group_put_defers_to_rpro_on_an_active_record() {
+        use epics_base_rs::server::records::ai::AiRecord;
+
+        for atomic in [false, true] {
+            let db = Arc::new(PvDatabase::new());
+            db.add_record("PACT:rec", Box::new(AiRecord::new(0.0)))
+                .await
+                .unwrap();
+            let cfg = format!(
+                r#"{{ "PACT:GRP": {{ "+atomic": {atomic},
+                    "go": {{ "+type": "proc", "+channel": "PACT:rec" }} }} }}"#
+            );
+            let mut defs = super::super::group_config::parse_group_config(&cfg).unwrap();
+            let channel = GroupChannel::new(db.clone(), defs.pop().unwrap());
+
+            // ACTIVE (PACT=1) — the async-device boundary.
+            {
+                let rec = db.get_record("PACT:rec").await.unwrap();
+                let inst = rec.write().await;
+                inst.processing
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+            channel
+                .put(&PvStructure::new("structure"))
+                .await
+                .expect("a group PUT onto an active record is not an error");
+            {
+                let rec = db.get_record("PACT:rec").await.unwrap();
+                let inst = rec.read().await;
+                assert!(
+                    inst.common.rpro,
+                    "an active record takes the RPRO deferral (atomic={atomic})"
+                );
+                assert!(
+                    !inst.common.putf,
+                    "PUTF marks a cycle that actually ran (atomic={atomic})"
+                );
+                assert_eq!(
+                    inst.common.lcnt, 0,
+                    "the deferral must not re-enter dbProcess's PACT guard \
+                     — an LCNT bump is the SCAN_ALARM path C avoids (atomic={atomic})"
+                );
+            }
+
+            // IDLE — the other side of the same boundary.
+            {
+                let rec = db.get_record("PACT:rec").await.unwrap();
+                let mut inst = rec.write().await;
+                inst.processing
+                    .store(false, std::sync::atomic::Ordering::Release);
+                inst.common.rpro = false;
+            }
+            channel
+                .put(&PvStructure::new("structure"))
+                .await
+                .expect("group PUT on an idle record processes");
+            {
+                let rec = db.get_record("PACT:rec").await.unwrap();
+                let inst = rec.read().await;
+                assert!(
+                    !inst.common.rpro,
+                    "an idle record processes now, it does not defer (atomic={atomic})"
+                );
+            }
         }
     }
 

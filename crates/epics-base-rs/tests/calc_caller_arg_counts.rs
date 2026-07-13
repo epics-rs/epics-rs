@@ -40,9 +40,28 @@
 //! static name past the count, transform's zero string args, `@@` at the array
 //! bound, and a negative index.
 
+//! R19-92 extends the same rule to the NUMERIC engine, whose C has no count at
+//! all: `calcPerform(double *parg, ...)` indexes all 21 args out of the caller's
+//! pointer unconditionally. `swaitRecord` supplies only twelve (`swaitRecord.dbd`
+//! declares A..L, then LA..LL), so in C `parg[12]` IS `&pwait->la` — `CALC="M"`
+//! reads the previous A and `CALC="M:=5"` corrupts the record's change-detection
+//! latch (CBUG-G3). The port does not reproduce that: swait hands the engine its
+//! count, so M..U do not exist there — fetch 0, store nowhere, exactly as sCalc
+//! and aCalc already spell out for their own short callers.
+//!
+//! | caller             | numeric args |                                       |
+//! |--------------------|--------------|---------------------------------------|
+//! | calc / calcout     | 21           | `calcRecord.dbd` declares A..U        |
+//! | lnkCalc, asLib ASG | 21           | both allocate `CALCPERFORM_NARGS`     |
+//! | swait              | **12**       | `swaitRecord.c:409` `&pwait->a` = A..L |
+
+use std::collections::HashSet;
+
 use epics_base_rs::calc::{
-    ArrayInputs, ArrayStackValue, CALC_NARGS, ScalcString, StackValue, StringInputs, acalc, scalc,
+    ArrayInputs, ArrayStackValue, CALC_NARGS, NumericInputs, ScalcString, StackValue, StringInputs,
+    acalc, calc, scalc,
 };
+use epics_base_rs::server::ioc_builder::IocBuilder;
 
 /// scalcout's counts: `MAX_FIELDS` / `STRING_MAX_FIELDS`, both 12.
 fn scalcout_inputs() -> StringInputs {
@@ -255,4 +274,102 @@ fn default_inputs_supply_every_arg() {
         d(scalc(&format!("@{CALC_NARGS}:=5;@{CALC_NARGS}"), &mut inputs).unwrap()),
         0.0
     );
+}
+
+// ---------------------------------------------------------------------------
+// R19-92 — the NUMERIC engine under a short caller (swait's twelve)
+// ---------------------------------------------------------------------------
+
+/// swait's count: `&pwait->a` spans A..L (`swaitRecord.c:409`).
+fn swait_inputs() -> NumericInputs {
+    NumericInputs::with_counts(12)
+}
+
+/// `L` is index 11, and 12 > 11 — the last arg swait supplies is a real one.
+#[test]
+fn numeric_arg_at_the_last_supplied_index_is_stored() {
+    let mut inputs = swait_inputs();
+    assert_eq!(calc("L:=5;L", &mut inputs).unwrap(), 5.0);
+    assert_eq!(inputs.vars[11], 5.0);
+}
+
+/// `M` is index 12, the first one swait does NOT supply. C would write
+/// `pwait->la` here; the port stores nowhere and fetches 0.
+#[test]
+fn numeric_arg_past_the_count_stores_nothing_and_fetches_zero() {
+    let mut inputs = swait_inputs();
+    assert_eq!(calc("M:=5;M", &mut inputs).unwrap(), 0.0);
+    assert_eq!(inputs.vars[12], 0.0, "the store must not land");
+}
+
+/// The fetch is 0 because the arg does not EXIST, not because the slot happens
+/// to be zero: a caller-preloaded slot past the count is still invisible.
+#[test]
+fn numeric_arg_past_the_count_fetches_zero_even_when_the_slot_holds_a_value() {
+    let mut inputs = swait_inputs();
+    inputs.vars[12] = 7.0; // present in the struct, NOT supplied by the caller
+    assert_eq!(calc("M", &mut inputs).unwrap(), 0.0);
+    assert_eq!(inputs.vars[12], 7.0, "and the engine did not touch it");
+}
+
+/// calc/calcout DO declare A..U (`calcRecord.dbd`), so the full-count caller
+/// keeps every one of the 21 — the bound narrows swait, not the engine.
+#[test]
+fn a_full_count_caller_keeps_every_numeric_arg() {
+    let mut inputs = NumericInputs::new();
+    assert_eq!(calc("U:=5;U", &mut inputs).unwrap(), 5.0);
+    assert_eq!(inputs.vars[CALC_NARGS - 1], 5.0);
+}
+
+/// A count above the engine's array clamps to it — `num_args <= vars.len()` holds
+/// by construction, so no access site can be handed an index the array lacks.
+#[test]
+fn a_count_above_the_array_clamps_to_it() {
+    let mut inputs = NumericInputs::with_counts(CALC_NARGS + 9);
+    assert_eq!(calc("U:=5;U", &mut inputs).unwrap(), 5.0);
+    assert_eq!(inputs.vars[CALC_NARGS - 1], 5.0);
+}
+
+/// The record-level case: swait must hand the engine its count, so an `M` in a
+/// live swait's CALC is inert. In C this same database reads and rewrites LA.
+#[tokio::test]
+async fn a_swait_calc_cannot_reach_past_l() {
+    let (db, _) = IocBuilder::new()
+        .db_string(
+            r#"
+record(swait, "W:M") {
+    field(CALC, "M:=5;M")
+}
+record(swait, "W:L") {
+    field(CALC, "L:=5;L")
+}
+"#,
+            &std::collections::HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+
+    let process = async |name: &str| {
+        let mut visited = HashSet::new();
+        db.process_record_with_links(name, &mut visited, 0)
+            .await
+            .unwrap();
+    };
+
+    process("W:M").await;
+    assert_eq!(
+        db.get_pv("W:M").await.unwrap().to_f64().unwrap(),
+        0.0,
+        "M is not one of swait's twelve args: the store is dropped and the fetch is 0"
+    );
+
+    process("W:L").await;
+    assert_eq!(
+        db.get_pv("W:L").await.unwrap().to_f64().unwrap(),
+        5.0,
+        "L is the last one that exists"
+    );
+    assert_eq!(db.get_pv("W:L.L").await.unwrap().to_f64().unwrap(), 5.0);
 }

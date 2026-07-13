@@ -248,13 +248,45 @@ pub struct NumericInputs {
     /// Previous calculation result, read by the `VAL` token (C `FETCH_VAL`,
     /// `*presult`). Defaults to 0.0 for a fresh evaluation.
     pub prev_val: f64,
+
+    /// How many of `vars` the CALLER actually supplied — the count sCalc and
+    /// aCalc take as `numArgs` / `num_dArgs` and base's `calcPerform` does NOT.
+    ///
+    /// C's `calcPerform(double *parg, ...)` takes a bare pointer and indexes all
+    /// `CALCPERFORM_NARGS` (21) args out of it unconditionally, so the caller is
+    /// on its honour to own 21 doubles at `parg`. `swaitRecord` does not:
+    /// `swaitRecord.dbd:250-331` declares A..L and then LA..LL, so
+    /// `calcPerform(&pwait->a, ...)` (`swaitRecord.c:409`) makes `parg[12]` alias
+    /// `&pwait->la`. In C, `CALC="M"` reads the record's previous A and
+    /// `CALC="M:=5"` overwrites LA — corrupting the record's own change-detection
+    /// latch. That is an upstream defect (CBUG-G3), not a contract, and the port
+    /// does not reproduce it: a variable the caller did not supply does not
+    /// exist, so it fetches 0 and a store into it is a no-op — the rule sCalc and
+    /// aCalc already state explicitly for their own args.
+    ///
+    /// The count travels WITH the args because the callers disagree: calc,
+    /// calcout and the CALC-evaluating links supply all 21; swait supplies 12.
+    num_args: usize,
 }
 
 impl NumericInputs {
+    /// Every arg present — the caller supplies all [`CALC_NARGS`] of them.
     pub fn new() -> Self {
+        Self::with_counts(CALC_NARGS)
+    }
+
+    /// C's `calcPerform(parg, ...)` plus the count C omits: the args and the
+    /// bound that says how many of them are real, handed over together.
+    ///
+    /// A count above [`CALC_NARGS`] clamps to it — the engine's array is the whole
+    /// world it can reach, so a caller cannot promise more args than exist. That
+    /// clamp is what makes `num_args <= vars.len()` hold by construction, so the
+    /// accessors below need only the one test.
+    pub fn with_counts(num_args: usize) -> Self {
         NumericInputs {
             vars: [0.0; CALC_NARGS],
             prev_val: 0.0,
+            num_args: num_args.min(CALC_NARGS),
         }
     }
 
@@ -262,7 +294,20 @@ impl NumericInputs {
         NumericInputs {
             vars,
             prev_val: 0.0,
+            num_args: CALC_NARGS,
         }
+    }
+
+    /// The one read path for an arg. `None` is "the caller never supplied this
+    /// one", which the engine turns into 0 rather than into the caller's next
+    /// field.
+    pub(crate) fn num_arg(&self, i: usize) -> Option<f64> {
+        (i < self.num_args).then(|| self.vars[i])
+    }
+
+    /// The one write path for an arg. `None` means the store is a no-op.
+    pub(crate) fn num_arg_mut(&mut self, i: usize) -> Option<&mut f64> {
+        (i < self.num_args).then(|| &mut self.vars[i])
     }
 }
 

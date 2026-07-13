@@ -29,9 +29,13 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut NumericInputs) -> Result<f64, Calc
 
                 // Push operations
                 CoreOp::PushConst(v) => stack.push(*v),
-                CoreOp::PushVar(idx) => stack.push(inputs.vars[*idx as usize]),
+                // An arg the caller did not supply fetches 0 — the same rule
+                // `sCalcPerform.c:421-427` and `aCalcPerform.c:432` state for
+                // theirs. Base's C omits the bound and walks off the end of a
+                // short caller's field block (CBUG-G3); see `NumericInputs::num_args`.
+                CoreOp::PushVar(idx) => stack.push(inputs.num_arg(*idx as usize).unwrap_or(0.0)),
                 CoreOp::PushDoubleVar(idx) => {
-                    stack.push(inputs.vars[*idx as usize]);
+                    stack.push(inputs.num_arg(*idx as usize).unwrap_or(0.0));
                 }
 
                 // Constants
@@ -378,14 +382,20 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut NumericInputs) -> Result<f64, Calc
                     stack.push(if a < b { a } else { b });
                 }
 
-                // Store
+                // Store. The stack is popped whether or not the arg exists — C's
+                // guarded store (`sCalcPerform.c:432-438`) pops in both arms too;
+                // only the assignment is conditional.
                 CoreOp::StoreVar(idx) => {
                     let v = pop1(&mut stack)?;
-                    inputs.vars[*idx as usize] = v;
+                    if let Some(slot) = inputs.num_arg_mut(*idx as usize) {
+                        *slot = v;
+                    }
                 }
                 CoreOp::StoreDoubleVar(idx) => {
                     let v = pop1(&mut stack)?;
-                    inputs.vars[*idx as usize] = v;
+                    if let Some(slot) = inputs.num_arg_mut(*idx as usize) {
+                        *slot = v;
+                    }
                 }
             },
 

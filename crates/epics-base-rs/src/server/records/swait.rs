@@ -243,9 +243,14 @@ impl SwaitRecord {
     /// Build the calc inputs. `prev_val` is the cell C passes as `presult`, which
     /// the `VAL` token (`FETCH_VAL`) pushes — for swait that is `&pwait->val`
     /// (C `swaitRecord.c:409`), i.e. the *previous* VAL.
+    ///
+    /// swait supplies TWELVE args, not the engine's 21: `swaitRecord.dbd:250-331`
+    /// declares A..L and nothing else numbered, so `&pwait->a` is twelve doubles
+    /// long. Handing the count to the engine is what makes M..U not exist here —
+    /// see [`NumericInputs::with_counts`] and CBUG-G3 for what C does instead.
     fn build_inputs(&self, prev_val: f64) -> NumericInputs {
-        let mut inputs = NumericInputs::new();
-        inputs.vars[..12].copy_from_slice(&self.num_vals[..12]);
+        let mut inputs = NumericInputs::with_counts(CHAN.len());
+        inputs.vars[..CHAN.len()].copy_from_slice(&self.num_vals);
         inputs.prev_val = prev_val;
         inputs
     }
@@ -260,10 +265,11 @@ impl SwaitRecord {
     /// increments the record's A. The engine here evaluates an owned copy, so
     /// without this the store was dropped on the floor.
     ///
-    /// Only the twelve args C supplies (`swaitRecord.c` passes `&pwait->a` over
-    /// A..L); the engine refuses a store past `numArgs` anyway.
+    /// Only the twelve args swait supplies come back, because only those twelve
+    /// can have been written: the engine takes the count from
+    /// [`Self::build_inputs`] and a store past L never lands.
     fn apply_stores(&mut self, inputs: &NumericInputs) {
-        self.num_vals[..12].copy_from_slice(&inputs.vars[..12]);
+        self.num_vals.copy_from_slice(&inputs.vars[..CHAN.len()]);
     }
 
     /// C `swaitRecord.c:425-450` — the OOPT switch, whose "old value" operand

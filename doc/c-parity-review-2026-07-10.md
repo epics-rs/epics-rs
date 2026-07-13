@@ -4578,3 +4578,118 @@ against compiled C yet — Round-14 adjudication input, NOT findings.
   as DBF_CHAR bytes, numeric target gets `OVAL` (DBR_DOUBLE). Surfaced during
   the W10-E3 family widening (the acalcout target-NELM analogue); port site
   `scalcout.rs:1200` (`multi_output_links`).
+
+---
+
+## Round 14 re-audit (2026-07-13)
+
+Five read-only opus auditor panels reused from Round 13 (round
+`01KXCQM527VJ3GX4CKQCT8DAYP`; full per-panel output in the caucus round
+archive). Methods: A re-ran the ~1500-case compiled-C corpus plus a new
+compiled BASE-engine driver (`calcPerform.c` — this is what exposed R14-1)
+and a 57-case aCalc array sweep; B ran ~110 head-to-head invocations of the
+compiled C tools vs the Rust tools on one live softIoc; C hand-decoded pvxs
+BitMask wire layout from `testxcode.cpp` and drove the port's bitset API
+from an out-of-tree probe; D compiled two probes against asyn-rs (retry
+timer/enabled gate; four-runtime-shape queue-deadline matrix); E read every
+cited C line and re-used the Round-13 compiled recGbl harnesses.
+
+### Wave-11 fix verification
+
+44 of 49 verified dispositions HOLD. The exceptions:
+
+- `9677b68a` (ARANDOM) INCOMPLETE — sCalc/aCalc replay compiled C exactly;
+  the BASE numeric engine does not (C has a second generator) → **R14-1**.
+- R13-5 `ed0abb19` INCOMPLETE — dynamic fetches match; the dynamic STOREs C
+  compiles in the same switch are still refused → **R14-4**.
+- W10-A2 `8a76ad0f` INCOMPLETE — correct in the string evaluator; an
+  all-double `|-` never reaches it in C → **R14-2**.
+- W10-A4 `6b85f8b0` INCOMPLETE — the `StoreStringVar` twin is equally dead
+  → **R14-8**.
+- W10-A8 `210887a3` REGRESSED (both bounds) — C's `dbPut` DOES zero the tail
+  via `put_array_info`, and the link splice is bounded at NELM where C
+  bounds at `numElements` → **R14-6**, **R14-7**.
+- R13-26 `1cecf272` INCOMPLETE — ordering fix real, but the getopt `'?'`/`':'`
+  error arms bypass the warning replay → **R14-18**.
+- R13-31/32 `a529d571` INCOMPLETE — encoder fixed, enqueue gate still tests
+  the structure-bit bitset → **R14-31**.
+- R13-33 `abaf0e57` INCOMPLETE — the default (pure-self-trigger) group shape
+  bypasses the marked path entirely → **R14-32**.
+- `1897513e` (W10-D1) INCOMPLETE — the gate is byte-exact; the refusal
+  REPORTING invents callback behaviour C never runs → **R14-46**.
+- W10-D2 `09a782e6` INCOMPLETE — right shape for callbacks that ran; gate
+  refusals mis-reported (R14-46) and `connect_device` posts nothing
+  (→ **R14-47**).
+- W10-D6 `56288d66` HOLDS for dispatch; report CONTENT is not C's → **R14-51**.
+- `9d083975` (W10-E3) **HOLDS** — set_output_to_ivov is `oval = ivov` alone;
+  buffer choice matches devaCalcoutSoft.c:65-88 incl. disconnected-CA
+  default and nuse clamp.
+- Merge-of-main resolutions all HOLD: tcp.rs/beacon (structurally — the TCP
+  path no longer receives the Notify; residual stale comment → **R14-19**),
+  port_handle.rs queue deadline (verified in all four runtime shapes),
+  qsrv can_write async fallout (behaviour-neutral, clippy-clean).
+
+### Lead adjudications (wave-11 fixer leads)
+
+- sCalc double-only no-ops — PARTIALLY REAL: BYTE/TO_DOUBLE are identity both
+  sides; SUBLAST diverges → R14-2. STORE_AA unreachable via the sticky
+  uses_string rule → R14-3 (REAL).
+- Dynamic STORE `@n:=`/`@@n:=` — REAL → R14-4.
+- `loop_pairs` dead — CONFIRMED DEAD → folded into R14-8 (hygiene).
+- catools `-h`/`-V` streams — REAL for `-h` (all four C tools use stderr) →
+  R14-16; `-V` already matches (stdout).
+- asyn `connect_device` post_if_new — REAL but INVERTED: it posts nothing at
+  all → R14-47.
+- `asynSetEos` drops addr — REAL → R14-48.
+- EOS hooks not asynUser-aware — REAL → R14-49 (structural cause of R14-48).
+- SIOL WRITE LINK_ALARM ordering — REAL → R14-62 (setLinkAlarm lives inside
+  dbPutLink itself, dbLink.c:444-446).
+- `alarm_field_posts` duplicates — NOT-REAL: RECGBL_POSTED_ALARM_FIELDS
+  excludes the four fields from the subscriber loop; one event per field per
+  cycle. Residual: the "single owner" comment at processing.rs:399-401 is
+  false (2 of 5 sites call it) — doc-only.
+- scalcout OUT buffer by TARGET FIELD TYPE — REAL → R14-61.
+
+### Open Findings — Round 14 (23 findings)
+
+Category A (calc engines):
+### R14-1: base `RNDM` replays the WRONG C generator — **High**, compiled repro. `numeric.rs:51,67-68` → `random.rs:31-37` vs calcPerform.c:508-520: base C's `calcRandom` is `seed = seed*multy + addy; return (double)seed/65535.0` — process-global static, NO `+1`, divisor 65535. The `9677b68a` unification put the base engine on sCalc/aCalc's `local_random` (`(seed+1)/65536`, thread-private). Same LCG state, different normalisation: first draw C 0.75007248, port 0.75007629. Every RNDM in calc/calcout/swait differs from C on every draw. sCalc/aCalc are correct.
+### R14-2: sCalc `|-` on two doubles succeeds where compiled C fails the whole expression — Medium, compiled repro. string.rs (SubLast arm runs regardless of path) vs sCalcPerform.c:811-823: SUBLAST is not in USES_STRING, so `A|-B` all-numeric runs C's double-only evaluator which has NO case SUBLAST → default break → depth check fails → stat=-1, VAL=-1, SVAL="***ERROR***", CALC_ALARM. Port computes A−B.
+### R14-3: `uses_string` re-scan misses C's sticky lookup rule — Medium, compiled repro. C's USES_STRING flag latches on the ELEMENT LOOKED UP (sCalcPostfix.c:447-471): `AA:=` is looked up as FETCH_AA (setting the flag) before being rewritten to STORE_AA (:552-557). The port re-scans the final opcode list where only Core(StoreDoubleVar) survives, so `AA:="…";…` can take the wrong evaluator.
+### R14-4: dynamic STOREs `@n:=` / `@@n:=` do not compile — Medium, compiled repro. sCalcPostfix.c:509-529 → A_STORE/A_SSTORE, evaluated at sCalcPerform.c:440,:897,:909. Port raises BadAssignment at compile; a scalcout using the idiom never runs (CLCV≠0). R13-5 ported only the fetch half.
+### R14-5: sCalc `>>`/`<<` on a string operand is a CHARACTER shift in C; the port bit-shifts — **High**, compiled repro. string.rs:287-293 (pop2_f64) vs sCalcPerform.c:1263-1294: C type-branches on the left operand — string shifts the 40-byte buffer (`>>` right, space-fill; `<<` left, truncate), count = myNINT(rhs) clamped 40. `"abc">>1` → C `" abc"`, port `0.0`. Wrong value AND wrong type on every sCalc string shift. (All other C string type-branches re-verified head-to-head: shifts are the only remaining gap.)
+### R14-6: an acalcout client put must zero `[nNew, numElements)` — the W10-A8 fix asserts the opposite — Medium. acalcout.rs:363-369,376-381 vs dbAccess.c:1366-1369 (dbPut calls put_array_info for SPC_DBADDR fields) + aCalcoutRecord.c:726-731 (zeros the tail of the NUSE window). Client short put leaves stale elements the calc engine then reads.
+### R14-7: the acalcout link splice is bounded at NELM; C's link read is bounded at numElements — Medium. acalcout.rs:363-369 vs aCalcoutRecord.c:1096-1097 (`nRequest = acalcGetNumElements`): an INAA source longer than the NUSE window overwrites the hidden tail `[numElements, nelm)` the splice invariant exists to preserve.
+### R14-8: dead calc surface: `StringOp::StoreStringVar` (opcodes.rs:114, string.rs:507 — nothing emits it; its uses_string arm at :1716 is misleading next to R14-3) and `CompiledExpr::loop_pairs` (mod.rs:36 — written Vec::new() at all 5 sites, never read) — Low, hygiene.
+
+Category B (CA tools):
+### R14-16: `-h` writes the usage block to stdout; all four C tools write it to stderr — Low. copt.rs:287-291 vs caget.c:58/camonitor.c:47/caput.c:62/cainfo.c:39. `-V` already matches (stdout). The port's comment concedes the deviation but it is not in the deviation register; the exit-1 usage path already writes stderr, so the same block goes to two streams depending on how it was reached.
+### R14-17: `EPICS_CLI_TIMEOUT` bypasses the copt scanner — Medium, live repro. cli.rs:57-67 (`str::parse`) vs tool_lib.c:646-660 (epicsScanDouble + warning). Bad value: C warns naming the variable, port silent. Whitespace-padded value: C honours it (epicsParseDouble trims), port silently reverts to 1 s — `" -1 "` flips exit status. The one C-scanned argument escaping copt's single-owner contract; route it through the scanner, do not add a second parser.
+### R14-18: the getopt `'?'`/`':'` arms swallow every preceding option's warning — Medium, live repro. copt.rs:307-346 (usage_exit runs before Scan::finish replays) vs caget.c:437-522. `caget -w abc -X` → C two stderr lines, port one. Replay the buffer up to the offending token's argv index (options AFTER it never warn in C — verified).
+### R14-19: `run_beacon_emitter`'s doc comment still describes the TCP-connect ramp reset the merge removed — Low, doc-only. beacon.rs:20-25: every clause now false (sole notifier is trigger_beacon_anomaly; tests/beacon_ramp_connect.rs forbids what the comment calls deliberate). Stale-comment-as-instruction hazard.
+
+Category C (PVA):
+### R14-31: the monitor enqueue gate and the wire bitset disagree on structure bits — Medium, compiled repro. tcp.rs:1752-1754 (`MonitorQueue::real` tests marked_changed_bitset, which carries structure bits) vs pvrequest.cpp:73-92 (testmask tests `store[idx].valid` — never true for a structure) + servermon.cpp:256-268. After a529d571 the encoder emits leaves only, so a post admitted on a structure bit alone frames to an EMPTY changed-bitset — client typo `field(timeStamp.bogus)` yields empty MONITOR DATA frames at full event rate where pvxs drops the post. Structural fix: one owner — `real()` decides on `canonical_changed_bitset(intro, marked ∩ mask)` non-empty.
+### R14-32: a pure-self-trigger group (the DEFAULT `+trigger` shape) bypasses the marked path — R13-33's property-leaf narrowing never applies to it — Medium. group.rs:2062-2066,:2124-2125 (EventMark::Derive) vs groupsource.cpp:355-380 + iocsource.cpp:312-352. Wider than C: the snapshot diff marks timeStamp/alarm leaves on property events C never assigns (UpdateType::Property gates getTimeAlarm). Narrower: unchanged limits diff to nothing → empty-bitset frame where pvxs carries assigned-not-changed leaves. Fix: fall through to leaves_or_derive for the self-trigger case; retire Derive/emits_partial for QSRV groups.
+
+Category D (asyn):
+### R14-46: a gate-refused special() is reported as a callback that ran — Medium. asyn_record/mod.rs:2698-2712, :2936-2947, :4115-4161 vs asynRecord.c:571-576: on a refused queueRequest C writes `pasynUserSpecial->errorMessage` ("port X not connected") to ERRS and frees the user — asynCallbackSpecial never runs, so no readback, no monitorStatus tail. Port invents callback-shaped ERRS text and returns SpecialRan::Yes → readback + monitorStatus + posts C never performs. Only is_queue_timeout is special-cased; Disconnected/Disabled falls through the driver-error path.
+### R14-47: `connect_device` refreshes every readback field and posts NONE of them — Medium. mod.rs:3097-3123 vs asynRecord.c:1270,:1319 (two monitorStatus calls) + :1848-1938/:1985-2026 (getOptions/getEos post BAUD..HOSTINFO, IEOS/OEOS). A put to PORT/ADDR/DRVINFO/PCNCT updates the record in memory but fires no CA monitor — screens keep showing the previous port's values.
+### R14-48: iocsh `asynSetEos`/`asynShowEos` parse addr and throw it away — Medium. iocsh.rs `let _addr = …` vs asynShellCommands.c:220,:233-234,:79 (addr threads into findInterface → connectDevice). Multi-device port: shell EOS applies to the wrong device. Sibling asynSetOption routes addr correctly.
+### R14-49: EOS is port-wide state with no asynUser on the hook — a multi-device port cannot hold two EOSes — Medium, structural cause of R14-48. port.rs:196 (one `input_eos` per port), :1561 (`set_input_eos(&mut self, eos)` — no user/addr) vs asynInterposeEos.c:48,:84-120,:288 (per-(port,addr) instance, hook takes pasynUser). Fix at the hook: `set_input_eos(&mut self, user: &AsynUser, eos: &[u8])`, per-device state — one change, not two patches.
+### R14-50: the auto-connect retry timer bypasses the enabled/defunct gate — **High**, compiled repro. port_actor.rs:384-406 (`service_connect_timer` checks is_connected + auto_connect, then calls driver.connect directly) vs asynManager.c:3252-3266 (timer issues queueRequest, which the gate refuses asynDisabled) + :1541-1546. `asynEnable(port,0)` does not stop asyn-rs: probe shows 6 hw connect attempts per 300 ms while DISABLED (C: 0); a shutdownPort'd (defunct) port keeps connecting too. Structural fix: route the timer's connect through the same gate the queue uses.
+### R14-51: `asynReport` prints none of C's manager-level block — Low. port_actor.rs:1225-1245 + port.rs:1178-1190 vs asynManager.c:1043-1122 (reportPort): multiDevice/canBlock/autoConnect line, enabled/connected/numberConnects, nDevices/nQueued/blocked, lock states, exception counts, trace masks, per-address lines, interpose/interface lists — all absent. First tool an engineer runs on a stuck port; parsers break.
+
+Category E (records/framework):
+### R14-61: scalcout drives OVAL into every OUT target — C routes the buffer by the target's FIELD TYPE and sends OSV to string/char targets — **High**. scalcout.rs:1200 vs devsCalcoutSoft.c:66-144: STRING/ENUM/MENU/DEVICE/link-type targets get DBR_STRING from &osv; CHAR/UCHAR with n_elements>1 get DBF_CHAR from &osv (async) or &sval (sync — C asymmetry) clamped to sizeof(sval); numeric targets get DBR_DOUBLE from &oval. Every string-valued scalcout output link is wrong (writes 0/last numeric where C writes the computed string). The target-field-type sibling of W10-E3's target-NELM choice.
+### R14-62: a failed OUT / SIOL WRITE raises no LINK_ALARM, and the write is sequenced after the alarm commit — **High**. processing.rs:3241,:3270,:4695 + links.rs:742,:1084 vs dbLink.c:434-448 (`setLinkAlarm` INSIDE dbPutLink; :469-471 async twin) + aoRecord.c:196-232 (checkAlarms → writeValue → monitor). Port swallows put failures (eprintln/discard) → a record whose OUT/SIOL target is down stays NO_ALARM forever; and even once raised it would land a cycle late (reset_alarms at :2782 precedes the write at :3241). Write-side twin of W10-E4. Affects every soft-output record + simulated SIOL writes.
+### R14-63: `.UDF` is posted on every cycle that posts anything — C never posts UDF at all — Medium, rg proof. processing.rs:3123-3134,:4224-4235,:5635-5645 + record_instance.rs:2832-2843 push ("UDF", udf, cycle_mask) with no change detection and a synthesized mask; justifying comment cites `recGblCheckUDF`, which does not exist, and recGblResetAlarms posts only SEVR/STAT/AMSG/ACKS (recGbl.c:204-216). `db_post_events(...udf...)` has ZERO matches across epics-base and epics-modules; the only C UDF event is a client dbPut to UDF itself. Archivers/alarm handlers on .UDF see duplicate streams C cannot produce.
+
+### Notes
+- epics-ca-rs suite is FLAKY under parallel load (2 different single-test
+  failures in 5 full runs: caput_readback_timeout, acf_host_identity; both
+  pass isolated). Workspace "8560/0" gates are single-run observations.
+- False comment at processing.rs:399-401 ("single owner" — 2 of 5 alarm-post
+  sites call it) — fold into the wave-12 E batch as doc-only.
+- R13-24 stream-interleave observation (exception block position under 2>&1)
+  examined and NOT filed: two independently-correct streams.

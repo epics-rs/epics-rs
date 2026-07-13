@@ -54,6 +54,20 @@
 //! are therefore ORDINARY repeatable options in every tool's spec
 //! ([`assert_repeatable`] now rejects clap's Help/Version actions outright), and
 //! no resolver may write to stderr directly.
+//!
+//! # Long-form options (DELIBERATE deviation — kept by user decision, wave 11)
+//!
+//! C parses SHORT options only: `getopt(3)` treats `caget --wait 5` as the
+//! unknown option `'-'` and answers with the `'?'` arm's diagnostic (the
+//! echoed `optopt` collapses the token to `'--'` — see
+//! [`CTool::get_matches`]'s UnknownArgument arm). The Rust binaries
+//! additionally declare a clap long form per option (`--wait`, `--terse`,
+//! `--dbr-type`, ...). This is a deliberate SUPERSET: every command line C
+//! accepts parses identically here (short letters, argv order,
+//! repeatability, warning replay), and the long forms only admit command
+//! lines C would refuse — no C-valid invocation changes meaning. The
+//! accepted cost is one-way portability: a script written against the Rust
+//! long forms does not run on the C tools.
 
 use std::io::Write as _;
 

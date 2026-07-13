@@ -1121,6 +1121,208 @@ impl ParamList {
     pub fn is_empty(&self) -> bool {
         self.params[0].is_empty()
     }
+
+    /// C `paramList::report` (asynPortDriver.cpp:885-892) — the count line, then
+    /// every parameter through [`ParamEntry::report`].
+    ///
+    /// C has one `paramList` per address and reports the one it was handed; here
+    /// one list holds every address, so the address is the argument. It takes no
+    /// detail level because C's does not use it: `paramVal::report` prints the
+    /// same line whatever `details` says (paramVal.cpp:296-330), and the only
+    /// thing the level decides is *how many* lists are printed — which is
+    /// [`crate::port::PortDriverBase::report_params`]'s decision, and stays there.
+    pub fn report(&self, out: &mut dyn std::fmt::Write, addr: i32) {
+        use std::fmt::Write as _;
+        let _ = writeln!(out, "Number of parameters is: {}", self.len());
+        // A port whose `max_addr` outruns its list count (single-device, so every
+        // addr collapses onto list 0) reports list 0 again, exactly as C does with
+        // its `maxAddr` copies of the same values.
+        let a = self.validate_addr(addr).unwrap_or(0);
+        for (i, entry) in self.params[a].iter().enumerate() {
+            entry.report(out, i);
+        }
+    }
+}
+
+impl ParamEntry {
+    /// C `paramVal::report` (paramVal.cpp:296-372) — one line per parameter,
+    /// name + type + value + status, *whatever* the detail level. C passes
+    /// `details` in and never reads it; the only branch is defined vs undefined.
+    fn report(&self, out: &mut dyn std::fmt::Write, id: usize) {
+        use std::fmt::Write as _;
+        let name = &self.name;
+        // C's `asynStatus` is an unadorned enum and `%d` prints its ordinal;
+        // [`AsynStatus`] declares the same six in the same order (asynDriver.h:48).
+        let status = self.status as i32;
+
+        // C's `switch(type)` has no case for `asynParamGenericPointer`, so it
+        // lands in `default:` (paramVal.cpp:368-370) — a pointer parameter has no
+        // printable value, and C says so rather than inventing one.
+        if self.param_type == ParamType::GenericPointer {
+            let _ = writeln!(out, "Parameter {id} is undefined, name={name}");
+            return;
+        }
+        let type_name = c_param_type_name(self.param_type);
+        if !self.defined {
+            let _ = writeln!(
+                out,
+                "Parameter {id} type={type_name}, name={name}, value is undefined"
+            );
+            return;
+        }
+        match &self.value {
+            ParamValue::Int32(v) => {
+                let _ = writeln!(
+                    out,
+                    "Parameter {id} type={type_name}, name={name}, value={v}, status={status}"
+                );
+            }
+            ParamValue::Int64(v) => {
+                let _ = writeln!(
+                    out,
+                    "Parameter {id} type={type_name}, name={name}, value={v}, status={status}"
+                );
+            }
+            ParamValue::UInt64(v) => {
+                let _ = writeln!(
+                    out,
+                    "Parameter {id} type={type_name}, name={name}, value={v}, status={status}"
+                );
+            }
+            // C prints the three masks alongside the value (paramVal.cpp:314-316):
+            // a UInt32Digital parameter's callback behaviour is half its state.
+            ParamValue::UInt32Digital(v) => {
+                let _ = writeln!(
+                    out,
+                    "Parameter {id} type={type_name}, name={name}, value=0x{v:x}, \
+                     status={status}, risingMask=0x{:x}, fallingMask=0x{:x}, callbackMask=0x{:x}",
+                    self.uint32_rising_mask, self.uint32_falling_mask, self.uint32_interrupt_mask
+                );
+            }
+            ParamValue::Float64(v) => {
+                let _ = writeln!(
+                    out,
+                    "Parameter {id} type={type_name}, name={name}, value={}, status={status}",
+                    format_g(*v)
+                );
+            }
+            ParamValue::Octet(v) => {
+                let _ = writeln!(
+                    out,
+                    "Parameter {id} type={type_name}, name={name}, value={v}, status={status}"
+                );
+            }
+            // C prints the array's data pointer (`%p` over `data.pi8` &c.), not its
+            // contents — the report says *that* there is an array and where, and
+            // leaves the elements to the record that reads them.
+            ParamValue::Int8Array(v) => report_array(out, id, type_name, name, v.as_ptr(), status),
+            ParamValue::Int16Array(v) => report_array(out, id, type_name, name, v.as_ptr(), status),
+            ParamValue::Int32Array(v) => report_array(out, id, type_name, name, v.as_ptr(), status),
+            ParamValue::Int64Array(v) => report_array(out, id, type_name, name, v.as_ptr(), status),
+            ParamValue::UInt64Array(v) => {
+                report_array(out, id, type_name, name, v.as_ptr(), status)
+            }
+            ParamValue::Float32Array(v) => {
+                report_array(out, id, type_name, name, v.as_ptr(), status)
+            }
+            ParamValue::Float64Array(v) => {
+                report_array(out, id, type_name, name, v.as_ptr(), status)
+            }
+            ParamValue::Enum { index, .. } => {
+                let _ = writeln!(
+                    out,
+                    "Parameter {id} type={type_name}, name={name}, value={index}, status={status}"
+                );
+            }
+            // C's `asynParamNotDefined` — the type itself is unset, so the
+            // `switch` falls to the same `default:` a generic pointer does
+            // (paramVal.cpp:368-370).
+            ParamValue::Undefined | ParamValue::GenericPointer(_) => {
+                let _ = writeln!(out, "Parameter {id} is undefined, name={name}");
+            }
+        }
+    }
+}
+
+fn report_array<T>(
+    out: &mut dyn std::fmt::Write,
+    id: usize,
+    type_name: &str,
+    name: &str,
+    ptr: *const T,
+    status: i32,
+) {
+    use std::fmt::Write as _;
+    let _ = writeln!(
+        out,
+        "Parameter {id} type={type_name}, name={name}, value={ptr:p}, status={status}"
+    );
+}
+
+/// The type name C's `paramVal::report` prints — note it is *not*
+/// `paramVal::typeNames` (`asynParamInt32`, …): the report writes the interface
+/// name (`asynInt32`), and calls octet `string` (paramVal.cpp:302-330).
+///
+/// `UInt64`, `UInt64Array` and `Enum` have no C `paramVal` case — they are this
+/// port's extensions (upstream asyn issue #231 for the 64-bit unsigned pair) — so
+/// they take the name C would have given them in the same scheme.
+fn c_param_type_name(t: ParamType) -> &'static str {
+    match t {
+        ParamType::Int32 => "asynInt32",
+        ParamType::Int64 => "asynInt64",
+        ParamType::UInt64 => "asynUInt64",
+        ParamType::Float64 => "asynFloat64",
+        ParamType::Octet => "string",
+        ParamType::UInt32Digital => "asynUInt32Digital",
+        ParamType::Int8Array => "asynInt8Array",
+        ParamType::Int16Array => "asynInt16Array",
+        ParamType::Int32Array => "asynInt32Array",
+        ParamType::Int64Array => "asynInt64Array",
+        ParamType::UInt64Array => "asynUInt64Array",
+        ParamType::Float32Array => "asynFloat32Array",
+        ParamType::Float64Array => "asynFloat64Array",
+        ParamType::Enum => "asynEnum",
+        ParamType::GenericPointer => "asynGenericPointer",
+    }
+}
+
+/// C `printf("%g")` over a double, which is what `paramVal::report` prints a
+/// `Float64` with (paramVal.cpp:322): six significant digits, `%e` form when the
+/// exponent is below -4 or at least 6, and trailing zeros stripped either way.
+/// Rust's `{}` prints the shortest round-trip form instead — `1e-7` as
+/// `0.0000001`, `0.1+0.2` as `0.30000000000000004` — so the line has to be built.
+fn format_g(v: f64) -> String {
+    if v.is_nan() {
+        return "nan".to_string();
+    }
+    if v.is_infinite() {
+        return if v < 0.0 { "-inf" } else { "inf" }.to_string();
+    }
+    const PRECISION: i32 = 6;
+    // Round to six significant digits first, and read the decimal exponent back
+    // off the result: it is the rounded exponent that picks the form (9.999995
+    // rounds to 1e+01, and C prints `10`, not `9.99999`).
+    let sci = format!("{:.*e}", (PRECISION - 1) as usize, v);
+    let (mantissa, exp) = sci.split_once('e').expect("Rust {:e} always emits one");
+    let exp: i32 = exp.parse().expect("…followed by a decimal exponent");
+    let strip = |s: &str| -> String {
+        if s.contains('.') {
+            s.trim_end_matches('0').trim_end_matches('.').to_string()
+        } else {
+            s.to_string()
+        }
+    };
+    if exp < -4 || exp >= PRECISION {
+        // C's `%e` exponent is signed and at least two digits: `1.5e+10`, `1e-05`.
+        format!(
+            "{}e{}{:02}",
+            strip(mantissa),
+            if exp < 0 { '-' } else { '+' },
+            exp.abs()
+        )
+    } else {
+        strip(&format!("{:.*}", (PRECISION - 1 - exp).max(0) as usize, v))
+    }
 }
 
 /// Flat parameter-group helper — C++ `asynParamSet` equivalent.
@@ -1206,6 +1408,33 @@ impl AsynParamSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// C `%g` (paramVal.cpp:322 prints a Float64 with it): six significant
+    /// digits, `%e` form when the decimal exponent is < -4 or >= 6, trailing
+    /// zeros stripped, two-digit signed exponent. One case per boundary of that
+    /// rule — Rust's own `{}` matches none of them.
+    #[test]
+    fn format_g_matches_c_printf_g() {
+        for (v, expect) in [
+            (0.0f64, "0"),
+            (7.0, "7"),
+            (0.1 + 0.2, "0.3"),
+            (1.5, "1.5"),
+            // Six significant digits, then the trailing zeros go.
+            (1.0 / 3.0, "0.333333"),
+            (123456.0, "123456"),
+            // exp == 6 → the %e form starts here.
+            (1234567.0, "1.23457e+06"),
+            // exp == -4 is still the %f form; -5 is not.
+            (0.000123456789, "0.000123457"),
+            (0.0000123456789, "1.23457e-05"),
+            (-2.5e-9, "-2.5e-09"),
+            (f64::INFINITY, "inf"),
+            (f64::NAN, "nan"),
+        ] {
+            assert_eq!(format_g(v), expect, "%g of {v}");
+        }
+    }
 
     #[test]
     fn test_create_and_find() {

@@ -3980,7 +3980,15 @@ mod tests {
             !out.contains("EOS["),
             "a port with no octet interface has no EOS to report: {out}"
         );
-        assert!(out.contains("  Number of parameters is 1"), "{out}");
+        // C `reportParams(fp, details)` with the level unshifted (:3692): at
+        // details 1 the whole parameter block is already there — list 0, the
+        // count, and every parameter with its value (:1804-1807,
+        // paramVal.cpp:296-330).
+        assert!(
+            out.contains("Parameter list 0\nNumber of parameters is: 1\n")
+                && out.contains("Parameter 0 type=asynInt32, name=VAL, value is undefined\n"),
+            "asynReport 1 prints the parameter list, as C does: {out}"
+        );
 
         // details 0: the port line and nothing else (C :3678-3679).
         let mut out0 = String::new();

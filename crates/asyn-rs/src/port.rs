@@ -605,17 +605,26 @@ impl PortDriverBase {
     ///
     /// The `ConnectCheck` can only come from [`AsynUser::connect_check`], so the
     /// waiver is available exactly to the requests C gives it to.
+    ///
+    /// Its refusal is [`AsynError::QueueRefused`], not [`AsynError::Status`]:
+    /// C's refusal is `queueRequest`'s *return value*, so the callback never
+    /// runs and nothing it implies happened. A caller must be able to tell that
+    /// from a driver error raised *inside* a callback that did run — the record
+    /// writes the refusal to ERRS and stops, where a driver error still gets the
+    /// callback's readback and `monitorStatus` tail (asynRecord.c:571-576 vs
+    /// :788-900). This is the only place that stamps it.
     pub fn check_queue(&self, addr: i32, connect: ConnectCheck) -> AsynResult<()> {
-        self.check_enabled()?;
-        match connect {
-            // C `checkPortConnect == FALSE`: neither the port's nor the device's
-            // connected flag is read — the port thread drains the Connect queue
-            // before it ever calls `autoConnectDevice` (asynManager.c:812-856),
-            // and the device-level checks live in the lower-priority loop it has
-            // not reached yet (:864-874).
-            ConnectCheck::Waived => Ok(()),
-            ConnectCheck::Required => self.check_ready_addr(addr),
-        }
+        self.check_enabled()
+            .and_then(|()| match connect {
+                // C `checkPortConnect == FALSE`: neither the port's nor the
+                // device's connected flag is read — the port thread drains the
+                // Connect queue before it ever calls `autoConnectDevice`
+                // (asynManager.c:812-856), and the device-level checks live in
+                // the lower-priority loop it has not reached yet (:864-874).
+                ConnectCheck::Waived => Ok(()),
+                ConnectCheck::Required => self.check_ready_addr(addr),
+            })
+            .map_err(AsynError::into_queue_refusal)
     }
 
     /// The unconditional half of the queue gate: a defunct or disabled port

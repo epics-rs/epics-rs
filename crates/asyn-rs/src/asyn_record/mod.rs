@@ -21,7 +21,7 @@ use epics_base_rs::server::record::{
 };
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
-use crate::error::{AsynResult, AsynStatus};
+use crate::error::{AsynError, AsynResult, AsynStatus};
 use crate::exception::{AsynException, ExceptionCallbackId, ExceptionManager};
 use crate::interpose::EomReason;
 use crate::port_handle::PortHandle;
@@ -696,6 +696,24 @@ impl IoOutcome {
         self.report_error(PROCESS_QUEUE_TIMEOUT_MSG.to_string());
         raise_io_alarm(self, alarm_status::STATE_ALARM, AlarmSeverity::Major);
     }
+
+    /// The **refused** process request, C `process()` (asynRecord.c:342-361): the
+    /// queue gate turned `queueRequest` down (`asynDisabled` / `asynDisconnected`,
+    /// asynManager.c:1541-1552), so `performIO` never ran. C reports the literal
+    /// `"queueRequest failed"` and alarms `STATE_ALARM`/`MINOR_ALARM` — the same
+    /// arm that answers a record with no port ("Not connect to a port", :356-357)
+    /// — and posts no transfer field, because there was no transfer.
+    ///
+    /// The process-side twin of [`AsynRecord::report_special_never_ran`]: a
+    /// refusal is `queueRequest`'s *return value*, not a driver diagnostic raised
+    /// inside a callback that ran, so it must not be dressed up as one (R14-46).
+    /// Without this the port reported a disabled port as `"Read error, port X is
+    /// disabled"` with a COMM/MAJOR alarm and published NORD/EOMR for a read that
+    /// never reached the driver.
+    fn report_queue_refused(&mut self) {
+        self.report_error(PROCESS_QUEUE_REFUSED_MSG.to_string());
+        raise_io_alarm(self, alarm_status::STATE_ALARM, AlarmSeverity::Minor);
+    }
 }
 
 /// The status word C splices into the final octet read-error message
@@ -1194,6 +1212,16 @@ fn record_phase_result(
             out.report_queue_timeout();
             return PhaseFlow::Aborted;
         }
+        // The queue gate's refusal, ahead of the per-phase recorders for the same
+        // reason: C's `queueRequest` returned `asynDisabled` / `asynDisconnected`
+        // in `process()` (asynRecord.c:342-355) and `performIO` was never entered,
+        // so no phase of this plan ran and none of them may report. C's own
+        // `performIO` is one queued request covering every phase, so a refusal
+        // aborts the whole plan here, not just this phase.
+        if e.is_queue_refused() {
+            out.report_queue_refused();
+            return PhaseFlow::Aborted;
+        }
     }
     match phase {
         IoPhase::Flush => {
@@ -1330,6 +1358,10 @@ const QUEUE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// C `queueTimeoutCallbackProcess` (asynRecord.c:919-926) — the process request
 /// waited out `QUEUE_TIMEOUT` and was removed from the queue.
 const PROCESS_QUEUE_TIMEOUT_MSG: &str = "process queueRequest timeout";
+
+/// C `process()` (asynRecord.c:355) — the queue gate refused the process request,
+/// so `performIO` never ran.
+const PROCESS_QUEUE_REFUSED_MSG: &str = "queueRequest failed";
 
 /// C `queueTimeoutCallbackSpecial` (asynRecord.c:929-938) — the special
 /// (option / EOS / connect readback) request waited out `QUEUE_TIMEOUT`.
@@ -2689,15 +2721,14 @@ impl AsynRecord {
             .handle
             .set_option_blocking(self.option_user_for(queue), key, value)
         {
-            // The queued special request never ran (C `queueTimeoutCallbackSpecial`,
-            // asynRecord.c:929-938): no option was written, and the
-            // `setOption -> getOptions` fall-through lives *inside* that request
-            // (:845-849), so the readback does not happen either. Reporting the
-            // set failure and then re-reading would claim a driver round-trip the
-            // port never made.
-            if e.is_queue_timeout() {
-                self.report_special_queue_timeout();
-                return SpecialRan::No;
+            // The special request never ran — the queue gate refused it, or it
+            // timed out in the queue ([`Self::report_special_never_ran`]). No
+            // option was written, and the `setOption -> getOptions` fall-through
+            // lives *inside* that request (asynRecord.c:845-849), so the readback
+            // does not happen either. Reporting the set failure and then
+            // re-reading would claim a driver round-trip the port never made.
+            if e.never_ran() {
+                return self.report_special_never_ran(&e);
             }
             self.errs = format!("Error setting option, {}", e.message());
         }
@@ -2795,6 +2826,34 @@ impl AsynRecord {
     /// [`Self::option_user`] builds.
     fn report_special_queue_timeout(&mut self) {
         self.errs = SPECIAL_QUEUE_TIMEOUT_MSG.to_string();
+    }
+
+    /// The outcome of a special request that **never ran** — the single owner of
+    /// C's two no-callback exits, and of the answer every `asynCallbackSpecial`
+    /// arm gives when its request comes back refused or timed out.
+    ///
+    /// - The port's queue gate refused it: C's `queueRequest` returned
+    ///   non-success, so `special()` writes `pasynUser->errorMessage` to ERRS and
+    ///   frees the user (asynRecord.c:571-576). `asynCallbackSpecial` never runs
+    ///   — no option or EOS is written, no connect is attempted, no readback, and
+    ///   no `monitorStatus` tail.
+    /// - It waited out `QUEUE_TIMEOUT`: `queueTimeoutCallbackSpecial` runs
+    ///   instead of the callback (:929-938), reporting its own text.
+    ///
+    /// Returns [`SpecialRan::No`] either way, so the caller's `return` is the
+    /// whole exit: [`Self::special_callback`] then skips C's tail. An arm that
+    /// instead reported the refusal and carried on would drive a readback,
+    /// `monitorStatus` and its posts off a request the port never accepted.
+    fn report_special_never_ran(&mut self, e: &AsynError) -> SpecialRan {
+        if e.is_queue_refused() {
+            // C splices `pasynUser->errorMessage` — the gate's own text, e.g.
+            // "port X is disconnected" — into ERRS (:575). No severity: C's
+            // `reportError` raises none.
+            self.errs = e.message();
+        } else {
+            self.report_special_queue_timeout();
+        }
+        SpecialRan::No
     }
 
     /// The record's I/O Intr machinery, shared with its `asynRecordDevice`
@@ -2931,11 +2990,10 @@ impl AsynRecord {
                 .set_input_eos_blocking(self.option_user(), &bytes)
         };
         if let Err(e) = res {
-            // Same rule as `write_option`: a queued special request that timed out
-            // wrote nothing and runs no `getEos` fall-through (asynRecord.c:851-854).
-            if e.is_queue_timeout() {
-                self.report_special_queue_timeout();
-                return SpecialRan::No;
+            // Same rule as `write_option`: a special request that never ran wrote
+            // nothing and runs no `getEos` fall-through (asynRecord.c:851-854).
+            if e.never_ran() {
+                return self.report_special_never_ran(&e);
             }
             let which = if output { "output" } else { "input" };
             self.errs = format!("Error setting {which} eos, {}", e.message());
@@ -4148,6 +4206,17 @@ impl Record for AsynRecord {
                             }
                         };
                         if let Some((what, Err(e))) = res {
+                            // The gate refused the request, or it timed out in the
+                            // queue: `asynCallbackSpecial` never ran, so C's
+                            // `special()` reports the refusal and frees the user
+                            // (asynRecord.c:571-576) — no connect was attempted and
+                            // there is no callback tail to run. This is the arm the
+                            // waiver rules bite on: a device-addressed CNCT put to a
+                            // disconnected port is refused `asynDisconnected`
+                            // (W10-D1).
+                            if e.never_ran() {
+                                return this.report_special_never_ran(&e);
+                            }
                             this.errs = format!("asynCallbackSpecial callbackConnect {what}: {e}");
                         }
                     }
@@ -5133,9 +5202,17 @@ mod tests {
             log.lock().unwrap().option_sets.is_empty(),
             "a BAUD put on a disconnected port is asynDisconnected in C, not a driver call"
         );
+        // The refusal is `queueRequest`'s return value, so C reports
+        // `pasynUserSpecial->errorMessage` (asynRecord.c:571-576) — *not* the
+        // "Error setting option, %s" text of a `setOption` that ran (R14-46).
         assert!(
-            rec.errs.starts_with("Error setting option"),
-            "and the refusal is reported: {}",
+            rec.errs.contains("disconnected"),
+            "the gate's refusal message is what reaches ERRS: {}",
+            rec.errs
+        );
+        assert!(
+            !rec.errs.starts_with("Error setting option"),
+            "a refused put never entered setOption: {}",
             rec.errs
         );
 
@@ -6835,8 +6912,12 @@ mod tests {
         // user rides the Connect queue at the record's ADDR (0) with no
         // sentinel, and C's `checkPortConnect` waiver covers only addr == -1
         // or the sentinel (asynManager.c:1520,1536-1538) — the W10-D1 wart,
-        // reproduced by decision. The refusal lands in ERRS and monitorStatus
-        // snaps CNCT back to the wire's state.
+        // reproduced by decision. The refusal is `queueRequest`'s return value,
+        // so `asynCallbackSpecial` never runs: C reports
+        // `pasynUserSpecial->errorMessage` and frees the user
+        // (asynRecord.c:571-576), and with no callback there is no `monitorStatus`
+        // tail — CNCT keeps the value the operator typed until the next status
+        // cycle (R14-46).
         rec.cnct = 1;
         rec.special("CNCT", true).unwrap();
         assert_eq!(
@@ -6846,11 +6927,20 @@ mod tests {
              port (C checkPortConnect)"
         );
         assert!(
-            rec.errs.contains("callbackConnect connect"),
-            "the refusal reaches ERRS: {}",
+            rec.errs.contains("disconnected"),
+            "the gate's refusal message is what reaches ERRS: {}",
             rec.errs
         );
-        assert_eq!(rec.cnct, 0, "monitorStatus snaps CNCT back to the wire");
+        assert!(
+            !rec.errs.contains("callbackConnect"),
+            "a refused request never entered the callback: {}",
+            rec.errs
+        );
+        assert_eq!(
+            rec.cnct, 1,
+            "no callback ran, so no monitorStatus tail snapped CNCT back \
+             (asynRecord.c:571-576 vs :897)"
+        );
 
         // The port-level route (C `connectDevice(port, -1)`) brings the line
         // back up; CNCT reads it back on the next status cycle.
@@ -6888,6 +6978,229 @@ mod tests {
             rec.cnct, 0,
             "detached: isConnected has no device to report on (C :1091)"
         );
+    }
+
+    /// R14-46: a request the queue gate refuses never ran, and the record must
+    /// report it as a refusal — not as a callback that did something.
+    ///
+    /// C `special()` (asynRecord.c:571-576): when `queueRequest` returns non-zero
+    /// the record writes `pasynUserSpecial->errorMessage` into ERRS and frees the
+    /// user. `asynCallbackSpecial` is never dispatched, so none of the work it
+    /// implies happens — no `setOption`, no `setEos`, no `connect`, no
+    /// `getOptions`/`getEos` readback (the `/* no break */` fall-through lives
+    /// *inside* the callback, :845-849) and no `monitorStatus` tail (:897).
+    ///
+    /// The same on the process side: C `process()` (:342-361) reports the literal
+    /// `"queueRequest failed"` with `STATE_ALARM`/`MINOR_ALARM` and never enters
+    /// `performIO`, so no transfer field is published.
+    ///
+    /// One case per boundary of "did the request run?": refused-disabled,
+    /// refused-disconnected, refused-CNCT, refused-process — plus the control
+    /// that must keep the callback tail, a driver error raised *inside* a
+    /// callback that ran.
+    #[test]
+    fn a_gate_refused_request_reports_the_refusal_and_runs_no_callback() {
+        use crate::error::{AsynError, AsynStatus};
+        use crate::interrupt::InterruptManager;
+        use crate::port::{PortDriver, PortDriverBase, PortFlags};
+        use crate::port_actor::PortActor;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::mpsc;
+
+        #[derive(Default)]
+        struct Log {
+            option_sets: Vec<(String, String)>,
+            eos_sets: Vec<Vec<u8>>,
+            reads: usize,
+        }
+
+        struct GateDriver {
+            base: PortDriverBase,
+            log: Arc<Mutex<Log>>,
+            connects: Arc<AtomicUsize>,
+        }
+        impl PortDriver for GateDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn set_option(
+                &mut self,
+                _user: &mut AsynUser,
+                key: &str,
+                value: &str,
+            ) -> crate::error::AsynResult<()> {
+                self.log
+                    .lock()
+                    .unwrap()
+                    .option_sets
+                    .push((key.to_string(), value.to_string()));
+                if value == "Unknown" {
+                    return Err(AsynError::Status {
+                        status: AsynStatus::Error,
+                        message: format!("Bad {key}"),
+                    });
+                }
+                Ok(())
+            }
+            fn get_option(&self, key: &str) -> crate::error::AsynResult<String> {
+                match key {
+                    "baud" => Ok("9600".to_string()),
+                    _ => Err(AsynError::Status {
+                        status: AsynStatus::Error,
+                        message: format!("unsupported option {key}"),
+                    }),
+                }
+            }
+            fn set_input_eos(
+                &mut self,
+                _user: &AsynUser,
+                eos: &[u8],
+            ) -> crate::error::AsynResult<()> {
+                self.log.lock().unwrap().eos_sets.push(eos.to_vec());
+                Ok(())
+            }
+            fn read_octet(
+                &mut self,
+                _user: &AsynUser,
+                buf: &mut [u8],
+            ) -> crate::error::AsynResult<usize> {
+                self.log.lock().unwrap().reads += 1;
+                let data = b"hi";
+                buf[..data.len()].copy_from_slice(data);
+                Ok(data.len())
+            }
+            fn connect(&mut self, _user: &AsynUser) -> crate::error::AsynResult<()> {
+                self.connects.fetch_add(1, Ordering::SeqCst);
+                self.base.set_connected(true);
+                Ok(())
+            }
+        }
+
+        let port_name = "r14_46_gate_refusal";
+        let log = Arc::new(Mutex::new(Log::default()));
+        let connects = Arc::new(AtomicUsize::new(0));
+        let (tx, rx) = mpsc::channel(64);
+        let actor = PortActor::new(
+            Box::new(GateDriver {
+                base: PortDriverBase::new(port_name, 1, PortFlags::default()),
+                log: log.clone(),
+                connects: connects.clone(),
+            }),
+            rx,
+        );
+        let actor_id = actor.id();
+        std::thread::spawn(move || actor.run());
+        let handle = PortHandle::new(
+            tx,
+            port_name.into(),
+            Arc::new(InterruptManager::new(16)),
+            actor_id,
+        );
+        register_port(port_name, handle, Arc::new(TraceManager::new())).unwrap();
+
+        let mut rec = AsynRecord::default();
+        rec.port = port_name.to_string();
+        let _ = rec.connect_device();
+        assert_eq!(rec.baud, baud_choice_index("9600"), "the port runs at 9600");
+        let entry_handle = rec.port_entry.as_ref().unwrap().handle.clone();
+
+        // --- Control: the callback RAN and the driver refused the value. C
+        // reports "Error setting option, %s" (:1828-1830) *and* keeps the whole
+        // callback tail — the getOptions fall-through snaps BAUD back to 9600.
+        log.lock().unwrap().option_sets.clear();
+        rec.baud = 0; // menu index 0 = "Unknown"
+        rec.special("BAUD", true).unwrap();
+        assert_eq!(
+            log.lock().unwrap().option_sets,
+            vec![("baud".to_string(), "Unknown".to_string())],
+            "control: the request ran, so the driver saw the put"
+        );
+        assert_eq!(rec.errs, "Error setting option, Bad baud");
+        assert_eq!(
+            rec.baud,
+            baud_choice_index("9600"),
+            "control: the callback's readback tail ran"
+        );
+
+        // --- Boundary 1: refused because the port is DISABLED
+        // (asynManager.c:1541-1546 — no waiver reaches it).
+        entry_handle.set_enable_blocking(false).unwrap();
+        log.lock().unwrap().option_sets.clear();
+        rec.baud = baud_choice_index("19200");
+        rec.special("BAUD", true).unwrap();
+        assert!(
+            log.lock().unwrap().option_sets.is_empty(),
+            "a refused put must not reach the driver"
+        );
+        assert!(
+            rec.errs.contains("disabled"),
+            "ERRS is the gate's errorMessage (asynRecord.c:575): {}",
+            rec.errs
+        );
+        assert_eq!(
+            rec.baud,
+            baud_choice_index("19200"),
+            "no callback ran, so no getOptions readback snapped BAUD back"
+        );
+
+        // --- Boundary 2: refused process I/O on the same disabled port. C
+        // reports "queueRequest failed" with STATE/MINOR and never enters
+        // performIO (asynRecord.c:342-361).
+        rec.tmod = TransferMode::Read as i32;
+        rec.nord = 0;
+        rec.process().unwrap();
+        assert_eq!(
+            log.lock().unwrap().reads,
+            0,
+            "a refused process request must not reach the driver"
+        );
+        assert_eq!(rec.errs, "queueRequest failed");
+        assert_eq!(rec.nord, 0, "no transfer, so no NORD to publish");
+        assert_eq!(
+            read_alarm(&mut rec),
+            (alarm_status::STATE_ALARM, AlarmSeverity::Minor),
+            "C alarms the refusal STATE/MINOR (:361), not COMM/MAJOR"
+        );
+
+        // --- Boundary 3: refused because the port is DISCONNECTED
+        // (checkPortConnect, asynManager.c:1547-1552) — an EOS put carries no
+        // waiver, so it is refused with the port enabled but the line down.
+        entry_handle.set_enable_blocking(true).unwrap();
+        entry_handle.disconnect_blocking().unwrap();
+        log.lock().unwrap().eos_sets.clear();
+        rec.ieos = "\\n".to_string();
+        rec.special("IEOS", true).unwrap();
+        assert!(
+            log.lock().unwrap().eos_sets.is_empty(),
+            "a refused EOS put must not reach the driver"
+        );
+        assert!(
+            rec.errs.contains("disconnected"),
+            "ERRS is the gate's errorMessage: {}",
+            rec.errs
+        );
+
+        // --- Boundary 4: the CNCT put refused on that same disconnected port
+        // (the device-addressed W10-D1 wart). No connect is attempted, and with
+        // no callback there is no monitorStatus tail: CNCT keeps the operator's
+        // value instead of being snapped back.
+        let connects_before = connects.load(Ordering::SeqCst);
+        rec.cnct = 1;
+        rec.special("CNCT", true).unwrap();
+        assert_eq!(
+            connects.load(Ordering::SeqCst),
+            connects_before,
+            "a refused CNCT put must not touch the wire"
+        );
+        assert!(
+            rec.errs.contains("disconnected"),
+            "ERRS is the gate's errorMessage, not a callback-shaped text: {}",
+            rec.errs
+        );
+        assert_eq!(rec.cnct, 1, "no callback ran, so no monitorStatus tail");
     }
 
     /// R8-48: NAWT is what the *device* took, on both arms. C `performOctetIO`
@@ -9138,26 +9451,29 @@ mod tests {
             rec.connect_device().unwrap();
             assert_eq!(rec.enbl, 1, "{field}: the port starts enabled");
             assert_eq!(rec.cnct, 1, "{field}: …and connected");
+            assert_eq!(rec.auct, 1, "{field}: …and auto-connecting");
 
             // The port moves underneath the record — another IOC thread, an
-            // `asynEnable` from the shell, a link that dropped. Nothing has told
-            // the record.
+            // `asynAutoConnect` from the shell. Nothing has told the record.
+            //
+            // The move has to be one the queue gate tolerates: a *disabled* or
+            // *disconnected* port refuses the put at `queueRequest`, and then C
+            // runs no callback and therefore no `monitorStatus` either
+            // (asynRecord.c:571-576 — that is R14-46's boundary, asserted in
+            // `a_gate_refused_request_reports_the_refusal_and_runs_no_callback`).
+            // What this test is about is the *other* side of that line: a request
+            // that DID run must end in the tail.
             let handle = rec.port_entry.as_ref().unwrap().handle.clone();
-            handle.disconnect_blocking().unwrap();
-            handle.set_enable_blocking(false).unwrap();
+            handle.set_auto_connect_blocking(false).unwrap();
 
             // Now the operator puts the field. Whatever the arm does with it, C's
             // callback ends in `monitorStatus`.
             rec.special(field, true).unwrap();
 
             assert_eq!(
-                rec.enbl, 0,
-                "{field}: monitorStatus re-imports ENBL from isEnabled \
-                 (asynRecord.c:1094-1097) at the tail of every arm (:897)"
-            );
-            assert_eq!(
-                rec.cnct, 0,
-                "{field}: …and CNCT from isConnected (asynRecord.c:1089-1093)"
+                rec.auct, 0,
+                "{field}: monitorStatus re-imports AUCT from isAutoConnect \
+                 (asynRecord.c:1084-1088) at the tail of every arm (:897)"
             );
         }
     }

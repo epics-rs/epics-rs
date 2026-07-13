@@ -1922,10 +1922,12 @@ mod tests {
         let tx = spawn_actor(drv);
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
         let result = send_and_wait(&tx, RequestOp::Int32Read, user);
-        match result {
-            Err(AsynError::Status { status, .. }) => assert_eq!(status, AsynStatus::Disabled),
-            other => panic!("expected Disabled, got {other:?}"),
-        }
+        let err = result.unwrap_err();
+        assert!(
+            err.is_queue_refused(),
+            "the gate's refusal is a QueueRefused, not a driver error: {err:?}"
+        );
+        assert_eq!(err.status(), AsynStatus::Disabled);
     }
 
     #[test]
@@ -1940,9 +1942,13 @@ mod tests {
         let tx = spawn_actor(drv);
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
         let result = send_and_wait(&tx, RequestOp::SetEnable { yes: true }, user);
+        // Not a queue refusal: the request ran, and the *enable owner* turned it
+        // down — so it stays an `AsynError::Status`, the way C's `enable` returns
+        // `asynDisabled` from the manager call itself rather than from
+        // `queueRequest` (asynManager.c:2236-2241).
         match result {
             Err(AsynError::Status { status, .. }) => assert_eq!(status, AsynStatus::Disabled),
-            other => panic!("expected Disabled, got {other:?}"),
+            other => panic!("expected a Status(Disabled), got {other:?}"),
         }
     }
 
@@ -2007,12 +2013,9 @@ mod tests {
             let result = send_and_wait(&tx, RequestOp::Int32Read, user);
             // The port never reconnects, so each request fails Disconnected
             // (C autoConnectDevice returns FALSE => queueRequest fails).
-            match result {
-                Err(AsynError::Status { status, .. }) => {
-                    assert_eq!(status, AsynStatus::Disconnected)
-                }
-                other => panic!("expected Disconnected, got {other:?}"),
-            }
+            let err = result.unwrap_err();
+            assert!(err.is_queue_refused(), "got {err:?}");
+            assert_eq!(err.status(), AsynStatus::Disconnected);
         }
 
         // Only the first request's attempt fired; the second and third fell
@@ -2284,12 +2287,9 @@ mod tests {
             .with_addr(1)
             .with_timeout(Duration::from_secs(1));
         let result = send_and_wait(&tx, RequestOp::Int32Read, user);
-        match result {
-            Err(AsynError::Status { status, .. }) => {
-                assert_eq!(status, AsynStatus::Disconnected)
-            }
-            other => panic!("expected Disconnected, got {other:?}"),
-        }
+        let err = result.unwrap_err();
+        assert!(err.is_queue_refused(), "got {err:?}");
+        assert_eq!(err.status(), AsynStatus::Disconnected);
         assert_eq!(
             calls.lock().clone(),
             vec!["connect"],
@@ -2566,10 +2566,11 @@ mod tests {
             user,
         )
         .unwrap_err();
-        match err {
-            AsynError::Status { status, .. } => assert_eq!(status, AsynStatus::Disconnected),
-            other => panic!("expected Disconnected, got {other:?}"),
-        }
+        assert!(
+            err.is_queue_refused(),
+            "the gate's refusal is a QueueRefused, not a driver error: {err:?}"
+        );
+        assert_eq!(err.status(), AsynStatus::Disconnected);
 
         // Connect priority alone is not the waiver: the user carries addr 0, so
         // C's :1536-1538 leaves `checkPortConnect` set.
@@ -2585,10 +2586,11 @@ mod tests {
             user,
         )
         .unwrap_err();
-        match err {
-            AsynError::Status { status, .. } => assert_eq!(status, AsynStatus::Disconnected),
-            other => panic!("expected Disconnected, got {other:?}"),
-        }
+        assert!(
+            err.is_queue_refused(),
+            "the gate's refusal is a QueueRefused, not a driver error: {err:?}"
+        );
+        assert_eq!(err.status(), AsynStatus::Disconnected);
 
         // With the waiver the put reaches the driver on the dead line — the
         // operator's only route to repoint a wrong or moved host.
@@ -2840,10 +2842,11 @@ mod tests {
         // never called — the hardware is not touched.
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
         let err = send_and_wait(&tx, RequestOp::Connect, user).unwrap_err();
-        match err {
-            AsynError::Status { status, .. } => assert_eq!(status, AsynStatus::Disabled),
-            other => panic!("expected Disabled, got {other:?}"),
-        }
+        assert!(
+            err.is_queue_refused(),
+            "the gate's refusal is a QueueRefused, not a driver error: {err:?}"
+        );
+        assert_eq!(err.status(), AsynStatus::Disabled);
         assert_eq!(
             connects.load(std::sync::atomic::Ordering::SeqCst),
             0,
@@ -2864,10 +2867,11 @@ mod tests {
             user,
         )
         .unwrap_err();
-        match err {
-            AsynError::Status { status, .. } => assert_eq!(status, AsynStatus::Disabled),
-            other => panic!("expected Disabled, got {other:?}"),
-        }
+        assert!(
+            err.is_queue_refused(),
+            "the gate's refusal is a QueueRefused, not a driver error: {err:?}"
+        );
+        assert_eq!(err.status(), AsynStatus::Disabled);
 
         // The enable itself is a direct manager call in C and takes no gate…
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
@@ -2879,10 +2883,11 @@ mod tests {
         // W10-D1 wart, reproduced.
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
         let err = send_and_wait(&tx, RequestOp::Connect, user).unwrap_err();
-        match err {
-            AsynError::Status { status, .. } => assert_eq!(status, AsynStatus::Disconnected),
-            other => panic!("expected Disconnected, got {other:?}"),
-        }
+        assert!(
+            err.is_queue_refused(),
+            "the gate's refusal is a QueueRefused, not a driver error: {err:?}"
+        );
+        assert_eq!(err.status(), AsynStatus::Disconnected);
         assert_eq!(connects.load(std::sync::atomic::Ordering::SeqCst), 0);
 
         // The route that DOES bring the enabled port up is the port-level
@@ -2934,10 +2939,11 @@ mod tests {
         // Boundary 1: addr >= 0, no sentinel → refused (C checkPortConnect).
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
         let err = send_and_wait(&tx, RequestOp::Connect, user).unwrap_err();
-        match err {
-            AsynError::Status { status, .. } => assert_eq!(status, AsynStatus::Disconnected),
-            other => panic!("expected Disconnected, got {other:?}"),
-        }
+        assert!(
+            err.is_queue_refused(),
+            "the gate's refusal is a QueueRefused, not a driver error: {err:?}"
+        );
+        assert_eq!(err.status(), AsynStatus::Disconnected);
 
         // Boundary 2: addr >= 0 WITH the sentinel → waived, runs.
         let user = AsynUser::new(0)

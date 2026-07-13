@@ -1660,3 +1660,62 @@ async fn trapped_group_put_emits_per_member_astrapwrite() {
         assert_eq!(pairs[1].2, Some("ok".to_string()));
     }
 }
+
+/// R17-31 (group surface): the long-string NT choice is made by the shared
+/// owner (`pvif::nt_type_for_channel`), so a `Q:form,"String"` `DBF_CHAR`
+/// waveform member of a Q:group serves an `NTScalar<string>` — the same
+/// view the single-record channel serves, since pvxs builds group member
+/// types from the same `getChannelValueType`
+/// (groupconfigprocessor.cpp:867-974). Pre-fix the member was an
+/// `NTScalarArray<byte>`.
+#[tokio::test]
+async fn r17_31_group_scalar_member_serves_long_string() {
+    use epics_base_rs::server::records::waveform::WaveformRecord;
+    use epics_base_rs::types::DbFieldType;
+
+    const JSON: &str = r#"{
+        "TEST:grpls": {
+            "msg": { "+channel": "TEST:lstrwf.VAL", "+type": "scalar", "+putorder": 0 }
+        }
+    }"#;
+
+    let db = Arc::new(PvDatabase::new());
+    db.add_record(
+        "TEST:lstrwf",
+        Box::new(WaveformRecord::new(40, DbFieldType::Char)),
+    )
+    .await
+    .unwrap();
+    {
+        let rec = db.get_record("TEST:lstrwf").await.expect("record");
+        rec.write().await.set_info("Q:form", "String");
+    }
+    db.put_pv("TEST:lstrwf", EpicsValue::CharArray(b"hi\0".to_vec()))
+        .await
+        .expect("seed");
+
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+    provider.load_group_config(JSON).expect("load");
+    let def = provider
+        .groups()
+        .get("TEST:grpls")
+        .cloned()
+        .expect("grp registered");
+    let ch = GroupChannel::new(db.clone(), def);
+
+    let got = ch.get(&empty_request()).await.expect("get");
+    let msg = got
+        .fields
+        .iter()
+        .find(|(n, _)| n == "msg")
+        .map(|(_, v)| v)
+        .expect("msg member");
+    let value = match msg {
+        PvField::Structure(s) => s.get_field("value").cloned(),
+        other => panic!("expected an NTScalar member structure, got {other:?}"),
+    };
+    match value {
+        Some(PvField::Scalar(ScalarValue::String(s))) => assert_eq!(s, "hi"),
+        other => panic!("long-string member must serve a scalar string, got {other:?}"),
+    }
+}

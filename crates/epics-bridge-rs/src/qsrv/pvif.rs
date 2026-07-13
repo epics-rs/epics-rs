@@ -417,6 +417,64 @@ pub(crate) fn nt_type_for_field(value: Option<&EpicsValue>) -> NtType {
     }
 }
 
+/// The port's `IOCSource::getChannelValueType` (pvxs
+/// `ioc/iocsource.cpp:619-643`): the NT a channel bound to
+/// `record.field` serves, INCLUDING the long-string collapse. Single
+/// owner — the single-record channel ([`super::channel::BridgeChannel`])
+/// and the group scalar-member path ([`super::group::GroupChannel`]) both
+/// resolve their NT here, so a long-string field cannot be a string on one
+/// surface and a byte array on the other.
+///
+/// Two ways a channel is a long string, both of which pvxs decides as
+/// "final field type is `DBR_CHAR`, the field is an array, and the
+/// channel's format is `String`":
+///
+/// - The record type declares the field one (`Record::long_string_fields`
+///   — `lsi`/`lso` VAL/OVAL, `printf` VAL). These are C's `SPC_DBADDR`
+///   fields whose `cvt_dbaddr` reports a `DBF_STRING` with `field_size >
+///   MAX_STRING_SIZE+1`; pvxs re-views them as a `DBR_CHAR` array and
+///   forces `form = "String"` (`ioc/channel.cpp:52-74`).
+/// - The record carries `info(Q:form, "String")` and the field is the VAL
+///   of a `DBF_CHAR` array — the QSRV long-string idiom for a plain
+///   `waveform`/`aai` of CHAR. The info tag applies to VAL only
+///   (`dbIsValueField`, `ioc/channel.cpp:43-47`), so another field of the
+///   same record stays a byte array.
+pub(crate) fn nt_type_for_channel(
+    instance: &epics_base_rs::server::record::RecordInstance,
+    field_upper: &str,
+    resolved: Option<&EpicsValue>,
+) -> NtType {
+    if instance
+        .record
+        .long_string_fields()
+        .iter()
+        .any(|f| f.eq_ignore_ascii_case(field_upper))
+    {
+        return NtType::LongString;
+    }
+    // `DBR_CHAR` (not `DBR_UCHAR` — pvxs tests `final_field_type ==
+    // DBR_CHAR`) array VAL with the `String` form tag.
+    if field_upper.eq_ignore_ascii_case("VAL")
+        && matches!(resolved, Some(EpicsValue::CharArray(_)))
+        && instance.get_info("Q:form") == Some("String")
+    {
+        return NtType::LongString;
+    }
+    nt_type_for_field(resolved)
+}
+
+/// The port's `putLongString` (pvxs `ioc/iocsource.cpp:513-519`): the
+/// image a string PUT writes into a long-string channel's CHAR-array
+/// storage — the string's bytes plus the NUL terminator, which is what
+/// `doDbPut(pDbChannel, DBR_CHAR, str.c_str(), strlen+1)` puts. The
+/// terminator counts: it is why C's `NORD` / `LEN` after a long-string
+/// PUT is `strlen + 1`.
+pub(crate) fn long_string_put_image(s: &PvString) -> EpicsValue {
+    let mut bytes = s.as_bytes().to_vec();
+    bytes.push(0);
+    EpicsValue::CharArray(bytes)
+}
+
 // ---------------------------------------------------------------------------
 // Scalar-type classification
 // ---------------------------------------------------------------------------
@@ -706,7 +764,7 @@ pub fn snapshot_to_nt_scalar_array(snapshot: &Snapshot) -> PvStructure {
 /// byte run verbatim — pvxs serves the `DBF_CHAR` `form="String"` view as a
 /// `pvString` of the raw bytes up to NUL with no UTF-8 validation
 /// (`singlesource.cpp:189-205`), so the bytes pass through unmodified.
-fn long_string_value(value: &EpicsValue) -> PvString {
+pub(crate) fn long_string_value(value: &EpicsValue) -> PvString {
     match value {
         EpicsValue::CharArray(bytes) => {
             let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());

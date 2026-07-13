@@ -4,7 +4,7 @@ use crate::server::record::{
 };
 use crate::types::{DbFieldType, EpicsValue};
 
-use crate::calc::{CompiledExpr, StringInputs, scalc_compile, scalc_eval};
+use crate::calc::{CompiledExpr, StringInputs, scalc_compile, scalc_perform};
 
 const NUM_CHANNELS: usize = 16; // A-P
 
@@ -686,13 +686,20 @@ impl Record for TransformRecord {
                 //
                 //   return (((isnan(*presult)||isinf(*presult)) ? -1 : 0));   // :2056
                 //
-                // so a non-finite result — `1/0` → +inf, `0/0` → NaN — is a
-                // FAILURE, and `:593-596` turns it into CALC_ALARM/INVALID +
-                // udf. Base's `calcPerform` has no such check and returns 0 with
-                // the infinity in hand, which is what the port used to do:
-                // `CLCx = "1/0"` yielded `inf` with NO_ALARM. `scalc_eval` is
-                // the port's `sCalcPerform`, and it already owns the
-                // non-finite rule (`CalcError::NonFiniteResult`).
+                // so a non-finite result — `1e308*10` → +inf, `ACOS(2)` → NaN —
+                // is a FAILURE, and `:593-596` turns it into CALC_ALARM/INVALID
+                // + udf. Base's `calcPerform` has no such check and returns 0
+                // with the infinity in hand, which is what the port used to do:
+                // `CLCx = "1/0"` yielded `inf` with NO_ALARM.
+                //
+                // But the failing status does NOT cancel the write: C's epilogue
+                // stores `*presult` and only THEN returns -1, so the channel
+                // KEEPS the inf/NaN and `:594-596` alarms beside it — and the
+                // OUTx loop below fans that non-finite value out. Only the
+                // OTHER -1 (an operator refusing outright: `1/0`, `SQRT(-1)`)
+                // leaves the channel untouched, because C returns before the
+                // epilogue runs. [`ScalcResult`] carries both halves so the two
+                // cannot be confused.
                 // C `sCalcPerform(&ptran->a, 16, NULL, 0, pval, NULL, 0, ...)`
                 // (`transformRecord.c:593`): SIXTEEN numeric args — A..P, the
                 // record's channels — and ZERO string args, with a NULL `psarg` to
@@ -706,16 +713,23 @@ impl Record for TransformRecord {
                 // the `VAL` token (`FETCH_VAL`) pushes `*presult` — *this
                 // channel's* current value, not a record-wide previous VAL.
                 inputs.prev_val = self.vals[i];
-                match scalc_eval(compiled, &mut inputs) {
+                match scalc_perform(compiled, &mut inputs, self.prec) {
                     Ok(result) => {
                         // C's epilogue with `psresult == NULL`: `*presult` takes
-                        // the double, coercing a string result through `atof` —
-                        // `StackValue::to_double` is that coercion, the same one
-                        // `scalc_perform`'s epilogue uses for its `val` half.
+                        // the double, coercing a string result through `atof`.
                         // transform never consumes the SVAL half, so PREC plays
                         // no part here (C passes `ptran->prec` but a NULL
-                        // `psresult` makes it moot).
-                        self.vals[i] = result.to_double();
+                        // `psresult` makes it moot) — the `val` half is the
+                        // whole of `*presult`.
+                        //
+                        // Written FIRST, unconditionally: a non-finite result is
+                        // stored in the channel and THEN alarmed
+                        // (`transformRecord.c:593-597` keeps `*pval` = inf and
+                        // fans it through OUTx).
+                        self.vals[i] = result.val;
+                        if result.non_finite {
+                            self.calc_failed = true;
+                        }
                     }
                     Err(_) => {
                         // C `transformRecord.c:593-596`:
@@ -725,12 +739,15 @@ impl Record for TransformRecord {
                         //       ptran->udf = TRUE;
                         //   }
                         //
-                        // `*pval` is left untouched and the loop continues with
-                        // the next channel. The severity is raised by
+                        // This is the -1 an operator raised BEFORE the epilogue,
+                        // so `*pval` is left untouched and the loop continues
+                        // with the next channel. The severity is raised by
                         // `check_alarms` below (the framework's `checkAlarms`
-                        // slot) off this flag. IVLA plays no part here — it
-                        // gates the whole cycle on the INPUT severity (see the
-                        // top of `process`), never a single channel's calc.
+                        // slot) off this flag — the same flag the non-finite
+                        // status above sets, because C tests one `if` for both.
+                        // IVLA plays no part here — it gates the whole cycle on
+                        // the INPUT severity (see the top of `process`), never a
+                        // single channel's calc.
                         self.calc_failed = true;
                     }
                 }

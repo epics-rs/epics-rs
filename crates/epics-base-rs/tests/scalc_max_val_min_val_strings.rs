@@ -27,11 +27,21 @@
 //! Every expected value below is an output of the compiled upstream
 //! `sCalcPostfix.c` + `sCalcPerform.c`.
 
-use epics_base_rs::calc::{CalcError, StackValue, StringInputs, scalc};
+use epics_base_rs::calc::{
+    CalcError, StackValue, StringInputs, scalc, scalc_compile, scalc_perform,
+};
 
 fn ev(expr: &str) -> Result<StackValue, CalcError> {
     let mut inputs = StringInputs::new();
     scalc(expr, &mut inputs)
+}
+
+/// C `sCalcPerform`'s return code paired with the `*presult` it wrote — see
+/// `sCalcPerform.c:2034-2056`.
+fn perform(expr: &str) -> (f64, bool) {
+    let mut inputs = StringInputs::new();
+    let r = scalc_perform(&scalc_compile(expr).unwrap(), &mut inputs, 6).unwrap();
+    (r.val, r.non_finite)
 }
 
 fn num(expr: &str) -> f64 {
@@ -82,6 +92,10 @@ fn two_doubles_stay_numeric() {
 /// Compiled C: `NAN>?5` is a perform error (-1), while `5>?NAN` is 5.
 #[test]
 fn the_nan_rule_is_asymmetric_and_has_no_isnan_clause() {
-    assert_eq!(ev("NAN>?5"), Err(CalcError::NonFiniteResult));
+    // C: st=-1 d=nan — the NaN IS written to *presult, and the perform still
+    // fails on it.
+    let (val, non_finite) = perform("NAN>?5");
+    assert!(val.is_nan(), "C writes d=nan into *presult for NAN>?5");
+    assert!(non_finite, "C: PERFORM st=-1 for NAN>?5");
     assert_eq!(num("5>?NAN"), 5.0);
 }

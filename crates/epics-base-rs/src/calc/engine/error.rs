@@ -23,7 +23,6 @@ pub enum CalcError {
     BracketNotOpen,
     BraceNotOpen,
     DomainError,
-    NonFiniteResult,
     EmptyProgram,
     /// aCalc's polynomial fit failed — fewer than three points in the window, or a
     /// singular normal matrix (`calcUtil.c:271`, `:297`). C's `fitpoly` returns -1,
@@ -69,7 +68,6 @@ impl fmt::Display for CalcError {
             CalcError::BracketNotOpen => write!(f, "Close bracket found without open"),
             CalcError::BraceNotOpen => write!(f, "Close brace found without open"),
             CalcError::DomainError => write!(f, "Operand outside the operator's domain"),
-            CalcError::NonFiniteResult => write!(f, "Result is not a finite number"),
             CalcError::EmptyProgram => write!(f, "Empty postfix program"),
             CalcError::FitFailed => write!(f, "Polynomial fit failed"),
             CalcError::StackLeak => write!(f, "Too many results returned"),
@@ -116,8 +114,7 @@ impl CalcError {
             | CalcError::EmptyArray
             | CalcError::InvalidSubrange
             | CalcError::DomainError
-            | CalcError::FitFailed
-            | CalcError::NonFiniteResult => 11,
+            | CalcError::FitFailed => 11,
             // CALC_ERR_NULL_ARG       = 12. `EmptyProgram` is an *evaluation*
             // failure — C's `perform()` returns a bare -1 with no error code
             // (`calcPerform.c:419-420`, `sCalcPerform.c:396`,

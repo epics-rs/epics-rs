@@ -16,6 +16,7 @@
 
 use epics_base_rs::calc::{
     ArrayInputs, ArrayStackValue, NumericInputs, StackValue, StringInputs, acalc, calc, scalc,
+    scalc_compile, scalc_perform,
 };
 
 /// C `myMAXFLOAT` (`aCalcPerform.c:60`) — `((float)1e+35)` widened back to
@@ -27,6 +28,21 @@ fn s(expr: &str) -> Result<StackValue, epics_base_rs::calc::CalcError> {
     inp.num_vars[0] = 6.0; // A
     inp.num_vars[1] = 3.0; // B
     scalc(expr, &mut inp)
+}
+
+/// C `sCalcPerform`'s FULL return: the `*presult` it wrote, paired with the
+/// status. C has two different `-1`s and only this pair tells them apart —
+/// an operator that refuses returns -1 leaving `*presult` untouched (`Err`
+/// from [`scalc`] above), while a non-finite result is written FIRST and the
+/// -1 comes from the closing line (`sCalcPerform.c:2056`). R16-4: transform
+/// keeps that written value in its channel, so the port must not drop it.
+fn perform(expr: &str) -> (f64, bool) {
+    let mut inp = StringInputs::new();
+    inp.num_vars[0] = 6.0; // A
+    inp.num_vars[1] = 3.0; // B
+    let r = scalc_perform(&scalc_compile(expr).unwrap(), &mut inp, 6)
+        .expect("no operator refuses in these expressions — the -1 is the non-finite tail");
+    (r.val, r.non_finite)
 }
 
 fn a_scalar(expr: &str) -> f64 {
@@ -82,17 +98,20 @@ fn scalc_negative_sqrt_and_log_fail_the_perform() {
 /// (`sCalcPerform.c:833`, `:2056`): every operator can succeed and the perform
 /// still fails because the RESULT is not finite.
 #[test]
-fn scalc_non_finite_result_fails_the_perform() {
-    // C: `LOG(0)` -> st=-1 d=-inf. The `< 0` guard does not catch 0.
-    assert!(s("LOG(0)").is_err(), "C: PERFORM st=-1 for LOG(0)");
-    assert!(s("LOGE(0)").is_err(), "C: PERFORM st=-1 for LOGE(0)");
+fn scalc_non_finite_result_fails_the_perform_but_still_writes_the_value() {
+    // C: `LOG(0)` -> st=-1 d=-inf. The `< 0` guard does not catch 0. Both
+    // halves are C's: the cell holds -inf AND the perform failed.
+    assert_eq!(perform("LOG(0)"), (f64::NEG_INFINITY, true));
+    assert_eq!(perform("LOGE(0)"), (f64::NEG_INFINITY, true));
     // C: `1e300*1e300` -> st=-1 d=inf.
-    assert!(
-        s("1e300*1e300").is_err(),
-        "C: PERFORM st=-1 for 1e300*1e300"
-    );
+    assert_eq!(perform("1e300*1e300"), (f64::INFINITY, true));
     // C: `ACOS(2)` -> st=-1 d=nan (ACOS has no domain guard; the tail catches it).
-    assert!(s("ACOS(2)").is_err(), "C: PERFORM st=-1 for ACOS(2)");
+    let (val, non_finite) = perform("ACOS(2)");
+    assert!(val.is_nan(), "C: ACOS(2) writes d=nan");
+    assert!(non_finite, "C: PERFORM st=-1 for ACOS(2)");
+    // The healthy result carries status 0 — the tail is the ONLY thing that can
+    // fail here.
+    assert_eq!(perform("LOG(100)"), (2.0, false));
 }
 
 /// C's tail tests `*presult`, which for a STRING result is `to_double(ps)`
@@ -101,11 +120,11 @@ fn scalc_non_finite_result_fails_the_perform() {
 /// does not.
 #[test]
 fn scalc_string_result_is_atof_d_for_the_finite_test() {
-    // C: PRINTF("%s","inf") -> st=-1 d=inf s='inf'
-    assert!(
-        s(r#"PRINTF("%s","inf")"#).is_err(),
-        r#"C: PERFORM st=-1 for PRINTF("%s","inf")"#
-    );
+    // C: PRINTF("%s","inf") -> st=-1 d=inf s='inf' — the string cell keeps
+    // "inf" and the double cell its atof, and the perform still returns -1.
+    let (val, non_finite) = perform(r#"PRINTF("%s","inf")"#);
+    assert_eq!(val, f64::INFINITY, r#"C: d=inf for PRINTF("%s","inf")"#);
+    assert!(non_finite, r#"C: PERFORM st=-1 for PRINTF("%s","inf")"#);
     // C: PRINTF("%s","hello") -> st=0 d=0 s='hello'
     assert_eq!(
         s(r#"PRINTF("%s","hello")"#).unwrap(),

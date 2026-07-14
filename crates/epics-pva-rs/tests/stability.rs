@@ -51,6 +51,32 @@ struct MemState {
     values: std::collections::HashMap<String, PvField>,
 }
 
+/// Fan a value out to one PV's monitor subscribers, reaping only the dead.
+///
+/// A bounded `try_send` fails for two reasons and they are NOT the same:
+/// `Closed` (the receiver is gone — reap it) and `Full` (the subscriber is
+/// alive, it just has not drained yet). A source that treats `Full` as death
+/// — `list.retain(|tx| tx.try_send(v).is_ok())` — silently unsubscribes a
+/// live monitor the first time its channel backs up, and every later value
+/// goes nowhere.
+///
+/// So this awaits room instead of dropping, which also keeps the source
+/// LOSSLESS: the only place a value may be squashed is the server's
+/// negotiated monitor queue. That cannot deadlock, because the server's
+/// monitor pump drains this channel unconditionally — an exhausted credit
+/// window gates the EMIT, never the DRAIN (`server_native/tcp.rs`: "`rx.recv()`
+/// stays polled ... a stalled pipelined client coalesces at `limit`").
+async fn fan_out(list: &mut Vec<mpsc::Sender<PvField>>, value: &PvField) {
+    let mut live = Vec::with_capacity(list.len());
+    for tx in list.drain(..) {
+        // Err <=> receiver dropped. A full queue merely awaits room.
+        if tx.send(value.clone()).await.is_ok() {
+            live.push(tx);
+        }
+    }
+    *list = live;
+}
+
 impl MemSource {
     fn new() -> Self {
         Self {
@@ -108,7 +134,7 @@ impl MemSource {
             .insert(name.to_string(), pv.clone());
         let mut subs = self.inner.subs.lock().await;
         if let Some(list) = subs.get_mut(name) {
-            list.retain(|tx| tx.try_send(pv.clone()).is_ok());
+            fan_out(list, &pv).await;
         }
     }
 
@@ -120,10 +146,10 @@ impl MemSource {
             .await
             .values
             .insert(name.to_string(), pv.clone());
-        // Notify subscribers (drop dead).
+        // Notify subscribers (reap only the dead — see `fan_out`).
         let mut subs = self.inner.subs.lock().await;
         if let Some(list) = subs.get_mut(name) {
-            list.retain(|tx| tx.try_send(pv.clone()).is_ok());
+            fan_out(list, &pv).await;
         }
     }
 }
@@ -221,7 +247,7 @@ impl ChannelSource for MemSource {
                 .insert(name.clone(), value.clone());
             let mut subs = inner.subs.lock().await;
             if let Some(list) = subs.get_mut(&name) {
-                list.retain(|tx| tx.try_send(value.clone()).is_ok());
+                fan_out(list, &value).await;
             }
             Ok(())
         }

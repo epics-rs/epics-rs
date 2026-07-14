@@ -90,7 +90,21 @@ impl PvaPvHandle {
         // can never observe an older value than a monitor frame.
         *self.latest.lock() = Some(value.clone());
         let mut subs = self.subscribers.lock();
-        subs.retain(|tx| tx.try_send(value.clone()).is_ok());
+        // A bounded `try_send` fails for two reasons and they are NOT the
+        // same. `Closed` means the receiver is gone — reap the subscriber.
+        // `Full` means the subscriber is alive but has not drained yet;
+        // the frame is lost, the SUBSCRIPTION is not. Collapsing the two
+        // (`retain(|tx| tx.try_send(..).is_ok())`) silently unsubscribes a
+        // live monitor the first time its queue backs up, and it never
+        // receives another value. `SharedPV` already reaps on liveness
+        // alone (`shared_pv.rs`: `retain(|tx| !tx.is_closed())`, full queue
+        // → squash the tail, pvxs servermon.cpp:283-286); this is the same
+        // rule for the QSRV fan-out.
+        subs.retain(|tx| match tx.try_send(value.clone()) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => true,
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        });
         Ok(())
     }
 
@@ -1758,6 +1772,73 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "rejected post must not reach monitor subscribers"
+        );
+    }
+
+    /// Boundaries of the fan-out reap predicate in [`PvaPvHandle::post`].
+    ///
+    /// A bounded `try_send` fails on `Full` AND on `Closed`. Only `Closed`
+    /// means the subscriber is dead. The boundaries, one case each:
+    ///
+    /// - queue below capacity  → delivered, subscriber retained
+    /// - queue exactly full    → frame dropped, subscriber RETAINED
+    /// - full, then drained    → later posts still arrive (the regression:
+    ///   the old `retain(|tx| tx.try_send(v).is_ok())` evicted the live
+    ///   subscriber at the moment it filled, so it never received again)
+    /// - receiver dropped      → subscriber reaped
+    #[tokio::test]
+    async fn native_pva_full_monitor_queue_drops_the_frame_not_the_subscriber() {
+        use epics_pva_rs::pvdata::{PvField, ScalarValue};
+
+        // Descriptor-less: this test is about the fan-out, not validation.
+        let handle = PvaPvHandle::new(None);
+        let mut rx = handle.add_subscriber();
+        let cap = 64; // `add_subscriber`'s channel capacity.
+        let v = |i: i32| PvField::Scalar(ScalarValue::Int(i));
+
+        // Boundary 1: below capacity — delivered, subscriber retained.
+        handle.post(v(0)).expect("post accepted");
+        assert_eq!(handle.subscribers.lock().len(), 1, "live sub retained");
+
+        // Boundary 2: fill to exactly capacity, then post past it. The
+        // overflow frames are lost; the SUBSCRIPTION must survive.
+        for i in 1..cap {
+            handle.post(v(i)).expect("post accepted");
+        }
+        for i in cap..(cap + 10) {
+            handle
+                .post(v(i))
+                .expect("post accepted even when the queue is full");
+        }
+        assert_eq!(
+            handle.subscribers.lock().len(),
+            1,
+            "a FULL queue is backpressure, not death: the subscriber must survive"
+        );
+
+        // Boundary 3: drain, then post again — a live subscriber that once
+        // filled must still receive. This is what the old predicate broke.
+        for i in 0..cap {
+            assert_eq!(
+                rx.try_recv().ok(),
+                Some(v(i)),
+                "the queued frames are the first {cap} posts, in order"
+            );
+        }
+        assert!(rx.try_recv().is_err(), "nothing beyond capacity was queued");
+        handle.post(v(999)).expect("post accepted");
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some(v(999)),
+            "a subscriber that survived a full queue still receives after it drains"
+        );
+
+        // Boundary 4: receiver gone (Closed) — reap.
+        drop(rx);
+        handle.post(v(1000)).expect("post accepted");
+        assert!(
+            handle.subscribers.lock().is_empty(),
+            "a CLOSED receiver is the only condition that reaps a subscriber"
         );
     }
 

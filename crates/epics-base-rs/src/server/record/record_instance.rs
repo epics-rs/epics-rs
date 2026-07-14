@@ -1115,6 +1115,51 @@ impl RecordInstance {
             .get_field(&name)
             .or_else(|| self.get_common_field(&name))
             .or_else(|| self.get_virtual_field(&name))
+            .or_else(|| self.declared_default(&name))
+    }
+
+    /// The value a field that is DECLARED by the `.dbd` but has no live store
+    /// on this record serves: its `initial(...)`, or a type-zero.
+    ///
+    /// C makes *every* `.dbd` field addressable — `dbNameToAddr` resolves the
+    /// field from its `dbFldDes` and `dbGet` reads it out of record memory,
+    /// which the dbd loader seeded with `initial()` (or left zero). A Rust
+    /// record implements only the fields it has behaviour for, so a field it
+    /// declares but never touches — `aSub.OVAL`, `sub.LA`, `sel.HOPR` — had no
+    /// channel at all: [`Self::resolve_field`]'s three accessors all returned
+    /// `None` and CA create-channel answered `S_dbLib_recNotFound`.
+    ///
+    /// The declared table is the contract for *which* fields exist; this is the
+    /// last resort for the *value* of one with no runtime accessor, and it is
+    /// exactly what an unprocessed C record on an empty `.db` returns —
+    /// [`apply_dbd_initials`](crate::server::db_loader) seeds the same
+    /// `initial()` into the fields the record *does* store, from the same
+    /// generated table, so the two paths agree by construction.
+    fn declared_default(&self, name: &str) -> Option<EpicsValue> {
+        let desc = self.field_desc(name)?;
+        // A `runtime_typed` field (`VAL`/`BG`, re-typed from `FTVL`/`SDEF`) is
+        // record-owned by definition and its placeholder `dbf_type` is not what
+        // it serves; never synthesise one here — the record itself answers it.
+        if desc.runtime_typed {
+            return None;
+        }
+        let initial = desc.initial.unwrap_or("");
+        if let Some(choices) = desc
+            .menu
+            .or_else(|| self.record.menu_field_choices(name))
+            .or_else(|| super::shared_menu_choices(name))
+        {
+            // A menu field with no `initial(...)` is index 0, exactly as an
+            // empty numeric field is 0 below.
+            if initial.is_empty() {
+                return Some(EpicsValue::Enum(0));
+            }
+            return super::resolve_menu_field_string_db_load(name, choices, desc.dbf_type, initial)
+                .ok();
+        }
+        // `parse` maps an empty string to the declared type's zero, so this one
+        // call serves both `initial(...)` and no-initial fields.
+        EpicsValue::parse_bytes(desc.dbf_type, initial.as_bytes()).ok()
     }
 
     /// Resolve a field for EPICS `$` long-string (character-array) access.

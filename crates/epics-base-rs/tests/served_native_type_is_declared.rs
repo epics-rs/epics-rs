@@ -58,8 +58,29 @@ fn served_code(value: &EpicsValue) -> u16 {
     value.dbr_type().ca_wire_type()
 }
 
+/// A record instantiated the way the fixture's C IOC was.
+///
+/// The fixture header states it: the array records were probed under `NELM=10
+/// FTVL=DOUBLE`, because a `cvt_dbaddr` field's served type comes from the
+/// record's live state and there is no such thing as "the" waveform VAL type. A
+/// bare port record is NOT that instantiation — C's own bare waveform has
+/// `FTVL=STRING` (menuFtype index 0, no `initial()` in any of the four `.dbd`s;
+/// measured: `cainfo` on `record(waveform,"P:WF"){}` reports `DBF_STRING`). The
+/// port's FTVL default used to be DOUBLE, which made the bare record accidentally
+/// agree with the fixture's DOUBLE row and hid the deviation; with the default
+/// corrected, the FIXTURE'S instantiation has to be applied here or the comparison
+/// is against a record C never probed.
 fn instance(record_type: &str) -> Option<RecordInstance> {
-    let rec = create_record(record_type).ok()?;
+    let mut rec = create_record(record_type).ok()?;
+    if matches!(record_type, "waveform" | "aai" | "aao" | "subArray") {
+        // menuFtype index 10 = DOUBLE, and NELM=10 (MALM for subArray, whose
+        // buffer is the source view).
+        rec.put_field("FTVL", EpicsValue::Short(10)).ok()?;
+        rec.put_field("NELM", EpicsValue::Long(10)).ok()?;
+        if record_type == "subArray" {
+            rec.put_field("MALM", EpicsValue::Long(10)).ok()?;
+        }
+    }
     Some(RecordInstance::new_boxed(format!("T:{record_type}"), rec))
 }
 

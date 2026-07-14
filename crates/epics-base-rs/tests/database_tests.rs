@@ -4215,9 +4215,13 @@ async fn test_empty_array_into_array_field_is_a_silent_no_op() {
     use epics_base_rs::server::record::AlarmSeverity;
 
     let db = PvDatabase::new();
-    let mut wf = epics_base_rs::server::records::waveform::WaveformRecord::default();
-    wf.nelm = 4;
-    wf.ftvl = 6; // DOUBLE
+    // NELM=4, FTVL=DOUBLE. (This used to set `wf.ftvl = 6` — menuFtype index 6 is
+    // ULONG, not DOUBLE; the buffer stayed DoubleArray only because assigning the
+    // index did not retype it. `new` derives both from the element type.)
+    let wf = epics_base_rs::server::records::waveform::WaveformRecord::new(
+        4,
+        epics_base_rs::types::DbFieldType::Double,
+    );
     db.add_record("EMPTYWF", Box::new(wf)).await.unwrap();
 
     let result = db
@@ -4280,9 +4284,10 @@ async fn r6_10_multi_element_array_into_scalar_writes_element_zero() {
 #[tokio::test]
 async fn r6_10_multi_element_array_into_array_field_writes_all_elements() {
     let db = PvDatabase::new();
-    let mut wf = epics_base_rs::server::records::waveform::WaveformRecord::default();
-    wf.nelm = 4;
-    wf.ftvl = 10; // DBF_DOUBLE (waveform.rs:1443-1453 maps FTVL -> field type)
+    let wf = epics_base_rs::server::records::waveform::WaveformRecord::new(
+        4,
+        epics_base_rs::types::DbFieldType::Double,
+    );
     db.add_record("ARRWF", Box::new(wf)).await.unwrap();
 
     db.put_record_field_from_ca("ARRWF", "VAL", EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0]))
@@ -4325,9 +4330,10 @@ async fn r6_10_single_element_array_into_scalar_writes_that_element() {
 #[tokio::test]
 async fn r6_10_array_source_link_into_scalar_val_delivers_element_zero() {
     let db = PvDatabase::new();
-    let mut wf = epics_base_rs::server::records::waveform::WaveformRecord::default();
-    wf.nelm = 4;
-    wf.ftvl = 10; // DBF_DOUBLE (waveform.rs:1443-1453 maps FTVL -> field type)
+    let wf = epics_base_rs::server::records::waveform::WaveformRecord::new(
+        4,
+        epics_base_rs::types::DbFieldType::Double,
+    );
     db.add_record("LNKWF", Box::new(wf)).await.unwrap();
     db.put_pv("LNKWF.VAL", EpicsValue::DoubleArray(vec![7.0, 8.0, 9.0]))
         .await

@@ -1,5 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, ProcessOutcome, Record, dbd_generated};
+use crate::server::record::{ProcessOutcome, Record};
 use crate::server::records::count_put;
 use crate::types::{EpicsValue, PvString};
 
@@ -517,8 +517,6 @@ impl CompressRecord {
     }
 }
 
-static COMPRESS_FIELDS: &[FieldDesc] = dbd_generated::COMPRESS_FIELDS;
-
 /// Choice labels for the compression algorithm menu, in index order.
 /// C `menu(compressALG)` (`compressRecord.dbd.pod:49-55`).
 const COMPRESS_ALG_CHOICES: &[&str] = &[
@@ -798,10 +796,6 @@ impl Record for CompressRecord {
             }
             _ => Err(CaError::FieldNotFound(name.to_string())),
         }
-    }
-
-    fn field_list(&self) -> &'static [FieldDesc] {
-        COMPRESS_FIELDS
     }
 
     /// C `compressRecord.c::cvt_dbaddr` (:398-407):

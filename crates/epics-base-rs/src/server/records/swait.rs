@@ -5,10 +5,9 @@ use crate::calc::{CompiledExpr, ExprKind, eval as calc_eval};
 use crate::error::{CaError, CaResult};
 use crate::server::database::AsyncDbHandle;
 use crate::server::record::{
-    FieldDesc, InputFetchPolicy, MENU_YES_NO, ProcessAction, ProcessOutcome, Record,
-    RecordProcessResult,
+    InputFetchPolicy, MENU_YES_NO, ProcessAction, ProcessOutcome, Record, RecordProcessResult,
 };
-use crate::types::{DbFieldType, EpicsValue};
+use crate::types::EpicsValue;
 
 /// The PV-status fields, in C's `NUM_LINKS` order: the twelve inputs
 /// (`INAV`..`INLV`), then `DOLV`, then `OUTV`. C keeps the statuses in one
@@ -393,100 +392,6 @@ impl SwaitRecord {
     }
 }
 
-static SWAIT_FIELDS_SCALAR: &[FieldDesc] = &[
-    FieldDesc::new("VAL", DbFieldType::Double, false),
-    // swaitRecord.dbd:497-517 — the simulation group. None is SPC_NOMOD, so all
-    // five are writable, exactly as in C.
-    FieldDesc::new("SIML", DbFieldType::String, false),
-    FieldDesc::new("SIMM", DbFieldType::Short, false),
-    FieldDesc::new("SIOL", DbFieldType::String, false),
-    FieldDesc::new("SVAL", DbFieldType::Double, false),
-    FieldDesc::new("SIMS", DbFieldType::Short, false),
-    FieldDesc::new("CALC", DbFieldType::String, false),
-    // swaitRecord.dbd:433 — `field(CLCV,DBF_LONG)`, `interest(1)`, no
-    // `special(SPC_NOMOD)`: writable, exactly like calcout's/scalcout's.
-    FieldDesc::new("CLCV", DbFieldType::Long, false),
-    FieldDesc::new("OOPT", DbFieldType::Short, false),
-    FieldDesc::new("DOPT", DbFieldType::Short, false),
-    FieldDesc::new("DOLN", DbFieldType::String, false),
-    FieldDesc::new("DOLD", DbFieldType::Double, false),
-    FieldDesc::new("OVAL", DbFieldType::Double, true),
-    FieldDesc::new("OEVT", DbFieldType::UShort, false),
-    FieldDesc::new("ODLY", DbFieldType::Float, false),
-    // OUT and OUTN are intentionally absent: both route to RecordInstance::common.out
-    // via put_common_field so that parsed_out is populated for output dispatch.
-    // OUTN is swait's output link field name; RecordInstance handles the alias.
-    FieldDesc::new("PREC", DbFieldType::Short, false),
-    FieldDesc::new("MDEL", DbFieldType::Double, false),
-    FieldDesc::new("ADEL", DbFieldType::Double, false),
-    FieldDesc::new("A", DbFieldType::Double, false),
-    FieldDesc::new("B", DbFieldType::Double, false),
-    FieldDesc::new("C", DbFieldType::Double, false),
-    FieldDesc::new("D", DbFieldType::Double, false),
-    FieldDesc::new("E", DbFieldType::Double, false),
-    FieldDesc::new("F", DbFieldType::Double, false),
-    FieldDesc::new("G", DbFieldType::Double, false),
-    FieldDesc::new("H", DbFieldType::Double, false),
-    FieldDesc::new("I", DbFieldType::Double, false),
-    FieldDesc::new("J", DbFieldType::Double, false),
-    FieldDesc::new("K", DbFieldType::Double, false),
-    FieldDesc::new("L", DbFieldType::Double, false),
-    // LA..LL — "Last Val of Input x" (swaitRecord.dbd:298-331). Writable: the
-    // .dbd gives them no `special(SPC_NOMOD)`, unlike calcRecord's LA..LU.
-    FieldDesc::new("LA", DbFieldType::Double, false),
-    FieldDesc::new("LB", DbFieldType::Double, false),
-    FieldDesc::new("LC", DbFieldType::Double, false),
-    FieldDesc::new("LD", DbFieldType::Double, false),
-    FieldDesc::new("LE", DbFieldType::Double, false),
-    FieldDesc::new("LF", DbFieldType::Double, false),
-    FieldDesc::new("LG", DbFieldType::Double, false),
-    FieldDesc::new("LH", DbFieldType::Double, false),
-    FieldDesc::new("LI", DbFieldType::Double, false),
-    FieldDesc::new("LJ", DbFieldType::Double, false),
-    FieldDesc::new("LK", DbFieldType::Double, false),
-    FieldDesc::new("LL", DbFieldType::Double, false),
-    // INAV..INLV / DOLV / OUTV — `menu(swaitINAV)` PV status, read-only to
-    // clients (`special(SPC_NOMOD)`, swaitRecord.dbd:166-250).
-    FieldDesc::new("INAV", DbFieldType::Enum, true),
-    FieldDesc::new("INBV", DbFieldType::Enum, true),
-    FieldDesc::new("INCV", DbFieldType::Enum, true),
-    FieldDesc::new("INDV", DbFieldType::Enum, true),
-    FieldDesc::new("INEV", DbFieldType::Enum, true),
-    FieldDesc::new("INFV", DbFieldType::Enum, true),
-    FieldDesc::new("INGV", DbFieldType::Enum, true),
-    FieldDesc::new("INHV", DbFieldType::Enum, true),
-    FieldDesc::new("INIV", DbFieldType::Enum, true),
-    FieldDesc::new("INJV", DbFieldType::Enum, true),
-    FieldDesc::new("INKV", DbFieldType::Enum, true),
-    FieldDesc::new("INLV", DbFieldType::Enum, true),
-    FieldDesc::new("DOLV", DbFieldType::Enum, true),
-    FieldDesc::new("OUTV", DbFieldType::Enum, true),
-    FieldDesc::new("INAN", DbFieldType::String, false),
-    FieldDesc::new("INBN", DbFieldType::String, false),
-    FieldDesc::new("INCN", DbFieldType::String, false),
-    FieldDesc::new("INDN", DbFieldType::String, false),
-    FieldDesc::new("INEN", DbFieldType::String, false),
-    FieldDesc::new("INFN", DbFieldType::String, false),
-    FieldDesc::new("INGN", DbFieldType::String, false),
-    FieldDesc::new("INHN", DbFieldType::String, false),
-    FieldDesc::new("ININ", DbFieldType::String, false),
-    FieldDesc::new("INJN", DbFieldType::String, false),
-    FieldDesc::new("INKN", DbFieldType::String, false),
-    FieldDesc::new("INLN", DbFieldType::String, false),
-    FieldDesc::new("INAP", DbFieldType::Short, false),
-    FieldDesc::new("INBP", DbFieldType::Short, false),
-    FieldDesc::new("INCP", DbFieldType::Short, false),
-    FieldDesc::new("INDP", DbFieldType::Short, false),
-    FieldDesc::new("INEP", DbFieldType::Short, false),
-    FieldDesc::new("INFP", DbFieldType::Short, false),
-    FieldDesc::new("INGP", DbFieldType::Short, false),
-    FieldDesc::new("INHP", DbFieldType::Short, false),
-    FieldDesc::new("INIP", DbFieldType::Short, false),
-    FieldDesc::new("INJP", DbFieldType::Short, false),
-    FieldDesc::new("INKP", DbFieldType::Short, false),
-    FieldDesc::new("INLP", DbFieldType::Short, false),
-];
-
 /// Choice labels for the `swait` output-execute-option menu, in index
 /// order. C `menu(swaitOOPT)` (`swaitRecord.dbd`): the six `longoutOOPT`
 /// choices plus a trailing "Never" (index 6) that suppresses output.
@@ -508,10 +413,6 @@ const SWAIT_DOPT_CHOICES: &[&str] = &["Use VAL", "Use DOL"];
 impl Record for SwaitRecord {
     fn record_type(&self) -> &'static str {
         "swait"
-    }
-
-    fn field_list(&self) -> &'static [FieldDesc] {
-        SWAIT_FIELDS_SCALAR
     }
 
     /// Record-specific `DBF_MENU` fields, served as `DBR_ENUM` with the

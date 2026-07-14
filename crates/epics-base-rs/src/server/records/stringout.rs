@@ -1,7 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{
-    FieldDesc, MENU_POST, MENU_YES_NO, ProcessOutcome, Record, dbd_generated,
-};
+use crate::server::record::{MENU_POST, MENU_YES_NO, ProcessOutcome, Record};
 use crate::types::{EpicsValue, PvString};
 
 /// EPICS `MAX_STRING_SIZE` — `val`/`oval`/`ivov` are fixed 40-byte
@@ -84,15 +82,9 @@ impl StringoutRecord {
     }
 }
 
-static STRINGOUT_FIELDS: &[FieldDesc] = dbd_generated::STRINGOUT_FIELDS;
-
 impl Record for StringoutRecord {
     fn record_type(&self) -> &'static str {
         "stringout"
-    }
-
-    fn field_list(&self) -> &'static [FieldDesc] {
-        STRINGOUT_FIELDS
     }
 
     /// `SIMM` is `DBF_MENU menu(menuYesNo)` (`stringoutRecord.dbd.pod`): the

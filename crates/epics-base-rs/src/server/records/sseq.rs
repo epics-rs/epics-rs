@@ -6,8 +6,8 @@ use super::link_status::{
 use crate::error::{CaError, CaResult};
 use crate::server::database::AsyncDbHandle;
 use crate::server::record::{
-    CyclePostMask, FieldDesc, LinkReadAs, LinkType, OutTarget, ProcessAction, ProcessOutcome,
-    Record, RecordProcessResult, parse_link_v2,
+    CyclePostMask, LinkReadAs, LinkType, OutTarget, ProcessAction, ProcessOutcome, Record,
+    RecordProcessResult, parse_link_v2,
 };
 use crate::types::{DbFieldType, EpicsValue, PvString};
 use std::sync::Arc;
@@ -996,59 +996,6 @@ async fn reenter_now(name: &str, handle: &AsyncDbHandle) {
     }
 }
 
-/// Build the full `sseq` field table. The 7 base record fields plus the
-/// top-level `ABORTING` status, then the C "struct linkGroup" — 13 fields
-/// per step (sseqRecord.dbd) for each of the 10 steps (suffixes `1`..`9`,
-/// `A`), in DBD declaration order. `concat!` materialises each per-step
-/// field name as a `&'static str`, keeping the table a compile-time
-/// `static` while the per-step shape is generated once (no copy-paste
-/// drift across 130 entries).
-///
-/// The read-only diagnostics are all driven LIVE. `WTGn` (outstanding
-/// put-callback) and top-level `ABORTING` come from the sequence machine
-/// (C `sseqRecord.c::processCallback`/`putCallbackCB`/`special`/
-/// `asyncFinish`), posted via `post_live`. `DTn`/`LTn` (DOL/LNK link
-/// field type), `WERRn` (wait-config error) and `DOLnV`/`LNKnV` (link
-/// connection status, `menu(sseqLNKV)`) come from C `checkLinks`, posted
-/// by `refresh_link_status` (with the external-link / `WERRn` divergences
-/// documented there). `IXn` (step index) is a fixed per-step constant.
-macro_rules! sseq_fields {
-    ($($s:literal),+ $(,)?) => {
-        &[
-            FieldDesc::new("VAL", DbFieldType::Long, false),
-            // SELM is DBF_MENU menu(sseqSELM) (sseqRecord.dbd:34) — served
-            // as DBR_ENUM with the menu's choice labels (SSEQ_SELM_CHOICES).
-            FieldDesc::new("SELM", DbFieldType::Enum, false),
-            FieldDesc::new("SELN", DbFieldType::UShort, false),
-            FieldDesc::new("SELL", DbFieldType::String, false),
-            FieldDesc::new("PREC", DbFieldType::Short, false),
-            FieldDesc::new("ABORT", DbFieldType::Short, false),
-            FieldDesc::new("ABORTING", DbFieldType::Short, true),
-            FieldDesc::new("BUSY", DbFieldType::Short, true),
-            $(
-                FieldDesc::new(concat!("DLY", $s), DbFieldType::Double, false),
-                FieldDesc::new(concat!("DOL", $s), DbFieldType::String, false),
-                FieldDesc::new(concat!("DO", $s), DbFieldType::Double, false),
-                FieldDesc::new(concat!("LNK", $s), DbFieldType::String, false),
-                FieldDesc::new(concat!("STR", $s), DbFieldType::String, false),
-                FieldDesc::new(concat!("DT", $s), DbFieldType::Short, true),
-                FieldDesc::new(concat!("LT", $s), DbFieldType::Short, true),
-                // WAITn is DBF_MENU menu(sseqWAIT) — see SSEQ_WAIT_CHOICES.
-                FieldDesc::new(concat!("WAIT", $s), DbFieldType::Short, false),
-                FieldDesc::new(concat!("WERR", $s), DbFieldType::Short, true),
-                FieldDesc::new(concat!("WTG", $s), DbFieldType::Short, true),
-                FieldDesc::new(concat!("IX", $s), DbFieldType::Short, true),
-                // DOLnV / LNKnV are DBF_MENU menu(sseqLNKV) — served as
-                // DBR_ENUM with SSEQ_LNKV_CHOICES.
-                FieldDesc::new(concat!("DOL", $s, "V"), DbFieldType::Enum, true),
-                FieldDesc::new(concat!("LNK", $s, "V"), DbFieldType::Enum, true),
-            )+
-        ]
-    };
-}
-
-static SSEQ_FIELDS: &[FieldDesc] = sseq_fields!("1", "2", "3", "4", "5", "6", "7", "8", "9", "A");
-
 impl Record for SseqRecord {
     fn record_type(&self) -> &'static str {
         "sseq"
@@ -1779,10 +1726,6 @@ impl Record for SseqRecord {
         }
     }
 
-    fn field_list(&self) -> &'static [FieldDesc] {
-        SSEQ_FIELDS
-    }
-
     fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
         match field {
             "SELM" => Some(SSEQ_SELM_CHOICES),
@@ -1802,6 +1745,7 @@ impl Record for SseqRecord {
 mod tests {
     use super::super::link_status::LINK_EXT_NC as LNKV_EXT_NC;
     use super::*;
+    use crate::server::record::FieldDeclaration;
 
     #[test]
     fn test_sseq_default() {
@@ -2219,23 +2163,35 @@ mod tests {
 
     #[test]
     fn test_sseq_status_fields_read_only() {
-        // Diagnostics are SPC_NOMOD in the DBD (sseqRecord.dbd); ABORTING's
-        // live transition is machine-owned. All are read-only here. The
-        // writable control/step fields stay writable.
+        // The step diagnostics are `special(SPC_NOMOD)` in `sseqRecord.dbd`;
+        // the control and step-config fields are not.
+        //
+        // `ABORTING` used to be in the read-only set. It is not SPC_NOMOD:
+        // `sseqRecord.dbd:820-824` declares it `special(SPC_MOD)`, which is
+        // C's "writable, and call the record's `special()` on the write" — the
+        // opposite of a no-modify. Only the hand-written table said otherwise,
+        // and this test pinned the hand-written table. The declaration is the
+        // `.dbd`.
         let rec = SseqRecord::new();
         let fields = rec.field_list();
         for ro_name in [
-            "ABORTING", "DT1", "LT1", "WERR1", "WTG1", "IX1", "DOL1V", "LNK1V", "DTA", "LNKAV",
+            "DT1", "LT1", "WERR1", "WTG1", "IX1", "DOL1V", "LNK1V", "DTA", "LNKAV",
         ] {
             let f = fields
                 .iter()
                 .find(|f| f.name == ro_name)
                 .unwrap_or_else(|| panic!("{ro_name} present in field_list"));
-            assert!(f.read_only, "{ro_name} must be read-only");
+            assert!(
+                f.read_only,
+                "{ro_name} is special(SPC_NOMOD) in sseqRecord.dbd"
+            );
         }
-        for rw_name in ["VAL", "ABORT", "DLY1", "WAIT1", "LNK1", "STRA"] {
+        for rw_name in ["VAL", "ABORT", "ABORTING", "DLY1", "WAIT1", "LNK1", "STRA"] {
             let f = fields.iter().find(|f| f.name == rw_name).unwrap();
-            assert!(!f.read_only, "{rw_name} stays writable");
+            assert!(
+                !f.read_only,
+                "{rw_name} carries no special(SPC_NOMOD) in sseqRecord.dbd"
+            );
         }
     }
 

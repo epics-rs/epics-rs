@@ -406,7 +406,7 @@ impl Record for MotorRecord {
         field_access::motor_put_field(self, name, value)
     }
 
-    fn field_list(&self) -> &'static [FieldDesc] {
+    fn hand_field_list(&self) -> &'static [FieldDesc] {
         field_access::FIELDS
     }
 
@@ -631,6 +631,8 @@ impl Record for MotorRecord {
 
 #[cfg(test)]
 mod tests {
+    use epics_base_rs::server::record::FieldDeclaration;
+
     use super::*;
 
     #[test]

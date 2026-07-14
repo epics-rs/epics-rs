@@ -1,7 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{
-    FieldDesc, MENU_POST, MENU_YES_NO, ProcessOutcome, Record, dbd_generated,
-};
+use crate::server::record::{MENU_POST, MENU_YES_NO, ProcessOutcome, Record};
 use crate::types::{EpicsValue, PvString};
 
 /// EPICS `MAX_STRING_SIZE` — `val`/`oval`/`sval` are fixed 40-byte
@@ -73,15 +71,9 @@ impl StringinRecord {
     }
 }
 
-static STRINGIN_FIELDS: &[FieldDesc] = dbd_generated::STRINGIN_FIELDS;
-
 impl Record for StringinRecord {
     fn record_type(&self) -> &'static str {
         "stringin"
-    }
-
-    fn field_list(&self) -> &'static [FieldDesc] {
-        STRINGIN_FIELDS
     }
 
     /// `SIMM` is `DBF_MENU menu(menuYesNo)` (`stringinRecord.dbd.pod`): the

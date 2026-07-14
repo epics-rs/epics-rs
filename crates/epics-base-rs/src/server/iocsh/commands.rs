@@ -4,6 +4,7 @@ use super::registry::*;
 use crate::error::CaResult;
 use crate::server::database::{RecordLoad, parse_pv_name};
 use crate::server::db_loader;
+use crate::server::record::FieldDeclaration;
 use crate::types::EpicsValue;
 
 /// Register all built-in iocsh commands.

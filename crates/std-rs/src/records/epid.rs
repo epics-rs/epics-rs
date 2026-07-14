@@ -1085,7 +1085,7 @@ impl Record for EpidRecord {
         }
     }
 
-    fn field_list(&self) -> &'static [FieldDesc] {
+    fn hand_field_list(&self) -> &'static [FieldDesc] {
         FIELDS
     }
 

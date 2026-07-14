@@ -1,8 +1,7 @@
 use super::calc_compile;
 use crate::error::{CaError, CaResult};
 use crate::server::record::{
-    FieldDesc, InputFetchPolicy, OutTarget, ProcessAction, ProcessOutcome, Record,
-    RecordProcessResult, dbd_generated,
+    InputFetchPolicy, OutTarget, ProcessAction, ProcessOutcome, Record, RecordProcessResult,
 };
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
@@ -335,8 +334,6 @@ static SCALCOUT_STRING_INPUT_LINKS: &[(&str, &str)] = &[
     ("INKK", "KK"),
     ("INLL", "LL"),
 ];
-
-static SCALCOUT_FIELDS: &[FieldDesc] = dbd_generated::SCALCOUT_FIELDS;
 
 /// Choice labels for the `scalcout` output-execute-option menu, in index
 /// order. C `menu(scalcoutOOPT)` (`sCalcoutRecord.dbd`): like `calcoutOOPT`
@@ -1001,10 +998,6 @@ impl Record for ScalcoutRecord {
         } else {
             None
         }
-    }
-
-    fn field_list(&self) -> &'static [FieldDesc] {
-        SCALCOUT_FIELDS
     }
 
     /// Record-specific `DBF_MENU` fields, served as `DBR_ENUM` with the

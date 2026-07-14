@@ -336,7 +336,7 @@ impl Record for PickyReader {
         }
         self.put_field(name, value)
     }
-    fn field_list(&self) -> &'static [FieldDesc] {
+    fn hand_field_list(&self) -> &'static [FieldDesc] {
         PICKY_FIELDS
     }
 }

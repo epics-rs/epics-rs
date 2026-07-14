@@ -1273,7 +1273,7 @@ impl Record for ScalerRecord {
         }
     }
 
-    fn field_list(&self) -> &'static [FieldDesc] {
+    fn hand_field_list(&self) -> &'static [FieldDesc] {
         let fields: &Vec<FieldDesc> = &ALL_FIELDS;
         unsafe { std::slice::from_raw_parts(fields.as_ptr(), fields.len()) }
     }

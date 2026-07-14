@@ -1,6 +1,6 @@
 use super::calc_compile;
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, InputFetchPolicy, ProcessOutcome, Record, dbd_generated};
+use crate::server::record::{InputFetchPolicy, ProcessOutcome, Record};
 use crate::types::{EpicsValue, PvString};
 
 /// Calc record — evaluates CALC expression with inputs A-U.
@@ -340,8 +340,6 @@ impl CalcRecord {
         }
     }
 }
-
-static CALC_FIELDS: &[FieldDesc] = dbd_generated::CALC_FIELDS;
 
 impl Record for CalcRecord {
     fn record_type(&self) -> &'static str {
@@ -1072,10 +1070,6 @@ impl Record for CalcRecord {
             },
             _ => Err(CaError::FieldNotFound(name.to_string())),
         }
-    }
-
-    fn field_list(&self) -> &'static [FieldDesc] {
-        CALC_FIELDS
     }
 
     /// C `calcRecord.c:103`: every CONSTANT input link is loaded into its value

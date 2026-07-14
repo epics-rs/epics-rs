@@ -2,7 +2,7 @@
 //!
 //! Tests verify:
 //! - record_type() returns the correct type string
-//! - field_list() returns correct field descriptors
+//! - the derive is NOT a field-declaration source (the `.dbd` is)
 //! - get_field() retrieves typed values
 //! - put_field() sets typed values
 //! - Field type mappings (Double, String, Short, Long, Float)
@@ -12,7 +12,7 @@
 //! - Unknown field error handling
 
 use epics_base_rs::error::CaError;
-use epics_base_rs::server::record::Record;
+use epics_base_rs::server::record::{FieldDeclaration, Record};
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 use epics_macros_rs::EpicsRecord;
 
@@ -112,11 +112,20 @@ fn record_type_returns_correct_string() {
 }
 
 // ---------------------------------------------------------------------------
-// field_list()
+// The derive is not a declaration source
 // ---------------------------------------------------------------------------
 
+/// `#[derive(EpicsRecord)]` declares no field.
+///
+/// It used to emit a `field_list()` built from the Rust struct members, which
+/// named each field after its member (`HIGH_LIMIT`, `ENGINEERING_UNITS` — names
+/// no `.dbd` has) and typed it from the member's Rust type. That is how
+/// `longin.ADEL`, whose member is an `f64`, was declared `DBF_DOUBLE` where
+/// `longinRecord.dbd` declares it `DBF_LONG`: the member types the *storage*,
+/// only the `.dbd` types the *field*. A record type has exactly one
+/// declaration, and it is the `.dbd`.
 #[test]
-fn field_list_returns_all_fields() {
+fn the_derive_declares_no_fields() {
     let ai = AiRecord {
         val: 0.0,
         high_limit: 0.0,
@@ -124,12 +133,27 @@ fn field_list_returns_all_fields() {
         precision: 0,
         engineering_units: String::new(),
     };
-    let fields = ai.field_list();
-    assert_eq!(fields.len(), 5);
+    assert!(
+        Record::hand_field_list(&ai).is_empty(),
+        "the derive must not hand a record type a second declaration"
+    );
+
+    let ao = AoRecord {
+        val: 0.0,
+        some_float: 0.0,
+        some_long: 0,
+        status: 0,
+    };
+    assert!(
+        Record::hand_field_list(&ao).is_empty(),
+        "the derive must not hand a record type a second declaration"
+    );
 }
 
+/// ...and what a derived record IS declared by is the generated `.dbd` table.
+/// The struct-member names never reach the declaration.
 #[test]
-fn field_list_has_correct_names_upper_case() {
+fn a_derived_record_is_declared_by_its_dbd() {
     let ai = AiRecord {
         val: 0.0,
         high_limit: 0.0,
@@ -138,49 +162,29 @@ fn field_list_has_correct_names_upper_case() {
         engineering_units: String::new(),
     };
     let names: Vec<&str> = ai.field_list().iter().map(|f| f.name).collect();
-    assert_eq!(
-        names,
-        vec![
-            "VAL",
-            "HIGH_LIMIT",
-            "LOW_LIMIT",
-            "PRECISION",
-            "ENGINEERING_UNITS"
-        ]
-    );
-}
 
-#[test]
-fn field_list_has_correct_dbf_types() {
-    let ai = AiRecord {
-        val: 0.0,
-        high_limit: 0.0,
-        low_limit: 0.0,
-        precision: 0,
-        engineering_units: String::new(),
-    };
-    let fields = ai.field_list();
-    assert_eq!(fields[0].dbf_type, DbFieldType::Double); // VAL
-    assert_eq!(fields[1].dbf_type, DbFieldType::Double); // HIGH_LIMIT
-    assert_eq!(fields[2].dbf_type, DbFieldType::Double); // LOW_LIMIT
-    assert_eq!(fields[3].dbf_type, DbFieldType::Short); // PRECISION
-    assert_eq!(fields[4].dbf_type, DbFieldType::String); // ENGINEERING_UNITS
-}
+    // `aiRecord.dbd` fields, present because the `.dbd` declares them — not
+    // because this struct has a member of that name.
+    for declared in ["VAL", "RVAL", "EGU", "PREC", "LINR", "AOFF", "ASLO"] {
+        assert!(
+            names.contains(&declared),
+            "ai.{declared} is in aiRecord.dbd but not in the served declaration"
+        );
+    }
+    // The struct-member-derived names are gone.
+    for member in ["HIGH_LIMIT", "LOW_LIMIT", "PRECISION", "ENGINEERING_UNITS"] {
+        assert!(
+            !names.contains(&member),
+            "{member} is a Rust member name, not an aiRecord.dbd field"
+        );
+    }
 
-#[test]
-fn field_list_tracks_read_only() {
-    let ao = AoRecord {
-        val: 0.0,
-        some_float: 0.0,
-        some_long: 0,
-        status: 0,
-    };
-    let fields = ao.field_list();
-    // VAL, SOME_FLOAT, SOME_LONG are writable; STATUS is read_only
-    assert!(!fields[0].read_only); // VAL
-    assert!(!fields[1].read_only); // SOME_FLOAT
-    assert!(!fields[2].read_only); // SOME_LONG
-    assert!(fields[3].read_only); // STATUS
+    // And the served type is the `.dbd`'s. `PREC` is `DBF_SHORT` there; the
+    // struct types its `precision` member `i16`, which happens to agree — so
+    // pin a field where the two would NOT agree if the members were consulted:
+    // `EGU` is a `DBF_STRING` the struct has no member for at all.
+    let egu = ai.field_list().iter().find(|f| f.name == "EGU").unwrap();
+    assert_eq!(egu.dbf_type, DbFieldType::String);
 }
 
 // ---------------------------------------------------------------------------

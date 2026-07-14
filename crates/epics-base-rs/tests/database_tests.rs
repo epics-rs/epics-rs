@@ -2874,7 +2874,7 @@ impl Record for AsyncRecord {
             _ => Err(CaError::FieldNotFound(name.into())),
         }
     }
-    fn field_list(&self) -> &'static [FieldDesc] {
+    fn hand_field_list(&self) -> &'static [FieldDesc] {
         &[]
     }
 }
@@ -2917,7 +2917,7 @@ impl Record for AsyncOutRecord {
             _ => Err(CaError::FieldNotFound(name.into())),
         }
     }
-    fn field_list(&self) -> &'static [FieldDesc] {
+    fn hand_field_list(&self) -> &'static [FieldDesc] {
         &[]
     }
 }
@@ -3100,7 +3100,7 @@ impl Record for AsyncAlarmingRecord {
             _ => Err(CaError::FieldNotFound(name.into())),
         }
     }
-    fn field_list(&self) -> &'static [FieldDesc] {
+    fn hand_field_list(&self) -> &'static [FieldDesc] {
         &[]
     }
 }
@@ -3388,7 +3388,7 @@ async fn test_reprocess_after_continuation_bypasses_pact_guard() {
         ) -> epics_base_rs::error::CaResult<()> {
             Ok(())
         }
-        fn field_list(&self) -> &'static [FieldDesc] {
+        fn hand_field_list(&self) -> &'static [FieldDesc] {
             &[]
         }
     }
@@ -4692,7 +4692,7 @@ async fn test_udf_not_cleared_by_clears_udf_false() {
                 _ => Err(CaError::FieldNotFound(name.into())),
             }
         }
-        fn field_list(&self) -> &'static [FieldDesc] {
+        fn hand_field_list(&self) -> &'static [FieldDesc] {
             &[]
         }
         fn clears_udf(&self) -> bool {
@@ -5667,7 +5667,7 @@ impl Record for CountingTarget {
     fn put_field(&mut self, _name: &str, _value: EpicsValue) -> epics_base_rs::error::CaResult<()> {
         Ok(())
     }
-    fn field_list(&self) -> &'static [FieldDesc] {
+    fn hand_field_list(&self) -> &'static [FieldDesc] {
         COUNTING_TARGET_FIELDS
     }
 }
@@ -5759,7 +5759,7 @@ impl Record for WriteThenFlnkProducer {
     fn put_field(&mut self, _name: &str, _value: EpicsValue) -> epics_base_rs::error::CaResult<()> {
         Ok(())
     }
-    fn field_list(&self) -> &'static [FieldDesc] {
+    fn hand_field_list(&self) -> &'static [FieldDesc] {
         &[]
     }
 }

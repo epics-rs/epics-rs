@@ -1,5 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, MENU_YES_NO, ProcessOutcome, Record, dbd_generated};
+use crate::server::record::{MENU_YES_NO, ProcessOutcome, Record};
 use crate::types::EpicsValue;
 
 /// Histogram record — counts values into buckets.
@@ -187,8 +187,6 @@ impl HistogramRecord {
         self.mcnt = self.mdel + 1;
     }
 }
-
-static HISTOGRAM_FIELDS: &[FieldDesc] = dbd_generated::HISTOGRAM_FIELDS;
 
 /// Choice labels for the histogram command menu, in index order.
 /// C `menu(histogramCMD)` (`histogramRecord.dbd.pod`): 0=Read, 1=Clear,
@@ -661,10 +659,6 @@ impl Record for HistogramRecord {
         }
     }
 
-    fn field_list(&self) -> &'static [FieldDesc] {
-        HISTOGRAM_FIELDS
-    }
-
     /// `CMD` is `DBF_MENU menu(histogramCMD)` (`histogramRecord.dbd.pod`);
     /// served as `DBR_ENUM` with the Read/Clear/Start/Stop choice labels.
     /// `SIMM` is `DBF_MENU menu(menuYesNo)` (`histogramRecord.dbd.pod:258-262`),
@@ -685,6 +679,7 @@ impl Record for HistogramRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::record::dbd_generated;
     use crate::types::DbFieldType;
 
     // C `histogramRecord.dbd.pod` `field(NELM,DBF_USHORT){ initial("1") }` —
@@ -733,7 +728,7 @@ mod tests {
     fn val_is_dbf_ulong_and_promotes_to_dbr_double_on_ca() {
         let rec = HistogramRecord::new(2, 0.0, 10.0);
 
-        let val_desc = HISTOGRAM_FIELDS
+        let val_desc = dbd_generated::HISTOGRAM_FIELDS
             .iter()
             .find(|f| f.name == "VAL")
             .expect("histogram declares VAL");

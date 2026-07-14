@@ -268,20 +268,14 @@ fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
         });
     }
 
-    let field_count = field_infos.len();
-
-    // Generate field_list entries
-    let field_descs: Vec<_> = field_infos
-        .iter()
-        .map(|fi| {
-            let name_str = &fi.epics_name;
-            let dbf = dbf_type_ident(&fi.dbf_type);
-            let ro = fi.read_only;
-            quote! {
-                #krate::server::record::FieldDesc::new(#name_str, #krate::types::DbFieldType::#dbf, #ro)
-            }
-        })
-        .collect();
+    // NOTE: the derive deliberately emits NO field declaration. A record type
+    // is declared by its `.dbd` and by nothing else; the generated table in
+    // `dbd_generated` is what `FieldDeclaration::field_list` serves. Deriving
+    // the declaration from the Rust struct member instead is what typed
+    // `longin.ADEL` `DBF_DOUBLE` (the member is an `f64`) where
+    // `longinRecord.dbd` says `DBF_LONG`, and typed every `DBF_MENU` field as
+    // a bare integer with no `menu()`. The member types the *storage*; only the
+    // `.dbd` types the *field*.
 
     // Generate get_field match arms
     let get_arms: Vec<_> = field_infos
@@ -373,13 +367,6 @@ fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
 
             fn record_type(&self) -> &'static str {
                 #record_type_str
-            }
-
-            fn field_list(&self) -> &'static [#krate::server::record::FieldDesc] {
-                static FIELDS: [#krate::server::record::FieldDesc; #field_count] = [
-                    #(#field_descs),*
-                ];
-                &FIELDS
             }
 
             fn get_field(&self, name: &str) -> Option<#krate::types::EpicsValue> {
@@ -496,18 +483,6 @@ fn parse_field_attrs(field: &syn::Field) -> syn::Result<(String, bool, Option<sy
         .ok_or_else(|| syn::Error::new_spanned(field, "missing #[field(type = \"...\")]"))?;
 
     Ok((dbf_type, read_only, menu_choices))
-}
-
-fn dbf_type_ident(type_str: &str) -> proc_macro2::Ident {
-    // `PvStr` is a byte-faithful DBF_STRING storage field backed by a
-    // `PvString`; it advertises the same DBF_STRING wire type as a
-    // `String` field but preserves non-UTF-8 bytes on the value path.
-    let variant = if type_str == "PvStr" {
-        "String"
-    } else {
-        type_str
-    };
-    proc_macro2::Ident::new(variant, proc_macro2::Span::call_site())
 }
 
 fn value_to_epics(

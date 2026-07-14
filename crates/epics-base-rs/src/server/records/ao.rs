@@ -1,5 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, MENU_SIMM, ProcessOutcome, Record, dbd_generated};
+use crate::server::record::{MENU_SIMM, ProcessOutcome, Record};
 use crate::server::records::convert_phase::ConvertPhase;
 use crate::types::{EpicsValue, PvString};
 
@@ -324,8 +324,6 @@ impl AoRecord {
         self.val = value;
     }
 }
-
-static FIELDS: &[FieldDesc] = dbd_generated::AO_FIELDS;
 
 impl Record for AoRecord {
     fn record_type(&self) -> &'static str {
@@ -776,10 +774,6 @@ impl Record for AoRecord {
             },
             _ => Err(CaError::FieldNotFound(name.into())),
         }
-    }
-
-    fn field_list(&self) -> &'static [FieldDesc] {
-        FIELDS
     }
 
     /// `SIMM` is `DBF_MENU menu(menuSimm)` and `OIF` is `menu(aoOIF)`

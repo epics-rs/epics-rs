@@ -1,6 +1,6 @@
 use crate::error::{CaError, CaResult};
 use crate::server::record::{
-    FieldDesc, Ftype, MENU_FTYPE, MENU_YES_NO, ProcessAction, ProcessOutcome, Record, parse_link_v2,
+    Ftype, MENU_FTYPE, MENU_YES_NO, ProcessAction, ProcessOutcome, Record, parse_link_v2,
 };
 use crate::server::records::count_put;
 use crate::types::{DbFieldType, EpicsValue, PvString};
@@ -662,172 +662,6 @@ impl WaveformRecord {
     }
 }
 
-// Field sets for the four array kinds. One macro emits the shape the C `.dbd`
-// files share — VAL/NELM/NORD/FTVL plus the EGU/HOPR/LOPR/PREC display block —
-// and each kind passes the extra `FieldDesc`s its own `.dbd` declares. Building
-// every set from the one macro is what keeps a field from being declared for one
-// kind and silently forgotten for its siblings (the `.db` loader gates
-// `field(...)` on `field_list` membership, so an omission there is a silently
-// dropped field at load, not a compile error).
-//
-// Two shape differences in the shared part, both straight from the `.dbd.pod`s:
-//
-// `$nelm_ro` — waveform/aai/aao declare NELM `special(SPC_NOMOD)` (load-settable,
-// runtime-immutable), subArray declares it `pp(TRUE)` (runtime-writable).
-// FTVL/NORD are `special(SPC_NOMOD)` in all four.
-//
-// `$nord_ty` — NORD is `DBF_ULONG` on waveform (:465), aai (:364) and aao (:397)
-// but `DBF_LONG` on subArray (`subArrayRecord.dbd.pod:394`). C really is
-// asymmetric here, and the type is wire-visible (CA promotes DBF_ULONG to
-// DBR_DOUBLE, PVA serves it as uint32), so each kind passes its own.
-macro_rules! array_field_list {
-    ($valty:expr, $nelm_ro:expr, $nord_ty:expr $(, $extra:expr)* $(,)?) => {
-        &[
-            FieldDesc::new("VAL", $valty, false),
-                        // `DBF_ULONG` on all four (waveformRecord.dbd.pod:447,
-            // aaiRecord :349, aaoRecord :382, subArrayRecord :379).
-            FieldDesc::new("NELM", DbFieldType::ULong, $nelm_ro),
-            FieldDesc::new("NORD", $nord_ty, true),
-            FieldDesc::new("FTVL", DbFieldType::Short, true),
-            // Display/control metadata fields. Typed storage + get_field/put_field
-            // already back these; they MUST be in field_list so the db loader applies
-            // field(EGU/HOPR/LOPR/PREC, ...) to that storage rather than routing them
-            // to common fields (where the record's own get_field shadows them with
-            // defaults, zeroing DBR_GR/DBR_CTRL limits).
-            FieldDesc::new("EGU", DbFieldType::String, false),
-            FieldDesc::new("HOPR", DbFieldType::Double, false),
-            FieldDesc::new("LOPR", DbFieldType::Double, false),
-            FieldDesc::new("PREC", DbFieldType::Short, false),
-            $($extra),*
-        ]
-    };
-}
-
-// waveform/aai/aao field set: the shared shape plus the two blocks all three
-// `.dbd`s declare and subArray does not —
-//
-//  * the simulation block SIML/SIMM/SIOL/SIMS/SDLY (`aaiRecord.dbd.pod:374-415`,
-//    `aaoRecord.dbd.pod:407-448`, `waveformRecord.dbd.pod:475-516`). Membership
-//    here is what lets a `.db` configure simulation at all: `apply_fields` routes
-//    a field NOT in `field_list` to the common fields, where it is rejected
-//    (`FieldNotFound`, logged and skipped) — so `field(SIMM,"YES")` on an aai was
-//    silently dropped at load. SIMPVT is `DBF_NOACCESS` (C's callback struct) and
-//    has no port equivalent;
-//  * the posting-mode block MPST/APST (`aaiRecord.dbd.pod:422-433` etc.), read by
-//    `array_monitor_post`. Same load-time story: without membership every array
-//    record posted its full VAL every cycle whatever the `.db` asked for.
-//
-// The extra per-kind fields follow (`$extra`).
-macro_rules! array_sim_field_list {
-    ($valty:expr $(, $extra:expr)* $(,)?) => {
-        array_field_list!(
-            $valty,
-            true,
-            // waveform/aai/aao: NORD is DBF_ULONG.
-            DbFieldType::ULong,
-            FieldDesc::new("SIML", DbFieldType::String, false),
-            FieldDesc::new("SIMM", DbFieldType::Short, false),
-            FieldDesc::new("SIOL", DbFieldType::String, false),
-            FieldDesc::new("SIMS", DbFieldType::Short, false),
-            FieldDesc::new("SDLY", DbFieldType::Double, false),
-            FieldDesc::new("MPST", DbFieldType::Short, false),
-            FieldDesc::new("APST", DbFieldType::Short, false),
-            $($extra),*
-        )
-    };
-}
-
-// waveform: the common+sim shape plus the TimeSeries acquisition-control fields
-// (devAsynXXXTimeSeries) — RARM `pp(TRUE)` client-settable, BUSY
-// `special(SPC_NOMOD)` device-set. waveformRecord.dbd.pod:411,461. RARM is
-// waveform-only; BUSY is also declared by subArray (see `subarray_field_list`).
-// aai/aao declare neither.
-macro_rules! waveform_field_list {
-    ($valty:expr) => {
-        array_sim_field_list!(
-            $valty,
-            FieldDesc::new("RARM", DbFieldType::Short, false),
-            FieldDesc::new("BUSY", DbFieldType::Short, true),
-        )
-    };
-}
-
-// The field set for ONE kind, selected by the FTVL element type. `$set` is that
-// kind's field-set macro; every `menuFtype` choice gets its own static, so a
-// `field_list` can never be asked for an element type it has no set for — the
-// `match` is total over [`Ftype`] and the compiler says so.
-//
-// Before this, each kind's selector was a hand-written `match self.ftvl { 1 | 2 =>
-// .._CHAR, 3 | 4 => .._SHORT, ... _ => .._DOUBLE }` over the raw menu index, with
-// no STRING/ENUM/USHORT/ULONG arm: a `field(FTVL,"USHORT")` waveform served VAL as
-// `DBF_SHORT`, and the declared default (index 0 = STRING) landed on the DOUBLE
-// set.
-macro_rules! field_list_by_ftvl {
-    ($set:ident, $ftvl:expr) => {{
-        static STRING: &[FieldDesc] = $set!(DbFieldType::String);
-        static CHAR: &[FieldDesc] = $set!(DbFieldType::Char);
-        static UCHAR: &[FieldDesc] = $set!(DbFieldType::UChar);
-        static SHORT: &[FieldDesc] = $set!(DbFieldType::Short);
-        static USHORT: &[FieldDesc] = $set!(DbFieldType::UShort);
-        static LONG: &[FieldDesc] = $set!(DbFieldType::Long);
-        static ULONG: &[FieldDesc] = $set!(DbFieldType::ULong);
-        static INT64: &[FieldDesc] = $set!(DbFieldType::Int64);
-        static UINT64: &[FieldDesc] = $set!(DbFieldType::UInt64);
-        static FLOAT: &[FieldDesc] = $set!(DbFieldType::Float);
-        static DOUBLE: &[FieldDesc] = $set!(DbFieldType::Double);
-        static ENUM: &[FieldDesc] = $set!(DbFieldType::Enum);
-        match $ftvl {
-            Ftype::String => STRING,
-            Ftype::Char => CHAR,
-            Ftype::UChar => UCHAR,
-            Ftype::Short => SHORT,
-            Ftype::UShort => USHORT,
-            Ftype::Long => LONG,
-            Ftype::ULong => ULONG,
-            Ftype::Int64 => INT64,
-            Ftype::UInt64 => UINT64,
-            Ftype::Float => FLOAT,
-            Ftype::Double => DOUBLE,
-            Ftype::Enum => ENUM,
-        }
-    }};
-}
-
-// aao: the common+sim shape plus OMSL `menu(menuOmsl)` and DOL `DBF_INLINK`
-// (`aaoRecord.dbd.pod:355-360`) — the desired-output mode + link that none of
-// the other three array types declare.
-macro_rules! aao_field_list {
-    ($valty:expr) => {
-        array_sim_field_list!(
-            $valty,
-            FieldDesc::new("OMSL", DbFieldType::Short, false),
-            FieldDesc::new("DOL", DbFieldType::String, false),
-        )
-    };
-}
-
-// subArray: NELM is `pp(TRUE)` (runtime-writable), and MALM
-// (`special(SPC_NOMOD)`) / INDX (`pp(TRUE)`) exist. It declares NO simulation
-// block and NO MPST/APST/HASH (`subArrayRecord.dbd.pod:324-398`), so it must not
-// answer those names.
-macro_rules! subarray_field_list {
-    ($valty:expr) => {
-        array_field_list!(
-            $valty,
-            false,
-            // subArray alone declares NORD `DBF_LONG` (subArrayRecord.dbd.pod:394).
-            DbFieldType::Long,
-            // `DBF_ULONG` (subArrayRecord.dbd.pod:371).
-            FieldDesc::new("MALM", DbFieldType::ULong, true),
-            // `DBF_ULONG` (subArrayRecord.dbd.pod:385).
-            FieldDesc::new("INDX", DbFieldType::ULong, false),
-            // subArray declares BUSY too (`subArrayRecord.dbd.pod:390-393`),
-            // `special(SPC_NOMOD)` like waveform's. It has no RARM.
-            FieldDesc::new("BUSY", DbFieldType::Short, true),
-        )
-    };
-}
-
 /// `menu(menuOmsl)` index for `closed_loop` (`MENU_OMSL[1]`,
 /// `menu_choices.rs:61`). When `aao.omsl == closed_loop` the record sources
 /// VAL from DOL each cycle (C `aaoRecord.c::fetchValue`).
@@ -1353,28 +1187,6 @@ impl Record for WaveformRecord {
         }
     }
 
-    // `field_list` is keyed first by `ArrayKind`, then by FTVL element type.
-    // Each array kind selects its own field set, keyed then by FTVL element type:
-    // subArray -> `SUBARRAY_FIELDS_*` (NELM `pp(TRUE)`, plus MALM/INDX/BUSY), aao ->
-    // `AAO_FIELDS_*` (common shape + OMSL/DOL), aai -> `AAI_FIELDS_*` (bare common
-    // shape), waveform -> `WAVEFORM_FIELDS_*` (common shape + RARM/BUSY). The sets
-    // differ exactly where the C dbd does. Selecting the set by kind makes each
-    // FieldDesc `read_only`/membership kind-correct by construction, so it stays
-    // the single source the field_io runtime gate (`put_record_field_from_ca_inner`)
-    // reads — no per-kind runtime override.
-    fn field_list(&self) -> &'static [FieldDesc] {
-        match self.kind {
-            ArrayKind::SubArray => field_list_by_ftvl!(subarray_field_list, self.ftvl),
-            // aao adds OMSL/DOL to the common shape (aaoRecord.dbd.pod).
-            ArrayKind::Aao => field_list_by_ftvl!(aao_field_list, self.ftvl),
-            // aai is the bare common+sim shape — no RARM/BUSY (waveform-only) and
-            // no OMSL/DOL (aao-only) (aaiRecord.dbd.pod).
-            ArrayKind::Aai => field_list_by_ftvl!(array_sim_field_list, self.ftvl),
-            // waveform: common+sim shape + RARM/BUSY (waveformRecord.dbd.pod).
-            ArrayKind::Waveform => field_list_by_ftvl!(waveform_field_list, self.ftvl),
-        }
-    }
-
     /// aao `OMSL=closed_loop` desired-output pull. C `aaoRecord.c::fetchValue`
     /// (357-377): an aao whose `omsl == closed_loop` sources its array from
     /// `DOL` before writing. At PROCESS time C fetches only when DOL is a
@@ -1558,6 +1370,7 @@ impl Record for WaveformRecord {
 #[cfg(test)]
 mod array_kind_tests {
     use super::*;
+    use crate::server::record::FieldDeclaration;
 
     #[test]
     fn epics_mem_hash_matches_c_reference_vectors() {
@@ -2070,13 +1883,25 @@ mod array_kind_tests {
             other => panic!("FTVL=UINT64 VAL must be UInt64Array, got {other:?}"),
         }
 
-        // QSRV introspects VAL through field_list — must be UInt64.
-        let val_dbf = r
-            .field_list()
-            .iter()
-            .find(|f| f.name == "VAL")
-            .map(|f| f.dbf_type);
-        assert_eq!(val_dbf, Some(DbFieldType::UInt64));
+        // The declaration cannot answer "what type is VAL" for a waveform, and
+        // must not pretend to: `waveformRecord.dbd` gives VAL a placeholder
+        // type and `special(SPC_DBADDR)`, and C's `cvt_dbaddr` overwrites
+        // `paddr->field_type` from FTVL at name-resolution time. So the
+        // generated FieldDesc is `runtime_typed`, `declared_field_type` is
+        // `None`, and every consumer falls back to the stored value — which is
+        // the UInt64Array asserted above. (The hand-written table used to
+        // FTVL-switch the FieldDesc itself and answer `UInt64` here; that was a
+        // second declaration of VAL, contradicting the `.dbd`'s.)
+        let val = r.field_list().iter().find(|f| f.name == "VAL").unwrap();
+        assert!(
+            val.runtime_typed,
+            "waveform VAL is typed by FTVL, not by the .dbd"
+        );
+        assert_eq!(
+            crate::server::record::record_instance::declared_field_type_of(&r, "VAL"),
+            None,
+            "a runtime-typed field has no declared type to hand out"
+        );
 
         // A value above i64::MAX round-trips without precision loss.
         let big = u64::MAX - 9;
@@ -2095,12 +1920,11 @@ mod array_kind_tests {
             r2.get_field("VAL"),
             Some(EpicsValue::Int64Array(_))
         ));
-        let i64_dbf = r2
-            .field_list()
-            .iter()
-            .find(|f| f.name == "VAL")
-            .map(|f| f.dbf_type);
-        assert_eq!(i64_dbf, Some(DbFieldType::Int64));
+        assert_eq!(
+            crate::server::record::record_instance::declared_field_type_of(&r2, "VAL"),
+            None,
+            "a runtime-typed field has no declared type to hand out"
+        );
     }
 
     /// MPST/APST are `menu(waveformPOST)` served as DBR_ENUM. The base

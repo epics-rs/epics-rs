@@ -3,8 +3,7 @@ use super::link_status::{LINK_CON, LINK_STATUS_CHOICES, LinkRole, LinkStatusGen,
 use crate::error::{CaError, CaResult};
 use crate::server::database::AsyncDbHandle;
 use crate::server::record::{
-    FieldDesc, InputFetchPolicy, ProcessAction, ProcessOutcome, Record, RecordProcessResult,
-    dbd_generated,
+    InputFetchPolicy, ProcessAction, ProcessOutcome, Record, RecordProcessResult,
 };
 #[cfg(test)]
 use crate::types::DbFieldType;
@@ -434,8 +433,6 @@ impl CalcoutRecord {
         });
     }
 }
-
-static CALCOUT_FIELDS: &[FieldDesc] = dbd_generated::CALCOUT_FIELDS;
 
 /// Choice labels for the output-execute-option menu, in index order.
 /// C `menu(calcoutOOPT)` (`calcoutRecord.dbd.pod:33-39`).
@@ -1137,10 +1134,6 @@ impl Record for CalcoutRecord {
         }
     }
 
-    fn field_list(&self) -> &'static [FieldDesc] {
-        CALCOUT_FIELDS
-    }
-
     fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
         match field {
             "OOPT" => Some(CALCOUT_OOPT_CHOICES),
@@ -1340,6 +1333,7 @@ impl Record for CalcoutRecord {
 #[cfg(test)]
 mod link_status_tests {
     use super::*;
+    use crate::server::record::dbd_generated;
 
     // The link-status menu choice labels, C `menu(calcoutINAV)`
     // (calcoutRecord.dbd.pod:45-50): identical to sseqLNKV.
@@ -1420,10 +1414,10 @@ mod link_status_tests {
     #[test]
     fn link_status_fields_are_read_only_enum_in_table() {
         for name in CALCOUT_INAV_FIELDS.iter().chain(std::iter::once(&"OUTV")) {
-            let fd = CALCOUT_FIELDS
+            let fd = dbd_generated::CALCOUT_FIELDS
                 .iter()
                 .find(|f| f.name == *name)
-                .unwrap_or_else(|| panic!("{name} missing from CALCOUT_FIELDS"));
+                .unwrap_or_else(|| panic!("{name} missing from dbd_generated::CALCOUT_FIELDS"));
             assert_eq!(fd.dbf_type, DbFieldType::Enum, "{name} must be ENUM");
             assert!(fd.read_only, "{name} must be read-only (SPC_NOMOD)");
         }

@@ -21,6 +21,7 @@
 //! so CI without the C source is not blocked.
 
 use epics_base_rs::server::db_loader::{apply_fields, create_record};
+use epics_base_rs::server::record::FieldDeclaration;
 use epics_base_rs::types::EpicsValue;
 use std::path::PathBuf;
 

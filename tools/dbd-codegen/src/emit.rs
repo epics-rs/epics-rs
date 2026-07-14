@@ -422,7 +422,15 @@ fn emit_field(
     let mut s = String::new();
     // An SPC_DBADDR field's type is not in the `.dbd` — say where it came from,
     // and which field re-selects it at runtime, right at the entry.
-    if let Some(c) = cvt.get(&(record.to_string(), f.name.clone())) {
+    //
+    // A row WITH a selector is the one kind of field whose declared type is not
+    // what it is served as: C's `cvt_dbaddr` overwrites `paddr->field_type` from
+    // the selector's live value, so `dbf_type` below is only the selector's
+    // default. `runtime_typed` carries that to the runtime, which then serves
+    // the record's stored variant instead of the declaration. A row WITHOUT a
+    // selector has a fixed type that the declaration states correctly.
+    let entry = cvt.get(&(record.to_string(), f.name.clone()));
+    if let Some(c) = entry {
         match &c.selector {
             Some(sel) => writeln!(
                 s,
@@ -432,12 +440,14 @@ fn emit_field(
             None => writeln!(s, "    // {dbf} from cvt_dbaddr.types.").unwrap(),
         }
     }
+    let runtime_typed = entry.is_some_and(|c| c.selector.is_some());
     // `read_only` is `special(SPC_NOMOD)` — its own bit because it is the one
     // attribute the runtime put gate reads on every write.
     let read_only = spc == "SPC_NOMOD";
     writeln!(s, "    FieldDesc {{").unwrap();
     writeln!(s, "        name: {},", rust_str(&f.name)).unwrap();
     writeln!(s, "        dbf_type: DbFieldType::{ty},").unwrap();
+    writeln!(s, "        runtime_typed: {runtime_typed},").unwrap();
     writeln!(s, "        read_only: {read_only},").unwrap();
     writeln!(s, "        special: {special},").unwrap();
     writeln!(s, "        pp: {},", f.pp).unwrap();

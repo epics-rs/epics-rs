@@ -92,7 +92,25 @@ pub struct FieldDesc {
     /// has no type for (`ULong`/`Int64`/`UInt64` -> `DBR_DOUBLE`, `UShort` ->
     /// `DBR_LONG`, `UChar` -> `DBR_CHAR`). Do not pre-promote here: PVA serves
     /// the native width.
+    ///
+    /// This is what the field is SERVED as, on every delivery path — see
+    /// [`RecordInstance::project_to_declared_type`](super::RecordInstance::project_to_declared_type),
+    /// which projects the stored value onto it. The one exception is a
+    /// [`Self::runtime_typed`] field, where C's `cvt_dbaddr` overrides.
     pub dbf_type: DbFieldType,
+    /// C's `cvt_dbaddr` re-types this field at name-resolution time from the
+    /// record's own state — `waveform.VAL` from `FTVL`, `aSub.A` from `FTA`,
+    /// `mbbo.VAL` from `SDEF` — so the `.dbd` declaration is a placeholder
+    /// carrying only the selector's default. [`Self::dbf_type`] is therefore
+    /// NOT what such a field is served as; the record's stored variant is this
+    /// port's `cvt_dbaddr` answer, and it wins.
+    ///
+    /// A `special(SPC_DBADDR)` field whose type is nevertheless FIXED
+    /// (`compress.VAL` is always a double array, `histogram.VAL` always
+    /// `epicsUInt32`) is *not* runtime-typed: its row in `cvt_dbaddr.types`
+    /// carries no selector, so the declared type is the true one and it is
+    /// projected like any other field.
+    pub runtime_typed: bool,
     /// `special(SPC_NOMOD)` — the field is immutable for this record type. The
     /// static half of the no-modify declaration; see [`Record::field_no_mod`]
     /// for the half a record decides at runtime.
@@ -134,6 +152,10 @@ impl FieldDesc {
         Self {
             name,
             dbf_type,
+            // A hand-written table declares a plain field: the type it names is
+            // the type it is served as. The `cvt_dbaddr` records are all on the
+            // generated table, which sets this from `cvt_dbaddr.types`.
+            runtime_typed: false,
             read_only,
             special: if read_only {
                 Special::NoMod
@@ -1010,6 +1032,17 @@ pub trait Record: Send + Sync + 'static {
     /// index as [`EpicsValue::Enum`]. Default: no record-specific menu
     /// fields. The dbCommon menu fields (`SCAN`, etc.) are handled
     /// separately by the framework, not here.
+    ///
+    /// INVARIANT — answering here is a claim that the field is `DBF_MENU`, so
+    /// [`Self::field_list`] MUST declare it [`DbFieldType::Enum`]: C's
+    /// `mapDBFToDBR` serves every `DBF_MENU` as `DBR_ENUM`, and the DECLARED
+    /// type is what goes on the wire
+    /// ([`RecordInstance::project_to_declared_type`](super::RecordInstance::project_to_declared_type)).
+    /// A field with choices but a `Short` declaration is a self-contradictory
+    /// declaration: it would be served as a bare `DBR_SHORT` index while
+    /// claiming to have labels for it. `menu_choices_are_served_as_dbr_enum`
+    /// (`tests/menu_fields_serve_enum_choices.rs`) fails on any record type
+    /// that breaks it — the storage may be a short, the declaration may not.
     fn menu_field_choices(&self, _field: &str) -> Option<&'static [&'static str]> {
         None
     }

@@ -465,6 +465,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -478,6 +479,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OVAL",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -491,6 +493,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INAM",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -504,6 +507,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LFLG",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -517,6 +521,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SUBL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -530,6 +535,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SNAM",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -543,6 +549,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ONAM",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -556,6 +563,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "BRSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -569,6 +577,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PREC",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -582,6 +591,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "EFLG",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -595,6 +605,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPA",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -608,6 +619,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPB",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -621,6 +633,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPC",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -634,6 +647,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPD",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -647,6 +661,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPE",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -660,6 +675,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPF",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -673,6 +689,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPG",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -686,6 +703,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPH",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -699,6 +717,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPI",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -712,6 +731,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPJ",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -725,6 +745,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPK",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -738,6 +759,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -751,6 +773,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPM",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -764,6 +787,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPN",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -777,6 +801,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPO",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -790,6 +815,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPP",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -803,6 +829,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPQ",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -816,6 +843,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPR",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -829,6 +857,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPS",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -842,6 +871,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPT",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -855,6 +885,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPU",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -869,6 +900,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "A",
         dbf_type: DbFieldType::Double,
+        runtime_typed: true,
         read_only: false,
         special: Special::DbAddr,
         pp: false,
@@ -883,6 +915,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "B",
         dbf_type: DbFieldType::Double,
+        runtime_typed: true,
         read_only: false,
         special: Special::DbAddr,
         pp: false,
@@ -897,6 +930,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "C",
         dbf_type: DbFieldType::Double,
+        runtime_typed: true,
         read_only: false,
         special: Special::DbAddr,
         pp: false,
@@ -911,6 +945,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "D",
         dbf_type: DbFieldType::Double,
+        runtime_typed: true,
         read_only: false,
         special: Special::DbAddr,
         pp: false,
@@ -925,6 +960,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "E",
         dbf_type: DbFieldType::Double,
+        runtime_typed: true,
         read_only: false,
         special: Special::DbAddr,
         pp: false,
@@ -939,6 +975,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "F",
         dbf_type: DbFieldType::Double,
+        runtime_typed: true,
         read_only: false,
         special: Special::DbAddr,
         pp: false,
@@ -953,6 +990,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "G",
         dbf_type: DbFieldType::Double,
+        runtime_typed: true,
         read_only: false,
         special: Special::DbAddr,
         pp: false,
@@ -967,6 +1005,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "H",
         dbf_type: DbFieldType::Double,
+        runtime_typed: true,
         read_only: false,
         special: Special::DbAddr,
         pp: false,
@@ -981,6 +1020,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "I",
         dbf_type: DbFieldType::Double,
+        runtime_typed: true,
         read_only: false,
         special: Special::DbAddr,
         pp: false,
@@ -995,6 +1035,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "J",
         dbf_type: DbFieldType::Double,
+        runtime_typed: true,
         read_only: false,
         special: Special::DbAddr,
         pp: false,
@@ -1009,6 +1050,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "K",
         dbf_type: DbFieldType::Double,
+        runtime_typed: true,
         read_only: false,
         special: Special::DbAddr,
         pp: false,
@@ -1023,6 +1065,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "L",
         dbf_type: DbFieldType::Double,
+        runtime_typed: true,
         read_only: false,
         special: Special::DbAddr,
         pp: false,
@@ -1037,6 +1080,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "M",
         dbf_type: DbFieldType::Double,
+        runtime_typed: true,
         read_only: false,
         special: Special::DbAddr,
         pp: false,
@@ -1051,6 +1095,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "N",
         dbf_type: DbFieldType::Double,
+        runtime_typed: true,
         read_only: false,
         special: Special::DbAddr,
         pp: false,
@@ -1065,6 +1110,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "O",
         dbf_type: DbFieldType::Double,
+        runtime_typed: true,
         read_only: false,
         special: Special::DbAddr,
         pp: false,
@@ -1079,6 +1125,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "P",
         dbf_type: DbFieldType::Double,
+        runtime_typed: true,
         read_only: false,
         special: Special::DbAddr,
         pp: false,
@@ -1093,6 +1140,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "Q",
         dbf_type: DbFieldType::Double,
+        runtime_typed: true,
         read_only: false,
         special: Special::DbAddr,
         pp: false,
@@ -1107,6 +1155,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "R",
         dbf_type: DbFieldType::Double,
+        runtime_typed: true,
         read_only: false,
         special: Special::DbAddr,
         pp: false,
@@ -1121,6 +1170,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "S",
         dbf_type: DbFieldType::Double,
+        runtime_typed: true,
         read_only: false,
         special: Special::DbAddr,
         pp: false,
@@ -1135,6 +1185,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "T",
         dbf_type: DbFieldType::Double,
+        runtime_typed: true,
         read_only: false,
         special: Special::DbAddr,
         pp: false,
@@ -1149,6 +1200,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "U",
         dbf_type: DbFieldType::Double,
+        runtime_typed: true,
         read_only: false,
         special: Special::DbAddr,
         pp: false,
@@ -1162,6 +1214,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FTA",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1175,6 +1228,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FTB",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1188,6 +1242,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FTC",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1201,6 +1256,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FTD",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1214,6 +1270,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FTE",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1227,6 +1284,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FTF",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1240,6 +1298,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FTG",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1253,6 +1312,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FTH",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1266,6 +1326,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FTI",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1279,6 +1340,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FTJ",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1292,6 +1354,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FTK",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1305,6 +1368,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FTL",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1318,6 +1382,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FTM",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1331,6 +1396,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FTN",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1344,6 +1410,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FTO",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1357,6 +1424,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FTP",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1370,6 +1438,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FTQ",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1383,6 +1452,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FTR",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1396,6 +1466,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FTS",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1409,6 +1480,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FTT",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1422,6 +1494,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FTU",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1435,6 +1508,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NOA",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1448,6 +1522,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NOB",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1461,6 +1536,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NOC",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1474,6 +1550,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NOD",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1487,6 +1564,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NOE",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1500,6 +1578,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NOF",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1513,6 +1592,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NOG",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1526,6 +1606,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NOH",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1539,6 +1620,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NOI",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1552,6 +1634,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NOJ",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1565,6 +1648,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NOK",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1578,6 +1662,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NOL",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1591,6 +1676,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NOM",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1604,6 +1690,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NON",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1617,6 +1704,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NOO",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1630,6 +1718,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NOP",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1643,6 +1732,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NOQ",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1656,6 +1746,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NOR",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1669,6 +1760,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NOS",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1682,6 +1774,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NOT",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1695,6 +1788,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NOU",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1708,6 +1802,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NEA",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1721,6 +1816,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NEB",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1734,6 +1830,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NEC",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1747,6 +1844,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NED",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1760,6 +1858,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NEE",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1773,6 +1872,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NEF",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1786,6 +1886,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NEG",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1799,6 +1900,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NEH",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1812,6 +1914,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NEI",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1825,6 +1928,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NEJ",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1838,6 +1942,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NEK",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1851,6 +1956,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NEL",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1864,6 +1970,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NEM",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1877,6 +1984,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NEN",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1890,6 +1998,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NEO",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1903,6 +2012,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NEP",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1916,6 +2026,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NEQ",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1929,6 +2040,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NER",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1942,6 +2054,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NES",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1955,6 +2068,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NET",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1968,6 +2082,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NEU",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -1981,6 +2096,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUTA",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -1994,6 +2110,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUTB",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -2007,6 +2124,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUTC",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -2020,6 +2138,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUTD",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -2033,6 +2152,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUTE",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -2046,6 +2166,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUTF",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -2059,6 +2180,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUTG",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -2072,6 +2194,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUTH",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -2085,6 +2208,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUTI",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -2098,6 +2222,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUTJ",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -2111,6 +2236,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUTK",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -2124,6 +2250,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUTL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -2137,6 +2264,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUTM",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -2150,6 +2278,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUTN",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -2163,6 +2292,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUTO",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -2176,6 +2306,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUTP",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -2189,6 +2320,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUTQ",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -2202,6 +2334,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUTR",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -2215,6 +2348,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUTS",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -2228,6 +2362,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUTT",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -2241,6 +2376,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUTU",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -2255,6 +2391,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VALA",
         dbf_type: DbFieldType::Double,
+        runtime_typed: true,
         read_only: false,
         special: Special::DbAddr,
         pp: false,
@@ -2269,6 +2406,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VALB",
         dbf_type: DbFieldType::Double,
+        runtime_typed: true,
         read_only: false,
         special: Special::DbAddr,
         pp: false,
@@ -2283,6 +2421,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VALC",
         dbf_type: DbFieldType::Double,
+        runtime_typed: true,
         read_only: false,
         special: Special::DbAddr,
         pp: false,
@@ -2297,6 +2436,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VALD",
         dbf_type: DbFieldType::Double,
+        runtime_typed: true,
         read_only: false,
         special: Special::DbAddr,
         pp: false,
@@ -2311,6 +2451,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VALE",
         dbf_type: DbFieldType::Double,
+        runtime_typed: true,
         read_only: false,
         special: Special::DbAddr,
         pp: false,
@@ -2325,6 +2466,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VALF",
         dbf_type: DbFieldType::Double,
+        runtime_typed: true,
         read_only: false,
         special: Special::DbAddr,
         pp: false,
@@ -2339,6 +2481,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VALG",
         dbf_type: DbFieldType::Double,
+        runtime_typed: true,
         read_only: false,
         special: Special::DbAddr,
         pp: false,
@@ -2353,6 +2496,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VALH",
         dbf_type: DbFieldType::Double,
+        runtime_typed: true,
         read_only: false,
         special: Special::DbAddr,
         pp: false,
@@ -2367,6 +2511,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VALI",
         dbf_type: DbFieldType::Double,
+        runtime_typed: true,
         read_only: false,
         special: Special::DbAddr,
         pp: false,
@@ -2381,6 +2526,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VALJ",
         dbf_type: DbFieldType::Double,
+        runtime_typed: true,
         read_only: false,
         special: Special::DbAddr,
         pp: false,
@@ -2395,6 +2541,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VALK",
         dbf_type: DbFieldType::Double,
+        runtime_typed: true,
         read_only: false,
         special: Special::DbAddr,
         pp: false,
@@ -2409,6 +2556,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VALL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: true,
         read_only: false,
         special: Special::DbAddr,
         pp: false,
@@ -2423,6 +2571,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VALM",
         dbf_type: DbFieldType::Double,
+        runtime_typed: true,
         read_only: false,
         special: Special::DbAddr,
         pp: false,
@@ -2437,6 +2586,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VALN",
         dbf_type: DbFieldType::Double,
+        runtime_typed: true,
         read_only: false,
         special: Special::DbAddr,
         pp: false,
@@ -2451,6 +2601,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VALO",
         dbf_type: DbFieldType::Double,
+        runtime_typed: true,
         read_only: false,
         special: Special::DbAddr,
         pp: false,
@@ -2465,6 +2616,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VALP",
         dbf_type: DbFieldType::Double,
+        runtime_typed: true,
         read_only: false,
         special: Special::DbAddr,
         pp: false,
@@ -2479,6 +2631,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VALQ",
         dbf_type: DbFieldType::Double,
+        runtime_typed: true,
         read_only: false,
         special: Special::DbAddr,
         pp: false,
@@ -2493,6 +2646,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VALR",
         dbf_type: DbFieldType::Double,
+        runtime_typed: true,
         read_only: false,
         special: Special::DbAddr,
         pp: false,
@@ -2507,6 +2661,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VALS",
         dbf_type: DbFieldType::Double,
+        runtime_typed: true,
         read_only: false,
         special: Special::DbAddr,
         pp: false,
@@ -2521,6 +2676,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VALT",
         dbf_type: DbFieldType::Double,
+        runtime_typed: true,
         read_only: false,
         special: Special::DbAddr,
         pp: false,
@@ -2535,6 +2691,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VALU",
         dbf_type: DbFieldType::Double,
+        runtime_typed: true,
         read_only: false,
         special: Special::DbAddr,
         pp: false,
@@ -2548,6 +2705,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FTVA",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -2561,6 +2719,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FTVB",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -2574,6 +2733,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FTVC",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -2587,6 +2747,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FTVD",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -2600,6 +2761,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FTVE",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -2613,6 +2775,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FTVF",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -2626,6 +2789,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FTVG",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -2639,6 +2803,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FTVH",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -2652,6 +2817,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FTVI",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -2665,6 +2831,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FTVJ",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -2678,6 +2845,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FTVK",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -2691,6 +2859,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FTVL",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -2704,6 +2873,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FTVM",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -2717,6 +2887,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FTVN",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -2730,6 +2901,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FTVO",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -2743,6 +2915,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FTVP",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -2756,6 +2929,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FTVQ",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -2769,6 +2943,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FTVR",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -2782,6 +2957,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FTVS",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -2795,6 +2971,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FTVT",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -2808,6 +2985,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FTVU",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -2821,6 +2999,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NOVA",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -2834,6 +3013,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NOVB",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -2847,6 +3027,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NOVC",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -2860,6 +3041,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NOVD",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -2873,6 +3055,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NOVE",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -2886,6 +3069,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NOVF",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -2899,6 +3083,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NOVG",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -2912,6 +3097,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NOVH",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -2925,6 +3111,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NOVI",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -2938,6 +3125,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NOVJ",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -2951,6 +3139,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NOVK",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -2964,6 +3153,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NOVL",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -2977,6 +3167,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NOVM",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -2990,6 +3181,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NOVN",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -3003,6 +3195,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NOVO",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -3016,6 +3209,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NOVP",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -3029,6 +3223,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NOVQ",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -3042,6 +3237,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NOVR",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -3055,6 +3251,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NOVS",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -3068,6 +3265,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NOVT",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -3081,6 +3279,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NOVU",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -3094,6 +3293,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NEVA",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -3107,6 +3307,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NEVB",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -3120,6 +3321,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NEVC",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -3133,6 +3335,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NEVD",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -3146,6 +3349,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NEVE",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -3159,6 +3363,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NEVF",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -3172,6 +3377,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NEVG",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -3185,6 +3391,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NEVH",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -3198,6 +3405,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NEVI",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -3211,6 +3419,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NEVJ",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -3224,6 +3433,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NEVK",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -3237,6 +3447,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NEVL",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -3250,6 +3461,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NEVM",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -3263,6 +3475,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NEVN",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -3276,6 +3489,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NEVO",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -3289,6 +3503,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NEVP",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -3302,6 +3517,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NEVQ",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -3315,6 +3531,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NEVR",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -3328,6 +3545,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NEVS",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -3341,6 +3559,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NEVT",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -3354,6 +3573,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NEVU",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -3367,6 +3587,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ONVA",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -3380,6 +3601,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ONVB",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -3393,6 +3615,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ONVC",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -3406,6 +3629,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ONVD",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -3419,6 +3643,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ONVE",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -3432,6 +3657,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ONVF",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -3445,6 +3671,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ONVG",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -3458,6 +3685,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ONVH",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -3471,6 +3699,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ONVI",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -3484,6 +3713,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ONVJ",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -3497,6 +3727,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ONVK",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -3510,6 +3741,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ONVL",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -3523,6 +3755,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ONVM",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -3536,6 +3769,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ONVN",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -3549,6 +3783,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ONVO",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -3562,6 +3797,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ONVP",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -3575,6 +3811,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ONVQ",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -3588,6 +3825,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ONVR",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -3601,6 +3839,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ONVS",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -3614,6 +3853,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ONVT",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -3627,6 +3867,7 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ONVU",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -3645,6 +3886,7 @@ pub static AAI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: true,
         read_only: false,
         special: Special::DbAddr,
         pp: true,
@@ -3658,6 +3900,7 @@ pub static AAI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PREC",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -3671,6 +3914,7 @@ pub static AAI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INP",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -3684,6 +3928,7 @@ pub static AAI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "EGU",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -3697,6 +3942,7 @@ pub static AAI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HOPR",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -3710,6 +3956,7 @@ pub static AAI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LOPR",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -3723,6 +3970,7 @@ pub static AAI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NELM",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -3736,6 +3984,7 @@ pub static AAI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FTVL",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -3749,6 +3998,7 @@ pub static AAI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NORD",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -3762,6 +4012,7 @@ pub static AAI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIML",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -3775,6 +4026,7 @@ pub static AAI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIMM",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -3788,6 +4040,7 @@ pub static AAI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIMS",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -3801,6 +4054,7 @@ pub static AAI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIOL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -3814,6 +4068,7 @@ pub static AAI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OLDSIMM",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -3827,6 +4082,7 @@ pub static AAI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SSCN",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -3840,6 +4096,7 @@ pub static AAI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SDLY",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -3853,6 +4110,7 @@ pub static AAI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "MPST",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -3866,6 +4124,7 @@ pub static AAI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "APST",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -3879,6 +4138,7 @@ pub static AAI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HASH",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -3897,6 +4157,7 @@ pub static AAO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: true,
         read_only: false,
         special: Special::DbAddr,
         pp: true,
@@ -3910,6 +4171,7 @@ pub static AAO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PREC",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -3923,6 +4185,7 @@ pub static AAO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUT",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -3936,6 +4199,7 @@ pub static AAO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DOL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -3949,6 +4213,7 @@ pub static AAO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OMSL",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -3962,6 +4227,7 @@ pub static AAO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "EGU",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -3975,6 +4241,7 @@ pub static AAO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HOPR",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -3988,6 +4255,7 @@ pub static AAO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LOPR",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -4001,6 +4269,7 @@ pub static AAO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NELM",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -4014,6 +4283,7 @@ pub static AAO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FTVL",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -4027,6 +4297,7 @@ pub static AAO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NORD",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -4040,6 +4311,7 @@ pub static AAO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIML",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -4053,6 +4325,7 @@ pub static AAO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIMM",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -4066,6 +4339,7 @@ pub static AAO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIMS",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -4079,6 +4353,7 @@ pub static AAO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIOL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -4092,6 +4367,7 @@ pub static AAO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OLDSIMM",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -4105,6 +4381,7 @@ pub static AAO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SSCN",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -4118,6 +4395,7 @@ pub static AAO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SDLY",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -4131,6 +4409,7 @@ pub static AAO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "MPST",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -4144,6 +4423,7 @@ pub static AAO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "APST",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -4157,6 +4437,7 @@ pub static AAO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HASH",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -4174,6 +4455,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VERS",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -4187,6 +4469,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -4201,6 +4484,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "AVAL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::DbAddr,
         pp: true,
@@ -4214,6 +4498,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NELM",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -4227,6 +4512,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NUSE",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -4240,6 +4526,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PVAL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -4253,6 +4540,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CALC",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -4266,6 +4554,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CLCV",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -4279,6 +4568,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPA",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -4292,6 +4582,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPB",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -4305,6 +4596,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPC",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -4318,6 +4610,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPD",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -4331,6 +4624,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPE",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -4344,6 +4638,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPF",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -4357,6 +4652,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPG",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -4370,6 +4666,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPH",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -4383,6 +4680,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPI",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -4396,6 +4694,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPJ",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -4409,6 +4708,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPK",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -4422,6 +4722,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -4435,6 +4736,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INAA",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -4448,6 +4750,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INBB",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -4461,6 +4764,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INCC",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -4474,6 +4778,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INDD",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -4487,6 +4792,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INEE",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -4500,6 +4806,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INFF",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -4513,6 +4820,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INGG",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -4526,6 +4834,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INHH",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -4539,6 +4848,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INII",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -4552,6 +4862,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INJJ",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -4565,6 +4876,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INKK",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -4578,6 +4890,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INLL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -4591,6 +4904,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUT",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -4604,6 +4918,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INAV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -4617,6 +4932,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INBV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -4630,6 +4946,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INCV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -4643,6 +4960,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INDV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -4656,6 +4974,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INEV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -4669,6 +4988,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INFV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -4682,6 +5002,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INGV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -4695,6 +5016,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INHV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -4708,6 +5030,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INIV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -4721,6 +5044,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INJV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -4734,6 +5058,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INKV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -4747,6 +5072,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INLV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -4760,6 +5086,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IAAV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -4773,6 +5100,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IBBV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -4786,6 +5114,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ICCV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -4799,6 +5128,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IDDV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -4812,6 +5142,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IEEV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -4825,6 +5156,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IFFV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -4838,6 +5170,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IGGV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -4851,6 +5184,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IHHV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -4864,6 +5198,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IIIV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -4877,6 +5212,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IJJV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -4890,6 +5226,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IKKV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -4903,6 +5240,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ILLV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -4916,6 +5254,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUTV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -4929,6 +5268,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OOPT",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -4942,6 +5282,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ODLY",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -4955,6 +5296,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "WAIT",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -4968,6 +5310,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DLYA",
         dbf_type: DbFieldType::UShort,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -4981,6 +5324,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DOPT",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -4994,6 +5338,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OCAL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -5007,6 +5352,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OCLV",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -5020,6 +5366,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OEVT",
         dbf_type: DbFieldType::UShort,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -5033,6 +5380,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IVOA",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -5046,6 +5394,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IVOV",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -5059,6 +5408,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "EGU",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -5072,6 +5422,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PREC",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -5085,6 +5436,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HOPR",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -5098,6 +5450,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LOPR",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -5111,6 +5464,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HIHI",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -5124,6 +5478,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LOLO",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -5137,6 +5492,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HIGH",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -5150,6 +5506,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LOW",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -5163,6 +5520,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HHSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -5176,6 +5534,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LLSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -5189,6 +5548,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -5202,6 +5562,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -5215,6 +5576,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HYST",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -5228,6 +5590,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ADEL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -5241,6 +5604,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "MDEL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -5254,6 +5618,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "A",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -5267,6 +5632,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "B",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -5280,6 +5646,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "C",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -5293,6 +5660,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "D",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -5306,6 +5674,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "E",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -5319,6 +5688,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "F",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -5332,6 +5702,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "G",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -5345,6 +5716,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "H",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -5358,6 +5730,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "I",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -5371,6 +5744,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "J",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -5384,6 +5758,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "K",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -5397,6 +5772,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "L",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -5411,6 +5787,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "AA",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::DbAddr,
         pp: true,
@@ -5425,6 +5802,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "BB",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::DbAddr,
         pp: true,
@@ -5439,6 +5817,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CC",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::DbAddr,
         pp: true,
@@ -5453,6 +5832,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DD",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::DbAddr,
         pp: true,
@@ -5467,6 +5847,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "EE",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::DbAddr,
         pp: true,
@@ -5481,6 +5862,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FF",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::DbAddr,
         pp: true,
@@ -5495,6 +5877,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "GG",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::DbAddr,
         pp: true,
@@ -5509,6 +5892,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HH",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::DbAddr,
         pp: true,
@@ -5523,6 +5907,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "II",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::DbAddr,
         pp: true,
@@ -5537,6 +5922,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "JJ",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::DbAddr,
         pp: true,
@@ -5551,6 +5937,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "KK",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::DbAddr,
         pp: true,
@@ -5565,6 +5952,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::DbAddr,
         pp: true,
@@ -5578,6 +5966,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NEWM",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -5591,6 +5980,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OVAL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -5605,6 +5995,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OAV",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::DbAddr,
         pp: true,
@@ -5618,6 +6009,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PA",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -5631,6 +6023,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PB",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -5644,6 +6037,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PC",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -5657,6 +6051,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PD",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -5670,6 +6065,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PE",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -5683,6 +6079,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PF",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -5696,6 +6093,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PG",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -5709,6 +6107,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PH",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -5722,6 +6121,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PI",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -5735,6 +6135,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PJ",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -5748,6 +6149,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PK",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -5761,6 +6163,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -5774,6 +6177,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "POVL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -5787,6 +6191,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LALM",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -5800,6 +6205,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ALST",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -5813,6 +6219,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "MLST",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -5826,6 +6233,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CACT",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -5839,6 +6247,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CSTAT",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -5852,6 +6261,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "AMASK",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -5865,6 +6275,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIZE",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -5878,6 +6289,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "AMEM",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -5891,6 +6303,7 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PMEM",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -5908,6 +6321,7 @@ pub static AI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -5921,6 +6335,7 @@ pub static AI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INP",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -5934,6 +6349,7 @@ pub static AI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PREC",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -5947,6 +6363,7 @@ pub static AI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LINR",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::LinConv,
         pp: true,
@@ -5960,6 +6377,7 @@ pub static AI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "EGUF",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::LinConv,
         pp: true,
@@ -5973,6 +6391,7 @@ pub static AI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "EGUL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::LinConv,
         pp: true,
@@ -5986,6 +6405,7 @@ pub static AI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "EGU",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -5999,6 +6419,7 @@ pub static AI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HOPR",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -6012,6 +6433,7 @@ pub static AI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LOPR",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -6025,6 +6447,7 @@ pub static AI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "AOFF",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -6038,6 +6461,7 @@ pub static AI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ASLO",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -6051,6 +6475,7 @@ pub static AI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SMOO",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -6064,6 +6489,7 @@ pub static AI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HIHI",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -6077,6 +6503,7 @@ pub static AI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LOLO",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -6090,6 +6517,7 @@ pub static AI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HIGH",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -6103,6 +6531,7 @@ pub static AI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LOW",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -6116,6 +6545,7 @@ pub static AI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HHSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -6129,6 +6559,7 @@ pub static AI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LLSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -6142,6 +6573,7 @@ pub static AI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -6155,6 +6587,7 @@ pub static AI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -6168,6 +6601,7 @@ pub static AI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HYST",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -6181,6 +6615,7 @@ pub static AI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "AFTC",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -6194,6 +6629,7 @@ pub static AI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ADEL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -6207,6 +6643,7 @@ pub static AI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "MDEL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -6220,6 +6657,7 @@ pub static AI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LALM",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -6233,6 +6671,7 @@ pub static AI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "AFVL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -6246,6 +6685,7 @@ pub static AI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ALST",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -6259,6 +6699,7 @@ pub static AI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "MLST",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -6272,6 +6713,7 @@ pub static AI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ESLO",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -6285,6 +6727,7 @@ pub static AI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "EOFF",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -6298,6 +6741,7 @@ pub static AI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ROFF",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -6311,6 +6755,7 @@ pub static AI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INIT",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -6324,6 +6769,7 @@ pub static AI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LBRK",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -6337,6 +6783,7 @@ pub static AI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "RVAL",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -6350,6 +6797,7 @@ pub static AI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ORAW",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -6363,6 +6811,7 @@ pub static AI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIOL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -6376,6 +6825,7 @@ pub static AI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SVAL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -6389,6 +6839,7 @@ pub static AI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIML",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -6402,6 +6853,7 @@ pub static AI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIMM",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -6415,6 +6867,7 @@ pub static AI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIMS",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -6428,6 +6881,7 @@ pub static AI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OLDSIMM",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -6441,6 +6895,7 @@ pub static AI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SSCN",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -6454,6 +6909,7 @@ pub static AI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SDLY",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -6471,6 +6927,7 @@ pub static AO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -6484,6 +6941,7 @@ pub static AO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OVAL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -6497,6 +6955,7 @@ pub static AO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUT",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -6510,6 +6969,7 @@ pub static AO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OROC",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -6523,6 +6983,7 @@ pub static AO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DOL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -6536,6 +6997,7 @@ pub static AO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OMSL",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -6549,6 +7011,7 @@ pub static AO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OIF",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -6562,6 +7025,7 @@ pub static AO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PREC",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -6575,6 +7039,7 @@ pub static AO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LINR",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::LinConv,
         pp: true,
@@ -6588,6 +7053,7 @@ pub static AO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "EGUF",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::LinConv,
         pp: true,
@@ -6601,6 +7067,7 @@ pub static AO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "EGUL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::LinConv,
         pp: true,
@@ -6614,6 +7081,7 @@ pub static AO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "EGU",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -6627,6 +7095,7 @@ pub static AO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ROFF",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -6640,6 +7109,7 @@ pub static AO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "EOFF",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -6653,6 +7123,7 @@ pub static AO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ESLO",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -6666,6 +7137,7 @@ pub static AO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DRVH",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -6679,6 +7151,7 @@ pub static AO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DRVL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -6692,6 +7165,7 @@ pub static AO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HOPR",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -6705,6 +7179,7 @@ pub static AO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LOPR",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -6718,6 +7193,7 @@ pub static AO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "AOFF",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -6731,6 +7207,7 @@ pub static AO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ASLO",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -6744,6 +7221,7 @@ pub static AO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HIHI",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -6757,6 +7235,7 @@ pub static AO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LOLO",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -6770,6 +7249,7 @@ pub static AO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HIGH",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -6783,6 +7263,7 @@ pub static AO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LOW",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -6796,6 +7277,7 @@ pub static AO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HHSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -6809,6 +7291,7 @@ pub static AO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LLSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -6822,6 +7305,7 @@ pub static AO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -6835,6 +7319,7 @@ pub static AO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -6848,6 +7333,7 @@ pub static AO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HYST",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -6861,6 +7347,7 @@ pub static AO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ADEL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -6874,6 +7361,7 @@ pub static AO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "MDEL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -6887,6 +7375,7 @@ pub static AO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "RVAL",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -6900,6 +7389,7 @@ pub static AO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ORAW",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -6913,6 +7403,7 @@ pub static AO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "RBV",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -6926,6 +7417,7 @@ pub static AO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ORBV",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -6939,6 +7431,7 @@ pub static AO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PVAL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -6952,6 +7445,7 @@ pub static AO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LALM",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -6965,6 +7459,7 @@ pub static AO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ALST",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -6978,6 +7473,7 @@ pub static AO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "MLST",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -6991,6 +7487,7 @@ pub static AO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INIT",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -7004,6 +7501,7 @@ pub static AO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LBRK",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -7017,6 +7515,7 @@ pub static AO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIOL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -7030,6 +7529,7 @@ pub static AO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIML",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -7043,6 +7543,7 @@ pub static AO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIMM",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -7056,6 +7557,7 @@ pub static AO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIMS",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -7069,6 +7571,7 @@ pub static AO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OLDSIMM",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -7082,6 +7585,7 @@ pub static AO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SSCN",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -7095,6 +7599,7 @@ pub static AO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SDLY",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -7108,6 +7613,7 @@ pub static AO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IVOA",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -7121,6 +7627,7 @@ pub static AO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IVOV",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -7134,6 +7641,7 @@ pub static AO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OMOD",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -7151,6 +7659,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -7164,6 +7673,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PORT",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -7177,6 +7687,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ADDR",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -7190,6 +7701,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PCNCT",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -7203,6 +7715,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DRVINFO",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -7216,6 +7729,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "REASON",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -7229,6 +7743,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "TMOD",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -7242,6 +7757,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "TMOT",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -7255,6 +7771,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IFACE",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -7268,6 +7785,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OCTETIV",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -7281,6 +7799,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OPTIONIV",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -7294,6 +7813,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "GPIBIV",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -7307,6 +7827,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "I32IV",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -7320,6 +7841,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "UI32IV",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -7333,6 +7855,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "F64IV",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -7346,6 +7869,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "AOUT",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -7359,6 +7883,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OEOS",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -7373,6 +7898,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "BOUT",
         dbf_type: DbFieldType::Char,
+        runtime_typed: false,
         read_only: false,
         special: Special::DbAddr,
         pp: true,
@@ -7386,6 +7912,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OMAX",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -7399,6 +7926,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NOWT",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -7412,6 +7940,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NAWT",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -7425,6 +7954,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OFMT",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -7438,6 +7968,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "AINP",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -7451,6 +7982,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "TINP",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -7464,6 +7996,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IEOS",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -7478,6 +8011,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "BINP",
         dbf_type: DbFieldType::Char,
+        runtime_typed: false,
         read_only: false,
         special: Special::DbAddr,
         pp: false,
@@ -7491,6 +8025,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IMAX",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -7504,6 +8039,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NRRD",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -7517,6 +8053,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NORD",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -7530,6 +8067,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IFMT",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -7543,6 +8081,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "EOMR",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -7556,6 +8095,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "I32INP",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -7569,6 +8109,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "I32OUT",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -7582,6 +8123,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "UI32INP",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -7595,6 +8137,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "UI32OUT",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -7608,6 +8151,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "UI32MASK",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -7621,6 +8165,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "F64INP",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -7634,6 +8179,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "F64OUT",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -7647,6 +8193,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "BAUD",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -7660,6 +8207,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LBAUD",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -7673,6 +8221,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PRTY",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -7686,6 +8235,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DBIT",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -7699,6 +8249,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SBIT",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -7712,6 +8263,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "MCTL",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -7725,6 +8277,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FCTL",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -7738,6 +8291,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IXON",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -7751,6 +8305,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IXOFF",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -7764,6 +8319,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IXANY",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -7777,6 +8333,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HOSTINFO",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -7790,6 +8347,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DRTO",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -7803,6 +8361,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "UCMD",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -7816,6 +8375,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ACMD",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -7829,6 +8389,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SPR",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -7842,6 +8403,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "TMSK",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -7855,6 +8417,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "TB0",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -7868,6 +8431,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "TB1",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -7881,6 +8445,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "TB2",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -7894,6 +8459,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "TB3",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -7907,6 +8473,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "TB4",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -7920,6 +8487,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "TB5",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -7933,6 +8501,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "TIOM",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -7946,6 +8515,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "TIB0",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -7959,6 +8529,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "TIB1",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -7972,6 +8543,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "TIB2",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -7985,6 +8557,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "TINM",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -7998,6 +8571,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "TINB0",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -8011,6 +8585,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "TINB1",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -8024,6 +8599,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "TINB2",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -8037,6 +8613,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "TINB3",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -8050,6 +8627,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "TSIZ",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -8063,6 +8641,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "TFIL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -8076,6 +8655,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "AUCT",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -8089,6 +8669,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CNCT",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -8102,6 +8683,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ENBL",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -8116,6 +8698,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ERRS",
         dbf_type: DbFieldType::Char,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -8129,6 +8712,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "AQR",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -8146,6 +8730,7 @@ pub static BI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INP",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -8159,6 +8744,7 @@ pub static BI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -8172,6 +8758,7 @@ pub static BI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ZSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -8185,6 +8772,7 @@ pub static BI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -8198,6 +8786,7 @@ pub static BI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "COSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -8211,6 +8800,7 @@ pub static BI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ZNAM",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -8224,6 +8814,7 @@ pub static BI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ONAM",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -8237,6 +8828,7 @@ pub static BI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "RVAL",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -8250,6 +8842,7 @@ pub static BI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ORAW",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -8263,6 +8856,7 @@ pub static BI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "MASK",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -8276,6 +8870,7 @@ pub static BI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LALM",
         dbf_type: DbFieldType::UShort,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -8289,6 +8884,7 @@ pub static BI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "MLST",
         dbf_type: DbFieldType::UShort,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -8302,6 +8898,7 @@ pub static BI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIOL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -8315,6 +8912,7 @@ pub static BI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SVAL",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -8328,6 +8926,7 @@ pub static BI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIML",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -8341,6 +8940,7 @@ pub static BI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIMM",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -8354,6 +8954,7 @@ pub static BI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIMS",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -8367,6 +8968,7 @@ pub static BI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OLDSIMM",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -8380,6 +8982,7 @@ pub static BI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SSCN",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -8393,6 +8996,7 @@ pub static BI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SDLY",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -8410,6 +9014,7 @@ pub static BO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -8423,6 +9028,7 @@ pub static BO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OMSL",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -8436,6 +9042,7 @@ pub static BO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DOL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -8449,6 +9056,7 @@ pub static BO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUT",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -8462,6 +9070,7 @@ pub static BO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HIGH",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -8475,6 +9084,7 @@ pub static BO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ZNAM",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -8488,6 +9098,7 @@ pub static BO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ONAM",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -8501,6 +9112,7 @@ pub static BO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "RVAL",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -8514,6 +9126,7 @@ pub static BO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ORAW",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -8527,6 +9140,7 @@ pub static BO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "MASK",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -8540,6 +9154,7 @@ pub static BO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ZSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -8553,6 +9168,7 @@ pub static BO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -8566,6 +9182,7 @@ pub static BO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "COSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -8579,6 +9196,7 @@ pub static BO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "RBV",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -8592,6 +9210,7 @@ pub static BO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ORBV",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -8605,6 +9224,7 @@ pub static BO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "MLST",
         dbf_type: DbFieldType::UShort,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -8618,6 +9238,7 @@ pub static BO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LALM",
         dbf_type: DbFieldType::UShort,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -8631,6 +9252,7 @@ pub static BO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIOL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -8644,6 +9266,7 @@ pub static BO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIML",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -8657,6 +9280,7 @@ pub static BO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIMM",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -8670,6 +9294,7 @@ pub static BO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIMS",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -8683,6 +9308,7 @@ pub static BO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OLDSIMM",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -8696,6 +9322,7 @@ pub static BO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SSCN",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -8709,6 +9336,7 @@ pub static BO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SDLY",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -8722,6 +9350,7 @@ pub static BO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IVOA",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -8735,6 +9364,7 @@ pub static BO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IVOV",
         dbf_type: DbFieldType::UShort,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -8752,6 +9382,7 @@ pub static BUSY_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -8765,6 +9396,7 @@ pub static BUSY_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OMSL",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -8778,6 +9410,7 @@ pub static BUSY_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DOL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -8791,6 +9424,7 @@ pub static BUSY_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUT",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -8804,6 +9438,7 @@ pub static BUSY_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HIGH",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -8817,6 +9452,7 @@ pub static BUSY_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ZNAM",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -8830,6 +9466,7 @@ pub static BUSY_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ONAM",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -8843,6 +9480,7 @@ pub static BUSY_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "RVAL",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -8856,6 +9494,7 @@ pub static BUSY_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ORAW",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -8869,6 +9508,7 @@ pub static BUSY_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OVAL",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -8882,6 +9522,7 @@ pub static BUSY_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "MASK",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -8895,6 +9536,7 @@ pub static BUSY_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ZSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -8908,6 +9550,7 @@ pub static BUSY_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -8921,6 +9564,7 @@ pub static BUSY_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "COSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -8934,6 +9578,7 @@ pub static BUSY_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "RBV",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -8947,6 +9592,7 @@ pub static BUSY_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ORBV",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -8960,6 +9606,7 @@ pub static BUSY_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "MLST",
         dbf_type: DbFieldType::UShort,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -8973,6 +9620,7 @@ pub static BUSY_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LALM",
         dbf_type: DbFieldType::UShort,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -8986,6 +9634,7 @@ pub static BUSY_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIOL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -8999,6 +9648,7 @@ pub static BUSY_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIML",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -9012,6 +9662,7 @@ pub static BUSY_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIMM",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -9025,6 +9676,7 @@ pub static BUSY_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIMS",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -9038,6 +9690,7 @@ pub static BUSY_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IVOA",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -9051,6 +9704,7 @@ pub static BUSY_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IVOV",
         dbf_type: DbFieldType::UShort,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -9068,6 +9722,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -9081,6 +9736,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CALC",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Calc,
         pp: true,
@@ -9094,6 +9750,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPA",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -9107,6 +9764,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPB",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -9120,6 +9778,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPC",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -9133,6 +9792,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPD",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -9146,6 +9806,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPE",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -9159,6 +9820,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPF",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -9172,6 +9834,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPG",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -9185,6 +9848,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPH",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -9198,6 +9862,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPI",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -9211,6 +9876,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPJ",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -9224,6 +9890,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPK",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -9237,6 +9904,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -9250,6 +9918,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPM",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -9263,6 +9932,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPN",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -9276,6 +9946,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPO",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -9289,6 +9960,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPP",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -9302,6 +9974,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPQ",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -9315,6 +9988,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPR",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -9328,6 +10002,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPS",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -9341,6 +10016,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPT",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -9354,6 +10030,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPU",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -9367,6 +10044,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "EGU",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -9380,6 +10058,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PREC",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -9393,6 +10072,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HOPR",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -9406,6 +10086,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LOPR",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -9419,6 +10100,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HIHI",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -9432,6 +10114,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LOLO",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -9445,6 +10128,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HIGH",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -9458,6 +10142,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LOW",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -9471,6 +10156,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HHSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -9484,6 +10170,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LLSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -9497,6 +10184,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -9510,6 +10198,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -9523,6 +10212,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "AFTC",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -9536,6 +10226,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "AFVL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -9549,6 +10240,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HYST",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -9562,6 +10254,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ADEL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -9575,6 +10268,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "MDEL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -9588,6 +10282,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "A",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -9601,6 +10296,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "B",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -9614,6 +10310,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "C",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -9627,6 +10324,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "D",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -9640,6 +10338,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "E",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -9653,6 +10352,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "F",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -9666,6 +10366,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "G",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -9679,6 +10380,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "H",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -9692,6 +10394,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "I",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -9705,6 +10408,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "J",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -9718,6 +10422,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "K",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -9731,6 +10436,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "L",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -9744,6 +10450,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "M",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -9757,6 +10464,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "N",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -9770,6 +10478,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "O",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -9783,6 +10492,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "P",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -9796,6 +10506,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "Q",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -9809,6 +10520,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "R",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -9822,6 +10534,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "S",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -9835,6 +10548,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "T",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -9848,6 +10562,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "U",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -9861,6 +10576,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LA",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -9874,6 +10590,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LB",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -9887,6 +10604,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LC",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -9900,6 +10618,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LD",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -9913,6 +10632,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LE",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -9926,6 +10646,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LF",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -9939,6 +10660,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LG",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -9952,6 +10674,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LH",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -9965,6 +10688,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LI",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -9978,6 +10702,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LJ",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -9991,6 +10716,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LK",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -10004,6 +10730,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -10017,6 +10744,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LM",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -10030,6 +10758,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LN",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -10043,6 +10772,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LO",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -10056,6 +10786,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LP",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -10069,6 +10800,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LQ",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -10082,6 +10814,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LR",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -10095,6 +10828,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LS",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -10108,6 +10842,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LT",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -10121,6 +10856,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LU",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -10134,6 +10870,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LALM",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -10147,6 +10884,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ALST",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -10160,6 +10898,7 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "MLST",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -10177,6 +10916,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -10190,6 +10930,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PVAL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -10203,6 +10944,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CALC",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Calc,
         pp: true,
@@ -10216,6 +10958,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CLCV",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -10229,6 +10972,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPA",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -10242,6 +10986,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPB",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -10255,6 +11000,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPC",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -10268,6 +11014,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPD",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -10281,6 +11028,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPE",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -10294,6 +11042,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPF",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -10307,6 +11056,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPG",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -10320,6 +11070,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPH",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -10333,6 +11084,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPI",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -10346,6 +11098,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPJ",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -10359,6 +11112,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPK",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -10372,6 +11126,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -10385,6 +11140,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPM",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -10398,6 +11154,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPN",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -10411,6 +11168,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPO",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -10424,6 +11182,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPP",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -10437,6 +11196,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPQ",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -10450,6 +11210,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPR",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -10463,6 +11224,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPS",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -10476,6 +11238,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPT",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -10489,6 +11252,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPU",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -10502,6 +11266,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUT",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -10515,6 +11280,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INAV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -10528,6 +11294,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INBV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -10541,6 +11308,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INCV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -10554,6 +11322,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INDV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -10567,6 +11336,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INEV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -10580,6 +11350,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INFV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -10593,6 +11364,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INGV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -10606,6 +11378,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INHV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -10619,6 +11392,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INIV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -10632,6 +11406,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INJV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -10645,6 +11420,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INKV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -10658,6 +11434,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INLV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -10671,6 +11448,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INMV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -10684,6 +11462,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INNV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -10697,6 +11476,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INOV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -10710,6 +11490,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -10723,6 +11504,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INQV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -10736,6 +11518,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INRV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -10749,6 +11532,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -10762,6 +11546,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INTV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -10775,6 +11560,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INUV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -10788,6 +11574,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUTV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -10801,6 +11588,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OOPT",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -10814,6 +11602,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ODLY",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -10827,6 +11616,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DLYA",
         dbf_type: DbFieldType::UShort,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -10840,6 +11630,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DOPT",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -10853,6 +11644,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OCAL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Calc,
         pp: true,
@@ -10866,6 +11658,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OCLV",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -10879,6 +11672,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OEVT",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -10892,6 +11686,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IVOA",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -10905,6 +11700,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IVOV",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -10918,6 +11714,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "EGU",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -10931,6 +11728,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PREC",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -10944,6 +11742,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HOPR",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -10957,6 +11756,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LOPR",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -10970,6 +11770,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HIHI",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -10983,6 +11784,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LOLO",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -10996,6 +11798,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HIGH",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -11009,6 +11812,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LOW",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -11022,6 +11826,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HHSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -11035,6 +11840,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LLSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -11048,6 +11854,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -11061,6 +11868,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -11074,6 +11882,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HYST",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -11087,6 +11896,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ADEL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -11100,6 +11910,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "MDEL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -11113,6 +11924,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "A",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -11126,6 +11938,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "B",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -11139,6 +11952,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "C",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -11152,6 +11966,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "D",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -11165,6 +11980,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "E",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -11178,6 +11994,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "F",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -11191,6 +12008,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "G",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -11204,6 +12022,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "H",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -11217,6 +12036,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "I",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -11230,6 +12050,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "J",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -11243,6 +12064,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "K",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -11256,6 +12078,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "L",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -11269,6 +12092,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "M",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -11282,6 +12106,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "N",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -11295,6 +12120,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "O",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -11308,6 +12134,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "P",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -11321,6 +12148,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "Q",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -11334,6 +12162,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "R",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -11347,6 +12176,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "S",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -11360,6 +12190,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "T",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -11373,6 +12204,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "U",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -11386,6 +12218,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OVAL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -11399,6 +12232,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LA",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -11412,6 +12246,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LB",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -11425,6 +12260,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LC",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -11438,6 +12274,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LD",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -11451,6 +12288,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LE",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -11464,6 +12302,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LF",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -11477,6 +12316,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LG",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -11490,6 +12330,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LH",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -11503,6 +12344,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LI",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -11516,6 +12358,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LJ",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -11529,6 +12372,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LK",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -11542,6 +12386,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -11555,6 +12400,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LM",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -11568,6 +12414,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LN",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -11581,6 +12428,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LO",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -11594,6 +12442,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LP",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -11607,6 +12456,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LQ",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -11620,6 +12470,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LR",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -11633,6 +12484,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LS",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -11646,6 +12498,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LT",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -11659,6 +12512,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LU",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -11672,6 +12526,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "POVL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -11685,6 +12540,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LALM",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -11698,6 +12554,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ALST",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -11711,6 +12568,7 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "MLST",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -11729,6 +12587,7 @@ pub static COMPRESS_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::DbAddr,
         pp: true,
@@ -11742,6 +12601,7 @@ pub static COMPRESS_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INP",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -11755,6 +12615,7 @@ pub static COMPRESS_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "RES",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: false,
         special: Special::Reset,
         pp: false,
@@ -11768,6 +12629,7 @@ pub static COMPRESS_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ALG",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Reset,
         pp: false,
@@ -11781,6 +12643,7 @@ pub static COMPRESS_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PBUF",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Reset,
         pp: false,
@@ -11794,6 +12657,7 @@ pub static COMPRESS_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "BALG",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Reset,
         pp: false,
@@ -11807,6 +12671,7 @@ pub static COMPRESS_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NSAM",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -11820,6 +12685,7 @@ pub static COMPRESS_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "N",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: false,
         special: Special::Reset,
         pp: false,
@@ -11833,6 +12699,7 @@ pub static COMPRESS_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IHIL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -11846,6 +12713,7 @@ pub static COMPRESS_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ILIL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -11859,6 +12727,7 @@ pub static COMPRESS_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HOPR",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -11872,6 +12741,7 @@ pub static COMPRESS_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LOPR",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -11885,6 +12755,7 @@ pub static COMPRESS_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PREC",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -11898,6 +12769,7 @@ pub static COMPRESS_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "EGU",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -11911,6 +12783,7 @@ pub static COMPRESS_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OFF",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -11924,6 +12797,7 @@ pub static COMPRESS_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NUSE",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -11937,6 +12811,7 @@ pub static COMPRESS_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUSE",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -11950,6 +12825,7 @@ pub static COMPRESS_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPN",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -11963,6 +12839,7 @@ pub static COMPRESS_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CVB",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -11976,6 +12853,7 @@ pub static COMPRESS_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INX",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -11993,6 +12871,7 @@ pub static DFANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -12006,6 +12885,7 @@ pub static DFANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SELM",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -12019,6 +12899,7 @@ pub static DFANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SELN",
         dbf_type: DbFieldType::UShort,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -12032,6 +12913,7 @@ pub static DFANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SELL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -12045,6 +12927,7 @@ pub static DFANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUTA",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -12058,6 +12941,7 @@ pub static DFANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUTB",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -12071,6 +12955,7 @@ pub static DFANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUTC",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -12084,6 +12969,7 @@ pub static DFANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUTD",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -12097,6 +12983,7 @@ pub static DFANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUTE",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -12110,6 +12997,7 @@ pub static DFANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUTF",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -12123,6 +13011,7 @@ pub static DFANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUTG",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -12136,6 +13025,7 @@ pub static DFANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUTH",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -12149,6 +13039,7 @@ pub static DFANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUTI",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -12162,6 +13053,7 @@ pub static DFANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUTJ",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -12175,6 +13067,7 @@ pub static DFANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUTK",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -12188,6 +13081,7 @@ pub static DFANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUTL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -12201,6 +13095,7 @@ pub static DFANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUTM",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -12214,6 +13109,7 @@ pub static DFANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUTN",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -12227,6 +13123,7 @@ pub static DFANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUTO",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -12240,6 +13137,7 @@ pub static DFANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUTP",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -12253,6 +13151,7 @@ pub static DFANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DOL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -12266,6 +13165,7 @@ pub static DFANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OMSL",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -12279,6 +13179,7 @@ pub static DFANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "EGU",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -12292,6 +13193,7 @@ pub static DFANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PREC",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -12305,6 +13207,7 @@ pub static DFANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HOPR",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -12318,6 +13221,7 @@ pub static DFANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LOPR",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -12331,6 +13235,7 @@ pub static DFANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HIHI",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -12344,6 +13249,7 @@ pub static DFANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LOLO",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -12357,6 +13263,7 @@ pub static DFANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HIGH",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -12370,6 +13277,7 @@ pub static DFANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LOW",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -12383,6 +13291,7 @@ pub static DFANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HHSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -12396,6 +13305,7 @@ pub static DFANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LLSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -12409,6 +13319,7 @@ pub static DFANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -12422,6 +13333,7 @@ pub static DFANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -12435,6 +13347,7 @@ pub static DFANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HYST",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -12448,6 +13361,7 @@ pub static DFANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ADEL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -12461,6 +13375,7 @@ pub static DFANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "MDEL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -12474,6 +13389,7 @@ pub static DFANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LALM",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -12487,6 +13403,7 @@ pub static DFANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ALST",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -12500,6 +13417,7 @@ pub static DFANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "MLST",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -12513,6 +13431,7 @@ pub static DFANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IVOA",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -12526,6 +13445,7 @@ pub static DFANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IVOV",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -12543,6 +13463,7 @@ pub static EVENT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -12556,6 +13477,7 @@ pub static EVENT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INP",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -12569,6 +13491,7 @@ pub static EVENT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIOL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -12582,6 +13505,7 @@ pub static EVENT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SVAL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -12595,6 +13519,7 @@ pub static EVENT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIML",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -12608,6 +13533,7 @@ pub static EVENT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIMM",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -12621,6 +13547,7 @@ pub static EVENT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIMS",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -12634,6 +13561,7 @@ pub static EVENT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OLDSIMM",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -12647,6 +13575,7 @@ pub static EVENT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SSCN",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -12660,6 +13589,7 @@ pub static EVENT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SDLY",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -12677,6 +13607,7 @@ pub static FANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -12690,6 +13621,7 @@ pub static FANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SELM",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -12703,6 +13635,7 @@ pub static FANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SELN",
         dbf_type: DbFieldType::UShort,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -12716,6 +13649,7 @@ pub static FANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SELL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -12729,6 +13663,7 @@ pub static FANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OFFS",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -12742,6 +13677,7 @@ pub static FANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SHFT",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -12755,6 +13691,7 @@ pub static FANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LNK0",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -12768,6 +13705,7 @@ pub static FANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LNK1",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -12781,6 +13719,7 @@ pub static FANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LNK2",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -12794,6 +13733,7 @@ pub static FANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LNK3",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -12807,6 +13747,7 @@ pub static FANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LNK4",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -12820,6 +13761,7 @@ pub static FANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LNK5",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -12833,6 +13775,7 @@ pub static FANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LNK6",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -12846,6 +13789,7 @@ pub static FANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LNK7",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -12859,6 +13803,7 @@ pub static FANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LNK8",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -12872,6 +13817,7 @@ pub static FANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LNK9",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -12885,6 +13831,7 @@ pub static FANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LNKA",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -12898,6 +13845,7 @@ pub static FANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LNKB",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -12911,6 +13859,7 @@ pub static FANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LNKC",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -12924,6 +13873,7 @@ pub static FANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LNKD",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -12937,6 +13887,7 @@ pub static FANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LNKE",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -12950,6 +13901,7 @@ pub static FANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LNKF",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -12968,6 +13920,7 @@ pub static HISTOGRAM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: false,
         special: Special::DbAddr,
         pp: false,
@@ -12981,6 +13934,7 @@ pub static HISTOGRAM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NELM",
         dbf_type: DbFieldType::UShort,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -12994,6 +13948,7 @@ pub static HISTOGRAM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CSTA",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -13007,6 +13962,7 @@ pub static HISTOGRAM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CMD",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Calc,
         pp: false,
@@ -13020,6 +13976,7 @@ pub static HISTOGRAM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ULIM",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::Reset,
         pp: false,
@@ -13033,6 +13990,7 @@ pub static HISTOGRAM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LLIM",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::Reset,
         pp: false,
@@ -13046,6 +14004,7 @@ pub static HISTOGRAM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "WDTH",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -13059,6 +14018,7 @@ pub static HISTOGRAM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SGNL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -13072,6 +14032,7 @@ pub static HISTOGRAM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PREC",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -13085,6 +14046,7 @@ pub static HISTOGRAM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SVL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -13098,6 +14060,7 @@ pub static HISTOGRAM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "MDEL",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -13111,6 +14074,7 @@ pub static HISTOGRAM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "MCNT",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -13124,6 +14088,7 @@ pub static HISTOGRAM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SDEL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::Reset,
         pp: false,
@@ -13137,6 +14102,7 @@ pub static HISTOGRAM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIOL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -13150,6 +14116,7 @@ pub static HISTOGRAM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SVAL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -13163,6 +14130,7 @@ pub static HISTOGRAM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIML",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -13176,6 +14144,7 @@ pub static HISTOGRAM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIMM",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -13189,6 +14158,7 @@ pub static HISTOGRAM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIMS",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -13202,6 +14172,7 @@ pub static HISTOGRAM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OLDSIMM",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -13215,6 +14186,7 @@ pub static HISTOGRAM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SSCN",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -13228,6 +14200,7 @@ pub static HISTOGRAM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SDLY",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -13241,6 +14214,7 @@ pub static HISTOGRAM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HOPR",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -13254,6 +14228,7 @@ pub static HISTOGRAM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LOPR",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -13271,6 +14246,7 @@ pub static INT64IN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
         dbf_type: DbFieldType::Int64,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -13284,6 +14260,7 @@ pub static INT64IN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INP",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -13297,6 +14274,7 @@ pub static INT64IN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "EGU",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -13310,6 +14288,7 @@ pub static INT64IN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HOPR",
         dbf_type: DbFieldType::Int64,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -13323,6 +14302,7 @@ pub static INT64IN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LOPR",
         dbf_type: DbFieldType::Int64,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -13336,6 +14316,7 @@ pub static INT64IN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HIHI",
         dbf_type: DbFieldType::Int64,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -13349,6 +14330,7 @@ pub static INT64IN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LOLO",
         dbf_type: DbFieldType::Int64,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -13362,6 +14344,7 @@ pub static INT64IN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HIGH",
         dbf_type: DbFieldType::Int64,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -13375,6 +14358,7 @@ pub static INT64IN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LOW",
         dbf_type: DbFieldType::Int64,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -13388,6 +14372,7 @@ pub static INT64IN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HHSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -13401,6 +14386,7 @@ pub static INT64IN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LLSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -13414,6 +14400,7 @@ pub static INT64IN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -13427,6 +14414,7 @@ pub static INT64IN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -13440,6 +14428,7 @@ pub static INT64IN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HYST",
         dbf_type: DbFieldType::Int64,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -13453,6 +14442,7 @@ pub static INT64IN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "AFTC",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -13466,6 +14456,7 @@ pub static INT64IN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "AFVL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -13479,6 +14470,7 @@ pub static INT64IN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ADEL",
         dbf_type: DbFieldType::Int64,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -13492,6 +14484,7 @@ pub static INT64IN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "MDEL",
         dbf_type: DbFieldType::Int64,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -13505,6 +14498,7 @@ pub static INT64IN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LALM",
         dbf_type: DbFieldType::Int64,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -13518,6 +14512,7 @@ pub static INT64IN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ALST",
         dbf_type: DbFieldType::Int64,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -13531,6 +14526,7 @@ pub static INT64IN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "MLST",
         dbf_type: DbFieldType::Int64,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -13544,6 +14540,7 @@ pub static INT64IN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIOL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -13557,6 +14554,7 @@ pub static INT64IN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SVAL",
         dbf_type: DbFieldType::Int64,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -13570,6 +14568,7 @@ pub static INT64IN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIML",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -13583,6 +14582,7 @@ pub static INT64IN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIMM",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -13596,6 +14596,7 @@ pub static INT64IN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIMS",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -13609,6 +14610,7 @@ pub static INT64IN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OLDSIMM",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -13622,6 +14624,7 @@ pub static INT64IN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SSCN",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -13635,6 +14638,7 @@ pub static INT64IN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SDLY",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -13652,6 +14656,7 @@ pub static INT64OUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
         dbf_type: DbFieldType::Int64,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -13665,6 +14670,7 @@ pub static INT64OUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUT",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -13678,6 +14684,7 @@ pub static INT64OUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DOL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -13691,6 +14698,7 @@ pub static INT64OUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OMSL",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -13704,6 +14712,7 @@ pub static INT64OUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "EGU",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -13717,6 +14726,7 @@ pub static INT64OUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DRVH",
         dbf_type: DbFieldType::Int64,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -13730,6 +14740,7 @@ pub static INT64OUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DRVL",
         dbf_type: DbFieldType::Int64,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -13743,6 +14754,7 @@ pub static INT64OUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HOPR",
         dbf_type: DbFieldType::Int64,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -13756,6 +14768,7 @@ pub static INT64OUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LOPR",
         dbf_type: DbFieldType::Int64,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -13769,6 +14782,7 @@ pub static INT64OUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HIHI",
         dbf_type: DbFieldType::Int64,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -13782,6 +14796,7 @@ pub static INT64OUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LOLO",
         dbf_type: DbFieldType::Int64,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -13795,6 +14810,7 @@ pub static INT64OUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HIGH",
         dbf_type: DbFieldType::Int64,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -13808,6 +14824,7 @@ pub static INT64OUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LOW",
         dbf_type: DbFieldType::Int64,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -13821,6 +14838,7 @@ pub static INT64OUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HHSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -13834,6 +14852,7 @@ pub static INT64OUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LLSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -13847,6 +14866,7 @@ pub static INT64OUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -13860,6 +14880,7 @@ pub static INT64OUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -13873,6 +14894,7 @@ pub static INT64OUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HYST",
         dbf_type: DbFieldType::Int64,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -13886,6 +14908,7 @@ pub static INT64OUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ADEL",
         dbf_type: DbFieldType::Int64,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -13899,6 +14922,7 @@ pub static INT64OUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "MDEL",
         dbf_type: DbFieldType::Int64,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -13912,6 +14936,7 @@ pub static INT64OUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LALM",
         dbf_type: DbFieldType::Int64,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -13925,6 +14950,7 @@ pub static INT64OUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ALST",
         dbf_type: DbFieldType::Int64,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -13938,6 +14964,7 @@ pub static INT64OUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "MLST",
         dbf_type: DbFieldType::Int64,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -13951,6 +14978,7 @@ pub static INT64OUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIOL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -13964,6 +14992,7 @@ pub static INT64OUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIML",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -13977,6 +15006,7 @@ pub static INT64OUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIMM",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -13990,6 +15020,7 @@ pub static INT64OUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIMS",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -14003,6 +15034,7 @@ pub static INT64OUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OLDSIMM",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -14016,6 +15048,7 @@ pub static INT64OUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SSCN",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -14029,6 +15062,7 @@ pub static INT64OUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SDLY",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -14042,6 +15076,7 @@ pub static INT64OUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IVOA",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -14055,6 +15090,7 @@ pub static INT64OUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IVOV",
         dbf_type: DbFieldType::Int64,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -14072,6 +15108,7 @@ pub static LONGIN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -14085,6 +15122,7 @@ pub static LONGIN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INP",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -14098,6 +15136,7 @@ pub static LONGIN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "EGU",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -14111,6 +15150,7 @@ pub static LONGIN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HOPR",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -14124,6 +15164,7 @@ pub static LONGIN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LOPR",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -14137,6 +15178,7 @@ pub static LONGIN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HIHI",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -14150,6 +15192,7 @@ pub static LONGIN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LOLO",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -14163,6 +15206,7 @@ pub static LONGIN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HIGH",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -14176,6 +15220,7 @@ pub static LONGIN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LOW",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -14189,6 +15234,7 @@ pub static LONGIN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HHSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -14202,6 +15248,7 @@ pub static LONGIN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LLSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -14215,6 +15262,7 @@ pub static LONGIN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -14228,6 +15276,7 @@ pub static LONGIN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -14241,6 +15290,7 @@ pub static LONGIN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HYST",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -14254,6 +15304,7 @@ pub static LONGIN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "AFTC",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -14267,6 +15318,7 @@ pub static LONGIN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "AFVL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -14280,6 +15332,7 @@ pub static LONGIN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ADEL",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -14293,6 +15346,7 @@ pub static LONGIN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "MDEL",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -14306,6 +15360,7 @@ pub static LONGIN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LALM",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -14319,6 +15374,7 @@ pub static LONGIN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ALST",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -14332,6 +15388,7 @@ pub static LONGIN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "MLST",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -14345,6 +15402,7 @@ pub static LONGIN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIOL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -14358,6 +15416,7 @@ pub static LONGIN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SVAL",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -14371,6 +15430,7 @@ pub static LONGIN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIML",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -14384,6 +15444,7 @@ pub static LONGIN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIMM",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -14397,6 +15458,7 @@ pub static LONGIN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIMS",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -14410,6 +15472,7 @@ pub static LONGIN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OLDSIMM",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -14423,6 +15486,7 @@ pub static LONGIN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SSCN",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -14436,6 +15500,7 @@ pub static LONGIN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SDLY",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -14453,6 +15518,7 @@ pub static LONGOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -14466,6 +15532,7 @@ pub static LONGOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUT",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -14479,6 +15546,7 @@ pub static LONGOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DOL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -14492,6 +15560,7 @@ pub static LONGOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OMSL",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -14505,6 +15574,7 @@ pub static LONGOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "EGU",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -14518,6 +15588,7 @@ pub static LONGOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DRVH",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -14531,6 +15602,7 @@ pub static LONGOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DRVL",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -14544,6 +15616,7 @@ pub static LONGOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HOPR",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -14557,6 +15630,7 @@ pub static LONGOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LOPR",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -14570,6 +15644,7 @@ pub static LONGOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HIHI",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -14583,6 +15658,7 @@ pub static LONGOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LOLO",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -14596,6 +15672,7 @@ pub static LONGOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HIGH",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -14609,6 +15686,7 @@ pub static LONGOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LOW",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -14622,6 +15700,7 @@ pub static LONGOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HHSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -14635,6 +15714,7 @@ pub static LONGOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LLSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -14648,6 +15728,7 @@ pub static LONGOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -14661,6 +15742,7 @@ pub static LONGOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -14674,6 +15756,7 @@ pub static LONGOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HYST",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -14687,6 +15770,7 @@ pub static LONGOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ADEL",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -14700,6 +15784,7 @@ pub static LONGOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "MDEL",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -14713,6 +15798,7 @@ pub static LONGOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LALM",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -14726,6 +15812,7 @@ pub static LONGOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ALST",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -14739,6 +15826,7 @@ pub static LONGOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "MLST",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -14752,6 +15840,7 @@ pub static LONGOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIOL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -14765,6 +15854,7 @@ pub static LONGOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIML",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -14778,6 +15868,7 @@ pub static LONGOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIMM",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -14791,6 +15882,7 @@ pub static LONGOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIMS",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -14804,6 +15896,7 @@ pub static LONGOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OLDSIMM",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -14817,6 +15910,7 @@ pub static LONGOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SSCN",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -14830,6 +15924,7 @@ pub static LONGOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SDLY",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -14843,6 +15938,7 @@ pub static LONGOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IVOA",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -14856,6 +15952,7 @@ pub static LONGOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IVOV",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -14869,6 +15966,7 @@ pub static LONGOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PVAL",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -14882,6 +15980,7 @@ pub static LONGOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OOCH",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -14895,6 +15994,7 @@ pub static LONGOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OOPT",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -14913,6 +16013,7 @@ pub static LSI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -14927,6 +16028,7 @@ pub static LSI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OVAL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -14940,6 +16042,7 @@ pub static LSI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIZV",
         dbf_type: DbFieldType::UShort,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -14953,6 +16056,7 @@ pub static LSI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LEN",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -14966,6 +16070,7 @@ pub static LSI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OLEN",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -14979,6 +16084,7 @@ pub static LSI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INP",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -14992,6 +16098,7 @@ pub static LSI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "MPST",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -15005,6 +16112,7 @@ pub static LSI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "APST",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -15018,6 +16126,7 @@ pub static LSI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIML",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -15031,6 +16140,7 @@ pub static LSI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIMM",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -15044,6 +16154,7 @@ pub static LSI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIMS",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -15057,6 +16168,7 @@ pub static LSI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIOL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -15070,6 +16182,7 @@ pub static LSI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OLDSIMM",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -15083,6 +16196,7 @@ pub static LSI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SSCN",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -15096,6 +16210,7 @@ pub static LSI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SDLY",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -15114,6 +16229,7 @@ pub static LSO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -15128,6 +16244,7 @@ pub static LSO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OVAL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -15141,6 +16258,7 @@ pub static LSO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIZV",
         dbf_type: DbFieldType::UShort,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -15154,6 +16272,7 @@ pub static LSO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LEN",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -15167,6 +16286,7 @@ pub static LSO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OLEN",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -15180,6 +16300,7 @@ pub static LSO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DOL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -15193,6 +16314,7 @@ pub static LSO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IVOA",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -15206,6 +16328,7 @@ pub static LSO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IVOV",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -15219,6 +16342,7 @@ pub static LSO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OMSL",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -15232,6 +16356,7 @@ pub static LSO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUT",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -15245,6 +16370,7 @@ pub static LSO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "MPST",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -15258,6 +16384,7 @@ pub static LSO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "APST",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -15271,6 +16398,7 @@ pub static LSO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIML",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -15284,6 +16412,7 @@ pub static LSO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIMM",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -15297,6 +16426,7 @@ pub static LSO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIMS",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -15310,6 +16440,7 @@ pub static LSO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIOL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -15323,6 +16454,7 @@ pub static LSO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OLDSIMM",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -15336,6 +16468,7 @@ pub static LSO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SSCN",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -15349,6 +16482,7 @@ pub static LSO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SDLY",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -15366,6 +16500,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -15379,6 +16514,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NOBT",
         dbf_type: DbFieldType::UShort,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -15392,6 +16528,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INP",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -15405,6 +16542,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ZRVL",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -15418,6 +16556,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ONVL",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -15431,6 +16570,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "TWVL",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -15444,6 +16584,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "THVL",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -15457,6 +16598,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FRVL",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -15470,6 +16612,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FVVL",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -15483,6 +16626,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SXVL",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -15496,6 +16640,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SVVL",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -15509,6 +16654,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "EIVL",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -15522,6 +16668,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NIVL",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -15535,6 +16682,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "TEVL",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -15548,6 +16696,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ELVL",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -15561,6 +16710,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "TVVL",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -15574,6 +16724,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "TTVL",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -15587,6 +16738,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FTVL",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -15600,6 +16752,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FFVL",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -15613,6 +16766,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ZRST",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -15626,6 +16780,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ONST",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -15639,6 +16794,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "TWST",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -15652,6 +16808,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "THST",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -15665,6 +16822,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FRST",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -15678,6 +16836,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FVST",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -15691,6 +16850,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SXST",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -15704,6 +16864,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SVST",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -15717,6 +16878,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "EIST",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -15730,6 +16892,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NIST",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -15743,6 +16906,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "TEST",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -15756,6 +16920,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ELST",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -15769,6 +16934,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "TVST",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -15782,6 +16948,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "TTST",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -15795,6 +16962,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FTST",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -15808,6 +16976,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FFST",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -15821,6 +16990,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ZRSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -15834,6 +17004,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ONSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -15847,6 +17018,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "TWSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -15860,6 +17032,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "THSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -15873,6 +17046,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FRSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -15886,6 +17060,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FVSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -15899,6 +17074,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SXSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -15912,6 +17088,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SVSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -15925,6 +17102,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "EISV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -15938,6 +17116,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NISV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -15951,6 +17130,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "TESV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -15964,6 +17144,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ELSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -15977,6 +17158,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "TVSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -15990,6 +17172,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "TTSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -16003,6 +17186,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FTSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -16016,6 +17200,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FFSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -16029,6 +17214,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "AFTC",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -16042,6 +17228,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "AFVL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -16055,6 +17242,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "UNSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -16068,6 +17256,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "COSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -16081,6 +17270,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "RVAL",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -16094,6 +17284,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ORAW",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -16107,6 +17298,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "MASK",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -16120,6 +17312,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "MLST",
         dbf_type: DbFieldType::UShort,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -16133,6 +17326,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LALM",
         dbf_type: DbFieldType::UShort,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -16146,6 +17340,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SDEF",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -16159,6 +17354,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SHFT",
         dbf_type: DbFieldType::UShort,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -16172,6 +17368,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIOL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -16185,6 +17382,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SVAL",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -16198,6 +17396,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIML",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -16211,6 +17410,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIMM",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -16224,6 +17424,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIMS",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -16237,6 +17438,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OLDSIMM",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -16250,6 +17452,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SSCN",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -16263,6 +17466,7 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SDLY",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -16280,6 +17484,7 @@ pub static MBBI_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -16293,6 +17498,7 @@ pub static MBBI_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NOBT",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -16306,6 +17512,7 @@ pub static MBBI_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INP",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -16319,6 +17526,7 @@ pub static MBBI_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "RVAL",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -16332,6 +17540,7 @@ pub static MBBI_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ORAW",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -16345,6 +17554,7 @@ pub static MBBI_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "MASK",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -16358,6 +17568,7 @@ pub static MBBI_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "MLST",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -16371,6 +17582,7 @@ pub static MBBI_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SHFT",
         dbf_type: DbFieldType::UShort,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -16384,6 +17596,7 @@ pub static MBBI_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIOL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -16397,6 +17610,7 @@ pub static MBBI_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SVAL",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -16410,6 +17624,7 @@ pub static MBBI_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIML",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -16423,6 +17638,7 @@ pub static MBBI_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIMM",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -16436,6 +17652,7 @@ pub static MBBI_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIMS",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -16449,6 +17666,7 @@ pub static MBBI_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OLDSIMM",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -16462,6 +17680,7 @@ pub static MBBI_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SSCN",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -16475,6 +17694,7 @@ pub static MBBI_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SDLY",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -16488,6 +17708,7 @@ pub static MBBI_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "B0",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -16501,6 +17722,7 @@ pub static MBBI_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "B1",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -16514,6 +17736,7 @@ pub static MBBI_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "B2",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -16527,6 +17750,7 @@ pub static MBBI_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "B3",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -16540,6 +17764,7 @@ pub static MBBI_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "B4",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -16553,6 +17778,7 @@ pub static MBBI_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "B5",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -16566,6 +17792,7 @@ pub static MBBI_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "B6",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -16579,6 +17806,7 @@ pub static MBBI_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "B7",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -16592,6 +17820,7 @@ pub static MBBI_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "B8",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -16605,6 +17834,7 @@ pub static MBBI_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "B9",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -16618,6 +17848,7 @@ pub static MBBI_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "BA",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -16631,6 +17862,7 @@ pub static MBBI_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "BB",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -16644,6 +17876,7 @@ pub static MBBI_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "BC",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -16657,6 +17890,7 @@ pub static MBBI_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "BD",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -16670,6 +17904,7 @@ pub static MBBI_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "BE",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -16683,6 +17918,7 @@ pub static MBBI_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "BF",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -16696,6 +17932,7 @@ pub static MBBI_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "B10",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -16709,6 +17946,7 @@ pub static MBBI_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "B11",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -16722,6 +17960,7 @@ pub static MBBI_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "B12",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -16735,6 +17974,7 @@ pub static MBBI_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "B13",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -16748,6 +17988,7 @@ pub static MBBI_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "B14",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -16761,6 +18002,7 @@ pub static MBBI_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "B15",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -16774,6 +18016,7 @@ pub static MBBI_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "B16",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -16787,6 +18030,7 @@ pub static MBBI_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "B17",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -16800,6 +18044,7 @@ pub static MBBI_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "B18",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -16813,6 +18058,7 @@ pub static MBBI_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "B19",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -16826,6 +18072,7 @@ pub static MBBI_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "B1A",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -16839,6 +18086,7 @@ pub static MBBI_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "B1B",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -16852,6 +18100,7 @@ pub static MBBI_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "B1C",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -16865,6 +18114,7 @@ pub static MBBI_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "B1D",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -16878,6 +18128,7 @@ pub static MBBI_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "B1E",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -16891,6 +18142,7 @@ pub static MBBI_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "B1F",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -16909,6 +18161,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: true,
         read_only: false,
         special: Special::DbAddr,
         pp: true,
@@ -16922,6 +18175,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DOL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -16935,6 +18189,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OMSL",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -16948,6 +18203,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NOBT",
         dbf_type: DbFieldType::UShort,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -16961,6 +18217,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUT",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -16974,6 +18231,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ZRVL",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -16987,6 +18245,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ONVL",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -17000,6 +18259,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "TWVL",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -17013,6 +18273,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "THVL",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -17026,6 +18287,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FRVL",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -17039,6 +18301,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FVVL",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -17052,6 +18315,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SXVL",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -17065,6 +18329,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SVVL",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -17078,6 +18343,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "EIVL",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -17091,6 +18357,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NIVL",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -17104,6 +18371,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "TEVL",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -17117,6 +18385,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ELVL",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -17130,6 +18399,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "TVVL",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -17143,6 +18413,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "TTVL",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -17156,6 +18427,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FTVL",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -17169,6 +18441,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FFVL",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -17182,6 +18455,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ZRST",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -17195,6 +18469,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ONST",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -17208,6 +18483,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "TWST",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -17221,6 +18497,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "THST",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -17234,6 +18511,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FRST",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -17247,6 +18525,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FVST",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -17260,6 +18539,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SXST",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -17273,6 +18553,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SVST",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -17286,6 +18567,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "EIST",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -17299,6 +18581,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NIST",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -17312,6 +18595,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "TEST",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -17325,6 +18609,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ELST",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -17338,6 +18623,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "TVST",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -17351,6 +18637,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "TTST",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -17364,6 +18651,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FTST",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -17377,6 +18665,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FFST",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -17390,6 +18679,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ZRSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -17403,6 +18693,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ONSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -17416,6 +18707,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "TWSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -17429,6 +18721,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "THSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -17442,6 +18735,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FRSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -17455,6 +18749,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FVSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -17468,6 +18763,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SXSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -17481,6 +18777,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SVSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -17494,6 +18791,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "EISV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -17507,6 +18805,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NISV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -17520,6 +18819,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "TESV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -17533,6 +18833,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ELSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -17546,6 +18847,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "TVSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -17559,6 +18861,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "TTSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -17572,6 +18875,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FTSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -17585,6 +18889,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FFSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -17598,6 +18903,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "UNSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -17611,6 +18917,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "COSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -17624,6 +18931,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "RVAL",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -17637,6 +18945,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ORAW",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -17650,6 +18959,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "RBV",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -17663,6 +18973,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ORBV",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -17676,6 +18987,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "MASK",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -17689,6 +19001,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "MLST",
         dbf_type: DbFieldType::UShort,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -17702,6 +19015,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LALM",
         dbf_type: DbFieldType::UShort,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -17715,6 +19029,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SDEF",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -17728,6 +19043,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SHFT",
         dbf_type: DbFieldType::UShort,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -17741,6 +19057,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIOL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -17754,6 +19071,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIML",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -17767,6 +19085,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIMM",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -17780,6 +19099,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIMS",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -17793,6 +19113,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OLDSIMM",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -17806,6 +19127,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SSCN",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -17819,6 +19141,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SDLY",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -17832,6 +19155,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IVOA",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -17845,6 +19169,7 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IVOV",
         dbf_type: DbFieldType::UShort,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -17862,6 +19187,7 @@ pub static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -17875,6 +19201,7 @@ pub static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OMSL",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -17888,6 +19215,7 @@ pub static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NOBT",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -17901,6 +19229,7 @@ pub static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DOL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -17914,6 +19243,7 @@ pub static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUT",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -17927,6 +19257,7 @@ pub static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "RVAL",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: true,
@@ -17940,6 +19271,7 @@ pub static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ORAW",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -17953,6 +19285,7 @@ pub static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "RBV",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -17966,6 +19299,7 @@ pub static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ORBV",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -17979,6 +19313,7 @@ pub static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "MASK",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -17992,6 +19327,7 @@ pub static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "MLST",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -18005,6 +19341,7 @@ pub static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OBIT",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -18018,6 +19355,7 @@ pub static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SHFT",
         dbf_type: DbFieldType::UShort,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -18031,6 +19369,7 @@ pub static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIOL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -18044,6 +19383,7 @@ pub static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIML",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -18057,6 +19397,7 @@ pub static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIMM",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -18070,6 +19411,7 @@ pub static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIMS",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -18083,6 +19425,7 @@ pub static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OLDSIMM",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -18096,6 +19439,7 @@ pub static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SSCN",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -18109,6 +19453,7 @@ pub static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SDLY",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -18122,6 +19467,7 @@ pub static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IVOA",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -18135,6 +19481,7 @@ pub static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IVOV",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -18148,6 +19495,7 @@ pub static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "B0",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -18161,6 +19509,7 @@ pub static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "B1",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -18174,6 +19523,7 @@ pub static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "B2",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -18187,6 +19537,7 @@ pub static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "B3",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -18200,6 +19551,7 @@ pub static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "B4",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -18213,6 +19565,7 @@ pub static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "B5",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -18226,6 +19579,7 @@ pub static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "B6",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -18239,6 +19593,7 @@ pub static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "B7",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -18252,6 +19607,7 @@ pub static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "B8",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -18265,6 +19621,7 @@ pub static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "B9",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -18278,6 +19635,7 @@ pub static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "BA",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -18291,6 +19649,7 @@ pub static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "BB",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -18304,6 +19663,7 @@ pub static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "BC",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -18317,6 +19677,7 @@ pub static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "BD",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -18330,6 +19691,7 @@ pub static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "BE",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -18343,6 +19705,7 @@ pub static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "BF",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -18356,6 +19719,7 @@ pub static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "B10",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -18369,6 +19733,7 @@ pub static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "B11",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -18382,6 +19747,7 @@ pub static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "B12",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -18395,6 +19761,7 @@ pub static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "B13",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -18408,6 +19775,7 @@ pub static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "B14",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -18421,6 +19789,7 @@ pub static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "B15",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -18434,6 +19803,7 @@ pub static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "B16",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -18447,6 +19817,7 @@ pub static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "B17",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -18460,6 +19831,7 @@ pub static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "B18",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -18473,6 +19845,7 @@ pub static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "B19",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -18486,6 +19859,7 @@ pub static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "B1A",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -18499,6 +19873,7 @@ pub static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "B1B",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -18512,6 +19887,7 @@ pub static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "B1C",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -18525,6 +19901,7 @@ pub static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "B1D",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -18538,6 +19915,7 @@ pub static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "B1E",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -18551,6 +19929,7 @@ pub static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "B1F",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -18568,6 +19947,7 @@ pub static PERMISSIVE_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
         dbf_type: DbFieldType::UShort,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -18581,6 +19961,7 @@ pub static PERMISSIVE_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "WFLG",
         dbf_type: DbFieldType::UShort,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -18594,6 +19975,7 @@ pub static PERMISSIVE_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LABL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -18607,6 +19989,7 @@ pub static PERMISSIVE_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OVAL",
         dbf_type: DbFieldType::UShort,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -18620,6 +20003,7 @@ pub static PERMISSIVE_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OFLG",
         dbf_type: DbFieldType::UShort,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -18638,6 +20022,7 @@ pub static PRINTF_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::DbAddr,
         pp: true,
@@ -18651,6 +20036,7 @@ pub static PRINTF_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIZV",
         dbf_type: DbFieldType::UShort,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -18664,6 +20050,7 @@ pub static PRINTF_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LEN",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -18677,6 +20064,7 @@ pub static PRINTF_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUT",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -18690,6 +20078,7 @@ pub static PRINTF_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FMT",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -18703,6 +20092,7 @@ pub static PRINTF_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IVLS",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -18716,6 +20106,7 @@ pub static PRINTF_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INP0",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -18729,6 +20120,7 @@ pub static PRINTF_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INP1",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -18742,6 +20134,7 @@ pub static PRINTF_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INP2",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -18755,6 +20148,7 @@ pub static PRINTF_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INP3",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -18768,6 +20162,7 @@ pub static PRINTF_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INP4",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -18781,6 +20176,7 @@ pub static PRINTF_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INP5",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -18794,6 +20190,7 @@ pub static PRINTF_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INP6",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -18807,6 +20204,7 @@ pub static PRINTF_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INP7",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -18820,6 +20218,7 @@ pub static PRINTF_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INP8",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -18833,6 +20232,7 @@ pub static PRINTF_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INP9",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -18850,6 +20250,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VERS",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -18863,6 +20264,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -18876,6 +20278,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SVAL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -18889,6 +20292,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PVAL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -18902,6 +20306,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PSVL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -18915,6 +20320,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CALC",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -18928,6 +20334,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CLCV",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -18941,6 +20348,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPA",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -18954,6 +20362,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPB",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -18967,6 +20376,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPC",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -18980,6 +20390,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPD",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -18993,6 +20404,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPE",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -19006,6 +20418,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPF",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -19019,6 +20432,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPG",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -19032,6 +20446,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPH",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -19045,6 +20460,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPI",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -19058,6 +20474,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPJ",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -19071,6 +20488,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPK",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -19084,6 +20502,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -19097,6 +20516,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INAA",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -19110,6 +20530,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INBB",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -19123,6 +20544,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INCC",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -19136,6 +20558,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INDD",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -19149,6 +20572,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INEE",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -19162,6 +20586,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INFF",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -19175,6 +20600,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INGG",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -19188,6 +20614,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INHH",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -19201,6 +20628,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INII",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -19214,6 +20642,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INJJ",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -19227,6 +20656,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INKK",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -19240,6 +20670,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INLL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -19253,6 +20684,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUT",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -19266,6 +20698,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INAV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -19279,6 +20712,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INBV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -19292,6 +20726,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INCV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -19305,6 +20740,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INDV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -19318,6 +20754,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INEV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -19331,6 +20768,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INFV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -19344,6 +20782,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INGV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -19357,6 +20796,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INHV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -19370,6 +20810,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INIV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -19383,6 +20824,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INJV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -19396,6 +20838,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INKV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -19409,6 +20852,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INLV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -19422,6 +20866,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IAAV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -19435,6 +20880,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IBBV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -19448,6 +20894,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ICCV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -19461,6 +20908,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IDDV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -19474,6 +20922,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IEEV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -19487,6 +20936,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IFFV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -19500,6 +20950,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IGGV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -19513,6 +20964,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IHHV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -19526,6 +20978,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IIIV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -19539,6 +20992,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IJJV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -19552,6 +21006,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IKKV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -19565,6 +21020,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ILLV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -19578,6 +21034,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUTV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -19591,6 +21048,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OOPT",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -19604,6 +21062,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ODLY",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -19617,6 +21076,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "WAIT",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -19630,6 +21090,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DLYA",
         dbf_type: DbFieldType::UShort,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -19643,6 +21104,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DOPT",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -19656,6 +21118,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OCAL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -19669,6 +21132,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OCLV",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -19682,6 +21146,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OEVT",
         dbf_type: DbFieldType::UShort,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -19695,6 +21160,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IVOA",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -19708,6 +21174,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IVOV",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -19721,6 +21188,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "EGU",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -19734,6 +21202,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PREC",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -19747,6 +21216,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HOPR",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -19760,6 +21230,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LOPR",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -19773,6 +21244,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HIHI",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -19786,6 +21258,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LOLO",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -19799,6 +21272,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HIGH",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -19812,6 +21286,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LOW",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -19825,6 +21300,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HHSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -19838,6 +21314,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LLSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -19851,6 +21328,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -19864,6 +21342,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -19877,6 +21356,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HYST",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -19890,6 +21370,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ADEL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -19903,6 +21384,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "MDEL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -19916,6 +21398,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "A",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -19929,6 +21412,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "B",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -19942,6 +21426,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "C",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -19955,6 +21440,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "D",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -19968,6 +21454,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "E",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -19981,6 +21468,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "F",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -19994,6 +21482,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "G",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -20007,6 +21496,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "H",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -20020,6 +21510,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "I",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -20033,6 +21524,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "J",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -20046,6 +21538,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "K",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -20059,6 +21552,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "L",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -20072,6 +21566,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "AA",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -20085,6 +21580,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "BB",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -20098,6 +21594,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CC",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -20111,6 +21608,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DD",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -20124,6 +21622,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "EE",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -20137,6 +21636,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FF",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -20150,6 +21650,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "GG",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -20163,6 +21664,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HH",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -20176,6 +21678,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "II",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -20189,6 +21692,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "JJ",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -20202,6 +21706,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "KK",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -20215,6 +21720,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -20229,6 +21735,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PAA",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::DbAddr,
         pp: false,
@@ -20243,6 +21750,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PBB",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::DbAddr,
         pp: false,
@@ -20257,6 +21765,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PCC",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::DbAddr,
         pp: false,
@@ -20271,6 +21780,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PDD",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::DbAddr,
         pp: false,
@@ -20285,6 +21795,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PEE",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::DbAddr,
         pp: false,
@@ -20299,6 +21810,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PFF",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::DbAddr,
         pp: false,
@@ -20313,6 +21825,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PGG",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::DbAddr,
         pp: false,
@@ -20327,6 +21840,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PHH",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::DbAddr,
         pp: false,
@@ -20341,6 +21855,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PII",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::DbAddr,
         pp: false,
@@ -20355,6 +21870,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PJJ",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::DbAddr,
         pp: false,
@@ -20369,6 +21885,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PKK",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::DbAddr,
         pp: false,
@@ -20383,6 +21900,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PLL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::DbAddr,
         pp: false,
@@ -20396,6 +21914,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OVAL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -20409,6 +21928,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OSV",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -20422,6 +21942,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "POSV",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -20435,6 +21956,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PA",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -20448,6 +21970,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PB",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -20461,6 +21984,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PC",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -20474,6 +21998,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PD",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -20487,6 +22012,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PE",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -20500,6 +22026,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PF",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -20513,6 +22040,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PG",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -20526,6 +22054,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PH",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -20539,6 +22068,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PI",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -20552,6 +22082,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PJ",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -20565,6 +22096,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PK",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -20578,6 +22110,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -20591,6 +22124,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "POVL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -20604,6 +22138,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LALM",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -20617,6 +22152,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ALST",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -20630,6 +22166,7 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "MLST",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -20647,6 +22184,7 @@ pub static SEL_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -20660,6 +22198,7 @@ pub static SEL_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SELM",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -20673,6 +22212,7 @@ pub static SEL_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SELN",
         dbf_type: DbFieldType::UShort,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -20686,6 +22226,7 @@ pub static SEL_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PREC",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -20699,6 +22240,7 @@ pub static SEL_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NVL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -20712,6 +22254,7 @@ pub static SEL_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPA",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -20725,6 +22268,7 @@ pub static SEL_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPB",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -20738,6 +22282,7 @@ pub static SEL_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPC",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -20751,6 +22296,7 @@ pub static SEL_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPD",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -20764,6 +22310,7 @@ pub static SEL_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPE",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -20777,6 +22324,7 @@ pub static SEL_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPF",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -20790,6 +22338,7 @@ pub static SEL_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPG",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -20803,6 +22352,7 @@ pub static SEL_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPH",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -20816,6 +22366,7 @@ pub static SEL_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPI",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -20829,6 +22380,7 @@ pub static SEL_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPJ",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -20842,6 +22394,7 @@ pub static SEL_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPK",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -20855,6 +22408,7 @@ pub static SEL_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -20868,6 +22422,7 @@ pub static SEL_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "EGU",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -20881,6 +22436,7 @@ pub static SEL_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HOPR",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -20894,6 +22450,7 @@ pub static SEL_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LOPR",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -20907,6 +22464,7 @@ pub static SEL_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HIHI",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -20920,6 +22478,7 @@ pub static SEL_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LOLO",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -20933,6 +22492,7 @@ pub static SEL_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HIGH",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -20946,6 +22506,7 @@ pub static SEL_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LOW",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -20959,6 +22520,7 @@ pub static SEL_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HHSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -20972,6 +22534,7 @@ pub static SEL_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LLSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -20985,6 +22548,7 @@ pub static SEL_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -20998,6 +22562,7 @@ pub static SEL_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -21011,6 +22576,7 @@ pub static SEL_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HYST",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -21024,6 +22590,7 @@ pub static SEL_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ADEL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -21037,6 +22604,7 @@ pub static SEL_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "MDEL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -21050,6 +22618,7 @@ pub static SEL_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "A",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -21063,6 +22632,7 @@ pub static SEL_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "B",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -21076,6 +22646,7 @@ pub static SEL_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "C",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -21089,6 +22660,7 @@ pub static SEL_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "D",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -21102,6 +22674,7 @@ pub static SEL_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "E",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -21115,6 +22688,7 @@ pub static SEL_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "F",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -21128,6 +22702,7 @@ pub static SEL_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "G",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -21141,6 +22716,7 @@ pub static SEL_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "H",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -21154,6 +22730,7 @@ pub static SEL_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "I",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -21167,6 +22744,7 @@ pub static SEL_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "J",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -21180,6 +22758,7 @@ pub static SEL_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "K",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -21193,6 +22772,7 @@ pub static SEL_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "L",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -21206,6 +22786,7 @@ pub static SEL_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LA",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -21219,6 +22800,7 @@ pub static SEL_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LB",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -21232,6 +22814,7 @@ pub static SEL_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LC",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -21245,6 +22828,7 @@ pub static SEL_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LD",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -21258,6 +22842,7 @@ pub static SEL_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LE",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -21271,6 +22856,7 @@ pub static SEL_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LF",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -21284,6 +22870,7 @@ pub static SEL_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LG",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -21297,6 +22884,7 @@ pub static SEL_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LH",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -21310,6 +22898,7 @@ pub static SEL_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LI",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -21323,6 +22912,7 @@ pub static SEL_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LJ",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -21336,6 +22926,7 @@ pub static SEL_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LK",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -21349,6 +22940,7 @@ pub static SEL_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -21362,6 +22954,7 @@ pub static SEL_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LALM",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -21375,6 +22968,7 @@ pub static SEL_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ALST",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -21388,6 +22982,7 @@ pub static SEL_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "MLST",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -21401,6 +22996,7 @@ pub static SEL_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NLST",
         dbf_type: DbFieldType::UShort,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -21418,6 +23014,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -21431,6 +23028,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SELM",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -21444,6 +23042,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SELN",
         dbf_type: DbFieldType::UShort,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -21457,6 +23056,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SELL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -21470,6 +23070,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OFFS",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -21483,6 +23084,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SHFT",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -21496,6 +23098,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OLDN",
         dbf_type: DbFieldType::UShort,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -21509,6 +23112,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PREC",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -21522,6 +23126,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DLY0",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -21535,6 +23140,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DOL0",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -21548,6 +23154,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DO0",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -21561,6 +23168,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LNK0",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -21574,6 +23182,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DLY1",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -21587,6 +23196,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DOL1",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -21600,6 +23210,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DO1",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -21613,6 +23224,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LNK1",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -21626,6 +23238,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DLY2",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -21639,6 +23252,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DOL2",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -21652,6 +23266,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DO2",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -21665,6 +23280,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LNK2",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -21678,6 +23294,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DLY3",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -21691,6 +23308,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DOL3",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -21704,6 +23322,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DO3",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -21717,6 +23336,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LNK3",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -21730,6 +23350,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DLY4",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -21743,6 +23364,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DOL4",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -21756,6 +23378,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DO4",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -21769,6 +23392,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LNK4",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -21782,6 +23406,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DLY5",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -21795,6 +23420,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DOL5",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -21808,6 +23434,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DO5",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -21821,6 +23448,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LNK5",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -21834,6 +23462,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DLY6",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -21847,6 +23476,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DOL6",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -21860,6 +23490,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DO6",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -21873,6 +23504,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LNK6",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -21886,6 +23518,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DLY7",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -21899,6 +23532,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DOL7",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -21912,6 +23546,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DO7",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -21925,6 +23560,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LNK7",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -21938,6 +23574,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DLY8",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -21951,6 +23588,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DOL8",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -21964,6 +23602,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DO8",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -21977,6 +23616,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LNK8",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -21990,6 +23630,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DLY9",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -22003,6 +23644,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DOL9",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -22016,6 +23658,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DO9",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -22029,6 +23672,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LNK9",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -22042,6 +23686,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DLYA",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -22055,6 +23700,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DOLA",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -22068,6 +23714,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DOA",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -22081,6 +23728,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LNKA",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -22094,6 +23742,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DLYB",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -22107,6 +23756,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DOLB",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -22120,6 +23770,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DOB",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -22133,6 +23784,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LNKB",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -22146,6 +23798,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DLYC",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -22159,6 +23812,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DOLC",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -22172,6 +23826,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DOC",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -22185,6 +23840,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LNKC",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -22198,6 +23854,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DLYD",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -22211,6 +23868,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DOLD",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -22224,6 +23882,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DOD",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -22237,6 +23896,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LNKD",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -22250,6 +23910,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DLYE",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -22263,6 +23924,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DOLE",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -22276,6 +23938,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DOE",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -22289,6 +23952,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LNKE",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -22302,6 +23966,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DLYF",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -22315,6 +23980,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DOLF",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -22328,6 +23994,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DOF",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -22341,6 +24008,7 @@ pub static SEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LNKF",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -22358,6 +24026,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -22371,6 +24040,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SELM",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -22384,6 +24054,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SELN",
         dbf_type: DbFieldType::UShort,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -22397,6 +24068,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SELL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -22410,6 +24082,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PREC",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -22423,6 +24096,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DLY1",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -22436,6 +24110,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DOL1",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -22449,6 +24124,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DO1",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -22462,6 +24138,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LNK1",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -22475,6 +24152,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "STR1",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -22488,6 +24166,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DT1",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -22501,6 +24180,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LT1",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -22514,6 +24194,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "WAIT1",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -22527,6 +24208,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "WERR1",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -22540,6 +24222,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "WTG1",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -22553,6 +24236,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IX1",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -22566,6 +24250,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DOL1V",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -22579,6 +24264,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LNK1V",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -22592,6 +24278,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DLY2",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -22605,6 +24292,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DOL2",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -22618,6 +24306,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DO2",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -22631,6 +24320,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LNK2",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -22644,6 +24334,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "STR2",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -22657,6 +24348,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DT2",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -22670,6 +24362,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LT2",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -22683,6 +24376,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "WAIT2",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -22696,6 +24390,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "WERR2",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -22709,6 +24404,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "WTG2",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -22722,6 +24418,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IX2",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -22735,6 +24432,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DOL2V",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -22748,6 +24446,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LNK2V",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -22761,6 +24460,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DLY3",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -22774,6 +24474,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DOL3",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -22787,6 +24488,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DO3",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -22800,6 +24502,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LNK3",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -22813,6 +24516,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "STR3",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -22826,6 +24530,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DT3",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -22839,6 +24544,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LT3",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -22852,6 +24558,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "WAIT3",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -22865,6 +24572,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "WERR3",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -22878,6 +24586,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "WTG3",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -22891,6 +24600,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IX3",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -22904,6 +24614,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DOL3V",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -22917,6 +24628,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LNK3V",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -22930,6 +24642,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DLY4",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -22943,6 +24656,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DOL4",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -22956,6 +24670,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DO4",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -22969,6 +24684,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LNK4",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -22982,6 +24698,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "STR4",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -22995,6 +24712,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DT4",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -23008,6 +24726,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LT4",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -23021,6 +24740,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "WAIT4",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -23034,6 +24754,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "WERR4",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -23047,6 +24768,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "WTG4",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -23060,6 +24782,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IX4",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -23073,6 +24796,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DOL4V",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -23086,6 +24810,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LNK4V",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -23099,6 +24824,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DLY5",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -23112,6 +24838,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DOL5",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -23125,6 +24852,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DO5",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -23138,6 +24866,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LNK5",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -23151,6 +24880,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "STR5",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -23164,6 +24894,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DT5",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -23177,6 +24908,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LT5",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -23190,6 +24922,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "WAIT5",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -23203,6 +24936,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "WERR5",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -23216,6 +24950,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "WTG5",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -23229,6 +24964,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IX5",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -23242,6 +24978,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DOL5V",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -23255,6 +24992,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LNK5V",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -23268,6 +25006,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DLY6",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -23281,6 +25020,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DOL6",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -23294,6 +25034,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DO6",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -23307,6 +25048,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LNK6",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -23320,6 +25062,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "STR6",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -23333,6 +25076,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DT6",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -23346,6 +25090,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LT6",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -23359,6 +25104,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "WAIT6",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -23372,6 +25118,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "WERR6",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -23385,6 +25132,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "WTG6",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -23398,6 +25146,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IX6",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -23411,6 +25160,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DOL6V",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -23424,6 +25174,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LNK6V",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -23437,6 +25188,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DLY7",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -23450,6 +25202,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DOL7",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -23463,6 +25216,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DO7",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -23476,6 +25230,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LNK7",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -23489,6 +25244,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "STR7",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -23502,6 +25258,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DT7",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -23515,6 +25272,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LT7",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -23528,6 +25286,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "WAIT7",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -23541,6 +25300,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "WERR7",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -23554,6 +25314,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "WTG7",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -23567,6 +25328,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IX7",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -23580,6 +25342,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DOL7V",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -23593,6 +25356,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LNK7V",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -23606,6 +25370,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DLY8",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -23619,6 +25384,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DOL8",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -23632,6 +25398,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DO8",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -23645,6 +25412,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LNK8",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -23658,6 +25426,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "STR8",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -23671,6 +25440,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DT8",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -23684,6 +25454,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LT8",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -23697,6 +25468,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "WAIT8",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -23710,6 +25482,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "WERR8",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -23723,6 +25496,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "WTG8",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -23736,6 +25510,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IX8",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -23749,6 +25524,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DOL8V",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -23762,6 +25538,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LNK8V",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -23775,6 +25552,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DLY9",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -23788,6 +25566,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DOL9",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -23801,6 +25580,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DO9",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -23814,6 +25594,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LNK9",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -23827,6 +25608,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "STR9",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -23840,6 +25622,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DT9",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -23853,6 +25636,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LT9",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -23866,6 +25650,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "WAIT9",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -23879,6 +25664,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "WERR9",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -23892,6 +25678,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "WTG9",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -23905,6 +25692,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IX9",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -23918,6 +25706,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DOL9V",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -23931,6 +25720,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LNK9V",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -23944,6 +25734,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DLYA",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -23957,6 +25748,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DOLA",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -23970,6 +25762,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DOA",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -23983,6 +25776,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LNKA",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -23996,6 +25790,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "STRA",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -24009,6 +25804,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DTA",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -24022,6 +25818,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LTA",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -24035,6 +25832,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "WAITA",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -24048,6 +25846,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "WERRA",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -24061,6 +25860,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "WTGA",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -24074,6 +25874,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IXA",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -24087,6 +25888,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DOLAV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -24100,6 +25902,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LNKAV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -24113,6 +25916,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ABORT",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -24126,6 +25930,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ABORTING",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -24139,6 +25944,7 @@ pub static SSEQ_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "BUSY",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -24156,6 +25962,7 @@ pub static STATE_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -24169,6 +25976,7 @@ pub static STATE_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OVAL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -24186,6 +25994,7 @@ pub static STRINGIN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -24199,6 +26008,7 @@ pub static STRINGIN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OVAL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -24212,6 +26022,7 @@ pub static STRINGIN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INP",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -24225,6 +26036,7 @@ pub static STRINGIN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "MPST",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -24238,6 +26050,7 @@ pub static STRINGIN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "APST",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -24251,6 +26064,7 @@ pub static STRINGIN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIOL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -24264,6 +26078,7 @@ pub static STRINGIN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SVAL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -24277,6 +26092,7 @@ pub static STRINGIN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIML",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -24290,6 +26106,7 @@ pub static STRINGIN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIMM",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -24303,6 +26120,7 @@ pub static STRINGIN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIMS",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -24316,6 +26134,7 @@ pub static STRINGIN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OLDSIMM",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -24329,6 +26148,7 @@ pub static STRINGIN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SSCN",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -24342,6 +26162,7 @@ pub static STRINGIN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SDLY",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -24359,6 +26180,7 @@ pub static STRINGOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -24372,6 +26194,7 @@ pub static STRINGOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OVAL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -24385,6 +26208,7 @@ pub static STRINGOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DOL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -24398,6 +26222,7 @@ pub static STRINGOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OMSL",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -24411,6 +26236,7 @@ pub static STRINGOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUT",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -24424,6 +26250,7 @@ pub static STRINGOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "MPST",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -24437,6 +26264,7 @@ pub static STRINGOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "APST",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -24450,6 +26278,7 @@ pub static STRINGOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIOL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -24463,6 +26292,7 @@ pub static STRINGOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIML",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -24476,6 +26306,7 @@ pub static STRINGOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIMM",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -24489,6 +26320,7 @@ pub static STRINGOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIMS",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -24502,6 +26334,7 @@ pub static STRINGOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OLDSIMM",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -24515,6 +26348,7 @@ pub static STRINGOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SSCN",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -24528,6 +26362,7 @@ pub static STRINGOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SDLY",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -24541,6 +26376,7 @@ pub static STRINGOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IVOA",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -24554,6 +26390,7 @@ pub static STRINGOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IVOV",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -24571,6 +26408,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -24584,6 +26422,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INAM",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -24597,6 +26436,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SNAM",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -24610,6 +26450,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPA",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -24623,6 +26464,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPB",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -24636,6 +26478,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPC",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -24649,6 +26492,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPD",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -24662,6 +26506,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPE",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -24675,6 +26520,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPF",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -24688,6 +26534,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPG",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -24701,6 +26548,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPH",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -24714,6 +26562,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPI",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -24727,6 +26576,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPJ",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -24740,6 +26590,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPK",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -24753,6 +26604,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -24766,6 +26618,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPM",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -24779,6 +26632,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPN",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -24792,6 +26646,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPO",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -24805,6 +26660,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPP",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -24818,6 +26674,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPQ",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -24831,6 +26688,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPR",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -24844,6 +26702,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPS",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -24857,6 +26716,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPT",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -24870,6 +26730,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPU",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -24883,6 +26744,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "EGU",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -24896,6 +26758,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HOPR",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -24909,6 +26772,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LOPR",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -24922,6 +26786,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HIHI",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -24935,6 +26800,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LOLO",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -24948,6 +26814,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HIGH",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -24961,6 +26828,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LOW",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -24974,6 +26842,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PREC",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -24987,6 +26856,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "BRSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -25000,6 +26870,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HHSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -25013,6 +26884,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LLSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -25026,6 +26898,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -25039,6 +26912,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LSV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -25052,6 +26926,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HYST",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -25065,6 +26940,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ADEL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -25078,6 +26954,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "MDEL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -25091,6 +26968,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "A",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -25104,6 +26982,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "B",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -25117,6 +26996,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "C",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -25130,6 +27010,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "D",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -25143,6 +27024,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "E",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -25156,6 +27038,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "F",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -25169,6 +27052,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "G",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -25182,6 +27066,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "H",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -25195,6 +27080,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "I",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -25208,6 +27094,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "J",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -25221,6 +27108,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "K",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -25234,6 +27122,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "L",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -25247,6 +27136,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "M",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -25260,6 +27150,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "N",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -25273,6 +27164,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "O",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -25286,6 +27178,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "P",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -25299,6 +27192,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "Q",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -25312,6 +27206,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "R",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -25325,6 +27220,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "S",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -25338,6 +27234,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "T",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -25351,6 +27248,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "U",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -25364,6 +27262,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LA",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -25377,6 +27276,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LB",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -25390,6 +27290,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LC",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -25403,6 +27304,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LD",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -25416,6 +27318,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LE",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -25429,6 +27332,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LF",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -25442,6 +27346,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LG",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -25455,6 +27360,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LH",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -25468,6 +27374,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LI",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -25481,6 +27388,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LJ",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -25494,6 +27402,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LK",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -25507,6 +27416,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -25520,6 +27430,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LM",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -25533,6 +27444,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LN",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -25546,6 +27458,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LO",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -25559,6 +27472,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LP",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -25572,6 +27486,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LQ",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -25585,6 +27500,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LR",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -25598,6 +27514,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LS",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -25611,6 +27528,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LT",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -25624,6 +27542,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LU",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -25637,6 +27556,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LALM",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -25650,6 +27570,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ALST",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -25663,6 +27584,7 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "MLST",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -25680,6 +27602,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VERS",
         dbf_type: DbFieldType::Float,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -25693,6 +27616,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HOPR",
         dbf_type: DbFieldType::Float,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -25706,6 +27630,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LOPR",
         dbf_type: DbFieldType::Float,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -25719,6 +27644,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INIT",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -25732,6 +27658,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INAN",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -25745,6 +27672,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INBN",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -25758,6 +27686,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INCN",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -25771,6 +27700,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INDN",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -25784,6 +27714,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INEN",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -25797,6 +27728,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INFN",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -25810,6 +27742,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INGN",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -25823,6 +27756,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INHN",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -25836,6 +27770,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ININ",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -25849,6 +27784,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INJN",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -25862,6 +27798,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INKN",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -25875,6 +27812,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INLN",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -25888,6 +27826,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DOLN",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -25901,6 +27840,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUTN",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -25914,6 +27854,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INAV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -25927,6 +27868,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INBV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -25940,6 +27882,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INCV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -25953,6 +27896,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INDV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -25966,6 +27910,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INEV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -25979,6 +27924,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INFV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -25992,6 +27938,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INGV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -26005,6 +27952,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INHV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -26018,6 +27966,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INIV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -26031,6 +27980,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INJV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -26044,6 +27994,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INKV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -26057,6 +28008,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INLV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -26070,6 +28022,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DOLV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -26083,6 +28036,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUTV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -26096,6 +28050,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "A",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -26109,6 +28064,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "B",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -26122,6 +28078,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "C",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -26135,6 +28092,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "D",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -26148,6 +28106,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "E",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -26161,6 +28120,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "F",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -26174,6 +28134,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "G",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -26187,6 +28148,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "H",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -26200,6 +28162,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "I",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -26213,6 +28176,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "J",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -26226,6 +28190,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "K",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -26239,6 +28204,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "L",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -26252,6 +28218,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LA",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -26265,6 +28232,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LB",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -26278,6 +28246,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LC",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -26291,6 +28260,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LD",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -26304,6 +28274,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LE",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -26317,6 +28288,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LF",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -26330,6 +28302,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LG",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -26343,6 +28316,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LH",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -26356,6 +28330,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LI",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -26369,6 +28344,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LJ",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -26382,6 +28358,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LK",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -26395,6 +28372,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -26408,6 +28386,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INAP",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -26421,6 +28400,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INBP",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -26434,6 +28414,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INCP",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -26447,6 +28428,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INDP",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -26460,6 +28442,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INEP",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -26473,6 +28456,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INFP",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -26486,6 +28470,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INGP",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -26499,6 +28484,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INHP",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -26512,6 +28498,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INIP",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -26525,6 +28512,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INJP",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -26538,6 +28526,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INKP",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -26551,6 +28540,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INLP",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -26564,6 +28554,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CALC",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Calc,
         pp: false,
@@ -26577,6 +28568,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CLCV",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -26590,6 +28582,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -26603,6 +28596,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OVAL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -26616,6 +28610,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PREC",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -26629,6 +28624,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OOPT",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -26642,6 +28638,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ODLY",
         dbf_type: DbFieldType::Float,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -26655,6 +28652,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DOPT",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -26668,6 +28666,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DOLD",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -26681,6 +28680,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OEVT",
         dbf_type: DbFieldType::UShort,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -26694,6 +28694,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ADEL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -26707,6 +28708,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "MDEL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -26720,6 +28722,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ALST",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -26733,6 +28736,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "MLST",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -26746,6 +28750,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIOL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -26759,6 +28764,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SVAL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -26772,6 +28778,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIML",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -26785,6 +28792,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIMM",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -26798,6 +28806,7 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIMS",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -26815,6 +28824,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VERS",
         dbf_type: DbFieldType::Float,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -26828,6 +28838,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IVLA",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -26841,6 +28852,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "COPT",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -26854,6 +28866,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -26867,6 +28880,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CLCA",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -26880,6 +28894,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CLCB",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -26893,6 +28908,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CLCC",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -26906,6 +28922,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CLCD",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -26919,6 +28936,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CLCE",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -26932,6 +28950,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CLCF",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -26945,6 +28964,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CLCG",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -26958,6 +28978,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CLCH",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -26971,6 +28992,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CLCI",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -26984,6 +29006,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CLCJ",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -26997,6 +29020,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CLCK",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -27010,6 +29034,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CLCL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -27023,6 +29048,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CLCM",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -27036,6 +29062,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CLCN",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -27049,6 +29076,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CLCO",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -27062,6 +29090,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CLCP",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -27075,6 +29104,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CAV",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -27088,6 +29118,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CBV",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -27101,6 +29132,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CCV",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -27114,6 +29146,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CDV",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -27127,6 +29160,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CEV",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -27140,6 +29174,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CFV",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -27153,6 +29188,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CGV",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -27166,6 +29202,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CHV",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -27179,6 +29216,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CIV",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -27192,6 +29230,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CJV",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -27205,6 +29244,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CKV",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -27218,6 +29258,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CLV",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -27231,6 +29272,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CMV",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -27244,6 +29286,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CNV",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -27257,6 +29300,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "COV",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -27270,6 +29314,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CPV",
         dbf_type: DbFieldType::Long,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -27283,6 +29328,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPA",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -27296,6 +29342,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPB",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -27309,6 +29356,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPC",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -27322,6 +29370,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPD",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -27335,6 +29384,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPE",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -27348,6 +29398,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPF",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -27361,6 +29412,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPG",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -27374,6 +29426,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPH",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -27387,6 +29440,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPI",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -27400,6 +29454,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPJ",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -27413,6 +29468,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPK",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -27426,6 +29482,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -27439,6 +29496,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPM",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -27452,6 +29510,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPN",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -27465,6 +29524,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPO",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -27478,6 +29538,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INPP",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -27491,6 +29552,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUTA",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -27504,6 +29566,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUTB",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -27517,6 +29580,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUTC",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -27530,6 +29594,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUTD",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -27543,6 +29608,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUTE",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -27556,6 +29622,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUTF",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -27569,6 +29636,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUTG",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -27582,6 +29650,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUTH",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -27595,6 +29664,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUTI",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -27608,6 +29678,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUTJ",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -27621,6 +29692,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUTK",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -27634,6 +29706,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUTL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -27647,6 +29720,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUTM",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -27660,6 +29734,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUTN",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -27673,6 +29748,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUTO",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -27686,6 +29762,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OUTP",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -27699,6 +29776,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "EGU",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -27712,6 +29790,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PREC",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -27725,6 +29804,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "A",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -27738,6 +29818,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "B",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -27751,6 +29832,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "C",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -27764,6 +29846,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "D",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -27777,6 +29860,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "E",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -27790,6 +29874,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "F",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -27803,6 +29888,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "G",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -27816,6 +29902,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "H",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -27829,6 +29916,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "I",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -27842,6 +29930,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "J",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -27855,6 +29944,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "K",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -27868,6 +29958,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "L",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -27881,6 +29972,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "M",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -27894,6 +29986,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "N",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -27907,6 +30000,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "O",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -27920,6 +30014,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "P",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: true,
@@ -27933,6 +30028,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LA",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -27946,6 +30042,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LB",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -27959,6 +30056,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LC",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -27972,6 +30070,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LD",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -27985,6 +30084,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LE",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -27998,6 +30098,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LF",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -28011,6 +30112,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LG",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -28024,6 +30126,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LH",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -28037,6 +30140,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LI",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -28050,6 +30154,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LJ",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -28063,6 +30168,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LK",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -28076,6 +30182,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -28089,6 +30196,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LM",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -28102,6 +30210,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LN",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -28115,6 +30224,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LO",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -28128,6 +30238,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LP",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -28141,6 +30252,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CMTA",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -28154,6 +30266,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CMTB",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -28167,6 +30280,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CMTC",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -28180,6 +30294,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CMTD",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -28193,6 +30308,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CMTE",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -28206,6 +30322,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CMTF",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -28219,6 +30336,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CMTG",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -28232,6 +30350,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CMTH",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -28245,6 +30364,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CMTI",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -28258,6 +30378,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CMTJ",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -28271,6 +30392,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CMTK",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -28284,6 +30406,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CMTL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -28297,6 +30420,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CMTM",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -28310,6 +30434,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CMTN",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -28323,6 +30448,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CMTO",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -28336,6 +30462,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CMTP",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -28349,6 +30476,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "MAP",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -28362,6 +30490,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IAV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -28375,6 +30504,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IBV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -28388,6 +30518,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ICV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -28401,6 +30532,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IDV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -28414,6 +30546,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IEV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -28427,6 +30560,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IFV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -28440,6 +30574,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IGV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -28453,6 +30588,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IHV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -28466,6 +30602,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IIV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -28479,6 +30616,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IJV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -28492,6 +30630,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IKV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -28505,6 +30644,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ILV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -28518,6 +30658,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IMV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -28531,6 +30672,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -28544,6 +30686,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IOV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -28557,6 +30700,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "IPV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -28570,6 +30714,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OAV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -28583,6 +30728,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OBV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -28596,6 +30742,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OCV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -28609,6 +30756,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ODV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -28622,6 +30770,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OEV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -28635,6 +30784,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OFV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -28648,6 +30798,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OGV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -28661,6 +30812,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OHV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -28674,6 +30826,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OIV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -28687,6 +30840,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OJV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -28700,6 +30854,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OKV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -28713,6 +30868,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OLV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -28726,6 +30882,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OMV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -28739,6 +30896,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ONV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -28752,6 +30910,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OOV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -28765,6 +30924,7 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OPV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -28783,6 +30943,7 @@ pub static WAVEFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
         dbf_type: DbFieldType::Double,
+        runtime_typed: true,
         read_only: false,
         special: Special::DbAddr,
         pp: true,
@@ -28796,6 +30957,7 @@ pub static WAVEFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "RARM",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -28809,6 +30971,7 @@ pub static WAVEFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PREC",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -28822,6 +30985,7 @@ pub static WAVEFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INP",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -28835,6 +30999,7 @@ pub static WAVEFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "EGU",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -28848,6 +31013,7 @@ pub static WAVEFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HOPR",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -28861,6 +31027,7 @@ pub static WAVEFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LOPR",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -28874,6 +31041,7 @@ pub static WAVEFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NELM",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -28887,6 +31055,7 @@ pub static WAVEFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FTVL",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -28900,6 +31069,7 @@ pub static WAVEFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "BUSY",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -28913,6 +31083,7 @@ pub static WAVEFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NORD",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -28926,6 +31097,7 @@ pub static WAVEFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIOL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -28939,6 +31111,7 @@ pub static WAVEFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIML",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -28952,6 +31125,7 @@ pub static WAVEFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIMM",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Mod,
         pp: false,
@@ -28965,6 +31139,7 @@ pub static WAVEFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIMS",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -28978,6 +31153,7 @@ pub static WAVEFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OLDSIMM",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -28991,6 +31167,7 @@ pub static WAVEFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SSCN",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -29004,6 +31181,7 @@ pub static WAVEFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SDLY",
         dbf_type: DbFieldType::Double,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -29017,6 +31195,7 @@ pub static WAVEFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "MPST",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -29030,6 +31209,7 @@ pub static WAVEFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "APST",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -29043,6 +31223,7 @@ pub static WAVEFORM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "HASH",
         dbf_type: DbFieldType::ULong,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -29065,6 +31246,7 @@ pub static DB_COMMON_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NAME",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -29078,6 +31260,7 @@ pub static DB_COMMON_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DESC",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -29091,6 +31274,7 @@ pub static DB_COMMON_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ASG",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::As,
         pp: false,
@@ -29104,6 +31288,7 @@ pub static DB_COMMON_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SCAN",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Scan,
         pp: false,
@@ -29117,6 +31302,7 @@ pub static DB_COMMON_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PINI",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -29130,6 +31316,7 @@ pub static DB_COMMON_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PHAS",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: false,
         special: Special::Scan,
         pp: false,
@@ -29143,6 +31330,7 @@ pub static DB_COMMON_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "EVNT",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::Scan,
         pp: false,
@@ -29156,6 +31344,7 @@ pub static DB_COMMON_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "TSE",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -29169,6 +31358,7 @@ pub static DB_COMMON_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "TSEL",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -29182,6 +31372,7 @@ pub static DB_COMMON_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DTYP",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -29195,6 +31386,7 @@ pub static DB_COMMON_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DISV",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -29208,6 +31400,7 @@ pub static DB_COMMON_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DISA",
         dbf_type: DbFieldType::Short,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -29221,6 +31414,7 @@ pub static DB_COMMON_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SDIS",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -29234,6 +31428,7 @@ pub static DB_COMMON_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DISP",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -29247,6 +31442,7 @@ pub static DB_COMMON_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PROC",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -29260,6 +31456,7 @@ pub static DB_COMMON_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "STAT",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -29273,6 +31470,7 @@ pub static DB_COMMON_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SEVR",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -29286,6 +31484,7 @@ pub static DB_COMMON_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "AMSG",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -29299,6 +31498,7 @@ pub static DB_COMMON_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NSTA",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -29312,6 +31512,7 @@ pub static DB_COMMON_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NSEV",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -29325,6 +31526,7 @@ pub static DB_COMMON_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "NAMSG",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -29338,6 +31540,7 @@ pub static DB_COMMON_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ACKS",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -29351,6 +31554,7 @@ pub static DB_COMMON_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ACKT",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -29364,6 +31568,7 @@ pub static DB_COMMON_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "DISS",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -29377,6 +31582,7 @@ pub static DB_COMMON_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LCNT",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -29390,6 +31596,7 @@ pub static DB_COMMON_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PACT",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -29403,6 +31610,7 @@ pub static DB_COMMON_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PUTF",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -29416,6 +31624,7 @@ pub static DB_COMMON_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "RPRO",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -29429,6 +31638,7 @@ pub static DB_COMMON_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PRIO",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::Scan,
         pp: false,
@@ -29442,6 +31652,7 @@ pub static DB_COMMON_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "TPRO",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -29455,6 +31666,7 @@ pub static DB_COMMON_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "UDF",
         dbf_type: DbFieldType::UChar,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: true,
@@ -29468,6 +31680,7 @@ pub static DB_COMMON_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "UDFS",
         dbf_type: DbFieldType::Enum,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,
@@ -29481,6 +31694,7 @@ pub static DB_COMMON_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "UTAG",
         dbf_type: DbFieldType::UInt64,
+        runtime_typed: false,
         read_only: true,
         special: Special::NoMod,
         pp: false,
@@ -29494,6 +31708,7 @@ pub static DB_COMMON_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "FLNK",
         dbf_type: DbFieldType::String,
+        runtime_typed: false,
         read_only: false,
         special: Special::None,
         pp: false,

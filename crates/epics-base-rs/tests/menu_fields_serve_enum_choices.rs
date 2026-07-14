@@ -19,8 +19,10 @@ use epics_base_rs::server::record::RecordInstance;
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
-/// What a CA client sees on create-channel: the native type is read from the
-/// VALUE, not from the descriptor (`epics-ca-rs/src/server/tcp.rs`).
+/// What a CA client sees on create-channel. The CA server reads the native type
+/// off this value (`epics-ca-rs/src/server/tcp.rs`), and the value is the stored
+/// one projected onto the field's DECLARED type — so the type it reads is the
+/// declaration, and it cannot drift from the bytes the GET path then serves.
 fn served(inst: &RecordInstance, field: &str) -> EpicsValue {
     inst.client_field_value(field)
         .unwrap_or_else(|| panic!("{field} is not served at all"))
@@ -88,4 +90,66 @@ fn a_put_to_a_menu_field_still_lands_as_the_stored_index() {
     inst.record.put_field("SIMM", EpicsValue::Short(1)).unwrap();
     assert_eq!(served(&inst, "SIMM"), EpicsValue::Enum(1));
     assert_eq!(enum_strs(&inst, "SIMM")[1], "YES");
+}
+
+/// INVARIANT: a field that has menu choices is SERVED as `DBR_ENUM`.
+///
+/// A menu field is declared in two halves — the TYPE in a field table, the
+/// CHOICES in `Record::menu_field_choices` or the field's own `menu()` — and
+/// nothing but this check stops them disagreeing. A field with choices served
+/// as a bare `DBR_SHORT` is a contradiction a client cannot resolve: it is
+/// handed an index and no labels to read it with.
+///
+/// Asserted on the EFFECTIVE declaration — `declared_field_type`, the type that
+/// actually reaches the wire — because that is where the invariant is
+/// load-bearing. This is the check that caught the 24 downstream fields
+/// (`scaler` `CONT`/`PCNT`/`G{n}`/`D{n}`, `epid` `SMSL`/`FMOD`/`FBOP`,
+/// `timestamp` `TST`, `throttle`'s six, `motor`'s twelve) whose hand tables
+/// said `Short` while their records answered with choice labels; those crates
+/// have no generated table, so the hand table WAS what reached the wire.
+///
+/// It does not catch a contradiction in a hand table that the generated table
+/// shadows — `waveform.SIMM`, `swait.OOPT`, `sseq.WAIT1`.. and 27 others still
+/// say `Short` in tables `field_desc` no longer consults for the type. Those are
+/// inert (the `.dbd` table wins, and `served_native_type_is_declared` pins every
+/// one of them against the C IOC), but they are not *correct*, and they are the
+/// property of the hand-table migration: four of those record types get their
+/// table from `#[derive(EpicsRecord)]`, which types each field from its Rust
+/// struct member, so there is no per-field type to fix without a macro
+/// attribute. The type-level close — a `FieldDesc` constructor that sets type
+/// and choices together, making the contradiction unrepresentable — is not
+/// built.
+#[test]
+fn menu_choices_are_served_as_dbr_enum() {
+    use epics_base_rs::server::db_loader::create_record;
+    use epics_base_rs::server::record::dbd_generated::RECORD_TYPES;
+
+    let mut contradictory = Vec::new();
+    for record_type in RECORD_TYPES {
+        let Ok(rec) = create_record(record_type) else {
+            continue;
+        };
+        let inst = RecordInstance::new_boxed(format!("T:{record_type}"), rec);
+        for desc in inst.record.field_list() {
+            let has_choices =
+                desc.menu.is_some() || inst.record.menu_field_choices(desc.name).is_some();
+            if !has_choices {
+                continue;
+            }
+            let served = inst.declared_field_type(desc.name);
+            if served != Some(DbFieldType::Enum) {
+                contradictory.push(format!(
+                    "{record_type}.{}: has menu choices but is served as {served:?}, \
+                     so a client gets a bare index and no labels to read it with",
+                    desc.name
+                ));
+            }
+        }
+    }
+    assert!(
+        contradictory.is_empty(),
+        "{} field(s) are served at a type that contradicts their own menu:\n  {}",
+        contradictory.len(),
+        contradictory.join("\n  ")
+    );
 }

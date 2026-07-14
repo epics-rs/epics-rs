@@ -954,10 +954,21 @@ async fn test_caput_to_udf_field_posts_udf_event() {
     let event = udf_rx
         .try_recv()
         .expect("a caput to .UDF must deliver a .UDF monitor event");
+    // `UDF` is `DBF_UCHAR` (`dbCommon.dbd:265`), so the monitor update carries
+    // it as the unsigned byte it is declared as — CA then serves that as
+    // `DBR_CHAR`, which is what the compiled C IOC reports for `.UDF`
+    // (`fixtures/c_native_types.tsv`: `ai UDF DBF_UCHAR - DBF_CHAR`). Asserting
+    // the SIGNED `EpicsValue::Char` here pinned the storage variant the record
+    // happened to hold, which is exactly the type-from-the-value defect.
     assert!(
-        matches!(event.snapshot.value, EpicsValue::Char(1)),
+        matches!(event.snapshot.value, EpicsValue::UChar(1)),
         "the .UDF event must carry the value the client wrote, got {:?}",
         event.snapshot.value
+    );
+    assert_eq!(
+        event.snapshot.value.dbr_type().ca_wire_type(),
+        DbFieldType::Char as u16,
+        "a DBF_UCHAR field goes on the CA wire as DBR_CHAR"
     );
 }
 

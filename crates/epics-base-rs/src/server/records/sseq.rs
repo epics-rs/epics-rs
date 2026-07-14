@@ -1,6 +1,7 @@
 use super::link_status::{
-    DBF_UNKNOWN, LINK_CON as LNKV_CON, LINK_LOC as LNKV_LOC,
-    LINK_STATUS_CHOICES as SSEQ_LNKV_CHOICES, LinkStatusGen, classify_link, link_is_external,
+    DBF_NOACCESS, DBF_UNKNOWN, LINK_CON as LNKV_CON, LINK_LOC as LNKV_LOC,
+    LINK_STATUS_CHOICES as SSEQ_LNKV_CHOICES, LinkRole, LinkStatusGen, classify_link,
+    link_is_external,
 };
 use crate::error::{CaError, CaResult};
 use crate::server::database::AsyncDbHandle;
@@ -268,11 +269,13 @@ impl Default for SseqStep {
             str_val: PvString::default(),
             wait: 0,
             waiting: false,
-            // An empty link is a CONSTANT link with no resolvable field type
-            // (C `init_record`, sseqRecord.c:204-206,222-225).
+            // An empty link is a CONSTANT link. C `init_record` marks the DOL
+            // one `DBF_NOACCESS` — it consumed the constant, once — and the LNK
+            // one `DBF_unknown`, since a constant output has no target
+            // (sseqRecord.c:204-206,222-225).
             dol_status: LNKV_CON,
             lnk_status: LNKV_CON,
-            dol_field_type: DBF_UNKNOWN,
+            dol_field_type: DBF_NOACCESS,
             lnk_field_type: DBF_UNKNOWN,
             wait_err: 0,
             lnk_target: OutTarget::UNRESOLVED,
@@ -943,8 +946,8 @@ impl SseqRecord {
             tokio::task::yield_now().await;
             let mut fields: Vec<(String, EpicsValue)> = Vec::with_capacity(NUM_STEPS * 5);
             for (i, (dol, lnk, wait)) in groups.iter().enumerate() {
-                let (dol_status, dol_ft) = classify_link(&handle, dol).await;
-                let (lnk_status, lnk_ft) = classify_link(&handle, lnk).await;
+                let (dol_status, dol_ft) = classify_link(&handle, dol, LinkRole::Input).await;
+                let (lnk_status, lnk_ft) = classify_link(&handle, lnk, LinkRole::Output).await;
                 let werr = wait_config_err(*wait, lnk_status);
                 fields.push((
                     DOLV_FIELDS[i].to_string(),
@@ -1973,15 +1976,17 @@ mod tests {
         // openable/readable (clients previously got field-not-found). With
         // no async context wired, the link-status fields hold their C
         // `init_record` classification of an empty (constant) link: `CON`
-        // status and `DBF_unknown` (-1) field type (sseqRecord.c:204-225).
+        // status, and the field-type code of the link's DIRECTION —
+        // `DBF_NOACCESS` (17) for the consumed DOL constant, `DBF_unknown` (-1)
+        // for the LNK constant, which has no target (sseqRecord.c:204-225).
         let rec = SseqRecord::new();
-        assert_eq!(rec.get_field("DT1"), Some(EpicsValue::Short(-1)));
+        assert_eq!(rec.get_field("DT1"), Some(EpicsValue::Short(17)));
         assert_eq!(rec.get_field("LT1"), Some(EpicsValue::Short(-1)));
         // WERRn = 0: an empty link with the default NoWait is not a misconfig.
         assert_eq!(rec.get_field("WERR1"), Some(EpicsValue::Short(0)));
         assert_eq!(rec.get_field("WTG1"), Some(EpicsValue::Short(0)));
         // A-suffix step variants.
-        assert_eq!(rec.get_field("DTA"), Some(EpicsValue::Short(-1)));
+        assert_eq!(rec.get_field("DTA"), Some(EpicsValue::Short(17)));
         assert_eq!(rec.get_field("WTGA"), Some(EpicsValue::Short(0)));
         assert_eq!(rec.get_field("WERRA"), Some(EpicsValue::Short(0)));
         // DOLnV / LNKnV: empty link → sseqLNKV_CON (3).

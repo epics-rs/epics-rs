@@ -6,7 +6,7 @@ use epics_base_rs::server::record::{
     FieldDesc, LinkType, ProcessAction, ProcessOutcome, Record, link_field_type,
 };
 use epics_base_rs::server::records::link_status::{
-    LINK_CON, LINK_EXT_NC, LinkStatusGen, classify_link,
+    LINK_CON, LINK_EXT_NC, LinkRole, LinkStatusGen, classify_link,
 };
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
@@ -221,8 +221,10 @@ impl ThrottleRecord {
             // this task may be spawned from `set_async_context`, which runs
             // just before the record is inserted into the map.
             tokio::task::yield_now().await;
-            let (ov, _) = classify_link(&handle, &out).await;
-            let (siv, _) = classify_link(&handle, &sinp).await;
+            // OUT is written to, SINP is read from — the classifier answers a
+            // CONSTANT link's field-type code by direction.
+            let (ov, _) = classify_link(&handle, &out, LinkRole::Output).await;
+            let (siv, _) = classify_link(&handle, &sinp, LinkRole::Input).await;
             if link_gen.is_current(token) {
                 let _ = handle
                     .post_fields(

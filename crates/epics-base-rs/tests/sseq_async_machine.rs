@@ -662,13 +662,17 @@ async fn sseq_link_status_loc_vs_con() {
     )
     .await;
 
-    // Empty links classify as CON with unknown (-1) field type.
+    // Empty links classify as CON. The field-type code differs by DIRECTION:
+    // C's `init_record` consumes a constant DOL (`recGblInitConstantLink`) and
+    // marks it `DBF_NOACCESS` = 17 (sseqRecord.c:206) so the per-cycle read
+    // switch never touches it again, while a constant LNK has no target at all
+    // and stays `DBF_unknown` = -1 (:225).
     poll_i16(&db, "SSEQ_LS.DOL2V", 3, "empty DOL → CON").await;
     poll_i16(&db, "SSEQ_LS.LNK2V", 3, "empty LNK → CON").await;
     assert_eq!(
         read_i16(&db, "SSEQ_LS.DT2").await,
-        -1,
-        "empty DOL field type is unknown (-1)"
+        17,
+        "a constant DOL is DBF_NOACCESS (17), not unknown"
     );
     assert_eq!(
         read_i16(&db, "SSEQ_LS.LT2").await,

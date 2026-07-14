@@ -1,7 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{
-    FieldDesc, MENU_SIMM, ProcessOutcome, RawSoftEntry, Record, dbd_generated,
-};
+use crate::server::record::{MENU_SIMM, ProcessOutcome, RawSoftEntry, Record};
 use crate::types::{EpicsValue, PvString};
 
 /// Binary input record matching C biRecord behavior.
@@ -77,8 +75,6 @@ impl BiRecord {
         }
     }
 }
-
-static FIELDS: &[FieldDesc] = dbd_generated::BI_FIELDS;
 
 impl Record for BiRecord {
     fn record_type(&self) -> &'static str {
@@ -398,10 +394,6 @@ impl Record for BiRecord {
             },
             _ => Err(CaError::FieldNotFound(name.into())),
         }
-    }
-
-    fn field_list(&self) -> &'static [FieldDesc] {
-        FIELDS
     }
 
     /// `SIMM` is `DBF_MENU menu(menuSimm)` (`biRecord.dbd.pod`): the binary

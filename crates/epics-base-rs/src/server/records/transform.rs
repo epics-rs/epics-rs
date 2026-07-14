@@ -1,7 +1,7 @@
 use crate::error::{CaError, CaResult};
 use crate::server::record::{
-    AlarmSeverity, FieldDesc, ParsedLink, ProcessAction, ProcessContext, ProcessOutcome, Record,
-    dbd_generated, parse_link_v2, parse_output_link_v2,
+    AlarmSeverity, ParsedLink, ProcessAction, ProcessContext, ProcessOutcome, Record,
+    parse_link_v2, parse_output_link_v2,
 };
 use crate::types::EpicsValue;
 
@@ -214,8 +214,6 @@ impl TransformRecord {
         None
     }
 }
-
-static TRANSFORM_FIELDS: &[FieldDesc] = dbd_generated::TRANSFORM_FIELDS;
 
 /// Choice labels for the calculation-option menu, in index order.
 /// C `menu(transformCOPT)` (synApps `transformRecord.dbd`): 0=Conditional
@@ -696,10 +694,6 @@ impl Record for TransformRecord {
         ]
     }
 
-    fn field_list(&self) -> &'static [FieldDesc] {
-        TRANSFORM_FIELDS
-    }
-
     /// Record-specific `DBF_MENU` fields, served as `DBR_ENUM` with the
     /// menu's choice labels in `.dbd` index order (`transformRecord.dbd`):
     /// `COPT` is `menu(transformCOPT)`, `IVLA` is `menu(transformIVLA)`.
@@ -731,6 +725,7 @@ static INP_FIELD_NAMES: [&str; NUM_CHANNELS] = [
 mod tests {
     use super::*;
     use crate::server::record::CommonFields;
+    use crate::server::record::FieldDeclaration;
 
     /// C's `init_record` tail, `*plvalue = *pvalue` (`transformRecord.c:490`).
     /// The DB path runs it for every record (`seed_constant_links` ends in

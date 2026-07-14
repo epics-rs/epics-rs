@@ -15,6 +15,7 @@
 //! repository** at `crates/epics-base-rs/dbd/`, and its output is checked in, so
 //! neither the build nor CI depends on an EPICS installation.
 
+mod breaktable;
 mod emit;
 mod parse;
 
@@ -24,6 +25,12 @@ use std::process::ExitCode;
 
 const DBD_DIR: &str = "crates/epics-base-rs/dbd";
 const OUT_FILE: &str = "crates/epics-base-rs/src/server/record/dbd_generated.rs";
+/// The breakpoint tables are emitted to their OWN file, not spliced into
+/// `dbd_generated.rs`: they come from a different grammar (`breaktable(...)`,
+/// not `recordtype(...)`), they are `makeBpt` output rather than a hand-written
+/// spec, and keeping them separate means a `bpt*.dbd` change cannot produce a
+/// diff in the record tables.
+const BPT_OUT_FILE: &str = "crates/epics-base-rs/src/server/record/bpt_generated.rs";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -50,28 +57,41 @@ fn main() -> ExitCode {
         }
     };
 
-    let out_path = root.join(OUT_FILE);
-    if write {
-        if let Err(e) = std::fs::write(&out_path, &generated) {
-            eprintln!("dbd-codegen: {}: {e}", out_path.display());
+    let generated_bpt = match generate_breaktables(&root.join(DBD_DIR)) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("dbd-codegen: {e}");
             return ExitCode::FAILURE;
         }
-        eprintln!("dbd-codegen: wrote {}", out_path.display());
-        return ExitCode::SUCCESS;
-    }
+    };
 
-    // --check
-    let current = std::fs::read_to_string(&out_path).unwrap_or_default();
-    if current == generated {
-        eprintln!("dbd-codegen: {} is up to date", out_path.display());
-        ExitCode::SUCCESS
-    } else {
+    let outputs = [
+        (root.join(OUT_FILE), generated),
+        (root.join(BPT_OUT_FILE), generated_bpt),
+    ];
+
+    let mut stale = false;
+    for (path, want) in &outputs {
+        if write {
+            if let Err(e) = std::fs::write(path, want) {
+                eprintln!("dbd-codegen: {}: {e}", path.display());
+                return ExitCode::FAILURE;
+            }
+            eprintln!("dbd-codegen: wrote {}", path.display());
+            continue;
+        }
+        let have = std::fs::read_to_string(path).unwrap_or_default();
+        if &have == want {
+            eprintln!("dbd-codegen: {} is up to date", path.display());
+            continue;
+        }
+        stale = true;
         eprintln!(
             "dbd-codegen: {} is STALE — it does not match the vendored .dbd files.\n\
              Re-run `cargo run -p dbd-codegen -- --write` and commit the result.",
-            out_path.display()
+            path.display()
         );
-        for (n, (a, b)) in current.lines().zip(generated.lines()).enumerate() {
+        for (n, (a, b)) in have.lines().zip(want.lines()).enumerate() {
             if a != b {
                 eprintln!(
                     "  first difference at line {}:\n    have: {a}\n    want: {b}",
@@ -80,8 +100,36 @@ fn main() -> ExitCode {
                 break;
             }
         }
-        ExitCode::FAILURE
     }
+
+    if stale {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// The `breaktable(...)` half of the vendored `.dbd` set. Separate walk,
+/// separate grammar, separate output file — see [`BPT_OUT_FILE`].
+fn generate_breaktables(dbd_dir: &Path) -> Result<String, String> {
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(dbd_dir)
+        .map_err(|e| format!("{}: {e}", dbd_dir.display()))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|e| e == "dbd"))
+        .filter(|p| breaktable::is_breaktable_file(p))
+        .collect();
+    paths.sort();
+
+    let mut tables = Vec::new();
+    for path in &paths {
+        tables.extend(breaktable::parse_file(path)?);
+    }
+    eprintln!(
+        "dbd-codegen: {} breakpoint tables ({} points)",
+        tables.len(),
+        tables.iter().map(|t| t.points.len()).sum::<usize>()
+    );
+    rustfmt(&breaktable::emit(&tables))
 }
 
 /// Walk up from the manifest dir to the workspace root (the directory whose
@@ -116,6 +164,9 @@ fn generate(dbd_dir: &Path) -> Result<String, String> {
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().is_some_and(|e| e == "dbd"))
         .filter(|p| p.file_name().is_some_and(|n| n != "dbCommon.dbd"))
+        // `bpt*.dbd` declare `breaktable(...)`, not `recordtype(...)` — a
+        // different grammar, walked by `generate_breaktables`.
+        .filter(|p| !breaktable::is_breaktable_file(p))
         .collect();
     paths.sort();
 
@@ -206,4 +257,48 @@ fn rustfmt(src: &str) -> Result<String, String> {
         return Err(format!("rustfmt failed: {}", out.status));
     }
     String::from_utf8(out.stdout).map_err(|e| format!("rustfmt: non-utf8 output: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    /// The drift gate.
+    ///
+    /// `dbd_generated.rs` is checked in, so nothing at build time forces it to
+    /// agree with the vendored `.dbd` files it claims to be derived from. The
+    /// file used to say `--check` "is what CI runs" — CI ran no such step, and
+    /// this crate had no test for nextest to pick up, so the single generator
+    /// the port has could go stale in silence and the header would keep
+    /// asserting it hadn't.
+    ///
+    /// It is a `#[test]` rather than a CI-yaml step so `cargo nextest run`
+    /// catches drift on the developer's machine, before the push, and so the
+    /// gate cannot be skipped by editing a workflow file.
+    #[test]
+    fn generated_file_is_not_stale() {
+        let root = super::repo_root().expect("workspace root");
+        let want = super::generate(&root.join(super::DBD_DIR)).expect("generator run");
+        let have = std::fs::read_to_string(root.join(super::OUT_FILE)).unwrap_or_default();
+        if have == want {
+            return;
+        }
+        let first = have
+            .lines()
+            .zip(want.lines())
+            .enumerate()
+            .find(|(_, (a, b))| a != b)
+            .map(|(n, (a, b))| format!("line {}:\n  have: {a}\n  want: {b}", n + 1))
+            .unwrap_or_else(|| {
+                format!(
+                    "length differs: {} vs {} lines",
+                    have.lines().count(),
+                    want.lines().count()
+                )
+            });
+        panic!(
+            "{} is STALE — it no longer matches the vendored .dbd files.\n\
+             Re-run `cargo run -p dbd-codegen -- --write` and commit the result.\n\
+             First difference at {first}",
+            super::OUT_FILE
+        );
+    }
 }

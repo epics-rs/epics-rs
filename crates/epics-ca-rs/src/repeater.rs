@@ -384,8 +384,9 @@ fn fan_out(clients: &mut HashMap<u16, RepeaterClient>, src: SocketAddr, data: &[
 /// that isn't multicast is silently skipped. Logs warnings for join failures
 /// but never aborts: the repeater keeps running for unicast/broadcast beacons.
 fn join_beacon_multicast_groups(sock: &socket2::Socket) {
-    let list = epics_base_rs::runtime::env::get("EPICS_CAS_BEACON_ADDR_LIST")
-        .or_else(|| epics_base_rs::runtime::env::get("EPICS_CA_ADDR_LIST"));
+    let list = epics_base_rs::runtime::env_table::EPICS_CAS_BEACON_ADDR_LIST
+        .get()
+        .or_else(|| epics_base_rs::runtime::env_table::EPICS_CA_ADDR_LIST.get());
     let Some(list) = list else {
         return;
     };

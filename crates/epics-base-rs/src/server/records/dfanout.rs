@@ -1,5 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, ProcessOutcome, Record, dbd_generated};
+use crate::server::record::{ProcessOutcome, Record};
 use crate::types::EpicsValue;
 
 /// Choice labels for the SELM link-selection menu, in index order.
@@ -180,15 +180,9 @@ impl DfanoutRecord {
     }
 }
 
-static DFANOUT_FIELDS: &[FieldDesc] = dbd_generated::DFANOUT_FIELDS;
-
 impl Record for DfanoutRecord {
     fn record_type(&self) -> &'static str {
         "dfanout"
-    }
-
-    fn field_list(&self) -> &'static [FieldDesc] {
-        DFANOUT_FIELDS
     }
 
     fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {

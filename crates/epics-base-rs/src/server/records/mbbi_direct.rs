@@ -1,6 +1,6 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, MENU_SIMM, ProcessOutcome, RawSoftEntry, Record};
-use crate::types::{DbFieldType, EpicsValue};
+use crate::server::record::{MENU_SIMM, ProcessOutcome, RawSoftEntry, Record};
+use crate::types::EpicsValue;
 
 // Multi-bit binary input direct record.
 // VAL holds the full unsigned 32-bit value; B0-B1F expose individual bits
@@ -82,83 +82,9 @@ pub(crate) const BIT_NAMES: [&str; 32] = [
     "B1D", "B1E", "B1F",
 ];
 
-fn bit_field_descs() -> &'static [FieldDesc] {
-    // Const-evaluated table of the 32 bit fields.
-    macro_rules! bf {
-        ($name:literal) => {
-            FieldDesc::new($name, DbFieldType::Char, false)
-        };
-    }
-    static BITS: [FieldDesc; 32] = [
-        bf!("B0"),
-        bf!("B1"),
-        bf!("B2"),
-        bf!("B3"),
-        bf!("B4"),
-        bf!("B5"),
-        bf!("B6"),
-        bf!("B7"),
-        bf!("B8"),
-        bf!("B9"),
-        bf!("BA"),
-        bf!("BB"),
-        bf!("BC"),
-        bf!("BD"),
-        bf!("BE"),
-        bf!("BF"),
-        bf!("B10"),
-        bf!("B11"),
-        bf!("B12"),
-        bf!("B13"),
-        bf!("B14"),
-        bf!("B15"),
-        bf!("B16"),
-        bf!("B17"),
-        bf!("B18"),
-        bf!("B19"),
-        bf!("B1A"),
-        bf!("B1B"),
-        bf!("B1C"),
-        bf!("B1D"),
-        bf!("B1E"),
-        bf!("B1F"),
-    ];
-    &BITS
-}
-
-static MBBI_DIRECT_HEAD_FIELDS: &[FieldDesc] = &[
-    FieldDesc::new("VAL", DbFieldType::Long, false),
-    FieldDesc::new("RVAL", DbFieldType::ULong, false),
-    FieldDesc::new("ORAW", DbFieldType::ULong, true),
-    FieldDesc::new("MASK", DbFieldType::ULong, false),
-    FieldDesc::new("SHFT", DbFieldType::UShort, false),
-    FieldDesc::new("NOBT", DbFieldType::Short, false),
-    FieldDesc::new("MLST", DbFieldType::Long, true),
-    FieldDesc::new("SIMM", DbFieldType::Short, false),
-    FieldDesc::new("SIML", DbFieldType::String, false),
-    FieldDesc::new("SIOL", DbFieldType::String, false),
-    FieldDesc::new("SIMS", DbFieldType::Short, false),
-    FieldDesc::new("SDLY", DbFieldType::Double, false),
-];
-
-/// Full field table: the 11 scalar fields followed by the 32 bit fields.
-fn mbbi_direct_fields() -> &'static [FieldDesc] {
-    use std::sync::OnceLock;
-    static ALL: OnceLock<Vec<FieldDesc>> = OnceLock::new();
-    ALL.get_or_init(|| {
-        let mut v: Vec<FieldDesc> = MBBI_DIRECT_HEAD_FIELDS.to_vec();
-        v.extend_from_slice(bit_field_descs());
-        v
-    })
-}
-
 impl Record for MbbiDirectRecord {
     fn record_type(&self) -> &'static str {
         "mbbiDirect"
-    }
-
-    fn field_list(&self) -> &'static [FieldDesc] {
-        mbbi_direct_fields()
     }
 
     /// `SIMM` is `DBF_MENU menu(menuSimm)` (`mbbiDirectRecord.dbd.pod`): the

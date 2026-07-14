@@ -8,7 +8,7 @@
 //! `should_output_fn` knob this file can switch back to the derive form.
 
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, MENU_YES_NO, ProcessOutcome, Record, dbd_generated};
+use crate::server::record::{MENU_YES_NO, ProcessOutcome, Record};
 use crate::types::{EpicsValue, PvString};
 
 pub struct LongoutRecord {
@@ -160,8 +160,6 @@ impl LongoutRecord {
     }
 }
 
-static LONGOUT_FIELDS: &[FieldDesc] = dbd_generated::LONGOUT_FIELDS;
-
 /// Choice labels for the output-execute-option menu, in index order.
 /// C `menu(longoutOOPT)` (`longoutRecord.dbd.pod:23-29`). A distinct menu
 /// from `calcoutOOPT`, with the same six choices and no trailing "Never".
@@ -202,10 +200,6 @@ impl Record for LongoutRecord {
             self.val = self.val.clamp(self.drvl, self.drvh);
         }
         Ok(ProcessOutcome::complete())
-    }
-
-    fn field_list(&self) -> &'static [FieldDesc] {
-        LONGOUT_FIELDS
     }
 
     /// `DBF_MENU` fields, served as `DBR_ENUM` with the menu's choice labels

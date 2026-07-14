@@ -169,19 +169,24 @@ pub(crate) fn prime_connection_timeout() {
 
 /// The uncached resolution behind [`connection_timeout`].
 fn resolve_connection_timeout() -> Duration {
-    /// C `CA_CONN_VERIFY_PERIOD` (`cac.cpp:190`).
-    const DEFAULT_SECS: f64 = 30.0;
-    let secs = match crate::estdlib::env_double("EPICS_CA_CONN_TMO") {
+    use epics_base_rs::runtime::env_table::EPICS_CA_CONN_TMO;
+    // C `CA_CONN_VERIFY_PERIOD` (`cac.cpp:190`) is a hand-copy of the table's
+    // "30.0"; here the number has one home.
+    let default_secs: f64 = EPICS_CA_CONN_TMO
+        .default_str()
+        .parse()
+        .expect("EPICS_CA_CONN_TMO's compiled default is a number");
+    // Unset resolves to the compiled default string and parses, silently — so
+    // only a set-but-bad value reaches the error arm.
+    let secs = match EPICS_CA_CONN_TMO.double() {
         Ok(v) => v,
-        // Unset: C reads the compiled "30.0" default string, silently.
-        Err(crate::estdlib::EnvDoubleError::Unset) => DEFAULT_SECS,
         // C `cac::cac` (`cac.cpp:189-194`) — both lines, verbatim, on top
         // of the "Unable to find a real number in ..." that
         // `envGetDoubleConfigParam` already printed.
-        Err(crate::estdlib::EnvDoubleError::Invalid(_)) => {
+        Err(_) => {
             eprintln!("EPICS \"EPICS_CA_CONN_TMO\" double fetch failed");
-            eprintln!("Defaulting \"EPICS_CA_CONN_TMO\" = {DEFAULT_SECS:.6}");
-            DEFAULT_SECS
+            eprintln!("Defaulting \"EPICS_CA_CONN_TMO\" = {default_secs:.6}");
+            default_secs
         }
     };
     // DOCUMENTED DEVIATION — a non-positive (or NaN) period does not become a
@@ -207,10 +212,10 @@ fn resolve_connection_timeout() -> Duration {
     } else {
         eprintln!(
             "Warning: \"EPICS_CA_CONN_TMO\" = {secs} is not a positive period; \
-             using {DEFAULT_SECS:.6} (a non-positive period fires the connection \
+             using {default_secs:.6} (a non-positive period fires the connection \
              watchdog continuously)"
         );
-        crate::estdlib::duration_from_secs(DEFAULT_SECS)
+        crate::estdlib::duration_from_secs(default_secs)
     }
 }
 /// Legacy seconds accessor kept for call sites that need a coarse
@@ -2646,7 +2651,7 @@ mod recv_body_limit_tests {
     use std::time::Duration;
     use tokio::io::AsyncWriteExt;
 
-    /// A frame announcing a body far larger than `max_payload_size()` must
+    /// A frame announcing a body far larger than `max_frame_body_bytes()` must
     /// NOT close the circuit: the loop waits for the body, exactly as C waits
     /// for the bytes in `recvQue`. (Pre-fix: `TcpClosed` immediately, both
     /// from the parser's "payload too large" and from the accumulation cap.)
@@ -2674,11 +2679,11 @@ mod recv_body_limit_tests {
             std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
         ));
 
-        // Extended header announcing 3x max_payload_size() of body.
+        // Extended header announcing 3x max_frame_body_bytes() of body.
         let mut hdr = CaHeader::new(CA_PROTO_EVENT_ADD);
         hdr.postsize = 0xFFFF;
         let mut frame = hdr.to_bytes().to_vec();
-        let huge = (crate::protocol::max_payload_size() * 3) as u32;
+        let huge = (crate::protocol::max_frame_body_bytes() * 3) as u32;
         frame.extend_from_slice(&huge.to_be_bytes());
         frame.extend_from_slice(&0u32.to_be_bytes());
         assert_eq!(frame.len(), 24);
@@ -2698,12 +2703,12 @@ mod recv_body_limit_tests {
         let _ = tokio::time::timeout(Duration::from_secs(2), loop_handle).await;
     }
 
-    /// The end of the same story: a body PAST `max_payload_size()` is
+    /// The end of the same story: a body PAST `max_frame_body_bytes()` is
     /// delivered, and framing resumes on the frame that follows it. Uses a
-    /// 20 MiB payload — over the 16 MiB `max_payload_size()` default that the
+    /// 20 MiB payload — over the 16 MiB `max_frame_body_bytes()` default that the
     /// pre-fix client turned into a hard close.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn body_larger_than_max_payload_size_is_delivered() {
+    async fn body_larger_than_max_frame_body_bytes_is_delivered() {
         let server_addr: SocketAddr = "127.0.0.1:5064".parse().unwrap();
         let (event_tx, mut event_rx) = mpsc::unbounded_channel::<TransportEvent>();
         let (write_tx, _write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
@@ -2730,7 +2735,7 @@ mod recv_body_limit_tests {
         // dispatcher drops it, but the framer must consume exactly
         // 24 + 20 MiB bytes and carry on.
         const BODY: usize = 20 * 1024 * 1024;
-        assert!(BODY > crate::protocol::max_payload_size() / 2);
+        assert!(BODY > crate::protocol::max_frame_body_bytes() / 2);
         let mut hdr = CaHeader::new(CA_PROTO_EVENT_ADD);
         hdr.postsize = 0xFFFF;
         let mut frame = hdr.to_bytes().to_vec();
@@ -3256,13 +3261,18 @@ mod flow_control_tests {
     /// so it stays at `contiguousMsgCountWhichTriggersFlowControl` = 10.
     #[test]
     fn r6_17_max_contiguous_frames_scales_from_max_array_bytes() {
-        use crate::protocol::{COM_BUF_SIZE, MAX_TCP, max_contiguous_frames, max_recv_bytes_tcp};
+        use crate::protocol::{
+            COM_BUF_SIZE, MAX_TCP, max_array_bytes_buffer, max_contiguous_frames,
+        };
         assert_eq!(
             MAX_TCP / COM_BUF_SIZE,
             1,
             "bufsPerArray is not > 1 at the C default"
         );
-        assert!(max_recv_bytes_tcp() >= MAX_TCP, "C rounds up to MAX_TCP");
+        assert!(
+            max_array_bytes_buffer() >= MAX_TCP,
+            "C rounds up to MAX_TCP"
+        );
         assert!(
             max_contiguous_frames() >= 10,
             "never below C's contiguousMsgCountWhichTriggersFlowControl"

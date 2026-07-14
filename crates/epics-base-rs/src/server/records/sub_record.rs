@@ -1,5 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, InputFetchPolicy, ProcessOutcome, Record, dbd_generated};
+use crate::server::record::{InputFetchPolicy, ProcessOutcome, Record};
 use crate::types::{EpicsValue, PvString};
 
 /// Number of subroutine input arguments. C `subRecord.c`:
@@ -95,8 +95,6 @@ impl Default for SubRecord {
         }
     }
 }
-
-static SUB_FIELDS: &[FieldDesc] = dbd_generated::SUB_FIELDS;
 
 impl Record for SubRecord {
     fn record_type(&self) -> &'static str {
@@ -225,10 +223,6 @@ impl Record for SubRecord {
             return Ok(());
         }
         Err(CaError::FieldNotFound(name.to_string()))
-    }
-
-    fn field_list(&self) -> &'static [FieldDesc] {
-        SUB_FIELDS
     }
 
     /// C `subRecord.c:104`: every CONSTANT input link is loaded into its value

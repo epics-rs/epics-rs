@@ -1,8 +1,6 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{
-    FieldDesc, FieldMetadataOverride, InputFetchPolicy, ProcessOutcome, Record,
-};
-use crate::types::{DbFieldType, EpicsValue, PvString};
+use crate::server::record::{FieldMetadataOverride, InputFetchPolicy, ProcessOutcome, Record};
+use crate::types::{EpicsValue, PvString};
 
 /// Number of aSub channels. C `aSubRecord.c`: `NUM_ARGS == 21`
 /// (inputs `A..U`, outputs `VALA..VALU`).
@@ -230,84 +228,6 @@ fn channel_get(v: &EpicsValue) -> EpicsValue {
     }
 }
 
-impl ASubRecord {
-    /// Build the static field-descriptor table (21 of each per-channel
-    /// field plus VAL/SNAM/INAM).
-    fn descriptors() -> Vec<FieldDesc> {
-        let mut v = vec![
-            FieldDesc::new("VAL", DbFieldType::Double, false),
-            FieldDesc::new("SNAM", DbFieldType::String, false),
-            // INAM: init-routine name, SPC_NOMOD (config; .db-load only).
-            FieldDesc::new("INAM", DbFieldType::String, true),
-            FieldDesc::new("BRSV", DbFieldType::Short, false),
-            FieldDesc::new("PREC", DbFieldType::Short, false),
-            FieldDesc::new("EFLG", DbFieldType::Short, false),
-            FieldDesc::new("LFLG", DbFieldType::Short, false),
-            // SUBL/ONAM are `special(SPC_NOMOD)` in C: client runtime puts are
-            // blocked (read_only), but the `.db` loader and the framework's
-            // own processing writes go through `put_field` directly.
-            FieldDesc::new("SUBL", DbFieldType::String, true),
-            FieldDesc::new("ONAM", DbFieldType::String, true),
-        ];
-        // Per-channel field families. Names are leaked to obtain the
-        // 'static lifetime FieldDesc requires; the table is built once.
-        for &c in SUFFIX.iter() {
-            let mk = |s: String| -> &'static str { Box::leak(s.into_boxed_str()) };
-            v.push(FieldDesc::new(
-                mk(format!("INP{c}")),
-                DbFieldType::String,
-                false,
-            ));
-            v.push(FieldDesc::new(
-                mk(c.to_string()),
-                DbFieldType::Double,
-                false,
-            ));
-            v.push(FieldDesc::new(
-                mk(format!("VAL{c}")),
-                DbFieldType::Double,
-                false,
-            ));
-            v.push(FieldDesc::new(
-                mk(format!("OUT{c}")),
-                DbFieldType::String,
-                false,
-            ));
-            v.push(FieldDesc::new(
-                mk(format!("FT{c}")),
-                DbFieldType::Short,
-                false,
-            ));
-            v.push(FieldDesc::new(
-                mk(format!("FTV{c}")),
-                DbFieldType::Short,
-                false,
-            ));
-            v.push(FieldDesc::new(
-                mk(format!("NO{c}")),
-                DbFieldType::Long,
-                false,
-            ));
-            v.push(FieldDesc::new(
-                mk(format!("NOV{c}")),
-                DbFieldType::Long,
-                false,
-            ));
-            v.push(FieldDesc::new(
-                mk(format!("NE{c}")),
-                DbFieldType::Long,
-                true,
-            ));
-            v.push(FieldDesc::new(
-                mk(format!("NEV{c}")),
-                DbFieldType::Long,
-                true,
-            ));
-        }
-        v
-    }
-}
-
 impl Record for ASubRecord {
     fn record_type(&self) -> &'static str {
         "aSub"
@@ -467,12 +387,6 @@ impl Record for ASubRecord {
             _ => return Err(CaError::FieldNotFound(name.to_string())),
         }
         Ok(())
-    }
-
-    fn field_list(&self) -> &'static [FieldDesc] {
-        use std::sync::OnceLock;
-        static FIELDS: OnceLock<Vec<FieldDesc>> = OnceLock::new();
-        FIELDS.get_or_init(ASubRecord::descriptors)
     }
 
     fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {

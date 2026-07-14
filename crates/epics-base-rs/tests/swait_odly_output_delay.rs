@@ -52,7 +52,7 @@ impl Record for ProcCounter {
     fn put_field(&mut self, _name: &str, _value: EpicsValue) -> CaResult<()> {
         Ok(())
     }
-    fn field_list(&self) -> &'static [FieldDesc] {
+    fn hand_field_list(&self) -> &'static [FieldDesc] {
         &[]
     }
 }

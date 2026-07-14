@@ -20,6 +20,7 @@
 //! The boundaries are the menu itself: every choice, in and out of range.
 
 use epics_base_rs::server::db_loader::create_record;
+use epics_base_rs::server::record::FieldDeclaration;
 use epics_base_rs::server::record::{Ftype, MENU_FTYPE, RecordInstance};
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
@@ -80,15 +81,28 @@ fn r21_every_menu_ftype_choice_types_the_val_buffer() {
                 want,
                 "{rt}.VAL under FTVL={label} must be served as its element type"
             );
+            // The declaration must NOT answer the type here, and must say so.
+            // `waveformRecord.dbd` gives VAL a placeholder type plus
+            // `special(SPC_DBADDR)`; C's `cvt_dbaddr` overwrites
+            // `paddr->field_type` from FTVL at name-resolution time. The
+            // generated FieldDesc is therefore `runtime_typed`, and the served
+            // type is the stored buffer's — asserted above. A field table that
+            // FTVL-switched its own `dbf_type` (the hand-written one did) was a
+            // second declaration of VAL, contradicting the `.dbd`'s.
             let desc = inst
                 .record
                 .field_list()
                 .iter()
                 .find(|f| f.name == "VAL")
                 .expect("VAL is in the field table");
+            assert!(
+                desc.runtime_typed,
+                "{rt}.VAL is typed by FTVL at runtime, not by the .dbd"
+            );
             assert_eq!(
-                desc.dbf_type, want,
-                "{rt}: the field table and the buffer must agree under FTVL={label}"
+                inst.declared_field_type("VAL"),
+                None,
+                "{rt}.VAL is runtime-typed: the declaration has no type to hand out"
             );
         }
     }

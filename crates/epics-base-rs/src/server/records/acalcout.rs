@@ -93,8 +93,8 @@
 
 use crate::error::{CaError, CaResult};
 use crate::server::record::{
-    CyclePostMask, FieldDesc, InputFetchPolicy, OutTarget, ProcessAction, ProcessOutcome, Record,
-    RecordProcessResult, dbd_generated,
+    CyclePostMask, InputFetchPolicy, OutTarget, ProcessAction, ProcessOutcome, Record,
+    RecordProcessResult,
 };
 use crate::types::{EpicsValue, PvString};
 
@@ -737,8 +737,6 @@ impl AcalcoutRecord {
         }
     }
 }
-
-static ACALCOUT_FIELDS: &[FieldDesc] = dbd_generated::ACALCOUT_FIELDS;
 
 /// `menu(acalcoutOOPT)` (`aCalcoutRecord.dbd`): like `scalcoutOOPT` with the
 /// trailing "Never" choice (index 6).
@@ -1733,10 +1731,6 @@ impl Record for AcalcoutRecord {
         }
     }
 
-    fn field_list(&self) -> &'static [FieldDesc] {
-        ACALCOUT_FIELDS
-    }
-
     /// Record-specific `DBF_MENU` fields. `HHSV..LSV` (menuAlarmSevr) and
     /// `IVOA` (menuIvoa) are shared menus resolved centrally.
     fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
@@ -1872,6 +1866,7 @@ impl Record for AcalcoutRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::record::FieldDeclaration;
 
     #[test]
     fn test_acalcout_default_matches_dbd_initials() {

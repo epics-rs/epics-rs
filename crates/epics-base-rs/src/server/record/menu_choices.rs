@@ -1,6 +1,11 @@
-//! Choice-string tables for the EPICS shared `menu(...)` definitions, and
-//! the field-name registry that maps a globally-consistent menu field to
-//! its table.
+//! The field-name registry that maps a globally-consistent menu field to its
+//! `menu(...)` choice table.
+//!
+//! The tables themselves are NOT defined here: they are generated from
+//! `dbd/menu*.dbd` into [`dbd_generated`](super::dbd_generated) and re-exported
+//! below. This module owns only the *mapping* — which shared field name resolves
+//! to which menu — which is a fact about the record `.dbd`s collectively and has
+//! no single `.dbd` to be read from.
 //!
 //! In EPICS dbStaticLib a `DBF_MENU` field is served to clients as
 //! `DBR_ENUM`: the value is the menu index and the field carries its
@@ -9,10 +14,10 @@
 //! `get_enum_str`). A handful of menus are *shared* — the same `menu()`
 //! is referenced by the same field name across every record type
 //! (`HHSV`/`HSV`/`LSV`/`LLSV`/... are always `menuAlarmSevr`, `OMSL` is
-//! always `menuOmsl`, and so on). Those tables are defined once here and
-//! keyed by field name in [`shared_menu_choices`], so a record never
-//! restates the mapping. Record-*specific* menus (`sel.SELM`,
-//! `compress.ALG`, ...) stay with their record via
+//! always `menuOmsl`, and so on). Those names are keyed to their generated
+//! table once, in [`shared_menu_choices`], so a record never restates the
+//! mapping. Record-*specific* menus (`sel.SELM`, `compress.ALG`, ...) stay with
+//! their record via
 //! [`crate::server::record::Record::menu_field_choices`].
 //!
 //! A name only belongs in [`shared_menu_choices`] when it maps to the
@@ -31,110 +36,29 @@
 //!   (`aaiRecord.dbd.pod` `menu(aaiPOST)`). The order is wire-visible, so
 //!   a single shared table would mislabel those records.
 //!
-//! The choice order MUST match the `menu()` value order in the upstream
-//! `.dbd` exactly: the index↔string mapping is wire-visible to clients.
-//! Each table cites its source.
+//! The choice order MUST match the `menu()` value order in the upstream `.dbd`
+//! exactly: the index↔string mapping is wire-visible to clients. That is why
+//! the tables are generated and not written: a hand copy can drift, and the
+//! drift is silent.
 
 use crate::error::{CaError, CaResult};
 use crate::server::snapshot::EnumStringForm;
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
-/// `menu(menuAlarmSevr)` — `menuAlarmSevr.dbd.pod:21-24`.
-pub const MENU_ALARM_SEVR: &[&str] = &["NO_ALARM", "MINOR", "MAJOR", "INVALID"];
-
-/// `menu(menuAlarmStat)` — `menuAlarmStat.dbd.pod:87-109`. The index order is
-/// `alarm.h`'s `epicsAlarmCondition`, which `recGblSetSevr` stores in
-/// `STAT`/`NSTA`.
-pub const MENU_ALARM_STAT: &[&str] = &[
-    "NO_ALARM",
-    "READ",
-    "WRITE",
-    "HIHI",
-    "HIGH",
-    "LOLO",
-    "LOW",
-    "STATE",
-    "COS",
-    "COMM",
-    "TIMEOUT",
-    "HWLIMIT",
-    "CALC",
-    "SCAN",
-    "LINK",
-    "SOFT",
-    "BAD_SUB",
-    "UDF",
-    "DISABLE",
-    "SIMM",
-    "READ_ACCESS",
-    "WRITE_ACCESS",
-];
-
-/// `menu(menuPini)` — `menuPini.dbd.pod:59-65`. See
-/// [`PiniMode`](crate::server::record::PiniMode) for the lifecycle point each
-/// choice selects.
-pub const MENU_PINI: &[&str] = &["NO", "YES", "RUN", "RUNNING", "PAUSE", "PAUSED"];
-
-/// `menu(menuSimm)` — `menuSimm.dbd.pod:20-22`.
-pub const MENU_SIMM: &[&str] = &["NO", "YES", "RAW"];
-
-/// `menu(menuScan)` — `menuScan.dbd.pod:47-57`.
-pub const MENU_SCAN: &[&str] = &[
-    "Passive",
-    "Event",
-    "I/O Intr",
-    "10 second",
-    "5 second",
-    "2 second",
-    "1 second",
-    ".5 second",
-    ".2 second",
-    ".1 second",
-];
-
-/// `menu(menuOmsl)` — `menuOmsl.dbd.pod:23-24`.
-pub const MENU_OMSL: &[&str] = &["supervisory", "closed_loop"];
-
-/// `menu(menuIvoa)` — `menuIvoa.dbd.pod:20-22`.
-pub const MENU_IVOA: &[&str] = &[
-    "Continue normally",
-    "Don't drive outputs",
-    "Set output to IVOV",
-];
-
-/// `menu(menuConvert)` — `menuConvert.dbd.pod:23-37`.
-pub const MENU_CONVERT: &[&str] = &[
-    "NO CONVERSION",
-    "SLOPE",
-    "LINEAR",
-    "typeKdegF",
-    "typeKdegC",
-    "typeJdegF",
-    "typeJdegC",
-    "typeEdegF(ixe only)",
-    "typeEdegC(ixe only)",
-    "typeTdegF",
-    "typeTdegC",
-    "typeRdegF",
-    "typeRdegC",
-    "typeSdegF",
-    "typeSdegC",
-];
-
-/// `menu(menuYesNo)` — `menuYesNo.dbd.pod:28-29`.
-pub const MENU_YES_NO: &[&str] = &["NO", "YES"];
-
-/// `menu(menuPost)` — `menuPost.dbd.pod:19-20`.
-pub const MENU_POST: &[&str] = &["On Change", "Always"];
-
-/// `menu(menuPriority)` — `menuPriority.dbd.pod:25-27`.
-pub const MENU_PRIORITY: &[&str] = &["LOW", "MEDIUM", "HIGH"];
-
-/// `menu(menuFtype)` — `menuFtype.dbd.pod:19-30`.
-pub const MENU_FTYPE: &[&str] = &[
-    "STRING", "CHAR", "UCHAR", "SHORT", "USHORT", "LONG", "ULONG", "INT64", "UINT64", "FLOAT",
-    "DOUBLE", "ENUM",
-];
+/// The shared `menu()` choice tables, re-exported from the tables the generator
+/// transcribes out of `dbd/menu*.dbd`.
+///
+/// These twelve used to be hand-copied here as well, beside the generated ones.
+/// They matched, and nothing enforced that they matched — a `menu()` whose value
+/// order drifted in the vendored `.dbd` would have kept serving the old labels
+/// from this file, and the index↔string mapping is wire-visible (a `DBF_MENU`
+/// field is served as `DBR_ENUM`). There is now one definition per menu, and it
+/// is the `.dbd`'s. A consumer that needs a shape these do not have extends the
+/// generator, not this file.
+pub use super::dbd_generated::{
+    MENU_ALARM_SEVR, MENU_ALARM_STAT, MENU_CONVERT, MENU_FTYPE, MENU_IVOA, MENU_OMSL, MENU_PINI,
+    MENU_POST, MENU_PRIORITY, MENU_SCAN, MENU_SIMM, MENU_YES_NO,
+};
 
 /// A `menu(menuFtype)` value: the ELEMENT TYPE of an array field's buffer.
 ///

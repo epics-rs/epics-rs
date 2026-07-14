@@ -31,8 +31,15 @@ pub struct CasUdpConfig {
 }
 
 /// C `online_notify.c:59` — the beacon period RSRV falls back to, and the
-/// number its diagnostic prints. Same 15 s as [`CasUdpConfig::default`].
-const DEFAULT_BEACON_PERIOD_SECS: f64 = 15.0;
+/// number its diagnostic prints. Same 15 s as [`CasUdpConfig::default`], and it
+/// comes from the one place that number is declared: the generated `ENV_PARAM`
+/// table's `EPICS_CA_BEACON_PERIOD` default (`configure/CONFIG_ENV`).
+fn default_beacon_period_secs() -> f64 {
+    epics_base_rs::runtime::env_table::EPICS_CA_BEACON_PERIOD
+        .default_str()
+        .parse()
+        .expect("EPICS_CA_BEACON_PERIOD's compiled default is a number")
+}
 
 impl Default for CasUdpConfig {
     fn default() -> Self {
@@ -43,7 +50,7 @@ impl Default for CasUdpConfig {
                 CA_REPEATER_PORT,
             ))],
             ignore_addrs: Vec::new(),
-            beacon_period: Duration::from_secs(15),
+            beacon_period: crate::estdlib::duration_from_secs(default_beacon_period_secs()),
             mcast_addrs: Vec::new(),
         }
     }
@@ -90,7 +97,7 @@ pub fn from_env() -> CaResult<CasUdpConfig> {
 fn resolve_from_env() -> CaResult<CasUdpConfig> {
     let mut cfg = CasUdpConfig::default();
 
-    if let Some(list) = epics_base_rs::runtime::env::get("EPICS_CAS_INTF_ADDR_LIST") {
+    if let Some(list) = epics_base_rs::runtime::env_table::EPICS_CAS_INTF_ADDR_LIST.get() {
         // C `caservertask.c:341-343` tokenizes with the server's UDP port —
         // which is the port its duplicate warning dots the address with.
         let udp_port = epics_base_rs::runtime::net::cas_server_port();
@@ -138,7 +145,7 @@ fn resolve_from_env() -> CaResult<CasUdpConfig> {
     // standalone `caRepeater` daemon (repeater.cpp:545-547) DOES still
     // fall back; that path lives in `repeater.rs` and is unaffected.
     let mut beacon_addrs: Vec<SocketAddr> = Vec::new();
-    if let Some(list) = epics_base_rs::runtime::env::get("EPICS_CAS_BEACON_ADDR_LIST") {
+    if let Some(list) = epics_base_rs::runtime::env_table::EPICS_CAS_BEACON_ADDR_LIST.get() {
         beacon_addrs.extend(parse_addr_list(
             &list,
             "EPICS_CAS_BEACON_ADDR_LIST",
@@ -166,7 +173,7 @@ fn resolve_from_env() -> CaResult<CasUdpConfig> {
     // (e.g. when only multicast targets are wanted via interface
     // setup, or when running fully isolated). Honour AUTO==NO
     // strictly; only run discovery when AUTO is YES.
-    let auto_beacon = epics_base_rs::runtime::env::get("EPICS_CAS_AUTO_BEACON_ADDR_LIST");
+    let auto_beacon = epics_base_rs::runtime::env_table::EPICS_CAS_AUTO_BEACON_ADDR_LIST.get();
     let auto_on = match auto_beacon.as_deref() {
         // Unset or empty → C `envGetBoolConfigParam` returns -1,
         // initial `autobeaconlist = 1` survives.
@@ -250,7 +257,7 @@ fn resolve_from_env() -> CaResult<CasUdpConfig> {
     }
     cfg.beacon_addrs = beacon_addrs;
 
-    if let Some(list) = epics_base_rs::runtime::env::get("EPICS_CAS_IGNORE_ADDR_LIST") {
+    if let Some(list) = epics_base_rs::runtime::env_table::EPICS_CAS_IGNORE_ADDR_LIST.get() {
         // C `caservertask.c:450-451` builds this one with `port = 0`, so the
         // duplicate it reports is dotted as `10.1.2.3:0` — captured from the
         // compiled `softIoc`, which is why the port is not the server's here.
@@ -285,18 +292,19 @@ fn resolve_from_env() -> CaResult<CasUdpConfig> {
     // an accepted — never-firing — period rather than a panic, and NaN
     // (which fails `> 0.0`, like every C comparison against it) keeps
     // the default.
-    let name = if crate::estdlib::env_raw("EPICS_CAS_BEACON_PERIOD").is_some() {
-        "EPICS_CAS_BEACON_PERIOD"
+    use epics_base_rs::runtime::env_table::{EPICS_CA_BEACON_PERIOD, EPICS_CAS_BEACON_PERIOD};
+    let param = if EPICS_CAS_BEACON_PERIOD.get().is_some() {
+        EPICS_CAS_BEACON_PERIOD
     } else {
-        "EPICS_CA_BEACON_PERIOD"
+        EPICS_CA_BEACON_PERIOD
     };
-    match crate::estdlib::env_double(name) {
+    match param.double() {
         Ok(period) if period > 0.0 => {
             cfg.beacon_period = crate::estdlib::duration_from_secs(period);
         }
-        // Unset: C reads the compiled "15.0" default of the legacy var,
+        // Unresolvable: C reads the compiled "15.0" default of the legacy var,
         // silently. Keep the default period, print nothing.
-        Err(crate::estdlib::EnvDoubleError::Unset) => {}
+        Err(epics_base_rs::runtime::env::EnvDoubleError::Unresolvable) => {}
         // Parse failure OR `<= 0.0` — C `online_notify.c:58-64`. C names
         // EPICS_CAS_BEACON_PERIOD in both lines even when the value it
         // fetched came from the deprecated var, so this does too.
@@ -304,7 +312,7 @@ fn resolve_from_env() -> CaResult<CasUdpConfig> {
             eprintln!("EPICS \"EPICS_CAS_BEACON_PERIOD\" float fetch failed");
             eprintln!(
                 "Setting \"EPICS_CAS_BEACON_PERIOD\" = {:.6}",
-                DEFAULT_BEACON_PERIOD_SECS
+                default_beacon_period_secs()
             );
         }
     }

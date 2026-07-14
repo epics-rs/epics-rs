@@ -2242,7 +2242,7 @@ mod tests {
         ) -> epics_base_rs::error::CaResult<()> {
             Ok(())
         }
-        fn field_list(&self) -> &'static [epics_base_rs::server::record::FieldDesc] {
+        fn hand_field_list(&self) -> &'static [epics_base_rs::server::record::FieldDesc] {
             &[]
         }
     }
@@ -2863,7 +2863,7 @@ mod tests {
         fn put_field(&mut self, _n: &str, _v: EpicsValue) -> epics_base_rs::error::CaResult<()> {
             Ok(())
         }
-        fn field_list(&self) -> &'static [epics_base_rs::server::record::FieldDesc] {
+        fn hand_field_list(&self) -> &'static [epics_base_rs::server::record::FieldDesc] {
             &[]
         }
     }
@@ -3895,7 +3895,7 @@ mod tests {
         ) -> epics_base_rs::error::CaResult<()> {
             Ok(())
         }
-        fn field_list(&self) -> &'static [epics_base_rs::server::record::FieldDesc] {
+        fn hand_field_list(&self) -> &'static [epics_base_rs::server::record::FieldDesc] {
             &[]
         }
     }

@@ -907,6 +907,37 @@ pub enum InputFetchPolicy {
     AbortOnFirstFailure,
 }
 
+/// **The** field declaration of a record type, and the only way to obtain one.
+///
+/// Not implementable: the blanket `impl` below covers every [`Record`], so a
+/// second `impl FieldDeclaration for MyRecord` is a coherence error. A record
+/// type therefore cannot *supply* a field list — it can only be *asked* for
+/// one, and the answer is resolved here:
+///
+/// * a record type the vendored `.dbd` set covers is declared by the table
+///   generated from that `.dbd` ([`dbd_generated::record_fields`]);
+/// * a record type it does not cover falls back to
+///   [`Record::hand_field_list`].
+///
+/// The two are mutually exclusive by construction, which is what closes the
+/// invariant *one declaration per record type*. It used to be closed by luck:
+/// both tables were live, `field_desc_of` merely happened to consult the
+/// generated one first, and every consumer that reached for `field_list()`
+/// directly (`dbpr`, the `dbpf` typo hint, `motor`'s field gate) read the
+/// hand-written one — which is how `waveform.FTVL` was declared `DBF_SHORT`
+/// with no menu while `waveformRecord.dbd` said `DBF_MENU`/`menu(menuFtype)`.
+pub trait FieldDeclaration {
+    /// The record type's field descriptors, in `.dbd` declaration order.
+    fn field_list(&self) -> &'static [FieldDesc];
+}
+
+impl<R: Record + ?Sized> FieldDeclaration for R {
+    fn field_list(&self) -> &'static [FieldDesc] {
+        super::dbd_generated::record_fields(self.record_type())
+            .unwrap_or_else(|| self.hand_field_list())
+    }
+}
+
 /// Trait that all EPICS record types must implement.
 pub trait Record: Send + Sync + 'static {
     /// Return the record type name (e.g., "ai", "ao", "bi").
@@ -945,14 +976,31 @@ pub trait Record: Send + Sync + 'static {
     /// Set a field value by name.
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()>;
 
-    /// Return the list of field descriptors — the record type's `.dbd`
-    /// declaration.
+    /// The field declaration of a record type whose `.dbd` is **not vendored**.
     ///
-    /// This is a *spec*: it says what each field's type, menu and
-    /// `special(SPC_NOMOD)` are. It does NOT say who implements the field.
-    /// Ask [`Record::implements_field`] for that — see its docs for why the
-    /// two must not be the same question.
-    fn field_list(&self) -> &'static [FieldDesc];
+    /// C has exactly one declaration per record type: the `.dbd`, read at
+    /// runtime. The port compiles the vendored `.dbd`s into
+    /// [`dbd_generated`](crate::server::record::dbd_generated), and
+    /// [`FieldDeclaration::field_list`] — the single resolver every consumer
+    /// goes through — serves that table for every record type it covers and
+    /// **never falls through to here**. So for a `.dbd`-covered type this
+    /// method is unreachable: a record cannot declare one of its fields a
+    /// second time, whatever it writes here. That is the structural half of
+    /// "one declaration per record type"; there is no runtime gate to forget.
+    ///
+    /// A record type the vendored `.dbd` set does NOT cover (the downstream
+    /// Tier-3 crates: `motor`, `table`, `scaler`, `epid`, `throttle`,
+    /// `timestamp`, and the synthetic record types tests define) has no
+    /// generated table, so this hand-written one *is* its declaration. Vendor
+    /// its `.dbd` and this override goes away.
+    ///
+    /// The declaration is a *spec*: it says what each field's type, menu and
+    /// `special(SPC_NOMOD)` are. It does NOT say who implements the field. Ask
+    /// [`Record::implements_field`] for that — see its docs for why the two
+    /// must not be the same question.
+    fn hand_field_list(&self) -> &'static [FieldDesc] {
+        &[]
+    }
 
     /// Does this record type implement `name` in its own `get_field` /
     /// `put_field`, as opposed to leaving it to the framework's dbCommon

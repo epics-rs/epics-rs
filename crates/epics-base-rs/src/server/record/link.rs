@@ -1,7 +1,8 @@
 use std::borrow::Cow;
 
+use crate::error::{CaError, CaResult};
 use crate::runtime::json_string::{decode_json_string, decode_json_string_token};
-use crate::types::EpicsValue;
+use crate::types::{DbfLinkClass, EpicsValue};
 
 /// Link processing policy for input/output links.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -346,7 +347,180 @@ pub enum LinkType {
     Other,
 }
 
+/// The link type a `device()` declaration demands, and the type a link's *text*
+/// parses to — C's `link.h` discriminants, which are the two sides
+/// `dbCanSetLink` compares.
+///
+/// This is deliberately NOT [`LinkType`]. `LinkType` is the *runtime* kind of an
+/// established link (a `PV_LINK` becomes `DB_LINK` or `CA_LINK` once the target
+/// is looked up at `iocInit`); `DbLinkType` is the *static* kind the `.dbd` and
+/// the `.db` text agree on at load time, before any lookup has happened. Fusing
+/// them is what makes a link field mean two things at once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DbLinkType {
+    /// `CONSTANT` — a literal, or an unset link. Also what C expects of every
+    /// link field that is *not* the device link (`INP`/`OUT`), because those
+    /// have no `devSup` and `dbCanSetLink` defaults `expected_type` to
+    /// `CONSTANT` (`dbStaticLib.c:2403`).
+    Constant,
+    /// `PV_LINK` — `record.FLD` / `pv MS PP`. Not yet resolved to DB vs CA.
+    PvLink,
+    /// `JSON_LINK` — `{const:1}`, `{calc:{...}}`, `{pva:{...}}`.
+    JsonLink,
+    /// `VME_IO` — `#Cn Sn @parm`.
+    VmeIo,
+    /// `CAMAC_IO`, `AB_IO`, … — declared by some device supports, never parsed
+    /// into a distinct [`ParsedLink`] variant by this port.
+    CamacIo,
+    AbIo,
+    GpibIo,
+    BitbusIo,
+    /// `INST_IO` — `@dev arg …`. The form every asyn-based device support uses.
+    InstIo,
+    BbgpibIo,
+    RfIo,
+    VxiIo,
+}
+
+impl DbLinkType {
+    /// The C name, for the error message C prints.
+    pub fn c_name(self) -> &'static str {
+        match self {
+            DbLinkType::Constant => "CONSTANT",
+            DbLinkType::PvLink => "PV_LINK",
+            DbLinkType::JsonLink => "JSON_LINK",
+            DbLinkType::VmeIo => "VME_IO",
+            DbLinkType::CamacIo => "CAMAC_IO",
+            DbLinkType::AbIo => "AB_IO",
+            DbLinkType::GpibIo => "GPIB_IO",
+            DbLinkType::BitbusIo => "BITBUS_IO",
+            DbLinkType::InstIo => "INST_IO",
+            DbLinkType::BbgpibIo => "BBGPIB_IO",
+            DbLinkType::RfIo => "RF_IO",
+            DbLinkType::VxiIo => "VXI_IO",
+        }
+    }
+
+    /// `dbCanSetLink` (`dbStaticLib.c:2400-2419`), verbatim: the parsed type may
+    /// be installed on a field whose device declares `self` iff they are equal,
+    /// or both are drawn from the interchangeable
+    /// `{CONSTANT, JSON_LINK, PV_LINK}` set — those three are what
+    /// `dbPutString` will happily re-parse into one another at runtime, so C
+    /// lets the `.db` pick any of them.
+    ///
+    /// Every hardware type is therefore exact-match only: an `INST_IO` device
+    /// support gets `@…` or nothing.
+    pub fn accepts(self, parsed: DbLinkType) -> bool {
+        if self == parsed {
+            return true;
+        }
+        let soft = |t: DbLinkType| {
+            matches!(
+                t,
+                DbLinkType::Constant | DbLinkType::JsonLink | DbLinkType::PvLink
+            )
+        };
+        soft(self) && soft(parsed)
+    }
+}
+
+/// The link type the `.dbd` declares for one link field of one record — C's
+/// `dbCanSetLink` `expected_type` (`dbStaticLib.c:2403`).
+///
+/// `None` means *no declaration exists*, not "no constraint": the record type
+/// brings no vendored `.dbd` (`motor`, `table`, `scaler`, … — their device
+/// support registers at runtime), or its `DTYP` names a device no vendored
+/// `.dbd` declares (`asynInt32` on an `ai`). C has a `devSup` there and this
+/// port does not, so there is nothing to compare and nothing is invented.
+///
+/// `dtyp` is the record's DTYP text, or `None` when the `.db` never spelled it —
+/// which is NOT "no device": `DTYP` is a `DBF_DEVICE` menu index and its default
+/// is 0, so the record is bound to the FIRST device its `.dbd` declares. C
+/// rejects `record(ai,"X") { field(INP,"@instio parm") }` on exactly that
+/// ground (measured on the built 7.0.10.1-DEV `softIoc`).
+pub fn declared_link_type(
+    record_type: &str,
+    dtyp: Option<&str>,
+    upper_field: &str,
+) -> Option<DbLinkType> {
+    // C `dbLexRoutines.c:571`: only INP/OUT are device links. Every other link
+    // field has no `devSup`, so `dbCanSetLink` expects CONSTANT — which is why
+    // the C IOC refuses `field(SDIS,"@instio parm")` on any record type.
+    if !matches!(upper_field, "INP" | "OUT") {
+        return Some(DbLinkType::Constant);
+    }
+    let menu = super::dbd_generated::device_menu(record_type)?;
+    let dtyp = dtyp
+        .filter(|d| !d.is_empty())
+        .or_else(|| menu.first().copied())?;
+    super::dbd_generated::device_link_type(record_type, dtyp)
+}
+
+/// C `dbCanSetLink` (`dbStaticLib.c:2400-2419`) as the single gate every link
+/// assignment passes: the db-load one (`dbStaticLib.c:2222`) and the runtime
+/// `dbPutField` one (`dbAccess.c:1133`), which in C are two call sites of this
+/// one function and here are two call sites of this one function.
+///
+/// `Ok(())` when there is no declaration to enforce (see [`declared_link_type`])
+/// or when the link's parsed type is one the bound device support takes.
+pub fn check_link_assignment(
+    record_type: &str,
+    dtyp: Option<&str>,
+    upper_field: &str,
+    text: &str,
+) -> CaResult<()> {
+    let Some(class) = crate::types::dbf_link_class(record_type, upper_field) else {
+        return Ok(());
+    };
+    let Some(expected) = declared_link_type(record_type, dtyp, upper_field) else {
+        return Ok(());
+    };
+    let ftype = match class {
+        DbfLinkClass::InLink => LinkFieldType::In,
+        DbfLinkClass::OutLink => LinkFieldType::Out,
+        DbfLinkClass::FwdLink => LinkFieldType::Fwd,
+    };
+    let Some(parsed) = parse_link_field(text, ftype).db_link_type() else {
+        return Ok(());
+    };
+    if expected.accepts(parsed) {
+        return Ok(());
+    }
+    Err(CaError::InvalidValue(format!(
+        "{record_type}.{upper_field}: can't initialize link type {} with \"{text}\" (type {})",
+        expected.c_name(),
+        parsed.c_name(),
+    )))
+}
+
 impl ParsedLink {
+    /// The static [`DbLinkType`] this link's text parses to — C's
+    /// `dbLinkInfo::ltype` as `dbParseLink` sets it.
+    ///
+    /// `ParsedLink::None` is `CONSTANT` because that is what C's parser makes of
+    /// the empty string, and C rejects `field(INP,"")` on an `INST_IO` device
+    /// for exactly that reason (measured on the built 7.0.10.1-DEV `softIoc`).
+    /// A link the `.db` never mentions at all is a different thing — C never
+    /// reaches `dbCanSetLink` for it (`if (!plink->text) continue;`,
+    /// `dbStaticLib.c:2213`) — and so it must not be handed to this function.
+    ///
+    /// `None` for [`HwLinkKind::Other`]: this port keeps the payload of the
+    /// remaining C hardware forms (`#Bn Cn Nn …`) verbatim rather than
+    /// discriminating them, so there is no type to compare and the honest answer
+    /// is "cannot say" — not a guess that would reject a `.db` C accepts.
+    pub fn db_link_type(&self) -> Option<DbLinkType> {
+        Some(match self {
+            ParsedLink::None | ParsedLink::Constant(_) => DbLinkType::Constant,
+            ParsedLink::Db(_) | ParsedLink::Ca(_) | ParsedLink::Pva(_) => DbLinkType::PvLink,
+            ParsedLink::PvaJson(_) | ParsedLink::Calc(_) => DbLinkType::JsonLink,
+            ParsedLink::Hw(hw) => match hw.kind {
+                HwLinkKind::InstIo => DbLinkType::InstIo,
+                HwLinkKind::VmeIo => DbLinkType::VmeIo,
+                HwLinkKind::Other => return None,
+            },
+        })
+    }
+
     /// The discriminated [`LinkType`] of this link — the C
     /// `prec->xxx.type` analogue. See [`LinkType`] for the C mapping.
     pub fn link_type(&self) -> LinkType {

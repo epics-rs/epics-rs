@@ -1,3 +1,4 @@
+use epics_base_rs::server::record::FieldDeclaration;
 use epics_base_rs::server::record::Record;
 use epics_base_rs::types::EpicsValue;
 use motor_rs::MotorRecord;

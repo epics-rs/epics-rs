@@ -3064,18 +3064,10 @@ impl CaChannel {
     }
 }
 
-/// Library version + CA minor protocol version, mirroring libca
-/// `ca_version()` (cadef.h:1860). The string is `"<crate-version>
-/// (CA v4.<minor>)"` so callers logging client identity see both
-/// the implementation revision and the wire-protocol version it
-/// negotiates.
-pub fn ca_version() -> String {
-    format!(
-        "epics-ca-rs {} (CA v4.{})",
-        env!("CARGO_PKG_VERSION"),
-        crate::protocol::CA_MINOR_VERSION,
-    )
-}
+/// libca `ca_version()` (`cadef.h`) — re-exported from its one owner,
+/// [`crate::protocol::ca_version`]. C returns the wire protocol revision
+/// (`"4.13"`); a caller comparing against it gets that, not a library banner.
+pub use crate::protocol::ca_version;
 
 /// Handle for a monitor subscription. Dropping it cancels the subscription.
 pub struct MonitorHandle {
@@ -4820,14 +4812,16 @@ pub(crate) fn parse_addr_list_with_hostnames() -> CaResult<Vec<AddrEntry>> {
     // Server-side `addr_list::from_env` keeps the strict semantic
     // because the C server var uses `envGetBoolConfigParam` (strict);
     // only the CLIENT var has the strstr quirk that Rust must mirror.
-    let auto_addr = epics_base_rs::runtime::env::get_or("EPICS_CA_AUTO_ADDR_LIST", "YES");
+    let auto_addr = epics_base_rs::runtime::env_table::EPICS_CA_AUTO_ADDR_LIST
+        .get()
+        .unwrap_or_default();
     let auto_addr_enabled = !(auto_addr.contains("no") || auto_addr.contains("NO"));
     if auto_addr_enabled {
         let bcasts = crate::server::addr_list::discover_broadcast_addrs();
         append_auto_addr_entries(&mut addrs, &bcasts, default_port);
     }
 
-    if let Some(list) = epics_base_rs::runtime::env::get("EPICS_CA_ADDR_LIST") {
+    if let Some(list) = epics_base_rs::runtime::env_table::EPICS_CA_ADDR_LIST.get() {
         // C `iocinf.cpp:225`. The tokenizer owns the bad-token diagnostic; the
         // only thing left to do here is the Rust-only IP quarantine.
         for tok in crate::iocinf::add_addr_to_channel_access_address_list(
@@ -5216,8 +5210,10 @@ mod addr_entry_tests {
 fn expand_pv_name(name: &str) -> String {
     // EPICS_CA_USE_SHELL_VARS=YES expands ${VAR}/$(VAR) tokens in PV
     // names against the process environment, matching libca behaviour.
-    if epics_base_rs::runtime::env::get_or("EPICS_CA_USE_SHELL_VARS", "NO")
-        .eq_ignore_ascii_case("YES")
+    // Not an EPICS Base `ENV_PARAM` — it is in no `envDefs.h`, so there is no
+    // compiled default and the caller owns the fallback (`getenv`-shaped).
+    if epics_base_rs::runtime::env::get("EPICS_CA_USE_SHELL_VARS")
+        .is_some_and(|v| v.eq_ignore_ascii_case("YES"))
     {
         expand_shell_vars(name)
     } else {
@@ -5328,7 +5324,7 @@ fn parse_tls_sni_map() -> Vec<(SocketAddr, String)> {
 /// deployments with hostname-bound certs work without a single global
 /// `EPICS_CA_TLS_SERVER_NAME` override.
 pub(crate) fn parse_nameserver_list() -> Vec<(SocketAddr, Option<String>)> {
-    let Some(list) = epics_base_rs::runtime::env::get("EPICS_CA_NAME_SERVERS") else {
+    let Some(list) = epics_base_rs::runtime::env_table::EPICS_CA_NAME_SERVERS.get() else {
         return Vec::new();
     };
     // C `cac.cpp:259` defaults bare-hostname entries to

@@ -640,9 +640,10 @@ fn test_read_only_field() {
         other => panic!("expected Double(2.0), got {:?}", other),
     }
 
-    let fields = rec.field_list();
-    assert!(!fields[0].read_only); // VAL
-    assert!(fields[1].read_only); // NAME
+    // No `field_list()` assertion here: `#[derive(EpicsRecord)]` is not a
+    // declaration source. `#[field(read_only)]` drives this record's own
+    // `put_field` refusal (asserted above); the wire-visible SPC_NOMOD
+    // declaration comes from the `.dbd`, and record type "test" has none.
 }
 
 #[test]
@@ -1863,7 +1864,7 @@ impl Record for HookTrackingRecord {
             _ => Err(CaError::FieldNotFound(name.into())),
         }
     }
-    fn field_list(&self) -> &'static [FieldDesc] {
+    fn hand_field_list(&self) -> &'static [FieldDesc] {
         static FIELDS: &[FieldDesc] = &[FieldDesc::new("VAL", DbFieldType::Double, false)];
         FIELDS
     }
@@ -2014,7 +2015,7 @@ impl Record for NoUdfClearRecord {
             _ => Err(CaError::FieldNotFound(name.into())),
         }
     }
-    fn field_list(&self) -> &'static [FieldDesc] {
+    fn hand_field_list(&self) -> &'static [FieldDesc] {
         &[]
     }
     fn clears_udf(&self) -> bool {

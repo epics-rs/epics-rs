@@ -8,11 +8,13 @@
 //! `RecordInstance::is_no_mod`, so `is_no_mod` is the thing this file pins.
 //!
 //! It used to read `Record::field_list()`, and six record types (`aSub`,
-//! `mbbiDirect`, `mbboDirect`, `sseq`, `swait`, `waveform`) still hand-write
-//! that table through the transitional `FieldDesc::new` rather than taking the
-//! generated `.dbd` transcription. Every one of them under-declared SPC_NOMOD,
-//! so the CA server advertised `read, write` on fields the C IOC serves as
-//! `read, no write`. Measured on the built C `softIoc` (7.0.10.1-DEV):
+//! `mbbiDirect`, `mbboDirect`, `sseq`, `swait`, `waveform`) hand-wrote that
+//! table through `FieldDesc::new` rather than taking the generated `.dbd`
+//! transcription. Every one of them under-declared SPC_NOMOD, so the CA server
+//! advertised `read, write` on fields the C IOC serves as `read, no write`.
+//! Those hand tables are gone (see `one_declaration_per_record_type.rs`);
+//! this file keeps walking the boundary they used to break. Measured on the
+//! built C `softIoc` (7.0.10.1-DEV):
 //!
 //! ```text
 //! cainfo T:MBBOD.RVAL   Access: read, no write     port: read, write
@@ -77,8 +79,8 @@ fn is_no_mod_answers_the_dbd_for_every_declared_field() {
     assert!(nomod > 100, "only {nomod} SPC_NOMOD fields walked");
 }
 
-/// The six record types that still hand-write `field_list()`, named. Each pair
-/// is one field the C IOC serves `read, no write` and one the C IOC serves
+/// The six record types that used to hand-write `field_list()`, named. Each
+/// pair is one field the C IOC serves `read, no write` and one the C IOC serves
 /// `read, write` — the boundary, per record type, measured with `cainfo`.
 #[test]
 fn hand_written_field_tables_cannot_under_declare_no_modify() {

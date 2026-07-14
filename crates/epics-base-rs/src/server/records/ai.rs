@@ -1,7 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{
-    FieldDesc, MENU_SIMM, ProcessOutcome, RawSoftEntry, Record, ValuePostGate, dbd_generated,
-};
+use crate::server::record::{MENU_SIMM, ProcessOutcome, RawSoftEntry, Record, ValuePostGate};
 use crate::server::records::convert_phase::ConvertPhase;
 use crate::types::{EpicsValue, PvString};
 
@@ -511,10 +509,6 @@ impl Record for AiRecord {
             },
             _ => Err(CaError::FieldNotFound(name.into())),
         }
-    }
-
-    fn field_list(&self) -> &'static [FieldDesc] {
-        dbd_generated::AI_FIELDS
     }
 
     /// `SIMM` is `DBF_MENU menu(menuSimm)` (`aiRecord.dbd.pod`): the analog

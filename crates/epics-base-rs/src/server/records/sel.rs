@@ -1,5 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, ProcessOutcome, Record, dbd_generated};
+use crate::server::record::{ProcessOutcome, Record};
 use crate::types::EpicsValue;
 
 /// Number of input signals A..L (C `selRecord.c::SEL_MAX`).
@@ -125,8 +125,6 @@ impl SelRecord {
         ]
     }
 }
-
-static SEL_FIELDS: &[FieldDesc] = dbd_generated::SEL_FIELDS;
 
 impl Record for SelRecord {
     fn record_type(&self) -> &'static str {
@@ -479,10 +477,6 @@ impl Record for SelRecord {
             },
             _ => Err(CaError::FieldNotFound(name.to_string())),
         }
-    }
-
-    fn field_list(&self) -> &'static [FieldDesc] {
-        SEL_FIELDS
     }
 
     fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {

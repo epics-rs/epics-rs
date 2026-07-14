@@ -23,11 +23,14 @@ use std::time::Duration;
 
 pub use epics_base_rs::runtime::stdlib::{ParseDoubleError, epics_parse_double, epics_scan_double};
 
-/// C `envGetConfigParamPtr` (`envSubr.c:83-100`): the parameter is present
-/// only when the environment holds a NON-EMPTY string for it (C folds an
-/// empty value back to "unset", then to the compiled default — which this
-/// port keeps at the call site).
-pub fn env_raw(name: &str) -> Option<String> {
+/// `envGetConfigParamPtr`-shaped presence test for a variable that is **not** an
+/// EPICS Base `ENV_PARAM` — there is no compiled default to fall back to,
+/// because C has no such parameter at all.
+///
+/// Every variable in C's table goes through
+/// [`epics_base_rs::runtime::env_table`] and
+/// [`EnvParam::get`](epics_base_rs::runtime::env::EnvParam::get) instead.
+fn env_raw(name: &str) -> Option<String> {
     epics_base_rs::runtime::env::get(name).filter(|s| !s.is_empty())
 }
 
@@ -53,10 +56,17 @@ pub enum EnvDoubleError {
 /// (`envSubr.c:205-206`, `fprintf(stderr, ...)`) before reporting failure.
 /// C's callers then print their OWN named diagnostic on top of it — see
 /// `cac.cpp:192-193`, `udpiiu.cpp:86-89`, `online_notify.c:59-64` — so a
-/// bad `EPICS_CA_CONN_TMO` yields three lines, not one.
+/// bad value yields three lines, not one.
 ///
-/// The caller supplies the default (C reads it from the compiled
-/// `ENV_PARAM` table).
+/// **Only for variables outside C's `ENV_PARAM` table** — the CA-TLS and
+/// port-local knobs (`EPICS_CAS_SEND_TMO`, `EPICS_CA_PUT_TIMEOUT`, …), which do
+/// not appear in `envDefs.h` and therefore have no compiled default for anyone
+/// to read. The caller owning the fallback is correct *there*, and only there.
+///
+/// A parameter that IS in the table resolves its default through
+/// [`epics_base_rs::runtime::env_table`] via
+/// [`EnvParam::double`](epics_base_rs::runtime::env::EnvParam::double), which
+/// takes no default argument at all.
 pub fn env_double(name: &str) -> Result<f64, EnvDoubleError> {
     let raw = env_raw(name).ok_or(EnvDoubleError::Unset)?;
     epics_parse_double(&raw).map_err(|e| {

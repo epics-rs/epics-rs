@@ -17,7 +17,8 @@ use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::database::AsyncDbHandle;
 use epics_base_rs::server::recgbl::{alarm_status, rec_gbl_set_sevr};
 use epics_base_rs::server::record::{
-    AlarmSeverity, CommonFields, FieldDesc, ProcessOutcome, Record, RecordProcessResult, ScanType,
+    AlarmSeverity, CommonFields, FieldDeclaration, ProcessOutcome, Record, RecordProcessResult,
+    ScanType,
 };
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
@@ -1665,98 +1666,6 @@ fn connect_readback_fields(
         ("ENBL".to_string(), EpicsValue::Enum(u16::from(enabled))),
     ]
 }
-
-// ===== Field descriptor table =====
-
-static FIELD_LIST: &[FieldDesc] = &[
-    // Address
-    FieldDesc::new("PORT", DbFieldType::String, false),
-    FieldDesc::new("ADDR", DbFieldType::Long, false),
-    FieldDesc::new("PCNCT", DbFieldType::Enum, false),
-    FieldDesc::new("DRVINFO", DbFieldType::String, false),
-    FieldDesc::new("REASON", DbFieldType::Long, false),
-    // I/O control
-    FieldDesc::new("TMOD", DbFieldType::Enum, false),
-    FieldDesc::new("TMOT", DbFieldType::Double, false),
-    FieldDesc::new("IFACE", DbFieldType::Enum, false),
-    FieldDesc::new("OCTETIV", DbFieldType::Long, true),
-    FieldDesc::new("OPTIONIV", DbFieldType::Long, true),
-    FieldDesc::new("GPIBIV", DbFieldType::Long, true),
-    FieldDesc::new("I32IV", DbFieldType::Long, true),
-    FieldDesc::new("UI32IV", DbFieldType::Long, true),
-    FieldDesc::new("F64IV", DbFieldType::Long, true),
-    // Octet output
-    FieldDesc::new("AOUT", DbFieldType::String, false),
-    FieldDesc::new("OEOS", DbFieldType::String, false),
-    FieldDesc::new("BOUT", DbFieldType::Char, false),
-    FieldDesc::new("OMAX", DbFieldType::Long, true),
-    FieldDesc::new("NOWT", DbFieldType::Long, false),
-    FieldDesc::new("NAWT", DbFieldType::Long, true),
-    FieldDesc::new("OFMT", DbFieldType::Enum, false),
-    // Octet input
-    FieldDesc::new("AINP", DbFieldType::String, true),
-    FieldDesc::new("TINP", DbFieldType::String, true),
-    FieldDesc::new("IEOS", DbFieldType::String, false),
-    FieldDesc::new("BINP", DbFieldType::Char, true),
-    FieldDesc::new("IMAX", DbFieldType::Long, true),
-    FieldDesc::new("NRRD", DbFieldType::Long, false),
-    FieldDesc::new("NORD", DbFieldType::Long, true),
-    FieldDesc::new("IFMT", DbFieldType::Enum, false),
-    FieldDesc::new("EOMR", DbFieldType::Enum, true),
-    // Int32/UInt32/Float64
-    FieldDesc::new("I32INP", DbFieldType::Long, true),
-    FieldDesc::new("I32OUT", DbFieldType::Long, false),
-    FieldDesc::new("UI32INP", DbFieldType::ULong, true),
-    FieldDesc::new("UI32OUT", DbFieldType::ULong, false),
-    FieldDesc::new("UI32MASK", DbFieldType::ULong, false),
-    FieldDesc::new("F64INP", DbFieldType::Double, true),
-    FieldDesc::new("F64OUT", DbFieldType::Double, false),
-    // Serial
-    FieldDesc::new("BAUD", DbFieldType::Enum, false),
-    FieldDesc::new("LBAUD", DbFieldType::Long, false),
-    FieldDesc::new("PRTY", DbFieldType::Enum, false),
-    FieldDesc::new("DBIT", DbFieldType::Enum, false),
-    FieldDesc::new("SBIT", DbFieldType::Enum, false),
-    FieldDesc::new("MCTL", DbFieldType::Enum, false),
-    FieldDesc::new("FCTL", DbFieldType::Enum, false),
-    FieldDesc::new("IXON", DbFieldType::Enum, false),
-    FieldDesc::new("IXOFF", DbFieldType::Enum, false),
-    FieldDesc::new("IXANY", DbFieldType::Enum, false),
-    // IP options
-    FieldDesc::new("HOSTINFO", DbFieldType::String, false),
-    FieldDesc::new("DRTO", DbFieldType::Enum, false),
-    // GPIB
-    FieldDesc::new("UCMD", DbFieldType::Enum, false),
-    FieldDesc::new("ACMD", DbFieldType::Enum, false),
-    FieldDesc::new("SPR", DbFieldType::Char, true),
-    // Trace
-    FieldDesc::new("TMSK", DbFieldType::Long, false),
-    FieldDesc::new("TB0", DbFieldType::Enum, false),
-    FieldDesc::new("TB1", DbFieldType::Enum, false),
-    FieldDesc::new("TB2", DbFieldType::Enum, false),
-    FieldDesc::new("TB3", DbFieldType::Enum, false),
-    FieldDesc::new("TB4", DbFieldType::Enum, false),
-    FieldDesc::new("TB5", DbFieldType::Enum, false),
-    FieldDesc::new("TIOM", DbFieldType::Long, false),
-    FieldDesc::new("TIB0", DbFieldType::Enum, false),
-    FieldDesc::new("TIB1", DbFieldType::Enum, false),
-    FieldDesc::new("TIB2", DbFieldType::Enum, false),
-    FieldDesc::new("TINM", DbFieldType::Long, false),
-    FieldDesc::new("TINB0", DbFieldType::Enum, false),
-    FieldDesc::new("TINB1", DbFieldType::Enum, false),
-    FieldDesc::new("TINB2", DbFieldType::Enum, false),
-    FieldDesc::new("TINB3", DbFieldType::Enum, false),
-    FieldDesc::new("TSIZ", DbFieldType::Long, false),
-    FieldDesc::new("TFIL", DbFieldType::String, false),
-    // Connection management
-    FieldDesc::new("AUCT", DbFieldType::Enum, false),
-    FieldDesc::new("CNCT", DbFieldType::Enum, false),
-    FieldDesc::new("ENBL", DbFieldType::Enum, false),
-    // Misc
-    FieldDesc::new("VAL", DbFieldType::Long, false),
-    FieldDesc::new("ERRS", DbFieldType::String, true),
-    FieldDesc::new("AQR", DbFieldType::Char, false),
-];
 
 // ===== Trace bit helpers =====
 
@@ -3485,10 +3394,6 @@ const MENU_GPIB_ACMD: &[&str] = &[
 impl Record for AsynRecord {
     fn record_type(&self) -> &'static str {
         "asyn"
-    }
-
-    fn field_list(&self) -> &'static [FieldDesc] {
-        FIELD_LIST
     }
 
     /// Choice strings for every asynRecord `DBF_MENU` field, in menu index

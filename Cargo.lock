@@ -987,6 +987,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "env-codegen"
+version = "0.0.0"
+
+[[package]]
 name = "epics-base-rs"
 version = "0.23.0"
 dependencies = [

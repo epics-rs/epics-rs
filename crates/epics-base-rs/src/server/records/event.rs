@@ -1,5 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, MENU_YES_NO, Record, dbd_generated};
+use crate::server::record::{MENU_YES_NO, Record};
 use crate::types::{EpicsValue, PvString};
 
 /// `event` record — software-event source.
@@ -41,8 +41,6 @@ pub struct EventRecord {
     /// via `get_field("SDLY")`, so the field must exist for a `.db` to set it.
     pub sdly: f64,
 }
-
-static EVENT_FIELDS: &[FieldDesc] = dbd_generated::EVENT_FIELDS;
 
 impl Default for EventRecord {
     fn default() -> Self {
@@ -120,10 +118,6 @@ impl Record for EventRecord {
     /// NO_ALARM, even with the default `UDFS = INVALID`).
     fn raises_udf_alarm(&self) -> bool {
         false
-    }
-
-    fn field_list(&self) -> &'static [FieldDesc] {
-        EVENT_FIELDS
     }
 
     /// C `eventRecord.c::monitor` (157-165) is the whole of the record's

@@ -1,5 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, ProcessOutcome, Record, dbd_generated};
+use crate::server::record::{ProcessOutcome, Record};
 use crate::types::{EpicsValue, PvString};
 
 // printf record (EPICS 7).
@@ -512,8 +512,6 @@ fn strip_trailing_zeros_sci(s: &str, upper: bool) -> String {
     }
 }
 
-static PRINTF_FIELDS: &[FieldDesc] = dbd_generated::PRINTF_FIELDS;
-
 impl Record for PrintfRecord {
     fn record_type(&self) -> &'static str {
         "printf"
@@ -535,10 +533,6 @@ impl Record for PrintfRecord {
     /// delivering every cycle, and it declares no `constant_init_links`.
     fn constant_inputs_deliver_at_process(&self) -> bool {
         true
-    }
-
-    fn field_list(&self) -> &'static [FieldDesc] {
-        PRINTF_FIELDS
     }
 
     fn long_string_fields(&self) -> &'static [&'static str] {

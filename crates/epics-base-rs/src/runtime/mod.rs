@@ -1,4 +1,6 @@
+pub mod build_info;
 pub mod env;
+pub mod env_table;
 pub mod epics_string;
 pub mod general_time;
 pub mod json_string;
@@ -9,6 +11,7 @@ pub mod supervise;
 pub mod sync;
 pub mod task;
 pub mod time;
+pub mod version;
 
 // Re-export tokio::select! macro through the runtime facade.
 pub use tokio::select;

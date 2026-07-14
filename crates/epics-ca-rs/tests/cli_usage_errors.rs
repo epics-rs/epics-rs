@@ -261,3 +261,33 @@ fn help_goes_to_stderr_and_version_to_stdout_both_exit_0() {
         );
     }
 }
+
+/// The `-V` banner is an interop surface: a deployment script reads the EPICS
+/// Base release out of it. Byte-for-byte what the compiled C tools print
+/// (`caget -V | od -c`, EPICS 7.0.10.1-DEV):
+///
+/// ```text
+/// \nEPICS Version EPICS 7.0.10.1-DEV, CA Protocol version 4.13\n
+/// ```
+///
+/// The port used to print `EPICS Version epics-rs <crate-version>` — the crate
+/// version in the slot that names the base release, so the one field the line
+/// exists to carry was the one field it did not carry.
+#[test]
+fn version_banner_is_the_c_line() {
+    let want = format!(
+        "\nEPICS Version {}, CA Protocol version {}\n",
+        epics_base_rs::runtime::version::EPICS_VERSION_STRING,
+        epics_ca_rs::protocol::ca_version(),
+    );
+    // Pinned against the compiled C, not just against our own consts: a const
+    // that drifts from upstream would otherwise agree with itself.
+    assert_eq!(
+        want,
+        "\nEPICS Version EPICS 7.0.10.1-DEV, CA Protocol version 4.13\n"
+    );
+    for (bin, tool) in TOOLS {
+        let (_, stdout, _) = run(bin, &["-V"]);
+        assert_eq!(stdout, want, "{tool} -V");
+    }
+}

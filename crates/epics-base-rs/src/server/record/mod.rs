@@ -1,4 +1,5 @@
 mod alarm;
+pub mod bpt_generated;
 mod common_fields;
 mod constant_link;
 pub mod dbd_generated;

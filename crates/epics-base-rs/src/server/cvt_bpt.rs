@@ -269,19 +269,63 @@ fn standard_index_of(name: &str) -> Option<i16> {
 /// So `LINR` indexes the STATIC menu (stable: a name never moves once placed),
 /// and only the name->DATA lookup is dynamic — matching C
 /// `findBrkTable`/`papChoiceValue[linr]` (cvtBpt.c:25-39) +
-/// `dbFindBrkTable`/`bptList`. A standard `LINR` (e.g. 3 = `typeKdegF`) whose
-/// data was never loaded resolves to no table and the conversion fails, exactly
-/// like C `dbFindBrkTable` returning NULL.
-#[derive(Debug, Clone, Default)]
+/// `dbFindBrkTable`/`bptList`. A standard `LINR` (e.g. 9 = `typeTdegF`) that
+/// EPICS ships no `bpt*.data` for resolves to no table and the conversion fails,
+/// exactly like C `dbFindBrkTable` returning NULL.
+///
+/// The four tables EPICS DOES ship data for (`typeJdegC`, `typeJdegF`,
+/// `typeKdegC`, `typeKdegF`) are compiled in and present in every registry from
+/// construction — see [`Self::new`].
+#[derive(Debug, Clone)]
 pub struct BreakTableRegistry {
     tables: BTreeMap<String, Arc<BrkTable>>,
     extra_menu: Vec<String>,
 }
 
+impl Default for BreakTableRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BreakTableRegistry {
-    /// An empty registry.
+    /// A registry holding the vendored breakpoint tables, and nothing else.
+    ///
+    /// The four thermocouple tables an EPICS install ships in `dbd/bpt*.dbd` are
+    /// compiled into
+    /// [`bpt_generated::BREAK_TABLES`](crate::server::record::bpt_generated::BREAK_TABLES)
+    /// and seeded here, so a registry cannot exist without them and no load path
+    /// can forget to install them. A `.db` that says `field(LINR,"typeKdegC")`
+    /// converts.
+    ///
+    /// DEVIATION FROM C, stated: C's `bptList` starts EMPTY. The tables live in
+    /// separate `.dbd` files and an IOC opts in with
+    /// `dbLoadDatabase("$(EPICS_BASE)/dbd/bptTypeKdegC.dbd")`; without that line
+    /// the C IOC leaves `VAL == RVAL` unconverted and raises `STAT=SOFT`
+    /// (measured on the built `softIoc`, 7.0.10.1-DEV: `LINR=typeKdegC`,
+    /// `RVAL=1702` gives `VAL=1702`/`STAT=SOFT` with the file unloaded and
+    /// `VAL=417.918353467`/`STAT=NO_ALARM` with it loaded). That opt-in is a
+    /// packaging decision of C's build — one `.dbd` per curve, so an IOC links
+    /// only the curves it uses — not a semantic one, and the port cannot mirror
+    /// it: it has no `dbLoadDatabase`, so the `SOFT` arm was the ONLY reachable
+    /// one. The bytes seeded here are exactly the bytes C would have loaded, so
+    /// the only behaviour that changes is the behaviour that was unreachable.
+    ///
+    /// First-wins still holds ([`Self::insert`]): a `.db` that defines its own
+    /// `breaktable(typeKdegC)` is ignored in favour of the vendored one — which
+    /// is what C does too, once the `.dbd` is loaded first.
     pub fn new() -> Self {
-        Self::default()
+        let mut registry = Self {
+            tables: BTreeMap::new(),
+            extra_menu: Vec::new(),
+        };
+        for (name, points) in crate::server::record::bpt_generated::BREAK_TABLES {
+            let table = BrkTable::build(*name, points).unwrap_or_else(|e| {
+                unreachable!("vendored breakpoint table {name} is malformed: {e}")
+            });
+            registry.insert(table);
+        }
+        registry
     }
 
     /// Whether no table DATA has been loaded. The standard `menuConvert` names
@@ -506,16 +550,21 @@ mod tests {
         assert_eq!(reg.table_for_linr(15).unwrap().name, "ramp");
     }
 
-    /// A reserved standard index whose DATA was never loaded resolves to no
-    /// table — exactly like C `dbFindBrkTable` returning NULL, so the
-    /// conversion fails rather than silently using a different table.
+    /// A reserved standard index with no DATA resolves to no table — exactly
+    /// like C `dbFindBrkTable` returning NULL, so the conversion fails rather
+    /// than silently using a different table.
+    ///
+    /// The example used to be `typeKdegF` (3), which now HAS data: EPICS ships
+    /// `dbd/bptTypeKdegF.dbd` and the port vendors it. Of the twelve
+    /// `menuConvert` breakpoint names, EPICS ships `bpt*.data` for only the four
+    /// J/K thermocouple curves; `typeTdegC` (10) is one of the eight it does not,
+    /// in C and here.
     #[test]
     fn standard_index_without_data_resolves_to_no_table() {
         let mut reg = BreakTableRegistry::new();
         reg.insert(BrkTable::build("ramp", &[(0.0, 0.0), (1.0, 1.0)]).unwrap());
-        // typeKdegF (3) is a valid menu choice but no data was loaded for it.
-        assert_eq!(reg.linr_index_of("typeKdegF"), Some(3));
-        assert!(reg.table_for_linr(3).is_none());
+        assert_eq!(reg.linr_index_of("typeTdegC"), Some(10));
+        assert!(reg.table_for_linr(10).is_none());
     }
 
     /// Stability: a later insert must NOT shift an existing table's index —

@@ -48,6 +48,10 @@ impl IocShell {
     pub fn new(db: Arc<PvDatabase>, handle: tokio::runtime::Handle) -> Self {
         let mut registry = CommandRegistry::new();
         commands::register_builtins(&mut registry);
+        // C `iocshRegisterCommon` publishes the base version and target arch as
+        // environment variables at the same point it registers the commands, so
+        // the first `dbLoadRecords` can already expand `$(EPICS_VERSION_FULL)`.
+        crate::runtime::env::register_iocsh_env_vars();
         Self {
             registry: Arc::new(RwLock::new(registry)),
             ctx: CommandContext::new(db, handle),
@@ -706,6 +710,26 @@ mod tests {
         });
         std::mem::forget(rt);
         IocShell::new(db, handle)
+    }
+
+    /// C `iocshRegisterCommon` publishes the base version and the target arch
+    /// as environment variables, which is what makes `$(EPICS_VERSION_FULL)` in
+    /// a `.db`, a `.substitutions` or an `st.cmd` expand. It expanded under C
+    /// and passed through verbatim here, because nothing ever set the variable.
+    ///
+    /// The boundary is the shell's existence: before `IocShell::new` there is no
+    /// registration to have run, after it every one of C's names resolves.
+    #[test]
+    fn a_shell_publishes_the_version_macros_a_db_can_expand() {
+        let _shell = make_shell();
+        assert_eq!(
+            registry::substitute_env_vars("$(EPICS_VERSION_FULL)"),
+            crate::runtime::version::EPICS_VERSION_FULL,
+        );
+        assert_eq!(
+            registry::substitute_env_vars("${ARCH}"),
+            crate::runtime::build_info::TARGET_ARCH,
+        );
     }
 
     /// Regression: a CommandDef must be cloneable so the

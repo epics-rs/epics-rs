@@ -151,17 +151,6 @@ fn resolve_dbr_type(scan: &copt::Scan, int_base: copt::Base, dbr_type: Option<u1
     }
 }
 
-// C `caget -V` prints a blank line then
-//   "EPICS Version EPICS 7.0.10.1-DEV, CA Protocol version 4.13"
-// We mirror the same line shape but stamp our own crate version into
-// the "EPICS Version" slot so operators can tell at a glance which
-// implementation answered.
-const VERSION_INFO: &str = concat!(
-    "\nEPICS Version epics-rs ",
-    env!("CARGO_PKG_VERSION"),
-    ", CA Protocol version 4.13"
-);
-
 /// Mirror of C `caget` flags. Where the C flag is a value-printing
 /// modifier we forward into [`epics_ca_rs::cli::ValueFormat`].
 #[derive(Parser)]
@@ -797,7 +786,7 @@ async fn main() {
     // End of C's getopt loop: the warnings above go to stderr in command-line
     // order, and `-h` / `-V` — which C's loop `return`s from where it meets
     // them — run here, AFTER those warnings and never before (R13-26).
-    scan.finish(&cmd, VERSION_INFO, TERMINALS);
+    scan.finish(&cmd, &epics_ca_rs::protocol::version_info(), TERMINALS);
 
     // C `caget.c:527-531`: the missing-PV check runs after the getopt loop,
     // so `-V` above still wins and a bad option argument has already warned.

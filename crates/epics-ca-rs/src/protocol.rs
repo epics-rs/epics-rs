@@ -45,7 +45,37 @@ pub fn repeater_port() -> u16 {
 }
 
 // CA protocol version
+/// C `CA_MAJOR_PROTOCOL_REVISION` (`caProto.h:30`).
+pub const CA_MAJOR_VERSION: u16 = 4;
+/// C `CA_MINOR_PROTOCOL_REVISION` (`caProto.h:31`).
 pub const CA_MINOR_VERSION: u16 = 13;
+
+/// C `ca_version()` (`access.cpp`, declared `cadef.h`) — the wire protocol
+/// revision this library speaks, `"<major>.<minor>"`, and nothing else. It is a
+/// libca API a caller may print or compare, so it says what C's says.
+pub fn ca_version() -> String {
+    format!("{CA_MAJOR_VERSION}.{CA_MINOR_VERSION}")
+}
+
+/// The `-V` banner, shared by every CA tool: C prints it from one `printf`
+/// (`caget.c:404`, and the identical line in `caput.c`/`camonitor.c`/`cainfo.c`)
+///
+/// ```text
+/// \nEPICS Version %s, CA Protocol version %s\n   EPICS_VERSION_STRING, ca_version()
+/// ```
+///
+/// The EPICS Base version comes from the generated
+/// [`epics_base_rs::runtime::version`], so a base bump moves this line without
+/// anyone editing four binaries. It deliberately does NOT carry the `epics-ca-rs`
+/// crate version: `-V` is a parsed interop surface, and a script that reads the
+/// base release out of it must get the base release.
+pub fn version_info() -> String {
+    format!(
+        "\nEPICS Version {}, CA Protocol version {}",
+        epics_base_rs::runtime::version::EPICS_VERSION_STRING,
+        ca_version()
+    )
+}
 
 // Monitor masks
 pub const DBE_VALUE: u16 = 1;

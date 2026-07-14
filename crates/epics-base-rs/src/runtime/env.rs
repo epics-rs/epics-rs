@@ -273,6 +273,47 @@ pub fn prt_env_params() -> impl Iterator<Item = String> {
         .map(EnvParam::describe)
 }
 
+/// C `iocshRegisterCommon` (`iocshRegisterCommon.c:54-67`) — the environment
+/// variables an IOC shell publishes about *itself*, so a `.db`, a `.substitutions`
+/// or an `st.cmd` can expand `$(EPICS_VERSION_FULL)` or `$(ARCH)`.
+///
+/// These are outputs, not inputs: they are not `ENV_PARAM`s, they have no
+/// compiled default to fall back to, and C sets them with `epicsEnvSet`, which
+/// overwrites whatever the shell had. So does this — but only once per process,
+/// because a re-entrant `set_var` is what makes it unsound.
+///
+/// `ARCH` is C's `envGetConfigParam(&EPICS_BUILD_TARGET_ARCH)`, which is the
+/// build that produced the binary; here that is [`super::build_info`], reached
+/// through the generated table like every other parameter.
+pub fn register_iocsh_env_vars() {
+    use super::version as v;
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // C: `if (targetArch) epicsEnvSet("ARCH", targetArch)` — an unresolvable
+        // parameter is a NULL, and NULL is not published as an empty `ARCH`.
+        let mut vars: Vec<(&str, String)> = super::env_table::EPICS_BUILD_TARGET_ARCH
+            .get()
+            .map(|arch| ("ARCH", arch))
+            .into_iter()
+            .collect();
+        vars.extend([
+            ("EPICS_VERSION_MAJOR", v::EPICS_VERSION.to_string()),
+            ("EPICS_VERSION_MIDDLE", v::EPICS_REVISION.to_string()),
+            ("EPICS_VERSION_MINOR", v::EPICS_MODIFICATION.to_string()),
+            ("EPICS_VERSION_PATCH", v::EPICS_PATCH_LEVEL.to_string()),
+            ("EPICS_VERSION_SNAPSHOT", v::EPICS_DEV_SNAPSHOT.to_string()),
+            ("EPICS_VERSION_SITE", v::EPICS_SITE_VERSION.to_string()),
+            ("EPICS_VERSION_SHORT", v::EPICS_VERSION_SHORT.to_string()),
+            ("EPICS_VERSION_FULL", v::EPICS_VERSION_FULL.to_string()),
+        ]);
+        for (name, value) in vars {
+            // SAFETY: `Once`, and called from `IocShell::new` — C registers these
+            // at the same point, before any script or record can read them.
+            unsafe { std::env::set_var(name, value) };
+        }
+    });
+}
+
 /// Set an environment variable only if it is not already set.
 ///
 /// # Safety
@@ -560,6 +601,39 @@ mod tests {
         );
         for (i, (a, b)) in ours.iter().zip(&theirs).enumerate() {
             assert_eq!(a, b, "row {i} differs from compiled C");
+        }
+    }
+
+    /// The IOC shell's own environment, diffed against compiled C.
+    ///
+    /// Fixture: `printf 'epicsEnvShow\nexit\n' | env -i softIoc` (7.0.10.1-DEV,
+    /// linux-x86_64), keeping the variables `iocshRegisterCommon` sets and
+    /// dropping the two the OS supplies (`PWD`) — nine names, nine values.
+    ///
+    /// A `.db` or an `st.cmd` that expands `$(EPICS_VERSION_FULL)` or `$(ARCH)`
+    /// resolves under C; before this it silently did not resolve here. Note
+    /// `EPICS_VERSION_SITE` is *set and empty*, not absent — an empty
+    /// `epicsEnvSet` value is still a variable, and `$(EPICS_VERSION_SITE)`
+    /// expands to nothing rather than failing.
+    #[test]
+    #[serial(epics_env)]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+    fn iocsh_registers_the_version_env_vars_c_does() {
+        let expected = include_str!("testdata/iocshRegisterCommon.txt");
+        for name in expected.lines().filter_map(|l| l.split_once('=')) {
+            // SAFETY: `#[serial(epics_env)]`.
+            unsafe { std::env::remove_var(name.0) };
+        }
+
+        register_iocsh_env_vars();
+
+        for (i, line) in expected.lines().enumerate() {
+            let (name, value) = line.split_once('=').expect("NAME=value");
+            assert_eq!(
+                std::env::var(name).ok().as_deref(),
+                Some(value),
+                "line {i}: C's iocshRegisterCommon publishes `{line}`"
+            );
         }
     }
 }

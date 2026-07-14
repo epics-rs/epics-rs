@@ -135,12 +135,6 @@ const TERMINALS: &[(&str, copt::Terminal)] = &[
     ("version", copt::Terminal::Version),
 ];
 
-const VERSION_INFO: &str = concat!(
-    "\nEPICS Version epics-rs ",
-    env!("CARGO_PKG_VERSION"),
-    ", CA Protocol version 4.13"
-);
-
 /// Mirror of C `caput` flag set.
 ///
 /// Note: positional grammar differs in array mode (`-a`):
@@ -333,7 +327,7 @@ async fn main() {
     let field_separator = scan.field_separator("field_separator");
     // End of C's getopt loop: warnings out in command-line order, then `-h` /
     // `-V` if the loop reached one (R13-26).
-    scan.finish(&cmd, VERSION_INFO, TERMINALS);
+    scan.finish(&cmd, &epics_ca_rs::protocol::version_info(), TERMINALS);
 
     // -n / -s steer ENUM scalar handling below (force_numeric =
     // interpret as index; force_string = always send DBR_STRING for

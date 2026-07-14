@@ -1,20 +1,25 @@
-//! `CONFIG_ENV` -> Rust `ENV_PARAM` table generator for `epics-base-rs`.
+//! `configure/` -> Rust generator for `epics-base-rs`: the `ENV_PARAM` table and
+//! the EPICS Base version.
 //!
-//! C does not hand-write its environment-parameter defaults either. The spec is
-//! three files — `modules/libcom/src/env/envDefs.h` (which parameters exist, and
-//! in what order), `configure/CONFIG_ENV` and `configure/CONFIG_SITE_ENV` (what
-//! each one defaults to) — and `bldEnvData.pl` turns them into `envData.c`, a
-//! table of `ENV_PARAM {name, pdflt}` plus the `env_param_list[]` every
-//! `envGet*ConfigParam` and `epicsPrtEnvParams` walks.
+//! C does not hand-write either of them. Both are generated from the same
+//! `configure/` spec:
 //!
-//! This generator is the same transform, emitting Rust instead of C. Its output
-//! is the ONLY place an EPICS environment default is written down in this
-//! workspace: `EnvParam` has no public constructor, and the accessors that
-//! resolve a value take no `default` argument, so a caller cannot introduce a
-//! second one.
+//! * `envDefs.h` (which parameters exist, and in what order) + `CONFIG_ENV` +
+//!   `CONFIG_SITE_ENV` --`bldEnvData.pl`--> `envData.c`, a table of
+//!   `ENV_PARAM {name, pdflt}` plus the `env_param_list[]` every
+//!   `envGet*ConfigParam` and `epicsPrtEnvParams` walks.
+//! * `CONFIG_BASE_VERSION` --`makeEpicsVersion.pl`--> `epicsVersion.h`, the
+//!   `EPICS_VERSION_*` macros every tool banner and `iocshRegisterCommon`
+//!   environment variable is built from.
+//!
+//! This generator is the same pair of transforms, emitting Rust instead of C.
+//! Its output is the ONLY place an EPICS environment default or an EPICS Base
+//! version number is written down in this workspace: `EnvParam` has no public
+//! constructor, and the accessors that resolve a value take no `default`
+//! argument, so a caller cannot introduce a second one.
 //!
 //! ```text
-//! cargo run -p env-codegen -- --write    # regenerate the checked-in table
+//! cargo run -p env-codegen -- --write    # regenerate the checked-in tables
 //! cargo run -p env-codegen -- --check    # fail on drift (the in-tree gate test)
 //! ```
 //!
@@ -28,6 +33,7 @@ use std::process::ExitCode;
 
 const ENVCONFIG_DIR: &str = "crates/epics-base-rs/envconfig";
 const OUT_FILE: &str = "crates/epics-base-rs/src/runtime/env_table.rs";
+const OUT_VERSION: &str = "crates/epics-base-rs/src/runtime/version.rs";
 
 /// The three parameters `bldEnvData.pl` does NOT read from the config files:
 /// C's Makefile passes them on the command line (`-c`, `-s`, `-t`) so they
@@ -65,37 +71,59 @@ fn main() -> ExitCode {
         }
     };
 
-    let out_path = root.join(OUT_FILE);
-    if write {
-        if let Err(e) = std::fs::write(&out_path, &generated) {
-            eprintln!("env-codegen: {}: {e}", out_path.display());
-            return ExitCode::FAILURE;
+    let mut stale = false;
+    for (file, generated) in generated {
+        let out_path = root.join(file);
+        if write {
+            if let Err(e) = std::fs::write(&out_path, &generated) {
+                eprintln!("env-codegen: {}: {e}", out_path.display());
+                return ExitCode::FAILURE;
+            }
+            eprintln!("env-codegen: wrote {}", out_path.display());
+            continue;
         }
-        eprintln!("env-codegen: wrote {}", out_path.display());
-        return ExitCode::SUCCESS;
-    }
 
-    let current = std::fs::read_to_string(&out_path).unwrap_or_default();
-    if current == generated {
-        eprintln!("env-codegen: {} is up to date", out_path.display());
-        ExitCode::SUCCESS
-    } else {
+        let current = std::fs::read_to_string(&out_path).unwrap_or_default();
+        if current == generated {
+            eprintln!("env-codegen: {} is up to date", out_path.display());
+            continue;
+        }
+        stale = true;
         eprintln!(
             "env-codegen: {} is STALE — it does not match the vendored configure/ files.\n\
-             Re-run `cargo run -p env-codegen -- --write` and commit the result.",
-            out_path.display()
+             Re-run `cargo run -p env-codegen -- --write` and commit the result.\n\
+             {}",
+            out_path.display(),
+            first_difference(&current, &generated)
         );
-        for (n, (a, b)) in current.lines().zip(generated.lines()).enumerate() {
-            if a != b {
-                eprintln!(
-                    "  first difference at line {}:\n    have: {a}\n    want: {b}",
-                    n + 1
-                );
-                break;
-            }
-        }
-        ExitCode::FAILURE
     }
+
+    if stale {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// The line the reader has to look at, not "the files differ".
+fn first_difference(have: &str, want: &str) -> String {
+    have.lines()
+        .zip(want.lines())
+        .enumerate()
+        .find(|(_, (a, b))| a != b)
+        .map(|(n, (a, b))| {
+            format!(
+                "  first difference at line {}:\n    have: {a}\n    want: {b}",
+                n + 1
+            )
+        })
+        .unwrap_or_else(|| {
+            format!(
+                "  length differs: {} vs {} lines",
+                have.lines().count(),
+                want.lines().count()
+            )
+        })
 }
 
 /// Walk up from the manifest dir to the workspace root, so the tool works from
@@ -117,7 +145,15 @@ fn repo_root() -> Result<PathBuf, String> {
     }
 }
 
-fn generate(dir: &Path) -> Result<String, String> {
+/// Every generated file, as `(path relative to the workspace root, contents)`.
+fn generate(dir: &Path) -> Result<Vec<(&'static str, String)>, String> {
+    Ok(vec![
+        (OUT_FILE, generate_env_table(dir)?),
+        (OUT_VERSION, generate_version(dir)?),
+    ])
+}
+
+fn generate_env_table(dir: &Path) -> Result<String, String> {
     let defs = read(&dir.join("envDefs.h"))?;
     let names = parse_env_defs(&defs);
     if names.is_empty() {
@@ -351,6 +387,148 @@ fn emit(rows: &[(String, Value)]) -> String {
     s
 }
 
+/// C `makeEpicsVersion.pl`'s five variables, straight out of
+/// `configure/CONFIG_BASE_VERSION`, plus the site string C's Makefile passes in
+/// as `-v $(EPICS_SITE_VERSION)` (empty unless a site sets it in `CONFIG_SITE`).
+struct BaseVersion {
+    version: u32,
+    revision: u32,
+    modification: u32,
+    patch_level: u32,
+    snapshot: String,
+    site: String,
+}
+
+impl BaseVersion {
+    /// `makeEpicsVersion.pl:51-55`. The patch level is part of the number only
+    /// when it is non-zero; the snapshot and site suffixes are appended only
+    /// when non-empty.
+    fn short(&self) -> String {
+        let mut s = format!("{}.{}.{}", self.version, self.revision, self.modification);
+        if self.patch_level > 0 {
+            s.push_str(&format!(".{}", self.patch_level));
+        }
+        s
+    }
+
+    fn full(&self) -> String {
+        let mut s = self.short();
+        s.push_str(&self.snapshot);
+        if !self.site.is_empty() {
+            s.push_str(&format!("-{}", self.site));
+        }
+        s
+    }
+
+    /// `epicsVersion.h`'s `VERSION_INT(V,R,M,P)`.
+    fn int(&self) -> u32 {
+        (self.version << 24) | (self.revision << 16) | (self.modification << 8) | self.patch_level
+    }
+}
+
+fn generate_version(dir: &Path) -> Result<String, String> {
+    let text = read(&dir.join("CONFIG_BASE_VERSION"))?;
+    let v = parse_base_version(&text)?;
+    eprintln!("env-codegen: EPICS Base {}", v.full());
+    rustfmt(&emit_version(&v))
+}
+
+/// `makeEpicsVersion.pl:36-49` — the same five `^NAME\s*=\s*...` scans over
+/// `CONFIG_BASE_VERSION`, and the same "missing variable is a hard error".
+fn parse_base_version(text: &str) -> Result<BaseVersion, String> {
+    let num = |key: &str| -> Option<u32> {
+        assignment(text, key).and_then(|v| v.split_whitespace().next()?.parse().ok())
+    };
+    let version = num("EPICS_VERSION").ok_or("CONFIG_BASE_VERSION: no EPICS_VERSION")?;
+    let revision = num("EPICS_REVISION").ok_or("CONFIG_BASE_VERSION: no EPICS_REVISION")?;
+    let modification =
+        num("EPICS_MODIFICATION").ok_or("CONFIG_BASE_VERSION: no EPICS_MODIFICATION")?;
+    let patch_level =
+        num("EPICS_PATCH_LEVEL").ok_or("CONFIG_BASE_VERSION: no EPICS_PATCH_LEVEL")?;
+    let snapshot = assignment(text, "EPICS_DEV_SNAPSHOT")
+        .ok_or("CONFIG_BASE_VERSION: no EPICS_DEV_SNAPSHOT")?;
+    // C's Makefile passes this in from CONFIG_SITE (`-v`); no site version is
+    // vendored here, and the reference build likewise has it empty.
+    let site = assignment(text, "EPICS_SITE_VERSION").unwrap_or_default();
+
+    if version == 0 || version > 255 || revision > 255 || modification > 255 || patch_level > 255 {
+        return Err(format!(
+            "CONFIG_BASE_VERSION: {version}.{revision}.{modification}.{patch_level} does not fit \
+             VERSION_INT's one-byte fields"
+        ));
+    }
+    Ok(BaseVersion {
+        version,
+        revision,
+        modification,
+        patch_level,
+        snapshot,
+        site,
+    })
+}
+
+/// The right-hand side of the first `^KEY = value` line, comments skipped —
+/// the Perl `m/^KEY\s*=\s*.../` scan, which never sees a `#` line.
+fn assignment(text: &str, key: &str) -> Option<String> {
+    text.lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .find_map(|l| {
+            let rest = l.strip_prefix(key)?;
+            let rest = rest.trim_start();
+            let rest = rest.strip_prefix('=')?;
+            Some(rest.trim().to_string())
+        })
+}
+
+fn emit_version(v: &BaseVersion) -> String {
+    let (short, full, int) = (v.short(), v.full(), v.int());
+    format!(
+        "//! The EPICS Base release this crate ports — the Rust `epicsVersion.h`.\n\
+         //!\n\
+         //! @generated by `cargo run -p env-codegen -- --write` from the vendored\n\
+         //! `crates/epics-base-rs/envconfig/CONFIG_BASE_VERSION`, exactly as C's\n\
+         //! `makeEpicsVersion.pl` generates `epicsVersion.h` from `configure/`.\n\
+         //! DO NOT EDIT — bump the spec and regenerate. `env-codegen --check` fails on\n\
+         //! drift and runs as part of `cargo nextest run -p env-codegen`.\n\
+         //!\n\
+         //! These are the EPICS Base version, NOT the `epics-base-rs` crate version\n\
+         //! (`CARGO_PKG_VERSION`): the crate version tracks the Rust port's own release\n\
+         //! cadence, these name the upstream release being ported.\n\
+         \n\
+         /// C `EPICS_VERSION` — the major number.\n\
+         pub const EPICS_VERSION: u32 = {version};\n\
+         /// C `EPICS_REVISION`.\n\
+         pub const EPICS_REVISION: u32 = {revision};\n\
+         /// C `EPICS_MODIFICATION`.\n\
+         pub const EPICS_MODIFICATION: u32 = {modification};\n\
+         /// C `EPICS_PATCH_LEVEL`.\n\
+         pub const EPICS_PATCH_LEVEL: u32 = {patch_level};\n\
+         /// C `EPICS_DEV_SNAPSHOT` — `\"-DEV\"` between releases, empty on one.\n\
+         pub const EPICS_DEV_SNAPSHOT: &str = {snapshot:?};\n\
+         /// C `EPICS_SITE_VERSION` — a site's local version suffix, empty upstream.\n\
+         pub const EPICS_SITE_VERSION: &str = {site:?};\n\
+         \n\
+         /// C `EPICS_VERSION_SHORT` — the release, with no snapshot or site suffix.\n\
+         pub const EPICS_VERSION_SHORT: &str = {short:?};\n\
+         /// C `EPICS_VERSION_FULL` — short version plus the snapshot and site suffixes.\n\
+         pub const EPICS_VERSION_FULL: &str = {full:?};\n\
+         /// C `EPICS_VERSION_STRING` — what every tool's `-V` banner prints.\n\
+         pub const EPICS_VERSION_STRING: &str = {string:?};\n\
+         /// C `epicsReleaseVersion`.\n\
+         pub const EPICS_RELEASE_VERSION: &str = {release:?};\n\
+         /// C `EPICS_VERSION_INT` — `VERSION_INT(V, R, M, P)`, for numeric compares.\n\
+         pub const EPICS_VERSION_INT: u32 = {int:#010x};\n",
+        version = v.version,
+        revision = v.revision,
+        modification = v.modification,
+        patch_level = v.patch_level,
+        snapshot = v.snapshot,
+        site = v.site,
+        string = format!("EPICS {full}"),
+        release = format!("EPICS R{full}"),
+    )
+}
+
 /// Pipe the emitted source through the toolchain's `rustfmt`, so the checked-in
 /// file is already the fixed point `cargo fmt --all` agrees with and `--check`
 /// answers "is this current with the spec?" rather than "has anyone run fmt?".
@@ -388,32 +566,56 @@ mod tests {
     /// edit that nobody regenerated is a failing test rather than a table that
     /// quietly disagrees with its own spec.
     #[test]
-    fn generated_file_is_not_stale() {
+    fn generated_files_are_not_stale() {
         let root = super::repo_root().expect("workspace root");
-        let want = super::generate(&root.join(super::ENVCONFIG_DIR)).expect("generator run");
-        let have = std::fs::read_to_string(root.join(super::OUT_FILE)).unwrap_or_default();
-        if have == want {
-            return;
+        for (file, want) in
+            super::generate(&root.join(super::ENVCONFIG_DIR)).expect("generator run")
+        {
+            let have = std::fs::read_to_string(root.join(file)).unwrap_or_default();
+            assert!(
+                have == want,
+                "{file} is STALE — it no longer matches the vendored configure/ files.\n\
+                 Re-run `cargo run -p env-codegen -- --write` and commit the result.\n{}",
+                super::first_difference(&have, &want)
+            );
         }
-        let first = have
-            .lines()
-            .zip(want.lines())
-            .enumerate()
-            .find(|(_, (a, b))| a != b)
-            .map(|(n, (a, b))| format!("line {}:\n  have: {a}\n  want: {b}", n + 1))
-            .unwrap_or_else(|| {
-                format!(
-                    "length differs: {} vs {} lines",
-                    have.lines().count(),
-                    want.lines().count()
-                )
-            });
-        panic!(
-            "{} is STALE — it no longer matches the vendored configure/ files.\n\
-             Re-run `cargo run -p env-codegen -- --write` and commit the result.\n\
-             First difference at {first}",
-            super::OUT_FILE
-        );
+    }
+
+    /// `makeEpicsVersion.pl`'s two conditionals — the patch level drops out of
+    /// the number when it is zero, the snapshot suffix when it is empty — are
+    /// what make `7.0.10` and `7.0.10.1-DEV` different strings. A generator that
+    /// always pastes all four fields prints `7.0.10.0` on a release.
+    #[test]
+    fn version_strings_match_make_epics_version() {
+        let v = super::parse_base_version(
+            "EPICS_VERSION = 7\nEPICS_REVISION = 0\nEPICS_MODIFICATION = 10\n\
+             EPICS_PATCH_LEVEL = 1\nEPICS_DEV_SNAPSHOT=-DEV\n",
+        )
+        .expect("parses");
+        assert_eq!(v.short(), "7.0.10.1");
+        assert_eq!(v.full(), "7.0.10.1-DEV");
+        assert_eq!(v.int(), 0x0700_0a01);
+
+        // A zero patch level is not in the version number (`$patch > 0`).
+        let rel = super::parse_base_version(
+            "EPICS_VERSION = 7\nEPICS_REVISION = 0\nEPICS_MODIFICATION = 10\n\
+             EPICS_PATCH_LEVEL = 0\nEPICS_DEV_SNAPSHOT=\n",
+        )
+        .expect("parses");
+        assert_eq!(rel.short(), "7.0.10");
+        assert_eq!(rel.full(), "7.0.10");
+        assert_eq!(rel.int(), 0x0700_0a00);
+
+        // A site version appends `-SITE` (`$ver_str .= "-$opt_v"`).
+        let site = super::parse_base_version(
+            "EPICS_VERSION = 7\nEPICS_REVISION = 0\nEPICS_MODIFICATION = 10\n\
+             EPICS_PATCH_LEVEL = 1\nEPICS_DEV_SNAPSHOT=-DEV\nEPICS_SITE_VERSION = pls\n",
+        )
+        .expect("parses");
+        assert_eq!(site.full(), "7.0.10.1-DEV-pls");
+
+        // A missing variable is a hard error, not a zero.
+        assert!(super::parse_base_version("EPICS_VERSION = 7\n").is_err());
     }
 
     /// The generator's own transform, on the shapes `bldEnvData.pl` accepts.

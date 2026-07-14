@@ -3064,18 +3064,10 @@ impl CaChannel {
     }
 }
 
-/// Library version + CA minor protocol version, mirroring libca
-/// `ca_version()` (cadef.h:1860). The string is `"<crate-version>
-/// (CA v4.<minor>)"` so callers logging client identity see both
-/// the implementation revision and the wire-protocol version it
-/// negotiates.
-pub fn ca_version() -> String {
-    format!(
-        "epics-ca-rs {} (CA v4.{})",
-        env!("CARGO_PKG_VERSION"),
-        crate::protocol::CA_MINOR_VERSION,
-    )
-}
+/// libca `ca_version()` (`cadef.h`) — re-exported from its one owner,
+/// [`crate::protocol::ca_version`]. C returns the wire protocol revision
+/// (`"4.13"`); a caller comparing against it gets that, not a library banner.
+pub use crate::protocol::ca_version;
 
 /// Handle for a monitor subscription. Dropping it cancels the subscription.
 pub struct MonitorHandle {

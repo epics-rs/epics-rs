@@ -1219,6 +1219,23 @@ pub trait Record: Send + Sync + 'static {
         true
     }
 
+    /// The rest of the soft INPUT device support's `init_record`, once the
+    /// constant-INP load above has (or has not) landed.
+    ///
+    /// Most soft dsets are exactly `recGblInitConstantLink()` and stop there —
+    /// a link they could not load leaves the record's own init state alone. The
+    /// ARRAY dsets do not: `devWfSoft.c:39-51` runs `dbLoadLinkArray` on every
+    /// waveform and sets `prec->nord = 0` when it fails (a real link, or none —
+    /// `dbLoadLinkArray` has no `loadArray` lset outside a constant), which is
+    /// why C serves `NORD = 0` on a `record(waveform,"X"){}` even though the
+    /// record's own `init_record` seeded `nord = (nelm == 1)` a moment earlier.
+    ///
+    /// `loaded` is whether a constant INP reached the value field. Defaulted to
+    /// a no-op: a dset that only seeds does not need this half.
+    fn soft_input_dset_init(&mut self, loaded: bool) {
+        let _ = loaded;
+    }
+
     /// The `DTYP="Raw Soft Channel"` INPUT dset — C's four `devXxxSoftRaw.c`
     /// read supports (`devAiSoftRaw`, `devBiSoftRaw`, `devMbbiSoftRaw`,
     /// `devMbbiDirectSoftRaw`).

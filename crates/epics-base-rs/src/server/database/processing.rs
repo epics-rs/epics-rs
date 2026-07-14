@@ -5202,6 +5202,7 @@ pub(crate) fn seed_constant_links(instance: &mut RecordInstance) {
         && instance.record.input_read_by_device_support()
     {
         let inp = crate::server::record::parse_link_v2(&instance.common.inp);
+        let mut loaded = false;
         if let Some(value) = crate::server::recgbl::simm::constant_load_value(&inp) {
             // Same sink the per-cycle soft-input apply uses, so the constant
             // lands in the field the link would have written: RVAL for `Raw
@@ -5216,7 +5217,7 @@ pub(crate) fn seed_constant_links(instance: &mut RecordInstance) {
             } else {
                 None
             };
-            let loaded = match raw {
+            loaded = match raw {
                 Some(res) => res.is_ok(),
                 None => instance.record.set_val(value).is_ok(),
             };
@@ -5226,6 +5227,19 @@ pub(crate) fn seed_constant_links(instance: &mut RecordInstance) {
                 instance.common.udf = false;
             }
         }
+        // The FAILURE arm of the same dset `init_record`. `devWfSoft.c:39-51`
+        // does not just skip a link it could not load — it ZEROES the element
+        // count:
+        //
+        // ```c
+        //     status = dbLoadLinkArray(&prec->inp, prec->ftvl, prec->bptr, &nelm);
+        //     if (!status) { prec->nord = nelm; prec->udf = FALSE; }
+        //     else          prec->nord = 0;
+        // ```
+        //
+        // so the record's own `nord = (nelm == 1)` seed does not survive a
+        // waveform whose INP is a real link or unset. Defaulted no-op.
+        instance.record.soft_input_dset_init(loaded);
     }
 
     // 2. The record's own `recGblInitConstantLink` table, through the shared

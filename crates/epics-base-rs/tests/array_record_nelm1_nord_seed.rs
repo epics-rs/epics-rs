@@ -1,14 +1,30 @@
-//! R15-80: `NELM=1` must yield `NORD=1` at init on waveform/aai/aao.
+//! R15-80, corrected in R21: what a `NELM=1` array record serves at init.
 //!
-//! C `init_record` pass 0 seeds `prec->nord = (prec->nelm == 1)`
-//! (waveformRecord.c:100, aaiRecord.c:113, aaoRecord.c:116-120): a
-//! one-element array record is fully populated by construction. The port
-//! seeded NORD=0 unconditionally and `get_field("VAL")` truncates to NORD, so
-//! a NELM=1 record served a ZERO-length array to every client until its first
-//! process. subArray keeps NORD=0 (subArrayRecord.c:101 has no such seed).
+//! R15-80 read the RECORD's `init_record` pass 0 — `prec->nord = (prec->nelm ==
+//! 1)` (waveformRecord.c:100, aaiRecord.c:113, aaoRecord.c:116-120) — and
+//! stopped there, so it asserted NORD=1 on all three kinds. That seed is not the
+//! last word: the soft DEVICE SUPPORT's `init_record` runs in the same iocInit
+//! and overwrites it on two of the three. Measured on the compiled softIoc
+//! (7.0.10.1-DEV), bare `record(x,"P"){}`, never processed:
 //!
-//! Boundaries: NELM==1 vs NELM>1, per kind; no record is processed — the seed
-//! must come from init alone.
+//! ```text
+//! $ caget -t P:WF.NORD    -> 0     waveform
+//! $ caget -t P:AAI.NORD   -> 1     aai
+//! $ caget -t P:AAO.NORD   -> 0     aao
+//! $ caget -t P:SA.NORD    -> 0     subArray
+//! ```
+//!
+//! * `devWfSoft.c:39-51` runs `dbLoadLinkArray` on the INP unconditionally and
+//!   sets `prec->nord = 0` when it fails — which it does for anything but a
+//!   constant (`dbLink.c:255-264`: no `loadArray` lset ⇒ `S_db_noLSET`).
+//! * `devAaiSoft.c:55` loads only `if (dbLinkIsConstant(plink))`, so a waveform-
+//!   shaped aai keeps the record's seed.
+//! * `devAaoSoft.c:43-51` is `if (dbLinkIsConstant(&prec->out)) prec->nord = 0;`
+//!   and runs at pass 0 — BEFORE `doResolveLinks` (`iocInit.c::initDatabase`),
+//!   when every link still reads as a constant — so it fires on every aao.
+//!
+//! The full link-shape table is `tests/array_nord_at_init.rs`; this file keeps
+//! the NELM boundary (NELM==1 vs NELM>1) per kind, with no record processed.
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -64,15 +80,35 @@ async fn nord(db: &PvDatabase, rec: &str) -> f64 {
         .unwrap()
 }
 
+/// `aai` is the one kind whose dset leaves the seed alone: its single element IS
+/// the value, and a client reads it before the first process.
 #[tokio::test]
-async fn nelm1_seeds_nord1_and_serves_one_element() {
+async fn nelm1_seeds_nord1_on_aai_and_serves_one_element() {
     let db = build().await;
-    for rec in ["N1:WF", "N1:AAI", "N1:AAO"] {
-        assert_eq!(nord(&db, rec).await, 1.0, "{rec}: NELM=1 must seed NORD=1");
+    assert_eq!(nord(&db, "N1:AAI").await, 1.0, "devAaiSoft keeps the seed");
+    assert_eq!(
+        db.get_pv("N1:AAI").await.unwrap(),
+        EpicsValue::DoubleArray(vec![0.0]),
+        "a NELM=1 aai serves its single element before first process"
+    );
+}
+
+/// waveform and aao: the seed does not survive their dsets, so a NELM=1 record
+/// serves a zero-length array until something loads elements into it — exactly
+/// what C serves.
+#[tokio::test]
+async fn nelm1_keeps_nord_zero_on_waveform_and_aao() {
+    let db = build().await;
+    for rec in ["N1:WF", "N1:AAO"] {
+        assert_eq!(
+            nord(&db, rec).await,
+            0.0,
+            "{rec}: the soft dset's init zeroes the NELM=1 seed"
+        );
         assert_eq!(
             db.get_pv(rec).await.unwrap(),
-            EpicsValue::DoubleArray(vec![0.0]),
-            "{rec}: a NELM=1 record must serve its single element before first process"
+            EpicsValue::DoubleArray(vec![]),
+            "{rec}: NORD=0 serves a zero-length array"
         );
     }
 }
@@ -91,7 +127,7 @@ async fn nelm_above_one_keeps_nord_zero() {
 }
 
 /// subArray has no NELM==1 seed in C (`subArrayRecord.c:101` sets NORD=0
-/// unconditionally) — its NORD comes from the INP slice at process time.
+/// unconditionally) — its NORD comes from the INP slice.
 #[tokio::test]
 async fn subarray_nelm1_keeps_nord_zero() {
     let db = build().await;

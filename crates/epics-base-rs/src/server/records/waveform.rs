@@ -126,6 +126,16 @@ pub struct WaveformRecord {
     /// framework reports the outcome through `set_resolved_input_links`.
     dol_fetch_requested: bool,
     dol_read_failed: bool,
+    /// The element count the record ARRIVED at `init_record` with — elements an
+    /// in-process `record()` build put into VAL before `add_record`. C has no
+    /// such path (VAL is `DBF_NOACCESS` on all four `.dbd`s, so a `.db` cannot
+    /// fill the buffer and C's dsets are calloc'd-empty by construction), which
+    /// is why C's `init_record`s are free to overwrite NORD outright. The port's
+    /// builder path is real data, so the init-time NORD rules
+    /// ([`Record::init_record`], [`Record::soft_input_dset_init`]) may only
+    /// decide the count for a record that arrived EMPTY — never discard this.
+    /// Captured at pass 0, before the record's own seed runs.
+    prebuilt_nord: i32,
 }
 
 /// Type aliases for documentation / pattern-match clarity. All point
@@ -217,6 +227,7 @@ impl Default for WaveformRecord {
             constant_dol_loaded: false,
             dol_fetch_requested: false,
             dol_read_failed: false,
+            prebuilt_nord: 0,
         }
     }
 }
@@ -858,23 +869,35 @@ impl Record for WaveformRecord {
     /// (`.db`-supplied) needs — a `Default`/`new()` seed would be computed
     /// before NELM exists.
     ///
-    /// * waveform/aai/aao: `prec->nord = (prec->nelm == 1)` (waveformRecord.c:100,
-    ///   aaiRecord.c:113, aaoRecord.c:116-120). A one-element array record is
-    ///   fully populated by construction — its single element IS the value — so
-    ///   it serves NORD=1 from load. The port seeded NORD=0 always, and
-    ///   `get_field("VAL")` truncates to NORD, so a NELM=1 record served a
-    ///   ZERO-length array to every client until its first process.
+    /// * waveform/aai: `prec->nord = (prec->nelm == 1)` (waveformRecord.c:100,
+    ///   aaiRecord.c:113). A one-element array record is fully populated by
+    ///   construction — its single element IS the value — so it serves NORD=1
+    ///   from load. The port seeded NORD=0 always, and `get_field("VAL")`
+    ///   truncates to NORD, so a NELM=1 record served a ZERO-length array to
+    ///   every client until its first process. On a waveform the seed only
+    ///   SURVIVES when device support is not the soft one — see
+    ///   [`Record::soft_input_dset_init`], which is `devWfSoft`'s other arm.
+    /// * aao: 0. C's record seeds `nord = (nelm == 1)` too (aaoRecord.c:116-120)
+    ///   but calls its dset's `init_record` in the SAME pass (:127), and
+    ///   `devAaoSoft.c:43-51` is `if (dbLinkIsConstant(&prec->out)) prec->nord =
+    ///   0;`. Links are not resolved until AFTER pass 0
+    ///   (`iocInit.c::initDatabase`: `doInitRecord0`, then `doResolveLinks`,
+    ///   then `doInitRecord1`), so at that moment EVERY aao's OUT still reads as
+    ///   a constant and the seed is wiped for all of them — measured on the
+    ///   compiled softIoc: a NELM=1 aao with `field(OUT,"OTHER:PV")` serves
+    ///   NORD=0. The only thing that puts elements in an aao at init is the
+    ///   constant-DOL `fetchValue` at pass 1 below.
     /// * subArray: `prec->nord = 0` (subArrayRecord.c:101 — never the NELM=1
     ///   seed), MALM floored to 1, then NELM clamped down to MALM
     ///   (subArrayRecord.c:95-103). Process-time clamping in `set_val` (the
     ///   readValue equivalent) re-applies the same bounds each cycle, so the
     ///   .db order of NELM/MALM/INDX cannot matter.
     ///
-    /// The NORD seed is skipped when NORD is already non-zero — i.e. when
-    /// element data was put into VAL before init. C cannot reach that state
-    /// (VAL is `DBF_NOACCESS` on all four `.dbd`s, so no `.db` can fill it),
-    /// but an in-process `record()` build can, and zeroing NORD there would
-    /// discard the caller's array.
+    /// Every rule here decides the count for a record that arrived EMPTY. A
+    /// record that arrived WITH elements — an in-process `record()` build that
+    /// put VAL before `add_record`, a state C has no path to — keeps them:
+    /// [`Self::prebuilt_nord`] is captured first, and no init rule may discard
+    /// it.
     ///
     /// Pass 1 runs the aao's `fetchValue(prec, 1)` (aaoRecord.c:147) — see
     /// [`Self::fetch_constant_dol`].
@@ -886,6 +909,7 @@ impl Record for WaveformRecord {
         if pass != 0 {
             return Ok(());
         }
+        self.prebuilt_nord = self.nord;
         if matches!(self.kind, ArrayKind::SubArray) {
             if self.malm < 1 {
                 self.malm = 1;
@@ -903,7 +927,10 @@ impl Record for WaveformRecord {
             self.resize_val_preserving();
             return Ok(());
         }
-        if self.nord == 0 && self.nelm == 1 {
+        if matches!(self.kind, ArrayKind::Aao) {
+            return Ok(());
+        }
+        if self.prebuilt_nord == 0 && self.nelm == 1 {
             self.nord = 1;
         }
         Ok(())
@@ -934,6 +961,38 @@ impl Record for WaveformRecord {
     /// UDF_ALARM, prec->udfs);` (subArrayRecord.c:149-150).
     fn raises_udf_alarm(&self) -> bool {
         matches!(self.kind, ArrayKind::SubArray)
+    }
+
+    /// `devWfSoft.c::init_record` (39-51) — the arm the constant-INP loader
+    /// above does NOT cover:
+    ///
+    /// ```c
+    ///     long status = dbLoadLinkArray(&prec->inp, prec->ftvl, prec->bptr, &nelm);
+    ///     if (!status) { prec->nord = nelm; prec->udf = FALSE; }
+    ///     else          prec->nord = 0;
+    /// ```
+    ///
+    /// The call is unconditional — no `dbLinkIsConstant` gate — and only the
+    /// CONSTANT lset supplies a `loadArray` (`dbConstLink.c:239`; `dbLoadLinkArray`
+    /// returns `S_db_noLSET` otherwise, `dbLink.c:255-264`), so a waveform whose
+    /// INP is a real link, or unset, lands in the `else`: NORD = 0. That is why C
+    /// serves NORD=0 on a bare `record(waveform,"X"){}` (NELM defaults to 1) while
+    /// the identical `aai` serves 1 — `devAaiSoft.c:55` loads only
+    /// `if (dbLinkIsConstant(plink))` and leaves the record's seed alone otherwise.
+    ///
+    /// So the three input kinds split here, and each is C's own dset:
+    ///
+    /// * waveform — the seed does not survive a failed load;
+    /// * aai — it does;
+    /// * subArray — `devSASoft.c:58-74` loads and subsets (NORD comes from the
+    ///   slice, `subset()`), and leaves NORD alone when the load fails; its seed
+    ///   is 0 to begin with.
+    fn soft_input_dset_init(&mut self, loaded: bool) {
+        // `prebuilt_nord`: the elements a caller loaded are not C's calloc'd
+        // buffer, and the dset's zeroing arm exists because C's buffer IS empty.
+        if matches!(self.kind, ArrayKind::Waveform) && !loaded && self.prebuilt_nord == 0 {
+            self.nord = 0;
+        }
     }
 
     /// C `fetchValue(prec, 1)`'s `if (!status) { prec->nord = nReq;

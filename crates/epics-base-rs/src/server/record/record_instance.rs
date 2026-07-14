@@ -7,7 +7,9 @@ use crate::error::{CaError, CaResult};
 use crate::server::event_queue::{EventReader, EventUser};
 use crate::server::pv::{MonitorEvent, Subscriber};
 use crate::server::recgbl::EventMask;
-use crate::server::snapshot::{ControlInfo, DisplayInfo, EnumInfo, PropertySupport};
+use crate::server::snapshot::{
+    ControlInfo, DisplayInfo, EnumInfo, EnumStringForm, PropertySupport,
+};
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
 use super::alarm::{AlarmSeverity, AnalogAlarmConfig};
@@ -1067,6 +1069,39 @@ impl RecordInstance {
             .or_else(|| super::menu_choices::shared_menu_choices(field))
     }
 
+    /// **The** owner of "what string does this enum-valued field render as" —
+    /// C's `[DBF_*][DBR_STRING]` conversion row, chosen by the field's DBF
+    /// class. Every path that renders an enum as a string goes through here:
+    /// the CA/PVA encoders (via [`snapshot::EnumInfo::string_form`] on the
+    /// snapshot this builds) and the db-link read
+    /// ([`Self::field_as_dbr_string`]). There is exactly one such table per
+    /// field, and no path may reconstruct a second one.
+    ///
+    /// C's dispatch, and this function's, in the same order:
+    ///
+    /// * `DBF_MENU` / `DBF_DEVICE` -> `getMenuString` / `getDeviceString`, the
+    ///   field's own choice list. Asked FIRST, because a menu field on a record
+    ///   whose `VAL` is an enum (`bo.OMSL`) must render its menu's choices, not
+    ///   the record's `ZNAM`/`ONAM`.
+    /// * `DBF_ENUM` `VAL` -> `getEnumString` -> the record's `get_enum_str`
+    ///   rset ([`Record::enum_string_form`](super::record_trait::Record::enum_string_form)).
+    ///
+    /// `None` when the field has neither — C answers `S_db_noRSET`, an error;
+    /// the port renders empty. It never renders the index: no C conversion row
+    /// produces one.
+    pub(crate) fn enum_string_form_for(&self, field: &str) -> Option<EnumStringForm> {
+        if let Some(choices) = self.menu_choices_for(field) {
+            return Some(EnumStringForm {
+                slots: choices.iter().map(|c| PvString::from(*c)).collect(),
+                overflow: PvString::new(),
+            });
+        }
+        if field.eq_ignore_ascii_case("VAL") {
+            return self.record.enum_string_form();
+        }
+        None
+    }
+
     /// Is `field` one of the DBF classes C's soft device support writes as
     /// `DBR_STRING`?
     ///
@@ -1125,36 +1160,23 @@ impl RecordInstance {
     /// the field metadata — the link-read owner has an index and nothing to
     /// resolve it with.
     ///
-    /// An index past the configured labels falls back to its decimal form, the
-    /// same rule the CA `*_STRING` encoder applies (`types/codec.rs::enum_label`).
+    /// The render goes through [`Self::enum_string_form_for`], the same owner
+    /// the CA/PVA encoders use, so a link read and a `caget -t` of one field can
+    /// never disagree about its string.
     pub(crate) fn field_as_dbr_string(&self, field: &str) -> Option<PvString> {
         let value = self.resolve_field(field)?;
         // A `DBF_ENUM` index, and a `DBF_MENU` index (stored as a short),
-        // resolve through this record's label tables: the field's `menu()`
-        // choices, else the record's own enum states (the `get_enum_str` table
-        // the snapshot builder already assembles). A short field that is neither
-        // has no table and stays the plain number C converts it to.
+        // render through the field's string source. A short field that is
+        // neither has no source and stays the plain number C converts it to.
         let idx = match value {
             EpicsValue::Enum(v) => Some(v),
             EpicsValue::Short(v) => u16::try_from(v).ok(),
             _ => None,
         };
-        if let Some(idx) = idx {
-            if let Some(label) = self
-                .menu_choices_for(field)
-                .and_then(|c| c.get(idx as usize))
-            {
-                return Some(PvString::from(*label));
-            }
-            if matches!(value, EpicsValue::Enum(_))
-                && let Some(label) = self
-                    .cached_metadata()
-                    .enums
-                    .and_then(|e| e.strings.get(idx as usize).cloned())
-                && !label.is_empty()
-            {
-                return Some(label);
-            }
+        if let Some(idx) = idx
+            && let Some(form) = self.enum_string_form_for(field)
+        {
+            return Some(form.render(idx));
         }
         value_as_dbr_string(&value)
     }
@@ -1266,9 +1288,12 @@ impl RecordInstance {
             return;
         };
         if matches!(snap.value, EpicsValue::Enum(_)) {
-            snap.enums = Some(super::super::snapshot::EnumInfo {
-                strings: choices.iter().map(|s| PvString::from(*s)).collect(),
-            });
+            // A menu's choice list IS its string table (C `getMenuString`
+            // indexes the same `papChoiceValue` the `DBR_GR_ENUM` reply
+            // carries), so both rset slots come from the one list.
+            snap.enums = Some(super::super::snapshot::EnumInfo::new(
+                choices.iter().map(|s| PvString::from(*s)).collect(),
+            ));
         }
     }
 
@@ -1899,9 +1924,18 @@ impl RecordInstance {
     /// by construction. It arrives already trimmed to C's `no_str` (bi/bo/busy
     /// drop an empty ONAM behind a set ZNAM — `boRecord.c:342-352`; mbbi/mbbo
     /// cut at the last non-empty state — `mbbiRecord.c:262-269`).
+    ///
+    /// The `DBR_STRING` half of the same channel is the record's OTHER rset slot
+    /// (`get_enum_str`), which is not this trimmed list — see
+    /// [`EnumStringForm`]. A record that has no such slot (every record but
+    /// bi/bo/busy/mbbi/mbbo, including the downstream crates' own enum records)
+    /// renders from its label list, which is what C's absent slot amounts to.
     fn populate_enum_info(&self, snap: &mut super::super::snapshot::Snapshot) {
         if let Some(strings) = self.record.enum_state_strings() {
-            snap.enums = Some(super::super::snapshot::EnumInfo { strings });
+            snap.enums = Some(match self.record.enum_string_form() {
+                Some(form) => super::super::snapshot::EnumInfo::with_string_form(strings, form),
+                None => super::super::snapshot::EnumInfo::new(strings),
+            });
         }
     }
 

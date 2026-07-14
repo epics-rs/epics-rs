@@ -1727,9 +1727,7 @@ mod tests {
         assert!(t.contains("    Status:           NO_ALARM"), "{t}");
         // GR_ENUM (24): status/severity then the enum table.
         let mut e = Snapshot::new(EpicsValue::Enum(1), 0, 0, SystemTime::UNIX_EPOCH);
-        e.enums = Some(EnumInfo {
-            strings: vec!["OFF".into(), "ON".into()],
-        });
+        e.enums = Some(EnumInfo::new(vec!["OFF".into(), "ON".into()]));
         let es = dbr_extended_str(24, &e);
         assert!(es.contains("    Enums:            ( 2)"), "{es}");
         assert!(es.contains("[ 0] OFF"), "{es}");

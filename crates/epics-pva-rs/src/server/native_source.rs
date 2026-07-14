@@ -1255,9 +1255,7 @@ mod tests {
         // not a numeric NTScalar.
         use epics_base_rs::server::snapshot::EnumInfo;
         let mut snap = Snapshot::new(EpicsValue::Enum(1), 0, 0, std::time::UNIX_EPOCH);
-        snap.enums = Some(EnumInfo {
-            strings: vec!["OFF".into(), "ON".into()],
-        });
+        snap.enums = Some(EnumInfo::new(vec!["OFF".into(), "ON".into()]));
 
         // value: NTEnum struct id + nested enum_t { index, choices }.
         let PvField::Structure(s) = snapshot_to_pv_field(&snap) else {
@@ -1460,9 +1458,7 @@ mod tests {
 
         // value.choices boundary: producer struct, then wire round-trip.
         let mut esnap = Snapshot::new(EpicsValue::Enum(0), 0, 0, std::time::UNIX_EPOCH);
-        esnap.enums = Some(EnumInfo {
-            strings: vec![PvString::from_bytes(raw.clone())],
-        });
+        esnap.enums = Some(EnumInfo::new(vec![PvString::from_bytes(raw.clone())]));
         let PvField::Structure(s) = snapshot_to_pv_field(&esnap) else {
             panic!("NTEnum value must be a structure");
         };

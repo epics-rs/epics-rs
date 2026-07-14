@@ -441,6 +441,20 @@ impl Record for MbboRecord {
         ]))
     }
 
+    /// C `get_enum_str` (mbboRecord.c:314-333): any `val <= 15` reads its state slot,
+    /// defined or not, so an unset state renders EMPTY; past 15 it is
+    /// `"Illegal Value"`. `enum_state_strings` above stops at the last
+    /// non-empty state because `no_str` says how many labels are meaningful —
+    /// that trim must never reach this read, or an undefined state comes back
+    /// as its index, which no C IOC emits.
+    fn enum_string_form(&self) -> Option<crate::server::snapshot::EnumStringForm> {
+        Some(crate::server::record::multibit_enum_string_form([
+            &self.zrst, &self.onst, &self.twst, &self.thst, &self.frst, &self.fvst, &self.sxst,
+            &self.svst, &self.eist, &self.nist, &self.test, &self.elst, &self.tvst, &self.ttst,
+            &self.ftst, &self.ffst,
+        ]))
+    }
+
     // C recMbbo.c IVOA=set_to_IVOV: val = ivov; rval = ivov. IVOV is
     // DBF_USHORT (mbboRecord.dbd.pod:717); RVAL is DBF_ULONG
     // (mbboRecord.dbd.pod:620). Coerce the incoming carrier to the

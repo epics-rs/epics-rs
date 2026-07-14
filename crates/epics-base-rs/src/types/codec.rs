@@ -117,9 +117,10 @@ fn convert_value_to_dbr_string(
                 .map(|v| cvt_float_to_string(*v, prec).into())
                 .collect(),
         ),
-        // C `getEnumString` (dbConvert.c, `[DBF_ENUM][DBR_STRING]`)
-        // returns the state LABEL via `get_enum_str`, not the index. Map each
-        // index to `snapshot.enums.strings[idx]`; see `enum_label`.
+        // C `getEnumString` (dbConvert.c, `[DBF_ENUM][DBR_STRING]`) hands the
+        // value to the field's own string source — the record's `get_enum_str`
+        // rset, a menu's choice list, a device's choice list — and renders what
+        // comes back. See `enum_label`.
         EpicsValue::Enum(v) => EpicsValue::String(enum_label(snapshot, *v)),
         EpicsValue::EnumArray(a) => {
             EpicsValue::StringArray(a.iter().map(|v| enum_label(snapshot, *v)).collect())
@@ -128,20 +129,21 @@ fn convert_value_to_dbr_string(
     }
 }
 
-/// render an enum index as its state label for a `*_STRING` request,
-/// matching C `get_enum_str`. The label array is the one already populated
-/// for DBR_GR_ENUM. An index past the configured states (or a channel with no
-/// enum metadata) falls back to the decimal index — the record-type-specific
-/// out-of-range sentinel (`"Illegal_Value"` / `"Illegal Value"`) is not
-/// reproducible without the record type, and a record's VAL is always a
-/// defined state in normal operation.
+/// Render an enum index as C's `get_enum_str` does, through the channel's
+/// [`EnumStringForm`](crate::server::snapshot::EnumStringForm) — the one owner
+/// of "what string this enum value is".
+///
+/// There is no decimal fallback, because C has no path that produces one: a
+/// value with no matching slot renders as the record's out-of-range sentinel
+/// (empty for a menu), and a channel with no enum source at all is `S_db_noRSET`
+/// in C — an error, never the number. The port answers empty rather than invent
+/// a digit string that no C IOC can emit.
 fn enum_label(snapshot: &crate::server::snapshot::Snapshot, idx: u16) -> PvString {
     snapshot
         .enums
         .as_ref()
-        .and_then(|e| e.strings.get(idx as usize))
-        .cloned()
-        .unwrap_or_else(|| PvString::from(idx.to_string()))
+        .map(|e| e.string_form.render(idx))
+        .unwrap_or_default()
 }
 
 /// Port of libCom `cvtDoubleToString` (cvtFast.c:111-190).
@@ -1223,7 +1225,9 @@ fn decode_enum_metadata(data: &[u8], off: usize) -> CaResult<(EnumInfo, usize)> 
         }
         pos += MAX_ENUM_STRING_SIZE;
     }
-    Ok((EnumInfo { strings }, pos))
+    // Decoding a server's `DBR_GR_ENUM` reply: the `no_str` labels it sent are
+    // all a CLIENT has, so they are both its label list and its string table.
+    Ok((EnumInfo::new(strings), pos))
 }
 
 #[cfg(test)]
@@ -1548,9 +1552,7 @@ mod r58_enum_label_tests {
 
     fn snap_with_enum(value: EpicsValue, labels: &[&str]) -> Snapshot {
         let mut s = Snapshot::new(value, 0, 0, SystemTime::UNIX_EPOCH);
-        s.enums = Some(EnumInfo {
-            strings: labels.iter().map(|x| (*x).into()).collect(),
-        });
+        s.enums = Some(EnumInfo::new(labels.iter().map(|x| (*x).into()).collect()));
         s
     }
 
@@ -1577,21 +1579,77 @@ mod r58_enum_label_tests {
         );
     }
 
+    /// CORRECTED (was `enum_out_of_range_falls_back_to_index`, asserting
+    /// `"5"`). No C conversion row renders an enum as its number. A channel
+    /// whose string table is a plain label list has no out-of-range sentinel —
+    /// C `getMenuString` fails the `dbGet` with `S_db_badChoice` — so the port
+    /// answers empty. Ground truth, compiled `softIoc`: an `mbbi` put to an
+    /// index with no state string answers `caget -t` with an empty line.
     #[test]
-    fn enum_out_of_range_falls_back_to_index() {
+    fn enum_out_of_range_renders_the_overflow_never_the_index() {
         let s = snap_with_enum(EpicsValue::Enum(5), &["Off", "On"]);
         assert_eq!(
             convert_value_to_dbr_string(&s.value, &s),
-            EpicsValue::String("5".into())
+            EpicsValue::String("".into())
         );
     }
 
+    /// The record sentinel reaches the wire when the field HAS one: `mbbi`'s
+    /// `get_enum_str` answers `"Illegal Value"` past state 15
+    /// (`mbbiRecord.c:252`). Measured: `caput E:MBBI.VAL 20` then
+    /// `caget -t E:MBBI` prints `Illegal Value`.
     #[test]
-    fn enum_without_metadata_falls_back_to_index() {
+    fn enum_past_the_slots_renders_the_records_sentinel() {
+        use crate::server::snapshot::EnumStringForm;
+        let mut s = Snapshot::new(EpicsValue::Enum(20), 0, 0, SystemTime::UNIX_EPOCH);
+        let mut slots: Vec<crate::types::PvString> = vec!["zero".into(), "one".into()];
+        slots.resize(16, crate::types::PvString::new());
+        s.enums = Some(EnumInfo::with_string_form(
+            vec!["zero".into(), "one".into()],
+            EnumStringForm {
+                slots,
+                overflow: "Illegal Value".into(),
+            },
+        ));
+        assert_eq!(
+            convert_value_to_dbr_string(&s.value, &s),
+            EpicsValue::String("Illegal Value".into())
+        );
+    }
+
+    /// An UNDEFINED state inside the slot range is the empty string, not the
+    /// sentinel and not the index: C `strncpy`s the empty state
+    /// (`mbbiRecord.c:246-250`). Measured: `caput E:MBBI.VAL 5` -> `caget -t`
+    /// prints an empty line, while `caget -t -n` still prints `5`.
+    #[test]
+    fn enum_undefined_slot_renders_empty() {
+        use crate::server::snapshot::EnumStringForm;
+        let mut s = Snapshot::new(EpicsValue::Enum(5), 0, 0, SystemTime::UNIX_EPOCH);
+        let mut slots: Vec<crate::types::PvString> = vec!["zero".into(), "one".into()];
+        slots.resize(16, crate::types::PvString::new());
+        s.enums = Some(EnumInfo::with_string_form(
+            vec!["zero".into(), "one".into()],
+            EnumStringForm {
+                slots,
+                overflow: "Illegal Value".into(),
+            },
+        ));
+        assert_eq!(
+            convert_value_to_dbr_string(&s.value, &s),
+            EpicsValue::String("".into())
+        );
+    }
+
+    /// CORRECTED (was `enum_without_metadata_falls_back_to_index`, asserting
+    /// `"1"`). A channel with no enum source at all is `S_db_noRSET` in C — an
+    /// ERROR, never the number. Empty is the closest the port can answer
+    /// without inventing a string no C IOC emits.
+    #[test]
+    fn enum_without_metadata_renders_empty_never_the_index() {
         let s = Snapshot::new(EpicsValue::Enum(1), 0, 0, SystemTime::UNIX_EPOCH);
         assert_eq!(
             convert_value_to_dbr_string(&s.value, &s),
-            EpicsValue::String("1".into())
+            EpicsValue::String("".into())
         );
     }
 }

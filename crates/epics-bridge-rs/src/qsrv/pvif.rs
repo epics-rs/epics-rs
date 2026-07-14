@@ -1844,9 +1844,7 @@ mod tests {
     #[test]
     fn nt_enum_structure() {
         let mut snap = Snapshot::new(EpicsValue::Enum(1), 0, 0, UNIX_EPOCH);
-        snap.enums = Some(EnumInfo {
-            strings: vec!["Off".into(), "On".into()],
-        });
+        snap.enums = Some(EnumInfo::new(vec!["Off".into(), "On".into()]));
         let pv = snapshot_to_nt_enum(&snap);
 
         assert_eq!(pv.struct_id, "epics:nt/NTEnum:1.0");
@@ -1906,9 +1904,7 @@ mod tests {
     #[test]
     fn put_roundtrip_enum() {
         let mut snap = Snapshot::new(EpicsValue::Enum(2), 0, 0, UNIX_EPOCH);
-        snap.enums = Some(EnumInfo {
-            strings: vec!["A".into(), "B".into(), "C".into()],
-        });
+        snap.enums = Some(EnumInfo::new(vec!["A".into(), "B".into(), "C".into()]));
         let pv = snapshot_to_nt_enum(&snap);
         let back = pv_structure_to_epics(&pv).unwrap();
         assert_eq!(back, EpicsValue::Enum(2));

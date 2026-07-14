@@ -36,6 +36,7 @@
 //! Each table cites its source.
 
 use crate::error::{CaError, CaResult};
+use crate::server::snapshot::EnumStringForm;
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
 /// `menu(menuAlarmSevr)` — `menuAlarmSevr.dbd.pod:21-24`.
@@ -369,6 +370,32 @@ pub fn multibit_enum_states(states: [&PvString; 16]) -> Vec<PvString> {
         .map(|i| i + 1)
         .unwrap_or(0);
     states[..no_str].iter().map(|s| (*s).clone()).collect()
+}
+
+/// C `get_enum_str` for the two-state records (`bi`/`bo`/`busy`):
+/// `VAL==0 -> ZNAM`, `VAL==1 -> ONAM`, anything else `"Illegal_Value"`
+/// (`biRecord.c:173-192`, `boRecord.c:320-339`).
+///
+/// Both slots are indexed UNTRIMMED — unlike [`binary_enum_states`], an empty
+/// `ONAM` behind a set `ZNAM` is still slot 1 and still renders empty. C's
+/// `no_str` trimming belongs to the label list, not to this read.
+pub fn binary_enum_string_form(znam: &PvString, onam: &PvString) -> EnumStringForm {
+    EnumStringForm {
+        slots: vec![znam.clone(), onam.clone()],
+        overflow: PvString::from("Illegal_Value"),
+    }
+}
+
+/// C `get_enum_str` for the 16-state records (`mbbi`/`mbbo`): any `val <= 15`
+/// reads its state slot, empty or not; past that, `"Illegal Value"` — with a
+/// SPACE, where the two-state records use an underscore
+/// (`mbbiRecord.c:235-255`, `mbboRecord.c:314-333`). The two spellings are C's,
+/// and both are wire-visible, so neither is normalized here.
+pub fn multibit_enum_string_form(states: [&PvString; 16]) -> EnumStringForm {
+    EnumStringForm {
+        slots: states.iter().map(|s| (*s).clone()).collect(),
+        overflow: PvString::from("Illegal Value"),
+    }
 }
 
 /// C `dbConvert.c::putStringEnum` (lines 1149-1190) — a `DBR_STRING` write to a

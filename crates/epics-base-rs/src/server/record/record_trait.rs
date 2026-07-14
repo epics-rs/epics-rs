@@ -1142,6 +1142,29 @@ pub trait Record: Send + Sync + 'static {
         None
     }
 
+    /// The record's `get_enum_str` rset slot — how a `DBR_STRING` READ of its
+    /// `DBF_ENUM` `VAL` renders. A THIRD slot, distinct from the pair above:
+    /// C's `get_enum_str` (singular) is not `get_enum_strs` (plural), and
+    /// serving the read from the plural table is what made an undefined `mbbi`
+    /// state come out as its index.
+    ///
+    /// The difference is the trimming. `get_enum_strs` reports `no_str`, so the
+    /// label list stops at the last non-empty state; `get_enum_str` indexes the
+    /// state array *untrimmed* (`mbbiRecord.c:246-250`: any `val <= 15` reads
+    /// `zrst + val * sizeof(zrst)`, empty or not) and only an index past the
+    /// array reaches the sentinel. Verified on the compiled C `softIoc`: an
+    /// `mbbi` with `ZRST`/`ONST` set answers `caget -t` with `""` at `VAL=5` and
+    /// `"Illegal Value"` at `VAL=20`.
+    ///
+    /// `None` — the record leaves the rset slot NULL (`#define get_enum_str
+    /// NULL`), which is every record but `bi`/`bo`/`mbbi`/`mbbo`. A field on
+    /// such a record renders from its menu instead; see
+    /// [`RecordInstance::enum_string_form_for`](super::RecordInstance::enum_string_form_for),
+    /// the single owner that picks between the two.
+    fn enum_string_form(&self) -> Option<crate::server::snapshot::EnumStringForm> {
+        None
+    }
+
     /// Validate a put before it is applied. Return Err to reject.
     fn validate_put(&self, _field: &str, _value: &EpicsValue) -> CaResult<()> {
         Ok(())

@@ -43,14 +43,98 @@ pub struct ControlInfo {
     pub lower_ctrl_limit: f64,
 }
 
+/// How an enum-valued field renders as a `DBR_STRING` — C's `get_enum_str`
+/// rset slot (`dbConvert.c::getEnumString`), the menu choice list
+/// (`getMenuString`) or the device choice list (`getDeviceString`).
+///
+/// This is NOT the [`EnumInfo::strings`] label array. C keeps the two apart
+/// and so must the port:
+///
+/// * `get_enum_strs` (plural) fills `DBR_GR_ENUM` and reports `no_str`, the
+///   count of *meaningful* leading states. `mbbi` cuts it at the last
+///   non-empty state (`mbbiRecord.c:257-271`), so an all-empty record has
+///   `no_str == 0`.
+/// * `get_enum_str` (singular) renders ONE value. It indexes the record's
+///   state array *untrimmed* (`mbbiRecord.c:246-250` reads `zrst + val*size`
+///   for any `val <= 15`), so an undefined state renders as the EMPTY string,
+///   and only an index past the array yields the record's sentinel.
+///
+/// Indexing the trimmed label list for the singular form is what made the port
+/// answer with a decimal index. **C never renders an enum as its number.**
+/// Measured on the compiled C IOC (`softIoc`, mbbi with ZRST/ONST set):
+///
+/// ```text
+/// caput VAL 5  -> caget -t: []                 (slot 5 empty, still <= 15)
+/// caput VAL 20 -> caget -t: [Illegal Value]    (past the 16 states)
+/// blank mbbi   -> caget -t: []                 (no states at all)
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct EnumStringForm {
+    /// The index-addressable state slots. An undefined state is an EMPTY slot,
+    /// not a missing one — C `strncpy`s whatever is in the record.
+    pub slots: Vec<PvString>,
+    /// What an index past `slots` renders as. C's sentinel is per record type
+    /// (`mbbi`/`mbbo`: `"Illegal Value"`; `bi`/`bo`: `"Illegal_Value"`), and a
+    /// menu/device choice list has none — C fails the `dbGet` with
+    /// `S_db_badChoice` and the port renders empty rather than invent a number.
+    pub overflow: PvString,
+}
+
+impl EnumStringForm {
+    /// C `get_enum_str`: the slot, or the record's out-of-range sentinel.
+    pub fn render(&self, index: u16) -> PvString {
+        self.slots
+            .get(index as usize)
+            .cloned()
+            .unwrap_or_else(|| self.overflow.clone())
+    }
+}
+
 /// Enum state strings (up to 16 states, each max 26 chars on wire).
 ///
 /// Byte-preserving like [`DisplayInfo::units`]: enum choice labels are
 /// raw wire/record bytes with no UTF-8 guarantee, so they must reach the
 /// CA `DBR_GR_ENUM` slots and the PVA `value.choices` array unmangled.
+///
+/// `#[non_exhaustive]`: the two C rset slots this carries — the `no_str`-trimmed
+/// label array and the [`EnumStringForm`] a `DBR_STRING` read indexes — must be
+/// assigned together, so the struct is built through [`EnumInfo::new`] (labels
+/// are their own state table: a menu, a plain enum channel) or
+/// [`EnumInfo::with_string_form`] (a record whose `get_enum_str` differs from
+/// its `get_enum_strs`). A bare literal could set one and leave the other empty,
+/// which is the exact desync that made an enum serve its index as its string.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct EnumInfo {
+    /// C `get_enum_strs` — the `DBR_GR_ENUM` label array, trimmed to `no_str`.
     pub strings: Vec<PvString>,
+    /// C `get_enum_str` — how a `DBR_STRING` read of the field renders.
+    pub string_form: EnumStringForm,
+}
+
+impl EnumInfo {
+    /// A channel whose labels ARE its state table: every menu and device choice
+    /// list, and any enum channel with no record `get_enum_str` behind it. The
+    /// two C slots coincide, so one list fills both.
+    pub fn new(strings: Vec<PvString>) -> Self {
+        Self {
+            string_form: EnumStringForm {
+                slots: strings.clone(),
+                overflow: PvString::new(),
+            },
+            strings,
+        }
+    }
+
+    /// A record whose `get_enum_str` is NOT its `get_enum_strs`: `mbbi`'s label
+    /// list stops at the last non-empty state while its `DBR_STRING` form still
+    /// indexes all 16 slots and has an `"Illegal Value"` sentinel beyond them.
+    pub fn with_string_form(strings: Vec<PvString>, string_form: EnumStringForm) -> Self {
+        Self {
+            strings,
+            string_form,
+        }
+    }
 }
 
 /// Unified internal state representation for a PV read.

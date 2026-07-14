@@ -481,9 +481,7 @@ fn test_encode_gr_char_saturates_out_of_range() {
 #[test]
 fn test_encode_gr_enum_with_strings() {
     let mut snap = Snapshot::new(EpicsValue::Enum(1), 0, 0, SystemTime::UNIX_EPOCH);
-    snap.enums = Some(EnumInfo {
-        strings: vec!["Off".into(), "On".into()],
-    });
+    snap.enums = Some(EnumInfo::new(vec!["Off".into(), "On".into()]));
     let data = encode_dbr(24, &snap).unwrap();
     assert_eq!(data.len(), 424);
     assert_eq!(&data[4..6], &2u16.to_be_bytes());
@@ -790,9 +788,11 @@ fn test_decode_ctrl_char_roundtrip() {
 #[test]
 fn test_decode_ctrl_enum_roundtrip() {
     let mut snap_orig = full_snapshot(EpicsValue::Enum(2));
-    snap_orig.enums = Some(EnumInfo {
-        strings: vec!["Off".into(), "On".into(), "Reset".into()],
-    });
+    snap_orig.enums = Some(EnumInfo::new(vec![
+        "Off".into(),
+        "On".into(),
+        "Reset".into(),
+    ]));
     let data = encode_dbr(31, &snap_orig).unwrap();
     let snap = decode_dbr(31, &data, 1).unwrap();
     assert_eq!(snap.value, EpicsValue::Enum(2));

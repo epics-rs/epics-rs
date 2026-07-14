@@ -1024,11 +1024,7 @@ impl PvDatabase {
         } else {
             db.field.as_str()
         };
-        inst.record
-            .field_list()
-            .iter()
-            .find(|f| f.name.eq_ignore_ascii_case(field))
-            .map(|f| f.dbf_type)
+        crate::server::record::record_instance::declared_field_type_of(inst.record.as_ref(), field)
     }
 
     /// Create a put-notify wait-set for a downstream operation a record is
@@ -5811,13 +5807,11 @@ impl PvDatabase {
                     // process() computes VAL = 0*ESLO + EOFF
                     // (the offset only), not the intended
                     // RAW*ESLO + EOFF.
-                    let rval_type = instance
-                        .record
-                        .field_list()
-                        .iter()
-                        .find(|f| f.name == "RVAL")
-                        .map(|f| f.dbf_type)
-                        .unwrap_or(crate::types::DbFieldType::Long);
+                    let rval_type = crate::server::record::record_instance::declared_field_type_of(
+                        instance.record.as_ref(),
+                        "RVAL",
+                    )
+                    .unwrap_or(crate::types::DbFieldType::Long);
                     // C parity (aiRecord.c:495): `rval = (long)floor(sval)`.
                     // Rust `convert_to(Long)` truncates toward zero,
                     // diverging for negative bipolar-ADC raw values

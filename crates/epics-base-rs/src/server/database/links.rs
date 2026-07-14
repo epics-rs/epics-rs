@@ -1508,13 +1508,11 @@ impl PvDatabase {
                     return OutTarget::UNRESOLVED;
                 };
                 let guard = target.read().await;
-                let field_type = guard
-                    .record
-                    .field_list()
-                    .iter()
-                    .find(|f| f.name.eq_ignore_ascii_case(&db.field))
-                    .map(|f| f.dbf_type)
-                    .or_else(|| guard.record.get_field(&db.field).map(|v| v.db_field_type()));
+                let field_type = crate::server::record::record_instance::declared_field_type_of(
+                    guard.record.as_ref(),
+                    &db.field,
+                )
+                .or_else(|| guard.record.get_field(&db.field).map(|v| v.db_field_type()));
                 let element_count = match guard.record.get_field(&db.field) {
                     Some(v) if v.is_array() => guard
                         .record

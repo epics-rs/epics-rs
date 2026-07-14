@@ -2822,13 +2822,7 @@ pub fn put_field_internal_default<R: Record + ?Sized>(
     let target_type = record
         .get_field(name)
         .map(|v| v.db_field_type())
-        .or_else(|| {
-            record
-                .field_list()
-                .iter()
-                .find(|f| f.name.eq_ignore_ascii_case(name))
-                .map(|f| f.dbf_type)
-        });
+        .or_else(|| crate::server::record::record_instance::declared_field_type_of(record, name));
     // An array source into a SCALAR destination delivers element 0. C's link
     // layer asks for exactly one element (`dbGetLink(..., nRequest = NULL)`), so
     // `dbGet` converts the field at offset 0 and the record sees a scalar — a
@@ -2888,10 +2882,7 @@ pub fn coerce_put_value<R: Record + ?Sized>(
     value: EpicsValue,
 ) -> CaResult<EpicsValue> {
     if let EpicsValue::String(s) = &value {
-        if let Some(choices) = record
-            .menu_field_choices(field)
-            .or_else(|| super::shared_menu_choices(field))
-        {
+        if let Some(choices) = super::record_instance::menu_choices_of(record, field) {
             return super::resolve_menu_field_string(field, choices, target, &s.as_str_lossy());
         }
         if target == DbFieldType::Enum {

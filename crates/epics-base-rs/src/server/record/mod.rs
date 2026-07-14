@@ -6,7 +6,7 @@ mod link;
 mod menu_choices;
 mod pini;
 mod process_passive;
-mod record_instance;
+pub(crate) mod record_instance;
 mod record_trait;
 mod scan;
 

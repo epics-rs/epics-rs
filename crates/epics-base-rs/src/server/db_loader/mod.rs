@@ -1469,10 +1469,14 @@ pub fn apply_fields(
         // most record types leave to the framework — so ownership is asked of
         // `implements_field()`, not of table membership.
         let owned = record.implements_field(&upper_name);
-        let spec = record
-            .field_list()
-            .iter()
-            .find(|f| f.name == upper_name.as_str());
+        // The DECLARATION, from the same owner every other consumer asks: the
+        // `.dbd`-generated table first, the record's hand table only where the
+        // `.dbd` does not reach. Reading it off `field_list()` alone left an
+        // `aSub`'s `field(FTA,"LONG")` with no `menu()` to resolve against.
+        let spec = crate::server::record::record_instance::field_desc_of(
+            record.as_ref(),
+            upper_name.as_str(),
+        );
 
         if owned {
             // Parse to the type the record STORES, exactly as

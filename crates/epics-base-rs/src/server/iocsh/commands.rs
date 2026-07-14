@@ -250,8 +250,11 @@ fn cmd_dbpf() -> CommandDef {
                 if let Some(rec) = ctx.db().get_record(base).await {
                     let inst = rec.read().await;
                     // Check record-specific fields
-                    if let Some(desc) = inst.record.field_list().iter().find(|f| f.name == field) {
-                        return Some(desc.dbf_type);
+                    if let Some(t) = crate::server::record::record_instance::declared_field_type_of(
+                        inst.record.as_ref(),
+                        &field,
+                    ) {
+                        return Some(t);
                     }
                     // Common field types
                     return common_field_dbf_type(&field);

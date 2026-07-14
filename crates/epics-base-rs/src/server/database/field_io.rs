@@ -270,13 +270,7 @@ fn dbput_request(
     let target = record
         .get_field(field)
         .map(|v| v.db_field_type())
-        .or_else(|| {
-            record
-                .field_list()
-                .iter()
-                .find(|f| f.name.eq_ignore_ascii_case(field))
-                .map(|f| f.dbf_type)
-        });
+        .or_else(|| crate::server::record::record_instance::declared_field_type_of(record, field));
 
     // C `dbPut` clamps the request to the destination's element count —
     // `if (no_elements < nRequest) nRequest = no_elements;` (dbAccess.c:1359),

@@ -380,10 +380,10 @@ pub fn multibit_enum_states(states: [&PvString; 16]) -> Vec<PvString> {
 /// `ONAM` behind a set `ZNAM` is still slot 1 and still renders empty. C's
 /// `no_str` trimming belongs to the label list, not to this read.
 pub fn binary_enum_string_form(znam: &PvString, onam: &PvString) -> EnumStringForm {
-    EnumStringForm {
-        slots: vec![znam.clone(), onam.clone()],
-        overflow: PvString::from("Illegal_Value"),
-    }
+    EnumStringForm::states(
+        vec![znam.clone(), onam.clone()],
+        PvString::from("Illegal_Value"),
+    )
 }
 
 /// C `get_enum_str` for the 16-state records (`mbbi`/`mbbo`): any `val <= 15`
@@ -392,10 +392,10 @@ pub fn binary_enum_string_form(znam: &PvString, onam: &PvString) -> EnumStringFo
 /// (`mbbiRecord.c:235-255`, `mbboRecord.c:314-333`). The two spellings are C's,
 /// and both are wire-visible, so neither is normalized here.
 pub fn multibit_enum_string_form(states: [&PvString; 16]) -> EnumStringForm {
-    EnumStringForm {
-        slots: states.iter().map(|s| (*s).clone()).collect(),
-        overflow: PvString::from("Illegal Value"),
-    }
+    EnumStringForm::states(
+        states.iter().map(|s| (*s).clone()).collect(),
+        PvString::from("Illegal Value"),
+    )
 }
 
 /// C `dbConvert.c::putStringEnum` (lines 1149-1190) — a `DBR_STRING` write to a

@@ -1606,10 +1606,7 @@ mod r58_enum_label_tests {
         slots.resize(16, crate::types::PvString::new());
         s.enums = Some(EnumInfo::with_string_form(
             vec!["zero".into(), "one".into()],
-            EnumStringForm {
-                slots,
-                overflow: "Illegal Value".into(),
-            },
+            EnumStringForm::states(slots, "Illegal Value".into()),
         ));
         assert_eq!(
             convert_value_to_dbr_string(&s.value, &s),
@@ -1629,10 +1626,7 @@ mod r58_enum_label_tests {
         slots.resize(16, crate::types::PvString::new());
         s.enums = Some(EnumInfo::with_string_form(
             vec!["zero".into(), "one".into()],
-            EnumStringForm {
-                slots,
-                overflow: "Illegal Value".into(),
-            },
+            EnumStringForm::states(slots, "Illegal Value".into()),
         ));
         assert_eq!(
             convert_value_to_dbr_string(&s.value, &s),

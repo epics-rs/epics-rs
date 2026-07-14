@@ -1215,20 +1215,19 @@ impl RecordInstance {
     ///   rset ([`Record::enum_string_form`](super::record_trait::Record::enum_string_form)).
     ///
     /// `None` when the field has neither — C answers `S_db_noRSET`, an error;
-    /// the port renders empty. It never renders the index: no C conversion row
-    /// produces one.
+    /// the port renders empty.
+    ///
+    /// Each class brings its own out-of-range rule with it (see
+    /// [`EnumOverflow`](crate::server::snapshot::EnumOverflow)); the index is
+    /// rendered as a number for a `DBF_MENU` and ONLY for a `DBF_MENU`.
     pub(crate) fn enum_string_form_for(&self, field: &str) -> Option<EnumStringForm> {
         if field.eq_ignore_ascii_case("DTYP") {
-            return Some(EnumStringForm {
-                slots: self.device_choices(),
-                overflow: PvString::new(),
-            });
+            return Some(EnumStringForm::device(self.device_choices()));
         }
         if let Some(choices) = self.menu_choices_for(field) {
-            return Some(EnumStringForm {
-                slots: choices.iter().map(|c| PvString::from(*c)).collect(),
-                overflow: PvString::new(),
-            });
+            return Some(EnumStringForm::menu(
+                choices.iter().map(|c| PvString::from(*c)),
+            ));
         }
         if field.eq_ignore_ascii_case("VAL") {
             return self.record.enum_string_form();

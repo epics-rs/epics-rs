@@ -65,7 +65,13 @@ pub struct CommonFields {
     pub utag: u64,
     // Analog alarm config (Some for analog record types)
     pub analog_alarm: Option<AnalogAlarmConfig>,
-    // Access security group
+    /// Access security group — C `dbCommon.ASG`, a `DBF_STRING` with NO
+    /// `initial()` in `dbCommon.dbd`, so a record that does not name a group
+    /// holds the EMPTY string and `caget -t REC.ASG` on any C IOC prints an
+    /// empty line. It is `asAddMember` (asLibRoutines.c:893-928) that resolves
+    /// an empty or unknown name to the DEFAULT group — the FIELD never says
+    /// "DEFAULT" unless the `.db` put it there. Ask [`Self::access_group`] for
+    /// the group to evaluate against; read this only to serve the field.
     pub asg: String,
     /// Access security level. C `dbCommon.ASL`
     /// (0 or 1, default 0). Compared against `RULE(N, …)` levels
@@ -110,6 +116,26 @@ pub struct CommonFields {
 }
 
 impl CommonFields {
+    /// **The single owner of "which access group does this record belong to"** —
+    /// C `asAddMember(&prec->asp, prec->asg)`, whose `asAddMemberPvt`
+    /// (asLibRoutines.c:893-928) resolves an empty or unknown group name to the
+    /// always-present `DEFAULT` group.
+    ///
+    /// Every access-security call site asks this, never [`Self::asg`] directly:
+    /// the FIELD is what the `.db` wrote (empty by default, and that is what the
+    /// wire must show), the GROUP is what the ACF is evaluated against. Three
+    /// call sites used to spell the empty→DEFAULT rule out for themselves and a
+    /// fourth (the CA server) relied on the config lookup missing — which is a
+    /// different rule (C's unknown-NAME reassignment) that happened to have the
+    /// same effect.
+    pub fn access_group(&self) -> &str {
+        if self.asg.is_empty() {
+            "DEFAULT"
+        } else {
+            &self.asg
+        }
+    }
+
     /// Build a [`ProcessContext`](super::record_trait::ProcessContext)
     /// snapshot of the framework-owned state a record's `process()` or
     /// device support's `read()` needs to observe during the cycle.
@@ -172,7 +198,7 @@ impl Default for CommonFields {
             tsel: String::new(),
             utag: 0,
             analog_alarm: None,
-            asg: "DEFAULT".to_string(),
+            asg: String::new(),
             asl: 0,
             desc: PvString::new(),
             phas: 0,

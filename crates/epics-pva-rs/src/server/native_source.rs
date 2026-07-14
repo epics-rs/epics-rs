@@ -83,12 +83,7 @@ impl PvDatabaseSource {
                 let (base, _field) = parse_pv_name(&pv_name);
                 if let Some(rec) = db.get_record(base).await {
                     let inst = rec.read().await;
-                    let asg = if !inst.common.asg.is_empty() {
-                        inst.common.asg.clone()
-                    } else {
-                        "DEFAULT".to_string()
-                    };
-                    return (asg, inst.common.asl);
+                    return (inst.common.access_group().to_string(), inst.common.asl);
                 }
                 ("DEFAULT".to_string(), 0u8)
             })

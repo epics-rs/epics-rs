@@ -379,7 +379,7 @@ fn cmd_aspmem() -> CommandDef {
                 if let Some(rec) = ctx.block_on(ctx.db().get_record(rec_name)) {
                     let inst = ctx.block_on(rec.read());
                     by_asg
-                        .entry(inst.common.asg.clone())
+                        .entry(inst.common.access_group().to_string())
                         .or_default()
                         .push(rec_name.clone());
                 }
@@ -438,7 +438,7 @@ fn cmd_astac() -> CommandDef {
             let (asg, asl) = match ctx.block_on(ctx.db().get_record(&record)) {
                 Some(rec) => {
                     let inst = ctx.block_on(rec.read());
-                    (inst.common.asg.clone(), inst.common.asl)
+                    (inst.common.access_group().to_string(), inst.common.asl)
                 }
                 None => {
                     ctx.println(&format!("astac: record '{record}' not found"));

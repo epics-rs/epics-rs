@@ -47,7 +47,7 @@ proptest! {
     #[test]
     fn header_roundtrip_extended(
         cmmd in 0u16..=64,
-        ext_size in 0u32..=(MAX_PAYLOAD_SIZE as u32),
+        ext_size in 0u32..=(MAX_FRAME_BODY_BYTES as u32),
         ext_count in any::<u32>(),
         cid in any::<u32>(),
         available in any::<u32>(),
@@ -71,7 +71,7 @@ proptest! {
     /// `set_payload_size` chooses extended form iff size or count
     /// exceed the u16 range.
     #[test]
-    fn extended_iff_overflow(size in 0usize..=(MAX_PAYLOAD_SIZE), count in any::<u32>()) {
+    fn extended_iff_overflow(size in 0usize..=(MAX_FRAME_BODY_BYTES), count in any::<u32>()) {
         let mut hdr = CaHeader::new(CA_PROTO_READ_NOTIFY);
         hdr.set_payload_size(size, count, epics_ca_rs::protocol::CA_MINOR_VERSION)
         .expect("modern peer accepts the extended header");
@@ -109,8 +109,8 @@ proptest! {
     /// the claimed size: we pass a bare 24-byte buffer, so the parser sees
     /// the claimed size without any actual payload and must not touch it.
     #[test]
-    fn extended_payload_past_max_payload_size_parses(
-        ext_size in (MAX_PAYLOAD_SIZE as u64 + 1)..=u32::MAX as u64,
+    fn extended_payload_past_max_frame_body_bytes_parses(
+        ext_size in (MAX_FRAME_BODY_BYTES as u64 + 1)..=u32::MAX as u64,
         ext_count in any::<u32>(),
     ) {
         let mut buf = [0u8; 24];
@@ -139,7 +139,7 @@ proptest! {
     /// - be < input + 8
     /// - be idempotent (align8(align8(x)) == align8(x))
     #[test]
-    fn align8_invariants(n in 0usize..=(MAX_PAYLOAD_SIZE)) {
+    fn align8_invariants(n in 0usize..=(MAX_FRAME_BODY_BYTES)) {
         let aligned = align8(n);
         prop_assert_eq!(aligned % 8, 0);
         prop_assert!(aligned >= n);

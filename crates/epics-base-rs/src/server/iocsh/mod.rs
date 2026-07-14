@@ -320,7 +320,13 @@ impl IocShell {
     /// the captured stderr stream when an operator pipes a script in.
     pub fn run_repl(&self) -> Result<(), String> {
         use std::io::IsTerminal;
-        if std::io::stdin().is_terminal() {
+        // C `epicsReadline.c:48` — `IOCSH_HISTEDIT_DISABLE` set (to anything
+        // non-empty) means "do not use readline or equivalent", so the line
+        // editor is never started and lines come straight off stdin.
+        let histedit_disabled = crate::runtime::env_table::IOCSH_HISTEDIT_DISABLE
+            .get()
+            .is_some();
+        if std::io::stdin().is_terminal() && !histedit_disabled {
             self.run_repl_interactive()
         } else {
             self.run_repl_piped()
@@ -328,14 +334,17 @@ impl IocShell {
     }
 
     fn run_repl_interactive(&self) -> Result<(), String> {
-        // History capacity from `EPICS_RS_IOCSH_HISTORY_SIZE` (default
-        // 500). Mirrors epics-base PR #459 — bound the history so a
-        // long-running IOC shell session does not grow unbounded.
-        // Lower bound 16 keeps history useful even for hostile env values.
-        let history_size = crate::runtime::env::get("EPICS_RS_IOCSH_HISTORY_SIZE")
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(500)
-            .max(16);
+        // C `gnuReadline.c:49-54`:
+        //     long i = 50;                                 /* the table default */
+        //     envGetLongConfigParam(&IOCSH_HISTSIZE, &i);
+        //     if (i < 0) i = 0;
+        //     stifle_history(i);
+        // `IOCSH_HISTSIZE` is the parameter an existing `st.cmd` sets; the port
+        // previously read a renamed `EPICS_RS_IOCSH_HISTORY_SIZE` with a
+        // different default (500), so a site's setting was silently ignored.
+        let history_size =
+            usize::try_from(crate::runtime::env_table::IOCSH_HISTSIZE.long_or_default())
+                .unwrap_or(0);
         let config = rustyline::Config::builder()
             .max_history_size(history_size)
             .map_err(|e| format!("invalid rustyline history config: {e}"))?
@@ -352,30 +361,31 @@ impl IocShell {
         // when stdout is not a TTY (already TTY-gated by `run_repl`
         // dispatch but defensive).
         let want_color = use_ansi_color();
-        // Bright-green prompt: `\x1b[32;1m` = `ANSI_GREEN` (errlog.h:282),
-        // `\x1b[0m` = reset.
+        // C `iocsh.cpp:1047-1049`: the prompt IS `IOCSH_PS1`, whose compiled
+        // default is `ANSI_GREEN("epics> ")` = `\x1b[32;1mepics> \x1b[0m`
+        // (`CONFIG_SITE_ENV`, expanded by the generator). A site that sets
+        // `IOCSH_PS1` in its `st.cmd` gets its own prompt, as under C; the
+        // port used to hard-code the string and never read the parameter.
         //
         // rustyline 18 splits the prompt's *raw* text (what it measures for
         // visible width) from its *styled* text (what it renders), via the
         // `Prompt::raw()` / `Prompt::styled()` trait, and accepts a
         // `(raw, styled)` tuple as a `Prompt`. We pass that tuple so width is
-        // always measured on the plain `epics> ` (7 columns) while the green
-        // tint still shows wherever the terminal renders ANSI. Embedding the
-        // escapes inline in a single prompt string (the pre-18 approach) made
-        // rustyline's Windows console backend count the escape bytes as
-        // visible columns — its `calculate_position` (tty/windows.rs) sums
-        // raw grapheme width, unlike the Unix backend's ANSI-stripping path —
-        // which pushed the cursor and any typed/echoed text ~9 columns to the
-        // right of `epics> `. Measuring `raw()` fixes that on every platform
-        // and satisfies rustyline 18's debug-assert that the measured text
-        // carries no `\x1b[`. The styled form keeps the same display width as
-        // the raw form, as the `Prompt` trait requires.
-        let styled_prompt = if want_color {
-            "\x1b[32;1mepics> \x1b[0m"
-        } else {
-            "epics> "
-        };
-        let prompt = ("epics> ", styled_prompt);
+        // always measured on the ANSI-stripped form while the tint still shows
+        // wherever the terminal renders ANSI. Embedding the escapes inline in a
+        // single prompt string (the pre-18 approach) made rustyline's Windows
+        // console backend count the escape bytes as visible columns — its
+        // `calculate_position` (tty/windows.rs) sums raw grapheme width, unlike
+        // the Unix backend's ANSI-stripping path — which pushed the cursor and
+        // any typed/echoed text ~9 columns to the right of `epics> `. Measuring
+        // `raw()` fixes that on every platform and satisfies rustyline 18's
+        // debug-assert that the measured text carries no `\x1b[`.
+        let ps1 = crate::runtime::env_table::IOCSH_PS1
+            .get()
+            .unwrap_or_default();
+        let raw_prompt = strip_ansi(&ps1);
+        let styled_prompt = if want_color { ps1 } else { raw_prompt.clone() };
+        let prompt = (raw_prompt.as_str(), styled_prompt.as_str());
 
         loop {
             match rl.readline(&prompt) {
@@ -514,6 +524,31 @@ fn use_ansi_color() -> bool {
         }
     }
     true
+}
+
+/// Drop CSI escape sequences (`ESC [ ... final-byte`) from a prompt.
+///
+/// `IOCSH_PS1` carries them by default (`ANSI_GREEN("epics> ")`), and rustyline
+/// needs the *visible* text separately to compute the cursor column.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            out.push(c);
+            continue;
+        }
+        // CSI: `ESC [` params/intermediates, terminated by 0x40..=0x7e.
+        if chars.next() != Some('[') {
+            continue;
+        }
+        for c in chars.by_ref() {
+            if ('\x40'..='\x7e').contains(&c) {
+                break;
+            }
+        }
+    }
+    out
 }
 
 /// Format an error string with optional ANSI bold-red prefix.

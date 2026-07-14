@@ -1,11 +1,19 @@
 use std::net::SocketAddr;
 
-use super::env;
+use super::env_table::{
+    EPICS_CA_MCAST_TTL, EPICS_CA_REPEATER_PORT, EPICS_CA_SERVER_PORT, EPICS_CAS_BEACON_PORT,
+    EPICS_CAS_SERVER_PORT,
+};
 
-// CA port constants (originally from protocol.rs, now in epics-ca-rs)
-pub const CA_SERVER_PORT: u16 = 5064;
-pub const CA_REPEATER_PORT: u16 = 5065;
-// PVA port constants (originally from pva/protocol.rs, now in epics-pva-rs)
+/// C `CA_SERVER_PORT` (`caProto.h`) — const-derived from the generated
+/// `ENV_PARAM` table, so it cannot drift from `configure/CONFIG_ENV`. A default
+/// that stopped being a valid port would fail const-evaluation.
+pub const CA_SERVER_PORT: u16 = EPICS_CA_SERVER_PORT.default_port();
+/// C `CA_REPEATER_PORT` — see [`CA_SERVER_PORT`].
+pub const CA_REPEATER_PORT: u16 = EPICS_CA_REPEATER_PORT.default_port();
+// PVA port constants (originally from pva/protocol.rs, now in epics-pva-rs).
+// NOT const-derived: PVA has no `ENV_PARAM` in EPICS Base — pvxs owns its own
+// config vocabulary, and `EPICS_PVA_SERVER_PORT` is not in `env_param_list[]`.
 pub const PVA_SERVER_PORT: u16 = 5075;
 pub const PVA_BROADCAST_PORT: u16 = 5076;
 
@@ -19,7 +27,7 @@ pub const PVA_BROADCAST_PORT: u16 = 5076;
 /// hosts both a client and a server (e.g. a gateway) does not get
 /// its client routing redirected by a server-side override.
 pub fn ca_server_port() -> u16 {
-    env::env_inet_port("EPICS_CA_SERVER_PORT", CA_SERVER_PORT)
+    EPICS_CA_SERVER_PORT.inet_port(CA_SERVER_PORT)
 }
 
 /// Server-side CA bind-port reader — where the server **binds** the
@@ -46,16 +54,16 @@ pub fn ca_server_port() -> u16 {
 /// `EPICS_CAS_SERVER_PORT` lands on 5064 — it does not fall through to
 /// `EPICS_CA_SERVER_PORT`.
 pub fn cas_server_port() -> u16 {
-    if env::config_param_ptr("EPICS_CAS_SERVER_PORT").is_some() {
-        env::env_inet_port("EPICS_CAS_SERVER_PORT", CA_SERVER_PORT)
+    if EPICS_CAS_SERVER_PORT.get().is_some() {
+        EPICS_CAS_SERVER_PORT.inet_port(CA_SERVER_PORT)
     } else {
-        env::env_inet_port("EPICS_CA_SERVER_PORT", CA_SERVER_PORT)
+        EPICS_CA_SERVER_PORT.inet_port(CA_SERVER_PORT)
     }
 }
 
 /// Returns the CA repeater port, allowing override via `EPICS_CA_REPEATER_PORT`.
 pub fn ca_repeater_port() -> u16 {
-    env::env_inet_port("EPICS_CA_REPEATER_PORT", CA_REPEATER_PORT)
+    EPICS_CA_REPEATER_PORT.inet_port(CA_REPEATER_PORT)
 }
 
 /// Server-side beacon port — C `caservertask.c:501-508`.
@@ -64,10 +72,10 @@ pub fn ca_repeater_port() -> u16 {
 /// when it is configured, else `EPICS_CA_REPEATER_PORT`, each resolved
 /// against the compiled [`CA_REPEATER_PORT`] default.
 pub fn cas_beacon_port() -> u16 {
-    if env::config_param_ptr("EPICS_CAS_BEACON_PORT").is_some() {
-        env::env_inet_port("EPICS_CAS_BEACON_PORT", CA_REPEATER_PORT)
+    if EPICS_CAS_BEACON_PORT.get().is_some() {
+        EPICS_CAS_BEACON_PORT.inet_port(CA_REPEATER_PORT)
     } else {
-        env::env_inet_port("EPICS_CA_REPEATER_PORT", CA_REPEATER_PORT)
+        EPICS_CA_REPEATER_PORT.inet_port(CA_REPEATER_PORT)
     }
 }
 
@@ -85,16 +93,16 @@ pub fn cas_beacon_port() -> u16 {
 /// OS only consults this field when the destination is in the
 /// 224.0.0.0/4 range.
 pub fn ca_mcast_ttl() -> u32 {
-    const DEFAULT: u32 = 1;
-    match env::get("EPICS_CA_MCAST_TTL") {
-        Some(s) => s
-            .trim()
-            .parse::<u32>()
-            .ok()
-            .filter(|v| *v >= 1 && *v <= 255)
-            .unwrap_or(DEFAULT),
-        None => DEFAULT,
-    }
+    // C `udpiiu.cpp:198-200` / `caservertask.c:324-326`:
+    //     long val;
+    //     if (envGetLongConfigParam(&EPICS_CA_MCAST_TTL, &val)) val = 1;
+    // — the `1` being a hand-copy of the table default, which here comes from
+    // the table.
+    let ttl = EPICS_CA_MCAST_TTL.long_or_default();
+    u32::try_from(ttl)
+        .ok()
+        .filter(|v| (1..=255).contains(v))
+        .unwrap_or(1)
 }
 
 // There is deliberately NO `pva_server_port()` / `pva_broadcast_port()` here.

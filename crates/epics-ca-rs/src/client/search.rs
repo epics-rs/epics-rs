@@ -148,8 +148,15 @@ fn cascade_smoothed_next(
 
 /// C default for `EPICS_CA_MAX_SEARCH_PERIOD`
 /// (`epics-base:modules/ca/src/client/udpiiu.h:87`,
-/// `maxSearchPeriodDefault = 5.0 * 60.0`).
-const MAX_SEARCH_PERIOD_DEFAULT_SECS: f64 = 300.0;
+/// `maxSearchPeriodDefault = 5.0 * 60.0`) — a hand-copy, in C, of the parameter's
+/// compiled default. Here it comes from the generated `ENV_PARAM` table, so the
+/// two cannot disagree.
+fn max_search_period_default_secs() -> f64 {
+    epics_base_rs::runtime::env_table::EPICS_CA_MAX_SEARCH_PERIOD
+        .default_str()
+        .parse()
+        .expect("EPICS_CA_MAX_SEARCH_PERIOD's compiled default is a number")
+}
 
 /// C lower bound for `EPICS_CA_MAX_SEARCH_PERIOD`
 /// (`epics-base:modules/ca/src/client/udpiiu.h:88`,
@@ -210,16 +217,18 @@ fn max_search_period_secs() -> f64 {
 
 /// The uncached resolution behind [`max_search_period_secs`].
 fn resolve_max_search_period_secs() -> f64 {
-    const NAME: &str = "EPICS_CA_MAX_SEARCH_PERIOD";
-    let v = match crate::estdlib::env_double(NAME) {
+    let param = epics_base_rs::runtime::env_table::EPICS_CA_MAX_SEARCH_PERIOD;
+    let name = param.name();
+    let default_secs = max_search_period_default_secs();
+    // Unset resolves to the compiled default string and parses, silently — so
+    // only a set-but-bad value reaches the error arm.
+    let v = match param.double() {
         Ok(v) => v,
-        // Unset: C reads the compiled "300.0" default string, silently.
-        Err(crate::estdlib::EnvDoubleError::Unset) => return MAX_SEARCH_PERIOD_DEFAULT_SECS,
         // C `getMaxPeriod` (`udpiiu.cpp:85-90`), verbatim.
-        Err(crate::estdlib::EnvDoubleError::Invalid(_)) => {
-            eprintln!("EPICS \"{NAME}\" wasn't a real number");
-            eprintln!("Setting \"{NAME}\" = {MAX_SEARCH_PERIOD_DEFAULT_SECS:.6} seconds");
-            return MAX_SEARCH_PERIOD_DEFAULT_SECS;
+        Err(_) => {
+            eprintln!("EPICS \"{name}\" wasn't a real number");
+            eprintln!("Setting \"{name}\" = {default_secs:.6} seconds");
+            return default_secs;
         }
     };
     // C `udpiiu.cpp:78-83`: below the 60 s lower limit, say so and clamp.
@@ -228,8 +237,8 @@ fn resolve_max_search_period_secs() -> f64 {
     // one deviation here, because a NaN tick would stop the client searching
     // altogether.
     if v.is_nan() || v < MAX_SEARCH_PERIOD_LOWER_LIMIT_SECS {
-        eprintln!("\"{NAME}\" out of range (low)");
-        eprintln!("Setting \"{NAME}\" = {MAX_SEARCH_PERIOD_LOWER_LIMIT_SECS:.6} seconds");
+        eprintln!("\"{name}\" out of range (low)");
+        eprintln!("Setting \"{name}\" = {MAX_SEARCH_PERIOD_LOWER_LIMIT_SECS:.6} seconds");
         return MAX_SEARCH_PERIOD_LOWER_LIMIT_SECS;
     }
     // C's upper bound is not on the period: `getNTimers` (`udpiiu.cpp:96-111`)
@@ -248,8 +257,8 @@ fn resolve_max_search_period_secs() -> f64 {
     // out-of-range period gets.
     if search_timer_count(v) > MAX_SEARCH_TIMER_COUNT {
         let capped = max_search_period_upper_limit_secs();
-        eprintln!("\"{NAME}\" out of range (high)");
-        eprintln!("Setting \"{NAME}\" = {capped:.6} seconds");
+        eprintln!("\"{name}\" out of range (high)");
+        eprintln!("Setting \"{name}\" = {capped:.6} seconds");
         return capped;
     }
     v
@@ -830,7 +839,7 @@ async fn run_nameserver_connection(
                                 // `from_bytes_extended` rejected them
                                 // ⇒ definitively malformed (e.g. the
                                 // declared payload exceeds
-                                // max_payload_size()). Close circuit
+                                // max_frame_body_bytes()). Close circuit
                                 // per C `tcpiiu.cpp:1197-1202`.
                                 bad_frame = true;
                                 break;

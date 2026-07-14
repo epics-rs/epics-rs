@@ -26,9 +26,9 @@ pub const CA_PROTO_READ_SYNC: u16 = 10; // legacy echo (used by older clients)
 pub const CA_PROTO_ERROR: u16 = 11;
 pub const CA_PROTO_CREATE_CH_FAIL: u16 = 26;
 
-// Ports
-pub const CA_SERVER_PORT: u16 = 5064;
-pub const CA_REPEATER_PORT: u16 = 5065;
+// Ports — re-exported from the one owner, `epics-base-rs`, which const-derives
+// them from the generated `ENV_PARAM` table (`configure/CONFIG_ENV`).
+pub use epics_base_rs::runtime::net::{CA_REPEATER_PORT, CA_SERVER_PORT};
 
 /// Resolved CA repeater UDP port. Mirrors libca
 /// `envGetInetPortConfigParam(&EPICS_CA_REPEATER_PORT, …)` (e.g.
@@ -220,39 +220,25 @@ pub const ECA_MESSAGE_TEXT: &[&str] = &[
     "Virtual circuit unresponsive",
 ];
 
-/// Maximum payload size for DoS prevention.
+/// The absolute ceiling on a single inbound CA message body, in bytes.
 ///
-/// **Default divergence from C**: this Rust port defaults to 16 MB
-/// when `EPICS_CA_MAX_ARRAY_BYTES` is unset. The C client/server
-/// (`epics-base/configure/CONFIG_ENV:36`) defaults to **16384 bytes
-/// (16 KB)** — `cac.cpp:197-214` reads the env and rounds it up to
-/// MAX_TCP = `1024 * 16u` (`caProto.h:67` "so waveforms fit").
+/// **Tier 2 deviation from C, and it is NOT `EPICS_CA_MAX_ARRAY_BYTES`.**
 ///
-/// Rationale for the Rust default: most modern deployments override
-/// this to multi-megabyte values anyway (large waveforms,
-/// area-detector frames), so the C default rejects in practice
-/// before the operator even knows the env exists. Rust ships with
-/// the operator-friendly default but honours the env override
-/// when present.
+/// C has no such ceiling. With `EPICS_CA_AUTO_ARRAY_BYTES=YES` — the compiled
+/// default — both peers grow their body cache to whatever the *sender* announced
+/// in the header: `tcpiiu::processIncoming` `realloc`s to `((m_postsize-1)|0xfff)+1`
+/// (`tcpiiu.cpp:1214-1225`) and `casExpandBuffer` does the same server-side
+/// (`caservertask.c:1339-1348`). A peer that announces 4 GiB gets a 4 GiB
+/// allocation attempt before a single body byte is read. This port refuses to
+/// reproduce that: an unauthenticated allocation sized by a remote header is a
+/// denial-of-service primitive, and "C does it" is not the contract.
 ///
-/// Strict-C-parity callers who want the 16 KB default can set
-/// `EPICS_CA_MAX_ARRAY_BYTES=16384` explicitly. The env-honour
-/// behaviour is unchanged.
-///
-/// **This is a SEND/serve-side bound only.** It plays no part in what a
-/// circuit will *receive*: libca's receive path is bounded by
-/// [`max_recv_body_bytes`], which is unbounded by default (C
-/// `EPICS_CA_AUTO_ARRAY_BYTES=YES`). Setting `EPICS_CA_MAX_ARRAY_BYTES` does
-/// not make a C *receiver* reject a large array, so it must not make ours
-/// either.
-pub fn max_payload_size() -> usize {
-    epics_base_rs::runtime::env::get("EPICS_CA_MAX_ARRAY_BYTES")
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(16 * 1024 * 1024)
-}
-
-/// Compile-time constant for tests that need a fixed value.
-pub const MAX_PAYLOAD_SIZE: usize = 16 * 1024 * 1024;
+/// The bound is a compile-time constant precisely so it stays independent of
+/// `EPICS_CA_MAX_ARRAY_BYTES`. That variable means exactly one thing — the
+/// operator's declared largest array, C's — and it is read in exactly one place
+/// ([`max_array_bytes_buffer`]); it previously ALSO stood in as this cap with a
+/// second, 1024x larger default, so one name carried two numbers.
+pub const MAX_FRAME_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 /// C `MAX_TCP` (`modules/ca/src/client/caProto.h:67`) — `1024 * 16u`,
 /// "so waveforms fit". The floor for `maxRecvBytesTCP` and the unit of
@@ -267,31 +253,27 @@ pub const COM_BUF_SIZE: usize = 0x4000;
 /// (`modules/ca/src/client/iocinf.h:62`).
 pub const CONTIGUOUS_FRAMES_TRIGGERING_FLOW_CONTROL: usize = 10;
 
-/// C `cac::maxRecvBytesTCP` (`modules/ca/src/client/cac.cpp:196-217`).
+/// The array buffer `EPICS_CA_MAX_ARRAY_BYTES` sizes — the ONE meaning that
+/// variable has, on both the client and the server side of C.
 ///
-/// Defaults to [`MAX_TCP`]. `EPICS_CA_MAX_ARRAY_BYTES` raises it, but only
-/// after C adds room for the extended header (`sizeof(caHdr) + 2 *
-/// sizeof(ca_uint32_t)` = 24) so the operator gets the array size they
-/// asked for — and only if the result still reaches `MAX_TCP`; a smaller
-/// value is rounded up (C errlogs "was rounded up to %u" and leaves the
-/// default in place).
-///
-/// Distinct from [`max_payload_size`], which is this port's DoS bound and
-/// carries a deliberately larger default (see its docs).
-pub fn max_recv_bytes_tcp() -> usize {
+/// C computes the identical value twice under two names, from the same
+/// parameter: `cac::maxRecvBytesTCP` (`cac.cpp:196-217`) and
+/// `rsrvSizeofLargeBufTCP` (`caservertask.c:510-531`). Room for the extended
+/// header (`sizeof(caHdr) + 2 * sizeof(ca_uint32_t)` = 24) is added so the
+/// operator gets the array size they asked for, and the result is floored at
+/// [`MAX_TCP`] (C errlogs "was rounded up to %u"). A rejected value leaves the
+/// compiled default — 16384 — standing, exactly as `envGetLongConfigParam`'s
+/// failure branch does.
+pub fn max_array_bytes_buffer() -> usize {
     /// `sizeof ( caHdr ) + 2 * sizeof ( ca_uint32_t )` (`cac.cpp:204`).
     const HEADER_SIZE: usize = 16 + EXTENDED_EXTRA;
-    let Some(max_bytes) = epics_base_rs::runtime::env::get("EPICS_CA_MAX_ARRAY_BYTES")
-        .and_then(|s| s.parse::<usize>().ok())
-    else {
+    let max_bytes = epics_base_rs::runtime::env_table::EPICS_CA_MAX_ARRAY_BYTES.long_or_default();
+    // `status || maxBytesAsALong < 0` (`caservertask.c:511`) — a negative value
+    // is a failed fetch, and C falls back to MAX_TCP.
+    let Ok(max_bytes) = usize::try_from(max_bytes) else {
         return MAX_TCP;
     };
-    let max_bytes = max_bytes.saturating_add(HEADER_SIZE);
-    if max_bytes < MAX_TCP {
-        MAX_TCP
-    } else {
-        max_bytes
-    }
+    max_bytes.saturating_add(HEADER_SIZE).max(MAX_TCP)
 }
 
 /// C `EPICS_CA_AUTO_ARRAY_BYTES` (`configure/CONFIG_ENV:37`, compiled default
@@ -300,9 +282,13 @@ pub fn max_recv_bytes_tcp() -> usize {
 /// C reads it with `envGetBoolConfigParam` (`envSubr.c:325-333`), which is
 /// literally `epicsStrCaseCmp(text, "yes") == 0` — so ONLY the word "yes"
 /// (any case) enables it. `EPICS_CA_AUTO_ARRAY_BYTES=1` disables it, quirk
-/// included. Unset resolves to the compiled default and is therefore `true`.
+/// included. `unwrap_or(true)` is C's own `if (envGetBoolConfigParam(...))
+/// autoMaxBytes = 1;` (`caservertask.c:534-535`), not a second copy of the
+/// table default.
 pub fn auto_array_bytes() -> bool {
-    epics_base_rs::runtime::env::get_bool("EPICS_CA_AUTO_ARRAY_BYTES", true)
+    epics_base_rs::runtime::env_table::EPICS_CA_AUTO_ARRAY_BYTES
+        .bool()
+        .unwrap_or(true)
 }
 
 /// The receive-side body limit of a CA circuit — `None` means "no limit",
@@ -314,7 +300,7 @@ pub fn auto_array_bytes() -> bool {
 /// (`tcpiiu.cpp:1214-1225`) and `malloc`/`realloc`s the body cache to
 /// `((m_postsize-1)|0xfff)+1` — whatever the server announced, no cap.
 ///
-/// With it off, the cache is capped at [`max_recv_bytes_tcp`] and an
+/// With it off, the cache is capped at [`max_array_bytes_buffer`] and an
 /// over-cap response is *ignored*, not fatal: C logs once and drains the
 /// body with `recvQue.removeBytes` (`tcpiiu.cpp:1269-1283`), keeping the
 /// circuit. A CA circuit is NEVER closed for an oversized payload.
@@ -322,8 +308,18 @@ pub fn max_recv_body_bytes() -> Option<usize> {
     if auto_array_bytes() {
         None
     } else {
-        Some(max_recv_bytes_tcp())
+        Some(max_array_bytes_buffer())
     }
+}
+
+/// The largest body this process will ALLOCATE for, whatever a peer announces.
+///
+/// With `EPICS_CA_AUTO_ARRAY_BYTES` off this is C's declared array bound. With
+/// it on — C's default, where C is unbounded — it is [`MAX_FRAME_BODY_BYTES`],
+/// the Tier 2 refusal to size an allocation from a remote header. Either way
+/// it is one number with one meaning; see [`MAX_FRAME_BODY_BYTES`].
+pub fn max_frame_body_bytes() -> usize {
+    max_recv_body_bytes().unwrap_or(MAX_FRAME_BODY_BYTES)
 }
 
 /// C `cac::maxContiguousFrames` (`modules/ca/src/client/cac.cpp:233-237`,
@@ -336,7 +332,7 @@ pub fn max_recv_body_bytes() -> Option<usize> {
 /// large waveforms tolerates proportionally more contiguous frames before
 /// tripping.
 pub fn max_contiguous_frames() -> usize {
-    let bufs_per_array = max_recv_bytes_tcp() / COM_BUF_SIZE;
+    let bufs_per_array = max_array_bytes_buffer() / COM_BUF_SIZE;
     if bufs_per_array > 1 {
         bufs_per_array * CONTIGUOUS_FRAMES_TRIGGERING_FLOW_CONTROL
     } else {
@@ -1195,8 +1191,71 @@ mod tests {
         }
     }
 
+    /// `EPICS_CA_MAX_ARRAY_BYTES` means ONE thing: the operator's declared
+    /// largest array, C's meaning, with C's default of 16384. It is NOT the
+    /// allocation ceiling, and it never carries a second, 1024x larger default.
+    ///
+    /// The boundaries, one case each:
+    ///   * AUTO on  (C's default)  ⇒ ceiling is the compile-time constant, and
+    ///     `EPICS_CA_MAX_ARRAY_BYTES` does not move it. (C is unbounded here;
+    ///     the constant is the Tier 2 refusal to size an allocation from a
+    ///     remote header — see `MAX_FRAME_BODY_BYTES`.)
+    ///   * AUTO off                ⇒ ceiling IS the declared array buffer.
+    ///   * unset, either way       ⇒ the table default, 16384, floored at
+    ///     MAX_TCP — never 16 MiB.
+    #[test]
+    #[serial_test::serial]
+    fn max_array_bytes_has_exactly_one_meaning() {
+        let saved_auto = std::env::var("EPICS_CA_AUTO_ARRAY_BYTES").ok();
+        let saved_max = std::env::var("EPICS_CA_MAX_ARRAY_BYTES").ok();
+        // SAFETY: serial_test::serial; both vars are restored below.
+        unsafe {
+            std::env::remove_var("EPICS_CA_AUTO_ARRAY_BYTES");
+            std::env::remove_var("EPICS_CA_MAX_ARRAY_BYTES");
+        }
+
+        // Unset: the table's 16384, + the 24-byte extended header (`cac.cpp:204`
+        // "allow room for the protocol header so that they get the array size
+        // they requested"). C's number, not 16 MiB.
+        assert_eq!(max_array_bytes_buffer(), 16384 + 24);
+
+        // AUTO on (default) — the declared array size does not move the ceiling.
+        assert_eq!(max_frame_body_bytes(), MAX_FRAME_BODY_BYTES);
+        unsafe { std::env::set_var("EPICS_CA_MAX_ARRAY_BYTES", "65536") };
+        assert_eq!(
+            max_frame_body_bytes(),
+            MAX_FRAME_BODY_BYTES,
+            "under AUTO=YES C bounds nothing with this variable, so neither do we"
+        );
+        assert_eq!(
+            max_array_bytes_buffer(),
+            65536 + 24,
+            "the declared array buffer still tracks the variable"
+        );
+
+        // AUTO off — now the ceiling IS the declared array buffer.
+        unsafe { std::env::set_var("EPICS_CA_AUTO_ARRAY_BYTES", "NO") };
+        assert_eq!(max_frame_body_bytes(), 65536 + 24);
+
+        // A negative value is a failed fetch (`caservertask.c:511`).
+        unsafe { std::env::set_var("EPICS_CA_MAX_ARRAY_BYTES", "-1") };
+        assert_eq!(max_array_bytes_buffer(), MAX_TCP);
+
+        // SAFETY: see above. Restore for subsequent serial tests.
+        unsafe {
+            match saved_auto {
+                Some(v) => std::env::set_var("EPICS_CA_AUTO_ARRAY_BYTES", v),
+                None => std::env::remove_var("EPICS_CA_AUTO_ARRAY_BYTES"),
+            }
+            match saved_max {
+                Some(v) => std::env::set_var("EPICS_CA_MAX_ARRAY_BYTES", v),
+                None => std::env::remove_var("EPICS_CA_MAX_ARRAY_BYTES"),
+            }
+        }
+    }
+
     /// The header codec carries no size policy: an extended header announcing
-    /// a body far past `max_payload_size()` is syntactically valid and must
+    /// a body far past `max_frame_body_bytes()` is syntactically valid and must
     /// parse. Rejecting it here is what closed the circuit on a 33 MB
     /// waveform; C's `tcpiiu` accepts the header and allocates the body.
     #[test]
@@ -1204,7 +1263,7 @@ mod tests {
         let mut hdr = CaHeader::new(CA_PROTO_READ_NOTIFY);
         hdr.postsize = 0xFFFF;
         let mut bytes = hdr.to_bytes().to_vec();
-        let huge = (max_payload_size() * 3) as u32;
+        let huge = (max_frame_body_bytes() * 3) as u32;
         bytes.extend_from_slice(&huge.to_be_bytes());
         bytes.extend_from_slice(&1u32.to_be_bytes());
 
@@ -1296,20 +1355,20 @@ mod tests {
         assert_eq!(hdr.actual_count(), 0xFFFF);
     }
 
-    /// A payload past `MAX_PAYLOAD_SIZE` is NOT a parse error: the codec has
+    /// A payload past `MAX_FRAME_BODY_BYTES` is NOT a parse error: the codec has
     /// no size policy (R6-21). The receive loop that owns the buffer applies
     /// the bound — the client via [`max_recv_body_bytes`] (unbounded by C's
     /// default), the server via its own `maxstk` check + ECA_TOLARGE reply.
     #[test]
-    fn test_extended_payload_past_max_payload_size_parses() {
+    fn test_extended_payload_past_max_frame_body_bytes_parses() {
         let mut buf = vec![0u8; 24];
         // Set postsize=0xFFFF, count=0
         buf[2] = 0xFF;
         buf[3] = 0xFF;
         buf[6] = 0;
         buf[7] = 0;
-        // Set extended_postsize to > MAX_PAYLOAD_SIZE
-        let big: u32 = (MAX_PAYLOAD_SIZE + 1) as u32;
+        // Set extended_postsize to > MAX_FRAME_BODY_BYTES
+        let big: u32 = (MAX_FRAME_BODY_BYTES + 1) as u32;
         buf[16..20].copy_from_slice(&big.to_be_bytes());
         buf[20..24].copy_from_slice(&1u32.to_be_bytes());
 

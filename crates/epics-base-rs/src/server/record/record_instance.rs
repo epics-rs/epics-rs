@@ -1188,6 +1188,37 @@ impl RecordInstance {
         slots
     }
 
+    /// C `dbPutFieldLink`'s link-type gate (`dbAccess.c:1125-1137`): a link
+    /// written at RUNTIME is held to the same `dbCanSetLink` rule as one written
+    /// by the `.db`, against the device support the record's CURRENT `DTYP`
+    /// binds. Same rule, same owner — [`super::check_link_assignment`]; only the
+    /// DTYP it is asked about differs (the record's, not the `.db` text's).
+    ///
+    /// [`MenuBound::DbLoad`] is exempt, and that is not a hole: on the db-load
+    /// path C does not check a link as each field is parsed either. It checks
+    /// once, at `iocInit`, over the record as loaded (`dbStaticLib.c:2178-2231`)
+    /// — which is why `field(INP,…)` may precede `field(DTYP,…)` in a `.db` and
+    /// still bind. `db_loader::check_link_types` is that pass, and it reads the
+    /// record's DTYP out of the whole field set, so it does not depend on the
+    /// order the `.db` happened to spell them in. Gating here as well would
+    /// re-introduce exactly that order dependence.
+    fn check_link_assignment(
+        &self,
+        upper_field: &str,
+        text: &str,
+        bound: MenuBound,
+    ) -> CaResult<()> {
+        if matches!(bound, MenuBound::DbLoad) {
+            return Ok(());
+        }
+        super::check_link_assignment(
+            self.record.record_type(),
+            Some(self.common.dtyp.as_str()),
+            upper_field,
+            text,
+        )
+    }
+
     /// The value of the `DTYP` field: the index of the bound device support in
     /// [`Self::device_choices`]. An unset DTYP is index 0, exactly as in C.
     pub(crate) fn dtyp_index(&self) -> u16 {
@@ -2591,6 +2622,7 @@ impl RecordInstance {
                     return Err(CaError::FieldNotFound("INP".to_string()));
                 }
                 if let EpicsValue::String(s) = value {
+                    self.check_link_assignment("INP", &s.as_str_lossy(), bound)?;
                     self.common.inp = s.as_str_lossy().into_owned();
                     if !self.record_declares_field("INP") {
                         self.parsed_inp = parse_link_v2(&self.common.inp);
@@ -2600,6 +2632,7 @@ impl RecordInstance {
             "OUT" => {
                 if let EpicsValue::String(s) = value {
                     let s = s.as_str_lossy();
+                    self.check_link_assignment("OUT", &s, bound)?;
                     // C `dbParseLink` (dbStaticLib.c:2382-2386) discards a
                     // CP/CPP modifier on a DBF_OUTLINK and warns once, naming
                     // the holder record, its field and the target. The discard

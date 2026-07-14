@@ -17,11 +17,11 @@ pub use alarm::{AlarmSeverity, AnalogAlarmConfig};
 pub use common_fields::CommonFields;
 pub use constant_link::{rec_gbl_init_constant_link, reseed_constant_input_link};
 pub use link::{
-    CaLink, CalcLink, DbLink, HwLink, HwLinkKind, JlinkValue, LinkAddress, LinkFieldType,
-    LinkProcessPolicy, LinkType, LsLoad, MonitorSwitch, PVAJSON_IDENTITY_SEP, ParsedLink,
-    PvaJsonLink, link_field_type, load_link_ls, out_link_discards_cp, parse_c_double,
-    parse_forward_link_v2, parse_link, parse_link_field, parse_link_v2, parse_output_link_v2,
-    pvajson_identity_key,
+    CaLink, CalcLink, DbLink, DbLinkType, HwLink, HwLinkKind, JlinkValue, LinkAddress,
+    LinkFieldType, LinkProcessPolicy, LinkType, LsLoad, MonitorSwitch, PVAJSON_IDENTITY_SEP,
+    ParsedLink, PvaJsonLink, check_link_assignment, declared_link_type, link_field_type,
+    load_link_ls, out_link_discards_cp, parse_c_double, parse_forward_link_v2, parse_link,
+    parse_link_field, parse_link_v2, parse_output_link_v2, pvajson_identity_key,
 };
 pub use menu_choices::{
     Ftype, MENU_ALARM_SEVR, MENU_ALARM_STAT, MENU_CONVERT, MENU_FTYPE, MENU_IVOA, MENU_OMSL,

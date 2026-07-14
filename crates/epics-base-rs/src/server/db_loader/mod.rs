@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 use crate::error::{CaError, CaResult};
-use crate::server::record::Record;
+use crate::server::record::{Record, check_link_assignment};
 use crate::types::{EpicsValue, PvString};
 
 mod include;
@@ -1450,11 +1450,44 @@ fn is_common_link_field(upper_name: &str) -> bool {
     matches!(upper_name, "INP" | "OUT")
 }
 
+/// C's db-load link-type gate (`dbStaticLib.c:2222`): every link field the
+/// `.db` explicitly assigns must carry a type the record's bound device support
+/// takes. The rule itself lives in [`check_link_assignment`] — this is only the
+/// half that says WHICH links a `.db` load offers to it.
+///
+/// A field the `.db` never mentions is NOT checked; C skips it too
+/// (`if (!plink->text) continue;`, `dbStaticLib.c:2213`), which is why this
+/// walks the `.db`'s own field list rather than the record's declaration.
+///
+/// DEVIATION from C (Tier 2): C prints the error, leaves the link uninitialized
+/// and runs the IOC anyway, so the record sits there with a dead link that will
+/// never read or write anything. The port refuses the load. The dead link is
+/// precisely the illegal state, and a `.db` C has already declared invalid is
+/// not worth constructing it for.
+fn check_link_types(record_type: &str, fields: &[(String, PvString)]) -> CaResult<()> {
+    let dtyp = fields
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case("DTYP"))
+        .map(|(_, v)| v.as_str_lossy().trim().to_string());
+
+    for (name, value) in fields {
+        check_link_assignment(
+            record_type,
+            dtyp.as_deref(),
+            &name.to_uppercase(),
+            &value.as_str_lossy(),
+        )?;
+    }
+    Ok(())
+}
+
 pub fn apply_fields(
     record: &mut Box<dyn Record>,
     fields: &[(String, PvString)],
     common_fields: &mut Vec<(String, EpicsValue)>,
 ) -> CaResult<()> {
+    check_link_types(record.record_type(), fields)?;
+
     for (name, value) in fields {
         let upper_name = name.to_uppercase();
         // Menu labels, numbers and link text are ASCII by construction; only a

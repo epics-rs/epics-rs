@@ -6268,3 +6268,82 @@ load flake, not a regression, and it is on the open list below.
   numeric DBF types yield 0 where C errors; `scanf.rs` `v as i32/u32` narrowing.
 - R19-43 was not measured live against a C IOC (read from `iocsource.cpp`
   and proven by a boundary test that fails pre-fix).
+
+## Fix wave 20 dispositions — the declared type reaches the wire
+
+The biggest open item from wave 19 is closed. The `.dbd` codegen had made the
+field *tables* correct, but the CA native type a client saw was still derived
+from the **stored value's variant**, not from the field's declared
+`FieldDesc.dbf_type`. Tables right, storage wrong — and that, not the tables,
+is why the oracle's `native_type` defects survived the codegen landing.
+
+**Oracle scoreboard** (`--phase read`, 2551 CA-observable fields, 34 record
+types), BEFORE `8c5ff2b9` → AFTER `fc1b6ebe`:
+
+| | BEFORE | AFTER |
+|---|---|---|
+| `native_type` defects | **215** | **0** |
+| agreed | 2186 | 2207 |
+| total defects (all surfaces) | 276 | 179 |
+
+Of the 215: 92 now agree outright; 119 have the correct native type but still
+differ on `value_string` / `value_numeric` / `access_rights` (pre-existing
+defects on other surfaces); 4 (`ai.DTYP/INIT/LCNT/ROFF`) were not re-measured
+because the C `softIoc` boot timed out under load — re-measured by hand with
+`cainfo`, and **not** counted as oracle-verified.
+
+Three findings, three commits:
+
+- **`064edb8e`** — the declared type is what goes on the wire.
+  `RecordInstance::project_to_declared_type` projects a stored value onto its
+  declared type through `EpicsValue::convert_to` (the single value-coercion
+  owner — **no second conversion table**), and create-channel, GET, MONITOR and
+  the PVA descriptor all run it. `field_desc` consults the generated `.dbd`
+  table *first*: a record's own `field_list()` cannot be the type source,
+  because `#[derive(EpicsRecord)]` builds it from the Rust struct member (which
+  is why `longin.ADEL` was a DOUBLE). `promote_menu_value` is deleted;
+  `FieldDesc::runtime_typed` carries the `cvt_dbaddr` selector bit, exempting
+  the 46 selector-typed fields.
+- **`6677c424`** — a stateless mbbo serves VAL as `DBF_USHORT` (`DBF_LONG` on
+  the wire), measured on the C IOC. Underneath it, `sdef` was a *stored* bool
+  refreshed by a hook, so a direct state write left it stale — and a stale
+  `sdef` picks the wrong **wire type**. It is now derived: the stale state is
+  unrepresentable.
+- **`fc1b6ebe`** — `subArrayRecord.dbd` was never vendored, so subArray had no
+  declaration and its hand table reached the wire (FTVL served `DBF_SHORT`, not
+  `DBF_ENUM`). Record types with no vendored `.dbd`: was 1, now **0**.
+
+**The declaration governs the wire; the storage variant governs the put.** Every
+remaining `db_field_type()` call site is inbound/storage-side (`field_io.rs`,
+`put_coerced`, `db_loader`, `links.rs`, `waveform.rs`) and must NOT follow the
+declaration — coercing an incoming `Short` up to `Enum` because the `.dbd` says
+`DBF_MENU` would make a menu field's `Short` put arm unreachable.
+
+**Seven tests were pinning the defect** and were corrected against the C IOC —
+including two whose own comments said "no state table" and then asserted an
+`Enum` read-back, and the `mbbo.VAL` row of `fixtures/c_native_types.tsv`, the
+one row not taken from the bulk sweep.
+
+Two prior-wave rulings, for the record: the superseded R19-3 commit `3b9fe4ba`
+is **not** reverted (it is fixed forward, merged and gated; a revert-then-fix
+history adds noise without changing the tree), and the NSMOOTH fixed-point bound
+stays where it landed rather than being split out of already-merged history.
+
+### Carried UNFIXED after wave 20
+
+- **179 oracle defects on other surfaces** — 116 `value_string`, 41
+  `value_numeric`, 104 `access_rights` (a case can carry more than one). This is
+  now the largest open block, and the next wave's target.
+- **30 self-contradictory menu declarations** in the epics-base-rs hand tables
+  still say `Short` while the record answers with choices. Inert (the generated
+  table shadows them, and `served_native_type_is_declared` pins every one
+  against the C IOC) but not correct. Four of those record types get their table
+  from `#[derive(EpicsRecord)]`, which types each field from its Rust struct
+  member — there is no per-field type to fix without a macro attribute.
+- **The type-level close is not built**: a `FieldDesc` constructor that sets
+  type and choices together, making "has menu choices but is typed `Short`"
+  unrepresentable. Today a test catches it, not the type system.
+- **waveform `FTVL=STRING` is unsupported** — `reallocate_val` has no
+  `StringArray` branch (`waveform.rs:181`).
+- **`mbbo.SDEF` / `mbbi.SDEF` are not served at all** — declared in the `.dbd`,
+  `get_field` returns `None`. A value/access defect, not a native-type one.

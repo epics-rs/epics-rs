@@ -258,3 +258,47 @@ fn rustfmt(src: &str) -> Result<String, String> {
     }
     String::from_utf8(out.stdout).map_err(|e| format!("rustfmt: non-utf8 output: {e}"))
 }
+
+#[cfg(test)]
+mod tests {
+    /// The drift gate.
+    ///
+    /// `dbd_generated.rs` is checked in, so nothing at build time forces it to
+    /// agree with the vendored `.dbd` files it claims to be derived from. The
+    /// file used to say `--check` "is what CI runs" — CI ran no such step, and
+    /// this crate had no test for nextest to pick up, so the single generator
+    /// the port has could go stale in silence and the header would keep
+    /// asserting it hadn't.
+    ///
+    /// It is a `#[test]` rather than a CI-yaml step so `cargo nextest run`
+    /// catches drift on the developer's machine, before the push, and so the
+    /// gate cannot be skipped by editing a workflow file.
+    #[test]
+    fn generated_file_is_not_stale() {
+        let root = super::repo_root().expect("workspace root");
+        let want = super::generate(&root.join(super::DBD_DIR)).expect("generator run");
+        let have = std::fs::read_to_string(root.join(super::OUT_FILE)).unwrap_or_default();
+        if have == want {
+            return;
+        }
+        let first = have
+            .lines()
+            .zip(want.lines())
+            .enumerate()
+            .find(|(_, (a, b))| a != b)
+            .map(|(n, (a, b))| format!("line {}:\n  have: {a}\n  want: {b}", n + 1))
+            .unwrap_or_else(|| {
+                format!(
+                    "length differs: {} vs {} lines",
+                    have.lines().count(),
+                    want.lines().count()
+                )
+            });
+        panic!(
+            "{} is STALE — it no longer matches the vendored .dbd files.\n\
+             Re-run `cargo run -p dbd-codegen -- --write` and commit the result.\n\
+             First difference at {first}",
+            super::OUT_FILE
+        );
+    }
+}

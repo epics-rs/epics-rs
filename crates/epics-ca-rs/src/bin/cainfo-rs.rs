@@ -22,12 +22,6 @@ const TERMINALS: &[(&str, copt::Terminal)] = &[
     ("dead_n", copt::Terminal::Usage(1)),
 ];
 
-const VERSION_INFO: &str = concat!(
-    "\nEPICS Version epics-rs ",
-    env!("CARGO_PKG_VERSION"),
-    ", CA Protocol version 4.13"
-);
-
 #[derive(Parser)]
 #[command(
     name = "cainfo-rs",
@@ -119,7 +113,7 @@ async fn main() {
     let priority = scan.priority("priority");
     // End of C's getopt loop: warnings out in command-line order, then `-h` /
     // `-V` if the loop reached one (R13-26).
-    scan.finish(&cmd, VERSION_INFO, TERMINALS);
+    scan.finish(&cmd, &epics_ca_rs::protocol::version_info(), TERMINALS);
 
     // C `cainfo.c:202-205`: a missing PV list is an error unless a
     // non-zero `-s` level was selected. `--diag` (Rust-only) is an

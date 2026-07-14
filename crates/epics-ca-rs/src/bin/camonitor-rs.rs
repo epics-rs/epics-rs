@@ -23,12 +23,6 @@ const TERMINALS: &[(&str, copt::Terminal)] = &[
     ("version", copt::Terminal::Version),
 ];
 
-const VERSION_INFO: &str = concat!(
-    "\nEPICS Version epics-rs ",
-    env!("CARGO_PKG_VERSION"),
-    ", CA Protocol version 4.13"
-);
-
 /// Mirror of C `camonitor` flags. The flag set is mostly the same as
 /// `caget` minus `-t`/`-a`/`-d` and plus `-m`/`-t<key>`. We model the
 /// CLI to match — including the parity-only flags so existing scripts
@@ -248,7 +242,7 @@ async fn main() {
     let spec = parse_timestamp_spec(&mut scan, "timestamp_key");
     // End of C's getopt loop: warnings out in command-line order, then `-h` /
     // `-V` if the loop reached one (R13-26).
-    scan.finish(&cmd, VERSION_INFO, TERMINALS);
+    scan.finish(&cmd, &epics_ca_rs::protocol::version_info(), TERMINALS);
 
     if args.pv_names.is_empty() {
         TOOL.no_pv_name();

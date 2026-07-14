@@ -11,19 +11,17 @@ use tokio::sync::broadcast;
 /// Maximum accumulated TCP read buffer per client (DoS guard).
 ///
 /// This MUST be >= the largest legal single frame, otherwise a valid
-/// large waveform (e.g. a 2 MB array, well under the 16 MB
-/// `max_payload_size()` default) would push `accumulated` past the cap
-/// and the connection would be closed before the frame could be
-/// dispatched — a permanent failure that survives reconnect.
+/// large waveform would push `accumulated` past the cap and the connection
+/// would be closed before the frame could be dispatched — a permanent failure
+/// that survives reconnect.
 ///
-/// Largest legal frame = extended header (24 bytes) + `max_payload_size()`
-/// payload. We add a 64 KiB slack so a partially-received *next* frame
-/// pipelined behind a full one in the same read burst does not trip the
-/// guard before the first frame is drained. `max_payload_size()` honours
-/// `EPICS_CA_MAX_ARRAY_BYTES`, so the cap tracks any operator override.
-/// Mirrors the client-side cap in `client/transport.rs`.
+/// Largest legal frame = extended header (24 bytes) +
+/// `max_frame_body_bytes()` payload. We add a 64 KiB slack so a partially-
+/// received *next* frame pipelined behind a full one in the same read burst does
+/// not trip the guard before the first frame is drained. Mirrors the
+/// client-side cap in `client/transport.rs`.
 fn max_accumulated() -> usize {
-    crate::protocol::max_payload_size()
+    crate::protocol::max_frame_body_bytes()
         .saturating_add(24)
         .saturating_add(64 * 1024)
 }
@@ -1705,15 +1703,15 @@ where
                 // the oversize body, and **keeps serving** — `status =
                 // RSRV_OK`. Rust `CaHeader::from_bytes_extended` returns
                 // CaError::Protocol("payload too large") when the extended
-                // postsize exceeds `max_payload_size()` (default 16 MiB), so
-                // pre-check it here, reply, and refuse just this message.
-                // Closing the circuit instead (as this did pre-R7-18) let a
-                // single oversize array caput destroy every channel and
-                // subscription the client held; C loses none of them.
+                // postsize exceeds `max_frame_body_bytes()`, so pre-check it
+                // here, reply, and refuse just this message. Closing the circuit
+                // instead (as this did pre-R7-18) let a single oversize array
+                // caput destroy every channel and subscription the client held;
+                // C loses none of them.
                 //
-                // Normal-form headers can't overflow `max_payload_size()`
-                // because their postsize is u16 (max 0xfffe < 16 MiB),
-                // so the check only triggers on extended frames.
+                // Normal-form headers can't overflow the bound because their
+                // postsize is u16 (max 0xfffe), so the check only triggers on
+                // extended frames.
                 let buf = &accumulated[offset..];
                 // Every extended-form step below — the ECA_TOLARGE
                 // pre-check, the partial-annex wait, and the annex parse
@@ -1729,7 +1727,7 @@ where
                 if peer_v49 && buf.len() >= 24 && buf[2] == 0xFF && buf[3] == 0xFF {
                     let ext_post =
                         u32::from_be_bytes([buf[16], buf[17], buf[18], buf[19]]) as usize;
-                    let max_payload = crate::protocol::max_payload_size();
+                    let max_payload = crate::protocol::max_frame_body_bytes();
                     if ext_post > max_payload {
                         // Build a stand-in header for the error reply
                         // (cmmd echoed from the malformed frame; cid
@@ -6996,15 +6994,37 @@ mod oversize_request_tests {
     /// its body is drained, and the circuit keeps serving — the ECHO that
     /// follows the oversize body is answered.
     ///
-    /// `EPICS_CA_MAX_ARRAY_BYTES` is lowered so the oversize body is a few
-    /// KiB rather than 16 MiB. nextest runs each test in its own process,
-    /// so the env mutation is contained.
+    /// The bound is only a *bound* when `EPICS_CA_AUTO_ARRAY_BYTES` is off:
+    /// that is the sole configuration in which C's server allocates a fixed
+    /// `rsrvSizeofLargeBufTCP` buffer and answers ECA_TOLARGE past it
+    /// (`caservertask.c:534-538`, `camessage.c:2471-2489`). With it ON — the
+    /// compiled default — C grows the buffer to whatever the peer announced and
+    /// refuses nothing, so an oversize request is not a thing that exists.
+    ///
+    /// This test used to set `EPICS_CA_MAX_ARRAY_BYTES` **alone** and expect a
+    /// refusal, which pinned the defect it was written under: that variable was
+    /// also standing in as the port's DoS cap, so it bounded a path C does not
+    /// bound with it. It sets both parameters now, and takes the ceiling from
+    /// [`crate::protocol::max_frame_body_bytes`] rather than assuming the raw
+    /// env value is the ceiling — C floors it at `MAX_TCP` and adds the 24-byte
+    /// extended header, so a 4 KiB request really yields a 16 KiB buffer.
+    ///
+    /// nextest runs each test in its own process, so the env mutation is
+    /// contained.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn oversize_request_draws_eca_tolarge_and_keeps_the_circuit() {
-        const MAX_BYTES: usize = 4096;
         // SAFETY: nextest gives each test its own process; no other thread
         // in it reads the environment concurrently at this point.
-        unsafe { std::env::set_var("EPICS_CA_MAX_ARRAY_BYTES", MAX_BYTES.to_string()) };
+        unsafe {
+            std::env::set_var("EPICS_CA_AUTO_ARRAY_BYTES", "NO");
+            std::env::set_var("EPICS_CA_MAX_ARRAY_BYTES", "4096");
+        }
+        let ceiling = crate::protocol::max_frame_body_bytes();
+        assert_eq!(
+            ceiling,
+            crate::protocol::MAX_TCP,
+            "C rounds a sub-MAX_TCP EPICS_CA_MAX_ARRAY_BYTES up to MAX_TCP"
+        );
 
         let db = Arc::new(PvDatabase::new());
         let acf = Arc::new(tokio::sync::RwLock::new(None));
@@ -7041,7 +7061,7 @@ mod oversize_request_tests {
         client.write_all(&ver.to_bytes()).await.unwrap();
 
         // Extended-form WRITE with a body one element past the ceiling.
-        let ext_post: u32 = (MAX_BYTES + 8) as u32;
+        let ext_post: u32 = (ceiling + 8) as u32;
         let mut hdr = CaHeader::new(CA_PROTO_WRITE);
         hdr.postsize = 0xFFFF;
         let mut frame = hdr.to_bytes().to_vec();

@@ -191,16 +191,17 @@ fn cmd_epics_env_show() -> CommandDef {
     )
 }
 
-/// Print the EPICS environment parameters — the `EPICS_*` variables.
-/// Shared by `epicsPrtEnvParams` and `epicsParamShow` (C registers
-/// both names for the same report).
+/// C `epicsPrtEnvParams` (`envSubr.c:383-392`): walk `env_param_list[]` and
+/// print each parameter's *effective* value — the environment string, else the
+/// compiled default, else "is undefined". Shared by `epicsPrtEnvParams` and
+/// `epicsParamShow` (C registers both names for the same report).
+///
+/// This is NOT a filtered dump of the process environment. On a clean shell C
+/// prints all 34 parameters with their compiled defaults; a `std::env::vars()`
+/// scan prints nothing, and can never reach the `IOCSH_*` trio at all.
 fn print_epics_params(ctx: &CommandContext) {
-    let mut vars: Vec<(String, String)> = std::env::vars()
-        .filter(|(k, _)| k.starts_with("EPICS_"))
-        .collect();
-    vars.sort();
-    for (k, v) in vars {
-        ctx.println(&format!("{k}={v}"));
+    for line in crate::runtime::env::prt_env_params() {
+        ctx.println(&line);
     }
 }
 

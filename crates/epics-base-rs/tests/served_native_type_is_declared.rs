@@ -237,6 +237,47 @@ fn a_selector_typed_field_keeps_its_runtime_type() {
     );
 }
 
+/// A record type with NO vendored `.dbd` has no declaration at all, and then
+/// its hand-written `field_list()` is what reaches the wire — declaration by
+/// accident. `subArray` was that record type: its hand table typed `FTVL`
+/// `Short`, so C's `DBF_ENUM` (`field(FTVL,DBF_MENU) menu(menuFtype)`) went out
+/// as a bare `DBF_SHORT` and a client got an index with no `menuFtype` labels.
+///
+/// Asserted on the resolved value, not on the table, because a field the record
+/// does not resolve is SKIPPED by the sweep above — a missing `.dbd` would
+/// otherwise look like coverage.
+#[test]
+fn sub_array_is_declared_by_the_dbd_not_by_its_hand_table() {
+    let mut inst = instance("subArray").expect("subArray is registered");
+
+    let ftvl = inst
+        .client_field_value("FTVL")
+        .expect("subArray.FTVL resolves");
+    assert_eq!(
+        ftvl.dbr_type(),
+        DbFieldType::Enum,
+        "subArray.FTVL is menu(menuFtype) — C serves DBF_ENUM, got {ftvl:?}"
+    );
+
+    // VAL is the same `cvt_dbaddr` selector shape as waveform's: the element
+    // type IS FTVL (subArrayRecord.c:229-238), so the .dbd's DBF_NOACCESS
+    // placeholder must not be projected onto it.
+    inst.record
+        .put_field("FTVL", EpicsValue::Short(5))
+        .expect("FTVL is writable");
+    inst.record
+        .put_field("VAL", EpicsValue::LongArray(vec![1, 2, 3]))
+        .expect("VAL takes a long array under FTVL=LONG");
+    let val = inst
+        .client_field_value("VAL")
+        .expect("subArray.VAL resolves");
+    assert_eq!(
+        val.dbr_type(),
+        DbFieldType::Long,
+        "FTVL=LONG re-types subArray.VAL to DBF_LONG, got {val:?}"
+    );
+}
+
 /// The `SDEF` selector, both halves. `mbbo.VAL` is the one field whose runtime
 /// type is chosen by whether the record has any state table at all
 /// (`mbboRecord.c:300-312`: `if (!prec->sdef) paddr->field_type = DBF_USHORT`),

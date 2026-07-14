@@ -175,7 +175,7 @@ impl Default for CommonFields {
             scan: ScanType::Passive,
             // C dbd `field(SSCN,DBF_MENU){ menu(menuScan) initial("65535") }`:
             // the default is the out-of-range "use SCAN" sentinel, not Passive.
-            sscn: SimModeScan::DoNotUse,
+            sscn: SimModeScan::default(),
             // C dbd `field(OLDSIMM,DBF_MENU){ menu(menuSimm) }` — no
             // `initial()`, so it starts at index 0 (`menuSimmNO`).
             oldsimm: 0,

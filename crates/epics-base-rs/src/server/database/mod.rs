@@ -21,7 +21,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use crate::server::pv::ProcessVariable;
-use crate::server::record::{Record, RecordInstance, ScanType};
+use crate::server::record::{Record, RecordInstance, ScanList};
 use crate::types::EpicsValue;
 
 /// What a `.db` definition carries into the creation sink alongside the record
@@ -239,7 +239,9 @@ struct PvDatabaseInner {
     /// `load_order` sequence (NOT the record name), so two records
     /// sharing a PHAS scan in the order they were loaded, matching a
     /// C IOC built from the same `.db` file.
-    scan_index: RwLock<HashMap<ScanType, BTreeSet<(i16, u64, String)>>>,
+    /// Keyed by [`ScanList`], not `ScanType`: a `Passive` or illegal SCAN names
+    /// no list (C `scanAdd`, dbScan.c:241-251) and so cannot be a key at all.
+    scan_index: RwLock<HashMap<ScanList, BTreeSet<(i16, u64, String)>>>,
     /// Per-record load-order sequence number, assigned monotonically
     /// at `add_record`. Used as the secondary scan-index sort key so
     /// same-PHAS records preserve database load order. Survives a
@@ -1380,12 +1382,12 @@ impl PvDatabase {
             .await
             .insert(name.to_string(), seq);
 
-        if scan != ScanType::Passive {
+        if let Some(list) = scan.scan_list() {
             self.inner
                 .scan_index
                 .write()
                 .await
-                .entry(scan)
+                .entry(list)
                 .or_default()
                 .insert((phas, seq, name.to_string()));
         }
@@ -1441,12 +1443,12 @@ impl PvDatabase {
         // 2) Drop from scan index if it was scheduled. Match by record
         // name only — PHAS and load_order are not needed and may be
         // stale relative to the entry actually present.
-        if scan != ScanType::Passive {
+        if let Some(list) = scan.scan_list() {
             let mut idx = self.inner.scan_index.write().await;
-            if let Some(set) = idx.get_mut(&scan) {
+            if let Some(set) = idx.get_mut(&list) {
                 set.retain(|(_, _, n)| n != name);
                 if set.is_empty() {
-                    idx.remove(&scan);
+                    idx.remove(&list);
                 }
             }
         }

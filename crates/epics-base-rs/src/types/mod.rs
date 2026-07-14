@@ -1,4 +1,5 @@
 pub mod c_cast;
+pub mod c_parse;
 mod codec;
 mod dbr;
 mod pv_string;

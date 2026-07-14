@@ -245,6 +245,121 @@ enum ChannelTarget {
     },
 }
 
+/// The CA status a *database put* reports to the client.
+///
+/// C decides this by LAYER, not by which database error came back:
+/// `write_action` (`rsrv/camessage.c:781-789`) answers a failed
+/// `dbChannel_put` with `ECA_PUTFAIL` whatever the `dbStatus` was, and
+/// `write_notify_reply` (`camessage.c:1386-1391`) maps every
+/// `status != notifyOK` to the same `ECA_PUTFAIL`. The type errors —
+/// `ECA_BADTYPE` — belong to the gates ABOVE the put (`caNetConvert`,
+/// `camessage.c:753`, and the DBR-type gate), which run first and tear the
+/// connection down; a *value* that the field's converter refuses is not a
+/// wire-type error and can never be reported as one.
+///
+/// Constructing the reply status only through this type is what keeps that
+/// true: [`CaError::to_eca_status`] is the client-side table, where
+/// `ECA_BADTYPE` is a legitimate answer, and calling it on a put reply is
+/// how the port came to tell a `caput` of `32768` into a `DBF_SHORT` field
+/// "The data type specified is invalid" where C says "Channel write request
+/// failed".
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct PutStatus(u32);
+
+impl PutStatus {
+    /// The put reached the database and was accepted.
+    const OK: Self = Self(ECA_NORMAL);
+
+    /// The status for a put the database refused.
+    fn of_failure(err: &epics_base_rs::error::CaError) -> Self {
+        use epics_base_rs::error::CaError;
+        Self(match err {
+            // C reports the channel's own write refusal from `rsrvCheckPut`,
+            // above the put: measured on the C softIoc, `caput REC.STAT 3`
+            // (a `special(SPC_NOMOD)` field) answers "Write access denied".
+            CaError::ReadOnlyField(_) => ECA_NOWTACCESS,
+            // Not an rsrv case — its database is local — but this server also
+            // backs the CA gateway, whose "database" is an upstream channel.
+            // A dead upstream is actionable as ECA_DISCONN, not as "Put fail".
+            CaError::Disconnected | CaError::Shutdown | CaError::Io(_) => ECA_DISCONN,
+            // C `camessage.c:1660-1707`: the superseded put-callback, not this
+            // one, is the request that hears ECA_PUTCBINPROG.
+            CaError::PutCallbackInProgress(_) => ECA_PUTCBINPROG,
+            // Every other way the database can refuse a put — a value the
+            // field's converter rejects, a menu string that names no choice, a
+            // record-side veto — is C's `dbStatus < 0`.
+            _ => ECA_PUTFAIL,
+        })
+    }
+
+    /// The status of a completed put, ready for the wire.
+    fn eca(self) -> u32 {
+        self.0
+    }
+}
+
+#[cfg(test)]
+mod put_status_tests {
+    //! The boundary this type exists to hold: a refusal from INSIDE the
+    //! database put is `ECA_PUTFAIL` no matter which error the record layer
+    //! raised, while the refusal from ABOVE it keeps its own status.
+    //!
+    //! Measured on the C softIoc (`record(ai,"MEAS:A") {}`):
+    //! `caput MEAS:A.PHAS 32768` and `caput MEAS:A.RVAL notanumber` both print
+    //! "Channel write request failed" (`ECA_PUTFAIL`), while
+    //! `caput MEAS:A.STAT 3` — a `special(SPC_NOMOD)` field — prints
+    //! "Write access denied" (`ECA_NOWTACCESS`).
+
+    use super::*;
+    use epics_base_rs::error::CaError;
+
+    /// Every way the database can refuse a value is C's `dbStatus < 0`, and
+    /// C answers all of them with one status. In particular none of them may
+    /// answer `ECA_BADTYPE`: the wire type was already accepted by the gate
+    /// above (C `caNetConvert`), so "the data type specified is invalid" is a
+    /// statement the put path is not entitled to make.
+    #[test]
+    fn every_database_refusal_is_putfail_and_never_badtype() {
+        let refusals = [
+            CaError::InvalidValue("32768 overflows DBF_SHORT".into()),
+            CaError::TypeMismatch("string into a numeric field".into()),
+            CaError::UnsupportedType(epics_base_rs::types::DBR_STRING),
+            CaError::BadField("S_db_badField".into()),
+            CaError::BadChoice("S_db_badChoice".into()),
+            CaError::PutDisabled("DISP".into()),
+            CaError::FieldNotFound("NOSUCH".into()),
+        ];
+        for err in &refusals {
+            let status = PutStatus::of_failure(err).eca();
+            assert_ne!(
+                status, ECA_BADTYPE,
+                "{err:?}: the wire type passed `caNetConvert` — a value the field \
+                 refuses is not a type error"
+            );
+            assert_eq!(
+                status, ECA_PUTFAIL,
+                "{err:?}: C `write_action` answers every failed dbChannel_put with \
+                 ECA_PUTFAIL (camessage.c:781-789)"
+            );
+        }
+    }
+
+    /// The refusal C reports from `rsrvCheckPut`, above the put.
+    #[test]
+    fn a_field_the_channel_cannot_write_stays_nowtaccess() {
+        assert_eq!(
+            PutStatus::of_failure(&CaError::ReadOnlyField("STAT".into())).eca(),
+            ECA_NOWTACCESS
+        );
+    }
+
+    /// An accepted put is not a failure status.
+    #[test]
+    fn an_accepted_put_is_normal() {
+        assert_eq!(PutStatus::OK.eca(), ECA_NORMAL);
+    }
+}
+
 /// One async `CA_PROTO_WRITE_NOTIFY` put-callback awaiting record
 /// processing completion, owned by [`PutNotifySlot`].
 struct InFlightPutNotify {
@@ -3376,15 +3491,15 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     )),
                 };
                 if is_notify {
-                    let eca = match result {
-                        Ok(()) => ECA_NORMAL,
-                        Err(_) => ECA_PUTFAIL,
+                    let eca = match &result {
+                        Ok(()) => PutStatus::OK,
+                        Err(e) => PutStatus::of_failure(e),
                     };
                     send_put_notify_response(
                         writer,
                         hdr.data_type,
                         hdr.actual_count(),
-                        eca,
+                        eca.eca(),
                         ioid,
                         ReplyContext {
                             req_hdr: *hdr,
@@ -3406,11 +3521,11 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                             format!("{}.{}", record.read().await.name, field)
                         }
                     };
-                    let eca = e.to_eca_status();
+                    let eca = PutStatus::of_failure(e);
                     send_ca_error(
                         writer,
                         hdr,
-                        eca,
+                        eca.eca(),
                         entry_cid,
                         &audit_pv,
                         state.client_minor_version,
@@ -3799,11 +3914,11 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             // via WRITE_NOTIFY below.
             if !is_notify {
                 if let Err(e) = &write_result {
-                    let eca = e.to_eca_status();
+                    let eca = PutStatus::of_failure(e);
                     send_ca_error(
                         writer,
                         hdr,
-                        eca,
+                        eca.eca(),
                         entry_cid,
                         &audit_pv,
                         state.client_minor_version,
@@ -3815,9 +3930,10 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             // CA_PROTO_WRITE (cmd=4) is fire-and-forget — no response
             if is_notify {
                 let eca_status = match &write_result {
-                    Ok(_) => ECA_NORMAL,
-                    Err(e) => e.to_eca_status(),
-                };
+                    Ok(_) => PutStatus::OK,
+                    Err(e) => PutStatus::of_failure(e),
+                }
+                .eca();
 
                 // If async processing started (e.g. motor move), spawn a
                 // background task to await completion and send the response.

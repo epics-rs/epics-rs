@@ -1,5 +1,5 @@
 use crate::error::CaResult;
-use crate::types::{DbFieldType, EpicsValue, PvString};
+use crate::types::{DbFieldType, EpicsValue, PvString, c_parse};
 
 use super::scan::ScanType;
 
@@ -2948,19 +2948,30 @@ pub fn put_field_internal_default<R: Record + ?Sized>(
 /// `dbPut` ([`crate::server::database::field_io`]) and an internal link /
 /// device-support delivery ([`put_field_internal_default`]).
 ///
-/// The three `DBR_STRING` rows C does NOT route through a numeric parse are the
-/// point of the shared owner:
+/// Every `DBR_STRING` row of C's put table is a converter that can FAIL, and
+/// none of them is `EpicsValue::convert_to`:
 ///
 /// * `DBF_MENU` → `putStringMenu` — exact label, else an index below `nChoice`
 ///   ([`resolve_menu_field_string`]).
 /// * `DBF_ENUM` → `putStringEnum` — the record's state strings, else an index
 ///   below `no_str` ([`resolve_enum_state_string`]).
-/// * every other type → `EpicsValue::convert_to`, the value-coercion owner.
+/// * `DBF_STRING` → `putStringString` — a byte copy, the one row that cannot
+///   fail.
+/// * every numeric width → `putStringChar` … `putStringDouble`, i.e.
+///   `epicsParse*`, which refuses the put on overflow and on unparseable text
+///   ([`c_parse::put_string`]).
 ///
-/// Both string rows FAIL the put on no match (`S_db_badChoice`); C stores
-/// nothing. `convert_to` cannot express that — it is field-blind and maps any
-/// unparseable string to `0` — which is how `caput MY:VALVE Open` became a
-/// silent no-op that drove `VAL` to state 0.
+/// `convert_to` cannot express any of the failures — it is field-blind and
+/// total, mapping unparseable text to `0` and an out-of-range number to the
+/// nearest representable one. That is how `caput MY:VALVE Open` became a silent
+/// no-op that drove `VAL` to state 0, and how `caput REC.PREC 32768` — which the
+/// compiled softIoc REFUSES — stored 32767.
+///
+/// An ARRAY destination keeps the coercion path. C reaches it through the same
+/// `putString*` routine (`nRequest` elements, parsed one at a time), but this
+/// port's array records carry their own element-type conversion, so the row is
+/// theirs to own; routing a string here would break the string→`DBF_CHAR[]`
+/// carry that `convert_to` provides for them.
 pub fn coerce_put_value<R: Record + ?Sized>(
     record: &R,
     field: &str,
@@ -2977,6 +2988,12 @@ pub fn coerce_put_value<R: Record + ?Sized>(
                 record.enum_state_strings().as_deref(),
                 s,
             );
+        }
+        let dest_is_array = record.get_field(field).is_some_and(|v| v.is_array());
+        if !dest_is_array {
+            if let Some(numeric) = c_parse::NumericField::of(target) {
+                return c_parse::put_string(field, numeric, &s.as_str_lossy());
+            }
         }
     }
     Ok(value.convert_to(target))

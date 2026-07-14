@@ -780,7 +780,7 @@ impl Record for ThrottleRecord {
         }
     }
 
-    fn field_list(&self) -> &'static [FieldDesc] {
+    fn hand_field_list(&self) -> &'static [FieldDesc] {
         FIELDS
     }
 

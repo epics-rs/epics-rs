@@ -1,7 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{
-    FieldDesc, MENU_YES_NO, ProcessAction, ProcessOutcome, Record, dbd_generated,
-};
+use crate::server::record::{MENU_YES_NO, ProcessAction, ProcessOutcome, Record};
 use crate::types::{EpicsValue, PvString};
 
 // --- Busy-specific types (inlined from busy-rs/types.rs) ---
@@ -230,8 +228,6 @@ impl BusyRecord {
         self.orbv = self.rbv;
     }
 }
-
-static FIELDS: &[FieldDesc] = dbd_generated::BUSY_FIELDS;
 
 impl Record for BusyRecord {
     fn record_type(&self) -> &'static str {
@@ -547,10 +543,6 @@ impl Record for BusyRecord {
         }
     }
 
-    fn field_list(&self) -> &'static [FieldDesc] {
-        FIELDS
-    }
-
     /// `SIMM` is `DBF_MENU menu(menuYesNo)` (`busyRecord.dbd:137-141`) — the
     /// two-choice NO/YES menu, not the NO/YES/RAW `menuSimm` of the base binary
     /// records. Served as `DBR_ENUM` with those labels; `SIMS` is the shared
@@ -596,6 +588,7 @@ impl Record for BusyRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::record::dbd_generated;
     use crate::types::DbFieldType;
 
     #[test]
@@ -722,7 +715,10 @@ mod tests {
 
         // The advertised dbf type is unsigned for the whole raw family.
         for name in ["RVAL", "ORAW", "MASK", "RBV", "ORBV"] {
-            let desc = FIELDS.iter().find(|f| f.name == name).unwrap();
+            let desc = dbd_generated::BUSY_FIELDS
+                .iter()
+                .find(|f| f.name == name)
+                .unwrap();
             assert_eq!(desc.dbf_type, DbFieldType::ULong, "{name} dbf_type");
         }
     }

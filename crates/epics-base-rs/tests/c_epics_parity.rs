@@ -11,6 +11,7 @@
 
 use std::collections::HashSet;
 
+use epics_base_rs::server::record::FieldDeclaration;
 use epics_base_rs::server::record::{AlarmSeverity, Record, RecordInstance};
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::server::records::ao::AoRecord;

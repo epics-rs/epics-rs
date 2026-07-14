@@ -1,5 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, MENU_YES_NO, ProcessOutcome, Record, dbd_generated};
+use crate::server::record::{MENU_YES_NO, ProcessOutcome, Record};
 use crate::types::{EpicsValue, PvString};
 
 // int64out: 64-bit integer output.
@@ -74,8 +74,6 @@ impl Int64outRecord {
     }
 }
 
-static INT64OUT_FIELDS: &[FieldDesc] = dbd_generated::INT64OUT_FIELDS;
-
 impl Record for Int64outRecord {
     fn record_type(&self) -> &'static str {
         "int64out"
@@ -115,10 +113,6 @@ impl Record for Int64outRecord {
             }
         }
         Ok(ProcessOutcome::complete())
-    }
-
-    fn field_list(&self) -> &'static [FieldDesc] {
-        INT64OUT_FIELDS
     }
 
     /// `SIMM` is `DBF_MENU menu(menuYesNo)` (`int64outRecord.dbd.pod`): the

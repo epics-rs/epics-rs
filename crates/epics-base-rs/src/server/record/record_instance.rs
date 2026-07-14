@@ -20,8 +20,8 @@ use super::link::{
 use super::menu_choices::MenuBound;
 use super::pini::PiniMode;
 use super::record_trait::{
-    AuxPostMask, CommonFieldPutResult, FieldDesc, ProcessSnapshot, Record, RecordProcessResult,
-    SubroutineFn,
+    AuxPostMask, CommonFieldPutResult, FieldDeclaration, FieldDesc, ProcessSnapshot, Record,
+    RecordProcessResult, SubroutineFn,
 };
 use super::scan::{ScanType, SimModeScan};
 
@@ -624,20 +624,14 @@ pub(crate) struct DeadbandPost {
 /// cannot reach falls back to its decimal form, like the CA `*_STRING` encoder.
 /// **The** declaration lookup: a field's `dbFldDes`, in C's terms.
 ///
-/// The `.dbd` is the declaration, so the table generated FROM the `.dbd` is
-/// asked first, for every record type that has one; a record's own
-/// [`Record::field_list`] is a hand-written stand-in consulted only for the
-/// record types the `.dbd` does not cover (`subArray`, and the downstream
-/// crates' records); `dbCommon` last, so a record-specific field shadows the
-/// common one.
+/// The record type's declaration is [`FieldDeclaration::field_list`] — the
+/// generated `.dbd` table where one exists and the hand-written table where it
+/// does not, never both. `dbCommon` is asked last, so a record-specific field
+/// shadows the common one.
 ///
 /// A free function, not just a [`RecordInstance`] method, because the sites that
 /// need the declaration do not all hold an instance — a constant-link seed, a
-/// link write, the db loader all have `&dyn Record`. Every one of them used to
-/// reach into `record.field_list()` directly, which is how a record with BOTH
-/// tables (an `aSub`, whose hand table types `FTA` `DBF_SHORT` and carries no
-/// `menu()`, where the `.dbd` says `DBF_MENU`/`menu(menuFtype)`) served its
-/// declared type from one table and its choices from the other.
+/// link write, the db loader all have `&dyn Record`.
 ///
 /// `None` for a field with no declaration at all: a virtual field (`RTYP`,
 /// `TIME`, ...), which C answers from dbStaticLib rather than from a `dbFldDes`.
@@ -646,10 +640,7 @@ pub(crate) fn field_desc_of<R: Record + ?Sized>(
     field: &str,
 ) -> Option<&'static FieldDesc> {
     let named = |t: &'static [FieldDesc]| t.iter().find(|f| f.name.eq_ignore_ascii_case(field));
-    super::dbd_generated::record_fields(record.record_type())
-        .and_then(named)
-        .or_else(|| named(record.field_list()))
-        .or_else(|| named(super::dbd_generated::DB_COMMON_FIELDS))
+    named(record.field_list()).or_else(|| named(super::dbd_generated::DB_COMMON_FIELDS))
 }
 
 /// **The single owner of "which choice list does this field resolve against"**,
@@ -4865,7 +4856,7 @@ mod metadata_cache_tests {
         fn put_field(&mut self, name: &str, _value: EpicsValue) -> CaResult<()> {
             Err(CaError::FieldNotFound(name.to_string()))
         }
-        fn field_list(&self) -> &'static [crate::server::record::FieldDesc] {
+        fn hand_field_list(&self) -> &'static [crate::server::record::FieldDesc] {
             &[]
         }
         fn field_metadata_override(
@@ -4961,7 +4952,7 @@ mod metadata_cache_tests {
                 _ => Err(CaError::FieldNotFound(name.to_string())),
             }
         }
-        fn field_list(&self) -> &'static [crate::server::record::FieldDesc] {
+        fn hand_field_list(&self) -> &'static [crate::server::record::FieldDesc] {
             &[]
         }
         fn monitor_deadband_value(&self) -> Option<EpicsValue> {
@@ -5086,7 +5077,7 @@ mod metadata_cache_tests {
         fn put_field(&mut self, name: &str, _value: EpicsValue) -> CaResult<()> {
             Err(CaError::FieldNotFound(name.to_string()))
         }
-        fn field_list(&self) -> &'static [crate::server::record::FieldDesc] {
+        fn hand_field_list(&self) -> &'static [crate::server::record::FieldDesc] {
             &[]
         }
         fn force_posted_fields(&self) -> &'static [&'static str] {
@@ -5208,7 +5199,7 @@ mod metadata_cache_tests {
                 _ => Err(CaError::FieldNotFound(name.to_string())),
             }
         }
-        fn field_list(&self) -> &'static [crate::server::record::FieldDesc] {
+        fn hand_field_list(&self) -> &'static [crate::server::record::FieldDesc] {
             &[]
         }
         fn log_swept_fields(&self) -> &'static [&'static str] {
@@ -5365,7 +5356,7 @@ mod metadata_cache_tests {
                 _ => Err(CaError::FieldNotFound(name.to_string())),
             }
         }
-        fn field_list(&self) -> &'static [crate::server::record::FieldDesc] {
+        fn hand_field_list(&self) -> &'static [crate::server::record::FieldDesc] {
             &[]
         }
         fn log_swept_fields(&self) -> &'static [&'static str] {
@@ -5496,7 +5487,7 @@ mod metadata_cache_tests {
                 _ => Err(CaError::FieldNotFound(name.to_string())),
             }
         }
-        fn field_list(&self) -> &'static [crate::server::record::FieldDesc] {
+        fn hand_field_list(&self) -> &'static [crate::server::record::FieldDesc] {
             &[]
         }
         fn took_metadata_change(&mut self) -> bool {
@@ -5562,7 +5553,7 @@ mod metadata_cache_tests {
         fn put_field(&mut self, _: &str, _: EpicsValue) -> CaResult<()> {
             Ok(())
         }
-        fn field_list(&self) -> &'static [crate::server::record::FieldDesc] {
+        fn hand_field_list(&self) -> &'static [crate::server::record::FieldDesc] {
             &[]
         }
         // took_metadata_change uses default impl (returns false)

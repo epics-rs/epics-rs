@@ -1,5 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, MENU_SIMM, ProcessOutcome, Record, dbd_generated};
+use crate::server::record::{MENU_SIMM, ProcessOutcome, Record};
 use crate::types::{EpicsValue, PvString};
 
 /// Multi-bit binary output record — manual Record impl for raw↔index conversion.
@@ -273,8 +273,6 @@ impl MbboRecord {
     }
 }
 
-static MBBO_FIELDS: &[FieldDesc] = dbd_generated::MBBO_FIELDS;
-
 /// Helper macro: maps EPICS field name strings to struct fields.
 macro_rules! mbb_get_field {
     // `String`-tagged fields (the DOL/OUT/SIML/SIOL link grammar) store a
@@ -421,9 +419,6 @@ impl Record for MbboRecord {
         };
         let mask = base.checked_shl(u32::from(self.shft)).unwrap_or(0);
         Some(EpicsValue::ULong(self.rval & mask))
-    }
-    fn field_list(&self) -> &'static [FieldDesc] {
-        MBBO_FIELDS
     }
 
     /// `SIMM` is `DBF_MENU menu(menuSimm)` (`mbboRecord.dbd.pod:673-677`):
@@ -672,6 +667,7 @@ impl Record for MbboRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::record::dbd_generated;
 
     /// Simulation block (mbboRecord.dbd.pod:663-695) must be served:
     /// SIMM/SIMS as DBR_ENUM shorts, SIML/SIOL as the in/out link strings.
@@ -709,7 +705,7 @@ mod tests {
         // All four are advertised in the field list.
         for name in ["SIMM", "SIML", "SIOL", "SIMS"] {
             assert!(
-                MBBO_FIELDS.iter().any(|f| f.name == name),
+                dbd_generated::MBBO_FIELDS.iter().any(|f| f.name == name),
                 "{name} missing from field_list"
             );
         }

@@ -11,7 +11,7 @@ use std::sync::LazyLock;
 
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::record::{
-    FieldDesc, FieldMetadataOverride, ProcessAction, ProcessOutcome, Record,
+    FieldDeclaration, FieldDesc, FieldMetadataOverride, ProcessAction, ProcessOutcome, Record,
 };
 use epics_base_rs::types::{DbFieldType, EpicsValue, PvString};
 
@@ -3198,7 +3198,7 @@ impl Record for TableRecord {
         }
     }
 
-    fn field_list(&self) -> &'static [FieldDesc] {
+    fn hand_field_list(&self) -> &'static [FieldDesc] {
         let fields: &Vec<FieldDesc> = &ALL_FIELDS;
         unsafe { std::slice::from_raw_parts(fields.as_ptr(), fields.len()) }
     }

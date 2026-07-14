@@ -1,7 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{
-    FieldDesc, MENU_SIMM, ProcessOutcome, RawSoftEntry, Record, dbd_generated,
-};
+use crate::server::record::{MENU_SIMM, ProcessOutcome, RawSoftEntry, Record};
 use crate::types::{EpicsValue, PvString};
 
 /// Multi-bit binary input record — manual Record impl for raw↔index conversion.
@@ -246,8 +244,6 @@ impl MbbiRecord {
     }
 }
 
-static MBBI_FIELDS: &[FieldDesc] = dbd_generated::MBBI_FIELDS;
-
 /// Helper macro: maps EPICS field name strings to struct fields.
 macro_rules! mbb_get_field {
     // `String`-tagged fields (the SIML/SIOL link grammar) store a Rust
@@ -360,9 +356,6 @@ macro_rules! mbb_put_field {
 impl Record for MbbiRecord {
     fn record_type(&self) -> &'static str {
         "mbbi"
-    }
-    fn field_list(&self) -> &'static [FieldDesc] {
-        MBBI_FIELDS
     }
 
     /// `SIMM` is `DBF_MENU menu(menuSimm)` (`mbbiRecord.dbd.pod`): the

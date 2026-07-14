@@ -15,7 +15,7 @@
 //! `DBF_SHORT` in its hand-written table and served a bare `0`. A client asking
 //! for the string got a number.
 
-use epics_base_rs::server::record::RecordInstance;
+use epics_base_rs::server::record::{FieldDeclaration, RecordInstance};
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 

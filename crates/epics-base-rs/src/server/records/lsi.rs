@@ -1,7 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{
-    FieldDesc, MENU_POST, MENU_YES_NO, ProcessOutcome, Record, dbd_generated,
-};
+use crate::server::record::{MENU_POST, MENU_YES_NO, ProcessOutcome, Record};
 use crate::types::{EpicsValue, PvString};
 
 /// EPICS `MAX_STRING_SIZE` — DBR_STRING buffers are 40 bytes.
@@ -105,15 +103,9 @@ impl LsiRecord {
     }
 }
 
-static LSI_FIELDS: &[FieldDesc] = dbd_generated::LSI_FIELDS;
-
 impl Record for LsiRecord {
     fn record_type(&self) -> &'static str {
         "lsi"
-    }
-
-    fn field_list(&self) -> &'static [FieldDesc] {
-        LSI_FIELDS
     }
 
     /// `DBF_MENU` fields, served as `DBR_ENUM` (`lsiRecord.dbd.pod`): `SIMM`

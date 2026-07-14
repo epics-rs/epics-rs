@@ -1,5 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, ProcessOutcome, Record, dbd_generated};
+use crate::server::record::{ProcessOutcome, Record};
 use crate::types::{EpicsValue, PvString};
 
 /// `LABL` is a `size(20)` `char[20]` in C (`permissiveRecord.dbd.pod`):
@@ -63,15 +63,9 @@ impl Default for PermissiveRecord {
     }
 }
 
-static PERMISSIVE_FIELDS: &[FieldDesc] = dbd_generated::PERMISSIVE_FIELDS;
-
 impl Record for PermissiveRecord {
     fn record_type(&self) -> &'static str {
         "permissive"
-    }
-
-    fn field_list(&self) -> &'static [FieldDesc] {
-        PERMISSIVE_FIELDS
     }
 
     /// C `permissiveRecord.c::monitor` (lines 90-117): post `VAL` when

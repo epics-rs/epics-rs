@@ -1,7 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{
-    FieldDesc, MENU_SIMM, ProcessAction, ProcessOutcome, Record, dbd_generated,
-};
+use crate::server::record::{MENU_SIMM, ProcessAction, ProcessOutcome, Record};
 use crate::types::{EpicsValue, PvString};
 
 /// Binary output record matching C boRecord behavior.
@@ -112,8 +110,6 @@ impl BoRecord {
         }
     }
 }
-
-static FIELDS: &[FieldDesc] = dbd_generated::BO_FIELDS;
 
 impl Record for BoRecord {
     fn record_type(&self) -> &'static str {
@@ -489,10 +485,6 @@ impl Record for BoRecord {
             },
             _ => Err(CaError::FieldNotFound(name.into())),
         }
-    }
-
-    fn field_list(&self) -> &'static [FieldDesc] {
-        FIELDS
     }
 
     /// `SIMM` is `DBF_MENU menu(menuSimm)` (`boRecord.dbd.pod`): the binary

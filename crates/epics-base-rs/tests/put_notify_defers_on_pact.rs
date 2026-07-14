@@ -103,7 +103,7 @@ impl Record for AsyncOnceRecord {
         }
     }
 
-    fn field_list(&self) -> &'static [FieldDesc] {
+    fn hand_field_list(&self) -> &'static [FieldDesc] {
         FIELDS
     }
 
@@ -321,7 +321,7 @@ impl Record for OdlyRecord {
         }
     }
 
-    fn field_list(&self) -> &'static [FieldDesc] {
+    fn hand_field_list(&self) -> &'static [FieldDesc] {
         FIELDS
     }
 

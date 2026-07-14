@@ -1,6 +1,6 @@
 use crate::error::{CaError, CaResult};
 use crate::server::database::AsyncDbHandle;
-use crate::server::record::{FieldDesc, ProcessOutcome, Record, dbd_generated};
+use crate::server::record::{ProcessOutcome, Record};
 use crate::types::{EpicsValue, PvString};
 
 /// `VAL`/`OVAL` are `size(20)` `char[20]` buffers in C
@@ -64,15 +64,9 @@ impl StateRecord {
     }
 }
 
-static STATE_FIELDS: &[FieldDesc] = dbd_generated::STATE_FIELDS;
-
 impl Record for StateRecord {
     fn record_type(&self) -> &'static str {
         "state"
-    }
-
-    fn field_list(&self) -> &'static [FieldDesc] {
-        STATE_FIELDS
     }
 
     /// C `stateRecord.c::init_record` pass 0 warns that the record type is

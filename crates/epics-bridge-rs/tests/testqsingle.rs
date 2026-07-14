@@ -801,9 +801,15 @@ async fn common_field_descriptor_matches_value_type() {
         .unwrap();
 
     // (field, expected descriptor scalar type)
+    //
+    // `.PROC` is `DBF_UCHAR` (`dbCommon.dbd:110`), not `DBF_CHAR`, and pvxs
+    // serves `DBR_UCHAR` as `TypeCode::UInt8` (`ioc/typeutils.cpp`). The
+    // `Byte` this case used to expect was the port's signed storage variant
+    // showing through — the descriptor was derived from the stored value
+    // instead of from the declaration.
     let cases = [
         ("TEST:ai.DESC", ScalarType::String), // DBF_STRING
-        ("TEST:ai.PROC", ScalarType::Byte),   // DBF_CHAR
+        ("TEST:ai.PROC", ScalarType::UByte),  // DBF_UCHAR
         ("TEST:ai.UTAG", ScalarType::ULong),  // DBF_UINT64
     ];
 

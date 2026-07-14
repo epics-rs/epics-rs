@@ -616,7 +616,12 @@ impl BridgeChannel {
                 })?;
             (Some(v), NtType::LongString)
         } else {
-            let resolved = instance.resolve_field(&field_upper);
+            // `client_field_value`, not `resolve_field`: the value projected
+            // onto the field's DECLARED type, which is what every delivery
+            // path serves. Reading the DBF off the raw stored variant is what
+            // advertised `.PROC` (`DBF_UCHAR`) as a signed byte and a
+            // `DBF_MENU` field as a short.
+            let resolved = instance.client_field_value(&field_upper);
             // `pvif::nt_type_for_channel` is the single owner of the NT
             // choice (the port's `getChannelValueType`): a record-declared
             // long-string field (`lsi`/`lso` VAL/OVAL, `printf` VAL) AND a
@@ -628,34 +633,24 @@ impl BridgeChannel {
             (resolved, nt_type)
         };
 
-        // DBF type for the bound field, taken from the field's actual
-        // resolved value. pvxs serves the type from
+        // DBF type for the bound field. pvxs serves the type from
         // `dbChannelFinalFieldType(chan)` (singlesource.cpp:189-205,
         // dbChannel.h:452) — the channel's final field type after lookup,
         // which covers `dbCommon` fields, not only record-specific ones.
-        // Deriving the DBF from the resolved `EpicsValue` makes the
-        // advertised descriptor agree with the value the GET path returns
-        // *by construction*: common/virtual fields such as `.SCAN`
-        // (enum), `.DESC` (string), `.PROC` (char), and `.UTAG` (unsigned
-        // 64) no longer fall back to `double`. The earlier `field_list`
-        // lookup + `Double` fallback advertised `double value` for every
-        // field a record's table did not enumerate, contradicting the
-        // value the snapshot then serialized — a descriptor/value
-        // wire-schema mismatch, not mere display drift. The
-        // record-specific `field_list` is the fallback only for a field
-        // that resolves to no concrete value, and `Double` the final
-        // backstop.
+        //
+        // `resolved` above is `client_field_value`, i.e. already projected onto
+        // the field's declared type, so reading the DBF off it IS reading the
+        // declaration — and the advertised descriptor agrees with the value the
+        // GET path serializes by construction, because both are that one
+        // projection. Taking it from the RAW stored variant used to advertise
+        // `.PROC` (`DBF_UCHAR`) as a signed byte and every `DBF_MENU` field as
+        // a short: agreement with the value, but agreement on the wrong type.
+        //
+        // `Double` remains the backstop for a field that resolves to no value
+        // at all.
         let value_dbf = resolved
             .as_ref()
             .map(|v| v.db_field_type())
-            .or_else(|| {
-                instance
-                    .record
-                    .field_list()
-                    .iter()
-                    .find(|f| f.name == field_upper)
-                    .map(|f| f.dbf_type)
-            })
             .unwrap_or(DbFieldType::Double);
 
         Ok(Self {

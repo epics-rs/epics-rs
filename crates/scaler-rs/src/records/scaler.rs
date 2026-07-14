@@ -536,11 +536,11 @@ static ALL_FIELDS: LazyLock<Vec<FieldDesc>> = LazyLock::new(|| {
     let mut fields = vec![
         FieldDesc::new("VAL", DbFieldType::Double, false),
         FieldDesc::new("FREQ", DbFieldType::Double, false),
-        FieldDesc::new("CNT", DbFieldType::Short, false),
-        FieldDesc::new("PCNT", DbFieldType::Short, true),
+        FieldDesc::new("CNT", DbFieldType::Enum, false),
+        FieldDesc::new("PCNT", DbFieldType::Enum, true),
         FieldDesc::new("SS", DbFieldType::Short, true),
         FieldDesc::new("US", DbFieldType::Short, true),
-        FieldDesc::new("CONT", DbFieldType::Short, false),
+        FieldDesc::new("CONT", DbFieldType::Enum, false),
         FieldDesc::new("RATE", DbFieldType::Float, false),
         FieldDesc::new("RAT1", DbFieldType::Float, false),
         FieldDesc::new("DLY", DbFieldType::Float, false),
@@ -567,13 +567,19 @@ static ALL_FIELDS: LazyLock<Vec<FieldDesc>> = LazyLock::new(|| {
         // PR1..PR64 are DBF_ULONG (scalerRecord.dbd:945-1323).
         fields.push(FieldDesc::new(pr, DbFieldType::ULong, false));
     }
+    // G1..G64 (`menu(scalerG)`, N/Y) and D1..D64 (`menu(scalerD)`) are
+    // DBF_MENU, which is served as DBR_ENUM with those labels — the index is
+    // stored as a short, but the DECLARED type is what goes on the wire
+    // (`RecordInstance::declared_field_type`). Declaring them Short here made
+    // the declaration contradict `menu_field_choices`, which answers for
+    // exactly these fields.
     for i in 1..=MAX_SCALER_CHANNELS {
         let g: &'static str = Box::leak(format!("G{}", i).into_boxed_str());
-        fields.push(FieldDesc::new(g, DbFieldType::Short, false));
+        fields.push(FieldDesc::new(g, DbFieldType::Enum, false));
     }
     for i in 1..=MAX_SCALER_CHANNELS {
         let d: &'static str = Box::leak(format!("D{}", i).into_boxed_str());
-        fields.push(FieldDesc::new(d, DbFieldType::Short, false));
+        fields.push(FieldDesc::new(d, DbFieldType::Enum, false));
     }
     for i in 1..=MAX_SCALER_CHANNELS {
         let nm: &'static str = Box::leak(format!("NM{}", i).into_boxed_str());

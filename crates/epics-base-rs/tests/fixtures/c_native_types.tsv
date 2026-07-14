@@ -14,17 +14,19 @@
 # (DBF_ULONG is served as DBF_DOUBLE, DBF_MENU as DBF_ENUM, and an
 # SPC_DBADDR field's type comes from the record's cvt_dbaddr, not the .dbd).
 #
-# One row is NOT from the bulk sweep: `mbbo.VAL`. `mbboRecord.c:308` degenerates
-# VAL to DBF_USHORT (DBF_LONG on the wire) when `!prec->sdef` — i.e. when the
-# record defines no states at all, which the bulk sweep's bare `record(mbbo,...)`
-# did not. Re-probed against the same softIoc with states defined:
+# `mbbo.VAL` is the sharpest `cvt_dbaddr` row. `mbboRecord.c:300-312` degenerates
+# VAL to DBF_USHORT — DBF_LONG on the wire, CA having no unsigned-16 type — when
+# `!prec->sdef`, i.e. when the record defines no states at all. The bulk sweep's
+# bare `record(mbbo,...)` defines none, so DBF_LONG is the row, measured the same
+# way as every other. Both halves of the selector, on the same softIoc:
 #
-#   record(mbbo,"T:SDEF")  { field(ZRST,"zero") field(ONST,"one") field(ZRVL,"0") }
-#     -> cainfo: Native data type: DBF_ENUM ; caget -> "zero"
+#   record(mbbo,"P:BARE")  {}                                    -> DBF_LONG
+#   record(mbbo,"P:SDEF")  { field(ZRST,"zero") field(ONST,"one")
+#                            field(ZRVL,"0")   field(ONVL,"1") } -> DBF_ENUM
 #
-# DBF_ENUM is what every mbbo with states serves and what this port models, so
-# that is the row. The stateless degeneration is a C behaviour the port does not
-# implement; see the report's UNFIXED list.
+# The port implements both: VAL is `runtime_typed`, and the record answers
+# `UShort` with no state table and `Enum` with one
+# (`records/mbbo.rs`, pinned by `a_stateless_mbbo_serves_its_val_as_dbf_long`).
 #
 # Regenerate: see tools/dbd-codegen/README.md.
 #
@@ -1900,7 +1902,7 @@ mbbo	UDF	DBF_UCHAR	-	DBF_CHAR	1
 mbbo	UDFS	DBF_MENU	-	DBF_ENUM	1
 mbbo	UNSV	DBF_MENU	-	DBF_ENUM	1
 mbbo	UTAG	DBF_UINT64	SPC_NOMOD	DBF_DOUBLE	1
-mbbo	VAL	DBF_ENUM	SPC_DBADDR	DBF_ENUM	1
+mbbo	VAL	DBF_ENUM	SPC_DBADDR	DBF_LONG	1
 mbbo	ZRST	DBF_STRING	SPC_MOD	DBF_STRING	1
 mbbo	ZRSV	DBF_MENU	-	DBF_ENUM	1
 mbbo	ZRVL	DBF_ULONG	SPC_MOD	DBF_DOUBLE	1
@@ -2532,6 +2534,52 @@ sub	UDF	DBF_UCHAR	-	DBF_CHAR	1
 sub	UDFS	DBF_MENU	-	DBF_ENUM	1
 sub	UTAG	DBF_UINT64	SPC_NOMOD	DBF_DOUBLE	1
 sub	VAL	DBF_DOUBLE	-	DBF_DOUBLE	1
+subArray	ACKS	DBF_MENU	SPC_NOMOD	DBF_ENUM	1
+subArray	ACKT	DBF_MENU	SPC_NOMOD	DBF_ENUM	1
+subArray	AMSG	DBF_STRING	SPC_NOMOD	DBF_STRING	1
+subArray	ASG	DBF_STRING	SPC_AS	DBF_STRING	1
+subArray	BUSY	DBF_SHORT	SPC_NOMOD	DBF_SHORT	1
+subArray	DESC	DBF_STRING	-	DBF_STRING	1
+subArray	DISA	DBF_SHORT	-	DBF_SHORT	1
+subArray	DISP	DBF_UCHAR	-	DBF_CHAR	1
+subArray	DISS	DBF_MENU	-	DBF_ENUM	1
+subArray	DISV	DBF_SHORT	-	DBF_SHORT	1
+subArray	DTYP	DBF_DEVICE	-	DBF_ENUM	1
+subArray	EGU	DBF_STRING	-	DBF_STRING	1
+subArray	EVNT	DBF_STRING	SPC_SCAN	DBF_STRING	1
+subArray	FLNK	DBF_FWDLINK	-	DBF_STRING	1
+subArray	FTVL	DBF_MENU	SPC_NOMOD	DBF_ENUM	1
+subArray	HOPR	DBF_DOUBLE	-	DBF_DOUBLE	1
+subArray	INDX	DBF_ULONG	-	DBF_DOUBLE	1
+subArray	INP	DBF_INLINK	-	DBF_STRING	1
+subArray	LCNT	DBF_UCHAR	SPC_NOMOD	DBF_CHAR	1
+subArray	LOPR	DBF_DOUBLE	-	DBF_DOUBLE	1
+subArray	MALM	DBF_ULONG	SPC_NOMOD	DBF_DOUBLE	1
+subArray	NAME	DBF_STRING	SPC_NOMOD	DBF_STRING	1
+subArray	NAMSG	DBF_STRING	SPC_NOMOD	DBF_STRING	1
+subArray	NELM	DBF_ULONG	-	DBF_DOUBLE	1
+subArray	NORD	DBF_LONG	SPC_NOMOD	DBF_LONG	1
+subArray	NSEV	DBF_MENU	SPC_NOMOD	DBF_ENUM	1
+subArray	NSTA	DBF_MENU	SPC_NOMOD	DBF_ENUM	1
+subArray	PACT	DBF_UCHAR	SPC_NOMOD	DBF_CHAR	1
+subArray	PHAS	DBF_SHORT	SPC_SCAN	DBF_SHORT	1
+subArray	PINI	DBF_MENU	-	DBF_ENUM	1
+subArray	PREC	DBF_SHORT	-	DBF_SHORT	1
+subArray	PRIO	DBF_MENU	SPC_SCAN	DBF_ENUM	1
+subArray	PROC	DBF_UCHAR	-	DBF_CHAR	1
+subArray	PUTF	DBF_UCHAR	SPC_NOMOD	DBF_CHAR	1
+subArray	RPRO	DBF_UCHAR	SPC_NOMOD	DBF_CHAR	1
+subArray	SCAN	DBF_MENU	SPC_SCAN	DBF_ENUM	1
+subArray	SDIS	DBF_INLINK	-	DBF_STRING	1
+subArray	SEVR	DBF_MENU	SPC_NOMOD	DBF_ENUM	1
+subArray	STAT	DBF_MENU	SPC_NOMOD	DBF_ENUM	1
+subArray	TPRO	DBF_UCHAR	-	DBF_CHAR	1
+subArray	TSE	DBF_SHORT	-	DBF_SHORT	1
+subArray	TSEL	DBF_INLINK	-	DBF_STRING	1
+subArray	UDF	DBF_UCHAR	-	DBF_CHAR	1
+subArray	UDFS	DBF_MENU	-	DBF_ENUM	1
+subArray	UTAG	DBF_UINT64	SPC_NOMOD	DBF_DOUBLE	1
+subArray	VAL	DBF_NOACCESS	SPC_DBADDR	DBF_DOUBLE	10
 waveform	ACKS	DBF_MENU	SPC_NOMOD	DBF_ENUM	1
 waveform	ACKT	DBF_MENU	SPC_NOMOD	DBF_ENUM	1
 waveform	AMSG	DBF_STRING	SPC_NOMOD	DBF_STRING	1

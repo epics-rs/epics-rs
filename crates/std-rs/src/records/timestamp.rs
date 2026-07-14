@@ -103,7 +103,7 @@ static FIELDS: &[FieldDesc] = &[
     FieldDesc::new("VAL", DbFieldType::String, false),
     FieldDesc::new("OVAL", DbFieldType::String, true),
     FieldDesc::new("RVAL", DbFieldType::Long, false),
-    FieldDesc::new("TST", DbFieldType::Short, false),
+    FieldDesc::new("TST", DbFieldType::Enum, false),
 ];
 
 impl TimestampRecord {

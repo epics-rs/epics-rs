@@ -1905,9 +1905,15 @@ async fn r17_35_group_scalar_member_put_derefs_the_nt_wrapper() {
         db.add_record("TEST:sc_so", Box::new(StringoutRecord::new("")))
             .await
             .unwrap();
-        db.add_record("TEST:sc_mb", Box::new(MbboRecord::new(0)))
-            .await
-            .unwrap();
+        // The state table is what MAKES this an enum member: C's `cvt_dbaddr`
+        // (mbboRecord.c:300-312) degenerates a stateless mbbo's VAL to
+        // DBF_USHORT, and pvxs would then advertise it as an NTScalar long, not
+        // an NTEnum — there would be no `value.index` to deref. Two states, so
+        // the member under test is the one the test is named for.
+        let mut mb = MbboRecord::new(0);
+        mb.zrst = "zero".into();
+        mb.onst = "one".into();
+        db.add_record("TEST:sc_mb", Box::new(mb)).await.unwrap();
 
         let provider = Arc::new(BridgeProvider::new(db.clone()));
         provider.load_group_config(&json).expect("load");

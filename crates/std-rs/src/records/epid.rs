@@ -490,7 +490,7 @@ impl EpidRecord {
 static FIELDS: &[FieldDesc] = &[
     // PID control
     FieldDesc::new("VAL", DbFieldType::Double, false),
-    FieldDesc::new("SMSL", DbFieldType::Short, false),
+    FieldDesc::new("SMSL", DbFieldType::Enum, false),
     FieldDesc::new("STPL", DbFieldType::String, false),
     FieldDesc::new("INP", DbFieldType::String, false),
     FieldDesc::new("OUTL", DbFieldType::String, false),
@@ -514,9 +514,9 @@ static FIELDS: &[FieldDesc] = &[
     FieldDesc::new("DT", DbFieldType::Double, false),
     FieldDesc::new("DTP", DbFieldType::Double, true),
     FieldDesc::new("MDT", DbFieldType::Double, false),
-    FieldDesc::new("FMOD", DbFieldType::Short, false),
+    FieldDesc::new("FMOD", DbFieldType::Enum, false),
     FieldDesc::new("FBON", DbFieldType::Short, false),
-    FieldDesc::new("FBOP", DbFieldType::Short, true),
+    FieldDesc::new("FBOP", DbFieldType::Enum, true),
     FieldDesc::new("ODEL", DbFieldType::Double, false),
     // Display
     FieldDesc::new("PREC", DbFieldType::Short, false),

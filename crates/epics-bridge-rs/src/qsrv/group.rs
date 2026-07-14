@@ -1045,7 +1045,7 @@ impl GroupChannel {
             }
             FieldMapping::Plain => {
                 let field_upper = field_name.to_ascii_uppercase();
-                let value = instance.resolve_field(&field_upper).ok_or_else(|| {
+                let value = instance.client_field_value(&field_upper).ok_or_else(|| {
                     BridgeError::FieldNotFound {
                         record: record_name.to_string(),
                         field: field_name.to_string(),
@@ -1083,7 +1083,7 @@ impl GroupChannel {
                 Ok(PvField::Structure(meta))
             }
             FieldMapping::Any => {
-                let value = instance.resolve_field(field_name).ok_or_else(|| {
+                let value = instance.client_field_value(field_name).ok_or_else(|| {
                     BridgeError::FieldNotFound {
                         record: record_name.to_string(),
                         field: field_name.to_string(),
@@ -1108,10 +1108,10 @@ impl GroupChannel {
     /// Introspect a group scalar member's NT shape and DBF type from the
     /// configured channel's final field — the same final-field metadata
     /// the single-record path uses ([`super::channel::BridgeChannel::new`]),
-    /// not the owning record type. Resolving the field's actual value once
-    /// (record → common → virtual) is the single source of truth for both
-    /// the advertised NT shape and the descriptor's DBF, so the
-    /// descriptor cannot drift from the value the GET path serializes:
+    /// not the owning record type. The value is taken through
+    /// `client_field_value` — the stored value projected onto the field's
+    /// DECLARED type — which is the same call the GET path above serializes,
+    /// so the descriptor cannot drift from the bytes that follow it:
     /// `REC.SCAN` advertises NTEnum, `REC.DESC` advertises NTScalar
     /// string, and `BI.DESC` stays a string member on an enum record.
     /// pvxs builds scalar group member descriptors from
@@ -1129,31 +1129,24 @@ impl GroupChannel {
 
         let instance = rec.read().await;
         let field_upper = field_name.to_ascii_uppercase();
-        let resolved = instance.resolve_field(&field_upper);
+        let resolved = instance.client_field_value(&field_upper);
         let nt_type = pvif::nt_type_for_channel(&instance, &field_upper, resolved.as_ref());
         let value_dbf = resolved
             .as_ref()
             .map(|v| v.db_field_type())
-            .or_else(|| {
-                instance
-                    .record
-                    .field_list()
-                    .iter()
-                    .find(|f| f.name == field_upper)
-                    .map(|f| f.dbf_type)
-            })
+            .or_else(|| instance.declared_field_type(&field_upper))
             .unwrap_or(DbFieldType::Double);
 
         Ok((nt_type, dbf_to_scalar_type(value_dbf)))
     }
 
-    /// Look up a member's actual DBF field type for the PUT conversion
-    /// target. Resolves the configured field's value first (record →
-    /// common → virtual), so a common/virtual member field (e.g.
-    /// `REC.DESC` string, `REC.UTAG` uint64) converts against its real
-    /// type instead of falling back to `Double` — same final-field
-    /// resolution as the descriptor path above. Returns `Double` only
-    /// when the record/field cannot be resolved at all.
+    /// Look up a member's DBF field type for the PUT conversion target —
+    /// pvxs converts the incoming leaf to `dbChannelFinalFieldType`, the
+    /// field's DECLARED type, so this must be the type the descriptor
+    /// advertised, not the variant the record happens to store. Taken
+    /// through the same `client_field_value` projection as the descriptor
+    /// path above; `declared_field_type` covers the fields that carry no
+    /// value at all, and `Double` only when the record/field is unknown.
     async fn member_dbf_type(&self, member: &GroupMember) -> DbFieldType {
         let (record_name, field_name) =
             epics_base_rs::server::database::parse_pv_name(&member.channel);
@@ -1165,16 +1158,9 @@ impl GroupChannel {
         let instance = rec.read().await;
         let field_upper = field_name.to_ascii_uppercase();
         instance
-            .resolve_field(&field_upper)
+            .client_field_value(&field_upper)
             .map(|v| v.db_field_type())
-            .or_else(|| {
-                instance
-                    .record
-                    .field_list()
-                    .iter()
-                    .find(|f| f.name == field_upper)
-                    .map(|f| f.dbf_type)
-            })
+            .or_else(|| instance.declared_field_type(&field_upper))
             .unwrap_or(DbFieldType::Double)
     }
 
@@ -1280,7 +1266,7 @@ impl GroupChannel {
         };
         let instance = rec.read().await;
         matches!(
-            instance.resolve_field(&field_name.to_ascii_uppercase()),
+            instance.client_field_value(&field_name.to_ascii_uppercase()),
             Some(epics_base_rs::types::EpicsValue::CharArray(_))
         )
     }

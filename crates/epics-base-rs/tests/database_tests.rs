@@ -954,10 +954,21 @@ async fn test_caput_to_udf_field_posts_udf_event() {
     let event = udf_rx
         .try_recv()
         .expect("a caput to .UDF must deliver a .UDF monitor event");
+    // `UDF` is `DBF_UCHAR` (`dbCommon.dbd:265`), so the monitor update carries
+    // it as the unsigned byte it is declared as — CA then serves that as
+    // `DBR_CHAR`, which is what the compiled C IOC reports for `.UDF`
+    // (`fixtures/c_native_types.tsv`: `ai UDF DBF_UCHAR - DBF_CHAR`). Asserting
+    // the SIGNED `EpicsValue::Char` here pinned the storage variant the record
+    // happened to hold, which is exactly the type-from-the-value defect.
     assert!(
-        matches!(event.snapshot.value, EpicsValue::Char(1)),
+        matches!(event.snapshot.value, EpicsValue::UChar(1)),
         "the .UDF event must carry the value the client wrote, got {:?}",
         event.snapshot.value
+    );
+    assert_eq!(
+        event.snapshot.value.dbr_type().ca_wire_type(),
+        DbFieldType::Char as u16,
+        "a DBF_UCHAR field goes on the CA wire as DBR_CHAR"
     );
 }
 
@@ -8131,9 +8142,15 @@ async fn test_ca_put_mbbo_val_recomputes_rval() {
 
     let rec = db.get_record("MBBO_CA").await.unwrap();
     let inst = rec.read().await;
+    // `UShort`, not `Enum`: this record defines no state table, and C's
+    // `cvt_dbaddr` (mbboRecord.c:300-312) degenerates a stateless mbbo's VAL to
+    // DBF_USHORT — there are no labels to serve behind an enum index. The put
+    // still arrives as `Enum(3)` (a CA client that asked for DBR_ENUM), which
+    // is the point: the WRITE accepts the enum, the READ answers at the type C
+    // serves. Measured: bare `record(mbbo,...)` -> `cainfo` DBF_LONG.
     assert_eq!(
         inst.record.get_field("VAL"),
-        Some(EpicsValue::Enum(3)),
+        Some(EpicsValue::UShort(3)),
         "VAL holds the CA-written value"
     );
     // RVAL/ORAW are DBF_ULONG (mbboRecord.dbd.pod:620,624).
@@ -9878,9 +9895,12 @@ async fn init_applies_constant_dol_across_record_types() {
     {
         let rec = db.get_record("MBBO_CONST").await.unwrap();
         let inst = rec.read().await;
+        // `UShort`, not `Enum`, for the same reason the comment above gives:
+        // with no state table there is nothing to label the index with, so C's
+        // `cvt_dbaddr` serves VAL as DBF_USHORT (mbboRecord.c:300-312).
         assert_eq!(
             inst.record.get_field("VAL"),
-            Some(EpicsValue::Enum(2)),
+            Some(EpicsValue::UShort(2)),
             "mbbo constant DOL → VAL (state index) = 2"
         );
         assert_eq!(

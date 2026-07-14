@@ -8668,6 +8668,20 @@ mod tests {
     ///
     /// One case per boundary: a real refusal posts its text; the same text
     /// written again does not re-post; the clear posts.
+    ///
+    /// ERRS goes on the wire as a `DBF_CHAR` ARRAY, not a `DBF_STRING`:
+    /// `cvt_dbaddr` (asynRecord.c:956-962) re-types it to
+    /// `field_type = DBF_CHAR, no_elements = ERR_SIZE`, so a client sees the
+    /// error text as bytes. The record stores it as a Rust `String`; the
+    /// framework projects that onto the declared `DBF_CHAR` before serving it,
+    /// which is what a monitor subscriber receives. Asserting
+    /// `EpicsValue::String` here pinned the storage variant, i.e. the very
+    /// type-from-the-value defect — the port served `DBF_STRING` where the C
+    /// IOC serves `DBF_CHAR[ERR_SIZE]`.
+    fn errs_on_the_wire(text: &str) -> EpicsValue {
+        EpicsValue::CharArray(text.bytes().collect())
+    }
+
     #[tokio::test]
     async fn every_errs_write_posts_and_an_unchanged_one_does_not() {
         use crate::exception::ExceptionManager;
@@ -8755,9 +8769,7 @@ mod tests {
         }
         assert_eq!(
             errs_sub.recv().await,
-            Some(EpicsValue::String(
-                format!("port {port_name} not connected").into()
-            )),
+            Some(errs_on_the_wire(&format!("port {port_name} not connected"))),
             "a refused put must fire the ERRS monitor with the refusal text"
         );
 
@@ -8796,7 +8808,7 @@ mod tests {
         }
         assert_eq!(
             errs_sub.recv().await,
-            Some(EpicsValue::String(String::new().into())),
+            Some(errs_on_the_wire("")),
             "resetError's clear must post"
         );
     }

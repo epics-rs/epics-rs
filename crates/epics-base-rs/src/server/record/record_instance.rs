@@ -18,7 +18,8 @@ use super::link::{
 use super::menu_choices::MenuBound;
 use super::pini::PiniMode;
 use super::record_trait::{
-    AuxPostMask, CommonFieldPutResult, ProcessSnapshot, Record, RecordProcessResult, SubroutineFn,
+    AuxPostMask, CommonFieldPutResult, FieldDesc, ProcessSnapshot, Record, RecordProcessResult,
+    SubroutineFn,
 };
 use super::scan::{ScanType, SimModeScan};
 
@@ -1096,15 +1097,19 @@ impl RecordInstance {
     ///
     /// Everything else (`DBF_DOUBLE`, `DBF_LONG`, `DBF_CHAR`, …) falls to the
     /// device support's `default:` arm.
+    ///
+    /// The question is about the target field's DECLARED class, so it is asked
+    /// of the declaration ([`Self::declared_field_type`]) and not of the
+    /// variant the record stores: C's `switch` is on `dbAddr.field_type`, which
+    /// `dbNameToAddr` took from the `dbFldDes`. `DBF_MENU` and `DBF_DEVICE` both
+    /// map to `DbFieldType::Enum` in the generated tables (`mapDBFToDBR`), and
+    /// the three link classes to `DbFieldType::String`, so the seven C arms are
+    /// exactly these two.
     pub(crate) fn field_puts_as_string(&self, field: &str) -> bool {
-        let Some(value) = self.resolve_field(field) else {
+        let Some(declared) = self.declared_field_type(field) else {
             return false;
         };
-        match value.db_field_type() {
-            DbFieldType::String | DbFieldType::Enum => true,
-            DbFieldType::Short | DbFieldType::UShort => self.menu_choices_for(field).is_some(),
-            _ => false,
-        }
+        matches!(declared, DbFieldType::String | DbFieldType::Enum)
     }
 
     /// The field's value as C `dbGetLink(plink, DBR_STRING, ...)` delivers it —
@@ -1154,49 +1159,112 @@ impl RecordInstance {
         value_as_dbr_string(&value)
     }
 
-    /// Promote a `DBF_MENU` field's value to its `DBR_ENUM` client form: a
-    /// menu index stored as a short becomes [`EpicsValue::Enum`], so the
-    /// wire type a client sees is `DBR_ENUM` (CA) / `NTEnum` (PVA),
-    /// matching C dbStaticLib serving `DBF_MENU` as `DBR_ENUM`. The
-    /// menu index is held internally as `DbFieldType::Short`, so only that
-    /// representation is promoted; a same-named field that is not a menu
-    /// index here (e.g. `scalcout.OSV`, a string) is returned unchanged.
-    /// Idempotent for a value already delivered as `Enum` (`.SCAN`/`SSCN`,
-    /// the record-specific `SELM`).
-    fn promote_menu_value(&self, field: &str, value: EpicsValue) -> EpicsValue {
-        if self.menu_choices_for(field).is_some() {
-            if let EpicsValue::Short(idx) = value {
-                return EpicsValue::Enum(idx as u16);
-            }
-        }
-        value
+    /// The field's declaration — its `dbFldDes`, in C's terms.
+    ///
+    /// The `.dbd` is the declaration, so the table generated FROM the `.dbd`
+    /// ([`dbd_generated::record_fields`](super::dbd_generated::record_fields))
+    /// is asked first, for every record type that has one. A record's own
+    /// [`Record::field_list`](super::record_trait::Record::field_list) is a
+    /// hand-written stand-in for that table, and it is consulted only for a
+    /// record type the `.dbd` does not cover (`subArray`, and the record types
+    /// the downstream crates add). It cannot be the primary answer: several of
+    /// those tables are *derived from the record's Rust storage types* — the
+    /// `#[derive(EpicsRecord)]` records type `longin.ADEL` `DBF_DOUBLE`
+    /// because the struct member is an `f64`, where the `.dbd` says
+    /// `DBF_LONG` — and reading the type off the storage is the whole defect
+    /// this owner exists to close.
+    ///
+    /// `dbCommon` last, matching the order [`Self::resolve_field`] reads the
+    /// value in, so a record-specific field always shadows the common one in
+    /// both halves.
+    ///
+    /// `None` for a field with no declaration at all: a virtual field
+    /// (`RTYP`, `TIME`, ...), which C answers from dbStaticLib rather than
+    /// from a `dbFldDes`.
+    pub(crate) fn field_desc(&self, field: &str) -> Option<&'static FieldDesc> {
+        let named = |t: &'static [FieldDesc]| t.iter().find(|f| f.name.eq_ignore_ascii_case(field));
+        super::dbd_generated::record_fields(self.record.record_type())
+            .and_then(named)
+            .or_else(|| named(self.record.field_list()))
+            .or_else(|| named(super::dbd_generated::DB_COMMON_FIELDS))
     }
 
-    /// The client-facing value of `field`: the resolved value with a
-    /// `DBF_MENU` field promoted to its `DBR_ENUM` form (see
-    /// [`Self::promote_menu_value`]), so a wire type derived directly from
-    /// the value matches the GET/MONITOR data. Used by the CA create-
-    /// channel path, which reads the native type from the value rather
-    /// than from [`Self::snapshot_for_field`].
+    /// The `DBF_*` type `field` is SERVED as — the single source of truth for
+    /// the type on the wire, on every delivery path.
+    ///
+    /// This is the field's DECLARED type ([`FieldDesc::dbf_type`], from the
+    /// `.dbd`), not the type of whatever variant the record happens to store.
+    /// C resolves a channel's `field_type` from the `dbFldDes` at
+    /// name-resolution time (`dbChannelCreate` -> `dbNameToAddr`,
+    /// `dbAccess.c:184-205`) and every later `dbGet`/`db_post_events` converts
+    /// the stored bytes to it — the storage is private to the record, the
+    /// declaration is the contract.
+    ///
+    /// Two answers are NOT the declaration:
+    ///
+    /// * a [`FieldDesc::runtime_typed`] field — C's `cvt_dbaddr` overwrites
+    ///   `paddr->field_type` from record state (`FTVL`, `FTA`, `SDEF`), and
+    ///   this port's `cvt_dbaddr` is the variant the record stores;
+    /// * a field with no `FieldDesc` at all (a virtual field).
+    ///
+    /// In both cases the value's own type is the answer, so this returns
+    /// `None` and [`Self::project_to_declared_type`] leaves the value alone.
+    pub fn declared_field_type(&self, field: &str) -> Option<DbFieldType> {
+        let desc = self.field_desc(field)?;
+        (!desc.runtime_typed).then_some(desc.dbf_type)
+    }
+
+    /// Project a field's stored value onto its declared type
+    /// ([`Self::declared_field_type`]) — the single owner of "what type this
+    /// field goes on the wire as", run by the CA create-channel path
+    /// ([`Self::client_field_value`]), the GET path
+    /// ([`Self::snapshot_for_field`]) and the MONITOR path
+    /// ([`Self::make_monitor_snapshot`]), so all three announce and serve the
+    /// same type.
+    ///
+    /// The projection is [`EpicsValue::convert_to`], the one value-coercion
+    /// owner — the same routine `dbGet` converts through. Never re-derive a
+    /// conversion here: C picks its routine from BOTH the source and the
+    /// destination type, and only `convert_to` knows that table.
+    ///
+    /// Idempotent: a value already of its declared type is short-circuited by
+    /// `convert_to`, and re-projecting a projected value is a no-op. That is
+    /// what lets the CA path derive the native type from the value it is about
+    /// to serve.
+    pub fn project_to_declared_type(&self, field: &str, value: EpicsValue) -> EpicsValue {
+        match self.declared_field_type(field) {
+            Some(declared) => value.convert_to(declared),
+            None => value,
+        }
+    }
+
+    /// The client-facing value of `field`: the resolved value projected onto
+    /// the field's declared type ([`Self::project_to_declared_type`]), so a
+    /// native type derived from the value — which is what the CA
+    /// create-channel path does — is the DECLARED type, and matches the
+    /// GET/MONITOR data byte for byte.
     pub fn client_field_value(&self, field: &str) -> Option<EpicsValue> {
         let value = self.resolve_field(field)?;
-        Some(self.promote_menu_value(field, value))
+        Some(self.project_to_declared_type(field, value))
     }
 
-    /// Attach the `DBF_MENU` → `DBR_ENUM` representation to a built
-    /// snapshot: promote the value to [`EpicsValue::Enum`] and attach the
-    /// menu's `menu()` choice labels so the CA/PVA enum encoders present
-    /// them. The single owner of "menu field -> (enum value, choice
-    /// table)" for both the GET ([`Self::snapshot_for_field`]) and MONITOR
-    /// ([`Self::make_monitor_snapshot`]) snapshot builders, so the wire
-    /// form is identical on every delivery path. A same-named non-menu
-    /// field (whose value is not a menu index) keeps its plain value and
-    /// gets no choice table.
+    /// Attach a `DBF_MENU` field's `menu()` choice labels to a built snapshot,
+    /// so the CA/PVA enum encoders present `"NO CONVERSION"` rather than `0`.
+    ///
+    /// The VALUE half of the `DBF_MENU` -> `DBR_ENUM` mapping is not here: the
+    /// `.dbd` declares a menu field `DBF_MENU`, the generator types that
+    /// `DbFieldType::Enum` (`mapDBFToDBR`), and
+    /// [`Self::project_to_declared_type`] — which every delivery path runs —
+    /// makes the served value an [`EpicsValue::Enum`] on that declaration
+    /// alone. So the label table is all that is left to attach, and it is
+    /// attached exactly when the served value came out an enum. A same-named
+    /// field that is NOT a menu index (`scalcout.OSV`, declared `DBF_STRING`,
+    /// shares a name with the alarm-severity menu) is served as its own
+    /// declared string and gets no choice table.
     fn attach_menu_enum(&self, field: &str, snap: &mut super::super::snapshot::Snapshot) {
         let Some(choices) = self.menu_choices_for(field) else {
             return;
         };
-        snap.value = self.promote_menu_value(field, snap.value.clone());
         if matches!(snap.value, EpicsValue::Enum(_)) {
             snap.enums = Some(super::super::snapshot::EnumInfo {
                 strings: choices.iter().map(|s| PvString::from(*s)).collect(),
@@ -1206,7 +1274,10 @@ impl RecordInstance {
 
     /// Build a Snapshot with full metadata for the given field.
     pub fn snapshot_for_field(&self, field: &str) -> Option<super::super::snapshot::Snapshot> {
-        let value = self.resolve_field(field)?;
+        // The GET path serves the field at its DECLARED type, the same type
+        // the CA create-channel path announced from `client_field_value` and
+        // the same one the monitor path posts.
+        let value = self.client_field_value(field)?;
         let mut snap = super::super::snapshot::Snapshot::new(
             value,
             self.common.stat,
@@ -3664,11 +3735,17 @@ impl RecordInstance {
     /// Build a Snapshot for a given value, populated with the record's display metadata.
     /// Uses the metadata cache so the populate cost is paid at most once
     /// per metadata-stable interval (cf. `cached_metadata`).
-    fn make_monitor_snapshot(
+    pub fn make_monitor_snapshot(
         &self,
         field: &str,
         value: EpicsValue,
     ) -> super::super::snapshot::Snapshot {
+        // A monitor update is posted from the record's own change-detection
+        // loop, which hands over the STORED variant. Project it onto the
+        // field's declared type here, at the same owner the GET path and the
+        // CA create-channel path use, or a client that was told `DBR_ENUM` at
+        // create time would be posted a `DBR_SHORT` update.
+        let value = self.project_to_declared_type(field, value);
         let mut snap = super::super::snapshot::Snapshot::new(
             value,
             self.common.stat,

@@ -1,5 +1,6 @@
 use std::time::Instant;
 
+use super::dbd_generated;
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::database::AsyncDbHandle;
 use epics_base_rs::server::record::{
@@ -8,18 +9,7 @@ use epics_base_rs::server::record::{
 use epics_base_rs::server::records::link_status::{
     LINK_CON, LINK_EXT_NC, LinkRole, LinkStatusGen, classify_link,
 };
-use epics_base_rs::types::{DbFieldType, EpicsValue};
-
-/// Record-specific `DBF_MENU` choice tables, in `.dbd` value order (the
-/// index↔string mapping is wire-visible to clients). Source: the C
-/// `throttleRecord.dbd` menu definitions (std module). `OV`/`SIV` share
-/// `menu(throttleOV)`.
-const THROTTLE_WAIT_CHOICES: &[&str] = &["False", "True"];
-const THROTTLE_DRVLC_CHOICES: &[&str] = &["Off", "On"];
-const THROTTLE_DRVLS_CHOICES: &[&str] = &["Normal", "Low Limit", "High Limit"];
-const THROTTLE_STS_CHOICES: &[&str] = &["Unknown", "Error", "Success"];
-const THROTTLE_OV_CHOICES: &[&str] = &["Ext PV NC", "Ext PV OK", "Local PV", "Constant"];
-const THROTTLE_SYNC_CHOICES: &[&str] = &["Idle", "Process"];
+use epics_base_rs::types::EpicsValue;
 
 // `menu(throttleSTS)` indices (throttleRecord.dbd) — STS is set only by a
 // real link operation (`valuePut`/`valueSync`), never by the limit block.
@@ -363,30 +353,6 @@ impl ThrottleRecord {
         }
     }
 }
-
-static FIELDS: &[FieldDesc] = &[
-    FieldDesc::new("VAL", DbFieldType::Double, false),
-    FieldDesc::new("OVAL", DbFieldType::Double, true),
-    FieldDesc::new("SENT", DbFieldType::Double, true),
-    FieldDesc::new("OSENT", DbFieldType::Double, true),
-    FieldDesc::new("WAIT", DbFieldType::Enum, true),
-    FieldDesc::new("HOPR", DbFieldType::Double, false),
-    FieldDesc::new("LOPR", DbFieldType::Double, false),
-    FieldDesc::new("DRVLH", DbFieldType::Double, false),
-    FieldDesc::new("DRVLL", DbFieldType::Double, false),
-    FieldDesc::new("DRVLS", DbFieldType::Enum, true),
-    FieldDesc::new("DRVLC", DbFieldType::Enum, false),
-    FieldDesc::new("VER", DbFieldType::String, true),
-    FieldDesc::new("STS", DbFieldType::Enum, true),
-    FieldDesc::new("PREC", DbFieldType::Short, false),
-    FieldDesc::new("DPREC", DbFieldType::Short, false),
-    FieldDesc::new("DLY", DbFieldType::Double, false),
-    FieldDesc::new("OUT", DbFieldType::String, false),
-    FieldDesc::new("OV", DbFieldType::Short, true),
-    FieldDesc::new("SINP", DbFieldType::String, false),
-    FieldDesc::new("SIV", DbFieldType::Enum, true),
-    FieldDesc::new("SYNC", DbFieldType::Enum, false),
-];
 
 impl Record for ThrottleRecord {
     fn record_type(&self) -> &'static str {
@@ -780,25 +746,8 @@ impl Record for ThrottleRecord {
         }
     }
 
-    fn hand_field_list(&self) -> &'static [FieldDesc] {
-        FIELDS
-    }
-
-    /// Record-specific `DBF_MENU` fields, served as `DBR_ENUM` with the
-    /// menu's choice labels in `.dbd` index order (C `throttleRecord.dbd`):
-    /// `WAIT`=`throttleWAIT`, `DRVLC`=`throttleDRVLC`,
-    /// `DRVLS`=`throttleDRVLS`, `STS`=`throttleSTS`,
-    /// `OV`/`SIV`=`throttleOV`, `SYNC`=`throttleSYNC`.
-    fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
-        match field {
-            "WAIT" => Some(THROTTLE_WAIT_CHOICES),
-            "DRVLC" => Some(THROTTLE_DRVLC_CHOICES),
-            "DRVLS" => Some(THROTTLE_DRVLS_CHOICES),
-            "STS" => Some(THROTTLE_STS_CHOICES),
-            "OV" | "SIV" => Some(THROTTLE_OV_CHOICES),
-            "SYNC" => Some(THROTTLE_SYNC_CHOICES),
-            _ => None,
-        }
+    fn declared_fields(&self) -> &'static [FieldDesc] {
+        dbd_generated::THROTTLE_FIELDS
     }
 
     /// C `throttleRecord.c:308` keeps `recGblFwdLink(prec)` commented
@@ -875,31 +824,34 @@ impl Record for ThrottleRecord {
 #[cfg(test)]
 mod menu_choice_tests {
     use super::ThrottleRecord;
-    use epics_base_rs::server::record::Record;
+    use epics_base_rs::server::record::FieldDeclaration;
 
-    // Choice tables must match throttleRecord.dbd menu value order — the
-    // index↔string mapping is wire-visible to clients.
+    /// The choices a client sees are the DECLARATION's — `throttleRecord.dbd`'s
+    /// `menu()` on each field — and the index↔string mapping is wire-visible.
+    /// This used to assert them through `Record::menu_field_choices`, a hand
+    /// written table that declared the same menus a second time.
     #[test]
-    fn throttle_menu_field_choices_match_dbd() {
+    fn throttle_menu_choices_come_from_the_declaration() {
         let rec = ThrottleRecord::default();
-        assert_eq!(rec.menu_field_choices("WAIT"), Some(&["False", "True"][..]));
-        assert_eq!(rec.menu_field_choices("DRVLC"), Some(&["Off", "On"][..]));
+        let menu = |name: &str| {
+            rec.field_list()
+                .iter()
+                .find(|f| f.name == name)
+                .unwrap_or_else(|| panic!("{name} is declared"))
+                .menu
+        };
+        assert_eq!(menu("WAIT"), Some(&["False", "True"][..]));
+        assert_eq!(menu("DRVLC"), Some(&["Off", "On"][..]));
         assert_eq!(
-            rec.menu_field_choices("DRVLS"),
+            menu("DRVLS"),
             Some(&["Normal", "Low Limit", "High Limit"][..])
         );
-        assert_eq!(
-            rec.menu_field_choices("STS"),
-            Some(&["Unknown", "Error", "Success"][..])
-        );
+        assert_eq!(menu("STS"), Some(&["Unknown", "Error", "Success"][..]));
         // OV and SIV share menu(throttleOV).
         let ov = &["Ext PV NC", "Ext PV OK", "Local PV", "Constant"][..];
-        assert_eq!(rec.menu_field_choices("OV"), Some(ov));
-        assert_eq!(rec.menu_field_choices("SIV"), Some(ov));
-        assert_eq!(
-            rec.menu_field_choices("SYNC"),
-            Some(&["Idle", "Process"][..])
-        );
-        assert_eq!(rec.menu_field_choices("VAL"), None);
+        assert_eq!(menu("OV"), Some(ov));
+        assert_eq!(menu("SIV"), Some(ov));
+        assert_eq!(menu("SYNC"), Some(&["Idle", "Process"][..]));
+        assert_eq!(menu("VAL"), None);
     }
 }

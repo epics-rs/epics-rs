@@ -1,0 +1,161 @@
+menu(throttleWAIT) {
+        choice(throttleWAIT_FALSE,"False")
+        choice(throttleWAIT_TRUE,"True")
+}
+menu(throttleDRVLS) {
+        choice(throttleDRVLS_NORM,"Normal")
+        choice(throttleDRVLS_LOW,"Low Limit")
+        choice(throttleDRVLS_HIGH,"High Limit")
+}
+menu(throttleSTS) {
+        choice(throttleSTS_UNK,"Unknown")
+        choice(throttleSTS_ERR,"Error")
+        choice(throttleSTS_SUC,"Success")
+}
+menu(throttleOV) {
+        choice(throttleOV_EXT_NC,"Ext PV NC")
+        choice(throttleOV_EXT,"Ext PV OK")
+        choice(throttleOV_LOC,"Local PV")
+        choice(throttleOV_CON,"Constant")
+}
+menu(throttleDRVLC) {
+        choice(throttleDRVLC_OFF,"Off")
+        choice(throttleDRVLC_ON,"On")
+}
+menu(throttleSYNC) {
+        choice(throttleSYNC_IDLE,"Idle")
+        choice(throttleSYNC_PROC,"Process")
+}
+recordtype(throttle) {
+        include "dbCommon.dbd" 
+        field(VAL,DBF_DOUBLE   ) {
+                prompt("Set Value")
+                pp(TRUE)
+        }
+        field(OVAL,DBF_DOUBLE) {
+                prompt("Previous Set Value")
+                special(SPC_NOMOD)
+                interest(3)
+        }
+        field(SENT,DBF_DOUBLE) {
+                prompt("Sent Value")
+                special(SPC_NOMOD)
+        }
+        field(OSENT,DBF_DOUBLE) {
+                prompt("Previous Sent Value")
+                special(SPC_NOMOD)
+        }
+
+        field(WAIT,DBF_MENU) {
+		prompt("Busy")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(throttleWAIT)
+		initial("0")
+        }
+
+	field(HOPR,DBF_DOUBLE) {
+		prompt("High Operating Range")
+		promptgroup(GUI_DISPLAY)
+		interest(1)
+	}
+	field(LOPR,DBF_DOUBLE) {
+		prompt("Low Operating Range")
+		promptgroup(GUI_DISPLAY)
+		interest(1)
+	}
+        field(DRVLH,DBF_DOUBLE) {
+                prompt("High Limit")
+                special(SPC_MOD)
+                initial("0.0")
+        }
+        field(DRVLL,DBF_DOUBLE) {
+                prompt("Low Limit")
+                special(SPC_MOD)
+                initial("0.0")
+        }
+        field(DRVLS,DBF_MENU) {
+		prompt("Limit Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(throttleDRVLS)
+		initial("0")
+        }
+        field(DRVLC,DBF_MENU) {
+		prompt("Limit Clipping")
+		menu(throttleDRVLC)
+		initial("0")
+        }
+
+        field(VER,DBF_STRING) {
+                prompt("Code Version")
+                special(SPC_NOMOD)
+                size(20)
+                initial("")
+        }
+        field(RPVT,DBF_NOACCESS) {
+                prompt("Record Private")
+                special(SPC_NOMOD)
+                interest(4)
+                extra("void *rpvt")
+        }
+
+        field(STS,DBF_MENU) {
+                prompt("Record Status")
+                special(SPC_NOMOD)
+                interest(1)
+                menu(throttleSTS)
+                initial("0")
+        }
+        field(PREC,DBF_SHORT) {
+                prompt("Display Precision")
+                promptgroup(GUI_DISPLAY)
+                interest(1)
+        }
+        field(DPREC,DBF_SHORT) {
+                prompt("Delay Display Precision")
+                promptgroup(GUI_DISPLAY)
+                interest(1)
+        }
+
+
+        field(DLY,DBF_DOUBLE) {
+                prompt("Delay value")
+		special(SPC_MOD)
+                initial("0.0")
+        }
+
+	field(OUT,DBF_OUTLINK) {
+		prompt("Output")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		interest(1)
+	}
+	field(OV,DBF_MENU) {
+		prompt("Output link valid")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(throttleOV)
+		initial("1")
+	}
+	field(SINP,DBF_INLINK) {
+		prompt("Sync Input")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		interest(1)
+	}
+	field(SIV,DBF_MENU) {
+		prompt("Sync Input link valid")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(throttleOV)
+		initial("1")
+	}
+	field(SYNC,DBF_MENU) {
+		prompt("Sync values")
+		special(SPC_MOD)
+		menu(throttleSYNC)
+		initial("Idle")
+	}
+
+}

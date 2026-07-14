@@ -2,27 +2,10 @@ use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::record::{
     EPICS_TIME_EVENT_DEVICE_TIME, FieldDesc, ProcessContext, ProcessOutcome, Record, ValuePostGate,
 };
-use epics_base_rs::types::{DbFieldType, EpicsValue, PvString};
+use epics_base_rs::types::{EpicsValue, PvString};
 
+use super::dbd_generated;
 use chrono::{Local, TimeZone};
-
-/// Choice labels for the timestamp string-format menu, in index order.
-/// C `menu(timestampTST)` (std `timestampRecord.dbd`): `TST` selects which
-/// of these `strftime`-style formats `VAL` is rendered with. The
-/// index↔string mapping is wire-visible to clients.
-const TIMESTAMP_TST_CHOICES: &[&str] = &[
-    "YY/MM/DD HH:MM:SS",
-    "MM/DD/YY HH:MM:SS",
-    "Mon DD HH:MM:SS YY",
-    "Mon DD HH:MM:SS",
-    "HH:MM:SS",
-    "HH:MM",
-    "DD/MM/YY HH:MM:SS",
-    "DD Mon HH:MM:SS YY",
-    "DD-Mon-YYYY HH:MM:SS",
-    "Mon DD, YYYY HH:MM:SS.ns",
-    "MM/DD/YY HH:MM:SS.ns",
-];
 
 /// EPICS epoch: 1990-01-01 00:00:00 UTC
 const EPICS_EPOCH_OFFSET: i64 = 631152000;
@@ -65,7 +48,11 @@ pub struct TimestampRecord {
     /// Seconds past EPICS epoch (RVAL). DBF_ULONG in C; the Rust value
     /// model has no unsigned-32 scalar, so this follows the project
     /// convention of mapping DBF_ULONG to `i32`/`EpicsValue::Long`.
-    pub rval: i32,
+    /// `field(RVAL,DBF_ULONG)` (`timestampRecord.dbd:28`) — C
+    /// `ptimestamp->rval = ptimestamp->time.secPastEpoch` (`timestampRecord.c:94`),
+    /// and `secPastEpoch` is an `epicsUInt32`. Stored `i32` and served
+    /// `EpicsValue::Long` while the port hand-wrote its own field table.
+    pub rval: u32,
     /// Timestamp format selector (TST), a DBF_MENU. Values `0..=10`
     /// select an explicit format; any other value is rendered with
     /// format 0 (C `switch` `default:` branch).
@@ -99,15 +86,8 @@ impl Default for TimestampRecord {
     }
 }
 
-static FIELDS: &[FieldDesc] = &[
-    FieldDesc::new("VAL", DbFieldType::String, false),
-    FieldDesc::new("OVAL", DbFieldType::String, true),
-    FieldDesc::new("RVAL", DbFieldType::Long, false),
-    FieldDesc::new("TST", DbFieldType::Enum, false),
-];
-
 impl TimestampRecord {
-    fn format_timestamp(&self) -> (PvString, i32) {
+    fn format_timestamp(&self) -> (PvString, u32) {
         // C `timestampRecord.c:90-93`: `tse == epicsTimeEventDeviceTime`
         // takes the raw OS clock via `epicsTimeFromTime_t(&time, time(0))`
         // — whole seconds only, the nanosecond field is zero. Any other
@@ -129,7 +109,7 @@ impl TimestampRecord {
             Local::now()
         };
         let unix_secs = now.timestamp();
-        let sec_past_epoch = (unix_secs - EPICS_EPOCH_OFFSET) as i32;
+        let sec_past_epoch = (unix_secs - EPICS_EPOCH_OFFSET) as u32;
 
         // C `timestampRecord.c:96`: `if (time.secPastEpoch == 0)` — the
         // "-NULL-" sentinel is emitted only when the EPICS-epoch second
@@ -237,7 +217,7 @@ impl Record for TimestampRecord {
         match name {
             "VAL" => Some(EpicsValue::String(self.val.clone())),
             "OVAL" => Some(EpicsValue::String(self.oval.clone())),
-            "RVAL" => Some(EpicsValue::Long(self.rval)),
+            "RVAL" => Some(EpicsValue::ULong(self.rval)),
             "TST" => Some(EpicsValue::Short(self.tst)),
             _ => None,
         }
@@ -255,7 +235,7 @@ impl Record for TimestampRecord {
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
             "RVAL" => match value {
-                EpicsValue::Long(v) => {
+                EpicsValue::ULong(v) => {
                     self.rval = v;
                     Ok(())
                 }
@@ -279,17 +259,8 @@ impl Record for TimestampRecord {
         }
     }
 
-    fn hand_field_list(&self) -> &'static [FieldDesc] {
-        FIELDS
-    }
-
-    /// `TST` is `DBF_MENU menu(timestampTST)` (std `timestampRecord.dbd`);
-    /// served as `DBR_ENUM` with the format-string choice labels.
-    fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
-        match field {
-            "TST" => Some(TIMESTAMP_TST_CHOICES),
-            _ => None,
-        }
+    fn declared_fields(&self) -> &'static [FieldDesc] {
+        dbd_generated::TIMESTAMP_FIELDS
     }
 
     /// C `timestampRecord.c:90` reads `ptimestamp->tse`. The framework
@@ -382,7 +353,8 @@ mod subsec_round_tests {
 
 #[cfg(test)]
 mod menu_choice_tests {
-    use super::{TIMESTAMP_TST_CHOICES, TimestampRecord};
+    use super::{TimestampRecord, dbd_generated};
+    use epics_base_rs::server::record::FieldDeclaration;
     use epics_base_rs::server::record::{Record, RecordInstance};
     use epics_base_rs::types::EpicsValue;
 
@@ -401,11 +373,26 @@ mod menu_choice_tests {
         assert_eq!(strings[4], "HH:MM:SS");
     }
 
+    /// The choices are the DECLARATION's, not a record hook's: `TST` is
+    /// `DBF_MENU menu(timestampTST)` in `timestampRecord.dbd`, so its
+    /// `FieldDesc` carries the choices and every consumer reads them from
+    /// there. This used to assert a hand-written `TIMESTAMP_TST_CHOICES` that
+    /// `menu_field_choices` returned — a second declaration of the same menu.
     #[test]
-    fn timestamp_menu_field_choices_match_dbd() {
+    fn timestamp_tst_choices_come_from_the_declaration() {
         let rec = TimestampRecord::default();
-        assert_eq!(rec.menu_field_choices("TST"), Some(TIMESTAMP_TST_CHOICES));
-        assert_eq!(rec.menu_field_choices("VAL"), None);
+        let tst = rec
+            .field_list()
+            .iter()
+            .find(|f| f.name == "TST")
+            .expect("TST is declared");
+        assert_eq!(tst.menu, Some(dbd_generated::MENU_TIMESTAMP_TST));
+        let val = rec
+            .field_list()
+            .iter()
+            .find(|f| f.name == "VAL")
+            .expect("VAL is declared");
+        assert_eq!(val.menu, None);
     }
 
     // C `timestampRecord.c:152-163`: `monitor()` posts VAL (and RVAL)

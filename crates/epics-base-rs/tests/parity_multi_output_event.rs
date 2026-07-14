@@ -363,7 +363,7 @@ impl Record for CountingTarget {
             _ => Err(CaError::FieldNotFound(name.into())),
         }
     }
-    fn hand_field_list(&self) -> &'static [FieldDesc] {
+    fn declared_fields(&self) -> &'static [FieldDesc] {
         &[]
     }
 }

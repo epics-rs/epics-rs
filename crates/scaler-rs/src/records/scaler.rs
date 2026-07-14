@@ -1,23 +1,14 @@
 use std::any::Any;
+use std::sync::LazyLock;
 use std::time::Instant;
 
+use super::dbd_generated;
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::record::{FieldDesc, ProcessAction, ProcessOutcome, Record};
-use epics_base_rs::types::{DbFieldType, EpicsValue, PvString};
+use epics_base_rs::types::{EpicsValue, PvString};
 
 /// Maximum number of scaler channels.
 pub const MAX_SCALER_CHANNELS: usize = 64;
-
-/// Record-specific `DBF_MENU` choice tables, in `.dbd` value order (the
-/// index↔string mapping is wire-visible to clients). Source: the C
-/// `scalerRecord.dbd` menu definitions (scaler module). `CNT`/`PCNT` share
-/// `menu(scalerCNT)`; `CONT` is `menu(scalerCONT)`.
-const SCALER_CNT_CHOICES: &[&str] = &["Done", "Count"];
-const SCALER_CONT_CHOICES: &[&str] = &["OneShot", "AutoCount"];
-/// `D1`..`D64` count direction — `menu(scalerD1)` (`scalerRecord.dbd:9-12`).
-const SCALER_D_CHOICES: &[&str] = &["Up", "Dn"];
-/// `G1`..`G64` gate/preset enable — `menu(scalerG1)` (`scalerRecord.dbd:13-16`).
-const SCALER_G_CHOICES: &[&str] = &["N", "Y"];
 
 const VERSION: f32 = 3.19;
 
@@ -528,65 +519,6 @@ impl ScalerRecord {
         actions
     }
 }
-
-// Full FIELDS including indexed fields
-use std::sync::LazyLock;
-
-static ALL_FIELDS: LazyLock<Vec<FieldDesc>> = LazyLock::new(|| {
-    let mut fields = vec![
-        FieldDesc::new("VAL", DbFieldType::Double, false),
-        FieldDesc::new("FREQ", DbFieldType::Double, false),
-        FieldDesc::new("CNT", DbFieldType::Enum, false),
-        FieldDesc::new("PCNT", DbFieldType::Enum, true),
-        FieldDesc::new("SS", DbFieldType::Short, true),
-        FieldDesc::new("US", DbFieldType::Short, true),
-        FieldDesc::new("CONT", DbFieldType::Enum, false),
-        FieldDesc::new("RATE", DbFieldType::Float, false),
-        FieldDesc::new("RAT1", DbFieldType::Float, false),
-        FieldDesc::new("DLY", DbFieldType::Float, false),
-        FieldDesc::new("DLY1", DbFieldType::Float, false),
-        FieldDesc::new("NCH", DbFieldType::Short, true),
-        FieldDesc::new("TP", DbFieldType::Double, false),
-        FieldDesc::new("TP1", DbFieldType::Double, false),
-        FieldDesc::new("T", DbFieldType::Double, true),
-        FieldDesc::new("VERS", DbFieldType::Float, true),
-        FieldDesc::new("PREC", DbFieldType::Short, false),
-        FieldDesc::new("EGU", DbFieldType::String, false),
-        FieldDesc::new("OUT", DbFieldType::String, false),
-        FieldDesc::new("COUT", DbFieldType::String, false),
-        FieldDesc::new("COUTP", DbFieldType::String, false),
-    ];
-    for i in 1..=MAX_SCALER_CHANNELS {
-        let s: &'static str = Box::leak(format!("S{}", i).into_boxed_str());
-        // S1..S64 are DBF_ULONG (scalerRecord.dbd:1334-1649) — 32-bit
-        // unsigned hardware counts; storage is already u32.
-        fields.push(FieldDesc::new(s, DbFieldType::ULong, true));
-    }
-    for i in 1..=MAX_SCALER_CHANNELS {
-        let pr: &'static str = Box::leak(format!("PR{}", i).into_boxed_str());
-        // PR1..PR64 are DBF_ULONG (scalerRecord.dbd:945-1323).
-        fields.push(FieldDesc::new(pr, DbFieldType::ULong, false));
-    }
-    // G1..G64 (`menu(scalerG)`, N/Y) and D1..D64 (`menu(scalerD)`) are
-    // DBF_MENU, which is served as DBR_ENUM with those labels — the index is
-    // stored as a short, but the DECLARED type is what goes on the wire
-    // (`RecordInstance::declared_field_type`). Declaring them Short here made
-    // the declaration contradict `menu_field_choices`, which answers for
-    // exactly these fields.
-    for i in 1..=MAX_SCALER_CHANNELS {
-        let g: &'static str = Box::leak(format!("G{}", i).into_boxed_str());
-        fields.push(FieldDesc::new(g, DbFieldType::Enum, false));
-    }
-    for i in 1..=MAX_SCALER_CHANNELS {
-        let d: &'static str = Box::leak(format!("D{}", i).into_boxed_str());
-        fields.push(FieldDesc::new(d, DbFieldType::Enum, false));
-    }
-    for i in 1..=MAX_SCALER_CHANNELS {
-        let nm: &'static str = Box::leak(format!("NM{}", i).into_boxed_str());
-        fields.push(FieldDesc::new(nm, DbFieldType::String, false));
-    }
-    fields
-});
 
 /// `S1..S{MAX_SCALER_CHANNELS}` field names, in channel order, for
 /// [`ScalerRecord::log_swept_fields`]. C `scalerRecord.c:770-787`
@@ -1273,9 +1205,8 @@ impl Record for ScalerRecord {
         }
     }
 
-    fn hand_field_list(&self) -> &'static [FieldDesc] {
-        let fields: &Vec<FieldDesc> = &ALL_FIELDS;
-        unsafe { std::slice::from_raw_parts(fields.as_ptr(), fields.len()) }
+    fn declared_fields(&self) -> &'static [FieldDesc] {
+        dbd_generated::SCALER_FIELDS
     }
 
     /// C `scalerRecord.c:471,770-787`: `process()` calls `monitor()` only
@@ -1362,23 +1293,6 @@ impl Record for ScalerRecord {
         self.side_effect_posts
     }
 
-    /// `CNT`/`PCNT` are `DBF_MENU menu(scalerCNT)`; `CONT` is
-    /// `menu(scalerCONT)`; `D1`..`D64` are `menu(scalerD1)` (Up/Dn) and
-    /// `G1`..`G64` are `menu(scalerG1)` (N/Y) (C `scalerRecord.dbd`). Served
-    /// as `DBR_ENUM` with the menu's choice labels in `.dbd` index order.
-    fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
-        match field {
-            "CNT" | "PCNT" => Some(SCALER_CNT_CHOICES),
-            "CONT" => Some(SCALER_CONT_CHOICES),
-            // D{n}/G{n} are indexed menu fields; reuse the same 1..=64
-            // index parser the get/put paths use so "DLY"/"DLY1" (which
-            // start with 'D' but are not indexed) do not falsely match.
-            _ if parse_indexed_field(field, "D").is_some() => Some(SCALER_D_CHOICES),
-            _ if parse_indexed_field(field, "G").is_some() => Some(SCALER_G_CHOICES),
-            _ => None,
-        }
-    }
-
     fn as_any_mut(&mut self) -> Option<&mut dyn Any> {
         Some(self)
     }
@@ -1428,39 +1342,61 @@ mod menu_choice_tests {
         );
     }
 
+    /// The choices a client sees are the DECLARATION's — `scalerRecord.dbd`'s
+    /// `menu()` on each field. This used to assert them through
+    /// `Record::menu_field_choices`, a hand-written table that declared the
+    /// same menus a second time.
     #[test]
-    fn scaler_menu_field_choices_match_dbd() {
+    fn scaler_menu_choices_come_from_the_declaration() {
+        use epics_base_rs::server::record::FieldDeclaration;
         let rec = ScalerRecord::default();
-        assert_eq!(rec.menu_field_choices("CNT"), Some(&["Done", "Count"][..]));
-        assert_eq!(rec.menu_field_choices("PCNT"), Some(&["Done", "Count"][..]));
-        assert_eq!(rec.menu_field_choices("VAL"), None);
+        let menu = |name: &str| {
+            rec.field_list()
+                .iter()
+                .find(|f| f.name == name)
+                .unwrap_or_else(|| panic!("{name} is declared"))
+                .menu
+        };
+        assert_eq!(menu("CNT"), Some(&["Done", "Count"][..]));
+        assert_eq!(menu("PCNT"), Some(&["Done", "Count"][..]));
+        assert_eq!(menu("VAL"), None);
     }
 
-    // D1..D64 are menu(scalerD1) (Up/Dn); G1..G64 are menu(scalerG1) (N/Y).
-    // The whole indexed range must resolve, while the 'D'-prefixed non-menu
-    // fields DLY/DLY1 must NOT falsely match the direction menu.
+    /// `D1..D64` are `menu(scalerD1)` (Up/Dn) and `G1..G64` are `menu(scalerG1)`
+    /// (N/Y) — declared field by field in the `.dbd`, so the whole indexed range
+    /// carries its menu and the `D`-prefixed non-menu fields (`DLY`, `DLY1`)
+    /// cannot falsely match: they are separate declarations, not a prefix rule.
+    /// The hand-written table resolved these by parsing the field NAME, which is
+    /// why it needed a guard against `DLY`/`DLY1` at all.
     #[test]
-    fn scaler_direction_gate_menu_choices_match_dbd() {
+    fn scaler_indexed_menu_choices_come_from_the_declaration() {
+        use epics_base_rs::server::record::FieldDeclaration;
         let rec = ScalerRecord::default();
+        let menu = |name: &str| {
+            rec.field_list()
+                .iter()
+                .find(|f| f.name == name)
+                .map(|f| f.menu)
+        };
         for i in 1..=super::MAX_SCALER_CHANNELS {
             assert_eq!(
-                rec.menu_field_choices(&format!("D{i}")),
-                Some(&["Up", "Dn"][..]),
+                menu(&format!("D{i}")),
+                Some(Some(&["Up", "Dn"][..])),
                 "D{i} must serve menu(scalerD1)"
             );
             assert_eq!(
-                rec.menu_field_choices(&format!("G{i}")),
-                Some(&["N", "Y"][..]),
+                menu(&format!("G{i}")),
+                Some(Some(&["N", "Y"][..])),
                 "G{i} must serve menu(scalerG1)"
             );
         }
-        // 'D'-prefixed non-indexed fields are not direction menus.
-        assert_eq!(rec.menu_field_choices("DLY"), None);
-        assert_eq!(rec.menu_field_choices("DLY1"), None);
-        // Out-of-range indices do not resolve.
-        assert_eq!(rec.menu_field_choices("D0"), None);
-        assert_eq!(rec.menu_field_choices("D65"), None);
-        assert_eq!(rec.menu_field_choices("G65"), None);
+        // 'D'-prefixed non-indexed fields are declared, and carry no menu.
+        assert_eq!(menu("DLY"), Some(None));
+        assert_eq!(menu("DLY1"), Some(None));
+        // Out-of-range indices are not fields at all.
+        assert_eq!(menu("D0"), None);
+        assert_eq!(menu("D65"), None);
+        assert_eq!(menu("G65"), None);
     }
 
     // A G{n} field served as Short is promoted to DBR_ENUM by the base

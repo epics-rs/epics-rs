@@ -914,10 +914,12 @@ pub enum InputFetchPolicy {
 /// type therefore cannot *supply* a field list — it can only be *asked* for
 /// one, and the answer is resolved here:
 ///
-/// * a record type the vendored `.dbd` set covers is declared by the table
-///   generated from that `.dbd` ([`dbd_generated::record_fields`]);
-/// * a record type it does not cover falls back to
-///   [`Record::hand_field_list`].
+/// * a record type **base's** vendored `.dbd` set covers is declared by the
+///   table generated from that `.dbd` ([`dbd_generated::record_fields`]);
+/// * any other record type is asked for its own declaration,
+///   [`Record::declared_fields`] — which for the downstream record types is the
+///   table generated from the `.dbd` *their* crate vendors, and for a synthetic
+///   record type (tests) is a hand-written table.
 ///
 /// The two are mutually exclusive by construction, which is what closes the
 /// invariant *one declaration per record type*. It used to be closed by luck:
@@ -934,7 +936,7 @@ pub trait FieldDeclaration {
 impl<R: Record + ?Sized> FieldDeclaration for R {
     fn field_list(&self) -> &'static [FieldDesc] {
         super::dbd_generated::record_fields(self.record_type())
-            .unwrap_or_else(|| self.hand_field_list())
+            .unwrap_or_else(|| self.declared_fields())
     }
 }
 
@@ -976,29 +978,38 @@ pub trait Record: Send + Sync + 'static {
     /// Set a field value by name.
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()>;
 
-    /// The field declaration of a record type whose `.dbd` is **not vendored**.
+    /// The field declaration of a record type **base's** `.dbd` set does not
+    /// cover — a record type that lives in another crate.
     ///
     /// C has exactly one declaration per record type: the `.dbd`, read at
-    /// runtime. The port compiles the vendored `.dbd`s into
-    /// [`dbd_generated`](crate::server::record::dbd_generated), and
-    /// [`FieldDeclaration::field_list`] — the single resolver every consumer
-    /// goes through — serves that table for every record type it covers and
-    /// **never falls through to here**. So for a `.dbd`-covered type this
-    /// method is unreachable: a record cannot declare one of its fields a
-    /// second time, whatever it writes here. That is the structural half of
-    /// "one declaration per record type"; there is no runtime gate to forget.
+    /// runtime. The port compiles the vendored `.dbd`s into a generated table,
+    /// and [`FieldDeclaration::field_list`] — the single resolver every consumer
+    /// goes through — serves base's
+    /// [`dbd_generated`](crate::server::record::dbd_generated) table for every
+    /// record type IT covers and **never falls through to here**. So for a
+    /// base record type this method is unreachable: it cannot declare one of its
+    /// fields a second time, whatever it writes here.
     ///
-    /// A record type the vendored `.dbd` set does NOT cover (the downstream
-    /// Tier-3 crates: `motor`, `table`, `scaler`, `epid`, `throttle`,
-    /// `timestamp`, and the synthetic record types tests define) has no
-    /// generated table, so this hand-written one *is* its declaration. Vendor
-    /// its `.dbd` and this override goes away.
+    /// A record type outside base declares itself here, and the answer is still
+    /// its `.dbd`: the downstream Tier-3 record types (`motor`, `table`,
+    /// `scaler`, `epid`, `throttle`, `timestamp`) vendor their upstream `.dbd`
+    /// into their OWN crate, `tools/dbd-codegen` generates a table into that
+    /// crate (`tools/dbd-codegen/src/targets.rs`), and this method returns it.
+    /// Each such crate carries the same ratchet base does
+    /// (`one_declaration_per_record_type`): the table returned here must BE the
+    /// generated one, so the `.dbd` stays the single declaration across a crate
+    /// boundary the generator's output cannot cross on its own.
+    ///
+    /// A hand-written table is what is left when a record type has no `.dbd`
+    /// anywhere — the synthetic record types the tests define. There are no
+    /// others; a shipped record type has a `.dbd`, and its declaration is that
+    /// `.dbd`.
     ///
     /// The declaration is a *spec*: it says what each field's type, menu and
     /// `special(SPC_NOMOD)` are. It does NOT say who implements the field. Ask
     /// [`Record::implements_field`] for that — see its docs for why the two
     /// must not be the same question.
-    fn hand_field_list(&self) -> &'static [FieldDesc] {
+    fn declared_fields(&self) -> &'static [FieldDesc] {
         &[]
     }
 

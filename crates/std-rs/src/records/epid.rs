@@ -1,13 +1,14 @@
 use std::any::Any;
 use std::time::Instant;
 
+use super::dbd_generated;
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::recgbl::{self, alarm_status};
 use epics_base_rs::server::record::{
-    AlarmSeverity, CommonFields, FieldDesc, LinkType, MENU_OMSL, ProcessAction, ProcessContext,
+    AlarmSeverity, CommonFields, FieldDesc, LinkType, ProcessAction, ProcessContext,
     ProcessOutcome, Record, link_field_type,
 };
-use epics_base_rs::types::{DbFieldType, EpicsValue, PvString};
+use epics_base_rs::types::{EpicsValue, PvString};
 
 /// Record-specific `DBF_MENU` choice tables, in `.dbd` value order (the
 /// index↔string mapping is wire-visible to clients). Source: the C
@@ -18,9 +19,6 @@ use epics_base_rs::types::{DbFieldType, EpicsValue, PvString};
 /// but its field *name* is record-specific — the base registry keys the
 /// shared `menuOmsl` table by the standard name `OMSL` — so it is mapped
 /// per record to [`MENU_OMSL`].
-const EPID_FMOD_CHOICES: &[&str] = &["PID", "Max/Min"];
-const EPID_FBSTATE_CHOICES: &[&str] = &["Off", "On"];
-
 /// `ReadDbLink` target for the bumpless-transfer OUTL readback.
 ///
 /// Deliberately NOT a `.dbd` field: it names the internal staging cell
@@ -486,62 +484,6 @@ impl EpidRecord {
         // `cvlp`/...), not the MLST/ALST deadband state.
     }
 }
-
-static FIELDS: &[FieldDesc] = &[
-    // PID control
-    FieldDesc::new("VAL", DbFieldType::Double, false),
-    FieldDesc::new("SMSL", DbFieldType::Enum, false),
-    FieldDesc::new("STPL", DbFieldType::String, false),
-    FieldDesc::new("INP", DbFieldType::String, false),
-    FieldDesc::new("OUTL", DbFieldType::String, false),
-    FieldDesc::new("TRIG", DbFieldType::String, false),
-    FieldDesc::new("TVAL", DbFieldType::Double, false),
-    FieldDesc::new("CVAL", DbFieldType::Double, true),
-    FieldDesc::new("CVLP", DbFieldType::Double, true),
-    FieldDesc::new("OVAL", DbFieldType::Double, true),
-    FieldDesc::new("OVLP", DbFieldType::Double, true),
-    FieldDesc::new("KP", DbFieldType::Double, false),
-    FieldDesc::new("KI", DbFieldType::Double, false),
-    FieldDesc::new("KD", DbFieldType::Double, false),
-    FieldDesc::new("P", DbFieldType::Double, true),
-    FieldDesc::new("PP", DbFieldType::Double, true),
-    FieldDesc::new("I", DbFieldType::Double, false),
-    FieldDesc::new("IP", DbFieldType::Double, true),
-    FieldDesc::new("D", DbFieldType::Double, true),
-    FieldDesc::new("DP", DbFieldType::Double, true),
-    FieldDesc::new("ERR", DbFieldType::Double, true),
-    FieldDesc::new("ERRP", DbFieldType::Double, true),
-    FieldDesc::new("DT", DbFieldType::Double, false),
-    FieldDesc::new("DTP", DbFieldType::Double, true),
-    FieldDesc::new("MDT", DbFieldType::Double, false),
-    FieldDesc::new("FMOD", DbFieldType::Enum, false),
-    FieldDesc::new("FBON", DbFieldType::Short, false),
-    FieldDesc::new("FBOP", DbFieldType::Enum, true),
-    FieldDesc::new("ODEL", DbFieldType::Double, false),
-    // Display
-    FieldDesc::new("PREC", DbFieldType::Short, false),
-    FieldDesc::new("EGU", DbFieldType::String, false),
-    FieldDesc::new("HOPR", DbFieldType::Double, false),
-    FieldDesc::new("LOPR", DbFieldType::Double, false),
-    FieldDesc::new("DRVH", DbFieldType::Double, false),
-    FieldDesc::new("DRVL", DbFieldType::Double, false),
-    // Alarm
-    FieldDesc::new("HIHI", DbFieldType::Double, false),
-    FieldDesc::new("LOLO", DbFieldType::Double, false),
-    FieldDesc::new("HIGH", DbFieldType::Double, false),
-    FieldDesc::new("LOW", DbFieldType::Double, false),
-    FieldDesc::new("HHSV", DbFieldType::Short, false),
-    FieldDesc::new("LLSV", DbFieldType::Short, false),
-    FieldDesc::new("HSV", DbFieldType::Short, false),
-    FieldDesc::new("LSV", DbFieldType::Short, false),
-    FieldDesc::new("HYST", DbFieldType::Double, false),
-    FieldDesc::new("LALM", DbFieldType::Double, true),
-    // Monitor deadband
-    FieldDesc::new("ADEL", DbFieldType::Double, false),
-    FieldDesc::new("MDEL", DbFieldType::Double, false),
-    FieldDesc::new("ALST", DbFieldType::Double, true),
-    FieldDesc::new("MLST", DbFieldType::Double, true),
-];
 
 impl Record for EpidRecord {
     fn record_type(&self) -> &'static str {
@@ -1085,20 +1027,8 @@ impl Record for EpidRecord {
         }
     }
 
-    fn hand_field_list(&self) -> &'static [FieldDesc] {
-        FIELDS
-    }
-
-    /// `FMOD` is `DBF_MENU menu(epidFeedbackMode)`; `FBON`/`FBOP` are
-    /// `menu(epidFeedbackState)` (C `epidRecord.dbd`). Served as `DBR_ENUM`
-    /// with the menu's choice labels in `.dbd` index order.
-    fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
-        match field {
-            "SMSL" => Some(MENU_OMSL),
-            "FMOD" => Some(EPID_FMOD_CHOICES),
-            "FBON" | "FBOP" => Some(EPID_FBSTATE_CHOICES),
-            _ => None,
-        }
+    fn declared_fields(&self) -> &'static [FieldDesc] {
+        dbd_generated::EPID_FIELDS
     }
 
     fn as_any_mut(&mut self) -> Option<&mut dyn Any> {
@@ -1336,29 +1266,33 @@ impl Record for EpidRecord {
 #[cfg(test)]
 mod menu_choice_tests {
     use super::EpidRecord;
-    use epics_base_rs::server::record::{Record, RecordInstance};
+    use epics_base_rs::server::record::{FieldDeclaration, Record, RecordInstance};
     use epics_base_rs::types::EpicsValue;
 
-    // FMOD is menu(epidFeedbackMode); FBON/FBOP are menu(epidFeedbackState);
-    // SMSL is menu(menuOmsl). Choice tables must match epidRecord.dbd value
-    // order (wire-visible).
+    /// The choices a client sees are the DECLARATION's — `epidRecord.dbd`'s
+    /// `menu()` on each field — and the index↔string mapping is wire-visible.
+    /// This used to assert them through `Record::menu_field_choices`, a hand
+    /// written table that declared the same menus a second time; `SMSL` needed
+    /// a per-record mapping there only because the shared-menu registry keys
+    /// `menuOmsl` by the field name `OMSL`. The declaration has no such
+    /// problem: the `.dbd` says `field(SMSL,DBF_MENU) { menu(menuOmsl) }`, so
+    /// the FieldDesc points straight at base's `MENU_OMSL`.
     #[test]
-    fn epid_menu_field_choices_match_dbd() {
+    fn epid_menu_choices_come_from_the_declaration() {
         let rec = EpidRecord::default();
-        assert_eq!(
-            rec.menu_field_choices("FMOD"),
-            Some(&["PID", "Max/Min"][..])
-        );
+        let menu = |name: &str| {
+            rec.field_list()
+                .iter()
+                .find(|f| f.name == name)
+                .unwrap_or_else(|| panic!("{name} is declared"))
+                .menu
+        };
+        assert_eq!(menu("FMOD"), Some(&["PID", "Max/Min"][..]));
         let fbstate = &["Off", "On"][..];
-        assert_eq!(rec.menu_field_choices("FBON"), Some(fbstate));
-        assert_eq!(rec.menu_field_choices("FBOP"), Some(fbstate));
-        // SMSL is menu(menuOmsl); the field name is record-specific so the
-        // base registry does not resolve it — the per-record mapping must.
-        assert_eq!(
-            rec.menu_field_choices("SMSL"),
-            Some(&["supervisory", "closed_loop"][..])
-        );
-        assert_eq!(rec.menu_field_choices("VAL"), None);
+        assert_eq!(menu("FBON"), Some(fbstate));
+        assert_eq!(menu("FBOP"), Some(fbstate));
+        assert_eq!(menu("SMSL"), Some(&["supervisory", "closed_loop"][..]));
+        assert_eq!(menu("VAL"), None);
     }
 
     // End-to-end: SMSL is served as Short; the base snapshot path promotes

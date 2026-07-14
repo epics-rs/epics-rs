@@ -134,7 +134,7 @@ fn the_derive_declares_no_fields() {
         engineering_units: String::new(),
     };
     assert!(
-        Record::hand_field_list(&ai).is_empty(),
+        Record::declared_fields(&ai).is_empty(),
         "the derive must not hand a record type a second declaration"
     );
 
@@ -145,7 +145,7 @@ fn the_derive_declares_no_fields() {
         status: 0,
     };
     assert!(
-        Record::hand_field_list(&ao).is_empty(),
+        Record::declared_fields(&ao).is_empty(),
         "the derive must not hand a record type a second declaration"
     );
 }

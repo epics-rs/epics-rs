@@ -4889,7 +4889,7 @@ mod metadata_cache_tests {
         fn put_field(&mut self, name: &str, _value: EpicsValue) -> CaResult<()> {
             Err(CaError::FieldNotFound(name.to_string()))
         }
-        fn hand_field_list(&self) -> &'static [crate::server::record::FieldDesc] {
+        fn declared_fields(&self) -> &'static [crate::server::record::FieldDesc] {
             &[]
         }
         fn field_metadata_override(
@@ -4985,7 +4985,7 @@ mod metadata_cache_tests {
                 _ => Err(CaError::FieldNotFound(name.to_string())),
             }
         }
-        fn hand_field_list(&self) -> &'static [crate::server::record::FieldDesc] {
+        fn declared_fields(&self) -> &'static [crate::server::record::FieldDesc] {
             &[]
         }
         fn monitor_deadband_value(&self) -> Option<EpicsValue> {
@@ -5110,7 +5110,7 @@ mod metadata_cache_tests {
         fn put_field(&mut self, name: &str, _value: EpicsValue) -> CaResult<()> {
             Err(CaError::FieldNotFound(name.to_string()))
         }
-        fn hand_field_list(&self) -> &'static [crate::server::record::FieldDesc] {
+        fn declared_fields(&self) -> &'static [crate::server::record::FieldDesc] {
             &[]
         }
         fn force_posted_fields(&self) -> &'static [&'static str] {
@@ -5232,7 +5232,7 @@ mod metadata_cache_tests {
                 _ => Err(CaError::FieldNotFound(name.to_string())),
             }
         }
-        fn hand_field_list(&self) -> &'static [crate::server::record::FieldDesc] {
+        fn declared_fields(&self) -> &'static [crate::server::record::FieldDesc] {
             &[]
         }
         fn log_swept_fields(&self) -> &'static [&'static str] {
@@ -5389,7 +5389,7 @@ mod metadata_cache_tests {
                 _ => Err(CaError::FieldNotFound(name.to_string())),
             }
         }
-        fn hand_field_list(&self) -> &'static [crate::server::record::FieldDesc] {
+        fn declared_fields(&self) -> &'static [crate::server::record::FieldDesc] {
             &[]
         }
         fn log_swept_fields(&self) -> &'static [&'static str] {
@@ -5520,7 +5520,7 @@ mod metadata_cache_tests {
                 _ => Err(CaError::FieldNotFound(name.to_string())),
             }
         }
-        fn hand_field_list(&self) -> &'static [crate::server::record::FieldDesc] {
+        fn declared_fields(&self) -> &'static [crate::server::record::FieldDesc] {
             &[]
         }
         fn took_metadata_change(&mut self) -> bool {
@@ -5586,7 +5586,7 @@ mod metadata_cache_tests {
         fn put_field(&mut self, _: &str, _: EpicsValue) -> CaResult<()> {
             Ok(())
         }
-        fn hand_field_list(&self) -> &'static [crate::server::record::FieldDesc] {
+        fn declared_fields(&self) -> &'static [crate::server::record::FieldDesc] {
             &[]
         }
         // took_metadata_change uses default impl (returns false)

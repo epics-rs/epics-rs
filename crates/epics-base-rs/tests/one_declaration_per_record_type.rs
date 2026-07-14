@@ -17,7 +17,7 @@
 //! `field_list()` lives on `FieldDeclaration`, which is blanket-implemented for
 //! every `Record` and so cannot be overridden, and it serves the generated
 //! table for every record type the `.dbd` set covers, never falling through to
-//! `Record::hand_field_list`. A record type cannot *supply* a declaration; it
+//! `Record::declared_fields`. A record type cannot *supply* a declaration; it
 //! can only be *asked* for one.
 //!
 //! The boundary this file walks is the fall-through: covered types must resolve
@@ -47,7 +47,7 @@ fn a_dbd_covered_record_type_is_declared_only_by_its_dbd() {
 
         // And there is no second table to contradict it.
         assert!(
-            Record::hand_field_list(record.as_ref()).is_empty(),
+            Record::declared_fields(record.as_ref()).is_empty(),
             "{record_type} has a vendored .dbd, so it must not also hand-write a field table"
         );
     }
@@ -84,7 +84,7 @@ fn a_record_type_with_no_dbd_falls_through_to_its_hand_table() {
         fn put_field(&mut self, _name: &str, _value: EpicsValue) -> CaResult<()> {
             Ok(())
         }
-        fn hand_field_list(&self) -> &'static [FieldDesc] {
+        fn declared_fields(&self) -> &'static [FieldDesc] {
             HAND
         }
     }

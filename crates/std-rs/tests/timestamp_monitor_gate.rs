@@ -59,7 +59,7 @@ record(timestamp, "TS:MIN") {
             .add_subscriber(
                 "RVAL",
                 1,
-                DbFieldType::Long,
+                DbFieldType::ULong,
                 (EventMask::VALUE | EventMask::LOG | EventMask::ALARM).bits(),
             )
             .expect("RVAL subscription accepted");
@@ -84,7 +84,7 @@ record(timestamp, "TS:MIN") {
     let first_rval = rval_rx
         .try_recv()
         .expect("first render posts RVAL from inside the guard");
-    let first_secs = long_of(&first_rval.snapshot.value);
+    let first_secs = ulong_of(&first_rval.snapshot.value);
     let first_val = server.get("TS:MIN.VAL").await.unwrap();
 
     // Cross a second boundary. RVAL (seconds past the EPICS epoch) necessarily
@@ -98,7 +98,7 @@ record(timestamp, "TS:MIN") {
         "TST=5 renders HH:MM — the second cycle must land in the same minute \
          (test setup bug if not)"
     );
-    let now_secs = long_of(&server.get("TS:MIN.RVAL").await.unwrap());
+    let now_secs = ulong_of(&server.get("TS:MIN.RVAL").await.unwrap());
     assert!(
         now_secs > first_secs,
         "RVAL is refreshed on every process (C timestampRecord.c:94), so the \
@@ -144,7 +144,7 @@ record(timestamp, "TS:SEC") {
             .add_subscriber(
                 "RVAL",
                 1,
-                DbFieldType::Long,
+                DbFieldType::ULong,
                 (EventMask::VALUE | EventMask::LOG | EventMask::ALARM).bits(),
             )
             .expect("RVAL subscription accepted");
@@ -174,7 +174,7 @@ record(timestamp, "TS:SEC") {
         "the changed string posts VAL alongside RVAL"
     );
     assert!(
-        long_of(&second.snapshot.value) > long_of(&first.snapshot.value),
+        ulong_of(&second.snapshot.value) > ulong_of(&first.snapshot.value),
         "the posted RVAL carries the fresh seconds count"
     );
     // C posts RVAL with VAL's own monitor_mask: DBE_VALUE|DBE_LOG (plus any
@@ -192,9 +192,13 @@ async fn proc(db: &epics_base_rs::server::database::PvDatabase, pv: &str) {
         .unwrap();
 }
 
-fn long_of(v: &EpicsValue) -> i32 {
+/// `field(RVAL,DBF_ULONG)` (`timestampRecord.dbd:28`) — the EPICS-epoch seconds
+/// are UNSIGNED. This used to unwrap an `EpicsValue::Long` and panic with "RVAL
+/// is DBF_LONG": the port's hand-written field table declared it `DBF_LONG`, and
+/// the test pinned that. The declaration is the `.dbd` now.
+fn ulong_of(v: &EpicsValue) -> u32 {
     match v {
-        EpicsValue::Long(n) => *n,
-        other => panic!("RVAL is DBF_LONG, got {other:?}"),
+        EpicsValue::ULong(n) => *n,
+        other => panic!("RVAL is DBF_ULONG, got {other:?}"),
     }
 }

@@ -1864,7 +1864,7 @@ impl Record for HookTrackingRecord {
             _ => Err(CaError::FieldNotFound(name.into())),
         }
     }
-    fn hand_field_list(&self) -> &'static [FieldDesc] {
+    fn declared_fields(&self) -> &'static [FieldDesc] {
         static FIELDS: &[FieldDesc] = &[FieldDesc::new("VAL", DbFieldType::Double, false)];
         FIELDS
     }
@@ -2015,7 +2015,7 @@ impl Record for NoUdfClearRecord {
             _ => Err(CaError::FieldNotFound(name.into())),
         }
     }
-    fn hand_field_list(&self) -> &'static [FieldDesc] {
+    fn declared_fields(&self) -> &'static [FieldDesc] {
         &[]
     }
     fn clears_udf(&self) -> bool {

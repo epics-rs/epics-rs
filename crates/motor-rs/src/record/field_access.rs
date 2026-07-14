@@ -1,6 +1,5 @@
 #![allow(unused_imports)]
 use epics_base_rs::error::{CaError, CaResult};
-use epics_base_rs::server::record::FieldDesc;
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
 use crate::coordinate;
@@ -8,154 +7,11 @@ use crate::fields::*;
 use crate::flags::*;
 
 use super::MotorRecord;
+use super::dbd_generated::MOTOR_FIELDS;
 
 /// The motorRecord version this port tracks (C `#define VERSION 7.4`,
 /// stamped into VERS at init_record:608; SPC_NOMOD).
 const MOTOR_RECORD_VERSION: f32 = 7.4;
-
-pub(crate) static FIELDS: &[FieldDesc] = &[
-    // Position
-    FieldDesc::new("VAL", DbFieldType::Double, false),
-    FieldDesc::new("RBV", DbFieldType::Double, true),
-    FieldDesc::new("RLV", DbFieldType::Double, false),
-    FieldDesc::new("OFF", DbFieldType::Double, false),
-    FieldDesc::new("DIFF", DbFieldType::Double, true),
-    FieldDesc::new("RDIF", DbFieldType::Int64, true),
-    FieldDesc::new("DVAL", DbFieldType::Double, false),
-    FieldDesc::new("DRBV", DbFieldType::Double, true),
-    FieldDesc::new("RVAL", DbFieldType::Int64, false),
-    FieldDesc::new("RRBV", DbFieldType::Int64, true),
-    FieldDesc::new("RMP", DbFieldType::Int64, true),
-    FieldDesc::new("REP", DbFieldType::Int64, true),
-    // Conversion
-    FieldDesc::new("DIR", DbFieldType::Enum, false),
-    FieldDesc::new("FOFF", DbFieldType::Enum, false),
-    FieldDesc::new("FOF", DbFieldType::Short, false),
-    FieldDesc::new("VOF", DbFieldType::Short, false),
-    FieldDesc::new("SET", DbFieldType::Enum, false),
-    FieldDesc::new("SSET", DbFieldType::Short, false),
-    FieldDesc::new("SUSE", DbFieldType::Short, false),
-    FieldDesc::new("IGSET", DbFieldType::Short, false),
-    FieldDesc::new("MRES", DbFieldType::Double, false),
-    FieldDesc::new("ERES", DbFieldType::Double, false),
-    FieldDesc::new("SREV", DbFieldType::Long, false),
-    FieldDesc::new("UREV", DbFieldType::Double, false),
-    FieldDesc::new("UEIP", DbFieldType::Short, false),
-    FieldDesc::new("URIP", DbFieldType::Enum, false),
-    FieldDesc::new("RRES", DbFieldType::Double, false),
-    FieldDesc::new("RDBL_VAL", DbFieldType::Double, false),
-    FieldDesc::new("RSTM", DbFieldType::Enum, false),
-    FieldDesc::new("LOADPOS_BLOCK", DbFieldType::Short, false),
-    // Velocity
-    FieldDesc::new("VELO", DbFieldType::Double, false),
-    FieldDesc::new("VBAS", DbFieldType::Double, false),
-    FieldDesc::new("VMAX", DbFieldType::Double, false),
-    FieldDesc::new("S", DbFieldType::Double, false),
-    FieldDesc::new("SBAS", DbFieldType::Double, false),
-    FieldDesc::new("SMAX", DbFieldType::Double, false),
-    FieldDesc::new("ACCL", DbFieldType::Double, false),
-    FieldDesc::new("ACCS", DbFieldType::Double, false),
-    FieldDesc::new("ACCU", DbFieldType::Enum, false),
-    FieldDesc::new("BVEL", DbFieldType::Double, false),
-    FieldDesc::new("BACC", DbFieldType::Double, false),
-    FieldDesc::new("HVEL", DbFieldType::Double, false),
-    FieldDesc::new("JVEL", DbFieldType::Double, false),
-    FieldDesc::new("JAR", DbFieldType::Double, false),
-    FieldDesc::new("SBAK", DbFieldType::Double, false),
-    // Retry
-    FieldDesc::new("BDST", DbFieldType::Double, false),
-    FieldDesc::new("FRAC", DbFieldType::Double, false),
-    FieldDesc::new("RDBD", DbFieldType::Double, false),
-    FieldDesc::new("SPDB", DbFieldType::Double, false),
-    FieldDesc::new("RTRY", DbFieldType::Short, false),
-    FieldDesc::new("RMOD", DbFieldType::Enum, false),
-    FieldDesc::new("RCNT", DbFieldType::Short, true),
-    FieldDesc::new("MISS", DbFieldType::Short, true),
-    // Limits
-    FieldDesc::new("HLM", DbFieldType::Double, false),
-    FieldDesc::new("LLM", DbFieldType::Double, false),
-    FieldDesc::new("DHLM", DbFieldType::Double, false),
-    FieldDesc::new("DLLM", DbFieldType::Double, false),
-    // C dbd (2e89b552): RHLM/RLLM are SPC_NOMOD — runtime writes are
-    // refused; only a database field() load lands in them.
-    FieldDesc::new("RHLM", DbFieldType::Double, true),
-    FieldDesc::new("RLLM", DbFieldType::Double, true),
-    FieldDesc::new("LVIO", DbFieldType::Short, true),
-    FieldDesc::new("HLS", DbFieldType::Short, true),
-    FieldDesc::new("LLS", DbFieldType::Short, true),
-    FieldDesc::new("RHLS", DbFieldType::Short, true),
-    FieldDesc::new("RLLS", DbFieldType::Short, true),
-    FieldDesc::new("VERS", DbFieldType::Float, true),
-    FieldDesc::new("HLSV", DbFieldType::Enum, false),
-    // Control
-    FieldDesc::new("SPMG", DbFieldType::Enum, false),
-    FieldDesc::new("STOP", DbFieldType::Short, false),
-    FieldDesc::new("HOMF", DbFieldType::Short, false),
-    FieldDesc::new("HOMR", DbFieldType::Short, false),
-    FieldDesc::new("JOGF", DbFieldType::Short, false),
-    FieldDesc::new("JOGR", DbFieldType::Short, false),
-    FieldDesc::new("TWF", DbFieldType::Short, false),
-    FieldDesc::new("TWR", DbFieldType::Short, false),
-    FieldDesc::new("TWV", DbFieldType::Double, false),
-    FieldDesc::new("CNEN", DbFieldType::Enum, false),
-    // Status
-    FieldDesc::new("DMOV", DbFieldType::Short, true),
-    FieldDesc::new("MOVN", DbFieldType::Short, true),
-    FieldDesc::new("MSTA", DbFieldType::Long, true),
-    FieldDesc::new("MIP", DbFieldType::Short, true),
-    FieldDesc::new("CDIR", DbFieldType::Short, true),
-    FieldDesc::new("TDIR", DbFieldType::Short, true),
-    FieldDesc::new("ATHM", DbFieldType::Short, true),
-    FieldDesc::new("STUP", DbFieldType::Enum, false),
-    FieldDesc::new("RVEL", DbFieldType::Int64, true),
-    // PID
-    FieldDesc::new("PCOF", DbFieldType::Double, false),
-    FieldDesc::new("ICOF", DbFieldType::Double, false),
-    FieldDesc::new("DCOF", DbFieldType::Double, false),
-    // Display
-    FieldDesc::new("EGU", DbFieldType::String, false),
-    FieldDesc::new("PREC", DbFieldType::Short, false),
-    FieldDesc::new("ADEL", DbFieldType::Double, false),
-    FieldDesc::new("MDEL", DbFieldType::Double, false),
-    // Sync trigger (write-only semantic; C: 82c26005)
-    FieldDesc::new("SYNC", DbFieldType::Short, false),
-    // Timing
-    FieldDesc::new("DLY", DbFieldType::Double, false),
-    FieldDesc::new("NTM", DbFieldType::Enum, false),
-    FieldDesc::new("NTMF", DbFieldType::UShort, false),
-    // Public C motorRecord.dbd link / menu surface (motorRecord.dbd:233-265,
-    // 739-760). DBF_INLINK/DBF_OUTLINK fields appear over CA as DBF_STRING (the
-    // link specification); DBF_MENU OMSL appears as the menuOmsl index.
-    FieldDesc::new("OUT", DbFieldType::String, false),
-    FieldDesc::new("RDBL", DbFieldType::String, false),
-    FieldDesc::new("DOL", DbFieldType::String, false),
-    FieldDesc::new("RLNK", DbFieldType::String, false),
-    FieldDesc::new("STOO", DbFieldType::String, false),
-    FieldDesc::new("DINP", DbFieldType::String, false),
-    FieldDesc::new("RINP", DbFieldType::String, false),
-    FieldDesc::new("POST", DbFieldType::String, false),
-    FieldDesc::new("OMSL", DbFieldType::Short, false),
-    // Public C motorRecord.dbd alarm-limit / operator-range surface
-    // (motorRecord.dbd:370-441). HHSV/LLSV are menuAlarmSevr indices.
-    FieldDesc::new("HIHI", DbFieldType::Double, false),
-    FieldDesc::new("HIGH", DbFieldType::Double, false),
-    FieldDesc::new("LOW", DbFieldType::Double, false),
-    FieldDesc::new("LOLO", DbFieldType::Double, false),
-    FieldDesc::new("HHSV", DbFieldType::Short, false),
-    FieldDesc::new("LLSV", DbFieldType::Short, false),
-    FieldDesc::new("HOPR", DbFieldType::Double, false),
-    FieldDesc::new("LOPR", DbFieldType::Double, false),
-    // Public C motorRecord.dbd last-value / monitor-map surface
-    // (motorRecord.dbd:560-595, 675-682, 829-836). All SPC_NOMOD → read-only.
-    FieldDesc::new("LVAL", DbFieldType::Double, true),
-    FieldDesc::new("LDVL", DbFieldType::Double, true),
-    FieldDesc::new("LRVL", DbFieldType::Int64, true),
-    FieldDesc::new("LRLV", DbFieldType::Double, true),
-    FieldDesc::new("ALST", DbFieldType::Double, true),
-    FieldDesc::new("MLST", DbFieldType::Double, true),
-    FieldDesc::new("MMAP", DbFieldType::Long, true),
-    FieldDesc::new("NMAP", DbFieldType::Long, true),
-];
 
 pub(crate) fn motor_get_field(rec: &MotorRecord, name: &str) -> Option<EpicsValue> {
     match name {
@@ -2028,7 +1884,7 @@ fn precision_for(rec: &MotorRecord, field: &str) -> Option<i16> {
     match field {
         "RRBV" | "RMP" | "REP" => Some(0),
         "VERS" => Some(2),
-        _ => match FIELDS.iter().find(|f| f.name == field)?.dbf_type {
+        _ => match MOTOR_FIELDS.iter().find(|f| f.name == field)?.dbf_type {
             DbFieldType::Short
             | DbFieldType::Long
             | DbFieldType::Int64
@@ -2075,7 +1931,7 @@ fn limits_for(rec: &MotorRecord, field: &str) -> Option<(f64, f64)> {
             }
         }
         "VELO" => Some((rec.vel.vmax, rec.vel.vbas)),
-        _ => match FIELDS.iter().find(|f| f.name == field)?.dbf_type {
+        _ => match MOTOR_FIELDS.iter().find(|f| f.name == field)?.dbf_type {
             DbFieldType::Char | DbFieldType::UChar => Some((255.0, 0.0)),
             DbFieldType::Short => Some((32767.0, -32768.0)),
             DbFieldType::Enum | DbFieldType::UShort => Some((65535.0, 0.0)),

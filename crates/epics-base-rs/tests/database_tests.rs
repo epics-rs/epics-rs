@@ -6708,9 +6708,16 @@ async fn test_new_common_fields_get_put() {
 
 /// SSCN (simulation-mode scan) is a `DBF_MENU`/`menuScan` field whose C dbd
 /// default is the out-of-range sentinel 65535 ("use SCAN"), not a real menu
-/// choice. The put path must round-trip both a real menuScan index and the
-/// sentinel, and a put of any out-of-menu value collapses to the sentinel —
-/// matching C `field(SSCN,DBF_MENU){ menu(menuScan) initial("65535") }`.
+/// choice. The put path must round-trip a real menuScan index, the sentinel,
+/// and — since the field is a plain `epicsEnum16` C stores whatever a numeric
+/// put sent — any OTHER out-of-menu index as itself.
+///
+/// CORRECTED: this test used to assert that an out-of-menu index (12) collapses
+/// to the sentinel. It does not. Measured on the C softIoc,
+/// `caput T:A.SSCN 10` reports `New : T:A.SSCN 10` and `caget -n T:A.SSCN`
+/// answers `10`; the recGbl simulation helpers bail on `*psscn == USHRT_MAX`
+/// (recGbl.c) and on nothing else, so 12 is an ordinary illegal index, not
+/// "unset".
 #[tokio::test]
 async fn test_sscn_serves_menu_index_and_65535_sentinel() {
     let db = PvDatabase::new();
@@ -6745,15 +6752,17 @@ async fn test_sscn_serves_menu_index_and_65535_sentinel() {
         Some(EpicsValue::Enum(65535))
     );
 
-    // An out-of-menu index (>9, not 65535) collapses to the sentinel.
+    // An out-of-menu index (>9, not 65535) is stored as itself — it is illegal,
+    // but it is not the sentinel.
     rec.write()
         .await
         .put_common_field("SSCN", EpicsValue::Enum(12))
         .unwrap();
     assert_eq!(
         rec.read().await.get_common_field("SSCN"),
-        Some(EpicsValue::Enum(65535))
+        Some(EpicsValue::Enum(12))
     );
+    assert!(!rec.read().await.common.sscn.is_unset());
 }
 
 /// epics-base PR #359 (commits 5ba8080f6, aff74638b, 51c5b8f1e,

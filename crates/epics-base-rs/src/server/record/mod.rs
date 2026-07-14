@@ -40,4 +40,4 @@ pub use record_trait::{
     put_field_internal_default, seed_input_links,
 };
 pub(crate) use record_trait::{AuxPostMask, value_gate};
-pub use scan::{ScanType, SimModeScan};
+pub use scan::{ScanList, ScanType, SimModeScan};

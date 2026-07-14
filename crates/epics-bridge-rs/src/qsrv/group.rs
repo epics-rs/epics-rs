@@ -4095,9 +4095,12 @@ mod tests {
                     .await
                     .unwrap();
                 // Not Passive: the `pp(TRUE) && SCAN==Passive` term is false.
-                db.put_pv("SCANNED:rec.SCAN", EpicsValue::Enum(ScanType::Sec1 as u16))
-                    .await
-                    .unwrap();
+                db.put_pv(
+                    "SCANNED:rec.SCAN",
+                    EpicsValue::Enum(ScanType::Sec1.to_u16()),
+                )
+                .await
+                .unwrap();
 
                 let cfg = format!(
                     r#"{{ "PROCGATE:GRP": {{ "+atomic": {atomic},
@@ -4147,7 +4150,7 @@ mod tests {
             db.add_record("FORCED:rec", Box::new(AiRecord::new(0.0)))
                 .await
                 .unwrap();
-            db.put_pv("FORCED:rec.SCAN", EpicsValue::Enum(ScanType::Sec1 as u16))
+            db.put_pv("FORCED:rec.SCAN", EpicsValue::Enum(ScanType::Sec1.to_u16()))
                 .await
                 .unwrap();
 

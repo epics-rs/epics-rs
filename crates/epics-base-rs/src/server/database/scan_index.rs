@@ -34,11 +34,11 @@ impl PvDatabase {
         // stale PHAS / load_order does not leave a phantom entry.
         {
             let mut index = self.inner.scan_index.write().await;
-            if old_scan != ScanType::Passive {
-                if let Some(set) = index.get_mut(&old_scan) {
+            if let Some(list) = old_scan.scan_list() {
+                if let Some(set) = index.get_mut(&list) {
                     set.retain(|(_, _, n)| n != name);
                     if set.is_empty() {
-                        index.remove(&old_scan);
+                        index.remove(&list);
                     }
                 }
             }
@@ -59,7 +59,10 @@ impl PvDatabase {
             let inst = rec_arc.read().await;
             (inst.common.scan, inst.common.phas)
         };
-        if cur_scan != ScanType::Passive {
+        // C `scanAdd` refuses both `Passive` and an out-of-menu index — the
+        // latter with "scanAdd detected illegal SCAN value" — so neither can
+        // key a bucket. [`ScanList::of`] is that refusal.
+        if let Some(list) = cur_scan.scan_list() {
             // Re-use the record's existing load-order sequence so the
             // scan-index secondary key stays stable across SCAN/PHAS
             // edits. A record loaded before should always scan before
@@ -76,7 +79,7 @@ impl PvDatabase {
                 .scan_index
                 .write()
                 .await
-                .entry(cur_scan)
+                .entry(list)
                 .or_default()
                 .insert((cur_phas, seq, name.to_string()));
         }
@@ -84,12 +87,18 @@ impl PvDatabase {
 
     /// Get record names for a given scan type, sorted by PHAS then
     /// database load order (C `dbScan.c` stable same-PHAS FIFO).
+    ///
+    /// A SCAN value that names no list (`Passive`, or an index outside
+    /// `menuScan`) holds no records — there is no such bucket to look up.
     pub async fn records_for_scan(&self, scan_type: ScanType) -> Vec<String> {
+        let Some(list) = scan_type.scan_list() else {
+            return Vec::new();
+        };
         self.inner
             .scan_index
             .read()
             .await
-            .get(&scan_type)
+            .get(&list)
             .map(|s| s.iter().map(|(_, _, name)| name.clone()).collect())
             .unwrap_or_default()
     }

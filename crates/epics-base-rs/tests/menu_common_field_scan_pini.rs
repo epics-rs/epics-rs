@@ -139,15 +139,16 @@ async fn sscn_sentinel_loads_from_db_but_is_refused_at_runtime() {
     let mut inst = RecordInstance::new("SIM".to_string(), AiRecord::default());
     inst.put_common_field_db_load("SSCN", EpicsValue::String("65535".into()))
         .expect("field(SSCN,\"65535\") is what the dbd initial() is");
-    assert_eq!(inst.common.sscn, SimModeScan::DoNotUse);
+    assert!(inst.common.sscn.is_unset());
+    assert_eq!(inst.common.sscn.to_u16(), SimModeScan::DO_NOT_USE);
 
     inst.put_common_field_db_load("SSCN", EpicsValue::String("1 second".into()))
         .unwrap();
-    assert_eq!(inst.common.sscn, SimModeScan::Scan(ScanType::Sec1));
+    assert_eq!(inst.common.sscn, SimModeScan::from_scan(ScanType::Sec1));
 
     let err = inst
         .put_common_field("SSCN", EpicsValue::String("65535".into()))
         .expect_err("putStringMenu bounds the index by nChoice");
     assert!(matches!(err, CaError::BadChoice(_)), "got {err:?}");
-    assert_eq!(inst.common.sscn, SimModeScan::Scan(ScanType::Sec1));
+    assert_eq!(inst.common.sscn, SimModeScan::from_scan(ScanType::Sec1));
 }

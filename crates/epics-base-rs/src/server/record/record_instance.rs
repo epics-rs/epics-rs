@@ -2145,7 +2145,7 @@ impl RecordInstance {
             "ACKT" => Some(EpicsValue::Short(if self.common.ackt { 1 } else { 0 })),
             "UDF" => Some(EpicsValue::Char(if self.common.udf { 1 } else { 0 })),
             "UDFS" => Some(EpicsValue::Short(self.common.udfs as i16)),
-            "SCAN" => Some(EpicsValue::Enum(self.common.scan as u16)),
+            "SCAN" => Some(EpicsValue::Enum(self.common.scan.to_u16())),
             "SSCN" => Some(EpicsValue::Enum(self.common.sscn.to_u16())),
             // `OLDSIMM` is `DBF_MENU`/`menu(menuSimm)`, stored as the menu index
             // and promoted to `DBR_ENUM` with the NO/YES/RAW labels by
@@ -2335,7 +2335,9 @@ impl RecordInstance {
         if !self.record.uses_recgbl_simm_helpers() {
             return;
         }
-        if self.common.sscn == SimModeScan::DoNotUse {
+        // C `recGblSaveSimm`: `if (*psscn == USHRT_MAX) return;` — the literal
+        // sentinel, not "any index outside the menu".
+        if self.common.sscn.is_unset() {
             return;
         }
         if let Some(EpicsValue::Short(simm)) = self.record.get_field("SIMM") {
@@ -2376,8 +2378,10 @@ impl RecordInstance {
         if !self.record.uses_recgbl_simm_helpers() {
             return CommonFieldPutResult::NoChange;
         }
-        let SimModeScan::Scan(sim_scan) = self.common.sscn else {
-            // `*psscn == USHRT_MAX` — SSCN unset, no swap.
+        let Some(sim_scan) = self.common.sscn.scan() else {
+            // `*psscn == USHRT_MAX` — SSCN unset, no swap. An SSCN that is
+            // merely ILLEGAL still swaps: C assigns it into SCAN and `scanAdd`
+            // then declines to scan the record.
             return CommonFieldPutResult::NoChange;
         };
         let Some(EpicsValue::Short(simm)) = self.record.get_field("SIMM") else {
@@ -2388,7 +2392,7 @@ impl RecordInstance {
         }
         let previous_scan = self.common.scan;
         let result = self.set_scan(sim_scan);
-        self.common.sscn = SimModeScan::Scan(previous_scan);
+        self.common.sscn = SimModeScan::from_scan(previous_scan);
         result
     }
 
@@ -2739,7 +2743,9 @@ impl RecordInstance {
                 if let EpicsValue::Short(v) = value {
                     let old_phas = self.common.phas;
                     self.common.phas = v;
-                    if old_phas != v && self.common.scan != ScanType::Passive {
+                    // Only a record that IS in a scan list can be re-sorted
+                    // within one; the same gate the index owner applies.
+                    if old_phas != v && self.common.scan.scan_list().is_some() {
                         let scan = self.common.scan;
                         self.record.on_put(&name);
                         self.record.special(&name, true)?;

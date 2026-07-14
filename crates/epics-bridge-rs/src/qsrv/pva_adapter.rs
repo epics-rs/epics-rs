@@ -2615,7 +2615,7 @@ mod tests {
             // Non-Passive scan: a passive put will NOT process this record.
             db.put_pv(
                 &format!("{rec}.SCAN"),
-                EpicsValue::Enum(ScanType::Sec1 as u16),
+                EpicsValue::Enum(ScanType::Sec1.to_u16()),
             )
             .await
             .unwrap();

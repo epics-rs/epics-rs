@@ -2692,7 +2692,7 @@ impl AsynRecord {
         // put that reached `special()`, so the write is handed to the database
         // rather than re-entered here. It lands as soon as this put returns —
         // C's `dbScanLock` is recursive, this one is not.
-        let passive = EpicsValue::Enum(ScanType::Passive as u16);
+        let passive = EpicsValue::Enum(ScanType::Passive.to_u16());
         tokio::spawn(async move {
             let _ = db.put_pv(&format!("{name}.SCAN"), passive).await;
         });

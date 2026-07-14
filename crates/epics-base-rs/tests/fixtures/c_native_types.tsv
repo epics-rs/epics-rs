@@ -14,17 +14,19 @@
 # (DBF_ULONG is served as DBF_DOUBLE, DBF_MENU as DBF_ENUM, and an
 # SPC_DBADDR field's type comes from the record's cvt_dbaddr, not the .dbd).
 #
-# One row is NOT from the bulk sweep: `mbbo.VAL`. `mbboRecord.c:308` degenerates
-# VAL to DBF_USHORT (DBF_LONG on the wire) when `!prec->sdef` — i.e. when the
-# record defines no states at all, which the bulk sweep's bare `record(mbbo,...)`
-# did not. Re-probed against the same softIoc with states defined:
+# `mbbo.VAL` is the sharpest `cvt_dbaddr` row. `mbboRecord.c:300-312` degenerates
+# VAL to DBF_USHORT — DBF_LONG on the wire, CA having no unsigned-16 type — when
+# `!prec->sdef`, i.e. when the record defines no states at all. The bulk sweep's
+# bare `record(mbbo,...)` defines none, so DBF_LONG is the row, measured the same
+# way as every other. Both halves of the selector, on the same softIoc:
 #
-#   record(mbbo,"T:SDEF")  { field(ZRST,"zero") field(ONST,"one") field(ZRVL,"0") }
-#     -> cainfo: Native data type: DBF_ENUM ; caget -> "zero"
+#   record(mbbo,"P:BARE")  {}                                    -> DBF_LONG
+#   record(mbbo,"P:SDEF")  { field(ZRST,"zero") field(ONST,"one")
+#                            field(ZRVL,"0")   field(ONVL,"1") } -> DBF_ENUM
 #
-# DBF_ENUM is what every mbbo with states serves and what this port models, so
-# that is the row. The stateless degeneration is a C behaviour the port does not
-# implement; see the report's UNFIXED list.
+# The port implements both: VAL is `runtime_typed`, and the record answers
+# `UShort` with no state table and `Enum` with one
+# (`records/mbbo.rs`, pinned by `a_stateless_mbbo_serves_its_val_as_dbf_long`).
 #
 # Regenerate: see tools/dbd-codegen/README.md.
 #
@@ -1900,7 +1902,7 @@ mbbo	UDF	DBF_UCHAR	-	DBF_CHAR	1
 mbbo	UDFS	DBF_MENU	-	DBF_ENUM	1
 mbbo	UNSV	DBF_MENU	-	DBF_ENUM	1
 mbbo	UTAG	DBF_UINT64	SPC_NOMOD	DBF_DOUBLE	1
-mbbo	VAL	DBF_ENUM	SPC_DBADDR	DBF_ENUM	1
+mbbo	VAL	DBF_ENUM	SPC_DBADDR	DBF_LONG	1
 mbbo	ZRST	DBF_STRING	SPC_MOD	DBF_STRING	1
 mbbo	ZRSV	DBF_MENU	-	DBF_ENUM	1
 mbbo	ZRVL	DBF_ULONG	SPC_MOD	DBF_DOUBLE	1

@@ -18157,10 +18157,10 @@ pub static MBBI_DIRECT_FIELDS: &[FieldDesc] = &[
 
 /// `recordtype(mbbo)` — 73 CA-visible own fields from `dbd/mbboRecord.dbd` (1 `DBF_NOACCESS` internals dropped).
 pub static MBBO_FIELDS: &[FieldDesc] = &[
-    // DBF_ENUM from cvt_dbaddr.types; re-typed at runtime by `SDEF`.
+    // DBF_USHORT from cvt_dbaddr.types; re-typed at runtime by `SDEF`.
     FieldDesc {
         name: "VAL",
-        dbf_type: DbFieldType::Enum,
+        dbf_type: DbFieldType::UShort,
         runtime_typed: true,
         read_only: false,
         special: Special::DbAddr,

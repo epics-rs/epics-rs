@@ -15,7 +15,6 @@ pub struct MbboRecord {
     pub mask: u32,
     // SHFT/NOBT are DBF_USHORT (mbboRecord.dbd.pod:658,211).
     pub shft: u16,
-    pub sdef: bool,
     pub nobt: u16,
     // MLST/LALM/IVOV are DBF_USHORT (mbboRecord.dbd.pod:643,648,717).
     pub mlst: u16,
@@ -110,7 +109,6 @@ impl Default for MbboRecord {
             orbv: 0,
             mask: 0,
             shft: 0,
-            sdef: false,
             nobt: 0,
             mlst: 0,
             lalm: 0,
@@ -201,7 +199,7 @@ impl MbboRecord {
     /// directly. C `processMbbo` readback (devAsynInt32.c:1314-1330 /
     /// devAsynUInt32Digital.c:948-963); the input twin is `mbbi::raw_to_val`.
     fn raw_to_val(&self, raw: u32) -> u16 {
-        if !self.sdef {
+        if !self.sdef() {
             return raw as u16;
         }
         let rvs = self.raw_values();
@@ -213,20 +211,26 @@ impl MbboRecord {
         65535
     }
 
-    fn compute_sdef(&mut self) {
+    /// C `mbboRecord.c::init_common` — "check if any states are defined": TRUE
+    /// as soon as one of ZRVL..FFVL is non-zero or one of ZRST..FFST is
+    /// non-empty.
+    ///
+    /// DERIVED, never stored. C keeps `prec->sdef` as a struct member and
+    /// recomputes it from `init_common` — at init, and from `special()` after
+    /// every write to a state field. A cached copy of a value that is a pure
+    /// function of 32 other fields can go stale, and here staleness is not
+    /// cosmetic: `sdef` selects VAL's WIRE TYPE (`cvt_dbaddr`, DBF_USHORT with
+    /// no state table, DBF_ENUM with one), so a stale `false` serves an enum
+    /// field as a long. Computing it on demand makes that state unreachable
+    /// rather than merely unlikely.
+    fn sdef(&self) -> bool {
         let rvs = self.raw_values();
         let sts: [&PvString; 16] = [
             &self.zrst, &self.onst, &self.twst, &self.thst, &self.frst, &self.fvst, &self.sxst,
             &self.svst, &self.eist, &self.nist, &self.test, &self.elst, &self.tvst, &self.ttst,
             &self.ftst, &self.ffst,
         ];
-        self.sdef = false;
-        for i in 0..16 {
-            if rvs[i] != 0 || !sts[i].is_empty() {
-                self.sdef = true;
-                return;
-            }
-        }
+        (0..16).any(|i| rvs[i] != 0 || !sts[i].is_empty())
     }
 
     /// C convert(): VAL -> RVAL with SDEF check and SHFT.
@@ -237,7 +241,7 @@ impl MbboRecord {
     /// `soft_alarm` so `check_alarms()` raises the alarm.
     fn convert(&mut self) {
         self.soft_alarm = false;
-        if self.sdef {
+        if self.sdef() {
             if self.val > 15 {
                 self.soft_alarm = true;
                 return;
@@ -291,6 +295,16 @@ macro_rules! mbb_get_field {
     };
     ($self:expr, $name:expr, $( $str:literal => $field:ident : $variant:ident ),* $(,)?) => {
         match $name {
+            // C `mbboRecord.c:300-312` `cvt_dbaddr`: VAL is `special(SPC_DBADDR)`
+            // and the record RE-TYPES it from its own state. With no state table
+            // defined (`!prec->sdef` — every ZRVL..FFVL zero and every ZRST..FFST
+            // empty) there are no labels to hand a client, so C degenerates VAL to
+            // `DBF_USHORT`; CA has no unsigned-16 wire type, so it goes out
+            // `DBF_LONG`. Measured on the C softIoc: bare `record(mbbo,"P:BARE")`
+            // -> `cainfo` says DBF_LONG; the same record with ZRST/ONST -> DBF_ENUM.
+            // This is why VAL carries `runtime_typed` — the declaration cannot
+            // answer it, only the record can.
+            "VAL" if !$self.sdef() => Some(EpicsValue::UShort($self.val)),
             "VAL" => Some(EpicsValue::Enum($self.val)),
             $( $str => mbb_get_field!(@get $self, $field, $variant), )*
             _ => None,
@@ -353,6 +367,10 @@ macro_rules! mbb_put_field {
             "VAL" => {
                 match $value {
                     EpicsValue::Enum(v) => { $self.val = v; }
+                    // The put twin of the `cvt_dbaddr` degeneration above: a
+                    // stateless mbbo is SERVED `DBF_USHORT`, so the write path
+                    // coerces an inbound put to `UShort` before it lands here.
+                    EpicsValue::UShort(v) => { $self.val = v; }
                     EpicsValue::Long(v) => { $self.val = v as u16; }
                     EpicsValue::Short(v) => { $self.val = v as u16; }
                     // C rset `put_enum_str` (mbboRecord.c:354-371) — the one
@@ -456,7 +474,6 @@ impl Record for MbboRecord {
             if self.mask == 0 && self.nobt > 0 && self.nobt <= 32 {
                 self.mask = ((1i64 << self.nobt) - 1) as u32;
             }
-            self.compute_sdef();
         }
         Ok(())
     }
@@ -631,13 +648,12 @@ impl Record for MbboRecord {
         }
     }
 
-    /// C `mbboRecord.c::special` — recompute `sdef` after any runtime
-    /// write to a state value (ZRVL..FFVL) or state string
-    /// (ZRST..FFST) field. See `mbbi::is_state_table_field`.
-    fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
-        if after && super::mbbi::is_state_table_field(field) {
-            self.compute_sdef();
-        }
+    /// C `mbboRecord.c::special` recomputes the cached `prec->sdef` after any
+    /// runtime write to a state value (ZRVL..FFVL) or state string
+    /// (ZRST..FFST). [`Self::sdef`] derives it on demand instead, so there is
+    /// nothing left to recompute and no window in which a state write has
+    /// landed but the cache has not.
+    fn special(&mut self, _field: &str, _after: bool) -> CaResult<()> {
         Ok(())
     }
 }

@@ -236,3 +236,52 @@ fn a_selector_typed_field_keeps_its_runtime_type() {
          to DBR_DOUBLE, got {served:?}"
     );
 }
+
+/// The `SDEF` selector, both halves. `mbbo.VAL` is the one field whose runtime
+/// type is chosen by whether the record has any state table at all
+/// (`mbboRecord.c:300-312`: `if (!prec->sdef) paddr->field_type = DBF_USHORT`),
+/// and `DBF_USHORT` has no CA wire type, so a stateless mbbo goes out
+/// `DBF_LONG`. Measured on the C softIoc, both records in one `.db`:
+///
+/// ```text
+/// record(mbbo,"P:BARE") {}                                    -> DBF_LONG
+/// record(mbbo,"P:SDEF") { field(ZRST,"zero") field(ONST,"one")
+///                         field(ZRVL,"0")   field(ONVL,"1") } -> DBF_ENUM
+/// ```
+///
+/// A client that asked a stateless mbbo for `DBR_ENUM` would be handed an index
+/// with no labels behind it — which is precisely why C refuses to call it an
+/// enum. The declaration cannot answer this; only the record can.
+#[test]
+fn a_stateless_mbbo_serves_its_val_as_dbf_long() {
+    let mut inst = instance("mbbo").expect("mbbo is registered");
+    let bare = inst.client_field_value("VAL").expect("mbbo.VAL resolves");
+    assert_eq!(
+        bare.dbr_type().ca_wire_type(),
+        DbFieldType::Long as u16,
+        "a stateless mbbo has no labels to serve, so C degenerates VAL to \
+         DBF_USHORT -> DBF_LONG on the wire, got {bare:?}"
+    );
+
+    // One state string is enough to define the table (C tests every ZRVL..FFVL
+    // and every ZRST..FFST; any non-zero or non-empty entry sets sdef).
+    inst.record
+        .put_field("ZRST", EpicsValue::String("zero".into()))
+        .expect("ZRST is writable");
+    let with_states = inst.client_field_value("VAL").expect("mbbo.VAL resolves");
+    assert_eq!(
+        with_states.dbr_type(),
+        DbFieldType::Enum,
+        "an mbbo WITH a state table serves VAL as DBF_ENUM, got {with_states:?}"
+    );
+
+    // And the put path must accept what the get path advertised: a stateless
+    // mbbo is served DBF_USHORT, so an inbound put is coerced to `UShort`
+    // before it reaches `put_field` — a `TypeMismatch` here would make the
+    // field unwritable over CA.
+    let mut bare = instance("mbbo").expect("mbbo is registered");
+    bare.record
+        .put_field("VAL", EpicsValue::UShort(3))
+        .expect("a stateless mbbo takes the UShort it is served as");
+    assert_eq!(bare.client_field_value("VAL"), Some(EpicsValue::UShort(3)));
+}

@@ -46,7 +46,7 @@ aao.VAL                 DBF_DOUBLE      SPC_DBADDR  FTVL        aaoRecord.c:172-
 # mbbo: VAL is DBF_ENUM only when state strings are defined. With no ZRST..FFST,
 # `sdef` is false and C re-types VAL to DBF_USHORT — which CA promotes to
 # DBR_LONG, so a default mbbo's VAL is served as a LONG, not an ENUM.
-mbbo.VAL                DBF_ENUM        SPC_DBADDR  SDEF        mbboRecord.c:300-312
+mbbo.VAL                DBF_USHORT      SPC_DBADDR  SDEF        mbboRecord.c:300-312
 
 # compress: the circular buffer is always doubles, `NSAM` deep.
 compress.VAL            DBF_DOUBLE      SPC_DBADDR  -           compressRecord.c:398-410

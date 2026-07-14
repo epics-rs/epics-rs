@@ -38,6 +38,13 @@ pub struct SwaitRecord {
     /// 0 when the CALC compiled, -1 when it did not; the same
     /// [`calc_compile`]-owned status calcout/scalcout/acalcout store.
     pub clcv: i32,
+    /// INIT ("Initialized?", `swaitRecord.dbd:42`, `DBF_SHORT`, `SPC_NOMOD`).
+    /// C `swaitRecord.c:330` and `:374` set `pwait->init = TRUE` in
+    /// `init_record` and NOTHING ever clears it — unlike `ai`/`ao`'s INIT
+    /// (`ConvertPhase`) this is not a conversion phase but a latch:
+    /// "this record has been through init_record". The port served 0 for the
+    /// life of the IOC.
+    initialized: bool,
     /// This cycle's `calcPerform` outcome. C `swaitRecord.c:409-410`:
     /// `if (calcPerform(...)) recGblSetSevr(pwait, CALC_ALARM, INVALID_ALARM)`.
     ///
@@ -182,6 +189,7 @@ impl Default for SwaitRecord {
             calc: String::new(),
             compiled_calc: CompiledExpr::empty(ExprKind::Numeric),
             clcv: 0,
+            initialized: false,
             calc_alarm: false,
             calc_succeeded: false,
             oopt: 0,
@@ -530,6 +538,8 @@ impl Record for SwaitRecord {
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
         if pass == 0 {
             self.recompile();
+            // C `swaitRecord.c:330`: `pwait->init = TRUE;` — and never cleared.
+            self.initialized = true;
         }
         Ok(())
     }
@@ -893,6 +903,7 @@ impl Record for SwaitRecord {
             "SIMS" => Some(EpicsValue::Short(self.sims)),
             "CALC" => Some(EpicsValue::String(self.calc.clone().into())),
             "CLCV" => Some(EpicsValue::Long(self.clcv)),
+            "INIT" => Some(EpicsValue::Short(if self.initialized { 1 } else { 0 })),
             "OOPT" => Some(EpicsValue::Short(self.oopt)),
             "DOPT" => Some(EpicsValue::Short(self.dopt)),
             "DOLN" => Some(EpicsValue::String(self.doln.clone().into())),

@@ -893,11 +893,18 @@ fn test_ai_smoothing() {
     rec.eslo = 1.0;
     rec.aslo = 1.0;
     rec.smoo = 0.5;
+    // `init_record` is what arms the INIT phase (C `aiRecord.c:114`), and the
+    // phase is what makes the first conversion SMOO's initial condition rather
+    // than a blend against the pre-init VAL. A `.db` load always runs it.
+    rec.init_record(0).unwrap();
 
     rec.rval = 100;
     rec.process().unwrap();
     assert!((rec.val - 100.0).abs() < 1e-10);
-    assert!(rec.init);
+    assert!(
+        !rec.init.is_initial(),
+        "C clears INIT at the end of every process (aiRecord.c:170)"
+    );
 
     rec.rval = 200;
     rec.process().unwrap();

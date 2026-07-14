@@ -86,6 +86,7 @@ pub mod calc;
 pub(crate) mod calc_compile;
 pub mod calcout;
 pub mod compress;
+pub mod convert_phase;
 pub mod dfanout;
 pub mod event;
 pub mod fanout;

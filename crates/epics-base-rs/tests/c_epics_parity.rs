@@ -84,8 +84,13 @@ fn ai_smoothing_filter() {
     rec.aslo = 1.0;
     rec.eslo = 1.0;
     rec.smoo = 0.5;
+    // C arms INIT in `init_record` (aiRecord.c:114) and the SMOO filter takes
+    // the initial conversion as its initial condition (`:441`) — without the
+    // init pass a record with a stale VAL would blend against it, which is
+    // exactly what C does too.
+    rec.init_record(0).unwrap();
 
-    // First process: no smoothing (init=false)
+    // First process: the initial conversion is its own initial condition
     rec.rval = 100;
     let _ = rec.process();
     assert!(

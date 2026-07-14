@@ -75,13 +75,32 @@ pub fn link_is_external(status: i16) -> bool {
     status == LINK_EXT_NC || status == LINK_EXT_OK
 }
 
-/// Sentinel for "no resolvable target field type", C `DBF_unknown` (-1).
-/// Used for every constant, external, and unresolvable link. C
-/// `init_record` further distinguishes a constant DOL (`DBF_NOACCESS`) from
-/// a constant LNK (`DBF_unknown`) (sseqRecord.c:206,225); that split is
-/// collapsed to a single unknown here because the Rust `DbFieldType` model
-/// has no `NOACCESS` variant.
+/// Sentinel for "no resolvable target field type", C `DBF_unknown` (-1): an
+/// external or unresolvable link of either direction, and a constant OUTPUT link
+/// (sseqRecord.c:225).
 pub(crate) const DBF_UNKNOWN: i16 = -1;
+
+/// C `DBF_NOACCESS` (dbFldTypes.h — dbStatic index 17), the code `init_record`
+/// stores for a constant INPUT link (sseqRecord.c:206). It is not "unknown": the
+/// constant HAS been consumed, once, by `recGblInitConstantLink` at init, and the
+/// code exists to make the per-cycle read switch fall to `default: break` so the
+/// constant is never re-read over a client's value. `DTn` is a wire-visible
+/// diagnostic field, so the code itself has to be C's — the port served -1 where
+/// C serves 17.
+pub(crate) const DBF_NOACCESS: i16 = 17;
+
+/// Which end of the record a link is attached to. C's `init_record` classifies a
+/// CONSTANT link differently by direction — an input constant is loaded and marked
+/// `DBF_NOACCESS` (sseqRecord.c:203-207), an output constant has no target at all
+/// and stays `DBF_unknown` (:224-226) — so the classifier cannot answer without
+/// being told which it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkRole {
+    /// `DOL`/`INP`: read from.
+    Input,
+    /// `LNK`/`OUT`: written to.
+    Output,
+}
 
 /// Map a resolved [`DbFieldType`] to the C `dbStatic` `dbfType` integer
 /// (dbFldTypes.h:24-43) that `DTn`/`LTn` expose — NOT the CA `DBR` wire-type
@@ -129,10 +148,17 @@ fn dbf_static_code(ft: DbFieldType) -> i16 {
 /// resolves LOCAL, exactly as C's `iocInit`-time `init_record` does. There is
 /// no gate to observe here because there is no way to run this against a
 /// half-built database.
-pub async fn classify_link(handle: &AsyncDbHandle, link: &str) -> (i16, i16) {
+pub async fn classify_link(handle: &AsyncDbHandle, link: &str, role: LinkRole) -> (i16, i16) {
     match parse_link_v2(link).link_type() {
-        // Empty / constant link: C → CON, no resolvable field type.
-        LinkType::Empty | LinkType::Constant => (LINK_CON, DBF_UNKNOWN),
+        // Empty / constant link: C → CON. The field-type code is the direction's
+        // (see [`DBF_NOACCESS`]).
+        LinkType::Empty | LinkType::Constant => (
+            LINK_CON,
+            match role {
+                LinkRole::Input => DBF_NOACCESS,
+                LinkRole::Output => DBF_UNKNOWN,
+            },
+        ),
         // Local DB link: C `dbNameToAddr` ok → LOC + the addressed field's
         // type. A DB-syntax link whose target is not on this IOC resolves to
         // `None` and falls through to EXT_NC (C `init_record` else branch).

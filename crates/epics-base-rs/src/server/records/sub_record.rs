@@ -115,6 +115,19 @@ impl Record for SubRecord {
         Ok(())
     }
 
+    /// C `subRecord.c:119-123`: an empty `SNAM` names no subroutine, so
+    /// `init_record` prints `"%s.SNAM is empty"`, sets `prec->pact = TRUE` and
+    /// returns 0 — the record serves its fields forever and never processes
+    /// again. Measured: `caget -t P:SUB.PACT` on a bare `record(sub,"P:SUB"){}`
+    /// reads 1.
+    ///
+    /// The non-empty-but-unregistered case is NOT this one: C returns
+    /// `S_db_BadSub` there (`:125-129`), which is an init FAILURE, not a PACT
+    /// park.
+    fn init_record_parks_pact(&self) -> bool {
+        self.snam.is_empty()
+    }
+
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         // The subroutine is invoked by the framework via
         // `RecordInstance::subroutine` (it needs the registry of

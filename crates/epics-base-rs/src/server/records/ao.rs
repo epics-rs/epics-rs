@@ -1,5 +1,6 @@
 use crate::error::{CaError, CaResult};
 use crate::server::record::{FieldDesc, MENU_SIMM, ProcessOutcome, Record, dbd_generated};
+use crate::server::records::convert_phase::ConvertPhase;
 use crate::types::{EpicsValue, PvString};
 
 /// Choice labels for the output-increment-format menu, in index order.
@@ -31,7 +32,13 @@ pub struct AoRecord {
     pub eslo: f64, // default 1.0
     pub eoff: f64, // engineering offset (defaults to egul for LINEAR)
     pub roff: i32,
-    pub aslo: f64, // default 1.0
+    /// `ASLO` — raw-to-engineering slope applied ahead of ESLO. `aoRecord.dbd`
+    /// gives it NO `initial()`, so C's calloc'd record starts at 0.0 and every
+    /// use is guarded (`if (prec->aslo != 0.0) value *= prec->aslo`), i.e. 0.0
+    /// means "no ASLO scaling" — it is NOT a unit slope. (`ai` is the asymmetric
+    /// twin: `aiRecord.dbd` DOES declare `initial("1")`. Measured: a bare C
+    /// `record(ao,..)` serves ASLO=0, a bare `record(ai,..)` serves ASLO=1.)
+    pub aslo: f64,
     pub aoff: f64,
     // Output control
     pub omsl: i16,   // 0=supervisory, 1=closed_loop
@@ -49,7 +56,9 @@ pub struct AoRecord {
     pub alst: f64,
     pub mlst: f64,
     // Runtime
-    pub init: bool,
+    /// C `prec->init` — see [`ConvertPhase`]. Set by `init_record` and by an
+    /// `SPC_LINCONV` put, cleared at the end of every `process`.
+    pub init: ConvertPhase,
     /// Set by `convert()` when a `LINR >= 3` breakpoint-table conversion
     /// fails — the table could not be resolved, or the engineering value
     /// fell past an end of the table. C `aoRecord.c::convert` raises
@@ -110,7 +119,7 @@ impl Default for AoRecord {
             eslo: 1.0,
             eoff: 0.0,
             roff: 0,
-            aslo: 1.0,
+            aslo: 0.0,
             aoff: 0.0,
             omsl: 0,
             dol: String::new(),
@@ -124,7 +133,7 @@ impl Default for AoRecord {
             lalm: 0.0,
             alst: 0.0,
             mlst: 0.0,
-            init: false,
+            init: ConvertPhase::default(),
             bpt_error: false,
             readback_bpt_error: false,
             bpt_registry: None,
@@ -250,7 +259,6 @@ impl AoRecord {
         }
 
         self.oraw = self.rval;
-        self.init = true;
     }
 
     /// C `processAo` readback `raw → eng` inverse convert (devAsynInt32.c:
@@ -389,7 +397,8 @@ impl Record for AoRecord {
                 self.eslo = saved_eslo;
             }
 
-            self.init = true;
+            // C `aoRecord.c:120`: `prec->init = TRUE;`
+            self.init = ConvertPhase::Initial;
         }
         Ok(())
     }
@@ -413,6 +422,9 @@ impl Record for AoRecord {
             self.convert();
         }
         self.skip_convert = false;
+        // C `aoRecord.c:237`: `prec->init = FALSE;` on the way out of EVERY
+        // process, not just the first one.
+        self.init = ConvertPhase::Converted;
         Ok(ProcessOutcome::complete())
     }
 
@@ -495,7 +507,7 @@ impl Record for AoRecord {
             "LALM" => Some(EpicsValue::Double(self.lalm)),
             "ALST" => Some(EpicsValue::Double(self.alst)),
             "MLST" => Some(EpicsValue::Double(self.mlst)),
-            "INIT" => Some(EpicsValue::Char(if self.init { 1 } else { 0 })),
+            "INIT" => Some(self.init.as_field()),
             "SIMM" => Some(EpicsValue::Short(self.simm)),
             "SIML" => Some(EpicsValue::String(self.siml.clone().into())),
             "SIOL" => Some(EpicsValue::String(self.siol.clone().into())),
@@ -583,9 +595,13 @@ impl Record for AoRecord {
             // ao the ungated rebase was worse than on an ai: EOFF feeds the
             // VAL→RVAL convert, so retuning the display range EGUL moved the
             // hardware output. See `ai.rs` for the full C excerpt.
+            // `special(SPC_LINCONV)` in aoRecord.dbd — C `special()` sets
+            // `prec->init = TRUE` for a put to any of LINR / EGUF / EGUL
+            // (aoRecord.c:254), so the retuned conversion starts fresh.
             "LINR" => match value {
                 EpicsValue::Short(v) => {
                     self.linr = v;
+                    self.init = ConvertPhase::Initial;
                     // A LINR change re-selects the breakpoint table (C
                     // `special_linconv`); drop the cached table + interval
                     // index so the next conversion resolves the new LINR.
@@ -598,6 +614,7 @@ impl Record for AoRecord {
             "EGUF" => match value {
                 EpicsValue::Double(v) => {
                     self.eguf = v;
+                    self.init = ConvertPhase::Initial;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
@@ -605,6 +622,7 @@ impl Record for AoRecord {
             "EGUL" => match value {
                 EpicsValue::Double(v) => {
                     self.egul = v;
+                    self.init = ConvertPhase::Initial;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),

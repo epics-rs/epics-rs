@@ -1142,6 +1142,29 @@ pub trait Record: Send + Sync + 'static {
         None
     }
 
+    /// The record's `get_enum_str` rset slot — how a `DBR_STRING` READ of its
+    /// `DBF_ENUM` `VAL` renders. A THIRD slot, distinct from the pair above:
+    /// C's `get_enum_str` (singular) is not `get_enum_strs` (plural), and
+    /// serving the read from the plural table is what made an undefined `mbbi`
+    /// state come out as its index.
+    ///
+    /// The difference is the trimming. `get_enum_strs` reports `no_str`, so the
+    /// label list stops at the last non-empty state; `get_enum_str` indexes the
+    /// state array *untrimmed* (`mbbiRecord.c:246-250`: any `val <= 15` reads
+    /// `zrst + val * sizeof(zrst)`, empty or not) and only an index past the
+    /// array reaches the sentinel. Verified on the compiled C `softIoc`: an
+    /// `mbbi` with `ZRST`/`ONST` set answers `caget -t` with `""` at `VAL=5` and
+    /// `"Illegal Value"` at `VAL=20`.
+    ///
+    /// `None` — the record leaves the rset slot NULL (`#define get_enum_str
+    /// NULL`), which is every record but `bi`/`bo`/`mbbi`/`mbbo`. A field on
+    /// such a record renders from its menu instead; see
+    /// [`RecordInstance::enum_string_form_for`](super::RecordInstance::enum_string_form_for),
+    /// the single owner that picks between the two.
+    fn enum_string_form(&self) -> Option<crate::server::snapshot::EnumStringForm> {
+        None
+    }
+
     /// Validate a put before it is applied. Return Err to reject.
     fn validate_put(&self, _field: &str, _value: &EpicsValue) -> CaResult<()> {
         Ok(())
@@ -1194,6 +1217,23 @@ pub trait Record: Send + Sync + 'static {
     /// sample in the buffer before the first scan.
     fn input_read_by_device_support(&self) -> bool {
         true
+    }
+
+    /// The rest of the soft INPUT device support's `init_record`, once the
+    /// constant-INP load above has (or has not) landed.
+    ///
+    /// Most soft dsets are exactly `recGblInitConstantLink()` and stop there —
+    /// a link they could not load leaves the record's own init state alone. The
+    /// ARRAY dsets do not: `devWfSoft.c:39-51` runs `dbLoadLinkArray` on every
+    /// waveform and sets `prec->nord = 0` when it fails (a real link, or none —
+    /// `dbLoadLinkArray` has no `loadArray` lset outside a constant), which is
+    /// why C serves `NORD = 0` on a `record(waveform,"X"){}` even though the
+    /// record's own `init_record` seeded `nord = (nelm == 1)` a moment earlier.
+    ///
+    /// `loaded` is whether a constant INP reached the value field. Defaulted to
+    /// a no-op: a dset that only seeds does not need this half.
+    fn soft_input_dset_init(&mut self, loaded: bool) {
+        let _ = loaded;
     }
 
     /// The `DTYP="Raw Soft Channel"` INPUT dset — C's four `devXxxSoftRaw.c`
@@ -1770,6 +1810,27 @@ pub trait Record: Send + Sync + 'static {
     /// Initialize record (pass 0: field defaults; pass 1: dependent init).
     fn init_record(&mut self, _pass: u8) -> CaResult<()> {
         Ok(())
+    }
+
+    /// Did `init_record` leave the record PERMANENTLY ACTIVE — C's
+    /// `prec->pact = TRUE` inside `init_record`, which is how a record type
+    /// disables itself when it cannot possibly process?
+    ///
+    /// `subRecord.c:119-123` is the live case: an empty `SNAM` has no
+    /// subroutine to call, so C prints `"%s.SNAM is empty"`, sets `pact = TRUE`
+    /// and returns 0. The record exists and serves its fields, but `dbProcess`
+    /// takes the PACT-active branch on every scan from then on — it never runs
+    /// record support again. `caget X.PACT` on a bare `record(sub,"X"){}` reads
+    /// 1 on a C IOC.
+    ///
+    /// PACT is a `dbCommon` field with a single owner
+    /// ([`RecordInstance::enter_pact`] / [`leave_pact`]), so a record cannot
+    /// park it from `init_record`. It reports the fact here and the owner
+    /// performs the transition, once, at the end of the init passes.
+    ///
+    /// [`leave_pact`]: crate::server::record::RecordInstance::leave_pact
+    fn init_record_parks_pact(&self) -> bool {
+        false
     }
 
     /// Post-init finalisation hook with mutable access to the
@@ -2799,13 +2860,7 @@ pub fn put_field_internal_default<R: Record + ?Sized>(
     let target_type = record
         .get_field(name)
         .map(|v| v.db_field_type())
-        .or_else(|| {
-            record
-                .field_list()
-                .iter()
-                .find(|f| f.name.eq_ignore_ascii_case(name))
-                .map(|f| f.dbf_type)
-        });
+        .or_else(|| crate::server::record::record_instance::declared_field_type_of(record, name));
     // An array source into a SCALAR destination delivers element 0. C's link
     // layer asks for exactly one element (`dbGetLink(..., nRequest = NULL)`), so
     // `dbGet` converts the field at offset 0 and the record sees a scalar — a
@@ -2865,10 +2920,7 @@ pub fn coerce_put_value<R: Record + ?Sized>(
     value: EpicsValue,
 ) -> CaResult<EpicsValue> {
     if let EpicsValue::String(s) = &value {
-        if let Some(choices) = record
-            .menu_field_choices(field)
-            .or_else(|| super::shared_menu_choices(field))
-        {
+        if let Some(choices) = super::record_instance::menu_choices_of(record, field) {
             return super::resolve_menu_field_string(field, choices, target, &s.as_str_lossy());
         }
         if target == DbFieldType::Enum {

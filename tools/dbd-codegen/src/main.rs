@@ -121,8 +121,10 @@ fn generate(dbd_dir: &Path) -> Result<String, String> {
 
     let mut menus: BTreeMap<String, parse::Menu> = BTreeMap::new();
     let mut records: Vec<parse::RecordType> = Vec::new();
+    let mut devices: Vec<parse::Device> = Vec::new();
     for path in &paths {
         let dbd = parse::parse_file(path, &common)?;
+        devices.extend(dbd.devices);
         for (name, menu) in dbd.menus {
             if let Some(prev) = menus.insert(name.clone(), menu) {
                 // Two `.dbd` files declaring the same menu name with different
@@ -156,13 +158,15 @@ fn generate(dbd_dir: &Path) -> Result<String, String> {
     eprintln!(
         "dbd-codegen: {} record types, {emitted} own fields emitted \
          ({dbaddr} typed from cvt_dbaddr.types), {internal} DBF_NOACCESS internals \
-         dropped, {} menus",
+         dropped, {} menus, {} device() entries",
         records.len(),
-        menus.len()
+        menus.len(),
+        devices.len()
     );
 
     let src = emit::emit(&emit::Input {
         menus: &menus,
+        devices: &devices,
         records: &records,
         common: &common,
         cvt: &cvt,

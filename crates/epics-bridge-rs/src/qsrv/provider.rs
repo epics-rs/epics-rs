@@ -175,12 +175,7 @@ impl AcfAccessControl {
         let (record_name, _field) = epics_base_rs::server::database::parse_pv_name(channel);
         if let Some(rec) = self.db.get_record(record_name).await {
             let inst = rec.read().await;
-            let asg = if inst.common.asg.is_empty() {
-                "DEFAULT".to_string()
-            } else {
-                inst.common.asg.clone()
-            };
-            return (asg, inst.common.asl);
+            return (inst.common.access_group().to_string(), inst.common.asl);
         }
         ("DEFAULT".to_string(), 0u8)
     }

@@ -7,7 +7,9 @@ use crate::error::{CaError, CaResult};
 use crate::server::event_queue::{EventReader, EventUser};
 use crate::server::pv::{MonitorEvent, Subscriber};
 use crate::server::recgbl::EventMask;
-use crate::server::snapshot::{ControlInfo, DisplayInfo, EnumInfo, PropertySupport};
+use crate::server::snapshot::{
+    ControlInfo, DisplayInfo, EnumInfo, EnumStringForm, PropertySupport,
+};
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
 use super::alarm::{AlarmSeverity, AnalogAlarmConfig};
@@ -341,39 +343,58 @@ fn epics_parse_int32_base10(s: &str) -> Option<i32> {
     i32::try_from(sign * magnitude).ok()
 }
 
-/// String-typed common fields (DESC, ASG, OUT, TSEL, …) and already-typed
-/// non-String writes pass through untouched, and an unparseable String is
-/// returned as-is so the arm drops it exactly as before. The runtime
-/// alarm-output fields (SEVR/STAT/NSEV/NSTA/ACKS) and debug flags
-/// (RPRO/TPRO/BKPT) are deliberately omitted: they are recomputed every
-/// process, not `.db` init directives, so coercing a loaded value would be
-/// overwritten immediately.
-fn coerce_common_field_string(
-    name: &str,
-    value: EpicsValue,
-    bound: MenuBound,
-) -> CaResult<EpicsValue> {
-    let s = match &value {
-        EpicsValue::String(s) => s,
-        _ => return Ok(value),
-    };
-    // Canonical DBF type per numeric/menu common field, chosen to match the
-    // variant its `put_common_field` arm binds. The `DBF_MENU` fields take
-    // `Enum`, C's `epicsEnum16` menu index.
-    let dbf = match name {
+/// The STORED type of a `dbCommon` field — the variant its
+/// [`RecordInstance::put_common_field_bounded`] arm binds, which is not always
+/// the type the `.dbd` DECLARES it as (a `menu()` field is declared `DBF_MENU`
+/// and served `DBR_ENUM`, but held here as its bare index).
+///
+/// String-typed common fields (DESC, ASG, OUT, TSEL, …) have no entry: their
+/// arms take the string verbatim.
+fn stored_common_field_type(name: &str) -> Option<DbFieldType> {
+    Some(match name {
         "SCAN" | "SSCN" | "PINI" => DbFieldType::Enum,
         "TSE" | "PHAS" | "PRIO" | "DISV" | "DISA" | "DISS" | "LCNT" | "UDFS" | "ACKT" | "ACKS"
         | "SEVR" | "STAT" | "NSEV" | "NSTA" => DbFieldType::Short,
         // The analog-alarm limits and the hysteresis margin — `DBF_DOUBLE` in
         // every dbd that declares them (`aiRecord.dbd.pod:357-388`,
         // `calcRecord.dbd.pod:716-744`, `sCalcoutRecord.dbd:479-531`). A field
-        // missing from this table reaches its arm as the loader's raw String,
-        // and an arm that binds a typed variant then drops it: that is how
-        // `field(HYST,"2")` silently became 0 on every record whose hysteresis
-        // lives in `common.hyst` (calc/calcout/scalcout/ai/ao/longin/int64in).
+        // missing from this table reaches its arm as whatever variant the caller
+        // built, and an arm that binds a typed variant then drops it: that is
+        // how `field(HYST,"2")` silently became 0 on every record whose
+        // hysteresis lives in `common.hyst`
+        // (calc/calcout/scalcout/ai/ao/longin/int64in).
         "HIHI" | "HIGH" | "LOW" | "LOLO" | "HYST" => DbFieldType::Double,
-        "DISP" | "UDF" => DbFieldType::Char,
-        _ => return Ok(value),
+        // The `DBF_UCHAR` flags. `bool` here, a NUMBER in C.
+        "DISP" | "UDF" | "TPRO" | "RPRO" | "BKPT" => DbFieldType::Char,
+        _ => return None,
+    })
+}
+
+/// **The single owner of "what type does a `dbCommon` field hold"**, run on
+/// EVERY put before the typed arms below see the value — so an arm may bind one
+/// variant and know the put cannot have arrived in another.
+///
+/// This is not a string-parsing convenience. A common field is reached by three
+/// writers with three different ideas of the value's shape: the db loader hands
+/// every field over as a raw `String`; a `dbPut` arrives coerced to the field's
+/// DECLARED type (`DBF_MENU` → `Enum` for PRIO, `DBF_UCHAR` → `Char` for DISP);
+/// an internal link delivers whatever its source stored. Before this ran on the
+/// non-`String` shapes too, each arm's single-variant `if let` was a silent
+/// drop for the other two writers — `caput REC.PRIO HIGH` resolved its label to
+/// `Enum(2)` and then vanished at the arm, leaving PRIO at 0.
+///
+/// An unparseable String is returned as-is so the arm drops it, and a menu
+/// field's bad label FAILS the put (`S_db_badChoice`) rather than landing as
+/// index 0.
+fn coerce_common_field(name: &str, value: EpicsValue, bound: MenuBound) -> CaResult<EpicsValue> {
+    let Some(dbf) = stored_common_field_type(name) else {
+        return Ok(value);
+    };
+    let EpicsValue::String(s) = &value else {
+        // Already typed: project onto the stored type through the one
+        // value-coercion owner. `convert_to` short-circuits a value that is
+        // already `dbf`, so the common case costs nothing.
+        return Ok(value.convert_to(dbf));
     };
     let text = s.as_str_lossy();
     // A `DBF_MENU` common field resolves its label against THAT field's own
@@ -601,6 +622,89 @@ pub(crate) struct DeadbandPost {
 /// `choices` (pvxs `pvalink_lset.cpp:344-356` — a `DBR_STRING` target copies
 /// `choices[index]`). A bare `Enum` index from a link whose labels the port
 /// cannot reach falls back to its decimal form, like the CA `*_STRING` encoder.
+/// **The** declaration lookup: a field's `dbFldDes`, in C's terms.
+///
+/// The `.dbd` is the declaration, so the table generated FROM the `.dbd` is
+/// asked first, for every record type that has one; a record's own
+/// [`Record::field_list`] is a hand-written stand-in consulted only for the
+/// record types the `.dbd` does not cover (`subArray`, and the downstream
+/// crates' records); `dbCommon` last, so a record-specific field shadows the
+/// common one.
+///
+/// A free function, not just a [`RecordInstance`] method, because the sites that
+/// need the declaration do not all hold an instance — a constant-link seed, a
+/// link write, the db loader all have `&dyn Record`. Every one of them used to
+/// reach into `record.field_list()` directly, which is how a record with BOTH
+/// tables (an `aSub`, whose hand table types `FTA` `DBF_SHORT` and carries no
+/// `menu()`, where the `.dbd` says `DBF_MENU`/`menu(menuFtype)`) served its
+/// declared type from one table and its choices from the other.
+///
+/// `None` for a field with no declaration at all: a virtual field (`RTYP`,
+/// `TIME`, ...), which C answers from dbStaticLib rather than from a `dbFldDes`.
+pub(crate) fn field_desc_of<R: Record + ?Sized>(
+    record: &R,
+    field: &str,
+) -> Option<&'static FieldDesc> {
+    let named = |t: &'static [FieldDesc]| t.iter().find(|f| f.name.eq_ignore_ascii_case(field));
+    super::dbd_generated::record_fields(record.record_type())
+        .and_then(named)
+        .or_else(|| named(record.field_list()))
+        .or_else(|| named(super::dbd_generated::DB_COMMON_FIELDS))
+}
+
+/// **The single owner of "which choice list does this field resolve against"**,
+/// asked by BOTH sides of a menu field:
+///
+/// * the READ side ([`RecordInstance::enum_string_form_for`]) — C `getMenuString`,
+///   which renders the stored index as its choice;
+/// * the WRITE side ([`crate::server::record::coerce_put_value`]) — C
+///   `putStringMenu`, which resolves an incoming label to that same index.
+///
+/// They MUST see the same list or the field is not round-trippable. The write
+/// side used to ask only [`Record::menu_field_choices`] (the record's hand
+/// table), so an `aSub`'s `caput FTA LONG` found no menu, fell through to the
+/// numeric parse and landed as index 0 — while the read side, on the `.dbd`
+/// menu, rendered index 0 as `STRING`.
+///
+/// Order is C's: the field's own `menu()` from the declaration, then the
+/// record's hand table where the `.dbd` does not reach (the downstream crates'
+/// record types), then the `dbCommon` menus.
+pub(crate) fn menu_choices_of<R: Record + ?Sized>(
+    record: &R,
+    field: &str,
+) -> Option<&'static [&'static str]> {
+    // `DTYP` is `DBF_DEVICE`: its choices are the record type's DEVICE menu
+    // (C `dbDeviceMenu`, built from the `device()` declarations), which is
+    // per-record-type and so cannot live in the shared `dbCommon` FieldDesc.
+    if field.eq_ignore_ascii_case("DTYP") {
+        return super::dbd_generated::device_menu(record.record_type());
+    }
+    field_desc_of(record, field)
+        .and_then(|f| f.menu)
+        .or_else(|| record.menu_field_choices(field))
+        .or_else(|| super::menu_choices::shared_menu_choices(field))
+}
+
+/// The `DBF_*` type `field` is SERVED as, for a caller that holds only a
+/// `&dyn Record` — the free-function form of
+/// [`RecordInstance::declared_field_type`], and the ONLY way any site outside
+/// the instance may turn a [`FieldDesc`] into a type.
+///
+/// A [`FieldDesc::runtime_typed`] field (`waveform.VAL` typed by `FTVL`, an
+/// `aSub`'s `A`..`U` typed by `FTA`..`FTU`) has NO type in its declaration: C's
+/// `cvt_dbaddr` overwrites `paddr->field_type` from record state, so the `.dbd`
+/// entry is a placeholder and the value the record stores is the answer. Every
+/// caller falls back to that value, which is why this returns `None` rather than
+/// the placeholder — handing out `DBF_DOUBLE` for a `FTVL=CHAR` waveform is how
+/// a string written down an output link became `0.0`.
+pub(crate) fn declared_field_type_of<R: Record + ?Sized>(
+    record: &R,
+    field: &str,
+) -> Option<DbFieldType> {
+    let desc = field_desc_of(record, field)?;
+    (!desc.runtime_typed).then_some(desc.dbf_type)
+}
+
 pub(crate) fn value_as_dbr_string(value: &EpicsValue) -> Option<PvString> {
     match value {
         EpicsValue::String(s) => Some(s.clone()),
@@ -746,6 +850,15 @@ impl RecordInstance {
             eprintln!("post_init_finalize_undef failed for {name}: {e}");
         }
         self.common.udf = udf;
+        // C `init_record` can END with `prec->pact = TRUE` to disable a record
+        // it cannot process (`subRecord.c:119-123`, an empty SNAM). PACT has one
+        // owner, so the record declares the fact and the owner parks it — after
+        // the passes, so the `leave_pact()` above cannot undo it. There is
+        // nothing to release later: `dbProcess` takes the PACT-active branch on
+        // every scan from here on, which is exactly the point.
+        if self.record.init_record_parks_pact() {
+            self.enter_pact();
+        }
     }
 
     /// SINGLE OWNER of the DTYP -> soft-output-dset mapping. The dset table
@@ -942,12 +1055,7 @@ impl RecordInstance {
         if DBCOMMON_NOMOD.iter().any(|f| f.eq_ignore_ascii_case(field)) {
             return true;
         }
-        if self
-            .record
-            .field_list()
-            .iter()
-            .any(|f| f.name.eq_ignore_ascii_case(field) && f.read_only)
-        {
+        if self.field_desc(field).is_some_and(|f| f.read_only) {
             return true;
         }
         self.record.field_no_mod(field)
@@ -1058,13 +1166,82 @@ impl RecordInstance {
     /// the same field name different menus. Asking the field's own descriptor
     /// first removes that assumption.
     fn menu_choices_for(&self, field: &str) -> Option<&'static [&'static str]> {
-        self.record
-            .field_list()
+        menu_choices_of(self.record.as_ref(), field)
+    }
+
+    /// The choices this record's `DTYP` selects among — C's `dbDeviceMenu` for
+    /// the record type, in `.dbd` declaration order.
+    ///
+    /// C's DTYP field IS the index into this list, and an unset DTYP is index 0
+    /// — which is why a bare `record(ai,"X"){}` serves `Soft Channel` and a
+    /// `record(calc,"X"){}`, whose record type declares no device support at
+    /// all, serves the empty string.
+    ///
+    /// The port stores the device NAME rather than the index, because the name
+    /// is what the device-support registry dispatches on, and a name registered
+    /// at runtime by a downstream crate (`asynInt32`) has no `device()` line in
+    /// any vendored `.dbd`. Such a name is appended as its own slot, so the
+    /// index and the string still name the SAME device support: there is no
+    /// value of DTYP that renders as a device this record is not bound to.
+    pub(crate) fn device_choices(&self) -> Vec<PvString> {
+        let declared = super::dbd_generated::device_menu(self.record.record_type()).unwrap_or(&[]);
+        let mut slots: Vec<PvString> = declared.iter().map(|c| PvString::from(*c)).collect();
+        let dtyp = self.common.dtyp.as_str();
+        if !dtyp.is_empty() && !declared.contains(&dtyp) {
+            slots.push(PvString::from(dtyp));
+        }
+        slots
+    }
+
+    /// The value of the `DTYP` field: the index of the bound device support in
+    /// [`Self::device_choices`]. An unset DTYP is index 0, exactly as in C.
+    pub(crate) fn dtyp_index(&self) -> u16 {
+        let dtyp = self.common.dtyp.as_str();
+        if dtyp.is_empty() {
+            return 0;
+        }
+        self.device_choices()
             .iter()
-            .find(|f| f.name.eq_ignore_ascii_case(field))
-            .and_then(|f| f.menu)
-            .or_else(|| self.record.menu_field_choices(field))
-            .or_else(|| super::menu_choices::shared_menu_choices(field))
+            .position(|c| c.as_str_lossy() == dtyp)
+            .unwrap_or(0) as u16
+    }
+
+    /// **The** owner of "what string does this enum-valued field render as" —
+    /// C's `[DBF_*][DBR_STRING]` conversion row, chosen by the field's DBF
+    /// class. Every path that renders an enum as a string goes through here:
+    /// the CA/PVA encoders (via [`snapshot::EnumInfo::string_form`] on the
+    /// snapshot this builds) and the db-link read
+    /// ([`Self::field_as_dbr_string`]). There is exactly one such table per
+    /// field, and no path may reconstruct a second one.
+    ///
+    /// C's dispatch, and this function's, in the same order:
+    ///
+    /// * `DBF_MENU` / `DBF_DEVICE` -> `getMenuString` / `getDeviceString`, the
+    ///   field's own choice list. Asked FIRST, because a menu field on a record
+    ///   whose `VAL` is an enum (`bo.OMSL`) must render its menu's choices, not
+    ///   the record's `ZNAM`/`ONAM`.
+    /// * `DBF_ENUM` `VAL` -> `getEnumString` -> the record's `get_enum_str`
+    ///   rset ([`Record::enum_string_form`](super::record_trait::Record::enum_string_form)).
+    ///
+    /// `None` when the field has neither — C answers `S_db_noRSET`, an error;
+    /// the port renders empty.
+    ///
+    /// Each class brings its own out-of-range rule with it (see
+    /// [`EnumOverflow`](crate::server::snapshot::EnumOverflow)); the index is
+    /// rendered as a number for a `DBF_MENU` and ONLY for a `DBF_MENU`.
+    pub(crate) fn enum_string_form_for(&self, field: &str) -> Option<EnumStringForm> {
+        if field.eq_ignore_ascii_case("DTYP") {
+            return Some(EnumStringForm::device(self.device_choices()));
+        }
+        if let Some(choices) = self.menu_choices_for(field) {
+            return Some(EnumStringForm::menu(
+                choices.iter().map(|c| PvString::from(*c)),
+            ));
+        }
+        if field.eq_ignore_ascii_case("VAL") {
+            return self.record.enum_string_form();
+        }
+        None
     }
 
     /// Is `field` one of the DBF classes C's soft device support writes as
@@ -1125,36 +1302,23 @@ impl RecordInstance {
     /// the field metadata — the link-read owner has an index and nothing to
     /// resolve it with.
     ///
-    /// An index past the configured labels falls back to its decimal form, the
-    /// same rule the CA `*_STRING` encoder applies (`types/codec.rs::enum_label`).
+    /// The render goes through [`Self::enum_string_form_for`], the same owner
+    /// the CA/PVA encoders use, so a link read and a `caget -t` of one field can
+    /// never disagree about its string.
     pub(crate) fn field_as_dbr_string(&self, field: &str) -> Option<PvString> {
         let value = self.resolve_field(field)?;
         // A `DBF_ENUM` index, and a `DBF_MENU` index (stored as a short),
-        // resolve through this record's label tables: the field's `menu()`
-        // choices, else the record's own enum states (the `get_enum_str` table
-        // the snapshot builder already assembles). A short field that is neither
-        // has no table and stays the plain number C converts it to.
+        // render through the field's string source. A short field that is
+        // neither has no source and stays the plain number C converts it to.
         let idx = match value {
             EpicsValue::Enum(v) => Some(v),
             EpicsValue::Short(v) => u16::try_from(v).ok(),
             _ => None,
         };
-        if let Some(idx) = idx {
-            if let Some(label) = self
-                .menu_choices_for(field)
-                .and_then(|c| c.get(idx as usize))
-            {
-                return Some(PvString::from(*label));
-            }
-            if matches!(value, EpicsValue::Enum(_))
-                && let Some(label) = self
-                    .cached_metadata()
-                    .enums
-                    .and_then(|e| e.strings.get(idx as usize).cloned())
-                && !label.is_empty()
-            {
-                return Some(label);
-            }
+        if let Some(idx) = idx
+            && let Some(form) = self.enum_string_form_for(field)
+        {
+            return Some(form.render(idx));
         }
         value_as_dbr_string(&value)
     }
@@ -1182,11 +1346,7 @@ impl RecordInstance {
     /// (`RTYP`, `TIME`, ...), which C answers from dbStaticLib rather than
     /// from a `dbFldDes`.
     pub(crate) fn field_desc(&self, field: &str) -> Option<&'static FieldDesc> {
-        let named = |t: &'static [FieldDesc]| t.iter().find(|f| f.name.eq_ignore_ascii_case(field));
-        super::dbd_generated::record_fields(self.record.record_type())
-            .and_then(named)
-            .or_else(|| named(self.record.field_list()))
-            .or_else(|| named(super::dbd_generated::DB_COMMON_FIELDS))
+        field_desc_of(self.record.as_ref(), field)
     }
 
     /// The `DBF_*` type `field` is SERVED as — the single source of truth for
@@ -1210,8 +1370,7 @@ impl RecordInstance {
     /// In both cases the value's own type is the answer, so this returns
     /// `None` and [`Self::project_to_declared_type`] leaves the value alone.
     pub fn declared_field_type(&self, field: &str) -> Option<DbFieldType> {
-        let desc = self.field_desc(field)?;
-        (!desc.runtime_typed).then_some(desc.dbf_type)
+        declared_field_type_of(self.record.as_ref(), field)
     }
 
     /// Project a field's stored value onto its declared type
@@ -1262,14 +1421,26 @@ impl RecordInstance {
     /// shares a name with the alarm-severity menu) is served as its own
     /// declared string and gets no choice table.
     fn attach_menu_enum(&self, field: &str, snap: &mut super::super::snapshot::Snapshot) {
-        let Some(choices) = self.menu_choices_for(field) else {
+        if !matches!(snap.value, EpicsValue::Enum(_)) {
+            return;
+        }
+        // `VAL` is the one field whose two rset slots differ: C's
+        // `get_enum_strs` (the `DBR_GR_ENUM` labels) is TRIMMED to `no_str`
+        // while `get_enum_str` (the DBR_STRING form) indexes the untrimmed
+        // state array. `populate_enum_info` owns that pair; every OTHER
+        // enum-valued field is a menu or a device, whose one choice list
+        // answers both (C `getMenuString`/`getDeviceString` index the same
+        // `papChoiceValue` the GR_ENUM reply carries).
+        if field.eq_ignore_ascii_case("VAL") {
+            return;
+        }
+        let Some(form) = self.enum_string_form_for(field) else {
             return;
         };
-        if matches!(snap.value, EpicsValue::Enum(_)) {
-            snap.enums = Some(super::super::snapshot::EnumInfo {
-                strings: choices.iter().map(|s| PvString::from(*s)).collect(),
-            });
-        }
+        snap.enums = Some(super::super::snapshot::EnumInfo::with_string_form(
+            form.slots.clone(),
+            form,
+        ));
     }
 
     /// Build a Snapshot with full metadata for the given field.
@@ -1899,9 +2070,18 @@ impl RecordInstance {
     /// by construction. It arrives already trimmed to C's `no_str` (bi/bo/busy
     /// drop an empty ONAM behind a set ZNAM — `boRecord.c:342-352`; mbbi/mbbo
     /// cut at the last non-empty state — `mbbiRecord.c:262-269`).
+    ///
+    /// The `DBR_STRING` half of the same channel is the record's OTHER rset slot
+    /// (`get_enum_str`), which is not this trimmed list — see
+    /// [`EnumStringForm`]. A record that has no such slot (every record but
+    /// bi/bo/busy/mbbi/mbbo, including the downstream crates' own enum records)
+    /// renders from its label list, which is what C's absent slot amounts to.
     fn populate_enum_info(&self, snap: &mut super::super::snapshot::Snapshot) {
         if let Some(strings) = self.record.enum_state_strings() {
-            snap.enums = Some(super::super::snapshot::EnumInfo { strings });
+            snap.enums = Some(match self.record.enum_string_form() {
+                Some(form) => super::super::snapshot::EnumInfo::with_string_form(strings, form),
+                None => super::super::snapshot::EnumInfo::new(strings),
+            });
         }
     }
 
@@ -1984,7 +2164,10 @@ impl RecordInstance {
                 Some(EpicsValue::String(self.common.inp.clone().into()))
             }
             "OUT" => Some(EpicsValue::String(self.common.out.clone().into())),
-            "DTYP" => Some(EpicsValue::String(self.common.dtyp.clone().into())),
+            // C's DTYP is `DBF_DEVICE`: an epicsEnum16 index into the record
+            // type's device menu, NOT the name. The name is what this port
+            // stores and dispatches on; the index is what the wire carries.
+            "DTYP" => Some(EpicsValue::Enum(self.dtyp_index())),
             "TSE" => Some(EpicsValue::Short(self.common.tse)),
             "TSEL" => Some(EpicsValue::String(self.common.tsel.clone().into())),
             // C `UTAG` is DBF_UINT64 — exposed natively as the unsigned
@@ -2283,7 +2466,7 @@ impl RecordInstance {
         // typed arms below apply a `field(PHAS, "1")` / `field(PRIO, "HIGH")`
         // directive instead of silently dropping it at IOC load. String-typed
         // and already-typed values pass through unchanged.
-        let value = coerce_common_field_string(&name, value, bound)?;
+        let value = coerce_common_field(&name, value, bound)?;
         match name.as_str() {
             // `special(SPC_NOMOD)` — C `dbPutSpecial` refuses the put with
             // `S_db_noMod` (dbAccess.c:123-127). OLDSIMM is written only by the
@@ -2349,7 +2532,7 @@ impl RecordInstance {
                 }
             }
             // The `String` form never reaches these three menu arms:
-            // `coerce_common_field_string` has already run it through the one
+            // `coerce_common_field` has already run it through the one
             // menu converter, which either produced an `Enum` index or failed
             // the put with `S_db_badChoice`.
             "SCAN" => {
@@ -2457,11 +2640,31 @@ impl RecordInstance {
                     self.record.special(&name, true)?;
                 }
             }
-            "DTYP" => {
-                if let EpicsValue::String(s) = value {
-                    self.common.dtyp = s.as_str_lossy().into_owned();
+            // Two shapes reach DTYP and both name a device support:
+            //
+            // * the `.db` loader hands over the NAME verbatim, and it may be a
+            //   name registered at runtime by a downstream crate ("asynInt32")
+            //   that no vendored `.dbd` declares — C would reject that at load,
+            //   the port's registry accepts it (Tier 3);
+            // * a `dbPut` arrives as the menu INDEX, because `DBF_DEVICE` is
+            //   served as `DBR_ENUM` and `coerce_put_value` already resolved an
+            //   incoming label through the device menu (C `putStringMenu`,
+            //   which fails `S_db_badChoice` on a name the menu does not have).
+            //
+            // The index is only meaningful against the DECLARED menu, which is
+            // what the converter bounded it by.
+            "DTYP" => match value {
+                EpicsValue::String(s) => self.common.dtyp = s.as_str_lossy().into_owned(),
+                EpicsValue::Enum(i) => {
+                    let declared =
+                        super::dbd_generated::device_menu(self.record.record_type()).unwrap_or(&[]);
+                    match declared.get(i as usize) {
+                        Some(name) => self.common.dtyp = (*name).to_string(),
+                        None => return Ok(CommonFieldPutResult::NoChange),
+                    }
                 }
-            }
+                _ => return Ok(CommonFieldPutResult::NoChange),
+            },
             "TSE" => {
                 if let EpicsValue::Short(v) = value {
                     self.common.tse = v;
@@ -2598,11 +2801,11 @@ impl RecordInstance {
                     self.common.lcnt = v;
                 }
             }
-            "DISP" => match value {
-                EpicsValue::Char(v) => self.common.disp = v != 0,
-                EpicsValue::Short(v) => self.common.disp = v != 0,
-                _ => {}
-            },
+            "DISP" => {
+                if let EpicsValue::Char(v) = value {
+                    self.common.disp = v != 0;
+                }
+            }
             "PUTF" => return Err(CaError::ReadOnlyField("PUTF".into())),
             "RPRO" => {
                 if let EpicsValue::Char(v) = value {
@@ -2612,7 +2815,7 @@ impl RecordInstance {
             "PACT" => return Err(CaError::ReadOnlyField("PACT".into())),
             "PROC" => { /* Trigger handled by put_record_field_from_ca; no-op here */ }
             // Analog alarm limits. The DB-load String was already coerced to
-            // `Double` by `coerce_common_field_string` — the one owner of
+            // `Double` by `coerce_common_field` — the one owner of
             // "what type does this common field hold" — so every writer
             // (`.db` load, `caput`, a link) lands here with a numeric value.
             "HIHI" => {

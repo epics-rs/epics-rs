@@ -893,11 +893,18 @@ fn test_ai_smoothing() {
     rec.eslo = 1.0;
     rec.aslo = 1.0;
     rec.smoo = 0.5;
+    // `init_record` is what arms the INIT phase (C `aiRecord.c:114`), and the
+    // phase is what makes the first conversion SMOO's initial condition rather
+    // than a blend against the pre-init VAL. A `.db` load always runs it.
+    rec.init_record(0).unwrap();
 
     rec.rval = 100;
     rec.process().unwrap();
     assert!((rec.val - 100.0).abs() < 1e-10);
-    assert!(rec.init);
+    assert!(
+        !rec.init.is_initial(),
+        "C clears INIT at the end of every process (aiRecord.c:170)"
+    );
 
     rec.rval = 200;
     rec.process().unwrap();
@@ -2836,4 +2843,104 @@ fn desc_preserves_non_utf8_bytes() {
         ),
         other => panic!("expected EpicsValue::String, got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// R21: an enum-valued field's DBR_STRING form. C renders it from the FIELD's
+// own string source — the record's `get_enum_str` rset for a `DBF_ENUM` VAL,
+// the menu's choice list for a `DBF_MENU` field — and NEVER as the decimal
+// index. The port used to index the `no_str`-trimmed GR_ENUM label list and
+// fall back to the number, so a `record(mbbi,"X"){}` served its VAL as "0"
+// where C serves "".
+//
+// The cases are the boundaries of that lookup, not a story: slot defined /
+// slot in range but empty / index past the slots / no table at all. Every
+// expectation below was measured on the compiled C `softIoc` (see the module
+// doc on `EnumStringForm`).
+// ---------------------------------------------------------------------------
+
+/// `caget -t` of the field, i.e. a DBR_STRING (0) read: the 40-byte payload up
+/// to its NUL.
+fn dbr_string_of(inst: &RecordInstance, field: &str) -> String {
+    let snap = inst.snapshot_for_field(field).unwrap();
+    let bytes = epics_base_rs::types::encode_dbr(0, &snap).unwrap();
+    let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..end]).into_owned()
+}
+
+fn mbbi_with_states() -> epics_base_rs::server::records::mbbi::MbbiRecord {
+    use epics_base_rs::server::records::mbbi::MbbiRecord;
+    let mut rec = MbbiRecord::default();
+    rec.zrst = "zero".into();
+    rec.onst = "one".into();
+    rec
+}
+
+#[test]
+fn r21_enum_val_defined_slot_renders_its_state() {
+    let mut rec = mbbi_with_states();
+    rec.val = 1;
+    let inst = RecordInstance::new("MBBI:R21".into(), rec);
+    assert_eq!(dbr_string_of(&inst, "VAL"), "one");
+}
+
+/// BOUNDARY: index inside the 16 slots but with no state string. C `strncpy`s
+/// the empty state (`mbbiRecord.c:246-250`) — measured `caput VAL 5` -> `[]`.
+/// The trimmed label list stops at 2 here, which is exactly what used to push
+/// this case onto the decimal fallback.
+#[test]
+fn r21_enum_val_undefined_slot_in_range_renders_empty() {
+    let mut rec = mbbi_with_states();
+    rec.val = 5;
+    let inst = RecordInstance::new("MBBI:R21".into(), rec);
+    assert_eq!(dbr_string_of(&inst, "VAL"), "");
+}
+
+/// BOUNDARY: index past the 16 slots. Measured `caput VAL 20` ->
+/// `[Illegal Value]` — with a SPACE, the mbbi/mbbo spelling.
+#[test]
+fn r21_enum_val_past_the_slots_renders_illegal_value() {
+    let mut rec = mbbi_with_states();
+    rec.val = 20;
+    let inst = RecordInstance::new("MBBI:R21".into(), rec);
+    assert_eq!(dbr_string_of(&inst, "VAL"), "Illegal Value");
+}
+
+/// BOUNDARY: no state strings at all. `record(mbbi,"X"){}` — the oracle case.
+/// C serves the empty state; the port served "0".
+#[test]
+fn r21_enum_val_with_no_states_renders_empty_not_zero() {
+    use epics_base_rs::server::records::mbbi::MbbiRecord;
+    let inst = RecordInstance::new("MBBI:R21".into(), MbbiRecord::default());
+    assert_eq!(dbr_string_of(&inst, "VAL"), "");
+}
+
+/// The two-state records index slot 1 even when ONAM is empty, where their
+/// `no_str` label list has been trimmed to 1 (`boRecord.c:342-352`). Measured:
+/// a `bi` with only ZNAM set, `caput VAL 1` -> `[]`.
+#[test]
+fn r21_binary_enum_val_empty_onam_renders_empty() {
+    let mut rec = BiRecord::new(0);
+    rec.znam = "off".into();
+    rec.val = 1;
+    let inst = RecordInstance::new("BI:R21".into(), rec);
+    assert_eq!(
+        inst.snapshot_for_field("VAL")
+            .unwrap()
+            .enums
+            .unwrap()
+            .strings
+            .len(),
+        1
+    );
+    assert_eq!(dbr_string_of(&inst, "VAL"), "");
+}
+
+/// A `DBF_MENU` field renders its MENU's choice, not the record's VAL states —
+/// the record here has both, and they must not cross.
+#[test]
+fn r21_menu_field_renders_its_own_choice_not_the_records_states() {
+    let rec = mbbi_with_states();
+    let inst = RecordInstance::new("MBBI:R21".into(), rec);
+    assert_eq!(dbr_string_of(&inst, "SCAN"), "Passive");
 }

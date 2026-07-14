@@ -1,6 +1,6 @@
 use crate::error::{CaError, CaResult};
 use crate::server::record::{
-    FieldDesc, MENU_YES_NO, ProcessAction, ProcessOutcome, Record, parse_link_v2,
+    FieldDesc, Ftype, MENU_FTYPE, MENU_YES_NO, ProcessAction, ProcessOutcome, Record, parse_link_v2,
 };
 use crate::server::records::count_put;
 use crate::types::{DbFieldType, EpicsValue, PvString};
@@ -45,7 +45,17 @@ pub struct WaveformRecord {
     pub val: EpicsValue,
     pub nelm: i32,
     pub nord: i32,
-    pub ftvl: i16,
+    /// `FTVL` — the element type of the VAL buffer, C's `prec->ftvl`. Held as the
+    /// TYPE, not as the menu index: [`Ftype`] is the single owner of the
+    /// index↔element-type mapping, so an FTVL the buffer has no storage for is
+    /// unrepresentable.
+    ///
+    /// Private, and written only by [`Self::set_ftvl`], which reallocates VAL in
+    /// the same breath (C allocates `bptr` from `dbValueSize(ftvl)` and never
+    /// re-types it independently). A `pub` field let a caller retype FTVL while
+    /// VAL kept its old element variant — the desync the `field_list`/`get_field`
+    /// pair then reports two different native types from.
+    ftvl: Ftype,
     pub mpst: i16, // Monitor Post Mode: 0=Always, 1=OnChange
     pub apst: i16, // Archive Post Mode: 0=Always, 1=OnChange
     pub hash: u32, // Hash of array for OnChange detection
@@ -116,6 +126,16 @@ pub struct WaveformRecord {
     /// framework reports the outcome through `set_resolved_input_links`.
     dol_fetch_requested: bool,
     dol_read_failed: bool,
+    /// The element count the record ARRIVED at `init_record` with — elements an
+    /// in-process `record()` build put into VAL before `add_record`. C has no
+    /// such path (VAL is `DBF_NOACCESS` on all four `.dbd`s, so a `.db` cannot
+    /// fill the buffer and C's dsets are calloc'd-empty by construction), which
+    /// is why C's `init_record`s are free to overwrite NORD outright. The port's
+    /// builder path is real data, so the init-time NORD rules
+    /// ([`Record::init_record`], [`Record::soft_input_dset_init`]) may only
+    /// decide the count for a record that arrived EMPTY — never discard this.
+    /// Captured at pass 0, before the record's own seed runs.
+    prebuilt_nord: i32,
 }
 
 /// Type aliases for documentation / pattern-match clarity. All point
@@ -124,9 +144,6 @@ pub struct WaveformRecord {
 pub type AaiRecord = WaveformRecord;
 pub type AaoRecord = WaveformRecord;
 pub type SubArrayRecord = WaveformRecord;
-
-/// menuFtype constants for FTVL field.
-const MENU_FTYPE_DOUBLE: i16 = 10;
 
 /// `menu(waveformPOST)` choice labels for the `MPST`/`APST` fields, in
 /// `.dbd` value order (`waveformRecord.dbd.pod:20-23`). The order is the
@@ -171,18 +188,14 @@ impl Default for WaveformRecord {
     fn default() -> Self {
         Self {
             kind: ArrayKind::Waveform,
-            val: EpicsValue::DoubleArray(Vec::new()),
+            val: EpicsValue::StringArray(Vec::new()),
             nelm: 1,
             nord: 0,
-            // Intentional deviation: C `field(FTVL,DBF_MENU){ menu(menuFtype) }`
-            // (waveform/aai/aao) carries no `initial(...)`, so C defaults FTVL
-            // to menuFtype index 0 = DBF_STRING. The port has no string-array
-            // waveform support (`reallocate_val` has no StringArray branch), so
-            // a STRING default would leave FTVL=STRING with a DoubleArray VAL —
-            // inconsistent. DOUBLE keeps FTVL and the VAL buffer type in sync;
-            // a .db that sets FTVL re-derives VAL via the FTVL put, so this
-            // default only applies to a (degenerate) omitted-FTVL waveform.
-            ftvl: MENU_FTYPE_DOUBLE,
+            // `field(FTVL,DBF_MENU){ menu(menuFtype) }` carries no `initial(...)`
+            // in any of the four `.dbd`s, so the calloc'd record starts at menu
+            // index 0 = STRING and a `record(waveform,"X"){}` serves `FTVL=STRING`
+            // on a C IOC (measured: `caget -t P:WAVEFORM.FTVL` -> `STRING`).
+            ftvl: Ftype::String,
             mpst: 0,
             apst: 0,
             hash: 0,
@@ -214,6 +227,7 @@ impl Default for WaveformRecord {
             constant_dol_loaded: false,
             dol_fetch_requested: false,
             dol_read_failed: false,
+            prebuilt_nord: 0,
         }
     }
 }
@@ -258,45 +272,34 @@ impl WaveformRecord {
 }
 
 impl WaveformRecord {
-    pub fn new(nelm: i32, ftvl: DbFieldType) -> Self {
-        // Map DBR type to menuFtype index for the ftvl field.
-        // DBR and menuFtype have different numbering.
-        let (val, ftvl_idx) = match ftvl {
-            DbFieldType::Char => (EpicsValue::CharArray(vec![0; nelm as usize]), 1), // CHAR
-            DbFieldType::UChar => (EpicsValue::UCharArray(vec![0; nelm as usize]), 2), // UCHAR
-            DbFieldType::Short => (EpicsValue::ShortArray(vec![0; nelm as usize]), 3), // SHORT
-            DbFieldType::Long => (EpicsValue::LongArray(vec![0; nelm as usize]), 5), // LONG
-            DbFieldType::Int64 => (EpicsValue::Int64Array(vec![0; nelm as usize]), 7), // INT64
-            DbFieldType::UInt64 => (EpicsValue::UInt64Array(vec![0; nelm as usize]), 8), // UINT64
-            DbFieldType::Float => (EpicsValue::FloatArray(vec![0.0; nelm as usize]), 9), // FLOAT
-            DbFieldType::Double => (EpicsValue::DoubleArray(vec![0.0; nelm as usize]), 10), // DOUBLE
-            _ => (EpicsValue::DoubleArray(vec![0.0; nelm as usize]), 10),
-        };
+    pub fn new(nelm: i32, element_type: DbFieldType) -> Self {
+        let ftvl = Ftype::of_element_type(element_type);
         Self {
-            val,
+            val: ftvl.zeroed(nelm.max(0) as usize),
             nelm,
             nord: 0,
-            ftvl: ftvl_idx,
+            ftvl,
             ..Default::default()
         }
     }
 
+    /// The VAL buffer's element type, as a `menuFtype` choice.
+    pub fn ftvl(&self) -> Ftype {
+        self.ftvl
+    }
+
+    /// Retype the VAL buffer. The buffer is reallocated (zero-filled, `NORD = 0`)
+    /// exactly as C's `init_record` `callocMustSucceed(nelm, dbValueSize(ftvl))`
+    /// does, so FTVL and the VAL variant cannot disagree.
+    pub fn set_ftvl(&mut self, ftvl: Ftype) {
+        self.ftvl = ftvl;
+        self.reallocate_val();
+    }
+
     /// The element type of the VAL buffer for the current FTVL — the C
-    /// `dbValueSize(prec->ftvl)` element `bptr` is typed with. Kept in lockstep
-    /// with [`Self::reallocate_val`] (the storage owner): both map USHORT onto
-    /// the SHORT buffer and ULONG onto the LONG one, and both fall back to
-    /// DOUBLE for the element types the port has no array storage for.
+    /// `dbValueSize(prec->ftvl)` element `bptr` is typed with.
     fn ftvl_element_type(&self) -> DbFieldType {
-        match self.ftvl {
-            1 => DbFieldType::Char,
-            2 => DbFieldType::UChar,
-            3 | 4 => DbFieldType::Short,
-            5 | 6 => DbFieldType::Long,
-            7 => DbFieldType::Int64,
-            8 => DbFieldType::UInt64,
-            9 => DbFieldType::Float,
-            _ => DbFieldType::Double,
-        }
+        self.ftvl.element_type()
     }
 
     /// How many elements the VAL buffer physically holds — the single owner of
@@ -369,20 +372,28 @@ impl WaveformRecord {
             EpicsValue::CharArray(a) => land!(a, CharArray, 0),
             EpicsValue::UCharArray(a) => land!(a, UCharArray, 0),
             EpicsValue::ShortArray(a) => land!(a, ShortArray, 0),
+            EpicsValue::UShortArray(a) => land!(a, UShortArray, 0),
             EpicsValue::LongArray(a) => land!(a, LongArray, 0),
+            EpicsValue::ULongArray(a) => land!(a, ULongArray, 0),
             EpicsValue::Int64Array(a) => land!(a, Int64Array, 0),
             EpicsValue::UInt64Array(a) => land!(a, UInt64Array, 0),
             EpicsValue::FloatArray(a) => land!(a, FloatArray, 0.0),
             EpicsValue::DoubleArray(a) => land!(a, DoubleArray, 0.0),
+            EpicsValue::EnumArray(a) => land!(a, EnumArray, 0),
+            EpicsValue::StringArray(a) => land!(a, StringArray, PvString::new()),
             // Scalar source: one element, into bptr[0].
             EpicsValue::Char(x) => land!(vec![x], CharArray, 0),
             EpicsValue::UChar(x) => land!(vec![x], UCharArray, 0),
             EpicsValue::Short(x) => land!(vec![x], ShortArray, 0),
+            EpicsValue::UShort(x) => land!(vec![x], UShortArray, 0),
             EpicsValue::Long(x) => land!(vec![x], LongArray, 0),
+            EpicsValue::ULong(x) => land!(vec![x], ULongArray, 0),
             EpicsValue::Int64(x) => land!(vec![x], Int64Array, 0),
             EpicsValue::UInt64(x) => land!(vec![x], UInt64Array, 0),
             EpicsValue::Float(x) => land!(vec![x], FloatArray, 0.0),
             EpicsValue::Double(x) => land!(vec![x], DoubleArray, 0.0),
+            EpicsValue::Enum(x) => land!(vec![x], EnumArray, 0),
+            EpicsValue::String(x) => land!(vec![x], StringArray, PvString::new()),
             other => Err(CaError::TypeMismatch(format!(
                 "VAL: {other:?} does not convert to the FTVL element type"
             ))),
@@ -430,22 +441,10 @@ impl WaveformRecord {
         }
     }
 
-    /// Reallocate VAL buffer to match current FTVL and [`Self::val_capacity`].
-    ///
-    /// menuFtype indices: STRING=0, CHAR=1, UCHAR=2, SHORT=3, USHORT=4,
-    /// LONG=5, ULONG=6, INT64=7, UINT64=8, FLOAT=9, DOUBLE=10, ENUM=11
+    /// Reallocate VAL buffer to match current FTVL and [`Self::val_capacity`] —
+    /// C `callocMustSucceed(nelm, dbValueSize(prec->ftvl))`.
     fn reallocate_val(&mut self) {
-        let n = self.val_capacity();
-        self.val = match self.ftvl {
-            1 => EpicsValue::CharArray(vec![0; n]),  // CHAR (epicsInt8)
-            2 => EpicsValue::UCharArray(vec![0; n]), // UCHAR (epicsUInt8)
-            3 | 4 => EpicsValue::ShortArray(vec![0; n]), // SHORT, USHORT
-            5 | 6 => EpicsValue::LongArray(vec![0; n]), // LONG, ULONG
-            7 => EpicsValue::Int64Array(vec![0; n]), // INT64
-            8 => EpicsValue::UInt64Array(vec![0; n]), // UINT64
-            9 => EpicsValue::FloatArray(vec![0.0; n]), // FLOAT
-            _ => EpicsValue::DoubleArray(vec![0.0; n]), // DOUBLE, etc.
-        };
+        self.val = self.ftvl.zeroed(self.val_capacity());
         self.nord = 0;
     }
 
@@ -753,23 +752,46 @@ macro_rules! waveform_field_list {
     };
 }
 
-static WAVEFORM_FIELDS_CHAR: &[FieldDesc] = waveform_field_list!(DbFieldType::Char);
-static WAVEFORM_FIELDS_SHORT: &[FieldDesc] = waveform_field_list!(DbFieldType::Short);
-static WAVEFORM_FIELDS_LONG: &[FieldDesc] = waveform_field_list!(DbFieldType::Long);
-static WAVEFORM_FIELDS_INT64: &[FieldDesc] = waveform_field_list!(DbFieldType::Int64);
-static WAVEFORM_FIELDS_UINT64: &[FieldDesc] = waveform_field_list!(DbFieldType::UInt64);
-static WAVEFORM_FIELDS_FLOAT: &[FieldDesc] = waveform_field_list!(DbFieldType::Float);
-static WAVEFORM_FIELDS_DOUBLE: &[FieldDesc] = waveform_field_list!(DbFieldType::Double);
-
-// aai: the bare common+sim shape — no RARM/BUSY (waveform-only) and no OMSL/DOL
-// (aao-only) (aaiRecord.dbd.pod).
-static AAI_FIELDS_CHAR: &[FieldDesc] = array_sim_field_list!(DbFieldType::Char);
-static AAI_FIELDS_SHORT: &[FieldDesc] = array_sim_field_list!(DbFieldType::Short);
-static AAI_FIELDS_LONG: &[FieldDesc] = array_sim_field_list!(DbFieldType::Long);
-static AAI_FIELDS_INT64: &[FieldDesc] = array_sim_field_list!(DbFieldType::Int64);
-static AAI_FIELDS_UINT64: &[FieldDesc] = array_sim_field_list!(DbFieldType::UInt64);
-static AAI_FIELDS_FLOAT: &[FieldDesc] = array_sim_field_list!(DbFieldType::Float);
-static AAI_FIELDS_DOUBLE: &[FieldDesc] = array_sim_field_list!(DbFieldType::Double);
+// The field set for ONE kind, selected by the FTVL element type. `$set` is that
+// kind's field-set macro; every `menuFtype` choice gets its own static, so a
+// `field_list` can never be asked for an element type it has no set for — the
+// `match` is total over [`Ftype`] and the compiler says so.
+//
+// Before this, each kind's selector was a hand-written `match self.ftvl { 1 | 2 =>
+// .._CHAR, 3 | 4 => .._SHORT, ... _ => .._DOUBLE }` over the raw menu index, with
+// no STRING/ENUM/USHORT/ULONG arm: a `field(FTVL,"USHORT")` waveform served VAL as
+// `DBF_SHORT`, and the declared default (index 0 = STRING) landed on the DOUBLE
+// set.
+macro_rules! field_list_by_ftvl {
+    ($set:ident, $ftvl:expr) => {{
+        static STRING: &[FieldDesc] = $set!(DbFieldType::String);
+        static CHAR: &[FieldDesc] = $set!(DbFieldType::Char);
+        static UCHAR: &[FieldDesc] = $set!(DbFieldType::UChar);
+        static SHORT: &[FieldDesc] = $set!(DbFieldType::Short);
+        static USHORT: &[FieldDesc] = $set!(DbFieldType::UShort);
+        static LONG: &[FieldDesc] = $set!(DbFieldType::Long);
+        static ULONG: &[FieldDesc] = $set!(DbFieldType::ULong);
+        static INT64: &[FieldDesc] = $set!(DbFieldType::Int64);
+        static UINT64: &[FieldDesc] = $set!(DbFieldType::UInt64);
+        static FLOAT: &[FieldDesc] = $set!(DbFieldType::Float);
+        static DOUBLE: &[FieldDesc] = $set!(DbFieldType::Double);
+        static ENUM: &[FieldDesc] = $set!(DbFieldType::Enum);
+        match $ftvl {
+            Ftype::String => STRING,
+            Ftype::Char => CHAR,
+            Ftype::UChar => UCHAR,
+            Ftype::Short => SHORT,
+            Ftype::UShort => USHORT,
+            Ftype::Long => LONG,
+            Ftype::ULong => ULONG,
+            Ftype::Int64 => INT64,
+            Ftype::UInt64 => UINT64,
+            Ftype::Float => FLOAT,
+            Ftype::Double => DOUBLE,
+            Ftype::Enum => ENUM,
+        }
+    }};
+}
 
 // aao: the common+sim shape plus OMSL `menu(menuOmsl)` and DOL `DBF_INLINK`
 // (`aaoRecord.dbd.pod:355-360`) — the desired-output mode + link that none of
@@ -783,14 +805,6 @@ macro_rules! aao_field_list {
         )
     };
 }
-
-static AAO_FIELDS_CHAR: &[FieldDesc] = aao_field_list!(DbFieldType::Char);
-static AAO_FIELDS_SHORT: &[FieldDesc] = aao_field_list!(DbFieldType::Short);
-static AAO_FIELDS_LONG: &[FieldDesc] = aao_field_list!(DbFieldType::Long);
-static AAO_FIELDS_INT64: &[FieldDesc] = aao_field_list!(DbFieldType::Int64);
-static AAO_FIELDS_UINT64: &[FieldDesc] = aao_field_list!(DbFieldType::UInt64);
-static AAO_FIELDS_FLOAT: &[FieldDesc] = aao_field_list!(DbFieldType::Float);
-static AAO_FIELDS_DOUBLE: &[FieldDesc] = aao_field_list!(DbFieldType::Double);
 
 // subArray: NELM is `pp(TRUE)` (runtime-writable), and MALM
 // (`special(SPC_NOMOD)`) / INDX (`pp(TRUE)`) exist. It declares NO simulation
@@ -813,14 +827,6 @@ macro_rules! subarray_field_list {
         )
     };
 }
-
-static SUBARRAY_FIELDS_CHAR: &[FieldDesc] = subarray_field_list!(DbFieldType::Char);
-static SUBARRAY_FIELDS_SHORT: &[FieldDesc] = subarray_field_list!(DbFieldType::Short);
-static SUBARRAY_FIELDS_LONG: &[FieldDesc] = subarray_field_list!(DbFieldType::Long);
-static SUBARRAY_FIELDS_INT64: &[FieldDesc] = subarray_field_list!(DbFieldType::Int64);
-static SUBARRAY_FIELDS_UINT64: &[FieldDesc] = subarray_field_list!(DbFieldType::UInt64);
-static SUBARRAY_FIELDS_FLOAT: &[FieldDesc] = subarray_field_list!(DbFieldType::Float);
-static SUBARRAY_FIELDS_DOUBLE: &[FieldDesc] = subarray_field_list!(DbFieldType::Double);
 
 /// `menu(menuOmsl)` index for `closed_loop` (`MENU_OMSL[1]`,
 /// `menu_choices.rs:61`). When `aao.omsl == closed_loop` the record sources
@@ -863,23 +869,35 @@ impl Record for WaveformRecord {
     /// (`.db`-supplied) needs — a `Default`/`new()` seed would be computed
     /// before NELM exists.
     ///
-    /// * waveform/aai/aao: `prec->nord = (prec->nelm == 1)` (waveformRecord.c:100,
-    ///   aaiRecord.c:113, aaoRecord.c:116-120). A one-element array record is
-    ///   fully populated by construction — its single element IS the value — so
-    ///   it serves NORD=1 from load. The port seeded NORD=0 always, and
-    ///   `get_field("VAL")` truncates to NORD, so a NELM=1 record served a
-    ///   ZERO-length array to every client until its first process.
+    /// * waveform/aai: `prec->nord = (prec->nelm == 1)` (waveformRecord.c:100,
+    ///   aaiRecord.c:113). A one-element array record is fully populated by
+    ///   construction — its single element IS the value — so it serves NORD=1
+    ///   from load. The port seeded NORD=0 always, and `get_field("VAL")`
+    ///   truncates to NORD, so a NELM=1 record served a ZERO-length array to
+    ///   every client until its first process. On a waveform the seed only
+    ///   SURVIVES when device support is not the soft one — see
+    ///   [`Record::soft_input_dset_init`], which is `devWfSoft`'s other arm.
+    /// * aao: 0. C's record seeds `nord = (nelm == 1)` too (aaoRecord.c:116-120)
+    ///   but calls its dset's `init_record` in the SAME pass (:127), and
+    ///   `devAaoSoft.c:43-51` is `if (dbLinkIsConstant(&prec->out)) prec->nord =
+    ///   0;`. Links are not resolved until AFTER pass 0
+    ///   (`iocInit.c::initDatabase`: `doInitRecord0`, then `doResolveLinks`,
+    ///   then `doInitRecord1`), so at that moment EVERY aao's OUT still reads as
+    ///   a constant and the seed is wiped for all of them — measured on the
+    ///   compiled softIoc: a NELM=1 aao with `field(OUT,"OTHER:PV")` serves
+    ///   NORD=0. The only thing that puts elements in an aao at init is the
+    ///   constant-DOL `fetchValue` at pass 1 below.
     /// * subArray: `prec->nord = 0` (subArrayRecord.c:101 — never the NELM=1
     ///   seed), MALM floored to 1, then NELM clamped down to MALM
     ///   (subArrayRecord.c:95-103). Process-time clamping in `set_val` (the
     ///   readValue equivalent) re-applies the same bounds each cycle, so the
     ///   .db order of NELM/MALM/INDX cannot matter.
     ///
-    /// The NORD seed is skipped when NORD is already non-zero — i.e. when
-    /// element data was put into VAL before init. C cannot reach that state
-    /// (VAL is `DBF_NOACCESS` on all four `.dbd`s, so no `.db` can fill it),
-    /// but an in-process `record()` build can, and zeroing NORD there would
-    /// discard the caller's array.
+    /// Every rule here decides the count for a record that arrived EMPTY. A
+    /// record that arrived WITH elements — an in-process `record()` build that
+    /// put VAL before `add_record`, a state C has no path to — keeps them:
+    /// [`Self::prebuilt_nord`] is captured first, and no init rule may discard
+    /// it.
     ///
     /// Pass 1 runs the aao's `fetchValue(prec, 1)` (aaoRecord.c:147) — see
     /// [`Self::fetch_constant_dol`].
@@ -891,6 +909,7 @@ impl Record for WaveformRecord {
         if pass != 0 {
             return Ok(());
         }
+        self.prebuilt_nord = self.nord;
         if matches!(self.kind, ArrayKind::SubArray) {
             if self.malm < 1 {
                 self.malm = 1;
@@ -908,7 +927,10 @@ impl Record for WaveformRecord {
             self.resize_val_preserving();
             return Ok(());
         }
-        if self.nord == 0 && self.nelm == 1 {
+        if matches!(self.kind, ArrayKind::Aao) {
+            return Ok(());
+        }
+        if self.prebuilt_nord == 0 && self.nelm == 1 {
             self.nord = 1;
         }
         Ok(())
@@ -939,6 +961,38 @@ impl Record for WaveformRecord {
     /// UDF_ALARM, prec->udfs);` (subArrayRecord.c:149-150).
     fn raises_udf_alarm(&self) -> bool {
         matches!(self.kind, ArrayKind::SubArray)
+    }
+
+    /// `devWfSoft.c::init_record` (39-51) — the arm the constant-INP loader
+    /// above does NOT cover:
+    ///
+    /// ```c
+    ///     long status = dbLoadLinkArray(&prec->inp, prec->ftvl, prec->bptr, &nelm);
+    ///     if (!status) { prec->nord = nelm; prec->udf = FALSE; }
+    ///     else          prec->nord = 0;
+    /// ```
+    ///
+    /// The call is unconditional — no `dbLinkIsConstant` gate — and only the
+    /// CONSTANT lset supplies a `loadArray` (`dbConstLink.c:239`; `dbLoadLinkArray`
+    /// returns `S_db_noLSET` otherwise, `dbLink.c:255-264`), so a waveform whose
+    /// INP is a real link, or unset, lands in the `else`: NORD = 0. That is why C
+    /// serves NORD=0 on a bare `record(waveform,"X"){}` (NELM defaults to 1) while
+    /// the identical `aai` serves 1 — `devAaiSoft.c:55` loads only
+    /// `if (dbLinkIsConstant(plink))` and leaves the record's seed alone otherwise.
+    ///
+    /// So the three input kinds split here, and each is C's own dset:
+    ///
+    /// * waveform — the seed does not survive a failed load;
+    /// * aai — it does;
+    /// * subArray — `devSASoft.c:58-74` loads and subsets (NORD comes from the
+    ///   slice, `subset()`), and leaves NORD alone when the load fails; its seed
+    ///   is 0 to begin with.
+    fn soft_input_dset_init(&mut self, loaded: bool) {
+        // `prebuilt_nord`: the elements a caller loaded are not C's calloc'd
+        // buffer, and the dset's zeroing arm exists because C's buffer IS empty.
+        if matches!(self.kind, ArrayKind::Waveform) && !loaded && self.prebuilt_nord == 0 {
+            self.nord = 0;
+        }
     }
 
     /// C `fetchValue(prec, 1)`'s `if (!status) { prec->nord = nReq;
@@ -1045,7 +1099,7 @@ impl Record for WaveformRecord {
                 ArrayKind::SubArray => EpicsValue::Long(self.nord),
                 _ => EpicsValue::ULong(self.nord as u32),
             }),
-            "FTVL" => Some(EpicsValue::Short(self.ftvl)),
+            "FTVL" => Some(EpicsValue::Short(self.ftvl.index())),
             "MPST" if self.has_post_block() => Some(EpicsValue::Short(self.mpst)),
             "APST" if self.has_post_block() => Some(EpicsValue::Short(self.apst)),
             // HASH (DBF_ULONG) — the On Change content hash. Only the
@@ -1095,8 +1149,12 @@ impl Record for WaveformRecord {
                 // into a char-element buffer is the string's BYTES, not a
                 // numeric parse of it.
                 let value = match (&value, self.ftvl) {
-                    (EpicsValue::String(s), 1) => EpicsValue::CharArray(s.as_bytes().to_vec()),
-                    (EpicsValue::String(s), 2) => EpicsValue::UCharArray(s.as_bytes().to_vec()),
+                    (EpicsValue::String(s), Ftype::Char) => {
+                        EpicsValue::CharArray(s.as_bytes().to_vec())
+                    }
+                    (EpicsValue::String(s), Ftype::UChar) => {
+                        EpicsValue::UCharArray(s.as_bytes().to_vec())
+                    }
                     _ => value,
                 };
                 self.land_val_in_buffer(value)
@@ -1140,15 +1198,21 @@ impl Record for WaveformRecord {
                 }
             }
             "FTVL" => {
-                if let EpicsValue::Short(v) = value {
-                    self.ftvl = v;
-                    self.reallocate_val();
-                    Ok(())
-                } else {
-                    Err(CaError::InvalidValue(format!(
+                let EpicsValue::Short(v) = value else {
+                    return Err(CaError::InvalidValue(format!(
                         "FTVL requires Short, got {value:?}"
-                    )))
-                }
+                    )));
+                };
+                // An index past the menu is not a choice: C `dbPutStringNum`
+                // rejects it with `S_db_badChoice` and leaves the field alone,
+                // rather than storing an index whose `dbValueSize` is undefined.
+                let Some(ftvl) = Ftype::from_index(v) else {
+                    return Err(CaError::BadChoice(format!(
+                        "FTVL: {v} is not one of {MENU_FTYPE:?}"
+                    )));
+                };
+                self.set_ftvl(ftvl);
+                Ok(())
             }
             "MPST" if self.has_post_block() => {
                 if let EpicsValue::Short(v) = value {
@@ -1299,51 +1363,15 @@ impl Record for WaveformRecord {
     // the single source the field_io runtime gate (`put_record_field_from_ca_inner`)
     // reads — no per-kind runtime override.
     fn field_list(&self) -> &'static [FieldDesc] {
-        if matches!(self.kind, ArrayKind::SubArray) {
-            return match self.ftvl {
-                1 | 2 => SUBARRAY_FIELDS_CHAR,
-                3 | 4 => SUBARRAY_FIELDS_SHORT,
-                5 | 6 => SUBARRAY_FIELDS_LONG,
-                7 => SUBARRAY_FIELDS_INT64,
-                8 => SUBARRAY_FIELDS_UINT64,
-                9 => SUBARRAY_FIELDS_FLOAT,
-                _ => SUBARRAY_FIELDS_DOUBLE,
-            };
-        }
-        // aao adds OMSL/DOL to the common shape (aaoRecord.dbd.pod).
-        if matches!(self.kind, ArrayKind::Aao) {
-            return match self.ftvl {
-                1 | 2 => AAO_FIELDS_CHAR,
-                3 | 4 => AAO_FIELDS_SHORT,
-                5 | 6 => AAO_FIELDS_LONG,
-                7 => AAO_FIELDS_INT64,
-                8 => AAO_FIELDS_UINT64,
-                9 => AAO_FIELDS_FLOAT,
-                _ => AAO_FIELDS_DOUBLE,
-            };
-        }
-        // aai is the bare common shape — no RARM/BUSY (waveform-only) and no
-        // OMSL/DOL (aao-only) (aaiRecord.dbd.pod).
-        if matches!(self.kind, ArrayKind::Aai) {
-            return match self.ftvl {
-                1 | 2 => AAI_FIELDS_CHAR,
-                3 | 4 => AAI_FIELDS_SHORT,
-                5 | 6 => AAI_FIELDS_LONG,
-                7 => AAI_FIELDS_INT64,
-                8 => AAI_FIELDS_UINT64,
-                9 => AAI_FIELDS_FLOAT,
-                _ => AAI_FIELDS_DOUBLE,
-            };
-        }
-        // waveform: common shape + RARM/BUSY (waveformRecord.dbd.pod).
-        match self.ftvl {
-            1 | 2 => WAVEFORM_FIELDS_CHAR,
-            3 | 4 => WAVEFORM_FIELDS_SHORT,
-            5 | 6 => WAVEFORM_FIELDS_LONG,
-            7 => WAVEFORM_FIELDS_INT64,
-            8 => WAVEFORM_FIELDS_UINT64,
-            9 => WAVEFORM_FIELDS_FLOAT,
-            _ => WAVEFORM_FIELDS_DOUBLE,
+        match self.kind {
+            ArrayKind::SubArray => field_list_by_ftvl!(subarray_field_list, self.ftvl),
+            // aao adds OMSL/DOL to the common shape (aaoRecord.dbd.pod).
+            ArrayKind::Aao => field_list_by_ftvl!(aao_field_list, self.ftvl),
+            // aai is the bare common+sim shape — no RARM/BUSY (waveform-only) and
+            // no OMSL/DOL (aao-only) (aaiRecord.dbd.pod).
+            ArrayKind::Aai => field_list_by_ftvl!(array_sim_field_list, self.ftvl),
+            // waveform: common+sim shape + RARM/BUSY (waveformRecord.dbd.pod).
+            ArrayKind::Waveform => field_list_by_ftvl!(waveform_field_list, self.ftvl),
         }
     }
 
@@ -1893,6 +1921,9 @@ mod array_kind_tests {
     #[test]
     fn subarray_slices_input_at_indx_with_nelm_take() {
         let mut r = WaveformRecord::with_kind(ArrayKind::SubArray);
+        // FTVL defaults to the declared STRING (menuFtype index 0); this case is
+        // about the SLICE, so give it the DOUBLE buffer a real `.db` would.
+        r.set_ftvl(Ftype::Double);
         // 4-element double buffer; consume up to 4 from offset 2.
         // MALM is the source-view cap (C floors it to >= 1), so it must be at
         // least the source length to expose the whole source — a real subArray
@@ -1930,6 +1961,7 @@ mod array_kind_tests {
     #[test]
     fn subarray_partial_tail_zero_pads_to_nelm() {
         let mut r = WaveformRecord::with_kind(ArrayKind::SubArray);
+        r.set_ftvl(Ftype::Double);
         // MALM=5 == source length: the whole source is visible, the slice from
         // offset 3 has only 2 valid elements and zero-pads the rest to NELM.
         r.put_field("MALM", EpicsValue::Long(5)).unwrap();
@@ -1950,6 +1982,7 @@ mod array_kind_tests {
     #[test]
     fn subarray_malm_caps_visible_source_length() {
         let mut r = WaveformRecord::with_kind(ArrayKind::SubArray);
+        r.set_ftvl(Ftype::Double);
         r.put_field("NELM", EpicsValue::Long(4)).unwrap();
         r.put_field("INDX", EpicsValue::Long(0)).unwrap();
         // MALM caps how far into the source we look — even if the
@@ -2155,7 +2188,8 @@ mod array_kind_tests {
         // `WaveformRecord::new(_, DbFieldType::UInt64)` must mint
         // a UInt64Array VAL and FTVL index 8, not fall through to Double.
         let r = WaveformRecord::new(4, DbFieldType::UInt64);
-        assert_eq!(r.ftvl, 8);
+        assert_eq!(r.ftvl, Ftype::UInt64);
+        assert_eq!(r.ftvl.index(), 8);
         // The VAL buffer is a UInt64Array sized to NELM; `get_field`
         // truncates to NORD (0 when fresh), so check the buffer directly.
         assert!(matches!(&r.val, EpicsValue::UInt64Array(v) if v.len() == 4));

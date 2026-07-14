@@ -1,5 +1,5 @@
 use super::calc_compile;
-use super::link_status::{LINK_CON, LINK_STATUS_CHOICES, LinkStatusGen, classify_link};
+use super::link_status::{LINK_CON, LINK_STATUS_CHOICES, LinkRole, LinkStatusGen, classify_link};
 use crate::error::{CaError, CaResult};
 use crate::server::database::AsyncDbHandle;
 use crate::server::record::{
@@ -419,13 +419,13 @@ impl CalcoutRecord {
             tokio::task::yield_now().await;
             let mut fields: Vec<(String, EpicsValue)> = Vec::with_capacity(22);
             for (i, link) in inputs.iter().enumerate() {
-                let (status, _ft) = classify_link(&handle, link).await;
+                let (status, _ft) = classify_link(&handle, link, LinkRole::Input).await;
                 fields.push((
                     CALCOUT_INAV_FIELDS[i].to_string(),
                     EpicsValue::Enum(status as u16),
                 ));
             }
-            let (out_status, _ft) = classify_link(&handle, &out).await;
+            let (out_status, _ft) = classify_link(&handle, &out, LinkRole::Output).await;
             fields.push(("OUTV".to_string(), EpicsValue::Enum(out_status as u16)));
             // Publish only if no newer refresh was issued meanwhile.
             if link_gen.is_current(token) {

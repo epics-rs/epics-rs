@@ -43,14 +43,158 @@ pub struct ControlInfo {
     pub lower_ctrl_limit: f64,
 }
 
+/// How an enum-valued field renders as a `DBR_STRING` — C's `get_enum_str`
+/// rset slot (`dbConvert.c::getEnumString`), the menu choice list
+/// (`getMenuString`) or the device choice list (`getDeviceString`).
+///
+/// This is NOT the [`EnumInfo::strings`] label array. C keeps the two apart
+/// and so must the port:
+///
+/// * `get_enum_strs` (plural) fills `DBR_GR_ENUM` and reports `no_str`, the
+///   count of *meaningful* leading states. `mbbi` cuts it at the last
+///   non-empty state (`mbbiRecord.c:257-271`), so an all-empty record has
+///   `no_str == 0`.
+/// * `get_enum_str` (singular) renders ONE value. It indexes the record's
+///   state array *untrimmed* (`mbbiRecord.c:246-250` reads `zrst + val*size`
+///   for any `val <= 15`), so an undefined state renders as the EMPTY string,
+///   and only an index past the array yields the record's sentinel.
+///
+/// Indexing the trimmed label list for the singular form is what made the port
+/// answer with a decimal index for an ENUM. Measured on the compiled C IOC
+/// (`softIoc`, mbbi with ZRST/ONST set):
+///
+/// ```text
+/// caput VAL 5  -> caget -t: []                 (slot 5 empty, still <= 15)
+/// caput VAL 20 -> caget -t: [Illegal Value]    (past the 16 states)
+/// blank mbbi   -> caget -t: []                 (no states at all)
+/// ```
+///
+/// The out-of-range answer is NOT one rule — see [`EnumOverflow`].
+#[derive(Debug, Clone, Default)]
+pub struct EnumStringForm {
+    /// The index-addressable state slots. An undefined state is an EMPTY slot,
+    /// not a missing one — C `strncpy`s whatever is in the record.
+    pub slots: Vec<PvString>,
+    /// What an index past `slots` renders as. See [`EnumOverflow`]: the rule is
+    /// the DBF class's, not one global fallback.
+    pub overflow: EnumOverflow,
+}
+
+/// What an index PAST the slots renders as — and it is not one rule, because C
+/// reaches the out-of-range case through a different converter per DBF class
+/// (`dbFastLinkConv.c`, the scalar table `dbGet` uses for a one-element read):
+///
+/// * `DBF_ENUM` → `cvt_e_st_get` → the record's `get_enum_str` rset, whose
+///   out-of-range answer is a per-record-type SENTINEL (`mbbi`/`mbbo`:
+///   `"Illegal Value"`; `bi`/`bo`: `"Illegal_Value"`).
+/// * `DBF_MENU` → `cvt_menu_st` (:1590-1596) — *"Convert out-of-range values to
+///   numeric strings"*, `epicsSnprintf(to, MAX_STRING_SIZE, "%u", *from)`. This
+///   is C's ONE numeric enum rendering, and it is reachable: `SSCN`'s declared
+///   initial is 65535, past every menu, and a C IOC serves `caget -t REC.SSCN`
+///   as `65535`.
+/// * `DBF_DEVICE` → `cvt_device_st` (:1616-1620) — a record type with NO device
+///   support is *"Valid"* and renders the EMPTY string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnumOverflow {
+    /// A fixed string: the record's `get_enum_str` sentinel, or the empty string
+    /// where C has no answer to give.
+    Text(PvString),
+    /// The index itself, decimal — C `cvt_menu_st`'s out-of-range branch.
+    Decimal,
+}
+
+impl Default for EnumOverflow {
+    fn default() -> Self {
+        Self::Text(PvString::new())
+    }
+}
+
+impl EnumStringForm {
+    /// C `get_enum_str` / `cvt_menu_st` / `cvt_device_st`: the slot, or the
+    /// class's out-of-range answer.
+    pub fn render(&self, index: u16) -> PvString {
+        match self.slots.get(index as usize) {
+            Some(slot) => slot.clone(),
+            None => match &self.overflow {
+                EnumOverflow::Text(text) => text.clone(),
+                EnumOverflow::Decimal => PvString::from(index.to_string().as_str()),
+            },
+        }
+    }
+
+    /// A `DBF_MENU` field's form: its `menu()` choices, and C's numeric-string
+    /// rendering for an index past them.
+    pub fn menu(choices: impl IntoIterator<Item = PvString>) -> Self {
+        Self {
+            slots: choices.into_iter().collect(),
+            overflow: EnumOverflow::Decimal,
+        }
+    }
+
+    /// A `DBF_DEVICE` field's form: the record type's device menu, and the empty
+    /// string where the type declares no device support.
+    pub fn device(choices: Vec<PvString>) -> Self {
+        Self {
+            slots: choices,
+            overflow: EnumOverflow::Text(PvString::new()),
+        }
+    }
+
+    /// A `DBF_ENUM` `VAL`'s form: the record's untrimmed state slots and its
+    /// out-of-range sentinel.
+    pub fn states(slots: Vec<PvString>, sentinel: PvString) -> Self {
+        Self {
+            slots,
+            overflow: EnumOverflow::Text(sentinel),
+        }
+    }
+}
+
 /// Enum state strings (up to 16 states, each max 26 chars on wire).
 ///
 /// Byte-preserving like [`DisplayInfo::units`]: enum choice labels are
 /// raw wire/record bytes with no UTF-8 guarantee, so they must reach the
 /// CA `DBR_GR_ENUM` slots and the PVA `value.choices` array unmangled.
+///
+/// `#[non_exhaustive]`: the two C rset slots this carries — the `no_str`-trimmed
+/// label array and the [`EnumStringForm`] a `DBR_STRING` read indexes — must be
+/// assigned together, so the struct is built through [`EnumInfo::new`] (labels
+/// are their own state table: a menu, a plain enum channel) or
+/// [`EnumInfo::with_string_form`] (a record whose `get_enum_str` differs from
+/// its `get_enum_strs`). A bare literal could set one and leave the other empty,
+/// which is the exact desync that made an enum serve its index as its string.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct EnumInfo {
+    /// C `get_enum_strs` — the `DBR_GR_ENUM` label array, trimmed to `no_str`.
     pub strings: Vec<PvString>,
+    /// C `get_enum_str` — how a `DBR_STRING` read of the field renders.
+    pub string_form: EnumStringForm,
+}
+
+impl EnumInfo {
+    /// A channel whose labels ARE its state table: every menu and device choice
+    /// list, and any enum channel with no record `get_enum_str` behind it. The
+    /// two C slots coincide, so one list fills both.
+    pub fn new(strings: Vec<PvString>) -> Self {
+        Self {
+            string_form: EnumStringForm {
+                slots: strings.clone(),
+                overflow: EnumOverflow::default(),
+            },
+            strings,
+        }
+    }
+
+    /// A record whose `get_enum_str` is NOT its `get_enum_strs`: `mbbi`'s label
+    /// list stops at the last non-empty state while its `DBR_STRING` form still
+    /// indexes all 16 slots and has an `"Illegal Value"` sentinel beyond them.
+    pub fn with_string_form(strings: Vec<PvString>, string_form: EnumStringForm) -> Self {
+        Self {
+            strings,
+            string_form,
+        }
+    }
 }
 
 /// Unified internal state representation for a PV read.

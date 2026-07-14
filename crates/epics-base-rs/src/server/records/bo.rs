@@ -513,6 +513,16 @@ impl Record for BoRecord {
         ))
     }
 
+    /// C `get_enum_str` (boRecord.c:320-339): VAL 0 -> ZNAM, 1 -> ONAM, and any
+    /// other index -> `"Illegal_Value"`. Slot 1 is indexed even when ONAM is
+    /// empty, so it renders empty — the `no_str` trim in `enum_state_strings`
+    /// is the LABEL list's, not this read's.
+    fn enum_string_form(&self) -> Option<crate::server::snapshot::EnumStringForm> {
+        Some(crate::server::record::binary_enum_string_form(
+            &self.znam, &self.onam,
+        ))
+    }
+
     /// VAL posts DBE_VALUE|DBE_LOG
     /// only when it changed (C boRecord.c:394-399 `mlst != val`), not every
     /// process cycle. The comparison is captured in process(); see

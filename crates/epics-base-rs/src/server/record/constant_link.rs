@@ -81,11 +81,15 @@ pub fn rec_gbl_init_constant_link<R: Record + ?Sized>(
     // C loads into the target field's own DBF type
     // (`recGblInitConstantLink(plink, DBF_USHORT, &prec->seln)`), so coerce
     // through the field's descriptor before the put.
-    let target_type = record
-        .field_list()
-        .iter()
-        .find(|f| f.name == seed.target_field)
-        .map(|f| f.dbf_type);
+    // A runtime-typed target (`mbbo.VAL`, whose type C's `cvt_dbaddr` derives
+    // from SDEF) has no type in its declaration, so the variant it currently
+    // holds is the type C would load into.
+    let target_type = super::record_instance::declared_field_type_of(record, seed.target_field)
+        .or_else(|| {
+            record
+                .get_field(seed.target_field)
+                .map(|v| v.db_field_type())
+        });
     let value = match target_type {
         Some(t) => constant_to_field_type(value, t, &raw),
         None => value,

@@ -197,6 +197,16 @@ impl Record for BiRecord {
         ))
     }
 
+    /// C `get_enum_str` (biRecord.c:173-192): VAL 0 -> ZNAM, 1 -> ONAM, and any
+    /// other index -> `"Illegal_Value"`. Slot 1 is indexed even when ONAM is
+    /// empty, so it renders empty — the `no_str` trim in `enum_state_strings`
+    /// is the LABEL list's, not this read's.
+    fn enum_string_form(&self) -> Option<crate::server::snapshot::EnumStringForm> {
+        Some(crate::server::record::binary_enum_string_form(
+            &self.znam, &self.onam,
+        ))
+    }
+
     /// C `devBiSoftRaw` — `recGblInitConstantLink(&prec->inp, DBF_ULONG,
     /// &prec->rval)` at init, `dbGetLink(.., DBR_ULONG, &prec->rval, ..)` +
     /// `if (prec->mask) prec->rval &= prec->mask;` per read (epics-base

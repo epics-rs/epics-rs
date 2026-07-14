@@ -36,6 +36,7 @@
 //! Each table cites its source.
 
 use crate::error::{CaError, CaResult};
+use crate::server::snapshot::EnumStringForm;
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
 /// `menu(menuAlarmSevr)` — `menuAlarmSevr.dbd.pod:21-24`.
@@ -134,6 +135,131 @@ pub const MENU_FTYPE: &[&str] = &[
     "STRING", "CHAR", "UCHAR", "SHORT", "USHORT", "LONG", "ULONG", "INT64", "UINT64", "FLOAT",
     "DOUBLE", "ENUM",
 ];
+
+/// A `menu(menuFtype)` value: the ELEMENT TYPE of an array field's buffer.
+///
+/// C keeps one number for this (`prec->ftvl`, the menu index) and re-derives the
+/// element type from it at every use — `dbValueSize(prec->ftvl)` when it allocates
+/// `bptr`, again when `dbGetLink`/`dbPutLink` converts into it, again when
+/// `cvt_dbaddr` reports the field type. The port had FOUR hand-written copies of
+/// that derivation in `waveform.rs` (the constructor, the element-type getter, the
+/// reallocator, and the `field_list` selector), and they did not agree: none had a
+/// STRING or ENUM row, two collapsed USHORT onto SHORT and ULONG onto LONG, and
+/// every one of them fell through to DOUBLE for the indices it did not name — so a
+/// `field(FTVL,"USHORT")` waveform silently served `DBF_SHORT`, and index 0 (the
+/// declared default, STRING) became DOUBLE.
+///
+/// This type is that derivation, once. The menu index is only its wire form
+/// ([`Self::index`] / [`Self::from_index`]); an index outside the menu cannot be
+/// turned into one, so a record cannot hold an FTVL its buffer has no type for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ftype {
+    String,
+    Char,
+    UChar,
+    Short,
+    UShort,
+    Long,
+    ULong,
+    Int64,
+    UInt64,
+    Float,
+    Double,
+    Enum,
+}
+
+impl Ftype {
+    /// The menu in declaration order — index `i` is `ALL[i]`, and
+    /// `MENU_FTYPE[i]` is its label. `menu_ftype_index_matches_the_choice_table`
+    /// pins the two together.
+    pub const ALL: [Ftype; 12] = [
+        Self::String,
+        Self::Char,
+        Self::UChar,
+        Self::Short,
+        Self::UShort,
+        Self::Long,
+        Self::ULong,
+        Self::Int64,
+        Self::UInt64,
+        Self::Float,
+        Self::Double,
+        Self::Enum,
+    ];
+
+    /// The menu index a client reads and writes (`FTVL`, `FTA`, `FTVA`, ...).
+    pub fn index(self) -> i16 {
+        Self::ALL.iter().position(|f| *f == self).unwrap_or(0) as i16
+    }
+
+    /// The menu index as a choice, or `None` when it names no choice — C
+    /// `dbPutStringNum`/`putStringMenu` reject an out-of-menu index with
+    /// `S_db_badChoice` rather than storing it.
+    pub fn from_index(index: i16) -> Option<Self> {
+        usize::try_from(index)
+            .ok()
+            .and_then(|i| Self::ALL.get(i))
+            .copied()
+    }
+
+    /// The element type of a buffer of this `menuFtype` — C `dbValueSize(ftvl)`'s
+    /// carrier. The mapping is a bijection: every `DbFieldType` an array element
+    /// can have is a `menuFtype` choice and vice versa.
+    pub fn element_type(self) -> DbFieldType {
+        match self {
+            Self::String => DbFieldType::String,
+            Self::Char => DbFieldType::Char,
+            Self::UChar => DbFieldType::UChar,
+            Self::Short => DbFieldType::Short,
+            Self::UShort => DbFieldType::UShort,
+            Self::Long => DbFieldType::Long,
+            Self::ULong => DbFieldType::ULong,
+            Self::Int64 => DbFieldType::Int64,
+            Self::UInt64 => DbFieldType::UInt64,
+            Self::Float => DbFieldType::Float,
+            Self::Double => DbFieldType::Double,
+            Self::Enum => DbFieldType::Enum,
+        }
+    }
+
+    /// The `menuFtype` choice whose buffer holds this element type — the inverse
+    /// of [`Self::element_type`].
+    pub fn of_element_type(t: DbFieldType) -> Self {
+        match t {
+            DbFieldType::String => Self::String,
+            DbFieldType::Char => Self::Char,
+            DbFieldType::UChar => Self::UChar,
+            DbFieldType::Short => Self::Short,
+            DbFieldType::UShort => Self::UShort,
+            DbFieldType::Long => Self::Long,
+            DbFieldType::ULong => Self::ULong,
+            DbFieldType::Int64 => Self::Int64,
+            DbFieldType::UInt64 => Self::UInt64,
+            DbFieldType::Float => Self::Float,
+            DbFieldType::Double => Self::Double,
+            DbFieldType::Enum => Self::Enum,
+        }
+    }
+
+    /// A zero-filled buffer of `n` elements — C's
+    /// `callocMustSucceed(n, dbValueSize(ftvl))`.
+    pub fn zeroed(self, n: usize) -> EpicsValue {
+        match self {
+            Self::String => EpicsValue::StringArray(vec![PvString::new(); n]),
+            Self::Char => EpicsValue::CharArray(vec![0; n]),
+            Self::UChar => EpicsValue::UCharArray(vec![0; n]),
+            Self::Short => EpicsValue::ShortArray(vec![0; n]),
+            Self::UShort => EpicsValue::UShortArray(vec![0; n]),
+            Self::Long => EpicsValue::LongArray(vec![0; n]),
+            Self::ULong => EpicsValue::ULongArray(vec![0; n]),
+            Self::Int64 => EpicsValue::Int64Array(vec![0; n]),
+            Self::UInt64 => EpicsValue::UInt64Array(vec![0; n]),
+            Self::Float => EpicsValue::FloatArray(vec![0.0; n]),
+            Self::Double => EpicsValue::DoubleArray(vec![0.0; n]),
+            Self::Enum => EpicsValue::EnumArray(vec![0; n]),
+        }
+    }
+}
 
 /// Choice table for a *shared* menu field, keyed by its (uppercase) field
 /// name, or `None` for a name that is not a shared menu field.
@@ -371,6 +497,32 @@ pub fn multibit_enum_states(states: [&PvString; 16]) -> Vec<PvString> {
     states[..no_str].iter().map(|s| (*s).clone()).collect()
 }
 
+/// C `get_enum_str` for the two-state records (`bi`/`bo`/`busy`):
+/// `VAL==0 -> ZNAM`, `VAL==1 -> ONAM`, anything else `"Illegal_Value"`
+/// (`biRecord.c:173-192`, `boRecord.c:320-339`).
+///
+/// Both slots are indexed UNTRIMMED — unlike [`binary_enum_states`], an empty
+/// `ONAM` behind a set `ZNAM` is still slot 1 and still renders empty. C's
+/// `no_str` trimming belongs to the label list, not to this read.
+pub fn binary_enum_string_form(znam: &PvString, onam: &PvString) -> EnumStringForm {
+    EnumStringForm::states(
+        vec![znam.clone(), onam.clone()],
+        PvString::from("Illegal_Value"),
+    )
+}
+
+/// C `get_enum_str` for the 16-state records (`mbbi`/`mbbo`): any `val <= 15`
+/// reads its state slot, empty or not; past that, `"Illegal Value"` — with a
+/// SPACE, where the two-state records use an underscore
+/// (`mbbiRecord.c:235-255`, `mbboRecord.c:314-333`). The two spellings are C's,
+/// and both are wire-visible, so neither is normalized here.
+pub fn multibit_enum_string_form(states: [&PvString; 16]) -> EnumStringForm {
+    EnumStringForm::states(
+        states.iter().map(|s| (*s).clone()).collect(),
+        PvString::from("Illegal Value"),
+    )
+}
+
 /// C `dbConvert.c::putStringEnum` (lines 1149-1190) — a `DBR_STRING` write to a
 /// `DBF_ENUM` field, i.e. `caput MY:VALVE Open`.
 ///
@@ -494,6 +646,23 @@ fn menu_index_value(dbf_type: DbFieldType, index: i64) -> EpicsValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The boundary the whole [`Ftype`] type rests on: its index IS the position
+    /// of its label in `menu(menuFtype)`, and no index outside the menu is a
+    /// choice. Both directions round-trip, and so does the element type.
+    #[test]
+    fn menu_ftype_index_matches_the_choice_table() {
+        for (i, label) in MENU_FTYPE.iter().enumerate() {
+            let f = Ftype::from_index(i as i16).unwrap_or_else(|| panic!("{label} is a choice"));
+            assert_eq!(f.index(), i as i16, "{label}");
+            assert_eq!(Ftype::of_element_type(f.element_type()), f, "{label}");
+            assert_eq!(f.zeroed(3).count(), 3, "{label}");
+            assert_eq!(f.zeroed(1).db_field_type(), f.element_type(), "{label}");
+        }
+        assert_eq!(Ftype::from_index(MENU_FTYPE.len() as i16), None);
+        assert_eq!(Ftype::from_index(-1), None);
+        assert_eq!(Ftype::ALL.len(), MENU_FTYPE.len());
+    }
 
     #[test]
     fn alarm_severity_order_matches_dbd() {

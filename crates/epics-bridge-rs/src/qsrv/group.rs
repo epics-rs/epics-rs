@@ -2892,6 +2892,21 @@ mod tests {
     use crate::qsrv::provider::Channel;
     use std::time::Duration;
 
+    /// Has the record processed since it was added to the database?
+    ///
+    /// `ai.INIT` is C's `prec->init`: `init_record` sets it (so a record that
+    /// has only been added reads 1) and the end of every `process` clears it
+    /// (`aiRecord.c:114`, `:170`). The proc-member cases below use it as the
+    /// "did the group PUT process this record?" probe; reading the phase
+    /// through this helper keeps the C polarity in ONE place.
+    async fn has_processed(db: &Arc<PvDatabase>, rec: &str) -> bool {
+        use epics_base_rs::types::EpicsValue;
+        match db.get_pv(&format!("{rec}.INIT")).await.unwrap() {
+            EpicsValue::Short(v) => v == 0,
+            other => panic!("unexpected INIT type: {other:?}"),
+        }
+    }
+
     /// Every member supplies every property — the mask a channel on an
     /// `mbbi`/`ai` VAL field resolves to. The leaf-narrowing cases below are
     /// about the DBE CHANGE CLASSES (which leaves a value / property event
@@ -3930,20 +3945,12 @@ mod tests {
     /// 547-573); a no-`+putorder` proc keeps the sentinel order
     /// (fieldconfig.h:37) and is still processed. Before the fix the
     /// PUT-candidate `filter_map(put_order)` dropped it, so a proc-only
-    /// save/apply hook silently never ran. Observable: a freshly added
-    /// AiRecord has `INIT=0`; its first process sets `INIT=1`.
+    /// save/apply hook silently never ran. Observable through `has_processed`:
+    /// a freshly added AiRecord is still in its INIT phase, and its first
+    /// process leaves it.
     #[tokio::test]
     async fn proc_member_without_putorder_is_processed_atomic_and_nonatomic() {
         use epics_base_rs::server::records::ai::AiRecord;
-        use epics_base_rs::types::EpicsValue;
-
-        async fn init_flag(db: &Arc<PvDatabase>, rec: &str) -> i64 {
-            match db.get_pv(&format!("{rec}.INIT")).await.unwrap() {
-                EpicsValue::Char(c) => c as i64,
-                EpicsValue::Long(v) => v as i64,
-                other => panic!("unexpected INIT type: {other:?}"),
-            }
-        }
 
         for atomic in [false, true] {
             let db = Arc::new(PvDatabase::new());
@@ -3959,9 +3966,8 @@ mod tests {
             let def = defs.pop().unwrap();
             let channel = GroupChannel::new(db.clone(), def);
 
-            assert_eq!(
-                init_flag(&db, "HOOK:rec").await,
-                0,
+            assert!(
+                !has_processed(&db, "HOOK:rec").await,
                 "fresh record not processed"
             );
 
@@ -3972,9 +3978,8 @@ mod tests {
                 .await
                 .expect("proc-only group PUT must succeed");
 
-            assert_eq!(
-                init_flag(&db, "HOOK:rec").await,
-                1,
+            assert!(
+                has_processed(&db, "HOOK:rec").await,
                 "proc member without +putorder must process its record (atomic={atomic})"
             );
         }
@@ -4082,14 +4087,6 @@ mod tests {
         use epics_base_rs::server::records::ai::AiRecord;
         use epics_base_rs::types::EpicsValue;
 
-        async fn init_flag(db: &Arc<PvDatabase>, rec: &str) -> i64 {
-            match db.get_pv(&format!("{rec}.INIT")).await.unwrap() {
-                EpicsValue::Char(c) => c as i64,
-                EpicsValue::Long(v) => v as i64,
-                other => panic!("unexpected INIT type: {other:?}"),
-            }
-        }
-
         // (bound field, must the record process?)
         for (channel_field, expect_processed) in [("VAL", false), ("PROC", true)] {
             for atomic in [false, true] {
@@ -4116,7 +4113,7 @@ mod tests {
                     .await
                     .expect("proc-only group PUT must succeed");
 
-                let processed = init_flag(&db, "SCANNED:rec").await == 1;
+                let processed = has_processed(&db, "SCANNED:rec").await;
                 assert_eq!(
                     processed, expect_processed,
                     "+proc member bound to {channel_field} on a SCAN=1s record \
@@ -4138,14 +4135,6 @@ mod tests {
         use epics_base_rs::server::record::ScanType;
         use epics_base_rs::server::records::ai::AiRecord;
         use epics_base_rs::types::EpicsValue;
-
-        async fn init_flag(db: &Arc<PvDatabase>, rec: &str) -> i64 {
-            match db.get_pv(&format!("{rec}.INIT")).await.unwrap() {
-                EpicsValue::Char(c) => c as i64,
-                EpicsValue::Long(v) => v as i64,
-                other => panic!("unexpected INIT type: {other:?}"),
-            }
-        }
 
         // (bound field, process mode, must the record process?)
         let cases = [
@@ -4184,7 +4173,7 @@ mod tests {
                 .await
                 .expect("proc-only group PUT must succeed");
 
-            let processed = init_flag(&db, "FORCED:rec").await == 1;
+            let processed = has_processed(&db, "FORCED:rec").await;
             assert_eq!(
                 processed, expect_processed,
                 "+proc member bound to {channel_field} under {process:?}: \
@@ -4237,13 +4226,8 @@ mod tests {
                 .await
                 .expect("a marked, putable meta member participates: PUT must not fail");
 
-            let init = match db.get_pv("META:rec.INIT").await.unwrap() {
-                EpicsValue::Char(c) => c as i64,
-                EpicsValue::Long(v) => v as i64,
-                other => panic!("unexpected INIT type: {other:?}"),
-            };
-            assert_eq!(
-                init, 1,
+            assert!(
+                has_processed(&db, "META:rec").await,
                 "a changing meta member must post-process its record \
                  (groupsource.cpp:568, atomic={atomic})"
             );
@@ -4266,7 +4250,6 @@ mod tests {
     #[tokio::test]
     async fn r17_37_marked_meta_member_without_putorder_does_nothing() {
         use epics_base_rs::server::records::ai::AiRecord;
-        use epics_base_rs::types::EpicsValue;
         use epics_pva_rs::pvdata::ScalarValue;
 
         let db = Arc::new(PvDatabase::new());
@@ -4295,13 +4278,8 @@ mod tests {
             "expected pvxs's No-fields-changed reply, got: {err}"
         );
 
-        let init = match db.get_pv("META2:rec.INIT").await.unwrap() {
-            EpicsValue::Char(c) => c as i64,
-            EpicsValue::Long(v) => v as i64,
-            other => panic!("unexpected INIT type: {other:?}"),
-        };
-        assert_eq!(
-            init, 0,
+        assert!(
+            !has_processed(&db, "META2:rec").await,
             "a member without +putorder is not putable, so it never post-processes"
         );
     }
@@ -5574,7 +5552,6 @@ mod tests {
     async fn q51_group_put_does_not_write_acf_check_proc_member() {
         use super::super::provider::{AccessContext, AccessControl};
         use epics_base_rs::server::records::ai::AiRecord;
-        use epics_base_rs::types::EpicsValue;
         use epics_pva_rs::pvdata::ScalarValue;
 
         // Deny writes to the proc member's backing channel only.
@@ -5583,14 +5560,6 @@ mod tests {
         impl AccessControl for DenyChannel {
             async fn can_write(&self, channel: &str, _user: &str, _host: &str) -> bool {
                 channel != self.0
-            }
-        }
-
-        async fn init_flag(db: &Arc<PvDatabase>, rec: &str) -> i64 {
-            match db.get_pv(&format!("{rec}.INIT")).await.unwrap() {
-                EpicsValue::Char(c) => c as i64,
-                EpicsValue::Long(v) => v as i64,
-                other => panic!("unexpected INIT type: {other:?}"),
             }
         }
 
@@ -5616,9 +5585,8 @@ mod tests {
             AccessContext::with_identity(Arc::new(DenyChannel("HOOK:rec")), "u".into(), "h".into());
         let channel = GroupChannel::new(db.clone(), def).with_access(access);
 
-        assert_eq!(
-            init_flag(&db, "HOOK:rec").await,
-            0,
+        assert!(
+            !has_processed(&db, "HOOK:rec").await,
             "proc target unprocessed at start"
         );
 
@@ -5637,9 +5605,8 @@ mod tests {
             .await
             .expect("group PUT must succeed: a write-denied proc member is not write-ACF checked");
 
-        assert_eq!(
-            init_flag(&db, "HOOK:rec").await,
-            1,
+        assert!(
+            has_processed(&db, "HOOK:rec").await,
             "the proc member's record was processed despite the write deny"
         );
     }

@@ -878,7 +878,11 @@ impl ClientState {
                     // VAL under BALG=LIFO), so the server advertised WRITE on
                     // fields it would then refuse.
                     let is_ro = instance.is_no_mod(f.as_str());
-                    (is_ro, instance.common.asg.clone(), instance.common.asl)
+                    (
+                        is_ro,
+                        instance.common.access_group().to_string(),
+                        instance.common.asl,
+                    )
                 };
                 // Read-only field-ness must AND
                 // with ACF, never replace it. Pre-fix the read-only

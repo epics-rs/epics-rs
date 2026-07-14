@@ -6,7 +6,7 @@ mod link;
 mod menu_choices;
 mod pini;
 mod process_passive;
-mod record_instance;
+pub(crate) mod record_instance;
 mod record_trait;
 mod scan;
 
@@ -23,10 +23,11 @@ pub use link::{
     pvajson_identity_key,
 };
 pub use menu_choices::{
-    MENU_ALARM_SEVR, MENU_ALARM_STAT, MENU_CONVERT, MENU_FTYPE, MENU_IVOA, MENU_OMSL, MENU_PINI,
-    MENU_POST, MENU_PRIORITY, MENU_SCAN, MENU_SIMM, MENU_YES_NO, binary_enum_states,
-    multibit_enum_states, resolve_enum_state_string, resolve_menu_field_string,
-    resolve_menu_field_string_db_load, shared_menu_choices,
+    Ftype, MENU_ALARM_SEVR, MENU_ALARM_STAT, MENU_CONVERT, MENU_FTYPE, MENU_IVOA, MENU_OMSL,
+    MENU_PINI, MENU_POST, MENU_PRIORITY, MENU_SCAN, MENU_SIMM, MENU_YES_NO, binary_enum_states,
+    binary_enum_string_form, multibit_enum_states, multibit_enum_string_form,
+    resolve_enum_state_string, resolve_menu_field_string, resolve_menu_field_string_db_load,
+    shared_menu_choices,
 };
 pub use pini::PiniMode;
 pub(crate) use record_instance::value_as_dbr_string;

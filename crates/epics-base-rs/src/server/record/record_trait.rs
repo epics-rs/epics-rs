@@ -1795,6 +1795,27 @@ pub trait Record: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Did `init_record` leave the record PERMANENTLY ACTIVE — C's
+    /// `prec->pact = TRUE` inside `init_record`, which is how a record type
+    /// disables itself when it cannot possibly process?
+    ///
+    /// `subRecord.c:119-123` is the live case: an empty `SNAM` has no
+    /// subroutine to call, so C prints `"%s.SNAM is empty"`, sets `pact = TRUE`
+    /// and returns 0. The record exists and serves its fields, but `dbProcess`
+    /// takes the PACT-active branch on every scan from then on — it never runs
+    /// record support again. `caget X.PACT` on a bare `record(sub,"X"){}` reads
+    /// 1 on a C IOC.
+    ///
+    /// PACT is a `dbCommon` field with a single owner
+    /// ([`RecordInstance::enter_pact`] / [`leave_pact`]), so a record cannot
+    /// park it from `init_record`. It reports the fact here and the owner
+    /// performs the transition, once, at the end of the init passes.
+    ///
+    /// [`leave_pact`]: crate::server::record::RecordInstance::leave_pact
+    fn init_record_parks_pact(&self) -> bool {
+        false
+    }
+
     /// Post-init finalisation hook with mutable access to the
     /// framework's UDF flag. Called once after both `init_record`
     /// passes complete. Default implementation is a no-op.

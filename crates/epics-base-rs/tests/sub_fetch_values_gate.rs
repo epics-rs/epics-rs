@@ -57,15 +57,17 @@ async fn sub_db(inpb: &str) -> PvDatabase {
     db.add_record("SRCC", Box::new(AiRecord::new(3.0)))
         .await
         .unwrap();
-    db.add_record("SUB", Box::new(SubRecord::default()))
-        .await
+    // SNAM before the add: C applies every `field()` line and only then runs
+    // `init_record`, which parks PACT for good when SNAM is empty
+    // (subRecord.c:119-123).
+    let mut seed = SubRecord::default();
+    seed.put_field("SNAM", EpicsValue::String("sum_a_c".into()))
         .unwrap();
+    db.add_record("SUB", Box::new(seed)).await.unwrap();
 
     let arc = db.get_record("SUB").await.unwrap();
     let mut inst = arc.write().await;
     let r = &mut inst.record;
-    r.put_field("SNAM", EpicsValue::String("sum_a_c".into()))
-        .unwrap();
     r.put_field("INPA", EpicsValue::String("SRCA".into()))
         .unwrap();
     if !inpb.is_empty() {

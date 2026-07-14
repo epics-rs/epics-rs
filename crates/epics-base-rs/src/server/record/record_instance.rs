@@ -850,6 +850,15 @@ impl RecordInstance {
             eprintln!("post_init_finalize_undef failed for {name}: {e}");
         }
         self.common.udf = udf;
+        // C `init_record` can END with `prec->pact = TRUE` to disable a record
+        // it cannot process (`subRecord.c:119-123`, an empty SNAM). PACT has one
+        // owner, so the record declares the fact and the owner parks it — after
+        // the passes, so the `leave_pact()` above cannot undo it. There is
+        // nothing to release later: `dbProcess` takes the PACT-active branch on
+        // every scan from here on, which is exactly the point.
+        if self.record.init_record_parks_pact() {
+            self.enter_pact();
+        }
     }
 
     /// SINGLE OWNER of the DTYP -> soft-output-dset mapping. The dset table

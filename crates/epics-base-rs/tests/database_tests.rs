@@ -12,6 +12,18 @@ use epics_base_rs::server::records::bi::BiRecord;
 use epics_base_rs::server::records::longin::LonginRecord;
 use epics_base_rs::types::EpicsValue;
 
+/// A `sub` with its SNAM already set, as a `.db` `field(SNAM,...)` line leaves it
+/// BEFORE `init_record` runs. C parks PACT permanently on an empty SNAM
+/// (`subRecord.c:119-123`), so a `sub` that is added first and configured after
+/// is a record C would have declared dead — the tests below are about the
+/// subroutine/alarm/deadband paths, not about that.
+fn sub_with_snam(snam: &str) -> epics_base_rs::server::records::sub_record::SubRecord {
+    let mut rec = epics_base_rs::server::records::sub_record::SubRecord::default();
+    rec.put_field("SNAM", EpicsValue::String(snam.into()))
+        .expect("SNAM is writable");
+    rec
+}
+
 #[tokio::test]
 async fn test_write_notify_follows_flnk() {
     let db = PvDatabase::new();
@@ -8892,18 +8904,19 @@ async fn sub_record_subroutine_runs_on_main_engine_path() {
     use epics_base_rs::server::records::sub_record::SubRecord;
 
     let db = PvDatabase::new();
-    db.add_record("SUBM", Box::new(SubRecord::default()))
-        .await
+    // SNAM is set BEFORE the record is added: C's `.db` load applies every
+    // `field()` and only then runs `init_record`, which parks PACT for good when
+    // SNAM is empty (subRecord.c:119-123). A sub configured after init is a
+    // record C would have declared dead.
+    let mut seed = SubRecord::default();
+    seed.put_field("SNAM", EpicsValue::String("double_val".into()))
         .unwrap();
+    db.add_record("SUBM", Box::new(seed)).await.unwrap();
 
-    // SNAM + a VAL-doubling subroutine, plus a seed VAL so the change is
-    // observable.
+    // A VAL-doubling subroutine, plus a seed VAL so the change is observable.
     {
         let arc = db.get_record("SUBM").await.unwrap();
         let mut inst = arc.write().await;
-        inst.record
-            .put_field("SNAM", EpicsValue::String("double_val".into()))
-            .unwrap();
         inst.record
             .put_field("VAL", EpicsValue::Double(5.0))
             .unwrap();
@@ -8946,11 +8959,11 @@ async fn sub_record_hihi_alarm_fires_via_shared_owner() {
     let db = PvDatabase::new();
 
     // FIRE: subroutine drives VAL to 100, HIHI=50/Major -> HIHI_ALARM.
-    db.add_record("SUB_HIHI", Box::new(SubRecord::default()))
+    db.add_record("SUB_HIHI", Box::new(sub_with_snam("drive")))
         .await
         .unwrap();
     // CONTROL: same VAL=100 but HIHI=200 -> no alarm, LALM tracks VAL.
-    db.add_record("SUB_OK", Box::new(SubRecord::default()))
+    db.add_record("SUB_OK", Box::new(sub_with_snam("drive")))
         .await
         .unwrap();
 
@@ -9023,7 +9036,7 @@ async fn sub_record_mdel_gates_val_monitor() {
     use epics_base_rs::server::records::sub_record::SubRecord;
 
     let db = PvDatabase::new();
-    let mut rec = SubRecord::default();
+    let mut rec = sub_with_snam("noop");
     rec.val = 100.0;
     rec.mdel = 10.0;
     rec.init_record(0).unwrap(); // MLST seeded to 100
@@ -9077,11 +9090,11 @@ async fn sub_record_negative_status_raises_soft_alarm_at_brsv() {
     let db = PvDatabase::new();
 
     // FIRE: status -1 with BRSV=Major -> SOFT_ALARM/Major.
-    db.add_record("SUB_SOFT", Box::new(SubRecord::default()))
+    db.add_record("SUB_SOFT", Box::new(sub_with_snam("status")))
         .await
         .unwrap();
     // CONTROL: status 0 with BRSV=Major -> no alarm.
-    db.add_record("SUB_OK0", Box::new(SubRecord::default()))
+    db.add_record("SUB_OK0", Box::new(sub_with_snam("status")))
         .await
         .unwrap();
 

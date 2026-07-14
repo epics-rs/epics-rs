@@ -306,6 +306,12 @@ macro_rules! mbb_get_field {
             // answer it, only the record can.
             "VAL" if !$self.sdef() => Some(EpicsValue::UShort($self.val)),
             "VAL" => Some(EpicsValue::Enum($self.val)),
+            // `field(SDEF,DBF_SHORT) { special(SPC_NOMOD) }`
+            // (mbboRecord.dbd.pod) — readable over CA, never writable. It is
+            // the very predicate the VAL arms above branch on, so serving it
+            // derived keeps the reported flag and the served wire type from
+            // ever disagreeing.
+            "SDEF" => Some(EpicsValue::Short($self.sdef() as i16)),
             $( $str => mbb_get_field!(@get $self, $field, $variant), )*
             _ => None,
         }
@@ -660,15 +666,6 @@ impl Record for MbboRecord {
             }
             self.lalm = val;
         }
-    }
-
-    /// C `mbboRecord.c::special` recomputes the cached `prec->sdef` after any
-    /// runtime write to a state value (ZRVL..FFVL) or state string
-    /// (ZRST..FFST). [`Self::sdef`] derives it on demand instead, so there is
-    /// nothing left to recompute and no window in which a state write has
-    /// landed but the cache has not.
-    fn special(&mut self, _field: &str, _after: bool) -> CaResult<()> {
-        Ok(())
     }
 }
 

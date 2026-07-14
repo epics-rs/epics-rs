@@ -15,7 +15,6 @@ pub struct MbbiRecord {
     pub mask: u32,
     // SHFT/NOBT/MLST/LALM are DBF_USHORT (mbbiRecord.dbd.pod:633,133,618,623).
     pub shft: u16,
-    pub sdef: bool,
     pub nobt: u16,
     pub mlst: u16,
     pub lalm: u16,
@@ -100,7 +99,6 @@ impl Default for MbbiRecord {
             oraw: 0,
             mask: 0,
             shft: 0,
-            sdef: false,
             nobt: 0,
             mlst: 0,
             lalm: 0,
@@ -183,24 +181,30 @@ impl MbbiRecord {
         ]
     }
 
-    fn compute_sdef(&mut self) {
+    /// C `mbbiRecord.c::init_common` (93-105) — "check if any states are
+    /// defined": TRUE as soon as one of ZRVL..FFVL is non-zero or one of
+    /// ZRST..FFST is non-empty.
+    ///
+    /// DERIVED, never stored — the same call `MbboRecord::sdef` makes, and for
+    /// the same reason. C keeps `prec->sdef` as a struct member and recomputes it
+    /// from `init_common`: at init, and from `special()` after every write to any
+    /// of the 32 state fields. A cached copy of a pure function of 32 other
+    /// fields can go stale, and a `special()` that forgets one field is exactly
+    /// how it does. Computing it on demand makes the stale state unreachable
+    /// rather than merely unlikely, and leaves one definition of "are states
+    /// defined" for both records instead of two that can drift.
+    fn sdef(&self) -> bool {
         let rvs = self.raw_values();
         let sts: [&PvString; 16] = [
             &self.zrst, &self.onst, &self.twst, &self.thst, &self.frst, &self.fvst, &self.sxst,
             &self.svst, &self.eist, &self.nist, &self.test, &self.elst, &self.tvst, &self.ttst,
             &self.ftst, &self.ffst,
         ];
-        self.sdef = false;
-        for i in 0..16 {
-            if rvs[i] != 0 || !sts[i].is_empty() {
-                self.sdef = true;
-                return;
-            }
-        }
+        (0..16).any(|i| rvs[i] != 0 || !sts[i].is_empty())
     }
 
     fn raw_to_val(&self, raw: u32) -> u16 {
-        if !self.sdef {
+        if !self.sdef() {
             return raw as u16;
         }
         let rvs = self.raw_values();
@@ -244,22 +248,6 @@ impl MbbiRecord {
 
 static MBBI_FIELDS: &[FieldDesc] = dbd_generated::MBBI_FIELDS;
 
-/// True for the mbbi/mbbo state-table fields whose modification must
-/// trigger an `sdef` recompute — the 16 state values (ZRVL..FFVL) and
-/// the 16 state strings (ZRST..FFST). Shared by `mbbi` and `mbbo`
-/// `special()` (C `mbbiRecord.c`/`mbboRecord.c` `init_common`).
-pub(crate) fn is_state_table_field(field: &str) -> bool {
-    const VL: [&str; 16] = [
-        "ZRVL", "ONVL", "TWVL", "THVL", "FRVL", "FVVL", "SXVL", "SVVL", "EIVL", "NIVL", "TEVL",
-        "ELVL", "TVVL", "TTVL", "FTVL", "FFVL",
-    ];
-    const ST: [&str; 16] = [
-        "ZRST", "ONST", "TWST", "THST", "FRST", "FVST", "SXST", "SVST", "EIST", "NIST", "TEST",
-        "ELST", "TVST", "TTST", "FTST", "FFST",
-    ];
-    VL.contains(&field) || ST.contains(&field)
-}
-
 /// Helper macro: maps EPICS field name strings to struct fields.
 macro_rules! mbb_get_field {
     // `String`-tagged fields (the SIML/SIOL link grammar) store a Rust
@@ -280,7 +268,14 @@ macro_rules! mbb_get_field {
     };
     ($self:expr, $name:expr, $( $str:literal => $field:ident : $variant:ident ),* $(,)?) => {
         match $name {
+            // C `mbbiRecord.c:53` is `#define cvt_dbaddr NULL` — unlike mbbo,
+            // mbbi never re-types VAL, so it is DBF_ENUM with or without a
+            // state table.
             "VAL" => Some(EpicsValue::Enum($self.val)),
+            // `field(SDEF,DBF_SHORT) { special(SPC_NOMOD) }`
+            // (mbbiRecord.dbd.pod:628) — readable over CA, never writable.
+            // Derived, so it cannot disagree with the state table it reports on.
+            "SDEF" => Some(EpicsValue::Short($self.sdef() as i16)),
             $( $str => mbb_get_field!(@get $self, $field, $variant), )*
             _ => None,
         }
@@ -439,7 +434,6 @@ impl Record for MbbiRecord {
             if self.mask == 0 && self.nobt > 0 && self.nobt <= 32 {
                 self.mask = ((1i64 << self.nobt) - 1) as u32;
             }
-            self.compute_sdef();
             self.mlst = self.val;
             self.lalm = self.val;
             self.oraw = self.rval;
@@ -574,19 +568,6 @@ impl Record for MbbiRecord {
             }
             self.lalm = val;
         }
-    }
-
-    /// C `mbbiRecord.c::special` — after a runtime write to any of the
-    /// state value (ZRVL..FFVL) or state string (ZRST..FFST) fields,
-    /// `init_common()` re-derives `sdef`. Without this a record that
-    /// started with an empty state table (`sdef=false`) would stay on
-    /// the no-states `VAL=RVAL` path even after a CA put populated a
-    /// state value.
-    fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
-        if after && is_state_table_field(field) {
-            self.compute_sdef();
-        }
-        Ok(())
     }
 
     /// Soft Channel VAL entry — a pass-through, NOT a raw->state map. C

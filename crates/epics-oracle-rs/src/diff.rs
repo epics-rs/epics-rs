@@ -91,18 +91,35 @@ pub struct Difference {
     pub rust: String,
 }
 
+/// The outcome of comparing one case: what was actually looked at, and what
+/// disagreed.
+///
+/// `compared` is not bookkeeping — it is the difference between "this deviation
+/// stopped happening" and "this run could not have seen it". A `--phase read`
+/// run never drives a put, so a `put_accepted` allowlist row cannot fire; without
+/// `compared`, the harness reports that row as a stale finding, which is a
+/// fabricated one. Staleness is only meaningful over a surface that was observed.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Comparison {
+    /// Every surface on which BOTH sides produced a reading, whether or not they
+    /// agreed.
+    pub compared: Vec<Surface>,
+    pub differences: Vec<Difference>,
+}
+
 /// Compare the two sides on every surface for which **both** produced a
 /// reading.
 ///
 /// A surface where one side is `None` is not a difference — it is an absence,
 /// and absences are handled by the ERROR path. Scoring "C said 5, port said
 /// nothing" as a value difference would be a fabricated finding.
-pub fn compare(c: &Observation, rust: &Observation) -> Vec<Difference> {
-    let mut d = Vec::new();
+pub fn compare(c: &Observation, rust: &Observation) -> Comparison {
+    let mut out = Comparison::default();
 
     let mut push = |surface: Surface, a: String, b: String| {
+        out.compared.push(surface);
         if a != b {
-            d.push(Difference {
+            out.differences.push(Difference {
                 surface,
                 c: a,
                 rust: b,
@@ -174,7 +191,7 @@ pub fn compare(c: &Observation, rust: &Observation) -> Vec<Difference> {
         push(Surface::MonitorEvents, seq(a), seq(b));
     }
 
-    d
+    out
 }
 
 /// What the harness concluded about one case.
@@ -207,7 +224,7 @@ mod tests {
             value_string: Some("1.5".into()),
             ..Default::default()
         };
-        assert!(compare(&o, &o).is_empty());
+        assert!(compare(&o, &o).differences.is_empty());
     }
 
     #[test]
@@ -220,7 +237,7 @@ mod tests {
             info: Some(info("DBF_LONG", 2, "read")),
             ..Default::default()
         };
-        let d = compare(&c, &r);
+        let d = compare(&c, &r).differences;
         let surfaces: Vec<_> = d.iter().map(|x| x.surface).collect();
         assert!(surfaces.contains(&Surface::NativeType));
         assert!(surfaces.contains(&Surface::ElementCount));
@@ -242,7 +259,7 @@ mod tests {
             value_numeric: Some("1".into()),
             ..Default::default()
         };
-        let d = compare(&c, &r);
+        let d = compare(&c, &r).differences;
         assert_eq!(d.len(), 1);
         assert_eq!(d[0].surface, Surface::ValueString);
     }
@@ -264,7 +281,10 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert!(compare(&c, &r).is_empty(), "absence is not a difference");
+        assert!(
+            compare(&c, &r).differences.is_empty(),
+            "absence is not a difference"
+        );
         assert!(!r.is_readable(), "...it is an ERROR");
     }
 
@@ -285,7 +305,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let d = compare(&c, &r);
+        let d = compare(&c, &r).differences;
         assert_eq!(d.len(), 1);
         assert_eq!(d[0].surface, Surface::PutAccepted);
     }
@@ -299,7 +319,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let d = compare(&mk("Invalid value"), &mk("Write access denied"));
+        let d = compare(&mk("Invalid value"), &mk("Write access denied")).differences;
         assert_eq!(d.len(), 1);
         assert_eq!(d[0].surface, Surface::PutError);
     }
@@ -335,6 +355,7 @@ mod tests {
                 ..Default::default()
             },
         );
+        let d = d.differences;
         let surfaces: Vec<_> = d.iter().map(|x| x.surface).collect();
         assert!(surfaces.contains(&Surface::MonitorCount));
         assert!(surfaces.contains(&Surface::MonitorEvents));
@@ -352,6 +373,7 @@ mod tests {
                 ..Default::default()
             },
         );
+        let d = d.differences;
         assert!(d.iter().any(|x| x.surface == Surface::MonitorEvents));
         assert!(
             !d.iter().any(|x| x.surface == Surface::MonitorCount),

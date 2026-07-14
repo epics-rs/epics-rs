@@ -29,7 +29,7 @@ use crate::allowlist::{Allowlist, MatchContext};
 use crate::cases::{BoundaryCase, boundary_cases};
 use crate::catool::{CaTools, PutOutcome, ToolError};
 use crate::dbd::Dbd;
-use crate::diff::{Observation, Verdict, compare};
+use crate::diff::{Comparison, Observation, Verdict, compare};
 use crate::ioc::{CTools, Ioc, Pair, Side};
 use crate::report::{CaseResult, Reproducer};
 use crate::surface::{Surface, is_put_candidate};
@@ -433,7 +433,21 @@ fn adjudicate(
         return base;
     }
 
-    let differences = compare(c, r);
+    let Comparison {
+        compared,
+        differences,
+    } = compare(c, r);
+
+    let ctx = MatchContext {
+        record_type,
+        field,
+        class,
+    };
+    // Tell the allowlist what this case LOOKED at, agreement or not — that is what
+    // separates a deviation that stopped happening (stale: a finding) from one this
+    // run never drove (unexercised: coverage). Must run before the agreed-early-out.
+    allowlist.note_compared(&ctx, &compared);
+
     if differences.is_empty() {
         return CaseResult {
             verdict: Verdict::Agreed,
@@ -441,11 +455,6 @@ fn adjudicate(
         };
     }
 
-    let ctx = MatchContext {
-        record_type,
-        field,
-        class,
-    };
     let hits: Vec<Option<String>> = differences
         .iter()
         .map(|d| allowlist.match_diff(&ctx, d))

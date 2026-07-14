@@ -143,6 +143,12 @@ pub struct Report {
     pub field_coverage: Coverage,
     pub counts: Counts,
     pub stale_allowlist_rows: Vec<StaleRow>,
+    /// Rows this run never drove — no case in their scope ran, or none of their
+    /// surfaces was compared. NOT findings: coverage. A `--phase read` run leaves
+    /// every put-surface row here, and reporting those as stale would be inventing
+    /// findings out of a narrowed scope.
+    #[serde(default)]
+    pub unexercised_allowlist_rows: Vec<StaleRow>,
     pub fired_allowlist_rows: Vec<String>,
     pub cases: Vec<CaseResult>,
 }
@@ -235,8 +241,20 @@ impl Report {
             s.push_str("STALE ALLOWLIST ROWS (the deviation stopped happening — investigate)\n");
             for r in &self.stale_allowlist_rows {
                 s.push_str(&format!(
-                    "  {} — never fired. Either the port regressed back onto C's bug,\n     \
-                     or C fixed it upstream. Both are findings.\n",
+                    "  {} — its scope WAS exercised and it still never fired. Either the port\n     \
+                     regressed back onto C's bug, or C fixed it upstream. Both are findings.\n",
+                    r.id
+                ));
+            }
+            s.push('\n');
+        }
+
+        if !self.unexercised_allowlist_rows.is_empty() {
+            s.push_str("UNEXERCISED ALLOWLIST ROWS (not findings — this run never drove them)\n");
+            for r in &self.unexercised_allowlist_rows {
+                s.push_str(&format!(
+                    "  {} — no case in its scope ran, or none of its surfaces was compared.\n     \
+                     Its silence measures nothing. Widen the run (e.g. --phase all) to judge it.\n",
                     r.id
                 ));
             }
@@ -429,6 +447,7 @@ mod tests {
                 id: "CBUG-E1".into(),
                 why: "compress FIFO".into(),
             }],
+            unexercised_allowlist_rows: vec![],
             fired_allowlist_rows: vec![],
             cases: vec![case(Verdict::Errored), case(Verdict::Defect)],
         };
@@ -461,6 +480,7 @@ mod tests {
             field_coverage: Coverage::default(),
             counts: Counts::tally(std::slice::from_ref(&c)),
             stale_allowlist_rows: vec![],
+            unexercised_allowlist_rows: vec![],
             fired_allowlist_rows: vec![],
             cases: vec![c],
         };

@@ -14,15 +14,26 @@
 //!
 //! - a diff matching a row -> **EXPECTED DEVIATION** (not a failure)
 //! - a diff matching no row -> **PORT DEFECT**
-//! - a row that never fired -> **STALE**, and reported. The deviation has
-//!   vanished: either the port regressed back onto C's bug, or C fixed it
-//!   upstream. Both are findings. A harness that only checked the first two
-//!   would let a silent regression sit forever behind a stale justification.
+//! - a row the run DROVE and that still never fired -> **STALE**, and reported.
+//!   The deviation has vanished: either the port regressed back onto C's bug, or
+//!   C fixed it upstream. Both are findings. A harness that only checked the
+//!   first two would let a silent regression sit forever behind a stale
+//!   justification.
+//! - a row the run never drove -> **UNEXERCISED**, and reported separately as
+//!   coverage, never as a finding.
+//!
+//! That last split is load-bearing. Staleness is a claim about what we *saw*, so
+//! it may only be asserted over a surface we actually looked at. A `--phase read`
+//! run never drives a put, so a `put_accepted` row cannot fire — calling it stale
+//! would fabricate a finding out of a narrowed scope, and a check that cries wolf
+//! is one people learn to ignore, which costs exactly the silent regressions it
+//! exists to catch. "I could not look" and "I looked and it was fine" are
+//! different answers here too, for the same reason ERROR is not AGREED.
 
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use crate::diff::Difference;
+use crate::diff::{Difference, Surface};
 
 /// One transcribed NOT-REPRODUCED entry, as a matchable rule.
 ///
@@ -71,11 +82,17 @@ struct File {
     deviations: Vec<Deviation>,
 }
 
-/// The loaded allowlist, plus which rows actually fired during the run.
+/// The loaded allowlist, plus which rows fired during the run and which rows the
+/// run was even in a position to fire.
 #[derive(Debug, Clone)]
 pub struct Allowlist {
     pub rows: Vec<Deviation>,
     fired: BTreeSet<String>,
+    /// Rows whose scope was actually observed: a case in the row's
+    /// record/field/class scope ran, and one of the row's surfaces was compared
+    /// on it. A row outside this set was never given the chance to fire, so its
+    /// silence says nothing.
+    exercised: BTreeSet<String>,
 }
 
 /// The context a difference occurred in, which the rules match against.
@@ -116,7 +133,27 @@ impl Allowlist {
         Ok(Self {
             rows: f.deviations,
             fired: BTreeSet::new(),
+            exercised: BTreeSet::new(),
         })
+    }
+
+    /// Record that a case ran and that these surfaces were compared on it —
+    /// whether they agreed or not.
+    ///
+    /// This is what makes [`Self::stale_rows`] honest. A row is only expected to
+    /// fire if the run actually looked where the row points; a `--phase read` run
+    /// never drives a put, so a `put_accepted` row that stays silent has told us
+    /// nothing at all.
+    pub fn note_compared(&mut self, ctx: &MatchContext<'_>, compared: &[Surface]) {
+        for row in &self.rows {
+            if row.enabled
+                && row.in_scope(ctx)
+                && compared.iter().any(|s| row.covers_surface(*s))
+                && !self.exercised.contains(&row.id)
+            {
+                self.exercised.insert(row.id.clone());
+            }
+        }
     }
 
     /// Find the row that justifies this difference, if any, and record that it
@@ -131,15 +168,31 @@ impl Allowlist {
         Some(hit)
     }
 
-    /// Enabled rows that never matched anything during the run.
+    /// Enabled rows whose scope the run DID observe, and which still never fired.
     ///
     /// Each is a finding: the deviation it describes no longer happens. Either
     /// the port regressed onto C's bug (bad) or C fixed it upstream (good, and
     /// the catalogue entry should be retired). Reported either way.
+    ///
+    /// A row the run never exercised is NOT stale — see [`Self::unexercised_rows`].
+    /// Conflating the two turns every scoped run into a source of fabricated
+    /// findings, and a check that cries wolf is a check people learn to ignore.
     pub fn stale_rows(&self) -> Vec<&Deviation> {
         self.rows
             .iter()
-            .filter(|r| r.enabled && !self.fired.contains(&r.id))
+            .filter(|r| r.enabled && !self.fired.contains(&r.id) && self.exercised.contains(&r.id))
+            .collect()
+    }
+
+    /// Enabled rows the run never put in a position to fire — no case in their
+    /// scope ran, or none of their surfaces was compared.
+    ///
+    /// Not a finding. It is coverage: these deviations went unmeasured, and a run
+    /// that could not look must not be read as a run that looked and saw nothing.
+    pub fn unexercised_rows(&self) -> Vec<&Deviation> {
+        self.rows
+            .iter()
+            .filter(|r| r.enabled && !self.fired.contains(&r.id) && !self.exercised.contains(&r.id))
             .collect()
     }
 
@@ -150,18 +203,31 @@ impl Allowlist {
 
 impl Deviation {
     fn matches(&self, ctx: &MatchContext<'_>, d: &Difference) -> bool {
+        self.in_scope(ctx) && self.covers_surface(d.surface)
+    }
+
+    /// Everything about a row except the surface: does this row point at the case
+    /// that just ran?
+    ///
+    /// Split out of [`Self::matches`] so that "did the run look here?" and "did the
+    /// row fire?" are decided by ONE rule. If they drifted apart, a row could be
+    /// judged stale against a scope it was never matched under.
+    fn in_scope(&self, ctx: &MatchContext<'_>) -> bool {
         // Each stated constraint must hold; each omitted one is a wildcard.
         let ok = |list: &[String], v: &str| list.is_empty() || list.iter().any(|x| x == v);
 
         ok(&self.record_types, ctx.record_type)
             && ok(&self.fields, ctx.field)
-            && ok(&self.surface, d.surface.as_str())
             && match ctx.class {
                 Some(c) => ok(&self.classes, c),
                 // A case with no boundary class (a pure read probe) can only
                 // match a row that does not constrain classes.
                 None => self.classes.is_empty(),
             }
+    }
+
+    fn covers_surface(&self, s: Surface) -> bool {
+        self.surface.is_empty() || self.surface.iter().any(|x| x == s.as_str())
     }
 }
 
@@ -248,15 +314,73 @@ why = "C's special() rejects SPC_MOD; port accepts. Documented fields unwritable
         );
     }
 
+    /// STALE means "we drove it and the deviation did not happen". The run must
+    /// have LOOKED: a row is only stale once a case in its scope was compared on
+    /// one of its surfaces and still agreed.
     #[test]
-    fn a_row_that_never_fires_is_reported_stale() {
+    fn a_row_whose_scope_was_exercised_and_did_not_fire_is_stale() {
         let mut al = Allowlist::parse(F6).unwrap();
-        assert_eq!(al.stale_rows().len(), 1, "nothing fired yet");
-        al.match_diff(
-            &ctx("calc", "INPM", Some("link-constant")),
-            &diff(Surface::PutAccepted, "false", "true"),
+        let c = ctx("calc", "INPM", Some("link-constant"));
+
+        al.note_compared(&c, &[Surface::PutAccepted]);
+        assert_eq!(
+            al.stale_rows().len(),
+            1,
+            "we drove the put and C and the port agreed — the deviation stopped"
         );
+        assert!(al.unexercised_rows().is_empty());
+
+        al.match_diff(&c, &diff(Surface::PutAccepted, "false", "true"));
         assert!(al.stale_rows().is_empty(), "it fired, so it is not stale");
+    }
+
+    /// The defect this split exists to kill: a `--phase read` run never drives a
+    /// put, so a `put_accepted` row CANNOT fire. Calling that stale invents a
+    /// finding out of a narrowed scope — and a check that cries wolf gets ignored,
+    /// which costs the real regressions it exists to catch.
+    #[test]
+    fn a_row_the_run_never_drove_is_unexercised_not_stale() {
+        let mut al = Allowlist::parse(F6).unwrap();
+
+        // Nothing ran at all.
+        assert!(
+            al.stale_rows().is_empty(),
+            "a run that did not look is not evidence"
+        );
+        assert_eq!(al.unexercised_rows().len(), 1);
+
+        // A read-phase sweep over the very same field: every read surface is
+        // compared, but the put surface the row names never is.
+        let c = ctx("calc", "INPM", None);
+        al.note_compared(
+            &c,
+            &[
+                Surface::NativeType,
+                Surface::ValueString,
+                Surface::ValueNumeric,
+                Surface::AccessRights,
+            ],
+        );
+        assert!(
+            al.stale_rows().is_empty(),
+            "the row's surface was never compared — its silence measures nothing"
+        );
+        assert_eq!(al.unexercised_rows().len(), 1);
+    }
+
+    /// Exercise is scoped by record/field too, not just by surface.
+    #[test]
+    fn a_case_outside_the_rows_scope_does_not_exercise_it() {
+        let mut al = Allowlist::parse(F6).unwrap();
+        al.note_compared(
+            &ctx("ai", "INPM", Some("link-constant")),
+            &[Surface::PutAccepted],
+        );
+        assert!(
+            al.stale_rows().is_empty(),
+            "the row is scoped to calc/calcout; an ai case says nothing about it"
+        );
+        assert_eq!(al.unexercised_rows().len(), 1);
     }
 
     /// A REPRODUCED row must never match: the port carries C's bug on purpose,
@@ -281,7 +405,12 @@ why = "port reproduces C's bare cast on purpose; agreement expected today"
             .is_none(),
             "a REPRODUCED row must not launder a diff into 'expected'"
         );
+        al.note_compared(&ctx("ai", "VAL", Some("over-max")), &[Surface::ValueString]);
         assert!(al.stale_rows().is_empty(), "disabled rows are not stale");
+        assert!(
+            al.unexercised_rows().is_empty(),
+            "nor unexercised — a disabled row is outside the ledger entirely"
+        );
     }
 
     #[test]

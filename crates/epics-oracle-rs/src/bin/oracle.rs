@@ -152,14 +152,12 @@ async fn run() -> Result<ExitCode, String> {
     let counts = Counts::tally(&cases);
     counts.check()?;
 
-    let stale: Vec<StaleRow> = allowlist
-        .stale_rows()
-        .into_iter()
-        .map(|r| StaleRow {
-            id: r.id.clone(),
-            why: r.why.trim().to_string(),
-        })
-        .collect();
+    let row = |r: &epics_oracle_rs::allowlist::Deviation| StaleRow {
+        id: r.id.clone(),
+        why: r.why.trim().to_string(),
+    };
+    let stale: Vec<StaleRow> = allowlist.stale_rows().into_iter().map(row).collect();
+    let unexercised: Vec<StaleRow> = allowlist.unexercised_rows().into_iter().map(row).collect();
     let fired: Vec<String> = allowlist.fired_rows().iter().cloned().collect();
 
     let report = Report {
@@ -174,6 +172,7 @@ async fn run() -> Result<ExitCode, String> {
         field_coverage,
         counts,
         stale_allowlist_rows: stale,
+        unexercised_allowlist_rows: unexercised,
         fired_allowlist_rows: fired,
         cases,
     };

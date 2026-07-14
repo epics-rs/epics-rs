@@ -99,8 +99,17 @@ impl Default for DfanoutRecord {
             lalm: 0.0,
             mdel: 0.0,
             adel: 0.0,
-            mlst: f64::NAN,
-            alst: f64::NAN,
+            // `dfanoutRecord.dbd` gives MLST/ALST no `initial()`: C's calloc'd
+            // record starts both at 0.0, and `caget D:DF.MLST` on a C IOC reads
+            // 0. They are ordinary wire-visible fields, not sentinels — the
+            // "nothing posted yet" state lives in `CommonFields::{mlst,alst}`
+            // (`Option<f64>`), which the deadband owner falls back to when a
+            // record does not declare the field at all. Every other analog record
+            // in the port already starts them at 0.0; dfanout alone used NaN,
+            // which both served `nan` to clients and made its FIRST deadband check
+            // fire where C's (delta = |0 - 0| = 0, not > MDEL) does not.
+            mlst: 0.0,
+            alst: 0.0,
         }
     }
 }

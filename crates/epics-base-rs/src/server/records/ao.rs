@@ -31,7 +31,13 @@ pub struct AoRecord {
     pub eslo: f64, // default 1.0
     pub eoff: f64, // engineering offset (defaults to egul for LINEAR)
     pub roff: i32,
-    pub aslo: f64, // default 1.0
+    /// `ASLO` — raw-to-engineering slope applied ahead of ESLO. `aoRecord.dbd`
+    /// gives it NO `initial()`, so C's calloc'd record starts at 0.0 and every
+    /// use is guarded (`if (prec->aslo != 0.0) value *= prec->aslo`), i.e. 0.0
+    /// means "no ASLO scaling" — it is NOT a unit slope. (`ai` is the asymmetric
+    /// twin: `aiRecord.dbd` DOES declare `initial("1")`. Measured: a bare C
+    /// `record(ao,..)` serves ASLO=0, a bare `record(ai,..)` serves ASLO=1.)
+    pub aslo: f64,
     pub aoff: f64,
     // Output control
     pub omsl: i16,   // 0=supervisory, 1=closed_loop
@@ -110,7 +116,7 @@ impl Default for AoRecord {
             eslo: 1.0,
             eoff: 0.0,
             roff: 0,
-            aslo: 1.0,
+            aslo: 0.0,
             aoff: 0.0,
             omsl: 0,
             dol: String::new(),

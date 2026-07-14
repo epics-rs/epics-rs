@@ -31894,6 +31894,162 @@ pub static DB_COMMON_FIELDS: &[FieldDesc] = &[
     },
 ];
 
+// ---------------------------------------------------------------------
+// Per-record-type device menus (C `dbDeviceMenu`), in `.dbd` declaration
+// order. The index is wire-visible: it IS the value of the DTYP field.
+// ---------------------------------------------------------------------
+
+/// `device(aai, ...)` choices, in declaration order.
+pub static DEVICE_MENU_AAI: &[&str] = &["Soft Channel"];
+
+/// `device(aao, ...)` choices, in declaration order.
+pub static DEVICE_MENU_AAO: &[&str] = &["Soft Channel"];
+
+/// `device(acalcout, ...)` choices, in declaration order.
+pub static DEVICE_MENU_ACALCOUT: &[&str] = &["Soft Channel"];
+
+/// `device(ai, ...)` choices, in declaration order.
+pub static DEVICE_MENU_AI: &[&str] = &[
+    "Soft Channel",
+    "Raw Soft Channel",
+    "Async Soft Channel",
+    "Soft Timestamp",
+    "General Time",
+];
+
+/// `device(ao, ...)` choices, in declaration order.
+pub static DEVICE_MENU_AO: &[&str] = &["Soft Channel", "Raw Soft Channel", "Async Soft Channel"];
+
+/// `device(asyn, ...)` choices, in declaration order.
+pub static DEVICE_MENU_ASYN: &[&str] = &["asynRecordDevice"];
+
+/// `device(bi, ...)` choices, in declaration order.
+pub static DEVICE_MENU_BI: &[&str] = &[
+    "Soft Channel",
+    "Raw Soft Channel",
+    "Async Soft Channel",
+    "Db State",
+];
+
+/// `device(bo, ...)` choices, in declaration order.
+pub static DEVICE_MENU_BO: &[&str] = &[
+    "Soft Channel",
+    "Raw Soft Channel",
+    "Async Soft Channel",
+    "General Time",
+    "Db State",
+];
+
+/// `device(busy, ...)` choices, in declaration order.
+pub static DEVICE_MENU_BUSY: &[&str] = &["Soft Channel", "Raw Soft Channel"];
+
+/// `device(calcout, ...)` choices, in declaration order.
+pub static DEVICE_MENU_CALCOUT: &[&str] = &["Soft Channel", "Async Soft Channel"];
+
+/// `device(event, ...)` choices, in declaration order.
+pub static DEVICE_MENU_EVENT: &[&str] = &["Soft Channel"];
+
+/// `device(histogram, ...)` choices, in declaration order.
+pub static DEVICE_MENU_HISTOGRAM: &[&str] = &["Soft Channel"];
+
+/// `device(int64in, ...)` choices, in declaration order.
+pub static DEVICE_MENU_INT64IN: &[&str] = &["Soft Channel", "Async Soft Channel"];
+
+/// `device(int64out, ...)` choices, in declaration order.
+pub static DEVICE_MENU_INT64OUT: &[&str] = &["Soft Channel", "Async Soft Channel"];
+
+/// `device(longin, ...)` choices, in declaration order.
+pub static DEVICE_MENU_LONGIN: &[&str] = &["Soft Channel", "Async Soft Channel", "General Time"];
+
+/// `device(longout, ...)` choices, in declaration order.
+pub static DEVICE_MENU_LONGOUT: &[&str] = &["Soft Channel", "Async Soft Channel"];
+
+/// `device(lsi, ...)` choices, in declaration order.
+pub static DEVICE_MENU_LSI: &[&str] = &["Soft Channel", "getenv"];
+
+/// `device(lso, ...)` choices, in declaration order.
+pub static DEVICE_MENU_LSO: &[&str] = &["Soft Channel", "Async Soft Channel", "stdio"];
+
+/// `device(mbbi, ...)` choices, in declaration order.
+pub static DEVICE_MENU_MBBI: &[&str] = &["Soft Channel", "Raw Soft Channel", "Async Soft Channel"];
+
+/// `device(mbbiDirect, ...)` choices, in declaration order.
+pub static DEVICE_MENU_MBBIDIRECT: &[&str] =
+    &["Soft Channel", "Raw Soft Channel", "Async Soft Channel"];
+
+/// `device(mbbo, ...)` choices, in declaration order.
+pub static DEVICE_MENU_MBBO: &[&str] = &["Soft Channel", "Raw Soft Channel", "Async Soft Channel"];
+
+/// `device(mbboDirect, ...)` choices, in declaration order.
+pub static DEVICE_MENU_MBBODIRECT: &[&str] =
+    &["Soft Channel", "Raw Soft Channel", "Async Soft Channel"];
+
+/// `device(printf, ...)` choices, in declaration order.
+pub static DEVICE_MENU_PRINTF: &[&str] = &["Soft Channel", "Async Soft Channel", "stdio"];
+
+/// `device(scalcout, ...)` choices, in declaration order.
+pub static DEVICE_MENU_SCALCOUT: &[&str] = &["Soft Channel"];
+
+/// `device(stringin, ...)` choices, in declaration order.
+pub static DEVICE_MENU_STRINGIN: &[&str] = &[
+    "Soft Channel",
+    "Async Soft Channel",
+    "Soft Timestamp",
+    "General Time",
+    "getenv",
+];
+
+/// `device(stringout, ...)` choices, in declaration order.
+pub static DEVICE_MENU_STRINGOUT: &[&str] = &["Soft Channel", "Async Soft Channel", "stdio"];
+
+/// `device(subArray, ...)` choices, in declaration order.
+pub static DEVICE_MENU_SUBARRAY: &[&str] = &["Soft Channel"];
+
+/// `device(swait, ...)` choices, in declaration order.
+pub static DEVICE_MENU_SWAIT: &[&str] = &["Soft Channel"];
+
+/// `device(waveform, ...)` choices, in declaration order.
+pub static DEVICE_MENU_WAVEFORM: &[&str] = &["Soft Channel"];
+
+/// The device menu for a record type — the choices its `DTYP` field selects
+/// among, in `.dbd` declaration order. `None` for a record type that declares
+/// no device support: C has no `dbDeviceMenu` for it, and its DTYP renders as
+/// the empty string.
+pub fn device_menu(record_type: &str) -> Option<&'static [&'static str]> {
+    Some(match record_type {
+        "aai" => DEVICE_MENU_AAI,
+        "aao" => DEVICE_MENU_AAO,
+        "acalcout" => DEVICE_MENU_ACALCOUT,
+        "ai" => DEVICE_MENU_AI,
+        "ao" => DEVICE_MENU_AO,
+        "asyn" => DEVICE_MENU_ASYN,
+        "bi" => DEVICE_MENU_BI,
+        "bo" => DEVICE_MENU_BO,
+        "busy" => DEVICE_MENU_BUSY,
+        "calcout" => DEVICE_MENU_CALCOUT,
+        "event" => DEVICE_MENU_EVENT,
+        "histogram" => DEVICE_MENU_HISTOGRAM,
+        "int64in" => DEVICE_MENU_INT64IN,
+        "int64out" => DEVICE_MENU_INT64OUT,
+        "longin" => DEVICE_MENU_LONGIN,
+        "longout" => DEVICE_MENU_LONGOUT,
+        "lsi" => DEVICE_MENU_LSI,
+        "lso" => DEVICE_MENU_LSO,
+        "mbbi" => DEVICE_MENU_MBBI,
+        "mbbiDirect" => DEVICE_MENU_MBBIDIRECT,
+        "mbbo" => DEVICE_MENU_MBBO,
+        "mbboDirect" => DEVICE_MENU_MBBODIRECT,
+        "printf" => DEVICE_MENU_PRINTF,
+        "scalcout" => DEVICE_MENU_SCALCOUT,
+        "stringin" => DEVICE_MENU_STRINGIN,
+        "stringout" => DEVICE_MENU_STRINGOUT,
+        "subArray" => DEVICE_MENU_SUBARRAY,
+        "swait" => DEVICE_MENU_SWAIT,
+        "waveform" => DEVICE_MENU_WAVEFORM,
+        _ => return None,
+    })
+}
+
 /// The record-own field table for a record type name, or `None` for a type
 /// no vendored `.dbd` declares.
 pub fn record_fields(record_type: &str) -> Option<&'static [FieldDesc]> {

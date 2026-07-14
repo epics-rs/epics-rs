@@ -673,6 +673,12 @@ pub(crate) fn menu_choices_of<R: Record + ?Sized>(
     record: &R,
     field: &str,
 ) -> Option<&'static [&'static str]> {
+    // `DTYP` is `DBF_DEVICE`: its choices are the record type's DEVICE menu
+    // (C `dbDeviceMenu`, built from the `device()` declarations), which is
+    // per-record-type and so cannot live in the shared `dbCommon` FieldDesc.
+    if field.eq_ignore_ascii_case("DTYP") {
+        return super::dbd_generated::device_menu(record.record_type());
+    }
     field_desc_of(record, field)
         .and_then(|f| f.menu)
         .or_else(|| record.menu_field_choices(field))
@@ -1154,6 +1160,43 @@ impl RecordInstance {
         menu_choices_of(self.record.as_ref(), field)
     }
 
+    /// The choices this record's `DTYP` selects among — C's `dbDeviceMenu` for
+    /// the record type, in `.dbd` declaration order.
+    ///
+    /// C's DTYP field IS the index into this list, and an unset DTYP is index 0
+    /// — which is why a bare `record(ai,"X"){}` serves `Soft Channel` and a
+    /// `record(calc,"X"){}`, whose record type declares no device support at
+    /// all, serves the empty string.
+    ///
+    /// The port stores the device NAME rather than the index, because the name
+    /// is what the device-support registry dispatches on, and a name registered
+    /// at runtime by a downstream crate (`asynInt32`) has no `device()` line in
+    /// any vendored `.dbd`. Such a name is appended as its own slot, so the
+    /// index and the string still name the SAME device support: there is no
+    /// value of DTYP that renders as a device this record is not bound to.
+    pub(crate) fn device_choices(&self) -> Vec<PvString> {
+        let declared = super::dbd_generated::device_menu(self.record.record_type()).unwrap_or(&[]);
+        let mut slots: Vec<PvString> = declared.iter().map(|c| PvString::from(*c)).collect();
+        let dtyp = self.common.dtyp.as_str();
+        if !dtyp.is_empty() && !declared.contains(&dtyp) {
+            slots.push(PvString::from(dtyp));
+        }
+        slots
+    }
+
+    /// The value of the `DTYP` field: the index of the bound device support in
+    /// [`Self::device_choices`]. An unset DTYP is index 0, exactly as in C.
+    pub(crate) fn dtyp_index(&self) -> u16 {
+        let dtyp = self.common.dtyp.as_str();
+        if dtyp.is_empty() {
+            return 0;
+        }
+        self.device_choices()
+            .iter()
+            .position(|c| c.as_str_lossy() == dtyp)
+            .unwrap_or(0) as u16
+    }
+
     /// **The** owner of "what string does this enum-valued field render as" —
     /// C's `[DBF_*][DBR_STRING]` conversion row, chosen by the field's DBF
     /// class. Every path that renders an enum as a string goes through here:
@@ -1175,6 +1218,12 @@ impl RecordInstance {
     /// the port renders empty. It never renders the index: no C conversion row
     /// produces one.
     pub(crate) fn enum_string_form_for(&self, field: &str) -> Option<EnumStringForm> {
+        if field.eq_ignore_ascii_case("DTYP") {
+            return Some(EnumStringForm {
+                slots: self.device_choices(),
+                overflow: PvString::new(),
+            });
+        }
         if let Some(choices) = self.menu_choices_for(field) {
             return Some(EnumStringForm {
                 slots: choices.iter().map(|c| PvString::from(*c)).collect(),
@@ -1364,17 +1413,26 @@ impl RecordInstance {
     /// shares a name with the alarm-severity menu) is served as its own
     /// declared string and gets no choice table.
     fn attach_menu_enum(&self, field: &str, snap: &mut super::super::snapshot::Snapshot) {
-        let Some(choices) = self.menu_choices_for(field) else {
+        if !matches!(snap.value, EpicsValue::Enum(_)) {
+            return;
+        }
+        // `VAL` is the one field whose two rset slots differ: C's
+        // `get_enum_strs` (the `DBR_GR_ENUM` labels) is TRIMMED to `no_str`
+        // while `get_enum_str` (the DBR_STRING form) indexes the untrimmed
+        // state array. `populate_enum_info` owns that pair; every OTHER
+        // enum-valued field is a menu or a device, whose one choice list
+        // answers both (C `getMenuString`/`getDeviceString` index the same
+        // `papChoiceValue` the GR_ENUM reply carries).
+        if field.eq_ignore_ascii_case("VAL") {
+            return;
+        }
+        let Some(form) = self.enum_string_form_for(field) else {
             return;
         };
-        if matches!(snap.value, EpicsValue::Enum(_)) {
-            // A menu's choice list IS its string table (C `getMenuString`
-            // indexes the same `papChoiceValue` the `DBR_GR_ENUM` reply
-            // carries), so both rset slots come from the one list.
-            snap.enums = Some(super::super::snapshot::EnumInfo::new(
-                choices.iter().map(|s| PvString::from(*s)).collect(),
-            ));
-        }
+        snap.enums = Some(super::super::snapshot::EnumInfo::with_string_form(
+            form.slots.clone(),
+            form,
+        ));
     }
 
     /// Build a Snapshot with full metadata for the given field.
@@ -2098,7 +2156,10 @@ impl RecordInstance {
                 Some(EpicsValue::String(self.common.inp.clone().into()))
             }
             "OUT" => Some(EpicsValue::String(self.common.out.clone().into())),
-            "DTYP" => Some(EpicsValue::String(self.common.dtyp.clone().into())),
+            // C's DTYP is `DBF_DEVICE`: an epicsEnum16 index into the record
+            // type's device menu, NOT the name. The name is what this port
+            // stores and dispatches on; the index is what the wire carries.
+            "DTYP" => Some(EpicsValue::Enum(self.dtyp_index())),
             "TSE" => Some(EpicsValue::Short(self.common.tse)),
             "TSEL" => Some(EpicsValue::String(self.common.tsel.clone().into())),
             // C `UTAG` is DBF_UINT64 — exposed natively as the unsigned
@@ -2571,11 +2632,31 @@ impl RecordInstance {
                     self.record.special(&name, true)?;
                 }
             }
-            "DTYP" => {
-                if let EpicsValue::String(s) = value {
-                    self.common.dtyp = s.as_str_lossy().into_owned();
+            // Two shapes reach DTYP and both name a device support:
+            //
+            // * the `.db` loader hands over the NAME verbatim, and it may be a
+            //   name registered at runtime by a downstream crate ("asynInt32")
+            //   that no vendored `.dbd` declares — C would reject that at load,
+            //   the port's registry accepts it (Tier 3);
+            // * a `dbPut` arrives as the menu INDEX, because `DBF_DEVICE` is
+            //   served as `DBR_ENUM` and `coerce_put_value` already resolved an
+            //   incoming label through the device menu (C `putStringMenu`,
+            //   which fails `S_db_badChoice` on a name the menu does not have).
+            //
+            // The index is only meaningful against the DECLARED menu, which is
+            // what the converter bounded it by.
+            "DTYP" => match value {
+                EpicsValue::String(s) => self.common.dtyp = s.as_str_lossy().into_owned(),
+                EpicsValue::Enum(i) => {
+                    let declared =
+                        super::dbd_generated::device_menu(self.record.record_type()).unwrap_or(&[]);
+                    match declared.get(i as usize) {
+                        Some(name) => self.common.dtyp = (*name).to_string(),
+                        None => return Ok(CommonFieldPutResult::NoChange),
+                    }
                 }
-            }
+                _ => return Ok(CommonFieldPutResult::NoChange),
+            },
             "TSE" => {
                 if let EpicsValue::Short(v) = value {
                     self.common.tse = v;

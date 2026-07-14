@@ -10,7 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
-use crate::parse::{Field, Menu, RecordType};
+use crate::parse::{Device, Field, Menu, RecordType};
 
 /// The `DBF_*` -> `DbFieldType` map, mirroring C `dbStaticLib`'s `dbfType`
 /// enum and `dbAccess.c`'s `mapDBFToDBR`:
@@ -166,6 +166,7 @@ fn rust_str(s: &str) -> String {
 
 pub struct Input<'a> {
     pub menus: &'a BTreeMap<String, Menu>,
+    pub devices: &'a [Device],
     pub records: &'a [RecordType],
     pub common: &'a [Field],
     pub cvt: &'a BTreeMap<(String, String), CvtDbAddr>,
@@ -359,6 +360,63 @@ pub fn emit(input: &Input<'_>) -> Result<String, String> {
         out.push_str(&emit_field("dbCommon", f, &menu_names, input.cvt)?);
     }
     out.push_str("];\n\n");
+
+    // --- device menus ---------------------------------------------------
+    //
+    // C `dbDeviceMenu`: the ordered list of `device()` declarations for a record
+    // type. `DTYP` is an INDEX into it — an unset DTYP is index 0, the first
+    // device the loaded `.dbd` declares for that type, which is why a C IOC
+    // serves `caget -t REC.DTYP` as "Soft Channel" for a bare `record(ai,"X"){}`
+    // and as the empty string for a record type that declares no device at all
+    // (`dbConvert.c::getDeviceString` fails the get, leaving the caller's buffer
+    // zeroed).
+    out.push_str(
+        "// ---------------------------------------------------------------------\n\
+         // Per-record-type device menus (C `dbDeviceMenu`), in `.dbd` declaration\n\
+         // order. The index is wire-visible: it IS the value of the DTYP field.\n\
+         // ---------------------------------------------------------------------\n\n",
+    );
+    let mut device_menus: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for d in input.devices {
+        let choices = device_menus.entry(d.record.as_str()).or_default();
+        // C `dbDeviceMenu` holds one entry per device() line; a duplicate choice
+        // string for the same record type is a `.dbd` error there and would make
+        // the index ambiguous here.
+        if choices.contains(&d.name.as_str()) {
+            return Err(format!(
+                "device({}, ..., {:?}) is declared twice",
+                d.record, d.name
+            ));
+        }
+        choices.push(d.name.as_str());
+    }
+    let mut device_consts: Vec<(&str, String)> = Vec::new();
+    for (record, choices) in &device_menus {
+        let konst = format!("DEVICE_MENU_{}", record.to_uppercase().replace('-', "_"));
+        writeln!(
+            out,
+            "/// `device({record}, ...)` choices, in declaration order."
+        )
+        .unwrap();
+        writeln!(out, "pub static {konst}: &[&str] = &[").unwrap();
+        for c in choices {
+            writeln!(out, "    {},", rust_str(c)).unwrap();
+        }
+        out.push_str("];\n\n");
+        device_consts.push((record, konst));
+    }
+    out.push_str(
+        "/// The device menu for a record type — the choices its `DTYP` field selects\n\
+         /// among, in `.dbd` declaration order. `None` for a record type that declares\n\
+         /// no device support: C has no `dbDeviceMenu` for it, and its DTYP renders as\n\
+         /// the empty string.\n\
+         pub fn device_menu(record_type: &str) -> Option<&'static [&'static str]> {\n\
+         \x20   Some(match record_type {\n",
+    );
+    for (record, konst) in &device_consts {
+        writeln!(out, "        {} => {konst},", rust_str(record)).unwrap();
+    }
+    out.push_str("        _ => return None,\n    })\n}\n\n");
 
     // --- registry -------------------------------------------------------
     out.push_str(

@@ -5,6 +5,7 @@
 //!
 //! ```text
 //! menu(NAME) { choice(IDENT,"label") ... }
+//! device(recordtype, link_type, dset_name, "choice string")
 //! recordtype(NAME) {
 //!     include "dbCommon.dbd"
 //!     field(NAME,DBF_TYPE) {
@@ -61,10 +62,23 @@ pub struct RecordType {
     pub source: String,
 }
 
+/// One `device(rectype, link_type, dset, "name")` declaration.
+///
+/// C builds a `dbDeviceMenu` per record type out of these, in LOAD order, and
+/// a record's `DTYP` field is an index into it (`dbConvert.c::getDeviceString`
+/// renders the choice; an unset DTYP is index 0, the first device declared for
+/// that record type). The order is therefore wire-visible and is preserved.
+#[derive(Debug, Clone)]
+pub struct Device {
+    pub record: String,
+    pub name: String,
+}
+
 #[derive(Debug, Default)]
 pub struct Dbd {
     pub menus: BTreeMap<String, Menu>,
     pub records: Vec<RecordType>,
+    pub devices: Vec<Device>,
 }
 
 /// One lexical token. The `.dbd` grammar needs nothing richer: identifiers,
@@ -183,6 +197,24 @@ impl Parser {
             other => Err(format!("expected {want:?}, found {other:?}")),
         }
     }
+    /// The comma-separated arguments of `foo(a, b, c)`.
+    fn paren_args(&mut self) -> Result<Vec<String>, String> {
+        self.expect(&Tok::LParen)?;
+        let mut args = Vec::new();
+        loop {
+            match self.next() {
+                Some(Tok::Ident(s)) | Some(Tok::Str(s)) => args.push(s),
+                Some(Tok::RParen) => return Ok(args),
+                other => return Err(format!("expected argument, found {other:?}")),
+            }
+            match self.next() {
+                Some(Tok::Comma) => {}
+                Some(Tok::RParen) => return Ok(args),
+                other => return Err(format!("expected , or ) found {other:?}")),
+            }
+        }
+    }
+
     /// The single argument of `foo(arg)` — an identifier or a quoted string,
     /// both of which reduce to their text.
     fn paren_arg(&mut self) -> Result<String, String> {
@@ -225,6 +257,16 @@ pub fn parse_str(src: &str, source: &str, common: &[Field]) -> Result<Dbd, Strin
                 let choices = parse_menu_body(&mut p)?;
                 dbd.menus.insert(name, Menu { choices });
             }
+            Tok::Ident(kw) if kw == "device" => {
+                p.next();
+                let args = p.paren_args()?;
+                // `device(rectype, link_type, dset, "choice")` — four arguments,
+                // and the port models only the first and the last: the record
+                // type it extends and the DTYP string a `.db` names it by.
+                let [record, _link, _dset, name] = <[String; 4]>::try_from(args)
+                    .map_err(|a| format!("device() takes 4 arguments, found {}", a.len()))?;
+                dbd.devices.push(Device { record, name });
+            }
             Tok::Ident(kw) if kw == "recordtype" => {
                 p.next();
                 let name = p.paren_arg()?;
@@ -235,7 +277,7 @@ pub fn parse_str(src: &str, source: &str, common: &[Field]) -> Result<Dbd, Strin
                     source: source.to_string(),
                 });
             }
-            // `include`, `device`, `driver`, `registrar`, `variable`,
+            // `include`, `driver`, `registrar`, `variable`,
             // `function`, `breaktable` — declarations this generator does not
             // model. Skip the statement and any brace body that follows.
             Tok::Ident(_) => {

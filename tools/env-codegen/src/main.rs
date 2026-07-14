@@ -378,3 +378,69 @@ fn rustfmt(src: &str) -> Result<String, String> {
     }
     String::from_utf8(out.stdout).map_err(|e| format!("rustfmt: non-utf8 output: {e}"))
 }
+
+#[cfg(test)]
+mod tests {
+    /// The drift gate — see `dbd-codegen`'s twin.
+    ///
+    /// A checked-in generated file with no test behind it is a file that can go
+    /// stale in silence. `cargo nextest run` executes this, so a `CONFIG_ENV`
+    /// edit that nobody regenerated is a failing test rather than a table that
+    /// quietly disagrees with its own spec.
+    #[test]
+    fn generated_file_is_not_stale() {
+        let root = super::repo_root().expect("workspace root");
+        let want = super::generate(&root.join(super::ENVCONFIG_DIR)).expect("generator run");
+        let have = std::fs::read_to_string(root.join(super::OUT_FILE)).unwrap_or_default();
+        if have == want {
+            return;
+        }
+        let first = have
+            .lines()
+            .zip(want.lines())
+            .enumerate()
+            .find(|(_, (a, b))| a != b)
+            .map(|(n, (a, b))| format!("line {}:\n  have: {a}\n  want: {b}", n + 1))
+            .unwrap_or_else(|| {
+                format!(
+                    "length differs: {} vs {} lines",
+                    have.lines().count(),
+                    want.lines().count()
+                )
+            });
+        panic!(
+            "{} is STALE — it no longer matches the vendored configure/ files.\n\
+             Re-run `cargo run -p env-codegen -- --write` and commit the result.\n\
+             First difference at {first}",
+            super::OUT_FILE
+        );
+    }
+
+    /// The generator's own transform, on the shapes `bldEnvData.pl` accepts.
+    /// `IOCSH_PS1`'s default is a C macro, not a string literal — getting this
+    /// wrong is how the prompt silently becomes the literal text
+    /// `ANSI_GREEN("epics> ")`.
+    #[test]
+    fn expand_value_matches_the_c_preprocessor() {
+        // Bare word: the script quotes it verbatim.
+        assert_eq!(super::expand_value("YES").unwrap(), "YES");
+        assert_eq!(super::expand_value("5064").unwrap(), "5064");
+        assert_eq!(super::expand_value("").unwrap(), "");
+        // Quoted: the quotes are delimiters, not content.
+        assert_eq!(super::expand_value("\"\"").unwrap(), "");
+        assert_eq!(
+            super::expand_value("\"CST6CDT,M3.2.0/2\"").unwrap(),
+            "CST6CDT,M3.2.0/2"
+        );
+        // Adjacent string literals concatenate, as in C.
+        assert_eq!(super::expand_value("\"a\" \"b\"").unwrap(), "ab");
+        // ANSI_COLOR(STR) == ANSI_ESC_COLOR STR ANSI_ESC_RESET (errlog.h:290-297).
+        assert_eq!(
+            super::expand_value("ANSI_GREEN(\"epics> \")").unwrap(),
+            "\x1b[32;1mepics> \x1b[0m"
+        );
+        assert_eq!(super::expand_value("ANSI_ESC_RED").unwrap(), "\x1b[31;1m");
+        // An unknown macro is a hard error, not a silently pasted literal.
+        assert!(super::expand_value("ANSI_TEAL(\"x\")").is_err());
+    }
+}

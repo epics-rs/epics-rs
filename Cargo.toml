@@ -17,6 +17,11 @@ default-members = [
     "crates/mqtt-rs",
     "crates/modbus-rs",
     "crates/epics-tools-rs",
+    # The codegen drift gates live here as `#[test]`s. They are in
+    # default-members so a BARE `cargo nextest run` catches a stale generated
+    # table — a gate you have to remember to invoke is not a gate.
+    "tools/dbd-codegen",
+    "tools/env-codegen",
 ]
 resolver = "3"
 

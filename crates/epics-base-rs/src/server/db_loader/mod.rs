@@ -1257,16 +1257,24 @@ fn expect_char(
 /// instead; there is no record storage here to write it into, and
 /// `tests/dbd_initial_parity.rs` is what holds those to the `.dbd`.
 fn apply_dbd_initials(record: &mut Box<dyn Record>) -> CaResult<()> {
-    // The `.dbd` is the source, so the initials come from the GENERATED tables —
+    // The `.dbd` is the source, so the initials come from the GENERATED table —
     // `crate::server::record::dbd_generated`, which `tools/dbd-codegen` emits
-    // from the vendored `.dbd` files — and not from `record.field_list()`, which
-    // a record may still answer with a hand-written table (swait does, and its
-    // hand-written CALC entry has no `initial` precisely because a human wrote
-    // it). Asking the `.dbd` directly is what makes the default impossible to
-    // get wrong by hand.
+    // from the vendored `.dbd` files. Asking the `.dbd` directly is what makes
+    // the default impossible to get wrong by hand.
+    //
+    // This is BASE's generated table, so it seeds base's record types only. The
+    // downstream record types (`motor`, `table`, `scaler`, `epid`, `throttle`,
+    // `timestamp`) now carry a generated table too — in their own crate, which
+    // base cannot name — and their `.dbd` `initial()` values are therefore
+    // parsed but never applied: those records keep the defaults their `Default`
+    // impl sets. Seeding them is not a table lookup but a semantic change (C
+    // applies the `.dbd` initial BEFORE `init_record`, and each record's
+    // `init_record` then overwrites some of them — `motor`'s VERS is stamped
+    // 7.4 over an `initial("1")`), so it is left to a change that can validate
+    // each record against its C `init_record` rather than folded in here.
     let Some(fields) = crate::server::record::dbd_generated::record_fields(record.record_type())
     else {
-        return Ok(()); // a record type no vendored `.dbd` declares
+        return Ok(()); // a record type base's vendored `.dbd` set does not declare
     };
     let initials: Vec<(&'static str, &'static str)> = fields
         .iter()

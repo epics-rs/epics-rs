@@ -68,7 +68,7 @@ impl Record for TestAsyncRecord {
         }
     }
 
-    fn hand_field_list(&self) -> &'static [FieldDesc] {
+    fn declared_fields(&self) -> &'static [FieldDesc] {
         TEST_FIELDS
     }
 }
@@ -338,7 +338,7 @@ impl Record for HandleCaptureRecord {
             _ => Err(CaError::FieldNotFound(name.to_string())),
         }
     }
-    fn hand_field_list(&self) -> &'static [FieldDesc] {
+    fn declared_fields(&self) -> &'static [FieldDesc] {
         TEST_FIELDS
     }
     fn set_async_context(&mut self, _name: String, db: AsyncDbHandle) {
@@ -389,7 +389,7 @@ impl Record for NotifySourceRecord {
     fn put_field(&mut self, _name: &str, _value: EpicsValue) -> CaResult<()> {
         Ok(())
     }
-    fn hand_field_list(&self) -> &'static [FieldDesc] {
+    fn declared_fields(&self) -> &'static [FieldDesc] {
         NOTIFY_SRC_FIELDS
     }
 }
@@ -422,7 +422,7 @@ impl Record for AbortSourceRecord {
     fn put_field(&mut self, _name: &str, _value: EpicsValue) -> CaResult<()> {
         Ok(())
     }
-    fn hand_field_list(&self) -> &'static [FieldDesc] {
+    fn declared_fields(&self) -> &'static [FieldDesc] {
         TEST_FIELDS
     }
 }
@@ -577,7 +577,7 @@ impl Record for PendingNotifyWriteSource {
     fn put_field(&mut self, _name: &str, _value: EpicsValue) -> CaResult<()> {
         Ok(())
     }
-    fn hand_field_list(&self) -> &'static [FieldDesc] {
+    fn declared_fields(&self) -> &'static [FieldDesc] {
         NOTIFY_SRC_FIELDS
     }
 }

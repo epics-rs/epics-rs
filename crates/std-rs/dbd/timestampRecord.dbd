@@ -1,0 +1,38 @@
+menu(timestampTST) {
+	choice(timestampTST_YY_MM_DD_HH_MM_SS,"YY/MM/DD HH:MM:SS")
+	choice(timestampTST_MM_DD_YY_HH_MM_SS,"MM/DD/YY HH:MM:SS")
+	choice(timestampTST_MM_DD_HH_MM_SS_YY,"Mon DD HH:MM:SS YY")
+	choice(timestampTST_MM_DD_HH_MM_SS,"Mon DD HH:MM:SS")
+	choice(timestampTST_HH_MM_SS,"HH:MM:SS")
+	choice(timestampTST_HH_MM,"HH:MM")
+	choice(timestampTST_DD_MM_YY_HH_MM_SS,"DD/MM/YY HH:MM:SS")
+	choice(timestampTST_DD_MM_HH_MM_SS_YY,"DD Mon HH:MM:SS YY")
+        choice(timestampTST_VMS,"DD-Mon-YYYY HH:MM:SS")
+        choice(timestampTST_MM_DD_YYYY,"Mon DD, YYYY HH:MM:SS.ns")
+        choice(timestampTST_MM_DD_YY,"MM/DD/YY HH:MM:SS.ns")
+}
+recordtype(timestamp) {
+	include "dbCommon.dbd" 
+	field(VAL,DBF_STRING) {
+		prompt("Current Value")
+		asl(ASL0)
+		pp(TRUE)
+		size(40)
+	}
+	field(OVAL,DBF_STRING) {
+		prompt("Previous Value")
+		special(SPC_NOMOD)
+		interest(3)
+		size(40)
+	}
+	field(RVAL,DBF_ULONG) {
+		prompt("Current Raw Value")
+		pp(TRUE)
+	}
+	field(TST,DBF_MENU) {
+		prompt("Time Stamp Type")
+		promptgroup(GUI_INPUTS)
+		interest(2)
+		menu(timestampTST)
+	}
+}

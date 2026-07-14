@@ -1282,16 +1282,32 @@ fn test_tweak_offset_only_escapes_loadpos_block_in_set_mode() {
 #[test]
 fn test_field_list_coverage() {
     let rec = MotorRecord::new();
-    let fields = rec.field_list();
-    // All fields in the list should be gettable
-    for fd in fields {
-        assert!(
-            rec.get_field(fd.name).is_some(),
-            "field {} not gettable",
-            fd.name
-        );
-    }
+    let ungettable: Vec<&str> = rec
+        .field_list()
+        .iter()
+        .filter(|fd| rec.get_field(fd.name).is_none())
+        .map(|fd| fd.name)
+        .collect();
+    assert_eq!(ungettable, UNIMPLEMENTED);
 }
+
+/// The fields `motorRecord.dbd` declares that this port does not implement.
+///
+/// They were invisible while the declaration was a hand-written table: the hand
+/// table simply omitted them, so "declared" and "implemented" were the same set
+/// by construction and the gap could not be seen. The declaration is the `.dbd`
+/// now, so the gap is a list — and it is a RATCHET: a new unimplemented field
+/// has to be added here, and implementing one has to remove it.
+///
+/// What C does with each, so the list is a work item and not a shrug:
+/// `CARD` (card number, `motorRecord.cc:596`), `HSV`/`LSV` (HIGH/LOW alarm
+/// severities, `alarm_sub:3411`), `LSPG` (limit-switch stop/pause/go,
+/// `motorRecord.cc:2622`), `PP` ("post process" flag, `:1590`), `INIT`
+/// (startup command string, `:604`), `PREM` (pre-move command, `:2213`) and
+/// `LOCK` (lock the record against moves, `:2050`). A client asking a C IOC for
+/// any of them gets a value; asking this port gets a field-not-found — which is
+/// what it got before too, just without anything saying so.
+const UNIMPLEMENTED: &[&str] = &["CARD", "HSV", "LSV", "LSPG", "PP", "INIT", "PREM", "LOCK"];
 
 #[test]
 fn test_dly_delays_finalization() {

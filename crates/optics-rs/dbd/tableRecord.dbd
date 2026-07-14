@@ -1,0 +1,925 @@
+menu(tableSET) {
+	choice(tableSET_Use,"Use")
+	choice(tableSET_Set,"Set")
+}
+menu(tableGEOM) {
+	choice(tableGEOM_SRI,"SRI")
+	choice(tableGEOM_GEOCARS,"GEOCARS")
+	choice(tableGEOM_NEWPORT,"NEWPORT")
+	choice(tableGEOM_PNC,"PNC")
+}
+menu(tableAUNIT) {
+	choice(tableAUNIT_DEGREES,"degrees")
+	choice(tableAUNIT_MICRORADIANS,"ur")
+}
+recordtype(table) {
+	include "dbCommon.dbd" 
+	field(VERS,DBF_FLOAT) {
+		prompt("Code Version")
+		special(SPC_NOMOD)
+		initial("1")
+	}
+	field(VAL,DBF_DOUBLE) {
+		prompt("Result")
+	}
+	field(LX,DBF_DOUBLE) {
+		prompt("wheelbase x")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		pp(TRUE)
+	}
+	field(LZ,DBF_DOUBLE) {
+		prompt("wheelbase z")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		pp(TRUE)
+	}
+	field(SX,DBF_DOUBLE) {
+		prompt("x of fixed point")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		pp(TRUE)
+	}
+	field(SY,DBF_DOUBLE) {
+		prompt("y of fixed point")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		pp(TRUE)
+	}
+	field(SZ,DBF_DOUBLE) {
+		prompt("z of fixed point")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		pp(TRUE)
+	}
+	field(RX,DBF_DOUBLE) {
+		prompt("x of ref point")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		pp(TRUE)
+	}
+	field(RY,DBF_DOUBLE) {
+		prompt("y of ref point")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		pp(TRUE)
+	}
+	field(RZ,DBF_DOUBLE) {
+		prompt("z of ref point")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		pp(TRUE)
+	}
+	field(YANG,DBF_DOUBLE) {
+		prompt("Orientation angle")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		pp(TRUE)
+	}
+	field(AX,DBF_DOUBLE) {
+		prompt("x angle")
+		special(SPC_MOD)
+		pp(TRUE)
+	}
+	field(AY,DBF_DOUBLE) {
+		prompt("y angle")
+		special(SPC_MOD)
+		pp(TRUE)
+	}
+	field(AZ,DBF_DOUBLE) {
+		prompt("z angle")
+		special(SPC_MOD)
+		pp(TRUE)
+	}
+	field(X,DBF_DOUBLE) {
+		prompt("x translation")
+		special(SPC_MOD)
+		pp(TRUE)
+	}
+	field(Y,DBF_DOUBLE) {
+		prompt("y translation")
+		special(SPC_MOD)
+		pp(TRUE)
+	}
+	field(Z,DBF_DOUBLE) {
+		prompt("z translation")
+		special(SPC_MOD)
+		pp(TRUE)
+	}
+	field(AX0,DBF_DOUBLE) {
+		prompt("x-angle offset")
+	}
+	field(AY0,DBF_DOUBLE) {
+		prompt("y-angle offset")
+	}
+	field(AZ0,DBF_DOUBLE) {
+		prompt("z-angle offset")
+	}
+	field(X0,DBF_DOUBLE) {
+		prompt("x offset")
+	}
+	field(Y0,DBF_DOUBLE) {
+		prompt("y offset")
+	}
+	field(Z0,DBF_DOUBLE) {
+		prompt("z offset")
+	}
+	field(AXL,DBF_DOUBLE) {
+		prompt("x angle true value")
+		special(SPC_NOMOD)
+	}
+	field(AYL,DBF_DOUBLE) {
+		prompt("y angle true value")
+		special(SPC_NOMOD)
+	}
+	field(AZL,DBF_DOUBLE) {
+		prompt("z angle true value")
+		special(SPC_NOMOD)
+	}
+	field(XL,DBF_DOUBLE) {
+		prompt("x true value")
+		special(SPC_NOMOD)
+	}
+	field(YL,DBF_DOUBLE) {
+		prompt("y true value")
+		special(SPC_NOMOD)
+	}
+	field(ZL,DBF_DOUBLE) {
+		prompt("z true value")
+		special(SPC_NOMOD)
+	}
+	field(AXRB,DBF_DOUBLE) {
+		prompt("x angle readback")
+		special(SPC_NOMOD)
+	}
+	field(AYRB,DBF_DOUBLE) {
+		prompt("y angle readback")
+		special(SPC_NOMOD)
+	}
+	field(AZRB,DBF_DOUBLE) {
+		prompt("z angle readback")
+		special(SPC_NOMOD)
+	}
+	field(XRB,DBF_DOUBLE) {
+		prompt("x readback value")
+		special(SPC_NOMOD)
+	}
+	field(YRB,DBF_DOUBLE) {
+		prompt("y readback value")
+		special(SPC_NOMOD)
+	}
+	field(ZRB,DBF_DOUBLE) {
+		prompt("z readback value")
+		special(SPC_NOMOD)
+	}
+	field(EAX,DBF_DOUBLE) {
+		prompt("encoder x angle")
+		special(SPC_NOMOD)
+	}
+	field(EAY,DBF_DOUBLE) {
+		prompt("encoder y angle")
+		special(SPC_NOMOD)
+	}
+	field(EAZ,DBF_DOUBLE) {
+		prompt("encoder z angle")
+		special(SPC_NOMOD)
+	}
+	field(EX,DBF_DOUBLE) {
+		prompt("encoder x")
+		special(SPC_NOMOD)
+	}
+	field(EY,DBF_DOUBLE) {
+		prompt("encoder y")
+		special(SPC_NOMOD)
+	}
+	field(EZ,DBF_DOUBLE) {
+		prompt("encoder z")
+		special(SPC_NOMOD)
+	}
+	field(HLAX,DBF_DOUBLE) {
+		prompt("x angle hi limit")
+		special(SPC_NOMOD)
+	}
+	field(HLAY,DBF_DOUBLE) {
+		prompt("y angle hi limit")
+		special(SPC_NOMOD)
+	}
+	field(HLAZ,DBF_DOUBLE) {
+		prompt("z angle hi limit")
+		special(SPC_NOMOD)
+	}
+	field(HLX,DBF_DOUBLE) {
+		prompt("x hi limit")
+		special(SPC_NOMOD)
+	}
+	field(HLY,DBF_DOUBLE) {
+		prompt("y hi limit")
+		special(SPC_NOMOD)
+	}
+	field(HLZ,DBF_DOUBLE) {
+		prompt("z hi limit")
+		special(SPC_NOMOD)
+	}
+	field(LLAX,DBF_DOUBLE) {
+		prompt("x angle lo limit")
+		special(SPC_NOMOD)
+	}
+	field(LLAY,DBF_DOUBLE) {
+		prompt("y angle lo limit")
+		special(SPC_NOMOD)
+	}
+	field(LLAZ,DBF_DOUBLE) {
+		prompt("z angle lo limit")
+		special(SPC_NOMOD)
+	}
+	field(LLX,DBF_DOUBLE) {
+		prompt("x lo limit")
+		special(SPC_NOMOD)
+	}
+	field(LLY,DBF_DOUBLE) {
+		prompt("y lo limit")
+		special(SPC_NOMOD)
+	}
+	field(LLZ,DBF_DOUBLE) {
+		prompt("z lo limit")
+		special(SPC_NOMOD)
+	}
+	field(UHAX,DBF_DOUBLE) {
+		prompt("x angle user hi limit (absolute)")
+		promptgroup(GUI_COMMON)
+		pp(TRUE)
+		special(SPC_MOD)
+	}
+	field(UHAY,DBF_DOUBLE) {
+		prompt("y angle user hi limit (absolute)")
+		promptgroup(GUI_COMMON)
+		pp(TRUE)
+		special(SPC_MOD)
+	}
+	field(UHAZ,DBF_DOUBLE) {
+		prompt("z angle user hi limit (absolute)")
+		promptgroup(GUI_COMMON)
+		pp(TRUE)
+		special(SPC_MOD)
+	}
+	field(UHX,DBF_DOUBLE) {
+		prompt("x user hi limit (absolute)")
+		promptgroup(GUI_COMMON)
+		pp(TRUE)
+		special(SPC_MOD)
+	}
+	field(UHY,DBF_DOUBLE) {
+		prompt("y user hi limit (absolute)")
+		promptgroup(GUI_COMMON)
+		pp(TRUE)
+		special(SPC_MOD)
+	}
+	field(UHZ,DBF_DOUBLE) {
+		prompt("z user hi limit (absolute)")
+		promptgroup(GUI_COMMON)
+		pp(TRUE)
+		special(SPC_MOD)
+	}
+	field(ULAX,DBF_DOUBLE) {
+		prompt("x angle user lo limit (absolute)")
+		promptgroup(GUI_COMMON)
+		pp(TRUE)
+		special(SPC_MOD)
+	}
+	field(ULAY,DBF_DOUBLE) {
+		prompt("y angle user lo limit (absolute)")
+		promptgroup(GUI_COMMON)
+		pp(TRUE)
+		special(SPC_MOD)
+	}
+	field(ULAZ,DBF_DOUBLE) {
+		prompt("z angle user lo limit (absolute)")
+		promptgroup(GUI_COMMON)
+		pp(TRUE)
+		special(SPC_MOD)
+	}
+	field(ULX,DBF_DOUBLE) {
+		prompt("x user lo limit (absolute)")
+		promptgroup(GUI_COMMON)
+		pp(TRUE)
+		special(SPC_MOD)
+	}
+	field(ULY,DBF_DOUBLE) {
+		prompt("y user lo limit (absolute)")
+		promptgroup(GUI_COMMON)
+		pp(TRUE)
+		special(SPC_MOD)
+	}
+	field(ULZ,DBF_DOUBLE) {
+		prompt("z user lo limit (absolute)")
+		promptgroup(GUI_COMMON)
+		pp(TRUE)
+		special(SPC_MOD)
+	}
+	field(UHAXR,DBF_DOUBLE) {
+		prompt("x angle user hi limit (relative)")
+		promptgroup(GUI_COMMON)
+		pp(TRUE)
+		special(SPC_MOD)
+	}
+	field(UHAYR,DBF_DOUBLE) {
+		prompt("y angle user hi limit (relative)")
+		promptgroup(GUI_COMMON)
+		pp(TRUE)
+		special(SPC_MOD)
+	}
+	field(UHAZR,DBF_DOUBLE) {
+		prompt("z angle user hi limit (relative)")
+		promptgroup(GUI_COMMON)
+		pp(TRUE)
+		special(SPC_MOD)
+	}
+	field(UHXR,DBF_DOUBLE) {
+		prompt("x user hi limit (relative)")
+		promptgroup(GUI_COMMON)
+		pp(TRUE)
+		special(SPC_MOD)
+	}
+	field(UHYR,DBF_DOUBLE) {
+		prompt("y user hi limit (relative)")
+		promptgroup(GUI_COMMON)
+		pp(TRUE)
+		special(SPC_MOD)
+	}
+	field(UHZR,DBF_DOUBLE) {
+		prompt("z user hi limit (relative)")
+		promptgroup(GUI_COMMON)
+		pp(TRUE)
+		special(SPC_MOD)
+	}
+	field(ULAXR,DBF_DOUBLE) {
+		prompt("x angle user lo limit (relative)")
+		promptgroup(GUI_COMMON)
+		pp(TRUE)
+		special(SPC_MOD)
+	}
+	field(ULAYR,DBF_DOUBLE) {
+		prompt("y angle user lo limit (relative)")
+		promptgroup(GUI_COMMON)
+		pp(TRUE)
+		special(SPC_MOD)
+	}
+	field(ULAZR,DBF_DOUBLE) {
+		prompt("z angle user lo limit (relative)")
+		promptgroup(GUI_COMMON)
+		pp(TRUE)
+		special(SPC_MOD)
+	}
+	field(ULXR,DBF_DOUBLE) {
+		prompt("x user lo limit (relative)")
+		promptgroup(GUI_COMMON)
+		pp(TRUE)
+		special(SPC_MOD)
+	}
+	field(ULYR,DBF_DOUBLE) {
+		prompt("y user lo limit (relative)")
+		promptgroup(GUI_COMMON)
+		pp(TRUE)
+		special(SPC_MOD)
+	}
+	field(ULZR,DBF_DOUBLE) {
+		prompt("z user lo limit (relative)")
+		promptgroup(GUI_COMMON)
+		pp(TRUE)
+		special(SPC_MOD)
+	}
+	field(M0XL,DBF_OUTLINK) {
+		prompt("motor 0X outlink")
+		promptgroup(GUI_COMMON)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(M0YL,DBF_OUTLINK) {
+		prompt("motor 0Y outlink")
+		promptgroup(GUI_COMMON)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(M1YL,DBF_OUTLINK) {
+		prompt("motor 1Y outlink")
+		promptgroup(GUI_COMMON)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(M2XL,DBF_OUTLINK) {
+		prompt("motor 2X outlink")
+		promptgroup(GUI_COMMON)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(M2YL,DBF_OUTLINK) {
+		prompt("motor 2Y outlink")
+		promptgroup(GUI_COMMON)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(M2ZL,DBF_OUTLINK) {
+		prompt("motor 2Z outlink")
+		promptgroup(GUI_COMMON)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(M0X,DBF_DOUBLE) {
+		prompt("motor 0X val")
+		special(SPC_NOMOD)
+	}
+	field(M0Y,DBF_DOUBLE) {
+		prompt("motor 0Y val")
+		special(SPC_NOMOD)
+	}
+	field(M1Y,DBF_DOUBLE) {
+		prompt("motor 1Y val")
+		special(SPC_NOMOD)
+	}
+	field(M2X,DBF_DOUBLE) {
+		prompt("motor 2X val")
+		special(SPC_NOMOD)
+	}
+	field(M2Y,DBF_DOUBLE) {
+		prompt("motor 2Y val")
+		special(SPC_NOMOD)
+	}
+	field(M2Z,DBF_DOUBLE) {
+		prompt("motor 2Z val")
+		special(SPC_NOMOD)
+	}
+	field(R0XI,DBF_INLINK) {
+		prompt("motor 0X RBV link")
+		promptgroup(GUI_COMMON)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(R0YI,DBF_INLINK) {
+		prompt("motor 0Y RBV link")
+		promptgroup(GUI_COMMON)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(R1YI,DBF_INLINK) {
+		prompt("motor 1Y RBV link")
+		promptgroup(GUI_COMMON)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(R2XI,DBF_INLINK) {
+		prompt("motor 2X RBV link")
+		promptgroup(GUI_COMMON)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(R2YI,DBF_INLINK) {
+		prompt("motor 2Y RBV link")
+		promptgroup(GUI_COMMON)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(R2ZI,DBF_INLINK) {
+		prompt("motor 2Z RBV link")
+		promptgroup(GUI_COMMON)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(R0X,DBF_DOUBLE) {
+		prompt("motor 0X readback")
+		special(SPC_NOMOD)
+	}
+	field(R0Y,DBF_DOUBLE) {
+		prompt("motor 0Y readback")
+		special(SPC_NOMOD)
+	}
+	field(R1Y,DBF_DOUBLE) {
+		prompt("motor 1Y readback")
+		special(SPC_NOMOD)
+	}
+	field(R2X,DBF_DOUBLE) {
+		prompt("motor 2X readback")
+		special(SPC_NOMOD)
+	}
+	field(R2Y,DBF_DOUBLE) {
+		prompt("motor 2Y readback")
+		special(SPC_NOMOD)
+	}
+	field(R2Z,DBF_DOUBLE) {
+		prompt("motor 2Z readback")
+		special(SPC_NOMOD)
+	}
+	field(E0XI,DBF_INLINK) {
+		prompt("encoder 0X inlink")
+		promptgroup(GUI_COMMON)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(E0YI,DBF_INLINK) {
+		prompt("encoder 0Y inlink")
+		promptgroup(GUI_COMMON)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(E1YI,DBF_INLINK) {
+		prompt("encoder 1Y inlink")
+		promptgroup(GUI_COMMON)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(E2XI,DBF_INLINK) {
+		prompt("encoder 2X inlink")
+		promptgroup(GUI_COMMON)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(E2YI,DBF_INLINK) {
+		prompt("encoder 2Y inlink")
+		promptgroup(GUI_COMMON)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(E2ZI,DBF_INLINK) {
+		prompt("encoder 2Z inlink")
+		promptgroup(GUI_COMMON)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(E0X,DBF_DOUBLE) {
+		prompt("encoder 0X val")
+		special(SPC_NOMOD)
+	}
+	field(E0Y,DBF_DOUBLE) {
+		prompt("encoder 0Y val")
+		special(SPC_NOMOD)
+	}
+	field(E1Y,DBF_DOUBLE) {
+		prompt("encoder 1Y val")
+		special(SPC_NOMOD)
+	}
+	field(E2X,DBF_DOUBLE) {
+		prompt("encoder 2X val")
+		special(SPC_NOMOD)
+	}
+	field(E2Y,DBF_DOUBLE) {
+		prompt("encoder 2Y val")
+		special(SPC_NOMOD)
+	}
+	field(E2Z,DBF_DOUBLE) {
+		prompt("encoder 2Z val")
+		special(SPC_NOMOD)
+	}
+	field(V0XL,DBF_OUTLINK) {
+		prompt("speed 0X outlink")
+		promptgroup(GUI_COMMON)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(V0YL,DBF_OUTLINK) {
+		prompt("speed 0Y outlink")
+		promptgroup(GUI_COMMON)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(V1YL,DBF_OUTLINK) {
+		prompt("speed 1Y outlink")
+		promptgroup(GUI_COMMON)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(V2XL,DBF_OUTLINK) {
+		prompt("speed 2X outlink")
+		promptgroup(GUI_COMMON)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(V2YL,DBF_OUTLINK) {
+		prompt("speed 2Y outlink")
+		promptgroup(GUI_COMMON)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(V2ZL,DBF_OUTLINK) {
+		prompt("speed 2Z outlink")
+		promptgroup(GUI_COMMON)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(V0X,DBF_DOUBLE) {
+		prompt("speed 0X val")
+		special(SPC_NOMOD)
+	}
+	field(V0Y,DBF_DOUBLE) {
+		prompt("speed 0Y val")
+		special(SPC_NOMOD)
+	}
+	field(V1Y,DBF_DOUBLE) {
+		prompt("speed 1Y val")
+		special(SPC_NOMOD)
+	}
+	field(V2X,DBF_DOUBLE) {
+		prompt("speed 2X val")
+		special(SPC_NOMOD)
+	}
+	field(V2Y,DBF_DOUBLE) {
+		prompt("speed 2Y val")
+		special(SPC_NOMOD)
+	}
+	field(V2Z,DBF_DOUBLE) {
+		prompt("speed 2Z val")
+		special(SPC_NOMOD)
+	}
+	field(V0XI,DBF_INLINK) {
+		prompt("speed 0X inlink")
+		promptgroup(GUI_COMMON)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(V0YI,DBF_INLINK) {
+		prompt("speed 0Y inlink")
+		promptgroup(GUI_COMMON)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(V1YI,DBF_INLINK) {
+		prompt("speed 1Y inlink")
+		promptgroup(GUI_COMMON)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(V2XI,DBF_INLINK) {
+		prompt("speed 2X inlink")
+		promptgroup(GUI_COMMON)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(V2YI,DBF_INLINK) {
+		prompt("speed 2Y inlink")
+		promptgroup(GUI_COMMON)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(V2ZI,DBF_INLINK) {
+		prompt("speed 2Z inlink")
+		promptgroup(GUI_COMMON)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(H0XL,DBF_INLINK) {
+		prompt("motor 0X HLM link")
+		promptgroup(GUI_COMMON)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(H0YL,DBF_INLINK) {
+		prompt("motor 0Y HLM link")
+		promptgroup(GUI_COMMON)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(H1YL,DBF_INLINK) {
+		prompt("motor 1Y HLM link")
+		promptgroup(GUI_COMMON)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(H2XL,DBF_INLINK) {
+		prompt("motor 2X HLM link")
+		promptgroup(GUI_COMMON)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(H2YL,DBF_INLINK) {
+		prompt("motor 2Y HLM link")
+		promptgroup(GUI_COMMON)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(H2ZL,DBF_INLINK) {
+		prompt("motor 2Z HLM link")
+		promptgroup(GUI_COMMON)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(H0X,DBF_DOUBLE) {
+		prompt("motor 0X hi limit")
+		special(SPC_NOMOD)
+	}
+	field(H0Y,DBF_DOUBLE) {
+		prompt("motor 0Y hi limit")
+		special(SPC_NOMOD)
+	}
+	field(H1Y,DBF_DOUBLE) {
+		prompt("motor 1Y hi limit")
+		special(SPC_NOMOD)
+	}
+	field(H2X,DBF_DOUBLE) {
+		prompt("motor 2X hi limit")
+		special(SPC_NOMOD)
+	}
+	field(H2Y,DBF_DOUBLE) {
+		prompt("motor 2Y hi limit")
+		special(SPC_NOMOD)
+	}
+	field(H2Z,DBF_DOUBLE) {
+		prompt("motor 2Z hi limit")
+		special(SPC_NOMOD)
+	}
+	field(L0XL,DBF_INLINK) {
+		prompt("motor 0X LLM link")
+		promptgroup(GUI_COMMON)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(L0YL,DBF_INLINK) {
+		prompt("motor 0Y LLM link")
+		promptgroup(GUI_COMMON)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(L1YL,DBF_INLINK) {
+		prompt("motor 1Y LLM link")
+		promptgroup(GUI_COMMON)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(L2XL,DBF_INLINK) {
+		prompt("motor 2X LLM link")
+		promptgroup(GUI_COMMON)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(L2YL,DBF_INLINK) {
+		prompt("motor 2Y LLM link")
+		promptgroup(GUI_COMMON)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(L2ZL,DBF_INLINK) {
+		prompt("motor 2Z LLM link")
+		promptgroup(GUI_COMMON)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(L0X,DBF_DOUBLE) {
+		prompt("motor 0X lo limit")
+		special(SPC_NOMOD)
+	}
+	field(L0Y,DBF_DOUBLE) {
+		prompt("motor 0Y lo limit")
+		special(SPC_NOMOD)
+	}
+	field(L1Y,DBF_DOUBLE) {
+		prompt("motor 1Y lo limit")
+		special(SPC_NOMOD)
+	}
+	field(L2X,DBF_DOUBLE) {
+		prompt("motor 2X lo limit")
+		special(SPC_NOMOD)
+	}
+	field(L2Y,DBF_DOUBLE) {
+		prompt("motor 2Y lo limit")
+		special(SPC_NOMOD)
+	}
+	field(L2Z,DBF_DOUBLE) {
+		prompt("motor 2Z lo limit")
+		special(SPC_NOMOD)
+	}
+	field(INIT,DBF_SHORT) {
+		prompt("init table")
+		special(SPC_MOD)
+		pp(TRUE)
+	}
+	field(ZERO,DBF_SHORT) {
+		prompt("zero table")
+		special(SPC_MOD)
+		pp(TRUE)
+	}
+	field(SYNC,DBF_SHORT) {
+		prompt("sync with motors")
+		special(SPC_MOD)
+		pp(TRUE)
+	}
+	field(READ,DBF_SHORT) {
+		prompt("readback motors")
+		special(SPC_MOD)
+		pp(TRUE)
+	}
+	field(SET,DBF_MENU) {
+		prompt("set table")
+		interest(1)
+		menu(tableSET)
+	}
+	field(SSET,DBF_SHORT) {
+		prompt("Set SET Mode")
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+	}
+	field(SUSE,DBF_SHORT) {
+		prompt("Set USE Mode")
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+	}
+	field(LVIO,DBF_SHORT) {
+		prompt("limit violation")
+		special(SPC_NOMOD)
+	}
+	field(PP0,DBF_NOACCESS) {
+		prompt("pivot pt 0")
+		special(SPC_DBADDR)
+		interest(1)
+		size(4)
+		extra("double *	pp0")
+	}
+	field(PP1,DBF_NOACCESS) {
+		prompt("pivot pt 1")
+		special(SPC_DBADDR)
+		interest(1)
+		size(4)
+		extra("double *	pp1")
+	}
+	field(PP2,DBF_NOACCESS) {
+		prompt("pivot pt 2")
+		special(SPC_DBADDR)
+		interest(1)
+		size(4)
+		extra("double *	pp2")
+	}
+	field(PPO0,DBF_NOACCESS) {
+		prompt("pivot pt 0 orig")
+		special(SPC_DBADDR)
+		interest(1)
+		size(4)
+		extra("double *	ppo0")
+	}
+	field(PPO1,DBF_NOACCESS) {
+		prompt("pivot pt 1 orig")
+		special(SPC_DBADDR)
+		interest(1)
+		size(4)
+		extra("double *	ppo1")
+	}
+	field(PPO2,DBF_NOACCESS) {
+		prompt("pivot pt 2 orig")
+		special(SPC_DBADDR)
+		interest(1)
+		size(4)
+		extra("double *	ppo2")
+	}
+	field(A,DBF_NOACCESS) {
+		prompt("x to m matrix")
+		special(SPC_DBADDR)
+		interest(1)
+		size(4)
+		extra("double **	a")
+	}
+	field(B,DBF_NOACCESS) {
+		prompt("m to x matrix")
+		special(SPC_DBADDR)
+		interest(1)
+		size(4)
+		extra("double **	b")
+	}
+	field(LEGU,DBF_STRING) {
+		prompt("Linear Units Name")
+		promptgroup(GUI_COMMON)
+		interest(1)
+		size(16)
+	}
+	field(AEGU,DBF_STRING) {
+		prompt("Angular Units Name")
+		promptgroup(GUI_COMMON)
+		interest(1)
+		size(16)
+	}
+	field(PREC,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_COMMON)
+		interest(1)
+	}
+	field(MMAP,DBF_ULONG) {
+		prompt("Monitor Mask")
+		special(SPC_NOMOD)
+		interest(3)
+	}
+	field(GEOM,DBF_MENU) {
+		prompt("Geometry")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		pp(TRUE)
+		menu(tableGEOM)
+	}
+	field(TORAD,DBF_DOUBLE) {
+        special(SPC_NOMOD)
+        interest(3)
+        prompt("conversion to radians")
+	}
+	field(AUNIT,DBF_MENU) {
+		prompt("Angle units")
+		promptgroup(GUI_COMMON)
+		special(SPC_MOD)
+		pp(TRUE)
+		menu(tableAUNIT)
+	}
+}

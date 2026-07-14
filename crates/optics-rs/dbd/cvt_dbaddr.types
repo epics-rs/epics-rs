@@ -1,0 +1,25 @@
+# What `tableRecord.c::cvt_dbaddr` makes of each `special(SPC_DBADDR)` field.
+#
+# A `special(SPC_DBADDR)` field is declared `DBF_NOACCESS` in the `.dbd` because
+# its C struct member is a bare pointer; the record's `cvt_dbaddr` supplies the
+# type a client actually sees. The `.dbd` cannot carry that, so it is stated
+# here, citing the C, and the generator refuses to emit a `SPC_DBADDR` field
+# that has no row (`emit::field_dbf`).
+#
+# record.FIELD  DBF_TYPE    SPC_xxx      selector|-   cite
+#
+# tableRecord.c:745-747 — every one of the eight is typed unconditionally:
+#     paddr->field_type = DBF_DOUBLE; paddr->dbr_field_type = DBR_DOUBLE;
+# There is no selector field: unlike `waveform.FTVL` or `aSub.FTA`, the type
+# does not depend on the record's state, so the declared type IS the served one.
+# `A`/`B` are the 3x3 geometry matrices (no_elements 9, tableRecord.c:735-740);
+# `PP0..PP2`/`PPO0..PPO2` are the 3-element pivot/offset vectors
+# (no_elements 3, tableRecord.c:741-743).
+table.A     DBF_DOUBLE  SPC_DBADDR  -   tableRecord.c:735-736,745
+table.B     DBF_DOUBLE  SPC_DBADDR  -   tableRecord.c:738-739,745
+table.PP0   DBF_DOUBLE  SPC_DBADDR  -   tableRecord.c:741-743,745
+table.PP1   DBF_DOUBLE  SPC_DBADDR  -   tableRecord.c:741-743,745
+table.PP2   DBF_DOUBLE  SPC_DBADDR  -   tableRecord.c:741-743,745
+table.PPO0  DBF_DOUBLE  SPC_DBADDR  -   tableRecord.c:741-743,745
+table.PPO1  DBF_DOUBLE  SPC_DBADDR  -   tableRecord.c:741-743,745
+table.PPO2  DBF_DOUBLE  SPC_DBADDR  -   tableRecord.c:741-743,745

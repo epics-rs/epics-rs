@@ -45,7 +45,7 @@ impl Record for OwnsOutRecord {
         "ownsOut"
     }
 
-    fn hand_field_list(&self) -> &'static [FieldDesc] {
+    fn declared_fields(&self) -> &'static [FieldDesc] {
         OWNS_OUT_FIELDS
     }
 

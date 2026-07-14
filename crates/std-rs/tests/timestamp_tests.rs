@@ -162,9 +162,12 @@ fn test_get_field() {
         Some(EpicsValue::Short(v)) => assert_eq!(v, 3),
         other => panic!("expected Short(3), got {:?}", other),
     }
+    // `field(RVAL,DBF_ULONG)` (`timestampRecord.dbd:28`): C's `secPastEpoch` is
+    // an `epicsUInt32`. This expected `Long` because the port's hand-written
+    // field table declared RVAL `DBF_LONG`.
     match rec.get_field("RVAL") {
-        Some(EpicsValue::Long(v)) => assert!(v > 0),
-        other => panic!("expected Long, got {:?}", other),
+        Some(EpicsValue::ULong(v)) => assert!(v > 0),
+        other => panic!("expected ULong, got {:?}", other),
     }
 }
 

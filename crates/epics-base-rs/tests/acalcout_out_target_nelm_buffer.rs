@@ -58,7 +58,7 @@ impl Record for ScalarProbe {
         }
         Ok(())
     }
-    fn hand_field_list(&self) -> &'static [FieldDesc] {
+    fn declared_fields(&self) -> &'static [FieldDesc] {
         &[]
     }
 }
@@ -87,7 +87,7 @@ impl Record for ArrayProbe {
         }
         Ok(())
     }
-    fn hand_field_list(&self) -> &'static [FieldDesc] {
+    fn declared_fields(&self) -> &'static [FieldDesc] {
         &[]
     }
 }

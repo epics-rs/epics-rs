@@ -7,13 +7,13 @@
 
 use std::any::Any;
 use std::f64::consts::PI;
-use std::sync::LazyLock;
 
+use super::dbd_generated;
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::record::{
     FieldDeclaration, FieldDesc, FieldMetadataOverride, ProcessAction, ProcessOutcome, Record,
 };
-use epics_base_rs::types::{DbFieldType, EpicsValue, PvString};
+use epics_base_rs::types::{EpicsValue, PvString};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -2189,220 +2189,8 @@ impl TableRecord {
 }
 
 // ===========================================================================
-// Field list (LazyLock + Box::leak)
-// ===========================================================================
-
-static ALL_FIELDS: LazyLock<Vec<FieldDesc>> = LazyLock::new(|| {
-    vec![
-        FieldDesc::new("VERS", DbFieldType::Float, true),
-        FieldDesc::new("VAL", DbFieldType::Double, false),
-        // Geometry parameters
-        FieldDesc::new("LX", DbFieldType::Double, false),
-        FieldDesc::new("LZ", DbFieldType::Double, false),
-        FieldDesc::new("SX", DbFieldType::Double, false),
-        FieldDesc::new("SY", DbFieldType::Double, false),
-        FieldDesc::new("SZ", DbFieldType::Double, false),
-        FieldDesc::new("RX", DbFieldType::Double, false),
-        FieldDesc::new("RY", DbFieldType::Double, false),
-        FieldDesc::new("RZ", DbFieldType::Double, false),
-        FieldDesc::new("YANG", DbFieldType::Double, false),
-        // User coordinates
-        FieldDesc::new("AX", DbFieldType::Double, false),
-        FieldDesc::new("AY", DbFieldType::Double, false),
-        FieldDesc::new("AZ", DbFieldType::Double, false),
-        FieldDesc::new("X", DbFieldType::Double, false),
-        FieldDesc::new("Y", DbFieldType::Double, false),
-        FieldDesc::new("Z", DbFieldType::Double, false),
-        // Offsets
-        FieldDesc::new("AX0", DbFieldType::Double, false),
-        FieldDesc::new("AY0", DbFieldType::Double, false),
-        FieldDesc::new("AZ0", DbFieldType::Double, false),
-        FieldDesc::new("X0", DbFieldType::Double, false),
-        FieldDesc::new("Y0", DbFieldType::Double, false),
-        FieldDesc::new("Z0", DbFieldType::Double, false),
-        // True values
-        FieldDesc::new("AXL", DbFieldType::Double, true),
-        FieldDesc::new("AYL", DbFieldType::Double, true),
-        FieldDesc::new("AZL", DbFieldType::Double, true),
-        FieldDesc::new("XL", DbFieldType::Double, true),
-        FieldDesc::new("YL", DbFieldType::Double, true),
-        FieldDesc::new("ZL", DbFieldType::Double, true),
-        // Readbacks
-        FieldDesc::new("AXRB", DbFieldType::Double, true),
-        FieldDesc::new("AYRB", DbFieldType::Double, true),
-        FieldDesc::new("AZRB", DbFieldType::Double, true),
-        FieldDesc::new("XRB", DbFieldType::Double, true),
-        FieldDesc::new("YRB", DbFieldType::Double, true),
-        FieldDesc::new("ZRB", DbFieldType::Double, true),
-        // Encoder user
-        FieldDesc::new("EAX", DbFieldType::Double, true),
-        FieldDesc::new("EAY", DbFieldType::Double, true),
-        FieldDesc::new("EAZ", DbFieldType::Double, true),
-        FieldDesc::new("EX", DbFieldType::Double, true),
-        FieldDesc::new("EY", DbFieldType::Double, true),
-        FieldDesc::new("EZ", DbFieldType::Double, true),
-        // Calculated user limits
-        FieldDesc::new("HLAX", DbFieldType::Double, true),
-        FieldDesc::new("HLAY", DbFieldType::Double, true),
-        FieldDesc::new("HLAZ", DbFieldType::Double, true),
-        FieldDesc::new("HLX", DbFieldType::Double, true),
-        FieldDesc::new("HLY", DbFieldType::Double, true),
-        FieldDesc::new("HLZ", DbFieldType::Double, true),
-        FieldDesc::new("LLAX", DbFieldType::Double, true),
-        FieldDesc::new("LLAY", DbFieldType::Double, true),
-        FieldDesc::new("LLAZ", DbFieldType::Double, true),
-        FieldDesc::new("LLX", DbFieldType::Double, true),
-        FieldDesc::new("LLY", DbFieldType::Double, true),
-        FieldDesc::new("LLZ", DbFieldType::Double, true),
-        // User limits (absolute)
-        FieldDesc::new("UHAX", DbFieldType::Double, false),
-        FieldDesc::new("UHAY", DbFieldType::Double, false),
-        FieldDesc::new("UHAZ", DbFieldType::Double, false),
-        FieldDesc::new("UHX", DbFieldType::Double, false),
-        FieldDesc::new("UHY", DbFieldType::Double, false),
-        FieldDesc::new("UHZ", DbFieldType::Double, false),
-        FieldDesc::new("ULAX", DbFieldType::Double, false),
-        FieldDesc::new("ULAY", DbFieldType::Double, false),
-        FieldDesc::new("ULAZ", DbFieldType::Double, false),
-        FieldDesc::new("ULX", DbFieldType::Double, false),
-        FieldDesc::new("ULY", DbFieldType::Double, false),
-        FieldDesc::new("ULZ", DbFieldType::Double, false),
-        // User limits (relative)
-        FieldDesc::new("UHAXR", DbFieldType::Double, false),
-        FieldDesc::new("UHAYR", DbFieldType::Double, false),
-        FieldDesc::new("UHAZR", DbFieldType::Double, false),
-        FieldDesc::new("UHXR", DbFieldType::Double, false),
-        FieldDesc::new("UHYR", DbFieldType::Double, false),
-        FieldDesc::new("UHZR", DbFieldType::Double, false),
-        FieldDesc::new("ULAXR", DbFieldType::Double, false),
-        FieldDesc::new("ULAYR", DbFieldType::Double, false),
-        FieldDesc::new("ULAZR", DbFieldType::Double, false),
-        FieldDesc::new("ULXR", DbFieldType::Double, false),
-        FieldDesc::new("ULYR", DbFieldType::Double, false),
-        FieldDesc::new("ULZR", DbFieldType::Double, false),
-        // Motor drive links
-        FieldDesc::new("M0XL", DbFieldType::String, false),
-        FieldDesc::new("M0YL", DbFieldType::String, false),
-        FieldDesc::new("M1YL", DbFieldType::String, false),
-        FieldDesc::new("M2XL", DbFieldType::String, false),
-        FieldDesc::new("M2YL", DbFieldType::String, false),
-        FieldDesc::new("M2ZL", DbFieldType::String, false),
-        // Motor drive values
-        FieldDesc::new("M0X", DbFieldType::Double, true),
-        FieldDesc::new("M0Y", DbFieldType::Double, true),
-        FieldDesc::new("M1Y", DbFieldType::Double, true),
-        FieldDesc::new("M2X", DbFieldType::Double, true),
-        FieldDesc::new("M2Y", DbFieldType::Double, true),
-        FieldDesc::new("M2Z", DbFieldType::Double, true),
-        // Motor readback links
-        FieldDesc::new("R0XI", DbFieldType::String, false),
-        FieldDesc::new("R0YI", DbFieldType::String, false),
-        FieldDesc::new("R1YI", DbFieldType::String, false),
-        FieldDesc::new("R2XI", DbFieldType::String, false),
-        FieldDesc::new("R2YI", DbFieldType::String, false),
-        FieldDesc::new("R2ZI", DbFieldType::String, false),
-        // Motor readback values
-        FieldDesc::new("R0X", DbFieldType::Double, true),
-        FieldDesc::new("R0Y", DbFieldType::Double, true),
-        FieldDesc::new("R1Y", DbFieldType::Double, true),
-        FieldDesc::new("R2X", DbFieldType::Double, true),
-        FieldDesc::new("R2Y", DbFieldType::Double, true),
-        FieldDesc::new("R2Z", DbFieldType::Double, true),
-        // Encoder links
-        FieldDesc::new("E0XI", DbFieldType::String, false),
-        FieldDesc::new("E0YI", DbFieldType::String, false),
-        FieldDesc::new("E1YI", DbFieldType::String, false),
-        FieldDesc::new("E2XI", DbFieldType::String, false),
-        FieldDesc::new("E2YI", DbFieldType::String, false),
-        FieldDesc::new("E2ZI", DbFieldType::String, false),
-        // Encoder motor values
-        FieldDesc::new("E0X", DbFieldType::Double, true),
-        FieldDesc::new("E0Y", DbFieldType::Double, true),
-        FieldDesc::new("E1Y", DbFieldType::Double, true),
-        FieldDesc::new("E2X", DbFieldType::Double, true),
-        FieldDesc::new("E2Y", DbFieldType::Double, true),
-        FieldDesc::new("E2Z", DbFieldType::Double, true),
-        // Speed output links
-        FieldDesc::new("V0XL", DbFieldType::String, false),
-        FieldDesc::new("V0YL", DbFieldType::String, false),
-        FieldDesc::new("V1YL", DbFieldType::String, false),
-        FieldDesc::new("V2XL", DbFieldType::String, false),
-        FieldDesc::new("V2YL", DbFieldType::String, false),
-        FieldDesc::new("V2ZL", DbFieldType::String, false),
-        // Speed values
-        FieldDesc::new("V0X", DbFieldType::Double, true),
-        FieldDesc::new("V0Y", DbFieldType::Double, true),
-        FieldDesc::new("V1Y", DbFieldType::Double, true),
-        FieldDesc::new("V2X", DbFieldType::Double, true),
-        FieldDesc::new("V2Y", DbFieldType::Double, true),
-        FieldDesc::new("V2Z", DbFieldType::Double, true),
-        // Speed input links
-        FieldDesc::new("V0XI", DbFieldType::String, false),
-        FieldDesc::new("V0YI", DbFieldType::String, false),
-        FieldDesc::new("V1YI", DbFieldType::String, false),
-        FieldDesc::new("V2XI", DbFieldType::String, false),
-        FieldDesc::new("V2YI", DbFieldType::String, false),
-        FieldDesc::new("V2ZI", DbFieldType::String, false),
-        // Motor hi limit links
-        FieldDesc::new("H0XL", DbFieldType::String, false),
-        FieldDesc::new("H0YL", DbFieldType::String, false),
-        FieldDesc::new("H1YL", DbFieldType::String, false),
-        FieldDesc::new("H2XL", DbFieldType::String, false),
-        FieldDesc::new("H2YL", DbFieldType::String, false),
-        FieldDesc::new("H2ZL", DbFieldType::String, false),
-        // Motor hi limit values
-        FieldDesc::new("H0X", DbFieldType::Double, true),
-        FieldDesc::new("H0Y", DbFieldType::Double, true),
-        FieldDesc::new("H1Y", DbFieldType::Double, true),
-        FieldDesc::new("H2X", DbFieldType::Double, true),
-        FieldDesc::new("H2Y", DbFieldType::Double, true),
-        FieldDesc::new("H2Z", DbFieldType::Double, true),
-        // Motor lo limit links
-        FieldDesc::new("L0XL", DbFieldType::String, false),
-        FieldDesc::new("L0YL", DbFieldType::String, false),
-        FieldDesc::new("L1YL", DbFieldType::String, false),
-        FieldDesc::new("L2XL", DbFieldType::String, false),
-        FieldDesc::new("L2YL", DbFieldType::String, false),
-        FieldDesc::new("L2ZL", DbFieldType::String, false),
-        // Motor lo limit values
-        FieldDesc::new("L0X", DbFieldType::Double, true),
-        FieldDesc::new("L0Y", DbFieldType::Double, true),
-        FieldDesc::new("L1Y", DbFieldType::Double, true),
-        FieldDesc::new("L2X", DbFieldType::Double, true),
-        FieldDesc::new("L2Y", DbFieldType::Double, true),
-        FieldDesc::new("L2Z", DbFieldType::Double, true),
-        // Control fields
-        FieldDesc::new("INIT", DbFieldType::Short, false),
-        FieldDesc::new("ZERO", DbFieldType::Short, false),
-        FieldDesc::new("SYNC", DbFieldType::Short, false),
-        FieldDesc::new("READ", DbFieldType::Short, false),
-        FieldDesc::new("SET", DbFieldType::Enum, false),
-        FieldDesc::new("SSET", DbFieldType::Short, false),
-        FieldDesc::new("SUSE", DbFieldType::Short, false),
-        FieldDesc::new("LVIO", DbFieldType::Short, true),
-        // Display / config
-        FieldDesc::new("LEGU", DbFieldType::String, false),
-        FieldDesc::new("AEGU", DbFieldType::String, false),
-        FieldDesc::new("PREC", DbFieldType::Short, false),
-        FieldDesc::new("MMAP", DbFieldType::Long, true),
-        FieldDesc::new("GEOM", DbFieldType::Enum, false),
-        FieldDesc::new("TORAD", DbFieldType::Double, true),
-        FieldDesc::new("AUNIT", DbFieldType::Enum, false),
-    ]
-});
-
-// ===========================================================================
 // Record trait implementation
 // ===========================================================================
-
-/// Record-specific `DBF_MENU` choice tables, in `.dbd` value order (the
-/// index↔string mapping is wire-visible to clients). Source: the C
-/// `tableRecord.dbd` menu definitions (optics module). `SET`/`GEOM`/`AUNIT`
-/// are already served as `DBR_ENUM`; these tables supply the labels the
-/// base record registry attaches to the snapshot.
-const TABLE_SET_CHOICES: &[&str] = &["Use", "Set"];
-const TABLE_GEOM_CHOICES: &[&str] = &["SRI", "GEOCARS", "NEWPORT", "PNC"];
-const TABLE_AUNIT_CHOICES: &[&str] = &["degrees", "ur"];
 
 /// Record-internal monitor posts that C `tableRecord.c` emits with a
 /// literal `DBE_VALUE` — never `DBE_LOG`. `monitor()` posts the thirteen
@@ -3198,21 +2986,8 @@ impl Record for TableRecord {
         }
     }
 
-    fn hand_field_list(&self) -> &'static [FieldDesc] {
-        let fields: &Vec<FieldDesc> = &ALL_FIELDS;
-        unsafe { std::slice::from_raw_parts(fields.as_ptr(), fields.len()) }
-    }
-
-    /// `SET`/`GEOM`/`AUNIT` are `DBF_MENU` (`tableSET`/`tableGEOM`/
-    /// `tableAUNIT`, C `tableRecord.dbd`); served as `DBR_ENUM` with the
-    /// menu's choice labels in `.dbd` index order.
-    fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
-        match field {
-            "SET" => Some(TABLE_SET_CHOICES),
-            "GEOM" => Some(TABLE_GEOM_CHOICES),
-            "AUNIT" => Some(TABLE_AUNIT_CHOICES),
-            _ => None,
-        }
+    fn declared_fields(&self) -> &'static [FieldDesc] {
+        dbd_generated::TABLE_FIELDS
     }
 
     /// C `tableRecord.c` posts every record-internal change with a literal
@@ -5372,7 +5147,7 @@ mod tests {
 #[cfg(test)]
 mod menu_choice_tests {
     use super::{Geometry, TableRecord};
-    use epics_base_rs::server::record::{Record, RecordInstance};
+    use epics_base_rs::server::record::RecordInstance;
     use epics_base_rs::types::EpicsValue;
 
     // GEOM is already served as DBR_ENUM; the menu_field_choices override
@@ -5392,14 +5167,27 @@ mod menu_choice_tests {
         );
     }
 
+    /// The choices a client sees are the DECLARATION's — `tableRecord.dbd`'s
+    /// `menu()` on each field. This used to assert them through
+    /// `Record::menu_field_choices`, a hand-written table that declared the
+    /// same menus a second time.
     #[test]
-    fn table_menu_field_choices_match_dbd() {
+    fn table_menu_choices_come_from_the_declaration() {
+        use epics_base_rs::server::record::FieldDeclaration;
         let rec = TableRecord::new();
-        assert_eq!(rec.menu_field_choices("SET"), Some(&["Use", "Set"][..]));
+        let menu = |name: &str| {
+            rec.field_list()
+                .iter()
+                .find(|f| f.name == name)
+                .unwrap_or_else(|| panic!("{name} is declared"))
+                .menu
+        };
+        assert_eq!(menu("SET"), Some(&["Use", "Set"][..]));
         assert_eq!(
-            rec.menu_field_choices("AUNIT"),
-            Some(&["degrees", "ur"][..])
+            menu("GEOM"),
+            Some(&["SRI", "GEOCARS", "NEWPORT", "PNC"][..])
         );
-        assert_eq!(rec.menu_field_choices("VAL"), None);
+        assert_eq!(menu("AUNIT"), Some(&["degrees", "ur"][..]));
+        assert_eq!(menu("VAL"), None);
     }
 }

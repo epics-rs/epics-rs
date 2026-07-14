@@ -58,7 +58,7 @@ impl Record for OutProbe {
         }
         Ok(())
     }
-    fn hand_field_list(&self) -> &'static [FieldDesc] {
+    fn declared_fields(&self) -> &'static [FieldDesc] {
         &[]
     }
 }

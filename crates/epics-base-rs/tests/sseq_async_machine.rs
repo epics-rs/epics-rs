@@ -162,7 +162,7 @@ impl Record for AsyncHold {
             _ => Err(epics_base_rs::error::CaError::FieldNotFound(name.into())),
         }
     }
-    fn hand_field_list(&self) -> &'static [FieldDesc] {
+    fn declared_fields(&self) -> &'static [FieldDesc] {
         // A local record ALWAYS names its fields (C has no field-less
         // record): the link classification resolves `LNKnV` = LOC from the
         // target field's DBF type, and R16-1's destination switch picks the
@@ -191,7 +191,7 @@ impl Record for CountingTarget {
     fn put_field(&mut self, _name: &str, _value: EpicsValue) -> CaResult<()> {
         Ok(())
     }
-    fn hand_field_list(&self) -> &'static [FieldDesc] {
+    fn declared_fields(&self) -> &'static [FieldDesc] {
         DOUBLE_VAL_FIELD
     }
 }

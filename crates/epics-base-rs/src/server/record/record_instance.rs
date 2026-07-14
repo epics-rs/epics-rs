@@ -931,7 +931,8 @@ impl RecordInstance {
     ///
     /// 1. the dbCommon `SPC_NOMOD` set below — common fields, so no record's
     ///    `field_list` declares them;
-    /// 2. [`FieldDesc::read_only`] — a record field its `.dbd` marks SPC_NOMOD;
+    /// 2. the record type's **declaration**, resolved by
+    ///    [`Self::declared_fields`] — the vendored `.dbd` whenever one exists;
     /// 3. [`Record::field_no_mod`] — an SPC_NOMOD a record's `cvt_dbaddr`
     ///    raises from its own state (compress VAL under BALG=LIFO,
     ///    `compressRecord.c:398-407`), which a static `FieldDesc` cannot
@@ -943,14 +944,39 @@ impl RecordInstance {
             return true;
         }
         if self
-            .record
-            .field_list()
+            .declared_fields()
             .iter()
             .any(|f| f.name.eq_ignore_ascii_case(field) && f.read_only)
         {
             return true;
         }
         self.record.field_no_mod(field)
+    }
+
+    /// The record type's field **declaration** — the table `special(SPC_NOMOD)`
+    /// is read from.
+    ///
+    /// C has exactly one declaration per record type: the `.dbd` the record was
+    /// built from. This port has two tables for the in-tree types — the
+    /// generated [`dbd_generated`] transcription of that same `.dbd`, and the
+    /// record's own [`Record::field_list`], which six types
+    /// (`aSub`, `mbbiDirect`, `mbboDirect`, `sseq`, `swait`, `waveform`) still
+    /// hand-write through the transitional [`FieldDesc::new`]. A hand-written
+    /// table is not a declaration and cannot be trusted as one: every one of
+    /// those six under-declared SPC_NOMOD (mbboDirect `RVAL`/`MASK`/`NOBT`,
+    /// aSub `FTA`..`FTU` / `NOA`..`NOU`, ...), so the CA server advertised
+    /// `read, write` on fields the C IOC serves as `read, no write` and `dbPut`
+    /// would then refuse.
+    ///
+    /// So the `.dbd` wins whenever the port vendors one, and the record's own
+    /// table is consulted **only** for a record type that has no `.dbd` at all
+    /// (`motor`, `optics`, `scaler`, `std` — Tier 3 record types whose table
+    /// genuinely *is* their declaration). A vendored-`.dbd` record therefore
+    /// cannot advertise a SPC_NOMOD field as writable, whatever its hand-written
+    /// table says.
+    fn declared_fields(&self) -> &'static [FieldDesc] {
+        super::dbd_generated::record_fields(self.record.record_type())
+            .unwrap_or_else(|| self.record.field_list())
     }
 
     /// Check if the record is currently processing (PACT equivalent).

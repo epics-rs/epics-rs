@@ -1044,7 +1044,11 @@ impl RecordInstance {
     ///
     /// 1. the dbCommon `SPC_NOMOD` set below — common fields, so no record's
     ///    `field_list` declares them;
-    /// 2. [`FieldDesc::read_only`] — a record field its `.dbd` marks SPC_NOMOD;
+    /// 2. the record type's **declaration**, resolved by [`Self::field_desc`] —
+    ///    the vendored `.dbd` whenever one exists, and only for a record type
+    ///    that has no `.dbd` at all (`motor`, `optics`, `scaler`, `std`) the
+    ///    record's own hand-written table, which for those Tier 3 types
+    ///    genuinely *is* their declaration;
     /// 3. [`Record::field_no_mod`] — an SPC_NOMOD a record's `cvt_dbaddr`
     ///    raises from its own state (compress VAL under BALG=LIFO,
     ///    `compressRecord.c:398-407`), which a static `FieldDesc` cannot

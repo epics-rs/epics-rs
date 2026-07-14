@@ -24,11 +24,20 @@ const SEQ_SELM_CHOICES: &[&str] = &["All", "Specified", "Mask"];
     type = "seq",
     constant_init = "SELL:SELN,DOL0:DO0,DOL1:DO1,DOL2:DO2,DOL3:DO3,DOL4:DO4,\
                      DOL5:DO5,DOL6:DO6,DOL7:DO7,DOL8:DO8,DOL9:DO9,DOLA:DOA,\
-                     DOLB:DOB,DOLC:DOC,DOLD:DOD,DOLE:DOE,DOLF:DOF"
+                     DOLB:DOB,DOLC:DOC,DOLD:DOD,DOLE:DOE,DOLF:DOF",
+    init = seq_init_record
 )]
 pub struct SeqRecord {
     #[field(type = "Enum")]
     pub val: u16,
+    // OLDN is `DBF_USHORT` (seqRecord.dbd:54), change-detection state for the
+    // SELN monitor: C `process` posts a SELN monitor when `seln != oldn`, then
+    // copies `oldn = seln` (seqRecord.c:230-232). Its init value is `seln`
+    // (`seqRecord.c:128` `prec->oldn = prec->seln`), served by
+    // `seq_init_record`; the .dbd has no `initial(...)`, so a record that did
+    // not store OLDN would serve type-zero (0) where C serves the copied SELN.
+    #[field(type = "UShort")]
+    pub oldn: u16,
     // SELM is DBF_MENU menu(seqSELM) (seqRecord.dbd.pod:265): served as
     // DBR_ENUM with the menu's choice labels (SEQ_SELM_CHOICES). The index
     // is stored as a short; the framework promotes it to Enum.
@@ -177,6 +186,9 @@ impl Default for SeqRecord {
     fn default() -> Self {
         Self {
             val: 0,
+            // Init state; `seq_init_record` copies SELN into it at pass 1,
+            // matching C `seqRecord.c:128`.
+            oldn: 0,
             selm: 0,
             // C `seqRecord.dbd.pod` `field(SELN,DBF_USHORT){ initial("1") }`:
             // an unset SELN defaults to 1, not 0. Only observable when the
@@ -263,6 +275,26 @@ impl SeqRecord {
     pub fn new() -> Self {
         Self::default()
     }
+}
+
+/// C `seqRecord.c:init_record` — `Record::init_record` for `seq`, wired through
+/// `#[record(init = seq_init_record)]`.
+///
+/// C runs the body at pass 1 (`seqRecord.c:112-113` returns early on pass 0):
+/// after `recGblInitConstantLink(&prec->sell, …, &prec->seln)`, it copies
+/// `prec->oldn = prec->seln` (`seqRecord.c:121,128`) so the first `process`
+/// posts a SELN monitor only on a real change. The SELL constant seed itself
+/// is this framework's constant-link owner's job (`SELL:SELN` in
+/// `constant_init`), which runs after the init passes; OLDN therefore tracks
+/// the default/`.db` SELN here. A non-empty CONSTANT `field(SELL,…)` — the one
+/// case where C seeds SELN inside `init_record` before this copy — is the sole
+/// configuration where OLDN would differ, and is not exercised by the soft
+/// database surface.
+fn seq_init_record(rec: &mut SeqRecord, pass: u8) -> crate::error::CaResult<()> {
+    if pass == 1 {
+        rec.oldn = rec.seln;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

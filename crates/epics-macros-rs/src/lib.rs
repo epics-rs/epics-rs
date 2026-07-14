@@ -182,6 +182,10 @@ pub fn epics_test(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// - `#[record(type = "ai")]` — sets the record type name
 /// - `#[record(type = "ai", crate_path = "my_crate")]` — override crate path
+/// - `#[record(type = "seq", init = seq_init_record)]` — emit
+///   `Record::init_record` delegating to the named free function
+///   (`fn(&mut Self, u8) -> CaResult<()>`), for a record type whose C
+///   `init_record` does real work; omitted, the trait's no-op applies
 /// - `#[field(type = "Double")]` — sets the DBR type for a field
 /// - `#[field(type = "Double", read_only)]` — marks a field as read-only
 /// - `#[field(type = "Short", menu_choices = SELM_CHOICES)]` — a
@@ -210,6 +214,14 @@ struct RecordAttrs {
     /// `Record` impl is hand-written declares the same table by overriding that
     /// method directly.
     constant_init: Vec<(String, String)>,
+    /// `#[record(init = some_fn)]` — the record's C `init_record`. The derive
+    /// emits no `init_record` by default (the trait's no-op applies); a record
+    /// type whose C `init_record` does real work (e.g. `seq`'s
+    /// `prec->oldn = prec->seln`) names a free function `fn(&mut Self, u8) ->
+    /// CaResult<()>` here, and the derive emits `Record::init_record`
+    /// delegating to it. Kept a free function, not an inherent method, so the
+    /// derive need not assume a method exists.
+    init: Option<syn::Path>,
 }
 
 struct FieldInfo {
@@ -361,9 +373,22 @@ fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
         }
     };
 
+    // `#[record(init = some_fn)]` — emit `Record::init_record` delegating to
+    // the named free function. Omitted entirely when the record declares no
+    // init, so the trait default (no-op) applies.
+    let init_method = match &attrs.init {
+        Some(path) => quote! {
+            fn init_record(&mut self, pass: u8) -> #krate::error::CaResult<()> {
+                #path(self, pass)
+            }
+        },
+        None => quote! {},
+    };
+
     let expanded = quote! {
         impl #krate::server::record::Record for #name {
             #constant_init_method
+            #init_method
 
             fn record_type(&self) -> &'static str {
                 #record_type_str
@@ -399,6 +424,7 @@ fn parse_record_attrs(input: &DeriveInput) -> syn::Result<RecordAttrs> {
     let mut record_type = None;
     let mut crate_path = None;
     let mut constant_init: Vec<(String, String)> = Vec::new();
+    let mut init: Option<syn::Path> = None;
 
     for attr in &input.attrs {
         if attr.path().is_ident("record") {
@@ -430,8 +456,11 @@ fn parse_record_attrs(input: &DeriveInput) -> syn::Result<RecordAttrs> {
                         }
                     }
                     Ok(())
+                } else if meta.path.is_ident("init") {
+                    init = Some(meta.value()?.parse()?);
+                    Ok(())
                 } else {
-                    Err(meta.error("expected `type`, `crate_path` or `constant_init`"))
+                    Err(meta.error("expected `type`, `crate_path`, `constant_init` or `init`"))
                 }
             })?;
         }
@@ -444,6 +473,7 @@ fn parse_record_attrs(input: &DeriveInput) -> syn::Result<RecordAttrs> {
         record_type,
         crate_path,
         constant_init,
+        init,
     })
 }
 

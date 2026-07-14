@@ -2118,6 +2118,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "mca-rs"
+version = "0.23.0"
+dependencies = [
+ "chrono",
+ "epics-base-rs",
+ "epics-ca-rs",
+ "tokio",
+]
+
+[[package]]
 name = "mdns-sd"
 version = "0.13.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"

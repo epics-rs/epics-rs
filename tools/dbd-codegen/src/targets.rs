@@ -78,4 +78,14 @@ pub const TARGETS: &[Target] = &[
         bpt_out_file: None,
         base_path: "epics_base_rs",
     },
+    Target {
+        // The synApps `mca` (multichannel analyzer) record type. `mca.FTVL` is
+        // `menu(menuFtype)` and `mca.VAL`/`mca.BG` are `special(SPC_DBADDR)`
+        // runtime-typed from FTVL — both resolved exactly as the other
+        // downstream targets resolve base's menus and their own cvt_dbaddr rows.
+        dbd_dir: "crates/mca-rs/dbd",
+        out_file: "crates/mca-rs/src/record/dbd_generated.rs",
+        bpt_out_file: None,
+        base_path: "epics_base_rs",
+    },
 ];

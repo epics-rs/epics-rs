@@ -1,0 +1,16 @@
+[package]
+name = "mca-rs"
+version.workspace = true
+edition.workspace = true
+description = "Rust port of the synApps mca record (multichannel analyzer)"
+license-file = "LICENSE"
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+chrono = "0.4"
+epics-base-rs = { workspace = true }
+
+[dev-dependencies]
+epics-ca-rs = { workspace = true }
+tokio = { version = "1", features = ["full", "test-util"] }

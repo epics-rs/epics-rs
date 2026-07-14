@@ -14,6 +14,7 @@ default-members = [
     "crates/std-rs",
     "crates/scaler-rs",
     "crates/optics-rs",
+    "crates/mca-rs",
     "crates/mqtt-rs",
     "crates/modbus-rs",
     "crates/epics-tools-rs",
@@ -45,6 +46,7 @@ motor-rs = { path = "crates/motor-rs", version = "0.23.0" }
 std-rs = { path = "crates/std-rs", version = "0.23.0" }
 scaler-rs = { path = "crates/scaler-rs", version = "0.23.0" }
 optics-rs = { path = "crates/optics-rs", version = "0.23.0" }
+mca-rs = { path = "crates/mca-rs", version = "0.23.0" }
 mqtt-rs = { path = "crates/mqtt-rs", version = "0.23.0" }
 modbus-rs = { path = "crates/modbus-rs", version = "0.23.0", package = "epics-modbus-rs" }
 epics-tools-rs = { path = "crates/epics-tools-rs", version = "0.23.0" }

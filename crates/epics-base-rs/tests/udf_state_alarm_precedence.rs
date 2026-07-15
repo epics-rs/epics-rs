@@ -40,6 +40,18 @@ async fn caput(db: &PvDatabase, field: &str, text: &str) {
         .unwrap();
 }
 
+/// A **numeric** put of a raw severity ordinal into a `DBF_MENU` selector — the
+/// wire path a `caput .ZSV 4` / `caput .ZSV -1` takes. A DBR_SHORT/LONG/ENUM put
+/// skips `putStringMenu`'s `< nChoice` label bound (which refuses a string "4")
+/// and stores the raw `epicsEnum16` via `putEnum` (`*pfield = (epicsEnum16)val`):
+/// `4 -> 4`, `-1 -> 65535`. The port stores it as the field's native `i16`
+/// (`-1i16` reads back as raw `u16` 65535 in the severity compare).
+async fn caput_raw(db: &PvDatabase, field: &str, ordinal: i16) {
+    db.put_record_field_from_ca("REC", field, EpicsValue::Short(ordinal))
+        .await
+        .unwrap();
+}
+
 async fn alarm(db: &PvDatabase) -> (AlarmSeverity, u16) {
     let inst = db.get_record("REC").await.unwrap();
     let g = inst.read().await;
@@ -68,6 +80,58 @@ async fn mbbo_udf_beats_equal_severity_state() {
         alarm(&db).await,
         (AlarmSeverity::Invalid, UDF_ALARM),
         "UDF is raised before ZRSV STATE and equal severity does not override"
+    );
+}
+
+/// Out-of-range STATE severity ordinal (`ZSV=4`, over-max) DOES override the
+/// prior UDF: C `recGblSetSevr(STATE_ALARM, prec->zsv)` compares the RAW
+/// `epicsEnum16` (recGbl.c:242), and `3 < 4` is true, so STAT=STATE. The
+/// displayed SEVR stays INVALID (`recGblResetAlarms` clamps). This is the
+/// regression the raw-ordinal compare fixes — clamping `zsv=4` to `Invalid(3)`
+/// before the compare would tie UDF and wrongly leave STAT=UDF.
+#[tokio::test]
+async fn bo_over_max_state_severity_overrides_udf() {
+    let db = db_with(Box::new(BoRecord::new(0))).await;
+    caput_raw(&db, "ZSV", 4).await;
+    assert_eq!(
+        alarm(&db).await,
+        (AlarmSeverity::Invalid, STATE_ALARM),
+        "raw zsv=4 > udfs=3, so STATE overrides UDF; SEVR clamped to INVALID"
+    );
+}
+
+/// Negative STATE severity ordinal (`ZSV=-1` → `65535`) also overrides: the raw
+/// `DBF_MENU` field holds `65535`, numerically greater than UDFS's `3`.
+#[tokio::test]
+async fn bo_negative_state_severity_overrides_udf() {
+    let db = db_with(Box::new(BoRecord::new(0))).await;
+    caput_raw(&db, "ZSV", -1).await;
+    assert_eq!(
+        alarm(&db).await,
+        (AlarmSeverity::Invalid, STATE_ALARM),
+        "raw zsv=65535 > udfs=3, so STATE overrides UDF; SEVR clamped to INVALID"
+    );
+}
+
+#[tokio::test]
+async fn mbbo_over_max_state_severity_overrides_udf() {
+    let db = db_with(Box::new(MbboRecord::new(0))).await;
+    caput_raw(&db, "ZRSV", 4).await;
+    assert_eq!(
+        alarm(&db).await,
+        (AlarmSeverity::Invalid, STATE_ALARM),
+        "raw zrsv=4 > udfs=3, so STATE overrides UDF; SEVR clamped to INVALID"
+    );
+}
+
+#[tokio::test]
+async fn mbbo_negative_state_severity_overrides_udf() {
+    let db = db_with(Box::new(MbboRecord::new(0))).await;
+    caput_raw(&db, "ZRSV", -1).await;
+    assert_eq!(
+        alarm(&db).await,
+        (AlarmSeverity::Invalid, STATE_ALARM),
+        "raw zrsv=65535 > udfs=3, so STATE overrides UDF; SEVR clamped to INVALID"
     );
 }
 

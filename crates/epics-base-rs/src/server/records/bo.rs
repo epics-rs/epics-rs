@@ -284,17 +284,16 @@ impl Record for BoRecord {
             );
         }
 
+        // STATE/COS use the RAW severity ordinal (ZSV/OSV/COSV are DBF_MENU
+        // stored raw i16): C `recGblSetSevr(prec, STATE_ALARM, prec->zsv)`
+        // compares the raw `epicsEnum16`, so an out-of-range `ZSV=4`/`65535`
+        // numerically exceeds a prior UDF's INVALID(3) and overrides it. See
+        // `rec_gbl_set_sevr_raw`. VAL is 0/1, so the branch picks ZSV or OSV.
         let val = self.val;
         let state_sev = if val == 0 { self.zsv } else { self.osv };
-        let sev = AlarmSeverity::from_u16(state_sev as u16);
-        if sev != AlarmSeverity::NoAlarm {
-            recgbl::rec_gbl_set_sevr(common, alarm_status::STATE_ALARM, sev);
-        }
+        recgbl::rec_gbl_set_sevr_raw(common, alarm_status::STATE_ALARM, state_sev as u16);
         if val != self.lalm {
-            let cos_sev = AlarmSeverity::from_u16(self.cosv as u16);
-            if cos_sev != AlarmSeverity::NoAlarm {
-                recgbl::rec_gbl_set_sevr(common, alarm_status::COS_ALARM, cos_sev);
-            }
+            recgbl::rec_gbl_set_sevr_raw(common, alarm_status::COS_ALARM, self.cosv as u16);
             self.lalm = val;
         }
     }

@@ -190,10 +190,18 @@ impl Record for MbbiDirectRecord {
             "SIOL" => Some(EpicsValue::String(self.siol.clone().into())),
             "SIMS" => Some(EpicsValue::Short(self.sims)),
             "SDLY" => Some(EpicsValue::Double(self.sdly)),
+            // B0..B1F are DBF_UCHAR (mbbiDirectRecord.dbd.pod). Serve the bit as
+            // the native `UChar` (unsigned) — it still projects to `DBR_CHAR` on
+            // the wire (`dbr.rs`: `UChar -> Char`), so a client's `caget` reports
+            // DBF_CHAR exactly as C does, but the put-coercion target derived
+            // from this value (`dbput_request`) is now the unsigned 0..=255 range
+            // instead of signed i8. C `dbFastPutConvert[DBR_STRING][DBF_UCHAR]`
+            // accepts `caput .Bn 255`; the prior `Char` representation made the
+            // port refuse everything above i8-max (128..=255).
             _ => BIT_NAMES
                 .iter()
                 .position(|&n| n == name)
-                .map(|idx| EpicsValue::Char(self.bits[idx])),
+                .map(|idx| EpicsValue::UChar(self.bits[idx])),
         }
     }
 
@@ -277,10 +285,20 @@ impl Record for MbbiDirectRecord {
             }
             _ => {
                 if let Some(idx) = BIT_NAMES.iter().position(|&n| n == name) {
+                    // B0..B1F are DBF_UCHAR, so a numeric CA put coerces to the
+                    // native `UChar`; accept it alongside the signed variants
+                    // device support / autosave may send. C stores the coerced
+                    // byte into `*pBn` and `monitor()` re-derives it as
+                    // `!! (val & 1)` (mbbiDirectRecord.c:221) — a NONZERO byte is
+                    // bit 1, not the low bit. This transient store is overwritten
+                    // by the re-derive below on the very next process, so it only
+                    // affects a readback taken before process; mirror C's nonzero
+                    // rule regardless.
                     let bit = match value {
-                        EpicsValue::Char(v) => v & 1,
-                        EpicsValue::Short(v) => (v & 1) as u8,
-                        EpicsValue::Long(v) => (v & 1) as u8,
+                        EpicsValue::UChar(v) => u8::from(v != 0),
+                        EpicsValue::Char(v) => u8::from(v != 0),
+                        EpicsValue::Short(v) => u8::from(v != 0),
+                        EpicsValue::Long(v) => u8::from(v != 0),
                         _ => return Err(CaError::TypeMismatch(name.into())),
                     };
                     // INPUT record: Bx is DERIVED from VAL, so a Bx put must

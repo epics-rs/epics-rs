@@ -77,11 +77,23 @@ fn check_no_mod(instance: &crate::server::record::RecordInstance, field: &str) -
 ///
 /// C `dbPutField` (`dbAccess.c:1263-1268`) and pvxs `IOCSource::
 /// doPostProcessing` (`iocsource.cpp:397-403`) ask the same question with the
-/// same three terms: the `PROC` field always, else a `pp(TRUE)` field on a
-/// Passive record. (`dbrType < DBR_PUT_ACKT` is subsumed: the alarm-ack fields
-/// are not `pp(TRUE)`.) A caller that FORCES processing
-/// (`record._options.process=true`) does not consult this at all — force is
-/// the caller's own term, not the record's.
+/// same terms as C `processNotifyCommon` (dbNotify.c:243-246): the `PROC` field
+/// always, else a `pp(TRUE)` field on a Passive record. (`dbrType <
+/// DBR_PUT_ACKT` is subsumed: the alarm-ack fields are not `pp(TRUE)`.) A caller
+/// that FORCES processing (`record._options.process=true`) does not consult this
+/// at all — force is the caller's own term, not the record's.
+///
+/// `PROC` and `UDF` are the ONLY two `dbCommon` `pp(TRUE)` fields
+/// (`dbCommon.dbd.pod`: PROC line 243, UDF line 552); every other `pp(TRUE)`
+/// field is declared per record TYPE and reached through
+/// [`Record::processes_after_put`]. Because the two `dbCommon` fields are NOT in
+/// any type's `process_passive_fields()` table, they are named here directly:
+/// `PROC` unconditionally (force-process on any SCAN), `UDF` on the Passive
+/// branch (an ordinary `pp` field, so it processes only when `SCAN == 0`, unlike
+/// PROC). Both `dbCommon` `pp(TRUE)` fields are thus handled at this one owner
+/// gate, uniformly for every record type. A put to UDF is accepted+stored by
+/// `put_common_field`; this gate only adds the process cycle, after which the
+/// record recomputes alarms → NO_ALARM (C ends STAT/SEVR=NO_ALARM likewise).
 ///
 /// Single owner of the rule: the single-record put route
 /// ([`PvDatabase::put_record_field_from_ca`]) tests it while it already holds
@@ -96,7 +108,7 @@ pub(crate) fn put_drives_processing_of(
 ) -> bool {
     field == "PROC"
         || (instance.common.scan == crate::server::record::ScanType::Passive
-            && instance.record.processes_after_put(field))
+            && (field == "UDF" || instance.record.processes_after_put(field)))
 }
 
 /// Drain the record's per-cycle post marks ([`Record::take_cycle_posted_fields`])

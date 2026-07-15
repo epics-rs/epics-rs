@@ -74,7 +74,10 @@ async fn simm_yes_with_unset_siml_and_siol_simulates_from_sval() {
         inst.common.stat,
         epics_base_rs::server::recgbl::alarm_status::SIMM_ALARM
     );
-    assert!(!inst.common.udf, "C clears UDF on the status-0 SIOL read");
+    assert!(
+        inst.common.udf == 0,
+        "C clears UDF on the status-0 SIOL read"
+    );
 }
 
 /// The same record with SIMM back at NO must NOT simulate: the SVAL is ignored

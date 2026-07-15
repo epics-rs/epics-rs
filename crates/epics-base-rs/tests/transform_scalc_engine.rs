@@ -78,7 +78,7 @@ async fn r11_c14_divide_by_zero_is_a_calc_failure() {
         "the status is CALC_ALARM"
     );
     assert!(
-        g.common.udf,
+        g.common.udf != 0,
         "transformRecord.c:595 also sets udf = TRUE on the failure"
     );
     // C leaves `*pval` untouched when sCalcPerform fails — the channel keeps its

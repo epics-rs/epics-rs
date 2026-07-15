@@ -71,7 +71,7 @@ async fn add_ao_with_out(db: &PvDatabase, name: &str, out: &str) {
     let mut inst = rec.write().await;
     inst.put_common_field("OUT", EpicsValue::String(out.into()))
         .unwrap();
-    inst.common.udf = false;
+    inst.common.udf = 0;
 }
 
 async fn alarm_of(db: &PvDatabase, name: &str) -> (u16, AlarmSeverity) {

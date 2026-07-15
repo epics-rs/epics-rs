@@ -35,7 +35,7 @@ use epics_base_rs::types::EpicsValue;
 async fn udf(db: &PvDatabase, name: &str) -> bool {
     let rec = db.get_record(name).await.unwrap();
     let inst = rec.read().await;
-    inst.common.udf
+    inst.common.udf != 0
 }
 
 /// A UDF put drives processing; because the cycle sources nothing, the put
@@ -131,7 +131,7 @@ async fn asub_clears_udf_when_subroutine_runs() {
     // Start undefined, then process: a running subroutine defines the record.
     {
         let r = db.get_record("ASUB").await.unwrap();
-        r.write().await.common.udf = true;
+        r.write().await.common.udf = 1;
     }
 
     let mut visited = std::collections::HashSet::new();

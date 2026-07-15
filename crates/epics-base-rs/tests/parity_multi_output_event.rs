@@ -124,7 +124,7 @@ async fn dfanout_specified_out_of_range_raises_invalid() {
         .write()
         .await
         .common
-        .udf = false;
+        .udf = 0;
 
     let mut visited = HashSet::new();
     db.process_record_with_links("DF_BAD", &mut visited, 0)
@@ -221,7 +221,7 @@ async fn udf_stays_true_on_nan_value() {
     let rec = db.get_record("NAN_REC").await.unwrap();
     let inst = rec.read().await;
     assert!(
-        inst.common.udf,
+        inst.common.udf != 0,
         "UDF must stay true when VAL is NaN (C aiRecord.c:285)"
     );
     assert_eq!(
@@ -242,7 +242,7 @@ async fn udf_cleared_on_defined_value() {
     db.process_record("OK_REC").await.unwrap();
     let rec = db.get_record("OK_REC").await.unwrap();
     assert!(
-        !rec.read().await.common.udf,
+        rec.read().await.common.udf == 0,
         "UDF must clear when VAL is a defined value"
     );
 }

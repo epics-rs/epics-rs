@@ -161,7 +161,7 @@ async fn test_single_inp_ms_propagates_link_alarm_no_msg() {
         let mut inst = rec.write().await;
         inst.put_common_field("INP", EpicsValue::String("SRC NPP MS".into()))
             .unwrap();
-        inst.common.udf = false;
+        inst.common.udf = 0;
     }
 
     let mut visited = HashSet::new();
@@ -213,7 +213,7 @@ async fn test_single_inp_mss_propagates_stat_and_amsg() {
         let mut inst = rec.write().await;
         inst.put_common_field("INP", EpicsValue::String("SRC NPP MSS".into()))
             .unwrap();
-        inst.common.udf = false;
+        inst.common.udf = 0;
     }
 
     let mut visited = HashSet::new();
@@ -268,13 +268,13 @@ async fn test_out_link_ms_propagates_link_alarm_to_dest() {
             .unwrap();
         inst.put_common_field("HHSV", EpicsValue::Short(AlarmSeverity::Major as i16))
             .unwrap();
-        inst.common.udf = false;
+        inst.common.udf = 0;
     }
     if let Some(rec) = db.get_record("DST").await {
         // Clear DST's own UDF so its post-write process raises no alarm
         // of its own — the only severity it can end up at is the
         // inherited one.
-        rec.write().await.common.udf = false;
+        rec.write().await.common.udf = 0;
     }
 
     let mut visited = HashSet::new();
@@ -328,10 +328,10 @@ async fn test_out_link_nms_does_not_propagate_alarm_to_dest() {
             .unwrap();
         inst.put_common_field("HHSV", EpicsValue::Short(AlarmSeverity::Major as i16))
             .unwrap();
-        inst.common.udf = false;
+        inst.common.udf = 0;
     }
     if let Some(rec) = db.get_record("DST").await {
-        rec.write().await.common.udf = false;
+        rec.write().await.common.udf = 0;
     }
 
     let mut visited = HashSet::new();
@@ -387,7 +387,7 @@ async fn test_pva_link_propagates_alarm_severity_into_link_alarm() {
         let mut inst = rec.write().await;
         inst.put_common_field("INP", EpicsValue::String("pva://REMOTE:PV".into()))
             .unwrap();
-        inst.common.udf = false;
+        inst.common.udf = 0;
     }
 
     let mut visited = HashSet::new();
@@ -445,7 +445,7 @@ async fn test_pva_link_no_alarm_when_lset_reports_none() {
         let mut inst = rec.write().await;
         inst.put_common_field("INP", EpicsValue::String("pva://REMOTE:OK".into()))
             .unwrap();
-        inst.common.udf = false;
+        inst.common.udf = 0;
     }
 
     let mut visited = HashSet::new();
@@ -539,7 +539,7 @@ async fn test_pva_out_link_writes_value_through_link_set() {
         let mut inst = rec.write().await;
         inst.put_common_field("OUT", EpicsValue::String("pva://REMOTE:OUT".into()))
             .unwrap();
-        inst.common.udf = false;
+        inst.common.udf = 0;
         // Set VAL so process() has a value to drive out the OUT link.
         inst.record
             .put_field("VAL", EpicsValue::Double(3.5))
@@ -588,7 +588,7 @@ async fn test_pva_out_link_no_link_set_fails_gracefully() {
         let mut inst = rec.write().await;
         inst.put_common_field("OUT", EpicsValue::String("pva://NOWHERE:PV".into()))
             .unwrap();
-        inst.common.udf = false;
+        inst.common.udf = 0;
         inst.record
             .put_field("VAL", EpicsValue::Double(1.0))
             .unwrap();
@@ -644,7 +644,7 @@ async fn test_pva_out_link_put_notify_chain_uses_async_op() {
         let mut inst = rec.write().await;
         inst.put_common_field("OUT", EpicsValue::String("pva://REMOTE:OUT".into()))
             .unwrap();
-        inst.common.udf = false;
+        inst.common.udf = 0;
         inst.record
             .put_field("VAL", EpicsValue::Double(7.0))
             .unwrap();
@@ -714,7 +714,7 @@ async fn test_mss_propagates_amsg_only_change_posts_amsg_event() {
         let mut inst = rec.write().await;
         inst.put_common_field("INP", EpicsValue::String("SRC_AMSG NPP MSS".into()))
             .unwrap();
-        inst.common.udf = false;
+        inst.common.udf = 0;
     }
 
     // Cycle 1: drives sevr 0→Major, amsg ""→"msg1" (alarm_changed=true).
@@ -799,7 +799,7 @@ async fn test_record_posts_carry_per_event_dbe_mask() {
         let mut inst = rec.write().await;
         inst.put_common_field("INP", EpicsValue::String("SRC_MASK NPP MSS".into()))
             .unwrap();
-        inst.common.udf = false;
+        inst.common.udf = 0;
     }
 
     let mut val_rx = {
@@ -895,7 +895,7 @@ async fn test_process_cycle_posts_no_udf_event() {
     {
         let rec = db.get_record("UDF_REC").await.unwrap();
         let mut inst = rec.write().await;
-        inst.common.udf = true;
+        inst.common.udf = 1;
         inst.common.sevr = AlarmSeverity::Invalid;
         inst.common.stat = alarm_status::UDF_ALARM;
     }
@@ -913,7 +913,7 @@ async fn test_process_cycle_posts_no_udf_event() {
         let rec = db.get_record("UDF_REC").await.unwrap();
         let inst = rec.read().await;
         assert!(
-            !inst.common.udf,
+            inst.common.udf == 0,
             "process must have cleared UDF in the record"
         );
     }
@@ -926,7 +926,7 @@ async fn test_process_cycle_posts_no_udf_event() {
     {
         let rec = db.get_record("UDF_REC").await.unwrap();
         let mut inst = rec.write().await;
-        inst.common.udf = true;
+        inst.common.udf = 1;
     }
     let mut visited = HashSet::new();
     db.process_record_with_links("UDF_REC", &mut visited, 0)
@@ -954,7 +954,7 @@ async fn test_caput_to_udf_field_posts_udf_event() {
     let mut udf_rx = {
         let rec = db.get_record("UDF_PUT").await.unwrap();
         let mut inst = rec.write().await;
-        inst.common.udf = false;
+        inst.common.udf = 0;
         inst.add_subscriber("UDF", 32, DbFieldType::Char, EventMask::VALUE.bits())
     }
     .expect("UDF subscription must be accepted");
@@ -1093,7 +1093,7 @@ async fn test_put_record_field_from_ca_clears_udf_on_primary_field_write() {
     {
         let rec = db.get_record("UDF_ASYNC").await.unwrap();
         assert!(
-            rec.read().await.common.udf,
+            rec.read().await.common.udf != 0,
             "AsyncRecord starts undefined (udf=true)"
         );
     }
@@ -1112,7 +1112,7 @@ async fn test_put_record_field_from_ca_clears_udf_on_primary_field_write() {
         "AsyncRecord should be mid-async (PACT=true)"
     );
     assert!(
-        !inst.common.udf,
+        inst.common.udf == 0,
         "primary-field CA put must clear UDF synchronously \
          (dbAccess.c::dbPut:1411 parity) — observable before \
          complete_async_record runs"
@@ -1201,7 +1201,7 @@ async fn test_putf_propagates_through_db_out_link_to_passive_target() {
         "after both records' synchronous cycles complete, both clear putf"
     );
     assert!(
-        !inst.common.rpro,
+        inst.common.rpro == 0,
         "target was not pact, so rpro must stay false (normal propagation)"
     );
     let val = inst.record.val().and_then(|v| v.to_f64()).unwrap_or(0.0);
@@ -2359,7 +2359,7 @@ async fn test_disp_allows_disp_write() {
 
     let rec = db.get_record("REC").await.unwrap();
     let inst = rec.read().await;
-    assert!(!inst.common.disp);
+    assert!(inst.common.disp == 0);
 }
 
 #[tokio::test]
@@ -2391,7 +2391,7 @@ async fn test_proc_triggers_processing() {
     assert!(result.is_ok());
     let rec = db.get_record("REC").await.unwrap();
     let inst = rec.read().await;
-    assert!(!inst.common.udf);
+    assert!(inst.common.udf == 0);
 }
 
 #[tokio::test]
@@ -2411,7 +2411,7 @@ async fn test_proc_works_any_scan() {
     assert!(result.is_ok());
     let rec = db.get_record("REC").await.unwrap();
     let inst = rec.read().await;
-    assert!(!inst.common.udf);
+    assert!(inst.common.udf == 0);
 }
 
 /// C `dbAccess.c::dbPutField:1255-1257` returns `S_db_putDisabled` for a
@@ -2442,7 +2442,7 @@ async fn test_disp_blocks_proc_and_suppresses_processing() {
     let rec = db.get_record("REC").await.unwrap();
     let inst = rec.read().await;
     assert!(
-        inst.common.udf,
+        inst.common.udf != 0,
         "the refused PROC put must not have force-processed the record"
     );
 }
@@ -2482,7 +2482,7 @@ async fn test_proc_while_pact() {
     assert!(result.is_ok());
     let rec = db.get_record("REC").await.unwrap();
     let inst = rec.read().await;
-    assert!(!inst.common.udf);
+    assert!(inst.common.udf == 0);
 }
 
 #[tokio::test]
@@ -2965,7 +2965,7 @@ async fn test_put_to_pact_record_sets_rpro_and_second_value_reaches_device() {
         let inst = rec.read().await;
         assert!(inst.is_processing(), "still PACT from put 1");
         assert!(
-            inst.common.rpro,
+            inst.common.rpro != 0,
             "put to a PACT record must set RPRO (C dbAccess.c:1272)"
         );
         assert_eq!(
@@ -2998,7 +2998,7 @@ async fn test_put_to_pact_record_sets_rpro_and_second_value_reaches_device() {
     let rec = db.get_record("ASYNC_OUT").await.unwrap();
     let inst = rec.read().await;
     assert!(
-        !inst.common.rpro,
+        inst.common.rpro == 0,
         "RPRO is consumed (cleared) by the completion tail"
     );
 }
@@ -3025,7 +3025,7 @@ async fn test_async_pending_skips_post_process() {
     assert!(!visited.contains("FLNK_TARGET"));
     let rec = db.get_record("ASYNC").await.unwrap();
     let inst = rec.read().await;
-    assert!(inst.common.udf);
+    assert!(inst.common.udf != 0);
 }
 
 #[tokio::test]
@@ -3050,7 +3050,7 @@ async fn test_complete_async_record() {
     db.complete_async_record("ASYNC").await.unwrap();
     let rec = db.get_record("ASYNC").await.unwrap();
     let inst = rec.read().await;
-    assert!(!inst.common.udf);
+    assert!(inst.common.udf == 0);
 }
 
 /// Defect 1 regression: the async-completion path
@@ -3118,7 +3118,7 @@ async fn test_complete_async_posts_sevr_with_per_field_mask() {
 
     if let Some(rec) = db.get_record("ASYNC_SEVR").await {
         let mut inst = rec.write().await;
-        inst.common.udf = false;
+        inst.common.udf = 0;
     }
 
     // First cycle: record reports async_pending (PACT set).
@@ -3193,7 +3193,7 @@ async fn test_pact_entry_guard_silent_bail_until_max_lock() {
     {
         let rec = db.get_record("ASYNC_PACT").await.unwrap();
         let mut inst = rec.write().await;
-        inst.common.udf = false;
+        inst.common.udf = 0;
         inst.common.sevr = AlarmSeverity::NoAlarm;
         inst.common.stat = epics_base_rs::server::recgbl::alarm_status::NO_ALARM;
     }
@@ -3267,8 +3267,8 @@ async fn test_pact_entry_guard_tpro_diagnostic_does_not_change_bail_outcome() {
     {
         let rec = db.get_record("ASYNC_TPRO").await.unwrap();
         let mut inst = rec.write().await;
-        inst.common.tpro = true;
-        inst.common.rpro = true;
+        inst.common.tpro = 1;
+        inst.common.rpro = 1;
     }
 
     // Cycle 1: drive into PACT.
@@ -3280,8 +3280,11 @@ async fn test_pact_entry_guard_tpro_diagnostic_does_not_change_bail_outcome() {
         let rec = db.get_record("ASYNC_TPRO").await.unwrap();
         let inst = rec.read().await;
         assert!(inst.is_processing(), "must enter PACT");
-        assert!(inst.common.tpro, "TPRO must be preserved");
-        assert!(inst.common.rpro, "RPRO must be preserved across PACT entry");
+        assert!(inst.common.tpro != 0, "TPRO must be preserved");
+        assert!(
+            inst.common.rpro != 0,
+            "RPRO must be preserved across PACT entry"
+        );
     }
 
     // Re-entry while PACT=true: bail with lcnt increment. Diagnostic
@@ -3296,7 +3299,7 @@ async fn test_pact_entry_guard_tpro_diagnostic_does_not_change_bail_outcome() {
     assert!(inst.is_processing(), "still PACT after bail");
     assert_eq!(inst.common.lcnt, 1, "lcnt must have advanced");
     assert!(
-        inst.common.rpro,
+        inst.common.rpro != 0,
         "RPRO must remain unchanged by the diagnostic path"
     );
 }
@@ -3659,7 +3662,7 @@ async fn test_sdis_disable_clears_rpro_and_putf() {
             .unwrap();
         // Pre-set rpro=true, putf=true so the disable path's clear is
         // observable.
-        inst.common.rpro = true;
+        inst.common.rpro = 1;
         inst.common.putf = true;
     }
 
@@ -3671,7 +3674,7 @@ async fn test_sdis_disable_clears_rpro_and_putf() {
     let rec = db.get_record("DIS_TGT").await.unwrap();
     let inst = rec.read().await;
     assert!(
-        !inst.common.rpro,
+        inst.common.rpro == 0,
         "SDIS disable must clear rpro (C dbAccess.c:575). Pre-fix this leaked."
     );
     assert!(
@@ -4083,12 +4086,12 @@ async fn test_udf_cleared_by_process_with_links() {
         .await
         .unwrap();
     let rec = db.get_record("REC").await.unwrap();
-    assert!(rec.read().await.common.udf);
+    assert!(rec.read().await.common.udf != 0);
     let mut visited = HashSet::new();
     db.process_record_with_links("REC", &mut visited, 0)
         .await
         .unwrap();
-    assert!(!rec.read().await.common.udf);
+    assert!(rec.read().await.common.udf == 0);
 }
 
 /// R6-5 — `PINI` is the 6-choice `menuPini` (`menuPini.dbd:11-18`), and C
@@ -4141,7 +4144,7 @@ async fn test_pini_passes_select_disjoint_menu_choices() {
     db.pini_process(PiniMode::Yes).await;
     let udf = |n: &'static str| {
         let db = &db;
-        async move { db.get_record(n).await.unwrap().read().await.common.udf }
+        async move { db.get_record(n).await.unwrap().read().await.common.udf != 0 }
     };
     assert!(
         !udf("PINI_YES").await,
@@ -4521,7 +4524,7 @@ async fn test_pini_records_process_in_ascending_phas_order() {
             .unwrap();
         inst.put_common_field("OUT", EpicsValue::String("PHAS_SINK".into()))
             .unwrap();
-        inst.common.udf = false;
+        inst.common.udf = 0;
     }
 
     db.pini_process(PiniMode::Yes).await;
@@ -4567,7 +4570,7 @@ async fn test_pini_sweep_covers_every_phase_present() {
 
     for name in ["SWEEP_MIN", "SWEEP_ZERO", "SWEEP_MAX"] {
         assert!(
-            !db.get_record(name).await.unwrap().read().await.common.udf,
+            db.get_record(name).await.unwrap().read().await.common.udf == 0,
             "{name} must be processed by the pass for its own phase"
         );
     }
@@ -4637,7 +4640,7 @@ async fn test_ao_asyn_readback_clears_udf_via_framework() {
         .await
         .unwrap();
     let rec = db.get_record("REC").await.unwrap();
-    assert!(rec.read().await.common.udf, "ao starts undefined");
+    assert!(rec.read().await.common.udf != 0, "ao starts undefined");
 
     // Simulate the asyn readback: device sets VAL from the raw and asks the
     // framework to skip the forward VAL->RVAL convert.
@@ -4654,7 +4657,7 @@ async fn test_ao_asyn_readback_clears_udf_via_framework() {
 
     let g = rec.read().await;
     assert!(
-        !g.common.udf,
+        g.common.udf == 0,
         "finite readback value clears UDF (isnan(value)==false)"
     );
     assert_eq!(g.record.get_field("VAL"), Some(EpicsValue::Double(150.0)));
@@ -4705,12 +4708,12 @@ async fn test_udf_not_cleared_by_clears_udf_false() {
         .await
         .unwrap();
     let rec = db.get_record("REC").await.unwrap();
-    assert!(rec.read().await.common.udf);
+    assert!(rec.read().await.common.udf != 0);
     let mut visited = HashSet::new();
     db.process_record_with_links("REC", &mut visited, 0)
         .await
         .unwrap();
-    assert!(rec.read().await.common.udf);
+    assert!(rec.read().await.common.udf != 0);
 }
 
 /// A constant INP link reaches VAL at INIT — `recGblInitConstantLink(&prec->inp,
@@ -4745,13 +4748,14 @@ async fn test_constant_inp_link() {
         other => panic!("expected Double(3.15), got {other:?}"),
     }
     assert!(
-        !db.get_record("AI_CONST")
+        db.get_record("AI_CONST")
             .await
             .unwrap()
             .read()
             .await
             .common
-            .udf,
+            .udf
+            == 0,
         "C: `if (recGblInitConstantLink(...)) prec->udf = FALSE;`"
     );
 
@@ -5416,7 +5420,7 @@ async fn test_dfanout_omsl_supervisory_ignores_dol() {
 /// histogram, event).
 async fn define_val(db: &PvDatabase, name: &str) {
     let rec = db.get_record(name).await.expect("record exists");
-    rec.write().await.common.udf = false;
+    rec.write().await.common.udf = 0;
 }
 
 /// A failed dfanout OUT-link put raises the LINK alarm TWICE in C, and the
@@ -6405,7 +6409,7 @@ async fn test_rpro_causes_reprocessing() {
         .unwrap();
     if let Some(rec) = db.get_record("DEST").await {
         let mut inst = rec.write().await;
-        inst.common.rpro = true;
+        inst.common.rpro = 1;
     }
     let mut visited = HashSet::new();
     db.process_record_with_links("DEST", &mut visited, 0)
@@ -6415,7 +6419,7 @@ async fn test_rpro_causes_reprocessing() {
     assert_eq!(val.to_f64().unwrap() as i64, 20);
     let rec = db.get_record("DEST").await.unwrap();
     let inst = rec.read().await;
-    assert!(!inst.common.rpro);
+    assert!(inst.common.rpro == 0);
 }
 
 #[tokio::test]
@@ -6694,7 +6698,7 @@ async fn test_new_common_fields_get_put() {
 
     {
         let inst = rec.read().await;
-        assert_eq!(inst.get_common_field("RPRO"), Some(EpicsValue::Char(0)));
+        assert_eq!(inst.get_common_field("RPRO"), Some(EpicsValue::UChar(0)));
     }
     {
         let mut inst = rec.write().await;
@@ -6702,7 +6706,7 @@ async fn test_new_common_fields_get_put() {
     }
     {
         let inst = rec.read().await;
-        assert_eq!(inst.get_common_field("RPRO"), Some(EpicsValue::Char(1)));
+        assert_eq!(inst.get_common_field("RPRO"), Some(EpicsValue::UChar(1)));
     }
 }
 
@@ -7392,7 +7396,7 @@ async fn test_self_link_out_does_not_loop() {
         .common
         .rpro;
     assert!(
-        !rpro_after,
+        rpro_after == 0,
         "RPRO must be cleared after self-link processing — \
          stuck-true would queue an infinite reprocess loop"
     );
@@ -8780,7 +8784,7 @@ async fn br_fr3_ca_link_applies_maximize_switch_at_processing() {
             let mut inst = rec.write().await;
             inst.put_common_field("INP", EpicsValue::String(inp.into()))
                 .unwrap();
-            inst.common.udf = false;
+            inst.common.udf = 0;
         }
         let mut visited = HashSet::new();
         db.process_record_with_links("CADST", &mut visited, 0)
@@ -9911,7 +9915,7 @@ async fn init_applies_constant_dol_across_record_types() {
             Some(EpicsValue::ULong(6)),
             "lso LEN = strlen+1 (C convention)"
         );
-        assert!(!inst.common.udf, "a loaded LS link defines the record");
+        assert!(inst.common.udf == 0, "a loaded LS link defines the record");
     }
 
     // mbbo: constant DOL is the state index; the init tail's convert() maps it

@@ -162,7 +162,7 @@ async fn val(db: &PvDatabase) -> i32 {
 async fn rpro(db: &PvDatabase) -> bool {
     let rec = db.get_record("ASY").await.unwrap();
     let inst = rec.read().await;
-    inst.common.rpro
+    inst.common.rpro != 0
 }
 
 /// The deferral itself: while the record is PACT the put-notify writes NOTHING

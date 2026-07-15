@@ -94,7 +94,7 @@ async fn an_overflowing_result_is_stored_in_the_channel_and_alarms() {
         "the -1 still raises CALC_ALARM/INVALID (transformRecord.c:594)"
     );
     assert_eq!(g.common.stat, alarm_status::CALC_ALARM);
-    assert!(g.common.udf, "transformRecord.c:595 sets udf = TRUE");
+    assert!(g.common.udf != 0, "transformRecord.c:595 sets udf = TRUE");
 }
 
 /// The same rule with a NaN — C's tail tests `isnan(*presult)` too, and the
@@ -112,7 +112,7 @@ async fn a_nan_result_is_stored_in_the_channel_and_alarms() {
     let rec = db.get_record("T").await.unwrap();
     let g = rec.read().await;
     assert_eq!(g.common.sevr, AlarmSeverity::Invalid);
-    assert!(g.common.udf);
+    assert!(g.common.udf != 0);
 }
 
 /// The value C wrote is a value like any other: the OUTx loop fans it out.
@@ -165,7 +165,7 @@ async fn an_operator_refusal_leaves_the_channel_untouched() {
         AlarmSeverity::Invalid,
         "both of C's -1s raise the same CALC_ALARM/INVALID"
     );
-    assert!(g.common.udf);
+    assert!(g.common.udf != 0);
 }
 
 /// Control — a finite result is status 0: no alarm, no UDF, value stored.
@@ -179,5 +179,5 @@ async fn a_finite_result_stores_the_value_and_does_not_alarm() {
     let rec = db.get_record("T").await.unwrap();
     let g = rec.read().await;
     assert_eq!(g.common.sevr, AlarmSeverity::NoAlarm);
-    assert!(!g.common.udf);
+    assert!(g.common.udf == 0);
 }

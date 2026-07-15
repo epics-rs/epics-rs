@@ -101,7 +101,7 @@ async fn field(db: &PvDatabase, rec: &str, f: &str) -> f64 {
 async fn alarm(db: &PvDatabase) -> (AlarmSeverity, u16, bool) {
     let inst = db.get_record("W").await.unwrap();
     let g = inst.read().await;
-    (g.common.sevr, g.common.stat, g.common.udf)
+    (g.common.sevr, g.common.stat, g.common.udf != 0)
 }
 
 /// The record's committed alarm message — C's `amsg`, written by

@@ -4032,7 +4032,7 @@ mod tests {
                 let rec = db.get_record("PACT:rec").await.unwrap();
                 let inst = rec.read().await;
                 assert!(
-                    inst.common.rpro,
+                    inst.common.rpro != 0,
                     "an active record takes the RPRO deferral (atomic={atomic})"
                 );
                 assert!(
@@ -4054,7 +4054,7 @@ mod tests {
                 // test parks none (a group PUT, not a put-callback), so there is
                 // nothing for the token to hand back.
                 let _ = inst.leave_pact();
-                inst.common.rpro = false;
+                inst.common.rpro = 0;
             }
             channel
                 .put(&PvStructure::new("structure"))
@@ -4064,7 +4064,7 @@ mod tests {
                 let rec = db.get_record("PACT:rec").await.unwrap();
                 let inst = rec.read().await;
                 assert!(
-                    !inst.common.rpro,
+                    inst.common.rpro == 0,
                     "an idle record processes now, it does not defer (atomic={atomic})"
                 );
             }
@@ -4522,7 +4522,7 @@ mod tests {
             .write()
             .await
             .common
-            .disp = true;
+            .disp = 1;
         let disabled = GroupChannel::new(db.clone(), group_of(putable));
         let err = disabled
             .put(&v)

@@ -63,7 +63,7 @@ async fn state(db: &PvDatabase, rec: &str) -> (String, u32, bool) {
         EpicsValue::ULong(v) => v,
         other => panic!("{rec}.LEN: {other:?}"),
     };
-    (val, len, inst.common.udf)
+    (val, len, inst.common.udf != 0)
 }
 
 #[tokio::test]

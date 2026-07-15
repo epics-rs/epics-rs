@@ -1044,7 +1044,7 @@ impl Record for AcalcoutRecord {
         // C checkAlarms line 845-852: the UDF guard returns before the limit
         // check. The framework set `common.udf` from `value_is_undefined()`
         // before this hook (a NaN VAL keeps UDF and raises UDF_ALARM).
-        if common.udf {
+        if common.udf != 0 {
             return;
         }
 

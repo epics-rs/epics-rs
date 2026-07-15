@@ -994,7 +994,7 @@ async fn scan_target_should_process(
         return false;
     }
     if tg.is_processing() {
-        tg.common.rpro = true;
+        tg.common.rpro = 1;
         return false;
     }
     true
@@ -2355,7 +2355,7 @@ mod tests {
         // ... and RPRO was armed so the standard RPRO mechanism
         // reprocesses it once the async cycle completes.
         assert!(
-            dest.read().await.common.rpro,
+            dest.read().await.common.rpro != 0,
             "a PACT target must get rpro=true (pvxs prec->rpro = TRUE)"
         );
     }

@@ -158,7 +158,7 @@ fn bi_state_alarm_zsv() {
     // (uninitialised), so clear it to exercise the STATE path,
     // mirroring what `process_local` does via `value_is_undefined()`.
     let mut common = CommonFields {
-        udf: false,
+        udf: 0,
         ..Default::default()
     };
     rec.check_alarms(&mut common);
@@ -174,7 +174,7 @@ fn bi_cos_alarm_fires_on_change() {
     // See bi_state_alarm_zsv: clear the default UDF so checkAlarms
     // evaluates COS instead of returning after UDF_ALARM.
     let mut common = CommonFields {
-        udf: false,
+        udf: 0,
         ..Default::default()
     };
     rec.check_alarms(&mut common);
@@ -182,7 +182,7 @@ fn bi_cos_alarm_fires_on_change() {
     assert_eq!(common.nsta, alarm_status::COS_ALARM);
     // Second evaluation with no change: COS does not re-fire.
     let mut common2 = CommonFields {
-        udf: false,
+        udf: 0,
         ..Default::default()
     };
     rec.check_alarms(&mut common2);
@@ -200,7 +200,7 @@ fn mbbi_state_alarm_per_state() {
     // the per-state STATE alarm (process_local clears it via
     // `value_is_undefined()` for a defined VAL).
     let mut common = CommonFields {
-        udf: false,
+        udf: 0,
         ..Default::default()
     };
     rec.check_alarms(&mut common);
@@ -387,7 +387,7 @@ fn sel_high_limit_alarm() {
     // mirror the framework so the limit alarm is reached instead of
     // UDF_ALARM (C `selRecord.c::checkAlarms:256-259`).
     let mut common = CommonFields {
-        udf: rec.value_is_undefined(),
+        udf: rec.value_is_undefined() as u8,
         ..Default::default()
     };
     rec.check_alarms(&mut common);
@@ -408,7 +408,7 @@ fn sel_hihi_limit_alarm_takes_priority() {
     rec.process().unwrap();
     // See sel_high_limit_alarm: mirror the framework UDF wiring.
     let mut common = CommonFields {
-        udf: rec.value_is_undefined(),
+        udf: rec.value_is_undefined() as u8,
         ..Default::default()
     };
     rec.check_alarms(&mut common);
@@ -430,7 +430,7 @@ fn dfanout_low_limit_alarm() {
     // the limit alarm is reached instead of UDF_ALARM
     // (C `dfanoutRecord.c::checkAlarms:233-236`).
     let mut common = CommonFields {
-        udf: rec.value_is_undefined(),
+        udf: rec.value_is_undefined() as u8,
         ..Default::default()
     };
     rec.check_alarms(&mut common);
@@ -448,7 +448,7 @@ fn dfanout_lolo_limit_alarm() {
     rec.process().unwrap();
     // See dfanout_low_limit_alarm: mirror the framework UDF wiring.
     let mut common = CommonFields {
-        udf: rec.value_is_undefined(),
+        udf: rec.value_is_undefined() as u8,
         ..Default::default()
     };
     rec.check_alarms(&mut common);
@@ -466,7 +466,7 @@ fn dfanout_no_alarm_when_in_range() {
     rec.process().unwrap();
     // See dfanout_low_limit_alarm: mirror the framework UDF wiring.
     let mut common = CommonFields {
-        udf: rec.value_is_undefined(),
+        udf: rec.value_is_undefined() as u8,
         ..Default::default()
     };
     rec.check_alarms(&mut common);
@@ -479,7 +479,7 @@ fn dfanout_udf_alarm_on_nan_val() {
     assert!(rec.value_is_undefined());
     // framework sets this from value_is_undefined()
     let mut common = CommonFields {
-        udf: true,
+        udf: 1,
         ..Default::default()
     };
     rec.check_alarms(&mut common);

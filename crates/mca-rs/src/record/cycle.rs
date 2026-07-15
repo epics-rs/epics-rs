@@ -284,7 +284,7 @@ impl McaRecord {
         // C returns before the ladder when the record is undefined (`:968-971`).
         // The framework raises UDF_ALARM itself (`rec_gbl_check_udf`), which is
         // the other half of that same branch.
-        if common.udf {
+        if common.udf != 0 {
             return;
         }
 

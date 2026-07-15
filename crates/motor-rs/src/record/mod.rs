@@ -538,11 +538,11 @@ impl Record for MotorRecord {
         // record sees CommonFields; a pass without a DOL read leaves
         // udf as-is, like C falling through the collection block.
         if let Some(undefined) = self.internal.dol_udf.take() {
-            common.udf = undefined;
+            common.udf = undefined as u8;
         }
 
         // C 3372-3376: an undefined VAL short-circuits every other check.
-        if common.udf {
+        if common.udf != 0 {
             rec_gbl_set_sevr(common, alarm_status::UDF_ALARM, AlarmSeverity::Invalid);
             return;
         }
@@ -863,19 +863,22 @@ mod tests {
         // Failed read: the resolved report omits DOL.
         rec.set_resolved_input_links(&[]);
         rec.check_alarms(&mut common);
-        assert!(common.udf, "failed DOL read marks VAL undefined");
+        assert!(common.udf != 0, "failed DOL read marks VAL undefined");
 
         // Successful read clears it.
         rec.set_resolved_input_links(&["DOL"]);
         rec.check_alarms(&mut common);
-        assert!(!common.udf, "successful DOL read clears UDF");
+        assert!(common.udf == 0, "successful DOL read clears UDF");
 
         // Supervisory pass (no DOL request): udf stays as-is.
-        common.udf = true;
+        common.udf = 1;
         rec.links.omsl = 0;
         rec.set_resolved_input_links(&[]);
         rec.check_alarms(&mut common);
-        assert!(common.udf, "a pass without a DOL read leaves udf alone");
+        assert!(
+            common.udf != 0,
+            "a pass without a DOL read leaves udf alone"
+        );
     }
 
     // R61: a settled-idle record keeps the poller alive (Start), never Stop.
@@ -960,7 +963,7 @@ mod tests {
         );
         let mut common = CommonFields::default(); // udf == true (dbCommon default)
         rec.check_alarms(&mut common);
-        assert!(!common.udf, "CONSTANT DOL motor is defined after init");
+        assert!(common.udf == 0, "CONSTANT DOL motor is defined after init");
     }
 
     // C leaves udf TRUE for a non-CONSTANT .dol (init_record only clears for
@@ -988,7 +991,7 @@ mod tests {
         let mut common = CommonFields::default(); // udf == true
         rec.check_alarms(&mut common);
         assert!(
-            common.udf,
+            common.udf != 0,
             "DB_LINK DOL motor stays undefined until the first DOL read"
         );
     }

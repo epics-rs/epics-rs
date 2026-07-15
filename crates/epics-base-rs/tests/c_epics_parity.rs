@@ -128,11 +128,11 @@ fn ai_udf_clears_on_process() {
     let mut inst = RecordInstance::new("TEST:ai".to_string(), rec);
 
     // UDF starts true
-    assert!(inst.common.udf, "UDF should start true");
+    assert!(inst.common.udf != 0, "UDF should start true");
 
     // Process clears UDF
     let _ = inst.process_local();
-    assert!(!inst.common.udf, "UDF should be false after process");
+    assert!(inst.common.udf == 0, "UDF should be false after process");
 }
 
 /// C EPICS: test_operator_display
@@ -573,7 +573,7 @@ fn udf_alarm_on_uninit() {
     let rec = AoRecord::new(0.0);
     let inst = RecordInstance::new("TEST:udf".to_string(), rec);
 
-    assert!(inst.common.udf, "UDF should be true on new record");
+    assert!(inst.common.udf != 0, "UDF should be true on new record");
     assert_eq!(inst.common.udfs, AlarmSeverity::Invalid);
 }
 
@@ -1401,7 +1401,7 @@ async fn database_proc_triggers_processing() {
     // UDF should be cleared after processing
     if let Some(rec) = db.get_record("proc_rec").await {
         let inst = rec.read().await;
-        assert!(!inst.common.udf, "UDF should be cleared after PROC");
+        assert!(inst.common.udf == 0, "UDF should be cleared after PROC");
     }
 }
 
@@ -1428,7 +1428,7 @@ async fn database_proc_zero_still_triggers_processing() {
     if let Some(rec) = db.get_record("proc_zero_rec").await {
         let inst = rec.read().await;
         assert!(
-            !inst.common.udf,
+            inst.common.udf == 0,
             "UDF should be cleared after PROC=0 (force-process, not a no-op)"
         );
     }
@@ -1847,7 +1847,7 @@ async fn rpro_reprocessing() {
     // Set RPRO flag
     if let Some(rec) = db.get_record("rpro_rec").await {
         let mut inst = rec.write().await;
-        inst.common.rpro = true;
+        inst.common.rpro = 1;
     }
 
     // Process — should process, detect RPRO, reprocess once, then clear RPRO
@@ -1860,7 +1860,7 @@ async fn rpro_reprocessing() {
     if let Some(rec) = db.get_record("rpro_rec").await {
         let inst = rec.read().await;
         assert!(
-            !inst.common.rpro,
+            inst.common.rpro == 0,
             "RPRO should be cleared after reprocessing"
         );
     }
@@ -1910,7 +1910,7 @@ async fn process_record_clears_udf() {
     // UDF should be true initially
     if let Some(rec) = db.get_record("scan_rec").await {
         let inst = rec.read().await;
-        assert!(inst.common.udf, "UDF should be true before process");
+        assert!(inst.common.udf != 0, "UDF should be true before process");
     }
 
     // Process record
@@ -1919,7 +1919,7 @@ async fn process_record_clears_udf() {
     // UDF should be cleared
     if let Some(rec) = db.get_record("scan_rec").await {
         let inst = rec.read().await;
-        assert!(!inst.common.udf, "UDF should be false after process");
+        assert!(inst.common.udf == 0, "UDF should be false after process");
     }
 }
 

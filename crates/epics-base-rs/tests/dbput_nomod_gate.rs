@@ -205,7 +205,7 @@ async fn every_dbcommon_nomod_field_is_refused_on_every_route() {
         inst.common.ackt,
         "ACKT default YES survives the refused put"
     );
-    assert!(!inst.common.rpro);
+    assert!(inst.common.rpro == 0);
     assert_eq!(inst.common.utag, 0);
     assert_eq!(inst.name, "AO2");
 }

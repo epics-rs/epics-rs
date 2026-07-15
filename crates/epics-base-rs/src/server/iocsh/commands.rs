@@ -2447,7 +2447,7 @@ record(mbboDirect, "MBD0") {{ }}
         ctx.block_on(async {
             let udf = |name: &'static str| {
                 let db = db.clone();
-                async move { db.get_record(name).await.unwrap().read().await.common.udf }
+                async move { db.get_record(name).await.unwrap().read().await.common.udf != 0 }
             };
             assert!(
                 !udf("HG").await,

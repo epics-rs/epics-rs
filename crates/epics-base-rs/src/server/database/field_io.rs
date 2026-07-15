@@ -23,7 +23,7 @@ fn check_put_disabled(
     instance: &crate::server::record::RecordInstance,
     field_upper: &str,
 ) -> CaResult<()> {
-    if instance.common.disp && field_upper != "DISP" {
+    if instance.common.disp != 0 && field_upper != "DISP" {
         return Err(CaError::PutDisabled(field_upper.to_string()));
     }
     Ok(())
@@ -927,7 +927,7 @@ impl PvDatabase {
                             // earlier synchronous stat/sevr clear here diverged
                             // from C and reported NO_ALARM where C keeps UDF/INVALID.
                             if instance.record.is_udf_defining_put(&field) {
-                                instance.common.udf = false;
+                                instance.common.udf = 0;
                             }
                             result
                         }
@@ -1275,7 +1275,7 @@ impl PvDatabase {
             };
             let mut instance = rec.write().await;
             if instance.is_processing() {
-                instance.common.rpro = true;
+                instance.common.rpro = 1;
                 return Ok(());
             }
             instance.common.putf = true;
@@ -1579,7 +1579,7 @@ impl PvDatabase {
                             // when the record does process. The earlier
                             // synchronous stat/sevr clear here diverged from C.
                             if instance.record.is_udf_defining_put(&field) {
-                                instance.common.udf = false;
+                                instance.common.udf = 0;
                             }
                             result
                         }

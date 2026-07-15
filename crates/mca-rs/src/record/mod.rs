@@ -950,7 +950,7 @@ mod tests {
     /// record reaches this hook in.
     fn defined() -> CommonFields {
         CommonFields {
-            udf: false,
+            udf: 0,
             ..Default::default()
         }
     }
@@ -1416,7 +1416,7 @@ mod tests {
             ..Default::default()
         };
         let mut common = CommonFields {
-            udf: true,
+            udf: 1,
             ..Default::default()
         };
         rec.check_alarms(&mut common);

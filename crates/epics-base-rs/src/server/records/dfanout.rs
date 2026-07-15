@@ -252,7 +252,7 @@ impl Record for DfanoutRecord {
         use crate::server::recgbl::{self, alarm_status};
         use crate::server::record::AlarmSeverity;
 
-        if common.udf {
+        if common.udf != 0 {
             recgbl::rec_gbl_set_sevr(common, alarm_status::UDF_ALARM, common.udfs);
             return;
         }

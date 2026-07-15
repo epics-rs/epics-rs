@@ -819,7 +819,9 @@ impl RecordInstance {
             "a record cannot hold a parked put-notify at init"
         );
         drop(deferred);
-        if self.common.udf && self.common.stat == crate::server::recgbl::alarm_status::UDF_ALARM {
+        if self.common.udf != 0
+            && self.common.stat == crate::server::recgbl::alarm_status::UDF_ALARM
+        {
             self.common.sevr = self.common.udfs;
         }
         if let Err(e) = self.record.init_record(0) {
@@ -836,11 +838,14 @@ impl RecordInstance {
         // because it is part of the same C pass: a creation path that ran the
         // passes but skipped the tail (iocsh `dbLoadRecords` did) left those
         // records UDF=1 where C has UDF=0.
-        let mut udf = self.common.udf;
+        // The `post_init_finalize_undef` hook is a cross-crate record-trait API
+        // over a `bool` (histogram/aao/mbboDirect implement it); bridge the raw
+        // `u8` carrier through it here at the single init owner.
+        let mut udf = self.common.udf != 0;
         if let Err(e) = self.record.post_init_finalize_undef(&mut udf) {
             eprintln!("post_init_finalize_undef failed for {name}: {e}");
         }
-        self.common.udf = udf;
+        self.common.udf = udf as u8;
         // C `init_record` can END with `prec->pact = TRUE` to disable a record
         // it cannot process (`subRecord.c:119-123`, an empty SNAM). PACT has one
         // owner, so the record declares the fact and the owner parks it — after
@@ -2210,7 +2215,9 @@ impl RecordInstance {
             // menu's choice strings. Storing them as `Short` is what makes
             // them eligible for that promotion — see `promote_menu_value`.
             "ACKT" => Some(EpicsValue::Short(if self.common.ackt { 1 } else { 0 })),
-            "UDF" => Some(EpicsValue::Char(if self.common.udf { 1 } else { 0 })),
+            // DBF_UCHAR: served as UChar (declared type) so the raw put byte
+            // round-trips to the wire — see the DISP/TPRO comment above.
+            "UDF" => Some(EpicsValue::UChar(self.common.udf)),
             "UDFS" => Some(EpicsValue::Short(self.common.udfs as i16)),
             "SCAN" => Some(EpicsValue::Enum(self.common.scan.to_u16())),
             "SSCN" => Some(EpicsValue::Enum(self.common.sscn.to_u16())),
@@ -2221,7 +2228,15 @@ impl RecordInstance {
             // owner (`rec_gbl_save_simm`); `special(SPC_NOMOD)` for clients.
             "OLDSIMM" => Some(EpicsValue::Short(self.common.oldsimm)),
             "PINI" => Some(EpicsValue::Short(self.common.pini.to_u16() as i16)),
-            "TPRO" => Some(EpicsValue::Char(if self.common.tpro { 1 } else { 0 })),
+            // DISP/TPRO/RPRO/UDF are `DBF_UCHAR` in `dbCommon.dbd`. Serve them
+            // as `UChar` — their DECLARED type — so `project_to_declared_type`
+            // is identity and the raw put byte reaches the wire untouched (C
+            // stores the byte and `caget` renders `DBR_CHAR` signed: 255 → -1).
+            // Serving `Char` here instead routed the value through the lossy
+            // `Char → UChar` projection (signed −1 clamped to 0), so a
+            // `caput DISP 255` read back as 0 rather than C's -1. `BKPT` is
+            // `DBF_NOACCESS`: no `FieldDesc`, no projection, served `Char`.
+            "TPRO" => Some(EpicsValue::UChar(self.common.tpro)),
             "BKPT" => Some(EpicsValue::Char(self.common.bkpt)),
             "FLNK" => Some(EpicsValue::String(self.common.flnk.clone().into())),
             // A record type whose C `.dbd` has no INP has no `.INP` channel
@@ -2256,9 +2271,9 @@ impl RecordInstance {
             "DISS" => Some(EpicsValue::Short(self.common.diss as i16)),
             "HYST" => Some(EpicsValue::Double(self.common.hyst)),
             "LCNT" => Some(EpicsValue::Short(self.common.lcnt)),
-            "DISP" => Some(EpicsValue::Char(if self.common.disp { 1 } else { 0 })),
+            "DISP" => Some(EpicsValue::UChar(self.common.disp)),
             "PUTF" => Some(EpicsValue::Char(if self.common.putf { 1 } else { 0 })),
-            "RPRO" => Some(EpicsValue::Char(if self.common.rpro { 1 } else { 0 })),
+            "RPRO" => Some(EpicsValue::UChar(self.common.rpro)),
             "PACT" => Some(EpicsValue::Char(if self.is_processing() { 1 } else { 0 })),
             "PROC" => Some(EpicsValue::Char(0)), // Always 0 (trigger-only)
             // Analog alarm fields
@@ -2597,8 +2612,11 @@ impl RecordInstance {
                 _ => return Ok(CommonFieldPutResult::NoChange),
             },
             "UDF" => {
+                // Store the raw put byte (C keeps the epicsUInt8 verbatim); a
+                // record that re-derives UDF on process overwrites it, one that
+                // sources nothing this cycle keeps it (put-defect cluster #3).
                 if let EpicsValue::Char(v) = value {
-                    self.common.udf = v != 0;
+                    self.common.udf = v;
                 }
             }
             "UDFS" => {
@@ -2647,7 +2665,7 @@ impl RecordInstance {
             }
             "TPRO" => {
                 if let EpicsValue::Char(v) = value {
-                    self.common.tpro = v != 0;
+                    self.common.tpro = v;
                 }
             }
             "BKPT" => {
@@ -2882,13 +2900,13 @@ impl RecordInstance {
             }
             "DISP" => {
                 if let EpicsValue::Char(v) = value {
-                    self.common.disp = v != 0;
+                    self.common.disp = v;
                 }
             }
             "PUTF" => return Err(CaError::ReadOnlyField("PUTF".into())),
             "RPRO" => {
                 if let EpicsValue::Char(v) = value {
-                    self.common.rpro = v != 0;
+                    self.common.rpro = v;
                 }
             }
             "PACT" => return Err(CaError::ReadOnlyField("PACT".into())),
@@ -3060,7 +3078,7 @@ impl RecordInstance {
         // out records (ao/longout/int64out/calcout) have no `AFVL` and just
         // return. Running the range check here would drift `LALM` to `val`
         // (NaN on an undefined cycle) and filter `AFVL` — both observable.
-        if self.common.udf {
+        if self.common.udf != 0 {
             if matches!(
                 self.record.record_type(),
                 "calc" | "ai" | "longin" | "int64in"
@@ -3267,7 +3285,7 @@ impl RecordInstance {
             // (past the suppress / no-sub early returns above). `sub` keeps the
             // blanket re-derive (`clears_udf` true, C `do_sub` `udf =
             // isnan(val)`), so it is deliberately not cleared here.
-            self.common.udf = false;
+            self.common.udf = 0;
         }
         Ok(status)
     }
@@ -3723,7 +3741,7 @@ impl RecordInstance {
         // `recGblCheckUDF` raises UDF_ALARM this cycle instead of the
         // record reporting a stale/garbage value with no alarm.
         if self.record.clears_udf() {
-            self.common.udf = self.record.value_is_undefined();
+            self.common.udf = self.record.value_is_undefined() as u8;
         }
         // Per-record alarm hook (C `checkAlarms()`).
         self.record.check_alarms(&mut self.common);
@@ -5976,9 +5994,9 @@ mod common_field_dbload_tests {
         put(&mut inst, "LCNT", "3");
         assert_eq!(inst.common.lcnt, 3, "field(LCNT, \"3\")");
         put(&mut inst, "DISP", "1");
-        assert!(inst.common.disp, "field(DISP, \"1\")");
+        assert!(inst.common.disp != 0, "field(DISP, \"1\")");
         put(&mut inst, "UDF", "0");
-        assert!(!inst.common.udf, "field(UDF, \"0\")");
+        assert!(inst.common.udf == 0, "field(UDF, \"0\")");
 
         // Menu-label directives (resolved via the one menu converter).
         put(&mut inst, "PRIO", "HIGH");

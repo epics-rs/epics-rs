@@ -141,7 +141,8 @@ async fn indx_put_past_the_data_empties_the_slice_and_alarms() {
             .read()
             .await
             .common
-            .udf,
+            .udf
+            != 0,
         "an empty subArray slice is UNDEFINED (C `prec->udf = !!status`)"
     );
 }

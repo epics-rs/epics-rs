@@ -309,7 +309,7 @@ pub fn wire_device_to_record(instance: &mut RecordInstance, mut dev: Box<dyn Dev
             // Clear UDF if init successfully produced a value
             // (e.g. an initial readback).
             if instance.record.val().is_some() {
-                instance.common.udf = false;
+                instance.common.udf = 0;
             }
         }
         Err(e) => {

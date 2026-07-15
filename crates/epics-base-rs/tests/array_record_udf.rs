@@ -70,7 +70,7 @@ async fn failed_sim_read_still_clears_udf_on_the_array_kinds() {
     for rec in ["SIM:AAI", "SIM:AAO", "SIM:WF"] {
         let handle = db.get_record(rec).await.unwrap();
         assert!(
-            handle.read().await.common.udf,
+            handle.read().await.common.udf != 0,
             "{rec}: undefined before the first process"
         );
 
@@ -81,7 +81,7 @@ async fn failed_sim_read_still_clears_udf_on_the_array_kinds() {
 
         let common = &handle.read().await.common;
         assert!(
-            !common.udf,
+            common.udf == 0,
             "{rec}: C `process` clears UDF after readValue whatever its status"
         );
         assert_ne!(
@@ -139,7 +139,10 @@ async fn an_undefined_waveform_carries_the_initial_udf_severity() {
         .unwrap();
 
     let handle = db.get_record("UDF:WF").await.unwrap();
-    assert!(handle.read().await.common.udf, "never processed, so UDF");
+    assert!(
+        handle.read().await.common.udf != 0,
+        "never processed, so UDF"
+    );
 
     assert_eq!(
         db.get_pv("UDF:WF.SEVR").await.unwrap().to_f64(),

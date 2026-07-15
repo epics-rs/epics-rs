@@ -91,13 +91,14 @@ async fn constant_array_inp_is_loaded_at_init() {
         Some(3.0)
     );
     assert!(
-        !db.get_record("CONST:AAI")
+        db.get_record("CONST:AAI")
             .await
             .unwrap()
             .read()
             .await
             .common
-            .udf,
+            .udf
+            == 0,
         "a record loaded from a constant link is DEFINED"
     );
 

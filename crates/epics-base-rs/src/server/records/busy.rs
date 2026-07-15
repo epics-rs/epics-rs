@@ -52,44 +52,6 @@ impl From<Ivoa> for i16 {
     }
 }
 
-/// Alarm severity for ZSV/OSV/COSV fields
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum AlarmSevr {
-    #[default]
-    None = 0,
-    Minor = 1,
-    Major = 2,
-    Invalid = 3,
-}
-
-impl From<i16> for AlarmSevr {
-    fn from(v: i16) -> Self {
-        match v {
-            1 => Self::Minor,
-            2 => Self::Major,
-            3 => Self::Invalid,
-            _ => Self::None,
-        }
-    }
-}
-
-impl From<AlarmSevr> for i16 {
-    fn from(v: AlarmSevr) -> Self {
-        v as i16
-    }
-}
-
-impl AlarmSevr {
-    pub fn to_base(self) -> crate::server::record::AlarmSeverity {
-        match self {
-            Self::None => crate::server::record::AlarmSeverity::NoAlarm,
-            Self::Minor => crate::server::record::AlarmSeverity::Minor,
-            Self::Major => crate::server::record::AlarmSeverity::Major,
-            Self::Invalid => crate::server::record::AlarmSeverity::Invalid,
-        }
-    }
-}
-
 /// EPICS busy record implementation.
 ///
 /// A busy record is a binary output variant that tracks asynchronous operation
@@ -105,10 +67,13 @@ pub struct BusyRecord {
     pub onam: PvString,
     // Timing
     pub high: f64,
-    // Alarms
-    pub zsv: AlarmSevr,
-    pub osv: AlarmSevr,
-    pub cosv: AlarmSevr,
+    // Alarms — ZSV/OSV/COSV are DBF_MENU menu(menuAlarmSevr) (busyRecord.dbd:87-
+    // 107). Stored as the RAW epicsEnum16 ordinal, not a clamped enum, exactly as
+    // bo does: a numeric `caput .ZSV 4`/`-1` (→65535) must round-trip and its raw
+    // ordinal drives the STATE alarm precedence (see check_alarms).
+    pub zsv: i16,
+    pub osv: i16,
+    pub cosv: i16,
     pub lalm: u16,
     // Invalid output
     pub ivoa: Ivoa,
@@ -139,9 +104,6 @@ pub struct BusyRecord {
     // next (timer-driven) process() forces VAL=0, mirroring C
     // boRecord.c::myCallbackFunc.
     high_reset_pending: bool,
-    // Internal alarm state (highest severity from the last
-    // check_alarms() — STATE vs COS). Retained for inspection/tests.
-    nsev: AlarmSevr,
     // VAL change gate. C
     // busyRecord.c:365-369 monitor() raises DBE_VALUE|DBE_LOG for VAL only
     // when `mlst != val`. Captured in the monitor() owner during process()
@@ -157,9 +119,9 @@ impl Default for BusyRecord {
             znam: PvString::from("Done"),
             onam: PvString::from("Busy"),
             high: 0.0,
-            zsv: AlarmSevr::None,
-            osv: AlarmSevr::None,
-            cosv: AlarmSevr::None,
+            zsv: 0,
+            osv: 0,
+            cosv: 0,
             lalm: 0,
             ivoa: Ivoa::ContinueNormally,
             ivov: 0,
@@ -176,7 +138,6 @@ impl Default for BusyRecord {
             siol: String::new(),
             sims: 0,
             high_reset_pending: false,
-            nsev: AlarmSevr::None,
             value_changed: false,
         }
     }
@@ -194,24 +155,6 @@ impl BusyRecord {
         } else {
             self.rval = self.val as u32;
         }
-    }
-
-    /// Compute the highest alarm severity for the current VAL —
-    /// STATE (ZSV/OSV) vs COS (COSV). Records the result in `nsev`
-    /// but does NOT advance `lalm`; the COS state transition is owned
-    /// by the trait `check_alarms` so it happens exactly once per
-    /// process cycle (mirroring C `busyRecord.c::checkAlarms`).
-    fn compute_state_severity(&mut self) -> AlarmSevr {
-        let mut max_sev = AlarmSevr::None;
-        let state_sev = if self.val == 0 { self.zsv } else { self.osv };
-        if (state_sev as u16) > (max_sev as u16) {
-            max_sev = state_sev;
-        }
-        if self.val != self.lalm && (self.cosv as u16) > (max_sev as u16) {
-            max_sev = self.cosv;
-        }
-        self.nsev = max_sev;
-        max_sev
     }
 
     /// Update monitoring fields.
@@ -232,6 +175,26 @@ impl BusyRecord {
 impl Record for BusyRecord {
     fn record_type(&self) -> &'static str {
         "busy"
+    }
+
+    /// C `busyRecord.c:195-208`: `process()` clears `udf` to FALSE only on a
+    /// successful closed-loop DOL fetch (`if(status==0){ prec->val = val;
+    /// prec->udf = FALSE; }`, `:202-204`); a bare (no-DOL) record reads the
+    /// stored VAL and leaves `udf` alone, so `checkAlarms` (`:337`) raises
+    /// UDF_ALARM every cycle. busy is boRecord's process verbatim here — it
+    /// never re-derives `udf` from the stored VAL, so it opts out of the
+    /// framework's blanket per-cycle clear (mirrors [`bo`](super::bo)).
+    fn clears_udf(&self) -> bool {
+        false
+    }
+
+    /// C `busyRecord.c:337` tests `if (prec->udf == TRUE)` — exact-one. Combined
+    /// with `clears_udf() == false`, a direct `caput X.UDF 255` (or `-1`, stored
+    /// `255`) leaves `udf == 255` at `checkAlarms`, and `255 != TRUE`, so C
+    /// raises NO UDF_ALARM — STAT/SEVR stay `NO_ALARM`. bo shares this
+    /// (`boRecord.c:371`); see [`Record::udf_alarm_on_exact_one`].
+    fn udf_alarm_on_exact_one(&self) -> bool {
+        true
     }
 
     /// W10-E5. `busyRecord.c:397-400` — a failed SIML read returns from
@@ -285,11 +248,10 @@ impl Record for BusyRecord {
         // Step 3: Save current VAL before write (for FLNK decision)
         self.oval = self.val;
 
-        // Step 4: precompute alarm severity for inspection (the real
-        // alarm raising is in the trait check_alarms() hook, and the
-        // INVALID-output IVOA policy is enforced by the framework
-        // which gates the OUT write on common.sevr == Invalid).
-        self.compute_state_severity();
+        // Step 4: alarm raising is owned by the trait check_alarms() hook (STATE
+        // vs COS, raw menu ordinals), and the INVALID-output IVOA policy is
+        // enforced by the framework which gates the OUT write on
+        // common.sevr == Invalid.
 
         // Step 5: Monitor
         self.monitor();
@@ -308,22 +270,39 @@ impl Record for BusyRecord {
         Ok(ProcessOutcome::complete_with(actions))
     }
 
-    /// C `busyRecord.c::checkAlarms` (bo variant) — STATE alarm
-    /// (ZSV for VAL=0, OSV for VAL=1) and COS alarm (COSV). Raising
-    /// these into `common` lets the framework's IVOA handler gate the
-    /// OUT-link write: with SEVR=INVALID and IVOA="Don't drive", the
-    /// framework's `skip_out` path suppresses the write entirely.
+    /// C `busyRecord.c::checkAlarms` (`:332-357`, boRecord's verbatim) — the UDF
+    /// alarm FIRST, then the STATE alarm (ZSV for VAL=0, OSV for VAL=1), then COS
+    /// (COSV). The udf raise must lead: C `recGblSetSevr` overrides STAT/SEVR only
+    /// on a strictly greater severity, so on a fresh record with `UDFS == INVALID`
+    /// the equal-severity STATE alarm cannot displace the UDF that was set first —
+    /// STAT stays UDF. busy does NOT early-return on UDF, so STATE/COS still
+    /// evaluate. Raising it here (idempotent with the framework's
+    /// `rec_gbl_check_udf`, which runs after this hook) is what puts UDF ahead of
+    /// STATE. Raising STATE=INVALID into `common` also lets the framework's IVOA
+    /// handler gate the OUT-link write (IVOA="Don't drive" → `skip_out`).
     fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
         use crate::server::recgbl::{self, alarm_status};
+        use crate::server::record::AlarmSeverity;
 
-        let state_sev = if self.val == 0 { self.zsv } else { self.osv };
-        if state_sev != AlarmSevr::None {
-            recgbl::rec_gbl_set_sevr(common, alarm_status::STATE_ALARM, state_sev.to_base());
+        // C `busyRecord.c:337` — `if (prec->udf == TRUE)` (exact-one, see
+        // `udf_alarm_on_exact_one`), raised before STATE with no early return.
+        if recgbl::udf_alarm_active(common.udf, true) {
+            recgbl::rec_gbl_set_sevr(
+                common,
+                alarm_status::UDF_ALARM,
+                AlarmSeverity::from_u16(common.udfs as u16),
+            );
         }
+
+        // STATE/COS use the RAW severity ordinal (ZSV/OSV/COSV are DBF_MENU
+        // stored raw i16): C `recGblSetSevr(prec, STATE_ALARM, prec->zsv)`
+        // compares the raw `epicsEnum16`, so an out-of-range `ZSV=4`/`65535`
+        // numerically exceeds a prior UDF's INVALID(3) and overrides it (see
+        // `rec_gbl_set_sevr_raw`). `raw_sevr == 0` is a no-op. Mirrors bo.
+        let state_sev = if self.val == 0 { self.zsv } else { self.osv };
+        recgbl::rec_gbl_set_sevr_raw(common, alarm_status::STATE_ALARM, state_sev as u16);
         if self.val != self.lalm {
-            if self.cosv != AlarmSevr::None {
-                recgbl::rec_gbl_set_sevr(common, alarm_status::COS_ALARM, self.cosv.to_base());
-            }
+            recgbl::rec_gbl_set_sevr_raw(common, alarm_status::COS_ALARM, self.cosv as u16);
             self.lalm = self.val;
         }
     }
@@ -347,9 +326,9 @@ impl Record for BusyRecord {
             "ZNAM" => Some(EpicsValue::String(self.znam.clone())),
             "ONAM" => Some(EpicsValue::String(self.onam.clone())),
             "HIGH" => Some(EpicsValue::Double(self.high)),
-            "ZSV" => Some(EpicsValue::Short(self.zsv.into())),
-            "OSV" => Some(EpicsValue::Short(self.osv.into())),
-            "COSV" => Some(EpicsValue::Short(self.cosv.into())),
+            "ZSV" => Some(EpicsValue::Short(self.zsv)),
+            "OSV" => Some(EpicsValue::Short(self.osv)),
+            "COSV" => Some(EpicsValue::Short(self.cosv)),
             "LALM" => Some(EpicsValue::Enum(self.lalm)),
             "IVOA" => Some(EpicsValue::Short(self.ivoa.into())),
             "IVOV" => Some(EpicsValue::Enum(self.ivov)),
@@ -426,9 +405,13 @@ impl Record for BusyRecord {
                     Err(CaError::TypeMismatch(name.to_string()))
                 }
             }
+            // ZSV/OSV/COSV are DBF_MENU menu(menuAlarmSevr): store the RAW
+            // epicsEnum16 ordinal the central menu converter resolved, mirroring
+            // bo — an out-of-range numeric put keeps its bit pattern so it
+            // round-trips and drives the raw STATE-alarm precedence.
             "ZSV" => {
                 if let EpicsValue::Short(v) = value {
-                    self.zsv = AlarmSevr::from(v);
+                    self.zsv = v;
                     Ok(())
                 } else {
                     Err(CaError::TypeMismatch(name.to_string()))
@@ -436,7 +419,7 @@ impl Record for BusyRecord {
             }
             "OSV" => {
                 if let EpicsValue::Short(v) = value {
-                    self.osv = AlarmSevr::from(v);
+                    self.osv = v;
                     Ok(())
                 } else {
                     Err(CaError::TypeMismatch(name.to_string()))
@@ -444,7 +427,7 @@ impl Record for BusyRecord {
             }
             "COSV" => {
                 if let EpicsValue::Short(v) = value {
-                    self.cosv = AlarmSevr::from(v);
+                    self.cosv = v;
                     Ok(())
                 } else {
                     Err(CaError::TypeMismatch(name.to_string()))
@@ -599,9 +582,9 @@ mod tests {
         assert_eq!(rec.znam, "Done");
         assert_eq!(rec.onam, "Busy");
         assert_eq!(rec.high, 0.0);
-        assert_eq!(rec.zsv, AlarmSevr::None);
-        assert_eq!(rec.osv, AlarmSevr::None);
-        assert_eq!(rec.cosv, AlarmSevr::None);
+        assert_eq!(rec.zsv, 0);
+        assert_eq!(rec.osv, 0);
+        assert_eq!(rec.cosv, 0);
         assert_eq!(rec.ivoa, Ivoa::ContinueNormally);
         assert_eq!(rec.omsl, Omsl::Supervisory);
         assert_eq!(rec.mlst, 0);
@@ -824,37 +807,90 @@ mod tests {
 
     #[test]
     fn test_state_alarm_zsv() {
+        use crate::server::record::{AlarmSeverity, CommonFields};
         let mut rec = BusyRecord::new();
-        rec.zsv = AlarmSevr::Minor;
+        rec.zsv = 1; // MINOR
         rec.val = 0;
-        rec.process().unwrap();
-        assert_eq!(rec.nsev, AlarmSevr::Minor);
+        // Clear the default UDF to isolate the STATE path (as bo_state_alarm_osv).
+        let mut common = CommonFields {
+            udf: 0,
+            ..Default::default()
+        };
+        rec.check_alarms(&mut common);
+        assert_eq!(common.nsev, AlarmSeverity::Minor);
+        assert_eq!(
+            common.nsta,
+            crate::server::recgbl::alarm_status::STATE_ALARM
+        );
     }
 
     #[test]
     fn test_state_alarm_osv() {
+        use crate::server::record::{AlarmSeverity, CommonFields};
         let mut rec = BusyRecord::new();
-        rec.osv = AlarmSevr::Major;
+        rec.osv = 2; // MAJOR
         rec.val = 1;
-        rec.process().unwrap();
-        assert_eq!(rec.nsev, AlarmSevr::Major);
+        let mut common = CommonFields {
+            udf: 0,
+            ..Default::default()
+        };
+        rec.check_alarms(&mut common);
+        assert_eq!(common.nsev, AlarmSeverity::Major);
+        assert_eq!(
+            common.nsta,
+            crate::server::recgbl::alarm_status::STATE_ALARM
+        );
+    }
+
+    /// A numeric `caput .ZSV 4` stores the raw out-of-range ordinal (busy is a
+    /// DBF_MENU stored as raw i16). C hands it straight to `recGblSetSevr`, so a
+    /// raw ordinal numerically greater than a prior UDF's INVALID(3) overrides
+    /// it: STAT becomes STATE (the displayed SEVR still clamps to INVALID).
+    #[test]
+    fn test_state_alarm_raw_ordinal_overrides_udf() {
+        use crate::server::record::{AlarmSeverity, CommonFields};
+        let mut rec = BusyRecord::new();
+        rec.put_field("ZSV", EpicsValue::Short(4)).unwrap();
+        assert_eq!(
+            rec.get_field("ZSV"),
+            Some(EpicsValue::Short(4)),
+            "raw round-trip"
+        );
+        rec.val = 0;
+        let mut common = CommonFields::default(); // udf=1, udfs=INVALID
+        rec.check_alarms(&mut common);
+        assert_eq!(
+            common.nsta,
+            crate::server::recgbl::alarm_status::STATE_ALARM,
+            "raw ZSV=4 > UDF's INVALID(3) overrides the UDF that was set first"
+        );
+        assert_eq!(common.nsev, AlarmSeverity::Invalid, "displayed SEVR clamps");
     }
 
     #[test]
     fn test_cos_alarm() {
         use crate::server::record::CommonFields;
         let mut rec = BusyRecord::new();
-        rec.cosv = AlarmSevr::Minor;
+        rec.cosv = 1; // MINOR
         rec.lalm = 0;
         rec.val = 1; // changed from lalm=0
-        let mut common = CommonFields::default();
+        // C `busyRecord.c:337` raises UDF_ALARM (at UDFS=INVALID) before COS;
+        // `CommonFields::default()` has udf=1, so clear it to isolate the COS
+        // path (as the bi/bo parity tests do).
+        let mut common = CommonFields {
+            udf: 0,
+            ..Default::default()
+        };
         rec.check_alarms(&mut common);
         // COS alarm fires and advances lalm.
         assert_eq!(rec.lalm, 1);
         assert_eq!(common.nsev, crate::server::record::AlarmSeverity::Minor);
 
         // Same val — no COS change.
-        let mut common2 = CommonFields::default();
+        let mut common2 = CommonFields {
+            udf: 0,
+            ..Default::default()
+        };
         rec.check_alarms(&mut common2);
         assert_eq!(rec.lalm, 1);
         assert_eq!(common2.nsev, crate::server::record::AlarmSeverity::NoAlarm);
@@ -862,14 +898,21 @@ mod tests {
 
     #[test]
     fn test_cos_alarm_severity() {
+        use crate::server::record::{AlarmSeverity, CommonFields};
         let mut rec = BusyRecord::new();
-        rec.cosv = AlarmSevr::Major;
-        rec.osv = AlarmSevr::Minor;
+        rec.cosv = 2; // MAJOR
+        rec.osv = 1; // MINOR
         rec.lalm = 0;
         rec.val = 1;
-        rec.process().unwrap();
-        // COS (Major) > OSV (Minor), so nsev should be Major
-        assert_eq!(rec.nsev, AlarmSevr::Major);
+        // Clear the default UDF to isolate STATE/COS.
+        let mut common = CommonFields {
+            udf: 0,
+            ..Default::default()
+        };
+        rec.check_alarms(&mut common);
+        // COS (Major) > OSV (Minor), so the raised severity is Major, at COS.
+        assert_eq!(common.nsev, AlarmSeverity::Major);
+        assert_eq!(common.nsta, crate::server::recgbl::alarm_status::COS_ALARM);
     }
 
     #[test]
@@ -1001,9 +1044,14 @@ mod tests {
     fn test_check_alarms_raises_invalid_state() {
         use crate::server::record::{AlarmSeverity, CommonFields};
         let mut rec = BusyRecord::new();
-        rec.osv = AlarmSevr::Invalid;
+        rec.osv = 3; // INVALID
         rec.val = 1;
-        let mut common = CommonFields::default();
+        // Clear the default UDF (udf=1) to isolate the STATE path; the UDF-first
+        // precedence is covered by `check_alarms_udf_precedes_state`.
+        let mut common = CommonFields {
+            udf: 0,
+            ..Default::default()
+        };
         rec.check_alarms(&mut common);
         // INVALID state severity propagates into common — the
         // framework's IVOA "Don't drive" then suppresses the OUT write.
@@ -1014,12 +1062,39 @@ mod tests {
         );
     }
 
+    /// C `busyRecord.c::checkAlarms:337-350` raises UDF_ALARM (at UDFS=INVALID)
+    /// BEFORE the STATE alarm, and `recGblSetSevr` overrides only on a strictly
+    /// greater severity — so on a `udf=1` record the equal-severity INVALID STATE
+    /// alarm cannot displace it: STAT stays UDF. This is the divergence the
+    /// oracle saw as `stat C='UDF' port='NO_ALARM'` after a `pp(TRUE)` put.
+    #[test]
+    fn check_alarms_udf_precedes_state() {
+        use crate::server::record::{AlarmSeverity, CommonFields};
+        let mut rec = BusyRecord::new();
+        rec.osv = 3; // INVALID
+        rec.val = 1;
+        // Default udf=1 (a fresh, never-DOL-sourced record).
+        let mut common = CommonFields::default();
+        rec.check_alarms(&mut common);
+        assert_eq!(common.nsev, AlarmSeverity::Invalid);
+        assert_eq!(
+            common.nsta,
+            crate::server::recgbl::alarm_status::UDF_ALARM,
+            "UDF is raised first and the equal-severity STATE cannot displace it"
+        );
+    }
+
     #[test]
     fn test_check_alarms_no_alarm_when_severities_unset() {
         use crate::server::record::{AlarmSeverity, CommonFields};
         let mut rec = BusyRecord::new();
         rec.val = 0;
-        let mut common = CommonFields::default();
+        // Clear the default UDF (udf=1) so this exercises the "no severity set"
+        // path rather than the UDF alarm.
+        let mut common = CommonFields {
+            udf: 0,
+            ..Default::default()
+        };
         rec.check_alarms(&mut common);
         assert_eq!(common.nsev, AlarmSeverity::NoAlarm);
     }

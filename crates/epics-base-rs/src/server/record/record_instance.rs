@@ -3258,6 +3258,16 @@ impl RecordInstance {
                 .map(|f| AlarmSeverity::from_u16(f as u16))
                 .unwrap_or(AlarmSeverity::NoAlarm);
             recgbl::rec_gbl_set_sevr(&mut self.common, alarm_status::SOFT_ALARM, brsv);
+        } else if self.record.record_type() == "aSub" {
+            // C `aSubRecord.c::do_sub` (469-470): a subroutine that ran and
+            // returned `>= 0` DEFINES the record — `else prec->udf = FALSE`.
+            // aSub opts out of the framework's per-cycle blanket UDF re-derive
+            // (`Record::clears_udf` == false), so THIS is aSub's UDF clear,
+            // reached only on the path where the subroutine actually executed
+            // (past the suppress / no-sub early returns above). `sub` keeps the
+            // blanket re-derive (`clears_udf` true, C `do_sub` `udf =
+            // isnan(val)`), so it is deliberately not cleared here.
+            self.common.udf = false;
         }
         Ok(status)
     }

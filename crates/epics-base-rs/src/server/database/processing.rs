@@ -2855,7 +2855,32 @@ impl PvDatabase {
             // This MUST run before `evaluate_alarms()` (which calls
             // `rec_gbl_check_udf`): C records set `prec->udf` inside
             // `process()` before `checkAlarms()` runs.
-            if instance.record.clears_udf() {
+            //
+            // The re-derive fires only when a value was actually SOURCED or
+            // RECOMPUTED this cycle — the C invariant. Two record classes
+            // reach it:
+            //   * `clears_udf()` true: records whose C `process()` re-derives
+            //     UDF UNCONDITIONALLY every cycle, whatever the read did
+            //     (`aiRecord.c:161` `if(status==0) prec->udf = isnan(val)`,
+            //     with a soft read's `status==2` folded to 0 — so a constant
+            //     INP still re-derives). ai/ao/bi/longin/calc/mbbi… .
+            //   * `device_did_compute`: a value was sourced this cycle — a
+            //     real soft-channel INP read landed a value, or device
+            //     support's `read()` computed one. This is how the
+            //     sourced-only records (`clears_udf()` false: stringin, bo,
+            //     longout, …) get their UDF cleared on a genuine read, exactly
+            //     like C `devSiSoft.c::read_stringin` clears UDF only inside
+            //     the `!dbLinkIsConstant` read branch.
+            //
+            // A cycle that sources nothing — e.g. a `caput UDF x` that drove
+            // processing on a Passive record with a constant/empty INP — must
+            // NOT re-derive UDF on a sourced-only record: the client's UDF put
+            // stands (softIoc-verified: `caput REC.UDF 1` keeps UDF=1 for
+            // stringin/lso/bo/longout, unlike ai/longin which re-derive to 0).
+            // DOL-sourced output records clear UDF in their own DOL branch
+            // above; the subroutine records (aSub) clear it in the subroutine
+            // run (C `do_sub`), so neither needs `device_did_compute` here.
+            if instance.record.clears_udf() || device_did_compute {
                 instance.common.udf = instance.record.value_is_undefined();
             }
 

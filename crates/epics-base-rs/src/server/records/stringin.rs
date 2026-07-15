@@ -111,6 +111,29 @@ impl Record for StringinRecord {
         (self.mpst == MENU_POST_ALWAYS, self.apst == MENU_POST_ALWAYS)
     }
 
+    /// `stringinRecord.c::process` has NO unconditional UDF re-derive — unlike
+    /// `aiRecord.c:161` it never runs `prec->udf = isnan(prec->val)`. UDF is
+    /// cleared ONLY inside `devSiSoft.c::read_stringin` on a real read:
+    /// `if (!status && !dbLinkIsConstant(&prec->inp)) prec->udf = FALSE`
+    /// (and the SIOL simulation branch, `stringinRecord.c:209-211`). So a
+    /// process cycle that sources nothing — e.g. a `caput .UDF 1` driving a
+    /// Passive record with a constant/empty INP — must leave the client's UDF
+    /// put intact. The framework clears UDF on a genuine soft read via
+    /// `device_did_compute`; this opts out of the per-cycle blanket re-derive,
+    /// exactly like `stringout`/`lso`/`bo`/`longout`.
+    fn clears_udf(&self) -> bool {
+        false
+    }
+
+    /// `stringinRecord.c` has NO `recGblCheckUdf` / `UDF_ALARM` (unlike
+    /// `stringoutRecord.c:147`): an undefined stringin raises no alarm from UDF
+    /// (softIoc: `record(stringin,"X"){}` → UDF 1, STAT/SEVR = NO_ALARM). With
+    /// `clears_udf` false, UDF can now legitimately stay 1, so this MUST be
+    /// false or `rec_gbl_check_udf` would invent an alarm C never raises.
+    fn raises_udf_alarm(&self) -> bool {
+        false
+    }
+
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         // C `stringinRecord.c::monitor` copies VAL into OVAL — but only on the
         // `strncmp` mismatch that also raises DBE_VALUE|DBE_LOG. Capture the

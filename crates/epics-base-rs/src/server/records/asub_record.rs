@@ -233,6 +233,29 @@ impl Record for ASubRecord {
         "aSub"
     }
 
+    /// `aSubRecord.c::process` has no unconditional UDF re-derive: UDF is
+    /// cleared only inside `do_sub` when the subroutine actually ran and
+    /// returned `>= 0` (`aSubRecord.c:469-470` `prec->udf = FALSE`). The
+    /// framework performs that clear in `run_registered_subroutine` (C
+    /// `do_sub`'s home); a process cycle that runs no subroutine — e.g. a
+    /// `caput .UDF 1` on a Passive record with no SNAM — sources nothing and
+    /// must keep the client's UDF put. Opt out of the per-cycle blanket
+    /// re-derive.
+    fn clears_udf(&self) -> bool {
+        false
+    }
+
+    /// `aSubRecord.c` has NO `recGblCheckUdf` anywhere — an undefined aSub
+    /// raises NO alarm from UDF (softIoc: a fresh `record(aSub,"X"){}` reports
+    /// UDF 1 with STAT/SEVR = NO_ALARM, unlike `sub` which raises UDF/INVALID).
+    /// With `clears_udf` false, UDF can now legitimately stay 1 on a cycle that
+    /// sourced nothing (or on a negative `do_sub` status), so this MUST be false
+    /// or the framework's `rec_gbl_check_udf` would invent an alarm C never
+    /// raises. See [`Record::raises_udf_alarm`]; same shape as `event`/`swait`.
+    fn raises_udf_alarm(&self) -> bool {
+        false
+    }
+
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         // Subroutine is invoked externally via RecordInstance.subroutine.
         Ok(ProcessOutcome::complete())

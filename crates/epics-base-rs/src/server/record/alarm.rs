@@ -22,16 +22,28 @@ impl AlarmSeverity {
 }
 
 /// Analog alarm configuration — only for ai/ao/longin/longout.
+///
+/// The four severity selectors (`HHSV`/`HSV`/`LSV`/`LLSV`, each
+/// `DBF_MENU menu(menuAlarmSevr)`) hold the **raw stored ordinal**, not a
+/// clamped [`AlarmSeverity`]. C stores whatever `(epicsEnum16)` a numeric put
+/// truncates to (`dbConvert.c::putDoubleEnum` = `*pfield = (epicsEnum16)val`),
+/// so `caput REC.HSV 4` keeps `4` and `caput REC.HSV -1` keeps `65535` — both
+/// wire-visible and both used verbatim to derive the alarm (C's `if (prec->hsv)`
+/// is a nonzero test, and `recGblResetAlarms` clamps the resulting `nsev` to
+/// `INVALID_ALARM`, not the field). Modeled as `i16` so the 16-bit pattern
+/// round-trips, matching sel/dfanout's already-raw `hhsv`/… fields; read the
+/// alarm meaning with `AlarmSeverity::from_u16(field as u16)` and the C nonzero
+/// enable with `field != 0`.
 #[derive(Clone, Debug)]
 pub struct AnalogAlarmConfig {
     pub hihi: f64,
     pub high: f64,
     pub low: f64,
     pub lolo: f64,
-    pub hhsv: AlarmSeverity,
-    pub hsv: AlarmSeverity,
-    pub lsv: AlarmSeverity,
-    pub llsv: AlarmSeverity,
+    pub hhsv: i16,
+    pub hsv: i16,
+    pub lsv: i16,
+    pub llsv: i16,
 }
 
 impl Default for AnalogAlarmConfig {
@@ -41,10 +53,10 @@ impl Default for AnalogAlarmConfig {
             high: 0.0,
             low: 0.0,
             lolo: 0.0,
-            hhsv: AlarmSeverity::NoAlarm,
-            hsv: AlarmSeverity::NoAlarm,
-            lsv: AlarmSeverity::NoAlarm,
-            llsv: AlarmSeverity::NoAlarm,
+            hhsv: 0,
+            hsv: 0,
+            lsv: 0,
+            llsv: 0,
         }
     }
 }

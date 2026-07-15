@@ -378,7 +378,13 @@ fn cmd_dbpr() -> CommandDef {
                     if !inst.common.flnk.is_empty() {
                         fields.push(("FLNK".to_string(), inst.common.flnk.clone()));
                     }
-                    fields.push(("PINI".to_string(), format!("{}", inst.common.pini)));
+                    fields.push((
+                        "PINI".to_string(),
+                        format!(
+                            "{}",
+                            crate::server::record::PiniMode::from_u16(inst.common.pini as u16)
+                        ),
+                    ));
                     fields.push(("UDF".to_string(), format!("{}", inst.common.udf)));
                 }
 

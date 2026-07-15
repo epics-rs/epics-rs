@@ -344,7 +344,7 @@ pub fn rec_gbl_check_udf(common: &mut CommonFields) {
         rec_gbl_set_sevr_msg(
             common,
             alarm_status::UDF_ALARM,
-            common.udfs,
+            AlarmSeverity::from_u16(common.udfs as u16),
             "UDF: record not initialized",
         );
     }
@@ -492,7 +492,7 @@ mod tests {
     fn test_check_udf_uses_udfs() {
         let mut common = CommonFields::default();
         assert!(common.udf != 0);
-        common.udfs = AlarmSeverity::Minor;
+        common.udfs = AlarmSeverity::Minor as i16;
         rec_gbl_check_udf(&mut common);
         assert_eq!(common.nsev, AlarmSeverity::Minor);
         assert_eq!(common.nsta, alarm_status::UDF_ALARM);
@@ -501,7 +501,7 @@ mod tests {
     #[test]
     fn test_check_udf_default_udfs_is_invalid() {
         let common = CommonFields::default();
-        assert_eq!(common.udfs, AlarmSeverity::Invalid);
+        assert_eq!(common.udfs, AlarmSeverity::Invalid as i16);
     }
 
     // ----- AMSG / NAMSG (epics-base PR #568 / #566) -----

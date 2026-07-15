@@ -165,10 +165,10 @@ fn ai_alarm_thresholds() {
         high: 70.0,
         low: 30.0,
         lolo: 10.0,
-        hhsv: AlarmSeverity::Major,
-        hsv: AlarmSeverity::Minor,
-        lsv: AlarmSeverity::Minor,
-        llsv: AlarmSeverity::Major,
+        hhsv: AlarmSeverity::Major as i16,
+        hsv: AlarmSeverity::Minor as i16,
+        lsv: AlarmSeverity::Minor as i16,
+        llsv: AlarmSeverity::Major as i16,
     });
 
     // Process to clear UDF alarm first
@@ -574,7 +574,7 @@ fn udf_alarm_on_uninit() {
     let inst = RecordInstance::new("TEST:udf".to_string(), rec);
 
     assert!(inst.common.udf != 0, "UDF should be true on new record");
-    assert_eq!(inst.common.udfs, AlarmSeverity::Invalid);
+    assert_eq!(inst.common.udfs, AlarmSeverity::Invalid as i16);
 }
 
 /// Multiple record types: field list completeness
@@ -1981,13 +1981,13 @@ async fn pini_flag() {
     // Set PINI
     if let Some(rec) = db.get_record("pini_rec").await {
         let mut inst = rec.write().await;
-        inst.common.pini = PiniMode::Yes;
+        inst.common.pini = PiniMode::Yes as i16;
     }
 
     // Verify PINI is set
     if let Some(rec) = db.get_record("pini_rec").await {
         let inst = rec.read().await;
-        assert_eq!(inst.common.pini, PiniMode::Yes, "PINI should be YES");
+        assert_eq!(inst.common.pini, PiniMode::Yes as i16, "PINI should be YES");
     }
     // `pini_records()` is the `piniProcess(menuPiniYES)` pass — it selects the
     // exact menu index, so only YES records are in it.

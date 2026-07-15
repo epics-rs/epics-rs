@@ -1197,10 +1197,10 @@ fn test_deadband_alarm_on_change_bypasses_value_deadband() {
         high: 0.5,
         low: -1000.0,
         lolo: -2000.0,
-        hhsv: AlarmSeverity::Major,
-        hsv: AlarmSeverity::Major,
-        lsv: AlarmSeverity::Minor,
-        llsv: AlarmSeverity::Major,
+        hhsv: AlarmSeverity::Major as i16,
+        hsv: AlarmSeverity::Major as i16,
+        lsv: AlarmSeverity::Minor as i16,
+        llsv: AlarmSeverity::Major as i16,
     });
 
     instance.record.set_val(EpicsValue::Double(1.0)).unwrap();
@@ -1351,10 +1351,10 @@ fn test_acks_posts_once_with_dbe_value_only() {
         high: 0.5,
         low: -1000.0,
         lolo: -2000.0,
-        hhsv: AlarmSeverity::Major,
-        hsv: AlarmSeverity::Major,
-        lsv: AlarmSeverity::Minor,
-        llsv: AlarmSeverity::Major,
+        hhsv: AlarmSeverity::Major as i16,
+        hsv: AlarmSeverity::Major as i16,
+        lsv: AlarmSeverity::Minor as i16,
+        llsv: AlarmSeverity::Major as i16,
     });
 
     instance.record.set_val(EpicsValue::Double(1.0)).unwrap();
@@ -1432,10 +1432,10 @@ fn test_alarm_cycle_does_not_fan_out_for_default_records() {
         high: 0.5,
         low: -1000.0,
         lolo: -2000.0,
-        hhsv: AlarmSeverity::Major,
-        hsv: AlarmSeverity::Major,
-        lsv: AlarmSeverity::Minor,
-        llsv: AlarmSeverity::Major,
+        hhsv: AlarmSeverity::Major as i16,
+        hsv: AlarmSeverity::Major as i16,
+        lsv: AlarmSeverity::Minor as i16,
+        llsv: AlarmSeverity::Major as i16,
     });
     let _rval_rx = instance
         .add_subscriber("RVAL", 1, DbFieldType::Long, EventMask::ALARM.bits())
@@ -1512,10 +1512,10 @@ fn test_ai_rval_alarm_only_cycle_posts_alarm_mask_not_value_log() {
         high: 0.5,
         low: -1000.0,
         lolo: -2000.0,
-        hhsv: AlarmSeverity::Major,
-        hsv: AlarmSeverity::Major,
-        lsv: AlarmSeverity::Minor,
-        llsv: AlarmSeverity::Major,
+        hhsv: AlarmSeverity::Major as i16,
+        hsv: AlarmSeverity::Major as i16,
+        lsv: AlarmSeverity::Minor as i16,
+        llsv: AlarmSeverity::Major as i16,
     });
     let _rval_rx = instance
         .add_subscriber("RVAL", 1, DbFieldType::Long, EventMask::ALARM.bits())
@@ -1560,10 +1560,10 @@ fn test_ai_udf_cycle_leaves_lalm_and_zeroes_afvl() {
         high: 0.5,
         low: -1000.0,
         lolo: -2000.0,
-        hhsv: AlarmSeverity::Major,
-        hsv: AlarmSeverity::Major,
-        lsv: AlarmSeverity::Minor,
-        llsv: AlarmSeverity::Major,
+        hhsv: AlarmSeverity::Major as i16,
+        hsv: AlarmSeverity::Major as i16,
+        lsv: AlarmSeverity::Minor as i16,
+        llsv: AlarmSeverity::Major as i16,
     });
     // Seed LALM/AFVL to sentinels, then force a UDF cycle.
     instance
@@ -2082,10 +2082,10 @@ fn test_snapshot_ai_with_display_metadata() {
         high: 80.0,
         low: -20.0,
         lolo: -40.0,
-        hhsv: AlarmSeverity::Major,
-        hsv: AlarmSeverity::Minor,
-        lsv: AlarmSeverity::Minor,
-        llsv: AlarmSeverity::Major,
+        hhsv: AlarmSeverity::Major as i16,
+        hsv: AlarmSeverity::Minor as i16,
+        lsv: AlarmSeverity::Minor as i16,
+        llsv: AlarmSeverity::Major as i16,
     });
 
     let snap = inst.snapshot_for_field("VAL").unwrap();
@@ -2273,9 +2273,9 @@ fn test_snapshot_dbcommon_menu_fields_serve_as_enum() {
     inst.common.nsta = 17; // UDF
     inst.common.acks = AlarmSeverity::Invalid;
     inst.common.ackt = false;
-    inst.common.diss = AlarmSeverity::Minor;
-    inst.common.udfs = AlarmSeverity::Invalid;
-    inst.common.pini = PiniMode::Run;
+    inst.common.diss = AlarmSeverity::Minor as i16;
+    inst.common.udfs = AlarmSeverity::Invalid as i16;
+    inst.common.pini = PiniMode::Run as i16;
 
     let sevr = inst.snapshot_for_field("SEVR").unwrap();
     assert_eq!(sevr.value, EpicsValue::Enum(2));
@@ -2334,23 +2334,23 @@ fn test_put_dbcommon_menu_field_resolves_label() {
     let mut inst = RecordInstance::new("COMMON:PUT".into(), AiRecord::new(1.0));
     inst.put_common_field("DISS", EpicsValue::String("MAJOR".into()))
         .unwrap();
-    assert_eq!(inst.common.diss, AlarmSeverity::Major);
+    assert_eq!(inst.common.diss, AlarmSeverity::Major as i16);
 
     inst.put_common_field("UDFS", EpicsValue::String("MINOR".into()))
         .unwrap();
-    assert_eq!(inst.common.udfs, AlarmSeverity::Minor);
+    assert_eq!(inst.common.udfs, AlarmSeverity::Minor as i16);
 
     inst.put_common_field("PINI", EpicsValue::String("RUN".into()))
         .unwrap();
-    assert_eq!(inst.common.pini, PiniMode::Run);
+    assert_eq!(inst.common.pini, PiniMode::Run as i16);
     // Bare menu index, as C `epicsParseUInt16` accepts.
     inst.put_common_field("PINI", EpicsValue::String("3".into()))
         .unwrap();
-    assert_eq!(inst.common.pini, PiniMode::Running);
+    assert_eq!(inst.common.pini, PiniMode::Running as i16);
     // "NO" is a real choice — index 0, not a parse failure.
     inst.put_common_field("PINI", EpicsValue::String("NO".into()))
         .unwrap();
-    assert_eq!(inst.common.pini, PiniMode::No);
+    assert_eq!(inst.common.pini, PiniMode::No as i16);
     // A string naming no choice is C `S_db_badChoice`, not a silent NO.
     assert!(
         inst.put_common_field("PINI", EpicsValue::String("MAYBE".into()))
@@ -2589,10 +2589,10 @@ fn test_ai_aftc_filter_engages_and_seeds() {
         high: 80.0,
         low: -20.0,
         lolo: -40.0,
-        hhsv: AlarmSeverity::Major,
-        hsv: AlarmSeverity::Minor,
-        lsv: AlarmSeverity::Minor,
-        llsv: AlarmSeverity::Major,
+        hhsv: AlarmSeverity::Major as i16,
+        hsv: AlarmSeverity::Minor as i16,
+        lsv: AlarmSeverity::Minor as i16,
+        llsv: AlarmSeverity::Major as i16,
     });
 
     inst.evaluate_alarms();
@@ -2630,10 +2630,10 @@ fn test_longin_aftc_filter_engages_and_seeds() {
         high: 80.0,
         low: -20.0,
         lolo: -40.0,
-        hhsv: AlarmSeverity::Major,
-        hsv: AlarmSeverity::Minor,
-        lsv: AlarmSeverity::Minor,
-        llsv: AlarmSeverity::Major,
+        hhsv: AlarmSeverity::Major as i16,
+        hsv: AlarmSeverity::Minor as i16,
+        lsv: AlarmSeverity::Minor as i16,
+        llsv: AlarmSeverity::Major as i16,
     });
 
     inst.evaluate_alarms();
@@ -2667,10 +2667,10 @@ fn test_int64in_aftc_filter_engages_and_seeds() {
         high: 80.0,
         low: -20.0,
         lolo: -40.0,
-        hhsv: AlarmSeverity::Major,
-        hsv: AlarmSeverity::Minor,
-        lsv: AlarmSeverity::Minor,
-        llsv: AlarmSeverity::Major,
+        hhsv: AlarmSeverity::Major as i16,
+        hsv: AlarmSeverity::Minor as i16,
+        lsv: AlarmSeverity::Minor as i16,
+        llsv: AlarmSeverity::Major as i16,
     });
 
     inst.evaluate_alarms();
@@ -2705,10 +2705,10 @@ fn test_ai_aftc_disabled_resets_stale_afvl() {
         high: 80.0,
         low: -20.0,
         lolo: -40.0,
-        hhsv: AlarmSeverity::Major,
-        hsv: AlarmSeverity::Minor,
-        lsv: AlarmSeverity::Minor,
-        llsv: AlarmSeverity::Major,
+        hhsv: AlarmSeverity::Major as i16,
+        hsv: AlarmSeverity::Minor as i16,
+        lsv: AlarmSeverity::Minor as i16,
+        llsv: AlarmSeverity::Major as i16,
     });
 
     inst.evaluate_alarms();

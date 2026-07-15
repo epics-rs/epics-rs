@@ -1480,7 +1480,8 @@ impl PvDatabase {
                     // all_done` ordering.
                     if instance.common.stat != crate::server::recgbl::alarm_status::DISABLE_ALARM {
                         use crate::server::recgbl::EventMask;
-                        instance.common.sevr = diss;
+                        instance.common.sevr =
+                            crate::server::record::AlarmSeverity::from_u16(diss as u16);
                         instance.common.stat = crate::server::recgbl::alarm_status::DISABLE_ALARM;
                         // C `dbAccess.c:586-593` posts each field with
                         // its own mask:

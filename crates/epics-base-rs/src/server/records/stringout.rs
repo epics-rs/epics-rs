@@ -132,6 +132,19 @@ impl Record for StringoutRecord {
         Some(self.value_changed)
     }
 
+    /// C `stringoutRecord.c:138-144`: `process()` clears `udf` to FALSE only
+    /// on a successful non-constant closed-loop DOL fetch (`if
+    /// (!dbLinkIsConstant(&prec->dol) && !status) prec->udf=FALSE;`); with no
+    /// such fetch this cycle, `udf` is left untouched and `if (prec->udf ==
+    /// TRUE) recGblSetSevr(prec,UDF_ALARM,prec->udfs);` (`:146-148`) raises it
+    /// every cycle for a bare record. `udf` is never re-derived from the
+    /// stored VAL, so stringout opts out of the framework's blanket
+    /// per-cycle clear. The definers are a direct VAL put (`dbPut`,
+    /// `field_io.rs`) and the DOL-apply site (`processing.rs`).
+    fn clears_udf(&self) -> bool {
+        false
+    }
+
     /// C: `if (mpst == stringoutPOST_Always) monitor_mask |= DBE_VALUE;`
     /// `if (apst == stringoutPOST_Always) monitor_mask |= DBE_LOG;`
     fn monitor_always_post(&self) -> (bool, bool) {

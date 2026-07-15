@@ -2953,6 +2953,48 @@ pub trait Record: Send + Sync + 'static {
     fn soft_channel_skips_convert(&self) -> bool {
         false
     }
+
+    /// Whether this output record's forward `VAL → RVAL` `convert()` must be
+    /// SKIPPED on a process cycle where VAL is still undefined (`UDF != 0`) and
+    /// no value source ran.
+    ///
+    /// C's output records take an early `goto CONTINUE` before `convert()` when
+    /// the record is undefined and no value was sourced this cycle:
+    ///
+    /// ```c
+    /// /* mbboRecord.c:199-217 (and ao/bo/mbboDirect alike) */
+    /// if (!pact) {
+    ///     if (!dbLinkIsConstant(&prec->dol) && omsl == closed_loop) {
+    ///         ... prec->val = <DOL>;          /* value sourced -> udf cleared */
+    ///     }
+    ///     else if (prec->udf) {
+    ///         recGblSetSevr(prec, UDF_ALARM, prec->udfs);
+    ///         goto CONTINUE;                  /* skip udf=FALSE AND convert() */
+    ///     }
+    ///     prec->udf = FALSE;
+    ///     convert(prec);                      /* VAL -> RVAL */
+    /// }
+    /// ```
+    ///
+    /// So a `caput REC.RVAL 1` on a bare `record(mbbo,"M"){}` (UDF still 1, no
+    /// VAL put, no closed-loop DOL) leaves RVAL at the client value: `convert`
+    /// never runs to recompute `RVAL = VAL(=0)`. Verified on the compiled
+    /// softIoc — bare RVAL put reads back the put value; after a VAL put clears
+    /// UDF, the next RVAL put IS overwritten by `convert`.
+    ///
+    /// The framework consults this before `process()`: an opted-in output record
+    /// with `UDF != 0` and no value source this cycle is told
+    /// [`Self::set_device_did_compute(true)`] so its `process()` skips the
+    /// forward convert. A VAL put (UDF cleared in `field_io`) or a closed-loop
+    /// DOL fetch (UDF cleared at the DOL-apply site) leaves `UDF == 0`, so the
+    /// convert runs exactly as C's fall-through does.
+    ///
+    /// Default `false`. The rest of C's output family (ao/bo/mbboDirect) shares
+    /// the same `goto CONTINUE`; they are a separate change and stay opted out
+    /// here.
+    fn skips_forward_convert_when_undefined(&self) -> bool {
+        false
+    }
 }
 
 /// The body of [`Record::put_field_internal`] — the framework's internal write

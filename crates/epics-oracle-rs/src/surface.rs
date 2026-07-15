@@ -153,7 +153,7 @@ pub async fn probe_supported_record_types(dbd: &Dbd) -> BTreeSet<String> {
     let macros: HashMap<String, String> = HashMap::new();
 
     for rt in &dbd.record_types {
-        let db = format!("record({}, \"ORACLE:PROBE\") {{}}\n", rt.name);
+        let db = crate::record_stmt(&rt.name, "ORACLE:PROBE");
         // Parsing is not enough: `db_string` only reads the grammar, while
         // `build()` is what instantiates the record type. A type can parse and
         // still have no implementation behind it, so require the full build.

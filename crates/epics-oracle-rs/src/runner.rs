@@ -72,7 +72,7 @@ impl Runner {
         allowlist: &mut Allowlist,
     ) -> Vec<CaseResult> {
         let rec = format!("ORACLE:{}", record_type.to_uppercase());
-        let db_text = format!("record({record_type}, \"{rec}\") {{}}\n");
+        let db_text = crate::record_stmt(record_type, &rec);
 
         let fields: Vec<String> = surface
             .fields_of(record_type)
@@ -146,7 +146,7 @@ impl Runner {
         let rec_of = |i: usize| format!("ORACLE:{}:{i}", record_type.to_uppercase());
         let mut db_text = String::new();
         for i in 0..plan.len() {
-            db_text.push_str(&format!("record({record_type}, \"{}\") {{}}\n", rec_of(i)));
+            db_text.push_str(&crate::record_stmt(record_type, &rec_of(i)));
         }
 
         let names: Vec<String> = plan.iter().map(|(f, _)| f.clone()).collect();
@@ -200,7 +200,7 @@ impl Runner {
                 let repro = Reproducer {
                     // The minimal db is ONE record -- the other instances exist
                     // only to isolate the other cases in the same run.
-                    db: format!("record({record_type}, \"{rec}\") {{}}\n"),
+                    db: crate::record_stmt(record_type, &rec),
                     ops: vec![
                         format!("caput {rec}.{f} '{}'", bc.value),
                         format!("caget {rec}.{f} {rec}.STAT {rec}.SEVR"),
@@ -242,7 +242,7 @@ impl Runner {
         }
 
         let rec = format!("ORACLE:MON:{}", record_type.to_uppercase());
-        let db_text = format!("record({record_type}, \"{rec}\") {{}}\n");
+        let db_text = crate::record_stmt(record_type, &rec);
         let seq = ["1", "2", "2", "3"];
         let repro = Reproducer {
             db: db_text.clone(),

@@ -241,8 +241,20 @@ pub fn shared_menu_choices(field: &str) -> Option<&'static [&'static str]> {
         // `MPST`/`APST` are deliberately absent: `menu(menuPost)` on
         // `lsi`/`lso` but record-specific POST menus with a *reversed* value
         // order on `aai`/`aao`/`waveform`, so they are resolved per record.
-        // Array element type (`menuFtype`).
-        "FTVL" => Some(MENU_FTYPE),
+        //
+        // `FTVL` is deliberately absent too, and this is a name COLLISION, not
+        // an omission: on the array records (`waveform`/`aai`/`aao`/`subArray`)
+        // FTVL is the `menu(menuFtype)` element type, but on `mbbi`/`mbbo` FTVL
+        // is the DBF_ULONG "Fourteen Value" state field
+        // (`mbbiRecord.dbd.pod:256`). This table keys on the field NAME alone,
+        // so a `"FTVL" => MENU_FTYPE` arm resolved mbbi/mbbo's numeric FTVL as a
+        // menu — a full-range caput (4294967295) is not a valid menu index, so
+        // C accepted the put while the port rejected it as a bad choice. The
+        // array records carry `menu: Some(MENU_FTYPE)` in their generated
+        // `FieldDesc`, which every caller consults BEFORE this fallback, so
+        // dropping the arm leaves their FTVL menu fully served and lets
+        // mbbi/mbbo's FTVL fall through to the numeric put its DBF_ULONG type
+        // demands.
         // Record scan priority (`menuPriority`).
         "PRIO" => Some(MENU_PRIORITY),
         _ => None,
@@ -616,9 +628,17 @@ mod tests {
         assert_eq!(shared_menu_choices("IVOA"), Some(MENU_IVOA));
         assert_eq!(shared_menu_choices("LINR"), Some(MENU_CONVERT));
         assert_eq!(shared_menu_choices("SSCN"), Some(MENU_SCAN));
-        assert_eq!(shared_menu_choices("FTVL"), Some(MENU_FTYPE));
         assert_eq!(shared_menu_choices("PRIO"), Some(MENU_PRIORITY));
         assert_eq!(shared_menu_choices("PBUF"), Some(MENU_YES_NO));
+    }
+
+    /// FTVL is NOT shared: it means `menu(menuFtype)` on the array records but
+    /// the DBF_ULONG "Fourteen Value" state field on mbbi/mbbo, so keying it by
+    /// name alone mis-resolved the numeric field as a menu. The array records'
+    /// FTVL menu is served by their own `FieldDesc.menu`, consulted first.
+    #[test]
+    fn ftvl_is_not_shared_because_it_collides() {
+        assert_eq!(shared_menu_choices("FTVL"), None);
     }
 
     #[test]

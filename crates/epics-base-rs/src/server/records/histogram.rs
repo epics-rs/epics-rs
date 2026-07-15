@@ -590,16 +590,32 @@ impl Record for HistogramRecord {
             },
             "CMD" => match value {
                 EpicsValue::Short(v) => {
-                    // C `special` SPC_CALC: cmd<=1 clear, cmd==2 start,
-                    // cmd==3 stop; cmd is always reset to 0 afterwards.
+                    // Store the raw ordinal first — C `dbPut` writes `prec->cmd`
+                    // before `special()` runs.
                     self.cmd = v;
-                    match v {
-                        2 => self.csta = true,
-                        3 => self.csta = false,
-                        // <= 1 (Read / Clear) clears the histogram.
-                        _ => self.clear_histogram(),
+                    // C `histogramRecord.c::special` SPC_CALC (:246-259) is an
+                    // `if / else if` chain, NOT a catch-all:
+                    //   cmd <= 1  → clear_histogram(); cmd = 0;
+                    //   cmd == 2  → csta = TRUE;        cmd = 0;
+                    //   cmd == 3  → csta = FALSE;       cmd = 0;
+                    // An out-of-range ordinal (cmd >= 4) matches no branch, so C
+                    // does NOTHING and the raw ordinal survives verbatim (no
+                    // action, no reset-to-0). The `_ => clear_histogram(); cmd=0`
+                    // the port had ran the Read/Clear arm for over-max ordinals
+                    // and then zeroed cmd, which is exactly the divergence: a
+                    // caput CMD '4' must read back CMD=4, not 0/"Read". (STAT=UDF
+                    // SEVR=INVALID come from the fresh record's undefined state /
+                    // the generic menu-put path, unchanged here.)
+                    if v <= 1 {
+                        self.clear_histogram();
+                        self.cmd = 0;
+                    } else if v == 2 {
+                        self.csta = true;
+                        self.cmd = 0;
+                    } else if v == 3 {
+                        self.csta = false;
+                        self.cmd = 0;
                     }
-                    self.cmd = 0;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("CMD".into())),

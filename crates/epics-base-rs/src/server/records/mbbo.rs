@@ -660,10 +660,29 @@ impl Record for MbboRecord {
     /// `convert()` — STATE alarm from the per-state severity
     /// (ZRSV..FFSV, or UNSV for an unknown state), COS alarm (COSV),
     /// and `SOFT_ALARM/INVALID` when `VAL > 15` with a defined state
-    /// table. The framework's `rec_gbl_check_udf` raises UDF.
+    /// table.
+    ///
+    /// The UDF alarm leads. C raises it in `process()` BEFORE `checkAlarms`
+    /// (`mbboRecord.c:210-212`: `else if (prec->udf) { recGblSetSevr(prec,
+    /// UDF_ALARM, prec->udfs); goto CONTINUE; }`), and `recGblSetSevr` overrides
+    /// only on strictly greater severity (recGbl.c:242), so on a fresh record
+    /// with `UDFS == ZRSV == INVALID` the equal-severity STATE alarm cannot
+    /// displace it — STAT stays UDF. Raising it here (idempotent with the
+    /// framework's `rec_gbl_check_udf`, which runs after this hook) puts UDF
+    /// ahead of STATE. mbbo's C test is `if (prec->udf)` — truthy, not the
+    /// exact-one form bo/stringout use.
     fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
         use crate::server::recgbl::{self, alarm_status};
         use crate::server::record::AlarmSeverity;
+
+        // C `mbboRecord.c:210` — UDF (truthy) raised before STATE.
+        if recgbl::udf_alarm_active(common.udf, false) {
+            recgbl::rec_gbl_set_sevr(
+                common,
+                alarm_status::UDF_ALARM,
+                AlarmSeverity::from_u16(common.udfs as u16),
+            );
+        }
 
         // SOFT_ALARM for an illegal VAL — C convert() path.
         if self.soft_alarm {

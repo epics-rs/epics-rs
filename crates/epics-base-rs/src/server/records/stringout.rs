@@ -145,6 +145,15 @@ impl Record for StringoutRecord {
         false
     }
 
+    /// C `stringoutRecord.c:146` tests `if (prec->udf == TRUE)` — exact-one.
+    /// With `clears_udf() == false`, a direct `caput X.UDF 255` (or `-1`,
+    /// stored `255`) leaves `udf == 255` at the alarm check, and `255 != TRUE`,
+    /// so C raises NO UDF_ALARM — STAT/SEVR stay `NO_ALARM`. See
+    /// [`Record::udf_alarm_on_exact_one`].
+    fn udf_alarm_on_exact_one(&self) -> bool {
+        true
+    }
+
     /// C: `if (mpst == stringoutPOST_Always) monitor_mask |= DBE_VALUE;`
     /// `if (apst == stringoutPOST_Always) monitor_mask |= DBE_LOG;`
     fn monitor_always_post(&self) -> (bool, bool) {

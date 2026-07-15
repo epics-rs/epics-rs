@@ -338,9 +338,27 @@ pub fn rec_gbl_reset_alarms(common: &mut CommonFields) -> AlarmResetResult {
     }
 }
 
-/// Check UDF alarm: if record is still undefined, raise UDF_ALARM with UDFS severity.
-pub fn rec_gbl_check_udf(common: &mut CommonFields) {
-    if common.udf != 0 {
+/// The two ways C `checkAlarms` tests the `UDF` byte before raising
+/// `UDF_ALARM`. Almost every record uses `if (prec->udf)` — TRUTHY, so any
+/// non-zero byte counts as undefined (`aiRecord.c:319`, `mbboRecord.c:210`,
+/// `longoutRecord.c:317`, …). A small set uses `if (prec->udf == TRUE)` —
+/// EXACT-ONE, where `TRUE` is `1`, so a byte that is neither 0 nor 1 does NOT
+/// raise the alarm (`boRecord.c:371`, `stringoutRecord.c:146`,
+/// `biRecord.c:225`, `busyRecord.c:337`). The distinction is observable only
+/// for a record whose `udf` byte can hold a value other than 0/1 at
+/// `checkAlarms` time — i.e. one that does NOT re-derive `udf` every cycle
+/// (`clears_udf() == false`) — after a direct `caput .UDF 255` (or `-1`, which
+/// reaches the `DBF_UCHAR` field as `255`): C's exact-one records leave
+/// STAT/SEVR at `NO_ALARM`, the truthy records raise `UDF_ALARM/INVALID`.
+pub fn udf_alarm_active(udf: u8, exact_one: bool) -> bool {
+    if exact_one { udf == 1 } else { udf != 0 }
+}
+
+/// Check UDF alarm: if record is still undefined, raise UDF_ALARM with UDFS
+/// severity. `exact_one` selects C's `udf == TRUE` semantics (see
+/// [`udf_alarm_active`]); pass the record's [`Record::udf_alarm_on_exact_one`].
+pub fn rec_gbl_check_udf(common: &mut CommonFields, exact_one: bool) {
+    if udf_alarm_active(common.udf, exact_one) {
         rec_gbl_set_sevr_msg(
             common,
             alarm_status::UDF_ALARM,
@@ -483,7 +501,7 @@ mod tests {
     fn test_check_udf() {
         let mut common = CommonFields::default();
         assert!(common.udf != 0);
-        rec_gbl_check_udf(&mut common);
+        rec_gbl_check_udf(&mut common, false);
         assert_eq!(common.nsev, AlarmSeverity::Invalid);
         assert_eq!(common.nsta, alarm_status::UDF_ALARM);
     }
@@ -493,9 +511,29 @@ mod tests {
         let mut common = CommonFields::default();
         assert!(common.udf != 0);
         common.udfs = AlarmSeverity::Minor as i16;
-        rec_gbl_check_udf(&mut common);
+        rec_gbl_check_udf(&mut common, false);
         assert_eq!(common.nsev, AlarmSeverity::Minor);
         assert_eq!(common.nsta, alarm_status::UDF_ALARM);
+    }
+
+    /// C `udf == TRUE` records (exact-one): a `udf` byte of `255` — what a
+    /// direct `caput .UDF 255` / `-1` leaves on a record that does not
+    /// re-derive `udf` — does NOT raise UDF_ALARM, while the truthy records do.
+    #[test]
+    fn test_check_udf_exact_one_ignores_non_one_byte() {
+        assert!(udf_alarm_active(255, false), "truthy: 255 raises");
+        assert!(
+            !udf_alarm_active(255, true),
+            "exact-one: 255 does not raise"
+        );
+        assert!(udf_alarm_active(1, true), "exact-one: 1 still raises");
+        assert!(!udf_alarm_active(0, true), "exact-one: 0 never raises");
+
+        let mut common = CommonFields::default();
+        common.udf = 255;
+        rec_gbl_check_udf(&mut common, true);
+        assert_eq!(common.nsev, AlarmSeverity::NoAlarm);
+        assert_eq!(common.nsta, alarm_status::NO_ALARM);
     }
 
     #[test]

@@ -207,6 +207,15 @@ async fn sim_output_real_invalid_alarm_ivoa_dont_drive_suppresses() {
     bo.ivoa = 1; // Don't drive outputs
     db.add_record("BOIV", Box::new(bo)).await.unwrap();
 
+    // Define VAL so the record is not UDF: a bare bo stays UDF=1 and
+    // `boRecord.c:371` raises UDF_ALARM/INVALID first, which (severity INVALID)
+    // would dominate the record's own INVALID STATE alarm this test is about.
+    // A full CA put clears UDF, as `caput BOIV 1` would — same pattern as
+    // `sim_output_simm_alarm_loses_stat_on_severity_tie`.
+    db.put_pv_and_post("BOIV.VAL", EpicsValue::Enum(1))
+        .await
+        .unwrap();
+
     let mut v1 = HashSet::new();
     db.process_record_with_links("BOIV", &mut v1, 0)
         .await

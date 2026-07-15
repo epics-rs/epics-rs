@@ -236,10 +236,39 @@ impl CIoc {
     }
 
     fn try_boot(tools: &CTools, db: &Path, port: u16) -> Result<Self, BootError> {
-        let mut child = Command::new(&tools.ioc_bin)
-            .arg("-S") // no interactive shell
-            .arg("-d")
-            .arg(db)
+        // An asyn reproducer names a port (`ORACLE_ASYN_PORT`) that must already
+        // exist when `init_record` connects the record — otherwise the C asyn
+        // record errors on boot. The fat softIoc runs a positional st.cmd
+        // *before* its `iocInit`, but only owns that `iocInit` when no `-d` is
+        // given (softMain gates its auto-`iocInit` on a `-d` load). So an
+        // asyn-bearing db is driven through an st.cmd that creates the port,
+        // loads the db, then runs `iocInit` itself (softMain "approach A"); the
+        // registered-but-disconnected `drvAsynIPPort` mirrors the Rust
+        // `NullOctetPort` (noAutoConnect → CNCT/AUCT=0, {octet,option} → the
+        // `*IV` set). Every other record type keeps the plain `-d` path.
+        let db_text = std::fs::read_to_string(db)
+            .map_err(|e| BootError(format!("read db {}: {e}", db.display())))?;
+        let needs_asyn_port = db_text.contains(crate::ORACLE_ASYN_PORT);
+
+        let mut cmd = Command::new(&tools.ioc_bin);
+        cmd.arg("-S"); // no interactive shell
+        if needs_asyn_port {
+            let db_abs = db.canonicalize().unwrap_or_else(|_| db.to_path_buf());
+            let st_cmd = db.with_extension("st.cmd");
+            let script = format!(
+                "drvAsynIPPortConfigure(\"{port_name}\",\"localhost:1\",0,1,0)\n\
+                 dbLoadRecords(\"{db}\")\n\
+                 iocInit\n",
+                port_name = crate::ORACLE_ASYN_PORT,
+                db = db_abs.display(),
+            );
+            std::fs::write(&st_cmd, script)
+                .map_err(|e| BootError(format!("write st.cmd {}: {e}", st_cmd.display())))?;
+            cmd.arg(&st_cmd);
+        } else {
+            cmd.arg("-d").arg(db);
+        }
+        let mut child = cmd
             .env("EPICS_CAS_INTF_ADDR_LIST", "127.0.0.1")
             .env("EPICS_CAS_BEACON_ADDR_LIST", "127.0.0.1")
             .env("EPICS_CA_SERVER_PORT", port.to_string())

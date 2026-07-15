@@ -188,6 +188,10 @@ const INIT_COMPUTED: &[(&str, &str)] = &[
     // `asyn.CNCT` is the port connection state, driven by the record's connection
     // management rather than by a declaration default.
     ("asyn", "CNCT"),
+    // `asyn.TFIL` (trace I/O file) is seeded by `init_record` pass 0
+    // (`asynRecord.c`: `strcpy(prec->tfil, "Unknown")`); `asynRecord.dbd`
+    // declares no `initial(...)` for it, so the value comes from record code.
+    ("asyn", "TFIL"),
 ];
 
 fn is_init_computed(record_type: &str, field: &str) -> bool {

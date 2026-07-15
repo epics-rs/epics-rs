@@ -31,6 +31,12 @@ const ASUB_EFLG_CHOICES: &[&str] = &["NEVER", "ON CHANGE", "ALWAYS"];
 /// (`fetch_values`), which holds the link + subroutine registry.
 const ASUB_LFLG_CHOICES: &[&str] = &["IGNORE", "READ"];
 
+/// `LFLG == IGNORE` (`menu(aSubLFLG)` index 0): SNAM is resolved at init and on
+/// each SNAM put via `special()`. Only in this mode does C `aSubRecord.c::
+/// special` run `registryFunctionFind(prec->snam)` and refuse an unregistered
+/// name; in READ mode a SNAM put is not validated.
+const LFLG_IGNORE: i16 = 0;
+
 /// The output-array fields whose monitor posting `EFLG` gates: `VALA..VALU`
 /// (the output values) and `NEVA..NEVU` (their element counts). C
 /// `aSubRecord.c::monitor` posts `vala[i]` and `neva[i]` together inside the
@@ -412,6 +418,17 @@ impl Record for ASubRecord {
         Ok(())
     }
 
+    /// C `aSubRecord.c::special` (SPC_MOD on SNAM) resolves the name via
+    /// `registryFunctionFind` and returns `S_db_BadSub` for a non-empty
+    /// unregistered name — but ONLY when `LFLG == IGNORE` (`:557-558`). In
+    /// READ mode the name is read from the SUBL link at process time
+    /// (`fetch_values`) and a SNAM put is not validated. The registry lookup
+    /// itself is performed by the put owner; see
+    /// [`Record::is_subroutine_name_field`].
+    fn is_subroutine_name_field(&self, field: &str) -> bool {
+        field == "SNAM" && self.lflg == LFLG_IGNORE
+    }
+
     fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
         // EFLG is `menu(aSubEFLG)`, LFLG is `menu(aSubLFLG)`; serve their
         // labels so a `.db` `field(EFLG,"ON CHANGE")` / `field(LFLG,"READ")`
@@ -675,6 +692,24 @@ mod tests {
         assert_eq!(
             rec.get_field("ONAM"),
             Some(EpicsValue::String("prev".into()))
+        );
+    }
+
+    /// C `aSubRecord.c::special` runs `registryFunctionFind(prec->snam)` ONLY
+    /// when `LFLG == IGNORE`; a SNAM put in READ mode is not validated, and no
+    /// other field is a subroutine name.
+    #[test]
+    fn snam_is_a_subroutine_name_field_only_in_ignore_mode() {
+        let mut rec = ASubRecord::default();
+        assert_eq!(rec.lflg, LFLG_IGNORE);
+        assert!(rec.is_subroutine_name_field("SNAM"));
+        assert!(!rec.is_subroutine_name_field("INAM"));
+        assert!(!rec.is_subroutine_name_field("VAL"));
+
+        rec.put_field("LFLG", EpicsValue::Short(1)).unwrap(); // READ
+        assert!(
+            !rec.is_subroutine_name_field("SNAM"),
+            "READ mode reads the name from SUBL at process time; a SNAM put is not validated"
         );
     }
 

@@ -1385,6 +1385,34 @@ impl PvDatabase {
             check_no_mod(&instance, &field)?;
         }
 
+        // C `aSubRecord.c::special` / `subRecord.c::special` (SPC_MOD on SNAM):
+        // the put owner resolves the subroutine name against the registry — the
+        // record's `special()` cannot, having no DB handle. A non-empty,
+        // unregistered name will make the after-put `special()` refuse the
+        // write (`S_db_BadSub` → `ECA_PUTFAIL`) AFTER the value is stored, so
+        // the lookup is done up front here and its verdict applied inside the
+        // write below. An empty name names no routine and is accepted.
+        let snam_registry_reject = {
+            let name_to_resolve: Option<String> = {
+                let guard = rec.read().await;
+                if guard.record.is_subroutine_name_field(&field) {
+                    match &value {
+                        EpicsValue::String(s) => {
+                            let name = s.as_str_lossy();
+                            (!name.is_empty()).then(|| name.into_owned())
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            };
+            match name_to_resolve {
+                Some(name) => self.find_subroutine_named(&name).await.is_none(),
+                None => false,
+            }
+        };
+
         // C `processNotifyCommon` (dbNotify.c:225-231) tests PACT ABOVE the
         // put — `if (precord->pact) { ... pnotify->state =
         // notifyRestartCallbackRequested; ... return; }` — so a put-notify that
@@ -1638,6 +1666,20 @@ impl PvDatabase {
                             // reproduces all three.
                             let result =
                                 special_after_put(&mut instance, &field, &mut special_actions)?;
+                            // C `aSubRecord.c::special` / `subRecord.c::special`
+                            // (SPC_MOD on SNAM): the name was stored by
+                            // `put_field` above (C keeps `prec->snam`), but an
+                            // unregistered name makes `special(after)` return
+                            // `S_db_BadSub`. The registry is the DB's,
+                            // unreachable from the record's `special()`, so the
+                            // lookup was performed up front and its refusal is
+                            // applied here — the same point C's `dbPut` returns
+                            // the after-put `special()` status: value kept, no
+                            // field monitor post, no `pp` process, client sees
+                            // `ECA_PUTFAIL` ("Channel write request failed").
+                            if snam_registry_reject {
+                                return Err(CaError::BadField("SNAM: Subroutine not found".into()));
+                            }
                             // C `dbAccess.c::dbPut:1410-1411` clears
                             // `precord->udf = FALSE` synchronously when the
                             // put target is the record-type's primary value

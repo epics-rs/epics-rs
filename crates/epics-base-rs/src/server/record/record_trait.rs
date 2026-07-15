@@ -1232,6 +1232,27 @@ pub trait Record: Send + Sync + 'static {
     /// Hook called after a successful put_field.
     fn on_put(&mut self, _field: &str) {}
 
+    /// Whether a put to `field` names a subroutine that must resolve in the
+    /// function registry — C `special(SPC_MOD)` → `registryFunctionFind`
+    /// (`aSubRecord.c::special`, `subRecord.c::special`). C stores the name in
+    /// `dbPut`, then `special(after)` looks it up and returns `S_db_BadSub`
+    /// (→ rsrv `ECA_PUTFAIL`) when the name is non-empty and unregistered, so
+    /// the client's write is REFUSED while the field keeps the value it was
+    /// given. An empty name names no routine and is accepted.
+    ///
+    /// The record's `special()` has no database handle and so cannot reach the
+    /// registry itself (the registry is the DB's single owner); this hook only
+    /// says "a put to `field` is a subroutine name that must be resolved". The
+    /// put owner — which holds the registry — extracts the name from the write,
+    /// performs the lookup, and applies the `S_db_BadSub` refusal at the point
+    /// C's `dbPut` returns the after-put `special()` status. Returns `false`
+    /// for any field/mode C accepts without a lookup (a non-SNAM field, or an
+    /// aSub in `LFLG=READ` where the name comes from the SUBL link at process
+    /// time and a SNAM put is not validated).
+    fn is_subroutine_name_field(&self, _field: &str) -> bool {
+        false
+    }
+
     /// Primary field name (default "VAL"). Override for waveform etc.
     fn primary_field(&self) -> &'static str {
         "VAL"

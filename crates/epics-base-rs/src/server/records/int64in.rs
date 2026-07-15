@@ -17,18 +17,26 @@ pub struct Int64inRecord {
     pub val: i64,
     #[field(type = "PvStr")]
     pub egu: PvString,
-    #[field(type = "Double")]
-    pub hopr: f64,
-    #[field(type = "Double")]
-    pub lopr: f64,
-    #[field(type = "Double")]
-    pub hyst: f64,
+    // HOPR/LOPR/HYST/ADEL/MDEL are DBF_INT64 (int64inRecord.dbd.pod:140-268),
+    // not DBF_DOUBLE. Modeling them as i64 keys the string→native put parse on
+    // the integer row (`epicsParseInt64`), so a fractional or out-of-i64-range
+    // caput is REFUSED, matching C; served over CA as DBR_DOUBLE via
+    // `EpicsValue::Int64`'s wire mapping, the same as VAL.
+    #[field(type = "Int64")]
+    pub hopr: i64,
+    #[field(type = "Int64")]
+    pub lopr: i64,
+    #[field(type = "Int64")]
+    pub hyst: i64,
+    // LALM is DBF_INT64 too, but `special(SPC_NOMOD)` (dbd:233-236): read-only,
+    // so no client put reaches the parse. Kept f64 — it is the internal
+    // last-alarmed bookkeeping the alarm filter reads as a double.
     #[field(type = "Double")]
     pub lalm: f64,
-    #[field(type = "Double")]
-    pub adel: f64,
-    #[field(type = "Double")]
-    pub mdel: f64,
+    #[field(type = "Int64")]
+    pub adel: i64,
+    #[field(type = "Int64")]
+    pub mdel: i64,
     // Alarm-range time-constant filter (int64inRecord.c::checkAlarms:303-349).
     // AFTC > 0 low-pass-filters the integer alarmRange so transient
     // excursions don't immediately alarm; AFVL is the accumulator.
@@ -69,12 +77,12 @@ impl Default for Int64inRecord {
         Self {
             val: 0,
             egu: PvString::new(),
-            hopr: 0.0,
-            lopr: 0.0,
-            hyst: 0.0,
+            hopr: 0,
+            lopr: 0,
+            hyst: 0,
             lalm: 0.0,
-            adel: 0.0,
-            mdel: 0.0,
+            adel: 0,
+            mdel: 0,
             aftc: 0.0,
             afvl: 0.0,
             alst: 0.0,

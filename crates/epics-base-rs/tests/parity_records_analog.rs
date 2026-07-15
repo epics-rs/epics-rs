@@ -48,8 +48,8 @@ fn h1_longout_equal_limits_disable_clamp() {
 #[test]
 fn h1_int64out_clamps_val_to_drive_window() {
     let mut r = Int64outRecord::new(0);
-    r.drvl = -8.0;
-    r.drvh = 8.0;
+    r.drvl = -8;
+    r.drvh = 8;
     r.val = 1_000;
     r.process().unwrap();
     assert_eq!(r.val, 8, "int64out VAL above DRVH clamps to DRVH");

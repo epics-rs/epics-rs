@@ -16,16 +16,24 @@ use crate::types::{EpicsValue, PvString};
 pub struct Int64outRecord {
     pub val: i64,
     pub egu: PvString,
-    pub hopr: f64,
-    pub lopr: f64,
-    pub drvh: f64,
-    pub drvl: f64,
-    pub hyst: f64,
+    // HOPR/LOPR/DRVH/DRVL/HYST/IVOV/ADEL/MDEL are DBF_INT64
+    // (int64outRecord.dbd.pod:176-386), not DBF_DOUBLE. Stored as i64 so the
+    // string→native put parse keys on `epicsParseInt64` and REFUSES a fractional
+    // or out-of-i64-range caput, matching C; served over CA as DBR_DOUBLE via
+    // `EpicsValue::Int64`'s wire mapping, the same as VAL.
+    pub hopr: i64,
+    pub lopr: i64,
+    pub drvh: i64,
+    pub drvl: i64,
+    pub hyst: i64,
+    // LALM/ALST/MLST are DBF_INT64 too, but `special(SPC_NOMOD)`: read-only, so
+    // no client put reaches the parse. Kept f64 — internal alarm/archive/monitor
+    // bookkeeping the deadband engine reads as doubles.
     pub lalm: f64,
     pub ivoa: i16,
-    pub ivov: f64,
-    pub adel: f64,
-    pub mdel: f64,
+    pub ivov: i64,
+    pub adel: i64,
+    pub mdel: i64,
     pub alst: f64,
     pub mlst: f64,
     pub omsl: i16,
@@ -42,16 +50,16 @@ impl Default for Int64outRecord {
         Self {
             val: 0,
             egu: PvString::new(),
-            hopr: 0.0,
-            lopr: 0.0,
-            drvh: 0.0,
-            drvl: 0.0,
-            hyst: 0.0,
+            hopr: 0,
+            lopr: 0,
+            drvh: 0,
+            drvl: 0,
+            hyst: 0,
             lalm: 0.0,
             ivoa: 0,
-            ivov: 0.0,
-            adel: 0.0,
-            mdel: 0.0,
+            ivov: 0,
+            adel: 0,
+            mdel: 0,
             alst: 0.0,
             mlst: 0.0,
             omsl: 0,
@@ -108,20 +116,15 @@ impl Record for Int64outRecord {
     /// C `int64outRecord.c::convert` (lines 418-423): clamp VAL into the
     /// drive-limit window `[DRVL, DRVH]` every process cycle, but only
     /// when `DRVH > DRVL` (equal limits = no clamping). DRVH/DRVL are
-    /// DBF_DOUBLE in int64out's .dbd; the comparison and clamp are done
-    /// in i64 space (the C `convert` clamps the `epicsInt64 value`
-    /// against `prec->drvh`/`prec->drvl`, which the C struct also stores
-    /// as DBF_INT64 — here the limits are doubles, so they are rounded
-    /// to i64 with saturation before the clamp, matching the integer
-    /// semantics of the C clamp).
+    /// DBF_INT64 in int64out's .dbd and are stored as i64 here, so the
+    /// comparison and clamp are the direct integer clamp C's `convert`
+    /// performs against the `epicsInt64 value`.
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         if self.drvh > self.drvl {
-            let hi = double_to_i64_saturating(self.drvh);
-            let lo = double_to_i64_saturating(self.drvl);
-            if self.val > hi {
-                self.val = hi;
-            } else if self.val < lo {
-                self.val = lo;
+            if self.val > self.drvh {
+                self.val = self.drvh;
+            } else if self.val < self.drvl {
+                self.val = self.drvl;
             }
         }
         Ok(ProcessOutcome::complete())
@@ -143,16 +146,16 @@ impl Record for Int64outRecord {
         match name {
             "VAL" => Some(EpicsValue::Int64(self.val)),
             "EGU" => Some(EpicsValue::String(self.egu.clone())),
-            "HOPR" => Some(EpicsValue::Double(self.hopr)),
-            "LOPR" => Some(EpicsValue::Double(self.lopr)),
-            "DRVH" => Some(EpicsValue::Double(self.drvh)),
-            "DRVL" => Some(EpicsValue::Double(self.drvl)),
-            "HYST" => Some(EpicsValue::Double(self.hyst)),
+            "HOPR" => Some(EpicsValue::Int64(self.hopr)),
+            "LOPR" => Some(EpicsValue::Int64(self.lopr)),
+            "DRVH" => Some(EpicsValue::Int64(self.drvh)),
+            "DRVL" => Some(EpicsValue::Int64(self.drvl)),
+            "HYST" => Some(EpicsValue::Int64(self.hyst)),
             "LALM" => Some(EpicsValue::Double(self.lalm)),
             "IVOA" => Some(EpicsValue::Short(self.ivoa)),
-            "IVOV" => Some(EpicsValue::Double(self.ivov)),
-            "ADEL" => Some(EpicsValue::Double(self.adel)),
-            "MDEL" => Some(EpicsValue::Double(self.mdel)),
+            "IVOV" => Some(EpicsValue::Int64(self.ivov)),
+            "ADEL" => Some(EpicsValue::Int64(self.adel)),
+            "MDEL" => Some(EpicsValue::Int64(self.mdel)),
             "ALST" => Some(EpicsValue::Double(self.alst)),
             "MLST" => Some(EpicsValue::Double(self.mlst)),
             "OMSL" => Some(EpicsValue::Short(self.omsl)),
@@ -184,29 +187,39 @@ impl Record for Int64outRecord {
                 }
             }
             "HOPR" => {
-                self.hopr = value
-                    .to_f64()
-                    .ok_or_else(|| CaError::TypeMismatch("HOPR".into()))?;
+                if let EpicsValue::Int64(v) = value {
+                    self.hopr = v;
+                } else {
+                    return Err(CaError::TypeMismatch("HOPR".into()));
+                }
             }
             "LOPR" => {
-                self.lopr = value
-                    .to_f64()
-                    .ok_or_else(|| CaError::TypeMismatch("LOPR".into()))?;
+                if let EpicsValue::Int64(v) = value {
+                    self.lopr = v;
+                } else {
+                    return Err(CaError::TypeMismatch("LOPR".into()));
+                }
             }
             "DRVH" => {
-                self.drvh = value
-                    .to_f64()
-                    .ok_or_else(|| CaError::TypeMismatch("DRVH".into()))?;
+                if let EpicsValue::Int64(v) = value {
+                    self.drvh = v;
+                } else {
+                    return Err(CaError::TypeMismatch("DRVH".into()));
+                }
             }
             "DRVL" => {
-                self.drvl = value
-                    .to_f64()
-                    .ok_or_else(|| CaError::TypeMismatch("DRVL".into()))?;
+                if let EpicsValue::Int64(v) = value {
+                    self.drvl = v;
+                } else {
+                    return Err(CaError::TypeMismatch("DRVL".into()));
+                }
             }
             "HYST" => {
-                self.hyst = value
-                    .to_f64()
-                    .ok_or_else(|| CaError::TypeMismatch("HYST".into()))?;
+                if let EpicsValue::Int64(v) = value {
+                    self.hyst = v;
+                } else {
+                    return Err(CaError::TypeMismatch("HYST".into()));
+                }
             }
             "LALM" => {
                 self.lalm = value
@@ -221,19 +234,25 @@ impl Record for Int64outRecord {
                 }
             }
             "IVOV" => {
-                self.ivov = value
-                    .to_f64()
-                    .ok_or_else(|| CaError::TypeMismatch("IVOV".into()))?;
+                if let EpicsValue::Int64(v) = value {
+                    self.ivov = v;
+                } else {
+                    return Err(CaError::TypeMismatch("IVOV".into()));
+                }
             }
             "ADEL" => {
-                self.adel = value
-                    .to_f64()
-                    .ok_or_else(|| CaError::TypeMismatch("ADEL".into()))?;
+                if let EpicsValue::Int64(v) = value {
+                    self.adel = v;
+                } else {
+                    return Err(CaError::TypeMismatch("ADEL".into()));
+                }
             }
             "MDEL" => {
-                self.mdel = value
-                    .to_f64()
-                    .ok_or_else(|| CaError::TypeMismatch("MDEL".into()))?;
+                if let EpicsValue::Int64(v) = value {
+                    self.mdel = v;
+                } else {
+                    return Err(CaError::TypeMismatch("MDEL".into()));
+                }
             }
             "ALST" => {
                 self.alst = value
@@ -301,22 +320,6 @@ impl Record for Int64outRecord {
     }
 }
 
-/// Round a DBF_DOUBLE drive limit to i64 with saturation. NaN maps to 0,
-/// out-of-range values saturate to i64::MIN/MAX. Used so the int64out
-/// drive-limit clamp operates in the same integer space as the C
-/// `int64outRecord.c::convert` clamp.
-fn double_to_i64_saturating(v: f64) -> i64 {
-    if v.is_nan() {
-        0
-    } else if v >= i64::MAX as f64 {
-        i64::MAX
-    } else if v <= i64::MIN as f64 {
-        i64::MIN
-    } else {
-        v as i64
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,8 +327,8 @@ mod tests {
     #[test]
     fn clamps_val_into_drive_window() {
         let mut r = Int64outRecord::new(0);
-        r.drvl = -10.0;
-        r.drvh = 10.0;
+        r.drvl = -10;
+        r.drvh = 10;
         r.val = 50;
         r.process().unwrap();
         assert_eq!(r.val, 10, "above DRVH clamps down to DRVH");
@@ -340,8 +343,8 @@ mod tests {
     #[test]
     fn equal_drive_limits_disable_clamp() {
         let mut r = Int64outRecord::new(0);
-        r.drvl = 0.0;
-        r.drvh = 0.0; // DRVH not > DRVL
+        r.drvl = 0;
+        r.drvh = 0; // DRVH not > DRVL
         r.val = 99999;
         r.process().unwrap();
         assert_eq!(r.val, 99999, "DRVH == DRVL: no clamping (C parity)");

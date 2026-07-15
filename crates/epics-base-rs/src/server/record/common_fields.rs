@@ -46,7 +46,11 @@ pub struct CommonFields {
     /// `PINI` is `DBF_MENU`/`menu(menuPini)` — a six-choice lifecycle
     /// selector, not a flag. See [`PiniMode`].
     pub pini: PiniMode,
-    pub tpro: bool,
+    /// `TPRO` (`DBF_UCHAR` in `dbCommon.dbd`) — trace-processing flag. C
+    /// stores the raw put byte and serves it as SIGNED `DBR_CHAR`
+    /// (`caput TPRO 255` → `caget` = -1). Modeled as the raw `u8`, like
+    /// [`Self::bkpt`], so the byte round-trips; consumers test `!= 0`.
+    pub tpro: u8,
     pub bkpt: u8,
     // Links (raw strings)
     pub flnk: String,
@@ -105,11 +109,15 @@ pub struct CommonFields {
     pub hyst: f64,
     // Lock count (re-entrance counter)
     pub lcnt: i16,
-    // Disable putfield from CA (default false)
-    pub disp: bool,
+    // DISP — disable putfield from CA. `DBF_UCHAR` in `dbCommon.dbd`: C
+    // stores the raw put byte and serves it SIGNED as `DBR_CHAR`
+    // (`caput DISP 255` → `caget` = -1). Raw `u8` like [`Self::bkpt`];
+    // consumers test `!= 0`.
+    pub disp: u8,
     // Process control
     pub putf: bool,
-    pub rpro: bool,
+    // RPRO — reprocess flag. `DBF_UCHAR`, raw-byte readback like DISP/TPRO.
+    pub rpro: u8,
     // Fallback monitor/archive last-sent values for records without MLST/ALST fields
     pub mlst: Option<f64>,
     pub alst: Option<f64>,
@@ -180,7 +188,7 @@ impl Default for CommonFields {
             // `initial()`, so it starts at index 0 (`menuSimmNO`).
             oldsimm: 0,
             pini: PiniMode::No,
-            tpro: false,
+            tpro: 0,
             bkpt: 0,
             flnk: String::new(),
             inp: String::new(),
@@ -210,9 +218,9 @@ impl Default for CommonFields {
             diss: AlarmSeverity::NoAlarm,
             hyst: 0.0,
             lcnt: 0,
-            disp: false,
+            disp: 0,
             putf: false,
-            rpro: false,
+            rpro: 0,
             mlst: None,
             alst: None,
         }

@@ -1962,7 +1962,7 @@ mod tests {
             .write()
             .await
             .common
-            .disp = true;
+            .disp = 1;
         let ch = BridgeChannel::new(db.clone(), "PS:ai").await.unwrap();
         let err = ch.put(&put).await.expect_err("DISP=1 must reject the put");
         assert_eq!(

@@ -2221,7 +2221,15 @@ impl RecordInstance {
             // owner (`rec_gbl_save_simm`); `special(SPC_NOMOD)` for clients.
             "OLDSIMM" => Some(EpicsValue::Short(self.common.oldsimm)),
             "PINI" => Some(EpicsValue::Short(self.common.pini.to_u16() as i16)),
-            "TPRO" => Some(EpicsValue::Char(if self.common.tpro { 1 } else { 0 })),
+            // DISP/TPRO/RPRO/UDF are `DBF_UCHAR` in `dbCommon.dbd`. Serve them
+            // as `UChar` — their DECLARED type — so `project_to_declared_type`
+            // is identity and the raw put byte reaches the wire untouched (C
+            // stores the byte and `caget` renders `DBR_CHAR` signed: 255 → -1).
+            // Serving `Char` here instead routed the value through the lossy
+            // `Char → UChar` projection (signed −1 clamped to 0), so a
+            // `caput DISP 255` read back as 0 rather than C's -1. `BKPT` is
+            // `DBF_NOACCESS`: no `FieldDesc`, no projection, served `Char`.
+            "TPRO" => Some(EpicsValue::UChar(self.common.tpro)),
             "BKPT" => Some(EpicsValue::Char(self.common.bkpt)),
             "FLNK" => Some(EpicsValue::String(self.common.flnk.clone().into())),
             // A record type whose C `.dbd` has no INP has no `.INP` channel
@@ -2256,9 +2264,9 @@ impl RecordInstance {
             "DISS" => Some(EpicsValue::Short(self.common.diss as i16)),
             "HYST" => Some(EpicsValue::Double(self.common.hyst)),
             "LCNT" => Some(EpicsValue::Short(self.common.lcnt)),
-            "DISP" => Some(EpicsValue::Char(if self.common.disp { 1 } else { 0 })),
+            "DISP" => Some(EpicsValue::UChar(self.common.disp)),
             "PUTF" => Some(EpicsValue::Char(if self.common.putf { 1 } else { 0 })),
-            "RPRO" => Some(EpicsValue::Char(if self.common.rpro { 1 } else { 0 })),
+            "RPRO" => Some(EpicsValue::UChar(self.common.rpro)),
             "PACT" => Some(EpicsValue::Char(if self.is_processing() { 1 } else { 0 })),
             "PROC" => Some(EpicsValue::Char(0)), // Always 0 (trigger-only)
             // Analog alarm fields
@@ -2647,7 +2655,7 @@ impl RecordInstance {
             }
             "TPRO" => {
                 if let EpicsValue::Char(v) = value {
-                    self.common.tpro = v != 0;
+                    self.common.tpro = v;
                 }
             }
             "BKPT" => {
@@ -2882,13 +2890,13 @@ impl RecordInstance {
             }
             "DISP" => {
                 if let EpicsValue::Char(v) = value {
-                    self.common.disp = v != 0;
+                    self.common.disp = v;
                 }
             }
             "PUTF" => return Err(CaError::ReadOnlyField("PUTF".into())),
             "RPRO" => {
                 if let EpicsValue::Char(v) = value {
-                    self.common.rpro = v != 0;
+                    self.common.rpro = v;
                 }
             }
             "PACT" => return Err(CaError::ReadOnlyField("PACT".into())),
@@ -5976,7 +5984,7 @@ mod common_field_dbload_tests {
         put(&mut inst, "LCNT", "3");
         assert_eq!(inst.common.lcnt, 3, "field(LCNT, \"3\")");
         put(&mut inst, "DISP", "1");
-        assert!(inst.common.disp, "field(DISP, \"1\")");
+        assert!(inst.common.disp != 0, "field(DISP, \"1\")");
         put(&mut inst, "UDF", "0");
         assert!(!inst.common.udf, "field(UDF, \"0\")");
 

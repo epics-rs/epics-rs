@@ -1847,7 +1847,7 @@ async fn rpro_reprocessing() {
     // Set RPRO flag
     if let Some(rec) = db.get_record("rpro_rec").await {
         let mut inst = rec.write().await;
-        inst.common.rpro = true;
+        inst.common.rpro = 1;
     }
 
     // Process — should process, detect RPRO, reprocess once, then clear RPRO
@@ -1860,7 +1860,7 @@ async fn rpro_reprocessing() {
     if let Some(rec) = db.get_record("rpro_rec").await {
         let inst = rec.read().await;
         assert!(
-            !inst.common.rpro,
+            inst.common.rpro == 0,
             "RPRO should be cleared after reprocessing"
         );
     }

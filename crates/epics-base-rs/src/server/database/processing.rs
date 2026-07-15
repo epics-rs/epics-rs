@@ -1333,12 +1333,10 @@ impl PvDatabase {
                 // debugging a stuck async record sees NO sign that the
                 // entry guard is firing — they only notice the
                 // eventual SCAN_ALARM after MAX_LOCK=10 attempts.
-                if instance.common.tpro {
+                if instance.common.tpro != 0 {
                     eprintln!(
                         "[TPRO] {}: dbProcess of Active '{}' with RPRO={}",
-                        instance.name,
-                        instance.name,
-                        if instance.common.rpro { 1 } else { 0 },
+                        instance.name, instance.name, instance.common.rpro,
                     );
                 }
                 let stat = instance.common.stat;
@@ -1462,7 +1460,7 @@ impl PvDatabase {
                     // CA put-notify caller must be released. A disabled
                     // record drives no FLNK/OUT chain, so leaving the
                     // wait-set here is its whole contribution.
-                    instance.common.rpro = false;
+                    instance.common.rpro = 0;
                     instance.common.putf = false;
                     let notify = instance.notify.take();
 
@@ -2549,7 +2547,7 @@ impl PvDatabase {
             }
 
             // TPRO: trace processing (C EPICS dbProcess prints context when TPRO>0)
-            if instance.common.tpro {
+            if instance.common.tpro != 0 {
                 eprintln!(
                     "[TPRO] {}: process (SCAN={:?}, PACT={})",
                     instance.name,
@@ -3791,8 +3789,8 @@ impl PvDatabase {
         {
             let needs_rpro = {
                 let mut instance = rec.write().await;
-                if instance.common.rpro {
-                    instance.common.rpro = false;
+                if instance.common.rpro != 0 {
+                    instance.common.rpro = 0;
                     true
                 } else {
                     false
@@ -4717,8 +4715,8 @@ impl PvDatabase {
         {
             let needs_rpro = {
                 let mut guard = rec.write().await;
-                if guard.common.rpro {
-                    guard.common.rpro = false;
+                if guard.common.rpro != 0 {
+                    guard.common.rpro = 0;
                     true
                 } else {
                     false
@@ -4826,7 +4824,7 @@ impl PvDatabase {
                 // takes this branch and always processes.
                 skip = true;
             } else if tg.is_processing() {
-                tg.common.rpro = true;
+                tg.common.rpro = 1;
                 skip = true;
             }
             // else (not processing): fall through and process below.

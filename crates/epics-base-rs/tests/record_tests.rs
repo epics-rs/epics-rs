@@ -1814,17 +1814,18 @@ fn test_proc_reads_zero() {
 #[test]
 fn test_disp_get_put() {
     let mut instance = RecordInstance::new("TEST".into(), AoRecord::new(0.0));
+    // DISP is `DBF_UCHAR`: served as `UChar` (its declared type).
     match instance.get_common_field("DISP") {
-        Some(EpicsValue::Char(0)) => {}
-        other => panic!("expected Char(0), got {:?}", other),
+        Some(EpicsValue::UChar(0)) => {}
+        other => panic!("expected UChar(0), got {:?}", other),
     }
     instance
         .put_common_field("DISP", EpicsValue::Char(1))
         .unwrap();
-    assert!(instance.common.disp);
+    assert!(instance.common.disp != 0);
     match instance.get_common_field("DISP") {
-        Some(EpicsValue::Char(1)) => {}
-        other => panic!("expected Char(1), got {:?}", other),
+        Some(EpicsValue::UChar(1)) => {}
+        other => panic!("expected UChar(1), got {:?}", other),
     }
 }
 

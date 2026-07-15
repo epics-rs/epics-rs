@@ -23,7 +23,7 @@ fn check_put_disabled(
     instance: &crate::server::record::RecordInstance,
     field_upper: &str,
 ) -> CaResult<()> {
-    if instance.common.disp && field_upper != "DISP" {
+    if instance.common.disp != 0 && field_upper != "DISP" {
         return Err(CaError::PutDisabled(field_upper.to_string()));
     }
     Ok(())
@@ -1275,7 +1275,7 @@ impl PvDatabase {
             };
             let mut instance = rec.write().await;
             if instance.is_processing() {
-                instance.common.rpro = true;
+                instance.common.rpro = 1;
                 return Ok(());
             }
             instance.common.putf = true;

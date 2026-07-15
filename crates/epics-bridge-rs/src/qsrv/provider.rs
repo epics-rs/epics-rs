@@ -778,7 +778,7 @@ impl BridgeProvider {
             return false;
         };
         let inst = rec_arc.read().await;
-        !inst.common.disp
+        inst.common.disp == 0
     }
 
     /// Which NT property leaves the channel `name` (`REC`, `REC.FIELD`, or a
@@ -1665,7 +1665,7 @@ mod tests {
         // predicate would still advertise writable=true.
         {
             let rec = db.get_record("SH:rec").await.unwrap();
-            rec.write().await.common.disp = true;
+            rec.write().await.common.disp = 1;
         }
 
         let provider = BridgeProvider::new(db);

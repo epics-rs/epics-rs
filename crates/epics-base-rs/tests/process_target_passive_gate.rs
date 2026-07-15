@@ -62,7 +62,7 @@ record(ai, "ASY") {{
 async fn flags(db: &PvDatabase, rec: &str) -> (bool, bool) {
     let inst = db.get_record(rec).await.unwrap();
     let inst = inst.read().await;
-    (inst.common.rpro, inst.common.putf)
+    (inst.common.rpro != 0, inst.common.putf)
 }
 
 /// R18-93: an FLNK to a BUSY, non-Passive target must not be touched at all.

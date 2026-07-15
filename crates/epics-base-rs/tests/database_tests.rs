@@ -1201,7 +1201,7 @@ async fn test_putf_propagates_through_db_out_link_to_passive_target() {
         "after both records' synchronous cycles complete, both clear putf"
     );
     assert!(
-        !inst.common.rpro,
+        inst.common.rpro == 0,
         "target was not pact, so rpro must stay false (normal propagation)"
     );
     let val = inst.record.val().and_then(|v| v.to_f64()).unwrap_or(0.0);
@@ -2359,7 +2359,7 @@ async fn test_disp_allows_disp_write() {
 
     let rec = db.get_record("REC").await.unwrap();
     let inst = rec.read().await;
-    assert!(!inst.common.disp);
+    assert!(inst.common.disp == 0);
 }
 
 #[tokio::test]
@@ -2965,7 +2965,7 @@ async fn test_put_to_pact_record_sets_rpro_and_second_value_reaches_device() {
         let inst = rec.read().await;
         assert!(inst.is_processing(), "still PACT from put 1");
         assert!(
-            inst.common.rpro,
+            inst.common.rpro != 0,
             "put to a PACT record must set RPRO (C dbAccess.c:1272)"
         );
         assert_eq!(
@@ -2998,7 +2998,7 @@ async fn test_put_to_pact_record_sets_rpro_and_second_value_reaches_device() {
     let rec = db.get_record("ASYNC_OUT").await.unwrap();
     let inst = rec.read().await;
     assert!(
-        !inst.common.rpro,
+        inst.common.rpro == 0,
         "RPRO is consumed (cleared) by the completion tail"
     );
 }
@@ -3267,8 +3267,8 @@ async fn test_pact_entry_guard_tpro_diagnostic_does_not_change_bail_outcome() {
     {
         let rec = db.get_record("ASYNC_TPRO").await.unwrap();
         let mut inst = rec.write().await;
-        inst.common.tpro = true;
-        inst.common.rpro = true;
+        inst.common.tpro = 1;
+        inst.common.rpro = 1;
     }
 
     // Cycle 1: drive into PACT.
@@ -3280,8 +3280,11 @@ async fn test_pact_entry_guard_tpro_diagnostic_does_not_change_bail_outcome() {
         let rec = db.get_record("ASYNC_TPRO").await.unwrap();
         let inst = rec.read().await;
         assert!(inst.is_processing(), "must enter PACT");
-        assert!(inst.common.tpro, "TPRO must be preserved");
-        assert!(inst.common.rpro, "RPRO must be preserved across PACT entry");
+        assert!(inst.common.tpro != 0, "TPRO must be preserved");
+        assert!(
+            inst.common.rpro != 0,
+            "RPRO must be preserved across PACT entry"
+        );
     }
 
     // Re-entry while PACT=true: bail with lcnt increment. Diagnostic
@@ -3296,7 +3299,7 @@ async fn test_pact_entry_guard_tpro_diagnostic_does_not_change_bail_outcome() {
     assert!(inst.is_processing(), "still PACT after bail");
     assert_eq!(inst.common.lcnt, 1, "lcnt must have advanced");
     assert!(
-        inst.common.rpro,
+        inst.common.rpro != 0,
         "RPRO must remain unchanged by the diagnostic path"
     );
 }
@@ -3659,7 +3662,7 @@ async fn test_sdis_disable_clears_rpro_and_putf() {
             .unwrap();
         // Pre-set rpro=true, putf=true so the disable path's clear is
         // observable.
-        inst.common.rpro = true;
+        inst.common.rpro = 1;
         inst.common.putf = true;
     }
 
@@ -3671,7 +3674,7 @@ async fn test_sdis_disable_clears_rpro_and_putf() {
     let rec = db.get_record("DIS_TGT").await.unwrap();
     let inst = rec.read().await;
     assert!(
-        !inst.common.rpro,
+        inst.common.rpro == 0,
         "SDIS disable must clear rpro (C dbAccess.c:575). Pre-fix this leaked."
     );
     assert!(
@@ -6405,7 +6408,7 @@ async fn test_rpro_causes_reprocessing() {
         .unwrap();
     if let Some(rec) = db.get_record("DEST").await {
         let mut inst = rec.write().await;
-        inst.common.rpro = true;
+        inst.common.rpro = 1;
     }
     let mut visited = HashSet::new();
     db.process_record_with_links("DEST", &mut visited, 0)
@@ -6415,7 +6418,7 @@ async fn test_rpro_causes_reprocessing() {
     assert_eq!(val.to_f64().unwrap() as i64, 20);
     let rec = db.get_record("DEST").await.unwrap();
     let inst = rec.read().await;
-    assert!(!inst.common.rpro);
+    assert!(inst.common.rpro == 0);
 }
 
 #[tokio::test]
@@ -6694,7 +6697,7 @@ async fn test_new_common_fields_get_put() {
 
     {
         let inst = rec.read().await;
-        assert_eq!(inst.get_common_field("RPRO"), Some(EpicsValue::Char(0)));
+        assert_eq!(inst.get_common_field("RPRO"), Some(EpicsValue::UChar(0)));
     }
     {
         let mut inst = rec.write().await;
@@ -6702,7 +6705,7 @@ async fn test_new_common_fields_get_put() {
     }
     {
         let inst = rec.read().await;
-        assert_eq!(inst.get_common_field("RPRO"), Some(EpicsValue::Char(1)));
+        assert_eq!(inst.get_common_field("RPRO"), Some(EpicsValue::UChar(1)));
     }
 }
 
@@ -7392,7 +7395,7 @@ async fn test_self_link_out_does_not_loop() {
         .common
         .rpro;
     assert!(
-        !rpro_after,
+        rpro_after == 0,
         "RPRO must be cleared after self-link processing — \
          stuck-true would queue an infinite reprocess loop"
     );

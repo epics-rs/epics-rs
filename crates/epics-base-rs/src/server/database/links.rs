@@ -1164,7 +1164,7 @@ impl PvDatabase {
                 tg.common.putf = src_putf;
                 join_put_notify(&mut tg, src_notify);
             } else if src_putf && !visited.contains(target_name) {
-                tg.common.rpro = true;
+                tg.common.rpro = 1;
                 tg.common.putf = false;
             }
             !pact

@@ -5,6 +5,7 @@ use crate::server::record::{
 };
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
+use super::link_status::{LINK_CON, LINK_STATUS_CHOICES};
 use crate::calc::StringInputs;
 use crate::calc::engine::value::{SCALC_STRING_SIZE, ScalcString};
 use crate::calc::{CompiledExpr, ExprKind, ScalcResult, scalc_perform};
@@ -316,7 +317,35 @@ impl ScalcoutRecord {
             .iter()
             .position(|(lf, _)| *lf == name)
     }
+
+    /// The link-connection-status fields INAV..INLV (numeric inputs),
+    /// IAAV..ILLV (string inputs) and OUTV (output)
+    /// (`sCalcoutRecord.dbd:229-402`, DBF_MENU `menu(scalcoutINAV)`,
+    /// `special(SPC_NOMOD)`).
+    ///
+    /// Each is DERIVED from its link, never client-set: C `init_record`
+    /// (`sCalcoutRecord.c`, same shape as `aCalcoutRecord.c:208-242`) stores
+    /// `scalcoutINAV_CON` (=3) for every CONSTANT link, and a default record
+    /// has all links constant. Like the sibling `acalcout` record this port
+    /// classifies the status STATICALLY (no live re-derivation on a link
+    /// re-point), so every field reads `Constant`. The dbd `initial("1")` is
+    /// C's pre-init placeholder that `init_record` overwrites — serving it raw
+    /// (what `declared_default` did for these un-modeled fields) reported
+    /// `Ext PV OK` where C reports `Constant`.
+    fn is_link_status_field(name: &str) -> bool {
+        name == "OUTV" || SCALCOUT_INAV_NAMES.contains(&name) || SCALCOUT_IAAV_NAMES.contains(&name)
+    }
 }
+
+/// INAV..INLV — numeric-input connection-status field names (channel A..L).
+static SCALCOUT_INAV_NAMES: [&str; 12] = [
+    "INAV", "INBV", "INCV", "INDV", "INEV", "INFV", "INGV", "INHV", "INIV", "INJV", "INKV", "INLV",
+];
+
+/// IAAV..ILLV — string-input connection-status field names (channel AA..LL).
+static SCALCOUT_IAAV_NAMES: [&str; 12] = [
+    "IAAV", "IBBV", "ICCV", "IDDV", "IEEV", "IFFV", "IGGV", "IHHV", "IIIV", "IJJV", "IKKV", "ILLV",
+];
 
 /// C `sCalcoutRecord.c::fetch_values`' second loop (890-941): INAA..LL → AA..LL.
 /// Order is C's `sFldnames` order, i.e. the `str_vals` index order.
@@ -361,6 +390,21 @@ const SCALCOUT_WAIT_CHOICES: &[&str] = &["NoWait", "Wait"];
 impl Record for ScalcoutRecord {
     fn record_type(&self) -> &'static str {
         "scalcout"
+    }
+
+    /// The link-status menus (INAV..INLV, IAAV..ILLV, OUTV) are served read-only
+    /// by `get_field`, but the record owns no WRITE path for them — they are
+    /// `SPC_NOMOD`, derived from the link (see [`Self::is_link_status_field`]).
+    /// The loader's `.dbd`-initial seed and `.db field()` apply both key on this
+    /// predicate to decide whether to WRITE a field; answering `false` keeps
+    /// them from storing the `.dbd` `initial("1")` over the init-derived
+    /// `Constant`. The read is unaffected: `resolve_field` consults `get_field`
+    /// independently.
+    fn implements_field(&self, name: &str) -> bool {
+        if Self::is_link_status_field(name) {
+            return false;
+        }
+        self.get_field(name).is_some()
     }
 
     /// C `scalcoutRecord.c::init_record` compiles CALC/OCAL into RPCL/ORPC and
@@ -657,6 +701,11 @@ impl Record for ScalcoutRecord {
                 }
                 if let Some(idx) = Self::str_inp_index(name) {
                     return Some(EpicsValue::String(self.str_inp_links[idx].clone().into()));
+                }
+                if Self::is_link_status_field(name) {
+                    // Link-derived, `Constant` for the default record's constant
+                    // links (see [`Self::is_link_status_field`]).
+                    return Some(EpicsValue::Enum(LINK_CON as u16));
                 }
                 None
             }
@@ -1009,6 +1058,7 @@ impl Record for ScalcoutRecord {
             "OOPT" => Some(SCALCOUT_OOPT_CHOICES),
             "DOPT" => Some(SCALCOUT_DOPT_CHOICES),
             "WAIT" => Some(SCALCOUT_WAIT_CHOICES),
+            _ if Self::is_link_status_field(field) => Some(LINK_STATUS_CHOICES),
             _ => None,
         }
     }
@@ -1017,6 +1067,36 @@ impl Record for ScalcoutRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn link_status_fields_read_derived_constant_and_reject_put() {
+        use crate::server::record::RecordInstance;
+        // INAV..INLV / IAAV..ILLV / OUTV are `special(SPC_NOMOD)`, DERIVED from
+        // the link. A default record's links are all constant, so C reports
+        // `Constant`(3). Before this fix these fields were declared but
+        // un-modeled, so `resolve_field` fell through to `declared_default` and
+        // served the dbd `initial("1")` (`Ext PV OK`) / OUTV's `initial` — the
+        // C-parity divergence the oracle measured (`caget SCALCOUT.INAV` → 1,
+        // C → 3). The put is already refused by the framework read-only gate
+        // (`is_no_mod`), matching C `S_db_noMod`; the fix is the read value.
+        let inst = RecordInstance::new("S:LS".into(), ScalcoutRecord::new());
+        for name in ["INAV", "INLV", "IAAV", "ILLV", "OUTV"] {
+            assert_eq!(
+                inst.resolve_field(name),
+                Some(EpicsValue::Enum(LINK_CON as u16)),
+                "{name} should read derived Constant(3), not the dbd initial"
+            );
+            assert!(
+                inst.is_no_mod(name),
+                "{name} is SPC_NOMOD — a client put must be refused"
+            );
+            assert_eq!(
+                inst.record.menu_field_choices(name),
+                Some(LINK_STATUS_CHOICES),
+                "{name} exposes the link-status choice labels"
+            );
+        }
+    }
 
     /// R9-74 (family): OOPT="On Change" is the numeric MDEL deadband test
     /// `fabs(pval - val) > mdel` (C `sCalcoutRecord.c:379`). A numeric change

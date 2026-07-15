@@ -712,6 +712,13 @@ impl AcalcoutRecord {
         IAAV_NAMES.iter().position(|&n| n == name)
     }
 
+    /// The link-connection-status menu fields INAV..INLV, IAAV..ILLV and OUTV
+    /// (`aCalcoutRecord.dbd:246-419`, `special(SPC_NOMOD)`): served read-only,
+    /// their value derived from the link at init (see [`Self::implements_field`]).
+    fn is_link_status_field(name: &str) -> bool {
+        name == "OUTV" || Self::inav_index(name).is_some() || Self::iaav_index(name).is_some()
+    }
+
     fn pa_index(name: &str) -> Option<usize> {
         PA_NAMES.iter().position(|&n| n == name)
     }
@@ -787,6 +794,23 @@ impl Record for AcalcoutRecord {
             self.recompile_ocal();
         }
         Ok(())
+    }
+
+    /// The link-status menus (INAV..INLV, IAAV..ILLV, OUTV) are served read-only
+    /// by `get_field`, but the record owns no WRITE path for them — they are
+    /// `SPC_NOMOD`, classified from the link at init (`aCalcoutRecord.c:208-242`)
+    /// and held as the record's `Default` of `Constant`(3) (the port has no
+    /// separate init_record seed step). The loader's `.dbd`-initial seed and
+    /// `.db field()` apply both key on this predicate to decide whether to WRITE
+    /// a field; answering `false` keeps them from storing the `.dbd`
+    /// `initial("1")` over the init-derived `Constant` — which is exactly the
+    /// corruption that made a loaded record read `Ext PV OK`(1). The read is
+    /// unaffected: `resolve_field` consults `get_field` independently.
+    fn implements_field(&self, name: &str) -> bool {
+        if Self::is_link_status_field(name) {
+            return false;
+        }
+        self.get_field(name).is_some()
     }
 
     /// C `aCalcoutRecord.c::special:469-491` — a put to CALC/OCAL recompiles
@@ -1403,13 +1427,13 @@ impl Record for AcalcoutRecord {
                     .ok_or_else(|| CaError::TypeMismatch("IVOV".into()))?;
                 Ok(())
             }
-            "OUTV" => match value {
-                EpicsValue::Short(v) => {
-                    self.outv = v;
-                    Ok(())
-                }
-                _ => Err(CaError::TypeMismatch("OUTV".into())),
-            },
+            // OUTV is `special(SPC_NOMOD)` (aCalcoutRecord.dbd:414-419): its
+            // value is DERIVED from the output link at init/`special`
+            // (aCalcoutRecord.c:216,538 — `*plinkValid = acalcoutINAV_CON` for a
+            // constant link), never set by a client. C `dbPut` rejects the put
+            // with `S_db_noMod` and leaves the link-derived value standing; the
+            // port mirrors that with `ReadOnlyField` (→ `ECA_NOWTACCESS`).
+            "OUTV" => Err(CaError::ReadOnlyField("OUTV".into())),
             "EGU" => match value {
                 EpicsValue::String(s) => {
                     self.egu = s;
@@ -1610,19 +1634,14 @@ impl Record for AcalcoutRecord {
                         _ => return Err(CaError::TypeMismatch(name.into())),
                     }
                 }
-                if let Some(idx) = Self::inav_index(name) {
-                    self.inav[idx] = value
-                        .to_f64()
-                        .ok_or_else(|| CaError::TypeMismatch(name.into()))?
-                        as i16;
-                    return Ok(());
-                }
-                if let Some(idx) = Self::iaav_index(name) {
-                    self.iaav[idx] = value
-                        .to_f64()
-                        .ok_or_else(|| CaError::TypeMismatch(name.into()))?
-                        as i16;
-                    return Ok(());
+                // INAV..INLV / IAAV..ILLV are `special(SPC_NOMOD)`
+                // (aCalcoutRecord.dbd:246-413): each is DERIVED from its input
+                // link's connection state at init/`special`
+                // (aCalcoutRecord.c:216,538), not client-settable. C `dbPut`
+                // rejects with `S_db_noMod`, leaving the derived value; the port
+                // mirrors that rather than storing the raw put over it.
+                if Self::inav_index(name).is_some() || Self::iaav_index(name).is_some() {
+                    return Err(CaError::ReadOnlyField(name.to_string()));
                 }
                 if let Some(idx) = Self::pa_index(name) {
                     self.pa[idx] = value
@@ -1881,6 +1900,34 @@ mod tests {
         assert_eq!(rec.get_field("ILLV"), Some(EpicsValue::Short(3)));
         assert_eq!(rec.get_field("OUTV"), Some(EpicsValue::Short(3)));
         assert_eq!(rec.get_field("VAL"), Some(EpicsValue::Double(0.0)));
+    }
+
+    #[test]
+    fn link_status_fields_reject_put_and_keep_derived_value() {
+        // INAV..INLV / IAAV..ILLV / OUTV are `special(SPC_NOMOD)` — derived from
+        // the link, not client-settable. A direct put must be rejected
+        // (`ECA_NOWTACCESS`, C `S_db_noMod`) and leave the link-derived value
+        // standing. A default record has all-constant links → every field = 3
+        // (`acalcoutINAV_CON`). This is the C-parity case the oracle measured:
+        // `caput ACALCOUT.INAV 0` then caget → C returns 3, not the put value.
+        for name in ["INAV", "INLV", "IAAV", "ILLV", "OUTV"] {
+            let mut rec = AcalcoutRecord::new();
+            assert_eq!(
+                rec.get_field(name),
+                Some(EpicsValue::Short(LINK_CON)),
+                "{name} should start at derived Constant(3)"
+            );
+            let err = rec.put_field(name, EpicsValue::Short(0));
+            assert!(
+                matches!(err, Err(CaError::ReadOnlyField(_))),
+                "{name} put should be rejected as read-only, got {err:?}"
+            );
+            assert_eq!(
+                rec.get_field(name),
+                Some(EpicsValue::Short(LINK_CON)),
+                "{name} must stay at the derived Constant(3) after a rejected put"
+            );
+        }
     }
 
     #[test]

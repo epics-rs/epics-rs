@@ -10,7 +10,7 @@ use crate::server::recgbl::EventMask;
 use crate::server::snapshot::{
     ControlInfo, DisplayInfo, EnumInfo, EnumStringForm, PropertySupport,
 };
-use crate::types::{DbFieldType, EpicsValue, PvString};
+use crate::types::{DbFieldType, EpicsValue, PvString, c_parse};
 
 use super::alarm::{AlarmSeverity, AnalogAlarmConfig};
 use super::common_fields::CommonFields;
@@ -416,12 +416,33 @@ fn coerce_common_field(name: &str, value: EpicsValue, bound: MenuBound) -> CaRes
             name, choices, dbf, &text, bound,
         );
     }
-    // Numeric (non-menu) common field: C's `dbPut` runs the string through
-    // `epicsParse*`, which tolerates whitespace around the digits.
-    match EpicsValue::parse(dbf, text.trim()) {
-        Ok(parsed) => Ok(parsed),
-        Err(_) => Ok(value),
-    }
+    // Numeric (non-menu) common field: C's `dbPut` runs the string through the
+    // SAME `epicsParse*` (`dbConvert.c` `putString*`) the record data fields use,
+    // and a non-zero status REFUSES the whole put (`dbAccess.c:1362`, mapped to
+    // `ECA_PUTFAIL`). Route it through the single owner of that conversion —
+    // [`c_parse::put_string`] — instead of the field-blind `EpicsValue::parse`,
+    // which wrapped (`256 as u8 == 0`) and swallowed the error (`Err(_) =>
+    // Ok(value)`), so `caput REC.PROC 256` and `caput REC.PROC notanumber` were
+    // accepted where C rejects them.
+    //
+    // Key the parse on the field's C-DECLARED width, not its stored variant: the
+    // `DBF_UCHAR` flags (DISP/UDF/TPRO/RPRO/BKPT/PROC, `dbCommon.dbd`) are held in
+    // the signed `Char` variant here but C parses them with `epicsParseUInt8`, so
+    // `caput REC.PROC 255` and `caput REC.PROC -1` (→255) are accepted and only
+    // `256`+/non-numeric refused. `put_string` returns the value in the declared
+    // variant; project it back onto the stored variant through the one
+    // value-coercion owner (byte-identity for `UChar`→`Char`).
+    let declared = match dbf {
+        DbFieldType::Char => DbFieldType::UChar,
+        other => other,
+    };
+    let Some(target) = c_parse::NumericField::of(declared) else {
+        // Unreachable: every numeric `stored_common_field_type` (Char/Short/
+        // Double, all with a numeric row) reaches here; the `Enum` menu types
+        // returned above. Keep the pre-parse value rather than panic.
+        return Ok(value);
+    };
+    c_parse::put_string(name, target, text.trim()).map(|parsed| parsed.convert_to(dbf))
 }
 
 /// The alarm-acknowledge request types C's `dbPut` dispatches on

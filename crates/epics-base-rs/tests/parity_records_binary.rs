@@ -30,7 +30,7 @@ fn mbbi_direct_exposes_upper_16_bits() {
     // VAL here — that is mbboDirect's opposite data flow).
     rec.rval = 1 << 26;
     rec.process().unwrap();
-    assert!(matches!(rec.get_field("B1A"), Some(EpicsValue::Char(1))));
+    assert!(matches!(rec.get_field("B1A"), Some(EpicsValue::UChar(1))));
     assert!(matches!(
         rec.get_field("VAL"),
         Some(EpicsValue::Long(v)) if v == (1 << 26)
@@ -55,7 +55,7 @@ fn mbbi_direct_bit_put_reverts_on_process() {
     rec.process().unwrap();
     assert_eq!(rec.bits[0], 0, "process re-derives B0 from VAL=0");
     assert_eq!(rec.val, 0, "VAL unchanged across the bit put + process");
-    assert!(matches!(rec.get_field("B0"), Some(EpicsValue::Char(0))));
+    assert!(matches!(rec.get_field("B0"), Some(EpicsValue::UChar(0))));
 }
 
 #[test]

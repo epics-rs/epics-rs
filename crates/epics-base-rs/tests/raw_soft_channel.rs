@@ -202,11 +202,11 @@ async fn mbbi_direct_raw_soft_channel_masks_then_spreads_bits() {
     process(&db, "RMBID").await;
 
     assert_eq!(field(&db, "RMBID", "RVAL").await, EpicsValue::ULong(0x125));
-    assert_eq!(field(&db, "RMBID", "B0").await, EpicsValue::Char(1));
-    assert_eq!(field(&db, "RMBID", "B1").await, EpicsValue::Char(0));
-    assert_eq!(field(&db, "RMBID", "B2").await, EpicsValue::Char(1));
-    assert_eq!(field(&db, "RMBID", "B5").await, EpicsValue::Char(1));
-    assert_eq!(field(&db, "RMBID", "B8").await, EpicsValue::Char(1));
+    assert_eq!(field(&db, "RMBID", "B0").await, EpicsValue::UChar(1));
+    assert_eq!(field(&db, "RMBID", "B1").await, EpicsValue::UChar(0));
+    assert_eq!(field(&db, "RMBID", "B2").await, EpicsValue::UChar(1));
+    assert_eq!(field(&db, "RMBID", "B5").await, EpicsValue::UChar(1));
+    assert_eq!(field(&db, "RMBID", "B8").await, EpicsValue::UChar(1));
 }
 
 // ---- output dsets: the OUT link carries RVAL, not VAL/OVAL ----

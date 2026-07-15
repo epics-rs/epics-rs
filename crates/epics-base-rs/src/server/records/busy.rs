@@ -234,6 +234,26 @@ impl Record for BusyRecord {
         "busy"
     }
 
+    /// C `busyRecord.c:195-208`: `process()` clears `udf` to FALSE only on a
+    /// successful closed-loop DOL fetch (`if(status==0){ prec->val = val;
+    /// prec->udf = FALSE; }`, `:202-204`); a bare (no-DOL) record reads the
+    /// stored VAL and leaves `udf` alone, so `checkAlarms` (`:337`) raises
+    /// UDF_ALARM every cycle. busy is boRecord's process verbatim here — it
+    /// never re-derives `udf` from the stored VAL, so it opts out of the
+    /// framework's blanket per-cycle clear (mirrors [`bo`](super::bo)).
+    fn clears_udf(&self) -> bool {
+        false
+    }
+
+    /// C `busyRecord.c:337` tests `if (prec->udf == TRUE)` — exact-one. Combined
+    /// with `clears_udf() == false`, a direct `caput X.UDF 255` (or `-1`, stored
+    /// `255`) leaves `udf == 255` at `checkAlarms`, and `255 != TRUE`, so C
+    /// raises NO UDF_ALARM — STAT/SEVR stay `NO_ALARM`. bo shares this
+    /// (`boRecord.c:371`); see [`Record::udf_alarm_on_exact_one`].
+    fn udf_alarm_on_exact_one(&self) -> bool {
+        true
+    }
+
     /// W10-E5. `busyRecord.c:397-400` — a failed SIML read returns from
     /// `writeValue` BEFORE `write_busy` and before the SIOL `dbPutLink`:
     ///
@@ -308,13 +328,29 @@ impl Record for BusyRecord {
         Ok(ProcessOutcome::complete_with(actions))
     }
 
-    /// C `busyRecord.c::checkAlarms` (bo variant) — STATE alarm
-    /// (ZSV for VAL=0, OSV for VAL=1) and COS alarm (COSV). Raising
-    /// these into `common` lets the framework's IVOA handler gate the
-    /// OUT-link write: with SEVR=INVALID and IVOA="Don't drive", the
-    /// framework's `skip_out` path suppresses the write entirely.
+    /// C `busyRecord.c::checkAlarms` (`:332-357`, boRecord's verbatim) — the UDF
+    /// alarm FIRST, then the STATE alarm (ZSV for VAL=0, OSV for VAL=1), then COS
+    /// (COSV). The udf raise must lead: C `recGblSetSevr` overrides STAT/SEVR only
+    /// on a strictly greater severity, so on a fresh record with `UDFS == INVALID`
+    /// the equal-severity STATE alarm cannot displace the UDF that was set first —
+    /// STAT stays UDF. busy does NOT early-return on UDF, so STATE/COS still
+    /// evaluate. Raising it here (idempotent with the framework's
+    /// `rec_gbl_check_udf`, which runs after this hook) is what puts UDF ahead of
+    /// STATE. Raising STATE=INVALID into `common` also lets the framework's IVOA
+    /// handler gate the OUT-link write (IVOA="Don't drive" → `skip_out`).
     fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
         use crate::server::recgbl::{self, alarm_status};
+        use crate::server::record::AlarmSeverity;
+
+        // C `busyRecord.c:337` — `if (prec->udf == TRUE)` (exact-one, see
+        // `udf_alarm_on_exact_one`), raised before STATE with no early return.
+        if recgbl::udf_alarm_active(common.udf, true) {
+            recgbl::rec_gbl_set_sevr(
+                common,
+                alarm_status::UDF_ALARM,
+                AlarmSeverity::from_u16(common.udfs as u16),
+            );
+        }
 
         let state_sev = if self.val == 0 { self.zsv } else { self.osv };
         if state_sev != AlarmSevr::None {
@@ -847,14 +883,23 @@ mod tests {
         rec.cosv = AlarmSevr::Minor;
         rec.lalm = 0;
         rec.val = 1; // changed from lalm=0
-        let mut common = CommonFields::default();
+        // C `busyRecord.c:337` raises UDF_ALARM (at UDFS=INVALID) before COS;
+        // `CommonFields::default()` has udf=1, so clear it to isolate the COS
+        // path (as the bi/bo parity tests do).
+        let mut common = CommonFields {
+            udf: 0,
+            ..Default::default()
+        };
         rec.check_alarms(&mut common);
         // COS alarm fires and advances lalm.
         assert_eq!(rec.lalm, 1);
         assert_eq!(common.nsev, crate::server::record::AlarmSeverity::Minor);
 
         // Same val — no COS change.
-        let mut common2 = CommonFields::default();
+        let mut common2 = CommonFields {
+            udf: 0,
+            ..Default::default()
+        };
         rec.check_alarms(&mut common2);
         assert_eq!(rec.lalm, 1);
         assert_eq!(common2.nsev, crate::server::record::AlarmSeverity::NoAlarm);
@@ -1003,7 +1048,12 @@ mod tests {
         let mut rec = BusyRecord::new();
         rec.osv = AlarmSevr::Invalid;
         rec.val = 1;
-        let mut common = CommonFields::default();
+        // Clear the default UDF (udf=1) to isolate the STATE path; the UDF-first
+        // precedence is covered by `check_alarms_udf_precedes_state`.
+        let mut common = CommonFields {
+            udf: 0,
+            ..Default::default()
+        };
         rec.check_alarms(&mut common);
         // INVALID state severity propagates into common — the
         // framework's IVOA "Don't drive" then suppresses the OUT write.
@@ -1014,12 +1064,39 @@ mod tests {
         );
     }
 
+    /// C `busyRecord.c::checkAlarms:337-350` raises UDF_ALARM (at UDFS=INVALID)
+    /// BEFORE the STATE alarm, and `recGblSetSevr` overrides only on a strictly
+    /// greater severity — so on a `udf=1` record the equal-severity INVALID STATE
+    /// alarm cannot displace it: STAT stays UDF. This is the divergence the
+    /// oracle saw as `stat C='UDF' port='NO_ALARM'` after a `pp(TRUE)` put.
+    #[test]
+    fn check_alarms_udf_precedes_state() {
+        use crate::server::record::{AlarmSeverity, CommonFields};
+        let mut rec = BusyRecord::new();
+        rec.osv = AlarmSevr::Invalid;
+        rec.val = 1;
+        // Default udf=1 (a fresh, never-DOL-sourced record).
+        let mut common = CommonFields::default();
+        rec.check_alarms(&mut common);
+        assert_eq!(common.nsev, AlarmSeverity::Invalid);
+        assert_eq!(
+            common.nsta,
+            crate::server::recgbl::alarm_status::UDF_ALARM,
+            "UDF is raised first and the equal-severity STATE cannot displace it"
+        );
+    }
+
     #[test]
     fn test_check_alarms_no_alarm_when_severities_unset() {
         use crate::server::record::{AlarmSeverity, CommonFields};
         let mut rec = BusyRecord::new();
         rec.val = 0;
-        let mut common = CommonFields::default();
+        // Clear the default UDF (udf=1) so this exercises the "no severity set"
+        // path rather than the UDF alarm.
+        let mut common = CommonFields {
+            udf: 0,
+            ..Default::default()
+        };
         rec.check_alarms(&mut common);
         assert_eq!(common.nsev, AlarmSeverity::NoAlarm);
     }

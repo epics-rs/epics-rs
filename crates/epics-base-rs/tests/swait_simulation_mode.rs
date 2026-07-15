@@ -317,13 +317,16 @@ async fn r11_62_busy_simm_yes_redirects_the_output_to_siol() {
     b.put_field("SIMM", EpicsValue::Short(1)).unwrap(); // YES
     b.put_field("VAL", EpicsValue::Enum(1)).unwrap();
     db.add_record("B", Box::new(b)).await.unwrap();
-    db.get_record("B")
-        .await
-        .unwrap()
-        .write()
-        .await
-        .put_common_field("OUT", EpicsValue::String("B_OUT".into()))
-        .unwrap();
+    {
+        let inst = db.get_record("B").await.unwrap();
+        let mut w = inst.write().await;
+        w.put_common_field("OUT", EpicsValue::String("B_OUT".into()))
+            .unwrap();
+        // busy is `clears_udf() == false` (busyRecord.c:195-208), so a bare
+        // record stays UDF and its INVALID would mask the SIMM_ALARM/SIMS under
+        // test. VAL was defined above; clear UDF as a real dbPut to VAL does.
+        w.put_common_field("UDF", EpicsValue::Char(0)).unwrap();
+    }
 
     let mut visited = HashSet::new();
     db.process_record_with_links("B", &mut visited, 0)
@@ -364,13 +367,16 @@ async fn r11_62_busy_simm_no_drives_the_real_output() {
         .unwrap();
     b.put_field("VAL", EpicsValue::Enum(1)).unwrap();
     db.add_record("B2", Box::new(b)).await.unwrap();
-    db.get_record("B2")
-        .await
-        .unwrap()
-        .write()
-        .await
-        .put_common_field("OUT", EpicsValue::String("B2_OUT".into()))
-        .unwrap();
+    {
+        let inst = db.get_record("B2").await.unwrap();
+        let mut w = inst.write().await;
+        w.put_common_field("OUT", EpicsValue::String("B2_OUT".into()))
+            .unwrap();
+        // See r11_62_busy_simm_yes: busy stays UDF without an explicit clear
+        // (clears_udf() == false); VAL was defined above, so clear UDF to assert
+        // the NoAlarm the SIMM=NO negative control expects.
+        w.put_common_field("UDF", EpicsValue::Char(0)).unwrap();
+    }
 
     let mut visited = HashSet::new();
     db.process_record_with_links("B2", &mut visited, 0)

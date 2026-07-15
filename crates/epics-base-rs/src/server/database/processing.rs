@@ -433,7 +433,7 @@ fn ext_time_pair((secs, ns, utag): (i64, i32, u64)) -> (std::time::SystemTime, u
 /// fanout/seq SELN post in `links::apply_selm_alarm` are NOT clients: they
 /// carry C's `dbAccess.c:586-593` and `fanoutRecord.c:116` masks, not
 /// `recGblResetAlarms`'.)
-fn alarm_field_posts(
+pub(crate) fn alarm_field_posts(
     common: &crate::server::record::CommonFields,
     alarm_result: &crate::server::recgbl::AlarmResetResult,
 ) -> Vec<(&'static str, crate::server::recgbl::EventMask)> {

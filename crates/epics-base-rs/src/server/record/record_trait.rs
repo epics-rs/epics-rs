@@ -2192,6 +2192,26 @@ pub trait Record: Send + Sync + 'static {
         &[]
     }
 
+    /// True iff the C `special()` for a put to `put_field` runs the record's
+    /// own `monitor()` — whose first act is `recGblResetAlarms(prec)`, which
+    /// commits `nsta`/`nsev` into `stat`/`sevr` and clears the born-UDF alarm.
+    ///
+    /// `compress` is the case this exists for: `compressRecord.c::special`
+    /// (:385-388) calls `reset(prec); monitor(prec);` on any SPC_RESET write
+    /// (RES/ALG/PBUF/BALG/N), and `compressRecord.c::monitor` (:103) opens with
+    /// `recGblResetAlarms`. A born-UDF compress record therefore transitions to
+    /// NO_ALARM the moment one of those fields is put, with no process cycle.
+    ///
+    /// The framework already posts the `db_post_events` half of that `monitor()`
+    /// through [`Record::monitor_side_effect_fields`]; this hook is the
+    /// `recGblResetAlarms` half. When it returns true, the put owner
+    /// (`field_io`'s `dbPut` paths) runs `rec_gbl_reset_alarms` and posts the
+    /// resulting STAT/SEVR/AMSG/ACKS transition. Default: false (a `special()`
+    /// that does not run the record's `monitor()`).
+    fn special_commits_alarms(&self, _put_field: &str) -> bool {
+        false
+    }
+
     /// Downcast to concrete type for device support init injection.
     /// Override in record types that need device support to inject state (e.g., MotorRecord).
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {

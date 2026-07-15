@@ -577,6 +577,16 @@ impl Record for CompressRecord {
         }
     }
 
+    /// The `recGblResetAlarms` half of C's SPC_RESET `special()`. C's `monitor()`
+    /// (compressRecord.c:103) — which `special()` invokes for every SPC_RESET
+    /// write — opens with `recGblResetAlarms(prec)`, so a put to any of the five
+    /// reset fields commits the record's pending alarm (clearing the born-UDF of
+    /// a never-processed compress) without a process cycle. Keyed on the same
+    /// five fields as [`Record::monitor_side_effect_fields`].
+    fn special_commits_alarms(&self, put_field: &str) -> bool {
+        COMPRESS_SPC_RESET_FIELDS.contains(&put_field)
+    }
+
     /// C `init_record` pass 0 (compressRecord.c:307-315): allocate the sample
     /// buffer, then `reset(prec)`. The reset is what clears a `.db`-loaded
     /// `field(RES,"1")` — the static loader bypasses `special()`, so without

@@ -87,7 +87,7 @@ impl Runner {
             Ok(p) => p,
             Err(e) => return errored_cases(record_type, &fields, None, &db_text, &e),
         };
-        let pair = match Pair::boot(&self.tools, &db) {
+        let pair = match Pair::boot(&self.tools, &db, &rec) {
             Ok(p) => p,
             // The IOC would not boot: every field of this type is an ERROR, and
             // not one of them is scored as agreement.
@@ -156,7 +156,7 @@ impl Runner {
             Ok(p) => p,
             Err(e) => return errored_puts(record_type, &plan, &db_text, &e),
         };
-        let pair = match Pair::boot(&self.tools, &db) {
+        let pair = match Pair::boot(&self.tools, &db, &rec_of(0)) {
             Ok(p) => p,
             Err(e) => return errored_puts(record_type, &plan, &db_text, &e.to_string()),
         };
@@ -258,7 +258,7 @@ impl Runner {
             Ok(p) => p,
             Err(e) => return Some(errored_case(record_type, "VAL", None, repro, &e)),
         };
-        let pair = match Pair::boot(&self.tools, &db) {
+        let pair = match Pair::boot(&self.tools, &db, &rec) {
             Ok(p) => p,
             Err(e) => {
                 return Some(errored_case(

@@ -28,8 +28,16 @@ const SEQ_SELM_CHOICES: &[&str] = &["All", "Specified", "Mask"];
     init = seq_init_record
 )]
 pub struct SeqRecord {
-    #[field(type = "Enum")]
-    pub val: u16,
+    // VAL is `field(VAL,DBF_LONG){ pp(TRUE) }` (seqRecord.dbd:21-25) — the "Used
+    // to trigger" field. It carries no output value: C `process`
+    // (seqRecord.c) never reads or writes VAL, it only sequences the DOn→LNKn
+    // writes. A `caput X.VAL 1` therefore stores 1 verbatim and pp(TRUE)
+    // reprocesses. Declaring it `DBF_LONG` (i32) routes a `DBR_STRING` put
+    // through the numeric `c_parse::put_string` Long row; the previous
+    // `Enum`/u16 declaration sent it to the enum choice-matcher, which refused a
+    // bare "1" as S_db_badChoice.
+    #[field(type = "Long")]
+    pub val: i32,
     // OLDN is `DBF_USHORT` (seqRecord.dbd:54), change-detection state for the
     // SELN monitor: C `process` posts a SELN monitor when `seln != oldn`, then
     // copies `oldn = seln` (seqRecord.c:230-232). Its init value is `seln`

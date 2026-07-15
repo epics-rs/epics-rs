@@ -4247,6 +4247,17 @@ impl Record for AsynRecord {
     fn clears_udf(&self) -> bool {
         true
     }
+
+    /// C `asynRecord.c` init_record pass 0: `pasynRec->udf = 0;
+    /// recGblResetAlarms(pasynRec)` — set unconditionally, before any connect,
+    /// so a freshly loaded asyn record is defined and no-alarm even against a
+    /// disconnected port. Without this the record shows the born
+    /// UDF/INVALID/UDF (a device-config record has no undefined-value state to
+    /// justify it). The init owner performs the reset — see
+    /// [`Record::init_resets_alarms`].
+    fn init_resets_alarms(&self) -> bool {
+        true
+    }
 }
 
 impl AsynRecord {
@@ -5541,6 +5552,49 @@ mod tests {
             rec.get_field("TFIL"),
             Some(EpicsValue::String("Unknown".into())),
             "get(TFIL) must serve C's init_record seed with no live port"
+        );
+    }
+
+    /// End-to-end: a freshly loaded asyn record — no port, never processed —
+    /// reads UDF=0 / STAT=NO_ALARM / SEVR=NO_ALARM, C `asynRecord.c`
+    /// init_record pass 0's `pasynRec->udf = 0; recGblResetAlarms(pasynRec)`.
+    /// Built through `IocBuilder` so the init owner's `run_init_passes` (where
+    /// [`Record::init_resets_alarms`] is honoured) actually runs — the record
+    /// struct alone cannot reach the common UDF/STAT/SEVR fields.
+    #[tokio::test]
+    async fn init_resets_alarms_to_defined_no_alarm() {
+        use epics_base_rs::server::ioc_builder::IocBuilder;
+        use std::collections::HashMap;
+
+        let macros = HashMap::new();
+        let (name, factory) = crate::asyn_record::asyn_record_factory();
+        let (db, _autosave) = IocBuilder::new()
+            .register_record_type(name, factory)
+            .db_string("record(asyn, \"TEST:ASYN:UDF\") {}\n", &macros)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+
+        let rec = db
+            .get_record("TEST:ASYN:UDF")
+            .await
+            .expect("asyn record loaded");
+        let inst = rec.read().await;
+        assert_eq!(
+            inst.get_common_field("UDF"),
+            Some(EpicsValue::UChar(0)),
+            "C init_record pass 0: udf=0 (a device-config record is defined at load)"
+        );
+        assert_eq!(
+            inst.get_common_field("STAT"),
+            Some(EpicsValue::Short(0)),
+            "recGblResetAlarms → STAT=NO_ALARM"
+        );
+        assert_eq!(
+            inst.get_common_field("SEVR"),
+            Some(EpicsValue::Short(0)),
+            "recGblResetAlarms → SEVR=NO_ALARM"
         );
     }
 

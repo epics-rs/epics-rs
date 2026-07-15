@@ -130,6 +130,55 @@ async fn r9_70_put_to_dlya_quantizes_dly1_and_leaves_dlya_raw() {
     );
 }
 
+/// Oracle symptom (read/mon): the DEFAULT `DLYn` is `0.0`, and C's `NINT`
+/// casts `0.0` to the integer `0`, so every served/monitored `DLYn` is `+0.0`
+/// — it renders `"0"`. An `f64::trunc` port produced `-0.0` (`(-0.0 -
+/// 0.5).trunc()` = `-0.0`), which renders `"-0"`.
+#[tokio::test]
+async fn r9_70_default_dly_serves_positive_zero_not_negative_zero() {
+    let mut rec = SseqRecord::default();
+    rec.init_record(0).unwrap();
+    for n in ["1", "2", "3", "4", "5", "6", "7", "8", "9", "A"] {
+        let v = dly(&rec, n);
+        assert_eq!(v, 0.0, "default DLY{n} is 0.0");
+        assert!(
+            v.is_sign_positive(),
+            "served DLY{n} must be +0.0 (renders \"0\"), got a negative zero \
+             (renders \"-0\")"
+        );
+    }
+}
+
+/// Oracle symptom (put): a huge `caput DLY1` overflows C's `(long)` cast to
+/// i64::MIN, so the served value is `quantum * i64::MIN` ≈ -9.22e16 — finite
+/// and negative. An `f64::trunc` port kept `inf`.
+#[tokio::test]
+async fn r9_70_huge_put_to_dly1_overflows_to_c_long_min() {
+    let q = thread_sleep_quantum();
+    let expect_overflow = q * (i64::MIN as f64);
+
+    let mut rec = SseqRecord::default();
+    rec.put_field("DLY1", EpicsValue::Double(1e300)).unwrap();
+    rec.special("DLY1", true).unwrap();
+    let v = dly(&rec, "1");
+    assert_eq!(
+        v, expect_overflow,
+        "a huge DLY1 must serve C's overflow value ~-9.22e16, not inf"
+    );
+    assert!(v.is_finite() && v < 0.0, "must be finite negative, got {v}");
+
+    // The same for a value that rounds to exactly zero on the put path.
+    let mut rec2 = SseqRecord::default();
+    rec2.put_field("DLY1", EpicsValue::Double(-0.0)).unwrap();
+    rec2.special("DLY1", true).unwrap();
+    let z = dly(&rec2, "1");
+    assert_eq!(z, 0.0);
+    assert!(
+        z.is_sign_positive(),
+        "a -0.0 put to DLY1 must serve +0.0, not -0.0"
+    );
+}
+
 /// The framework put path (`special` after the store) must show the same
 /// thing end to end: DLYA raw, DLY1 rounded.
 #[tokio::test]

@@ -176,7 +176,7 @@ async fn r9_69_asub_failed_inpn_read_skips_the_subroutine() {
     let inst = arc.read().await;
     assert_eq!(
         inst.record.get_field("VAL"),
-        Some(EpicsValue::Double(-1.0)),
+        Some(EpicsValue::Long(-1)),
         "a failed INPB read skips do_sub, so VAL keeps -1 and never becomes \
          the subroutine's status 7"
     );

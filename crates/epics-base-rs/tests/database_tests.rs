@@ -9204,7 +9204,7 @@ async fn asub_record_val_is_return_status_and_negative_soft_alarms() {
         let inst = arc.read().await;
         assert_eq!(
             inst.record.get_field("VAL"),
-            Some(EpicsValue::Double(42.0)),
+            Some(EpicsValue::Long(42)),
             "aSub VAL must be the return status (42), not the closure's 999"
         );
     }
@@ -9213,7 +9213,7 @@ async fn asub_record_val_is_return_status_and_negative_soft_alarms() {
         let inst = arc.read().await;
         assert_eq!(
             inst.record.get_field("VAL"),
-            Some(EpicsValue::Double(-5.0)),
+            Some(EpicsValue::Long(-5)),
             "aSub VAL must carry the negative return status (-5)"
         );
         assert_eq!(
@@ -9372,7 +9372,7 @@ async fn asub_lflg_read_reresolves_subroutine_from_subl_link() {
     );
     assert_eq!(
         field(&db, "VAL").await,
-        Some(EpicsValue::Double(11.0)),
+        Some(EpicsValue::Long(11)),
         "sub_a must have run (VAL = its return status)"
     );
 
@@ -9392,7 +9392,7 @@ async fn asub_lflg_read_reresolves_subroutine_from_subl_link() {
     );
     assert_eq!(
         field(&db, "VAL").await,
-        Some(EpicsValue::Double(22.0)),
+        Some(EpicsValue::Long(22)),
         "sub_b must have run after the name changed"
     );
 
@@ -9417,7 +9417,7 @@ async fn asub_lflg_read_reresolves_subroutine_from_subl_link() {
     );
     assert_eq!(
         field(&db, "VAL").await,
-        Some(EpicsValue::Double(22.0)),
+        Some(EpicsValue::Long(22)),
         "bad sub: subroutine not run, VAL frozen at the last good result"
     );
 }
@@ -9453,7 +9453,7 @@ record(aSub, "ASUB_S") {
     let inst = arc.read().await;
     assert_eq!(
         inst.record.get_field("VAL"),
-        Some(EpicsValue::Double(7.0)),
+        Some(EpicsValue::Long(7)),
         "aSub LFLG=IGNORE: subroutine resolved from SNAM at init must run"
     );
 }
@@ -9522,7 +9522,7 @@ record(aSub, "ASUB_INIT") {
     let asub = db.get_record("ASUB_INIT").await.unwrap();
     assert_eq!(
         asub.read().await.record.get_field("VAL"),
-        Some(EpicsValue::Double(88.0)),
+        Some(EpicsValue::Long(88)),
         "aSub INAM init write visible after init"
     );
 
@@ -9534,7 +9534,7 @@ record(aSub, "ASUB_INIT") {
         .unwrap();
     assert_eq!(
         asub.read().await.record.get_field("VAL"),
-        Some(EpicsValue::Double(5.0)),
+        Some(EpicsValue::Long(5)),
         "aSub SNAM routine runs after INAM and publishes its status as VAL"
     );
 }
@@ -9589,7 +9589,7 @@ async fn asub_lflg_read_reresolves_on_foreign_process_path() {
     db.process_record("ASUB_F").await.unwrap();
     assert_eq!(
         val(&db).await,
-        Some(EpicsValue::Double(11.0)),
+        Some(EpicsValue::Long(11)),
         "foreign path: sub_a resolved and ran"
     );
 
@@ -9598,7 +9598,7 @@ async fn asub_lflg_read_reresolves_on_foreign_process_path() {
     db.process_record("ASUB_F").await.unwrap();
     assert_eq!(
         val(&db).await,
-        Some(EpicsValue::Double(22.0)),
+        Some(EpicsValue::Long(22)),
         "foreign path: re-resolved sub_b after the name changed"
     );
 
@@ -9608,7 +9608,7 @@ async fn asub_lflg_read_reresolves_on_foreign_process_path() {
     db.process_record("ASUB_F").await.unwrap();
     assert_eq!(
         val(&db).await,
-        Some(EpicsValue::Double(22.0)),
+        Some(EpicsValue::Long(22)),
         "foreign path bad sub: subroutine skipped, VAL frozen"
     );
 }

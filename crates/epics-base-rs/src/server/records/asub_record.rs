@@ -67,7 +67,12 @@ fn asub_output_event_fields() -> &'static [&'static str] {
 /// `FTx` field selects the interpretation. The subroutine itself is
 /// invoked by the framework (`RecordInstance::subroutine`).
 pub struct ASubRecord {
-    pub val: f64,
+    /// The subroutine return status, published as VAL (`aSubRecord.c:223`
+    /// `prec->val = status`). VAL is `DBF_LONG` (`aSubRecord.dbd.pod:126`), i.e.
+    /// `epicsInt32`, so a string caput parses via `epicsParseLong` and an
+    /// out-of-i32-range or fractional value is REFUSED — modeling it as i32
+    /// keys the put on the integer row instead of accepting any double.
+    pub val: i32,
     pub snam: PvString,
     pub inam: PvString,
     /// Input links `INPA..INPU`.
@@ -148,7 +153,7 @@ fn asub_output_links() -> &'static [(&'static str, &'static str)] {
 impl Default for ASubRecord {
     fn default() -> Self {
         Self {
-            val: 0.0,
+            val: 0,
             snam: PvString::new(),
             inam: PvString::new(),
             inp: std::array::from_fn(|_| String::new()),
@@ -263,7 +268,7 @@ impl Record for ASubRecord {
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
-            "VAL" => return Some(EpicsValue::Double(self.val)),
+            "VAL" => return Some(EpicsValue::Long(self.val)),
             "SNAM" => return Some(EpicsValue::String(self.snam.clone())),
             "INAM" => return Some(EpicsValue::String(self.inam.clone())),
             "BRSV" => return Some(EpicsValue::Short(self.brsv)),
@@ -293,8 +298,15 @@ impl Record for ASubRecord {
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
         match name {
             "VAL" => {
+                // VAL is DBF_LONG; the string→native put parse already rejects a
+                // fractional / out-of-i32 caput in `coerce_put_value` (target is
+                // DBF_LONG from `get_field`). Here VAL is also the status field
+                // that subroutine closures and the framework assign directly with
+                // whatever numeric they hold — C `prec->val = status` truncates
+                // any arithmetic value to epicsInt32, so accept any numeric and
+                // project it onto DBF_LONG rather than rejecting a Double writer.
                 self.val = value
-                    .to_f64()
+                    .to_dbf_i32()
                     .ok_or_else(|| CaError::TypeMismatch(name.into()))?;
                 return Ok(());
             }

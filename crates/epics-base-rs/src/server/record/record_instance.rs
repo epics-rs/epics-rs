@@ -3291,9 +3291,11 @@ impl RecordInstance {
         // closure may have written to VAL. `sub` does NOT do this — its VAL
         // is the value the subroutine computed.
         if self.record.record_type() == "aSub" {
+            // aSub VAL is DBF_LONG (epicsInt32); the do_sub status is a C `long`
+            // truncated into it (`prec->val = status`).
             let _ = self
                 .record
-                .put_field("VAL", EpicsValue::Double(status as f64));
+                .put_field("VAL", EpicsValue::Long(status as i32));
         }
 
         // A negative status raises SOFT_ALARM at the record's BRSV severity

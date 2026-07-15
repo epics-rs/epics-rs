@@ -152,12 +152,23 @@ impl std::fmt::Display for Side {
 /// the tree is absent it is an ERROR, not a skipped-and-passed run.
 #[derive(Debug, Clone)]
 pub struct CTools {
+    /// Base's CA client tools (caget/caput/cainfo/camonitor) — the drivers.
     pub bin: PathBuf,
+    /// The C ground-truth IOC binary. This is the *fat* softIoc built under
+    /// `oracle-ioc/`, which links busy/calc/asyn record+device support on top
+    /// of base, so the sweep covers those record types with the same
+    /// `softIoc -S -d db` interface base's stock softIoc provides.
+    pub ioc_bin: PathBuf,
 }
 
 impl CTools {
     pub const DEFAULT_BIN: &'static str = "/home/stevek/work/epics-base/bin/linux-x86_64";
-    pub const DEFAULT_DBD: &'static str = "/home/stevek/work/epics-base/dbd/softIoc.dbd";
+    /// The fat dbd — base's 34 record types plus busy/transform/sseq/acalcout/
+    /// scalcout/asyn. A strict superset of base's `softIoc.dbd`.
+    pub const DEFAULT_DBD: &'static str = "/home/stevek/work/oracle-ioc/dbd/softIoc.dbd";
+    /// The fat softIoc binary that serves the `DEFAULT_DBD` record types.
+    pub const DEFAULT_IOC_BIN: &'static str =
+        "/home/stevek/work/oracle-ioc/bin/linux-x86_64/softIoc";
 
     /// Locate the C tree, honoring `EPICS_BASE_BIN` for hosts where it lives
     /// elsewhere. Verifies every binary the harness actually invokes, so a
@@ -173,12 +184,22 @@ impl CTools {
                 bin.display()
             ));
         }
-        for tool in ["softIoc", "caget", "caput", "cainfo", "camonitor"] {
+        for tool in ["caget", "caput", "cainfo", "camonitor"] {
             if !bin.join(tool).is_file() {
                 return err(format!("missing C tool `{tool}` in {}", bin.display()));
             }
         }
-        Ok(Self { bin })
+        let ioc_bin = std::env::var("EPICS_ORACLE_IOC_BIN")
+            .unwrap_or_else(|_| Self::DEFAULT_IOC_BIN.to_string());
+        let ioc_bin = PathBuf::from(ioc_bin);
+        if !ioc_bin.is_file() {
+            return err(format!(
+                "fat C softIoc not found at {}. Build it under oracle-ioc/ (or set \
+                 EPICS_ORACLE_IOC_BIN). The oracle cannot run without ground truth.",
+                ioc_bin.display()
+            ));
+        }
+        Ok(Self { bin, ioc_bin })
     }
 
     pub fn tool(&self, name: &str) -> PathBuf {
@@ -215,7 +236,7 @@ impl CIoc {
     }
 
     fn try_boot(tools: &CTools, db: &Path, port: u16) -> Result<Self, BootError> {
-        let mut child = Command::new(tools.tool("softIoc"))
+        let mut child = Command::new(&tools.ioc_bin)
             .arg("-S") // no interactive shell
             .arg("-d")
             .arg(db)

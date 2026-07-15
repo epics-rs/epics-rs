@@ -108,6 +108,15 @@ pub struct ScalcoutRecord {
     /// fact, not record state: `check_alarms` — the owner of this record's alarm
     /// transitions — consumes it, so it cannot outlive the cycle that set it.
     calc_alarm: bool,
+    /// C `pcalc->udf` (`dbCommon.udf`) as sCalcout maintains it: undefined
+    /// until a fetch+calc successfully defines VAL/SVAL. C
+    /// `sCalcoutRecord.c:356-366` clears it `else pcalc->udf = FALSE` ONLY
+    /// inside the `if (fetch_values==0)` gate on a successful `sCalcPerform`,
+    /// and NEVER sets it TRUE in `process()` — a monotonic clear, not the
+    /// framework's per-cycle `isnan(VAL)`. Reported through
+    /// [`Record::value_is_undefined`], which the framework writes into
+    /// `common.udf` each cycle; init TRUE mirrors C's `iocInit` udf=TRUE.
+    udf: bool,
     /// This cycle's `fetch_values()` outcome, pushed by the framework through
     /// `set_fetch_gate_failed`. C `sCalcoutRecord.c::process` (356) runs
     /// `sCalcPerform` only `if (fetch_values(pcalc)==0)`, and `fetch_values`
@@ -167,6 +176,7 @@ impl Default for ScalcoutRecord {
             lalm: 0.0,
             psvl: PvString::new(),
             calc_alarm: false,
+            udf: true,
             fetch_gate_failed: false,
             cached_should_output: false,
             odly: 0.0,
@@ -541,6 +551,15 @@ impl Record for ScalcoutRecord {
                 _ => true,
             }
         };
+
+        // C `sCalcoutRecord.c:366`: `else pcalc->udf = FALSE` — a successful
+        // fetch+calc DEFINES VAL/SVAL. This is the ONLY site that clears `udf`;
+        // a failed calc and a failed input fetch (`fetch_gate_failed`, which
+        // C's `if (fetch_values==0)` gate skips) both leave it untouched, so
+        // `udf` is monotonically cleared, never re-raised.
+        if !self.fetch_gate_failed && !calc_failed {
+            self.udf = false;
+        }
 
         // IVOA=Don't_drive on a failed calc vetoes the OUT WRITE only. C
         // applies the veto inside `execOutput` (sCalcoutRecord.c:430), which
@@ -979,6 +998,18 @@ impl Record for ScalcoutRecord {
         }
     }
 
+    /// sCalcout's UDF is C's `pcalc->udf` (see [`Self::udf`]), NOT the
+    /// framework default `isnan(VAL)`: C `sCalcoutRecord.c:356-366` clears it
+    /// only inside the fetch gate on a successful `sCalcPerform` and leaves it
+    /// otherwise. A default record (empty CALC, which C's `sCalcPerform` fails
+    /// every cycle) therefore reads UDF=1 where the `isnan(0.0)` default would
+    /// wrongly report 0 — the C-parity divergence the oracle measured
+    /// (`caget SCALCOUT.UDF` → 0, C → 1). The framework writes this into
+    /// `common.udf` each cycle.
+    fn value_is_undefined(&self) -> bool {
+        self.udf
+    }
+
     /// scalcout writes its computed output to the `OUT` link. The
     /// framework's generic multi-output dispatch reads the `OUT` field
     /// for the link string and `OVAL` for the value. Gated on the last
@@ -1116,6 +1147,42 @@ mod tests {
         assert_eq!(rec.get_field("VERS"), Some(EpicsValue::Double(4.1)));
         assert!(rec.put_field("VERS", EpicsValue::Double(99.0)).is_ok());
         assert_eq!(rec.get_field("VERS"), Some(EpicsValue::Double(4.1)));
+    }
+
+    /// UDF (C `pcalc->udf`) is undefined until a calc successfully defines VAL,
+    /// and is cleared MONOTONICALLY: C `sCalcoutRecord.c:356-366` sets
+    /// `udf=FALSE` only inside the fetch gate on a successful `sCalcPerform`
+    /// and never re-raises it. The oracle measured `SCALCOUT.UDF` C=1, port=0
+    /// for the default (empty-CALC) record, because the framework's
+    /// `isnan(VAL=0.0)` default reported 0.
+    #[test]
+    fn udf_set_until_finite_calc_then_monotonic() {
+        let mut rec = ScalcoutRecord::new();
+        // Init: undefined, mirroring C `iocInit` udf=TRUE.
+        assert!(rec.value_is_undefined(), "fresh scalcout is UDF");
+        // Empty CALC fails sCalcPerform every cycle → UDF stays set (C keeps 1).
+        rec.process().unwrap();
+        assert!(
+            rec.value_is_undefined(),
+            "empty CALC failed → UDF stays 1, not isnan(0.0)=0"
+        );
+        // A finite result clears UDF (C `else pcalc->udf = FALSE`).
+        rec.put_field("CALC", EpicsValue::String("1+1".into()))
+            .unwrap();
+        rec.special("CALC", true).unwrap();
+        rec.process().unwrap();
+        assert_eq!(rec.get_field("VAL"), Some(EpicsValue::Double(2.0)));
+        assert!(!rec.value_is_undefined(), "finite result clears UDF");
+        // Monotonic: a later FAILED calc (empty CALC) does NOT re-raise UDF —
+        // C raises CALC_ALARM (`if(stat)`) and leaves `udf` at FALSE.
+        rec.put_field("CALC", EpicsValue::String("".into()))
+            .unwrap();
+        rec.special("CALC", true).unwrap();
+        rec.process().unwrap();
+        assert!(
+            !rec.value_is_undefined(),
+            "a failed calc after a success leaves UDF cleared, matching C"
+        );
     }
 
     /// R9-74 (family): OOPT="On Change" is the numeric MDEL deadband test

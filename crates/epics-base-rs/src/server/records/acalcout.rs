@@ -80,11 +80,14 @@
 //!   directly, so the advertised capacity differs only when `NUSE` is set to
 //!   `0 < NUSE < NELM` under `SIZE=NELM`. `NELM=0` (degenerate; dbd
 //!   initial 1) serves a 1-element array, where C serves 0.
-//! - `UDF` follows the framework `value_is_undefined()` (NaN VAL ⇒ UDF). A
-//!   NaN result correctly keeps UDF; but a compile-failure/empty `CALC` on the
-//!   first process shows `UDF=0` (VAL still 0.0) where C keeps `UDF=1` (C sets
-//!   `udf=FALSE` only on a successful calc). Narrow: only before the first
-//!   successful calc.
+//! - `UDF` is C's `pcalc->udf` ([`AcalcoutRecord::udf`]): undefined until a
+//!   calc successfully defines VAL. C `aCalcoutRecord.c:305-307` clears it
+//!   `else pcalc->udf = FALSE` only on a finite result (`cstat==0`) and never
+//!   re-raises it in `process()`; a compile-failure/empty `CALC` (which
+//!   `aCalcPerform` fails every cycle) keeps `UDF=1`, matching C. This is
+//!   reported through [`Record::value_is_undefined`], NOT the framework
+//!   default `isnan(VAL)` (which wrongly reported 0 for a non-NaN VAL after a
+//!   failed calc).
 //! - `LALM` advances on every matched alarm level; C gates it on
 //!   `if (recGblSetSevr(...))` (advance only when that severity actually
 //!   raised `nsev`). Mirrors the framework-wide `rec_gbl_set_sevr` (returns
@@ -273,6 +276,14 @@ pub struct AcalcoutRecord {
 
     // --- diagnostics (mostly inert) ---
     size: i16, // 0=NELM, 1=NUSE
+    /// C `pcalc->udf` (`dbCommon.udf`) as aCalcout maintains it: undefined
+    /// until a calc successfully defines VAL. C `aCalcoutRecord.c:305-307`
+    /// clears it `else pcalc->udf = FALSE` ONLY when `cstat==0` (a finite
+    /// result) and NEVER sets it TRUE in `process()` — a monotonic clear, not
+    /// the framework's per-cycle `isnan(VAL)`. Reported through
+    /// [`Record::value_is_undefined`], which the framework writes into
+    /// `common.udf` each cycle; init TRUE mirrors C's `iocInit` udf=TRUE.
+    udf: bool,
     cstat: i32,
     cact: u8,
     amask: u32,
@@ -354,6 +365,7 @@ impl Default for AcalcoutRecord {
             alst: 0.0,
             mlst: 0.0,
             size: 0,
+            udf: true,
             cstat: 0,
             cact: 0,
             amask: 0,
@@ -963,6 +975,12 @@ impl Record for AcalcoutRecord {
             // `check_alarms`).
             self.calc_alarm = true;
             self.cstat = -1;
+        } else {
+            // C `aCalcoutRecord.c:307`: `else pcalc->udf = FALSE` — the finite
+            // result DEFINES VAL. This is the ONLY site that clears `udf`; a
+            // failed calc (above) and the fetch-gate-fail early return leave it
+            // untouched, so `udf` is monotonically cleared, never re-raised.
+            self.udf = false;
         }
 
         // --- OOPT decision (C afterCalc switch :313-335, using the
@@ -1067,7 +1085,9 @@ impl Record for AcalcoutRecord {
 
         // C checkAlarms line 845-852: the UDF guard returns before the limit
         // check. The framework set `common.udf` from `value_is_undefined()`
-        // before this hook (a NaN VAL keeps UDF and raises UDF_ALARM).
+        // (= [`Self::udf`]) before this hook, so a record whose calc has not
+        // yet defined VAL keeps UDF and raises UDF_ALARM — matching C's
+        // `if (pcalc->udf == TRUE) { recGblSetSevr(UDF_ALARM,...); return; }`.
         if common.udf != 0 {
             return;
         }
@@ -1115,6 +1135,17 @@ impl Record for AcalcoutRecord {
             // C checkAlarms line 890: out of alarm by at least hyst.
             self.lalm = val;
         }
+    }
+
+    /// aCalcout's UDF is C's `pcalc->udf` (see [`Self::udf`]), NOT the
+    /// framework default `isnan(VAL)`: C `aCalcoutRecord.c:305-307` clears it
+    /// only on a finite calc result and leaves it otherwise. A default record
+    /// (empty CALC, which C's `aCalcPerform` fails every cycle) therefore
+    /// reads UDF=1 where the `isnan(0.0)` default would wrongly report 0 — the
+    /// C-parity divergence the oracle measured (`caget ACALCOUT.UDF` → 0,
+    /// C → 1). The framework writes this into `common.udf` each cycle.
+    fn value_is_undefined(&self) -> bool {
+        self.udf
     }
 
     /// IVOA=SetIVOV severity hook. The framework calls this when SEVR is
@@ -2082,6 +2113,42 @@ mod tests {
         rec.process().unwrap();
         assert!(rec.calc_alarm);
         assert_eq!(rec.cstat, -1);
+    }
+
+    /// UDF (C `pcalc->udf`) is undefined until a calc successfully defines VAL,
+    /// and is cleared MONOTONICALLY: C `aCalcoutRecord.c:305-307` sets
+    /// `udf=FALSE` only on a finite result and never re-raises it. The oracle
+    /// measured `ACALCOUT.UDF` C=1, port=0 for the default (empty-CALC) record,
+    /// because the framework's `isnan(VAL=0.0)` default reported 0.
+    #[test]
+    fn udf_set_until_finite_calc_then_monotonic() {
+        let mut rec = AcalcoutRecord::new();
+        // Init: undefined, mirroring C `iocInit` udf=TRUE.
+        assert!(rec.value_is_undefined(), "fresh acalcout is UDF");
+        // Empty CALC fails aCalcPerform every cycle → UDF stays set (C keeps 1).
+        rec.process().unwrap();
+        assert!(
+            rec.value_is_undefined(),
+            "empty CALC failed → UDF stays 1, not isnan(0.0)=0"
+        );
+        // A finite result clears UDF (C `else pcalc->udf = FALSE`).
+        rec.put_field("CALC", EpicsValue::String("1+1".into()))
+            .unwrap();
+        rec.special("CALC", true).unwrap();
+        rec.process().unwrap();
+        assert_eq!(rec.get_field("VAL"), Some(EpicsValue::Double(2.0)));
+        assert!(!rec.value_is_undefined(), "finite result clears UDF");
+        // Monotonic: a later NON-finite result does NOT re-raise UDF — C raises
+        // CALC_ALARM (`if(cstat)`) and leaves `udf` at FALSE.
+        rec.put_field("CALC", EpicsValue::String("1e300*1e300".into()))
+            .unwrap();
+        rec.special("CALC", true).unwrap();
+        rec.process().unwrap();
+        assert!(rec.calc_alarm, "non-finite result raises CALC_ALARM");
+        assert!(
+            !rec.value_is_undefined(),
+            "a failed calc after a success leaves UDF cleared, matching C"
+        );
     }
 
     /// A NaN/Inf calc result is written into VAL/AVAL (not left stale): C

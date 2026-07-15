@@ -812,6 +812,21 @@ impl Record for CalcoutRecord {
                     as i32;
                 Ok(())
             }
+            // PVAL (DBF_DOUBLE, "Previous Value", calcoutRecord.dbd.pod:718-720)
+            // carries no `special()`/`pp()`, so C `dbPut` stores it verbatim like
+            // any plain field — a client `caput CO.PVAL 5` succeeds. It is
+            // TRANSIENT: `process()` overwrites `pval = val` at the end of each
+            // cycle (calcoutRecord.c:263 `prec->pval = prec->val`), so the stored
+            // value stands only until the next process. Mirrors VAL's DBF_DOUBLE
+            // arm above (same type, same record). The port previously had no arm
+            // and rejected the put with `FieldNotFound`.
+            "PVAL" => match value {
+                EpicsValue::Double(v) => {
+                    self.pval = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("PVAL".into())),
+            },
             "EGU" => match value {
                 EpicsValue::String(s) => {
                     self.egu = s;
@@ -1428,6 +1443,26 @@ mod link_status_tests {
 #[cfg(test)]
 mod process_tests {
     use super::*;
+
+    /// PVAL (DBF_DOUBLE, no special/pp) accepts a client put and stores it
+    /// verbatim — including NaN and the infinities, which are ordinary
+    /// DBF_DOUBLE values. The store is TRANSIENT: `process()` overwrites
+    /// `pval = val` each cycle, so a following process replaces it.
+    #[test]
+    fn pval_put_stores_transient_double() {
+        let mut rec = CalcoutRecord::default();
+        rec.put_field("PVAL", EpicsValue::Double(-1.0)).unwrap();
+        assert_eq!(rec.pval, -1.0);
+        rec.put_field("PVAL", EpicsValue::Double(f64::INFINITY))
+            .unwrap();
+        assert_eq!(rec.pval, f64::INFINITY);
+        rec.put_field("PVAL", EpicsValue::Double(f64::NAN)).unwrap();
+        assert!(rec.pval.is_nan());
+        // Transient: a process cycle latches pval = val (0.0 here).
+        rec.init_record(0).unwrap();
+        rec.process().unwrap();
+        assert_eq!(rec.pval, rec.val);
+    }
 
     /// CALC `VAL` token reads the previous VAL (C `presult = &val`,
     /// calcoutRecord.c:238), so `CALC="VAL+1"` counts up.

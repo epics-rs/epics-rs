@@ -361,8 +361,16 @@ impl Record for LongoutRecord {
                 }
             }
             "PVAL" => {
-                // Read-only — validate_put already rejected the call.
-                return Err(CaError::ReadOnlyField("PVAL".into()));
+                // PVAL (DBF_LONG, "Previous Value", longoutRecord.dbd.pod:438-440)
+                // carries no `special()`/`pp()`, so C `dbPut` stores it verbatim —
+                // `caput LO.PVAL 5` succeeds. It is TRANSIENT: a successful output
+                // latches `pval = val` (`on_output_complete`, C
+                // longoutRecord.c:105 `prec->pval = prec->val`), so the stored
+                // value stands only until the next output cycle. Mirrors VAL's
+                // DBF_LONG arm above. The port previously refused it as read-only.
+                if let EpicsValue::Long(v) = value {
+                    self.pval = v;
+                }
             }
             "OOCH" => {
                 if let EpicsValue::Short(v) = value {
@@ -557,11 +565,20 @@ mod tests {
         assert_eq!(r.oopt, 3);
     }
 
+    /// PVAL (DBF_LONG, no special/pp — longoutRecord.dbd.pod:438-440) accepts a
+    /// client put: C `dbPut` stores it verbatim. The value is TRANSIENT — the
+    /// next successful output latches `pval = val` — but the store itself
+    /// succeeds and reads back until then. Boundary values (`type-max`,
+    /// `type-min`) round-trip because PVAL is a plain 32-bit signed field.
     #[test]
-    fn pval_is_read_only_via_put_field() {
+    fn pval_put_stores_transient_value() {
         let mut r = LongoutRecord::new(0);
-        let err = r.put_field("PVAL", EpicsValue::Long(42)).unwrap_err();
-        assert!(matches!(err, CaError::ReadOnlyField(_)));
+        r.put_field("PVAL", EpicsValue::Long(42)).unwrap();
+        assert_eq!(r.pval, 42);
+        r.put_field("PVAL", EpicsValue::Long(i32::MAX)).unwrap();
+        assert_eq!(r.pval, i32::MAX);
+        r.put_field("PVAL", EpicsValue::Long(i32::MIN)).unwrap();
+        assert_eq!(r.pval, i32::MIN);
     }
 
     /// PR #6c573b4 part 2 (`longoutRecord.c:222-225`): writing OUT at

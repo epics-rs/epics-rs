@@ -2545,6 +2545,23 @@ impl PvDatabase {
             // for CA puts to VAL. We only set true here, never reset to false.
             if device_did_compute {
                 instance.record.set_device_did_compute(true);
+            } else if instance.record.skips_forward_convert_when_undefined()
+                && instance.common.udf != 0
+            {
+                // C output-record `else if (prec->udf) goto CONTINUE`
+                // (mbboRecord.c:210-213): an output record whose VAL is still
+                // undefined and had no value source this cycle (no VAL put —
+                // which clears UDF in `field_io` — and no closed-loop DOL fetch,
+                // which clears UDF at the DOL-apply site above) SKIPS the
+                // forward VAL->RVAL convert. Without this a `caput REC.RVAL 1`
+                // on a bare mbbo is clobbered by `convert()` recomputing
+                // `RVAL = VAL(=0)`. Same vehicle as the device-compute skip:
+                // `set_device_did_compute(true)` sets the record's own
+                // convert-skip flag, which `process()` consumes and clears. The
+                // per-cycle UDF clear below stays gated on `clears_udf()` /
+                // `device_did_compute` (both false here), so UDF stays 1 —
+                // matching C's `goto CONTINUE` leaving `prec->udf` untouched.
+                instance.record.set_device_did_compute(true);
             }
 
             // TPRO: trace processing (C EPICS dbProcess prints context when TPRO>0)

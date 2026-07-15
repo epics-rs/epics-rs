@@ -28,8 +28,15 @@ pub struct LongoutRecord {
     pub lalm: f64,
     pub ivoa: i16,
     pub ivov: i32,
-    pub adel: f64,
-    pub mdel: f64,
+    // ADEL/MDEL are `DBF_LONG` (longoutRecord.dbd.pod) — integer archive and
+    // monitor deadbands. Stored as `i32` (not `f64`) so a client put resolves
+    // its target to `DBF_LONG` and parses through the single
+    // `c_parse::put_string` `Long` row, which REFUSES an over-i32/under-i32
+    // value as C's `epicsParseInt32` does rather than the `DBF_DOUBLE` row
+    // accepting it and the read projection saturating. Mirrors int64in/int64out
+    // Cause B (commit 224d5ad5).
+    pub adel: i32,
+    pub mdel: i32,
     pub alst: f64,
     pub mlst: f64,
     pub omsl: i16,
@@ -91,8 +98,8 @@ impl Default for LongoutRecord {
             lalm: 0.0,
             ivoa: 0,
             ivov: 0,
-            adel: 0.0,
-            mdel: 0.0,
+            adel: 0,
+            mdel: 0,
             alst: 0.0,
             mlst: 0.0,
             omsl: 0,
@@ -231,8 +238,8 @@ impl Record for LongoutRecord {
             "LALM" => Some(EpicsValue::Double(self.lalm)),
             "IVOA" => Some(EpicsValue::Short(self.ivoa)),
             "IVOV" => Some(EpicsValue::Long(self.ivov)),
-            "ADEL" => Some(EpicsValue::Double(self.adel)),
-            "MDEL" => Some(EpicsValue::Double(self.mdel)),
+            "ADEL" => Some(EpicsValue::Long(self.adel)),
+            "MDEL" => Some(EpicsValue::Long(self.mdel)),
             "ALST" => Some(EpicsValue::Double(self.alst)),
             "MLST" => Some(EpicsValue::Double(self.mlst)),
             "OMSL" => Some(EpicsValue::Short(self.omsl)),
@@ -301,12 +308,12 @@ impl Record for LongoutRecord {
                 }
             }
             "ADEL" => {
-                if let EpicsValue::Double(v) = value {
+                if let EpicsValue::Long(v) = value {
                     self.adel = v;
                 }
             }
             "MDEL" => {
-                if let EpicsValue::Double(v) = value {
+                if let EpicsValue::Long(v) = value {
                     self.mdel = v;
                 }
             }

@@ -626,6 +626,17 @@ impl Record for MbboRecord {
         self.skip_convert = did;
     }
 
+    /// C `mbboRecord.c:210-213` — `else if (prec->udf) goto CONTINUE` skips the
+    /// forward `convert()` when the record is undefined and no value was sourced
+    /// this cycle. So a `caput REC.RVAL <v>` on a bare `record(mbbo,"M"){}`
+    /// (UDF=1, no VAL put, no closed-loop DOL) stores `<v>` and reads it back —
+    /// `convert` never recomputes `RVAL` from `VAL(=0)`. Opts mbbo into the
+    /// framework's undefined-skip so `process()`'s convert is suppressed for
+    /// exactly that cycle. Verified against the compiled softIoc.
+    fn skips_forward_convert_when_undefined(&self) -> bool {
+        true
+    }
+
     /// Device readback (`asyn:READBACK` / SCAN="I/O Intr" / init seed): store
     /// the raw and resolve VAL through the state table, mirroring C
     /// `processMbbo`/`initMbbo` (devAsynInt32.c:1311-1330,1296 /

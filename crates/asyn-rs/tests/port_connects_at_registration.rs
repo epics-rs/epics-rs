@@ -47,18 +47,31 @@ fn an_auto_connect_port_is_up_the_moment_it_is_created() {
     let (rt, _jh) = create_port_runtime(driver, RuntimeConfig::default());
 
     // No I/O request is submitted anywhere in this test: registration itself must
-    // have brought the port up, and waited for it (C waitConnect).
+    // have brought the port up, and waited for it (C waitConnect). This is the
+    // by-construction invariant — the connect exception `create_port_runtime`
+    // waited on fires only AFTER `connect_tcp()` completes the handshake
+    // (`ip_port.rs`: `connect_tcp()?` then `set_connected(true)`), so a live
+    // `is_connected` proves the server's kernel has already accepted the circuit.
+    assert!(
+        rt.port_handle().is_connected_blocking().unwrap(),
+        "CNCT must read 1 straight after configure (asynRecord.c:1089-1093 reads \
+         pasynManager->isConnected)"
+    );
+    // The server's `accept()` runs on its own thread, so it may not have returned
+    // and bumped the counter the instant registration does — the connection is in
+    // the kernel accept queue, but the accepting thread is a separate schedule.
+    // Reading the counter with zero tolerance for that gap is a test-side race
+    // (it flaked under load); wait a bounded moment for the accept to land.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while accepted.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
     assert_eq!(
         accepted.load(Ordering::SeqCst),
         1,
         "registering an auto-connect port must connect it — C queues the connect \
          at asynQueuePriorityConnect from portConnectTimerCallback and waits for \
          it (asynManager.c:2131-2136)"
-    );
-    assert!(
-        rt.port_handle().is_connected_blocking().unwrap(),
-        "CNCT must read 1 straight after configure (asynRecord.c:1089-1093 reads \
-         pasynManager->isConnected)"
     );
 }
 

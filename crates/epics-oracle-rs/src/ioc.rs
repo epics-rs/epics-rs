@@ -40,10 +40,30 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use crate::catool::CaTools;
+
 /// How long to wait for an IOC to report itself up before calling the boot an
 /// ERROR. Generous: a slow boot must surface as an error, never as a case that
 /// quietly "agreed".
 const BOOT_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// How long to keep re-probing a booted IOC for **observed** reachability
+/// before declaring it a genuine boot failure.
+///
+/// A process reporting itself "up" is not the same as its CA layer answering a
+/// search. The Rust `oracle-ioc` prints its port right after `from_parts` binds
+/// the sockets — but the UDP search responder is not spawned until `run()`,
+/// which happens *after* that line. Under full-run load the harness reads the
+/// port and drives cases in that window, the client's search retries exhaust
+/// before `run()` starts answering, and every case of the type comes back
+/// "not found" — a whole record type turned `errored` by a boot race rather
+/// than by any real defect. So readiness is **observed**, not assumed: poll a
+/// known channel through the real C client until it connects.
+const REACHABLE_TIMEOUT: Duration = Duration::from_secs(15);
+/// First inter-probe pause; doubles up to [`REACHABLE_BACKOFF_MAX`]. Small so a
+/// server that is already up is measured as up almost immediately.
+const REACHABLE_BACKOFF_START: Duration = Duration::from_millis(50);
+const REACHABLE_BACKOFF_MAX: Duration = Duration::from_millis(500);
 
 /// Boot failures are retried on a *fresh* port this many times. A retry only
 /// happens when the failure is a port collision, which is inherently racy; any
@@ -450,7 +470,14 @@ pub struct Pair {
 }
 
 impl Pair {
-    pub fn boot(tools: &CTools, db: &Path) -> Result<Self, BootError> {
+    /// Boot both sides and return only once **each** is observed reachable.
+    ///
+    /// `probe_pv` must name a channel present in `db` (every caller's `.db` has
+    /// at least one record, so its name is the natural probe). The returned
+    /// `Pair` is reachable by construction: a caller cannot obtain one whose CA
+    /// layer is not yet answering searches, which is the race that used to turn
+    /// a whole record type `errored`.
+    pub fn boot(tools: &CTools, db: &Path, probe_pv: &str) -> Result<Self, BootError> {
         let c = CIoc::boot(tools, db)?;
         let rust = RustIoc::boot(db)?;
         if c.port() == rust.port() {
@@ -459,7 +486,44 @@ impl Pair {
                         answers would not be attributable",
             );
         }
+        // Gate on OBSERVED reachability, both sides. The C softIoc's "All
+        // initialization complete" is a genuine ready signal, but the Rust
+        // side prints its port before `run()` spawns the search responder;
+        // probing both is symmetric and future-proofs the C side too. A side
+        // that never answers within the budget is a real boot failure, named
+        // as such — not a silent per-case `errored`.
+        wait_reachable(tools, c.port(), Side::C, probe_pv)?;
+        wait_reachable(tools, rust.port(), Side::Rust, probe_pv)?;
         Ok(Self { c, rust })
+    }
+}
+
+/// Poll a known channel through the real C client until it connects, with
+/// bounded retries and exponential backoff.
+///
+/// Uses `cainfo`, the same instrument the harness measures with, so "reachable"
+/// means exactly "a C client can create this channel" — the property the cases
+/// depend on. Returns `Ok` on the first successful connect; a
+/// [`REACHABLE_TIMEOUT`] with no connect is a genuine boot failure carrying the
+/// last probe error, never masked as a per-case timeout.
+fn wait_reachable(tools: &CTools, port: u16, side: Side, probe_pv: &str) -> Result<(), BootError> {
+    let t = CaTools::new(tools, port, side);
+    let deadline = Instant::now() + REACHABLE_TIMEOUT;
+    let mut backoff = REACHABLE_BACKOFF_START;
+    loop {
+        let last = match t.cainfo(probe_pv) {
+            Ok(_) => return Ok(()),
+            Err(e) => e.message,
+        };
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return err(format!(
+                "{side} IOC did not become reachable within {REACHABLE_TIMEOUT:?} \
+                 (probe {probe_pv}: {last})"
+            ));
+        }
+        std::thread::sleep(backoff.min(left));
+        backoff = (backoff * 2).min(REACHABLE_BACKOFF_MAX);
     }
 }
 

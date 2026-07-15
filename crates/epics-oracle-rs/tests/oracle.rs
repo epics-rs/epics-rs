@@ -75,7 +75,7 @@ fn the_pair_boots_on_distinct_ports_and_both_serve_the_record() {
     )
     .unwrap();
 
-    let pair = Pair::boot(&t, &db).expect("both IOCs must boot");
+    let pair = Pair::boot(&t, &db, "ORACLE:SMOKE").expect("both IOCs must boot");
     assert_ne!(
         pair.c.port(),
         pair.rust.port(),
@@ -99,7 +99,7 @@ fn an_unconnectable_pv_errors_rather_than_silently_agreeing() {
     let dir = workdir(None).unwrap();
     let db = dir.join("pair_missing.db");
     std::fs::write(&db, "record(ai, \"ORACLE:PRESENT\") {}\n").unwrap();
-    let pair = Pair::boot(&t, &db).expect("boot");
+    let pair = Pair::boot(&t, &db, "ORACLE:PRESENT").expect("boot");
 
     for (port, side) in [(pair.c.port(), Side::C), (pair.rust.port(), Side::Rust)] {
         let tools = CaTools::new(&t, port, side);

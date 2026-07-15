@@ -533,6 +533,29 @@ pub struct RecordInstance {
     /// [`RecordInstance::notify_field_with_origin`] included — advances it
     /// through the owner.
     last_posted: HashMap<String, EpicsValue>,
+    /// The live store for a field the record's `.dbd` DECLARES but the record
+    /// struct has no `put_field` arm / no storage for — the WRITE analog of the
+    /// read-side [`Self::declared_default`] fallback.
+    ///
+    /// C makes every `.dbd` field not just readable but WRITABLE: `dbPutField`
+    /// resolves the field from its `dbFldDes` and `dbPut` writes the incoming
+    /// value into record memory, whether or not any record code ever reads it
+    /// back — a `caput dfanout.HOPR 10` sticks even though `dfanoutRecord.c`
+    /// never touches HOPR. A Rust record models only the fields it has
+    /// behaviour for, so a field it declares but never stores had nowhere for a
+    /// put to land: [`Self::put_common_field`]'s catch-all reported
+    /// `S_dbLib_fieldNotFound` and the client's put was refused, while a READ of
+    /// the same field succeeded through `declared_default`. This map is that
+    /// missing storage — one uniform mechanism for the whole family, not a
+    /// per-field struct member on each record type.
+    ///
+    /// Keyed by upper-case field name, holding the value already coerced to the
+    /// field's C-declared DBF type (the same projection `declared_default` and
+    /// the read path serve). [`Self::resolve_field`] reads it BEFORE
+    /// `declared_default`, so a read reflects a prior write and an untouched
+    /// field still reads its `.dbd` initial. Empty for a record whose declared
+    /// fields are all modeled.
+    declared_overrides: HashMap<String, EpicsValue>,
     /// Set by `check_deadband_ext` for waveform/aai/aao when their
     /// content hash changed this cycle (C `monitor()` On Change mode,
     /// waveformRecord.c:310-319). The snapshot builders read it to post
@@ -786,6 +809,7 @@ impl RecordInstance {
             notify: None,
             deferred_notify_put: None,
             last_posted: HashMap::new(),
+            declared_overrides: HashMap::new(),
             array_hash_changed: false,
             suppress_subroutine_run: false,
             reprocess_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -1141,6 +1165,7 @@ impl RecordInstance {
             .get_field(&name)
             .or_else(|| self.get_common_field(&name))
             .or_else(|| self.get_virtual_field(&name))
+            .or_else(|| self.declared_overrides.get(&name).cloned())
             .or_else(|| self.declared_default(&name))
     }
 
@@ -3012,7 +3037,16 @@ impl RecordInstance {
             // `dbpf` prints "PV '%s' not found" and returns -1 (dbTest.c:787-795).
             // Returning success here made a put to a misspelled field a silent
             // no-op.
-            _ => return Err(self.unknown_field_error(name)),
+            //
+            // But a field the record's `.dbd` DECLARES and no arm above stored
+            // is NOT unknown: C `dbPut` writes it into record memory even when
+            // no record code reads it back (`caput dfanout.HOPR 10`). Land it in
+            // the per-instance declared-override store — the write analog of
+            // `declared_default` — so the put is accepted and a later read
+            // reflects it. `put_declared_override` still returns
+            // `unknown_field_error` for a name with no `dbFldDes`, so a
+            // misspelled field is refused exactly as before.
+            _ => return self.put_declared_override(&name, value),
         }
         self.record.on_put(&name);
         // C `dbPut` (dbAccess.c:1399-1405) returns the after-put
@@ -3041,6 +3075,87 @@ impl RecordInstance {
         } else {
             CaError::FieldNotFound(name)
         }
+    }
+
+    /// Store a put to a field the record's `.dbd` DECLARES but the record
+    /// models no storage for — the WRITE owner of [`Self::declared_overrides`]
+    /// and the write analog of [`Self::declared_default`].
+    ///
+    /// Reached only from [`Self::put_common_field_bounded`]'s catch-all, i.e.
+    /// after both `Record::put_field` (returned `FieldNotFound`) and every
+    /// `dbCommon` arm above have declined the field. Three gates, mirroring
+    /// C `dbNameToAddr`/`dbPut`:
+    ///
+    /// * NO `dbFldDes` (`field_desc` is `None`) — the name is not a field of
+    ///   this record type at all. C resolves nothing and `dbPutField` reports
+    ///   `S_dbLib_fieldNotFound`; return [`Self::unknown_field_error`] (which
+    ///   also renders `NAME`/`RTYP` as the read-only attributes they are).
+    /// * `special(SPC_NOMOD)` — a declared field that is immutable
+    ///   ([`Self::is_no_mod`]: the `.dbd` `read_only`/attribute bit or the
+    ///   record's runtime `field_no_mod`). C refuses the put with `S_db_noMod`;
+    ///   the runtime dispatch already gates this via `field_io::check_no_mod`,
+    ///   but the db-load path does not, so enforce it here too — never store an
+    ///   SPC_NOMOD field in the override map.
+    /// * [`FieldDesc::runtime_typed`] — a field whose served type C's
+    ///   `cvt_dbaddr` re-derives from record state (`waveform.VAL` from `FTVL`,
+    ///   `aSub.A` from `FTA`). Such a field is record-owned by definition, so
+    ///   its `put_field` should have taken the put; if it somehow reached here
+    ///   the override store must not shadow it (`declared_default` skips it for
+    ///   the same reason). Treat as not-found rather than store a value under
+    ///   the wrong type.
+    /// * PARTIALLY modeled — `Record::get_field` serves the field but no
+    ///   `put_field` arm accepts it (`calcout.PVAL` → `self.pval`). The record
+    ///   owns the read path, so the write belongs in its own `put_field`, not a
+    ///   shadow cell; refuse here rather than store a value `resolve_field`
+    ///   would never reach. See the inline note on the `get_field` guard.
+    ///
+    /// Otherwise coerce the incoming value to the field's C-declared DBF type
+    /// through the one write-side value-coercion owner
+    /// ([`coerce_put_value`](crate::server::record::coerce_put_value)) — so a
+    /// `.db`/`caput` string parses with C's range rules (`caput REC.PREC 99999`
+    /// into a `DBF_SHORT` is refused, not wrapped) and a menu label resolves
+    /// against the field's own choices — and store it. Returns
+    /// [`CommonFieldPutResult::NoChange`]: there is no scan/phas/alarm side
+    /// effect for a metadata field with no record behaviour, and the caller's
+    /// value-field monitor post reads the stored value back through
+    /// [`Self::resolve_field`].
+    fn put_declared_override(
+        &mut self,
+        name: &str,
+        value: EpicsValue,
+    ) -> CaResult<CommonFieldPutResult> {
+        let Some(desc) = self.field_desc(name) else {
+            return Err(self.unknown_field_error(name.to_string()));
+        };
+        if desc.runtime_typed {
+            return Err(self.unknown_field_error(name.to_string()));
+        }
+        if self.is_no_mod(name) {
+            // C `dbPutSpecial` pass 0 refuses SPC_NOMOD with `S_db_noMod`.
+            return Err(CaError::ReadOnlyField(name.to_string()));
+        }
+        // The override is the WRITABLE TWIN of `declared_default`, and
+        // `declared_default` is `resolve_field`'s fallback ONLY when the record
+        // itself serves nothing (`Record::get_field` is `None`). If the record
+        // DOES serve this field (`get_field` is `Some`), it is not unmodeled —
+        // it is PARTIALLY modeled: a getter into record memory (e.g.
+        // `calcout.PVAL` → `self.pval`, which `process()` also writes) but no
+        // matching `put_field` arm. Storing here would place the value in a
+        // second cell that `resolve_field` never reaches (`get_field` shadows
+        // the override) and that no `process()` keeps in step — a silent write
+        // loss. Such a field's put belongs in the record's OWN `put_field`
+        // (a per-record setter, a distinct change); refuse it here rather than
+        // half-accept it, so `resolve_field` stays single-valued. A field the
+        // record does not serve at all falls through to be stored.
+        if self.record.get_field(name).is_some() {
+            return Err(self.unknown_field_error(name.to_string()));
+        }
+        let target = desc.dbf_type;
+        let coerced =
+            crate::server::record::coerce_put_value(self.record.as_ref(), name, target, value)?;
+        self.declared_overrides
+            .insert(name.to_ascii_uppercase(), coerced);
+        Ok(CommonFieldPutResult::NoChange)
     }
 
     /// Get virtual fields (NAME, RTYP).
@@ -6060,5 +6175,99 @@ mod common_field_dbload_tests {
         // A String-typed common field is untouched by the coercion.
         put(&mut inst, "DESC", "a description");
         assert_eq!(inst.common.desc.as_str_lossy().as_ref(), "a description");
+    }
+}
+
+#[cfg(test)]
+mod declared_override_tests {
+    use super::*;
+    use crate::server::records::dfanout::DfanoutRecord;
+
+    /// A field `dfanout`'s `.dbd` DECLARES (HOPR/LOPR/PREC/EGU) but the
+    /// `DfanoutRecord` struct models no storage for: a put must be ACCEPTED and
+    /// stored (C `dbPut` writes it into record memory), and a later
+    /// `resolve_field` must serve the written value — not the `.dbd` initial.
+    #[test]
+    fn declared_but_unmodeled_field_put_is_stored_and_served() {
+        let mut inst = RecordInstance::new("DF".to_string(), DfanoutRecord::default());
+
+        // Untouched: reads its declared default (initial / type-zero), NOT an
+        // error, and the override store is empty.
+        assert_eq!(inst.resolve_field("HOPR"), Some(EpicsValue::Double(0.0)));
+        assert!(inst.declared_overrides.is_empty());
+
+        // DBF_DOUBLE, DBF_SHORT and DBF_STRING declared metadata fields all
+        // land, coerced to the declared type.
+        inst.put_common_field("HOPR", EpicsValue::String("10".into()))
+            .expect("caput dfanout.HOPR 10 must be accepted");
+        inst.put_common_field("PREC", EpicsValue::String("3".into()))
+            .expect("caput dfanout.PREC 3 must be accepted");
+        inst.put_common_field("EGU", EpicsValue::String("volts".into()))
+            .expect("caput dfanout.EGU volts must be accepted");
+
+        assert_eq!(inst.resolve_field("HOPR"), Some(EpicsValue::Double(10.0)));
+        assert_eq!(inst.resolve_field("PREC"), Some(EpicsValue::Short(3)));
+        assert_eq!(
+            inst.resolve_field("EGU"),
+            Some(EpicsValue::String("volts".into()))
+        );
+        // Case-insensitive key: the lower-case read reaches the same slot.
+        assert_eq!(inst.resolve_field("hopr"), Some(EpicsValue::Double(10.0)));
+    }
+
+    /// The declared type's C range rules apply through the write-side coercion
+    /// owner: `caput dfanout.PREC 99999` into a `DBF_SHORT` is REFUSED (C
+    /// `epicsParseInt16` overflow → `S_db_badField`), and the field keeps its
+    /// prior value — never wraps to a garbage `Short`.
+    #[test]
+    fn declared_override_honors_declared_type_range() {
+        let mut inst = RecordInstance::new("DF".to_string(), DfanoutRecord::default());
+        inst.put_common_field("PREC", EpicsValue::String("3".into()))
+            .expect("in-range PREC accepted");
+        assert!(
+            inst.put_common_field("PREC", EpicsValue::String("99999".into()))
+                .is_err(),
+            "PREC 99999 overflows DBF_SHORT and must be refused"
+        );
+        assert!(
+            inst.put_common_field("PREC", EpicsValue::String("abc".into()))
+                .is_err(),
+            "non-numeric PREC must be refused"
+        );
+        // The refused puts left the accepted value intact.
+        assert_eq!(inst.resolve_field("PREC"), Some(EpicsValue::Short(3)));
+    }
+
+    /// An UNDECLARED field name is still `FieldNotFound` — the override store
+    /// captures only fields with a real `dbFldDes`, so a misspelled field is
+    /// refused exactly as C's `dbNameToAddr` refuses it.
+    #[test]
+    fn undeclared_field_is_still_not_found() {
+        let mut inst = RecordInstance::new("DF".to_string(), DfanoutRecord::default());
+        assert!(matches!(
+            inst.put_common_field("XYZZY", EpicsValue::String("1".into())),
+            Err(CaError::FieldNotFound(_))
+        ));
+        assert!(inst.declared_overrides.is_empty());
+    }
+
+    /// A PARTIALLY modeled field — one the record SERVES via `get_field` but
+    /// has no `put_field` arm for (`calcout.PVAL` → `self.pval`) — must NOT
+    /// land in the override map: doing so would place the value where
+    /// `resolve_field` (which reads `get_field` first) never sees it, a silent
+    /// write loss. The override is only for fields the record serves nothing
+    /// for; a partially modeled field's put is the record's own concern.
+    #[test]
+    fn partially_modeled_field_is_not_captured_by_override() {
+        use crate::server::records::calcout::CalcoutRecord;
+        let mut inst = RecordInstance::new("CO".to_string(), CalcoutRecord::default());
+        // PVAL is served by the record (its own storage), so it is not stored
+        // in the override map; the map stays empty and no ghost cell shadows
+        // the record's read.
+        let _ = inst.put_common_field("PVAL", EpicsValue::String("1".into()));
+        assert!(
+            inst.declared_overrides.is_empty(),
+            "a field the record serves via get_field must not enter the override map"
+        );
     }
 }

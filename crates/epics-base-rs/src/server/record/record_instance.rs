@@ -3205,7 +3205,7 @@ impl RecordInstance {
         // the `if (prec->udf) recGblSetSevr(..., UDF_ALARM, ...)` guard. C has
         // no central UDF alarm; see `Record::raises_udf_alarm`.
         if self.record.raises_udf_alarm() {
-            recgbl::rec_gbl_check_udf(&mut self.common);
+            recgbl::rec_gbl_check_udf(&mut self.common, self.record.udf_alarm_on_exact_one());
         }
 
         // The analog-alarm SLOT is the enumeration — a record has the ladder iff

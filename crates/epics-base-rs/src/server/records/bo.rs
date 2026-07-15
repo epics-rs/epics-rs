@@ -127,6 +127,15 @@ impl Record for BoRecord {
         false
     }
 
+    /// C `boRecord.c:371` tests `if (prec->udf == TRUE)` — exact-one. Combined
+    /// with `clears_udf() == false`, a direct `caput X.UDF 255` (or `-1`,
+    /// stored `255`) leaves `udf == 255` at `checkAlarms`, and `255 != TRUE`,
+    /// so C raises NO UDF_ALARM — STAT/SEVR stay `NO_ALARM`. See
+    /// [`Record::udf_alarm_on_exact_one`].
+    fn udf_alarm_on_exact_one(&self) -> bool {
+        true
+    }
+
     /// C `devBoSoftRaw::write_bo` (`devBoSoftRaw.c:47-54`):
     /// `dbPutLink(&prec->out, DBR_LONG, &prec->rval, 1)` — the RAW word
     /// (`VAL ? MASK : 0`), not the `VAL` that `devBoSoft` writes.

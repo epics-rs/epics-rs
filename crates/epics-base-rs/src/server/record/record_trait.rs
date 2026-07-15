@@ -2352,6 +2352,24 @@ pub trait Record: Send + Sync + 'static {
         true
     }
 
+    /// Whether this record's C `checkAlarms` tests the UDF byte with
+    /// `if (prec->udf == TRUE)` (EXACT-ONE) rather than `if (prec->udf)`
+    /// (truthy). See [`crate::server::recgbl::udf_alarm_active`]: exact-one
+    /// records (`boRecord.c:371`, `stringoutRecord.c:146`, `biRecord.c:225`,
+    /// `busyRecord.c:337`) do NOT raise UDF_ALARM for a `udf` byte that is
+    /// neither 0 nor 1.
+    ///
+    /// This only changes behavior for a record whose `udf` byte can actually
+    /// hold such a value at `checkAlarms` time — one that does NOT re-derive
+    /// `udf` every cycle ([`Record::clears_udf`] `== false`), reached via a
+    /// direct `caput .UDF 255` (or `-1`, stored as `255` in the `DBF_UCHAR`
+    /// field). For the re-deriving records (`clears_udf() == true`, e.g.
+    /// `bi`/`busy`/the calc family) the byte is always 0/1 here, so exact-one
+    /// and truthy agree and the flag is left at its default. Default `false`.
+    fn udf_alarm_on_exact_one(&self) -> bool {
+        false
+    }
+
     /// Whether the record's current `VAL` is undefined (UDF must
     /// stay set).
     ///

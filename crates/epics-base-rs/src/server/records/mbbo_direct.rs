@@ -308,10 +308,18 @@ impl Record for MbboDirectRecord {
             "SIOL" => Some(EpicsValue::String(self.siol.clone().into())),
             "SIMS" => Some(EpicsValue::Short(self.sims)),
             "SDLY" => Some(EpicsValue::Double(self.sdly)),
+            // B0..B1F are DBF_UCHAR (mbboDirectRecord.dbd.pod). Serve the bit as
+            // the native `UChar` (unsigned) — it still projects to `DBR_CHAR` on
+            // the wire (`dbr.rs`: `UChar -> Char`), so a client's `caget` reports
+            // DBF_CHAR exactly as C does, but the put-coercion target derived
+            // from this value (`dbput_request`) is now the unsigned 0..=255 range
+            // instead of signed i8. C `dbFastPutConvert[DBR_STRING][DBF_UCHAR]`
+            // accepts `caput .Bn 255`; the prior `Char` representation made the
+            // port refuse everything above i8-max (128..=255).
             _ => BIT_NAMES
                 .iter()
                 .position(|&n| n == name)
-                .map(|idx| EpicsValue::Char(self.bits[idx])),
+                .map(|idx| EpicsValue::UChar(self.bits[idx])),
         }
     }
 
@@ -430,10 +438,19 @@ impl Record for MbboDirectRecord {
             }
             _ => {
                 if let Some(idx) = BIT_NAMES.iter().position(|&n| n == name) {
+                    // B0..B1F are DBF_UCHAR (mbboDirectRecord.dbd.pod), so a
+                    // numeric CA put coerces to the native `UChar`; accept it
+                    // alongside the signed variants device support / autosave
+                    // may send. C `mbboDirectRecord.c::special` (after==1, line
+                    // 282) sets the bit with `if (*pBn)` — the coerced value
+                    // defines the bit when NONZERO, not by its low bit — and
+                    // `bitsFromVAL` (line 96) then normalizes it to 0/1. So the
+                    // store rule is `value != 0`, uniform across all 32 bits.
                     let bit = match value {
-                        EpicsValue::Char(v) => v & 1,
-                        EpicsValue::Short(v) => (v & 1) as u8,
-                        EpicsValue::Long(v) => (v & 1) as u8,
+                        EpicsValue::UChar(v) => u8::from(v != 0),
+                        EpicsValue::Char(v) => u8::from(v != 0),
+                        EpicsValue::Short(v) => u8::from(v != 0),
+                        EpicsValue::Long(v) => u8::from(v != 0),
                         _ => return Err(CaError::TypeMismatch(name.into())),
                     };
                     self.bits[idx] = bit;

@@ -4258,6 +4258,19 @@ impl Record for AsynRecord {
     fn init_resets_alarms(&self) -> bool {
         true
     }
+
+    /// The `SPC_DBADDR` octet buffers: C `cvt_dbaddr` (asynRecord.c:948-955)
+    /// fixes the channel's `no_elements = omax` (BOUT) / `imax` (BINP) — the
+    /// buffer capacity, `80` by default — while `get_array_info` reports the
+    /// current transferred length (`nowt`/`nord`). So `ca_element_count` is the
+    /// capacity even though `get_field` serves the shorter transferred bytes.
+    fn field_native_count(&self, field: &str) -> Option<u32> {
+        match field {
+            "BOUT" => Some(self.omax.max(0) as u32),
+            "BINP" => Some(self.imax.max(0) as u32),
+            _ => None,
+        }
+    }
 }
 
 impl AsynRecord {
@@ -8023,6 +8036,35 @@ mod tests {
             .unwrap();
         assert_eq!(rec.nowt, 2);
         assert_eq!(rec.octet_output_buffer(), vec![9, 9]);
+    }
+
+    /// The BOUT/BINP channel's native element count is the buffer capacity
+    /// (OMAX/IMAX = 80 by default) — C `cvt_dbaddr` `no_elements = omax`/`imax`
+    /// — distinct from the current transferred length the *value* carries.
+    /// This is what `ca_element_count` reports; without it the channel
+    /// advertised 0 (the empty buffer's length) where C advertises 80.
+    #[test]
+    fn bout_binp_native_count_is_the_buffer_capacity() {
+        use epics_base_rs::server::record::Record;
+
+        let rec = AsynRecord::default();
+        // Capacity is OMAX/IMAX, served independent of the (empty) value.
+        assert_eq!(rec.field_native_count("BOUT"), Some(80));
+        assert_eq!(rec.field_native_count("BINP"), Some(80));
+        // The value itself is still the current transferred bytes (empty here),
+        // so channel count and value count are genuinely decoupled.
+        assert_eq!(rec.get_field("BOUT"), Some(EpicsValue::CharArray(vec![])));
+        assert_eq!(rec.get_field("BINP"), Some(EpicsValue::CharArray(vec![])));
+        // A non-buffer field keeps the value's own count.
+        assert_eq!(rec.field_native_count("AOUT"), None);
+        assert_eq!(rec.field_native_count("PORT"), None);
+
+        // Capacity tracks OMAX/IMAX, not a hardcoded 80.
+        let mut rec = AsynRecord::default();
+        rec.omax = 256;
+        rec.imax = 512;
+        assert_eq!(rec.field_native_count("BOUT"), Some(256));
+        assert_eq!(rec.field_native_count("BINP"), Some(512));
     }
 
     /// R8-54: C `performOctetIO` writes the clamped transfer sizes back into

@@ -2663,21 +2663,17 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                     // every delivery path decodes it to a scalar
                                     // string with `apply_native_long_string`.
                                     (DbFieldType::String, 1u32, LongStringMode::NativeString)
-                                } else if field == "VAL"
-                                    && instance.record.record_type() == "waveform"
+                                } else if let Some(native) =
+                                    instance.record.field_native_count(&field)
                                 {
-                                    // For waveform records, get_field("VAL") returns
-                                    // NORD elements (valid data) but the channel's
-                                    // native count must be NELM (max capacity) so
-                                    // clients allocate the right buffer.
-                                    // NELM is DBF_ULONG (waveformRecord.dbd.pod), so read
-                                    // it through the numeric view rather than one variant.
-                                    let nelm = instance
-                                        .resolve_field("NELM")
-                                        .and_then(|n| n.to_f64())
-                                        .map(|n| n.max(0.0) as u32)
-                                        .unwrap_or(v.count() as u32);
-                                    (v.dbr_type(), nelm, LongStringMode::Plain)
+                                    // C `cvt_dbaddr` fixes a channel's no_elements at
+                                    // the field's buffer capacity, distinct from the
+                                    // current value length `get_array_info` reports
+                                    // (waveform VAL→NELM serving NORD; asyn BOUT→OMAX /
+                                    // BINP→IMAX serving the transferred byte count). The
+                                    // client sizes its buffer to the capacity even
+                                    // though a GET returns fewer elements.
+                                    (v.dbr_type(), native, LongStringMode::Plain)
                                 } else {
                                     (v.dbr_type(), v.count() as u32, LongStringMode::Plain)
                                 };

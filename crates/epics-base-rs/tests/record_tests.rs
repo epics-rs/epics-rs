@@ -706,7 +706,7 @@ fn test_evaluate_alarms() {
     use epics_base_rs::server::recgbl;
     let rec = AiRecord::new(0.0);
     let mut instance = RecordInstance::new("TEMP".into(), rec);
-    instance.common.udf = false;
+    instance.common.udf = 0;
 
     instance
         .put_common_field("HIHI", EpicsValue::Double(100.0))
@@ -963,7 +963,7 @@ fn test_hyst_alarm_hysteresis() {
     use epics_base_rs::server::recgbl;
     let rec = AiRecord::new(0.0);
     let mut instance = RecordInstance::new("TEMP".into(), rec);
-    instance.common.udf = false;
+    instance.common.udf = 0;
 
     instance
         .put_common_field("HIGH", EpicsValue::Double(80.0))
@@ -1106,7 +1106,7 @@ fn test_bi_state_alarm() {
     rec.osv = AlarmSeverity::Minor as i16;
 
     let mut instance = RecordInstance::new("SW".into(), rec);
-    instance.common.udf = false;
+    instance.common.udf = 0;
 
     // bi STATE alarm lives in the `Record::check_alarms` hook (C
     // `biRecord.c::checkAlarms`); `process_local` calls it before
@@ -1133,7 +1133,7 @@ fn test_mbbi_state_alarm() {
     rec.twsv = AlarmSeverity::Major as i16;
 
     let mut instance = RecordInstance::new("SEL".into(), rec);
-    instance.common.udf = false;
+    instance.common.udf = 0;
 
     // mbbi STATE alarm lives in the `Record::check_alarms` hook (C
     // `mbbiRecord.c::checkAlarms`); `process_local` calls it before
@@ -1578,7 +1578,7 @@ fn test_ai_udf_cycle_leaves_lalm_and_zeroes_afvl() {
         .record
         .set_val(EpicsValue::Double(f64::NAN))
         .unwrap();
-    instance.common.udf = true;
+    instance.common.udf = 1;
 
     instance.evaluate_alarms();
 
@@ -2028,18 +2028,18 @@ impl Record for NoUdfClearRecord {
 fn test_udf_cleared_after_process() {
     let rec = AiRecord::new(1.0);
     let mut instance = RecordInstance::new("TEST".into(), rec);
-    assert!(instance.common.udf);
+    assert!(instance.common.udf != 0);
     instance.process_local().unwrap();
-    assert!(!instance.common.udf);
+    assert!(instance.common.udf == 0);
 }
 
 #[test]
 fn test_udf_not_cleared_when_clears_udf_false() {
     let rec = NoUdfClearRecord { val: 1.0 };
     let mut instance = RecordInstance::new("TEST".into(), rec);
-    assert!(instance.common.udf);
+    assert!(instance.common.udf != 0);
     instance.process_local().unwrap();
-    assert!(instance.common.udf);
+    assert!(instance.common.udf != 0);
 }
 
 #[test]
@@ -2047,9 +2047,9 @@ fn test_udf_alarm_persists() {
     use epics_base_rs::server::recgbl;
     let rec = NoUdfClearRecord { val: 1.0 };
     let mut instance = RecordInstance::new("TEST".into(), rec);
-    instance.common.udf = true;
+    instance.common.udf = 1;
     instance.process_local().unwrap();
-    assert!(instance.common.udf);
+    assert!(instance.common.udf != 0);
     instance.evaluate_alarms();
     let result = recgbl::rec_gbl_reset_alarms(&mut instance.common);
     assert!(result.alarm_changed || instance.common.sevr == AlarmSeverity::Invalid);
@@ -2521,7 +2521,7 @@ fn test_mbbi_aftc_writes_afvl_back_each_cycle() {
     rec.afvl = 0.0;
 
     let mut inst = RecordInstance::new("MBBI:AFTC".into(), rec);
-    inst.common.udf = false;
+    inst.common.udf = 0;
 
     // AFTC alarm filter runs inside `Record::check_alarms` (C
     // `mbbiRecord.c::checkAlarms`), the hook `process_local` invokes.
@@ -2571,7 +2571,7 @@ fn test_ai_aftc_filter_engages_and_seeds() {
     rec.aftc = 5.0;
     rec.afvl = 0.0; // first sample
     let mut inst = RecordInstance::new("AI:AFTC".into(), rec);
-    inst.common.udf = false;
+    inst.common.udf = 0;
     inst.common.analog_alarm = Some(AnalogAlarmConfig {
         hihi: 100.0,
         high: 80.0,
@@ -2612,7 +2612,7 @@ fn test_longin_aftc_filter_engages_and_seeds() {
     rec.aftc = 5.0;
     rec.afvl = 0.0;
     let mut inst = RecordInstance::new("LONGIN:AFTC".into(), rec);
-    inst.common.udf = false;
+    inst.common.udf = 0;
     inst.common.analog_alarm = Some(AnalogAlarmConfig {
         hihi: 100.0,
         high: 80.0,
@@ -2649,7 +2649,7 @@ fn test_int64in_aftc_filter_engages_and_seeds() {
     rec.aftc = 5.0;
     rec.afvl = 0.0;
     let mut inst = RecordInstance::new("INT64IN:AFTC".into(), rec);
-    inst.common.udf = false;
+    inst.common.udf = 0;
     inst.common.analog_alarm = Some(AnalogAlarmConfig {
         hihi: 100.0,
         high: 80.0,
@@ -2687,7 +2687,7 @@ fn test_ai_aftc_disabled_resets_stale_afvl() {
     rec.aftc = 0.0; // filter disabled
     rec.afvl = 3.0; // stale accumulator left from a prior AFTC>0 run
     let mut inst = RecordInstance::new("AI:AFTC".into(), rec);
-    inst.common.udf = false;
+    inst.common.udf = 0;
     inst.common.analog_alarm = Some(AnalogAlarmConfig {
         hihi: 100.0,
         high: 80.0,
@@ -2735,7 +2735,7 @@ fn test_mbbi_lalm_updates_when_cosv_set() {
     rec.put_field("LALM", EpicsValue::Enum(0)).unwrap();
 
     let mut inst = RecordInstance::new("MBBI:LALM".into(), rec);
-    inst.common.udf = false;
+    inst.common.udf = 0;
 
     // Transition 0 → 2: COS_ALARM fires (cosv=Major), LALM must
     // advance to 2. COS/LALM logic lives in `Record::check_alarms`
@@ -2801,7 +2801,7 @@ fn test_bi_lalm_updates_when_cosv_set() {
     rec.put_field("LALM", EpicsValue::Enum(0)).unwrap();
 
     let mut inst = RecordInstance::new("BI:LALM".into(), rec);
-    inst.common.udf = false;
+    inst.common.udf = 0;
 
     // COS/LALM logic lives in `Record::check_alarms` (C
     // `biRecord.c::checkAlarms`), the hook `process_local` runs.

@@ -2276,7 +2276,7 @@ impl PvDatabase {
                 // what the per-cycle clear below does; for dfanout — whose
                 // `process()` touches UDF nowhere else — it is the ONLY definer,
                 // which is why dfanout can opt out of the per-cycle clear.
-                instance.common.udf = instance.record.value_is_undefined();
+                instance.common.udf = instance.record.value_is_undefined() as u8;
             }
 
             // Apply INP value. "Soft Channel" sets VAL directly
@@ -2879,7 +2879,7 @@ impl PvDatabase {
             // above; the subroutine records (aSub) clear it in the subroutine
             // run (C `do_sub`), so neither needs `device_did_compute` here.
             if instance.record.clears_udf() || device_did_compute {
-                instance.common.udf = instance.record.value_is_undefined();
+                instance.common.udf = instance.record.value_is_undefined() as u8;
             }
 
             // Per-record alarm hook — record-type-specific STATE / COS
@@ -4334,7 +4334,7 @@ impl PvDatabase {
             // sync process path). A NaN/undefined value keeps UDF true
             // so `recGblCheckUDF` raises UDF_ALARM this cycle.
             if instance.record.clears_udf() {
-                instance.common.udf = instance.record.value_is_undefined();
+                instance.common.udf = instance.record.value_is_undefined() as u8;
             }
             // Per-record alarm hook (C `checkAlarms()`).
             {
@@ -5208,7 +5208,7 @@ pub(crate) fn seed_constant_links(instance: &mut RecordInstance) {
                 // — a link that loaded (even the number case, whose LEN is 1
                 // with an empty VAL) DEFINES the record.
                 if instance.record.apply_ls_load(load) != 0 {
-                    instance.common.udf = false;
+                    instance.common.udf = 0;
                 }
             }
         }
@@ -5247,7 +5247,7 @@ pub(crate) fn seed_constant_links(instance: &mut RecordInstance) {
             // C: `if (recGblInitConstantLink(...)) prec->udf = FALSE;` — a
             // record whose value came from a constant link is DEFINED.
             if loaded {
-                instance.common.udf = false;
+                instance.common.udf = 0;
             }
         }
         // The FAILURE arm of the same dset `init_record`. `devWfSoft.c:39-51`
@@ -5285,7 +5285,7 @@ pub(crate) fn seed_constant_links(instance: &mut RecordInstance) {
         // unless it is NaN.
         let is_nan = value.to_f64().is_some_and(f64::is_nan);
         if seed.clears_udf && !is_nan {
-            instance.common.udf = false;
+            instance.common.udf = 0;
         }
     }
 
@@ -5692,7 +5692,7 @@ impl PvDatabase {
                 if let Some(sval) = instance.record.get_field("SVAL") {
                     let _ = instance.record.land_simulated_value(sval);
                 }
-                instance.common.udf = false;
+                instance.common.udf = 0;
             }
             let sev = crate::server::record::AlarmSeverity::from_u16(sims as u16);
             crate::server::recgbl::rec_gbl_set_sevr(
@@ -5970,7 +5970,7 @@ fn sim_process_tail(instance: &mut RecordInstance, clear_udf: bool) {
     // `clears_udf_unconditionally`, which is the record's own C, not a
     // framework choice.
     if clear_udf || instance.record.clears_udf_unconditionally() {
-        instance.common.udf = false;
+        instance.common.udf = 0;
     }
 
     {

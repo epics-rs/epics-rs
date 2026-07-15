@@ -7780,7 +7780,7 @@ mod alarm_sub {
 
     fn common() -> CommonFields {
         CommonFields {
-            udf: false,
+            udf: 0,
             ..Default::default()
         }
     }
@@ -7793,7 +7793,7 @@ mod alarm_sub {
         rec.limits.hlsv = 2; // MAJOR
         rec.limits.hls = true;
         let mut c = common();
-        c.udf = true;
+        c.udf = 1;
         rec.check_alarms(&mut c);
         assert_eq!(c.nsta, alarm_status::UDF_ALARM);
         assert_eq!(c.nsev, AlarmSeverity::Invalid);
@@ -8902,7 +8902,7 @@ fn test_alarm_cycle_fans_out_alarm_mask_to_monitored_fields() {
     // clearing that on the first process IS an alarm transition. This test is
     // about a QUIESCENT cycle, so start from the already-processed state:
     // defined value, alarm committed at NO_ALARM.
-    instance.common.udf = false;
+    instance.common.udf = 0;
     instance.common.stat = epics_base_rs::server::recgbl::alarm_status::NO_ALARM;
 
     let _dmov_rx = instance

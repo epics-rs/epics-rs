@@ -25,7 +25,14 @@ pub struct CommonFields {
     // Alarm acknowledgement
     pub acks: AlarmSeverity,
     pub ackt: bool,
-    pub udf: bool,
+    /// `UDF` (`DBF_UCHAR` in `dbCommon.dbd`) — "value undefined". C models it
+    /// as one `epicsUInt8` that is BOTH the predicate (`if (prec->udf)`) and
+    /// the served byte: `caput UDF 255` stores 255 and `caget` renders it
+    /// signed `DBR_CHAR` (-1). Modeled as the raw `u8` so the byte round-trips
+    /// on records that do not re-derive it; every predicate reader tests
+    /// `!= 0`, and the record-facing [`ProcessContext::udf`] boundary keeps the
+    /// `bool` view.
+    pub udf: u8,
     pub udfs: AlarmSeverity,
     // Scan
     pub scan: ScanType,
@@ -149,7 +156,7 @@ impl CommonFields {
     /// device support's `read()` needs to observe during the cycle.
     pub fn process_context(&self) -> super::record_trait::ProcessContext {
         super::record_trait::ProcessContext {
-            udf: self.udf,
+            udf: self.udf != 0,
             udfs: self.udfs,
             nsev: self.nsev,
             phas: self.phas,
@@ -178,7 +185,7 @@ impl Default for CommonFields {
             namsg: String::new(),
             acks: AlarmSeverity::NoAlarm,
             ackt: true,
-            udf: true,
+            udf: 1,
             udfs: AlarmSeverity::Invalid,
             scan: ScanType::Passive,
             // C dbd `field(SSCN,DBF_MENU){ menu(menuScan) initial("65535") }`:

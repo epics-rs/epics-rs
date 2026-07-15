@@ -248,7 +248,7 @@ impl Record for SelRecord {
         }
 
         // C checkAlarms: UDF first; if undefined, raise UDF and return.
-        if common.udf {
+        if common.udf != 0 {
             recgbl::rec_gbl_set_sevr(common, alarm_status::UDF_ALARM, common.udfs);
             return;
         }

@@ -61,7 +61,7 @@ async fn a_never_processed_record_is_udf_invalid_after_init() {
     for name in ["A1", "C1", "B1", "W1"] {
         let rec = db.get_record(name).await.unwrap();
         let inst = rec.read().await;
-        assert!(inst.common.udf, "{name}: never processed, so UDF");
+        assert!(inst.common.udf != 0, "{name}: never processed, so UDF");
         assert_eq!(
             inst.common.stat,
             alarm_status::UDF_ALARM,
@@ -139,7 +139,7 @@ async fn a_db_val_defines_the_record_so_the_seed_does_not_fire() {
         let rec = db.get_record(name).await.unwrap();
         let inst = rec.read().await;
         assert!(
-            !inst.common.udf,
+            inst.common.udf == 0,
             "{name}: field(VAL,…) clears UDF at load (C dbPutString)"
         );
         assert_eq!(
@@ -157,7 +157,7 @@ async fn a_db_val_defines_the_record_so_the_seed_does_not_fire() {
     // The control: the same load, no VAL, still INVALID.
     let rec = db.get_record("QT2").await.unwrap();
     let inst = rec.read().await;
-    assert!(inst.common.udf);
+    assert!(inst.common.udf != 0);
     assert_eq!(inst.common.sevr, AlarmSeverity::Invalid);
 }
 
@@ -192,13 +192,13 @@ async fn the_runtime_db_loader_applies_the_val_udf_rule_too() {
 
     let rec = db.get_record("RT1").await.unwrap();
     let inst = rec.read().await;
-    assert!(!inst.common.udf, "RT1: field(VAL,…) clears UDF at load");
+    assert!(inst.common.udf == 0, "RT1: field(VAL,…) clears UDF at load");
     assert_eq!(inst.common.sevr, AlarmSeverity::NoAlarm);
     drop(inst);
 
     let rec = db.get_record("RT2").await.unwrap();
     let inst = rec.read().await;
-    assert!(inst.common.udf);
+    assert!(inst.common.udf != 0);
     assert_eq!(inst.common.sevr, AlarmSeverity::Invalid);
 
     std::fs::remove_dir_all(&dir).ok();
@@ -227,7 +227,7 @@ async fn the_initial_severity_clears_on_the_first_successful_process() {
 
     let rec = db.get_record("C2").await.unwrap();
     let inst = rec.read().await;
-    assert!(!inst.common.udf);
+    assert!(inst.common.udf == 0);
     assert_eq!(inst.common.stat, alarm_status::NO_ALARM);
     assert_eq!(inst.common.sevr, AlarmSeverity::NoAlarm);
 }

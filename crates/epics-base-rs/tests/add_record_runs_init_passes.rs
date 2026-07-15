@@ -42,7 +42,7 @@ async fn add_record_runs_the_init_udf_prologue() {
 
     let inst = db.get_record("AI").await.unwrap();
     let inst = inst.read().await;
-    assert!(inst.common.udf, "a fresh ai is undefined");
+    assert!(inst.common.udf != 0, "a fresh ai is undefined");
     assert_eq!(
         (inst.common.stat, inst.common.sevr),
         (alarm_status::UDF_ALARM, AlarmSeverity::Invalid),
@@ -103,7 +103,7 @@ async fn add_record_runs_the_post_init_udf_tail() {
     {
         let rec = db.get_record("MBD").await.unwrap();
         let inst = rec.read().await;
-        assert!(!inst.common.udf, "the B0..B1F fold defines the record");
+        assert!(inst.common.udf == 0, "the B0..B1F fold defines the record");
         assert_eq!(
             inst.record.get_field("VAL"),
             Some(EpicsValue::Long(5)),
@@ -114,7 +114,7 @@ async fn add_record_runs_the_post_init_udf_tail() {
         let rec = db.get_record("HG").await.unwrap();
         let inst = rec.read().await;
         assert!(
-            !inst.common.udf,
+            inst.common.udf == 0,
             "the constant SVL load defines the histogram at init"
         );
     }

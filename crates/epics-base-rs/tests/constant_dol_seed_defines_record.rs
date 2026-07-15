@@ -52,7 +52,7 @@ async fn field(db: &PvDatabase, rec: &str, f: &str) -> EpicsValue {
 async fn udf(db: &PvDatabase, rec: &str) -> bool {
     let r = db.get_record(rec).await.unwrap();
     let inst = r.read().await;
-    inst.common.udf
+    inst.common.udf != 0
 }
 
 async fn sevr(db: &PvDatabase, rec: &str) -> AlarmSeverity {

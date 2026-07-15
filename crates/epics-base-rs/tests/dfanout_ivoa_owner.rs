@@ -68,7 +68,7 @@ async fn add_dfanout(db: &PvDatabase, ivoa: i16, invalid: bool, outa: &str) {
     // `record(dfanout,"DFBU"){field(SELM,"Specified") field(SELN,"99")}`
     // reports INVALID/UDF, while the same record with `field(VAL,"1")` reports
     // INVALID/SOFT.
-    db.get_record("DF").await.unwrap().write().await.common.udf = false;
+    db.get_record("DF").await.unwrap().write().await.common.udf = 0;
 }
 
 /// Boundary 1 — INVALID cycle, IVOA=Set_output_to_IVOV: the targets get IVOV,

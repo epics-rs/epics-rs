@@ -401,7 +401,7 @@ record(epid, "TEST:PIDSUP") {
     let udf = server.get("TEST:PIDSUP.UDF").await.unwrap();
     assert_eq!(
         udf,
-        EpicsValue::Char(1),
+        EpicsValue::UChar(1),
         "UDF must stay set for a supervisory empty-STPL epid"
     );
 }
@@ -472,7 +472,7 @@ record(epid, "TEST:PIDCL") {
     let udf = server.get("TEST:PIDCL.UDF").await.unwrap();
     assert_eq!(
         udf,
-        EpicsValue::Char(0),
+        EpicsValue::UChar(0),
         "closed-loop epid with a resolved STPL must have UDF cleared"
     );
 
@@ -557,7 +557,7 @@ record(epid, "TEST:PIDCLF") {
     let udf = server.get("TEST:PIDCLF.UDF").await.unwrap();
     assert_eq!(
         udf,
-        EpicsValue::Char(1),
+        EpicsValue::UChar(1),
         "UDF must stay set when the STPL fetch fails"
     );
 }

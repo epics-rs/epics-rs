@@ -241,7 +241,7 @@ async fn r10_67_calc_alarm_wins_the_stat_over_udf_alarm() {
     process(&db, "C").await;
 
     let inst = db.get_record("C").await.unwrap();
-    assert!(inst.read().await.common.udf, "a NaN VAL keeps UDF");
+    assert!(inst.read().await.common.udf != 0, "a NaN VAL keeps UDF");
     assert_eq!(
         alarm(&db, "C").await,
         (AlarmSeverity::Invalid, CALC_ALARM),

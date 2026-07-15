@@ -76,13 +76,14 @@ async fn constant_array_dol_is_loaded_at_init() {
         Some(3.0)
     );
     assert!(
-        !db.get_record("CL:ARRAY")
+        db.get_record("CL:ARRAY")
             .await
             .unwrap()
             .read()
             .await
             .common
-            .udf,
+            .udf
+            == 0,
         "C `fetchValue`: on a successful load, nord = nReq and udf = FALSE"
     );
 }
@@ -121,7 +122,8 @@ async fn supervisory_mode_ignores_the_constant_dol() {
             .read()
             .await
             .common
-            .udf,
+            .udf
+            != 0,
         "nothing was loaded, so the record is still UNDEFINED"
     );
 }

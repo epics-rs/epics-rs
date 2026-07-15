@@ -162,7 +162,7 @@ async fn record_with_ca_inp_link_reads_remote_value() {
         let mut inst = rec.write().await;
         inst.put_common_field("INP", EpicsValue::String("CALINK:INP:SRC CA".into()))
             .unwrap();
-        inst.common.udf = false;
+        inst.common.udf = 0;
     }
 
     let mut visited = HashSet::new();
@@ -228,7 +228,7 @@ async fn ca_cp_holder_processes_on_remote_change() {
         let mut inst = rec.write().await;
         inst.put_common_field("INP", EpicsValue::String("CALINK:CP:SRC CP".into()))
             .unwrap();
-        inst.common.udf = false;
+        inst.common.udf = 0;
         assert_eq!(
             inst.common.scan,
             epics_base_rs::server::record::ScanType::Passive,

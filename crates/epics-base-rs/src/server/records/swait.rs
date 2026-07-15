@@ -515,7 +515,7 @@ impl Record for SwaitRecord {
         // simulated cycle — where the framework's SIOL owner has already done
         // C `:419` itself), leaves UDF exactly as it was.
         if std::mem::take(&mut self.calc_succeeded) {
-            common.udf = false;
+            common.udf = 0;
         }
     }
 

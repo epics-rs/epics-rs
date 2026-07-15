@@ -40,7 +40,7 @@ async fn process(db: &PvDatabase, name: &str) {
 }
 
 async fn udf(db: &PvDatabase, name: &str) -> bool {
-    db.get_record(name).await.unwrap().read().await.common.udf
+    db.get_record(name).await.unwrap().read().await.common.udf != 0
 }
 
 async fn alarm(db: &PvDatabase, name: &str) -> (AlarmSeverity, u16) {

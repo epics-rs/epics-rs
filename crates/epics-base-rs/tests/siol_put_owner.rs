@@ -45,7 +45,7 @@ async fn add_simulated_ao(db: &PvDatabase, name: &str, siol: &str, val: f64) {
     db.add_record(name, Box::new(ao)).await.unwrap();
     let rec = db.get_record(name).await.unwrap();
     let mut inst = rec.write().await;
-    inst.common.udf = false;
+    inst.common.udf = 0;
 }
 
 /// Boundary 1 — `SIOL` with an explicit `PP` and a Passive target: C

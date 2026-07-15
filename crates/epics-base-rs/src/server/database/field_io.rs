@@ -927,7 +927,7 @@ impl PvDatabase {
                             // earlier synchronous stat/sevr clear here diverged
                             // from C and reported NO_ALARM where C keeps UDF/INVALID.
                             if instance.record.is_udf_defining_put(&field) {
-                                instance.common.udf = false;
+                                instance.common.udf = 0;
                             }
                             result
                         }
@@ -1579,7 +1579,7 @@ impl PvDatabase {
                             // when the record does process. The earlier
                             // synchronous stat/sevr clear here diverged from C.
                             if instance.record.is_udf_defining_put(&field) {
-                                instance.common.udf = false;
+                                instance.common.udf = 0;
                             }
                             result
                         }

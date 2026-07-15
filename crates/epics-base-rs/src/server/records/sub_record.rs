@@ -155,6 +155,16 @@ impl Record for SubRecord {
         None
     }
 
+    /// C `subRecord.c::special` (SPC_MOD on SNAM, `:188-193`) resolves the name
+    /// via `registryFunctionFind` and returns `S_db_BadSub` for a non-empty
+    /// unregistered name — sub has no LFLG, so every SNAM put is validated. The
+    /// empty-name case is accepted (C parks PACT instead; see
+    /// [`Self::init_record_parks_pact`]). The registry lookup itself is
+    /// performed by the put owner; see [`Record::is_subroutine_name_field`].
+    fn is_subroutine_name_field(&self, field: &str) -> bool {
+        field == "SNAM"
+    }
+
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
         match name {
             "VAL" => {
@@ -261,6 +271,17 @@ mod tests {
                 .unwrap();
             assert_eq!(rec.get_field(name), Some(EpicsValue::String("src".into())));
         }
+    }
+
+    /// C `subRecord.c::special` validates every SNAM put via
+    /// `registryFunctionFind` (sub has no LFLG); no other field is a
+    /// subroutine name.
+    #[test]
+    fn snam_is_the_subroutine_name_field() {
+        let rec = SubRecord::default();
+        assert!(rec.is_subroutine_name_field("SNAM"));
+        assert!(!rec.is_subroutine_name_field("INAM"));
+        assert!(!rec.is_subroutine_name_field("VAL"));
     }
 
     /// All 21 input channels are wired into `multi_input_links`.

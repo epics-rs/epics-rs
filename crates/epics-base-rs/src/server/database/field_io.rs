@@ -1409,7 +1409,29 @@ impl PvDatabase {
         //
         // A fire-and-forget `dbPutField` is NOT deferred: it writes and raises
         // RPRO (dbAccess.c:1263-1277). Only the notify route waits.
-        if want_notify {
+        //
+        // C `dbProcessNotify` (dbNotify.c:337-353) handles a put-notify to a
+        // DBF link field (INLINK/OUTLINK/FWDLINK) as a dedicated early case,
+        // ABOVE the PACT logic and the whole `processNotifyCommon` machinery:
+        // "Only dbPutField will change link fields. Also the record is not
+        // processed as a result." It writes the value via `dbPutField`
+        // (`putFieldType`) and fires the done callback IMMEDIATELY — it never
+        // reaches the PACT test, never processes, never defers. So a link
+        // field always takes the value even on a busy or permanently-parked
+        // record: a bare `sub` (empty `SNAM`) parks PACT=TRUE forever
+        // (subRecord.c:119-122), and parking its link-field put on a `PactExit`
+        // that never comes drops the value — `caput <sub>.INPA '0'` then reads
+        // back "" instead of C's "0". The ordinary write path below already
+        // reproduces C's link semantics for these fields (writes the value;
+        // `put_drives_processing_of` is false — no link field is `pp` or PROC —
+        // so it processes nothing and returns immediate completion), so the
+        // only correction the special case needs is to keep a link field OUT
+        // of the notify PACT-defer park.
+        let is_dbf_link_field = {
+            let guard = rec.read().await;
+            crate::types::dbf_link_class(guard.record.record_type(), &field).is_some()
+        };
+        if want_notify && !is_dbf_link_field {
             let mut guard = rec.write().await;
             if guard.is_processing() {
                 let Some((completion, completion_rx)) = notify_request.into_completion() else {

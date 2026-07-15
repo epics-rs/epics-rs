@@ -18,15 +18,13 @@ pub struct LongoutRecord {
     pub lopr: i32,
     pub drvh: i32,
     pub drvl: i32,
-    pub hihi: i32,
-    pub high: i32,
-    pub low: i32,
-    pub lolo: i32,
-    pub hhsv: i16,
-    pub hsv: i16,
-    pub lsv: i16,
-    pub llsv: i16,
-    pub hyst: f64,
+    // HIHI/HIGH/LOW/LOLO, HHSV/HSV/LSV/LLSV and HYST are owned by
+    // `CommonFields` (limits/severities in `analog_alarm`, HYST in `hyst`),
+    // NOT by this struct — the `checkAlarms` ladder reads them from there. A
+    // record-local copy is a second, never-consulted owner, which is why a
+    // `caput LO.HHSV INVALID` never fired the alarm. Omitting the fields
+    // routes get/put through the common-field path (the single owner), as
+    // `ao`/`int64out` do. LALM (last-alarmed value) IS record state and stays.
     pub lalm: f64,
     pub ivoa: i16,
     pub ivov: i32,
@@ -90,15 +88,6 @@ impl Default for LongoutRecord {
             lopr: 0,
             drvh: 0, // C defaults both to 0 (equal = no clamping)
             drvl: 0,
-            hihi: 0,
-            high: 0,
-            low: 0,
-            lolo: 0,
-            hhsv: 0,
-            hsv: 0,
-            lsv: 0,
-            llsv: 0,
-            hyst: 0.0,
             lalm: 0.0,
             ivoa: 0,
             ivov: 0,
@@ -237,15 +226,8 @@ impl Record for LongoutRecord {
             "LOPR" => Some(EpicsValue::Long(self.lopr)),
             "DRVH" => Some(EpicsValue::Long(self.drvh)),
             "DRVL" => Some(EpicsValue::Long(self.drvl)),
-            "HIHI" => Some(EpicsValue::Long(self.hihi)),
-            "HIGH" => Some(EpicsValue::Long(self.high)),
-            "LOW" => Some(EpicsValue::Long(self.low)),
-            "LOLO" => Some(EpicsValue::Long(self.lolo)),
-            "HHSV" => Some(EpicsValue::Short(self.hhsv)),
-            "HSV" => Some(EpicsValue::Short(self.hsv)),
-            "LSV" => Some(EpicsValue::Short(self.lsv)),
-            "LLSV" => Some(EpicsValue::Short(self.llsv)),
-            "HYST" => Some(EpicsValue::Double(self.hyst)),
+            // HIHI/HIGH/LOW/LOLO/HHSV/HSV/LSV/LLSV/HYST fall through to the
+            // common-field path (their single owner) — see the struct comment.
             "LALM" => Some(EpicsValue::Double(self.lalm)),
             "IVOA" => Some(EpicsValue::Short(self.ivoa)),
             "IVOV" => Some(EpicsValue::Long(self.ivov)),
@@ -300,51 +282,9 @@ impl Record for LongoutRecord {
                     self.drvl = v;
                 }
             }
-            "HIHI" => {
-                if let EpicsValue::Long(v) = value {
-                    self.hihi = v;
-                }
-            }
-            "HIGH" => {
-                if let EpicsValue::Long(v) = value {
-                    self.high = v;
-                }
-            }
-            "LOW" => {
-                if let EpicsValue::Long(v) = value {
-                    self.low = v;
-                }
-            }
-            "LOLO" => {
-                if let EpicsValue::Long(v) = value {
-                    self.lolo = v;
-                }
-            }
-            "HHSV" => {
-                if let EpicsValue::Short(v) = value {
-                    self.hhsv = v;
-                }
-            }
-            "HSV" => {
-                if let EpicsValue::Short(v) = value {
-                    self.hsv = v;
-                }
-            }
-            "LSV" => {
-                if let EpicsValue::Short(v) = value {
-                    self.lsv = v;
-                }
-            }
-            "LLSV" => {
-                if let EpicsValue::Short(v) = value {
-                    self.llsv = v;
-                }
-            }
-            "HYST" => {
-                if let EpicsValue::Double(v) = value {
-                    self.hyst = v;
-                }
-            }
+            // HIHI/HIGH/LOW/LOLO/HHSV/HSV/LSV/LLSV/HYST are not handled here:
+            // they hit the `_ =>` arm below and fall through to
+            // `put_common_field`, the single owner of the analog-alarm ladder.
             "LALM" => {
                 if let EpicsValue::Double(v) = value {
                     self.lalm = v;

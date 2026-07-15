@@ -14,25 +14,18 @@ pub struct LonginRecord {
     pub hopr: i32,
     #[field(type = "Long")]
     pub lopr: i32,
-    // Alarm thresholds
-    #[field(type = "Long")]
-    pub hihi: i32,
-    #[field(type = "Long")]
-    pub high: i32,
-    #[field(type = "Long")]
-    pub low: i32,
-    #[field(type = "Long")]
-    pub lolo: i32,
-    #[field(type = "Short")]
-    pub hhsv: i16,
-    #[field(type = "Short")]
-    pub hsv: i16,
-    #[field(type = "Short")]
-    pub lsv: i16,
-    #[field(type = "Short")]
-    pub llsv: i16,
-    #[field(type = "Double")]
-    pub hyst: f64,
+    // Alarm thresholds (HIHI/HIGH/LOW/LOLO), severities (HHSV/HSV/LSV/LLSV)
+    // and the alarm hysteresis (HYST) are NOT record-owned fields: they are
+    // dbCommon-adjacent state owned by `CommonFields` — the limits/severities
+    // in `CommonFields::analog_alarm` and HYST in `CommonFields::hyst`. The
+    // record's `checkAlarms` ladder (`RecordInstance::evaluate_analog_alarm`)
+    // reads them from there, so a record-local copy would be a second,
+    // never-consulted owner: a `caput LI.HHSV INVALID` stored into a shadow
+    // field left `analog_alarm.hhsv` at NO_ALARM and the alarm never fired.
+    // Omitting the fields routes their get/put through the common-field path
+    // (the single owner), exactly as `ai`/`int64in` do. LALM (last-alarmed
+    // value) below IS record state — `evaluate_analog_alarm` reads it via
+    // `self.record.get_field("LALM")` — so it stays.
     #[field(type = "Double")]
     pub lalm: f64,
     // Deadband
@@ -84,15 +77,6 @@ impl Default for LonginRecord {
             egu: PvString::new(),
             hopr: 0,
             lopr: 0,
-            hihi: 0,
-            high: 0,
-            low: 0,
-            lolo: 0,
-            hhsv: 0,
-            hsv: 0,
-            lsv: 0,
-            llsv: 0,
-            hyst: 0.0,
             lalm: 0.0,
             adel: 0.0,
             mdel: 0.0,

@@ -689,21 +689,20 @@ impl Record for MbboRecord {
             recgbl::rec_gbl_set_sevr(common, alarm_status::SOFT_ALARM, AlarmSeverity::Invalid);
         }
 
+        // STATE/COS use the RAW severity ordinal (ZRSV..FFSV/UNSV/COSV are
+        // DBF_MENU stored raw i16): C `recGblSetSevr(prec, STATE_ALARM,
+        // severities[val])` compares the raw `epicsEnum16`, so an out-of-range
+        // `ZRSV=4`/`65535` numerically exceeds a prior UDF's INVALID(3) and
+        // overrides it. See `rec_gbl_set_sevr_raw`.
         let val = self.val;
         let raw_sev = if val > 15 {
             self.unsv
         } else {
             self.state_severities()[val as usize]
         };
-        let sev = AlarmSeverity::from_u16(raw_sev as u16);
-        if sev != AlarmSeverity::NoAlarm {
-            recgbl::rec_gbl_set_sevr(common, alarm_status::STATE_ALARM, sev);
-        }
+        recgbl::rec_gbl_set_sevr_raw(common, alarm_status::STATE_ALARM, raw_sev as u16);
         if val != self.lalm {
-            let cos_sev = AlarmSeverity::from_u16(self.cosv as u16);
-            if cos_sev != AlarmSeverity::NoAlarm {
-                recgbl::rec_gbl_set_sevr(common, alarm_status::COS_ALARM, cos_sev);
-            }
+            recgbl::rec_gbl_set_sevr_raw(common, alarm_status::COS_ALARM, self.cosv as u16);
             self.lalm = val;
         }
     }

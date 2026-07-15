@@ -190,6 +190,35 @@ pub fn rec_gbl_set_sevr(common: &mut CommonFields, stat: u16, sevr: AlarmSeverit
     }
 }
 
+/// `rec_gbl_set_sevr` for a severity that is a **raw menu ordinal**, comparing
+/// it the way C's `recGblSetSevrVMsg` does — against the RAW `epicsEnum16`
+/// (recGbl.c:242 `if (prec->nsev < new_sevr)`), BEFORE any clamp to
+/// `INVALID_ALARM`.
+///
+/// A numeric `caput .ZSV 4` (or `-1` → `65535`) stores that raw ordinal in the
+/// `DBF_MENU` field (`dbConvert.c::putDoubleEnum` = `*pfield = (epicsEnum16)val`,
+/// the same raw-ordinal rule the analog `HHSV`/… selectors already follow, see
+/// [`crate::server::record::AnalogAlarmConfig`]). C hands that raw ordinal
+/// straight to `recGblSetSevr`, so a state alarm whose raw severity is
+/// numerically greater than a prior UDF's in-range `INVALID` (3) — e.g. `ZSV=4`
+/// or `65535` — DOES override it: `3 < 4` is true, STAT becomes STATE. Clamping
+/// the ordinal to `Invalid` (3) BEFORE the compare (the [`rec_gbl_set_sevr`]
+/// path via [`AlarmSeverity::from_u16`]) would tie the prior UDF and wrongly
+/// leave STAT=UDF.
+///
+/// The DISPLAYED severity stays clamped: C clamps `nsev` to `INVALID_ALARM` in
+/// `recGblResetAlarms` (recGbl.c:188), and this stores the clamped
+/// [`AlarmSeverity`] so both sides show `INVALID`. `raw_sevr == 0` is a no-op
+/// (NO_ALARM never raises), matching C's `recGblSetSevr(.., 0)`.
+pub fn rec_gbl_set_sevr_raw(common: &mut CommonFields, stat: u16, raw_sevr: u16) {
+    if raw_sevr > (common.nsev as u16) {
+        common.nsta = stat;
+        common.nsev = AlarmSeverity::from_u16(raw_sevr);
+        // C `msg == NULL` branch clears the pending message.
+        common.namsg.clear();
+    }
+}
+
 /// Set new alarm severity AND attach an alarm message (epics-base PR
 /// #568 `recGblSetSevrMsg`). Same "raise only" rule as `rec_gbl_set_sevr`;
 /// when the new severity raises the pending state, both `nsta`/`nsev`

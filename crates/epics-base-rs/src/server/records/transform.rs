@@ -7,6 +7,8 @@ use crate::types::EpicsValue;
 
 use crate::calc::{CompiledExpr, StringInputs, scalc_compile, scalc_perform};
 
+use super::link_status::{LINK_CON, LINK_STATUS_CHOICES};
+
 const NUM_CHANNELS: usize = 16; // A-P
 
 /// Transform record — 16 input/output channels (A-P), each with its own calc expression.
@@ -202,6 +204,29 @@ impl TransformRecord {
         (cur == 0.0 && last == 0.0) || cur.to_bits() == last.to_bits()
     }
 
+    /// The input/output link-connection-status fields IAV..IPV / OAV..OPV
+    /// (`transformRecord.dbd:766-989`, DBF_MENU `menu(transformIAV)`,
+    /// `special(SPC_NOMOD)`). Names are `I<c>V` / `O<c>V` for channel `c` in
+    /// A..P.
+    ///
+    /// Each is DERIVED from its link, never client-set: C `init_record`
+    /// (`transformRecord.c:430-471`) and `checkLinks` (`:713-741`) classify the
+    /// link and store `transformIAV_CON` (=3) for every CONSTANT link, and a
+    /// default record has all links constant. As with the sibling `acalcout`
+    /// calc record, this port classifies the status STATICALLY (there is no
+    /// live re-derivation on a link re-point), so every field reads
+    /// `Constant`. The dbd `initial("1")` is C's pre-init placeholder that
+    /// `init_record` overwrites — serving it raw (what `declared_default` did
+    /// for these un-modeled fields) reported `Ext PV OK` where C reports
+    /// `Constant`.
+    fn is_link_status_field(name: &str) -> bool {
+        let b = name.as_bytes();
+        name.len() == 3
+            && (b[0] == b'I' || b[0] == b'O')
+            && (b'A'..=b'P').contains(&b[1])
+            && b[2] == b'V'
+    }
+
     /// LA..LP — "Prev Value of A".."Prev Value of P"
     /// (`transformRecord.dbd:505-584`).
     fn last_value_index(name: &str) -> Option<usize> {
@@ -228,6 +253,21 @@ const TRANSFORM_IVLA_CHOICES: &[&str] = &["Ignore error", "Do Nothing"];
 impl Record for TransformRecord {
     fn record_type(&self) -> &'static str {
         "transform"
+    }
+
+    /// The link-status menus (IAV..IPV, OAV..OPV) are served read-only by
+    /// `get_field`, but the record owns no WRITE path for them — they are
+    /// `SPC_NOMOD`, derived from the link (see [`Self::is_link_status_field`]).
+    /// The loader's `.dbd`-initial seed and `.db field()` apply both key on this
+    /// predicate to decide whether to WRITE a field; answering `false` keeps
+    /// them from storing the `.dbd` `initial("1")` over the init-derived
+    /// `Constant`. The read is unaffected: `resolve_field` consults `get_field`
+    /// independently.
+    fn implements_field(&self, name: &str) -> bool {
+        if Self::is_link_status_field(name) {
+            return false;
+        }
+        self.get_field(name).is_some()
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
@@ -446,6 +486,11 @@ impl Record for TransformRecord {
         }
         if let Some(idx) = Self::last_value_index(name) {
             return Some(EpicsValue::Double(self.lvals[idx]));
+        }
+        if Self::is_link_status_field(name) {
+            // Link-derived, `Constant` for the default record's constant links
+            // (see [`Self::is_link_status_field`]).
+            return Some(EpicsValue::Enum(LINK_CON as u16));
         }
         None
     }
@@ -701,6 +746,7 @@ impl Record for TransformRecord {
         match field {
             "COPT" => Some(TRANSFORM_COPT_CHOICES),
             "IVLA" => Some(TRANSFORM_IVLA_CHOICES),
+            _ if Self::is_link_status_field(field) => Some(LINK_STATUS_CHOICES),
             _ => None,
         }
     }
@@ -726,6 +772,45 @@ mod tests {
     use super::*;
     use crate::server::record::CommonFields;
     use crate::server::record::FieldDeclaration;
+
+    #[test]
+    fn link_status_fields_read_derived_constant_and_reject_put() {
+        use crate::server::record::RecordInstance;
+        // IAV..IPV / OAV..OPV are `special(SPC_NOMOD)`, DERIVED from the link. A
+        // default record's links are all constant, so C reports `Constant`(3).
+        // Before this fix these fields were declared but un-modeled, so
+        // `resolve_field` fell through to `declared_default` and served the dbd
+        // `initial("1")` (`Ext PV OK`) — the C-parity divergence the oracle
+        // measured (`caget TRANSFORM.IAV` → 1, C → 3). The put is already
+        // refused by the framework read-only gate (`is_no_mod`), matching C
+        // `S_db_noMod`; the fix is the read value.
+        let inst = RecordInstance::new("T:LS".into(), TransformRecord::new());
+        for name in ["IAV", "IPV", "IOV", "OAV", "OPV"] {
+            assert_eq!(
+                inst.resolve_field(name),
+                Some(EpicsValue::Enum(LINK_CON as u16)),
+                "{name} should read derived Constant(3), not the dbd initial"
+            );
+            assert!(
+                inst.is_no_mod(name),
+                "{name} is SPC_NOMOD — a client put must be refused"
+            );
+            assert_eq!(
+                inst.record.menu_field_choices(name),
+                Some(LINK_STATUS_CHOICES),
+                "{name} exposes the link-status choice labels"
+            );
+        }
+        // The name matcher is bounded to channels A..P and the I/O prefix — it
+        // must not sweep in look-alikes (a would-be `IQV` past channel P, the
+        // 4-char link/menu fields, or the L-prefixed prev-value fields).
+        assert!(TransformRecord::is_link_status_field("IAV"));
+        assert!(TransformRecord::is_link_status_field("OPV"));
+        assert!(!TransformRecord::is_link_status_field("IQV"));
+        assert!(!TransformRecord::is_link_status_field("IVLA"));
+        assert!(!TransformRecord::is_link_status_field("LAV"));
+        assert!(!TransformRecord::is_link_status_field("INPA"));
+    }
 
     /// C's `init_record` tail, `*plvalue = *pvalue` (`transformRecord.c:490`).
     /// The DB path runs it for every record (`seed_constant_links` ends in

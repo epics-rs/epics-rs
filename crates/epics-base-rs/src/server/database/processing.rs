@@ -3383,28 +3383,10 @@ impl PvDatabase {
             // early)
             use crate::server::recgbl::EventMask;
 
-            let (include_val, include_archive) = match instance.record.monitor_value_changed() {
-                // lsi/lso post VALUE|LOG only when the string actually
-                // changed (C `lsiRecord.c`/`lsoRecord.c` monitor: `len !=
-                // olen || memcmp(oval, val, len)`); they have no MDEL/ADEL
-                // deadband to express that, so the gate is explicit. The
-                // MPST/APST `menuPost` "Always" override OR-adds DBE_VALUE /
-                // DBE_LOG even on an unchanged cycle (C monitor: `if (mpst ==
-                // menuPost_Always) events |= DBE_VALUE; if (apst ==
-                // menuPost_Always) events |= DBE_LOG;`).
-                Some(changed) => {
-                    let (val_always, archive_always) = instance.record.monitor_always_post();
-                    (changed || val_always, changed || archive_always)
-                }
-                None => {
-                    if instance.record.uses_monitor_deadband() {
-                        instance.check_deadband_ext()
-                    } else {
-                        // Binary records (bi/bo/busy/mbbi/mbbo): always post monitors
-                        (true, true)
-                    }
-                }
-            };
+            // The primary-value VALUE/LOG gate, through the single owner so it
+            // holds identically on every processing path (`fanout`/`seq`
+            // trigger-VAL suppression included).
+            let (include_val, include_archive) = instance.value_include_classes();
             // C `recGblResetAlarms` returns `val_mask = DBE_ALARM`
             // (recGbl.c:194/203/212) when the severity/status OR the
             // alarm message moved — every monitored-value post this
@@ -4526,28 +4508,10 @@ impl PvDatabase {
             // has joined. See `complete_put_notify` at the tail.
 
             use crate::server::recgbl::EventMask;
-            let (include_val, include_archive) = match instance.record.monitor_value_changed() {
-                // lsi/lso post VALUE|LOG only when the string actually
-                // changed (C `lsiRecord.c`/`lsoRecord.c` monitor: `len !=
-                // olen || memcmp(oval, val, len)`); they have no MDEL/ADEL
-                // deadband to express that, so the gate is explicit. The
-                // MPST/APST `menuPost` "Always" override OR-adds DBE_VALUE /
-                // DBE_LOG even on an unchanged cycle (C monitor: `if (mpst ==
-                // menuPost_Always) events |= DBE_VALUE; if (apst ==
-                // menuPost_Always) events |= DBE_LOG;`).
-                Some(changed) => {
-                    let (val_always, archive_always) = instance.record.monitor_always_post();
-                    (changed || val_always, changed || archive_always)
-                }
-                None => {
-                    if instance.record.uses_monitor_deadband() {
-                        instance.check_deadband_ext()
-                    } else {
-                        // Binary records (bi/bo/busy/mbbi/mbbo): always post monitors
-                        (true, true)
-                    }
-                }
-            };
+            // The primary-value VALUE/LOG gate, through the single owner so it
+            // holds identically on every processing path (`fanout`/`seq`
+            // trigger-VAL suppression included).
+            let (include_val, include_archive) = instance.value_include_classes();
             // C `recGblResetAlarms` `val_mask = DBE_ALARM`
             // (recGbl.c:194/203/212) — same parity rule as the main
             // process path above (see comment there).
@@ -6004,19 +5968,10 @@ fn sim_process_tail(instance: &mut RecordInstance, clear_udf: bool) {
         EventMask::NONE
     };
 
-    let (include_val, include_archive) = match instance.record.monitor_value_changed() {
-        Some(changed) => {
-            let (val_always, archive_always) = instance.record.monitor_always_post();
-            (changed || val_always, changed || archive_always)
-        }
-        None => {
-            if instance.record.uses_monitor_deadband() {
-                instance.check_deadband_ext()
-            } else {
-                (true, true)
-            }
-        }
-    };
+    // The primary-value VALUE/LOG gate, through the single owner (see
+    // `RecordInstance::value_include_classes`) so trigger-VAL suppression and
+    // the deadband/change gates hold identically on every processing path.
+    let (include_val, include_archive) = instance.value_include_classes();
     let deadband_field = instance.record.monitor_deadband_field();
     // The mask every change-detected aux field posts with — owned by
     // `AuxPostMask`, the single resolver of the record's declared narrowings of

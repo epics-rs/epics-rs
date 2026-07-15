@@ -144,9 +144,10 @@ impl HistogramRecord {
         if !self.csta {
             return;
         }
-        // Inverted limits: count nothing. C also raises SOFT/INVALID here and
-        // then erases it in the same cycle — see `check_alarms`, which raises it
-        // for real (CBUG-F12).
+        // Inverted limits: count nothing. C's `add_count` also writes
+        // stat/sevr=SOFT/INVALID directly here; that direct write is modelled
+        // by `check_alarms` (erased on the process path, sticks on the SGNL
+        // special path — CBUG-F12), which the counting-only path leaves out.
         if self.llim >= self.ulim || self.nelm <= 0 {
             return;
         }
@@ -216,32 +217,43 @@ impl Record for HistogramRecord {
         false
     }
 
-    /// The invalid-limits alarm C intends to raise but erases.
+    /// The invalid-limits alarm — C `add_count` (histogramRecord.c:329-334):
     ///
-    /// DEVIATION from C, deliberate — CBUG-F12. C's `add_count`
-    /// (histogramRecord.c:328-334) refuses to count when `LLIM >= ULIM` and
-    /// raises SOFT_ALARM / INVALID for it — but it writes `prec->stat` and
-    /// `prec->sevr` DIRECTLY instead of `nsta`/`nsev` via `recGblSetSevr`. The
-    /// same process cycle then calls `monitor()`, whose `recGblResetAlarms()`
-    /// copies `nsta/nsev → stat/sevr` and overwrites the write before any client
-    /// can observe it. The alarm is dead code: C's INTENT is to alarm, C's
-    /// BEHAVIOUR is NO_ALARM (verified on compiled softIoc: `LLIM=10 ULIM=5`,
-    /// process → STAT=NO_ALARM SEVR=NO_ALARM).
+    /// ```c
+    /// if (prec->llim >= prec->ulim) {
+    ///     if (prec->nsev < INVALID_ALARM) {
+    ///         prec->stat = SOFT_ALARM;   /* writes stat/sevr, NOT nsta/nsev */
+    ///         prec->sevr = INVALID_ALARM;
+    /// ```
     ///
-    /// Raised here through `rec_gbl_set_sevr`, which is `recGblSetSevr` — it
-    /// writes `nsta`/`nsev`, so `recGblResetAlarms` promotes it instead of
-    /// erasing it, and it keeps only the highest severity, which is what C's
-    /// hand-rolled `if (prec->nsev < INVALID_ALARM)` guard was for. Gated on
-    /// `csta` because C's is: `add_count` returns before the limits test when
-    /// counting is stopped, so a stopped histogram with inverted limits raises
-    /// nothing.
+    /// C writes `stat`/`sevr` DIRECTLY, not `nsta`/`nsev` via `recGblSetSevr`.
+    /// That single mechanism yields two OBSERVABLE behaviours depending on
+    /// whether `recGblResetAlarms` runs afterwards:
+    ///
+    /// * process path (this record's `process()` → `monitor()`): the cycle's
+    ///   `recGblResetAlarms` copies `nsta/nsev`(0/0) over the direct write, so
+    ///   it is erased before any client sees it — NO_ALARM (CBUG-F12, the
+    ///   `LLIM=10 ULIM=5` softIoc proof still holds).
+    /// * SGNL SPC_MOD `special()` path: `add_count` runs with NO monitor after
+    ///   it, so the direct write STICKS — a `caget` reports STAT=SOFT
+    ///   (verified on compiled softIoc: fresh histogram, `caput .SGNL 1` →
+    ///   STAT=SOFT SEVR=INVALID).
+    ///
+    /// Writing through `rec_gbl_set_sevr` (`nsta`/`nsev`) instead — the prior
+    /// shape — made `recGblResetAlarms` COMMIT it on the process path (a stuck
+    /// SOFT, wrong) and left the special path unwritten (born UDF, wrong):
+    /// inverted on both. The direct write is the only shape that matches C on
+    /// both. C's `nsev < INVALID_ALARM` guard is preserved — it keeps a
+    /// higher pending severity from being overwritten. Gated on `csta` because
+    /// C's `add_count` returns before the limits test when counting is stopped.
     fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
-        if self.csta && self.llim >= self.ulim {
-            crate::server::recgbl::rec_gbl_set_sevr(
-                common,
-                crate::server::recgbl::alarm_status::SOFT_ALARM,
-                crate::server::record::AlarmSeverity::Invalid,
-            );
+        use crate::server::record::AlarmSeverity;
+        if self.csta
+            && self.llim >= self.ulim
+            && (common.nsev as u16) < (AlarmSeverity::Invalid as u16)
+        {
+            common.stat = crate::server::recgbl::alarm_status::SOFT_ALARM;
+            common.sevr = AlarmSeverity::Invalid;
         }
     }
 
@@ -332,6 +344,15 @@ impl Record for HistogramRecord {
             _ => {}
         }
         Ok(())
+    }
+
+    /// A `.SGNL` caput is C's SPC_MOD `special()` → `add_count`, which writes
+    /// `stat`/`sevr` directly (histogramRecord.c:329-334) with no monitor after
+    /// it. The put owner runs [`Record::check_alarms`] once the value is stored
+    /// so that direct write lands and — with no process cycle to follow —
+    /// persists, matching C's stuck STAT=SOFT on inverted limits.
+    fn special_checks_alarms(&self, put_field: &str) -> bool {
+        put_field.eq_ignore_ascii_case("SGNL")
     }
 
     fn take_special_actions(&mut self) -> Vec<crate::server::record::ProcessAction> {

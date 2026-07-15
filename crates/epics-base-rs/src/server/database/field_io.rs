@@ -667,6 +667,24 @@ impl PvDatabase {
                 }
             };
 
+            // C `dbPut` runs `dbPutSpecial(paddr, 1)` regardless of caller entry
+            // path, so a put via this internal route commits/writes the same
+            // `special()`-driven alarm the CA route does. State only — `put_pv`
+            // posts no monitors (its contract), so unlike the CA path these
+            // commit the alarm without the STAT/SEVR posts.
+            //
+            // compress SPC_RESET: `monitor()`'s `recGblResetAlarms` commits the
+            // born-UDF alarm (compressRecord.c:103).
+            if instance.record.special_commits_alarms(&field) {
+                let _ = crate::server::recgbl::rec_gbl_reset_alarms(&mut instance.common);
+            }
+            // histogram SGNL SPC_MOD: `add_count` writes stat/sevr directly and
+            // no monitor follows, so it sticks (histogramRecord.c:329-334).
+            if instance.record.special_checks_alarms(&field) {
+                let inst = &mut *instance;
+                inst.record.check_alarms(&mut inst.common);
+            }
+
             // Invalidate metadata cache only if the metadata-class
             // field's value actually changed (faac1df1).
             instance.notify_field_written_if_changed(&field, prev_value.as_ref());
@@ -1573,6 +1591,20 @@ impl PvDatabase {
                 }
             };
 
+            // C `add_count` writes stat/sevr DIRECTLY during a SGNL SPC_MOD
+            // `special()` (histogramRecord.c:329-334); with no monitor on the
+            // special path that write STICKS and a later caget observes it
+            // (STAT=SOFT on inverted limits). `check_alarms` performs that
+            // direct write. Unlike the process path — where the cycle's
+            // `recGblResetAlarms` erases it — this special-only put runs no
+            // process, so it persists, matching C. Gated on
+            // `special_checks_alarms` (histogram SGNL only). No STAT post: C's
+            // `add_count` posts nothing, and the special path has no monitor.
+            if instance.record.special_checks_alarms(&field) {
+                let inst = &mut *instance;
+                inst.record.check_alarms(&mut inst.common);
+            }
+
             // Invalidate metadata cache only if the metadata-class
             // field's value actually changed (faac1df1).
             instance.notify_field_written_if_changed(&field, prev_value.as_ref());
@@ -1721,6 +1753,16 @@ impl PvDatabase {
                         };
                         instance.notify_field(sf, mask | alarm_mask);
                     }
+                }
+                // The same `dbPutSpecial(paddr, 1)`-on-reject rule for a field
+                // whose special() writes stat/sevr DIRECTLY (histogram SGNL →
+                // add_count): C still runs add_count when the SGNL conversion
+                // fails, so its stuck STAT=SOFT on inverted limits appears even
+                // for a rejected `caput .SGNL notanumber`. `check_alarms` makes
+                // that direct write; no process follows, so it persists.
+                if instance.record.special_checks_alarms(&field) {
+                    let inst = &mut *instance;
+                    inst.record.check_alarms(&mut inst.common);
                 }
                 if want_notify && put_drives_processing_of(&instance, &field) {
                     drop(instance);

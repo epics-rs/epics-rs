@@ -2212,6 +2212,22 @@ pub trait Record: Send + Sync + 'static {
         false
     }
 
+    /// True iff the C `special()` for a put to `put_field` runs code that
+    /// writes `stat`/`sevr` DIRECTLY (not `nsta`/`nsev`) with NO `monitor()` /
+    /// `recGblResetAlarms` after it — so the write STICKS and a later `caget`
+    /// observes it, unlike the process path where `recGblResetAlarms` erases it.
+    ///
+    /// `histogram` is the case this exists for: a `.SGNL` caput is C's SPC_MOD
+    /// `special()` → `add_count`, which writes `prec->stat = SOFT_ALARM` on
+    /// inverted limits (histogramRecord.c:329-334) and returns with no monitor.
+    /// When true, the put owner (`field_io`) runs
+    /// [`Record::check_alarms`] after the store — the same direct write the
+    /// process path makes, but here it persists because no process cycle
+    /// follows. Default: false (no direct special-path alarm write).
+    fn special_checks_alarms(&self, _put_field: &str) -> bool {
+        false
+    }
+
     /// Downcast to concrete type for device support init injection.
     /// Override in record types that need device support to inject state (e.g., MotorRecord).
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {

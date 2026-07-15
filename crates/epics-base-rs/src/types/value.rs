@@ -1094,9 +1094,17 @@ impl EpicsValue {
                 None => c_cast::f64_to_i16(self.to_f64().unwrap_or(0.0)),
             }),
             DbFieldType::Float => EpicsValue::Float(self.to_f64().unwrap_or(0.0) as f32),
+            // C's numeric→`DBF_ENUM`/`DBF_MENU` put is `putDoubleEnum`
+            // (`dbConvert.c`): `*pfield = (epicsEnum16)*psrc`, a WRAPPING cast of
+            // the truncated value, not a saturating clamp. A float `-1.0` must
+            // land as `65535` (served signed as `-1`), matching `caput REC.HSV -1`
+            // on a compiled softIoc — `c_cast::f64_to_u16` saturates it to `0`,
+            // which silently clamped every out-of-range menu-ordinal put. Truncate
+            // toward zero via the `i64` view, then take the low 16 bits like the
+            // integer-source path above.
             DbFieldType::Enum => EpicsValue::Enum(match self.as_int_i64() {
                 Some(i) => i as u16,
-                None => c_cast::f64_to_u16(self.to_f64().unwrap_or(0.0)),
+                None => self.to_f64().unwrap_or(0.0) as i64 as u16,
             }),
             DbFieldType::Char => {
                 // String → CharArray (for waveform FTVL=CHAR)

@@ -122,7 +122,7 @@ impl PvDatabase {
     pub async fn pini_records(&self, mode: PiniMode) -> Vec<String> {
         let mut result = Vec::new();
         for (name, rec) in self.records_in_load_order().await {
-            if rec.read().await.common.pini == mode {
+            if rec.read().await.common.pini == mode.to_u16() as i16 {
                 result.push(name);
             }
         }
@@ -203,7 +203,7 @@ impl PvDatabase {
                     let instance = rec.read().await;
                     (instance.common.pini, i32::from(instance.common.phas))
                 };
-                if pini != mode {
+                if pini != mode.to_u16() as i16 {
                     continue;
                 }
                 if phas == this {

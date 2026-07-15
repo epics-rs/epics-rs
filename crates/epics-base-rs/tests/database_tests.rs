@@ -4137,7 +4137,7 @@ async fn test_pini_passes_select_disjoint_menu_choices() {
             .await
             .common
             .pini,
-        PiniMode::Run
+        PiniMode::Run.to_u16() as i16
     );
 
     // Pass 1: initialProcess() — YES only.
@@ -4600,13 +4600,13 @@ async fn test_pini_put_accepts_every_menu_choice_and_rejects_junk() {
         let mut inst = rec.write().await;
         inst.put_common_field("PINI", EpicsValue::String(label.into()))
             .unwrap();
-        assert_eq!(inst.common.pini, expect, "PINI={label}");
+        assert_eq!(inst.common.pini, expect.to_u16() as i16, "PINI={label}");
     }
     // Numeric puts index the menu (DBR_ENUM write from a CA client).
     {
         let mut inst = rec.write().await;
         inst.put_common_field("PINI", EpicsValue::Short(2)).unwrap();
-        assert_eq!(inst.common.pini, PiniMode::Run);
+        assert_eq!(inst.common.pini, PiniMode::Run.to_u16() as i16);
     }
     // A string outside the menu is an error, not a silent demotion to NO.
     {
@@ -4618,7 +4618,7 @@ async fn test_pini_put_accepts_every_menu_choice_and_rejects_junk() {
         );
         assert_eq!(
             inst.common.pini,
-            PiniMode::Run,
+            PiniMode::Run.to_u16() as i16,
             "the rejected put must not change PINI"
         );
     }

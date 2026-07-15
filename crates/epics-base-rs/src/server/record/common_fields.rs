@@ -1,7 +1,6 @@
 use std::time::SystemTime;
 
 use super::alarm::{AlarmSeverity, AnalogAlarmConfig};
-use super::pini::PiniMode;
 use super::scan::{ScanType, SimModeScan};
 use crate::types::PvString;
 
@@ -33,7 +32,12 @@ pub struct CommonFields {
     /// `!= 0`, and the record-facing [`ProcessContext::udf`] boundary keeps the
     /// `bool` view.
     pub udf: u8,
-    pub udfs: AlarmSeverity,
+    /// `UDFS` (`DBF_MENU menu(menuAlarmSevr)`) — the severity raised for a UDF
+    /// record. Holds the **raw stored ordinal** (see [`AnalogAlarmConfig`]): C
+    /// stores `(epicsEnum16)` verbatim on a numeric put, so an out-of-range
+    /// `UDFS` round-trips (`caput REC.UDFS 4` → `4`); the alarm meaning is
+    /// `AlarmSeverity::from_u16(udfs as u16)`.
+    pub udfs: i16,
     // Scan
     pub scan: ScanType,
     // SSCN's dbd default is the out-of-range sentinel 65535 ("use SCAN"),
@@ -51,8 +55,13 @@ pub struct CommonFields {
     /// (`rec_gbl_check_simm`). Read-only to clients (SPC_NOMOD).
     pub oldsimm: i16,
     /// `PINI` is `DBF_MENU`/`menu(menuPini)` — a six-choice lifecycle
-    /// selector, not a flag. See [`PiniMode`].
-    pub pini: PiniMode,
+    /// selector, not a flag (see [`PiniMode`] for the choice semantics). Holds
+    /// the **raw stored ordinal** as `i16`: C stores `(epicsEnum16)` verbatim on
+    /// a numeric put, so `caput REC.PINI 6` keeps `6` and `caput REC.PINI -1`
+    /// keeps `65535`. `doRecordPini` compares against the exact valid indices,
+    /// so any out-of-range ordinal simply matches no lifecycle pass — read a
+    /// choice with `PiniMode::from_u16(pini as u16)`.
+    pub pini: i16,
     /// `TPRO` (`DBF_UCHAR` in `dbCommon.dbd`) — trace-processing flag. C
     /// stores the raw put byte and serves it as SIGNED `DBR_CHAR`
     /// (`caput TPRO 255` → `caget` = -1). Modeled as the raw `u8`, like
@@ -111,7 +120,9 @@ pub struct CommonFields {
     pub disv: i16,
     pub disa: i16,
     pub sdis: String,
-    pub diss: AlarmSeverity,
+    /// `DISS` (`DBF_MENU menu(menuAlarmSevr)`) — the severity a disabled record
+    /// takes. Holds the **raw stored ordinal** (see [`AnalogAlarmConfig`]).
+    pub diss: i16,
     // Alarm hysteresis (analog records)
     pub hyst: f64,
     // Lock count (re-entrance counter)
@@ -164,7 +175,7 @@ impl CommonFields {
     pub fn process_context(&self) -> super::record_trait::ProcessContext {
         super::record_trait::ProcessContext {
             udf: self.udf != 0,
-            udfs: self.udfs,
+            udfs: AlarmSeverity::from_u16(self.udfs as u16),
             nsev: self.nsev,
             phas: self.phas,
             tse: self.tse,
@@ -193,7 +204,7 @@ impl Default for CommonFields {
             acks: AlarmSeverity::NoAlarm,
             ackt: true,
             udf: 1,
-            udfs: AlarmSeverity::Invalid,
+            udfs: AlarmSeverity::Invalid as i16,
             scan: ScanType::Passive,
             // C dbd `field(SSCN,DBF_MENU){ menu(menuScan) initial("65535") }`:
             // the default is the out-of-range "use SCAN" sentinel, not Passive.
@@ -201,7 +212,7 @@ impl Default for CommonFields {
             // C dbd `field(OLDSIMM,DBF_MENU){ menu(menuSimm) }` — no
             // `initial()`, so it starts at index 0 (`menuSimmNO`).
             oldsimm: 0,
-            pini: PiniMode::No,
+            pini: 0,
             tpro: 0,
             bkpt: 0,
             flnk: String::new(),
@@ -229,7 +240,7 @@ impl Default for CommonFields {
             disv: 1,
             disa: 0,
             sdis: String::new(),
-            diss: AlarmSeverity::NoAlarm,
+            diss: 0,
             hyst: 0.0,
             lcnt: 0,
             disp: 0,

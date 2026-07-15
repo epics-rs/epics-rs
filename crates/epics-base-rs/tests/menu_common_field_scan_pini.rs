@@ -116,7 +116,7 @@ async fn pini_uses_the_menu_converter() {
     db.put_record_field_from_ca("REC", "PINI", EpicsValue::String("RUN".into()))
         .await
         .unwrap();
-    assert_eq!(rec.read().await.common.pini.to_u16(), 2);
+    assert_eq!(rec.read().await.common.pini, 2);
 
     for bad in [" RUN", "run", "6", "true"] {
         let err = db
@@ -127,7 +127,7 @@ async fn pini_uses_the_menu_converter() {
             matches!(err, CaError::BadChoice(_)),
             "PINI {bad:?} must be S_db_badChoice; got {err:?}"
         );
-        assert_eq!(rec.read().await.common.pini.to_u16(), 2, "after {bad:?}");
+        assert_eq!(rec.read().await.common.pini, 2, "after {bad:?}");
     }
 }
 

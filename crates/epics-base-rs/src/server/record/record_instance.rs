@@ -18,7 +18,6 @@ use super::link::{
     ParsedLink, out_link_discards_cp, parse_forward_link_v2, parse_link_v2, parse_output_link_v2,
 };
 use super::menu_choices::MenuBound;
-use super::pini::PiniMode;
 use super::record_trait::{
     AuxPostMask, CommonFieldPutResult, FieldDeclaration, FieldDesc, ProcessSnapshot, Record,
     RecordProcessResult, SubroutineFn,
@@ -266,26 +265,44 @@ fn is_metadata_field(name: &str) -> bool {
 
 /// One alarm limit for a DBR_AL_DOUBLE response: the value when its
 /// severity threshold is enabled, `NaN` otherwise. Mirrors C
-/// `get_alarm_double`'s `prec->hhsv ? prec->hihi : epicsNAN`.
-fn gated(severity: AlarmSeverity, limit: f64) -> f64 {
-    if severity != AlarmSeverity::NoAlarm {
-        limit
-    } else {
-        f64::NAN
-    }
+/// `get_alarm_double`'s `prec->hhsv ? prec->hihi : epicsNAN` — a NONZERO
+/// test on the raw ordinal, so an out-of-range severity still enables the
+/// limit.
+fn gated(severity: i16, limit: f64) -> f64 {
+    if severity != 0 { limit } else { f64::NAN }
 }
 
-fn parse_alarm_severity(value: &EpicsValue) -> AlarmSeverity {
+/// Extract the RAW stored ordinal a put lands in a `menu(menuAlarmSevr)`
+/// severity field (`HHSV`/`HSV`/`LSV`/`LLSV`/`UDFS`/`DISS`), WITHOUT clamping
+/// to the 0..=3 valid range.
+///
+/// C's numeric menu put stores whatever `(epicsEnum16)` the value truncates to
+/// (`dbConvert.c::putDoubleEnum` = `*pfield = (epicsEnum16)*psrc`), so
+/// `caput REC.HSV 4` keeps `4` and `caput REC.HSV -1` keeps `65535` — both
+/// wire-visible (served signed as `-1`) and both used verbatim to derive the
+/// alarm. The carrier is `i16` so the 16-bit pattern round-trips; the alarm
+/// meaning is read back with [`AlarmSeverity::from_u16`] and the C nonzero
+/// enable with `!= 0`.
+///
+/// A numeric value has already been wrapped to `epicsEnum16` upstream
+/// (`EpicsValue::convert_to(Enum)`, the one owner of C's double→enum cast); this
+/// only reinterprets its bit pattern. A `String` is a db-load / internal-link
+/// label (a client string put is rejected-or-resolved by `putStringMenu`
+/// upstream), resolved to its ordinal here.
+fn menu_ordinal_raw(value: &EpicsValue) -> i16 {
     match value {
-        EpicsValue::Short(v) => AlarmSeverity::from_u16(*v as u16),
-        EpicsValue::String(s) => AlarmSeverity::from_u16(match s.as_str_lossy().as_ref() {
+        EpicsValue::String(s) => match s.as_str_lossy().as_ref() {
             "NO_ALARM" => 0,
             "MINOR" => 1,
             "MAJOR" => 2,
             "INVALID" => 3,
-            other => other.parse::<u16>().unwrap_or(0),
-        }),
-        other => AlarmSeverity::from_u16(other.to_f64().unwrap_or(0.0) as u16),
+            other => other
+                .parse::<i64>()
+                .ok()
+                .map(|n| n as u16 as i16)
+                .unwrap_or(0),
+        },
+        other => other.to_f64().unwrap_or(0.0) as i64 as u16 as i16,
     }
 }
 
@@ -867,7 +884,7 @@ impl RecordInstance {
         if self.common.udf != 0
             && self.common.stat == crate::server::recgbl::alarm_status::UDF_ALARM
         {
-            self.common.sevr = self.common.udfs;
+            self.common.sevr = AlarmSeverity::from_u16(self.common.udfs as u16);
         }
         if let Err(e) = self.record.init_record(0) {
             eprintln!("init_record(0) failed for {name}: {e}");
@@ -2264,7 +2281,7 @@ impl RecordInstance {
             // DBF_UCHAR: served as UChar (declared type) so the raw put byte
             // round-trips to the wire — see the DISP/TPRO comment above.
             "UDF" => Some(EpicsValue::UChar(self.common.udf)),
-            "UDFS" => Some(EpicsValue::Short(self.common.udfs as i16)),
+            "UDFS" => Some(EpicsValue::Short(self.common.udfs)),
             "SCAN" => Some(EpicsValue::Enum(self.common.scan.to_u16())),
             "SSCN" => Some(EpicsValue::Enum(self.common.sscn.to_u16())),
             // `OLDSIMM` is `DBF_MENU`/`menu(menuSimm)`, stored as the menu index
@@ -2273,7 +2290,7 @@ impl RecordInstance {
             // menuSimm, unlike the live SIMM). Written only by the simulation
             // owner (`rec_gbl_save_simm`); `special(SPC_NOMOD)` for clients.
             "OLDSIMM" => Some(EpicsValue::Short(self.common.oldsimm)),
-            "PINI" => Some(EpicsValue::Short(self.common.pini.to_u16() as i16)),
+            "PINI" => Some(EpicsValue::Short(self.common.pini)),
             // DISP/TPRO/RPRO/UDF are `DBF_UCHAR` in `dbCommon.dbd`. Serve them
             // as `UChar` — their DECLARED type — so `project_to_declared_type`
             // is identity and the raw put byte reaches the wire untouched (C
@@ -2314,7 +2331,7 @@ impl RecordInstance {
             "DISV" => Some(EpicsValue::Short(self.common.disv)),
             "DISA" => Some(EpicsValue::Short(self.common.disa)),
             "SDIS" => Some(EpicsValue::String(self.common.sdis.clone().into())),
-            "DISS" => Some(EpicsValue::Short(self.common.diss as i16)),
+            "DISS" => Some(EpicsValue::Short(self.common.diss)),
             "HYST" => Some(EpicsValue::Double(self.common.hyst)),
             "LCNT" => Some(EpicsValue::Short(self.common.lcnt)),
             "DISP" => Some(EpicsValue::UChar(self.common.disp)),
@@ -2352,22 +2369,22 @@ impl RecordInstance {
                 .common
                 .analog_alarm
                 .as_ref()
-                .map(|a| EpicsValue::Short(a.hhsv as i16)),
+                .map(|a| EpicsValue::Short(a.hhsv)),
             "HSV" => self
                 .common
                 .analog_alarm
                 .as_ref()
-                .map(|a| EpicsValue::Short(a.hsv as i16)),
+                .map(|a| EpicsValue::Short(a.hsv)),
             "LSV" => self
                 .common
                 .analog_alarm
                 .as_ref()
-                .map(|a| EpicsValue::Short(a.lsv as i16)),
+                .map(|a| EpicsValue::Short(a.lsv)),
             "LLSV" => self
                 .common
                 .analog_alarm
                 .as_ref()
-                .map(|a| EpicsValue::Short(a.llsv as i16)),
+                .map(|a| EpicsValue::Short(a.llsv)),
             // swait OUTN is aliased to common.out
             "OUTN" => {
                 if self.record.record_type() == "swait" {
@@ -2671,9 +2688,7 @@ impl RecordInstance {
                 }
             }
             "UDFS" => {
-                if let EpicsValue::Short(v) = value {
-                    self.common.udfs = AlarmSeverity::from_u16(v as u16);
-                }
+                self.common.udfs = menu_ordinal_raw(&value);
             }
             // The `String` form never reaches these three menu arms:
             // `coerce_common_field` has already run it through the one
@@ -2707,10 +2722,15 @@ impl RecordInstance {
             // `caput REC.PINI RUN` *disabled* PINI instead of selecting the
             // iocRun pass.
             "PINI" => {
+                // Store the RAW ordinal (see [`CommonFields::pini`]): C's numeric
+                // menu put keeps `(epicsEnum16)`, so an out-of-range `caput
+                // REC.PINI 6` / `-1` round-trips and simply matches no lifecycle
+                // pass in `doRecordPini`. A `String` label is already resolved to
+                // `Enum` by `coerce_common_field` (menuPini via `putStringMenu`).
                 self.common.pini = match &value {
-                    EpicsValue::Short(v) => PiniMode::from_u16(*v as u16),
-                    EpicsValue::Char(v) => PiniMode::from_u16(*v as u16),
-                    EpicsValue::Enum(v) => PiniMode::from_u16(*v),
+                    EpicsValue::Short(v) => *v,
+                    EpicsValue::Char(v) => *v as i16,
+                    EpicsValue::Enum(v) => *v as i16,
                     _ => return Ok(CommonFieldPutResult::NoChange),
                 };
             }
@@ -2935,9 +2955,7 @@ impl RecordInstance {
                 }
             }
             "DISS" => {
-                if let EpicsValue::Short(v) = value {
-                    self.common.diss = AlarmSeverity::from_u16(v as u16);
-                }
+                self.common.diss = menu_ordinal_raw(&value);
             }
             "HYST" => {
                 if let Some(v) = value.to_f64() {
@@ -2997,22 +3015,22 @@ impl RecordInstance {
             }
             "HHSV" => {
                 if let Some(a) = &mut self.common.analog_alarm {
-                    a.hhsv = parse_alarm_severity(&value);
+                    a.hhsv = menu_ordinal_raw(&value);
                 }
             }
             "HSV" => {
                 if let Some(a) = &mut self.common.analog_alarm {
-                    a.hsv = parse_alarm_severity(&value);
+                    a.hsv = menu_ordinal_raw(&value);
                 }
             }
             "LSV" => {
                 if let Some(a) = &mut self.common.analog_alarm {
-                    a.lsv = parse_alarm_severity(&value);
+                    a.lsv = menu_ordinal_raw(&value);
                 }
             }
             "LLSV" => {
                 if let Some(a) = &mut self.common.analog_alarm {
-                    a.llsv = parse_alarm_severity(&value);
+                    a.llsv = menu_ordinal_raw(&value);
                 }
             }
             // swait-specific: OUTN is the output link name for swait records.
@@ -3254,23 +3272,46 @@ impl RecordInstance {
         // 3=Normal, 4=High, 5=Hihi. Required for the calc-record AFTC
         // filter (`calcRecord.c::checkAlarms:339-381`) which filters
         // on the range level (not on severity) and re-maps back.
-        let (mut new_sevr, mut new_stat, mut alev, mut alarm_range) = if cfg.hhsv
-            != AlarmSeverity::NoAlarm
+        // C's `checkAlarms` enables each level with a NONZERO test on the raw
+        // severity ordinal (`if (prec->hhsv && …)`) and passes that raw ordinal
+        // to `recGblSetSevr`; `recGblResetAlarms` then clamps the resulting
+        // *severity* to `INVALID_ALARM` while the *status* keeps the level. So an
+        // out-of-range selector (`HHSV = 4`) still fires HIHI and lands
+        // SEVR=INVALID/STAT=HIHI — reproduced by testing `!= 0` and mapping the
+        // ordinal through [`AlarmSeverity::from_u16`] (which clamps `>= 3` to
+        // `Invalid`).
+        let (mut new_sevr, mut new_stat, mut alev, mut alarm_range) = if cfg.hhsv != 0
             && (val >= cfg.hihi || (lalm == cfg.hihi && val >= cfg.hihi - hyst))
         {
-            (cfg.hhsv, alarm_status::HIHI_ALARM, cfg.hihi, 5u16)
-        } else if cfg.llsv != AlarmSeverity::NoAlarm
-            && (val <= cfg.lolo || (lalm == cfg.lolo && val <= cfg.lolo + hyst))
+            (
+                AlarmSeverity::from_u16(cfg.hhsv as u16),
+                alarm_status::HIHI_ALARM,
+                cfg.hihi,
+                5u16,
+            )
+        } else if cfg.llsv != 0 && (val <= cfg.lolo || (lalm == cfg.lolo && val <= cfg.lolo + hyst))
         {
-            (cfg.llsv, alarm_status::LOLO_ALARM, cfg.lolo, 1u16)
-        } else if cfg.hsv != AlarmSeverity::NoAlarm
-            && (val >= cfg.high || (lalm == cfg.high && val >= cfg.high - hyst))
+            (
+                AlarmSeverity::from_u16(cfg.llsv as u16),
+                alarm_status::LOLO_ALARM,
+                cfg.lolo,
+                1u16,
+            )
+        } else if cfg.hsv != 0 && (val >= cfg.high || (lalm == cfg.high && val >= cfg.high - hyst))
         {
-            (cfg.hsv, alarm_status::HIGH_ALARM, cfg.high, 4u16)
-        } else if cfg.lsv != AlarmSeverity::NoAlarm
-            && (val <= cfg.low || (lalm == cfg.low && val <= cfg.low + hyst))
-        {
-            (cfg.lsv, alarm_status::LOW_ALARM, cfg.low, 2u16)
+            (
+                AlarmSeverity::from_u16(cfg.hsv as u16),
+                alarm_status::HIGH_ALARM,
+                cfg.high,
+                4u16,
+            )
+        } else if cfg.lsv != 0 && (val <= cfg.low || (lalm == cfg.low && val <= cfg.low + hyst)) {
+            (
+                AlarmSeverity::from_u16(cfg.lsv as u16),
+                alarm_status::LOW_ALARM,
+                cfg.low,
+                2u16,
+            )
         } else {
             (AlarmSeverity::NoAlarm, alarm_status::NO_ALARM, val, 3u16)
         };
@@ -3309,10 +3350,26 @@ impl RecordInstance {
                 if filtered_range != alarm_range {
                     // Re-map filtered range back to (sevr, stat, alev).
                     let (mapped_sevr, mapped_stat, mapped_alev) = match filtered_range {
-                        5 => (cfg.hhsv, alarm_status::HIHI_ALARM, cfg.hihi),
-                        4 => (cfg.hsv, alarm_status::HIGH_ALARM, cfg.high),
-                        2 => (cfg.lsv, alarm_status::LOW_ALARM, cfg.low),
-                        1 => (cfg.llsv, alarm_status::LOLO_ALARM, cfg.lolo),
+                        5 => (
+                            AlarmSeverity::from_u16(cfg.hhsv as u16),
+                            alarm_status::HIHI_ALARM,
+                            cfg.hihi,
+                        ),
+                        4 => (
+                            AlarmSeverity::from_u16(cfg.hsv as u16),
+                            alarm_status::HIGH_ALARM,
+                            cfg.high,
+                        ),
+                        2 => (
+                            AlarmSeverity::from_u16(cfg.lsv as u16),
+                            alarm_status::LOW_ALARM,
+                            cfg.low,
+                        ),
+                        1 => (
+                            AlarmSeverity::from_u16(cfg.llsv as u16),
+                            alarm_status::LOLO_ALARM,
+                            cfg.lolo,
+                        ),
                         _ => (AlarmSeverity::NoAlarm, alarm_status::NO_ALARM, val),
                     };
                     new_sevr = mapped_sevr;
@@ -6156,13 +6213,13 @@ mod common_field_dbload_tests {
         put(&mut inst, "DISS", "MAJOR");
         assert_eq!(
             inst.common.diss,
-            AlarmSeverity::Major,
+            AlarmSeverity::Major as i16,
             "field(DISS, \"MAJOR\")"
         );
         put(&mut inst, "UDFS", "NO_ALARM");
         assert_eq!(
             inst.common.udfs,
-            AlarmSeverity::NoAlarm,
+            AlarmSeverity::NoAlarm as i16,
             "field(UDFS, \"NO_ALARM\")"
         );
         put(&mut inst, "ACKT", "NO");

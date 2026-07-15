@@ -483,7 +483,7 @@ fn dfanout_udf_alarm_on_nan_val() {
         ..Default::default()
     };
     rec.check_alarms(&mut common);
-    assert_eq!(common.nsev, common.udfs);
+    assert_eq!(common.nsev, AlarmSeverity::from_u16(common.udfs as u16));
     assert_eq!(common.nsta, alarm_status::UDF_ALARM);
 }
 

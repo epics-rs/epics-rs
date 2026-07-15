@@ -214,6 +214,37 @@ fn special_before_put(instance: &mut crate::server::record::RecordInstance, fiel
     }
 }
 
+/// The `recGblResetAlarms` half of a C `monitor()` that a `special()` invokes
+/// (compress SPC_RESET, [`crate::server::record::Record::special_commits_alarms`]).
+///
+/// C's `monitor()` opens with `recGblResetAlarms(prec)` (compressRecord.c:103),
+/// committing `nsta`/`nsev` into `stat`/`sevr` — this is what clears the
+/// born-UDF alarm of a never-processed record the moment a reset field is put.
+/// Commits the alarm, posts any STAT/SEVR/AMSG/ACKS transition through the one
+/// owner ([`crate::server::database::processing::alarm_field_posts`]), and
+/// returns the `DBE_ALARM` mask C ORs into the value posts (`val_mask`,
+/// recGbl.c:213 — set iff any alarm-class field moved this cycle).
+///
+/// Shared by `dbPut`'s success tail and its rejected-conversion path: C runs
+/// `dbPutSpecial(paddr, 1)` on BOTH (dbAccess.c:83-88, "Always do special
+/// processing if needed", before the `goto done` that bails on a failed put).
+fn commit_special_reset_alarm(
+    instance: &mut crate::server::record::RecordInstance,
+) -> crate::server::recgbl::EventMask {
+    use crate::server::recgbl::EventMask;
+    let alarm_result = crate::server::recgbl::rec_gbl_reset_alarms(&mut instance.common);
+    for (af, mask) in
+        crate::server::database::processing::alarm_field_posts(&instance.common, &alarm_result)
+    {
+        instance.notify_field(af, mask);
+    }
+    if alarm_result.alarm_changed || alarm_result.amsg_changed {
+        EventMask::ALARM
+    } else {
+        EventMask::NONE
+    }
+}
+
 /// Coerce a write `value` to a record field's stored `target` type — C
 /// `dbConvert.c`'s `dbFastPutConvertRoutine[dbrType][field_type]` table.
 ///
@@ -635,6 +666,24 @@ impl PvDatabase {
                     }
                 }
             };
+
+            // C `dbPut` runs `dbPutSpecial(paddr, 1)` regardless of caller entry
+            // path, so a put via this internal route commits/writes the same
+            // `special()`-driven alarm the CA route does. State only — `put_pv`
+            // posts no monitors (its contract), so unlike the CA path these
+            // commit the alarm without the STAT/SEVR posts.
+            //
+            // compress SPC_RESET: `monitor()`'s `recGblResetAlarms` commits the
+            // born-UDF alarm (compressRecord.c:103).
+            if instance.record.special_commits_alarms(&field) {
+                let _ = crate::server::recgbl::rec_gbl_reset_alarms(&mut instance.common);
+            }
+            // histogram SGNL SPC_MOD: `add_count` writes stat/sevr directly and
+            // no monitor follows, so it sticks (histogramRecord.c:329-334).
+            if instance.record.special_checks_alarms(&field) {
+                let inst = &mut *instance;
+                inst.record.check_alarms(&mut inst.common);
+            }
 
             // Invalidate metadata cache only if the metadata-class
             // field's value actually changed (faac1df1).
@@ -1542,6 +1591,20 @@ impl PvDatabase {
                 }
             };
 
+            // C `add_count` writes stat/sevr DIRECTLY during a SGNL SPC_MOD
+            // `special()` (histogramRecord.c:329-334); with no monitor on the
+            // special path that write STICKS and a later caget observes it
+            // (STAT=SOFT on inverted limits). `check_alarms` performs that
+            // direct write. Unlike the process path — where the cycle's
+            // `recGblResetAlarms` erases it — this special-only put runs no
+            // process, so it persists, matching C. Gated on
+            // `special_checks_alarms` (histogram SGNL only). No STAT post: C's
+            // `add_count` posts nothing, and the special path has no monitor.
+            if instance.record.special_checks_alarms(&field) {
+                let inst = &mut *instance;
+                inst.record.check_alarms(&mut inst.common);
+            }
+
             // Invalidate metadata cache only if the metadata-class
             // field's value actually changed (faac1df1).
             instance.notify_field_written_if_changed(&field, prev_value.as_ref());
@@ -1606,6 +1669,21 @@ impl PvDatabase {
             // posts the field with a literal `DBE_VALUE` (e.g. table SET,
             // tableRecord.c:659) gets the LOG bit stripped, honoring the
             // same value-only contract as the change-detection path.
+            //
+            // C's `monitor()` runs `recGblResetAlarms(prec)` BEFORE those
+            // `db_post_events`, and OR-adds the alarm bit it returns into the
+            // value posts (compressRecord.c:103-110). The port mirrors that
+            // order: commit the alarm here (posting any STAT/SEVR/AMSG/ACKS
+            // transition through the one owner, `alarm_field_posts`) and carry
+            // the resulting DBE_ALARM into the side-effect posts below. Records
+            // whose `special()` does not run `monitor()` return false and skip
+            // this entirely (no spurious alarm commit on an unrelated put).
+            let side_effect_alarm_mask = if instance.record.special_commits_alarms(&field) {
+                commit_special_reset_alarm(&mut instance)
+            } else {
+                crate::server::recgbl::EventMask::NONE
+            };
+
             let side_effect_value_only = instance.record.value_only_change_fields();
             for sf in instance.record.monitor_side_effect_fields(&field) {
                 use crate::server::recgbl::EventMask;
@@ -1617,7 +1695,7 @@ impl PvDatabase {
                 } else {
                     EventMask::VALUE | EventMask::LOG
                 };
-                instance.notify_field(sf, mask);
+                instance.notify_field(sf, mask | side_effect_alarm_mask);
             }
 
             // The same `special()` posts, but named by the WRITER instead of
@@ -1650,6 +1728,42 @@ impl PvDatabase {
                 cr
             }
             Err(e) => {
+                // C `dbPut:83-88` runs `dbPutSpecial(paddr, 1)` UNCONDITIONALLY
+                // ("Always do special processing if needed") — even when the
+                // conversion above failed — before the `goto done` that skips
+                // the udf clear and the field's monitor post. For a compress
+                // SPC_RESET field that means `special()` still runs `monitor()`
+                // → `recGblResetAlarms`, committing the born-UDF alarm to
+                // NO_ALARM though the RES/N put is rejected (a caget then sees
+                // stat/sevr=NO_ALARM with udf still 1, matching C softIoc).
+                // Run the after-put `special()` and its alarm commit here, then
+                // hand back the ORIGINAL Err so the client still sees PUTFAIL.
+                // Gated on `special_commits_alarms` (compress only) so no other
+                // special record runs its after-put hook on a failed conversion.
+                if instance.record.special_commits_alarms(&field) {
+                    let _ = instance.record.special(&field, true);
+                    let alarm_mask = commit_special_reset_alarm(&mut instance);
+                    let value_only = instance.record.value_only_change_fields();
+                    for sf in instance.record.monitor_side_effect_fields(&field) {
+                        use crate::server::recgbl::EventMask;
+                        let mask = if value_only.iter().any(|f| f.eq_ignore_ascii_case(sf)) {
+                            EventMask::VALUE
+                        } else {
+                            EventMask::VALUE | EventMask::LOG
+                        };
+                        instance.notify_field(sf, mask | alarm_mask);
+                    }
+                }
+                // The same `dbPutSpecial(paddr, 1)`-on-reject rule for a field
+                // whose special() writes stat/sevr DIRECTLY (histogram SGNL →
+                // add_count): C still runs add_count when the SGNL conversion
+                // fails, so its stuck STAT=SOFT on inverted limits appears even
+                // for a rejected `caput .SGNL notanumber`. `check_alarms` makes
+                // that direct write; no process follows, so it persists.
+                if instance.record.special_checks_alarms(&field) {
+                    let inst = &mut *instance;
+                    inst.record.check_alarms(&mut inst.common);
+                }
                 if want_notify && put_drives_processing_of(&instance, &field) {
                     drop(instance);
                     let _ = self.put_driven_process_already_locked(record_name).await;

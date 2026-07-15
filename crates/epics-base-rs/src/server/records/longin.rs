@@ -28,11 +28,18 @@ pub struct LonginRecord {
     // `self.record.get_field("LALM")` — so it stays.
     #[field(type = "Double")]
     pub lalm: f64,
-    // Deadband
-    #[field(type = "Double")]
-    pub adel: f64,
-    #[field(type = "Double")]
-    pub mdel: f64,
+    // Deadband. ADEL/MDEL are `DBF_LONG` (longinRecord.dbd.pod) — the archive
+    // and monitor deadbands are integer counts, not doubles. Stored as `i32`
+    // (not `f64`) so the client-put target resolves to `DBF_LONG` and a string
+    // put parses through the single `c_parse::put_string` owner's `Long` row,
+    // which REFUSES an over-i32/under-i32 value exactly as C's `epicsParseInt32`
+    // does — instead of the `DBF_DOUBLE` row accepting it and the read-path
+    // projection saturating it to `i32::MAX`/`MIN`. Mirrors Cause A/B of the
+    // put-conversion family (int64in/int64out DBF_INT64, commit 224d5ad5).
+    #[field(type = "Long")]
+    pub adel: i32,
+    #[field(type = "Long")]
+    pub mdel: i32,
     // Alarm-range time-constant filter (longinRecord.c::checkAlarms:310-356).
     // AFTC > 0 low-pass-filters the integer alarmRange so transient
     // excursions don't immediately alarm; AFVL is the accumulator.
@@ -78,8 +85,8 @@ impl Default for LonginRecord {
             hopr: 0,
             lopr: 0,
             lalm: 0.0,
-            adel: 0.0,
-            mdel: 0.0,
+            adel: 0,
+            mdel: 0,
             aftc: 0.0,
             afvl: 0.0,
             alst: 0.0,

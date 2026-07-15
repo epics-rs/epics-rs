@@ -1328,7 +1328,7 @@ decisive code path is quoted.
 | CBUG-F9 | pvxs | process-only blocking PUT selects a `requestType` dbNotify never matches — silent no-op success | Medium | NOT-REPRODUCED |
 | CBUG-F10 | pvxs | UnionArray encode omits the selector its own decoder requires — a decoded UnionA cannot be re-serialized | Medium | NOT-REPRODUCED |
 | CBUG-F11 | asyn | `caput REC.TSIZ -1` suspends the put thread forever inside `callocMustSucceed`, holding the global trace mutex | High | NOT-REPRODUCED |
-| CBUG-F12 | base histogram | the `LLIM >= ULIM` alarm writes `stat`/`sevr` directly and `recGblResetAlarms` erases it — dead code | Low | REPRODUCED |
+| CBUG-F12 | base histogram | the `LLIM >= ULIM` alarm writes `stat`/`sevr` directly — erased on the process path (NO_ALARM) but STICKS on the `.SGNL` special path (SOFT); port reproduces both (`932291d9`) | Low | REPRODUCED |
 
 ### CBUG-F1: aCalc's `INC` bounds check admits writes two elements past the runtime stack — SIGSEGV at legal compile depth
 Bucket: NOT-REPRODUCED · Severity: High
@@ -1609,20 +1609,30 @@ if (prec->llim >= prec->ulim) {
         return -1;
 ```
 It writes `stat`/`sevr` directly rather than `nsta`/`nsev` via
-`recGblSetSevr`. `process()` later calls `monitor()`, which runs
-`recGblResetAlarms()` in the same cycle; that copies `nsta/nsev → stat/sevr`,
-overwriting the direct write before any client can observe it.
-Defect: the alarm the author intended is unconditionally erased in the
-same process cycle — dead code. C's *intent* is to alarm; C's *behavior* is
-NO_ALARM.
-Port: `crates/epics-base-rs/src/server/records/histogram.rs` — never sets
-the `LLIM>=ULIM` alarm, so it coincidentally matches C's *behavior*
-(NO_ALARM). **REPRODUCE by matching behavior, not intent**: no port change
-is warranted; if upstream ever fixes this, the port will need the alarm
-added. Flagged so a future auditor reading `histogramRecord.c` does not
-re-derive it as a parity gap.
-Impact: a histogram with inverted limits (`LLIM=10, ULIM=5`) reports
-NO_ALARM on both the C IOC and the port; the "invalid limits" alarm the
-source appears to raise is never observable on either.
-Proof (compiled softIoc, this host): `LLIM=10 ULIM=5`, process → C reports
-`STAT=NO_ALARM SEVR=NO_ALARM`; port reports the same.
+`recGblSetSevr`. Its observability then depends on **which trigger ran
+`add_count`**, and the two triggers disagree — the reason the original
+"dead code" reading was only half right:
+- **Process path** (`process()` → `add_count` → `monitor()`): `monitor()`
+  runs `recGblResetAlarms()` in the same cycle, copying `nsta/nsev →
+  stat/sevr` and overwriting the direct write before any client observes
+  it. Here the alarm IS dead code — C's *intent* is to alarm, C's
+  *behavior* is NO_ALARM.
+- **SGNL special path** (`caput .SGNL` → SPC_MOD `special()` → `add_count`,
+  no full process cycle): nothing runs `recGblResetAlarms` afterward, so
+  the direct `stat=SOFT_ALARM/sevr=INVALID` write **STICKS** and a later
+  `caget` observes `STAT=SOFT`. Observable, not dead.
+Port (as of `932291d9`): reproduces C on **both** paths. `check_alarms`
+writes `stat`/`sevr` directly (not `nsta`/`nsev`); the record declares
+`special_checks_alarms` for `SGNL`, so the put owner runs `check_alarms`
+after the store on the SGNL special path (success + rejected-conversion),
+where it persists → SOFT; on the process path `recGblResetAlarms` erases it
+→ NO_ALARM. The earlier "no port change warranted" note was a
+**process-path-only** view — correct for that path, but it missed the SGNL
+special-path observability that the differential oracle (`caput .SGNL`)
+exercises.
+Impact: a histogram with inverted limits reports NO_ALARM when reached by a
+process cycle, but SOFT/INVALID when reached by a `.SGNL` special-path put —
+on both the C IOC and the port.
+Proof (compiled softIoc, this host, and differential oracle):
+`LLIM=10 ULIM=5`, process → C and port both `STAT=NO_ALARM`; `caput .SGNL`
+with inverted limits → C and port both `STAT=SOFT SEVR=INVALID`.

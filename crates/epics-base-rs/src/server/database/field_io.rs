@@ -297,9 +297,16 @@ fn dbput_request(
     };
 
     match target {
-        Some(target) if value.db_field_type() != target => Ok(PutRequest::Write(
-            coerce_write_value(record, field, target, value)?,
-        )),
+        // A String target always runs the converter even on a type match: C's
+        // `putStringString` is not a no-op, it truncates to `field_size - 1`
+        // (see `coerce_put_value`).
+        Some(target)
+            if value.db_field_type() != target || target == crate::types::DbFieldType::String =>
+        {
+            Ok(PutRequest::Write(coerce_write_value(
+                record, field, target, value,
+            )?))
+        }
         _ => Ok(PutRequest::Write(value)),
     }
 }

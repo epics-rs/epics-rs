@@ -2940,8 +2940,12 @@ pub fn put_field_internal_default<R: Record + ?Sized>(
     };
     let is_enum_carrier = matches!(value, EpicsValue::EnumWithChoices { .. });
     let value = match target_type {
+        // A String target routes through the converter even on a type match: C's
+        // `putStringString` truncates to `field_size - 1` (see `coerce_put_value`).
         Some(target)
-            if is_enum_carrier || (value.db_field_type() != target && !value.is_empty_array()) =>
+            if is_enum_carrier
+                || ((value.db_field_type() != target || target == DbFieldType::String)
+                    && !value.is_empty_array()) =>
         {
             coerce_put_value(record, name, target, value)?
         }
@@ -3005,9 +3009,42 @@ pub fn coerce_put_value<R: Record + ?Sized>(
             if let Some(numeric) = c_parse::NumericField::of(target) {
                 return c_parse::put_string(field, numeric, &s.as_str_lossy());
             }
+            if target == DbFieldType::String {
+                // C `putStringString` (dbConvert.c:916-925): `strncpy(pdst, psrc,
+                // field_size); pdst[field_size-1] = 0` — the DBF_STRING put
+                // truncates to `field_size - 1` bytes. The row is NOT a no-op even
+                // for a String source, so it must run even when source and stored
+                // type match (the two gates that call this converter skip it on a
+                // type match; both route a String target here regardless). The CA
+                // wire already caps a DBR_STRING at `MAX_STRING_SIZE - 1` (39), so
+                // this only bites a field whose `.dbd` `size(N)` is under 40 —
+                // dbCommon `ASG` `size(29)` → 28, and the like.
+                return Ok(EpicsValue::String(cap_string_to_field_size(
+                    record, field, s,
+                )));
+            }
         }
     }
     Ok(value.convert_to(target))
+}
+
+/// C `putStringString`'s truncation: a `DBF_STRING` field stores at most
+/// `field_size - 1` bytes (its `.dbd` `size(N)` less the forced NUL). A field
+/// with no declared size (`0` — a Tier 3 hand table, or a field with no
+/// declaration) is left uncapped beyond the wire's own `MAX_STRING_SIZE - 1`.
+fn cap_string_to_field_size<R: Record + ?Sized>(record: &R, field: &str, s: &PvString) -> PvString {
+    match super::record_instance::field_desc_of(record, field) {
+        Some(desc) if desc.size > 0 => {
+            let cap = (desc.size as usize).saturating_sub(1);
+            let bytes = s.as_bytes();
+            if bytes.len() > cap {
+                PvString::from_bytes(bytes[..cap].to_vec())
+            } else {
+                s.clone()
+            }
+        }
+        _ => s.clone(),
+    }
 }
 
 /// Subroutine function type for `sub`/`aSub` records.

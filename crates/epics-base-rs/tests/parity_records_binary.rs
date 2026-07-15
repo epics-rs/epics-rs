@@ -126,7 +126,14 @@ fn mbbo_direct_process_keeps_device_rbv() {
 fn bo_state_alarm_osv() {
     let mut rec = BoRecord::new(1);
     rec.osv = AlarmSeverity::Major as i16;
-    let mut common = CommonFields::default();
+    // C `boRecord.c::checkAlarms:371-380` raises UDF_ALARM (at UDFS=INVALID)
+    // BEFORE the STATE alarm, and `recGblSetSevr` overrides only on strictly
+    // greater severity — so on a `udf=1` record STATE never shows. Clear the
+    // default UDF to exercise the STATE path (as `bi_state_alarm_zsv` does).
+    let mut common = CommonFields {
+        udf: 0,
+        ..Default::default()
+    };
     rec.check_alarms(&mut common);
     assert_eq!(common.nsev, AlarmSeverity::Major);
     assert_eq!(common.nsta, alarm_status::STATE_ALARM);
@@ -216,7 +223,14 @@ fn mbbo_soft_alarm_on_illegal_val() {
     rec.zrvl = 1; // define a state table → sdef=true
     rec.init_record(0).unwrap();
     rec.process().unwrap();
-    let mut common = CommonFields::default();
+    // C mbbo raises UDF in `process()` before `checkAlarms`, and its SOFT alarm
+    // is raised by `convert()` — which the `udf` early-exit (`goto CONTINUE`)
+    // SKIPS. So SOFT is a defined-record alarm; clear the default UDF to isolate
+    // it (as `bo_state_alarm_osv`/`bi_state_alarm_zsv` do).
+    let mut common = CommonFields {
+        udf: 0,
+        ..Default::default()
+    };
     rec.check_alarms(&mut common);
     assert_eq!(common.nsev, AlarmSeverity::Invalid);
     assert_eq!(common.nsta, alarm_status::SOFT_ALARM);
@@ -226,7 +240,13 @@ fn mbbo_soft_alarm_on_illegal_val() {
 fn mbbo_state_alarm_per_state() {
     let mut rec = MbboRecord::new(3);
     rec.thsv = AlarmSeverity::Minor as i16;
-    let mut common = CommonFields::default();
+    // mbbo raises UDF (at UDFS=INVALID) before the STATE alarm; a `udf=1`
+    // record would show UDF, not the Minor STATE. Clear the default UDF to
+    // isolate the per-state severity (as `bo_state_alarm_osv` does).
+    let mut common = CommonFields {
+        udf: 0,
+        ..Default::default()
+    };
     rec.check_alarms(&mut common);
     assert_eq!(common.nsev, AlarmSeverity::Minor);
     assert_eq!(common.nsta, alarm_status::STATE_ALARM);

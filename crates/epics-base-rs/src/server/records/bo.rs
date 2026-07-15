@@ -261,14 +261,28 @@ impl Record for BoRecord {
         true
     }
 
-    /// C `boRecord.c::checkAlarms` — STATE alarm (ZSV for VAL=0,
-    /// OSV for VAL=1) and COS alarm (COSV). The framework's
-    /// `rec_gbl_check_udf` raises the UDF alarm separately; unlike
-    /// `bi`, C `boRecord.c::checkAlarms` evaluates STATE/COS even
-    /// when UDF is set, so this method does not early-return on UDF.
+    /// C `boRecord.c::checkAlarms` (`:366-387`) — the UDF alarm FIRST, then the
+    /// STATE alarm (ZSV for VAL=0, OSV for VAL=1), then COS (COSV). The udf
+    /// raise must lead: C `recGblSetSevr` overrides STAT/SEVR only when the new
+    /// severity is strictly greater (recGbl.c:242 `if (nsev < new_sevr)`), so on
+    /// a fresh record with `UDFS == ZSV == INVALID` the equal-severity STATE
+    /// alarm cannot displace the UDF that was set first — STAT stays UDF. Unlike
+    /// `bi`, C bo does NOT early-return on UDF, so STATE/COS still evaluate.
+    /// Raising it here (idempotent with the framework's `rec_gbl_check_udf`,
+    /// which runs after this hook) is what puts UDF ahead of STATE.
     fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
         use crate::server::recgbl::{self, alarm_status};
         use crate::server::record::AlarmSeverity;
+
+        // C `boRecord.c:371` — `if (prec->udf == TRUE)` (exact-one, see
+        // `udf_alarm_on_exact_one`), raised before STATE, with no early return.
+        if recgbl::udf_alarm_active(common.udf, true) {
+            recgbl::rec_gbl_set_sevr(
+                common,
+                alarm_status::UDF_ALARM,
+                AlarmSeverity::from_u16(common.udfs as u16),
+            );
+        }
 
         let val = self.val;
         let state_sev = if val == 0 { self.zsv } else { self.osv };

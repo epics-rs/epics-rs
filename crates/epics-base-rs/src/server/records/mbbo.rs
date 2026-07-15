@@ -401,6 +401,21 @@ impl Record for MbboRecord {
         "mbbo"
     }
 
+    /// C `mbboRecord.c:199-215`: `process()` clears `udf` to FALSE only when a
+    /// value SOURCE ran this cycle — a successful closed-loop DOL fetch. With no
+    /// DOL (or a constant one), the `else if (prec->udf)` arm raises UDF_ALARM at
+    /// UDFS and `goto CONTINUE`s, leaving `udf` untouched. `udf` is NEVER
+    /// re-derived from the stored VAL every cycle, so the framework's blanket
+    /// per-cycle clear (`processing.rs`) is wrong for mbbo: a bare
+    /// `record(mbbo,"M"){}` with a client put to any PP field (e.g. COSV) must
+    /// stay UDF=1/INVALID, not silently clear to NO_ALARM. The two real definers
+    /// are covered elsewhere — a direct VAL put clears `udf` in `dbPut`
+    /// (`field_io.rs`), and a closed-loop DOL fetch clears it at the DOL-apply
+    /// site (`processing.rs`, C `:213`). So mbbo opts out of the per-cycle clear.
+    fn clears_udf(&self) -> bool {
+        false
+    }
+
     /// C `devMbboSoftRaw::write_mbbo` (`devMbboSoftRaw.c:40-46`):
     /// `data = prec->rval & prec->mask; dbPutLink(&prec->out, DBR_ULONG, &data,
     /// 1)` — the RAW word, not the state index `devMbboSoft` writes. The dset's

@@ -79,6 +79,18 @@ impl Record for Int64outRecord {
         "int64out"
     }
 
+    /// C `int64outRecord.c:135-143`: `process()` clears `udf` to FALSE only on a
+    /// successful closed-loop DOL fetch (`if (prec->dol.type!=CONSTANT &&
+    /// RTN_SUCCESS(status)) prec->udf=FALSE;`); the no-DOL arm reads the current
+    /// VAL and leaves `udf` alone, so `checkAlarms` (`:298-299`) raises UDF_ALARM
+    /// every cycle for a bare record. `udf` is never re-derived from the stored
+    /// VAL, so int64out opts out of the framework's blanket per-cycle clear. The
+    /// definers are a direct VAL put (`dbPut`, `field_io.rs`) and the DOL-apply
+    /// site (`processing.rs`).
+    fn clears_udf(&self) -> bool {
+        false
+    }
+
     /// C `int64outRecord.c:109-111`:
     /// `if (prec->dol.type == CONSTANT) {
     ///      if (recGblInitConstantLink(&prec->dol, DBF_INT64, &prec->val))

@@ -255,6 +255,18 @@ async fn sim_output_simm_alarm_loses_stat_on_severity_tie() {
     bo.sims = 1; // SIMM severity = MINOR -> ties; must NOT override STAT
     db.add_record("BOTIE", Box::new(bo)).await.unwrap();
 
+    // A bare bo stays UDF=1 until a value SOURCE defines it — `boRecord.c:371`
+    // raises UDF_ALARM/INVALID on every process otherwise, which (severity
+    // INVALID) would dominate the MINOR state/SIMM tie this test is about. Model
+    // the client setpoint that defines VAL: a full CA put clears UDF in `dbPut`
+    // (isValueField), exactly as `caput BOTIE 1` would. `bo` no longer re-derives
+    // UDF from the stored VAL every cycle (it clears only on a source), matching
+    // C, so the definition must be explicit rather than implied by `new(1)`.
+    // (`put_pv` alone does not clear UDF — only the post-driving CA-put path does.)
+    db.put_pv_and_post("BOTIE.VAL", EpicsValue::Enum(1))
+        .await
+        .unwrap();
+
     let mut v1 = HashSet::new();
     db.process_record_with_links("BOTIE", &mut v1, 0)
         .await

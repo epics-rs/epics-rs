@@ -177,6 +177,18 @@ impl Record for LongoutRecord {
         "longout"
     }
 
+    /// C `longoutRecord.c:145-153`: `process()` clears `udf` to FALSE only on a
+    /// successful closed-loop DOL fetch (`if (!dbLinkIsConstant(&prec->dol) &&
+    /// !status) prec->udf=FALSE;`); the no-DOL arm reads the current VAL and
+    /// leaves `udf` alone, so `checkAlarms` (`:317-318`) raises UDF_ALARM every
+    /// cycle for a bare record. `udf` is never re-derived from the stored VAL, so
+    /// longout opts out of the framework's blanket per-cycle clear. The definers
+    /// are a direct VAL put (`dbPut`, `field_io.rs`) and the DOL-apply site
+    /// (`processing.rs`).
+    fn clears_udf(&self) -> bool {
+        false
+    }
+
     /// C `longoutRecord.c:113-114`:
     /// `if (recGblInitConstantLink(&prec->dol, DBF_LONG, &prec->val))
     ///      prec->udf = FALSE;`

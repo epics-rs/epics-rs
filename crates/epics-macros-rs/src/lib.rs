@@ -186,6 +186,10 @@ pub fn epics_test(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///   `Record::init_record` delegating to the named free function
 ///   (`fn(&mut Self, u8) -> CaResult<()>`), for a record type whose C
 ///   `init_record` does real work; omitted, the trait's no-op applies
+/// - `#[record(type = "fanout", no_value_monitor)]` — emit
+///   `Record::process_posts_value_monitor` returning `false`, for a "trigger"
+///   record (fanout/seq) whose C `process()` posts VAL only with alarm events;
+///   omitted, the trait default `true` applies
 /// - `#[field(type = "Double")]` — sets the DBR type for a field
 /// - `#[field(type = "Double", read_only)]` — marks a field as read-only
 /// - `#[field(type = "Short", menu_choices = SELM_CHOICES)]` — a
@@ -222,6 +226,12 @@ struct RecordAttrs {
     /// delegating to it. Kept a free function, not an inherent method, so the
     /// derive need not assume a method exists.
     init: Option<syn::Path>,
+    /// `#[record(no_value_monitor)]` — the record's process cycle posts no VAL
+    /// value monitor (`Record::process_posts_value_monitor` → `false`). Set for
+    /// the "trigger" records `fanout`/`seq`, whose C `process()` posts VAL only
+    /// with alarm events, never `DBE_VALUE`/`DBE_LOG`. Default `false` (the
+    /// trait default `true` applies), so ordinary value records are unaffected.
+    no_value_monitor: bool,
 }
 
 struct FieldInfo {
@@ -385,10 +395,24 @@ fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
         None => quote! {},
     };
 
+    // `#[record(no_value_monitor)]` — emit `Record::process_posts_value_monitor`
+    // returning `false` (fanout/seq trigger-VAL). Omitted when the flag is
+    // absent, so the trait default (`true`) applies to every value record.
+    let value_monitor_method = if attrs.no_value_monitor {
+        quote! {
+            fn process_posts_value_monitor(&self) -> bool {
+                false
+            }
+        }
+    } else {
+        quote! {}
+    };
+
     let expanded = quote! {
         impl #krate::server::record::Record for #name {
             #constant_init_method
             #init_method
+            #value_monitor_method
 
             fn record_type(&self) -> &'static str {
                 #record_type_str
@@ -425,6 +449,7 @@ fn parse_record_attrs(input: &DeriveInput) -> syn::Result<RecordAttrs> {
     let mut crate_path = None;
     let mut constant_init: Vec<(String, String)> = Vec::new();
     let mut init: Option<syn::Path> = None;
+    let mut no_value_monitor = false;
 
     for attr in &input.attrs {
         if attr.path().is_ident("record") {
@@ -459,8 +484,14 @@ fn parse_record_attrs(input: &DeriveInput) -> syn::Result<RecordAttrs> {
                 } else if meta.path.is_ident("init") {
                     init = Some(meta.value()?.parse()?);
                     Ok(())
+                } else if meta.path.is_ident("no_value_monitor") {
+                    // Bare flag, like a field's `read_only`: no `= value`.
+                    no_value_monitor = true;
+                    Ok(())
                 } else {
-                    Err(meta.error("expected `type`, `crate_path`, `constant_init` or `init`"))
+                    Err(meta.error(
+                        "expected `type`, `crate_path`, `constant_init`, `init` or `no_value_monitor`",
+                    ))
                 }
             })?;
         }
@@ -474,6 +505,7 @@ fn parse_record_attrs(input: &DeriveInput) -> syn::Result<RecordAttrs> {
         crate_path,
         constant_init,
         init,
+        no_value_monitor,
     })
 }
 

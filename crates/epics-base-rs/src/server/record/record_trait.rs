@@ -1495,6 +1495,27 @@ pub trait Record: Send + Sync + 'static {
         true
     }
 
+    /// Whether this record's process cycle posts its primary value (`VAL`)
+    /// as a value monitor (`DBE_VALUE` / `DBE_LOG`).
+    ///
+    /// Default `true`: for most records C `monitor()` posts `VAL` whenever the
+    /// value moved (deadband, change-gate, or always).
+    ///
+    /// `false` for the "trigger" records `fanout` and `seq`. Their `VAL` is
+    /// `field(VAL,DBF_LONG){ pp(TRUE) }` — "Used to trigger" — and their C
+    /// `process()` posts `VAL` ONLY with the alarm events `recGblResetAlarms`
+    /// returns: `if (events) db_post_events(prec, &prec->val, events)`
+    /// (fanoutRecord.c:148-150, seqRecord.c:227-229), never `DBE_VALUE` /
+    /// `DBE_LOG`. Writing `VAL` fans out the forward links / sequences the
+    /// `DOn`→`LNKn` writes; the value itself is not a monitored quantity, so a
+    /// run of `caput VAL` posts no per-put value event (only the initial
+    /// subscription snapshot fires). The alarm bits still reach `VAL` through
+    /// the deadband post's `alarm_bits`, so an alarm transition posts `VAL`
+    /// with `DBE_ALARM` exactly as C's `if (events)` does.
+    fn process_posts_value_monitor(&self) -> bool {
+        true
+    }
+
     /// Per-record VALUE/LOG monitor gate for record types that post a
     /// monitor *only when the value actually changed* — and have no
     /// MDEL/ADEL deadband to express that.

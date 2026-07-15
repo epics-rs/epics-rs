@@ -4133,6 +4133,43 @@ impl RecordInstance {
     ///
     /// [`DeadbandPost::field`] is `None` when no class fired, i.e. when C's
     /// `if (monitor_mask)` guard would skip the post.
+    /// C `monitor()`'s VALUE / LOG gate for the primary-value post —
+    /// `(include_val, include_archive)`, the single owner every processing path
+    /// feeds into [`Self::deadband_post`] and [`Self::collect_subscriber_posts`].
+    /// Keeping it in one place is what stops the rule from holding on the
+    /// synchronous path but not the async-continuation / put-notify paths.
+    pub(crate) fn value_include_classes(&mut self) -> (bool, bool) {
+        // fanout/seq "trigger" records post VAL only with the alarm events
+        // `recGblResetAlarms` returns, never DBE_VALUE/DBE_LOG — see
+        // `Record::process_posts_value_monitor`. The alarm bits still reach VAL
+        // via `deadband_post`'s `alarm_bits`, so an alarm transition still posts
+        // it; only the value/archive classes are suppressed.
+        if !self.record.process_posts_value_monitor() {
+            return (false, false);
+        }
+        match self.record.monitor_value_changed() {
+            // lsi/lso post VALUE|LOG only when the string actually changed (C
+            // `lsiRecord.c`/`lsoRecord.c` monitor: `len != olen || memcmp(oval,
+            // val, len)`); they have no MDEL/ADEL deadband to express that, so
+            // the gate is explicit. The MPST/APST `menuPost` "Always" override
+            // OR-adds DBE_VALUE / DBE_LOG even on an unchanged cycle (C monitor:
+            // `if (mpst == menuPost_Always) events |= DBE_VALUE; if (apst ==
+            // menuPost_Always) events |= DBE_LOG;`).
+            Some(changed) => {
+                let (val_always, archive_always) = self.record.monitor_always_post();
+                (changed || val_always, changed || archive_always)
+            }
+            None => {
+                if self.record.uses_monitor_deadband() {
+                    self.check_deadband_ext()
+                } else {
+                    // Binary records (bi/bo/busy/mbbi/mbbo): always post monitors
+                    (true, true)
+                }
+            }
+        }
+    }
+
     pub(crate) fn deadband_post(
         &self,
         alarm_bits: EventMask,

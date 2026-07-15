@@ -17,7 +17,11 @@ const FANOUT_SELM_CHOICES: &[&str] = &["All", "Specified", "Mask"];
 // C `fanoutRecord.c:88`: `recGblInitConstantLink(&prec->sell, DBF_USHORT,
 // &prec->seln)` — a constant SELL loads SELN ONCE, at init. `dbGetLink` on it
 // at process delivers nothing, so a later `caput REC.SELN` is not stomped.
-#[record(type = "fanout", constant_init = "SELL:SELN")]
+// `no_value_monitor`: fanout's VAL is a `pp(TRUE)` "trigger" — C `process()`
+// posts VAL only with alarm events (`if (events) db_post_events(&prec->val,
+// events)`, fanoutRecord.c:148-150), never DBE_VALUE/DBE_LOG. So a run of
+// `caput VAL` posts no per-put value monitor (only the connect-time snapshot).
+#[record(type = "fanout", constant_init = "SELL:SELN", no_value_monitor)]
 pub struct FanoutRecord {
     // VAL is `field(VAL,DBF_LONG){ pp(TRUE) }` (fanoutRecord.dbd:21-25) — the
     // "Used to trigger" field. It carries no output value: C `process`

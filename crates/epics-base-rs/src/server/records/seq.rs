@@ -25,7 +25,12 @@ const SEQ_SELM_CHOICES: &[&str] = &["All", "Specified", "Mask"];
     constant_init = "SELL:SELN,DOL0:DO0,DOL1:DO1,DOL2:DO2,DOL3:DO3,DOL4:DO4,\
                      DOL5:DO5,DOL6:DO6,DOL7:DO7,DOL8:DO8,DOL9:DO9,DOLA:DOA,\
                      DOLB:DOB,DOLC:DOC,DOLD:DOD,DOLE:DOE,DOLF:DOF",
-    init = seq_init_record
+    init = seq_init_record,
+    // seq's VAL is a `pp(TRUE)` "trigger" — C `process()` posts VAL only with
+    // alarm events (`if (events) db_post_events(&prec->val, events)`,
+    // seqRecord.c:227-229), never DBE_VALUE/DBE_LOG. So a run of `caput VAL`
+    // posts no per-put value monitor (only the connect-time snapshot).
+    no_value_monitor
 )]
 pub struct SeqRecord {
     // VAL is `field(VAL,DBF_LONG){ pp(TRUE) }` (seqRecord.dbd:21-25) — the "Used

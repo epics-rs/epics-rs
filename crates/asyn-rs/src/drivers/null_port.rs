@@ -74,15 +74,18 @@ impl PortDriver for NullOctetPort {
         &mut self.base
     }
 
-    // CAPS PINNED BY MAIN AFTER C OBSERVATION — provisional
+    // CAPS CONFIRMED against C, field-by-field.
     //
-    // The interface set a port advertises decides asyn record readback fields
-    // (OCTETIV/OPTIONIV/GPIBIV/I32IV/UI32IV/F64IV from `findInterface`, and the
-    // "No asyn<X> interface" diagnostics). It MUST mirror exactly what the C
-    // `ORACLEASYN` port serves. Main has not yet booted the C side to observe
-    // that set, so this is a placeholder octet-transport guess (the same set
-    // drvAsynIPPort registers — asynCommon + asynOption + asynOctet), NOT a
-    // confirmed value. Main replaces this after cageting the C readbacks.
+    // The interface set a port advertises decides the asyn record readback
+    // fields (OCTETIV/OPTIONIV/GPIBIV/I32IV/UI32IV/F64IV from `findInterface`).
+    // Observed on the C fat softIoc with a registered-disconnected octet port
+    // (`drvAsynIPPortConfigure("ORACLEASYN","localhost:1",0,1,0)`, noAutoConnect):
+    // drvAsynIPPort advertises exactly asynCommon + asynOption + asynOctet
+    // (drvAsynIPPort.c:1037-1053), so C reads OCTETIV=1, OPTIONIV=1, and
+    // GPIBIV=I32IV=UI32IV=F64IV=0. `octet_transport_capabilities()`
+    // ({OctetRead, OctetWrite, Option, Flush, Connect}) yields byte-exact those
+    // readbacks — CNCT/AUCT/ENBL/PCNCT/REASON also matched. This is the pinned,
+    // confirmed set, not a guess.
     fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
         crate::interfaces::octet_transport_capabilities()
     }
@@ -143,17 +146,22 @@ mod tests {
         );
     }
 
-    /// Provisional (main pins after C observation): the octet-transport set —
-    /// asynCommon + asynOption + asynOctet, the drvAsynIPPort mirror.
+    /// Confirmed against C (drvAsynIPPort registered-disconnected): the
+    /// octet-transport set — asynCommon + asynOption + asynOctet — which is what
+    /// makes the asyn record read OCTETIV=1, OPTIONIV=1, and every other *IV=0.
     #[test]
-    fn capabilities_are_provisional_octet_transport() {
+    fn capabilities_are_confirmed_octet_transport() {
         let drv = NullOctetPort::new("ORACLEASYN");
         let caps = drv.capabilities();
+        // asynOctet -> OCTETIV=1.
         assert!(caps.contains(&Capability::OctetRead));
         assert!(caps.contains(&Capability::OctetWrite));
+        // asynOption -> OPTIONIV=1.
         assert!(caps.contains(&Capability::Option));
-        // Not a kitchen-sink port: no scalar-numeric interfaces.
+        // No asynGpib/Int32/UInt32/Float64 -> GPIBIV=I32IV=UI32IV=F64IV=0.
+        assert!(!caps.contains(&Capability::Gpib));
         assert!(!caps.contains(&Capability::Int32Read));
+        assert!(!caps.contains(&Capability::UInt32DigitalRead));
         assert!(!caps.contains(&Capability::Float64Read));
     }
 }

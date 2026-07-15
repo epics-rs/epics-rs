@@ -20,7 +20,12 @@ pub struct AiRecord {
     pub egul: f64,
     pub eslo: f64, // default 1.0
     pub eoff: f64, // engineering offset (defaults to egul for LINEAR)
-    pub roff: i32,
+    // ROFF is DBF_ULONG (aiRecord.dbd.pod:442) — stored unsigned so the full
+    // 0..=2^32-1 range round-trips: a client caput 4294967295 reads back as
+    // that value (promoted to DBR_DOUBLE over CA), and the RVAL+ROFF convert
+    // uses C's epicsUInt32 addend. Storing it signed made a high-bit put read
+    // back negative and convert with the wrong sign.
+    pub roff: u32,
     pub aslo: f64, // default 1.0
     pub aoff: f64,
     pub smoo: f64, // smoothing 0~1
@@ -248,7 +253,7 @@ impl Record for AiRecord {
             "EGUL" => Some(EpicsValue::Double(self.egul)),
             "ESLO" => Some(EpicsValue::Double(self.eslo)),
             "EOFF" => Some(EpicsValue::Double(self.eoff)),
-            "ROFF" => Some(EpicsValue::Long(self.roff)),
+            "ROFF" => Some(EpicsValue::ULong(self.roff)),
             "ASLO" => Some(EpicsValue::Double(self.aslo)),
             "AOFF" => Some(EpicsValue::Double(self.aoff)),
             "SMOO" => Some(EpicsValue::Double(self.smoo)),
@@ -385,9 +390,16 @@ impl Record for AiRecord {
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
+            // DBF_ULONG: accept the native unsigned carrier and the legacy signed
+            // Long (bit-preserving), so a full-range caput (4294967295) stores
+            // rather than being rejected as a type mismatch.
             "ROFF" => match value {
-                EpicsValue::Long(v) => {
+                EpicsValue::ULong(v) => {
                     self.roff = v;
+                    Ok(())
+                }
+                EpicsValue::Long(v) => {
+                    self.roff = v as u32;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
@@ -591,6 +603,21 @@ impl Record for AiRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ROFF is DBF_ULONG (aiRecord.dbd.pod:442): a client caput of the full
+    /// unsigned range stores and reads back as that value (served ULong,
+    /// promoted to DBR_DOUBLE over CA). The native ULong carrier and the legacy
+    /// signed Long (bit-preserving) are both accepted; storing was previously
+    /// signed and rejected the ULong carrier a full-range caput arrives as.
+    #[test]
+    fn roff_put_accepts_full_ulong_range() {
+        let mut rec = AiRecord::default();
+        rec.put_field("ROFF", EpicsValue::ULong(u32::MAX)).unwrap();
+        assert_eq!(rec.get_field("ROFF"), Some(EpicsValue::ULong(u32::MAX)));
+        // Legacy signed carrier reinterprets bit-for-bit.
+        rec.put_field("ROFF", EpicsValue::Long(-1)).unwrap();
+        assert_eq!(rec.get_field("ROFF"), Some(EpicsValue::ULong(u32::MAX)));
+    }
 
     /// SPC_LINCONV parity (aiRecord.c:187): writing LINR / EGUF / EGUL re-arms
     /// the INIT phase, so the next process takes the retuned conversion as its

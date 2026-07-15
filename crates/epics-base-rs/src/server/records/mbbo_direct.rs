@@ -163,6 +163,23 @@ impl Record for MbboDirectRecord {
         false
     }
 
+    /// C `mbboDirectRecord.c:190-195`: `process()` clears `udf` to FALSE only
+    /// when a value SOURCE ran this cycle — a successful closed-loop DOL
+    /// fetch. With no DOL (or a constant one), the `else if (prec->udf)` arm
+    /// raises UDF_ALARM at UDFS and `goto CONTINUE`s, leaving `udf`
+    /// untouched. `udf` is NEVER re-derived from the stored VAL every cycle,
+    /// so the framework's blanket per-cycle clear (`processing.rs`) is wrong
+    /// for mbboDirect: a bare `record(mbboDirect,"M"){}` with a client put to
+    /// a PP field must stay UDF=1/INVALID, not silently clear to NO_ALARM.
+    /// The real definers are covered elsewhere — a VAL put clears `udf` in
+    /// `dbPut` (`field_io.rs`), a Bn bit-field put clears it via
+    /// [`Self::is_udf_defining_put`] below, and a closed-loop DOL fetch
+    /// clears it at the DOL-apply site (`processing.rs`, C `:188`). So
+    /// mbboDirect opts out of the per-cycle clear.
+    fn clears_udf(&self) -> bool {
+        false
+    }
+
     /// C `mbboDirectRecord.c::special` (`after==1`, B0..B1F, line 290):
     /// `prec->udf = FALSE` — a bit-field put defines the record exactly like
     /// a VAL put, independent of `dbIsValueField` (VAL only, `field_io.rs`'s

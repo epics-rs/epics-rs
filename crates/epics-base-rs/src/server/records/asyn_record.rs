@@ -68,15 +68,44 @@ use epics_macros_rs::EpicsRecord;
 /// modeled as `DBF_LONG`, so they served `DBR_LONG` where C serves `DBR_ENUM`
 /// — a wire-type divergence on top of a faked value. Unmodeled, they now serve
 /// as the correct `DBR_ENUM` from the declaration table.
-#[derive(EpicsRecord, Default)]
+///
+/// # `TFIL` is the one config field the `.dbd` cannot express
+///
+/// `asynRecord.c` `init_record` pass 0 does `strcpy(prec->tfil, "Unknown")`,
+/// but `asynRecord.dbd` gives `TFIL` no `initial(...)`. So the generic
+/// declared-default path serves `""` where C serves `"Unknown"`, and no `.dbd`
+/// edit can fix it (the initial is set in record code, not the declaration).
+/// `init_record` on the record struct runs on `&mut Self`, which cannot reach
+/// the per-instance override store either. The faithful fix is therefore to
+/// model `TFIL` as a struct field whose `Default` is `"Unknown"` — the same
+/// justification as `PORT`, and the only way to serve a runtime constant the
+/// declaration does not carry. (Its `monitorStatus` refresh — reset to
+/// `"Unknown"` when the trace file changes — is port-derived, step 2 in the
+/// asyn module; the base display stub only needs the constant default.)
+#[derive(EpicsRecord)]
 #[record(type = "asyn")]
 pub struct AsynRecord {
     /// `field(PORT,DBF_STRING) size(40)` — the asyn port name this record
-    /// attaches to. The one modeled field: the connect path keys on it, and
-    /// its `DBF_STRING` type matches the declaration. Initial `""` matches
-    /// `asynRecord.dbd`'s `initial("")` and this struct's `Default`.
+    /// attaches to. The connect path keys on it, and its `DBF_STRING` type
+    /// matches the declaration. Initial `""` matches `asynRecord.dbd`'s
+    /// `initial("")` and this struct's `Default`.
     #[field(type = "String")]
     pub port: String,
+    /// `field(TFIL,DBF_STRING) size(40)` — trace I/O file. Modeled solely to
+    /// carry the `"Unknown"` constant `init_record` seeds, which the `.dbd`
+    /// `initial(...)` cannot (see the type-level note).
+    #[field(type = "String")]
+    pub tfil: String,
+}
+
+impl Default for AsynRecord {
+    fn default() -> Self {
+        Self {
+            port: String::new(),
+            // C `init_record` pass 0: `strcpy(prec->tfil, "Unknown")`.
+            tfil: "Unknown".to_string(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -170,6 +199,20 @@ mod tests {
         assert_eq!(
             inst.resolve_field("PORT"),
             Some(EpicsValue::String("L0".into()))
+        );
+    }
+
+    /// `TFIL` serves the `"Unknown"` constant `init_record` seeds, with no port
+    /// — the `.dbd` has no `initial(...)` for it, so the generic path would
+    /// serve `""`. This is the one field modeled purely to carry that default.
+    #[test]
+    fn tfil_serves_unknown_with_no_port() {
+        let inst = instance();
+        assert_eq!(inst.declared_field_type("TFIL"), Some(DbFieldType::String));
+        assert_eq!(
+            inst.resolve_field("TFIL"),
+            Some(EpicsValue::String("Unknown".into())),
+            "C init_record pass 0 sets tfil=\"Unknown\"; the .dbd cannot express it"
         );
     }
 }

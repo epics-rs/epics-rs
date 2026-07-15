@@ -1451,21 +1451,48 @@ impl PvDatabase {
             // fire-and-forget paths take it, then fall through to force-process.
             // C `dbPut:1408` posts DBE_VALUE|DBE_LOG for the put field (PROC is
             // not the record's value field, so the pp-suppression never applies).
-            {
+            // Store the raw PROC byte (C `dbChannelPut`). A bad conversion
+            // (`caput REC.PROC 256` / non-numeric) refuses the store AND the
+            // client's put — but, exactly as C's `putCallback` returns
+            // `didPut = 1` while setting `notifyError` (`dbNotify.c:528-530`),
+            // the PROC `pp(TRUE)`-driven `dbProcess` (`dbNotify.c:243-261`) still
+            // runs on the NOTIFY path. This is the SAME rule the general put path
+            // applies for a rejected pp-field conversion (`field_io.rs:1748-1806`,
+            // "Cause B"); mirror it here so PROC does not diverge from UDF: carry
+            // the refusal, force-process when `want_notify`, then hand the Err
+            // back so the client still sees `ECA_PUTFAIL`.
+            let proc_store: CaResult<()> = {
                 let rec_arc = {
                     let recs = self.inner.records.read().await;
                     recs.get(record_name).cloned()
                 };
                 if let Some(rec_arc) = rec_arc {
                     let mut guard = rec_arc.write().await;
-                    if guard.put_common_field("PROC", value).is_ok() {
-                        guard.notify_field(
-                            "PROC",
-                            crate::server::recgbl::EventMask::VALUE
-                                | crate::server::recgbl::EventMask::LOG,
-                        );
+                    match guard.put_common_field("PROC", value) {
+                        Ok(_) => {
+                            guard.notify_field(
+                                "PROC",
+                                crate::server::recgbl::EventMask::VALUE
+                                    | crate::server::recgbl::EventMask::LOG,
+                            );
+                            Ok(())
+                        }
+                        Err(e) => Err(e),
                     }
+                } else {
+                    Ok(())
                 }
+            };
+            if let Err(e) = proc_store {
+                // `want_notify` ⇒ C `ca_put_callback`: the PROC process runs
+                // despite the rejected conversion (`didPut == 1`). Fire-and-forget
+                // ⇒ C plain `dbPutField`, which returns before `dbProcess` on a
+                // non-zero `dbPut` status (`dbAccess.c:1263-1264`), so it must NOT
+                // process. Either way the client is answered `ECA_PUTFAIL`.
+                if want_notify {
+                    let _ = self.put_driven_process_already_locked(record_name).await;
+                }
+                return Err(e);
             }
             // A fire-and-forget caller parks nothing — C `dbPutField` on PROC
             // processes the record with no putNotify.

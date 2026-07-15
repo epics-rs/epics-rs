@@ -568,7 +568,12 @@ impl Default for AsynRecord {
             tinb2: 0,
             tinb3: 0,
             tsiz: 80,
-            tfil: String::new(),
+            // C `asynRecord.c` init_record pass 0: `strcpy(prec->tfil,
+            // "Unknown")` — set unconditionally, no port needed. The `.dbd`
+            // carries no `initial(...)` for TFIL, so the seed lives in record
+            // code; served before any client read. (Same fix as epics-base-rs's
+            // display stub; this is the record Path 1 actually serves.)
+            tfil: TFIL_UNKNOWN.to_string(),
             auct: 1,
             cnct: 0,
             enbl: 1,
@@ -5521,6 +5526,24 @@ mod tests {
         );
     }
 
+    /// C `asynRecord.c` init_record pass 0 seeds `tfil = "Unknown"`
+    /// unconditionally — no port, no connect. The `.dbd` carries no
+    /// `initial(...)` for TFIL, so a faithful port must serve the constant from
+    /// record code. This is the record Path 1 serves (the oracle's asyn
+    /// reproducer), where the base display stub's seed does not reach.
+    #[test]
+    fn tfil_serves_unknown_with_no_live_port() {
+        let rec = AsynRecord::default();
+        // No port set, no connect_device, no monitor_status — the raw
+        // construction value a client reads.
+        assert_eq!(rec.tfil, "Unknown");
+        assert_eq!(
+            rec.get_field("TFIL"),
+            Some(EpicsValue::String("Unknown".into())),
+            "get(TFIL) must serve C's init_record seed with no live port"
+        );
+    }
+
     /// R9-52: C `monitorStatus` refreshes TSIZ from `getTraceIOTruncateSize`
     /// (asynRecord.c:1100) and writes TFIL = "Unknown" when the port's trace
     /// sink is no longer the one this record installed (:1119-1124). Neither
@@ -5567,16 +5590,17 @@ mod tests {
         rec.port = port_name.to_string();
         let _ = rec.connect_device();
         // The default truncate size lands in TSIZ on connect, and the first
-        // sample seeds the sink identity: no spurious "Unknown".
+        // sample seeds the sink identity: no spurious foreign flip. TFIL holds
+        // its init-record seed ("Unknown") — the trace file has not changed.
         assert_eq!(rec.tsiz, 80);
-        assert_eq!(rec.tfil, "");
+        assert_eq!(rec.tfil, "Unknown");
 
         // A foreign `asynSetTraceIOTruncateSize` — the iocsh path, not this
         // record — must show up in TSIZ on the next monitorStatus.
         trace.set_io_truncate_size(Some(port_name), 17);
         rec.monitor_status();
         assert_eq!(rec.tsiz, 17);
-        assert_eq!(rec.tfil, "", "the trace file did not change");
+        assert_eq!(rec.tfil, "Unknown", "the trace file did not change");
 
         // The record's own TFIL write must NOT read back as foreign.
         rec.tfil = "<stdout>".to_string();

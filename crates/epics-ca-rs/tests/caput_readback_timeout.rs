@@ -162,8 +162,17 @@ async fn caput_readback_timeout_prints_the_new_line_and_exits_zero() {
 
     let proxy_port = read_dropping_proxy(server_udp, server_tcp).await;
 
+    // `-w` is the single pend_io window covering BOTH the connect (search +
+    // data circuit, relayed through this test's UDP+TCP proxy) and the readback
+    // get. Only the readback is under test, and it is DETERMINISTIC: the proxy
+    // swallows every CA_PROTO_READ_NOTIFY, so the get times out no matter how
+    // long the window is. A too-tight window instead makes the load-sensitive
+    // path — the proxy-relayed connect — race the clock, so under load caput
+    // aborts with "Channel connect timed out" and never reaches the readback
+    // this test asserts on. 2 s matches the sibling `caput_old_read_never_aborts`
+    // (same proxy shape, same deterministically-denied read).
     let out = Command::new(env!("CARGO_BIN_EXE_caput-rs"))
-        .args(["-w", "0.5", "R918:PUT", "42"])
+        .args(["-w", "2", "R918:PUT", "42"])
         .env("EPICS_CA_ADDR_LIST", format!("127.0.0.1:{proxy_port}"))
         .env("EPICS_CA_AUTO_ADDR_LIST", "NO")
         .env("EPICS_CA_SERVER_PORT", proxy_port.to_string())

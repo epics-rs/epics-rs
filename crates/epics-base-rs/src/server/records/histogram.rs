@@ -365,8 +365,21 @@ impl Record for HistogramRecord {
 
     /// C `wdogInit` (:126-152): `if (prec->sdel > 0)` arm a delayed callback of
     /// SDEL seconds. A non-positive SDEL means no watchdog at all.
+    ///
+    /// SDEL is `DBF_DOUBLE` (histogramRecord.dbd.pod) and C stores the full
+    /// double range verbatim — `caput REC.SDEL 1e308`/`inf` SUCCEEDS, arming a
+    /// callback so far in the future it never fires. `Duration::from_secs_f64`
+    /// PANICS on a non-finite or Duration-overflowing value, so it cannot be the
+    /// converter here: a store of `1e308`/`1e39`/`inf` would abort the put the
+    /// oracle expects to succeed. `try_from_secs_f64` maps every such value to
+    /// `None` (no watchdog arms — behaviourally identical to C's never-firing
+    /// callback), leaving the store itself accepted for the whole double range.
     fn watchdog_interval(&self) -> Option<std::time::Duration> {
-        (self.sdel > 0.0).then(|| std::time::Duration::from_secs_f64(self.sdel))
+        if self.sdel > 0.0 {
+            std::time::Duration::try_from_secs_f64(self.sdel).ok()
+        } else {
+            None
+        }
     }
 
     /// C `wdogCallback` (:102-124): when counts have accumulated since the last

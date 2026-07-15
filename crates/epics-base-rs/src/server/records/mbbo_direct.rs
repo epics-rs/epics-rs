@@ -163,6 +163,15 @@ impl Record for MbboDirectRecord {
         false
     }
 
+    /// C `mbboDirectRecord.c::special` (`after==1`, B0..B1F, line 290):
+    /// `prec->udf = FALSE` — a bit-field put defines the record exactly like
+    /// a VAL put, independent of `dbIsValueField` (VAL only, `field_io.rs`'s
+    /// generic dbPut UDF clear). A client put to B0..B1F must clear UDF the
+    /// same way a VAL put does.
+    fn is_udf_defining_put(&self, field: &str) -> bool {
+        field == self.primary_field() || BIT_NAMES.contains(&field)
+    }
+
     /// VAL posts DBE_VALUE|DBE_LOG
     /// only when it changed (C mbboDirectRecord.c:311-314 `mlst != val`), not
     /// every process cycle. The comparison is captured in process(); see

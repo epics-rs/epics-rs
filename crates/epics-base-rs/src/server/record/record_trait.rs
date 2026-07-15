@@ -1237,6 +1237,21 @@ pub trait Record: Send + Sync + 'static {
         "VAL"
     }
 
+    /// Whether a put to `field` directly defines the record — clears UDF
+    /// exactly like a primary-value-field put. C `dbAccess.c::dbPut`
+    /// (`:1409-1411`) clears `udf` synchronously only when the put target is
+    /// `dbIsValueField` (i.e. `field == primary_field()`); this hook is where
+    /// a record type says its own `special()` ALSO clears UDF for a
+    /// non-value field, independent of `dbIsValueField`.
+    ///
+    /// `mbboDirect` is the case this exists for: `mbboDirectRecord.c::special`
+    /// (`after==1`, B0..B1F, line 290) sets `prec->udf = FALSE` on a bit-field
+    /// put — the bit write is a second value source alongside a VAL put and
+    /// the closed-loop DOL fetch. Default: only the primary field.
+    fn is_udf_defining_put(&self, field: &str) -> bool {
+        field == self.primary_field()
+    }
+
     /// Get the primary value.
     fn val(&self) -> Option<EpicsValue> {
         self.get_field(self.primary_field())

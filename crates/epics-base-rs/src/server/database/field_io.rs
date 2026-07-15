@@ -865,7 +865,7 @@ impl PvDatabase {
                             // leaves the stale UDF alarm exactly as C does — the
                             // earlier synchronous stat/sevr clear here diverged
                             // from C and reported NO_ALARM where C keeps UDF/INVALID.
-                            if field == instance.record.primary_field() {
+                            if instance.record.is_udf_defining_put(&field) {
                                 instance.common.udf = false;
                             }
                             result
@@ -1501,7 +1501,7 @@ impl PvDatabase {
                             // udf clear) + `rec_gbl_reset_alarms` clears it
                             // when the record does process. The earlier
                             // synchronous stat/sevr clear here diverged from C.
-                            if field == instance.record.primary_field() {
+                            if instance.record.is_udf_defining_put(&field) {
                                 instance.common.udf = false;
                             }
                             result

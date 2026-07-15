@@ -1114,6 +1114,7 @@ dependencies = [
 name = "epics-oracle-rs"
 version = "0.23.0"
 dependencies = [
+ "asyn-rs",
  "clap",
  "epics-base-rs",
  "epics-ca-rs",

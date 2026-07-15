@@ -63,3 +63,29 @@ pub use ioc::{CTools, Pair};
 pub use report::{Counts, Report};
 pub use runner::Runner;
 pub use surface::{Coverage, Surface};
+
+/// The asyn port both differential sides attach every asyn record to.
+///
+/// C's `asynRecord` refuses to `init_record` against an empty PORT
+/// (`connectDevice` finds no port and the record errors out), so a bare
+/// `record(asyn, "…") {}` cannot be swept. Both sides therefore pin the same
+/// port name here: the Rust `oracle_ioc` registers a `NullOctetPort` under it,
+/// and the C st.cmd creates a matching port before `iocInit`.
+pub const ORACLE_ASYN_PORT: &str = "ORACLEASYN";
+
+/// One `record(type, "name") { … }` statement for a reproducer `.db`.
+///
+/// Every record type gets an empty body — the reproducer is deliberately
+/// minimal — EXCEPT `asyn`, which pins `field(PORT, "ORACLEASYN")` so the
+/// record can attach to a port and `init_record` (see [`ORACLE_ASYN_PORT`]).
+/// Both differential sides are handed byte-identical db text, so this is the
+/// single owner of that asymmetry.
+pub fn record_stmt(record_type: &str, rec_name: &str) -> String {
+    if record_type == "asyn" {
+        format!(
+            "record({record_type}, \"{rec_name}\") {{\n    field(PORT, \"{ORACLE_ASYN_PORT}\")\n}}\n"
+        )
+    } else {
+        format!("record({record_type}, \"{rec_name}\") {{}}\n")
+    }
+}

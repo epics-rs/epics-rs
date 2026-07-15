@@ -84,7 +84,14 @@ bucket = "NOT-REPRODUCED"
 upstream = "epics-base / dbConvert"
 fields = []
 surface = ["value_string", "value_numeric"]
-classes = ["over-max", "under-min", "over-double-max", "over-float-max", "nan"]
+classes = [
+    "over-max",
+    "under-min",
+    "over-double-max",
+    "over-float-max",
+    "nan",
+    "enum-negative-ordinal",
+]
 why = """
 dbConvert's double->integer put is a bare C cast, which is UNDEFINED out of range
 (C17 6.3.1.4p1) -- so compiled C is not single-valued. The C softIoc this harness
@@ -96,6 +103,18 @@ Adjudicated 2026-07-14 (commit 651bf392): the port SATURATES and sends NaN to 0
 (types::c_cast), which is byte-identical to a compiled aarch64 IOC. No alarm --
 the stored value is in range and valid, and dbConvert runs outside the record's
 process cycle where an alarm would be erased by the next recGblResetAlarms.
+
+The epicsEnum16 (DBF_MENU/DBF_ENUM) destination is the same cast: `putDoubleEnum`
+instantiates the identical PUT macro body, so a numeric ordinal put whose value is
+out of the u16 range takes the same UB. `caput` sends a numeric-but-not-a-choice
+value to an enum field as DBR_DOUBLE (caput.c:498-507), so `caput SCAN -1` reaches
+`putDoubleEnum` as -1.0: the x86-64 softIoc stores the indefinite 65535, the port
+saturates the negative double to 0 -- a valid menu ordinal (SCAN -> Passive,
+PINI -> NO, a severity -> NO_ALARM). That is the `enum-negative-ordinal` class. Its
+value-agreeing twin -- a negative ordinal into a *signed* raw field (PRIO's i16)
+that holds -1 exactly -- produces no value diff and is not matched here. (An enum
+put whose ordinal is IN u16 range but out of the record's menu range is NOT this
+cast -- it is exact -- and is adjudicated separately, not under E2.)
 
 Expect: on an out-of-range numeric put, the x86-64 C softIoc stores the indefinite
 value and the port stores the saturated one. In range, both agree exactly.

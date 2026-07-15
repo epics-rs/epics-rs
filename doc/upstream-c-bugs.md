@@ -1270,6 +1270,20 @@ in range and valid.
 Tier 1 (wire) is unaffected: a `DBF_LONG` field carries 32 bits regardless of which 32 bits
 were chosen.
 
+**The `epicsEnum16` (DBF_MENU / DBF_ENUM) destination is the same cast.** `putDoubleEnum`
+(`dbConvert.c:1631-1638`, same PUT macro body) casts the double straight to `epicsEnum16`,
+so a numeric ordinal put out of the u16 range is the identical UB. It reaches that routine
+because `caput` sends a numeric value that is not one of the enum's choice strings as
+`DBR_DOUBLE`, not `DBR_ENUM` (`caput.c:498-507`): `caput SCAN -1` arrives as `-1.0`. The
+x86-64 softIoc stores the indefinite `65535`; the port saturates the negative double to `0`,
+which for a menu is a *valid* ordinal — `SCAN → Passive`, `PINI → NO`, a severity field →
+`NO_ALARM`. This is the differential harness's `enum-negative-ordinal` class, allowlisted
+under E2 on the `value_string`/`value_numeric` surface. Two neighbours are deliberately NOT
+under E2: a negative ordinal into a *signed raw* field (`PRIO`'s `epicsInt16` holds `-1`
+exactly, so C and the port agree and there is no diff to justify), and an ordinal that is in
+u16 range but past the record's menu count (`DISS 4`, `PINI 6`) — that cast is exact, not UB,
+and the port's clamp-to-menu-range is a separate decision adjudicated on its own.
+
 **Scope — what moves with the owner, and what does not.** `c_cast` is also the calc
 engines' narrowing owner, so `INT()`, `NINT()`, the bitwise/shift operands, `PRINTF` and
 `BIN_WRITE` saturate too. Two families are DEFINED C, not UB, and deliberately do not move:

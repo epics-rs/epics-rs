@@ -1064,6 +1064,24 @@ impl Record for WaveformRecord {
                     Err(CaError::TypeMismatch("APST".into()))
                 }
             }
+            // HASH (DBF_ULONG, waveform/aai/aao — waveformRecord.dbd.pod:535) is
+            // the On-Change content hash. Its .dbd carries no special()/pp(), so
+            // C dbPutField stores a client caput verbatim, exactly like any plain
+            // DBF_ULONG field. The store is TRANSIENT: `array_monitor_post`
+            // recomputes HASH from the array bytes on the next On-Change process
+            // (waveformRecord.c:311-319), overwriting it — but the put itself
+            // succeeds and reads back until then, matching C. subArray declares no
+            // HASH (`has_post_block` is false there), so it falls through. Accept
+            // the native ULong carrier and the legacy signed Long (bit-preserving
+            // reinterpret), the same rule the mbbi/mbbo DBF_ULONG fields use.
+            "HASH" if self.has_post_block() => {
+                self.hash = match value {
+                    EpicsValue::ULong(v) => v,
+                    EpicsValue::Long(v) => v as u32,
+                    _ => return Err(CaError::TypeMismatch("HASH".into())),
+                };
+                Ok(())
+            }
             "NORD" => Err(CaError::ReadOnlyField(name.to_string())),
             "INDX" if matches!(self.kind, ArrayKind::SubArray) => {
                 let Some(v) = count_put(&value) else {
@@ -1393,6 +1411,28 @@ mod array_kind_tests {
         // Odd length exercises the mid-pair break in the C loop.
         assert_eq!(epics_mem_hash(&[0xAA, 0xBB, 0xCC], 0), 0x06ab_0bfc);
         assert_eq!(epics_mem_hash(&[], 0), 0);
+    }
+
+    /// HASH (DBF_ULONG, waveform/aai/aao) accepts a client put and stores the
+    /// full unsigned range verbatim — u32::MAX and the negative-into-unsigned
+    /// wrap both round-trip. subArray declares no HASH and rejects the name.
+    #[test]
+    fn hash_put_stores_ulong_for_post_kinds() {
+        for kind in [ArrayKind::Waveform, ArrayKind::Aai, ArrayKind::Aao] {
+            let mut r = WaveformRecord::with_kind(kind);
+            r.put_field("HASH", EpicsValue::ULong(1)).unwrap();
+            assert_eq!(r.get_field("HASH"), Some(EpicsValue::ULong(1)));
+            r.put_field("HASH", EpicsValue::ULong(u32::MAX)).unwrap();
+            assert_eq!(r.get_field("HASH"), Some(EpicsValue::ULong(u32::MAX)));
+            // Legacy signed carrier: -1 reinterprets to u32::MAX bit pattern.
+            r.put_field("HASH", EpicsValue::Long(-1)).unwrap();
+            assert_eq!(r.get_field("HASH"), Some(EpicsValue::ULong(u32::MAX)));
+        }
+        let mut sa = WaveformRecord::with_kind(ArrayKind::SubArray);
+        assert!(matches!(
+            sa.put_field("HASH", EpicsValue::ULong(1)),
+            Err(CaError::FieldNotFound(_))
+        ));
     }
 
     #[test]

@@ -1440,8 +1440,34 @@ impl PvDatabase {
         // record (when !pact). The standard `caput REC.PROC 0` / `dbpf REC.PROC
         // 0` force-process idiom must therefore not be skipped for a zero value.
         if field == "PROC" {
-            // The value itself isn't stored; PROC is a trigger. A
-            // fire-and-forget caller parks nothing — C `dbPutField` on PROC
+            // C `dbCommon.dbd` declares `field(PROC,DBF_UCHAR){ pp(TRUE) }`, so
+            // a put to PROC does BOTH: `dbPut` stores the raw byte in
+            // `prec->proc` (retained — C never resets it), AND `pp(TRUE)` drives
+            // the reprocess below. The prior port kept only the reprocess and
+            // dropped the byte, so `caput REC.PROC v; caget REC.PROC` always
+            // read 0. Store the byte through the SAME `DBF_UCHAR` common-field
+            // path DISP/RPRO use (coercion + signed readback: `caput PROC 255` →
+            // `caget` = -1) in its own brief write lock so both the notify and
+            // fire-and-forget paths take it, then fall through to force-process.
+            // C `dbPut:1408` posts DBE_VALUE|DBE_LOG for the put field (PROC is
+            // not the record's value field, so the pp-suppression never applies).
+            {
+                let rec_arc = {
+                    let recs = self.inner.records.read().await;
+                    recs.get(record_name).cloned()
+                };
+                if let Some(rec_arc) = rec_arc {
+                    let mut guard = rec_arc.write().await;
+                    if guard.put_common_field("PROC", value).is_ok() {
+                        guard.notify_field(
+                            "PROC",
+                            crate::server::recgbl::EventMask::VALUE
+                                | crate::server::recgbl::EventMask::LOG,
+                        );
+                    }
+                }
+            }
+            // A fire-and-forget caller parks nothing — C `dbPutField` on PROC
             // processes the record with no putNotify.
             let parked = if let Some((completion_tx, completion_rx)) =
                 notify_request.into_completion()

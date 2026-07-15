@@ -365,7 +365,7 @@ fn stored_common_field_type(name: &str) -> Option<DbFieldType> {
         // (calc/calcout/scalcout/ai/ao/longin/int64in).
         "HIHI" | "HIGH" | "LOW" | "LOLO" | "HYST" => DbFieldType::Double,
         // The `DBF_UCHAR` flags. `bool` here, a NUMBER in C.
-        "DISP" | "UDF" | "TPRO" | "RPRO" | "BKPT" => DbFieldType::Char,
+        "DISP" | "UDF" | "TPRO" | "RPRO" | "BKPT" | "PROC" => DbFieldType::Char,
         _ => return None,
     })
 }
@@ -2275,7 +2275,12 @@ impl RecordInstance {
             "PUTF" => Some(EpicsValue::Char(if self.common.putf { 1 } else { 0 })),
             "RPRO" => Some(EpicsValue::UChar(self.common.rpro)),
             "PACT" => Some(EpicsValue::Char(if self.is_processing() { 1 } else { 0 })),
-            "PROC" => Some(EpicsValue::Char(0)), // Always 0 (trigger-only)
+            // C `dbCommon.dbd`: `field(PROC,DBF_UCHAR)` — the raw put byte is
+            // retained in `prec->proc` and served back SIGNED as `DBR_CHAR`
+            // (`caput PROC 255` → `caget` = -1), exactly like DISP/RPRO. The
+            // `pp(TRUE)` force-process is orthogonal: writing PROC still
+            // reprocesses the record (put-path intercept), but the byte sticks.
+            "PROC" => Some(EpicsValue::UChar(self.common.proc_field)),
             // Analog alarm fields
             "HIHI" => self
                 .common
@@ -2910,7 +2915,16 @@ impl RecordInstance {
                 }
             }
             "PACT" => return Err(CaError::ReadOnlyField("PACT".into())),
-            "PROC" => { /* Trigger handled by put_record_field_from_ca; no-op here */ }
+            // C `dbPut` stores the raw byte in `prec->proc` (retained across
+            // processing — C never resets it); `coerce_common_field` has
+            // already projected the put onto `DBF_UCHAR` (→ `Char`). The
+            // `pp(TRUE)` reprocess is driven separately by the put-path
+            // force-process intercept, so this arm ONLY records the byte.
+            "PROC" => {
+                if let EpicsValue::Char(v) = value {
+                    self.common.proc_field = v;
+                }
+            }
             // Analog alarm limits. The DB-load String was already coerced to
             // `Double` by `coerce_common_field` — the one owner of
             // "what type does this common field hold" — so every writer

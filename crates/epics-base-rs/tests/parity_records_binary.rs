@@ -25,13 +25,50 @@ use epics_base_rs::types::EpicsValue;
 #[test]
 fn mbbi_direct_exposes_upper_16_bits() {
     let mut rec = MbbiDirectRecord::default();
-    // Bit B1A is bit 26 — must exist and round-trip.
-    rec.put_field("B1A", EpicsValue::Char(1)).unwrap();
+    // Bit B1A is bit 26 — an INPUT record derives the bit FROM VAL, so drive
+    // VAL through process() and read the bit back (a Bx put does NOT fold into
+    // VAL here — that is mbboDirect's opposite data flow).
+    rec.rval = 1 << 26;
+    rec.process().unwrap();
     assert!(matches!(rec.get_field("B1A"), Some(EpicsValue::Char(1))));
     assert!(matches!(
         rec.get_field("VAL"),
         Some(EpicsValue::Long(v)) if v == (1 << 26)
     ));
+}
+
+#[test]
+fn mbbi_direct_bit_put_reverts_on_process() {
+    // Differential-oracle put-defect #1d: `caput B0 1` on an mbbiDirect whose
+    // VAL=0. B0 is pp(TRUE), so the put processes the record. In this INPUT
+    // record the bit fields are DERIVED from VAL, and a Bx put is not a value
+    // put — VAL stays 0, and C `mbbiDirectRecord.c:217-226` monitor() re-derives
+    // B0 = (VAL >> 0) & 1 = 0. The port under-re-derived: it folded the bit into
+    // VAL and, on a soft channel (which skips the RVAL->VAL convert), never
+    // rebuilt the bits, so `caput B0 1` wrongly ended B0=1.
+    let mut rec = MbbiDirectRecord::default();
+    rec.put_field("B0", EpicsValue::Char(1)).unwrap();
+    assert_eq!(rec.val, 0, "a Bx put must not fold into VAL (mbbiDirect)");
+    // Soft-channel process skips the convert (C `read_mbbiDirect` returns 2);
+    // the bit rebuild must still run on that path.
+    rec.set_device_did_compute(true);
+    rec.process().unwrap();
+    assert_eq!(rec.bits[0], 0, "process re-derives B0 from VAL=0");
+    assert_eq!(rec.val, 0, "VAL unchanged across the bit put + process");
+    assert!(matches!(rec.get_field("B0"), Some(EpicsValue::Char(0))));
+}
+
+#[test]
+fn mbbi_direct_process_rederives_bits_from_val() {
+    // Bit re-derivation across the width: VAL=5 -> B0=1, B2=1, all others 0.
+    let mut rec = MbbiDirectRecord::default();
+    rec.rval = 5;
+    rec.process().unwrap();
+    assert_eq!(rec.val, 5);
+    assert_eq!(rec.bits[0], 1);
+    assert_eq!(rec.bits[1], 0);
+    assert_eq!(rec.bits[2], 1);
+    assert!(rec.bits[3..].iter().all(|&b| b == 0));
 }
 
 #[test]

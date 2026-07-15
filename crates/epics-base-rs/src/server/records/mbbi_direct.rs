@@ -66,13 +66,6 @@ impl MbbiDirectRecord {
             self.bits[i] = ((self.val >> i) & 1) as u8;
         }
     }
-
-    fn bits_to_val(&mut self) {
-        self.val = 0;
-        for i in 0..32 {
-            self.val |= (self.bits[i] as u32 & 1) << i;
-        }
-    }
 }
 
 /// Bit field names B0..B1F — 32 entries, matching C `NUM_BITS 32`.
@@ -159,9 +152,19 @@ impl Record for MbbiDirectRecord {
                 raw = raw.checked_shr(self.shft as u32).unwrap_or(0);
             }
             self.val = raw;
-            self.val_to_bits();
         }
         self.skip_convert = false;
+        // C `mbbiDirectRecord.c:217-226` monitor() re-derives every bit
+        // B0..B1F FROM VAL each cycle (`*pBn = !!(val & 1)`), whether or not
+        // the RVAL->VAL convert ran. In this INPUT record the bit fields are
+        // DERIVED from VAL — a `pp(TRUE)` Bx put processes the record but never
+        // changes VAL (Bx is not a value field), so the transient bit is
+        // overwritten by the VAL-derived bit. Re-derive UNCONDITIONALLY here
+        // (a soft-channel process sets `skip_convert`, leaving VAL untouched);
+        // gating the rebuild on the convert left a Bx put's transient bit
+        // standing, so `caput B0 1` with VAL=0 ended B0=1 instead of C's 0.
+        // Opposite direction from mbboDirect, where Bx puts DERIVE VAL.
+        self.val_to_bits();
         self.oraw = self.rval;
         // Capture the VAL-change
         // gate now (C mbbiDirectRecord.c:228-231 `mlst != val`); the framework
@@ -280,8 +283,13 @@ impl Record for MbbiDirectRecord {
                         EpicsValue::Long(v) => (v & 1) as u8,
                         _ => return Err(CaError::TypeMismatch(name.into())),
                     };
+                    // INPUT record: Bx is DERIVED from VAL, so a Bx put must
+                    // NOT fold back into VAL (unlike mbboDirect). Store the raw
+                    // bit transiently; the `pp(TRUE)` put processes the record,
+                    // and process() re-derives every bit from the unchanged VAL,
+                    // overwriting this (C `mbbiDirectRecord.c` has no `special`
+                    // for Bx and never updates VAL on a bit put — VAL stays put).
                     self.bits[idx] = bit;
-                    self.bits_to_val();
                 } else {
                     return Err(CaError::FieldNotFound(name.to_string()));
                 }

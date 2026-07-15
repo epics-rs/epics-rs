@@ -130,6 +130,27 @@ impl Record for LsiRecord {
         false
     }
 
+    /// `lsiRecord.c::process` has no unconditional UDF re-derive; UDF is
+    /// cleared only where a value is actually loaded — the init-time
+    /// `dbLoadLinkLS` (`lsiRecord.c:85-88`, applied by the init-seed owner)
+    /// and the soft support's sourced read (`devLsiSoft.c`,
+    /// `if (status == 0) prec->udf = FALSE`). A process cycle that sources
+    /// nothing — e.g. a `caput .UDF 1` on a Passive record with a
+    /// constant/empty INP — must keep the client's UDF put. Opt out of the
+    /// per-cycle blanket re-derive, like `stringin`/`lso`.
+    fn clears_udf(&self) -> bool {
+        false
+    }
+
+    /// `lsiRecord.c` has NO `recGblCheckUdf` / `UDF_ALARM` (unlike
+    /// `lsoRecord.c:118`): an undefined lsi raises no alarm from UDF (softIoc:
+    /// `record(lsi,"X"){}` → UDF 1, STAT/SEVR = NO_ALARM). With `clears_udf`
+    /// false, UDF can now legitimately stay 1, so this MUST be false or
+    /// `rec_gbl_check_udf` would invent an alarm C never raises.
+    fn raises_udf_alarm(&self) -> bool {
+        false
+    }
+
     /// C `devLsiSoft.c:24` — the soft input support's
     /// `dbLoadLinkLS(&prec->inp, prec->val, prec->sizv, &prec->len)`. The
     /// load runs in the init-seed owner, which gates it on the soft DTYP the

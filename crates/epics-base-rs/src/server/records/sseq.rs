@@ -195,7 +195,19 @@ struct SseqStep {
     lnk: String,       // Output link (LNKn)
     str_val: PvString, // String value (STRn)
     wait: i16,         // Wait mode: 0=NoWait, 1=Wait, 2..=After1..After9
-    waiting: bool,     // WTGn — an outstanding put-callback for this step
+    // WTGn — an outstanding put-callback for this step. C's `plinkGroup->waiting`
+    // is a raw `DBF_SHORT` the machine drives 0/1; the machine treats non-zero
+    // as "waiting". It is `DBF_SHORT` and not a bool because WTGA carries no
+    // `special(SPC_NOMOD)` in `sseqRecord.dbd` (unlike WTG1..WTG9), so a client
+    // `caput SQ.WTGA 5` stores 5 verbatim and reads it back — a bool would
+    // collapse it to 1. See `ix` for the twin 10th-group `.dbd` omission.
+    waiting: i16,
+    // IXn — the step's own index. C's `plinkGroup->index`, a stored `DBF_SHORT`
+    // (`initial(0)`..`initial(9)`), `special(SPC_NOMOD)` for IX1..IX9 but NOT
+    // for IXA (the `.dbd` omits it), so `caput SQ.IXA 5` stores 5 where the
+    // 1..9 puts are refused by the read-only gate. Stored, not computed from the
+    // slot, so IXA can hold a client override the way C does.
+    ix: i16,
     // Link-status diagnostics, refreshed by `refresh_link_status` from C
     // `sseqRecord.c:checkLinks` (sseqRecord.c:848-969). Defaulted to the
     // C `init_record` classification of an empty (constant) link.
@@ -268,7 +280,11 @@ impl Default for SseqStep {
             lnk: String::new(),
             str_val: PvString::default(),
             wait: 0,
-            waiting: false,
+            waiting: 0,
+            // Fixed up to the slot index by `SseqRecord::default` (C
+            // `initial(0)`..`initial(9)`); a bare array `Default` cannot know
+            // its own position.
+            ix: 0,
             // An empty link is a CONSTANT link. C `init_record` marks the DOL
             // one `DBF_NOACCESS` — it consumed the constant, once — and the LNK
             // one `DBF_unknown`, since a constant output has no target
@@ -347,6 +363,12 @@ pub struct SseqRecord {
 
 impl Default for SseqRecord {
     fn default() -> Self {
+        let mut steps: [SseqStep; NUM_STEPS] = Default::default();
+        // C `sseqRecord.dbd` seeds each `IXn` with `initial(n-1)` — the step's
+        // own 0-based index; the array `Default` cannot set it per slot.
+        for (i, step) in steps.iter_mut().enumerate() {
+            step.ix = i as i16;
+        }
         Self {
             val: 0,
             selm: 0,
@@ -360,7 +382,7 @@ impl Default for SseqRecord {
             phase: SeqPhase::Idle,
             active: Vec::new(),
             cursor: 0,
-            steps: Default::default(),
+            steps,
             in_flight: Vec::new(),
             seq_wake: None,
             async_ctx: None,
@@ -534,8 +556,8 @@ impl SseqRecord {
         // C `process` (sseqRecord.c:338-344) clears every `waiting` flag
         // before building the list.
         for i in 0..NUM_STEPS {
-            if self.steps[i].waiting {
-                self.steps[i].waiting = false;
+            if self.steps[i].waiting != 0 {
+                self.steps[i].waiting = 0;
                 live.push((WTG_FIELDS[i].to_string(), EpicsValue::Short(0)));
             }
         }
@@ -589,8 +611,8 @@ impl SseqRecord {
             }
         });
         for i in done_steps {
-            if self.steps[i].waiting {
-                self.steps[i].waiting = false;
+            if self.steps[i].waiting != 0 {
+                self.steps[i].waiting = 0;
                 live.push((WTG_FIELDS[i].to_string(), EpicsValue::Short(0)));
             }
         }
@@ -766,7 +788,7 @@ impl SseqRecord {
         value: EpicsValue,
         live: &mut Vec<(String, EpicsValue)>,
     ) {
-        self.steps[i].waiting = true;
+        self.steps[i].waiting = 1;
         live.push((WTG_FIELDS[i].to_string(), EpicsValue::Short(1)));
         let done = Arc::new(AtomicBool::new(false));
         self.in_flight.push(InFlight {
@@ -859,8 +881,8 @@ impl SseqRecord {
             live.push(("ABORTING".to_string(), EpicsValue::Short(0)));
         }
         for i in 0..NUM_STEPS {
-            if self.steps[i].waiting {
-                self.steps[i].waiting = false;
+            if self.steps[i].waiting != 0 {
+                self.steps[i].waiting = 0;
                 live.push((WTG_FIELDS[i].to_string(), EpicsValue::Short(0)));
             }
         }
@@ -1211,8 +1233,8 @@ impl Record for SseqRecord {
             // on, so they are harmless (C's `waiting == 0` abandoned-callback
             // guard).
             for i in 0..NUM_STEPS {
-                if self.steps[i].waiting {
-                    self.steps[i].waiting = false;
+                if self.steps[i].waiting != 0 {
+                    self.steps[i].waiting = 0;
                     live.push((WTG_FIELDS[i].to_string(), EpicsValue::Short(0)));
                 }
             }
@@ -1467,10 +1489,12 @@ impl Record for SseqRecord {
                         // WTGn — live "outstanding put-callback" flag for
                         // this step (C `processCallback`/`putCallbackCB`
                         // toggle `waiting`); posted via `post_live`.
-                        "WTG" => Some(EpicsValue::Short(self.steps[idx].waiting as i16)),
+                        "WTG" => Some(EpicsValue::Short(self.steps[idx].waiting)),
                         // IXn holds the step's own 0-based index
-                        // (sseqRecord.dbd initial: IX1=0 .. IXA=9).
-                        "IX" => Some(EpicsValue::Short(idx as i16)),
+                        // (sseqRecord.dbd initial: IX1=0 .. IXA=9). Served from
+                        // storage so a `caput SQ.IXA` override survives (IX1..IX9
+                        // are read-only, so their cell stays at the init index).
+                        "IX" => Some(EpicsValue::Short(step.ix)),
                         _ => None,
                     };
                 }
@@ -1683,14 +1707,30 @@ impl Record for SseqRecord {
                             }
                             _ => Err(CaError::TypeMismatch(name.into())),
                         },
-                        // WTGn is read-only to clients; the machine posts it
-                        // via `post_fields` (`put_field_internal`), which
-                        // lands here. Store the flag the machine already set.
+                        // WTG1..WTG9 are `special(SPC_NOMOD)` — the read-only
+                        // gate refuses a client put, and only the machine's own
+                        // `post_fields` (`put_field_internal`) reaches here with
+                        // the 0/1 flag it just set. WTGA carries NO `SPC_NOMOD`
+                        // in `sseqRecord.dbd`, so a client `caput SQ.WTGA v` also
+                        // lands here and C stores `v` verbatim in the raw short.
+                        // Store the raw `DBF_SHORT` either way (`as i16`), not a
+                        // 0/1 bool, so the client override reads back unchanged.
                         "WTG" => {
                             step.waiting = value
                                 .to_f64()
                                 .ok_or_else(|| CaError::TypeMismatch(name.into()))?
-                                != 0.0;
+                                as i16;
+                            Ok(())
+                        }
+                        // IX1..IX9 are `special(SPC_NOMOD)` (gate-refused);
+                        // IXA is not, so `caput SQ.IXA v` stores `v` in the step's
+                        // raw index short exactly as C does. Reached only for IXA
+                        // on the client path (1..9 are refused upstream).
+                        "IX" => {
+                            step.ix = value
+                                .to_f64()
+                                .ok_or_else(|| CaError::TypeMismatch(name.into()))?
+                                as i16;
                             Ok(())
                         }
                         // DTn / LTn / WERRn are read-only to clients; the
@@ -2186,13 +2226,55 @@ mod tests {
                 "{ro_name} is special(SPC_NOMOD) in sseqRecord.dbd"
             );
         }
-        for rw_name in ["VAL", "ABORT", "ABORTING", "DLY1", "WAIT1", "LNK1", "STRA"] {
+        // WTGA and IXA are the twin `.dbd` omission: WTG1..WTG9 / IX1..IX9 all
+        // carry `special(SPC_NOMOD)`, but the 10th group's WTGA/IXA do NOT (both
+        // the vendored and the upstream `sseqRecord.dbd`), so C leaves them
+        // writable. They belong in the writable set, not the read-only one.
+        for rw_name in [
+            "VAL", "ABORT", "ABORTING", "DLY1", "WAIT1", "LNK1", "STRA", "WTGA", "IXA",
+        ] {
             let f = fields.iter().find(|f| f.name == rw_name).unwrap();
             assert!(
                 !f.read_only,
                 "{rw_name} carries no special(SPC_NOMOD) in sseqRecord.dbd"
             );
         }
+    }
+
+    /// The 10th-group `.dbd` omission, end to end: `WTG1..WTG9` / `IX1..IX9` are
+    /// `special(SPC_NOMOD)` and their put is refused by the read-only gate, but
+    /// `WTGA` / `IXA` carry no `SPC_NOMOD`, so C stores a client put verbatim in
+    /// the raw `DBF_SHORT` and reads it back. The port modelled `IXn` as a
+    /// computed slot index (a put returned `FieldNotFound`) and `WTGn` as a bool
+    /// (a put of 5 read back as 1); now both are stored raw shorts.
+    #[test]
+    fn sseq_tenth_group_wtga_ixa_store_client_put_like_c() {
+        // Defaults: IXn is its 0-based index, WTGn is 0.
+        let rec = SseqRecord::new();
+        assert_eq!(rec.get_field("IX1"), Some(EpicsValue::Short(0)));
+        assert_eq!(rec.get_field("IX9"), Some(EpicsValue::Short(8)));
+        assert_eq!(rec.get_field("IXA"), Some(EpicsValue::Short(9)));
+        assert_eq!(rec.get_field("WTGA"), Some(EpicsValue::Short(0)));
+
+        // A put to IXA / WTGA stores the raw short verbatim (the read-only gate
+        // that would block IX1..IX9 / WTG1..WTG9 lives in the framework, above
+        // `put_field`; C's dbPut stores these two because they lack SPC_NOMOD).
+        let mut rec = SseqRecord::new();
+        rec.put_field("IXA", EpicsValue::Short(5)).unwrap();
+        rec.put_field("WTGA", EpicsValue::Short(5)).unwrap();
+        assert_eq!(
+            rec.get_field("IXA"),
+            Some(EpicsValue::Short(5)),
+            "IXA must store the client put, not stay at the init index 9"
+        );
+        assert_eq!(
+            rec.get_field("WTGA"),
+            Some(EpicsValue::Short(5)),
+            "WTGA must store the raw short 5, not collapse to a 0/1 bool"
+        );
+        // The write is isolated to the 10th group.
+        assert_eq!(rec.get_field("IX1"), Some(EpicsValue::Short(0)));
+        assert_eq!(rec.get_field("WTG1"), Some(EpicsValue::Short(0)));
     }
 
     /// R17-1: a NEGATIVE `PREC` reaches C's

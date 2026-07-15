@@ -125,6 +125,13 @@ pub struct CommonFields {
     pub putf: bool,
     // RPRO — reprocess flag. `DBF_UCHAR`, raw-byte readback like DISP/TPRO.
     pub rpro: u8,
+    // PROC — force-processing field. `DBF_UCHAR` in `dbCommon.dbd`
+    // (`field(PROC,DBF_UCHAR){ pp(TRUE) }`): C's `dbPut` stores the raw put
+    // byte in `prec->proc` and never resets it (retained across processing),
+    // serving it back SIGNED as `DBR_CHAR` (`caput PROC 255` → `caget` = -1).
+    // Raw `u8` like [`Self::disp`]/[`Self::rpro`]; the `pp(TRUE)` reprocess is
+    // orthogonal and driven by the put-path force-process intercept.
+    pub proc_field: u8,
     // Fallback monitor/archive last-sent values for records without MLST/ALST fields
     pub mlst: Option<f64>,
     pub alst: Option<f64>,
@@ -228,6 +235,7 @@ impl Default for CommonFields {
             disp: 0,
             putf: false,
             rpro: 0,
+            proc_field: 0,
             mlst: None,
             alst: None,
         }

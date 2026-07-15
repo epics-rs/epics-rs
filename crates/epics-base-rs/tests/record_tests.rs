@@ -1803,11 +1803,23 @@ fn test_lcnt_reset_on_success() {
 }
 
 #[test]
-fn test_proc_reads_zero() {
-    let instance = RecordInstance::new("TEST".into(), AoRecord::new(0.0));
+fn test_proc_get_put() {
+    // C `dbCommon.dbd`: `field(PROC,DBF_UCHAR)` — the raw put byte is retained
+    // in `prec->proc` and served back as `DBF_UCHAR` (`UChar`), like DISP. A
+    // fresh record reads the default 0; a stored byte round-trips. (The
+    // `pp(TRUE)` force-process is orthogonal and driven by the put path.)
+    let mut instance = RecordInstance::new("TEST".into(), AoRecord::new(0.0));
     match instance.get_common_field("PROC") {
-        Some(EpicsValue::Char(0)) => {}
-        other => panic!("expected Char(0), got {:?}", other),
+        Some(EpicsValue::UChar(0)) => {}
+        other => panic!("expected UChar(0), got {:?}", other),
+    }
+    instance
+        .put_common_field("PROC", EpicsValue::Char(1))
+        .unwrap();
+    assert_eq!(instance.common.proc_field, 1);
+    match instance.get_common_field("PROC") {
+        Some(EpicsValue::UChar(1)) => {}
+        other => panic!("expected UChar(1), got {:?}", other),
     }
 }
 

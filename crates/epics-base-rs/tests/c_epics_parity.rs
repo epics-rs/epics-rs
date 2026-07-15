@@ -1434,6 +1434,49 @@ async fn database_proc_zero_still_triggers_processing() {
     }
 }
 
+/// C EPICS: `field(PROC,DBF_UCHAR){ pp(TRUE) }` — a PROC put does BOTH:
+/// `dbPut` stores the raw byte in `prec->proc` (retained; C never resets it)
+/// AND `pp(TRUE)` force-processes the record. The byte is served back SIGNED
+/// as `DBR_CHAR` (put-defect cluster PROC), so `caput PROC 255` reads back -1.
+#[tokio::test]
+async fn database_proc_stores_byte_and_still_processes() {
+    use epics_base_rs::server::database::PvDatabase;
+    use std::sync::Arc;
+
+    let db = Arc::new(PvDatabase::new());
+    db.add_record("proc_rb", Box::new(AoRecord::new(5.0)))
+        .await
+        .unwrap();
+
+    // `caput proc_rb.PROC 1`: processes (clears the born-UDF) AND stores 1.
+    db.put_record_field_from_ca("proc_rb", "PROC", EpicsValue::Char(1))
+        .await
+        .unwrap();
+    if let Some(rec) = db.get_record("proc_rb").await {
+        let inst = rec.read().await;
+        assert!(inst.common.udf == 0, "PROC=1 must still force-process");
+        assert_eq!(
+            inst.get_common_field("PROC"),
+            Some(EpicsValue::UChar(1)),
+            "PROC must read back the written byte, not 0"
+        );
+    }
+
+    // `caput proc_rb.PROC 255`: the DBF_UCHAR byte round-trips and is served
+    // signed (255 → -1) on the DBR_CHAR wire, exactly like DISP/RPRO.
+    db.put_record_field_from_ca("proc_rb", "PROC", EpicsValue::Char(255))
+        .await
+        .unwrap();
+    if let Some(rec) = db.get_record("proc_rb").await {
+        let inst = rec.read().await;
+        assert_eq!(
+            inst.get_common_field("PROC"),
+            Some(EpicsValue::UChar(255)),
+            "PROC 255 must retain the raw byte (served signed as -1)"
+        );
+    }
+}
+
 /// C EPICS: all record names returned from database
 #[tokio::test]
 async fn database_all_record_names() {

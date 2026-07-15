@@ -1273,6 +1273,19 @@ pub trait Record: Send + Sync + 'static {
         field == self.primary_field()
     }
 
+    /// A put wrote `dbCommon.udf` on the client-put path — either a direct
+    /// `caput UDF <byte>` (the framework stored `udf_nonzero = byte != 0`) or a
+    /// value-defining put that cleared it (`udf_nonzero = false`). Records that
+    /// SHADOW `udf` in their own [`Record::value_is_undefined`] state — the
+    /// calc family's monotonic cell — sync it here so the put WINS over the
+    /// cell on the re-derivation the framework runs next cycle. Without this
+    /// the cell (undefined-until-first-calc) and the puttable UDF field are two
+    /// meanings of one state, and the cell clobbers a `caput UDF 0`.
+    ///
+    /// Default no-op — most records keep no shadow and read UDF straight from
+    /// `common`, so the framework's stored byte already stands.
+    fn set_udf_from_put(&mut self, _udf_nonzero: bool) {}
+
     /// Get the primary value.
     fn val(&self) -> Option<EpicsValue> {
         self.get_field(self.primary_field())

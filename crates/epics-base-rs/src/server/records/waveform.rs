@@ -553,7 +553,14 @@ impl WaveformRecord {
     /// (`init_record` floors it, 96-97).
     fn sa_clamp_bounds(&mut self) {
         let malm = self.malm.max(1);
-        if self.nelm > malm {
+        // NELM/INDX/MALM are DBF_ULONG in C (subArrayRecord.dbd.pod), and C's
+        // readValue clamp is on `epicsUInt32` (`if (nelm > malm) nelm = malm`,
+        // subArrayRecord.c:310) — an UNSIGNED compare. The port carries them in
+        // i32, so a full-range NELM put (4294967295) lands as -1; comparing that
+        // signed leaves `-1 > malm` false and the huge value survives, where C
+        // clamps it to MALM. Compare as u32 to reproduce C: 4294967295 > malm
+        // clamps to malm, while a genuine small NELM is unaffected.
+        if (self.nelm as u32) > (malm as u32) {
             self.nelm = malm;
         }
         if self.indx >= malm {
@@ -748,7 +755,11 @@ impl Record for WaveformRecord {
             if self.malm < 1 {
                 self.malm = 1;
             }
-            if self.nelm > self.malm {
+            // Unsigned clamp, as in C `init_record` (subArrayRecord.c:103, an
+            // `epicsUInt32` compare) and `sa_clamp_bounds` — a NELM at the top of
+            // the unsigned range must clamp down to MALM, not survive as a
+            // negative i32.
+            if (self.nelm as u32) > (self.malm as u32) {
                 self.nelm = self.malm;
             }
             // C `callocMustSucceed(prec->malm, dbValueSize(prec->ftvl))`
@@ -994,41 +1005,46 @@ impl Record for WaveformRecord {
                 self.land_val_in_buffer(value)
             }
             "NELM" => {
-                if let Some(n) = count_put(&value) {
+                let Some(n) = count_put(&value) else {
+                    return Err(CaError::InvalidValue(format!(
+                        "NELM requires Long, got {value:?}"
+                    )));
+                };
+                if matches!(self.kind, ArrayKind::SubArray) {
+                    // subArray: NELM (DBF_ULONG, pp(TRUE), NO special —
+                    // subArrayRecord.dbd.pod:379) is the SLICE LENGTH, not the
+                    // buffer size — the buffer is MALM wide (`val_capacity`) and a
+                    // NELM put does not touch it. C's NELM is a plain
+                    // `epicsUInt32`: `dbPutField` stores ANY value verbatim (0 and
+                    // the full unsigned range included — C rejects none of them),
+                    // the `pp(TRUE)` process re-slices, and `bptr` (allocated once
+                    // at `init_record`) keeps its contents throughout. Reallocating
+                    // a zeroed buffer here EMPTIED VAL on every NELM put: C `caput
+                    // SA.NELM 2` on an `INP="[1,2,3,4]"` subArray reads back
+                    // `VAL=[1,2] NORD=2`; the port read back an empty VAL, NORD=0.
+                    //
+                    // Store as the DBF_ULONG bit pattern (`count_put` reinterprets,
+                    // so 4294967295 lands as -1 in the i32 carrier). NO rejection
+                    // of zero/negative and NO MALM clamp here — C clamps NELM->MALM
+                    // at init_record and at process (subArrayRecord.c:103-104,
+                    // 310-311) with an UNSIGNED compare, never at field put, so the
+                    // .db load order of NELM vs MALM cannot matter. `init_record`
+                    // and `sa_clamp_bounds` (the readValue equivalent) apply it.
+                    self.nelm = n;
+                    Ok(())
+                } else {
+                    // waveform/aai/aao: NELM is `special(SPC_NOMOD)`, so a CA put
+                    // never reaches here — this arm is the `.db`-load / builder
+                    // sizing path, where NELM must be a positive element count.
+                    // Preserve the existing element data instead of wiping VAL.
                     if n <= 0 {
                         return Err(CaError::InvalidValue(format!(
                             "NELM must be positive, got {n}"
                         )));
                     }
-                    if matches!(self.kind, ArrayKind::SubArray) {
-                        // subArray: NELM is the SLICE LENGTH, not the buffer
-                        // size — the buffer is MALM wide (`val_capacity`) and a
-                        // NELM put does not touch it. C's NELM is a plain
-                        // `epicsUInt32` field: `dbPutField` stores it, the
-                        // `pp(TRUE)` process re-slices, and `bptr` (allocated
-                        // once at `init_record`) keeps its contents throughout.
-                        // Reallocating a zeroed buffer here EMPTIED VAL on every
-                        // NELM put: C `caput SA.NELM 2` on an `INP="[1,2,3,4]"`
-                        // subArray reads back `VAL=[1,2] NORD=2`; the port read
-                        // back an empty VAL with NORD=0.
-                        //
-                        // NO MALM clamp here either — C clamps NELM->MALM at
-                        // init_record and at process (subArrayRecord.c:103-104,
-                        // 310-311), never at field put, so the .db load order of
-                        // NELM vs MALM cannot matter. `init_record` and
-                        // `sa_clamp_bounds` (the readValue equivalent) apply it.
-                        self.nelm = n;
-                    } else {
-                        // waveform/aai/aao: preserve the existing
-                        // element data instead of wiping VAL.
-                        self.nelm = n;
-                        self.resize_val_preserving();
-                    }
+                    self.nelm = n;
+                    self.resize_val_preserving();
                     Ok(())
-                } else {
-                    Err(CaError::InvalidValue(format!(
-                        "NELM requires Long, got {value:?}"
-                    )))
                 }
             }
             "FTVL" => {
@@ -1433,6 +1449,31 @@ mod array_kind_tests {
             sa.put_field("HASH", EpicsValue::ULong(1)),
             Err(CaError::FieldNotFound(_))
         ));
+    }
+
+    /// subArray NELM (DBF_ULONG, pp(TRUE), no special) accepts any client put:
+    /// zero stores and survives the readValue clamp (0 <= MALM), while a
+    /// full-range put (u32::MAX, or the -1 legacy wrap) is stored and then
+    /// clamped DOWN to MALM by the unsigned compare — matching C
+    /// (subArrayRecord.c:310). The port previously rejected NELM <= 0 outright
+    /// and, if stored, would have kept the huge value under a signed compare.
+    #[test]
+    fn subarray_nelm_put_accepts_zero_and_full_range() {
+        let mut r = WaveformRecord::with_kind(ArrayKind::SubArray);
+        assert_eq!(r.malm, 1);
+        // Zero: stored, and 0 <= MALM so the clamp leaves it.
+        r.put_field("NELM", EpicsValue::ULong(0)).unwrap();
+        assert_eq!(r.get_field("NELM"), Some(EpicsValue::ULong(0)));
+        r.sa_clamp_bounds();
+        assert_eq!(r.get_field("NELM"), Some(EpicsValue::ULong(0)));
+        // Full unsigned range: stored, then clamped down to MALM.
+        r.put_field("NELM", EpicsValue::ULong(u32::MAX)).unwrap();
+        r.sa_clamp_bounds();
+        assert_eq!(r.get_field("NELM"), Some(EpicsValue::ULong(1)));
+        // Negative-into-unsigned via the legacy Long carrier: same wrap.
+        r.put_field("NELM", EpicsValue::Long(-1)).unwrap();
+        r.sa_clamp_bounds();
+        assert_eq!(r.get_field("NELM"), Some(EpicsValue::ULong(1)));
     }
 
     #[test]

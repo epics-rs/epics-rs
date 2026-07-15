@@ -855,16 +855,18 @@ impl PvDatabase {
                             // `goto done` skips on a non-zero status.
                             let result =
                                 special_after_put(&mut instance, &field, &mut special_actions)?;
-                            // Clear UDF/UDF_ALARM on primary field write
+                            // C `dbAccess.c::dbPut:1411` clears ONLY `precord->udf
+                            // = FALSE` on a value-field put, and nothing else. It
+                            // does NOT touch stat/sevr: the UDF_ALARM stays until
+                            // the record's own process cycle recomputes it
+                            // (`rec_gbl_check_udf` no longer raises it now udf is
+                            // clear, `rec_gbl_reset_alarms` commits the new state).
+                            // A value put that does not drive a process therefore
+                            // leaves the stale UDF alarm exactly as C does — the
+                            // earlier synchronous stat/sevr clear here diverged
+                            // from C and reported NO_ALARM where C keeps UDF/INVALID.
                             if field == instance.record.primary_field() {
                                 instance.common.udf = false;
-                                if instance.common.stat
-                                    == crate::server::recgbl::alarm_status::UDF_ALARM
-                                {
-                                    instance.common.stat = 0;
-                                    instance.common.sevr =
-                                        crate::server::record::AlarmSeverity::NoAlarm;
-                                }
                             }
                             result
                         }
@@ -1487,29 +1489,20 @@ impl PvDatabase {
                             // C `dbAccess.c::dbPut:1410-1411` clears
                             // `precord->udf = FALSE` synchronously when the
                             // put target is the record-type's primary value
-                            // field (`dbIsValueField`). The clear happens
-                            // BEFORE `dbProcess` runs, so any reader between
-                            // the put and the process-cycle's own clear sees
-                            // the new value with a consistent UDF=false.
-                            //
-                            // Rust's processing path also clears UDF via
-                            // `clears_udf()` in process/complete_async_record,
-                            // but that runs AFTER the put lock drops and the
-                            // process re-acquires — leaving a small window
-                            // where another reader can observe (new VAL,
-                            // udf=true). For async records the window spans
-                            // the entire device round trip. Clear here to
-                            // close the window. The same clear already exists
-                            // in `put_pv_and_post` (line 256-262); mirror it.
+                            // field (`dbIsValueField`), and clears NOTHING
+                            // else. The clear happens BEFORE `dbProcess` runs,
+                            // so any reader between the put and the process
+                            // cycle sees the new value with a consistent
+                            // udf=false — but stat/sevr keep their old
+                            // UDF_ALARM until the process cycle recomputes
+                            // them. A value put that drives no process leaves
+                            // the stale UDF alarm, matching C; the process
+                            // path's own `rec_gbl_check_udf` (now a no-op with
+                            // udf clear) + `rec_gbl_reset_alarms` clears it
+                            // when the record does process. The earlier
+                            // synchronous stat/sevr clear here diverged from C.
                             if field == instance.record.primary_field() {
                                 instance.common.udf = false;
-                                if instance.common.stat
-                                    == crate::server::recgbl::alarm_status::UDF_ALARM
-                                {
-                                    instance.common.stat = 0;
-                                    instance.common.sevr =
-                                        crate::server::record::AlarmSeverity::NoAlarm;
-                                }
                             }
                             result
                         }

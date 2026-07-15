@@ -7980,10 +7980,11 @@ async fn test_mbbo_direct_initialises_val_from_bits_when_undef() {
     rec2.post_init_finalize_undef(&mut udf2).unwrap();
     assert!(!udf2, "UDF stays cleared");
     assert!(matches!(rec2.get_field("VAL"), Some(EpicsValue::Long(5))));
-    // bits[0] and bits[2] should reflect VAL=5 (binary 0101).
-    assert!(matches!(rec2.get_field("B0"), Some(EpicsValue::Char(1))));
-    assert!(matches!(rec2.get_field("B2"), Some(EpicsValue::Char(1))));
-    assert!(matches!(rec2.get_field("B1"), Some(EpicsValue::Char(0))));
+    // bits[0] and bits[2] should reflect VAL=5 (binary 0101). B0..B1F are
+    // DBF_UCHAR, so mbboDirect serves the bit as the native unsigned `UChar`.
+    assert!(matches!(rec2.get_field("B0"), Some(EpicsValue::UChar(1))));
+    assert!(matches!(rec2.get_field("B2"), Some(EpicsValue::UChar(1))));
+    assert!(matches!(rec2.get_field("B1"), Some(EpicsValue::UChar(0))));
 
     // Sibling case: nothing set — UDF stays true, VAL stays 0.
     let mut rec3 = MbboDirectRecord::default();

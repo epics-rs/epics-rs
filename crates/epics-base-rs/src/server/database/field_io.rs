@@ -77,11 +77,23 @@ fn check_no_mod(instance: &crate::server::record::RecordInstance, field: &str) -
 ///
 /// C `dbPutField` (`dbAccess.c:1263-1268`) and pvxs `IOCSource::
 /// doPostProcessing` (`iocsource.cpp:397-403`) ask the same question with the
-/// same three terms: the `PROC` field always, else a `pp(TRUE)` field on a
-/// Passive record. (`dbrType < DBR_PUT_ACKT` is subsumed: the alarm-ack fields
-/// are not `pp(TRUE)`.) A caller that FORCES processing
-/// (`record._options.process=true`) does not consult this at all — force is
-/// the caller's own term, not the record's.
+/// same terms as C `processNotifyCommon` (dbNotify.c:243-246): the `PROC` field
+/// always, else a `pp(TRUE)` field on a Passive record. (`dbrType <
+/// DBR_PUT_ACKT` is subsumed: the alarm-ack fields are not `pp(TRUE)`.) A caller
+/// that FORCES processing (`record._options.process=true`) does not consult this
+/// at all — force is the caller's own term, not the record's.
+///
+/// `PROC` and `UDF` are the ONLY two `dbCommon` `pp(TRUE)` fields
+/// (`dbCommon.dbd.pod`: PROC line 243, UDF line 552); every other `pp(TRUE)`
+/// field is declared per record TYPE and reached through
+/// [`Record::processes_after_put`]. Because the two `dbCommon` fields are NOT in
+/// any type's `process_passive_fields()` table, they are named here directly:
+/// `PROC` unconditionally (force-process on any SCAN), `UDF` on the Passive
+/// branch (an ordinary `pp` field, so it processes only when `SCAN == 0`, unlike
+/// PROC). Both `dbCommon` `pp(TRUE)` fields are thus handled at this one owner
+/// gate, uniformly for every record type. A put to UDF is accepted+stored by
+/// `put_common_field`; this gate only adds the process cycle, after which the
+/// record recomputes alarms → NO_ALARM (C ends STAT/SEVR=NO_ALARM likewise).
 ///
 /// Single owner of the rule: the single-record put route
 /// ([`PvDatabase::put_record_field_from_ca`]) tests it while it already holds
@@ -96,7 +108,7 @@ pub(crate) fn put_drives_processing_of(
 ) -> bool {
     field == "PROC"
         || (instance.common.scan == crate::server::record::ScanType::Passive
-            && instance.record.processes_after_put(field))
+            && (field == "UDF" || instance.record.processes_after_put(field)))
 }
 
 /// Drain the record's per-cycle post marks ([`Record::take_cycle_posted_fields`])
@@ -1443,9 +1455,25 @@ impl PvDatabase {
         // wired to scaler `.COUTP` is processed with the scaler not yet armed
         // (scalerRecord.c:623-624, before the `:637` REQSTART).
         let mut special_actions = Vec::new();
-        let common_result = {
-            let mut instance = rec.write().await;
+        let mut instance = rec.write().await;
 
+        // C `db_put_process` (db_access.c:1025-1043) returns 1 (didPut) even
+        // when the internal `dbChannelPut` FAILS — a rejected conversion, an
+        // SPC_NOMOD refusal, or an after-put `special()` error all set
+        // `ppn->status = notifyError` yet still `return 1` — so
+        // `processNotifyCommon` (dbNotify.c:243-246) still runs `dbProcess`
+        // when the gate passes. The whole put write is therefore wrapped so
+        // that ANY failure inside it — `dbput_request`, `special()` pass 0,
+        // `put_field`, `special_after_put`, `put_common_field` — is caught at
+        // ONE place below: on the notify path we evaluate the SAME process gate
+        // the success path uses and process the record as a side effect, then
+        // hand the original Err back to the client. On the failing conversion
+        // path no field is written — `dbChannelPut` wrote nothing either.
+        //
+        // On SUCCESS this closure is just C `dbPut`: the monitor posts at its
+        // tail run only when the put fully succeeded (C's `goto done` skips
+        // them on failure).
+        let block_result: CaResult<crate::server::record::CommonFieldPutResult> = (|| {
             // Coerce value to the field's native DBR type (e.g. String → Double for ao.VAL).
             // This matches C EPICS db_put_field() which converts from the CA client's type
             // to the record field's native type.
@@ -1602,7 +1630,32 @@ impl PvDatabase {
             // express "only if it changed", so it over-posts; the mark can.
             emit_cycle_posts(&mut instance);
 
-            common_result
+            Ok(common_result)
+        })();
+
+        // Cause B: a put-NOTIFY whose write was rejected must still process.
+        // C `db_put_process` returned 1 (didPut) despite the failure above, so
+        // `processNotifyCommon` runs `dbProcess` whenever the gate passes.
+        // Reuse the SAME `put_drives_processing_of` gate the success tail uses,
+        // process the record as a side effect, then return the ORIGINAL Err —
+        // the CA layer maps it to PUTFAIL (C `notifyError`) and `put_accepted`
+        // stays False, while STAT/SEVR recompute to match C. The notify path
+        // ONLY: a plain `dbPutField` failure processes nothing (dbAccess.c:1263
+        // processes only when `dbPut` status==0), so `want_notify == false`
+        // keeps its Err-without-process behavior. The instance write lock must
+        // drop before `put_driven_process_already_locked` re-acquires it.
+        let common_result = match block_result {
+            Ok(cr) => {
+                drop(instance);
+                cr
+            }
+            Err(e) => {
+                if want_notify && put_drives_processing_of(&instance, &field) {
+                    drop(instance);
+                    let _ = self.put_driven_process_already_locked(record_name).await;
+                }
+                return Err(e);
+            }
         };
         // ASG-field change re-evaluation hook. C
         // `asDbLib.c:107-110,144` `asSpcAsCallback` invokes

@@ -1881,6 +1881,28 @@ impl PvDatabase {
                     let inst = &mut *instance;
                     inst.record.check_alarms(&mut inst.common);
                 }
+                // The same `dbPutSpecial(paddr, 1)`-on-reject rule for a field
+                // whose special() clears UDF: C `mbboDirectRecord.c::special`
+                // (after==1, B0..B1F, line 290) sets `prec->udf = FALSE`, and
+                // that special runs UNCONDITIONALLY in `dbPut` (dbAccess.c:1401,
+                // "Always do special processing") even when the value conversion
+                // failed — BEFORE the `if (status) goto done`. So a rejected
+                // `caput -c mbboDirect.Bn 256`/`notanumber` still clears UDF, and
+                // the notify-process that follows recomputes STAT/SEVR to
+                // NO_ALARM instead of the born-UDF INVALID (verified live against
+                // the C softIoc: fresh record → rejected Bn put → NO_ALARM,
+                // udf=0). The success path clears UDF for this same field set via
+                // `is_udf_defining_put` (the `udf = 0` at the tail of the put
+                // body). The primary VAL field is EXCLUDED here: its UDF clear is
+                // `isValueField` (dbAccess.c:1408), which runs AFTER the status
+                // check, so a rejected VAL put keeps UDF — matching C. Only
+                // mbboDirect overrides `is_udf_defining_put` to add non-primary
+                // fields, so this is a no-op for every other record type.
+                if instance.record.is_udf_defining_put(&field)
+                    && field != instance.record.primary_field()
+                {
+                    instance.common.udf = 0;
+                }
                 if want_notify && put_drives_processing_of(&instance, &field) {
                     drop(instance);
                     let _ = self.put_driven_process_already_locked(record_name).await;

@@ -143,6 +143,18 @@ impl Record for LsoRecord {
         Some(self.value_changed)
     }
 
+    /// C `lsoRecord.c:113-115`: `process()` clears `udf` to FALSE only on a
+    /// successful closed-loop DOL fetch (`if (!dbGetLinkLS(...)) prec->udf =
+    /// FALSE;`); with no closed-loop fetch this cycle, `udf` is left
+    /// untouched and `if (prec->udf) recGblSetSevr(UDF_ALARM, ...)` (`:117-118`)
+    /// raises it every cycle for a bare record. `udf` is never re-derived
+    /// from the stored VAL, so lso opts out of the framework's blanket
+    /// per-cycle clear. The definers are a direct VAL put (`dbPut`,
+    /// `field_io.rs`) and the DOL-apply site (`processing.rs`).
+    fn clears_udf(&self) -> bool {
+        false
+    }
+
     fn monitor_always_post(&self) -> (bool, bool) {
         // C `lsoRecord.c` monitor: `if (mpst == menuPost_Always) events |=
         // DBE_VALUE; if (apst == menuPost_Always) events |= DBE_LOG;`.

@@ -185,6 +185,12 @@ const INIT_COMPUTED: &[(&str, &str)] = &[
     // (`aCalcoutRecord.c:186`, `#define VERSION 1.4`) OVERWRITES the `.dbd`'s
     // `initial("1")` at init.
     ("acalcout", "VERS"),
+    // Same for the sibling calc records: `pcalc->vers = VERSION` overwrites the
+    // `.dbd` `initial("1")` at init — scalcout `#define VERSION 4.1`
+    // (`sCalcoutRecord.c:55`), transform `#define VERSION 5.8`
+    // (`transformRecord.c:92`).
+    ("scalcout", "VERS"),
+    ("transform", "VERS"),
     // `asyn.CNCT` is the port connection state, driven by the record's connection
     // management rather than by a declaration default.
     ("asyn", "CNCT"),

@@ -10,6 +10,9 @@ use crate::calc::StringInputs;
 use crate::calc::engine::value::{SCALC_STRING_SIZE, ScalcString};
 use crate::calc::{CompiledExpr, ExprKind, ScalcResult, scalc_perform};
 
+/// Code version reported by `VERS` (C `sCalcoutRecord.c:55 #define VERSION 4.1`).
+const VERSION: f64 = 4.1;
+
 /// Scalcout record — string calc with output.
 ///
 /// Like calcout but uses the string calc engine (sCalcPerform).
@@ -689,6 +692,9 @@ impl Record for ScalcoutRecord {
             "ODLY" => Some(EpicsValue::Double(self.odly)),
             "DLYA" => Some(EpicsValue::Short(self.dlya)),
             "OEVT" => Some(EpicsValue::UShort(self.oevt)),
+            // Fixed code-version constant, C `pcalc->vers = VERSION` in
+            // init_record; never the `.dbd` initial.
+            "VERS" => Some(EpicsValue::Double(VERSION)),
             _ => {
                 if let Some(idx) = Self::var_index(name) {
                     return Some(EpicsValue::Double(self.num_vals[idx]));
@@ -861,6 +867,8 @@ impl Record for ScalcoutRecord {
                     as u16;
                 Ok(())
             }
+            // VERS is a fixed code-version constant; accept and ignore writes.
+            "VERS" => Ok(()),
             _ => {
                 if let Some(idx) = Self::var_index(name) {
                     self.num_vals[idx] = value
@@ -1096,6 +1104,18 @@ mod tests {
                 "{name} exposes the link-status choice labels"
             );
         }
+    }
+
+    /// VERS is the code-version constant (C `sCalcoutRecord.c:55 #define
+    /// VERSION 4.1`, written `pcalc->vers = VERSION` in init_record), NOT the
+    /// `.dbd` `initial("1")`. A write is accepted-and-ignored, matching
+    /// acalcout.
+    #[test]
+    fn vers_is_the_version_constant_and_ignores_writes() {
+        let mut rec = ScalcoutRecord::new();
+        assert_eq!(rec.get_field("VERS"), Some(EpicsValue::Double(4.1)));
+        assert!(rec.put_field("VERS", EpicsValue::Double(99.0)).is_ok());
+        assert_eq!(rec.get_field("VERS"), Some(EpicsValue::Double(4.1)));
     }
 
     /// R9-74 (family): OOPT="On Change" is the numeric MDEL deadband test

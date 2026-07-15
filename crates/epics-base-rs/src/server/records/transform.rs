@@ -11,6 +11,9 @@ use super::link_status::{LINK_CON, LINK_STATUS_CHOICES};
 
 const NUM_CHANNELS: usize = 16; // A-P
 
+/// Code version reported by `VERS` (C `transformRecord.c:92 #define VERSION 5.8`).
+const VERSION: f64 = 5.8;
+
 /// Transform record — 16 input/output channels (A-P), each with its own calc expression.
 ///
 /// Processing: reads inputs via INPA-INPP links, evaluates CLCA-CLCP expressions
@@ -472,6 +475,11 @@ impl Record for TransformRecord {
         if name == "PREC" {
             return Some(EpicsValue::Short(self.prec));
         }
+        if name == "VERS" {
+            // Fixed code-version constant, C `ptran->vers = VERSION` in
+            // init_record; never the `.dbd` initial.
+            return Some(EpicsValue::Double(VERSION));
+        }
         if let Some(idx) = Self::channel_index(name) {
             return Some(EpicsValue::Double(self.vals[idx]));
         }
@@ -530,6 +538,10 @@ impl Record for TransformRecord {
                 }
                 _ => return Err(CaError::TypeMismatch("PREC".into())),
             }
+        }
+        if name == "VERS" {
+            // VERS is a fixed code-version constant; accept and ignore writes.
+            return Ok(());
         }
         if let Some(idx) = Self::channel_index(name) {
             self.vals[idx] = value
@@ -810,6 +822,18 @@ mod tests {
         assert!(!TransformRecord::is_link_status_field("IVLA"));
         assert!(!TransformRecord::is_link_status_field("LAV"));
         assert!(!TransformRecord::is_link_status_field("INPA"));
+    }
+
+    /// VERS is the code-version constant (C `transformRecord.c:92 #define
+    /// VERSION 5.8`, written `ptran->vers = VERSION` in init_record), NOT the
+    /// `.dbd` `initial("1")`. A write is accepted-and-ignored, matching
+    /// acalcout.
+    #[test]
+    fn vers_is_the_version_constant_and_ignores_writes() {
+        let mut rec = TransformRecord::new();
+        assert_eq!(rec.get_field("VERS"), Some(EpicsValue::Double(5.8)));
+        assert!(rec.put_field("VERS", EpicsValue::Double(99.0)).is_ok());
+        assert_eq!(rec.get_field("VERS"), Some(EpicsValue::Double(5.8)));
     }
 
     /// C's `init_record` tail, `*plvalue = *pvalue` (`transformRecord.c:490`).

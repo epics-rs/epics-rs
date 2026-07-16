@@ -345,25 +345,84 @@ mod tests {
         }
     }
 
+    /// Env var marking "this process is the isolated child `run_isolated`
+    /// spawned; run the real test body instead of spawning another one."
+    const ISOLATION_CHILD_MARKER: &str = "EPICS_TOOLS_RS_DAEMON_SIGNAL_TEST_CHILD";
+
+    /// The tests below all mutate or inspect process-wide signal
+    /// dispositions through [`install_signal_handlers`]'s raw `sigaction`
+    /// calls, and each assumes it starts from that state fresh (e.g.
+    /// `sigxfsz_is_ignored_in_daemon_mode`'s `SIG_DFL` precondition). That
+    /// assumption is only true with one process per test — `cargo
+    /// nextest` gives that, but plain `cargo test` runs every test in
+    /// this binary as OS threads inside one shared process.
+    ///
+    /// Worse than an ordinary data race: `tokio::signal::unix::signal`
+    /// (used for SIGINT in daemon mode) installs its OS-level handler via
+    /// `signal-hook-registry`, which sets up its `sigaction` trampoline
+    /// exactly ONCE per signal number for the life of the process and
+    /// never re-installs or reverts it afterward (see its own
+    /// `unregister` docs). Once a *different* test's raw
+    /// `nix::sys::signal::signal(SIGINT, SigIgn)` (foreground mode) has
+    /// stomped that trampoline in a shared process, no later
+    /// `tokio::signal::unix::signal` call — nor a mutex, nor resetting
+    /// the disposition by hand — brings it back: the registry believes
+    /// its handler is already installed and won't touch `sigaction`
+    /// again. Only a fresh process per test avoids this, so `run_isolated`
+    /// re-execs this test binary for exactly one named test (`--exact`)
+    /// in a child process and asserts it exited cleanly, reproducing
+    /// nextest's process-per-test guarantee without depending on it being
+    /// installed. `Command::spawn` (fork+exec) is used rather than a bare
+    /// `fork()`, which would be unsafe here — this binary's other tests
+    /// run concurrently on other OS threads, and forking a multithreaded
+    /// process risks the child inheriting a lock (e.g. the allocator's)
+    /// held by a thread that no longer exists to release it.
+    fn run_isolated(test_name: &str, body: impl FnOnce()) {
+        if std::env::var_os(ISOLATION_CHILD_MARKER).is_some() {
+            body();
+            return;
+        }
+        let exe = std::env::current_exe().expect("current test exe");
+        let output = std::process::Command::new(exe)
+            .args(["--exact", test_name])
+            .env(ISOLATION_CHILD_MARKER, "1")
+            .output()
+            .expect("spawn isolated signal-disposition test process");
+        assert!(
+            output.status.success(),
+            "{test_name} failed in its isolated child process ({}):\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+        );
+    }
+
     /// R6-25 / C `procServ.cc:503-509`: foreground mode sets SIGINT and
     /// SIGQUIT to `SIG_IGN`. `Ctrl-C` and `Ctrl-\` at a `procserv-rs -f`
     /// prompt are the console client's keystrokes; they must not shut
     /// the supervisor down (SIGINT) or core-dump it (SIGQUIT's default).
-    ///
-    /// nextest runs each test in its own process, so mutating this
-    /// process's dispositions is contained.
-    #[tokio::test]
-    async fn foreground_mode_ignores_sigint_and_sigquit() {
-        let _shutdown = install_signal_handlers(true).await;
-        assert_eq!(
-            disposition(libc::SIGINT),
-            libc::SIG_IGN,
-            "foreground mode must ignore SIGINT (C procServ.cc:504-505)"
-        );
-        assert_eq!(
-            disposition(libc::SIGQUIT),
-            libc::SIG_IGN,
-            "foreground mode must ignore SIGQUIT (C procServ.cc:506-507)"
+    #[test]
+    fn foreground_mode_ignores_sigint_and_sigquit() {
+        run_isolated(
+            "procserv::daemon::tests::foreground_mode_ignores_sigint_and_sigquit",
+            || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build isolated test runtime")
+                    .block_on(async {
+                        let _shutdown = install_signal_handlers(true).await;
+                        assert_eq!(
+                            disposition(libc::SIGINT),
+                            libc::SIG_IGN,
+                            "foreground mode must ignore SIGINT (C procServ.cc:504-505)"
+                        );
+                        assert_eq!(
+                            disposition(libc::SIGQUIT),
+                            libc::SIG_IGN,
+                            "foreground mode must ignore SIGQUIT (C procServ.cc:506-507)"
+                        );
+                    });
+            },
         );
     }
 
@@ -372,30 +431,52 @@ mod tests {
     /// `RLIMIT_FSIZE` (a `ulimit -f`-capped log) must fail with `EFBIG`,
     /// not kill the supervisor, and the child must inherit the ignored
     /// disposition through `execvp`.
-    #[tokio::test]
-    async fn sigxfsz_is_ignored_in_daemon_mode() {
-        assert_eq!(
-            disposition(libc::SIGXFSZ),
-            libc::SIG_DFL,
-            "precondition: SIGXFSZ starts at its default disposition"
-        );
-        let _shutdown = install_signal_handlers(false).await;
-        assert_eq!(
-            disposition(libc::SIGXFSZ),
-            libc::SIG_IGN,
-            "SIGXFSZ must be ignored in the parent (C procServ.cc:502-503)"
+    #[test]
+    fn sigxfsz_is_ignored_in_daemon_mode() {
+        run_isolated(
+            "procserv::daemon::tests::sigxfsz_is_ignored_in_daemon_mode",
+            || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build isolated test runtime")
+                    .block_on(async {
+                        assert_eq!(
+                            disposition(libc::SIGXFSZ),
+                            libc::SIG_DFL,
+                            "precondition: SIGXFSZ starts at its default disposition"
+                        );
+                        let _shutdown = install_signal_handlers(false).await;
+                        assert_eq!(
+                            disposition(libc::SIGXFSZ),
+                            libc::SIG_IGN,
+                            "SIGXFSZ must be ignored in the parent (C procServ.cc:502-503)"
+                        );
+                    });
+            },
         );
     }
 
     /// Same set in foreground mode — the C call sits above the `inFgMode`
     /// block, so both modes must land on `SIG_IGN`.
-    #[tokio::test]
-    async fn sigxfsz_is_ignored_in_foreground_mode() {
-        let _shutdown = install_signal_handlers(true).await;
-        assert_eq!(
-            disposition(libc::SIGXFSZ),
-            libc::SIG_IGN,
-            "SIGXFSZ must be ignored in foreground mode too"
+    #[test]
+    fn sigxfsz_is_ignored_in_foreground_mode() {
+        run_isolated(
+            "procserv::daemon::tests::sigxfsz_is_ignored_in_foreground_mode",
+            || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build isolated test runtime")
+                    .block_on(async {
+                        let _shutdown = install_signal_handlers(true).await;
+                        assert_eq!(
+                            disposition(libc::SIGXFSZ),
+                            libc::SIG_IGN,
+                            "SIGXFSZ must be ignored in foreground mode too"
+                        );
+                    });
+            },
         );
     }
 
@@ -403,24 +484,35 @@ mod tests {
     /// installs neither `SIG_IGN`, so SIGINT stays a shutdown trigger
     /// (tokio installs its own handler — the disposition is neither
     /// `SIG_IGN` nor `SIG_DFL`) and SIGQUIT keeps its default.
-    #[tokio::test]
-    async fn daemon_mode_keeps_sigint_as_shutdown_and_sigquit_default() {
-        let _shutdown = install_signal_handlers(false).await;
-        let sigint = disposition(libc::SIGINT);
-        assert_ne!(
-            sigint,
-            libc::SIG_IGN,
-            "daemon mode must not ignore SIGINT — it is a shutdown trigger"
-        );
-        assert_ne!(
-            sigint,
-            libc::SIG_DFL,
-            "daemon mode installs a SIGINT handler for graceful shutdown"
-        );
-        assert_eq!(
-            disposition(libc::SIGQUIT),
-            libc::SIG_DFL,
-            "C leaves SIGQUIT alone outside foreground mode"
+    #[test]
+    fn daemon_mode_keeps_sigint_as_shutdown_and_sigquit_default() {
+        run_isolated(
+            "procserv::daemon::tests::daemon_mode_keeps_sigint_as_shutdown_and_sigquit_default",
+            || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build isolated test runtime")
+                    .block_on(async {
+                        let _shutdown = install_signal_handlers(false).await;
+                        let sigint = disposition(libc::SIGINT);
+                        assert_ne!(
+                            sigint,
+                            libc::SIG_IGN,
+                            "daemon mode must not ignore SIGINT — it is a shutdown trigger"
+                        );
+                        assert_ne!(
+                            sigint,
+                            libc::SIG_DFL,
+                            "daemon mode installs a SIGINT handler for graceful shutdown"
+                        );
+                        assert_eq!(
+                            disposition(libc::SIGQUIT),
+                            libc::SIG_DFL,
+                            "C leaves SIGQUIT alone outside foreground mode"
+                        );
+                    });
+            },
         );
     }
 }

@@ -2083,8 +2083,29 @@ fn read_paren_string_list(
 mod tests {
     use super::*;
 
+    /// [`AS_CHECK_CLIENT_IP`] is a process-global flag, mirroring C's
+    /// global IOC variable — every `parse_acf` call whose ACF has a
+    /// `HAG(...)` block reads it via [`hag_members`]. Rust's default test
+    /// runner runs every `#[test]` fn in this module concurrently on its
+    /// own thread, so without serialization a test that never touches the
+    /// flag can still observe a value flipped mid-flight by a sibling
+    /// test's `set_as_check_client_ip(true)` / `(false)` window — that
+    /// race is what turned `"host1"` into `"unresolved:host1"` under plain
+    /// `cargo test`. Every test that reads or writes the flag (directly,
+    /// or by parsing an ACF containing a `HAG` block) takes this lock for
+    /// its whole body so at most one such test runs at a time; poisoning
+    /// is ignored so one test's panic doesn't cascade-fail its siblings.
+    static AS_CHECK_CLIENT_IP_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_as_check_client_ip() -> std::sync::MutexGuard<'static, ()> {
+        AS_CHECK_CLIENT_IP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn test_parse_acf_basic() {
+        let _guard = lock_as_check_client_ip();
         let acf = r#"
 UAG(admins) { user1, user2 }
 HAG(operators) { host1, host2 }
@@ -2102,6 +2123,7 @@ ASG(DEFAULT) {
 
     #[test]
     fn test_parse_acf_hag_uag() {
+        let _guard = lock_as_check_client_ip();
         // Use `.invalid` so DNS resolution is guaranteed to fail
         // (RFC 6761 — every resolver returns NXDOMAIN). This isolates
         // the test from `expand_hag_members`' soft-DNS path: the
@@ -2130,6 +2152,7 @@ ASG(SECURE) {
     /// server keyed ACF on the peer IP. Both halves are C's now.
     #[test]
     fn hag_stores_names_by_default() {
+        let _guard = lock_as_check_client_ip();
         set_as_check_client_ip(false);
         let acf = r#"
 HAG(local) { LocalHost }
@@ -2160,6 +2183,7 @@ ASG(DEFAULT) {
     /// on the peer IP.
     #[test]
     fn hag_stores_resolved_ips_under_as_check_client_ip() {
+        let _guard = lock_as_check_client_ip();
         set_as_check_client_ip(true);
         let acf = r#"
 HAG(local) { localhost }
@@ -2186,6 +2210,7 @@ ASG(DEFAULT) {
     /// sentinel that simply never matches.
     #[test]
     fn hag_unresolvable_under_as_check_client_ip_becomes_sentinel() {
+        let _guard = lock_as_check_client_ip();
         set_as_check_client_ip(true);
         let config = parse_acf("HAG(lab) { lab-pc1.invalid }\n").unwrap();
         set_as_check_client_ip(false);
@@ -2194,6 +2219,7 @@ ASG(DEFAULT) {
 
     #[test]
     fn hag_unresolvable_name_does_not_abort_parser() {
+        let _guard = lock_as_check_client_ip();
         // `.invalid` TLD guarantees NXDOMAIN (RFC 6761). Pre-fix
         // upstream would `abort()` here; we keep the literal entries
         // verbatim — no resolved IPs are appended and the parser
@@ -2250,6 +2276,7 @@ ASG(READONLY) {
 
     #[test]
     fn test_check_access_hag_uag_match() {
+        let _guard = lock_as_check_client_ip();
         let acf = r#"
 UAG(ops) { alice }
 HAG(lab) { lab-pc1 }
@@ -2478,6 +2505,7 @@ ASG(MIXED_CASE) {
     /// denies, matching a C IOC whose only ASG is the empty DEFAULT.
     #[test]
     fn empty_acf_denies_all_access() {
+        let _guard = lock_as_check_client_ip();
         for acf in ["", "# just a comment\n", "UAG(ops){alice}\nHAG(h){pc1}\n"] {
             let config = parse_acf(acf).unwrap();
             assert_eq!(
@@ -2670,6 +2698,7 @@ ASG(DEFAULT) { RULE(1, READ) }
 
     #[test]
     fn hag_host_match_is_case_insensitive() {
+        let _guard = lock_as_check_client_ip();
         let acf = r#"
 HAG(lab) { LabPC1.invalid }
 ASG(C) {

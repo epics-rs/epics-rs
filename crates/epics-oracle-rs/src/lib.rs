@@ -69,8 +69,9 @@ pub use surface::{Coverage, Surface};
 /// C's `asynRecord` refuses to `init_record` against an empty PORT
 /// (`connectDevice` finds no port and the record errors out), so a bare
 /// `record(asyn, "…") {}` cannot be swept. Both sides therefore pin the same
-/// port name here: the Rust `oracle_ioc` registers a `NullOctetPort` under it,
-/// and the C st.cmd creates a matching port before `iocInit`.
+/// port name here: the Rust `oracle_ioc` registers a disconnected
+/// `DrvAsynIPPort` under it, and the C st.cmd creates a matching port before
+/// `iocInit`.
 pub const ORACLE_ASYN_PORT: &str = "ORACLEASYN";
 
 /// One `record(type, "name") { … }` statement for a reproducer `.db`.
@@ -88,4 +89,24 @@ pub fn record_stmt(record_type: &str, rec_name: &str) -> String {
     } else {
         format!("record({record_type}, \"{rec_name}\") {{}}\n")
     }
+}
+
+/// Whether the oracle's **put** phase can yield a comparable C-vs-Rust verdict
+/// for a record type.
+///
+/// `asyn` is the sole exception. Its writable fields drive async device I/O
+/// whose `ca_put_callback` never completes against the deliberately
+/// disconnected `ORACLEASYN` port (see [`ORACLE_ASYN_PORT`]) — on *both* sides —
+/// so every asyn put times out and errors instead of producing a comparison.
+/// A connected loopback would make them measurable but inject socket-timing
+/// nondeterminism into the oracle, so `asyn` is a read/monitor-only record here.
+///
+/// This is NOT the "exit 0 when you could not look" anti-pattern the harness
+/// exists to prevent: the omission is explicit (this predicate), loud (the put
+/// dispatch logs each skip by name), and scoped to one record type whose put
+/// surface was deliberately placed out of scope — not a silent blind spot.
+/// The caller MUST log when this returns `false` so a skipped phase is never
+/// mistaken for a measured-clean one.
+pub fn puts_are_measurable(record_type: &str) -> bool {
+    record_type != "asyn"
 }

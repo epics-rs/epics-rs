@@ -111,7 +111,20 @@ async fn run() -> Result<ExitCode, String> {
             cases.extend(runner.probe_reads(rt, &surface, &mut allowlist));
         }
         if matches!(args.phase, Phase::Put | Phase::All) {
-            cases.extend(runner.probe_puts(rt, &surface, &mut allowlist, args.max_put_cases));
+            if epics_oracle_rs::puts_are_measurable(rt) {
+                cases.extend(runner.probe_puts(rt, &surface, &mut allowlist, args.max_put_cases));
+            } else {
+                // Loud, by-policy skip — NOT a silent false-clean. See
+                // `puts_are_measurable`: this record's puts cannot complete
+                // against the disconnected ORACLEASYN port, so driving them
+                // would only manufacture timeouts. The omission is declared
+                // here so a clean `--phase all` exit never implies asyn puts
+                // were measured.
+                eprintln!(
+                    "    put phase skipped for {rt}: read/monitor-only \
+                     (unmeasurable against the disconnected ORACLEASYN port)"
+                );
+            }
         }
         if matches!(args.phase, Phase::Monitor | Phase::All) {
             cases.extend(runner.probe_monitor(rt, &surface, &mut allowlist));

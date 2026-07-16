@@ -11,7 +11,8 @@ use std::process::ExitCode;
 use clap::{Parser, ValueEnum};
 use epics_oracle_rs::allowlist::Allowlist;
 use epics_oracle_rs::dbd::Dbd;
-use epics_oracle_rs::ioc::CTools;
+use epics_oracle_rs::ioc::{CTools, PvxTools};
+use epics_oracle_rs::pvaread;
 use epics_oracle_rs::report::{Counts, Denominator, Report, StaleRow};
 use epics_oracle_rs::runner::{Runner, select_types, workdir};
 use epics_oracle_rs::surface::{Coverage, Surface, probe_supported_record_types};
@@ -25,6 +26,14 @@ enum Phase {
     Put,
     /// Monitor event sequence and count.
     Monitor,
+    /// **PVA** read skeleton: `pvxget` each record on pvxs QSRV2
+    /// (`softIocPVX`) and on `oracle-ioc --pva`, and diff the text.
+    ///
+    /// Deliberately outside `All`. `All` means "every CA phase", and its
+    /// coverage number is a percentage of the `.dbd` denominator; this phase
+    /// has no denominator yet, so folding it in would let a hand-picked
+    /// record-type list borrow the credibility of an enumerated surface.
+    PvaRead,
     All,
 }
 
@@ -75,6 +84,10 @@ async fn main() -> ExitCode {
 
 async fn run() -> Result<ExitCode, String> {
     let args = Args::parse();
+
+    if args.phase == Phase::PvaRead {
+        return run_pva_read(&args);
+    }
 
     // Ground truth must exist. Without it there is nothing to diff against, and
     // pretending otherwise would be the worst possible failure mode.
@@ -197,6 +210,46 @@ async fn run() -> Result<ExitCode, String> {
     println!("{}", report.human());
 
     // A DEFECT or an ERROR both fail the run. "Could not measure" is not a pass.
+    let ok = report.counts.defect == 0 && report.counts.errored == 0;
+    Ok(if ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
+}
+
+/// The PVA read skeleton. Its own path rather than a branch inside the CA run:
+/// it has a different ground truth (pvxs `softIocPVX`, not base's `softIoc`), a
+/// different instrument (`pvxget`, not `caget`), and no `.dbd` denominator — so
+/// the `.dbd`/allowlist/coverage machinery above has nothing to say about it,
+/// and pretending otherwise is how a skeleton starts reporting numbers it has
+/// not earned.
+fn run_pva_read(args: &Args) -> Result<ExitCode, String> {
+    let tools = PvxTools::discover().map_err(|e| e.to_string())?;
+
+    let types: Vec<String> = match &args.record_types {
+        Some(rts) => rts.clone(),
+        None => pvaread::SKELETON_TYPES
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+    };
+    eprintln!(
+        "pva read skeleton: {} record types (hand-picked, NOT an enumerated surface)",
+        types.len()
+    );
+
+    let report = pvaread::probe(&tools, &workdir(None)?, &types);
+    report.counts.check()?;
+
+    if let Some(p) = &args.json {
+        std::fs::write(p, report.to_json()).map_err(|e| format!("write {}: {e}", p.display()))?;
+        eprintln!("wrote {}", p.display());
+    }
+    println!("{}", report.human());
+
+    // Same rule as the CA phases: a case that could not run fails the run
+    // exactly like a wrong one.
     let ok = report.counts.defect == 0 && report.counts.errored == 0;
     Ok(if ok {
         ExitCode::SUCCESS

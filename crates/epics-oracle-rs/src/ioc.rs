@@ -376,6 +376,34 @@ impl Drop for CIoc {
     }
 }
 
+/// Which protocol a [`RustIoc`] serves.
+///
+/// The port line is per-protocol on purpose. A CA port and a PVA UDP search
+/// port are not interchangeable, and a harness that read one and aimed the
+/// other's client at it would score every case ERROR for a reason that looks
+/// like a port bug rather than a wiring mistake. Distinct names make that
+/// mistake a parse failure at boot instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RustMode {
+    Ca,
+    Pva,
+}
+
+impl RustMode {
+    fn flag(self) -> Option<&'static str> {
+        match self {
+            RustMode::Ca => None,
+            RustMode::Pva => Some("--pva"),
+        }
+    }
+    fn port_line(self) -> &'static str {
+        match self {
+            RustMode::Ca => "ORACLE_IOC_PORT",
+            RustMode::Pva => "ORACLE_IOC_PVA_PORT",
+        }
+    }
+}
+
 /// The Rust IOC (`oracle-ioc` binary), booted on the same `.db`.
 ///
 /// Runs as a subprocess rather than in-process so that both sides of the pair
@@ -416,27 +444,45 @@ impl RustIoc {
         })
     }
 
+    /// Boot the CA side, reporting the bound CA port.
     pub fn boot(db: &Path) -> Result<Self, BootError> {
+        Self::boot_mode(db, RustMode::Ca)
+    }
+
+    /// Boot the **PVA** side, reporting the bound UDP search port.
+    ///
+    /// Same binary, same `.db`, same bind-and-read-back discipline — only the
+    /// protocol and the port line differ (see [`RustMode`]).
+    pub fn boot_pva(db: &Path) -> Result<Self, BootError> {
+        Self::boot_mode(db, RustMode::Pva)
+    }
+
+    fn boot_mode(db: &Path, mode: RustMode) -> Result<Self, BootError> {
         let bin = Self::binary()?;
-        let mut child = Command::new(&bin)
-            .arg("--db")
-            .arg(db)
+        let mut cmd = Command::new(&bin);
+        cmd.arg("--db").arg(db);
+        if let Some(flag) = mode.flag() {
+            cmd.arg(flag);
+        }
+        let mut child = cmd
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| BootError(format!("spawn {}: {e}", bin.display())))?;
+        let port_line = mode.port_line();
 
         let stdout = child.stdout.take().expect("piped");
         let stderr = child.stderr.take().expect("piped");
 
-        // The Rust IOC prints `ORACLE_IOC_PORT <p>` after the socket is bound,
-        // so the number is read back from the bind, never predicted.
+        // The Rust IOC prints `<port_line> <p>` after the socket is bound, so
+        // the number is read back from the bind, never predicted.
         let (tx, rx) = mpsc::channel::<Result<u16, String>>();
         let ttx = tx.clone();
+        let prefix = format!("{port_line} ");
         std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                if let Some(p) = line.strip_prefix("ORACLE_IOC_PORT ") {
+                if let Some(p) = line.strip_prefix(&prefix) {
                     let parsed = p
                         .trim()
                         .parse::<u16>()
@@ -445,9 +491,9 @@ impl RustIoc {
                     return;
                 }
             }
-            let _ = ttx.send(Err(
-                "oracle-ioc closed stdout without reporting a port".into()
-            ));
+            let _ = ttx.send(Err(format!(
+                "oracle-ioc closed stdout without reporting a `{port_line}` port"
+            )));
         });
         // Capture stderr so a panic/failure has a diagnosable message rather
         // than a bare timeout.
@@ -574,6 +620,301 @@ fn wait_reachable(tools: &CTools, port: u16, side: Side, probe_pv: &str) -> Resu
         }
         std::thread::sleep(backoff.min(left));
         backoff = (backoff * 2).min(REACHABLE_BACKOFF_MAX);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The PVA pair: pvxs QSRV2 (`softIocPVX`) vs `oracle-ioc --pva`.
+// ---------------------------------------------------------------------------
+
+/// Paths to the built pvxs tree — the PVA reference side and its client tools.
+///
+/// The same refusal-to-invent as [`CTools`]: an absent tree is an ERROR at
+/// startup, not a skipped-and-passed run.
+#[derive(Debug, Clone)]
+pub struct PvxTools {
+    /// pvxs client tools (`pvxget`/`pvxinfo`/`pvxlist`) — the instrument both
+    /// sides are driven through.
+    pub bin: PathBuf,
+    /// pvxs QSRV2's IOC binary — the PVA ground truth.
+    pub ioc_bin: PathBuf,
+    /// A deliberately **quiet** port for the client tools to receive beacons
+    /// on (`EPICS_PVA_BROADCAST_PORT`).
+    ///
+    /// A pvxs client always binds that port and listens for beacons
+    /// (`client.cpp:641`), and `pvxlist` reports servers it learns about
+    /// *from beacons* as well as from searches ("Monitor server beacons to
+    /// detect servers coming online"). Left at pvxs's default the client
+    /// would hear every PVA server on this host — which made
+    /// [`verify_sole_server`] intermittently report a foreign server as a
+    /// second server on our port, an ERROR verdict caused entirely by the
+    /// instrument. (Observed: `2 PVA servers answer on the C side's UDP
+    /// port`, with only our own pair running and nothing else on that port.)
+    ///
+    /// So the tools are pointed at a port nothing beacons to. Nothing else
+    /// should be able to influence a reading; the search target is named
+    /// explicitly in the address list and never comes from here.
+    ///
+    /// It must not be either side's search port: the client *binds* it, and
+    /// the Rust side's kernel-assigned socket is exclusively owned (no
+    /// SO_REUSEPORT), so aiming it there fails the tool outright. Allocated
+    /// like every other port here — by binding.
+    pub beacon_port: u16,
+}
+
+impl PvxTools {
+    pub const DEFAULT_BIN: &'static str = "/home/stevek/work/epics-modules/pvxs/bin/linux-x86_64";
+
+    /// The client tools this harness actually invokes. Verified up front so a
+    /// missing binary is one loud error rather than an "errored" verdict on
+    /// every case.
+    const REQUIRED: [&'static str; 3] = ["pvxget", "pvxinfo", "pvxlist"];
+
+    /// Locate the pvxs tree, honoring `PVXS_BIN`.
+    pub fn discover() -> Result<Self, BootError> {
+        let bin = std::env::var("PVXS_BIN").unwrap_or_else(|_| Self::DEFAULT_BIN.to_string());
+        let bin = PathBuf::from(bin);
+        if !bin.is_dir() {
+            return err(format!(
+                "pvxs bin dir not found at {}. Set PVXS_BIN to the built \
+                 linux-x86_64 bin dir. The PVA oracle cannot run without ground truth.",
+                bin.display()
+            ));
+        }
+        for tool in Self::REQUIRED {
+            if !bin.join(tool).is_file() {
+                return err(format!("missing pvxs tool `{tool}` in {}", bin.display()));
+            }
+        }
+        let ioc_bin = bin.join("softIocPVX");
+        if !ioc_bin.is_file() {
+            return err(format!(
+                "pvxs `softIocPVX` not found at {}. The PVA oracle cannot run \
+                 without ground truth.",
+                ioc_bin.display()
+            ));
+        }
+        let beacon_port = alloc_free_port()?;
+        Ok(Self {
+            bin,
+            ioc_bin,
+            beacon_port,
+        })
+    }
+}
+
+/// pvxs QSRV2's `softIocPVX`, booted on the given `.db`. PVA ground truth.
+pub struct PvxIoc {
+    port: u16,
+    child: Child,
+}
+
+impl PvxIoc {
+    /// Boot `softIocPVX` serving `db`, loopback-isolated, on a UDP search port
+    /// nothing else holds.
+    pub fn boot(tools: &PvxTools, db: &Path) -> Result<Self, BootError> {
+        let mut last = String::new();
+        for _ in 0..BOOT_ATTEMPTS {
+            let udp = alloc_free_port()?;
+            let ca = alloc_free_port()?;
+            match Self::try_boot(tools, db, udp, ca) {
+                Ok(ioc) => return Ok(ioc),
+                Err(BootError(e)) if e.contains("PORT_COLLISION") => {
+                    last = e;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        err(format!(
+            "softIocPVX could not get an exclusive port in {BOOT_ATTEMPTS} attempts: {last}"
+        ))
+    }
+
+    fn try_boot(tools: &PvxTools, db: &Path, udp: u16, ca: u16) -> Result<Self, BootError> {
+        let mut child = Command::new(&tools.ioc_bin)
+            .arg("-S") // no interactive shell
+            .arg("-d")
+            .arg(db)
+            // --- PVA server, loopback only. Names verified against pvxs
+            // `src/config.cpp:402-432`, not guessed. ---
+            .env("EPICS_PVAS_INTF_ADDR_LIST", "127.0.0.1")
+            .env("EPICS_PVAS_BEACON_ADDR_LIST", "127.0.0.1")
+            // Refuse auto-beaconing outright, so no frame reaches a real
+            // subnet (`config.cpp:430`).
+            .env("EPICS_PVAS_AUTO_BEACON_ADDR_LIST", "NO")
+            .env("EPICS_PVAS_BROADCAST_PORT", udp.to_string())
+            // TCP is the one port that needs no allocation: pvxs binds `:0`
+            // and stamps the real port back (`server.cpp:484`), then
+            // advertises it in the search reply. A number nobody chose cannot
+            // be a number somebody else took.
+            .env("EPICS_PVAS_SERVER_PORT", "0")
+            // --- CA server. softIocPVX links base's rsrv, which binds CA
+            // 5064 by default: left alone it would fight the host's real IOCs
+            // and both sides of this pair would collide on it (measured — the
+            // `cas WARNING` in a two-IOC PVA run is CA's, not PVA's). No CA is
+            // measured in this phase; the ports exist only to keep it off
+            // 5064. ---
+            .env("EPICS_CAS_INTF_ADDR_LIST", "127.0.0.1")
+            .env("EPICS_CAS_BEACON_ADDR_LIST", "127.0.0.1")
+            .env("EPICS_CA_SERVER_PORT", ca.to_string())
+            .env("EPICS_CAS_SERVER_PORT", ca.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| BootError(format!("spawn softIocPVX: {e}")))?;
+
+        // Same ready/collision watch as `CIoc`: softIocPVX prints base's
+        // `iocRun: All initialization complete`. Note what this does NOT buy
+        // us — a *PVA* search-port collision prints nothing at all (see
+        // `PvaPair::boot`), so this watch covers the CA side only.
+        let stdout = child.stdout.take().expect("piped");
+        let stderr = child.stderr.take().expect("piped");
+        let (tx, rx) = mpsc::channel::<BootSignal>();
+        spawn_watcher(stdout, tx.clone());
+        spawn_watcher(stderr, tx);
+
+        let deadline = Instant::now() + BOOT_TIMEOUT;
+        let mut ready = false;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                let _ = child.kill();
+                return err(format!(
+                    "softIocPVX did not report ready within {BOOT_TIMEOUT:?} on UDP {udp}"
+                ));
+            }
+            match rx.recv_timeout(left) {
+                Ok(BootSignal::PortCollision(line)) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return err(format!("PORT_COLLISION on CA {ca}: {line}"));
+                }
+                Ok(BootSignal::Ready) => {
+                    ready = true;
+                    break;
+                }
+                Ok(BootSignal::Other) => continue,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        if !ready {
+            let status = child.try_wait().ok().flatten();
+            let _ = child.kill();
+            return err(format!(
+                "softIocPVX exited during boot (status {status:?}) — db rejected?"
+            ));
+        }
+        Ok(Self { port: udp, child })
+    }
+}
+
+impl Ioc for PvxIoc {
+    fn port(&self) -> u16 {
+        self.port
+    }
+    fn side(&self) -> Side {
+        Side::C
+    }
+}
+
+impl Drop for PvxIoc {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// The booted PVA differential pair: the same `.db` on both sides, each on its
+/// own **proven-exclusive** UDP search port.
+pub struct PvaPair {
+    pub c: PvxIoc,
+    pub rust: RustIoc,
+}
+
+impl PvaPair {
+    /// Boot both PVA sides and return only once each is observed reachable
+    /// **and** proven to be the only server on its port.
+    ///
+    /// The exclusivity proof is the part with no CA analogue, and it is not
+    /// belt-and-braces. CA announces a shared UDP port (`cas WARNING: ... two
+    /// or more servers share the same UDP port`), which is what [`CIoc::boot`]
+    /// scans for. A PVA search socket sets `SO_REUSEPORT`, so a second server
+    /// binds the same port **silently** — measured: two `softIocPVX` on one
+    /// port, six `pvxget` of one PV, values `1,2,2,1,1,2`. Both sides here
+    /// serve identical PV names from the same `.db`, so that outcome would
+    /// misattribute readings with nothing in any log to show for it.
+    ///
+    /// There is no output to scan, so exclusivity is established the only way
+    /// left: by measurement. `pvxlist` on each side's port must find exactly
+    /// one server ([`PvaTools::server_count`]).
+    pub fn boot(tools: &PvxTools, db: &Path, probe_pv: &str) -> Result<Self, BootError> {
+        let c = PvxIoc::boot(tools, db)?;
+        let rust = RustIoc::boot_pva(db)?;
+        if c.port() == rust.port() {
+            return err(
+                "pvxs and Rust PVA servers landed on the same UDP search port — \
+                 refusing to run, answers would not be attributable",
+            );
+        }
+        wait_pva_reachable(tools, c.port(), Side::C, probe_pv)?;
+        wait_pva_reachable(tools, rust.port(), Side::Rust, probe_pv)?;
+        verify_sole_server(tools, c.port(), Side::C)?;
+        verify_sole_server(tools, rust.port(), Side::Rust)?;
+        Ok(Self { c, rust })
+    }
+}
+
+/// Poll a known channel through the real pvxs client until it reads, with
+/// bounded retries and exponential backoff. The PVA sibling of
+/// [`wait_reachable`].
+fn wait_pva_reachable(
+    tools: &PvxTools,
+    port: u16,
+    side: Side,
+    probe_pv: &str,
+) -> Result<(), BootError> {
+    let t = crate::pvatool::PvaTools::new(tools, port, side);
+    let deadline = Instant::now() + REACHABLE_TIMEOUT;
+    let mut backoff = REACHABLE_BACKOFF_START;
+    loop {
+        let last = match t.pvxget(probe_pv) {
+            Ok(_) => return Ok(()),
+            Err(e) => e.message,
+        };
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return err(format!(
+                "{side} PVA server did not become reachable within {REACHABLE_TIMEOUT:?} \
+                 (probe {probe_pv}: {last})"
+            ));
+        }
+        std::thread::sleep(backoff.min(left));
+        backoff = (backoff * 2).min(REACHABLE_BACKOFF_MAX);
+    }
+}
+
+/// Prove exactly one PVA server answers on `port`. See [`PvaPair::boot`] for
+/// why this is mandatory rather than defensive.
+fn verify_sole_server(tools: &PvxTools, port: u16, side: Side) -> Result<(), BootError> {
+    let t = crate::pvatool::PvaTools::new(tools, port, side);
+    match t.server_count() {
+        Ok(1) => Ok(()),
+        Ok(n) => err(format!(
+            "{n} PVA servers answer on the {side} side's UDP port {port} — refusing to \
+             run. A PVA port collision binds silently (SO_REUSEPORT), and both sides \
+             serve the same PV names, so readings here would be misattributed rather \
+             than failed."
+        )),
+        // Not "assume one": the side was reachable a moment ago, so a
+        // countless port is an unexplained change, and this harness does not
+        // score what it could not measure.
+        Err(e) => err(format!(
+            "could not count the PVA servers on the {side} side's UDP port {port}, so \
+             exclusivity is unproven and no reading from it is attributable: {e}"
+        )),
     }
 }
 

@@ -721,6 +721,15 @@ pub(crate) fn field_desc_of<R: Record + ?Sized>(
 /// Order is C's: the field's own `menu()` from the declaration, then the
 /// record's hand table where the `.dbd` does not reach (the downstream crates'
 /// record types), then the `dbCommon` menus.
+///
+/// The last step — [`shared_menu_choices`](super::menu_choices::shared_menu_choices)
+/// — is a heuristic keyed on the field NAME (`OSV`, `SIMS`, `HHSV`, …), so it is
+/// consulted ONLY when the field's declaration does not already pin a non-menu
+/// type: a menu is served as `DBR_ENUM`, so a field DECLARED `DBF_STRING` is
+/// never a menu. Without this gate scalcout's string `OSV` ("Output string
+/// value") matched the name-based `menuAlarmSevr` entry a same-named bi/bo
+/// severity field owns, and `caput SCALCOUT.OSV <string>` was rejected with
+/// `S_db_badChoice` where C accepts the string.
 pub(crate) fn menu_choices_of<R: Record + ?Sized>(
     record: &R,
     field: &str,
@@ -731,10 +740,18 @@ pub(crate) fn menu_choices_of<R: Record + ?Sized>(
     if field.eq_ignore_ascii_case("DTYP") {
         return super::dbd_generated::device_menu(record.record_type());
     }
-    field_desc_of(record, field)
-        .and_then(|f| f.menu)
+    let desc = field_desc_of(record, field);
+    desc.and_then(|f| f.menu)
         .or_else(|| record.menu_field_choices(field))
-        .or_else(|| super::menu_choices::shared_menu_choices(field))
+        .or_else(|| {
+            // Name-based fallback — but the declared type wins: a `DBF_STRING`
+            // field is not a menu even when a same-named field elsewhere is.
+            if desc.is_some_and(|f| f.dbf_type == DbFieldType::String) {
+                None
+            } else {
+                super::menu_choices::shared_menu_choices(field)
+            }
+        })
 }
 
 /// The `DBF_*` type `field` is SERVED as, for a caller that holds only a
@@ -2695,6 +2712,10 @@ impl RecordInstance {
                 // sources nothing this cycle keeps it (put-defect cluster #3).
                 if let EpicsValue::Char(v) = value {
                     self.common.udf = v;
+                    // Sync a record that shadows UDF in `value_is_undefined()`
+                    // (calc family), so the put wins over its cell on the
+                    // re-derivation UDF's `pp(TRUE)` process triggers next.
+                    self.record.set_udf_from_put(v != 0);
                 }
             }
             "UDFS" => {

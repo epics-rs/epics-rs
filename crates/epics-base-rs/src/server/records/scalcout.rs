@@ -1010,6 +1010,16 @@ impl Record for ScalcoutRecord {
         self.udf
     }
 
+    /// A direct `caput UDF` (or a value-defining put that cleared UDF) must WIN
+    /// over the monotonic [`Self::udf`] cell: C `dbCommon.udf` is one puttable
+    /// byte, so `caput SCALCOUT.UDF 0` stands (C stores 0) even though a fresh
+    /// empty-CALC record is otherwise undefined. Syncing the cell here makes
+    /// [`Self::value_is_undefined`] report the put on the `pp(TRUE)` process
+    /// that follows, while a record with no UDF put stays undefined (init 1).
+    fn set_udf_from_put(&mut self, udf_nonzero: bool) {
+        self.udf = udf_nonzero;
+    }
+
     /// scalcout writes its computed output to the `OUT` link. The
     /// framework's generic multi-output dispatch reads the `OUT` field
     /// for the link string and `OVAL` for the value. Gated on the last
@@ -1149,6 +1159,25 @@ mod tests {
         assert_eq!(rec.get_field("VERS"), Some(EpicsValue::Double(4.1)));
     }
 
+    /// `OSV` ("Output string value") is `DBF_STRING`, not a severity menu: the
+    /// name-based `shared_menu_choices` map lists `OSV` as `menuAlarmSevr` for
+    /// the bi/bo severity field of the same name, but the declared type must
+    /// win so a `caput SCALCOUT.OSV <string>` is not rejected as a bad choice.
+    #[test]
+    fn osv_is_a_string_field_not_a_severity_menu() {
+        use crate::server::record::record_instance::menu_choices_of;
+        let rec = ScalcoutRecord::new();
+        assert_eq!(
+            menu_choices_of(&rec, "OSV"),
+            None,
+            "OSV is DBF_STRING — the name-based severity menu must not apply"
+        );
+        // A real Enum severity field still resolves via the shared map, and
+        // scalcout's own declared menus are unaffected.
+        assert!(menu_choices_of(&rec, "HHSV").is_some());
+        assert!(menu_choices_of(&rec, "OOPT").is_some());
+    }
+
     /// UDF (C `pcalc->udf`) is undefined until a calc successfully defines VAL,
     /// and is cleared MONOTONICALLY: C `sCalcoutRecord.c:356-366` sets
     /// `udf=FALSE` only inside the fetch gate on a successful `sCalcPerform`
@@ -1182,6 +1211,35 @@ mod tests {
         assert!(
             !rec.value_is_undefined(),
             "a failed calc after a success leaves UDF cleared, matching C"
+        );
+    }
+
+    /// A direct `caput UDF v` wins over the monotonic cell — C `dbCommon.udf`
+    /// is one puttable byte. `caput SCALCOUT.UDF 0` must STAND (C stores 0)
+    /// even on the empty-CALC record that is otherwise undefined; the oracle
+    /// measured C=0, port=1 because the wave-2 cell (=1) clobbered the put on
+    /// UDF's `pp(TRUE)` re-process. A fresh record with no UDF put stays 1.
+    #[test]
+    fn direct_udf_put_wins_over_the_monotonic_cell() {
+        let mut rec = ScalcoutRecord::new();
+        assert!(
+            rec.value_is_undefined(),
+            "fresh scalcout is undefined (cell=1)"
+        );
+        // caput UDF 0 → defined; must survive the empty-CALC re-process (the
+        // monotonic clear leaves the cell the put set to defined).
+        rec.set_udf_from_put(false);
+        assert!(!rec.value_is_undefined(), "caput UDF 0 defines the record");
+        rec.process().unwrap();
+        assert!(
+            !rec.value_is_undefined(),
+            "empty-CALC re-process must not re-raise the put-cleared UDF"
+        );
+        // caput UDF 1 → undefined again.
+        rec.set_udf_from_put(true);
+        assert!(
+            rec.value_is_undefined(),
+            "caput UDF 1 makes the record undefined"
         );
     }
 

@@ -51,7 +51,11 @@ tracing-opentelemetry = { version = "0.25", optional = true }
 # Winsock symbol, not a CRT one). `hostname.rs` calls Winsock's `getnameinfo`
 # directly on Windows, the same resolver C EPICS uses there.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Networking_WinSock"] }
+windows-sys = { version = "0.59", features = [
+    "Win32_Networking_WinSock",
+    "Win32_Foundation",
+    "Win32_System_Console",
+] }
 
 [features]
 default = []

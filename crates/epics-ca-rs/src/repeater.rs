@@ -611,6 +611,33 @@ fn spawn_repeater() {
     if let Some(ref bin) = repeater_bin {
         if bin.exists() {
             use std::process::{Command, Stdio};
+            // Windows has no CLOEXEC: `CreateProcess` inherits every
+            // inheritable handle we hold, and the stdout/stderr pipe a
+            // capturing parent (`Command::output`, a shell `$(caput …)`,
+            // nextest) handed us stays inheritable. The repeater is a
+            // detached daemon that outlives us, so if it inherits that
+            // pipe the capturing parent never sees EOF and blocks until
+            // the daemon exits — i.e. forever. Unix avoids this because
+            // `Stdio::null()` redirects the child's fds 0/1/2 and the pipe
+            // only ever lived on fd 1. Clear the inherit flag on our own
+            // standard handles first so the daemon cannot hold them — the
+            // Windows analogue of the CLOEXEC unix already gets.
+            #[cfg(windows)]
+            unsafe {
+                use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+                use windows_sys::Win32::System::Console::{
+                    GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+                };
+                for id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+                    let h = GetStdHandle(id);
+                    // A closed/redirected slot is null; an unset one is
+                    // INVALID_HANDLE_VALUE. Skip both — only real handles
+                    // carry the inheritable pipe we must detach.
+                    if !h.is_null() && h != windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+                        SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0);
+                    }
+                }
+            }
             if Command::new(bin)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())

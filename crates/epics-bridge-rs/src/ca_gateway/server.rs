@@ -1451,6 +1451,13 @@ mod tests {
     async fn build_with_minimal_config() {
         let config = GatewayConfig {
             pvlist_content: Some("".to_string()),
+            // Ephemeral bind: decouple from the ambient
+            // EPICS_CA_SERVER_PORT/EPICS_CAS_SERVER_PORT env vars, which
+            // other tests in this binary (e.g. upstream.rs's
+            // `#[serial(epics_env)]` group) mutate process-wide and can
+            // point at a port a concurrently-running test already owns
+            // exclusively.
+            server_port: Some(0),
             ..Default::default()
         };
         let server = GatewayServer::build(config).await;
@@ -1468,6 +1475,8 @@ mod tests {
                 "#
                 .to_string(),
             ),
+            // Ephemeral bind — see `build_with_minimal_config`.
+            server_port: Some(0),
             ..Default::default()
         };
         let server = GatewayServer::build(config).await.unwrap();
@@ -1489,6 +1498,8 @@ mod tests {
             pvlist_content: Some("".to_string()),
             upstream_tls: Some(TlsConfig::client_from_roots(Roots::empty())),
             upstream_tls_server_name: Some("ioc.example.com".to_string()),
+            // Ephemeral bind — see `build_with_minimal_config`.
+            server_port: Some(0),
             ..Default::default()
         };
         let server = GatewayServer::build(config).await;
@@ -1506,7 +1517,11 @@ mod tests {
         // deny-all. Assumes no `gateway.pvlist` exists in the crate's
         // working directory (it does not) — the default-file probe is the
         // thin `is_file()` branch above, exercised by `parse_pvlist_file`.
-        let config = GatewayConfig::default();
+        let config = GatewayConfig {
+            // Ephemeral bind — see `build_with_minimal_config`.
+            server_port: Some(0),
+            ..Default::default()
+        };
         let server = GatewayServer::build(config).await.unwrap();
         let pvlist = server.pvlist().load_full();
         assert!(
@@ -1523,6 +1538,8 @@ mod tests {
         // the no-config path installs. This pins the two intents apart.
         let config = GatewayConfig {
             pvlist_content: Some(String::new()),
+            // Ephemeral bind — see `build_with_minimal_config`.
+            server_port: Some(0),
             ..Default::default()
         };
         let server = GatewayServer::build(config).await.unwrap();
@@ -1544,6 +1561,8 @@ mod tests {
 
         let config = GatewayConfig {
             pvlist_content: Some("PV.* ALLOW\nPV.* DENY FROM 127.0.0.1\n".to_string()),
+            // Ephemeral bind — see `build_with_minimal_config`.
+            server_port: Some(0),
             ..Default::default()
         };
         let server = GatewayServer::build(config).await.unwrap();
@@ -1598,6 +1617,8 @@ mod tests {
 
         let config = GatewayConfig {
             pvlist_content: Some("PV.* ALLOW\n".to_string()),
+            // Ephemeral bind — see `build_with_minimal_config`.
+            server_port: Some(0),
             ..Default::default()
         };
         let server = GatewayServer::build(config).await.unwrap();
@@ -1674,6 +1695,8 @@ mod tests {
         let config = GatewayConfig {
             pvlist_content: Some("PV.* ALLOW\n".to_string()),
             stats_prefix: "gateway".to_string(),
+            // Ephemeral bind — see `build_with_minimal_config`.
+            server_port: Some(0),
             ..Default::default()
         };
         let server = GatewayServer::build(config).await.unwrap();
@@ -1700,6 +1723,8 @@ mod tests {
         let config = GatewayConfig {
             pvlist_content: Some("PV.* ALLOW\ngateway.* ALLOW\n".to_string()),
             stats_prefix: "gateway".to_string(),
+            // Ephemeral bind — see `build_with_minimal_config`.
+            server_port: Some(0),
             ..Default::default()
         };
         let server = GatewayServer::build(config).await.unwrap();

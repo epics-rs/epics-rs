@@ -541,15 +541,29 @@ pub trait ChannelSource: Send + Sync + 'static {
 
     /// True iff `name` should be answered to a UDP SEARCH broadcast.
     ///
-    /// Distinct from [`Self::has_pv`]: a name may be reachable via a
-    /// direct TCP connect (`has_pv` true) yet deliberately NOT be
-    /// advertised on UDP discovery (`searchable` false). pvxs's
-    /// built-in `ServerSource` does exactly this — `onSearch` is empty
-    /// so the `server` PV resolves only by direct connect, never by
-    /// broadcast SEARCH (`serversource.cpp`). The default impl
-    /// delegates to `has_pv`, so ordinary sources are unaffected; the
-    /// built-in [`crate::server_native::ServerInfoSource`] overrides
-    /// this to return `false`.
+    /// Independent of [`Self::has_pv`] in BOTH directions — pvxs models
+    /// `onSearch` and `onCreate` as separate callbacks, and this is the
+    /// `onSearch` half. It is asked on its own; the caller never ANDs
+    /// `has_pv` into it.
+    ///
+    /// - *Narrower* than `has_pv`: a name may be reachable via a direct
+    ///   TCP connect (`has_pv` true) yet deliberately NOT be advertised on
+    ///   UDP discovery (`searchable` false). pvxs's built-in `ServerSource`
+    ///   does exactly this — `onSearch` is empty so the `server` PV resolves
+    ///   only by direct connect, never by broadcast SEARCH
+    ///   (`serversource.cpp`); the built-in
+    ///   [`crate::server_native::ServerInfoSource`] overrides this to `false`.
+    /// - *Wider* than `has_pv`: a source may advertise a name it will then
+    ///   REFUSE at CREATE_CHANNEL. pvxs's `SingleSource` claims every name
+    ///   `dbChannelTest` resolves (`singlesource.cpp:467-472`) and only
+    ///   discovers at `onCreate` that the field has no NT, answering
+    ///   `Refused to create Channel`. Withholding the search reply instead
+    ///   would turn that prompt refusal into a client-side timeout — a
+    ///   different observable, not the same one. See
+    ///   [`PvDatabaseSource`](crate::server::PvDatabaseSource).
+    ///
+    /// The default impl delegates to `has_pv`, so a source that does not
+    /// distinguish the two questions is unaffected.
     fn searchable(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
         self.has_pv(name)
     }

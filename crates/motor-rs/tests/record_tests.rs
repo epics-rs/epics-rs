@@ -8946,13 +8946,15 @@ fn test_alarm_cycle_fans_out_alarm_mask_to_monitored_fields() {
 }
 
 #[test]
-fn test_same_value_reput_after_miss_giveup_refuses_with_get_info() {
-    // C do_work entry gates (motorRecord.cc:2204, 2240): after a retry
-    // give-up (maybeRetry 1060-1075 adopts the unreached target into
-    // lval/ldvl/lrvl with MISS latched), a re-put of the SAME target
-    // fails `val != lval` and `dval != ldvl || !dmov` — no new move
-    // dispatches; the pass falls to the chain end and fires the
-    // implicit GET_INFO (2546-2557).
+fn test_same_value_unblinked_pass_after_miss_giveup_refuses_with_get_info() {
+    // C do_work entry gates (motorRecord.cc:2204, 2240) refuse a pass
+    // that arrives WITHOUT the special() pass-0 blink — the closed-loop
+    // DOL collection (a bare dbGetLink into VAL, 1994, no special) and
+    // housekeeping passes. After a retry give-up (maybeRetry 1060-1075
+    // adopts the unreached target into lval/ldvl/lrvl with MISS
+    // latched), a same-value unblinked delivery fails `val != lval` and
+    // `dval != ldvl || !dmov` — no new move dispatches; the pass falls
+    // to the chain end and fires the implicit GET_INFO (2546-2557).
     let mut rec = MotorRecord::new();
     rec.set_device_state(motor_rs::device_state::new_shared_state());
     rec.stat.msta = MstaFlags::DONE;
@@ -8971,11 +8973,11 @@ fn test_same_value_reput_after_miss_giveup_refuses_with_get_info() {
     assert!(rec.stat.dmov);
     assert_eq!(rec.internal.ldvl, 10.0, "lasts adopt the unreached target");
 
-    // Same-value re-put: the write cascade leaves VAL/DVAL unchanged.
+    // Same-value delivery with no blink (no dbPut ran).
     let effects = rec.plan_motion(CommandSource::Val);
     assert!(
         effects.commands.is_empty(),
-        "C 2240: same-value re-put does not re-dispatch the move"
+        "C 2240: same-value unblinked pass does not re-dispatch the move"
     );
     assert!(
         rec.retry.miss,
@@ -8987,6 +8989,52 @@ fn test_same_value_reput_after_miss_giveup_refuses_with_get_info() {
         "chain end fires the implicit GET_INFO"
     );
     assert_eq!(rec.stat.stup, 2, "STUP goes BUSY for the refresh");
+}
+
+#[test]
+fn test_same_value_dbput_after_miss_giveup_redispatches() {
+    // A database put is preceded by the special() pass-0 blink
+    // (motorRecord.cc:2582-2608): DMOV drops before the record
+    // processes, the entry gate (2240) passes via `!dmov`, the target
+    // sits 500 steps out (not too_small), and the dispatch gate (2455,
+    // `mip == MIP_DONE`) sends the move again — C retries a missed
+    // target on an operator re-put of the same value.
+    let mut rec = MotorRecord::new();
+    rec.set_device_state(motor_rs::device_state::new_shared_state());
+    rec.stat.msta = MstaFlags::DONE;
+    rec.stat.phase = MotionPhase::MainMove;
+    rec.stat.dmov = false;
+    rec.conv.mres = 0.001;
+    rec.retry.rdbd = 0.1;
+    rec.retry.rtry = 3;
+    rec.retry.rcnt = 3; // exhausted
+    rec.pos.val = 10.0;
+    rec.pos.dval = 10.0;
+    rec.pos.drbv = 9.5; // error 0.5 > rdbd -> give-up
+
+    let _ = rec.check_completion();
+    assert!(rec.retry.miss, "give-up latches MISS");
+    assert!(rec.stat.dmov);
+
+    // dbPut of the same VAL: framework order is special(pass 0), then
+    // put_field, then the pp process pass.
+    rec.special("VAL", false).unwrap();
+    assert!(!rec.stat.dmov, "pass-0 blink drops DMOV");
+    rec.put_field("VAL", EpicsValue::Double(10.0)).unwrap();
+    let effects = rec.do_process();
+    assert!(
+        effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveAbsolute { .. })),
+        "C 2455: blinked same-value re-put re-dispatches the missed move"
+    );
+    assert!(!rec.stat.dmov, "move in flight");
+    assert_eq!(rec.stat.phase, MotionPhase::MainMove);
+    assert!(
+        rec.retry.miss,
+        "MISS stays latched until maybeRetry lands close enough"
+    );
 }
 
 #[test]
@@ -9023,10 +9071,14 @@ fn test_new_target_after_miss_giveup_dispatches() {
 }
 
 #[test]
-fn test_same_value_set_redefinition_does_not_resend_load_pos() {
-    // C 2240 sits ahead of the set test (2257-2263): load_pos synced
-    // the lasts at dispatch (3771-3817), so re-putting the same DVAL in
-    // SET mode falls to the chain end instead of re-sending LOAD_POS.
+fn test_same_value_set_redefinition_resends_load_pos_when_blinked() {
+    // C: a dbPut to DVAL is preceded by the special() pass-0 blink
+    // (2582-2608) even in SET mode, so a same-value redefinition re-put
+    // re-enters the move block via `!dmov` (2240) and the set test
+    // (2257-2263) routes it to load_pos again — the redefinition is a
+    // command, not a value change, and C re-sends LOAD_POS for it.
+    // Without the blink (no fresh drive write) the entry gate refuses
+    // and the pass falls to the chain end instead.
     let mut rec = MotorRecord::new();
     rec.set_device_state(motor_rs::device_state::new_shared_state());
     rec.conv.mres = 1.0;
@@ -9038,6 +9090,7 @@ fn test_same_value_set_redefinition_does_not_resend_load_pos() {
     rec.internal.ldvl = 5.0;
     rec.put_field("SET", EpicsValue::Short(1)).unwrap();
 
+    rec.special("DVAL", false).unwrap();
     rec.put_field("DVAL", EpicsValue::Double(0.0)).unwrap();
     let effects = rec.plan_motion(CommandSource::Set);
     assert!(
@@ -9056,11 +9109,32 @@ fn test_same_value_set_redefinition_does_not_resend_load_pos() {
     let _ = rec.check_completion();
     assert!(rec.stat.dmov, "LOAD_P cycle completed");
 
+    // Same-value re-put, blinked like every dbPut.
+    rec.special("DVAL", false).unwrap();
     rec.put_field("DVAL", EpicsValue::Double(0.0)).unwrap();
     let effects = rec.plan_motion(CommandSource::Set);
     assert!(
+        effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::SetPosition { .. })),
+        "C re-sends LOAD_POS on a blinked same-value redefinition re-put"
+    );
+
+    // Unblinked same-value pass (no fresh drive write): entry gate
+    // (2240) refuses — chain end, implicit GET_INFO.
+    let status = asyn_rs::interfaces::motor::MotorStatus {
+        position: 0.0,
+        done: true,
+        ..Default::default()
+    };
+    rec.process_motor_info(&status);
+    let _ = rec.check_completion();
+    assert!(rec.stat.dmov, "second LOAD_P cycle completed");
+    let effects = rec.plan_motion(CommandSource::Set);
+    assert!(
         effects.commands.is_empty(),
-        "no second LOAD_POS for the same value"
+        "no LOAD_POS on an unblinked same-value pass"
     );
     assert!(
         effects.status_refresh,
@@ -9069,11 +9143,11 @@ fn test_same_value_set_redefinition_does_not_resend_load_pos() {
 }
 
 #[test]
-fn test_zero_tweak_refuses_and_falls_to_chain_end() {
-    // C: the tweak fold (2167-2181) with TWV = 0 leaves VAL unchanged;
-    // the collection gate (2204) and the move-block entry (2240) both
-    // refuse, and the pass ends at the chain end (implicit GET_INFO,
-    // 2546-2557) — no move, no DMOV pulse.
+fn test_unblinked_zero_tweak_refuses_and_falls_to_chain_end() {
+    // An UNBLINKED zero fold (TWV = 0, no dbPut ran): the fold leaves
+    // VAL unchanged, the collection gate (2204) and the move-block
+    // entry (2240) both refuse, and the pass ends at the chain end
+    // (implicit GET_INFO, 2546-2557) — no move, no DMOV pulse.
     let mut rec = MotorRecord::new();
     rec.set_device_state(motor_rs::device_state::new_shared_state());
     rec.stat.msta = MstaFlags::DONE;
@@ -9092,5 +9166,108 @@ fn test_zero_tweak_refuses_and_falls_to_chain_end() {
     assert!(
         effects.status_refresh,
         "chain end fires the implicit GET_INFO"
+    );
+}
+
+#[test]
+fn test_blinked_zero_tweak_pulses_dmov() {
+    // A dbPut to TWF is preceded by the special() pass-0 blink
+    // (2582-2608, TWF is in the blink list), so even a zero fold
+    // (TWV = 0) enters the move block via `!dmov` (2240); at position
+    // the request is too_small and the sub-step pulse runs — DMOV
+    // 1→0→1, no controller command (C 2333-2342 restores DMOV=TRUE on
+    // the same pass; the Rust pulse posts the low half and the
+    // recovery pass restores it).
+    let mut rec = MotorRecord::new();
+    rec.set_device_state(motor_rs::device_state::new_shared_state());
+    rec.stat.msta = MstaFlags::DONE;
+    rec.conv.mres = 0.001;
+    rec.pos.val = 10.0;
+    rec.pos.dval = 10.0;
+    rec.pos.drbv = 10.0;
+    rec.internal.lval = 10.0;
+    rec.internal.ldvl = 10.0;
+    rec.ctrl.twv = 0.0;
+
+    rec.special("TWF", false).unwrap();
+    assert!(!rec.stat.dmov, "pass-0 blink drops DMOV");
+    rec.ctrl.twf = true;
+    let effects = rec.plan_motion(CommandSource::Twf);
+    assert!(effects.commands.is_empty(), "zero fold sends no command");
+    assert!(!rec.stat.dmov, "pulse low half");
+    assert!(rec.stat.movn, "pulse presents as a (zero-length) move");
+    assert!(effects.request_poll, "pulse schedules the recovery pass");
+
+    // The recovery pass (no pending put) restores DMOV=1.
+    let _ = rec.do_process();
+    assert!(rec.stat.dmov, "pulse high half restores DMOV");
+    assert!(!rec.stat.movn);
+}
+
+#[test]
+fn test_special_pass0_blinks_dmov_for_drive_fields_only() {
+    // C special() pass-0 (motorRecord.cc:2582-2608): exactly the six
+    // drive fields blink DMOV; nothing else does, and the after-put
+    // pass (pass 1) never blinks.
+    for f in ["VAL", "DVAL", "RVAL", "RLV", "TWF", "TWR"] {
+        let mut rec = MotorRecord::new();
+        assert!(rec.stat.dmov);
+        rec.special(f, false).unwrap();
+        assert!(!rec.stat.dmov, "pass-0 blink drops DMOV for {f}");
+    }
+    let mut rec = MotorRecord::new();
+    rec.special("VAL", true).unwrap();
+    assert!(rec.stat.dmov, "after-put special does not blink");
+    for f in ["TWV", "SET", "SPMG", "STOP", "HOMF", "JOGF", "VELO"] {
+        rec.special(f, false).unwrap();
+        assert!(rec.stat.dmov, "{f} is not a drive field — no blink");
+    }
+}
+
+#[test]
+fn test_init_record_pass1_restores_dmov_after_load_time_blink() {
+    // C init_record (721-723): dmov = TRUE, movn = FALSE no matter
+    // what the load wrote — a load-time write to a drive field may
+    // have run the pass-0 blink, and DMOV must still start done.
+    let mut rec = MotorRecord::new();
+    rec.special("VAL", false).unwrap();
+    rec.put_field("VAL", EpicsValue::Double(1.0)).unwrap();
+    assert!(!rec.stat.dmov, "load-time blink left DMOV low");
+    rec.init_record(1).unwrap();
+    assert!(rec.stat.dmov, "init pass 1 restores DMOV=1 (C 721)");
+    assert!(!rec.stat.movn, "init pass 1 clears MOVN (C 723)");
+}
+
+#[test]
+fn test_blinked_put_blocked_by_hw_limit_completes_with_lasts_adopted() {
+    // A blinked put whose first leg is blocked by an active hardware
+    // limit switch: C dispatches it (no hw-limit gate in the move
+    // block), the driver stops at the switch, and maybeRetry's
+    // limit-switch escape (1049) completes it with the lasts already
+    // adopted at dispatch (2469-2471). The Rust refusal skips the
+    // controller command but lands the same end state — the written
+    // target stays in VAL/DVAL, the lasts adopt it (no dangling
+    // re-dispatch on a later SPMG pass), and the pending pulse
+    // completes with DMOV=1 (the blink must not stay latched low).
+    let mut rec = MotorRecord::new();
+    rec.stat.msta = MstaFlags::DONE;
+    rec.conv.mres = 0.001;
+    rec.limits.hls = true; // parked on the high limit switch
+
+    rec.special("VAL", false).unwrap();
+    rec.put_field("VAL", EpicsValue::Double(10.0)).unwrap();
+    let effects = rec.do_process();
+    assert!(effects.commands.is_empty(), "blocked move sends nothing");
+    assert!(rec.stat.dmov, "refusal completes the pending pulse");
+    assert_eq!(rec.stat.phase, MotionPhase::Idle);
+    assert_eq!(rec.pos.val, 10.0, "the written target stays (C parity)");
+    assert_eq!(rec.internal.ldvl, rec.pos.dval, "lasts adopt the target");
+
+    // No dangling re-dispatch: an SPMG=Go pass finds nothing pending.
+    rec.ctrl.spmg = SpmgMode::Go;
+    let effects = rec.plan_motion(CommandSource::Spmg);
+    assert!(
+        effects.commands.is_empty(),
+        "no stale target dispatches after the refusal"
     );
 }

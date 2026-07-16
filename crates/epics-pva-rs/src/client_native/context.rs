@@ -617,21 +617,27 @@ impl PvaClient {
         Self::builder().server_addr(server_addr).build()
     }
 
-    async fn search_engine(&self) -> PvaResult<&SearchEngine> {
-        // The process-wide shared engine is a single `OnceCell` and cannot
-        // carry per-client name_servers (different clients may have
-        // different lists) NOR a per-client UDP-search config (address list /
-        // ports / auto-addr-list). pvxs keeps `nameServers` per-Context
-        // regardless of `overrideShareUDP` — shareUDP only shares the UDP
-        // socket. To match that and avoid silently dropping configured TCP
-        // name servers or a programmatic addr_list, a client that has name
-        // servers OR an overridden search config always uses its own
-        // per-client engine, even when `share_udp(true)` was requested.
-        // share_udp still saves the UDP socket for clients that have neither.
-        if self.inner.share_udp
+    /// True when [`Self::search_engine`] resolves to the process-wide
+    /// `SHARED_SEARCH_ENGINE` instead of spawning a per-client engine.
+    ///
+    /// The shared engine is a single `OnceCell` and cannot carry per-client
+    /// name_servers (different clients may have different lists) NOR a
+    /// per-client UDP-search config (address list / ports / auto-addr-list).
+    /// pvxs keeps `nameServers` per-Context regardless of `overrideShareUDP`
+    /// — shareUDP only shares the UDP socket. To match that and avoid
+    /// silently dropping configured TCP name servers or a programmatic
+    /// addr_list, a client that has name servers OR an overridden search
+    /// config always uses its own per-client engine, even when
+    /// `share_udp(true)` was requested. share_udp still saves the UDP
+    /// socket for clients that have neither.
+    fn uses_shared_search_engine(&self) -> bool {
+        self.inner.share_udp
             && self.inner.name_servers.is_empty()
             && !self.inner.search_config_overridden
-        {
+    }
+
+    async fn search_engine(&self) -> PvaResult<&SearchEngine> {
+        if self.uses_shared_search_engine() {
             let engine = SHARED_SEARCH_ENGINE
                 .get_or_try_init(|| async { SearchEngine::spawn(Vec::new(), Vec::new()).await })
                 .await?;
@@ -3334,6 +3340,13 @@ mod tests {
     // spawned with an empty name-server list and would silently drop the
     // configured TCP name servers. Such a client must fall back to its
     // own per-client engine, which carries the name-server list.
+    //
+    // The assertions are the client-local observables only: the singleton
+    // itself is process-wide and populated by whichever concurrently
+    // running test resolves the shared path first, so its emptiness is not
+    // observable soundly here. `search_engine()`'s early return makes the
+    // two paths mutually exclusive by construction, so the routing decision
+    // plus this client's engine cell fully pin the behavior.
     #[tokio::test]
     async fn mr_r9_share_udp_with_name_servers_uses_per_client_engine() {
         let ns: SocketAddr = "127.0.0.1:5099".parse().unwrap();
@@ -3342,15 +3355,14 @@ mod tests {
             .name_servers(vec![ns])
             .build();
 
-        // Resolving the engine must spawn a per-client engine, not the
-        // shared singleton.
-        let _engine = client.search_engine().await.expect("engine spawn");
-
         assert!(
-            SHARED_SEARCH_ENGINE.get().is_none(),
-            "share_udp(true) + name_servers must use the per-client engine, \
-             not the shared singleton that drops name servers"
+            !client.uses_shared_search_engine(),
+            "share_udp(true) + name_servers must route to the per-client \
+             engine, not the shared singleton that drops name servers"
         );
+
+        // Resolving the engine must spawn a per-client engine.
+        let _engine = client.search_engine().await.expect("engine spawn");
         assert!(
             client.inner.search.get().is_some(),
             "per-client engine must be populated"
@@ -3362,11 +3374,11 @@ mod tests {
     #[tokio::test]
     async fn mr_r9_share_udp_without_name_servers_uses_shared_engine() {
         let client = PvaClient::builder().share_udp(true).build();
-        let _engine = client.search_engine().await.expect("engine spawn");
         assert!(
-            SHARED_SEARCH_ENGINE.get().is_some(),
+            client.uses_shared_search_engine(),
             "share_udp(true) with no name servers must use the shared engine"
         );
+        let _engine = client.search_engine().await.expect("engine spawn");
         assert!(
             client.inner.search.get().is_none(),
             "shared-engine path must not spawn a per-client engine"

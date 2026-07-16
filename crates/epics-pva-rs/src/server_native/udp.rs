@@ -107,23 +107,55 @@ fn bind_beacon_send_v6() -> Option<Arc<tokio::net::UdpSocket>> {
     }
 }
 
-fn bind_udp(
+/// Bind the search socket, returning the bundle **and the port it actually
+/// got**.
+///
+/// `port == 0` means "kernel, choose one", and the caller then has no other
+/// way to learn the number — so it is read back from the bind here rather
+/// than predicted. Two properties this function owns:
+///
+/// * **One port across the bundle.** The responder embeds this number in
+///   beacons, in the loopback-multicast retransmit, and in the multicast
+///   joins below, so a bundle whose NICs each got a *different* ephemeral
+///   port would make "the" UDP port meaningless. `bind_ephemeral_same_port*`
+///   lets the first NIC pick and the rest reuse that one number.
+/// * **Read back, never probed.** The socket that reports the port is the
+///   socket the responder serves on, so nothing can take it in between.
+///   (This matters more for PVA than for CA: the search socket sets
+///   `SO_REUSEPORT`, so a *collision does not fail* — a second server binds
+///   the same port silently and the two answer searches at random. There is
+///   no error to detect after the fact, which is exactly why the number must
+///   never be guessed.)
+pub(crate) fn bind_udp(
     port: u16,
     interfaces: &[Ipv4Addr],
     beacon_dests: &[Endpoint],
-) -> PvaResult<AsyncUdpV4> {
+) -> PvaResult<(AsyncUdpV4, u16)> {
     // `EPICS_PVAS_INTF_ADDR_LIST` constrains the responder to the listed
     // interfaces (pvxs `server.cpp:407-439` binds UDP search listeners
     // only on the effective interface set). Empty list = the historical
     // all-NIC default. A constrained bind also gets each listed NIC's
     // broadcast-RX socket from `bind_on_interfaces`, so subnet-directed
     // SEARCH to a listed interface still reaches us.
-    let mut sock = if interfaces.is_empty() {
+    let mut sock = if port == 0 {
+        // Ephemeral: every NIC socket must land on the SAME kernel-assigned
+        // port (see the doc comment) — `bind(0, ..)` per NIC would not.
+        if interfaces.is_empty() {
+            AsyncUdpV4::bind_ephemeral_same_port(true)
+        } else {
+            AsyncUdpV4::bind_ephemeral_same_port_on_interfaces(interfaces, true)
+        }
+    } else if interfaces.is_empty() {
         AsyncUdpV4::bind(port, true)
     } else {
         AsyncUdpV4::bind_on_interfaces(interfaces, port, true)
     }
     .map_err(PvaError::Io)?;
+
+    // The bound port, read off the socket. pvxs does the same read-back
+    // (`server.cpp:426`: `effective.udp_port = addr.addr.port()`), which is
+    // what makes `EPICS_PVAS_BROADCAST_PORT=0` usable at all.
+    let port = resolve_bound_udp_port(&sock, port)?;
     // pvxs `config.cpp:512-518` calls `addGroups(ifaces, beaconDestinations,
     // ifmap)` after resolving the server's beacon destinations, so every
     // multicast address the server beacons to also becomes a search-listener
@@ -148,7 +180,38 @@ fn bind_udp(
         .map(|i| i.ip)
         .collect();
     join_beacon_multicast_groups(&mut sock, beacon_dests, port, &external_nics);
-    Ok(sock)
+    Ok((sock, port))
+}
+
+/// The single port a bound [`AsyncUdpV4`] bundle is serving on.
+///
+/// `requested != 0` is authoritative — that is the number every socket was
+/// told to bind. For `requested == 0` the port is whatever the kernel handed
+/// out, so it is read off the sockets; the bundle is required to agree,
+/// because a split bundle has no single "the port" to advertise and
+/// silently picking one socket's number would make beacons and SEARCH
+/// replies point somewhere a peer cannot reach.
+fn resolve_bound_udp_port(sock: &AsyncUdpV4, requested: u16) -> PvaResult<u16> {
+    if requested != 0 {
+        return Ok(requested);
+    }
+    let addrs = sock.local_addrs();
+    let mut ports = addrs.iter().map(|a| a.port());
+    let first = ports.next().ok_or_else(|| {
+        PvaError::Protocol("UDP search socket bound no interfaces; no port to report".into())
+    })?;
+    if first == 0 {
+        return Err(PvaError::Protocol(
+            "UDP search socket reported port 0 after bind".into(),
+        ));
+    }
+    if ports.any(|p| p != first) {
+        return Err(PvaError::Protocol(format!(
+            "UDP search sockets landed on different ephemeral ports ({addrs:?}); \
+             the responder advertises one port and cannot honour a split bundle"
+        )));
+    }
+    Ok(first)
 }
 
 /// Resolve the `(group, interface)` multicast join targets from the
@@ -307,7 +370,52 @@ pub async fn run_udp_responder_with_config(
     // discovered NIC. Empty = all-NIC default.
     interfaces: Vec<Ipv4Addr>,
 ) -> PvaResult<()> {
-    let socket = bind_udp(udp_port, &interfaces, &destinations)?;
+    let (socket, udp_port) = bind_udp(udp_port, &interfaces, &destinations)?;
+    run_udp_responder_on_socket(
+        socket,
+        udp_port,
+        source,
+        tcp_port,
+        guid,
+        protocol,
+        beacon_period,
+        beacon_period_long,
+        beacon_burst_count,
+        destinations,
+        auto_beacon,
+        ignore_addrs,
+        enable_ipv6_udp,
+    )
+    .await
+}
+
+/// Like [`run_udp_responder_with_config`] but serves an **already-bound**
+/// socket whose port the caller has read back from the bind.
+///
+/// Splitting the bind out is what lets [`crate::server_native::runtime`]
+/// support `udp_port = 0`: the responder is spawned as a task, so a bind
+/// performed inside it would publish the kernel-assigned port nowhere and
+/// `report()`/SEARCH replies would advertise 0. The binder learns the port
+/// and hands it here, so `udp_port` below is always the real one — it is
+/// embedded in beacons, the loopback-multicast retransmit, and the
+/// origin-tag group, none of which tolerate a placeholder.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_udp_responder_on_socket(
+    socket: AsyncUdpV4,
+    // The port `socket` is actually bound to — see [`bind_udp`].
+    udp_port: u16,
+    source: DynSource,
+    tcp_port: u16,
+    guid: [u8; 12],
+    protocol: &'static str,
+    beacon_period: Duration,
+    beacon_period_long: Duration,
+    beacon_burst_count: u8,
+    destinations: Vec<Endpoint>,
+    auto_beacon: bool,
+    ignore_addrs: Vec<(IpAddr, u16)>,
+    enable_ipv6_udp: bool,
+) -> PvaResult<()> {
     let socket = Arc::new(socket);
     debug!(?udp_port, "UDP search responder started");
 

@@ -1059,9 +1059,10 @@ impl PvDatabase {
     ///   `!plset->getGraphicLimits` test in `dbGetGraphicLimits`
     ///   (`dbLink.c:358-359`) short-circuits to `S_db_noLSET` and NOTHING is
     ///   written. This is the case for the oracle's `field(INPA,"5")`
-    ///   records: C's answer is *not* a propagated or type-range limit — the
-    ///   record's buffer keeps whatever `dbAccess.c` pre-filled it with
-    ///   (`0.0/0.0` for graphic and control, `NaN×4` for alarm).
+    ///   records: C's answer is *not* a propagated limit and *not* a
+    ///   DBF-type-range default — the record's buffer keeps the seed it held
+    ///   before the fetch (see the routing contract below). Measured: a
+    ///   `calc` `field(INPA,"5")` serves display limits `0/0`.
     /// * **DB link** — `Some(meta)` from the target field, via
     ///   [`Self::db_link_metadata`].
     /// * **CA/PVA link** — delegated to the registered lset
@@ -1074,6 +1075,43 @@ impl PvDatabase {
     /// `visited` is the caller's chain state and carries C's
     /// `DBLINK_FLAG_VISITED` recursion guard — see
     /// [`Self::db_link_metadata`].
+    ///
+    /// # Contract for the routing layer
+    ///
+    /// This method reports what the LINK says. It does not know what the
+    /// calling record should do with a `None`, because C's answer to that is
+    /// per-slot and not uniform. Record support must seed its buffer, call
+    /// this, and overwrite only on `Some` — the seed IS the answer whenever
+    /// the fetch reports nothing. C's seeds, and the four slots that route
+    /// through a link at all:
+    ///
+    /// | rset slot | seed before the fetch | C site |
+    /// |---|---|---|
+    /// | `get_graphic_double` | `(0.0, 0.0)` | `dbAccess.c:216` |
+    /// | `get_alarm_double` | `NaN×4` | `dbAccess.c:290` |
+    /// | `get_units` | `""` (NOT the record's `EGU`) | `dbAccess.c:378` |
+    /// | `get_precision` | the record's own `PREC` | `calcRecord.c:191` |
+    /// | `get_control_double` | **never fetched — see below** | |
+    ///
+    /// Two of those seeds are counter-intuitive and are measured facts, not
+    /// deductions (softIoc + `caget -d DBR_CTRL_DOUBLE`, EPICS 7 base): on a
+    /// `calc` with `field(INPA,"5") field(PREC,"7") field(EGU,"volts")`, C
+    /// serves `INPA` with **precision 7** (the record's own `PREC` survives,
+    /// because `get_precision` seeds `*pprecision = prec->prec` *before* the
+    /// fetch and overwrites only on a zero status) but **units `""`** (the
+    /// `strncpy(units, prec->egu)` fallback sits in the `else` arm that a
+    /// link-backed field never takes — `calcRecord.c:172-181`).
+    ///
+    /// **Control limits must NOT be routed through a link.** `dbDbLink.c:414`
+    /// really does install `dbDbGetControlLimits`, and `dbGetControlLimits` is
+    /// public API (`dbLink.h:436`) — so this method reports it — but NOTHING
+    /// in EPICS base calls it. Every record instead sends its link-backed
+    /// fields to `recGblGetControlDouble` (`calcRecord.c:251`,
+    /// `subRecord.c`, `calcoutRecord.c`, `aSubRecord.c:376`), i.e. to
+    /// `getMaxRangeValues` — which is why C serves a `calc` `INPA` with
+    /// `±1e300` control limits (measured) regardless of what the link points
+    /// at. Routing this method's `control_limits` into a record's
+    /// `get_control_double` would be a defect.
     pub async fn link_metadata(
         &self,
         link: &crate::server::record::ParsedLink,

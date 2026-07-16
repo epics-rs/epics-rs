@@ -4389,6 +4389,13 @@ impl RecordInstance {
         {
             display.form = 0;
         }
+        // A record type that has transcribed its C rset owns every slot for
+        // every field; the legacy record-level cache and the
+        // `field_metadata_override` patch below are the untranscribed path.
+        if let Some(routes) = self.record.field_metadata_routes(field) {
+            self.apply_field_metadata_routes(field, routes, snap);
+            return;
+        }
         let Some(ov) = self.record.field_metadata_override(field) else {
             return;
         };
@@ -4420,6 +4427,141 @@ impl RecordInstance {
             c.upper_ctrl_limit = upper;
             c.lower_ctrl_limit = lower;
         }
+    }
+
+    /// Resolve a transcribed record's [`FieldMetaRoutes`] against C's
+    /// `dbAccess.c` seeds and write the result into `snap`.
+    ///
+    /// The single owner of "what a routed slot means". Each [`MetaSlot`]
+    /// resolves the same way for every record type and every field, so a
+    /// transcription only has to say WHICH arm C takes — never what the arm
+    /// is worth:
+    ///
+    /// * [`MetaSlot::RecordLevel`] — leave the record-level cache in place.
+    /// * [`MetaSlot::Wrote`] — assign the transcribed value.
+    /// * [`MetaSlot::RecGbl`] — the `recGbl*` default, keyed on the field's
+    ///   **static dbd** type ([`Self::rec_gbl_range_for`]).
+    /// * [`MetaSlot::Unwritten`] — the `dbAccess.c` seed.
+    ///
+    /// The marking mask is NOT decided here: whether a leaf reaches the wire
+    /// at all is [`Self::assign_property_support`]'s call (C clears the
+    /// option bit for a NULL rset slot, `dbAccess.c:217-220`). A slot the
+    /// record type does not implement is never marked, so the value this
+    /// writes for it is unobservable.
+    fn apply_field_metadata_routes(
+        &self,
+        field: &str,
+        routes: super::record_trait::FieldMetaRoutes,
+        snap: &mut super::super::snapshot::Snapshot,
+    ) {
+        use super::record_trait::MetaSlot;
+        use crate::server::recgbl::{rec_gbl_get_alarm_double, rec_gbl_get_prec};
+
+        let d = snap.display.get_or_insert_with(Default::default);
+
+        // `get_units`: no `recGblGetUnits` exists, so `RecGbl` is
+        // unreachable and resolves as the record-level `EGU` — C's
+        // `default:` arm copies `prec->egu` (`aiRecord.c:230`).
+        match routes.units {
+            MetaSlot::Wrote(u) => d.units = u,
+            // `dbAccess.c:377` memsets the caller's 16-byte buffer before the
+            // slot runs, so a slot that writes nothing serves the empty
+            // string — NOT the record's EGU.
+            MetaSlot::Unwritten => d.units = Default::default(),
+            MetaSlot::RecordLevel | MetaSlot::RecGbl => {}
+        }
+
+        match routes.precision {
+            MetaSlot::Wrote(p) => d.precision = p,
+            // `recGblGetPrec` (`recGbl.c:119-144`) mutates the seed the
+            // record's `get_precision` already stored — the record's own
+            // `PREC`, which is what the record-level cache carries.
+            MetaSlot::RecGbl => {
+                d.precision = rec_gbl_get_prec(self.static_field_type(field), d.precision);
+            }
+            MetaSlot::Unwritten => d.precision = 0,
+            MetaSlot::RecordLevel => {}
+        }
+
+        match routes.graphic {
+            MetaSlot::Wrote((upper, lower)) => {
+                d.upper_disp_limit = upper;
+                d.lower_disp_limit = lower;
+            }
+            MetaSlot::RecGbl => {
+                // No case in C's switch (`recGbl.c:372-419` has no
+                // `default:`) means nothing is written, so the seed stands.
+                let (upper, lower) = self.rec_gbl_range_for(field).unwrap_or((0.0, 0.0));
+                d.upper_disp_limit = upper;
+                d.lower_disp_limit = lower;
+            }
+            // `dbAccess.c:216` seeds `(0.0, 0.0)`.
+            MetaSlot::Unwritten => {
+                d.upper_disp_limit = 0.0;
+                d.lower_disp_limit = 0.0;
+            }
+            MetaSlot::RecordLevel => {}
+        }
+
+        let alarm = match routes.alarm {
+            MetaSlot::Wrote(v) => Some(v),
+            // `recGblGetAlarmDouble` writes four NaN (`recGbl.c:155-162`),
+            // which is also the `dbAccess.c:290` seed.
+            MetaSlot::RecGbl | MetaSlot::Unwritten => Some(rec_gbl_get_alarm_double()),
+            MetaSlot::RecordLevel => None,
+        };
+        if let Some((hihi, high, low, lolo)) = alarm {
+            d.upper_alarm_limit = hihi;
+            d.upper_warning_limit = high;
+            d.lower_warning_limit = low;
+            d.lower_alarm_limit = lolo;
+        }
+
+        match routes.control {
+            MetaSlot::Wrote((upper, lower)) => {
+                let c = snap.control.get_or_insert_with(Default::default);
+                c.upper_ctrl_limit = upper;
+                c.lower_ctrl_limit = lower;
+            }
+            MetaSlot::RecGbl => {
+                let (upper, lower) = self.rec_gbl_range_for(field).unwrap_or((0.0, 0.0));
+                let c = snap.control.get_or_insert_with(Default::default);
+                c.upper_ctrl_limit = upper;
+                c.lower_ctrl_limit = lower;
+            }
+            // `dbAccess.c:256` seeds `(0.0, 0.0)`.
+            MetaSlot::Unwritten => {
+                let c = snap.control.get_or_insert_with(Default::default);
+                c.upper_ctrl_limit = 0.0;
+                c.lower_ctrl_limit = 0.0;
+            }
+            MetaSlot::RecordLevel => {}
+        }
+    }
+
+    /// The field's type as the **dbd declares it**, which is the only type
+    /// `recGblGetPrec` / `getMaxRangeValues` ever see.
+    ///
+    /// C reads `pdbFldDes->field_type` (`recGbl.c:127`, `:151`, `:169`) — the
+    /// STATIC descriptor — so a `cvt_dbaddr` retype (the port's
+    /// `runtime_typed`, DBF_NOACCESS in the dbd) never reaches the switch and
+    /// the switch has no case for it. `None` reproduces that: no case, no
+    /// write.
+    fn static_field_type(&self, field: &str) -> Option<crate::types::DbFieldType> {
+        let desc = self.field_desc(field)?;
+        (!desc.runtime_typed).then_some(desc.dbf_type)
+    }
+
+    /// `recGblGetGraphicDouble` / `recGblGetControlDouble` for `field` — the
+    /// same `getMaxRangeValues` table both C entry points share
+    /// (`recGbl.c:146-171`). `None` where C's switch has no case (STRING,
+    /// MENU, DEVICE, NOACCESS, links), which writes nothing.
+    fn rec_gbl_range_for(&self, field: &str) -> Option<(f64, f64)> {
+        let desc = self.field_desc(field)?;
+        crate::server::recgbl::rec_gbl_get_graphic_double(
+            self.static_field_type(field),
+            desc.menu.is_some(),
+        )
     }
 
     /// Notify subscribers from a snapshot (call outside lock).

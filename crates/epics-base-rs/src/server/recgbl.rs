@@ -558,6 +558,60 @@ pub fn rec_gbl_get_alarm_double() -> (f64, f64, f64, f64) {
     (f64::NAN, f64::NAN, f64::NAN, f64::NAN)
 }
 
+/// C's `recGblGetPrec` (`recGbl.c:119-144`) — the precision for a field the
+/// record's own `get_precision` does not list.
+///
+/// Unlike the limit helpers this one MUTATES the caller's seed rather than
+/// producing a value: C takes `long *precision` already holding whatever the
+/// record's `get_precision` stored (typically `prec->prec`, e.g.
+/// `aiRecord.c:236`) and rewrites it only for the types its switch names.
+/// `seed` is that value; the return is C's post-call buffer.
+///
+/// ```c
+/// switch (pdbFldDes->field_type) {
+/// case DBF_CHAR: ... case DBF_UINT64:  *precision = 0;  break;
+/// case DBF_FLOAT: case DBF_DOUBLE:
+///     if (*precision < 0 || *precision > 15) *precision = 15;
+///     break;
+/// default: break;
+/// }
+/// ```
+///
+/// `field_type` is the **static** dbd type (`pdbFldDes->field_type`), so a
+/// runtime-retyped field passes `None` and takes the `default:` arm — the seed
+/// survives untouched.
+///
+/// The integer arm is unobservable through `dbGet`: `dbAccess.c:387-394` gates
+/// `DBR_PRECISION` on the field being `DBF_FLOAT`/`DBF_DOUBLE` *before* the
+/// slot runs, so a `DBF_LONG` field's precision is never sent at all (the port
+/// applies that gate in `PropertySupport::narrowed_to_field`). It is
+/// transcribed anyway because this is `recGblGetPrec`, not `dbGet`'s view of
+/// it, and a future caller must see C's rule, not the subset one caller can
+/// observe.
+pub fn rec_gbl_get_prec(field_type: Option<DbFieldType>, seed: i16) -> i16 {
+    match field_type {
+        Some(
+            DbFieldType::Char
+            | DbFieldType::UChar
+            | DbFieldType::Short
+            | DbFieldType::UShort
+            | DbFieldType::Long
+            | DbFieldType::ULong
+            | DbFieldType::Int64
+            | DbFieldType::UInt64,
+        ) => 0,
+        Some(DbFieldType::Float | DbFieldType::Double) => {
+            if !(0..=15).contains(&seed) {
+                15
+            } else {
+                seed
+            }
+        }
+        // No case in C's switch: STRING, ENUM/MENU, DEVICE, NOACCESS, links.
+        _ => seed,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -584,6 +638,53 @@ mod tests {
         // recGbl.c:410-413 / :414-417 — 1e30 and 1e300, not FLT_MAX/DBL_MAX.
         assert_eq!(r(DbFieldType::Float), Some((1e30, -1e30)));
         assert_eq!(r(DbFieldType::Double), Some((1e300, -1e300)));
+    }
+
+    /// Every branch of C's `recGblGetPrec` switch (`recGbl.c:119-144`).
+    /// C mutates the caller's seed, so each case is pinned as
+    /// `(seed) -> post-call buffer`.
+    #[test]
+    fn rec_gbl_get_prec_matches_the_c_switch() {
+        // recGbl.c:123-131 — every integer type forces 0, whatever the seed.
+        for t in [
+            DbFieldType::Char,
+            DbFieldType::UChar,
+            DbFieldType::Short,
+            DbFieldType::UShort,
+            DbFieldType::Long,
+            DbFieldType::ULong,
+            DbFieldType::Int64,
+            DbFieldType::UInt64,
+        ] {
+            assert_eq!(rec_gbl_get_prec(Some(t), 7), 0, "{t:?}");
+            assert_eq!(rec_gbl_get_prec(Some(t), 0), 0, "{t:?}");
+        }
+        // recGbl.c:133-137 — FLOAT/DOUBLE clamp OUT-OF-RANGE to 15 and keep
+        // an in-range seed. The boundaries are inclusive on both ends.
+        for t in [DbFieldType::Float, DbFieldType::Double] {
+            assert_eq!(rec_gbl_get_prec(Some(t), 7), 7, "{t:?}");
+            assert_eq!(rec_gbl_get_prec(Some(t), 0), 0, "{t:?}");
+            assert_eq!(rec_gbl_get_prec(Some(t), 15), 15, "{t:?}");
+            assert_eq!(rec_gbl_get_prec(Some(t), 16), 15, "{t:?}");
+            assert_eq!(rec_gbl_get_prec(Some(t), -1), 15, "{t:?}");
+        }
+    }
+
+    /// C's `default: break` (`recGbl.c:141-143`) and the runtime-retyped
+    /// field: the seed survives. `recGblGetPrec` reads the STATIC
+    /// `pdbFldDes->field_type` (`recGbl.c:121`), so a `cvt_dbaddr` retype
+    /// never reaches the switch — `None` is that field.
+    #[test]
+    fn rec_gbl_get_prec_leaves_the_seed_where_c_has_no_case() {
+        for t in [
+            Some(DbFieldType::String),
+            Some(DbFieldType::Enum),
+            // Runtime-typed (DBF_NOACCESS in the dbd).
+            None,
+        ] {
+            assert_eq!(rec_gbl_get_prec(t, 7), 7, "{t:?}");
+            assert_eq!(rec_gbl_get_prec(t, 99), 99, "{t:?}");
+        }
     }
 
     /// `DBF_INT64`'s upper bound is 2^63 — `INT64_MAX + 1`, not `INT64_MAX`

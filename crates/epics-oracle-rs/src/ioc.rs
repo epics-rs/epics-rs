@@ -121,6 +121,59 @@ pub fn alloc_free_port() -> Result<u16, BootError> {
     err("could not find a port free on both UDP and TCP after 64 tries")
 }
 
+/// Tell a `softIoc`-family binary to serve `db`, by whichever route that `db`
+/// requires.
+///
+/// **The single owner of the load route**, shared by [`CIoc`] (base's fat
+/// `softIoc`) and [`PvxIoc`] (the fat `softIocPVX`) because both are built from
+/// base's `softMain` and both must stage an asyn reproducer *identically*. If
+/// the two sides staged it differently the oracle would be diffing two
+/// different configurations while reporting on one.
+///
+/// An asyn reproducer names a port ([`crate::ORACLE_ASYN_PORT`]) that must
+/// already exist when `init_record` connects the record. `softMain` gates its
+/// auto-`iocInit` on a `-d` load and runs a positional st.cmd *before* it, so
+/// `-d` can only create the port too late. Measured on the fat `softIocPVX`,
+/// which is exactly what makes this route mandatory rather than stylistic:
+///
+/// ```text
+/// -S -d asyn.db  -> T:ASYN: Connect error, status=3,
+///                   asynManager:connectDevice port ORACLEASYN not found
+/// -S asyn.st.cmd -> T:ASYN: queueRequest failed
+/// ```
+///
+/// Both then print `iocRun: All initialization complete`, so `-d` *boots* — it
+/// just boots a record that never found its port. That is the shape of failure
+/// this harness exists to not accept. The st.cmd route reaches the intended
+/// state: the port exists, the record is attached, and only the device is
+/// unreachable — `queueRequest failed` is the disconnected `localhost:1`
+/// talking, which is the point (it mirrors the Rust `NullOctetPort`:
+/// noAutoConnect → CNCT/AUCT=0, {octet,option} → the `*IV` set).
+///
+/// Every other record type keeps the plain `-d` path.
+fn load_db_into(cmd: &mut Command, db: &Path) -> Result<(), BootError> {
+    let db_text = std::fs::read_to_string(db)
+        .map_err(|e| BootError(format!("read db {}: {e}", db.display())))?;
+    if !db_text.contains(crate::ORACLE_ASYN_PORT) {
+        cmd.arg("-d").arg(db);
+        return Ok(());
+    }
+
+    let db_abs = db.canonicalize().unwrap_or_else(|_| db.to_path_buf());
+    let st_cmd = db.with_extension("st.cmd");
+    let script = format!(
+        "drvAsynIPPortConfigure(\"{port_name}\",\"localhost:1\",0,1,0)\n\
+         dbLoadRecords(\"{db}\")\n\
+         iocInit\n",
+        port_name = crate::ORACLE_ASYN_PORT,
+        db = db_abs.display(),
+    );
+    std::fs::write(&st_cmd, script)
+        .map_err(|e| BootError(format!("write st.cmd {}: {e}", st_cmd.display())))?;
+    cmd.arg(&st_cmd);
+    Ok(())
+}
+
 /// A booted IOC serving a `.db` on a known-exclusive CA port.
 pub trait Ioc {
     /// The CA server port: both the UDP search port and (for a healthy boot)
@@ -236,38 +289,9 @@ impl CIoc {
     }
 
     fn try_boot(tools: &CTools, db: &Path, port: u16) -> Result<Self, BootError> {
-        // An asyn reproducer names a port (`ORACLE_ASYN_PORT`) that must already
-        // exist when `init_record` connects the record — otherwise the C asyn
-        // record errors on boot. The fat softIoc runs a positional st.cmd
-        // *before* its `iocInit`, but only owns that `iocInit` when no `-d` is
-        // given (softMain gates its auto-`iocInit` on a `-d` load). So an
-        // asyn-bearing db is driven through an st.cmd that creates the port,
-        // loads the db, then runs `iocInit` itself (softMain "approach A"); the
-        // registered-but-disconnected `drvAsynIPPort` mirrors the Rust
-        // `NullOctetPort` (noAutoConnect → CNCT/AUCT=0, {octet,option} → the
-        // `*IV` set). Every other record type keeps the plain `-d` path.
-        let db_text = std::fs::read_to_string(db)
-            .map_err(|e| BootError(format!("read db {}: {e}", db.display())))?;
-        let needs_asyn_port = db_text.contains(crate::ORACLE_ASYN_PORT);
-
         let mut cmd = Command::new(&tools.ioc_bin);
         cmd.arg("-S"); // no interactive shell
-        if needs_asyn_port {
-            let db_abs = db.canonicalize().unwrap_or_else(|_| db.to_path_buf());
-            let st_cmd = db.with_extension("st.cmd");
-            let script = format!(
-                "drvAsynIPPortConfigure(\"{port_name}\",\"localhost:1\",0,1,0)\n\
-                 dbLoadRecords(\"{db}\")\n\
-                 iocInit\n",
-                port_name = crate::ORACLE_ASYN_PORT,
-                db = db_abs.display(),
-            );
-            std::fs::write(&st_cmd, script)
-                .map_err(|e| BootError(format!("write st.cmd {}: {e}", st_cmd.display())))?;
-            cmd.arg(&st_cmd);
-        } else {
-            cmd.arg("-d").arg(db);
-        }
+        load_db_into(&mut cmd, db)?;
         let mut child = cmd
             .env("EPICS_CAS_INTF_ADDR_LIST", "127.0.0.1")
             .env("EPICS_CAS_BEACON_ADDR_LIST", "127.0.0.1")
@@ -656,6 +680,20 @@ pub struct PvxTools {
 impl PvxTools {
     pub const DEFAULT_BIN: &'static str = "/home/stevek/work/epics-modules/pvxs/bin/linux-x86_64";
 
+    /// The **fat** `softIocPVX` — QSRV2 plus the same busy/calc/asyn support the
+    /// fat CA [`CTools::DEFAULT_IOC_BIN`] links, so the PVA ground truth serves
+    /// the same record types the `.dbd` denominator enumerates.
+    ///
+    /// Stock pvxs `softIocPVX` cannot load six of them (`acalcout`, `asyn`,
+    /// `busy`, `scalcout`, `sseq`, `transform`): it exits during boot and every
+    /// channel of those types scored ERROR — 835 of 3386, which is why coverage
+    /// was capped at 75.3% by the *instrument* rather than by the port. It lives
+    /// under `oracle-ioc/` rather than in the pvxs tree, exactly like its CA
+    /// sibling; the client tools still come from `bin`. It derives its dbd from
+    /// its own exe dir, so no `-D` is passed.
+    pub const DEFAULT_IOC_BIN: &'static str =
+        "/home/stevek/work/oracle-ioc/bin/linux-x86_64/softIocPVX";
+
     /// The client tools this harness actually invokes. Verified up front so a
     /// missing binary is one loud error rather than an "errored" verdict on
     /// every case.
@@ -677,11 +715,18 @@ impl PvxTools {
                 return err(format!("missing pvxs tool `{tool}` in {}", bin.display()));
             }
         }
-        let ioc_bin = bin.join("softIocPVX");
+        // Same discipline as `CTools::discover`: the fat IOC is named, verified,
+        // and its absence is one loud error. Never fall back to the stock
+        // `softIocPVX` in `bin` — it cannot load six of the denominator's record
+        // types, so a silent fallback would turn a missing build into 835
+        // ERRORs and a 75.3% coverage number that looks like a port problem.
+        let ioc_bin = std::env::var("EPICS_ORACLE_PVX_IOC_BIN")
+            .unwrap_or_else(|_| Self::DEFAULT_IOC_BIN.to_string());
+        let ioc_bin = PathBuf::from(ioc_bin);
         if !ioc_bin.is_file() {
             return err(format!(
-                "pvxs `softIocPVX` not found at {}. The PVA oracle cannot run \
-                 without ground truth.",
+                "fat `softIocPVX` not found at {}. Build it under oracle-ioc/ (or set \
+                 EPICS_ORACLE_PVX_IOC_BIN). The PVA oracle cannot run without ground truth.",
                 ioc_bin.display()
             ));
         }
@@ -718,10 +763,13 @@ impl PvxIoc {
     }
 
     fn try_boot(tools: &PvxTools, db: &Path, udp: u16, ca: u16) -> Result<Self, BootError> {
-        let mut child = Command::new(&tools.ioc_bin)
-            .arg("-S") // no interactive shell
-            .arg("-d")
-            .arg(db)
+        let mut cmd = Command::new(&tools.ioc_bin);
+        cmd.arg("-S"); // no interactive shell
+        // The same load route as the CA side, from the same owner: the fat
+        // `softIocPVX` is a `softMain` too, so an asyn db needs its port created
+        // before `iocInit` here exactly as it does there.
+        load_db_into(&mut cmd, db)?;
+        let mut child = cmd
             // --- PVA server, loopback only. Names verified against pvxs
             // `src/config.cpp:402-432`, not guessed. ---
             .env("EPICS_PVAS_INTF_ADDR_LIST", "127.0.0.1")
@@ -907,6 +955,65 @@ fn verify_sole_server(tools: &PvxTools, port: u16, side: Side) -> Result<(), Boo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn args_of(cmd: &Command) -> Vec<String> {
+        cmd.get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect()
+    }
+
+    /// An asyn db MUST go through the st.cmd route, and every other db MUST NOT.
+    ///
+    /// The boundary is worth pinning because the wrong branch fails *silently*:
+    /// `-S -d asyn.db` still prints `iocRun: All initialization complete`, so the
+    /// IOC boots and serves — with a record that never found its port
+    /// (`connectDevice port ORACLEASYN not found`). Nothing downstream would
+    /// report that as anything but a diff against the Rust side.
+    #[test]
+    fn only_an_asyn_db_is_staged_through_a_script() {
+        let dir = std::env::temp_dir().join(format!("oracle_load_route_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("workdir");
+
+        let plain = dir.join("plain.db");
+        std::fs::write(&plain, crate::record_stmt("ai", "ORACLE:AI")).expect("write");
+        let mut cmd = Command::new("softIoc");
+        load_db_into(&mut cmd, &plain).expect("load");
+        let a = args_of(&cmd);
+        assert!(
+            a.contains(&"-d".to_string()),
+            "a plain db loads with -d: {a:?}"
+        );
+        assert!(
+            !a.iter().any(|x| x.ends_with("st.cmd")),
+            "a plain db needs no script: {a:?}",
+        );
+
+        let asyn = dir.join("asyn.db");
+        std::fs::write(&asyn, crate::record_stmt("asyn", "ORACLE:ASYN")).expect("write");
+        let mut cmd = Command::new("softIoc");
+        load_db_into(&mut cmd, &asyn).expect("load");
+        let a = args_of(&cmd);
+        assert!(
+            !a.contains(&"-d".to_string()),
+            "-d would defer the script past iocInit, so the port would not exist \
+             when the record connects: {a:?}",
+        );
+        let script = a.iter().find(|x| x.ends_with("st.cmd")).expect("a script");
+
+        // The script must create the port BEFORE it loads the db and inits.
+        let text = std::fs::read_to_string(script).expect("read script");
+        let at = |needle: &str| {
+            text.find(needle)
+                .unwrap_or_else(|| panic!("{needle} in {text}"))
+        };
+        assert!(
+            at(crate::ORACLE_ASYN_PORT) < at("dbLoadRecords")
+                && at("dbLoadRecords") < at("iocInit"),
+            "order must be port -> load -> init, got:\n{text}",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn allocated_port_is_free_on_both_protocols() {

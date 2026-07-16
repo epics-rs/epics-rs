@@ -2,6 +2,11 @@ record(motor, "$(P)$(M)") {
     field(DTYP, "simMotor_$(PORT)")
     field(SCAN, "Passive")
     field(VELO, "$(VELO=1.0)")
+    # HVEL must be configured for homing to be usable: C leaves HVEL at 0
+    # (no dbd initial) and check_speed_and_resolution derives it from VBAS
+    # (motorRecord.cc:4064-4065), which is also 0 here — the home dispatch
+    # would send SET_VELOCITY 0 (C 2047 has no zero guard).
+    field(HVEL, "$(HVEL=1.0)")
     field(ACCL, "$(ACCL=0.5)")
     field(DHLM, "$(HLM=100.0)")
     field(DLLM, "$(LLM=-100.0)")

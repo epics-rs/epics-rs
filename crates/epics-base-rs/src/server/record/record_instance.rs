@@ -2700,12 +2700,10 @@ impl RecordInstance {
                 // Store the raw put byte (C keeps the epicsUInt8 verbatim); a
                 // record that re-derives UDF on process overwrites it, one that
                 // sources nothing this cycle keeps it (put-defect cluster #3).
+                // The calc family reads UDF straight from `common` too
+                // (`clears_udf() == false`), so the stored byte stands.
                 if let EpicsValue::Char(v) = value {
                     self.common.udf = v;
-                    // Sync a record that shadows UDF in `value_is_undefined()`
-                    // (calc family), so the put wins over its cell on the
-                    // re-derivation UDF's `pp(TRUE)` process triggers next.
-                    self.record.set_udf_from_put(v != 0);
                 }
             }
             "UDFS" => {

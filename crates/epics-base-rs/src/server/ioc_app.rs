@@ -1840,6 +1840,13 @@ mod tests {
             fn io_intr_scan_independent(&self) -> bool {
                 true
             }
+            // ...and take the C `newOutputCallbackValue` readback branch on
+            // callback cycles (never re-write the setpoint). Devices that do
+            // not declare this — e.g. devMotorAsyn — still write on callback
+            // passes; that default-false path has its own regression tests.
+            fn output_callback_readback(&self) -> bool {
+                true
+            }
             fn read(
                 &mut self,
                 record: &mut dyn crate::server::record::Record,

@@ -237,6 +237,26 @@ pub trait DeviceSupport: Send + Sync + 'static {
     /// entry. Default no-op; see [`Self::arm_readback_callback`].
     fn reconcile_readback_callback(&mut self) {}
 
+    /// Whether a driver-callback (`asyn:READBACK`) processing cycle replaces
+    /// this device's output stage with a value readback.
+    ///
+    /// C devEpics (`devAsynInt32.c::processAo`/`processBo`/…) takes the
+    /// `newOutputCallbackValue` readback branch on a callback cycle and never
+    /// calls the output `write()` — re-writing would re-assert the setpoint
+    /// and re-trigger the driver (the AD `Acquire` loop). Only device support
+    /// implementing that contract (the [`Self::arm_readback_callback`] /
+    /// [`Self::reconcile_readback_callback`] pair) returns `true`.
+    ///
+    /// Default `false`: a C `dbProcess` driven by a driver callback is a full
+    /// record process, output stage included. `devMotorAsyn` has no readback
+    /// suppression — the motor record dispatches its retry, backlash-leg,
+    /// NTM-stop, and queued-motion-resume commands from exactly these
+    /// CALLBACK_DATA passes, and suppressing the write strands them in the
+    /// command mailbox (DMOV stuck 0, MIP=RETRY|MOVE, later puts time out).
+    fn output_callback_readback(&self) -> bool {
+        false
+    }
+
     /// Begin an asynchronous write (submit only, no blocking).
     /// Returns `Some(handle)` if the write was submitted to a worker queue —
     /// the caller should wait on the handle outside any record lock.

@@ -131,3 +131,159 @@ async fn pid_gain_put_rides_its_pass_to_the_driver() {
         "SetPidGain forwarded through the put's process pass"
     );
 }
+
+/// A retry dispatch is emitted on a driver-callback (CALLBACK_DATA) pass —
+/// C `maybeRetry` arms MIP_RETRY and the same `dbProcess` re-enters
+/// `do_work`, whose move block re-fires through devMotorAsyn's write. The
+/// framework's driver-callback entry (`process_record_readback`) must
+/// therefore run the motor's output stage: the regression suppressed it
+/// (asyn `newOutputCallbackValue` semantics applied to every output
+/// record), so the retry command rotted in the mailbox and the record
+/// stuck at DMOV=0, MIP=RETRY|MOVE, with every later put timing out.
+#[tokio::test]
+async fn retry_dispatched_on_callback_pass_reaches_the_driver() {
+    use asyn_rs::error::AsynError;
+    use asyn_rs::interfaces::motor::{AsynMotor, MotorStatus};
+    use asyn_rs::user::AsynUser;
+    use motor_rs::device_state::StampedStatus;
+    use motor_rs::device_support::MotorDeviceSupport;
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    /// Lands 0.05 EGU short of the first commanded target, exactly on
+    /// target afterwards — so the first completion needs one retry.
+    struct UndershootMotor {
+        position: f64,
+        moves: Arc<AtomicU32>,
+    }
+    impl AsynMotor for UndershootMotor {
+        fn poll(&mut self, _user: &AsynUser) -> Result<MotorStatus, AsynError> {
+            Ok(MotorStatus {
+                position: self.position,
+                done: true,
+                ..MotorStatus::default()
+            })
+        }
+        fn move_absolute(
+            &mut self,
+            _user: &AsynUser,
+            position: f64,
+            _min_vel: f64,
+            _max_vel: f64,
+            _accel: f64,
+        ) -> Result<(), AsynError> {
+            let n = self.moves.fetch_add(1, Ordering::SeqCst);
+            self.position = if n == 0 { position - 0.05 } else { position };
+            Ok(())
+        }
+        fn stop(&mut self, _user: &AsynUser, _accel: f64) -> Result<(), AsynError> {
+            Ok(())
+        }
+        fn home(
+            &mut self,
+            _user: &AsynUser,
+            _min_vel: f64,
+            _max_vel: f64,
+            _accel: f64,
+            _forwards: bool,
+        ) -> Result<(), AsynError> {
+            Ok(())
+        }
+        fn set_position(&mut self, _user: &AsynUser, position: f64) -> Result<(), AsynError> {
+            self.position = position;
+            Ok(())
+        }
+    }
+
+    let moves = Arc::new(AtomicU32::new(0));
+    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(UndershootMotor {
+        position: 0.0,
+        moves: moves.clone(),
+    }));
+    let user = AsynUser::new(0);
+
+    let state = motor_rs::device_state::new_shared_state();
+    let mut rec = MotorRecord::new();
+    rec.set_device_state(state.clone());
+    rec.conv.mres = 0.001;
+    rec.limits.dhlm = 100.0;
+    rec.limits.dllm = -100.0;
+    rec.limits.hlm = 100.0;
+    rec.limits.llm = -100.0;
+    rec.limits.lvio = false;
+    rec.vel.velo = 100000.0;
+    rec.vel.accl = 0.5;
+    rec.stat.msta = MstaFlags::DONE;
+
+    // poll_cmd_rx is held alive so PollDirective sends succeed; the test
+    // drives statuses by hand instead of running the poll loop.
+    let (poll_cmd_tx, _poll_cmd_rx) = tokio::sync::mpsc::channel(16);
+    let mut dev = MotorDeviceSupport::new(
+        motor.clone(),
+        0,
+        Duration::from_secs(1),
+        poll_cmd_tx,
+        state.clone(),
+    );
+    {
+        use epics_base_rs::server::device_support::DeviceSupport;
+        use epics_base_rs::server::record::Record;
+        dev.init(&mut rec as &mut dyn Record).unwrap();
+    }
+
+    let db = PvDatabase::new();
+    db.add_record("M1", Box::new(rec)).await.unwrap();
+    if let Some(arc) = db.get_record("M1").await {
+        let mut inst = arc.write().await;
+        inst.common.dtyp = "simMotor".to_string();
+        inst.device = Some(Box::new(dev));
+    }
+
+    // Startup pass consumes the init-seeded status (seq 1).
+    let mut visited = HashSet::new();
+    db.process_record_readback("M1", &mut visited, 0)
+        .await
+        .unwrap();
+
+    // Move to 1.0 — the put pass dispatches, the driver undershoots.
+    db.put_record_field_from_ca_no_notify("M1", "VAL", EpicsValue::Double(1.0))
+        .await
+        .unwrap();
+    assert_eq!(moves.load(Ordering::SeqCst), 1, "put pass dispatched");
+
+    // Completion callback pass: diff = 0.05 >= RDBD -> maybeRetry arms and
+    // re-dispatches ON THIS PASS. The write must reach the driver.
+    let stamp = |seq: u64| {
+        let status = motor.lock().unwrap().poll(&user).unwrap();
+        state.lock().unwrap().latest_status = Some(StampedStatus { seq, status });
+    };
+    stamp(2);
+    let mut visited = HashSet::new();
+    db.process_record_readback("M1", &mut visited, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        moves.load(Ordering::SeqCst),
+        2,
+        "the retry emitted on the callback pass must reach the driver"
+    );
+
+    // Retry landed on target: the next callback pass finalizes.
+    stamp(3);
+    let mut visited = HashSet::new();
+    db.process_record_readback("M1", &mut visited, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.get_pv("M1.DMOV").await.unwrap(),
+        EpicsValue::Short(1),
+        "retry completion finalizes the motion"
+    );
+    assert_eq!(
+        db.get_pv("M1.MIP").await.unwrap(),
+        EpicsValue::Short(0),
+        "MIP collapses to DONE after the retry converges"
+    );
+}

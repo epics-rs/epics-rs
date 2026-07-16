@@ -3215,14 +3215,24 @@ impl PvDatabase {
                 } else {
                     None
                 }
-            } else if device_callback {
-                // Driver-callback (`asyn:READBACK`) cycle on a hardware output:
-                // the new value was read back into VAL by the read stage above;
+            } else if device_callback
+                && instance
+                    .device
+                    .as_ref()
+                    .is_some_and(|d| d.output_callback_readback())
+            {
+                // Driver-callback (`asyn:READBACK`) cycle on a hardware output
+                // whose device support takes the callback-readback branch: the
+                // new value was read back into VAL by the read stage above;
                 // writing it here would re-assert the setpoint to the driver and
                 // re-trigger it (the AD `Acquire` loop). C
                 // `devAsynInt32.c::processBo` takes the `newOutputCallbackValue`
                 // readback branch and never calls `processCallbackOutput`'s
-                // `write()` on a callback cycle.
+                // `write()` on a callback cycle. Devices without that contract
+                // (`output_callback_readback` false — devMotorAsyn) run their
+                // output stage on callback cycles like any other C `dbProcess`:
+                // the motor record's retry / backlash / NTM-stop commands are
+                // emitted on exactly these passes.
                 None
             } else if !record_should_output {
                 // OOPT gating for hardware outputs (longout DTYP=...).

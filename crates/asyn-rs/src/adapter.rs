@@ -2809,6 +2809,16 @@ impl DeviceSupport for AsynDeviceSupport {
         }
     }
 
+    fn output_callback_readback(&self) -> bool {
+        // The C `newOutputCallbackValue` contract applies exactly where
+        // `arm_readback_callback` arms: asyn:READBACK outputs (PRs #60/#208),
+        // whose callback cycle reads the driver value back and must not
+        // re-write the setpoint. Records without the readback subscription
+        // keep the full output stage on callback cycles, like any C
+        // `dbProcess`.
+        self.asyn_readback
+    }
+
     fn property_post_receiver(
         &mut self,
     ) -> Option<tokio::sync::mpsc::Receiver<Vec<(String, EpicsValue)>>> {

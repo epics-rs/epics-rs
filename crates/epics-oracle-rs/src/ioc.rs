@@ -638,28 +638,19 @@ pub struct PvxTools {
     pub bin: PathBuf,
     /// pvxs QSRV2's IOC binary — the PVA ground truth.
     pub ioc_bin: PathBuf,
-    /// A deliberately **quiet** port for the client tools to receive beacons
-    /// on (`EPICS_PVA_BROADCAST_PORT`).
-    ///
-    /// A pvxs client always binds that port and listens for beacons
-    /// (`client.cpp:641`), and `pvxlist` reports servers it learns about
-    /// *from beacons* as well as from searches ("Monitor server beacons to
-    /// detect servers coming online"). Left at pvxs's default the client
-    /// would hear every PVA server on this host — which made
-    /// [`verify_sole_server`] intermittently report a foreign server as a
-    /// second server on our port, an ERROR verdict caused entirely by the
-    /// instrument. (Observed: `2 PVA servers answer on the C side's UDP
-    /// port`, with only our own pair running and nothing else on that port.)
-    ///
-    /// So the tools are pointed at a port nothing beacons to. Nothing else
-    /// should be able to influence a reading; the search target is named
-    /// explicitly in the address list and never comes from here.
-    ///
-    /// It must not be either side's search port: the client *binds* it, and
-    /// the Rust side's kernel-assigned socket is exclusively owned (no
-    /// SO_REUSEPORT), so aiming it there fails the tool outright. Allocated
-    /// like every other port here — by binding.
-    pub beacon_port: u16,
+    // NO beacon port here, on purpose. The client tools need one, but a client
+    // *binds* it, so the number must be one no live server holds — and
+    // `alloc_free_port` releases the port it names, so a number allocated once
+    // at start-up is owned by nobody. Any later allocation may legitimately
+    // hand it to a `softIocPVX` or `oracle-ioc` search port, after which every
+    // client aimed at it dies on `Address already in use` for the life of that
+    // pair (measured: 45 channels of one record type, ERROR, nondeterministic).
+    // The invariant this field's docs used to *state* — "must not be either
+    // side's search port" — was enforced by nothing. It is now enforced by
+    // construction in `crate::pvatool::PvaTools::run_raw`, which allocates the
+    // port immediately before spawning, when the pair's sockets are live and
+    // therefore excluded. The field is deleted rather than left unused so the
+    // shared number cannot come back.
 }
 
 impl PvxTools {
@@ -694,12 +685,7 @@ impl PvxTools {
                 ioc_bin.display()
             ));
         }
-        let beacon_port = alloc_free_port()?;
-        Ok(Self {
-            bin,
-            ioc_bin,
-            beacon_port,
-        })
+        Ok(Self { bin, ioc_bin })
     }
 }
 

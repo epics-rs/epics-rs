@@ -26,13 +26,17 @@ enum Phase {
     Put,
     /// Monitor event sequence and count.
     Monitor,
-    /// **PVA** read skeleton: `pvxget` each record on pvxs QSRV2
-    /// (`softIocPVX`) and on `oracle-ioc --pva`, and diff the text.
+    /// **PVA** read: every channel of the `.dbd` surface on pvxs QSRV2
+    /// (`softIocPVX`) and on `oracle-ioc --pva`, on two contracts — the
+    /// declared type (`pvxinfo`) and the value+marking (`pvxget`).
     ///
-    /// Deliberately outside `All`. `All` means "every CA phase", and its
-    /// coverage number is a percentage of the `.dbd` denominator; this phase
-    /// has no denominator yet, so folding it in would let a hand-picked
-    /// record-type list borrow the credibility of an enumerated surface.
+    /// Deliberately outside `All`. It shares the CA phases' denominator (QSRV2
+    /// serves base's dbChannel namespace) but nothing else: a different ground
+    /// truth (`softIocPVX`, not base's `softIoc`), a different instrument
+    /// (`pvxget`, not `caget`), and no allowlist — `doc/upstream-c-bugs.md` is
+    /// about C's CA behaviour and justifies nothing about QSRV2. Folding it
+    /// into `All` would merge two populations of cases whose verdicts are not
+    /// comparable, into one set of counts.
     PvaRead,
     All,
 }
@@ -86,7 +90,7 @@ async fn run() -> Result<ExitCode, String> {
     let args = Args::parse();
 
     if args.phase == Phase::PvaRead {
-        return run_pva_read(&args);
+        return run_pva_read(&args).await;
     }
 
     // Ground truth must exist. Without it there is nothing to diff against, and
@@ -218,28 +222,37 @@ async fn run() -> Result<ExitCode, String> {
     })
 }
 
-/// The PVA read skeleton. Its own path rather than a branch inside the CA run:
-/// it has a different ground truth (pvxs `softIocPVX`, not base's `softIoc`), a
-/// different instrument (`pvxget`, not `caget`), and no `.dbd` denominator — so
-/// the `.dbd`/allowlist/coverage machinery above has nothing to say about it,
-/// and pretending otherwise is how a skeleton starts reporting numbers it has
-/// not earned.
-fn run_pva_read(args: &Args) -> Result<ExitCode, String> {
+/// The PVA read phase. Its own path rather than a branch inside the CA run: it
+/// has a different ground truth (pvxs `softIocPVX`, not base's `softIoc`), a
+/// different instrument (`pvxget`/`pvxinfo`, not `caget`), and no allowlist, so
+/// the CA allowlist/report machinery above has nothing to say about it.
+///
+/// What it *does* share is the denominator, and that is not a convenience: QSRV2
+/// hands channel names straight to base's `dbChannelTest`
+/// (`singlesource.cpp:469`), so its namespace is exactly the `record.FIELD` set
+/// [`Surface`] already enumerates from the `.dbd`.
+async fn run_pva_read(args: &Args) -> Result<ExitCode, String> {
+    // Ground truth must exist. Without it there is nothing to diff against, and
+    // pretending otherwise would be the worst possible failure mode.
     let tools = PvxTools::discover().map_err(|e| e.to_string())?;
+    let dbd = Dbd::parse_file(&args.dbd)?;
 
-    let types: Vec<String> = match &args.record_types {
-        Some(rts) => rts.clone(),
-        None => pvaread::SKELETON_TYPES
-            .iter()
-            .map(|s| s.to_string())
-            .collect(),
-    };
+    // Which record types the port implements is MEASURED, not read out of its
+    // source -- the same probe the CA phases use, for the same reason.
+    eprintln!("probing which record types the port implements...");
+    let supported = probe_supported_record_types(&dbd).await;
+    let surface = Surface::build(&dbd, &supported);
+    let types = select_types(&surface, &args.record_types);
+
     eprintln!(
-        "pva read skeleton: {} record types (hand-picked, NOT an enumerated surface)",
-        types.len()
+        "denominator: {} PVA channels across {} record types ({} unimplemented)",
+        surface.denominator(),
+        surface.covered_types.len(),
+        surface.unimplemented_types.len()
     );
 
-    let report = pvaread::probe(&tools, &workdir(None)?, &types);
+    let cases = pvaread::probe(&tools, &workdir(None)?, &surface, &types);
+    let report = pvaread::report(&args.dbd.display().to_string(), &surface, cases);
     report.counts.check()?;
 
     if let Some(p) = &args.json {

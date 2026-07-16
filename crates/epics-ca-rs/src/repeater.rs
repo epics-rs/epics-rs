@@ -597,7 +597,15 @@ async fn try_register(repeater_port: u16) -> Result<(), ()> {
 /// Falls back to an in-process repeater thread if the binary is not found.
 fn spawn_repeater() {
     let exe = std::env::current_exe().unwrap_or_default();
-    let repeater_bin = exe.parent().map(|p| p.join("ca-repeater-rs"));
+    // The sibling binary carries the platform executable suffix: on Windows
+    // it is `ca-repeater-rs.exe`. Joining the bare stem made `bin.exists()`
+    // always false there, so every client fell through to the in-process
+    // repeater fallback — which re-resolves `EPICS_CA_REPEATER_PORT` (and
+    // re-prints its diagnostics into the client's own stderr) instead of
+    // spawning the shared daemon C `caStartRepeaterIfNotInstalled` starts.
+    let repeater_bin = exe
+        .parent()
+        .map(|p| p.join(format!("ca-repeater-rs{}", std::env::consts::EXE_SUFFIX)));
 
     // Try external binary first
     if let Some(ref bin) = repeater_bin {

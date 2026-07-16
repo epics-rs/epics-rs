@@ -366,16 +366,19 @@ mod tests {
 
     #[tokio::test]
     async fn tcp_listener_forwards_accepted_socket() {
-        // Pick an OS-assigned port.
+        // Bind once, to an OS-assigned port, and read the real address
+        // back from that same listener before handing it to
+        // `run_tcp_accept` — no separate bind-query-drop-then-reuse-the-
+        // number step, so nothing else on the box can steal the port in
+        // between (that was this test's own flake: another test's ephemeral
+        // bind could land on the number in the gap between `drop(listener)`
+        // and `tcp_listen(actual)` re-binding it).
         let bind = "127.0.0.1:0".parse::<SocketAddr>().unwrap();
-        // Bind first to learn the port, then re-bind via run_tcp on
-        // that exact port. Simpler: just bind once and use the port.
-        let listener = tokio::net::TcpListener::bind(bind).await.unwrap();
+        let listener = tcp_listen(bind).unwrap();
         let actual = listener.local_addr().unwrap();
-        drop(listener);
+        let std_l = listener.into_std().unwrap();
 
         let (tx, mut rx) = mpsc::channel(4);
-        let std_l = tcp_listen(actual).unwrap().into_std().unwrap();
         let server = tokio::spawn(async move { run_tcp_accept(std_l, false, tx).await });
 
         // Give the listener a moment to bind.

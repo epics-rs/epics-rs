@@ -65,32 +65,45 @@ fn cat_config(port: u16) -> ProcServConfig {
     }
 }
 
-/// Allocate an OS-assigned localhost port: bind to :0, query, drop.
-async fn pick_port() -> u16 {
-    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let p = l.local_addr().unwrap().port();
-    drop(l);
-    p
-}
-
 /// Bind `cfg`'s configured endpoints immediately and return a `ProcServ`
 /// ready to `.run()` (its listeners pre-bound via `with_prebound`)
 /// together with the real port(s) it is now listening on — control
 /// port(s) first (`cfg.listen.control` order), then the log port if one
 /// is configured. Build `cfg` with port `0` placeholders (`cat_config(0)`)
-/// and use this instead of `pick_port()` when a test's own load-bearing
-/// assertions depend on the server actually being reachable: unlike
-/// bind-query-drop-then-reuse-the-number, which races anyone else on the
-/// box binding an ephemeral port in that gap, the listener here is
-/// already bound before this function returns — nothing can steal the
-/// port in between.
-async fn spawn_bound(cfg: ProcServConfig) -> (ProcServ, Vec<u16>) {
+/// and use this for every test: unlike bind-query-drop-then-reuse-the-
+/// number (this used to be a `pick_port()` helper, removed — its own
+/// gap raced anyone else on the box binding an ephemeral port in that
+/// window), the listener here is already bound before this function
+/// returns — nothing can steal the port in between.
+///
+/// Also rewrites `cfg`'s `:0` placeholders to the addresses actually
+/// bound before constructing the `ProcServ`: `bootstrap` publishes the
+/// info file / `PROCSERV_INFO` env from `config.listen` verbatim, not
+/// from the prebound listeners, so a config left at `:0` would report an
+/// unusable port there even though the listener itself is bound and
+/// reachable.
+async fn spawn_bound(mut cfg: ProcServConfig) -> (ProcServ, Vec<u16>) {
     let listeners = bind_endpoints(&cfg).expect("bind configured endpoints");
-    let ports = listeners
+    let ports: Vec<u16> = listeners
         .iter()
         .filter_map(|l| l.local_addr())
         .map(|a| a.port())
         .collect();
+
+    let mut bound_tcp_addrs = listeners.iter().filter_map(|l| l.local_addr());
+    for ep in cfg
+        .listen
+        .control
+        .iter_mut()
+        .chain(cfg.listen.log.iter_mut())
+    {
+        if let Endpoint::Tcp(addr) = ep {
+            *addr = bound_tcp_addrs
+                .next()
+                .expect("a bound TCP address for each TCP control/log endpoint");
+        }
+    }
+
     let server = ProcServ::new(cfg).expect("build").with_prebound(listeners);
     (server, ports)
 }
@@ -182,9 +195,9 @@ fn strip_iac(input: &[u8]) -> Vec<u8> {
 
 #[tokio::test]
 async fn cat_round_trip_via_tcp_console() {
-    let port = pick_port().await;
-    let cfg = cat_config(port);
-    let server = ProcServ::new(cfg).expect("build");
+    let cfg = cat_config(0);
+    let (server, ports) = spawn_bound(cfg).await;
+    let port = ports[0];
 
     // Run server in a background task; we'll abort it at the end.
     let server_task = tokio::spawn(async move {
@@ -281,15 +294,15 @@ async fn occupied_control_port_fails_fast_not_headless() {
 /// to open without preventing the child from starting.
 #[tokio::test]
 async fn unwritable_pid_and_log_paths_do_not_abort_startup() {
-    let port = pick_port().await;
-    let mut cfg = cat_config(port);
+    let mut cfg = cat_config(0);
     // A missing intermediate directory makes both opens fail with ENOENT,
     // exercising the pid-file and log-file sites of the same defect family.
     let dir = tempfile::tempdir().unwrap();
     let bad = dir.path().join("does-not-exist");
     cfg.logging.log_path = Some(bad.join("ioc.log"));
     cfg.logging.pid_path = Some(bad.join("ioc.pid"));
-    let server = ProcServ::new(cfg).expect("build");
+    let (server, ports) = spawn_bound(cfg).await;
+    let port = ports[0];
 
     let server_task = tokio::spawn(async move {
         let _ = server.run().await;
@@ -325,9 +338,9 @@ async fn unwritable_pid_and_log_paths_do_not_abort_startup() {
 
 #[tokio::test]
 async fn kill_keystroke_signals_child() {
-    let port = pick_port().await;
-    let cfg = cat_config(port);
-    let server = ProcServ::new(cfg).expect("build");
+    let cfg = cat_config(0);
+    let (server, ports) = spawn_bound(cfg).await;
+    let port = ports[0];
 
     let server_task = tokio::spawn(async move {
         let _ = server.run().await;
@@ -389,9 +402,9 @@ async fn kill_keystroke_signals_child() {
 /// the next poll-loop iteration.
 #[tokio::test]
 async fn kill_key_on_a_dead_child_restarts_it_and_still_broadcasts() {
-    let port = pick_port().await;
-    let cfg = cat_config(port); // RestartMode::Disabled — no auto-respawn
-    let server = ProcServ::new(cfg).expect("build");
+    let cfg = cat_config(0); // RestartMode::Disabled — no auto-respawn
+    let (server, ports) = spawn_bound(cfg).await;
+    let port = ports[0];
     let server_task = tokio::spawn(async move {
         let _ = server.run().await;
     });
@@ -454,10 +467,9 @@ async fn server_messages_are_written_to_the_log() {
     let dir = tempfile::tempdir().unwrap();
     let log_path = dir.path().join("procserv.log");
 
-    let port = pick_port().await;
-    let mut cfg = cat_config(port);
+    let mut cfg = cat_config(0);
     cfg.logging.log_path = Some(log_path.clone());
-    let server = ProcServ::new(cfg).expect("build");
+    let (server, _ports) = spawn_bound(cfg).await;
     let server_task = tokio::spawn(async move {
         let _ = server.run().await;
     });
@@ -488,12 +500,16 @@ async fn log_port_client_is_readonly_but_receives_output() {
     // acceptFactory.cc:395). Verify a client on the log port (a) sees
     // child/party-line output and (b) cannot inject input — bytes it
     // sends never reach the child or the control client.
-    let ctl_port = pick_port().await;
-    let log_port = pick_port().await;
-    let mut cfg = cat_config(ctl_port);
-    cfg.listen.log = Some(Endpoint::Tcp(SocketAddr::from(([127, 0, 0, 1], log_port))));
+    let mut cfg = cat_config(0);
+    cfg.listen.log = Some(Endpoint::Tcp(SocketAddr::from(([127, 0, 0, 1], 0))));
 
-    let server = ProcServ::new(cfg).expect("build");
+    let (server, ports) = spawn_bound(cfg).await;
+    assert_eq!(
+        ports.len(),
+        2,
+        "expected a control and a log port, got: {ports:?}"
+    );
+    let (ctl_port, log_port) = (ports[0], ports[1]);
     let server_task = tokio::spawn(async move {
         let _ = server.run().await;
     });
@@ -670,12 +686,12 @@ async fn manual_restart_preempts_active_holdoff() {
     // (the child would already have auto-restarted and be alive), so the
     // manual "@@@ Restarting child" announcement would not appear before
     // the holdoff elapses.
-    let port = pick_port().await;
-    let mut cfg = cat_config(port);
+    let mut cfg = cat_config(0);
     cfg.restart_mode = RestartMode::OnExit;
     cfg.holdoff = Duration::from_secs(3); // long enough to observe the wait
 
-    let server = ProcServ::new(cfg).expect("build");
+    let (server, ports) = spawn_bound(cfg).await;
+    let port = ports[0];
     let server_task = tokio::spawn(async move {
         let _ = server.run().await;
     });
@@ -813,11 +829,11 @@ async fn client_keystrokes_are_not_forwarded_to_other_clients() {
     // there is no PTY to echo through, so a second client must see NOTHING
     // when the first types. Under the old `fanout_excluding(Some(sender))`
     // the bytes were forwarded straight to the other client and this fails.
-    let port = pick_port().await;
-    let mut cfg = cat_config(port); // RestartMode::Disabled
+    let mut cfg = cat_config(0); // RestartMode::Disabled
     cfg.child.program = PathBuf::from("/bin/sh");
     cfg.child.args = vec!["-c".into(), "exit 0".into()];
-    let server = ProcServ::new(cfg).expect("build");
+    let (server, ports) = spawn_bound(cfg).await;
+    let port = ports[0];
 
     let server_task = tokio::spawn(async move {
         let _ = server.run().await;
@@ -866,10 +882,10 @@ async fn ignored_chars_are_stripped_from_child_stdin() {
     // input through the ignore filter. A plain letter keeps the assertion
     // free of control-byte / PTY-special-char confounds; the always-active
     // command keys join this same set via the supervisor auto-append.
-    let port = pick_port().await;
-    let mut cfg = cat_config(port);
+    let mut cfg = cat_config(0);
     cfg.child.ignore_chars = vec![b'Z'];
-    let server = ProcServ::new(cfg).expect("build");
+    let (server, ports) = spawn_bound(cfg).await;
+    let port = ports[0];
     let server_task = tokio::spawn(async move {
         let _ = server.run().await;
     });
@@ -908,15 +924,14 @@ async fn child_exit_sigkills_orphaned_process_group() {
     // (same process group — no job control in a non-interactive shell),
     // records its PID to a file, then exits; the group SIGKILL must reap
     // the sleep.
-    let port = pick_port().await;
     let dir = tempfile::tempdir().unwrap();
     let pidfile = dir.path().join("gpid");
     let pf = pidfile.to_str().unwrap().to_string();
 
-    let mut cfg = cat_config(port); // Disabled: child exits, server stays up
+    let mut cfg = cat_config(0); // Disabled: child exits, server stays up
     cfg.child.program = PathBuf::from("/bin/sh");
     cfg.child.args = vec!["-c".into(), format!("sleep 30 & echo $! > '{pf}'; exit 0")];
-    let server = ProcServ::new(cfg).expect("build");
+    let (server, _ports) = spawn_bound(cfg).await;
     let server_task = tokio::spawn(async move { server.run().await });
 
     // Wait for the grandchild PID to be recorded.
@@ -1080,12 +1095,11 @@ async fn child_exit_code_becomes_server_exit_code() {
     // exit status (childExitCode → main return, procServ.cc:798,701).
     // Under one-shot the supervisor runs the child once then exits, so
     // `run()` resolves to the child's code. `sh -c 'exit 7'` → 7.
-    let port = pick_port().await;
-    let mut cfg = cat_config(port);
+    let mut cfg = cat_config(0);
     cfg.child.program = PathBuf::from("/bin/sh");
     cfg.child.args = vec!["-c".into(), "exit 7".into()];
     cfg.restart_mode = RestartMode::OneShot;
-    let server = ProcServ::new(cfg).expect("build");
+    let (server, _ports) = spawn_bound(cfg).await;
 
     let code = timeout(Duration::from_secs(5), server.run())
         .await
@@ -1184,9 +1198,9 @@ async fn banner_precedes_telnet_negotiation() {
     // telnet_negotiate (clientFactory.cc:153-174), so the first bytes on
     // the wire are the ASCII banner and the IAC (0xFF) negotiation follows.
     // The Rust port used to send the IAC handshake ahead of the greeting.
-    let port = pick_port().await;
-    let cfg = cat_config(port);
-    let server = ProcServ::new(cfg).expect("build");
+    let cfg = cat_config(0);
+    let (server, ports) = spawn_bound(cfg).await;
+    let port = ports[0];
     let server_task = tokio::spawn(async move {
         let _ = server.run().await;
     });
@@ -1233,8 +1247,7 @@ async fn banner_precedes_telnet_negotiation() {
 /// listening on. Pre-fix Rust removed only the pid file.
 #[tokio::test]
 async fn clean_shutdown_removes_both_the_info_and_pid_files() {
-    let port = pick_port().await;
-    let mut cfg = cat_config(port);
+    let mut cfg = cat_config(0);
     let dir = tempfile::tempdir().unwrap();
     let info = dir.path().join("ioc.info");
     let pid = dir.path().join("ioc.pid");
@@ -1246,7 +1259,7 @@ async fn clean_shutdown_removes_both_the_info_and_pid_files() {
     cfg.child.args = vec!["-c".into(), "exit 0".into()];
     cfg.restart_mode = RestartMode::OneShot;
 
-    let server = ProcServ::new(cfg).expect("build");
+    let (server, _ports) = spawn_bound(cfg).await;
     timeout(Duration::from_secs(5), server.run())
         .await
         .expect("one-shot supervisor should exit promptly")
@@ -1271,14 +1284,14 @@ async fn clean_shutdown_removes_both_the_info_and_pid_files() {
 /// endpoint is how it would issue the manual start.
 #[tokio::test]
 async fn info_file_is_published_at_startup_even_under_wait_for_manual_start() {
-    let port = pick_port().await;
-    let mut cfg = cat_config(port);
+    let mut cfg = cat_config(0);
     let dir = tempfile::tempdir().unwrap();
     let info = dir.path().join("ioc.info");
     cfg.logging.info_path = Some(info.clone());
     cfg.wait_for_manual_start = true; // --wait: no initial child spawn
 
-    let server = ProcServ::new(cfg).expect("build");
+    let (server, ports) = spawn_bound(cfg).await;
+    let port = ports[0];
     let server_task = tokio::spawn(async move {
         let _ = server.run().await;
     });

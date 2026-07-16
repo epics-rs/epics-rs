@@ -1745,7 +1745,7 @@ impl RecordInstance {
     /// `DBR_ENUM` form), so the mask is read off the same value the client
     /// receives and no consumer has to re-derive either gate.
     fn assign_property_support(&self, field: &str, snap: &mut super::super::snapshot::Snapshot) {
-        snap.properties = Self::property_support(self.record.record_type()).narrowed_to_field(
+        snap.properties = self.record.property_support().narrowed_to_field(
             snap.value.db_field_type(),
             self.menu_choices_for(field).is_some(),
         );
@@ -1762,136 +1762,10 @@ impl RecordInstance {
         let Some(value) = self.client_field_value(field) else {
             return PropertySupport::NONE;
         };
-        Self::property_support(self.record.record_type()).narrowed_to_field(
+        self.record.property_support().narrowed_to_field(
             value.db_field_type(),
             self.menu_choices_for(field).is_some(),
         )
-    }
-
-    /// The record type's RSET metadata slots — which of C's six nullable
-    /// `get_*` property functions the record type implements.
-    ///
-    /// This is the port's `rset` property table, transcribed slot by slot
-    /// from the `#define get_xxx NULL` lines of each C record's `.c`. It is
-    /// what `dbGet` consults to *narrow* the caller's `options` mask
-    /// (`dbAccess.c:336-430`), and therefore what decides whether QSRV marks
-    /// an NT leaf at all (pvxs `ioc/iocsource.cpp:263-305`). Without it the
-    /// port fabricated every leaf it could name and marked it as supplied —
-    /// telling the client a made-up `display.precision = 0` on a `longout`,
-    /// or `valueAlarm` bands at zero on a `waveform`, were authoritative.
-    ///
-    /// A slot counts as supplied when the C function pointer is non-NULL,
-    /// even if the function writes nothing for the field in question — C
-    /// leaves the option bit set either way (e.g. `boRecord.c:294-299`,
-    /// whose `get_units` writes `"s"` only for `HIGH`, yet `DBR_UNITS`
-    /// survives for every `bo` field).
-    fn property_support(rtype: &str) -> PropertySupport {
-        use PropertySupport as P;
-        match rtype {
-            // Every numeric slot, no enum strings.
-            // aiRecord.c:68-87, aoRecord.c:67-86, calcRecord.c:63-82,
-            // calcoutRecord.c:67-86, selRecord.c:58-77, subRecord.c:62-81,
-            // dfanoutRecord.c:66-85, seqRecord.c:56-75.
-            "ai" | "ao" | "calc" | "calcout" | "sel" | "sub" | "dfanout" | "seq" => P::NUMERIC,
-
-            // Integer scalars: `#define get_precision NULL`
-            // (longinRecord.c, longoutRecord.c, int64inRecord.c,
-            // int64outRecord.c). This is the measured `longout` case —
-            // pvxs leaves `display.precision` absent, the port sent 0.
-            "longin" | "longout" | "int64in" | "int64out" => P {
-                precision: false,
-                ..P::NUMERIC
-            },
-
-            // Arrays and compress: `#define get_alarm_double NULL`
-            // (waveformRecord.c, aaiRecord.c, aaoRecord.c,
-            // subArrayRecord.c, compressRecord.c, histogramRecord.c).
-            // This is the measured `waveform` case — pvxs leaves all four
-            // `valueAlarm.*Limit` absent, the port sent four zeros.
-            "waveform" | "aai" | "aao" | "subArray" | "compress" | "histogram" => P {
-                alarm_double: false,
-                ..P::NUMERIC
-            },
-
-            // No property slots at all: every `get_*` is `#define`d NULL.
-            // stringinRecord.c:62-81, stringoutRecord.c:64-83,
-            // lsiRecord.c:287-306, lsoRecord.c:328-347,
-            // eventRecord.c:62-81, permissiveRecord.c:56-75,
-            // stateRecord.c:58-77, printfRecord.c:456-475,
-            // fanoutRecord.c:60-79, timestampRecord (std-rs).
-            // This is the measured `stringout` case — pvxs leaves
-            // `display.units` absent, the port sent "".
-            "stringin" | "stringout" | "lsi" | "lso" | "event" | "permissive" | "state"
-            | "printf" | "fanout" | "timestamp" => P::NONE,
-
-            // Enum records. `biRecord.c:61-80` and `mbbiRecord.c:65-84` /
-            // `mbboRecord.c:64-83` NULL every numeric slot and supply only
-            // `get_enum_strs`. `boRecord.c:59-61` keeps `get_units`,
-            // `get_precision` and `get_control_double` (they serve the
-            // `HIGH` field) but NULLs `get_graphic_double` and
-            // `get_alarm_double`.
-            "bi" | "mbbi" | "mbbo" => P {
-                enum_strs: true,
-                ..P::NONE
-            },
-            "bo" => P {
-                units: true,
-                precision: true,
-                control_double: true,
-                enum_strs: true,
-                ..P::NONE
-            },
-            // busyRecord.c (synApps busy): units/graphic/control/alarm NULL,
-            // get_precision and get_enum_strs present.
-            "busy" => P {
-                precision: true,
-                enum_strs: true,
-                ..P::NONE
-            },
-            // mbbiDirectRecord.c:63-81 / mbboDirectRecord.c:63-81 — only
-            // `get_precision` survives, and C's DBF_FLOAT/DOUBLE gate
-            // (`dbAccess.c:388-395`) drops it again for their DBF_ENUM/LONG
-            // value, so nothing is marked. `Snapshot::precision` applies
-            // that gate.
-            "mbbiDirect" | "mbboDirect" => P {
-                precision: true,
-                ..P::NONE
-            },
-
-            // synApps, transcribed the same way.
-            // sCalcoutRecord.c / aCalcoutRecord.c / sseqRecord.c /
-            // motorRecord.cc: full numeric set, no enum strings.
-            "scalcout" | "acalcout" | "sseq" | "motor" | "epid" | "aSub" | "scaler" => P::NUMERIC,
-            // tableRecord.cc (optics): `#define get_alarm_double NULL`.
-            "table" => P {
-                alarm_double: false,
-                ..P::NUMERIC
-            },
-            // swaitRecord.c: get_units and get_control_double are NULL.
-            "swait" => P {
-                units: false,
-                control_double: false,
-                ..P::NUMERIC
-            },
-            // transformRecord.c and std-rs throttle: only get_precision
-            // (transform) / get_precision+get_graphic_double (throttle)
-            // survive.
-            "transform" => P {
-                precision: true,
-                ..P::NONE
-            },
-            "throttle" => P {
-                precision: true,
-                graphic_double: true,
-                ..P::NONE
-            },
-
-            // A record type whose C rset the port has not transcribed keeps
-            // the pre-existing "supplies what it populated" behaviour rather
-            // than silently losing metadata. Add an arm above — with the C
-            // file and line — when porting a new record type.
-            _ => P::NUMERIC,
-        }
     }
 
     fn populate_display_info(&self, snap: &mut super::super::snapshot::Snapshot) {
@@ -4904,6 +4778,48 @@ pub(crate) fn check_deadband(newval: f64, oldval: f64, deadband: f64) -> bool {
     // fire (C path leaves delta=0 and the `delta > deadband` check fails
     // for any non-negative deadband).
     newval != oldval
+}
+
+#[cfg(test)]
+mod property_support_owner_tests {
+    use crate::server::record::record_trait::default_property_support;
+    use crate::server::snapshot::PropertySupport as P;
+
+    /// `sseqRecord.c:124-144` — the rset table NULLs every property slot
+    /// except `get_precision`:
+    ///
+    /// ```c
+    /// NULL,           /* get_units */
+    /// get_precision,  /* get_precision */
+    /// NULL,           /* get_enum_str */
+    /// NULL,           /* get_enum_strs */
+    /// NULL,           /* put_enum_str */
+    /// NULL,           /* get_graphic_double */
+    /// NULL,           /* get_control_double */
+    /// NULL            /* get_alarm_double */
+    /// ```
+    ///
+    /// `sseq` was previously grouped with the full-numeric synApps types, so
+    /// the port marked six leaves per field that QSRV2 omits entirely.
+    #[test]
+    fn sseq_supplies_only_precision() {
+        assert_eq!(
+            default_property_support("sseq"),
+            P {
+                precision: true,
+                ..P::NONE
+            }
+        );
+    }
+
+    /// A record type the table does not name keeps the permissive
+    /// `NUMERIC` default rather than silently losing metadata. This is the
+    /// arm `asyn` used to land on — and why marking had to become a trait
+    /// method: asyn-rs cannot add a row here.
+    #[test]
+    fn an_untranscribed_record_type_keeps_the_permissive_default() {
+        assert_eq!(default_property_support("no-such-record-type"), P::NUMERIC);
+    }
 }
 
 #[cfg(test)]

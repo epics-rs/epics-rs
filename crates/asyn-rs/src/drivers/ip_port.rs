@@ -358,7 +358,16 @@ impl OctetNext for IpIoState {
         }
         match inner {
             IpIoInner::Tcp(stream) => {
-                stream.set_read_timeout(Some(socket_poll_timeout(user.timeout)))?;
+                // C readRaw (drvAsynIPPort.c:744-756) records a failed
+                // setsockopt(SO_RCVTIMEO) but falls through to recv(); the recv
+                // outcome governs teardown (:797-821). On macOS this setsockopt
+                // returns EINVAL on a reset socket, so an early return (`?`) here
+                // would replace the ECONNRESET the read is about to surface with a
+                // synthetic "set_read_timeout failed", and the port would never
+                // classify the transport as dead. Drop the error and read — the
+                // status taint C keeps for a >0-byte read (:822-831) is
+                // unreachable here (the EINVAL cause is a socket whose read fails).
+                let _ = stream.set_read_timeout(Some(socket_poll_timeout(user.timeout)));
                 match stream.read(buf) {
                     // C drvAsynIPPort.c::readRaw (815-821): recv()==0 on a
                     // SOCK_STREAM socket means the peer closed — report
@@ -385,7 +394,10 @@ impl OctetNext for IpIoState {
                 }
             }
             IpIoInner::Udp(socket, _peer) => {
-                socket.set_read_timeout(Some(socket_poll_timeout(user.timeout)))?;
+                // Same C fall-through as the TCP arm: setsockopt(SO_RCVTIMEO)
+                // precedes the socketType branch in readRaw (:749) and a failure
+                // does not return — the recvfrom governs. Drop the error and read.
+                let _ = socket.set_read_timeout(Some(socket_poll_timeout(user.timeout)));
                 // C drvAsynIPPort.c::readRaw (775-789) uses recvfrom on the
                 // unconnected datagram socket so it accepts replies from any
                 // peer (broadcast/multi-peer); the source address is only
@@ -412,7 +424,10 @@ impl OctetNext for IpIoState {
             }
             #[cfg(unix)]
             IpIoInner::Unix(stream) => {
-                stream.set_read_timeout(Some(socket_poll_timeout(user.timeout)))?;
+                // Same C fall-through as the TCP arm (drvAsynIPPort.c:744-756):
+                // a failed set_read_timeout must not pre-empt the read that
+                // surfaces the real transport error. Drop the error and read.
+                let _ = stream.set_read_timeout(Some(socket_poll_timeout(user.timeout)));
                 match stream.read(buf) {
                     // Unix-domain stream EOF = peer closed = END, the same
                     // stream semantics as the TCP arm above.

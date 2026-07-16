@@ -52,6 +52,7 @@ pub mod catool;
 pub mod dbd;
 pub mod diff;
 pub mod ioc;
+pub mod ntshape;
 pub mod pvaread;
 pub mod pvatool;
 pub mod report;

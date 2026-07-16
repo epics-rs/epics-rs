@@ -41,6 +41,9 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+/// One batched tool's per-PV reading, or why that PV has none.
+pub type Readings = Vec<Result<String, ToolError>>;
+
 use crate::catool::{ToolError, wait_bounded};
 use crate::ioc::{PvxTools, Side};
 
@@ -89,6 +92,7 @@ impl PvaTools {
 
     /// The client environment. See the module docs for why the port rides in
     /// the address list rather than in `EPICS_PVA_BROADCAST_PORT`.
+    ///
     fn env(&self) -> HashMap<&'static str, String> {
         HashMap::from([
             // Explicit `addr:port` — `split_addr_into` (config.cpp:580) takes
@@ -105,8 +109,11 @@ impl PvaTools {
         ])
     }
 
-    /// Run a tool to completion, returning stdout on success.
-    fn run(&self, tool: &str, args: &[String]) -> Result<String, ToolError> {
+    /// Spawn `tool`, wait for it bounded, and hand back its raw output.
+    ///
+    /// The one place a pvxs client is spawned, so the client environment and the
+    /// wall-clock bound cannot drift between the single and batched paths.
+    fn run_raw(&self, tool: &str, args: &[String]) -> Result<std::process::Output, ToolError> {
         let mut cmd = Command::new(self.bin.join(tool));
         cmd.args(args)
             .stdin(Stdio::null())
@@ -118,7 +125,12 @@ impl PvaTools {
         let child = cmd
             .spawn()
             .map_err(|e| self.err(tool, format!("spawn: {e}")))?;
-        let out = wait_bounded(child, TOOL_TIMEOUT).map_err(|e| self.err(tool, e))?;
+        wait_bounded(child, TOOL_TIMEOUT).map_err(|e| self.err(tool, e))
+    }
+
+    /// Run a tool to completion, returning stdout on success.
+    fn run(&self, tool: &str, args: &[String]) -> Result<String, ToolError> {
+        let out = self.run_raw(tool, args)?;
 
         let stdout = String::from_utf8_lossy(&out.stdout).to_string();
         let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
@@ -178,6 +190,82 @@ impl PvaTools {
         Ok(out.trim_end().to_string())
     }
 
+    /// Run a tool, keeping stdout **regardless of exit status**.
+    ///
+    /// Only a failure to run at all (spawn, timeout) is an error here. A
+    /// non-zero exit is not, because for a batch it does not mean what it means
+    /// for a single PV: see [`Self::batch`].
+    fn run_partial(&self, tool: &str, args: &[String]) -> Result<(String, String), ToolError> {
+        let out = self.run_raw(tool, args)?;
+        Ok((
+            String::from_utf8_lossy(&out.stdout).to_string(),
+            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        ))
+    }
+
+    /// Read many PVs in one invocation, attributing each reading to its own PV.
+    ///
+    /// # Why this is not [`crate::runner::probe_bisect`]
+    ///
+    /// The C CA tools are all-or-nothing: one unconnectable PV and `caget`
+    /// prints *nothing at all*, so the only way to isolate the bad one is to
+    /// split the batch and retry. The pvxs tools are not. Measured — a batch of
+    /// three where the middle PV does not exist exits 1 and prints
+    /// `Timeout with 1 outstanding` on stderr, and **still prints a full block
+    /// for each of the other two**. So the good PVs need no retry and the bad
+    /// one is identified by the absence of its block, at one spawn per batch
+    /// rather than O(k log n). Attribution is by name, not by position, so it
+    /// survives the tools answering out of order.
+    ///
+    /// This is why a non-zero exit must not fail the whole batch: doing so
+    /// would throw away readings that were successfully obtained and turn one
+    /// missing PV into `n` ERRORs — manufacturing unmeasured cases out of a
+    /// measured run.
+    fn batch(&self, tool: &str, pvs: &[String], header: fn(&str) -> Option<&str>) -> Readings {
+        if pvs.is_empty() {
+            return Vec::new();
+        }
+        let mut args = vec!["-w".to_string(), PVA_TIMEOUT_SECS.to_string()];
+        args.extend(pvs.iter().cloned());
+
+        let (stdout, stderr) = match self.run_partial(tool, &args) {
+            Ok(x) => x,
+            // The tool never ran: nothing was measured, so every PV in the
+            // batch is an ERROR carrying the same cause.
+            Err(e) => return pvs.iter().map(|_| Err(e.clone())).collect(),
+        };
+
+        split_blocks(pvs, &stdout, header)
+            .into_iter()
+            .map(|b| match b {
+                // A header with an empty body is not a reading. Same rule as
+                // `run`: a tool that printed nothing did not look.
+                Some(t) if !t.trim().is_empty() => Ok(t.trim_end().to_string()),
+                Some(_) => Err(self.err(tool, "reported this PV with no body")),
+                None => Err(self.err(
+                    tool,
+                    if stderr.is_empty() {
+                        "no output for this PV in the batch".to_string()
+                    } else {
+                        stderr.clone()
+                    },
+                )),
+            })
+            .collect()
+    }
+
+    /// `pvxget` for many PVs at once — the value, and which fields the reply
+    /// marked. One entry per requested PV, in the order requested.
+    pub fn pvxget_batch(&self, pvs: &[String]) -> Readings {
+        self.batch("pvxget", pvs, pvxget_header)
+    }
+
+    /// `pvxinfo` for many PVs at once — the declared type, without any value.
+    /// One entry per requested PV, in the order requested.
+    pub fn pvxinfo_batch(&self, pvs: &[String]) -> Readings {
+        self.batch("pvxinfo", pvs, pvxinfo_header)
+    }
+
     /// How many distinct PVA servers answer a search on this side's port.
     ///
     /// **This is the PVA port-exclusivity check, and it has no CA analogue.**
@@ -209,5 +297,155 @@ impl PvaTools {
             .filter(|l| !l.is_empty())
             .collect();
         Ok(distinct.len())
+    }
+}
+
+/// The PV a `pvxget` block header announces: the bare PV name, at column 0.
+/// Every line of a value body is indented, so an unindented line is a header
+/// candidate — and only counts as one if it names a PV that was asked for.
+fn pvxget_header(line: &str) -> Option<&str> {
+    if line.starts_with([' ', '\t']) || line.trim().is_empty() {
+        return None;
+    }
+    Some(line)
+}
+
+/// The PV a `pvxinfo` block header announces, out of `<pv> from <addr>:<port>`.
+///
+/// The ` from ` guard is what keeps `ORACLE:AI` from swallowing
+/// `ORACLE:AI.SCAN`'s header, and what keeps the `struct "..." {` line — also at
+/// column 0 — from being mistaken for a header.
+fn pvxinfo_header(line: &str) -> Option<&str> {
+    if line.starts_with([' ', '\t']) {
+        return None;
+    }
+    line.split_once(" from ").map(|(pv, _)| pv)
+}
+
+/// Split a batched tool's stdout into one block per requested PV, keyed by name.
+///
+/// The header line is **not** part of the block, and for `pvxinfo` that is
+/// load-bearing rather than cosmetic. Its header is `<pv> from 127.0.0.1:<port>`
+/// — and the two sides can never agree on that port, because this harness
+/// assigns them and [`crate::ioc::PvaPair::boot`] *refuses to run* if they ever
+/// match. Comparing the header would therefore mark every channel a DEFECT for
+/// a difference the harness itself created, which is the one normalization the
+/// module docs' "declare it with evidence" rule plainly earns. Nothing else is
+/// normalized: the type declaration and the value text are compared verbatim.
+///
+/// A PV with no block gets `None` — the caller turns that into an ERROR for
+/// that PV alone, never for its batch-mates.
+fn split_blocks(
+    pvs: &[String],
+    out: &str,
+    header: fn(&str) -> Option<&str>,
+) -> Vec<Option<String>> {
+    let index: HashMap<&str, usize> = pvs
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (p.as_str(), i))
+        .collect();
+    let mut blocks: Vec<Option<String>> = vec![None; pvs.len()];
+    let mut cur: Option<usize> = None;
+
+    for line in out.lines() {
+        if let Some(name) = header(line)
+            && let Some(&i) = index.get(name)
+        {
+            cur = Some(i);
+            blocks[i] = Some(String::new());
+            continue;
+        }
+        if let Some(i) = cur
+            && let Some(b) = blocks[i].as_mut()
+        {
+            b.push_str(line);
+            b.push('\n');
+        }
+    }
+    blocks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pvs(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Verbatim `pvxget` output for three PVs, as `softIocPVX` printed it.
+    const GET_OUT: &str = "ORACLE:AI\n    value double = 0\n    alarm.severity int32_t = 3\nORACLE:AI.SCAN\n    value.index int32_t = 0\nORACLE:BI\n    value.index int32_t = 0\n";
+
+    /// Verbatim `pvxinfo` output for two PVs. Note the ports in the headers.
+    const INFO_OUT: &str = "ORACLE:AI from 127.0.0.1:45627\nstruct \"epics:nt/NTScalar:1.0\" {\n    double value\n}\nORACLE:AI.SCAN from 127.0.0.1:45627\nstruct \"epics:nt/NTEnum:1.0\" {\n    struct \"enum_t\" {\n        int32_t index\n    } value\n}\n";
+
+    #[test]
+    fn pvxget_blocks_are_split_by_pv_and_exclude_the_header() {
+        let list = pvs(&["ORACLE:AI", "ORACLE:AI.SCAN", "ORACLE:BI"]);
+        let b = split_blocks(&list, GET_OUT, pvxget_header);
+        assert_eq!(
+            b[0].as_deref().unwrap().trim_end(),
+            "    value double = 0\n    alarm.severity int32_t = 3"
+        );
+        assert_eq!(
+            b[1].as_deref().unwrap().trim_end(),
+            "    value.index int32_t = 0"
+        );
+        assert!(b[2].is_some());
+        assert!(
+            !b[0].as_deref().unwrap().contains("ORACLE:AI"),
+            "the header names the PV; it is the separator, not part of the reading"
+        );
+    }
+
+    /// The port in `pvxinfo`'s header differs between the two sides **by
+    /// construction**, so it must never reach the compared text.
+    #[test]
+    fn pvxinfo_blocks_drop_the_header_and_with_it_the_server_port() {
+        let list = pvs(&["ORACLE:AI", "ORACLE:AI.SCAN"]);
+        let b = split_blocks(&list, INFO_OUT, pvxinfo_header);
+        let ai = b[0].as_deref().unwrap();
+        assert!(ai.starts_with("struct \"epics:nt/NTScalar:1.0\" {"));
+        assert!(
+            !ai.contains("45627") && !ai.contains("127.0.0.1"),
+            "the server port must not be comparable text: got {ai:?}"
+        );
+        assert!(b[1].as_deref().unwrap().contains("NTEnum"));
+    }
+
+    /// A PV name that is a prefix of another must not steal its block.
+    #[test]
+    fn a_prefix_pv_name_does_not_swallow_a_longer_one() {
+        let list = pvs(&["ORACLE:AI", "ORACLE:AI.SCAN"]);
+        let b = split_blocks(&list, INFO_OUT, pvxinfo_header);
+        assert!(b[0].as_deref().unwrap().contains("NTScalar"));
+        assert!(b[1].as_deref().unwrap().contains("NTEnum"));
+    }
+
+    /// The behaviour the batch design rests on: pvxs prints the good PVs even
+    /// when another PV in the same batch never answers. The missing one must be
+    /// the ONLY one reported absent.
+    #[test]
+    fn one_absent_pv_does_not_cost_its_batch_mates_their_readings() {
+        let list = pvs(&["ORACLE:AI", "ORACLE:NOPE", "ORACLE:AI.SCAN"]);
+        let b = split_blocks(&list, GET_OUT, pvxget_header);
+        assert!(b[0].is_some(), "a good PV keeps its reading");
+        assert!(b[1].is_none(), "the absent PV is the one reported absent");
+        assert!(b[2].is_some(), "and its batch-mates are untouched");
+    }
+
+    /// Attribution is by name, so it survives the tools answering out of order.
+    #[test]
+    fn blocks_are_attributed_by_name_not_by_position() {
+        let list = pvs(&["ORACLE:BI", "ORACLE:AI"]);
+        let b = split_blocks(&list, GET_OUT, pvxget_header);
+        assert!(b[0].as_deref().unwrap().contains("value.index"), "BI");
+        assert!(b[1].as_deref().unwrap().contains("value double"), "AI");
+    }
+
+    #[test]
+    fn an_empty_request_reads_nothing() {
+        assert!(split_blocks(&[], GET_OUT, pvxget_header).is_empty());
     }
 }

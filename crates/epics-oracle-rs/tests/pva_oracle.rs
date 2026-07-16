@@ -35,7 +35,7 @@ use std::path::Path;
 
 use epics_oracle_rs::dbd::Dbd;
 use epics_oracle_rs::diff::Verdict;
-use epics_oracle_rs::ioc::{CTools, Ioc, PvaPair, PvxTools, Side};
+use epics_oracle_rs::ioc::{CTools, Ioc, PvaPair, PvxTools, Side, alloc_free_port};
 use epics_oracle_rs::pvaread::{self, PvaReport};
 use epics_oracle_rs::pvatool::PvaTools;
 use epics_oracle_rs::runner::workdir;
@@ -111,6 +111,44 @@ fn the_pva_pair_boots_on_distinct_ports() {
     );
     assert_eq!(pair.c.side(), Side::C);
     assert_eq!(pair.rust.side(), Side::Rust);
+}
+
+/// The read phase runs four clients at once (two sides × `pvxinfo`+`pvxget`),
+/// so concurrent client tools must not break each other.
+///
+/// This is NOT the regression test for the beacon-port fault that made 45
+/// channels ERROR — that one was a *server* stealing the client's beacon port,
+/// and it is structurally gone (see `PvaTools::run_raw`). Concurrency was the
+/// first suspect and was measured innocent: pvxs clients share a beacon port
+/// happily, and this test is what established that. It stays because batched
+/// reads depend on the property either way.
+///
+/// No server is booted: pointing at a port nothing serves isolates the client
+/// question from the reachability question. Finding no server there is fine;
+/// failing to *look* because of the harness's own plumbing is not.
+#[test]
+fn concurrent_client_tools_do_not_break_each_other() {
+    let t = tools();
+    let dead = alloc_free_port().expect("a port to aim at");
+    let tool = PvaTools::new(&t, dead, Side::C);
+
+    let results: Vec<_> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..8).map(|_| s.spawn(|| tool.server_count())).collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("client thread must not panic"))
+            .collect()
+    });
+
+    for r in &results {
+        if let Err(e) = r {
+            assert!(
+                !e.message.contains("Address already in use") && !e.message.contains("beacon"),
+                "a client failed for a reason of the harness's own making: {}",
+                e.message,
+            );
+        }
+    }
 }
 
 /// Each side is the **only** server on its port, proven by measurement.

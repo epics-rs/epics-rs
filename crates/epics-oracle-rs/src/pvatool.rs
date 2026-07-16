@@ -28,13 +28,20 @@
 //! owns it (`async_udp_v4.rs`, `if port != 0`). Measured: `pvxget` prints
 //! nothing and dies.
 //!
-//! So the port is instead named **explicitly in the address list**
-//! (`127.0.0.1:<port>`), which makes the search target unambiguous without
-//! binding anything, and `EPICS_PVA_BROADCAST_PORT` is left alone. The client
-//! then binds pvxs's default beacon port, which is the well-known
-//! fanout-shareable co-bind case those flags exist for. Beacons are irrelevant
-//! here anyway: with `EPICS_PVA_AUTO_ADDR_LIST=NO` and an explicit unicast
-//! target, a search can only ever reach the one server we mean to measure.
+//! So the *search target* is instead named **explicitly in the address list**
+//! (`127.0.0.1:<port>`), which makes it unambiguous without binding anything.
+//! Beacons cannot influence a reading either way: with
+//! `EPICS_PVA_AUTO_ADDR_LIST=NO` and an explicit unicast target, a search can
+//! only ever reach the one server we mean to measure.
+//!
+//! `EPICS_PVA_BROADCAST_PORT` is then set to a **quiet** port purely to keep the
+//! client's beacon bind out of everyone's way — left at pvxs's default, the
+//! client hears every PVA server on this host, and `pvxlist` reports
+//! beacon-discovered servers as well as searched ones, which made
+//! [`crate::ioc::verify_sole_server`] intermittently indict a foreign IOC as a
+//! second server on our port. That port is allocated per invocation, never once
+//! per run; [`PvaTools::run_raw`] explains why that distinction is what stops
+//! whole record types from scoring ERROR.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -45,7 +52,17 @@ use std::time::Duration;
 pub type Readings = Vec<Result<String, ToolError>>;
 
 use crate::catool::{ToolError, wait_bounded};
-use crate::ioc::{PvxTools, Side};
+use crate::ioc::{PvxTools, Side, alloc_free_port};
+
+/// Did this tool die because it could not bind its beacon port?
+///
+/// Matched on the message rather than an exit code because pvxs reports it as a
+/// plain `ERROR: Address already in use` and exits like any other failure. The
+/// match is on the text pvxs prints; the `ERROR` label around it carries ANSI
+/// colour codes, so only the stable part is compared.
+fn is_beacon_collision(stderr: &str) -> bool {
+    stderr.contains("Address already in use")
+}
 
 /// Wall-clock cap on any single tool invocation, mirroring
 /// [`crate::catool`]'s. Bounds the process, not just the PVA operation.
@@ -53,12 +70,19 @@ const TOOL_TIMEOUT: Duration = Duration::from_secs(8);
 /// PVA connect/operation timeout handed to the tools via `-w`.
 const PVA_TIMEOUT_SECS: &str = "3";
 
+/// How many times a tool is retried when it cannot bind its beacon port.
+///
+/// The port is allocated by binding, then released so the child can bind it
+/// (`alloc_free_port`) — a child process cannot inherit the fd. That window is
+/// small but real, and the same window `CIoc::boot`/`PvxIoc::boot` close by
+/// retrying on a fresh port; this is that discipline applied to the clients.
+const BEACON_ATTEMPTS: usize = 8;
+
 /// The pvxs client tools aimed at exactly one PVA server.
 #[derive(Debug, Clone)]
 pub struct PvaTools {
     bin: PathBuf,
     port: u16,
-    beacon_port: u16,
     side: Side,
 }
 
@@ -67,7 +91,6 @@ impl PvaTools {
         Self {
             bin: tools.bin.clone(),
             port,
-            beacon_port: tools.beacon_port,
             side,
         }
     }
@@ -93,7 +116,10 @@ impl PvaTools {
     /// The client environment. See the module docs for why the port rides in
     /// the address list rather than in `EPICS_PVA_BROADCAST_PORT`.
     ///
-    fn env(&self) -> HashMap<&'static str, String> {
+    /// `beacon` is passed in rather than read off `self`: it belongs to one
+    /// invocation, and every invocation that shares it deserves its own. See
+    /// [`Self::run_raw`].
+    fn env(&self, beacon: u16) -> HashMap<&'static str, String> {
         HashMap::from([
             // Explicit `addr:port` — `split_addr_into` (config.cpp:580) takes
             // the port from the entry, so no default-port var is consulted.
@@ -103,29 +129,79 @@ impl PvaTools {
             ("EPICS_PVA_AUTO_ADDR_LIST", "NO".to_string()),
             // Beacon RX on a port nothing beacons to, so no foreign server can
             // reach this client. Not the side's port — the client binds this,
-            // and the Rust side's socket exclusively owns its own. See
-            // `PvxTools::beacon_port`.
-            ("EPICS_PVA_BROADCAST_PORT", self.beacon_port.to_string()),
+            // and the Rust side's socket exclusively owns its own.
+            ("EPICS_PVA_BROADCAST_PORT", beacon.to_string()),
         ])
     }
 
-    /// Spawn `tool`, wait for it bounded, and hand back its raw output.
+    /// Spawn `tool` on a beacon port of its own and wait for it, bounded.
     ///
-    /// The one place a pvxs client is spawned, so the client environment and the
-    /// wall-clock bound cannot drift between the single and batched paths.
+    /// **The single owner of the beacon port**, and the only place a pvxs client
+    /// is spawned. A pvxs client binds `EPICS_PVA_BROADCAST_PORT` for beacon RX
+    /// (`client.cpp:641`); it must be a quiet port, or `pvxlist` hears every PVA
+    /// server on this host and [`crate::ioc::verify_sole_server`] reports a
+    /// foreign one as a second server on our port. It also cannot be 0 —
+    /// `config.cpp:561` rejects that and silently substitutes pvxs's real
+    /// default, 5076, which is the very port being avoided.
+    ///
+    /// # Why it is allocated here and not once per run
+    ///
+    /// Because the client *binds* it, the number must be one **no live server
+    /// holds** — and a number allocated up front is owned by nobody.
+    /// `alloc_free_port` binds a port, reads its number, and releases it, so a
+    /// beacon port chosen at start-up is merely a number that *was* free once.
+    /// Every later `alloc_free_port` may hand the same number to a `softIocPVX`
+    /// or `oracle-ioc` search port, entirely legitimately — it is free. From
+    /// that moment every client aimed at that beacon port dies on `Address
+    /// already in use` (measured directly: a plain UDP socket squatting the port
+    /// reproduces exactly that error), and it stays dead for the whole life of
+    /// that pair — one record type's worth of channels, all scored ERROR. That
+    /// is the harness manufacturing unmeasured cases out of its own instrument.
+    /// Measured: 45 channels of `subArray`, and 0 in the previous run of the
+    /// same binaries.
+    ///
+    /// Allocating immediately before the spawn is what makes the number exclude
+    /// the live pair's ports: the servers are booted and holding their sockets
+    /// by then, so a port that binds now is not one of theirs. The retry then
+    /// covers the residual window between the release and the child's bind —
+    /// the same window, closed the same way, as `CIoc::boot`/`PvxIoc::boot`.
+    ///
+    /// Concurrency is *not* the issue: pvxs clients share a beacon port happily
+    /// (measured — eight concurrent `pvxlist` on one port all succeed), which is
+    /// why the fault looked random rather than tracking the batch width.
     fn run_raw(&self, tool: &str, args: &[String]) -> Result<std::process::Output, ToolError> {
-        let mut cmd = Command::new(self.bin.join(tool));
-        cmd.args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        for (k, v) in self.env() {
-            cmd.env(k, v);
+        let mut last = String::new();
+        for _ in 0..BEACON_ATTEMPTS {
+            let beacon = alloc_free_port().map_err(|e| self.err(tool, e.to_string()))?;
+            let mut cmd = Command::new(self.bin.join(tool));
+            cmd.args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            for (k, v) in self.env(beacon) {
+                cmd.env(k, v);
+            }
+            let child = cmd
+                .spawn()
+                .map_err(|e| self.err(tool, format!("spawn: {e}")))?;
+            let out = wait_bounded(child, TOOL_TIMEOUT).map_err(|e| self.err(tool, e))?;
+
+            // The client builds its context — and binds the beacon port —
+            // before it reads anything, so a bind failure means nothing was
+            // measured and the whole invocation is safe to retry on a fresh
+            // port. The only other socket a client binds is its search TX, and
+            // that one is kernel-assigned (`client.cpp:580`), so EADDRINUSE
+            // here is always the beacon port.
+            if is_beacon_collision(&String::from_utf8_lossy(&out.stderr)) {
+                last = format!("beacon port {beacon}: address already in use");
+                continue;
+            }
+            return Ok(out);
         }
-        let child = cmd
-            .spawn()
-            .map_err(|e| self.err(tool, format!("spawn: {e}")))?;
-        wait_bounded(child, TOOL_TIMEOUT).map_err(|e| self.err(tool, e))
+        Err(self.err(
+            tool,
+            format!("could not get a free beacon port in {BEACON_ATTEMPTS} attempts ({last})"),
+        ))
     }
 
     /// Run a tool to completion, returning stdout on success.
@@ -372,6 +448,33 @@ mod tests {
 
     fn pvs(names: &[&str]) -> Vec<String> {
         names.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// A beacon-port collision, exactly as pvxs reports it.
+    ///
+    /// Captured by holding a plain UDP socket on a port and pointing a real
+    /// `pvxlist` at it via `EPICS_PVA_BROADCAST_PORT` — the same shape the
+    /// harness produced when a booted IOC had taken the client's beacon port.
+    /// Note the ANSI colour codes wrapping `ERROR`: they are why the match is on
+    /// the message text and not on the label.
+    const BIND_FAILURE: &str = "\u{1b}[31;1mERROR\u{1b}[0m: Address already in use";
+
+    /// The retry in `run_raw` is only as good as its trigger. If this stops
+    /// matching, a collision silently becomes an ERROR verdict again.
+    #[test]
+    fn a_beacon_collision_is_recognized_from_what_pvxs_actually_prints() {
+        assert!(is_beacon_collision(BIND_FAILURE));
+    }
+
+    /// ...and it must not fire on the ordinary failures, or a real ERROR would
+    /// be retried eight times and then reported as a port problem.
+    #[test]
+    fn an_ordinary_tool_failure_is_not_read_as_a_beacon_collision() {
+        assert!(!is_beacon_collision("Timeout with 1 outstanding"));
+        assert!(!is_beacon_collision(""));
+        assert!(!is_beacon_collision(
+            "\u{1b}[31;1mERROR\u{1b}[0m: Channel not found"
+        ));
     }
 
     /// Verbatim `pvxget` output for three PVs, as `softIocPVX` printed it.

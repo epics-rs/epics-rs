@@ -55,6 +55,7 @@ const PVA_TIMEOUT_SECS: &str = "3";
 pub struct PvaTools {
     bin: PathBuf,
     port: u16,
+    beacon_port: u16,
     side: Side,
 }
 
@@ -63,6 +64,7 @@ impl PvaTools {
         Self {
             bin: tools.bin.clone(),
             port,
+            beacon_port: tools.beacon_port,
             side,
         }
     }
@@ -95,6 +97,11 @@ impl PvaTools {
             // Never let a search escape to a real subnet, or be answered by
             // the other side of the pair.
             ("EPICS_PVA_AUTO_ADDR_LIST", "NO".to_string()),
+            // Beacon RX on a port nothing beacons to, so no foreign server can
+            // reach this client. Not the side's port — the client binds this,
+            // and the Rust side's socket exclusively owns its own. See
+            // `PvxTools::beacon_port`.
+            ("EPICS_PVA_BROADCAST_PORT", self.beacon_port.to_string()),
         ])
     }
 
@@ -187,8 +194,20 @@ impl PvaTools {
     /// exclusivity is established **positively, by measurement**: `pvxlist`
     /// prints one line per server that answers, and anything but exactly one
     /// means the port is not ours alone.
+    ///
+    /// Lines are deduplicated, because the question is how many *distinct*
+    /// servers answered — a server that replies twice is still one server, and
+    /// it prints its own address both times. The count is scoped to this port
+    /// by [`PvxTools::beacon_port`]: without that, `pvxlist` also reports
+    /// beacon-discovered servers, and a foreign IOC elsewhere on the host
+    /// would be miscounted as a second server here.
     pub fn server_count(&self) -> Result<usize, ToolError> {
         let out = self.run("pvxlist", &["-w".into(), PVA_TIMEOUT_SECS.into()])?;
-        Ok(out.lines().filter(|l| !l.trim().is_empty()).count())
+        let distinct: std::collections::BTreeSet<&str> = out
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        Ok(distinct.len())
     }
 }

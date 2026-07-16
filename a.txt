@@ -1,8 +1,0 @@
-    value string = "ORACLE:SSEQ"
-    alarm.severity int32_t = 3
-    alarm.status int32_t = 2
-    alarm.message string = "UDF"
-    timeStamp.secondsPastEpoch int64_t = 631152000
-    timeStamp.nanoseconds int32_t = 0
-    timeStamp.userTag int32_t = 0
-    display.description string = ""

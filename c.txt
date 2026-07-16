@@ -1,8 +1,0 @@
-    value string = "ORACLE:ASYN"
-    alarm.severity int32_t = 0
-    alarm.status int32_t = 0
-    alarm.message string = ""
-    timeStamp.secondsPastEpoch int64_t = 631152000
-    timeStamp.nanoseconds int32_t = 0
-    timeStamp.userTag int32_t = 0
-    display.description string = ""

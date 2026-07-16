@@ -4122,33 +4122,44 @@ mod tests {
     /// `pasynManager->report` (asynShellCommands.c:589) — it is an answer to an
     /// iocsh question, so `asynReport 1 port > file` captures it. The Rust actor
     /// printed it to stderr, where a shell redirect misses it.
+    ///
+    /// A `dup2` on fd 1 around the call cannot observe this: libtest's default
+    /// capture rewrites `print!`/`println!` to an in-process buffer *before* the
+    /// bytes ever reach a file descriptor, and it does so regardless of which
+    /// thread makes the call — spawning a helper thread does not escape it
+    /// either. The intercept is only off for a process actually started with
+    /// `--nocapture`, so this re-execs the test binary as a child, selects just
+    /// this test by exact name, forces `--nocapture` on that child, and reads
+    /// the child's real stdout back through the pipe `Command::output` sets up.
+    /// That holds under plain `cargo test`, `cargo nextest run`, and
+    /// `--nocapture`, since the child's capture state is forced explicitly
+    /// rather than inherited from however the outer run was invoked.
     #[cfg(unix)]
     #[test]
     fn asyn_report_writes_to_stdout() {
-        use std::os::fd::AsRawFd as _;
-
-        let base = PortDriverBase::new("stdout_rep", 1, PortFlags::default());
-        let (_tx, rx) = mpsc::channel(1);
-        let actor = PortActor::new(Box::new(TestDriverBase(base)), rx);
-
-        // nextest runs each test in its own process, so redirecting fd 1 for the
-        // duration of the call cannot disturb another test.
-        let path = std::env::temp_dir().join(format!("asyn_report_stdout_{}", std::process::id()));
-        let file = std::fs::File::create(&path).unwrap();
-        unsafe {
-            let saved = libc::dup(1);
-            assert!(saved >= 0);
-            assert!(libc::dup2(file.as_raw_fd(), 1) >= 0);
+        const CHILD_ENV: &str = "ASYN_REPORT_WRITES_TO_STDOUT_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let base = PortDriverBase::new("stdout_rep", 1, PortFlags::default());
+            let (_tx, rx) = mpsc::channel(1);
+            let actor = PortActor::new(Box::new(TestDriverBase(base)), rx);
             actor.report_port(0);
-            assert!(libc::dup2(saved, 1) >= 0);
-            libc::close(saved);
+            return;
         }
-        drop(file);
-        let captured = std::fs::read_to_string(&path).unwrap();
-        let _ = std::fs::remove_file(&path);
+
+        let exe = std::env::current_exe().unwrap();
+        let output = std::process::Command::new(exe)
+            .args([
+                "port_actor::tests::asyn_report_writes_to_stdout",
+                "--exact",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .output()
+            .unwrap();
+        let captured = String::from_utf8_lossy(&output.stdout);
         assert!(
             captured.contains("stdout_rep multiDevice:No") && captured.contains("Port: stdout_rep"),
-            "the manager block and the driver block both belong on stdout: {captured:?}"
+            "the manager block and the driver block both belong on stdout: {captured}"
         );
     }
 

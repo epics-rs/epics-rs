@@ -1495,7 +1495,7 @@ mod tests {
         {
             drv.set_option(&mut AsynUser::default(), "baud", "12345")
                 .unwrap();
-            assert_eq!(drv.config.baud, 12345);
+            assert_eq!(drv.baud, 12345);
             assert_eq!(drv.get_option("baud").unwrap(), "12345");
         }
     }

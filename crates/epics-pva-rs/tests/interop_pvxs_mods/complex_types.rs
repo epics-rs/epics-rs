@@ -33,14 +33,18 @@ async fn pvxget_capture(
     pvxget: &std::path::Path,
     server_str: String,
     pv_name: &'static str,
+    extra_args: &[&'static str],
 ) -> std::process::Output {
     let pvxget = pvxget.to_path_buf();
     let pv_name = pv_name.to_string();
+    let extra: Vec<String> = extra_args.iter().map(|s| s.to_string()).collect();
     tokio::task::spawn_blocking(move || {
         let mut cmd = pvxs_command(&pvxget);
-        cmd.arg("-w")
-            .arg("3")
-            .arg(&pv_name)
+        cmd.arg("-w").arg("3");
+        for a in &extra {
+            cmd.arg(a);
+        }
+        cmd.arg(&pv_name)
             .env("EPICS_PVA_AUTO_ADDR_LIST", "NO")
             .env("EPICS_PVA_ADDR_LIST", "")
             .env("EPICS_PVA_NAME_SERVERS", &server_str)
@@ -158,8 +162,25 @@ async fn interop_complex_types_pvxget_against_rust_server() {
         (
             "T:NDARR",
             &[
-                "struct \"epics:nt/NTNDArray:1.0\"",
-                // Union select via ubyteValue branch + the 4 sample values.
+                // The top-level `struct "epics:nt/NTNDArray:1.0"` line is
+                // deliberately NOT asserted here: pvxget's default Delta
+                // format prints the very-top struct line only when the
+                // root changed-bit is set (pvxs `FmtDelta::field`,
+                // datafmt.cpp:19 `if(verytop && !val.isMarked(false))
+                // return;`), and neither pvxs's own server nor this one
+                // sets the root bit on a GET reply — `to_wire_valid`
+                // emits only the marked leaves with no parent/root bit
+                // (dataencode.cpp:416-439) and `Value::mark` cannot set a
+                // structure's own bit (data.cpp:256-270). Verified end to
+                // end: a real pvxs SharedPV server serving an NTNDArray
+                // yields identical Delta output with no top id line. The
+                // top-level type identity IS wire-observable via Tree
+                // format and is asserted separately below.
+                //
+                // These needles cover the Delta-observable shapes: Union
+                // select (ubyteValue branch), a scalar leaf, a nested
+                // Structure (alarm), and a StructureArray-with-Variant
+                // element (attribute name).
                 "ubyteValue",
                 "uniqueId int32_t = 7",
                 r#"alarm.message string = "NO_ALARM""#,
@@ -172,7 +193,7 @@ async fn interop_complex_types_pvxget_against_rust_server() {
 
     let mut failures: Vec<String> = Vec::new();
     for (pv, needles) in matrix {
-        let out = pvxget_capture(&pvxget, server_str.clone(), pv).await;
+        let out = pvxget_capture(&pvxget, server_str.clone(), pv, &[]).await;
         let stdout = String::from_utf8_lossy(&out.stdout).to_string();
         let stderr = String::from_utf8_lossy(&out.stderr).to_string();
         if !out.status.success() {
@@ -199,6 +220,27 @@ async fn interop_complex_types_pvxget_against_rust_server() {
         if update_goldens && let Some(build) = pvs.iter().find(|b| b.name == *pv) {
             capture_golden(build);
         }
+    }
+
+    // The NTNDArray top-level type identity (`epics:nt/NTNDArray:1.0`)
+    // is not observable in pvxget's default Delta output (see the
+    // T:NDARR matrix comment above), but it IS in Tree format, where
+    // FmtTree prints every struct's id unconditionally
+    // (`datafmt.cpp:196-200`). Assert it there so a regression that drops
+    // or corrupts the server's top-level id is still caught by a
+    // C-observable pvxget invocation.
+    let tree = pvxget_capture(&pvxget, server_str.clone(), "T:NDARR", &["-F", "tree"]).await;
+    let tree_stdout = String::from_utf8_lossy(&tree.stdout).to_string();
+    let tree_stderr = String::from_utf8_lossy(&tree.stderr).to_string();
+    if !tree.status.success() {
+        failures.push(format!(
+            "[T:NDARR -F tree] pvxget exited non-zero ({:?}).\n  stdout: {tree_stdout}\n  stderr: {tree_stderr}",
+            tree.status,
+        ));
+    } else if !tree_stdout.contains(r#"struct "epics:nt/NTNDArray:1.0""#) {
+        failures.push(format!(
+            "[T:NDARR -F tree] missing top-level id `struct \"epics:nt/NTNDArray:1.0\"`.\n  stdout: {tree_stdout}\n  stderr: {tree_stderr}",
+        ));
     }
 
     server.stop();

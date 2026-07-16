@@ -150,17 +150,17 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     // sCalc, not base: a zero divisor is an ERROR
                     // (`return(-1)`), never NaN. That rule is C's and is kept.
                     //
-                    // C's operand narrowing is NOT kept — it is a plain cast
-                    // whose WIDTH even depends on which evaluator C picked for
-                    // this program (no-string path `(int)`,
-                    // `sCalcPerform.c:558-563`; string path `(long)`,
-                    // `:1102-1110`), so the same expression answers differently
-                    // depending on whether an unrelated string operand appears
-                    // in it. See `cast::imod` and CBUG-A2.
-                    if b.trunc() == 0.0 {
-                        return Err(CalcError::DivisionByZero);
+                    // sCalc's dialect narrowing is `(long)` (LP64 64-bit), so
+                    // `cast::imod` is given `c_long`. C's width actually depends
+                    // on which evaluator it picked (no-string `(int)`,
+                    // `sCalcPerform.c:558-563`; string `(long)`, `:1102-1110`);
+                    // the port models the wider `(long)` path, so 3e9 survives
+                    // intact (`3e9 % 7 = 4`, `NINT(3e9) = 3e9`). `cast::imod`
+                    // owns the -1 guard. See CBUG-A2.
+                    match imod(a, b, c_long) {
+                        Some(r) => stack.push(StackValue::Double(r)),
+                        None => return Err(CalcError::DivisionByZero),
                     }
-                    stack.push(StackValue::Double(imod(a, b)));
                 }
                 CoreOp::Neg => {
                     let a = pop1_f64(&mut stack)?;
@@ -469,10 +469,10 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                 }
                 CoreOp::Nint => {
                     let a = pop1_f64(&mut stack)?;
-                    // C `sCalcPerform.c:716-719`:
-                    //   *pd = (double)(long)(d >= 0 ? d+0.5 : d-0.5)
-                    // The `(long)` narrowing is dropped — `cast::nint`, CBUG-A2.
-                    stack.push(StackValue::Double(nint(a)));
+                    // sCalc `sCalcPerform.c:716-719` narrows with a plain
+                    // `(long)` (64-bit); `cast::nint` is given `c_long`, so
+                    // `NINT(3e9) = 3e9` (no 32-bit loss). CBUG-A2.
+                    stack.push(StackValue::Double(nint(a, c_long)));
                 }
                 CoreOp::IsNan(nargs) => {
                     let n = *nargs as usize;

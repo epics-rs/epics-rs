@@ -624,6 +624,14 @@ impl PvDatabase {
 
             let request = dbput_request(&*instance.record, &field, value)?;
 
+            // Pre-write special hook (C EPICS dbPutSpecial pass=0).
+            // C `dbPut` runs it on EVERY entry path — dbPutField and
+            // dbPutLink alike (dbAccess.c) — so the OUT-link route
+            // through this body must call it too (motor's drive-field
+            // DMOV blink, motorRecord.cc:2582-2608, fires on put-links
+            // in C). A non-zero status aborts the put like C.
+            instance.record.special(&field, false)?;
+
             // Capture the pre-put value so the metadata-cache
             // invalidation (and the downstream `DBE_PROPERTY`
             // emission) can be skipped when the put is a no-op —
@@ -885,6 +893,11 @@ impl PvDatabase {
             check_no_mod(&instance, &field)?;
 
             let request = dbput_request(&*instance.record, &field, value)?;
+
+            // Pre-write special hook (C EPICS dbPutSpecial pass=0) —
+            // C `dbPut` runs it on every entry path; this is the third
+            // `dbPut` body and must match the other two.
+            instance.record.special(&field, false)?;
 
             let old_value = instance.record.get_field(&field);
             let old_stat = instance.common.stat;

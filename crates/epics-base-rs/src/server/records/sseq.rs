@@ -1095,6 +1095,31 @@ impl Record for SseqRecord {
         &["DLY1"]
     }
 
+    /// C `sseqRecord.c::asyncFinish` (474) posts `VAL` on EVERY process:
+    ///
+    /// ```c
+    /// MonitorMask = DBE_VALUE | recGblResetAlarms(pR);
+    /// if (MonitorMask) db_post_events(pR, &pR->val, MonitorMask);
+    /// ```
+    ///
+    /// `DBE_VALUE` is set unconditionally, so a run of `caput VAL 1;2;2;3` posts
+    /// FOUR value events — the repeated `2` posts again — where the framework
+    /// default MDEL/deadband path dedupes the unchanged repeat to three. There
+    /// is no value-change gate and no `DBE_LOG`: the mask is `DBE_VALUE` plus the
+    /// alarm bits alone. Encode that as "value class always, archive class
+    /// never": the change gate contributes nothing ([`Self::monitor_value_changed`]
+    /// `= Some(false)`), and [`Self::monitor_always_post`] forces `DBE_VALUE`
+    /// on while leaving `DBE_LOG` off. The alarm bits still reach `VAL` through
+    /// the deadband post's `alarm_bits`, so an alarm transition posts it exactly
+    /// as C's `recGblResetAlarms` term does.
+    fn monitor_value_changed(&self) -> Option<bool> {
+        Some(false)
+    }
+
+    fn monitor_always_post(&self) -> (bool, bool) {
+        (true, false)
+    }
+
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         let mut live = Vec::new();
         // An abort in flight drains the outstanding put-callbacks, then

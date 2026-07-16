@@ -1380,9 +1380,7 @@ pub(crate) fn build_configured_ip_port(
     no_auto_connect: bool,
     no_process_eos: bool,
 ) -> AsynResult<DrvAsynIPPort> {
-    let mut driver = DrvAsynIPPort::new(port, host)?;
-    DrvAsynIPPort::apply_ip_port_configure(driver.base_mut(), no_auto_connect, no_process_eos);
-    Ok(driver)
+    DrvAsynIPPort::new_configured(port, host, no_auto_connect, no_process_eos)
 }
 
 pub fn drv_asyn_ip_port_configure_command(services: PortServices) -> CommandDef {

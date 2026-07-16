@@ -987,6 +987,29 @@ impl DrvAsynIPPort {
         })
     }
 
+    /// Build a port configured exactly as C's `drvAsynIPPortConfigure(portName,
+    /// hostInfo, priority, noAutoConnect, noProcessEos)` leaves one:
+    /// [`Self::new`] plus [`Self::apply_ip_port_configure`] (the `registerPort`
+    /// autoConnect flag and, unless `noProcessEos`, the default EOS interpose —
+    /// drvAsynIPPort.c:1043-1066).
+    ///
+    /// The single public entry for callers outside the iocsh command that need a
+    /// fully-configured IP port — e.g. a `noAutoConnect` port registered for a
+    /// record to attach to without ever dialing. `priority` has no effect in the
+    /// Rust runtime (see the iocsh command), so it takes no such parameter. The
+    /// configure steps stay owned by `apply_ip_port_configure`; this only
+    /// sequences `new` before it.
+    pub fn new_configured(
+        port_name: &str,
+        config_str: &str,
+        no_auto_connect: bool,
+        no_process_eos: bool,
+    ) -> AsynResult<Self> {
+        let mut driver = Self::new(port_name, config_str)?;
+        Self::apply_ip_port_configure(&mut driver.base, no_auto_connect, no_process_eos);
+        Ok(driver)
+    }
+
     /// Run one transfer against the port's raw octet link — the **bottom** of
     /// the port's interpose chain, which the port itself runs on top of this
     /// driver ([`crate::port::octet_read_chain`], C asynManager.c:2190-2220).
@@ -1660,6 +1683,34 @@ mod tests {
         assert!(!drv.base().is_connected());
         assert!(drv.base().auto_connect);
         assert!(drv.base().flags.can_block);
+    }
+
+    /// `new_configured(..., noAutoConnect=1, noProcessEos=0)` — the differential
+    /// oracle's `drvAsynIPPortConfigure("ORACLEASYN","localhost:1",0,1,0)`
+    /// equivalent — must yield a port that (1) advertises exactly the
+    /// octet-transport interface set (asynCommon + asynOption + asynOctet, so
+    /// OCTETIV=OPTIONIV=1 and GPIB/I32/UI32/F64 IV=0), (2) starts
+    /// disconnected and never auto-dials, and (3) answers HOSTINFO="localhost:1"
+    /// / DRTO="N" the way C's real IP port does. A regression on any of these
+    /// reopens the asyn read fields the oracle compares.
+    #[test]
+    fn new_configured_no_auto_connect_matches_the_oracle_port_model() {
+        let drv = DrvAsynIPPort::new_configured("ORACLEASYN", "localhost:1", true, false).unwrap();
+
+        // (1) Interface set — the exact octet-transport capabilities, no extras.
+        assert_eq!(
+            drv.capabilities(),
+            crate::interfaces::octet_transport_capabilities()
+        );
+
+        // (2) Disconnected, noAutoConnect — nothing arms the reconnect timer,
+        // so the port stays permanently disconnected (CNCT/AUCT read 0).
+        assert!(!drv.base().is_connected());
+        assert!(!drv.base().auto_connect);
+
+        // (3) The IP options the asyn record renders as HOSTINFO / DRTO.
+        assert_eq!(drv.get_option("hostinfo").unwrap(), "localhost:1");
+        assert_eq!(drv.get_option("disconnectOnReadTimeout").unwrap(), "N");
     }
 
     // --- Integration tests with mock TCP server ---

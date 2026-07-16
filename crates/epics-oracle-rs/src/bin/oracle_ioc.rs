@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use asyn_rs::asyn_record::asyn_record_factory;
-use asyn_rs::drivers::null_port::NullOctetPort;
+use asyn_rs::drivers::ip_port::DrvAsynIPPort;
 use asyn_rs::manager::PortManager;
 use clap::Parser;
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -23,8 +23,13 @@ use epics_ca_rs::server::CaServer;
 
 /// The asyn port every asyn reproducer attaches to. C's `asynRecord` refuses to
 /// `init_record` against an empty PORT, so both differential sides name this
-/// port; the Rust side backs it with a [`NullOctetPort`] (registered, but
-/// permanently disconnected), the C side with a matching port from its st.cmd.
+/// port. Both back it with the *same* port model: a `drvAsynIPPort` on
+/// `localhost:1`, `noAutoConnect` — the C side via its st.cmd
+/// `drvAsynIPPortConfigure("ORACLEASYN","localhost:1",0,1,0)`, the Rust side via
+/// [`DrvAsynIPPort::new_configured`]. Nothing listens on `localhost:1` and
+/// `noAutoConnect` keeps the port from ever dialing, so it stays permanently
+/// disconnected on both sides while still answering the IP driver's `hostinfo`
+/// / `disconnectOnReadTimeout` options (HOSTINFO / DRTO) exactly as C does.
 const ORACLE_ASYN_PORT: &str = "ORACLEASYN";
 
 #[derive(Parser)]
@@ -49,13 +54,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db_path = args.db.to_string_lossy().to_string();
     let macros: HashMap<String, String> = HashMap::new();
 
-    // Register the null asyn port BEFORE `build()`. The asyn record's
-    // `init_record` (pass 0) runs `connectDevice`, which resolves PORT
-    // ("ORACLEASYN") out of the global port registry — so the port has to be
-    // published before the db is loaded. Kept alive for the process lifetime:
-    // dropping the manager/handle would tear the port's runtime down.
+    // Register the asyn port BEFORE `build()`. The asyn record's `init_record`
+    // (pass 0) runs `connectDevice`, which resolves PORT ("ORACLEASYN") out of
+    // the global port registry — so the port has to be published before the db
+    // is loaded. Kept alive for the process lifetime: dropping the
+    // manager/handle would tear the port's runtime down.
+    //
+    // A `drvAsynIPPort` on `localhost:1`, `noAutoConnect=1`, `noProcessEos=0`
+    // — the exact C st.cmd `drvAsynIPPortConfigure("ORACLEASYN","localhost:1",
+    // 0,1,0)`. `noAutoConnect` (auto_connect=false) means the port never dials
+    // (port.rs arms the reconnect timer only for auto-connect ports), so it
+    // stays disconnected exactly like the former null port — CNCT/AUCT=0,
+    // PCNCT=1 — while now answering HOSTINFO="localhost:1" / DRTO="No" the way
+    // C's real IP port does. Its interface set is the same
+    // `octet_transport_capabilities()` the null port pinned (asynCommon +
+    // asynOption + asynOctet), so the 100+ agreeing read fields are unchanged.
     let asyn_manager = PortManager::new();
-    let _asyn_port = asyn_manager.register_port(NullOctetPort::new(ORACLE_ASYN_PORT))?;
+    let _asyn_port = asyn_manager.register_port(DrvAsynIPPort::new_configured(
+        ORACLE_ASYN_PORT,
+        "localhost:1",
+        true,  // noAutoConnect — never dial; stay permanently disconnected
+        false, // noProcessEos=0 — install the default EOS interpose, as C does
+    )?)?;
 
     // Route the `asyn` record type to asyn-rs's full `AsynRecord` (overriding
     // epics-base-rs's CNCT-only display stub), so the reproducer serves the

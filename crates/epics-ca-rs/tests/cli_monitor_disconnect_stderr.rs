@@ -139,12 +139,14 @@ fn a_disconnect_under_camonitor_writes_no_per_pv_stderr_line() {
             && stderr.contains("    Source File: ../cac.cpp line 1240\n"),
         "stderr: {stderr:?}"
     );
-    // The resolved loopback name is a `/etc/hosts` guarantee on unix, not on
-    // Windows: there CI has no loopback PTR record, so `getnameinfo(NI_NAMEREQD)`
-    // fails and `hostNameCache` correctly falls back to the dotted IP (the same
-    // contract `hostname::ip_addr_to_a` documents). Pin the resolved NAME where
-    // it holds; on Windows pin the faithful dotted-IP fallback. Either way the
-    // context is the peer `<host>:<port>`, and both keep the port.
+    // The resolved loopback name is a `/etc/hosts` guarantee on unix: there
+    // `getnameinfo` returns `localhost`, so pin that exact name. Windows has no
+    // such alias, but `getnameinfo` still resolves 127.0.0.1 to the runner's
+    // own computer name (e.g. `runnervmuktm0`), so C's `tcpiiu::getHostName`
+    // yields `<machine>:<port>` — a resolved name, not the dotted IP. The
+    // machine name varies per runner, so assert the SHAPE the R18-19 contract
+    // guarantees (a non-empty resolved host with the peer port preserved)
+    // rather than a fixed host string.
     #[cfg(unix)]
     assert!(
         stderr.contains("    Context: \"localhost:"),
@@ -152,11 +154,25 @@ fn a_disconnect_under_camonitor_writes_no_per_pv_stderr_line() {
          `tcpiiu::getHostName` gives it; stderr: {stderr:?}"
     );
     #[cfg(windows)]
-    assert!(
-        stderr.contains("    Context: \"127.0.0.1:"),
-        "with no loopback PTR on Windows CI, the context is the dotted-IP \
-         fallback `ipAddrToA` takes; stderr: {stderr:?}"
-    );
+    {
+        let ctx = stderr
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("Context: \""))
+            .and_then(|rest| rest.strip_suffix('"'))
+            .unwrap_or_else(|| panic!("no `Context:` line on stderr: {stderr:?}"));
+        let (host, port) = ctx
+            .rsplit_once(':')
+            .unwrap_or_else(|| panic!("Context is not `<host>:<port>`: {ctx:?}"));
+        assert!(
+            !host.is_empty(),
+            "the exception context is the RESOLVED peer name (C's \
+             `tcpiiu::getHostName`), which must be non-empty; ctx: {ctx:?}"
+        );
+        assert!(
+            port.parse::<u16>().is_ok(),
+            "R18-19: the peer port must be preserved in the context; ctx: {ctx:?}"
+        );
+    }
     // R18-21: and that block is ALL of it. C's `event_handler` prints nothing
     // for a non-NORMAL status, so the per-PV status line the port used to emit
     // (`TST:AI: server reported ECA status 0x00c0`) is a line C never writes.

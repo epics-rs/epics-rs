@@ -338,7 +338,12 @@ impl Default for TraceConfig {
             // turns a form on (:3186-3190). ASCII is a value an operator asks
             // for, not one a port is born with.
             trace_io_mask: TraceIoMask::NODATA,
-            trace_info_mask: TraceInfoMask::TIME | TraceInfoMask::PORT,
+            // C `tracePvtInit` (asynManager.c:455) sets
+            // `traceInfoMask = ASYN_TRACEINFO_TIME` and nothing else, so a port
+            // is born with only the TIME bit: `monitorStatus` reads back
+            // `TINM=1`, `TINB0(time)=On`, `TINB1(port)=Off`. PORT is a bit an
+            // operator turns on, not one a port starts with.
+            trace_info_mask: TraceInfoMask::TIME,
             io_truncate_size: 80,
             trace_buffer_size: DEFAULT_TRACE_BUFFER_SIZE,
             file: TraceFile::default(),
@@ -872,7 +877,9 @@ impl TraceManager {
         self.global_config
             .lock()
             .map(|c| c.trace_info_mask)
-            .unwrap_or(TraceInfoMask::TIME | TraceInfoMask::PORT)
+            // Matches `TraceConfig::default` — a port born with only the TIME
+            // bit (C `tracePvtInit`, asynManager.c:455).
+            .unwrap_or(TraceInfoMask::TIME)
     }
 }
 
@@ -1246,6 +1253,28 @@ mod tests {
         assert_eq!(
             TraceIoMask::from_symbolic("NODATA+HEX").unwrap(),
             TraceIoMask::HEX
+        );
+    }
+
+    /// A port is born with only the TIME trace-info bit (C `tracePvtInit`,
+    /// asynManager.c:455 `traceInfoMask = ASYN_TRACEINFO_TIME`), so an asyn
+    /// record over a fresh port reads back `TINM=1` / `TINB1(port)=Off` — not
+    /// `TIME | PORT` (=3, which lit `TINB1=On`).
+    #[test]
+    fn fresh_port_trace_info_mask_is_time_only() {
+        assert_eq!(TraceConfig::default().trace_info_mask, TraceInfoMask::TIME);
+        let mgr = TraceManager::new();
+        // Unknown port falls back to the global default — also TIME only.
+        assert_eq!(
+            mgr.get_trace_info_mask(Some("never-created")),
+            TraceInfoMask::TIME
+        );
+        assert_eq!(mgr.get_trace_info_mask(None), TraceInfoMask::TIME);
+        // The PORT bit is therefore off until an operator sets it.
+        assert!(
+            !TraceConfig::default()
+                .trace_info_mask
+                .contains(TraceInfoMask::PORT)
         );
     }
 
@@ -1692,10 +1721,14 @@ mod tests {
     #[test]
     fn output_device_uses_device_config_when_present() {
         let mgr = TraceManager::new();
-        mgr.set_trace_info_mask(None, TraceInfoMask::PORT);
         // Port allows ERROR; device allows ERROR | FLOW.
         mgr.set_trace_mask(Some("dev_p"), TraceMask::ERROR);
         mgr.set_device_trace_mask("dev_p", 5, TraceMask::ERROR | TraceMask::FLOW);
+        // The `[port:addr]` prefix is driven by the *effective* config's info
+        // mask, which for a device is the device's own slot (whole-config
+        // resolution, not per-field merge). A fresh port/device carries only
+        // TIME, so turn PORT on where the emit actually reads it.
+        mgr.set_device_trace_info_mask("dev_p", 5, TraceInfoMask::PORT);
 
         let temp = std::env::temp_dir().join("asyn_trace_device_output.txt");
         let file = std::fs::File::create(&temp).unwrap();
@@ -1834,7 +1867,9 @@ mod tests {
         // Port disables FLOW; device enables FLOW.
         mgr.set_trace_mask(Some("p"), TraceMask::ERROR);
         mgr.set_device_trace_mask("p", 7, TraceMask::FLOW);
-        mgr.set_trace_info_mask(None, TraceInfoMask::PORT);
+        // Prefix reads the device's own info mask (whole-config resolution);
+        // a fresh device carries only TIME, so enable PORT on the device slot.
+        mgr.set_device_trace_info_mask("p", 7, TraceInfoMask::PORT);
 
         let temp = std::env::temp_dir().join("asyn_trace_device_macro.txt");
         let file = std::fs::File::create(&temp).unwrap();

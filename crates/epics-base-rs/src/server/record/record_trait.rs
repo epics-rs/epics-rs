@@ -1963,6 +1963,40 @@ pub trait Record: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Whether this record type's C `init_record` resets the record to a
+    /// defined, no-alarm state — `prec->udf = 0; recGblResetAlarms(prec)` — so
+    /// a freshly loaded, never-processed record reads `UDF=0`,
+    /// `STAT=NO_ALARM`, `SEVR=NO_ALARM` instead of the born `UDF`/`INVALID`/`1`.
+    ///
+    /// Almost no record does this: a not-yet-processed record is normally left
+    /// `UDF` so an `MS` consumer inherits `INVALID` at IOC startup (see
+    /// [`RecordInstance::run_init_passes`]). The asyn record is the exception —
+    /// `asynRecord.c` `init_record` pass 0 does `pasynRec->udf = 0;
+    /// recGblResetAlarms(pasynRec)` unconditionally, because a device-config
+    /// record is defined the moment it loads, even against a disconnected port.
+    /// `UDF` is a common field `init_record` cannot reach, so the record
+    /// declares the fact here and the init owner performs the reset. Default
+    /// `false`.
+    fn init_resets_alarms(&self) -> bool {
+        false
+    }
+
+    /// The channel's native (maximum) element count for `field`, when it
+    /// differs from the count of the field's current value.
+    ///
+    /// C's `cvt_dbaddr` fixes a channel's `no_elements` at the field's buffer
+    /// capacity, while `get_array_info` reports the current valid length — so a
+    /// client's `ca_element_count` is the capacity even though a GET returns
+    /// fewer elements. Return `Some(capacity)` for such a field; `None`
+    /// (default) means the channel count is the value's own count.
+    ///
+    /// - waveform `VAL` → `NELM` (buffer capacity; the value serves `NORD`).
+    /// - asyn `BOUT` → `OMAX`, `BINP` → `IMAX` (the `SPC_DBADDR` octet buffers;
+    ///   the value serves the transferred byte count `NOWT`/`NORD`).
+    fn field_native_count(&self, _field: &str) -> Option<u32> {
+        None
+    }
+
     /// Seed the monitor/archive/alarm deadband trackers (MLST/ALST/LALM)
     /// from the initial value at iocInit, called once by the builder after
     /// both `init_record` passes and `post_init_finalize_undef`.

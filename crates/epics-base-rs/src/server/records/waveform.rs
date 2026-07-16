@@ -851,6 +851,15 @@ impl Record for WaveformRecord {
         Ok(())
     }
 
+    /// `waveform` VAL: `get_field("VAL")` serves NORD valid elements, but the
+    /// channel's native count is NELM (the buffer capacity) so a client sizes
+    /// its buffer right — C `cvt_dbaddr` `no_elements = nelm` vs
+    /// `get_array_info` `*no_elements = nord`. Only the waveform kind: `aai`/
+    /// `aao`/`subArray` serve their VAL at its own count.
+    fn field_native_count(&self, field: &str) -> Option<u32> {
+        (field == "VAL" && self.kind == ArrayKind::Waveform).then_some(self.nelm.max(0) as u32)
+    }
+
     /// `aao` is an output record; the rest of the array family read
     /// from INP. Output records take the device-write path in
     /// processing.rs (or fall through to the soft-link write when the

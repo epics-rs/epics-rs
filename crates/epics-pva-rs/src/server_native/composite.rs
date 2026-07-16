@@ -320,7 +320,7 @@ impl ChannelSource for CompositeSource {
     }
 
     /// A name is SEARCH-advertised iff *any* source claims it — the OR
-    /// of `searchable` across every source that hosts the name.
+    /// of `searchable` across every source.
     ///
     /// SEARCH aggregation is separate from CREATE/GET/PUT/RPC ownership.
     /// pvxs runs `Source::onSearch` on every registered source and lets
@@ -336,12 +336,23 @@ impl ChannelSource for CompositeSource {
     /// user PV that happens to be named `server`, which pvxs advertises.
     /// CREATE/GET/PUT/RPC keep the first-owner rule (lowest order wins,
     /// so `__server` owns the literal `server` channel); only SEARCH ORs.
+    ///
+    /// `searchable` is asked ALONE — not `has_pv(name) && searchable(name)`.
+    /// pvxs's `onSearch` and `onCreate` are independent callbacks and a
+    /// source may legitimately claim more at search than it will serve at
+    /// create: `SingleSource` claims every name `dbChannelTest` resolves, then
+    /// refuses the ones whose field has no NT (`ORACLE:AI.MLOK`, a
+    /// `DBF_NOACCESS` field — see
+    /// [`PvDatabaseSource::has_pv`](crate::server::PvDatabaseSource::has_pv)).
+    /// ANDing `has_pv` in here made that shape unrepresentable and forced the
+    /// two questions to share one answer. Sources that do not distinguish them
+    /// are unaffected: [`ChannelSource::searchable`]'s default IS `has_pv`.
     fn searchable(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
         let sources = self.snapshot();
         let name = name.to_string();
         async move {
             for src in sources {
-                if src.has_pv(&name).await && src.searchable(&name).await {
+                if src.searchable(&name).await {
                     return true;
                 }
             }
@@ -350,13 +361,15 @@ impl ChannelSource for CompositeSource {
     }
 
     /// Endpoint-scoped counterpart of [`Self::searchable`]: the OR of
-    /// `searchable_from` across every source that hosts the name, so a
+    /// `searchable_from` across every source, so a
     /// source can claim a PV only for some requesters (pvxs
     /// `Search::source()`, filled from the UDP reply dest /
     /// `server.cpp:674-704` or the TCP peer / `serverchan.cpp:197-222`).
     /// Same "any source may claim" rule as [`Self::searchable`] — a
     /// non-searchable hosting source must not veto a later source's
-    /// claim, matching pvxs's per-source independent `onSearch`.
+    /// claim, matching pvxs's per-source independent `onSearch`, and
+    /// `searchable_from` is likewise asked alone (see [`Self::searchable`] for
+    /// why `has_pv` is not ANDed in).
     fn searchable_from(
         &self,
         name: &str,
@@ -366,7 +379,7 @@ impl ChannelSource for CompositeSource {
         let name = name.to_string();
         async move {
             for src in sources {
-                if src.has_pv(&name).await && src.searchable_from(&name, requester).await {
+                if src.searchable_from(&name, requester).await {
                     return true;
                 }
             }
@@ -1887,6 +1900,99 @@ mod tests {
             comp.get_value("server").await.is_none(),
             "first-owner CREATE/GET rule must keep `server` owned by the \
              front `__server` source; SEARCH OR must not change ownership"
+        );
+    }
+
+    /// The other direction of the same independence: a source may advertise a
+    /// name at SEARCH that it will REFUSE at CREATE_CHANNEL.
+    ///
+    /// This is pvxs's `SingleSource` shape — `onSearch` claims every name
+    /// `dbChannelTest` resolves (`singlesource.cpp:467-472`), and `onCreate`
+    /// then refuses a field with no NT (`DBF_NOACCESS`), which the server
+    /// reports as `Refused to create Channel` (`serverchan.cpp:328-351`).
+    /// Measured on `softIocPVX`: `pvxget ORACLE:AI.MLOK` gets exactly that
+    /// refusal, which proves the search was answered first.
+    ///
+    /// The composite previously asked `has_pv(name) && searchable(name)`,
+    /// which made `searchable`-wider-than-`has_pv` unrepresentable: the
+    /// refusal would have degraded to a search timeout. Sources that do not
+    /// distinguish the two are unaffected — `searchable` defaults to `has_pv`,
+    /// which the sibling test above still pins.
+    #[tokio::test]
+    async fn search_advertises_a_name_the_source_refuses_at_create() {
+        /// Advertised at SEARCH, refused at CREATE — the `SingleSource`
+        /// `DBF_NOACCESS` shape.
+        struct RefusesAtCreateSrc {
+            name: &'static str,
+        }
+        impl ChannelSource for RefusesAtCreateSrc {
+            fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
+                async { Vec::new() }
+            }
+            /// The CREATE gate: this source serves nothing.
+            fn has_pv(&self, _: &str) -> impl std::future::Future<Output = bool> + Send {
+                async { false }
+            }
+            /// The SEARCH gate: the name resolves, so it is advertised.
+            fn searchable(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
+                let m = name == self.name;
+                async move { m }
+            }
+            fn get_introspection(
+                &self,
+                _: &str,
+            ) -> impl std::future::Future<Output = Option<FieldDesc>> + Send {
+                async { None }
+            }
+            fn get_value(
+                &self,
+                _: &str,
+            ) -> impl std::future::Future<Output = Option<PvField>> + Send {
+                async { None }
+            }
+            fn put_value(
+                &self,
+                _: &str,
+                _: PvField,
+            ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
+                async { Err("n/a".into()) }
+            }
+            fn is_writable(&self, _: &str) -> impl std::future::Future<Output = bool> + Send {
+                async { false }
+            }
+            fn subscribe(
+                &self,
+                _: &str,
+            ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send
+            {
+                async { None }
+            }
+        }
+
+        let requester: std::net::SocketAddr = "10.0.0.5:5076".parse().unwrap();
+        let comp = CompositeSource::new();
+        comp.add_source(
+            "db",
+            Arc::new(RefusesAtCreateSrc {
+                name: "REC.NOACCESS",
+            }),
+            0,
+        )
+        .unwrap();
+
+        assert!(
+            comp.searchable("REC.NOACCESS").await,
+            "SEARCH must be answered for a name the source advertises, even \
+             though CREATE will refuse it — else the client never sends \
+             CREATE_CHANNEL and the refusal becomes a timeout"
+        );
+        assert!(
+            comp.searchable_from("REC.NOACCESS", requester).await,
+            "the TCP-circuit search gate must agree with the UDP one"
+        );
+        assert!(
+            !comp.has_pv("REC.NOACCESS").await,
+            "the CREATE gate must still refuse the advertised name"
         );
     }
 }

@@ -570,7 +570,47 @@ impl ChannelSource for PvDatabaseSource {
         }
     }
 
+    /// Whether this source will SERVE a channel for `name` — the CREATE gate.
+    ///
+    /// Stricter than [`Self::searchable`] on purpose, and the asymmetry is
+    /// pvxs's. `SingleSource::onSearch` claims a name whenever `dbChannelTest`
+    /// resolves it (`ioc/singlesource.cpp:467-472`) — a pure dbd name lookup
+    /// (`dbFindRecordPart` + `dbFindFieldPart`, `dbChannel.c:311-343`) with no
+    /// type check at all. `onCreate` then builds the value prototype OUTSIDE
+    /// its `try`/`catch` (`singlesource.cpp:427-459`), so a field whose DBR
+    /// type has no NT — `DBF_NOACCESS` maps to `TypeCode::Null`, which
+    /// `NTScalar::build()` refuses — throws past `onCreate`, the source never
+    /// claims the channel, and the server answers `Refused to create Channel`
+    /// (`src/serverchan.cpp:328-351`). Measured against `softIocPVX`:
+    /// `ORACLE:AI.MLOK` is searched successfully and then refused.
+    ///
+    /// So existence is answered per-FIELD here, not per-record: `has_name` is
+    /// the search-side lookup and stops at the record (`database/mod.rs`, "for
+    /// UDP search"). Resolving the snapshot is the same gate the CA server
+    /// already applies at its own CREATE_CHANNEL — `client_field_value` is
+    /// `None` for an unmodeled field, which answers `CREATE_CH_FAIL`
+    /// (`epics-ca-rs/src/server/tcp.rs:2630-2642`) — so both protocols now
+    /// refuse an unservable field at create rather than claiming it and
+    /// failing later with "field introspection unavailable".
+    ///
+    /// A simple PV has no field to narrow, so it resolves exactly as before.
     fn has_pv(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
+        let db = self.db.clone();
+        let name = name.to_string();
+        async move { snapshot_for(&db, &name).await.is_some() }
+    }
+
+    /// Whether `name` is SEARCH-advertised — deliberately the looser,
+    /// record-level [`PvDatabase::has_name`] rather than [`Self::has_pv`].
+    ///
+    /// pvxs claims at search everything `dbChannelTest` resolves and only
+    /// refuses at create (see [`Self::has_pv`]), so a channel that cannot be
+    /// served must still be ANSWERED — otherwise the client never sends
+    /// CREATE_CHANNEL and a prompt "Refused to create Channel" degrades into a
+    /// silent search timeout, which is a different divergence, not a fix.
+    /// Keeping `has_name` here also keeps the search reply cheap: no snapshot
+    /// is built for a broadcast that may match nothing.
+    fn searchable(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
         let db = self.db.clone();
         let name = name.to_string();
         async move { db.has_name(&name).await }
@@ -1905,6 +1945,64 @@ mod tests {
             ),
             "NTEnum PUT must land on value.index"
         );
+    }
+
+    /// The search/create gates by boundary, one case per boundary rather than
+    /// per scenario. `searchable` is the dbd-name question (pvxs
+    /// `dbChannelTest`); `has_pv` is the can-this-be-served question (pvxs
+    /// `getValuePrototype`). The two answers must differ exactly on a name
+    /// whose record exists but whose field cannot be served.
+    ///
+    /// Measured against `softIocPVX` on `record(ai,"ORACLE:AI")`:
+    /// `pvxget ORACLE:AI.MLOK` → `Refused to create Channel`, i.e. the search
+    /// WAS answered (a refusal can only follow a CREATE_CHANNEL, which only
+    /// follows a successful search) and the create was refused.
+    #[tokio::test]
+    async fn search_claims_every_dbd_name_but_create_gates_on_a_servable_field() {
+        use epics_base_rs::server::records::ai::AiRecord;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("ORACLE:AI", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        db.add_pv("SIMPLE:PV", EpicsValue::Double(1.0))
+            .await
+            .unwrap();
+        let src = PvDatabaseSource::new(db.clone());
+
+        // Boundary: record base name — servable (VAL), both gates true.
+        assert!(src.searchable("ORACLE:AI").await);
+        assert!(src.has_pv("ORACLE:AI").await);
+
+        // Boundary: an explicitly addressed servable field.
+        assert!(src.searchable("ORACLE:AI.EGU").await);
+        assert!(src.has_pv("ORACLE:AI.EGU").await);
+
+        // Boundary: THE case. `MLOK` is `DBF_NOACCESS` in ai.dbd (a mutex, so
+        // this port models no field for it). The record resolves, so search
+        // must still answer; the field has no value, so create must refuse.
+        // This is the one name where the two gates disagree.
+        assert!(
+            src.searchable("ORACLE:AI.MLOK").await,
+            "a DBF_NOACCESS field's record resolves, so pvxs answers the \
+             SEARCH — withholding it would replace `Refused to create \
+             Channel` with a client timeout"
+        );
+        assert!(
+            !src.has_pv("ORACLE:AI.MLOK").await,
+            "a DBF_NOACCESS field has no NT, so CREATE_CHANNEL must be refused \
+             rather than claimed and later failed with `field introspection \
+             unavailable`"
+        );
+
+        // Boundary: a record that does not exist at all — neither gate.
+        assert!(!src.searchable("NO:SUCH:RECORD").await);
+        assert!(!src.has_pv("NO:SUCH:RECORD").await);
+
+        // Boundary: a simple PV has no field to narrow, so the stricter create
+        // gate must not change its answer.
+        assert!(src.searchable("SIMPLE:PV").await);
+        assert!(src.has_pv("SIMPLE:PV").await);
     }
 
     /// Regression: a monitor on a *simple* native PV must observe later

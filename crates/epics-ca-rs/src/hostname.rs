@@ -49,10 +49,20 @@ pub fn ip_addr_to_a(addr: SocketAddr) -> String {
 
 /// libcom `ipAddrToHostName`. `None` is C's `return 0` — "no name", which is
 /// the only thing the caller is allowed to distinguish.
+///
+/// The reverse lookup itself is the OS `getnameinfo(NI_NAMEREQD)` — the same
+/// call C libcom makes. It lives behind [`resolve_ptr`] because that symbol is
+/// in `libc` on unix but in Winsock on Windows.
 fn ip_addr_to_host_name(addr: SocketAddr) -> Option<String> {
     // `socket2` owns the `SocketAddr` → `sockaddr` conversion (and its
     // length), so this module does not hand-roll a `sockaddr_in`.
     let sa = socket2::SockAddr::from(addr);
+    resolve_ptr(&sa)
+}
+
+/// POSIX `getnameinfo(NI_NAMEREQD)` — the resolver C libcom uses on unix.
+#[cfg(unix)]
+fn resolve_ptr(sa: &socket2::SockAddr) -> Option<String> {
     let mut buf = [0 as libc::c_char; 256];
     // SAFETY: `sa` outlives the call and reports its own length; `buf` is
     // `buf.len()` bytes of writable storage. `getnameinfo` NUL-terminates
@@ -73,6 +83,38 @@ fn ip_addr_to_host_name(addr: SocketAddr) -> Option<String> {
     }
     // SAFETY: `getnameinfo` returned 0, so `buf` holds a NUL-terminated name.
     let name = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) };
+    let name = name.to_str().ok()?;
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// Winsock `getnameinfo(NI_NAMEREQD)` — the same resolver C EPICS uses on
+/// Windows, where the symbol lives in `ws2_32` rather than the CRT. Winsock is
+/// already initialised: no socket in this process exists without it.
+#[cfg(windows)]
+fn resolve_ptr(sa: &socket2::SockAddr) -> Option<String> {
+    use windows_sys::Win32::Networking::WinSock::{NI_NAMEREQD, SOCKADDR, getnameinfo};
+    let mut buf = [0u8; 256];
+    // SAFETY: `sa` outlives the call and reports its own length; `buf` is
+    // `buf.len()` bytes of writable storage. The `SockAddr` is a C `sockaddr`
+    // by layout, so the cross-crate pointer cast is a reinterpret of the same
+    // bytes Winsock expects. `getnameinfo` NUL-terminates within the bound or
+    // returns non-zero.
+    let rc = unsafe {
+        getnameinfo(
+            sa.as_ptr() as *const SOCKADDR,
+            sa.len() as i32,
+            buf.as_mut_ptr(),
+            buf.len() as u32,
+            std::ptr::null_mut(),
+            0,
+            NI_NAMEREQD as i32,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    // SAFETY: `getnameinfo` returned 0, so `buf` holds a NUL-terminated name.
+    let name = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr() as *const libc::c_char) };
     let name = name.to_str().ok()?;
     (!name.is_empty()).then(|| name.to_string())
 }

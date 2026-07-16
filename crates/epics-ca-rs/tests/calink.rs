@@ -18,13 +18,29 @@ use epics_ca_rs::client::{CaClient, CaClientConfig};
 use epics_ca_rs::server::CaServer;
 use serial_test::serial;
 
-/// A port with nothing bound to it — for the tests that want an
-/// unreachable upstream. A test that *hosts* a server must not use this:
-/// it asks the server for port 0 and reads back the port it bound, so
-/// the port cannot be taken between the probe and the bind.
-fn free_port() -> u16 {
-    let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve free CA port");
-    probe.local_addr().unwrap().port()
+/// A held, silent UDP socket that OWNS a dead CA port for the test's whole
+/// lifetime — for tests that want an unreachable upstream.
+///
+/// Ownership rule: a port is TAKEN by binding it, never probed and handed
+/// on. The old `TcpListener::bind(:0)` + drop probe reserved nothing after
+/// it returned — and it never touched the UDP namespace at all, so a
+/// parallel test's `CaServer` (which binds UDP `:0`) could land on the very
+/// same number and answer the `EPICS_CA_SERVER_PORT` searches, flaking the
+/// "dead upstream" false-alive. Binding UDP `127.0.0.1:0` and keeping the
+/// socket (never reading it) instead guarantees (a) no other socket in the
+/// process can take the number, and (b) every search sent there lands in
+/// this socket's buffer and is never answered — the upstream is
+/// deterministically dead. UDP-only suffices: the CA client only opens a
+/// TCP circuit after a UDP search *reply* names a server, which never comes.
+///
+/// The caller must bind the returned guard for the test duration — the port
+/// is dead only while the socket lives. A test that *hosts* a server must
+/// not use this: it asks the server for port 0 and reads back the port it
+/// bound.
+fn dead_upstream() -> (std::net::UdpSocket, u16) {
+    let sock = std::net::UdpSocket::bind(("127.0.0.1", 0)).expect("own a dead CA port");
+    let port = sock.local_addr().unwrap().port();
+    (sock, port)
 }
 
 /// Build a `CaClient` pinned to `127.0.0.1:port` so a test does not
@@ -561,8 +577,10 @@ async fn ca_link_exposes_remote_metadata() {
 #[serial(epics_env)]
 async fn install_registers_ca_scheme() {
     // No server needed — the resolver registers regardless of
-    // upstream connectivity.
-    pin_env(free_port());
+    // upstream connectivity. Own a dead port for the whole test so a
+    // parallel `CaServer` cannot land on the number mid-run.
+    let (_dead, port) = dead_upstream();
+    pin_env(port);
 
     let db = PvDatabase::new();
     let _resolver = install_calink_resolver(&db, tokio::runtime::Handle::current()).await;

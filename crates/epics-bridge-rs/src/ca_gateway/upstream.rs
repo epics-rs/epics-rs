@@ -2029,13 +2029,28 @@ mod tests {
         assert_eq!(cached_old_for_audit(&env, "GW:PV").await, "24.8");
     }
 
-    /// Reserve a free TCP port by binding ephemeral then dropping.
-    fn free_port() -> u16 {
-        std::net::TcpListener::bind(("127.0.0.1", 0))
-            .expect("reserve free CA port")
-            .local_addr()
-            .unwrap()
-            .port()
+    /// A held, silent UDP socket that OWNS a dead CA port for the test's
+    /// whole lifetime — for the dead-upstream tests.
+    ///
+    /// Ownership rule: a port is TAKEN by binding it, never probed and
+    /// handed on. The old `TcpListener::bind(:0)` + drop probe reserved
+    /// nothing after it returned — and never touched the UDP namespace at
+    /// all, so a parallel test's `CaServer` (which binds UDP `:0`) could
+    /// land on the very same number and answer the `EPICS_CA_SERVER_PORT`
+    /// searches, flaking the "dead upstream" false-alive. Binding UDP
+    /// `127.0.0.1:0` and keeping the socket (never reading it) instead
+    /// guarantees (a) no other socket in the process can take the number,
+    /// and (b) every search sent there lands in this socket's buffer and is
+    /// never answered — the upstream is deterministically dead. UDP-only
+    /// suffices: the CA client only opens a TCP circuit after a UDP search
+    /// *reply* names a server, which never comes.
+    ///
+    /// The caller must bind the returned guard for the test duration — the
+    /// port is dead only while the socket lives.
+    fn dead_upstream() -> (std::net::UdpSocket, u16) {
+        let sock = std::net::UdpSocket::bind(("127.0.0.1", 0)).expect("own a dead CA port");
+        let port = sock.local_addr().unwrap().port();
+        (sock, port)
     }
 
     /// Point the ambient `EPICS_CA_*` env at `127.0.0.1:port` so the
@@ -2580,9 +2595,11 @@ ASG(NewGroup) {
     #[tokio::test(flavor = "multi_thread")]
     #[serial(epics_env)]
     async fn br_r64_dead_upstream_not_registered() {
-        // A free port with NO server bound: the upstream search never
-        // resolves and the configured connect_timeout expires.
-        let port = free_port();
+        // A held dead port with NO server bound: the upstream search never
+        // resolves and the configured connect_timeout expires. The guard
+        // stays alive for the whole test so no parallel `CaServer` can land
+        // on the number and answer.
+        let (_dead, port) = dead_upstream();
         pin_env(port);
         let db = Arc::new(PvDatabase::new());
         let mgr = pinned_manager(db.clone()).await;
@@ -2857,8 +2874,10 @@ ASG(NewGroup) {
     #[serial(epics_env)]
     async fn br_2026_22_lazy_connect_honors_configured_timeout() {
         // Deliberately a dead port: nothing is served here, so the
-        // configured connect timeout is what ends the search.
-        let port = free_port();
+        // configured connect timeout is what ends the search. Hold the
+        // guard for the whole test so a parallel `CaServer` cannot land on
+        // the number and resolve the search early.
+        let (_dead, port) = dead_upstream();
         pin_env(port);
         let db = Arc::new(PvDatabase::new());
         let env = dummy_env();

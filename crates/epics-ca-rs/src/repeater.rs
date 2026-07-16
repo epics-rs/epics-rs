@@ -46,16 +46,30 @@ impl RepeaterClient {
         }
     }
 
-    /// Check if client is still alive by trying to bind to its port.
+    /// Check if client is still alive by trying to bind to its address.
     /// If bind succeeds, the client has released the port (dead).
+    ///
+    /// C's bind test binds INADDR_ANY:port (`makeSocket(port, false)`,
+    /// `repeater.cpp:94-124`), which works there because C's clients bind
+    /// their UDP socket to INADDR_ANY (`udpiiu.cpp:241-249`) — so the
+    /// wildcard test collides (EADDRINUSE) with the wildcard client. This
+    /// port's clients bind SPECIFIC NIC addresses (the AsyncUdpV4 per-NIC
+    /// bundle, never a wildcard socket), and on Windows a wildcard bind
+    /// test does NOT collide with a socket bound to a specific address —
+    /// so an INADDR_ANY probe would report every live client as departed
+    /// and reap it. Bind the test to the client's OWN registered address
+    /// (`self.addr`, the datagram source the repeater stored) so it
+    /// collides with the client's specific-address socket on every
+    /// platform, preserving C's liveness semantics ("is this client's port
+    /// still held?") against the port's specific-address sockets.
     fn verify(&self) -> bool {
-        let port = match self.addr {
-            SocketAddr::V4(v4) => v4.port(),
+        let bind_addr = match self.addr {
+            SocketAddr::V4(v4) => v4,
             _ => return false,
         };
-        match StdUdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port)) {
-            Ok(_) => false,                                         // port free → client gone
-            Err(e) if e.kind() == io::ErrorKind::AddrInUse => true, // port in use → alive
+        match StdUdpSocket::bind(bind_addr) {
+            Ok(_) => false,                                         // addr free → client gone
+            Err(e) if e.kind() == io::ErrorKind::AddrInUse => true, // addr in use → alive
             Err(_) => true,                                         // other error → assume alive
         }
     }

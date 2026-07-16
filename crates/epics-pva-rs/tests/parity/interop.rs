@@ -490,11 +490,22 @@ async fn pvxs_pvxget_to_rust_server_ntndarray() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // pvxget against our NTNDArray-serving rust server.
+    //
+    // Tree format (`-F tree`) — not pvxget's default Delta — so the
+    // top-level `epics:nt/NTNDArray:1.0` id is observable. FmtDelta
+    // prints the very-top struct line only when the root changed-bit is
+    // set (pvxs `datafmt.cpp:19`), which neither pvxs's own server nor
+    // this one sets on a GET (`to_wire_valid`, `dataencode.cpp:416-439`;
+    // `Value::mark` cannot set a structure's own bit, `data.cpp:256-270`).
+    // FmtTree prints every struct's id unconditionally
+    // (`datafmt.cpp:196-200`), so the id assertion below holds.
     let output = TokioCommand::new(&pvxget)
         .env("EPICS_PVA_ADDR_LIST", format!("127.0.0.1:{}", port + 1))
         .env("EPICS_PVA_AUTO_ADDR_LIST", "NO")
         .arg("-w")
         .arg("3")
+        .arg("-F")
+        .arg("tree")
         .arg("IMG:RAW")
         .output()
         .await

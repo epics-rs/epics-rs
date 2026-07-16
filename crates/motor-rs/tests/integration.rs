@@ -884,3 +884,105 @@ async fn failed_poll_posts_comms_error_status() {
     let _ = poll_cmd_tx.send(PollCommand::Shutdown).await;
     let _ = poll_handle.await;
 }
+
+/// autosave pass0 restore contract. C `reboot_restore` pass0 writes fields
+/// with `dbPut` BEFORE `init_record` runs (`initHookAfterInitDevSup`
+/// precedes `initDatabase` in iocInit), so a restored VAL is a plain field
+/// write: per-record device init clears the parked put (`clear_last_write`)
+/// and the Startup readback's RSTM decision adopts the restored DVAL via
+/// `SetPosition` (redefine). A restore must never dispatch a move — the
+/// regression dispatched the restored VAL as a real move on the first
+/// status pass, and on a fast axis the Startup readback then caught the
+/// move mid-flight and synced the instantaneous position into VAL/DVAL.
+#[tokio::test]
+async fn pass0_restored_val_is_not_a_move_command() {
+    use asyn_rs::error::AsynError;
+    use asyn_rs::interfaces::motor::MotorStatus;
+    use asyn_rs::user::AsynUser;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    struct SpyMotor {
+        position: f64,
+        moves: Arc<AtomicU32>,
+        loads: Arc<AtomicU32>,
+    }
+    impl AsynMotor for SpyMotor {
+        fn poll(&mut self, _user: &AsynUser) -> Result<MotorStatus, AsynError> {
+            Ok(MotorStatus {
+                position: self.position,
+                done: true,
+                ..MotorStatus::default()
+            })
+        }
+        fn move_absolute(
+            &mut self,
+            _user: &AsynUser,
+            position: f64,
+            _min_vel: f64,
+            _max_vel: f64,
+            _accel: f64,
+        ) -> Result<(), AsynError> {
+            self.moves.fetch_add(1, Ordering::SeqCst);
+            self.position = position;
+            Ok(())
+        }
+        fn stop(&mut self, _user: &AsynUser, _accel: f64) -> Result<(), AsynError> {
+            Ok(())
+        }
+        fn home(
+            &mut self,
+            _user: &AsynUser,
+            _min_vel: f64,
+            _max_vel: f64,
+            _accel: f64,
+            _forwards: bool,
+        ) -> Result<(), AsynError> {
+            Ok(())
+        }
+        fn set_position(&mut self, _user: &AsynUser, position: f64) -> Result<(), AsynError> {
+            self.loads.fetch_add(1, Ordering::SeqCst);
+            self.position = position;
+            Ok(())
+        }
+    }
+
+    let moves = Arc::new(AtomicU32::new(0));
+    let loads = Arc::new(AtomicU32::new(0));
+    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(SpyMotor {
+        position: 0.0,
+        moves: moves.clone(),
+        loads: loads.clone(),
+    }));
+    let mut setup = make_builder(motor.clone()).build();
+
+    // pass0 restore: a silent field write, before device init.
+    setup
+        .record
+        .put_field("VAL", EpicsValue::Double(1.5))
+        .unwrap();
+    // C init_record era: initial readback seed + parked-put clear.
+    setup.device_support.init(&mut setup.record).unwrap();
+    // First status pass = Startup -> initial_readback -> RSTM restore.
+    setup.record.process().unwrap();
+    setup.device_support.write(&mut setup.record).unwrap();
+
+    assert_eq!(
+        setup.record.pos.val, 1.5,
+        "restored VAL survives init and the Startup pass"
+    );
+    assert_eq!(setup.record.pos.dval, 1.5);
+    assert!(setup.record.stat.dmov, "restored axis comes up done");
+    assert_eq!(
+        moves.load(Ordering::SeqCst),
+        0,
+        "a pass0-restored VAL must never dispatch a move"
+    );
+    assert_eq!(
+        loads.load(Ordering::SeqCst),
+        1,
+        "RSTM NearZero adopts the autosaved DVAL via SetPosition"
+    );
+    let user = AsynUser::new(0);
+    let st = motor.lock().unwrap().poll(&user).unwrap();
+    assert_eq!(st.position, 1.5, "the controller was redefined, not moved");
+}

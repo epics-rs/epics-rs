@@ -599,6 +599,20 @@ impl Acceptor {
                 });
             }
         };
+        // C's connectionListener accepts on a BLOCKING listener
+        // (epicsSocketAccept, :326), so its child fds are blocking and
+        // SO_RCVTIMEO governs every slot read. This listener is non-blocking
+        // (the poll loop needs it), and macOS/BSD accepted sockets INHERIT
+        // O_NONBLOCK from the listener (Linux resets it) — an inherited
+        // non-blocking child turns every timed slot read into an instant
+        // EWOULDBLOCK poll and SO_RCVTIMEO into a no-op. Restore blocking
+        // explicitly so the child matches C on every platform.
+        stream
+            .set_nonblocking(false)
+            .map_err(|e| AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!("set_nonblocking(false) on accepted client failed: {e}"),
+            })?;
         if let Some(t) = self.read_timeout {
             stream
                 .set_read_timeout(Some(t))

@@ -110,43 +110,70 @@ fn a_taken_tcp_port_makes_the_server_print_cs_five_warning_lines() {
 /// nothing at all. The warning is about a conflict, not a startup trace.
 #[test]
 fn a_free_tcp_port_is_silent() {
-    // A port taken by binding and then released: free at spawn time, and not a
-    // number this test invented.
-    let port = {
-        let probe = TcpListener::bind("0.0.0.0:0").expect("take a TCP port");
-        probe.local_addr().expect("bound addr").port()
-    };
+    // The port is obtained by binding an ephemeral socket and releasing it, so
+    // there is an unavoidable window between the release and softioc-rs's own
+    // bind in which another process on a busy test host can steal it. A steal
+    // is an environment artifact, not the behavior under test: softioc-rs then
+    // finds the port taken and prints the same `cas` fallback block test 1
+    // checks, or fails to bind at all. Retry on a non-clean run and let only a
+    // run where softioc-rs actually got the port (and stayed silent) count.
+    const ATTEMPTS: usize = 10;
+    for attempt in 0..ATTEMPTS {
+        let port = {
+            let probe = TcpListener::bind("0.0.0.0:0").expect("take a TCP port");
+            probe.local_addr().expect("bound addr").port()
+        };
 
-    let mut ioc = Reaped(
-        Command::new(env!("CARGO_BIN_EXE_softioc-rs"))
-            .args(["--port", &port.to_string(), "--pv", "TST:AI:double:1.0"])
-            .env("EPICS_CAS_BEACON_ADDR_LIST", "127.0.0.1:1")
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn softioc-rs"),
-    );
-
-    let stderr = ioc.0.stderr.take().expect("piped stderr");
-    let mut reader = BufReader::new(stderr);
-    let deadline = Instant::now() + Duration::from_secs(15);
-    let mut seen: Vec<String> = Vec::new();
-    let mut line = String::new();
-    loop {
-        assert!(
-            Instant::now() < deadline,
-            "softioc-rs never got past startup; stderr so far: {seen:#?}"
+        let mut ioc = Reaped(
+            Command::new(env!("CARGO_BIN_EXE_softioc-rs"))
+                .args(["--port", &port.to_string(), "--pv", "TST:AI:double:1.0"])
+                .env("EPICS_CAS_BEACON_ADDR_LIST", "127.0.0.1:1")
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn softioc-rs"),
         );
-        line.clear();
-        let n = reader.read_line(&mut line).expect("read softioc-rs stderr");
-        assert!(n > 0, "softioc-rs exited; stderr: {seen:#?}");
-        seen.push(line.trim_end().to_string());
-        if line.contains("CA server:") {
-            break;
+
+        let stderr = ioc.0.stderr.take().expect("piped stderr");
+        let mut reader = BufReader::new(stderr);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut seen: Vec<String> = Vec::new();
+        let mut line = String::new();
+        // Outcomes: reached "CA server:" silently (clean pass), or the port was
+        // stolen — surfaced either as a `cas` fallback line or as softioc-rs
+        // exiting before the banner (it could not bind the stolen port at all).
+        let mut stolen = false;
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "softioc-rs never got past startup; stderr so far: {seen:#?}"
+            );
+            line.clear();
+            let n = reader.read_line(&mut line).expect("read softioc-rs stderr");
+            if n == 0 {
+                // Exited before the banner: treat as a steal and retry.
+                stolen = true;
+                break;
+            }
+            seen.push(line.trim_end().to_string());
+            if line.starts_with("cas ") {
+                stolen = true;
+            }
+            if line.contains("CA server:") {
+                break;
+            }
         }
+
+        if !stolen {
+            // softioc-rs got its configured port and said nothing — the case
+            // under test.
+            return;
+        }
+
+        assert!(
+            attempt < ATTEMPTS - 1,
+            "the configured TCP port was stolen in the release→bind window on \
+             every one of {ATTEMPTS} attempts; last stderr: {seen:#?}"
+        );
     }
-    assert!(
-        !seen.iter().any(|l| l.starts_with("cas ")),
-        "the server got the port it asked for; stderr: {seen:#?}"
-    );
 }

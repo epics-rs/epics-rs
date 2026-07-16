@@ -1318,14 +1318,26 @@ impl RecordInstance {
     /// any vendored `.dbd`. Such a name is appended as its own slot, so the
     /// index and the string still name the SAME device support: there is no
     /// value of DTYP that renders as a device this record is not bound to.
-    pub(crate) fn device_choices(&self) -> Vec<PvString> {
-        let declared = super::dbd_generated::device_menu(self.record.record_type()).unwrap_or(&[]);
+    /// `None` when the record type declares NO device support at all — C's
+    /// `dbDeviceMenu *pdevs = paddr->pfldDes->ftPvt; if (!pdevs) goto nostrs;`
+    /// (`dbAccess.c:176-179`), which clears `DBR_ENUM_STRS` so the client is
+    /// sent no choice list at all.
+    ///
+    /// C keeps that case DISTINCT from a device menu that exists but is empty,
+    /// and says so at `dbAccess.c:205`: *"indicate option data not available.
+    /// distinct from no_str==0"*. An empty-but-present menu is still marked,
+    /// with `no_str = 0`; a missing menu is not marked. Returning `Vec` here
+    /// and defaulting the missing menu to `[]` collapsed the two, so a
+    /// `record(calc,"X"){}` — whose record type has no `device()` line — served
+    /// `value.choices = {0}[]` where QSRV2 omits the leaf entirely.
+    pub(crate) fn device_choices(&self) -> Option<Vec<PvString>> {
+        let declared = super::dbd_generated::device_menu(self.record.record_type())?;
         let mut slots: Vec<PvString> = declared.iter().map(|c| PvString::from(*c)).collect();
         let dtyp = self.common.dtyp.as_str();
         if !dtyp.is_empty() && !declared.contains(&dtyp) {
             slots.push(PvString::from(dtyp));
         }
-        slots
+        Some(slots)
     }
 
     /// C `dbPutFieldLink`'s link-type gate (`dbAccess.c:1125-1137`): a link
@@ -1366,7 +1378,10 @@ impl RecordInstance {
         if dtyp.is_empty() {
             return 0;
         }
+        // A record type with no device menu has no slot for any DTYP, so the
+        // index stays 0 — the same answer the old `unwrap_or(&[])` gave.
         self.device_choices()
+            .unwrap_or_default()
             .iter()
             .position(|c| c.as_str_lossy() == dtyp)
             .unwrap_or(0) as u16
@@ -1397,7 +1412,10 @@ impl RecordInstance {
     /// rendered as a number for a `DBF_MENU` and ONLY for a `DBF_MENU`.
     pub(crate) fn enum_string_form_for(&self, field: &str) -> Option<EnumStringForm> {
         if field.eq_ignore_ascii_case("DTYP") {
-            return Some(EnumStringForm::device(self.device_choices()));
+            // `None` propagates C's `goto nostrs` (`dbAccess.c:178`): a record
+            // type with no `device()` declaration supplies no choice list, so
+            // the leaf is omitted rather than marked empty.
+            return self.device_choices().map(EnumStringForm::device);
         }
         if let Some(choices) = self.menu_choices_for(field) {
             return Some(EnumStringForm::menu(
@@ -4778,6 +4796,62 @@ pub(crate) fn check_deadband(newval: f64, oldval: f64, deadband: f64) -> bool {
     // fire (C path leaves delta=0 and the `delta > deadband` check fails
     // for any non-negative deadband).
     newval != oldval
+}
+
+#[cfg(test)]
+mod device_menu_marking_tests {
+    use super::*;
+    use crate::server::records::ai::AiRecord;
+    use crate::server::records::calc::CalcRecord;
+
+    /// C `dbAccess.c:176-179`: a `DBF_DEVICE` field whose record type declares
+    /// no device support has `pfldDes->ftPvt == NULL` and takes `goto nostrs`,
+    /// which clears `DBR_ENUM_STRS` — the client is sent NO choice list.
+    ///
+    /// `calc` declares no `device()` line, so QSRV2 omits `value.choices` on
+    /// `CALC.DTYP`. The port used to default the missing menu to `[]` and mark
+    /// an empty list instead.
+    #[test]
+    fn dtyp_of_a_record_type_with_no_device_support_supplies_no_choices() {
+        let inst = RecordInstance::new("X".into(), CalcRecord::default());
+        assert!(
+            super::super::dbd_generated::device_menu("calc").is_none(),
+            "precondition: calc declares no device() line (C ftPvt == NULL)"
+        );
+        assert!(
+            inst.device_choices().is_none(),
+            "a record type with no device menu must report None, not an empty list"
+        );
+        assert!(
+            inst.enum_string_form_for("DTYP").is_none(),
+            "DTYP must supply no enum-string form, so no `value.choices` is marked"
+        );
+    }
+
+    /// The other side of C's `dbAccess.c:205` comment — *"indicate option data
+    /// not available. distinct from no_str==0"*. `ai` DOES declare device
+    /// support, so its menu exists and its choices are served.
+    #[test]
+    fn dtyp_of_a_record_type_with_device_support_supplies_its_choices() {
+        let inst = RecordInstance::new("X".into(), AiRecord::default());
+        let choices = inst
+            .device_choices()
+            .expect("ai declares device() lines, so its menu exists");
+        assert!(
+            choices.iter().any(|c| c.as_str_lossy() == "Soft Channel"),
+            "ai's device menu must carry its declared choices, got {choices:?}"
+        );
+        assert!(inst.enum_string_form_for("DTYP").is_some());
+    }
+
+    /// An unset `DTYP` is index 0 on both sides of the distinction — a record
+    /// type with no device menu has no slot for any DTYP, so the index stays 0
+    /// rather than panicking or shifting.
+    #[test]
+    fn dtyp_index_is_zero_when_the_record_type_has_no_device_menu() {
+        let inst = RecordInstance::new("X".into(), CalcRecord::default());
+        assert_eq!(inst.dtyp_index(), 0);
+    }
 }
 
 #[cfg(test)]

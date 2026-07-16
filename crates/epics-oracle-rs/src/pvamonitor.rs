@@ -28,6 +28,8 @@
 //!   `histogram`, `lsi`, `lso`, `printf`, `subArray`, `waveform`). pvxs refuses
 //!   an NT of `Null`, so those channels are outside the enumerated surface
 //!   already ([`crate::surface`]) and there is nothing to subscribe to.
+//! - **`sel`, whose `VAL` is `special(SPC_NOMOD)`** — the `.dbd` states no
+//!   client may write it, so no client can drive it. See [`val_status`].
 //! - **QSRV2 group PVs** (`dbLoadGroup` JSON), exactly as in the read phase:
 //!   a configured surface no `.dbd` enumerates.
 //!
@@ -71,11 +73,17 @@
 //! `pvxput` **exits 0 when the put was refused** (see [`PvaTools::pvxput`]).
 //! That matters here more than anywhere: a refused put posts no event, a port
 //! that posts nothing then matches a ground truth that posted nothing, and the
-//! case scores AGREED on an experiment that never ran. `sel.VAL` is exactly
-//! that case — `special(SPC_NOMOD)`, and pvxs answers `Attempt to modify noMod
-//! field`. So a drive that failed on either side makes the case ERRORED, and the
-//! `.dbd` needs no hand-kept list of undrivable fields: the drive reports
-//! itself.
+//! case scores AGREED on an experiment that never ran. So a drive that failed on
+//! either side makes the case ERRORED, and no hand-kept list of undrivable
+//! fields is needed for the cases the `.dbd` does not speak to: the drive
+//! reports itself.
+//!
+//! That runtime rule and [`val_status`]'s static exclusions are not duplicates —
+//! they have different jobs. The `.dbd` removes what it *proves* undrivable
+//! (`SPC_NOMOD`) before a case is ever built; the drive check catches what the
+//! `.dbd` could not know. Note which one is *not* allowed to decide: nothing is
+//! ever excluded because of what a side *did*, or a port could shrink the
+//! denominator by misbehaving.
 //!
 //! Note the converse is **not** an error. `fanout`, `seq` and `sub` accept the
 //! put (silent stderr) and post nothing — measured. That is ground truth's real
@@ -321,6 +329,11 @@ pub struct MonDenominator {
     pub record_types_with_val: usize,
     /// Record types whose `VAL` is `DBF_NOACCESS`, so no channel exists.
     pub excluded_noaccess_val: Vec<String>,
+    /// Record types whose `VAL` is `special(SPC_NOMOD)`: the `.dbd` says no
+    /// client can write it, so no client can drive it.
+    pub excluded_nomod_val: Vec<String>,
+    /// Record types whose `VAL` is a link or is otherwise not client-writable.
+    pub excluded_unwritable_val: Vec<String>,
     /// Record types with no [`Drive::Scanned`] reproducer, and why.
     pub excluded_scanned: Vec<String>,
     /// Non-`VAL` channels, which this phase does not drive.
@@ -385,6 +398,23 @@ impl MonReport {
                 d.excluded_noaccess_val.len(),
                 d.excluded_noaccess_val.join(", "),
                 ""
+            );
+        }
+        if !d.excluded_nomod_val.is_empty() {
+            let _ = writeln!(
+                s,
+                "  excluded (VAL is SPC_NOMOD): {} — {}\n  {:27}  (the .dbd forbids writing it, so no client can drive it)",
+                d.excluded_nomod_val.len(),
+                d.excluded_nomod_val.join(", "),
+                ""
+            );
+        }
+        if !d.excluded_unwritable_val.is_empty() {
+            let _ = writeln!(
+                s,
+                "  excluded (VAL not writable): {} — {}",
+                d.excluded_unwritable_val.len(),
+                d.excluded_unwritable_val.join(", ")
             );
         }
         let _ = writeln!(
@@ -503,9 +533,18 @@ pub fn probe(
 ) -> Vec<MonCase> {
     let mut cases = Vec::new();
     for (i, rt) in record_types.iter().enumerate() {
-        if !drives_val(surface, rt) {
+        // A skip is loud and says WHICH rule excluded the type, so a shrunken
+        // denominator can never be mistaken for a measured-clean one.
+        let status = val_status(surface, rt);
+        if status != ValStatus::Drivable {
+            let why = match status {
+                ValStatus::NoChannel => "VAL is DBF_NOACCESS — pvxs serves no channel for it",
+                ValStatus::NoMod => "VAL is special(SPC_NOMOD) — the .dbd forbids writing it",
+                ValStatus::NotWritable => "VAL is not a client-writable scalar",
+                ValStatus::Drivable => unreachable!(),
+            };
             eprintln!(
-                "[{}/{}] pva monitor: {rt} — SKIPPED: VAL is not a drivable channel",
+                "[{}/{}] pva monitor: {rt} — EXCLUDED: {why}",
                 i + 1,
                 record_types.len()
             );
@@ -524,17 +563,64 @@ pub fn probe(
     cases
 }
 
-/// Does this record type have a `VAL` channel this phase can drive?
+/// Why a record type's `VAL` channel is, or is not, in this phase's denominator.
 ///
-/// The same gate the CA probe applies — `VAL` must be in the enumerated surface
-/// (so not `DBF_NOACCESS`) and be a writable, client-observable scalar. Whether
-/// the drive is actually *accepted* is not predicted here: the drive proves
-/// itself, and a refusal is an ERROR (see the module docs).
-fn drives_val(surface: &Surface, record_type: &str) -> bool {
-    surface
+/// The single owner of that question, so the report's exclusion lines and the
+/// probe's skips cannot drift into disagreeing about why a type is absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValStatus {
+    /// A channel exists and the `.dbd` does not forbid writing it.
+    Drivable,
+    /// `VAL` is `DBF_NOACCESS`: pvxs refuses an NT of `Null`, so no channel
+    /// exists to subscribe to and the read phase already excludes it.
+    NoChannel,
+    /// `VAL` is `special(SPC_NOMOD)`: the `.dbd` states the field cannot be
+    /// written, so no client can ever drive it.
+    NoMod,
+    /// `VAL` is a link or otherwise not a client-writable scalar.
+    NotWritable,
+}
+
+/// Why this record type's `VAL` is or is not measurable here.
+///
+/// The `.dbd` answers two of these *statically*, and both are exclusions rather
+/// than errors — the same rule the read phase applies to `DBF_NOACCESS`: a
+/// channel the spec says cannot be measured is outside the denominator, not a
+/// failure inside it.
+///
+/// [`ValStatus::NoMod`] is the one worth naming. `sel.VAL` is
+/// `special(SPC_NOMOD)`, so **both** sides refuse the drive and **both** post
+/// nothing — identical traces, on an experiment that never ran. Erroring it
+/// every run said "we could not measure this" about a field the `.dbd` already
+/// said could never be measured, and it dragged in nondeterminism through the
+/// back door: the port self-posts on every scan of an undriven `sel`, so the
+/// ERRORED case's diagnostic trace carried 28 events one run and 29 the next.
+///
+/// This does **not** replace the runtime rule that a refused drive is an ERROR
+/// (see the module docs). The two have different jobs and different owners: this
+/// removes what the `.dbd` *proves* undrivable, and the drive check catches
+/// everything the `.dbd` does not know about. A port can never shrink the
+/// denominator by misbehaving, because every exclusion here is derived from the
+/// spec, never from what a side did.
+pub fn val_status(surface: &Surface, record_type: &str) -> ValStatus {
+    let Some(v) = surface
         .fields_of(record_type)
         .find(|f| f.field.name == "VAL")
-        .is_some_and(|v| is_put_candidate(&v.field) && !v.field.dbf.is_link())
+    else {
+        return ValStatus::NoChannel;
+    };
+    if v.field.is_nomod() {
+        return ValStatus::NoMod;
+    }
+    if !is_put_candidate(&v.field) || v.field.dbf.is_link() {
+        return ValStatus::NotWritable;
+    }
+    ValStatus::Drivable
+}
+
+/// Does this record type have a `VAL` channel this phase can drive?
+fn drives_val(surface: &Surface, record_type: &str) -> bool {
+    val_status(surface, record_type) == ValStatus::Drivable
 }
 
 /// The reproducers this record type gets.
@@ -851,16 +937,18 @@ pub fn report(dbd_path: &str, surface: &Surface, cases: Vec<MonCase>) -> MonRepo
         .filter(|c| c.verdict != Verdict::Errored)
         .count();
 
+    let of_status = |want: ValStatus| -> Vec<String> {
+        surface
+            .covered_types
+            .iter()
+            .filter(|rt| val_status(surface, rt) == want)
+            .cloned()
+            .collect()
+    };
     let with_val: Vec<&String> = surface
         .covered_types
         .iter()
         .filter(|rt| drives_val(surface, rt))
-        .collect();
-    let no_val: Vec<String> = surface
-        .covered_types
-        .iter()
-        .filter(|rt| !drives_val(surface, rt))
-        .cloned()
         .collect();
     let excluded_scanned: Vec<String> = with_val
         .iter()
@@ -884,7 +972,9 @@ pub fn report(dbd_path: &str, surface: &Surface, cases: Vec<MonCase>) -> MonRepo
             dbd: dbd_path.to_string(),
             channels_in_surface: surface.denominator(),
             record_types_with_val: with_val.len(),
-            excluded_noaccess_val: no_val,
+            excluded_noaccess_val: of_status(ValStatus::NoChannel),
+            excluded_nomod_val: of_status(ValStatus::NoMod),
+            excluded_unwritable_val: of_status(ValStatus::NotWritable),
             excluded_scanned,
             excluded_non_val_channels: surface.denominator().saturating_sub(val_channels),
         },
@@ -931,9 +1021,10 @@ mod tests {
     }
 
     /// The rule the whole harness rests on, at this phase's most dangerous
-    /// point: `sel.VAL` is `special(SPC_NOMOD)`, so BOTH sides refuse the drive
-    /// and BOTH post nothing. Their traces are identical — and scoring that
-    /// AGREED would be a false clean on an experiment that never ran.
+    /// point. A refused drive posts no event on EITHER side, so the two traces
+    /// come out identical — and scoring that AGREED would be a false clean on an
+    /// experiment that never ran. (`SPC_NOMOD` fields no longer reach here; this
+    /// is the net under every refusal the `.dbd` does not predict.)
     #[test]
     fn a_refused_drive_is_an_error_even_though_both_sides_look_identical() {
         let mut c = obs("value double = 0", &[]);
@@ -1111,5 +1202,40 @@ mod tests {
             PUT_SPACING >= Duration::from_millis(300),
             "a put must not race the next scan: {PUT_SPACING:?}"
         );
+    }
+
+    /// The `.dbd` proves `sel.VAL` undrivable (`special(SPC_NOMOD)`), so it is
+    /// excluded before a case exists rather than erroring every run — the same
+    /// rule the read phase applies to `DBF_NOACCESS`. Driven through a real
+    /// parse and a real [`Surface`], so a regression that dropped `special` on
+    /// the way through would fail here rather than silently re-admit `sel`.
+    ///
+    /// `sel`'s and `aai`'s declarations are the real ones from base's `.dbd`.
+    #[test]
+    fn the_dbd_names_which_vals_no_client_can_drive() {
+        const DBD: &str = r#"
+recordtype(sel) {
+    field(VAL, DBF_DOUBLE) { prompt("Result") special(SPC_NOMOD) }
+}
+recordtype(ai) {
+    field(VAL, DBF_DOUBLE) { pp(TRUE) }
+}
+recordtype(aai) {
+    field(VAL, DBF_NOACCESS) { extra("void *val") }
+}
+"#;
+        let dbd = crate::Dbd::parse(DBD).unwrap();
+        let types: std::collections::BTreeSet<String> =
+            ["sel", "ai", "aai"].iter().map(|s| s.to_string()).collect();
+        let s = Surface::build(&dbd, &types);
+
+        assert_eq!(val_status(&s, "sel"), ValStatus::NoMod);
+        assert_eq!(val_status(&s, "ai"), ValStatus::Drivable);
+        // The surface already drops a DBF_NOACCESS VAL, so no channel survives
+        // for this phase to subscribe to.
+        assert_eq!(val_status(&s, "aai"), ValStatus::NoChannel);
+
+        assert!(!drives_val(&s, "sel"));
+        assert!(drives_val(&s, "ai"));
     }
 }

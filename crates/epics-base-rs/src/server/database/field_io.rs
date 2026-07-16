@@ -928,10 +928,6 @@ impl PvDatabase {
                             // from C and reported NO_ALARM where C keeps UDF/INVALID.
                             if instance.record.is_udf_defining_put(&field) {
                                 instance.common.udf = 0;
-                                // Keep a UDF-shadowing record's cell in step
-                                // with the byte the defining put just cleared
-                                // (see `Record::set_udf_from_put`).
-                                instance.record.set_udf_from_put(false);
                             }
                             result
                         }
@@ -1701,10 +1697,6 @@ impl PvDatabase {
                             // synchronous stat/sevr clear here diverged from C.
                             if instance.record.is_udf_defining_put(&field) {
                                 instance.common.udf = 0;
-                                // Keep a UDF-shadowing record's cell in step
-                                // with the byte the defining put just cleared
-                                // (see `Record::set_udf_from_put`).
-                                instance.record.set_udf_from_put(false);
                             }
                             result
                         }

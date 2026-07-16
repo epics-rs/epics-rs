@@ -80,14 +80,18 @@
 //!   directly, so the advertised capacity differs only when `NUSE` is set to
 //!   `0 < NUSE < NELM` under `SIZE=NELM`. `NELM=0` (degenerate; dbd
 //!   initial 1) serves a 1-element array, where C serves 0.
-//! - `UDF` is C's `pcalc->udf` ([`AcalcoutRecord::udf`]): undefined until a
-//!   calc successfully defines VAL. C `aCalcoutRecord.c:305-307` clears it
-//!   `else pcalc->udf = FALSE` only on a finite result (`cstat==0`) and never
-//!   re-raises it in `process()`; a compile-failure/empty `CALC` (which
-//!   `aCalcPerform` fails every cycle) keeps `UDF=1`, matching C. This is
-//!   reported through [`Record::value_is_undefined`], NOT the framework
-//!   default `isnan(VAL)` (which wrongly reported 0 for a non-NaN VAL after a
-//!   failed calc).
+//! - `UDF` is C's `pcalc->udf`, owned directly as the framework's `dbCommon.udf`
+//!   `epicsUInt8` (no shadow cell): undefined until a calc successfully defines
+//!   VAL. C `aCalcoutRecord.c:305-307` clears it `else pcalc->udf = FALSE` only
+//!   on a finite result (`cstat==0`) and never re-raises it in `process()`; a
+//!   compile-failure/empty `CALC` (which `aCalcPerform` fails every cycle) keeps
+//!   `UDF=1`, matching C. [`Record::clears_udf`] is `false` so the framework
+//!   does NOT re-derive `UDF` from VAL each cycle — [`Record::check_alarms`]
+//!   (C's `afterCalc` tail) is the single owner, clearing `common.udf` to 0 on a
+//!   successful calc and leaving the byte untouched otherwise. A direct `caput
+//!   UDF` therefore stores its raw `DBF_UCHAR` byte verbatim (`255` for `-1`,
+//!   served signed) instead of collapsing to 0/1, and `checkAlarms` tests it
+//!   exact-one (`udf == TRUE`, [`Record::udf_alarm_on_exact_one`]).
 //! - `LALM` advances on every matched alarm level; C gates it on
 //!   `if (recGblSetSevr(...))` (advance only when that severity actually
 //!   raised `nsev`). Mirrors the framework-wide `rec_gbl_set_sevr` (returns
@@ -276,14 +280,6 @@ pub struct AcalcoutRecord {
 
     // --- diagnostics (mostly inert) ---
     size: i16, // 0=NELM, 1=NUSE
-    /// C `pcalc->udf` (`dbCommon.udf`) as aCalcout maintains it: undefined
-    /// until a calc successfully defines VAL. C `aCalcoutRecord.c:305-307`
-    /// clears it `else pcalc->udf = FALSE` ONLY when `cstat==0` (a finite
-    /// result) and NEVER sets it TRUE in `process()` — a monotonic clear, not
-    /// the framework's per-cycle `isnan(VAL)`. Reported through
-    /// [`Record::value_is_undefined`], which the framework writes into
-    /// `common.udf` each cycle; init TRUE mirrors C's `iocInit` udf=TRUE.
-    udf: bool,
     cstat: i32,
     cact: u8,
     amask: u32,
@@ -365,7 +361,6 @@ impl Default for AcalcoutRecord {
             alst: 0.0,
             mlst: 0.0,
             size: 0,
-            udf: true,
             cstat: 0,
             cact: 0,
             amask: 0,
@@ -972,15 +967,11 @@ impl Record for AcalcoutRecord {
 
         if calc_failed {
             // C afterCalc line 304-305: cstat != 0 → CALC_ALARM (raised in
-            // `check_alarms`).
+            // `check_alarms`). The UDF clear is C's `else` arm of the SAME test,
+            // so it lives beside the CALC_ALARM raise in `check_alarms` (C's
+            // `afterCalc` tail): a failed calc leaves `common.udf` untouched.
             self.calc_alarm = true;
             self.cstat = -1;
-        } else {
-            // C `aCalcoutRecord.c:307`: `else pcalc->udf = FALSE` — the finite
-            // result DEFINES VAL. This is the ONLY site that clears `udf`; a
-            // failed calc (above) and the fetch-gate-fail early return leave it
-            // untouched, so `udf` is monotonically cleared, never re-raised.
-            self.udf = false;
         }
 
         // --- OOPT decision (C afterCalc switch :313-335, using the
@@ -1081,14 +1072,23 @@ impl Record for AcalcoutRecord {
                 AlarmSeverity::Invalid,
                 "CALC expression evaluation failed",
             );
+            // C `aCalcoutRecord.c:304-307`: the failed-calc branch does NOT
+            // touch `udf`, so a `caput UDF <byte>` made before a failing cycle
+            // keeps its raw byte here — byte fidelity (`255` for `-1`).
+        } else {
+            // C `aCalcoutRecord.c:307` `else pcalc->udf = FALSE`: a finite calc
+            // DEFINES VAL. This hook (C's `afterCalc` tail) is the SINGLE owner
+            // of `common.udf` — [`Self::clears_udf`] is false, so the framework
+            // never re-derives it from VAL and never collapses the put byte.
+            common.udf = 0;
         }
 
-        // C checkAlarms line 845-852: the UDF guard returns before the limit
-        // check. The framework set `common.udf` from `value_is_undefined()`
-        // (= [`Self::udf`]) before this hook, so a record whose calc has not
-        // yet defined VAL keeps UDF and raises UDF_ALARM — matching C's
-        // `if (pcalc->udf == TRUE) { recGblSetSevr(UDF_ALARM,...); return; }`.
-        if common.udf != 0 {
+        // C checkAlarms line 845: `if (pcalc->udf == TRUE)` — EXACT-ONE (`TRUE`
+        // is 1). The guard returns before the limit check; UDF_ALARM itself is
+        // raised centrally by `rec_gbl_check_udf` with the same exact-one flag
+        // ([`Self::udf_alarm_on_exact_one`]). A byte that is neither 0 nor 1
+        // (from a direct `caput UDF 255`) is NOT undefined here, matching C.
+        if common.udf == 1 {
             return;
         }
 
@@ -1137,25 +1137,25 @@ impl Record for AcalcoutRecord {
         }
     }
 
-    /// aCalcout's UDF is C's `pcalc->udf` (see [`Self::udf`]), NOT the
-    /// framework default `isnan(VAL)`: C `aCalcoutRecord.c:305-307` clears it
-    /// only on a finite calc result and leaves it otherwise. A default record
-    /// (empty CALC, which C's `aCalcPerform` fails every cycle) therefore
-    /// reads UDF=1 where the `isnan(0.0)` default would wrongly report 0 — the
-    /// C-parity divergence the oracle measured (`caget ACALCOUT.UDF` → 0,
-    /// C → 1). The framework writes this into `common.udf` each cycle.
-    fn value_is_undefined(&self) -> bool {
-        self.udf
+    /// aCalcout does NOT re-derive UDF from VAL each cycle: C `pcalc->udf` is
+    /// cleared only on a finite calc (`aCalcoutRecord.c:307`) and left otherwise
+    /// — never recomputed from the value. Returning `false` makes
+    /// [`Record::check_alarms`] the single owner of `common.udf` (the C
+    /// `afterCalc` tail); the framework's per-cycle `udf = value_is_undefined()`
+    /// re-derivation is suppressed, so a direct `caput UDF <byte>` keeps its raw
+    /// `DBF_UCHAR` byte (`255` for `-1`) instead of collapsing to 0/1. A default
+    /// record (empty CALC, which C's `aCalcPerform` fails every cycle) reads
+    /// UDF=1 — the C-parity divergence the oracle measured.
+    fn clears_udf(&self) -> bool {
+        false
     }
 
-    /// A direct `caput UDF` (or a value-defining put that cleared UDF) must WIN
-    /// over the monotonic [`Self::udf`] cell: C `dbCommon.udf` is one puttable
-    /// byte, so `caput ACALCOUT.UDF 0` stands (C stores 0) even though a fresh
-    /// empty-CALC record is otherwise undefined. Syncing the cell here makes
-    /// [`Self::value_is_undefined`] report the put on the `pp(TRUE)` process
-    /// that follows, while a record with no UDF put stays undefined (init 1).
-    fn set_udf_from_put(&mut self, udf_nonzero: bool) {
-        self.udf = udf_nonzero;
+    /// C `aCalcoutRecord.c:845` guards `checkAlarms` with `if (pcalc->udf ==
+    /// TRUE)` — EXACT-ONE. With [`Self::clears_udf`] false the byte can hold a
+    /// `caput`-supplied value other than 0/1, so this must match C's `== TRUE`
+    /// (1): a byte of `255` is not undefined and raises no UDF_ALARM.
+    fn udf_alarm_on_exact_one(&self) -> bool {
+        true
     }
 
     /// IVOA=SetIVOV severity hook. The framework calls this when SEVR is
@@ -2125,29 +2125,34 @@ mod tests {
         assert_eq!(rec.cstat, -1);
     }
 
-    /// UDF (C `pcalc->udf`) is undefined until a calc successfully defines VAL,
-    /// and is cleared MONOTONICALLY: C `aCalcoutRecord.c:305-307` sets
-    /// `udf=FALSE` only on a finite result and never re-raises it. The oracle
-    /// measured `ACALCOUT.UDF` C=1, port=0 for the default (empty-CALC) record,
-    /// because the framework's `isnan(VAL=0.0)` default reported 0.
+    /// UDF (C `pcalc->udf`) is cleared ONLY by a successful calc and is owned by
+    /// `check_alarms` (C's `afterCalc` tail), NOT re-derived from VAL. C
+    /// `aCalcoutRecord.c:305-307` sets `udf=FALSE` only on a finite result and
+    /// never re-raises it; the oracle measured `ACALCOUT.UDF` C=1, port=0 for
+    /// the default (empty-CALC) record, because the framework's `isnan(VAL=0.0)`
+    /// default reported 0.
     #[test]
-    fn udf_set_until_finite_calc_then_monotonic() {
+    fn udf_cleared_only_by_a_successful_calc() {
+        use crate::server::record::CommonFields;
         let mut rec = AcalcoutRecord::new();
+        let mut common = CommonFields::default();
         // Init: undefined, mirroring C `iocInit` udf=TRUE.
-        assert!(rec.value_is_undefined(), "fresh acalcout is UDF");
+        assert_eq!(common.udf, 1, "fresh common is undefined (init 1)");
         // Empty CALC fails aCalcPerform every cycle → UDF stays set (C keeps 1).
         rec.process().unwrap();
-        assert!(
-            rec.value_is_undefined(),
-            "empty CALC failed → UDF stays 1, not isnan(0.0)=0"
+        rec.check_alarms(&mut common);
+        assert_eq!(
+            common.udf, 1,
+            "empty CALC failed → UDF stays 1, not isnan()=0"
         );
         // A finite result clears UDF (C `else pcalc->udf = FALSE`).
         rec.put_field("CALC", EpicsValue::String("1+1".into()))
             .unwrap();
         rec.special("CALC", true).unwrap();
         rec.process().unwrap();
+        rec.check_alarms(&mut common);
         assert_eq!(rec.get_field("VAL"), Some(EpicsValue::Double(2.0)));
-        assert!(!rec.value_is_undefined(), "finite result clears UDF");
+        assert_eq!(common.udf, 0, "finite result clears UDF");
         // Monotonic: a later NON-finite result does NOT re-raise UDF — C raises
         // CALC_ALARM (`if(cstat)`) and leaves `udf` at FALSE.
         rec.put_field("CALC", EpicsValue::String("1e300*1e300".into()))
@@ -2155,39 +2160,38 @@ mod tests {
         rec.special("CALC", true).unwrap();
         rec.process().unwrap();
         assert!(rec.calc_alarm, "non-finite result raises CALC_ALARM");
-        assert!(
-            !rec.value_is_undefined(),
+        rec.check_alarms(&mut common);
+        assert_eq!(
+            common.udf, 0,
             "a failed calc after a success leaves UDF cleared, matching C"
         );
     }
 
-    /// A direct `caput UDF v` wins over the monotonic cell — C `dbCommon.udf`
-    /// is one puttable byte. `caput ACALCOUT.UDF 0` must STAND (C stores 0)
-    /// even on the empty-CALC record that is otherwise undefined; the oracle
-    /// measured C=0, port=1 because the wave-2 cell (=1) clobbered the put on
-    /// UDF's `pp(TRUE)` re-process. A fresh record with no UDF put stays 1.
+    /// A failing calc leaves `common.udf` UNTOUCHED — so a direct `caput UDF
+    /// <byte>` keeps its raw `DBF_UCHAR` byte across the `pp(TRUE)` re-process
+    /// (`255` for `-1`, served signed). C `aCalcoutRecord.c:304-307` clears udf
+    /// only in the `else` (success) arm; the oracle measured `caput UDF -1/255`
+    /// → C=-1, port=1 because the wave-3 boolean cell collapsed every nonzero
+    /// byte to 1.
     #[test]
-    fn direct_udf_put_wins_over_the_monotonic_cell() {
-        let mut rec = AcalcoutRecord::new();
-        assert!(
-            rec.value_is_undefined(),
-            "fresh acalcout is undefined (cell=1)"
-        );
-        // caput UDF 0 → defined; must survive the empty-CALC re-process (the
-        // monotonic clear leaves the cell the put set to defined).
-        rec.set_udf_from_put(false);
-        assert!(!rec.value_is_undefined(), "caput UDF 0 defines the record");
+    fn failing_calc_leaves_the_udf_byte_untouched() {
+        use crate::server::record::CommonFields;
+        let mut rec = AcalcoutRecord::new(); // empty CALC → fails every cycle
+        let mut common = CommonFields::default();
+        // A `caput UDF 255` (or `-1`, stored 255 in the signed DBF_UCHAR) put
+        // this raw byte; the empty-CALC re-process must not collapse it.
+        common.udf = 255;
         rec.process().unwrap();
-        assert!(
-            !rec.value_is_undefined(),
-            "empty-CALC re-process must not re-raise the put-cleared UDF"
+        rec.check_alarms(&mut common);
+        assert_eq!(
+            common.udf, 255,
+            "empty-CALC re-process must not touch the put byte"
         );
-        // caput UDF 1 → undefined again.
-        rec.set_udf_from_put(true);
-        assert!(
-            rec.value_is_undefined(),
-            "caput UDF 1 makes the record undefined"
-        );
+        // `caput UDF 0` likewise stands on a failing-calc record.
+        common.udf = 0;
+        rec.process().unwrap();
+        rec.check_alarms(&mut common);
+        assert_eq!(common.udf, 0, "caput UDF 0 stands over a failing calc");
     }
 
     /// A NaN/Inf calc result is written into VAL/AVAL (not left stale): C

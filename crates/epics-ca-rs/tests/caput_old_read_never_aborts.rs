@@ -30,17 +30,28 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::process::Command;
 
-/// A port number for the test's OWN proxy, which needs the same number on
-/// UDP and TCP and so cannot use the `.port(0)` + read-back pattern.
+/// Bind the proxy's UDP socket and TCP listener on the SAME port number,
+/// holding both — a port is TAKEN by binding it, never probed and handed on.
 ///
-/// Never use this for a `CaServer`: a server TAKES its port by binding it
-/// (`.port(0)` → `udp_port()`), because a probed port is free only until
-/// the next socket in this process claims it.
-fn free_proxy_port() -> u16 {
-    let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve free port");
-    let p = probe.local_addr().expect("addr").port();
-    drop(probe);
-    p
+/// The proxy needs one number on both protocols, so it cannot use the plain
+/// `.port(0)` + read-back pattern of a single socket: bind UDP on `:0` to
+/// take a number, then bind TCP on that number; an unrelated TCP listener
+/// can already hold it, so retry the pair with a fresh number. There is no
+/// drop→rebind window at any point — under a parallel test run the old
+/// probe-then-drop pattern lost the number to a neighbour and the bind
+/// `expect` panicked the test.
+async fn bind_proxy_pair() -> (UdpSocket, TcpListener, u16) {
+    const ATTEMPTS: usize = 10;
+    for _ in 0..ATTEMPTS {
+        let udp = UdpSocket::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind proxy UDP");
+        let port = udp.local_addr().expect("proxy UDP addr").port();
+        if let Ok(tcp) = TcpListener::bind(("127.0.0.1", port)).await {
+            return (udp, tcp, port);
+        }
+    }
+    panic!("no same-numbered UDP+TCP port pair in {ATTEMPTS} attempts");
 }
 
 /// Relay one direction of a CA circuit frame by frame. In the server→client
@@ -87,13 +98,10 @@ async fn relay(
 /// `.port(0)`, so the UDP search port and the TCP data port are separate
 /// ephemerals.
 async fn read_denying_proxy(server_udp: u16, server_tcp: u16) -> u16 {
-    let proxy_port = free_proxy_port();
+    let (udp, tcp, proxy_port) = bind_proxy_pair().await;
     let search: SocketAddr = ([127, 0, 0, 1], server_udp).into();
     let circuit: SocketAddr = ([127, 0, 0, 1], server_tcp).into();
 
-    let udp = UdpSocket::bind(("127.0.0.1", proxy_port))
-        .await
-        .expect("bind proxy UDP");
     tokio::spawn(async move {
         let upstream = UdpSocket::bind(("127.0.0.1", 0))
             .await
@@ -125,9 +133,6 @@ async fn read_denying_proxy(server_udp: u16, server_tcp: u16) -> u16 {
         }
     });
 
-    let tcp = TcpListener::bind(("127.0.0.1", proxy_port))
-        .await
-        .expect("bind proxy TCP");
     tokio::spawn(async move {
         loop {
             let Ok((client, _)) = tcp.accept().await else {

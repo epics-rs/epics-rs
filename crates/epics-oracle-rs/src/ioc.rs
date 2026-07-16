@@ -697,7 +697,7 @@ impl PvxTools {
     /// The client tools this harness actually invokes. Verified up front so a
     /// missing binary is one loud error rather than an "errored" verdict on
     /// every case.
-    const REQUIRED: [&'static str; 3] = ["pvxget", "pvxinfo", "pvxlist"];
+    const REQUIRED: [&'static str; 5] = ["pvxget", "pvxinfo", "pvxlist", "pvxmonitor", "pvxput"];
 
     /// Locate the pvxs tree, honoring `PVXS_BIN`.
     pub fn discover() -> Result<Self, BootError> {

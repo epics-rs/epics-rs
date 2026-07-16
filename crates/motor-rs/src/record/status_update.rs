@@ -12,7 +12,15 @@ impl MotorRecord {
         // mailbox untouched — no status consume, no STUP ack, no delay
         // take. The io_intr pulse that announced a pending status or
         // delay expiry is already queued and triggers its own pass.
-        if self.last_write.is_some() || self.internal.res_reanchor {
+        //
+        // The deferral applies only once the record is anchored: in C,
+        // init_record precedes any dbPutField pass (iocInit), so no put
+        // can exist before the anchor. A write parked before the first
+        // status pulse (an autosave pass-1 restore, or a CA put landing
+        // in the init→first-poll window) must NOT turn that pulse into a
+        // put pass — the pulse anchors (Startup) and the parked write
+        // replays on the pass the anchor's forced refresh queues.
+        if (self.last_write.is_some() || self.internal.res_reanchor) && self.initialized {
             return None;
         }
         // Extract data from shared state, then drop the lock before mutating self
@@ -434,6 +442,47 @@ impl MotorRecord {
         // skips URIP RDBL scaling and seeds the readback from motor position.
         self.process_motor_info_initcall(status, true);
 
+        // DMOV from driver
+        self.stat.dmov = status.done && !status.moving;
+
+        if status.moving {
+            // At startup, the poll loop may not be active yet — request it.
+            effects.request_poll = true;
+        }
+
+        // C init_record (motorRecord.cc:677-681): a CONSTANT .dol clears UDF
+        // at init (`pmr->udf = FALSE`) and seeds VAL from the constant. The
+        // motor never derives UDF from VAL otherwise — clears_udf() returns
+        // false so the framework's value_is_undefined() path is off — so this
+        // is the only init UDF clear for the common (no-DOL / literal-DOL)
+        // axis. A DB_LINK / CA DOL is left undefined until the closed-loop
+        // collection's first successful read clears it (1994-2005), exactly
+        // like C leaving udf TRUE for a non-CONSTANT .dol. An unset DOL has
+        // C link type CONSTANT (recGblInitConstantLink is a no-op leaving VAL
+        // at 0), so ParsedLink::None counts alongside a literal Constant.
+        if matches!(
+            parse_link_v2(&self.links.dol),
+            ParsedLink::None | ParsedLink::Constant(_)
+        ) {
+            self.internal.dol_udf = Some(false);
+        }
+
+        // A write parked before this anchor (an autosave pass-1 restore or
+        // a CA put in the init→first-poll window — a window C cannot have,
+        // since init_record precedes any dbPutField pass) means the drive
+        // triplet already carries that write's target, not saved state.
+        // Anchor the readback only: no RSTM decision (its DVAL input is
+        // gone, and a SetPosition to the parked target would redefine the
+        // axis to where the put asks it to MOVE), no drive-field sync (it
+        // would destroy the target), and no lasts anchoring (C anchors
+        // them to the pre-put values, which is what they still hold — an
+        // anchored-to-target lval would swallow the replay's val != lval
+        // change detection). The forced refresh queues the replay pass.
+        if self.last_write.is_some() {
+            effects.request_poll = true;
+            return effects;
+        }
+
         // C: devMotorAsyn.c init_controller — RSTM restore decision.
         // rdbd = max(|RDBD|, |MRES|); dval_non_zero_pos_near_zero is true when
         // the autosaved DVAL is meaningful but the driver currently sits near
@@ -501,31 +550,6 @@ impl MotorRecord {
             self.internal.lrvl = self.pos.rval;
         } else {
             self.sync_positions();
-        }
-
-        // DMOV from driver
-        self.stat.dmov = status.done && !status.moving;
-
-        if status.moving {
-            // At startup, the poll loop may not be active yet — request it.
-            effects.request_poll = true;
-        }
-
-        // C init_record (motorRecord.cc:677-681): a CONSTANT .dol clears UDF
-        // at init (`pmr->udf = FALSE`) and seeds VAL from the constant. The
-        // motor never derives UDF from VAL otherwise — clears_udf() returns
-        // false so the framework's value_is_undefined() path is off — so this
-        // is the only init UDF clear for the common (no-DOL / literal-DOL)
-        // axis. A DB_LINK / CA DOL is left undefined until the closed-loop
-        // collection's first successful read clears it (1994-2005), exactly
-        // like C leaving udf TRUE for a non-CONSTANT .dol. An unset DOL has
-        // C link type CONSTANT (recGblInitConstantLink is a no-op leaving VAL
-        // at 0), so ParsedLink::None counts alongside a literal Constant.
-        if matches!(
-            parse_link_v2(&self.links.dol),
-            ParsedLink::None | ParsedLink::Constant(_)
-        ) {
-            self.internal.dol_udf = Some(false);
         }
 
         effects

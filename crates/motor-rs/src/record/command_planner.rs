@@ -2057,6 +2057,46 @@ impl MotorRecord {
         // already applied; C would have run two passes).
         let idle_status_pass = std::mem::take(&mut self.internal.idle_status_pass);
 
+        // C iocInit parity: init_record runs before any dbProcess pass can
+        // exist, so the anchor outranks every command source. The Startup
+        // pass is handled before the put/res-reanchor/latent gates below —
+        // determine_event anchors on the first status pulse even when a
+        // write is parked (the pass-1-restore / init→first-poll put
+        // window), so Startup and a parked last_write CAN co-occur on this
+        // pass. The anchor runs; the parked write stays armed and replays
+        // on the pass the anchor's forced refresh queues (initial_readback
+        // sets request_poll whenever a write is parked).
+        if matches!(self.pending_event, Some(MotorEvent::Startup)) {
+            self.pending_event = None;
+            self.initialized = true;
+            // C init_record (motorRecord.cc:687-733): the first device
+            // readback runs process_motor_info(initcall), the RSTM
+            // restore decision (devMotorAsyn.c init_controller), and
+            // the OMSL-gated drive-triplet sync. determine_event()
+            // consumed the seq but left the status in the shared slot.
+            let status = self.device_state.as_ref().and_then(|state| {
+                state
+                    .lock()
+                    .ok()
+                    .and_then(|ds| ds.latest_status.as_ref().map(|s| s.status.clone()))
+            });
+            return match status {
+                Some(status) => self.initial_readback(&status),
+                None => ProcessEffects::default(),
+            };
+        }
+        // A mailbox-wired record that has not anchored yet may not consume
+        // or dispatch any command: a parked put, a res-reanchor mark, or a
+        // latched button waits for the anchor and replays afterwards. In C
+        // this pass cannot exist (no dbProcess before init_record); running
+        // it here dispatched real moves against an unanchored baseline, and
+        // the following Startup then synced the mid-flight readback into
+        // VAL/DVAL. Records without a device-state mailbox never see a
+        // Startup, so the anchor concept does not apply to them.
+        if !self.initialized && self.device_state.is_some() {
+            return ProcessEffects::default();
+        }
+
         // C do_work resolution block (1936-1991) on the pass a
         // pp(TRUE) MRES/SREV/UREV/ERES/UEIP put triggers — in this
         // dispatcher that pass carries no command source. The mark
@@ -2128,21 +2168,9 @@ impl MotorRecord {
 
         match self.pending_event.take() {
             Some(MotorEvent::Startup) => {
-                // C init_record (motorRecord.cc:687-733): the first device
-                // readback runs process_motor_info(initcall), the RSTM
-                // restore decision (devMotorAsyn.c init_controller), and
-                // the OMSL-gated drive-triplet sync. determine_event()
-                // consumed the seq but left the status in the shared slot.
-                let status = self.device_state.as_ref().and_then(|state| {
-                    state
-                        .lock()
-                        .ok()
-                        .and_then(|ds| ds.latest_status.as_ref().map(|s| s.status.clone()))
-                });
-                match status {
-                    Some(status) => self.initial_readback(&status),
-                    None => ProcessEffects::default(),
-                }
+                // Consumed by the anchor-first block at the top of this
+                // pass — a Startup can no longer reach the event match.
+                ProcessEffects::default()
             }
             Some(MotorEvent::UserWrite(cmd_src)) => self.plan_motion(cmd_src),
             Some(MotorEvent::DeviceUpdate(status)) => {

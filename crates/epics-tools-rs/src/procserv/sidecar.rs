@@ -27,9 +27,8 @@ use tokio::fs::{File, OpenOptions};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex as AsyncMutex;
 
-use crate::procserv::config::ListenConfig;
-use crate::procserv::endpoint::Endpoint;
 use crate::procserv::error::{ProcServError, ProcServResult};
+use crate::procserv::listener::{BoundAddr, PreboundListener};
 
 /// Prefix every new line in `chunk` with `stamp`, tracking mid-line
 /// state across calls via `in_line`. This is the one stamp-at-newline
@@ -319,17 +318,22 @@ pub struct ListenAddress {
 }
 
 impl ListenAddress {
-    /// Format one parsed [`Endpoint`] as C's `writeAddress` / `writeAddressEnv`
+    /// Format one *bound* listener as C's `writeAddress` / `writeAddressEnv`
     /// token (`acceptFactory.cc:45-99`): `tcp:<ip>:<port>` (bare, no `[]`),
     /// `unix:<path>` for a filesystem socket, or `unix:@<name>` for an
-    /// abstract socket.
-    pub fn from_endpoint(ep: &Endpoint, readonly: bool) -> Self {
-        let addr = match ep {
-            Endpoint::Tcp(a) => format!("tcp:{}:{}", a.ip(), a.port()),
-            Endpoint::Unix(u) if u.abstract_socket => format!("unix:@{}", u.name.display()),
-            Endpoint::Unix(u) => format!("unix:{}", u.name.display()),
+    /// abstract socket. The TCP address is the one the kernel reported at
+    /// bind time (C `getsockname`, `acceptFactory.cc:184`), so a config
+    /// that asked for port `0` publishes the real assigned port here.
+    pub fn from_bound(pl: &PreboundListener) -> Self {
+        let addr = match pl.bound_addr() {
+            BoundAddr::Tcp(a) => format!("tcp:{}:{}", a.ip(), a.port()),
+            BoundAddr::Unix(u) if u.abstract_socket => format!("unix:@{}", u.name.display()),
+            BoundAddr::Unix(u) => format!("unix:{}", u.name.display()),
         };
-        Self { readonly, addr }
+        Self {
+            readonly: pl.readonly(),
+            addr,
+        }
     }
 }
 
@@ -374,23 +378,29 @@ pub fn render_procserv_info_env(info: &InfoSnapshot) -> String {
     out
 }
 
-/// Build the listener address list in C `connectionItem::head` iteration
-/// order. C prepends each acceptItem on creation (`procServ.cc:824-832`) and
-/// creates the control listeners before the log listener
-/// (`procServ.cc:515-534`), so head order is the reverse: the log endpoint
-/// first, then the control endpoints in reverse of their `ctlSpecs` order.
-/// `manage-procs` is order-independent (`manage.py:68` joins all ports), so
-/// this ordering is functional parity for any combination and byte-exact for
-/// the common control-only / control+log cases.
-pub fn listen_addresses(listen: &ListenConfig) -> Vec<ListenAddress> {
-    let mut out = Vec::new();
-    if let Some(ep) = &listen.log {
-        out.push(ListenAddress::from_endpoint(ep, true));
-    }
-    for ep in listen.control.iter().rev() {
-        out.push(ListenAddress::from_endpoint(ep, false));
-    }
-    out
+/// Build the published address list from the *bound* listeners, in C
+/// `connectionItem::head` iteration order. C prepends each acceptItem on
+/// creation (`procServ.cc:824-832`) and creates the control listeners
+/// before the log listener (`procServ.cc:515-534`), so head order is the
+/// reverse of creation order: the log endpoint first, then the control
+/// endpoints in reverse of their `ctlSpecs` order. [`bind_endpoints`]
+/// binds in creation order (controls, then log), so reverse iteration
+/// reproduces head order exactly. `manage-procs` is order-independent
+/// (`manage.py:68` joins all ports), so this ordering is functional parity
+/// for any combination and byte-exact for the common control-only /
+/// control+log cases.
+///
+/// Deriving from the bound listeners rather than the config is itself the
+/// C behavior: every acceptItem refreshes its address from the kernel
+/// after binding (`getsockname`, `acceptFactory.cc:184`), so with port `0`
+/// C's info file carries the real assigned port — a config-derived render
+/// would publish the unusable `:0` placeholder instead.
+pub fn bound_addresses(listeners: &[PreboundListener]) -> Vec<ListenAddress> {
+    listeners
+        .iter()
+        .rev()
+        .map(ListenAddress::from_bound)
+        .collect()
 }
 
 #[cfg(test)]
@@ -426,11 +436,14 @@ mod tests {
         let info = InfoSnapshot {
             procserv_pid: 1234,
             addresses: vec![
-                ListenAddress::from_endpoint(&Endpoint::Tcp("0.0.0.0:7001".parse().unwrap()), true),
-                ListenAddress::from_endpoint(
-                    &Endpoint::Tcp("127.0.0.1:7000".parse().unwrap()),
-                    false,
-                ),
+                ListenAddress {
+                    readonly: true,
+                    addr: "tcp:0.0.0.0:7001".into(),
+                },
+                ListenAddress {
+                    readonly: false,
+                    addr: "tcp:127.0.0.1:7000".into(),
+                },
             ],
         };
         assert_eq!(
@@ -446,11 +459,14 @@ mod tests {
         let info = InfoSnapshot {
             procserv_pid: 1234,
             addresses: vec![
-                ListenAddress::from_endpoint(&Endpoint::Tcp("0.0.0.0:7001".parse().unwrap()), true),
-                ListenAddress::from_endpoint(
-                    &Endpoint::Tcp("127.0.0.1:7000".parse().unwrap()),
-                    false,
-                ),
+                ListenAddress {
+                    readonly: true,
+                    addr: "tcp:0.0.0.0:7001".into(),
+                },
+                ListenAddress {
+                    readonly: false,
+                    addr: "tcp:127.0.0.1:7000".into(),
+                },
             ],
         };
         assert_eq!(
@@ -469,46 +485,66 @@ mod tests {
         assert_eq!(render_info_file(&info), "pid:42\n");
     }
 
-    #[test]
-    fn listen_addresses_orders_log_first_then_control_reversed() {
-        use crate::procserv::endpoint::UnixEndpoint;
-        // Control specs in CLI order: TCP 7000 then a UNIX socket; the log
-        // endpoint is 7001. C head order is log first, then control reversed.
+    #[tokio::test]
+    async fn bound_addresses_order_log_first_then_control_reversed_with_real_ports() {
+        use crate::procserv::config::ListenConfig;
+        use crate::procserv::endpoint::{Endpoint, UnixEndpoint};
+        use crate::procserv::listener::bind_endpoints;
+        // Control specs in CLI order: a TCP `:0` then a UNIX socket; the
+        // log endpoint is another TCP `:0`. C head order is log first,
+        // then control reversed — and every TCP token must carry the
+        // kernel-assigned port (C getsockname, acceptFactory.cc:184),
+        // never the `:0` placeholder from the config.
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("ioc.sock");
         let listen = ListenConfig {
             control: vec![
-                Endpoint::Tcp("127.0.0.1:7000".parse().unwrap()),
-                Endpoint::Unix(UnixEndpoint::filesystem(PathBuf::from("/run/ioc.sock"))),
+                Endpoint::Tcp("127.0.0.1:0".parse().unwrap()),
+                Endpoint::Unix(UnixEndpoint::filesystem(sock.clone())),
             ],
-            log: Some(Endpoint::Tcp("0.0.0.0:7001".parse().unwrap())),
+            log: Some(Endpoint::Tcp("127.0.0.1:0".parse().unwrap())),
         };
-        let addrs = listen_addresses(&listen);
-        let tokens: Vec<(&str, bool)> = addrs
-            .iter()
-            .map(|a| (a.addr.as_str(), a.readonly))
-            .collect();
+        let listeners = bind_endpoints(&listen).expect("all three endpoints bind");
+        let ctl_port = listeners[0].local_addr().unwrap().port();
+        let log_port = listeners[2].local_addr().unwrap().port();
+        assert_ne!(ctl_port, 0, "kernel must have assigned a control port");
+        assert_ne!(log_port, 0, "kernel must have assigned a log port");
+
+        let addrs = bound_addresses(&listeners);
+        let tokens: Vec<(String, bool)> =
+            addrs.iter().map(|a| (a.addr.clone(), a.readonly)).collect();
         assert_eq!(
             tokens,
             vec![
-                ("tcp:0.0.0.0:7001", true),
-                ("unix:/run/ioc.sock", false),
-                ("tcp:127.0.0.1:7000", false),
+                (format!("tcp:127.0.0.1:{log_port}"), true),
+                (format!("unix:{}", sock.display()), false),
+                (format!("tcp:127.0.0.1:{ctl_port}"), false),
             ]
         );
     }
 
-    #[test]
-    fn abstract_unix_address_uses_the_at_prefix() {
-        use crate::procserv::endpoint::UnixEndpoint;
-        let ep = Endpoint::Unix(UnixEndpoint {
-            name: PathBuf::from("ioc-console"),
-            abstract_socket: true,
-            uid: None,
-            gid: None,
-            perms: 0o666,
-        });
+    #[tokio::test]
+    async fn abstract_unix_address_uses_the_at_prefix() {
+        use crate::procserv::config::ListenConfig;
+        use crate::procserv::endpoint::{Endpoint, UnixEndpoint};
+        use crate::procserv::listener::bind_endpoints;
+        // Abstract names live in a process-independent global namespace, so
+        // key it on the pid to keep parallel test runs from colliding.
+        let name = format!("procserv-rs-test-{}", std::process::id());
+        let listen = ListenConfig {
+            control: vec![Endpoint::Unix(UnixEndpoint {
+                name: PathBuf::from(&name),
+                abstract_socket: true,
+                uid: None,
+                gid: None,
+                perms: 0o666,
+            })],
+            log: None,
+        };
+        let listeners = bind_endpoints(&listen).expect("abstract socket binds");
         assert_eq!(
-            ListenAddress::from_endpoint(&ep, false).addr,
-            "unix:@ioc-console"
+            ListenAddress::from_bound(&listeners[0]).addr,
+            format!("unix:@{name}")
         );
     }
 

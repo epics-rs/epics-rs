@@ -856,11 +856,22 @@ impl IocApplication {
         announce!(InitHookState::AfterInitDrvSup);
         announce!(InitHookState::AfterInitRecSup);
 
-        // Phase 2b: iocInit — wire device support to all records with DTYP.
-        // C: initDevSup() then initHookAfterInitDevSup (autosave pass 0).
+        // Phase 2b: iocInit. C order is initDevSup() → initHookAfterInitDevSup
+        // (autosave pass 0) → initDatabase() (per-record init_record, where
+        // devMotorAsyn's init_controller runs). Rust's per-record device init
+        // lives in `wire_device_support` — the initDatabase-era half of C's
+        // init, not initDevSup (whose analogue, device-factory registration,
+        // already happened) — so the pass-0 hook fires BEFORE it. A pass0-
+        // restored field must land as a plain pre-init field write (C dbPut
+        // before init_record); `DeviceSupport::init` then anchors/clears any
+        // command state the write armed (motor `clear_last_write`). Firing the
+        // hook after wiring let a restored motor VAL survive as a pending move
+        // command, dispatched as a real move on the first driver-status pass —
+        // and on a fast axis (VELO high) the Startup readback then caught the
+        // move mid-flight and synced the instantaneous position into VAL/DVAL.
+        announce!(InitHookState::AfterInitDevSup);
         let record_count =
             wire_device_support(&db, &device_factories, &dynamic_device_factory).await?;
-        announce!(InitHookState::AfterInitDevSup);
         // Retain the registry in the database for runtime re-resolution
         // (aSub LFLG=READ / SUBL); `wire_subroutines` then performs the
         // static init-time SNAM resolution (C `init_record`).
@@ -1827,6 +1838,13 @@ mod tests {
             // asyn:READBACK records follow driver-side changes regardless of
             // SCAN (PRs #60/#208) — the trait flag the I/O Intr wiring keys on.
             fn io_intr_scan_independent(&self) -> bool {
+                true
+            }
+            // ...and take the C `newOutputCallbackValue` readback branch on
+            // callback cycles (never re-write the setpoint). Devices that do
+            // not declare this — e.g. devMotorAsyn — still write on callback
+            // passes; that default-false path has its own regression tests.
+            fn output_callback_readback(&self) -> bool {
                 true
             }
             fn read(

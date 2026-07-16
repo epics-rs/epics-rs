@@ -1262,8 +1262,21 @@ mod tests {
     /// filename is a success no-op (C `asInitCommon`, asDbLib.c:127-128:
     /// returns 0 with no ACF file, leaving access security disabled), so
     /// a startup script under `on error break` is not aborted.
+    ///
+    /// `asInit` reads the process-global `as_state()` in
+    /// `access_commands.rs`, which `access_commands::tests` also mutates
+    /// (tempfile paths that get deleted, deliberately malformed ACFs). Take
+    /// the same test lock those tests use, and reset the state itself
+    /// rather than assume it starts fresh — the lock alone only stops a
+    /// *concurrent* sibling from racing in; it does nothing about a
+    /// filename a sibling left behind from running earlier in the same
+    /// process, which is what turned this test's expected `Ok(Continue)`
+    /// into a stale file-read `Err` under `cargo test`'s default
+    /// concurrency.
     #[test]
     fn test_as_commands_registered() {
+        let _guard = super::access_commands::as_state_test_guard();
+        super::access_commands::reset_as_state_for_test();
         let shell = make_shell();
         // asInit without asSetFilename leaves AS disabled and continues.
         assert!(matches!(

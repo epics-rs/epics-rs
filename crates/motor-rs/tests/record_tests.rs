@@ -4,6 +4,24 @@ use epics_base_rs::types::EpicsValue;
 use motor_rs::MotorRecord;
 use motor_rs::flags::*;
 
+/// Anchor a mailbox-wired record with a first idle status pulse (Startup
+/// pass). C's init_record precedes any dbProcess pass, so tests that drive
+/// put/scan passes must run them against an anchored record — an unanchored
+/// mailbox-wired record parks its signals until the anchor
+/// (do_process_inner's anchor-first gate).
+fn anchor(rec: &mut MotorRecord, state: &motor_rs::device_state::SharedDeviceState) {
+    use asyn_rs::interfaces::motor::MotorStatus;
+    use motor_rs::device_state::StampedStatus;
+    state.lock().unwrap().latest_status = Some(StampedStatus {
+        seq: 1,
+        status: MotorStatus {
+            done: true,
+            ..MotorStatus::default()
+        },
+    });
+    rec.process().unwrap();
+}
+
 #[test]
 fn test_default_values() {
     let rec = MotorRecord::new();
@@ -1691,7 +1709,9 @@ fn test_stup_does_not_drop_concurrent_user_write() {
     // write (last_write) arriving in the same cycle must still be planned —
     // the STUP must not early-return and discard it.
     let mut rec = MotorRecord::new();
-    rec.set_device_state(motor_rs::device_state::new_shared_state());
+    let state = motor_rs::device_state::new_shared_state();
+    rec.set_device_state(state.clone());
+    anchor(&mut rec, &state);
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
     rec.stat.stup = 1;
@@ -1718,7 +1738,9 @@ fn test_stup_put_rejects_non_on_and_busy_retrigger() {
     // back to OFF and does not trigger the protocol; (2615-2617): a put
     // while the previous request is in flight is refused.
     let mut rec = MotorRecord::new();
-    rec.set_device_state(motor_rs::device_state::new_shared_state());
+    let state = motor_rs::device_state::new_shared_state();
+    rec.set_device_state(state.clone());
+    anchor(&mut rec, &state);
 
     rec.put_field("STUP", EpicsValue::Short(2)).unwrap();
     assert_eq!(rec.stat.stup, 0, "BUSY write forced to OFF");
@@ -1753,7 +1775,9 @@ fn test_idle_status_pass_blocks_implicit_get_info() {
     // one-pass mark from determine_event's Idle consume carries that
     // discriminator.
     let mut rec = MotorRecord::new();
-    rec.set_device_state(motor_rs::device_state::new_shared_state());
+    let state = motor_rs::device_state::new_shared_state();
+    rec.set_device_state(state.clone());
+    anchor(&mut rec, &state);
 
     rec.internal.idle_status_pass = true;
     let effects = rec.do_process();

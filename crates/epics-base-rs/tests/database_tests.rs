@@ -2516,6 +2516,7 @@ struct MockDeviceSupport {
     read_count: Arc<AtomicU32>,
     write_count: Arc<AtomicU32>,
     dtyp_name: String,
+    callback_readback: bool,
 }
 
 impl MockDeviceSupport {
@@ -2524,7 +2525,16 @@ impl MockDeviceSupport {
             read_count,
             write_count,
             dtyp_name: dtyp.to_string(),
+            callback_readback: false,
         }
+    }
+
+    /// Declare the asyn devEpics `newOutputCallbackValue` contract
+    /// (`output_callback_readback` = true): a driver-callback cycle reads
+    /// the value back and suppresses the output write.
+    fn with_callback_readback(mut self) -> Self {
+        self.callback_readback = true;
+        self
     }
 }
 
@@ -2543,6 +2553,9 @@ impl epics_base_rs::server::device_support::DeviceSupport for MockDeviceSupport 
     }
     fn dtyp(&self) -> &str {
         &self.dtyp_name
+    }
+    fn output_callback_readback(&self) -> bool {
+        self.callback_readback
     }
 }
 
@@ -2564,6 +2577,73 @@ async fn test_ca_put_no_double_device_write() {
         .await
         .unwrap();
     assert_eq!(write_count.load(Ordering::SeqCst), 1);
+}
+
+/// A driver-callback cycle (`process_record_readback`) on a hardware output
+/// whose device support does NOT declare the `newOutputCallbackValue`
+/// contract is a full C `dbProcess`: the output stage runs. devMotorAsyn is
+/// the live case — the motor record emits its retry / backlash-leg /
+/// NTM-stop commands on exactly these passes, and suppressing the write
+/// strands them in the command mailbox (DMOV stuck 0, MIP=RETRY|MOVE).
+#[tokio::test]
+async fn test_readback_cycle_runs_device_write_without_callback_contract() {
+    let db = PvDatabase::new();
+    db.add_record("AO_CB1", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    let read_count = Arc::new(AtomicU32::new(0));
+    let write_count = Arc::new(AtomicU32::new(0));
+    let mock = MockDeviceSupport::new("MockDev", read_count.clone(), write_count.clone());
+    if let Some(rec) = db.get_record("AO_CB1").await {
+        let mut inst = rec.write().await;
+        inst.common.dtyp = "MockDev".to_string();
+        inst.device = Some(Box::new(mock));
+    }
+    let mut visited = HashSet::new();
+    db.process_record_readback("AO_CB1", &mut visited, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        write_count.load(Ordering::SeqCst),
+        1,
+        "a callback cycle without the readback contract runs the output stage"
+    );
+}
+
+/// The asyn devEpics contract (`output_callback_readback` = true,
+/// `devAsynInt32.c::processBo` taking the `newOutputCallbackValue` branch):
+/// the callback cycle reads the driver value back and must NOT re-write the
+/// setpoint — re-asserting it would re-trigger the driver (AD `Acquire`
+/// loop).
+#[tokio::test]
+async fn test_readback_cycle_suppresses_device_write_with_callback_contract() {
+    let db = PvDatabase::new();
+    db.add_record("AO_CB2", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    let read_count = Arc::new(AtomicU32::new(0));
+    let write_count = Arc::new(AtomicU32::new(0));
+    let mock = MockDeviceSupport::new("MockDev", read_count.clone(), write_count.clone())
+        .with_callback_readback();
+    if let Some(rec) = db.get_record("AO_CB2").await {
+        let mut inst = rec.write().await;
+        inst.common.dtyp = "MockDev".to_string();
+        inst.device = Some(Box::new(mock));
+    }
+    let mut visited = HashSet::new();
+    db.process_record_readback("AO_CB2", &mut visited, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        read_count.load(Ordering::SeqCst),
+        1,
+        "the callback cycle reads the driver value back into VAL"
+    );
+    assert_eq!(
+        write_count.load(Ordering::SeqCst),
+        0,
+        "the readback contract suppresses the output write on a callback cycle"
+    );
 }
 
 // epics-base f2fe9d12 (devBiSoftRaw): a `bi` record with

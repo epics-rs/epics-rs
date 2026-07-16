@@ -1750,6 +1750,7 @@ mod tests {
     /// scoped config — that ambient fallback was the contamination this
     /// primitive exists to prevent.
     #[test]
+    #[serial_test::serial(epics_env)]
     fn pva_config_defs_get_does_not_fall_back_to_ambient_env() {
         const KEY: &str = "EPICS_PVA_NAME_SERVERS";
         unsafe {
@@ -1778,6 +1779,7 @@ mod tests {
     /// A key absent from one config's defs must not bleed in from another
     /// config's map nor from the process environment.
     #[test]
+    #[serial_test::serial(epics_env)]
     fn pva_config_defs_absent_key_does_not_bleed_between_maps_or_env() {
         const KEY: &str = "EPICS_PVA_ADDR_LIST";
         unsafe {
@@ -1843,9 +1845,12 @@ mod tests {
     /// ON, matching pvxs leaving `autoAddrList` untouched on an invalid
     /// value — `N`, `FALSE`, and `" NO "` no longer disable discovery.
     #[test]
+    #[serial_test::serial(epics_env)]
     fn auto_addr_list_non_pvxs_bool_preserves_default_enabled() {
-        // SAFETY: nextest runs each test in its own process, so mutating
-        // the process environment here cannot race other tests.
+        // SAFETY: std::env mutation is unsafe in edition 2024; the
+        // `epics_env` serial guard makes it race-free under `cargo test`,
+        // which runs all lib tests as threads in one process (unlike
+        // nextest, which isolates each test in its own process).
         for invalid in ["N", "FALSE", " NO ", "false"] {
             unsafe { std::env::set_var("EPICS_PVA_AUTO_ADDR_LIST", invalid) };
             assert!(
@@ -1860,11 +1865,13 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(epics_env)]
     fn auto_addr_list_invalid_value_preserves_default_enabled() {
         // pvxs: a misspelled EPICS_PVA_AUTO_ADDR_LIST keeps auto-addr ON;
         // the old truthy-collapse turned it OFF on any non-true string.
-        // SAFETY: nextest runs each test in its own process, so mutating
-        // the process environment here cannot race other tests.
+        // SAFETY: std::env mutation is unsafe in edition 2024; the
+        // `epics_env` serial guard makes it race-free under `cargo test`,
+        // which runs all lib tests as threads in one process.
         unsafe { std::env::set_var("EPICS_PVA_AUTO_ADDR_LIST", "maybe") };
         assert!(
             auto_addr_list_enabled(),
@@ -1877,10 +1884,13 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(epics_env)]
     fn broadcast_port_zero_falls_back_to_5076_client_only() {
         // pvxs ignores EPICS_PVA_BROADCAST_PORT=0 and restores 5076 for the
         // client (a SEARCH to UDP port 0 can never reach a server).
-        // SAFETY: nextest runs each test in its own process.
+        // SAFETY: std::env mutation is unsafe in edition 2024; the
+        // `epics_env` serial guard makes it race-free under `cargo test`,
+        // which runs all lib tests as threads in one process.
         unsafe { std::env::set_var("EPICS_PVA_BROADCAST_PORT", "0") };
         assert_eq!(
             broadcast_port(),
@@ -1928,10 +1938,12 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(epics_env)]
     fn port_getters_truncate_out_of_range_like_pvxs() {
         // The finding's named cases, exercised through the getters.
-        // SAFETY: nextest runs each test in its own process, so mutating
-        // the process environment here cannot race other tests.
+        // SAFETY: std::env mutation is unsafe in edition 2024; the
+        // `epics_env` serial guard makes it race-free under `cargo test`,
+        // which runs all lib tests as threads in one process.
         // EPICS_PVAS_SERVER_PORT=70000 -> pvxs TCP port 4464, not the
         // default 5075 a strict u16 parse fell back to.
         unsafe { std::env::set_var("EPICS_PVAS_SERVER_PORT", "70000") };
@@ -2165,6 +2177,7 @@ mod tests {
     /// the wiring, ops who templated their st.cmd-style addr lists
     /// see literal `$(IFACE_IP)` tokens silently dropped as invalid.
     #[test]
+    #[serial_test::serial(epics_env)]
     fn intf_and_ignore_addr_lists_expand_dollar_vars() {
         unsafe {
             std::env::set_var("EPICS_RS_AUDIT_IFACE", "127.0.0.1");
@@ -2208,6 +2221,7 @@ mod tests {
     /// literal IP, so `localhost` produced `[]` — the all-NIC / wildcard
     /// default — broadening the bind/search surface beyond pvxs.
     #[test]
+    #[serial_test::serial(epics_env)]
     fn intf_addr_list_resolves_hostname_to_loopback() {
         unsafe {
             std::env::set_var("EPICS_PVA_INTF_ADDR_LIST", "localhost");
@@ -2238,6 +2252,7 @@ mod tests {
     /// error so the server refuses to start, NOT silently fall back to
     /// listening on every interface (`0.0.0.0`).
     #[test]
+    #[serial_test::serial(epics_env)]
     fn server_intf_checked_errors_when_all_tokens_unresolvable() {
         // Unset → Ok(None): caller keeps its own interfaces.
         unsafe {
@@ -2281,6 +2296,7 @@ mod tests {
     /// non-blank tokens unresolvable ⟹ `Err` (refuse a silently-empty
     /// blocklist) rather than dropping every entry.
     #[test]
+    #[serial_test::serial(epics_env)]
     fn server_ignore_checked_errors_when_all_tokens_unresolvable() {
         // Unset → Ok(None): caller keeps its own ignore_addrs.
         unsafe {
@@ -2323,6 +2339,7 @@ mod tests {
     /// hostname that resolves to an IP already listed collapses into the
     /// existing entry.
     #[test]
+    #[serial_test::serial(epics_env)]
     fn intf_addr_list_dedups_after_resolution() {
         unsafe {
             std::env::set_var("EPICS_PVA_INTF_ADDR_LIST", "127.0.0.1 localhost 127.0.0.1");
@@ -2390,9 +2407,11 @@ mod tests {
     /// that host (was an empty drop). Mixed numeric + hostname + invalid
     /// tokens: the invalid one is dropped, the rest resolve.
     #[test]
+    #[serial_test::serial(epics_env)]
     fn server_ignore_addr_list_resolves_hostname_tokens() {
-        // SAFETY: nextest runs each test in its own process; the env
-        // mutation here cannot leak into a sibling test.
+        // SAFETY: std::env mutation is unsafe in edition 2024; the
+        // `epics_env` serial guard makes it race-free under `cargo test`,
+        // which runs all lib tests as threads in one process.
         unsafe {
             std::env::set_var(
                 "EPICS_PVAS_IGNORE_ADDR_LIST",

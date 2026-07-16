@@ -13,7 +13,7 @@ use tokio::net::{TcpListener, TcpSocket, UnixListener};
 use tokio::sync::mpsc;
 
 use crate::procserv::client::{ClientPeer, ClientStream, IncomingClient};
-use crate::procserv::config::ProcServConfig;
+use crate::procserv::config::ListenConfig;
 use crate::procserv::endpoint::{Endpoint, UnixEndpoint};
 use crate::procserv::error::{ProcServError, ProcServResult};
 
@@ -54,8 +54,19 @@ impl Drop for UnlinkOnDrop {
 /// `acceptItem` before `forkAndGo` and `exit(error)`s on failure
 /// (`procServ.cc:513-543,551`).
 enum BoundEndpoint {
-    Tcp(StdTcpListener),
+    /// The `SocketAddr` is read back from the kernel right after the bind
+    /// (C `getsockname`, `acceptFactory.cc:184`), so a `:0` config carries
+    /// the real assigned port from the moment the listener exists.
+    Tcp(StdTcpListener, SocketAddr),
     Unix(StdUnixListener, UnixEndpoint),
+}
+
+/// A bound listener's address, for publishing (info file / `PROCSERV_INFO`).
+/// TCP carries the kernel-reported address; UNIX carries the endpoint spec
+/// (C `writeAddress` prints `addr.sun_path`, which is the bound path).
+pub enum BoundAddr<'a> {
+    Tcp(SocketAddr),
+    Unix(&'a UnixEndpoint),
 }
 
 /// One bound-but-not-accepting listener plus the metadata its accept loop
@@ -69,13 +80,45 @@ pub struct PreboundListener {
 }
 
 impl PreboundListener {
+    /// The address this listener is actually bound to, for a TCP endpoint
+    /// bound with port `0` (OS-assigned) — `None` for a UNIX endpoint,
+    /// which has no numeric port. Lets a caller that bound with port `0`
+    /// via [`bind_endpoints`] learn the real port with zero gap between
+    /// bind and use, unlike bind-query-drop-then-reuse-the-number, which
+    /// races anyone else binding an ephemeral port in that gap.
+    pub fn local_addr(&self) -> Option<SocketAddr> {
+        match &self.listener {
+            BoundEndpoint::Tcp(_, addr) => Some(*addr),
+            BoundEndpoint::Unix(..) => None,
+        }
+    }
+
+    /// The bound address for publishing (info file / `PROCSERV_INFO`).
+    /// For TCP this is the kernel-reported address captured at bind time
+    /// (C refreshes its `addr` member via `getsockname` right after
+    /// `bind`+`listen`, `acceptFactory.cc:184`, and `writeInfoFile` prints
+    /// that member), so a config that said port `0` publishes the real
+    /// assigned port, never the `:0` placeholder.
+    pub fn bound_addr(&self) -> BoundAddr<'_> {
+        match &self.listener {
+            BoundEndpoint::Tcp(_, addr) => BoundAddr::Tcp(*addr),
+            BoundEndpoint::Unix(_, ep) => BoundAddr::Unix(ep),
+        }
+    }
+
+    /// `true` ⇒ read-only log/viewer endpoint (bound from `listen.log`);
+    /// `false` ⇒ control endpoint.
+    pub fn readonly(&self) -> bool {
+        self.readonly
+    }
+
     /// Run this listener's accept loop until the supervisor's `out` channel
     /// closes. A loop that exits with an error is logged; the supervisor
     /// keeps running its other endpoints (steady-state accept failures are
     /// per-listener in C too).
     pub async fn accept(self, out: mpsc::Sender<IncomingClient>) {
         let res = match self.listener {
-            BoundEndpoint::Tcp(l) => run_tcp_accept(l, self.readonly, out).await,
+            BoundEndpoint::Tcp(l, _) => run_tcp_accept(l, self.readonly, out).await,
             BoundEndpoint::Unix(l, ep) => run_unix_accept(l, ep, self.readonly, out).await,
         };
         if let Err(e) = res {
@@ -99,12 +142,12 @@ impl PreboundListener {
 /// UNIX/abstract binds go through tokio listeners (reused verbatim for
 /// their tested option/permission handling) which are then detached to
 /// their `std` form via `into_std`.
-pub fn bind_endpoints(config: &ProcServConfig) -> ProcServResult<Vec<PreboundListener>> {
+pub fn bind_endpoints(listen: &ListenConfig) -> ProcServResult<Vec<PreboundListener>> {
     let mut bound = Vec::new();
-    for ep in &config.listen.control {
+    for ep in &listen.control {
         bound.push(bind_one(ep.clone(), false, "control")?);
     }
-    if let Some(ep) = &config.listen.log {
+    if let Some(ep) = &listen.log {
         bound.push(bind_one(ep.clone(), true, "log")?);
     }
     Ok(bound)
@@ -115,7 +158,13 @@ pub fn bind_endpoints(config: &ProcServConfig) -> ProcServResult<Vec<PreboundLis
 fn bind_one(ep: Endpoint, readonly: bool, role: &'static str) -> ProcServResult<PreboundListener> {
     let listener = match ep {
         Endpoint::Tcp(addr) => {
-            BoundEndpoint::Tcp(tcp_listen(addr)?.into_std().map_err(ProcServError::Io)?)
+            let std_listener = tcp_listen(addr)?.into_std().map_err(ProcServError::Io)?;
+            // Read the real address back from the kernel while still in the
+            // fail-fast bind path (C `getsockname` right after `bind`+`listen`,
+            // `acceptFactory.cc:184`) — with port `0` this is the assigned
+            // port, and it is what gets published, not the config placeholder.
+            let bound = std_listener.local_addr().map_err(ProcServError::Io)?;
+            BoundEndpoint::Tcp(std_listener, bound)
         }
         Endpoint::Unix(u) => {
             let std_listener = bind_unix(&u)?.into_std().map_err(ProcServError::Io)?;
@@ -353,16 +402,19 @@ mod tests {
 
     #[tokio::test]
     async fn tcp_listener_forwards_accepted_socket() {
-        // Pick an OS-assigned port.
+        // Bind once, to an OS-assigned port, and read the real address
+        // back from that same listener before handing it to
+        // `run_tcp_accept` — no separate bind-query-drop-then-reuse-the-
+        // number step, so nothing else on the box can steal the port in
+        // between (that was this test's own flake: another test's ephemeral
+        // bind could land on the number in the gap between `drop(listener)`
+        // and `tcp_listen(actual)` re-binding it).
         let bind = "127.0.0.1:0".parse::<SocketAddr>().unwrap();
-        // Bind first to learn the port, then re-bind via run_tcp on
-        // that exact port. Simpler: just bind once and use the port.
-        let listener = tokio::net::TcpListener::bind(bind).await.unwrap();
+        let listener = tcp_listen(bind).unwrap();
         let actual = listener.local_addr().unwrap();
-        drop(listener);
+        let std_l = listener.into_std().unwrap();
 
         let (tx, mut rx) = mpsc::channel(4);
-        let std_l = tcp_listen(actual).unwrap().into_std().unwrap();
         let server = tokio::spawn(async move { run_tcp_accept(std_l, false, tx).await });
 
         // Give the listener a moment to bind.
@@ -506,12 +558,7 @@ mod tests {
     async fn bind_one_binds_a_free_port_and_accepts() {
         let bind = "127.0.0.1:0".parse::<SocketAddr>().unwrap();
         let pl = bind_one(Endpoint::Tcp(bind), false, "control").expect("free port binds");
-        // Recover the actual port to connect to: re-read it from the bound
-        // std listener before the accept loop consumes `pl`.
-        let actual = match &pl.listener {
-            BoundEndpoint::Tcp(l) => l.local_addr().unwrap(),
-            _ => unreachable!(),
-        };
+        let actual = pl.local_addr().expect("tcp listener reports a local addr");
         let (tx, mut rx) = mpsc::channel(4);
         let server = tokio::spawn(pl.accept(tx));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -522,5 +569,23 @@ mod tests {
         assert!(!inc.readonly);
 
         server.abort();
+    }
+
+    /// `local_addr` is how a caller that bound with port `0` learns the
+    /// real port with no gap between bind and use (unlike bind-query-drop-
+    /// then-reuse-the-number). A TCP listener bound to `:0` must report a
+    /// concrete, non-zero port; a UNIX listener has no numeric port at all.
+    #[tokio::test]
+    async fn local_addr_reports_bound_tcp_port_and_none_for_unix() {
+        let bind = "127.0.0.1:0".parse::<SocketAddr>().unwrap();
+        let tcp = bind_one(Endpoint::Tcp(bind), false, "control").expect("free port binds");
+        let addr = tcp.local_addr().expect("tcp listener reports a local addr");
+        assert_eq!(addr.ip(), bind.ip());
+        assert_ne!(addr.port(), 0);
+
+        let dir = tempfile::tempdir().unwrap();
+        let ep = UnixEndpoint::filesystem(dir.path().join("ioc.sock"));
+        let unix = bind_one(Endpoint::Unix(ep), false, "control").expect("unix path binds");
+        assert_eq!(unix.local_addr(), None);
     }
 }

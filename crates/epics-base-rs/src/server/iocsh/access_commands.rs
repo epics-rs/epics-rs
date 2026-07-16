@@ -36,6 +36,33 @@ fn as_state() -> &'static Mutex<AsState> {
     STATE.get_or_init(|| Mutex::new(AsState::default()))
 }
 
+/// `as_state()` is process-global, shared by every test in the crate that
+/// exercises the `as*` iocsh family — this module's own tests, and
+/// `iocsh::tests::test_as_commands_registered`. Locking [`as_state`] only
+/// protects one field access at a time, not a whole `asSetFilename` +
+/// `asInit` scenario, so under Rust's default concurrent test runner one
+/// test's `asSetFilename` (to a tempfile that is later deleted, or to a
+/// deliberately malformed ACF) can land in `as_state` while a sibling test
+/// that never touches `as*` itself runs `asInit` and reads that stale
+/// filename — turning its expected `Ok(Continue)` into a file-read or
+/// parse `Err`. Every test that touches `as_state`, directly or through
+/// an `as*` iocsh command, takes this lock for its whole body.
+#[cfg(test)]
+pub(crate) fn as_state_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Reset `as_state` to its startup default. A test that assumes "no
+/// filename set" (or any other default-state precondition) must call this
+/// itself rather than rely on process start order — the lock above only
+/// stops *concurrent* corruption, not a stale value left behind by
+/// whichever test happened to run earlier in the same process.
+#[cfg(test)]
+pub(crate) fn reset_as_state_for_test() {
+    *as_state().lock().unwrap() = AsState::default();
+}
+
 /// Register the `as*` command family on `registry`.
 pub(crate) fn register(registry: &mut CommandRegistry) {
     registry.register(cmd_as_check_client_ip());
@@ -516,11 +543,6 @@ mod tests {
         (db, ctx)
     }
 
-    fn reset_state() {
-        let mut st = as_state().lock().unwrap();
-        *st = AsState::default();
-    }
-
     /// asInit before asSetFilename is a success no-op: C `asInitCommon`
     /// (asDbLib.c:127-128) returns 0 with no filename, leaving access
     /// security disabled rather than failing. It must return Continue so
@@ -528,7 +550,8 @@ mod tests {
     /// not install any config.
     #[test]
     fn as_init_without_filename_is_noop_success() {
-        reset_state();
+        let _guard = as_state_test_guard();
+        reset_as_state_for_test();
         let (_db, ctx) = make_ctx();
         let mut reg = CommandRegistry::new();
         register(&mut reg);
@@ -548,7 +571,8 @@ mod tests {
     /// asSetFilename + asInit loads an ACF; asprules then dumps it.
     #[test]
     fn as_set_filename_then_init_loads_acf() {
-        reset_state();
+        let _guard = as_state_test_guard();
+        reset_as_state_for_test();
         let (_db, ctx) = make_ctx();
         let mut reg = CommandRegistry::new();
         register(&mut reg);
@@ -575,7 +599,8 @@ mod tests {
     /// asInit on a malformed ACF surfaces the parse error.
     #[test]
     fn as_init_bad_acf_errors() {
-        reset_state();
+        let _guard = as_state_test_guard();
+        reset_as_state_for_test();
         let (_db, ctx) = make_ctx();
         let mut reg = CommandRegistry::new();
         register(&mut reg);

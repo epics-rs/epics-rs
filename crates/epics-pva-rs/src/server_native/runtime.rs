@@ -1958,6 +1958,7 @@ mod with_env_preserve_tests {
     ];
 
     #[test]
+    #[serial_test::serial(epics_env)]
     fn with_env_preserves_caller_fields_when_vars_absent() {
         with_cleared_env(PORT_VARS, || {
             let cfg = PvaServerConfig {
@@ -1978,6 +1979,7 @@ mod with_env_preserve_tests {
     }
 
     #[test]
+    #[serial_test::serial(epics_env)]
     fn with_env_overrides_only_the_present_var() {
         with_cleared_env(PORT_VARS, || {
             unsafe { std::env::set_var("EPICS_PVAS_SERVER_PORT", "6789") };
@@ -2051,6 +2053,7 @@ mod with_env_preserve_tests {
     /// `PickOne{EPICS_PVAS_TLS_PORT, EPICS_PVA_TLS_PORT}`); an absent var
     /// preserves the caller value.
     #[test]
+    #[serial_test::serial(epics_env)]
     fn with_env_tls_port_pvas_first_then_shared_then_preserve() {
         with_cleared_env(TLS_PORT_VARS, || {
             // Absent → caller value preserved.
@@ -2077,6 +2080,7 @@ mod with_env_preserve_tests {
     }
 
     #[test]
+    #[serial_test::serial(epics_env)]
     fn isolated_with_env_stays_isolated_in_empty_env() {
         let vars = [
             "EPICS_PVAS_SERVER_PORT",

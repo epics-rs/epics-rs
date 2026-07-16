@@ -1159,6 +1159,25 @@ mod tests {
         assert_eq!(rec.get_field("VERS"), Some(EpicsValue::Double(4.1)));
     }
 
+    /// `OSV` ("Output string value") is `DBF_STRING`, not a severity menu: the
+    /// name-based `shared_menu_choices` map lists `OSV` as `menuAlarmSevr` for
+    /// the bi/bo severity field of the same name, but the declared type must
+    /// win so a `caput SCALCOUT.OSV <string>` is not rejected as a bad choice.
+    #[test]
+    fn osv_is_a_string_field_not_a_severity_menu() {
+        use crate::server::record::record_instance::menu_choices_of;
+        let rec = ScalcoutRecord::new();
+        assert_eq!(
+            menu_choices_of(&rec, "OSV"),
+            None,
+            "OSV is DBF_STRING — the name-based severity menu must not apply"
+        );
+        // A real Enum severity field still resolves via the shared map, and
+        // scalcout's own declared menus are unaffected.
+        assert!(menu_choices_of(&rec, "HHSV").is_some());
+        assert!(menu_choices_of(&rec, "OOPT").is_some());
+    }
+
     /// UDF (C `pcalc->udf`) is undefined until a calc successfully defines VAL,
     /// and is cleared MONOTONICALLY: C `sCalcoutRecord.c:356-366` sets
     /// `udf=FALSE` only inside the fetch gate on a successful `sCalcPerform`

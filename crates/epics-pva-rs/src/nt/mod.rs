@@ -15,6 +15,7 @@ pub mod attribute;
 pub mod enum_t;
 pub mod meta;
 pub mod nd_array;
+pub mod qsrv_marks;
 pub mod scalar;
 pub mod table;
 pub mod typed;
@@ -22,6 +23,7 @@ pub mod uri;
 
 pub use attribute::NTAttribute;
 pub use enum_t::NTEnum;
+pub use qsrv_marks::{FORM_CHOICES, property_leaves};
 pub use scalar::NTScalar;
 pub use table::NTTable;
 pub use typed::{Alarm, TimeStamp, TypedNT, TypedNTError};

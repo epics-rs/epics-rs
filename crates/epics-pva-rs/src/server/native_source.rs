@@ -530,7 +530,21 @@ fn read_leaves(snap: &Snapshot, is_value_field: bool) -> Vec<String> {
         .collect();
     leaves.push("timeStamp".into());
     leaves.push("alarm".into());
-    leaves.push("value".into());
+    // An NTEnum's value is a STRUCT, so marking bare `value` would mark both
+    // its children — `index` AND `choices` — making the choice list ride the
+    // value's own mark and bypass the option bit that owns it. pvxs assigns
+    // the enum value through `value.index` alone (`iocsource.cpp:589-593`);
+    // `value.choices` is `getProperties`' leaf, gated on `DBR_ENUM_STRS`
+    // (already in `property_leaves`). A DTYP whose record type declares no
+    // `device()` takes C's `goto nostrs` (`dbAccess.c:176-179`), which clears
+    // that bit — so the leaf must be OMITTED, not sent as `{0}[]`. That is the
+    // distinction `dbAccess.c:205` draws: *"option data not available.
+    // distinct from no_str==0"*.
+    if matches!(&snap.value, EpicsValue::Enum(_)) {
+        leaves.push("value.index".into());
+    } else {
+        leaves.push("value".into());
+    }
     leaves.push("display.form.choices".into());
     if is_value_field {
         leaves.push("display.form.index".into());
@@ -1183,6 +1197,74 @@ mod tests {
         let mut snap = Snapshot::new(EpicsValue::Double(0.0), 0, 0, std::time::UNIX_EPOCH);
         snap.properties = props;
         read_leaves(&snap, is_value_field)
+    }
+
+    fn enum_leaves_for(props: PropertySupport) -> Vec<String> {
+        let mut snap = Snapshot::new(EpicsValue::Enum(0), 0, 0, std::time::UNIX_EPOCH);
+        snap.properties = props;
+        read_leaves(&snap, false)
+    }
+
+    /// An NTEnum's `value` is a STRUCT. Marking bare `value` would mark both
+    /// children, carrying `choices` in on the value's mark and bypassing the
+    /// `DBR_ENUM_STRS` bit that owns it. pvxs assigns the enum through
+    /// `value.index` (`iocsource.cpp:589-593`), so the mark must be the index
+    /// leaf — never the parent.
+    #[test]
+    fn an_enum_read_marks_the_index_leaf_not_the_value_parent() {
+        let leaves = enum_leaves_for(PropertySupport::NONE);
+        assert!(
+            leaves.contains(&"value.index".to_string()),
+            "the enum value must be marked through its index leaf, got {leaves:?}"
+        );
+        assert!(
+            !leaves.contains(&"value".to_string()),
+            "marking the `value` parent would drag `choices` in with it: {leaves:?}"
+        );
+    }
+
+    /// C `dbAccess.c:176-179`: a `DTYP` whose record type declares no
+    /// `device()` has `ftPvt == NULL` and takes `goto nostrs`, clearing
+    /// `DBR_ENUM_STRS`. QSRV2 then OMITS `value.choices` rather than sending it
+    /// empty — `dbAccess.c:205`: *"option data not available. distinct from
+    /// no_str==0"*. Measured: `ORACLE:CALC.DTYP` shipped `{0}[]` where C sends
+    /// nothing.
+    #[test]
+    fn an_enum_with_no_enum_strs_omits_choices_entirely() {
+        let leaves = enum_leaves_for(PropertySupport::NONE);
+        // Both halves are load-bearing: a bare `value` mark COVERS
+        // `value.choices` without ever naming it, which is exactly how the
+        // measured `{0}[]` shipped. Asserting only the absence of the
+        // `value.choices` string passes on the defective code.
+        assert!(
+            !leaves.contains(&"value.choices".to_string()),
+            "no DBR_ENUM_STRS => the choices leaf is not marked: {leaves:?}"
+        );
+        assert!(
+            !leaves.contains(&"value".to_string()),
+            "nor may it be covered by a mark on the `value` parent: {leaves:?}"
+        );
+    }
+
+    /// The other side of the same distinction: `ai` DOES declare device
+    /// support, so its `DTYP` supplies the bit and both leaves are marked.
+    #[test]
+    fn an_enum_that_supplies_enum_strs_marks_index_and_choices() {
+        let leaves = enum_leaves_for(PropertySupport {
+            enum_strs: true,
+            ..PropertySupport::NONE
+        });
+        assert!(leaves.contains(&"value.index".to_string()));
+        assert!(leaves.contains(&"value.choices".to_string()));
+    }
+
+    /// A plain scalar's `value` IS the leaf — it must keep its bare mark; the
+    /// index split is the enum shape's alone.
+    #[test]
+    fn a_scalar_read_still_marks_the_bare_value_leaf() {
+        let leaves = leaves_for(PropertySupport::NUMERIC, true);
+        assert!(leaves.contains(&"value".to_string()));
+        assert!(!leaves.contains(&"value.index".to_string()));
     }
 
     /// The invariant, over every one of the 64 possible rset support masks:

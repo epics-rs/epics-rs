@@ -139,10 +139,23 @@ fn a_disconnect_under_camonitor_writes_no_per_pv_stderr_line() {
             && stderr.contains("    Source File: ../cac.cpp line 1240\n"),
         "stderr: {stderr:?}"
     );
+    // The resolved loopback name is a `/etc/hosts` guarantee on unix, not on
+    // Windows: there CI has no loopback PTR record, so `getnameinfo(NI_NAMEREQD)`
+    // fails and `hostNameCache` correctly falls back to the dotted IP (the same
+    // contract `hostname::ip_addr_to_a` documents). Pin the resolved NAME where
+    // it holds; on Windows pin the faithful dotted-IP fallback. Either way the
+    // context is the peer `<host>:<port>`, and both keep the port.
+    #[cfg(unix)]
     assert!(
         stderr.contains("    Context: \"localhost:"),
         "the exception context is the resolved peer name, as C's \
          `tcpiiu::getHostName` gives it; stderr: {stderr:?}"
+    );
+    #[cfg(windows)]
+    assert!(
+        stderr.contains("    Context: \"127.0.0.1:"),
+        "with no loopback PTR on Windows CI, the context is the dotted-IP \
+         fallback `ipAddrToA` takes; stderr: {stderr:?}"
     );
     // R18-21: and that block is ALL of it. C's `event_handler` prints nothing
     // for a non-NORMAL status, so the per-PV status line the port used to emit

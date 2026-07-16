@@ -1223,7 +1223,25 @@ impl DrvAsynIPPort {
             }
             match socket.connect_timeout(&(*remote_addr).into(), self.config.connect_timeout) {
                 Ok(()) => return Ok(TcpStream::from(socket)),
-                Err(e) => last_err = Some(AsynError::Io(e)),
+                // C `connectIt` uses a *blocking* `connect()` (drvAsynIPPort.c:513-523)
+                // and only switches the socket to non-blocking afterward (:536), so it
+                // never polls the connecting socket: a blocking connect returns as soon
+                // as the TCP handshake completes and cannot observe a peer that hangs up
+                // right after. `socket2::connect_timeout` instead `poll()`s the socket
+                // for `POLLIN|POLLOUT` and rejects a `POLLHUP` even when `SO_ERROR` is
+                // clear (it returns io::Error "no error set after POLLHUP"). macOS raises
+                // that `POLLHUP` when the peer FINs immediately after accepting, where
+                // Linux does not. On macOS the handshake still completed, so C treats the
+                // link as connected and lets the *later read* surface the EOF
+                // (`closeConnection`, "Read from broken connection", :819) — it does not
+                // fail the connect. Match C: if the socket is in fact connected
+                // (`getpeername` succeeds) the connect succeeded, whatever POLLHUP
+                // socket2 flagged; a genuine connect failure (refused/unreachable/timeout)
+                // never reached ESTABLISHED, so `peer_addr()` errors and we keep `e`.
+                Err(e) => match socket.peer_addr() {
+                    Ok(_) => return Ok(TcpStream::from(socket)),
+                    Err(_) => last_err = Some(AsynError::Io(e)),
+                },
             }
         }
         Err(last_err.unwrap_or_else(|| AsynError::Status {

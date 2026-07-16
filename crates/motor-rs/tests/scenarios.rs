@@ -1169,10 +1169,15 @@ fn sim_motor_end_to_end() {
     assert!((rec.pos.rbv - 10.0).abs() < 1e-6);
 }
 
-/// Setting VAL to the current position must still produce a DMOV 1→0→1
-/// transition. ophyd/bluesky rely on this to detect move completion.
+/// A database put of VAL to the current position produces a DMOV
+/// 1→0→1 pulse: the special() pass-0 blink (motorRecord.cc:2582-2608)
+/// drops DMOV, the move-block entry gate (2240) passes via `!dmov`,
+/// and too_small (2333-2342) completes the zero-length "move".
+/// ophyd/bluesky rely on this edge to detect move completion.
+/// Full framework order: special(pass 0) → put_field → process pass
+/// (consumes last_write) → recovery pass restores DMOV.
 #[test]
-fn move_to_same_position_refuses_without_dmov_pulse() {
+fn dbput_to_same_position_pulses_dmov() {
     let mut rec = make_record();
 
     rec.pos.val = 0.0;
@@ -1183,35 +1188,100 @@ fn move_to_same_position_refuses_without_dmov_pulse() {
     rec.stat.dmov = true;
     rec.stat.phase = MotionPhase::Idle;
 
-    // Write VAL=0 (same as the last-dispatched target): C do_work
-    // refuses the pass at the entry gates (motorRecord.cc:2204, 2240)
-    // — no command, no DMOV edge; the pass is pure housekeeping.
+    rec.special("VAL", false).unwrap();
+    assert!(!rec.stat.dmov, "pass-0 blink drops DMOV");
     rec.put_field("VAL", EpicsValue::Double(0.0)).unwrap();
-    let effects = rec.plan_motion(CommandSource::Val);
 
-    assert!(rec.stat.dmov, "DMOV stays 1 — C refuses the pass");
+    // The pp process pass: put-owned (last_write = Val), so the pulse
+    // recovery must NOT eat it — it dispatches, lands in too_small,
+    // and posts the pulse's low half.
+    let effects = rec.do_process();
+    assert!(!rec.stat.dmov, "pulse low half");
+    assert!(rec.stat.movn, "pulse presents as a (zero-length) move");
     assert!(effects.commands.is_empty(), "no motor command");
+    assert!(effects.request_poll, "pulse schedules the recovery pass");
     assert_eq!(rec.stat.phase, MotionPhase::Idle);
+
+    // The recovery pass restores DMOV=1 — the pulse's high half.
+    let _ = rec.do_process();
+    assert!(rec.stat.dmov, "DMOV returns to 1");
+    assert!(!rec.stat.movn);
 }
 
-/// Same-position re-put after a genuinely completed move: the lasts
-/// were synced at the dispatch, so the C entry gate (2240) refuses —
-/// no command, no DMOV edge — end-to-end through the completion flow.
+/// Same-position dbPut re-put after a genuinely completed move,
+/// end-to-end through the completion flow: the blink re-opens the
+/// entry gate, too_small pulses. An unblinked same-value pass (no
+/// fresh drive write — C's closed-loop DOL dbGetLink delivery) is the
+/// one the entry gate (2240) refuses with no DMOV edge.
 #[test]
-fn same_position_reput_after_completed_move_refuses() {
+fn same_position_reput_after_completed_move_pulses() {
     let mut rec = make_record();
 
+    rec.special("VAL", false).unwrap();
     rec.put_field("VAL", EpicsValue::Double(5.0)).unwrap();
-    let effects = rec.plan_motion(CommandSource::Val);
+    let effects = rec.do_process();
     assert!(!effects.commands.is_empty(), "real move dispatched");
     complete_move(&mut rec, 5.0);
     let _ = rec.check_completion();
     assert!(rec.stat.dmov);
 
+    // Blinked re-put of the same target: DMOV pulses, no command.
+    rec.special("VAL", false).unwrap();
     rec.put_field("VAL", EpicsValue::Double(5.0)).unwrap();
-    let effects = rec.plan_motion(CommandSource::Val);
-    assert!(rec.stat.dmov, "DMOV stays 1 — C refuses the pass");
+    let effects = rec.do_process();
+    assert!(!rec.stat.dmov, "pulse low half");
     assert!(effects.commands.is_empty(), "no motor command");
+    let _ = rec.do_process();
+    assert!(rec.stat.dmov, "pulse high half restores DMOV");
+
+    // Unblinked same-value pass: entry gate refuses, no DMOV edge.
+    let effects = rec.plan_motion(CommandSource::Val);
+    assert!(rec.stat.dmov, "DMOV stays 1 — C refuses the unblinked pass");
+    assert!(effects.commands.is_empty(), "no motor command");
+}
+
+/// A blinked drive put while SPMG=Pause parks like C: the special()
+/// blink drops DMOV, the top-block stop_or_pause return (C 2237)
+/// refuses the dispatch with mip=STOP, and DMOV reads 0 — "not done",
+/// a move is pending. Go falls through to the move block (1909-1925)
+/// and dispatches the parked target; the pulse recovery must not
+/// finalize the parked state early (mip=STOP keeps it out).
+#[test]
+fn blinked_put_while_paused_parks_and_resumes_on_go() {
+    let mut rec = make_record();
+
+    // Idle at 0, then Pause.
+    rec.ctrl.spmg = SpmgMode::Pause;
+    let effects = rec.plan_motion(CommandSource::Spmg);
+    assert!(matches!(effects.commands[0], MotorCommand::Stop { .. }));
+    assert_eq!(rec.stat.mip, MipFlags::STOP);
+    complete_move(&mut rec, 0.0);
+    let _ = rec.check_completion();
+
+    // dbPut VAL=7 while paused: blink + park, no dispatch.
+    rec.special("VAL", false).unwrap();
+    rec.put_field("VAL", EpicsValue::Double(7.0)).unwrap();
+    let effects = rec.do_process();
+    assert!(effects.commands.is_empty(), "paused put dispatches nothing");
+    assert!(!rec.stat.dmov, "DMOV stays low — a move is pending (C)");
+    assert_eq!(rec.pos.dval, 7.0, "parked target survives the pause");
+
+    // A stray non-put pass must not finalize the parked state.
+    let effects = rec.do_process();
+    assert!(effects.commands.is_empty());
+    assert!(!rec.stat.dmov, "recovery does not eat the parked move");
+
+    // Go dispatches the parked target.
+    rec.ctrl.spmg = SpmgMode::Go;
+    let effects = rec.plan_motion(CommandSource::Spmg);
+    assert!(
+        effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveAbsolute { .. })),
+        "Go dispatches the move parked during the pause"
+    );
+    assert!(!rec.stat.dmov, "move in flight");
 }
 
 /// Sequential moves: move to multiple positions and verify each.

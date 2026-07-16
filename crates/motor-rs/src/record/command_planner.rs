@@ -394,12 +394,17 @@ impl MotorRecord {
                         }
                     }
                 }
-                // C move-block entry (2240): `dval != ldvl || !dmov`. A
-                // same-value re-put does not re-enter the move block —
-                // notably after a retry give-up, where maybeRetry adopted
-                // the unreached target into the lasts (1067-1069) with
-                // MISS latched — the pass falls to the chain end instead
-                // (latched SYNC, implicit GET_INFO, 2540-2557).
+                // C move-block entry (2240): `dval != ldvl || !dmov`.
+                // A database put never fails this gate — the special()
+                // pass-0 blink (2582-2608) dropped DMOV before the pass
+                // — so a same-value dbPut re-put re-enters and the
+                // dispatch gate (2455, `mip == MIP_DONE || MIP_RETRY`)
+                // re-sends the move: C retries a missed target on an
+                // operator re-put. What the entry gate refuses is the
+                // UNBLINKED same-value pass — the closed-loop DOL
+                // collection (a bare dbGetLink, 1994, no special) and
+                // housekeeping passes — which falls to the chain end
+                // instead (latched SYNC, implicit GET_INFO, 2540-2557).
                 if !self.stat.dmov || self.pos.dval != self.internal.ldvl {
                     self.plan_absolute_move(&mut effects);
                 } else {
@@ -477,9 +482,11 @@ impl MotorRecord {
             CommandSource::Twf | CommandSource::Twr => {
                 // The fold already ran in the collection above (SET-mode
                 // redefinition included); dispatch the pending move (C
-                // move block firing on the folded val change). A zero
-                // fold (TWV = 0) leaves DVAL at the lasts and the entry
-                // gate (2240) refuses like C — chain end instead.
+                // move block firing on the folded val change). A dbPut
+                // to TWF/TWR is blinked (special pass-0, 2582-2608), so
+                // even a zero fold (TWV = 0) enters via `!dmov` and
+                // too_small pulses DMOV like C; only an unblinked zero
+                // fold refuses at the entry gate (2240) — chain end.
                 if tweak_pending {
                     if !self.stat.dmov || self.pos.dval != self.internal.ldvl {
                         self.plan_absolute_move(&mut effects);
@@ -501,10 +508,11 @@ impl MotorRecord {
                 // C: the SET-mode redefinition dispatches through the
                 // move block (2240-2263) — plan_absolute_move recomputes
                 // DIFF/RDIF and its set test routes to load_pos. The
-                // entry gate (2240) applies first: a same-value
-                // redefinition re-put (load_pos synced the lasts at
-                // dispatch) does not re-send LOAD_POS — like C it falls
-                // to the chain end.
+                // entry gate (2240) applies first, but a dbPut to a
+                // drive field is blinked (special pass-0, 2582-2608) and
+                // always re-enters — C re-sends LOAD_POS on a same-value
+                // redefinition re-put. Only an unblinked same-value pass
+                // (no fresh drive write) falls to the chain end.
                 if !self.stat.dmov || self.pos.dval != self.internal.ldvl {
                     self.plan_absolute_move(&mut effects);
                 } else {
@@ -738,6 +746,28 @@ impl MotorRecord {
         };
         if self.is_blocked_by_hw_limit(dir) {
             tracing::warn!("hardware limit active, blocking {dir:?} move");
+            // C has no hardware-limit gate in the move block: it
+            // dispatches (2455-2540, adopting the lasts at 2469-2471),
+            // the driver stops at the switch, and maybeRetry's
+            // limit-switch escape (1049, `hls && user_cdir`) completes
+            // the move as close-enough. This refusal skips the futile
+            // controller command but must land the same end state:
+            // lasts adopted (the written target stays in VAL/DVAL like
+            // C, and no dangling `dval != ldvl` re-dispatches on a
+            // later SPMG pass), an armed retry collapsed, and a
+            // pending pulse completed — a blinked put (special pass-0,
+            // 2582-2608) must not leave DMOV latched low with nothing
+            // in flight to restore it.
+            self.internal.ldvl = self.pos.dval;
+            self.internal.lval = self.pos.val;
+            self.internal.lrvl = self.pos.rval;
+            if self.stat.mip.contains(MipFlags::RETRY) {
+                self.stat.mip = MipFlags::empty();
+            }
+            if self.stat.mip.is_empty() && !self.stat.dmov {
+                self.stat.dmov = true;
+                self.set_phase(MotionPhase::Idle);
+            }
             return;
         }
 
@@ -2053,8 +2083,30 @@ impl MotorRecord {
         }
 
         // Sub-step pulse recovery: if DMOV is false but phase is Idle
-        // (no real motion started), finalize to restore DMOV=1.
-        if !self.stat.dmov && self.stat.phase == MotionPhase::Idle && self.stat.mip.is_empty() {
+        // (no real motion started), finalize to restore DMOV=1. This is
+        // the pulse's high half — C's too_small (2333-2347) restores
+        // DMOV on the same pass; the Rust pulse splits it so the low
+        // half posts, and too_small's lasts adoption (ldvl <- dval) is
+        // what marks the pulse as started. Two states share the DMOV-
+        // low/Idle/MIP-empty shape and must NOT be finalized:
+        //
+        // - A put-owned pass: the C special() pass-0 blink (2582-2608)
+        //   drops DMOV before the record processes, so a pending
+        //   last_write/UserWrite arrives here with DMOV already low —
+        //   the blink is the pass's move-block entry ticket (2240), not
+        //   a completed pulse, and the pass must reach its dispatch arm.
+        // - A parked blinked put (dval != ldvl): written under
+        //   SPMG=Pause/Stop, waiting for the Go pass to dispatch — C
+        //   keeps DMOV low across the pause ("not done": a move is
+        //   pending).
+        let put_owned = self.last_write.is_some()
+            || matches!(self.pending_event, Some(MotorEvent::UserWrite(_)));
+        if !put_owned
+            && !self.stat.dmov
+            && self.stat.phase == MotionPhase::Idle
+            && self.stat.mip.is_empty()
+            && self.pos.dval == self.internal.ldvl
+        {
             let mut effects = ProcessEffects::default();
             self.finalize_motion(&mut effects);
             return effects;

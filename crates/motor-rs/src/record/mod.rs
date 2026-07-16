@@ -395,6 +395,42 @@ impl Record for MotorRecord {
         dbd_generated::MOTOR_FIELDS
     }
 
+    /// C `special()` pass-0 blink (motorRecord.cc:2582-2608): "Someone
+    /// wrote to drive field. Blink .dmov unless record is disabled."
+    /// Every database put to a drive field drops DMOV before the record
+    /// processes — that blink is what carries the put pass through the
+    /// do_work move-block entry gate (2240, `dval != ldvl || !dmov`)
+    /// even when the target equals the last-dispatched one; the move
+    /// block then decides between the sub-step pulse restore
+    /// (too_small, 2333-2342), a re-dispatch (2455, `mip == MIP_DONE ||
+    /// MIP_RETRY`), and the SET-mode load_pos. The entry gate itself
+    /// only ever refuses passes that did NOT come through database put
+    /// access — C's closed-loop DOL collection is a bare `dbGetLink`
+    /// into VAL (1994) with no special, mirrored here by the framework
+    /// link reads landing via `put_field_internal`, which never runs
+    /// this hook.
+    ///
+    /// C's disabled-record gate (2600-2601): the DISP half is enforced
+    /// upstream — the framework rejects the put before this hook runs
+    /// (`check_put_disabled`, C dbPutField's put-disable test), so no
+    /// blink can land on a DISP'd record. The DISA==DISV half is not
+    /// reachable from the record trait (DISA/DISV are framework common
+    /// fields); a drive put to a processing-disabled motor blinks DMOV
+    /// low and it stays low until the record next processes, where C
+    /// keeps DMOV=1. Known divergence.
+    fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
+        if after {
+            return Ok(());
+        }
+        if ["VAL", "DVAL", "RVAL", "RLV", "TWF", "TWR"]
+            .iter()
+            .any(|f| field.eq_ignore_ascii_case(f))
+        {
+            self.stat.dmov = false;
+        }
+        Ok(())
+    }
+
     /// C `init_record`: on pass 1, once all `field()` values have been
     /// applied, reconcile the rev↔EGU speed pairs (C
     /// `check_speed_and_resolution`) and establish the limit invariant from
@@ -419,6 +455,12 @@ impl Record for MotorRecord {
             if self.conv.eres == 0.0 {
                 self.conv.eres = self.conv.mres;
             }
+            // C 721-723: `dmov = TRUE; movn = FALSE` — DMOV starts done
+            // no matter what the load wrote. In particular this
+            // neutralizes any `special()` pass-0 blink a load-time /
+            // restore write to a drive field may have left behind.
+            self.stat.dmov = true;
+            self.stat.movn = false;
             // C 734-743: LVIO starts clear; with soft limits enabled
             // (the dial pair not both 0), an initial dial readback
             // outside the dial window by more than one MRES, or an

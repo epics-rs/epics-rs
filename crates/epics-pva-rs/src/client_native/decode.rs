@@ -378,6 +378,73 @@ pub fn decode_op_response(
     decode_op_response_cached(frame, introspection, &mut empty)
 }
 
+/// The MONITOR FINISH rule, and its only owner.
+///
+/// A final MONITOR frame (`subcmd & 0x10`) always carries a `Status` after
+/// `ioid + subcmd`, and pvxs still decodes a trailing update from it whenever
+/// bytes remain: `clientmon.cpp:504-511` runs
+/// `if(!sts.isSuccess()) { } else if(init) { … } else if(!final || !M.empty())
+/// { … from_wire_valid(M, rxRegistry, data); from_wire(M, overrun); }`. The
+/// update is queued and only then is the `Finished()` marker appended
+/// (`clientmon.cpp:692-707`), so a subscriber sees the last update followed by
+/// the end of stream. `servermon.cpp:176-178` is the server side of the same
+/// shape.
+///
+/// Returns the FINISH `Status` plus the offset at which its trailing
+/// `changed | value | overrun` body begins, or `None` when there is no body.
+/// The arm order above is what makes a body absent: a failed status carries
+/// none, an INIT frame's post-status bytes are a type descriptor rather than an
+/// update (pvxs's `else if(init)` wins over the update arm), and an empty tail
+/// is the ordinary status-only FINISH.
+///
+/// Every consumer of a FINISH frame — the typed decode below, the reader-task
+/// marker flattening ([`flatten_type_cache_markers`]), and the raw-forwarding
+/// monitor loop — asks this instead of re-deriving "is there a body?", so the
+/// three cannot disagree about whether a final update exists.
+///
+/// [`flatten_type_cache_markers`]: crate::client_native::decode::flatten_type_cache_markers
+pub(crate) fn monitor_finish_body(
+    payload: &[u8],
+    order: ByteOrder,
+) -> Result<(Status, Option<usize>), String> {
+    let subcmd = *payload
+        .get(4)
+        .ok_or_else(|| format!("MONITOR FINISH frame too short: {} bytes", payload.len()))?;
+    let mut cur = Cursor::new(payload);
+    cur.set_position(5);
+    let status = Status::decode(&mut cur, order)
+        .map_err(|e| format!("MONITOR FINISH status decode failed: {e}"))?;
+    let pos = cur.position() as usize;
+    let body = (status.is_success() && subcmd & 0x08 == 0 && pos < payload.len()).then_some(pos);
+    Ok((status, body))
+}
+
+/// Offset of the `changed BitSet | value | [overrun]` region of an op DATA
+/// payload, or `None` when the frame carries no value body. GET/PUT/PUT_GET
+/// put a `Status` before it (and a PUT without GetBack has no body at all),
+/// MONITOR DATA starts it right after `ioid + subcmd`, and a MONITOR FINISH
+/// defers to [`monitor_finish_body`].
+fn op_data_body_start(payload: &[u8], order: ByteOrder, cmd: Command, subcmd: u8) -> Option<usize> {
+    if cmd == Command::Monitor {
+        if subcmd & 0x10 != 0 {
+            return monitor_finish_body(payload, order).ok()?.1;
+        }
+        // MONITOR DATA carries no Status.
+        return Some(5);
+    }
+    // A PUT data response without GetBack (subcmd & 0x40 == 0) is status-only.
+    if cmd == Command::Put && subcmd & 0x40 == 0 {
+        return None;
+    }
+    let mut cur = Cursor::new(payload);
+    cur.set_position(5);
+    match Status::decode(&mut cur, order) {
+        // A non-success status is a status-only reply — no value follows.
+        Ok(s) if s.is_success() => Some(cur.position() as usize),
+        _ => None,
+    }
+}
+
 /// Like [`decode_op_response`] but threads a
 /// [`TypeCache`](crate::pvdata::encode::TypeCache) for 0xFD/0xFE marker support.
 ///
@@ -406,23 +473,34 @@ pub fn decode_op_response_cached(
         .map_err(|e| PvaError::Decode(e.to_string()))?;
     let subcmd = cur.get_u8().map_err(|e| PvaError::Decode(e.to_string()))?;
 
-    // MONITOR FINISH (subcmd & 0x10) — the server signals end-of-stream
-    // and emits only a Status after ioid/subcmd. pvxs `servermon.cpp:148`
-    // sets `subcmd = 0x10` and `cleanup()`s the monitor. This status-only
-    // shape is MONITOR-specific: for GET/PUT/RPC the same bit is the
-    // "last request" marker that pvxs echoes on an otherwise normal data
+    // MONITOR FINISH (subcmd & 0x10) — the server signals end-of-stream with a
+    // Status after ioid/subcmd, and MAY append one last update after it
+    // ([`monitor_finish_body`], pvxs `clientmon.cpp:504-511`). With a body, the
+    // frame is decoded as ordinary MONITOR data (the cursor is parked at the
+    // changed BitSet and the FINISH status carried down); without one it is the
+    // status-only end of stream.
+    //
+    // This FINISH shape is MONITOR-specific: for GET/PUT/RPC the same bit is
+    // the "last request" marker that pvxs echoes on an otherwise normal data
     // response (`serverget.cpp:83,112-116`) and the client decodes by
-    // `cmd`/`init`/`get` bits, not as status-only (`clientget.cpp:405-452`).
-    // Classifying every `0x10` op response as status-only dropped the value
-    // body of a GET/PUT/RPC last-request data response.
+    // `cmd`/`init`/`get` bits (`clientget.cpp:405-452`).
+    let mut finish_status = None;
     if cmd == Command::Monitor && subcmd & 0x10 != 0 {
-        let status =
-            Status::decode(&mut cur, order).map_err(|e| PvaError::Decode(e.to_string()))?;
-        return Ok(OpResponse::Status(OpStatusResponse {
-            ioid,
-            subcmd,
-            status,
-        }));
+        let (status, body) =
+            monitor_finish_body(&frame.payload, order).map_err(PvaError::Decode)?;
+        match body {
+            None => {
+                return Ok(OpResponse::Status(OpStatusResponse {
+                    ioid,
+                    subcmd,
+                    status,
+                }));
+            }
+            Some(start) => {
+                cur.set_position(start as u64);
+                finish_status = Some(status);
+            }
+        }
     }
 
     if subcmd & 0x08 != 0 {
@@ -483,11 +561,23 @@ pub fn decode_op_response_cached(
                 status,
             }));
         }
-        let resp_desc = crate::pvdata::encode::decode_type_desc_cached(&mut cur, order, type_cache)
-            .map_err(|e| PvaError::Decode(e.to_string()))?;
-        let resp_value =
-            crate::pvdata::encode::decode_pv_field_cached(&resp_desc, &mut cur, order, type_cache)
+        // The reply type may be the NULL (`0xFF`) code: pvxs's no-argument
+        // `ExecOp::reply()` (`srvcommon.h:108`) writes exactly that, with no
+        // value body (`serverget.cpp:105-109`, `dataencode.cpp:29-33`), and
+        // its own client accepts it — `from_wire_type(M, rxRegistry, data);
+        // if(data) from_wire_full(...)` (`clientget.cpp:415-421`) leaves
+        // `data` an empty `Value`. Decoding the value body only when the
+        // descriptor is present mirrors that `if(data)` guard.
+        let resp_desc =
+            crate::pvdata::encode::decode_type_desc_cached_opt(&mut cur, order, type_cache)
                 .map_err(|e| PvaError::Decode(e.to_string()))?;
+        let resp_value = match &resp_desc {
+            Some(desc) => {
+                crate::pvdata::encode::decode_pv_field_cached(desc, &mut cur, order, type_cache)
+                    .map_err(|e| PvaError::Decode(e.to_string()))?
+            }
+            None => PvField::Null,
+        };
         let mut all = BitSet::new();
         all.set(0);
         return Ok(OpResponse::Data(OpDataResponse {
@@ -498,7 +588,10 @@ pub fn decode_op_response_cached(
             value: resp_value,
             // RPC responses carry no overrun bitset.
             overrun: BitSet::new(),
-            response_desc: Some(resp_desc),
+            // `None` is the empty reply — kept distinct from
+            // `Some(FieldDesc::Variant)` + `PvField::Null`, which is a
+            // *present* `any` field holding nothing.
+            response_desc: resp_desc,
         }));
     }
 
@@ -507,8 +600,11 @@ pub fn decode_op_response_cached(
     })?;
 
     // GET data response and PUT_GET (PUT with subcmd & 0x40) begin with a
-    // Status; MONITOR data does not.
-    let status = if cmd == Command::Get || cmd == Command::Put {
+    // Status; MONITOR data does not — except a FINISH-carried update, whose
+    // (success) Status was consumed above by `monitor_finish_body`.
+    let status = if let Some(s) = finish_status {
+        s
+    } else if cmd == Command::Get || cmd == Command::Put {
         Status::decode(&mut cur, order).map_err(|e| PvaError::Decode(e.to_string()))?
     } else {
         Status::ok()
@@ -621,10 +717,16 @@ pub fn flatten_type_cache_markers(
             let Some(subcmd) = peek_u8(&frame.payload, 4) else {
                 return;
             };
-            // MONITOR FINISH (status-only, MONITOR-specific) drops the op.
-            // For GET/PUT the same 0x10 bit is the last-request marker on an
-            // otherwise normal DATA response, so it must NOT short-circuit.
+            // MONITOR FINISH (MONITOR-specific) ends the op. It may still
+            // carry one last update ([`monitor_finish_body`]) whose `any`
+            // payloads can hold 0xFD/0xFE markers, so flatten that body
+            // BEFORE dropping the introspection the walk needs — otherwise
+            // the trailing update reaches the per-op decoder with markers
+            // and an empty cache. For GET/PUT the same 0x10 bit is the
+            // last-request marker on an otherwise normal DATA response, so
+            // it must NOT short-circuit.
             if cmd == Command::Monitor && subcmd & 0x10 != 0 {
+                flatten_op_data_value(frame, order, cache, cmd, subcmd, ioid, introspection);
                 introspection.remove(&ioid);
                 return;
             }
@@ -639,7 +741,7 @@ pub fn flatten_type_cache_markers(
                 return;
             }
             // DATA: flatten markers inside the value using captured intro.
-            flatten_op_data_value(frame, order, cache, cmd, ioid, introspection);
+            flatten_op_data_value(frame, order, cache, cmd, subcmd, ioid, introspection);
         }
         Command::Rpc => {
             let Some(subcmd) = peek_u8(&frame.payload, 4) else {
@@ -674,7 +776,7 @@ pub fn flatten_type_cache_markers(
                 return;
             }
             // DATA: ioid+subcmd+status+getChanged+getValue → flatten value.
-            flatten_op_data_value(frame, order, cache, cmd, ioid, introspection);
+            flatten_op_data_value(frame, order, cache, cmd, subcmd, ioid, introspection);
         }
         _ => {}
     }
@@ -735,14 +837,17 @@ fn rewrite_after_status(
 }
 
 /// Flatten 0xFD/0xFE markers embedded in `any` payloads of a
-/// GET/PUT/MONITOR/PUT_GET DATA value, in place. `cmd` selects the frame
-/// layout; the value type is the introspection captured from the op's INIT.
-/// On any difficulty the frame is left as-is for the per-op decoder.
+/// GET/PUT/MONITOR/PUT_GET DATA value, in place. `cmd`/`subcmd` select the
+/// frame layout (via [`op_data_body_start`], which also answers for a MONITOR
+/// FINISH that carries a trailing update); the value type is the introspection
+/// captured from the op's INIT. On any difficulty — including a frame with no
+/// value body at all — the frame is left as-is for the per-op decoder.
 fn flatten_op_data_value(
     frame: &mut Frame,
     order: ByteOrder,
     cache: &mut crate::pvdata::encode::TypeCache,
     cmd: Command,
+    subcmd: u8,
     ioid: u32,
     introspection: &dashmap::DashMap<u32, FieldDesc>,
 ) {
@@ -758,27 +863,14 @@ fn flatten_op_data_value(
         return;
     }
 
-    // Locate the value start and decode the changed BitSet. ioid(4) +
-    // subcmd(1) = 5, then a Status for GET/PUT/PUT_GET (MONITOR DATA carries
-    // none), then the changed BitSet. Any early return leaves the frame as-is.
+    // Locate the `changed | value | [overrun]` region, then decode the changed
+    // BitSet that precedes the value. Any early return leaves the frame as-is.
+    let Some(body_start) = op_data_body_start(&frame.payload, order, cmd, subcmd) else {
+        return;
+    };
     let (value_start, changed) = {
         let mut cur = Cursor::new(frame.payload.as_slice());
-        cur.set_position(5);
-        if matches!(cmd, Command::Get | Command::Put | Command::PutGet) {
-            match Status::decode(&mut cur, order) {
-                Ok(s) if s.is_success() => {}
-                // status-only error reply (no value) or undecodable status.
-                _ => return,
-            }
-        }
-        // A PUT data response without GetBack (subcmd & 0x40 == 0) is
-        // status-only — there is no value to flatten.
-        if cmd == Command::Put {
-            match peek_u8(&frame.payload, 4) {
-                Some(subcmd) if subcmd & 0x40 != 0 => {}
-                _ => return,
-            }
-        }
+        cur.set_position(body_start as u64);
         let changed = match BitSet::decode(&mut cur, order) {
             Ok(b) => b,
             Err(_) => return,
@@ -1013,6 +1105,43 @@ mod tests {
                 }
             }
             other => panic!("expected init, got {other:?}"),
+        }
+    }
+
+    /// A pvxs server answering an RPC with the no-argument `ExecOp::reply()`
+    /// (`srvcommon.h:108`) sends `ioid + subcmd + Status` followed by a bare
+    /// NULL type code and NO value body (`serverget.cpp:105-109` +
+    /// `dataencode.cpp:29-33`). Its own client accepts that — `from_wire_type`
+    /// leaves an invalid `Value` and the `if(data)` guard skips the body
+    /// (`clientget.cpp:415-421`). Decoding it must succeed with no value, not
+    /// fail on the `0xFF` type code.
+    #[test]
+    fn rpc_reply_with_a_null_type_code_decodes_to_no_value() {
+        use crate::proto::WriteExt;
+
+        let order = ByteOrder::Little;
+        let mut payload = Vec::new();
+        payload.put_u32(11, order); // ioid
+        payload.put_u8(0x00); // subcmd = EXEC (not INIT)
+        Status::ok().write_into(order, &mut payload);
+        payload.put_u8(crate::pvdata::encode::TAG_NULL); // null desc, no body
+
+        let header = PvaHeader::application(true, order, Command::Rpc.code(), payload.len() as u32);
+        let mut frame_bytes = Vec::new();
+        header.write_into(&mut frame_bytes);
+        frame_bytes.extend_from_slice(&payload);
+
+        let (frame, _) = try_parse_frame(&frame_bytes).unwrap().unwrap();
+        match decode_op_response(&frame, None).expect("a NULL-typed RPC reply must decode") {
+            OpResponse::Data(d) => {
+                assert_eq!(d.ioid, 11);
+                assert!(
+                    d.response_desc.is_none(),
+                    "no descriptor accompanies the pvxs no-value reply"
+                );
+                assert_eq!(d.value, PvField::Null);
+            }
+            other => panic!("expected an RPC data response, got {other:?}"),
         }
     }
 
@@ -1537,6 +1666,77 @@ mod tests {
             decode_op_response(&frame, None).is_err(),
             "MONITOR FINISH with a truncated Status must be a decode error"
         );
+    }
+
+    /// R6-35: a MONITOR FINISH frame whose Status is followed by more bytes
+    /// carries one last update. pvxs decodes it — `else if(!final ||
+    /// !M.empty())` (`clientmon.cpp:504-511`) — queues it, and only then
+    /// appends the `Finished()` marker (`:701-707`). The Rust decoder must
+    /// surface the update as DATA (with the final bit still set on `subcmd`, so
+    /// the monitor loop ends the stream after delivering it), not discard the
+    /// body as a status-only end.
+    #[test]
+    fn monitor_finish_with_a_trailing_update_decodes_the_update() {
+        use crate::proto::WriteExt;
+        use crate::pvdata::{ScalarType, ScalarValue};
+
+        let order = ByteOrder::Little;
+        let intro = FieldDesc::Structure {
+            struct_id: "epics:nt/NTScalar:1.0".into(),
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+        };
+
+        let mut payload = Vec::new();
+        payload.put_u32(7, order); // ioid
+        payload.put_u8(0x10); // subcmd = FINISH
+        Status::ok().write_into(order, &mut payload);
+        // …followed by an ordinary monitor update: changed | value | overrun.
+        let mut changed = BitSet::new();
+        changed.set(1); // field 1 = `value`
+        payload.extend_from_slice(&changed.encode(order));
+        crate::pvdata::encode::encode_pv_field_with_bitset(
+            &PvField::Structure({
+                let mut s = crate::pvdata::PvStructure::new("epics:nt/NTScalar:1.0");
+                s.set("value", PvField::Scalar(ScalarValue::Double(2.5)));
+                s
+            }),
+            &intro,
+            &changed,
+            0,
+            order,
+            &mut payload,
+        );
+        let mut overrun = BitSet::new();
+        overrun.set(1);
+        payload.extend_from_slice(&overrun.encode(order));
+
+        let header =
+            PvaHeader::application(true, order, Command::Monitor.code(), payload.len() as u32);
+        let frame = Frame { header, payload };
+
+        match decode_op_response(&frame, Some(&intro)).expect("FINISH+update must decode") {
+            OpResponse::Data(d) => {
+                assert_eq!(d.ioid, 7);
+                assert_eq!(
+                    d.subcmd & 0x10,
+                    0x10,
+                    "the final bit stays set so the loop can end the stream after delivery"
+                );
+                assert!(d.status.is_success());
+                match &d.value {
+                    PvField::Structure(s) => match s.get_field("value") {
+                        Some(PvField::Scalar(ScalarValue::Double(v))) => assert_eq!(*v, 2.5),
+                        other => panic!("unexpected FINISH update value: {other:?}"),
+                    },
+                    other => panic!("unexpected FINISH update: {other:?}"),
+                }
+                assert!(
+                    !d.overrun.is_empty(),
+                    "the FINISH update's trailing overrun bitset is decoded too"
+                );
+            }
+            other => panic!("expected the trailing update as Data, got {other:?}"),
+        }
     }
 
     /// Input contract: a MONITOR frame with the

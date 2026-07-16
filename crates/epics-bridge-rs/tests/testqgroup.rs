@@ -276,7 +276,7 @@ async fn group_put_rejected_when_unmarked_member_is_disp_disabled() {
             block: false,
         };
         let err = ch
-            .put_with_options(&put, opts, None)
+            .put_with_options(&put, opts, None, &Default::default())
             .await
             .expect_err("DISP=1 member must reject the whole group PUT");
         let msg = format!("{err}").to_ascii_lowercase();
@@ -297,13 +297,22 @@ async fn group_put_rejected_when_unmarked_member_is_disp_disabled() {
 }
 
 /// a `DBE_LOG`-only post against a backing record (archive
-/// deadband fires without a value change) wakes the group monitor,
+/// deadband fires without a value change) reaches the group monitor,
 /// matching pvxs `groupsource.cpp:389` which subscribes group value
 /// events with `DBE_VALUE | DBE_ALARM | DBE_ARCHIVE`.
 ///
 /// Regression: the prior Rust mask was `VALUE|ALARM` only, so log
 /// posts dropped silently on group monitors and archiver-like
 /// clients tracking a group PV missed samples.
+///
+/// What the delivered event carries is decided downstream, and the two
+/// outcomes are the boundaries pinned here. pvxs refreshes a *triggered*
+/// target with `Value | Alarm` unconditionally, but the *self*-triggered
+/// field with `pDbFieldLog->mask & UpdateType::Everything`
+/// (`groupsource.cpp:327-337`) — and `Everything` excludes DBE_ARCHIVE, so
+/// a LOG-only post assigns nothing on itself. `subscriptionPost` then sees
+/// an unmarked value and returns without posting (`if(empty && !first)`,
+/// `groupsource.cpp:266-275`).
 #[tokio::test]
 async fn group_monitor_subscribes_archive_log_events() {
     use epics_base_rs::server::recgbl::EventMask;
@@ -314,35 +323,62 @@ async fn group_monitor_subscribes_archive_log_events() {
     let db = make_db().await;
     let provider = Arc::new(BridgeProvider::new(db.clone()));
     provider.load_group_config(GROUP_JSON).expect("load");
+    provider
+        .load_group_config(GROUP_JSON_NAMED_TRIGGER)
+        .expect("load trigger group");
+
+    // `level` triggers `count`: the LOG post carries no self leaves, but the
+    // triggered target refreshes with Value|Alarm, so the group posts with
+    // `count` marked. If the bridge had subscribed only with VALUE|ALARM the
+    // event would never arrive and this poll would time out.
+    let def = provider
+        .groups()
+        .get("TEST:grp_trig")
+        .cloned()
+        .expect("grp_trig registered");
+    let mut mon = GroupMonitor::new(db.clone(), def);
+    mon.start().await.expect("start");
+    {
+        let rec = db.get_record("TEST:level").await.expect("rec exists");
+        rec.write().await.notify_field("VAL", EventMask::LOG);
+    }
+    let snap = tokio::time::timeout(Duration::from_millis(500), mon.poll())
+        .await
+        .expect("LOG event must reach the group monitor within 500ms")
+        .expect("snapshot delivered");
+    assert_eq!(
+        snap.marked,
+        Some(vec!["count".to_string()]),
+        "a DBE_ARCHIVE post refreshes the triggered target with Value|Alarm; \
+         the self field contributes nothing"
+    );
+    assert!(
+        !snap.value.fields.is_empty(),
+        "the posted value is the full group structure, got {snap:?}"
+    );
+    mon.stop().await;
+
+    // Self-trigger boundary: the same LOG-only post on the DEFAULT group
+    // (`level` triggers only itself) assigns nothing at all, so pvxs posts
+    // nothing — poll must stay parked.
     let def = provider
         .groups()
         .get("TEST:grp")
         .cloned()
         .expect("grp registered");
-
     let mut mon = GroupMonitor::new(db.clone(), def);
     mon.start().await.expect("start");
-
-    // Post a LOG-ONLY event on `level.VAL`. No VALUE / ALARM bit set;
-    // if the bridge had subscribed only with VALUE|ALARM the event
-    // would silently drop and the following poll would time out. The
-    // group monitor is purely delta-driven (the wire layer owns the
-    // initial frame), so this delta must wake poll() directly.
     {
         let rec = db.get_record("TEST:level").await.expect("rec exists");
-        let inst = rec.read().await;
-        inst.notify_field("VAL", EventMask::LOG);
+        rec.write().await.notify_field("VAL", EventMask::LOG);
     }
-
-    let polled = tokio::time::timeout(Duration::from_millis(500), mon.poll()).await;
-    let snap = polled
-        .expect("LOG event must wake group poll within 500ms")
-        .expect("snapshot delivered");
     assert!(
-        !snap.value.fields.is_empty(),
-        "log-event group snapshot must carry the full group structure, got {snap:?}"
+        tokio::time::timeout(Duration::from_millis(200), mon.poll())
+            .await
+            .is_err(),
+        "an ARCHIVE-only self-trigger event marks nothing — pvxs's \
+         subscriptionPost returns on `empty && !first`"
     );
-
     mon.stop().await;
 }
 
@@ -539,27 +575,32 @@ async fn group_get_carries_record_options_queue_size_and_atomic() {
     }
 }
 
-/// a group monitor stamps the *per-operation
-/// negotiated* `record._options.queueSize` — the value resolved
-/// from the MONITOR INIT pvRequest — not a hardcoded constant.
-/// pvxs `servermon.cpp:533-540` parses `record._options.queueSize`
-/// (kept iff >= 2) into `op->limit`, then `groupsource.cpp:359`
-/// stamps `stats.limitQueue` into the monitor value.
+/// R10-33 — a group monitor stamps the queue limit the SERVER negotiated,
+/// and NEVER re-reads the client's `record._options.queueSize`.
+///
+/// pvxs `GroupSource::onSubscribe` asks the subscription control what depth
+/// it actually got — `subscriptionControl->stats(stats)` then
+/// `currentValue["record._options.queueSize"] = stats.limitQueue`
+/// (groupsource.cpp:401-404) — where `stats.limitQueue` is the server's
+/// `MonitorOp::limit` (servermon.cpp:313). It parses no option itself; the
+/// ONE reader of `queueSize` is the server's INIT negotiation
+/// (servermon.cpp:533-543), whose result reaches the source as
+/// `MonitorOptions::queue_size`.
+///
+/// The port had a SECOND reader in `qsrv::group::negotiated_queue_size` — a
+/// decimal-only i32 parser that disagreed with the server's own
+/// `Value::as<uint32>` on every shape the latter accepts (hex/octal strings,
+/// reals). Both halves below fail against it.
 #[tokio::test]
-async fn br_r33_group_monitor_stamps_negotiated_queue_size() {
-    use epics_base_rs::server::recgbl::EventMask;
-    use epics_bridge_rs::qsrv::group::{
-        GROUP_DEFAULT_QUEUE_SIZE, GroupMonitor, negotiated_queue_size,
-    };
-    use epics_bridge_rs::qsrv::provider::PvaMonitor;
-    use std::time::Duration;
+async fn br_r10_33_group_monitor_stamps_the_servers_negotiated_queue_size() {
+    use epics_bridge_rs::qsrv::QsrvPvStore;
+    use epics_pva_rs::server_native::MonitorOptions;
+    use epics_pva_rs::server_native::source::{AccessGate, ChannelContext, ChannelSource};
 
-    // Build a MONITOR INIT pvRequest carrying
-    // `record._options.queueSize = 32`.
-    let mk_request = |qsize: i32| {
+    /// The pvRequest a client sent, carrying its own `queueSize` claim.
+    fn ctx_requesting(queue_size: PvField) -> ChannelContext {
         let mut opts = PvStructure::new("");
-        opts.fields
-            .push(("queueSize".into(), PvField::Scalar(ScalarValue::Int(qsize))));
+        opts.fields.push(("queueSize".into(), queue_size));
         let mut record = PvStructure::new("");
         record
             .fields
@@ -567,89 +608,95 @@ async fn br_r33_group_monitor_stamps_negotiated_queue_size() {
         let mut req = PvStructure::new("epics:nt/NTRequest:1.0");
         req.fields
             .push(("record".into(), PvField::Structure(record)));
-        req
-    };
+        ChannelContext {
+            peer: "127.0.0.1:5075".parse().unwrap(),
+            account: "alice".into(),
+            method: "anonymous".into(),
+            host: "host1".into(),
+            authority: String::new(),
+            roles: Vec::new(),
+            pv_request: Some(PvField::Structure(req)),
+            log: Default::default(),
+        }
+    }
 
-    // Negotiation rule (pvxs `servermon.cpp:533`): >= 2 honoured.
-    assert_eq!(negotiated_queue_size(&mk_request(32)), 32);
-    // < 2 → default kept.
-    assert_eq!(
-        negotiated_queue_size(&mk_request(1)),
-        GROUP_DEFAULT_QUEUE_SIZE
-    );
-    // Absent `record._options.queueSize` → default.
-    assert_eq!(
-        negotiated_queue_size(&empty_request()),
-        GROUP_DEFAULT_QUEUE_SIZE
-    );
-
-    // The monitor stamps the negotiated value into its snapshots.
-    let queue_size_in_snapshot =
-        |def: epics_bridge_rs::qsrv::GroupPvDef, db: Arc<PvDatabase>, negotiated: i32| async move {
-            let mut mon = GroupMonitor::new(db.clone(), def).with_queue_size(negotiated);
-            mon.start().await.expect("start");
-            // A member post wakes the delta-driven monitor; the emitted
-            // value carries the stamped record._options.queueSize.
-            for rec_name in ["TEST:level", "TEST:count"] {
-                let rec = db.get_record(rec_name).await.expect("rec exists");
-                rec.read().await.notify_field("VAL", EventMask::VALUE);
-            }
-            let snap = tokio::time::timeout(Duration::from_secs(2), mon.poll())
-                .await
-                .expect("first monitor delta within 2s")
-                .expect("snapshot");
-            mon.stop().await;
-            let record = match snap
-                .value
-                .fields
-                .iter()
-                .find(|(n, _)| n == "record")
-                .map(|(_, v)| v)
-            {
-                Some(PvField::Structure(s)) => s.clone(),
-                other => panic!("record sub-structure missing: {other:?}"),
-            };
-            let options = match record
-                .fields
-                .iter()
-                .find(|(n, _)| n == "_options")
-                .map(|(_, v)| v)
-            {
-                Some(PvField::Structure(s)) => s.clone(),
-                other => panic!("record._options missing: {other:?}"),
-            };
-            match options
-                .fields
-                .iter()
-                .find(|(n, _)| n == "queueSize")
-                .map(|(_, v)| v)
-            {
-                Some(PvField::Scalar(ScalarValue::Int(n))) => *n,
-                other => panic!("queueSize missing: {other:?}"),
-            }
+    /// `record._options.queueSize` stamped on the monitor's seed value.
+    async fn stamped_queue_size(ctx: ChannelContext, opts: MonitorOptions) -> i32 {
+        let db = make_db().await;
+        let provider = Arc::new(BridgeProvider::new(db.clone()));
+        provider.load_group_config(GROUP_JSON).expect("load");
+        let store = QsrvPvStore::new(provider);
+        let checked = AccessGate::open()
+            .check("TEST:grp", "host1", "alice", "anonymous", "")
+            .await;
+        let seed = store
+            .subscribe_seeded(checked, ctx, opts)
+            .await
+            .expect("group monitor subscribes");
+        let initial = match seed
+            .initial
+            .expect("a group monitor seeds from its monitor-stamped value")
+            .value
+        {
+            PvField::Structure(s) => s,
+            other => panic!("group seed must be a structure: {other:?}"),
         };
+        let record = match find_field(&initial, "record") {
+            Some(PvField::Structure(s)) => s.clone(),
+            other => panic!("record sub-structure missing: {other:?}"),
+        };
+        let options = match record
+            .fields
+            .iter()
+            .find(|(n, _)| n == "_options")
+            .map(|(_, v)| v)
+        {
+            Some(PvField::Structure(s)) => s.clone(),
+            other => panic!("record._options missing: {other:?}"),
+        };
+        match options
+            .fields
+            .iter()
+            .find(|(n, _)| n == "queueSize")
+            .map(|(_, v)| v)
+        {
+            Some(PvField::Scalar(ScalarValue::Int(n))) => *n,
+            other => panic!("queueSize missing: {other:?}"),
+        }
+    }
 
-    // Negotiated 32 → snapshot carries 32.
-    let db = make_db().await;
-    let provider = Arc::new(BridgeProvider::new(db.clone()));
-    provider.load_group_config(GROUP_JSON).expect("load");
-    let def = provider.groups().get("TEST:grp").cloned().expect("grp");
-    let qs = queue_size_in_snapshot(def, db, negotiated_queue_size(&mk_request(32))).await;
+    // The server negotiated 32 (its `Value::as<uint32>` reads the string
+    // "0x20" BASE 0, as `stoull(s,&idx,0)` does). The source stamps THAT —
+    // it does not re-parse "0x20", which the deleted decimal-only parser
+    // refused outright.
+    let stamped = stamped_queue_size(
+        ctx_requesting(PvField::Scalar(ScalarValue::String("0x20".into()))),
+        MonitorOptions {
+            queue_size: 32,
+            ..MonitorOptions::default()
+        },
+    )
+    .await;
     assert_eq!(
-        qs, 32,
-        "monitor must stamp the negotiated queueSize (32), not a hardcoded default"
+        stamped, 32,
+        "the monitor must stamp the server's negotiated limit (stats.limitQueue)"
     );
 
-    // No negotiation → default GROUP_DEFAULT_QUEUE_SIZE.
-    let db2 = make_db().await;
-    let provider2 = Arc::new(BridgeProvider::new(db2.clone()));
-    provider2.load_group_config(GROUP_JSON).expect("load");
-    let def2 = provider2.groups().get("TEST:grp").cloned().expect("grp");
-    let qs_default =
-        queue_size_in_snapshot(def2, db2, negotiated_queue_size(&empty_request())).await;
+    // Negative control: the client's `queueSize` is NOT an input to the
+    // source. With the SAME pvRequest claiming 99 but a server limit of 4
+    // (e.g. the request was refused as `< 2`, or never reached this source),
+    // the stamp is 4. The old parser answered 99.
+    let stamped = stamped_queue_size(
+        ctx_requesting(PvField::Scalar(ScalarValue::Int(99))),
+        MonitorOptions {
+            queue_size: 4,
+            ..MonitorOptions::default()
+        },
+    )
+    .await;
     assert_eq!(
-        qs_default, GROUP_DEFAULT_QUEUE_SIZE,
-        "absent queueSize → monitor stamps the default"
+        stamped, 4,
+        "the source must report the negotiated limit, never the client's request"
     );
 }
 
@@ -723,7 +770,7 @@ async fn group_monitor_stamps_atomic_true_while_get_reports_operation_atomicity(
     mon.start().await.expect("start");
     for rec_name in ["TEST:level_na", "TEST:count_na"] {
         let rec = db.get_record(rec_name).await.expect("rec exists");
-        rec.read().await.notify_field("VAL", EventMask::VALUE);
+        rec.write().await.notify_field("VAL", EventMask::VALUE);
     }
     let snap = tokio::time::timeout(Duration::from_secs(2), mon.poll())
         .await
@@ -776,9 +823,12 @@ async fn group_put_member_acf_denial_rejects_entire_put() {
     let result = ch.put(&put).await;
     let err = result.expect_err("group PUT must be rejected");
     let msg = format!("{err}");
-    assert!(
-        msg.contains("TEST:count.VAL"),
-        "error must name the denied member channel; got: {msg}"
+    // pvxs's `doFieldPreProcessing` throws the bare contract text
+    // (iocsource.cpp:385); the denied member channel is a server-log detail,
+    // never part of the Status.message the client receives.
+    assert_eq!(
+        msg, "put rejected: Put not permitted",
+        "member ACF denial must carry pvxs's contract text and no member identity"
     );
 
     // Verify the allowed member's record was NOT pre-emptively
@@ -886,7 +936,7 @@ async fn br_fr12_named_trigger_marks_only_target() {
     // A `level` post triggers only `count`.
     {
         let rec = db.get_record("TEST:level").await.expect("rec exists");
-        rec.read().await.notify_field("VAL", EventMask::VALUE);
+        rec.write().await.notify_field("VAL", EventMask::VALUE);
     }
     let ev = tokio::time::timeout(Duration::from_millis(500), mon.poll())
         .await
@@ -902,7 +952,7 @@ async fn br_fr12_named_trigger_marks_only_target() {
     // A `count` post triggers only `level`.
     {
         let rec = db.get_record("TEST:count").await.expect("rec exists");
-        rec.read().await.notify_field("VAL", EventMask::VALUE);
+        rec.write().await.notify_field("VAL", EventMask::VALUE);
     }
     let ev = tokio::time::timeout(Duration::from_millis(500), mon.poll())
         .await
@@ -917,13 +967,15 @@ async fn br_fr12_named_trigger_marks_only_target() {
     mon.stop().await;
 }
 
-/// A pure self-trigger group keeps the
-/// value-diff path — every member defaults `+trigger`, so the monitor
-/// derives the changed-bitset (`marked: None`) instead of carrying an
-/// explicit set. This guards that the new marked-set path does not
-/// regress the existing self-trigger narrowing.
+/// R14-32 — a pure self-trigger group (the DEFAULT `+trigger` shape) marks
+/// its self member like any other trigger target. pvxs seeds
+/// `field.triggers` with the field itself
+/// (`groupconfigprocessor.cpp:317-339`) and runs the identical
+/// `IOCSource::get` mark loop, so there is no derive/diff special case: a
+/// `level` post marks `level` (a `+type:plain` member IS its value node)
+/// and nothing else.
 #[tokio::test]
-async fn br_fr12_pure_self_trigger_derives_bitset() {
+async fn r14_32_pure_self_trigger_marks_the_self_member() {
     use epics_base_rs::server::recgbl::EventMask;
     use epics_bridge_rs::qsrv::group::GroupMonitor;
     use epics_bridge_rs::qsrv::provider::PvaMonitor;
@@ -945,21 +997,22 @@ async fn br_fr12_pure_self_trigger_derives_bitset() {
     let mut mon = GroupMonitor::new(db.clone(), def);
     mon.start().await.expect("start");
 
-    // Delta-driven monitor: a single `level` post yields one delta. A
-    // pure self-trigger group derives its changed-bitset (marked: None)
-    // rather than carrying an explicit marked set.
+    // Delta-driven monitor: a single `level` post yields one delta carrying
+    // the self member's leaves — assigned-not-changed, so it is a pure
+    // function of the DBE mask and the mapping, never of what the snapshot
+    // diff happened to see move.
     {
         let rec = db.get_record("TEST:level").await.expect("rec exists");
-        rec.read().await.notify_field("VAL", EventMask::VALUE);
+        rec.write().await.notify_field("VAL", EventMask::VALUE);
     }
     let ev = tokio::time::timeout(Duration::from_millis(500), mon.poll())
         .await
         .expect("level event wakes poll within 500ms")
         .expect("snapshot");
-    assert!(
-        ev.marked.is_none(),
-        "a pure self-trigger group must derive its bitset (marked: None), got {:?}",
-        ev.marked
+    assert_eq!(
+        ev.marked,
+        Some(vec!["level".to_string()]),
+        "a self-triggered `level` post marks `level` and nothing else"
     );
 
     mon.stop().await;
@@ -997,7 +1050,7 @@ async fn br113_quiet_member_does_not_block_active_member_update() {
     // Only `level` changes after start; `count` never posts.
     {
         let rec = db.get_record("TEST:level").await.expect("rec exists");
-        rec.read().await.notify_field("VAL", EventMask::VALUE);
+        rec.write().await.notify_field("VAL", EventMask::VALUE);
     }
     let ev = tokio::time::timeout(Duration::from_millis(500), mon.poll())
         .await
@@ -1020,7 +1073,7 @@ async fn group_config_parses_and_finalizes() {
     let db = make_db().await;
     let provider = BridgeProvider::new(db);
     provider.load_group_config(GROUP_JSON).expect("load");
-    let n = provider.process_groups();
+    let n = provider.process_groups().await;
     assert_eq!(n, 1);
     let groups = provider.groups();
     let def = groups.get("TEST:grp").expect("registered");
@@ -1486,7 +1539,7 @@ async fn group_monitor_stop_disables_member_subscriptions() {
 
     async fn post(db: &Arc<PvDatabase>) {
         let rec = db.get_record("TEST:level").await.expect("rec exists");
-        rec.read().await.notify_field("VAL", EventMask::VALUE);
+        rec.write().await.notify_field("VAL", EventMask::VALUE);
     }
 
     // Active (post-START): a member post wakes the group poll.
@@ -1605,5 +1658,388 @@ async fn trapped_group_put_emits_per_member_astrapwrite() {
         assert_eq!(pairs[0].2, None);
         assert_eq!(pairs[1].0, TrapWriteOp::AfterWrite);
         assert_eq!(pairs[1].2, Some("ok".to_string()));
+    }
+}
+
+/// R17-31 (group surface): the long-string NT choice is made by the shared
+/// owner (`pvif::nt_type_for_channel`), so a `Q:form,"String"` `DBF_CHAR`
+/// waveform member of a Q:group serves an `NTScalar<string>` — the same
+/// view the single-record channel serves, since pvxs builds group member
+/// types from the same `getChannelValueType`
+/// (groupconfigprocessor.cpp:867-974). Pre-fix the member was an
+/// `NTScalarArray<byte>`.
+#[tokio::test]
+async fn r17_31_group_scalar_member_serves_long_string() {
+    use epics_base_rs::server::records::waveform::WaveformRecord;
+    use epics_base_rs::types::DbFieldType;
+
+    const JSON: &str = r#"{
+        "TEST:grpls": {
+            "msg": { "+channel": "TEST:lstrwf.VAL", "+type": "scalar", "+putorder": 0 }
+        }
+    }"#;
+
+    let db = Arc::new(PvDatabase::new());
+    db.add_record(
+        "TEST:lstrwf",
+        Box::new(WaveformRecord::new(40, DbFieldType::Char)),
+    )
+    .await
+    .unwrap();
+    {
+        let rec = db.get_record("TEST:lstrwf").await.expect("record");
+        rec.write().await.set_info("Q:form", "String");
+    }
+    db.put_pv("TEST:lstrwf", EpicsValue::CharArray(b"hi\0".to_vec()))
+        .await
+        .expect("seed");
+
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+    provider.load_group_config(JSON).expect("load");
+    let def = provider
+        .groups()
+        .get("TEST:grpls")
+        .cloned()
+        .expect("grp registered");
+    let ch = GroupChannel::new(db.clone(), def);
+
+    let got = ch.get(&empty_request()).await.expect("get");
+    let msg = got
+        .fields
+        .iter()
+        .find(|(n, _)| n == "msg")
+        .map(|(_, v)| v)
+        .expect("msg member");
+    let value = match msg {
+        PvField::Structure(s) => s.get_field("value").cloned(),
+        other => panic!("expected an NTScalar member structure, got {other:?}"),
+    };
+    match value {
+        Some(PvField::Scalar(ScalarValue::String(s))) => assert_eq!(s, "hi"),
+        other => panic!("long-string member must serve a scalar string, got {other:?}"),
+    }
+}
+
+/// R18-26: a `+type:"plain"` long-string member's DESCRIPTOR and VALUE must
+/// be the same type.
+///
+/// pvxs builds the plain leaf from `getChannelValueType`
+/// (`addMembersForPlainType`, groupconfigprocessor.cpp:886-895), which is
+/// `TypeCode::String` for a `DBR_CHAR` array with `format()=="String"`
+/// (iocsource.cpp:634-636), and `getArrayValue` fills that same leaf by
+/// collapsing the buffer at the NUL (:132-137). The port derived the two
+/// independently: `52fe221b` taught the NT owner about long strings but the
+/// plain arm's local `match nt_type` had no `LongString` case, so it fell to
+/// `_ => Scalar(Byte)` while the read path still served `ScalarArray(bytes)` —
+/// a descriptor a client cannot decode the value against.
+#[tokio::test]
+async fn r18_26_plain_long_string_member_descriptor_matches_value() {
+    use epics_base_rs::server::records::waveform::WaveformRecord;
+    use epics_base_rs::types::DbFieldType;
+    use epics_pva_rs::pvdata::{FieldDesc, ScalarType};
+
+    const JSON: &str = r#"{
+        "TEST:grpplls": {
+            "msg": { "+channel": "TEST:plls.VAL", "+type": "plain" }
+        }
+    }"#;
+
+    let db = Arc::new(PvDatabase::new());
+    db.add_record(
+        "TEST:plls",
+        Box::new(WaveformRecord::new(40, DbFieldType::Char)),
+    )
+    .await
+    .unwrap();
+    {
+        let rec = db.get_record("TEST:plls").await.expect("record");
+        rec.write().await.set_info("Q:form", "String");
+    }
+    db.put_pv("TEST:plls", EpicsValue::CharArray(b"hi\0".to_vec()))
+        .await
+        .expect("seed");
+
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+    provider.load_group_config(JSON).expect("load");
+    let def = provider
+        .groups()
+        .get("TEST:grpplls")
+        .cloned()
+        .expect("grp registered");
+    let ch = GroupChannel::new(db.clone(), def);
+
+    // Descriptor: the bare leaf is a scalar string, not a byte scalar.
+    let desc = ch.get_field().await.expect("get_field");
+    let fields = match &desc {
+        FieldDesc::Structure { fields, .. } => fields,
+        other => panic!("group descriptor must be a structure, got {other:?}"),
+    };
+    let msg_desc = fields
+        .iter()
+        .find(|(n, _)| n == "msg")
+        .map(|(_, d)| d)
+        .expect("msg descriptor");
+    assert_eq!(
+        msg_desc,
+        &FieldDesc::Scalar(ScalarType::String),
+        "a plain long-string member's leaf is TypeCode::String"
+    );
+
+    // Value: the same type the descriptor advertises, NUL-collapsed.
+    let got = ch.get(&empty_request()).await.expect("get");
+    match find_field(&got, "msg") {
+        Some(PvField::Scalar(ScalarValue::String(s))) => assert_eq!(s, "hi"),
+        other => panic!("plain long-string member must serve a scalar string, got {other:?}"),
+    }
+}
+
+/// A `+type:"plain"` CHAR waveform WITHOUT `info(Q:form,"String")` stays a
+/// byte array on both surfaces — the tag is what selects the long-string view
+/// (pvxs `getChannelValueType` requires `format()=="String"`), so the paired
+/// leaf must not collapse every char array.
+#[tokio::test]
+async fn r18_26_plain_char_waveform_without_qform_stays_a_byte_array() {
+    use epics_base_rs::server::records::waveform::WaveformRecord;
+    use epics_base_rs::types::DbFieldType;
+    use epics_pva_rs::pvdata::{FieldDesc, ScalarType};
+
+    const JSON: &str = r#"{
+        "TEST:grpplraw": {
+            "raw": { "+channel": "TEST:plraw.VAL", "+type": "plain" }
+        }
+    }"#;
+
+    let db = Arc::new(PvDatabase::new());
+    db.add_record(
+        "TEST:plraw",
+        Box::new(WaveformRecord::new(40, DbFieldType::Char)),
+    )
+    .await
+    .unwrap();
+    db.put_pv("TEST:plraw", EpicsValue::CharArray(vec![1, 0, 3]))
+        .await
+        .expect("seed");
+
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+    provider.load_group_config(JSON).expect("load");
+    let def = provider
+        .groups()
+        .get("TEST:grpplraw")
+        .cloned()
+        .expect("grp registered");
+    let ch = GroupChannel::new(db.clone(), def);
+
+    let desc = ch.get_field().await.expect("get_field");
+    let fields = match &desc {
+        FieldDesc::Structure { fields, .. } => fields,
+        other => panic!("group descriptor must be a structure, got {other:?}"),
+    };
+    assert_eq!(
+        fields.iter().find(|(n, _)| n == "raw").map(|(_, d)| d),
+        Some(&FieldDesc::ScalarArray(ScalarType::Byte)),
+        "no Q:form tag ⟹ the plain leaf is still a byte array"
+    );
+
+    let got = ch.get(&empty_request()).await.expect("get");
+    match find_field(&got, "raw") {
+        Some(PvField::ScalarArray(a)) => assert_eq!(a.len(), 3, "the NUL is a value, not a stop"),
+        other => panic!("expected a byte array, got {other:?}"),
+    }
+}
+
+/// Build the NTScalar wrapper a real client sends for a `+type:"scalar"`
+/// member — the group type advertises the wrapper, so a PUT carries
+/// `member.value`, never a bare leaf (pvxs `IOCSource::put` reads
+/// `node["value"]`, iocsource.cpp:590-593).
+fn nt_scalar_put(value: PvField) -> PvField {
+    let mut st = PvStructure::new("epics:nt/NTScalar:1.0");
+    st.fields.push(("value".into(), value));
+    PvField::Structure(st)
+}
+
+/// The NTEnum wrapper: the writable leaf is `value.index`
+/// (`IOCSource::put`: `if(value.type()==TypeCode::Struct) value = value["index"]`).
+fn nt_enum_put(index: i32) -> PvField {
+    let mut inner = PvStructure::new("enum_t");
+    inner
+        .fields
+        .push(("index".into(), PvField::Scalar(ScalarValue::Int(index))));
+    let mut st = PvStructure::new("epics:nt/NTEnum:1.0");
+    st.fields.push(("value".into(), PvField::Structure(inner)));
+    PvField::Structure(st)
+}
+
+/// R17-35: a `+type:"scalar"` member is advertised as an NTScalar/NTEnum
+/// STRUCTURE, so the client PUTs that wrapper. `convert_member_value` must
+/// de-reference the wrapper's `value` leaf (and, for NTEnum, `value.index`)
+/// exactly as pvxs `IOCSource::put` does before converting to the backing
+/// DBF (iocsource.cpp:576-598). Pre-fix the wrapper itself reached
+/// `pv_field_to_epics`, which cannot convert a Structure — so EVERY
+/// scalar-mapped member PUT was rejected with "value is not convertible to
+/// backing field", numeric and string alike.
+///
+/// Both group paths (atomic and non-atomic) go through the same converter;
+/// run the case on both so neither can regress alone.
+#[tokio::test]
+async fn r17_35_group_scalar_member_put_derefs_the_nt_wrapper() {
+    use epics_base_rs::server::records::ao::AoRecord;
+    use epics_base_rs::server::records::mbbo::MbboRecord;
+    use epics_base_rs::server::records::stringout::StringoutRecord;
+
+    for atomic in [true, false] {
+        let json = format!(
+            r#"{{
+                "TEST:grpsc": {{
+                    "+atomic": {atomic},
+                    "num": {{ "+channel": "TEST:sc_ao.VAL",  "+type": "scalar", "+putorder": 0 }},
+                    "txt": {{ "+channel": "TEST:sc_so.VAL",  "+type": "scalar", "+putorder": 1 }},
+                    "sel": {{ "+channel": "TEST:sc_mb.VAL",  "+type": "scalar", "+putorder": 2 }}
+                }}
+            }}"#
+        );
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("TEST:sc_ao", Box::new(AoRecord::new(0.0)))
+            .await
+            .unwrap();
+        db.add_record("TEST:sc_so", Box::new(StringoutRecord::new("")))
+            .await
+            .unwrap();
+        // The state table is what MAKES this an enum member: C's `cvt_dbaddr`
+        // (mbboRecord.c:300-312) degenerates a stateless mbbo's VAL to
+        // DBF_USHORT, and pvxs would then advertise it as an NTScalar long, not
+        // an NTEnum — there would be no `value.index` to deref. Two states, so
+        // the member under test is the one the test is named for.
+        let mut mb = MbboRecord::new(0);
+        mb.zrst = "zero".into();
+        mb.onst = "one".into();
+        db.add_record("TEST:sc_mb", Box::new(mb)).await.unwrap();
+
+        let provider = Arc::new(BridgeProvider::new(db.clone()));
+        provider.load_group_config(&json).expect("load");
+        let def = provider
+            .groups()
+            .get("TEST:grpsc")
+            .cloned()
+            .expect("grp registered");
+        let ch = GroupChannel::new(db.clone(), def);
+
+        let mut put = PvStructure::new("structure");
+        put.fields.push((
+            "num".into(),
+            nt_scalar_put(PvField::Scalar(ScalarValue::Double(2.5))),
+        ));
+        put.fields.push((
+            "txt".into(),
+            nt_scalar_put(PvField::Scalar(ScalarValue::String("hello".into()))),
+        ));
+        put.fields.push(("sel".into(), nt_enum_put(1)));
+        ch.put(&put)
+            .await
+            .unwrap_or_else(|e| panic!("atomic={atomic}: scalar-member PUT rejected: {e}"));
+
+        assert_eq!(
+            db.get_pv("TEST:sc_ao.VAL").await.unwrap(),
+            EpicsValue::Double(2.5),
+            "atomic={atomic}: numeric scalar member must write the value leaf"
+        );
+        assert_eq!(
+            db.get_pv("TEST:sc_so.VAL").await.unwrap(),
+            EpicsValue::String("hello".into()),
+            "atomic={atomic}: string scalar member must write the value leaf"
+        );
+        assert_eq!(
+            db.get_pv("TEST:sc_mb.VAL").await.unwrap(),
+            EpicsValue::Enum(1),
+            "atomic={atomic}: enum scalar member must write value.index"
+        );
+    }
+}
+
+/// R17-35, `+type:"plain"` arm: a plain member's node IS the leaf (pvxs
+/// `IOCSource::put`: `case Plain: value = node;`), so the de-reference
+/// above must NOT be applied to it. Guards the fix against over-unwrapping
+/// — a bare scalar for a plain member still writes.
+#[tokio::test]
+async fn r17_35_plain_member_put_is_not_unwrapped() {
+    let db = make_db().await;
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+    provider.load_group_config(GROUP_JSON).expect("load");
+    let def = provider.groups().get("TEST:grp").cloned().expect("grp");
+    let ch = GroupChannel::new(db.clone(), def);
+
+    let mut put = PvStructure::new("structure");
+    put.fields
+        .push(("level".into(), PvField::Scalar(ScalarValue::Double(7.5))));
+    ch.put(&put).await.expect("plain member PUT");
+
+    assert_eq!(
+        db.get_pv("TEST:level.VAL").await.unwrap(),
+        EpicsValue::Double(7.5)
+    );
+}
+
+/// R17-35 + R17-31 (group PUT half): with the wrapper de-referenced, a
+/// string PUT to a `Q:form,"String"` `DBF_CHAR` waveform member reaches the
+/// long-string path — pvxs `putLongString`: `dbPut(DBR_CHAR, str,
+/// strlen+1)` (iocsource.cpp:601-606), i.e. the NUL-terminated char image,
+/// not a parse of the string as one integer. This case was unreachable
+/// while every scalar-member PUT was rejected, which is why R17-31 could
+/// only cover the group GET.
+#[tokio::test]
+async fn r17_35_group_long_string_member_put_writes_char_image() {
+    use epics_base_rs::server::records::waveform::WaveformRecord;
+    use epics_base_rs::types::DbFieldType;
+
+    const JSON: &str = r#"{
+        "TEST:grpls": {
+            "msg": { "+channel": "TEST:lstrwf.VAL", "+type": "scalar", "+putorder": 0 }
+        }
+    }"#;
+
+    let db = Arc::new(PvDatabase::new());
+    db.add_record(
+        "TEST:lstrwf",
+        Box::new(WaveformRecord::new(40, DbFieldType::Char)),
+    )
+    .await
+    .unwrap();
+    {
+        let rec = db.get_record("TEST:lstrwf").await.expect("record");
+        rec.write().await.set_info("Q:form", "String");
+    }
+
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+    provider.load_group_config(JSON).expect("load");
+    let def = provider.groups().get("TEST:grpls").cloned().expect("grp");
+    let ch = GroupChannel::new(db.clone(), def);
+
+    let mut put = PvStructure::new("structure");
+    put.fields.push((
+        "msg".into(),
+        nt_scalar_put(PvField::Scalar(ScalarValue::String("hello".into()))),
+    ));
+    ch.put(&put).await.expect("long-string member PUT");
+
+    assert_eq!(
+        db.get_pv("TEST:lstrwf.VAL").await.unwrap(),
+        EpicsValue::CharArray(b"hello\0".to_vec()),
+        "long-string member PUT must write the NUL-terminated char image"
+    );
+
+    // …and the member reads back through the same long-string view.
+    let got = ch.get(&empty_request()).await.expect("get");
+    let msg = got
+        .fields
+        .iter()
+        .find(|(n, _)| n == "msg")
+        .map(|(_, v)| v)
+        .expect("msg member");
+    match msg {
+        PvField::Structure(s) => match s.get_field("value") {
+            Some(PvField::Scalar(ScalarValue::String(s))) => assert_eq!(s, "hello"),
+            other => panic!("expected a scalar string, got {other:?}"),
+        },
+        other => panic!("expected an NTScalar member structure, got {other:?}"),
     }
 }

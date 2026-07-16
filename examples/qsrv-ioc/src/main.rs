@@ -42,15 +42,15 @@ use epics_pva_rs::server_native::ChannelSource;
 async fn main() -> CaResult<()> {
     let args: Vec<String> = std::env::args().collect();
 
-    let ca_port: u16 = std::env::var("EPICS_CA_SERVER_PORT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(5064);
+    // C `envGetInetPortConfigParam` semantics (5000 floor, sscanf leniency,
+    // diagnostics) — a strict `parse()` here diverged from a C IOC.
+    let ca_port: u16 = epics_base_rs::runtime::net::cas_server_port();
 
-    let pva_port: u16 = std::env::var("EPICS_PVA_SERVER_PORT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(5075);
+    // pvxs `PickOne` semantics (config.cpp:402-408): the server-specific
+    // `EPICS_PVAS_SERVER_PORT` wins over the shared `EPICS_PVA_SERVER_PORT`,
+    // and `0` means "bind an ephemeral port". Not the CA rule above — pvxs has
+    // no 5000 floor and no out-of-range diagnostic.
+    let pva_port: u16 = epics_pva_rs::config::env::pvas_server_port();
 
     epics_base_rs::runtime::env::set_default("QSRV_IOC", env!("CARGO_MANIFEST_DIR"));
 

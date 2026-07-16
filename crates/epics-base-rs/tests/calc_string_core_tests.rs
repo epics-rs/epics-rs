@@ -1,6 +1,6 @@
 #![allow(clippy::approx_constant)]
 
-use epics_base_rs::calc::{CalcError, StackValue, StringInputs, scalc, scalc_compile, scalc_eval};
+use epics_base_rs::calc::{StackValue, StringInputs, scalc, scalc_compile, scalc_eval};
 
 fn eval_str(expr: &str) -> StackValue {
     let mut inputs = StringInputs::new();
@@ -23,19 +23,32 @@ fn test_string_literal_single_quote() {
     assert_eq!(eval_str("'world'"), StackValue::Str("world".into()));
 }
 
+// R13-3 — a string literal is RAW BYTES. C's `LITERAL_STRING`
+// (`sCalcPostfix.c:803-812`) is `while (*psrc != c && *psrc) *pout++ = *psrc++;`
+// — a byte-for-byte copy that interprets no backslash at all. `$T` / `TR_ESC` is
+// the only translator, which is why sCalc has that operator.
+//
+// These three used to assert the opposite (that the lexer translates), which is
+// the defect: it made `$T` a double translation and changed the bytes on every
+// path that does not translate.
+
 #[test]
-fn test_string_literal_escape_newline() {
-    assert_eq!(eval_str(r#""a\nb""#), StackValue::Str("a\nb".into()));
+fn test_string_literal_keeps_backslash_n_raw() {
+    // Compiled C: `LEN("a\nb")` = 4 — the bytes are `a`, `\`, `n`, `b`.
+    assert_eq!(eval_str(r#""a\nb""#), StackValue::Str("a\\nb".into()));
 }
 
 #[test]
-fn test_string_literal_escape_tab() {
-    assert_eq!(eval_str(r#""a\tb""#), StackValue::Str("a\tb".into()));
+fn test_string_literal_keeps_backslash_t_raw() {
+    // Compiled C: `BYTE("\t")` = 92, the backslash — not 9, a TAB.
+    assert_eq!(eval_str(r#""a\tb""#), StackValue::Str("a\\tb".into()));
 }
 
 #[test]
-fn test_string_literal_escape_backslash() {
-    assert_eq!(eval_str(r#""a\\b""#), StackValue::Str("a\\b".into()));
+fn test_string_literal_keeps_both_backslashes_raw() {
+    // Compiled C: `LEN("\\\\")` = 4. The lexer collapses nothing; `$T` is what
+    // turns `\\` into one backslash.
+    assert_eq!(eval_str(r#""a\\b""#), StackValue::Str("a\\\\b".into()));
 }
 
 #[test]
@@ -56,7 +69,9 @@ fn test_string_var_push() {
 #[test]
 fn test_string_var_store() {
     let mut inputs = StringInputs::new();
-    let compiled = scalc_compile(r#"AA:="test""#).unwrap();
+    // R10-9: bare `AA:="test"` is CALC_ERR_INCOMPLETE in sCalcPostfix — a store
+    // leaves nothing on the stack, and the program must end with exactly one value.
+    let compiled = scalc_compile(r#"AA:="test";AA"#).unwrap();
     scalc_eval(&compiled, &mut inputs).unwrap();
     assert_eq!(inputs.str_vars[0], "test");
 }
@@ -143,39 +158,57 @@ fn test_string_ge() {
     assert_eq!(eval_str(r#""abc" >= "abc""#), StackValue::Double(1.0));
 }
 
-// --- TypeMismatch tests ---
+// --- Mixed string/double operands ---
+//
+// These three cases asserted TypeMismatch. C raises no such error: a numeric
+// position COERCES a string with atof (`toDouble`, sCalcPerform.c:80-83), and a
+// binary operator with a string branch takes it only when BOTH sides are
+// strings. Compiled sCalcPerform answers each of them, so the assertions now
+// carry C's value instead of an error the C engine cannot produce.
+// tests/calc_string_coercion.rs covers the rule in full.
 
 #[test]
-fn test_type_mismatch_add() {
+fn a_string_plus_a_double_coerces_the_string() {
     let mut inputs = StringInputs::new();
-    let result = scalc(r#""abc" + 1"#, &mut inputs);
-    assert!(matches!(result, Err(CalcError::TypeMismatch)));
+    // atof("abc") is 0, so this is 0 + 1.
+    assert_eq!(
+        scalc(r#""abc" + 1"#, &mut inputs).unwrap(),
+        StackValue::Double(1.0)
+    );
 }
 
 #[test]
-fn test_type_mismatch_add_reverse() {
+fn a_double_plus_a_string_coerces_the_string() {
     let mut inputs = StringInputs::new();
-    let result = scalc(r#"3 + "12""#, &mut inputs);
-    assert!(matches!(result, Err(CalcError::TypeMismatch)));
+    assert_eq!(
+        scalc(r#"3 + "12""#, &mut inputs).unwrap(),
+        StackValue::Double(15.0)
+    );
 }
 
 #[test]
-fn test_type_mismatch_compare() {
+fn a_mixed_comparison_compares_numerically() {
     let mut inputs = StringInputs::new();
-    let result = scalc(r#""3" < 20"#, &mut inputs);
-    assert!(matches!(result, Err(CalcError::TypeMismatch)));
+    assert_eq!(
+        scalc(r#""3" < 20"#, &mut inputs).unwrap(),
+        StackValue::Double(1.0)
+    );
 }
 
 // --- STR/DBL conversion ---
 
+// C `to_string` is `cvtDoubleToString(d, s, 8)` — a FIXED-POINT rendering with 8
+// fractional digits, not a shortest-round-trip one (R11-1). See
+// `tests/scalc_double_to_string.rs` for the compiled-C table.
+
 #[test]
 fn test_str_function() {
-    assert_eq!(eval_str("STR(3.14)"), StackValue::Str("3.14".into()));
+    assert_eq!(eval_str("STR(3.14)"), StackValue::Str("3.14000000".into()));
 }
 
 #[test]
 fn test_str_integer() {
-    assert_eq!(eval_str("STR(42)"), StackValue::Str("42".into()));
+    assert_eq!(eval_str("STR(42)"), StackValue::Str("42.00000000".into()));
 }
 
 #[test]

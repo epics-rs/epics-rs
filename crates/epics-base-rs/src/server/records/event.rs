@@ -1,6 +1,6 @@
-use epics_macros_rs::EpicsRecord;
-
-use crate::server::record::MENU_YES_NO;
+use crate::error::{CaError, CaResult};
+use crate::server::record::{MENU_YES_NO, Record};
+use crate::types::{EpicsValue, PvString};
 
 /// `event` record — software-event source.
 ///
@@ -14,23 +14,32 @@ use crate::server::record::MENU_YES_NO;
 /// The framework (`processing.rs`) reads `VAL` after `process()` and
 /// routes the event through [`PvDatabase::post_event_named`] — the
 /// record stays a pure state machine with no direct DB access.
-#[derive(EpicsRecord)]
-#[record(type = "event")]
+///
+/// Manually implements [`Record`] rather than using `#[derive(EpicsRecord)]`
+/// so it can declare [`Record::fields_posted_with_monitor_mask`] — the derive
+/// emits only the four mandatory methods (the same reason `longout` is hand
+/// written).
 pub struct EventRecord {
     /// Event name to post. DBF_STRING in C (was a numeric subscript
     /// pre-EPICS-7; a numeric string still works for back-compat).
-    #[field(type = "String")]
     pub val: String,
-    // SIMM is `DBF_MENU menu(menuYesNo)` (eventRecord.dbd.pod:152-156):
-    // the two-choice NO/YES simulation menu, served as DBR_ENUM.
-    #[field(type = "Short", menu_choices = MENU_YES_NO)]
+    /// SIMM is `DBF_MENU menu(menuYesNo)` (eventRecord.dbd.pod:152-156):
+    /// the two-choice NO/YES simulation menu, served as DBR_ENUM.
     pub simm: i16,
-    #[field(type = "String")]
     pub siml: String,
-    #[field(type = "String")]
     pub siol: String,
-    #[field(type = "Short")]
+    /// SVAL is `DBF_STRING` (eventRecord.dbd.pod:143-145) — the BUFFER C's
+    /// `readValue` reads SIOL into (`dbGetLink(&prec->siol, DBR_STRING,
+    /// &prec->sval)`, eventRecord.c:185) before publishing `val = sval`.
+    pub sval: PvString,
     pub sims: i16,
+    /// SDLY — "Sim. Mode Async Delay" (`DBF_DOUBLE`, `initial("-1.0")`,
+    /// eventRecord.dbd.pod:171-177). A non-negative SDLY makes the simulated
+    /// SIOL read asynchronous: C's `readValue` arms
+    /// `callbackRequestProcessCallbackDelayed(..., prec->sdly)` and holds PACT
+    /// across the delay (eventRecord.c:184-201). The framework reads the delay
+    /// via `get_field("SDLY")`, so the field must exist for a `.db` to set it.
+    pub sdly: f64,
 }
 
 impl Default for EventRecord {
@@ -40,7 +49,11 @@ impl Default for EventRecord {
             simm: 0,
             siml: String::new(),
             siol: String::new(),
+            sval: PvString::new(),
             sims: 0,
+            // C `field(SDLY,DBF_DOUBLE) { initial("-1.0") }` — negative means
+            // "synchronous simulation".
+            sdly: -1.0,
         }
     }
 }
@@ -55,16 +68,126 @@ impl EventRecord {
     }
 }
 
+fn put_string(slot: &mut String, value: EpicsValue, field: &str) -> CaResult<()> {
+    match value {
+        EpicsValue::String(v) => {
+            *slot = v.as_str_lossy().into_owned();
+            Ok(())
+        }
+        _ => Err(CaError::TypeMismatch(field.to_string())),
+    }
+}
+
+fn put_short(slot: &mut i16, value: EpicsValue, field: &str) -> CaResult<()> {
+    match value {
+        EpicsValue::Short(v) => {
+            *slot = v;
+            Ok(())
+        }
+        _ => Err(CaError::TypeMismatch(field.to_string())),
+    }
+}
+
+fn put_double(slot: &mut f64, value: EpicsValue, field: &str) -> CaResult<()> {
+    match value {
+        EpicsValue::Double(v) => {
+            *slot = v;
+            Ok(())
+        }
+        _ => Err(CaError::TypeMismatch(field.to_string())),
+    }
+}
+
+impl Record for EventRecord {
+    fn record_type(&self) -> &'static str {
+        "event"
+    }
+
+    /// C `eventRecord.c::process` never clears UDF: the record's one
+    /// `prec->udf = FALSE` is inside `readValue`'s simulated SIOL branch
+    /// (`:191`), which the framework's simulation tail already reproduces. A
+    /// plain event record therefore keeps the UDF it was loaded with — softIoc:
+    /// `record(event,"E2"){}` processes to UDF=1, while `field(VAL,"1")` in the
+    /// `.db` defines it at load (UDF=0).
+    fn clears_udf(&self) -> bool {
+        false
+    }
+
+    /// `eventRecord.c` has NO `checkAlarms` either — an event record with UDF=1
+    /// publishes NO_ALARM (softIoc: `record(event,"E2"){}` → UDF 1, SEVR
+    /// NO_ALARM, even with the default `UDFS = INVALID`).
+    fn raises_udf_alarm(&self) -> bool {
+        false
+    }
+
+    /// C `eventRecord.c::monitor` (157-165) is the whole of the record's
+    /// posting:
+    ///
+    /// ```c
+    /// monitor_mask = recGblResetAlarms(prec);
+    /// db_post_events(prec,&prec->val,monitor_mask|DBE_VALUE);
+    /// ```
+    ///
+    /// `monitor_mask` is `recGblResetAlarms`'s return — the alarm bits alone —
+    /// so VAL's post carries `DBE_VALUE` (plus `DBE_ALARM` on a cycle whose
+    /// alarm moved) and NEVER `DBE_LOG`. event has no MDEL/ADEL, and the post
+    /// is not guarded by `if (monitor_mask)`, so it fires on every process
+    /// whether or not the event name changed.
+    ///
+    /// The port's generic path gave VAL the framework default
+    /// `DBE_VALUE | DBE_LOG`, so a `DBE_LOG`-only archiver was sent the event
+    /// name on every process — updates C sends it on no cycle at all. Naming
+    /// VAL here routes it through the LOG-stripping arm of
+    /// `RecordInstance::deadband_post`, the single owner of that mask.
+    fn fields_posted_with_monitor_mask(&self) -> &'static [&'static str] {
+        &["VAL"]
+    }
+
+    /// `SIMM` is `menu(menuYesNo)`, served as DBR_ENUM with the NO/YES labels.
+    fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
+        match field {
+            "SIMM" => Some(MENU_YES_NO),
+            _ => None,
+        }
+    }
+
+    fn get_field(&self, name: &str) -> Option<EpicsValue> {
+        match name {
+            "VAL" => Some(EpicsValue::String(self.val.clone().into())),
+            "SIMM" => Some(EpicsValue::Short(self.simm)),
+            "SIML" => Some(EpicsValue::String(self.siml.clone().into())),
+            "SIOL" => Some(EpicsValue::String(self.siol.clone().into())),
+            "SIMS" => Some(EpicsValue::Short(self.sims)),
+            "SDLY" => Some(EpicsValue::Double(self.sdly)),
+            _ => None,
+        }
+    }
+
+    /// Same per-variant strictness the derive emits: a put of the wrong
+    /// `EpicsValue` variant is a `TypeMismatch`, not a silent no-op.
+    fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
+        self.validate_put(name, &value)?;
+        match name {
+            "VAL" => put_string(&mut self.val, value, name)?,
+            "SIML" => put_string(&mut self.siml, value, name)?,
+            "SIOL" => put_string(&mut self.siol, value, name)?,
+            "SIMM" => put_short(&mut self.simm, value, name)?,
+            "SIMS" => put_short(&mut self.sims, value, name)?,
+            "SDLY" => put_double(&mut self.sdly, value, name)?,
+            _ => return Err(CaError::FieldNotFound(name.to_string())),
+        }
+        self.on_put(name);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::record::{Record, RecordInstance};
-    use crate::types::EpicsValue;
+    use crate::server::record::RecordInstance;
 
-    /// SIMM is `menu(menuYesNo)` served as DBR_ENUM. The derive macro must
-    /// wire the `menu_choices = MENU_YES_NO` attribute into
-    /// `menu_field_choices`, and the base snapshot path then promotes the
-    /// stored Short to `Enum` and attaches the NO/YES labels.
+    /// SIMM is `menu(menuYesNo)` served as DBR_ENUM. The base snapshot path
+    /// promotes the stored Short to `Enum` and attaches the NO/YES labels.
     #[test]
     fn simm_snapshot_is_enum_with_yesno_labels() {
         let mut rec = EventRecord::default();

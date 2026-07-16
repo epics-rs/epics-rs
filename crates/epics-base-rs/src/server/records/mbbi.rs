@@ -1,6 +1,6 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, MENU_SIMM, ProcessOutcome, Record};
-use crate::types::{DbFieldType, EpicsValue, PvString};
+use crate::server::record::{MENU_SIMM, ProcessOutcome, RawSoftEntry, Record};
+use crate::types::{EpicsValue, PvString};
 
 /// Multi-bit binary input record — manual Record impl for raw↔index conversion.
 pub struct MbbiRecord {
@@ -13,7 +13,6 @@ pub struct MbbiRecord {
     pub mask: u32,
     // SHFT/NOBT/MLST/LALM are DBF_USHORT (mbbiRecord.dbd.pod:633,133,618,623).
     pub shft: u16,
-    pub sdef: bool,
     pub nobt: u16,
     pub mlst: u16,
     pub lalm: u16,
@@ -76,6 +75,10 @@ pub struct MbbiRecord {
     pub simm: i16,
     pub siml: String,
     pub siol: String,
+    // SVAL is `DBF_ULONG` (mbbiRecord.dbd.pod:299-301) — the BUFFER C's
+    // `readValue` reads SIOL into (`dbGetLink(&prec->siol, DBR_ULONG,
+    // &prec->sval)`, mbbiRecord.c:390) before publishing `val = sval`.
+    pub sval: u32,
     pub sims: i16,
     pub sdly: f64,
     skip_convert: bool,
@@ -94,7 +97,6 @@ impl Default for MbbiRecord {
             oraw: 0,
             mask: 0,
             shft: 0,
-            sdef: false,
             nobt: 0,
             mlst: 0,
             lalm: 0,
@@ -153,6 +155,7 @@ impl Default for MbbiRecord {
             simm: 0,
             siml: String::new(),
             siol: String::new(),
+            sval: 0,
             sims: 0,
             sdly: -1.0,
             skip_convert: false,
@@ -176,24 +179,30 @@ impl MbbiRecord {
         ]
     }
 
-    fn compute_sdef(&mut self) {
+    /// C `mbbiRecord.c::init_common` (93-105) — "check if any states are
+    /// defined": TRUE as soon as one of ZRVL..FFVL is non-zero or one of
+    /// ZRST..FFST is non-empty.
+    ///
+    /// DERIVED, never stored — the same call `MbboRecord::sdef` makes, and for
+    /// the same reason. C keeps `prec->sdef` as a struct member and recomputes it
+    /// from `init_common`: at init, and from `special()` after every write to any
+    /// of the 32 state fields. A cached copy of a pure function of 32 other
+    /// fields can go stale, and a `special()` that forgets one field is exactly
+    /// how it does. Computing it on demand makes the stale state unreachable
+    /// rather than merely unlikely, and leaves one definition of "are states
+    /// defined" for both records instead of two that can drift.
+    fn sdef(&self) -> bool {
         let rvs = self.raw_values();
         let sts: [&PvString; 16] = [
             &self.zrst, &self.onst, &self.twst, &self.thst, &self.frst, &self.fvst, &self.sxst,
             &self.svst, &self.eist, &self.nist, &self.test, &self.elst, &self.tvst, &self.ttst,
             &self.ftst, &self.ffst,
         ];
-        self.sdef = false;
-        for i in 0..16 {
-            if rvs[i] != 0 || !sts[i].is_empty() {
-                self.sdef = true;
-                return;
-            }
-        }
+        (0..16).any(|i| rvs[i] != 0 || !sts[i].is_empty())
     }
 
     fn raw_to_val(&self, raw: u32) -> u16 {
-        if !self.sdef {
+        if !self.sdef() {
             return raw as u16;
         }
         let rvs = self.raw_values();
@@ -205,6 +214,27 @@ impl MbbiRecord {
         65535
     }
 
+    /// The mask `devMbbiSoftRaw::read_mbbi` ANDs the raw word with.
+    ///
+    /// C builds it in the dset's `init_record` (`devMbbiSoftRaw.c:44-49`):
+    /// `if (prec->nobt == 0) prec->mask = 0xffffffff;` — which OVERRIDES an
+    /// explicitly configured MASK — `prec->mask <<= prec->shft;`. The record's
+    /// own `init_record` has already set `mask = (1 << nobt) - 1` when MASK was
+    /// left at 0 (`mbbiRecord.c:154-155`).
+    ///
+    /// C stores the shifted mask back into the MASK *field*; the port applies
+    /// the shift here instead and leaves MASK as the record declared it, because
+    /// the record's `process()` reads MASK on the (shared) device-readback path
+    /// where it must stay unshifted.
+    fn raw_soft_mask(&self) -> u32 {
+        let base = if self.nobt == 0 {
+            0xffff_ffff
+        } else {
+            self.mask
+        };
+        base.checked_shl(u32::from(self.shft)).unwrap_or(0)
+    }
+
     /// Per-state severity fields ZRSV..FFSV indexed by state 0..15.
     fn state_severities(&self) -> [i16; 16] {
         [
@@ -212,355 +242,6 @@ impl MbbiRecord {
             self.eisv, self.nisv, self.tesv, self.elsv, self.tvsv, self.ttsv, self.ftsv, self.ffsv,
         ]
     }
-}
-
-static MBBI_FIELDS: &[FieldDesc] = &[
-    FieldDesc {
-        name: "VAL",
-        dbf_type: DbFieldType::Enum,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "RVAL",
-        dbf_type: DbFieldType::ULong,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ORAW",
-        dbf_type: DbFieldType::ULong,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "MASK",
-        dbf_type: DbFieldType::ULong,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SHFT",
-        dbf_type: DbFieldType::UShort,
-        read_only: false,
-    },
-    // Simulation-mode fields. `mbbiRecord.c:125-126` declares SIML/SIOL
-    // and `mbbiRecord.c:379-396` reads SIOL when SIMM != NO. These were
-    // missing from the field table / get_field / put_field, so the
-    // database simulation path (`check_simulation_mode`) could never
-    // observe SIMM on an mbbi.
-    FieldDesc {
-        name: "SIMM",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIML",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIOL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIMS",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SDLY",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "MLST",
-        dbf_type: DbFieldType::UShort,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "LALM",
-        dbf_type: DbFieldType::UShort,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "NOBT",
-        dbf_type: DbFieldType::UShort,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ZRSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ONSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "TWSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "THSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "FRSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "FVSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SXSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SVSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "EISV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "NISV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "TESV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ELSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "TVSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "TTSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "FTSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "FFSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "UNSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "COSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "AFTC",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "AFVL",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "ZRVL",
-        dbf_type: DbFieldType::ULong,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ONVL",
-        dbf_type: DbFieldType::ULong,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "TWVL",
-        dbf_type: DbFieldType::ULong,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "THVL",
-        dbf_type: DbFieldType::ULong,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "FRVL",
-        dbf_type: DbFieldType::ULong,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "FVVL",
-        dbf_type: DbFieldType::ULong,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SXVL",
-        dbf_type: DbFieldType::ULong,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SVVL",
-        dbf_type: DbFieldType::ULong,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "EIVL",
-        dbf_type: DbFieldType::ULong,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "NIVL",
-        dbf_type: DbFieldType::ULong,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "TEVL",
-        dbf_type: DbFieldType::ULong,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ELVL",
-        dbf_type: DbFieldType::ULong,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "TVVL",
-        dbf_type: DbFieldType::ULong,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "TTVL",
-        dbf_type: DbFieldType::ULong,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "FTVL",
-        dbf_type: DbFieldType::ULong,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "FFVL",
-        dbf_type: DbFieldType::ULong,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ZRST",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ONST",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "TWST",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "THST",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "FRST",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "FVST",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SXST",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SVST",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "EIST",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "NIST",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "TEST",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ELST",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "TVST",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "TTST",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "FTST",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "FFST",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-];
-
-/// True for the mbbi/mbbo state-table fields whose modification must
-/// trigger an `sdef` recompute — the 16 state values (ZRVL..FFVL) and
-/// the 16 state strings (ZRST..FFST). Shared by `mbbi` and `mbbo`
-/// `special()` (C `mbbiRecord.c`/`mbboRecord.c` `init_common`).
-pub(crate) fn is_state_table_field(field: &str) -> bool {
-    const VL: [&str; 16] = [
-        "ZRVL", "ONVL", "TWVL", "THVL", "FRVL", "FVVL", "SXVL", "SVVL", "EIVL", "NIVL", "TEVL",
-        "ELVL", "TVVL", "TTVL", "FTVL", "FFVL",
-    ];
-    const ST: [&str; 16] = [
-        "ZRST", "ONST", "TWST", "THST", "FRST", "FVST", "SXST", "SVST", "EIST", "NIST", "TEST",
-        "ELST", "TVST", "TTST", "FTST", "FFST",
-    ];
-    VL.contains(&field) || ST.contains(&field)
 }
 
 /// Helper macro: maps EPICS field name strings to struct fields.
@@ -583,7 +264,14 @@ macro_rules! mbb_get_field {
     };
     ($self:expr, $name:expr, $( $str:literal => $field:ident : $variant:ident ),* $(,)?) => {
         match $name {
+            // C `mbbiRecord.c:53` is `#define cvt_dbaddr NULL` — unlike mbbo,
+            // mbbi never re-types VAL, so it is DBF_ENUM with or without a
+            // state table.
             "VAL" => Some(EpicsValue::Enum($self.val)),
+            // `field(SDEF,DBF_SHORT) { special(SPC_NOMOD) }`
+            // (mbbiRecord.dbd.pod:628) — readable over CA, never writable.
+            // Derived, so it cannot disagree with the state table it reports on.
+            "SDEF" => Some(EpicsValue::Short($self.sdef() as i16)),
             $( $str => mbb_get_field!(@get $self, $field, $variant), )*
             _ => None,
         }
@@ -647,6 +335,15 @@ macro_rules! mbb_put_field {
                     EpicsValue::Enum(v) => { $self.val = v; }
                     EpicsValue::Long(v) => { $self.val = v as u16; }
                     EpicsValue::Short(v) => { $self.val = v as u16; }
+                    // C rset `put_enum_str` — the one string→state converter.
+                    EpicsValue::String(ref s) => {
+                        let resolved = crate::server::record::resolve_enum_state_string(
+                            "VAL",
+                            $self.enum_state_strings().as_deref(),
+                            s,
+                        )?;
+                        if let EpicsValue::Enum(v) = resolved { $self.val = v; }
+                    }
                     _ => return Err(CaError::TypeMismatch("VAL".into())),
                 }
             }
@@ -660,9 +357,6 @@ impl Record for MbbiRecord {
     fn record_type(&self) -> &'static str {
         "mbbi"
     }
-    fn field_list(&self) -> &'static [FieldDesc] {
-        MBBI_FIELDS
-    }
 
     /// `SIMM` is `DBF_MENU menu(menuSimm)` (`mbbiRecord.dbd.pod`): the
     /// multibit records carry the three-choice NO/YES/RAW simulation menu.
@@ -673,6 +367,47 @@ impl Record for MbbiRecord {
             "SIMM" => Some(MENU_SIMM),
             _ => None,
         }
+    }
+
+    /// C `devMbbiSoftRaw` — `recGblInitConstantLink(&prec->inp, DBF_ULONG,
+    /// &prec->rval)` at init (`devMbbiSoftRaw.c:42`, unmasked), and per read
+    /// `dbGetLink(pinp, DBR_LONG, &prec->rval, 0, 0)` followed by
+    /// `prec->rval &= prec->mask` (`:78-79`, UNCONDITIONAL — unlike `bi`, whose
+    /// dset masks only when MASK is non-zero). `read_mbbi` returns 0, so the
+    /// record's `RVAL >> SHFT` → state-index convert then runs.
+    fn raw_soft_input(&mut self, entry: RawSoftEntry, value: EpicsValue) -> Option<CaResult<()>> {
+        self.rval = match super::raw_soft_rval_u32("mbbi", &value) {
+            Ok(rval) => rval,
+            Err(e) => return Some(Err(e)),
+        };
+        if entry == RawSoftEntry::Read {
+            self.rval &= self.raw_soft_mask();
+        }
+        Some(Ok(()))
+    }
+
+    /// C rset `get_enum_strs`/`put_enum_str` (mbbiRecord.c:251-291) — ZRST..FFST
+    /// cut at the last non-empty state.
+    fn enum_state_strings(&self) -> Option<Vec<PvString>> {
+        Some(crate::server::record::multibit_enum_states([
+            &self.zrst, &self.onst, &self.twst, &self.thst, &self.frst, &self.fvst, &self.sxst,
+            &self.svst, &self.eist, &self.nist, &self.test, &self.elst, &self.tvst, &self.ttst,
+            &self.ftst, &self.ffst,
+        ]))
+    }
+
+    /// C `get_enum_str` (mbbiRecord.c:235-255): any `val <= 15` reads its state slot,
+    /// defined or not, so an unset state renders EMPTY; past 15 it is
+    /// `"Illegal Value"`. `enum_state_strings` above stops at the last
+    /// non-empty state because `no_str` says how many labels are meaningful —
+    /// that trim must never reach this read, or an undefined state comes back
+    /// as its index, which no C IOC emits.
+    fn enum_string_form(&self) -> Option<crate::server::snapshot::EnumStringForm> {
+        Some(crate::server::record::multibit_enum_string_form([
+            &self.zrst, &self.onst, &self.twst, &self.thst, &self.frst, &self.fvst, &self.sxst,
+            &self.svst, &self.eist, &self.nist, &self.test, &self.elst, &self.tvst, &self.ttst,
+            &self.ftst, &self.ffst,
+        ]))
     }
 
     /// VAL posts DBE_VALUE|DBE_LOG
@@ -692,7 +427,6 @@ impl Record for MbbiRecord {
             if self.mask == 0 && self.nobt > 0 && self.nobt <= 32 {
                 self.mask = ((1i64 << self.nobt) - 1) as u32;
             }
-            self.compute_sdef();
             self.mlst = self.val;
             self.lalm = self.val;
             self.oraw = self.rval;
@@ -797,8 +531,12 @@ impl Record for MbbiRecord {
         use crate::server::recgbl::{self, alarm_status};
         use crate::server::record::AlarmSeverity;
 
-        if common.udf {
-            recgbl::rec_gbl_set_sevr(common, alarm_status::UDF_ALARM, common.udfs);
+        if common.udf != 0 {
+            recgbl::rec_gbl_set_sevr(
+                common,
+                alarm_status::UDF_ALARM,
+                AlarmSeverity::from_u16(common.udfs as u16),
+            );
             self.afvl = 0.0;
             return;
         }
@@ -829,19 +567,6 @@ impl Record for MbbiRecord {
         }
     }
 
-    /// C `mbbiRecord.c::special` — after a runtime write to any of the
-    /// state value (ZRVL..FFVL) or state string (ZRST..FFST) fields,
-    /// `init_common()` re-derives `sdef`. Without this a record that
-    /// started with an empty state table (`sdef=false`) would stay on
-    /// the no-states `VAL=RVAL` path even after a CA put populated a
-    /// state value.
-    fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
-        if after && is_state_table_field(field) {
-            self.compute_sdef();
-        }
-        Ok(())
-    }
-
     /// Soft Channel VAL entry — a pass-through, NOT a raw->state map. C
     /// `devMbbiSoft::read_mbbi` (devMbbiSoft.c:51) does
     /// `dbGetLink(DBR_USHORT, &prec->val); return 2`: the link value is
@@ -859,20 +584,17 @@ impl Record for MbbiRecord {
             EpicsValue::ULong(v) => self.val = v as u16,
             EpicsValue::Long(v) => self.val = v as u16,
             EpicsValue::Short(v) => self.val = v as u16,
-            // epics-base PR/issue #183 — DBF_MENU ↔ DBF_STRING. Match the
-            // string against ZRST..FFST and store the corresponding index.
-            EpicsValue::String(s) => {
-                let strs: [&PvString; 16] = [
-                    &self.zrst, &self.onst, &self.twst, &self.thst, &self.frst, &self.fvst,
-                    &self.sxst, &self.svst, &self.eist, &self.nist, &self.test, &self.elst,
-                    &self.tvst, &self.ttst, &self.ftst, &self.ffst,
-                ];
-                if let Some(idx) = strs.iter().position(|st| **st == s) {
-                    self.val = idx as u16;
-                } else {
-                    return Err(CaError::TypeMismatch(format!(
-                        "mbbi VAL: '{s}' matches no ZRST..FFST state string"
-                    )));
+            // C rset `put_enum_str` (mbbiRecord.c:273-291), reached from
+            // `dbConvert.c::putStringEnum` — the one string→state converter,
+            // over `enum_state_strings` (the same table `get_enum_strs` serves).
+            EpicsValue::String(ref s) => {
+                let resolved = crate::server::record::resolve_enum_state_string(
+                    "VAL",
+                    self.enum_state_strings().as_deref(),
+                    s,
+                )?;
+                if let EpicsValue::Enum(v) = resolved {
+                    self.val = v;
                 }
             }
             _ => return Err(CaError::TypeMismatch("VAL".into())),

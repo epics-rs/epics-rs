@@ -192,19 +192,23 @@ impl CommandHandler for MqttConfigHandler {
                             &def.fields,
                             &mut common_fields,
                         );
+                        // The record and its loaded common fields enter the
+                        // database together — the creation sink runs the
+                        // `iocInit` passes against the FINAL field set (the
+                        // SCAN="I/O Intr" this .db declares, and the UDF a
+                        // field(VAL,…) clears). Applying them afterwards left
+                        // the record initialised from a pre-load field set.
+                        let load = epics_base_rs::server::database::RecordLoad::from_common_fields(
+                            common_fields,
+                        );
                         ctx.block_on(async {
-                            if let Err(e) = ctx.db().add_record(&def.name, record).await {
+                            if let Err(e) =
+                                ctx.db().add_loaded_record(&def.name, record, load).await
+                            {
                                 eprintln!(
                                     "mqttDriverConfigure: register '{}' skipped: {e}",
                                     def.name
                                 );
-                                return;
-                            }
-                            if let Some(rec_arc) = ctx.db().get_record(&def.name).await {
-                                let mut instance = rec_arc.write().await;
-                                for (name, value) in common_fields {
-                                    let _ = instance.put_common_field(&name, value);
-                                }
                             }
                         });
                     }

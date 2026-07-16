@@ -23,7 +23,7 @@ fn c1_compress_val_array_put_does_not_panic_or_desync() {
     rec.put_field("VAL", EpicsValue::DoubleArray(vec![1.0, 2.0]))
         .unwrap();
     // The array was ingested through the algorithm, NUSE tracks it.
-    assert_eq!(rec.get_field("NUSE"), Some(EpicsValue::Long(2)));
+    assert_eq!(rec.get_field("NUSE"), Some(EpicsValue::ULong(2)));
     // Reading VAL linearises NUSE elements — must not index OOB.
     match rec.get_field("VAL").unwrap() {
         EpicsValue::DoubleArray(v) => assert_eq!(v, vec![1.0, 2.0]),
@@ -32,7 +32,7 @@ fn c1_compress_val_array_put_does_not_panic_or_desync() {
     // A second, longer write keeps the buffer consistent.
     rec.put_field("VAL", EpicsValue::DoubleArray(vec![3.0, 4.0, 5.0]))
         .unwrap();
-    assert_eq!(rec.get_field("NUSE"), Some(EpicsValue::Long(4)));
+    assert_eq!(rec.get_field("NUSE"), Some(EpicsValue::ULong(4)));
     match rec.get_field("VAL").unwrap() {
         EpicsValue::DoubleArray(v) => assert_eq!(v.len(), 4),
         other => panic!("expected DoubleArray, got {other:?}"),
@@ -46,7 +46,7 @@ fn c1_compress_val_array_put_does_not_panic_or_desync() {
 #[test]
 fn c2_histogram_counter_wraps_no_panic() {
     let mut rec = HistogramRecord::new(2, 0.0, 10.0);
-    rec.val[0] = u32::MAX as i32; // UINT_MAX bit pattern
+    rec.val[0] = u32::MAX; // the C epicsUInt32 counter at its max
     rec.put_field("SGNL", EpicsValue::Double(1.0)).unwrap();
     // SGNL put triggers add_count (C SPC_MOD); counter wraps to 0.
     assert_eq!(rec.val[0], 0);
@@ -238,16 +238,16 @@ fn h11_histogram_cmd_start_stop() {
     rec.put_field("SGNL", EpicsValue::Double(2.0)).unwrap();
     assert_eq!(
         rec.get_field("VAL"),
-        Some(EpicsValue::LongArray(vec![0, 0, 0, 0])),
+        Some(EpicsValue::ULongArray(vec![0, 0, 0, 0])),
         "stopped histogram does not count"
     );
     // CMD=2 resumes counting.
     rec.put_field("CMD", EpicsValue::Short(2)).unwrap();
     rec.put_field("SGNL", EpicsValue::Double(2.0)).unwrap();
-    if let Some(EpicsValue::LongArray(v)) = rec.get_field("VAL") {
-        assert_eq!(v.iter().sum::<i32>(), 1, "resumed histogram counts");
+    if let Some(EpicsValue::ULongArray(v)) = rec.get_field("VAL") {
+        assert_eq!(v.iter().sum::<u32>(), 1, "resumed histogram counts");
     } else {
-        panic!("expected LongArray");
+        panic!("expected ULongArray");
     }
 }
 
@@ -310,7 +310,7 @@ fn m2_compress_ilil_ihil_leading_run_only() {
     // out-of-limit -1 is kept. Mean = (5 + -1 + 7)/3 = 11/3.
     rec.put_field("VAL", EpicsValue::DoubleArray(vec![5.0, -1.0, 7.0]))
         .unwrap();
-    assert_eq!(rec.get_field("NUSE"), Some(EpicsValue::Long(1)));
+    assert_eq!(rec.get_field("NUSE"), Some(EpicsValue::ULong(1)));
     if let Some(EpicsValue::DoubleArray(v)) = rec.get_field("VAL") {
         assert!((v[0] - 11.0 / 3.0).abs() < 1e-9);
     } else {
@@ -330,13 +330,13 @@ fn m1_compress_scalar_cvb_and_inx() {
     rec.put_field("VAL", EpicsValue::Double(9.0)).unwrap();
     // Two of three samples accumulated: INX=2, CVB tracks the running
     // high (9.0), nothing emitted yet.
-    assert_eq!(rec.get_field("INX"), Some(EpicsValue::Long(2)));
+    assert_eq!(rec.get_field("INX"), Some(EpicsValue::ULong(2)));
     assert_eq!(rec.get_field("CVB"), Some(EpicsValue::Double(9.0)));
-    assert_eq!(rec.get_field("NUSE"), Some(EpicsValue::Long(0)));
+    assert_eq!(rec.get_field("NUSE"), Some(EpicsValue::ULong(0)));
     // Third sample completes the chunk: emit max(2,9,4)=9, INX resets.
     rec.put_field("VAL", EpicsValue::Double(4.0)).unwrap();
-    assert_eq!(rec.get_field("INX"), Some(EpicsValue::Long(0)));
-    assert_eq!(rec.get_field("NUSE"), Some(EpicsValue::Long(1)));
+    assert_eq!(rec.get_field("INX"), Some(EpicsValue::ULong(0)));
+    assert_eq!(rec.get_field("NUSE"), Some(EpicsValue::ULong(1)));
     if let Some(EpicsValue::DoubleArray(v)) = rec.get_field("VAL") {
         assert_eq!(v[0], 9.0);
     } else {

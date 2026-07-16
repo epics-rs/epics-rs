@@ -101,15 +101,11 @@ impl ScanSchedulerV2 {
         }
     }
 
+    /// C `initialProcess()` (`iocInit.c:653-657`) — the PINI=YES pass.
     async fn process_pini(&self) {
-        let pini_records = self.db.pini_records().await;
-        for name in &pini_records {
-            let mut visited = HashSet::new();
-            let _ = self
-                .db
-                .process_record_with_links(name, &mut visited, 0)
-                .await;
-        }
+        self.db
+            .pini_process(crate::server::record::PiniMode::Yes)
+            .await;
     }
 
     async fn periodic_scan_loop(

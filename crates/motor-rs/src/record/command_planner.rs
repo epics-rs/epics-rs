@@ -1295,15 +1295,14 @@ impl MotorRecord {
         self.ctrl.twf = false;
         self.ctrl.twr = false;
 
-        let dir = if forward {
-            MotionDirection::Positive
-        } else {
-            MotionDirection::Negative
-        };
-        if self.is_blocked_by_hw_limit(dir) {
-            return false;
-        }
-
+        // No hard-limit gate here: C's fold (motorRecord.cc:2167-2181) is
+        // unconditional — `val += twv * dir` runs on the latched button with no
+        // hls/lls test, exactly like a direct VAL write. Limits are the move
+        // block's business further down (and the driver's, which holds the axis
+        // at the switch). Gating the fold made a tweak strictly more restrictive
+        // than the VAL write it is shorthand for, and silently ate the button:
+        // with the user-direction switch active but the soft target legal, C
+        // folds VAL and dispatches.
         let delta = if forward {
             self.ctrl.twv
         } else {

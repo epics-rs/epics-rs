@@ -6,7 +6,6 @@ use parking_lot::Mutex;
 use crate::error::{ADError, ADResult};
 use crate::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
 use crate::ndarray_handle::{NDArrayHandle, pooled_array};
-use crate::timestamp::EpicsTimestamp;
 
 /// If a free-list buffer is more than this ratio larger than needed, discard
 /// it and allocate fresh to avoid wasting memory.
@@ -16,51 +15,6 @@ const THRESHOLD_SIZE_RATIO: f64 = 1.5;
 /// non-zero id so `release` can verify an array belongs to it (C++
 /// NDArrayPool.cpp:352 checks `pArray->pNDArrayPool == this`).
 static NEXT_POOL_ID: AtomicU64 = AtomicU64::new(1);
-
-/// Accumulator for `convert`'s binning sum. C `convertDim`
-/// (NDArrayPool.cpp:465) does `*pDOut += (dataTypeOut)*pDIn` — each source
-/// element is cast to the OUTPUT type and summed in the OUTPUT type, with
-/// C integer arithmetic wrapping on overflow. The Rust port reproduces
-/// that by accumulating in the *target* type's arithmetic, then casting the
-/// accumulator to the target element type:
-///
-/// * Integer targets accumulate in `i128` — wide enough that the running
-///   sum of any realistic bin window of 8/16/32/64-bit source elements
-///   never itself overflows — and the final `as`-cast to the narrower
-///   target reduces modulo 2^width, identical to C's per-step wrapping by
-///   the ring homomorphism `Z -> Z/2^width`. (This also avoids the old
-///   f64 accumulator's precision loss for |value| > 2^53, which corrupted
-///   i64/u64 arrays even at binning == 1.)
-/// * Float targets accumulate in the target float type (`f32`/`f64`)
-///   exactly as C does, so the same rounding / precision applies.
-trait BinAcc: Copy {
-    const ZERO: Self;
-    fn bin_add(self, rhs: Self) -> Self;
-}
-
-impl BinAcc for i128 {
-    const ZERO: Self = 0;
-    #[inline]
-    fn bin_add(self, rhs: Self) -> Self {
-        self.wrapping_add(rhs)
-    }
-}
-
-impl BinAcc for f32 {
-    const ZERO: Self = 0.0;
-    #[inline]
-    fn bin_add(self, rhs: Self) -> Self {
-        self + rhs
-    }
-}
-
-impl BinAcc for f64 {
-    const ZERO: Self = 0.0;
-    #[inline]
-    fn bin_add(self, rhs: Self) -> Self {
-        self + rhs
-    }
-}
 
 /// NDArray factory with free-list reuse and memory tracking.
 ///
@@ -253,7 +207,13 @@ impl NDArrayPool {
         };
 
         arr.unique_id = self.next_unique_id.fetch_add(1, Ordering::Relaxed);
-        arr.timestamp = EpicsTimestamp::now();
+        // The "Initialize fields" block of C++ NDArrayPool::alloc
+        // (NDArrayPool.cpp:187-204) sets neither `epicsTS` nor `timeStamp`: the
+        // driver owns both and stamps them together via
+        // asynNDArrayDriver::updateTimeStamps (asynNDArrayDriver.cpp:832-836).
+        // Stamping only `epicsTS` here left `timeStamp` at 0.0 (fresh buffer) or
+        // at the previous frame's value (reused buffer), so the two published
+        // timestamps disagreed. See NDArray::update_time_stamps.
         arr.pool_id = self.id;
         // `data_size` is already correct: a fresh `NDArray::new` sets it to
         // `needed_bytes`; the reuse branch keeps the buffer's larger size.
@@ -267,7 +227,11 @@ impl NDArrayPool {
         let data_type = source.data.data_type();
         let mut copy = self.alloc(dims, data_type)?;
         copy.data = source.data.clone();
+        // C++ NDArrayPool::copy carries BOTH stamps across (NDArrayPool.cpp:284-285).
+        // Copying only `time_stamp` left `timestamp` (epicsTS) at whatever the
+        // recycled buffer happened to hold.
         copy.time_stamp = source.time_stamp;
+        copy.timestamp = source.timestamp;
         copy.attributes = source.attributes.clone();
         copy.codec = source.codec.clone();
         Ok(copy)
@@ -443,206 +407,26 @@ impl NDArrayPool {
     }
 
     /// Full convert with dimension changes: extract sub-region, bin, reverse.
-    /// `dims_out` specifies offset/size/binning/reverse for each dimension.
-    /// Allocates from pool with output dimensions.
     ///
-    /// Matches the C++ `NDArrayPool::convert()` semantics:
-    /// - Output size for each dim = `dims_out[i].size / dims_out[i].binning`
-    /// - Source pixels are summed (not averaged) across each binning window
-    /// - Reverse flips the output along that dimension
-    /// - Cumulative offset: `out.dims[i].offset = src.dims[i].offset + dims_out[i].offset`
-    /// - Cumulative binning: `out.dims[i].binning = src.dims[i].binning * dims_out[i].binning`
+    /// The conversion kernel itself lives in [`crate::convert::convert_dims`]
+    /// (the single owner of C++ `NDArrayPool::convert` semantics — binning
+    /// accumulates in the TARGET type, casts are C casts). This wrapper adds
+    /// what only a pool can: allocating the output THROUGH the pool so it
+    /// counts against allocated_bytes / num_alloc_buffers and can be reused
+    /// via the free list (C parity: C++ convert calls alloc() for its output).
     pub fn convert(
         &self,
         src: &NDArray,
         dims_out: &[NDDimension],
         target_type: NDDataType,
     ) -> ADResult<NDArray> {
-        // C parity (NDArrayPool.cpp:620-625): cannot convert compressed data.
-        if src.codec.is_some() {
-            return Err(ADError::UnsupportedConversion(
-                "convert: cannot convert compressed (codec) data".into(),
-            ));
-        }
+        let converted = crate::convert::convert_dims(src, dims_out, target_type)?;
 
-        let ndims = src.dims.len();
-        if dims_out.len() != ndims {
-            return Err(ADError::InvalidDimensions(format!(
-                "convert: dims_out length {} != source ndims {}",
-                dims_out.len(),
-                ndims,
-            )));
-        }
-
-        // Compute output sizes and validate
-        let mut out_sizes = Vec::with_capacity(ndims);
-        for (i, d) in dims_out.iter().enumerate() {
-            let bin = d.binning.max(1);
-            if d.size == 0 {
-                return Err(ADError::InvalidDimensions(format!(
-                    "convert: dims_out[{}].size is 0",
-                    i,
-                )));
-            }
-            let out_size = d.size / bin;
-            if out_size == 0 {
-                return Err(ADError::InvalidDimensions(format!(
-                    "convert: dims_out[{}] size {} / binning {} = 0",
-                    i, d.size, bin,
-                )));
-            }
-            // Validate that offset + size fits within source dimension
-            if d.offset + d.size > src.dims[i].size {
-                return Err(ADError::InvalidDimensions(format!(
-                    "convert: dims_out[{}] offset {} + size {} > src dim size {}",
-                    i, d.offset, d.size, src.dims[i].size,
-                )));
-            }
-            out_sizes.push(out_size);
-        }
-
-        // Build output dimension metadata.
-        // C++ NDArrayPool.cpp:719-724 makes `reverse` cumulative:
-        //   if (pIn->dims[i].reverse) pOut->dims[i].reverse = !pOut->dims[i].reverse;
-        // i.e. out.reverse = dims_out[i].reverse XOR src.dims[i].reverse.
-        let mut out_dims = Vec::with_capacity(ndims);
-        for i in 0..ndims {
-            let bin = dims_out[i].binning.max(1);
-            out_dims.push(NDDimension {
-                size: out_sizes[i],
-                offset: src.dims[i].offset + dims_out[i].offset,
-                binning: src.dims[i].binning * bin,
-                reverse: dims_out[i].reverse ^ src.dims[i].reverse,
-            });
-        }
-
-        let total_out: usize = out_sizes.iter().product();
-
-        // Precompute source strides (row-major: dim[0] varies fastest)
-        let mut src_strides = vec![1usize; ndims];
-        for i in 1..ndims {
-            src_strides[i] = src_strides[i - 1] * src.dims[i - 1].size;
-        }
-
-        // Precompute output strides
-        let mut out_strides = vec![1usize; ndims];
-        for i in 1..ndims {
-            out_strides[i] = out_strides[i - 1] * out_sizes[i - 1];
-        }
-
-        // Macro: bin/offset/reverse a single (source -> target) type pair,
-        // accumulating directly in the TARGET type to match C `convertDim`
-        // (NDArrayPool.cpp:434-471), which sums `(dataTypeOut)*pDIn` in the
-        // output type. `$AccT` is the accumulator (`i128` for integer
-        // targets, the target float type otherwise — see [`BinAcc`]);
-        // `$DstT` / `$variant` are the target element type and its
-        // `NDDataBuffer` variant.
-        macro_rules! bin_loop {
-            ($src_vec:expr, $DstT:ty, $AccT:ty, $variant:ident) => {{
-                let mut out = vec![0 as $DstT; total_out];
-
-                // Iterate over all output pixels
-                for out_idx in 0..total_out {
-                    // Decompose flat output index into per-dim coordinates
-                    let mut remaining = out_idx;
-                    let mut out_coords = [0usize; 10]; // up to 10 dims
-                    for i in (0..ndims).rev() {
-                        out_coords[i] = remaining / out_strides[i];
-                        remaining %= out_strides[i];
-                    }
-
-                    // Apply reverse: flip coordinate in output space
-                    let mut eff_coords = [0usize; 10];
-                    for i in 0..ndims {
-                        eff_coords[i] = if dims_out[i].reverse {
-                            out_sizes[i] - 1 - out_coords[i]
-                        } else {
-                            out_coords[i]
-                        };
-                    }
-
-                    // Sum over the binning window in the TARGET type.
-                    let mut acc = <$AccT as BinAcc>::ZERO;
-                    let bin_total: usize = dims_out.iter().map(|d| d.binning.max(1)).product();
-
-                    // Iterate over all bin offsets
-                    for bin_flat in 0..bin_total {
-                        let mut br = bin_flat;
-                        let mut src_flat = 0usize;
-                        let mut valid = true;
-
-                        for i in (0..ndims).rev() {
-                            let bin = dims_out[i].binning.max(1);
-                            let bin_off = br % bin;
-                            br /= bin;
-
-                            let src_coord = dims_out[i].offset + eff_coords[i] * bin + bin_off;
-                            if src_coord >= src.dims[i].size {
-                                valid = false;
-                                break;
-                            }
-                            src_flat += src_coord * src_strides[i];
-                        }
-
-                        if valid {
-                            // C `(dataTypeOut)*pDIn`: cast the source element
-                            // into the accumulator (target) type, then add.
-                            acc = acc.bin_add($src_vec[src_flat] as $AccT);
-                        }
-                    }
-
-                    out[out_idx] = acc as $DstT;
-                }
-
-                NDDataBuffer::$variant(out)
-            }};
-        }
-
-        // For a given typed source buffer, dispatch on the target type.
-        // Integer targets accumulate in `i128`; float targets in their own
-        // float type, matching C `convertDim`'s output-typed accumulator.
-        macro_rules! bin_to_target {
-            ($src_vec:expr) => {
-                match target_type {
-                    NDDataType::Int8 => bin_loop!($src_vec, i8, i128, I8),
-                    NDDataType::UInt8 => bin_loop!($src_vec, u8, i128, U8),
-                    NDDataType::Int16 => bin_loop!($src_vec, i16, i128, I16),
-                    NDDataType::UInt16 => bin_loop!($src_vec, u16, i128, U16),
-                    NDDataType::Int32 => bin_loop!($src_vec, i32, i128, I32),
-                    NDDataType::UInt32 => bin_loop!($src_vec, u32, i128, U32),
-                    NDDataType::Int64 => bin_loop!($src_vec, i64, i128, I64),
-                    NDDataType::UInt64 => bin_loop!($src_vec, u64, i128, U64),
-                    NDDataType::Float32 => bin_loop!($src_vec, f32, f32, F32),
-                    NDDataType::Float64 => bin_loop!($src_vec, f64, f64, F64),
-                }
-            };
-        }
-
-        let out_data = match &src.data {
-            NDDataBuffer::I8(v) => bin_to_target!(v),
-            NDDataBuffer::U8(v) => bin_to_target!(v),
-            NDDataBuffer::I16(v) => bin_to_target!(v),
-            NDDataBuffer::U16(v) => bin_to_target!(v),
-            NDDataBuffer::I32(v) => bin_to_target!(v),
-            NDDataBuffer::U32(v) => bin_to_target!(v),
-            NDDataBuffer::I64(v) => bin_to_target!(v),
-            NDDataBuffer::U64(v) => bin_to_target!(v),
-            NDDataBuffer::F32(v) => bin_to_target!(v),
-            NDDataBuffer::F64(v) => bin_to_target!(v),
-        };
-
-        // Allocate the output array THROUGH the pool so it counts against
-        // allocated_bytes / num_alloc_buffers and can be reused via the free
-        // list (C parity: C++ convert calls alloc() for its output).
-        let mut arr = self.alloc(out_dims, target_type)?;
+        let mut arr = self.alloc(converted.dims.clone(), target_type)?;
         arr.timestamp = src.timestamp;
         arr.time_stamp = src.time_stamp;
         arr.attributes.copy_from(&src.attributes);
-
-        // `out_data` already holds the binned result in the TARGET type
-        // (C `convertDim` sums in the output type), so install it directly —
-        // no separate, lossy source-typed staging + conversion step.
-        arr.data = out_data;
+        arr.data = converted.data;
 
         Ok(arr)
     }
@@ -706,6 +490,67 @@ mod tests {
             .unwrap();
         assert_eq!(a1.unique_id, 1);
         assert_eq!(a2.unique_id, 2);
+    }
+
+    #[test]
+    fn test_r6_65_alloc_stamps_neither_timestamp() {
+        // R6-65 / NDArrayPool.cpp:187-204 — alloc's "Initialize fields" block
+        // sets neither epicsTS nor timeStamp. Stamping only epicsTS left the two
+        // published timestamps disagreeing on every array.
+        let pool = NDArrayPool::new(1_000_000);
+        let fresh = pool
+            .alloc(vec![NDDimension::new(10)], NDDataType::UInt8)
+            .unwrap();
+        assert_eq!(fresh.timestamp, crate::timestamp::EpicsTimestamp::default());
+        assert_eq!(fresh.time_stamp, 0.0);
+
+        // Reuse path: C leaves the recycled buffer's stamps alone too, so
+        // whatever is there stays there — but the pair still agrees.
+        let mut used = pool
+            .alloc(vec![NDDimension::new(10)], NDDataType::UInt8)
+            .unwrap();
+        used.update_time_stamps(crate::timestamp::EpicsTimestamp {
+            sec: 1000,
+            nsec: 250_000_000,
+        });
+        pool.release(used);
+        let reused = pool
+            .alloc(vec![NDDimension::new(10)], NDDataType::UInt8)
+            .unwrap();
+        assert_eq!(reused.timestamp.sec, 1000);
+        assert_eq!(reused.time_stamp, 1000.25);
+    }
+
+    #[test]
+    fn test_r6_65_update_time_stamps_derives_the_double() {
+        // asynNDArrayDriver.cpp:832-836: timeStamp = epicsTS.secPastEpoch +
+        // epicsTS.nsec/1.e9 — derived, so the pair cannot disagree.
+        let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
+        arr.update_time_stamps(crate::timestamp::EpicsTimestamp {
+            sec: 42,
+            nsec: 500_000_000,
+        });
+        assert_eq!(arr.timestamp.sec, 42);
+        assert_eq!(arr.timestamp.nsec, 500_000_000);
+        assert_eq!(arr.time_stamp, 42.5);
+    }
+
+    #[test]
+    fn test_r6_65_alloc_copy_carries_both_stamps() {
+        // NDArrayPool.cpp:284-285 copies timeStamp AND epicsTS from the source.
+        let pool = NDArrayPool::new(1_000_000);
+        let mut src = pool
+            .alloc(vec![NDDimension::new(8)], NDDataType::UInt8)
+            .unwrap();
+        src.update_time_stamps(crate::timestamp::EpicsTimestamp {
+            sec: 777,
+            nsec: 125_000_000,
+        });
+
+        let copy = pool.alloc_copy(&src).unwrap();
+        assert_eq!(copy.timestamp, src.timestamp);
+        assert_eq!(copy.time_stamp, src.time_stamp);
+        assert_eq!(copy.time_stamp, 777.125);
     }
 
     #[test]
@@ -928,19 +773,22 @@ mod tests {
         }
     }
 
+    /// C++ `convertType` (NDArrayPool.cpp:378-388) is a plain C cast:
+    /// `(epicsUInt8)300 == 44` — narrowing truncates to the low bits and
+    /// wraps. It does NOT clamp to 255.
     #[test]
-    fn test_convert_type_u16_to_u8() {
+    fn test_convert_type_u16_to_u8_wraps_like_a_c_cast() {
         let pool = NDArrayPool::new(1_000_000);
         let mut src = NDArray::new(vec![NDDimension::new(2)], NDDataType::UInt16);
         if let NDDataBuffer::U16(ref mut v) = src.data {
             v[0] = 100;
-            v[1] = 300; // clamps to 255
+            v[1] = 300;
         }
 
         let out = pool.convert_type(&src, NDDataType::UInt8).unwrap();
         if let NDDataBuffer::U8(ref v) = out.data {
             assert_eq!(v[0], 100);
-            assert_eq!(v[1], 255); // clamped
+            assert_eq!(v[1], 44, "300 % 256 == 44, not a clamp to 255");
         } else {
             panic!("wrong type");
         }

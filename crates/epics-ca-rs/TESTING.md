@@ -204,7 +204,7 @@ EPICS variables honoured by the test harness and by `ca-soak`:
 | `EPICS_CAS_BEACON_ADDR_LIST` | Beacon destinations |
 | `EPICS_CAS_BEACON_PERIOD` | Beacon period (seconds) |
 | `EPICS_CAS_INACTIVITY_TMO` | Forced client disconnect after idle period |
-| `EPICS_CAS_USE_HOST_NAMES` | Trust client-supplied hostname (`YES`/`NO`) |
+| _(none)_ | Host identity is not env-configurable — use the `asCheckClientIP` iocsh command |
 
 See the main `README.md` "Environment variables" section for the full
 list.

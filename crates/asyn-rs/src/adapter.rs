@@ -12,7 +12,7 @@ use crate::interrupt::{InterruptFilter, InterruptSubscription};
 use crate::port::DrvUserRequest;
 use crate::port_handle::{AsyncCompletionHandle, PortHandle};
 use crate::request::{RequestOp, RequestResult};
-use crate::user::AsynUser;
+use crate::user::{AsynUser, DEFAULT_TIMEOUT, timeout_from_secs};
 
 /// Parsed `@asyn(portName, addr, timeout) drvInfoString` link specification.
 #[derive(Debug, Clone)]
@@ -116,12 +116,16 @@ pub fn parse_asyn_link(s: &str) -> Result<AsynLink, AsynError> {
         0
     };
     let timeout = if parts.len() > 2 {
+        // C asynEpicsUtils.c:125 `strtod(pnext, &endp)` into `pasynUser->timeout`.
+        // A negative value ("wait forever" in C) is accepted there and bounded
+        // here; `timeout_from_secs` owns that substitution under DRV-42.
         let secs: f64 = parts[2]
             .parse()
             .map_err(|_| AsynError::InvalidLinkSyntax(format!("invalid timeout: {}", parts[2])))?;
-        Duration::from_secs_f64(secs)
+        timeout_from_secs(secs)
     } else {
-        Duration::from_secs(1)
+        // C asynEpicsUtils.c:109,121 — `pasynUser->timeout = 1.0`.
+        DEFAULT_TIMEOUT
     };
 
     Ok(AsynLink {
@@ -181,12 +185,13 @@ pub fn parse_asyn_mask_link(s: &str) -> Result<AsynMaskLink, AsynError> {
         .ok_or_else(|| AsynError::InvalidLinkSyntax(format!("invalid mask: {mask_str}")))?;
 
     let timeout = if parts.len() > 3 {
+        // Same `strtod` timeout field as `@asyn` (asynEpicsUtils.c:200).
         let secs: f64 = parts[3]
             .parse()
             .map_err(|_| AsynError::InvalidLinkSyntax(format!("invalid timeout: {}", parts[3])))?;
-        Duration::from_secs_f64(secs)
+        timeout_from_secs(secs)
     } else {
-        Duration::from_secs(1)
+        DEFAULT_TIMEOUT
     };
 
     Ok(AsynMaskLink {
@@ -905,14 +910,13 @@ fn resolve_intr_alarm(
 /// [`asyn_status_to_alarm_with_default`] (specific statuses —
 /// Timeout/Overflow/Disconnected/Disabled — map direction-independently).
 fn asyn_error_to_alarm_with_default(e: &AsynError, default_stat: u16) -> (u16, u16) {
-    use epics_base_rs::server::record::AlarmSeverity;
-    match e {
-        AsynError::Status { status, .. } => {
-            asyn_status_to_alarm_with_default(*status, default_stat)
-        }
-        // Non-status asyn errors take C's asynError/default branch.
-        _ => (default_stat, AlarmSeverity::Invalid as u16),
-    }
+    // `AsynError::status()` is the single owner of error → asynStatus, so a
+    // status-carrying variant added later (e.g. `PartialRead`, which reports
+    // a real timeout alongside the bytes it did receive) keeps its condition
+    // code instead of silently falling into the generic asynError branch.
+    // Non-status variants map to `AsynStatus::Error`, which
+    // `asyn_status_to_alarm_with_default` resolves to C's default branch.
+    asyn_status_to_alarm_with_default(e.status(), default_stat)
 }
 
 /// [`asyn_error_to_alarm_with_default`] with C's input default (`READ_ALARM`).
@@ -1343,9 +1347,11 @@ impl AsynDeviceSupport {
             return self.write_op(val);
         };
         // Size by the record's NORD (C `pwf->nord`), clamped to the value length.
-        let nord = match record.get_field("NORD") {
-            Some(EpicsValue::Long(n)) => (n.max(0) as usize).min(data.len()),
-            _ => data.len(),
+        // NORD is DBF_ULONG on waveform/aai/aao and DBF_LONG on subArray, so read
+        // it through the numeric view rather than one variant.
+        let nord = match record.get_field("NORD").and_then(|v| v.to_f64()) {
+            Some(n) => (n.max(0.0) as usize).min(data.len()),
+            None => data.len(),
         };
         Some(RequestOp::OctetWrite {
             data: self.cap_octet_write(data[..nord].to_vec()),
@@ -1648,38 +1654,51 @@ impl AsynDeviceSupport {
 impl DeviceSupport for AsynDeviceSupport {
     fn init(&mut self, record: &mut dyn Record) -> CaResult<()> {
         if !self.reason_set {
-            // Pass the record's asyn `addr`: a multi-device driver (e.g. modbus)
-            // rejects an out-of-range offset here at bind time (C `drvUserCreate`
-            // `checkOffset`) instead of alarming on every I/O. Pass the record's
-            // interface (from its DTYP): an on-demand driver must create the
-            // parameter with the type this record will read it as — C
-            // `adsAsynPortDriver::getRecordInfoFromDrvInfo`.
-            let req = DrvUserRequest::new(&self.drv_info, self.addr).with_iface(self.iface);
-            match self.handle.drv_user_create_blocking(&req) {
-                Ok(info) => {
-                    self.reason = info.reason;
-                    // Per-record octet cap (C `modbusDrvUser_t.len`); applied to
-                    // `octet_max_size` below, after SIZV finalizes the buffer.
-                    self.octet_len_cap = info.max_octet_len;
-                }
-                Err(e) => {
-                    // Param not found, or the driver rejected the bind (e.g. an
-                    // out-of-range offset) — this record cannot bind to a param.
-                    eprintln!(
-                        "[asyn] init FAILED: port='{}' drv_info='{}' err={e}",
-                        self.handle.port_name(),
-                        self.drv_info
-                    );
-                    self.reason_set = false;
-                    return Ok(());
+            // C calls drvUser->create only when the port registered asynDrvUser
+            // **and** the record named a userParam (`if (pasynInterface &&
+            // pPvt->userParam)`, devAsynInt32.c:264-265; the same pair of
+            // conditions in devAsynFloat64.c, devAsynOctet.c, asynOctetSyncIO.c:141).
+            // A byte transport registers no asynDrvUser and has no parameter to
+            // name: the record binds at reason 0 — the port's own reason space —
+            // and that is not a bind failure. Ask the interface registry
+            // (`has_interface`), never a failed `create`.
+            if self.handle.has_interface(InterfaceType::DrvUser) && !self.drv_info.is_empty() {
+                // Pass the record's asyn `addr`: a multi-device driver (e.g. modbus)
+                // rejects an out-of-range offset here at bind time (C `drvUserCreate`
+                // `checkOffset`) instead of alarming on every I/O. Pass the record's
+                // interface (from its DTYP): an on-demand driver must create the
+                // parameter with the type this record will read it as — C
+                // `adsAsynPortDriver::getRecordInfoFromDrvInfo`.
+                let req = DrvUserRequest::new(&self.drv_info, self.addr).with_iface(self.iface);
+                match self.handle.drv_user_create_blocking(&req) {
+                    Ok(info) => {
+                        self.reason = info.reason;
+                        // Per-record octet cap (C `modbusDrvUser_t.len`); applied to
+                        // `octet_max_size` below, after SIZV finalizes the buffer.
+                        self.octet_len_cap = info.max_octet_len;
+                    }
+                    Err(e) => {
+                        // Param not found, or the driver rejected the bind (e.g. an
+                        // out-of-range offset) — this record cannot bind to a param.
+                        // C prints and `goto bad` (devAsynInt32.c:272-276).
+                        eprintln!(
+                            "[asyn] init FAILED: port='{}' drv_info='{}' err={e}",
+                            self.handle.port_name(),
+                            self.drv_info
+                        );
+                        self.reason_set = false;
+                        return Ok(());
+                    }
                 }
             }
             self.reason_set = true;
         }
 
         // Read NELM from the record to set max_array_elements for array reads.
-        if let Some(EpicsValue::Long(nelm)) = record.get_field("NELM") {
-            if nelm > 0 {
+        // NELM is DBF_ULONG (waveform/aai/aao) and DBF_USHORT (histogram); take
+        // the numeric view so no declaration is missed.
+        if let Some(nelm) = record.get_field("NELM").and_then(|v| v.to_f64()) {
+            if nelm > 0.0 {
                 self.max_array_elements = nelm as usize;
             }
         }
@@ -2288,6 +2307,29 @@ impl DeviceSupport for AsynDeviceSupport {
                     self.last_ts = result.timestamp;
                 }
                 Err(e) => {
+                    // A failed octet read that still transferred bytes hands
+                    // them to the record. C `devAsynOctet::readIt`
+                    // (devAsynOctet.c:693-717) passes the record's own value
+                    // buffer straight to `pasynOctet->read`, so on an
+                    // `asynTimeout` after a partial line the driver has
+                    // *already* written those bytes into `psi->val` /
+                    // `pwf->bptr`; readIt returns the failing status but the
+                    // data is in the record. Only the success-gated fields
+                    // (UDF, NORD/LEN — callbackSiRead:924-931,
+                    // callbackWfRead:1055-1061) stay untouched, which is what
+                    // the alarm below plus `skip_convert` express here.
+                    // Dropping the value on the error path is what R6-48's
+                    // partial never reached.
+                    if let Some(partial) = e.partial_read() {
+                        let result = RequestResult::octet_read_eom(
+                            partial.data.clone(),
+                            partial.nbytes_transferred(),
+                            partial.eom_reason.bits(),
+                        );
+                        if let Some(val) = self.result_to_value(&result) {
+                            skip_convert = self.store_read_value(record, val);
+                        }
+                    }
                     // Convert asyn error to EPICS alarm (C parity: asynStatusToEpicsAlarm)
                     let (alarm_status, alarm_severity) = asyn_error_to_alarm(&e);
                     self.last_alarm_status = alarm_status;
@@ -2912,6 +2954,14 @@ fn normalize_asyn_dtyp(dtyp: &str) -> String {
 pub fn universal_asyn_factory(
     ctx: &epics_base_rs::server::ioc_app::DeviceSupportContext,
 ) -> Option<Box<dyn DeviceSupport>> {
+    // The asyn record's own DSET (C `devAsynRecord.dbd`:
+    // `device(asyn, INST_IO, asynRecordDevice, "asynRecordDevice")`). It binds
+    // no link — the record carries PORT/ADDR/DRVINFO as fields — so it must be
+    // recognised before the `@asyn(...)` parse below, which would reject it.
+    if ctx.dtyp == crate::asyn_record::ASYN_RECORD_DTYP {
+        return Some(Box::new(crate::asyn_record::AsynRecordDevice::new()));
+    }
+
     // Try @asyn() link in INP or OUT
     let (link_str, is_output) = if ctx.out.contains("@asyn") || ctx.out.contains("@asynMask") {
         (ctx.out, true)
@@ -3232,6 +3282,39 @@ mod tests {
     #[test]
     fn test_parse_invalid_timeout() {
         assert!(parse_asyn_link("@asyn(port, 0, xyz) X").is_err());
+    }
+
+    /// R9-54: C `strtod` accepts the negative "wait forever" sentinel
+    /// (asynEpicsUtils.c:125) and every other double the operator can type.
+    /// `Duration::from_secs_f64` panicked on exactly those, aborting the thread
+    /// at record init. They now take the bounded DRV-42 substitution instead.
+    #[test]
+    fn test_parse_negative_and_non_finite_timeout_is_bounded_not_a_panic() {
+        for spec in [
+            "@asyn(PORT, 0, -1) DRV",
+            "@asyn(PORT, 0, -0.5) DRV",
+            "@asyn(PORT, 0, inf) DRV",
+            "@asyn(PORT, 0, NaN) DRV",
+            "@asyn(PORT, 0, 1e30) DRV",
+        ] {
+            let link = parse_asyn_link(spec).expect(spec);
+            assert_eq!(link.timeout, DEFAULT_TIMEOUT, "{spec}");
+            assert_eq!(link.drv_info, "DRV", "{spec}");
+        }
+        // A representable timeout still passes through verbatim.
+        assert_eq!(
+            parse_asyn_link("@asyn(PORT, 0, 0) DRV").unwrap().timeout,
+            Duration::ZERO
+        );
+    }
+
+    /// R9-54, same field on the `@asynMask` parser.
+    #[test]
+    fn test_parse_mask_negative_timeout_is_bounded_not_a_panic() {
+        let link = parse_asyn_mask_link("@asynMask(PORT, 0, 0x1F, -1) DRV").unwrap();
+        assert_eq!(link.timeout, DEFAULT_TIMEOUT);
+        assert_eq!(link.mask, 0x1F);
+        assert_eq!(link.drv_info, "DRV");
     }
 
     #[test]
@@ -5552,6 +5635,93 @@ mod tests {
         assert_eq!(ads.octet_max_size, 256);
     }
 
+    /// R11-48. C device support calls `drvUser->create` only when the port
+    /// registered asynDrvUser **and** the record named a userParam
+    /// (`if (pasynInterface && pPvt->userParam)`, devAsynInt32.c:264-265). A byte
+    /// transport registers no asynDrvUser: an `@asyn(L0,0,1)` link with no
+    /// drvInfo binds at reason 0 and the record works. The port called
+    /// `drv_user_create` unconditionally, took the transport's `ParamNotFound` as
+    /// a bind failure, and returned from `init` before the buffer setup — leaving
+    /// the record permanently dead (`reason_set == false` short-circuits read,
+    /// write and the I/O Intr receiver).
+    #[test]
+    fn a_device_support_on_a_port_without_asyn_drv_user_binds_at_reason_zero() {
+        use crate::runtime::{RuntimeConfig, create_port_runtime};
+        use epics_base_rs::server::records::lsi::LsiRecord;
+
+        struct Transport(PortDriverBase);
+        impl PortDriver for Transport {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+            fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
+                crate::interfaces::octet_transport_capabilities()
+            }
+            fn read_octet(
+                &mut self,
+                _user: &AsynUser,
+                buf: &mut [u8],
+            ) -> crate::error::AsynResult<usize> {
+                let bytes = b"HELLO";
+                buf[..bytes.len()].copy_from_slice(bytes);
+                Ok(bytes.len())
+            }
+        }
+
+        let (rt, _jh) = create_port_runtime(
+            Transport(PortDriverBase::new("r11_48_dev", 1, PortFlags::default())),
+            RuntimeConfig::default(),
+        );
+        let link = AsynLink {
+            port_name: "r11_48_dev".into(),
+            addr: 0,
+            timeout: Duration::from_secs(1),
+            // `@asyn(L0,0,1)` with no drvInfo — the ordinary serial/IP link.
+            drv_info: String::new(),
+        };
+        let mut ads = AsynDeviceSupport::from_handle(rt.port_handle().clone(), link, "asynOctet");
+        ads.set_record_info("TEST:R11_48", ScanType::Passive);
+
+        let mut rec = LsiRecord::new("");
+        rec.sizv = 1024;
+        ads.init(&mut rec).unwrap();
+
+        assert_eq!(ads.reason(), 0, "the transport's only reason");
+        assert_eq!(
+            ads.octet_max_size, 1024,
+            "init ran to completion — the buffer setup below the drvUser branch is reached"
+        );
+
+        ads.read(&mut rec).unwrap();
+        assert_eq!(
+            rec.get_field("VAL"),
+            Some(EpicsValue::CharArray(b"HELLO".to_vec())),
+            "the record is bound and reads from the transport"
+        );
+    }
+
+    /// R11-48 negative control: on a port that DOES register asynDrvUser, an
+    /// unresolvable drvInfo is still a bind failure — C prints and `goto bad`
+    /// (devAsynInt32.c:272-276), leaving the record unbound.
+    #[test]
+    fn a_device_support_with_an_unknown_drv_info_still_fails_to_bind() {
+        use epics_base_rs::server::records::longin::LonginRecord;
+
+        let mut ads = make_adapter(ScanType::Passive);
+        ads.drv_info = "NO_SUCH_PARAM".to_string();
+
+        let mut rec = LonginRecord::default();
+        ads.init(&mut rec).unwrap();
+
+        assert!(
+            !ads.reason_set,
+            "a param-library port that cannot resolve the drvInfo leaves the record unbound"
+        );
+    }
+
     /// A record's bind carries the asyn interface it will read the parameter
     /// through (from its DTYP), so an on-demand driver creates the parameter
     /// with that type instead of guessing.
@@ -7322,6 +7492,87 @@ mod tests {
             EpicsValue::CharArray(v) => assert_eq!(v, long),
             other => panic!("expected CharArray, got {other:?}"),
         }
+    }
+
+    /// R7-46: C `devAsynOctet::readIt` (devAsynOctet.c:693-717) passes the
+    /// record's own value buffer to `pasynOctet->read`, so a partial line
+    /// followed by a timeout leaves those bytes *in the record* (`psi->val`)
+    /// and returns the failing status; `processCommon` maps it to
+    /// TIMEOUT_ALARM/INVALID (:805-808). The port's error branch mapped the
+    /// alarm but dropped the bytes, because the transfer never left the
+    /// driver's buffer.
+    #[test]
+    fn octet_partial_read_stores_the_bytes_and_the_timeout_alarm() {
+        use crate::error::{AsynError, AsynResult, AsynStatus};
+        use crate::interpose::{EomReason, PartialOctetRead};
+        use crate::user::AsynUser;
+        use epics_base_rs::server::records::stringin::StringinRecord;
+
+        struct PartialThenTimeout(PortDriverBase);
+        impl PortDriver for PartialThenTimeout {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+            fn io_read_octet_eom(
+                &mut self,
+                _user: &AsynUser,
+                buf: &mut [u8],
+            ) -> AsynResult<(usize, EomReason)> {
+                buf[..3].copy_from_slice(b"abc");
+                Err(AsynError::Status {
+                    status: AsynStatus::Timeout,
+                    message: "read timeout".into(),
+                }
+                .with_partial_read(PartialOctetRead {
+                    data: b"abc".to_vec(),
+                    eom_reason: EomReason::empty(),
+                }))
+            }
+        }
+
+        let interrupts = Arc::new(InterruptManager::new(256));
+        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let actor = PortActor::new(
+            Box::new(PartialThenTimeout(PortDriverBase::new(
+                "octet_partial",
+                1,
+                PortFlags::default(),
+            ))),
+            rx,
+        );
+        let actor_id = actor.id();
+        std::thread::spawn(move || actor.run());
+        let handle = PortHandle::new(tx, "octet_partial".into(), interrupts, actor_id);
+
+        let link = AsynLink {
+            port_name: "octet_partial".into(),
+            addr: 0,
+            timeout: Duration::from_secs(1),
+            drv_info: String::new(),
+        };
+        let mut ads = AsynDeviceSupport::from_handle(handle, link, "asynOctet");
+        ads.octet_max_size = 40;
+        ads.reason_set = true;
+
+        let mut rec = StringinRecord::new("");
+        ads.read(&mut rec).unwrap();
+
+        assert_eq!(
+            rec.val.as_str_lossy(),
+            "abc",
+            "the bytes the device did send reach VAL, as C's in-place read does"
+        );
+        assert_eq!(
+            (ads.last_alarm_status, ads.last_alarm_severity),
+            (
+                epics_base_rs::server::recgbl::alarm_status::TIMEOUT_ALARM,
+                epics_base_rs::server::record::AlarmSeverity::Invalid as u16
+            ),
+            "the failing status still raises TIMEOUT/INVALID (asynStatusToEpicsAlarm)"
+        );
     }
 
     /// Full asynOctetCmdResponse chain through the factory: the literal DRVINFO

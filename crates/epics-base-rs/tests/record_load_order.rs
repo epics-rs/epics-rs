@@ -23,7 +23,7 @@ use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::device_support::{DeviceReadOutcome, DeviceSupport};
 use epics_base_rs::server::ioc_app::DeviceSupportContext;
 use epics_base_rs::server::ioc_builder::IocBuilder;
-use epics_base_rs::server::record::Record;
+use epics_base_rs::server::record::{PiniMode, Record};
 use epics_base_rs::server::records::ai::AiRecord;
 
 /// Enough records that hash order cannot coincide with load order.
@@ -132,11 +132,12 @@ async fn pini_records_returns_load_order() {
             .await
             .unwrap();
         let rec = db.get_record(name).await.unwrap();
-        rec.write().await.common.pini = true;
+        // r6: `pini` is the `menuPini` index (i16), not a bool. YES = 1.
+        rec.write().await.common.pini = PiniMode::Yes.to_u16() as i16;
     }
 
     assert_eq!(
-        db.pini_records().await,
+        db.pini_records(PiniMode::Yes).await,
         names,
         "PINI records must process in database load order, not hash order"
     );

@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 use crate::error::{CaError, CaResult};
-use crate::server::record::Record;
-use crate::types::EpicsValue;
+use crate::server::record::{Record, check_link_assignment};
+use crate::types::{EpicsValue, PvString};
 
 mod include;
 mod substitution;
@@ -39,7 +39,11 @@ pub fn register_record_type(name: &str, factory: RecordFactory) {
 pub struct DbRecordDef {
     pub record_type: String,
     pub name: String,
-    pub fields: Vec<(String, String)>,
+    /// The record's fields, in file order. A `.db` value is a BYTE STRING, not
+    /// text: C's escape translation writes one byte per `\xHH`
+    /// (`epicsString.c:106`), and a DBF_STRING's budget is 40 BYTES. Modelling
+    /// the value as a Rust `String` made `\xff` two bytes (R19-68).
+    pub fields: Vec<(String, PvString)>,
     /// Aliases declared inside the record body (`alias("name")`).
     /// Mirrors epics-base PR #336 — alias names are validated with
     /// the same rules as record names.
@@ -140,7 +144,7 @@ pub fn parse_db_with_breaktables(
         // are accepted and skipped rather than erroring out.
         if word == "path" || word == "addpath" {
             skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-            let _dir = read_quoted_string(&chars, &mut pos, &mut line, &mut col)?;
+            let _dir = read_token_string(&chars, &mut pos, &mut line, &mut col)?;
             continue;
         }
 
@@ -152,7 +156,7 @@ pub fn parse_db_with_breaktables(
         // layer's job.
         if word == "include" {
             skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-            let _file = read_quoted_string(&chars, &mut pos, &mut line, &mut col)?;
+            let _file = read_token_string(&chars, &mut pos, &mut line, &mut col)?;
             continue;
         }
 
@@ -165,11 +169,11 @@ pub fn parse_db_with_breaktables(
             skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
             expect_char(&chars, &mut pos, &mut col, '(', line)?;
             skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-            let target = read_quoted_string(&chars, &mut pos, &mut line, &mut col)?;
+            let target = read_token_string(&chars, &mut pos, &mut line, &mut col)?;
             skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
             expect_char(&chars, &mut pos, &mut col, ',', line)?;
             skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-            let alias_name = read_quoted_string(&chars, &mut pos, &mut line, &mut col)?;
+            let alias_name = read_token_string(&chars, &mut pos, &mut line, &mut col)?;
             validate_record_name(&alias_name, line, col)?;
             skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
             expect_char(&chars, &mut pos, &mut col, ')', line)?;
@@ -186,12 +190,7 @@ pub fn parse_db_with_breaktables(
             skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
             expect_char(&chars, &mut pos, &mut col, '(', line)?;
             skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-            // The name is a quoted string or a bare identifier (C accepts both).
-            let bt_name = if pos < chars.len() && chars[pos] == '"' {
-                read_quoted_string(&chars, &mut pos, &mut line, &mut col)?
-            } else {
-                read_word(&chars, &mut pos, &mut col)
-            };
+            let bt_name = read_token_string(&chars, &mut pos, &mut line, &mut col)?;
             skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
             expect_char(&chars, &mut pos, &mut col, ')', line)?;
             skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
@@ -278,13 +277,13 @@ pub fn parse_db_with_breaktables(
         expect_char(&chars, &mut pos, &mut col, '(', line)?;
 
         skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-        let rec_type = read_word(&chars, &mut pos, &mut col);
+        let rec_type = read_token_string(&chars, &mut pos, &mut line, &mut col)?;
 
         skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
         expect_char(&chars, &mut pos, &mut col, ',', line)?;
 
         skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-        let name = read_quoted_string(&chars, &mut pos, &mut line, &mut col)?;
+        let name = read_token_string(&chars, &mut pos, &mut line, &mut col)?;
         validate_record_name(&name, line, col)?;
 
         skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
@@ -325,7 +324,7 @@ pub fn parse_db_with_breaktables(
                 skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
                 expect_char(&chars, &mut pos, &mut col, '(', line)?;
                 skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-                let alias_name = read_quoted_string(&chars, &mut pos, &mut line, &mut col)?;
+                let alias_name = read_token_string(&chars, &mut pos, &mut line, &mut col)?;
                 validate_record_name(&alias_name, line, col)?;
                 skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
                 expect_char(&chars, &mut pos, &mut col, ')', line)?;
@@ -341,17 +340,23 @@ pub fn parse_db_with_breaktables(
                 // tokens. Base's dbStaticLib parser tolerates either
                 // form and ad-core templates rely on the unquoted
                 // shape (`info(asyn:READBACK, "1")`).
+                //
+                // C `info(tokenSTRING, json_value)` (dbYacc.y:262-267): the tag
+                // is a `tokenSTRING` — the same raw, untranslated token a record
+                // NAME is — and only the value is a `jsonSTRING` that
+                // `dbRecordInfo` runs `dbTranslateEscape` over
+                // (dbLexRoutines.c:1435-1440). Hence the two different readers.
                 skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
                 expect_char(&chars, &mut pos, &mut col, '(', line)?;
                 skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-                let tag = read_field_value(&chars, &mut pos, &mut line, &mut col)?;
+                let tag = read_token_string(&chars, &mut pos, &mut line, &mut col)?;
                 skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
                 expect_char(&chars, &mut pos, &mut col, ',', line)?;
                 skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
                 let value = read_field_value(&chars, &mut pos, &mut line, &mut col)?;
                 skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
                 expect_char(&chars, &mut pos, &mut col, ')', line)?;
-                info_tags.push((tag, value));
+                info_tags.push((tag, value.as_str_lossy().into_owned()));
                 continue;
             }
 
@@ -359,7 +364,7 @@ pub fn parse_db_with_breaktables(
             expect_char(&chars, &mut pos, &mut col, '(', line)?;
 
             skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-            let field_name = read_word(&chars, &mut pos, &mut col);
+            let field_name = read_token_string(&chars, &mut pos, &mut line, &mut col)?;
 
             skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
             expect_char(&chars, &mut pos, &mut col, ',', line)?;
@@ -841,20 +846,22 @@ fn read_quoted_string(
     *pos += 1;
     *col += 1;
 
-    // C dbStatic lexer parity (dbLex.l:90-93): a quoted `tokenSTRING`
-    // matches `{doublequote}({dqschar}|{escape})*{doublequote}` where
-    // `escape = {backslash}.`. The lexer keeps the **raw bytes** of the
-    // string body — `dbmfStrdup(yytext+1)` then NUL-terminates one byte
-    // early, so only the surrounding quotes are stripped; escape
-    // sequences are NOT translated. Escape translation
-    // (`dbTranslateEscape`) runs in `dbGetFieldValue`/`dbRecordInfo`
-    // ONLY when the value still carries quotes, which a plain
-    // `tokenSTRING` never does (dbLexRoutines.c:1398). So for `.db`
-    // field/name/info values a `\n` stays the literal 2 chars `\n`.
+    // C dbStatic lexer parity (dbLex.l:88-92): a quoted `tokenSTRING` matches
+    // `{doublequote}({dqschar}|{escape})*{doublequote}` where `escape =
+    // {backslash}.`. The lexer keeps the **raw bytes** of the string body —
+    // `dbmfStrdup(yytext+1)` then NUL-terminates one byte early, so only the
+    // surrounding quotes are stripped; escape sequences are NOT translated.
     //
-    // The escape sequence still consumes its following char for
-    // delimiter purposes — `\"` does not terminate the string — but
-    // both bytes are emitted verbatim.
+    // This rule reads NAMES ONLY (record/alias/breaktable names, `path` and
+    // `include` arguments, the `info` tag) — every `tokenSTRING` in the C
+    // grammar. Field and info VALUES are a different token from a different
+    // start condition (`jsonSTRING`, dbLex.l:111-114) and DO get translated;
+    // they go through [`read_json_string`]. Do not merge the two: unescaping
+    // here would corrupt every record name (R18-91).
+    //
+    // The escape sequence still consumes its following char for delimiter
+    // purposes — `\"` does not terminate the string — but both bytes are
+    // emitted verbatim.
     let mut s = String::new();
     while *pos < chars.len() && chars[*pos] != '"' {
         if chars[*pos] == '\\' && *pos + 1 < chars.len() && chars[*pos + 1] != '\n' {
@@ -898,14 +905,260 @@ fn read_quoted_string(
     Ok(s)
 }
 
-fn read_field_value(
+/// A quoted field/info VALUE — C's `jsonSTRING` (dbLex.l:111-114, matched in
+/// the `JSON` start condition the `field(`/`info(` rules switch into,
+/// dbYacc.y:256-267), followed by the translation `dbLexRoutines.c:1398-1403`
+/// and `:1435-1440` run on it.
+///
+/// C keeps the quotes on a `jsonSTRING` — they are precisely the marker that
+/// the translation is still owed — and `dbGetFieldValue`/`dbRecordInfo` then
+/// strip them and call `dbTranslateEscape(value, value)` before `dbPutString`.
+/// So `field(DESC,"hex\x41end")` stores `hexAend`, and a link field's
+/// `"@drvUser(\"chan1\")"` reaches device support with real quotes in it, not
+/// backslashes. This is the half [`read_quoted_string`] (names, raw) must NOT
+/// do, and the whole of R18-91.
+///
+/// The accepted grammar is C's (dbLex.l:23-33), which is STRICTER than a raw
+/// read: a literal control character and the escapes `\1`..`\9` are syntax
+/// errors, `\x` demands exactly two hex digits and `\u` exactly four. Single
+/// quotes delimit a value string as well as double (`jsonsqstr`), and the other
+/// quote character is then an ordinary character. C accepts `\uHHHH` in the
+/// lexer but implements no `\u` in the translation, so it comes out as the
+/// literal text `uHHHH` — reproduced, because a `.db` in the field may rely on
+/// what C actually stores.
+fn read_json_string(
+    chars: &[char],
+    pos: &mut usize,
+    line: &mut usize,
+    col: &mut usize,
+) -> CaResult<PvString> {
+    let quote = match chars.get(*pos) {
+        Some(&c @ ('"' | '\'')) => c,
+        _ => {
+            return Err(CaError::DbParseError {
+                line: *line,
+                column: *col,
+                message: "expected a quoted value".into(),
+            });
+        }
+    };
+    *pos += 1;
+    *col += 1;
+
+    let err = |line: usize, col: usize, message: &str| CaError::DbParseError {
+        line,
+        column: col,
+        message: message.into(),
+    };
+
+    // The escaped source text, quotes stripped — C's `yytext`, minus the two
+    // quote characters `dbGetFieldValue` steps over.
+    let mut escaped = String::new();
+    loop {
+        let Some(&c) = chars.get(*pos) else {
+            return Err(err(*line, *col, "unterminated string"));
+        };
+        if c == quote {
+            *pos += 1;
+            *col += 1;
+            break;
+        }
+        if c == '\n' {
+            // dbLex.l:131-133 — the JSON string rule cannot match a newline
+            // (`normalchar` excludes every control character), and the
+            // catch-all reports the missing quote.
+            return Err(err(*line, *col, "Newline in string, closing quote missing"));
+        }
+        if c == '\\' {
+            let Some(&esc) = chars.get(*pos + 1) else {
+                return Err(err(*line, *col, "unterminated string"));
+            };
+            // `escapedchar` is `{backslash}[^ux1-9]`; `x` and `u` introduce the
+            // fixed-width `latinchar`/`unicodechar` forms, and `\1`..`\9` are
+            // not escapes at all (C has no octal here).
+            let hex = |n: usize| {
+                chars
+                    .get(*pos + 2..*pos + 2 + n)
+                    .is_some_and(|ds| ds.iter().all(|d| d.is_ascii_hexdigit()))
+            };
+            let width = match esc {
+                'x' if hex(2) => 4,
+                'u' if hex(4) => 6,
+                'x' | 'u' | '1'..='9' => {
+                    return Err(err(
+                        *line,
+                        *col,
+                        "invalid escape sequence (\\x needs 2 hex digits, \
+                         \\u needs 4, and \\1..\\9 are not escapes)",
+                    ));
+                }
+                _ => 2,
+            };
+            // `\<newline>` is a legal escape here (the class `[^ux1-9]` matches
+            // a newline where the name rule's `.` does not), so the line
+            // counter has to follow it.
+            let consumed = &chars[*pos..*pos + width];
+            escaped.extend(consumed);
+            *pos += width;
+            if consumed.contains(&'\n') {
+                *line += 1;
+                *col = 0;
+            } else {
+                *col += width;
+            }
+            continue;
+        }
+        if (c as u32) < 0x20 {
+            return Err(err(
+                *line,
+                *col,
+                "a control character must be escaped inside a quoted value",
+            ));
+        }
+        escaped.push(c);
+        *pos += 1;
+        *col += 1;
+    }
+
+    Ok(PvString::from_bytes(
+        crate::runtime::epics_string::raw_from_escaped(&escaped),
+    ))
+}
+
+/// A brace-delimited JSON field value, returned verbatim (braces included).
+/// Braces inside a JSON string do not nest the value, and a `\` escapes the
+/// next character inside a string.
+fn read_json_value(
     chars: &[char],
     pos: &mut usize,
     line: &mut usize,
     col: &mut usize,
 ) -> CaResult<String> {
-    if *pos < chars.len() && chars[*pos] == '"' {
+    let start_line = *line;
+    let mut s = String::new();
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    while *pos < chars.len() {
+        let c = chars[*pos];
+        s.push(c);
+        *pos += 1;
+        if c == '\n' {
+            *line += 1;
+            *col = 0;
+        } else {
+            *col += 1;
+        }
+
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Ok(s);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Err(CaError::DbParseError {
+        line: start_line,
+        column: *col,
+        message: "unterminated JSON value (missing '}')".into(),
+    })
+}
+
+/// A C `tokenSTRING` — the ONE reader for every grammar position `dbYacc.y`
+/// spells that way (record type, record name, field name, info tag, alias
+/// names, breaktable name, path/include).
+///
+/// `dbLex.l:88-97` gives `tokenSTRING` two lexical forms and the grammar never
+/// distinguishes them:
+///
+/// * a bareword — `[a-zA-Z0-9_\-+:.\[\]<>;]+` (`dbLex.l:21`);
+/// * a double-quoted string — taken RAW, the lexer only strips the quotes; no
+///   escape translation happens in the INITIAL start condition (that is the
+///   `JSON` condition's job, and it applies to VALUES only — see
+///   [`read_field_value`]).
+///
+/// So `record("ai", "QT1") { field("VAL", "5") }` and `record(ai, QT2)` are the
+/// same grammar to C, and softIoc loads both. The port used to read the type
+/// and the field name with [`read_word`] (bareword only, and a narrower charset
+/// at that) and the record/alias names with [`read_quoted_string`] (quoted
+/// only) — so each position accepted one of C's two forms and refused the
+/// other, turning a legal `.db` into a hard startup failure. Reading them all
+/// through here is what makes the two forms indistinguishable to the caller,
+/// as they are to C.
+fn read_token_string(
+    chars: &[char],
+    pos: &mut usize,
+    line: &mut usize,
+    col: &mut usize,
+) -> CaResult<String> {
+    if matches!(chars.get(*pos), Some('"')) {
         return read_quoted_string(chars, pos, line, col);
+    }
+
+    let mut s = String::new();
+    while let Some(&c) = chars.get(*pos) {
+        if c.is_ascii_alphanumeric()
+            || matches!(c, '_' | '-' | '+' | ':' | '.' | '[' | ']' | '<' | '>' | ';')
+        {
+            s.push(c);
+            *pos += 1;
+            *col += 1;
+        } else {
+            break;
+        }
+    }
+    if s.is_empty() {
+        let got = chars.get(*pos).map_or("EOF".to_string(), |c| c.to_string());
+        return Err(CaError::DbParseError {
+            line: *line,
+            column: *col,
+            message: format!("expected a name (bareword or quoted string), got '{got}'"),
+        });
+    }
+    Ok(s)
+}
+
+/// A field or info VALUE — C's `json_value` (dbYacc.y:256-267): the parser
+/// switches into the `JSON` start condition for it, so a quoted value is a
+/// `jsonSTRING` and its escapes are translated ([`read_json_string`]). The
+/// unquoted forms (`jsonBARE`, `jsonNUMBER`) carry no escapes and are taken
+/// verbatim, as C does.
+fn read_field_value(
+    chars: &[char],
+    pos: &mut usize,
+    line: &mut usize,
+    col: &mut usize,
+) -> CaResult<PvString> {
+    if matches!(chars.get(*pos), Some('"' | '\'')) {
+        return read_json_string(chars, pos, line, col);
+    }
+
+    // JSON value: C's dbLex tokenizes a brace-delimited field value as JSON
+    // (`field(DOL, {const:"hello"})`, `field(INP, {pva:"PV"})`) and hands the
+    // raw text to `dbParseLink`, which sees the braces and calls
+    // `dbJLinkParse` (dbStaticLib.c:2280-2285). Keep the text verbatim — the
+    // link parser is the one that interprets it.
+    if *pos < chars.len() && chars[*pos] == '{' {
+        // The brace text is JSON source — ASCII/UTF-8 by construction, and the
+        // escapes inside it belong to yajl, not to the `.db` lexer (R19-67).
+        return read_json_value(chars, pos, line, col).map(PvString::from);
     }
 
     // Unquoted value: a C `bareword` (dbLex.l:21) —
@@ -948,7 +1201,7 @@ fn read_field_value(
             ),
         });
     }
-    Ok(s)
+    Ok(PvString::from(s))
 }
 
 fn expect_char(
@@ -975,9 +1228,118 @@ fn expect_char(
     Ok(())
 }
 
+/// C `dbStaticLib`'s record PROTOTYPE — the `initial("…")` directive.
+///
+/// `dbReadDatabase` builds one zeroed prototype per record type and writes each
+/// field's `.dbd` `initial(...)` into it (`dbLexRoutines.c:1150-1163`,
+/// `dbPutStringNum`); `dbCreateRecord` then copies that prototype, and the
+/// `.db`'s own `field(...)` lines overwrite it. So a `.dbd` initial is the
+/// record's default, and a `record(calc,"X") {}` with no CALC line still has
+/// `CALC="0"` — not the empty string.
+///
+/// The port had no such step: every record hand-wrote a Rust `Default`, and
+/// nothing tied it to the `.dbd`. calc, calcout and swait all forgot
+/// `initial("0")` on their CALC/OCAL (`calcRecord.dbd:26`,
+/// `calcoutRecord.dbd:62,382`, `swaitRecord.dbd:424`), so a default record
+/// carried the EMPTY expression — which base's `postfix()` refuses
+/// (`CALC_ERR_NULL_ARG`) and every evaluation then fails, putting a plain
+/// `record(calc,"X") {}` into CALC/INVALID on its first process where C sits at
+/// NO_ALARM.
+///
+/// This is the single owner of that step, so the `.dbd` is the only place a
+/// default can be stated. A record's `Default` supplies the zeroed struct; the
+/// `.dbd` supplies the initial value. The store is [`Record::put_field_internal`]
+/// — dbStatic writes the prototype directly, with no `special()` and no
+/// `SPC_NOMOD` gate, so a read-only field's initial lands too (its record's
+/// `init_record` overwrites it afterwards, exactly as in C).
+///
+/// A field the record does not own carries its default in `CommonFields`
+/// instead; there is no record storage here to write it into, and
+/// `tests/dbd_initial_parity.rs` is what holds those to the `.dbd`.
+fn apply_dbd_initials(record: &mut Box<dyn Record>) -> CaResult<()> {
+    // The `.dbd` is the source, so the initials come from the GENERATED table —
+    // `crate::server::record::dbd_generated`, which `tools/dbd-codegen` emits
+    // from the vendored `.dbd` files. Asking the `.dbd` directly is what makes
+    // the default impossible to get wrong by hand.
+    //
+    // This is BASE's generated table, so it seeds base's record types only. The
+    // downstream record types (`motor`, `table`, `scaler`, `epid`, `throttle`,
+    // `timestamp`) now carry a generated table too — in their own crate, which
+    // base cannot name — and their `.dbd` `initial()` values are therefore
+    // parsed but never applied: those records keep the defaults their `Default`
+    // impl sets. Seeding them is not a table lookup but a semantic change (C
+    // applies the `.dbd` initial BEFORE `init_record`, and each record's
+    // `init_record` then overwrites some of them — `motor`'s VERS is stamped
+    // 7.4 over an `initial("1")`), so it is left to a change that can validate
+    // each record against its C `init_record` rather than folded in here.
+    let Some(fields) = crate::server::record::dbd_generated::record_fields(record.record_type())
+    else {
+        return Ok(()); // a record type base's vendored `.dbd` set does not declare
+    };
+    let initials: Vec<(&'static str, &'static str)> = fields
+        .iter()
+        .filter(|f| record.implements_field(f.name))
+        .filter_map(|f| f.initial.map(|v| (f.name, v)))
+        .collect();
+
+    for (name, initial) in initials {
+        let spec = fields.iter().find(|f| f.name == name);
+        // The `.db` load path's coercion, reused verbatim: a `menu()` field's
+        // initial is a LABEL (`initial("Passive")`), everything else parses to
+        // the field's stored type — which is what the record already holds, the
+        // `.dbd` type being the fallback for a field it cannot yet produce.
+        let dbf_type = match record
+            .get_field(name)
+            .map(|v| v.db_field_type())
+            .or_else(|| spec.map(|f| f.dbf_type))
+        {
+            Some(t) => t,
+            None => continue,
+        };
+        let parsed = if let Some(choices) = spec
+            .and_then(|f| f.menu)
+            .or_else(|| record.menu_field_choices(name))
+            .or_else(|| crate::server::record::shared_menu_choices(name))
+        {
+            crate::server::record::resolve_menu_field_string_db_load(
+                name, choices, dbf_type, initial,
+            )?
+        } else {
+            EpicsValue::parse_bytes(dbf_type, initial.as_bytes()).map_err(|e| {
+                CaError::InvalidValue(format!(
+                    "{}.{name}: cannot parse .dbd initial(\"{initial}\") as {dbf_type:?}: {e}",
+                    record.record_type()
+                ))
+            })?
+        };
+        // A field whose zeroed Rust default already IS the `.dbd` initial needs
+        // no store — and must not get one: a `SPC_NOMOD` field the record serves
+        // but has no store arm for (`sseq.IX1`, C's read-only step index, whose
+        // initial is the 0 it already holds) would fail the write. The write is
+        // therefore driven by the DIFFERENCE, which is the thing this step exists
+        // to remove.
+        if record.get_field(name).as_ref() == Some(&parsed) {
+            continue;
+        }
+        record.put_field_internal(name, parsed)?;
+    }
+    Ok(())
+}
+
 /// Create a record from a type name.
 /// Checks the external factory registry first, then falls back to built-in types.
+///
+/// The record comes back holding its `.dbd` initial values — see
+/// [`apply_dbd_initials`]. Every load path (`IocBuilder`, `dbLoadRecords`,
+/// `dbCreateRecord`) goes through here, so no record can reach the database
+/// disagreeing with its `.dbd` about a default.
 pub fn create_record(record_type: &str) -> CaResult<Box<dyn Record>> {
+    let mut record = create_record_raw(record_type)?;
+    apply_dbd_initials(&mut record)?;
+    Ok(record)
+}
+
+fn create_record_raw(record_type: &str) -> CaResult<Box<dyn Record>> {
     // Check external registry first (allows overrides from e.g. asyn-rs)
     if let Ok(reg) = get_registry().lock() {
         if let Some(factory) = reg.get(record_type) {
@@ -1052,7 +1414,9 @@ pub fn create_record_with_factories(
     extra_factories: &std::collections::HashMap<String, super::RecordFactory>,
 ) -> CaResult<Box<dyn Record>> {
     if let Some(factory) = extra_factories.get(record_type) {
-        return Ok(factory());
+        let mut record = factory();
+        apply_dbd_initials(&mut record)?;
+        return Ok(record);
     }
     create_record(record_type)
 }
@@ -1069,7 +1433,7 @@ pub fn create_record_with_factories(
 /// and `dbLoadRecords` load paths so both resolve table names identically.
 pub fn resolve_linr_breaktable_names(
     record_type: &str,
-    fields: &mut [(String, String)],
+    fields: &mut [(String, PvString)],
     registry: &crate::server::cvt_bpt::BreakTableRegistry,
 ) {
     if registry.is_empty() || !matches!(record_type, "ai" | "ao") {
@@ -1077,8 +1441,9 @@ pub fn resolve_linr_breaktable_names(
     }
     for (fname, fvalue) in fields.iter_mut() {
         if fname.eq_ignore_ascii_case("LINR") {
-            if let Some(idx) = registry.linr_index_of(fvalue) {
-                *fvalue = idx.to_string();
+            // A breakpoint-table NAME is an identifier — ASCII.
+            if let Some(idx) = registry.linr_index_of(&fvalue.as_str_lossy()) {
+                *fvalue = PvString::from(idx.to_string());
             }
         }
     }
@@ -1093,45 +1458,107 @@ fn is_common_link_field(upper_name: &str) -> bool {
     matches!(upper_name, "INP" | "OUT")
 }
 
+/// C's db-load link-type gate (`dbStaticLib.c:2222`): every link field the
+/// `.db` explicitly assigns must carry a type the record's bound device support
+/// takes. The rule itself lives in [`check_link_assignment`] — this is only the
+/// half that says WHICH links a `.db` load offers to it.
+///
+/// A field the `.db` never mentions is NOT checked; C skips it too
+/// (`if (!plink->text) continue;`, `dbStaticLib.c:2213`), which is why this
+/// walks the `.db`'s own field list rather than the record's declaration.
+///
+/// DEVIATION from C (Tier 2): C prints the error, leaves the link uninitialized
+/// and runs the IOC anyway, so the record sits there with a dead link that will
+/// never read or write anything. The port refuses the load. The dead link is
+/// precisely the illegal state, and a `.db` C has already declared invalid is
+/// not worth constructing it for.
+fn check_link_types(record_type: &str, fields: &[(String, PvString)]) -> CaResult<()> {
+    let dtyp = fields
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case("DTYP"))
+        .map(|(_, v)| v.as_str_lossy().trim().to_string());
+
+    for (name, value) in fields {
+        check_link_assignment(
+            record_type,
+            dtyp.as_deref(),
+            &name.to_uppercase(),
+            &value.as_str_lossy(),
+        )?;
+    }
+    Ok(())
+}
+
 pub fn apply_fields(
     record: &mut Box<dyn Record>,
-    fields: &[(String, String)],
+    fields: &[(String, PvString)],
     common_fields: &mut Vec<(String, EpicsValue)>,
 ) -> CaResult<()> {
-    for (name, value_str) in fields {
+    check_link_types(record.record_type(), fields)?;
+
+    for (name, value) in fields {
         let upper_name = name.to_uppercase();
+        // Menu labels, numbers and link text are ASCII by construction; only a
+        // DBF_STRING can carry a byte outside it, and that one goes to
+        // `EpicsValue::parse_bytes` below, which keeps the bytes.
+        let value_str = &value.as_str_lossy();
 
-        // Try record-specific field first
-        let field_desc = record
-            .field_list()
-            .iter()
-            .find(|f| f.name == upper_name.as_str());
+        // Two separate questions, and they must stay separate: *who owns* this
+        // field (the record, or the framework's dbCommon fallback), and *what
+        // type* the `.db` string parses as. `field_list()` is the spec and now
+        // carries every field the `.dbd` declares — including INP/OUT, which
+        // most record types leave to the framework — so ownership is asked of
+        // `implements_field()`, not of table membership.
+        let owned = record.implements_field(&upper_name);
+        // The DECLARATION, from the same owner every other consumer asks: the
+        // `.dbd`-generated table first, the record's hand table only where the
+        // `.dbd` does not reach. Reading it off `field_list()` alone left an
+        // `aSub`'s `field(FTA,"LONG")` with no `menu()` to resolve against.
+        let spec = crate::server::record::record_instance::field_desc_of(
+            record.as_ref(),
+            upper_name.as_str(),
+        );
 
-        if let Some(desc) = field_desc {
-            let dbf_type = desc.dbf_type;
+        if owned {
+            // Parse to the type the record STORES, exactly as
+            // `put_field_internal_default` coerces to it: `put_field`'s arms
+            // match on what is stored, and a `menu()` field is declared
+            // `DBF_MENU` but stored as a `Short` choice index. The `.dbd` type
+            // is the fallback for a field the record cannot yet produce a value
+            // for.
+            let dbf_type = record
+                .get_field(&upper_name)
+                .map(|v| v.db_field_type())
+                .or_else(|| spec.map(|f| f.dbf_type))
+                .ok_or_else(|| {
+                    CaError::InvalidValue(format!("field {upper_name}: no type to parse it as"))
+                })?;
             // A `DBF_MENU` field's `.db` value resolves against THAT field's
             // own menu (label-first, then a numeric index) — C dbStaticLib
             // `dbPutStringNum`. Using the field's choices, not a cross-menu
             // global table, is what keeps a menu-specific label from being
             // dropped or mis-mapped (e.g. `field(SELM,"Specified")`).
-            let value = if let Some(choices) = record
-                .menu_field_choices(&upper_name)
+            let parsed = if let Some(choices) = spec
+                .and_then(|f| f.menu)
+                .or_else(|| record.menu_field_choices(&upper_name))
                 .or_else(|| crate::server::record::shared_menu_choices(&upper_name))
             {
-                crate::server::record::resolve_menu_field_string(choices, dbf_type, value_str)
-                    .ok_or_else(|| {
-                        CaError::InvalidValue(format!(
-                            "field {upper_name}: '{value_str}' is not a valid menu choice"
-                        ))
-                    })?
+                crate::server::record::resolve_menu_field_string_db_load(
+                    &upper_name,
+                    choices,
+                    dbf_type,
+                    value_str,
+                )?
             } else {
-                EpicsValue::parse(dbf_type, value_str).map_err(|e| {
+                // BYTES, not text: a DBF_STRING is a byte string with a 40-byte
+                // budget, and `field(VAL,"h\xffz")` is 3 bytes in C (R19-68).
+                EpicsValue::parse_bytes(dbf_type, value.as_bytes()).map_err(|e| {
                     CaError::InvalidValue(format!(
                         "field {upper_name} (type {dbf_type:?}): cannot parse '{value_str}': {e}"
                     ))
                 })?
             };
-            record.put_field(&upper_name, value)?;
+            record.put_field(&upper_name, parsed)?;
             // A record type may declare INP/OUT in its own `field_list`,
             // mirroring its C `.dbd` (`scalerRecord`, `motorRecord`,
             // `acalcout`, …). The value is then stored by the record — but in
@@ -1150,14 +1577,32 @@ pub fn apply_fields(
             // `parsed_out`) only for a record that does NOT declare the field,
             // so a record driving its own link is not driven twice.
             if is_common_link_field(&upper_name) {
-                common_fields.push((
-                    upper_name.clone(),
-                    EpicsValue::String(value_str.clone().into()),
-                ));
+                common_fields.push((upper_name.clone(), EpicsValue::String(value.clone())));
             }
         } else {
-            // Store as common field for RecordInstance to handle
-            common_fields.push((upper_name, EpicsValue::String(value_str.clone().into())));
+            // Store as common field for RecordInstance to handle. The BYTES: a
+            // common DBF_STRING (DESC, EGU, …) has the same 40-byte budget.
+            common_fields.push((upper_name.clone(), EpicsValue::String(value.clone())));
+        }
+
+        // C `dbPutString` (`dbStaticLib.c:2653-2660`): writing VAL through the
+        // STATIC library also writes UDF = 0 —
+        //
+        // ```c
+        // if (!status && strcmp(pflddes->name, "VAL") == 0) {
+        //     ...
+        //     if (!dbFindField(&dbentry, "UDF")) dbPutString(&dbentry, "0");
+        // }
+        // ```
+        //
+        // — so `field(VAL,"1")` in a `.db` DEFINES the record at load, on every
+        // record type, whatever its `process()` later does with UDF. The load
+        // owner is the only place this can live: it is the one gate both
+        // `dbLoadRecords` paths (IocBuilder and iocsh) cross. Pushed in file
+        // order, so an explicit `field(UDF,...)` after `field(VAL,...)` still
+        // wins, exactly as it does in C.
+        if upper_name == "VAL" {
+            common_fields.push(("UDF".to_string(), EpicsValue::Char(0)));
         }
     }
     Ok(())
@@ -1239,33 +1684,108 @@ mod tests {
 
     #[test]
     fn test_quoted_string_escape() {
-        // C dbStatic parity: a quoted `tokenSTRING` keeps escape
-        // bytes RAW — only the surrounding quotes are stripped. A `.db`
-        // field value `"hello \"world\""` therefore stores the literal
-        // 15 chars `hello \"world\"`, NOT `hello "world"`. The `\"`
-        // still does not terminate the string.
+        // R18-91: a quoted field VALUE is a `jsonSTRING`, and
+        // `dbGetFieldValue` runs `dbTranslateEscape` over it — so
+        // `"hello \"world\""` stores the 13 chars `hello "world"`, with real
+        // quotes. (This test previously pinned the defect, asserting the raw
+        // 15-char form.) The `\"` still does not terminate the string.
+        //
+        // softIoc: field(VAL,"a \"b\" c") -> dbgf prints "a \"b\" c", i.e. it
+        // re-escapes on print (dbTest.c:1007), so the stored bytes are 9.
         let input = r#"
     record(stringin, "TEST") {
     field(VAL, "hello \"world\"")
     }
     "#;
         let records = parse_db(input, &HashMap::new()).unwrap();
-        assert_eq!(records[0].fields[0].1, r#"hello \"world\""#);
+        assert_eq!(records[0].fields[0].1, r#"hello "world""#);
     }
 
     #[test]
-    fn test_quoted_string_keeps_escapes_raw() {
-        // `\n`, `\t`, `\\` are all kept verbatim for `.db` field
-        // values — a C IOC stores the literal backslash sequences.
+    fn test_quoted_value_translates_escapes() {
+        // R18-91: `\n`, `\t`, `\\` and `\xHH` are all TRANSLATED in a field
+        // value — softIoc `field(DESC,"hex\x41end")` -> `dbgf E2.DESC` =
+        // "hexAend". (This test previously pinned the defect under the name
+        // `test_quoted_string_keeps_escapes_raw`.)
         let input = r#"
     record(stringin, "TEST") {
     field(DESC, "line1\nline2")
     field(OUT, "a\\b\tc")
+    field(SIOL, "hex\x41end")
     }
     "#;
         let records = parse_db(input, &HashMap::new()).unwrap();
-        assert_eq!(records[0].fields[0].1, r"line1\nline2");
-        assert_eq!(records[0].fields[1].1, r"a\\b\tc");
+        assert_eq!(records[0].fields[0].1, "line1\nline2");
+        assert_eq!(records[0].fields[1].1, "a\\b\tc");
+        assert_eq!(records[0].fields[2].1, "hexAend");
+    }
+
+    /// The other half of the split: a record/alias NAME is a `tokenSTRING`
+    /// (dbLex.l:88-92) and keeps its escape bytes RAW. Unescaping the shared
+    /// helper would have broken every name.
+    #[test]
+    fn test_record_name_keeps_escapes_raw() {
+        let input = r#"
+    record(stringin, "T\tEST") {
+    field(VAL, "x")
+    }
+    "#;
+        let records = parse_db(input, &HashMap::new()).unwrap();
+        assert_eq!(records[0].name, r"T\tEST");
+    }
+
+    /// An `info` VALUE is translated (`dbRecordInfo`, dbLexRoutines.c:1435-1440);
+    /// the info TAG is a `tokenSTRING` and is not.
+    #[test]
+    fn test_info_value_translates_escapes() {
+        let input = r#"
+    record(stringin, "TEST") {
+    info("Q:group", "tab\there")
+    }
+    "#;
+        let records = parse_db(input, &HashMap::new()).unwrap();
+        assert_eq!(records[0].info_tags[0].0, "Q:group");
+        assert_eq!(records[0].info_tags[0].1, "tab\there");
+    }
+
+    /// A single-quoted value is a `jsonsqstr` (dbLex.l:31-33) and is translated
+    /// the same way — softIoc: `field(VAL,'sq:\tx')` stores `sq:<TAB>x`.
+    #[test]
+    fn test_single_quoted_value_translates_escapes() {
+        let input = "record(stringin, \"TEST\") {\n field(VAL, 'sq:\\tx')\n}\n";
+        let records = parse_db(input, &HashMap::new()).unwrap();
+        assert_eq!(records[0].fields[0].1, "sq:\tx");
+    }
+
+    /// C's value grammar is STRICTER than a raw read: `\1`..`\9` is not an
+    /// escape (`escapedchar` = `{backslash}[^ux1-9]`, dbLex.l:25), so a `.db`
+    /// carrying an octal escape is a syntax error — softIoc rejects
+    /// `field(VAL,"octal\101x")` with `ERROR: syntax error`, and the port must
+    /// not silently start up with different data.
+    #[test]
+    fn test_octal_escape_in_value_is_rejected() {
+        let input = r#"
+    record(stringin, "TEST") {
+    field(VAL, "octal\101x")
+    }
+    "#;
+        assert!(matches!(
+            parse_db(input, &HashMap::new()),
+            Err(CaError::DbParseError { .. })
+        ));
+    }
+
+    /// A link field rides the same path: the escaped quotes reach device
+    /// support as real quotes, not backslashes (R18-91's headline impact).
+    #[test]
+    fn test_link_field_value_is_translated() {
+        let input = r#"
+    record(stringin, "TEST") {
+    field(INP, "@drvUser(\"chan1\")")
+    }
+    "#;
+        let records = parse_db(input, &HashMap::new()).unwrap();
+        assert_eq!(records[0].fields[0].1, r#"@drvUser("chan1")"#);
     }
 
     #[test]
@@ -1283,18 +1803,35 @@ mod tests {
 
     #[test]
     fn test_quoted_string_backslash_before_newline_aborts() {
-        // C `{escape}` is `{backslash}.` and flex `.` never matches a
-        // newline (`{dqschar}` is `[^"\n\\]`), so a backslash
-        // immediately before a newline is NOT an escape: the string
-        // stays unterminated and aborts with the same newline-in-string
-        // error (dbLex.l:131-133). The `\` must not swallow the newline.
-        let input = "record(stringin, \"TEST\") {\n    field(DESC, \"line1\\\nline2\")\n}\n";
+        // The NAME rule (dbLex.l:88-92): `{escape}` is `{backslash}.` and flex
+        // `.` never matches a newline (`{dqschar}` is `[^"\n\\]`), so a
+        // backslash immediately before a newline is NOT an escape — the string
+        // stays unterminated and aborts (dbLex.l:131-133).
+        //
+        // softIoc, `record(stringin,"BN2\<newline>X")`:
+        //   ERROR: Invalid character '"' / Invalid character '\' / syntax error
+        let input = "record(stringin, \"TE\\\nST\") {\n    field(DESC, \"x\")\n}\n";
         let res = parse_db(input, &HashMap::new());
         assert!(
             matches!(res, Err(CaError::DbParseError { ref message, .. })
                 if message.contains("Newline in string")),
             "expected newline-in-string abort, got {res:?}"
         );
+    }
+
+    /// The VALUE rule is the other start condition and disagrees on exactly
+    /// this character: `escapedchar` is `{backslash}[^ux1-9]` (dbLex.l:25), a
+    /// character CLASS, which does match a newline. So a backslash before a
+    /// newline is a valid escape in a value, and the translation's default arm
+    /// yields the newline itself.
+    ///
+    /// softIoc, `field(DESC, "line1\<newline>line2")` → `dbgf BN.DESC` prints
+    /// `"line1\nline2"` — i.e. a real newline, re-escaped for display.
+    #[test]
+    fn test_value_backslash_before_newline_is_a_newline() {
+        let input = "record(stringin, \"TEST\") {\n    field(DESC, \"line1\\\nline2\")\n}\n";
+        let records = parse_db(input, &HashMap::new()).unwrap();
+        assert_eq!(records[0].fields[0].1, "line1\nline2");
     }
 
     #[test]
@@ -1325,7 +1862,7 @@ mod tests {
         let macros = HashMap::new();
         let records = parse_db(input, &macros).unwrap();
         // With undefined macro and default="", the field gets the raw default
-        assert!(records[0].fields[0].1.contains("CP MS"));
+        assert!(records[0].fields[0].1.as_str_lossy().contains("CP MS"));
     }
 
     #[test]
@@ -1397,6 +1934,9 @@ mod tests {
         let mut rec = CalcoutRecord::default();
         rec.put_field("CALC", EpicsValue::String("A+B".into()))
             .unwrap();
+        // C compiles CALC in special(SPC_CALC), never in the field write —
+        // dbPut always runs both, so drive the same pair here.
+        rec.special("CALC", true).unwrap();
         rec.put_field("A", EpicsValue::Double(3.0)).unwrap();
         rec.put_field("B", EpicsValue::Double(4.0)).unwrap();
         rec.process().unwrap();
@@ -1414,6 +1954,7 @@ mod tests {
         let mut rec = CalcoutRecord::default();
         rec.put_field("CALC", EpicsValue::String("A".into()))
             .unwrap();
+        rec.special("CALC", true).unwrap();
         rec.put_field("OOPT", EpicsValue::Short(1)).unwrap(); // On Change
         rec.put_field("A", EpicsValue::Double(5.0)).unwrap();
 
@@ -1434,8 +1975,12 @@ mod tests {
         let mut rec = CalcoutRecord::default();
         rec.put_field("CALC", EpicsValue::String("A+B".into()))
             .unwrap();
+        // C compiles CALC in special(SPC_CALC), never in the field write —
+        // dbPut always runs both, so drive the same pair here.
+        rec.special("CALC", true).unwrap();
         rec.put_field("OCAL", EpicsValue::String("A*B".into()))
             .unwrap();
+        rec.special("OCAL", true).unwrap();
         rec.put_field("DOPT", EpicsValue::Short(1)).unwrap(); // Use OCAL
         rec.put_field("A", EpicsValue::Double(3.0)).unwrap();
         rec.put_field("B", EpicsValue::Double(4.0)).unwrap();
@@ -1542,7 +2087,7 @@ mod tests {
         rec.add_sample(-1.0); // below range
         rec.add_sample(10.0); // at upper limit (excluded)
         rec.add_sample(15.0); // above range
-        let total: i32 = rec.val.iter().sum();
+        let total: u32 = rec.val.iter().sum();
         assert_eq!(total, 0);
     }
 
@@ -1601,11 +2146,7 @@ mod tests {
         let apply = |rt: &str, field: &str, value: &str| -> CaResult<Box<dyn Record>> {
             let mut rec = create_record(rt).unwrap();
             let mut common = Vec::new();
-            apply_fields(
-                &mut rec,
-                &[(field.to_string(), value.to_string())],
-                &mut common,
-            )?;
+            apply_fields(&mut rec, &[(field.to_string(), value.into())], &mut common)?;
             Ok(rec)
         };
 
@@ -1684,17 +2225,17 @@ record(ai, "T") { field(LINR, "typeJdegC") }
         // A registered non-standard table name on an ai/ao LINR is rewritten to
         // its index — the first user-table slot (15), since the standard
         // menuConvert names reserve 3..=14.
-        let mut fields = vec![("LINR".to_string(), "alpha".to_string())];
+        let mut fields = vec![("LINR".to_string(), PvString::from("alpha"))];
         resolve_linr_breaktable_names("ai", &mut fields, &reg);
         assert_eq!(fields[0].1, "15");
 
         // A fixed menuConvert label matches no table name and is untouched.
-        let mut fixed = vec![("LINR".to_string(), "LINEAR".to_string())];
+        let mut fixed = vec![("LINR".to_string(), PvString::from("LINEAR"))];
         resolve_linr_breaktable_names("ai", &mut fixed, &reg);
         assert_eq!(fixed[0].1, "LINEAR");
 
         // A non-ai/ao record's field is never rewritten.
-        let mut other = vec![("LINR".to_string(), "alpha".to_string())];
+        let mut other = vec![("LINR".to_string(), PvString::from("alpha"))];
         resolve_linr_breaktable_names("bo", &mut other, &reg);
         assert_eq!(other[0].1, "alpha");
     }
@@ -2058,7 +2599,7 @@ record(ao, "$(P)_noDtyp") {
             rec.fields
                 .iter()
                 .find(|(n, _)| n == "DTYP")
-                .map(|(_, v)| v.clone())
+                .map(|(_, v)| v.as_str_lossy().into_owned())
         };
 
         // Literal DTYP: untouched by the macro. Force-override used to corrupt

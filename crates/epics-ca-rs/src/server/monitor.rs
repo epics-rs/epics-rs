@@ -1,128 +1,15 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncWrite, AsyncWriteExt, BufWriter};
-use tokio::sync::Notify;
 
-use epics_base_rs::runtime::sync::{Mutex, mpsc};
+use epics_base_rs::runtime::sync::Mutex;
 
 use super::LongStringMode;
 use super::ca_server::ServerStats;
 use crate::protocol::*;
-use epics_base_rs::server::pv::{MonitorEvent, ProcessVariable, coalesce_consume};
+use epics_base_rs::server::event_queue::EventReader;
+use epics_base_rs::server::pv::MonitorEvent;
 use epics_base_rs::types::encode_dbr;
-
-#[derive(Default)]
-pub struct FlowControlGate {
-    paused: AtomicBool,
-    resumed: Notify,
-}
-
-impl FlowControlGate {
-    pub fn pause(&self) {
-        self.paused.store(true, Ordering::Release);
-    }
-
-    pub fn resume(&self) {
-        self.paused.store(false, Ordering::Release);
-        self.resumed.notify_waiters();
-    }
-
-    pub async fn wait_until_resumed(&self) {
-        loop {
-            // Register the resume waiter eagerly with `enable()` BEFORE
-            // re-reading the pause flag. `Notify::notified()` does not
-            // register until first polled and `notify_waiters()` stores
-            // no permit, so without this a `resume()` firing between the
-            // `paused.load()` and the `.await` would be lost and leave
-            // this blocked until the next resume. `resume()` stores
-            // `paused = false` (Release) before notifying, so if we still
-            // observe `paused` here the broadcast has not fired yet and is
-            // guaranteed to land on this enabled waiter. Same lost-wake-
-            // safe pattern as `coalesce_while_paused` and
-            // `Channel::wait_until_inactive`.
-            let resumed = self.resumed.notified();
-            tokio::pin!(resumed);
-            resumed.as_mut().enable();
-            if !self.paused.load(Ordering::Acquire) {
-                return;
-            }
-            resumed.await;
-        }
-    }
-
-    pub fn is_paused(&self) -> bool {
-        self.paused.load(Ordering::Acquire)
-    }
-
-    /// Collapse the monitor backlog to a single latest value while the
-    /// circuit is paused (EVENTS_OFF), returning it once EVENTS_ON
-    /// resumes (or `None` if the source channel closes).
-    ///
-    /// `pop_overflow` drains the producer's coalesce *slot* — the place
-    /// `notify_subscribers` / `post_monitor` parks the newest value once
-    /// the per-subscriber `rx` queue fills (`ProcessVariable` /
-    /// `RecordInstance::pop_coalesced`). Both sources must be folded here:
-    /// draining only `rx` lets an overflow that lands during the pause
-    /// stay in the slot, so resume delivers the stale `rx` tail first and
-    /// the newer slot value only on the next loop — defeating the
-    /// collapse-to-latest the pause exists to provide. Mirrors the
-    /// not-paused loop, which also prefers the slot as the newest value.
-    pub async fn coalesce_while_paused<F, Fut>(
-        &self,
-        rx: &mut mpsc::Receiver<MonitorEvent>,
-        mut pending: MonitorEvent,
-        mut pop_overflow: F,
-    ) -> Option<MonitorEvent>
-    where
-        F: FnMut() -> Fut,
-        Fut: std::future::Future<Output = Option<MonitorEvent>>,
-    {
-        loop {
-            // Register the resume waiter eagerly BEFORE re-reading the
-            // pause flag. `resume()` stores `paused = false` (Release)
-            // *before* `notify_waiters()`, so if we still observe
-            // `is_paused()` here the broadcast has not fired yet and is
-            // guaranteed to land on this already-enabled waiter. This
-            // closes the lost-wake gap where an EVENTS_ON arriving
-            // between the recheck and the `select!` await would otherwise
-            // be dropped — `Notify::notified()` does not register until
-            // first polled, and `notify_waiters()` stores no permit.
-            // `notify_waiters` (broadcast) is required rather than
-            // `notify_one`: one circuit-level gate fans out to every
-            // monitor task on the connection, and `notify_one` would wake
-            // only one of them. Same pattern as
-            // `Channel::wait_until_inactive`.
-            let resumed = self.resumed.notified();
-            tokio::pin!(resumed);
-            resumed.as_mut().enable();
-            if !self.is_paused() {
-                break;
-            }
-            // Collapse the backlog to the latest value while paused:
-            // drain the rx queue, then fold the producer overflow slot,
-            // which holds a value newer than anything in rx once the
-            // queue has filled. The slot holds at most one (overwritten)
-            // value, so a single take suffices; the next wake re-drains.
-            while let Ok(event) = rx.try_recv() {
-                pending = event;
-            }
-            if let Some(event) = pop_overflow().await {
-                pending = event;
-            }
-            if !self.is_paused() {
-                break;
-            }
-            tokio::select! {
-                maybe_event = rx.recv() => match maybe_event {
-                    Some(event) => pending = event,
-                    None => return None,
-                },
-                _ = resumed => {}
-            }
-        }
-        Some(pending)
-    }
-}
 
 /// Spawn a task that forwards monitor events from a PV subscription to the client TCP stream.
 /// Returns a handle that can be used to cancel the subscription.
@@ -144,42 +31,35 @@ impl FlowControlGate {
 // → scalar `EpicsValue::String` (C cvt_dbaddr).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_monitor_sender<W>(
-    pv: Arc<ProcessVariable>,
     sub_id: u32,
     data_type: u16,
     data_count: u32,
     writer: Arc<Mutex<BufWriter<W>>>,
-    flow_control: Arc<FlowControlGate>,
-    mut rx: mpsc::Receiver<MonitorEvent>,
+    mut reader: EventReader,
     denied: Arc<AtomicBool>,
     long_string_mode: LongStringMode,
     stats: Option<Arc<ServerStats>>,
+    // The EVENT_ADD request header (C `pevext->msg`) plus the client's
+    // negotiated minor version. Every delivery on this subscription is framed
+    // for THIS client: a pre-CA_V49 peer gets `ECA_16KARRAYCLIENT` rather than
+    // a 24-byte extended header it cannot parse (`caserverio.c:266-270`).
+    reply: super::tcp::ReplyContext,
 ) -> tokio::task::JoinHandle<()>
 where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     epics_base_rs::runtime::task::spawn(async move {
         loop {
-            // Block on the queue front, then fold the producer's coalesce
-            // overflow slot. When the queue filled while we were busy the
-            // newest value is parked in the slot; `coalesce_consume`
-            // delivers it AND drains the now-stale queue tail, so delivery
-            // never steps from the newest value back to an older queued one.
-            // A set slot implies the queue was full, so the front `recv()`
-            // returns immediately — no added latency over checking the slot
-            // first, and no newest-then-old replay of the stale backlog.
-            let Some(queued) = rx.recv().await else { break };
-            let coalesced = pv.pop_coalesced(sub_id).await;
-            let mut event = coalesce_consume(&mut rx, queued, coalesced);
-            if flow_control.is_paused() {
-                let Some(coalesced) = flow_control
-                    .coalesce_while_paused(&mut rx, event, || pv.pop_coalesced(sub_id))
-                    .await
-                else {
-                    break;
-                };
-                event = coalesced;
-            }
+            // C `event_read`: take this monitor's next queued entry, suspending
+            // under EVENTS_OFF exactly where C does (`flowCtrlMode &&
+            // nDuplicates == 0`). The queue is the single owner of both that
+            // gate and the coalescing rule — a post arriving while the ring is
+            // short of room replaced this monitor's LAST entry in place, so the
+            // earlier distinct entries are still here and go out as their own
+            // frames, and no side slot can reorder delivery.
+            let Some(event) = reader.recv().await else {
+                break;
+            };
             // One subscription update committed for delivery this cycle
             // (post-coalesce). PCAS `subscriptionEventsPosted` parity —
             // see `ServerStats::subscription_events_posted`. Counted
@@ -205,6 +85,7 @@ where
                 &event,
                 &writer,
                 long_string_mode,
+                reply,
             )
             .await
             .is_err()
@@ -229,7 +110,9 @@ async fn send_event<W: AsyncWrite + Unpin + Send + 'static>(
     event: &MonitorEvent,
     writer: &Arc<Mutex<BufWriter<W>>>,
     long_string_mode: LongStringMode,
+    reply: super::tcp::ReplyContext,
 ) -> std::io::Result<()> {
+    let (req_hdr, client_minor) = (&reply.req_hdr, reply.client_minor);
     // Apply the channel's long-string boundary conversion before
     // encoding (`$` → CHAR[40]+NUL, or a long-string record field →
     // scalar DBR_STRING). Clone only when a conversion actually runs
@@ -288,8 +171,18 @@ async fn send_event<W: AsyncWrite + Unpin + Send + 'static>(
     padded.resize(align8(padded.len()), 0);
 
     let mut hdr = CaHeader::new(CA_PROTO_EVENT_ADD);
-    // C client TCP parser requires 8-byte aligned postsize
-    hdr.set_payload_size(padded.len(), element_count);
+    // C client TCP parser requires 8-byte aligned postsize. C `read_reply`
+    // (`camessage.c:515-524`): when `cas_copy_in_header` refuses the frame
+    // because this client is pre-CA_V49, the update is answered with
+    // CA_PROTO_ERROR / ECA_16KARRAYCLIENT and the circuit is kept.
+    if hdr
+        .set_payload_size(padded.len(), element_count, client_minor)
+        .is_err()
+    {
+        let _ =
+            super::tcp::send_16k_array_client_err(writer, req_hdr, req_hdr.cid, client_minor).await;
+        return Ok(());
+    }
     hdr.data_type = data_type;
     hdr.cid = 1; // ECA_NORMAL status
     hdr.available = sub_id;
@@ -387,9 +280,20 @@ mod tests {
 
         // data_count = 0 means autosize (use snapshot's actual count);
         // matches every producer caller.
-        send_event(DBR_LONG, 0, 7, &event, &writer, LongStringMode::Plain)
-            .await
-            .expect("send_event must succeed");
+        send_event(
+            DBR_LONG,
+            0,
+            7,
+            &event,
+            &writer,
+            LongStringMode::Plain,
+            crate::server::tcp::ReplyContext {
+                req_hdr: crate::protocol::CaHeader::new(crate::protocol::CA_PROTO_EVENT_ADD),
+                client_minor: crate::protocol::CA_MINOR_VERSION,
+            },
+        )
+        .await
+        .expect("send_event must succeed");
 
         let guard = writer.lock().await;
         let batches = &guard.get_ref().batches;
@@ -478,22 +382,24 @@ mod tests {
         #[tokio::test]
         async fn successful_delivery_advances_posted_and_processed() {
             let pv = Arc::new(ProcessVariable::new("c:pv".into(), EpicsValue::Double(0.0)));
-            let rx = pv
+            let reader = pv
                 .add_subscriber(1, DbFieldType::Double, DBE_VALUE)
                 .await
                 .expect("subscriber added");
             let stats = Arc::new(ServerStats::default());
             let task = spawn_monitor_sender(
-                pv.clone(),
                 1,
                 DBR_DOUBLE,
                 0,
                 recording_writer(),
-                Arc::new(FlowControlGate::default()),
-                rx,
+                reader,
                 Arc::new(AtomicBool::new(false)),
                 LongStringMode::Plain,
                 Some(stats.clone()),
+                crate::server::tcp::ReplyContext {
+                    req_hdr: crate::protocol::CaHeader::new(crate::protocol::CA_PROTO_EVENT_ADD),
+                    client_minor: crate::protocol::CA_MINOR_VERSION,
+                },
             );
 
             for (i, v) in [1.0_f64, 2.0, 3.0].into_iter().enumerate() {
@@ -522,22 +428,24 @@ mod tests {
         #[tokio::test]
         async fn denied_delivery_counts_posted_not_processed() {
             let pv = Arc::new(ProcessVariable::new("c:pv".into(), EpicsValue::Double(0.0)));
-            let rx = pv
+            let reader = pv
                 .add_subscriber(1, DbFieldType::Double, DBE_VALUE)
                 .await
                 .expect("subscriber added");
             let stats = Arc::new(ServerStats::default());
             let task = spawn_monitor_sender(
-                pv.clone(),
                 1,
                 DBR_DOUBLE,
                 0,
                 recording_writer(),
-                Arc::new(FlowControlGate::default()),
-                rx,
+                reader,
                 Arc::new(AtomicBool::new(true)), // read access denied
                 LongStringMode::Plain,
                 Some(stats.clone()),
+                crate::server::tcp::ReplyContext {
+                    req_hdr: crate::protocol::CaHeader::new(crate::protocol::CA_PROTO_EVENT_ADD),
+                    client_minor: crate::protocol::CA_MINOR_VERSION,
+                },
             );
 
             pv.set(EpicsValue::Double(1.0)).await;
@@ -557,182 +465,6 @@ mod tests {
                 0,
                 "a denied event is suppressed before the wire — never processed"
             );
-        }
-    }
-
-    /// FlowControlGate (EVENTS_OFF/EVENTS_ON) pause/resume boundaries.
-    /// The gate is the single owner of the monitor pause transition that
-    /// both `spawn_monitor_sender` and the record-field monitor loop
-    /// acquire through `coalesce_while_paused`. Tested by boundary
-    /// (paused vs not at entry, backlog squash, channel open vs closed,
-    /// resume wake) rather than by narrative scenario.
-    mod flow_control_gate {
-        use super::*;
-        use epics_base_rs::server::pv::MonitorEvent;
-        use epics_base_rs::server::snapshot::Snapshot;
-        use epics_base_rs::types::EpicsValue;
-
-        fn ev(v: i32) -> MonitorEvent {
-            MonitorEvent {
-                snapshot: Snapshot::new(
-                    EpicsValue::Long(v),
-                    0,
-                    0,
-                    std::time::SystemTime::UNIX_EPOCH,
-                ),
-                origin: 0,
-                mask: epics_base_rs::server::recgbl::EventMask::VALUE,
-            }
-        }
-
-        fn value_of(e: &MonitorEvent) -> i32 {
-            match e.snapshot.value {
-                EpicsValue::Long(v) => v,
-                ref other => panic!("expected Long, got {other:?}"),
-            }
-        }
-
-        /// Not paused at entry → the pending value is returned at once,
-        /// without waiting on any rx event or resume.
-        #[tokio::test]
-        async fn not_paused_at_entry_returns_pending_immediately() {
-            let gate = FlowControlGate::default();
-            // No sender is ever used; default gate is not paused.
-            let (_tx, mut rx) = mpsc::channel::<MonitorEvent>(1);
-            let got = gate
-                .coalesce_while_paused(&mut rx, ev(7), || async { None })
-                .await;
-            assert_eq!(value_of(&got.expect("returns pending")), 7);
-        }
-
-        /// Paused → backlog squashes to the latest into `pending`; the
-        /// resume flushes only that latest value (no per-event frame).
-        #[tokio::test]
-        async fn coalesce_to_latest_while_paused_then_resume_flushes() {
-            let gate = Arc::new(FlowControlGate::default());
-            gate.pause();
-            let (tx, mut rx) = mpsc::channel::<MonitorEvent>(8);
-            let g2 = gate.clone();
-            let task = epics_base_rs::runtime::task::spawn(async move {
-                g2.coalesce_while_paused(&mut rx, ev(1), || async { None })
-                    .await
-            });
-            // Feed newer values while paused; each yield lets the gate
-            // absorb the value into `pending` and park again.
-            for v in [2i32, 3, 4] {
-                tx.send(ev(v)).await.unwrap();
-                tokio::task::yield_now().await;
-            }
-            gate.resume();
-            let got = task.await.unwrap().expect("resume delivers latest");
-            assert_eq!(
-                value_of(&got),
-                4,
-                "coalesce yields only the latest value on resume"
-            );
-        }
-
-        /// Paused + the producer overflow slot holds the genuine newest
-        /// value (rx queue filled during the pause) → resume must deliver
-        /// that slot value, NOT the stale rx tail. Regression for the
-        /// pause coalescing only draining rx: previously the rx tail went
-        /// out first and the newer slot value only on the next loop.
-        #[tokio::test]
-        async fn overflow_slot_folds_into_latest_on_resume() {
-            let gate = Arc::new(FlowControlGate::default());
-            gate.pause();
-            let (tx, mut rx) = mpsc::channel::<MonitorEvent>(8);
-            // The rx backlog is older than the overflow slot.
-            tx.send(ev(2)).await.unwrap();
-            tx.send(ev(3)).await.unwrap();
-            // Producer parked the genuine newest value in the slot once
-            // rx filled. `Cell::take` yields it once, then `None`.
-            let slot = std::cell::Cell::new(Some(ev(99)));
-            // Resume from a separate task (touches only the Send gate
-            // Arc) after the coalesce future has drained + folded the
-            // slot and parked. The coalesce future itself holds the
-            // non-Send `Cell`, so it runs on this task, not spawned.
-            let g2 = gate.clone();
-            let resumer = epics_base_rs::runtime::task::spawn(async move {
-                tokio::task::yield_now().await;
-                g2.resume();
-            });
-            let got = gate
-                .coalesce_while_paused(&mut rx, ev(1), || async { slot.take() })
-                .await
-                .expect("resume delivers the coalesced latest");
-            resumer.await.unwrap();
-            assert_eq!(
-                value_of(&got),
-                99,
-                "overflow slot (newest) must win over the stale rx tail"
-            );
-        }
-
-        /// Paused + the source channel closes → `None` (caller ends the
-        /// subscription), not a hang.
-        #[tokio::test]
-        async fn channel_close_while_paused_returns_none() {
-            let gate = Arc::new(FlowControlGate::default());
-            gate.pause();
-            let (tx, mut rx) = mpsc::channel::<MonitorEvent>(1);
-            let g2 = gate.clone();
-            let task = epics_base_rs::runtime::task::spawn(async move {
-                g2.coalesce_while_paused(&mut rx, ev(1), || async { None })
-                    .await
-            });
-            tokio::task::yield_now().await; // let the consumer park in the select
-            drop(tx); // closes the channel; rx.recv() resolves to None
-            assert!(
-                task.await.unwrap().is_none(),
-                "channel close while paused yields None"
-            );
-        }
-
-        /// A resume delivered while the consumer is parked must wake it
-        /// and flush the held value WITHOUT requiring a further rx event.
-        /// The held value is the only one ever sent, so a lost resume
-        /// wake would strand the consumer forever.
-        #[tokio::test]
-        async fn resume_flushes_held_without_further_event() {
-            let gate = Arc::new(FlowControlGate::default());
-            gate.pause();
-            let (tx, mut rx) = mpsc::channel::<MonitorEvent>(4);
-            let g2 = gate.clone();
-            let task = epics_base_rs::runtime::task::spawn(async move {
-                g2.coalesce_while_paused(&mut rx, ev(1), || async { None })
-                    .await
-            });
-            // One value arrives during the pause, then the source goes
-            // quiet — only a resume can release the consumer.
-            tx.send(ev(5)).await.unwrap();
-            tokio::task::yield_now().await;
-            gate.resume();
-            let got = tokio::time::timeout(std::time::Duration::from_secs(2), task)
-                .await
-                .expect("resume must wake a parked consumer (no lost wake)")
-                .unwrap()
-                .expect("resume delivers the held value");
-            assert_eq!(value_of(&got), 5);
-        }
-
-        /// `wait_until_resumed` (used by external callers of the gate)
-        /// must return after a resume even when the resume races the
-        /// consumer's entry — the eager `enable()` closes the same
-        /// lost-wake gap as `coalesce_while_paused`.
-        #[tokio::test]
-        async fn wait_until_resumed_unblocks_on_resume() {
-            let gate = Arc::new(FlowControlGate::default());
-            gate.pause();
-            let g2 = gate.clone();
-            let task =
-                epics_base_rs::runtime::task::spawn(async move { g2.wait_until_resumed().await });
-            tokio::task::yield_now().await; // let it park
-            gate.resume();
-            tokio::time::timeout(std::time::Duration::from_secs(2), task)
-                .await
-                .expect("wait_until_resumed must return after resume")
-                .unwrap();
         }
     }
 }

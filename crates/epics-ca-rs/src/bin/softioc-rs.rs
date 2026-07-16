@@ -33,9 +33,11 @@ struct Args {
     #[arg(long = "macro", short = 'm')]
     macros: Vec<String>,
 
-    /// Port to listen on (default: 5064)
-    #[arg(long, default_value_t = 5064)]
-    port: u16,
+    /// Port to listen on. Omit to take `EPICS_CAS_SERVER_PORT`, then
+    /// `EPICS_CA_SERVER_PORT`, then 5064 (C `caservertask.c:491-499`).
+    /// An explicit `--port 0` binds an ephemeral port.
+    #[arg(long)]
+    port: Option<u16>,
 
     /// Start interactive iocsh shell
     #[arg(long, short = 'i')]
@@ -308,7 +310,12 @@ async fn main() -> CaResult<()> {
         std::process::exit(1);
     }
 
-    let mut builder = CaServer::builder().port(args.port);
+    // The builder already seeds `port` from the EPICS environment; only an
+    // explicit `--port` may override it.
+    let mut builder = CaServer::builder();
+    if let Some(port) = args.port {
+        builder = builder.port(port);
+    }
 
     for pv_def in &args.pvs {
         let (name, value) = parse_pv_def(pv_def)?;
@@ -462,7 +469,30 @@ async fn main() -> CaResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_record_def;
+    use super::{Args, parse_record_def};
+    use clap::Parser;
+
+    /// R19-22 boundary: an omitted `--port` must reach the builder as
+    /// `None`, so `CaServerBuilder`'s env-seeded default
+    /// (`EPICS_CAS_SERVER_PORT` > `EPICS_CA_SERVER_PORT` > 5064) survives.
+    /// A clap literal here silently shadows the environment and pins the
+    /// IOC to the production port.
+    #[test]
+    fn omitted_port_defers_to_the_epics_environment() {
+        let args = Args::parse_from(["softioc-rs", "--db", "x.db"]);
+        assert_eq!(args.port, None);
+    }
+
+    /// The flag still wins over the environment, and `--port 0` is a
+    /// distinct, representable request for an ephemeral bind — the two
+    /// meanings the old `default_value_t = 5064` conflated.
+    #[test]
+    fn explicit_port_overrides_and_zero_means_ephemeral() {
+        let args = Args::parse_from(["softioc-rs", "--db", "x.db", "--port", "15070"]);
+        assert_eq!(args.port, Some(15070));
+        let args = Args::parse_from(["softioc-rs", "--db", "x.db", "--port", "0"]);
+        assert_eq!(args.port, Some(0));
+    }
 
     fn name_of(def: &str) -> String {
         parse_record_def(def).expect("valid record def").0

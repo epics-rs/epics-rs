@@ -1,6 +1,6 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, MENU_POST, MENU_YES_NO, ProcessOutcome, Record};
-use crate::types::{DbFieldType, EpicsValue, PvString};
+use crate::server::record::{MENU_POST, MENU_YES_NO, ProcessOutcome, Record};
+use crate::types::{EpicsValue, PvString};
 
 /// EPICS `MAX_STRING_SIZE` — DBR_STRING buffers are 40 bytes.
 const MAX_STRING_SIZE: usize = 40;
@@ -103,84 +103,9 @@ impl LsiRecord {
     }
 }
 
-static LSI_FIELDS: &[FieldDesc] = &[
-    FieldDesc {
-        name: "VAL",
-        dbf_type: DbFieldType::Char,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OVAL",
-        dbf_type: DbFieldType::Char,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "SIZV",
-        // C declares SIZV as DBF_USHORT (lsiRecord.dbd.pod:75): the VAL buffer
-        // size is an unsigned 16-bit count (clamped to [16, 0x7fff] at init).
-        dbf_type: DbFieldType::UShort,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LEN",
-        // C declares LEN as DBF_ULONG (lsiRecord.dbd.pod:82): the current
-        // string byte length is an unsigned 32-bit count.
-        dbf_type: DbFieldType::ULong,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "OLEN",
-        // C declares OLEN as DBF_ULONG (lsiRecord.dbd.pod:86): the previously
-        // posted byte length is an unsigned 32-bit count.
-        dbf_type: DbFieldType::ULong,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "SIMM",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIML",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIOL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIMS",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SDLY",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    // `menuPost` menu fields (DBF_MENU). Exposed as Short, matching the
-    // record's other menu field (SIMM); C `lsiRecord.dbd.pod:107/113`.
-    FieldDesc {
-        name: "MPST",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "APST",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-];
-
 impl Record for LsiRecord {
     fn record_type(&self) -> &'static str {
         "lsi"
-    }
-
-    fn field_list(&self) -> &'static [FieldDesc] {
-        LSI_FIELDS
     }
 
     /// `DBF_MENU` fields, served as `DBR_ENUM` (`lsiRecord.dbd.pod`): `SIMM`
@@ -203,6 +128,51 @@ impl Record for LsiRecord {
 
     fn uses_monitor_deadband(&self) -> bool {
         false
+    }
+
+    /// `lsiRecord.c::process` has no unconditional UDF re-derive; UDF is
+    /// cleared only where a value is actually loaded — the init-time
+    /// `dbLoadLinkLS` (`lsiRecord.c:85-88`, applied by the init-seed owner)
+    /// and the soft support's sourced read (`devLsiSoft.c`,
+    /// `if (status == 0) prec->udf = FALSE`). A process cycle that sources
+    /// nothing — e.g. a `caput .UDF 1` on a Passive record with a
+    /// constant/empty INP — must keep the client's UDF put. Opt out of the
+    /// per-cycle blanket re-derive, like `stringin`/`lso`.
+    fn clears_udf(&self) -> bool {
+        false
+    }
+
+    /// `lsiRecord.c` has NO `recGblCheckUdf` / `UDF_ALARM` (unlike
+    /// `lsoRecord.c:118`): an undefined lsi raises no alarm from UDF (softIoc:
+    /// `record(lsi,"X"){}` → UDF 1, STAT/SEVR = NO_ALARM). With `clears_udf`
+    /// false, UDF can now legitimately stay 1, so this MUST be false or
+    /// `rec_gbl_check_udf` would invent an alarm C never raises.
+    fn raises_udf_alarm(&self) -> bool {
+        false
+    }
+
+    /// C `devLsiSoft.c:24` — the soft input support's
+    /// `dbLoadLinkLS(&prec->inp, prec->val, prec->sizv, &prec->len)`. The
+    /// load runs in the init-seed owner, which gates it on the soft DTYP the
+    /// way C gates it on which device support is bound.
+    fn constant_ls_link(&self) -> Option<&'static str> {
+        Some("INP")
+    }
+
+    /// The `dbLoadLinkLS` sink plus C's init tail (`lsiRecord.c:85-88`).
+    fn apply_ls_load(&mut self, load: crate::server::record::LsLoad) -> u32 {
+        match load {
+            crate::server::record::LsLoad::Text(s) => {
+                let max = (self.sizv as usize).saturating_sub(1);
+                self.val = truncate_bytes(PvString::from(s), max);
+                self.len = (self.val.len() + 1) as u32;
+            }
+            // C's number case: the buffer is untouched, LEN comes out 1.
+            crate::server::record::LsLoad::LenOnly => self.len = 1,
+        }
+        self.oval = self.val.clone();
+        self.olen = self.len;
+        self.len
     }
 
     fn monitor_value_changed(&self) -> Option<bool> {

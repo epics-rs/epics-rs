@@ -1,6 +1,6 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, MENU_SIMM, ProcessOutcome, Record};
-use crate::types::{DbFieldType, EpicsValue};
+use crate::server::record::{MENU_SIMM, ProcessOutcome, Record};
+use crate::types::EpicsValue;
 
 use super::mbbi_direct::BIT_NAMES;
 
@@ -91,163 +91,26 @@ impl MbboDirectRecord {
     }
 }
 
-fn bit_field_descs() -> &'static [FieldDesc] {
-    macro_rules! bf {
-        ($name:literal) => {
-            FieldDesc {
-                name: $name,
-                dbf_type: DbFieldType::Char,
-                read_only: false,
-            }
-        };
-    }
-    static BITS: [FieldDesc; 32] = [
-        bf!("B0"),
-        bf!("B1"),
-        bf!("B2"),
-        bf!("B3"),
-        bf!("B4"),
-        bf!("B5"),
-        bf!("B6"),
-        bf!("B7"),
-        bf!("B8"),
-        bf!("B9"),
-        bf!("BA"),
-        bf!("BB"),
-        bf!("BC"),
-        bf!("BD"),
-        bf!("BE"),
-        bf!("BF"),
-        bf!("B10"),
-        bf!("B11"),
-        bf!("B12"),
-        bf!("B13"),
-        bf!("B14"),
-        bf!("B15"),
-        bf!("B16"),
-        bf!("B17"),
-        bf!("B18"),
-        bf!("B19"),
-        bf!("B1A"),
-        bf!("B1B"),
-        bf!("B1C"),
-        bf!("B1D"),
-        bf!("B1E"),
-        bf!("B1F"),
-    ];
-    &BITS
-}
-
-static MBBO_DIRECT_HEAD_FIELDS: &[FieldDesc] = &[
-    FieldDesc {
-        name: "VAL",
-        dbf_type: DbFieldType::Long,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "RVAL",
-        dbf_type: DbFieldType::ULong,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ORAW",
-        dbf_type: DbFieldType::ULong,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "RBV",
-        dbf_type: DbFieldType::ULong,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "ORBV",
-        dbf_type: DbFieldType::ULong,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "MASK",
-        dbf_type: DbFieldType::ULong,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SHFT",
-        dbf_type: DbFieldType::UShort,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "NOBT",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "MLST",
-        dbf_type: DbFieldType::Long,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "IVOA",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "IVOV",
-        dbf_type: DbFieldType::Long,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OMSL",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DOL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIMM",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIML",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIOL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIMS",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SDLY",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-];
-
-fn mbbo_direct_fields() -> &'static [FieldDesc] {
-    use std::sync::OnceLock;
-    static ALL: OnceLock<Vec<FieldDesc>> = OnceLock::new();
-    ALL.get_or_init(|| {
-        let mut v: Vec<FieldDesc> = MBBO_DIRECT_HEAD_FIELDS.to_vec();
-        v.extend_from_slice(bit_field_descs());
-        v
-    })
-}
-
 impl Record for MbboDirectRecord {
     fn record_type(&self) -> &'static str {
         "mbboDirect"
     }
 
-    fn field_list(&self) -> &'static [FieldDesc] {
-        mbbo_direct_fields()
+    /// C `devMbboDirectSoftRaw::write_mbbo` (`devMbboDirectSoftRaw.c:40-46`):
+    /// `data = prec->rval & prec->mask; dbPutLink(&prec->out, DBR_ULONG, &data,
+    /// 1)`, with the same dset-init mask (`nobt == 0` ⇒ `0xffffffff`, then
+    /// `<<= shft`).
+    /// C `devMbboDirectSoftRaw.c::write_mbbo` (71-75): `data = prec->rval &
+    /// prec->mask; dbPutLink(&prec->out, DBR_ULONG, &data, 1)`, with the dset's
+    /// `init_record` mask rule (`nobt == 0 -> 0xffffffff`, then `<<= shft`).
+    fn raw_soft_output_value(&self) -> Option<EpicsValue> {
+        let base = if self.nobt == 0 {
+            0xffff_ffff
+        } else {
+            self.mask
+        };
+        let mask = base.checked_shl(u32::from(self.shft)).unwrap_or(0);
+        Some(EpicsValue::ULong(self.rval & mask))
     }
 
     fn set_device_did_compute(&mut self, did: bool) {
@@ -298,6 +161,32 @@ impl Record for MbboDirectRecord {
 
     fn uses_monitor_deadband(&self) -> bool {
         false
+    }
+
+    /// C `mbboDirectRecord.c:190-195`: `process()` clears `udf` to FALSE only
+    /// when a value SOURCE ran this cycle — a successful closed-loop DOL
+    /// fetch. With no DOL (or a constant one), the `else if (prec->udf)` arm
+    /// raises UDF_ALARM at UDFS and `goto CONTINUE`s, leaving `udf`
+    /// untouched. `udf` is NEVER re-derived from the stored VAL every cycle,
+    /// so the framework's blanket per-cycle clear (`processing.rs`) is wrong
+    /// for mbboDirect: a bare `record(mbboDirect,"M"){}` with a client put to
+    /// a PP field must stay UDF=1/INVALID, not silently clear to NO_ALARM.
+    /// The real definers are covered elsewhere — a VAL put clears `udf` in
+    /// `dbPut` (`field_io.rs`), a Bn bit-field put clears it via
+    /// [`Self::is_udf_defining_put`] below, and a closed-loop DOL fetch
+    /// clears it at the DOL-apply site (`processing.rs`, C `:188`). So
+    /// mbboDirect opts out of the per-cycle clear.
+    fn clears_udf(&self) -> bool {
+        false
+    }
+
+    /// C `mbboDirectRecord.c::special` (`after==1`, B0..B1F, line 290):
+    /// `prec->udf = FALSE` — a bit-field put defines the record exactly like
+    /// a VAL put, independent of `dbIsValueField` (VAL only, `field_io.rs`'s
+    /// generic dbPut UDF clear). A client put to B0..B1F must clear UDF the
+    /// same way a VAL put does.
+    fn is_udf_defining_put(&self, field: &str) -> bool {
+        field == self.primary_field() || BIT_NAMES.contains(&field)
     }
 
     /// VAL posts DBE_VALUE|DBE_LOG
@@ -419,10 +308,18 @@ impl Record for MbboDirectRecord {
             "SIOL" => Some(EpicsValue::String(self.siol.clone().into())),
             "SIMS" => Some(EpicsValue::Short(self.sims)),
             "SDLY" => Some(EpicsValue::Double(self.sdly)),
+            // B0..B1F are DBF_UCHAR (mbboDirectRecord.dbd.pod). Serve the bit as
+            // the native `UChar` (unsigned) — it still projects to `DBR_CHAR` on
+            // the wire (`dbr.rs`: `UChar -> Char`), so a client's `caget` reports
+            // DBF_CHAR exactly as C does, but the put-coercion target derived
+            // from this value (`dbput_request`) is now the unsigned 0..=255 range
+            // instead of signed i8. C `dbFastPutConvert[DBR_STRING][DBF_UCHAR]`
+            // accepts `caput .Bn 255`; the prior `Char` representation made the
+            // port refuse everything above i8-max (128..=255).
             _ => BIT_NAMES
                 .iter()
                 .position(|&n| n == name)
-                .map(|idx| EpicsValue::Char(self.bits[idx])),
+                .map(|idx| EpicsValue::UChar(self.bits[idx])),
         }
     }
 
@@ -541,10 +438,19 @@ impl Record for MbboDirectRecord {
             }
             _ => {
                 if let Some(idx) = BIT_NAMES.iter().position(|&n| n == name) {
+                    // B0..B1F are DBF_UCHAR (mbboDirectRecord.dbd.pod), so a
+                    // numeric CA put coerces to the native `UChar`; accept it
+                    // alongside the signed variants device support / autosave
+                    // may send. C `mbboDirectRecord.c::special` (after==1, line
+                    // 282) sets the bit with `if (*pBn)` — the coerced value
+                    // defines the bit when NONZERO, not by its low bit — and
+                    // `bitsFromVAL` (line 96) then normalizes it to 0/1. So the
+                    // store rule is `value != 0`, uniform across all 32 bits.
                     let bit = match value {
-                        EpicsValue::Char(v) => v & 1,
-                        EpicsValue::Short(v) => (v & 1) as u8,
-                        EpicsValue::Long(v) => (v & 1) as u8,
+                        EpicsValue::UChar(v) => u8::from(v != 0),
+                        EpicsValue::Char(v) => u8::from(v != 0),
+                        EpicsValue::Short(v) => u8::from(v != 0),
+                        EpicsValue::Long(v) => u8::from(v != 0),
                         _ => return Err(CaError::TypeMismatch(name.into())),
                     };
                     self.bits[idx] = bit;

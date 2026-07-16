@@ -1,6 +1,6 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, MENU_SIMM, ProcessOutcome, Record};
-use crate::types::{DbFieldType, EpicsValue, PvString};
+use crate::server::record::{MENU_SIMM, ProcessOutcome, RawSoftEntry, Record};
+use crate::types::{EpicsValue, PvString};
 
 /// Binary input record matching C biRecord behavior.
 /// RVAL from device support is converted to VAL (0 or 1).
@@ -26,6 +26,10 @@ pub struct BiRecord {
     pub simm: i16,
     pub siml: String,
     pub siol: String,
+    // SVAL is `DBF_ULONG` (biRecord.dbd.pod:263-265) — the BUFFER C's
+    // `readValue` reads SIOL into (`dbGetLink(&prec->siol, DBR_ULONG,
+    // &prec->sval)`, biRecord.c:289) before publishing `val = sval`.
+    pub sval: u32,
     pub sims: i16,
     pub sdly: f64,
     // Internal: skip RVAL->VAL when soft INP set VAL directly
@@ -54,6 +58,7 @@ impl Default for BiRecord {
             simm: 0,
             siml: String::new(),
             siol: String::new(),
+            sval: 0,
             sims: 0,
             sdly: -1.0,
             skip_convert: false,
@@ -70,89 +75,6 @@ impl BiRecord {
         }
     }
 }
-
-static FIELDS: &[FieldDesc] = &[
-    FieldDesc {
-        name: "VAL",
-        dbf_type: DbFieldType::Enum,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "RVAL",
-        dbf_type: DbFieldType::ULong,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ORAW",
-        dbf_type: DbFieldType::ULong,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "MASK",
-        dbf_type: DbFieldType::ULong,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ZNAM",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ONAM",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ZSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "COSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LALM",
-        dbf_type: DbFieldType::UShort,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "MLST",
-        dbf_type: DbFieldType::UShort,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "SIMM",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIML",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIOL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIMS",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SDLY",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-];
 
 impl Record for BiRecord {
     fn record_type(&self) -> &'static str {
@@ -240,8 +162,12 @@ impl Record for BiRecord {
         use crate::server::recgbl::{self, alarm_status};
         use crate::server::record::AlarmSeverity;
 
-        if common.udf {
-            recgbl::rec_gbl_set_sevr(common, alarm_status::UDF_ALARM, common.udfs);
+        if common.udf != 0 {
+            recgbl::rec_gbl_set_sevr(
+                common,
+                alarm_status::UDF_ALARM,
+                AlarmSeverity::from_u16(common.udfs as u16),
+            );
             return;
         }
         let val = self.val;
@@ -264,24 +190,37 @@ impl Record for BiRecord {
         }
     }
 
-    fn accepts_raw_soft_input(&self) -> bool {
-        true
+    /// C rset `get_enum_strs`/`put_enum_str` (biRecord.c:275-298) — ZNAM/ONAM.
+    fn enum_state_strings(&self) -> Option<Vec<PvString>> {
+        Some(crate::server::record::binary_enum_states(
+            &self.znam, &self.onam,
+        ))
     }
 
-    /// `DTYP="Raw Soft Channel"` reads the link value into `RVAL` and
-    /// applies `MASK` (epics-base f2fe9d12, devBiSoftRaw): a non-zero
-    /// MASK gates which bits of the source contribute to the
-    /// subsequent RVAL→VAL conversion.
-    fn apply_raw_input(&mut self, value: EpicsValue) -> CaResult<()> {
-        let rval = value.to_f64().map(|f| f as i32).ok_or_else(|| {
-            CaError::TypeMismatch("bi Raw Soft Channel: INP value not numeric".into())
-        })?;
-        // RVAL is DBF_ULONG; preserve the bit pattern of the i32 conversion.
-        self.rval = rval as u32;
-        if self.mask != 0 {
+    /// C `get_enum_str` (biRecord.c:173-192): VAL 0 -> ZNAM, 1 -> ONAM, and any
+    /// other index -> `"Illegal_Value"`. Slot 1 is indexed even when ONAM is
+    /// empty, so it renders empty — the `no_str` trim in `enum_state_strings`
+    /// is the LABEL list's, not this read's.
+    fn enum_string_form(&self) -> Option<crate::server::snapshot::EnumStringForm> {
+        Some(crate::server::record::binary_enum_string_form(
+            &self.znam, &self.onam,
+        ))
+    }
+
+    /// C `devBiSoftRaw` — `recGblInitConstantLink(&prec->inp, DBF_ULONG,
+    /// &prec->rval)` at init, `dbGetLink(.., DBR_ULONG, &prec->rval, ..)` +
+    /// `if (prec->mask) prec->rval &= prec->mask;` per read (epics-base
+    /// `f2fe9d12`). The mask is in `read_bi` ONLY, so the init constant load is
+    /// unmasked.
+    fn raw_soft_input(&mut self, entry: RawSoftEntry, value: EpicsValue) -> Option<CaResult<()>> {
+        self.rval = match super::raw_soft_rval_u32("bi", &value) {
+            Ok(rval) => rval,
+            Err(e) => return Some(Err(e)),
+        };
+        if entry == RawSoftEntry::Read && self.mask != 0 {
             self.rval &= self.mask;
         }
-        Ok(())
+        Some(Ok(()))
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
@@ -321,22 +260,21 @@ impl Record for BiRecord {
                     self.val = v as u16;
                     Ok(())
                 }
-                // epics-base PR/issue #183 — DBF_MENU ↔ DBF_STRING.
-                // Accept the ZNAM/ONAM string and convert to the
-                // enum index. Mirrors the upstream fix that lets a
-                // bi VAL be written from a string-typed source link.
-                EpicsValue::String(s) => {
-                    if s == self.znam {
-                        self.val = 0;
-                        Ok(())
-                    } else if s == self.onam {
-                        self.val = 1;
-                        Ok(())
-                    } else {
-                        Err(CaError::TypeMismatch(format!(
-                            "bi VAL: '{s}' matches neither ZNAM nor ONAM"
-                        )))
+                // C rset `put_enum_str` (biRecord.c:290-298), reached from
+                // `dbConvert.c::putStringEnum`. The framework's put paths
+                // already resolve a DBR_STRING against `enum_state_strings`
+                // before they reach here; a direct caller takes the same
+                // converter, so there is one string→state rule.
+                EpicsValue::String(ref s) => {
+                    let resolved = crate::server::record::resolve_enum_state_string(
+                        "VAL",
+                        self.enum_state_strings().as_deref(),
+                        s,
+                    )?;
+                    if let EpicsValue::Enum(v) = resolved {
+                        self.val = v;
                     }
+                    Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
@@ -460,10 +398,6 @@ impl Record for BiRecord {
             },
             _ => Err(CaError::FieldNotFound(name.into())),
         }
-    }
-
-    fn field_list(&self) -> &'static [FieldDesc] {
-        FIELDS
     }
 
     /// `SIMM` is `DBF_MENU menu(menuSimm)` (`biRecord.dbd.pod`): the binary

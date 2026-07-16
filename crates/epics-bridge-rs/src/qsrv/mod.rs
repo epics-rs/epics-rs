@@ -30,6 +30,7 @@ pub mod group_config;
 pub mod iocsh;
 pub mod monitor;
 pub mod provider;
+pub(crate) mod put_status;
 #[cfg(feature = "qsrv")]
 pub mod pva_adapter;
 pub mod pvif;

@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use crate::error::CaResult;
-use crate::runtime::sync::mpsc;
+use crate::server::event_queue::EventReader;
 use crate::server::pv::MonitorEvent;
 use crate::server::recgbl::EventMask;
 use crate::types::{DbFieldType, EpicsValue};
@@ -203,7 +203,11 @@ impl DbChannel {
             .ok()
             .and_then(|v| match v {
                 EpicsValue::Long(i) => Some(i),
-                other => other.to_f64().map(|f| f as i32),
+                // C `dbGetLink(.., DBR_LONG, ..)` picks its conversion routine by
+                // the SOURCE type, so this goes through the coercion owner rather
+                // than `c_cast` direct: an integer source takes C's defined
+                // modular conversion, only a float source takes the UB cast.
+                other => other.to_dbf_i32(),
             })
             .unwrap_or(0)
     }
@@ -220,18 +224,16 @@ impl DbChannel {
 /// Subscribe to value changes on a PV via the database's subscriber mechanism.
 /// No polling — the record's process cycle pushes changes through the channel.
 pub struct DbSubscription {
-    rx: mpsc::Receiver<MonitorEvent>,
+    /// Consumer half of this subscription's slot in the record's event queue
+    /// (C `evSubscrip` + `event_read`). An in-process consumer is its own C
+    /// `event_user`, so nothing else shares its queue.
+    reader: EventReader,
     pv_name: String,
     /// If non-zero, events with this origin are silently skipped.
     /// Used to filter out self-triggered events from the same writer.
     ignore_origin: u64,
-    /// Reference back to the record + this subscription's sid so each
-    /// `recv*` can pull any pending coalesced overflow event the
-    /// producer stashed when the bounded mpsc was full. Without this,
-    /// in-process consumers (pvalink, gateway, qsrv) silently dropped
-    /// the latest event of every burst-overrun. The CA TCP
-    /// dispatcher already drains coalesced via `pop_coalesced`; this
-    /// puts every consumer on the same path.
+    /// Reference back to the record + this subscription's sid, for the
+    /// enable/disable (`db_event_disable`) path and the `Drop` reaper.
     record: std::sync::Arc<tokio::sync::RwLock<crate::server::record::RecordInstance>>,
     sid: u32,
 }
@@ -310,18 +312,18 @@ impl DbSubscription {
         let field = field.to_ascii_uppercase();
         let rec = db.get_record(record_name).await?;
         let sid = next_sid();
-        let rx = {
+        let reader = {
             let mut instance = rec.write().await;
-            let rx = instance.add_subscriber(&field, sid, DbFieldType::Double, mask)?;
+            let reader = instance.add_subscriber(&field, sid, DbFieldType::Double, mask)?;
             if let Some(chain) = filters {
                 for filter in chain.iter() {
                     instance.attach_filter_to_last_subscriber(&field, filter.clone());
                 }
             }
-            rx
+            reader
         };
         Some(Self {
-            rx,
+            reader,
             pv_name: pv_name.to_string(),
             ignore_origin,
             record: rec,
@@ -332,11 +334,12 @@ impl DbSubscription {
     /// Pause (`active == false`) or resume (`true`) this subscription's
     /// event flow at the source, the in-process equivalent of EPICS
     /// `db_event_disable` / `db_event_enable`. While paused, the record
-    /// posts no events to this subscriber and any pending coalesced
-    /// overflow is dropped, so the backing record stops doing
-    /// per-event work for this monitor (pvxs `onStart(false)`); the
-    /// subscription object survives so the same handle resumes on
-    /// re-enable. Idempotent.
+    /// posts no events to this subscriber, so it stops doing per-event
+    /// work for this monitor (pvxs `onStart(false)`); the subscription
+    /// object survives so the same handle resumes on re-enable, and
+    /// entries already queued still drain (C `db_event_disable` unlinks
+    /// the monitor from the record, it does not touch the event queue).
+    /// Idempotent.
     pub async fn set_active(&self, active: bool) {
         self.record
             .write()
@@ -356,23 +359,14 @@ impl DbSubscription {
         }
     }
 
-    /// Fold the latest pending coalesced event (set when the per-
-    /// subscriber mpsc filled mid-burst) into delivery AFTER each
-    /// successful `rx.recv()`. When the coalesce slot holds a newer value,
-    /// [`crate::server::pv::coalesce_consume`] returns it AND drains the
-    /// now-stale queue tail, so the caller observes the freshest value of a
-    /// burst and never steps back to an older queued snapshot afterward —
-    /// the same ordering rule `PvSubscription::recv_snapshot` applies.
+    /// Await the next event from this subscription's queue (C `event_read`).
+    /// A consumer that falls behind sees what a C monitor sees: its earlier
+    /// distinct queued updates, then a tail entry carrying the latest value,
+    /// because once the queue ran short of room further posts replaced that
+    /// entry in place instead of appending (`dbEvent.c:812-820`).
     async fn next_event(&mut self) -> Option<MonitorEvent> {
         loop {
-            let queued = self.rx.recv().await?;
-            // Take any newer event the producer stashed in the coalesce
-            // slot while the mpsc was full and discard the stale backlog.
-            // Without this, an in-process consumer that briefly fell behind
-            // would deliver the freshest value and then replay older queued
-            // values (newest-then-old).
-            let coalesced = self.record.read().await.pop_coalesced(self.sid);
-            let event = crate::server::pv::coalesce_consume(&mut self.rx, queued, coalesced);
+            let event = self.reader.recv().await?;
             if self.ignore_origin != 0 && event.origin == self.ignore_origin {
                 continue;
             }
@@ -425,12 +419,11 @@ impl Drop for DbSubscription {
     /// Remove this subscription's `Subscriber` slot from the record's
     /// per-field subscriber Vec. Without this, an in-process consumer
     /// that drops a `DbSubscription` (pvalink, qsrv, gateway, etc.)
-    /// leaves a dead `(sid, tx, coalesced)` entry in
-    /// `RecordInstance.subscribers`. Every subsequent
-    /// `notify_field_with_origin` then runs `tx.try_send(event.clone())`
-    /// against a closed mpsc — wasted clones, wasted contention on
-    /// the record lock, and over time an O(N_dropped_subs) tax on
-    /// every record process cycle.
+    /// leaves a dead subscriber row in `RecordInstance.subscribers`.
+    /// Every subsequent `notify_field_with_origin` then builds and posts
+    /// an event to a queue slot nobody reads — wasted clones, wasted
+    /// contention on the record lock, and over time an O(N_dropped_subs)
+    /// tax on every record process cycle.
     ///
     /// CA TCP server-side cleanup at `server/tcp.rs:1649` already
     /// calls `remove_subscriber` on disconnect; this Drop closes the
@@ -489,7 +482,7 @@ impl DbMultiMonitor {
     pub async fn wait_change(&mut self) -> (String, f64) {
         loop {
             for sub in &mut self.subs {
-                match sub.rx.try_recv() {
+                match sub.reader.try_recv() {
                     Ok(event) => {
                         // Skip self-triggered events
                         if sub.ignore_origin != 0 && event.origin == sub.ignore_origin {

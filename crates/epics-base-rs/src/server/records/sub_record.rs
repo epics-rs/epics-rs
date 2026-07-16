@@ -1,6 +1,6 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, ProcessOutcome, Record};
-use crate::types::{DbFieldType, EpicsValue, PvString};
+use crate::server::record::{InputFetchPolicy, ProcessOutcome, Record};
+use crate::types::{EpicsValue, PvString};
 
 /// Number of subroutine input arguments. C `subRecord.c`:
 /// `#define INP_ARG_MAX 21` — fields `A..U` / `INPA..INPU`.
@@ -96,118 +96,6 @@ impl Default for SubRecord {
     }
 }
 
-static SUB_FIELDS: &[FieldDesc] = &[
-    FieldDesc {
-        name: "VAL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SNAM",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    // INAM: init-routine name, SPC_NOMOD (config; .db-load only).
-    FieldDesc {
-        name: "INAM",
-        dbf_type: DbFieldType::String,
-        read_only: true,
-    },
-    // Monitor/archive deadbands (client-writable) + last-posted/alarm
-    // trackers (SPC_NOMOD in C, read-only to clients).
-    FieldDesc {
-        name: "MDEL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ADEL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LALM",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "MLST",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "ALST",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    // Bad-return severity menu (menuAlarmSevr).
-    FieldDesc {
-        name: "BRSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    // INPA..INPU
-    field_str("INPA"),
-    field_str("INPB"),
-    field_str("INPC"),
-    field_str("INPD"),
-    field_str("INPE"),
-    field_str("INPF"),
-    field_str("INPG"),
-    field_str("INPH"),
-    field_str("INPI"),
-    field_str("INPJ"),
-    field_str("INPK"),
-    field_str("INPL"),
-    field_str("INPM"),
-    field_str("INPN"),
-    field_str("INPO"),
-    field_str("INPP"),
-    field_str("INPQ"),
-    field_str("INPR"),
-    field_str("INPS"),
-    field_str("INPT"),
-    field_str("INPU"),
-    // A..U
-    field_dbl("A"),
-    field_dbl("B"),
-    field_dbl("C"),
-    field_dbl("D"),
-    field_dbl("E"),
-    field_dbl("F"),
-    field_dbl("G"),
-    field_dbl("H"),
-    field_dbl("I"),
-    field_dbl("J"),
-    field_dbl("K"),
-    field_dbl("L"),
-    field_dbl("M"),
-    field_dbl("N"),
-    field_dbl("O"),
-    field_dbl("P"),
-    field_dbl("Q"),
-    field_dbl("R"),
-    field_dbl("S"),
-    field_dbl("T"),
-    field_dbl("U"),
-];
-
-const fn field_str(name: &'static str) -> FieldDesc {
-    FieldDesc {
-        name,
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    }
-}
-
-const fn field_dbl(name: &'static str) -> FieldDesc {
-    FieldDesc {
-        name,
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    }
-}
-
 impl Record for SubRecord {
     fn record_type(&self) -> &'static str {
         "sub"
@@ -223,6 +111,19 @@ impl Record for SubRecord {
             self.lalm = self.val;
         }
         Ok(())
+    }
+
+    /// C `subRecord.c:119-123`: an empty `SNAM` names no subroutine, so
+    /// `init_record` prints `"%s.SNAM is empty"`, sets `prec->pact = TRUE` and
+    /// returns 0 — the record serves its fields forever and never processes
+    /// again. Measured: `caget -t P:SUB.PACT` on a bare `record(sub,"P:SUB"){}`
+    /// reads 1.
+    ///
+    /// The non-empty-but-unregistered case is NOT this one: C returns
+    /// `S_db_BadSub` there (`:125-129`), which is an init FAILURE, not a PACT
+    /// park.
+    fn init_record_parks_pact(&self) -> bool {
+        self.snam.is_empty()
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
@@ -252,6 +153,16 @@ impl Record for SubRecord {
             return Some(EpicsValue::Double(self.a[idx]));
         }
         None
+    }
+
+    /// C `subRecord.c::special` (SPC_MOD on SNAM, `:188-193`) resolves the name
+    /// via `registryFunctionFind` and returns `S_db_BadSub` for a non-empty
+    /// unregistered name — sub has no LFLG, so every SNAM put is validated. The
+    /// empty-name case is accepted (C parks PACT instead; see
+    /// [`Self::init_record_parks_pact`]). The registry lookup itself is
+    /// performed by the put owner; see [`Record::is_subroutine_name_field`].
+    fn is_subroutine_name_field(&self, field: &str) -> bool {
+        field == "SNAM"
     }
 
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
@@ -324,12 +235,22 @@ impl Record for SubRecord {
         Err(CaError::FieldNotFound(name.to_string()))
     }
 
-    fn field_list(&self) -> &'static [FieldDesc] {
-        SUB_FIELDS
+    /// C `subRecord.c:104`: every CONSTANT input link is loaded into its value
+    /// field ONCE, at `init_record` (`recGblInitConstantLink(plink,
+    /// DBF_DOUBLE, pvalue)`); `dbGetLink` then delivers nothing for it on
+    /// every later process, so a client's `caput REC.A 99` stands.
+    fn constant_init_links(&self) -> Vec<crate::server::record::ConstantInitLink> {
+        crate::server::record::seed_input_links(self.multi_input_links())
     }
 
     fn multi_input_links(&self) -> &[(&'static str, &'static str)] {
         &INP_VAL_PAIRS
+    }
+
+    /// C `subRecord.c::fetch_values` (407-418) returns -1 on the first failed
+    /// `dbGetLink` and `process` (146) then skips `do_sub`.
+    fn input_fetch_policy(&self) -> InputFetchPolicy {
+        InputFetchPolicy::AbortOnFirstFailure
     }
 }
 
@@ -350,6 +271,17 @@ mod tests {
                 .unwrap();
             assert_eq!(rec.get_field(name), Some(EpicsValue::String("src".into())));
         }
+    }
+
+    /// C `subRecord.c::special` validates every SNAM put via
+    /// `registryFunctionFind` (sub has no LFLG); no other field is a
+    /// subroutine name.
+    #[test]
+    fn snam_is_the_subroutine_name_field() {
+        let rec = SubRecord::default();
+        assert!(rec.is_subroutine_name_field("SNAM"));
+        assert!(!rec.is_subroutine_name_field("INAM"));
+        assert!(!rec.is_subroutine_name_field("VAL"));
     }
 
     /// All 21 input channels are wired into `multi_input_links`.

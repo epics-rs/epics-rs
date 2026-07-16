@@ -14,32 +14,32 @@ pub struct LonginRecord {
     pub hopr: i32,
     #[field(type = "Long")]
     pub lopr: i32,
-    // Alarm thresholds
-    #[field(type = "Long")]
-    pub hihi: i32,
-    #[field(type = "Long")]
-    pub high: i32,
-    #[field(type = "Long")]
-    pub low: i32,
-    #[field(type = "Long")]
-    pub lolo: i32,
-    #[field(type = "Short")]
-    pub hhsv: i16,
-    #[field(type = "Short")]
-    pub hsv: i16,
-    #[field(type = "Short")]
-    pub lsv: i16,
-    #[field(type = "Short")]
-    pub llsv: i16,
-    #[field(type = "Double")]
-    pub hyst: f64,
+    // Alarm thresholds (HIHI/HIGH/LOW/LOLO), severities (HHSV/HSV/LSV/LLSV)
+    // and the alarm hysteresis (HYST) are NOT record-owned fields: they are
+    // dbCommon-adjacent state owned by `CommonFields` — the limits/severities
+    // in `CommonFields::analog_alarm` and HYST in `CommonFields::hyst`. The
+    // record's `checkAlarms` ladder (`RecordInstance::evaluate_analog_alarm`)
+    // reads them from there, so a record-local copy would be a second,
+    // never-consulted owner: a `caput LI.HHSV INVALID` stored into a shadow
+    // field left `analog_alarm.hhsv` at NO_ALARM and the alarm never fired.
+    // Omitting the fields routes their get/put through the common-field path
+    // (the single owner), exactly as `ai`/`int64in` do. LALM (last-alarmed
+    // value) below IS record state — `evaluate_analog_alarm` reads it via
+    // `self.record.get_field("LALM")` — so it stays.
     #[field(type = "Double")]
     pub lalm: f64,
-    // Deadband
-    #[field(type = "Double")]
-    pub adel: f64,
-    #[field(type = "Double")]
-    pub mdel: f64,
+    // Deadband. ADEL/MDEL are `DBF_LONG` (longinRecord.dbd.pod) — the archive
+    // and monitor deadbands are integer counts, not doubles. Stored as `i32`
+    // (not `f64`) so the client-put target resolves to `DBF_LONG` and a string
+    // put parses through the single `c_parse::put_string` owner's `Long` row,
+    // which REFUSES an over-i32/under-i32 value exactly as C's `epicsParseInt32`
+    // does — instead of the `DBF_DOUBLE` row accepting it and the read-path
+    // projection saturating it to `i32::MAX`/`MIN`. Mirrors Cause A/B of the
+    // put-conversion family (int64in/int64out DBF_INT64, commit 224d5ad5).
+    #[field(type = "Long")]
+    pub adel: i32,
+    #[field(type = "Long")]
+    pub mdel: i32,
     // Alarm-range time-constant filter (longinRecord.c::checkAlarms:310-356).
     // AFTC > 0 low-pass-filters the integer alarmRange so transient
     // excursions don't immediately alarm; AFVL is the accumulator.
@@ -59,8 +59,22 @@ pub struct LonginRecord {
     pub siml: String,
     #[field(type = "String")]
     pub siol: String,
+    // SVAL is `DBF_LONG` (longinRecord.dbd.pod:466-468) — the BUFFER C's
+    // `readValue` reads SIOL into (`dbGetLink(&prec->siol, DBR_LONG,
+    // &prec->sval)`, longinRecord.c:416) before publishing `val = sval`. An
+    // unset (constant) SIOL reads status 0 without touching it, which is what
+    // makes `caput REC.SIMM 1; caput REC.SVAL 42` simulate against a constant.
+    #[field(type = "Long")]
+    pub sval: i32,
     #[field(type = "Short")]
     pub sims: i16,
+    // SDLY — "Sim. Mode Async Delay" (`DBF_DOUBLE`, `initial("-1.0")`,
+    // longinRecord.dbd.pod:497-503). A non-negative SDLY makes the simulated SIOL read asynchronous:
+    // C's `readValue` arms `callbackRequestProcessCallbackDelayed(..., sdly)`
+    // and holds PACT across the delay (longinRecord.c:405-412). The framework reads the delay
+    // via `get_field("SDLY")`, so the field must exist for a `.db` to set it.
+    #[field(type = "Double")]
+    pub sdly: f64,
 }
 
 impl Default for LonginRecord {
@@ -70,18 +84,9 @@ impl Default for LonginRecord {
             egu: PvString::new(),
             hopr: 0,
             lopr: 0,
-            hihi: 0,
-            high: 0,
-            low: 0,
-            lolo: 0,
-            hhsv: 0,
-            hsv: 0,
-            lsv: 0,
-            llsv: 0,
-            hyst: 0.0,
             lalm: 0.0,
-            adel: 0.0,
-            mdel: 0.0,
+            adel: 0,
+            mdel: 0,
             aftc: 0.0,
             afvl: 0.0,
             alst: 0.0,
@@ -89,7 +94,11 @@ impl Default for LonginRecord {
             simm: 0,
             siml: String::new(),
             siol: String::new(),
+            sval: 0,
             sims: 0,
+            // C `field(SDLY,DBF_DOUBLE) { initial("-1.0") }` — negative means
+            // "synchronous simulation".
+            sdly: -1.0,
         }
     }
 }

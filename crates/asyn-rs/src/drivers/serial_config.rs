@@ -97,26 +97,7 @@ impl SerialConfig {
     }
 }
 
-/// Parse a boolean option value.
-///
-/// Accepted truthy value (case-insensitive): `Y`. Accepted falsy value
-/// (case-insensitive): `N`. Returns `Err` for any other value.
-pub fn parse_bool_option(value: &str) -> AsynResult<bool> {
-    // C drvAsynSerialPort.c::setOption validates the boolean serial options
-    // (clocal/crtscts/ixon/ixoff/ixany, lines 410-504) strictly with
-    // epicsStrCaseCmp(val,"Y")/("N"): only "Y"/"N" (case-insensitive) are
-    // accepted; anything else returns asynError "Invalid <key> value."
-    // Match that strict accept-set instead of the looser y/yes/1/true
-    // coercion, so a typo errors rather than silently selecting the wrong
-    // setting (the same reason disconnectOnReadTimeout/noDelay are strict).
-    if value.eq_ignore_ascii_case("Y") {
-        Ok(true)
-    } else if value.eq_ignore_ascii_case("N") {
-        Ok(false)
-    } else {
-        Err(AsynError::Status {
-            status: AsynStatus::Error,
-            message: format!("invalid boolean value: '{value}' (expected Y or N)"),
-        })
-    }
-}
+// The boolean option value grammar (C's `epicsStrCaseCmp(val,"Y"/"N")`) and its
+// per-key diagnostic live with the rest of the C option grammar, in
+// [`super::option_parse::parse_yn_option`] — every backend, serial and IP, takes
+// it from there.

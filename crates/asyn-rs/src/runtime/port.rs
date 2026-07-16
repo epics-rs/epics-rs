@@ -95,6 +95,56 @@ impl PortRuntimeHandle {
     }
 }
 
+/// The one way to wait for a port's connect — C `waitConnect`
+/// (asynManager.c:3292-3336), which arms an exception handler and only then
+/// blocks on the event.
+///
+/// Arming first is the whole point: a connect that lands between "am I
+/// connected?" and "start waiting" would be missed by any caller that checked
+/// the flag first. So [`Self::arm`] registers the callback, the caller may then
+/// short-circuit on an already-connected port (C :3308-3311), and
+/// [`Self::wait`] blocks for the rest. Both waiters in the crate — port
+/// registration and the iocsh `asynWaitConnect` — go through it, so neither can
+/// grow its own race.
+pub struct ConnectWaiter {
+    rx: std::sync::mpsc::Receiver<()>,
+    services: crate::services::PortServices,
+    callback: crate::exception::ExceptionCallbackId,
+}
+
+impl ConnectWaiter {
+    /// Register for `port_name`'s connect exception. From here on the connect
+    /// cannot be missed, only waited for.
+    pub fn arm(services: &crate::services::PortServices, port_name: &str) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let waited_on = port_name.to_string();
+        let callback = services.exceptions().add_callback(move |event| {
+            if event.exception == crate::exception::AsynException::Connect
+                && event.port_name == waited_on
+            {
+                let _ = tx.send(());
+            }
+        });
+        Self {
+            rx,
+            services: services.clone(),
+            callback,
+        }
+    }
+
+    /// Block until the connect exception arrives or `timeout` elapses.
+    /// `true` = connected.
+    pub fn wait(self, timeout: std::time::Duration) -> bool {
+        self.rx.recv_timeout(timeout).is_ok()
+    }
+}
+
+impl Drop for ConnectWaiter {
+    fn drop(&mut self) {
+        self.services.exceptions().remove_callback(self.callback);
+    }
+}
+
 /// Create a port runtime from a driver.
 ///
 /// Returns:
@@ -111,13 +161,43 @@ pub fn create_port_runtime<D: PortDriver>(
 
 /// Create a port runtime from a boxed driver.
 pub fn create_port_runtime_boxed(
-    driver: Box<dyn PortDriver>,
+    mut driver: Box<dyn PortDriver>,
     config: RuntimeConfig,
 ) -> (PortRuntimeHandle, std::thread::JoinHandle<()>) {
+    // The one site that binds a port to its trace configuration and exception
+    // list. C does it inside `registerPort` — the sole path into the port list
+    // — so no port can exist without them (asynManager.c:503, :611-637). Every
+    // port creator in this crate (`PortManager::register_port`, the
+    // `drvAsyn*PortConfigure` iocsh commands, driver-owned ports) funnels
+    // through here, so binding here is what makes that true for the port too.
+    config.services.bind(driver.base_mut());
+
+    // C `registerInterface(asynCommonType)` — reached from `registerPort` for
+    // every port — calls `initPortConnect` and then `portConnectTimerCallback`
+    // (asynManager.c:2131-2136), which queues a connect at
+    // `asynQueuePriorityConnect` the moment the port exists (:3252-3266). An
+    // auto-connect port is therefore brought up BY REGISTRATION, not by whichever
+    // record first happens to do I/O: `CNCT` reads 1 straight after
+    // `drvAsynIPPortConfigure`, and a port no record ever talks to still comes up.
+    //
+    // Arming the actor's connect deadline is that queued request: the actor runs
+    // `service_connect_timer` ahead of anything in its queue, which is what C's
+    // Connect priority buys. It re-arms itself at `secondsBetweenPortConnect` on
+    // failure (C :3281), so a port whose device is down keeps trying without a
+    // single request ever being submitted.
+    let connect_at_registration = driver.base().auto_connect && !driver.base().is_connected();
+    if connect_at_registration {
+        driver.base_mut().connect_retry_at = Some(std::time::Instant::now());
+    }
+
     let port_name = driver.base().port_name.clone();
     let can_block = driver.base().flags.can_block;
     let multi_device = driver.base().flags.multi_device;
     let max_addr = driver.base().max_addr as i32;
+    // The driver's interface declaration, taken once here — C's port
+    // registration is where `registerInterface` is called too, and the set never
+    // changes afterwards (asynManager.c:2100-2120).
+    let interfaces = driver.capabilities();
 
     // Event broadcast
     let (event_tx, _) = broadcast::channel(256);
@@ -141,6 +221,14 @@ pub fn create_port_runtime_boxed(
     let event_tx_clone = event_tx.clone();
     let name_clone = port_name.clone();
 
+    // C's `waitConnect` (asynManager.c:2135, :3288-3336): registration waits on
+    // the port's *connect exception* for at most `autoConnectTimeout`, so the
+    // line of st.cmd after `drvAsynIPPortConfigure` already sees a live port.
+    // The waiter is armed before the actor thread exists, so the connect it
+    // waits for cannot fire ahead of it.
+    let connect_wait =
+        connect_at_registration.then(|| ConnectWaiter::arm(&config.services, &port_name));
+
     let join_handle = std::thread::Builder::new()
         .name(format!("asyn-runtime-{port_name}"))
         .spawn(move || {
@@ -155,9 +243,16 @@ pub fn create_port_runtime_boxed(
         })
         .expect("failed to spawn port runtime thread");
 
+    if let Some(waiter) = connect_wait {
+        // A timeout is not a failure: C ignores `waitConnect`'s status here and
+        // the port's own retry timer carries on (asynManager.c:2135, :3281).
+        let _ = waiter.wait(config.auto_connect_timeout);
+    }
+
     let mut port_handle = PortHandle::new(tx, port_name.clone(), handle_interrupts, actor_id);
     port_handle.set_can_block(can_block);
     port_handle.set_capabilities(multi_device, max_addr);
+    port_handle.set_interfaces(interfaces);
     let client = InProcessClient::new(port_handle.clone());
 
     let handle = PortRuntimeHandle {

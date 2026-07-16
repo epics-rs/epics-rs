@@ -1,6 +1,7 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, ProcessOutcome, Record};
-use crate::types::{DbFieldType, EpicsValue, PvString};
+use crate::server::record::{ProcessOutcome, Record};
+use crate::server::records::count_put;
+use crate::types::{EpicsValue, PvString};
 
 /// Compress record — circular buffer with compression algorithms.
 ///
@@ -20,14 +21,13 @@ use crate::types::{DbFieldType, EpicsValue, PvString};
 /// Circular-Buffer code path.
 pub struct CompressRecord {
     pub val: Vec<f64>,
-    pub nsam: i32,   // Number of samples (buffer size)
-    pub inp: String, // input link
-    pub alg: i16,    // See top-of-struct doc — matches menuCompressALG
-    pub n: i32,      // Number of values to compress
-    pub nuse: i32,   // Number of elements used
-    pub off: i32,    // Current write offset (see `put_one` for BALG-dependent role)
-    pub res: i16,    // Reset flag
-    pub balg: i16,   // 0=FIFO, 1=LIFO — `menuBufferingALG`
+    pub nsam: i32, // Number of samples (buffer size)
+    pub alg: i16,  // See top-of-struct doc — matches menuCompressALG
+    pub n: i32,    // Number of values to compress
+    pub nuse: i32, // Number of elements used
+    pub off: i32,  // Current write offset (see `put_one` for BALG-dependent role)
+    pub res: i16,  // Reset flag
+    pub balg: i16, // 0=FIFO, 1=LIFO — `menuBufferingALG`
     /// `ILIL` (input low limit). When `ILIL < IHIL`, samples outside
     /// `[ILIL, IHIL]` are dropped before compression (C
     /// `compress_array` skip loop, compressRecord.c:163-170).
@@ -45,6 +45,11 @@ pub struct CompressRecord {
     /// `(inx*cvb + value)/(inx+1)`. Exposed as a readable field so a
     /// CA client can observe the partial accumulation mid-cycle.
     pub cvb: f64,
+    /// `OUSE` (old number used) — C `prec->ouse`, `special(SPC_NOMOD)`
+    /// (compressRecord.dbd.pod:481-484). The latch behind C `monitor()`'s
+    /// "post NUSE only when it changed" rule (compressRecord.c:104-108); see
+    /// [`Self::monitor`]. Readable, never client-writable.
+    pub ouse: i32,
     /// `PBUF` (partial buffer) — epics-base 7.0.8.
     /// `0 = NO` (default): VAL is read by clients as the whole NSAM
     /// vector; the leading `NUSE` elements are valid, the rest are
@@ -76,11 +81,30 @@ pub struct CompressRecord {
     // each cycle in `pre_process_actions`.
     cycle_ingested: bool,
     cycle_emitted: bool,
-    // C `prec->inpn`: the INP source's element count from the previous
-    // INP-driven ingest. When the count changes between cycles the
-    // accumulation buffer is reset and restarted at the new length
-    // (compressRecord.c:334-340).
+    /// `INPN` — C `prec->inpn`, `DBF_LONG special(SPC_NOMOD)`
+    /// (compressRecord.dbd.pod:503-506), "Number of elements in Working
+    /// Buffer": the INP source's element count from the previous INP-driven
+    /// ingest, and the trigger for C's WPTR reallocation — when it changes
+    /// between cycles C frees the working buffer and `reset()`s
+    /// (compressRecord.c:334-340).
+    ///
+    /// KNOWN DIVERGENCE in the value served. C latches
+    /// `dbGetNelements(&prec->inp, &nelements)` — the source's element
+    /// CAPACITY — before the read; the port latches the length the framework's
+    /// `ReadDbLink` actually delivered. For a `waveform` source with NELM=3 and
+    /// NORD=1, softIoc reads `CMP2.INPN = 3` where the port reads 1. Closing it
+    /// needs the source capacity plumbed through `ReadDbLink`, which no other
+    /// record needs; the reset trigger itself is unaffected in practice (a
+    /// source's capacity and its delivered length both change exactly when the
+    /// source array is re-shaped).
     inpn: usize,
+    /// What C `monitor()` (:100-110) decided to post for the SPC_RESET put now
+    /// in flight. Written by [`Self::monitor`] — the only place that makes the
+    /// decision, and the only writer of `ouse` — and read back by
+    /// `monitor_side_effect_fields`, which the put owner calls immediately
+    /// after `special()`, for the same put. One meaning on every path: "the
+    /// field set the last `monitor()` posted".
+    monitor_posts: &'static [&'static str],
     // True only while applying this cycle's INP read (set in
     // `pre_process_actions`, consumed in `push_array`, cleared in `process`).
     // C's element-count reset lives in `process` and keys on `prec->wptr` (the
@@ -100,13 +124,13 @@ impl Default for CompressRecord {
             // there is no load-order dependency.
             val: vec![0.0; 1],
             nsam: 1,
-            inp: String::new(),
             // C `compressRecord.dbd.pod` `field(ALG,DBF_MENU){ menu(compressALG) }`
             // has no `initial(...)`, so an unset ALG defaults to menu index 0 =
             // `compressALG_N_to_1_Low_Value`, not Circular Buffer.
             alg: 0,
             n: 1,
             nuse: 0,
+            ouse: 0,
             off: 0,
             res: 0,
             balg: 0,
@@ -123,6 +147,7 @@ impl Default for CompressRecord {
             cycle_ingested: false,
             cycle_emitted: false,
             inpn: 0,
+            monitor_posts: &[],
             inp_read_pending: false,
         }
     }
@@ -144,20 +169,81 @@ impl CompressRecord {
         }
     }
 
-    /// Clear the running accumulator and output buffer — the body of C
-    /// `reset()` (compressRecord.c:85-99). Single owner shared by the
-    /// SPC_RESET path (`RES` write) and the INP element-count-change path in
-    /// `push_array`. Does NOT touch the C-1 completion gate
-    /// (`cycle_ingested`/`cycle_emitted`): a reset emits nothing, so the gate
-    /// stays whatever the surrounding cycle set it to.
-    fn reset_accumulators(&mut self) {
+    /// C `reset()` (compressRecord.c:85-99) — **the single owner of the
+    /// compress buffer reset**.
+    ///
+    /// ```c
+    /// prec->nuse = 0; prec->off = 0; prec->inx = 0;
+    /// prec->cvb = 0.0; prec->res = 0;
+    /// if (prec->alg == compressALG_Average && prec->sptr == NULL)
+    ///     prec->sptr = calloc(prec->nsam, sizeof(double));
+    /// if (prec->bptr && prec->nsam)
+    ///     memset(prec->bptr, 0, prec->nsam * sizeof(double));
+    /// ```
+    ///
+    /// INVARIANT: every C `SPC_RESET` write reaches exactly this body. C has
+    /// one caller shape — `special()` (compressRecord.c:377-393) runs
+    /// `reset(); monitor();` for the field index it was handed, whichever of
+    /// the five `special(SPC_RESET)` fields it is (RES, ALG, PBUF, BALG, N;
+    /// compressRecord.dbd.pod:396-437) — plus `init_record` pass 0 and the
+    /// INP element-count change in `process()`. The port's owners are
+    /// [`Record::special`], [`Record::init_record`] and `push_array`; no put
+    /// arm resets on its own.
+    ///
+    /// `res = 0` is part of the reset, not of the RES put arm: C stores the
+    /// written RES and `special()` then zeroes it, which is why `caput RES 1`
+    /// reads back 0 (softIoc: `dbpf CMP.RES 1` → `DBF_SHORT: 0`).
+    ///
+    /// The `accum` clear is C's summing-buffer handling: C only *allocates*
+    /// `sptr` (it does not zero an existing one), but it also sets `inx = 0`,
+    /// and `push_array_average` overwrites the accumulator wholesale at
+    /// `inx == 0`, so dropping the allocation is equivalent and re-allocates
+    /// lazily at the next Average cycle.
+    ///
+    /// Does NOT touch the C-1 completion gate (`cycle_ingested`/
+    /// `cycle_emitted`): a reset emits nothing, so the gate stays whatever the
+    /// surrounding cycle set it to.
+    fn reset(&mut self) {
         self.off = 0;
         self.nuse = 0;
         self.inx = 0;
         self.cvb = 0.0;
+        self.res = 0;
         self.accum.clear();
         for v in &mut self.val {
             *v = 0.0;
+        }
+    }
+
+    /// C `compressRecord.c::monitor` (:100-110) — **the single owner of the
+    /// OUSE latch**:
+    ///
+    /// ```c
+    /// if (alarm_mask || prec->nuse != prec->ouse) {
+    ///     db_post_events(prec, &prec->nuse, monitor_mask);
+    ///     prec->ouse = prec->nuse;
+    /// }
+    /// db_post_events(prec, &prec->val, monitor_mask);
+    /// ```
+    ///
+    /// NUSE posts only when it CHANGED since the last post; VAL posts every
+    /// time. OUSE is the "last posted NUSE" latch that makes that decision, and
+    /// nothing else may write it.
+    ///
+    /// C calls `monitor()` from exactly two places, and so does the port: the
+    /// SPC_RESET `special()` ([`Record::special`]) and the publication epilogue
+    /// of `process()` (`:365-372`, skipped on an accumulate-only cycle — which
+    /// is why an accumulating compress does not re-post NUSE).
+    ///
+    /// Returns the fields to post; `special()` hands them to the framework
+    /// through [`Record::monitor_side_effect_fields`] (the alarm-mask term is
+    /// the framework's — it posts on an alarm transition regardless).
+    fn monitor(&mut self) -> &'static [&'static str] {
+        if self.nuse != self.ouse {
+            self.ouse = self.nuse;
+            &["NUSE", "VAL"]
+        } else {
+            &["VAL"]
         }
     }
 
@@ -338,7 +424,7 @@ impl CompressRecord {
         if self.inp_read_pending {
             self.inp_read_pending = false;
             if self.inpn != 0 && input.len() != self.inpn {
-                self.reset_accumulators();
+                self.reset();
             }
             self.inpn = input.len();
         }
@@ -431,100 +517,6 @@ impl CompressRecord {
     }
 }
 
-static COMPRESS_FIELDS: &[FieldDesc] = &[
-    FieldDesc {
-        name: "VAL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "NSAM",
-        dbf_type: DbFieldType::Long,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "ALG",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "N",
-        dbf_type: DbFieldType::Long,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OFF",
-        dbf_type: DbFieldType::Long,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "NUSE",
-        dbf_type: DbFieldType::Long,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "RES",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "BALG",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "PBUF",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ILIL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "IHIL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INX",
-        dbf_type: DbFieldType::Long,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "CVB",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    // Display/control metadata fields. Typed storage + get_field/put_field
-    // already back these; they MUST be in field_list so the db loader applies
-    // field(EGU/HOPR/LOPR/PREC, ...) to that storage rather than routing them
-    // to common fields (where the record's own get_field shadows them with
-    // defaults, zeroing DBR_GR/DBR_CTRL limits). compressRecord.c declares
-    // EGU/HOPR/LOPR/PREC as record fields.
-    FieldDesc {
-        name: "EGU",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "HOPR",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LOPR",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "PREC",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-];
-
 /// Choice labels for the compression algorithm menu, in index order.
 /// C `menu(compressALG)` (`compressRecord.dbd.pod:49-55`).
 const COMPRESS_ALG_CHOICES: &[&str] = &[
@@ -540,19 +532,74 @@ const COMPRESS_ALG_CHOICES: &[&str] = &[
 /// C `menu(bufferingALG)` (`compressRecord.dbd.pod:57-59`).
 const COMPRESS_BALG_CHOICES: &[&str] = &["FIFO Buffer", "LIFO Buffer"];
 
+/// The five fields `compressRecord.dbd.pod` declares `special(SPC_RESET)`:
+/// RES (:396-400), ALG (:402-408), PBUF (:409-416), BALG (:417-423) and
+/// N (:431-437). C's `special()` (compressRecord.c:377-393) does not
+/// discriminate between them — any SPC_RESET write runs `reset(); monitor();` —
+/// so this list is both the [`Record::special`] trigger set and the
+/// [`Record::monitor_side_effect_fields`] key set. None of the five is
+/// `pp(TRUE)`, so the side-effect post is the only monitor the put produces.
+const COMPRESS_SPC_RESET_FIELDS: &[&str] = &["RES", "ALG", "PBUF", "BALG", "N"];
+
 impl Record for CompressRecord {
     fn record_type(&self) -> &'static str {
         "compress"
     }
 
-    fn monitor_side_effect_fields(&self, put_field: &str) -> &'static [&'static str] {
-        // C `compressRecord.c::reset` posts NUSE and VAL on a SPC_RESET
-        // write to RES; RES is not pp(TRUE), so this is the only monitor
-        // the put produces.
-        match put_field {
-            "RES" => &["NUSE", "VAL"],
-            _ => &[],
+    /// C `compressRecord.c::special` (:377-393) — the SPC_RESET hook:
+    ///
+    /// ```c
+    /// if (special_type == SPC_RESET) { reset(prec); monitor(prec); return 0; }
+    /// ```
+    ///
+    /// The field index never enters the decision, so ALL FIVE SPC_RESET fields
+    /// ([`COMPRESS_SPC_RESET_FIELDS`]) reset the buffer, not RES alone. The
+    /// `monitor()` half is [`Record::monitor_side_effect_fields`].
+    fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
+        if after && COMPRESS_SPC_RESET_FIELDS.contains(&field) {
+            self.reset();
+            self.monitor_posts = self.monitor();
         }
+        Ok(())
+    }
+
+    fn monitor_side_effect_fields(&self, put_field: &str) -> &'static [&'static str] {
+        // The `monitor(prec)` half of C's SPC_RESET `special()`. Which fields
+        // that is, is `monitor()`'s decision, not this hook's: VAL always, NUSE
+        // only when it changed against the OUSE latch (compressRecord.c:104-108)
+        // — so a second RES put on an already-empty buffer re-posts VAL alone,
+        // as C does. Keyed on the same five fields as the reset itself; none of
+        // them is pp(TRUE), so this is the only monitor such a put produces.
+        if COMPRESS_SPC_RESET_FIELDS.contains(&put_field) {
+            self.monitor_posts
+        } else {
+            &[]
+        }
+    }
+
+    /// The `recGblResetAlarms` half of C's SPC_RESET `special()`. C's `monitor()`
+    /// (compressRecord.c:103) — which `special()` invokes for every SPC_RESET
+    /// write — opens with `recGblResetAlarms(prec)`, so a put to any of the five
+    /// reset fields commits the record's pending alarm (clearing the born-UDF of
+    /// a never-processed compress) without a process cycle. Keyed on the same
+    /// five fields as [`Record::monitor_side_effect_fields`].
+    fn special_commits_alarms(&self, put_field: &str) -> bool {
+        COMPRESS_SPC_RESET_FIELDS.contains(&put_field)
+    }
+
+    /// C `init_record` pass 0 (compressRecord.c:307-315): allocate the sample
+    /// buffer, then `reset(prec)`. The reset is what clears a `.db`-loaded
+    /// `field(RES,"1")` — the static loader bypasses `special()`, so without
+    /// this pass the record would come up with RES stuck at 1.
+    fn init_record(&mut self, pass: u8) -> CaResult<()> {
+        if pass == 0 {
+            if self.nsam < 1 {
+                self.nsam = 1;
+                self.val = vec![0.0; 1];
+            }
+            self.reset();
+        }
+        Ok(())
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
@@ -560,16 +607,10 @@ impl Record for CompressRecord {
         // reached `push_array` (no INP, empty/error read, scalar via
         // `push_value`), so a later direct VAL put cannot inherit a stale mark.
         self.inp_read_pending = false;
-        if self.res != 0 {
-            // C `reset` (compressRecord.c:85-99) clears the running
-            // accumulator state too — `inx`, `cvb` and the summing
-            // buffer — not just `off`/`nuse`.
-            self.reset_accumulators();
-            self.res = 0;
-            // A reset publishes the cleared buffer (C `reset` is followed by
-            // `monitor`); never suppress on a reset cycle.
-            return Ok(ProcessOutcome::complete());
-        }
+        // C's `process()` does NOT inspect RES: the reset is `special()`'s, and
+        // `special()` zeroes RES as part of `reset()`. A record can never enter
+        // `process()` with RES set.
+        //
         // C `compressRecord.c:365` `if (status != 1)`: when this cycle's
         // ingestion (run during the pre-process INP read) accumulated without
         // emitting a compressed sample (C `status == 1`), the framework must
@@ -577,8 +618,13 @@ impl Record for CompressRecord {
         // / FLNK). An emit, or no ingestion at all (link error / no INP — C
         // forces `status = 0`), publishes.
         if self.cycle_ingested && !self.cycle_emitted {
+            // C skips the epilogue entirely on `status == 1`, `monitor()`
+            // included — so OUSE does NOT latch and NUSE is not posted.
             return Ok(ProcessOutcome::complete_no_emit());
         }
+        // C `compressRecord.c:365-372`: the epilogue calls `monitor(prec)`,
+        // which is where OUSE latches on a publishing cycle.
+        self.monitor_posts = self.monitor();
         Ok(ProcessOutcome::complete())
     }
 
@@ -595,18 +641,25 @@ impl Record for CompressRecord {
                 // client sees on read.
                 Some(EpicsValue::DoubleArray(self.linearise_val()))
             }
-            "INP" => Some(EpicsValue::String(self.inp.clone().into())),
-            "NSAM" => Some(EpicsValue::Long(self.nsam)),
-            "NUSE" => Some(EpicsValue::Long(self.nuse)),
+            // NSAM/N/OFF/NUSE/OUSE/INX are C's DBF_ULONG (INPN alone is
+            // DBF_LONG, :503). The value variant is what CA and PVA project the
+            // native type from — CA promotes DBF_ULONG to DBR_DOUBLE
+            // (db_convert.h), PVA serves uint32 — so it must agree with the
+            // `FieldDesc`. The counters are stored `i32` (the ring arithmetic is
+            // signed) and every writer floors them at 0, so `as u32` is exact.
+            "NSAM" => Some(EpicsValue::ULong(self.nsam as u32)),
+            "NUSE" => Some(EpicsValue::ULong(self.nuse as u32)),
+            "OUSE" => Some(EpicsValue::ULong(self.ouse as u32)),
+            "INPN" => Some(EpicsValue::Long(self.inpn as i32)),
             "RES" => Some(EpicsValue::Short(self.res)),
             "BALG" => Some(EpicsValue::Short(self.balg)),
             "ALG" => Some(EpicsValue::Short(self.alg)),
-            "N" => Some(EpicsValue::Long(self.n)),
-            "OFF" => Some(EpicsValue::Long(self.off)),
+            "N" => Some(EpicsValue::ULong(self.n as u32)),
+            "OFF" => Some(EpicsValue::ULong(self.off as u32)),
             "PBUF" => Some(EpicsValue::Short(self.pbuf)),
             "ILIL" => Some(EpicsValue::Double(self.ilil)),
             "IHIL" => Some(EpicsValue::Double(self.ihil)),
-            "INX" => Some(EpicsValue::Long(self.inx)),
+            "INX" => Some(EpicsValue::ULong(self.inx as u32)),
             "CVB" => Some(EpicsValue::Double(self.cvb)),
             "EGU" => Some(EpicsValue::String(self.egu.clone())),
             "HOPR" => Some(EpicsValue::Double(self.hopr)),
@@ -645,29 +698,21 @@ impl Record for CompressRecord {
                 }
                 _ => Err(CaError::TypeMismatch("ALG".into())),
             },
-            "N" => match value {
-                EpicsValue::Long(v) => {
+            "N" => match count_put(&value) {
+                Some(v) => {
                     self.n = v;
                     Ok(())
                 }
-                _ => Err(CaError::TypeMismatch("N".into())),
+                None => Err(CaError::TypeMismatch("N".into())),
             },
+            // The four SPC_RESET arms below (RES/ALG/N/BALG/PBUF) STORE ONLY.
+            // The reset is `special()`'s — C stores the value in `dbPut` and
+            // then runs `dbPutSpecial(paddr, 1)`, which is where `reset()`
+            // lives. That is also why RES reads back 0: `reset()` zeroes it
+            // after this arm stored the 1.
             "RES" => match value {
-                EpicsValue::Short(_) => {
-                    // epics-base 8ac2c87 (2025): writing any value to
-                    // RES triggers SPC_RESET — clear the circular
-                    // buffer and acknowledge by zeroing RES itself.
-                    // The framework should post a monitor event so
-                    // CA clients see the empty array immediately.
-                    self.nuse = 0;
-                    self.off = 0;
-                    self.inx = 0;
-                    self.cvb = 0.0;
-                    self.res = 0;
-                    self.accum.clear();
-                    let nsam = self.nsam.max(0) as usize;
-                    self.val.clear();
-                    self.val.resize(nsam, 0.0);
+                EpicsValue::Short(v) => {
+                    self.res = v;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("RES".into())),
@@ -714,8 +759,8 @@ impl Record for CompressRecord {
             // `read_only` gate; the FieldDesc carries `read_only: true`). This
             // arm serves only the load path, sizing the sample buffer like
             // `new()`.
-            "NSAM" => match value {
-                EpicsValue::Long(n) => {
+            "NSAM" => match count_put(&value) {
+                Some(n) => {
                     let n = n.max(1);
                     self.nsam = n as i32;
                     self.val = vec![0.0; n as usize];
@@ -724,11 +769,14 @@ impl Record for CompressRecord {
                     self.off = 0;
                     Ok(())
                 }
-                _ => Err(CaError::TypeMismatch("NSAM".into())),
+                None => Err(CaError::TypeMismatch("NSAM".into())),
             },
-            // OFF/NUSE/INX/CVB are runtime buffer state (no promptgroup) —
-            // never client-writable.
-            "OFF" | "NUSE" | "INX" | "CVB" => Err(CaError::ReadOnlyField(name.to_string())),
+            // OFF/NUSE/OUSE/INPN/INX/CVB are `special(SPC_NOMOD)` runtime buffer
+            // state — never client-writable, and (unlike NSAM) not settable at
+            // load either: C gives them no promptgroup and the record owns each.
+            "OFF" | "NUSE" | "OUSE" | "INPN" | "INX" | "CVB" => {
+                Err(CaError::ReadOnlyField(name.to_string()))
+            }
             "EGU" => {
                 if let EpicsValue::String(s) = value {
                     self.egu = s;
@@ -760,8 +808,36 @@ impl Record for CompressRecord {
         }
     }
 
-    fn field_list(&self) -> &'static [FieldDesc] {
-        COMPRESS_FIELDS
+    /// C `compressRecord.c::cvt_dbaddr` (:398-407):
+    ///
+    /// ```c
+    /// if (prec->balg == bufferingALG_LIFO)
+    ///     paddr->special = SPC_NOMOD;
+    /// ```
+    ///
+    /// A LIFO compress's VAL is not client-writable — `put_value` walks the
+    /// ring backwards from `off`, so `put_array_info`'s forward write cursor
+    /// (which is what a `dbPut` to VAL feeds) has no meaning there, and C
+    /// refuses the put outright. FIFO leaves VAL writable. This is per-record
+    /// STATE, not a `.dbd` declaration, so it cannot live in `field_list`'s
+    /// static `read_only`; [`Record::field_no_mod`] is the dynamic half of the
+    /// same gate.
+    ///
+    /// The INP-driven ingest is unaffected: it lands through
+    /// `put_field_internal`, which is C's direct-to-memory `dbGetLink` write
+    /// into `wptr`, not a `dbPut` on VAL.
+    ///
+    /// softIoc: with BALG="LIFO Buffer", `dbpf CMP.VAL 7` →
+    /// `recGblDbaddrError: dbPut Attempt to modify noMod field PV: CMP.VAL`.
+    /// `compressRecord.c` declares no `dset` — the record reads its own `INP`
+    /// (`process`: `dbGetLink(&prec->inp, …)`), so there is no soft device
+    /// support to run `recGblInitConstantLink` on it at init.
+    fn input_read_by_device_support(&self) -> bool {
+        false
+    }
+
+    fn field_no_mod(&self, field: &str) -> bool {
+        field == "VAL" && self.balg == 1
     }
 
     fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
@@ -776,30 +852,75 @@ impl Record for CompressRecord {
         "VAL"
     }
 
-    /// C `compressRecord.c::process` calls `dbGetLink(&prec->inp, ...)`
-    /// every cycle and feeds the result to the algorithm. The Rust
-    /// record cannot read links itself; it asks the framework to pull
-    /// `INP` into `VAL` before `process()`. The `VAL` put routes
-    /// through `push_array`, so the data is ingested by the configured
-    /// compression algorithm (NOT a raw buffer overwrite).
-    fn pre_process_actions(&mut self) -> Vec<crate::server::record::ProcessAction> {
-        // Reset the per-cycle completion gate before the INP read below feeds
-        // `push_value`/`push_array`. If the read never happens (no INP, or a
-        // link error that skips the put), both stay false and `process()`
-        // publishes — mirroring C, which forces `status = 0` on those paths.
+    /// C `compressRecord.c:326-343` — the INP ingest, and the one gate on it:
+    ///
+    /// ```c
+    /// if (!dbIsLinkConnected(&prec->inp) || dbGetNelements(...) || nelements <= 0)
+    ///     recGblSetSevr(prec, LINK_ALARM, INVALID_ALARM);   /* nothing ingested */
+    /// else { ... dbGetLink(&prec->inp, DBF_DOUBLE, prec->wptr, ...) ... }
+    /// ```
+    ///
+    /// The port does not read links from inside a record: the framework's
+    /// soft-input stage performs the `dbGetLink` and delivers the value through
+    /// [`Record::set_val`], which is why THAT is the ingest owner here. The
+    /// per-cycle gates are therefore reset in `pre_input_link_actions` — the
+    /// only hook that runs BEFORE that input stage. Resetting them in
+    /// `pre_process_actions`, which runs after it, would clear the very flags
+    /// the ingest had just set.
+    ///
+    /// compress emits no link action of its own. It used to emit a `ReadDbLink`
+    /// reading a link string off a `CompressRecord::inp` field the loader never
+    /// populates (a `.db`'s `field(INP,...)` lands in `common.inp`, since
+    /// `COMPRESS_FIELDS` declares no INP, matching `compressRecord.dbd.pod`).
+    /// That field was a second, always-empty INP: the action never fired for a
+    /// loaded record, and a `caget CMP.INP` answered `""` where softIoc answers
+    /// the link text. It is gone; INP has one source.
+    fn pre_input_link_actions(&mut self) -> Vec<crate::server::record::ProcessAction> {
+        // The per-cycle ingest/emit facts, cleared before the framework's input
+        // stage can set them. If no value arrives (link not connected, or a
+        // failed read), both stay false: `check_alarms` raises LINK/INVALID and
+        // `process()` publishes — mirroring C, which forces `status = 0` on
+        // those paths.
         self.cycle_ingested = false;
         self.cycle_emitted = false;
-        if self.inp.is_empty() {
-            return Vec::new();
-        }
-        // Mark the upcoming INP read so `push_array` knows this ingest is the
-        // INP-driven one that may trigger the element-count reset (vs a direct
-        // VAL put). Cleared in `process` if the read never reaches `push_array`.
+        Vec::new()
+    }
+
+    /// The framework's soft-input stage delivering this cycle's INP value —
+    /// C's `dbGetLink(&prec->inp, DBF_DOUBLE, prec->wptr, 0, &nelements)`
+    /// inside `process()` (:341).
+    ///
+    /// It is the ONLY INP-driven ingest, which is what `inp_read_pending`
+    /// records: C's element-count reset (`nelements != prec->inpn` frees WPTR
+    /// and `reset()`s, :334-340) lives in `process` and keys on WPTR, the INP
+    /// read buffer — a CA put to VAL reaches `put_field` directly, never
+    /// `set_val`, and must NOT reset. Marking the ingest here instead of in
+    /// `pre_process_actions` is what makes the mark fire for a LOADED record:
+    /// the old mark rode on the dead `ReadDbLink` above.
+    fn set_val(&mut self, value: EpicsValue) -> CaResult<()> {
         self.inp_read_pending = true;
-        vec![crate::server::record::ProcessAction::ReadDbLink {
-            link_field: "INP",
-            target_field: "VAL",
-        }]
+        self.put_field_internal("VAL", value)
+    }
+
+    /// C `compressRecord.c:328-343` — the record's only alarm. A cycle that
+    /// took NO sample from INP latches LINK/INVALID, and C has three ways to
+    /// take none: the link is unset, the link is CONSTANT (a literal has no
+    /// lset, so `dbIsLinkConnected` is FALSE and C refuses to sample it), or
+    /// the `dbGetLink` failed. All three land here as "nothing was ingested
+    /// this cycle" — `cycle_ingested`, set by the `push_value`/`push_array`
+    /// ingest owner and cleared by `pre_process_actions` — so ONE test covers
+    /// them, and it cannot disagree with what the buffer actually took.
+    ///
+    /// Without it, an unset or dead INP left the record in NO_ALARM forever and
+    /// operators lost the "my compression source is dead" signal entirely.
+    fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
+        if !self.cycle_ingested {
+            crate::server::recgbl::rec_gbl_set_sevr(
+                common,
+                crate::server::recgbl::alarm_status::LINK_ALARM,
+                crate::server::record::AlarmSeverity::Invalid,
+            );
+        }
     }
 }
 
@@ -815,7 +936,8 @@ mod pbuf_tests {
         let rec = CompressRecord::default();
         assert_eq!(rec.nsam, 1);
         assert_eq!(rec.val.len(), 1, "VAL is the NSAM-length buffer");
-        assert_eq!(rec.get_field("NSAM"), Some(EpicsValue::Long(1)));
+        // NSAM is C's DBF_ULONG (compressRecord.dbd.pod:424).
+        assert_eq!(rec.get_field("NSAM"), Some(EpicsValue::ULong(1)));
     }
 
     #[test]

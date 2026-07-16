@@ -273,10 +273,20 @@ impl NDPluginProcess for BadPixelProcessor {
             return ProcessResult::arrays(vec![Arc::new(array.clone())]);
         }
 
-        let offset_x = array.dims.first().map_or(0, |d| d.offset as i64);
-        let offset_y = array.dims.get(1).map_or(0, |d| d.offset as i64);
-        let binning_x = array.dims.first().map_or(1, |d| d.binning.max(1) as i64);
-        let binning_y = array.dims.get(1).map_or(1, |d| d.binning.max(1) as i64);
+        // C `NDPluginBadPixel.cpp:99-109` reads the detector offset/binning from
+        // the axis the image info names — `pArray->dims[pArrayInfo->xDim]` and
+        // `[pArrayInfo->yDim]` — not from the physical dims[0]/dims[1]. They
+        // differ for every non-RGB3 color layout (RGB1 keeps X in dims[1]).
+        // Y falls back to offset 0 / binning 1 when `ndims <= 1` (`:105-108`).
+        let [x_dim, y_dim, _] = info.user_dims();
+        let offset_x = array.dims.get(x_dim).map_or(0, |d| d.offset as i64);
+        let binning_x = array.dims.get(x_dim).map_or(1, |d| d.binning.max(1) as i64);
+        let (offset_y, binning_y) = if array.dims.len() > 1 {
+            let d = &array.dims[y_dim];
+            (d.offset as i64, d.binning.max(1) as i64)
+        } else {
+            (0, 1)
+        };
 
         let mut out = array.clone();
         self.apply_corrections(
@@ -387,6 +397,55 @@ mod tests {
         assert!((get_pixel(out, 1, 1, 4) - 0.0).abs() < 1e-10);
         assert!((get_pixel(out, 3, 2, 4) - 42.0).abs() < 1e-10);
         assert!((get_pixel(out, 0, 0, 4) - 100.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_r9_67_readout_offset_comes_from_the_user_dims_axis() {
+        // R9-67 family. C takes the detector readout offset/binning from the axis
+        // the image info names — `pArray->dims[pArrayInfo->xDim]` /
+        // `[pArrayInfo->yDim]` (NDPluginBadPixel.cpp:99-104) — while the port read
+        // the physical dims[0]/dims[1]. On RGB1 (`[color, x, y]`) dims[0] is the
+        // COLOUR axis, so the port used the colour axis's offset as the X readout
+        // offset and corrected the wrong pixel.
+        use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
+        use ad_core_rs::color::NDColorMode;
+
+        // RGB1: dims = [color=3, x=4, y=2]. The X axis (dims[1]) carries a
+        // readout offset of 2; the colour axis carries none.
+        let mut arr = NDArray::new(
+            vec![
+                NDDimension::new(3),
+                NDDimension::new(4),
+                NDDimension::new(2),
+            ],
+            NDDataType::Float64,
+        );
+        arr.dims[1].offset = 2;
+        arr.attributes.add(NDAttribute::new_static(
+            "ColorMode",
+            "",
+            NDAttrSource::Driver,
+            NDAttrValue::Int32(NDColorMode::RGB1 as i32),
+        ));
+        if let NDDataBuffer::F64(ref mut v) = arr.data {
+            v.iter_mut().for_each(|x| *x = 100.0);
+        }
+
+        // Sensor coordinate (3, 0). C: x = 3 - offsetX(2) = 1, y = 0
+        //   → buffer offset y * xSize + x = 1.
+        // Pre-fix the port took offsetX from dims[0] (the colour axis, offset 0)
+        //   → x = 3, buffer offset 3.
+        let mut proc = BadPixelProcessor::new(vec![set(3, 0, 7.0)]);
+        let pool = NDArrayPool::new(1_000_000);
+        let result = proc.process_array(&arr, &pool);
+        let out = &result.output_arrays[0];
+
+        assert_eq!(out.data.get_as_f64(1), Some(7.0), "corrected element 1");
+        assert_eq!(
+            out.data.get_as_f64(3),
+            Some(100.0),
+            "element 3 must be untouched — that is where the physical-index bug wrote"
+        );
     }
 
     #[test]

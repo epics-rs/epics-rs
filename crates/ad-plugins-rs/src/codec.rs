@@ -1,7 +1,8 @@
+use std::borrow::Cow;
 use std::io::{Read, Write};
 use std::sync::Arc;
 
-use ad_core_rs::codec::{Codec, CodecName};
+use ad_core_rs::codec::{Codec, CodecName, CodecStatus};
 use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::runtime::{NDPluginProcess, ParamUpdate, ProcessResult};
@@ -36,7 +37,7 @@ pub fn original_data_type(array: &NDArray) -> NDDataType {
 ///
 /// The byte slice is reinterpreted as the target type using native endianness.
 /// Returns `None` if the byte count is not a multiple of the element size.
-fn buffer_from_bytes(bytes: &[u8], data_type: NDDataType) -> Option<NDDataBuffer> {
+pub(crate) fn buffer_from_bytes(bytes: &[u8], data_type: NDDataType) -> Option<NDDataBuffer> {
     let elem_size = data_type.element_size();
     if bytes.len() % elem_size != 0 {
         return None;
@@ -754,52 +755,84 @@ pub fn decompress_bslz4(src: &NDArray) -> Option<NDArray> {
 
 /// Compress an NDArray to JPEG.
 ///
-/// Only supports UInt8 data. Handles:
-/// - 2D arrays (mono/grayscale)
-/// - 3D arrays with dims\[0\]=3 (RGB1 interleaved)
+/// Mirrors C `compressJPEG` (NDPluginCodec.cpp:109-266), which decides the JPEG
+/// geometry from the dimension count (:146-169) and the *source pixel layout*
+/// from the `ColorMode` attribute (:181-227):
+/// - 2-D: grayscale, `[x, y]`.
+/// - 3-D RGB1 `[3, x, y]`: already pixel-interleaved, encoded as-is.
+/// - 3-D RGB2 `[x, 3, y]` and RGB3 `[x, y, 3]`: C walks the three colour planes
+///   (`pRed`/`pGreen`/`pBlue`, plane step `sizeX*3` for RGB2 and `sizeX` for
+///   RGB3) and re-interleaves each scanline into an RGB row before encoding.
+///   The port reaches the same pixel order through `convert_rgb_layout`, the
+///   single owner of RGB layout conversion (also used by the JPEG/TIFF/Magick
+///   file writers), so the interleave rule is not re-implemented here.
 ///
-/// Returns `None` if the data type is not UInt8 or the layout is unsupported.
-pub fn compress_jpeg(src: &NDArray, quality: u8) -> Option<NDArray> {
-    if src.data.data_type() != NDDataType::UInt8 {
-        return None;
+/// Both 8-bit types are accepted, as in C (`case NDInt8: case NDUInt8:`,
+/// :135-143). Returns `None` for anything C rejects: a non-8-bit type, a
+/// dimension count other than 2 or 3, or a 3-D array whose `ColorMode` is not
+/// one of the three RGB layouts.
+pub fn compress_jpeg(src: &NDArray, quality: u8) -> Result<NDArray, JpegCompressError> {
+    use ad_core_rs::color::{NDColorMode, convert_rgb_layout};
+
+    // C `:135-143` — the dataType switch comes first.
+    match src.data.data_type() {
+        NDDataType::UInt8 | NDDataType::Int8 => {}
+        _ => return Err(JpegCompressError::NotEightBit),
     }
 
-    let raw = src.data.as_u8_slice();
     let info = src.info();
 
-    // JPEG dimensions must fit in u16
-    if info.x_size > u16::MAX as usize || info.y_size > u16::MAX as usize {
-        return None;
+    // C `:146-169` — the ndims switch: 2-D and 3-D have arms, anything else is
+    // "Unsupported array structure".
+    if !matches!(src.dims.len(), 2 | 3) {
+        return Err(JpegCompressError::UnsupportedArrayStructure);
     }
 
-    let (width, height, color_type) = match src.dims.len() {
-        2 => {
-            // Mono: dims = [x, y]
-            (
-                info.x_size as u16,
-                info.y_size as u16,
-                jpeg_encoder::ColorType::Luma,
-            )
-        }
-        3 if src.dims[0].size == 3 => {
-            // RGB1: dims = [3, x, y], pixel-interleaved
-            (
-                info.x_size as u16,
-                info.y_size as u16,
-                jpeg_encoder::ColorType::Rgb,
-            )
-        }
-        _ => return None,
+    // C `:181-204` — the colorMode switch: Mono/RGB1/RGB2/RGB3 have arms, and
+    // every other mode (Bayer, the three YUVs) falls to "Unknown color mode %d".
+    // `info.color_mode` is the ColorMode attribute defaulting to Mono, exactly
+    // C's `int colorMode = NDColorModeMono; if (pAttribute) getValue(...)` (:117-121).
+    match info.color_mode {
+        NDColorMode::Mono | NDColorMode::RGB1 | NDColorMode::RGB2 | NDColorMode::RGB3 => {}
+        mode => return Err(JpegCompressError::UnknownColorMode(mode as i32)),
+    }
+
+    // JPEG dimensions must fit in u16 — see `JpegCompressError::EncodeFailed`.
+    if info.x_size > u16::MAX as usize || info.y_size > u16::MAX as usize {
+        return Err(JpegCompressError::EncodeFailed);
+    }
+
+    // RGB2/RGB3 are re-interleaved to RGB1 first; every other accepted layout
+    // encodes straight out of the input buffer.
+    let (color_type, interleaved) = match (src.dims.len(), info.color_mode) {
+        (2, NDColorMode::Mono | NDColorMode::RGB1) => (jpeg_encoder::ColorType::Luma, None),
+        (3, NDColorMode::RGB1) if info.color_size == 3 => (jpeg_encoder::ColorType::Rgb, None),
+        (3, mode @ (NDColorMode::RGB2 | NDColorMode::RGB3)) if info.color_size == 3 => (
+            jpeg_encoder::ColorType::Rgb,
+            Some(
+                convert_rgb_layout(src, mode, NDColorMode::RGB1)
+                    .map_err(|_| JpegCompressError::EncodeFailed)?,
+            ),
+        ),
+        // Layouts C leaves `image_width`/`image_height` unset for, or reads out
+        // of bounds on — see `JpegCompressError::EncodeFailed`.
+        _ => return Err(JpegCompressError::EncodeFailed),
     };
+
+    let width = info.x_size as u16;
+    let height = info.y_size as u16;
+    let pixels = interleaved
+        .as_ref()
+        .map_or_else(|| src.data.as_u8_slice(), |a| a.data.as_u8_slice());
 
     let mut jpeg_buf = Vec::new();
     let encoder = jpeg_encoder::Encoder::new(&mut jpeg_buf, quality);
-    if encoder.encode(raw, width, height, color_type).is_err() {
-        return None;
+    if encoder.encode(pixels, width, height, color_type).is_err() {
+        return Err(JpegCompressError::EncodeFailed);
     }
 
     let compressed_size = jpeg_buf.len();
-    let original_size = raw.len();
+    let original_size = src.data.as_u8_slice().len();
 
     let mut arr = src.clone();
     arr.data = NDDataBuffer::U8(jpeg_buf);
@@ -809,9 +842,8 @@ pub fn compress_jpeg(src: &NDArray, quality: u8) -> Option<NDArray> {
         level: 0,
         shuffle: 0,
         compressor: 0,
-        // JPEG input is constrained to UInt8 above; record the source type so
-        // the codec carries the original element type uniformly (C
-        // `NDArray::dataType`, NDPluginCodec.cpp:35-36).
+        // Record the source type so the codec carries the original element type
+        // uniformly (C `NDArray::dataType`, NDPluginCodec.cpp:35-36).
         original_data_type: src.data.data_type(),
     });
 
@@ -823,7 +855,50 @@ pub fn compress_jpeg(src: &NDArray, quality: u8) -> Option<NDArray> {
         quality,
     );
 
-    Some(arr)
+    Ok(arr)
+}
+
+/// Why `compress_jpeg` refused an array, carrying the exact `errorMessage` C
+/// writes at that rejection point.
+///
+/// C's `compressJPEG` sets a *different* string at each failure and the plugin
+/// copies it verbatim into the `CodecError` PV, so the message is part of the
+/// observable contract — which means the encoder, not its caller, has to name the
+/// failure. A bare `Option` forced the caller to invent one generic text for all
+/// of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JpegCompressError {
+    /// C `:135-143` — only `NDInt8`/`NDUInt8` reach the encoder.
+    NotEightBit,
+    /// C `:165-169` — `ndims` is neither 2 nor 3.
+    UnsupportedArrayStructure,
+    /// C `:200-204` (and the identical guard inside the scanline loop, `:228-232`)
+    /// — the colorMode switch has no arm for this mode: Bayer and the YUVs.
+    UnknownColorMode(i32),
+    /// C `:234-238` — libjpeg would not take the data.
+    ///
+    /// The port also lands here for the arrays C hands to libjpeg's *fatal* error
+    /// handler: `jpeg_std_error` (`:115`) exits the process on error, so C has no
+    /// recovery path for dimensions past libjpeg's limit, nor for the 3-D layouts
+    /// its `else if` chain (`:155-164`) leaves `image_width`/`image_height` unset
+    /// for — a 3-D array whose ColorMode is Mono, or whose colour axis is not 3.
+    /// The port reports the failure instead of aborting the IOC, under C's own
+    /// text for "the encoder would not take this array".
+    EncodeFailed,
+}
+
+impl JpegCompressError {
+    /// The `errorMessage` C writes (NDPluginCodec.cpp:140, :166, :201, :235).
+    pub fn message(&self) -> Cow<'static, str> {
+        match self {
+            Self::NotEightBit => "JPEG only supports 8-bit data".into(),
+            Self::UnsupportedArrayStructure => "Unsupported array structure".into(),
+            // C `sprintf(errorMessage, "Unknown color mode %d", colorMode)` —
+            // NDColorMode's discriminants are C's NDColorMode_t values.
+            Self::UnknownColorMode(mode) => format!("Unknown color mode {}", mode).into(),
+            Self::EncodeFailed => "Error writing JPEG data".into(),
+        }
+    }
 }
 
 /// Decompress a JPEG-compressed NDArray.
@@ -831,8 +906,18 @@ pub fn compress_jpeg(src: &NDArray, quality: u8) -> Option<NDArray> {
 /// Uses jpeg-decoder to decode the JPEG data back to pixel data.
 /// Reconstructs proper dimensions and color layout (mono or RGB1).
 ///
+/// A decoded JPEG is always 8-bit mono or 8-bit RGB1 (C comment at
+/// NDPluginCodec.cpp:268-272), whatever the layout of the array that was
+/// compressed, so C overwrites the `ColorMode` attribute on the output
+/// (:318-322). Without that write an RGB2/RGB3 source's stale `ColorMode` would
+/// survive onto RGB1 data and every downstream `getInfo` would read the planes
+/// in the wrong order.
+///
 /// Returns `None` if the codec is not JPEG or decoding fails.
 pub fn decompress_jpeg(src: &NDArray) -> Option<NDArray> {
+    use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
+    use ad_core_rs::color::NDColorMode;
+
     if src.codec.as_ref().map(|c| c.name) != Some(CodecName::JPEG) {
         return None;
     }
@@ -845,19 +930,19 @@ pub fn decompress_jpeg(src: &NDArray) -> Option<NDArray> {
     let width = metadata.width as usize;
     let height = metadata.height as usize;
 
-    let dims = match metadata.pixel_format {
-        jpeg_decoder::PixelFormat::L8 => {
-            // Grayscale
-            vec![NDDimension::new(width), NDDimension::new(height)]
-        }
-        jpeg_decoder::PixelFormat::RGB24 => {
-            // RGB1 interleaved
+    let (dims, color_mode) = match metadata.pixel_format {
+        jpeg_decoder::PixelFormat::L8 => (
+            vec![NDDimension::new(width), NDDimension::new(height)],
+            NDColorMode::Mono,
+        ),
+        jpeg_decoder::PixelFormat::RGB24 => (
             vec![
                 NDDimension::new(3),
                 NDDimension::new(width),
                 NDDimension::new(height),
-            ]
-        }
+            ],
+            NDColorMode::RGB1,
+        ),
         _ => return None,
     };
 
@@ -865,6 +950,12 @@ pub fn decompress_jpeg(src: &NDArray) -> Option<NDArray> {
     arr.dims = dims;
     arr.data = NDDataBuffer::U8(pixels);
     arr.codec = None;
+    arr.attributes.add(NDAttribute::new_static(
+        "ColorMode",
+        "Color Mode",
+        NDAttrSource::Driver,
+        NDAttrValue::Int32(color_mode as i32),
+    ));
 
     Some(arr)
 }
@@ -1040,102 +1131,195 @@ impl CodecProcessor {
     }
 }
 
+/// What the codec plugin decided for one input array, mirroring the exits of C
+/// `NDPluginCodec::processCallbacks` (NDPluginCodec.cpp:670-778).
+///
+/// C distinguishes "the input *is* the result" (`result = pArray`, no error,
+/// codecStatus untouched) from "the codec produced nothing" (`result = NULL` +
+/// errorMessage, and the `finish:` block then substitutes `pArray` so the frame
+/// still flows downstream). Both end up publishing the input array, so an
+/// `Option<NDArray>` cannot tell them apart — collapsing them is what made an
+/// uncompressed input to a Decompress plugin report a codec failure.
+///
+/// The reported severity and error string are derived from the variant
+/// ([`CodecOutcome::status`] / [`CodecOutcome::error_message`]), so they are a
+/// property of what happened rather than integers picked at the publish site: a
+/// benign skip cannot be reported with a failure's severity, and no site can
+/// invent a level C does not have.
+enum CodecOutcome {
+    /// C `result = pArray`, codecStatus SUCCESS: the input is the output,
+    /// unchanged and not an error.
+    PassThrough,
+    /// C `result = pArray` + errorMessage + `NDCODEC_WARNING` (:671-676, and the
+    /// same guard inside each compressor, e.g. :466-469): the operation was
+    /// skipped, not failed — the frame flows on unchanged.
+    Skipped(&'static str),
+    /// C `result = <new array>`, codecStatus SUCCESS: the codec produced a new
+    /// array.
+    Converted(NDArray),
+    /// C `result = NULL` + errorMessage + `NDCODEC_ERROR`: the codec failed; the
+    /// input is republished but the error is reported.
+    ///
+    /// Owned, because C composes some of these with `sprintf` (e.g. "Unknown
+    /// color mode %d", NDPluginCodec.cpp:201) — the text belongs to the codec
+    /// that failed, not to the caller.
+    Failed(Cow<'static, str>),
+}
+
+impl CodecOutcome {
+    /// Severity reported in `CodecStatus` (C `NDCodecStatus_t`).
+    fn status(&self) -> CodecStatus {
+        match self {
+            Self::PassThrough | Self::Converted(_) => CodecStatus::Success,
+            Self::Skipped(_) => CodecStatus::Warning,
+            Self::Failed(_) => CodecStatus::Error,
+        }
+    }
+
+    /// Text reported in `CodecError` (C `errorMessage`, empty unless the codec
+    /// had something to say).
+    fn error_message(&self) -> &str {
+        match self {
+            Self::PassThrough | Self::Converted(_) => "",
+            Self::Skipped(message) => message,
+            Self::Failed(message) => message,
+        }
+    }
+}
+
 impl NDPluginProcess for CodecProcessor {
     fn process_array(&mut self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
         let original_bytes = array.data.as_u8_slice().len();
 
-        let result = match self.mode {
+        // C sets NDCodecCompressor from the codec it found on the input on every
+        // decompress branch, including the empty-codec one (NDPluginCodec.cpp:
+        // 732-757). Compress mode never writes it — there it is the operator's
+        // selection.
+        let mut compressor: Option<i32> = None;
+
+        let outcome = match self.mode {
+            // C: `algo` NONE short-circuits both the already-compressed check
+            // (:671, gated on `algo`) and the codec switch (:680-683
+            // `case NDCODEC_NONE: default: result = pArray`) — a pass-through,
+            // never a failure.
+            CodecMode::Compress {
+                codec: CodecName::None,
+                ..
+            } => CodecOutcome::PassThrough,
             CodecMode::Compress { .. } if array.codec.is_some() => {
-                // Already compressed — pass through unchanged
-                Some(array.clone())
+                // Already compressed — C passes the input through, but reports it
+                // as a benign WARNING with an error string (:671-676).
+                CodecOutcome::Skipped("Array already compressed")
             }
-            CodecMode::Compress {
-                codec: CodecName::LZ4,
-                ..
-            } => Some(compress_lz4(array)),
-            CodecMode::Compress {
-                codec: CodecName::JPEG,
-                ..
-            } => compress_jpeg(array, self.jpeg_quality),
-            CodecMode::Compress {
-                codec: CodecName::Zlib,
-                ..
-            } => Some(compress_zlib(array)),
-            CodecMode::Compress {
-                codec: CodecName::Blosc,
-                ..
-            } => Some(compress_blosc(array, &self.blosc_config)),
-            CodecMode::Compress {
-                codec: CodecName::LZ4HDF5,
-                ..
-            } => Some(compress_lz4hdf5(array)),
-            CodecMode::Compress {
-                codec: CodecName::BSLZ4,
-                ..
-            } => Some(compress_bslz4(array)),
-            CodecMode::Compress { .. } => None,
-            CodecMode::Decompress => match array.codec.as_ref().map(|c| c.name) {
-                Some(CodecName::LZ4) => decompress_lz4(array),
-                Some(CodecName::JPEG) => decompress_jpeg(array),
-                Some(CodecName::Zlib) => decompress_zlib(array),
-                Some(CodecName::Blosc) => decompress_blosc(array),
-                Some(CodecName::LZ4HDF5) => decompress_lz4hdf5(array),
-                Some(CodecName::BSLZ4) => decompress_bslz4(array),
-                _ => None,
+            CodecMode::Compress { codec, .. } => match codec {
+                CodecName::LZ4 => CodecOutcome::Converted(compress_lz4(array)),
+                // The encoder names its own failure (C writes a different
+                // errorMessage at each rejection, NDPluginCodec.cpp:140, :166,
+                // :201, :235); the caller must not invent one.
+                CodecName::JPEG => match compress_jpeg(array, self.jpeg_quality) {
+                    Ok(out) => CodecOutcome::Converted(out),
+                    Err(e) => CodecOutcome::Failed(e.message()),
+                },
+                CodecName::Zlib => CodecOutcome::Converted(compress_zlib(array)),
+                CodecName::Blosc => {
+                    CodecOutcome::Converted(compress_blosc(array, &self.blosc_config))
+                }
+                CodecName::LZ4HDF5 => CodecOutcome::Converted(compress_lz4hdf5(array)),
+                CodecName::BSLZ4 => CodecOutcome::Converted(compress_bslz4(array)),
+                // Matched by the first arm above.
+                CodecName::None => CodecOutcome::PassThrough,
             },
+            CodecMode::Decompress => {
+                // C keys the decompress dispatch on the input's codec *name*, so
+                // an empty name is simply "not compressed" (`codec.empty()`,
+                // Codec.h:37-39) — the Rust `Option` and a `CodecName::None`
+                // inside it mean the same thing and must decide the same way.
+                let name = array
+                    .codec
+                    .as_ref()
+                    .map(|c| c.name)
+                    .unwrap_or(CodecName::None);
+                compressor = Some(name.ordinal());
+                match name {
+                    // C :732-735 — uncompressed input: result = pArray,
+                    // COMPRESSOR = NDCODEC_NONE, codecStatus stays SUCCESS.
+                    CodecName::None => CodecOutcome::PassThrough,
+                    CodecName::LZ4 => match decompress_lz4(array) {
+                        Some(out) => CodecOutcome::Converted(out),
+                        None => CodecOutcome::Failed("Failed to LZ4 decompress".into()),
+                    },
+                    CodecName::JPEG => match decompress_jpeg(array) {
+                        Some(out) => CodecOutcome::Converted(out),
+                        None => CodecOutcome::Failed("Error decoding JPEG".into()),
+                    },
+                    CodecName::Zlib => match decompress_zlib(array) {
+                        Some(out) => CodecOutcome::Converted(out),
+                        None => CodecOutcome::Failed("Failed to Zlib decompress".into()),
+                    },
+                    CodecName::Blosc => match decompress_blosc(array) {
+                        Some(out) => CodecOutcome::Converted(out),
+                        None => CodecOutcome::Failed("Failed to Blosc decompress".into()),
+                    },
+                    CodecName::LZ4HDF5 => match decompress_lz4hdf5(array) {
+                        Some(out) => CodecOutcome::Converted(out),
+                        None => CodecOutcome::Failed("Failed to LZ4 decompress".into()),
+                    },
+                    // C's decompressBSLZ4 reports "Failed to Blosc decompress"
+                    // (NDPluginCodec.cpp:601) — a copy-paste from decompressBlosc
+                    // (:431), but it is the text the CodecError PV shows for a
+                    // corrupt BSLZ4 frame, so it is the contract.
+                    CodecName::BSLZ4 => match decompress_bslz4(array) {
+                        Some(out) => CodecOutcome::Converted(out),
+                        None => CodecOutcome::Failed("Failed to Blosc decompress".into()),
+                    },
+                }
+            }
+        };
+
+        let status = outcome.status();
+        let error = outcome.error_message().to_string();
+
+        // C recomputes NDCodecCompFactor only when `result != pArray`
+        // (:726-730, :763-767); on any exit that republishes the input it stays
+        // at 1.0.
+        let output = match outcome {
+            CodecOutcome::Converted(out) => {
+                let output_bytes = out.data.as_u8_slice().len();
+                self.compression_ratio = match self.mode {
+                    CodecMode::Compress { .. } => {
+                        original_bytes as f64 / output_bytes.max(1) as f64
+                    }
+                    CodecMode::Decompress => output_bytes as f64 / original_bytes.max(1) as f64,
+                };
+                out
+            }
+            CodecOutcome::PassThrough | CodecOutcome::Skipped(_) | CodecOutcome::Failed(_) => {
+                self.compression_ratio = 1.0;
+                array.clone()
+            }
         };
 
         let mut updates = Vec::new();
-
-        match result {
-            Some(ref out) => {
-                let output_bytes = out.data.as_u8_slice().len();
-                match self.mode {
-                    CodecMode::Compress { .. } => {
-                        self.compression_ratio = original_bytes as f64 / output_bytes.max(1) as f64;
-                    }
-                    CodecMode::Decompress => {
-                        self.compression_ratio = output_bytes as f64 / original_bytes.max(1) as f64;
-                    }
-                }
-                if let Some(idx) = self.params.comp_factor {
-                    updates.push(ParamUpdate::float64(idx, self.compression_ratio));
-                }
-                if let Some(idx) = self.params.codec_status {
-                    updates.push(ParamUpdate::int32(idx, 0)); // Success
-                }
-                if let Some(idx) = self.params.codec_error {
-                    updates.push(ParamUpdate::Octet {
-                        reason: idx,
-                        addr: 0,
-                        value: String::new(),
-                    });
-                }
-                let mut r = ProcessResult::arrays(vec![Arc::new(out.clone())]);
-                r.param_updates = updates;
-                r
-            }
-            None => {
-                // C++: on failure, pass through the original array unchanged
-                self.compression_ratio = 1.0;
-                if let Some(idx) = self.params.comp_factor {
-                    updates.push(ParamUpdate::float64(idx, 1.0));
-                }
-                if let Some(idx) = self.params.codec_status {
-                    updates.push(ParamUpdate::int32(idx, 1)); // Error
-                }
-                if let Some(idx) = self.params.codec_error {
-                    updates.push(ParamUpdate::Octet {
-                        reason: idx,
-                        addr: 0,
-                        value: "codec operation failed or unsupported".to_string(),
-                    });
-                }
-                let mut r = ProcessResult::arrays(vec![Arc::new(array.clone())]);
-                r.param_updates = updates;
-                r
-            }
+        if let Some(idx) = self.params.comp_factor {
+            updates.push(ParamUpdate::float64(idx, self.compression_ratio));
         }
+        if let (Some(idx), Some(value)) = (self.params.compressor, compressor) {
+            updates.push(ParamUpdate::int32(idx, value));
+        }
+        if let Some(idx) = self.params.codec_status {
+            updates.push(ParamUpdate::int32(idx, status.as_i32()));
+        }
+        if let Some(idx) = self.params.codec_error {
+            updates.push(ParamUpdate::Octet {
+                reason: idx,
+                addr: 0,
+                value: error,
+            });
+        }
+
+        let mut r = ProcessResult::arrays(vec![Arc::new(output)]);
+        r.param_updates = updates;
+        r
     }
 
     fn plugin_type(&self) -> &str {
@@ -1204,20 +1388,10 @@ impl NDPluginProcess for CodecProcessor {
                 self.mode = CodecMode::Decompress;
             }
         } else if Some(reason) == self.params.compressor {
-            // C `NDCodecCompressor_t` (Codec.h:12-18): NONE=0, JPEG=1,
-            // BLOSC=2, LZ4=3, BSLZ4=4. The Rust-only zlib/lz4hdf5 codecs
-            // (ADP-26 sign-off) take ordinals after the C set so they never
-            // shadow a C ordinal — COMPRESSOR=2 must select Blosc as in C.
-            let codec = match params.value.as_i32() {
-                0 => CodecName::None,
-                1 => CodecName::JPEG,
-                2 => CodecName::Blosc,
-                3 => CodecName::LZ4,
-                4 => CodecName::BSLZ4,
-                5 => CodecName::Zlib,
-                6 => CodecName::LZ4HDF5,
-                _ => CodecName::None,
-            };
+            // C `NDCodecCompressor_t` (Codec.h:12-18) — the ordinal mapping lives
+            // in `CodecName::from_ordinal`, shared with the COMPRESSOR value the
+            // decompress path reports back.
+            let codec = CodecName::from_ordinal(params.value.as_i32());
             if let CodecMode::Compress { .. } = self.mode {
                 self.mode = CodecMode::Compress {
                     codec,
@@ -1721,6 +1895,53 @@ mod tests {
     }
 
     #[test]
+    fn test_r9_71_corrupt_bslz4_reports_cs_blosc_text() {
+        // R9-71. C's decompressBSLZ4 reports "Failed to Blosc decompress"
+        // (NDPluginCodec.cpp:601) — a copy-paste from decompressBlosc (:431), but
+        // it is what the CodecError PV shows for a corrupt BSLZ4 frame, so the
+        // port must emit it verbatim rather than the "corrected" BSLZ4 wording.
+        use ad_core_rs::plugin::runtime::ParamUpdate;
+
+        let mut arr = NDArray::new(
+            vec![NDDimension::new(32), NDDimension::new(32)],
+            NDDataType::UInt16,
+        );
+        if let NDDataBuffer::U16(ref mut v) = arr.data {
+            for (i, x) in v.iter_mut().enumerate() {
+                *x = (i * 11) as u16;
+            }
+        }
+        let pool = NDArrayPool::new(10_000_000);
+
+        // A genuine BSLZ4 frame, then corrupt the compressed payload.
+        let mut compressed = compress_bslz4(&arr);
+        if let NDDataBuffer::U8(ref mut v) = compressed.data {
+            for b in v.iter_mut() {
+                *b = 0xFF;
+            }
+        }
+        assert!(
+            decompress_bslz4(&compressed).is_none(),
+            "the corrupted frame must fail to decompress"
+        );
+
+        let mut decomp = CodecProcessor::new(CodecMode::Decompress);
+        decomp.params.codec_error = Some(13);
+        let result = decomp.process_array(&compressed, &pool);
+        let text = result
+            .param_updates
+            .iter()
+            .find_map(|u| match u {
+                ParamUpdate::Octet {
+                    reason: 13, value, ..
+                } => Some(value.clone()),
+                _ => None,
+            })
+            .expect("CodecError posted");
+        assert_eq!(text, "Failed to Blosc decompress");
+    }
+
+    #[test]
     fn test_bslz4_via_processor() {
         // The CodecProcessor must round-trip through the BSLZ4 codec.
         let mut arr = NDArray::new(
@@ -1802,19 +2023,270 @@ mod tests {
         assert_eq!(decompressed.data.len(), 3 * 16 * 16);
     }
 
+    // ---- R8-62: JPEG compression of RGB2 / RGB3 ----
+
+    /// The same RGB image in one of the three AD layouts. `pixel(x, y, c)` is
+    /// deterministic so the three arrays hold identical pixels, only ordered
+    /// differently.
+    fn make_rgb_layout(mode: ad_core_rs::color::NDColorMode, w: usize, h: usize) -> NDArray {
+        use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
+        use ad_core_rs::color::NDColorMode;
+
+        let pixel = |x: usize, y: usize, c: usize| ((x * 7 + y * 13 + c * 61) % 256) as u8;
+        let dims = match mode {
+            NDColorMode::RGB1 => vec![3, w, h],
+            NDColorMode::RGB2 => vec![w, 3, h],
+            NDColorMode::RGB3 => vec![w, h, 3],
+            other => panic!("not an RGB layout: {other:?}"),
+        };
+        let mut arr = NDArray::new(
+            dims.into_iter().map(NDDimension::new).collect(),
+            NDDataType::UInt8,
+        );
+        arr.attributes.add(NDAttribute::new_static(
+            "ColorMode",
+            "Color Mode",
+            NDAttrSource::Driver,
+            NDAttrValue::Int32(mode as i32),
+        ));
+        if let NDDataBuffer::U8(ref mut v) = arr.data {
+            for y in 0..h {
+                for x in 0..w {
+                    for c in 0..3 {
+                        let idx = match mode {
+                            NDColorMode::RGB1 => c + x * 3 + y * w * 3,
+                            NDColorMode::RGB2 => x + c * w + y * w * 3,
+                            NDColorMode::RGB3 => x + y * w + c * w * h,
+                            _ => unreachable!(),
+                        };
+                        v[idx] = pixel(x, y, c);
+                    }
+                }
+            }
+        }
+        arr
+    }
+
+    #[test]
+    fn test_r8_62_jpeg_compresses_rgb2_and_rgb3_as_reinterleaved_rgb() {
+        // C compressJPEG walks the RGB2 (plane step sizeX*3) and RGB3 (plane step
+        // sizeX) colour planes and re-interleaves each scanline before encoding
+        // (NDPluginCodec.cpp:186-227), producing exactly the JPEG of the
+        // equivalent RGB1 image. The port rejected both layouts outright.
+        use ad_core_rs::color::NDColorMode;
+
+        let rgb1 = make_rgb_layout(NDColorMode::RGB1, 16, 8);
+        let reference = compress_jpeg(&rgb1, 90).expect("RGB1 must compress");
+
+        for mode in [NDColorMode::RGB2, NDColorMode::RGB3] {
+            let src = make_rgb_layout(mode, 16, 8);
+            let out = compress_jpeg(&src, 90)
+                .unwrap_or_else(|e| panic!("{mode:?} must compress, C encodes it: {e:?}"));
+            assert_eq!(out.codec.as_ref().unwrap().name, CodecName::JPEG);
+            assert_eq!(&out.data.as_u8_slice()[0..2], &[0xFF, 0xD8], "SOI marker");
+            assert_eq!(
+                out.data.as_u8_slice(),
+                reference.data.as_u8_slice(),
+                "{mode:?} must encode the same pixels as the RGB1 image — a wrong \
+                 (or missing) scanline re-interleave changes the JPEG bytes"
+            );
+            // C's allocArray copies the input dimensions onto the output.
+            assert_eq!(out.dims.len(), 3);
+        }
+    }
+
+    #[test]
+    fn test_r8_62_decompressed_jpeg_reports_rgb1_colormode() {
+        // A decoded JPEG is always mono or RGB1 (C :268-272), so C overwrites the
+        // ColorMode attribute on the output (:318-322). An RGB2 source's stale
+        // ColorMode=3 on RGB1 data would make every downstream getInfo read the
+        // planes in the wrong order.
+        use ad_core_rs::color::NDColorMode;
+
+        let src = make_rgb_layout(NDColorMode::RGB2, 16, 8);
+        let compressed = compress_jpeg(&src, 90).expect("rgb2 jpeg");
+        assert_eq!(
+            compressed
+                .attributes
+                .get("ColorMode")
+                .unwrap()
+                .value
+                .as_i64(),
+            Some(NDColorMode::RGB2 as i64),
+            "the compressed frame keeps the source ColorMode"
+        );
+
+        let out = decompress_jpeg(&compressed).expect("jpeg decode");
+        assert_eq!(
+            out.attributes.get("ColorMode").unwrap().value.as_i64(),
+            Some(NDColorMode::RGB1 as i64),
+            "decompressed JPEG must be reported as RGB1"
+        );
+        assert_eq!(out.dims[0].size, 3);
+        assert_eq!(out.dims[1].size, 16);
+        assert_eq!(out.dims[2].size, 8);
+        assert_eq!(out.info().color_mode, NDColorMode::RGB1);
+
+        // Mono round-trip reports Mono, not a stale colour mode.
+        let mono = decompress_jpeg(&compress_jpeg(&make_u8_array(16, 16), 90).unwrap()).unwrap();
+        assert_eq!(
+            mono.attributes.get("ColorMode").unwrap().value.as_i64(),
+            Some(NDColorMode::Mono as i64)
+        );
+    }
+
+    #[test]
+    fn test_r8_62_jpeg_accepts_int8_like_c() {
+        // C accepts both 8-bit types (`case NDInt8: case NDUInt8:`, :135-143) and
+        // encodes the raw bytes; only wider types are rejected ("JPEG only
+        // supports 8-bit data").
+        let mut arr = NDArray::new(
+            vec![NDDimension::new(8), NDDimension::new(8)],
+            NDDataType::Int8,
+        );
+        if let NDDataBuffer::I8(ref mut v) = arr.data {
+            for (i, x) in v.iter_mut().enumerate() {
+                *x = (i as i32 - 32) as i8;
+            }
+        }
+        let out = compress_jpeg(&arr, 90).expect("Int8 must compress");
+        assert_eq!(&out.data.as_u8_slice()[0..2], &[0xFF, 0xD8]);
+        assert_eq!(
+            out.codec.as_ref().unwrap().original_data_type,
+            NDDataType::Int8
+        );
+    }
+
+    #[test]
+    fn test_r8_62_jpeg_rejects_3d_without_an_rgb_colormode() {
+        // A 3-D array whose ColorMode is Mono (the default when the attribute is
+        // absent, C :117-121) is not JPEG-encodable: C's `else if` chain (:155-164)
+        // matches none of RGB1/2/3, so image_width/image_height are never set, and
+        // the empty image reaches libjpeg's FATAL handler (jpeg_std_error, :115 —
+        // its error_exit calls exit()). It is NOT the "Unknown color mode" branch,
+        // which this test used to claim: C's colorMode switch does have a
+        // `case NDColorModeMono` arm (:182). The port refuses instead of aborting,
+        // under C's "Error writing JPEG data" (:235).
+        let arr = NDArray::new(
+            vec![
+                NDDimension::new(3),
+                NDDimension::new(8),
+                NDDimension::new(8),
+            ],
+            NDDataType::UInt8,
+        );
+        assert_eq!(
+            compress_jpeg(&arr, 90).unwrap_err(),
+            JpegCompressError::EncodeFailed,
+            "3-D Mono (no ColorMode attribute) is not a JPEG-encodable layout in C"
+        );
+    }
+
     #[test]
     fn test_jpeg_rejects_non_u8() {
+        // R8-74: C `:139-142` — "JPEG only supports 8-bit data".
         let arr = NDArray::new(
             vec![NDDimension::new(8), NDDimension::new(8)],
             NDDataType::UInt16,
         );
-        assert!(compress_jpeg(&arr, 90).is_none());
+        let err = compress_jpeg(&arr, 90).unwrap_err();
+        assert_eq!(err, JpegCompressError::NotEightBit);
+        assert_eq!(err.message(), "JPEG only supports 8-bit data");
     }
 
     #[test]
     fn test_jpeg_rejects_1d() {
+        // R8-74: C `:165-168` — "Unsupported array structure" for ndims ∉ {2,3}.
         let arr = NDArray::new(vec![NDDimension::new(64)], NDDataType::UInt8);
-        assert!(compress_jpeg(&arr, 90).is_none());
+        let err = compress_jpeg(&arr, 90).unwrap_err();
+        assert_eq!(err, JpegCompressError::UnsupportedArrayStructure);
+        assert_eq!(err.message(), "Unsupported array structure");
+    }
+
+    #[test]
+    fn test_r8_74_jpeg_compress_failures_carry_the_c_error_texts() {
+        // R8-74. C writes a *different* errorMessage at each rejection point and
+        // the plugin copies it verbatim into the CodecError PV, so each text is
+        // part of the contract. The port reported one generic "JPEG compression
+        // failed" for all of them, because compress_jpeg returned a bare Option and
+        // the caller had to invent the text.
+        use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
+        use ad_core_rs::color::NDColorMode;
+
+        // C :140 — dataType is not 8-bit.
+        let arr = NDArray::new(
+            vec![NDDimension::new(8), NDDimension::new(8)],
+            NDDataType::Float32,
+        );
+        assert_eq!(
+            compress_jpeg(&arr, 90).unwrap_err().message(),
+            "JPEG only supports 8-bit data"
+        );
+
+        // C :166 — ndims is neither 2 nor 3.
+        let arr = NDArray::new(
+            vec![
+                NDDimension::new(2),
+                NDDimension::new(2),
+                NDDimension::new(2),
+                NDDimension::new(2),
+            ],
+            NDDataType::UInt8,
+        );
+        assert_eq!(
+            compress_jpeg(&arr, 90).unwrap_err().message(),
+            "Unsupported array structure"
+        );
+
+        // C :201 — a colorMode with no arm in the switch. Bayer is 1, YUV444 is 5;
+        // NDColorMode's discriminants are C's NDColorMode_t values, so the `%d`
+        // must print those numbers.
+        for (mode, text) in [
+            (NDColorMode::Bayer, "Unknown color mode 1"),
+            (NDColorMode::YUV444, "Unknown color mode 5"),
+            (NDColorMode::YUV411, "Unknown color mode 7"),
+        ] {
+            let mut arr = NDArray::new(
+                vec![NDDimension::new(8), NDDimension::new(8)],
+                NDDataType::UInt8,
+            );
+            arr.attributes.add(NDAttribute::new_static(
+                "ColorMode",
+                "",
+                NDAttrSource::Driver,
+                NDAttrValue::Int32(mode as i32),
+            ));
+            assert_eq!(compress_jpeg(&arr, 90).unwrap_err().message(), text);
+        }
+    }
+
+    #[test]
+    fn test_r8_74_codec_error_pv_carries_the_jpeg_text() {
+        // The typed error must reach the CodecError PV, not just the return value:
+        // C copies `errorMessage` into it verbatim.
+        use ad_core_rs::plugin::runtime::ParamUpdate;
+
+        let mut proc = CodecProcessor::new(CodecMode::Compress {
+            codec: CodecName::JPEG,
+            quality: 90,
+        });
+        proc.params.codec_error = Some(13);
+        let arr = NDArray::new(
+            vec![NDDimension::new(8), NDDimension::new(8)],
+            NDDataType::UInt16,
+        );
+        let result = proc.process_array(&arr, &NDArrayPool::new(0));
+        let text = result
+            .param_updates
+            .iter()
+            .find_map(|u| match u {
+                ParamUpdate::Octet {
+                    reason: 13, value, ..
+                } => Some(value.clone()),
+                _ => None,
+            })
+            .expect("CodecError posted");
+        assert_eq!(text, "JPEG only supports 8-bit data");
     }
 
     #[test]
@@ -2194,6 +2666,260 @@ mod tests {
         // C++: on failure, pass through original array unchanged
         assert_eq!(result.output_arrays.len(), 1);
         assert_eq!(proc.compression_ratio(), 1.0);
+    }
+
+    // ---- R8-61: pass-through vs failure on the Codec plugin's exits ----
+
+    /// Param indices used by the R8-61 tests; `register_params` normally
+    /// discovers them from the port, which a unit test has no need to build.
+    fn processor_with_params(mode: CodecMode) -> CodecProcessor {
+        let mut proc = CodecProcessor::new(mode);
+        proc.params.comp_factor = Some(10);
+        proc.params.compressor = Some(11);
+        proc.params.codec_status = Some(12);
+        proc.params.codec_error = Some(13);
+        proc
+    }
+
+    fn int32_update(updates: &[ParamUpdate], reason: usize) -> Option<i32> {
+        updates.iter().find_map(|u| match u {
+            ParamUpdate::Int32 {
+                reason: r, value, ..
+            } if *r == reason => Some(*value),
+            _ => None,
+        })
+    }
+
+    fn octet_update(updates: &[ParamUpdate], reason: usize) -> Option<String> {
+        updates.iter().find_map(|u| match u {
+            ParamUpdate::Octet {
+                reason: r, value, ..
+            } if *r == reason => Some(value.clone()),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn test_r8_61_decompress_uncompressed_input_is_success_passthrough() {
+        // C NDPluginCodec.cpp:732-735 — Decompress mode on an array with an empty
+        // codec: result = pArray, COMPRESSOR = NDCODEC_NONE, codecStatus stays
+        // SUCCESS and no error string is set. The port reported CodecStatus=1 +
+        // "codec operation failed or unsupported" and never wrote COMPRESSOR.
+        let pool = NDArrayPool::new(1_000_000);
+        let arr = make_u8_array(8, 8);
+        let mut proc = processor_with_params(CodecMode::Decompress);
+        let result = proc.process_array(&arr, &pool);
+
+        assert_eq!(
+            int32_update(&result.param_updates, 12),
+            Some(0),
+            "CodecStatus must stay SUCCESS on an uncompressed input"
+        );
+        assert_eq!(
+            octet_update(&result.param_updates, 13),
+            Some(String::new()),
+            "no error string on a pass-through"
+        );
+        assert_eq!(
+            int32_update(&result.param_updates, 11),
+            Some(0),
+            "COMPRESSOR must be set to NDCODEC_NONE"
+        );
+        assert_eq!(
+            result.output_arrays[0].data.as_u8_slice(),
+            arr.data.as_u8_slice(),
+            "the input array is passed through unchanged"
+        );
+        assert_eq!(proc.compression_ratio(), 1.0);
+    }
+
+    #[test]
+    fn test_r8_61_decompress_reports_compressor_of_the_input_codec() {
+        // C sets NDCodecCompressor on every decompress branch (:739/:747/:752/
+        // :757) from the codec found on the input; the port never wrote it.
+        let pool = NDArrayPool::new(1_000_000);
+        let src = make_u8_array(16, 16);
+        for (codec, ordinal) in [
+            (compress_lz4(&src), 3),
+            (compress_blosc(&src, &BloscConfig::default()), 2),
+            (compress_bslz4(&src), 4),
+            (compress_jpeg(&src, 90).expect("jpeg"), 1),
+        ] {
+            let mut proc = processor_with_params(CodecMode::Decompress);
+            let result = proc.process_array(&codec, &pool);
+            assert_eq!(
+                int32_update(&result.param_updates, 11),
+                Some(ordinal),
+                "COMPRESSOR must report the input codec's C ordinal"
+            );
+            assert_eq!(
+                int32_update(&result.param_updates, 12),
+                Some(0),
+                "a successful decompress is SUCCESS"
+            );
+        }
+    }
+
+    #[test]
+    fn test_r8_61_compress_with_compressor_none_is_success_passthrough() {
+        // C :671 gates the already-compressed check on `algo`, and :680-683 maps
+        // `case NDCODEC_NONE: default:` to `result = pArray` — a COMPRESSOR=None
+        // compress plugin is a SUCCESS pass-through, not a codec failure. The
+        // port's catch-all `Compress { .. } => None` sent it to the error branch.
+        let pool = NDArrayPool::new(1_000_000);
+        let arr = make_u8_array(8, 8);
+        let mut proc = processor_with_params(CodecMode::Compress {
+            codec: CodecName::None,
+            quality: 85,
+        });
+        let result = proc.process_array(&arr, &pool);
+
+        assert_eq!(int32_update(&result.param_updates, 12), Some(0));
+        assert_eq!(octet_update(&result.param_updates, 13), Some(String::new()));
+        assert_eq!(
+            int32_update(&result.param_updates, 11),
+            None,
+            "compress mode must not overwrite the operator's COMPRESSOR selection"
+        );
+        assert!(result.output_arrays[0].codec.is_none());
+        assert_eq!(
+            result.output_arrays[0].data.as_u8_slice(),
+            arr.data.as_u8_slice()
+        );
+    }
+
+    #[test]
+    fn test_r8_61_genuine_decompress_failure_still_reports_an_error() {
+        // The pass-through paths must not swallow real failures: a truncated LZ4
+        // payload still reports a non-zero CodecStatus + an error string, and
+        // still republishes the input (C `finish:` block, :770-776).
+        let pool = NDArrayPool::new(1_000_000);
+        let arr = make_u8_array(16, 16);
+        let mut corrupted = compress_lz4(&arr);
+        if let NDDataBuffer::U8(ref mut v) = corrupted.data {
+            v.truncate(3);
+        }
+        let mut proc = processor_with_params(CodecMode::Decompress);
+        let result = proc.process_array(&corrupted, &pool);
+
+        assert_ne!(
+            int32_update(&result.param_updates, 12),
+            Some(0),
+            "a failed decompress must not report SUCCESS"
+        );
+        assert_eq!(
+            octet_update(&result.param_updates, 13),
+            Some("Failed to LZ4 decompress".to_string())
+        );
+        assert_eq!(int32_update(&result.param_updates, 11), Some(3));
+        assert_eq!(
+            result.output_arrays[0].data.as_u8_slice(),
+            corrupted.data.as_u8_slice(),
+            "the input array is republished on failure"
+        );
+    }
+
+    // ---- R8-63: the three-level CodecStatus contract ----
+
+    #[test]
+    fn test_r8_63_status_levels_match_c() {
+        // C NDCodecStatus_t (NDPluginCodec.h:42-46): SUCCESS=0, WARNING=1,
+        // ERROR=2. These are the values every CodecStatus PV client reads.
+        assert_eq!(CodecStatus::Success.as_i32(), 0);
+        assert_eq!(CodecStatus::Warning.as_i32(), 1);
+        assert_eq!(CodecStatus::Error.as_i32(), 2);
+    }
+
+    #[test]
+    fn test_r8_63_already_compressed_is_a_warning_not_success() {
+        // C :671-676 — compressing an already-compressed array is benign but not
+        // silent: errorMessage "Array already compressed", codecStatus WARNING,
+        // and the input passes through. The port reported SUCCESS with no error.
+        let pool = NDArrayPool::new(1_000_000);
+        let compressed = compress_lz4(&make_u8_array(16, 16));
+        let mut proc = processor_with_params(CodecMode::Compress {
+            codec: CodecName::Zlib,
+            quality: 85,
+        });
+        let result = proc.process_array(&compressed, &pool);
+
+        assert_eq!(
+            int32_update(&result.param_updates, 12),
+            Some(CodecStatus::Warning.as_i32()),
+            "already-compressed input must report WARNING(1)"
+        );
+        assert_eq!(
+            octet_update(&result.param_updates, 13),
+            Some("Array already compressed".to_string())
+        );
+        // The frame still flows on, still LZ4-compressed.
+        assert_eq!(
+            result.output_arrays[0].codec.as_ref().unwrap().name,
+            CodecName::LZ4
+        );
+    }
+
+    #[test]
+    fn test_r8_63_genuine_failures_are_error_not_warning() {
+        // C reports ERROR(2) for real failures: a JPEG-unsupported input
+        // (:141/:167/:202/:252) and a codec that fails to decode (:279, :760).
+        // The port hardcoded 1 (WARNING) on every failure, making the two levels
+        // indistinguishable.
+        let pool = NDArrayPool::new(1_000_000);
+
+        // Compress: UInt16 is not JPEG-encodable ("JPEG only supports 8-bit data").
+        let wide = NDArray::new(
+            vec![NDDimension::new(8), NDDimension::new(8)],
+            NDDataType::UInt16,
+        );
+        let mut proc = processor_with_params(CodecMode::Compress {
+            codec: CodecName::JPEG,
+            quality: 85,
+        });
+        let result = proc.process_array(&wide, &pool);
+        assert_eq!(
+            int32_update(&result.param_updates, 12),
+            Some(CodecStatus::Error.as_i32()),
+            "an unsupported JPEG input is an ERROR"
+        );
+
+        // Decompress: a truncated payload is a decoder failure.
+        let mut corrupted = compress_lz4(&make_u8_array(16, 16));
+        if let NDDataBuffer::U8(ref mut v) = corrupted.data {
+            v.truncate(3);
+        }
+        let mut proc = processor_with_params(CodecMode::Decompress);
+        let result = proc.process_array(&corrupted, &pool);
+        assert_eq!(
+            int32_update(&result.param_updates, 12),
+            Some(CodecStatus::Error.as_i32()),
+            "a failed decompress is an ERROR"
+        );
+    }
+
+    #[test]
+    fn test_r8_63_successful_and_passthrough_paths_report_success() {
+        // The other two levels must stay at SUCCESS(0): a real compression, and
+        // the pass-through exits (C :659, :680-683, :732-735).
+        let pool = NDArrayPool::new(1_000_000);
+        let arr = make_u8_array(16, 16);
+
+        let mut proc = processor_with_params(CodecMode::Compress {
+            codec: CodecName::LZ4,
+            quality: 85,
+        });
+        let compressed = proc.process_array(&arr, &pool);
+        assert_eq!(
+            int32_update(&compressed.param_updates, 12),
+            Some(CodecStatus::Success.as_i32())
+        );
+
+        let mut proc = processor_with_params(CodecMode::Decompress);
+        let passthrough = proc.process_array(&arr, &pool);
+        assert_eq!(
+            int32_update(&passthrough.param_updates, 12),
+            Some(CodecStatus::Success.as_i32())
+        );
     }
 
     #[test]

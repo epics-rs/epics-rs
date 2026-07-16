@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::server::records::ao::AoRecord;
 use epics_base_rs::types::EpicsValue;
 use epics_ca_rs::server::CaServerBuilder;
@@ -412,9 +413,40 @@ record(epid, "TEST:PID") {
 //
 // C `devEpidSoft.c:153-158`: on the feedback OFF->ON edge the
 // integral term is seeded from the OUTL output link's *actual
-// current value*. The framework reads it via a `ReadDbLink`
-// pre-process action emitted by `EpidRecord::pre_process_actions`.
+// current value* — but only on a cycle that actually reaches
+// `do_pid`'s PID block: past the record's UDF gate
+// (`epidRecord.c:195`), past the CONSTANT-INP abort
+// (`devEpidSoft.c:110-112`) and past the MDT gate
+// (`devEpidSoft.c:125`).
 // ============================================================
+
+/// A db that reaches C's OUTL seed: a real INP (else `do_pid` aborts on the
+/// CONSTANT-INP check), a CONSTANT STPL (which clears UDF at init —
+/// `epidRecord.c:160-164` — else `process` returns before `do_pid`), and a
+/// non-zero KI (else `if (ki == 0) i = 0.` wipes the seed).
+fn epid_bumpless_db(mdt: &str) -> String {
+    format!(
+        r#"
+record(ai, "SENSOR") {{
+    field(VAL, "2.0")
+}}
+record(ao, "DAC") {{
+    field(VAL, "7.0")
+}}
+record(epid, "PID") {{
+    field(KP, "1.0")
+    field(KI, "0.5")
+    field(DRVH, "100")
+    field(DRVL, "-100")
+    field(INP, "SENSOR")
+    field(STPL, "1.0")
+    field(OUTL, "DAC")
+    field(FMOD, "0")
+    field(MDT, "{mdt}")
+}}
+"#
+    )
+}
 
 #[tokio::test]
 async fn test_epid_outl_readback_seeds_integral_term() {
@@ -422,25 +454,14 @@ async fn test_epid_outl_readback_seeds_integral_term() {
     // link points at it. On the feedback OFF->ON edge the epid must
     // seed its integral term I from DAC's current value, NOT from its
     // own last-commanded OVAL (which is 0.0).
-    let db_str = r#"
-record(ao, "DAC") {
-    field(VAL, "7.0")
-}
-record(epid, "PID") {
-    field(KP, "1.0")
-    field(KI, "0.5")
-    field(DRVH, "100")
-    field(DRVL, "-100")
-    field(OUTL, "DAC")
-    field(FMOD, "0")
-}
-"#;
+    let db_str = epid_bumpless_db("0");
     let macros = HashMap::new();
     let server = CaServerBuilder::new()
         .port(0)
         .register_record_type("epid", || Box::new(std_rs::EpidRecord::default()))
         .register_record_type("ao", || Box::new(AoRecord::default()))
-        .db_string(db_str, &macros)
+        .register_record_type("ai", || Box::new(AiRecord::default()))
+        .db_string(&db_str, &macros)
         .unwrap()
         .build()
         .await
@@ -454,9 +475,8 @@ record(epid, "PID") {
     db.put_record_field_from_ca("PID", "FBON", EpicsValue::Short(1))
         .await
         .unwrap();
-    // Process the epid: pre_process_actions emits ReadDbLink{OUTL->I},
-    // the framework reads DAC's value (7.0) into I before do_pid runs,
-    // and do_pid keeps I on the bumpless edge.
+    // Process the epid: the framework stages DAC's value (7.0) from OUTL, and
+    // `do_pid` — past the MDT gate (MDT=0 here) — moves it into I.
     db.put_record_field_from_ca("PID", "PROC", EpicsValue::Short(1))
         .await
         .unwrap();
@@ -467,6 +487,62 @@ record(epid, "PID") {
         EpicsValue::Double(v) => assert!(
             (v - 7.0).abs() < 1e-9,
             "bumpless edge must seed I from OUTL's actual value 7.0, got {v}"
+        ),
+        other => panic!("expected Double, got {other:?}"),
+    }
+}
+
+/// R7-64: C gates on `if (dt < pepid->mdt) return(1);` (`devEpidSoft.c:125`)
+/// BEFORE the OUTL seed (`:150-158`). A sub-MDT cycle therefore never reads
+/// OUTL and never touches `.I` — and because `fbop` is only committed by a
+/// cycle that computes, the OFF->ON edge survives to the next full cycle,
+/// which seeds for real.
+#[tokio::test]
+async fn test_epid_sub_mdt_edge_cycle_does_not_seed_i() {
+    let db_str = epid_bumpless_db("0.5");
+    let macros = HashMap::new();
+    let server = CaServerBuilder::new()
+        .register_record_type("epid", || Box::new(std_rs::EpidRecord::default()))
+        .register_record_type("ao", || Box::new(AoRecord::default()))
+        .register_record_type("ai", || Box::new(AiRecord::default()))
+        .db_string(&db_str, &macros)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let db = server.database().clone();
+
+    // OFF->ON edge, then process immediately: dt since the record's CT was
+    // stamped is a few ms — far below MDT=0.5 s.
+    db.put_record_field_from_ca("PID", "FBON", EpicsValue::Short(1))
+        .await
+        .unwrap();
+    db.put_record_field_from_ca("PID", "PROC", EpicsValue::Short(1))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    match server.get("PID.I").await.unwrap() {
+        EpicsValue::Double(v) => assert_eq!(
+            v, 0.0,
+            "a sub-MDT cycle must not read OUTL nor post .I (C returns at \
+             devEpidSoft.c:125, before the seed); got {v}"
+        ),
+        other => panic!("expected Double, got {other:?}"),
+    }
+
+    // Once MDT has elapsed the very same edge (FBOP is still 0 — a gated cycle
+    // commits nothing) seeds the integral term for real.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    db.put_record_field_from_ca("PID", "PROC", EpicsValue::Short(1))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    match server.get("PID.I").await.unwrap() {
+        EpicsValue::Double(v) => assert!(
+            (v - 7.0).abs() < 1e-9,
+            "the post-MDT cycle must seed I from OUTL (7.0), got {v}"
         ),
         other => panic!("expected Double, got {other:?}"),
     }

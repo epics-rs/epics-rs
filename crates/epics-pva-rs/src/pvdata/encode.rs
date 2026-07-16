@@ -355,6 +355,11 @@ const TAG_BOUNDED_STRING: u8 = 0x83;
 const TAG_STRUCTURE_ARRAY: u8 = 0x88;
 const TAG_UNION_ARRAY: u8 = 0x89;
 const TAG_VARIANT_ARRAY: u8 = 0x8A;
+/// pvxs `TypeCode::Null` — the type code of an absent (invalid) `Value`.
+/// `to_wire(Buf&, const FieldDesc*)` emits it for a null descriptor
+/// (`dataencode.cpp:29-33`) and `from_wire` accepts it, leaving the
+/// descriptor list empty and the buffer good (`dataencode.cpp:79-80`).
+pub const TAG_NULL: u8 = 0xFF;
 
 // ── FieldDesc encode ─────────────────────────────────────────────────────
 
@@ -680,14 +685,47 @@ fn decode_type_desc_at_depth(
 /// 0xFE: read a u16 key, return the cached descriptor by clone. If the
 /// slot is empty an error is returned.
 ///
-/// 0xFF: NULL — handled by callers (we reject here as caller-context
-/// dependent).
+/// 0xFF: NULL — rejected here, because a bare descriptor decode has no
+/// value to be absent. Callers that decode a pvxs `Value` (a descriptor
+/// that may legitimately be null) use [`decode_type_desc_cached_opt`].
 pub fn decode_type_desc_cached(
     cur: &mut Cursor<&[u8]>,
     order: ByteOrder,
     cache: &mut TypeCache,
 ) -> Result<FieldDesc, DecodeError> {
     decode_type_desc_cached_at_depth(cur, order, cache, BoundedStringPolicy::Interop, 0)
+}
+
+/// Decode a type descriptor that may be the NULL (`0xFF`) type code, the
+/// single owner of pvxs's "absent Value" rule.
+///
+/// This is pvxs `from_wire_type` (`dataencode.cpp:729-745`): `from_wire(buf,
+/// descs, cache)` short-circuits on `TypeCode::Null` (`:79-80`) leaving
+/// `descs` empty and **the buffer still good**, and `from_wire_type` then
+/// yields `val = Value()` — an invalid/absent Value, not a wire fault. It is
+/// the byte pvxs's own `to_wire(Buf&, const FieldDesc*)` emits for a null
+/// descriptor (`dataencode.cpp:29-33`).
+///
+/// `Ok(None)` is that absent Value. Every other tag decodes exactly as
+/// [`decode_type_desc_cached`], including `0xFD`/`0xFE` cache markers.
+///
+/// Callers that then read the value body must skip it when this returns
+/// `None` — pvxs's `from_wire_type_value` guards it with
+/// `if(buf.good() && val)` (`dataencode.cpp:747-753`).
+pub fn decode_type_desc_cached_opt(
+    cur: &mut Cursor<&[u8]>,
+    order: ByteOrder,
+    cache: &mut TypeCache,
+) -> Result<Option<FieldDesc>, DecodeError> {
+    // Peek: a `0xFF` is consumed and reported as the absent Value; anything
+    // else (including EOF) falls through to the normal decoder so its error
+    // reporting is unchanged.
+    let pos = cur.position();
+    if cur.get_u8()? == TAG_NULL {
+        return Ok(None);
+    }
+    cur.set_position(pos);
+    decode_type_desc_cached(cur, order, cache).map(Some)
 }
 
 /// Variant of [`decode_type_desc_cached`] that selects the
@@ -1286,43 +1324,46 @@ fn value_fits_desc(value: &PvField, desc: &FieldDesc) -> bool {
 }
 
 /// Canonicalize a *selection* bitset (e.g. the output of
-/// [`crate::pv_request::request_to_mask`]) into a valid wire
-/// *changed*-bitset, mirroring pvxs `to_wire_valid`
-/// (`src/dataencode.cpp:414-438`): a set structure bit conveys its
-/// *entire subtree*, and `to_wire_valid` skips past the descendants of
-/// a valid structure bit rather than emitting them individually.
+/// [`crate::pv_request::request_to_mask`]) into a wire *changed*-bitset,
+/// mirroring pvxs `to_wire_valid` (`src/dataencode.cpp:414-439`).
 ///
-/// A structure node is emitted as a whole subtree when either:
+/// **pvxs's changed-bitset is a set of LEAF bits.** `to_wire_valid` sets
+/// wire bit `b` iff `store[b].valid && mask[b]`, and `Value::mark`
+/// (`src/data.cpp:256-270`) sets `valid` on the *assigned* field and then
+/// walks only `store->top->enclosing` (Union / StructArray nesting) — it
+/// never touches a parent structure's `parent_index`. So assigning a leaf
+/// never makes its enclosing structure's bit valid, and the
+/// `bit += desc[bit].size()` skip in `to_wire_valid` only ever fires for a
+/// structure a source explicitly marked. pvxs's own serialization
+/// regression pins this: `test/testxcode.cpp:111-116` assigns
+/// `timeStamp.nanoseconds` + `alarm.message` on an `NTScalar<UInt32>` and
+/// expects the 2-byte BitMask `"\x02 \x01"` = bits `{5, 8}` — the two
+/// leaves, with no `alarm` (2), no `timeStamp` (6) and no root (0) bit.
 ///
-/// * **Every descendant bit is selected** — a fully-selected subtree,
-///   e.g. an empty `field {}` or `field(alarm)` request.
-/// * **Its own bit is selected and it is not the root** — the pvRequest
-///   named this structure, possibly via a nested path such as
-///   `field(alarm.status)`. pvxs `request2mask`
-///   (`src/pvrequest.cpp:33-40`) sets the matched structure's bit, and
-///   for a source value whose structure is valid pvxs sends the whole
-///   structure. Narrowing such a request down to the named leaf would
-///   drop sibling fields the peer expects.
+/// Hence: emit exactly the selected LEAF bits. Structure bits — including
+/// the root's — are never emitted. A structure bit in a *selection* mask is
+/// a PERMISSION bit, not a select-whole-subtree bit: `request2mask`
+/// (`src/pvrequest.cpp:33-40`) sets the matched structure's bit for a
+/// nested request such as `field(alarm.status)` while selecting only the
+/// named leaf. The whole-subtree case is carried by the selection itself —
+/// `request2mask`'s `crdesc->mlookup.empty()` branch (`pvrequest.cpp:41-46`)
+/// sets every descendant bit for a bare `field(alarm)`, so its leaves are
+/// already in `selection` and land in the result individually.
 ///
-/// The root bit (0) is excluded from the own-bit rule: `request_to_mask`
-/// always sets it as pvxs's wildcard bit, so honouring it as "whole
-/// tree" would defeat every field filter. The root expands to the whole
-/// tree only when every descendant is also selected (the empty-request
-/// case, first bullet).
+/// Consequences, all matching pvxs:
 ///
-/// Otherwise the structure bit stays clear and the walk recurses,
-/// keeping any selected leaves. Leaf bits are copied verbatim. The
-/// result encodes and decodes symmetrically under the §5.4 semantics
-/// enforced by `*_with_bitset`.
+/// * `field(alarm.status)` → `{alarm.status}`, one `int32` of payload —
+///   `alarm.severity` / `alarm.message` are NOT shipped.
+/// * `field(alarm)` → `{alarm.severity, alarm.status, alarm.message}`.
+/// * wildcard on an NTScalar → `{1,3,4,5,7,8,9}`.
+///
+/// The encoder/decoder still honour a set structure bit as "whole subtree"
+/// (`from_wire_valid` does too), so decoding a peer's parent-compressed
+/// bitset keeps working; this function simply never *produces* one.
 pub fn canonical_changed_bitset(
     desc: &FieldDesc,
     selection: &crate::proto::BitSet,
 ) -> crate::proto::BitSet {
-    fn all_descendants_set(sel: &crate::proto::BitSet, pos: usize, desc_local: &FieldDesc) -> bool {
-        let total = desc_local.total_bits();
-        (0..total).all(|i| sel.get(pos + i))
-    }
-
     fn walk(
         desc: &FieldDesc,
         bit_offset: usize,
@@ -1331,32 +1372,13 @@ pub fn canonical_changed_bitset(
     ) {
         match desc {
             FieldDesc::Structure { fields, .. } => {
-                // A set structure bit conveys its whole subtree (pvxs
-                // `to_wire_valid`). That holds when the subtree is fully
-                // selected, or when a non-root structure's own bit is set
-                // because the pvRequest named it (`request2mask` sets the
-                // matched structure bit even for a nested leaf request like
-                // `alarm.status`). The always-set root wildcard bit is
-                // excluded so it does not widen a field filter to the
-                // whole tree.
-                let whole = all_descendants_set(selection, bit_offset, desc)
-                    || (bit_offset != 0 && selection.get(bit_offset));
-                if whole {
-                    // pvxs `to_wire_valid` (dataencode.cpp:425-432) sets the
-                    // structure's own bit and then advances
-                    // `bit += desc[bit].size()`, skipping every descendant:
-                    // the parent bit alone conveys the whole subtree. Emit
-                    // parent-only so the wire bitset is byte-exact with pvxs;
-                    // the encoder/decoder treat a set structure bit as its
-                    // full subtree regardless of descendant bits.
-                    out.set(bit_offset);
-                } else {
-                    // Partial → leave the structure bit clear; recurse.
-                    let mut child_bit = bit_offset + 1;
-                    for (_, child) in fields {
-                        walk(child, child_bit, selection, out);
-                        child_bit += child.total_bits();
-                    }
+                // Never emit the structure's own bit — pvxs's `Value::mark`
+                // cannot set it (data.cpp:256-270). Recurse; the selected
+                // leaves below carry the update.
+                let mut child_bit = bit_offset + 1;
+                for (_, child) in fields {
+                    walk(child, child_bit, selection, out);
+                    child_bit += child.total_bits();
                 }
             }
             _ => {
@@ -1372,74 +1394,6 @@ pub fn canonical_changed_bitset(
     out
 }
 
-/// structural diff of two `PvField` snapshots against their
-/// shared `desc`, producing the per-event **changed bitset** — the
-/// leaves whose value differs between `prev` and `curr`.
-///
-/// pvxs posts a monitor `Value` whose marked bitset reflects exactly
-/// the leaves a source touched since the last `unmark()`
-/// (`servermon.cpp:174` then intersects with the request mask). A
-/// QSRV group monitor with the default self-trigger re-reads only the
-/// triggered member, so consecutive group snapshots differ in only
-/// that member's leaves — diffing them reproduces pvxs's marked-leaf
-/// set without the source having to track marks itself.
-///
-/// Bit numbering matches the rest of this module (pvData spec §5.4):
-/// root structure is bit 0, fields numbered depth-first in
-/// declaration order. Only **leaf** bits are set; structure bits stay
-/// clear so [`canonical_changed_bitset`] / the encoder treat the
-/// result as a partial update.
-///
-/// A leaf present in `desc` but missing from either snapshot is
-/// treated as changed (defensive: a shape mismatch must not silently
-/// drop the field from the wire delta).
-pub fn diff_changed_bitset(
-    desc: &FieldDesc,
-    prev: &PvField,
-    curr: &PvField,
-) -> crate::proto::BitSet {
-    fn walk(
-        desc: &FieldDesc,
-        bit_offset: usize,
-        prev: Option<&PvField>,
-        curr: Option<&PvField>,
-        out: &mut crate::proto::BitSet,
-    ) {
-        match desc {
-            FieldDesc::Structure { fields, .. } => {
-                let mut child_bit = bit_offset + 1;
-                for (name, child_desc) in fields {
-                    let prev_child = match prev {
-                        Some(PvField::Structure(s)) => s.get_field(name),
-                        _ => None,
-                    };
-                    let curr_child = match curr {
-                        Some(PvField::Structure(s)) => s.get_field(name),
-                        _ => None,
-                    };
-                    walk(child_desc, child_bit, prev_child, curr_child, out);
-                    child_bit += child_desc.total_bits();
-                }
-            }
-            _ => {
-                // Leaf node: mark changed when the values differ, or
-                // when either snapshot lacks the leaf entirely.
-                let changed = match (prev, curr) {
-                    (Some(p), Some(c)) => p != c,
-                    _ => true,
-                };
-                if changed {
-                    out.set(bit_offset);
-                }
-            }
-        }
-    }
-
-    let mut out = crate::proto::BitSet::new();
-    walk(desc, 0, Some(prev), Some(curr), &mut out);
-    out
-}
-
 /// build a wire *selection* bitset that marks every bit
 /// under each field path in `marked_paths`.
 ///
@@ -1448,14 +1402,14 @@ pub fn diff_changed_bitset(
 /// `field_name` paths. Marking a node sets its entire subtree, which
 /// reproduces pvxs's *assigned-not-changed* semantics
 /// (`groupsource.cpp:288` marks each `+trigger` target whether or not
-/// its value changed since the last post), unlike
-/// [`diff_changed_bitset`] which only marks leaves that differ.
+/// its value changed since the last post). The port has no
+/// value-diffing counterpart — pvxs never reconstructs a marked set by
+/// comparing consecutive values.
 ///
 /// The result is a *selection* mask in the same sense as
 /// [`request_to_mask`](crate::pv_request::request_to_mask): the caller
 /// intersects it with the request mask and runs it through
-/// [`canonical_changed_bitset`] before encoding, exactly as the diff
-/// path does.
+/// [`canonical_changed_bitset`] before encoding.
 ///
 /// Bit numbering matches the rest of this module (pvData §5.4): root is
 /// bit 0, fields depth-first in declaration order.
@@ -1495,6 +1449,40 @@ pub fn marked_changed_bitset(desc: &FieldDesc, marked_paths: &[String]) -> crate
     let mut out = crate::proto::BitSet::new();
     walk(desc, 0, "", marked_paths, &mut out);
     out
+}
+
+/// The wire changed-bitset a `marked_paths` post actually frames: the
+/// marked subtrees intersected with the request `mask`, canonicalized to
+/// leaf bits ([`canonical_changed_bitset`]).
+///
+/// **Single owner for both the enqueue gate and the wire.** pvxs decides
+/// whether a post is `real` with `testmask` (`pvrequest.cpp:73-92`), which
+/// scans `store[idx].valid && mask[idx]` — and only *leaves* ever carry
+/// `valid` (`Value::mark`, `data.cpp:256-270`), so its gate ranges over
+/// exactly the bits `to_wire_valid` would emit. Computing the gate from the
+/// raw [`marked_changed_bitset`] instead would test STRUCTURE bits too: a
+/// request such as `field(timeStamp.bogus)` yields a mask holding the
+/// `timeStamp` structure bit and no leaf under it (`request2mask`
+/// `pvrequest.cpp:33-40` sets the matched structure's bit; the non-existent
+/// child selects nothing), so a `timeStamp` post would pass a structure-bit
+/// gate and then frame an EMPTY changed-bitset — full-rate empty MONITOR
+/// DATA where pvxs posts nothing at all.
+///
+/// So: gate on `!result.is_empty()`, frame `result`. One computation, so the
+/// two can never disagree.
+pub fn marked_wire_changed_bitset(
+    desc: &FieldDesc,
+    marked_paths: &[String],
+    mask: &crate::proto::BitSet,
+) -> crate::proto::BitSet {
+    let target = marked_changed_bitset(desc, marked_paths);
+    let mut selected = crate::proto::BitSet::new();
+    for bit in target.iter() {
+        if mask.get(bit) {
+            selected.set(bit);
+        }
+    }
+    canonical_changed_bitset(desc, &selected)
 }
 
 /// Inverse of [`marked_changed_bitset`]: collect the dot-separated field
@@ -2584,6 +2572,44 @@ mod tests {
     use super::*;
     use crate::pvdata::{UnionItem, VariantValue};
 
+    /// `decode_type_desc_cached_opt` is pvxs `from_wire_type`
+    /// (`dataencode.cpp:729-745`): the NULL (`0xFF`) type code consumes
+    /// exactly one byte and yields the absent `Value` (`Ok(None)`) with the
+    /// buffer still good — it is not a fault. Every other tag, including the
+    /// `0xFD`/`0xFE` cache markers, decodes as usual. The strict
+    /// `decode_type_desc_cached` still rejects `0xFF`.
+    #[test]
+    fn decode_type_desc_opt_accepts_the_null_type_code() {
+        let order = ByteOrder::Little;
+        let mut cache = TypeCache::new();
+
+        // `0xFF` alone, followed by a trailing byte that must survive.
+        let bytes = [TAG_NULL, 0x42];
+        let mut cur = Cursor::new(&bytes[..]);
+        assert_eq!(
+            decode_type_desc_cached_opt(&mut cur, order, &mut cache).expect("null is not a fault"),
+            None
+        );
+        assert_eq!(cur.position(), 1, "the NULL type code consumes one byte");
+
+        // The strict decoder still rejects it — a bare descriptor has no
+        // value that could be absent.
+        let mut cur = Cursor::new(&bytes[..]);
+        assert!(decode_type_desc_cached(&mut cur, order, &mut cache).is_err());
+
+        // A non-null descriptor decodes identically through both entry points
+        // and leaves the cursor in the same place.
+        let desc = FieldDesc::Scalar(ScalarType::Int);
+        let mut buf = Vec::new();
+        encode_type_desc(&desc, order, &mut buf);
+        let mut cur = Cursor::new(buf.as_slice());
+        assert_eq!(
+            decode_type_desc_cached_opt(&mut cur, order, &mut cache).expect("scalar decodes"),
+            Some(desc)
+        );
+        assert_eq!(cur.position() as usize, buf.len());
+    }
+
     /// a bare descriptor-sensitive value encoded against an
     /// `any` (FieldDesc::Variant) must NOT advertise a degraded schema;
     /// the encoder emits a null `any` (0xFF) instead.
@@ -3484,6 +3510,90 @@ mod tests {
         PvField::Structure(root)
     }
 
+    /// `NTScalar<UInt32>` exactly as pvxs's `nt::NTScalar{TypeCode::UInt32}`
+    /// builds it (`test/testxcode.cpp:88`): bits 0=root, 1=value,
+    /// 2=alarm, 3=alarm.severity, 4=alarm.status, 5=alarm.message,
+    /// 6=timeStamp, 7=timeStamp.secondsPastEpoch, 8=timeStamp.nanoseconds,
+    /// 9=timeStamp.userTag.
+    fn ntscalar_uint32_desc() -> FieldDesc {
+        FieldDesc::Structure {
+            struct_id: "epics:nt/NTScalar:1.0".into(),
+            fields: vec![
+                ("value".into(), FieldDesc::Scalar(ScalarType::UInt)),
+                (
+                    "alarm".into(),
+                    FieldDesc::Structure {
+                        struct_id: "alarm_t".into(),
+                        fields: vec![
+                            ("severity".into(), FieldDesc::Scalar(ScalarType::Int)),
+                            ("status".into(), FieldDesc::Scalar(ScalarType::Int)),
+                            ("message".into(), FieldDesc::Scalar(ScalarType::String)),
+                        ],
+                    },
+                ),
+                (
+                    "timeStamp".into(),
+                    FieldDesc::Structure {
+                        struct_id: "time_t".into(),
+                        fields: vec![
+                            (
+                                "secondsPastEpoch".into(),
+                                FieldDesc::Scalar(ScalarType::Long),
+                            ),
+                            ("nanoseconds".into(), FieldDesc::Scalar(ScalarType::Int)),
+                            ("userTag".into(), FieldDesc::Scalar(ScalarType::Int)),
+                        ],
+                    },
+                ),
+            ],
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ntscalar_uint32_value(
+        value: u32,
+        severity: i32,
+        status: i32,
+        message: &str,
+        secs: i64,
+        nsec: i32,
+        user_tag: i32,
+    ) -> PvField {
+        let mut alarm = PvStructure::new("alarm_t");
+        alarm.fields.push((
+            "severity".into(),
+            PvField::Scalar(ScalarValue::Int(severity)),
+        ));
+        alarm
+            .fields
+            .push(("status".into(), PvField::Scalar(ScalarValue::Int(status))));
+        alarm.fields.push((
+            "message".into(),
+            PvField::Scalar(ScalarValue::String(message.into())),
+        ));
+        let mut ts = PvStructure::new("time_t");
+        ts.fields.push((
+            "secondsPastEpoch".into(),
+            PvField::Scalar(ScalarValue::Long(secs)),
+        ));
+        ts.fields.push((
+            "nanoseconds".into(),
+            PvField::Scalar(ScalarValue::Int(nsec)),
+        ));
+        ts.fields.push((
+            "userTag".into(),
+            PvField::Scalar(ScalarValue::Int(user_tag)),
+        ));
+        let mut root = PvStructure::new("epics:nt/NTScalar:1.0");
+        root.fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::UInt(value))));
+        root.fields
+            .push(("alarm".into(), PvField::Structure(alarm)));
+        root.fields
+            .push(("timeStamp".into(), PvField::Structure(ts)));
+        PvField::Structure(root)
+    }
+
     /// pvxs `BitSet` compresses "all descendants set" into the parent
     /// structure bit. When that compressed parent bit is set but the
     /// descendant leaf bits are clear, the encoder must emit the WHOLE
@@ -3619,41 +3729,6 @@ mod tests {
         }
     }
 
-    /// `diff_changed_bitset` marks exactly the leaf bits
-    /// whose value differs between two snapshots, and leaves
-    /// structure bits clear. Bit numbering for `nested_alarm_desc`:
-    /// root=0, value=1, alarm(struct)=2, alarm.severity=3,
-    /// alarm.status=4.
-    #[test]
-    fn br_r29_diff_changed_bitset_marks_only_changed_leaves() {
-        let desc = nested_alarm_desc();
-
-        // Only `value` changed (1.0 → 9.0); alarm identical.
-        let prev = nested_alarm_value(1.0, 7, 3);
-        let curr = nested_alarm_value(9.0, 7, 3);
-        let diff = diff_changed_bitset(&desc, &prev, &curr);
-        assert!(diff.get(1), "value leaf changed → bit 1 set");
-        assert!(!diff.get(0), "root structure bit must stay clear");
-        assert!(!diff.get(2), "alarm structure bit must stay clear");
-        assert!(!diff.get(3), "alarm.severity unchanged → clear");
-        assert!(!diff.get(4), "alarm.status unchanged → clear");
-        assert_eq!(diff.count(), 1, "exactly one leaf changed");
-
-        // Only a nested leaf changed (severity 7 → 2).
-        let prev2 = nested_alarm_value(5.0, 7, 3);
-        let curr2 = nested_alarm_value(5.0, 2, 3);
-        let diff2 = diff_changed_bitset(&desc, &prev2, &curr2);
-        assert!(diff2.get(3), "alarm.severity changed → bit 3 set");
-        assert!(!diff2.get(1), "value unchanged → clear");
-        assert!(!diff2.get(4), "alarm.status unchanged → clear");
-        assert_eq!(diff2.count(), 1);
-
-        // Identical snapshots → empty diff.
-        let same = nested_alarm_value(5.0, 1, 1);
-        let diff3 = diff_changed_bitset(&desc, &same, &same.clone());
-        assert_eq!(diff3.count(), 0, "no change → empty changed-bitset");
-    }
-
     /// `marked_changed_bitset` marks each named path's
     /// whole subtree (assigned-not-changed), independent of any value
     /// diff. Structure desc: root=0, value(leaf)=1, alarm(struct)=2,
@@ -3765,15 +3840,16 @@ mod tests {
         assert_eq!(cur.remaining(), 0);
     }
 
-    /// pvxs `request2mask` sets the matched structure bit for a nested
-    /// leaf request like `field(alarm.status)` (pvrequest.cpp:33-40),
-    /// and `to_wire_valid` then sends the WHOLE `alarm` structure
-    /// (dataencode.cpp:414-438). The server canonicalization must
-    /// preserve that named structure bit rather than narrowing the reply
-    /// to the requested leaf — otherwise sibling fields the peer expects
-    /// (`alarm.severity`) are dropped from a GET/PUT-readback value.
+    /// `request2mask`'s matched-structure bit is a PERMISSION bit, not a
+    /// select-whole-subtree bit. pvxs `to_wire_valid`
+    /// (dataencode.cpp:414-439) sets a wire bit only where
+    /// `store[bit].valid && mask[bit]`, and `Value::mark`
+    /// (data.cpp:256-270) never makes a parent structure valid — so for
+    /// `field(alarm.status)` pvxs emits the changed-bitset `{alarm.status}`
+    /// and one `int32` of payload. `alarm.severity` is NOT shipped: the
+    /// client did not select it.
     #[test]
-    fn named_nested_struct_request_sends_whole_subtree() {
+    fn named_nested_struct_request_sends_only_the_named_leaf() {
         use crate::pv_request::request_to_mask;
 
         let desc = nested_alarm_desc(); // root=0,value=1,alarm=2,severity=3,status=4
@@ -3804,43 +3880,33 @@ mod tests {
         // request_to_mask names alarm (bit 2) + alarm.status (bit 4); the
         // root wildcard (bit 0) is set; severity (bit 3) and value
         // (bit 1) are NOT selected.
-        let mask = request_to_mask(&desc, &req).unwrap();
+        let mask = request_to_mask(&desc, Some(&req)).unwrap();
         assert_eq!(mask.iter().collect::<Vec<_>>(), vec![0, 2, 4]);
 
-        // Canonicalization keeps the named `alarm` structure bit as the
-        // sole representative of its whole subtree — {2}, NOT a narrowed
-        // {4} and NOT {2,3,4}. pvxs `to_wire_valid` sets only the parent
-        // (structure) bit and skips its descendants (`bit += desc.size()`);
-        // the set parent bit alone conveys the whole subtree on the wire.
+        // Canonicalization is LEAF-enumerated: the `alarm` permission bit
+        // (2) is dropped, only the selected leaf `alarm.status` (4)
+        // survives. pvxs sets a wire bit only where the store is valid,
+        // and only `alarm.status` was selected.
         let changed = canonical_changed_bitset(&desc, &mask);
-        assert!(changed.get(2), "named alarm structure bit preserved");
-        assert!(
-            !changed.get(3),
-            "alarm.severity descendant bit not emitted (parent bit conveys it)"
-        );
-        assert!(
-            !changed.get(4),
-            "alarm.status descendant bit not emitted (parent bit conveys it)"
-        );
-        assert!(!changed.get(1), "value not requested → omitted");
-        assert!(
-            !changed.get(0),
-            "root wildcard must not widen to whole tree"
-        );
         assert_eq!(
             changed.iter().collect::<Vec<_>>(),
-            vec![2],
-            "parent (structure) bit only — pvxs to_wire_valid byte-exact"
+            vec![4],
+            "leaf bits only — pvxs to_wire_valid (dataencode.cpp:414-439) \
+             emits `store[bit].valid && mask[bit]`, and Value::mark \
+             (data.cpp:256-270) never validates a parent structure"
         );
 
-        // GET-response round-trip: the source value's alarm is fully
-        // populated; the wire reply must carry the WHOLE alarm.
+        // GET-response round-trip: only the selected leaf is on the wire.
         let value = nested_alarm_value(42.0, 7, 5); // value, severity=7, status=5
         for order in [ByteOrder::Little, ByteOrder::Big] {
             let mut buf = Vec::new();
             encode_pv_field_with_bitset(&value, &desc, &changed, 0, order, &mut buf);
-            // whole alarm (2 Int = 8 bytes); value (bit 1) omitted.
-            assert_eq!(buf.len(), 8, "whole alarm, value omitted, order={order:?}");
+            // alarm.status only (one Int = 4 bytes).
+            assert_eq!(
+                buf.len(),
+                4,
+                "alarm.status only; severity and value omitted, order={order:?}"
+            );
 
             let mut cur = Cursor::new(buf.as_slice());
             let decoded = decode_pv_field_with_bitset(&desc, &changed, 0, &mut cur, order).unwrap();
@@ -3851,11 +3917,11 @@ mod tests {
                     Some(PvField::Scalar(ScalarValue::Double(v))) if v.abs() < 1e-9
                 ));
                 if let Some(PvField::Structure(a)) = s.get_field("alarm") {
-                    // BOTH sibling leaves present — severity is not
-                    // dropped just because only status was named.
+                    // severity was NOT selected → default 0, not the
+                    // source's 7.
                     assert!(matches!(
                         a.get_field("severity"),
-                        Some(PvField::Scalar(ScalarValue::Int(7)))
+                        Some(PvField::Scalar(ScalarValue::Int(0)))
                     ));
                     assert!(matches!(
                         a.get_field("status"),
@@ -3873,14 +3939,14 @@ mod tests {
 
     /// Mirror of pvxs `testpvreq.cpp:58-71`: `field(timeStamp,alarm.status)`
     /// against an NTScalar descriptor yields request mask
-    /// {0,2,4,6,7,8,9}. The wire changed-bitset must keep the matched
-    /// `alarm` structure bit (2) so the whole `alarm` subtree is sent —
-    /// but pvxs `to_wire_valid` sets only the structure's own bit and
-    /// skips its descendants (`bit += desc.size()`), so the canonical
-    /// form is {2,6} (alarm + timeStamp parent bits), not the redundant
-    /// {2,3,4,5,6,7,8,9} and not a leaf-narrowed {4,6,7,8,9}.
+    /// {0,2,4,6,7,8,9}. The wire changed-bitset is the LEAF projection of
+    /// that mask — `{4,7,8,9}`: `alarm.status` plus `timeStamp`'s three
+    /// leaves (the bare `field(timeStamp)` selected the whole subtree, so
+    /// its leaves are already in the mask). The `alarm` (2) and `timeStamp`
+    /// (6) structure bits are permission bits and never reach the wire
+    /// (`dataencode.cpp:414-439`, `data.cpp:256-270`).
     #[test]
-    fn ntscalar_alarm_status_request_keeps_whole_alarm_structure() {
+    fn ntscalar_alarm_status_request_emits_leaf_bits() {
         use crate::pv_request::request_to_mask;
 
         let value_desc = FieldDesc::Structure {
@@ -3947,7 +4013,7 @@ mod tests {
             )],
         };
 
-        let mask = request_to_mask(&value_desc, &req).unwrap();
+        let mask = request_to_mask(&value_desc, Some(&req)).unwrap();
         assert_eq!(
             mask.iter().collect::<Vec<_>>(),
             vec![0, 2, 4, 6, 7, 8, 9],
@@ -3957,10 +4023,86 @@ mod tests {
         let changed = canonical_changed_bitset(&value_desc, &mask);
         assert_eq!(
             changed.iter().collect::<Vec<_>>(),
-            vec![2, 6],
-            "parent (structure) bits only — alarm (2) + timeStamp (6); pvxs \
-             to_wire_valid sets the structure bit and skips its descendants \
-             (`bit += desc.size()`), and value (1) is not requested"
+            vec![4, 7, 8, 9],
+            "leaf bits only — alarm.status (4) + timeStamp's three leaves \
+             (7,8,9); the alarm (2) and timeStamp (6) permission bits are \
+             not emitted, and value (1) is not requested"
+        );
+    }
+
+    /// pvxs's own serialization regression, byte-for-byte:
+    /// `test/testxcode.cpp:111-116` — on an `NTScalar<UInt32>`, assign
+    /// `timeStamp.nanoseconds = 0xab` and `alarm.message = "hello world"`,
+    /// then `to_wire_valid` yields
+    /// `"\x02 \x01\x0bhello world\x00\x00\x00\xab"`:
+    ///
+    /// * `\x02` — BitMask length 2,
+    /// * `\x20\x01` — bits {5, 8} = `alarm.message`, `timeStamp.nanoseconds`.
+    ///   NOT bit 0 (root), NOT bit 2 (`alarm`), NOT bit 6 (`timeStamp`).
+    /// * payload: `alarm.message` (length-prefixed string) then
+    ///   `timeStamp.nanoseconds` (big-endian `int32` 0xab).
+    ///
+    /// This pins that the port's changed-bitset is leaf-enumerated. The
+    /// test drives the marked-leaf path the QSRV monitor sources use
+    /// ([`marked_changed_bitset`] → [`canonical_changed_bitset`]).
+    #[test]
+    fn to_wire_valid_marked_leaves_match_pvxs_testxcode() {
+        let desc = ntscalar_uint32_desc();
+
+        // Assign exactly what testxcode.cpp:111-112 assigns.
+        let value = ntscalar_uint32_value(0, 0, 0, "hello world", 0, 0xab, 0);
+
+        // Marked set = the two assigned leaves; request mask = wildcard.
+        let marked = marked_changed_bitset(
+            &desc,
+            &[
+                "timeStamp.nanoseconds".to_string(),
+                "alarm.message".to_string(),
+            ],
+        );
+        let changed = canonical_changed_bitset(&desc, &marked);
+        assert_eq!(
+            changed.iter().collect::<Vec<_>>(),
+            vec![5, 8],
+            "pvxs testxcode.cpp:116 BitMask bits"
+        );
+
+        // Big-endian: pvxs's testToBytes(true, ...) serializes big-endian.
+        let mut buf = Vec::new();
+        changed.write_into(ByteOrder::Big, &mut buf);
+        encode_pv_field_with_bitset(&value, &desc, &changed, 0, ByteOrder::Big, &mut buf);
+        assert_eq!(
+            buf,
+            b"\x02\x20\x01\x0bhello world\x00\x00\x00\xab".to_vec(),
+            "pvxs testxcode.cpp:113-116 to_wire_valid bytes"
+        );
+
+        // Same descriptor, every leaf valid (a wildcard pvRequest on a
+        // freshly-read source value). pvxs enumerates all seven leaves;
+        // there is no whole-structure compression, because no `store[bit]`
+        // for a structure is ever `valid`.
+        let wildcard =
+            canonical_changed_bitset(&desc, &crate::proto::BitSet::all_set(desc.total_bits()));
+        assert_eq!(
+            wildcard.iter().collect::<Vec<_>>(),
+            vec![1, 3, 4, 5, 7, 8, 9],
+            "wildcard → leaf enumeration; NOT the root bit {{0}}"
+        );
+
+        // A bare `field(alarm)` — `request2mask`'s `mlookup.empty()` branch
+        // (pvrequest.cpp:41-46) selects alarm's whole subtree, so its three
+        // leaves land on the wire individually; the `alarm` bit (2) does
+        // not.
+        let mut bare_alarm = crate::proto::BitSet::new();
+        for b in [0usize, 2, 3, 4, 5] {
+            bare_alarm.set(b);
+        }
+        assert_eq!(
+            canonical_changed_bitset(&desc, &bare_alarm)
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![3, 4, 5],
+            "field(alarm) → alarm's leaves, not the alarm structure bit"
         );
     }
 

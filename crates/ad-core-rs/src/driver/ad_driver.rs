@@ -9,7 +9,7 @@ use crate::ndarray_pool::NDArrayPool;
 use crate::params::ad_driver::ADDriverParams;
 use crate::plugin::channel::{NDArrayOutput, NDArraySender, QueuedArrayCounter};
 
-use super::{ADStatus, ImageMode, ShutterMode};
+use super::{ADStatus, ShutterMode};
 
 /// Base state for ADDriver (extends NDArrayDriver with detector-specific params).
 pub struct ADDriverBase {
@@ -56,20 +56,30 @@ impl ADDriverBase {
         )?;
         port_base.set_string_param(params.base.codec, 0, String::new())?;
 
-        // C++ ADBase constructor: setIntegerParam(ADMaxSizeX, maxSizeX)
+        // ADDriver.cpp:174-179 states the rule these seeds follow: "values set
+        // here will override those in the database for output records because if
+        // asyn device support reads a value from the driver with no error during
+        // initialization then it sets the output record to that value."
+        //
+        // So the constructor seeds ONLY read-only parameters and the read/write
+        // ones that must not come from the DB (ADDriver.cpp:180-191). ADGain,
+        // ADTemperature, ADBinX/Y, ADSizeX/Y, ADImageMode, ADNumImages,
+        // ADNumExposures, ADAcquireTime/Period and ADShutterMode are deliberately
+        // absent: their records carry PINI="YES" with a DB default and are
+        // restored by autosave. Seeding them here would clobber both.
         port_base.set_int32_param(params.max_size_x, 0, max_size_x)?;
         port_base.set_int32_param(params.max_size_y, 0, max_size_y)?;
-        port_base.set_int32_param(params.size_x, 0, max_size_x)?;
-        port_base.set_int32_param(params.size_y, 0, max_size_y)?;
-        port_base.set_int32_param(params.bin_x, 0, 1)?;
-        port_base.set_int32_param(params.bin_y, 0, 1)?;
-        port_base.set_int32_param(params.image_mode, 0, ImageMode::Single as i32)?;
-        port_base.set_int32_param(params.num_images, 0, 1)?;
-        port_base.set_int32_param(params.num_exposures, 0, 1)?;
-        port_base.set_float64_param(params.acquire_time, 0, 1.0)?;
-        port_base.set_float64_param(params.acquire_period, 0, 1.0)?;
         port_base.set_int32_param(params.status, 0, ADStatus::Idle as i32)?;
-        port_base.set_string_param(params.status_message, 0, "Idle".into())?;
+        port_base.set_int32_param(params.num_images_counter, 0, 0)?;
+        port_base.set_int32_param(params.num_exposures_counter, 0, 0)?;
+        port_base.set_float64_param(params.time_remaining, 0, 0.0)?;
+        port_base.set_int32_param(params.shutter_status, 0, 0)?;
+        port_base.set_int32_param(params.acquire, 0, 0)?;
+        port_base.set_string_param(params.status_message, 0, String::new())?;
+        port_base.set_string_param(params.string_to_server, 0, String::new())?;
+        port_base.set_string_param(params.string_from_server, 0, String::new())?;
+
+        // asynNDArrayDriver.cpp:967-1005 — the NDArray base-class seeds.
         port_base.set_int32_param(params.base.data_type, 0, 1)?; // UInt8
         port_base.set_int32_param(params.base.color_mode, 0, NDColorMode::Mono as i32)?;
         port_base.set_int32_param(params.base.array_callbacks, 0, 1)?;
@@ -78,16 +88,10 @@ impl ADDriverBase {
             0,
             max_memory as f64 / 1_048_576.0,
         )?;
-        // C++ inits NDArraySizeX/Y/Size to 0
         port_base.set_int32_param(params.base.array_size_x, 0, 0)?;
         port_base.set_int32_param(params.base.array_size_y, 0, 0)?;
         port_base.set_int32_param(params.base.array_size_z, 0, 0)?;
         port_base.set_int32_param(params.base.array_size, 0, 0)?;
-
-        port_base.set_float64_param(params.gain, 0, 1.0)?;
-        port_base.set_int32_param(params.shutter_mode, 0, ShutterMode::None as i32)?;
-        port_base.set_float64_param(params.temperature, 0, 25.0)?;
-        port_base.set_float64_param(params.temperature_actual, 0, 25.0)?;
 
         let pool = Arc::new(NDArrayPool::new(max_memory));
 
@@ -96,11 +100,10 @@ impl ADDriverBase {
         // consumes the change flags silently. The flags must stay
         // pending until the first post-iocInit `call_param_callbacks`
         // (acquire start / poll / write) flushes them to the now-
-        // registered I/O Intr subscribers. The previous behaviour left
-        // MaxSizeX_RBV / MaxSizeY_RBV / SizeX_RBV / SizeY_RBV /
-        // BinX_RBV / BinY_RBV / ImageMode_RBV / etc at zero with
-        // undefined timestamps on a synthetic detector that never
-        // re-sets these statics.
+        // registered I/O Intr subscribers. The seeds above then reach
+        // MaxSizeX_RBV / Status_RBV / etc with a real timestamp; the
+        // parameters left unseeded arrive from their PINI="YES" records
+        // (or autosave) at iocInit, as in C.
 
         Ok(Self {
             port_base,
@@ -312,7 +315,8 @@ mod tests {
     #[test]
     fn test_new_sets_initial_params() {
         let ad = ADDriverBase::new("TEST", 1024, 768, 50_000_000).unwrap();
-        // C++ ADBase: setIntegerParam(ADMaxSizeX, maxSizeX)
+        // C++ ADDriver.cpp:180-191 — the full set of parameters the constructor
+        // seeds, and nothing more.
         assert_eq!(
             ad.port_base
                 .get_int32_param(ad.params.max_size_x, 0)
@@ -326,16 +330,97 @@ mod tests {
             768
         );
         assert_eq!(
-            ad.port_base.get_int32_param(ad.params.size_x, 0).unwrap(),
-            1024
-        );
-        assert_eq!(
-            ad.port_base.get_int32_param(ad.params.size_y, 0).unwrap(),
-            768
-        );
-        assert_eq!(
             ad.port_base.get_int32_param(ad.params.status, 0).unwrap(),
             ADStatus::Idle as i32
+        );
+        assert_eq!(
+            ad.port_base
+                .get_int32_param(ad.params.num_images_counter, 0)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            ad.port_base
+                .get_int32_param(ad.params.num_exposures_counter, 0)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            ad.port_base
+                .get_float64_param(ad.params.time_remaining, 0)
+                .unwrap(),
+            0.0
+        );
+        assert_eq!(
+            ad.port_base
+                .get_int32_param(ad.params.shutter_status, 0)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            ad.port_base.get_int32_param(ad.params.acquire, 0).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_r6_70_constructor_leaves_db_owned_params_unseeded() {
+        // R6-70 / ADDriver.cpp:174-179 — "values set here will override those in
+        // the database for output records". ADGain, ADTemperature, ADBinX/Y,
+        // ADSizeX/Y, ADImageMode, ADNumImages, ADNumExposures, ADAcquireTime/
+        // Period and ADShutterMode all carry PINI="YES" DB defaults (and are
+        // restored by autosave), so the constructor must NOT seed them.
+        // ADStatusMessage is seeded, but to "" (:189) — not "Idle".
+        let ad = ADDriverBase::new("TEST", 1024, 768, 50_000_000).unwrap();
+
+        for (name, idx) in [
+            ("SizeX", ad.params.size_x),
+            ("SizeY", ad.params.size_y),
+            ("BinX", ad.params.bin_x),
+            ("BinY", ad.params.bin_y),
+            ("ImageMode", ad.params.image_mode),
+            ("NumImages", ad.params.num_images),
+            ("NumExposures", ad.params.num_exposures),
+            ("ShutterMode", ad.params.shutter_mode),
+        ] {
+            assert_eq!(
+                ad.port_base.get_int32_param(idx, 0).unwrap(),
+                0,
+                "{name} must be left to the database, not seeded by the driver"
+            );
+        }
+        for (name, idx) in [
+            ("Gain", ad.params.gain),
+            ("Temperature", ad.params.temperature),
+            ("TemperatureActual", ad.params.temperature_actual),
+            ("AcquireTime", ad.params.acquire_time),
+            ("AcquirePeriod", ad.params.acquire_period),
+        ] {
+            assert_eq!(
+                ad.port_base.get_float64_param(idx, 0).unwrap(),
+                0.0,
+                "{name} must be left to the database, not seeded by the driver"
+            );
+        }
+
+        assert_eq!(
+            ad.port_base
+                .get_string_param(ad.params.status_message, 0)
+                .unwrap(),
+            "",
+            "ADStatusMessage is seeded to the empty string (ADDriver.cpp:189)"
+        );
+        assert_eq!(
+            ad.port_base
+                .get_string_param(ad.params.string_to_server, 0)
+                .unwrap(),
+            ""
+        );
+        assert_eq!(
+            ad.port_base
+                .get_string_param(ad.params.string_from_server, 0)
+                .unwrap(),
+            ""
         );
     }
 
@@ -461,13 +546,15 @@ mod tests {
                 .unwrap(),
             1
         );
-        // C parity: setShutter never writes SHUTTER_STATUS.
+        // C parity: setShutter never writes SHUTTER_STATUS. The constructor
+        // seeds it to 0 (ADDriver.cpp:186) and nothing in setShutter moves it —
+        // the detector driver reports the real shutter state.
         assert_eq!(
             ad.port_base
                 .get_int32_param_strict(ad.params.shutter_status, 0)
                 .ok(),
-            None,
-            "SHUTTER_STATUS must remain unset by setShutter"
+            Some(0),
+            "SHUTTER_STATUS must keep its constructor value through setShutter"
         );
     }
 
@@ -613,7 +700,15 @@ mod tests {
 
     #[test]
     fn test_gain_and_temperature() {
-        let ad = ADDriverBase::new("TEST", 8, 8, 1_000_000).unwrap();
+        // The constructor leaves both to the database (ADDriver.cpp:174-179);
+        // once written, they read back through the parameter library.
+        let mut ad = ADDriverBase::new("TEST", 8, 8, 1_000_000).unwrap();
+        ad.port_base
+            .set_float64_param(ad.params.gain, 0, 1.0)
+            .unwrap();
+        ad.port_base
+            .set_float64_param(ad.params.temperature, 0, 25.0)
+            .unwrap();
         assert_eq!(
             ad.port_base.get_float64_param(ad.params.gain, 0).unwrap(),
             1.0

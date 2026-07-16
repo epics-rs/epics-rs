@@ -206,7 +206,7 @@ impl DrvAsynUsbtmcPort {
                 destructible: true,
             },
         );
-        base.connected = false;
+        base.init_connected(false);
         base.auto_connect = !config.no_auto_connect();
         Ok(Self {
             base,
@@ -236,6 +236,18 @@ impl PortDriver for DrvAsynUsbtmcPort {
 
     fn base_mut(&mut self) -> &mut PortDriverBase {
         &mut self.base
+    }
+
+    /// C drvAsynUSBTMC registers asynCommon, asynOctet and asynInt32
+    /// (drvAsynUSBTMC.c:1285-1322) — asynInt32 carries the status-byte /
+    /// remote-local parameters. It registers no asynOption.
+    fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
+        use crate::interfaces::Capability::*;
+        // C drvAsynUSBTMC registers asynDrvUser (drvAsynUSBTMC.c:1319-1324) —
+        // its drvInfo strings (SRQ, STATUS_BYTE, …) resolve to reasons.
+        vec![
+            OctetRead, OctetWrite, Int32Read, Int32Write, DrvUser, Flush, Connect,
+        ]
     }
 
     fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {

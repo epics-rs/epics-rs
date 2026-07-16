@@ -148,13 +148,49 @@ fn cascade_smoothed_next(
 
 /// C default for `EPICS_CA_MAX_SEARCH_PERIOD`
 /// (`epics-base:modules/ca/src/client/udpiiu.h:87`,
-/// `maxSearchPeriodDefault = 5.0 * 60.0`).
-const MAX_SEARCH_PERIOD_DEFAULT_SECS: f64 = 300.0;
+/// `maxSearchPeriodDefault = 5.0 * 60.0`) — a hand-copy, in C, of the parameter's
+/// compiled default. Here it comes from the generated `ENV_PARAM` table, so the
+/// two cannot disagree.
+fn max_search_period_default_secs() -> f64 {
+    epics_base_rs::runtime::env_table::EPICS_CA_MAX_SEARCH_PERIOD
+        .default_str()
+        .parse()
+        .expect("EPICS_CA_MAX_SEARCH_PERIOD's compiled default is a number")
+}
 
 /// C lower bound for `EPICS_CA_MAX_SEARCH_PERIOD`
 /// (`epics-base:modules/ca/src/client/udpiiu.h:88`,
 /// `maxSearchPeriodLowerLimit = 60.0`).
 const MAX_SEARCH_PERIOD_LOWER_LIMIT_SECS: f64 = 60.0;
+
+/// C `minRoundTripEstimate` (`epics-base:modules/ca/src/client/udpiiu.h:85`,
+/// `32e-3`) — the bottom rung of C's search-timer ladder, and the unit the
+/// upper bound below is expressed in.
+const MIN_ROUND_TRIP_ESTIMATE_SECS: f64 = 32e-3;
+
+/// C `channelNode::getMaxSearchTimerCount()`
+/// (`epics-base:modules/ca/src/client/nciu.cpp:606-611`): the channel-state
+/// enum holds `cs_searchReqPending0 .. cs_searchReqPending17`, so the ladder
+/// is 18 rungs and cannot express a period past
+/// `(1 << 17) * minRoundTripEstimate`.
+const MAX_SEARCH_TIMER_COUNT: u32 = 18;
+
+/// The period C's ladder tops out at: `(1 << (nTimers - 1)) * RTT`
+/// = `131072 * 0.032` = 4194.304 s. C prints exactly this figure when it
+/// clamps (`udpiiu.cpp:105-107`).
+fn max_search_period_upper_limit_secs() -> f64 {
+    f64::from(1u32 << (MAX_SEARCH_TIMER_COUNT - 1)) * MIN_ROUND_TRIP_ESTIMATE_SECS
+}
+
+/// C `getNTimers` (`epics-base:modules/ca/src/client/udpiiu.cpp:96-99`):
+/// `static_cast<unsigned>(1.0 + log(maxPeriod / minRoundTripEstimate) / log(2.0))`.
+///
+/// Written with the same `ln(x) / ln(2)` C uses rather than `log2`, which is a
+/// different libm routine and can land the boundary case on the other side of
+/// the truncation.
+fn search_timer_count(period_secs: f64) -> u32 {
+    (1.0 + (period_secs / MIN_ROUND_TRIP_ESTIMATE_SECS).ln() / std::f64::consts::LN_2) as u32
+}
 
 /// `EPICS_CA_MAX_SEARCH_PERIOD` resolution, faithful
 /// to C `udpiiu.cpp::getMaxPeriod` (`epics-base:modules/ca/src/client/udpiiu.cpp:68-94`):
@@ -170,17 +206,62 @@ const MAX_SEARCH_PERIOD_LOWER_LIMIT_SECS: f64 = 60.0;
 /// C does not reject negative or zero values — they pass `parse` and
 /// are caught by the `< 60` lower-limit clamp — so this mirrors C by
 /// clamping rather than filtering.
+///
+/// Resolved once per process (C `udpiiu`'s constructor calls `getMaxPeriod`
+/// once and keeps the result): a second read could pick up a mutated
+/// environment and would repeat the diagnostics below.
 fn max_search_period_secs() -> f64 {
-    match epics_base_rs::runtime::env::get("EPICS_CA_MAX_SEARCH_PERIOD") {
-        Some(raw) => match raw.parse::<f64>() {
-            // Parsed: honour it, clamped up to C's 60 s lower limit.
-            Ok(v) => v.max(MAX_SEARCH_PERIOD_LOWER_LIMIT_SECS),
-            // Not a real number: C keeps the default, no clamp.
-            Err(_) => MAX_SEARCH_PERIOD_DEFAULT_SECS,
-        },
-        // Unset: documented C default.
-        None => MAX_SEARCH_PERIOD_DEFAULT_SECS,
+    static RESOLVED: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *RESOLVED.get_or_init(resolve_max_search_period_secs)
+}
+
+/// The uncached resolution behind [`max_search_period_secs`].
+fn resolve_max_search_period_secs() -> f64 {
+    let param = epics_base_rs::runtime::env_table::EPICS_CA_MAX_SEARCH_PERIOD;
+    let name = param.name();
+    let default_secs = max_search_period_default_secs();
+    // Unset resolves to the compiled default string and parses, silently — so
+    // only a set-but-bad value reaches the error arm.
+    let v = match param.double() {
+        Ok(v) => v,
+        // C `getMaxPeriod` (`udpiiu.cpp:85-90`), verbatim.
+        Err(_) => {
+            eprintln!("EPICS \"{name}\" wasn't a real number");
+            eprintln!("Setting \"{name}\" = {default_secs:.6} seconds");
+            return default_secs;
+        }
+    };
+    // C `udpiiu.cpp:78-83`: below the 60 s lower limit, say so and clamp.
+    // NaN takes this branch too — C's `maxPeriod < lowerLimit` is false for
+    // it and C then drives its timer wheel off a NaN period; clamping is the
+    // one deviation here, because a NaN tick would stop the client searching
+    // altogether.
+    if v.is_nan() || v < MAX_SEARCH_PERIOD_LOWER_LIMIT_SECS {
+        eprintln!("\"{name}\" out of range (low)");
+        eprintln!("Setting \"{name}\" = {MAX_SEARCH_PERIOD_LOWER_LIMIT_SECS:.6} seconds");
+        return MAX_SEARCH_PERIOD_LOWER_LIMIT_SECS;
     }
+    // C's upper bound is not on the period: `getNTimers` (`udpiiu.cpp:96-111`)
+    // turns the period into a rung count on the RTT-doubling ladder and clamps
+    // THAT to 18, so a period the ladder cannot reach is refused with the
+    // "(high)" pair and the search cadence tops out at the 18th rung. Recompute
+    // the count with C's expression — `1.0 + log(period/RTT)/log(2.0)`,
+    // truncated by `static_cast<unsigned>` — rather than a threshold in
+    // seconds, so the boundary lands on the same side as C's for every input:
+    // 8388.607 passes, 8388.608 (== 0.032 * 2^18) clamps, verified against the
+    // compiled caget.
+    //
+    // The one deviation is `inf`, where C's cast is undefined and the compiled
+    // caget aborts in malloc with a nTimers of garbage size. Rust's `as u32`
+    // saturates, so an infinite period clamps to the same 4194.304 s any other
+    // out-of-range period gets.
+    if search_timer_count(v) > MAX_SEARCH_TIMER_COUNT {
+        let capped = max_search_period_upper_limit_secs();
+        eprintln!("\"{name}\" out of range (high)");
+        eprintln!("Setting \"{name}\" = {capped:.6} seconds");
+        return capped;
+    }
+    v
 }
 
 /// Normal tick cadence. Rust's search model is structurally
@@ -214,8 +295,13 @@ fn max_search_period_secs() -> f64 {
 /// becomes a goal, the fix is an RTT-derived early-retry path for
 /// `Initial` searches, not a change to this normal-cadence tick.
 fn normal_tick() -> Duration {
-    let period_secs = max_search_period_secs();
-    Duration::from_secs_f64(period_secs / N_SEARCH_BUCKETS as f64)
+    normal_tick_for(max_search_period_secs())
+}
+
+/// `tick = period / N_SEARCH_BUCKETS`, split out so the env-boundary tests
+/// can drive it from an uncached period.
+fn normal_tick_for(period_secs: f64) -> Duration {
+    crate::estdlib::duration_from_secs(period_secs / N_SEARCH_BUCKETS as f64)
 }
 
 /// Fast-mode tick cadence after a beacon poke. One full bucket
@@ -442,8 +528,8 @@ pub(crate) async fn run_search_engine(
     }
 
     // Spawn a connection task per EPICS_CA_NAME_SERVERS entry.
-    // Each task auto-reconnects with exponential backoff and forwards
-    // outgoing search bytes to its TCP socket. Incoming responses are
+    // Each task auto-reconnects on C's EPICS_CA_CONN_TMO cadence and
+    // forwards outgoing search bytes to its TCP socket. Incoming responses are
     // queued via tcp_response_tx for the main loop to process through
     // the shared handle_udp_response parser.
     let (tcp_response_tx, mut tcp_response_rx) = mpsc::unbounded_channel::<ParsedDatagram>();
@@ -629,28 +715,37 @@ pub(crate) async fn run_search_engine(
 
 /// Long-lived task: maintain a TCP connection to one nameserver, forward
 /// outgoing search bytes from `outgoing_rx`, and feed parsed response
-/// frames into `response_tx`. Reconnects with exponential backoff on
-/// failure.
+/// frames into `response_tx`.
+///
+/// This is libca's name-service circuit (`tcpiiu::isNameService()`), and
+/// C's retry rule for it is a fixed cadence, not a backoff:
+/// `tcpRecvThread::connect` (`tcpiiu.cpp:606-661`) issues a *blocking*
+/// `::connect()` — bounded by the OS, never by an application deadline —
+/// and on failure sleeps `cacRef.connectionTimeout()` (EPICS_CA_CONN_TMO,
+/// default 30 s) before trying the same address again, indefinitely. The
+/// port's 5 s connect cap plus 1→30 s exponential backoff diverged in
+/// both directions: it abandoned a slow-but-live name server C would have
+/// reached, and it hammered a down one far harder than C does.
 async fn run_nameserver_connection(
     addr: SocketAddr,
     mut outgoing_rx: mpsc::Receiver<Vec<u8>>,
     response_tx: mpsc::UnboundedSender<ParsedDatagram>,
 ) {
-    let mut backoff = Duration::from_secs(1);
-    let max_backoff = Duration::from_secs(30);
-
     loop {
-        let stream =
-            match tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(addr)).await {
-                Ok(Ok(s)) => s,
-                _ => {
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(max_backoff);
-                    continue;
-                }
-            };
+        let stream = match TcpStream::connect(addr).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!(
+                    target: "epics_ca_rs::client::search",
+                    nameserver = %addr,
+                    error = %e,
+                    "EPICS_CA_NAME_SERVERS connect failed; retrying after EPICS_CA_CONN_TMO"
+                );
+                tokio::time::sleep(super::transport::connection_timeout()).await;
+                continue;
+            }
+        };
         let _ = stream.set_nodelay(true);
-        backoff = Duration::from_secs(1);
 
         let (mut reader, mut writer) = stream.into_split();
 
@@ -669,18 +764,16 @@ async fn run_nameserver_connection(
         // payload exceeds 16-bit postsize (libca's
         // `insertRequestHeader` parity). See the matching note in
         // `client/transport.rs` connect path.
-        let user_payload = pad_string(&user);
-        let mut client = CaHeader::new(CA_PROTO_CLIENT_NAME);
-        client.set_payload_size(user_payload.len(), 0);
-        handshake.extend_from_slice(&client.to_bytes_extended());
-        handshake.extend_from_slice(&user_payload);
-        let host_payload = pad_string(&epics_base_rs::runtime::env::hostname());
-        let mut host = CaHeader::new(CA_PROTO_HOST_NAME);
-        host.set_payload_size(host_payload.len(), 0);
-        handshake.extend_from_slice(&host.to_bytes_extended());
-        handshake.extend_from_slice(&host_payload);
+        handshake.extend_from_slice(&super::transport::build_identity_frame(
+            CA_PROTO_CLIENT_NAME,
+            &user,
+        ));
+        handshake.extend_from_slice(&super::transport::build_identity_frame(
+            CA_PROTO_HOST_NAME,
+            &epics_base_rs::runtime::env::hostname(),
+        ));
         if writer.write_all(&handshake).await.is_err() {
-            tokio::time::sleep(backoff).await;
+            tokio::time::sleep(super::transport::connection_timeout()).await;
             continue;
         }
 
@@ -746,7 +839,7 @@ async fn run_nameserver_connection(
                                 // `from_bytes_extended` rejected them
                                 // ⇒ definitively malformed (e.g. the
                                 // declared payload exceeds
-                                // max_payload_size()). Close circuit
+                                // max_frame_body_bytes()). Close circuit
                                 // per C `tcpiiu.cpp:1197-1202`.
                                 bad_frame = true;
                                 break;
@@ -833,10 +926,10 @@ async fn run_nameserver_connection(
         }
 
         if writer_failed {
-            // Brief pause before reconnect to avoid a spin loop when the
-            // nameserver is fully unreachable.
-            tokio::time::sleep(backoff).await;
-            backoff = (backoff * 2).min(max_backoff);
+            // Same cadence as a failed connect: one knob (CONN_TMO), so a
+            // nameserver that accepts and immediately drops cannot be
+            // hammered any harder than one that refuses outright.
+            tokio::time::sleep(super::transport::connection_timeout()).await;
         }
     }
 }
@@ -1580,6 +1673,31 @@ fn build_search_payload(cid: u32, pv_name: &str) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    /// C `getNTimers` (`udpiiu.cpp:96-111`) caps the search-timer ladder at 18
+    /// rungs, so the effective ceiling on `EPICS_CA_MAX_SEARCH_PERIOD` is
+    /// `(1 << 17) * 32e-3 == 4194.304 s` and the boundary sits at
+    /// `(1 << 18) * 32e-3 == 8388.608 s`. Every row here was run against the
+    /// compiled `caget`: 8388.607 is silent, 8388.608 prints the "(high)" pair.
+    #[test]
+    fn search_timer_ladder_bounds_the_max_search_period() {
+        assert_eq!(max_search_period_upper_limit_secs(), 4194.304);
+
+        // Inside the ladder: no clamp, no diagnostic.
+        for period in [60.0, 300.0, 4194.304, 8388.607] {
+            assert!(
+                search_timer_count(period) <= MAX_SEARCH_TIMER_COUNT,
+                "{period} s fits C's 18-rung ladder"
+            );
+        }
+        // Past it: C clamps and says so.
+        for period in [8388.608, 8389.0, 100_000.0, f64::INFINITY] {
+            assert!(
+                search_timer_count(period) > MAX_SEARCH_TIMER_COUNT,
+                "{period} s is past C's 18-rung ladder"
+            );
+        }
+    }
+
     fn schedule_initial(state: &mut SearchEngineState, cid: u32, pv_name: &str) {
         handle_request(
             state,
@@ -1612,35 +1730,44 @@ mod tests {
         // historical Rust 30 s). tick = 300/30 = 10 s.
         unsafe { std::env::remove_var("EPICS_CA_MAX_SEARCH_PERIOD") };
         assert_eq!(
-            max_search_period_secs(),
+            resolve_max_search_period_secs(),
             300.0,
             "unset env must default to C's 300 s, not the old 30 s"
         );
-        assert_eq!(normal_tick(), Duration::from_secs(10));
+        assert_eq!(
+            normal_tick_for(resolve_max_search_period_secs()),
+            Duration::from_secs(10)
+        );
 
         // Configured value below the 60 s lower limit → clamped up
         // to 60 s (C `maxPeriod < maxSearchPeriodLowerLimit`).
         unsafe { std::env::set_var("EPICS_CA_MAX_SEARCH_PERIOD", "45") };
         assert_eq!(
-            max_search_period_secs(),
+            resolve_max_search_period_secs(),
             60.0,
             "a configured 45 s must clamp UP to C's 60 s lower bound"
         );
-        assert_eq!(normal_tick(), Duration::from_secs(2));
+        assert_eq!(
+            normal_tick_for(resolve_max_search_period_secs()),
+            Duration::from_secs(2)
+        );
 
         // Configured value at/above the lower limit → honoured.
         unsafe { std::env::set_var("EPICS_CA_MAX_SEARCH_PERIOD", "120") };
-        assert_eq!(max_search_period_secs(), 120.0);
-        assert_eq!(normal_tick(), Duration::from_secs(4));
+        assert_eq!(resolve_max_search_period_secs(), 120.0);
+        assert_eq!(
+            normal_tick_for(resolve_max_search_period_secs()),
+            Duration::from_secs(4)
+        );
 
         // The documented C default expressed explicitly.
         unsafe { std::env::set_var("EPICS_CA_MAX_SEARCH_PERIOD", "300") };
-        assert_eq!(max_search_period_secs(), 300.0);
+        assert_eq!(resolve_max_search_period_secs(), 300.0);
 
         // Non-numeric value → C keeps the default (longStatus != 0).
         unsafe { std::env::set_var("EPICS_CA_MAX_SEARCH_PERIOD", "not-a-number") };
         assert_eq!(
-            max_search_period_secs(),
+            resolve_max_search_period_secs(),
             300.0,
             "a non-numeric value must fall back to the 300 s default"
         );
@@ -1649,12 +1776,12 @@ mod tests {
         // parse and are caught by the lower-bound clamp.
         unsafe { std::env::set_var("EPICS_CA_MAX_SEARCH_PERIOD", "-5") };
         assert_eq!(
-            max_search_period_secs(),
+            resolve_max_search_period_secs(),
             60.0,
             "a negative value must clamp to the 60 s lower bound, not default"
         );
         unsafe { std::env::set_var("EPICS_CA_MAX_SEARCH_PERIOD", "0") };
-        assert_eq!(max_search_period_secs(), 60.0);
+        assert_eq!(resolve_max_search_period_secs(), 60.0);
 
         // Restore the environment for any later serial test.
         match restore {
@@ -2403,7 +2530,8 @@ mod tests {
         hdr.data_type = server.port();
         hdr.cid = u32::from_be_bytes(ip.octets());
         hdr.available = cid;
-        hdr.set_payload_size(8, 1);
+        hdr.set_payload_size(8, 1, crate::protocol::CA_MINOR_VERSION)
+            .expect("modern peer accepts the extended header");
         let mut buf = hdr.to_bytes().to_vec();
         buf.extend_from_slice(&(CA_MINOR_VERSION).to_be_bytes());
         buf.extend_from_slice(&[0u8; 6]); // pad to 8-byte payload

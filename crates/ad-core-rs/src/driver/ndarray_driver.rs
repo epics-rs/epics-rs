@@ -27,6 +27,26 @@ pub const ATTR_STATUS_XML_SYNTAX_ERROR: i32 = 2;
 /// implemented in the Rust port.
 pub const ATTR_STATUS_MACRO_ERROR: i32 = 3;
 
+/// Normalize a FilePath in place and report whether the directory exists.
+///
+/// The single implementation of C++ `asynNDArrayDriver::checkPath(std::string&)`
+/// (asynNDArrayDriver.cpp:58-88), which every driver and file plugin inherits:
+/// strip one trailing separator (Windows `stat` will not find a directory that
+/// has one), test the directory, then append the separator back **even if the
+/// caller never had one**. An empty path is left untouched and reports `false`.
+pub fn check_path_str(file_path: &mut String) -> bool {
+    if file_path.is_empty() {
+        return false;
+    }
+    // C tests '/' on POSIX, and '/' or '\\' on Windows.
+    if file_path.ends_with('/') || file_path.ends_with(std::path::MAIN_SEPARATOR) {
+        file_path.pop();
+    }
+    let exists = Path::new(file_path.as_str()).is_dir();
+    file_path.push(std::path::MAIN_SEPARATOR);
+    exists
+}
+
 /// Extract the value of an XML attribute `key="..."` from a single tag body.
 fn xml_attr<'a>(tag: &'a str, key: &str) -> Option<&'a str> {
     let pat = format!("{key}=\"");
@@ -565,6 +585,14 @@ impl NDArrayDriverBase {
     /// `epicsSnprintf(fullFileName, maxChars, fileTemplate, filePath, fileName, fileNumber)`.
     /// The template is a C printf format string, e.g., `"%s%s_%3.3d.dat"`.
     pub fn create_file_name(&mut self) -> AsynResult<String> {
+        // asynNDArrayDriver.cpp:203 — createFileName calls checkPath() before
+        // reading any parameter, so FilePath is normalized (trailing separator
+        // written back to the parameter) and FilePathExists refreshed on every
+        // call. Without it the default template "%s%s_%3.3d.dat" run-togethers a
+        // separator-less FilePath into "/dataimg_000.dat". C discards checkPath's
+        // status here, so a missing directory does not abort the name.
+        self.check_path()?;
+
         let path = self.port_base.get_string_param(self.params.file_path, 0)?;
         let name = self.port_base.get_string_param(self.params.file_name, 0)?;
         let number = self.port_base.get_int32_param(self.params.file_number, 0)?;
@@ -593,18 +621,37 @@ impl NDArrayDriverBase {
         Ok(full)
     }
 
-    /// Check if the file path directory exists.
-    /// Normalizes the path to ensure it has a trailing '/'.
+    /// Stamp `epicsTS` and the derived double `timeStamp` on `array`.
+    ///
+    /// C++ `asynNDArrayDriver::updateTimeStamps` (asynNDArrayDriver.cpp:832-836).
+    /// The time comes from the port's registered timestamp source, so a driver
+    /// with a hardware clock stamps from it (C `updateTimeStamp`), and
+    /// `timeStamp` is always derived from `epicsTS` — the two cannot disagree.
+    /// `NDArrayPool::alloc` sets neither; this is the only place that sets them
+    /// for a newly produced frame.
+    pub fn update_time_stamps(&self, array: &mut NDArray) {
+        array.update_time_stamps(self.port_base.current_timestamp().into());
+    }
+
+    /// Check whether the `FILE_PATH` directory exists, normalizing the path.
+    ///
+    /// C++ `asynNDArrayDriver::checkPath()` (asynNDArrayDriver.cpp:98-109): an
+    /// empty FilePath returns early — neither the path nor `FilePathExists` is
+    /// written. Otherwise the path is normalized in place by
+    /// [`check_path_str`], written back to the parameter, and `FilePathExists`
+    /// is refreshed.
     pub fn check_path(&mut self) -> AsynResult<bool> {
-        let path_ref = self.port_base.get_string_param(self.params.file_path, 0)?;
-        let mut path = path_ref.to_string();
-        // Ensure trailing separator (C++ checkPath does this)
-        if !path.is_empty() && !path.ends_with('/') && !path.ends_with(std::path::MAIN_SEPARATOR) {
-            path.push('/');
-            self.port_base
-                .set_string_param(self.params.file_path, 0, path.clone())?;
+        let mut path = self
+            .port_base
+            .get_string_param(self.params.file_path, 0)?
+            .to_string();
+        if path.is_empty() {
+            return Ok(false);
         }
-        let exists = Path::new(&path).is_dir();
+
+        let exists = check_path_str(&mut path);
+        self.port_base
+            .set_string_param(self.params.file_path, 0, path)?;
         self.port_base
             .set_int32_param(self.params.file_path_exists, 0, exists as i32)?;
         Ok(exists)
@@ -949,6 +996,106 @@ mod tests {
 
         let name = drv.create_file_name().unwrap();
         assert_eq!(name, "/tmp/test_042.dat");
+    }
+
+    #[test]
+    fn test_r6_64_create_file_name_normalizes_file_path() {
+        // R6-64 / asynNDArrayDriver.cpp:203 — createFileName calls checkPath()
+        // first, so a FilePath without a trailing separator (e.g. one a driver
+        // seeded with set_string_param, bypassing writeOctet) is normalized
+        // before the template runs. Without it the "%s%s_%3.3d.dat" default
+        // produces "/tmpimg_042.dat".
+        let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
+        let tmp = std::env::temp_dir();
+        let no_sep = tmp
+            .to_string_lossy()
+            .trim_end_matches(std::path::MAIN_SEPARATOR)
+            .to_string();
+        drv.port_base
+            .set_string_param(drv.params.file_path, 0, no_sep.clone())
+            .unwrap();
+        drv.port_base
+            .set_string_param(drv.params.file_name, 0, "img".into())
+            .unwrap();
+        drv.port_base
+            .set_int32_param(drv.params.file_number, 0, 42)
+            .unwrap();
+        drv.port_base
+            .set_string_param(drv.params.file_template, 0, "%s%s_%3.3d.dat".into())
+            .unwrap();
+
+        let name = drv.create_file_name().unwrap();
+        let expected = format!("{}{}img_042.dat", no_sep, std::path::MAIN_SEPARATOR);
+        assert_eq!(name, expected, "createFileName must run checkPath first");
+
+        // checkPath also writes the normalized path back to the parameter and
+        // refreshes FilePathExists (asynNDArrayDriver.cpp:107-108).
+        let stored = drv
+            .port_base
+            .get_string_param(drv.params.file_path, 0)
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            stored,
+            format!("{}{}", no_sep, std::path::MAIN_SEPARATOR),
+            "FilePath must be written back with the trailing separator"
+        );
+        assert_eq!(
+            drv.port_base
+                .get_int32_param(drv.params.file_path_exists, 0)
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_r6_64_check_path_empty_path_touches_nothing() {
+        // C checkPath() returns early for an empty FilePath (:104), leaving both
+        // FilePath and FilePathExists alone.
+        let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
+        drv.port_base
+            .set_int32_param(drv.params.file_path_exists, 0, 1)
+            .unwrap();
+        assert!(!drv.check_path().unwrap());
+        assert_eq!(
+            drv.port_base
+                .get_int32_param(drv.params.file_path_exists, 0)
+                .unwrap(),
+            1,
+            "empty FilePath must not overwrite FilePathExists"
+        );
+    }
+
+    #[test]
+    fn test_r6_64_check_path_str_appends_separator_when_missing() {
+        // C checkPath(std::string&) appends the delimiter even when the input
+        // had none (asynNDArrayDriver.cpp:85-86), and strips exactly one
+        // trailing separator before the stat.
+        let tmp = std::env::temp_dir().to_string_lossy().into_owned();
+        let base = tmp.trim_end_matches(std::path::MAIN_SEPARATOR).to_string();
+        let sep = std::path::MAIN_SEPARATOR;
+
+        let mut p = base.clone();
+        assert!(check_path_str(&mut p));
+        assert_eq!(p, format!("{base}{sep}"));
+
+        // Already normalized: unchanged.
+        let mut p = format!("{base}{sep}");
+        assert!(check_path_str(&mut p));
+        assert_eq!(p, format!("{base}{sep}"));
+
+        // Missing directory: still normalized, reports false.
+        let mut p = format!("{base}{sep}definitely-not-a-real-dir-r6-64");
+        assert!(!check_path_str(&mut p));
+        assert_eq!(
+            p,
+            format!("{base}{sep}definitely-not-a-real-dir-r6-64{sep}")
+        );
+
+        // Empty: untouched.
+        let mut p = String::new();
+        assert!(!check_path_str(&mut p));
+        assert_eq!(p, "");
     }
 
     #[test]

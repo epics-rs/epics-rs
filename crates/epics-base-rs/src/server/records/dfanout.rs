@@ -1,6 +1,6 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, ProcessOutcome, Record};
-use crate::types::{DbFieldType, EpicsValue};
+use crate::server::record::{ProcessOutcome, Record};
+use crate::types::EpicsValue;
 
 /// Choice labels for the SELM link-selection menu, in index order.
 /// C `menu(dfanoutSELM)`: 0=All, 1=Specified, 2=Mask.
@@ -99,8 +99,17 @@ impl Default for DfanoutRecord {
             lalm: 0.0,
             mdel: 0.0,
             adel: 0.0,
-            mlst: f64::NAN,
-            alst: f64::NAN,
+            // `dfanoutRecord.dbd` gives MLST/ALST no `initial()`: C's calloc'd
+            // record starts both at 0.0, and `caget D:DF.MLST` on a C IOC reads
+            // 0. They are ordinary wire-visible fields, not sentinels — the
+            // "nothing posted yet" state lives in `CommonFields::{mlst,alst}`
+            // (`Option<f64>`), which the deadband owner falls back to when a
+            // record does not declare the field at all. Every other analog record
+            // in the port already starts them at 0.0; dfanout alone used NaN,
+            // which both served `nan` to clients and made its FIRST deadband check
+            // fire where C's (delta = |0 - 0| = 0, not > MDEL) does not.
+            mlst: 0.0,
+            alst: 0.0,
         }
     }
 }
@@ -171,208 +180,9 @@ impl DfanoutRecord {
     }
 }
 
-static DFANOUT_FIELDS: &[FieldDesc] = &[
-    FieldDesc {
-        name: "VAL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SELM",
-        // SELM is DBF_MENU menu(dfanoutSELM) (dfanoutRecord.dbd.pod) — served
-        // as DBR_ENUM with the menu's choice labels, see DFANOUT_SELM_CHOICES.
-        dbf_type: DbFieldType::Enum,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SELN",
-        dbf_type: DbFieldType::UShort,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OUTA",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OUTB",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OUTC",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OUTD",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OUTE",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OUTF",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OUTG",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OUTH",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OUTI",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OUTJ",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OUTK",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OUTL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OUTM",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OUTN",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OUTO",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OUTP",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DOL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OMSL",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SELL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "IVOA",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "IVOV",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "HIHI",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "HIGH",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LOW",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LOLO",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "HHSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "HSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LLSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "HYST",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LALM",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "MDEL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ADEL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "MLST",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "ALST",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-];
-
 impl Record for DfanoutRecord {
     fn record_type(&self) -> &'static str {
         "dfanout"
-    }
-
-    fn field_list(&self) -> &'static [FieldDesc] {
-        DFANOUT_FIELDS
     }
 
     fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
@@ -386,22 +196,24 @@ impl Record for DfanoutRecord {
         true
     }
 
-    /// C `dfanoutRecord.c::init_record` applies a constant DOL to VAL once
-    /// via `recGblInitConstantLink(&prec->dol, DBF_DOUBLE, &prec->val)`.
-    /// The framework gate (`processing.rs`) excludes a constant DOL from
-    /// the per-cycle closed-loop fetch (C `!dbLinkIsConstant`), so the
-    /// constant must be seeded here or it would never reach VAL.
-    fn init_record(&mut self, pass: u8) -> CaResult<()> {
-        if pass == 0 {
-            if let crate::server::record::ParsedLink::Constant(s) =
-                crate::server::record::parse_link_v2(&self.dol)
-            {
-                if let Ok(v) = s.trim().parse::<f64>() {
-                    self.val = v;
-                }
-            }
-        }
-        Ok(())
+    /// C `dfanoutRecord.c:102-105`:
+    ///
+    /// ```c
+    /// recGblInitConstantLink(&prec->sell, DBF_USHORT, &prec->seln);
+    /// if (recGblInitConstantLink(&prec->dol, DBF_DOUBLE, &prec->val))
+    ///     prec->udf = FALSE;
+    /// ```
+    ///
+    /// Both links are init-only — at process `dbGetLink` on a constant
+    /// delivers nothing — so this table is the only way a constant SELL or DOL
+    /// reaches SELN / VAL.
+    fn constant_init_links(&self) -> Vec<crate::server::record::ConstantInitLink> {
+        vec![
+            crate::server::record::ConstantInitLink::new("SELL", "SELN"),
+            // C `dfanoutRecord.c:105-106`: a successful DOL load also DEFINES
+            // the record — `prec->udf = isnan(prec->val)`.
+            crate::server::record::ConstantInitLink::dol_to_val("DOL", "VAL"),
+        ]
     }
 
     /// dfanout has no value computation in `process()` itself — VAL is
@@ -419,14 +231,33 @@ impl Record for DfanoutRecord {
         self.val.is_nan()
     }
 
+    /// ...and that DOL fetch is the ONLY thing in dfanout's `process()` that
+    /// touches UDF (`dfanoutRecord.c:116-122`). With no DOL — or a constant one,
+    /// which `dbGetLink` never re-delivers — C leaves UDF alone, so a
+    /// `record(dfanout,"DF1")` stays UDF=1 and `checkAlarms` (`:233-234`) raises
+    /// UDF_ALARM at UDFS every single cycle. softIoc: `dbpf DF1.PROC 1` →
+    /// UDF=1, SEVR INVALID, STAT UDF. The port's blanket per-cycle clear made it
+    /// NO_ALARM — an alarm-visible divergence, not a cosmetic one.
+    ///
+    /// The closed-loop DOL read still defines the record: the framework applies
+    /// `udf = value_is_undefined()` at the DOL-apply site, which is exactly
+    /// where C's `:121` sits (softIoc: `DF2` with `DOL="SRC"` → UDF=0).
+    fn clears_udf(&self) -> bool {
+        false
+    }
+
     /// C `dfanoutRecord.c::checkAlarms` — UDF alarm plus analog limit
     /// alarms (HIHI/HIGH/LOW/LOLO) with per-level hysteresis.
     fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
         use crate::server::recgbl::{self, alarm_status};
         use crate::server::record::AlarmSeverity;
 
-        if common.udf {
-            recgbl::rec_gbl_set_sevr(common, alarm_status::UDF_ALARM, common.udfs);
+        if common.udf != 0 {
+            recgbl::rec_gbl_set_sevr(
+                common,
+                alarm_status::UDF_ALARM,
+                AlarmSeverity::from_u16(common.udfs as u16),
+            );
             return;
         }
 

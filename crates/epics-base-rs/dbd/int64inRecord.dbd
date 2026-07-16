@@ -1,0 +1,205 @@
+#*************************************************************************
+# Copyright (c) 2016 UChicago Argonne LLC, as Operator of Argonne
+#     National Laboratory.
+# Copyright (c) 2002 The Regents of the University of California, as
+#     Operator of Los Alamos National Laboratory.
+# EPICS BASE is distributed subject to a Software License Agreement found
+# in file LICENSE that is included with this distribution. 
+#*************************************************************************
+
+
+recordtype(int64in) {
+
+
+    include "dbCommon.dbd"
+    %
+    %/* Declare Device Support Entry Table */
+    %struct int64inRecord;
+    %typedef struct int64indset {
+    %    dset common;
+    %    long (*read_int64in)(struct int64inRecord *prec);
+    %} int64indset;
+    %#define HAS_int64indset
+    %
+    field(VAL,DBF_INT64) {
+        prompt("Current value")
+        promptgroup("40 - Input")
+        asl(ASL0)
+        pp(TRUE)
+    }
+    field(INP,DBF_INLINK) {
+        prompt("Input Specification")
+        promptgroup("40 - Input")
+        interest(1)
+    }
+    field(EGU,DBF_STRING) {
+        prompt("Units name")
+        promptgroup("80 - Display")
+        interest(1)
+        size(16)
+        prop(YES)       # get_units
+    }
+    field(HOPR,DBF_INT64) {
+        prompt("High Operating Range")
+        promptgroup("80 - Display")
+        interest(1)
+        prop(YES)       # get_graphic_double, get_control_double
+    }
+    field(LOPR,DBF_INT64) {
+        prompt("Low Operating Range")
+        promptgroup("80 - Display")
+        interest(1)
+        prop(YES)       # get_graphic_double, get_control_double
+    }
+    field(HIHI,DBF_INT64) {
+        prompt("Hihi Alarm Limit")
+        promptgroup("70 - Alarm")
+        pp(TRUE)
+        interest(1)
+        prop(YES)       # get_alarm_double
+    }
+    field(LOLO,DBF_INT64) {
+        prompt("Lolo Alarm Limit")
+        promptgroup("70 - Alarm")
+        pp(TRUE)
+        interest(1)
+        prop(YES)       # get_alarm_double
+    }
+    field(HIGH,DBF_INT64) {
+        prompt("High Alarm Limit")
+        promptgroup("70 - Alarm")
+        pp(TRUE)
+        interest(1)
+        prop(YES)       # get_alarm_double
+    }
+    field(LOW,DBF_INT64) {
+        prompt("Low Alarm Limit")
+        promptgroup("70 - Alarm")
+        pp(TRUE)
+        interest(1)
+        prop(YES)       # get_alarm_double
+    }
+    field(HHSV,DBF_MENU) {
+        prompt("Hihi Severity")
+        promptgroup("70 - Alarm")
+        pp(TRUE)
+        interest(1)
+        menu(menuAlarmSevr)
+    }
+    field(LLSV,DBF_MENU) {
+        prompt("Lolo Severity")
+        promptgroup("70 - Alarm")
+        pp(TRUE)
+        interest(1)
+        menu(menuAlarmSevr)
+    }
+    field(HSV,DBF_MENU) {
+        prompt("High Severity")
+        promptgroup("70 - Alarm")
+        pp(TRUE)
+        interest(1)
+        menu(menuAlarmSevr)
+    }
+    field(LSV,DBF_MENU) {
+        prompt("Low Severity")
+        promptgroup("70 - Alarm")
+        pp(TRUE)
+        interest(1)
+        menu(menuAlarmSevr)
+    }
+    field(HYST,DBF_INT64) {
+        prompt("Alarm Deadband")
+        promptgroup("70 - Alarm")
+        interest(1)
+    }
+    field(AFTC, DBF_DOUBLE) {
+        prompt("Alarm Filter Time Constant")
+        promptgroup("70 - Alarm")
+        interest(1)
+    }
+    field(AFVL, DBF_DOUBLE) {
+        prompt("Alarm Filter Value")
+        special(SPC_NOMOD)
+        interest(3)
+    }
+    field(ADEL,DBF_INT64) {
+        prompt("Archive Deadband")
+        promptgroup("80 - Display")
+        interest(1)
+    }
+    field(MDEL,DBF_INT64) {
+        prompt("Monitor Deadband")
+        promptgroup("80 - Display")
+        interest(1)
+    }
+    field(LALM,DBF_INT64) {
+        prompt("Last Value Alarmed")
+        special(SPC_NOMOD)
+        interest(3)
+    }
+    field(ALST,DBF_INT64) {
+        prompt("Last Value Archived")
+        special(SPC_NOMOD)
+        interest(3)
+    }
+    field(MLST,DBF_INT64) {
+        prompt("Last Val Monitored")
+        special(SPC_NOMOD)
+        interest(3)
+    }
+
+
+    field(SIOL,DBF_INLINK) {
+        prompt("Simulation Input Link")
+        promptgroup("90 - Simulate")
+        interest(1)
+    }
+    field(SVAL,DBF_INT64) {
+        prompt("Simulation Value")
+    }
+    field(SIML,DBF_INLINK) {
+        prompt("Simulation Mode Link")
+        promptgroup("90 - Simulate")
+        interest(1)
+    }
+    field(SIMM,DBF_MENU) {
+        prompt("Simulation Mode")
+        special(SPC_MOD)
+        interest(1)
+        menu(menuYesNo)
+    }
+    field(SIMS,DBF_MENU) {
+        prompt("Simulation Mode Severity")
+        promptgroup("90 - Simulate")
+        interest(2)
+        menu(menuAlarmSevr)
+    }
+    field(OLDSIMM,DBF_MENU) {
+        prompt("Prev. Simulation Mode")
+        special(SPC_NOMOD)
+        interest(4)
+        menu(menuSimm)
+    }
+    field(SSCN,DBF_MENU) {
+        prompt("Sim. Mode Scan")
+        promptgroup("90 - Simulate")
+        interest(1)
+        menu(menuScan)
+        initial("65535")
+    }
+    field(SDLY,DBF_DOUBLE) {
+        prompt("Sim. Mode Async Delay")
+        promptgroup("90 - Simulate")
+        interest(2)
+        initial("-1.0")
+    }
+    %#include "callback.h"
+    field(SIMPVT,DBF_NOACCESS) {
+        prompt("Sim. Mode Private")
+        special(SPC_NOMOD)
+        interest(4)
+        extra("epicsCallback            *simpvt")
+    }
+}
+
+

@@ -41,9 +41,11 @@ struct Args {
     #[arg(long = "macro", value_parser = parse_macro)]
     macros: Vec<(String, String)>,
 
-    /// TCP port for pvAccess (UDP is port + 1). 0 = EPICS default (5075).
-    #[arg(long, default_value_t = 0)]
-    port: u16,
+    /// TCP port for pvAccess (UDP is port + 1). Omit to take
+    /// `EPICS_PVAS_SERVER_PORT`, then `EPICS_PVA_SERVER_PORT`, then 5075.
+    /// `--port 0` binds an ephemeral port.
+    #[arg(long)]
+    port: Option<u16>,
 }
 
 fn parse_macro(raw: &str) -> Result<(String, String), String> {
@@ -75,8 +77,8 @@ async fn main() -> ExitCode {
 
 async fn run(args: Args) -> Result<(), String> {
     let mut builder: PvaServerBuilder = PvaServer::builder();
-    if args.port != 0 {
-        builder = builder.port(args.port);
+    if let Some(port) = args.port {
+        builder = builder.port(port);
     }
     if let Some(path) = args.db_file.as_ref() {
         let macros: HashMap<String, String> = args.macros.iter().cloned().collect();

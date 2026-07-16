@@ -620,6 +620,13 @@ impl IocApplication {
         Fut: std::future::Future<Output = CaResult<()>> + Send,
     {
         let db = Arc::new(PvDatabase::new());
+        // Everything from here to the `db.ioc_init()` barrier below is C's
+        // pre-`iocInit` load: inline records, then the `st.cmd`'s
+        // `dbLoadRecords` calls. Records created in it queue their link-status
+        // classification instead of running it against a database that is still
+        // being built (R18-92).
+        db.begin_load()
+            .expect("a database created a line ago has not run iocInit");
         let handle = tokio::runtime::Handle::current();
 
         let Self {
@@ -897,6 +904,12 @@ impl IocApplication {
         // C: initDatabase() then initHookAfterInitDatabase (autosave
         // pass 1). The registered hook performs pass-1 + SaveSetConfig
         // restore.
+        //
+        // The `iocInit` barrier runs as part of initDatabase: every record the
+        // startup script loaded now exists, so the link-status classifications
+        // queued during the load run here, against the complete database. A
+        // no-op when the script already spelled `iocInit` out.
+        db.ioc_init().await;
         announce!(InitHookState::AfterInitDatabase);
         announce!(InitHookState::AfterFinishDevSup);
         announce!(InitHookState::AfterScanInit);
@@ -909,11 +922,8 @@ impl IocApplication {
         // could `caget` a PINI record's UDF/default value instead of
         // its processed value. C guarantees this cannot happen.
         {
-            let pini_records = db.pini_records().await;
-            for name in &pini_records {
-                let mut visited = std::collections::HashSet::new();
-                let _ = db.process_record_with_links(name, &mut visited, 0).await;
-            }
+            // C `initialProcess()` (iocInit.c:653-657) — `piniProcess(menuPiniYES)`.
+            db.pini_process(crate::server::record::PiniMode::Yes).await;
             // Publish completion so any scan scheduler started by the
             // protocol runner sees PINI as already done and its
             // non-owner branch does not block. The scheduler's owner
@@ -954,6 +964,11 @@ impl IocApplication {
         // iocRun begins. Scan tasks / CA links are started by the
         // protocol runner immediately after handoff.
         announce!(InitHookState::AtIocRun);
+        // C `piniProcessHook` (iocInit.c:629-646): the hook registered by
+        // `initialProcess()` runs `piniProcess(menuPiniRUN)` when
+        // `initHookAtIocRun` is announced. PINI=RUN records are processed
+        // here and NOT in the PINI=YES pass above.
+        db.pini_process(crate::server::record::PiniMode::Run).await;
         announce!(InitHookState::AfterDatabaseRunning);
         announce!(InitHookState::AfterCaServerRunning);
 
@@ -971,6 +986,10 @@ impl IocApplication {
             hook();
         }
         announce!(InitHookState::AfterIocRunning);
+        // C `piniProcessHook` at `initHookAfterIocRunning` (iocInit.c:637-639)
+        // — `piniProcess(menuPiniRUNNING)`.
+        db.pini_process(crate::server::record::PiniMode::Running)
+            .await;
 
         // Phase 2e: drain `afterIocRunning` queue (epics-base PR #558).
         // Each line is an iocsh command queued by the startup script;
@@ -1170,8 +1189,45 @@ async fn wire_subroutines(db: &PvDatabase, registry: &HashMap<String, Arc<Subrou
     }
 }
 
+/// C `scanAdd`'s `menuScanI_O_Intr` failure exit (`dbScan.c:272-293`): a record
+/// whose device support cannot supply an interrupt source is reported with
+/// `recGblRecordError` and **demoted to `menuScanPassive`** — it never joins the
+/// I/O Intr scan list, and `caget REC.SCAN` reads back `Passive`.
+///
+/// The demotion is a SCAN transition like any other, so it goes through
+/// `RecordInstance::set_scan` — the single owner, which drives the C
+/// `scanDelete` → `get_ioint_info(1)` hook and hands back the delta for
+/// `update_scan_index`, so the record also leaves the `IoIntr` scan bucket that
+/// `scanpiol` and `dbla` report from.
+async fn demote_io_intr_to_passive(db: &PvDatabase, name: &str, reason: &str) {
+    let Some(rec_arc) = db.get_record(name).await else {
+        return;
+    };
+    let result = {
+        let mut inst = rec_arc.write().await;
+        if inst.common.scan != record::ScanType::IoIntr {
+            return;
+        }
+        inst.set_scan(record::ScanType::Passive)
+    };
+    if let record::CommonFieldPutResult::ScanChanged {
+        old_scan,
+        new_scan,
+        phas,
+    } = result
+    {
+        db.update_scan_index(name, old_scan, new_scan, phas, phas)
+            .await;
+    }
+    eprintln!("scanAdd: I/O Intr not valid ({reason}), {name} set to Passive");
+}
+
 /// Set up I/O Intr scanning for records with SCAN="I/O Intr".
-async fn setup_io_intr(db: Arc<PvDatabase>) -> usize {
+///
+/// The single owner of that wiring — `IocBuilder` calls this too, so the C
+/// `scanAdd` failure paths cannot be present on one startup route and absent on
+/// the other.
+pub(crate) async fn setup_io_intr(db: Arc<PvDatabase>) -> usize {
     let all_names = db.all_record_names().await;
     let io_intr_recs: Vec<(
         String,
@@ -1187,6 +1243,11 @@ async fn setup_io_intr(db: Arc<PvDatabase>) -> usize {
     };
 
     let mut count = 0;
+    // Records that reached one of C `scanAdd`'s I/O Intr failure exits. The
+    // demotion runs after the loop: it takes the registration mutex and the
+    // records map (`update_scan_index`), which must not be entered while this
+    // loop holds a record's write guard.
+    let mut demote: Vec<(String, &'static str)> = Vec::new();
     for (name, rec_arc) in io_intr_recs {
         let mut inst = rec_arc.write().await;
         // Wire poll feedback when the record is on I/O Intr scan, OR when the
@@ -1201,37 +1262,53 @@ async fn setup_io_intr(db: Arc<PvDatabase>) -> usize {
             .device
             .as_ref()
             .is_some_and(|d| d.io_intr_scan_independent());
-        if inst.common.scan == record::ScanType::IoIntr || independent {
-            if let Some(mut dev) = inst.device.take() {
-                if let Some(mut intr_rx) = dev.io_intr_receiver() {
-                    let db_clone = db.clone();
-                    let rec_name = name.clone();
-                    let rec_arc_clone = rec_arc.clone();
-                    crate::runtime::task::spawn(async move {
-                        while intr_rx.recv().await.is_some() {
-                            // Process if the device drives SCAN-independently,
-                            // or the record is still on I/O Intr scan.
-                            let process = independent || {
-                                let inst = rec_arc_clone.read().await;
-                                inst.common.scan == record::ScanType::IoIntr
-                            };
-                            if !process {
-                                continue;
-                            }
-                            let mut visited = std::collections::HashSet::new();
-                            // Driver-callback cycle: an output (`asyn:READBACK`)
-                            // record reads the value back into VAL and skips the
-                            // device write; input records are unaffected.
-                            let _ = db_clone
-                                .process_record_readback(&rec_name, &mut visited, 0)
-                                .await;
-                        }
-                    });
-                    count += 1;
-                }
-                inst.device = Some(dev);
-            }
+        let on_io_intr = inst.common.scan == record::ScanType::IoIntr;
+        if !on_io_intr && !independent {
+            continue;
         }
+        let Some(mut dev) = inst.device.take() else {
+            // C `dbScan.c:272-276` — `precord->dset == NULL`.
+            if on_io_intr {
+                demote.push((name, "no DSET"));
+            }
+            continue;
+        };
+        if let Some(mut intr_rx) = dev.io_intr_receiver() {
+            let db_clone = db.clone();
+            let rec_name = name.clone();
+            let rec_arc_clone = rec_arc.clone();
+            crate::runtime::task::spawn(async move {
+                while intr_rx.recv().await.is_some() {
+                    // Process if the device drives SCAN-independently,
+                    // or the record is still on I/O Intr scan.
+                    let process = independent || {
+                        let inst = rec_arc_clone.read().await;
+                        inst.common.scan == record::ScanType::IoIntr
+                    };
+                    if !process {
+                        continue;
+                    }
+                    let mut visited = std::collections::HashSet::new();
+                    // Driver-callback cycle: an output (`asyn:READBACK`)
+                    // record reads the value back into VAL and skips the
+                    // device write; input records are unaffected.
+                    let _ = db_clone
+                        .process_record_readback(&rec_name, &mut visited, 0)
+                        .await;
+                }
+            });
+            count += 1;
+        } else if on_io_intr {
+            // C `dbScan.c:278-293` — device support with no `get_ioint_info`,
+            // or one whose `get_ioint_info` yields no scan list. The port
+            // collapses all three into "the device offers no interrupt
+            // receiver"; the observable is the same demotion.
+            demote.push((name, "no interrupt source from device support"));
+        }
+        inst.device = Some(dev);
+    }
+    for (name, reason) in demote {
+        demote_io_intr_to_passive(&db, &name, reason).await;
     }
     count
 }
@@ -1268,6 +1345,122 @@ pub(crate) async fn setup_property_posts(db: Arc<PvDatabase>) -> usize {
         }
     }
     count
+}
+
+#[cfg(test)]
+mod io_intr_scan_add_tests {
+    use super::setup_io_intr;
+    use crate::server::database::PvDatabase;
+    use crate::server::record::ScanType;
+    use crate::server::records::ai::AiRecord;
+    use std::sync::Arc;
+
+    /// R6-8 — C `scanAdd` (`dbScan.c:272-276`): a `SCAN="I/O Intr"` record with
+    /// no device support (`precord->dset == NULL`) is reported with
+    /// `recGblRecordError` and **demoted to `menuScanPassive`**. It must not be
+    /// left claiming I/O Intr, and must not stay in the I/O Intr scan bucket
+    /// that `scanpiol` reports from.
+    #[tokio::test]
+    async fn io_intr_without_device_support_is_demoted_to_passive() {
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("NODEV", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        {
+            let rec = db.get_record("NODEV").await.unwrap();
+            let mut inst = rec.write().await;
+            inst.common.scan = ScanType::IoIntr;
+        }
+        db.update_scan_index("NODEV", ScanType::Passive, ScanType::IoIntr, 0, 0)
+            .await;
+        assert_eq!(
+            db.records_for_scan(ScanType::IoIntr).await,
+            vec!["NODEV".to_string()],
+            "precondition: the record starts in the I/O Intr bucket"
+        );
+
+        let wired = setup_io_intr(db.clone()).await;
+        assert_eq!(wired, 0, "no device support ⇒ nothing to wire");
+
+        // C: `precord->scan = menuScanPassive` — `caget NODEV.SCAN` reads Passive.
+        let rec = db.get_record("NODEV").await.unwrap();
+        assert_eq!(
+            rec.read().await.common.scan,
+            ScanType::Passive,
+            "an unusable I/O Intr record must be demoted to Passive"
+        );
+        assert!(
+            db.records_for_scan(ScanType::IoIntr).await.is_empty(),
+            "and must leave the I/O Intr scan list"
+        );
+    }
+
+    /// R6-8 — C `scanAdd` (`dbScan.c:278-293`): device support that supplies no
+    /// interrupt source (`get_ioint_info == NULL`, or it returns non-zero, or it
+    /// yields a NULL scan list) is the same failure exit — log and demote. The
+    /// port collapses those three C cases into "the device offers no
+    /// `io_intr_receiver`", so this covers all of them.
+    #[tokio::test]
+    async fn io_intr_with_device_but_no_interrupt_source_is_demoted_to_passive() {
+        use crate::error::CaResult;
+        use crate::server::device_support::DeviceSupport;
+        use crate::server::record::Record;
+
+        /// Device support with the default `io_intr_receiver` (→ `None`).
+        struct NoIntrDevice;
+        impl DeviceSupport for NoIntrDevice {
+            fn write(&mut self, _record: &mut dyn Record) -> CaResult<()> {
+                Ok(())
+            }
+            fn dtyp(&self) -> &str {
+                "NoIntr"
+            }
+        }
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("NOINTR", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        {
+            let rec = db.get_record("NOINTR").await.unwrap();
+            let mut inst = rec.write().await;
+            inst.common.scan = ScanType::IoIntr;
+            inst.device = Some(Box::new(NoIntrDevice));
+        }
+        db.update_scan_index("NOINTR", ScanType::Passive, ScanType::IoIntr, 0, 0)
+            .await;
+
+        let wired = setup_io_intr(db.clone()).await;
+        assert_eq!(wired, 0, "no interrupt source ⇒ nothing to wire");
+
+        let rec = db.get_record("NOINTR").await.unwrap();
+        let inst = rec.read().await;
+        assert_eq!(
+            inst.common.scan,
+            ScanType::Passive,
+            "device support with no interrupt source must demote SCAN to Passive"
+        );
+        assert!(
+            inst.device.is_some(),
+            "the demotion must not drop the record's device support"
+        );
+        drop(inst);
+        assert!(db.records_for_scan(ScanType::IoIntr).await.is_empty());
+    }
+
+    /// The demotion is scoped to the failure exits: a record that was never on
+    /// I/O Intr is untouched by the pass.
+    #[tokio::test]
+    async fn a_passive_record_is_not_touched_by_the_io_intr_pass() {
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("PASV", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        let wired = setup_io_intr(db.clone()).await;
+        assert_eq!(wired, 0);
+        let rec = db.get_record("PASV").await.unwrap();
+        assert_eq!(rec.read().await.common.scan, ScanType::Passive);
+    }
 }
 
 #[cfg(test)]

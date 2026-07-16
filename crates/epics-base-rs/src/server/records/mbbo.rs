@@ -1,6 +1,6 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, MENU_SIMM, ProcessOutcome, Record};
-use crate::types::{DbFieldType, EpicsValue, PvString};
+use crate::server::record::{MENU_SIMM, ProcessOutcome, Record};
+use crate::types::{EpicsValue, PvString};
 
 /// Multi-bit binary output record — manual Record impl for raw↔index conversion.
 pub struct MbboRecord {
@@ -15,7 +15,6 @@ pub struct MbboRecord {
     pub mask: u32,
     // SHFT/NOBT are DBF_USHORT (mbboRecord.dbd.pod:658,211).
     pub shft: u16,
-    pub sdef: bool,
     pub nobt: u16,
     // MLST/LALM/IVOV are DBF_USHORT (mbboRecord.dbd.pod:643,648,717).
     pub mlst: u16,
@@ -110,7 +109,6 @@ impl Default for MbboRecord {
             orbv: 0,
             mask: 0,
             shft: 0,
-            sdef: false,
             nobt: 0,
             mlst: 0,
             lalm: 0,
@@ -201,7 +199,7 @@ impl MbboRecord {
     /// directly. C `processMbbo` readback (devAsynInt32.c:1314-1330 /
     /// devAsynUInt32Digital.c:948-963); the input twin is `mbbi::raw_to_val`.
     fn raw_to_val(&self, raw: u32) -> u16 {
-        if !self.sdef {
+        if !self.sdef() {
             return raw as u16;
         }
         let rvs = self.raw_values();
@@ -213,20 +211,26 @@ impl MbboRecord {
         65535
     }
 
-    fn compute_sdef(&mut self) {
+    /// C `mbboRecord.c::init_common` — "check if any states are defined": TRUE
+    /// as soon as one of ZRVL..FFVL is non-zero or one of ZRST..FFST is
+    /// non-empty.
+    ///
+    /// DERIVED, never stored. C keeps `prec->sdef` as a struct member and
+    /// recomputes it from `init_common` — at init, and from `special()` after
+    /// every write to a state field. A cached copy of a value that is a pure
+    /// function of 32 other fields can go stale, and here staleness is not
+    /// cosmetic: `sdef` selects VAL's WIRE TYPE (`cvt_dbaddr`, DBF_USHORT with
+    /// no state table, DBF_ENUM with one), so a stale `false` serves an enum
+    /// field as a long. Computing it on demand makes that state unreachable
+    /// rather than merely unlikely.
+    fn sdef(&self) -> bool {
         let rvs = self.raw_values();
         let sts: [&PvString; 16] = [
             &self.zrst, &self.onst, &self.twst, &self.thst, &self.frst, &self.fvst, &self.sxst,
             &self.svst, &self.eist, &self.nist, &self.test, &self.elst, &self.tvst, &self.ttst,
             &self.ftst, &self.ffst,
         ];
-        self.sdef = false;
-        for i in 0..16 {
-            if rvs[i] != 0 || !sts[i].is_empty() {
-                self.sdef = true;
-                return;
-            }
-        }
+        (0..16).any(|i| rvs[i] != 0 || !sts[i].is_empty())
     }
 
     /// C convert(): VAL -> RVAL with SDEF check and SHFT.
@@ -237,7 +241,7 @@ impl MbboRecord {
     /// `soft_alarm` so `check_alarms()` raises the alarm.
     fn convert(&mut self) {
         self.soft_alarm = false;
-        if self.sdef {
+        if self.sdef() {
             if self.val > 15 {
                 self.soft_alarm = true;
                 return;
@@ -269,358 +273,6 @@ impl MbboRecord {
     }
 }
 
-static MBBO_FIELDS: &[FieldDesc] = &[
-    FieldDesc {
-        name: "VAL",
-        dbf_type: DbFieldType::Enum,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "RVAL",
-        dbf_type: DbFieldType::ULong,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ORAW",
-        dbf_type: DbFieldType::ULong,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "RBV",
-        dbf_type: DbFieldType::ULong,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "ORBV",
-        dbf_type: DbFieldType::ULong,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "MASK",
-        dbf_type: DbFieldType::ULong,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SHFT",
-        dbf_type: DbFieldType::UShort,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "MLST",
-        dbf_type: DbFieldType::UShort,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "LALM",
-        dbf_type: DbFieldType::UShort,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "IVOA",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "IVOV",
-        dbf_type: DbFieldType::UShort,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "NOBT",
-        dbf_type: DbFieldType::UShort,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ZRSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ONSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "TWSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "THSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "FRSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "FVSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SXSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SVSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "EISV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "NISV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "TESV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ELSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "TVSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "TTSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "FTSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "FFSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "UNSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "COSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OMSL",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DOL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ZRVL",
-        dbf_type: DbFieldType::ULong,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ONVL",
-        dbf_type: DbFieldType::ULong,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "TWVL",
-        dbf_type: DbFieldType::ULong,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "THVL",
-        dbf_type: DbFieldType::ULong,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "FRVL",
-        dbf_type: DbFieldType::ULong,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "FVVL",
-        dbf_type: DbFieldType::ULong,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SXVL",
-        dbf_type: DbFieldType::ULong,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SVVL",
-        dbf_type: DbFieldType::ULong,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "EIVL",
-        dbf_type: DbFieldType::ULong,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "NIVL",
-        dbf_type: DbFieldType::ULong,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "TEVL",
-        dbf_type: DbFieldType::ULong,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ELVL",
-        dbf_type: DbFieldType::ULong,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "TVVL",
-        dbf_type: DbFieldType::ULong,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "TTVL",
-        dbf_type: DbFieldType::ULong,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "FTVL",
-        dbf_type: DbFieldType::ULong,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "FFVL",
-        dbf_type: DbFieldType::ULong,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ZRST",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ONST",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "TWST",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "THST",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "FRST",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "FVST",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SXST",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SVST",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "EIST",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "NIST",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "TEST",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ELST",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "TVST",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "TTST",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "FTST",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "FFST",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    // Simulation block (mbboRecord.dbd.pod:663-695). SIMM is
-    // DBF_MENU menu(menuSimm) (NO/YES/RAW), SIMS is DBF_MENU
-    // menu(menuAlarmSevr) (centrally resolved); both served as DBR_ENUM
-    // shorts. SIML/SIOL are the simulation in/out links.
-    FieldDesc {
-        name: "SIMM",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIML",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIOL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIMS",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SDLY",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-];
-
 /// Helper macro: maps EPICS field name strings to struct fields.
 macro_rules! mbb_get_field {
     // `String`-tagged fields (the DOL/OUT/SIML/SIOL link grammar) store a
@@ -641,7 +293,23 @@ macro_rules! mbb_get_field {
     };
     ($self:expr, $name:expr, $( $str:literal => $field:ident : $variant:ident ),* $(,)?) => {
         match $name {
+            // C `mbboRecord.c:300-312` `cvt_dbaddr`: VAL is `special(SPC_DBADDR)`
+            // and the record RE-TYPES it from its own state. With no state table
+            // defined (`!prec->sdef` — every ZRVL..FFVL zero and every ZRST..FFST
+            // empty) there are no labels to hand a client, so C degenerates VAL to
+            // `DBF_USHORT`; CA has no unsigned-16 wire type, so it goes out
+            // `DBF_LONG`. Measured on the C softIoc: bare `record(mbbo,"P:BARE")`
+            // -> `cainfo` says DBF_LONG; the same record with ZRST/ONST -> DBF_ENUM.
+            // This is why VAL carries `runtime_typed` — the declaration cannot
+            // answer it, only the record can.
+            "VAL" if !$self.sdef() => Some(EpicsValue::UShort($self.val)),
             "VAL" => Some(EpicsValue::Enum($self.val)),
+            // `field(SDEF,DBF_SHORT) { special(SPC_NOMOD) }`
+            // (mbboRecord.dbd.pod) — readable over CA, never writable. It is
+            // the very predicate the VAL arms above branch on, so serving it
+            // derived keeps the reported flag and the served wire type from
+            // ever disagreeing.
+            "SDEF" => Some(EpicsValue::Short($self.sdef() as i16)),
             $( $str => mbb_get_field!(@get $self, $field, $variant), )*
             _ => None,
         }
@@ -703,8 +371,22 @@ macro_rules! mbb_put_field {
             "VAL" => {
                 match $value {
                     EpicsValue::Enum(v) => { $self.val = v; }
+                    // The put twin of the `cvt_dbaddr` degeneration above: a
+                    // stateless mbbo is SERVED `DBF_USHORT`, so the write path
+                    // coerces an inbound put to `UShort` before it lands here.
+                    EpicsValue::UShort(v) => { $self.val = v; }
                     EpicsValue::Long(v) => { $self.val = v as u16; }
                     EpicsValue::Short(v) => { $self.val = v as u16; }
+                    // C rset `put_enum_str` (mbboRecord.c:354-371) — the one
+                    // string→state converter, over `enum_state_strings`.
+                    EpicsValue::String(ref s) => {
+                        let resolved = crate::server::record::resolve_enum_state_string(
+                            "VAL",
+                            $self.enum_state_strings().as_deref(),
+                            s,
+                        )?;
+                        if let EpicsValue::Enum(v) = resolved { $self.val = v; }
+                    }
                     _ => return Err(CaError::TypeMismatch("VAL".into())),
                 }
             }
@@ -718,8 +400,40 @@ impl Record for MbboRecord {
     fn record_type(&self) -> &'static str {
         "mbbo"
     }
-    fn field_list(&self) -> &'static [FieldDesc] {
-        MBBO_FIELDS
+
+    /// C `mbboRecord.c:199-215`: `process()` clears `udf` to FALSE only when a
+    /// value SOURCE ran this cycle — a successful closed-loop DOL fetch. With no
+    /// DOL (or a constant one), the `else if (prec->udf)` arm raises UDF_ALARM at
+    /// UDFS and `goto CONTINUE`s, leaving `udf` untouched. `udf` is NEVER
+    /// re-derived from the stored VAL every cycle, so the framework's blanket
+    /// per-cycle clear (`processing.rs`) is wrong for mbbo: a bare
+    /// `record(mbbo,"M"){}` with a client put to any PP field (e.g. COSV) must
+    /// stay UDF=1/INVALID, not silently clear to NO_ALARM. The two real definers
+    /// are covered elsewhere — a direct VAL put clears `udf` in `dbPut`
+    /// (`field_io.rs`), and a closed-loop DOL fetch clears it at the DOL-apply
+    /// site (`processing.rs`, C `:213`). So mbbo opts out of the per-cycle clear.
+    fn clears_udf(&self) -> bool {
+        false
+    }
+
+    /// C `devMbboSoftRaw::write_mbbo` (`devMbboSoftRaw.c:40-46`):
+    /// `data = prec->rval & prec->mask; dbPutLink(&prec->out, DBR_ULONG, &data,
+    /// 1)` — the RAW word, not the state index `devMbboSoft` writes. The dset's
+    /// `init_record` built the mask: `if (nobt == 0) mask = 0xffffffff;` (which
+    /// overrides a configured MASK) then `mask <<= shft`.
+    /// C `devMbboSoftRaw.c::write_mbbo` (71-75): `data = prec->rval &
+    /// prec->mask; dbPutLink(&prec->out, DBR_ULONG, &data, 1)`. The dset's
+    /// `init_record` (62-67) is what makes MASK usable — `if (nobt == 0) mask =
+    /// 0xffffffff; mask <<= shft` — so the shifted mask is computed here rather
+    /// than written back into the MASK field (see the commit note).
+    fn raw_soft_output_value(&self) -> Option<EpicsValue> {
+        let base = if self.nobt == 0 {
+            0xffff_ffff
+        } else {
+            self.mask
+        };
+        let mask = base.checked_shl(u32::from(self.shft)).unwrap_or(0);
+        Some(EpicsValue::ULong(self.rval & mask))
     }
 
     /// `SIMM` is `DBF_MENU menu(menuSimm)` (`mbboRecord.dbd.pod:673-677`):
@@ -731,6 +445,30 @@ impl Record for MbboRecord {
             "SIMM" => Some(MENU_SIMM),
             _ => None,
         }
+    }
+
+    /// C rset `get_enum_strs`/`put_enum_str` (mbboRecord.c:330-371) — ZRST..FFST
+    /// cut at the last non-empty state.
+    fn enum_state_strings(&self) -> Option<Vec<PvString>> {
+        Some(crate::server::record::multibit_enum_states([
+            &self.zrst, &self.onst, &self.twst, &self.thst, &self.frst, &self.fvst, &self.sxst,
+            &self.svst, &self.eist, &self.nist, &self.test, &self.elst, &self.tvst, &self.ttst,
+            &self.ftst, &self.ffst,
+        ]))
+    }
+
+    /// C `get_enum_str` (mbboRecord.c:314-333): any `val <= 15` reads its state slot,
+    /// defined or not, so an unset state renders EMPTY; past 15 it is
+    /// `"Illegal Value"`. `enum_state_strings` above stops at the last
+    /// non-empty state because `no_str` says how many labels are meaningful —
+    /// that trim must never reach this read, or an undefined state comes back
+    /// as its index, which no C IOC emits.
+    fn enum_string_form(&self) -> Option<crate::server::snapshot::EnumStringForm> {
+        Some(crate::server::record::multibit_enum_string_form([
+            &self.zrst, &self.onst, &self.twst, &self.thst, &self.frst, &self.fvst, &self.sxst,
+            &self.svst, &self.eist, &self.nist, &self.test, &self.elst, &self.tvst, &self.ttst,
+            &self.ftst, &self.ffst,
+        ]))
     }
 
     // C recMbbo.c IVOA=set_to_IVOV: val = ivov; rval = ivov. IVOV is
@@ -763,30 +501,35 @@ impl Record for MbboRecord {
 
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
         if pass == 0 {
-            // C `mbboRecord.c::init_record` applies a constant DOL to VAL
-            // (the state index) once via `recGblInitConstantLink(&prec->dol,
-            // DBF_USHORT, &prec->val)`. The framework gate (`processing.rs`)
-            // excludes a constant DOL from the per-cycle closed-loop fetch
-            // (C `!dbLinkIsConstant`), so it must be seeded here — before
-            // convert() maps the state index to RVAL.
-            if let crate::server::record::ParsedLink::Constant(s) =
-                crate::server::record::parse_link_v2(&self.dol)
-            {
-                if let Ok(v) = s.trim().parse::<f64>() {
-                    self.val = v as u16;
-                }
-            }
             if self.mask == 0 && self.nobt > 0 && self.nobt <= 32 {
                 self.mask = ((1i64 << self.nobt) - 1) as u32;
             }
-            self.compute_sdef();
-            self.convert();
-            self.mlst = self.val;
-            self.lalm = self.val;
-            self.oraw = self.rval;
-            self.orbv = self.rbv;
         }
         Ok(())
+    }
+
+    /// C `mbboRecord.c:133-134`:
+    /// `if (recGblInitConstantLink(&prec->dol, DBF_USHORT, &prec->val))
+    ///      prec->udf = FALSE;`
+    /// The framework gate (`processing.rs`) excludes a constant DOL from the
+    /// per-cycle closed-loop fetch (C `!dbLinkIsConstant`), so the init-seed
+    /// owner is the only place the constant state index can reach VAL — and a
+    /// record whose VAL came from it is DEFINED.
+    fn constant_init_links(&self) -> Vec<crate::server::record::ConstantInitLink> {
+        vec![crate::server::record::ConstantInitLink::dol_to_val(
+            "DOL", "VAL",
+        )]
+    }
+
+    /// C `mbboRecord.c:176-182` — the init tail, run right after the constant
+    /// load: `convert(prec)` maps the seeded state index to RVAL, then
+    /// `mlst = lalm = val; oraw = rval; orbv = rbv`.
+    fn seed_deadband_tracking(&mut self) {
+        self.convert();
+        self.mlst = self.val;
+        self.lalm = self.val;
+        self.oraw = self.rval;
+        self.orbv = self.rbv;
     }
 
     /// C `mbboRecord.c::process` (line 217) calls `convert(prec)`
@@ -883,6 +626,17 @@ impl Record for MbboRecord {
         self.skip_convert = did;
     }
 
+    /// C `mbboRecord.c:210-213` — `else if (prec->udf) goto CONTINUE` skips the
+    /// forward `convert()` when the record is undefined and no value was sourced
+    /// this cycle. So a `caput REC.RVAL <v>` on a bare `record(mbbo,"M"){}`
+    /// (UDF=1, no VAL put, no closed-loop DOL) stores `<v>` and reads it back —
+    /// `convert` never recomputes `RVAL` from `VAL(=0)`. Opts mbbo into the
+    /// framework's undefined-skip so `process()`'s convert is suppressed for
+    /// exactly that cycle. Verified against the compiled softIoc.
+    fn skips_forward_convert_when_undefined(&self) -> bool {
+        true
+    }
+
     /// Device readback (`asyn:READBACK` / SCAN="I/O Intr" / init seed): store
     /// the raw and resolve VAL through the state table, mirroring C
     /// `processMbbo`/`initMbbo` (devAsynInt32.c:1311-1330,1296 /
@@ -906,49 +660,58 @@ impl Record for MbboRecord {
     /// `convert()` — STATE alarm from the per-state severity
     /// (ZRSV..FFSV, or UNSV for an unknown state), COS alarm (COSV),
     /// and `SOFT_ALARM/INVALID` when `VAL > 15` with a defined state
-    /// table. The framework's `rec_gbl_check_udf` raises UDF.
+    /// table.
+    ///
+    /// The UDF alarm leads. C raises it in `process()` BEFORE `checkAlarms`
+    /// (`mbboRecord.c:210-212`: `else if (prec->udf) { recGblSetSevr(prec,
+    /// UDF_ALARM, prec->udfs); goto CONTINUE; }`), and `recGblSetSevr` overrides
+    /// only on strictly greater severity (recGbl.c:242), so on a fresh record
+    /// with `UDFS == ZRSV == INVALID` the equal-severity STATE alarm cannot
+    /// displace it — STAT stays UDF. Raising it here (idempotent with the
+    /// framework's `rec_gbl_check_udf`, which runs after this hook) puts UDF
+    /// ahead of STATE. mbbo's C test is `if (prec->udf)` — truthy, not the
+    /// exact-one form bo/stringout use.
     fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
         use crate::server::recgbl::{self, alarm_status};
         use crate::server::record::AlarmSeverity;
+
+        // C `mbboRecord.c:210` — UDF (truthy) raised before STATE.
+        if recgbl::udf_alarm_active(common.udf, false) {
+            recgbl::rec_gbl_set_sevr(
+                common,
+                alarm_status::UDF_ALARM,
+                AlarmSeverity::from_u16(common.udfs as u16),
+            );
+        }
 
         // SOFT_ALARM for an illegal VAL — C convert() path.
         if self.soft_alarm {
             recgbl::rec_gbl_set_sevr(common, alarm_status::SOFT_ALARM, AlarmSeverity::Invalid);
         }
 
+        // STATE/COS use the RAW severity ordinal (ZRSV..FFSV/UNSV/COSV are
+        // DBF_MENU stored raw i16): C `recGblSetSevr(prec, STATE_ALARM,
+        // severities[val])` compares the raw `epicsEnum16`, so an out-of-range
+        // `ZRSV=4`/`65535` numerically exceeds a prior UDF's INVALID(3) and
+        // overrides it. See `rec_gbl_set_sevr_raw`.
         let val = self.val;
         let raw_sev = if val > 15 {
             self.unsv
         } else {
             self.state_severities()[val as usize]
         };
-        let sev = AlarmSeverity::from_u16(raw_sev as u16);
-        if sev != AlarmSeverity::NoAlarm {
-            recgbl::rec_gbl_set_sevr(common, alarm_status::STATE_ALARM, sev);
-        }
+        recgbl::rec_gbl_set_sevr_raw(common, alarm_status::STATE_ALARM, raw_sev as u16);
         if val != self.lalm {
-            let cos_sev = AlarmSeverity::from_u16(self.cosv as u16);
-            if cos_sev != AlarmSeverity::NoAlarm {
-                recgbl::rec_gbl_set_sevr(common, alarm_status::COS_ALARM, cos_sev);
-            }
+            recgbl::rec_gbl_set_sevr_raw(common, alarm_status::COS_ALARM, self.cosv as u16);
             self.lalm = val;
         }
-    }
-
-    /// C `mbboRecord.c::special` — recompute `sdef` after any runtime
-    /// write to a state value (ZRVL..FFVL) or state string
-    /// (ZRST..FFST) field. See `mbbi::is_state_table_field`.
-    fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
-        if after && super::mbbi::is_state_table_field(field) {
-            self.compute_sdef();
-        }
-        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::record::dbd_generated;
 
     /// Simulation block (mbboRecord.dbd.pod:663-695) must be served:
     /// SIMM/SIMS as DBR_ENUM shorts, SIML/SIOL as the in/out link strings.
@@ -986,7 +749,7 @@ mod tests {
         // All four are advertised in the field list.
         for name in ["SIMM", "SIML", "SIOL", "SIMS"] {
             assert!(
-                MBBO_FIELDS.iter().any(|f| f.name == name),
+                dbd_generated::MBBO_FIELDS.iter().any(|f| f.name == name),
                 "{name} missing from field_list"
             );
         }

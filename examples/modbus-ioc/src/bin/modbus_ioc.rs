@@ -36,14 +36,10 @@ async fn main() -> CaResult<()> {
     let trace = Arc::new(TraceManager::new());
     let handle = epics_base_rs::runtime::task::runtime_handle();
 
+    // The server port comes from `IocApplication::new()`, which resolves
+    // EPICS_CAS_SERVER_PORT / EPICS_CA_SERVER_PORT through C
+    // `envGetInetPortConfigParam` (`runtime::net::cas_server_port`).
     let mut app = IocApplication::new();
-
-    app = app.port(
-        std::env::var("EPICS_CA_SERVER_PORT")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(5064),
-    );
 
     // Universal asyn record device support.
     app = asyn_rs::adapter::register_asyn_device_support(app);

@@ -54,22 +54,53 @@ impl LinkStatusGen {
 pub const LINK_STATUS_CHOICES: &[&str] = &["Ext PV NC", "Ext PV OK", "Local PV", "Constant"];
 
 /// Link-status menu indices. Index 1 (`EXT`, external PV connected) is a
-/// valid menu value but is never *produced* by this port: epics-base-rs has
-/// no CA/PVA client to confirm a remote link is connected, so an external
-/// link always reports `EXT_NC` (see [`classify_link`]). The choice label is
-/// still served via [`LINK_STATUS_CHOICES`], so the `EXT` constant is
-/// intentionally omitted here — nothing emits it.
+/// valid menu value that this port never *produces*: epics-base-rs has no
+/// CA/PVA client to confirm a remote link is connected, so an external link
+/// always reports `EXT_NC` (see [`classify_link`]). It is still named here
+/// because a record reading the status back must treat BOTH external indices
+/// as C's `CA_LINK` (see [`link_is_external`]).
 pub const LINK_EXT_NC: i16 = 0; // external PV, not connected
+pub const LINK_EXT_OK: i16 = 1; // external PV, connected (never produced here)
 pub const LINK_LOC: i16 = 2; // local PV (this IOC's database)
 pub const LINK_CON: i16 = 3; // constant / unset link
 
-/// Sentinel for "no resolvable target field type", C `DBF_unknown` (-1).
-/// Used for every constant, external, and unresolvable link. C
-/// `init_record` further distinguishes a constant DOL (`DBF_NOACCESS`) from
-/// a constant LNK (`DBF_unknown`) (sseqRecord.c:206,225); that split is
-/// collapsed to a single unknown here because the Rust `DbFieldType` model
-/// has no `NOACCESS` variant.
+/// True iff a classified link status names an EXTERNAL PV — C's `CA_LINK`
+/// (`dbInitLink` classifies by LOCALITY: a name that is not a record of this
+/// IOC is reached over Channel Access). Both external menu indices count.
+///
+/// The classification is the caller's cached status: a record that has not
+/// been classified yet reads its default (`LINK_CON`), which is NOT external
+/// — a link is only a CA link once its status says so.
+pub fn link_is_external(status: i16) -> bool {
+    status == LINK_EXT_NC || status == LINK_EXT_OK
+}
+
+/// Sentinel for "no resolvable target field type", C `DBF_unknown` (-1): an
+/// external or unresolvable link of either direction, and a constant OUTPUT link
+/// (sseqRecord.c:225).
 pub(crate) const DBF_UNKNOWN: i16 = -1;
+
+/// C `DBF_NOACCESS` (dbFldTypes.h — dbStatic index 17), the code `init_record`
+/// stores for a constant INPUT link (sseqRecord.c:206). It is not "unknown": the
+/// constant HAS been consumed, once, by `recGblInitConstantLink` at init, and the
+/// code exists to make the per-cycle read switch fall to `default: break` so the
+/// constant is never re-read over a client's value. `DTn` is a wire-visible
+/// diagnostic field, so the code itself has to be C's — the port served -1 where
+/// C serves 17.
+pub(crate) const DBF_NOACCESS: i16 = 17;
+
+/// Which end of the record a link is attached to. C's `init_record` classifies a
+/// CONSTANT link differently by direction — an input constant is loaded and marked
+/// `DBF_NOACCESS` (sseqRecord.c:203-207), an output constant has no target at all
+/// and stays `DBF_unknown` (:224-226) — so the classifier cannot answer without
+/// being told which it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkRole {
+    /// `DOL`/`INP`: read from.
+    Input,
+    /// `LNK`/`OUT`: written to.
+    Output,
+}
 
 /// Map a resolved [`DbFieldType`] to the C `dbStatic` `dbfType` integer
 /// (dbFldTypes.h:24-43) that `DTn`/`LTn` expose — NOT the CA `DBR` wire-type
@@ -110,10 +141,24 @@ fn dbf_static_code(ft: DbFieldType) -> i16 {
 /// Returns `(status, field_type)`. An external (CA/PVA) link is reported as
 /// not-connected: epics-base-rs has no client to confirm a remote field's
 /// connection state or type.
-pub async fn classify_link(handle: &AsyncDbHandle, link: &str) -> (i16, i16) {
+/// The database this reads is always the COMPLETE one: a classification issued
+/// while records are still being created is queued by
+/// [`AsyncDbHandle::schedule_record_init`] and only polled by `iocInit`, so a
+/// forward reference — within one `.db` or across two `dbLoadRecords` calls —
+/// resolves LOCAL, exactly as C's `iocInit`-time `init_record` does. There is
+/// no gate to observe here because there is no way to run this against a
+/// half-built database.
+pub async fn classify_link(handle: &AsyncDbHandle, link: &str, role: LinkRole) -> (i16, i16) {
     match parse_link_v2(link).link_type() {
-        // Empty / constant link: C → CON, no resolvable field type.
-        LinkType::Empty | LinkType::Constant => (LINK_CON, DBF_UNKNOWN),
+        // Empty / constant link: C → CON. The field-type code is the direction's
+        // (see [`DBF_NOACCESS`]).
+        LinkType::Empty | LinkType::Constant => (
+            LINK_CON,
+            match role {
+                LinkRole::Input => DBF_NOACCESS,
+                LinkRole::Output => DBF_UNKNOWN,
+            },
+        ),
         // Local DB link: C `dbNameToAddr` ok → LOC + the addressed field's
         // type. A DB-syntax link whose target is not on this IOC resolves to
         // `None` and falls through to EXT_NC (C `init_record` else branch).
@@ -124,5 +169,45 @@ pub async fn classify_link(handle: &AsyncDbHandle, link: &str) -> (i16, i16) {
         // CA/PVA/other external link: epics-base-rs cannot introspect a
         // remote field's connection state or type — report not-connected.
         LinkType::Ca | LinkType::Other => (LINK_EXT_NC, DBF_UNKNOWN),
+    }
+}
+
+/// Choice labels for swait's PV-status menu, in index order. C
+/// `menu(swaitINAV)` (swaitRecord.dbd:18-22) — a DIFFERENT menu from
+/// [`LINK_STATUS_CHOICES`]: swait reaches all of its links through
+/// `recDynLink` (a CA-style dynamic link), so it reports connection state,
+/// never "Local PV"/"Constant". The label at index 1 reads "PV BAD" while the
+/// C code constant for the same index is `PV_NC` (swaitRecord.c:199-201).
+pub const SWAIT_PV_STATUS_CHOICES: &[&str] = &["PV OK", "PV BAD", "No PV"];
+
+/// swait PV-status menu indices (C `swaitRecord.c:199-201`).
+pub const SWAIT_PV_OK: i16 = 0;
+pub const SWAIT_PV_NC: i16 = 1;
+pub const SWAIT_NO_PV: i16 = 2;
+
+/// Classify one swait PV name (`INAN`..`INLN`, `DOLN`, `OUTN`) into its
+/// `menu(swaitINAV)` status.
+///
+/// C `swaitRecord.c::init_record` (338-373) and `::special` (507-553) drive
+/// this: a blank name is `NO_PV`, and any other name is set `PV_NC` and handed
+/// to `recDynLinkAddInput`/`AddOutput`, after which `pvSearchCallback`
+/// (900-928) flips it to `PV_OK` once the search connects and back to `PV_NC`
+/// when it does not. epics-base-rs has no CA client, so "connected" is
+/// "resolves to a field on this IOC": a DB-syntax name that addresses a local
+/// record is `PV_OK`, and every name that cannot be resolved here — an unknown
+/// record, a CA/PVA target, a bare constant that is not a PV name at all —
+/// stays at the `PV_NC` C leaves it in until a search succeeds.
+pub async fn classify_swait_pv(handle: &AsyncDbHandle, name: &str) -> i16 {
+    if name.trim().is_empty() {
+        return SWAIT_NO_PV;
+    }
+    // Same `iocInit` boundary as `classify_link`: this only ever runs against
+    // the completed database, so a forward-referenced local record is PV_OK.
+    match parse_link_v2(name).link_type() {
+        LinkType::Db => match handle.link_target_field_type(name).await {
+            Some(_) => SWAIT_PV_OK,
+            None => SWAIT_PV_NC,
+        },
+        _ => SWAIT_PV_NC,
     }
 }

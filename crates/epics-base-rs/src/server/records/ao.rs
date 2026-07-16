@@ -1,6 +1,7 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, MENU_SIMM, ProcessOutcome, Record};
-use crate::types::{DbFieldType, EpicsValue, PvString};
+use crate::server::record::{MENU_SIMM, ProcessOutcome, Record};
+use crate::server::records::convert_phase::ConvertPhase;
+use crate::types::{EpicsValue, PvString};
 
 /// Choice labels for the output-increment-format menu, in index order.
 /// C `menu(aoOIF)` (`aoRecord.dbd.pod`): 0=Full, 1=Incremental. Selects
@@ -30,8 +31,19 @@ pub struct AoRecord {
     pub egul: f64,
     pub eslo: f64, // default 1.0
     pub eoff: f64, // engineering offset (defaults to egul for LINEAR)
-    pub roff: i32,
-    pub aslo: f64, // default 1.0
+    // ROFF is DBF_ULONG (aoRecord.dbd.pod:366) — stored unsigned so the full
+    // 0..=2^32-1 range round-trips: a client caput 4294967295 reads back as
+    // that value (promoted to DBR_DOUBLE over CA) and the RVAL+ROFF convert
+    // uses C's epicsUInt32 addend. Storing it signed made a high-bit put read
+    // back negative and convert with the wrong sign.
+    pub roff: u32,
+    /// `ASLO` — raw-to-engineering slope applied ahead of ESLO. `aoRecord.dbd`
+    /// gives it NO `initial()`, so C's calloc'd record starts at 0.0 and every
+    /// use is guarded (`if (prec->aslo != 0.0) value *= prec->aslo`), i.e. 0.0
+    /// means "no ASLO scaling" — it is NOT a unit slope. (`ai` is the asymmetric
+    /// twin: `aiRecord.dbd` DOES declare `initial("1")`. Measured: a bare C
+    /// `record(ao,..)` serves ASLO=0, a bare `record(ai,..)` serves ASLO=1.)
+    pub aslo: f64,
     pub aoff: f64,
     // Output control
     pub omsl: i16,   // 0=supervisory, 1=closed_loop
@@ -49,7 +61,9 @@ pub struct AoRecord {
     pub alst: f64,
     pub mlst: f64,
     // Runtime
-    pub init: bool,
+    /// C `prec->init` — see [`ConvertPhase`]. Set by `init_record` and by an
+    /// `SPC_LINCONV` put, cleared at the end of every `process`.
+    pub init: ConvertPhase,
     /// Set by `convert()` when a `LINR >= 3` breakpoint-table conversion
     /// fails — the table could not be resolved, or the engineering value
     /// fell past an end of the table. C `aoRecord.c::convert` raises
@@ -110,7 +124,7 @@ impl Default for AoRecord {
             eslo: 1.0,
             eoff: 0.0,
             roff: 0,
-            aslo: 1.0,
+            aslo: 0.0,
             aoff: 0.0,
             omsl: 0,
             dol: String::new(),
@@ -124,7 +138,7 @@ impl Default for AoRecord {
             lalm: 0.0,
             alst: 0.0,
             mlst: 0.0,
-            init: false,
+            init: ConvertPhase::default(),
             bpt_error: false,
             readback_bpt_error: false,
             bpt_registry: None,
@@ -250,7 +264,6 @@ impl AoRecord {
         }
 
         self.oraw = self.rval;
-        self.init = true;
     }
 
     /// C `processAo` readback `raw → eng` inverse convert (devAsynInt32.c:
@@ -317,212 +330,42 @@ impl AoRecord {
     }
 }
 
-static FIELDS: &[FieldDesc] = &[
-    FieldDesc {
-        name: "VAL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "EGU",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "HOPR",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LOPR",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "PREC",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DRVH",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DRVL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "RVAL",
-        dbf_type: DbFieldType::Long,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ORAW",
-        dbf_type: DbFieldType::Long,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "RBV",
-        dbf_type: DbFieldType::Long,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "ORBV",
-        dbf_type: DbFieldType::Long,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "OVAL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LINR",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "EGUF",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "EGUL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ESLO",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "EOFF",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ROFF",
-        dbf_type: DbFieldType::Long,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ASLO",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "AOFF",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OMSL",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DOL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OIF",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OROC",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "PVAL",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "IVOA",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "IVOV",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ADEL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "MDEL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LALM",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ALST",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "MLST",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INIT",
-        dbf_type: DbFieldType::Char,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "SIMM",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIML",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIOL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIMS",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SDLY",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-];
-
-/// Try to parse a DOL string as a constant value.
-/// Returns Some(f64) if it's a number, None if it's a link (PV name).
-fn dol_as_constant(dol: &str) -> Option<f64> {
-    let s = dol.trim();
-    if s.is_empty() {
-        return None;
-    }
-    s.parse::<f64>().ok()
-}
-
 impl Record for AoRecord {
     fn record_type(&self) -> &'static str {
         "ao"
+    }
+
+    /// C `devAoSoftRaw::write_ao` (`devAoSoftRaw.c:43-50`):
+    /// `dbPutLink(&prec->out, DBR_LONG, &prec->rval, 1)` — the RAW word, not the
+    /// engineering `OVAL` that `devAoSoft` writes.
+    /// C `devAoSoftRaw.c::write_ao` (44): `dbPutLink(&prec->out, DBR_LONG,
+    /// &prec->rval, 1)` — the raw word, unmasked, as DBR_LONG.
+    fn raw_soft_output_value(&self) -> Option<EpicsValue> {
+        Some(EpicsValue::Long(self.rval))
+    }
+
+    /// C `aoRecord.c:112-113`:
+    /// `if (recGblInitConstantLink(&prec->dol, DBF_DOUBLE, &prec->val))
+    ///      prec->udf = isnan(prec->val);`
+    /// — the constant DOL both seeds VAL and DEFINES the record. Declared for
+    /// the init-seed owner, which applies the isnan rule.
+    fn constant_init_links(&self) -> Vec<crate::server::record::ConstantInitLink> {
+        vec![crate::server::record::ConstantInitLink::dol_to_val(
+            "DOL", "VAL",
+        )]
+    }
+
+    /// C `aoRecord.c:156-161` — the init tail, run right after the constant
+    /// load: `oval = pval = val; mlst = alst = lalm = val; oraw = rval;
+    /// orbv = rbv`. softIoc with `field(DOL,"5")` reports OVAL=5 at init.
+    fn seed_deadband_tracking(&mut self) {
+        self.oval = self.val;
+        self.pval = self.val;
+        self.mlst = self.val;
+        self.alst = self.val;
+        self.lalm = self.val;
+        self.oraw = self.rval;
+        self.orbv = self.rbv;
     }
 
     // C `aoRecord.c::process` IVOA=Set_output_to_IVOV (lines 207-213):
@@ -557,20 +400,8 @@ impl Record for AoRecord {
                 self.eslo = saved_eslo;
             }
 
-            // If DOL contains a constant value, use it as the initial VAL.
-            if let Some(v) = dol_as_constant(&self.dol) {
-                self.val = v;
-            }
-
-            // Initialize tracking fields from current val
-            self.oval = self.val;
-            self.pval = self.val;
-            self.mlst = self.val;
-            self.alst = self.val;
-            self.lalm = self.val;
-            self.oraw = self.rval;
-            self.orbv = self.rbv;
-            self.init = true;
+            // C `aoRecord.c:120`: `prec->init = TRUE;`
+            self.init = ConvertPhase::Initial;
         }
         Ok(())
     }
@@ -594,6 +425,9 @@ impl Record for AoRecord {
             self.convert();
         }
         self.skip_convert = false;
+        // C `aoRecord.c:237`: `prec->init = FALSE;` on the way out of EVERY
+        // process, not just the first one.
+        self.init = ConvertPhase::Converted;
         Ok(ProcessOutcome::complete())
     }
 
@@ -661,7 +495,7 @@ impl Record for AoRecord {
             "EGUL" => Some(EpicsValue::Double(self.egul)),
             "ESLO" => Some(EpicsValue::Double(self.eslo)),
             "EOFF" => Some(EpicsValue::Double(self.eoff)),
-            "ROFF" => Some(EpicsValue::Long(self.roff)),
+            "ROFF" => Some(EpicsValue::ULong(self.roff)),
             "ASLO" => Some(EpicsValue::Double(self.aslo)),
             "AOFF" => Some(EpicsValue::Double(self.aoff)),
             "OMSL" => Some(EpicsValue::Short(self.omsl)),
@@ -676,7 +510,7 @@ impl Record for AoRecord {
             "LALM" => Some(EpicsValue::Double(self.lalm)),
             "ALST" => Some(EpicsValue::Double(self.alst)),
             "MLST" => Some(EpicsValue::Double(self.mlst)),
-            "INIT" => Some(EpicsValue::Char(if self.init { 1 } else { 0 })),
+            "INIT" => Some(self.init.as_field()),
             "SIMM" => Some(EpicsValue::Short(self.simm)),
             "SIML" => Some(EpicsValue::String(self.siml.clone().into())),
             "SIOL" => Some(EpicsValue::String(self.siol.clone().into())),
@@ -755,20 +589,22 @@ impl Record for AoRecord {
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
-            // SPC_LINCONV parity (aoRecord.c:242-267): LINR / EGUF / EGUL
-            // are tagged `special(SPC_LINCONV)` in aoRecord.dbd. C path
-            // rebases `eoff = egul` when LINR=LINEAR before invoking the
-            // device-support `special_linconv` callback. Rust soft-channel
-            // ports have no such callback, so the eoff rebase is the only
-            // visible effect. ao has no smoothing, so `init` is not reset
-            // here (mirroring that aoRecord.c does set init=TRUE but never
-            // consumes it from convert()).
+            // SPC_LINCONV parity (aoRecord.c:242-267): LINR / EGUF / EGUL are
+            // tagged `special(SPC_LINCONV)` in aoRecord.dbd. C's `special()`
+            // rebases `eoff = egul` INSIDE `if ((linr == menuConvertLINEAR) &&
+            // pdset->special_linconv)` — the rebase is the device support's,
+            // and no soft dset supplies `special_linconv` (`devAoSoftRaw.c`,
+            // like `devAiSoftRaw.c:32-34`, leaves that dset slot NULL). On an
+            // ao the ungated rebase was worse than on an ai: EOFF feeds the
+            // VAL→RVAL convert, so retuning the display range EGUL moved the
+            // hardware output. See `ai.rs` for the full C excerpt.
+            // `special(SPC_LINCONV)` in aoRecord.dbd — C `special()` sets
+            // `prec->init = TRUE` for a put to any of LINR / EGUF / EGUL
+            // (aoRecord.c:254), so the retuned conversion starts fresh.
             "LINR" => match value {
                 EpicsValue::Short(v) => {
                     self.linr = v;
-                    if self.linr == 2 {
-                        self.eoff = self.egul;
-                    }
+                    self.init = ConvertPhase::Initial;
                     // A LINR change re-selects the breakpoint table (C
                     // `special_linconv`); drop the cached table + interval
                     // index so the next conversion resolves the new LINR.
@@ -781,9 +617,7 @@ impl Record for AoRecord {
             "EGUF" => match value {
                 EpicsValue::Double(v) => {
                     self.eguf = v;
-                    if self.linr == 2 {
-                        self.eoff = self.egul;
-                    }
+                    self.init = ConvertPhase::Initial;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
@@ -791,9 +625,7 @@ impl Record for AoRecord {
             "EGUL" => match value {
                 EpicsValue::Double(v) => {
                     self.egul = v;
-                    if self.linr == 2 {
-                        self.eoff = self.egul;
-                    }
+                    self.init = ConvertPhase::Initial;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
@@ -812,9 +644,16 @@ impl Record for AoRecord {
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
+            // DBF_ULONG: accept the native unsigned carrier and the legacy signed
+            // Long (bit-preserving), so a full-range caput (4294967295) stores
+            // rather than being rejected as a type mismatch.
             "ROFF" => match value {
-                EpicsValue::Long(v) => {
+                EpicsValue::ULong(v) => {
                     self.roff = v;
+                    Ok(())
+                }
+                EpicsValue::Long(v) => {
+                    self.roff = v as u32;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
@@ -949,10 +788,6 @@ impl Record for AoRecord {
         }
     }
 
-    fn field_list(&self) -> &'static [FieldDesc] {
-        FIELDS
-    }
-
     /// `SIMM` is `DBF_MENU menu(menuSimm)` and `OIF` is `menu(aoOIF)`
     /// (`aoRecord.dbd.pod`); both served as `DBR_ENUM` with the menu's
     /// choice labels in `.dbd` index order. `SIMS`/`OLDSIMM`/`OMSL`/`IVOA`/
@@ -998,27 +833,49 @@ impl Record for AoRecord {
 mod tests {
     use super::*;
 
-    /// SPC_LINCONV parity (aoRecord.c:242-267): writing LINR / EGUF / EGUL
-    /// under LINR=LINEAR (2) must rebase `eoff = egul`. Without this fix
-    /// the C path's `eoff = egul` step (which the device-support
-    /// `special_linconv` callback then refines) was silently skipped on
-    /// the Rust port, so a user retuning EGUL via CA put kept the stale
-    /// eoff and computed `RVAL = (val - stale_eoff) / eslo` — the
-    /// hardware ended up driven by a constant offset the operator never
-    /// configured.
+    /// SPC_LINCONV parity (aoRecord.c:242-267). This test previously asserted
+    /// the OPPOSITE — that an EGUL put under LINR=LINEAR rebases `eoff = egul`
+    /// — and so pinned the defect (R18-97). C's rebase lives INSIDE
+    /// `if ((linr == menuConvertLINEAR) && pdset->special_linconv)`, and the
+    /// soft dsets supply no `special_linconv` (`devAiSoftRaw.c:32-34` leaves
+    /// that dset slot NULL), so on a soft record the rebase never runs.
+    ///
+    /// Oracle (softIoc 7.0.10.1-DEV, `DTYP="Raw Soft Channel"`, LINR=LINEAR,
+    /// EOFF=0): `dbpf T:AO.EGUL 3.5` → `dbgf T:AO.EOFF` = **0**. EGUL is a
+    /// display-range field; retuning it must not move the hardware output
+    /// through `RVAL = (val - eoff) / eslo`.
     #[test]
-    fn egul_put_under_linear_rebases_eoff() {
+    fn egul_put_under_linear_does_not_rebase_eoff() {
         let mut rec = AoRecord::default();
         rec.linr = 2; // LINEAR
         rec.eoff = 1.5;
 
         rec.put_field("EGUL", EpicsValue::Double(7.25)).unwrap();
 
-        assert_eq!(rec.eoff, 7.25, "EGUL put under LINEAR must set eoff=egul");
+        assert_eq!(
+            rec.eoff, 1.5,
+            "no soft dset provides special_linconv, so C leaves EOFF alone"
+        );
+        assert_eq!(rec.egul, 7.25, "the display range itself is written");
     }
 
-    /// SLOPE mode (LINR=1) preserves user-configured eoff/eslo across EGUL
-    /// edits — the C path only rebases eoff when LINR == menuConvertLINEAR.
+    /// The same holds for the other two `special(SPC_LINCONV)` fields — the
+    /// gate is the dset, not the field.
+    #[test]
+    fn linr_and_eguf_puts_do_not_rebase_eoff() {
+        let mut rec = AoRecord::default();
+        rec.eoff = 1.5;
+        rec.egul = 7.25;
+
+        rec.put_field("LINR", EpicsValue::Short(2)).unwrap();
+        assert_eq!(rec.eoff, 1.5, "LINR put: EOFF untouched");
+
+        rec.put_field("EGUF", EpicsValue::Double(100.0)).unwrap();
+        assert_eq!(rec.eoff, 1.5, "EGUF put: EOFF untouched");
+    }
+
+    /// SLOPE mode (LINR=1) likewise leaves user-configured eoff/eslo alone —
+    /// this arm was already correct, and stays a regression guard.
     #[test]
     fn egul_put_under_slope_does_not_touch_eoff() {
         let mut rec = AoRecord::default();

@@ -1,6 +1,6 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, MENU_POST, MENU_YES_NO, ProcessOutcome, Record};
-use crate::types::{DbFieldType, EpicsValue, PvString};
+use crate::server::record::{MENU_POST, MENU_YES_NO, ProcessOutcome, Record};
+use crate::types::{EpicsValue, PvString};
 
 /// EPICS `MAX_STRING_SIZE` — `val`/`oval`/`sval` are fixed 40-byte
 /// buffers in C `stringinRecord.c`; every copy truncates at 40.
@@ -36,7 +36,14 @@ pub struct StringinRecord {
     pub mpst: i16,
     /// `menu(stringinPOST)` Post Archive Monitors (0=On Change, 1=Always).
     pub apst: i16,
+    /// C `monitor()`'s `strncmp(oval, val)` verdict for THIS cycle, captured
+    /// in `process()` before OVAL is committed — the framework reads it
+    /// afterwards, by which time `oval == val`.
+    value_changed: bool,
 }
+
+/// `menu(stringinPOST)` — `stringinRecord.dbd.pod`: 0 = On Change, 1 = Always.
+const MENU_POST_ALWAYS: i16 = 1;
 
 impl Default for StringinRecord {
     fn default() -> Self {
@@ -50,6 +57,7 @@ impl Default for StringinRecord {
             sdly: -1.0,
             mpst: 0,
             apst: 0,
+            value_changed: false,
         }
     }
 }
@@ -63,61 +71,9 @@ impl StringinRecord {
     }
 }
 
-static STRINGIN_FIELDS: &[FieldDesc] = &[
-    FieldDesc {
-        name: "VAL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OVAL",
-        dbf_type: DbFieldType::String,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "SIMM",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIML",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIOL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIMS",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SDLY",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "MPST",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "APST",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-];
-
 impl Record for StringinRecord {
     fn record_type(&self) -> &'static str {
         "stringin"
-    }
-
-    fn field_list(&self) -> &'static [FieldDesc] {
-        STRINGIN_FIELDS
     }
 
     /// `SIMM` is `DBF_MENU menu(menuYesNo)` (`stringinRecord.dbd.pod`): the
@@ -134,9 +90,60 @@ impl Record for StringinRecord {
         }
     }
 
+    /// C `stringinRecord.c::monitor` (:176-188) has no MDEL/ADEL deadband: the
+    /// VAL post is gated on `strncmp(oval, val)` plus the MPST/APST "Always"
+    /// override. Without this the record fell into the analog deadband owner,
+    /// which posts everything a `to_f64()` cannot measure — one VAL event per
+    /// subscriber per cycle on an unchanging string — and put a *numeric-looking*
+    /// string ("12") through the MDEL comparison, where C's `strncmp` sees
+    /// "12" → "12.0" as a change.
+    fn uses_monitor_deadband(&self) -> bool {
+        false
+    }
+
+    fn monitor_value_changed(&self) -> Option<bool> {
+        Some(self.value_changed)
+    }
+
+    /// C: `if (mpst == stringinPOST_Always) monitor_mask |= DBE_VALUE;`
+    /// `if (apst == stringinPOST_Always) monitor_mask |= DBE_LOG;`
+    fn monitor_always_post(&self) -> (bool, bool) {
+        (self.mpst == MENU_POST_ALWAYS, self.apst == MENU_POST_ALWAYS)
+    }
+
+    /// `stringinRecord.c::process` has NO unconditional UDF re-derive — unlike
+    /// `aiRecord.c:161` it never runs `prec->udf = isnan(prec->val)`. UDF is
+    /// cleared ONLY inside `devSiSoft.c::read_stringin` on a real read:
+    /// `if (!status && !dbLinkIsConstant(&prec->inp)) prec->udf = FALSE`
+    /// (and the SIOL simulation branch, `stringinRecord.c:209-211`). So a
+    /// process cycle that sources nothing — e.g. a `caput .UDF 1` driving a
+    /// Passive record with a constant/empty INP — must leave the client's UDF
+    /// put intact. The framework clears UDF on a genuine soft read via
+    /// `device_did_compute`; this opts out of the per-cycle blanket re-derive,
+    /// exactly like `stringout`/`lso`/`bo`/`longout`.
+    fn clears_udf(&self) -> bool {
+        false
+    }
+
+    /// `stringinRecord.c` has NO `recGblCheckUdf` / `UDF_ALARM` (unlike
+    /// `stringoutRecord.c:147`): an undefined stringin raises no alarm from UDF
+    /// (softIoc: `record(stringin,"X"){}` → UDF 1, STAT/SEVR = NO_ALARM). With
+    /// `clears_udf` false, UDF can now legitimately stay 1, so this MUST be
+    /// false or `rec_gbl_check_udf` would invent an alarm C never raises.
+    fn raises_udf_alarm(&self) -> bool {
+        false
+    }
+
     fn process(&mut self) -> CaResult<ProcessOutcome> {
-        // C `stringinRecord.c::monitor` copies VAL into OVAL.
-        self.oval = self.val.clone();
+        // C `stringinRecord.c::monitor` copies VAL into OVAL — but only on the
+        // `strncmp` mismatch that also raises DBE_VALUE|DBE_LOG. Capture the
+        // verdict here: the framework's monitor gate reads
+        // `monitor_value_changed()` after `process()` returns, by which point
+        // an unconditional copy would have erased it.
+        self.value_changed = self.oval != self.val;
+        if self.value_changed {
+            self.oval = self.val.clone();
+        }
         Ok(ProcessOutcome::complete())
     }
 

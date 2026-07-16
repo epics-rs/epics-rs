@@ -71,7 +71,8 @@ fn ca_header_write_notify() {
 fn ca_header_extended_large_payload() {
     let mut hdr = CaHeader::new(CA_PROTO_READ_NOTIFY);
     hdr.data_type = 6;
-    hdr.set_payload_size(100_000, 10_000);
+    hdr.set_payload_size(100_000, 10_000, epics_ca_rs::protocol::CA_MINOR_VERSION)
+        .expect("modern peer accepts the extended header");
     let bytes = hdr.to_bytes_extended();
     assert!(bytes.len() > 16);
     let (parsed, _consumed) = CaHeader::from_bytes_extended(&bytes).unwrap();

@@ -6,7 +6,7 @@
 
 use epics_base_rs::server::database::PvDatabase;
 
-use crate::data::chantler::{find_material, transmission};
+use crate::data::chantler::{find_material, other_absorption_length_um};
 use crate::db_access::{DbChannel, DbMultiMonitor, alloc_origin};
 
 /// Number of filter combinations per bank (4 bits = 16).
@@ -205,6 +205,26 @@ pub fn is_legal_other(name: &str) -> bool {
 /// table, mirroring `RecalcFilters` (`pf4.st:661-699`) where the three named
 /// materials use `AlAbsorptionLength`/`TiAbsorptionLength`/`GlassAbsorptionLength`
 /// and only `z==3` calls `OtherAbsorptionLength`.
+///
+/// **DEVIATION from C, deliberate — CBUG-B4.** An "Other" blade whose material
+/// name is not in the Chantler table, or whose energy is outside that material's
+/// tabulated range, has **no absorption data** — and C answers that with `0.`
+/// (`pf4.st:629-631`, `:637-639`), which reaches the divisor below as
+/// `exp(-x*1000./0.)` = `exp(-inf)` = `0.0`: the blade is reported **perfectly
+/// opaque**, which is the maximally wrong answer, delivered with no error and no
+/// alarm. Both of C's `printf` diagnostics for it are commented out in the
+/// shipped source. A mistyped material name is an ordinary operator error.
+///
+/// The port cannot compute a transmission it has no data for and does not invent
+/// one: the blade is **not modelled** (transmission `1.0`, contributing no
+/// attenuation) and the condition is logged. It is already visible to the
+/// operator too — an unknown name drives `otherLegal` false
+/// ([`is_legal_other`], published via [`Pf4Actions::write_other_legal`]), which
+/// is the field the record has for exactly this.
+///
+/// Not modelling the blade is also the safe direction of the two wrong answers:
+/// a blade believed opaque is one the ranking would happily select to attenuate,
+/// letting far more beam through than predicted.
 pub fn calc_blade_transmission(
     energy_kev: f64,
     thickness_mm: f64,
@@ -219,20 +239,25 @@ pub fn calc_blade_transmission(
         MAT_TI => ti_absorption_length_microns(energy_kev),
         MAT_GLASS => glass_absorption_length_microns(energy_kev),
         MAT_OTHER => {
-            // "Other" stays on the Chantler table. C computes
-            // exp(-t_mm*1000/absLen_microns) with absLen = 1e4/(rho*mu); that is
-            // algebraically exp(-mu*rho*t_cm), exactly what `transmission` returns
-            // for in-range energies (t_cm = t_mm * 0.1).
-            return match find_material(other_name) {
-                Some(mat) => transmission(mat, energy_kev, thickness_mm * 0.1).unwrap_or(1.0),
-                None => 1.0,
-            };
+            match find_material(other_name)
+                .and_then(|mat| other_absorption_length_um(mat, energy_kev))
+            {
+                Some(len) => len,
+                None => {
+                    tracing::error!(
+                        material = other_name,
+                        energy_kev,
+                        "pf4: no absorption data for this Other blade \
+                         (unknown material, or energy outside its Chantler table); \
+                         the blade is NOT modelled — its transmission is reported as 1.0"
+                    );
+                    return 1.0;
+                }
+            }
         }
         _ => return 1.0,
     };
-    // C: xmit *= exp(-thickness_mm*1000 / absLen_microns). A zero absLen
-    // (Glass < 2 keV) yields exp(-inf) = 0; an infinite absLen (Ti < 1 keV)
-    // yields exp(0) = 1 — both reproduce the C floating-point result.
+    // C: xmit *= exp(-thickness_mm*1000 / absLen_microns) (pf4.st:693-699).
     (-thickness_mm * 1000.0 / abs_len_microns).exp()
 }
 
@@ -871,6 +896,70 @@ mod tests {
         assert!(is_legal_other("Al"));
         assert!(!is_legal_other("Unobtainium"));
         assert!(!is_legal_other(""));
+    }
+
+    /// CBUG-B4 — an "Other" blade with an unknown material name has no
+    /// absorption data, so it is NOT MODELLED (1.0) and `otherLegal` says so.
+    ///
+    /// This test used to pin C's answer, `0.0`: C returns `0.` for the unknown
+    /// species (`pf4.st:629-631`) and then divides by it — `exp(-t*1000/0)` =
+    /// `exp(-inf)` = 0 — reporting the blade **fully opaque**, silently.
+    #[test]
+    fn test_b4_other_unknown_material_is_not_modelled() {
+        assert_eq!(
+            calc_blade_transmission(10.0, 1.0, MAT_OTHER, "Unobtainium"),
+            1.0 // C: 0.0 (fully opaque)
+        );
+        // C's strcmp is case-sensitive (pf4.st:627), so "cu" is unknown too.
+        assert_eq!(calc_blade_transmission(10.0, 1.0, MAT_OTHER, "cu"), 1.0);
+        // ... and the operator sees it: the record publishes otherLegal.
+        assert!(!is_legal_other("cu"));
+        assert!(!is_legal_other("Unobtainium"));
+    }
+
+    /// CBUG-B4 — the same for an energy outside the material's tabulated range.
+    /// This test used to pin C's `0.0` (fully opaque).
+    #[test]
+    fn test_b4_other_energy_above_the_table_is_not_modelled() {
+        // Cu's table ends at 432.95 keV; at or above the last node the scan for
+        // `keV < keV[j]` never breaks, so there is no interval and no data.
+        let cu = crate::data::chantler::find_material("Cu").unwrap();
+        let last = cu.kev[cu.kev.len() - 1] as f64;
+        assert_eq!(calc_blade_transmission(500.0, 1.0, MAT_OTHER, "Cu"), 1.0);
+        assert_eq!(calc_blade_transmission(last, 1.0, MAT_OTHER, "Cu"), 1.0);
+        // Just below the last node is inside the table (the top bin), so the
+        // blade IS modelled — the boundary is the node itself.
+        let inside = calc_blade_transmission(last - 0.001, 1.0, MAT_OTHER, "Cu");
+        assert!(inside > 0.0 && inside < 1.0);
+    }
+
+    #[test]
+    fn test_r6_63_other_zero_thickness_stays_transparent() {
+        // C guards the multiply with `if (xOther1 > 0)` (pf4.st:696), so a blade
+        // of zero thickness contributes 1.0 even with a bad material name.
+        assert_eq!(
+            calc_blade_transmission(10.0, 0.0, MAT_OTHER, "Unobtainium"),
+            1.0
+        );
+    }
+
+    /// CBUG-B1 — the "Other" blade's transmission now comes from the interval
+    /// containing the energy. This test used to pin C's backwards extrapolation:
+    /// `absLen(Cu, 10 keV) = 5.28411457133 um -> exp(-1/5.28411457133) =
+    /// 0.827582511947`. The correct absorption length is 1e4/(rho * mu) with
+    /// `mu = 215.521099278` (the value C's own `calcTrans` gives at 10 keV).
+    #[test]
+    fn test_b1_other_in_range_uses_the_containing_interval() {
+        let cu = crate::data::chantler::find_material("Cu").unwrap();
+        let abs_len_um = 1.0e4 / (cu.density * 215.521099278);
+        let want = (-1.0 / abs_len_um).exp();
+        let t = calc_blade_transmission(10.0, 0.001, MAT_OTHER, "Cu");
+        assert!(
+            (t - want).abs() < 1e-9,
+            "Cu 1um at 10 keV: t={t}, want={want}"
+        );
+        // C's answer is a different number: it read the interval ABOVE 10 keV.
+        assert!((t - 0.827582511947).abs() > 1e-3);
     }
 
     #[test]

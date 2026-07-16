@@ -1,86 +1,139 @@
-use chrono::{DateTime, Local};
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches, Parser};
 use epics_base_rs::server::snapshot::{DbrClass, Snapshot};
-use epics_base_rs::types::WallTime;
-use epics_ca_rs::CaError;
-use epics_ca_rs::cli::{PV_NAME_WIDTH, ValueFormat, format_value};
+use epics_ca_rs::cli::{
+    CountPrefix, PV_NAME_WIDTH, ValueFormat, ca_error_marker, format_time, format_value,
+    format_value_segment, sevr_to_str, stat_to_str, zero_dbr_snapshot, zero_dbr_value,
+};
 use epics_ca_rs::client::{CaChannel, CaClient, enum_string_readback_dbr};
+use epics_ca_rs::copt::{self, CTool};
+use epics_ca_rs::{CaError, DbFieldType, EpicsValue};
 use std::time::SystemTime;
 
-fn format_server_timestamp(ts: WallTime) -> String {
-    // Display only, to microseconds (`%.6f`), so converting through
-    // `SystemTime` (100 ns-granular on Windows) loses nothing visible.
-    let dt: DateTime<Local> = SystemTime::from(ts).into();
-    dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string()
-}
-
-fn sevr_to_str(sevr: u16) -> &'static str {
-    match sevr {
-        0 => "NO_ALARM",
-        1 => "MINOR",
-        2 => "MAJOR",
-        3 => "INVALID",
-        _ => "Illegal value",
-    }
-}
-
-fn stat_to_str(stat: u16) -> &'static str {
-    match stat {
-        0 => "NO_ALARM",
-        1 => "READ",
-        2 => "WRITE",
-        3 => "HIHI",
-        4 => "HIGH",
-        5 => "LOLO",
-        6 => "LOW",
-        7 => "STATE",
-        8 => "COS",
-        9 => "COMM",
-        10 => "TIMEOUT",
-        11 => "HW_LIMIT",
-        12 => "CALC",
-        13 => "SCAN",
-        14 => "LINK",
-        15 => "SOFT",
-        16 => "BAD_SUB",
-        17 => "UDF",
-        18 => "DISABLE",
-        19 => "SIMM",
-        20 => "READ_ACCESS",
-        21 => "WRITE_ACCESS",
-        _ => "Illegal value",
-    }
-}
-
-/// Print one `Old : ...` / `New : ...` line in long-mode shape:
-///   `<prefix>{name-padded}<sep><ts>{sep}<value>{sep}{stat?}{sep}{sevr?}`
+/// One `Old : ...` / `New : ...` line in long-mode shape:
+///   `{name-padded}<sep><ts>{sep}<value>{sep}{stat?}{sep}{sevr?}`
 /// Mirrors `tool_lib.c::print_time_val_sts` — when alarm is
 /// (NO_ALARM, NO_ALARM) the trailing two fields are emitted empty.
-fn print_long_line(prefix: &str, name_col: &str, sep: char, snap: &Snapshot, fmt: &ValueFormat) {
+fn long_line(name_col: &str, sep: char, snap: &Snapshot, fmt: &ValueFormat) -> String {
     let enum_strings = snap.enums.as_ref().map(|e| e.strings.as_slice());
-    // caput has no `-#` element-count flag, so req_elems is always false:
-    // an array count prefix is emitted only when the array length itself
-    // exceeds 1 (matches C `caget.c` / `tool_lib.c` PRN_TIME_VAL_STS gating).
-    let val = format_value(&snap.value, fmt, enum_strings, false);
-    let ts = format_server_timestamp(snap.timestamp);
+    // C `caput.c:535,583` calls its `caget()` with `reqElems = 0`, so the
+    // count prefix reduces to `nElems > 1` and the `-S` long-string gate to
+    // `reqElems(0) || reqElems_pv > 1`. C's readback call is literally
+    // `caget(pvs, nPvs, format, 0, 0)` (`caput.c:537`) — `reqElems` is a
+    // hardcoded 0 — which is why `caput` never sets `ValueFormat::req_elems`
+    // even though `-#` is accepted on the command line (its value is
+    // overwritten before the put, `caput.c:418,441`).
+    // The separator before the value is C's per-item PREFIX
+    // (`tool_lib.c:481-489`), not a suffix of the timestamp.
+    let val = format_value_segment(
+        &snap.value,
+        fmt,
+        enum_strings,
+        CountPrefix::IfRequestedOrArray,
+    );
+    let ts = format_time(snap.timestamp);
     let stat = snap.alarm.status;
     let sevr = snap.alarm.severity;
     if stat == 0 && sevr == 0 {
-        println!("{prefix}{name_col}{sep}{ts}{sep}{val}{sep}{sep}");
+        format!("{name_col}{sep}{ts}{val}{sep}{sep}")
     } else {
-        println!(
-            "{prefix}{name_col}{sep}{ts}{sep}{val}{sep}{stat_str}{sep}{sevr_str}",
+        format!(
+            "{name_col}{sep}{ts}{val}{sep}{stat_str}{sep}{sevr_str}",
             stat_str = stat_to_str(stat),
             sevr_str = sevr_to_str(sevr),
-        );
+        )
     }
 }
 
-const VERSION_INFO: &str = concat!(
-    "\nEPICS Version epics-rs ",
-    env!("CARGO_PKG_VERSION"),
-    ", CA Protocol version 4.13"
-);
+/// C `print_time_val_sts` stamps its error lines with the CLIENT's current
+/// time (`epicsTimeGetCurrent`, `tool_lib.c:514-515`), not a server timestamp
+/// — a failed read carries no server response to take one from.
+fn format_client_timestamp() -> String {
+    format_time(SystemTime::now().into())
+}
+
+/// The SINGLE owner of what a `caput` readback may write to STDERR.
+///
+/// C's `caget()` (`caput.c:130-240`) has exactly ONE `fprintf(stderr, ...)`:
+/// the `ca_pend_io` timeout warning (`caput.c:186-188`). Every other outcome
+/// is silent on stderr —
+///
+/// * a CA error or read denial renders its `*** ...` marker on STDOUT inside
+///   the print loop (`caput.c:200-206`) and `caget()` still returns 0;
+/// * `!nConn` returns 1 from `caput.c:181` BEFORE the print loop, so C emits
+///   nothing on EITHER stream for that PV.
+///
+/// Routing both readback sites through one exhaustive match is what keeps a
+/// caller from inventing a diagnostic C never prints: `caput-rs` used to
+/// `eprintln!("error: {e}")` on the `New :` disconnect path, which has no C
+/// counterpart (the exit code already matched).
+fn readback_stderr(rb: &Readback) -> Option<&'static str> {
+    match rb {
+        Readback::TimedOut(..) => Some("Read operation timed out: PV data was not read."),
+        Readback::Value(..) | Readback::Disconnected | Readback::Other(_) => None,
+    }
+}
+
+/// What C's `caget()` (`caput.c:130-240`) prints on STDOUT for one readback,
+/// WITHOUT the `Old : ` / `New : ` prefix its caller already emitted.
+///
+/// `None` means C returned from `if (!nConn) return 1` (`caput.c:181`) BEFORE
+/// reaching its print loop — it printed nothing at all, not even a newline,
+/// leaving the bare prefix on stdout.
+///
+/// Whether that non-zero return MATTERS is the caller's business, and the two
+/// call sites differ: the `Old :` read's return is DISCARDED (`caput.c:535`)
+/// so the put runs regardless, while the `New :` read's return IS caput's
+/// exit status (`caput.c:583,589`).
+fn readback_line(
+    rb: &Readback,
+    name_col: &str,
+    sep: char,
+    fmt: &ValueFormat,
+    terse: bool,
+    long_mode: bool,
+) -> Option<String> {
+    match rb {
+        // C treats a timed-out read exactly like a successful one here: the
+        // zeroed buffer is still a buffer (see `zero_readback`).
+        Readback::Value(v, snap) | Readback::TimedOut(v, snap) => {
+            let rendered = format_value(v, fmt, None, CountPrefix::IfRequestedOrArray);
+            if terse {
+                return Some(rendered);
+            }
+            Some(match (long_mode, snap) {
+                (true, Some(s)) => long_line(name_col, sep, s, fmt),
+                (true, None) => format!("{name_col}{sep}*{sep}{rendered}{sep}{sep}"),
+                (false, _) => format!("{name_col}{sep}{rendered}"),
+            })
+        }
+        Readback::Disconnected => None,
+        Readback::Other(e) => {
+            let marker = ca_error_marker(e.to_eca_status());
+            Some(if terse {
+                marker
+            } else if long_mode {
+                format!(
+                    "{name_col}{sep}{ts} {marker}",
+                    ts = format_client_timestamp()
+                )
+            } else {
+                format!("{name_col}{sep}{marker}")
+            })
+        }
+    }
+}
+
+/// Owner of every C-scanned option argument in this binary (see
+/// [`epics_ca_rs::copt`]).
+const TOOL: CTool = CTool::new("caput");
+
+/// The getopt cases that `return` from C's `main` (`caput.c:291-297`), by clap
+/// id. `copt::Scan::finish` performs the FIRST one on the command line, after
+/// replaying the warnings the loop raised on its way there (R13-26).
+const TERMINALS: &[(&str, copt::Terminal)] = &[
+    ("help", copt::Terminal::Usage(0)),
+    ("version", copt::Terminal::Version),
+];
 
 /// Mirror of C `caput` flag set.
 ///
@@ -95,67 +148,114 @@ const VERSION_INFO: &str = concat!(
 #[command(
     name = "caput-rs",
     about = "Write a value to an EPICS PV",
-    disable_version_flag = true
+    disable_version_flag = true,
+    disable_help_flag = true
 )]
 struct Args {
-    #[arg(short = 'V', long, hide = true)]
-    version: bool,
+    // `-h` / `-V` are ordinary options, performed by `copt::Scan::finish` at
+    // their place in the getopt order so the warnings C prints before them
+    // survive (R13-26).
+    //
+    // Every option below is `Append` (value option) or `Count` (flag): C's
+    // getopt loop accepts every option any number of times, last one winning
+    // (R13-17, see `epics_ca_rs::copt`).
+    //
+    // Doc comments on these fields are the option's HELP TEXT, so the rationale
+    // above stays a plain comment.
+    /// Print this message
+    #[arg(short = 'h', long, action = clap::ArgAction::Count)]
+    help: u8,
 
-    /// CA timeout in seconds. Mirrors C `tool_lib.c:use_ca_timeout_env`.
-    #[arg(short = 'w', long = "timeout")]
-    timeout: Option<f64>,
+    #[arg(short = 'V', long, hide = true, action = clap::ArgAction::Count)]
+    version: u8,
+
+    /// CA timeout in seconds (`epicsScanDouble`; a bad value warns and keeps
+    /// the default — `caput.c:323-332`). Raw `String`: every C-scanned option
+    /// argument is resolved by [`epics_ca_rs::copt`], never by clap.
+    #[arg(short = 'w', long = "timeout", allow_hyphen_values = true, action = clap::ArgAction::Append)]
+    timeout: Vec<String>,
 
     /// Wait for completion callback (`ca_put_callback`).
-    #[arg(short = 'c', long = "callback")]
-    callback: bool,
+    #[arg(short = 'c', long = "callback", action = clap::ArgAction::Count)]
+    callback: u8,
 
-    /// CA priority (0-99). Opens the channel on the matching priority
-    /// virtual circuit (libca `ca_create_channel` priority parameter).
-    #[arg(short = 'p', long)]
-    priority: Option<u8>,
+    /// CA priority (`sscanf("%u")`, clamped to `CA_PRIORITY_MAX`; `-p -1`
+    /// and `-p 500` both clamp to 99 in C, `caput.c:344-351`).
+    #[arg(short = 'p', long, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+    priority: Vec<String>,
 
     /// Terse output: print only the new value (no `Old :`/`New :`
     /// prefix, no PV name).
-    #[arg(short = 't', long)]
-    terse: bool,
+    #[arg(short = 't', long, action = clap::ArgAction::Count)]
+    terse: u8,
 
     /// Long mode: post-write read prints `name timestamp value stat
     /// sevr` like `caget -a`.
-    #[arg(short = 'l', long = "long")]
-    long_mode: bool,
+    #[arg(short = 'l', long = "long", action = clap::ArgAction::Count)]
+    long_mode: u8,
 
     /// Force interpretation of values as numbers (overrides ENUM
     /// auto-string-resolution). C `caput.c:298-305` makes `-n` and `-s`
     /// a mutually-exclusive pair where the LAST one given wins (each case
-    /// sets its flag and clears the other), with no conflict error —
-    /// `overrides_with` reproduces that last-wins semantics.
-    #[arg(short = 'n', long = "num-enum", overrides_with = "force_string")]
-    force_numeric: bool,
+    /// sets its flag and clears the other), with no conflict error. Both are
+    /// `Count` (R13-17: every C option repeats), so the pairing is resolved
+    /// from the command-line indices by [`last_of_pair`] — clap's
+    /// `overrides_with` cannot express it once a repeat is legal.
+    #[arg(short = 'n', long = "num-enum", action = clap::ArgAction::Count)]
+    force_numeric: u8,
 
     /// Force interpretation of values as strings (overrides numeric
     /// parse for ENUM). Paired with `-n` (last one wins, caput.c:302-305).
-    #[arg(short = 's', long = "string-enum", overrides_with = "force_numeric")]
-    force_string: bool,
+    #[arg(short = 's', long = "string-enum", action = clap::ArgAction::Count)]
+    force_string: u8,
 
     /// Put long string as an array of chars (long-string convention).
     /// C `caput.c:306-319` makes `-S` and `-a` a mutually-exclusive pair
-    /// where the LAST one given wins (each clears the other) — modelled
-    /// with `overrides_with` so the two flags can never both be set.
-    #[arg(short = 'S', long = "long-string", overrides_with = "array_mode")]
-    long_string: bool,
+    /// where the LAST one given wins (each clears the other), resolved by
+    /// [`last_of_pair`] for the same reason as `-n`/`-s`.
+    #[arg(short = 'S', long = "long-string", action = clap::ArgAction::Count)]
+    long_string: u8,
 
     /// Put as array. The remaining positionals are
     /// `<count> <v0> <v1> ...`. Paired with `-S` (last one wins,
     /// caput.c:316-319).
-    #[arg(short = 'a', long = "array", overrides_with = "long_string")]
-    array_mode: bool,
+    #[arg(short = 'a', long = "array", action = clap::ArgAction::Count)]
+    array_mode: u8,
 
-    /// Alternate output field separator.
-    #[arg(short = 'F', long = "field-separator", value_name = "OFS")]
-    field_separator: Option<char>,
+    /// Vestigial array element count. C's getopt string accepts `-# <n>`
+    /// (`caput.c:290`, `":cnlhatsVS#:w:p:F:"`) and scans it into `count`
+    /// (`:336-343`), but `count` is OVERWRITTEN unconditionally before the
+    /// put — with `argc - optind` in `-a` array mode (`:418`) and with `1` in
+    /// scalar mode (`:441`) — so the value never reaches the wire, the
+    /// readback element count, or the output. Accepted here for the same
+    /// reason C accepts it: `caput -# 3 PV 1` must not fail, and clap
+    /// otherwise exits 2 on the unknown flag.
+    ///
+    /// Held as a raw `String` so a non-numeric argument reproduces C's
+    /// `sscanf`-failure warning ([`Args::warn_bad_element_count`]) instead of
+    /// clap's own parse error.
+    #[arg(
+        short = '#',
+        long = "max-elements",
+        value_name = "COUNT",
+        allow_hyphen_values = true,
+        action = clap::ArgAction::Append
+    )]
+    max_elements: Vec<String>,
 
-    /// Positional PV name.
-    #[arg(required_unless_present_any = ["version"])]
+    /// Alternate output field separator: C takes `(char) *optarg`, the FIRST
+    /// character, discarding the rest (`caput.c:353`).
+    #[arg(
+        short = 'F',
+        long = "field-separator",
+        value_name = "OFS",
+        allow_hyphen_values = true,
+        action = clap::ArgAction::Append
+    )]
+    field_separator: Vec<String>,
+
+    /// Positional PV name. NOT clap-`required` — see `caget-rs`; C checks
+    /// `nPvs < 1` after the getopt loop (`caput.c:457-461`).
     pv_name: Option<String>,
 
     /// Positional values. In `-a` mode the first element is the
@@ -165,14 +265,69 @@ struct Args {
     values: Vec<String>,
 }
 
+impl Args {
+    /// C `caput.c:336-343`: `-#` scans its argument with `sscanf("%d")` and,
+    /// on failure, warns and falls back to `count = 0`. The count is dead
+    /// either way (see [`Args::max_elements`]), so the warning is the flag's
+    /// ONLY observable effect — but it is raised by the SAME owner every
+    /// other C-scanned option uses ([`copt::Scan::req_elems_int`]), so `caput`
+    /// cannot drift from `caget` on what "not a valid array element count"
+    /// means, nor on WHERE the warning lands in the getopt order. The returned
+    /// count is deliberately discarded.
+    fn scan_dead_element_count(scan: &mut copt::Scan) {
+        let _ = scan.req_elems_int("max_elements");
+    }
+}
+
+/// C `caput.c:298-319`: `-n`/`-s` and `-S`/`-a` are pairs where each case
+/// SETS its own flag and CLEARS its partner, so the LAST occurrence of either
+/// member decides — and neither can be on when the other is. Both members
+/// repeat (R13-17), and clap records the index of each flag's last
+/// occurrence, which is exactly what "last of the pair wins" needs.
+///
+/// Returns `(this_wins, that_wins)`; both `false` when neither was given.
+///
+/// `get_count` is the gate, not `indices_of`: clap hands an ABSENT `Count`
+/// flag its `0` default and still reports an index for it, so an
+/// `indices_of`-only test reads every unused flag as present.
+fn last_of_pair(matches: &clap::ArgMatches, this_id: &str, that_id: &str) -> (bool, bool) {
+    let last = |id: &str| {
+        (matches.get_count(id) > 0)
+            .then(|| matches.indices_of(id).and_then(|mut i| i.next_back()))
+            .flatten()
+    };
+    match (last(this_id), last(that_id)) {
+        (None, None) => (false, false),
+        (Some(_), None) => (true, false),
+        (None, Some(_)) => (false, true),
+        (Some(a), Some(b)) => (a > b, b > a),
+    }
+}
+
 #[tokio::main]
 async fn main() {
-    let args = Args::parse();
+    let cmd = Args::command();
+    let parsed = TOOL.get_matches(cmd.clone());
+    let matches = parsed.matches();
+    let args = Args::from_arg_matches(matches).expect("clap validated the arguments");
 
-    if args.version {
-        println!("{VERSION_INFO}");
-        return;
-    }
+    // The two mutually-clearing pairs, resolved in command-line order.
+    let (force_numeric, force_string) = last_of_pair(matches, "force_numeric", "force_string");
+    let (long_string, array_mode) = last_of_pair(matches, "long_string", "array_mode");
+    let terse = args.terse > 0;
+    let callback = args.callback > 0;
+
+    // C's ENTIRE getopt loop runs before the `nPvs < 1` / `nPvs < 2` checks
+    // (`caput.c:290-455`, then `:457`), so every option argument is scanned —
+    // and every warning raised — even when no PV name or value follows.
+    let mut scan = parsed.scan();
+    Args::scan_dead_element_count(&mut scan);
+    let ca_timeout = scan.timeout("timeout", epics_ca_rs::cli::env_default_timeout());
+    let priority = scan.priority("priority");
+    let field_separator = scan.field_separator("field_separator");
+    // End of C's getopt loop: warnings out in command-line order, then `-h` /
+    // `-V` if the loop reached one (R13-26).
+    scan.finish(&cmd, &epics_ca_rs::protocol::version_info(), TERMINALS);
 
     // -n / -s steer ENUM scalar handling below (force_numeric =
     // interpret as index; force_string = always send DBR_STRING for
@@ -180,25 +335,30 @@ async fn main() {
     // no effect — matching C `caput`, where enumAsNr / enumAsString
     // only gate the DBR_ENUM branch.
 
-    let pv_name = args.pv_name.expect("clap enforces required");
+    // C `caput.c:457-465`: PV name first, then value — both are post-getopt
+    // checks with C's own one-line diagnostic and status 1.
+    let Some(pv_name) = args.pv_name else {
+        TOOL.no_pv_name();
+    };
 
     if args.values.is_empty() {
-        eprintln!("caput-rs: missing value");
-        std::process::exit(1);
+        TOOL.no_value();
     }
 
     let client = CaClient::new().await.expect("failed to create CA client");
-    let timeout = epics_ca_rs::cli::timeout_duration(
-        args.timeout
-            .unwrap_or_else(epics_ca_rs::cli::env_default_timeout),
-    );
-
-    // -p selects the priority virtual circuit.
-    let ch = client.create_channel_with_priority(&pv_name, args.priority.unwrap_or(0));
-    if let Err(e) = ch.wait_connected(timeout).await {
-        eprintln!("error: {e}");
-        std::process::exit(1);
-    }
+    let timeout = epics_ca_rs::cli::timeout_duration(ca_timeout);
+    // -p selects the priority virtual circuit. C `caput.c:406-410` runs the
+    // same `connect_pvs` barrier as caget/cainfo ("If the connection fails,
+    // we're done"): its ECA_TIMEOUT diagnostic names the single PV, and the
+    // put phase never starts.
+    let names = [pv_name.clone()];
+    let ch = match epics_ca_rs::cli::connect_pvs(&client, &names, priority, timeout).await {
+        Ok(mut channels) => channels.remove(0),
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
 
     // The channel's native field type drives how the value to WRITE is
     // encoded (C `ca_field_type`, caput.c:143) — it must stay the real
@@ -234,13 +394,13 @@ async fn main() {
     // requested in the STRING form for an ENUM field unless `-n`, so the
     // echoed value is the state label, not the index. `-l` keeps the
     // TIME-class string so the timestamp + alarm line is still populated.
-    let enum_dbr = enum_string_readback_dbr(native_type, args.long_mode, !args.force_numeric);
+    let enum_dbr = enum_string_readback_dbr(native_type, args.long_mode > 0, !force_numeric);
 
     // Read the pre-put value for the `Old :` display. Long mode also
     // wants the server timestamp + alarm pair captured BEFORE the put so
     // the `Old :` line reflects the actual pre-put state — the regular
     // path stays on the cheaper plain GET.
-    let long_mode = args.long_mode;
+    let long_mode = args.long_mode > 0;
     let read_display = move |ch: CaChannel| async move {
         match (long_mode, enum_dbr) {
             // Long mode + ENUM default: DBR_TIME_STRING (label + ts/alarm).
@@ -259,39 +419,71 @@ async fn main() {
             (false, None) => ch.get_with_timeout(timeout).await.map(|(_t, v)| (v, None)),
         }
     };
-    // C caput.c:532-535 gates the pre-put "Old :" read+print on
+    // The readback's element count: C sets `reqElems = nElems =
+    // ca_element_count(chid)` (`caput.c:142,154-155`) and hands that count to
+    // the zeroed buffer it prints on a read timeout.
+    let read_elems = ch.element_count().unwrap_or(1);
+    // An ENUM read back in its label form is a DBR_STRING readback, so its
+    // zeroed buffer is an empty string, not a 0 index.
+    let read_as_string = enum_dbr.is_some();
+
+    // The readback display format. C's `charArrAsStr` (`-S`) is read by BOTH
+    // the write-value builder (`caput.c:514`, DBR_CHAR) and the readback print
+    // loop (`caput.c:211-222`), which escapes a CHAR-array readback back into
+    // its long-string form — so `-S` must reach the `Old :`/`New :` rendering,
+    // not just the wire value. `format_value` owns C's gate
+    // (`charArrAsStr && dbr_type_is_CHAR && (reqElems || nElems > 1)`).
+    let mut fmt = ValueFormat {
+        char_array_as_string: long_string,
+        ..ValueFormat::default()
+    };
+    if let Some(c) = field_separator {
+        fmt.field_separator = c;
+    }
+    let sep = fmt.field_separator;
+    // C pads the PV-name column on the READ element count (`pvs[n].reqElems <=
+    // 1 && fieldSeparator == ' '`, caput.c:196-198), which caput knows before
+    // the put — it never depends on the value that comes back.
+    let name_col = if read_elems <= 1 && sep == ' ' {
+        format!("{pv_name:<width$}", width = PV_NAME_WIDTH)
+    } else {
+        pv_name.clone()
+    };
+
+    // C caput.c:531-535 gates the pre-put "Old :" read+print on
     // `if (format != terse)`. Terse mode prints only the new value, so the
     // pre-put GET must NOT be issued: C never issues it, and a PV that is slow
     // to read, read-denied before a write-side access transition, or backed by
     // an expensive/side-effecting read path must still proceed to the write.
     // The post-put read below is kept in every mode (C still calls caget()
     // after the put, caput.c:583; terse only suppresses the `New :` label).
-    let (old_value, old_snap) = if args.terse {
-        (None, None)
-    } else {
-        match read_display(ch.clone()).await {
-            Ok((v, s)) => (Some(v), s),
-            Err(CaError::Timeout) => {
-                eprintln!("Read operation timed out: PV data was not read.");
-                std::process::exit(1);
-            }
-            Err(e) => {
-                eprintln!("error: {e}");
-                std::process::exit(1);
-            }
-        }
-    };
-
-    // build the value to write in C's precedence order — `-S`
-    // (long string) resolved before any native-type parse. See
-    // `build_write_value`.
+    //
+    // The read's RETURN VALUE IS DISCARDED (`result` is overwritten by the put
+    // at caput.c:539-548), so NOTHING about this read can abort caput: a
+    // read-denied but writable PV prints `*** no read access` here and still
+    // gets its put, and a PV that dropped since the connect barrier prints
+    // nothing at all (C returns from `!nConn` before its print loop) and lets
+    // the PUT report the disconnect.
+    // Build (and VALIDATE) the value to write BEFORE the `Old :` read+print.
+    // C's order is not incidental: the enum/number parse sits at
+    // `caput.c:466-530` and every failure in it `return 1`s on the spot, so
+    // the `Old : ` block at `:531-535` is never reached (R13-22):
+    //
+    //     caput TST:MBBO Bogus
+    //       C:  Enum string value 'Bogus' invalid.                    (exit 1)
+    //       RS: Old : TST:MBBO   Zero
+    //           Enum string value 'Bogus' invalid.                    (exit 1)
+    //
+    // A rejected put must not leave a readback line on stdout. Value
+    // precedence inside the build is C's own — `-S` (long string) resolved
+    // before any native-type parse; see `build_write_value`.
     let parsed_value = match build_write_value(
         &args.values,
         native_type,
-        args.force_numeric,
-        args.force_string,
-        args.long_string,
-        args.array_mode,
+        force_numeric,
+        force_string,
+        long_string,
+        array_mode,
         &enum_menu,
     ) {
         Ok(v) => v,
@@ -301,12 +493,38 @@ async fn main() {
         }
     };
 
+    if !terse {
+        print!("Old : ");
+        let rb = classify_readback(
+            read_display(ch.clone()).await,
+            native_type,
+            read_as_string,
+            read_elems,
+            long_mode,
+        );
+        // C's `caget()` emits its stderr warning (if any) BEFORE the print
+        // loop (`caput.c:186-188` then `:191`). `readback_stderr` is the only
+        // source of it.
+        if let Some(warning) = readback_stderr(&rb) {
+            eprintln!("{warning}");
+        }
+        match readback_line(&rb, &name_col, sep, &fmt, false, long_mode) {
+            Some(line) => println!("{line}"),
+            // C printed the `Old : ` prefix and nothing else — not even a
+            // newline. Flush it so the put's stderr diagnostic does not race a
+            // buffered partial line.
+            None => {
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+            }
+        }
+    }
+
     let result = match &parsed_value {
         WriteValue::Wire { dbr_type, value } => {
             // C-tool wire model: send the explicit DBR type (DBR_STRING /
             // DBR_CHAR) and let the server convert. The CLI `-w` timeout
             // owns the callback wait, matching caput.c:556-567.
-            if args.callback {
+            if callback {
                 ch.put_as_dbr_with_timeout(*dbr_type, value, timeout).await
             } else {
                 ch.put_as_dbr_nowait(*dbr_type, value).await
@@ -321,7 +539,7 @@ async fn main() {
             // default which dropped `-w`.
             let v = epics_ca_rs::EpicsValue::String(s.clone());
             let dbr = epics_ca_rs::DbFieldType::String as u16;
-            if args.callback {
+            if callback {
                 ch.put_as_dbr_with_timeout(dbr, &v, timeout).await
             } else {
                 ch.put_as_dbr_nowait(dbr, &v).await
@@ -332,7 +550,7 @@ async fn main() {
             // each element. Same single timeout owner as above.
             let arr = epics_ca_rs::EpicsValue::StringArray(v.clone());
             let dbr = epics_ca_rs::DbFieldType::String as u16;
-            if args.callback {
+            if callback {
                 ch.put_as_dbr_with_timeout(dbr, &arr, timeout).await
             } else {
                 ch.put_as_dbr_nowait(dbr, &arr).await
@@ -347,77 +565,36 @@ async fn main() {
     // Re-read for echoing to stdout (matches C caput which always reads the PV
     // back after the put, caput.c:583). Same readback type selection as the
     // `Old :` read above, so an ENUM `New :` value also echoes as the state
-    // label. C returns this readback's status as caput's exit status
-    // (caput.c:589): a read TIMEOUT or a total DISCONNECT must fail the command
-    // (see `postput_read_fatal`), so we exit non-zero before printing rather
-    // than hiding the failure behind the submitted value. Other readback errors
-    // (e.g. read-access denied, which C exits 0 on) fall back to echoing the
-    // submitted value and exit 0, matching C's exit code.
-    let echo_fallback = parsed_value.echo_fallback();
-    let (new_value, new_snap) = match read_display(ch.clone()).await {
-        Ok(pair) => pair,
-        Err(e) => match postput_read_fatal(&e) {
-            Some(FatalReadback::Timeout) => {
-                eprintln!("Read operation timed out: PV data was not read.");
-                std::process::exit(1);
-            }
-            Some(FatalReadback::Disconnect) => {
-                eprintln!("error: {e}");
-                std::process::exit(1);
-            }
-            None => (echo_fallback.clone(), None),
-        },
-    };
-
-    let mut fmt = ValueFormat::default();
-    if let Some(c) = args.field_separator {
-        fmt.field_separator = c;
+    // label. C returns THIS readback's status as caput's exit status
+    // (caput.c:583,589), and inside `caget()` only `!nConn` yields a non-zero
+    // return (`caput.c:181`) — see [`Readback`]. A read TIMEOUT does NOT:
+    // C prints `New : <name> <zeroed value>` and exits 0.
+    if !terse {
+        // C `caput -t` suppresses the label, not the read (caput.c:580-583).
+        print!("New : ");
     }
-    let sep = fmt.field_separator;
-    // In terse mode `old_value` is `None` (no pre-put read was issued) and the
-    // rendered old value is unused; non-terse modes always carry `Some`.
-    let old_rendered = old_value
-        .as_ref()
-        .map(|v| format_value(v, &fmt, None, false))
-        .unwrap_or_default();
-    let new_rendered = format_value(&new_value, &fmt, None, false);
-    let is_scalar = new_value.count() == 1;
-    let pad = |name: &str| -> String {
-        if is_scalar && sep == ' ' {
-            format!("{name:<width$}", width = PV_NAME_WIDTH)
-        } else {
-            name.to_string()
+    let rb = classify_readback(
+        read_display(ch.clone()).await,
+        native_type,
+        read_as_string,
+        read_elems,
+        long_mode,
+    );
+    if let Some(warning) = readback_stderr(&rb) {
+        eprintln!("{warning}");
+    }
+    match readback_line(&rb, &name_col, sep, &fmt, terse, long_mode) {
+        Some(line) => println!("{line}"),
+        // `!nConn`: C's `caget()` returns 1 from `caput.c:181` BEFORE its
+        // print loop, so it emits NOTHING for this PV — no stdout line (not
+        // even a newline after the `New : ` prefix) and no stderr
+        // diagnostic. That return value IS caput's exit status
+        // (`caput.c:583,589`). Flush so the bare prefix reaches stdout
+        // before the process exits.
+        None => {
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+            std::process::exit(1);
         }
-    };
-
-    if args.terse {
-        // C `caput -t`: only the new value (no name, no Old/New).
-        println!("{new_rendered}");
-    } else if args.long_mode {
-        // C `caput -l`: same shape as `caget -a` for both lines, using
-        // the DBR_TIME snapshots captured around the put.
-        let name_col = pad(&pv_name);
-        match &old_snap {
-            Some(s) => print_long_line("Old : ", &name_col, sep, s, &fmt),
-            None => println!("Old : {name_col}{sep}*{sep}{old_rendered}{sep}{sep}"),
-        }
-        match &new_snap {
-            Some(s) => print_long_line("New : ", &name_col, sep, s, &fmt),
-            None => println!("New : {name_col}{sep}*{sep}{new_rendered}{sep}{sep}"),
-        }
-    } else {
-        // Default: `Old : <name-padded><sep><value>` and likewise for
-        // New. Mirrors C `caput.c::main` post-put echo.
-        println!(
-            "Old : {name}{sep}{val}",
-            name = pad(&pv_name),
-            val = old_rendered
-        );
-        println!(
-            "New : {name}{sep}{val}",
-            name = pad(&pv_name),
-            val = new_rendered
-        );
     }
 }
 
@@ -447,48 +624,74 @@ enum WriteValue {
     EnumStringArray(Vec<epics_ca_rs::PvString>),
 }
 
-impl WriteValue {
-    /// Value used to echo `New :` if the post-put read-back fails
-    /// non-fatally (see [`postput_read_fatal`]).
-    fn echo_fallback(&self) -> epics_ca_rs::EpicsValue {
-        match self {
-            WriteValue::Wire { value, .. } => value.clone(),
-            WriteValue::EnumString(s) => epics_ca_rs::EpicsValue::String(s.clone()),
-            WriteValue::EnumStringArray(v) => epics_ca_rs::EpicsValue::StringArray(v.clone()),
-        }
-    }
+/// One `caput` readback — the `Old :` read (`caput.c:535`) and the `New :`
+/// read (`caput.c:583`) are the SAME C function, `caget()`
+/// (`caput.c:130-240`) — classified by C's contract.
+#[derive(Debug)]
+enum Readback {
+    /// The get completed: print this value.
+    Value(EpicsValue, Option<Snapshot>),
+    /// `ca_pend_io` timed out (`caput.c:186-188`): C warns on stderr and
+    /// falls through to the print loop with the ZEROED buffer. Exit stays 0.
+    TimedOut(EpicsValue, Option<Snapshot>),
+    /// No channel connected: C `caget()` returns 1 from `if (!nConn) return
+    /// 1` (`caput.c:181`) BEFORE its print loop, and caput propagates that as
+    /// the exit status (`caput.c:583,589`).
+    ///
+    /// The variant is deliberately payload-free. C prints nothing at all on
+    /// this path — not the PV's `*** not connected` marker (the print loop is
+    /// never reached) and not any stderr diagnostic — so there is no CA error
+    /// text to render, and carrying one only invited the port-invented
+    /// `error: channel disconnected` line this replaces.
+    Disconnected,
+    /// Any other readback failure. C's `ca_array_get` failing *synchronously*
+    /// — most notably read-access-denied, which libca rejects client-side with
+    /// `ECA_NORDACCESS` before any I/O is outstanding — leaves `ca_pend_io` at
+    /// `ECA_NORMAL`; `caget()` prints a `*** ...` marker for the PV but still
+    /// returns 0 (`caput.c:200-206,239`), so C exits 0.
+    Other(CaError),
 }
 
-/// A post-put readback error that C `caput` propagates to a non-zero exit.
-#[derive(Debug, PartialEq, Eq)]
-enum FatalReadback {
-    /// `ca_pend_io` timed out — C `caget` prints the read-timeout message and
-    /// returns `ECA_TIMEOUT` (`caput.c:186-188`).
-    Timeout,
-    /// No channel connected for the readback — C `caget` returns `1` from its
-    /// `if (!nConn) return 1` guard (`caput.c:181`).
-    Disconnect,
-}
-
-/// Classify a post-put readback error by C `caput`'s exit-status contract.
+/// The value C `caput` prints for a readback whose `ca_pend_io` timed out:
+/// the zeroed `calloc` buffer, sized from the DBR type it REQUESTED. Owned
+/// by [`epics_ca_rs::cli::zero_dbr_value`] — `caget` renders the same buffer
+/// on its own synchronous timeout, and the contract is C's, not caput's.
 ///
-/// C always issues `caget()` after the put and returns its result as the
-/// process exit status (`caput.c:583,589`). Inside `caget()` only two
-/// conditions make the status non-`ECA_NORMAL`: a `ca_pend_io` timeout
-/// (`caput.c:186-188`) and "no PV connected" (`caput.c:181`). A read whose
-/// `ca_array_get` fails *synchronously* — most notably read-access-denied,
-/// which libca rejects client-side with `ECA_NORDACCESS` before any I/O is
-/// outstanding — leaves `ca_pend_io` at `ECA_NORMAL`; `caget()` prints a
-/// `*** ...` marker for that PV but still returns success, so C exits `0`
-/// (`caput.c:200-206`). This classifier therefore marks ONLY `Timeout` and
-/// `Disconnected`/`Shutdown` as fatal; every other readback error is
-/// non-fatal (echo the submitted value, exit `0`), matching C's exit code.
-/// Returns `None` for the non-fatal case.
-fn postput_read_fatal(err: &CaError) -> Option<FatalReadback> {
-    match err {
-        CaError::Timeout => Some(FatalReadback::Timeout),
-        CaError::Disconnected | CaError::Shutdown => Some(FatalReadback::Disconnect),
-        _ => None,
+/// `as_string` marks the ENUM-read-back-as-label case: that get requests a
+/// `DBR_STRING`, so its zeroed buffer is an empty string, not a `0` index.
+fn zero_readback(
+    native: DbFieldType,
+    as_string: bool,
+    count: u32,
+    long_mode: bool,
+) -> (EpicsValue, Option<Snapshot>) {
+    let base = if as_string {
+        DbFieldType::String
+    } else {
+        native
+    };
+    let value = zero_dbr_value(base, count);
+    let snap = long_mode.then(|| zero_dbr_snapshot(base, count));
+    (value, snap)
+}
+
+/// Single owner of C `caput`'s readback contract: map one get result onto
+/// [`Readback`], substituting the zeroed buffer C would print on timeout.
+fn classify_readback(
+    res: Result<(EpicsValue, Option<Snapshot>), CaError>,
+    native: DbFieldType,
+    as_string: bool,
+    count: u32,
+    long_mode: bool,
+) -> Readback {
+    match res {
+        Ok((value, snap)) => Readback::Value(value, snap),
+        Err(CaError::Timeout) => {
+            let (value, snap) = zero_readback(native, as_string, count, long_mode);
+            Readback::TimedOut(value, snap)
+        }
+        Err(CaError::Disconnected | CaError::Shutdown) => Readback::Disconnected,
+        Err(e) => Readback::Other(e),
     }
 }
 
@@ -740,9 +943,10 @@ fn classify_enum_token(
     menu: &[epics_ca_rs::PvString],
 ) -> Result<EnumToken, String> {
     if force_numeric {
-        return parse_enum_double(token)
-            .map(EnumToken::Number)
-            .ok_or_else(|| format!("Enum index value '{token}' is not a number."));
+        let index = parse_enum_double(token)
+            .ok_or_else(|| format!("Enum index value '{token}' is not a number."))?;
+        warn_if_enum_index_too_large(token, index, menu); // caput.c:477-479
+        return Ok(EnumToken::Number(index));
     }
     // C escapes the value into a fixed EpicsStr buffer before comparing
     // it to the menu names (caput.c:487-488).
@@ -758,9 +962,33 @@ fn classify_enum_token(
     if force_string {
         return Err(format!("Enum string value '{escaped}' invalid."));
     }
-    parse_enum_double(&String::from_utf8_lossy(escaped.as_bytes()))
-        .map(EnumToken::Number)
-        .ok_or_else(|| format!("Enum string value '{escaped}' invalid."))
+    let text = String::from_utf8_lossy(escaped.as_bytes()).into_owned();
+    let index = parse_enum_double(&text)
+        .ok_or_else(|| format!("Enum string value '{escaped}' invalid."))?;
+    // C warns with `sbuf[i]` here — the ESCAPED text, not the raw argv token
+    // it warns with on the `-n` path above (caput.c:505-507 vs :477-479).
+    warn_if_enum_index_too_large(&text, index, menu);
+    Ok(EnumToken::Number(index))
+}
+
+/// C `caput.c:477-479` and `:505-507` — the same warning at both places an ENUM
+/// value ends up as a NUMBER (R13-23):
+///
+/// ```text
+/// Warning: enum index value '%s' may be too large.
+/// ```
+///
+/// `dbuf[i] >= bufGrEnum.no_str`: an index at or past the end of the menu is
+/// suspicious, but NOT fatal — C prints this and puts the value anyway (neither
+/// site `return`s, unlike every other diagnostic in the block). A negative index
+/// is below `no_str`, so it does not warn; an empty menu (`no_str == 0`) warns
+/// for every index, as C's comparison does.
+///
+/// A menu NAME never reaches here: C only compares the numeric `dbuf[i]`.
+fn warn_if_enum_index_too_large(token: &str, index: f64, menu: &[epics_ca_rs::PvString]) {
+    if index >= menu.len() as f64 {
+        eprintln!("Warning: enum index value '{token}' may be too large.");
+    }
 }
 
 /// Parse an ENUM value as a number, mirroring C `epicsStrtod`
@@ -826,10 +1054,14 @@ fn build_enum_array(
 #[cfg(test)]
 mod tests {
     use super::{
-        Args, FatalReadback, WriteValue, build_write_value, postput_read_fatal, raw_from_escaped,
-        raw_from_escaped_string,
+        Args, Readback, ValueFormat, WriteValue, build_write_value, classify_readback,
+        last_of_pair, raw_from_escaped, raw_from_escaped_string, readback_line, readback_stderr,
+        zero_readback,
     };
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
+    use epics_base_rs::types::WallTime;
+    use epics_ca_rs::cli::EPICS_EPOCH_UNIX_SECS;
+    use epics_ca_rs::copt::scan_i32;
     use epics_ca_rs::{CaError, DbFieldType, EpicsValue};
 
     fn vals(s: &[&str]) -> Vec<String> {
@@ -840,95 +1072,256 @@ mod tests {
         s.iter().map(|x| (*x).into()).collect()
     }
 
+    /// C's getopt string accepts `-# <n>` (`caput.c:290`) and scans it into
+    /// `count` (`:336-343`), but `count` is then overwritten unconditionally —
+    /// `argc - optind` in `-a` mode (`:418`), `1` in scalar mode (`:441`) — so
+    /// the flag is vestigial: it must PARSE, and it must change nothing.
+    ///
+    /// Pre-fix caput-rs had no `-#` at all, so clap exited 2 on the unknown
+    /// flag where C runs the put.
+    #[test]
+    fn hash_flag_is_accepted_and_ignored() {
+        // Scalar: `-# 3` parses, and the value list is untouched.
+        let a = Args::try_parse_from(["caput", "-#", "3", "PV", "42"])
+            .expect("C's getopt accepts -# (caput.c:290); clap must too");
+        assert_eq!(a.max_elements, vals(&["3"]));
+        assert_eq!(a.pv_name.as_deref(), Some("PV"));
+        assert_eq!(a.values, vals(&["42"]));
+        // The count that reaches the wire comes from the values, never from
+        // `-#` — C overwrites it at caput.c:441. The scan is still performed
+        // (through the shared owner), purely for its warning.
+        assert_eq!(scan_i32("3"), Some(3));
+
+        // Array mode: `-# 1` must not truncate the 3-element write.
+        let a = Args::try_parse_from(["caput", "-a", "-#", "1", "WF", "3", "1", "2", "3"])
+            .expect("-# parses alongside -a");
+        assert!(a.array_mode > 0);
+        assert_eq!(a.values, vals(&["3", "1", "2", "3"]));
+
+        // A non-numeric argument: C's `sscanf` fails, warns, and keeps going
+        // (caput.c:337-342). It must NOT be a hard error.
+        let a = Args::try_parse_from(["caput", "-#", "abc", "PV", "42"])
+            .expect("C warns on a bad -# argument, it does not exit");
+        assert_eq!(a.max_elements, vals(&["abc"]));
+        assert_eq!(scan_i32("abc"), None, "the owner warns and falls back to 0");
+        // C's `sscanf("%d")` takes a LEADING integer and ignores the tail, so
+        // `3x` scans fine and warns nothing.
+        Args::try_parse_from(["caput", "-#", "3x", "PV", "42"]).expect("leading digits");
+        assert_eq!(scan_i32("3x"), Some(3));
+    }
+
     /// C `caput.c:298-319` parses `-n`/`-s` and `-S`/`-a` as two
     /// mutually-exclusive last-wins pairs via a getopt switch (each case
     /// sets its flag and clears the paired one), with NO conflict error.
-    /// `overrides_with` must reproduce that for every order boundary.
+    /// [`last_of_pair`] must reproduce that for every order boundary —
+    /// including a REPEAT of either member (R13-17), which clap's former
+    /// `overrides_with` spelling could not express.
     #[test]
     fn enum_and_array_flags_are_last_wins_pairs() {
-        let parse = |extra: &[&str]| {
+        let enum_pair = |extra: &[&str]| {
             let mut argv = vec!["caput-rs"];
             argv.extend_from_slice(extra);
             argv.extend_from_slice(&["PV", "1"]);
-            Args::try_parse_from(argv).expect("flags must parse without a conflict error")
+            let m = Args::command().get_matches_from(argv);
+            last_of_pair(&m, "force_numeric", "force_string")
+        };
+        let array_pair = |extra: &[&str]| {
+            let mut argv = vec!["caput-rs"];
+            argv.extend_from_slice(extra);
+            argv.extend_from_slice(&["PV", "1"]);
+            let m = Args::command().get_matches_from(argv);
+            last_of_pair(&m, "long_string", "array_mode")
         };
 
         // -n / -s: last one wins, neither errors.
-        let a = parse(&["-n", "-s"]);
-        assert!(
-            a.force_string && !a.force_numeric,
-            "-n -s → string (last wins)"
+        assert_eq!(enum_pair(&["-n", "-s"]), (false, true), "-n -s → string");
+        assert_eq!(enum_pair(&["-s", "-n"]), (true, false), "-s -n → numeric");
+        assert_eq!(enum_pair(&["-n"]), (true, false), "-n alone → numeric");
+        assert_eq!(enum_pair(&["-s"]), (false, true), "-s alone → string");
+        assert_eq!(enum_pair(&[]), (false, false), "neither given");
+        assert_eq!(
+            enum_pair(&["-n", "-s", "-n"]),
+            (true, false),
+            "a repeat is legal and the LAST occurrence still wins"
         );
-        let a = parse(&["-s", "-n"]);
-        assert!(
-            a.force_numeric && !a.force_string,
-            "-s -n → numeric (last wins)"
-        );
-        let a = parse(&["-n"]);
-        assert!(a.force_numeric && !a.force_string, "-n alone → numeric");
-        let a = parse(&["-s"]);
-        assert!(a.force_string && !a.force_numeric, "-s alone → string");
 
         // -S / -a: last one wins, never both set.
-        let a = parse(&["-a", "-S"]);
-        assert!(
-            a.long_string && !a.array_mode,
-            "-a -S → long string (last wins)"
-        );
-        let a = parse(&["-S", "-a"]);
-        assert!(a.array_mode && !a.long_string, "-S -a → array (last wins)");
-        let a = parse(&["-a"]);
-        assert!(a.array_mode && !a.long_string, "-a alone → array");
-        let a = parse(&["-S"]);
-        assert!(a.long_string && !a.array_mode, "-S alone → long string");
-    }
-
-    /// The post-put readback
-    /// status must follow C `caput`'s exit-code contract — a read TIMEOUT and a
-    /// total DISCONNECT fail the command (C `caget` returns ECA_TIMEOUT /
-    /// `!nConn` returns 1, caput.c:181,186-188), while a synchronously-failed
-    /// read such as read-access-denied leaves `ca_pend_io` at ECA_NORMAL so
-    /// C exits 0 (caput.c:200-206). Boundary cases, one per classifier arm.
-    #[test]
-    fn postput_read_timeout_is_fatal() {
+        assert_eq!(array_pair(&["-a", "-S"]), (true, false), "-a -S → long str");
+        assert_eq!(array_pair(&["-S", "-a"]), (false, true), "-S -a → array");
+        assert_eq!(array_pair(&["-a"]), (false, true), "-a alone → array");
+        assert_eq!(array_pair(&["-S"]), (true, false), "-S alone → long str");
+        assert_eq!(array_pair(&[]), (false, false), "neither given");
         assert_eq!(
-            postput_read_fatal(&CaError::Timeout),
-            Some(FatalReadback::Timeout),
-            "read timeout must fail caput like C ca_pend_io ECA_TIMEOUT"
+            array_pair(&["-S", "-a", "-S"]),
+            (true, false),
+            "a repeat is legal and the LAST occurrence still wins"
         );
     }
 
+    /// A readback timeout is NOT fatal in C. `ca_pend_io` returning
+    /// ECA_TIMEOUT only prints the stderr warning (`caput.c:186-188`); the
+    /// function keeps going, prints the (still zeroed) buffer and returns 0
+    /// (`caput.c:239`).
+    ///
+    /// This test previously asserted the opposite ("read timeout must fail
+    /// caput like C ca_pend_io ECA_TIMEOUT"), pinning a behaviour C does not
+    /// have — `caput.c:186-188` has no `return`.
     #[test]
-    fn postput_read_disconnect_is_fatal() {
+    fn readback_timeout_is_not_fatal_and_yields_the_zeroed_buffer() {
+        let r = classify_readback(
+            Err(CaError::Timeout),
+            DbFieldType::Double,
+            /* as_string */ false,
+            /* count */ 1,
+            /* long_mode */ false,
+        );
+        match r {
+            Readback::TimedOut(v, snap) => {
+                assert_eq!(
+                    v,
+                    EpicsValue::Double(0.0),
+                    "C prints the calloc'd, never-filled buffer: a zeroed double"
+                );
+                assert!(snap.is_none(), "no -l → no timestamp/alarm line");
+            }
+            other => panic!("read timeout must classify as TimedOut, got {other:?}"),
+        }
+    }
+
+    /// The zeroed buffer takes the shape of the READBACK type, not of the
+    /// value that was written: a label-form ENUM readback is a DBR_STRING
+    /// get, so its zeroed buffer prints as an empty string, and an array
+    /// readback zeroes every element (C `dbr_size_n(dbrType, reqElems)`,
+    /// `caput.c:167`).
+    #[test]
+    fn zero_readback_takes_the_shape_of_the_readback_type() {
+        let (v, _) = zero_readback(DbFieldType::Enum, /* as_string */ true, 1, false);
+        assert_eq!(
+            v,
+            EpicsValue::String(epics_ca_rs::PvString::from("")),
+            "ENUM read back as a label is a DBR_STRING get → zeroed string"
+        );
+
+        let (v, _) = zero_readback(DbFieldType::Enum, /* as_string */ false, 1, false);
+        assert_eq!(
+            v,
+            EpicsValue::Enum(0),
+            "`caput -n` reads the ENUM index → zeroed index"
+        );
+
+        let (v, _) = zero_readback(DbFieldType::Long, false, 3, false);
+        assert_eq!(
+            v,
+            EpicsValue::LongArray(vec![0, 0, 0]),
+            "an array readback zeroes ca_element_count elements"
+        );
+    }
+
+    /// Under `-l` C prints the zeroed `dbr_time_*` header too: the EPICS
+    /// epoch stamp (secPastEpoch == 0) and NO_ALARM / NO_ALARM.
+    #[test]
+    fn zero_readback_long_mode_carries_the_epics_epoch_and_no_alarm() {
+        let (_, snap) = zero_readback(DbFieldType::Double, false, 1, /* long_mode */ true);
+        let snap = snap.expect("-l readback carries a timestamp/alarm line");
+        assert_eq!(snap.alarm.status, 0);
+        assert_eq!(snap.alarm.severity, 0);
+        assert_eq!(
+            snap.timestamp,
+            WallTime::from_unix(EPICS_EPOCH_UNIX_SECS, 0),
+            "a zeroed epicsTimeStamp is the EPICS epoch, 1990-01-01T00:00:00Z"
+        );
+    }
+
+    /// C's `caget()` inside caput has exactly ONE `fprintf(stderr, ...)` — the
+    /// `ca_pend_io` timeout warning (`caput.c:186-188`). Everything else is
+    /// silent on stderr: a CA error / read denial renders its `*** ...` marker
+    /// on STDOUT (`caput.c:200-206`), and the `!nConn` path returns from
+    /// `caput.c:181` BEFORE the print loop, emitting nothing on EITHER stream.
+    ///
+    /// Pre-fix, `caput-rs`'s `New :` disconnect path wrote a port-invented
+    /// `error: channel disconnected` to stderr (the exit code already matched
+    /// C's `return 1`). The `Readback::Disconnected` variant is now
+    /// payload-free, so there is no error text left to render, and both
+    /// readback sites take their stderr from this one function.
+    #[test]
+    fn readback_disconnect_prints_nothing_on_either_stream() {
+        let fmt = ValueFormat::default();
+
+        // `!nConn`: silent on stdout AND stderr, in every output mode.
+        assert_eq!(readback_stderr(&Readback::Disconnected), None);
+        for (terse, long_mode) in [(false, false), (true, false), (false, true)] {
+            assert_eq!(
+                readback_line(&Readback::Disconnected, "PV", ' ', &fmt, terse, long_mode),
+                None,
+                "C never reaches its print loop (terse={terse}, long={long_mode})"
+            );
+        }
+
+        // The ONE stderr line C does print.
+        assert_eq!(
+            readback_stderr(&Readback::TimedOut(EpicsValue::Double(0.0), None)),
+            Some("Read operation timed out: PV data was not read.")
+        );
+
+        // Negative control: a CA error is NOT silent — but it speaks on
+        // STDOUT, via the marker, and still says nothing on stderr.
+        let other = Readback::Other(CaError::ServerError(epics_ca_rs::protocol::ECA_NORDACCESS));
+        assert_eq!(readback_stderr(&other), None);
+        let line = readback_line(&other, "PV", ' ', &fmt, true, false)
+            .expect("a CA error still reaches C's print loop");
+        assert_eq!(line, "*** no read access");
+
+        // A good readback is silent on stderr too.
+        assert_eq!(
+            readback_stderr(&Readback::Value(EpicsValue::Double(1.0), None)),
+            None
+        );
+    }
+
+    /// Only `!nConn` (`caput.c:181`) makes C's readback return non-zero.
+    #[test]
+    fn readback_disconnect_is_fatal() {
         // Both disconnect and shutdown map to C's `!nConn` no-connection guard.
-        assert_eq!(
-            postput_read_fatal(&CaError::Disconnected),
-            Some(FatalReadback::Disconnect),
-            "disconnected readback must fail caput like C caget !nConn"
-        );
-        assert_eq!(
-            postput_read_fatal(&CaError::Shutdown),
-            Some(FatalReadback::Disconnect),
-            "client shutdown during readback must fail caput"
-        );
+        assert!(matches!(
+            classify_readback(
+                Err(CaError::Disconnected),
+                DbFieldType::Double,
+                false,
+                1,
+                false
+            ),
+            Readback::Disconnected
+        ));
+        assert!(matches!(
+            classify_readback(Err(CaError::Shutdown), DbFieldType::Double, false, 1, false),
+            Readback::Disconnected
+        ));
     }
 
     #[test]
-    fn postput_read_other_errors_are_nonfatal() {
+    fn readback_other_errors_are_nonfatal() {
         // Read-access-denied and other synchronous CA failures: C's caget still
-        // returns ECA_NORMAL (ca_pend_io never timed out) → caput exits 0. These
-        // must be non-fatal so we echo the submitted value and exit 0, NOT
-        // over-correct to non-zero (the finding's prescription was wrong here).
-        assert_eq!(
-            postput_read_fatal(&CaError::ServerError(0x178)), // ECA_NORDACCESS
-            None,
-            "read-access-denied exits 0 in C, must stay non-fatal"
-        );
-        assert_eq!(
-            postput_read_fatal(&CaError::Protocol("bad frame".into())),
-            None,
-            "other readback errors exit 0 in C, must stay non-fatal"
-        );
+        // returns ECA_NORMAL (ca_pend_io never timed out) → caput exits 0.
+        assert!(matches!(
+            classify_readback(
+                Err(CaError::ServerError(0x178)), // ECA_NORDACCESS
+                DbFieldType::Double,
+                false,
+                1,
+                false
+            ),
+            Readback::Other(_)
+        ));
+        assert!(matches!(
+            classify_readback(
+                Err(CaError::Protocol("bad frame".into())),
+                DbFieldType::Double,
+                false,
+                1,
+                false
+            ),
+            Readback::Other(_)
+        ));
     }
 
     #[test]

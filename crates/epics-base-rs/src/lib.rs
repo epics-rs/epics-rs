@@ -22,20 +22,14 @@
     clippy::useless_conversion
 )]
 
-/// The upstream EPICS Base release this crate ports, as evaluated by
-/// `configure/CONFIG_BASE_VERSION`'s `EPICS_VERSION_NUMBER`
-/// (`EPICS_VERSION.EPICS_REVISION.EPICS_MODIFICATION.EPICS_PATCH_LEVEL`
-/// plus the `-DEV` development-snapshot suffix). This is the single
-/// source of truth for the EPICS Base version the CA/PVA diagnostic
-/// tools report — the Rust analogue of the C `EPICS_VERSION_STRING`
-/// macro that pvxs prints from `version_information`
-/// (`pvxs/src/describe.cpp`).
+/// The upstream EPICS Base release this crate ports — C's
+/// `EPICS_VERSION_FULL`.
 ///
-/// This is deliberately distinct from the `epics-base-rs` *crate*
-/// version (`CARGO_PKG_VERSION`): the crate version tracks the Rust
-/// port's own release cadence, while this names the EPICS Base release
-/// being ported.
-pub const EPICS_BASE_VERSION: &str = "7.0.10.1-DEV";
+/// Not written here: [`runtime::version`] is generated from the vendored
+/// `configure/CONFIG_BASE_VERSION` the same way C generates
+/// `epicsVersion.h`, so the next upstream bump is a spec edit plus a
+/// regeneration, not a literal somebody has to remember to change.
+pub use runtime::version::EPICS_VERSION_FULL as EPICS_BASE_VERSION;
 
 /// `LinkSet` is an `#[async_trait]` trait: re-exported so an out-of-tree lset
 /// can annotate its impl without taking its own `async-trait` dependency.

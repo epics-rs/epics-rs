@@ -32,10 +32,21 @@ async fn compress_fires_flnk_only_on_emit_not_every_cycle() {
 
     // Rolling Average (ALG index 3), N=4, NSAM=1: accumulates one sample per
     // cycle and emits the average only on the 4th. INP reads `src`.
+    //
+    // INP is a dbCommon link on a compress (`COMPRESS_FIELDS` declares no INP,
+    // matching `compressRecord.dbd.pod`), so it is set through the common field
+    // — the same place a `.db`'s `field(INP,"src")` lands. It used to be set on
+    // a `CompressRecord::inp` field that only this construction path could
+    // reach; that field is gone (R18-106).
     let mut cmp = CompressRecord::new(1, 3);
     cmp.n = 4;
-    cmp.inp = "src".to_string();
     db.add_record("cmp", Box::new(cmp)).await.unwrap();
+    {
+        let rec = db.get_record("cmp").await.unwrap();
+        let mut inst = rec.write().await;
+        inst.put_common_field("INP", EpicsValue::String("src".into()))
+            .unwrap();
+    }
 
     // Counter sink: `CALC="VAL+1"` increments its VAL once per process, so its
     // VAL is exactly the number of times the compress's FLNK fired it.

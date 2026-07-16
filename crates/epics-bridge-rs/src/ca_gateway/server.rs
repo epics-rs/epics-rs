@@ -122,8 +122,13 @@ pub struct GatewayConfig {
     /// `GatewayServer::install_search_resolver` (see `downstream.rs` doc
     /// comment).
     pub preload_path: Option<PathBuf>,
-    /// CA server port (downstream side). 0 = use EPICS default.
-    pub server_port: u16,
+    /// CA server port (downstream side). `None` = resolve from the EPICS
+    /// environment (`EPICS_CAS_SERVER_PORT` > `EPICS_CA_SERVER_PORT` >
+    /// 5064), which is what C's `-sport` does — it *sets*
+    /// `EPICS_CAS_SERVER_PORT` and lets the CAS read it back
+    /// (`ca-gateway/gateway.cc:398-401`). `Some(0)` binds an ephemeral
+    /// port; `Some(n)` binds `n`.
+    pub server_port: Option<u16>,
     /// Cache timeouts.
     pub timeouts: CacheTimeouts,
     /// Statistics PV namespace, the bare C `-prefix` string (e.g.
@@ -214,7 +219,7 @@ impl Default for GatewayConfig {
             command_path: None,
             report_path: Some(PathBuf::from(GATE_REPORT_FILE)),
             preload_path: None,
-            server_port: 0,
+            server_port: None,
             timeouts: CacheTimeouts::default(),
             // Bare C `-prefix`; the `:` separator is inserted at publish.
             stats_prefix: "gateway".to_string(),
@@ -507,23 +512,22 @@ impl GatewayServer {
         // configured. Upstream traffic to the IOC is encrypted
         // independently via `GatewayConfig::upstream_tls` (B10,
         // wired into `UpstreamManager::new` above).
+        let server_port = config
+            .server_port
+            .unwrap_or_else(epics_base_rs::runtime::net::cas_server_port);
         let downstream = Arc::new({
             #[cfg(feature = "ca-gateway-tls")]
             {
                 if let Some(ref tls) = config.tls {
-                    DownstreamServer::new_with_tls(
-                        shadow_db.clone(),
-                        config.server_port,
-                        tls.clone(),
-                    )
-                    .await?
+                    DownstreamServer::new_with_tls(shadow_db.clone(), server_port, tls.clone())
+                        .await?
                 } else {
-                    DownstreamServer::new(shadow_db.clone(), config.server_port).await?
+                    DownstreamServer::new(shadow_db.clone(), server_port).await?
                 }
             }
             #[cfg(not(feature = "ca-gateway-tls"))]
             {
-                DownstreamServer::new(shadow_db.clone(), config.server_port).await?
+                DownstreamServer::new(shadow_db.clone(), server_port).await?
             }
         });
 

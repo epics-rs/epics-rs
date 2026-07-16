@@ -87,28 +87,53 @@ type ClientTlsConfig = Arc<tokio_rustls::rustls::ClientConfig>;
 /// Timeout for echo response before declaring connection dead (matches C EPICS CA_ECHO_TIMEOUT).
 const ECHO_TIMEOUT_SECS: u64 = 5;
 
-/// Maximum accumulated TCP read buffer before disconnecting.
+/// C `tcpiiu::bytesArePendingInOS()` — "are there unread bytes still sitting
+/// in the OS receive buffer right now?" (`tcpiiu.cpp:544`, an `ioctl(FIONREAD)`
+/// under `osiSock`). This is the sole input to libca's flow control
+/// (`tcpiiu.cpp:548-567`): it measures the *socket*, not any consumer-side
+/// backlog, which is why libca can never latch `EVENTS_OFF` on a slow reader.
 ///
-/// This MUST be >= the largest legal single frame, otherwise a valid
-/// large waveform (e.g. a 2 MB array, well under the 16 MB
-/// `max_payload_size()` default) sent by a server would push
-/// `accumulated` past the cap and the connection would be closed
-/// before the frame could be parsed — a permanent failure that
-/// survives reconnect (the server re-sends, the client closes again).
-///
-/// Largest legal frame = extended header (24 bytes) + `max_payload_size()`
-/// payload. A 64 KiB slack covers a partially-received next frame
-/// pipelined behind a full one in the same read burst. `max_payload_size()`
-/// honours `EPICS_CA_MAX_ARRAY_BYTES`, so the cap tracks operator overrides.
-/// Mirrors the server-side cap in `server/tcp.rs`.
-fn max_accumulated() -> usize {
-    crate::protocol::max_payload_size()
-        .saturating_add(24)
-        .saturating_add(64 * 1024)
+/// Boxed rather than generic so `read_loop` keeps one shape across the
+/// plaintext, TLS and duplex-mock readers, each of which needs a different
+/// occupancy source (or none, in tests).
+type OsRecvQueueProbe = std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
+
+/// Occupancy probe over a live socket fd. Non-blocking `FIONREAD`; a failed
+/// ioctl reports "nothing pending", which is the safe answer — it can only
+/// clear flow control early, never latch it on.
+#[cfg(unix)]
+fn fd_recv_queue_probe(fd: std::os::fd::RawFd) -> OsRecvQueueProbe {
+    std::sync::Arc::new(move || {
+        let mut pending: libc::c_int = 0;
+        // SAFETY: `fd` belongs to the reader half owned by the `read_loop`
+        // that holds this closure, so it stays open for the closure's life.
+        // FIONREAD writes a single `c_int`.
+        let rc = unsafe { libc::ioctl(fd, libc::FIONREAD, &mut pending) };
+        rc == 0 && pending > 0
+    })
 }
 
-/// Default echo interval (matches C EPICS CA_CONN_VERIFY_PERIOD).
-/// Overridden by EPICS_CA_CONN_TMO environment variable.
+#[cfg(not(unix))]
+fn fd_recv_queue_probe(_fd: std::os::raw::c_int) -> OsRecvQueueProbe {
+    // No FIONREAD equivalent wired up here: report the socket as always
+    // drained, which disables flow control rather than latching it on.
+    std::sync::Arc::new(|| false)
+}
+
+/// Probe for tests whose subject is not flow control: the socket always reads
+/// clean, so `read_loop` never asks for `EVENTS_OFF`.
+#[cfg(test)]
+fn drained_socket_probe() -> OsRecvQueueProbe {
+    std::sync::Arc::new(|| false)
+}
+
+/// `EPICS_CA_CONN_TMO` — C's `cac::connectionTimeout()`, default 30 s.
+///
+/// One knob, two uses, exactly as in C: it is the idle interval after
+/// which a circuit sends CA_PROTO_ECHO, and it is the retry cadence a
+/// name-service circuit waits out after a failed connect
+/// (`tcpiiu.cpp:653-657`). Not a connect *deadline* — C's `::connect()`
+/// blocks under the OS timeout, and nothing caps it.
 ///
 /// C `cac.cpp:186-194` parses CONN_TMO as `double` and falls
 /// back to the default (30 s) on parse failure, on `<= 0.0`, AND on
@@ -120,25 +145,113 @@ fn max_accumulated() -> usize {
 /// instead of falling back to the default. Match C: keep as
 /// `Duration` with full sub-second precision; only `parse error`
 /// or `value <= 0.0` falls back to the default.
-fn echo_idle() -> Duration {
-    epics_base_rs::runtime::env::get("EPICS_CA_CONN_TMO")
-        .and_then(|s| s.parse::<f64>().ok())
-        .filter(|v| *v > 0.0)
-        .map(Duration::from_secs_f64)
-        .unwrap_or(Duration::from_secs(30))
+///
+/// Parsing is C's `envGetDoubleConfigParam` → `epicsScanDouble`
+/// (`crate::estdlib`), so `0x10` is 16 s and `1e400` is an ERANGE
+/// failure, and the conversion is the saturating one — an explicit
+/// `inf` is C's never-expiring deadline, not a panic.
+///
+/// Resolved ONCE per process, as C resolves it once in the `cac`
+/// constructor and stores it in `cac::connTMO`: re-reading `getenv` on
+/// every circuit would let the value drift mid-run and would repeat the
+/// diagnostic below on every reconnect. [`prime_connection_timeout`] does
+/// the resolution at client construction, where C does it.
+pub(crate) fn connection_timeout() -> Duration {
+    static RESOLVED: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *RESOLVED.get_or_init(resolve_connection_timeout)
+}
+
+/// Resolve `EPICS_CA_CONN_TMO` now, so its diagnostic lands at context
+/// creation (C `cac.cpp:188-194`) rather than on the first circuit.
+pub(crate) fn prime_connection_timeout() {
+    let _ = connection_timeout();
+}
+
+/// The uncached resolution behind [`connection_timeout`].
+fn resolve_connection_timeout() -> Duration {
+    use epics_base_rs::runtime::env_table::EPICS_CA_CONN_TMO;
+    // C `CA_CONN_VERIFY_PERIOD` (`cac.cpp:190`) is a hand-copy of the table's
+    // "30.0"; here the number has one home.
+    let default_secs: f64 = EPICS_CA_CONN_TMO
+        .default_str()
+        .parse()
+        .expect("EPICS_CA_CONN_TMO's compiled default is a number");
+    // Unset resolves to the compiled default string and parses, silently — so
+    // only a set-but-bad value reaches the error arm.
+    let secs = match EPICS_CA_CONN_TMO.double() {
+        Ok(v) => v,
+        // C `cac::cac` (`cac.cpp:189-194`) — both lines, verbatim, on top
+        // of the "Unable to find a real number in ..." that
+        // `envGetDoubleConfigParam` already printed.
+        Err(_) => {
+            eprintln!("EPICS \"EPICS_CA_CONN_TMO\" double fetch failed");
+            eprintln!("Defaulting \"EPICS_CA_CONN_TMO\" = {default_secs:.6}");
+            default_secs
+        }
+    };
+    // DOCUMENTED DEVIATION — a non-positive (or NaN) period does not become a
+    // zero-period watchdog here.
+    //
+    // C stores whatever `envGetDoubleConfigParam` parsed (`cac.cpp:188-194`:
+    // the default is applied ONLY when the fetch fails, never when it succeeds
+    // with a useless number) and hands it to the circuit's connection-verify
+    // watchdog. With `EPICS_CA_CONN_TMO=-5` or `=0` the deadline is already in
+    // the past on every check, so the compiled `camonitor` — still delivering
+    // updates, so the client is not "broken" — emitted 177_182 stderr lines in
+    // 3 seconds on this platform, a "Virtual circuit unresponsive" flood
+    // spinning a core. That is a degenerate behaviour with no operational
+    // meaning, and reproducing it faithfully would hand any operator with a
+    // typo'd env var a livelocked client.
+    //
+    // So the non-positive value is refused rather than obeyed, and — unlike
+    // the silent guard this replaces — the operator is told that the value
+    // they set is not the one in force. C prints nothing here because C obeys
+    // it; this line is the port's, not libca's.
+    if secs > 0.0 {
+        crate::estdlib::duration_from_secs(secs)
+    } else {
+        eprintln!(
+            "Warning: \"EPICS_CA_CONN_TMO\" = {secs} is not a positive period; \
+             using {default_secs:.6} (a non-positive period fires the connection \
+             watchdog continuously)"
+        );
+        crate::estdlib::duration_from_secs(default_secs)
+    }
 }
 /// Legacy seconds accessor kept for call sites that need a coarse
 /// number (e.g. `tokio::time::sleep(Duration::from_secs(N))` over a
 /// long interval where sub-second precision does not matter). New
-/// timer code should call `echo_idle()` directly.
+/// timer code should call `connection_timeout()` directly.
 fn echo_idle_secs() -> u64 {
-    let d = echo_idle();
+    let d = connection_timeout();
     d.as_secs().max(1)
+}
+
+/// Cap on the client-side TLS handshake, `EPICS_CA_TLS_HANDSHAKE_TMO`
+/// (port-specific; libca has no TLS). Floored at 1 s, default 10 s.
+///
+/// Resolved once per process, like every other env-derived duration here.
+#[cfg(feature = "experimental-rust-tls")]
+fn tls_handshake_timeout() -> Duration {
+    static RESOLVED: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *RESOLVED.get_or_init(|| {
+        crate::estdlib::env_double("EPICS_CA_TLS_HANDSHAKE_TMO")
+            .ok()
+            .map(|v| crate::estdlib::duration_from_secs(v.max(1.0)))
+            .unwrap_or(Duration::from_secs(10))
+    })
 }
 
 struct ServerConnection {
     write_tx: mpsc::UnboundedSender<Vec<u8>>,
     pending_frames: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Peer's minor protocol version, published by `read_loop` when the
+    /// circuit's `CA_PROTO_VERSION` frame arrives. Request framing needs
+    /// it: libca hands `CA_V49 ( minorProtocolVersion )` to
+    /// `comQueSend::insertRequestHeader` as `v49Ok` and refuses the
+    /// extended (24-byte) header for older peers (`comQueSend.cpp:285-363`).
+    /// 0 (pre-V49) until the VERSION frame is seen, matching C's `tcpiiu`.
+    server_minor: std::sync::Arc<std::sync::atomic::AtomicU16>,
     /// Beacon-arrival channel into `read_loop`. `false` = healthy
     /// beacon (refresh idle watchdog deadline); `true` = anomaly
     /// classified by `beacon_monitor` (set the in-loop flag so
@@ -256,7 +369,7 @@ pub(crate) async fn run_transport_manager(
                 // handles the fan-out). It never starts or waits on a
                 // connect, so it skips the per-circuit queue entirely.
                 let Some(circuit) = cmd_circuit_key(&cmd) else {
-                    process_command(cmd, &mut connections, &server_writers, &event_tx);
+                    process_command(cmd, &mut connections, &server_writers, &in_flight, &event_tx);
                     continue;
                 };
 
@@ -336,7 +449,7 @@ pub(crate) async fn run_transport_manager(
                     }
                 }
 
-                process_command(cmd, &mut connections, &server_writers, &event_tx);
+                process_command(cmd, &mut connections, &server_writers, &in_flight, &event_tx);
             }
             Some(joined) = pending_connects.join_next() => {
                 let (circuit, result) = match joined {
@@ -371,6 +484,7 @@ pub(crate) async fn run_transport_manager(
                                 queued_cmd,
                                 &mut connections,
                                 &server_writers,
+                                &in_flight,
                                 &event_tx,
                             );
                         }
@@ -441,14 +555,6 @@ fn cmd_circuit_key(cmd: &TransportCommand) -> Option<CircuitKey> {
             server_addr,
             priority,
             ..
-        }
-        | TransportCommand::EventsOff {
-            server_addr,
-            priority,
-        }
-        | TransportCommand::EventsOn {
-            server_addr,
-            priority,
         } => Some((*server_addr, *priority)),
         TransportCommand::BeaconArrivalNotify { .. } => None,
     }
@@ -466,6 +572,7 @@ fn process_command(
     cmd: TransportCommand,
     connections: &mut HashMap<CircuitKey, ServerConnection>,
     server_writers: &DirectServerWriters,
+    in_flight: &InFlightOps,
     event_tx: &mpsc::UnboundedSender<TransportEvent>,
 ) {
     match cmd {
@@ -498,15 +605,19 @@ fn process_command(
             server_addr,
             priority,
         } => {
+            let peer_minor = peer_minor_of(connections, (server_addr, priority));
             let mut hdr = CaHeader::new(CA_PROTO_READ_NOTIFY);
             hdr.data_type = data_type;
             hdr.cid = sid;
             hdr.available = ioid;
             // C parity (`comQueSend.cpp:285`): extended form for
             // `nElem >= 0xffff`. See `build_read_notify_frame` in
-            // client/mod.rs for the same boundary in the slow path.
+            // client/mod.rs for the same boundary in the fast path.
             if count >= 0xFFFF {
-                hdr.set_payload_size(0, count);
+                if hdr.set_payload_size(0, count, peer_minor).is_err() {
+                    dispatch_read_error(in_flight, ioid, epics_base_rs::error::CaError::BadCount);
+                    return;
+                }
             } else {
                 hdr.count = count as u16;
             }
@@ -526,17 +637,34 @@ fn process_command(
             server_addr,
             priority,
         } => {
-            let padded_len = align8(payload.len());
-            let mut padded = payload;
-            padded.resize(padded_len, 0);
-
-            let mut hdr = CaHeader::new(CA_PROTO_WRITE);
-            hdr.data_type = data_type;
-            hdr.cid = sid;
-            hdr.set_payload_size(padded.len(), count);
-
-            let mut frame = hdr.to_bytes_extended();
-            frame.extend_from_slice(&padded);
+            let peer_minor = peer_minor_of(connections, (server_addr, priority));
+            // Same framing owner as the direct-writer path
+            // (`CaChannel::build_write_frame`): C
+            // `comQueSend::insertRequestWithPayLoad`.
+            let Ok(frame) = crate::protocol::build_put_frame(
+                CA_PROTO_WRITE,
+                sid,
+                data_type,
+                count,
+                None,
+                payload,
+                peer_minor,
+            ) else {
+                // No IOID on a fire-and-forget WRITE, so there is no
+                // waiter to fail — libca's `ca_array_put` would have
+                // returned ECA_BADCOUNT to the caller synchronously
+                // (`comQueSend.cpp:313`). The channel-side gate does
+                // that; reaching here means the request slipped past
+                // it, so drop the frame rather than emit a header the
+                // peer cannot parse.
+                eprintln!(
+                    "CA: {server_addr}: dropping WRITE for sid {sid}: \
+                     libca would throw cacChannel::outOfBounds for this \
+                     payload against a peer speaking CA minor {peer_minor} \
+                     — ECA_BADCOUNT"
+                );
+                return;
+            };
             send_frame(
                 connections,
                 server_writers,
@@ -554,18 +682,21 @@ fn process_command(
             server_addr,
             priority,
         } => {
-            let padded_len = align8(payload.len());
-            let mut padded = payload;
-            padded.resize(padded_len, 0);
-
-            let mut hdr = CaHeader::new(CA_PROTO_WRITE_NOTIFY);
-            hdr.data_type = data_type;
-            hdr.cid = sid;
-            hdr.available = ioid;
-            hdr.set_payload_size(padded.len(), count);
-
-            let mut frame = hdr.to_bytes_extended();
-            frame.extend_from_slice(&padded);
+            let peer_minor = peer_minor_of(connections, (server_addr, priority));
+            let Ok(frame) = crate::protocol::build_put_frame(
+                CA_PROTO_WRITE_NOTIFY,
+                sid,
+                data_type,
+                count,
+                Some(ioid),
+                payload,
+                peer_minor,
+            ) else {
+                if let Some((_, (_, reply_tx))) = in_flight.writes.remove(&ioid) {
+                    let _ = reply_tx.send(Err(epics_base_rs::error::CaError::BadCount));
+                }
+                return;
+            };
             send_frame(
                 connections,
                 server_writers,
@@ -583,6 +714,7 @@ fn process_command(
             server_addr,
             priority,
         } => {
+            let peer_minor = peer_minor_of(connections, (server_addr, priority));
             let mut hdr = CaHeader::new(CA_PROTO_EVENT_ADD);
             hdr.postsize = 16;
             hdr.data_type = data_type;
@@ -591,7 +723,14 @@ fn process_command(
             // C parity (`comQueSend.cpp:285`): extended form for
             // `nElem >= 0xffff`. Same boundary as READ_NOTIFY above.
             if count >= 0xFFFF {
-                hdr.set_payload_size(16, count);
+                if hdr.set_payload_size(16, count, peer_minor).is_err() {
+                    eprintln!(
+                        "CA: {server_addr}: dropping EVENT_ADD for sid {sid}: \
+                         extended header needed but peer speaks CA minor \
+                         {peer_minor} (< 9) — ECA_BADCOUNT"
+                    );
+                    return;
+                }
             } else {
                 hdr.count = count as u16;
             }
@@ -628,7 +767,17 @@ fn process_command(
             // the count to u16 and used `to_bytes()`, so a CANCEL
             // for a >= 65,535-element monitor lost the count and
             // diverged from libca byte-for-byte.
-            hdr.set_payload_size(0, count);
+            let peer_minor = peer_minor_of(connections, (server_addr, priority));
+            if hdr.set_payload_size(0, count, peer_minor).is_err() {
+                // Unreachable: the matching EVENT_ADD could not have
+                // been framed for this peer either.
+                eprintln!(
+                    "CA: {server_addr}: dropping EVENT_CANCEL for sid {sid}: \
+                     extended header needed but peer speaks CA minor \
+                     {peer_minor} (< 9) — ECA_BADCOUNT"
+                );
+                return;
+            }
             hdr.cid = sid;
             hdr.available = subid;
             send_frame(
@@ -678,32 +827,6 @@ fn process_command(
                 }
             }
         }
-        TransportCommand::EventsOff {
-            server_addr,
-            priority,
-        } => {
-            let hdr = CaHeader::new(CA_PROTO_EVENTS_OFF);
-            send_frame(
-                connections,
-                server_writers,
-                (server_addr, priority),
-                hdr.to_bytes().to_vec(),
-                event_tx,
-            );
-        }
-        TransportCommand::EventsOn {
-            server_addr,
-            priority,
-        } => {
-            let hdr = CaHeader::new(CA_PROTO_EVENTS_ON);
-            send_frame(
-                connections,
-                server_writers,
-                (server_addr, priority),
-                hdr.to_bytes().to_vec(),
-                event_tx,
-            );
-        }
     }
 }
 
@@ -740,25 +863,47 @@ fn send_frame(
     }
 }
 
+/// Peer minor protocol version of an established circuit, or 0 (pre-V49)
+/// when the circuit is gone or has not yet announced its version.
+///
+/// Single reader of the per-circuit version published by `read_loop`, so
+/// every request framed by [`process_command`] gates the extended header
+/// on the same value libca feeds `insertRequestHeader` as `v49Ok`.
+fn peer_minor_of(connections: &HashMap<CircuitKey, ServerConnection>, circuit: CircuitKey) -> u16 {
+    connections
+        .get(&circuit)
+        .map(|c| c.server_minor.load(std::sync::atomic::Ordering::Relaxed))
+        .unwrap_or(0)
+}
+
 /// Build one CA identity frame — `CA_PROTO_CLIENT_NAME` (user name) or
 /// `CA_PROTO_HOST_NAME` (host name) — carrying `value` as a NUL-padded
 /// string payload.
 ///
 /// Single source of the on-wire identity-frame shape, used by the
-/// connect-time handshake ([`build_client_handshake`]). C
-/// `libca/tcpiiu.cpp::userNameSetRequest` / `hostNameSetRequest` route
-/// through `comQueSend::insertRequestHeader`; `set_payload_size` +
-/// `to_bytes_extended` reproduce its header, emitting the extended-size
-/// annex for payloads over 16 bits. In practice libca asserts
-/// `postSize < 0xffff` for these names and the IOC caps a name at 512
-/// bytes, so a real user/host never reaches the annex — the extended
-/// path is only defensive. The point of one shared builder is that the
-/// header encoding lives in exactly one place.
+/// connect-time handshake ([`build_client_handshake`]), which is queued
+/// before the peer's VERSION frame can have arrived — so its peer
+/// version is unknown by construction and no extended header may be
+/// emitted. C is in the same position and resolves it the same way:
+/// `userNameSetRequest` / `hostNameSetRequest`
+/// (`tcpiiu.cpp:1268,1303`) assert `postSize < 0xffff` before handing
+/// the frame to `comQueSend::insertRequestHeader`, i.e. an identity
+/// frame is always a plain 16-byte header. Names long enough to need
+/// the annex cannot occur (the IOC caps a name at 512 bytes); a caller
+/// that manages one anyway gets the payload clipped to the largest
+/// aligned size the 16-bit postsize can carry rather than a frame the
+/// peer cannot parse.
 pub(crate) fn build_identity_frame(cmd: u16, value: &str) -> Vec<u8> {
-    let payload = pad_string(value);
+    const MAX_IDENTITY_PAYLOAD: usize = 0xFFF8;
+    let mut payload = pad_string(value);
+    if payload.len() > MAX_IDENTITY_PAYLOAD {
+        payload.truncate(MAX_IDENTITY_PAYLOAD);
+        // keep the NUL terminator the receiver expects
+        payload[MAX_IDENTITY_PAYLOAD - 1] = 0;
+    }
     let mut hdr = CaHeader::new(cmd);
-    hdr.set_payload_size(payload.len(), 0);
-    let mut frame = hdr.to_bytes_extended();
+    hdr.postsize = payload.len() as u16;
+    let mut frame = hdr.to_bytes().to_vec();
     frame.extend_from_slice(&payload);
     frame
 }
@@ -816,19 +961,19 @@ async fn connect_server(
     #[cfg(feature = "experimental-rust-tls")] tls_server_name: Option<&str>,
 ) -> Option<ServerConnection> {
     tracing::debug!(server = %server_addr, "establishing TCP virtual circuit");
-    let stream = match tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        TcpStream::connect(server_addr),
-    )
-    .await
-    {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
+    // No application-level connect deadline. C `tcpRecvThread::connect`
+    // (`tcpiiu.cpp:606-661`) issues a *blocking* `::connect()` and lets the
+    // OS TCP stack bound it — on Linux that is tcp_syn_retries, ~130 s of
+    // exponentially backed-off SYNs. A hardcoded 5 s cap here made every
+    // server whose handshake takes longer than that (SYN-lossy path,
+    // congested WAN link) permanently unreachable from the port while a C
+    // client on the same wire connects fine. The search engine retries the
+    // address on its own cadence if this attempt fails, which is what C's
+    // `disconnectNotify` + `break` leaves to the same layer.
+    let stream = match TcpStream::connect(server_addr).await {
+        Ok(s) => s,
+        Err(e) => {
             tracing::warn!(server = %server_addr, error = %e, "TCP connect failed");
-            return None;
-        }
-        Err(_) => {
-            tracing::warn!(server = %server_addr, "TCP connect timed out");
             return None;
         }
     };
@@ -846,8 +991,25 @@ async fn connect_server(
         let _ = sock.set_tcp_keepalive(&keepalive);
     }
 
+    // C `tcpiiu::bytesArePendingInOS()` is an ioctl on the circuit's socket.
+    // Capture the fd before the stream is split (or wrapped in TLS): the
+    // reader half handed to `read_loop` keeps it open for exactly as long as
+    // the probe can be called.
+    #[cfg(unix)]
+    let bytes_pending_in_os = {
+        use std::os::fd::AsRawFd;
+        fd_recv_queue_probe(stream.as_raw_fd())
+    };
+    #[cfg(not(unix))]
+    let bytes_pending_in_os = fd_recv_queue_probe(0);
+
     let (write_tx, write_rx) = mpsc::unbounded_channel();
     let pending_frames = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // Peer minor version: 0 (pre-V49) until this circuit's VERSION frame
+    // lands in `read_loop`. Shared with the transport manager so request
+    // framing can gate the extended header on it (C: `tcpiiu`'s
+    // `minorProtocolVersion` → `insertRequestHeader`'s `v49Ok`).
+    let server_minor = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0));
     // C `tcpiiu::unresponsiveCircuit` (`tcpiiu.cpp:899-940`): a single
     // circuit-level flag shared by BOTH the send and receive watchdogs.
     // `sendTimeoutNotify` (send stall) and `receiveTimeoutNotify` /
@@ -900,10 +1062,7 @@ async fn connect_server(
         // forever. Pairs with the existing TCP-connect timeout above.
         // 10s default — long enough for a normal cert exchange, short
         // enough to fall through to the next NAME_SERVER candidate.
-        let hs_timeout = epics_base_rs::runtime::env::get("EPICS_CA_TLS_HANDSHAKE_TMO")
-            .and_then(|s| s.parse::<f64>().ok())
-            .map(|v| Duration::from_secs_f64(v.max(1.0)))
-            .unwrap_or(Duration::from_secs(10));
+        let hs_timeout = tls_handshake_timeout();
         let tls_stream =
             match tokio::time::timeout(hs_timeout, connector.connect(server_name, stream)).await {
                 Ok(Ok(s)) => s,
@@ -938,6 +1097,8 @@ async fn connect_server(
             in_flight.clone(),
             last_rx_at.clone(),
             unresponsive.clone(),
+            bytes_pending_in_os.clone(),
+            server_minor.clone(),
         ));
         (read_task, write_task)
     } else {
@@ -961,6 +1122,8 @@ async fn connect_server(
             in_flight.clone(),
             last_rx_at.clone(),
             unresponsive.clone(),
+            bytes_pending_in_os.clone(),
+            server_minor.clone(),
         ));
         (read_task, write_task)
     };
@@ -987,6 +1150,8 @@ async fn connect_server(
             in_flight.clone(),
             last_rx_at.clone(),
             unresponsive.clone(),
+            bytes_pending_in_os.clone(),
+            server_minor.clone(),
         ));
         (read_task, write_task)
     };
@@ -994,6 +1159,7 @@ async fn connect_server(
     Some(ServerConnection {
         write_tx,
         pending_frames,
+        server_minor,
         beacon_arrival_tx,
         _read_task: read_task,
         _write_task: write_task,
@@ -1131,7 +1297,7 @@ async fn write_loop<W: AsyncWrite + Unpin + Send + 'static>(
     // socket error (`Err`) or a 0-byte accept still closes (`TcpClosed`):
     // those are a dead socket, not a slow one, mirroring C's `flushToWire`
     // failure → `shutdown(SHUT_WR)` teardown (`tcpiiu.cpp:168-176`).
-    let send_timeout = echo_idle();
+    let send_timeout = connection_timeout();
     let mut batch = Vec::with_capacity(4096);
     while let Some(frame) = rx.recv().await {
         let mut drained: usize = 1;
@@ -1224,9 +1390,12 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
     in_flight: super::types::InFlightOps,
     last_rx_at: super::types::ServerLastRxAt,
     unresponsive: std::sync::Arc<UnresponsiveGate>,
+    bytes_pending_in_os: OsRecvQueueProbe,
+    server_minor: std::sync::Arc<std::sync::atomic::AtomicU16>,
 ) {
-    // Helper: emit an echo (or pre-v4.3 READ_SYNC) request. Used
-    // both on idle expiry and on the first leg of an echo timeout.
+    // Helper: emit an echo (or pre-v4.3 READ_SYNC) request. Used on idle
+    // expiry, and again on echo timeout (C `unresponsiveCircuitNotify`
+    // re-arms `echoRequestPending`, `tcpiiu.cpp:908`).
     fn send_echo(
         write_tx: &mpsc::UnboundedSender<Vec<u8>>,
         server_minor_version: u16,
@@ -1242,6 +1411,15 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
 
     let mut buf = vec![0u8; 8192];
     let mut accumulated = Vec::new();
+    // C `tcpiiu::processIncoming`'s receive-side body limit and its
+    // ignore-don't-close policy (`tcpiiu.cpp:1207-1283`). `None` — the C
+    // default (`EPICS_CA_AUTO_ARRAY_BYTES=YES`) — means the circuit accepts
+    // any payload the server announces; an operator who turns it off gets a
+    // limit, and over-limit responses are dropped one-by-one with a single
+    // log line. Neither case ever closes the circuit.
+    let recv_body_limit = crate::protocol::max_recv_body_bytes();
+    let mut bytes_to_drain: usize = 0;
+    let mut oversize_logged = false;
     let idle_timeout = Duration::from_secs(echo_idle_secs());
     let echo_timeout = Duration::from_secs(ECHO_TIMEOUT_SECS);
     let mut echo_pending = false;
@@ -1263,18 +1441,38 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
     // overwrites it before the wall-clock skip is consulted.
     let mut last_loop_at;
     // libca `tcpRecvWatchdog::beaconAnomaly` flag. Set when the
-    // beacon monitor classifies a beacon as a real restart signal
-    // (`IdMismatch` / `PeriodCollapse`); suppresses subsequent
+    // beacon monitor classifies a beacon as anomalous — fresh sequence
+    // or off-band period (`bhe.cpp:226-262`); suppresses subsequent
     // healthy-beacon watchdog refreshes so the deadline expires on
     // its own schedule. Cleared on any data arrival from the server.
     let mut beacon_anomaly = false;
-    // Escalation counter for the echo probe: `false` on the first echo
-    // timeout (mark unresponsive + send a second probe), `true` on the
-    // second (declare the circuit dead). Distinct from the shared
-    // `unresponsive` flag, which is the circuit-level state — also set by
-    // the send watchdog in `write_loop` — and guards the one-shot
-    // `CircuitUnresponsive`/`CircuitResponsive` events.
-    let mut probe_escalated = false;
+    // C `tcpRecvWatchdog`'s timer armed/cancelled state. `expire` returns
+    // `noRestart` once the echo probe times out (`tcpRecvWatchdog.cpp:81`)
+    // and `unresponsiveCircuitNotify` cancels the timer outright
+    // (`tcpiiu.cpp:915-921`), so the watchdog stops firing on an
+    // already-unresponsive circuit; the socket stays open and any byte from
+    // the server re-arms it. Distinct from the shared `unresponsive` flag,
+    // which is the circuit-level state — also set by the send watchdog in
+    // `write_loop` — and guards the one-shot `CircuitUnresponsive` /
+    // `CircuitResponsive` events.
+    let mut watchdog_armed = true;
+    // libca flow control (C `tcpRecvThread::run`, `tcpiiu.cpp:543-572`).
+    // `contig_recv_msg_count` counts consecutive receive frames that each
+    // left bytes still unread in the OS socket buffer; once it reaches
+    // `max_contiguous_frames()` the circuit is "busy" and we ask the server
+    // to stop sending monitors. The moment the socket reads clean the count
+    // resets and, if busy, flow control lifts immediately — C's comment:
+    // "if no bytes are pending then we must immediately switch off flow
+    // control w/o waiting for more data to arrive" (`tcpiiu.cpp:559-561`).
+    //
+    // C splits this across two flags — `busyStateDetected` (recv thread) and
+    // `flowControlActive` (send thread) — only because two threads observe
+    // it. Here one loop both detects the transition and queues the frame, so
+    // one flag carries the whole state and every edge emits exactly one
+    // request.
+    let max_contig_frames = crate::protocol::max_contiguous_frames();
+    let mut contig_recv_msg_count: usize = 0;
+    let mut flow_control_active = false;
     let mut server_minor_version: u16 = 0;
     let mut beacon_rx_open = true;
     // C `claim_ciu_reply` (`rsrv/camessage.c:1149-1175`) emits the
@@ -1379,8 +1577,9 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                 }
                 continue;
             }
-            // Watchdog deadline expired.
-            _ = &mut sleep => {
+            // Watchdog deadline expired. Disabled while the watchdog is
+            // cancelled (C: unresponsive circuit, timer not restarted).
+            _ = &mut sleep, if watchdog_armed => {
                 // libca Issue #190: detect suspend wake. If wall-clock
                 // skipped far more than expected for this sleep, the
                 // tokio reactor was paused (laptop suspend / VM stop).
@@ -1392,30 +1591,33 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                     .unwrap_or(Duration::ZERO);
                 let suspend_wake = wall_skip >= suspend_threshold;
                 if echo_pending {
-                    if !probe_escalated {
-                        // First echo timeout: perform the one-shot
-                        // unresponsive transition (shared with the send
-                        // watchdog via the gate — emit only on the winning
-                        // transition), then send a second probe before
-                        // declaring death.
-                        unresponsive.mark_unresponsive(&event_tx, server_addr, priority);
-                        probe_escalated = true;
-                        if send_echo(&write_tx, server_minor_version).is_err() {
-                            let _ = event_tx.send(TransportEvent::TcpClosed { server_addr, priority });
-                            return;
-                        }
-                        let probe = if suspend_wake {
-                            SUSPEND_PROBE_TIMEOUT
-                        } else {
-                            echo_timeout
-                        };
-                        deadline = tokio::time::Instant::now() + probe;
-                        sleep.as_mut().reset(deadline);
-                        continue;
+                    // Echo timeout. C `tcpRecvWatchdog::expire` with
+                    // `probeResponsePending` set calls `receiveTimeoutNotify`
+                    // and returns `noRestart` (`tcpRecvWatchdog.cpp:54-81`).
+                    // That routes to `tcpiiu::unresponsiveCircuitNotify`
+                    // (`tcpiiu.cpp:890-941`), which marks the circuit
+                    // unresponsive, re-arms `echoRequestPending` so one more
+                    // probe departs on the send thread, cancels BOTH
+                    // watchdogs, raises `ECA_UNRESPTMO` — and KEEPS the
+                    // socket. The circuit is torn down only on a genuine
+                    // socket error (`tcpiiu.cpp:586-601`), i.e. the
+                    // `Ok(0) | Err(_)` read arm below.
+                    //
+                    // So: perform the one-shot unresponsive transition
+                    // (shared with the send watchdog via the gate — only the
+                    // winning transition emits), emit the trailing probe, and
+                    // DISARM the watchdog. The data-arrival path below is the
+                    // recovery: it re-arms the deadline and emits the sole
+                    // `CircuitResponsive`. A server that goes quiet for
+                    // minutes and comes back keeps its circuit, its channels
+                    // and its subscriptions, with no re-search.
+                    unresponsive.mark_unresponsive(&event_tx, server_addr, priority);
+                    if send_echo(&write_tx, server_minor_version).is_err() {
+                        let _ = event_tx.send(TransportEvent::TcpClosed { server_addr, priority });
+                        return;
                     }
-                    // Second echo timeout — truly dead.
-                    let _ = event_tx.send(TransportEvent::TcpClosed { server_addr, priority });
-                    return;
+                    watchdog_armed = false;
+                    continue;
                 }
                 // Idle expired — send echo heartbeat. The deadline
                 // path itself doesn't read `beacon_anomaly`; the
@@ -1466,8 +1668,10 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
         // watchdog rather than marking this live circuit unresponsive.
         unresponsive.set_recv_busy(true);
         echo_pending = false;
-        probe_escalated = false;
         beacon_anomaly = false;
+        // Re-arm the watchdog (C `messageArrivalNotify` restarts the timer;
+        // an unresponsive circuit's cancelled timer comes back here).
+        watchdog_armed = true;
         deadline = tokio::time::Instant::now() + idle_timeout;
         sleep.as_mut().reset(deadline);
         // Phase D: bump the per-server "last RX" stamp before any
@@ -1482,24 +1686,23 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
         // guard (`tcpiiu.cpp:867`).
         unresponsive.mark_responsive(&event_tx, server_addr, priority);
 
-        // Automatic CA flow control is intentionally disabled here. The
-        // previous implementation counted TCP reads, which can overshoot badly
-        // on fragmented links and stall remote C IOCs with EVENTS_OFF. A
-        // correct implementation must count parsed monitor messages and resume
-        // based on downstream consumption, not socket read timing.
+        // Flow control is evaluated at the BOTTOM of this iteration, after the
+        // frame's messages have been processed — that is where C samples
+        // `bytesArePendingInOS()` (`tcpiiu.cpp:543-546`).
         accumulated.extend_from_slice(&buf[..n]);
 
-        // Guard against unbounded buffer growth from malformed servers.
-        let accum_cap = max_accumulated();
-        if accumulated.len() > accum_cap {
-            eprintln!(
-                "CA: {server_addr}: accumulated TCP buffer exceeded {accum_cap} bytes, closing"
-            );
-            let _ = event_tx.send(TransportEvent::TcpClosed {
-                server_addr,
-                priority,
-            });
-            return;
+        // C `tcpiiu::processIncoming` (`tcpiiu.cpp:1276-1282`) drains an
+        // ignored oversize body across reads with `recvQue.removeBytes` and
+        // returns to await the rest. `bytes_to_drain` is that counter: while
+        // it is non-zero every byte read belongs to a message we already
+        // decided to ignore, so it is consumed before framing resumes.
+        if bytes_to_drain > 0 {
+            let take = bytes_to_drain.min(accumulated.len());
+            accumulated.drain(..take);
+            bytes_to_drain -= take;
+            if bytes_to_drain > 0 {
+                continue;
+            }
         }
 
         let mut offset = 0;
@@ -1507,13 +1710,10 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
             let frame = &accumulated[offset..];
             // C `tcpiiu.cpp::processIncoming` distinguishes a *partial*
             // extended header (await more bytes) from a *definitively
-            // malformed* one (close the connection). `from_bytes_extended`
-            // returns `Err` for both, so a blanket `break` (await more)
-            // would spin: a malformed header is re-parsed on every read,
-            // never closing until the accumulation cap is hit. Detect the
-            // only legitimate "await more" case — an extended-form header
-            // (`postsize == 0xFFFF`) with fewer than its 24 bytes present
-            // — and treat every other parse error as a hard close.
+            // malformed* one (close the connection). Detect the only
+            // legitimate "await more" case — an extended-form header
+            // (`postsize == 0xFFFF`) with fewer than its 24 bytes present —
+            // and treat every other parse error as a hard close.
             let is_partial_extended_header =
                 frame.len() >= 4 && frame[2] == 0xFF && frame[3] == 0xFF && frame.len() < 24;
             let (hdr, hdr_size) = match CaHeader::from_bytes_extended(frame) {
@@ -1524,57 +1724,18 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                     break;
                 }
                 Err(e) => {
-                    // C `libca/tcpiiu.cpp:1269-1284` logs ONCE
-                    // and skips an oversized message (`m_postsize >
-                    // curDataMax` with realloc failure) via
-                    // `recvQue.removeBytes` — circuit kept alive.
-                    // Pre-fix Rust always closed. Try to recover the
-                    // same way: re-read the announced postsize and
-                    // skip header + payload if the bytes are present.
-                    let base_post = u16::from_be_bytes([frame[2], frame[3]]) as usize;
-                    let skip = if base_post == 0xFFFF && frame.len() >= 24 {
-                        let ext_post =
-                            u32::from_be_bytes([frame[16], frame[17], frame[18], frame[19]])
-                                as usize;
-                        // Sanity cap to stop a corrupted ext_post from
-                        // forcing us to wait for gigabytes of "data";
-                        // if the announced size dwarfs the buffer cap
-                        // it's safer to close.
-                        if ext_post > max_payload_size() * 2 {
-                            None
-                        } else {
-                            Some(24 + ext_post)
-                        }
-                    } else if base_post == 0xFFFF {
-                        // Need annex bytes before we can recover.
-                        break;
-                    } else {
-                        Some(16 + base_post)
-                    };
-                    if let Some(skip_n) = skip {
-                        if accumulated.len() - offset >= skip_n {
-                            tracing::warn!(
-                                server = %server_addr,
-                                err = %e,
-                                skip = skip_n,
-                                "CA: oversized / unparseable TCP frame; skipping (libca tcpiiu:1269-1284 parity)"
-                            );
-                            metrics::counter!("ca_client_oversized_frame_skips_total").increment(1);
-                            offset += skip_n;
-                            continue;
-                        } else {
-                            // Wait for the rest of the bytes before
-                            // skipping.
-                            break;
-                        }
-                    } else {
-                        eprintln!("CA: {server_addr}: malformed TCP header ({e}), closing");
-                        let _ = event_tx.send(TransportEvent::TcpClosed {
-                            server_addr,
-                            priority,
-                        });
-                        return;
-                    }
+                    // The parser carries no size policy (an oversize body is
+                    // a valid header — see `max_recv_body_bytes`, and the
+                    // ignore-don't-close handling below), so the only way to
+                    // land here is a header too short to parse, which the
+                    // loop condition and the partial-annex arm above have
+                    // already excluded. Treat it as a malformed peer.
+                    eprintln!("CA: {server_addr}: malformed TCP header ({e}), closing");
+                    let _ = event_tx.send(TransportEvent::TcpClosed {
+                        server_addr,
+                        priority,
+                    });
+                    return;
                 }
             };
             let actual_post = hdr.actual_postsize();
@@ -1600,6 +1761,33 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
             }
             let msg_len = hdr_size + actual_post;
 
+            // C `tcpiiu::processIncoming` (`tcpiiu.cpp:1269-1283`): a body the
+            // circuit's cache cannot hold is IGNORED — logged once, drained
+            // with `recvQue.removeBytes`, circuit kept. Unreachable with C's
+            // default (`recv_body_limit == None`), which is the whole point:
+            // a C client reads a 33 MB waveform from a C IOC without
+            // complaint, so ours must too.
+            if recv_body_limit.is_some_and(|limit| actual_post > limit) {
+                if !oversize_logged {
+                    eprintln!(
+                        "CA: {server_addr}: response with payload size={actual_post} \
+                         > EPICS_CA_MAX_ARRAY_BYTES ignored"
+                    );
+                    oversize_logged = true;
+                }
+                let present = accumulated.len() - offset;
+                if msg_len <= present {
+                    offset += msg_len;
+                    continue;
+                }
+                // The body is still arriving: consume what is here and carry
+                // the remainder into the next reads (C keeps `curDataBytes`
+                // and returns true to await more).
+                bytes_to_drain = msg_len - present;
+                offset = accumulated.len();
+                break;
+            }
+
             if offset + msg_len > accumulated.len() {
                 break;
             }
@@ -1617,6 +1805,10 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
             match hdr.cmmd {
                 CA_PROTO_VERSION => {
                     server_minor_version = hdr.count;
+                    // Publish to the transport manager: request framing
+                    // gates the extended header on the peer's version
+                    // (C `insertRequestHeader`'s `v49Ok`).
+                    server_minor.store(hdr.count, std::sync::atomic::Ordering::Relaxed);
                     let _ = event_tx.send(TransportEvent::ServerVersion {
                         server_addr,
                         priority,
@@ -1719,7 +1911,27 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                     // decoded here so the hot path does not allocate
                     // one payload Vec per response.
                     let ioid = hdr.available;
-                    if hdr.cid == ECA_NORMAL {
+                    if let Some(subid) = in_flight.take_sub_update(ioid) {
+                        // Circuit-recovery re-subscribe (C
+                        // `tcpiiu::subscriptionUpdateRequest`): the reply is
+                        // the subscription's post-recovery value, not a get
+                        // result — route it to the monitor callback exactly
+                        // as C does by issuing the request under the
+                        // subscription's own id.
+                        let _ = event_tx.send(if hdr.cid == ECA_NORMAL {
+                            TransportEvent::MonitorData {
+                                subid,
+                                data_type: hdr.data_type,
+                                count: hdr.actual_count(),
+                                data: accumulated[data_start..data_start + actual_post].to_vec(),
+                            }
+                        } else {
+                            TransportEvent::MonitorStatusError {
+                                subid,
+                                eca_status: hdr.cid,
+                            }
+                        });
+                    } else if hdr.cid == ECA_NORMAL {
                         let data = &accumulated[data_start..data_start + actual_post];
                         dispatch_read_reply_with(&in_flight, ioid, |mode| {
                             make_read_reply(mode, hdr.data_type, hdr.actual_count(), data)
@@ -1952,9 +2164,34 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                                     ));
                                 }
                             }
-                            // EVENT_ADD errors travel through
-                            // MonitorStatusError (Bug 5 path); EVENT_CANCEL
-                            // confirmations don't have a per-op waiter.
+                            CA_PROTO_EVENT_ADD => {
+                                // C `cac::eventAddExcep` (`cac.cpp:1030-1038`,
+                                // jump-table entry at `cac.cpp:97`) routes the
+                                // echoed EVENT_ADD's `m_available` (the
+                                // subscription id) through
+                                // `ioExceptionNotify` — the status reaches the
+                                // subscription's exception callback and the
+                                // subscription STAYS INSTALLED. Read/write use
+                                // `ioExceptionNotifyAndUninstall` instead; the
+                                // asymmetry is deliberate, because rsrv keeps
+                                // re-posting the monitor (`camessage.c:513-522`
+                                // emits this ERROR on every send-buffer-load
+                                // failure while the circuit stays up), so the
+                                // subscription must survive to receive the next
+                                // attempt.
+                                //
+                                // `on_monitor_error` (via MonitorStatusError)
+                                // is exactly that: delivers
+                                // `Err(ServerError(status))` to the subscriber
+                                // without removing the registry record.
+                                let _ = event_tx.send(TransportEvent::MonitorStatusError {
+                                    subid: ioid,
+                                    eca_status,
+                                });
+                            }
+                            // EVENT_CANCEL confirmations have no per-op waiter;
+                            // C maps them to `defaultExcep` (global exception
+                            // hook only) — the `ServerError` event below.
                             _ => {}
                         }
                     }
@@ -1970,11 +2207,39 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                         msg = %msg,
                         "CA server error",
                     );
+                    // The echoed request's DBR type and element count —
+                    // libca's `caHdrLargeArray.m_dataType` / `m_count`, which
+                    // every exception stub forwards and the default handler
+                    // prints (`type=DBR_STRING, count=1`). The extended form
+                    // (`m_count == 0`, postsize `0xFFFF`) carries the real
+                    // count in the 8-byte annex, same place `echo_hdr_size`
+                    // already accounts for.
+                    let (echo_type, echo_count) = if actual_post >= 16 {
+                        let e = &accumulated[data_start..data_start + 16];
+                        let ty = u16::from_be_bytes([e[4], e[5]]);
+                        let short_count = u16::from_be_bytes([e[6], e[7]]);
+                        let count = if echo_hdr_size == 24 {
+                            let a = &accumulated[data_start + 16..data_start + 24];
+                            u32::from_be_bytes([a[4], a[5], a[6], a[7]])
+                        } else {
+                            u32::from(short_count)
+                        };
+                        (Some(ty), Some(count))
+                    } else {
+                        (None, None)
+                    };
+                    // rsrv stamps the outer `m_cid` with the client's cid for
+                    // channel-scoped commands and `0xFFFF_FFFF` otherwise
+                    // (`rsrv/camessage.c:155-182`).
+                    let err_cid = (hdr.cid != 0xFFFF_FFFF).then_some(hdr.cid);
                     let _ = event_tx.send(TransportEvent::ServerError {
                         eca_status,
                         original_request: orig_cmd,
                         message: msg,
                         server_addr,
+                        cid: err_cid,
+                        data_type: echo_type,
+                        count: echo_count,
                     });
                 }
                 CA_PROTO_SERVER_DISCONN => {
@@ -2051,6 +2316,45 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
         if offset > 0 {
             accumulated.drain(..offset);
         }
+
+        // libca flow control, once per received frame, after the frame's
+        // messages have been processed (C `tcpiiu.cpp:543-572`).
+        //
+        // Key on the OS socket buffer, never on how far behind the
+        // application is. A consumer that stops polling its `MonitorHandle`
+        // must not be able to hold `EVENTS_OFF` down for every *other*
+        // subscription on the circuit — and it cannot, because the moment
+        // this socket reads clean, flow control lifts.
+        let want_flow_control = if bytes_pending_in_os() {
+            if !flow_control_active {
+                contig_recv_msg_count = contig_recv_msg_count.saturating_add(1);
+            }
+            contig_recv_msg_count >= max_contig_frames
+        } else {
+            // "if no bytes are pending then we must immediately switch off
+            // flow control w/o waiting for more data to arrive"
+            // (`tcpiiu.cpp:559-561`).
+            contig_recv_msg_count = 0;
+            false
+        };
+        if want_flow_control != flow_control_active {
+            let cmd = if want_flow_control {
+                CA_PROTO_EVENTS_OFF
+            } else {
+                CA_PROTO_EVENTS_ON
+            };
+            if write_tx
+                .send(CaHeader::new(cmd).to_bytes().to_vec())
+                .is_err()
+            {
+                let _ = event_tx.send(TransportEvent::TcpClosed {
+                    server_addr,
+                    priority,
+                });
+                return;
+            }
+            flow_control_active = want_flow_control;
+        }
     }
 }
 
@@ -2101,6 +2405,8 @@ mod read_loop_tests {
             crate::client::types::InFlightOps::new(),
             std::sync::Arc::new(dashmap::DashMap::new()),
             std::sync::Arc::new(UnresponsiveGate::new()),
+            drained_socket_probe(),
+            std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
         ));
         (server_end, event_rx, write_rx, beacon_tx, task)
     }
@@ -2280,6 +2586,7 @@ mod server_connection_drop_tests {
         let (beacon_arrival_tx, _ba_rx) = mpsc::unbounded_channel::<bool>();
 
         let conn = ServerConnection {
+            server_minor: std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
             write_tx,
             pending_frames: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             beacon_arrival_tx,
@@ -2329,39 +2636,149 @@ mod server_connection_drop_tests {
 }
 
 #[cfg(test)]
-mod framing_cap_tests {
-    //! BUG 2: the accumulation cap must be >= the largest legal frame,
-    //! otherwise a valid large waveform (under `max_payload_size()`)
-    //! closes the connection permanently.
-    use super::max_accumulated;
-    use crate::protocol::max_payload_size;
+mod recv_body_limit_tests {
+    //! R6-21: the receive path must accept any payload a C server can send.
+    //! C bounds the receive body with `EPICS_CA_AUTO_ARRAY_BYTES` (default
+    //! YES ⇒ NO bound, `cac.cpp:227-232`), not `EPICS_CA_MAX_ARRAY_BYTES`,
+    //! and an over-bound response is IGNORED, never fatal
+    //! (`tcpiiu.cpp:1269-1283`). The pre-fix Rust client closed the circuit
+    //! when the accumulated buffer passed a cap derived from
+    //! `EPICS_CA_MAX_ARRAY_BYTES` — permanently, since the server re-sends
+    //! the same waveform on reconnect.
+    use super::*;
+    use dashmap::DashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
 
-    #[test]
-    fn accumulation_cap_admits_largest_legal_frame() {
-        // A legal frame is at most extended-header (24 bytes) +
-        // `max_payload_size()`. The cap must strictly exceed it so the
-        // full frame can sit in `accumulated` before being drained.
-        let largest_legal_frame = max_payload_size() + 24;
+    /// A frame announcing a body far larger than `max_frame_body_bytes()` must
+    /// NOT close the circuit: the loop waits for the body, exactly as C waits
+    /// for the bytes in `recvQue`. (Pre-fix: `TcpClosed` immediately, both
+    /// from the parser's "payload too large" and from the accumulation cap.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn oversize_body_announcement_does_not_close_the_circuit() {
+        let server_addr: SocketAddr = "127.0.0.1:5064".parse().unwrap();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<TransportEvent>();
+        let (write_tx, _write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (_ba_tx, ba_rx) = mpsc::unbounded_channel::<bool>();
+        let in_flight = super::super::types::InFlightOps::new();
+        let last_rx_at: super::super::types::ServerLastRxAt = Arc::new(DashMap::new());
+        let (client_io, server_io) = tokio::io::duplex(256);
+
+        let loop_handle = tokio::spawn(read_loop(
+            server_io,
+            server_addr,
+            0,
+            event_tx,
+            write_tx,
+            ba_rx,
+            in_flight,
+            last_rx_at,
+            std::sync::Arc::new(UnresponsiveGate::new()),
+            drained_socket_probe(),
+            std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
+        ));
+
+        // Extended header announcing 3x max_frame_body_bytes() of body.
+        let mut hdr = CaHeader::new(CA_PROTO_EVENT_ADD);
+        hdr.postsize = 0xFFFF;
+        let mut frame = hdr.to_bytes().to_vec();
+        let huge = (crate::protocol::max_frame_body_bytes() * 3) as u32;
+        frame.extend_from_slice(&huge.to_be_bytes());
+        frame.extend_from_slice(&0u32.to_be_bytes());
+        assert_eq!(frame.len(), 24);
+
+        let mut client = client_io;
+        client.write_all(&frame).await.expect("write header");
+        client.flush().await.expect("flush");
+
+        let early = tokio::time::timeout(Duration::from_millis(300), event_rx.recv()).await;
         assert!(
-            max_accumulated() >= largest_legal_frame,
-            "accumulation cap {} is smaller than the largest legal frame {} \
-             — a valid large waveform would be rejected (BUG 2)",
-            max_accumulated(),
-            largest_legal_frame
+            early.is_err(),
+            "an oversize payload must never close a CA circuit — C logs and \
+             ignores the message, and by default has no size limit at all"
         );
+
+        drop(client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), loop_handle).await;
     }
 
-    #[test]
-    fn accumulation_cap_admits_two_megabyte_waveform() {
-        // The concrete BUG 2 repro: a 2 MB array payload is legal under
-        // the 16 MB default and must NOT trip the cap.
-        let two_mb_frame = 2 * 1024 * 1024 + 24;
-        assert!(
-            max_accumulated() >= two_mb_frame,
-            "2 MB waveform frame ({two_mb_frame} bytes) exceeds the \
-             accumulation cap ({}) — permanent failure for arrays > 1 MB",
-            max_accumulated()
+    /// The end of the same story: a body PAST `max_frame_body_bytes()` is
+    /// delivered, and framing resumes on the frame that follows it. Uses a
+    /// 20 MiB payload — over the 16 MiB `max_frame_body_bytes()` default that the
+    /// pre-fix client turned into a hard close.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn body_larger_than_max_frame_body_bytes_is_delivered() {
+        let server_addr: SocketAddr = "127.0.0.1:5064".parse().unwrap();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<TransportEvent>();
+        let (write_tx, _write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (_ba_tx, ba_rx) = mpsc::unbounded_channel::<bool>();
+        let in_flight = super::super::types::InFlightOps::new();
+        let last_rx_at: super::super::types::ServerLastRxAt = Arc::new(DashMap::new());
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+
+        let loop_handle = tokio::spawn(read_loop(
+            server_io,
+            server_addr,
+            0,
+            event_tx,
+            write_tx,
+            ba_rx,
+            in_flight,
+            last_rx_at,
+            std::sync::Arc::new(UnresponsiveGate::new()),
+            drained_socket_probe(),
+            std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
+        ));
+
+        // 20 MiB EVENT_ADD body for a subscription nobody is waiting on: the
+        // dispatcher drops it, but the framer must consume exactly
+        // 24 + 20 MiB bytes and carry on.
+        const BODY: usize = 20 * 1024 * 1024;
+        assert!(BODY > crate::protocol::max_frame_body_bytes() / 2);
+        let mut hdr = CaHeader::new(CA_PROTO_EVENT_ADD);
+        hdr.postsize = 0xFFFF;
+        let mut frame = hdr.to_bytes().to_vec();
+        frame.extend_from_slice(&(BODY as u32).to_be_bytes());
+        frame.extend_from_slice(&1u32.to_be_bytes());
+        frame.resize(24 + BODY, 0);
+
+        // Trailing VERSION frame: proves the framer resynchronised on the
+        // byte after the huge body rather than closing or desyncing.
+        let mut version = CaHeader::new(CA_PROTO_VERSION);
+        version.count = 13;
+        frame.extend_from_slice(&version.to_bytes());
+
+        let mut client = client_io;
+        tokio::spawn(async move {
+            let _ = client.write_all(&frame).await;
+            let _ = client.flush().await;
+            // Keep the write half alive until the loop has parsed.
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        });
+
+        let evt = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match event_rx.recv().await {
+                    Some(TransportEvent::ServerVersion { minor_version, .. }) => {
+                        return Some(minor_version);
+                    }
+                    Some(TransportEvent::TcpClosed { .. }) => return None,
+                    Some(_) => continue,
+                    None => return None,
+                }
+            }
+        })
+        .await
+        .expect("read_loop must parse past a 20 MiB body");
+        assert_eq!(
+            evt,
+            Some(13),
+            "the frame after a 20 MiB body must still be framed — a large \
+             array must not close or desync the circuit"
         );
+
+        loop_handle.abort();
     }
 }
 
@@ -2370,8 +2787,7 @@ mod malformed_header_close_tests {
     //! BUG 3: the client read loop must distinguish a *partial*
     //! extended header (await more bytes) from a *definitively
     //! malformed* one (close the connection). A blanket "await more"
-    //! spins forever re-parsing the same bad bytes until the
-    //! accumulation cap is hit.
+    //! spins forever re-parsing the same bad bytes.
     use super::*;
     use dashmap::DashMap;
     use std::sync::Arc;
@@ -2404,13 +2820,13 @@ mod malformed_header_close_tests {
         )
     }
 
-    /// A definitively malformed extended header (postsize=0xFFFF marking
-    /// extended form, extended postsize declared far beyond
-    /// `max_payload_size()`) must CLOSE the connection: `read_loop`
-    /// emits `TcpClosed` and returns. Pre-fix it `break`d to await more
-    /// bytes and re-parsed the same error on every read.
+    /// A definitively malformed header must CLOSE the connection, and after
+    /// R6-21 the definitive malformation is C's: a payload size that is not
+    /// 8-byte aligned (`tcpiiu.cpp:1202-1207`, "server sent missaligned
+    /// payload" ⇒ `return false` ⇒ circuit dropped). A merely *large*
+    /// postsize is NOT malformed — see `recv_body_limit_tests`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn malformed_extended_header_closes_connection() {
+    async fn misaligned_payload_closes_connection() {
         let (server_addr, mut event_rx, event_tx, write_tx, ba_rx, in_flight, last_rx_at) =
             loop_inputs();
         let (client_io, server_io) = tokio::io::duplex(256);
@@ -2425,21 +2841,14 @@ mod malformed_header_close_tests {
             in_flight,
             last_rx_at,
             std::sync::Arc::new(UnresponsiveGate::new()),
+            drained_socket_probe(),
+            std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
         ));
 
-        // 24-byte extended header: postsize=0xFFFF (extended marker),
-        // extended postsize set above the sanity cap (2x
-        // max_payload_size()) so the skip-and-continue recovery
-        // can't apply and the loop still closes the circuit.
-        // Values <= 2x max_payload_size() are now treated as
-        // recoverable (skip + continue) per libca tcpiiu:1269-1284.
+        // 16-byte header declaring a 12-byte payload: 12 & 0x7 != 0.
         let mut hdr = CaHeader::new(CA_PROTO_EVENT_ADD);
-        hdr.postsize = 0xFFFF;
-        let mut frame = hdr.to_bytes().to_vec();
-        let bad_post = (crate::protocol::max_payload_size() * 3) as u32;
-        frame.extend_from_slice(&bad_post.to_be_bytes()); // extended postsize
-        frame.extend_from_slice(&0u32.to_be_bytes()); // extended count
-        assert_eq!(frame.len(), 24);
+        hdr.postsize = 12;
+        let frame = hdr.to_bytes().to_vec();
 
         let mut client = client_io;
         client.write_all(&frame).await.expect("write bad header");
@@ -2450,10 +2859,10 @@ mod malformed_header_close_tests {
         // only passes if the loop closes on its own.
         let closed = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
             .await
-            .expect("read_loop must close on a malformed header, not spin");
+            .expect("read_loop must close on a misaligned payload, not spin");
         assert!(
             matches!(closed, Some(TransportEvent::TcpClosed { .. })),
-            "malformed extended header must emit TcpClosed"
+            "misaligned payload must emit TcpClosed"
         );
         let _ = tokio::time::timeout(Duration::from_secs(2), loop_handle).await;
         drop(client);
@@ -2479,6 +2888,8 @@ mod malformed_header_close_tests {
             in_flight,
             last_rx_at,
             std::sync::Arc::new(UnresponsiveGate::new()),
+            drained_socket_probe(),
+            std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
         ));
 
         // 20 bytes: 16-byte base header with postsize=0xFFFF + only 4 of
@@ -2502,6 +2913,600 @@ mod malformed_header_close_tests {
         );
 
         // Clean EOF resolves the loop.
+        drop(client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), loop_handle).await;
+    }
+}
+
+#[cfg(test)]
+mod error_echo_dispatch_tests {
+    //! R8-16: a `CA_PROTO_ERROR` echoing an `EVENT_ADD` header must reach
+    //! the subscription's callback. C `cac::exceptionRespAction` dispatches
+    //! by the *echoed* command through `tcpExcepJumpTableCAC`
+    //! (`cac.cpp:93-97`): EVENT_ADD → `eventAddExcep` → `ioExceptionNotify`
+    //! (`cac.cpp:1030-1038`) — status delivered, subscription NOT
+    //! uninstalled. rsrv emits this frame whenever a monitor update will
+    //! not fit the send buffer (`camessage.c:513-522`) with the circuit
+    //! staying up, so a swallowed error is a silently stalled monitor.
+    use super::*;
+    use dashmap::DashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+
+    /// Builds a `CA_PROTO_ERROR` frame whose 16-byte payload echoes a
+    /// request header of `echo_cmd` carrying `echo_available`
+    /// (ioid / subscription id).
+    fn error_frame(echo_cmd: u16, echo_available: u32, eca_status: u32, cid: u32) -> Vec<u8> {
+        let mut echoed = CaHeader::new(echo_cmd);
+        echoed.postsize = 16;
+        echoed.data_type = 6;
+        echoed.count = 1;
+        echoed.cid = 0x2A;
+        echoed.available = echo_available;
+        let echoed = echoed.to_bytes();
+
+        let mut err = CaHeader::new(CA_PROTO_ERROR);
+        err.postsize = echoed.len() as u16;
+        err.cid = cid;
+        err.available = eca_status;
+
+        let mut frame = err.to_bytes().to_vec();
+        frame.extend_from_slice(&echoed);
+        frame
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn r8_16_error_echoing_event_add_reaches_the_subscription() {
+        let server_addr: SocketAddr = "127.0.0.1:5064".parse().unwrap();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<TransportEvent>();
+        let (write_tx, _write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (_ba_tx, ba_rx) = mpsc::unbounded_channel::<bool>();
+        let in_flight = super::super::types::InFlightOps::new();
+        let last_rx_at: super::super::types::ServerLastRxAt = Arc::new(DashMap::new());
+        let (client_io, server_io) = tokio::io::duplex(256);
+
+        let loop_handle = tokio::spawn(read_loop(
+            server_io,
+            server_addr,
+            0,
+            event_tx,
+            write_tx,
+            ba_rx,
+            in_flight,
+            last_rx_at,
+            std::sync::Arc::new(UnresponsiveGate::new()),
+            drained_socket_probe(),
+            std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
+        ));
+
+        // ECA_TOLARGE echoing subscription id 0xCAFE_BABE — the exact
+        // frame rsrv sends when a monitor update overruns the send buffer.
+        const SUBID: u32 = 0xCAFE_BABE;
+        const ECA_TOLARGE: u32 = 0xC8;
+        let frame = error_frame(CA_PROTO_EVENT_ADD, SUBID, ECA_TOLARGE, 0x2A);
+
+        let mut client = client_io;
+        client.write_all(&frame).await.expect("write ERROR frame");
+        client.flush().await.expect("flush");
+
+        // The subscription-scoped delivery must appear. Pre-fix the
+        // dispatcher's `_ => {}` arm swallowed it and only the global
+        // `ServerError` hook fired.
+        let mut saw_status_error = false;
+        let mut saw_server_error = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline && !(saw_status_error && saw_server_error) {
+            match tokio::time::timeout_at(deadline, event_rx.recv()).await {
+                Ok(Some(TransportEvent::MonitorStatusError { subid, eca_status })) => {
+                    assert_eq!(subid, SUBID, "must carry the echoed subscription id");
+                    assert_eq!(eca_status, ECA_TOLARGE, "must carry the ECA status");
+                    saw_status_error = true;
+                }
+                Ok(Some(TransportEvent::ServerError { .. })) => saw_server_error = true,
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => break,
+            }
+        }
+        assert!(
+            saw_status_error,
+            "CA_PROTO_ERROR echoing EVENT_ADD must be routed to the \
+             subscription (C: eventAddExcep → ioExceptionNotify)"
+        );
+        assert!(
+            saw_server_error,
+            "the global exception hook must still fire (C: cac::exception)"
+        );
+
+        drop(client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), loop_handle).await;
+    }
+
+    /// The asymmetry C encodes in the jump table: read/write use
+    /// `ioExceptionNotifyAndUninstall`, EVENT_ADD does not. A read error
+    /// must therefore still complete-and-remove its in-flight IO, and must
+    /// NOT emit a subscription-scoped error.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn r8_16_error_echoing_read_notify_still_uninstalls_the_io() {
+        let server_addr: SocketAddr = "127.0.0.1:5064".parse().unwrap();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<TransportEvent>();
+        let (write_tx, _write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (_ba_tx, ba_rx) = mpsc::unbounded_channel::<bool>();
+        let in_flight = super::super::types::InFlightOps::new();
+        let last_rx_at: super::super::types::ServerLastRxAt = Arc::new(DashMap::new());
+        let (client_io, server_io) = tokio::io::duplex(256);
+
+        const IOID: u32 = 7;
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        in_flight.reads.insert(
+            IOID,
+            super::super::types::ReadWaiter::OneShot {
+                cid: 0x2A,
+                mode: super::super::types::ReadReplyMode::Plain,
+                reply_tx,
+            },
+        );
+
+        let loop_handle = tokio::spawn(read_loop(
+            server_io,
+            server_addr,
+            0,
+            event_tx,
+            write_tx,
+            ba_rx,
+            in_flight.clone(),
+            last_rx_at,
+            std::sync::Arc::new(UnresponsiveGate::new()),
+            drained_socket_probe(),
+            std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
+        ));
+
+        const ECA_GETFAIL: u32 = 0xC4;
+        let frame = error_frame(CA_PROTO_READ_NOTIFY, IOID, ECA_GETFAIL, 0x2A);
+        let mut client = client_io;
+        client.write_all(&frame).await.expect("write ERROR frame");
+        client.flush().await.expect("flush");
+
+        let got = tokio::time::timeout(Duration::from_secs(2), reply_rx)
+            .await
+            .expect("read waiter must be completed by the echoed READ_NOTIFY error")
+            .expect("waiter must not be dropped without a reply");
+        assert!(
+            matches!(
+                got,
+                Err(epics_base_rs::error::CaError::ServerError(ECA_GETFAIL))
+            ),
+            "read error must carry the ECA status"
+        );
+        assert!(
+            !in_flight.reads.contains_key(&IOID),
+            "read exceptions uninstall the IO (C: ioExceptionNotifyAndUninstall)"
+        );
+
+        // No subscription-scoped delivery for a read echo.
+        let mut saw_status_error = false;
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(Duration::from_millis(200), event_rx.recv()).await
+        {
+            if matches!(ev, TransportEvent::MonitorStatusError { .. }) {
+                saw_status_error = true;
+            }
+        }
+        assert!(
+            !saw_status_error,
+            "a READ_NOTIFY echo must not be routed to a subscription"
+        );
+
+        drop(client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), loop_handle).await;
+    }
+}
+
+#[cfg(test)]
+mod flow_control_tests {
+    //! R6-17: CA flow control keys on OS socket-buffer occupancy, exactly like
+    //! C `tcpRecvThread::run` (`tcpiiu.cpp:543-572`). `busyStateDetected` is
+    //! set only after `maxContiguousFrames` consecutive receive frames each
+    //! left bytes pending in the OS, and is cleared the *first* time the
+    //! socket reads clean — "w/o waiting for more data to arrive". Consumer
+    //! backlog is not an input, so a stalled reader can never latch
+    //! `EVENTS_OFF` on for the circuit's other subscriptions.
+    use super::*;
+    use dashmap::DashMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+
+    /// Drive `read_loop` with a scriptable occupancy probe and collect the
+    /// flow-control frames it emits.
+    struct Harness {
+        client: tokio::io::DuplexStream,
+        writes: mpsc::UnboundedReceiver<Vec<u8>>,
+        busy: Arc<AtomicBool>,
+        _events: mpsc::UnboundedReceiver<TransportEvent>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    fn harness() -> Harness {
+        let (event_tx, _events) = mpsc::unbounded_channel::<TransportEvent>();
+        let (write_tx, writes) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (_ba_tx, ba_rx) = mpsc::unbounded_channel::<bool>();
+        let busy = Arc::new(AtomicBool::new(false));
+        let probe: OsRecvQueueProbe = {
+            let busy = Arc::clone(&busy);
+            Arc::new(move || busy.load(Ordering::SeqCst))
+        };
+        let last_rx_at: super::super::types::ServerLastRxAt = Arc::new(DashMap::new());
+        let (client, server_io) = tokio::io::duplex(64 * 1024);
+        let task = tokio::spawn(read_loop(
+            server_io,
+            "127.0.0.1:5064".parse().unwrap(),
+            0,
+            event_tx,
+            write_tx,
+            ba_rx,
+            super::super::types::InFlightOps::new(),
+            last_rx_at,
+            Arc::new(UnresponsiveGate::new()),
+            probe,
+            Arc::new(std::sync::atomic::AtomicU16::new(0)),
+        ));
+        Harness {
+            client,
+            writes,
+            busy,
+            _events,
+            task,
+        }
+    }
+
+    /// Push one CA_PROTO_ECHO frame — a complete, harmless message — and wait
+    /// for `read_loop` to consume it, so each call drives exactly one receive
+    /// frame. Without the pause the duplex coalesces several frames into a
+    /// single `read()`, which is one frame for contiguous-count purposes.
+    async fn one_frame(h: &mut Harness) {
+        let frame = CaHeader::new(CA_PROTO_ECHO).to_bytes().to_vec();
+        h.client.write_all(&frame).await.expect("write");
+        h.client.flush().await.expect("flush");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+
+    /// Drain whatever the loop queued for the wire, as command codes.
+    async fn drain(h: &mut Harness) -> Vec<u16> {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut out = Vec::new();
+        while let Ok(frame) = h.writes.try_recv() {
+            out.push(CaHeader::from_bytes(&frame).expect("header").cmmd);
+        }
+        out
+    }
+
+    /// The trigger is `max_contiguous_frames()` CONSECUTIVE busy frames —
+    /// frame N-1 must not fire, frame N must. Then the very next drained read
+    /// must lift it, with no consumer having drained anything.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn r6_17_events_off_at_the_contiguous_frame_boundary() {
+        let trigger = crate::protocol::max_contiguous_frames();
+        let mut h = harness();
+
+        // Frames 1..trigger-1 with bytes still pending: under the bound, so no
+        // flow control yet.
+        h.busy.store(true, Ordering::SeqCst);
+        for _ in 0..trigger - 1 {
+            one_frame(&mut h).await;
+        }
+        assert_eq!(
+            drain(&mut h).await,
+            Vec::<u16>::new(),
+            "{} contiguous busy frames is one short of the bound — no EVENTS_OFF",
+            trigger - 1
+        );
+
+        // Frame `trigger`: the bound is reached.
+        one_frame(&mut h).await;
+        assert_eq!(
+            drain(&mut h).await,
+            vec![CA_PROTO_EVENTS_OFF],
+            "the {trigger}th contiguous busy frame must trip EVENTS_OFF"
+        );
+
+        // Socket drains. No consumer did anything — libca lifts flow control
+        // on the socket alone, immediately, on the very next frame.
+        h.busy.store(false, Ordering::SeqCst);
+        one_frame(&mut h).await;
+        assert_eq!(
+            drain(&mut h).await,
+            vec![CA_PROTO_EVENTS_ON],
+            "a drained socket must lift EVENTS_OFF immediately, with no \
+             consumer-side drain"
+        );
+
+        h.task.abort();
+    }
+
+    /// A busy run BROKEN by one clean read resets the contiguous count to 0
+    /// (C `contigRecvMsgCount = 0u`), so the next busy run starts over from 1
+    /// rather than resuming near the bound.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn r6_17_a_clean_read_resets_the_contiguous_count() {
+        let trigger = crate::protocol::max_contiguous_frames();
+        let mut h = harness();
+
+        h.busy.store(true, Ordering::SeqCst);
+        for _ in 0..trigger - 1 {
+            one_frame(&mut h).await;
+        }
+        // One clean read breaks the run.
+        h.busy.store(false, Ordering::SeqCst);
+        one_frame(&mut h).await;
+        assert_eq!(drain(&mut h).await, Vec::<u16>::new());
+
+        // Back to busy: a fresh run of trigger-1 must still be under the bound.
+        h.busy.store(true, Ordering::SeqCst);
+        for _ in 0..trigger - 1 {
+            one_frame(&mut h).await;
+        }
+        assert_eq!(
+            drain(&mut h).await,
+            Vec::<u16>::new(),
+            "the clean read must have reset the count — the run restarts at 1"
+        );
+
+        h.task.abort();
+    }
+
+    /// C `cac.cpp:233-237`: the trigger scales with EPICS_CA_MAX_ARRAY_BYTES,
+    /// and at the C default one max-size array is exactly one receive buffer,
+    /// so it stays at `contiguousMsgCountWhichTriggersFlowControl` = 10.
+    #[test]
+    fn r6_17_max_contiguous_frames_scales_from_max_array_bytes() {
+        use crate::protocol::{
+            COM_BUF_SIZE, MAX_TCP, max_array_bytes_buffer, max_contiguous_frames,
+        };
+        assert_eq!(
+            MAX_TCP / COM_BUF_SIZE,
+            1,
+            "bufsPerArray is not > 1 at the C default"
+        );
+        assert!(
+            max_array_bytes_buffer() >= MAX_TCP,
+            "C rounds up to MAX_TCP"
+        );
+        assert!(
+            max_contiguous_frames() >= 10,
+            "never below C's contiguousMsgCountWhichTriggersFlowControl"
+        );
+    }
+}
+
+#[cfg(test)]
+mod recv_watchdog_tests {
+    //! R6-16: an echo-probe timeout on the receive watchdog must mark the
+    //! circuit unresponsive and KEEP the socket. C `tcpRecvWatchdog::expire`
+    //! returns `noRestart` after `receiveTimeoutNotify`
+    //! (`tcpRecvWatchdog.cpp:54-81`); `tcpiiu::unresponsiveCircuitNotify`
+    //! (`tcpiiu.cpp:899-941`) cancels both watchdogs, re-arms one more echo,
+    //! raises `ECA_UNRESPTMO`, and never touches the socket. Only a genuine
+    //! socket error tears the circuit down (`tcpiiu.cpp:586-601`).
+    use super::*;
+    use dashmap::DashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+
+    /// Idle expiry → echo probe → echo timeout must emit exactly one
+    /// `CircuitUnresponsive`, a second echo, and NO `TcpClosed` — not even
+    /// after many further echo-timeout windows elapse. Pre-fix the loop
+    /// closed on the second echo timeout.
+    #[tokio::test(start_paused = true)]
+    async fn r6_16_echo_timeout_marks_unresponsive_and_keeps_socket() {
+        let server_addr: SocketAddr = "127.0.0.1:5064".parse().unwrap();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<TransportEvent>();
+        let (write_tx, mut write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (_ba_tx, ba_rx) = mpsc::unbounded_channel::<bool>();
+        let last_rx_at: super::super::types::ServerLastRxAt = Arc::new(DashMap::new());
+        let unresponsive = Arc::new(UnresponsiveGate::new());
+        // A silent-but-open peer: the duplex never yields a byte, and we hold
+        // `client_io` so the read never hits EOF.
+        let (client_io, server_io) = tokio::io::duplex(256);
+
+        let loop_handle = tokio::spawn(read_loop(
+            server_io,
+            server_addr,
+            0,
+            event_tx,
+            write_tx,
+            ba_rx,
+            super::super::types::InFlightOps::new(),
+            last_rx_at,
+            Arc::clone(&unresponsive),
+            drained_socket_probe(),
+            std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
+        ));
+
+        let idle = Duration::from_secs(echo_idle_secs());
+        let echo = Duration::from_secs(ECHO_TIMEOUT_SECS);
+
+        // Idle expiry: first echo probe departs, circuit still responsive.
+        tokio::time::sleep(idle + Duration::from_millis(100)).await;
+        let first = write_rx.try_recv().expect("idle expiry must send an echo");
+        assert_eq!(
+            CaHeader::from_bytes(&first).unwrap().cmmd,
+            CA_PROTO_READ_SYNC,
+            "idle expiry must emit the liveness probe (no VERSION frame was fed \
+             in, so `server_minor_version` is 0 and `send_echo` picks the \
+             pre-v4.3 CA_PROTO_READ_SYNC form)"
+        );
+        assert!(
+            event_rx.try_recv().is_err(),
+            "no event before the echo actually times out"
+        );
+
+        // Echo timeout: unresponsive + one trailing probe (C re-arms
+        // `echoRequestPending` inside `unresponsiveCircuitNotify`).
+        tokio::time::sleep(echo + Duration::from_millis(100)).await;
+        assert!(
+            matches!(
+                event_rx.try_recv(),
+                Ok(TransportEvent::CircuitUnresponsive { .. })
+            ),
+            "echo timeout must emit CircuitUnresponsive"
+        );
+        assert!(
+            write_rx.try_recv().is_ok(),
+            "unresponsiveCircuitNotify must re-arm one more echo request"
+        );
+
+        // The watchdog is now cancelled. Let ten more echo windows elapse:
+        // no further probes, no further events, and above all no TcpClosed.
+        tokio::time::sleep(echo * 10).await;
+        assert!(
+            write_rx.try_recv().is_err(),
+            "a cancelled watchdog must not keep probing"
+        );
+        match event_rx.try_recv() {
+            Err(_) => {}
+            Ok(_) => panic!("unresponsive circuit must be kept, not torn down"),
+        }
+        assert!(
+            !loop_handle.is_finished(),
+            "read_loop must stay alive on an unresponsive circuit"
+        );
+
+        // Recovery: a byte from the server re-arms the watchdog and emits the
+        // sole CircuitResponsive.
+        let mut client = client_io;
+        client
+            .write_all(&CaHeader::new(CA_PROTO_ECHO).to_bytes())
+            .await
+            .expect("write echo reply");
+        client.flush().await.expect("flush");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            matches!(
+                event_rx.try_recv(),
+                Ok(TransportEvent::CircuitResponsive { .. })
+            ),
+            "a byte from the server must recover the circuit"
+        );
+
+        // Re-armed: the next idle window probes again.
+        tokio::time::sleep(idle + Duration::from_millis(100)).await;
+        assert!(
+            write_rx.try_recv().is_ok(),
+            "the watchdog must be re-armed after recovery"
+        );
+
+        drop(client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), loop_handle).await;
+    }
+
+    /// A genuine socket error (peer closes → EOF) is still the one thing that
+    /// tears the circuit down (C `tcpiiu.cpp:586-601`).
+    #[tokio::test(start_paused = true)]
+    async fn r6_16_socket_eof_still_closes() {
+        let server_addr: SocketAddr = "127.0.0.1:5064".parse().unwrap();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<TransportEvent>();
+        let (write_tx, _write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (_ba_tx, ba_rx) = mpsc::unbounded_channel::<bool>();
+        let last_rx_at: super::super::types::ServerLastRxAt = Arc::new(DashMap::new());
+        let (client_io, server_io) = tokio::io::duplex(256);
+
+        let loop_handle = tokio::spawn(read_loop(
+            server_io,
+            server_addr,
+            0,
+            event_tx,
+            write_tx,
+            ba_rx,
+            super::super::types::InFlightOps::new(),
+            last_rx_at,
+            Arc::new(UnresponsiveGate::new()),
+            drained_socket_probe(),
+            std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
+        ));
+
+        drop(client_io);
+        let closed = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+            .await
+            .expect("EOF must close promptly");
+        assert!(
+            matches!(closed, Some(TransportEvent::TcpClosed { .. })),
+            "a real socket error must still emit TcpClosed"
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(2), loop_handle).await;
+    }
+    /// R18-18: the `READ_NOTIFY` the coordinator issues when a circuit becomes
+    /// responsive again is C's `tcpiiu::subscriptionUpdateRequest`
+    /// (`tcpiiu.cpp:1636-1641`), which puts the *subscription's* id in the
+    /// request so the reply reaches the monitor callback. The port's `ioid`
+    /// space is separate, so `InFlightOps::register_sub_update` records the
+    /// owner; the reply must come out as `MonitorData`, not be dropped for
+    /// want of a get waiter (pre-fix: nothing was ever emitted, so a
+    /// `camonitor` never re-posted the value after the IOC un-hung).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recovery_read_notify_reply_posts_to_the_subscription() {
+        let server_addr: SocketAddr = "127.0.0.1:5064".parse().unwrap();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<TransportEvent>();
+        let (write_tx, _write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (_ba_tx, ba_rx) = mpsc::unbounded_channel::<bool>();
+        let in_flight = super::super::types::InFlightOps::new();
+        let last_rx_at: super::super::types::ServerLastRxAt = Arc::new(DashMap::new());
+        let (client_io, server_io) = tokio::io::duplex(1024);
+
+        let ioid = in_flight.register_sub_update(42, 7);
+
+        let loop_handle = tokio::spawn(read_loop(
+            server_io,
+            server_addr,
+            0,
+            event_tx,
+            write_tx,
+            ba_rx,
+            in_flight.clone(),
+            last_rx_at,
+            std::sync::Arc::new(UnresponsiveGate::new()),
+            drained_socket_probe(),
+            std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
+        ));
+
+        // DBR_DOUBLE, one element: the post-recovery value.
+        let mut hdr = CaHeader::new(CA_PROTO_READ_NOTIFY);
+        hdr.data_type = 6;
+        hdr.count = 1;
+        hdr.postsize = 8;
+        hdr.cid = crate::protocol::ECA_NORMAL;
+        hdr.available = ioid;
+        let mut frame = hdr.to_bytes().to_vec();
+        frame.extend_from_slice(&3.5f64.to_be_bytes());
+
+        let mut client = client_io;
+        client.write_all(&frame).await.expect("write");
+        client.flush().await.expect("flush");
+
+        let evt = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+            .await
+            .expect("a recovery re-read must produce an event")
+            .expect("channel open");
+        match evt {
+            TransportEvent::MonitorData {
+                subid,
+                data_type,
+                count,
+                data,
+            } => {
+                assert_eq!(subid, 7, "the reply belongs to the subscription");
+                assert_eq!((data_type, count), (6, 1));
+                assert_eq!(f64::from_be_bytes(data[..8].try_into().unwrap()), 3.5);
+            }
+            _ => panic!("the recovery re-read reply must be posted as MonitorData"),
+        }
+        assert!(
+            in_flight.sub_updates.is_empty(),
+            "the record is consumed by the reply"
+        );
+
         drop(client);
         let _ = tokio::time::timeout(Duration::from_secs(2), loop_handle).await;
     }
@@ -2633,7 +3638,7 @@ mod write_loop_timeout_tests {
             .expect("frame enqueue must succeed");
 
         // First event on the stall must be CircuitUnresponsive (keep the
-        // socket), never TcpClosed. `echo_idle()` (default CONN_TMO 30 s)
+        // socket), never TcpClosed. `connection_timeout()` (default CONN_TMO 30 s)
         // elapses on the paused clock and the send watchdog fires.
         let evt = tokio::time::timeout(Duration::from_secs(60), event_rx.recv())
             .await
@@ -2798,6 +3803,87 @@ mod write_loop_timeout_tests {
     }
 }
 
+#[cfg(all(test, unix))]
+mod connect_deadline_tests {
+    //! R7-19: the client must impose **no** application-level deadline on
+    //! the TCP connect.
+    //!
+    //! C `tcpRecvThread::connect` (`tcpiiu.cpp:606-661`) issues a blocking
+    //! `::connect()` and lets the OS TCP stack bound it — on Linux ~130 s
+    //! of exponentially backed-off SYN retries. The port capped it at a
+    //! hardcoded 5 s, so a server whose handshake is slow but alive (SYN
+    //! loss, congested WAN) was reachable from a C client on the same wire
+    //! and unreachable from this one.
+    use super::*;
+    use crate::client::types::{InFlightOps, ServerLastRxAt};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// A local address whose SYNs the kernel drops: a listening socket
+    /// with a full accept queue. Linux (`tcp_abort_on_overflow = 0`, the
+    /// default) answers an overflowing SYN with silence, so the connecting
+    /// peer sits in SYN-SENT and retries — exactly the "slow but live
+    /// server" shape, without needing a route off the box.
+    ///
+    /// Returns the blackhole address and the listener, which the caller
+    /// must keep alive (and must never accept from).
+    fn syn_blackhole() -> (SocketAddr, socket2::Socket, std::net::TcpStream) {
+        use socket2::{Domain, Socket, Type};
+
+        let sock = Socket::new(Domain::IPV4, Type::STREAM, None).expect("socket");
+        sock.bind(&"127.0.0.1:0".parse::<SocketAddr>().unwrap().into())
+            .expect("bind");
+        // Backlog 0 → the kernel rounds to a 1-slot accept queue.
+        sock.listen(0).expect("listen");
+        let addr: SocketAddr = sock.local_addr().expect("local_addr").as_socket().unwrap();
+
+        // Fill the single accept-queue slot. This handshake completes; the
+        // *next* SYN is the one that gets dropped. Held for the test's
+        // lifetime so the queue stays full.
+        let filler = std::net::TcpStream::connect(addr).expect("fill accept queue");
+
+        (addr, sock, filler)
+    }
+
+    /// With `start_paused`, tokio auto-advances virtual time whenever the
+    /// runtime is otherwise idle — so any timer left in the connect path
+    /// fires immediately while the real SYN is still in flight. The outer
+    /// 10-minute timeout is therefore the *only* timer that may fire: if
+    /// it does, the connect had no deadline of its own, which is the
+    /// contract. Pre-fix, the inner 5 s cap fired first and `connect_server`
+    /// resolved to `None`.
+    #[tokio::test(start_paused = true)]
+    async fn tcp_connect_has_no_application_level_deadline() {
+        let (addr, _listener, _filler) = syn_blackhole();
+
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let identity = Arc::new(parking_lot::RwLock::new(
+            crate::client::types::ClientIdentity::from_env(),
+        ));
+        let connect = connect_server(
+            addr,
+            0,
+            event_tx,
+            InFlightOps::new(),
+            ServerLastRxAt::default(),
+            identity,
+            #[cfg(feature = "experimental-rust-tls")]
+            None,
+            #[cfg(feature = "experimental-rust-tls")]
+            None,
+        );
+
+        let outcome = tokio::time::timeout(Duration::from_secs(600), connect).await;
+        assert!(
+            outcome.is_err(),
+            "connect must still be in the OS's hands after 10 minutes of virtual time; \
+             it resolved instead ({:?}), which means an application-level deadline fired \
+             (C tcpiiu.cpp:606-661 has none)",
+            outcome.map(|c| c.is_some())
+        );
+    }
+}
+
 #[cfg(test)]
 mod priority_circuit_tests {
     //! priority is part of the virtual-circuit identity. Two
@@ -2847,15 +3933,19 @@ mod priority_circuit_tests {
         }
     }
 
-    /// `build_identity_frame` must reproduce libca's extended-size annex:
-    /// a sub-0xFFFF payload stays in the 16-byte header with `postsize`
-    /// set directly; a payload at/over 0xFFFF pegs `postsize` to 0xFFFF
-    /// and appends the real size in the 8-byte annex. A builder writing
-    /// `len as u16` would truncate the size and desync the circuit — this
-    /// guards both the handshake and the runtime-rename broadcast that
-    /// share this builder.
+    /// R6-18: an identity frame is ALWAYS a plain 16-byte header.
+    ///
+    /// It is queued on connect, before the peer's VERSION frame can have
+    /// arrived, so its peer version is unknown and the extended (24-byte)
+    /// header — a CA_V49 feature — must never be emitted. C is in the
+    /// same position and closes it with an assertion:
+    /// `hostNameSetRequest` / `userNameSetRequest` both do
+    /// `assert ( postSize < 0xffff )` (`tcpiiu.cpp:1303`, `:1333`) before
+    /// handing the frame to `insertRequestHeader`. Pre-fix Rust emitted
+    /// the annex for an over-long name, which a pre-V49 peer reads as a
+    /// 65,535-byte body and de-syncs on.
     #[test]
-    fn identity_frame_uses_extended_annex_for_oversized_payload() {
+    fn identity_frame_never_uses_the_extended_annex() {
         let small = build_identity_frame(crate::protocol::CA_PROTO_CLIENT_NAME, "operator");
         let (hdr, consumed) = CaHeader::from_bytes_extended(&small).expect("parse small frame");
         assert_eq!(hdr.cmmd, crate::protocol::CA_PROTO_CLIENT_NAME);
@@ -2863,13 +3953,22 @@ mod priority_circuit_tests {
         assert!(hdr.extended_postsize.is_none());
         assert_eq!(hdr.postsize as usize, small.len() - consumed);
 
+        // A name past the 16-bit postsize cannot occur (C asserts; the IOC
+        // caps a name at 512 bytes). If one is manufactured anyway, the
+        // payload is clipped to the largest aligned size the plain header
+        // can carry — never promoted to an annex.
         let big_value = "h".repeat(0x1_0000); // 65536 > 0xFFFF
         let big = build_identity_frame(crate::protocol::CA_PROTO_HOST_NAME, &big_value);
         let (hdr, consumed) = CaHeader::from_bytes_extended(&big).expect("parse big frame");
         assert_eq!(hdr.cmmd, crate::protocol::CA_PROTO_HOST_NAME);
-        assert_eq!(consumed, 24, "oversized payload carries the 8-byte annex");
-        assert_eq!(hdr.postsize, 0xFFFF);
-        assert_eq!(hdr.extended_postsize, Some((big.len() - consumed) as u32));
+        assert_eq!(consumed, 16, "identity frames are never extended");
+        assert!(hdr.extended_postsize.is_none());
+        assert_eq!(
+            hdr.postsize, 0xFFF8,
+            "clipped to the largest 8-aligned size the plain header carries"
+        );
+        assert_eq!(hdr.postsize as usize, big.len() - consumed);
+        assert_eq!(big[big.len() - 1], 0, "payload stays NUL-terminated");
     }
 
     /// A rename written to the shared identity slot is reflected in the
@@ -3134,5 +4233,76 @@ mod priority_circuit_tests {
             "surviving priority-5 circuit must still carry frames after the sibling closed"
         );
         let _ = s5.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+mod conn_tmo_env_tests {
+    //! Per-boundary coverage of `EPICS_CA_CONN_TMO` resolution (R15-16).
+    //!
+    //! Every row was probed against the compiled C `caget`: the values C
+    //! accepts must yield a working timeout here (no panic), and the ones
+    //! `epicsScanDouble` rejects must fall back to the 30 s default.
+    use super::resolve_connection_timeout;
+    use std::time::Duration;
+
+    /// SAFETY: gated by `serial_test::serial`; restored before return.
+    fn with_env(value: Option<&str>, f: impl FnOnce()) {
+        let saved = std::env::var("EPICS_CA_CONN_TMO").ok();
+        unsafe {
+            match value {
+                Some(v) => std::env::set_var("EPICS_CA_CONN_TMO", v),
+                None => std::env::remove_var("EPICS_CA_CONN_TMO"),
+            }
+        }
+        f();
+        unsafe {
+            match saved {
+                Some(v) => std::env::set_var("EPICS_CA_CONN_TMO", v),
+                None => std::env::remove_var("EPICS_CA_CONN_TMO"),
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn conn_tmo_boundaries() {
+        let default = Duration::from_secs(30);
+        let cases: &[(Option<&str>, Duration)] = &[
+            // Unset and empty are both "use the compiled default" in C
+            // (`envGetConfigParamPtr` folds "" back to unset).
+            (None, default),
+            (Some(""), default),
+            // Valid, including sub-second and whitespace padding.
+            (Some("10.5"), Duration::from_millis(10_500)),
+            (Some(" 10.5 "), Duration::from_millis(10_500)),
+            (Some("0.5"), Duration::from_millis(500)),
+            // strtod takes C99 hex floats.
+            (Some("0x10"), Duration::from_secs(16)),
+            // `inf` is a value C accepts (errno stays clear): a deadline
+            // that never fires. Used to panic the client.
+            (Some("inf"), Duration::MAX),
+            // ERANGE / no-conversion / extraneous → C's default branch.
+            (Some("1e400"), default),
+            (Some("abc"), default),
+            (Some("10x"), default),
+            (Some("   "), default),
+            // NaN and non-positive values fail the `> 0.0` gate. C obeys them
+            // and spins its connection watchdog; this is the documented
+            // deviation at `resolve_connection_timeout`, and it is announced on
+            // stderr rather than applied silently.
+            (Some("nan"), default),
+            (Some("0"), default),
+            (Some("-5"), default),
+        ];
+        for (raw, want) in cases {
+            with_env(*raw, || {
+                assert_eq!(
+                    resolve_connection_timeout(),
+                    *want,
+                    "EPICS_CA_CONN_TMO={raw:?} must resolve to {want:?}"
+                );
+            });
+        }
     }
 }

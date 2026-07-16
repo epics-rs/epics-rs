@@ -146,13 +146,18 @@ impl DrvAsynFtdiPort {
                 destructible: true,
             },
         );
-        base.connected = false;
+        base.init_connected(false);
         base.auto_connect = !no_auto_connect;
+        // C passes `interruptProcess = 1` to `pasynOctetBase->initialize`
+        // (drvAsynFTDIPort.cpp:616): every successful octet read on this port fans out to
+        // its octet interrupt users, which is what drives a SCAN="I/O Intr"
+        // record. See `PortDriverBase::octet_interrupt_process`.
+        base.octet_interrupt_process = true;
         // C drvAsynFTDIPort.cpp:622-623: install asynInterposeEos by default
         // (empty terminator until setInputEos/OEOS), suppressed by
         // noProcessEos.
         if !no_process_eos {
-            base.push_octet_interpose(Box::new(crate::interpose::eos::EosInterpose::default()));
+            base.install_octet_interpose(Box::new(crate::interpose::eos::EosInterpose::default()));
         }
         Ok(Self {
             base,
@@ -190,6 +195,12 @@ impl PortDriver for DrvAsynFtdiPort {
 
     fn base_mut(&mut self) -> &mut PortDriverBase {
         &mut self.base
+    }
+
+    /// C drvAsynFTDIPort registers asynCommon, asynOption and asynOctet
+    /// (drvAsynFTDIPort.cpp:579-613).
+    fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
+        crate::interfaces::octet_transport_capabilities()
     }
 
     fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {

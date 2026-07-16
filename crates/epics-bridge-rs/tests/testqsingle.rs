@@ -533,7 +533,7 @@ async fn arr_channel_filter_applies_to_get_matching_monitor() {
     mon.start().await.expect("start");
     {
         let rec = db.get_record("TEST:filt_wf").await.expect("rec");
-        rec.read().await.notify_field("VAL", EventMask::VALUE);
+        rec.write().await.notify_field("VAL", EventMask::VALUE);
     }
     let ev = tokio::time::timeout(std::time::Duration::from_secs(2), mon.poll())
         .await
@@ -801,9 +801,15 @@ async fn common_field_descriptor_matches_value_type() {
         .unwrap();
 
     // (field, expected descriptor scalar type)
+    //
+    // `.PROC` is `DBF_UCHAR` (`dbCommon.dbd:110`), not `DBF_CHAR`, and pvxs
+    // serves `DBR_UCHAR` as `TypeCode::UInt8` (`ioc/typeutils.cpp`). The
+    // `Byte` this case used to expect was the port's signed storage variant
+    // showing through — the descriptor was derived from the stored value
+    // instead of from the declaration.
     let cases = [
         ("TEST:ai.DESC", ScalarType::String), // DBF_STRING
-        ("TEST:ai.PROC", ScalarType::Byte),   // DBF_CHAR
+        ("TEST:ai.PROC", ScalarType::UByte),  // DBF_UCHAR
         ("TEST:ai.UTAG", ScalarType::ULong),  // DBF_UINT64
     ];
 
@@ -937,7 +943,7 @@ async fn monitor_stop_disables_backing_subscription() {
 
     async fn post(db: &Arc<PvDatabase>, mask: EventMask) {
         let rec = db.get_record("TEST:gate_ai").await.expect("rec");
-        rec.read().await.notify_field("VAL", mask);
+        rec.write().await.notify_field("VAL", mask);
     }
 
     // Active (post-START): a VALUE post is delivered.
@@ -1233,4 +1239,117 @@ async fn trapped_single_put_failure_emits_one_after_fail() {
         "failed put → fail"
     );
     assert_eq!(events[0].event_id, events[1].event_id);
+}
+
+/// R17-31: the QSRV long-string idiom — a `DBF_CHAR` array VAL whose
+/// record carries `info(Q:form, "String")` — is served as an
+/// `NTScalar<string>`, not an `NTScalarArray<byte>`.
+///
+/// pvxs `IOCSource::getChannelValueType` (ioc/iocsource.cpp:634-636):
+/// `final_field_type == DBR_CHAR && isArray && format() == "String"` →
+/// `TypeCode::String`; the GET collapses the buffer at the NUL
+/// (`getArrayValue`, :133-137) and a string PUT goes through
+/// `putLongString` (:513-519) — `dbPut(DBR_CHAR, str, strlen+1)`, so
+/// `NORD` counts the terminator.
+///
+/// Pre-fix the port had no `Q:form` reader outside `display.form`, so this
+/// channel was an `NTScalarArray<byte>` and a string PUT was rejected
+/// (the string was retyped to the bound `DBF_CHAR` and failed to parse).
+#[tokio::test]
+async fn r17_31_qform_string_char_waveform_serves_long_string() {
+    use epics_pva_rs::pvdata::{FieldDesc, ScalarType};
+
+    let db = Arc::new(PvDatabase::new());
+    db.add_record(
+        "TEST:lstr",
+        Box::new(WaveformRecord::new(40, DbFieldType::Char)),
+    )
+    .await
+    .unwrap();
+    {
+        let rec = db.get_record("TEST:lstr").await.expect("record");
+        rec.write().await.set_info("Q:form", "String");
+    }
+    db.put_pv("TEST:lstr", EpicsValue::CharArray(b"abc\0".to_vec()))
+        .await
+        .expect("seed");
+
+    let ch = BridgeChannel::new(db.clone(), "TEST:lstr")
+        .await
+        .expect("new");
+    assert_eq!(
+        ch.nt_type(),
+        NtType::LongString,
+        "info(Q:form,\"String\") on a DBF_CHAR array VAL is the long-string idiom"
+    );
+
+    // The descriptor advertises a string scalar (NTScalar<string>).
+    match ch.get_field().await.expect("get_field") {
+        FieldDesc::Structure { fields, .. } => {
+            let v = fields.iter().find(|(n, _)| n == "value").map(|(_, d)| d);
+            assert!(
+                matches!(v, Some(FieldDesc::Scalar(ScalarType::String))),
+                "value descriptor must be pvString, got {v:?}"
+            );
+        }
+        other => panic!("expected NTScalar descriptor, got {other:?}"),
+    }
+
+    // GET collapses the CHAR buffer at the NUL.
+    match extract_value(&ch.get(&empty_request()).await.expect("get")).expect("value") {
+        PvField::Scalar(ScalarValue::String(s)) => assert_eq!(s, "abc"),
+        other => panic!("expected scalar string value, got {other:?}"),
+    }
+
+    // A string PUT is accepted (putLongString), and it writes the C image:
+    // the bytes plus the NUL, so NORD == strlen + 1.
+    let mut put = PvStructure::new("epics:nt/NTScalar:1.0");
+    put.fields.push((
+        "value".into(),
+        PvField::Scalar(ScalarValue::String("hello world".into())),
+    ));
+    ch.put(&put)
+        .await
+        .expect("string PUT into a long-string channel");
+
+    match extract_value(&ch.get(&empty_request()).await.expect("get")).expect("value") {
+        PvField::Scalar(ScalarValue::String(s)) => assert_eq!(s, "hello world"),
+        other => panic!("expected updated string, got {other:?}"),
+    }
+    let nord = {
+        let rec = db.get_record("TEST:lstr").await.expect("record");
+        let inst = rec.read().await;
+        inst.resolve_field("NORD").expect("NORD")
+    };
+    assert_eq!(
+        nord,
+        EpicsValue::ULong(12),
+        "putLongString writes strlen+1 CHAR elements (the NUL counts)"
+    );
+}
+
+/// Boundary for R17-31: the SAME record without the info tag stays an
+/// `NTScalarArray<byte>` — `Q:form` is what selects the string view, and
+/// pvxs applies it to VAL only (`dbIsValueField`, ioc/channel.cpp:43-47).
+#[tokio::test]
+async fn r17_31_char_waveform_without_qform_stays_a_byte_array() {
+    let db = Arc::new(PvDatabase::new());
+    db.add_record(
+        "TEST:bytes",
+        Box::new(WaveformRecord::new(40, DbFieldType::Char)),
+    )
+    .await
+    .unwrap();
+    db.put_pv("TEST:bytes", EpicsValue::CharArray(b"abc".to_vec()))
+        .await
+        .expect("seed");
+
+    let ch = BridgeChannel::new(db.clone(), "TEST:bytes")
+        .await
+        .expect("new");
+    assert_eq!(ch.nt_type(), NtType::ScalarArray);
+    match extract_value(&ch.get(&empty_request()).await.expect("get")).expect("value") {
+        PvField::ScalarArray(_) | PvField::ScalarArrayTyped(_) => {}
+        other => panic!("expected a byte array, got {other:?}"),
+    }
 }

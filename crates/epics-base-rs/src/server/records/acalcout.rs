@@ -64,11 +64,14 @@
 //!   non-calc-fail `INVALID` (NaN-VAL UDF, limit, MS link) suppresses the OUT
 //!   write for every severity source — not only a failed evaluation. The
 //!   record-level `cached_should_output` still gates the OOPT/calc-fail
-//!   decision; the framework layer is the IVOA backstop on top. SetIVOV writes
-//!   `IVOV` into the field OUT consumes — see `set_output_to_ivov`. Under `DOPT=Use
-//!   CALC`, SetIVOV drives `IVOV` to OUT; literal C sets only the unused
-//!   `oval` there and drives the failed `aval`, so its IVOV substitution is a
-//!   no-op — this port deliberately does NOT replicate that C quirk.
+//!   decision; the framework layer is the IVOA backstop on top. SetIVOV sets
+//!   only the scalar `OVAL` (C `aCalcoutRecord.c:924`), and the OUT write
+//!   buffer is chosen by the resolved target element count exactly as
+//!   `devaCalcoutSoft.c` does — scalar target ⇒ `VAL`/`OVAL`, array target
+//!   ⇒ `AVAL`/`OAV` — so IVOV reaches a scalar `DOPT=Use OCAL` target, an
+//!   array target gets the stale `OAV`, and under `DOPT=Use CALC` the
+//!   substitution is a no-op (C quirk, reproduced). See
+//!   `set_output_to_ivov` / `multi_output_scalar_companion`.
 //! - `SIZE` (NELM vs NUSE) is stored but does not gate the client-advertised
 //!   array capacity: the served element count is always
 //!   `acalcGetNumElements()` (C `get_array_info`), matching C's served data.
@@ -77,29 +80,33 @@
 //!   directly, so the advertised capacity differs only when `NUSE` is set to
 //!   `0 < NUSE < NELM` under `SIZE=NELM`. `NELM=0` (degenerate; dbd
 //!   initial 1) serves a 1-element array, where C serves 0.
-//! - `UDF` follows the framework `value_is_undefined()` (NaN VAL ⇒ UDF). A
-//!   NaN result correctly keeps UDF; but a compile-failure/empty `CALC` on the
-//!   first process shows `UDF=0` (VAL still 0.0) where C keeps `UDF=1` (C sets
-//!   `udf=FALSE` only on a successful calc). Narrow: only before the first
-//!   successful calc.
+//! - `UDF` is C's `pcalc->udf`, owned directly as the framework's `dbCommon.udf`
+//!   `epicsUInt8` (no shadow cell): undefined until a calc successfully defines
+//!   VAL. C `aCalcoutRecord.c:305-307` clears it `else pcalc->udf = FALSE` only
+//!   on a finite result (`cstat==0`) and never re-raises it in `process()`; a
+//!   compile-failure/empty `CALC` (which `aCalcPerform` fails every cycle) keeps
+//!   `UDF=1`, matching C. [`Record::clears_udf`] is `false` so the framework
+//!   does NOT re-derive `UDF` from VAL each cycle — [`Record::check_alarms`]
+//!   (C's `afterCalc` tail) is the single owner, clearing `common.udf` to 0 on a
+//!   successful calc and leaving the byte untouched otherwise. A direct `caput
+//!   UDF` therefore stores its raw `DBF_UCHAR` byte verbatim (`255` for `-1`,
+//!   served signed) instead of collapsing to 0/1, and `checkAlarms` tests it
+//!   exact-one (`udf == TRUE`, [`Record::udf_alarm_on_exact_one`]).
 //! - `LALM` advances on every matched alarm level; C gates it on
 //!   `if (recGblSetSevr(...))` (advance only when that severity actually
 //!   raised `nsev`). Mirrors the framework-wide `rec_gbl_set_sevr` (returns
 //!   void); a higher pre-existing severity can thus perturb next-cycle
 //!   hysteresis vs C.
-//! - In-place array-variable mutation: C `aCalcPerform` may modify the input
-//!   arrays `aa..ll`, and `monitor()` re-posts each array flagged in `newm`
-//!   (aCalcoutRecord.c:1031-1035). The engine evaluates over a clone, so
-//!   mutations are dropped and `AMASK`/`NEWM` stay inert (only `AVAL`/`OAV`
-//!   results are captured). Advanced/uncommon aCalc usage.
 
 use crate::error::{CaError, CaResult};
 use crate::server::record::{
-    FieldDesc, ProcessAction, ProcessOutcome, Record, RecordProcessResult,
+    CyclePostMask, InputFetchPolicy, OutTarget, ProcessAction, ProcessOutcome, Record,
+    RecordProcessResult,
 };
-use crate::types::{DbFieldType, EpicsValue, PvString};
+use crate::types::{EpicsValue, PvString};
 
-use crate::calc::{ArrayInputs, CompiledExpr, acalc_compile, acalc_eval};
+use super::calc_compile;
+use crate::calc::{ArrayInputs, CompiledExpr, ExprKind, acalc_eval};
 // `LINK_CON` (= 3, the `Constant` link-status index) is the value C
 // `init_record` writes for an unconfigured link; shared with `calcout`.
 use super::link_status::LINK_CON;
@@ -107,8 +114,61 @@ use super::link_status::LINK_CON;
 /// Code version reported by `VERS` (C `#define VERSION 1.4`).
 const VERSION: f64 = 1.4;
 
+/// Everything one `aCalcPerform` call changed — its result, and the variable stores
+/// it made on the way there.
+///
+/// C does not need this type: it hands aCalcPerform pointers into the record, so a
+/// store IS the record write and the caller reads the effect back out of its own
+/// fields. The engine here works on an owned [`ArrayInputs`], so the effect is
+/// returned as a value and applied by one owner ([`AcalcoutRecord::apply_stores`]).
+/// Splitting the result from the stores is what makes C's DEFERRED status honest:
+/// a failing expression writes no VAL/AVAL, but the stores it already made stand.
+struct CalcPass {
+    /// `None` when aCalcPerform returned -1 before writing a result.
+    result: Option<(f64, Vec<f64>, bool)>,
+    /// `A..L` / `AA..LL` as the pass left them, plus [`ArrayInputs::amask`] — the
+    /// array fields it stored into.
+    inputs: ArrayInputs,
+}
+
 const ARR_NAMES: [&str; 12] = [
     "AA", "BB", "CC", "DD", "EE", "FF", "GG", "HH", "II", "JJ", "KK", "LL",
+];
+
+/// Number of NUMERIC (scalar `double`) inputs — C's `fieldIndex <=
+/// acalcoutRecordINPL` boundary. The scalar inputs come first in
+/// [`ACALCOUT_INPUT_LINKS`], so this is the length of the prefix that C's
+/// `special()` constant re-seed applies to.
+const ACALCOUT_NUMERIC_INPUTS: usize = 12;
+
+/// `(link_field, value_field)` for every input, scalars A..L first (C's
+/// `INPA..INPL`), then the arrays AA..LL (`INAA..INLL`) — the order
+/// `aCalcoutRecord.c::fetch_values` reads them in.
+const ACALCOUT_INPUT_LINKS: &[(&str, &str)] = &[
+    ("INPA", "A"),
+    ("INPB", "B"),
+    ("INPC", "C"),
+    ("INPD", "D"),
+    ("INPE", "E"),
+    ("INPF", "F"),
+    ("INPG", "G"),
+    ("INPH", "H"),
+    ("INPI", "I"),
+    ("INPJ", "J"),
+    ("INPK", "K"),
+    ("INPL", "L"),
+    ("INAA", "AA"),
+    ("INBB", "BB"),
+    ("INCC", "CC"),
+    ("INDD", "DD"),
+    ("INEE", "EE"),
+    ("INFF", "FF"),
+    ("INGG", "GG"),
+    ("INHH", "HH"),
+    ("INII", "II"),
+    ("INJJ", "JJ"),
+    ("INKK", "KK"),
+    ("INLL", "LL"),
 ];
 const INP_NAMES: [&str; 12] = [
     "INPA", "INPB", "INPC", "INPD", "INPE", "INPF", "INPG", "INPH", "INPI", "INPJ", "INPK", "INPL",
@@ -140,16 +200,32 @@ pub struct AcalcoutRecord {
 
     // --- array sizing ---
     nelm: u32,
+    /// `NUSE` — how many elements of each array the expression uses. The
+    /// record's ONE invariant on it is `nuse <= nelm`, and it is re-established
+    /// only through [`AcalcoutRecord::clamp_nuse`]; nothing else may write this
+    /// field down.
     nuse: u32,
+    /// Set by [`AcalcoutRecord::clamp_nuse`] when it actually clamped, drained by
+    /// `take_cycle_posted_fields`. It is C's `db_post_events(&pcalc->nuse, ...)`
+    /// waiting for the framework's post point — and it lives INSIDE the clamp
+    /// owner so that no site can correct NUSE without telling the subscribers.
+    /// It carries the MASK of the C call site that made it: the `init_record` and
+    /// `process` clamps post `DBE_VALUE|DBE_LOG` (`:189`, `:376`), the
+    /// `special(NUSE)` clamp a bare `DBE_VALUE` (`:497`).
+    nuse_post_pending: Option<CyclePostMask>,
 
     // --- CALC ---
     pub calc: String,
-    compiled_calc: Option<CompiledExpr>,
+    /// C `RPCL`. Always a program: an empty or uncompilable CALC carries C's
+    /// empty `END_EXPRESSION` postfix, which `aCalcPerform` refuses to run
+    /// (`aCalcPerform.c:312-314`), so the record alarms on every process.
+    compiled_calc: CompiledExpr,
     clcv: i32,
 
     // --- OCAL / output-data option ---
     pub ocal: String,
-    compiled_ocal: Option<CompiledExpr>,
+    /// C `ORPC`. Same contract as [`Self::compiled_calc`].
+    compiled_ocal: CompiledExpr,
     oclv: i32,
     dopt: i16, // 0=Use CALC, 1=Use OCAL
     oval: f64,
@@ -213,6 +289,11 @@ pub struct AcalcoutRecord {
 
     // --- process flags ---
     calc_alarm: bool,
+    /// This cycle's `fetch_values()` outcome, pushed by the framework through
+    /// `set_fetch_gate_failed`. C `aCalcoutRecord.c::process` (399) runs
+    /// `doCalc` + `afterCalc` only `if (fetch_values(pcalc)==0)`, and
+    /// `fetch_values` (1068-1071) returns at the first failing `dbGetLink`.
+    fetch_gate_failed: bool,
     cached_should_output: bool,
     /// The output decision captured on an ODLY delaying cycle, restored into
     /// `cached_should_output` on the continuation so the deferred OUT write
@@ -228,11 +309,12 @@ impl Default for AcalcoutRecord {
             pval: 0.0,
             nelm: 1, // dbd initial("1")
             nuse: 0, // dbd initial("0")
+            nuse_post_pending: None,
             calc: String::new(),
-            compiled_calc: None,
+            compiled_calc: CompiledExpr::empty(ExprKind::Array),
             clcv: 0,
             ocal: String::new(),
-            compiled_ocal: None,
+            compiled_ocal: CompiledExpr::empty(ExprKind::Array),
             oclv: 0,
             dopt: 0,
             oval: 0.0,
@@ -286,6 +368,7 @@ impl Default for AcalcoutRecord {
             pmem: 0,
             newm: 0,
             calc_alarm: false,
+            fetch_gate_failed: false,
             cached_should_output: false,
             pending_output: false,
         }
@@ -295,6 +378,38 @@ impl Default for AcalcoutRecord {
 impl AcalcoutRecord {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The ONE place `NUSE > NELM` is corrected — C does it identically at each
+    /// of its three sites, and each time it POSTS:
+    ///
+    /// ```c
+    /// if (pcalc->nuse > pcalc->nelm) {
+    ///     pcalc->nuse = pcalc->nelm;
+    ///     db_post_events(pcalc, &pcalc->nuse, DBE_VALUE|DBE_LOG);
+    /// }
+    /// ```
+    /// `init_record` pass 0 (`aCalcoutRecord.c:188-190`), `process`
+    /// (`:374-377`), `special(NUSE)` (`:495-497`, `DBE_VALUE` there).
+    ///
+    /// The comment C leaves at the process site names the trigger: *"Make sure.
+    /// Autosave is capable of setting NUSE to an illegal value."* — a restore
+    /// writes NUSE and NELM in whatever order the .sav file lists them, so the
+    /// record can legitimately be handed `NUSE > NELM` and must repair it. The
+    /// repair is only half done without the post: the client that wrote the
+    /// illegal value, and every monitor, would keep reading it back while the
+    /// record used the clamped one.
+    ///
+    /// Clamping and posting are therefore ONE operation. The pending post lives
+    /// in this owner's own cell and is drained by `take_cycle_posted_fields`, so
+    /// a caller cannot perform the clamp and forget the post.
+    fn clamp_nuse(&mut self, mask: CyclePostMask) -> bool {
+        if self.nuse > self.nelm {
+            self.nuse = self.nelm;
+            self.nuse_post_pending = Some(mask);
+            return true;
+        }
+        false
     }
 
     /// Current array element count (C `acalcGetNumElements`,
@@ -309,6 +424,31 @@ impl AcalcoutRecord {
         (n as usize).max(1)
     }
 
+    /// C `cvt_dbaddr`'s `paddr->no_elements` (`aCalcoutRecord.c:627-631`) — the
+    /// CAPACITY the database layer sees for an SPC_DBADDR array field, and so the
+    /// bound `dbPut` clamps a client write to (`dbAccess.c:1322`, `:1361-1362`).
+    ///
+    /// ```c
+    /// if (pcalc->size == acalcoutSIZE_NUSE)
+    ///     paddr->no_elements = acalcGetNumElements( pcalc );  /* the NUSE window */
+    /// else
+    ///     paddr->no_elements = pcalc->nelm;                   /* the whole buffer */
+    /// ```
+    ///
+    /// This is NOT [`Self::num_elements`]. SIZE defaults to NELM — it is the first
+    /// choice of the `acalcoutSIZE` menu (`aCalcoutRecord.dbd:32-35`) — so by
+    /// default a client may write the WHOLE `nelm` buffer, including the tail
+    /// `[numElements, nelm)` that NUSE currently hides. Only SIZE=NUSE narrows the
+    /// client to the window, and that is the whole point of the field: it exists so
+    /// a client can be told the smaller size (`:618-625`).
+    fn dbaddr_no_elements(&self) -> usize {
+        if self.size == ACALCOUT_SIZE_NUSE {
+            self.num_elements()
+        } else {
+            (self.nelm as usize).max(1)
+        }
+    }
+
     /// Serve an internal `f64` array as a `DoubleArray` of the client-reported
     /// element count (C `get_array_info` → `acalcGetNumElements`), padding
     /// with 0 when the buffer is short.
@@ -319,8 +459,96 @@ impl AcalcoutRecord {
         EpicsValue::DoubleArray(out)
     }
 
-    fn build_inputs(&self, n: usize, prev_val: f64) -> ArrayInputs {
-        let mut inputs = ArrayInputs::new(n);
+    /// Zero `[from, numElements)` — the REST OF THE WINDOW after a writer that
+    /// delivered fewer elements than the window holds. `[numElements, nelm)`, the
+    /// part of the buffer NUSE currently hides, is NOT touched: it keeps whatever
+    /// was in it and reappears if NUSE grows again.
+    ///
+    /// Both of the record's array writers do this, in the same words:
+    ///
+    /// ```c
+    /// /* fetch_values, aCalcoutRecord.c:1100-1102 — the input link */
+    /// if (nRequest<numElements)
+    ///     for (j=nRequest; j<numElements; j++) (*pavalue)[j] = 0;
+    ///
+    /// /* put_array_info, aCalcoutRecord.c:726-731 — the client dbPut */
+    /// if ( pd && (nNew < numElements) )
+    ///     for (i=nNew; i<numElements; i++) pd[i] = 0.;
+    /// ```
+    ///
+    /// The client half is not optional and not the record's own idea: `dbPut`
+    /// calls `put_array_info` for every SPC_DBADDR field it writes
+    /// (`dbAccess.c:1366-1369`), with `nNew` = the element count that arrived.
+    /// So a caput of two elements into a ten-element window leaves eight zeros
+    /// behind it, not eight stale values — which is the opposite of what W10-A8
+    /// asserted here.
+    /// (C's `if (nNew < numElements)` / `if (nRequest<numElements)` is the guard
+    /// on both loops: a writer that filled the window, or overran it, zeroes
+    /// nothing.)
+    fn zero_fill_window(buf: &mut [f64], from: usize, window: usize) {
+        let len = buf.len();
+        let (from, window) = (from.min(len), window.min(len));
+        if from >= window {
+            return;
+        }
+        for v in &mut buf[from..window] {
+            *v = 0.0;
+        }
+    }
+
+    /// The ONE owner of every write into an SPC_DBADDR array field — AA..LL, AVAL
+    /// and OAV, the three that C's `put_array_info` serves
+    /// (`aCalcoutRecord.c:677-731`), whether the writer is a client `dbPut` or an
+    /// input link.
+    ///
+    /// A write SPLICES its elements into the record's permanent `calloc(nelm)`
+    /// buffer and zeroes the rest of the WINDOW behind them. Both halves belong to
+    /// this owner; a caller that did one without the other is the bug it exists to
+    /// make unwritable.
+    ///
+    /// * SPLICE: C allocates each array field ONCE, at `calloc(pcalc->nelm,
+    ///   sizeof(double))` (`:695-698`, `:1084-1086`), and that buffer lives for the
+    ///   record's lifetime — nothing ever replaces it, so a write is always INTO it
+    ///   and never a swap of it.
+    /// * ZERO-FILL: `[nNew, numElements)`, and `numElements` here is always the NUSE
+    ///   window — `acalcGetNumElements` in BOTH writers (`put_array_info:726-731`,
+    ///   `fetch_values:1100-1102`), whatever the writer's bound was. See
+    ///   [`Self::zero_fill_window`].
+    ///
+    /// `bound` is NOT part of the rule — it is the WRITER's, and the two writers do
+    /// not agree:
+    ///
+    /// * the input link asks `dbGetLink` for `nRequest = acalcGetNumElements(pcalc)`
+    ///   elements (`:1096-1097`), so it can never deliver more than the window;
+    /// * a client `dbPut` is clamped at `paddr->no_elements`
+    ///   (`dbAccess.c:1361-1362`) — [`Self::dbaddr_no_elements`], which is the whole
+    ///   `nelm` buffer under the default SIZE=NELM.
+    ///
+    /// So a client CAN write the tail `[numElements, nelm)` that NUSE hides, and a
+    /// link cannot. Taking the bound as a parameter is what stops the owner from
+    /// deciding for a writer whose rule it does not know: R14-7 gave both writers
+    /// the link's window, and the tail became unwritable.
+    fn write_array_field(
+        &mut self,
+        src: &[f64],
+        bound: usize,
+        select: impl FnOnce(&mut Self) -> &mut Vec<f64>,
+    ) {
+        let nelm = (self.nelm as usize).max(1);
+        let window = self.num_elements();
+        let buf = select(self);
+        buf.resize(nelm, 0.0);
+        let n = src.len().min(bound).min(nelm);
+        buf[..n].copy_from_slice(&src[..n]);
+        Self::zero_fill_window(buf, n, window);
+    }
+
+    fn build_inputs(&self, n: usize, prev_val: f64, prev_aval: &[f64]) -> ArrayInputs {
+        // C `aCalcPerform(&pcalc->a, MAX_FIELDS, &pcalc->aa, ARRAY_MAX_FIELDS,
+        // numElements, ...)` (`aCalcoutRecord.c:1283`, `:1288`) — both counts are 12
+        // (`:156-157`). Args past that are not the record's to write: `M`/`@12`
+        // fetch 0, `@@12 :=` stores nothing and flags no AMASK bit.
+        let mut inputs = ArrayInputs::with_counts(n, 12, 12);
         for i in 0..12 {
             inputs.num_vars[i] = self.num_vals[i];
         }
@@ -335,35 +563,79 @@ impl AcalcoutRecord {
         // `aCalcPerform` calls; `aCalcPerform.c:528-532`). The caller supplies
         // that field's pre-write value as `prev_val`.
         inputs.prev_val = prev_val;
+        // The `AVAL` token is the same story one dimension up: it reads
+        // `p_aresult` (`aCalcPerform.c:534-539`), which is `prec->aval` for the
+        // CALC pass and `prec->oav` for the OCAL pass (`aCalcoutRecord.c:1283-1290`).
+        inputs.prev_aval = prev_aval.to_vec();
+        inputs.prev_aval.resize(n, 0.0);
         inputs
     }
 
     /// Evaluate a compiled expression over the current inputs. `prev_val` seeds
     /// the `VAL` token (see [`Self::build_inputs`]).
     ///
-    /// `Some((scalar, array, finite))` — the result is returned even when
-    /// non-finite, because C `aCalcPerform` stores `*p_dresult`/`aval`
-    /// unconditionally and only *then* returns -1 for a NaN/Inf scalar
-    /// (`aCalcPerform.c:1622-1644`). `finite=false` carries that -1 so the
-    /// caller writes the NaN/Inf into VAL/AVAL (matching C, which drives it to
-    /// OUT under the default `IVOA=Continue`) and still raises CALC_ALARM.
-    /// `None` — the engine could not produce any result (rare for a compiled
-    /// expression); the caller leaves VAL/AVAL unchanged.
+    /// The pass returns EVERYTHING it changed, not just its result, because a C
+    /// aCalcPerform call changes more than its result: C hands it pointers to the
+    /// record's own `a..p` and `aa..ll` fields (`aCalcoutRecord.c:1283-1285`), so a
+    /// store opcode (`A := ...`, `AA := ...`) writes the record IN PLACE. The engine
+    /// here evaluates over an owned [`ArrayInputs`], so the pass hands its effect
+    /// back and [`Self::apply_stores`] is the one place that lands it.
+    ///
+    /// `result`:
+    /// * `Some((scalar, array, finite))` — `finite=false` still carries a result,
+    ///   because C stores `*p_dresult`/`aval` and only *then* returns -1 for a
+    ///   NaN/Inf scalar (`aCalcPerform.c:1622-1644`); the caller writes the NaN/Inf
+    ///   into VAL/AVAL (C drives it to OUT under the default `IVOA=Continue`) and
+    ///   still raises CALC_ALARM.
+    /// * `None` — aCalcPerform returned -1 before writing a result (`:1602-1605`), so
+    ///   VAL/AVAL keep their previous values. The STORES still stand: C's status is
+    ///   deferred to the end of the expression, and the stores it already made went
+    ///   straight into the record's fields on the way there.
     fn eval(
         &self,
         compiled: &CompiledExpr,
         n: usize,
         prev_val: f64,
-    ) -> Option<(f64, Vec<f64>, bool)> {
-        let mut inputs = self.build_inputs(n, prev_val);
-        match acalc_eval(compiled, &mut inputs) {
+        prev_aval: &[f64],
+    ) -> CalcPass {
+        let mut inputs = self.build_inputs(n, prev_val, prev_aval);
+        let result = match acalc_eval(compiled, &mut inputs) {
             Ok(result) => {
                 let v = result.as_f64().unwrap_or(0.0);
-                let mut arr = result.broadcast(n);
+                // C fills AVAL from a scalar result with `toArray(ps,1)`
+                // (`aCalcPerform.c:1624`) — the same promotion as anywhere else,
+                // so a NaN scalar fills AVAL with ZEROS while VAL keeps the NaN
+                // (compiled aCalcPerform: `ACOS(2)` -> st=-1 d=nan a=[0 x8]).
+                let mut arr = result.to_array(n);
                 arr.resize(n, 0.0);
                 Some((v, arr, v.is_finite()))
             }
             Err(_) => None,
+        };
+        CalcPass { result, inputs }
+    }
+
+    /// Land one pass's variable stores back into the record's fields — C's store
+    /// opcodes writing through the pointers it was handed (`aCalcPerform.c:456-491`).
+    ///
+    /// The single owner of that write-back: no other path may copy an `ArrayInputs`
+    /// into `num_vals`/`arr_vals`, so a store cannot land without its AMASK bit and a
+    /// bit cannot be set without its store. The caller owns AMASK's accumulation
+    /// across the two passes, because C does: the CALC pass is handed `&pcalc->amask`
+    /// and resets it (`:326`), and the OCAL pass ORs its own mask in
+    /// (`aCalcoutRecord.c:1289-1291`).
+    ///
+    /// Only the first `n` elements of an array field are written — C's store loops run
+    /// `j < arraySize` (`:483-486`), where arraySize is NUSE (or NELM), so elements
+    /// past NUSE keep whatever the field already held.
+    fn apply_stores(&mut self, inputs: &ArrayInputs, n: usize) {
+        let scalars = self.num_vals.len();
+        self.num_vals.copy_from_slice(&inputs.num_vars[..scalars]);
+        for (dst, src) in self.arr_vals.iter_mut().zip(&inputs.arrays) {
+            if dst.len() < n {
+                dst.resize(n, 0.0);
+            }
+            dst[..n].copy_from_slice(&src[..n]);
         }
     }
 
@@ -378,64 +650,43 @@ impl AcalcoutRecord {
             4 => self.pval != 0.0 && self.val == 0.0,      // Transition To Zero
             5 => self.pval == 0.0 && self.val != 0.0,      // Transition To Non-zero
             6 => false,                                    // Never
-            _ => true,
+            // C's `doOutput` is initialised to 0 (`aCalcoutRecord.c:283`) and
+            // only a case that fires sets it, so an index the switch does not
+            // name drives NO output — the same rule that makes `Never` a 0.
+            _ => false,
         }
     }
 
     /// menuIvoaSet_output_to_IVOV (C `execOutput`, `aCalcoutRecord.c:923-924`):
-    /// make the OUT link carry `IVOV`. C sets only the scalar `oval`;
-    /// `writeValue` then sends `val`/`aval` under `DOPT=Use CALC` or
-    /// `oval`/`oav` under `DOPT=Use OCAL` (`devaCalcoutSoft.c`). This port's
-    /// OUT model drives a single array field, so `IVOV` is written into
-    /// whichever field OUT consumes plus its scalar companion — a scalar OUT
-    /// target therefore also receives `IVOV` (sibling `scalcout` likewise sets
-    /// `VAL=ivov`). This drives `IVOV` uniformly across `DOPT`, whereas literal
-    /// C leaves the `DOPT=Use CALC` output as the failed `VAL`/`AVAL`.
+    /// `pcalc->oval = pcalc->ivov;` — the scalar `OVAL` ONLY. `writeValue`
+    /// then picks the buffer by DOPT and target nelm (`devaCalcoutSoft.c`),
+    /// so the substitution is observable exactly where C makes it so:
+    /// under `DOPT=Use OCAL` a scalar OUT target receives `IVOV` (the
+    /// `&oval` buffer) while an array target receives the stale `OAV`;
+    /// under `DOPT=Use CALC` the buffer is `VAL`/`AVAL`, which IVOV never
+    /// touches, so the substitution is a no-op — a C quirk this port
+    /// reproduces (aCalcPerform fills `OVAL`+`OAV` together, so IVOV is
+    /// the only point where `OVAL` and `OAV[0]` decouple).
     fn set_output_to_ivov(&mut self) {
-        let n = self.num_elements();
-        if self.dopt == 1 {
-            self.oval = self.ivov;
-            self.oav = vec![self.ivov; n];
-        } else {
-            self.val = self.ivov;
-            self.aval = vec![self.ivov; n];
-        }
+        self.oval = self.ivov;
     }
 
+    /// C `aCalcoutRecord.c::special:471-478` — `pcalc->clcv =
+    /// aCalcPostfix(...)`. The value stored is aCalcPostfix's RETURN STATUS,
+    /// which is **-1** on failure (aCalcPostfix.c:801-809), not a generic 1 and
+    /// not the CALC_ERR_* code. An empty CALC is a valid empty program with
+    /// status 0 (aCalcPostfix.c:439-441).
     fn recompile_calc(&mut self) {
-        self.compiled_calc = if self.calc.is_empty() {
-            self.clcv = 0;
-            None
-        } else {
-            match acalc_compile(&self.calc) {
-                Ok(c) => {
-                    self.clcv = 0;
-                    Some(c)
-                }
-                Err(_) => {
-                    self.clcv = 1; // C `clcv = aCalcPostfix(...)` non-zero on error
-                    None
-                }
-            }
-        };
+        let compiled = calc_compile::acalc_postfix("acalcout", "CALC", &self.calc);
+        self.clcv = compiled.status;
+        self.compiled_calc = compiled.program;
     }
 
+    /// C `aCalcoutRecord.c::special:483-490` — same, into ORPC/OCLV.
     fn recompile_ocal(&mut self) {
-        self.compiled_ocal = if self.ocal.is_empty() {
-            self.oclv = 0;
-            None
-        } else {
-            match acalc_compile(&self.ocal) {
-                Ok(c) => {
-                    self.oclv = 0;
-                    Some(c)
-                }
-                Err(_) => {
-                    self.oclv = 1;
-                    None
-                }
-            }
-        };
+        let compiled = calc_compile::acalc_postfix("acalcout", "OCAL", &self.ocal);
+        self.oclv = compiled.status;
+        self.compiled_ocal = compiled.program;
     }
 
     fn num_index(name: &str) -> Option<usize> {
@@ -468,6 +719,13 @@ impl AcalcoutRecord {
         IAAV_NAMES.iter().position(|&n| n == name)
     }
 
+    /// The link-connection-status menu fields INAV..INLV, IAAV..ILLV and OUTV
+    /// (`aCalcoutRecord.dbd:246-419`, `special(SPC_NOMOD)`): served read-only,
+    /// their value derived from the link at init (see [`Self::implements_field`]).
+    fn is_link_status_field(name: &str) -> bool {
+        name == "OUTV" || Self::inav_index(name).is_some() || Self::iaav_index(name).is_some()
+    }
+
     fn pa_index(name: &str) -> Option<usize> {
         PA_NAMES.iter().position(|&n| n == name)
     }
@@ -494,682 +752,6 @@ impl AcalcoutRecord {
     }
 }
 
-static ACALCOUT_FIELDS: &[FieldDesc] = &[
-    // result
-    FieldDesc {
-        name: "VAL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "AVAL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "PVAL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    // sizing — SPC_NOMOD NELM kept read_only, .db-settable via the loader path
-    FieldDesc {
-        name: "NELM",
-        dbf_type: DbFieldType::ULong,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "NUSE",
-        dbf_type: DbFieldType::ULong,
-        read_only: false,
-    },
-    // CALC / OCAL
-    FieldDesc {
-        name: "CALC",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "CLCV",
-        dbf_type: DbFieldType::Long,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OCAL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OCLV",
-        dbf_type: DbFieldType::Long,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DOPT",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OVAL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OAV",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "POVL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    // scalar inputs A..L
-    FieldDesc {
-        name: "A",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "B",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "C",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "D",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "E",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "F",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "G",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "H",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "I",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "J",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "K",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "L",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    // array inputs AA..LL (DBF_NOACCESS double arrays via SPC_DBADDR)
-    FieldDesc {
-        name: "AA",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "BB",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "CC",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DD",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "EE",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "FF",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "GG",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "HH",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "II",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "JJ",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "KK",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    // input links (scalar + array)
-    FieldDesc {
-        name: "INPA",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPB",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPC",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPD",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPE",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPF",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPG",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPH",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPI",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPJ",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPK",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INAA",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INBB",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INCC",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INDD",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INEE",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INFF",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INGG",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INHH",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INII",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INJJ",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INKK",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INLL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OUT",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    // link status (SPC_NOMOD, menu acalcoutINAV)
-    FieldDesc {
-        name: "INAV",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "INBV",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "INCV",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "INDV",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "INEV",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "INFV",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "INGV",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "INHV",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "INIV",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "INJV",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "INKV",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "INLV",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "IAAV",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "IBBV",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "ICCV",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "IDDV",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "IEEV",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "IFFV",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "IGGV",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "IHHV",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "IIIV",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "IJJV",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "IKKV",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "ILLV",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "OUTV",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-    // output options
-    FieldDesc {
-        name: "OOPT",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ODLY",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "WAIT",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DLYA",
-        dbf_type: DbFieldType::UShort,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "OEVT",
-        dbf_type: DbFieldType::UShort,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "IVOA",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "IVOV",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    // display
-    FieldDesc {
-        name: "EGU",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "PREC",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "HOPR",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LOPR",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    // alarm limits
-    FieldDesc {
-        name: "HIHI",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LOLO",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "HIGH",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LOW",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "HHSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LLSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "HSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "HYST",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ADEL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "MDEL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    // previous scalar inputs PA..PL (SPC_NOMOD trackers)
-    FieldDesc {
-        name: "PA",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "PB",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "PC",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "PD",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "PE",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "PF",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "PG",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "PH",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "PI",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "PJ",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "PK",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "PL",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    // alarm trackers (SPC_NOMOD)
-    FieldDesc {
-        name: "LALM",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "ALST",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "MLST",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    // diagnostics
-    FieldDesc {
-        name: "NEWM",
-        dbf_type: DbFieldType::ULong,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "CACT",
-        dbf_type: DbFieldType::Char,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "CSTAT",
-        dbf_type: DbFieldType::Long,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "AMASK",
-        dbf_type: DbFieldType::ULong,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "SIZE",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "AMEM",
-        dbf_type: DbFieldType::Long,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "PMEM",
-        dbf_type: DbFieldType::Long,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "VERS",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-];
-
 /// `menu(acalcoutOOPT)` (`aCalcoutRecord.dbd`): like `scalcoutOOPT` with the
 /// trailing "Never" choice (index 6).
 const ACALCOUT_OOPT_CHOICES: &[&str] = &[
@@ -1191,12 +773,99 @@ const ACALCOUT_WAIT_CHOICES: &[&str] = &["NoWait", "Wait"];
 /// `menu(acalcoutSIZE)`: 0=report NELM, 1=report NUSE to clients.
 const ACALCOUT_SIZE_CHOICES: &[&str] = &["NELM", "NUSE"];
 
+/// `acalcoutSIZE_NUSE` — the SECOND choice of the menu, so 1. The FIRST, and
+/// therefore the default a record gets when the .db says nothing, is
+/// `acalcoutSIZE_NELM` = 0 (`aCalcoutRecord.dbd:32-35`).
+const ACALCOUT_SIZE_NUSE: i16 = 1;
+
 /// `menu(acalcoutINAV)` — input-link PV status (`INAV..ILLV`, `OUTV`).
 const ACALCOUT_INAV_CHOICES: &[&str] = &["Ext PV NC", "Ext PV OK", "Local PV", "Constant"];
 
 impl Record for AcalcoutRecord {
     fn record_type(&self) -> &'static str {
         "acalcout"
+    }
+
+    /// C `acalcoutRecord.c::init_record` compiles CALC/OCAL into RPCL/ORPC and
+    /// stores the postfix status in CLCV/OCLV (aCalcoutRecord.c:245-261) —
+    /// the load-time half of the compile owner. A put goes through
+    /// `special()` instead; `put_field` only stores the string, as C's dbPut
+    /// does.
+    fn init_record(&mut self, pass: u8) -> CaResult<()> {
+        if pass == 0 {
+            // C `init_record` pass 0 (`aCalcoutRecord.c:188-190`) — a .db or an
+            // autosave restore can name NUSE > NELM, and the record must not
+            // enter its first cycle holding it.
+            self.clamp_nuse(CyclePostMask::ValueLog);
+            self.recompile_calc();
+            self.recompile_ocal();
+        }
+        Ok(())
+    }
+
+    /// The link-status menus (INAV..INLV, IAAV..ILLV, OUTV) are served read-only
+    /// by `get_field`, but the record owns no WRITE path for them — they are
+    /// `SPC_NOMOD`, classified from the link at init (`aCalcoutRecord.c:208-242`)
+    /// and held as the record's `Default` of `Constant`(3) (the port has no
+    /// separate init_record seed step). The loader's `.dbd`-initial seed and
+    /// `.db field()` apply both key on this predicate to decide whether to WRITE
+    /// a field; answering `false` keeps them from storing the `.dbd`
+    /// `initial("1")` over the init-derived `Constant` — which is exactly the
+    /// corruption that made a loaded record read `Ext PV OK`(1). The read is
+    /// unaffected: `resolve_field` consults `get_field` independently.
+    fn implements_field(&self, name: &str) -> bool {
+        if Self::is_link_status_field(name) {
+            return false;
+        }
+        self.get_field(name).is_some()
+    }
+
+    /// C `aCalcoutRecord.c::special:469-491` — a put to CALC/OCAL recompiles
+    /// into RPCL/ORPC, stores `aCalcPostfix()`'s return status in CLCV/OCLV,
+    /// posts DBE_VALUE for it, and returns 0: the put is ACCEPTED.
+    fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
+        if !after {
+            return Ok(());
+        }
+        match field {
+            "CALC" => self.recompile_calc(),
+            "OCAL" => self.recompile_ocal(),
+            // C `aCalcoutRecord.c:494-501`:
+            //
+            //   case acalcoutRecordNUSE:
+            //       if (pcalc->nuse > pcalc->nelm) {
+            //           pcalc->nuse = pcalc->nelm;
+            //           db_post_events(pcalc,&pcalc->nuse,DBE_VALUE);
+            //           return(-1);
+            //       }
+            //       return(0);
+            //
+            // The clamped value STAYS and is posted — and the put still FAILS.
+            // C's `dbPut` propagates the nonzero `dbPutSpecial` status
+            // (`dbAccess.c:1399-1405`), so the client is told its NUSE was
+            // illegal, the record does not run its `pp(TRUE)` cycle, and dbPut
+            // makes no post of its own. The port silently accepted the put.
+            "NUSE" => {
+                if self.clamp_nuse(CyclePostMask::Value) {
+                    return Err(CaError::InvalidValue(
+                        "NUSE exceeds NELM; clamped to NELM".into(),
+                    ));
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// C posts the validity field explicitly from `special()`
+    /// (`db_post_events(pcalc, &pcalc->clcv, DBE_VALUE)`,
+    /// aCalcoutRecord.c:478,490).
+    fn monitor_side_effect_fields(&self, put_field: &str) -> &'static [&'static str] {
+        match put_field {
+            "CALC" => &["CLCV"],
+            "OCAL" => &["OCLV"],
+            _ => &[],
+        }
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
@@ -1215,67 +884,92 @@ impl Record for AcalcoutRecord {
 
         let n = self.num_elements();
 
-        self.calc_alarm = false;
-        self.cstat = 0;
-
-        // C `process` line 374-377: clamp a stale NUSE > NELM.
-        if self.nuse > self.nelm {
-            self.nuse = self.nelm;
-        }
+        // C `process` line 374-377 — through the one owner, so the post C makes
+        // here cannot be dropped.
+        self.clamp_nuse(CyclePostMask::ValueLog);
 
         // C `process` line 393-395: snapshot scalar inputs (so PA..PL track
         // the values used in this calc). The framework fetches inputs before
-        // `process()`, so these equal the current A..L.
+        // `process()`, so these equal the current A..L. Runs BEFORE the fetch
+        // gate below — C does it before calling `fetch_values`.
         self.pa = self.num_vals;
 
+        // C `aCalcoutRecord.c::process` (399-414) wraps BOTH `doCalc` and
+        // `afterCalc` in `if (fetch_values(pcalc)==0)`, and `fetch_values`
+        // (1068-1071) returns at the first failing `dbGetLink`. So a failed
+        // input link skips more here than in calc/calcout/sCalcout, whose gate
+        // covers only the calc: `afterCalc` (aCalcoutRecord.c:281-345) is where
+        // the CALC_ALARM/UDF update, `checkAlarms`, the OOPT decision, the
+        // `pval = val` advance and the output all live, so NONE of them happen.
+        // VAL/AVAL/OVAL/OAV and PVAL freeze, no OUT is written, and no limit
+        // alarm is re-evaluated. Only C's tail — timestamp, monitors, forward
+        // link — still runs, and the framework owns that.
+        if self.fetch_gate_failed {
+            self.cached_should_output = false;
+            return Ok(ProcessOutcome::complete());
+        }
+
+        self.calc_alarm = false;
+        self.cstat = 0;
+
         // --- CALC (C call_aCalcPerform, first aCalcPerform → val, aval) ---
+        //
+        // C calls aCalcPerform unconditionally (`aCalcoutRecord.c:263`): RPCL is
+        // always a program, and an empty or uncompilable CALC is the empty one,
+        // which aCalcPerform fails (`aCalcPerform.c:312-314`) → cstat=-1 →
+        // CALC_ALARM every process. So there is no "no expression" case here.
         let mut calc_failed = false;
-        if !self.calc.is_empty() {
-            if let Some(ref compiled) = self.compiled_calc {
-                // NLL: `compiled`'s last use is `eval`, so the immutable
-                // borrow ends before the `self.val`/`self.aval` writes.
-                // CALC pass: the `VAL` token reads `prec->val` (this pass's
-                // result field) before it is overwritten.
-                match self.eval(compiled, n, self.val) {
-                    Some((v, arr, finite)) => {
-                        self.val = v;
-                        self.aval = arr;
-                        if !finite {
-                            calc_failed = true; // NaN/Inf result: C returns -1
-                        }
-                    }
-                    None => calc_failed = true,
+        // CALC pass: the `VAL` token reads `prec->val` (this pass's result
+        // field) before it is overwritten.
+        let pass = self.eval(&self.compiled_calc, n, self.val, &self.aval);
+        // C passes `&pcalc->amask` straight into aCalcPerform, which zeroes it at
+        // entry (`aCalcPerform.c:326`) — so the CALC pass REPLACES the record's mask
+        // and nothing carries over from the previous process.
+        self.amask = pass.inputs.amask;
+        self.apply_stores(&pass.inputs, n);
+        match pass.result {
+            Some((v, arr, finite)) => {
+                self.val = v;
+                self.aval = arr;
+                if !finite {
+                    calc_failed = true; // NaN/Inf result: C returns -1
                 }
-            } else {
-                calc_failed = true; // non-empty CALC failed to compile
             }
+            None => calc_failed = true,
         }
 
         // --- OCAL (C call_aCalcPerform: evaluated EVERY cycle when DOPT=Use
         //     OCAL, before afterCalc → oval, oav) ---
-        if self.dopt == 1 && !self.ocal.is_empty() {
-            if let Some(ref compiled) = self.compiled_ocal {
-                // OCAL pass: the `VAL` token reads `prec->oval` (this pass's
-                // result field, C `p_dresult = &oval`), NOT `prec->val`, so an
-                // OCAL accumulator like "VAL+1" runs on OVAL.
-                match self.eval(compiled, n, self.oval) {
-                    Some((v, arr, finite)) => {
-                        self.oval = v;
-                        self.oav = arr;
-                        if !finite {
-                            calc_failed = true; // NaN/Inf result: C returns -1
-                        }
+        if self.dopt == 1 {
+            // OCAL pass: the `VAL` token reads `prec->oval` (this pass's
+            // result field, C `p_dresult = &oval`), NOT `prec->val`, so an
+            // OCAL accumulator like "VAL+1" runs on OVAL.
+            //
+            // It sees the CALC pass's stores, because C's two calls share the same
+            // record fields — which is why `apply_stores` above must land before this
+            // `eval` rebuilds its inputs from them.
+            let pass = self.eval(&self.compiled_ocal, n, self.oval, &self.oav);
+            // C `aCalcoutRecord.c:1289-1291` — the OCAL pass gets a LOCAL mask that is
+            // then OR'd in, so a CALC-pass store stays flagged.
+            self.amask |= pass.inputs.amask;
+            self.apply_stores(&pass.inputs, n);
+            match pass.result {
+                Some((v, arr, finite)) => {
+                    self.oval = v;
+                    self.oav = arr;
+                    if !finite {
+                        calc_failed = true; // NaN/Inf result: C returns -1
                     }
-                    None => calc_failed = true,
                 }
-            } else {
-                calc_failed = true;
+                None => calc_failed = true,
             }
         }
 
         if calc_failed {
             // C afterCalc line 304-305: cstat != 0 → CALC_ALARM (raised in
-            // `check_alarms`).
+            // `check_alarms`). The UDF clear is C's `else` arm of the SAME test,
+            // so it lives beside the CALC_ALARM raise in `check_alarms` (C's
+            // `afterCalc` tail): a failed calc leaves `common.udf` untouched.
             self.calc_alarm = true;
             self.cstat = -1;
         }
@@ -1351,20 +1045,50 @@ impl Record for AcalcoutRecord {
         use crate::server::recgbl::{self, alarm_status};
         use crate::server::record::AlarmSeverity;
 
+        // C reaches `checkAlarms` only through `afterCalc` (aCalcoutRecord.c:310),
+        // which the `fetch_values()` gate (:399) skips wholesale — so a cycle
+        // whose input fetch failed re-evaluates no alarm at all: neither
+        // CALC_ALARM nor the HIHI/LOLO limits, and LALM does not move.
+        if self.fetch_gate_failed {
+            return;
+        }
+
         // C afterCalc line 304-305: a failed aCalcPerform raises CALC_ALARM.
-        if self.calc_alarm {
+        //
+        // `calc_alarm` is a pending flag with ONE producer (the calc, above) and
+        // ONE consumer (this hook) — the same shape as `calc`/`calcout`/
+        // `scalcout`/`swait`. Take it, so no later reader can mistake it for
+        // "the record is INVALID": severity belongs to `common`, and the record
+        // must ask the framework, never this flag. It survives the ODLY
+        // delaying cycle un-taken on purpose — that cycle returns
+        // `AsyncPendingNotify` before the framework runs `check_alarms` (C
+        // returns ASYNC before `monitor()`, so `nsta`/`nsev` stay pending too),
+        // and the DLYA continuation consumes it here, exactly where C's
+        // `recGblResetAlarms` commits the pending `nsev`.
+        if std::mem::take(&mut self.calc_alarm) {
             recgbl::rec_gbl_set_sevr_msg(
                 common,
                 alarm_status::CALC_ALARM,
                 AlarmSeverity::Invalid,
                 "CALC expression evaluation failed",
             );
+            // C `aCalcoutRecord.c:304-307`: the failed-calc branch does NOT
+            // touch `udf`, so a `caput UDF <byte>` made before a failing cycle
+            // keeps its raw byte here — byte fidelity (`255` for `-1`).
+        } else {
+            // C `aCalcoutRecord.c:307` `else pcalc->udf = FALSE`: a finite calc
+            // DEFINES VAL. This hook (C's `afterCalc` tail) is the SINGLE owner
+            // of `common.udf` — [`Self::clears_udf`] is false, so the framework
+            // never re-derives it from VAL and never collapses the put byte.
+            common.udf = 0;
         }
 
-        // C checkAlarms line 845-852: the UDF guard returns before the limit
-        // check. The framework set `common.udf` from `value_is_undefined()`
-        // before this hook (a NaN VAL keeps UDF and raises UDF_ALARM).
-        if common.udf {
+        // C checkAlarms line 845: `if (pcalc->udf == TRUE)` — EXACT-ONE (`TRUE`
+        // is 1). The guard returns before the limit check; UDF_ALARM itself is
+        // raised centrally by `rec_gbl_check_udf` with the same exact-one flag
+        // ([`Self::udf_alarm_on_exact_one`]). A byte that is neither 0 nor 1
+        // (from a direct `caput UDF 255`) is NOT undefined here, matching C.
+        if common.udf == 1 {
             return;
         }
 
@@ -1413,15 +1137,46 @@ impl Record for AcalcoutRecord {
         }
     }
 
+    /// aCalcout does NOT re-derive UDF from VAL each cycle: C `pcalc->udf` is
+    /// cleared only on a finite calc (`aCalcoutRecord.c:307`) and left otherwise
+    /// — never recomputed from the value. Returning `false` makes
+    /// [`Record::check_alarms`] the single owner of `common.udf` (the C
+    /// `afterCalc` tail); the framework's per-cycle `udf = value_is_undefined()`
+    /// re-derivation is suppressed, so a direct `caput UDF <byte>` keeps its raw
+    /// `DBF_UCHAR` byte (`255` for `-1`) instead of collapsing to 0/1. A default
+    /// record (empty CALC, which C's `aCalcPerform` fails every cycle) reads
+    /// UDF=1 — the C-parity divergence the oracle measured.
+    fn clears_udf(&self) -> bool {
+        false
+    }
+
+    /// C `aCalcoutRecord.c:845` guards `checkAlarms` with `if (pcalc->udf ==
+    /// TRUE)` — EXACT-ONE. With [`Self::clears_udf`] false the byte can hold a
+    /// `caput`-supplied value other than 0/1, so this must match C's `== TRUE`
+    /// (1): a byte of `255` is not undefined and raises no UDF_ALARM.
+    fn udf_alarm_on_exact_one(&self) -> bool {
+        true
+    }
+
     /// IVOA=SetIVOV severity hook. The framework calls this when SEVR is
-    /// INVALID and IVOA=2; `process()` already owns the calc-failure path, so
-    /// this only reinforces the same field write (idempotently). Overriding
-    /// the trait default (which writes VAL via `set_val`) avoids a divergent
-    /// VAL write under `DOPT=Use OCAL`, where the OUT link reads OAV, not VAL.
-    /// Gated on `calc_alarm` + the OOPT decision so it stays consistent with
-    /// `process()` (C `execOutput` runs IVOA only when the record outputs).
+    /// INVALID and IVOA=2. Overriding the trait default (which writes VAL via
+    /// `set_val`) targets `OVAL` — C's `pcalc->oval = pcalc->ivov`, see
+    /// `set_output_to_ivov` and the module doc.
+    ///
+    /// The ONLY record-side gate is the output decision: C reaches the IVOA
+    /// switch through `execOutput` (aCalcoutRecord.c:933-937), and `execOutput`
+    /// runs only when `afterCalc`'s OOPT decision says the record outputs
+    /// (:338-352, and the DLYA continuation at :425-428). The severity test
+    /// inside it is `if (pcalc->nsev < INVALID_ALARM)` (:915) — the RECORD's
+    /// severity, from ANY source: a CALC failure, an MS input link, a limit
+    /// alarm at INVALID severity, UDF at UDFS=INVALID. It was gated on
+    /// `calc_alarm` as well, which silently narrowed C's rule to the calc
+    /// failure alone — an acalcout driven INVALID by HIHI/HHSV or by an MS link
+    /// then drove the computed value at IVOA=SetIVOV instead of IVOV. The
+    /// framework already evaluated `nsev` (it is why this hook was called), so
+    /// asking a private flag for the severity is both wrong and redundant.
     fn apply_invalid_output_value(&mut self, _ivov: EpicsValue) -> CaResult<()> {
-        if self.calc_alarm && self.cached_should_output {
+        if self.cached_should_output {
             self.set_output_to_ivov();
         }
         Ok(())
@@ -1477,7 +1232,6 @@ impl Record for AcalcoutRecord {
             "AMEM" => Some(EpicsValue::Long(self.amem)),
             "PMEM" => Some(EpicsValue::Long(self.pmem)),
             "VERS" => Some(EpicsValue::Double(VERSION)),
-            "CALC_ALARM" => Some(EpicsValue::Char(if self.calc_alarm { 1 } else { 0 })),
             _ => {
                 if let Some(idx) = Self::num_index(name) {
                     return Some(EpicsValue::Double(self.num_vals[idx]));
@@ -1505,6 +1259,60 @@ impl Record for AcalcoutRecord {
         }
     }
 
+    /// C `fetch_values` sets NEWM when an INAA..INLL link delivers an array
+    /// DIFFERENT from the one the field held (`aCalcoutRecord.c:1088-1106`):
+    ///
+    /// ```c
+    /// for (j=0; j<numElements; j++) pcalc->paa[j] = (*pavalue)[j];   /* save */
+    /// nRequest = acalcGetNumElements(pcalc);
+    /// status = dbGetLink(plink, DBR_DOUBLE, *pavalue, 0, &nRequest); /* fetch */
+    /// if (nRequest<numElements) for (j=nRequest; j<numElements; j++) (*pavalue)[j] = 0;
+    /// for (j=0; j<numElements; j++) {
+    ///     if (pcalc->paa[j] != (*pavalue)[j]) {pcalc->newm |= 1<<i; break;}
+    /// }
+    /// ```
+    ///
+    /// and `monitor()` posts exactly the NEWM-flagged arrays and clears the mask
+    /// (`:1031-1036`) — see [`Self::take_cycle_posted_fields`].
+    ///
+    /// The comparison window is `acalcGetNumElements` (NUSE, else NELM) with the
+    /// tail zero-filled: [`AcalcoutRecord::array_field_value`] is exactly that
+    /// view, so comparing it across the write is C's compare.
+    ///
+    /// This is the INTERNAL write path — the framework's input-link delivery
+    /// (`multi_input_links`: INAA..INLL -> AA..LL). A client caput lands in
+    /// `put_field` and does NOT set NEWM, which is C: only `fetch_values` sets it.
+    fn put_field_internal(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
+        let Some(i) = Self::arr_index(name) else {
+            return crate::server::record::put_field_internal_default(self, name, value);
+        };
+        let before = self.array_field_value(&self.arr_vals[i]);
+        // The LINK's bound, and it is this path's alone: C asks the link for exactly
+        // `nRequest = acalcGetNumElements(pcalc)` elements — the NUSE window
+        // (`aCalcoutRecord.c:1096-1097`) — so however long the source array is, no
+        // more than a window's worth ever arrives. The bound is at the REQUEST, so
+        // it belongs here, at the writer, and not in the shared owner: a client
+        // `dbPut` reaching that same owner is bounded at `paddr->no_elements`
+        // instead, which is the whole NELM buffer by default.
+        let value = match Self::coerce_array(value) {
+            Some(mut src) => {
+                src.truncate(self.num_elements());
+                EpicsValue::DoubleArray(src)
+            }
+            None => return Err(CaError::TypeMismatch(name.into())),
+        };
+        // The write itself — splice into the calloc(nelm) buffer, then zero the
+        // rest of the window — is [`Self::write_array_field`], reached through
+        // `put_field`. C's two writers do the same two things in the same order
+        // (`fetch_values:1096-1102` and `put_array_info:726-731`); the only thing
+        // that is this path's alone is NEWM, which only `fetch_values` sets.
+        crate::server::record::put_field_internal_default(self, name, value)?;
+        if self.array_field_value(&self.arr_vals[i]) != before {
+            self.newm |= 1 << i;
+        }
+        Ok(())
+    }
+
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
         match name {
             "VAL" => {
@@ -1513,9 +1321,15 @@ impl Record for AcalcoutRecord {
                     .ok_or_else(|| CaError::TypeMismatch("VAL".into()))?;
                 Ok(())
             }
+            // AVAL and OAV are SPC_DBADDR array fields too (`aCalcoutRecord.c:702`,
+            // `:711`), so a client put into either takes the same
+            // `put_array_info` treatment as AA..LL: splice into the calloc(nelm)
+            // buffer, zero the rest of the window. Replacing the whole vector
+            // dropped both invariants at once.
             "AVAL" => {
-                self.aval = Self::coerce_array(value)
+                let src = Self::coerce_array(value)
                     .ok_or_else(|| CaError::TypeMismatch("AVAL".into()))?;
+                self.write_array_field(&src, self.dbaddr_no_elements(), |r| &mut r.aval);
                 Ok(())
             }
             "PVAL" => {
@@ -1531,21 +1345,25 @@ impl Record for AcalcoutRecord {
                     as u32;
                 Ok(())
             }
+            // The RAW store, C's `dbPut`. The `nuse <= nelm` invariant is NOT
+            // enforced here: `put_field` is also how a `.db` field and an
+            // autosave restore land, and C's loader stores those verbatim — a
+            // `field(NUSE,"5")` written BEFORE `field(NELM,"10")` would
+            // otherwise be clamped against the DEFAULT nelm of 1 and silently
+            // become 1. C repairs the invariant in `special()` and in
+            // `init_record`, once every value is in.
             "NUSE" => {
                 self.nuse = value
                     .to_f64()
                     .ok_or_else(|| CaError::TypeMismatch("NUSE".into()))?
                     as u32;
-                // C special(NUSE) line 494-501 clamps NUSE to NELM.
-                if self.nuse > self.nelm {
-                    self.nuse = self.nelm;
-                }
                 Ok(())
             }
+            // C `dbPut` stores the string; `special()` compiles it and records
+            // aCalcPostfix()'s status in CLCV (see `Self::special`).
             "CALC" => match value {
                 EpicsValue::String(s) => {
                     self.calc = s.as_str_lossy().into_owned();
-                    self.recompile_calc();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("CALC".into())),
@@ -1560,7 +1378,6 @@ impl Record for AcalcoutRecord {
             "OCAL" => match value {
                 EpicsValue::String(s) => {
                     self.ocal = s.as_str_lossy().into_owned();
-                    self.recompile_ocal();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("OCAL".into())),
@@ -1586,8 +1403,9 @@ impl Record for AcalcoutRecord {
                 Ok(())
             }
             "OAV" => {
-                self.oav =
+                let src =
                     Self::coerce_array(value).ok_or_else(|| CaError::TypeMismatch("OAV".into()))?;
+                self.write_array_field(&src, self.dbaddr_no_elements(), |r| &mut r.oav);
                 Ok(())
             }
             "POVL" => {
@@ -1650,13 +1468,13 @@ impl Record for AcalcoutRecord {
                     .ok_or_else(|| CaError::TypeMismatch("IVOV".into()))?;
                 Ok(())
             }
-            "OUTV" => match value {
-                EpicsValue::Short(v) => {
-                    self.outv = v;
-                    Ok(())
-                }
-                _ => Err(CaError::TypeMismatch("OUTV".into())),
-            },
+            // OUTV is `special(SPC_NOMOD)` (aCalcoutRecord.dbd:414-419): its
+            // value is DERIVED from the output link at init/`special`
+            // (aCalcoutRecord.c:216,538 — `*plinkValid = acalcoutINAV_CON` for a
+            // constant link), never set by a client. C `dbPut` rejects the put
+            // with `S_db_noMod` and leaves the link-derived value standing; the
+            // port mirrors that with `ReadOnlyField` (→ `ECA_NOWTACCESS`).
+            "OUTV" => Err(CaError::ReadOnlyField("OUTV".into())),
             "EGU" => match value {
                 EpicsValue::String(s) => {
                     self.egu = s;
@@ -1832,8 +1650,11 @@ impl Record for AcalcoutRecord {
                     return Ok(());
                 }
                 if let Some(idx) = Self::arr_index(name) {
-                    self.arr_vals[idx] = Self::coerce_array(value)
+                    let src = Self::coerce_array(value)
                         .ok_or_else(|| CaError::TypeMismatch(name.into()))?;
+                    self.write_array_field(&src, self.dbaddr_no_elements(), |r| {
+                        &mut r.arr_vals[idx]
+                    });
                     return Ok(());
                 }
                 if let Some(idx) = Self::inp_index(name) {
@@ -1854,19 +1675,14 @@ impl Record for AcalcoutRecord {
                         _ => return Err(CaError::TypeMismatch(name.into())),
                     }
                 }
-                if let Some(idx) = Self::inav_index(name) {
-                    self.inav[idx] = value
-                        .to_f64()
-                        .ok_or_else(|| CaError::TypeMismatch(name.into()))?
-                        as i16;
-                    return Ok(());
-                }
-                if let Some(idx) = Self::iaav_index(name) {
-                    self.iaav[idx] = value
-                        .to_f64()
-                        .ok_or_else(|| CaError::TypeMismatch(name.into()))?
-                        as i16;
-                    return Ok(());
+                // INAV..INLV / IAAV..ILLV are `special(SPC_NOMOD)`
+                // (aCalcoutRecord.dbd:246-413): each is DERIVED from its input
+                // link's connection state at init/`special`
+                // (aCalcoutRecord.c:216,538), not client-settable. C `dbPut`
+                // rejects with `S_db_noMod`, leaving the derived value; the port
+                // mirrors that rather than storing the raw put over it.
+                if Self::inav_index(name).is_some() || Self::iaav_index(name).is_some() {
+                    return Err(CaError::ReadOnlyField(name.to_string()));
                 }
                 if let Some(idx) = Self::pa_index(name) {
                     self.pa[idx] = value
@@ -1885,39 +1701,46 @@ impl Record for AcalcoutRecord {
     /// values through to `put_field` (see `processing.rs`): the scalar
     /// `to_f64` coercion drops arrays, so without that path the AA..LL links
     /// would not populate.
+    /// C `aCalcoutRecord.c:213`: every CONSTANT input link is loaded into its value
+    /// field ONCE, at `init_record` (`recGblInitConstantLink(plink,
+    /// DBF_DOUBLE, pvalue)`); `dbGetLink` then delivers nothing for it on
+    /// every later process, so a client's `caput REC.A 99` stands.
+    fn constant_init_links(&self) -> Vec<crate::server::record::ConstantInitLink> {
+        crate::server::record::seed_input_links(self.multi_input_links())
+    }
+
     fn multi_input_links(&self) -> &[(&'static str, &'static str)] {
-        &[
-            ("INPA", "A"),
-            ("INPB", "B"),
-            ("INPC", "C"),
-            ("INPD", "D"),
-            ("INPE", "E"),
-            ("INPF", "F"),
-            ("INPG", "G"),
-            ("INPH", "H"),
-            ("INPI", "I"),
-            ("INPJ", "J"),
-            ("INPK", "K"),
-            ("INPL", "L"),
-            ("INAA", "AA"),
-            ("INBB", "BB"),
-            ("INCC", "CC"),
-            ("INDD", "DD"),
-            ("INEE", "EE"),
-            ("INFF", "FF"),
-            ("INGG", "GG"),
-            ("INHH", "HH"),
-            ("INII", "II"),
-            ("INJJ", "JJ"),
-            ("INKK", "KK"),
-            ("INLL", "LL"),
-        ]
+        ACALCOUT_INPUT_LINKS
+    }
+
+    /// C `aCalcoutRecord.c::special` (534-540) — the constant re-seed, under C's
+    /// `if (fieldIndex <= acalcoutRecordINPL)` guard: only the NUMERIC inputs
+    /// A..L are re-loaded. The ARRAY inputs AA..LL are not — C's
+    /// `pvalue = &pcalc->a + lnkIndex` is a scalar `double *`, so an array link
+    /// gets `INAV = CON` (the link-status refresh below) and nothing else. That
+    /// guard is this slice: the first twelve entries of `multi_input_links`.
+    fn special_reseed_input_links(&self) -> &[(&'static str, &'static str)] {
+        &ACALCOUT_INPUT_LINKS[..ACALCOUT_NUMERIC_INPUTS]
+    }
+
+    /// C `aCalcoutRecord.c::fetch_values` (1068-1071, 1097) `return`s at the
+    /// first failing `dbGetLink` — in the scalar INPA..INPL loop and then in the
+    /// array INAA..INLL loop, in exactly the order `multi_input_links` lists
+    /// them — and `process` (399) gates `doCalc` + `afterCalc` on the status.
+    fn input_fetch_policy(&self) -> InputFetchPolicy {
+        InputFetchPolicy::AbortOnFirstFailure
+    }
+
+    fn set_fetch_gate_failed(&mut self, failed: bool) {
+        self.fetch_gate_failed = failed;
     }
 
     /// The OUT link receives the array result: AVAL when DOPT=Use CALC, OAV
-    /// when DOPT=Use OCAL (C `devaCalcoutSoft::write_acalcout`). `AVAL[0]==VAL`
-    /// and `OAV[0]==OVAL` by construction, so a scalar OUT target still sees
-    /// the scalar. Gated on the last cycle's OOPT/IVOA decision.
+    /// when DOPT=Use OCAL (C `devaCalcoutSoft::write_acalcout`). Gated on
+    /// the last cycle's OOPT/IVOA decision. The scalar companion below
+    /// supplies the `nelm == 1 ? &val : aval` / `nelm == 1 ? &oval : oav`
+    /// buffer choice — necessary since IVOA=Set_output_to_IVOV decouples
+    /// `OVAL` from `OAV[0]` (see `set_output_to_ivov`).
     fn multi_output_links(&self) -> &[(&'static str, &'static str)] {
         if !self.cached_should_output {
             &[]
@@ -1926,6 +1749,32 @@ impl Record for AcalcoutRecord {
         } else {
             &[("OUT", "AVAL")]
         }
+    }
+
+    /// C `devaCalcoutSoft.c::write_acalcout` (75-87): when the effective
+    /// element count resolves to 1, the write buffer is the scalar field
+    /// — `&pcalc->val` under DOPT=Use CALC, `&pcalc->oval` under Use OCAL
+    /// — not element 0 of the array.
+    ///
+    /// The effective count is C's `nelm`: the target's `no_elements` /
+    /// `dbCaGetNelements` (resolved by the framework into `target`), clamped
+    /// by the source count `i = (nuse > 0) ? nuse : nelm` (:82-83) — the
+    /// staged array's served length here, so a 1-element source picks the
+    /// scalar whatever the target is.
+    fn multi_output_buffer(
+        &self,
+        link_field: &str,
+        staged: EpicsValue,
+        target: &OutTarget,
+    ) -> EpicsValue {
+        if link_field != "OUT" {
+            return staged;
+        }
+        if staged.count() > 1 && target.element_count > 1 {
+            return staged;
+        }
+        let scalar = if self.dopt == 1 { "OVAL" } else { "VAL" };
+        self.get_field(scalar).unwrap_or(staged)
     }
 
     /// `OEVT` ("Event To Issue"): post the numeric output event when output
@@ -1940,10 +1789,6 @@ impl Record for AcalcoutRecord {
         } else {
             None
         }
-    }
-
-    fn field_list(&self) -> &'static [FieldDesc] {
-        ACALCOUT_FIELDS
     }
 
     /// Record-specific `DBF_MENU` fields. `HHSV..LSV` (menuAlarmSevr) and
@@ -1987,11 +1832,101 @@ impl Record for AcalcoutRecord {
             "PG", "PH", "PI", "PJ", "PK", "PL",
         ]
     }
+
+    /// C posts an aCalcout array field from a per-cycle BIT MASK, and neither
+    /// mask consults the value — a store that writes the value the field already
+    /// held still posts.
+    ///
+    /// `afterCalc` (`aCalcoutRecord.c:293-297`), the AMASK half:
+    ///
+    /// ```c
+    /// /* post array fields that aCalcPerform wrote to. */
+    /// for (j=0, panew=&pcalc->aa; j<ARRAY_MAX_FIELDS; j++, panew++) {
+    ///     if (*panew && (pcalc->amask & (1<<j))) {
+    ///         db_post_events(pcalc, *panew, DBE_VALUE|DBE_LOG);
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// AMASK is the mask of arrays the EXPRESSION stored into: aCalcPerform
+    /// zeroes it at the top of every run (`aCalcPerform.c:326`) and sets bit i
+    /// in `STORE_AA..STORE_LL` (`:485-487`), so it is exactly this cycle's
+    /// stores. `AA := AA` sets the bit, changes nothing, and still posts AA —
+    /// the case the framework's change-detection loop drops.
+    ///
+    /// The other mask is NEWM — the arrays whose INAA..INLL LINK delivered a
+    /// changed value this cycle (`fetch_values`, see
+    /// [`AcalcoutRecord::put_field_internal`]). `monitor()` (`:1031-1036`) posts
+    /// those the same way and then clears the mask:
+    ///
+    /// ```c
+    /// for (i=0, panew=&pcalc->aa; i<ARRAY_MAX_FIELDS; i++, panew++) {
+    ///     if (*panew && (pcalc->newm & (1<<i))) {
+    ///         db_post_events(pcalc, *panew, monitor_mask|DBE_VALUE|DBE_LOG);
+    ///     }
+    /// }
+    /// pcalc->newm = 0;
+    /// ```
+    ///
+    /// A link-delivered change is usually also a value change, so the framework's
+    /// change detection covers most of it — but not when the field was moved
+    /// under the subscriber by a client caput, which posts the put's value and
+    /// does NOT advance `last_posted`. The link then re-delivering the ORIGINAL
+    /// value is a no-op to change detection and a NEWM post in C: without this
+    /// the caput value is the last thing the subscriber ever hears, and it is
+    /// wrong.
+    ///
+    /// AMASK needs no clearing here: [`AcalcoutRecord::process`] assigns
+    /// `self.amask` from the pass's mask on every cycle, which is C's
+    /// `*amask = 0` at the head of aCalcPerform. NEWM does — it accumulates
+    /// across `fetch_values` calls until `monitor()` zeroes it, which is why this
+    /// hook TAKES.
+    fn take_cycle_posted_fields(&mut self) -> Vec<(&'static str, CyclePostMask)> {
+        let (amask, newm) = (self.amask, self.newm);
+        self.newm = 0;
+        let mut marks = Vec::new();
+        // C's NUSE clamp post, with the mask of whichever C site made it. Marked
+        // by `clamp_nuse`, the only site that can clamp.
+        if let Some(mask) = self.nuse_post_pending.take() {
+            marks.push(("NUSE", mask));
+        }
+        for (i, name) in ARR_NAMES.iter().enumerate() {
+            let bit = 1u32 << i;
+            // C `afterCalc` (`:296`) runs first, and with a LITERAL mask — the
+            // alarm bits are not in scope there.
+            if amask & bit != 0 {
+                marks.push((*name, CyclePostMask::ValueLog));
+            }
+            // C `monitor()` (`:1034`) runs after, with `monitor_mask` folded in.
+            // An array the expression STORED into and whose input link ALSO
+            // delivered a change is in both masks, and C posts it from both
+            // loops — two events, two masks.
+            if newm & bit != 0 {
+                marks.push((*name, CyclePostMask::MonitorValueLog));
+            }
+        }
+        marks
+    }
+
+    /// AA..LL post from AMASK/NEWM and from nothing else. C `monitor()` keeps a
+    /// previous copy of every SCALAR input (PA..PL, `aCalcoutRecord.c:1023-1029`)
+    /// and of OVAL (POVL, `:1039`) and compares them — but it keeps NO previous
+    /// copy of an array and compares no array anywhere. The only array
+    /// comparison in the record is inside `fetch_values` (`:1103-1105`), against
+    /// the link's own previous delivery, and its result IS the NEWM bit.
+    ///
+    /// (PAA exists, but it is `fetch_values`' scratch buffer for exactly that
+    /// comparison — one buffer reused for every link, not a per-field previous
+    /// value.)
+    fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
+        &ARR_NAMES
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::record::FieldDeclaration;
 
     #[test]
     fn test_acalcout_default_matches_dbd_initials() {
@@ -2009,6 +1944,34 @@ mod tests {
     }
 
     #[test]
+    fn link_status_fields_reject_put_and_keep_derived_value() {
+        // INAV..INLV / IAAV..ILLV / OUTV are `special(SPC_NOMOD)` — derived from
+        // the link, not client-settable. A direct put must be rejected
+        // (`ECA_NOWTACCESS`, C `S_db_noMod`) and leave the link-derived value
+        // standing. A default record has all-constant links → every field = 3
+        // (`acalcoutINAV_CON`). This is the C-parity case the oracle measured:
+        // `caput ACALCOUT.INAV 0` then caget → C returns 3, not the put value.
+        for name in ["INAV", "INLV", "IAAV", "ILLV", "OUTV"] {
+            let mut rec = AcalcoutRecord::new();
+            assert_eq!(
+                rec.get_field(name),
+                Some(EpicsValue::Short(LINK_CON)),
+                "{name} should start at derived Constant(3)"
+            );
+            let err = rec.put_field(name, EpicsValue::Short(0));
+            assert!(
+                matches!(err, Err(CaError::ReadOnlyField(_))),
+                "{name} put should be rejected as read-only, got {err:?}"
+            );
+            assert_eq!(
+                rec.get_field(name),
+                Some(EpicsValue::Short(LINK_CON)),
+                "{name} must stay at the derived Constant(3) after a rejected put"
+            );
+        }
+    }
+
+    #[test]
     fn test_acalcout_field_list_count() {
         // 138 dbd record fields minus 6 DBF_NOACCESS internal pointer/scratch
         // fields (RPVT, PAVL, PAA, POAV, RPCL, ORPC) = 132 modeled fields.
@@ -2022,6 +1985,7 @@ mod tests {
         rec.put_field("B", EpicsValue::Double(4.0)).unwrap();
         rec.put_field("CALC", EpicsValue::String("A+B".into()))
             .unwrap();
+        rec.special("CALC", true).unwrap();
         rec.process().unwrap();
         assert_eq!(rec.val, 7.0);
         // Scalar result broadcasts into AVAL (C aCalcPerform toArray).
@@ -2039,6 +2003,7 @@ mod tests {
             .unwrap();
         rec.put_field("CALC", EpicsValue::String("AA+1".into()))
             .unwrap();
+        rec.special("CALC", true).unwrap();
         rec.process().unwrap();
         assert_eq!(
             rec.get_field("AVAL"),
@@ -2056,8 +2021,10 @@ mod tests {
             .unwrap();
         rec.put_field("CALC", EpicsValue::String("AA".into()))
             .unwrap();
+        rec.special("CALC", true).unwrap();
         rec.put_field("OCAL", EpicsValue::String("AA*2".into()))
             .unwrap();
+        rec.special("OCAL", true).unwrap();
         rec.put_field("DOPT", EpicsValue::Short(1)).unwrap();
         rec.process().unwrap();
         assert_eq!(
@@ -2076,6 +2043,7 @@ mod tests {
         let mut rec = AcalcoutRecord::new();
         rec.put_field("CALC", EpicsValue::String("42".into()))
             .unwrap();
+        rec.special("CALC", true).unwrap();
         rec.put_field("OOPT", EpicsValue::Short(0)).unwrap();
         rec.process().unwrap();
         assert_eq!(rec.multi_output_links(), &[("OUT", "AVAL")]);
@@ -2086,6 +2054,7 @@ mod tests {
         let mut rec = AcalcoutRecord::new();
         rec.put_field("CALC", EpicsValue::String("42".into()))
             .unwrap();
+        rec.special("CALC", true).unwrap();
         rec.put_field("OOPT", EpicsValue::Short(6)).unwrap(); // Never
         rec.process().unwrap();
         assert_eq!(rec.multi_output_links(), &[]);
@@ -2096,6 +2065,7 @@ mod tests {
         let mut rec = AcalcoutRecord::new();
         rec.put_field("CALC", EpicsValue::String("A".into()))
             .unwrap();
+        rec.special("CALC", true).unwrap();
         rec.put_field("OOPT", EpicsValue::Short(1)).unwrap(); // On Change
         rec.put_field("MDEL", EpicsValue::Double(0.5)).unwrap();
 
@@ -2113,8 +2083,10 @@ mod tests {
         let mut rec = AcalcoutRecord::new();
         rec.put_field("CALC", EpicsValue::String("1".into()))
             .unwrap();
+        rec.special("CALC", true).unwrap();
         rec.put_field("OCAL", EpicsValue::String("2".into()))
             .unwrap();
+        rec.special("OCAL", true).unwrap();
         rec.put_field("DOPT", EpicsValue::Short(1)).unwrap();
         rec.process().unwrap();
         assert_eq!(rec.multi_output_links(), &[("OUT", "OAV")]);
@@ -2129,8 +2101,10 @@ mod tests {
         let mut rec = AcalcoutRecord::new();
         rec.put_field("CALC", EpicsValue::String("5".into()))
             .unwrap();
+        rec.special("CALC", true).unwrap();
         rec.put_field("OCAL", EpicsValue::String("VAL+10".into()))
             .unwrap();
+        rec.special("OCAL", true).unwrap();
         rec.put_field("DOPT", EpicsValue::Short(1)).unwrap();
         rec.process().unwrap();
         assert_eq!(rec.get_field("OVAL"), Some(EpicsValue::Double(10.0)));
@@ -2145,21 +2119,98 @@ mod tests {
         let mut rec = AcalcoutRecord::new();
         // Non-empty CALC that fails to compile.
         rec.calc = "???bad".into();
-        rec.compiled_calc = None;
+        rec.compiled_calc = CompiledExpr::empty(ExprKind::Array);
         rec.process().unwrap();
         assert!(rec.calc_alarm);
         assert_eq!(rec.cstat, -1);
     }
 
+    /// UDF (C `pcalc->udf`) is cleared ONLY by a successful calc and is owned by
+    /// `check_alarms` (C's `afterCalc` tail), NOT re-derived from VAL. C
+    /// `aCalcoutRecord.c:305-307` sets `udf=FALSE` only on a finite result and
+    /// never re-raises it; the oracle measured `ACALCOUT.UDF` C=1, port=0 for
+    /// the default (empty-CALC) record, because the framework's `isnan(VAL=0.0)`
+    /// default reported 0.
+    #[test]
+    fn udf_cleared_only_by_a_successful_calc() {
+        use crate::server::record::CommonFields;
+        let mut rec = AcalcoutRecord::new();
+        let mut common = CommonFields::default();
+        // Init: undefined, mirroring C `iocInit` udf=TRUE.
+        assert_eq!(common.udf, 1, "fresh common is undefined (init 1)");
+        // Empty CALC fails aCalcPerform every cycle → UDF stays set (C keeps 1).
+        rec.process().unwrap();
+        rec.check_alarms(&mut common);
+        assert_eq!(
+            common.udf, 1,
+            "empty CALC failed → UDF stays 1, not isnan()=0"
+        );
+        // A finite result clears UDF (C `else pcalc->udf = FALSE`).
+        rec.put_field("CALC", EpicsValue::String("1+1".into()))
+            .unwrap();
+        rec.special("CALC", true).unwrap();
+        rec.process().unwrap();
+        rec.check_alarms(&mut common);
+        assert_eq!(rec.get_field("VAL"), Some(EpicsValue::Double(2.0)));
+        assert_eq!(common.udf, 0, "finite result clears UDF");
+        // Monotonic: a later NON-finite result does NOT re-raise UDF — C raises
+        // CALC_ALARM (`if(cstat)`) and leaves `udf` at FALSE.
+        rec.put_field("CALC", EpicsValue::String("1e300*1e300".into()))
+            .unwrap();
+        rec.special("CALC", true).unwrap();
+        rec.process().unwrap();
+        assert!(rec.calc_alarm, "non-finite result raises CALC_ALARM");
+        rec.check_alarms(&mut common);
+        assert_eq!(
+            common.udf, 0,
+            "a failed calc after a success leaves UDF cleared, matching C"
+        );
+    }
+
+    /// A failing calc leaves `common.udf` UNTOUCHED — so a direct `caput UDF
+    /// <byte>` keeps its raw `DBF_UCHAR` byte across the `pp(TRUE)` re-process
+    /// (`255` for `-1`, served signed). C `aCalcoutRecord.c:304-307` clears udf
+    /// only in the `else` (success) arm; the oracle measured `caput UDF -1/255`
+    /// → C=-1, port=1 because the wave-3 boolean cell collapsed every nonzero
+    /// byte to 1.
+    #[test]
+    fn failing_calc_leaves_the_udf_byte_untouched() {
+        use crate::server::record::CommonFields;
+        let mut rec = AcalcoutRecord::new(); // empty CALC → fails every cycle
+        let mut common = CommonFields::default();
+        // A `caput UDF 255` (or `-1`, stored 255 in the signed DBF_UCHAR) put
+        // this raw byte; the empty-CALC re-process must not collapse it.
+        common.udf = 255;
+        rec.process().unwrap();
+        rec.check_alarms(&mut common);
+        assert_eq!(
+            common.udf, 255,
+            "empty-CALC re-process must not touch the put byte"
+        );
+        // `caput UDF 0` likewise stands on a failing-calc record.
+        common.udf = 0;
+        rec.process().unwrap();
+        rec.check_alarms(&mut common);
+        assert_eq!(common.udf, 0, "caput UDF 0 stands over a failing calc");
+    }
+
     /// A NaN/Inf calc result is written into VAL/AVAL (not left stale): C
-    /// `aCalcPerform` stores `*p_dresult` before returning -1, so VAL holds the
-    /// non-finite value and CALC_ALARM is raised. (`1/0` → NaN in the array
-    /// engine.)
+    /// `aCalcPerform` stores `*p_dresult` before its non-finite tail returns -1
+    /// (`aCalcPerform.c:1644`), so VAL holds the non-finite value and
+    /// CALC_ALARM is raised.
+    ///
+    /// R8-7: the expression here used to be `1/0`, on the belief that the array
+    /// engine divides in IEEE and yields NaN. It does not — C answers
+    /// `myMAXFLOAT` (1e35) and `st=0` for `1/0` (`aCalcPerform.c:690-696`), so
+    /// that expression pinned invented behaviour and could never reach this
+    /// path. `1e300*1e300` is the C-verified non-finite case: the compiled
+    /// `aCalcPerform` prints `st=-1 d=inf`.
     #[test]
     fn test_acalcout_nonfinite_result_written_to_val() {
         let mut rec = AcalcoutRecord::new();
-        rec.put_field("CALC", EpicsValue::String("1/0".into()))
+        rec.put_field("CALC", EpicsValue::String("1e300*1e300".into()))
             .unwrap();
+        rec.special("CALC", true).unwrap();
         rec.process().unwrap();
         match rec.get_field("VAL") {
             Some(EpicsValue::Double(v)) => {
@@ -2170,11 +2221,31 @@ mod tests {
         assert!(rec.calc_alarm);
     }
 
+    /// R9-2 — a NaN SCALAR result reaches AVAL through C's `toArray(ps,1)`
+    /// (`aCalcPerform.c:1624`), whose promotion fills 0 for a NaN
+    /// (`to_array`, :135-138). So VAL keeps the NaN and AVAL is all ZEROS, not
+    /// all NaN. Compiled aCalcPerform: `ACOS(2)` -> st=-1 d=nan a=[0 x8].
+    #[test]
+    fn test_acalcout_nan_scalar_fills_aval_with_zeros() {
+        let mut rec = AcalcoutRecord::new();
+        rec.put_field("NELM", EpicsValue::ULong(4)).unwrap();
+        rec.put_field("CALC", EpicsValue::String("ACOS(2)".into()))
+            .unwrap();
+        rec.special("CALC", true).unwrap();
+        rec.process().unwrap();
+        match rec.get_field("VAL") {
+            Some(EpicsValue::Double(v)) => assert!(v.is_nan(), "VAL = {v}, expected NaN"),
+            other => panic!("expected Double VAL, got {other:?}"),
+        }
+        assert_eq!(rec.aval, vec![0.0; 4], "C fills AVAL with zeros for a NaN");
+        assert!(rec.calc_alarm);
+    }
+
     #[test]
     fn test_acalcout_ivoa_dont_drive_on_failure() {
         let mut rec = AcalcoutRecord::new();
         rec.calc = "???bad".into();
-        rec.compiled_calc = None;
+        rec.compiled_calc = CompiledExpr::empty(ExprKind::Array);
         rec.put_field("IVOA", EpicsValue::Short(1)).unwrap(); // Don't drive
         rec.process().unwrap();
         assert!(!rec.cached_should_output);
@@ -2186,30 +2257,92 @@ mod tests {
         let mut rec = AcalcoutRecord::new();
         rec.put_field("NELM", EpicsValue::ULong(2)).unwrap();
         rec.calc = "???bad".into();
-        rec.compiled_calc = None;
+        rec.compiled_calc = CompiledExpr::empty(ExprKind::Array);
         rec.put_field("IVOA", EpicsValue::Short(2)).unwrap(); // Set to IVOV
         rec.put_field("IVOV", EpicsValue::Double(9.0)).unwrap();
         rec.process().unwrap();
+        let val_before = rec.val;
+        let aval_before = rec.get_field("AVAL");
         // IVOV substitution is owned by the framework IVOA dispatch via
-        // `apply_invalid_output_value` on the Complete path (matching C
-        // `execOutput`, aCalcoutRecord.c:923-924); `process()` no longer
-        // substitutes inline. Drive the hook as the framework does on an
-        // INVALID + IVOA=Set cycle.
+        // `apply_invalid_output_value` on the Complete path; C's arm is
+        // `pcalc->oval = pcalc->ivov;` ALONE (aCalcoutRecord.c:924) —
+        // VAL/AVAL/OAV keep the failed cycle's values.
         rec.apply_invalid_output_value(EpicsValue::Double(9.0))
             .unwrap();
-        assert_eq!(rec.val, 9.0);
+        assert_eq!(rec.oval, 9.0, "C sets only the scalar OVAL");
+        assert_eq!(rec.val, val_before, "VAL is not IVOV's target");
         assert_eq!(
             rec.get_field("AVAL"),
-            Some(EpicsValue::DoubleArray(vec![9.0, 9.0]))
+            aval_before,
+            "AVAL is not IVOV's target"
         );
     }
 
+    /// C repairs `NUSE > NELM` in `special()`, NOT in the field store: `dbPut`
+    /// writes the value the client sent and `dbPutSpecial(paddr,1)` then clamps
+    /// it, posts it, and RETURNS -1 so the put fails (`aCalcoutRecord.c:494-501`).
+    /// The store itself must stay raw — it is also the `.db` / autosave load path,
+    /// where NELM may not have arrived yet.
     #[test]
-    fn test_acalcout_nuse_clamped_to_nelm() {
+    fn test_acalcout_nuse_special_clamps_posts_and_refuses_the_put() {
         let mut rec = AcalcoutRecord::new();
         rec.put_field("NELM", EpicsValue::ULong(4)).unwrap();
+
         rec.put_field("NUSE", EpicsValue::ULong(10)).unwrap();
+        assert_eq!(
+            rec.get_field("NUSE"),
+            Some(EpicsValue::ULong(10)),
+            "the raw store keeps what the client sent; special() has not run yet"
+        );
+
+        let status = rec.special("NUSE", true);
+        assert!(status.is_err(), "C returns -1, so the put must fail");
+        assert_eq!(
+            rec.get_field("NUSE"),
+            Some(EpicsValue::ULong(4)),
+            "and the clamped value stays"
+        );
+        assert_eq!(
+            rec.take_cycle_posted_fields(),
+            vec![("NUSE", CyclePostMask::Value)],
+            "posted with C's literal DBE_VALUE (:497)"
+        );
+    }
+
+    /// The load-order case the raw store protects: a `.db` that lists NUSE before
+    /// NELM. C stores both, then `init_record` pass 0 clamps once with the final
+    /// NELM (`:188-190`) — NUSE=5 is legal under NELM=10 and survives. Clamping
+    /// inside the store would have measured it against the DEFAULT nelm of 1.
+    #[test]
+    fn nuse_is_clamped_at_init_against_the_final_nelm_not_the_default() {
+        let mut rec = AcalcoutRecord::new();
+        rec.put_field("NUSE", EpicsValue::ULong(5)).unwrap();
+        rec.put_field("NELM", EpicsValue::ULong(10)).unwrap();
+
+        rec.init_record(0).unwrap();
+
+        assert_eq!(rec.get_field("NUSE"), Some(EpicsValue::ULong(5)));
+        assert!(
+            rec.take_cycle_posted_fields().is_empty(),
+            "nothing was clamped, so nothing is posted"
+        );
+    }
+
+    /// ...and the same init pass DOES repair a genuinely illegal restore.
+    #[test]
+    fn init_clamps_an_illegal_restored_nuse_and_posts_it() {
+        let mut rec = AcalcoutRecord::new();
+        rec.put_field("NELM", EpicsValue::ULong(4)).unwrap();
+        rec.put_field("NUSE", EpicsValue::ULong(99)).unwrap();
+
+        rec.init_record(0).unwrap();
+
         assert_eq!(rec.get_field("NUSE"), Some(EpicsValue::ULong(4)));
+        assert_eq!(
+            rec.take_cycle_posted_fields(),
+            vec![("NUSE", CyclePostMask::ValueLog)],
+            "C's init post is DBE_VALUE|DBE_LOG (:189)"
+        );
     }
 
     #[test]
@@ -2221,6 +2354,7 @@ mod tests {
             .unwrap();
         rec.put_field("CALC", EpicsValue::String("AA".into()))
             .unwrap();
+        rec.special("CALC", true).unwrap();
         rec.process().unwrap();
         // num_elements = NUSE (3) since 0 < NUSE < NELM.
         assert_eq!(

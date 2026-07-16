@@ -1,0 +1,206 @@
+//! The differential oracle, as a command.
+//!
+//! Exit code is the verdict: **non-zero if there is any DEFECT or any ERROR**.
+//! An unmeasurable case fails the run exactly like a wrong one, because a
+//! harness that exits 0 when it could not look is the thing that produced 21
+//! false-clean verdicts in the audit loop.
+
+use std::path::PathBuf;
+use std::process::ExitCode;
+
+use clap::{Parser, ValueEnum};
+use epics_oracle_rs::allowlist::Allowlist;
+use epics_oracle_rs::dbd::Dbd;
+use epics_oracle_rs::ioc::CTools;
+use epics_oracle_rs::report::{Counts, Denominator, Report, StaleRow};
+use epics_oracle_rs::runner::{Runner, select_types, workdir};
+use epics_oracle_rs::surface::{Coverage, Surface, probe_supported_record_types};
+use epics_oracle_rs::{Verdict, report::CaseResult};
+
+#[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
+enum Phase {
+    /// Native type, element count, access rights, value (string + numeric).
+    Read,
+    /// Boundary-value puts: accept/reject, stored value, STAT/SEVR.
+    Put,
+    /// Monitor event sequence and count.
+    Monitor,
+    All,
+}
+
+#[derive(Parser)]
+#[command(
+    name = "oracle",
+    about = "Differential oracle: boots the C softIoc and the Rust IOC on the same .db and diffs observable CA behavior"
+)]
+struct Args {
+    /// The expanded dbd that supplies the denominator.
+    #[arg(long, default_value = CTools::DEFAULT_DBD)]
+    dbd: PathBuf,
+
+    /// Which probes to run.
+    #[arg(long, value_enum, default_value_t = Phase::All)]
+    phase: Phase,
+
+    /// Restrict to these record types (default: every type the port implements).
+    #[arg(long, value_delimiter = ',')]
+    record_types: Option<Vec<String>>,
+
+    /// Cap the put cases per record type. Use for a fast pass; the report still
+    /// states the true denominator, so a capped run shows as LOW coverage
+    /// rather than as a full sweep.
+    #[arg(long)]
+    max_put_cases: Option<usize>,
+
+    /// Write the machine-readable report here.
+    #[arg(long)]
+    json: Option<PathBuf>,
+
+    /// Expected-deviation allowlist (defaults to the shipped file, which
+    /// transcribes doc/upstream-c-bugs.md).
+    #[arg(long)]
+    allowlist: Option<PathBuf>,
+}
+
+#[tokio::main]
+async fn main() -> ExitCode {
+    match run().await {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("oracle: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> Result<ExitCode, String> {
+    let args = Args::parse();
+
+    // Ground truth must exist. Without it there is nothing to diff against, and
+    // pretending otherwise would be the worst possible failure mode.
+    let tools = CTools::discover().map_err(|e| e.to_string())?;
+    let dbd = Dbd::parse_file(&args.dbd)?;
+
+    let mut allowlist = match &args.allowlist {
+        Some(p) => Allowlist::load(p)?,
+        None => Allowlist::load(&Allowlist::default_path())?,
+    };
+
+    // Which record types the port implements is MEASURED, not read out of its
+    // source -- the field tables are being regenerated concurrently, so source
+    // would be stale.
+    eprintln!("probing which record types the port implements...");
+    let supported = probe_supported_record_types(&dbd).await;
+    let surface = Surface::build(&dbd, &supported);
+    let types = select_types(&surface, &args.record_types);
+
+    eprintln!(
+        "denominator: {} CA-observable fields across {} record types ({} unimplemented)",
+        surface.denominator(),
+        surface.covered_types.len(),
+        surface.unimplemented_types.len()
+    );
+
+    let runner = Runner::new(tools, dbd, workdir(None)?);
+    let mut cases: Vec<CaseResult> = Vec::new();
+
+    for (i, rt) in types.iter().enumerate() {
+        eprintln!("[{}/{}] {rt}", i + 1, types.len());
+
+        if matches!(args.phase, Phase::Read | Phase::All) {
+            cases.extend(runner.probe_reads(rt, &surface, &mut allowlist));
+        }
+        if matches!(args.phase, Phase::Put | Phase::All) {
+            if epics_oracle_rs::puts_are_measurable(rt) {
+                cases.extend(runner.probe_puts(rt, &surface, &mut allowlist, args.max_put_cases));
+            } else {
+                // Loud, by-policy skip — NOT a silent false-clean. See
+                // `puts_are_measurable`: this record's puts cannot complete
+                // against the disconnected ORACLEASYN port, so driving them
+                // would only manufacture timeouts. The omission is declared
+                // here so a clean `--phase all` exit never implies asyn puts
+                // were measured.
+                eprintln!(
+                    "    put phase skipped for {rt}: read/monitor-only \
+                     (unmeasurable against the disconnected ORACLEASYN port)"
+                );
+            }
+        }
+        if matches!(args.phase, Phase::Monitor | Phase::All) {
+            cases.extend(runner.probe_monitor(rt, &surface, &mut allowlist));
+        }
+    }
+
+    // Field coverage is measured over the READ probe, which is the phase that
+    // visits every field of the denominator exactly once. A field is "covered"
+    // only if BOTH sides produced a reading for it.
+    let field_coverage = if matches!(args.phase, Phase::Read | Phase::All) {
+        let read_cases: Vec<&CaseResult> = cases
+            .iter()
+            .filter(|c| c.class.is_none() && !c.field.is_empty())
+            .collect();
+        let measured = read_cases
+            .iter()
+            .filter(|c| c.verdict != Verdict::Errored)
+            .count();
+        let errored = read_cases.len().saturating_sub(measured);
+        Coverage {
+            enumerated: surface.denominator(),
+            // Only fields we actually visited count; a --record-types filter
+            // shrinks what was measured but NOT the denominator, so a partial
+            // run honestly reports partial coverage.
+            measured,
+            errored,
+        }
+    } else {
+        // The put/monitor phases do not visit every field, so claiming field
+        // coverage from them would be an inflated number. Say zero and mean it.
+        Coverage {
+            enumerated: surface.denominator(),
+            measured: 0,
+            errored: 0,
+        }
+    };
+
+    let counts = Counts::tally(&cases);
+    counts.check()?;
+
+    let row = |r: &epics_oracle_rs::allowlist::Deviation| StaleRow {
+        id: r.id.clone(),
+        why: r.why.trim().to_string(),
+    };
+    let stale: Vec<StaleRow> = allowlist.stale_rows().into_iter().map(row).collect();
+    let unexercised: Vec<StaleRow> = allowlist.unexercised_rows().into_iter().map(row).collect();
+    let fired: Vec<String> = allowlist.fired_rows().iter().cloned().collect();
+
+    let report = Report {
+        denominator: Denominator {
+            dbd: args.dbd.display().to_string(),
+            record_types_in_dbd: surface.covered_types.len() + surface.unimplemented_types.len(),
+            record_types_covered: surface.covered_types.clone(),
+            record_types_unimplemented: surface.unimplemented_types.clone(),
+            observable_fields: surface.denominator(),
+            excluded_noaccess_fields: surface.excluded_noaccess,
+        },
+        field_coverage,
+        counts,
+        stale_allowlist_rows: stale,
+        unexercised_allowlist_rows: unexercised,
+        fired_allowlist_rows: fired,
+        cases,
+    };
+
+    if let Some(p) = &args.json {
+        std::fs::write(p, report.to_json()).map_err(|e| format!("write {}: {e}", p.display()))?;
+        eprintln!("wrote {}", p.display());
+    }
+    println!("{}", report.human());
+
+    // A DEFECT or an ERROR both fail the run. "Could not measure" is not a pass.
+    let ok = report.counts.defect == 0 && report.counts.errored == 0;
+    Ok(if ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
+}

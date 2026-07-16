@@ -260,13 +260,27 @@ pub fn write_pid_file(path: &Path, pid: i32) -> ProcServResult<()> {
     Ok(())
 }
 
-/// Best-effort delete on graceful shutdown. Errors are logged and
-/// swallowed — there's nothing we can do about a missing pid file at
+/// Best-effort delete of a side-car file on graceful shutdown. Errors are
+/// logged and swallowed — there's nothing we can do about a missing file at
 /// shutdown anyway.
-pub fn remove_pid_file(path: &Path) {
+fn remove_sidecar(path: &Path, what: &str) {
     if let Err(e) = std::fs::remove_file(path) {
-        tracing::warn!(path = %path.display(), error = %e, "procserv-rs: failed to remove pid file");
+        tracing::warn!(path = %path.display(), error = %e, "procserv-rs: failed to remove {what}");
     }
+}
+
+/// Unlink the pid file. C `main` unlinks it after the main loop
+/// (`procServ.cc:698-699`).
+pub fn remove_pid_file(path: &Path) {
+    remove_sidecar(path, "pid file");
+}
+
+/// Unlink the info file. C `main` unlinks it after the main loop, before the
+/// pid file (`procServ.cc:696-697`) — the file's presence is how
+/// `manage-procs` tracks a live procServ, so a stale one left behind names a
+/// dead pid and a control endpoint nobody is listening on.
+pub fn remove_info_file(path: &Path) {
+    remove_sidecar(path, "info file");
 }
 
 /// Status info file (C `writeInfoFile`, `procServ.cc:935-941`), the form

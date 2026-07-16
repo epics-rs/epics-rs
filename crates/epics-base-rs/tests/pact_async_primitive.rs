@@ -36,11 +36,7 @@ impl TestAsyncRecord {
     }
 }
 
-static TEST_FIELDS: &[FieldDesc] = &[FieldDesc {
-    name: "VAL",
-    dbf_type: DbFieldType::Long,
-    read_only: false,
-}];
+static TEST_FIELDS: &[FieldDesc] = &[FieldDesc::new("VAL", DbFieldType::Long, false)];
 
 impl Record for TestAsyncRecord {
     fn record_type(&self) -> &'static str {
@@ -72,7 +68,7 @@ impl Record for TestAsyncRecord {
         }
     }
 
-    fn field_list(&self) -> &'static [FieldDesc] {
+    fn declared_fields(&self) -> &'static [FieldDesc] {
         TEST_FIELDS
     }
 }
@@ -342,7 +338,7 @@ impl Record for HandleCaptureRecord {
             _ => Err(CaError::FieldNotFound(name.to_string())),
         }
     }
-    fn field_list(&self) -> &'static [FieldDesc] {
+    fn declared_fields(&self) -> &'static [FieldDesc] {
         TEST_FIELDS
     }
     fn set_async_context(&mut self, _name: String, db: AsyncDbHandle) {
@@ -360,16 +356,8 @@ struct NotifySourceRecord {
 }
 
 static NOTIFY_SRC_FIELDS: &[FieldDesc] = &[
-    FieldDesc {
-        name: "VAL",
-        dbf_type: DbFieldType::Long,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LNK",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
+    FieldDesc::new("VAL", DbFieldType::Long, false),
+    FieldDesc::new("LNK", DbFieldType::String, false),
 ];
 
 impl Record for NotifySourceRecord {
@@ -401,7 +389,7 @@ impl Record for NotifySourceRecord {
     fn put_field(&mut self, _name: &str, _value: EpicsValue) -> CaResult<()> {
         Ok(())
     }
-    fn field_list(&self) -> &'static [FieldDesc] {
+    fn declared_fields(&self) -> &'static [FieldDesc] {
         NOTIFY_SRC_FIELDS
     }
 }
@@ -434,7 +422,7 @@ impl Record for AbortSourceRecord {
     fn put_field(&mut self, _name: &str, _value: EpicsValue) -> CaResult<()> {
         Ok(())
     }
-    fn field_list(&self) -> &'static [FieldDesc] {
+    fn declared_fields(&self) -> &'static [FieldDesc] {
         TEST_FIELDS
     }
 }
@@ -589,7 +577,7 @@ impl Record for PendingNotifyWriteSource {
     fn put_field(&mut self, _name: &str, _value: EpicsValue) -> CaResult<()> {
         Ok(())
     }
-    fn field_list(&self) -> &'static [FieldDesc] {
+    fn declared_fields(&self) -> &'static [FieldDesc] {
         NOTIFY_SRC_FIELDS
     }
 }

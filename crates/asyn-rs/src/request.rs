@@ -161,6 +161,15 @@ pub enum RequestOp {
     SetAutoConnect {
         yes: bool,
     },
+    /// Enable / disable auto-connect for ONE device of a multi-device port —
+    /// the `user.addr` variant of [`RequestOp::SetAutoConnect`], symmetric with
+    /// [`RequestOp::EnableAddr`]. C reaches both through a single
+    /// `pasynManager->autoConnect`, which picks device-vs-port state via
+    /// `findDpCommon` (asynManager.c:496-509, 2314); the caller of the shell
+    /// command `asynAutoConnect portName addr yesNo` is what supplies the addr.
+    SetAutoConnectAddr {
+        yes: bool,
+    },
     /// Query int32 bounds (low, high).
     GetBoundsInt32,
     /// Query int64 bounds (low, high).
@@ -272,6 +281,83 @@ pub enum RequestOp {
     /// Set the port's output EOS bytes — C `pasynOctet->setOutputEos`.
     SetOutputEos {
         eos: Vec<u8>,
+    },
+    /// Read back the port's input EOS bytes — C `pasynOctet->getInputEos`.
+    /// asynRecord's `getEos` (asynRecord.c:1985-2026) calls it after every
+    /// IEOS/OEOS put so the record shows what the driver actually holds, not
+    /// what was requested. Returns the bytes in [`RequestResult::data`].
+    GetInputEos,
+    /// Read back the port's output EOS bytes — C `pasynOctet->getOutputEos`.
+    GetOutputEos,
+    /// Query whether the port's *transport* is connected. C parity:
+    /// `pasynManager->isConnected` — the state the driver publishes through
+    /// `exceptionConnect`/`exceptionDisconnect`, not "is a record bound to
+    /// this port". `asynRecord` reads it in `monitorStatus` (asynRecord.c:
+    /// 1089-1093) to refresh CNCT, and gates its `callbackConnect` on it
+    /// (:858-888) so a CNCT put never re-connects an already-connected port.
+    GetConnected,
+    /// Install the echo interpose on top of the port's octet stack. C parity:
+    /// `asynInterposeEcho(portName, addr)`
+    /// (`asynInterposeEcho.c:165-190`), the iocsh command a startup script
+    /// runs *after* the port is configured.
+    ///
+    /// It is a request rather than a direct `install_interpose` because the actor
+    /// owns the driver once the port is registered — the same reason
+    /// `SetOption` / `SetInputEos` are requests. Installing from the shell
+    /// thread would race every in-flight transfer.
+    PushEchoInterpose,
+    /// Install the delay interpose on top of the port's octet stack. C parity:
+    /// `asynInterposeDelay(portName, addr, delay)`
+    /// (`asynInterposeDelay.c:176-215`), registered with iocsh at
+    /// `asynInterposeDelay.c:221-234`. Same actor-ownership reason as
+    /// [`RequestOp::PushEchoInterpose`].
+    PushDelayInterpose {
+        delay: std::time::Duration,
+    },
+    /// Install the EOS interpose on the addressed device's octet stack. C
+    /// parity: `asynInterposeEosConfig(portName, addr, processEosIn,
+    /// processEosOut)` (`asynInterposeEos.c:84-140`), registered with iocsh at
+    /// :393-410. The two flags select which half of the layer is live.
+    PushEosInterpose {
+        process_in: bool,
+        process_out: bool,
+    },
+    /// Set (or clear) the port's time-stamp source by NAME. C parity:
+    /// `asynRegisterTimeStampSource(portName, functionName)` /
+    /// `asynUnregisterTimeStampSource(portName)` (asynShellCommands.c:1181-1223)
+    /// — C resolves the name through `registryFunctionFind` and hands the
+    /// function to `pasynManager->registerTimeStampSource`. The NAME travels,
+    /// not the function: that is what makes it resolvable on the far side of a
+    /// remote port, exactly as C resolves it in the IOC's own registry.
+    /// `None` = unregister (back to the driver's default clock).
+    SetTimeStampSource {
+        name: Option<String>,
+    },
+    /// Install the flush-timeout interpose on the addressed device's octet
+    /// stack. C parity: `asynInterposeFlushConfig(portName, addr, timeout)`
+    /// (`asynInterposeFlush.c:66-91`); C's shell argument is in milliseconds
+    /// and `<= 0` means 1 ms (:78-79), so the conversion happens at the shell
+    /// and the op carries a real duration.
+    PushFlushInterpose {
+        flush_timeout: std::time::Duration,
+    },
+    /// Send a GPIB universal command byte — C `asynGpib::universalCmd`
+    /// (asynGpib.c:480-484). asynRecord's UCMD dispatch
+    /// (`gpibUniversalCmd`, asynRecord.c:1638-1679).
+    GpibUniversalCmd {
+        cmd: u8,
+    },
+    /// Send a GPIB addressed-command frame — C `asynGpib::addressedCmd`
+    /// (asynGpib.c:472-478). asynRecord's ACMD dispatch builds the frame
+    /// (`gpibAddressedCmd`, asynRecord.c:1681-1756).
+    GpibAddressedCmd {
+        data: Vec<u8>,
+    },
+    /// Assert Interface Clear — C `asynGpib::ifc` (asynGpib.c:486-490).
+    GpibIfc,
+    /// Set the Remote Enable line — C `asynGpib::ren` (asynGpib.c:492-496).
+    GpibRen {
+        enable: bool,
     },
 }
 
@@ -543,10 +629,21 @@ impl RequestResult {
 /// finished, `wasQueued==0` and the I/O runs to completion and is reported
 /// normally (asynManager.c:1645-1659). `Queued` is the only state a cancel can
 /// win from; the executor's `Queued -> Running` transition closes that window.
+///
+/// The queue-wait timeout (C `queueTimeoutCallback`, asynManager.c:647-700) is
+/// the second way a request can leave the queue without running, and it obeys
+/// the same rule: the timer callback returns immediately when `!isQueued`
+/// (:655-661), so a request the port thread has already dequeued always
+/// completes. `TimedOut` is therefore a sibling of `Cancelled` — a terminal
+/// state reachable only from `Queued` — and the two together are the complete
+/// set of "this request never ran" outcomes. Which one won is what tells the
+/// caller *which* C callback to report ("I/O request canceled" vs "process
+/// queueRequest timeout"), so they are distinct states rather than one flag.
 const STATE_QUEUED: u8 = 0;
 const STATE_RUNNING: u8 = 1;
 const STATE_DONE: u8 = 2;
 const STATE_CANCELLED: u8 = 3;
+const STATE_TIMED_OUT: u8 = 4;
 
 /// Token tracking the queue/execution lifecycle of an off-thread request.
 ///
@@ -581,18 +678,40 @@ impl CancelToken {
             .is_ok()
     }
 
+    /// C `queueTimeoutCallback` (asynManager.c:647-700): the queue-wait deadline
+    /// expired. Removes the request from the queue iff it is still queued —
+    /// C's `if(!puserPvt->isQueued) { ...; return; }` guard (:655-661) — and
+    /// returns whether it won.
+    ///
+    /// `false` means the port thread had already dequeued the request: the timer
+    /// fired too late, the I/O runs to completion and reports normally, and the
+    /// caller must keep waiting for it. This is the same `isQueued` gate
+    /// [`Self::cancel`] answers for `AQR`, so a cancel and a timeout racing the
+    /// same request cannot both win.
+    pub fn time_out_if_queued(&self) -> bool {
+        self.0
+            .compare_exchange(
+                STATE_QUEUED,
+                STATE_TIMED_OUT,
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
+            )
+            .is_ok()
+    }
+
     /// Executor at dequeue: claim the request for execution (C dequeue under
     /// `asynManagerLock`, asynManager.c:1661-1666 is the cancel counterpart).
     ///
-    /// Returns `false` iff the request was cancelled while queued, in which
-    /// case the executor must drop it and report cancellation. Otherwise the
-    /// token enters `Running`. A multi-phase plan re-claims the same token for
-    /// its next phase from `Done`, so this transitions from either `Queued` or
-    /// `Done`; only `Cancelled` is terminal.
+    /// Returns `false` iff the request left the queue without running — it was
+    /// cancelled (`AQR`) or its queue-wait deadline expired — in which case the
+    /// executor must drop it and report that outcome. Otherwise the token enters
+    /// `Running`. A multi-phase plan re-claims the same token for its next phase
+    /// from `Done`, so this transitions from either `Queued` or `Done`;
+    /// `Cancelled` and `TimedOut` are terminal.
     pub fn begin_running(&self) -> bool {
         let mut cur = self.0.load(AtomicOrdering::Acquire);
         loop {
-            if cur == STATE_CANCELLED {
+            if cur == STATE_CANCELLED || cur == STATE_TIMED_OUT {
                 return false;
             }
             match self.0.compare_exchange_weak(
@@ -625,6 +744,14 @@ impl CancelToken {
     /// `false` and the completed I/O applies normally.
     pub fn is_cancelled(&self) -> bool {
         self.0.load(AtomicOrdering::Acquire) == STATE_CANCELLED
+    }
+
+    /// True iff the request was removed from the queue by its queue-wait
+    /// deadline — the C `queueTimeoutCallback` outcome. Mutually exclusive with
+    /// [`Self::is_cancelled`]: both transition out of `Queued`, so exactly one
+    /// can win.
+    pub fn is_timed_out(&self) -> bool {
+        self.0.load(AtomicOrdering::Acquire) == STATE_TIMED_OUT
     }
 }
 

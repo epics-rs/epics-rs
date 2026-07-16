@@ -17,18 +17,26 @@ pub struct Int64inRecord {
     pub val: i64,
     #[field(type = "PvStr")]
     pub egu: PvString,
-    #[field(type = "Double")]
-    pub hopr: f64,
-    #[field(type = "Double")]
-    pub lopr: f64,
-    #[field(type = "Double")]
-    pub hyst: f64,
+    // HOPR/LOPR/HYST/ADEL/MDEL are DBF_INT64 (int64inRecord.dbd.pod:140-268),
+    // not DBF_DOUBLE. Modeling them as i64 keys the string→native put parse on
+    // the integer row (`epicsParseInt64`), so a fractional or out-of-i64-range
+    // caput is REFUSED, matching C; served over CA as DBR_DOUBLE via
+    // `EpicsValue::Int64`'s wire mapping, the same as VAL.
+    #[field(type = "Int64")]
+    pub hopr: i64,
+    #[field(type = "Int64")]
+    pub lopr: i64,
+    #[field(type = "Int64")]
+    pub hyst: i64,
+    // LALM is DBF_INT64 too, but `special(SPC_NOMOD)` (dbd:233-236): read-only,
+    // so no client put reaches the parse. Kept f64 — it is the internal
+    // last-alarmed bookkeeping the alarm filter reads as a double.
     #[field(type = "Double")]
     pub lalm: f64,
-    #[field(type = "Double")]
-    pub adel: f64,
-    #[field(type = "Double")]
-    pub mdel: f64,
+    #[field(type = "Int64")]
+    pub adel: i64,
+    #[field(type = "Int64")]
+    pub mdel: i64,
     // Alarm-range time-constant filter (int64inRecord.c::checkAlarms:303-349).
     // AFTC > 0 low-pass-filters the integer alarmRange so transient
     // excursions don't immediately alarm; AFVL is the accumulator.
@@ -48,8 +56,20 @@ pub struct Int64inRecord {
     pub siml: String,
     #[field(type = "String")]
     pub siol: String,
+    // SVAL is `DBF_INT64` (int64inRecord.dbd.pod:270-272) — the BUFFER C's
+    // `readValue` reads SIOL into (`dbGetLink(&prec->siol, DBR_INT64,
+    // &prec->sval)`, int64inRecord.c:409) before publishing `val = sval`.
+    #[field(type = "Int64")]
+    pub sval: i64,
     #[field(type = "Short")]
     pub sims: i16,
+    // SDLY — "Sim. Mode Async Delay" (`DBF_DOUBLE`, `initial("-1.0")`,
+    // int64inRecord.dbd.pod:301-307). A non-negative SDLY makes the simulated SIOL read asynchronous:
+    // C's `readValue` arms `callbackRequestProcessCallbackDelayed(..., sdly)`
+    // and holds PACT across the delay (int64inRecord.c:398-405). The framework reads the delay
+    // via `get_field("SDLY")`, so the field must exist for a `.db` to set it.
+    #[field(type = "Double")]
+    pub sdly: f64,
 }
 
 impl Default for Int64inRecord {
@@ -57,12 +77,12 @@ impl Default for Int64inRecord {
         Self {
             val: 0,
             egu: PvString::new(),
-            hopr: 0.0,
-            lopr: 0.0,
-            hyst: 0.0,
+            hopr: 0,
+            lopr: 0,
+            hyst: 0,
             lalm: 0.0,
-            adel: 0.0,
-            mdel: 0.0,
+            adel: 0,
+            mdel: 0,
             aftc: 0.0,
             afvl: 0.0,
             alst: 0.0,
@@ -70,7 +90,11 @@ impl Default for Int64inRecord {
             simm: 0,
             siml: String::new(),
             siol: String::new(),
+            sval: 0,
             sims: 0,
+            // C `field(SDLY,DBF_DOUBLE) { initial("-1.0") }` — negative means
+            // "synchronous simulation".
+            sdly: -1.0,
         }
     }
 }

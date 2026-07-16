@@ -1,6 +1,6 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, FieldMetadataOverride, ProcessOutcome, Record};
-use crate::types::{DbFieldType, EpicsValue, PvString};
+use crate::server::record::{FieldMetadataOverride, InputFetchPolicy, ProcessOutcome, Record};
+use crate::types::{EpicsValue, PvString};
 
 /// Number of aSub channels. C `aSubRecord.c`: `NUM_ARGS == 21`
 /// (inputs `A..U`, outputs `VALA..VALU`).
@@ -30,6 +30,12 @@ const ASUB_EFLG_CHOICES: &[&str] = &["NEVER", "ON CHANGE", "ALWAYS"];
 /// process). The READ behaviour is owned by the processing path
 /// (`fetch_values`), which holds the link + subroutine registry.
 const ASUB_LFLG_CHOICES: &[&str] = &["IGNORE", "READ"];
+
+/// `LFLG == IGNORE` (`menu(aSubLFLG)` index 0): SNAM is resolved at init and on
+/// each SNAM put via `special()`. Only in this mode does C `aSubRecord.c::
+/// special` run `registryFunctionFind(prec->snam)` and refuse an unregistered
+/// name; in READ mode a SNAM put is not validated.
+const LFLG_IGNORE: i16 = 0;
 
 /// The output-array fields whose monitor posting `EFLG` gates: `VALA..VALU`
 /// (the output values) and `NEVA..NEVU` (their element counts). C
@@ -67,7 +73,12 @@ fn asub_output_event_fields() -> &'static [&'static str] {
 /// `FTx` field selects the interpretation. The subroutine itself is
 /// invoked by the framework (`RecordInstance::subroutine`).
 pub struct ASubRecord {
-    pub val: f64,
+    /// The subroutine return status, published as VAL (`aSubRecord.c:223`
+    /// `prec->val = status`). VAL is `DBF_LONG` (`aSubRecord.dbd.pod:126`), i.e.
+    /// `epicsInt32`, so a string caput parses via `epicsParseLong` and an
+    /// out-of-i32-range or fractional value is REFUSED — modeling it as i32
+    /// keys the put on the integer row instead of accepting any double.
+    pub val: i32,
     pub snam: PvString,
     pub inam: PvString,
     /// Input links `INPA..INPU`.
@@ -119,12 +130,36 @@ pub struct ASubRecord {
     /// subroutine only when SNAM differs from ONAM; ONAM is set to SNAM on a
     /// successful swap.
     pub onam: PvString,
+    /// This cycle's C `process` status, delivered by the framework's single
+    /// `do_sub` owner through [`Record::set_subroutine_status`]. C pushes every
+    /// OUT link only under `if (!status)` (aSubRecord.c:232-239), so this is the
+    /// whole gate: `0` drives OUTA..OUTU, anything else drives nothing. A record
+    /// that has never processed starts non-zero — no outputs before the first
+    /// successful `do_sub`.
+    sub_status: i64,
+}
+
+/// `OUTA..OUTU` -> `VALA..VALU`, the pairs C's push loop walks
+/// (`dbPutLink(&(&prec->outa)[i], ..., (&prec->vala)[i], (&prec->neva)[i])`).
+fn asub_output_links() -> &'static [(&'static str, &'static str)] {
+    use std::sync::OnceLock;
+    static PAIRS: OnceLock<Vec<(&'static str, &'static str)>> = OnceLock::new();
+    PAIRS.get_or_init(|| {
+        SUFFIX
+            .iter()
+            .map(|&c| {
+                let link: &'static str = Box::leak(format!("OUT{c}").into_boxed_str());
+                let val: &'static str = Box::leak(format!("VAL{c}").into_boxed_str());
+                (link, val)
+            })
+            .collect()
+    })
 }
 
 impl Default for ASubRecord {
     fn default() -> Self {
         Self {
-            val: 0.0,
+            val: 0,
             snam: PvString::new(),
             inam: PvString::new(),
             inp: std::array::from_fn(|_| String::new()),
@@ -143,9 +178,17 @@ impl Default for ASubRecord {
             lflg: 0,
             subl: String::new(),
             onam: PvString::new(),
+            // Never processed: C's `status` is only 0 after a `do_sub` that
+            // returned 0, so nothing is driven out before then.
+            sub_status: SUBROUTINE_NOT_RUN,
         }
     }
 }
+
+/// The `sub_status` of a record that has not yet completed a `do_sub` — any
+/// non-zero value; C's `status` is a `long` that only a successful `do_sub`
+/// leaves at 0.
+const SUBROUTINE_NOT_RUN: i64 = -1;
 
 /// Parse a per-channel field name into `(prefix, channel index)`.
 /// E.g. `"INPC"` -> `("INP", 2)`, `"VALU"` -> `("VAL", 20)`,
@@ -196,123 +239,32 @@ fn channel_get(v: &EpicsValue) -> EpicsValue {
     }
 }
 
-impl ASubRecord {
-    /// Build the static field-descriptor table (21 of each per-channel
-    /// field plus VAL/SNAM/INAM).
-    fn descriptors() -> Vec<FieldDesc> {
-        let mut v = vec![
-            FieldDesc {
-                name: "VAL",
-                dbf_type: DbFieldType::Double,
-                read_only: false,
-            },
-            FieldDesc {
-                name: "SNAM",
-                dbf_type: DbFieldType::String,
-                read_only: false,
-            },
-            FieldDesc {
-                // INAM: init-routine name, SPC_NOMOD (config; .db-load only).
-                name: "INAM",
-                dbf_type: DbFieldType::String,
-                read_only: true,
-            },
-            FieldDesc {
-                name: "BRSV",
-                dbf_type: DbFieldType::Short,
-                read_only: false,
-            },
-            FieldDesc {
-                name: "PREC",
-                dbf_type: DbFieldType::Short,
-                read_only: false,
-            },
-            FieldDesc {
-                name: "EFLG",
-                dbf_type: DbFieldType::Short,
-                read_only: false,
-            },
-            FieldDesc {
-                name: "LFLG",
-                dbf_type: DbFieldType::Short,
-                read_only: false,
-            },
-            // SUBL/ONAM are `special(SPC_NOMOD)` in C: client runtime puts are
-            // blocked (read_only), but the `.db` loader and the framework's
-            // own processing writes go through `put_field` directly.
-            FieldDesc {
-                name: "SUBL",
-                dbf_type: DbFieldType::String,
-                read_only: true,
-            },
-            FieldDesc {
-                name: "ONAM",
-                dbf_type: DbFieldType::String,
-                read_only: true,
-            },
-        ];
-        // Per-channel field families. Names are leaked to obtain the
-        // 'static lifetime FieldDesc requires; the table is built once.
-        for &c in SUFFIX.iter() {
-            let mk = |s: String| -> &'static str { Box::leak(s.into_boxed_str()) };
-            v.push(FieldDesc {
-                name: mk(format!("INP{c}")),
-                dbf_type: DbFieldType::String,
-                read_only: false,
-            });
-            v.push(FieldDesc {
-                name: mk(c.to_string()),
-                dbf_type: DbFieldType::Double,
-                read_only: false,
-            });
-            v.push(FieldDesc {
-                name: mk(format!("VAL{c}")),
-                dbf_type: DbFieldType::Double,
-                read_only: false,
-            });
-            v.push(FieldDesc {
-                name: mk(format!("OUT{c}")),
-                dbf_type: DbFieldType::String,
-                read_only: false,
-            });
-            v.push(FieldDesc {
-                name: mk(format!("FT{c}")),
-                dbf_type: DbFieldType::Short,
-                read_only: false,
-            });
-            v.push(FieldDesc {
-                name: mk(format!("FTV{c}")),
-                dbf_type: DbFieldType::Short,
-                read_only: false,
-            });
-            v.push(FieldDesc {
-                name: mk(format!("NO{c}")),
-                dbf_type: DbFieldType::Long,
-                read_only: false,
-            });
-            v.push(FieldDesc {
-                name: mk(format!("NOV{c}")),
-                dbf_type: DbFieldType::Long,
-                read_only: false,
-            });
-            v.push(FieldDesc {
-                name: mk(format!("NE{c}")),
-                dbf_type: DbFieldType::Long,
-                read_only: true,
-            });
-            v.push(FieldDesc {
-                name: mk(format!("NEV{c}")),
-                dbf_type: DbFieldType::Long,
-                read_only: true,
-            });
-        }
-        v
-    }
-}
-
 impl Record for ASubRecord {
     fn record_type(&self) -> &'static str {
         "aSub"
+    }
+
+    /// `aSubRecord.c::process` has no unconditional UDF re-derive: UDF is
+    /// cleared only inside `do_sub` when the subroutine actually ran and
+    /// returned `>= 0` (`aSubRecord.c:469-470` `prec->udf = FALSE`). The
+    /// framework performs that clear in `run_registered_subroutine` (C
+    /// `do_sub`'s home); a process cycle that runs no subroutine — e.g. a
+    /// `caput .UDF 1` on a Passive record with no SNAM — sources nothing and
+    /// must keep the client's UDF put. Opt out of the per-cycle blanket
+    /// re-derive.
+    fn clears_udf(&self) -> bool {
+        false
+    }
+
+    /// `aSubRecord.c` has NO `recGblCheckUdf` anywhere — an undefined aSub
+    /// raises NO alarm from UDF (softIoc: a fresh `record(aSub,"X"){}` reports
+    /// UDF 1 with STAT/SEVR = NO_ALARM, unlike `sub` which raises UDF/INVALID).
+    /// With `clears_udf` false, UDF can now legitimately stay 1 on a cycle that
+    /// sourced nothing (or on a negative `do_sub` status), so this MUST be false
+    /// or the framework's `rec_gbl_check_udf` would invent an alarm C never
+    /// raises. See [`Record::raises_udf_alarm`]; same shape as `event`/`swait`.
+    fn raises_udf_alarm(&self) -> bool {
+        false
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
@@ -322,7 +274,7 @@ impl Record for ASubRecord {
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
-            "VAL" => return Some(EpicsValue::Double(self.val)),
+            "VAL" => return Some(EpicsValue::Long(self.val)),
             "SNAM" => return Some(EpicsValue::String(self.snam.clone())),
             "INAM" => return Some(EpicsValue::String(self.inam.clone())),
             "BRSV" => return Some(EpicsValue::Short(self.brsv)),
@@ -352,8 +304,15 @@ impl Record for ASubRecord {
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
         match name {
             "VAL" => {
+                // VAL is DBF_LONG; the string→native put parse already rejects a
+                // fractional / out-of-i32 caput in `coerce_put_value` (target is
+                // DBF_LONG from `get_field`). Here VAL is also the status field
+                // that subroutine closures and the framework assign directly with
+                // whatever numeric they hold — C `prec->val = status` truncates
+                // any arithmetic value to epicsInt32, so accept any numeric and
+                // project it onto DBF_LONG rather than rejecting a Double writer.
                 self.val = value
-                    .to_f64()
+                    .to_dbf_i32()
                     .ok_or_else(|| CaError::TypeMismatch(name.into()))?;
                 return Ok(());
             }
@@ -471,10 +430,15 @@ impl Record for ASubRecord {
         Ok(())
     }
 
-    fn field_list(&self) -> &'static [FieldDesc] {
-        use std::sync::OnceLock;
-        static FIELDS: OnceLock<Vec<FieldDesc>> = OnceLock::new();
-        FIELDS.get_or_init(ASubRecord::descriptors)
+    /// C `aSubRecord.c::special` (SPC_MOD on SNAM) resolves the name via
+    /// `registryFunctionFind` and returns `S_db_BadSub` for a non-empty
+    /// unregistered name — but ONLY when `LFLG == IGNORE` (`:557-558`). In
+    /// READ mode the name is read from the SUBL link at process time
+    /// (`fetch_values`) and a SNAM put is not validated. The registry lookup
+    /// itself is performed by the put owner; see
+    /// [`Record::is_subroutine_name_field`].
+    fn is_subroutine_name_field(&self, field: &str) -> bool {
+        field == "SNAM" && self.lflg == LFLG_IGNORE
     }
 
     fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
@@ -524,6 +488,19 @@ impl Record for ASubRecord {
         None
     }
 
+    /// C `aSubRecord.c:126-136`: `recGblInitConstantLink(&prec->subl,
+    /// DBF_STRING, prec->snam)` followed by the `dbLoadLinkArray` loop over
+    /// INPA..INPU. Both are init-only: at process `dbGetLink` on a constant
+    /// delivers nothing, so SNAM and A..U keep what was seeded (or what a
+    /// client later put).
+    fn constant_init_links(&self) -> Vec<crate::server::record::ConstantInitLink> {
+        let mut seeds = vec![crate::server::record::ConstantInitLink::new("SUBL", "SNAM")];
+        seeds.extend(crate::server::record::seed_input_links(
+            self.multi_input_links(),
+        ));
+        seeds
+    }
+
     fn multi_input_links(&self) -> &[(&'static str, &'static str)] {
         use std::sync::OnceLock;
         static PAIRS: OnceLock<Vec<(&'static str, &'static str)>> = OnceLock::new();
@@ -537,6 +514,45 @@ impl Record for ASubRecord {
                 })
                 .collect()
         })
+    }
+
+    /// C `aSubRecord.c::fetch_values` (277-289) returns on the first failed
+    /// `dbGetLink` and `process` (216-218) then skips `do_sub`.
+    fn input_fetch_policy(&self) -> InputFetchPolicy {
+        InputFetchPolicy::AbortOnFirstFailure
+    }
+
+    /// The cycle status from the framework's single `do_sub` owner. Stored
+    /// verbatim; [`Self::multi_output_links`] is its only reader.
+    fn set_subroutine_status(&mut self, status: i64) {
+        self.sub_status = status;
+    }
+
+    /// C `aSubRecord.c::process` (232-239) pushes EVERY output link once the
+    /// cycle's status is 0:
+    ///
+    /// ```c
+    /// if (!status) {
+    ///     for (i = 0; i < NUM_ARGS; i++)
+    ///         dbPutLink(&(&prec->outa)[i], (&prec->ftva)[i], (&prec->vala)[i],
+    ///             (&prec->neva)[i]);
+    /// }
+    /// ```
+    ///
+    /// The port stored OUTA..OUTU and never wrote them, so a subroutine's
+    /// results reached VALA..VALU (and CA monitors on them) but no downstream
+    /// record. `status` is 0 only when `fetch_values` succeeded AND `do_sub` ran
+    /// and returned 0, so a failed input link, an unresolved SNAM and a
+    /// subroutine that reported failure each suppress every push — the gate is
+    /// the status itself, not a per-link condition. The framework's generic
+    /// `multi_output_links` dispatch skips an empty link name, which is C's
+    /// `dbPutLink` on an unset link (a no-op).
+    fn multi_output_links(&self) -> &[(&'static str, &'static str)] {
+        if self.sub_status == 0 {
+            asub_output_links()
+        } else {
+            &[]
+        }
     }
 }
 
@@ -688,6 +704,24 @@ mod tests {
         assert_eq!(
             rec.get_field("ONAM"),
             Some(EpicsValue::String("prev".into()))
+        );
+    }
+
+    /// C `aSubRecord.c::special` runs `registryFunctionFind(prec->snam)` ONLY
+    /// when `LFLG == IGNORE`; a SNAM put in READ mode is not validated, and no
+    /// other field is a subroutine name.
+    #[test]
+    fn snam_is_a_subroutine_name_field_only_in_ignore_mode() {
+        let mut rec = ASubRecord::default();
+        assert_eq!(rec.lflg, LFLG_IGNORE);
+        assert!(rec.is_subroutine_name_field("SNAM"));
+        assert!(!rec.is_subroutine_name_field("INAM"));
+        assert!(!rec.is_subroutine_name_field("VAL"));
+
+        rec.put_field("LFLG", EpicsValue::Short(1)).unwrap(); // READ
+        assert!(
+            !rec.is_subroutine_name_field("SNAM"),
+            "READ mode reads the name from SUBL at process time; a SNAM put is not validated"
         );
     }
 

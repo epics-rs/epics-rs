@@ -1,6 +1,6 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, MENU_SIMM, ProcessOutcome, Record};
-use crate::types::{DbFieldType, EpicsValue};
+use crate::server::record::{MENU_SIMM, ProcessOutcome, RawSoftEntry, Record};
+use crate::types::EpicsValue;
 
 // Multi-bit binary input direct record.
 // VAL holds the full unsigned 32-bit value; B0-B1F expose individual bits
@@ -23,6 +23,10 @@ pub struct MbbiDirectRecord {
     pub simm: i16,
     pub siml: String,
     pub siol: String,
+    // SVAL is `DBF_LONG` (mbbiDirectRecord.dbd.pod:203-205) — the BUFFER C's
+    // `readValue` reads SIOL into (`dbGetLink(&prec->siol, DBR_LONG,
+    // &prec->sval)`, mbbiDirectRecord.c:283) before publishing `val = sval`.
+    pub sval: i32,
     pub sims: i16,
     pub sdly: f64,
     skip_convert: bool,
@@ -47,6 +51,7 @@ impl Default for MbbiDirectRecord {
             simm: 0,
             siml: String::new(),
             siol: String::new(),
+            sval: 0,
             sims: 0,
             sdly: -1.0,
             skip_convert: false,
@@ -61,13 +66,6 @@ impl MbbiDirectRecord {
             self.bits[i] = ((self.val >> i) & 1) as u8;
         }
     }
-
-    fn bits_to_val(&mut self) {
-        self.val = 0;
-        for i in 0..32 {
-            self.val |= (self.bits[i] as u32 & 1) << i;
-        }
-    }
 }
 
 /// Bit field names B0..B1F — 32 entries, matching C `NUM_BITS 32`.
@@ -77,135 +75,9 @@ pub(crate) const BIT_NAMES: [&str; 32] = [
     "B1D", "B1E", "B1F",
 ];
 
-fn bit_field_descs() -> &'static [FieldDesc] {
-    // Const-evaluated table of the 32 bit fields.
-    macro_rules! bf {
-        ($name:literal) => {
-            FieldDesc {
-                name: $name,
-                dbf_type: DbFieldType::Char,
-                read_only: false,
-            }
-        };
-    }
-    static BITS: [FieldDesc; 32] = [
-        bf!("B0"),
-        bf!("B1"),
-        bf!("B2"),
-        bf!("B3"),
-        bf!("B4"),
-        bf!("B5"),
-        bf!("B6"),
-        bf!("B7"),
-        bf!("B8"),
-        bf!("B9"),
-        bf!("BA"),
-        bf!("BB"),
-        bf!("BC"),
-        bf!("BD"),
-        bf!("BE"),
-        bf!("BF"),
-        bf!("B10"),
-        bf!("B11"),
-        bf!("B12"),
-        bf!("B13"),
-        bf!("B14"),
-        bf!("B15"),
-        bf!("B16"),
-        bf!("B17"),
-        bf!("B18"),
-        bf!("B19"),
-        bf!("B1A"),
-        bf!("B1B"),
-        bf!("B1C"),
-        bf!("B1D"),
-        bf!("B1E"),
-        bf!("B1F"),
-    ];
-    &BITS
-}
-
-static MBBI_DIRECT_HEAD_FIELDS: &[FieldDesc] = &[
-    FieldDesc {
-        name: "VAL",
-        dbf_type: DbFieldType::Long,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "RVAL",
-        dbf_type: DbFieldType::ULong,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ORAW",
-        dbf_type: DbFieldType::ULong,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "MASK",
-        dbf_type: DbFieldType::ULong,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SHFT",
-        dbf_type: DbFieldType::UShort,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "NOBT",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "MLST",
-        dbf_type: DbFieldType::Long,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "SIMM",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIML",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIOL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIMS",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SDLY",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-];
-
-/// Full field table: the 11 scalar fields followed by the 32 bit fields.
-fn mbbi_direct_fields() -> &'static [FieldDesc] {
-    use std::sync::OnceLock;
-    static ALL: OnceLock<Vec<FieldDesc>> = OnceLock::new();
-    ALL.get_or_init(|| {
-        let mut v: Vec<FieldDesc> = MBBI_DIRECT_HEAD_FIELDS.to_vec();
-        v.extend_from_slice(bit_field_descs());
-        v
-    })
-}
-
 impl Record for MbbiDirectRecord {
     fn record_type(&self) -> &'static str {
         "mbbiDirect"
-    }
-
-    fn field_list(&self) -> &'static [FieldDesc] {
-        mbbi_direct_fields()
     }
 
     /// `SIMM` is `DBF_MENU menu(menuSimm)` (`mbbiDirectRecord.dbd.pod`): the
@@ -220,6 +92,29 @@ impl Record for MbbiDirectRecord {
 
     fn uses_monitor_deadband(&self) -> bool {
         false
+    }
+
+    /// C `devMbbiDirectSoftRaw` — `recGblInitConstantLink(&prec->inp,
+    /// DBF_ULONG, &prec->rval)` at init (`devMbbiDirectSoftRaw.c:42`, unmasked),
+    /// and per read `dbGetLink(&prec->inp, DBR_ULONG, &prec->rval, 0, 0)` then
+    /// `prec->rval &= prec->mask` (`:60-61`). `read_mbbi` returns 0, so the
+    /// record's `RVAL >> SHFT` → VAL/bit-field convert runs.
+    fn raw_soft_input(&mut self, entry: RawSoftEntry, value: EpicsValue) -> Option<CaResult<()>> {
+        self.rval = match super::raw_soft_rval_u32("mbbiDirect", &value) {
+            Ok(rval) => rval,
+            Err(e) => return Some(Err(e)),
+        };
+        if entry == RawSoftEntry::Read {
+            // The dset's init builds the mask: `if (nobt == 0) mask =
+            // 0xffffffff;` (overriding a configured MASK) then `mask <<= shft`.
+            let base = if self.nobt == 0 {
+                0xffff_ffff
+            } else {
+                self.mask
+            };
+            self.rval &= base.checked_shl(u32::from(self.shft)).unwrap_or(0);
+        }
+        Some(Ok(()))
     }
 
     /// VAL posts DBE_VALUE|DBE_LOG
@@ -257,9 +152,19 @@ impl Record for MbbiDirectRecord {
                 raw = raw.checked_shr(self.shft as u32).unwrap_or(0);
             }
             self.val = raw;
-            self.val_to_bits();
         }
         self.skip_convert = false;
+        // C `mbbiDirectRecord.c:217-226` monitor() re-derives every bit
+        // B0..B1F FROM VAL each cycle (`*pBn = !!(val & 1)`), whether or not
+        // the RVAL->VAL convert ran. In this INPUT record the bit fields are
+        // DERIVED from VAL — a `pp(TRUE)` Bx put processes the record but never
+        // changes VAL (Bx is not a value field), so the transient bit is
+        // overwritten by the VAL-derived bit. Re-derive UNCONDITIONALLY here
+        // (a soft-channel process sets `skip_convert`, leaving VAL untouched);
+        // gating the rebuild on the convert left a Bx put's transient bit
+        // standing, so `caput B0 1` with VAL=0 ended B0=1 instead of C's 0.
+        // Opposite direction from mbboDirect, where Bx puts DERIVE VAL.
+        self.val_to_bits();
         self.oraw = self.rval;
         // Capture the VAL-change
         // gate now (C mbbiDirectRecord.c:228-231 `mlst != val`); the framework
@@ -285,10 +190,18 @@ impl Record for MbbiDirectRecord {
             "SIOL" => Some(EpicsValue::String(self.siol.clone().into())),
             "SIMS" => Some(EpicsValue::Short(self.sims)),
             "SDLY" => Some(EpicsValue::Double(self.sdly)),
+            // B0..B1F are DBF_UCHAR (mbbiDirectRecord.dbd.pod). Serve the bit as
+            // the native `UChar` (unsigned) — it still projects to `DBR_CHAR` on
+            // the wire (`dbr.rs`: `UChar -> Char`), so a client's `caget` reports
+            // DBF_CHAR exactly as C does, but the put-coercion target derived
+            // from this value (`dbput_request`) is now the unsigned 0..=255 range
+            // instead of signed i8. C `dbFastPutConvert[DBR_STRING][DBF_UCHAR]`
+            // accepts `caput .Bn 255`; the prior `Char` representation made the
+            // port refuse everything above i8-max (128..=255).
             _ => BIT_NAMES
                 .iter()
                 .position(|&n| n == name)
-                .map(|idx| EpicsValue::Char(self.bits[idx])),
+                .map(|idx| EpicsValue::UChar(self.bits[idx])),
         }
     }
 
@@ -372,14 +285,29 @@ impl Record for MbbiDirectRecord {
             }
             _ => {
                 if let Some(idx) = BIT_NAMES.iter().position(|&n| n == name) {
+                    // B0..B1F are DBF_UCHAR, so a numeric CA put coerces to the
+                    // native `UChar`; accept it alongside the signed variants
+                    // device support / autosave may send. C stores the coerced
+                    // byte into `*pBn` and `monitor()` re-derives it as
+                    // `!! (val & 1)` (mbbiDirectRecord.c:221) — a NONZERO byte is
+                    // bit 1, not the low bit. This transient store is overwritten
+                    // by the re-derive below on the very next process, so it only
+                    // affects a readback taken before process; mirror C's nonzero
+                    // rule regardless.
                     let bit = match value {
-                        EpicsValue::Char(v) => v & 1,
-                        EpicsValue::Short(v) => (v & 1) as u8,
-                        EpicsValue::Long(v) => (v & 1) as u8,
+                        EpicsValue::UChar(v) => u8::from(v != 0),
+                        EpicsValue::Char(v) => u8::from(v != 0),
+                        EpicsValue::Short(v) => u8::from(v != 0),
+                        EpicsValue::Long(v) => u8::from(v != 0),
                         _ => return Err(CaError::TypeMismatch(name.into())),
                     };
+                    // INPUT record: Bx is DERIVED from VAL, so a Bx put must
+                    // NOT fold back into VAL (unlike mbboDirect). Store the raw
+                    // bit transiently; the `pp(TRUE)` put processes the record,
+                    // and process() re-derives every bit from the unchanged VAL,
+                    // overwriting this (C `mbbiDirectRecord.c` has no `special`
+                    // for Bx and never updates VAL on a bit put — VAL stays put).
                     self.bits[idx] = bit;
-                    self.bits_to_val();
                 } else {
                     return Err(CaError::FieldNotFound(name.to_string()));
                 }

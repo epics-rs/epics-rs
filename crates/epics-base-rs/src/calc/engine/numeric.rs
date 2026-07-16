@@ -1,8 +1,20 @@
+use super::cast::{d2i, d2ui, imod, nint};
 use super::error::CalcError;
 use super::opcodes::{CoreOp, Opcode};
+use super::random::calc_random;
 use super::{CompiledExpr, NumericInputs};
 
 pub fn eval(expr: &CompiledExpr, inputs: &mut NumericInputs) -> Result<f64, CalcError> {
+    // C `calcPerform` runs the empty program's loop zero times and leaves the
+    // stack empty, so its closing `if (ptop != stack + 1) return -1`
+    // (`calcPerform.c:419-420`) fails it — and `*presult` is never written, so
+    // the record keeps the previous VAL and goes to CALC_ALARM/INVALID. A
+    // failed compile leaves exactly this program behind, which is how C makes a
+    // broken CALC alarm on EVERY process rather than once at compile time.
+    if expr.is_empty() {
+        return Err(CalcError::EmptyProgram);
+    }
+
     let mut stack: Vec<f64> = Vec::with_capacity(20);
     let code = &expr.code;
     let mut pc = 0;
@@ -17,30 +29,56 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut NumericInputs) -> Result<f64, Calc
 
                 // Push operations
                 CoreOp::PushConst(v) => stack.push(*v),
-                CoreOp::PushVar(idx) => stack.push(inputs.vars[*idx as usize]),
+                // An arg the caller did not supply fetches 0 — the same rule
+                // `sCalcPerform.c:421-427` and `aCalcPerform.c:432` state for
+                // theirs. Base's C omits the bound and walks off the end of a
+                // short caller's field block (CBUG-G3); see `NumericInputs::num_args`.
+                CoreOp::PushVar(idx) => stack.push(inputs.num_arg(*idx as usize).unwrap_or(0.0)),
                 CoreOp::PushDoubleVar(idx) => {
-                    stack.push(inputs.vars[*idx as usize]);
+                    stack.push(inputs.num_arg(*idx as usize).unwrap_or(0.0));
                 }
 
                 // Constants
                 CoreOp::Pi => stack.push(std::f64::consts::PI),
                 CoreOp::D2R => stack.push(std::f64::consts::PI / 180.0),
                 CoreOp::R2D => stack.push(180.0 / std::f64::consts::PI),
+                CoreOp::S2R | CoreOp::R2S => {
+                    // The arcsecond constants are synApps-only (`sCalcPostfix.c:136,173`,
+                    // `aCalcPostfix.c:186,195`); base's element table has no S2R/R2S,
+                    // so `calcPerform` can never see them. Same shared-tokenizer
+                    // reachability as `FetchSval` below.
+                    return Err(CalcError::Internal);
+                }
 
-                // Random
+                // Random. BASE's generator, not synApps' — `calcRandom`
+                // (`calcPerform.c:518-523`) maps the shared Knuth LCG with
+                // `seed / 65535.0`, where sCalc/aCalc use `(seed+1) / 65536.0`.
+                // Every draw differs, from the first one on.
                 CoreOp::Random => {
-                    stack.push(simple_random());
+                    stack.push(calc_random());
                 }
                 CoreOp::FetchVal => {
                     // C calcPerform.c:74-76 — FETCH_VAL pushes *presult, the
                     // record's previous calculation result (the VAL field).
                     stack.push(inputs.prev_val);
                 }
+                CoreOp::FetchSval => {
+                    // C's numeric `postfix()` element table has no SVAL token,
+                    // so `calcPerform` can never see FETCH_SVAL. It reaches this
+                    // evaluator only because the port shares one tokenizer with
+                    // sCalc, and is rejected like every other string-only opcode
+                    // (the `Opcode::String(_)` catch-all below).
+                    return Err(CalcError::Internal);
+                }
                 CoreOp::NormalRandom => {
-                    let u1 = simple_random();
-                    let u2 = simple_random();
-                    let n = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
-                    stack.push(n);
+                    // `NRNDM` is synApps-only (`sCalcPostfix.c:169`,
+                    // `aCalcPostfix.c:133`); base's element table has RNDM and
+                    // nothing else (`postfix.c:133`), so `calcPerform` has no
+                    // NORMAL_RNDM case to run. Unreachable here for the same
+                    // shared-tokenizer reason as `FetchSval` and S2R/R2S — and
+                    // it must NOT draw, since base's generator is `calcRandom`
+                    // and its `[0, 1]` range would let `log(0)` through.
+                    return Err(CalcError::Internal);
                 }
 
                 // Arithmetic
@@ -63,12 +101,17 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut NumericInputs) -> Result<f64, Calc
                 }
                 CoreOp::Mod => {
                     let (a, b) = pop2(&mut stack)?;
-                    // C: itop = (epicsInt32)den; if(itop) (epicsInt32)num % itop else NaN
-                    let den = d2i(b);
-                    if den == 0 {
+                    // C `calcPerform.c:161-167`:
+                    //   itop = (epicsInt32) *ptop--;
+                    //   if (itop) *ptop = (epicsInt32) *ptop % itop;
+                    //   else      *ptop = epicsNAN;
+                    // The zero divisor is C's rule and is kept. The bare
+                    // `(epicsInt32)` narrowing of both operands is NOT — see
+                    // `cast::imod` and CBUG-A2.
+                    if b.trunc() == 0.0 {
                         stack.push(f64::NAN);
                     } else {
-                        stack.push((d2i(a).wrapping_rem(den)) as f64);
+                        stack.push(imod(a, b));
                     }
                 }
                 CoreOp::Neg => {
@@ -166,6 +209,12 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut NumericInputs) -> Result<f64, Calc
                 }
 
                 // Math functions (1 arg)
+                //
+                // BASE's ABS is `fabs` (`calcPerform.c:174-176`) and stays that
+                // way: `ABS(-0.0)` is `+0.0` here. The synApps engines use a
+                // conditional negate and answer `-0.0` — a real dialect
+                // difference, not an oversight to unify (see [`super::abs_val`],
+                // which they, and only they, call).
                 CoreOp::Abs => {
                     let a = pop1(&mut stack)?;
                     stack.push(a.abs());
@@ -185,10 +234,6 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut NumericInputs) -> Result<f64, Calc
                 CoreOp::LogE => {
                     let a = pop1(&mut stack)?;
                     stack.push(a.ln());
-                }
-                CoreOp::Log2 => {
-                    let a = pop1(&mut stack)?;
-                    stack.push(a.log2());
                 }
                 CoreOp::Sin => {
                     let a = pop1(&mut stack)?;
@@ -236,9 +281,11 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut NumericInputs) -> Result<f64, Calc
                 }
                 CoreOp::Nint => {
                     let a = pop1(&mut stack)?;
-                    // C: *ptop = (epicsInt32)(top>=0 ? top+0.5 : top-0.5)
-                    let pre = if a >= 0.0 { a + 0.5 } else { a - 0.5 };
-                    stack.push(f64_to_i32_wrap(pre) as f64);
+                    // C `calcPerform.c:290-293`:
+                    //   *ptop = (epicsInt32)(top >= 0 ? top+0.5 : top-0.5)
+                    // The `(epicsInt32)` narrowing is dropped — see `cast::nint`
+                    // and CBUG-A2.
+                    stack.push(nint(a));
                 }
 
                 // Test functions
@@ -256,7 +303,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut NumericInputs) -> Result<f64, Calc
                 }
                 CoreOp::IsInf => {
                     let a = pop1(&mut stack)?;
-                    stack.push(if a.is_infinite() { 1.0 } else { 0.0 });
+                    stack.push(super::isinf(a));
                 }
                 CoreOp::Finite(nargs) => {
                     let n = *nargs as usize;
@@ -335,14 +382,20 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut NumericInputs) -> Result<f64, Calc
                     stack.push(if a < b { a } else { b });
                 }
 
-                // Store
+                // Store. The stack is popped whether or not the arg exists — C's
+                // guarded store (`sCalcPerform.c:432-438`) pops in both arms too;
+                // only the assignment is conditional.
                 CoreOp::StoreVar(idx) => {
                     let v = pop1(&mut stack)?;
-                    inputs.vars[*idx as usize] = v;
+                    if let Some(slot) = inputs.num_arg_mut(*idx as usize) {
+                        *slot = v;
+                    }
                 }
                 CoreOp::StoreDoubleVar(idx) => {
                     let v = pop1(&mut stack)?;
-                    inputs.vars[*idx as usize] = v;
+                    if let Some(slot) = inputs.num_arg_mut(*idx as usize) {
+                        *slot = v;
+                    }
                 }
             },
 
@@ -352,69 +405,12 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut NumericInputs) -> Result<f64, Calc
         }
     }
 
-    // C calcPerform.c:418-422 — the stack must hold exactly one value at
+    // C calcPerform.c:419-420 — the stack must hold exactly one value at
     // END_EXPRESSION; otherwise the postfix was malformed.
-    // The empty-expression program ([End] only) is a deliberate Rust
-    // special case (`compile("")`) and yields 0.0; every other program
-    // must leave exactly one residual value.
-    let is_empty_program = code
-        .iter()
-        .all(|op| matches!(op, Opcode::Core(CoreOp::End)));
-    if is_empty_program {
-        return Ok(stack.first().copied().unwrap_or(0.0));
-    }
     if stack.len() != 1 {
         return Err(CalcError::Internal);
     }
     Ok(stack[0])
-}
-
-/// C `d2i` macro: positive doubles route through `epicsUInt32` first so that
-/// values with bit 31 set become the corresponding signed (negative) pattern;
-/// negative doubles cast directly. Wraps modulo 2^32 on overflow.
-#[inline]
-fn d2i(x: f64) -> i32 {
-    if x < 0.0 {
-        f64_to_i32_wrap(x)
-    } else {
-        f64_to_u32_wrap(x) as i32
-    }
-}
-
-/// C `d2ui` macro: negative doubles cast to `epicsInt32` then reinterpreted
-/// as `epicsUInt32`; non-negative doubles cast directly.
-#[inline]
-fn d2ui(x: f64) -> u32 {
-    if x < 0.0 {
-        f64_to_i32_wrap(x) as u32
-    } else {
-        f64_to_u32_wrap(x)
-    }
-}
-
-/// `(epicsInt32)x` — C cast of a double to a 32-bit signed integer with
-/// wrap-on-overflow semantics (matching x86 behavior; Rust `as` saturates).
-#[inline]
-fn f64_to_i32_wrap(x: f64) -> i32 {
-    if x.is_nan() {
-        return 0;
-    }
-    let t = x.trunc();
-    // Reduce modulo 2^32 then reinterpret the low 32 bits as signed.
-    let m = t.rem_euclid(4294967296.0);
-    (m as u64 as u32) as i32
-}
-
-/// `(epicsUInt32)x` — C cast of a double to a 32-bit unsigned integer with
-/// wrap-on-overflow semantics.
-#[inline]
-fn f64_to_u32_wrap(x: f64) -> u32 {
-    if x.is_nan() {
-        return 0;
-    }
-    let t = x.trunc();
-    let m = t.rem_euclid(4294967296.0);
-    m as u64 as u32
 }
 
 fn pop1(stack: &mut Vec<f64>) -> Result<f64, CalcError> {
@@ -460,32 +456,14 @@ fn cond_search(code: &[Opcode], start: usize, find_else: bool) -> Result<usize, 
     Err(CalcError::Conditional)
 }
 
-fn simple_random() -> f64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEED: AtomicU64 = AtomicU64::new(0);
-
-    let mut s = SEED.load(Ordering::Relaxed);
-    if s == 0 {
-        s = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
-    }
-    s = s
-        .wrapping_mul(6364136223846793005)
-        .wrapping_add(1442695040888963407);
-    SEED.store(s, Ordering::Relaxed);
-    // C calcRandom() returns (double)rand()/RAND_MAX — a closed [0,1] range
-    // (both endpoints reachable). Map 53 random bits onto [0,1] inclusive.
-    (s >> 11) as f64 / ((1u64 << 53) - 1) as f64
-}
-
 #[cfg(test)]
 mod parity_tests {
     //! C-parity regression tests for calc engine fixes (doc/parity-review/01-calc.md).
-    use super::{d2i, d2ui, f64_to_i32_wrap};
+    use crate::calc::engine::cast::{d2i, d2ui};
     use crate::calc::engine::error::calc_error_str;
-    use crate::calc::{ArrayInputs, CalcError, NumericInputs, acalc, calc, compile, eval};
+    use crate::calc::{
+        ArrayInputs, CalcError, NumericInputs, acalc, acalc_compile, calc, compile, eval,
+    };
 
     fn run(expr: &str) -> f64 {
         let mut inp = NumericInputs::new();
@@ -504,18 +482,28 @@ mod parity_tests {
                 Opcode::Core(CoreOp::PushConst(2.0)),
                 Opcode::Core(CoreOp::End),
             ],
-            kind: ExprKind::Numeric,
-            loop_pairs: Vec::new(),
+            ..CompiledExpr::empty(ExprKind::Numeric)
         };
         let mut inp = NumericInputs::new();
         assert_eq!(eval(&prog, &mut inp), Err(CalcError::Internal));
     }
 
+    /// This asserted that the empty program yields 0.0. It does not: base
+    /// `postfix("")` never even produces one (`CALC_ERR_NULL_ARG`,
+    /// postfix.c:235-241), and the empty program a FAILED compile leaves behind
+    /// makes `calcPerform` return -1 (its closing `ptop != stack + 1`,
+    /// calcPerform.c:419-420) — which is how a broken CALC alarms on every
+    /// process. Compiled C confirms both. See tests/calc_empty_program.rs.
     #[test]
-    fn c1_empty_program_still_yields_zero() {
-        let compiled = compile("").unwrap();
+    fn c1_the_empty_program_is_an_evaluation_error() {
+        use crate::calc::{CompiledExpr, ExprKind};
+        assert_eq!(compile("").err(), Some(CalcError::NullArg));
+
         let mut inp = NumericInputs::new();
-        assert_eq!(eval(&compiled, &mut inp).unwrap(), 0.0);
+        assert_eq!(
+            eval(&CompiledExpr::empty(ExprKind::Numeric), &mut inp),
+            Err(CalcError::EmptyProgram)
+        );
     }
 
     // compiler rejects net runtime depth != 1.
@@ -532,21 +520,15 @@ mod parity_tests {
     }
 
     #[test]
-    fn h1_store_terminated_expression_compiles() {
-        // This engine is a synApps superset: sCalc `:=` store-assignment is
-        // a valid construct that epics-base `postfix.c` does not have.
-        // `A:=5` is store-terminated — it ends at runtime depth 0 with a
-        // store as its final opcode — and must compile successfully.
-        use crate::calc::engine::opcodes::{CoreOp, Opcode};
-        let compiled = compile("A:=5").expect("A:=5 is a valid sCalc store");
-        assert_eq!(
-            compiled.code,
-            vec![
-                Opcode::Core(CoreOp::PushConst(5.0)),
-                Opcode::Core(CoreOp::StoreVar(0)),
-                Opcode::Core(CoreOp::End),
-            ]
-        );
+    fn h1_store_terminated_expression_is_incomplete() {
+        // `:=` is in base's element table too (`postfix.c:162`), with the same
+        // runtime_effect -1 as sCalc's — so a store-terminated source ends at
+        // depth 0 and fails the `runtime_depth != 1` check. Compiled base
+        // postfix: `A:=5` is CALC_ERR_INCOMPLETE, `A:=5;A` is 0.
+        //
+        // The port used to compile `A:=5` on the theory that base has no `:=`
+        // and synApps allows a value-less program. Neither is true.
+        assert!(matches!(compile("A:=5"), Err(CalcError::Incomplete)));
     }
 
     #[test]
@@ -560,44 +542,62 @@ mod parity_tests {
     // well-formed array/string extension opcodes. The arity of every
     // non-vararg function (incl. 0-arg ARNDM/IX, 2-arg CAT/NSMOO/NDERIV/
     // FITPOLY/FITQ, 3-arg FITMPOLY/FITMQ) is now modelled exactly.
+    //
+    // These compile through `acalc_compile` — the aCalcPostfix.c element table
+    // is the only one of the three that has these tokens. The numeric
+    // `compile()` rejects them (see `numeric_calc_rejects_foreign_engine_tokens`).
     #[test]
     fn h1_array_extension_ops_compile() {
         // 2-arg array concat: CAT consumes 2 operands, pushes 1.
-        assert!(compile("CAT(AA,BB)").is_ok());
-        assert!(compile("CAT(AA,4)").is_ok());
+        assert!(acalc_compile("CAT(AA,BB)").is_ok());
+        assert!(acalc_compile("CAT(AA,4)").is_ok());
         // 0-arg array generator: ARNDM consumes 0, pushes 1.
-        assert!(compile("ARNDM").is_ok());
+        assert!(acalc_compile("ARNDM").is_ok());
         // Other 2-arg array ops.
-        assert!(compile("NSMOO(AA,2)").is_ok());
-        assert!(compile("NDERIV(AA,5)").is_ok());
-        assert!(compile("FITPOLY(AA,BB)").is_ok());
-        assert!(compile("FITQ(AA,BB)").is_ok());
+        assert!(acalc_compile("NSMOO(AA,2)").is_ok());
+        assert!(acalc_compile("NDERIV(AA,5)").is_ok());
+        assert!(acalc_compile("FITMPOLY(AA,BB)").is_ok());
+        // FITPOLY is a UNARY_OPERATOR (`aCalcPostfix.c:142`) — one operand, and a
+        // second is a COMPILE error, not an extra argument. Compiled C:
+        // `FITPOLY(AA,BB)` is "Incomplete expression, operand missing", the same
+        // rejection `SUM(AA,BB)` gets.
+        assert!(acalc_compile("FITPOLY(AA)").is_ok());
+        assert!(acalc_compile("FITPOLY(AA,BB)").is_err());
+        // FITQ/FITMQ are VARARG_OPERATORs (`:140-141`): their trailing arguments
+        // name the scalar arguments the coefficients are stored into.
+        assert!(acalc_compile("FITQ(AA)").is_ok());
+        assert!(acalc_compile("FITQ(AA,C,D,E)").is_ok());
+        assert!(acalc_compile("FITMQ(AA,BB,C,D,E)").is_ok());
 
-        // And acalc end-to-end still produces an array result.
+        // And acalc end-to-end still produces an array result. CAT cannot grow the
+        // `arraySize` buffer: with AA carrying no window its `lastEl` is already
+        // arraySize-1, so C copies nothing (`aCalcPerform.c:1359-1364`) and the
+        // result is AA. See `tests/calc_array_window.rs` for the windowed cases.
         let mut inputs = ArrayInputs::new(3);
         inputs.arrays[0] = vec![1.0, 2.0, 3.0];
         inputs.arrays[1] = vec![4.0, 5.0, 6.0];
         let cat = acalc("CAT(AA,BB)", &mut inputs).unwrap();
         assert_eq!(
             cat,
-            crate::calc::ArrayStackValue::Array(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+            crate::calc::ArrayStackValue::array(vec![1.0, 2.0, 3.0])
         );
 
         let mut inputs2 = ArrayInputs::new(5);
         let arndm = acalc("ARNDM", &mut inputs2).unwrap();
         match arndm {
-            crate::calc::ArrayStackValue::Array(arr) => assert_eq!(arr.len(), 5),
+            crate::calc::ArrayStackValue::Array(cell) => assert_eq!(cell.buf().len(), 5),
             other => panic!("expected Array, got {other:?}"),
         }
     }
 
-    // Regression: a genuinely malformed array expression is still
-    // rejected — too few operands for a 2-arg function leaves the
-    // runtime stack short of exactly 1 value.
+    // Regression: an aCalc expression is rejected by the numeric compiler for
+    // the reason C rejects it — `CAT` and `AA` are not in postfix.c's ELEMENT
+    // table, so C's lexer never reaches the arity question. Verified against
+    // the C compiler: `CAT(AA)` is CALC_ERR_SYNTAX (11), not an arity error.
+    // (aCalc's own arity check for CAT lives in the array engine's tests.)
     #[test]
     fn h1_array_extension_arity_mismatch_rejected() {
-        // CAT needs 2 operands; one operand -> net depth 0 -> Incomplete.
-        assert!(matches!(compile("CAT(AA)"), Err(CalcError::Incomplete)));
+        assert!(matches!(compile("CAT(AA)"), Err(CalcError::Syntax)));
     }
 
     // max/min NaN propagation matches C.
@@ -624,11 +624,19 @@ mod parity_tests {
         assert!(run("MIN(5,0/0)").is_nan());
     }
 
-    // nint uses 32-bit wrap, not i64 saturation.
+    /// CBUG-A2 — NINT rounds and does NOT narrow. This test used to pin C's
+    /// `(epicsInt32)` cast (`calcPerform.c:292`), i.e. `i32::MIN`.
     #[test]
-    fn h3_nint_wraps_at_32bit() {
-        // 3e9 rounds to 3000000000, wrapping into a negative epicsInt32.
-        assert_eq!(run("NINT(3000000000)"), -1294967296.0);
+    fn h3_nint_out_of_range_is_the_true_rounded_value() {
+        // Compiled C (x86-64) answers INT32_MIN here — `cvttsd2si`'s indefinite
+        // value for an out-of-range `(epicsInt32)` cast. The nearest integer to
+        // 3e9 is 3e9, and the stack cell is a double, so that is what we push.
+        assert_eq!(run("NINT(3000000000)"), 3_000_000_000.0);
+        assert_eq!(run("NINT(-3000000000)"), -3_000_000_000.0);
+        assert_eq!(run("NINT(2500000000.4)"), 2_500_000_000.0);
+        // NaN/Inf: C's cast answers INT32_MIN for both.
+        assert!(run("NINT(0/0)").is_nan());
+        assert_eq!(run("NINT(1/0)"), f64::INFINITY);
     }
 
     #[test]
@@ -636,19 +644,38 @@ mod parity_tests {
         assert_eq!(run("NINT(2.5)"), 3.0);
         assert_eq!(run("NINT(-2.5)"), -3.0);
         assert_eq!(run("NINT(2.4)"), 2.0);
+        // In-range values are bit-identical to C, including the int32 edges.
+        assert_eq!(run("NINT(2147483647)"), 2_147_483_647.0);
+        assert_eq!(run("NINT(-2147483648)"), -2_147_483_648.0);
     }
 
-    // MODULO uses epicsInt32 truncation and zero detection.
+    /// CBUG-A2 — MODULO truncates its operands but does not narrow them. These
+    /// two cases used to pin C's `(epicsInt32)` cast (`calcPerform.c:162-164`):
+    /// `5 % 4294967296` was `5.0` because the divisor cast to INT32_MIN.
     #[test]
-    fn h4_mod_large_denominator_is_int32_zero() {
-        // 4294967296 == 2^32 truncates to epicsInt32 0 -> NaN.
-        assert!(run("5 % 4294967296").is_nan());
+    fn h4_mod_out_of_range_operands_are_not_narrowed() {
+        // Divisor 2^32: C casts it to INT32_MIN and answers 5. The true
+        // remainder of 5 by 2^32 is 5 as well — same answer, different reason.
+        assert_eq!(run("5 % 4294967296"), 5.0);
+        // Dividend 3e9: C casts it to INT32_MIN and answers -2. True: 4.
+        assert_eq!(run("3000000000 % 7"), 4.0);
+        // A NaN dividend is INT32_MIN in C (and then CBUG-A1's SIGFPE vector
+        // with divisor -1); here it stays NaN.
+        assert!(run("(0/0) % 7").is_nan());
+        assert!(run("7 % (0/0)").is_nan());
     }
 
     #[test]
     fn h4_mod_normal() {
         assert_eq!(run("17 % 5"), 2.0);
         assert!(run("5 % 0").is_nan());
+        // The divisor is zero exactly when it TRUNCATES to zero, as in C.
+        assert!(run("5 % 0.5").is_nan());
+        // C's truncated remainder: the sign follows the dividend.
+        assert_eq!(run("-17 % 5"), -2.0);
+        assert_eq!(run("17 % -5"), 2.0);
+        // Operands truncate toward zero before the remainder, as in C.
+        assert_eq!(run("17.9 % 5.9"), 2.0);
     }
 
     // bitwise ops use d2i/d2ui (wrap), not saturating `as i32`.
@@ -664,7 +691,6 @@ mod parity_tests {
         assert_eq!(d2ui(3_000_000_000.0), 3_000_000_000);
         assert_eq!(d2i(-1.0), -1);
         assert_eq!(d2ui(-1.0), 0xFFFF_FFFF);
-        assert_eq!(f64_to_i32_wrap(f64::NAN), 0);
     }
 
     // nested ternary branch selection matches C cond_search.
@@ -730,6 +756,45 @@ mod parity_tests {
             let r = run("RNDM");
             assert!((0.0..=1.0).contains(&r), "RNDM out of range: {r}");
         }
+    }
+
+    /// base RNDM replays `calcRandom` (`calcPerform.c:518-523`), NOT sCalc's
+    /// `local_random`: the first draw of compiled C is 49156/65535
+    /// (0.75007248…), where synApps' is 49157/65536 (0.75007629…).
+    /// A fresh thread, because the seed is thread-private.
+    #[test]
+    fn l4_random_first_draws_are_base_c_not_synapps() {
+        let got = std::thread::spawn(|| (0..3).map(|_| run("RNDM")).collect::<Vec<_>>())
+            .join()
+            .unwrap();
+        let mut s: u16 = 0xa3bf;
+        let expected: Vec<f64> = (0..3)
+            .map(|_| {
+                s = s.wrapping_mul(1533).wrapping_add(0x3141);
+                f64::from(s) / 65535.0
+            })
+            .collect();
+        assert_eq!(got, expected);
+        assert_eq!(got[0], 49156.0 / 65535.0);
+    }
+
+    /// NRNDM is not in base's element table, so it cannot compile — and if one
+    /// were hand-assembled, the evaluator refuses it rather than drawing from
+    /// base's `[0, 1]` generator (`log(0)`).
+    #[test]
+    fn l4_normal_random_is_not_a_base_operator() {
+        use crate::calc::engine::opcodes::{CoreOp, Opcode};
+        use crate::calc::{CompiledExpr, ExprKind};
+        assert_eq!(compile("NRNDM").unwrap_err(), CalcError::Syntax);
+        let mut hand_built = CompiledExpr::empty(ExprKind::Numeric);
+        hand_built.code = vec![
+            Opcode::Core(CoreOp::NormalRandom),
+            Opcode::Core(CoreOp::End),
+        ];
+        assert_eq!(
+            eval(&hand_built, &mut NumericInputs::new()).unwrap_err(),
+            CalcError::Internal
+        );
     }
 
     // L-5: VAL token reads the previous result, not the stack top.

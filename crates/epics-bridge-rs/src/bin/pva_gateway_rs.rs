@@ -92,13 +92,17 @@ struct Args {
     #[arg(long, default_value = "0.0.0.0")]
     bind: IpAddr,
 
-    /// Downstream TCP port (default 5075, flag mode only).
-    #[arg(long, default_value_t = 5075)]
-    tcp_port: u16,
+    /// Downstream TCP port (flag mode only). Precedence: this flag
+    /// overrides `EPICS_PVAS_SERVER_PORT` / `EPICS_PVA_SERVER_PORT`,
+    /// which override 5075.
+    #[arg(long)]
+    tcp_port: Option<u16>,
 
-    /// Downstream UDP search port (default 5076, flag mode only).
-    #[arg(long, default_value_t = 5076)]
-    udp_port: u16,
+    /// Downstream UDP search port (flag mode only). Precedence: this flag
+    /// overrides `EPICS_PVAS_BROADCAST_PORT` / `EPICS_PVA_BROADCAST_PORT`,
+    /// which override 5076.
+    #[arg(long)]
+    udp_port: Option<u16>,
 
     /// Per-PV upstream connect timeout in seconds. Precedence: this
     /// flag overrides `EPICS_PVA_GW_CONNECT_TMO`, which overrides the
@@ -579,9 +583,17 @@ impl ResolvedConfig {
     fn into_flag_config(self, args: &Args) -> PvaGatewayConfig {
         // epics-base PR #205 IPv6 Stage 1: `PvaServerConfig::bind_ip` is
         // `IpAddr` so v4 and v6 bind addresses pass through unchanged.
+        //
+        // Port precedence is flag > EPICS env > compiled default; the
+        // two env readers carry pvxs's `PickOne` order (server-specific
+        // `EPICS_PVAS_*` before the shared `EPICS_PVA_*`).
         let server_config = PvaServerConfig {
-            tcp_port: args.tcp_port,
-            udp_port: args.udp_port,
+            tcp_port: args
+                .tcp_port
+                .unwrap_or_else(epics_pva_rs::config::env::pvas_server_port),
+            udp_port: args
+                .udp_port
+                .unwrap_or_else(epics_pva_rs::config::env::server_broadcast_port),
             bind_ip: args.bind,
             ..PvaServerConfig::default()
         };

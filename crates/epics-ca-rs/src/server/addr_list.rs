@@ -5,7 +5,7 @@
 //! parsed address lists for the IOC's UDP search responder and beacon
 //! emitter.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::Duration;
 
 use crate::protocol::CA_REPEATER_PORT;
@@ -30,6 +30,17 @@ pub struct CasUdpConfig {
     pub mcast_addrs: Vec<Ipv4Addr>,
 }
 
+/// C `online_notify.c:59` — the beacon period RSRV falls back to, and the
+/// number its diagnostic prints. Same 15 s as [`CasUdpConfig::default`], and it
+/// comes from the one place that number is declared: the generated `ENV_PARAM`
+/// table's `EPICS_CA_BEACON_PERIOD` default (`configure/CONFIG_ENV`).
+fn default_beacon_period_secs() -> f64 {
+    epics_base_rs::runtime::env_table::EPICS_CA_BEACON_PERIOD
+        .default_str()
+        .parse()
+        .expect("EPICS_CA_BEACON_PERIOD's compiled default is a number")
+}
+
 impl Default for CasUdpConfig {
     fn default() -> Self {
         Self {
@@ -39,7 +50,7 @@ impl Default for CasUdpConfig {
                 CA_REPEATER_PORT,
             ))],
             ignore_addrs: Vec::new(),
-            beacon_period: Duration::from_secs(15),
+            beacon_period: crate::estdlib::duration_from_secs(default_beacon_period_secs()),
             mcast_addrs: Vec::new(),
         }
     }
@@ -58,11 +69,39 @@ impl Default for CasUdpConfig {
 /// UNCONDITIONALLY, not just when `EPICS_CAS_AUTO_BEACON_ADDR_LIST=YES`
 /// — pre-fix Rust nested it under `if auto_on`, so the misconfig
 /// silently escaped detection when AUTO=NO.
+///
+/// Resolved ONCE per process. C reads this configuration once — `rsrv_init`
+/// builds the address lists, and the single beacon thread
+/// (`online_notify.c:52-64`) reads `EPICS_CAS_BEACON_PERIOD` on its way up —
+/// so each diagnostic below is printed exactly once by a C IOC. The port calls
+/// this from three points in server startup (`bind_tcp_listeners`,
+/// `bind_sockets`, `CaServer::run`), which tripled every one of them: the
+/// compiled `softIoc` prints "float fetch failed" once for a bad beacon period,
+/// this printed it three times. Memoizing the whole resolution — not just the
+/// beacon period — also stops the interface discovery and the empty-list
+/// warning from repeating, and is what `EPICS_CA_*` client-side resolution
+/// already does.
 pub fn from_env() -> CaResult<CasUdpConfig> {
+    static RESOLVED: std::sync::OnceLock<Result<CasUdpConfig, String>> = std::sync::OnceLock::new();
+    // `resolve_from_env`'s only failure is `CaError::Protocol`, so caching the
+    // message and rebuilding the error loses nothing. `CaError` is not `Clone`.
+    RESOLVED
+        .get_or_init(|| resolve_from_env().map_err(|e| e.to_string()))
+        .clone()
+        .map_err(CaError::Protocol)
+}
+
+/// The uncached resolution behind [`from_env`] — every env read, every
+/// diagnostic, every interface probe. Tests drive this directly; production
+/// code goes through the memoized [`from_env`].
+fn resolve_from_env() -> CaResult<CasUdpConfig> {
     let mut cfg = CasUdpConfig::default();
 
-    if let Some(list) = epics_base_rs::runtime::env::get("EPICS_CAS_INTF_ADDR_LIST") {
-        let parsed = parse_ipv4_list(&list);
+    if let Some(list) = epics_base_rs::runtime::env_table::EPICS_CAS_INTF_ADDR_LIST.get() {
+        // C `caservertask.c:341-343` tokenizes with the server's UDP port —
+        // which is the port its duplicate warning dots the address with.
+        let udp_port = epics_base_rs::runtime::net::cas_server_port();
+        let parsed = parse_ipv4_list(&list, "EPICS_CAS_INTF_ADDR_LIST", udp_port);
         // C `rsrv/caservertask.c:367-371, 633-668` splits
         // multicast (224.0.0.0/4) entries off into
         // `casMCastAddrList` and joins each group via
@@ -84,18 +123,10 @@ pub fn from_env() -> CaResult<CasUdpConfig> {
         }
     }
 
-    // Server-side beacon port: EPICS_CAS_BEACON_PORT takes precedence
-    // (matches rsrv/caservertask.c:501-507 lookup order). Falls back to
-    // EPICS_CA_REPEATER_PORT, then the compiled-in default. Operators
-    // who only set the server-side variable were previously seeing it
-    // silently ignored — beacons went to the repeater port.
-    let beacon_port = epics_base_rs::runtime::env::get("EPICS_CAS_BEACON_PORT")
-        .and_then(|s| s.parse::<u16>().ok())
-        .or_else(|| {
-            epics_base_rs::runtime::env::get("EPICS_CA_REPEATER_PORT")
-                .and_then(|s| s.parse::<u16>().ok())
-        })
-        .unwrap_or(CA_REPEATER_PORT);
+    // Server-side beacon port: EPICS_CAS_BEACON_PORT when configured,
+    // else EPICS_CA_REPEATER_PORT, each resolved by the one owner of
+    // C `envGetInetPortConfigParam` (rsrv/caservertask.c:501-508).
+    let beacon_port = epics_base_rs::runtime::net::cas_beacon_port();
 
     // Beacon addr list: only EPICS_CAS_BEACON_ADDR_LIST. The C IOC
     // server (rsrv/caservertask.c:413) calls
@@ -114,8 +145,12 @@ pub fn from_env() -> CaResult<CasUdpConfig> {
     // standalone `caRepeater` daemon (repeater.cpp:545-547) DOES still
     // fall back; that path lives in `repeater.rs` and is unaffected.
     let mut beacon_addrs: Vec<SocketAddr> = Vec::new();
-    if let Some(list) = epics_base_rs::runtime::env::get("EPICS_CAS_BEACON_ADDR_LIST") {
-        beacon_addrs.extend(parse_addr_list(&list, beacon_port));
+    if let Some(list) = epics_base_rs::runtime::env_table::EPICS_CAS_BEACON_ADDR_LIST.get() {
+        beacon_addrs.extend(parse_addr_list(
+            &list,
+            "EPICS_CAS_BEACON_ADDR_LIST",
+            beacon_port,
+        ));
     }
 
     // C parity (`caservertask.c:281-287, 415-427`):
@@ -138,7 +173,7 @@ pub fn from_env() -> CaResult<CasUdpConfig> {
     // (e.g. when only multicast targets are wanted via interface
     // setup, or when running fully isolated). Honour AUTO==NO
     // strictly; only run discovery when AUTO is YES.
-    let auto_beacon = epics_base_rs::runtime::env::get("EPICS_CAS_AUTO_BEACON_ADDR_LIST");
+    let auto_beacon = epics_base_rs::runtime::env_table::EPICS_CAS_AUTO_BEACON_ADDR_LIST.get();
     let auto_on = match auto_beacon.as_deref() {
         // Unset or empty → C `envGetBoolConfigParam` returns -1,
         // initial `autobeaconlist = 1` survives.
@@ -189,12 +224,20 @@ pub fn from_env() -> CaResult<CasUdpConfig> {
         } else {
             discover_broadcast_addrs()
         };
+        // No `contains` guard: on the server C dedups the WHOLE beacon list —
+        // user entries and auto-discovered broadcasts together — with one
+        // `removeDuplicateAddresses(&beaconAddrList, &temp, 0)` at
+        // `caservertask.c:438`, which reports every repeat it drops. Two NICs on
+        // one subnet, or an operator who lists a broadcast the discovery already
+        // found, are exactly the cases C reports and the port swallowed.
         for bcast in bcast_iter {
-            let entry = SocketAddr::V4(SocketAddrV4::new(bcast, beacon_port));
-            if !beacon_addrs.contains(&entry) {
-                beacon_addrs.push(entry);
-            }
+            beacon_addrs.push(SocketAddr::V4(SocketAddrV4::new(bcast, beacon_port)));
         }
+    }
+    // C `caservertask.c:438` — outside the `if (autobeaconlist)`, so the user's
+    // own list is deduped and reported even when auto-discovery is off.
+    let mut beacon_addrs = crate::iocinf::remove_duplicate_addresses(beacon_addrs, |a| *a);
+    if auto_on {
         if beacon_addrs.is_empty() {
             // Last-resort fallback: limited broadcast.  C `rsrv_init`
             // does not add this — it warns and leaves the list empty
@@ -214,8 +257,11 @@ pub fn from_env() -> CaResult<CasUdpConfig> {
     }
     cfg.beacon_addrs = beacon_addrs;
 
-    if let Some(list) = epics_base_rs::runtime::env::get("EPICS_CAS_IGNORE_ADDR_LIST") {
-        cfg.ignore_addrs = parse_ipv4_list(&list);
+    if let Some(list) = epics_base_rs::runtime::env_table::EPICS_CAS_IGNORE_ADDR_LIST.get() {
+        // C `caservertask.c:450-451` builds this one with `port = 0`, so the
+        // duplicate it reports is dotted as `10.1.2.3:0` — captured from the
+        // compiled `softIoc`, which is why the port is not the server's here.
+        cfg.ignore_addrs = parse_ipv4_list(&list, "EPICS_CAS_IGNORE_ADDR_LIST", 0);
     }
 
     // C `online_notify.c::rsrv_online_notify_task:52-57` reads
@@ -238,61 +284,68 @@ pub fn from_env() -> CaResult<CasUdpConfig> {
     // in a soak test) gets raised against the operator's wishes.
     // Match C: accept any strictly-positive parsed value as-is;
     // fall back to default for parse-failure or non-positive.
-    let raw_period = epics_base_rs::runtime::env::get("EPICS_CAS_BEACON_PERIOD")
-        .or_else(|| epics_base_rs::runtime::env::get("EPICS_CA_BEACON_PERIOD"));
-    if let Some(period) = raw_period.and_then(|s| s.parse::<f64>().ok()) {
-        if period > 0.0 && period.is_finite() {
-            cfg.beacon_period = Duration::from_secs_f64(period);
+    //
+    // The fallback is C's `envGetConfigParamPtr` PRESENCE test, not a
+    // parse-success test: an invalid `EPICS_CAS_BEACON_PERIOD` does not
+    // silently promote the legacy var. Parsing and the `Duration`
+    // conversion are `crate::estdlib` (C `epicsScanDouble`), so `inf` is
+    // an accepted — never-firing — period rather than a panic, and NaN
+    // (which fails `> 0.0`, like every C comparison against it) keeps
+    // the default.
+    use epics_base_rs::runtime::env_table::{EPICS_CA_BEACON_PERIOD, EPICS_CAS_BEACON_PERIOD};
+    let param = if EPICS_CAS_BEACON_PERIOD.get().is_some() {
+        EPICS_CAS_BEACON_PERIOD
+    } else {
+        EPICS_CA_BEACON_PERIOD
+    };
+    match param.double() {
+        Ok(period) if period > 0.0 => {
+            cfg.beacon_period = crate::estdlib::duration_from_secs(period);
         }
-        // else: keep default (15s) — matches C's `maxPeriod <= 0.0` branch.
+        // Unresolvable: C reads the compiled "15.0" default of the legacy var,
+        // silently. Keep the default period, print nothing.
+        Err(epics_base_rs::runtime::env::EnvDoubleError::Unresolvable) => {}
+        // Parse failure OR `<= 0.0` — C `online_notify.c:58-64`. C names
+        // EPICS_CAS_BEACON_PERIOD in both lines even when the value it
+        // fetched came from the deprecated var, so this does too.
+        _ => {
+            eprintln!("EPICS \"EPICS_CAS_BEACON_PERIOD\" float fetch failed");
+            eprintln!(
+                "Setting \"EPICS_CAS_BEACON_PERIOD\" = {:.6}",
+                default_beacon_period_secs()
+            );
+        }
     }
 
     Ok(cfg)
 }
 
-/// Parse a whitespace-separated list of "host" or "host:port" tokens.
-/// Resolves DNS names if necessary. Unparseable entries are dropped.
-pub fn parse_addr_list(list: &str, default_port: u16) -> Vec<SocketAddr> {
-    let mut out = Vec::new();
-    for token in list.split_whitespace() {
-        if let Some(addr) = resolve_token(token, default_port) {
-            out.push(addr);
-        }
-    }
-    out
+/// One `EPICS_CAS_*` address list, tokenized and deduped exactly as C does it:
+/// `addAddrToChannelAccessAddressList` then
+/// `removeDuplicateAddresses(…, silent=0)` (`caservertask.c:341-343`,
+/// `:413-438`, `:450-451`). Both diagnostics — the bad token and the discarded
+/// duplicate — belong to those two functions and are printed by them.
+pub fn parse_addr_list(list: &str, env_name: &str, default_port: u16) -> Vec<SocketAddr> {
+    let tokens =
+        crate::iocinf::add_addr_to_channel_access_address_list(list, env_name, default_port);
+    crate::iocinf::remove_duplicate_addresses(tokens, |t| t.sock)
+        .into_iter()
+        .map(|t| t.sock)
+        .collect()
 }
 
-fn resolve_token(token: &str, default_port: u16) -> Option<SocketAddr> {
-    if let Ok(addr) = token.parse::<SocketAddr>() {
-        return Some(addr);
-    }
-    if let Ok(ip) = token.parse::<Ipv4Addr>() {
-        return Some(SocketAddr::V4(SocketAddrV4::new(ip, default_port)));
-    }
-    let (host, port) = match token.rsplit_once(':') {
-        Some((h, p)) => (h, p.parse::<u16>().ok()?),
-        None => (token, default_port),
-    };
-    let candidates = format!("{host}:{port}").to_socket_addrs().ok()?;
-    candidates.into_iter().find(|a| a.is_ipv4())
-}
-
-/// Parse a whitespace-separated list of IPv4 literals (no port).
-fn parse_ipv4_list(list: &str) -> Vec<Ipv4Addr> {
-    list.split_whitespace()
-        .filter_map(|tok| {
-            // Accept "ip" or "ip:port" (port ignored for ignore-list).
-            let (host, _) = tok.rsplit_once(':').unwrap_or((tok, ""));
-            host.parse::<Ipv4Addr>().ok().or_else(|| {
-                // Try DNS as a courtesy.
-                format!("{tok}:0")
-                    .to_socket_addrs()
-                    .ok()?
-                    .find_map(|sa| match sa {
-                        SocketAddr::V4(v4) => Some(*v4.ip()),
-                        _ => None,
-                    })
-            })
+/// The interface and ignore lists, which C builds through the same two
+/// functions and then uses only the IP half of: `casIntfAddrList` is bound per
+/// interface, `casIgnoreAddrs` is matched against a datagram's source IP. The
+/// port each entry carries still decides what counts as a duplicate and what
+/// the duplicate warning prints, which is why the list is deduped BEFORE the
+/// port is dropped.
+fn parse_ipv4_list(list: &str, env_name: &str, default_port: u16) -> Vec<Ipv4Addr> {
+    parse_addr_list(list, env_name, default_port)
+        .into_iter()
+        .filter_map(|a| match a {
+            SocketAddr::V4(v4) => Some(*v4.ip()),
+            SocketAddr::V6(_) => None,
         })
         .collect()
 }
@@ -326,6 +379,33 @@ pub fn discover_broadcast_addrs() -> Vec<Ipv4Addr> {
         }
     }
     out
+}
+
+/// C `osiLocalAddr` (libcom `osi/osdNetIfAddrs.c:167-215`, `osiLocalAddrOnce`):
+/// the address of the FIRST interface that is up (`IFF_UP`), `AF_INET`, and
+/// NOT loopback (`IFF_LOOPBACK`). When only loopback exists — or interface
+/// enumeration fails — C falls back to `INADDR_LOOPBACK`, and so do we.
+///
+/// C computes this once per process behind `epicsThreadOnce` and hands out the
+/// cached result; the `OnceLock` mirrors that (an interface list that changes
+/// under a running client is not re-read by C either).
+///
+/// Caveat, shared with the sibling [`discover_broadcast_addrs`]: `if_addrs`
+/// does not expose `IFF_UP`, so a down interface that still carries an address
+/// would be picked here where C skips it.
+pub fn osi_local_addr() -> Ipv4Addr {
+    static CACHED: std::sync::OnceLock<Ipv4Addr> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        let Ok(ifs) = if_addrs::get_if_addrs() else {
+            return Ipv4Addr::LOCALHOST;
+        };
+        ifs.into_iter()
+            .find_map(|iface| match (iface.is_loopback(), iface.ip()) {
+                (false, IpAddr::V4(v4)) => Some(v4),
+                _ => None,
+            })
+            .unwrap_or(Ipv4Addr::LOCALHOST)
+    })
 }
 
 /// Return the IPv4 broadcast address of the up, non-loopback interface
@@ -447,7 +527,11 @@ mod tests {
 
     #[test]
     fn parse_addr_list_with_ports() {
-        let parsed = parse_addr_list("10.0.0.1 192.168.1.255:5066", 5065);
+        let parsed = parse_addr_list(
+            "10.0.0.1 192.168.1.255:5066",
+            "EPICS_CAS_BEACON_ADDR_LIST",
+            5065,
+        );
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0].port(), 5065);
         assert_eq!(parsed[1].port(), 5066);
@@ -455,7 +539,7 @@ mod tests {
 
     #[test]
     fn parse_ipv4_list_drops_garbage() {
-        let v = parse_ipv4_list("1.2.3.4 not-an-ip 5.6.7.8");
+        let v = parse_ipv4_list("1.2.3.4 not-an-ip 5.6.7.8", "EPICS_CAS_INTF_ADDR_LIST", 0);
         assert_eq!(
             v,
             vec![Ipv4Addr::new(1, 2, 3, 4), Ipv4Addr::new(5, 6, 7, 8)]
@@ -484,8 +568,8 @@ mod tests {
 
     #[test]
     fn empty_list_returns_empty() {
-        assert!(parse_addr_list("", 5065).is_empty());
-        assert!(parse_ipv4_list("   ").is_empty());
+        assert!(parse_addr_list("", "EPICS_CAS_BEACON_ADDR_LIST", 5065).is_empty());
+        assert!(parse_ipv4_list("   ", "EPICS_CAS_INTF_ADDR_LIST", 0).is_empty());
     }
 
     /// `from_env` MUST NOT fall back to `EPICS_CA_ADDR_LIST` for the
@@ -511,7 +595,7 @@ mod tests {
             std::env::set_var("EPICS_CAS_AUTO_BEACON_ADDR_LIST", "NO");
         }
 
-        let cfg = from_env().expect("from_env in test");
+        let cfg = resolve_from_env().expect("resolve_from_env in test");
         let leaked = cfg
             .beacon_addrs
             .iter()
@@ -553,7 +637,7 @@ mod tests {
             std::env::set_var("EPICS_CAS_AUTO_BEACON_ADDR_LIST", "NO");
         }
 
-        let cfg = from_env().expect("from_env in test");
+        let cfg = resolve_from_env().expect("resolve_from_env in test");
         let hit = cfg.beacon_addrs.iter().any(|a| {
             matches!(a, SocketAddr::V4(v4)
                 if v4.ip().octets() == [198, 51, 100, 7] && v4.port() == 5099)
@@ -594,7 +678,7 @@ mod tests {
             std::env::set_var("EPICS_CAS_AUTO_BEACON_ADDR_LIST", "NO");
             std::env::set_var("EPICS_CAS_BEACON_PERIOD", "0");
         }
-        let cfg = from_env().expect("from_env in test");
+        let cfg = resolve_from_env().expect("resolve_from_env in test");
         assert_eq!(
             cfg.beacon_period,
             Duration::from_secs(15),
@@ -605,7 +689,7 @@ mod tests {
         unsafe {
             std::env::set_var("EPICS_CAS_BEACON_PERIOD", "-5");
         }
-        let cfg = from_env().expect("from_env in test");
+        let cfg = resolve_from_env().expect("resolve_from_env in test");
         assert_eq!(
             cfg.beacon_period,
             Duration::from_secs(15),
@@ -616,7 +700,7 @@ mod tests {
         unsafe {
             std::env::set_var("EPICS_CAS_BEACON_PERIOD", "garbage");
         }
-        let cfg = from_env().expect("from_env in test");
+        let cfg = resolve_from_env().expect("resolve_from_env in test");
         assert_eq!(
             cfg.beacon_period,
             Duration::from_secs(15),
@@ -628,7 +712,7 @@ mod tests {
         unsafe {
             std::env::set_var("EPICS_CAS_BEACON_PERIOD", "0.05");
         }
-        let cfg = from_env().expect("from_env in test");
+        let cfg = resolve_from_env().expect("resolve_from_env in test");
         assert_eq!(
             cfg.beacon_period,
             Duration::from_secs_f64(0.05),
@@ -670,7 +754,7 @@ mod tests {
             std::env::set_var("EPICS_CAS_AUTO_BEACON_ADDR_LIST", "NO");
         }
 
-        let cfg = from_env().expect("from_env in test");
+        let cfg = resolve_from_env().expect("resolve_from_env in test");
         assert!(
             cfg.beacon_addrs.is_empty(),
             "AUTO=NO with empty explicit list must yield empty beacon_addrs (C parity), got {:?}",

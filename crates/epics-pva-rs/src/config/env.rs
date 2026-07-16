@@ -472,6 +472,106 @@ fn parse_bool(name: &str, raw: &str) -> Option<bool> {
     }
 }
 
+/// Largest timeout pvxs `parse_timeout` accepts: `double(time_t::max)`
+/// (`config.cpp:218`). Anything above it is out-of-range and the
+/// destination keeps its default. This also keeps every downstream
+/// `Duration::from_secs_f64` below the `u64::MAX` seconds panic edge
+/// (~1.845e19 s) even after the 4/3 `tmoScale`.
+const TIMEOUT_SECS_MAX: f64 = i64::MAX as f64;
+
+/// pvxs `parseTo<double>` (`util.cpp:769-783`): `std::stod` — which skips
+/// leading whitespace and accepts C99 hex-float syntax (`0x1.8p3`) — plus
+/// the extraneous-character check, which tolerates trailing whitespace and
+/// rejects any other trailing text. Returns `None` where `parseTo` throws
+/// `NoConvert`.
+fn parse_double_pvxs(raw: &str) -> Option<f64> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let (neg, body) = match s.as_bytes()[0] {
+        b'-' => (true, &s[1..]),
+        b'+' => (false, &s[1..]),
+        _ => (false, s),
+    };
+    let v = if let Some(hex) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
+        parse_hex_float(hex)?
+    } else {
+        // Rust's f64 grammar covers the rest of stod's: decimal, exponent,
+        // `inf`/`infinity`/`nan` (case-insensitive). Overflowing text such
+        // as `1e400` yields `inf` here where stod throws out_of_range; both
+        // end at "keep the default" once the finite gate below runs.
+        body.parse::<f64>().ok()?
+    };
+    Some(if neg { -v } else { v })
+}
+
+/// The hex-float half of `std::stod`: `<hexdigits>[.<hexdigits>][p[+-]<dec>]`
+/// scaled by 2^exp. The binary exponent is optional (`strtod` subject
+/// sequence), so `0x10` is 16.0.
+fn parse_hex_float(s: &str) -> Option<f64> {
+    let (mantissa, exp) = match s.find(['p', 'P']) {
+        Some(i) => (&s[..i], Some(&s[i + 1..])),
+        None => (s, None),
+    };
+    let (int_part, frac_part) = match mantissa.find('.') {
+        Some(i) => (&mantissa[..i], &mantissa[i + 1..]),
+        None => (mantissa, ""),
+    };
+    if int_part.is_empty() && frac_part.is_empty() {
+        return None;
+    }
+    let mut v = 0.0f64;
+    for c in int_part.chars() {
+        v = v * 16.0 + f64::from(c.to_digit(16)?);
+    }
+    let mut scale = 1.0 / 16.0;
+    for c in frac_part.chars() {
+        v += f64::from(c.to_digit(16)?) * scale;
+        scale /= 16.0;
+    }
+    let e: i32 = match exp {
+        Some(e) => e.strip_prefix('+').unwrap_or(e).parse().ok()?,
+        None => 0,
+    };
+    Some(v * 2.0f64.powi(e))
+}
+
+/// The single owner of every PVA timeout/period env double, reproducing
+/// pvxs `parse_timeout` (`config.cpp:211-227`): parse with `parseTo<double>`
+/// ([`parse_double_pvxs`]), then REJECT a value that is non-finite, negative,
+/// or above `double(time_t::max)` — logging and leaving the destination at
+/// its default rather than saturating it. (This is deliberately unlike
+/// `epics-ca-rs`'s `envGetDoubleConfigParam`, which is epics-base's clamp
+/// semantics; pvxs governs here.)
+///
+/// Before this owner existed each getter did `parse::<f64>()` + a bare
+/// `is_finite() && > 0.0` filter and handed the result to
+/// `Duration::from_secs_f64`, which **panics** above `u64::MAX` seconds:
+/// `EPICS_PVA_CONN_TMO=1e300` passed the filter and aborted every client
+/// and server at startup. The range gate here makes that unrepresentable —
+/// a value that survives is always convertible to a `Duration`, including
+/// after the 4/3 `tmoScale` its owners apply ([`TIMEOUT_SECS_MAX`]).
+///
+/// Zero is rejected here rather than passed through as pvxs does, because
+/// every caller's default is what pvxs's `enforceTimeout` (`config.cpp:373-391`)
+/// / floor rule turns a zero into anyway: `EPICS_PVA_CONN_TMO=0` yields
+/// pvxs's 40 s effective idle timeout, and the port's default 30 s × 4/3 is
+/// the same 40 s.
+pub fn parse_timeout_env(name: &str, raw: &str) -> Option<f64> {
+    match parse_double_pvxs(raw) {
+        Some(v) if v.is_finite() && v > 0.0 && v <= TIMEOUT_SECS_MAX => Some(v),
+        _ => {
+            tracing::warn!(
+                var = name,
+                value = raw,
+                "invalid double value; keeping default"
+            );
+            None
+        }
+    }
+}
+
 /// Parse a PVA port env value the way pvxs does. pvxs `_fromDefs` parses
 /// every `EPICS_PVA*_{SERVER,BROADCAST}_PORT` with `parseTo<uint64_t>`
 /// (`util.cpp:786-800` — `std::stoull` with leading/trailing whitespace
@@ -672,9 +772,9 @@ pub fn beacon_period() -> Duration {
 pub fn beacon_period_opt() -> Option<Duration> {
     std::env::var("EPICS_PVAS_BEACON_PERIOD")
         .ok()
-        .and_then(|s| s.parse::<f64>().ok())
-        // Reject negatives, NaN, infinity, and zero.
-        .filter(|f| f.is_finite() && *f > 0.0)
+        // Negatives, zero, NaN, infinity, and out-of-range values are
+        // rejected by the shared resolver, so the conversion cannot panic.
+        .and_then(|s| parse_timeout_env("EPICS_PVAS_BEACON_PERIOD", &s))
         .map(Duration::from_secs_f64)
         .map(|d| d.max(Duration::from_millis(100)))
 }
@@ -686,8 +786,7 @@ pub fn beacon_period_opt() -> Option<Duration> {
 pub fn beacon_period_long() -> Option<Duration> {
     std::env::var("EPICS_PVAS_BEACON_PERIOD_LONG")
         .ok()
-        .and_then(|s| s.parse::<f64>().ok())
-        .filter(|f| f.is_finite() && *f > 0.0)
+        .and_then(|s| parse_timeout_env("EPICS_PVAS_BEACON_PERIOD_LONG", &s))
         .map(Duration::from_secs_f64)
         .map(|d| d.max(Duration::from_millis(100)))
 }
@@ -765,8 +864,7 @@ pub fn conn_timeout_secs() -> f64 {
 pub fn conn_timeout_secs_opt() -> Option<f64> {
     std::env::var("EPICS_PVA_CONN_TMO")
         .ok()
-        .and_then(|s| s.parse::<f64>().ok())
-        .filter(|f| f.is_finite() && *f > 0.0)
+        .and_then(|s| parse_timeout_env("EPICS_PVA_CONN_TMO", &s))
 }
 
 /// `EPICS_PVAS_SEND_TMO` — server-side per-write timeout (default 5s).
@@ -782,8 +880,7 @@ pub fn send_timeout_secs() -> f64 {
 pub fn send_timeout_secs_opt() -> Option<f64> {
     std::env::var("EPICS_PVAS_SEND_TMO")
         .ok()
-        .and_then(|s| s.parse::<f64>().ok())
-        .filter(|v| v.is_finite() && *v > 0.0)
+        .and_then(|s| parse_timeout_env("EPICS_PVAS_SEND_TMO", &s))
         .map(|v| v.max(0.1))
 }
 
@@ -802,8 +899,7 @@ pub fn tls_handshake_timeout_secs() -> f64 {
 pub fn tls_handshake_timeout_secs_opt() -> Option<f64> {
     std::env::var("EPICS_PVAS_TLS_HANDSHAKE_TMO")
         .ok()
-        .and_then(|s| s.parse::<f64>().ok())
-        .filter(|v| v.is_finite() && *v > 0.0)
+        .and_then(|s| parse_timeout_env("EPICS_PVAS_TLS_HANDSHAKE_TMO", &s))
         .map(|v| v.max(1.0))
 }
 
@@ -1311,6 +1407,50 @@ fn enforce_timeout(tmo: &mut f64) {
     } else if *tmo < 2.0 {
         *tmo = 2.0;
     }
+}
+
+/// The ECHO cadence for an *effective* (already scaled + `enforceTimeout`d)
+/// TCP timeout: pvxs `max(1.0, min(15.0, tcpTimeout * 3.0/8.0))`
+/// (`clientconn.cpp:163`) — "tcpTimeout(40) -> 15 second echo period,
+/// bound echo to range [1, 15]".
+///
+/// SINGLE OWNER of "effective TCP timeout → echo period". Both the
+/// env-derived [`crate::client_native::heartbeat_interval`] and the
+/// per-connection heartbeat task (which uses the builder-supplied
+/// `tcp_timeout`) derive their cadence here, so a connection cannot echo on
+/// a different clock than the API says it does.
+///
+/// The 15 s CAP is the half C keeps and the port dropped: without it a
+/// large CONN_TMO stretched the echo period without bound (a 100 s CONN_TMO
+/// echoed every 50 s instead of C's 15 s), so a peer that had already
+/// stopped responding was probed far later than pvxs probes it (R17-36).
+///
+/// The input is always a finite, positive effective timeout — it comes from
+/// [`effective_tcp_timeout_secs`] (which maps NaN / non-positive to 40 s) or
+/// from a `Duration` — so `clamp`'s NaN caveat cannot be reached here.
+pub fn echo_period_secs(tcp_timeout_secs: f64) -> f64 {
+    (tcp_timeout_secs * 3.0 / 8.0).clamp(1.0, 15.0)
+}
+
+/// The EFFECTIVE TCP inactivity timeout for a *configured*
+/// `EPICS_PVA_CONN_TMO` value: the `tmoScale` (4/3) followed by pvxs
+/// `enforceTimeout` (`config.cpp:373-391`), which C applies to the SCALED
+/// `tcpTimeout` (`config.cpp:527`/`:650`, after `parse_timeout` already
+/// multiplied by the scale).
+///
+/// SINGLE OWNER of "configured CONN_TMO → effective idle timeout". Both
+/// ends derive their window here — the native server's `idle_timeout` and
+/// the client's `heartbeat_timeout` — so neither can reproduce half the
+/// rule. The rule has BOTH bounds: `>= double(time_t::max)` (or
+/// non-finite / non-positive) resets to 40 s, and only then is the 2 s
+/// floor applied. Reproducing the floor alone left `CONN_TMO` in
+/// `[6.92e18, 9.22e18]` — values `parse_timeout` accepts, whose scaled
+/// form crosses `time_t::max` — running with a ~1.2e19 s window where
+/// pvxs falls back to 40 s (R17-34).
+pub fn effective_tcp_timeout_secs(configured: f64) -> f64 {
+    let mut tmo = configured * TMO_SCALE;
+    enforce_timeout(&mut tmo);
+    tmo
 }
 
 /// Wrap interface IPs as modifier-less [`Endpoint`]s (port 0 — a bind
@@ -2479,6 +2619,118 @@ mod tests {
         }
     }
 
+    /// R16-32: every PVA timeout/period env double goes through
+    /// `parse_timeout_env`, which reproduces pvxs `parse_timeout`
+    /// (config.cpp:211-227) over `parseTo<double>` (util.cpp:769-783).
+    #[test]
+    fn parse_timeout_env_matches_pvxs_parse_timeout() {
+        const N: &str = "EPICS_PVA_CONN_TMO";
+        // Plain doubles.
+        assert_eq!(parse_timeout_env(N, "30"), Some(30.0));
+        assert_eq!(parse_timeout_env(N, "2.5"), Some(2.5));
+        assert_eq!(parse_timeout_env(N, "1e3"), Some(1000.0));
+        // stod skips leading whitespace; parseTo tolerates trailing.
+        assert_eq!(parse_timeout_env(N, " 45"), Some(45.0));
+        assert_eq!(parse_timeout_env(N, "45 "), Some(45.0));
+        assert_eq!(parse_timeout_env(N, "\t45\n"), Some(45.0));
+        // stod accepts C99 hex floats (binary exponent optional).
+        assert_eq!(parse_timeout_env(N, "0x10"), Some(16.0));
+        assert_eq!(parse_timeout_env(N, "0x1.8p1"), Some(3.0));
+        assert_eq!(parse_timeout_env(N, "-0x1p2"), None, "negative → reject");
+        // Out of range: > double(time_t::max) → pvxs throws out_of_range and
+        // keeps the default. The port used to accept these and then PANIC in
+        // Duration::from_secs_f64.
+        assert_eq!(parse_timeout_env(N, "1e300"), None);
+        assert_eq!(parse_timeout_env(N, "1e19"), None);
+        assert_eq!(parse_timeout_env(N, "1e400"), None, "overflows to inf");
+        // Non-finite / non-positive / garbage → keep default.
+        assert_eq!(parse_timeout_env(N, "inf"), None);
+        assert_eq!(parse_timeout_env(N, "nan"), None);
+        assert_eq!(parse_timeout_env(N, "-1"), None);
+        assert_eq!(parse_timeout_env(N, "0"), None);
+        assert_eq!(parse_timeout_env(N, "45abc"), None, "extraneous chars");
+        assert_eq!(parse_timeout_env(N, ""), None);
+        // Anything accepted is convertible to a Duration, even after the
+        // 4/3 tmoScale its owners apply — this is what closes the panic.
+        let max = parse_timeout_env(N, &format!("{TIMEOUT_SECS_MAX}")).expect("time_t::max is ok");
+        let _ = Duration::from_secs_f64(max * 4.0 / 3.0);
+    }
+
+    /// R16-32: a large-but-finite `EPICS_PVA_CONN_TMO` used to pass the
+    /// `is_finite() && > 0.0` filter and panic every client/server at
+    /// startup inside `Duration::from_secs_f64`. pvxs logs and keeps the
+    /// default; so does the port now. Also covers the whitespace-tolerant
+    /// values pvxs accepts but the port silently dropped.
+    #[test]
+    #[serial_test::serial(epics_env)]
+    fn conn_tmo_out_of_range_keeps_default_instead_of_panicking() {
+        let prev = std::env::var("EPICS_PVA_CONN_TMO").ok();
+        unsafe {
+            std::env::set_var("EPICS_PVA_CONN_TMO", "1e300");
+        }
+        assert_eq!(conn_timeout_secs_opt(), None, "out of range → keep default");
+        assert_eq!(conn_timeout_secs(), 30.0);
+        // The consumers' conversion is what panicked; exercise it.
+        let _ = Duration::from_secs_f64((conn_timeout_secs() * 4.0 / 3.0).max(2.0));
+        unsafe {
+            std::env::set_var("EPICS_PVA_CONN_TMO", " 45 ");
+        }
+        assert_eq!(
+            conn_timeout_secs_opt(),
+            Some(45.0),
+            "pvxs stod/parseTo tolerate surrounding whitespace"
+        );
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("EPICS_PVA_CONN_TMO", v),
+                None => std::env::remove_var("EPICS_PVA_CONN_TMO"),
+            }
+        }
+    }
+
+    /// R16-32 siblings: the port-only timeout/period doubles carry the same
+    /// unguarded chain into `Duration::from_secs_f64`.
+    #[test]
+    #[serial_test::serial(epics_env)]
+    fn port_only_timeout_vars_reject_out_of_range() {
+        let names = [
+            "EPICS_PVAS_BEACON_PERIOD",
+            "EPICS_PVAS_BEACON_PERIOD_LONG",
+            "EPICS_PVAS_SEND_TMO",
+            "EPICS_PVAS_TLS_HANDSHAKE_TMO",
+        ];
+        let prev: Vec<_> = names.iter().map(|n| std::env::var(n).ok()).collect();
+        unsafe {
+            for n in names {
+                std::env::set_var(n, "1e300");
+            }
+        }
+        assert_eq!(beacon_period_opt(), None);
+        assert_eq!(beacon_period(), Duration::from_secs(15));
+        assert_eq!(beacon_period_long(), None);
+        assert_eq!(send_timeout_secs_opt(), None);
+        assert_eq!(send_timeout_secs(), 5.0);
+        assert_eq!(tls_handshake_timeout_secs_opt(), None);
+        assert_eq!(tls_handshake_timeout_secs(), 10.0);
+        unsafe {
+            for n in names {
+                std::env::set_var(n, " 3 ");
+            }
+        }
+        assert_eq!(beacon_period_opt(), Some(Duration::from_secs(3)));
+        assert_eq!(beacon_period_long(), Some(Duration::from_secs(3)));
+        assert_eq!(send_timeout_secs_opt(), Some(3.0));
+        assert_eq!(tls_handshake_timeout_secs_opt(), Some(3.0));
+        unsafe {
+            for (n, p) in names.iter().zip(prev) {
+                match p {
+                    Some(v) => std::env::set_var(n, v),
+                    None => std::env::remove_var(n),
+                }
+            }
+        }
+    }
+
     /// `EPICS_PVA_SERVER_PORT=0` is a valid server ephemeral-bind request
     /// but never a usable client TCP destination, so the client default
     /// port expands a zero back to 5075 (pvxs `Config::expand()`,
@@ -2781,6 +3033,57 @@ mod tests {
         nan.tcp_timeout = f64::NAN;
         nan.expand();
         assert_eq!(nan.tcp_timeout, 40.0);
+    }
+
+    /// `echo_period_secs` is pvxs's `max(1, min(15, tcpTimeout*3/8))`
+    /// (clientconn.cpp:163). Boundaries: the documented 40 s → 15 s pair,
+    /// the interior, and both bounds. The 15 s CAP is the half the port had
+    /// dropped (R17-36).
+    #[test]
+    fn echo_period_is_bounded_to_one_through_fifteen_seconds() {
+        // pvxs's own worked example: "tcpTimeout(40) -> 15 second echo".
+        assert_eq!(echo_period_secs(40.0), 15.0);
+        // Interior: the plain 3/8.
+        assert_eq!(echo_period_secs(8.0), 3.0);
+        // Upper bound: anything above 40 s stays at the 15 s cap.
+        assert_eq!(echo_period_secs(133.0), 15.0);
+        assert_eq!(echo_period_secs(1e18), 15.0);
+        // Lower bound: below 8/3 s the period floors at 1 s.
+        assert_eq!(echo_period_secs(2.0), 1.0);
+        assert_eq!(echo_period_secs(0.0), 1.0);
+    }
+
+    /// `effective_tcp_timeout_secs` is the single owner of "configured
+    /// CONN_TMO → effective idle window": `tmoScale` (4/3) then pvxs
+    /// `enforceTimeout` (config.cpp:373-391), which has BOTH an upper
+    /// reset and a lower floor. Boundaries, one per case.
+    #[test]
+    fn effective_tcp_timeout_applies_both_enforce_timeout_bounds() {
+        // Default: 30 × 4/3 = 40 s, pvxs's documented effective timeout.
+        assert_eq!(effective_tcp_timeout_secs(30.0), 40.0);
+
+        // Lower floor: 1.0 × 4/3 = 1.333 < 2 → 2 s.
+        assert_eq!(effective_tcp_timeout_secs(1.0), 2.0);
+        // Exactly at the floor after scaling.
+        assert_eq!(effective_tcp_timeout_secs(1.5), 2.0);
+        // Above the floor: the scaled double survives verbatim.
+        assert_eq!(effective_tcp_timeout_secs(2.5), 2.5 * TMO_SCALE);
+
+        // Upper reset. `parse_timeout` ACCEPTS a configured value up to
+        // `time_t::max` (~9.22e18), and `enforceTimeout` then runs on the
+        // SCALED value — so any configured value above 3/4 of that (here
+        // 7e18 × 4/3 ≈ 9.33e18 ≥ time_t::max) resets to 40 s. Pre-fix the
+        // scale-then-floor sites kept the ~9.33e18 s window.
+        let accepted = 7e18_f64.min(TIMEOUT_SECS_MAX);
+        assert_eq!(accepted, 7e18, "7e18 must be an ACCEPTED CONN_TMO");
+        assert_eq!(effective_tcp_timeout_secs(accepted), 40.0);
+        assert_eq!(effective_tcp_timeout_secs(TIMEOUT_SECS_MAX), 40.0);
+
+        // Non-positive / non-finite also reset to 40 s.
+        assert_eq!(effective_tcp_timeout_secs(0.0), 40.0);
+        assert_eq!(effective_tcp_timeout_secs(-1.0), 40.0);
+        assert_eq!(effective_tcp_timeout_secs(f64::INFINITY), 40.0);
+        assert_eq!(effective_tcp_timeout_secs(f64::NAN), 40.0);
     }
 
     /// `from_client_env` reads `EPICS_PVA_*`, scaling `CONN_TMO` by 4/3 and

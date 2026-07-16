@@ -57,7 +57,15 @@ pub enum DrawMode {
 pub struct OverlayDef {
     pub shape: OverlayShape,
     pub draw_mode: DrawMode,
-    pub color: [u8; 3], // RGB color; for Mono, color[1] (green) is used
+    /// RGB color; for Mono, `color[1]` (green) is used.
+    ///
+    /// `i32`, not `u8`: C's `NDOverlay_t` holds `int red/green/blue`
+    /// (NDPluginOverlay.h:38-40) fed from unclamped `asynParamInt32` params
+    /// (`getIntegerParam`, NDPluginOverlay.cpp:339-341), and `setPixel`
+    /// (:41-52) casts that `int` straight to the pixel type. A u8 channel
+    /// cannot express the overlay values 16- and 32-bit images need — a
+    /// full-scale marker on NDUInt16 is 65535.
+    pub color: [i32; 3],
     pub width_x: usize, // line thickness in X direction (0 or 1 = 1px)
     pub width_y: usize, // line thickness in Y direction (0 or 1 = 1px)
 }
@@ -154,42 +162,73 @@ fn format_epics_time(ts: ad_core_rs::timestamp::EpicsTimestamp, fmt: &str) -> St
 // ---------------------------------------------------------------------------
 
 macro_rules! draw_on_typed_buffer {
-    ($data:expr, $T:ty, $overlays:expr, $w:expr, $h:expr, $ts:expr, xor) => {{
-        draw_on_typed_buffer!(@inner $data, $T, $overlays, $w, $h, $ts, |data: &mut [$T], idx: usize, mode: DrawMode, value: $T| {
-            match mode {
-                DrawMode::Set => data[idx] = value,
-                DrawMode::XOR => data[idx] ^= value,
-            }
-        });
-    }};
-    ($data:expr, $T:ty, $overlays:expr, $w:expr, $h:expr, $ts:expr, set_only) => {{
-        draw_on_typed_buffer!(@inner $data, $T, $overlays, $w, $h, $ts, |data: &mut [$T], idx: usize, _mode: DrawMode, value: $T| {
-            data[idx] = value;
-        });
-    }};
-    (@inner $data:expr, $T:ty, $overlays:expr, $w:expr, $h:expr, $ts:expr, $set_fn:expr) => {{
+    ($data:expr, $T:ty, $overlays:expr, $info:expr, $ts:expr) => {{
         let data: &mut [$T] = $data;
-        let w: usize = $w;
-        let h: usize = $h;
+        let info: &ad_core_rs::ndarray::NDArrayInfo = $info;
         let array_ts: ad_core_rs::timestamp::EpicsTimestamp = $ts;
-        let set_fn = $set_fn;
+
+        // NDPluginOverlay.cpp:29-33 `addPixel` bounds-checks against
+        // pArrayInfo->xSize/ySize and addresses the sample as
+        // `iy*yStride + ix*xStride`, and setPixel (:38-53) walks the three
+        // color planes by `colorStride` when the array is RGB1/RGB2/RGB3.
+        // Both the geometry and the written value are color-mode aware, so
+        // everything below goes through getInfo() rather than assuming a
+        // packed mono `y*width + x` layout.
+        let is_rgb = matches!(
+            info.color_mode,
+            ad_core_rs::color::NDColorMode::RGB1
+                | ad_core_rs::color::NDColorMode::RGB2
+                | ad_core_rs::color::NDColorMode::RGB3
+        );
 
         for overlay in $overlays.iter() {
-            // C++ uses pOverlay->green for mono overlays
-            let value: $T = overlay.color[1] as $T;
+            // Mono uses pOverlay->green; RGB writes red/green/blue in turn.
+            let rgb: [i32; 3] = overlay.color;
             let wx = overlay.width_x.max(1);
             let wy = overlay.width_y.max(1);
 
-            // Closure to set a single pixel
+            // Write one sample.
+            //
+            // NDPluginOverlay.cpp:41-52 `setPixel`, templated over every
+            // `epicsType` including epicsFloat32/epicsFloat64:
+            //   Set: *pValue = (epicsType)color
+            //   XOR: *pValue = (epicsType)((int)*pValue ^ (int)color)
+            // The XOR therefore narrows through a 32-bit `int` for *all* widths
+            // — float pixels are truncated to int, xor'd, and cast back; 64-bit
+            // pixels lose their high word. Rust's `as` casts reproduce both.
+            // (C's float->int conversion is UB when out of range; `as i32`
+            // saturates instead of trapping.)
+            let put_sample = |data: &mut [$T], idx: usize, color: i32| {
+                // C indexes the raw buffer unchecked; keep the write in bounds
+                // when a ColorMode attribute disagrees with the real dims.
+                if let Some(slot) = data.get_mut(idx) {
+                    *slot = match overlay.draw_mode {
+                        DrawMode::Set => color as $T,
+                        DrawMode::XOR => ((*slot as i32) ^ color) as $T,
+                    };
+                }
+            };
+
             let mut set_pixel = |x: usize, y: usize| {
-                if x < w && y < h {
-                    let idx = y * w + x;
-                    set_fn(data, idx, overlay.draw_mode, value);
+                if x < info.x_size && y < info.y_size {
+                    let idx = y * info.y_stride + x * info.x_stride;
+                    if is_rgb {
+                        for (plane, color) in rgb.iter().enumerate() {
+                            put_sample(data, idx + plane * info.color_stride, *color);
+                        }
+                    } else {
+                        put_sample(data, idx, rgb[1]);
+                    }
                 }
             };
 
             match &overlay.shape {
-                OverlayShape::Cross { center_x, center_y, size_x, size_y } => {
+                OverlayShape::Cross {
+                    center_x,
+                    center_y,
+                    size_x,
+                    size_y,
+                } => {
                     // C++ doOverlayT Cross (NDPluginOverlay.cpp:94-117): the
                     // horizontal arm spans SizeX/2 each side of the center, the
                     // vertical arm SizeY/2 — independent extents. xwide/ywide
@@ -223,7 +262,12 @@ macro_rules! draw_on_typed_buffer {
                         }
                     }
                 }
-                OverlayShape::Rectangle { x, y, width, height } => {
+                OverlayShape::Rectangle {
+                    x,
+                    y,
+                    width,
+                    height,
+                } => {
                     // C doOverlayT Rectangle (NDPluginOverlay.cpp:119-145):
                     // xmax = PositionX + SizeX is INCLUSIVE, so the rectangle is
                     // SizeX+1 px wide / SizeY+1 tall. Border thickness grows
@@ -257,7 +301,12 @@ macro_rules! draw_on_typed_buffer {
                         }
                     }
                 }
-                OverlayShape::Ellipse { center_x, center_y, rx, ry } => {
+                OverlayShape::Ellipse {
+                    center_x,
+                    center_y,
+                    rx,
+                    ry,
+                } => {
                     // C++ doOverlayT Ellipse: parametric over the first
                     // quadrant, mirrored to the other three; for each of
                     // `xwide` thickness layers shrink the radii by jj. C++
@@ -294,7 +343,15 @@ macro_rules! draw_on_typed_buffer {
                         }
                     }
                 }
-                OverlayShape::Text { x, y, size_x, size_y, text, font, timestamp_format } => {
+                OverlayShape::Text {
+                    x,
+                    y,
+                    size_x,
+                    size_y,
+                    text,
+                    font,
+                    timestamp_format,
+                } => {
                     // C++ NDPluginOverlay.cpp text path: a fixed-cell bitmap
                     // font (no scaling); characters advance by the full font
                     // width; xmax = PositionX + SizeX clips trailing chars;
@@ -309,9 +366,7 @@ macro_rules! draw_on_typed_buffer {
                     };
                     let xmin = *x;
                     let xmax = x.saturating_add(*size_x);
-                    let ymax = y
-                        .saturating_add(*size_y)
-                        .min(y.saturating_add(bmp.height));
+                    let ymax = y.saturating_add(*size_y).min(y.saturating_add(bmp.height));
                     for (ci, ch) in rendered.chars().enumerate() {
                         // C tests `if (cp[ii] < 32) continue;` on a signed
                         // `char`, so bytes >= 128 are negative and skipped along
@@ -347,61 +402,48 @@ macro_rules! draw_on_typed_buffer {
     }};
 }
 
-/// Draw overlays on a 2D array. Supports I8, U8, I16, U16, I32, U32, I64, U64, F32, F64.
+/// Draw overlays on an array. Supports I8, U8, I16, U16, I32, U32, I64, U64, F32, F64.
+///
+/// The pixel geometry comes from [`NDArray::info`] (C++ `NDArray::getInfo`), so
+/// RGB1/RGB2/RGB3 arrays are addressed by their real x/y/color strides and each
+/// overlay paints red, green and blue into the three color planes — exactly what
+/// `NDPluginOverlay::addPixel`/`setPixel` do. Arrays with fewer than two usable
+/// dimensions get `y_size == 0` from `info()` and are left untouched, as in C.
 pub fn draw_overlays(src: &NDArray, overlays: &[OverlayDef]) -> NDArray {
     let mut arr = src.clone();
-    if arr.dims.len() < 2 {
-        return arr;
-    }
-    let w = arr.dims[0].size;
-    let h = arr.dims[1].size;
+    let info = arr.info();
+    let ts = arr.timestamp;
 
     match &mut arr.data {
         NDDataBuffer::U8(data) => {
-            draw_on_typed_buffer!(data.as_mut_slice(), u8, overlays, w, h, arr.timestamp, xor);
+            draw_on_typed_buffer!(data.as_mut_slice(), u8, overlays, &info, ts);
         }
         NDDataBuffer::U16(data) => {
-            draw_on_typed_buffer!(data.as_mut_slice(), u16, overlays, w, h, arr.timestamp, xor);
+            draw_on_typed_buffer!(data.as_mut_slice(), u16, overlays, &info, ts);
         }
         NDDataBuffer::I16(data) => {
-            draw_on_typed_buffer!(data.as_mut_slice(), i16, overlays, w, h, arr.timestamp, xor);
+            draw_on_typed_buffer!(data.as_mut_slice(), i16, overlays, &info, ts);
         }
         NDDataBuffer::I32(data) => {
-            draw_on_typed_buffer!(data.as_mut_slice(), i32, overlays, w, h, arr.timestamp, xor);
+            draw_on_typed_buffer!(data.as_mut_slice(), i32, overlays, &info, ts);
         }
         NDDataBuffer::U32(data) => {
-            draw_on_typed_buffer!(data.as_mut_slice(), u32, overlays, w, h, arr.timestamp, xor);
+            draw_on_typed_buffer!(data.as_mut_slice(), u32, overlays, &info, ts);
         }
         NDDataBuffer::F32(data) => {
-            draw_on_typed_buffer!(
-                data.as_mut_slice(),
-                f32,
-                overlays,
-                w,
-                h,
-                arr.timestamp,
-                set_only
-            );
+            draw_on_typed_buffer!(data.as_mut_slice(), f32, overlays, &info, ts);
         }
         NDDataBuffer::F64(data) => {
-            draw_on_typed_buffer!(
-                data.as_mut_slice(),
-                f64,
-                overlays,
-                w,
-                h,
-                arr.timestamp,
-                set_only
-            );
+            draw_on_typed_buffer!(data.as_mut_slice(), f64, overlays, &info, ts);
         }
         NDDataBuffer::I8(data) => {
-            draw_on_typed_buffer!(data.as_mut_slice(), i8, overlays, w, h, arr.timestamp, xor);
+            draw_on_typed_buffer!(data.as_mut_slice(), i8, overlays, &info, ts);
         }
         NDDataBuffer::I64(data) => {
-            draw_on_typed_buffer!(data.as_mut_slice(), i64, overlays, w, h, arr.timestamp, xor);
+            draw_on_typed_buffer!(data.as_mut_slice(), i64, overlays, &info, ts);
         }
         NDDataBuffer::U64(data) => {
-            draw_on_typed_buffer!(data.as_mut_slice(), u64, overlays, w, h, arr.timestamp, xor);
+            draw_on_typed_buffer!(data.as_mut_slice(), u64, overlays, &info, ts);
         }
     }
 
@@ -427,9 +469,11 @@ struct OverlaySlot {
     size_y: usize,
     width_x: usize,
     width_y: usize,
-    red: u8,
-    green: u8,
-    blue: u8,
+    // C `NDOverlay_t` (NDPluginOverlay.h:38-40): `int red/green/blue`, read
+    // from asynInt32 params with no range clamp.
+    red: i32,
+    green: i32,
+    blue: i32,
     display_text: String,
     timestamp_format: String,
     font: usize,
@@ -784,11 +828,16 @@ impl NDPluginProcess for OverlayProcessor {
         } else if Some(reason) == self.params.width_y {
             slot.width_y = params.value.as_i32().max(0) as usize;
         } else if Some(reason) == self.params.red {
-            slot.red = params.value.as_i32().clamp(0, 255) as u8;
+            // No clamp: C stores the raw epicsInt32 (setIntegerParam ->
+            // getIntegerParam into `int red`, NDPluginOverlay.cpp:339-341) and
+            // narrows only at the pixel write (`(epicsType)pOverlay->red`,
+            // :44). Clamping to 0..=255 here made every value above 255
+            // unreachable on 16-/32-bit images.
+            slot.red = params.value.as_i32();
         } else if Some(reason) == self.params.green {
-            slot.green = params.value.as_i32().clamp(0, 255) as u8;
+            slot.green = params.value.as_i32();
         } else if Some(reason) == self.params.blue {
-            slot.blue = params.value.as_i32().clamp(0, 255) as u8;
+            slot.blue = params.value.as_i32();
         } else if Some(reason) == self.params.display_text {
             if let ParamChangeValue::Octet(s) = &params.value {
                 slot.display_text = s.clone();
@@ -850,6 +899,80 @@ mod tests {
                 Some(OverlayShape::Ellipse { .. })
             ),
             "OVERLAY_SHAPE=3 must draw Ellipse (C NDOverlayEllipse)"
+        );
+    }
+
+    // R6-72: C's overlay color channels are `int` (NDPluginOverlay.h:38-40)
+    // written straight into the pixel by setPixel (:44, `(epicsType)red`), so a
+    // 16-bit image can carry a full-scale 65535 marker. The u8 channel could
+    // not express anything above 255.
+    #[test]
+    fn test_r6_72_color_above_255_reaches_a_16bit_pixel() {
+        let arr = NDArray::new(
+            vec![NDDimension::new(8), NDDimension::new(8)],
+            NDDataType::UInt16,
+        );
+        let overlays = vec![OverlayDef {
+            shape: OverlayShape::Rectangle {
+                x: 1,
+                y: 1,
+                width: 4,
+                height: 3,
+            },
+            draw_mode: DrawMode::Set,
+            // Mono takes the green channel (C setPixel:57).
+            color: [0, 65535, 0],
+            width_x: 1,
+            width_y: 1,
+        }];
+
+        let out = draw_overlays(&arr, &overlays);
+        let NDDataBuffer::U16(ref v) = out.data else {
+            panic!("expected U16 buffer");
+        };
+        assert_eq!(v[8 + 1], 65535, "full-scale 16-bit marker must survive");
+        assert_eq!(v[2 * 8 + 2], 0, "interior untouched");
+    }
+
+    // R6-72 boundary: 256 is the first value the old 0..=255 clamp destroyed.
+    #[test]
+    fn test_r6_72_param_write_above_255_is_not_clamped() {
+        use ad_core_rs::plugin::runtime::{ParamChangeValue, PluginParamSnapshot};
+        use asyn_rs::port::{PortDriverBase, PortFlags};
+
+        let mut proc = OverlayProcessor::new(vec![]);
+        let mut base = PortDriverBase::new("R6_72", MAX_OVERLAYS + 1, PortFlags::default());
+        proc.register_params(&mut base).unwrap();
+
+        let red = proc.params.red.expect("OVERLAY_RED registered");
+        let green = proc.params.green.expect("OVERLAY_GREEN registered");
+        let blue = proc.params.blue.expect("OVERLAY_BLUE registered");
+        for (reason, value) in [(red, 256), (green, 65535), (blue, 4095)] {
+            proc.on_param_change(
+                reason,
+                &PluginParamSnapshot {
+                    enable_callbacks: true,
+                    reason,
+                    addr: 0,
+                    value: ParamChangeValue::Int32(value),
+                },
+            );
+        }
+        proc.on_param_change(
+            proc.params.use_overlay.unwrap(),
+            &PluginParamSnapshot {
+                enable_callbacks: true,
+                reason: proc.params.use_overlay.unwrap(),
+                addr: 0,
+                value: ParamChangeValue::Int32(1),
+            },
+        );
+
+        let def = proc.slots[0].to_overlay_def().expect("overlay in use");
+        assert_eq!(
+            def.color,
+            [256, 65535, 4095],
+            "C stores the raw epicsInt32 and narrows only at the pixel write"
         );
     }
 
@@ -1210,12 +1333,104 @@ mod tests {
         }
     }
 
+    /// Build an `[color, x, y]` RGB1 array carrying the `ColorMode` attribute.
+    fn make_rgb1(x: usize, y: usize) -> NDArray {
+        use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
+        use ad_core_rs::color::NDColorMode;
+        let mut arr = NDArray::new(
+            vec![
+                NDDimension::new(3),
+                NDDimension::new(x),
+                NDDimension::new(y),
+            ],
+            NDDataType::UInt8,
+        );
+        arr.attributes.add(NDAttribute {
+            name: "ColorMode".into(),
+            description: "Color Mode".into(),
+            source: NDAttrSource::Driver,
+            value: NDAttrValue::Int32(NDColorMode::RGB1 as i32),
+            source_impl: None,
+        });
+        arr
+    }
+
     #[test]
-    fn test_f32_overlay_ignores_xor() {
-        let arr = NDArray::new(
+    fn test_r6_61_rgb1_uses_color_strides_and_writes_three_planes() {
+        // R6-61 / NDPluginOverlay.cpp:29-53 — for an RGB1 array getInfo gives
+        // xStride=3, yStride=3*xSize, colorStride=1, so pixel (x,y) lives at
+        // 3*(y*xSize + x) and setPixel writes red/green/blue into the three
+        // consecutive samples. The old code treated dims as [w=3, h=x] mono.
+        let arr = make_rgb1(8, 6);
+        let overlays = vec![OverlayDef {
+            shape: OverlayShape::Cross {
+                center_x: 4,
+                center_y: 3,
+                size_x: 0,
+                size_y: 0,
+            },
+            draw_mode: DrawMode::Set,
+            color: [10, 20, 30],
+            width_x: 1,
+            width_y: 1,
+        }];
+
+        let out = draw_overlays(&arr, &overlays);
+        let NDDataBuffer::U8(ref v) = out.data else {
+            panic!("expected U8 buffer");
+        };
+        let base = 3 * (3 * 8 + 4); // colorStride=1, xStride=3, yStride=24
+        assert_eq!(
+            (v[base], v[base + 1], v[base + 2]),
+            (10, 20, 30),
+            "RGB1 pixel must receive red/green/blue on the three color planes"
+        );
+        // Nothing else painted: exactly three samples differ from zero.
+        assert_eq!(v.iter().filter(|&&s| s != 0).count(), 3);
+    }
+
+    #[test]
+    fn test_r6_61_rgb1_out_of_range_pixel_is_clipped_by_x_size() {
+        // The C bound check is against xSize/ySize from getInfo (8x6 here), not
+        // against dims[0]/dims[1] (3x8). x=7 is inside; x=8 must be dropped.
+        let arr = make_rgb1(8, 6);
+        let overlays = vec![OverlayDef {
+            shape: OverlayShape::Cross {
+                center_x: 8,
+                center_y: 5,
+                size_x: 0,
+                size_y: 0,
+            },
+            draw_mode: DrawMode::Set,
+            color: [10, 20, 30],
+            width_x: 1,
+            width_y: 1,
+        }];
+        let out = draw_overlays(&arr, &overlays);
+        let NDDataBuffer::U8(ref v) = out.data else {
+            panic!("expected U8 buffer");
+        };
+        assert!(
+            v.iter().all(|&s| s == 0),
+            "x == xSize is out of bounds in C addPixel"
+        );
+    }
+
+    #[test]
+    fn test_r6_68_f32_xor_narrows_through_int() {
+        // R6-68 / NDPluginOverlay.cpp:60 — the XOR arm of setPixel is templated
+        // over every epicsType, floats included:
+        //   *pValue = (epicsType)((int)*pValue ^ (int)pOverlay->green)
+        // So a float pixel is truncated to int, xor'd, and cast back. It must
+        // NOT degrade to Set.
+        let mut arr = NDArray::new(
             vec![NDDimension::new(8), NDDimension::new(8)],
             NDDataType::Float32,
         );
+        // Seed the two pixels we check: 12.75 truncates to 12, 0.0 to 0.
+        if let NDDataBuffer::F32(ref mut v) = arr.data {
+            v[4 * 8 + 4] = 12.75;
+        }
         let overlays = vec![OverlayDef {
             shape: OverlayShape::Cross {
                 center_x: 4,
@@ -1223,17 +1438,52 @@ mod tests {
                 size_x: 2,
                 size_y: 2,
             },
-            draw_mode: DrawMode::XOR, // should be treated as Set for floats
+            draw_mode: DrawMode::XOR,
             color: [0, 100, 0],
             width_x: 1,
             width_y: 1,
         }];
 
         let out = draw_overlays(&arr, &overlays);
-        if let NDDataBuffer::F32(ref v) = out.data {
-            // Center pixel should be set (XOR falls back to Set for floats)
-            assert_eq!(v[4 * 8 + 4], 100.0);
+        let NDDataBuffer::F32(ref v) = out.data else {
+            panic!("expected F32 buffer");
+        };
+        // (int)12.75 == 12; 12 ^ 100 == 104 (the fraction is dropped, as in C).
+        assert_eq!(v[4 * 8 + 4], 104.0, "float XOR must narrow through int");
+        // A zero pixel on the arm xors to the plain color.
+        assert_eq!(v[4 * 8 + 5], 100.0);
+    }
+
+    #[test]
+    fn test_r6_68_i64_xor_narrows_through_int() {
+        // The same `(int)` narrowing applies to 64-bit pixels: C xors only the
+        // low 32 bits and sign-extends the result back to epicsInt64.
+        let mut arr = NDArray::new(
+            vec![NDDimension::new(4), NDDimension::new(4)],
+            NDDataType::Int64,
+        );
+        if let NDDataBuffer::I64(ref mut v) = arr.data {
+            v[1 * 4 + 1] = 0x0000_0007_0000_0005; // high word must be discarded
         }
+        let overlays = vec![OverlayDef {
+            shape: OverlayShape::Cross {
+                center_x: 1,
+                center_y: 1,
+                size_x: 0,
+                size_y: 0,
+            },
+            draw_mode: DrawMode::XOR,
+            color: [0, 3, 0],
+            width_x: 1,
+            width_y: 1,
+        }];
+
+        let out = draw_overlays(&arr, &overlays);
+        let NDDataBuffer::I64(ref v) = out.data else {
+            panic!("expected I64 buffer");
+        };
+        // C: (epicsInt64)((int)0x0000000700000005 ^ 3) == (epicsInt64)(5 ^ 3) == 6
+        assert_eq!(v[1 * 4 + 1], 6);
     }
 
     #[test]

@@ -105,6 +105,11 @@ pub enum PortCommand {
     SetAutoConnect {
         yes: bool,
     },
+    /// Per-device auto-connect toggle — the `addr` half of the same C call,
+    /// selected by `findDpCommon` (asynManager.c:496-509).
+    SetAutoConnectAddr {
+        yes: bool,
+    },
     GetBoundsInt32,
     GetBoundsInt64,
     /// Query whether the port is currently enabled.
@@ -147,6 +152,56 @@ pub enum PortCommand {
     /// asynRecord OEOS.
     SetOutputEos {
         eos: Vec<u8>,
+    },
+    /// Query whether the port's transport is connected — C
+    /// `pasynManager->isConnected`. Appended last: the variant order is the
+    /// wire encoding.
+    GetConnected,
+    /// Install the echo interpose — C `asynInterposeEcho(portName, addr)`.
+    PushEchoInterpose,
+    /// Install the delay interpose — C
+    /// `asynInterposeDelay(portName, addr, delay)`. The delay travels as
+    /// seconds, the C `double` argument's own unit
+    /// (asynInterposeDelay.c:223). Appended last: the variant order is the
+    /// wire encoding.
+    PushDelayInterpose {
+        delay_secs: f64,
+    },
+    /// Install the EOS interpose — C `asynInterposeEosConfig`. Appended last:
+    /// the variant order is the wire encoding.
+    PushEosInterpose {
+        process_in: bool,
+        process_out: bool,
+    },
+    /// Install the flush-timeout interpose — C `asynInterposeFlushConfig`. The
+    /// timeout travels as seconds; C's shell argument is milliseconds.
+    PushFlushInterpose {
+        flush_timeout_secs: f64,
+    },
+    /// Set or clear the port's time-stamp source by name — C
+    /// `asynRegisterTimeStampSource` / `asynUnregisterTimeStampSource`.
+    SetTimeStampSource {
+        name: Option<String>,
+    },
+    /// Read back the driver's input EOS — C `pasynOctet->getInputEos`.
+    /// Appended last: the variant order is the wire encoding.
+    GetInputEos,
+    /// Read back the driver's output EOS — C `pasynOctet->getOutputEos`.
+    GetOutputEos,
+    /// Send a GPIB universal command byte — C `asynGpib::universalCmd`.
+    /// Appended last: the variant order is the wire encoding.
+    GpibUniversalCmd {
+        cmd: u8,
+    },
+    /// Send a GPIB addressed-command frame — C `asynGpib::addressedCmd`.
+    GpibAddressedCmd {
+        data: Vec<u8>,
+    },
+    /// Assert Interface Clear — C `asynGpib::ifc`.
+    GpibIfc,
+    /// Set the Remote Enable line — C `asynGpib::ren`.
+    GpibRen {
+        enable: bool,
     },
 }
 
@@ -196,6 +251,7 @@ mod tests {
             PortCommand::DisableAddr,
             PortCommand::SetEnable { yes: true },
             PortCommand::SetAutoConnect { yes: false },
+            PortCommand::SetAutoConnectAddr { yes: true },
             PortCommand::GetBoundsInt32,
             PortCommand::GetBoundsInt64,
             PortCommand::GetEnable,
@@ -213,6 +269,27 @@ mod tests {
                 key: "baud".into(),
                 value: "9600".into(),
             },
+            PortCommand::GetConnected,
+            PortCommand::PushEchoInterpose,
+            PortCommand::PushDelayInterpose { delay_secs: 0.001 },
+            PortCommand::PushEosInterpose {
+                process_in: true,
+                process_out: false,
+            },
+            PortCommand::PushFlushInterpose {
+                flush_timeout_secs: 0.05,
+            },
+            PortCommand::SetTimeStampSource {
+                name: Some("myTimeStamp".into()),
+            },
+            PortCommand::GetInputEos,
+            PortCommand::GetOutputEos,
+            PortCommand::GpibUniversalCmd { cmd: 0x14 },
+            PortCommand::GpibAddressedCmd {
+                data: vec![0x5f, 0x3f, 0x25, 0x08, 0x5f, 0x3f],
+            },
+            PortCommand::GpibIfc,
+            PortCommand::GpibRen { enable: true },
         ];
         for cmd in commands {
             let json = serde_json::to_string(&cmd).unwrap();

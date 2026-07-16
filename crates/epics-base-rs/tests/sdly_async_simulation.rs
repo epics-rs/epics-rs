@@ -21,6 +21,7 @@
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
+use epics_base_rs::server::recgbl::alarm_status;
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::server::records::ao::AoRecord;
 use epics_base_rs::types::EpicsValue;
@@ -69,10 +70,15 @@ async fn sdly_async_defers_input_sim_read_to_continuation() {
         matches!(val, EpicsValue::Double(v) if v == 0.0),
         "VAL untouched on the delaying cycle (sim read deferred), got {val:?}"
     );
-    let sevr = db.get_pv("SDLY_AI.SEVR").await.unwrap();
+    // A never-processed record carries C's init UDF status (`doInitRecord0`:
+    // STAT=UDF, SEVR=UDFS=INVALID — softIoc reads that on every record right
+    // after `iocInit`), and the delaying cycle commits no alarms of its own. So
+    // "the SIMM alarm has not been raised yet" is a STATUS check: STAT is still
+    // UDF, not SIMM.
+    let stat = db.get_pv("SDLY_AI.STAT").await.unwrap();
     assert!(
-        matches!(sevr, EpicsValue::Short(0)),
-        "SIMM_ALARM not raised on the delaying cycle (alarm tail deferred), got {sevr:?}"
+        matches!(stat, EpicsValue::Short(s) if s as u16 == alarm_status::UDF_ALARM),
+        "SIMM_ALARM not raised on the delaying cycle (alarm tail deferred), got {stat:?}"
     );
 
     // Continuation: sync SIOL read -> VAL=42, SIMM_ALARM raised, PACT cleared.

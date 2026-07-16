@@ -1,6 +1,6 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, MENU_POST, MENU_YES_NO, ProcessOutcome, Record};
-use crate::types::{DbFieldType, EpicsValue, PvString};
+use crate::server::record::{MENU_POST, MENU_YES_NO, ProcessOutcome, Record};
+use crate::types::{EpicsValue, PvString};
 
 /// EPICS `MAX_STRING_SIZE` — DBR_STRING buffers are 40 bytes.
 const MAX_STRING_SIZE: usize = 40;
@@ -106,104 +106,9 @@ impl LsoRecord {
     }
 }
 
-static LSO_FIELDS: &[FieldDesc] = &[
-    FieldDesc {
-        name: "VAL",
-        dbf_type: DbFieldType::Char,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OVAL",
-        dbf_type: DbFieldType::Char,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "SIZV",
-        // C declares SIZV as DBF_USHORT (lsoRecord.dbd.pod:128): the VAL buffer
-        // size is an unsigned 16-bit count (clamped to [16, 0x7fff] at init).
-        dbf_type: DbFieldType::UShort,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LEN",
-        // C declares LEN as DBF_ULONG (lsoRecord.dbd.pod:135): the current
-        // string byte length is an unsigned 32-bit count.
-        dbf_type: DbFieldType::ULong,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "OLEN",
-        // C declares OLEN as DBF_ULONG (lsoRecord.dbd.pod:139): the previously
-        // posted byte length is an unsigned 32-bit count.
-        dbf_type: DbFieldType::ULong,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "IVOA",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "IVOV",
-        dbf_type: DbFieldType::Char,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OMSL",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DOL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIMM",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIML",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIOL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIMS",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SDLY",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    // `menuPost` menu fields (DBF_MENU). Exposed as Short, matching the
-    // record's other menu field (SIMM); C `lsoRecord.dbd.pod:172/178`.
-    FieldDesc {
-        name: "MPST",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "APST",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-];
-
 impl Record for LsoRecord {
     fn record_type(&self) -> &'static str {
         "lso"
-    }
-
-    fn field_list(&self) -> &'static [FieldDesc] {
-        LSO_FIELDS
     }
 
     /// `DBF_MENU` fields, served as `DBR_ENUM` (`lsoRecord.dbd.pod`): `SIMM`
@@ -238,33 +143,45 @@ impl Record for LsoRecord {
         Some(self.value_changed)
     }
 
+    /// C `lsoRecord.c:113-115`: `process()` clears `udf` to FALSE only on a
+    /// successful closed-loop DOL fetch (`if (!dbGetLinkLS(...)) prec->udf =
+    /// FALSE;`); with no closed-loop fetch this cycle, `udf` is left
+    /// untouched and `if (prec->udf) recGblSetSevr(UDF_ALARM, ...)` (`:117-118`)
+    /// raises it every cycle for a bare record. `udf` is never re-derived
+    /// from the stored VAL, so lso opts out of the framework's blanket
+    /// per-cycle clear. The definers are a direct VAL put (`dbPut`,
+    /// `field_io.rs`) and the DOL-apply site (`processing.rs`).
+    fn clears_udf(&self) -> bool {
+        false
+    }
+
     fn monitor_always_post(&self) -> (bool, bool) {
         // C `lsoRecord.c` monitor: `if (mpst == menuPost_Always) events |=
         // DBE_VALUE; if (apst == menuPost_Always) events |= DBE_LOG;`.
         (self.mpst == MENU_POST_ALWAYS, self.apst == MENU_POST_ALWAYS)
     }
 
-    /// C `lsoRecord.c::init_record` loads a constant DOL into VAL once via
-    /// `dbLoadLinkLS(&prec->dol, prec->val, prec->sizv, &prec->len)`. The
-    /// framework gate (`processing.rs`) excludes a constant DOL from the
-    /// per-cycle closed-loop fetch (C `!dbLinkIsConstant`), so the constant
-    /// text must be seeded here. A quoted (`"text"`) or bare-numeric (`5`)
-    /// DOL parses to `ParsedLink::Constant`; its text is copied into the
-    /// long-string VAL and LEN is set to the C `strlen+1` convention.
-    fn init_record(&mut self, pass: u8) -> CaResult<()> {
-        if pass == 0 {
-            if let crate::server::record::ParsedLink::Constant(s) =
-                crate::server::record::parse_link_v2(&self.dol)
-            {
-                self.val = PvString::from(s);
-                self.len = if self.val.is_empty() {
-                    0
-                } else {
-                    (self.val.len() + 1).min(256) as u32
-                };
+    /// C `lsoRecord.c:82` — `dbLoadLinkLS(&prec->dol, prec->val, prec->sizv,
+    /// &prec->len)`. The load itself is the init-seed owner's
+    /// (`seed_constant_links`); this only names the link it reads.
+    fn constant_ls_link(&self) -> Option<&'static str> {
+        Some("DOL")
+    }
+
+    /// The `dbLoadLinkLS` sink plus C's init tail (`lsoRecord.c:92-95`).
+    fn apply_ls_load(&mut self, load: crate::server::record::LsLoad) -> u32 {
+        match load {
+            crate::server::record::LsLoad::Text(s) => {
+                let max = (self.sizv as usize).saturating_sub(1);
+                self.val = truncate_bytes(PvString::from(s), max);
+                self.len = (self.val.len() + 1) as u32;
             }
+            // C's number case: the buffer is untouched, LEN comes out 1.
+            crate::server::record::LsLoad::LenOnly => self.len = 1,
         }
-        Ok(())
+        self.oval = self.val.clone();
+        self.olen = self.len;
+        self.len
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {

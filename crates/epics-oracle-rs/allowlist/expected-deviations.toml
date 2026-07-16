@@ -1,0 +1,149 @@
+# Expected-deviation allowlist for the differential oracle.
+#
+# WHAT THIS IS
+# Under the product policy adopted 2026-07-13 (doc/strategy-2026-07-13.md §2),
+# "C's bugs are not the contract. Clean is the goal." So a difference between
+# the C softIoc and the Rust port is NOT automatically a port bug. It is one of
+# exactly two things:
+#
+#   * a deliberate refusal to reproduce a C defect  -> EXPECTED DEVIATION
+#   * anything else                                 -> PORT DEFECT
+#
+# The allowlist IS doc/upstream-c-bugs.md. Every row below is a NOT-REPRODUCED
+# entry from that catalogue, transcribed into a machine-matchable rule with the
+# CBUG id that justifies it. This file holds no judgement of its own: if a row
+# here is not backed by a NOT-REPRODUCED entry there, the row is wrong.
+#
+# SELF-CHECKING, IN BOTH DIRECTIONS
+#   * a diff that matches a row      -> reported as EXPECTED DEVIATION, not a failure
+#   * a diff that matches no row     -> reported as a PORT DEFECT
+#   * a row that STOPS firing        -> reported as STALE. The deviation vanished.
+#                                       Either the port regressed back onto C's
+#                                       bug, or C fixed it upstream. Both are
+#                                       findings; neither may pass silently.
+#
+# MATCHING
+# A row fires when every constraint it states holds. Omitted constraints are
+# wildcards, so a row is as narrow as it is written. `record_types` and `fields`
+# are exact-match lists; `classes` matches the boundary class from cases.rs;
+# `surface` matches which observation differed.
+#
+# SCOPE NOTE, stated rather than implied: most of the 76 NOT-REPRODUCED entries
+# in the catalogue are Tier-3 (asyn, ADCore, motor, optics, modbus) or live
+# inside the calc expression engines. They cannot fire on the record/field CA
+# surface this harness drives, so they are deliberately NOT transcribed here --
+# listing them would be padding, and a row that can never fire would be flagged
+# STALE forever. Only entries reachable from a CA get/put on a base record
+# field are listed. When the harness grows a calc-expression generator, the
+# CBUG-A* / CBUG-C* / CBUG-F1..F5 rows become reachable and belong here.
+
+schema = 1
+
+# --------------------------------------------------------------------------
+# Reachable today: base record/field CA surface.
+# --------------------------------------------------------------------------
+
+[[deviation]]
+id = "CBUG-F6"
+bucket = "NOT-REPRODUCED"
+upstream = "epics-base / calc"
+record_types = ["calc", "calcout"]
+fields = ["INPM", "INPN", "INPO", "INPP", "INPQ", "INPR", "INPS", "INPT", "INPU"]
+surface = ["put_accepted"]
+why = """
+C's calcRecord.dbd declares special(SPC_MOD) on the nine link fields INPM..INPU,
+but calcRecord.c's special() implements only SPC_CALC and falls through to
+S_db_badChoice. So on a C IOC every dbPutField to these nine documented fields is
+REJECTED -- they are unwritable over CA. The port implements them as ordinary
+writable links, so the put is ACCEPTED. The deviation is the port refusing to
+reproduce an upstream defect that makes documented fields unusable.
+Expect: C rejects the put, port accepts it.
+"""
+
+[[deviation]]
+id = "CBUG-E1"
+bucket = "NOT-REPRODUCED"
+upstream = "epics-base / db"
+record_types = ["compress"]
+fields = ["VAL"]
+surface = ["value_string", "value_numeric", "monitor_events"]
+why = """
+In C, a scalar dbPut into a compress record's VAL takes its write offset from
+get_array_info(), which returns the READ start (it exists to serve dbGet). In FIFO
+mode that is the oldest element, so successive client puts overwrite the same slot
+instead of appending: three puts into an empty NSAM=3 FIFO leave [3,0,0] with NUSE
+still 0. The port appends at the write cursor and bumps NUSE, giving [1,2,3].
+One get_array_info serves two callers with opposite needs; dbPut consumes dbGet's
+answer.
+Expect: C and port disagree on VAL contents/NORD after scalar puts into compress.
+"""
+
+[[deviation]]
+id = "CBUG-E2"
+bucket = "NOT-REPRODUCED"
+upstream = "epics-base / dbConvert"
+fields = []
+surface = ["value_string", "value_numeric"]
+classes = [
+    "over-max",
+    "under-min",
+    "over-double-max",
+    "over-float-max",
+    "nan",
+    "enum-negative-ordinal",
+]
+why = """
+dbConvert's double->integer put is a bare C cast, which is UNDEFINED out of range
+(C17 6.3.1.4p1) -- so compiled C is not single-valued. The C softIoc this harness
+diffs against is x86-64, where cvttsd2si yields the integer indefinite
+(3.0e9 -> INT_MIN, NaN -> INT_MIN); an aarch64 IOC's fcvtzs SATURATES on the same
+input (3.0e9 -> INT_MAX, NaN -> 0). There is no single C answer to be faithful to.
+
+Adjudicated 2026-07-14 (commit 651bf392): the port SATURATES and sends NaN to 0
+(types::c_cast), which is byte-identical to a compiled aarch64 IOC. No alarm --
+the stored value is in range and valid, and dbConvert runs outside the record's
+process cycle where an alarm would be erased by the next recGblResetAlarms.
+
+The epicsEnum16 (DBF_MENU/DBF_ENUM) destination is the same cast: `putDoubleEnum`
+instantiates the identical PUT macro body, so a numeric ordinal put whose value is
+out of the u16 range takes the same UB. `caput` sends a numeric-but-not-a-choice
+value to an enum field as DBR_DOUBLE (caput.c:498-507), so `caput SCAN -1` reaches
+`putDoubleEnum` as -1.0: the x86-64 softIoc stores the indefinite 65535, the port
+saturates the negative double to 0 -- a valid menu ordinal (SCAN -> Passive,
+PINI -> NO, a severity -> NO_ALARM). That is the `enum-negative-ordinal` class. Its
+value-agreeing twin -- a negative ordinal into a *signed* raw field (PRIO's i16)
+that holds -1 exactly -- produces no value diff and is not matched here. (An enum
+put whose ordinal is IN u16 range but out of the record's menu range is NOT this
+cast -- it is exact -- and is adjudicated separately, not under E2.)
+
+Expect: on an out-of-range numeric put, the x86-64 C softIoc stores the indefinite
+value and the port stores the saturated one. In range, both agree exactly.
+"""
+
+# --------------------------------------------------------------------------
+# REPRODUCED entries that touch this surface.
+#
+# These are NOT deviations today: the port deliberately carries C's bug, so the
+# oracle must see AGREEMENT. They are recorded here (disabled) because
+# doc/strategy-2026-07-13.md §4 schedules them for re-adjudication under the
+# clean policy -- when the port stops reproducing them, these become live rows
+# and the diff they produce is EXPECTED, not a defect. Until then, a diff on
+# this surface would mean the port drifted off C without a decision, which is a
+# finding.
+# --------------------------------------------------------------------------
+
+[[deviation]]
+id = "CBUG-F12"
+bucket = "REPRODUCED"
+enabled = false
+upstream = "epics-base / histogram"
+record_types = ["histogram"]
+fields = ["STAT", "SEVR"]
+surface = ["value_string"]
+why = """
+C's histogram raises the LLIM >= ULIM alarm by writing stat/sevr directly instead
+of nsta/nsev, so recGblResetAlarms erases it in the same cycle -- the alarm is dead
+code and never reaches a client. The port reproduces this, so the oracle must see
+AGREEMENT (both report NO_ALARM). Strategy §4 schedules the fix (actually raise
+it); when it lands, flip enabled = true.
+"""

@@ -42,12 +42,20 @@ async fn sim_output_runs_ao_oroc_body_writes_limited_oval_to_siol() {
         .await
         .unwrap();
 
-    let mut ao = AoRecord::new(10.0); // VAL=10
+    let mut ao = AoRecord::new(0.0);
     ao.siml = "AOROC_SW".to_string();
     ao.siol = "AOROC_TGT".to_string();
     ao.oroc = 1.0; // rate limit: at most 1.0 EGU per cycle
-    // oval starts 0.0; sdly left at the default -1.0 (synchronous sim write).
+    // sdly left at the default -1.0 (synchronous sim write).
     db.add_record("AOROC", Box::new(ao)).await.unwrap();
+
+    // VAL=10 arrives as a PUT, not as the record's initial value: C's ao
+    // `init_record` tail seeds `oval = pval = val` (aoRecord.c:156, softIoc:
+    // `field(VAL,"10")` comes up with OVAL=10), so an initial VAL of 10 would
+    // leave nothing for OROC to rate-limit.
+    db.put_pv("AOROC.VAL", EpicsValue::Double(10.0))
+        .await
+        .unwrap();
 
     let mut v1 = HashSet::new();
     db.process_record_with_links("AOROC", &mut v1, 0)
@@ -199,6 +207,15 @@ async fn sim_output_real_invalid_alarm_ivoa_dont_drive_suppresses() {
     bo.ivoa = 1; // Don't drive outputs
     db.add_record("BOIV", Box::new(bo)).await.unwrap();
 
+    // Define VAL so the record is not UDF: a bare bo stays UDF=1 and
+    // `boRecord.c:371` raises UDF_ALARM/INVALID first, which (severity INVALID)
+    // would dominate the record's own INVALID STATE alarm this test is about.
+    // A full CA put clears UDF, as `caput BOIV 1` would — same pattern as
+    // `sim_output_simm_alarm_loses_stat_on_severity_tie`.
+    db.put_pv_and_post("BOIV.VAL", EpicsValue::Enum(1))
+        .await
+        .unwrap();
+
     let mut v1 = HashSet::new();
     db.process_record_with_links("BOIV", &mut v1, 0)
         .await
@@ -246,6 +263,18 @@ async fn sim_output_simm_alarm_loses_stat_on_severity_tie() {
     bo.osv = 1; // one-state severity = MINOR -> STATE_ALARM/MINOR (set first)
     bo.sims = 1; // SIMM severity = MINOR -> ties; must NOT override STAT
     db.add_record("BOTIE", Box::new(bo)).await.unwrap();
+
+    // A bare bo stays UDF=1 until a value SOURCE defines it — `boRecord.c:371`
+    // raises UDF_ALARM/INVALID on every process otherwise, which (severity
+    // INVALID) would dominate the MINOR state/SIMM tie this test is about. Model
+    // the client setpoint that defines VAL: a full CA put clears UDF in `dbPut`
+    // (isValueField), exactly as `caput BOTIE 1` would. `bo` no longer re-derives
+    // UDF from the stored VAL every cycle (it clears only on a source), matching
+    // C, so the definition must be explicit rather than implied by `new(1)`.
+    // (`put_pv` alone does not clear UDF — only the post-driving CA-put path does.)
+    db.put_pv_and_post("BOTIE.VAL", EpicsValue::Enum(1))
+        .await
+        .unwrap();
 
     let mut v1 = HashSet::new();
     db.process_record_with_links("BOTIE", &mut v1, 0)

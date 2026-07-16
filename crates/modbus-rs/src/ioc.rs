@@ -34,7 +34,7 @@
 //! poller is not spawned.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -53,7 +53,9 @@ use asyn_rs::user::AsynUser;
 use epics_base_rs::server::iocsh::registry::*;
 
 use crate::datatype::{self, ALL_DATA_TYPES, ModbusDataType};
-use crate::driver::{ModbusConfig, ModbusEngine, ModbusFunctionCode, OctetTransport};
+use crate::driver::{
+    ModbusConfig, ModbusEngine, ModbusFunctionCode, ModbusIoResponse, OctetTransport,
+};
 use crate::error::ModbusError;
 use crate::interpose::LinkType;
 use crate::protocol::MAX_MODBUS_FRAME_SIZE;
@@ -250,6 +252,21 @@ pub struct ModbusPortDriver {
     /// whether the data changed (C `forceCallback_`, :331/1654). Set for the
     /// first cycle and after an I/O error; cleared at each cycle end (:1928).
     force_callback: bool,
+    /// Status of the last poll's Modbus I/O (C `ioStatus_`, :1638). Every
+    /// interrupt the poll cycle fires carries it as the callback's `auxStatus`
+    /// (:1697/1738/1774/1810/1880/1915), which is what drives an I/O-Intr
+    /// record to READ/INVALID while the PLC is unreachable and back to NO_ALARM
+    /// when it returns.
+    io_status: AsynStatus,
+    /// Status of the *previous* poll (C `prevIOStatus`, :1602). The cycle
+    /// compares against it to detect the two transitions C acts on: a status
+    /// change forces the callbacks (:1654), and an unchanged *error* status is a
+    /// persistent failure whose callbacks C skips entirely (:1648-1651).
+    prev_io_status: AsynStatus,
+    /// Set by a persistent-error cycle so the poller task applies C's 1.0 s
+    /// error backoff before the next cycle (`epicsThreadSleep(1.0)`, :1649).
+    /// The poller task is the sole reader and clears it by swapping.
+    poll_backoff: Arc<AtomicBool>,
 }
 
 impl ModbusPortDriver {
@@ -355,6 +372,13 @@ impl ModbusPortDriver {
             // created (drvModbusAsyn.cpp:331), so the first cycle fires every
             // interface unconditionally.
             force_callback: true,
+            // C `ioStatus_` is asynSuccess until the first poll, and
+            // `prevIOStatus` is initialised to asynSuccess at readPoller entry
+            // (drvModbusAsyn.cpp:1602) — so the first failing poll is an error
+            // *transition* and fires the error callbacks.
+            io_status: AsynStatus::Success,
+            prev_io_status: AsynStatus::Success,
+            poll_backoff: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -454,15 +478,64 @@ impl ModbusPortDriver {
         if !self.engine.config().function.is_read() {
             return Ok(());
         }
-        // Single finalizer for the abort => recover invariant. Any error after
-        // the poll begins — the engine read, a mid-loop decode, or the stats
-        // publish — aborts the cycle WITHOUT advancing the on-change baseline, so
-        // the next cycle must be forced (C sets forceCallback_ on an I/O-status
-        // transition, drvModbusAsyn.cpp:1654). `run_poll_cycle` clears
-        // force_callback and advances prev_data only when the cycle fully
-        // completes (C :1928/1934); every Err path re-arms the force here, in one
-        // place, so no mid-loop `?` can leave the baseline frozen with the force
-        // cleared.
+
+        // The acquisition's I/O status is *port state*, not the outcome of this
+        // request: C `readPoller` stores it in `ioStatus_` (drvModbusAsyn.cpp:
+        // 1638) and keeps polling forever — a failed read never ends the poller
+        // and never suppresses the record callbacks. The failure reaches the
+        // records as the `auxStatus` of the interrupt callbacks below, which is
+        // what drives them to READ/INVALID; propagating it as an `Err` here
+        // instead would abort the cycle before a single record learned about it
+        // (and, in the old poller task, kill the poller for good).
+        self.io_status = match self.engine.poll(self.transport.as_mut()) {
+            Ok(_) => AsynStatus::Success,
+            // `AsynError::status()` is the single owner of "which asynStatus is
+            // this?" — it reads a queue refusal (a disabled/disconnected port
+            // turning the request down) as the `asynDisabled`/`asynDisconnected`
+            // it is, where matching `AsynError::Status` by hand flattened both to
+            // `asynError` and told every record the wrong reason.
+            Err(e) => to_asyn(e).status(),
+        };
+
+        // C `doModbusIO` moves the statistics counters on every I/O — success or
+        // failure (`IOErrors_` at :2206, the timings at :2214-2217, `readOK_` at
+        // :2255) — so they must be published on a failed cycle too; the old
+        // early-`?` return left IO_ERRORS reading 0 through an outage.
+        self.publish_stats()?;
+        // The statistics/control params are set at asyn addr 0 (their
+        // `statistics.template` records bind `@asyn($(PORT) 0)`) and still flow
+        // through the param-cache callback path — they are single-interface
+        // control values, not per-interface data points. Flush addr 0 every
+        // cycle so the statistics monitors post.
+        self.base.call_param_callbacks(0)?;
+
+        // A *persistent* error — this poll failed and so did the previous one —
+        // is the one case C skips the callbacks for: it sleeps 1.0 s and starts
+        // the next cycle (drvModbusAsyn.cpp:1646-1651), leaving `forceCallback_`,
+        // `prevIOStatus` and `prevData` exactly as the transition cycle left
+        // them. The records already carry the error status from that transition;
+        // re-firing it every second would be pure churn. Hand the backoff to the
+        // poller task, the owner of this port's pacing.
+        if self.io_status != AsynStatus::Success && self.io_status == self.prev_io_status {
+            self.poll_backoff.store(true, Ordering::Relaxed);
+            return Ok(());
+        }
+
+        // An I/O-status *transition* (good→bad or bad→good) forces the callbacks
+        // regardless of whether the data changed (C :1654) — on the way down so
+        // every record alarms, on the way up so every record recovers with the
+        // fresh value.
+        if self.io_status != self.prev_io_status {
+            self.force_callback = true;
+        }
+
+        // Single finalizer for the abort => recover invariant. An error after
+        // the poll's I/O — a mid-loop decode failure — aborts the cycle WITHOUT
+        // advancing the on-change baseline, so the next cycle must be forced.
+        // `run_poll_cycle` clears force_callback and advances prev_data /
+        // prev_io_status only when the cycle fully completes (C :1928-1934);
+        // every Err path re-arms the force here, in one place, so no mid-loop `?`
+        // can leave the baseline frozen with the force cleared.
         match self.run_poll_cycle() {
             Ok(()) => Ok(()),
             Err(e) => {
@@ -472,13 +545,18 @@ impl ModbusPortDriver {
         }
     }
 
-    /// The fallible body of one poll cycle: read the register block, fire every
-    /// bound interface (on-change gated per C `readPoller`), publish statistics,
-    /// and — only on full success — advance the on-change baseline (`prev_data`)
-    /// and clear the one-shot `force_callback`. Any `Err` leaves both untouched
-    /// so [`poll_cycle`](Self::poll_cycle) re-arms recovery.
+    /// The fallible body of one poll cycle: fire every bound interface with the
+    /// freshly-polled block (on-change gated per C `readPoller`, each callback
+    /// carrying the poll's `io_status` as its `auxStatus`) and — only on full
+    /// success — advance the on-change baseline (`prev_data` / `prev_io_status`)
+    /// and clear the one-shot `force_callback`. Any `Err` leaves all three
+    /// untouched so [`poll_cycle`](Self::poll_cycle) re-arms recovery.
+    ///
+    /// The Modbus read itself happened in [`poll_cycle`](Self::poll_cycle); on a
+    /// failed read the engine's register block still holds the last good data and
+    /// C fires it unchanged, with the failing status attached (:1638-1697).
     fn run_poll_cycle(&mut self) -> AsynResult<()> {
-        self.engine.poll(self.transport.as_mut()).map_err(to_asyn)?;
+        let io_status = self.io_status;
 
         // On-change gate, mirroring C `readPoller`. int32/int64/float64 and
         // float64Array fire every cycle (ADC averaging, drvModbusAsyn.cpp:
@@ -528,6 +606,7 @@ impl ModbusPortDriver {
                         InterfaceType::Octet,
                         ParamValue::Octet(s),
                         0,
+                        io_status,
                     );
                 }
             } else {
@@ -594,6 +673,7 @@ impl ModbusPortDriver {
                     InterfaceType::Int32,
                     ParamValue::Int32(i32v),
                     0,
+                    io_status,
                 );
                 self.base.notify_interface_value(
                     reason,
@@ -601,6 +681,7 @@ impl ModbusPortDriver {
                     InterfaceType::Int64,
                     ParamValue::Int64(i64v),
                     0,
+                    io_status,
                 );
                 self.base.notify_interface_value(
                     reason,
@@ -608,6 +689,7 @@ impl ModbusPortDriver {
                     InterfaceType::Float64,
                     ParamValue::Float64(f64v),
                     0,
+                    io_status,
                 );
                 // C fires uInt32Digital only on a per-offset masked change
                 // (`forceCallback_ || (newValue & mask != prevValue & mask)`,
@@ -630,6 +712,7 @@ impl ModbusPortDriver {
                         InterfaceType::UInt32Digital,
                         ParamValue::UInt32Digital(word),
                         changed_mask,
+                        io_status,
                     );
                 }
                 if let Some(arr) = int32_array {
@@ -639,6 +722,7 @@ impl ModbusPortDriver {
                         InterfaceType::Int32Array,
                         ParamValue::Int32Array(arr.into()),
                         0,
+                        io_status,
                     );
                 }
                 if let Some(arr) = float64_array {
@@ -648,26 +732,22 @@ impl ModbusPortDriver {
                         InterfaceType::Float64Array,
                         ParamValue::Float64Array(arr.into()),
                         0,
+                        io_status,
                     );
                 }
             }
         }
-        self.publish_stats()?;
-        // The statistics/control params are set at asyn addr 0 (their
-        // `statistics.template` records bind `@asyn($(PORT) 0)`) and still flow
-        // through the param-cache callback path — they are single-interface
-        // control values, not per-interface data points. Flush addr 0 every
-        // cycle so the statistics monitors post.
-        self.base.call_param_callbacks(0)?;
 
-        // Cycle fully completed: advance the on-change baseline and clear the
-        // one-shot force flag (C drvModbusAsyn.cpp:1928/1934). This is the LAST
-        // statement, reached only on full success — any earlier `?` (engine
-        // poll, a per-offset decode, or the stats publish) leaves `prev_data`
-        // and `force_callback` untouched, so `poll_cycle` re-arms the force and
-        // the next clean cycle recovers instead of freezing the baseline.
+        // Cycle fully completed: advance the on-change baseline, latch the I/O
+        // status this cycle's callbacks carried, and clear the one-shot force
+        // flag (C drvModbusAsyn.cpp:1928-1934). This is the LAST statement,
+        // reached only on full success — any earlier `?` (a per-offset decode)
+        // leaves `prev_data`, `prev_io_status` and `force_callback` untouched, so
+        // `poll_cycle` re-arms the force and the next clean cycle recovers
+        // instead of freezing the baseline.
         let snapshot: Vec<u16> = self.engine.data().to_vec();
         self.prev_data = snapshot;
+        self.prev_io_status = io_status;
         self.force_callback = false;
         Ok(())
     }
@@ -695,11 +775,13 @@ impl ModbusPortDriver {
     /// Flush a freshly-converted set of registers to the slave with the
     /// configured write function.
     ///
-    /// In relative mode the registers are also staged into the engine buffer
-    /// at `offset` so a subsequent cached read reflects the write. In absolute
-    /// mode the request targets `offset` as the wire address directly and
-    /// nothing is staged — the buffer is only `config.length` words and the
-    /// wire address can lie far outside it.
+    /// The register cache (`engine.data_`) is NOT touched. C's scalar writes
+    /// — `writeInt32` (`drvModbusAsyn.cpp:760-776`), `writeInt64` (`:920-936`),
+    /// `writeFloat64`, `writeUInt32Digital` (`:596-617`) — convert the value
+    /// into a *local* `epicsUInt16 buffer[4]` / `epicsUInt16 data` and send
+    /// that; `data_` keeps whatever the poller (or the init read-once) last
+    /// put there. Only the array/string writes transmit *from* `data_`, and
+    /// they use [`Self::flush_write_staged`].
     fn flush_write(&mut self, offset: i32, regs: &[u16]) -> AsynResult<()> {
         let function = self.engine.config().function;
         // C parity (drvModbusAsyn.cpp:760-767 / 920-927 / writeFloat64): a
@@ -739,13 +821,32 @@ impl ModbusPortDriver {
                 .do_modbus_io(self.transport.as_mut(), function, addr, regs, regs.len())
                 .map_err(to_asyn)?;
         }
-        let buf = self.engine.data_mut();
-        for (i, &r) in regs.iter().enumerate() {
-            if let Some(slot) = buf.get_mut(offset as usize + i) {
-                *slot = r;
+        Ok(())
+    }
+
+    /// Flush registers that C transmits *from* the register cache.
+    ///
+    /// C's array and string writes — `writeInt32Array` (`drvModbusAsyn.cpp:
+    /// 1402`), `writeFloat64Array` (`:1232`), `writeOctet` (`:1537-1554`) —
+    /// set `dataAddress = data_ + offset` and convert the record's elements
+    /// straight INTO `data_`, so the cache carries the written values and a
+    /// cached read on the port sees them. The conversion happens before the
+    /// I/O, so a failed request still leaves the staged values behind.
+    ///
+    /// Absolute mode stages nothing: C aliases `data_` as a scratch transmit
+    /// buffer there (`dataAddress = data_; outIndex = 0;`, `:1219-1221`), and
+    /// the port's reads go to the wire rather than to the cache, so the staged
+    /// words are never observable.
+    fn flush_write_staged(&mut self, offset: i32, regs: &[u16]) -> AsynResult<()> {
+        if !self.is_absolute() {
+            let buf = self.engine.data_mut();
+            for (i, &r) in regs.iter().enumerate() {
+                if let Some(slot) = buf.get_mut(offset as usize + i) {
+                    *slot = r;
+                }
             }
         }
-        Ok(())
+        self.flush_write(offset, regs)
     }
 
     /// After a successful write, stage the value into the parameter cache and
@@ -1146,7 +1247,7 @@ impl PortDriver for ModbusPortDriver {
             regs.extend(datatype::write_int32(dt, v).map_err(to_asyn)?);
             out_index += rc;
         }
-        self.flush_write(user.addr, &regs)
+        self.flush_write_staged(user.addr, &regs)
     }
 
     fn write_float64_array(&mut self, user: &AsynUser, data: &[f64]) -> AsynResult<()> {
@@ -1185,7 +1286,7 @@ impl PortDriver for ModbusPortDriver {
             regs.extend(datatype::write_float(dt, v).map_err(to_asyn)?);
             out_index += rc;
         }
-        self.flush_write(user.addr, &regs)
+        self.flush_write_staged(user.addr, &regs)
     }
 
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
@@ -1286,7 +1387,7 @@ impl PortDriver for ModbusPortDriver {
                     };
                     let readback =
                         (modbus_address + self.engine.config().readback_offset()).max(0) as u16;
-                    let regs = self
+                    let response = self
                         .engine
                         .do_modbus_io(
                             self.transport.as_mut(),
@@ -1296,7 +1397,18 @@ impl PortDriver for ModbusPortDriver {
                             1,
                         )
                         .map_err(to_asyn)?;
-                    let current = u32::from(regs.first().copied().unwrap_or(0));
+                    let current = match response {
+                        ModbusIoResponse::Data(regs) => {
+                            u32::from(regs.first().copied().unwrap_or(0))
+                        }
+                        // Exception 05 copies nothing into C's readback
+                        // destination, which is the local `epicsUInt16 data =
+                        // value` (drvModbusAsyn.cpp:578, :2231-2237) — so the
+                        // read/modify/write merges the record's own value with
+                        // itself, instead of merging against a zero word that was
+                        // never read.
+                        ModbusIoResponse::Acknowledged => value & 0xFFFF,
+                    };
                     // data |= (value & mask); data &= (value | ~mask)
                     (current & !mask) | (value & mask)
                 }
@@ -1363,7 +1475,7 @@ impl PortDriver for ModbusPortDriver {
             data
         };
         let (regs, consumed) = datatype::write_string(dt, bytes, budget).map_err(to_asyn)?;
-        self.flush_write(user.addr, &regs)?;
+        self.flush_write_staged(user.addr, &regs)?;
         // Relative mode caches the value and fans out its monitor (see
         // `cache_write_numeric`); absolute mode has no parameter-table slot
         // for a wire address and no poller, so it skips the cache.
@@ -1651,9 +1763,11 @@ impl CommandHandler for ModbusConfigHandler {
         let read_reason = driver.read_reason;
         // Cloned before the driver moves into the runtime: the poller reads the
         // live period from the shared atomic each cycle and the wake lets a
-        // POLL_DELAY write interrupt the current sleep (R46).
+        // POLL_DELAY write interrupt the current sleep (R46). `poll_backoff` is
+        // the poll cycle's request for C's persistent-error sleep.
         let poll_delay = driver.poll_delay.clone();
         let poll_wake = driver.poll_wake.clone();
+        let poll_backoff = driver.poll_backoff.clone();
 
         let (runtime, _jh) = create_port_runtime(driver, RuntimeConfig::default());
         let port_handle = runtime.port_handle().clone();
@@ -1673,24 +1787,61 @@ impl CommandHandler for ModbusConfigHandler {
         // Spawn the read poller — periodically triggers a poll cycle by
         // writing the MODBUS_READ parameter. Port of the `readPoller` thread.
         if needs_poller && !initial_poll_delay.is_zero() {
-            let poller_handle = port_handle.clone();
-            self.handle.spawn(async move {
-                loop {
-                    // Read the live period each cycle so a runtime POLL_DELAY
-                    // write retunes it. A wake (POLL_DELAY changed) ends the
-                    // wait early — C signals readPollerEventId_ and re-waits
-                    // with the new pollDelay_ — then we re-read the period.
-                    let ms = poll_delay.load(Ordering::Relaxed);
-                    let _ =
-                        tokio::time::timeout(Duration::from_millis(ms), poll_wake.notified()).await;
-                    if poller_handle.write_int32(read_reason, 0, 1).await.is_err() {
-                        break;
-                    }
-                }
-            });
+            self.handle.spawn(read_poller(
+                port_handle.clone(),
+                read_reason,
+                poll_delay,
+                poll_wake,
+                poll_backoff,
+            ));
         }
 
         Ok(CommandOutcome::Continue)
+    }
+}
+
+/// C's persistent-I/O-error sleep (`epicsThreadSleep(1.0)`,
+/// drvModbusAsyn.cpp:1649): once a poll has failed twice in a row the poller
+/// stops hammering the unreachable slave at the poll period and retries once a
+/// second until it answers.
+const POLL_ERROR_BACKOFF: Duration = Duration::from_secs(1);
+
+/// The read-poller task — port of the C `readPoller` thread's loop control
+/// (drvModbusAsyn.cpp:1626-1937). It waits the live poll period, then triggers
+/// one poll cycle by writing the `MODBUS_READ` parameter (C signals
+/// `readPollerEventId_`; here the write runs the cycle inside the port actor).
+///
+/// The loop exits on exactly one condition: the port actor is gone — the Rust
+/// equivalent of C's `if (modbusExiting_) break;` (:1637). A Modbus I/O error is
+/// **not** an exit condition and never has been in C: the poll cycle delivers it
+/// to the records as an alarm status and the poller keeps going, so an outage
+/// alarms the records and a recovered link brings them back with no IOC restart.
+/// The cycle asks for the 1.0 s backoff (`poll_backoff`) once the error is
+/// persistent, exactly as C sleeps before its next `doModbusIO`.
+async fn read_poller(
+    handle: asyn_rs::port_handle::PortHandle,
+    read_reason: usize,
+    poll_delay: Arc<AtomicU64>,
+    poll_wake: Arc<Notify>,
+    poll_backoff: Arc<AtomicBool>,
+) {
+    loop {
+        // Read the live period each cycle so a runtime POLL_DELAY write retunes
+        // it. A wake (POLL_DELAY changed) ends the wait early — C signals
+        // readPollerEventId_ and re-waits with the new pollDelay_ — then we
+        // re-read the period.
+        let ms = poll_delay.load(Ordering::Relaxed);
+        let _ = tokio::time::timeout(Duration::from_millis(ms), poll_wake.notified()).await;
+        if handle.is_closed() {
+            break;
+        }
+        // The cycle's own I/O status reaches the records as their callback
+        // status; an `Err` here is an internal fault (a data-type decode the
+        // engine could not perform), which C likewise logs and polls through.
+        let _ = handle.write_int32(read_reason, 0, 1).await;
+        if poll_backoff.swap(false, Ordering::Relaxed) {
+            tokio::time::sleep(POLL_ERROR_BACKOFF).await;
+        }
     }
 }
 
@@ -2935,6 +3086,48 @@ mod tests {
         );
     }
 
+    /// R8-70 sibling: the masked-write readback can itself answer exception 05.
+    /// C's readback destination is the local `epicsUInt16 data = value`
+    /// (drvModbusAsyn.cpp:578) and exception 05 copies nothing into it (:2231),
+    /// so the merge runs against the record's own value and the write carries it
+    /// unchanged. Treating the empty response as a zero word (the old
+    /// `unwrap_or(0)`) instead cleared every bit outside the mask.
+    #[test]
+    fn uint32_digital_partial_mask_readback_acknowledge_merges_the_written_value() {
+        // The readback answers exception 05 (fcode 0x83), then the write echoes.
+        // The value carries bits OUTSIDE the mask (0xAB00), which is what
+        // separates C's behaviour (they survive, because the merge base is the
+        // record's own value) from a zero merge base (they are cleared).
+        let ack = tcp_response(1, &[0x01, 0x83, 0x05]);
+        let write_echo = tcp_response(2, &[0x01, 0x06, 0x00, 0x02, 0xAB, 0x12]);
+        let transport = ReplayTransport::new(vec![Ok(ack), Ok(write_echo)]);
+        let written = transport.written_handle();
+        let mut cfg = test_config(0, 4);
+        cfg.function = ModbusFunctionCode::WriteSingleRegister;
+        let mut driver =
+            ModbusPortDriver::new("MB_REL_WSR_ACK", cfg, LinkType::Tcp, Box::new(transport))
+                .expect("relative config must build");
+        let reason = driver
+            .base
+            .find_param(ModbusDataType::UInt16.as_str())
+            .expect("UINT16 parameter must exist");
+        let mut user = AsynUser::new(reason);
+        user.addr = 2;
+        driver
+            .write_uint32_digital(&mut user, 0xAB12, 0x00FF)
+            .expect("an Acknowledge readback is a success, not an error");
+        let frames = written.lock().unwrap();
+        assert_eq!(frames.len(), 2, "the readback still precedes the write");
+        // merged = (value & ~mask) | (value & mask) = value = 0xAB12. A zero
+        // merge base would have written 0x0012, dropping the high byte.
+        assert_eq!(
+            &frames[1][6..12],
+            &[0x01, 0x06, 0x00, 0x02, 0xAB, 0x12],
+            "with nothing read back, the merge runs against the value C left in \
+             its readback local — the record's own value"
+        );
+    }
+
     /// A WRITE_SINGLE_COIL port writes the value directly and ignores the mask
     /// (drvModbusAsyn.cpp:596-599) — it must never do a holding-register
     /// readback even with a partial mask.
@@ -3726,11 +3919,12 @@ mod tests {
         );
     }
 
-    /// R57: an I/O error forces the next successful cycle's on-change callbacks
-    /// even if the data is unchanged, mirroring C's `forceCallback_` on an
-    /// I/O-status transition (drvModbusAsyn.cpp:1654). The Rust poller aborts the
-    /// failed cycle (returns Err, fires nothing), so the recovered cycle must
-    /// re-fire uInt32Digital with `!0` despite the word being identical.
+    /// R57: an I/O error forces the on-change callbacks even if the data is
+    /// unchanged, mirroring C's `forceCallback_` on an I/O-status transition
+    /// (drvModbusAsyn.cpp:1654) — once on the way down (the failed cycle fires
+    /// the last good data with the failing status, R8-69) and once on the way
+    /// back up, so the recovered cycle re-fires uInt32Digital with `!0` despite
+    /// the word being identical.
     #[test]
     fn poll_cycle_io_error_forces_next_unchanged_cycle() {
         let mut driver = ModbusPortDriver::new(
@@ -3764,17 +3958,26 @@ mod tests {
         driver.poll_cycle().expect("poll 1 must succeed");
         let _ = drain_addr0_fires(&mut rx, reason); // discard the forced first fire
 
-        // Poll 2 errors: poll_cycle returns Err and fires nothing.
+        // Poll 2 errors: the I/O-status transition forces a re-fire carrying the
+        // last good word and the failing status (C :1654/1697), so the record
+        // alarms instead of freezing.
         driver
             .poll_cycle()
-            .expect_err("poll 2 must surface the I/O error");
+            .expect("an I/O error reaches the records as a callback status, not as an Err");
+        let f2 = drain_addr0_fires(&mut rx, reason);
+        let u32d2: Vec<(u32, u32, AsynStatus)> = f2
+            .iter()
+            .filter_map(|iv| match (iv.iface, &iv.value) {
+                (Some(InterfaceType::UInt32Digital), ParamValue::UInt32Digital(v)) => {
+                    Some((*v, iv.uint32_changed_mask, iv.aux_status))
+                }
+                _ => None,
+            })
+            .collect();
         assert_eq!(
-            count_iface(
-                &drain_addr0_fires(&mut rx, reason),
-                InterfaceType::UInt32Digital
-            ),
-            0,
-            "a failed poll fires nothing"
+            u32d2,
+            vec![(1, !0, AsynStatus::Timeout)],
+            "the failed poll forces a re-fire of the last good word with the failing status"
         );
 
         // Poll 3: data identical to poll 1, but the error forced a re-fire.
@@ -4020,5 +4223,290 @@ mod tests {
         ]))
         .unwrap_err();
         assert!(err.contains("data type"));
+    }
+    // ---- R7-63: scalar writes must not stage into the register cache ----
+
+    /// C `writeInt32` (drvModbusAsyn.cpp:748-776) converts the value into a
+    /// LOCAL `epicsUInt16 buffer[4]` and sends that; `data_` — the register
+    /// cache the poller fills and `readInt32` (`:541,:550`) serves — is never
+    /// touched. So a read record on a write port keeps returning the
+    /// last-polled / init-read value after a write, not the just-written one.
+    #[test]
+    fn relative_scalar_write_leaves_the_register_cache_untouched() {
+        // WriteMultipleRegisters echo response.
+        let pdu = [0x01u8, 0x10, 0x00, 0x00, 0x00, 0x01];
+        let mut cfg = test_config(0, 4);
+        cfg.function = ModbusFunctionCode::WriteMultipleRegisters;
+        let mut driver = ModbusPortDriver::new(
+            "MB_WR_NOSTAGE",
+            cfg,
+            LinkType::Tcp,
+            Box::new(ReplayTransport::new(vec![Ok(tcp_response(1, &pdu))])),
+        )
+        .expect("config must build");
+
+        // Stand in for what the port's init read-once / poller left behind.
+        driver.engine.data_mut()[0] = 0x1111;
+
+        let reason = driver
+            .base
+            .find_param(ModbusDataType::UInt16.as_str())
+            .expect("UINT16 parameter must exist");
+        let mut user = AsynUser::new(reason);
+        user.addr = 0;
+        driver
+            .write_int32(&mut user, 0x2222)
+            .expect("scalar write must succeed");
+
+        assert_eq!(
+            driver.engine.data()[0],
+            0x1111,
+            "C's scalar write converts into a local buffer; the cache keeps the polled value"
+        );
+        assert_eq!(
+            driver.read_int32(&user).expect("cached read"),
+            0x1111,
+            "a read on the write port is served the polled value, not the written one"
+        );
+    }
+
+    /// The uint32-digital scalar write is the same C shape (`epicsUInt16 data
+    /// = value;` at drvModbusAsyn.cpp:578, sent from that local) — no staging.
+    #[test]
+    fn relative_uint32_digital_write_leaves_the_register_cache_untouched() {
+        let pdu = [0x01u8, 0x06, 0x00, 0x00, 0x00, 0x0f];
+        let mut cfg = test_config(0, 4);
+        cfg.function = ModbusFunctionCode::WriteSingleRegister;
+        let mut driver = ModbusPortDriver::new(
+            "MB_WR_DIG_NOSTAGE",
+            cfg,
+            LinkType::Tcp,
+            Box::new(ReplayTransport::new(vec![Ok(tcp_response(1, &pdu))])),
+        )
+        .expect("config must build");
+        driver.engine.data_mut()[0] = 0x1111;
+
+        let reason = driver
+            .base
+            .find_param(ModbusDataType::UInt16.as_str())
+            .expect("UINT16 parameter must exist");
+        let mut user = AsynUser::new(reason);
+        user.addr = 0;
+        // mask 0xFFFF -> straight write, no read/modify/write.
+        driver
+            .write_uint32_digital(&mut user, 0x000f, 0xffff)
+            .expect("digital write must succeed");
+
+        assert_eq!(driver.engine.data()[0], 0x1111, "cache untouched");
+    }
+
+    /// Control: the ARRAY write does stage. C `writeInt32Array`
+    /// (drvModbusAsyn.cpp:1402) converts straight into `data_` and transmits
+    /// from it (`dataAddress = data_ + offset`), so the cache carries the
+    /// written registers.
+    #[test]
+    fn relative_array_write_stages_into_the_register_cache() {
+        let pdu = [0x01u8, 0x10, 0x00, 0x00, 0x00, 0x02];
+        let mut cfg = test_config(0, 4);
+        cfg.function = ModbusFunctionCode::WriteMultipleRegisters;
+        let mut driver = ModbusPortDriver::new(
+            "MB_WR_ARR_STAGE",
+            cfg,
+            LinkType::Tcp,
+            Box::new(ReplayTransport::new(vec![Ok(tcp_response(1, &pdu))])),
+        )
+        .expect("config must build");
+        driver.engine.data_mut()[0] = 0x1111;
+        driver.engine.data_mut()[1] = 0x1111;
+
+        let reason = driver
+            .base
+            .find_param(ModbusDataType::UInt16.as_str())
+            .expect("UINT16 parameter must exist");
+        let mut user = AsynUser::new(reason);
+        user.addr = 0;
+        driver
+            .write_int32_array(&user, &[0x2222, 0x3333])
+            .expect("array write must succeed");
+
+        assert_eq!(driver.engine.data()[0], 0x2222, "array write stages reg 0");
+        assert_eq!(driver.engine.data()[1], 0x3333, "array write stages reg 1");
+    }
+
+    /// R8-69: the poll cycle's I/O status is port state that reaches the records
+    /// as their callback status — it is never a reason to stop delivering.
+    /// Walks C `readPoller`'s full status state machine (drvModbusAsyn.cpp:
+    /// 1638-1655, :1928-1934) across four cycles:
+    ///
+    /// 1. clean poll → callbacks carry `Success` and the fresh data;
+    /// 2. I/O failure (transition) → `forceCallback_` set, callbacks still fire,
+    ///    carrying the failing status and the last good data (records alarm);
+    /// 3. I/O failure again (persistent) → callbacks skipped, 1.0 s backoff asked
+    ///    for, no `Err` out of the cycle;
+    /// 4. link restored → status transition forces the callbacks again, now with
+    ///    `Success` and the fresh data (records recover).
+    #[test]
+    fn poll_cycle_delivers_io_error_status_to_records_and_recovers() {
+        let good1 = [0x01u8, 0x03, 0x08, 0, 1, 0, 2, 0, 3, 0, 4];
+        let good2 = [0x01u8, 0x03, 0x08, 0, 9, 0, 8, 0, 7, 0, 6];
+        // Cycle 1 succeeds, cycles 2 and 3 time out, cycle 4 succeeds. The
+        // transaction id advances on every request, failed ones included.
+        let mut driver = ModbusPortDriver::new(
+            "MB_IO_ERR",
+            test_config(0, 4),
+            LinkType::Tcp,
+            Box::new(ReplayTransport::new(vec![
+                Ok(tcp_response(1, &good1)),
+                Err(ModbusError::Timeout),
+                Err(ModbusError::Timeout),
+                Ok(tcp_response(4, &good2)),
+            ])),
+        )
+        .expect("non-absolute config must build");
+
+        let reason = driver
+            .base
+            .find_param(ModbusDataType::UInt16.as_str())
+            .expect("UINT16 parameter must exist");
+        let (_sub, _rx_sub) =
+            driver
+                .base
+                .interrupts
+                .register_interrupt_user(asyn_rs::interrupt::InterruptFilter {
+                    reason: Some(reason),
+                    addr: Some(0),
+                    iface: Some(InterfaceType::Int32),
+                    ..Default::default()
+                });
+        let mut rx = driver.base.interrupts.subscribe_async();
+
+        // The Int32 fires this cycle produced, as (value, aux_status).
+        let int32_fires =
+            |rx: &mut tokio::sync::broadcast::Receiver<asyn_rs::interrupt::InterruptValue>| {
+                let mut out = Vec::new();
+                while let Ok(iv) = rx.try_recv() {
+                    if iv.reason == reason
+                        && iv.addr == 0
+                        && iv.iface == Some(InterfaceType::Int32)
+                        && let ParamValue::Int32(v) = iv.value
+                    {
+                        out.push((v, iv.aux_status));
+                    }
+                }
+                out
+            };
+
+        // 1. Clean poll.
+        driver.poll_cycle().expect("clean poll must succeed");
+        assert_eq!(
+            int32_fires(&mut rx),
+            vec![(1, AsynStatus::Success)],
+            "a clean cycle delivers the fresh value with Success status"
+        );
+
+        // 2. First failure — an I/O-status transition. C fires every interrupt
+        // list with `auxStatus = ioStatus_` (:1697/1738), so the record alarms
+        // (READ/INVALID) while keeping the last good value.
+        driver
+            .poll_cycle()
+            .expect("an I/O error is delivered to the records, not returned as a request failure");
+        assert_eq!(
+            int32_fires(&mut rx),
+            vec![(1, AsynStatus::Timeout)],
+            "the error transition fires the last good data with the failing status"
+        );
+        assert!(
+            !driver.poll_backoff.load(Ordering::Relaxed),
+            "the transition cycle does not back off — C only sleeps once the error persists"
+        );
+
+        // 3. Second failure — persistent. C skips the callbacks entirely and
+        // sleeps 1.0 s (:1646-1651); the records already carry the alarm.
+        driver
+            .poll_cycle()
+            .expect("a persistent I/O error must not end the cycle in an error either");
+        assert!(
+            int32_fires(&mut rx).is_empty(),
+            "a persistent error fires no callbacks"
+        );
+        assert!(
+            driver.poll_backoff.load(Ordering::Relaxed),
+            "a persistent error asks the poller for C's 1.0 s backoff"
+        );
+        assert_eq!(
+            driver.engine.stats.io_errors, 2,
+            "both failed polls counted as I/O errors"
+        );
+
+        // 4. Link restored — the status transition forces the callbacks.
+        driver
+            .poll_cycle()
+            .expect("the recovered poll must succeed");
+        assert_eq!(
+            int32_fires(&mut rx),
+            vec![(9, AsynStatus::Success)],
+            "recovery re-fires every record with the fresh value and Success status"
+        );
+    }
+
+    /// R8-69: the read-poller task survives Modbus I/O errors. On the unfixed
+    /// tree the first failing poll broke the loop and the port never polled
+    /// again (every I/O-Intr record frozen until an IOC restart). C `readPoller`
+    /// exits only on `modbusExiting_` (drvModbusAsyn.cpp:1637) — here, only when
+    /// the port actor is gone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn read_poller_keeps_polling_through_io_errors() {
+        let good = [0x01u8, 0x03, 0x08, 0, 1, 0, 2, 0, 3, 0, 4];
+        // Two failed polls (the second is persistent → 1.0 s backoff), then the
+        // link comes back and every later poll succeeds.
+        let mut responses: Vec<crate::error::ModbusResult<Vec<u8>>> =
+            vec![Err(ModbusError::Timeout), Err(ModbusError::Timeout)];
+        for txid in 3..=12u16 {
+            responses.push(Ok(tcp_response(txid, &good)));
+        }
+        let mut config = test_config(0, 4);
+        config.poll_delay = Duration::from_millis(20);
+        let driver = ModbusPortDriver::new(
+            "MB_POLLER_LIVE",
+            config,
+            LinkType::Tcp,
+            Box::new(ReplayTransport::new(responses)),
+        )
+        .expect("non-absolute config must build");
+        let read_reason = driver.read_reason;
+        let read_ok_reason = driver.read_ok_reason;
+        let poll_delay = driver.poll_delay.clone();
+        let poll_wake = driver.poll_wake.clone();
+        let poll_backoff = driver.poll_backoff.clone();
+
+        let (runtime, _jh) = create_port_runtime(driver, RuntimeConfig::default());
+        let handle = runtime.port_handle().clone();
+        let poller = tokio::spawn(read_poller(
+            handle.clone(),
+            read_reason,
+            poll_delay,
+            poll_wake,
+            poll_backoff,
+        ));
+
+        // The two failures cost the 1.0 s persistent-error backoff; after it the
+        // recovered link must produce successful reads. A dead poller reads 0.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let read_ok = handle
+            .read_int32(read_ok_reason, 0)
+            .await
+            .expect("READ_OK must be readable");
+        assert!(
+            read_ok > 0,
+            "the poller must keep polling after the I/O errors and recover — READ_OK={read_ok}"
+        );
+        assert!(!poller.is_finished(), "the poller task must still be alive");
+
+        // Dropping the port runtime closes the actor — the poller's only exit.
+        drop(runtime);
+        tokio::time::timeout(Duration::from_secs(2), poller)
+            .await
+            .expect("the poller must exit once the port actor is gone")
+            .expect("the poller task must not panic");
     }
 }

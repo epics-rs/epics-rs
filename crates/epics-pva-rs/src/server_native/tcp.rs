@@ -30,9 +30,9 @@ use crate::proto::{
 };
 use crate::pvdata::encode::{
     EncodeTypeCache, TypeCache, decode_pv_field_cached, decode_pv_field_with_bitset_cached,
-    decode_type_desc_cached, encode_pv_field, encode_type_desc, encode_type_desc_cached,
+    encode_pv_field, encode_type_desc, encode_type_desc_cached,
 };
-use crate::pvdata::{FieldDesc, PvField};
+use crate::pvdata::{FieldDesc, NoConvert, PvField, RpcReply};
 
 use super::runtime::PvaServerConfig;
 use super::source::{ChannelInvalidator, DynSource, OpError};
@@ -67,32 +67,38 @@ struct MonitorOptionDiag {
     message: String,
 }
 
-/// Render a monitor `_options` scalar value for a pvxs-shaped
-/// `logRemote` message. pvxs streams the option `Value` through
-/// `operator<<` (`SB()<<…<<pipeline`); the scalar text form is the
-/// faithful approximation. Non-scalar fields render as `<non-scalar>`.
-fn render_option_value(f: &PvField) -> String {
-    match f {
-        PvField::Scalar(sv) => sv.to_string(),
-        _ => "<non-scalar>".to_string(),
-    }
-}
+/// Render a monitor `_options` value for a pvxs-shaped `logRemote` message.
+///
+/// pvxs streams the option `Value` through `operator<<` (`SB()<<…<<pipeline`,
+/// `servermon.cpp:529`), i.e. the default TREE formatter — `<typecode> =
+/// <value>` with the trailing newline the formatter always writes. That is
+/// [`crate::pvdata::render_value`], the one owner shared with the QSRV
+/// bridge's `record._options.process` diagnostic. This used to render a bare
+/// scalar (`maybe` where pvxs sends `string = "maybe"\n`) while the bridge
+/// rendered a third, differently-typed form (R10-36).
+use crate::pvdata::render_value as render_option_value;
 
+#[derive(Debug)]
 struct PipelineOptions {
     enabled: bool,
-    queue_size: u32,
-    /// The client-requested `record._options.queueSize`, recorded ONLY
-    /// when it was present and valid (`>= 2`), independent of pipeline
-    /// enablement. pvxs assigns `op->limit = qSize` for any valid
-    /// `queueSize` outside the `if(op->pipeline)` block
-    /// (`servermon.cpp:533-543`), so a non-pipeline monitor's queue depth
-    /// is the requested value too. `None` means absent/invalid → the
-    /// server keeps its configured default depth. `queue_size` above is
-    /// the negotiated pipeline queue depth (`op->limit`, defaults to 4);
-    /// it is NOT the initial credit window — that is the separate per-INIT
+    /// The NEGOTIATED per-op queue limit — pvxs `MonitorOp::limit`
+    /// (`servermon.cpp:66`), seeded from
+    /// [`crate::server_native::runtime::PvaServerConfig::monitor_queue_limit`]
+    /// and overridden by a valid (`>= 2`) `record._options.queueSize`
+    /// whether or not pipeline is enabled (`op->limit = qSize` sits
+    /// OUTSIDE the `if(op->pipeline)` block, `:533-543`).
+    ///
+    /// ONE meaning on every path: it is the squash threshold, the base of
+    /// the `ackAny` arithmetic, and the depth reported to the source. The
+    /// port used to carry a SECOND copy (`requested_queue_size:
+    /// Option<u32>`, `None` = "use the server default") whose default (64)
+    /// differed from this field's (4), so a plain monitor's squash depth
+    /// and its negotiated limit were different numbers (R11-31).
+    ///
+    /// It is NOT the initial credit window — that is the separate per-INIT
     /// `nack` rider (see [`parse_monitor_init_nack`]), which defaults to 0
-    /// when absent. Both are separate from this squash-threshold override.
-    requested_queue_size: Option<u32>,
+    /// when absent.
+    queue_size: u32,
     /// pvxs `MonitorOp::ackAt` (`servermon.cpp:68`) — the pipeline
     /// ACK-refill threshold parsed from `record._options.ackAny`. It
     /// caps the source-provided monitor watermarks at `ack_at - 1`
@@ -111,108 +117,127 @@ struct PipelineOptions {
 /// pipeline negotiation. Distinguishes the two cases the single `None`
 /// return used to conflate — a parsed set of options vs. a negotiation
 /// error the INIT must be rejected for.
+#[derive(Debug)]
 enum MonitorPipelineRequest {
     /// Parsed options to apply (pipeline on or off).
     Options(PipelineOptions),
     /// pvxs `servermon.cpp:537-540`: `pipeline=true` with a PRESENT but
-    /// invalid (`<2` or unparseable) `queueSize`. The pipeline
+    /// invalid (`<2` or unconvertible) `queueSize`. The pipeline
     /// sub-protocol requires agreement on `queueSize`, so the INIT is
     /// rejected with an error (`ctrl->error(...)` + `return`) rather
-    /// than silently downgraded to a non-pipeline monitor.
-    Reject,
+    /// than silently downgraded to a non-pipeline monitor. Carries the
+    /// error text pvxs sends (`SB()<<"can not pipeline invalid queueSize : "
+    /// <<queueSize`), so the offending value reaches the client — a
+    /// `queueSize` the CONVERSION accepts never lands here.
+    Reject(String),
 }
 
 /// pvxs `servermon.cpp:554-581` — derive the pipeline ACK-refill
 /// threshold `ackAt` from `record._options.ackAny` and the negotiated
-/// `queueSize` (pvxs `limit`). `ackAny` may be a plain integer (typed
-/// builder scalar or a numeric string) or a percentage string
-/// (`"N%"`). An absent or unparseable value keeps the pvxs default of
+/// `queueSize` (pvxs `limit`). `ackAny` may be a plain integer (any scalar
+/// [`crate::pvdata::convert::as_u32`] converts — bool, every signed/unsigned
+/// integer, both reals, and a BASE-0 numeric string) or a percentage string
+/// (`"N%"`). An absent or unconvertible value keeps the pvxs default of
 /// `1`; an explicit `0` becomes `queueSize / 2`; the result clamps to
 /// `[1, queueSize]`. `queue_size` MUST be `>= 1` (the caller only
 /// invokes this for an enabled pipeline, where `queueSize >= 2`).
 ///
 /// Returns the effective `ackAt` plus an optional pvxs
-/// `Level::Crit` [`MonitorOptionDiag`]. pvxs emits a Crit `logRemote`
-/// for exactly two cases (`servermon.cpp:557-573`), and leaves `ackAt`
-/// at its default in both:
-/// * a NON-scalar `ackAny` — `as<int>` and `as<string>` both fail →
-///   "Unable to parse …" (`:570-573`);
-/// * a `"N%"` percentage string whose numeric part fails to parse →
-///   "Unable to parse% …" (`:561-568`).
+/// `Level::Crit` [`MonitorOptionDiag`]. pvxs emits a Crit `logRemote` for a
+/// `"N%"` percentage string whose numeric part fails `parseTo<double>`
+/// (`:561-568`), leaving `ackAt` at its default.
 ///
 /// A plain scalar string that simply fails integer parse (e.g.
 /// `"garbage"`) is SILENTLY ignored by pvxs — `as<string>` succeeds, the
 /// value has no `%` suffix, so neither branch fires and no diagnostic is
 /// emitted (`:560-569`). This faithfully differs from the review doc's
 /// imprecise `ackAny=garbage` Crit example.
-fn ack_at_from(ack_any: Option<&PvField>, queue_size: u32) -> (u32, Option<MonitorOptionDiag>) {
-    use crate::pvdata::ScalarValue;
+///
+/// A NON-scalar `ackAny` (an array, a struct, an unselected union) is
+/// [`NoConvert`] — `Err`. pvxs runs the THROWING `ackAny.as<std::string>()`
+/// at `:556`, *before* the `if/else if`, and no `copyOut` arm converts those
+/// storages into a string (`data.cpp:466-499`). The exception escapes
+/// `handle_MONITOR` — nothing catches between there and the command-dispatch
+/// `catch` in `conn.cpp:277-282`, which logs and does `bev.reset()`. pvxs
+/// DROPS the circuit; it does not reply, and it does not serve the monitor.
+/// (`:570-573`'s "Unable to parse …" Crit is therefore dead code: it needs
+/// both conversions to fail, and any storage that fails the string one has
+/// already thrown at `:556`.) The caller turns this `Err` into the port's
+/// equivalent of `bev.reset()` — a fatal `PvaError` out of the TCP read loop.
+fn ack_at_from(
+    ack_any: Option<&PvField>,
+    queue_size: u32,
+) -> Result<(u32, Option<MonitorOptionDiag>), NoConvert> {
     // pvxs `MonitorOp::ackAt` struct default.
     let mut ack_at: u32 = 1;
     let mut diag: Option<MonitorOptionDiag> = None;
-    match ack_any {
-        Some(PvField::Scalar(sv)) => match sv {
-            ScalarValue::String(s) => {
-                let s = s.as_str_lossy();
-                if let Some(pct) = s.strip_suffix('%').filter(|p| !p.is_empty()) {
-                    match pct.trim().parse::<f64>() {
-                        Ok(percent) => {
-                            // pvxs `servermon.cpp:563` historically
-                            // computed `clamp(percent,0,100) * limit` with NO
-                            // `/ 100`, so any percent >= 1% saturated to the full
-                            // queue after the `[1, limit]` clamp below, defeating
-                            // the percentage control. Divide by 100 so `"50%"` of a
-                            // queue of 4 is 2 — honoring the documented percentage
-                            // semantics. pvxs adopts the same fix.
-                            ack_at = (percent.clamp(0.0, 100.0) / 100.0 * queue_size as f64) as u32;
-                        }
-                        Err(e) => {
-                            // pvxs `servermon.cpp:566-568`: a `"N%"` string whose
-                            // numeric prefix fails `parseTo<double>` is a Crit
-                            // logRemote; `ackAt` stays at its default.
-                            diag = Some(MonitorOptionDiag {
-                                level: MessageType::Fatal,
-                                message: format!(
-                                    "Unable to parse% record._options.ackAny : {s} : {e}"
-                                ),
-                            });
-                        }
-                    }
-                } else if let Ok(n) = s.trim().parse::<u32>() {
-                    ack_at = n;
+    if let Some(f) = ack_any {
+        // `servermon.cpp:556` — `auto sval = ackAny.as<std::string>();`, the
+        // THROWING form, run unconditionally ahead of both branches. Its value
+        // is immediately overwritten by the `as(sval)` below, so its only
+        // effect is this throw.
+        let sval = crate::pvdata::convert::as_string(f)?;
+        // pvxs then tries the PLAIN-INTEGER conversion FIRST — `ackAny.as(ival)`,
+        // `uint32_t ival` (`:557`) — and falls to the percentage form only when
+        // that conversion fails (`:560`). It runs that conversion for STRING
+        // storage too: `copyOut` String → UInteger is `parseTo<uint64_t>` =
+        // `stoull(s,&idx,0)`, BASE 0 (data.cpp:451-453, util.cpp:786-799). So
+        // `"0x10"` is 16, `"010"` is 8, and `"-1"` wraps to `0xFFFF_FFFF` (then
+        // clamps to queueSize) — all in the INTEGER branch (R9-34).
+        if let Ok(n) = crate::pvdata::convert::as_u32(f) {
+            ack_at = n;
+        } else if let Some(pct) = sval.strip_suffix('%').filter(|p| !p.is_empty()) {
+            // pvxs `else if(ackAny.as(sval))` (`:560`) — the same string the
+            // throwing `as<std::string>()` above already produced. Only a `"N%"`
+            // percentage does anything here.
+            match pct.trim().parse::<f64>() {
+                Ok(percent) => {
+                    // pvxs `servermon.cpp:563` historically computed
+                    // `clamp(percent,0,100) * limit` with NO `/ 100`, so any
+                    // percent >= 1% saturated to the full queue after the
+                    // `[1, limit]` clamp below, defeating the percentage
+                    // control. Divide by 100 so `"50%"` of a queue of 4 is 2 —
+                    // honoring the documented percentage semantics. pvxs adopts
+                    // the same fix.
+                    ack_at = (percent.clamp(0.0, 100.0) / 100.0 * queue_size as f64) as u32;
                 }
-                // else: a plain non-`%` string that fails integer parse —
-                // pvxs leaves `ackAt` default with NO logRemote
-                // (`servermon.cpp:560-569` only logs the `%` branch).
+                Err(e) => {
+                    // pvxs `servermon.cpp:566-568`: a `"N%"` string whose
+                    // numeric prefix fails `parseTo<double>` is a Crit
+                    // logRemote; `ackAt` stays at its default.
+                    diag = Some(MonitorOptionDiag {
+                        level: MessageType::Fatal,
+                        message: format!("Unable to parse% record._options.ackAny : {sval} : {e}"),
+                    });
+                }
             }
-            ScalarValue::Byte(i) => ack_at = u32::try_from(*i).unwrap_or(1),
-            ScalarValue::UByte(i) => ack_at = u32::from(*i),
-            ScalarValue::Short(i) => ack_at = u32::try_from(*i).unwrap_or(1),
-            ScalarValue::UShort(i) => ack_at = u32::from(*i),
-            ScalarValue::Int(i) => ack_at = u32::try_from(*i).unwrap_or(1),
-            ScalarValue::UInt(i) => ack_at = *i,
-            ScalarValue::Long(l) => ack_at = u32::try_from(*l).unwrap_or(1),
-            ScalarValue::ULong(l) => ack_at = u32::try_from(*l).unwrap_or(1),
-            _ => {}
-        },
-        Some(other) => {
-            // pvxs `servermon.cpp:570-573`: a NON-scalar `ackAny` fails both
-            // `as<int>` and `as<string>` → Crit logRemote; `ackAt` default.
-            diag = Some(MonitorOptionDiag {
-                level: MessageType::Fatal,
-                message: format!(
-                    "Unable to parse record._options.ackAny : {}",
-                    render_option_value(other)
-                ),
-            });
         }
-        None => {}
+        // else: a plain non-`%` string that is not a base-0 integer — pvxs
+        // leaves `ackAt` default with NO logRemote (`:560-569` only logs the
+        // `%` branch).
     }
-    // servermon.cpp:577-581.
-    if ack_at == 0 {
-        ack_at = queue_size / 2;
-    }
-    (ack_at.clamp(1, queue_size), diag)
+    // servermon.cpp:581 — the requested threshold, clamped to what is
+    // representable: you cannot ack at 0, and not past the queue.
+    //
+    // DEVIATION from C++, deliberate — CBUG-B12. pvxs runs
+    // `if(op->ackAt==0u) op->ackAt = op->limit/2u;` (servermon.cpp:577-578)
+    // first, reading 0 as "the caller named no threshold". It cannot mean that:
+    // `MonitorOp::ackAt` is initialised to 1 (`:68`), so an ABSENT `ackAny`
+    // never reaches that line — the branch fires ONLY on a value the client did
+    // supply. And after `:564` (`clamp(percent,0,100)/100*limit`, truncating)
+    // that is the common case: with the default limit of 4, every percentage
+    // below 25% truncates to 0. The result is non-monotonic — `ackAny="25%"`
+    // acks at 1 while `ackAny="10%"` acks at 2, so a client asking to ack MORE
+    // eagerly gets a LAZIER threshold, and the flow-control window errs toward
+    // less back-pressure, the unsafe direction for a slow client. `ackAny="0%"`
+    // is not expressible at all.
+    //
+    // Dropping the sentinel is the whole fix: `ack_at` now means one thing (the
+    // threshold the client asked for), the clamp below maps the sub-representable
+    // request 0 to the minimum 1, and the percentage mapping is monotonic
+    // non-decreasing. An absent `ackAny` still yields 1 — the struct default,
+    // which this never touched.
+    Ok((ack_at.clamp(1, queue_size), diag))
 }
 
 /// pvxs `servermon.cpp:332-333` — the pipeline ACK threshold `ack_at`
@@ -481,48 +506,6 @@ fn monitor_filter_chain_json(req: &PvField) -> Option<String> {
     }
 }
 
-/// epics-base PR `70735383350b` parity: extract
-/// `record._options.autoExec` from a decoded pvRequest. Returns
-/// `Some(false)` only when the field is explicitly set to "false"
-/// (case-insensitive); `Some(true)` for "true"; `None` when the
-/// option is absent (caller defaults to true / immediate execute).
-fn put_autoexec_from_request(req: Option<&PvField>) -> Option<bool> {
-    use crate::pvdata::ScalarValue;
-    let root = match req? {
-        PvField::Structure(s) => s,
-        _ => return None,
-    };
-    let record = root
-        .fields
-        .iter()
-        .find_map(|(k, v)| (k == "record").then_some(v))?;
-    let record_s = match record {
-        PvField::Structure(s) => s,
-        _ => return None,
-    };
-    let options = record_s
-        .fields
-        .iter()
-        .find_map(|(k, v)| (k == "_options").then_some(v))?;
-    let opt_s = match options {
-        PvField::Structure(s) => s,
-        _ => return None,
-    };
-    let raw = opt_s.fields.iter().find_map(|(k, v)| {
-        (k == "autoExec").then_some(v).and_then(|v| match v {
-            PvField::Scalar(ScalarValue::String(s)) => {
-                Some(s.as_str_lossy().trim().to_ascii_lowercase())
-            }
-            _ => None,
-        })
-    })?;
-    match raw.as_str() {
-        "true" | "yes" | "1" => Some(true),
-        "false" | "no" | "0" => Some(false),
-        _ => None,
-    }
-}
-
 /// Consume the optional u32 `nack` (initial pipeline window) that a
 /// pvxs client appends to a MONITOR INIT body when it sets the
 /// pipeline bit (pvxs `servermon.cpp:494-495` / `clientmon.cpp:341-342`).
@@ -556,107 +539,95 @@ fn parse_monitor_init_nack(
     })
 }
 
-/// Inspect a decoded pvRequest for `record._options.pipeline` and
-/// `record._options.queueSize`. pvxs `Subscription` defaults to
-/// `queueSize = 4` when pipeline is enabled; we follow.
+/// Inspect a decoded pvRequest for `record._options.pipeline`,
+/// `record._options.queueSize` and `record._options.ackAny` — pvxs
+/// `ServerConn::handle_MONITOR`'s INIT half (`servermon.cpp:519-582`).
 ///
-/// Returns `None` only when there is no `record._options` structure to
-/// negotiate (a plain monitor). A present `_options` yields
-/// [`MonitorPipelineRequest::Options`], or [`MonitorPipelineRequest::Reject`]
-/// when `pipeline=true` is paired with a PRESENT-but-invalid
-/// `queueSize` (pvxs `servermon.cpp:537-540`).
-fn monitor_pipeline_options(req: &PvField) -> Option<MonitorPipelineRequest> {
-    use crate::pvdata::ScalarValue;
-    let root = match req {
-        PvField::Structure(s) => s,
-        _ => return None,
+/// `default_limit` is the limit a fresh `MonitorOp` starts with (pvxs
+/// `limit=4u`, `servermon.cpp:66`; here
+/// [`crate::server_native::runtime::PvaServerConfig::monitor_queue_limit`]).
+/// Every returned [`PipelineOptions`] names a resolved
+/// [`PipelineOptions::queue_size`], so no caller re-derives the depth.
+///
+/// [`MonitorPipelineRequest::Options`] on success — including for a
+/// pvRequest with no `record._options` at all, which negotiates nothing and
+/// therefore lands on the defaults. [`MonitorPipelineRequest::Reject`] when
+/// `pipeline=true` is paired with a PRESENT-but-invalid `queueSize` (pvxs
+/// `servermon.cpp:537-540`).
+///
+/// `Err(NoConvert)` is pvxs's THIRD outcome, and the only one that is not a
+/// reply: an `ackAny` whose storage no `copyOut` arm converts throws out of
+/// `handle_MONITOR` and resets the circuit (see [`ack_at_from`]). The caller
+/// must fail the connection, not answer the INIT.
+fn monitor_pipeline_options(
+    req: &PvField,
+    default_limit: u32,
+) -> Result<MonitorPipelineRequest, NoConvert> {
+    let plain = || {
+        MonitorPipelineRequest::Options(PipelineOptions {
+            enabled: false,
+            queue_size: default_limit,
+            ack_at: 1,
+            diagnostics: Vec::new(),
+        })
     };
-    let record = root
+    let PvField::Structure(root) = req else {
+        return Ok(plain());
+    };
+    let Some(PvField::Structure(record_s)) = root
         .fields
         .iter()
-        .find_map(|(k, v)| (k == "record").then_some(v))?;
-    let record_s = match record {
-        PvField::Structure(s) => s,
-        _ => return None,
+        .find_map(|(k, v)| (k == "record").then_some(v))
+    else {
+        return Ok(plain());
     };
-    let options = record_s
+    let Some(PvField::Structure(opt_s)) = record_s
         .fields
         .iter()
-        .find_map(|(k, v)| (k == "_options").then_some(v))?;
-    let opt_s = match options {
-        PvField::Structure(s) => s,
-        _ => return None,
+        .find_map(|(k, v)| (k == "_options").then_some(v))
+    else {
+        return Ok(plain());
     };
     // pvxs `ServerConn::logRemote()` diagnostics for PRESENT-but-invalid
     // options, accumulated alongside the effective options without
     // altering any negotiated value.
     let mut diagnostics: Vec<MonitorOptionDiag> = Vec::new();
-    // pvxs `servermon.cpp:523-540` parses `pipeline` via
-    // `Value::as(bool)` and `queueSize` via the analogous scalar
-    // conversion. A pvxs client using the typed builder form
-    // (`.record("pipeline", true).record("queueSize", N)`) sends a
-    // BOOL/INT, not the parsed-from-`record[pipeline=true]` STRING.
-    // Pre-fix Rust matched only the string form; the typed builder
-    // produced a pvRequest Rust decoded as non-pipelined, dropping
-    // flow control. Accept both shapes.
+    // pvxs `servermon.cpp:523-531` — `pipeline.as(v)` with `bool v`, i.e.
+    // `Value::as(bool&)`: ONE conversion ([`crate::pvdata::convert::as_bool`],
+    // the port's `copyOut`/`copyOutScalar` owner), not a type test. Bool,
+    // every signed/unsigned integer, AND both reals convert by C's
+    // `bool(src)` non-zero rule (`data.cpp:405`); a string converts only as
+    // the exact tokens `"true"`/`"false"` (`data.cpp:466-469`). Anything the
+    // conversion refuses — an unrecognized string, an array, a struct — is
+    // `NoConvert` → `as(v)` answers false → pvxs leaves `op->pipeline` at its
+    // `false` default and emits a `Level::Warn` logRemote (`:529`).
     //
-    // The effective `enabled` mapping below is unchanged from before this
-    // finding (every input maps to the same true/false it did): the only
-    // addition is a pvxs `Level::Warn` diagnostic for a PRESENT pipeline
-    // value pvxs's `pipeline.as(bool)` cannot parse (an unrecognized
-    // string or a non-scalar). pvxs leaves pipeline disabled in that case
-    // (`servermon.cpp:528-530`), which the unrecognized→`false` mapping
-    // already does, so the diagnostic is purely additive.
+    // The hand-rolled per-variant match this replaces diverged twice: it
+    // hardcoded Float/Double to `false` (a pvxs client sending
+    // `pipeline = Double(1.0)` ran the credit-windowed pipeline sub-protocol
+    // against pvxs and a plain monitor here — R10-31), and it accepted
+    // `"1"`/`"yes"`/`"0"`/`"no"` strings that pvxs's `as<bool>` refuses. The
+    // QSRV side already had this conversion right for
+    // `record._options.atomic`/`block`/`process`; both now share the one owner.
     let pipeline_field = opt_s
         .fields
         .iter()
         .find_map(|(k, v)| (k == "pipeline").then_some(v));
     let enabled = match pipeline_field {
         None => false,
-        Some(PvField::Scalar(ScalarValue::Boolean(b))) => *b,
-        Some(PvField::Scalar(ScalarValue::Byte(i))) => *i != 0,
-        Some(PvField::Scalar(ScalarValue::UByte(i))) => *i != 0,
-        Some(PvField::Scalar(ScalarValue::Short(i))) => *i != 0,
-        Some(PvField::Scalar(ScalarValue::UShort(i))) => *i != 0,
-        Some(PvField::Scalar(ScalarValue::Int(i))) => *i != 0,
-        Some(PvField::Scalar(ScalarValue::UInt(i))) => *i != 0,
-        Some(PvField::Scalar(ScalarValue::Long(i))) => *i != 0,
-        Some(PvField::Scalar(ScalarValue::ULong(i))) => *i != 0,
-        // Float/Double pipeline fell to the pre-fix `_ => None` →
-        // `false`; keep that exact effective value with no diagnostic
-        // (this is an effective-value choice, out of scope for the
-        // diagnostics finding — do not start warning here).
-        Some(PvField::Scalar(ScalarValue::Float(_)))
-        | Some(PvField::Scalar(ScalarValue::Double(_))) => false,
-        Some(PvField::Scalar(ScalarValue::String(s))) => {
-            match s.as_str_lossy().to_ascii_lowercase().as_str() {
-                "true" | "1" | "yes" => true,
-                "false" | "0" | "no" => false,
-                _ => {
-                    // PRESENT but unrecognized string: pvxs `as(bool)`
-                    // fails → Warn logRemote, pipeline left disabled.
-                    diagnostics.push(MonitorOptionDiag {
-                        level: MessageType::Warning,
-                        message: format!(
-                            "Unable to parse record._options.pipeline : {}",
-                            s.as_str_lossy()
-                        ),
-                    });
-                    false
-                }
+        Some(f) => match crate::pvdata::convert::as_bool(f) {
+            Ok(v) => v,
+            Err(_) => {
+                diagnostics.push(MonitorOptionDiag {
+                    level: MessageType::Warning,
+                    message: format!(
+                        "Unable to parse record._options.pipeline : {}",
+                        render_option_value(f)
+                    ),
+                });
+                false
             }
-        }
-        Some(other) => {
-            // PRESENT non-scalar: pvxs `as(bool)` fails → Warn, disabled.
-            diagnostics.push(MonitorOptionDiag {
-                level: MessageType::Warning,
-                message: format!(
-                    "Unable to parse record._options.pipeline : {}",
-                    render_option_value(other)
-                ),
-            });
-            false
-        }
+        },
     };
     // pvxs `servermon.cpp:533-540` distinguishes a PRESENT-but-invalid
     // `queueSize` from an ABSENT one: `if(auto queueSize = ...)` gates
@@ -669,105 +640,84 @@ fn monitor_pipeline_options(req: &PvField) -> Option<MonitorPipelineRequest> {
         .iter()
         .find_map(|(k, v)| (k == "queueSize").then_some(v));
     let queue_size_present = queue_size_field.is_some();
-    let queue_size = queue_size_field.and_then(|v| match v {
-        PvField::Scalar(ScalarValue::String(s)) => s.as_str_lossy().parse::<u32>().ok(),
-        PvField::Scalar(ScalarValue::Byte(i)) => u32::try_from(*i).ok(),
-        PvField::Scalar(ScalarValue::UByte(i)) => Some(u32::from(*i)),
-        PvField::Scalar(ScalarValue::Short(i)) => u32::try_from(*i).ok(),
-        PvField::Scalar(ScalarValue::UShort(i)) => Some(u32::from(*i)),
-        PvField::Scalar(ScalarValue::Int(i)) => u32::try_from(*i).ok(),
-        PvField::Scalar(ScalarValue::UInt(i)) => Some(*i),
-        PvField::Scalar(ScalarValue::Long(l)) => u32::try_from(*l).ok(),
-        PvField::Scalar(ScalarValue::ULong(l)) => u32::try_from(*l).ok(),
-        _ => None,
-    });
+    // pvxs `queueSize.as(qSize)` with `uint32_t qSize` (`servermon.cpp:534`) —
+    // the same one conversion `pipeline` uses, targeting `StoreType::UInteger`
+    // ([`crate::pvdata::convert::as_u32`]). It converts a real
+    // (`uint64_t(double(src))`) and parses a string with `parseTo<uint64_t>` =
+    // `stoull(s, &idx, 0)`, i.e. BASE 0 — so `Double(8.0)` is 8, `"0x10"` is
+    // 16, `"010"` is 8. The hand-rolled match this replaces dropped
+    // Float/Double entirely and parsed strings as decimal-only, so a
+    // `queueSize` pvxs converts was rejected here: an enabled pipeline got the
+    // port's invented "can not pipeline invalid queueSize" error and a plain
+    // monitor got a spurious Warn plus the default depth (R10-32). A negative
+    // or oversized integer WRAPS through the uint64 cast and the uint32
+    // narrowing rather than being refused (`Int(-1)` → `0xFFFF_FFFF`), which is
+    // a valid — enormous — limit; the monitor queue grows lazily, so a hostile
+    // value costs no memory until the events actually arrive.
+    let queue_size = queue_size_field.and_then(|v| crate::pvdata::convert::as_u32(v).ok());
     // pvxs `servermon.cpp:554` — `record._options.ackAny`. Parsed only
     // for an enabled pipeline (`ackAt` is meaningless without one).
     let ack_any = opt_s
         .fields
         .iter()
         .find_map(|(k, v)| (k == "ackAny").then_some(v));
-    // A valid (`>= 2`) explicit `queueSize` is the per-op queue-depth
-    // override regardless of pipeline (pvxs `op->limit = qSize` sits
-    // OUTSIDE the `if(op->pipeline)` block, servermon.cpp:533-543).
-    let requested_queue_size = match queue_size {
-        Some(n) if n >= 2 => Some(n),
-        _ => None,
-    };
-    let opts = if enabled {
-        match queue_size {
-            // Valid: use the requested window (pvxs `op->limit = qSize`).
-            Some(n) if n >= 2 => {
-                let (ack_at, ack_diag) = ack_at_from(ack_any, n);
-                diagnostics.extend(ack_diag);
-                PipelineOptions {
-                    enabled: true,
-                    queue_size: n,
-                    requested_queue_size,
-                    ack_at,
-                    diagnostics,
-                }
-            }
-            // PRESENT but invalid (`<2` or unparseable): pvxs
-            // `servermon.cpp:537-540` rejects the INIT — the pipeline
-            // sub-protocol requires agreement on `queueSize`. Do NOT
-            // downgrade to a non-pipeline monitor. pvxs answers this with
-            // `ctrl->error(...)` (a per-op error), NOT a logRemote, and
-            // returns BEFORE the `ackAny` block — so no diagnostics are
-            // owed. `diagnostics` is provably empty here (a rejected
-            // pipeline required a recognized `pipeline=true`, which emits
-            // no Warn, and `ackAny` is never reached), so dropping it
-            // matches pvxs.
-            _ if queue_size_present => return Some(MonitorPipelineRequest::Reject),
-            // ABSENT: pvxs keeps the default `limit` (4) and leaves
-            // pipeline enabled.
-            _ => {
-                let (ack_at, ack_diag) = ack_at_from(ack_any, 4);
-                diagnostics.extend(ack_diag);
-                PipelineOptions {
-                    enabled: true,
-                    queue_size: 4,
-                    requested_queue_size,
-                    ack_at,
-                    diagnostics,
-                }
-            }
-        }
+    // pvxs `servermon.cpp:533-543`: `uint32_t qSize = op->limit;` then
+    // `if(queueSize.as(qSize) && qSize>=2) op->limit = qSize;`. ONE limit,
+    // seeded with the per-op default and overridden by a valid request —
+    // the assignment sits OUTSIDE `if(op->pipeline)`, so it holds for a
+    // plain monitor too. Everything downstream (squash threshold, `ackAt`
+    // arithmetic, reported depth) reads this single value.
+    let requested_limit = queue_size.filter(|&n| n >= 2);
+    let limit = requested_limit.unwrap_or(default_limit);
+    // present + not-accepted == pvxs's `!(queueSize.as(qSize) && qSize>=2)`
+    // (an unconvertible value or a `< 2` one). A CONFIGURED default that
+    // happens to equal the rejected request does not make it accepted.
+    let queue_size_invalid = queue_size_present && requested_limit.is_none();
+    if enabled && queue_size_invalid {
+        // PRESENT but invalid (`<2` or unconvertible) under pipeline: pvxs
+        // `servermon.cpp:537-540` rejects the INIT — the pipeline
+        // sub-protocol requires agreement on `queueSize`. Do NOT downgrade
+        // to a non-pipeline monitor. pvxs answers this with
+        // `ctrl->error(...)` (a per-op error), NOT a logRemote, and returns
+        // BEFORE the `ackAny` block — so no diagnostics are owed.
+        // `diagnostics` is provably empty here (a rejected pipeline
+        // required a recognized `pipeline=true`, which emits no Warn, and
+        // `ackAny` is never reached), so dropping it matches pvxs.
+        let rendered = queue_size_field
+            .map(render_option_value)
+            .unwrap_or_default();
+        return Ok(MonitorPipelineRequest::Reject(format!(
+            "can not pipeline invalid queueSize : {rendered}"
+        )));
+    }
+    if queue_size_invalid {
+        // pvxs `servermon.cpp:541-543`: the same present-but-invalid
+        // `queueSize` on a NON-pipeline monitor keeps the default depth and
+        // emits a Warn logRemote ("Unable to use …").
+        let rendered = queue_size_field
+            .map(render_option_value)
+            .unwrap_or_default();
+        diagnostics.push(MonitorOptionDiag {
+            level: MessageType::Warning,
+            message: format!("Unable to use record._options.queueSize : {rendered}"),
+        });
+    }
+    // pvxs parses `ackAny` only inside `if(op->pipeline)` (`:546-582`);
+    // without a credit window there is no ACK cadence to threshold, so a
+    // plain monitor keeps `ackAt` at its `1` initializer (`:68`).
+    let ack_at = if enabled {
+        let (ack_at, ack_diag) = ack_at_from(ack_any, limit)?;
+        diagnostics.extend(ack_diag);
+        ack_at
     } else {
-        // Non-pipeline: a valid `queueSize` sets the queue depth
-        // (pvxs sets `op->limit` regardless of pipeline); an invalid or
-        // absent one keeps the default depth 4. The pipeline credit
-        // window does not apply to a non-pipeline monitor, while
-        // `requested_queue_size` carries the squash override to the send
-        // loop.
-        let queue_size = match queue_size {
-            Some(n) if n >= 2 => n,
-            _ => 4,
-        };
-        // pvxs `servermon.cpp:541-543`: a PRESENT-but-invalid `queueSize`
-        // on a NON-pipeline monitor keeps the default depth and emits a
-        // Warn logRemote ("Unable to use …"). (Under pipeline the same
-        // case is the Reject above, not a Warn.) `requested_queue_size`
-        // is `Some` only for a valid `>= 2` value, so
-        // present + `None` == present-invalid.
-        if queue_size_present && requested_queue_size.is_none() {
-            let rendered = queue_size_field
-                .map(render_option_value)
-                .unwrap_or_default();
-            diagnostics.push(MonitorOptionDiag {
-                level: MessageType::Warning,
-                message: format!("Unable to use record._options.queueSize : {rendered}"),
-            });
-        }
-        PipelineOptions {
-            enabled: false,
-            queue_size,
-            requested_queue_size,
-            ack_at: 1,
-            diagnostics,
-        }
+        1
     };
-    Some(MonitorPipelineRequest::Options(opts))
+    Ok(MonitorPipelineRequest::Options(PipelineOptions {
+        enabled,
+        queue_size: limit,
+        ack_at,
+        diagnostics,
+    }))
 }
 
 #[derive(Clone)]
@@ -1269,15 +1219,6 @@ struct OpState {
     /// the event cause the iteration to continue without sending.
     /// Empty chain (the default) is a no-op.
     monitor_filters: Arc<epics_base_rs::server::database::filters::FilterChain>,
-    /// `record._options.autoExec` from the INIT pvRequest. pvxs
-    /// uses this purely client-side to decide whether to send the
-    /// PUT EXEC immediately after INIT or wait for an explicit
-    /// `reExec()` call (clientget.cpp:123). The server has no
-    /// queueing role — pvxs `serverget.cpp:488-492` calls `onPut`
-    /// the moment a CMD_PUT with !init arrives, regardless of the
-    /// client's autoExec setting. We keep the field for diagnostic
-    /// echoing but DO NOT gate write commits on it.
-    put_auto_exec: bool,
     /// full INIT pvRequest value (decoded). PVA PUT INIT
     /// carries per-operation options (`record._options.process` /
     /// `block`, etc.) that the data-phase payload does NOT carry.
@@ -1390,42 +1331,60 @@ struct MonitorPipelineCredit<'a> {
 }
 
 impl MonitorPipelineCredit<'_> {
-    /// Block until the pipeline window has a free slot, then consume one
-    /// credit for the DATA frame about to be sent and fire the LOW
+    /// True iff a DATA frame may be sent right now — the window holds a
+    /// credit, or this is a non-pipeline monitor (no window at all).
+    ///
+    /// This is pvxs `maybeReply`'s `(!op->pipeline || op->window)`
+    /// (`servermon.cpp:79-83`, echoed in `doReply` at `:143`): an exhausted
+    /// window suppresses the REPLY, and nothing else. It must NOT be awaited
+    /// inside the event loop's select — pvxs keeps calling `doPost`, so a
+    /// stalled pipelined client goes on squashing into the negotiated queue.
+    /// Awaiting here instead stopped polling the source, buffering
+    /// `channel_capacity + limit` distinct updates and delivering them all on
+    /// resume.
+    fn available(&self) -> bool {
+        let Some(w) = self.window else {
+            return true;
+        };
+        w.load(std::sync::atomic::Ordering::Relaxed) > 0
+    }
+
+    /// Register for the next ACK refill, BEFORE the caller reads the window.
+    ///
+    /// Ordering is load-bearing: the ACK path increments the window and then
+    /// calls `Notify::notify_waiters()`, which stores NO permit. A waiter
+    /// registered after the window read would miss a refill that landed in
+    /// between and park forever with credit in hand. `enable()` registers
+    /// eagerly (`Notified` does not register until first polled), so arming
+    /// first and reading the window second cannot lose the wake-up in either
+    /// interleaving.
+    ///
+    /// `None` for a non-pipeline monitor — it is never credit-blocked, so it
+    /// never waits on this.
+    fn arm_refill(&self) -> Option<std::pin::Pin<Box<tokio::sync::futures::Notified<'_>>>> {
+        let n = self.window_notify?;
+        let mut notified = Box::pin(n.notified());
+        notified.as_mut().enable();
+        Some(notified)
+    }
+
+    /// Consume one credit for the DATA frame about to be sent and fire the LOW
     /// watermark on the above→below crossing. A no-op for a non-pipeline
     /// monitor (`window` is `None`).
     ///
-    /// Must be called exactly once per monitor DATA frame, AFTER the
-    /// pause / filter gates (a held or filtered event produces no wire
-    /// frame, so it must not consume a slot).
-    async fn acquire(&self) {
+    /// Must be called exactly once per monitor DATA frame, AFTER the pause /
+    /// filter gates (a held or filtered event produces no wire frame, so it
+    /// must not consume a slot) and only under [`Self::available`] — this is
+    /// the ONLY site that decrements the window (the ACK path only adds), so
+    /// the credit checked in the emit gate is still there.
+    fn take(&self) {
         use std::sync::atomic::Ordering;
-        let (Some(w), Some(n)) = (self.window, self.window_notify) else {
+        let Some(w) = self.window else {
             return;
         };
-        loop {
-            let cur = w.load(Ordering::Relaxed);
-            if cur > 0 {
-                if w.compare_exchange(cur, cur - 1, Ordering::Relaxed, Ordering::Relaxed)
-                    .is_ok()
-                {
-                    break;
-                }
-                continue;
-            }
-            // Window exhausted — wait for an ACK to refill. `enable()`
-            // registers the waiter eagerly so an ACK firing between the
-            // recheck and the await is captured (`Notify::notified()`
-            // does not register until first polled). Same pattern as
-            // `channel.rs::wait_until_inactive`.
-            let notified = n.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if w.load(Ordering::Relaxed) > 0 {
-                continue;
-            }
-            notified.await;
-        }
+        let _ = w.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+            Some(cur.saturating_sub(1))
+        });
         // LOW fires when consuming this credit drained the
         // window to `<= low` (pvxs `onLowMark`).
         // `cross_watermark` checks-and-marks the above→below crossing AND
@@ -1448,6 +1407,20 @@ impl MonitorPipelineCredit<'_> {
                 );
             }
         }
+    }
+}
+
+/// Await a pipeline-credit refill. Only ever polled from the emit loop's
+/// credit arm, which runs solely when the window is exhausted — and an
+/// exhausted window implies a pipeline monitor, so `refill` is `Some` there.
+/// A non-pipeline monitor is never credit-blocked; `pending()` makes that arm
+/// inert for it rather than spinning the loop.
+async fn wait_credit_refill(
+    refill: Option<std::pin::Pin<Box<tokio::sync::futures::Notified<'_>>>>,
+) {
+    match refill {
+        Some(n) => n.await,
+        None => std::future::pending().await,
     }
 }
 
@@ -1644,22 +1617,57 @@ impl Drop for MonitorStartControl {
     }
 }
 
+/// A monitor post that may be pvxs's **terminal** — its null `Value`.
+///
+/// pvxs's `doPost` (`servermon.cpp:270-283`) gates the append on
+/// `(mon->queue.size() < mon->limit) || force || !val`, so a terminal is
+/// ALWAYS `push_back`'d and grows the queue past `limit`; only a
+/// non-terminal post can reach the squash branch. Both FIFOs the port
+/// runs — the decoded [`crate::server_native::MonitorUpdate`] queue and
+/// the raw-forward [`crate::server_native::RawMonitorEvent`] queue —
+/// carry that boundary as `type_changed`, so the rule lives in
+/// [`push_squash_monitor`] behind this trait rather than at each call
+/// site: a caller cannot forget it.
+trait MonitorPost {
+    /// pvxs's `!val`.
+    fn is_terminal(&self) -> bool;
+}
+
+impl MonitorPost for crate::server_native::MonitorUpdate {
+    fn is_terminal(&self) -> bool {
+        self.type_changed
+    }
+}
+
+impl MonitorPost for crate::server_native::RawMonitorEvent {
+    fn is_terminal(&self) -> bool {
+        self.type_changed
+    }
+}
+
 /// Push one monitor event into the bounded FIFO, squashing the newest into the
 /// tail once the queue is full — the single producer rule covering both the
 /// INIT->START and STOP->START "Idle, accruing" windows AND the Executing
-/// burst. Models pvxs `servermon.cpp:271-287`: a post is appended as a DISTINCT
-/// queue entry while the queue holds fewer than `limit` entries; once full, the
-/// newest update is coalesced into the queue tail (unioning marked-leaf sets via
-/// [`coalesce_monitor_update`] on the decoded path). `limit` must be >= 1 so a
-/// tail always exists to squash into. Returns whether an overflow squash
-/// happened (diagnostic only).
-fn push_squash_monitor<T>(
+/// burst. Models pvxs `servermon.cpp:270-287`:
+///
+/// * a **terminal** post ([`MonitorPost::is_terminal`], pvxs's `!val`) is
+///   always appended, even past `limit` — pvxs delivers every queued update
+///   and *then* the FINISH, so the terminal must never destroy a real one;
+/// * otherwise a post is appended as a DISTINCT queue entry while the queue
+///   holds fewer than `limit` entries;
+/// * once full, a non-terminal post is coalesced into the queue tail
+///   (unioning marked-leaf sets via [`coalesce_monitor_update`] on the
+///   decoded path).
+///
+/// `limit` must be >= 1 so a tail always exists to squash into. Returns
+/// whether an overflow squash happened (diagnostic only).
+fn push_squash_monitor<T: MonitorPost>(
     pending: &mut std::collections::VecDeque<T>,
     ev: T,
     limit: usize,
     coalesce: impl Fn(T, T) -> T,
 ) -> bool {
-    if pending.len() < limit {
+    if ev.is_terminal() || pending.len() < limit {
         pending.push_back(ev);
         false
     } else {
@@ -1668,6 +1676,126 @@ fn push_squash_monitor<T>(
             .expect("len >= limit >= 1 guarantees a tail to squash into");
         pending.push_back(coalesce(tail, ev));
         true
+    }
+}
+
+/// The decoded monitor's bounded FIFO and the SINGLE owner of the enqueue
+/// transition — pvxs `ServerMonitorControl::doPost` (`servermon.cpp:239-289`).
+///
+/// Invariant: **an update reaches the queue only if it would produce a
+/// non-empty wire changed-bitset** (or it is the first post, or a terminal).
+/// pvxs decides that BEFORE touching the queue:
+///
+/// ```text
+/// bool real = mon->first;                       // always post the first update
+/// if(real) mon->first = false;
+/// else     real = testmask(val, mon->pvMask);   // else consider the mask
+/// if(real || !val) { ...queue or squash...; maybeReply(); }
+/// ```
+///
+/// A masked-out update is DROPPED, never queued: it neither occupies a slot
+/// in the negotiated FIFO nor coalesces a real update out of the tail. The
+/// port used to push every arrival straight into the FIFO, so an update whose
+/// marked leaves lay entirely outside the client's pvRequest mask both framed
+/// an empty-bitset frame and evicted a real update under back-pressure — the
+/// squash CONTENTS differed, not just the frame count.
+///
+/// [`Self::seed`] carries pvxs's `first`: the connect-time seed IS the first
+/// post, so it is exempt from the mask test (and clears `first`). A source
+/// with no seed leaves `first` set, so ITS first stream event is the exempt
+/// one — exactly `MonitorOp::first` ("set until first update queued").
+struct MonitorQueue<'a> {
+    pending: std::collections::VecDeque<crate::server_native::MonitorUpdate>,
+    /// The ONE negotiated squash limit (`MonitorOp::limit`).
+    limit: usize,
+    /// pvxs `MonitorOp::first` — set until the first update is queued.
+    first: bool,
+    intro: &'a FieldDesc,
+    /// The op's pvRequest selection mask (`MonitorOp::pvMask`).
+    mask: &'a BitSet,
+    /// The wire changed-bitset a `marked: None` post frames — pvxs's
+    /// fully-marked `Value` intersected with `pvMask`. It depends only on
+    /// `(intro, mask)`, so it is computed once here rather than per post.
+    /// Empty ⟺ the request selected no leaf, and then no unmarked post is
+    /// `real`.
+    unmarked_changed: BitSet,
+}
+
+impl<'a> MonitorQueue<'a> {
+    fn new(limit: usize, intro: &'a FieldDesc, mask: &'a BitSet) -> Self {
+        Self {
+            pending: std::collections::VecDeque::new(),
+            limit: limit.max(1),
+            first: true,
+            intro,
+            mask,
+            unmarked_changed: crate::pvdata::encode::canonical_changed_bitset(intro, mask),
+        }
+    }
+
+    /// Queue the connect-time seed as pvxs's first post: exempt from the mask
+    /// test, and it clears `first` so every later arrival is tested. The seed
+    /// carries the leaves the source declared it assigned
+    /// ([`crate::server_native::source::SourceRead`]), so the START frame is
+    /// framed by the same rule as every update.
+    fn seed(&mut self, initial: crate::server_native::source::SourceRead) {
+        self.first = false;
+        self.pending
+            .push_back(crate::server_native::MonitorUpdate::from(initial));
+    }
+
+    /// pvxs `doPost`. Returns whether the update was queued (`false` = dropped
+    /// by the mask test, i.e. `real == false`).
+    fn push(&mut self, ev: crate::server_native::MonitorUpdate) -> bool {
+        if !self.real(&ev) {
+            return false;
+        }
+        self.first = false;
+        push_squash_monitor(&mut self.pending, ev, self.limit, coalesce_monitor_update);
+        true
+    }
+
+    /// pvxs's `real || !val`: the first post and a terminal (pvxs's null Value
+    /// — here the `type_changed` boundary, which MUST survive to become the
+    /// MONITOR FINISH) always queue; anything else must pass `testmask`
+    /// (`pvrequest.cpp:73-92`) — at least one marked bit inside `pvMask`.
+    ///
+    /// `testmask` is a LEAF test, on both arms. It scans `store[idx].valid`,
+    /// and `Value::mark` (`data.cpp:256-270`) sets `valid` on the marked field
+    /// and on the *enclosing tops* of a struct-array element — never on a
+    /// parent `Struct` node. So a `pvMask` covering only structure bits can
+    /// never satisfy it, however much the source marked: `field(alarm.bogus)`
+    /// selects `{0, alarm}` (`request2mask` matches the existing `alarm`
+    /// struct, finds no `alarm.bogus`, and pre-sets the always-permitted bit
+    /// 0), and pvxs stays silent for the life of that subscription.
+    ///
+    /// The gate is therefore the frame's own changed-bitset — the SAME value
+    /// the payload builder about to serialize this update computes, on either
+    /// arm ([`read_changed_bitset`]: `marked_wire_changed_bitset` for a
+    /// declared leaf set, `canonical_changed_bitset` for a wholly-changed
+    /// post). That makes
+    /// `gate == wire` an invariant: an admitted update always frames a
+    /// non-empty changed-bitset, and a leafless mask frames none because it
+    /// queues none.
+    fn real(&self, ev: &crate::server_native::MonitorUpdate) -> bool {
+        if self.first || ev.type_changed {
+            return true;
+        }
+        match ev.marked.as_ref() {
+            Some(paths) => {
+                !crate::pvdata::encode::marked_wire_changed_bitset(self.intro, paths, self.mask)
+                    .is_empty()
+            }
+            None => !self.unmarked_changed.is_empty(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    fn pop(&mut self) -> Option<crate::server_native::MonitorUpdate> {
+        self.pending.pop_front()
     }
 }
 
@@ -1818,15 +1946,25 @@ fn spawn_monitor_subscriber(
             .await;
 
         // ---------------- RAW FAST PATH ----------------
-        if raw_path_eligible
-            && let Some(seed_raw) = src
-                .subscribe_raw_seeded(
-                    mon_checked.clone(),
-                    mon_ctx.clone(),
-                    monitor_options.clone(),
-                )
-                .await
-        {
+        let raw_seed = if raw_path_eligible {
+            src.subscribe_raw_seeded(
+                mon_checked.clone(),
+                mon_ctx.clone(),
+                monitor_options.clone(),
+            )
+            .await
+        } else {
+            None
+        };
+        // Emit whatever the source recorded while opening the subscription
+        // (pvxs `singlesource.cpp:129` — `record._options.DBE` selecting an
+        // empty mask), whether or not it produced a seed. pvxs logs from
+        // inside `onSubscribe`, i.e. before its `connect()` INIT reply; here
+        // the INIT reply is enqueued by the read loop that spawned this task,
+        // so the frame follows that reply. Same ioid, level and text — only
+        // the position relative to the INIT reply differs.
+        flush_remote_log(&mon_ctx.log, ioid, order_now(), &tx_clone).await;
+        if let Some(seed_raw) = raw_seed {
             let crate::server_native::source::SubscriptionSeed {
                 initial: seed_raw_initial,
                 updates: mut rx_raw,
@@ -1861,7 +1999,8 @@ fn spawn_monitor_subscriber(
             // The connect-time seed (a decoded snapshot, emitted cooked)
             // and the accrued raw window are both Executing-gated; the seed is
             // emitted first, ahead of the backlog.
-            let mut seed_cooked: Option<PvField> = seed_raw_initial;
+            let mut seed_cooked: Option<crate::server_native::source::SourceRead> =
+                seed_raw_initial;
             let mut pending: std::collections::VecDeque<crate::server_native::RawMonitorEvent> =
                 std::collections::VecDeque::new();
             let mut source_open = true;
@@ -1932,7 +2071,12 @@ fn spawn_monitor_subscriber(
                                     .store(live_v, std::sync::atomic::Ordering::Release);
                             }
                             let payload = build_monitor_payload(
-                                ioid, &intro_clone, &initial, &mask_clone, order_now(),
+                                ioid,
+                                &intro_clone,
+                                &initial.value,
+                                initial.marked.as_deref(),
+                                &mask_clone,
+                                order_now(),
                             );
                             if tx_clone.send(payload).await.is_err() {
                                 return;
@@ -1982,14 +2126,19 @@ fn spawn_monitor_subscriber(
         }
 
         // ---------------- DECODED PATH ----------------
-        let Some(seed) = src
+        let seed = src
             .subscribe_seeded(
                 mon_checked.clone(),
                 mon_ctx.clone(),
                 monitor_options.clone(),
             )
-            .await
-        else {
+            .await;
+        // Same source-diagnostic drain as the raw path above: the source may
+        // have recorded a `record._options` warning while opening this
+        // subscription, and it must reach the client even when the
+        // subscription itself failed to open.
+        flush_remote_log(&mon_ctx.log, ioid, order_now(), &tx_clone).await;
+        let Some(seed) = seed else {
             return;
         };
         let crate::server_native::source::SubscriptionSeed {
@@ -2044,27 +2193,17 @@ fn spawn_monitor_subscriber(
                     .store(live_v0, std::sync::atomic::Ordering::Release);
             }
         }
-        let emits_partial = src.monitor_emits_partial(&pv_name).await;
-        let mut prev_value: Option<PvField> = None;
-
-        // Bounded FIFO: the connect-time seed is `pending[0]` (the
-        // consumer emits it first at START, ahead of the accrued backlog) rather
-        // than an unconditional pre-loop send. The seed is pushed RAW — the
-        // consumer runs the `_filter` chain on every pending item (so the seed
-        // is filtered exactly once, like epics-base `dbChannelRunPreChain`; a
-        // gating filter that drops it suppresses the initial frame, a transform
-        // mismatch tears the monitor down with an error). `prev_value` is NOT
-        // set here — the seed must emit FULL (the consumer sets `prev_value`
-        // after emitting, so event #2 onward is partial).
-        let mut pending: std::collections::VecDeque<crate::server_native::MonitorUpdate> =
-            std::collections::VecDeque::new();
+        // Bounded FIFO, owned by [`MonitorQueue`] (pvxs `doPost`): the
+        // connect-time seed is `pending[0]` (the consumer emits it first at
+        // START, ahead of the accrued backlog) rather than an unconditional
+        // pre-loop send. The seed is pushed RAW — the consumer runs the
+        // `_filter` chain on every pending item (so the seed is filtered
+        // exactly once, like epics-base `dbChannelRunPreChain`; a gating filter
+        // that drops it suppresses the initial frame, a transform mismatch
+        // tears the monitor down with an error).
+        let mut pending = MonitorQueue::new(queue_limit, &intro_clone, &mask_clone);
         if let Some(initial) = seed_initial {
-            pending.push_back(crate::server_native::MonitorUpdate {
-                value: initial,
-                marked: None,
-                type_changed: false,
-                overrun: Vec::new(),
-            });
+            pending.seed(initial);
         }
 
         let mut source_open = true;
@@ -2082,22 +2221,37 @@ fn spawn_monitor_subscriber(
             if !source_open && executing && pending.is_empty() {
                 break;
             }
+            // Arm the credit-refill waiter BEFORE reading the window (see
+            // `arm_refill`: the ACK's `notify_waiters()` leaves no permit, so
+            // registering after the read could lose the wake-up).
+            let refill = credit.arm_refill();
+            // pvxs `maybeReply`/`doReply`: an exhausted pipeline window
+            // suppresses the REPLY only (`servermon.cpp:79-83,143`). It must
+            // not suppress the DRAIN — `doPost` keeps squashing into the
+            // negotiated queue while the client owes ACKs. So this is an emit
+            // GATE, not an await inside the arm: `rx.recv()` stays polled and
+            // a stalled pipelined client coalesces at `limit` instead of
+            // making the port buffer `channel_capacity + limit` distinct
+            // updates and deliver them all on resume.
+            let has_credit = credit.available();
             tokio::select! {
                 biased;
                 r = rx.recv(), if source_open => {
                     match r {
                         Some(ev) => {
-                            push_squash_monitor(&mut pending, ev, queue_limit, coalesce_monitor_update);
+                            pending.push(ev);
                             while let Ok(e) = rx.try_recv() {
-                                push_squash_monitor(&mut pending, e, queue_limit, coalesce_monitor_update);
+                                pending.push(e);
                             }
                         }
                         None => source_open = false,
                     }
                 }
                 _ = exec_rx.changed() => {}
-                _ = std::future::ready(()), if executing && !pending.is_empty() => {
-                    let mut value = pending.pop_front().expect("guarded non-empty");
+                // Re-evaluate the gate when an ACK refills the window.
+                _ = wait_credit_refill(refill), if !has_credit => {}
+                _ = std::future::ready(()), if executing && has_credit && !pending.is_empty() => {
+                    let mut value = pending.pop().expect("guarded non-empty");
                     // Subscription boundary (upstream descriptor change): emit
                     // MONITOR FINISH and end — the decoded counterpart of the raw
                     // path's `type_changed` branch.
@@ -2154,26 +2308,26 @@ fn spawn_monitor_subscriber(
                         }
                     };
                     // Pipeline window: consume one credit AFTER the pause/filter
-                    // gates (pvxs `servermon.cpp:192`). No-op for a non-pipeline
-                    // monitor. For a pipeline monitor with no credit this awaits;
-                    // the source then backpressures at the `updates` channel
-                    // (sized >= queue_limit) instead of squashing — a documented
-                    // pipeline-starvation residual orthogonal to the accrual FIFO.
-                    credit.acquire().await;
-                    let payload = if let Some(paths) = marked.as_ref() {
-                        build_monitor_payload_marked(
-                            ioid, &intro_clone, &value, paths, &mask_clone, order_now(),
-                        )
-                    } else if let Some(prev) = prev_value.as_ref() {
-                        build_monitor_payload_partial(
-                            ioid, &intro_clone, &value, prev, &mask_clone, order_now(),
-                        )
-                    } else {
-                        build_monitor_payload(ioid, &intro_clone, &value, &mask_clone, order_now())
-                    };
-                    if emits_partial {
-                        prev_value = Some(value.clone());
-                    }
+                    // gates (pvxs `servermon.cpp:192`) — a held or filtered event
+                    // produces no wire frame, so it must not consume a slot. The
+                    // credit was checked by the arm's `has_credit` gate and this
+                    // is the only decrementer, so it is still there. No-op for a
+                    // non-pipeline monitor.
+                    credit.take();
+                    // A source that declares its marked leaves frames exactly
+                    // those (pvxs `to_wire_valid(R, ent, &pvMask)`); one that
+                    // declares none posts a wholly-changed value, which is
+                    // pvxs's fully-marked `Value` — the full request mask.
+                    // There is no third form: the port does not reconstruct a
+                    // marked set by diffing snapshots, which pvxs never does.
+                    let payload = build_monitor_payload(
+                        ioid,
+                        &intro_clone,
+                        &value,
+                        marked.as_deref(),
+                        &mask_clone,
+                        order_now(),
+                    );
                     if tx_clone.send(payload).await.is_err() {
                         return;
                     }
@@ -2856,10 +3010,6 @@ fn parse_client_credentials(
         authority: String::new(),
         roles: Vec::new(),
     };
-    let pos = cur.position();
-    let peek = cur
-        .get_u8()
-        .map_err(|e| PvaError::Decode(format!("CONN_VALIDATION auth desc peek: {e}")))?;
     // A leading `0xFF` is the pvxs "null type" tag: the auth Value carries
     // no `user`/`host` fields. pvxs `serverconn.cpp:223-231` only sets
     // method/account inside the `auth["user"]` callback, so a null body
@@ -2868,16 +3018,16 @@ fn parse_client_credentials(
     // a null-auth "ca" handshake as `method="ca", account=""` and skipped
     // the shared ca-requires-user rule below — fall through with an empty
     // account so both the null and empty-structure paths take one rule.
-    if peek != 0xFF {
-        // Rewind and decode the real descriptor.
-        cur.set_position(pos);
-        // Route through the connection-scope decode cache so a client that
-        // advertises its auth structure with a `0xFD <slot>` define here can
-        // later reference it by `0xFE <slot>` from a pvRequest/EXEC body, and
-        // vice versa — pvxs shares one connection `rxRegistry` (conn.h:23)
-        // across every inbound decode, including CONNECTION_VALIDATION.
-        let desc = decode_type_desc_cached(&mut cur, order, decode_cache)
+    //
+    // Routed through the connection-scope decode cache so a client that
+    // advertises its auth structure with a `0xFD <slot>` define here can
+    // later reference it by `0xFE <slot>` from a pvRequest/EXEC body, and
+    // vice versa — pvxs shares one connection `rxRegistry` (conn.h:23)
+    // across every inbound decode, including CONNECTION_VALIDATION.
+    let auth_desc =
+        crate::pvdata::encode::decode_type_desc_cached_opt(&mut cur, order, decode_cache)
             .map_err(|e| PvaError::Decode(format!("CONN_VALIDATION auth desc: {e}")))?;
+    if let Some(desc) = auth_desc {
         let value = decode_pv_field_cached(&desc, &mut cur, order, decode_cache)
             .map_err(|e| PvaError::Decode(format!("CONN_VALIDATION auth value: {e}")))?;
         if let PvField::Structure(s) = value {
@@ -3973,6 +4123,50 @@ fn decode_init_pv_request_value(
     Ok(if exhausted { None } else { Some(value) })
 }
 
+/// Decode an INIT pvRequest (`type + full value`) — the single owner of the
+/// INIT pvRequest wire shape for every op kind (GET / PUT / MONITOR / RPC /
+/// PUT_GET / PROCESS / ARRAY).
+///
+/// pvxs `from_wire_type_value` (`dataencode.cpp:747-753`):
+///
+/// ```c
+/// from_wire_type(buf, ctxt, val);
+/// if(buf.good() && val)
+///     from_wire_full(buf, ctxt, val);
+/// ```
+///
+/// A NULL (`0xFF`) type code is legal here and is NOT a wire fault: it leaves
+/// the descriptor list empty with the buffer still good (`dataencode.cpp:
+/// 79-80`), `from_wire_type` yields an invalid `Value` (`:737-744`), and the
+/// `if(... && val)` guard skips the value body. The INIT then passes
+/// `serverget.cpp:366-376` / `servermon.cpp:491-503`, which check only
+/// `!M.good()`, and the invalid pvRequest becomes the all-fields wildcard in
+/// `request2mask` (`pvrequest.cpp:53-55`). It is the exact byte pvxs's own
+/// `to_wire(Buf&, const FieldDesc*)` writes for a null descriptor
+/// (`dataencode.cpp:29-33`).
+///
+/// Rejecting it (as `decode_type_desc_cached` does, by design) tore down the
+/// whole TCP circuit — killing every other channel and operation multiplexed
+/// on it — where pvxs replies with a normal INIT success.
+///
+/// A present-but-malformed descriptor, or a non-null descriptor whose value
+/// body is truncated, is still the `!M.good()` fault the callers turn into a
+/// connection reset.
+fn decode_init_pv_request(
+    cur: &mut std::io::Cursor<&[u8]>,
+    order: ByteOrder,
+    decode_cache: &mut TypeCache,
+) -> Result<(Option<FieldDesc>, Option<PvField>), String> {
+    let Some(req_desc) =
+        crate::pvdata::encode::decode_type_desc_cached_opt(cur, order, decode_cache)
+            .map_err(|e| format!("invalid pvRequest descriptor: {e}"))?
+    else {
+        return Ok((None, None));
+    };
+    let req_value = decode_init_pv_request_value(cur, &req_desc, order, decode_cache)?;
+    Ok((Some(req_desc), req_value))
+}
+
 /// Decode an RPC EXEC argument body (`type + full value`), keeping the
 /// "parameterless" case structurally distinct from the "malformed"
 /// case.
@@ -4015,18 +4209,17 @@ fn decode_rpc_exec_arg(
     if cur.position() as usize >= cur.get_ref().len() {
         return Ok((FieldDesc::Variant, PvField::Null));
     }
-    // NULL (0xFF) type code: parameterless RPC (pvxs interop). Peek so
-    // we can consume exactly the one byte without depending on
-    // `decode_type_desc`'s error-vs-consume behaviour for 0xFF.
-    if cur.get_ref()[cur.position() as usize] == 0xFF {
-        cur.set_position(cur.position() + 1);
+    // NULL (0xFF) type code: parameterless RPC (pvxs interop). Routed through
+    // `decode_type_desc_cached_opt`, the single owner of the NULL-type rule,
+    // rather than a local peek.
+    let Some(desc) = crate::pvdata::encode::decode_type_desc_cached_opt(cur, order, decode_cache)
+        .map_err(|e| format!("invalid RPC argument descriptor: {e}"))?
+    else {
         return Ok((FieldDesc::Variant, PvField::Null));
-    }
-    // Present, non-null descriptor: decode type + full value or fail
-    // fatally — a present-but-undecodable body is a protocol error, not
-    // a parameterless call.
-    let desc = decode_type_desc_cached(cur, order, decode_cache)
-        .map_err(|e| format!("invalid RPC argument descriptor: {e}"))?;
+    };
+    // Present, non-null descriptor: decode the full value or fail fatally —
+    // a present-but-undecodable body is a protocol error, not a
+    // parameterless call.
     let value = decode_pv_field_cached(&desc, cur, order, decode_cache)
         .map_err(|e| format!("invalid RPC argument value: {e}"))?;
     Ok((desc, value))
@@ -4051,7 +4244,6 @@ fn non_monitor_op_state(intro: FieldDesc, kind: OpKind, mask: BitSet) -> OpState
         monitor_wm_seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         monitor_op_id: next_op_id(),
         monitor_filters: Arc::new(epics_base_rs::server::database::filters::FilterChain::new()),
-        put_auto_exec: true,
         pv_request: None,
         monitor_options: crate::server_native::source::MonitorOptions::default(),
         data_task_abort: None,
@@ -4130,7 +4322,7 @@ async fn handle_put_get(
             OpKind::PutGet,
             ioid,
             subcmd,
-            "PUT_GET not served (serve_put_get disabled for pvxs compatibility)",
+            Status::error("PUT_GET not served (serve_put_get disabled for pvxs compatibility)"),
             order,
         )
         .await?;
@@ -4159,7 +4351,7 @@ async fn handle_put_get(
                 OpKind::PutGet,
                 ioid,
                 subcmd,
-                "unknown channel sid",
+                Status::error("unknown channel sid"),
                 order,
             )
             .await?;
@@ -4192,7 +4384,7 @@ async fn handle_put_get(
                 OpKind::PutGet,
                 ioid,
                 subcmd,
-                "max ops per channel exceeded",
+                Status::error("max ops per channel exceeded"),
                 order,
             )
             .await?;
@@ -4207,7 +4399,7 @@ async fn handle_put_get(
                     OpKind::PutGet,
                     ioid,
                     subcmd,
-                    "must provide prototype",
+                    Status::error("must provide prototype"),
                     order,
                 )
                 .await?;
@@ -4219,21 +4411,11 @@ async fn handle_put_get(
         // A peer wire-decode fault of the INIT pvRequest type/value is
         // connection-fatal (pvxs `serverget.cpp:371-375` bev.reset()), not
         // a per-op Status — the empty-mask case below stays op-level.
-        let req_desc = match decode_type_desc_cached(&mut cur, inbound_order, decode_cache) {
-            Ok(d) => d,
-            Err(e) => {
-                return Err(PvaError::Decode(format!(
-                    "PUT_GET INIT pvRequest descriptor: {e}"
-                )));
-            }
-        };
-        let req_value =
-            match decode_init_pv_request_value(&mut cur, &req_desc, inbound_order, decode_cache) {
+        let (req_desc, req_value) =
+            match decode_init_pv_request(&mut cur, inbound_order, decode_cache) {
                 Ok(v) => v,
                 Err(e) => {
-                    return Err(PvaError::Decode(format!(
-                        "PUT_GET INIT pvRequest value: {e}"
-                    )));
+                    return Err(PvaError::Decode(format!("PUT_GET INIT pvRequest: {e}")));
                 }
             };
         // ChannelPutGet negotiates TWO field selections at INIT: the
@@ -4246,7 +4428,8 @@ async fn handle_put_get(
         // fallback collapses both to the common `field` selection
         // (modules/pvAccess/testApp/remote/testServer.cpp), so the common NT
         // round trip is unchanged. An empty selection is an INIT error.
-        let (put_mask, get_mask) = match crate::pv_request::put_get_masks(&intro, &req_desc) {
+        let (put_mask, get_mask) = match crate::pv_request::put_get_masks(&intro, req_desc.as_ref())
+        {
             Ok(masks) => masks,
             Err(e) => {
                 send_chan_op_error(
@@ -4254,7 +4437,7 @@ async fn handle_put_get(
                     OpKind::PutGet,
                     ioid,
                     subcmd,
-                    &format!("invalid pvRequest mask: {e}"),
+                    Status::error(format!("invalid pvRequest mask: {e}")),
                     order,
                 )
                 .await?;
@@ -4330,7 +4513,7 @@ async fn handle_put_get(
                 OpKind::PutGet,
                 ioid,
                 subcmd,
-                "operation not initialised",
+                Status::error("operation not initialised"),
                 order,
             )
             .await?;
@@ -4394,6 +4577,7 @@ async fn handle_put_get(
         authority: cred.authority.clone(),
         roles: cred.roles.clone(),
         pv_request: init_pv_request,
+        log: Default::default(),
     };
 
     let src = source.clone();
@@ -4425,6 +4609,9 @@ async fn handle_put_get(
         let mut payload = Vec::new();
         payload.put_u32(ioid, order);
         payload.put_u8(subcmd);
+        // The source's `RemoteLogger` sink for this op, kept alive past the
+        // moves below so its diagnostics can be flushed before the reply.
+        let op_log = ctx.log.clone();
 
         // putGet (0x00) is the atomic WRITE+READ round trip; getGet/getPut
         // (read-only) carry no put payload and only read back. The default
@@ -4436,7 +4623,11 @@ async fn handle_put_get(
         // separately-read cached get. The read-only legs stay a plain
         // READ-gated `get_value_checked`. A panic in either user handler
         // becomes an error reply instead of skipping the reply below.
-        let read_value: Result<Option<PvField>, String> =
+        // The error slot holds the `Status` this reply will carry, not text:
+        // a source fronting a remote (the gateway) reports its upstream's own
+        // Status, and rendering it to a string here is what put a Rust `{:?}`
+        // dump on the wire (R18-27).
+        let read_value: Result<Option<crate::server_native::source::SourceRead>, Status> =
             if let Some((changed, put_delta)) = put_payload {
                 let checked = src
                     .access_gate()
@@ -4459,8 +4650,8 @@ async fn handle_put_get(
                 .await
                 {
                     Ok(Ok(v)) => Ok(v),
-                    Ok(Err(e)) => Err(e.to_string()),
-                    Err(panic) => Err(panic),
+                    Ok(Err(e)) => Err(e.wire_status()),
+                    Err(panic) => Err(Status::error(panic)),
                 }
             } else {
                 let read_checked = src
@@ -4474,20 +4665,26 @@ async fn handle_put_get(
                         &ctx.authority,
                     )
                     .await;
-                catch_handler_panic(src.get_value_checked(read_checked, ctx)).await
+                catch_handler_panic(src.read_checked(read_checked, ctx))
+                    .await
+                    .map_err(Status::error)
             };
 
+        flush_remote_log(&op_log, ioid, order, &tx_clone).await;
+
         match read_value {
-            Ok(Some(v)) => {
+            Ok(Some(read)) => {
                 Status::ok().write_into(order, &mut payload);
                 // Project the read-back value by this leg's selection mask
                 // (getPut → put-leg, putGet/getGet → get-leg). See the
-                // `readback_mask` derivation above.
+                // `readback_mask` derivation above), narrowed to the leaves
+                // the source actually assigned — pvxs `to_wire_valid(R, value,
+                // &pvMask)` frames the readback exactly like a GET reply.
                 let wire_changed =
-                    crate::pvdata::encode::canonical_changed_bitset(&intro, &readback_mask);
+                    read_changed_bitset(&intro, &readback_mask, read.marked.as_deref());
                 wire_changed.write_into(order, &mut payload);
                 crate::pvdata::encode::encode_pv_field_with_bitset(
-                    &v,
+                    &read.value,
                     &intro,
                     &wire_changed,
                     0,
@@ -4500,7 +4697,7 @@ async fn handle_put_get(
                 let empty = BitSet::with_capacity(intro.total_bits());
                 empty.write_into(order, &mut payload);
             }
-            Err(msg) => Status::error(msg).write_into(order, &mut payload),
+            Err(status) => status.write_into(order, &mut payload),
         }
         let h = PvaHeader::application(true, order, Command::PutGet.code(), payload.len() as u32);
         let mut buf = Vec::new();
@@ -4585,7 +4782,7 @@ async fn handle_process(
                 OpKind::Process,
                 ioid,
                 subcmd,
-                "unknown channel sid",
+                Status::error("unknown channel sid"),
                 order,
             )
             .await?;
@@ -4618,7 +4815,7 @@ async fn handle_process(
                 OpKind::Process,
                 ioid,
                 subcmd,
-                "max ops per channel exceeded",
+                Status::error("max ops per channel exceeded"),
                 order,
             )
             .await?;
@@ -4637,7 +4834,7 @@ async fn handle_process(
                     OpKind::Process,
                     ioid,
                     subcmd,
-                    "must provide prototype",
+                    Status::error("must provide prototype"),
                     order,
                 )
                 .await?;
@@ -4646,7 +4843,7 @@ async fn handle_process(
         };
         // route the PROCESS INIT pvRequest through the SAME
         // structured boundary as the generic GET/PUT/MONITOR INIT path
-        // (`decode_init_pv_request_value`). PROCESS transfers no value,
+        // (`decode_init_pv_request`). PROCESS transfers no value,
         // but the create-time pvRequest carries `record._options` a
         // provider can interpret (and a gateway must forward through
         // `createChannelProcess(..., pvRequest)`, pva2pva
@@ -4662,23 +4859,13 @@ async fn handle_process(
         // descriptor or value is connection-fatal (the read loop closes
         // the circuit, no op reply), uniform with the generic INIT path.
         // A non-null descriptor that needs value bytes but ends before them
-        // is the same fault (see `decode_init_pv_request_value`); only the
-        // all-empty-structs default selector legitimately has a 0-byte body.
-        let req_desc = match decode_type_desc_cached(&mut cur, inbound_order, decode_cache) {
-            Ok(d) => d,
-            Err(e) => {
-                return Err(PvaError::Decode(format!(
-                    "PROCESS INIT pvRequest descriptor: {e}"
-                )));
-            }
-        };
-        let req_value =
-            match decode_init_pv_request_value(&mut cur, &req_desc, inbound_order, decode_cache) {
+        // is the same fault; only the all-empty-structs default selector
+        // (and the NULL `0xFF` descriptor) legitimately has a 0-byte body.
+        let (_req_desc, req_value) =
+            match decode_init_pv_request(&mut cur, inbound_order, decode_cache) {
                 Ok(v) => v,
                 Err(e) => {
-                    return Err(PvaError::Decode(format!(
-                        "PROCESS INIT pvRequest value: {e}"
-                    )));
+                    return Err(PvaError::Decode(format!("PROCESS INIT pvRequest: {e}")));
                 }
             };
         let mask = BitSet::all_set(intro.total_bits());
@@ -4737,6 +4924,7 @@ async fn handle_process(
         // — and a gateway forwarding createChannelProcess(..., pvRequest)
         // — can inspect `record._options`.
         pv_request: init_pv_request,
+        log: Default::default(),
     };
     let src = source.clone();
     let tx_clone = chan_tx.clone();
@@ -4777,17 +4965,19 @@ async fn handle_process(
             .await;
         // a panic in the user PROCESS handler becomes an error
         // reply instead of skipping the reply below.
+        let op_log = ctx.log.clone();
         let result = catch_handler_panic(src.process_checked(checked, ctx))
             .await
             .map_err(|e| OpError::failed(e))
             .and_then(|r| r);
+        flush_remote_log(&op_log, ioid, order, &tx_clone).await;
 
         let mut payload = Vec::new();
         payload.put_u32(ioid, order);
         payload.put_u8(subcmd);
         match result {
             Ok(()) => Status::ok().write_into(order, &mut payload),
-            Err(msg) => Status::error(msg).write_into(order, &mut payload),
+            Err(e) => e.wire_status().write_into(order, &mut payload),
         }
         let h = PvaHeader::application(true, order, Command::Process.code(), payload.len() as u32);
         let mut buf = Vec::new();
@@ -4910,7 +5100,7 @@ async fn handle_channel_array(
                 OpKind::Array,
                 ioid,
                 subcmd,
-                "unknown channel sid",
+                Status::error("unknown channel sid"),
                 order,
             )
             .await?;
@@ -4937,7 +5127,7 @@ async fn handle_channel_array(
                 OpKind::Array,
                 ioid,
                 subcmd,
-                "max ops per channel exceeded",
+                Status::error("max ops per channel exceeded"),
                 order,
             )
             .await?;
@@ -4948,20 +5138,13 @@ async fn handle_channel_array(
         // descriptor, or a non-null descriptor that needs value bytes but
         // ends before them, is a connection-fatal peer wire fault (pvxs
         // `from_wire_type_value`); only the all-empty-structs default
-        // selector legitimately has a 0-byte value body.
-        let req_desc = match decode_type_desc_cached(&mut cur, inbound_order, decode_cache) {
-            Ok(d) => d,
-            Err(e) => {
-                return Err(PvaError::Decode(format!(
-                    "ARRAY INIT pvRequest descriptor: {e}"
-                )));
-            }
-        };
-        let req_value =
-            match decode_init_pv_request_value(&mut cur, &req_desc, inbound_order, decode_cache) {
+        // selector (and the NULL `0xFF` descriptor) legitimately has a
+        // 0-byte value body.
+        let (_req_desc, req_value) =
+            match decode_init_pv_request(&mut cur, inbound_order, decode_cache) {
                 Ok(v) => v,
                 Err(e) => {
-                    return Err(PvaError::Decode(format!("ARRAY INIT pvRequest value: {e}")));
+                    return Err(PvaError::Decode(format!("ARRAY INIT pvRequest: {e}")));
                 }
             };
         let ctx = crate::server_native::source::ChannelContext {
@@ -4972,6 +5155,7 @@ async fn handle_channel_array(
             authority: cred.authority.clone(),
             roles: cred.roles.clone(),
             pv_request: req_value.clone(),
+            log: Default::default(),
         };
         // INIT resolves the array field's introspection (or refuses). No
         // access check here — pvAccessCPP gates per sub-op, not at create.
@@ -5008,8 +5192,15 @@ async fn handle_channel_array(
                 // Not supported / resolution failure: reply with the error
                 // Status on the INIT frame (pvAccessCPP `send`: a creation
                 // error still answers QOS_INIT). No op registered.
-                send_chan_op_error(&chan_tx, OpKind::Array, ioid, subcmd, &e.message, order)
-                    .await?;
+                send_chan_op_error(
+                    &chan_tx,
+                    OpKind::Array,
+                    ioid,
+                    subcmd,
+                    e.wire_status(),
+                    order,
+                )
+                .await?;
             }
         }
         return Ok(());
@@ -5028,7 +5219,7 @@ async fn handle_channel_array(
                 OpKind::Array,
                 ioid,
                 subcmd,
-                "bad request id",
+                Status::error("bad request id"),
                 order,
             )
             .await?;
@@ -5091,6 +5282,7 @@ async fn handle_channel_array(
         roles: cred.roles.clone(),
         // INIT pvRequest re-supplied so the source knows the bound field.
         pv_request: init_pv_request,
+        log: Default::default(),
     };
     let src = source.clone();
     let tx_clone = chan_tx.clone();
@@ -5108,7 +5300,7 @@ async fn handle_channel_array(
                 OpKind::Array,
                 ioid,
                 subcmd,
-                "other request pending",
+                Status::error("other request pending"),
                 order,
             )
             .await?;
@@ -5140,6 +5332,7 @@ async fn handle_channel_array(
             .await;
         // A panic in the (user / gateway) source handler becomes an error
         // reply instead of a skipped reply.
+        let op_log = ctx.log.clone();
         let result: Result<ChannelArrayReply, OpError> = match sub_op {
             ChannelArraySubOp::Get {
                 offset,
@@ -5174,6 +5367,7 @@ async fn handle_channel_array(
                     .map(ChannelArrayReply::Length)
             }
         };
+        flush_remote_log(&op_log, ioid, order, &tx_clone).await;
 
         let mut payload = Vec::new();
         payload.put_u32(ioid, order);
@@ -5191,7 +5385,7 @@ async fn handle_channel_array(
                     }
                 }
             }
-            Err(e) => Status::error(e.message).write_into(order, &mut payload),
+            Err(e) => e.wire_status().write_into(order, &mut payload),
         }
         let h = PvaHeader::application(true, order, Command::Array.code(), payload.len() as u32);
         let mut buf = Vec::new();
@@ -5469,6 +5663,7 @@ fn channel_lifecycle_ctx(
         authority: cred.authority.clone(),
         roles: cred.roles.clone(),
         pv_request: None,
+        log: Default::default(),
     }
 }
 
@@ -6108,7 +6303,7 @@ async fn handle_op(
                 kind,
                 ioid,
                 subcmd,
-                "max ops per channel exceeded",
+                Status::error("max ops per channel exceeded"),
                 order,
             )
             .await?;
@@ -6132,7 +6327,7 @@ async fn handle_op(
                     kind,
                     ioid,
                     subcmd,
-                    "must provide prototype",
+                    Status::error("must provide prototype"),
                     order,
                 )
                 .await?;
@@ -6152,50 +6347,92 @@ async fn handle_op(
         // connection-fatal `Decode` error (the read loop closes the
         // circuit) instead of a per-op Status that left a malformed-INIT
         // peer free to keep reusing the connection. The EMPTY-MASK case
-        // below is different — pvxs builds the mask inside the source's
-        // `onOp` (`serverget.cpp:198-203`), whose throw is caught and
-        // signalled as a remote *op* error (`serverget.cpp:407-413`),
-        // so that stays an op-level Status reply.
-        let req_desc = match decode_type_desc_cached(&mut cur, inbound_order, decode_cache) {
-            Ok(d) => d,
-            Err(e) => {
-                return Err(PvaError::Decode(format!("INIT pvRequest descriptor: {e}")));
-            }
-        };
-        // VALUE body: read per pvxs `from_wire_full`. The Rust client's
+        // below is different — see the `request_to_mask` arm.
+        //
+        // The VALUE body is read per pvxs `from_wire_full`. The Rust client's
         // default selectors (and RPC INIT) send a descriptor whose
         // sub-structures are all empty (`pv_request::build`), so the value
         // body is legitimately 0 bytes and decodes fine — no "absent body"
         // exception is needed. A non-null descriptor that needs value bytes
         // but ends before them is the same `!M.good()` bev.reset() wire
-        // fault as the descriptor above, so it is likewise connection-fatal.
-        let req_value =
-            match decode_init_pv_request_value(&mut cur, &req_desc, inbound_order, decode_cache) {
+        // fault as a malformed descriptor, so it is likewise connection-fatal.
+        // A NULL (`0xFF`) descriptor is NOT a fault — see
+        // `decode_init_pv_request`.
+        let (req_desc, req_value) =
+            match decode_init_pv_request(&mut cur, inbound_order, decode_cache) {
                 Ok(v) => v,
                 Err(e) => {
-                    return Err(PvaError::Decode(format!("INIT pvRequest value: {e}")));
+                    return Err(PvaError::Decode(format!("INIT pvRequest: {e}")));
                 }
             };
-        let mask = match crate::pv_request::request_to_mask(&intro, &req_desc) {
-            Ok(m) => m,
-            Err(e) => {
-                // The only variant today is `EmptyMask`: pvRequest
-                // selected no field that exists in the value
-                // descriptor (e.g. `field(noSuch)`). pvxs treats
-                // this as an INIT-level error
-                // (`pvrequest.cpp:61-62`). Pre-fix Rust silently
-                // fell back to all-fields, leaking fields the client
-                // didn't request.
-                send_chan_op_error(
-                    &chan_tx,
-                    kind,
-                    ioid,
-                    subcmd,
-                    &format!("invalid pvRequest mask: {e}"),
-                    order,
-                )
-                .await?;
-                return Ok(());
+        // An RPC is never masked. pvxs `serverget.cpp:402` connects it with a
+        // default-constructed (falsy) prototype — `ctrl->connect(Value())` —
+        // so `ServerGPRConnect::connect`'s `if(prototype)` arm
+        // (`serverget.cpp:198-201`) never runs and `request2mask()` is not
+        // invoked for CMD_RPC at all. The reply is written whole
+        // (`to_wire(R, desc(value)) + to_wire_full(R, value)`,
+        // `serverget.cpp:105-109`), never through `pvMask`, so the op carries
+        // no selection mask. Running `request_to_mask` here rejected every
+        // RPC whose pvRequest named a field (`RPCBuilder::pvRequest("field(
+        // value)")`, or a gateway forwarding a downstream pvRequest) with
+        // `EmptyMask` — the RPC prototype is `FieldDesc::Variant`, which
+        // matches no named selector — where pvxs answers `Status{}` and runs
+        // the call.
+        let mask = if kind == OpKind::Rpc {
+            crate::proto::BitSet::new()
+        } else {
+            match crate::pv_request::request_to_mask(&intro, req_desc.as_ref()) {
+                Ok(m) => m,
+                Err(e) => {
+                    // The only variant today is `EmptyMask`: pvRequest
+                    // selected no field that exists in the value
+                    // descriptor (e.g. `field(noSuch)`). pvxs raises it
+                    // as `throw std::runtime_error("pvRequest must select
+                    // at least one field")` (`pvrequest.cpp:61-62`), from
+                    // inside `request2mask()` — which runs in
+                    // `Server{GPR,Monitor}Setup::connect()`
+                    // (`serverget.cpp:200`, `servermon.cpp:402`), i.e.
+                    // inside the *source's* connect callback, never in the
+                    // protocol handler. Who catches it is therefore the
+                    // source's choice, and pvxs's own hosting API catches
+                    // it on both legs:
+                    //   GET/PUT — `serverget.cpp:406-412` wraps
+                    //     `chan->onOp(...)` in try/catch and signals a
+                    //     remote *op* error.
+                    //   MONITOR — `servermon.cpp:591-592` calls
+                    //     `chan->onSubscribe(...)` UNGUARDED, but the only
+                    //     library source, `SharedPV::Impl::connectSub`
+                    //     (`sharedpv.cpp:76,94-101`), catches around
+                    //     `conn->connect()` and calls `conn->error(msg)`
+                    //     ("not re-throwing for consistency") — an op-level
+                    //     Status reply with the circuit left up. pvxs's own
+                    //     regression for this throw (`test/testget.cpp:
+                    //     380-393`, SharedPV mailbox, `.field("invalid")`)
+                    //     asserts exactly that remote error.
+                    // So an op-level Status is the parity behaviour and this
+                    // is deliberately NOT a fatal `PvaError`. The circuit
+                    // reset one can observe against a C QSRV IOC comes from
+                    // QSRV's sources alone (`ioc/singlesource.cpp:147`,
+                    // `ioc/groupsource.cpp:399` call `connect()` bare, so the
+                    // throw unwinds through `servermon.cpp:592` into
+                    // `conn.cpp:277-282`'s `bev.reset()`): one client's typo'd
+                    // pvRequest drops the shared TCP circuit carrying every
+                    // other channel on it. That is an upstream C++ defect, not
+                    // a contract to port.
+                    //
+                    // Pre-fix Rust silently fell back to all-fields, leaking
+                    // fields the client didn't request.
+                    send_chan_op_error(
+                        &chan_tx,
+                        kind,
+                        ioid,
+                        subcmd,
+                        Status::error(format!("invalid pvRequest mask: {e}")),
+                        order,
+                    )
+                    .await?;
+                    return Ok(());
+                }
             }
         };
 
@@ -6206,31 +6443,61 @@ async fn handle_op(
         // bug for default `pvmonitor` callers (initial snapshot + 4
         // window credits). Without pipeline=true we don't gate the
         // emit loop — mpsc backpressure remains the only limiter.
-        let pipeline_req = req_value.as_ref().and_then(monitor_pipeline_options);
-        // The client-requested `queueSize` overrides the server's default
-        // monitor queue depth for THIS operation, whether or not pipeline
-        // flow control is enabled (pvxs `op->limit = qSize` sits outside
-        // `if(op->pipeline)`, servermon.cpp:533-543). Captured before
-        // `pipeline_req` is consumed by the move below; `None` means the
-        // server keeps its configured `monitor_queue_depth`.
-        let requested_queue_size = match &pipeline_req {
-            Some(MonitorPipelineRequest::Options(o)) => o.requested_queue_size,
-            _ => None,
+        //
+        // pvxs reads `record._options.{pipeline,queueSize,ackAny}` only inside
+        // `handle_MONITOR` (`servermon.cpp:523-582`); GET/PUT/PUT_GET/RPC never
+        // look at them. Parse them for MONITOR only, so every outcome of the
+        // reader — including the `NoConvert` throw below — is scoped to the one
+        // command pvxs parses them for.
+        //
+        // That throw is pvxs's third outcome, and the only one that is not a
+        // reply: `:556` runs `ackAny.as<std::string>()`, which no `copyOut` arm
+        // satisfies for an array / struct / unselected-union `ackAny`. Nothing
+        // catches between there and `conn.cpp:277-282`, which logs and calls
+        // `bev.reset()` — the circuit is dropped, with no INIT reply and no
+        // monitor. A fatal `PvaError` out of this read loop IS that reset. The
+        // port used to log a Crit CMD_MESSAGE and serve the monitor on with
+        // `ackAt = 1` (R9-33).
+        let pipeline_req = match req_value.as_ref().filter(|_| kind == OpKind::Monitor) {
+            Some(v) => Some(
+                monitor_pipeline_options(v, config.monitor_queue_limit()).map_err(|e| {
+                    PvaError::Decode(format!(
+                        "MONITOR INIT: record._options.ackAny is not convertible: {e}"
+                    ))
+                })?,
+            ),
+            None => None,
+        };
+        // The ONE negotiated per-op queue limit (pvxs `op->limit`): the
+        // server's per-op default unless a valid `record._options.queueSize`
+        // replaced it, whether or not pipeline flow control is enabled
+        // (`op->limit = qSize` sits outside `if(op->pipeline)`,
+        // servermon.cpp:533-543). Captured before `pipeline_req` is consumed
+        // by the move below — and read from the Options REGARDLESS of
+        // `enabled`, because the limit is not a pipeline property.
+        let negotiated_limit = match &pipeline_req {
+            Some(MonitorPipelineRequest::Options(o)) => o.queue_size,
+            _ => config.monitor_queue_limit(),
         };
         // pvxs `servermon.cpp:537-540`: a MONITOR pipeline request whose
-        // PRESENT `queueSize` is invalid (`<2`/unparseable) is a
+        // PRESENT `queueSize` is invalid (`<2` or unconvertible) is a
         // negotiation error — reject the INIT (`ctrl->error(...)` +
         // `return`) instead of silently downgrading to a non-pipeline
         // monitor. GET/PUT/RPC never negotiate pipeline (pvxs
         // `serverget` ignores these options), so the reject is
-        // monitor-only.
-        if kind == OpKind::Monitor && matches!(pipeline_req, Some(MonitorPipelineRequest::Reject)) {
+        // monitor-only. The text is pvxs's, carrying the offending value;
+        // the port used to append an invented "(must be >= 2)" and to reach
+        // this path for values pvxs's conversion accepts (a real, a hex or
+        // octal string).
+        if kind == OpKind::Monitor
+            && let Some(MonitorPipelineRequest::Reject(msg)) = &pipeline_req
+        {
             send_chan_op_error(
                 &chan_tx,
                 kind,
                 ioid,
                 subcmd,
-                "can not pipeline invalid queueSize (must be >= 2)",
+                Status::error(msg.to_string()),
                 order,
             )
             .await?;
@@ -6324,7 +6591,7 @@ async fn handle_op(
                                 kind,
                                 ioid,
                                 subcmd,
-                                &format!("invalid channel filter: {e}"),
+                                Status::error(format!("invalid channel filter: {e}")),
                                 order,
                             )
                             .await?;
@@ -6336,17 +6603,6 @@ async fn handle_op(
             }
         } else {
             Arc::new(epics_base_rs::server::database::filters::FilterChain::new())
-        };
-
-        // pvxs autoExec is purely client-side timing control
-        // (clientget.cpp:123 — controls when the client sends the
-        // PUT EXEC frame). The server-side handler runs onPut
-        // unconditionally on every CMD_PUT !init regardless of
-        // autoExec. We parse the option for diagnostic echo only.
-        let put_auto_exec = if kind == OpKind::Put {
-            put_autoexec_from_request(req_value.as_ref()).unwrap_or(true)
-        } else {
-            true
         };
 
         // Stash the INIT pvRequest so the data-phase
@@ -6376,7 +6632,7 @@ async fn handle_op(
         let monitor_options = if kind == OpKind::Monitor {
             crate::server_native::source::MonitorOptions {
                 pipeline: pipeline_opt.is_some(),
-                queue_size: requested_queue_size,
+                queue_size: negotiated_limit,
                 server_filter: !monitor_filters.is_empty(),
             }
         } else {
@@ -6400,6 +6656,67 @@ async fn handle_op(
             None
         };
 
+        // pvxs runs the SOURCE's `record._options` read at the top of
+        // `onSubscribe` — before `connect()` emits the INIT reply — through the
+        // THROWING `Value::as<T>()` (`ioc/singlesource.cpp:117-140`). An option
+        // whose storage no `copyOut` arm converts raises `NoConvert`, nothing
+        // catches it on the way out of `handle_MONITOR`, and
+        // `conn.cpp:277-282` calls `bev.reset()`. The port opens the
+        // subscription at START, not INIT, so the failing half of `onSubscribe`
+        // is its own INIT-time hook: `check_monitor_request`. (R9-35.)
+        //
+        // DEVIATION from C++, deliberate — CBUG-C2. QSRV's `bev.reset()` is a
+        // per-operation failure escalated to a transport reset: one client's
+        // malformed `record._options` drops the shared TCP circuit, and with it
+        // every OTHER channel multiplexed on it. Through a gateway that is one
+        // user's field typo disconnecting every other user. So the hook's `Err`
+        // is an `OpError`, answered here the same way as the pvRequest-mask
+        // failure above: an INIT reply carrying an error `Status`, the op left
+        // unregistered, the circuit and its other channels untouched. This is
+        // also what pvxs's OWN library source does for the same throw
+        // (`sharedpv.cpp:94-101` catches around `connect()` and calls
+        // `conn->error(msg)`); only QSRV's sources leave it bare.
+        if kind == OpKind::Monitor {
+            let init_ctx = crate::server_native::source::ChannelContext {
+                peer,
+                account: cred.account.clone(),
+                method: cred.method.clone(),
+                host: cred.host.clone(),
+                authority: cred.authority.clone(),
+                roles: cred.roles.clone(),
+                pv_request: req_value.clone(),
+                log: Default::default(),
+            };
+            let checked = source
+                .access_gate()
+                .check_with_roles(
+                    &ch.name,
+                    &init_ctx.host,
+                    &init_ctx.account,
+                    &init_ctx.roles,
+                    &init_ctx.method,
+                    &init_ctx.authority,
+                )
+                .await;
+            if let Err(e) = source.check_monitor_request(&checked, &init_ctx).await {
+                send_chan_op_error(&chan_tx, kind, ioid, subcmd, e.wire_status(), order).await?;
+                return Ok(());
+            }
+            // R10-37: the source's `onSubscribe` diagnostics are INIT-time.
+            // pvxs records them INSIDE `onSubscribe` — `singlesource.cpp:129`'s
+            // `record._options.DBE=… selects empty mask` is written before
+            // `connect()` emits the INIT reply — so the client sees the
+            // CMD_MESSAGE ahead of that reply. The port opens the subscription
+            // at START, and used to let this hook parse against a discarded log
+            // and re-parse at START to log there, putting the message AFTER the
+            // INIT reply (and emitting it for group / native-PVA channels, whose
+            // pvxs sources never read DBE at all). Draining here, before the
+            // reply is built, is pvxs's order. Only on the Ok path: the failing
+            // DBE returns above with an error INIT reply, and pvxs's throw
+            // likewise happens before its logRemote, so it logs nothing either.
+            flush_remote_log(&init_ctx.log, ioid, order, &chan_tx).await;
+        }
+
         ch.ops.insert(
             ioid,
             OpState {
@@ -6417,7 +6734,6 @@ async fn handle_op(
                 monitor_wm_seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
                 monitor_op_id: next_op_id(),
                 monitor_filters,
-                put_auto_exec,
                 pv_request: stashed_pv_request,
                 monitor_options,
                 data_task_abort: None,
@@ -6437,16 +6753,15 @@ async fn handle_op(
         // DESTROY-before-START always tears the upstream down.
         if kind == OpKind::Monitor {
             let pv_name = ch.name.clone();
-            // Per-op squash threshold: the client-requested
-            // `record._options.queueSize` (captured at INIT into
-            // `monitor_options.queue_size`) overrides the server-wide default,
-            // matching pvxs `op->limit = qSize` for both pipeline and plain
-            // monitors (servermon.cpp:533-543).
+            // Per-op squash threshold: the negotiated limit resolved at INIT
+            // (`monitor_options.queue_size` — the server's per-op default
+            // unless a valid `record._options.queueSize` replaced it). pvxs
+            // squashes against that one `op->limit` for pipeline and plain
+            // monitors alike (`queue.size() < limit`, servermon.cpp:273).
             let queue_depth = ch
                 .ops
                 .get(&ioid)
-                .and_then(|s| s.monitor_options.queue_size)
-                .map(|n| n as usize)
+                .map(|s| s.monitor_options.queue_size as usize)
                 .unwrap_or(config.monitor_queue_depth);
             let high_watermark = config.monitor_high_watermark;
             // Read the per-op state back out of the just-inserted `OpState`
@@ -6465,6 +6780,7 @@ async fn handle_op(
                     authority: cred.authority.clone(),
                     roles: cred.roles.clone(),
                     pv_request: s.pv_request.clone(),
+                    log: Default::default(),
                 };
                 MonitorSubscriberArgs {
                     sid,
@@ -6625,6 +6941,7 @@ async fn handle_op(
                     authority: cred_authority,
                     roles: cred_roles,
                     pv_request: init_pv_request_t,
+                    log: Default::default(),
                 };
                 let checked = src
                     .access_gate()
@@ -6639,7 +6956,10 @@ async fn handle_op(
                     .await;
                 // a panic in the user GET handler becomes a
                 // data-phase error reply instead of skipping the reply below.
-                let value = match catch_handler_panic(src.get_value_checked(checked, ctx)).await {
+                let op_log = ctx.log.clone();
+                let got = catch_handler_panic(src.read_checked(checked, ctx)).await;
+                flush_remote_log(&op_log, ioid, order, &tx_clone).await;
+                let read = match got {
                     Ok(Some(v)) => v,
                     Ok(None) => {
                         let _ = send_chan_op_error(
@@ -6647,27 +6967,35 @@ async fn handle_op(
                             OpKind::Get,
                             ioid,
                             subcmd,
-                            "PV not found",
+                            Status::error("PV not found"),
                             order,
                         )
                         .await;
                         return;
                     }
                     Err(msg) => {
-                        let _ =
-                            send_chan_op_error(&tx_clone, OpKind::Get, ioid, subcmd, &msg, order)
-                                .await;
+                        let _ = send_chan_op_error(
+                            &tx_clone,
+                            OpKind::Get,
+                            ioid,
+                            subcmd,
+                            Status::error(msg.to_string()),
+                            order,
+                        )
+                        .await;
                         return;
                     }
                 };
                 // source-side mismatch gate.
-                if let Err(e) = crate::pvdata::value_matches_descriptor(&value, &intro_t) {
+                if let Err(e) = crate::pvdata::value_matches_descriptor(&read.value, &intro_t) {
                     let _ = send_chan_op_error(
                         &tx_clone,
                         OpKind::Get,
                         ioid,
                         subcmd,
-                        &format!("source value does not match opened descriptor: {e}"),
+                        Status::error(format!(
+                            "source value does not match opened descriptor: {e}"
+                        )),
                         order,
                     )
                     .await;
@@ -6677,10 +7005,13 @@ async fn handle_op(
                 payload.put_u32(ioid, order);
                 payload.put_u8(subcmd);
                 Status::ok().write_into(order, &mut payload);
-                let changed = crate::pvdata::encode::canonical_changed_bitset(&intro_t, &mask_t);
+                // pvxs `serverget.cpp:104`: `to_wire_valid(R, value, &pvMask)`
+                // — the leaves the source assigned into the reply value, not
+                // every leaf the request selected.
+                let changed = read_changed_bitset(&intro_t, &mask_t, read.marked.as_deref());
                 changed.write_into(order, &mut payload);
                 crate::pvdata::encode::encode_pv_field_with_bitset(
-                    &value,
+                    &read.value,
                     &intro_t,
                     &changed,
                     0,
@@ -6758,6 +7089,7 @@ async fn handle_op(
                         authority: cred_authority,
                         roles: cred_roles,
                         pv_request: init_pv_request_t,
+                        log: Default::default(),
                     };
                     let checked = src
                         .access_gate()
@@ -6773,8 +7105,10 @@ async fn handle_op(
                     // a panic in the user GET (PUT readback)
                     // handler becomes a data-phase error reply instead of
                     // skipping the reply below.
-                    let value = match catch_handler_panic(src.get_value_checked(checked, ctx)).await
-                    {
+                    let op_log = ctx.log.clone();
+                    let got = catch_handler_panic(src.read_checked(checked, ctx)).await;
+                    flush_remote_log(&op_log, ioid, order, &tx_clone).await;
+                    let read = match got {
                         Ok(Some(v)) => v,
                         Ok(None) => {
                             let _ = send_chan_op_error(
@@ -6782,7 +7116,7 @@ async fn handle_op(
                                 OpKind::Put,
                                 ioid,
                                 subcmd,
-                                "PV not found",
+                                Status::error("PV not found"),
                                 order,
                             )
                             .await;
@@ -6794,7 +7128,7 @@ async fn handle_op(
                                 OpKind::Put,
                                 ioid,
                                 subcmd,
-                                &msg,
+                                Status::error(msg.to_string()),
                                 order,
                             )
                             .await;
@@ -6805,11 +7139,10 @@ async fn handle_op(
                     payload.put_u32(ioid, order);
                     payload.put_u8(subcmd);
                     Status::ok().write_into(order, &mut payload);
-                    let changed =
-                        crate::pvdata::encode::canonical_changed_bitset(&intro_t, &mask_t);
+                    let changed = read_changed_bitset(&intro_t, &mask_t, read.marked.as_deref());
                     changed.write_into(order, &mut payload);
                     crate::pvdata::encode::encode_pv_field_with_bitset(
-                        &value,
+                        &read.value,
                         &intro_t,
                         &changed,
                         0,
@@ -6905,7 +7238,13 @@ async fn handle_op(
                     authority: cred_authority,
                     roles: cred_roles,
                     pv_request: init_pv_request_t,
+                    log: Default::default(),
                 };
+                // The source's `RemoteLogger` sink for this PUT, drained onto
+                // the wire below before the reply (pvxs
+                // `groupsource.cpp:560` / `iocsource.cpp:447` warn from
+                // inside the PUT and reply afterwards).
+                let op_log = ctx.log.clone();
                 let result = {
                     let checked = src
                         .access_gate()
@@ -6931,6 +7270,7 @@ async fn handle_op(
                     .map_err(|e| OpError::failed(e))
                     .and_then(|r| r)
                 };
+                flush_remote_log(&op_log, ioid, order, &tx_clone).await;
                 let mut payload = Vec::new();
                 payload.put_u32(ioid, order);
                 payload.put_u8(subcmd);
@@ -6961,9 +7301,10 @@ async fn handle_op(
                             // a panic in the user GET (PUT_GET
                             // readback) handler becomes an error reply instead
                             // of skipping the reply below.
-                            match catch_handler_panic(src.get_value_checked(read_checked, ctx))
-                                .await
-                            {
+                            let readback =
+                                catch_handler_panic(src.get_value_checked(read_checked, ctx)).await;
+                            flush_remote_log(&op_log, ioid, order, &tx_clone).await;
+                            match readback {
                                 Ok(Some(v)) => {
                                     Status::ok().write_into(order, &mut payload);
                                     let bits = BitSet::all_set(intro_t.total_bits());
@@ -6987,8 +7328,8 @@ async fn handle_op(
                             true
                         }
                     }
-                    Err(msg) => {
-                        Status::error(msg).write_into(order, &mut payload);
+                    Err(e) => {
+                        e.wire_status().write_into(order, &mut payload);
                         false
                     }
                 };
@@ -7143,6 +7484,7 @@ async fn handle_op(
                         authority: cred.authority.clone(),
                         roles: cred.roles.clone(),
                         pv_request: None,
+                        log: Default::default(),
                     };
                     source.notify_watermark(
                         &ch.name,
@@ -7232,6 +7574,7 @@ async fn handle_op(
                 // above. A source (or gateway) can now inspect the
                 // create-time request (pvxs serverget.cpp:388-391).
                 pv_request: init_pv_request.clone(),
+                log: Default::default(),
             };
             // ignore a second RPC EXEC while the first call is in
             // flight rather than aborting it (pvxs `serverget.cpp:511-514`).
@@ -7267,6 +7610,7 @@ async fn handle_op(
                     .await;
                 // a panic in the user RPC handler becomes an error
                 // reply instead of skipping the reply below.
+                let op_log = rpc_ctx_val.log.clone();
                 let result = catch_handler_panic(src.rpc_checked(
                     rpc_checked,
                     req_desc,
@@ -7276,6 +7620,7 @@ async fn handle_op(
                 .await
                 .map_err(|e| OpError::failed(e))
                 .and_then(|r| r);
+                flush_remote_log(&op_log, ioid, order, &tx_clone).await;
 
                 let mut payload = Vec::new();
                 payload.put_u32(ioid, order);
@@ -7285,7 +7630,22 @@ async fn handle_op(
                 // `ServerGPR::doReply` cleans up a last_request RPC only after
                 // success and otherwise returns it to Idle (serverget.cpp:86-116).
                 let replied_ok = match result {
-                    Ok((resp_desc, resp_value)) => {
+                    // pvxs `serverget.cpp:105-109`:
+                    //     auto type = Value::Helper::desc(value);
+                    //     to_wire(R, type);
+                    //     if(value) to_wire_full(R, value);
+                    // — the descriptor is ALWAYS written, the value body only
+                    // when the reply carries one. `ExecOp::reply()` (the
+                    // no-argument overload, `srvcommon.h:108`) replies with a
+                    // default-constructed `Value`, so `desc()` is `nullptr`
+                    // and `to_wire(Buf&, const FieldDesc*)` writes the single
+                    // `0xFF` NULL type code (`dataencode.cpp:29-33`).
+                    Ok(RpcReply::Empty) => {
+                        Status::ok().write_into(order, &mut payload);
+                        payload.put_u8(crate::pvdata::encode::TAG_NULL);
+                        true
+                    }
+                    Ok(RpcReply::Value(resp_desc, resp_value)) => {
                         Status::ok().write_into(order, &mut payload);
                         // Spawned task cannot hold &mut EncodeTypeCache; use inline
                         // encode_type_desc (no cache) for RPC responses.
@@ -7293,8 +7653,8 @@ async fn handle_op(
                         encode_pv_field(&resp_value, &resp_desc, order, &mut payload);
                         true
                     }
-                    Err(msg) => {
-                        Status::error(msg).write_into(order, &mut payload);
+                    Err(e) => {
+                        e.wire_status().write_into(order, &mut payload);
                         false
                     }
                 };
@@ -7429,6 +7789,7 @@ async fn handle_get_field(
         authority: cred.authority.clone(),
         roles: cred.roles.clone(),
         pv_request: None,
+        log: Default::default(),
     };
     // The immutable borrow of `chan` ends here (all needed values cloned),
     // so we can take the mutable borrow to reserve the IOID.
@@ -7519,10 +7880,10 @@ async fn send_op_error(
     // data-phase error as an INIT response, so a client waiting for GET
     // data saw an unexpected INIT instead of the failure status.
     subcmd: u8,
-    msg: &str,
+    status: Status,
     order: ByteOrder,
 ) -> PvaResult<()> {
-    let buf = build_op_error_frame(kind, ioid, subcmd, msg, order);
+    let buf = build_op_error_frame(kind, ioid, subcmd, status, order);
     let _ = tx.send(buf).await;
     Ok(())
 }
@@ -7537,10 +7898,10 @@ async fn send_chan_op_error(
     kind: OpKind,
     ioid: u32,
     subcmd: u8,
-    msg: &str,
+    status: Status,
     order: ByteOrder,
 ) -> PvaResult<()> {
-    let buf = build_op_error_frame(kind, ioid, subcmd, msg, order);
+    let buf = build_op_error_frame(kind, ioid, subcmd, status, order);
     let _ = chan_tx.send(buf).await;
     Ok(())
 }
@@ -7553,14 +7914,14 @@ fn build_op_error_frame(
     kind: OpKind,
     ioid: u32,
     subcmd: u8,
-    msg: &str,
+    status: Status,
     order: ByteOrder,
 ) -> Vec<u8> {
     let cmd = kind.command();
     let mut payload = Vec::new();
     payload.put_u32(ioid, order);
     payload.put_u8(subcmd);
-    Status::error(msg.to_string()).write_into(order, &mut payload);
+    status.write_into(order, &mut payload);
     let h = PvaHeader::application(true, order, cmd.code(), payload.len() as u32);
     let mut buf = Vec::new();
     h.write_into(&mut buf);
@@ -7574,7 +7935,8 @@ fn build_op_error_frame(
 /// client decoder [`crate::client_native::server_conn`] (and is
 /// `ioid:u32 + mtype:u8 + message:string`); the client logs `Warning`
 /// (1) at `warn!` and `Fatal` (3) at `error!`. Used by the MONITOR INIT
-/// owner to surface [`MonitorOptionDiag`] negotiation diagnostics.
+/// owner to surface [`MonitorOptionDiag`] negotiation diagnostics, and
+/// by [`flush_remote_log`] to surface source-layer ones.
 fn build_message_frame(ioid: u32, level: MessageType, msg: &str, order: ByteOrder) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.put_u32(ioid, order);
@@ -7587,9 +7949,68 @@ fn build_message_frame(ioid: u32, level: MessageType, msg: &str, order: ByteOrde
     buf
 }
 
+/// Drain a source's per-operation [`RemoteLog`] onto the wire as
+/// IOID-tagged `CMD_MESSAGE` frames — the Rust half of pvxs
+/// `RemoteLogger::logRemote()` (`serverconn.cpp:146-160`), which the
+/// pvxs IOC source layer uses for "present but unusable option"
+/// diagnostics (`ioc/groupsource.cpp:560`, `ioc/singlesource.cpp:129`,
+/// `ioc/iocsource.cpp:447`).
+///
+/// The single owner of that transition: a source records, the
+/// connection emits. Called immediately after EVERY `ChannelSource` op
+/// call that carries an IOID and BEFORE that op's reply frame is
+/// enqueued, so a diagnostic always precedes the reply it qualifies —
+/// the order pvxs produces, where `logRemote` runs inside the source
+/// callback and the reply is sent when it returns.
+async fn flush_remote_log(
+    log: &crate::server_native::source::RemoteLog,
+    ioid: u32,
+    order: ByteOrder,
+    tx: &ChannelTx,
+) {
+    for m in log.take() {
+        if tx
+            .send(build_message_frame(ioid, m.level, &m.message, order))
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
 #[allow(unused_imports)]
 use crate::proto::ReadExt;
 const _: u8 = PVA_VERSION;
+
+/// **The one wire changed-bitset rule**, shared by every framed value the
+/// server sends — MONITOR data, the MONITOR seed, the GET reply, the PUT_GET
+/// readback. pvxs frames all of them with the identical call,
+/// `to_wire_valid(R, value, &pvMask)` (`servermon.cpp:174`,
+/// `serverget.cpp:104`): the leaves the source ASSIGNED, intersected with the
+/// request mask.
+///
+/// * `marked = Some(paths)` — the source declared what it assigned. Used by
+///   the QSRV sources: a group monitor marks its `+trigger` targets
+///   (`groupsource.cpp:288`, assigned-not-changed, so an unchanged leaf still
+///   carries), and a read marks what `IOCSource::initialize` + `IOCSource::get`
+///   actually wrote (`getProperties` never assigns `control.minStep`,
+///   `valueAlarm.active`, the four `valueAlarm.*Severity` leaves or
+///   `valueAlarm.hysteresis`).
+/// * `marked = None` — a wholly-assigned value (pvxs's fully-marked `Value`):
+///   every leaf the request selected.
+///
+/// `MonitorQueue::real` gates on this same computation, so an admitted post
+/// can never frame an empty changed-bitset.
+fn read_changed_bitset(intro: &FieldDesc, mask: &BitSet, marked: Option<&[String]>) -> BitSet {
+    match marked {
+        Some(paths) => crate::pvdata::encode::marked_wire_changed_bitset(intro, paths, mask),
+        // `mask` is a *selection* mask (request_to_mask) whose structure bits
+        // are permission bits — canonicalize it into pvxs's leaf-enumerated
+        // wire form (`to_wire_valid`, dataencode.cpp:414-439).
+        None => crate::pvdata::encode::canonical_changed_bitset(intro, mask),
+    }
+}
 
 /// Build a complete MONITOR data frame (header + payload) for a single value
 /// emission. Pulled out so the back-pressure squashing loop can call it.
@@ -7597,6 +8018,7 @@ fn build_monitor_payload(
     ioid: u32,
     intro: &FieldDesc,
     value: &PvField,
+    marked: Option<&[String]>,
     mask: &BitSet,
     order: ByteOrder,
 ) -> Vec<u8> {
@@ -7604,131 +8026,7 @@ fn build_monitor_payload(
     payload.put_u32(ioid, order);
     payload.put_u8(0x00);
     // PVA monitor data: changed bitset + partial value + overrun bitset.
-    // `mask` is a *selection* mask (request_to_mask) — canonicalize it
-    // into a wire changed-bitset so a partial field filter is not
-    // widened to the whole structure by a stray root/structure bit.
-    let changed = crate::pvdata::encode::canonical_changed_bitset(intro, mask);
-    changed.write_into(order, &mut payload);
-    crate::pvdata::encode::encode_pv_field_with_bitset(
-        value,
-        intro,
-        &changed,
-        0,
-        order,
-        &mut payload,
-    );
-    // pvxs `servermon.cpp:174-176` always writes a single 0x00 (empty
-    // BitSet) for the trailing overrun mask — `// TODO: placeholder for
-    // overrun mask` — regardless of any server-side squash. Emit that
-    // exact wire form: a server-computed overrun set makes a pvxs client
-    // set `servSquash=true` and bump `nSrvSquash` (clientmon.cpp:554-564),
-    // a counter that stays 0 against a real pvxs server.
-    BitSet::new().write_into(order, &mut payload);
-    let h = PvaHeader::application(true, order, Command::Monitor.code(), payload.len() as u32);
-    let mut buf = Vec::with_capacity(8 + payload.len());
-    h.write_into(&mut buf);
-    buf.extend_from_slice(&payload);
-    buf
-}
-
-/// build a MONITOR data frame whose wire changed-bitset is
-/// narrowed to exactly the leaves that differ between `prev` and
-/// `value`, intersected with the request `mask`.
-///
-/// This is the partial-update counterpart of [`build_monitor_payload`]
-/// — used for sources that emit partial updates (QSRV group monitor
-/// with a self-trigger). pvxs `servermon.cpp:174`
-/// `to_wire_valid(R, ent, &pvMask)` encodes the queued Value's own
-/// marked-changed bitset intersected with the request mask; here the
-/// marked set is reconstructed by structurally diffing consecutive
-/// snapshots ([`crate::pvdata::encode::diff_changed_bitset`]).
-///
-/// When the diff is empty (no leaf changed but the source still
-/// posted — e.g. an alarm-only re-post that decoded identically) the
-/// frame still carries an empty changed-bitset and no value bytes,
-/// matching pvxs posting an unmarked Value.
-fn build_monitor_payload_partial(
-    ioid: u32,
-    intro: &FieldDesc,
-    value: &PvField,
-    prev: &PvField,
-    mask: &BitSet,
-    order: ByteOrder,
-) -> Vec<u8> {
-    // Leaves that actually changed since the last emitted snapshot.
-    let diff = crate::pvdata::encode::diff_changed_bitset(intro, prev, value);
-    // Intersect the diff with the request selection mask so a client
-    // that subscribed to a field subset never sees leaves outside it
-    // (pvxs intersects with `pvMask`).
-    let mut selected = BitSet::new();
-    for bit in diff.iter() {
-        if mask.get(bit) {
-            selected.set(bit);
-        }
-    }
-
-    let mut payload = Vec::new();
-    payload.put_u32(ioid, order);
-    payload.put_u8(0x00);
-    // Canonicalize so a fully-selected subtree collapses to its
-    // structure bit exactly as `build_monitor_payload` does.
-    let changed = crate::pvdata::encode::canonical_changed_bitset(intro, &selected);
-    changed.write_into(order, &mut payload);
-    crate::pvdata::encode::encode_pv_field_with_bitset(
-        value,
-        intro,
-        &changed,
-        0,
-        order,
-        &mut payload,
-    );
-    // pvxs `servermon.cpp:174-176` always writes a single 0x00 (empty
-    // BitSet) for the trailing overrun mask — `// TODO: placeholder for
-    // overrun mask` — regardless of any server-side squash. Emit that
-    // exact wire form: a server-computed overrun set makes a pvxs client
-    // set `servSquash=true` and bump `nSrvSquash` (clientmon.cpp:554-564),
-    // a counter that stays 0 against a real pvxs server.
-    BitSet::new().write_into(order, &mut payload);
-    let h = PvaHeader::application(true, order, Command::Monitor.code(), payload.len() as u32);
-    let mut buf = Vec::with_capacity(8 + payload.len());
-    h.write_into(&mut buf);
-    buf.extend_from_slice(&payload);
-    buf
-}
-
-/// build a MONITOR data frame whose wire changed-bitset
-/// is the explicit set of `marked_paths` (a QSRV group `+trigger`
-/// target set), intersected with the request `mask`.
-///
-/// Unlike [`build_monitor_payload_partial`], which reconstructs the
-/// marked set by diffing consecutive snapshots and so only marks
-/// leaves that *changed*, this marks each target field whether or not
-/// its value differs — pvxs `groupsource.cpp:288` refreshes and marks
-/// every `+trigger` target (assigned-not-changed).
-fn build_monitor_payload_marked(
-    ioid: u32,
-    intro: &FieldDesc,
-    value: &PvField,
-    marked_paths: &[String],
-    mask: &BitSet,
-    order: ByteOrder,
-) -> Vec<u8> {
-    // Selection = every leaf under each marked target path.
-    let target = crate::pvdata::encode::marked_changed_bitset(intro, marked_paths);
-    // Intersect with the request mask so a client that subscribed to a
-    // field subset never sees leaves outside it (pvxs intersects with
-    // `pvMask`).
-    let mut selected = BitSet::new();
-    for bit in target.iter() {
-        if mask.get(bit) {
-            selected.set(bit);
-        }
-    }
-
-    let mut payload = Vec::new();
-    payload.put_u32(ioid, order);
-    payload.put_u8(0x00);
-    let changed = crate::pvdata::encode::canonical_changed_bitset(intro, &selected);
+    let changed = read_changed_bitset(intro, mask, marked);
     changed.write_into(order, &mut payload);
     crate::pvdata::encode::encode_pv_field_with_bitset(
         value,
@@ -7756,17 +8054,24 @@ fn build_monitor_payload_marked(
 /// squashes events under back-pressure or pause. The newer value wins;
 /// the marked-leaf sets union so the emitted frame still marks every
 /// field that changed across the coalesced burst. A `None` on either
-/// side means "no explicit set — derive by diff", which over-marks
-/// safely, so the union of `None` with anything stays `None`.
+/// side means "wholly assigned — every leaf the request selected", which
+/// over-marks safely, so the union of `None` with anything stays `None`.
 ///
-/// The squash also records OVERRUN: the dropped intermediate's distinct
-/// values are lost, so every leaf changed in BOTH the dropped older and
-/// the surviving newer update is added to the result's overrun set, and
-/// the two updates' own overrun sets union forward — pva2pva
-/// `moncache.cpp:160-168`. The cooked payload builders encode that set
-/// as the trailing overrun bitset so a lagging downstream learns it
-/// missed transitions (the decoded-path counterpart of the raw
-/// forwarder's bridge-local overrun marking).
+/// The squash also records OVERRUN in [`crate::server_native::MonitorUpdate`]:
+/// the dropped intermediate's distinct values are lost, so every leaf changed
+/// in BOTH the dropped older and the surviving newer update is added to the
+/// result's overrun set, and the two updates' own overrun sets union forward —
+/// pva2pva `moncache.cpp:160-168`.
+///
+/// That set does NOT reach the cooked wire, and must not: pvxs's server writes
+/// a hard-empty overrun bitset on every MONITOR data frame
+/// (`servermon.cpp:174-176`, `// TODO: placeholder for overrun mask`), so every
+/// cooked builder here writes one too — a server-computed overrun set makes a
+/// pvxs client set `servSquash` and bump `nSrvSquash` (`clientmon.cpp:554-564`),
+/// a counter that stays 0 against a real pvxs server. The only overrun bits the
+/// port puts on the wire are the ones the RAW forwarder decoded from an
+/// UPSTREAM server's frame (`build_raw_monitor_frame`), which it must carry
+/// through unchanged.
 ///
 /// A `type_changed` boundary must SURVIVE the squash: once the upstream
 /// descriptor changed, no value (squashed-old or post-boundary-new) may
@@ -8145,6 +8450,7 @@ mod tests {
             authority: String::new(),
             roles: Vec::new(),
             pv_request: None,
+            log: Default::default(),
         };
 
         // Dropping the guard fires exactly one Withdraw scoped to op 42.
@@ -8618,6 +8924,316 @@ mod tests {
         assert!(m.overrun.is_empty(), "boundary carries no overrun");
     }
 
+    /// R12-32 — the `testmask` gate. pvxs `doPost` decides `real` BEFORE
+    /// touching the queue (`servermon.cpp:252-268`): the first post always
+    /// goes through, every later one must have a marked leaf inside `pvMask`
+    /// (`testmask`, `pvrequest.cpp:73-92`), and a masked-out post is dropped
+    /// — it does NOT occupy a FIFO slot and so cannot coalesce a real update
+    /// out of the tail.
+    ///
+    /// Tested by invariant boundary: first-post exemption, marked-inside-mask,
+    /// marked-outside-mask, the unmarked (`marked: None`) post that pvxs sees
+    /// as fully marked, the terminal boundary, and the squash-contents case
+    /// where the drop is what keeps a real update alive.
+    #[test]
+    fn monitor_queue_drops_updates_outside_the_request_mask() {
+        // { value, alarm { severity } } — bits: 0 root, 1 value, 2 alarm,
+        // 3 alarm.severity.
+        let intro = FieldDesc::Structure {
+            struct_id: "epics:nt/NTScalar:1.0".into(),
+            fields: vec![
+                ("value".into(), FieldDesc::Scalar(ScalarType::Double)),
+                (
+                    "alarm".into(),
+                    FieldDesc::Structure {
+                        struct_id: "alarm_t".into(),
+                        fields: vec![("severity".into(), FieldDesc::Scalar(ScalarType::Int))],
+                    },
+                ),
+            ],
+        };
+        // The client asked for `field(value)` only.
+        let mut mask = BitSet::new();
+        mask.set(1);
+
+        let upd = |tag: i32, marked: &[&str]| crate::server_native::MonitorUpdate {
+            value: PvField::Scalar(ScalarValue::Int(tag)),
+            marked: Some(marked.iter().map(|s| s.to_string()).collect()),
+            type_changed: false,
+            overrun: Vec::new(),
+        };
+        let tags = |q: &MonitorQueue| {
+            q.pending
+                .iter()
+                .map(|u| u.value.clone())
+                .collect::<Vec<PvField>>()
+        };
+        let tag = |t: i32| PvField::Scalar(ScalarValue::Int(t));
+
+        // No seed: `first` is still set, so the FIRST post is exempt from the
+        // mask test even though `alarm.severity` lies outside `field(value)`.
+        let mut q = MonitorQueue::new(4, &intro, &mask);
+        assert!(
+            q.push(upd(1, &["alarm.severity"])),
+            "the first post is always queued (MonitorOp::first)"
+        );
+        // ...and every later masked-out post is dropped.
+        assert!(
+            !q.push(upd(2, &["alarm.severity"])),
+            "a post whose marked leaves lie outside pvMask must be dropped"
+        );
+        assert!(
+            q.push(upd(3, &["value"])),
+            "a post marking a selected leaf is queued"
+        );
+        assert_eq!(
+            tags(&q),
+            vec![tag(1), tag(3)],
+            "the masked-out post never entered the FIFO"
+        );
+
+        // A seeded op consumes the `first` exemption, so its very first stream
+        // event is already mask-tested.
+        let mut q = MonitorQueue::new(4, &intro, &mask);
+        q.seed(tag(0).into());
+        assert!(
+            !q.push(upd(1, &["alarm.severity"])),
+            "the seed IS pvxs's first post; the next event is mask-tested"
+        );
+        assert_eq!(tags(&q), vec![tag(0)], "only the seed is queued");
+
+        // A source that marks nothing posts a wholly-changed value — pvxs's
+        // fully-marked Value — so it passes `testmask` for any mask that
+        // selects at least one LEAF. `field(value)` does.
+        let mut q = MonitorQueue::new(4, &intro, &mask);
+        q.seed(tag(0).into());
+        assert!(
+            q.push(crate::server_native::MonitorUpdate {
+                value: tag(1),
+                marked: None,
+                type_changed: false,
+                overrun: Vec::new(),
+            }),
+            "an unmarked post is fully marked to pvxs; the mask selects a leaf"
+        );
+
+        // The terminal boundary is pvxs's null Value (`if(real || !val)`): it
+        // must queue regardless of the mask, or the MONITOR FINISH is lost.
+        let mut q = MonitorQueue::new(4, &intro, &mask);
+        q.seed(tag(0).into());
+        assert!(
+            q.push(crate::server_native::MonitorUpdate::type_change()),
+            "a descriptor boundary always queues"
+        );
+
+        // R13-34: the terminal on a FULL FIFO. pvxs's append gate is
+        // `(mon->queue.size() < mon->limit) || force || !val`
+        // (servermon.cpp:270-283) — a terminal is ALWAYS push_back'd and
+        // grows the queue PAST `limit`. It must never reach the squash
+        // branch, which would pop the newest real update and coalesce the
+        // terminal over it (`coalesce_monitor_update` returns a bare
+        // `type_change()` whenever either side is `type_changed`).
+        //
+        // pvxs delivers all `limit` queued updates and THEN the FINISH;
+        // pre-fix the port delivered `limit - 1` and the FINISH.
+        let mut q = MonitorQueue::new(2, &intro, &mask);
+        q.seed(tag(0).into());
+        assert!(q.push(upd(1, &["value"])), "fills the FIFO to limit=2");
+        assert_eq!(tags(&q), vec![tag(0), tag(1)], "FIFO is full");
+        assert!(
+            q.push(crate::server_native::MonitorUpdate::type_change()),
+            "a terminal always queues, even on a full FIFO"
+        );
+        assert_eq!(
+            q.pending.len(),
+            3,
+            "the terminal grows the queue past limit=2 (pvxs push_back)"
+        );
+        assert_eq!(
+            tags(&q),
+            vec![tag(0), tag(1), PvField::Null],
+            "both real updates survive and the terminal trails them — it must \
+             not squash the newest one out of the tail"
+        );
+        assert!(
+            q.pending[2].type_changed,
+            "the terminal is the last entry, delivered after every real update"
+        );
+
+        // Squash CONTENTS: with limit 2 and the FIFO already full, a
+        // masked-out post must not coalesce the real tail. Pre-fix it took a
+        // slot and overwrote `value=3` with `value=4`.
+        let mut q = MonitorQueue::new(2, &intro, &mask);
+        q.seed(tag(0).into());
+        q.push(upd(3, &["value"]));
+        assert!(!q.push(upd(4, &["alarm.severity"])), "masked out → dropped");
+        assert_eq!(
+            tags(&q),
+            vec![tag(0), tag(3)],
+            "a masked-out post must not squash a real update out of the tail"
+        );
+    }
+
+    /// R14-31 — the enqueue gate and the wire changed-bitset must be ONE
+    /// computation. pvxs's `testmask` (`pvrequest.cpp:73-92`) scans
+    /// `store[idx].valid && mask[idx]`, and only leaves ever carry `valid`,
+    /// so its gate ranges over exactly the bits `to_wire_valid` emits. A
+    /// mask can hold a STRUCTURE bit with no leaf under it — `field(
+    /// timeStamp.bogus)`, a client typo: `request2mask` marks the matched
+    /// `timeStamp` structure and the non-existent child selects nothing.
+    /// Gating on the raw marked bitset (which carries structure bits) admits
+    /// such a post and then frames an EMPTY changed-bitset at full event
+    /// rate, where pvxs sends nothing at all.
+    ///
+    /// R15-32 extends this to the `marked: None` arm, which used to be waved
+    /// through unconditionally: `testmask` is a leaf test whatever the source
+    /// marked, so a leafless mask silences the subscription for a fully-marked
+    /// `Value` too.
+    ///
+    /// Tested per boundary, on BOTH arms (declared leaf set / no leaf set):
+    /// mask with a structure bit but no leaf (drop, and the frame that was
+    /// avoided is provably empty), and a mask that does select a leaf below it
+    /// (admit, and the frame carries exactly that leaf).
+    #[test]
+    fn monitor_queue_drops_a_post_whose_wire_bitset_would_be_empty() {
+        // { value, timeStamp { secondsPastEpoch, nanoseconds } } — bits:
+        // 0 root, 1 value, 2 timeStamp, 3 secondsPastEpoch, 4 nanoseconds.
+        let intro = FieldDesc::Structure {
+            struct_id: "epics:nt/NTScalar:1.0".into(),
+            fields: vec![
+                ("value".into(), FieldDesc::Scalar(ScalarType::Double)),
+                (
+                    "timeStamp".into(),
+                    FieldDesc::Structure {
+                        struct_id: "time_t".into(),
+                        fields: vec![
+                            (
+                                "secondsPastEpoch".into(),
+                                FieldDesc::Scalar(ScalarType::Long),
+                            ),
+                            ("nanoseconds".into(), FieldDesc::Scalar(ScalarType::Int)),
+                        ],
+                    },
+                ),
+            ],
+        };
+        let empty_struct = || FieldDesc::Structure {
+            struct_id: String::new(),
+            fields: Vec::new(),
+        };
+        // pvRequest `field(timeStamp.<leaf>)`, built as the wire type is.
+        let request = |leaf: &str| FieldDesc::Structure {
+            struct_id: String::new(),
+            fields: vec![(
+                "field".into(),
+                FieldDesc::Structure {
+                    struct_id: String::new(),
+                    fields: vec![(
+                        "timeStamp".into(),
+                        FieldDesc::Structure {
+                            struct_id: String::new(),
+                            fields: vec![(leaf.into(), empty_struct())],
+                        },
+                    )],
+                },
+            )],
+        };
+        let post = || crate::server_native::MonitorUpdate {
+            value: PvField::Scalar(ScalarValue::Int(1)),
+            marked: Some(vec!["timeStamp".to_string()]),
+            type_changed: false,
+            overrun: Vec::new(),
+        };
+        let seed = PvField::Scalar(ScalarValue::Int(0));
+
+        // The typo: `field(timeStamp.bogus)` selects the `timeStamp`
+        // STRUCTURE bit and no leaf.
+        let bogus = crate::pv_request::request_to_mask(&intro, Some(&request("bogus")))
+            .expect("a matched structure keeps request2mask's foundrequested");
+        assert!(bogus.get(2), "the matched timeStamp structure bit is set");
+        assert!(
+            !bogus.get(3) && !bogus.get(4),
+            "no leaf below it is selected"
+        );
+
+        let mut q = MonitorQueue::new(4, &intro, &bogus);
+        q.seed(seed.clone().into());
+        assert!(
+            !q.push(post()),
+            "a post marking only a structure bit inside pvMask carries no wire \
+             leaf — pvxs's testmask drops it"
+        );
+        assert!(
+            crate::pvdata::encode::marked_wire_changed_bitset(
+                &intro,
+                &["timeStamp".to_string()],
+                &bogus,
+            )
+            .is_empty(),
+            "the frame the gate refused would have had an empty changed-bitset"
+        );
+
+        // Same marked path, but the request names a real leaf: admitted, and
+        // the wire bitset is exactly that leaf.
+        let real = crate::pv_request::request_to_mask(&intro, Some(&request("secondsPastEpoch")))
+            .expect("a matched leaf selects it");
+        let mut q = MonitorQueue::new(4, &intro, &real);
+        q.seed(seed.clone().into());
+        assert!(
+            q.push(post()),
+            "a marked subtree with a selected leaf posts"
+        );
+        let changed = crate::pvdata::encode::marked_wire_changed_bitset(
+            &intro,
+            &["timeStamp".to_string()],
+            &real,
+        );
+        assert_eq!(
+            changed.iter().collect::<Vec<usize>>(),
+            vec![3],
+            "the frame carries the one selected leaf, not the structure bit"
+        );
+
+        // R15-32 — the SAME boundary on the `marked: None` arm. pvxs's
+        // `testmask` is a leaf test whatever the source marked, so a leafless
+        // mask silences the subscription for a fully-marked Value too. The
+        // gate admitted every unmarked post, so `field(timeStamp.bogus)` drew
+        // full-rate DATA frames with an empty changed-bitset where pvxs sends
+        // nothing.
+        let unmarked = || crate::server_native::MonitorUpdate {
+            value: PvField::Scalar(ScalarValue::Int(1)),
+            marked: None,
+            type_changed: false,
+            overrun: Vec::new(),
+        };
+        let mut q = MonitorQueue::new(4, &intro, &bogus);
+        q.seed(seed.clone().into());
+        assert!(
+            !q.push(unmarked()),
+            "an unmarked post under a leafless mask frames no leaf — dropped"
+        );
+        assert!(
+            crate::pvdata::encode::canonical_changed_bitset(&intro, &bogus).is_empty(),
+            "the frame the gate refused would have had an empty changed-bitset"
+        );
+
+        // A mask that selects a leaf admits the same unmarked post, and the
+        // frame carries that leaf — gate and wire stay one computation.
+        let mut q = MonitorQueue::new(4, &intro, &real);
+        q.seed(seed.into());
+        assert!(
+            q.push(unmarked()),
+            "an unmarked post under a leafful mask is real"
+        );
+        assert_eq!(
+            crate::pvdata::encode::canonical_changed_bitset(&intro, &real)
+                .iter()
+                .collect::<Vec<usize>>(),
+            vec![3],
+            "the admitted frame carries exactly the selected leaf"
+        );
+    }
+
     /// Boundary test for the bounded server-side monitor FIFO
     /// ([`push_squash_monitor`], pvxs servermon.cpp:271-287). The producer
     /// appends each post as a DISTINCT entry while the FIFO holds fewer than
@@ -8681,23 +9297,58 @@ mod tests {
             "limit 1 collapses the burst to the single newest value"
         );
 
-        // A descriptor-change boundary is sticky through the squash: pushed
-        // into a full limit-1 FIFO it coalesces into the tail and stays
-        // type_changed, so the consumer detects it (MONITOR FINISH) rather
-        // than encoding a stale value.
+        // R13-34: a descriptor-change boundary (pvxs's terminal, `!val`)
+        // never squashes. pvxs's append gate is
+        // `(mon->queue.size() < mon->limit) || force || !val`
+        // (servermon.cpp:270-283), so the terminal is push_back'd PAST the
+        // limit. Pushed into a FULL limit-1 FIFO it must NOT pop the real
+        // update and coalesce over it — the real value survives and the
+        // terminal trails it, exactly as pvxs delivers every queued update
+        // and then the FINISH.
         let mut pending: VecDeque<crate::server_native::MonitorUpdate> = VecDeque::new();
         push_squash_monitor(&mut pending, upd(2), 1, coalesce_monitor_update);
-        push_squash_monitor(
+        let squashed = push_squash_monitor(
             &mut pending,
             crate::server_native::MonitorUpdate::type_change(),
             1,
             coalesce_monitor_update,
         );
-        assert_eq!(pending.len(), 1, "limit 1 keeps a single entry");
-        assert!(
-            pending[0].type_changed,
-            "a boundary post survives the limit-1 squash into the tail"
+        assert!(!squashed, "a terminal never reaches the squash branch");
+        assert_eq!(
+            pending.len(),
+            2,
+            "the terminal grows the queue past limit=1 (pvxs push_back)"
         );
+        assert_eq!(
+            pending[0].value,
+            val(2),
+            "the newest real update survives the terminal"
+        );
+        assert!(pending[1].type_changed, "the terminal trails it");
+
+        // Same rule on the RAW-forward FIFO: `RawMonitorEvent` carries the
+        // same `type_changed` boundary and coalesces with `|_old, new| new`,
+        // so pre-fix a terminal on a full raw queue replaced the newest raw
+        // frame outright.
+        let raw = |body: &[u8], terminal: bool| crate::server_native::RawMonitorEvent {
+            body_bytes: bytes::Bytes::copy_from_slice(body),
+            byte_order: ByteOrder::Little,
+            type_changed: terminal,
+        };
+        let mut raw_pending: VecDeque<crate::server_native::RawMonitorEvent> = VecDeque::new();
+        push_squash_monitor(&mut raw_pending, raw(b"a", false), 1, |_old, new| new);
+        push_squash_monitor(&mut raw_pending, raw(b"", true), 1, |_old, new| new);
+        assert_eq!(
+            raw_pending.len(),
+            2,
+            "the raw terminal is push_back'd past limit=1 too"
+        );
+        assert_eq!(
+            raw_pending[0].body_bytes.as_ref(),
+            b"a",
+            "the newest raw frame is not destroyed by the terminal"
+        );
+        assert!(raw_pending[1].type_changed, "the raw terminal trails it");
     }
 
     /// server pipeline parser accepts the typed-bool /
@@ -8721,15 +9372,25 @@ mod tests {
         })
     }
 
+    /// Negotiate `req` against the pvxs per-op default limit
+    /// (`MonitorOp::limit = 4u`), which is also this server's default
+    /// `monitor_queue_depth`.
+    fn negotiate_opts(req: &PvField) -> Result<MonitorPipelineRequest, NoConvert> {
+        monitor_pipeline_options(
+            req,
+            crate::server_native::source::DEFAULT_MONITOR_QUEUE_LIMIT,
+        )
+    }
+
     /// Unwrap the parsed options, asserting the request was NOT a
-    /// pipeline-negotiation reject.
+    /// pipeline-negotiation reject and did NOT throw.
     fn parsed_opts(req: &PvField) -> PipelineOptions {
-        match monitor_pipeline_options(req) {
-            Some(MonitorPipelineRequest::Options(o)) => o,
-            Some(MonitorPipelineRequest::Reject) => {
-                panic!("expected parsed options, got a pipeline-negotiation Reject")
+        match negotiate_opts(req) {
+            Ok(MonitorPipelineRequest::Options(o)) => o,
+            Ok(MonitorPipelineRequest::Reject(msg)) => {
+                panic!("expected parsed options, got a pipeline-negotiation Reject: {msg}")
             }
-            None => panic!("expected parsed options, got None (no _options structure)"),
+            Err(e) => panic!("expected parsed options, got a circuit-resetting NoConvert: {e}"),
         }
     }
 
@@ -8777,29 +9438,359 @@ mod tests {
             PvField::Scalar(ScalarValue::Int(1)),
         );
         assert!(
-            matches!(
-                monitor_pipeline_options(&req),
-                Some(MonitorPipelineRequest::Reject)
-            ),
+            matches!(negotiate_opts(&req), Ok(MonitorPipelineRequest::Reject(_))),
             "pipeline + queueSize<2 must reject the INIT, not downgrade",
         );
     }
 
     #[test]
     fn pva_r20_pipeline_unparseable_queue_size_rejects() {
-        // PRESENT but unparseable queueSize under pipeline → Reject
+        // PRESENT but unconvertible queueSize under pipeline → Reject
         // (pvxs `queueSize.as(qSize)` fails, then `op->pipeline` → error).
         let req = make_pipeline_request(
             PvField::Scalar(ScalarValue::Boolean(true)),
             PvField::Scalar(ScalarValue::String("not-a-number".into())),
         );
+        let got = negotiate_opts(&req);
+        let Ok(MonitorPipelineRequest::Reject(msg)) = got else {
+            panic!("pipeline + unconvertible queueSize must reject the INIT");
+        };
+        // pvxs `ctrl->error(SB()<<"can not pipeline invalid queueSize : "
+        // <<queueSize)` — the offending value, no invented "(must be >= 2)".
         assert!(
-            matches!(
-                monitor_pipeline_options(&req),
-                Some(MonitorPipelineRequest::Reject)
-            ),
-            "pipeline + unparseable queueSize must reject the INIT",
+            msg.starts_with("can not pipeline invalid queueSize : "),
+            "pvxs error text: {msg}"
         );
+        assert!(msg.contains("not-a-number"), "the value is named: {msg}");
+    }
+
+    /// R10-36: `SB()<<queueSize` streams the option `Value` through pvxs's
+    /// DEFAULT (tree) formatter — `<typecode> = <value>` plus the newline the
+    /// formatter always writes — not the bare scalar text this used to append.
+    /// Every diagnostic that names an option value shares that one renderer
+    /// ([`crate::pvdata::render_value`]) with the QSRV bridge.
+    #[test]
+    fn pva_r10_36_option_diagnostics_render_the_value_like_pvxs() {
+        // Reject text (`servermon.cpp:538`).
+        let req = make_pipeline_request(
+            PvField::Scalar(ScalarValue::Boolean(true)),
+            PvField::Scalar(ScalarValue::String("not-a-number".into())),
+        );
+        let Ok(MonitorPipelineRequest::Reject(msg)) = negotiate_opts(&req) else {
+            panic!("pipeline + unconvertible queueSize must reject the INIT");
+        };
+        assert_eq!(
+            msg, "can not pipeline invalid queueSize : string = \"not-a-number\"\n",
+            "pre-R10-36 this rendered the bare scalar (`not-a-number`)"
+        );
+
+        // Warn text on a NON-pipeline monitor (`servermon.cpp:542`).
+        let req = make_pipeline_request(
+            PvField::Scalar(ScalarValue::Boolean(false)),
+            PvField::Scalar(ScalarValue::String("garbage".into())),
+        );
+        let opts = parsed_opts(&req);
+        assert_eq!(
+            opts.diagnostics[0].message,
+            "Unable to use record._options.queueSize : string = \"garbage\"\n"
+        );
+
+        // `pipeline` Warn (`servermon.cpp:529`) — a string `as<bool>` refuses.
+        let req = make_pipeline_request(
+            PvField::Scalar(ScalarValue::String("maybe".into())),
+            PvField::Scalar(ScalarValue::Int(8)),
+        );
+        let opts = parsed_opts(&req);
+        assert_eq!(
+            opts.diagnostics[0].message,
+            "Unable to parse record._options.pipeline : string = \"maybe\"\n"
+        );
+
+        // Negative control: a NON-scalar option is no longer flattened to
+        // `<non-scalar>`; it renders as pvxs's tree form for that value.
+        let req = make_pipeline_request(
+            PvField::ScalarArrayTyped(crate::pvdata::TypedScalarArray::Int(vec![1, 2].into())),
+            PvField::Scalar(ScalarValue::Int(8)),
+        );
+        let opts = parsed_opts(&req);
+        assert_eq!(
+            opts.diagnostics[0].message,
+            "Unable to parse record._options.pipeline : int32_t[] = {2}[1, 2]\n"
+        );
+    }
+
+    /// R10-32: pvxs `queueSize.as(qSize)` converts a REAL
+    /// (`uint64_t(double(src))`) and parses a STRING with `parseTo<uint64_t>`
+    /// = `stoull(s,&idx,0)`, base 0. The port dropped Float/Double and read
+    /// strings as decimal-only, so each of these was refused: under pipeline
+    /// with the port's invented "can not pipeline invalid queueSize" error,
+    /// and on a plain monitor with a spurious Warn plus the default depth.
+    #[test]
+    fn pva_r10_32_queue_size_converts_reals_and_base_zero_strings() {
+        for (v, want) in [
+            (ScalarValue::Double(8.0), 8u32),
+            (ScalarValue::Double(8.9), 8),
+            (ScalarValue::Float(16.0), 16),
+            (ScalarValue::String("0x10".into()), 16),
+            (ScalarValue::String("010".into()), 8),
+            (ScalarValue::String("12".into()), 12),
+            (ScalarValue::UInt(5), 5),
+        ] {
+            let req = make_pipeline_request(
+                PvField::Scalar(ScalarValue::Boolean(true)),
+                PvField::Scalar(v.clone()),
+            );
+            let opts = parsed_opts(&req);
+            assert!(opts.enabled, "queueSize = {v:?} must not disable pipeline");
+            assert_eq!(opts.queue_size, want, "queueSize = {v:?}");
+            assert!(
+                opts.diagnostics.is_empty(),
+                "a converted queueSize must not warn: {:?}",
+                opts.diagnostics
+            );
+        }
+    }
+
+    /// R10-32 (non-pipeline half): the same conversion feeds `op->limit` for a
+    /// PLAIN monitor — no pipeline, no Warn, requested depth honored.
+    #[test]
+    fn pva_r10_32_real_queue_size_sets_a_plain_monitor_depth() {
+        let req = make_pipeline_request(
+            PvField::Scalar(ScalarValue::Boolean(false)),
+            PvField::Scalar(ScalarValue::Double(8.0)),
+        );
+        let opts = parsed_opts(&req);
+        assert!(!opts.enabled);
+        // `op->limit = qSize` sits OUTSIDE `if(op->pipeline)`, so the
+        // squash override applies to a non-pipeline monitor too.
+        assert_eq!(opts.queue_size, 8);
+        assert!(
+            opts.diagnostics.is_empty(),
+            "a converted queueSize must not warn: {:?}",
+            opts.diagnostics
+        );
+    }
+
+    /// Build a pvRequest carrying exactly the named `record._options`.
+    fn make_options_request(pairs: &[(&str, PvField)]) -> PvField {
+        let options = PvField::Structure(PvStructure {
+            struct_id: String::new(),
+            fields: pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect(),
+        });
+        let record = PvField::Structure(PvStructure {
+            struct_id: String::new(),
+            fields: vec![("_options".to_string(), options)],
+        });
+        PvField::Structure(PvStructure {
+            struct_id: String::new(),
+            fields: vec![("record".to_string(), record)],
+        })
+    }
+
+    /// R11-31 — the per-op queue limit is ONE value: pvxs seeds
+    /// `uint32_t qSize = op->limit` from the `MonitorOp::limit = 4u`
+    /// initializer (servermon.cpp:66) and overwrites it only for a valid
+    /// `queueSize >= 2` (`:533-543`). That single `op->limit` is the squash
+    /// threshold (`:273`), the base of the `ackAny` arithmetic
+    /// (`:564,578,581`) and the reported depth (`:313`).
+    ///
+    /// The port kept TWO: the squash depth defaulted to the server-wide
+    /// `monitor_queue_depth` (64) while the SAME negotiation defaulted the
+    /// `ackAny` base to a hardcoded 4. The assertions below distinguish them —
+    /// with a non-default server default, the pre-fix code answered 4 where
+    /// pvxs answers the server's limit.
+    #[test]
+    fn pva_r11_31_one_negotiated_limit_seeded_from_the_server_default() {
+        use crate::server_native::runtime::PvaServerConfig;
+
+        // The default IS the pvxs per-op initializer, not a 64-deep queue.
+        assert_eq!(
+            PvaServerConfig::default().monitor_queue_depth,
+            4,
+            "pvxs MonitorOp::limit = 4u (servermon.cpp:66)"
+        );
+        assert_eq!(
+            PvaServerConfig::default().monitor_queue_limit(),
+            crate::server_native::source::DEFAULT_MONITOR_QUEUE_LIMIT
+        );
+        // The documented `depth * 3 / 4` relation held for 64/48 and must
+        // still hold now that the depth is the pvxs per-op default.
+        assert_eq!(
+            PvaServerConfig::default().monitor_high_watermark,
+            PvaServerConfig::default().monitor_queue_depth * 3 / 4
+        );
+
+        // A deployment that raised the per-op default — the same deviation as
+        // building pvxs with a different `limit` initializer.
+        const SERVER_DEFAULT: u32 = 16;
+
+        // No `record._options` at all: nothing negotiated, so the limit is the
+        // server's. (The parser used to answer `None` here and leave each
+        // consumer to pick its own fallback.)
+        let plain = PvField::Structure(PvStructure {
+            struct_id: String::new(),
+            fields: vec![],
+        });
+        let Ok(MonitorPipelineRequest::Options(o)) =
+            monitor_pipeline_options(&plain, SERVER_DEFAULT)
+        else {
+            panic!("a pvRequest with no _options negotiates the defaults");
+        };
+        assert!(!o.enabled);
+        assert_eq!(o.queue_size, SERVER_DEFAULT);
+
+        // Pipeline ON, queueSize ABSENT, `ackAny = 50%`: pvxs takes the percent
+        // of `op->limit`, which is the SERVER default here — 8, not 2 (50% of
+        // the 4 the port hardcoded as the pipeline default).
+        let req = make_options_request(&[
+            ("pipeline", PvField::Scalar(ScalarValue::Boolean(true))),
+            ("ackAny", PvField::Scalar(ScalarValue::String("50%".into()))),
+        ]);
+        let Ok(MonitorPipelineRequest::Options(o)) = monitor_pipeline_options(&req, SERVER_DEFAULT)
+        else {
+            panic!("an absent queueSize is not a negotiation error");
+        };
+        assert!(o.enabled);
+        assert_eq!(
+            o.queue_size, SERVER_DEFAULT,
+            "absent queueSize keeps op->limit"
+        );
+        assert_eq!(
+            o.ack_at, 8,
+            "ackAny percent is a fraction of the NEGOTIATED limit"
+        );
+
+        // Pipeline ON, queueSize ABSENT, ackAny PRESENT but zero: 0 is below the
+        // representable minimum, so the [1, limit] clamp takes it to 1.
+        // CBUG-B12: pvxs runs `if(ackAt==0) ackAt = op->limit/2`
+        // (servermon.cpp:578) — this assertion used to read SERVER_DEFAULT / 2.
+        // What this case still pins for R11-31 is that the ack base is the
+        // NEGOTIATED limit, which the percentage case above covers.
+        let req = make_options_request(&[
+            ("pipeline", PvField::Scalar(ScalarValue::Boolean(true))),
+            ("ackAny", PvField::Scalar(ScalarValue::UInt(0))),
+        ]);
+        let Ok(MonitorPipelineRequest::Options(o)) = monitor_pipeline_options(&req, SERVER_DEFAULT)
+        else {
+            panic!("pipeline with a zero ackAny is a valid request");
+        };
+        assert_eq!(o.queue_size, SERVER_DEFAULT);
+        assert_eq!(o.ack_at, 1);
+
+        // A valid client `queueSize` still wins over the server default, and it
+        // is the ack base too (`ackAny=50%` of 8 → 4).
+        let req = make_options_request(&[
+            ("pipeline", PvField::Scalar(ScalarValue::Boolean(true))),
+            ("queueSize", PvField::Scalar(ScalarValue::UInt(8))),
+            ("ackAny", PvField::Scalar(ScalarValue::String("50%".into()))),
+        ]);
+        let Ok(MonitorPipelineRequest::Options(o)) = monitor_pipeline_options(&req, SERVER_DEFAULT)
+        else {
+            panic!("a valid queueSize is not a negotiation error");
+        };
+        assert_eq!(o.queue_size, 8);
+        assert_eq!(o.ack_at, 4);
+
+        // Boundary (negative control): `queueSize = 1` is REFUSED (pvxs
+        // `qSize>=2`) on a plain monitor — the limit stays the server default
+        // and a Warn is logged, even when the server default is itself 1, so a
+        // refused request is never mistaken for an accepted one.
+        let req = make_options_request(&[("queueSize", PvField::Scalar(ScalarValue::UInt(1)))]);
+        let Ok(MonitorPipelineRequest::Options(o)) = monitor_pipeline_options(&req, 1) else {
+            panic!("an invalid queueSize on a plain monitor is a Warn, not a reject");
+        };
+        assert_eq!(o.queue_size, 1, "the server default stands");
+        assert_eq!(
+            o.diagnostics.len(),
+            1,
+            "a refused queueSize warns even when it equals the default"
+        );
+    }
+
+    /// R10-32 (boundary): a negative / oversized integer WRAPS through
+    /// `uint64_t(int64_t(src))` and the `uint32_t` narrowing rather than being
+    /// refused — pvxs sets `op->limit = 0xFFFF_FFFF`. NOT a rejection.
+    #[test]
+    fn pva_r10_32_negative_queue_size_wraps_like_the_c_cast() {
+        let req = make_pipeline_request(
+            PvField::Scalar(ScalarValue::Boolean(true)),
+            PvField::Scalar(ScalarValue::Int(-1)),
+        );
+        let opts = parsed_opts(&req);
+        assert!(opts.enabled);
+        assert_eq!(opts.queue_size, 0xFFFF_FFFF);
+    }
+
+    /// R10-32 (documented non-divergence): a BOOLEAN queueSize converts to
+    /// 0/1, which is `< 2`, so both pvxs and the port treat it as invalid.
+    #[test]
+    fn pva_r10_32_boolean_queue_size_is_still_invalid() {
+        let req = make_pipeline_request(
+            PvField::Scalar(ScalarValue::Boolean(true)),
+            PvField::Scalar(ScalarValue::Boolean(true)),
+        );
+        assert!(
+            matches!(negotiate_opts(&req), Ok(MonitorPipelineRequest::Reject(_))),
+            "Boolean queueSize converts to 1, which is < 2 → invalid",
+        );
+    }
+
+    /// R10-31: pvxs `pipeline.as(v)` routes a REAL through `copyOutScalar`
+    /// → `bool(src)` (`servermon.cpp:525`, `data.cpp:405`), so
+    /// `pipeline = Double(1.0)` enables the credit-windowed pipeline
+    /// sub-protocol. The port hardcoded Float/Double to `false`, serving a
+    /// plain monitor where pvxs serves a pipelined one — a different wire
+    /// flow-control shape, with any accompanying `ackAny` silently dropped.
+    #[test]
+    fn pva_r10_31_real_pipeline_converts_by_nonzero() {
+        for (v, want) in [
+            (ScalarValue::Double(1.0), true),
+            (ScalarValue::Double(0.5), true),
+            (ScalarValue::Double(0.0), false),
+            (ScalarValue::Float(1.0), true),
+            (ScalarValue::Float(0.0), false),
+        ] {
+            let req = make_pipeline_request(
+                PvField::Scalar(v.clone()),
+                PvField::Scalar(ScalarValue::Int(8)),
+            );
+            let opts = parsed_opts(&req);
+            assert_eq!(opts.enabled, want, "pipeline = {v:?} must convert as bool");
+            // A converted option draws NO diagnostic — pvxs `as(v)` succeeded.
+            assert!(
+                opts.diagnostics.is_empty(),
+                "a converted pipeline value must not warn: {:?}",
+                opts.diagnostics
+            );
+        }
+    }
+
+    /// R10-31 (same owner): pvxs `Value::as<bool>` accepts ONLY the exact
+    /// string tokens `"true"`/`"false"` (`data.cpp:466-469`). The port's
+    /// hand-rolled match also took `"1"`/`"yes"`/`"0"`/`"no"` and case-folded,
+    /// so `pipeline="1"` enabled a pipeline pvxs leaves DISABLED (with a Warn).
+    #[test]
+    fn pva_r10_31_unconvertible_pipeline_string_warns_and_disables() {
+        for s in ["1", "yes", "0", "no", "TRUE", "True"] {
+            let req = make_pipeline_request(
+                PvField::Scalar(ScalarValue::String(s.into())),
+                PvField::Scalar(ScalarValue::Int(8)),
+            );
+            let opts = parsed_opts(&req);
+            assert!(
+                !opts.enabled,
+                "pvxs as<bool> refuses {s:?}: pipeline stays disabled"
+            );
+            assert_eq!(
+                opts.diagnostics.len(),
+                1,
+                "an unconvertible pipeline value draws the servermon.cpp:529 Warn"
+            );
+            assert_eq!(opts.diagnostics[0].level, MessageType::Warning);
+        }
     }
 
     #[test]
@@ -9223,6 +10214,131 @@ mod tests {
         );
     }
 
+    /// A NULL (`0xFF`) pvRequest type descriptor at INIT is legal and means
+    /// "no pvRequest": pvxs `from_wire(buf, descs, cache)` returns on
+    /// `TypeCode::Null` with the buffer still GOOD (`dataencode.cpp:79-80`),
+    /// `from_wire_type` yields an invalid `Value` (`:737-744`),
+    /// `from_wire_type_value` skips the absent value body (`:747-753`), and
+    /// the INIT passes `serverget.cpp:366-376` / `servermon.cpp:491-503`
+    /// (which check only `!M.good()`). `request2mask` then takes
+    /// `else if(!fields.valid()) foundrequested = true;`
+    /// (`pvrequest.cpp:53-55`) and the empty mask becomes the all-fields
+    /// wildcard (`:63-68`). It is the exact byte pvxs's own
+    /// `to_wire(Buf&, const FieldDesc*)` writes for a null descriptor
+    /// (`dataencode.cpp:29-33`).
+    ///
+    /// Rust rejected it as a decode error, which the read loop treats as
+    /// connection-fatal — tearing down every other channel and operation
+    /// multiplexed on that circuit.
+    #[tokio::test]
+    async fn init_null_pvrequest_descriptor_is_wildcard_not_fatal() {
+        use crate::server_native::SharedSource;
+        use crate::server_native::runtime::PvaServerConfig;
+        use crate::server_native::shared_pv::SharedPV;
+
+        /// Returns `(fatal, registered, mask)` for a one-byte `0xFF`
+        /// pvRequest INIT of `kind`.
+        async fn run(kind: OpKind, ioid: u32) -> (bool, bool, Option<BitSet>) {
+            let order = ByteOrder::Little;
+            let sid: u32 = 1;
+            let intro = three_field_intro();
+            let pv = SharedPV::new();
+            pv.open(intro.clone(), three_field_value(0, 0, 0)).unwrap();
+            let shared = SharedSource::new();
+            shared.add("dut", pv);
+            let source: DynSource = Arc::new(shared);
+
+            let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+            channels.insert(
+                sid,
+                ChannelState {
+                    name: "dut".into(),
+                    cid: 0,
+                    sid,
+                    introspection: Some(intro),
+                    source,
+                    stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                    open_cred: ClientCredentials::anonymous(),
+                    ops: HashMap::new(),
+                },
+            );
+            let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+            let config = PvaServerConfig::default();
+            let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+            let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+            let cred = ClientCredentials::anonymous();
+
+            let mut payload = Vec::new();
+            payload.put_u32(sid, order);
+            payload.put_u32(ioid, order);
+            payload.put_u8(0x08); // INIT
+            payload.put_u8(crate::pvdata::encode::TAG_NULL); // the whole pvRequest
+            let cmd = match kind {
+                OpKind::Monitor => Command::Monitor,
+                OpKind::Rpc => Command::Rpc,
+                OpKind::Put => Command::Put,
+                _ => Command::Get,
+            };
+            let frame = synth_frame(cmd, order, payload);
+            let fatal = handle_op(
+                &frame,
+                &tx,
+                &mut channels,
+                order,
+                &fixed_out_order(order),
+                kind,
+                &config,
+                &mut encode_cache,
+                &mut TypeCache::new(),
+                peer,
+                &cred,
+                &discard_mon_fin(),
+                &discard_exec_fin(),
+            )
+            .await
+            .is_err();
+            let op = channels.get(&sid).unwrap().ops.get(&ioid);
+            (fatal, op.is_some(), op.map(|o| o.mask.clone()))
+        }
+
+        // The wildcard mask pvxs's `request2mask` produces for an invalid
+        // pvRequest: every bit of the value descriptor.
+        let wildcard = BitSet::all_set(three_field_intro().total_bits());
+
+        for (kind, ioid) in [
+            (OpKind::Get, 830),
+            (OpKind::Put, 831),
+            (OpKind::Monitor, 832),
+        ] {
+            let (fatal, registered, mask) = run(kind, ioid).await;
+            assert!(
+                !fatal,
+                "{kind:?} INIT with a NULL pvRequest must not be a wire fault"
+            );
+            assert!(
+                registered,
+                "{kind:?} INIT with a NULL pvRequest must register the IOID"
+            );
+            assert_eq!(
+                mask.expect("op state"),
+                wildcard,
+                "{kind:?} INIT with a NULL pvRequest must serve the all-fields wildcard"
+            );
+        }
+
+        // RPC builds no mask at all (pvxs serverget.cpp:402), so only assert
+        // that it is accepted and registered.
+        let (fatal, registered, _) = run(OpKind::Rpc, 833).await;
+        assert!(
+            !fatal,
+            "RPC INIT with a NULL pvRequest must not be a wire fault"
+        );
+        assert!(
+            registered,
+            "RPC INIT with a NULL pvRequest must register the IOID"
+        );
+    }
+
     #[test]
     fn pva_r20_pipeline_bool_false_disables() {
         let req = make_pipeline_request(
@@ -9280,13 +10396,19 @@ mod tests {
             let opts = parsed_opts(&req);
             assert_eq!(opts.ack_at, want, "ackAny={ack} with queueSize={q}");
         }
-        // Explicit 0 → queueSize/2 (servermon.cpp:577-578).
+        // Explicit 0 → the minimum representable threshold, 1. CBUG-B12: pvxs
+        // reads a supplied 0 as "the caller named nothing" and jumps it to
+        // queueSize/2 (servermon.cpp:577-578) — this test asserted that 8.
         let req = make_pipeline_request_ack(
             PvField::Scalar(ScalarValue::Boolean(true)),
             PvField::Scalar(ScalarValue::Int(q as i32)),
             PvField::Scalar(ScalarValue::Int(0)),
         );
-        assert_eq!(parsed_opts(&req).ack_at, q / 2, "ackAny=0 → queueSize/2");
+        assert_eq!(
+            parsed_opts(&req).ack_at,
+            1,
+            "ackAny=0 clamps up to the minimum (C++: queueSize/2)"
+        );
         // Above queueSize → clamps down to queueSize (servermon.cpp:581).
         let req = make_pipeline_request_ack(
             PvField::Scalar(ScalarValue::Boolean(true)),
@@ -9298,6 +10420,57 @@ mod tests {
             q,
             "ackAny>queueSize → clamp to queueSize"
         );
+    }
+
+    /// R9-32. `ackAny.as(ival)` is `tryAs<uint32_t>` — a CONVERSION, not a type
+    /// test. pvxs pushes bool, every signed/unsigned integer, and both reals
+    /// through one `copyOutScalar()` that C-casts to `uint64_t`
+    /// (data.cpp:402-435), so a `Double(4.0)` or `Boolean(true)` ackAny reaches
+    /// the plain-integer branch (`servermon.cpp:557-558`) exactly like `Int(4)`.
+    ///
+    /// The port matched only the integer variants and swallowed the rest in a
+    /// `_ => {}` arm: `ackAt` stayed 1 (ACK every event) and the
+    /// `ackAt == 0 → queueSize/2` fallback could never fire for them. One case
+    /// per storage class, each landing on a value distinguishable from that
+    /// stuck default.
+    #[test]
+    fn ack_at_converts_every_scalar_storage_class() {
+        let q = 16u32;
+        let cases = [
+            // Real storage: `uint64_t(double)` truncates toward zero.
+            (PvField::Scalar(ScalarValue::Double(4.0)), 4u32),
+            (PvField::Scalar(ScalarValue::Double(4.9)), 4),
+            (PvField::Scalar(ScalarValue::Float(2.0)), 2),
+            // Bool storage: true → 1. The meaningful boundary is false → 0,
+            // which CBUG-B12 clamps up to 1; C++ jumped it to queueSize/2, and
+            // this case asserted that 8.
+            (PvField::Scalar(ScalarValue::Boolean(true)), 1),
+            (PvField::Scalar(ScalarValue::Boolean(false)), 1),
+            // Real 0.0 lands on the same 0, so the same minimum.
+            (PvField::Scalar(ScalarValue::Double(0.0)), 1),
+            // Unsigned/other integer widths were already handled; pin them so
+            // the exhaustive match cannot regress one.
+            (PvField::Scalar(ScalarValue::UByte(3)), 3),
+            (PvField::Scalar(ScalarValue::ULong(3)), 3),
+            // Negative integer: pvxs wraps (`uint64_t(int64_t(-1))` → u64::MAX,
+            // narrowed to 0xFFFF_FFFF) and the `[1, limit]` clamp
+            // (servermon.cpp:581) pins it to the queue. The port used to
+            // `u32::try_from(-1).unwrap_or(1)` → 1.
+            (PvField::Scalar(ScalarValue::Int(-1)), q),
+        ];
+        for (ack_any, want) in cases {
+            let label = format!("{ack_any:?}");
+            let req = make_pipeline_request_ack(
+                PvField::Scalar(ScalarValue::Boolean(true)),
+                PvField::Scalar(ScalarValue::Int(q as i32)),
+                ack_any,
+            );
+            assert_eq!(
+                parsed_opts(&req).ack_at,
+                want,
+                "ackAny={label} with queueSize={q}"
+            );
+        }
     }
 
     #[test]
@@ -9320,6 +10493,101 @@ mod tests {
             1,
             "unparseable ackAny → default 1"
         );
+    }
+
+    /// R9-34. pvxs runs `ackAny.as(ival)` (`uint32_t`) FIRST — even for STRING
+    /// storage. `copyOut` String→UInteger is `parseTo<uint64_t>`, i.e.
+    /// `std::stoull(s, &idx, 0)`: BASE 0 (data.cpp:451-453, util.cpp:786-799).
+    /// So a hex, octal, signed or whitespace-padded `ackAny` string resolves in
+    /// the INTEGER branch, before the `"N%"` percentage form is ever considered.
+    ///
+    /// The port's fallback was a decimal-only `str::trim().parse::<u32>()` sitting
+    /// INSIDE the string branch, so it rejected every one of these and left
+    /// `ackAt` at the default of 1 (ACK every event).
+    #[test]
+    fn pva_r9_34_ack_any_string_converts_base_zero() {
+        // queueSize 32 so none of these clamp on the way out (except -1, below).
+        let q = 32u32;
+        let cases: [(ScalarValue, u32); 6] = [
+            // `0x`/`0X` prefix → radix 16.
+            (ScalarValue::String("0x10".into()), 16),
+            (ScalarValue::String("0X10".into()), 16),
+            // Leading `0` → radix 8. "010" is EIGHT, not ten.
+            (ScalarValue::String("010".into()), 8),
+            // Plain decimal still decimal.
+            (ScalarValue::String("12".into()), 12),
+            // strtoull skips leading whitespace; parseTo skips trailing.
+            (ScalarValue::String("  12  ".into()), 12),
+            // A base-0 "0" converts to 0 — a threshold below the representable
+            // minimum, so the [1, limit] clamp takes it to 1. CBUG-B12: pvxs
+            // takes the `ackAt == 0 → queueSize/2` fallback (servermon.cpp:577)
+            // instead, which is the 16 this case used to assert. What it still
+            // pins for R9-34 is that "0" resolves in the INTEGER branch at all.
+            (ScalarValue::String("0".into()), 1),
+        ];
+        for (ack_any, want) in cases {
+            let label = format!("{ack_any:?}");
+            let req = make_pipeline_request_ack(
+                PvField::Scalar(ScalarValue::Boolean(true)),
+                PvField::Scalar(ScalarValue::Int(q as i32)),
+                PvField::Scalar(ack_any),
+            );
+            assert_eq!(parsed_opts(&req).ack_at, want, "ackAny={label}");
+        }
+        // A leading `-` negates the unsigned parse (C, not an error): "-1" is
+        // u64::MAX, narrowed to 0xFFFF_FFFF, then clamped to the queue — the
+        // same result the typed `Int(-1)` already produced.
+        let req = make_pipeline_request_ack(
+            PvField::Scalar(ScalarValue::Boolean(true)),
+            PvField::Scalar(ScalarValue::Int(q as i32)),
+            PvField::Scalar(ScalarValue::String("-1".into())),
+        );
+        assert_eq!(
+            parsed_opts(&req).ack_at,
+            q,
+            "ackAny=\"-1\" wraps to 0xFFFF_FFFF → clamps to queueSize"
+        );
+        // Octal radix has no digit 8: "08" is `invalid`/extraneous, so the
+        // integer conversion fails, the string branch finds no `%`, and pvxs
+        // leaves ackAt at the default with NO diagnostic.
+        let req = make_pipeline_request_ack(
+            PvField::Scalar(ScalarValue::Boolean(true)),
+            PvField::Scalar(ScalarValue::Int(q as i32)),
+            PvField::Scalar(ScalarValue::String("08".into())),
+        );
+        let opts = parsed_opts(&req);
+        assert_eq!(opts.ack_at, 1, "ackAny=\"08\" is not a base-0 integer");
+        assert!(
+            opts.diagnostics.is_empty(),
+            "a non-`%` unconvertible string is silent in pvxs"
+        );
+    }
+
+    /// R9-34. The percentage branch is pvxs's `else if(ackAny.as(sval))` — a
+    /// CONVERSION into `std::string`, which "automagic derefs" a selected union
+    /// (data.cpp:478-492). Both branches therefore see through a union-wrapped
+    /// `ackAny`, which the port's `PvField::Scalar(..)` match could not.
+    #[test]
+    fn pva_r9_34_ack_any_derefs_a_selected_union() {
+        let wrap = |sv: ScalarValue| PvField::Union {
+            selector: 0,
+            variant_name: "s".into(),
+            value: Box::new(PvField::Scalar(sv)),
+        };
+        // Integer branch, through the deref.
+        let req = make_pipeline_request_ack(
+            PvField::Scalar(ScalarValue::Boolean(true)),
+            PvField::Scalar(ScalarValue::Int(16)),
+            wrap(ScalarValue::String("0x4".into())),
+        );
+        assert_eq!(parsed_opts(&req).ack_at, 4);
+        // Percentage branch, through the deref.
+        let req = make_pipeline_request_ack(
+            PvField::Scalar(ScalarValue::Boolean(true)),
+            PvField::Scalar(ScalarValue::Int(16)),
+            wrap(ScalarValue::String("25%".into())),
+        );
+        assert_eq!(parsed_opts(&req).ack_at, 4);
     }
 
     #[test]
@@ -9353,10 +10621,11 @@ mod tests {
             PvField::Scalar(ScalarValue::String("25%".into())),
         );
         assert_eq!(parsed_opts(&req).ack_at, 4, "25% of 16 → 4");
-        // A percent so small it truncates below one slot becomes 0,
-        // which hits the explicit `ackAt==0 → limit/2` fallback
-        // (pvxs `servermon.cpp:577`), NOT the `[1, limit]` floor:
-        // 0.5% of 16 = 0.08 → 0 → limit/2 = 8.
+        // A percent so small it truncates below one slot becomes 0, and 0 is
+        // simply below the representable minimum: the `[1, limit]` floor takes
+        // it to 1. CBUG-B12: pvxs instead reads that 0 as "no ackAny given" and
+        // jumps it to limit/2 = 8 (servermon.cpp:577), which is what this test
+        // used to assert.
         let req = make_pipeline_request_ack(
             PvField::Scalar(ScalarValue::Boolean(true)),
             PvField::Scalar(ScalarValue::Int(16)),
@@ -9364,9 +10633,35 @@ mod tests {
         );
         assert_eq!(
             parsed_opts(&req).ack_at,
-            8,
-            "0.5% of 16 = 0.08 → truncates to 0 → limit/2 fallback = 8"
+            1,
+            "0.5% of 16 = 0.08 → floors to the minimum 1 (C++: limit/2 = 8)"
         );
+    }
+
+    /// CBUG-B12 — the mapping from requested percentage to ACK threshold is
+    /// MONOTONIC NON-DECREASING. This is the property C++'s `ackAt==0` sentinel
+    /// destroys: with the default limit of 4 every percentage below 25%
+    /// truncates to 0 and is jumped to limit/2 = 2, so `ackAny="25%"` acks at 1
+    /// while `ackAny="10%"` acks at 2 — asking to ack MORE eagerly gets a LAZIER
+    /// threshold, and the flow-control window errs toward less back-pressure.
+    #[test]
+    fn b12_ack_at_is_monotonic_in_the_requested_percentage() {
+        let q = 4u32; // the pvxs default limit, where the bug is worst
+        let mut prev = 0u32;
+        for pct in ["0%", "1%", "10%", "24%", "25%", "50%", "75%", "100%"] {
+            let req = make_pipeline_request_ack(
+                PvField::Scalar(ScalarValue::Boolean(true)),
+                PvField::Scalar(ScalarValue::Int(q as i32)),
+                PvField::Scalar(ScalarValue::String(pct.into())),
+            );
+            let got = parsed_opts(&req).ack_at;
+            assert!(
+                got >= prev,
+                "ackAny={pct} → {got}, below the {prev} a smaller percentage got"
+            );
+            prev = got;
+        }
+        assert_eq!(prev, q, "100% → the full queue");
     }
 
     // pvxs `ServerConn::logRemote()` diagnostics for PRESENT-but-invalid
@@ -9396,19 +10691,26 @@ mod tests {
     }
 
     #[test]
-    fn monitor_diag_recognized_false_tokens_do_not_warn() {
-        // Recognized false-ish tokens are intentional disables, NOT parse
-        // errors — no diagnostic (only genuinely unrecognized values warn).
-        for tok in ["false", "0", "no", "FALSE", "No"] {
-            let req = make_pipeline_request(
-                PvField::Scalar(ScalarValue::String(tok.into())),
-                PvField::Scalar(ScalarValue::Int(16)),
-            );
+    fn monitor_diag_converted_false_does_not_warn() {
+        // A CONVERTED false is an intentional disable, not a parse error —
+        // `as(bool)` succeeded, so pvxs emits no diagnostic. The convertible
+        // false-ish values are exactly the ones `Value::as<bool>` accepts:
+        // the string token `"false"` (and only that spelling — `"0"`/`"no"`/
+        // `"FALSE"` are NoConvert, covered by
+        // `pva_r10_31_unconvertible_pipeline_string_warns_and_disables`), plus
+        // any zero numeric or `Boolean(false)`.
+        for tok in [
+            PvField::Scalar(ScalarValue::String("false".into())),
+            PvField::Scalar(ScalarValue::Boolean(false)),
+            PvField::Scalar(ScalarValue::Int(0)),
+            PvField::Scalar(ScalarValue::Double(0.0)),
+        ] {
+            let req = make_pipeline_request(tok.clone(), PvField::Scalar(ScalarValue::Int(16)));
             let opts = parsed_opts(&req);
-            assert!(!opts.enabled, "{tok} → disabled");
+            assert!(!opts.enabled, "{tok:?} → disabled");
             assert!(
                 opts.diagnostics.is_empty(),
-                "{tok} is a recognized false token, no Warn"
+                "{tok:?} converts to false, no Warn"
             );
         }
     }
@@ -9474,28 +10776,64 @@ mod tests {
         );
     }
 
+    /// R9-33. A NON-scalar `ackAny` under an enabled pipeline THROWS in pvxs:
+    /// `servermon.cpp:556` runs `ackAny.as<std::string>()` ahead of both
+    /// branches, and no `copyOut` arm converts array / struct / unselected-union
+    /// storage into a string (`data.cpp:466-499`). Nothing catches it before
+    /// `conn.cpp:277-282`, which does `bev.reset()` — the circuit is dropped.
+    ///
+    /// The `:570-573` "Unable to parse …" Crit is dead code (it needs BOTH
+    /// conversions to fail, and anything that fails the string one has already
+    /// thrown at `:556`). The port used to emit exactly that Crit and serve the
+    /// monitor on with `ackAt = 1`, which is the divergence: pvxs never replies.
     #[test]
-    fn monitor_diag_ackany_non_scalar_under_pipeline_is_crit() {
-        // pvxs `servermon.cpp:570-573`: a NON-scalar ackAny fails both
-        // `as<int>` and `as<string>` → Crit logRemote. ackAt stays default.
-        let non_scalar = PvField::Structure(PvStructure {
-            struct_id: String::new(),
-            fields: vec![],
-        });
+    fn pva_r9_33_non_scalar_ack_any_throws_instead_of_serving() {
+        let non_scalar = [
+            PvField::Structure(PvStructure {
+                struct_id: String::new(),
+                fields: vec![],
+            }),
+            PvField::ScalarArrayTyped(crate::pvdata::TypedScalarArray::Int(vec![4].into())),
+            PvField::Union {
+                selector: -1,
+                variant_name: String::new(),
+                value: Box::new(PvField::Null),
+            },
+        ];
+        for ack_any in non_scalar {
+            let label = format!("{ack_any:?}");
+            let req = make_pipeline_request_ack(
+                PvField::Scalar(ScalarValue::Boolean(true)),
+                PvField::Scalar(ScalarValue::Int(16)),
+                ack_any,
+            );
+            let got = negotiate_opts(&req);
+            assert!(
+                got.is_err(),
+                "non-scalar ackAny must throw (circuit reset), not serve: {label} → {got:?}"
+            );
+        }
+    }
+
+    /// R9-33, the scope boundary. pvxs reads `ackAny` ONLY inside
+    /// `if(op->pipeline)` (`servermon.cpp:554`), so the same unconvertible
+    /// value on a NON-pipeline monitor is never touched and the INIT proceeds.
+    #[test]
+    fn pva_r9_33_non_scalar_ack_any_without_pipeline_is_never_read() {
         let req = make_pipeline_request_ack(
-            PvField::Scalar(ScalarValue::Boolean(true)),
+            PvField::Scalar(ScalarValue::Boolean(false)),
             PvField::Scalar(ScalarValue::Int(16)),
-            non_scalar,
+            PvField::Structure(PvStructure {
+                struct_id: String::new(),
+                fields: vec![],
+            }),
         );
         let opts = parsed_opts(&req);
-        assert!(opts.enabled);
-        assert_eq!(opts.ack_at, 1, "non-scalar ackAny leaves ackAt default");
-        assert_eq!(opts.diagnostics.len(), 1, "one ackAny Crit");
-        assert_eq!(opts.diagnostics[0].level, MessageType::Fatal);
+        assert!(!opts.enabled);
         assert!(
-            opts.diagnostics[0].message.contains("ackAny"),
-            "message names the ackAny option: {}",
-            opts.diagnostics[0].message
+            opts.diagnostics.is_empty(),
+            "ackAny is not read without pipeline: {:?}",
+            opts.diagnostics
         );
     }
 
@@ -9657,6 +10995,101 @@ mod tests {
         );
     }
 
+    /// R9-33, on the wire. A pipelined MONITOR INIT whose `ackAny` no `copyOut`
+    /// arm converts must DROP THE CIRCUIT: pvxs's `ackAny.as<std::string>()`
+    /// (`servermon.cpp:556`) throws `NoConvert`, nothing catches it inside
+    /// `handle_MONITOR`, and `conn.cpp:277-282` does `bev.reset()`. So there is
+    /// no CMD_MESSAGE, no INIT reply, and no monitor — the connection dies.
+    ///
+    /// The port used to emit a Crit CMD_MESSAGE and serve the subscription on
+    /// with `ackAt = 1`. `handle_op` returning `Err` is this port's `bev.reset()`
+    /// (the TCP read loop tears the connection down on a `PvaError` return).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pva_r9_33_non_scalar_ack_any_resets_the_circuit() {
+        use crate::server_native::SharedSource;
+        use crate::server_native::runtime::PvaServerConfig;
+        use crate::server_native::shared_pv::SharedPV;
+
+        let order = ByteOrder::Little;
+        let sid: u32 = 1;
+        let ioid: u32 = 933;
+
+        let intro = three_field_intro();
+        let pv = SharedPV::new();
+        pv.open(intro.clone(), three_field_value(0, 0, 0)).unwrap();
+        let shared = SharedSource::new();
+        shared.add("dut", pv);
+        let source: DynSource = Arc::new(shared);
+
+        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        channels.insert(
+            sid,
+            ChannelState {
+                name: "dut".into(),
+                cid: 0,
+                sid,
+                introspection: Some(intro.clone()),
+                source,
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                open_cred: ClientCredentials::anonymous(),
+                ops: HashMap::new(),
+            },
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        let config = PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = ClientCredentials::anonymous();
+
+        // pipeline=true, a valid queueSize, and an ARRAY ackAny — `Int32A` is
+        // Kind::Integer but stores as an array, and `copyOut` has no scalar arm
+        // for array storage (`data.cpp:466-476`).
+        let req_val = make_pipeline_request_ack(
+            PvField::Scalar(ScalarValue::Boolean(true)),
+            PvField::Scalar(ScalarValue::Int(16)),
+            PvField::ScalarArrayTyped(crate::pvdata::TypedScalarArray::Int(vec![4].into())),
+        );
+        let req_desc = req_val.descriptor();
+        let mut init_payload = Vec::new();
+        init_payload.put_u32(sid, order);
+        init_payload.put_u32(ioid, order);
+        init_payload.put_u8(0x88);
+        crate::pvdata::encode::encode_type_desc(&req_desc, order, &mut init_payload);
+        crate::pvdata::encode::encode_pv_field(&req_val, &req_desc, order, &mut init_payload);
+        // The 0x80 bit obliges the initial-nack rider (`servermon.cpp:494-496`).
+        init_payload.put_u32(4, order);
+        let init_frame = synth_frame(Command::Monitor, order, init_payload);
+        let got = handle_op(
+            &init_frame,
+            &tx,
+            &mut channels,
+            order,
+            &fixed_out_order(order),
+            OpKind::Monitor,
+            &config,
+            &mut encode_cache,
+            &mut TypeCache::new(),
+            peer,
+            &cred,
+            &discard_mon_fin(),
+            &discard_exec_fin(),
+        )
+        .await;
+        assert!(
+            got.is_err(),
+            "unconvertible ackAny must be fatal to the connection, not served: {got:?}"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "pvxs resets before replying: no CMD_MESSAGE and no INIT reply"
+        );
+        assert!(
+            channels[&sid].ops.is_empty(),
+            "no monitor op is registered for a circuit pvxs never answers"
+        );
+    }
+
     /// pvxs `servermon.cpp:133-135` parity: the MONITOR INIT reply
     /// subcommand is derived from operation STATE (`subcmd = 0x08` for the
     /// Creating→Idle frame), NOT echoed from the request. A client that set
@@ -9783,13 +11216,14 @@ mod tests {
             authority: String::new(),
             roles: Vec::new(),
             pv_request: None,
+            log: Default::default(),
         }
     }
 
-    /// Owner path: `MonitorPipelineCredit::acquire` consumes exactly one
-    /// window slot per call.
+    /// Owner path: `MonitorPipelineCredit::take` consumes exactly one window
+    /// slot per call, and `available()` reports the gate the emit arm reads.
     #[tokio::test]
-    async fn monitor_pipeline_credit_acquire_decrements_window() {
+    async fn monitor_pipeline_credit_take_decrements_window() {
         use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
         let window = Arc::new(AtomicU32::new(2));
         let notify = Arc::new(tokio::sync::Notify::new());
@@ -9806,16 +11240,31 @@ mod tests {
             pv_name: "dut",
             mon_ctx: &ctx,
         };
-        credit.acquire().await;
+        assert!(credit.available());
+        credit.take();
         assert_eq!(window.load(Ordering::Relaxed), 1);
-        credit.acquire().await;
+        assert!(credit.available());
+        credit.take();
         assert_eq!(window.load(Ordering::Relaxed), 0);
+        assert!(
+            !credit.available(),
+            "an exhausted window closes the emit gate"
+        );
     }
 
-    /// Owner path: at zero credit `acquire` blocks, and proceeds once the
-    /// window is refilled (the ACK dispatch does `fetch_add` + notify).
+    /// R12-33 — an exhausted window must SUPPRESS THE REPLY, not the drain.
+    /// pvxs `maybeReply` simply does not fire while `window == 0`
+    /// (`servermon.cpp:79-83`) and `doPost` goes on squashing into the
+    /// negotiated queue. So the credit primitive must be a non-blocking gate
+    /// (`available`) plus a wake-up (`arm_refill`) that the event loop can
+    /// select over alongside `rx.recv()` — never an await that parks the loop
+    /// and stops draining the source.
+    ///
+    /// Also pins the arm-before-read ordering: the ACK path adds credit and
+    /// calls `notify_waiters()`, which stores no permit, so a waiter armed
+    /// AFTER the window read would miss the refill and park forever.
     #[tokio::test]
-    async fn monitor_pipeline_credit_acquire_blocks_until_refill() {
+    async fn monitor_pipeline_credit_refill_wakes_the_armed_waiter() {
         use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
         let window = Arc::new(AtomicU32::new(0));
         let notify = Arc::new(tokio::sync::Notify::new());
@@ -9832,27 +11281,36 @@ mod tests {
             pv_name: "dut",
             mon_ctx: &ctx,
         };
-        // Exhausted window: acquire must not complete.
+
+        // Exhausted: the gate is shut and the refill waiter parks.
+        let refill = credit.arm_refill();
+        assert!(!credit.available(), "no credit → the emit gate is shut");
         assert!(
-            tokio::time::timeout(Duration::from_millis(50), credit.acquire())
+            tokio::time::timeout(Duration::from_millis(50), wait_credit_refill(refill))
                 .await
                 .is_err(),
-            "acquire must block while the window is empty"
+            "with no ACK the refill waiter must park"
         );
-        // Refill (as the ACK dispatch does) and re-acquire.
+
+        // Arm, THEN let the ACK land: `notify_waiters()` leaves no permit, so
+        // only an already-registered waiter is woken. This is the ordering the
+        // emit loop relies on.
+        let refill = credit.arm_refill();
         window.fetch_add(1, Ordering::Relaxed);
         notify.notify_waiters();
         assert!(
-            tokio::time::timeout(Duration::from_millis(500), credit.acquire())
+            tokio::time::timeout(Duration::from_millis(500), wait_credit_refill(refill))
                 .await
                 .is_ok(),
-            "acquire must complete once the window is refilled"
+            "an ACK refill must wake the armed waiter"
         );
+        assert!(credit.available(), "the refilled window re-opens the gate");
+        credit.take();
         assert_eq!(window.load(Ordering::Relaxed), 0);
     }
 
-    /// Owner path: a non-pipeline monitor (no window) never blocks and
-    /// touches no counter.
+    /// Owner path: a non-pipeline monitor (no window) is always emit-eligible,
+    /// never waits, and touches no counter.
     #[tokio::test]
     async fn monitor_pipeline_credit_no_window_is_no_op() {
         use std::sync::atomic::AtomicU64;
@@ -9869,9 +11327,15 @@ mod tests {
             pv_name: "dut",
             mon_ctx: &ctx,
         };
-        tokio::time::timeout(Duration::from_millis(50), credit.acquire())
-            .await
-            .expect("non-pipeline acquire must return immediately");
+        assert!(
+            credit.available(),
+            "a non-pipeline monitor is never credit-blocked"
+        );
+        credit.take();
+        assert!(
+            credit.arm_refill().is_none(),
+            "no window → nothing to wait on"
+        );
     }
 
     /// Bypass path (the formerly-uncounted send site): the pipeline
@@ -10120,9 +11584,9 @@ mod tests {
 
     /// Decode the field-`a` value of a MONITOR DATA frame (subcmd
     /// `0x00`), or `None` for any non-DATA frame (INIT reply `0x08`,
-    /// FINISH `0x10`). `SharedSource` emits FULL frames
-    /// (`monitor_emits_partial == false`), so every DATA frame carries
-    /// all three fields and `three_field_extract` applies.
+    /// FINISH `0x10`). `SharedSource` marks no leaves (`MonitorUpdate::
+    /// marked == None`), so every DATA frame carries all three fields and
+    /// `three_field_extract` applies.
     #[cfg(test)]
     fn pvx61_decode_data_a(resp: &[u8], intro: &FieldDesc, order: ByteOrder) -> Option<i32> {
         let (frame, _) = try_parse_frame(resp).ok()??;
@@ -11509,8 +12973,7 @@ mod tests {
         // ...yet the requested queueSize is preserved as the per-op squash
         // depth the START path consumes (was discarded before the fix).
         assert_eq!(
-            op.monitor_options.queue_size,
-            Some(2),
+            op.monitor_options.queue_size, 2,
             "non-pipeline queueSize=2 must be the per-op squash threshold, \
              not the server default {}",
             config.monitor_queue_depth
@@ -11723,7 +13186,6 @@ mod tests {
                 monitor_filters: Arc::new(
                     epics_base_rs::server::database::filters::FilterChain::new(),
                 ),
-                put_auto_exec: true,
                 pv_request: None,
                 monitor_options: crate::server_native::source::MonitorOptions::default(),
                 data_task_abort: None,
@@ -12681,7 +14143,6 @@ mod tests {
                 monitor_filters: Arc::new(
                     epics_base_rs::server::database::filters::FilterChain::new(),
                 ),
-                put_auto_exec: true,
                 pv_request: None,
                 monitor_options: crate::server_native::source::MonitorOptions::default(),
                 data_task_abort: None,
@@ -12967,7 +14428,8 @@ mod tests {
             .push(("value".into(), PvField::Scalar(ScalarValue::Double(42.5))));
 
         let mask = BitSet::all_set(intro.total_bits());
-        let bytes = build_monitor_payload(ioid, &intro, &PvField::Structure(value), &mask, order);
+        let bytes =
+            build_monitor_payload(ioid, &intro, &PvField::Structure(value), None, &mask, order);
         let (frame, used) = try_parse_frame(&bytes).unwrap().expect("complete frame");
         assert_eq!(used, bytes.len());
 
@@ -13022,7 +14484,7 @@ mod tests {
         // could carry server-side squash loss. The wire overrun bitset
         // must still be empty (pvxs placeholder).
         let marked = vec!["a".to_string()];
-        let bytes = build_monitor_payload_marked(ioid, &intro, &value, &marked, &mask, order);
+        let bytes = build_monitor_payload(ioid, &intro, &value, Some(&marked), &mask, order);
         let (frame, used) = try_parse_frame(&bytes).unwrap().expect("complete frame");
         assert_eq!(used, bytes.len());
         let data = match decode_op_response(&frame, Some(&intro)).unwrap() {
@@ -13037,7 +14499,7 @@ mod tests {
 
         // The plain full-value builder must likewise emit an empty
         // overrun bitset.
-        let bytes = build_monitor_payload(ioid, &intro, &value, &mask, order);
+        let bytes = build_monitor_payload(ioid, &intro, &value, None, &mask, order);
         let (frame, _) = try_parse_frame(&bytes).unwrap().expect("complete frame");
         let data = match decode_op_response(&frame, Some(&intro)).unwrap() {
             OpResponse::Data(d) => d,
@@ -13049,22 +14511,18 @@ mod tests {
         );
     }
 
-    /// Residual regression: `build_monitor_payload_partial`
-    /// narrows the wire changed-bitset to exactly the leaves that
-    /// differ from the previous snapshot, intersected with the
-    /// request mask — pvxs `servermon.cpp:174`
-    /// `to_wire_valid(R, ent, &pvMask)`. The previous QSRV group
-    /// monitor path always sent the full request mask, so a
-    /// self-trigger update on one member wrongly marked every member
-    /// changed on the wire.
+    /// The two surviving monitor frame builders: a source that declares its
+    /// marked leaves frames exactly those (pvxs `servermon.cpp:174`
+    /// `to_wire_valid(R, ent, &pvMask)`), and a source that declares none
+    /// frames the full request mask (pvxs's fully-marked `Value`). The port
+    /// has no third, snapshot-diffing form — pvxs never reconstructs a marked
+    /// set by comparing consecutive values, and the QSRV group monitor that
+    /// once needed it now hands up its marked leaves on every event.
     ///
-    /// This builds a two-member group value and an event in which
-    /// only member `a` changed; the decoded frame's changed-bitset
-    /// must mark `a`'s leaf and NOT `b`'s. The contrasting full-mask
-    /// `build_monitor_payload` marks both — proving the narrowing is
-    /// the partial builder's doing.
+    /// A two-member group value with only `a` marked: the frame must mark
+    /// `a`'s leaf and NOT `b`'s, while the full-mask builder marks both.
     #[test]
-    fn br_r29_partial_monitor_payload_narrows_changed_bitset() {
+    fn br_r29_marked_monitor_payload_narrows_changed_bitset() {
         let order = ByteOrder::Little;
         let ioid = 0x29;
         // Group structure: { a: Double, b: Double }.
@@ -13083,56 +14541,46 @@ mod tests {
                 .push(("b".into(), PvField::Scalar(ScalarValue::Double(b))));
             PvField::Structure(s)
         };
-        // Previous emitted snapshot, then an event where only `a`
-        // changed (self-trigger on member `a`).
-        let prev = mk(1.0, 2.0);
         let curr = mk(9.0, 2.0);
         let mask = BitSet::all_set(intro.total_bits());
 
-        // Partial builder: changed-bitset must mark only `a` (bit 1),
-        // not `b` (bit 2).
-        let partial = build_monitor_payload_partial(ioid, &intro, &curr, &prev, &mask, order);
-        let (frame, _) = try_parse_frame(&partial).unwrap().expect("complete frame");
+        // Marked builder: a self-trigger event on member `a` marks only `a`
+        // (bit 1), never `b` (bit 2).
+        let marked = vec!["a".to_string()];
+        let narrowed = build_monitor_payload(ioid, &intro, &curr, Some(&marked), &mask, order);
+        let (frame, _) = try_parse_frame(&narrowed).unwrap().expect("complete frame");
         let data = match decode_op_response(&frame, Some(&intro)).unwrap() {
             OpResponse::Data(d) => d,
             other => panic!("expected monitor data, got {other:?}"),
         };
         assert!(
             data.changed.get(1),
-            "member `a` (bit 1) changed — must be marked"
+            "member `a` (bit 1) is marked — must be set"
         );
         assert!(
             !data.changed.get(2),
-            "member `b` (bit 2) unchanged — must NOT be marked (narrowing)"
+            "member `b` (bit 2) is not marked — must NOT be set (narrowing)"
         );
 
-        // Full builder: a wildcard (all-set) request mask canonicalizes to
-        // the root structure bit alone. pvxs `to_wire_valid` compresses a
-        // fully-valid masked structure to its parent bit
-        // (`bit += desc.size()`), and the decoder expands that set root bit
-        // back to the whole structure (both members) — so the full builder
-        // still conveys every member while the partial builder narrows to
-        // the changed leaf. The contrast the residual gap describes holds:
-        // root/whole-struct {0} vs leaf-level {1}.
-        let full = build_monitor_payload(ioid, &intro, &curr, &mask, order);
+        // Full builder: a wildcard (all-set) request mask enumerates every
+        // LEAF — {1, 2}, never the root bit. pvxs `to_wire_valid`
+        // (dataencode.cpp:414-439) sets a wire bit only where
+        // `store[bit].valid`, and `Value::mark` (data.cpp:256-270) never
+        // validates a parent structure, so a root bit cannot appear.
+        let full = build_monitor_payload(ioid, &intro, &curr, None, &mask, order);
         let (full_frame, _) = try_parse_frame(&full).unwrap().expect("complete frame");
         let full_data = match decode_op_response(&full_frame, Some(&intro)).unwrap() {
             OpResponse::Data(d) => d,
             other => panic!("expected monitor data, got {other:?}"),
         };
-        assert!(
-            full_data.changed.get(0),
-            "full-mask builder emits the root structure bit (whole-struct \
-             compression) — pvxs to_wire_valid byte-exact"
-        );
-        assert!(
-            !full_data.changed.get(1) && !full_data.changed.get(2),
-            "descendant leaf bits are not emitted under the set root bit"
+        assert_eq!(
+            full_data.changed.iter().collect::<Vec<_>>(),
+            vec![1, 2],
+            "full-mask builder enumerates leaves, never the root structure \
+             bit — pvxs to_wire_valid byte-exact (testxcode.cpp:111-116)"
         );
         match &full_data.value {
             PvField::Structure(s) => {
-                // The whole structure is conveyed despite the compressed
-                // bitset: both members decode from the set root bit.
                 assert_eq!(
                     s.get_field("a"),
                     Some(&PvField::Scalar(ScalarValue::Double(9.0)))
@@ -13144,6 +14592,184 @@ mod tests {
             }
             other => panic!("expected structure, got {other:?}"),
         }
+    }
+
+    /// R15-33: one framing rule for every value the server sends with a
+    /// changed-bitset — MONITOR data, the MONITOR seed, the GET reply, the
+    /// PUT_GET readback. pvxs frames all four with the same call,
+    /// `to_wire_valid(R, value, &pvMask)` (`servermon.cpp:174`,
+    /// `serverget.cpp:104`), over a value the source only partially assigned
+    /// (`IOCSource::initialize` + `IOCSource::get` into a `cloneEmpty()`).
+    ///
+    /// So a read that declares its assigned leaves ([`SourceRead::marked`])
+    /// frames THOSE, intersected with the request mask — not every leaf the
+    /// mask selected. Both arms tested per boundary, plus the mask
+    /// intersection that bounds either.
+    #[test]
+    fn read_changed_bitset_frames_only_the_leaves_the_source_assigned() {
+        let intro = FieldDesc::Structure {
+            struct_id: "structure".into(),
+            fields: vec![
+                ("a".into(), FieldDesc::Scalar(ScalarType::Double)),
+                ("b".into(), FieldDesc::Scalar(ScalarType::Double)),
+                ("c".into(), FieldDesc::Scalar(ScalarType::Double)),
+            ],
+        };
+        let all = BitSet::all_set(intro.total_bits());
+
+        // `marked: None` — a wholly-assigned value (pvxs's fully-marked
+        // `Value`): every leaf the request selected, root bit excluded.
+        assert_eq!(
+            read_changed_bitset(&intro, &all, None)
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "an unmarked read frames every selected leaf"
+        );
+
+        // `marked: Some` — only the assigned leaves reach the wire, which is
+        // what makes a QSRV GET omit the seven leaves `getProperties` never
+        // assigns (`testqsingle.cpp:129-149`).
+        let assigned = vec!["a".to_string(), "c".to_string()];
+        assert_eq!(
+            read_changed_bitset(&intro, &all, Some(&assigned))
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![1, 3],
+            "a declared read frames only the leaves the source assigned"
+        );
+
+        // The request mask still bounds it: a leaf the source assigned but the
+        // client did not select is not framed (`… & pvMask`).
+        let mut only_a = BitSet::new();
+        only_a.set(1);
+        assert_eq!(
+            read_changed_bitset(&intro, &only_a, Some(&assigned))
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![1],
+            "the request mask bounds the assigned set"
+        );
+    }
+
+    /// W10-C2: byte-level pin on the connect-time monitor **seed** frame.
+    ///
+    /// The seed is queued with `marked: None` and no previous snapshot
+    /// (`MonitorQueue::seed`), so the emitter dispatches it to
+    /// [`build_monitor_payload`] with the op's full pvRequest mask. Its
+    /// changed-bitset is therefore the leaf enumeration of that mask —
+    /// pvxs `to_wire_valid` (`dataencode.cpp:414-439`) sets a wire bit only
+    /// where `store[bit].valid`, and `Value::mark` (`data.cpp:256-270`)
+    /// never validates a parent structure, so neither the root bit (0) nor
+    /// the `alarm` (2) / `timeStamp` (6) bits can appear.
+    /// `test/testxcode.cpp:111-116` is the upstream regression for this.
+    ///
+    /// Asserted byte-for-byte so a future bitset change cannot silently
+    /// drift the seed frame.
+    #[test]
+    fn w10_c2_monitor_seed_frame_bytes_are_leaf_enumerated() {
+        let order = ByteOrder::Big; // pvxs testxcode serializes big-endian
+        let ioid = 1u32;
+        // NTScalar<UInt32> exactly as pvxs's nt::NTScalar{TypeCode::UInt32}:
+        // 0=root 1=value 2=alarm 3=.severity 4=.status 5=.message
+        // 6=timeStamp 7=.secondsPastEpoch 8=.nanoseconds 9=.userTag
+        let intro = FieldDesc::Structure {
+            struct_id: "epics:nt/NTScalar:1.0".into(),
+            fields: vec![
+                ("value".into(), FieldDesc::Scalar(ScalarType::UInt)),
+                (
+                    "alarm".into(),
+                    FieldDesc::Structure {
+                        struct_id: "alarm_t".into(),
+                        fields: vec![
+                            ("severity".into(), FieldDesc::Scalar(ScalarType::Int)),
+                            ("status".into(), FieldDesc::Scalar(ScalarType::Int)),
+                            ("message".into(), FieldDesc::Scalar(ScalarType::String)),
+                        ],
+                    },
+                ),
+                (
+                    "timeStamp".into(),
+                    FieldDesc::Structure {
+                        struct_id: "time_t".into(),
+                        fields: vec![
+                            (
+                                "secondsPastEpoch".into(),
+                                FieldDesc::Scalar(ScalarType::Long),
+                            ),
+                            ("nanoseconds".into(), FieldDesc::Scalar(ScalarType::Int)),
+                            ("userTag".into(), FieldDesc::Scalar(ScalarType::Int)),
+                        ],
+                    },
+                ),
+            ],
+        };
+        let mut alarm = PvStructure::new("alarm_t");
+        alarm
+            .fields
+            .push(("severity".into(), PvField::Scalar(ScalarValue::Int(1))));
+        alarm
+            .fields
+            .push(("status".into(), PvField::Scalar(ScalarValue::Int(2))));
+        alarm.fields.push((
+            "message".into(),
+            PvField::Scalar(ScalarValue::String("hi".into())),
+        ));
+        let mut ts = PvStructure::new("time_t");
+        ts.fields.push((
+            "secondsPastEpoch".into(),
+            PvField::Scalar(ScalarValue::Long(5)),
+        ));
+        ts.fields
+            .push(("nanoseconds".into(), PvField::Scalar(ScalarValue::Int(6))));
+        ts.fields
+            .push(("userTag".into(), PvField::Scalar(ScalarValue::Int(7))));
+        let mut root = PvStructure::new("epics:nt/NTScalar:1.0");
+        root.fields.push((
+            "value".into(),
+            PvField::Scalar(ScalarValue::UInt(0xdead_beef)),
+        ));
+        root.fields
+            .push(("alarm".into(), PvField::Structure(alarm)));
+        root.fields
+            .push(("timeStamp".into(), PvField::Structure(ts)));
+        let seed = PvField::Structure(root);
+
+        // A wildcard pvRequest: `request_to_mask` selects every bit.
+        let mask = BitSet::all_set(intro.total_bits());
+        // The seed goes through the FIFO as `marked: None`, which the
+        // emitter dispatches to `build_monitor_payload`.
+        let mut q = MonitorQueue::new(4, &intro, &mask);
+        q.seed(seed.clone().into());
+        let ev = q.pop().expect("seed queued");
+        assert!(ev.marked.is_none(), "the seed carries no explicit mark set");
+
+        let frame =
+            build_monitor_payload(ioid, &intro, &ev.value, ev.marked.as_deref(), &mask, order);
+        // 8-byte PVA header, then the payload.
+        let payload = &frame[8..];
+
+        #[rustfmt::skip]
+        let expected: Vec<u8> = vec![
+            0x00, 0x00, 0x00, 0x01,             // ioid
+            0x00,                               // subcmd (monitor data)
+            // changed BitSet: 2 bytes, bits {1,3,4,5,7,8,9}.
+            // byte0 = 1<<1|1<<3|1<<4|1<<5|1<<7 = 0xBA; byte1 = 1<<0|1<<1 = 0x03.
+            0x02, 0xBA, 0x03,
+            0xde, 0xad, 0xbe, 0xef,             // value: UInt 0xdeadbeef
+            0x00, 0x00, 0x00, 0x01,             // alarm.severity = 1
+            0x00, 0x00, 0x00, 0x02,             // alarm.status   = 2
+            0x02, b'h', b'i',                   // alarm.message  = "hi"
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, // timeStamp.secondsPastEpoch = 5
+            0x00, 0x00, 0x00, 0x06,             // timeStamp.nanoseconds = 6
+            0x00, 0x00, 0x00, 0x07,             // timeStamp.userTag = 7
+            0x00,                               // overrun BitSet: empty (servermon.cpp:174-176)
+        ];
+        assert_eq!(
+            payload, expected,
+            "connect-time monitor seed frame bytes (leaf-enumerated \
+             changed-bitset; pvxs testxcode.cpp:111-116)"
+        );
     }
 
     /// pvxs `servermon.cpp:493` parity: when the client sets the
@@ -15018,6 +16644,7 @@ mod tests {
             authority: String::new(),
             roles: Vec::new(),
             pv_request: None,
+            log: Default::default(),
         };
 
         // Delta marking only field `b` (bit 2) -> 99.
@@ -15389,6 +17016,7 @@ mod tests {
                 authority: String::new(),
                 roles: Vec::new(),
                 pv_request: None,
+                log: Default::default(),
             };
 
             let src_a = Arc::clone(&source);
@@ -16746,7 +18374,6 @@ mod tests {
                 monitor_filters: Arc::new(
                     epics_base_rs::server::database::filters::FilterChain::new(),
                 ),
-                put_auto_exec: true,
                 pv_request: None,
                 monitor_options: crate::server_native::source::MonitorOptions::default(),
                 data_task_abort: None,
@@ -17641,6 +19268,7 @@ mod tests {
             authority: String::new(),
             roles: Vec::new(),
             pv_request: None,
+            log: Default::default(),
         }
     }
 
@@ -18760,14 +20388,146 @@ mod tests {
 
 #[cfg(test)]
 mod autoexec_tests {
-    //! epics-base PR `70735383350b` regression: the
-    //! `record._options.autoExec` pvRequest option must parse
-    //! correctly into the per-op `put_auto_exec` flag.
+    //! R10-34: `autoExec` is a pvxs CLIENT-side builder flag
+    //! (`SubBuilder::autoExec`, `src/pvxs/client.h:698` → `op->autoExec`,
+    //! `clientget.cpp:633`), never a pvRequest member. pvxs has NO
+    //! server-side reader for it: `serverget.cpp:488-492` runs `onPut` on
+    //! every `CMD_PUT` with `!init`, whatever the client's `autoExec`.
+    //!
+    //! The port used to parse `record._options.autoExec` server-side into a
+    //! per-op flag. These tests pin the contract that replaces it: the
+    //! option is INERT on the server. They fail if a server-side gate is
+    //! reintroduced.
 
     use super::*;
-    use crate::pvdata::{PvField, PvStructure, ScalarValue};
+    use crate::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
+    use crate::server_native::SharedSource;
+    use crate::server_native::runtime::PvaServerConfig;
+    use crate::server_native::shared_pv::SharedPV;
+    use crate::server_native::tcp::ClientCredentials;
+    use std::sync::Arc;
 
-    fn build_request(autoexec: Option<&str>) -> PvField {
+    // Local test scaffolding, per this file's convention for `#[cfg(test)]`
+    // sub-modules (`mod tests` keeps its copies private).
+    fn synth_frame(command: Command, order: ByteOrder, payload: Vec<u8>) -> Frame {
+        let header = PvaHeader::application(false, order, command.code(), payload.len() as u32);
+        Frame { header, payload }
+    }
+
+    fn discard_mon_fin() -> mpsc::UnboundedSender<MonitorFinished> {
+        mpsc::unbounded_channel().0
+    }
+
+    fn discard_exec_fin() -> mpsc::UnboundedSender<ExecFinished> {
+        mpsc::unbounded_channel().0
+    }
+
+    /// Drive a PUT INIT (carrying `pv_request`) + PUT EXEC (writing 2.5)
+    /// through `handle_op`, and return the PV's value afterwards.
+    async fn put_through(pv_request: PvField) -> Option<PvField> {
+        let order = ByteOrder::Little;
+        let sid: u32 = 1;
+        let ioid: u32 = 77;
+
+        let pv = SharedPV::build_mailbox();
+        let intro = FieldDesc::Structure {
+            struct_id: "epics:nt/NTScalar:1.0".into(),
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+        };
+        let mut initial = PvStructure::new("epics:nt/NTScalar:1.0");
+        initial
+            .fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::Double(1.0))));
+        pv.open(intro.clone(), PvField::Structure(initial)).unwrap();
+
+        let shared = SharedSource::new();
+        shared.add("dut", pv.clone());
+        let source: DynSource = Arc::new(shared);
+
+        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        channels.insert(
+            sid,
+            ChannelState {
+                name: "dut".into(),
+                cid: 0,
+                sid,
+                introspection: Some(intro.clone()),
+                source: source.clone(),
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                open_cred: ClientCredentials::anonymous(),
+                ops: HashMap::new(),
+            },
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let config = PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = ClientCredentials::anonymous();
+
+        let req_desc = pv_request.descriptor();
+        let mut init_payload = Vec::new();
+        init_payload.put_u32(sid, order);
+        init_payload.put_u32(ioid, order);
+        init_payload.put_u8(0x08);
+        crate::pvdata::encode::encode_type_desc(&req_desc, order, &mut init_payload);
+        crate::pvdata::encode::encode_pv_field(&pv_request, &req_desc, order, &mut init_payload);
+        let init_frame = synth_frame(Command::Put, order, init_payload);
+        handle_op(
+            &init_frame,
+            &tx,
+            &mut channels,
+            order,
+            &fixed_out_order(order),
+            OpKind::Put,
+            &config,
+            &mut encode_cache,
+            &mut TypeCache::new(),
+            peer,
+            &cred,
+            &discard_mon_fin(),
+            &discard_exec_fin(),
+        )
+        .await
+        .expect("PUT INIT ok");
+        let _ = rx.recv().await.expect("INIT resp");
+
+        let new_val = {
+            let mut s = PvStructure::new("epics:nt/NTScalar:1.0");
+            s.fields
+                .push(("value".into(), PvField::Scalar(ScalarValue::Double(2.5))));
+            PvField::Structure(s)
+        };
+        let mut exec_payload = Vec::new();
+        exec_payload.put_u32(sid, order);
+        exec_payload.put_u32(ioid, order);
+        exec_payload.put_u8(0x00);
+        let bs = BitSet::all_set(intro.total_bits());
+        bs.write_into(order, &mut exec_payload);
+        crate::pvdata::encode::encode_pv_field(&new_val, &intro, order, &mut exec_payload);
+        let exec_frame = synth_frame(Command::Put, order, exec_payload);
+        handle_op(
+            &exec_frame,
+            &tx,
+            &mut channels,
+            order,
+            &fixed_out_order(order),
+            OpKind::Put,
+            &config,
+            &mut encode_cache,
+            &mut TypeCache::new(),
+            peer,
+            &cred,
+            &discard_mon_fin(),
+            &discard_exec_fin(),
+        )
+        .await
+        .expect("PUT EXEC ok");
+        let _ = rx.recv().await.expect("PUT EXEC response emitted");
+        pv.current()
+    }
+
+    fn request_with_autoexec(autoexec: Option<&str>) -> PvField {
         let mut options = PvStructure::new("");
         if let Some(s) = autoexec {
             options.fields.push((
@@ -18785,60 +20545,51 @@ mod autoexec_tests {
         PvField::Structure(root)
     }
 
-    #[test]
-    fn parses_explicit_false() {
-        let req = build_request(Some("false"));
-        assert_eq!(put_autoexec_from_request(Some(&req)), Some(false));
-    }
-
-    #[test]
-    fn parses_explicit_true() {
-        let req = build_request(Some("true"));
-        assert_eq!(put_autoexec_from_request(Some(&req)), Some(true));
-    }
-
-    #[test]
-    fn parses_alternate_truthy_strings() {
-        for v in ["yes", "1", "TRUE"] {
-            let req = build_request(Some(v));
-            assert_eq!(
-                put_autoexec_from_request(Some(&req)),
-                Some(true),
-                "{v} must parse as true"
-            );
-        }
-        for v in ["no", "0", "FALSE"] {
-            let req = build_request(Some(v));
-            assert_eq!(
-                put_autoexec_from_request(Some(&req)),
-                Some(false),
-                "{v} must parse as false"
-            );
+    fn value_of(pv: Option<PvField>) -> f64 {
+        match pv {
+            Some(PvField::Structure(s)) => match s.get_field("value") {
+                Some(PvField::Scalar(ScalarValue::Double(v))) => *v,
+                other => panic!("unexpected value member: {other:?}"),
+            },
+            other => panic!("unexpected PV shape: {other:?}"),
         }
     }
 
-    #[test]
-    fn missing_field_returns_none() {
-        let req = build_request(None);
-        assert_eq!(put_autoexec_from_request(Some(&req)), None);
+    /// `record._options.autoExec=false` must NOT suppress the write: pvxs
+    /// never reads the option server-side, so the EXEC commits.
+    #[tokio::test]
+    async fn autoexec_false_still_commits_the_put() {
+        let after = put_through(request_with_autoexec(Some("false"))).await;
+        assert_eq!(
+            value_of(after),
+            2.5,
+            "autoExec=false is a client-side flag; the server must still commit the EXEC"
+        );
     }
 
-    #[test]
-    fn no_request_returns_none() {
-        assert_eq!(put_autoexec_from_request(None), None);
+    /// Negative control: with the option absent the EXEC commits too — so
+    /// the assertion above is pinning "the option is inert", not merely
+    /// "PUT works".
+    #[tokio::test]
+    async fn put_without_autoexec_commits_identically() {
+        let after = put_through(request_with_autoexec(None)).await;
+        assert_eq!(value_of(after), 2.5);
     }
 
-    #[test]
-    fn malformed_request_returns_none() {
-        // Plain scalar — not a Structure. Must not panic.
-        let req = PvField::Scalar(ScalarValue::Double(42.0));
-        assert_eq!(put_autoexec_from_request(Some(&req)), None);
-    }
-
-    #[test]
-    fn unknown_string_returns_none() {
-        let req = build_request(Some("maybe"));
-        assert_eq!(put_autoexec_from_request(Some(&req)), None);
+    /// The option is inert for EVERY spelling — including the ones the
+    /// deleted parser treated as false (`"no"`, `"0"`) and the ones it
+    /// rejected outright (`"maybe"`). No server-side branch may depend on
+    /// this text.
+    #[tokio::test]
+    async fn every_autoexec_spelling_is_inert() {
+        for v in ["false", "FALSE", "no", "0", "true", "maybe"] {
+            let after = put_through(request_with_autoexec(Some(v))).await;
+            assert_eq!(
+                value_of(after),
+                2.5,
+                "autoExec={v:?} must not gate the server-side write"
+            );
+        }
     }
 }
 

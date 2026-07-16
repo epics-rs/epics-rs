@@ -7,9 +7,11 @@ use std::io::{Read, Write};
 use std::net::{TcpStream, UdpSocket};
 use std::time::Duration;
 
+use super::option_parse::parse_yn_option;
 use crate::error::{AsynError, AsynResult, AsynStatus};
 use crate::exception::AsynException;
-use crate::interpose::{EomReason, OctetNext, OctetReadResult};
+use crate::interpose::com::{ComInterpose, ComPortOptions};
+use crate::interpose::{EomReason, OctetInterpose, OctetNext, OctetReadResult};
 use crate::port::{PortDriver, PortDriverBase, PortFlags};
 use crate::trace::TraceMask;
 use crate::user::AsynUser;
@@ -48,6 +50,32 @@ pub enum IpProtocol {
     /// HTTP: TCP with connect-per-transaction (C parity:
     /// `FLAG_CONNECT_PER_TRANSACTION` from line 368-371).
     Http,
+    /// `COM` — a remote serial port on a terminal server, reached over plain
+    /// TCP and configured by RFC 2217 telnet COM-port-option negotiation.
+    ///
+    /// C parity (`drvAsynIPPort.c:364-367`): the token sets `isCom` and leaves
+    /// `socketType = SOCK_STREAM`, so the transport is exactly TCP. What it
+    /// changes is that `drvAsynIPPortConfigure` then installs
+    /// `asynInterposeCOM` on the port (:1061) — the layer that IAC-escapes the
+    /// data stream and carries baud/bits/parity/stop/flow to the server. See
+    /// [`crate::interpose::com`].
+    Com,
+}
+
+impl IpProtocol {
+    /// C's `FLAG_BROADCAST` (drvAsynIPPort.c:372-374) — the `udp*` suffix.
+    fn broadcast(self) -> bool {
+        matches!(self, Self::UdpBroadcast | Self::UdpBroadcastReusePort)
+    }
+
+    /// C's `FLAG_SO_REUSEPORT` (drvAsynIPPort.c:360-363, :375-378) — the `&`
+    /// suffix, on TCP or UDP.
+    fn reuse_port(self) -> bool {
+        matches!(
+            self,
+            Self::TcpReusePort | Self::UdpReusePort | Self::UdpBroadcastReusePort
+        )
+    }
 }
 
 /// Configuration for an IP port connection.
@@ -112,7 +140,7 @@ impl IpPortConfig {
         }
 
         // Parse protocol suffix (case-insensitive)
-        let (addr_part, proto) = parse_protocol_suffix(spec);
+        let (addr_part, proto) = split_protocol(spec)?;
         let addr_part = addr_part.trim();
 
         // Parse host:port[:localPort], supporting IPv6 brackets
@@ -129,29 +157,60 @@ impl IpPortConfig {
     }
 }
 
-/// Parse the protocol suffix from the end of a spec string.
-/// Returns (remaining_addr_part, protocol).
+/// Split the trailing protocol token off the address part.
+/// Returns `(addr_part, protocol)`.
 ///
-/// Order matters: longest suffix first ("UDP*&" before "UDP*"
-/// before "UDP", and "TCP&" before "TCP") because we use
-/// `ends_with` and the first match wins.
-fn parse_protocol_suffix(spec: &str) -> (&str, IpProtocol) {
-    let upper = spec.to_ascii_uppercase();
+/// C `drvAsynIPPort.c:348-350`: the protocol begins at the first blank
+/// (`strchr(cp, ' ')`) and `sscanf(blank+1, "%5s", protocol)` takes the first
+/// whitespace-delimited run, truncated to five characters (`char protocol[6]`);
+/// whatever follows that run is ignored. With no blank at all, `protocol[0]` is
+/// `'\0'` and C defaults to `SOCK_STREAM` (:355-357).
+///
+/// The token is then classified *exhaustively* — see [`protocol_from_token`].
+/// A whitelist of recognized suffixes is not enough: an unrecognized token has
+/// to be rejected as a protocol, not silently left glued to the port number.
+fn split_protocol(spec: &str) -> AsynResult<(&str, IpProtocol)> {
+    let Some(blank) = spec.find(' ') else {
+        return Ok((spec, IpProtocol::Tcp));
+    };
+    let (addr_part, rest) = spec.split_at(blank);
+    let token: String = rest
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .chars()
+        .take(5)
+        .collect();
+    Ok((addr_part, protocol_from_token(&token)?))
+}
 
-    for (suffix, proto) in [
-        (" UDP*&", IpProtocol::UdpBroadcastReusePort),
-        (" UDP&", IpProtocol::UdpReusePort),
-        (" UDP*", IpProtocol::UdpBroadcast),
-        (" TCP&", IpProtocol::TcpReusePort),
-        (" HTTP", IpProtocol::Http),
-        (" TCP", IpProtocol::Tcp),
-        (" UDP", IpProtocol::Udp),
-    ] {
-        if upper.ends_with(suffix) {
-            return (&spec[..spec.len() - suffix.len()], proto);
-        }
+/// Classify one protocol token, C `drvAsynIPPort.c:355-390` (`epicsStrCaseCmp`,
+/// so case-insensitive). Every token C accepts maps to a variant; every token C
+/// rejects is rejected here with C's message.
+fn protocol_from_token(token: &str) -> AsynResult<IpProtocol> {
+    match token.to_ascii_lowercase().as_str() {
+        "" | "tcp" => Ok(IpProtocol::Tcp),
+        "tcp&" => Ok(IpProtocol::TcpReusePort),
+        "http" => Ok(IpProtocol::Http),
+        "udp" => Ok(IpProtocol::Udp),
+        "udp&" => Ok(IpProtocol::UdpReusePort),
+        "udp*" => Ok(IpProtocol::UdpBroadcast),
+        "udp*&" => Ok(IpProtocol::UdpBroadcastReusePort),
+        // C (:364-367) accepts `com` and sets `isCom`, which makes
+        // `drvAsynIPPortConfigure` install `asynInterposeCOM` (:1061).
+        // `DrvAsynIPPort::new` does the same (R8-57); until that layer existed
+        // this token was refused outright (R8-50), because a `COM` port run as a
+        // plain TCP stream is wrong on the wire in both directions — the device
+        // never receives its serial-line negotiation, and the server's
+        // IAC/subnegotiation bytes reach the record as device data.
+        "com" => Ok(IpProtocol::Com),
+        // C prints the token as `sscanf` read it — original case, truncated to
+        // five characters (:389).
+        _ => Err(AsynError::Status {
+            status: AsynStatus::Error,
+            message: format!("Unknown protocol \"{token}\"."),
+        }),
     }
-    (spec, IpProtocol::Tcp)
 }
 
 /// Parse `host:port[:localPort]` with IPv6 bracket support.
@@ -237,25 +296,35 @@ enum IpIoInner {
 }
 
 /// Write all data with retry on WouldBlock/Interrupted, enforcing a deadline.
+/// Write `data` to the stream, retrying short writes until the deadline.
+///
+/// Returns the bytes the peer accepted. C parity
+/// (`drvAsynIPPort.c::writeRaw`, like `drvAsynSerialPort.c:849`): a write that
+/// stalls part-way reports `*nbytesTransfered` **together with** its
+/// `asynTimeout`/`asynError` status, so a failure here carries the accepted
+/// count in [`AsynError::with_partial_write`] rather than dropping it — that
+/// count is what `asynRecord` publishes as NAWT (asynRecord.c:1547).
 fn write_with_retry(
     stream: &mut impl Write,
     data: &[u8],
     deadline: std::time::Instant,
-) -> AsynResult<()> {
+) -> AsynResult<usize> {
     let mut offset = 0;
     while offset < data.len() {
         if std::time::Instant::now() > deadline {
             return Err(AsynError::Status {
                 status: AsynStatus::Timeout,
                 message: "write timeout".into(),
-            });
+            }
+            .with_partial_write(offset));
         }
         match stream.write(&data[offset..]) {
             Ok(0) => {
                 return Err(AsynError::Status {
                     status: AsynStatus::Timeout,
                     message: "write returned 0 bytes".into(),
-                });
+                }
+                .with_partial_write(offset));
             }
             Ok(n) => offset += n,
             Err(ref e)
@@ -264,10 +333,10 @@ fn write_with_retry(
             {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
-            Err(e) => return Err(AsynError::Io(e)),
+            Err(e) => return Err(AsynError::Io(e).with_partial_write(offset)),
         }
     }
-    Ok(())
+    Ok(offset)
 }
 
 struct IpIoState {
@@ -391,24 +460,28 @@ impl OctetNext for IpIoState {
         // through. socket_poll_timeout is a no-op for any positive timeout, so
         // this only affects the `timeout == 0` case.
         let deadline = std::time::Instant::now() + socket_poll_timeout(user.timeout);
+        // C writeRaw reports what the socket took (`*nbytesTransfered`) on
+        // success and on failure alike; return the real count rather than
+        // assuming the whole buffer went out.
         match inner {
             IpIoInner::Tcp(stream) => {
                 stream.set_write_timeout(Some(socket_poll_timeout(user.timeout)))?;
-                write_with_retry(stream, data, deadline)?;
+                write_with_retry(stream, data, deadline)
             }
             IpIoInner::Udp(socket, peer) => {
                 socket.set_write_timeout(Some(socket_poll_timeout(user.timeout)))?;
                 // C drvAsynIPPort.c::writeRaw (656): sendto the resolved
-                // remote on the unconnected socket.
-                socket.send_to(data, *peer)?;
+                // remote on the unconnected socket. A datagram is all-or-
+                // nothing, so a failed sendto transferred zero bytes and needs
+                // no partial-write carrier.
+                Ok(socket.send_to(data, *peer)?)
             }
             #[cfg(unix)]
             IpIoInner::Unix(stream) => {
                 stream.set_write_timeout(Some(socket_poll_timeout(user.timeout)))?;
-                write_with_retry(stream, data, deadline)?;
+                write_with_retry(stream, data, deadline)
             }
         }
-        Ok(data.len())
     }
 
     /// Base-layer flush — C parity with `drvAsynIPPort.c::flushIt`,
@@ -495,6 +568,58 @@ pub struct DrvAsynIPPort {
     /// `getOption("hostInfo")` returns it verbatim. Kept so the IP driver's
     /// `get_option` can echo the live endpoint instead of the generic map.
     host_info: String,
+    /// Both halves of C's COM interpose, present exactly when the configure
+    /// string's protocol token was `COM` — C's `tty->isCom` (`drvAsynIPPort.c`
+    /// :113, :364-365) and the `asynInterposeCOM` install it gates (:1061).
+    com: Option<ComState>,
+}
+
+/// The two halves of C's `asynInterposeCOM`, which it interposes on the port as
+/// two separate interfaces (`asynInterposeCom.c:792-824`). One `Option`, so "a
+/// COM port has both halves and a non-COM port has neither" holds by type.
+struct ComState {
+    /// The `asynOctet` half — IAC stuffing.
+    ///
+    /// Deliberately **not** installed onto [`PortDriverBase::interpose_octet`]. C
+    /// installs COM at :1061 and the EOS interpose at :1065, and its
+    /// `interposeInterface` makes each *later* install the *outer* one — so C's
+    /// chain is `EOS → COM → driver`, with COM directly above the IP driver's
+    /// octet interface and below every other interpose.
+    ///
+    /// Making it the base link (see [`DrvAsynIPPort::with_base_link`]) puts it
+    /// beneath every stack layer *by construction*, so no install order can get it
+    /// wrong — rather than pinning the ordering with a convention the next person
+    /// to install a layer has to know about. (The stack now follows C's rule too —
+    /// [`crate::interpose::OctetInterposeStack::install`] — so COM installed first
+    /// would land innermost anyway; the base link keeps the invariant whatever
+    /// else is installed later.)
+    octet: ComInterpose,
+    /// The `asynOption` half — the negotiation and the serial settings it
+    /// carries. Driven against the raw link, since C's `setOption`/`getOption`
+    /// negotiate through `pasynOctetDrv`, the driver *below* the interpose
+    /// (`asynInterposeCom.c:339`, :430) — so the negotiation is neither stuffed
+    /// nor unstuffed by the octet half above.
+    options: ComPortOptions,
+}
+
+/// The base of the interpose chain for a COM port: the socket with the IAC layer
+/// wrapped around it. See [`ComState::octet`] for why COM lives here rather than
+/// on the stack.
+struct ComLink<'a> {
+    io: &'a mut IpIoState,
+    com: &'a mut ComInterpose,
+}
+
+impl OctetNext for ComLink<'_> {
+    fn read(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<OctetReadResult> {
+        self.com.read(user, buf, self.io)
+    }
+    fn write(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+        self.com.write(user, data, self.io)
+    }
+    fn flush(&mut self, user: &mut AsynUser) -> AsynResult<()> {
+        self.com.flush(user, self.io)
+    }
 }
 
 /// True for a socket read error that C `readRaw` treats as a non-fatal
@@ -527,6 +652,146 @@ pub(crate) fn maxchars_zero_error() -> AsynError {
     }
 }
 
+/// What C `readRaw` does with a failed read (drvAsynIPPort.c:797-812) — the
+/// teardown and the status it reports, as one value.
+///
+/// ```c
+/// int should_disconnect = (((tty->disconnectOnReadTimeout) && (pasynUser->timeout > 0)) ||
+///                          ((SOCKERRNO != SOCK_EWOULDBLOCK) && (SOCKERRNO != SOCK_EINTR)));
+/// if (should_disconnect) {
+///     epicsSnprintf(... "%s read error: %s" ...);
+///     closeConnection(pasynUser,tty,"Read error");
+///     status = asynError;                       /* :805 */
+/// } else {
+///     epicsSnprintf(... "%s timeout: %s" ...);
+///     status = asynTimeout;                     /* :811 */
+/// }
+/// ```
+///
+/// C decides both in one statement: the branch that closes the socket is the
+/// branch that reports `asynError`. Returning them separately is what let the
+/// port drop the connection and still hand the caller the lower layer's
+/// `asynTimeout` — so ERRS read `"Read error, nread=0, timeout"` where C says
+/// `"error"`, and a SyncIO caller branching on the status saw a retryable
+/// timeout on a link that no longer exists.
+struct ReadFailure {
+    /// C's `should_disconnect`: a timeout tears down only when the option is on
+    /// *and* the request carried a positive timeout (a `timeout == 0` poll —
+    /// floored to a 1 ms socket poll by [`socket_poll_timeout`] — expires with
+    /// the socket intact), and any non-would-block, non-EINTR error tears down
+    /// unconditionally.
+    disconnect: bool,
+    /// The error the caller reports: C's `asynError` + `"read error"` text on
+    /// the teardown branch, the lower layer's failure verbatim otherwise.
+    error: AsynError,
+}
+
+/// Single owner of C `readRaw`'s failed-read rule. C applies it *inside*
+/// `readRaw`, which is below the interpose chain — so it governs both the data
+/// path ([`DrvAsynIPPort::read_octet_core`]) and the RFC 2217 negotiation
+/// ([`NegotiationLink`]), which C likewise drives through `readIt`/`readRaw`
+/// (`asynInterposeCom.c:103` calls `pasynOctetDrv->read`, the driver below).
+/// Both callers take the teardown *and* the reported status from here, so
+/// neither can drift.
+fn classify_read_failure(
+    e: AsynError,
+    disconnect_on_read_timeout: bool,
+    timeout: Duration,
+    device_name: &str,
+) -> ReadFailure {
+    // Classify by the carried status, not the variant: an interpose below may
+    // wrap the lower-layer timeout in `PartialRead`, and a variant match would
+    // miss it.
+    let is_timeout = e.status() == AsynStatus::Timeout;
+    let disconnect = (disconnect_on_read_timeout && is_timeout && timeout > Duration::ZERO)
+        || e.is_fatal_transport();
+    if !disconnect {
+        return ReadFailure {
+            disconnect: false,
+            error: e,
+        };
+    }
+    // C overwrites `pasynUser->errorMessage` and the status together (:801-805)
+    // — while the partial transfer already in the caller's buffer stands, because
+    // `*nbytesTransfered = thisRead` (:824) runs on both branches. So restamp the
+    // failure and re-attach whatever the read did deliver.
+    let partial = e.partial_read().cloned();
+    let restamped = AsynError::Status {
+        status: AsynStatus::Error,
+        message: format!("{device_name} read error: {}", e.message()),
+    };
+    ReadFailure {
+        disconnect: true,
+        error: match partial {
+            Some(p) => restamped.with_partial_read(p),
+            None => restamped,
+        },
+    }
+}
+
+/// The raw link the RFC 2217 negotiation drives, and the teardown decision it
+/// hands back.
+///
+/// C's COM interpose negotiates against `pinterposePvt->pasynOctetDrv`
+/// (`asynInterposeCom.c:339`, :430, :103) — the octet driver *below* itself, so
+/// the negotiation is neither IAC-stuffed nor unstuffed. But that lower driver is
+/// `drvAsynIPPort`'s `readIt`/`readRaw`, which still applies the
+/// disconnect-on-read-timeout / fatal-error teardown per read. Handing
+/// [`ComPortOptions`] a bare `IpIoState` would have skipped it, leaving a COM
+/// port with `disconnectOnReadTimeout=Y` holding a socket C would have closed.
+///
+/// The socket has one owner ([`DrvAsynIPPort`]), and a `&mut IpIoState` borrow is
+/// live for the whole negotiation, so this cannot call `drop_connection` itself.
+/// It records the decision instead and the owner applies it once the borrow ends
+/// — the same "return the delta, let the owner commit it" shape the rest of the
+/// driver uses.
+struct NegotiationLink<'a> {
+    io: &'a mut IpIoState,
+    disconnect_on_read_timeout: bool,
+    /// C `tty->IPDeviceName`, for the `"%s read error: %s"` text `readRaw`
+    /// reports on the teardown branch (drvAsynIPPort.c:801-803).
+    device_name: &'a str,
+    /// Set when a read failed in a way C's `readRaw` would have closed the
+    /// socket for. Read back by [`DrvAsynIPPort::with_negotiation`].
+    teardown: bool,
+}
+
+impl OctetNext for NegotiationLink<'_> {
+    fn read(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<OctetReadResult> {
+        match self.io.read(user, buf) {
+            Ok(r) => Ok(r),
+            Err(e) => {
+                let failure = classify_read_failure(
+                    e,
+                    self.disconnect_on_read_timeout,
+                    user.timeout,
+                    self.device_name,
+                );
+                if failure.disconnect {
+                    self.teardown = true;
+                }
+                Err(failure.error)
+            }
+        }
+    }
+
+    fn write(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+        let r = self.io.write(user, data);
+        if let Err(ref e) = r {
+            // C `writeRaw` (drvAsynIPPort.c:625-640) closes the connection on any
+            // failing send, which `is_fatal_transport` is the single owner of.
+            if e.is_fatal_transport() {
+                self.teardown = true;
+            }
+        }
+        r
+    }
+
+    fn flush(&mut self, user: &mut AsynUser) -> AsynResult<()> {
+        self.io.flush(user)
+    }
+}
+
 /// Classify a failed socket read for the IP client read arms. A non-fatal
 /// timeout (see [`is_nonfatal_read_timeout`]) surfaces as `asynTimeout` with
 /// the socket left intact; any other error is a real transport failure
@@ -541,21 +806,6 @@ fn classify_read_error(e: std::io::Error) -> AsynError {
     } else {
         AsynError::Io(e)
     }
-}
-
-/// A transport error meaning the socket is broken and the connection must
-/// be torn down (vs a timeout / would-block, which leaves it intact). C
-/// parity: `drvAsynIPPort.c` calls `closeConnection` on any real
-/// `recv`/`send` error but returns `asynTimeout` with the socket intact on
-/// a poll/timeout expiry.
-fn is_fatal_transport_error(e: &AsynError) -> bool {
-    matches!(
-        e,
-        AsynError::Status {
-            status: AsynStatus::Disconnected,
-            ..
-        } | AsynError::Io(_)
-    )
 }
 
 /// Map an `AsynUser` timeout to the socket-level receive/send timeout,
@@ -633,10 +883,7 @@ impl DrvAsynIPPort {
             self.connect(&AsynUser::default())?;
         }
         self.base.check_ready()?;
-        let result = self
-            .base
-            .interpose_octet
-            .dispatch_read(user, buf, &mut self.io);
+        let result = self.with_base_link(|link| link.read(user, buf));
         match result {
             Ok(r) => {
                 asyn_trace_io!(
@@ -659,44 +906,41 @@ impl DrvAsynIPPort {
                 // (no Connect-exception flap); the socket reopens lazily on
                 // the next write.
                 let eof = r.eom_reason.contains(EomReason::END);
-                if eof && self.base.connected {
+                if eof && self.base.is_connected() {
                     self.drop_connection();
                 }
                 Ok((r.nbytes_transferred, r.eom_reason))
             }
             Err(e) => {
-                let is_timeout = matches!(
+                // Classify by the carried status, not by the variant — the
+                // same rule `is_fatal_transport_error` already follows. The
+                // read below is dispatched through the interpose chain, and
+                // `drvAsynIPPortConfigure` installs the EOS interpose by
+                // default (iocsh.rs), which wraps *every* lower-layer failure
+                // — including a zero-byte recv timeout — as `PartialRead`
+                // (C `asynInterposeEos.c:242-253` likewise returns the
+                // lower-layer `asynTimeout`, unchanged, alongside the count).
+                // A variant match therefore never saw a timeout on a default
+                // IP port and `disconnectOnReadTimeout` could not fire; C runs
+                // its test inside readRaw, below the interpose, where the raw
+                // recv timeout is visible (drvAsynIPPort.c:798-806).
+                let failure = classify_read_failure(
                     e,
-                    AsynError::Status {
-                        status: AsynStatus::Timeout,
-                        ..
-                    }
+                    self.disconnect_on_read_timeout,
+                    user.timeout,
+                    &self.host_info,
                 );
-                // C parity: auto-disconnect on:
-                // 1. disconnectOnReadTimeout AND a timeout error AND a
-                //    positive request timeout. C gates this on
-                //    `(disconnectOnReadTimeout) && (timeout > 0)`
-                //    (drvAsynIPPort.c:799), so a `timeout == 0` poll (now a
-                //    1 ms socket poll via `socket_poll_timeout`) that expires
-                //    is reported as `asynTimeout` with the socket left intact,
-                //    never torn down.
-                // 2. Any fatal transport error (connection reset) —
-                //    `is_fatal_transport_error` is the single owner of that
-                //    classification, shared with the write path.
-                let should_disconnect = (self.disconnect_on_read_timeout
-                    && is_timeout
-                    && user.timeout > Duration::ZERO)
-                    || is_fatal_transport_error(&e);
-                if should_disconnect && self.base.connected {
+                if failure.disconnect && self.base.is_connected() {
                     asyn_trace!(
                         Some(self.base.trace),
                         &self.base.port_name,
                         TraceMask::FLOW,
-                        "read error, disconnecting: {e}"
+                        "read error, disconnecting: {}",
+                        failure.error
                     );
                     self.drop_connection();
                 }
-                Err(e)
+                Err(failure.error)
             }
         }
     }
@@ -715,8 +959,22 @@ impl DrvAsynIPPort {
                 destructible: true,
             },
         );
-        base.connected = false;
+        base.init_connected(false);
         base.auto_connect = true;
+        // C passes `interruptProcess = 1` to `pasynOctetBase->initialize`
+        // (drvAsynIPPort.c:1055): every successful octet read on this port fans out to
+        // its octet interrupt users, which is what drives a SCAN="I/O Intr"
+        // record. See `PortDriverBase::octet_interrupt_process`.
+        base.octet_interrupt_process = true;
+
+        // C `drvAsynIPPortConfigure` (:1061): `if (tty->isCom) asynInterposeCOM(...)`
+        // — installed at configure time, before the port ever connects, so the
+        // very first byte of the very first transfer is already IAC-escaped
+        // (R8-57).
+        let com = (config.protocol == IpProtocol::Com).then(|| ComState {
+            octet: ComInterpose::new(),
+            options: ComPortOptions::new(),
+        });
 
         Ok(Self {
             base,
@@ -725,108 +983,253 @@ impl DrvAsynIPPort {
             disconnect_on_read_timeout: false,
             // C parseHostInfo: tty->IPDeviceName = epicsStrDup(hostInfo).
             host_info: config_str.to_string(),
+            com,
         })
     }
 
+    /// Build a port configured exactly as C's `drvAsynIPPortConfigure(portName,
+    /// hostInfo, priority, noAutoConnect, noProcessEos)` leaves one:
+    /// [`Self::new`] plus [`Self::apply_ip_port_configure`] (the `registerPort`
+    /// autoConnect flag and, unless `noProcessEos`, the default EOS interpose —
+    /// drvAsynIPPort.c:1043-1066).
+    ///
+    /// The single public entry for callers outside the iocsh command that need a
+    /// fully-configured IP port — e.g. a `noAutoConnect` port registered for a
+    /// record to attach to without ever dialing. `priority` has no effect in the
+    /// Rust runtime (see the iocsh command), so it takes no such parameter. The
+    /// configure steps stay owned by `apply_ip_port_configure`; this only
+    /// sequences `new` before it.
+    pub fn new_configured(
+        port_name: &str,
+        config_str: &str,
+        no_auto_connect: bool,
+        no_process_eos: bool,
+    ) -> AsynResult<Self> {
+        let mut driver = Self::new(port_name, config_str)?;
+        Self::apply_ip_port_configure(&mut driver.base, no_auto_connect, no_process_eos);
+        Ok(driver)
+    }
+
+    /// Run one transfer against the port's raw octet link — the **bottom** of
+    /// the port's interpose chain, which the port itself runs on top of this
+    /// driver ([`crate::port::octet_read_chain`], C asynManager.c:2190-2220).
+    ///
+    /// Single owner of what that chain terminates at: the raw socket, or — for a
+    /// COM port — the socket wrapped in the IAC layer, which is what puts COM
+    /// beneath every stack layer by construction (see [`ComState::octet`]). Every
+    /// octet path goes through here, so read, write and flush cannot disagree
+    /// about where the chain ends.
+    fn with_base_link<T>(&mut self, f: impl FnOnce(&mut dyn OctetNext) -> T) -> T {
+        match self.com.as_mut() {
+            Some(com) => {
+                let mut link = ComLink {
+                    io: &mut self.io,
+                    com: &mut com.octet,
+                };
+                f(&mut link)
+            }
+            None => f(&mut self.io),
+        }
+    }
+
+    /// Run one RFC 2217 exchange against the link below the interpose, then
+    /// apply whatever teardown C's `readRaw`/`writeRaw` would have applied
+    /// during it.
+    ///
+    /// The single gate for every negotiation in this driver — the connect-time
+    /// handshake and each `setOption` — so the socket-teardown rule cannot be
+    /// enforced on one path and missed on the other. See [`NegotiationLink`] for
+    /// why the decision is carried out rather than applied in place.
+    fn with_negotiation<T>(
+        &mut self,
+        f: impl FnOnce(&mut ComPortOptions, &mut NegotiationLink) -> T,
+    ) -> Option<T> {
+        let com = self.com.as_mut()?;
+        let mut link = NegotiationLink {
+            io: &mut self.io,
+            disconnect_on_read_timeout: self.disconnect_on_read_timeout,
+            device_name: &self.host_info,
+            teardown: false,
+        };
+        let out = f(&mut com.options, &mut link);
+        let teardown = link.teardown;
+        if teardown && self.base.is_connected() {
+            self.drop_connection();
+        }
+        Some(out)
+    }
+
+    /// Run the RFC 2217 handshake against the freshly-connected server.
+    ///
+    /// C wires this to `asynExceptionConnect` (`asynInterposeCom.c:763-774`):
+    /// every time the port connects — including after a terminal server reboots
+    /// — the negotiation is replayed so the serial line comes back up with the
+    /// settings the IOC last asked for. Its failure is reported and *swallowed*,
+    /// exactly as C's `exceptionHandler` does (`asynPrint(ASYN_TRACE_ERROR)`,
+    /// :770-772): a terminal server that merely refuses the negotiation still
+    /// leaves a usable TCP link, and failing the connect here would instead put
+    /// the port into an endless reconnect loop. A negotiation that failed because
+    /// the *socket* died is a different matter, and `with_negotiation` has
+    /// already closed it by the time we get here — same as C.
+    fn restore_com_settings(&mut self) {
+        let Some(Err(e)) = self.with_negotiation(|com, link| com.restore_settings(link)) else {
+            return;
+        };
+        asyn_trace!(
+            Some(self.base.trace),
+            &self.base.port_name,
+            TraceMask::ERROR,
+            "Unable to restore parameters for port {}: {}",
+            self.base.port_name,
+            e.message()
+        );
+    }
+
     /// Push an interpose layer onto the octet I/O stack.
-    pub fn push_interpose(&mut self, layer: Box<dyn crate::interpose::OctetInterpose>) {
-        self.base.push_octet_interpose(layer);
+    pub fn install_interpose(&mut self, layer: Box<dyn crate::interpose::OctetInterpose>) {
+        self.base.install_octet_interpose(layer);
+    }
+
+    /// Everything `drvAsynIPPortConfigure` gives a port beyond constructing the
+    /// driver (drvAsynIPPort.c:1043-1066):
+    ///
+    /// ```c
+    /// pasynManager->registerPort(tty->portName, ASYN_CANBLOCK, !noAutoConnect, ...);
+    /// pasynOctetBase->initialize(tty->portName, &tty->octet, 0, 0, 1);  /* interruptProcess */
+    /// if (!noProcessEos) asynInterposeEosConfig(portName, -1, 1, 1);
+    /// ```
+    ///
+    /// It takes the `PortDriverBase` rather than `&mut self` because **C's
+    /// IP-server child ports are created by this very call** —
+    /// `drvAsynIPServerPortConfigure` runs `drvAsynIPPortConfigure(pl->portName,
+    /// tty->serverInfo, priority, 1 /*noAutoConnect*/, tty->noProcessEos)` for
+    /// each slot (drvAsynIPServerPort.c:688-694). A child is not "a port plus
+    /// some of what a port gets": it gets all of it. Sharing one owner is what
+    /// makes that true here too — the child inherited none of it while each
+    /// property lived inside `DrvAsynIPPort::new` (R19-107, R19-108).
+    pub(crate) fn apply_ip_port_configure(
+        base: &mut crate::port::PortDriverBase,
+        no_auto_connect: bool,
+        no_process_eos: bool,
+    ) {
+        // `pasynOctetBase->initialize(..., interruptProcess = 1)`: every
+        // successful octet read on the port fans out to its octet interrupt
+        // users, which is what drives a SCAN="I/O Intr" record.
+        base.octet_interrupt_process = true;
+        // `registerPort(..., !noAutoConnect, ...)`.
+        base.auto_connect = !no_auto_connect;
+        // `asynInterposeEosConfig(portName, -1, 1, 1)` unless suppressed. Without
+        // it the port has NO EOS layer at all, so an IEOS set on it is accepted,
+        // reads back, and terminates nothing.
+        if !no_process_eos {
+            base.install_octet_interpose(Box::new(crate::interpose::eos::EosInterpose::default()));
+        }
+    }
+
+    /// Create the socket C's `connectIt` creates: fresh fd, then every option
+    /// the protocol suffix asked for — `SO_BROADCAST` (drvAsynIPPort.c:448-459)
+    /// and `SO_REUSEPORT` (:461-477) — applied **before** the socket is bound or
+    /// connected, because that is the only time the kernel honours them. Binding
+    /// first and setting `SO_REUSEPORT` afterwards, as this driver used to, left
+    /// `udp&` with a local port failing `EADDRINUSE` where C binds.
+    ///
+    /// Single owner of socket creation for both transports, so a new option
+    /// cannot be added to one and forgotten on the other.
+    fn new_socket(
+        &self,
+        domain: socket2::Domain,
+        ty: socket2::Type,
+        protocol: socket2::Protocol,
+    ) -> AsynResult<socket2::Socket> {
+        let socket = socket2::Socket::new(domain, ty, Some(protocol))?;
+        if self.config.protocol.broadcast() {
+            socket.set_broadcast(true).map_err(|e| AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!("Can't set {} socket BROADCAST option: {e}", self.host_info),
+            })?;
+        }
+        if self.config.protocol.reuse_port() {
+            // C picks SO_REUSEADDR when `USE_SO_REUSEADDR` is defined for the
+            // target and SO_REUSEPORT otherwise (:465-469); socket2 exposes
+            // `set_reuse_port` only where the option exists.
+            #[cfg(unix)]
+            socket.set_reuse_port(true).map_err(|e| AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!(
+                    "Can't set {} socket SO_REUSEPORT option: {e}",
+                    self.host_info
+                ),
+            })?;
+            #[cfg(not(unix))]
+            socket
+                .set_reuse_address(true)
+                .map_err(|e| AsynError::Status {
+                    status: AsynStatus::Error,
+                    message: format!(
+                        "Can't set {} socket SO_REUSEPORT option: {e}",
+                        self.host_info
+                    ),
+                })?;
+        }
+        Ok(socket)
     }
 
     fn connect_tcp(&mut self) -> AsynResult<TcpStream> {
+        use std::net::ToSocketAddrs;
         let addr_str = format!("{}:{}", self.config.host, self.config.port);
+        // Resolve the remote first: C delays the lookup to connect time too, in
+        // case the device has just appeared in DNS (drvAsynIPPort.c:479-493).
+        let addrs: Vec<std::net::SocketAddr> = addr_str
+            .to_socket_addrs()
+            .map_err(|e| AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!("failed to resolve '{addr_str}': {e}"),
+            })?
+            .collect();
 
-        if let Some(local_port) = self.config.local_port {
-            use std::net::ToSocketAddrs;
-            // Resolve the remote like the no-local-port branch — the old
-            // code used `SocketAddr::parse`, which only accepts literal
-            // IPs, so a hostname target (valid per the config parser)
-            // failed, as did any IPv6 target (domain was forced to IPV4).
-            let addrs: Vec<std::net::SocketAddr> = addr_str
-                .to_socket_addrs()
-                .map_err(|e| AsynError::Status {
-                    status: AsynStatus::Error,
-                    message: format!("failed to resolve '{addr_str}': {e}"),
-                })?
-                .collect();
-
-            let mut last_err: Option<AsynError> = None;
-            for remote_addr in &addrs {
-                let (domain, local_str) = if remote_addr.is_ipv6() {
-                    (socket2::Domain::IPV6, format!("[::]:{local_port}"))
-                } else {
-                    (socket2::Domain::IPV4, format!("0.0.0.0:{local_port}"))
-                };
-                let socket = match socket2::Socket::new(
-                    domain,
-                    socket2::Type::STREAM,
-                    Some(socket2::Protocol::TCP),
-                ) {
+        let mut last_err: Option<AsynError> = None;
+        for remote_addr in &addrs {
+            let domain = if remote_addr.is_ipv6() {
+                socket2::Domain::IPV6
+            } else {
+                socket2::Domain::IPV4
+            };
+            let socket =
+                match self.new_socket(domain, socket2::Type::STREAM, socket2::Protocol::TCP) {
                     Ok(s) => s,
                     Err(e) => {
-                        last_err = Some(AsynError::Io(e));
+                        last_err = Some(e);
                         continue;
                     }
                 };
+            // C binds the local address only when one was configured — "a very
+            // unusual configuration" (:495-506).
+            if let Some(local_port) = self.config.local_port {
+                let local_addr: std::net::SocketAddr = if remote_addr.is_ipv6() {
+                    (std::net::Ipv6Addr::UNSPECIFIED, local_port).into()
+                } else {
+                    (std::net::Ipv4Addr::UNSPECIFIED, local_port).into()
+                };
+                // Not C's: a fixed local port would otherwise be unusable for the
+                // TIME_WAIT lifetime of the previous connection.
                 if let Err(e) = socket.set_reuse_address(true) {
                     last_err = Some(AsynError::Io(e));
                     continue;
                 }
-                let local_addr: std::net::SocketAddr = match local_str.parse() {
-                    Ok(a) => a,
-                    Err(_) => {
-                        last_err = Some(AsynError::Status {
-                            status: AsynStatus::Error,
-                            message: format!("invalid local address: {local_str}"),
-                        });
-                        continue;
-                    }
-                };
                 if let Err(e) = socket.bind(&local_addr.into()) {
                     last_err = Some(AsynError::Io(e));
                     continue;
                 }
-                match socket.connect_timeout(&(*remote_addr).into(), self.config.connect_timeout) {
-                    Ok(()) => return Ok(TcpStream::from(socket)),
-                    Err(e) => last_err = Some(AsynError::Io(e)),
-                }
             }
-            Err(last_err.unwrap_or_else(|| AsynError::Status {
-                status: AsynStatus::Error,
-                message: format!("no addresses found for '{addr_str}'"),
-            }))
-        } else {
-            use std::net::ToSocketAddrs;
-            let addrs: Vec<std::net::SocketAddr> = addr_str
-                .to_socket_addrs()
-                .map_err(|e| AsynError::Status {
-                    status: AsynStatus::Error,
-                    message: format!("failed to resolve '{addr_str}': {e}"),
-                })?
-                .collect();
-
-            let mut last_err = None;
-            let mut connected_stream = None;
-            for addr in &addrs {
-                match TcpStream::connect_timeout(addr, self.config.connect_timeout) {
-                    Ok(s) => {
-                        connected_stream = Some(s);
-                        break;
-                    }
-                    Err(e) => last_err = Some(e),
-                }
+            match socket.connect_timeout(&(*remote_addr).into(), self.config.connect_timeout) {
+                Ok(()) => return Ok(TcpStream::from(socket)),
+                Err(e) => last_err = Some(AsynError::Io(e)),
             }
-            connected_stream.ok_or_else(|| {
-                if let Some(e) = last_err {
-                    AsynError::Io(e)
-                } else {
-                    AsynError::Status {
-                        status: AsynStatus::Error,
-                        message: format!("no addresses found for '{addr_str}'"),
-                    }
-                }
-            })
         }
+        Err(last_err.unwrap_or_else(|| AsynError::Status {
+            status: AsynStatus::Error,
+            message: format!("no addresses found for '{addr_str}'"),
+        }))
     }
 
     fn connect_udp(&mut self) -> AsynResult<(UdpSocket, std::net::SocketAddr)> {
@@ -848,42 +1251,28 @@ impl DrvAsynIPPort {
                 message: format!("UDP resolve '{remote}': no addresses"),
             })?;
         let local_port = self.config.local_port.unwrap_or(0);
-        let bind_addr = if peer.is_ipv6() {
-            format!("[::]:{local_port}")
+        let (domain, local_addr): (socket2::Domain, std::net::SocketAddr) = if peer.is_ipv6() {
+            (
+                socket2::Domain::IPV6,
+                (std::net::Ipv6Addr::UNSPECIFIED, local_port).into(),
+            )
         } else {
-            format!("0.0.0.0:{local_port}")
+            (
+                socket2::Domain::IPV4,
+                (std::net::Ipv4Addr::UNSPECIFIED, local_port).into(),
+            )
         };
-        let socket = UdpSocket::bind(&bind_addr)?;
-        Ok((socket, peer))
-    }
-
-    /// UDP variant builder — applies any combination of `SO_BROADCAST`
-    /// and `SO_REUSEPORT` requested by the protocol suffix. Mirrors C
-    /// asyn `connectIt` UDP socket option flow (drvAsynIPPort.c
-    /// branches on `tty->flags & FLAG_BROADCAST` and `FLAG_SO_REUSEPORT`).
-    fn connect_udp_with_options(
-        &mut self,
-        broadcast: bool,
-        reuse_port: bool,
-    ) -> AsynResult<(UdpSocket, std::net::SocketAddr)> {
-        let (socket, peer) = self.connect_udp()?;
-        if broadcast {
-            socket.set_broadcast(true)?;
-        }
-        if reuse_port {
-            #[cfg(unix)]
-            {
-                // SockRef borrows the std socket's fd without taking
-                // ownership — set_reuse_port goes through socket2's
-                // setsockopt(SO_REUSEPORT) wrapper.
-                let sref = socket2::SockRef::from(&socket);
-                sref.set_reuse_port(true).map_err(|e| AsynError::Status {
-                    status: AsynStatus::Error,
-                    message: format!("UDP SO_REUSEPORT failed: {e}"),
-                })?;
-            }
-        }
-        Ok((socket, peer))
+        // The options go on the fresh socket, before the bind — the whole point
+        // of `udp&` is two ports sharing one local port, and the kernel only
+        // honours SO_REUSEPORT on an unbound socket (C :461-477, then :495-506).
+        let socket = self.new_socket(domain, socket2::Type::DGRAM, socket2::Protocol::UDP)?;
+        socket
+            .bind(&local_addr.into())
+            .map_err(|e| AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!("UDP bind '{local_addr}' failed: {e}"),
+            })?;
+        Ok((UdpSocket::from(socket), peer))
     }
 
     #[cfg(unix)]
@@ -907,6 +1296,14 @@ impl PortDriver for DrvAsynIPPort {
         &mut self.base
     }
 
+    /// C drvAsynIPPort registers asynCommon, asynOption and asynOctet
+    /// (drvAsynIPPort.c:1037-1053) — no register interface. A record with
+    /// IFACE=Int32/UInt32/Float64 on this port gets C's "No asyn<X> interface"
+    /// (asynRecord.c:1336-1358), not a silent parameter-cache read.
+    fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
+        crate::interfaces::octet_transport_capabilities()
+    }
+
     fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {
         // C drvAsynIPPort.c::connectIt (424-427): reject a connect on an
         // already-open link ("Link already open!") rather than opening a
@@ -918,40 +1315,26 @@ impl PortDriver for DrvAsynIPPort {
             });
         }
         match self.config.protocol {
-            IpProtocol::Tcp | IpProtocol::TcpReusePort => {
+            // C :364-367 — `com` leaves `socketType = SOCK_STREAM` and sets no
+            // flags, so its transport is plain TCP; the whole of what `COM` adds
+            // rides in the interpose, not the socket.
+            IpProtocol::Tcp | IpProtocol::TcpReusePort | IpProtocol::Com => {
                 let stream = self.connect_tcp()?;
                 if self.config.no_delay {
                     stream.set_nodelay(true)?;
                 }
-                if self.config.protocol == IpProtocol::TcpReusePort {
-                    // tcp& in C asyn = TCP + SO_REUSEPORT (NOT
-                    // non-blocking). Apply via SockRef on the std
-                    // TcpStream so we don't churn the socket type.
-                    #[cfg(unix)]
-                    {
-                        let sref = socket2::SockRef::from(&stream);
-                        sref.set_reuse_port(true).map_err(|e| AsynError::Status {
-                            status: AsynStatus::Error,
-                            message: format!("TCP SO_REUSEPORT failed: {e}"),
-                        })?;
-                    }
-                }
+                // `tcp&` = TCP + SO_REUSEPORT (C :360-363, :461-477). The option
+                // is set by `new_socket` on the unconnected socket, which is the
+                // only place it means anything.
                 self.io.inner = Some(IpIoInner::Tcp(stream));
             }
-            IpProtocol::Udp => {
-                let (socket, peer) = self.connect_udp_with_options(false, false)?;
-                self.io.inner = Some(IpIoInner::Udp(socket, peer));
-            }
-            IpProtocol::UdpReusePort => {
-                let (socket, peer) = self.connect_udp_with_options(false, true)?;
-                self.io.inner = Some(IpIoInner::Udp(socket, peer));
-            }
-            IpProtocol::UdpBroadcast => {
-                let (socket, peer) = self.connect_udp_with_options(true, false)?;
-                self.io.inner = Some(IpIoInner::Udp(socket, peer));
-            }
-            IpProtocol::UdpBroadcastReusePort => {
-                let (socket, peer) = self.connect_udp_with_options(true, true)?;
+            IpProtocol::Udp
+            | IpProtocol::UdpReusePort
+            | IpProtocol::UdpBroadcast
+            | IpProtocol::UdpBroadcastReusePort => {
+                // BROADCAST / SO_REUSEPORT are the socket's, applied by
+                // `new_socket` before the bind — they are not a post-bind fixup.
+                let (socket, peer) = self.connect_udp()?;
                 self.io.inner = Some(IpIoInner::Udp(socket, peer));
             }
             #[cfg(unix)]
@@ -991,6 +1374,10 @@ impl PortDriver for DrvAsynIPPort {
             self.config.port,
             self.config.protocol
         );
+        // C `asynInterposeCom.c::exceptionHandler` (:763-774) runs the RFC 2217
+        // handshake on `asynExceptionConnect` — which `set_connected(true)` just
+        // fired. No-op unless this is a COM port.
+        self.restore_com_settings();
         Ok(())
     }
 
@@ -1041,11 +1428,7 @@ impl PortDriver for DrvAsynIPPort {
             data,
             "write"
         );
-        match self
-            .base
-            .interpose_octet
-            .dispatch_write(user, data, &mut self.io)
-        {
+        match self.with_base_link(|link| link.write(user, data)) {
             Ok(n) => Ok(n),
             Err(e) => {
                 // C parity: drvAsynIPPort.c::writeIt closes the connection
@@ -1054,7 +1437,7 @@ impl PortDriver for DrvAsynIPPort {
                 // fatal error; without the symmetric write-side teardown a
                 // wedged socket reports `connected` forever and never
                 // self-heals.
-                if is_fatal_transport_error(&e) && self.base.connected {
+                if e.is_fatal_transport() && self.base.is_connected() {
                     asyn_trace!(
                         Some(self.base.trace),
                         &self.base.port_name,
@@ -1069,28 +1452,31 @@ impl PortDriver for DrvAsynIPPort {
     }
 
     fn io_flush(&mut self, user: &mut AsynUser) -> AsynResult<()> {
-        // C parity: asynOctetSyncIO::writeRead (asynOctetSyncIO.c:~250)
-        // calls flushIt before write+read so the post-write read
-        // returns only the response to *this* command.
-        //
-        // The flush MUST traverse the interpose chain, not just the OS
-        // socket. C `asynInterposeEos.c::flushIt` resets the EOS
-        // interpose's persistent input buffer
-        // (`inBufHead/inBufTail/eosInMatch`) and then calls the
-        // lower-level `flush`. An earlier Rust version drained the OS
-        // socket directly and never reset the `EosInterpose`'s
-        // `in_buf` — so bytes already buffered *inside* the interpose
-        // from a prior read leaked into the next response after an
-        // `OctetWriteRead`.
-        //
-        // Routing through `dispatch_flush` runs every interpose layer's
-        // `flush` (resetting `EosInterpose::in_buf` etc.) and finally
-        // reaches `IpIoState::flush`, which drains the OS socket's
-        // receive buffer.
-        self.base.interpose_octet.dispatch_flush(user, &mut self.io)
+        // The driver end of the flush: drain the OS socket's receive buffer
+        // (C `drvAsynIPPort.c::flushIt`). The layers above — the EOS interpose's
+        // read-ahead buffer among them, C `asynInterposeEos.c::flushIt` resetting
+        // `inBufHead`/`inBufTail`/`eosInMatch` — are flushed by the port before
+        // it reaches here ([`crate::port::octet_flush_chain`]), which is what
+        // stops a byte buffered *inside* the interpose from leaking into the next
+        // `OctetWriteRead` response.
+        self.with_base_link(|link| link.flush(user))
     }
 
-    fn set_option(&mut self, key: &str, value: &str) -> AsynResult<()> {
+    fn set_option(&mut self, user: &mut AsynUser, key: &str, value: &str) -> AsynResult<()> {
+        // C interposes `asynInterposeCOM`'s asynOption interface *above* the IP
+        // driver's (`asynInterposeCom.c:809-824`), so a COM port's option writes
+        // hit the negotiation first and only an unclaimed key reaches the driver
+        // below (`setOption`'s trailing else, :645-652). Same order here: the
+        // seven serial keys negotiate, `hostInfo`/`disconnectOnReadTimeout` fall
+        // through to the IP chain — which is why this is one dispatch and not two
+        // independent option maps.
+        if self.com.is_some() && ComPortOptions::owns_key(key) {
+            // Same teardown gate as the connect-time handshake: C's setOption
+            // reads run through the same `readIt`/`readRaw` below the interpose.
+            return self
+                .with_negotiation(|com, link| com.set_option(user, link, key, value))
+                .expect("com is Some");
+        }
         // C `drvAsynIPPort.c::setOption`/`getOption` compare option keys
         // with `epicsStrCaseCmp` (case-insensitive). Match that here: the
         // asynRecord writes the IP keys lowercase (`hostinfo`, see
@@ -1107,17 +1493,9 @@ impl PortDriver for DrvAsynIPPort {
             // (default on via IpPortConfig::parse, matching C; settable off
             // here). Its value is validated strictly Y/N (case-insensitive)
             // like every other option value, so a typo errors instead of
-            // silently coercing to "off".
-            let enabled = if value.eq_ignore_ascii_case("Y") {
-                true
-            } else if value.eq_ignore_ascii_case("N") {
-                false
-            } else {
-                return Err(AsynError::Status {
-                    status: AsynStatus::Error,
-                    message: format!("Invalid noDelay value: '{value}'"),
-                });
-            };
+            // silently coercing to "off" — and it reports in C's words
+            // ("Invalid <key> value."), like every other option.
+            let enabled = parse_yn_option("noDelay", value)?;
             self.config.no_delay = enabled;
             if let Some(IpIoInner::Tcp(ref stream)) = self.io.inner {
                 stream.set_nodelay(enabled)?;
@@ -1127,16 +1505,7 @@ impl PortDriver for DrvAsynIPPort {
             // (case-insensitive) are valid; any other value returns
             // asynError "Invalid disconnectOnReadTimeout value." rather
             // than silently coercing the unknown text to "off".
-            if value.eq_ignore_ascii_case("Y") {
-                self.disconnect_on_read_timeout = true;
-            } else if value.eq_ignore_ascii_case("N") {
-                self.disconnect_on_read_timeout = false;
-            } else {
-                return Err(AsynError::Status {
-                    status: AsynStatus::Error,
-                    message: format!("Invalid disconnectOnReadTimeout value: '{value}'"),
-                });
-            }
+            self.disconnect_on_read_timeout = parse_yn_option("disconnectOnReadTimeout", value)?;
         } else if key.eq_ignore_ascii_case("hostInfo") {
             // Mirror C drvAsynIPPort.c::parseHostInfo (lines 273-401):
             //
@@ -1204,6 +1573,15 @@ impl PortDriver for DrvAsynIPPort {
     /// never populate, so the asynRecord could never read back the live
     /// `HOSTINFO`/`DRTO`. Unknown keys fall through to the generic map.
     fn get_option(&self, key: &str) -> AsynResult<String> {
+        // Same interposed order as `set_option`. C's COM `getOption` (:657-725)
+        // answers from cached state and touches the wire not at all, so this
+        // needs no `&mut self` — the settings it reports are what the *server*
+        // last acknowledged, refreshed on every `set_option` and reconnect.
+        if let Some(com) = self.com.as_ref() {
+            if ComPortOptions::owns_key(key) {
+                return com.options.get_option(key);
+            }
+        }
         if key.eq_ignore_ascii_case("disconnectOnReadTimeout") {
             Ok(if self.disconnect_on_read_timeout {
                 "Y"
@@ -1228,6 +1606,28 @@ mod tests {
     use super::*;
     use std::net::TcpListener;
     use std::thread;
+
+    /// Enter the port's octet interface the way a caller does — through the
+    /// interpose chain, with the driver at the bottom of it. C `findInterface`
+    /// hands the caller the *topmost* interpose (asynManager.c:1493-1501,
+    /// 2190-2220); the driver's own `read`/`write`/`flush` are the base the chain
+    /// ends at, so a test that wants the EOS layer must enter above it, exactly
+    /// as `PortActor` does.
+    fn chain_read(drv: &mut DrvAsynIPPort, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+        crate::port::octet_read_chain(drv, user, buf).map(|(n, _eom)| n)
+    }
+
+    fn chain_read_eom(
+        drv: &mut DrvAsynIPPort,
+        user: &AsynUser,
+        buf: &mut [u8],
+    ) -> AsynResult<(usize, EomReason)> {
+        crate::port::octet_read_chain(drv, user, buf)
+    }
+
+    fn chain_flush(drv: &mut DrvAsynIPPort, user: &mut AsynUser) -> AsynResult<()> {
+        crate::port::octet_flush_chain(drv, user)
+    }
 
     // --- Config parsing tests ---
 
@@ -1280,9 +1680,37 @@ mod tests {
     #[test]
     fn test_driver_initial_state() {
         let drv = DrvAsynIPPort::new("iptest", "localhost:5025").unwrap();
-        assert!(!drv.base().connected);
+        assert!(!drv.base().is_connected());
         assert!(drv.base().auto_connect);
         assert!(drv.base().flags.can_block);
+    }
+
+    /// `new_configured(..., noAutoConnect=1, noProcessEos=0)` — the differential
+    /// oracle's `drvAsynIPPortConfigure("ORACLEASYN","localhost:1",0,1,0)`
+    /// equivalent — must yield a port that (1) advertises exactly the
+    /// octet-transport interface set (asynCommon + asynOption + asynOctet, so
+    /// OCTETIV=OPTIONIV=1 and GPIB/I32/UI32/F64 IV=0), (2) starts
+    /// disconnected and never auto-dials, and (3) answers HOSTINFO="localhost:1"
+    /// / DRTO="N" the way C's real IP port does. A regression on any of these
+    /// reopens the asyn read fields the oracle compares.
+    #[test]
+    fn new_configured_no_auto_connect_matches_the_oracle_port_model() {
+        let drv = DrvAsynIPPort::new_configured("ORACLEASYN", "localhost:1", true, false).unwrap();
+
+        // (1) Interface set — the exact octet-transport capabilities, no extras.
+        assert_eq!(
+            drv.capabilities(),
+            crate::interfaces::octet_transport_capabilities()
+        );
+
+        // (2) Disconnected, noAutoConnect — nothing arms the reconnect timer,
+        // so the port stays permanently disconnected (CNCT/AUCT read 0).
+        assert!(!drv.base().is_connected());
+        assert!(!drv.base().auto_connect);
+
+        // (3) The IP options the asyn record renders as HOSTINFO / DRTO.
+        assert_eq!(drv.get_option("hostinfo").unwrap(), "localhost:1");
+        assert_eq!(drv.get_option("disconnectOnReadTimeout").unwrap(), "N");
     }
 
     // --- Integration tests with mock TCP server ---
@@ -1302,13 +1730,13 @@ mod tests {
 
         let mut drv = DrvAsynIPPort::new("iptest", &format!("127.0.0.1:{port}")).unwrap();
         let user = AsynUser::default();
-        assert!(!drv.base().connected);
+        assert!(!drv.base().is_connected());
 
         drv.connect(&user).unwrap();
-        assert!(drv.base().connected);
+        assert!(drv.base().is_connected());
 
         drv.disconnect(&user).unwrap();
-        assert!(!drv.base().connected);
+        assert!(!drv.base().is_connected());
     }
 
     #[test]
@@ -1363,7 +1791,7 @@ mod tests {
         let mut drv = DrvAsynIPPort::new("httptest", &format!("127.0.0.1:{port} HTTP")).unwrap();
         let user = AsynUser::default();
         drv.connect(&user).unwrap();
-        assert!(drv.base().connected);
+        assert!(drv.base().is_connected());
 
         // --- Transaction 1: write request, read the response in 4-B chunks.
         let mut wuser = AsynUser::new(0).with_timeout(Duration::from_secs(2));
@@ -1377,7 +1805,7 @@ mod tests {
         // The bug tore the socket down here; the fix keeps it up so the rest
         // of the response is still readable.
         assert!(
-            drv.base().connected,
+            drv.base().is_connected(),
             "HTTP must stay connected mid-response (no truncation)"
         );
         assert!(
@@ -1398,7 +1826,7 @@ mod tests {
         assert_eq!(n3, 0);
         assert!(eom3.contains(EomReason::END));
         assert!(
-            drv.base().connected,
+            drv.base().is_connected(),
             "HTTP logical connection must not flap on per-transaction EOF"
         );
         assert!(drv.io.inner.is_none(), "socket released after EOF");
@@ -1462,7 +1890,7 @@ mod tests {
         assert_eq!(n, 0);
         assert!(eom.contains(EomReason::END));
         // closeConnection ran, so the actor's reconnect can re-open it.
-        assert!(!drv.base().connected);
+        assert!(!drv.base().is_connected());
 
         handle.join().unwrap();
     }
@@ -1472,17 +1900,27 @@ mod tests {
         // DRV-5/DRV-31 family: a broken-socket error tears the connection
         // down; a timeout leaves it intact (the actor reconnects on the
         // next request only when `connected` flips to false).
-        assert!(is_fatal_transport_error(&AsynError::Status {
-            status: AsynStatus::Disconnected,
-            message: "EOF".into(),
-        }));
-        assert!(is_fatal_transport_error(&AsynError::Io(
-            std::io::Error::new(std::io::ErrorKind::ConnectionReset, "rst")
-        )));
-        assert!(!is_fatal_transport_error(&AsynError::Status {
-            status: AsynStatus::Timeout,
-            message: "read timeout".into(),
-        }));
+        assert!(
+            AsynError::Status {
+                status: AsynStatus::Disconnected,
+                message: "EOF".into(),
+            }
+            .is_fatal_transport()
+        );
+        assert!(
+            AsynError::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "rst"
+            ))
+            .is_fatal_transport()
+        );
+        assert!(
+            !AsynError::Status {
+                status: AsynStatus::Timeout,
+                message: "read timeout".into(),
+            }
+            .is_fatal_transport()
+        );
     }
 
     #[test]
@@ -1498,7 +1936,7 @@ mod tests {
 
         let mut drv = DrvAsynIPPort::new("iptest", &format!("127.0.0.1:{port}")).unwrap();
         drv.connect(&AsynUser::default()).unwrap();
-        assert!(drv.base().connected);
+        assert!(drv.base().is_connected());
         handle.join().unwrap();
         thread::sleep(Duration::from_millis(50));
 
@@ -1513,7 +1951,7 @@ mod tests {
         }
         assert!(last.is_err(), "expected a write to the dead peer to fail");
         assert!(
-            !drv.base().connected,
+            !drv.base().is_connected(),
             "DRV-5: fatal write error must set connected=false"
         );
     }
@@ -1544,6 +1982,239 @@ mod tests {
         handle.join().unwrap();
     }
 
+    /// R8-57 end-to-end over a real socket: connecting a `COM` port must run C's
+    /// RFC 2217 handshake (`asynInterposeCom.c::restoreSettings`, :729-758) on
+    /// the wire, and the data path that follows must be IAC-escaped in both
+    /// directions (`writeIt`/`readIt`, :136-245).
+    ///
+    /// The fake terminal server below answers the handshake with the standard
+    /// echoes, then behaves like a device: it receives one IAC-stuffed write and
+    /// sends back one IAC-stuffed reply.
+    #[test]
+    fn com_port_negotiates_rfc2217_on_connect_and_escapes_the_data_path() {
+        use crate::interpose::com::{IAC, SB, SE};
+
+        const COM_PORT_OPTION: u8 = 44;
+        const WILL_B: u8 = 251;
+        const DO_B: u8 = 253;
+        /// The server's acknowledgement of subcommand `n`: `IAC SB 44 n+100 …`.
+        fn ack(subcmd: u8, values: &[u8]) -> Vec<u8> {
+            let mut v = vec![IAC, SB, COM_PORT_OPTION, subcmd + 100];
+            v.extend_from_slice(values);
+            v.extend_from_slice(&[IAC, SE]);
+            v
+        }
+        /// A client subnegotiation: `IAC SB 44 <payload> IAC SE`.
+        fn sb(payload: &[u8]) -> Vec<u8> {
+            let mut v = vec![IAC, SB, COM_PORT_OPTION];
+            v.extend_from_slice(payload);
+            v.extend_from_slice(&[IAC, SE]);
+            v
+        }
+
+        let (listener, port) = start_echo_server();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+
+            // Blast the whole handshake reply first — the client drives the
+            // exchange step by step, reading each answer before sending the next,
+            // so queueing all the answers up front is what keeps this from
+            // deadlocking. In C's order: DO BINARY -> WILL, WILL BINARY -> DO,
+            // WILL COM-PORT-OPTION -> DO, then SET-MODEMSTATE-MASK and the six
+            // settings, each echoed back at its default.
+            let mut reply = vec![IAC, WILL_B, 0, IAC, DO_B, 0, IAC, DO_B, COM_PORT_OPTION];
+            reply.extend_from_slice(&ack(11, &[0])); // SET-MODEMSTATE-MASK
+            reply.extend_from_slice(&ack(1, &[0x00, 0x00, 0x25, 0x80])); // 9600 baud
+            reply.extend_from_slice(&ack(2, &[8])); // 8 data bits
+            reply.extend_from_slice(&ack(3, &[1])); // parity none
+            reply.extend_from_slice(&ack(4, &[1])); // 1 stop bit
+            reply.extend_from_slice(&ack(5, &[1])); // crtscts -> NOFLOW
+            reply.extend_from_slice(&ack(5, &[1])); // ixon    -> NOFLOW
+            stream.write_all(&reply).unwrap();
+            stream.flush().unwrap();
+
+            // What the client must have put on the wire, byte for byte: C
+            // `restoreSettings` (asynInterposeCom.c:740-756) on a default port.
+            let mut want = vec![
+                IAC,
+                DO_B,
+                0, // :740  IAC DO  BINARY
+                IAC,
+                WILL_B,
+                0, // :742  IAC WILL BINARY
+                IAC,
+                WILL_B,
+                COM_PORT_OPTION, // :744  IAC WILL COM-PORT-OPTION
+            ];
+            want.extend_from_slice(&sb(&[11, 0])); // SET-MODEMSTATE-MASK 0
+            want.extend_from_slice(&sb(&[1, 0x00, 0x00, 0x25, 0x80])); // 9600, big-endian
+            want.extend_from_slice(&sb(&[2, 8]));
+            want.extend_from_slice(&sb(&[3, 1]));
+            want.extend_from_slice(&sb(&[4, 1]));
+            want.extend_from_slice(&sb(&[5, 1])); // crtscts "N" -> current mode
+            want.extend_from_slice(&sb(&[5, 1])); // ixon    "N" -> current mode
+            let mut got = vec![0u8; want.len()];
+            stream.read_exact(&mut got).unwrap();
+            assert_eq!(got, want, "connect must emit C's RFC 2217 handshake");
+
+            // Now the device write. The caller sent 3 bytes containing one IAC,
+            // so 4 must arrive: the IAC is doubled on the wire.
+            let mut got = [0u8; 4];
+            stream.read_exact(&mut got).unwrap();
+            assert_eq!(got, [b'A', IAC, IAC, b'B'], "device write must be stuffed");
+
+            // Reply with a stuffed IAC of our own.
+            stream.write_all(&[b'X', IAC, IAC, b'Y']).unwrap();
+            stream.flush().unwrap();
+            thread::sleep(Duration::from_millis(200));
+        });
+
+        let mut drv = DrvAsynIPPort::new("comtest", &format!("127.0.0.1:{port} COM")).unwrap();
+        let user = AsynUser::default();
+        drv.connect(&user).unwrap();
+
+        // The handshake ran and the server's echoes landed in the cached state.
+        assert_eq!(drv.get_option("baud").unwrap(), "9600");
+        assert_eq!(drv.get_option("bits").unwrap(), "8");
+        assert_eq!(drv.get_option("parity").unwrap(), "none");
+        assert_eq!(drv.get_option("stop").unwrap(), "1");
+
+        // Data path out: 3 caller bytes, one of them an IAC. The interpose
+        // reports the caller's count, not the 4 bytes it put on the wire.
+        let mut wuser = AsynUser::new(0).with_timeout(Duration::from_secs(2));
+        let n = drv.write_octet(&mut wuser, &[b'A', IAC, b'B']).unwrap();
+        assert_eq!(n, 3);
+
+        // Data path in: 4 wire bytes unstuff to 3.
+        let ruser = AsynUser::new(0).with_timeout(Duration::from_secs(2));
+        let mut buf = [0u8; 16];
+        let n = drv.read_octet(&ruser, &mut buf).unwrap();
+        assert_eq!(&buf[..n], &[b'X', IAC, b'Y']);
+
+        server.join().unwrap();
+    }
+
+    /// R8-57: an option write on a live COM port must reach the wire as a
+    /// COM-PORT-OPTION subnegotiation — C routes `setOption` through the
+    /// interposed asynOption interface (asynInterposeCom.c:809-824), not into
+    /// the IP driver's option map.
+    #[test]
+    fn set_option_on_a_live_com_port_negotiates_with_the_server() {
+        use crate::interpose::com::{IAC, SB, SE};
+
+        let (listener, port) = start_echo_server();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            // Refuse the opening handshake so connect() takes the "report and
+            // carry on" path (C exceptionHandler, :770-772) and the link stays
+            // up — this test is about the later setOption, not the handshake.
+            stream.write_all(&[IAC, 252, 0]).unwrap(); // IAC WONT BINARY
+            stream.flush().unwrap();
+
+            // Drain the one handshake frame the client got out before the
+            // refusal stopped it: IAC DO BINARY.
+            let mut hs = [0u8; 3];
+            stream.read_exact(&mut hs).unwrap();
+            assert_eq!(hs, [IAC, 253, 0]);
+
+            // Now answer one SET-BAUDRATE with the rate applied.
+            let mut req = [0u8; 10];
+            stream.read_exact(&mut req).unwrap();
+            assert_eq!(
+                req,
+                [IAC, SB, 44, 1, 0x00, 0x01, 0xC2, 0x00, IAC, SE],
+                "115200 baud must go out as a big-endian SET-BAUDRATE"
+            );
+            let mut ack = vec![IAC, SB, 44, 101, 0x00, 0x01, 0xC2, 0x00];
+            ack.extend_from_slice(&[IAC, SE]);
+            stream.write_all(&ack).unwrap();
+            stream.flush().unwrap();
+            thread::sleep(Duration::from_millis(200));
+        });
+
+        let mut drv = DrvAsynIPPort::new("comtest2", &format!("127.0.0.1:{port} COM")).unwrap();
+        let user = AsynUser::default();
+        // A refused handshake does not fail the connect — C only prints.
+        drv.connect(&user).unwrap();
+        assert!(drv.base.is_connected());
+
+        drv.set_option(&mut AsynUser::default(), "baud", "115200")
+            .unwrap();
+        assert_eq!(drv.get_option("baud").unwrap(), "115200");
+
+        server.join().unwrap();
+    }
+
+    /// R8-57 boundary: C runs the negotiation's reads through
+    /// `readIt`/`readRaw`, so `readRaw`'s teardown gate (drvAsynIPPort.c:798-806)
+    /// governs them too — a negotiation read that times out with
+    /// `disconnectOnReadTimeout=Y` closes the socket. Driving the raw link would
+    /// have silently skipped that.
+    ///
+    /// Both sides of the gate, since it is a conjunction: option OFF leaves the
+    /// socket up (the handshake merely fails and is logged); option ON closes it.
+    ///
+    /// The server must stay alive and keep *draining* past the client's 2 s
+    /// negotiation timeout. Closing early with the client's handshake bytes still
+    /// unread would send an RST, and an RST tears the socket down through the
+    /// other disjunct (`is_fatal_transport`) no matter how the option is set —
+    /// which would pass the ON case for the wrong reason and fail the OFF case.
+    #[test]
+    fn a_timed_out_negotiation_read_honours_disconnect_on_read_timeout() {
+        /// A server that answers nothing but keeps draining, so the client's
+        /// negotiation read expires as a genuine timeout.
+        fn silent_server() -> (u16, thread::JoinHandle<()>) {
+            let (listener, port) = start_echo_server();
+            let handle = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_millis(100)))
+                    .unwrap();
+                let deadline = std::time::Instant::now() + Duration::from_millis(2600);
+                let mut scratch = [0u8; 64];
+                while std::time::Instant::now() < deadline {
+                    match stream.read(&mut scratch) {
+                        Ok(0) => break,
+                        Ok(_) => continue,
+                        Err(_) => continue, // our own 100 ms poll expiring
+                    }
+                }
+            });
+            (port, handle)
+        }
+
+        // Option OFF (C's default) — the handshake fails, the link survives.
+        let (port, server) = silent_server();
+        let mut drv = DrvAsynIPPort::new("comto1", &format!("127.0.0.1:{port} COM")).unwrap();
+        drv.connect(&AsynUser::default()).unwrap();
+        assert!(
+            drv.base.is_connected(),
+            "handshake failure alone must not close the socket (C only asynPrints)"
+        );
+        assert!(drv.io.inner.is_some());
+        server.join().unwrap();
+
+        // Option ON — the same silent server now costs the socket, because C
+        // applies readRaw's teardown to the negotiation's reads too.
+        let (port, server) = silent_server();
+        let mut drv = DrvAsynIPPort::new("comto2", &format!("127.0.0.1:{port} COM")).unwrap();
+        drv.set_option(&mut AsynUser::default(), "disconnectOnReadTimeout", "Y")
+            .unwrap();
+        drv.connect(&AsynUser::default()).unwrap();
+        assert!(
+            !drv.base.is_connected(),
+            "a timed-out negotiation read must close the socket, as C readRaw does"
+        );
+        assert!(drv.io.inner.is_none());
+        server.join().unwrap();
+    }
+
     #[test]
     fn test_eos_interpose_with_tcp() {
         use crate::interpose::eos::{EosConfig, EosInterpose};
@@ -1561,17 +2232,180 @@ mod tests {
             input_eos: vec![b'\r', b'\n'],
             output_eos: vec![],
         });
-        drv.push_interpose(Box::new(eos));
+        drv.install_interpose(Box::new(eos));
 
         let user = AsynUser::default();
         drv.connect(&user).unwrap();
 
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(2));
         let mut buf = [0u8; 32];
-        let n = drv.read_octet(&user, &mut buf).unwrap();
+        let n = chain_read(&mut drv, &user, &mut buf).unwrap();
         assert_eq!(&buf[..n], b"OK");
 
         handle.join().unwrap();
+    }
+
+    /// R7-47: `disconnectOnReadTimeout Y` must tear the socket down on a read
+    /// timeout even when the EOS interpose is installed — which
+    /// `drvAsynIPPortConfigure` does by default (iocsh.rs), so this is the
+    /// *normal* configuration, not a corner case. C runs its disconnect test
+    /// inside readRaw, below the interpose, on the raw recv timeout
+    /// (drvAsynIPPort.c:798-806); asyn-rs runs it above the interpose, where
+    /// the same timeout arrives wrapped as `PartialRead` — so the test must
+    /// key off `e.status()`, not the error variant. Matching by variant made
+    /// the option inert on every default IP port.
+    #[test]
+    fn disconnect_on_read_timeout_fires_through_the_eos_interpose() {
+        use crate::interpose::eos::{EosConfig, EosInterpose};
+
+        let (listener, port) = start_echo_server();
+        // The peer accepts and then says nothing: the read must time out with
+        // zero bytes, which the EOS interpose reports as PartialRead(Timeout, 0).
+        let handle = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            thread::sleep(Duration::from_millis(300));
+            drop(stream);
+        });
+
+        let mut drv = DrvAsynIPPort::new("iptest", &format!("127.0.0.1:{port}")).unwrap();
+        drv.install_interpose(Box::new(EosInterpose::new(EosConfig {
+            input_eos: vec![b'\n'],
+            output_eos: vec![],
+        })));
+        drv.set_option(&mut AsynUser::default(), "disconnectOnReadTimeout", "Y")
+            .unwrap();
+        drv.connect(&AsynUser::default()).unwrap();
+        assert!(drv.base().is_connected());
+
+        let user = AsynUser::new(0).with_timeout(Duration::from_millis(50));
+        let mut buf = [0u8; 32];
+        let err = drv
+            .read_octet(&user, &mut buf)
+            .expect_err("a silent peer must time the read out");
+        // R11-47: the branch that closes the socket is the branch that reports
+        // asynError (drvAsynIPPort.c:805) — the lower layer's asynTimeout does
+        // not survive the teardown.
+        assert_eq!(
+            err.status(),
+            AsynStatus::Error,
+            "C readRaw overwrites the status on the disconnect branch"
+        );
+        assert!(
+            err.message().contains("read error"),
+            "C's teardown text (drvAsynIPPort.c:801-803), got {:?}",
+            err.message()
+        );
+        assert!(
+            !drv.base().is_connected(),
+            "disconnectOnReadTimeout must drop the connection (C drvAsynIPPort.c:798-806)"
+        );
+
+        handle.join().unwrap();
+    }
+
+    /// Boundary companion to the test above: `disconnectOnReadTimeout` is off
+    /// by default, so the same timeout through the same interpose must leave
+    /// the socket up.
+    #[test]
+    fn read_timeout_without_the_option_keeps_the_connection() {
+        use crate::interpose::eos::{EosConfig, EosInterpose};
+
+        let (listener, port) = start_echo_server();
+        let handle = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            thread::sleep(Duration::from_millis(300));
+            drop(stream);
+        });
+
+        let mut drv = DrvAsynIPPort::new("iptest", &format!("127.0.0.1:{port}")).unwrap();
+        drv.install_interpose(Box::new(EosInterpose::new(EosConfig {
+            input_eos: vec![b'\n'],
+            output_eos: vec![],
+        })));
+        drv.connect(&AsynUser::default()).unwrap();
+
+        let user = AsynUser::new(0).with_timeout(Duration::from_millis(50));
+        let mut buf = [0u8; 32];
+        let err = drv.read_octet(&user, &mut buf).unwrap_err();
+        // R11-47 negative control: the non-teardown branch keeps C's asynTimeout
+        // (drvAsynIPPort.c:811) — the restamp is the teardown branch's, not every
+        // failed read's.
+        assert_eq!(err.status(), AsynStatus::Timeout);
+        assert!(
+            drv.base().is_connected(),
+            "a plain read timeout leaves the socket intact (C returns asynTimeout, no close)"
+        );
+
+        handle.join().unwrap();
+    }
+
+    /// R11-47: the restamp keeps the bytes the device did send. C assigns
+    /// `*nbytesTransfered = thisRead` (drvAsynIPPort.c:824) *below* both branches,
+    /// so a device that emits half a line and goes quiet reaches the record as
+    /// asynError **plus** its partial line — asynRecord commits NORD/EOMR
+    /// regardless of status (asynRecord.c:1591,1627).
+    #[test]
+    fn a_torn_down_read_reports_asyn_error_and_still_carries_the_partial_bytes() {
+        use crate::interpose::PartialOctetRead;
+
+        let timeout = Duration::from_millis(50);
+        let partial = PartialOctetRead {
+            data: b"OK\n".to_vec(),
+            eom_reason: EomReason::empty(),
+        };
+        let timed_out = AsynError::Status {
+            status: AsynStatus::Timeout,
+            message: "read timeout".into(),
+        }
+        .with_partial_read(partial);
+
+        let f = classify_read_failure(timed_out, true, timeout, "127.0.0.1:5001");
+        assert!(f.disconnect, "disconnectOnReadTimeout + timeout > 0");
+        assert_eq!(f.error.status(), AsynStatus::Error, "C :805");
+        assert_eq!(
+            f.error.message(),
+            "127.0.0.1:5001 read error: read timeout",
+            "C :801-803"
+        );
+        assert_eq!(
+            f.error.partial_read().map(|p| p.nbytes_transferred()),
+            Some(3),
+            "the transfer C writes out at :824 survives the restamp"
+        );
+    }
+
+    /// R11-47 boundary: the three inputs of C's `should_disconnect` disjunct, each
+    /// at its own boundary, and the status each produces.
+    #[test]
+    fn the_read_failure_rule_matches_c_should_disconnect_at_every_boundary() {
+        let timeout = || AsynError::Status {
+            status: AsynStatus::Timeout,
+            message: "read timeout".into(),
+        };
+        let fatal = || AsynError::Io(std::io::Error::other("cable yanked"));
+        let dev = "host:1";
+
+        // option off → no teardown, status unchanged, whatever the timeout.
+        let f = classify_read_failure(timeout(), false, Duration::from_secs(1), dev);
+        assert!(!f.disconnect);
+        assert_eq!(f.error.status(), AsynStatus::Timeout);
+
+        // option on but timeout == 0 (a poll) → C's `pasynUser->timeout > 0`
+        // fails: no teardown, asynTimeout stands.
+        let f = classify_read_failure(timeout(), true, Duration::ZERO, dev);
+        assert!(!f.disconnect);
+        assert_eq!(f.error.status(), AsynStatus::Timeout);
+
+        // option on, timeout > 0 → teardown + asynError.
+        let f = classify_read_failure(timeout(), true, Duration::from_millis(1), dev);
+        assert!(f.disconnect);
+        assert_eq!(f.error.status(), AsynStatus::Error);
+
+        // a real errno tears down with the option off — C's second disjunct.
+        let f = classify_read_failure(fatal(), false, Duration::ZERO, dev);
+        assert!(f.disconnect);
+        assert_eq!(f.error.status(), AsynStatus::Error);
+        assert_eq!(f.error.message(), "host:1 read error: IO: cable yanked");
     }
 
     #[test]
@@ -1587,14 +2421,22 @@ mod tests {
     #[test]
     fn test_set_option_nodelay() {
         let mut drv = DrvAsynIPPort::new("iptest", "127.0.0.1:5025").unwrap();
-        drv.set_option("noDelay", "Y").unwrap();
+        drv.set_option(&mut AsynUser::default(), "noDelay", "Y")
+            .unwrap();
         assert!(drv.config.no_delay);
-        drv.set_option("noDelay", "n").unwrap();
+        drv.set_option(&mut AsynUser::default(), "noDelay", "n")
+            .unwrap();
         assert!(!drv.config.no_delay);
         // Value is validated strictly Y/N (case-insensitive); the old loose
         // coercion silently treated any other token (incl. "0"/"1") as off.
-        assert!(drv.set_option("noDelay", "1").is_err());
-        assert!(drv.set_option("noDelay", "maybe").is_err());
+        assert!(
+            drv.set_option(&mut AsynUser::default(), "noDelay", "1")
+                .is_err()
+        );
+        assert!(
+            drv.set_option(&mut AsynUser::default(), "noDelay", "maybe")
+                .is_err()
+        );
     }
 
     // --- UDP tests ---
@@ -1614,7 +2456,7 @@ mod tests {
             DrvAsynIPPort::new("udptest", &format!("127.0.0.1:{server_port} udp")).unwrap();
         let user = AsynUser::default();
         drv.connect(&user).unwrap();
-        assert!(drv.base().connected);
+        assert!(drv.base().is_connected());
 
         let mut user = AsynUser::new(0).with_timeout(Duration::from_secs(2));
         drv.write_octet(&mut user, b"ping").unwrap();
@@ -1701,7 +2543,7 @@ mod tests {
         let n = drv.read_octet(&ruser, &mut buf).unwrap();
         assert_eq!(n, 0);
         // The port must remain open — a 0-byte datagram is not EOF.
-        assert!(drv.base().connected);
+        assert!(drv.base().is_connected());
 
         // And it can still read a subsequent real datagram.
         server.send_to(b"world", src).unwrap();
@@ -1750,15 +2592,16 @@ mod tests {
         });
 
         let mut drv = DrvAsynIPPort::new("iptest", &format!("127.0.0.1:{port}")).unwrap();
-        drv.set_option("disconnectOnReadTimeout", "Y").unwrap();
+        drv.set_option(&mut AsynUser::default(), "disconnectOnReadTimeout", "Y")
+            .unwrap();
         let user = AsynUser::default();
         drv.connect(&user).unwrap();
-        assert!(drv.base().connected);
+        assert!(drv.base().is_connected());
 
         let user = AsynUser::new(0).with_timeout(Duration::from_millis(50));
         let mut buf = [0u8; 32];
         let _ = drv.read_octet(&user, &mut buf);
-        assert!(!drv.base().connected);
+        assert!(!drv.base().is_connected());
     }
 
     #[test]
@@ -1796,10 +2639,11 @@ mod tests {
         });
 
         let mut drv = DrvAsynIPPort::new("iptest", &format!("127.0.0.1:{port}")).unwrap();
-        drv.set_option("disconnectOnReadTimeout", "Y").unwrap();
+        drv.set_option(&mut AsynUser::default(), "disconnectOnReadTimeout", "Y")
+            .unwrap();
         let user = AsynUser::default();
         drv.connect(&user).unwrap();
-        assert!(drv.base().connected);
+        assert!(drv.base().is_connected());
 
         let user = AsynUser::new(0).with_timeout(Duration::ZERO);
         let mut buf = [0u8; 32];
@@ -1813,7 +2657,7 @@ mod tests {
         }
         // timeout == 0 → C `timeout > 0` guard is false → no teardown.
         assert!(
-            drv.base().connected,
+            drv.base().is_connected(),
             "zero-timeout read must not disconnect even with disconnectOnReadTimeout=Y"
         );
     }
@@ -1838,14 +2682,14 @@ mod tests {
                 other => panic!("{kind:?} must map to a non-fatal Timeout, got {other:?}"),
             }
             assert!(
-                !is_fatal_transport_error(&classify_read_error(Error::from(kind))),
+                !classify_read_error(Error::from(kind)).is_fatal_transport(),
                 "{kind:?} must not be a fatal transport error"
             );
         }
         // A genuine transport failure stays fatal (Io) → teardown.
         let reset = classify_read_error(Error::from(ErrorKind::ConnectionReset));
         assert!(matches!(reset, AsynError::Io(_)));
-        assert!(is_fatal_transport_error(&reset));
+        assert!(reset.is_fatal_transport());
     }
 
     #[test]
@@ -1907,7 +2751,7 @@ mod tests {
             "zero-length read must be rejected with asynError, got {res:?}"
         );
         assert!(
-            drv.base().connected,
+            drv.base().is_connected(),
             "zero-length read must not tear down the connection"
         );
 
@@ -1921,15 +2765,18 @@ mod tests {
         // rather than silently coercing unknown text to "off".
         let mut drv = DrvAsynIPPort::new("iptest", "127.0.0.1:5025 tcp").unwrap();
 
-        drv.set_option("disconnectOnReadTimeout", "Y").unwrap();
+        drv.set_option(&mut AsynUser::default(), "disconnectOnReadTimeout", "Y")
+            .unwrap();
         assert_eq!(drv.get_option("disconnectOnReadTimeout").unwrap(), "Y");
-        drv.set_option("disconnectOnReadTimeout", "n").unwrap();
+        drv.set_option(&mut AsynUser::default(), "disconnectOnReadTimeout", "n")
+            .unwrap();
         assert_eq!(drv.get_option("disconnectOnReadTimeout").unwrap(), "N");
 
         // Values C never accepts must now error instead of mapping to "off".
         for bad in ["1", "yes", "true", "", "maybe"] {
             assert!(
-                drv.set_option("disconnectOnReadTimeout", bad).is_err(),
+                drv.set_option(&mut AsynUser::default(), "disconnectOnReadTimeout", bad)
+                    .is_err(),
                 "value {bad:?} should be rejected"
             );
         }
@@ -1951,12 +2798,12 @@ mod tests {
         let mut drv = DrvAsynIPPort::new("iptest", &format!("127.0.0.1:{port}")).unwrap();
         let user = AsynUser::default();
         drv.connect(&user).unwrap();
-        assert!(drv.base().connected);
+        assert!(drv.base().is_connected());
 
         let err = drv.connect(&user).unwrap_err();
         assert!(matches!(err, AsynError::Status { .. }));
         // The original socket is left intact (still connected).
-        assert!(drv.base().connected);
+        assert!(drv.base().is_connected());
     }
 
     // --- hostInfo option tests ---
@@ -1964,7 +2811,8 @@ mod tests {
     #[test]
     fn test_set_option_host_info() {
         let mut drv = DrvAsynIPPort::new("iptest", "127.0.0.1:5025").unwrap();
-        drv.set_option("hostInfo", "192.168.1.1:8080").unwrap();
+        drv.set_option(&mut AsynUser::default(), "hostInfo", "192.168.1.1:8080")
+            .unwrap();
         assert_eq!(drv.config.host, "192.168.1.1");
         assert_eq!(drv.config.port, 8080);
     }
@@ -1980,10 +2828,11 @@ mod tests {
         let mut drv = DrvAsynIPPort::new("iptest", &format!("127.0.0.1:{port}")).unwrap();
         let user = AsynUser::default();
         drv.connect(&user).unwrap();
-        assert!(drv.base().connected);
+        assert!(drv.base().is_connected());
 
-        drv.set_option("hostInfo", "127.0.0.1:9999").unwrap();
-        assert!(!drv.base().connected);
+        drv.set_option(&mut AsynUser::default(), "hostInfo", "127.0.0.1:9999")
+            .unwrap();
+        assert!(!drv.base().is_connected());
         assert_eq!(drv.config.port, 9999);
     }
 
@@ -1996,20 +2845,25 @@ mod tests {
         let mut drv = DrvAsynIPPort::new("iptest", "127.0.0.1:5025 tcp").unwrap();
         assert_eq!(drv.config.protocol, IpProtocol::Tcp);
 
-        drv.set_option("hostInfo", "127.0.0.1:5026 udp").unwrap();
+        drv.set_option(&mut AsynUser::default(), "hostInfo", "127.0.0.1:5026 udp")
+            .unwrap();
         assert_eq!(drv.config.protocol, IpProtocol::Udp);
         assert_eq!(drv.config.port, 5026);
 
-        drv.set_option("hostInfo", "127.0.0.1:5027 udp*").unwrap();
+        drv.set_option(&mut AsynUser::default(), "hostInfo", "127.0.0.1:5027 udp*")
+            .unwrap();
         assert_eq!(drv.config.protocol, IpProtocol::UdpBroadcast);
 
-        drv.set_option("hostInfo", "127.0.0.1:5028 udp&").unwrap();
+        drv.set_option(&mut AsynUser::default(), "hostInfo", "127.0.0.1:5028 udp&")
+            .unwrap();
         assert_eq!(drv.config.protocol, IpProtocol::UdpReusePort);
 
-        drv.set_option("hostInfo", "127.0.0.1:5029 udp*&").unwrap();
+        drv.set_option(&mut AsynUser::default(), "hostInfo", "127.0.0.1:5029 udp*&")
+            .unwrap();
         assert_eq!(drv.config.protocol, IpProtocol::UdpBroadcastReusePort);
 
-        drv.set_option("hostInfo", "127.0.0.1:5030 tcp&").unwrap();
+        drv.set_option(&mut AsynUser::default(), "hostInfo", "127.0.0.1:5030 tcp&")
+            .unwrap();
         assert_eq!(drv.config.protocol, IpProtocol::TcpReusePort);
     }
 
@@ -2022,7 +2876,8 @@ mod tests {
     fn host_info_reparse_clears_omitted_local_port() {
         let mut drv = DrvAsynIPPort::new("iptest", "127.0.0.1:5025:12345 tcp").unwrap();
         assert_eq!(drv.config.local_port, Some(12345));
-        drv.set_option("hostInfo", "127.0.0.1:5026 tcp").unwrap();
+        drv.set_option(&mut AsynUser::default(), "hostInfo", "127.0.0.1:5026 tcp")
+            .unwrap();
         assert_eq!(
             drv.config.local_port, None,
             "local_port must reset on hostInfo reparse"
@@ -2044,7 +2899,8 @@ mod tests {
         let mut drv = DrvAsynIPPort::new("iptest", "127.0.0.1:5025 tcp").unwrap();
 
         // asynRecord writes the lowercase key (asyn_record/mod.rs).
-        drv.set_option("hostinfo", "10.0.0.5:1234 udp").unwrap();
+        drv.set_option(&mut AsynUser::default(), "hostinfo", "10.0.0.5:1234 udp")
+            .unwrap();
         // The live driver config must reflect the reparse, not the map.
         assert_eq!(drv.config.host, "10.0.0.5");
         assert_eq!(drv.config.port, 1234);
@@ -2057,7 +2913,8 @@ mod tests {
 
         // disconnectOnReadTimeout shares the same case-insensitive key
         // contract for set and get (C getOption -> "Y"/"N").
-        drv.set_option("DISCONNECTONREADTIMEOUT", "Y").unwrap();
+        drv.set_option(&mut AsynUser::default(), "DISCONNECTONREADTIMEOUT", "Y")
+            .unwrap();
         assert_eq!(drv.get_option("disconnectonreadtimeout").unwrap(), "Y");
     }
 
@@ -2069,12 +2926,42 @@ mod tests {
         // empty key is a silent no-op.
         let mut drv = DrvAsynIPPort::new("iptest", "127.0.0.1:5025 tcp").unwrap();
 
-        let err = drv.set_option("bogusKey", "value").unwrap_err();
+        let err = drv
+            .set_option(&mut AsynUser::default(), "bogusKey", "value")
+            .unwrap_err();
         assert!(matches!(err, AsynError::OptionNotFound(_)));
+        // R11-49: reported in C's words (drvAsynIPPort.c:903-904).
+        assert_eq!(err.message(), "Unsupported key \"bogusKey\"");
         assert!(drv.get_option("bogusKey").is_err());
 
         // Empty key is a silent no-op (C `epicsStrCaseCmp(key,"") != 0`).
-        drv.set_option("", "ignored").unwrap();
+        drv.set_option(&mut AsynUser::default(), "", "ignored")
+            .unwrap();
+    }
+
+    /// R11-49: the IP driver's own invalid-value texts are C's
+    /// (drvAsynIPPort.c:932-933), and the Rust-only `noDelay` key follows the
+    /// same shape rather than inventing a third format.
+    #[test]
+    fn every_ip_option_reports_cs_text() {
+        let mut drv = DrvAsynIPPort::new("iptest", "127.0.0.1:5025 tcp").unwrap();
+
+        assert_eq!(
+            drv.set_option(&mut AsynUser::default(), "disconnectOnReadTimeout", "maybe")
+                .unwrap_err()
+                .message(),
+            "Invalid disconnectOnReadTimeout value."
+        );
+        assert_eq!(
+            drv.set_option(&mut AsynUser::default(), "noDelay", "1")
+                .unwrap_err()
+                .message(),
+            "Invalid noDelay value."
+        );
+        // Negative control: the valid values still take.
+        drv.set_option(&mut AsynUser::default(), "disconnectOnReadTimeout", "y")
+            .unwrap();
+        assert!(drv.disconnect_on_read_timeout);
     }
 
     // --- Protocol suffix parsing — C parity (drvAsynIPPort.c:355-391) ---
@@ -2182,6 +3069,169 @@ mod tests {
         );
     }
 
+    /// R8-57 (superseding R8-50): `host:port COM` is now accepted, because the
+    /// RFC 2217 layer it needs exists (`interpose::com`). C parses the token
+    /// case-insensitively (`epicsStrCaseCmp`, drvAsynIPPort.c:364).
+    ///
+    /// R8-50 refused the token outright — correctly, while the layer was
+    /// missing, since a COM port run as a raw TCP stream is a different
+    /// conversation with the terminal server. That refusal is now gone; this
+    /// test is what stops it coming back as a "safe" default.
+    #[test]
+    fn com_protocol_is_accepted_case_insensitively() {
+        for spec in ["1.2.3.4:5000 COM", "1.2.3.4:5000 com", "host:23 Com"] {
+            let cfg = IpPortConfig::parse(spec).unwrap();
+            assert_eq!(cfg.protocol, IpProtocol::Com, "{spec}");
+        }
+        // C :364-367 leaves socketType = SOCK_STREAM, so the port number parses
+        // out of the address exactly as it does for TCP.
+        let cfg = IpPortConfig::parse("1.2.3.4:5000 COM").unwrap();
+        assert_eq!(cfg.host, "1.2.3.4");
+        assert_eq!(cfg.port, 5000);
+    }
+
+    /// R8-57: `isCom` is what gates the install (C drvAsynIPPort.c:1061), so a
+    /// COM port comes up with the IAC layer already in place — before the first
+    /// transfer, not lazily at connect — and a TCP port never gets one.
+    ///
+    /// The IAC layer is the chain's *base*, not a stack entry (see
+    /// `ComState::octet`), so the interpose stack itself stays empty: that is
+    /// what keeps an EOS or echo layer pushed later from landing underneath it.
+    #[test]
+    fn com_port_installs_the_iac_layer_at_configure_time() {
+        let com = DrvAsynIPPort::new("comport", "1.2.3.4:5000 COM").unwrap();
+        assert!(com.com.is_some());
+        assert_eq!(
+            com.base.interpose_octet.len(),
+            0,
+            "the IAC layer is the base link, not a reorderable stack entry"
+        );
+
+        let tcp = DrvAsynIPPort::new("tcpport", "1.2.3.4:5000 TCP").unwrap();
+        assert!(tcp.com.is_none());
+        assert_eq!(tcp.base.interpose_octet.len(), 0);
+    }
+
+    /// R8-57 ordering: C installs COM at :1061 and the EOS interpose at :1065,
+    /// and `interposeInterface` makes each *later* install the *outer* one — so
+    /// C's chain is `EOS → COM → driver`, and EOS sees bytes COM has already
+    /// unstuffed.
+    ///
+    /// This is the regression that pushing COM onto the interpose stack caused:
+    /// the stack dispatches index 0 first and `push` appends, so a COM pushed at
+    /// construction sat *outside* the EOS layer `build_configured_ip_port` pushes
+    /// afterwards, inverting C's chain.
+    ///
+    /// Most streams do not notice, because unstuffing and terminator-stripping
+    /// commute — a 0xFF escape never creates or destroys a `\n`. What does not
+    /// commute is the *byte budget*: the caller's buffer is filled by whichever
+    /// layer is outermost. The device sends `A <IAC IAC> B \n` into a 3-byte read.
+    ///
+    ///   * C's order (EOS above COM): COM unstuffs first, so EOS fills the 3 bytes
+    ///     with real data — `A <IAC> B`.
+    ///   * inverted (COM above EOS): EOS fills the 3 bytes with the *stuffed*
+    ///     stream — `A <IAC> <IAC>` — and COM then unstuffs that down to 2, so `B`
+    ///     is silently dropped from the read.
+    ///
+    /// Assert the 3 bytes. Under the inverted chain this returns 2 and fails.
+    #[test]
+    fn eos_pushed_after_com_sits_above_it_and_sees_unstuffed_bytes() {
+        use crate::interpose::com::IAC;
+
+        let (listener, port) = start_echo_server();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            // Refuse the handshake; this test is about the data path.
+            stream.write_all(&[IAC, 252, 0]).unwrap(); // IAC WONT BINARY
+            stream.flush().unwrap();
+            let mut hs = [0u8; 3];
+            stream.read_exact(&mut hs).unwrap();
+            // One escaped IAC inside a terminated line.
+            stream.write_all(&[b'A', IAC, IAC, b'B', b'\n']).unwrap();
+            stream.flush().unwrap();
+            thread::sleep(Duration::from_millis(300));
+        });
+
+        // The iocsh path: DrvAsynIPPort::new installs COM, then the EOS interpose
+        // goes on top (noProcessEos defaults off, C :1064-1065).
+        let mut drv = crate::iocsh::build_configured_ip_port(
+            "com_eos",
+            &format!("127.0.0.1:{port} COM"),
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            drv.base.interpose_octet.len(),
+            1,
+            "EOS is the only stack layer; COM is the base"
+        );
+        drv.connect(&AsynUser::default()).unwrap();
+        drv.set_input_eos(&AsynUser::default(), b"\n").unwrap();
+
+        let user = AsynUser::new(0).with_timeout(Duration::from_secs(2));
+        let mut buf = [0u8; 3];
+        let (n, _eom) = chain_read_eom(&mut drv, &user, &mut buf).unwrap();
+        assert_eq!(
+            &buf[..n],
+            &[b'A', IAC, b'B'],
+            "the 3-byte read must carry 3 bytes of device data — an escape byte \
+             must not eat one of them, which is what happens when COM sits above EOS"
+        );
+
+        server.join().unwrap();
+    }
+
+    /// R8-57: C interposes the COM asynOption interface *above* the IP driver's
+    /// (asynInterposeCom.c:809-824), so the seven serial keys are answered by the
+    /// negotiation and everything else falls through to the driver below
+    /// (:710-717). Reading `baud` off a COM port must not reach the IP driver's
+    /// option map, and reading `hostInfo` must still reach it.
+    #[test]
+    fn com_option_interface_is_layered_over_the_ip_drivers() {
+        let com = DrvAsynIPPort::new("comport", "1.2.3.4:5000 COM").unwrap();
+        // Answered by the interpose, from the defaults C installs (:837-841).
+        assert_eq!(com.get_option("baud").unwrap(), "9600");
+        assert_eq!(com.get_option("parity").unwrap(), "none");
+        assert_eq!(com.get_option("crtscts").unwrap(), "N");
+        // Not the interpose's key: falls through to the IP driver.
+        assert_eq!(com.get_option("hostInfo").unwrap(), "1.2.3.4:5000 COM");
+        assert_eq!(com.get_option("disconnectOnReadTimeout").unwrap(), "N");
+
+        // A plain TCP port has no COM layer, so the serial keys are unknown to it
+        // — the same asynError C's IP driver returns for an unsupported key.
+        let tcp = DrvAsynIPPort::new("tcpport", "1.2.3.4:5000 TCP").unwrap();
+        assert!(tcp.get_option("baud").is_err());
+    }
+
+    /// R8-50: the token classification is exhaustive, so an unknown protocol is
+    /// C's `Unknown protocol "%s".` (drvAsynIPPort.c:389) rather than a
+    /// port-number complaint — and it is never silently accepted as TCP.
+    #[test]
+    fn unknown_protocol_token_is_rejected_by_name() {
+        let err = IpPortConfig::parse("1.2.3.4:5000 SCTP").unwrap_err();
+        assert_eq!(err.message(), "Unknown protocol \"SCTP\".");
+        // C's `%5s` into `char protocol[6]` truncates the token to five
+        // characters before the comparison, and the message prints what it
+        // matched against.
+        let err = IpPortConfig::parse("1.2.3.4:5000 tcpsocket").unwrap_err();
+        assert_eq!(err.message(), "Unknown protocol \"tcpso\".");
+    }
+
+    /// R8-50: C reads exactly one token (`sscanf(blank+1, "%5s", protocol)`) and
+    /// ignores whatever follows it, so a spec with trailing words still selects
+    /// the first protocol rather than failing on the address.
+    #[test]
+    fn only_the_first_token_after_the_blank_is_the_protocol() {
+        let cfg = IpPortConfig::parse("1.2.3.4:5000 UDP extra junk").unwrap();
+        assert_eq!(cfg.host, "1.2.3.4");
+        assert_eq!(cfg.port, 5000);
+        assert_eq!(cfg.protocol, IpProtocol::Udp);
+    }
+
     // --- Unix socket integration test ---
 
     #[cfg(unix)]
@@ -2204,7 +3254,7 @@ mod tests {
         let mut drv = DrvAsynIPPort::new("unixtest", &format!("unix://{sock_path}")).unwrap();
         let user = AsynUser::default();
         drv.connect(&user).unwrap();
-        assert!(drv.base().connected);
+        assert!(drv.base().is_connected());
 
         let mut user = AsynUser::new(0).with_timeout(Duration::from_secs(2));
         drv.write_octet(&mut user, b"unix_hello").unwrap();
@@ -2306,7 +3356,7 @@ mod tests {
         });
 
         let mut drv = DrvAsynIPPort::new("iptest", &format!("127.0.0.1:{port}")).unwrap();
-        drv.push_interpose(Box::new(EosInterpose::new(EosConfig {
+        drv.install_interpose(Box::new(EosInterpose::new(EosConfig {
             input_eos: vec![b'\n'],
             output_eos: vec![],
         })));
@@ -2321,12 +3371,12 @@ mod tests {
         // interpose.
         let ruser = AsynUser::new(0).with_timeout(Duration::from_secs(2));
         let mut small = [0u8; 4];
-        let n = drv.read_octet(&ruser, &mut small).unwrap();
+        let n = chain_read(&mut drv, &ruser, &mut small).unwrap();
         assert_eq!(&small[..n], b"OLD_");
 
         // Flush must clear BOTH the socket AND the interpose buffer.
         let mut fuser = AsynUser::new(0).with_timeout(Duration::from_secs(2));
-        drv.io_flush(&mut fuser).unwrap();
+        chain_flush(&mut drv, &mut fuser).unwrap();
 
         // Command + response cycle. If the interpose buffer was not
         // reset, this read returns the leftover "LINE" instead of "NEW".
@@ -2334,7 +3384,7 @@ mod tests {
         drv.write_octet(&mut wuser, b"CMD").unwrap();
         let ruser2 = AsynUser::new(0).with_timeout(Duration::from_secs(2));
         let mut buf = [0u8; 64];
-        let n = drv.read_octet(&ruser2, &mut buf).unwrap();
+        let n = chain_read(&mut drv, &ruser2, &mut buf).unwrap();
         assert_eq!(
             &buf[..n],
             b"NEW",

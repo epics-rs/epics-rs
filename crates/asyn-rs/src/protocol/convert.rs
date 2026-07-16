@@ -79,10 +79,26 @@ impl From<&RequestOp> for PortCommand {
             RequestOp::DisableAddr => Self::DisableAddr,
             RequestOp::SetEnable { yes } => Self::SetEnable { yes: *yes },
             RequestOp::SetAutoConnect { yes } => Self::SetAutoConnect { yes: *yes },
+            RequestOp::SetAutoConnectAddr { yes } => Self::SetAutoConnectAddr { yes: *yes },
             RequestOp::GetBoundsInt32 => Self::GetBoundsInt32,
             RequestOp::GetBoundsInt64 => Self::GetBoundsInt64,
             RequestOp::GetEnable => Self::GetEnable,
             RequestOp::GetAutoConnect => Self::GetAutoConnect,
+            RequestOp::GetConnected => Self::GetConnected,
+            RequestOp::PushEchoInterpose => Self::PushEchoInterpose,
+            RequestOp::PushDelayInterpose { delay } => Self::PushDelayInterpose {
+                delay_secs: delay.as_secs_f64(),
+            },
+            RequestOp::PushEosInterpose {
+                process_in,
+                process_out,
+            } => Self::PushEosInterpose {
+                process_in: *process_in,
+                process_out: *process_out,
+            },
+            RequestOp::PushFlushInterpose { flush_timeout } => Self::PushFlushInterpose {
+                flush_timeout_secs: flush_timeout.as_secs_f64(),
+            },
             RequestOp::BlockProcess => Self::BlockProcess,
             RequestOp::UnblockProcess => Self::UnblockProcess,
             RequestOp::DrvUserCreate(req) => Self::DrvUserCreate {
@@ -99,6 +115,15 @@ impl From<&RequestOp> for PortCommand {
             RequestOp::Report { level } => Self::Report { level: *level },
             RequestOp::SetInputEos { eos } => Self::SetInputEos { eos: eos.clone() },
             RequestOp::SetOutputEos { eos } => Self::SetOutputEos { eos: eos.clone() },
+            RequestOp::SetTimeStampSource { name } => {
+                Self::SetTimeStampSource { name: name.clone() }
+            }
+            RequestOp::GetInputEos => Self::GetInputEos,
+            RequestOp::GetOutputEos => Self::GetOutputEos,
+            RequestOp::GpibUniversalCmd { cmd } => Self::GpibUniversalCmd { cmd: *cmd },
+            RequestOp::GpibAddressedCmd { data } => Self::GpibAddressedCmd { data: data.clone() },
+            RequestOp::GpibIfc => Self::GpibIfc,
+            RequestOp::GpibRen { enable } => Self::GpibRen { enable: *enable },
         }
     }
 }
@@ -180,10 +205,29 @@ impl From<&PortCommand> for RequestOp {
             PortCommand::DisableAddr => Self::DisableAddr,
             PortCommand::SetEnable { yes } => Self::SetEnable { yes: *yes },
             PortCommand::SetAutoConnect { yes } => Self::SetAutoConnect { yes: *yes },
+            PortCommand::SetAutoConnectAddr { yes } => Self::SetAutoConnectAddr { yes: *yes },
             PortCommand::GetBoundsInt32 => Self::GetBoundsInt32,
             PortCommand::GetBoundsInt64 => Self::GetBoundsInt64,
             PortCommand::GetEnable => Self::GetEnable,
             PortCommand::GetAutoConnect => Self::GetAutoConnect,
+            PortCommand::GetConnected => Self::GetConnected,
+            PortCommand::PushEchoInterpose => Self::PushEchoInterpose,
+            // A negative / non-finite wire value would panic
+            // `Duration::from_secs_f64`; `delay_from_secs` owns the conversion
+            // and collapses those to C's "no delay".
+            PortCommand::PushDelayInterpose { delay_secs } => Self::PushDelayInterpose {
+                delay: crate::interpose::delay::delay_from_secs(*delay_secs),
+            },
+            PortCommand::PushEosInterpose {
+                process_in,
+                process_out,
+            } => Self::PushEosInterpose {
+                process_in: *process_in,
+                process_out: *process_out,
+            },
+            PortCommand::PushFlushInterpose { flush_timeout_secs } => Self::PushFlushInterpose {
+                flush_timeout: std::time::Duration::from_secs_f64(*flush_timeout_secs),
+            },
             PortCommand::BlockProcess => Self::BlockProcess,
             PortCommand::UnblockProcess => Self::UnblockProcess,
             PortCommand::DrvUserCreate {
@@ -209,6 +253,15 @@ impl From<&PortCommand> for RequestOp {
             PortCommand::Report { level } => Self::Report { level: *level },
             PortCommand::SetInputEos { eos } => Self::SetInputEos { eos: eos.clone() },
             PortCommand::SetOutputEos { eos } => Self::SetOutputEos { eos: eos.clone() },
+            PortCommand::SetTimeStampSource { name } => {
+                Self::SetTimeStampSource { name: name.clone() }
+            }
+            PortCommand::GetInputEos => Self::GetInputEos,
+            PortCommand::GetOutputEos => Self::GetOutputEos,
+            PortCommand::GpibUniversalCmd { cmd } => Self::GpibUniversalCmd { cmd: *cmd },
+            PortCommand::GpibAddressedCmd { data } => Self::GpibAddressedCmd { data: data.clone() },
+            PortCommand::GpibIfc => Self::GpibIfc,
+            PortCommand::GpibRen { enable } => Self::GpibRen { enable: *enable },
         }
     }
 }

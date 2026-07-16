@@ -96,15 +96,12 @@ async fn main() -> CaResult<()> {
     let (asyn_name, asyn_factory) = asyn_rs::asyn_record::asyn_record_factory();
     let (motor_name, motor_factory) = motor_rs::motor_record_factory();
 
+    // The server port comes from `IocApplication::new()`, which resolves
+    // EPICS_CAS_SERVER_PORT / EPICS_CA_SERVER_PORT through C
+    // `envGetInetPortConfigParam` (`runtime::net::cas_server_port`).
     let mut app = IocApplication::new();
     app = app.register_record_type(asyn_name, move || asyn_factory());
     app = app.register_record_type(motor_name, move || motor_factory());
-    app = app.port(
-        std::env::var("EPICS_CA_SERVER_PORT")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(5064),
-    );
     app = app.autosave_startup(autosave_config);
 
     // ========================================================================

@@ -1,22 +1,39 @@
 pub mod engine;
 pub mod math;
 
+pub use engine::cvt;
 pub use engine::error::{CalcError, calc_error_str};
 pub use engine::opcodes::{CoreOp, Opcode};
+pub use engine::random::seed_random_from_time;
 pub use engine::{CALC_NARGS, CalcResult, CompiledExpr, ExprKind, NumericInputs};
 
 pub use engine::StringInputs;
 pub use engine::opcodes::StringOp;
-pub use engine::value::StackValue;
+pub use engine::string::ScalcResult;
+pub use engine::value::{SCALC_STRING_MAX, SCALC_STRING_SIZE, ScalcString, StackValue};
 
 pub use engine::ArrayInputs;
-pub use engine::array_value::ArrayStackValue;
+pub use engine::array_value::{ArrayCell, ArrayStackValue};
 pub use engine::opcodes::ArrayOp;
 
-/// Compile an infix expression string into a postfix `CompiledExpr`.
+/// Compile an infix expression for the **numeric** engine — C `postfix()`
+/// (`postfix.c`), used by calc, calcout and swait.
+///
+/// Symbols outside `postfix.c`'s element table (`SVAL`, string literals and
+/// sCalc string functions, aCalc array functions, `UNTIL`, `AA`..`LL`, `>?`,
+/// `<?`, `NRNDM`, `INT`) are `CalcError::Syntax` — C's `CALC_ERR_SYNTAX`,
+/// raised at compile time (`CLCV != 0`), not at first evaluation.
+///
+/// The empty expression is `CALC_ERR_NULL_ARG` (`postfix.c:235-241` lumps
+/// `*psrc == '\0'` in with the NULL-pointer arguments), which is where base
+/// parts company with sCalc and aCalc — they accept it. Whitespace-only is not
+/// empty: it lexes to nothing and comes out `Incomplete`, as in C.
 pub fn compile(expr: &str) -> CalcResult<CompiledExpr> {
-    let tokens = engine::token::tokenize(expr)?;
-    engine::postfix::compile(&tokens)
+    if expr.is_empty() {
+        return Err(CalcError::NullArg);
+    }
+    let tokens = engine::token::tokenize(expr, ExprKind::Numeric)?;
+    engine::postfix::compile(&tokens, ExprKind::Numeric)
 }
 
 /// Evaluate a compiled expression with the given inputs.
@@ -30,9 +47,20 @@ pub fn calc(expr: &str, inputs: &mut NumericInputs) -> CalcResult<f64> {
     eval(&compiled, inputs)
 }
 
+/// Compile an infix expression for the **string** engine — synApps
+/// `sCalcPostfix()`, used by scalcout. Its element table is its own: no `FMOD`,
+/// no `>>>`, operands `A`..`P` / `AA`..`LL`, plus the string symbols base has
+/// never had.
+///
+/// Unlike base, the empty expression SUCCEEDS with the empty program
+/// (`sCalcPostfix.c:432-434`) — so `CLCV` reads 0 — and `sCalcPerform` then
+/// fails on it every cycle ([`CompiledExpr::empty`]).
 pub fn scalc_compile(expr: &str) -> CalcResult<CompiledExpr> {
-    let tokens = engine::token::tokenize(expr)?;
-    engine::postfix::compile(&tokens)
+    if expr.is_empty() {
+        return Ok(CompiledExpr::empty(ExprKind::String));
+    }
+    let tokens = engine::token::tokenize(expr, ExprKind::String)?;
+    engine::postfix::compile(&tokens, ExprKind::String)
 }
 
 pub fn scalc_eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> CalcResult<StackValue> {
@@ -44,9 +72,39 @@ pub fn scalc(expr: &str, inputs: &mut StringInputs) -> CalcResult<StackValue> {
     scalc_eval(&compiled, inputs)
 }
 
+/// C `sCalcPerform` (`sCalcoutRecord.c:357-359`, `:768-770`) — evaluate, then
+/// run the epilogue that fills BOTH of the record's cells, `(VAL, SVAL)` or
+/// `(OVAL, OSV)`. They are two views of ONE result, never two computations, so
+/// a record must not re-derive either with a formatter or a parser of its own.
+///
+/// `precision` is C's ninth argument, which scalcout passes as `pcalc->prec`.
+/// It is an argument and not a property of the value because only ONE of C's
+/// two epilogues honours it — see [`engine::string::epilogue`], which is where
+/// that rule lives. This is the only way to obtain the pair: a bare
+/// [`StackValue`] cannot know which evaluator produced it, so there is no
+/// `scalc_result(&value)` for a caller to reach for and get wrong.
+pub fn scalc_perform(
+    expr: &CompiledExpr,
+    inputs: &mut StringInputs,
+    precision: i16,
+) -> CalcResult<ScalcResult> {
+    let top = scalc_eval(expr, inputs)?;
+    Ok(engine::string::epilogue(expr, &top, precision))
+}
+
+/// Compile an infix expression for the **array** engine — synApps
+/// `aCalcPostfix()`, used by acalcout. Its element table is its own: no `FMOD`,
+/// no `>>>`, no `INF`/`NAN` literal and no `SVAL`, operands `A`..`P` /
+/// `AA`..`LL`, plus the array symbols.
+///
+/// As in sCalc, the empty expression succeeds with the empty program
+/// (`aCalcPostfix.c:439-441`), which `aCalcPerform` then refuses to run.
 pub fn acalc_compile(expr: &str) -> CalcResult<CompiledExpr> {
-    let tokens = engine::token::tokenize(expr)?;
-    engine::postfix::compile(&tokens)
+    if expr.is_empty() {
+        return Ok(CompiledExpr::empty(ExprKind::Array));
+    }
+    let tokens = engine::token::tokenize(expr, ExprKind::Array)?;
+    engine::postfix::compile(&tokens, ExprKind::Array)
 }
 
 pub fn acalc_eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> CalcResult<ArrayStackValue> {

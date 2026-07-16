@@ -117,6 +117,18 @@ impl CommandContext {
         let _ = writeln!(out, "{msg}");
     }
 
+    /// Print raw BYTES plus a newline to the current output.
+    ///
+    /// C's `echo` (`libComRegister.c:84-91`) hands `dbTranslateEscape`'s output
+    /// straight to `printf("%s")` — bytes, not characters — so `echo "\xff"`
+    /// emits the single byte 0xFF. Routing that through [`Self::println`] would
+    /// force it through a Rust `str` and replace it.
+    pub fn println_bytes(&self, bytes: &[u8]) {
+        let mut out = self.output.borrow_mut();
+        let _ = out.write_all(bytes);
+        let _ = out.write_all(b"\n");
+    }
+
     /// Print a formatted string to the current output.
     pub fn print_fmt(&self, args: std::fmt::Arguments<'_>) {
         let mut out = self.output.borrow_mut();

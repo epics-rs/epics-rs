@@ -8,8 +8,8 @@
 //! `should_output_fn` knob this file can switch back to the derive form.
 
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, MENU_YES_NO, ProcessOutcome, Record};
-use crate::types::{DbFieldType, EpicsValue, PvString};
+use crate::server::record::{MENU_YES_NO, ProcessOutcome, Record};
+use crate::types::{EpicsValue, PvString};
 
 pub struct LongoutRecord {
     pub val: i32,
@@ -18,20 +18,25 @@ pub struct LongoutRecord {
     pub lopr: i32,
     pub drvh: i32,
     pub drvl: i32,
-    pub hihi: i32,
-    pub high: i32,
-    pub low: i32,
-    pub lolo: i32,
-    pub hhsv: i16,
-    pub hsv: i16,
-    pub lsv: i16,
-    pub llsv: i16,
-    pub hyst: f64,
+    // HIHI/HIGH/LOW/LOLO, HHSV/HSV/LSV/LLSV and HYST are owned by
+    // `CommonFields` (limits/severities in `analog_alarm`, HYST in `hyst`),
+    // NOT by this struct — the `checkAlarms` ladder reads them from there. A
+    // record-local copy is a second, never-consulted owner, which is why a
+    // `caput LO.HHSV INVALID` never fired the alarm. Omitting the fields
+    // routes get/put through the common-field path (the single owner), as
+    // `ao`/`int64out` do. LALM (last-alarmed value) IS record state and stays.
     pub lalm: f64,
     pub ivoa: i16,
     pub ivov: i32,
-    pub adel: f64,
-    pub mdel: f64,
+    // ADEL/MDEL are `DBF_LONG` (longoutRecord.dbd.pod) — integer archive and
+    // monitor deadbands. Stored as `i32` (not `f64`) so a client put resolves
+    // its target to `DBF_LONG` and parses through the single
+    // `c_parse::put_string` `Long` row, which REFUSES an over-i32/under-i32
+    // value as C's `epicsParseInt32` does rather than the `DBF_DOUBLE` row
+    // accepting it and the read projection saturating. Mirrors int64in/int64out
+    // Cause B (commit 224d5ad5).
+    pub adel: i32,
+    pub mdel: i32,
     pub alst: f64,
     pub mlst: f64,
     pub omsl: i16,
@@ -90,20 +95,11 @@ impl Default for LongoutRecord {
             lopr: 0,
             drvh: 0, // C defaults both to 0 (equal = no clamping)
             drvl: 0,
-            hihi: 0,
-            high: 0,
-            low: 0,
-            lolo: 0,
-            hhsv: 0,
-            hsv: 0,
-            lsv: 0,
-            llsv: 0,
-            hyst: 0.0,
             lalm: 0.0,
             ivoa: 0,
             ivov: 0,
-            adel: 0.0,
-            mdel: 0.0,
+            adel: 0,
+            mdel: 0,
             alst: 0.0,
             mlst: 0.0,
             omsl: 0,
@@ -160,169 +156,6 @@ impl LongoutRecord {
     }
 }
 
-static LONGOUT_FIELDS: &[FieldDesc] = &[
-    FieldDesc {
-        name: "VAL",
-        dbf_type: DbFieldType::Long,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "EGU",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "HOPR",
-        dbf_type: DbFieldType::Long,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LOPR",
-        dbf_type: DbFieldType::Long,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DRVH",
-        dbf_type: DbFieldType::Long,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DRVL",
-        dbf_type: DbFieldType::Long,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "HIHI",
-        dbf_type: DbFieldType::Long,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "HIGH",
-        dbf_type: DbFieldType::Long,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LOW",
-        dbf_type: DbFieldType::Long,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LOLO",
-        dbf_type: DbFieldType::Long,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "HHSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "HSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LLSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "HYST",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LALM",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "IVOA",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "IVOV",
-        dbf_type: DbFieldType::Long,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ADEL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "MDEL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ALST",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "MLST",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OMSL",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DOL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIMM",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIML",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIOL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIMS",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SDLY",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OOPT",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "PVAL",
-        dbf_type: DbFieldType::Long,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "OOCH",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-];
-
 /// Choice labels for the output-execute-option menu, in index order.
 /// C `menu(longoutOOPT)` (`longoutRecord.dbd.pod:23-29`). A distinct menu
 /// from `calcoutOOPT`, with the same six choices and no trailing "Never".
@@ -340,22 +173,29 @@ impl Record for LongoutRecord {
         "longout"
     }
 
-    /// C `longoutRecord.c::init_record` applies a constant DOL to VAL once
-    /// via `recGblInitConstantLink(&prec->dol, DBF_LONG, &prec->val)`. The
-    /// framework gate (`processing.rs`) excludes a constant DOL from the
-    /// per-cycle closed-loop fetch (C `!dbLinkIsConstant`), so the constant
-    /// must be seeded here or it would never reach VAL.
-    fn init_record(&mut self, pass: u8) -> CaResult<()> {
-        if pass == 0 {
-            if let crate::server::record::ParsedLink::Constant(s) =
-                crate::server::record::parse_link_v2(&self.dol)
-            {
-                if let Ok(v) = s.trim().parse::<f64>() {
-                    self.val = v as i32;
-                }
-            }
-        }
-        Ok(())
+    /// C `longoutRecord.c:145-153`: `process()` clears `udf` to FALSE only on a
+    /// successful closed-loop DOL fetch (`if (!dbLinkIsConstant(&prec->dol) &&
+    /// !status) prec->udf=FALSE;`); the no-DOL arm reads the current VAL and
+    /// leaves `udf` alone, so `checkAlarms` (`:317-318`) raises UDF_ALARM every
+    /// cycle for a bare record. `udf` is never re-derived from the stored VAL, so
+    /// longout opts out of the framework's blanket per-cycle clear. The definers
+    /// are a direct VAL put (`dbPut`, `field_io.rs`) and the DOL-apply site
+    /// (`processing.rs`).
+    fn clears_udf(&self) -> bool {
+        false
+    }
+
+    /// C `longoutRecord.c:113-114`:
+    /// `if (recGblInitConstantLink(&prec->dol, DBF_LONG, &prec->val))
+    ///      prec->udf = FALSE;`
+    /// The framework gate (`processing.rs`) excludes a constant DOL from the
+    /// per-cycle closed-loop fetch (C `!dbLinkIsConstant`), so the init-seed
+    /// owner is the only place the constant can reach VAL — and a record whose
+    /// VAL came from it is DEFINED.
+    fn constant_init_links(&self) -> Vec<crate::server::record::ConstantInitLink> {
+        vec![crate::server::record::ConstantInitLink::dol_to_val(
+            "DOL", "VAL",
+        )]
     }
 
     /// C `longoutRecord.c::convert` (lines 436-441): clamp VAL into the
@@ -368,10 +208,6 @@ impl Record for LongoutRecord {
             self.val = self.val.clamp(self.drvl, self.drvh);
         }
         Ok(ProcessOutcome::complete())
-    }
-
-    fn field_list(&self) -> &'static [FieldDesc] {
-        LONGOUT_FIELDS
     }
 
     /// `DBF_MENU` fields, served as `DBR_ENUM` with the menu's choice labels
@@ -397,20 +233,13 @@ impl Record for LongoutRecord {
             "LOPR" => Some(EpicsValue::Long(self.lopr)),
             "DRVH" => Some(EpicsValue::Long(self.drvh)),
             "DRVL" => Some(EpicsValue::Long(self.drvl)),
-            "HIHI" => Some(EpicsValue::Long(self.hihi)),
-            "HIGH" => Some(EpicsValue::Long(self.high)),
-            "LOW" => Some(EpicsValue::Long(self.low)),
-            "LOLO" => Some(EpicsValue::Long(self.lolo)),
-            "HHSV" => Some(EpicsValue::Short(self.hhsv)),
-            "HSV" => Some(EpicsValue::Short(self.hsv)),
-            "LSV" => Some(EpicsValue::Short(self.lsv)),
-            "LLSV" => Some(EpicsValue::Short(self.llsv)),
-            "HYST" => Some(EpicsValue::Double(self.hyst)),
+            // HIHI/HIGH/LOW/LOLO/HHSV/HSV/LSV/LLSV/HYST fall through to the
+            // common-field path (their single owner) — see the struct comment.
             "LALM" => Some(EpicsValue::Double(self.lalm)),
             "IVOA" => Some(EpicsValue::Short(self.ivoa)),
             "IVOV" => Some(EpicsValue::Long(self.ivov)),
-            "ADEL" => Some(EpicsValue::Double(self.adel)),
-            "MDEL" => Some(EpicsValue::Double(self.mdel)),
+            "ADEL" => Some(EpicsValue::Long(self.adel)),
+            "MDEL" => Some(EpicsValue::Long(self.mdel)),
             "ALST" => Some(EpicsValue::Double(self.alst)),
             "MLST" => Some(EpicsValue::Double(self.mlst)),
             "OMSL" => Some(EpicsValue::Short(self.omsl)),
@@ -460,51 +289,9 @@ impl Record for LongoutRecord {
                     self.drvl = v;
                 }
             }
-            "HIHI" => {
-                if let EpicsValue::Long(v) = value {
-                    self.hihi = v;
-                }
-            }
-            "HIGH" => {
-                if let EpicsValue::Long(v) = value {
-                    self.high = v;
-                }
-            }
-            "LOW" => {
-                if let EpicsValue::Long(v) = value {
-                    self.low = v;
-                }
-            }
-            "LOLO" => {
-                if let EpicsValue::Long(v) = value {
-                    self.lolo = v;
-                }
-            }
-            "HHSV" => {
-                if let EpicsValue::Short(v) = value {
-                    self.hhsv = v;
-                }
-            }
-            "HSV" => {
-                if let EpicsValue::Short(v) = value {
-                    self.hsv = v;
-                }
-            }
-            "LSV" => {
-                if let EpicsValue::Short(v) = value {
-                    self.lsv = v;
-                }
-            }
-            "LLSV" => {
-                if let EpicsValue::Short(v) = value {
-                    self.llsv = v;
-                }
-            }
-            "HYST" => {
-                if let EpicsValue::Double(v) = value {
-                    self.hyst = v;
-                }
-            }
+            // HIHI/HIGH/LOW/LOLO/HHSV/HSV/LSV/LLSV/HYST are not handled here:
+            // they hit the `_ =>` arm below and fall through to
+            // `put_common_field`, the single owner of the analog-alarm ladder.
             "LALM" => {
                 if let EpicsValue::Double(v) = value {
                     self.lalm = v;
@@ -521,12 +308,12 @@ impl Record for LongoutRecord {
                 }
             }
             "ADEL" => {
-                if let EpicsValue::Double(v) = value {
+                if let EpicsValue::Long(v) = value {
                     self.adel = v;
                 }
             }
             "MDEL" => {
-                if let EpicsValue::Double(v) = value {
+                if let EpicsValue::Long(v) = value {
                     self.mdel = v;
                 }
             }
@@ -581,8 +368,16 @@ impl Record for LongoutRecord {
                 }
             }
             "PVAL" => {
-                // Read-only — validate_put already rejected the call.
-                return Err(CaError::ReadOnlyField("PVAL".into()));
+                // PVAL (DBF_LONG, "Previous Value", longoutRecord.dbd.pod:438-440)
+                // carries no `special()`/`pp()`, so C `dbPut` stores it verbatim —
+                // `caput LO.PVAL 5` succeeds. It is TRANSIENT: a successful output
+                // latches `pval = val` (`on_output_complete`, C
+                // longoutRecord.c:105 `prec->pval = prec->val`), so the stored
+                // value stands only until the next output cycle. Mirrors VAL's
+                // DBF_LONG arm above. The port previously refused it as read-only.
+                if let EpicsValue::Long(v) = value {
+                    self.pval = v;
+                }
             }
             "OOCH" => {
                 if let EpicsValue::Short(v) = value {
@@ -777,11 +572,20 @@ mod tests {
         assert_eq!(r.oopt, 3);
     }
 
+    /// PVAL (DBF_LONG, no special/pp — longoutRecord.dbd.pod:438-440) accepts a
+    /// client put: C `dbPut` stores it verbatim. The value is TRANSIENT — the
+    /// next successful output latches `pval = val` — but the store itself
+    /// succeeds and reads back until then. Boundary values (`type-max`,
+    /// `type-min`) round-trip because PVAL is a plain 32-bit signed field.
     #[test]
-    fn pval_is_read_only_via_put_field() {
+    fn pval_put_stores_transient_value() {
         let mut r = LongoutRecord::new(0);
-        let err = r.put_field("PVAL", EpicsValue::Long(42)).unwrap_err();
-        assert!(matches!(err, CaError::ReadOnlyField(_)));
+        r.put_field("PVAL", EpicsValue::Long(42)).unwrap();
+        assert_eq!(r.pval, 42);
+        r.put_field("PVAL", EpicsValue::Long(i32::MAX)).unwrap();
+        assert_eq!(r.pval, i32::MAX);
+        r.put_field("PVAL", EpicsValue::Long(i32::MIN)).unwrap();
+        assert_eq!(r.pval, i32::MIN);
     }
 
     /// PR #6c573b4 part 2 (`longoutRecord.c:222-225`): writing OUT at

@@ -1,0 +1,830 @@
+menu(sseqSELM) {
+	choice(sseqSELM_All,"All")
+	choice(sseqSELM_Specified,"Specified")
+	choice(sseqSELM_Mask,"Mask")
+}
+menu(sseqWAIT) {
+	choice(sseqWAIT_NoWait,"NoWait")
+	choice(sseqWAIT_Wait,"Wait")
+	choice(sseqWAIT_Wait1,"After1")
+	choice(sseqWAIT_Wait2,"After2")
+	choice(sseqWAIT_Wait3,"After3")
+	choice(sseqWAIT_Wait4,"After4")
+	choice(sseqWAIT_Wait5,"After5")
+	choice(sseqWAIT_Wait6,"After6")
+	choice(sseqWAIT_Wait7,"After7")
+	choice(sseqWAIT_Wait8,"After8")
+	choice(sseqWAIT_Wait9,"After9")
+	choice(sseqWAIT_Wait10,"AfterA")
+}
+menu(sseqLNKV) {
+	choice(sseqLNKV_EXT_NC,"Ext PV NC")
+	choice(sseqLNKV_EXT,"Ext PV OK")
+	choice(sseqLNKV_LOC,"Local PV")
+	choice(sseqLNKV_CON,"Constant")
+}
+
+recordtype(sseq) {
+	include "dbCommon.dbd" 
+	field(VAL,DBF_LONG) {
+		prompt("Used to trigger")
+		asl(ASL0)
+		pp(TRUE)
+	}
+	field(SELM,DBF_MENU) {
+		prompt("Select Mechanism")
+		promptgroup(GUI_INPUTS)
+		interest(1)
+		menu(sseqSELM)
+	}
+	field(SELN,DBF_USHORT) {
+		prompt("Link Selection")
+		interest(1)
+		initial("1")
+	}
+	field(SELL,DBF_INLINK) {
+		prompt("Link Selection Loc")
+		promptgroup(GUI_INPUTS)
+		interest(1)
+	}
+	field(PREC,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_DISPLAY)
+		interest(1)
+	}
+# The next 70 fields are used in sseqRecord.c as a 10-element array of
+# 10-field long structures ("struct linkGroup").
+	field(DLY1,DBF_DOUBLE) {
+		prompt("Delay 1")
+		promptgroup(GUI_SEQ1)
+		interest(1)
+		special(SPC_MOD)
+	}
+	field(DOL1,DBF_INLINK) {
+		prompt("Input link1")
+		promptgroup(GUI_SEQ1)
+		interest(1)
+		special(SPC_MOD)
+	}
+	field(DO1,DBF_DOUBLE) {
+		prompt("Constant input 1")
+		promptgroup(GUI_SEQ1)
+		interest(1)
+		special(SPC_MOD)
+	}
+	field(LNK1,DBF_OUTLINK) {
+		prompt("Output Link 1")
+		promptgroup(GUI_SEQ1)
+		interest(1)
+		special(SPC_MOD)
+	}
+	field(STR1,DBF_STRING) {
+		prompt("String value 1")
+		promptgroup(GUI_SEQ1)
+		interest(4)
+		size(40)
+		special(SPC_MOD)
+	}
+	field(DT1,DBF_SHORT) {
+		prompt("DOL link type")
+		interest(4)
+		special(SPC_NOMOD)
+	}
+	field(LT1,DBF_SHORT) {
+		prompt("LNK link type")
+		interest(4)
+		special(SPC_NOMOD)
+	}
+	field(WAIT1,DBF_MENU) {
+		prompt("Wait for completion?")
+		promptgroup(GUI_SEQ1)
+		interest(1)
+		menu(sseqWAIT)
+		special(SPC_MOD)
+	}
+	field(WERR1,DBF_SHORT) {
+		interest(1)
+		special(SPC_NOMOD)
+	}
+	field(WTG1,DBF_SHORT) {
+		interest(1)
+		special(SPC_NOMOD)
+	}
+	field(IX1,DBF_SHORT) {
+		interest(2)
+		initial(0)
+		special(SPC_NOMOD)
+	}
+	field(DOL1V,DBF_MENU) {
+		prompt("DOL LINK Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sseqLNKV)
+		initial("1")
+	}
+	field(LNK1V,DBF_MENU) {
+		prompt("LNK LINK Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sseqLNKV)
+		initial("1")
+	}
+
+	field(DLY2,DBF_DOUBLE) {
+		prompt("Delay 2")
+		promptgroup(GUI_SEQ1)
+		interest(1)
+		special(SPC_MOD)
+	}
+	field(DOL2,DBF_INLINK) {
+		prompt("Input link 2")
+		promptgroup(GUI_SEQ1)
+		interest(1)
+		special(SPC_MOD)
+	}
+	field(DO2,DBF_DOUBLE) {
+		prompt("Constant input 2")
+		promptgroup(GUI_SEQ1)
+		interest(1)
+		special(SPC_MOD)
+	}
+	field(LNK2,DBF_OUTLINK) {
+		prompt("Output Link 2")
+		promptgroup(GUI_SEQ1)
+		interest(1)
+		special(SPC_MOD)
+	}
+	field(STR2,DBF_STRING) {
+		prompt("String value 2")
+		promptgroup(GUI_SEQ1)
+		interest(4)
+		size(40)
+		special(SPC_MOD)
+	}
+	field(DT2,DBF_SHORT) {
+		prompt("DOL link type")
+		interest(4)
+		special(SPC_NOMOD)
+	}
+	field(LT2,DBF_SHORT) {
+		prompt("LNK link type")
+		interest(4)
+		special(SPC_NOMOD)
+	}
+	field(WAIT2,DBF_MENU) {
+		prompt("Wait for completion?")
+		promptgroup(GUI_SEQ1)
+		interest(1)
+		menu(sseqWAIT)
+		special(SPC_MOD)
+	}
+	field(WERR2,DBF_SHORT) {
+		interest(1)
+		special(SPC_NOMOD)
+	}
+	field(WTG2,DBF_SHORT) {
+		interest(1)
+		special(SPC_NOMOD)
+	}
+	field(IX2,DBF_SHORT) {
+		interest(2)
+		initial(1)
+		special(SPC_NOMOD)
+	}
+	field(DOL2V,DBF_MENU) {
+		prompt("DOL LINK Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sseqLNKV)
+		initial("1")
+	}
+	field(LNK2V,DBF_MENU) {
+		prompt("LNK LINK Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sseqLNKV)
+		initial("1")
+	}
+
+	field(DLY3,DBF_DOUBLE) {
+		prompt("Delay 3")
+		promptgroup(GUI_SEQ1)
+		interest(1)
+		special(SPC_MOD)
+	}
+	field(DOL3,DBF_INLINK) {
+		prompt("Input link 3")
+		promptgroup(GUI_SEQ1)
+		interest(1)
+		special(SPC_MOD)
+	}
+	field(DO3,DBF_DOUBLE) {
+		prompt("Constant input 3")
+		promptgroup(GUI_SEQ1)
+		interest(1)
+		special(SPC_MOD)
+	}
+	field(LNK3,DBF_OUTLINK) {
+		prompt("Output Link 3")
+		promptgroup(GUI_SEQ1)
+		interest(1)
+		special(SPC_MOD)
+	}
+	field(STR3,DBF_STRING) {
+		prompt("String value 3")
+		promptgroup(GUI_SEQ1)
+		interest(4)
+		size(40)
+		special(SPC_MOD)
+	}
+	field(DT3,DBF_SHORT) {
+		prompt("DOL link type")
+		interest(4)
+		special(SPC_NOMOD)
+	}
+	field(LT3,DBF_SHORT) {
+		prompt("LNK link type")
+		interest(4)
+		special(SPC_NOMOD)
+	}
+	field(WAIT3,DBF_MENU) {
+		prompt("Wait for completion?")
+		promptgroup(GUI_SEQ1)
+		interest(1)
+		menu(sseqWAIT)
+		special(SPC_MOD)
+	}
+	field(WERR3,DBF_SHORT) {
+		interest(1)
+		special(SPC_NOMOD)
+	}
+	field(WTG3,DBF_SHORT) {
+		interest(1)
+		special(SPC_NOMOD)
+	}
+	field(IX3,DBF_SHORT) {
+		interest(2)
+		initial(2)
+		special(SPC_NOMOD)
+	}
+	field(DOL3V,DBF_MENU) {
+		prompt("DOL LINK Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sseqLNKV)
+		initial("1")
+	}
+	field(LNK3V,DBF_MENU) {
+		prompt("LNK LINK Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sseqLNKV)
+		initial("1")
+	}
+
+	field(DLY4,DBF_DOUBLE) {
+		prompt("Delay 4")
+		promptgroup(GUI_SEQ2)
+		interest(1)
+		special(SPC_MOD)
+	}
+	field(DOL4,DBF_INLINK) {
+		prompt("Input link 4")
+		promptgroup(GUI_SEQ2)
+		interest(1)
+		special(SPC_MOD)
+	}
+	field(DO4,DBF_DOUBLE) {
+		prompt("Constant input 4")
+		promptgroup(GUI_SEQ1)
+		interest(1)
+		special(SPC_MOD)
+	}
+	field(LNK4,DBF_OUTLINK) {
+		prompt("Output Link 4")
+		promptgroup(GUI_SEQ2)
+		interest(1)
+		special(SPC_MOD)
+	}
+	field(STR4,DBF_STRING) {
+		prompt("String value 4")
+		promptgroup(GUI_SEQ1)
+		interest(4)
+		size(40)
+		special(SPC_MOD)
+	}
+	field(DT4,DBF_SHORT) {
+		prompt("DOL link type")
+		interest(4)
+		special(SPC_NOMOD)
+	}
+	field(LT4,DBF_SHORT) {
+		prompt("LNK link type")
+		interest(4)
+		special(SPC_NOMOD)
+	}
+	field(WAIT4,DBF_MENU) {
+		prompt("Wait for completion?")
+		promptgroup(GUI_SEQ1)
+		interest(1)
+		menu(sseqWAIT)
+		special(SPC_MOD)
+	}
+	field(WERR4,DBF_SHORT) {
+		interest(1)
+		special(SPC_NOMOD)
+	}
+	field(WTG4,DBF_SHORT) {
+		interest(1)
+		special(SPC_NOMOD)
+	}
+	field(IX4,DBF_SHORT) {
+		interest(2)
+		initial(3)
+		special(SPC_NOMOD)
+	}
+	field(DOL4V,DBF_MENU) {
+		prompt("DOL LINK Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sseqLNKV)
+		initial("1")
+	}
+	field(LNK4V,DBF_MENU) {
+		prompt("LNK LINK Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sseqLNKV)
+		initial("1")
+	}
+
+	field(DLY5,DBF_DOUBLE) {
+		prompt("Delay 5")
+		promptgroup(GUI_SEQ2)
+		interest(1)
+		special(SPC_MOD)
+	}
+	field(DOL5,DBF_INLINK) {
+		prompt("Input link 5")
+		promptgroup(GUI_SEQ2)
+		interest(1)
+		special(SPC_MOD)
+	}
+	field(DO5,DBF_DOUBLE) {
+		prompt("Constant input 5")
+		promptgroup(GUI_SEQ1)
+		interest(1)
+		special(SPC_MOD)
+	}
+	field(LNK5,DBF_OUTLINK) {
+		prompt("Output Link 5")
+		promptgroup(GUI_SEQ2)
+		interest(1)
+		special(SPC_MOD)
+	}
+	field(STR5,DBF_STRING) {
+		prompt("String value 5")
+		promptgroup(GUI_SEQ1)
+		interest(4)
+		size(40)
+		special(SPC_MOD)
+	}
+	field(DT5,DBF_SHORT) {
+		prompt("DOL link type")
+		interest(4)
+		special(SPC_NOMOD)
+	}
+	field(LT5,DBF_SHORT) {
+		prompt("LNK link type")
+		interest(4)
+		special(SPC_NOMOD)
+	}
+	field(WAIT5,DBF_MENU) {
+		prompt("Wait for completion?")
+		promptgroup(GUI_SEQ1)
+		interest(1)
+		menu(sseqWAIT)
+		special(SPC_MOD)
+	}
+	field(WERR5,DBF_SHORT) {
+		interest(1)
+		special(SPC_NOMOD)
+	}
+	field(WTG5,DBF_SHORT) {
+		interest(1)
+		special(SPC_NOMOD)
+	}
+	field(IX5,DBF_SHORT) {
+		interest(2)
+		initial(4)
+		special(SPC_NOMOD)
+	}
+	field(DOL5V,DBF_MENU) {
+		prompt("DOL LINK Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sseqLNKV)
+		initial("1")
+	}
+	field(LNK5V,DBF_MENU) {
+		prompt("LNK LINK Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sseqLNKV)
+		initial("1")
+	}
+
+	field(DLY6,DBF_DOUBLE) {
+		prompt("Delay 6")
+		promptgroup(GUI_SEQ2)
+		interest(1)
+		special(SPC_MOD)
+	}
+	field(DOL6,DBF_INLINK) {
+		prompt("Input link 6")
+		promptgroup(GUI_SEQ2)
+		interest(1)
+		special(SPC_MOD)
+	}
+	field(DO6,DBF_DOUBLE) {
+		prompt("Constant input 6")
+		promptgroup(GUI_SEQ1)
+		interest(1)
+		special(SPC_MOD)
+	}
+	field(LNK6,DBF_OUTLINK) {
+		prompt("Output Link 6")
+		promptgroup(GUI_SEQ2)
+		interest(1)
+		special(SPC_MOD)
+	}
+	field(STR6,DBF_STRING) {
+		prompt("String value 6")
+		promptgroup(GUI_SEQ1)
+		interest(4)
+		size(40)
+		special(SPC_MOD)
+	}
+	field(DT6,DBF_SHORT) {
+		prompt("DOL link type")
+		interest(4)
+		special(SPC_NOMOD)
+	}
+	field(LT6,DBF_SHORT) {
+		prompt("LNK link type")
+		interest(4)
+		special(SPC_NOMOD)
+	}
+	field(WAIT6,DBF_MENU) {
+		prompt("Wait for completion?")
+		promptgroup(GUI_SEQ1)
+		interest(1)
+		menu(sseqWAIT)
+		special(SPC_MOD)
+	}
+	field(WERR6,DBF_SHORT) {
+		interest(1)
+		special(SPC_NOMOD)
+	}
+	field(WTG6,DBF_SHORT) {
+		interest(1)
+		special(SPC_NOMOD)
+	}
+	field(IX6,DBF_SHORT) {
+		interest(2)
+		initial(5)
+		special(SPC_NOMOD)
+	}
+	field(DOL6V,DBF_MENU) {
+		prompt("DOL LINK Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sseqLNKV)
+		initial("1")
+	}
+	field(LNK6V,DBF_MENU) {
+		prompt("LNK LINK Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sseqLNKV)
+		initial("1")
+	}
+
+	field(DLY7,DBF_DOUBLE) {
+		prompt("Delay 7")
+		promptgroup(GUI_SEQ3)
+		interest(1)
+		special(SPC_MOD)
+	}
+	field(DOL7,DBF_INLINK) {
+		prompt("Input link 7")
+		promptgroup(GUI_SEQ3)
+		interest(1)
+		special(SPC_MOD)
+	}
+	field(DO7,DBF_DOUBLE) {
+		prompt("Constant input 7")
+		promptgroup(GUI_SEQ1)
+		interest(1)
+		special(SPC_MOD)
+	}
+	field(LNK7,DBF_OUTLINK) {
+		prompt("Output Link 7")
+		promptgroup(GUI_SEQ3)
+		interest(1)
+		special(SPC_MOD)
+	}
+	field(STR7,DBF_STRING) {
+		prompt("String value 7")
+		promptgroup(GUI_SEQ1)
+		interest(4)
+		size(40)
+		special(SPC_MOD)
+	}
+	field(DT7,DBF_SHORT) {
+		prompt("DOL link type")
+		interest(4)
+		special(SPC_NOMOD)
+	}
+	field(LT7,DBF_SHORT) {
+		prompt("LNK link type")
+		interest(4)
+		special(SPC_NOMOD)
+	}
+	field(WAIT7,DBF_MENU) {
+		prompt("Wait for completion?")
+		promptgroup(GUI_SEQ1)
+		interest(1)
+		menu(sseqWAIT)
+		special(SPC_MOD)
+	}
+	field(WERR7,DBF_SHORT) {
+		interest(1)
+		special(SPC_NOMOD)
+	}
+	field(WTG7,DBF_SHORT) {
+		interest(1)
+		special(SPC_NOMOD)
+	}
+	field(IX7,DBF_SHORT) {
+		interest(2)
+		initial(6)
+		special(SPC_NOMOD)
+	}
+	field(DOL7V,DBF_MENU) {
+		prompt("DOL LINK Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sseqLNKV)
+		initial("1")
+	}
+	field(LNK7V,DBF_MENU) {
+		prompt("LNK LINK Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sseqLNKV)
+		initial("1")
+	}
+
+	field(DLY8,DBF_DOUBLE) {
+		prompt("Delay 8")
+		promptgroup(GUI_SEQ3)
+		interest(1)
+		special(SPC_MOD)
+	}
+	field(DOL8,DBF_INLINK) {
+		prompt("Input link 8")
+		promptgroup(GUI_SEQ3)
+		interest(1)
+		special(SPC_MOD)
+	}
+	field(DO8,DBF_DOUBLE) {
+		prompt("Constant input 8")
+		promptgroup(GUI_SEQ1)
+		interest(1)
+		special(SPC_MOD)
+	}
+	field(LNK8,DBF_OUTLINK) {
+		prompt("Output Link 8")
+		promptgroup(GUI_SEQ3)
+		interest(1)
+		special(SPC_MOD)
+	}
+	field(STR8,DBF_STRING) {
+		prompt("String value 8")
+		promptgroup(GUI_SEQ1)
+		interest(4)
+		size(40)
+		special(SPC_MOD)
+	}
+	field(DT8,DBF_SHORT) {
+		prompt("DOL link type")
+		interest(4)
+		special(SPC_NOMOD)
+	}
+	field(LT8,DBF_SHORT) {
+		prompt("LNK link type")
+		interest(4)
+		special(SPC_NOMOD)
+	}
+	field(WAIT8,DBF_MENU) {
+		prompt("Wait for completion?")
+		promptgroup(GUI_SEQ1)
+		interest(1)
+		menu(sseqWAIT)
+		special(SPC_MOD)
+	}
+	field(WERR8,DBF_SHORT) {
+		interest(1)
+		special(SPC_NOMOD)
+	}
+	field(WTG8,DBF_SHORT) {
+		interest(1)
+		special(SPC_NOMOD)
+	}
+	field(IX8,DBF_SHORT) {
+		interest(2)
+		initial(7)
+		special(SPC_NOMOD)
+	}
+	field(DOL8V,DBF_MENU) {
+		prompt("DOL LINK Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sseqLNKV)
+		initial("1")
+	}
+	field(LNK8V,DBF_MENU) {
+		prompt("LNK LINK Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sseqLNKV)
+		initial("1")
+	}
+
+	field(DLY9,DBF_DOUBLE) {
+		prompt("Delay 9")
+		promptgroup(GUI_SEQ3)
+		interest(1)
+		special(SPC_MOD)
+	}
+	field(DOL9,DBF_INLINK) {
+		prompt("Input link 9")
+		promptgroup(GUI_SEQ3)
+		interest(1)
+		special(SPC_MOD)
+	}
+	field(DO9,DBF_DOUBLE) {
+		prompt("Constant input 9")
+		promptgroup(GUI_SEQ1)
+		interest(1)
+		special(SPC_MOD)
+	}
+	field(LNK9,DBF_OUTLINK) {
+		prompt("Output Link 9")
+		promptgroup(GUI_SEQ3)
+		interest(1)
+		special(SPC_MOD)
+	}
+	field(STR9,DBF_STRING) {
+		prompt("String value 9")
+		promptgroup(GUI_SEQ1)
+		interest(4)
+		size(40)
+		special(SPC_MOD)
+	}
+	field(DT9,DBF_SHORT) {
+		prompt("DOL link type")
+		interest(4)
+		special(SPC_NOMOD)
+	}
+	field(LT9,DBF_SHORT) {
+		prompt("LNK link type")
+		interest(4)
+		special(SPC_NOMOD)
+	}
+	field(WAIT9,DBF_MENU) {
+		prompt("Wait for completion?")
+		promptgroup(GUI_SEQ1)
+		interest(1)
+		menu(sseqWAIT)
+		special(SPC_MOD)
+	}
+	field(WERR9,DBF_SHORT) {
+		interest(1)
+		special(SPC_NOMOD)
+	}
+	field(WTG9,DBF_SHORT) {
+		interest(1)
+		special(SPC_NOMOD)
+	}
+	field(IX9,DBF_SHORT) {
+		interest(2)
+		initial(8)
+		special(SPC_NOMOD)
+	}
+	field(DOL9V,DBF_MENU) {
+		prompt("DOL LINK Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sseqLNKV)
+		initial("1")
+	}
+	field(LNK9V,DBF_MENU) {
+		prompt("LNK LINK Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sseqLNKV)
+		initial("1")
+	}
+
+	field(DLYA,DBF_DOUBLE) {
+		prompt("Delay 10")
+		promptgroup(GUI_SEQ3)
+		interest(1)
+		special(SPC_MOD)
+	}
+	field(DOLA,DBF_INLINK) {
+		prompt("Input link 10")
+		promptgroup(GUI_SEQ3)
+		interest(1)
+		special(SPC_MOD)
+	}
+	field(DOA,DBF_DOUBLE) {
+		prompt("Constant input 10")
+		promptgroup(GUI_SEQ1)
+		interest(1)
+		special(SPC_MOD)
+	}
+	field(LNKA,DBF_OUTLINK) {
+		prompt("Output Link 10")
+		promptgroup(GUI_SEQ3)
+		interest(1)
+		special(SPC_MOD)
+	}
+	field(STRA,DBF_STRING) {
+		prompt("String value A")
+		promptgroup(GUI_SEQ1)
+		interest(4)
+		size(40)
+		special(SPC_MOD)
+	}
+	field(DTA,DBF_SHORT) {
+		prompt("DOL link type")
+		interest(4)
+		special(SPC_NOMOD)
+	}
+	field(LTA,DBF_SHORT) {
+		prompt("LNK link type")
+		interest(4)
+		special(SPC_NOMOD)
+	}
+	field(WAITA,DBF_MENU) {
+		prompt("Wait for completion?")
+		promptgroup(GUI_SEQ1)
+		interest(1)
+		menu(sseqWAIT)
+		special(SPC_MOD)
+	}
+	field(WERRA,DBF_SHORT) {
+		interest(1)
+		special(SPC_NOMOD)
+	}
+	field(WTGA,DBF_SHORT) {
+		interest(1)
+	}
+	field(IXA,DBF_SHORT) {
+		interest(2)
+		initial(9)
+	}
+	field(DOLAV,DBF_MENU) {
+		prompt("DOL LINK Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sseqLNKV)
+		initial("1")
+	}
+	field(LNKAV,DBF_MENU) {
+		prompt("LNK LINK Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sseqLNKV)
+		initial("1")
+	}
+
+	field(ABORT,DBF_SHORT) {
+		prompt("Abort sequence")
+		interest(1)
+		special(SPC_MOD)
+	}
+	field(ABORTING,DBF_SHORT) {
+		prompt("Aborting")
+		interest(1)
+		special(SPC_MOD)
+	}
+	field(BUSY,DBF_SHORT) {
+		prompt("Sequence active")
+		interest(1)
+		special(SPC_NOMOD)
+	}
+}

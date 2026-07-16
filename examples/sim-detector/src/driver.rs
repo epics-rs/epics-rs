@@ -52,6 +52,13 @@ impl SimDetector {
 
         base.set_int32_param(ad.params.min_x, 0, 0)?;
         base.set_int32_param(ad.params.min_y, 0, 0)?;
+        // The read/write geometry parameters belong to the concrete driver:
+        // `ADDriverBase` seeds only what C's ADDriver constructor seeds
+        // (ADDriver.cpp:180-191), because SizeX/SizeY carry PINI="YES" in
+        // ADBase.template and a driver-side seed would override the DB and
+        // autosave.
+        base.set_int32_param(ad.params.size_x, 0, max_size_x)?;
+        base.set_int32_param(ad.params.size_y, 0, max_size_y)?;
         base.set_float64_param(ad.params.acquire_time, 0, 0.001)?;
         base.set_float64_param(ad.params.acquire_period, 0, 0.005)?;
         base.set_int32_param(ad.params.image_mode, 0, ImageMode::Continuous as i32)?;

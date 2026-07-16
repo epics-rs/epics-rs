@@ -1,13 +1,14 @@
 use std::any::Any;
 use std::time::Instant;
 
+use super::dbd_generated;
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::recgbl::{self, alarm_status};
 use epics_base_rs::server::record::{
-    AlarmSeverity, CommonFields, FieldDesc, LinkType, MENU_OMSL, ProcessAction, ProcessContext,
+    AlarmSeverity, CommonFields, FieldDesc, LinkType, ProcessAction, ProcessContext,
     ProcessOutcome, Record, link_field_type,
 };
-use epics_base_rs::types::{DbFieldType, EpicsValue, PvString};
+use epics_base_rs::types::{EpicsValue, PvString};
 
 /// Record-specific `DBF_MENU` choice tables, in `.dbd` value order (the
 /// index↔string mapping is wire-visible to clients). Source: the C
@@ -18,8 +19,13 @@ use epics_base_rs::types::{DbFieldType, EpicsValue, PvString};
 /// but its field *name* is record-specific — the base registry keys the
 /// shared `menuOmsl` table by the standard name `OMSL` — so it is mapped
 /// per record to [`MENU_OMSL`].
-const EPID_FMOD_CHOICES: &[&str] = &["PID", "Max/Min"];
-const EPID_FBSTATE_CHOICES: &[&str] = &["Off", "On"];
+/// `ReadDbLink` target for the bumpless-transfer OUTL readback.
+///
+/// Deliberately NOT a `.dbd` field: it names the internal staging cell
+/// [`EpidRecord::outl_seed`], not a CA-visible one. C reads OUTL inside
+/// `do_pid`, after the MDT gate, so the value must not be observable (nor
+/// monitor-posted) on a cycle C would have gated — see `pre_process_actions`.
+const OUTL_SEED_FIELD: &str = "__OUTL_SEED";
 
 /// Feedback mode for the epid record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -227,6 +233,20 @@ pub struct EpidRecord {
     /// only on this success — a STPL that is empty, or a DB/CA link
     /// whose fetch failed, leaves `udf` set.
     stpl_resolved: bool,
+    /// The OUTL readback captured for THIS cycle's bumpless turn-on, or
+    /// `None` if OUTL was not read.
+    ///
+    /// C reads OUTL *inside* `do_pid`, after the `if (dt<pepid->mdt)
+    /// return(1);` gate (`devEpidSoft.c:125`), and lands the value straight in
+    /// `do_pid`'s local `i` / `oval` (`:150-158`, `:178-184`) — a sub-MDT (or
+    /// UDF-gated) cycle therefore never reads OUTL and never touches `.I` /
+    /// `.OVAL`. The framework's `ReadDbLink` can only run *before* `process()`,
+    /// so it lands here instead of in the CA-visible field: this cell is the
+    /// staging slot, written only by that pre-process read and consumed only
+    /// by `do_pid` at C's line. A gated cycle simply leaves it unconsumed —
+    /// no field write, no monitor, and FBOP stays 0 so the next full cycle
+    /// re-reads and seeds for real.
+    pub(crate) outl_seed: Option<f64>,
     /// Framework-owned `dbCommon.dtyp`, pushed by the framework via
     /// [`Record::set_process_context`] before the input-link fetch.
     /// C device support for the epid record lives in two distinct
@@ -340,6 +360,7 @@ impl Default for EpidRecord {
             compute_skipped: false,
             outl_write: false,
             stpl_resolved: false,
+            outl_seed: None,
             // C `epidRecord.c` init: `udf` starts TRUE and is cleared
             // only by the two clear-conditions — see `value_undefined`.
             value_undefined: true,
@@ -464,258 +485,6 @@ impl EpidRecord {
     }
 }
 
-static FIELDS: &[FieldDesc] = &[
-    // PID control
-    FieldDesc {
-        name: "VAL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SMSL",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "STPL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INP",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OUTL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "TRIG",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "TVAL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "CVAL",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "CVLP",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "OVAL",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "OVLP",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "KP",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "KI",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "KD",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "P",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "PP",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "I",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "IP",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "D",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "DP",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "ERR",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "ERRP",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "DT",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DTP",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "MDT",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "FMOD",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "FBON",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "FBOP",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "ODEL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    // Display
-    FieldDesc {
-        name: "PREC",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "EGU",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "HOPR",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LOPR",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DRVH",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DRVL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    // Alarm
-    FieldDesc {
-        name: "HIHI",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LOLO",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "HIGH",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LOW",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "HHSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LLSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "HSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "HYST",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LALM",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    // Monitor deadband
-    FieldDesc {
-        name: "ADEL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "MDEL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ALST",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "MLST",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-];
-
 impl Record for EpidRecord {
     fn record_type(&self) -> &'static str {
         "epid"
@@ -739,25 +508,32 @@ impl Record for EpidRecord {
     ///     readback lands in the output value `OVAL`.
     ///
     /// The Rust framework's `ReadDbLink` pre-process action performs
-    /// exactly that synchronous read of the DB link's target value into
-    /// a record field, executed BEFORE `process()` / `do_pid` runs.
+    /// exactly that synchronous read of the DB link's target value, but it
+    /// can only run BEFORE `process()` / `do_pid`, whereas C reads OUTL
+    /// *after* the `dt < MDT` gate (`devEpidSoft.c:125`) and the record's
+    /// UDF gate (`epidRecord.c:195`). So the read does NOT land in `.I` /
+    /// `.OVAL` here — it lands in [`EpidRecord::outl_seed`], and `do_pid`
+    /// consumes it at C's line. A cycle that C would have gated leaves the
+    /// staged value unconsumed: no field write, no monitor, and FBOP stays
+    /// 0 so the next ungated cycle re-reads and seeds for real.
     ///
     /// `FBOP` still holds the *previous* cycle's `FBON` at this point
     /// (it is committed at the end of `do_pid`), so the edge is
     /// detectable here. The action is emitted only for a non-CONSTANT
     /// `OUTL` link, mirroring C's `outl.type != CONSTANT` guard — for a
-    /// CONSTANT/empty `OUTL` the seeded field keeps its prior value.
+    /// CONSTANT/empty `OUTL` nothing is staged and the seeded field keeps
+    /// its prior value.
     fn pre_process_actions(&mut self) -> Vec<ProcessAction> {
+        // The staged readback is per-cycle: whatever a previous cycle left
+        // behind must not be mistaken for this cycle's OUTL value.
+        self.outl_seed = None;
         let edge = self.fbon != 0 && self.fbop == 0;
         if edge {
-            // PID seeds `I` from OUTL (devEpidSoft.c:153-158);
-            // MaxMin seeds `OVAL` from OUTL (devEpidSoft.c:178-184).
-            let target_field = if self.fmod == 0 { "I" } else { "OVAL" };
             match link_field_type(&self.outl) {
                 LinkType::Db | LinkType::Ca => {
                     return vec![ProcessAction::ReadDbLink {
                         link_field: "OUTL",
-                        target_field,
+                        target_field: OUTL_SEED_FIELD,
                     }];
                 }
                 _ => {}
@@ -934,6 +710,19 @@ impl Record for EpidRecord {
                 self.lalm = alev;
             }
         }
+    }
+
+    /// C `epidRecord.c:376` REASSIGNS `monitor_mask = DBE_LOG|DBE_VALUE` after
+    /// VAL's own post, so every secondary the rest of `monitor()` posts
+    /// (:377-406) carries a LITERAL `DBE_VALUE | DBE_LOG` — this cycle's alarm
+    /// bits are discarded, unlike VAL's post (:371), which keeps them. A
+    /// `DBE_ALARM`-only subscriber on `.OVAL`/`.P`/`.I`/... is therefore
+    /// notified on no cycle at all.
+    ///
+    /// C's list is OVAL, P, I, D, CT, DT, ERR, CVAL; `CT` is `DBF_NOACCESS`
+    /// (`epidRecord.dbd:226`) and has no CA-visible field, leaving these seven.
+    fn fields_posted_without_alarm_bits(&self) -> &'static [&'static str] {
+        &["OVAL", "P", "I", "D", "DT", "ERR", "CVAL"]
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
@@ -1238,20 +1027,8 @@ impl Record for EpidRecord {
         }
     }
 
-    fn field_list(&self) -> &'static [FieldDesc] {
-        FIELDS
-    }
-
-    /// `FMOD` is `DBF_MENU menu(epidFeedbackMode)`; `FBON`/`FBOP` are
-    /// `menu(epidFeedbackState)` (C `epidRecord.dbd`). Served as `DBR_ENUM`
-    /// with the menu's choice labels in `.dbd` index order.
-    fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
-        match field {
-            "SMSL" => Some(MENU_OMSL),
-            "FMOD" => Some(EPID_FMOD_CHOICES),
-            "FBON" | "FBOP" => Some(EPID_FBSTATE_CHOICES),
-            _ => None,
-        }
+    fn declared_fields(&self) -> &'static [FieldDesc] {
+        dbd_generated::EPID_FIELDS
     }
 
     fn as_any_mut(&mut self) -> Option<&mut dyn Any> {
@@ -1373,6 +1150,16 @@ impl Record for EpidRecord {
         // Bypass read-only checks for framework-internal writes (ReadDbLink).
         // This allows the framework to write to CVAL, OVAL, etc. from link resolution.
         match name {
+            // The bumpless-transfer OUTL readback. Staged, not committed:
+            // `do_pid` moves it into `I` (PID) or `OVAL` (MaxMin) at C's line,
+            // after the MDT gate. See `OUTL_SEED_FIELD`.
+            OUTL_SEED_FIELD => match value {
+                EpicsValue::Double(v) => {
+                    self.outl_seed = Some(v);
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
             "CVAL" => match value {
                 EpicsValue::Double(v) => {
                     self.cval = v;
@@ -1410,6 +1197,28 @@ impl Record for EpidRecord {
             },
             _ => self.put_field(name, value),
         }
+    }
+
+    /// C `epidRecord.c:158-164`:
+    ///
+    /// ```c
+    /// if (pepid->stpl.type == CONSTANT) {
+    ///     if (recGblInitConstantLink(&pepid->stpl, DBF_DOUBLE, &pepid->val))
+    ///         pepid->udf = FALSE;
+    /// }
+    /// ```
+    ///
+    /// The setpoint of a constant-STPL epid is loaded ONCE, here — at process
+    /// `dbGetLink(&prec->stpl, ...)` delivers nothing (it returns success, so
+    /// the closed-loop UDF clear at `:191` still fires), which is why an
+    /// operator `caput REC.VAL` on a constant-STPL epid holds.
+    ///
+    /// INP is NOT seeded: a constant INP means "nothing to control" in C —
+    /// `devEpidSoft.c` raises SOFT/INVALID rather than reading a value.
+    fn constant_init_links(&self) -> Vec<epics_base_rs::server::record::ConstantInitLink> {
+        vec![epics_base_rs::server::record::ConstantInitLink::dol_to_val(
+            "STPL", "VAL",
+        )]
     }
 
     fn multi_input_links(&self) -> &[(&'static str, &'static str)] {
@@ -1457,29 +1266,33 @@ impl Record for EpidRecord {
 #[cfg(test)]
 mod menu_choice_tests {
     use super::EpidRecord;
-    use epics_base_rs::server::record::{Record, RecordInstance};
+    use epics_base_rs::server::record::{FieldDeclaration, Record, RecordInstance};
     use epics_base_rs::types::EpicsValue;
 
-    // FMOD is menu(epidFeedbackMode); FBON/FBOP are menu(epidFeedbackState);
-    // SMSL is menu(menuOmsl). Choice tables must match epidRecord.dbd value
-    // order (wire-visible).
+    /// The choices a client sees are the DECLARATION's — `epidRecord.dbd`'s
+    /// `menu()` on each field — and the index↔string mapping is wire-visible.
+    /// This used to assert them through `Record::menu_field_choices`, a hand
+    /// written table that declared the same menus a second time; `SMSL` needed
+    /// a per-record mapping there only because the shared-menu registry keys
+    /// `menuOmsl` by the field name `OMSL`. The declaration has no such
+    /// problem: the `.dbd` says `field(SMSL,DBF_MENU) { menu(menuOmsl) }`, so
+    /// the FieldDesc points straight at base's `MENU_OMSL`.
     #[test]
-    fn epid_menu_field_choices_match_dbd() {
+    fn epid_menu_choices_come_from_the_declaration() {
         let rec = EpidRecord::default();
-        assert_eq!(
-            rec.menu_field_choices("FMOD"),
-            Some(&["PID", "Max/Min"][..])
-        );
+        let menu = |name: &str| {
+            rec.field_list()
+                .iter()
+                .find(|f| f.name == name)
+                .unwrap_or_else(|| panic!("{name} is declared"))
+                .menu
+        };
+        assert_eq!(menu("FMOD"), Some(&["PID", "Max/Min"][..]));
         let fbstate = &["Off", "On"][..];
-        assert_eq!(rec.menu_field_choices("FBON"), Some(fbstate));
-        assert_eq!(rec.menu_field_choices("FBOP"), Some(fbstate));
-        // SMSL is menu(menuOmsl); the field name is record-specific so the
-        // base registry does not resolve it — the per-record mapping must.
-        assert_eq!(
-            rec.menu_field_choices("SMSL"),
-            Some(&["supervisory", "closed_loop"][..])
-        );
-        assert_eq!(rec.menu_field_choices("VAL"), None);
+        assert_eq!(menu("FBON"), Some(fbstate));
+        assert_eq!(menu("FBOP"), Some(fbstate));
+        assert_eq!(menu("SMSL"), Some(&["supervisory", "closed_loop"][..]));
+        assert_eq!(menu("VAL"), None);
     }
 
     // End-to-end: SMSL is served as Short; the base snapshot path promotes

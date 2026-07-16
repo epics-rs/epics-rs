@@ -84,7 +84,14 @@ C-bug divergence (SCAL-6) is intentional (the global rule forbids copying C's
 actual bugs); the design divergences are faithful at the semantic level. No fix
 commits are warranted.
 
-### SCAL-6 — COUTP fires once on user-stop (C fires twice) — NOTE (C-bug-avoided)
+### SCAL-6 — COUTP fires once on user-stop (C fires twice) — RETRACTED, fixed as R10-61
+**RETRACTION (2026-07-12).** The governing workspace audit
+(`doc/c-parity-review-2026-07-10.md`, Round 10) re-adjudicated this
+edge as R10-61 CONFIRMED: C's observed behaviour — including the
+double-fire — is the parity contract, and the port now fires COUTP
+twice on a user stop (commit `1ef74d92`, each C put site emits its own
+`WriteDbLink`). The "Not copied" disposition below is retained for
+history only and no longer describes the code.
 Refines the prior "COUT/COUTP verified-equivalent" by enumerating the stop edge.
 - Rust: `scaler.rs:751-762` coalesces the `coutp_pending` trigger (set by
   `special("CNT")`, mirroring `scalerRecord.c:625`) and the

@@ -11,6 +11,7 @@
 
 use std::collections::HashSet;
 
+use epics_base_rs::server::record::FieldDeclaration;
 use epics_base_rs::server::record::{AlarmSeverity, Record, RecordInstance};
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::server::records::ao::AoRecord;
@@ -84,8 +85,13 @@ fn ai_smoothing_filter() {
     rec.aslo = 1.0;
     rec.eslo = 1.0;
     rec.smoo = 0.5;
+    // C arms INIT in `init_record` (aiRecord.c:114) and the SMOO filter takes
+    // the initial conversion as its initial condition (`:441`) — without the
+    // init pass a record with a stale VAL would blend against it, which is
+    // exactly what C does too.
+    rec.init_record(0).unwrap();
 
-    // First process: no smoothing (init=false)
+    // First process: the initial conversion is its own initial condition
     rec.rval = 100;
     let _ = rec.process();
     assert!(
@@ -122,11 +128,11 @@ fn ai_udf_clears_on_process() {
     let mut inst = RecordInstance::new("TEST:ai".to_string(), rec);
 
     // UDF starts true
-    assert!(inst.common.udf, "UDF should start true");
+    assert!(inst.common.udf != 0, "UDF should start true");
 
     // Process clears UDF
     let _ = inst.process_local();
-    assert!(!inst.common.udf, "UDF should be false after process");
+    assert!(inst.common.udf == 0, "UDF should be false after process");
 }
 
 /// C EPICS: test_operator_display
@@ -159,10 +165,10 @@ fn ai_alarm_thresholds() {
         high: 70.0,
         low: 30.0,
         lolo: 10.0,
-        hhsv: AlarmSeverity::Major,
-        hsv: AlarmSeverity::Minor,
-        lsv: AlarmSeverity::Minor,
-        llsv: AlarmSeverity::Major,
+        hhsv: AlarmSeverity::Major as i16,
+        hsv: AlarmSeverity::Minor as i16,
+        lsv: AlarmSeverity::Minor as i16,
+        llsv: AlarmSeverity::Major as i16,
     });
 
     // Process to clear UDF alarm first
@@ -505,12 +511,12 @@ fn waveform_put_get_array() {
     let mut rec = WaveformRecord::new(10, DbFieldType::Long);
 
     // Initially empty
-    assert_eq!(rec.get_field("NORD"), Some(EpicsValue::Long(0)));
+    assert_eq!(rec.get_field("NORD"), Some(EpicsValue::ULong(0)));
 
     // Put 3 values
     rec.put_field("VAL", EpicsValue::LongArray(vec![1, 2, 3]))
         .unwrap();
-    assert_eq!(rec.get_field("NORD"), Some(EpicsValue::Long(3)));
+    assert_eq!(rec.get_field("NORD"), Some(EpicsValue::ULong(3)));
 
     // Verify values
     if let Some(EpicsValue::LongArray(arr)) = rec.get_field("VAL") {
@@ -567,8 +573,8 @@ fn udf_alarm_on_uninit() {
     let rec = AoRecord::new(0.0);
     let inst = RecordInstance::new("TEST:udf".to_string(), rec);
 
-    assert!(inst.common.udf, "UDF should be true on new record");
-    assert_eq!(inst.common.udfs, AlarmSeverity::Invalid);
+    assert!(inst.common.udf != 0, "UDF should be true on new record");
+    assert_eq!(inst.common.udfs, AlarmSeverity::Invalid as i16);
 }
 
 /// Multiple record types: field list completeness
@@ -790,7 +796,7 @@ fn waveform_length_one() {
 
     wf.put_field("VAL", EpicsValue::DoubleArray(vec![2.0]))
         .unwrap();
-    assert_eq!(wf.get_field("NORD"), Some(EpicsValue::Long(1)));
+    assert_eq!(wf.get_field("NORD"), Some(EpicsValue::ULong(1)));
 
     if let Some(EpicsValue::DoubleArray(arr)) = wf.get_field("VAL") {
         assert_eq!(arr.len(), 1);
@@ -807,7 +813,7 @@ fn waveform_multi_element() {
 
     wf.put_field("VAL", EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0]))
         .unwrap();
-    assert_eq!(wf.get_field("NORD"), Some(EpicsValue::Long(3)));
+    assert_eq!(wf.get_field("NORD"), Some(EpicsValue::ULong(3)));
 
     // Put exactly NELM elements
     wf.put_field(
@@ -815,7 +821,7 @@ fn waveform_multi_element() {
         EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0, 5.0]),
     )
     .unwrap();
-    assert_eq!(wf.get_field("NORD"), Some(EpicsValue::Long(5)));
+    assert_eq!(wf.get_field("NORD"), Some(EpicsValue::ULong(5)));
 }
 
 /// C EPICS: testLinkSevr — alarm severity field access
@@ -1021,13 +1027,13 @@ fn waveform_ftvl_types() {
     let mut wf_d = WaveformRecord::new(5, DbFieldType::Double);
     wf_d.put_field("VAL", EpicsValue::DoubleArray(vec![1.0, 2.0]))
         .unwrap();
-    assert_eq!(wf_d.get_field("NORD"), Some(EpicsValue::Long(2)));
+    assert_eq!(wf_d.get_field("NORD"), Some(EpicsValue::ULong(2)));
 
     // Long array
     let mut wf_l = WaveformRecord::new(5, DbFieldType::Long);
     wf_l.put_field("VAL", EpicsValue::LongArray(vec![10, 20, 30]))
         .unwrap();
-    assert_eq!(wf_l.get_field("NORD"), Some(EpicsValue::Long(3)));
+    assert_eq!(wf_l.get_field("NORD"), Some(EpicsValue::ULong(3)));
 }
 
 // ============================================================
@@ -1395,7 +1401,7 @@ async fn database_proc_triggers_processing() {
     // UDF should be cleared after processing
     if let Some(rec) = db.get_record("proc_rec").await {
         let inst = rec.read().await;
-        assert!(!inst.common.udf, "UDF should be cleared after PROC");
+        assert!(inst.common.udf == 0, "UDF should be cleared after PROC");
     }
 }
 
@@ -1422,8 +1428,51 @@ async fn database_proc_zero_still_triggers_processing() {
     if let Some(rec) = db.get_record("proc_zero_rec").await {
         let inst = rec.read().await;
         assert!(
-            !inst.common.udf,
+            inst.common.udf == 0,
             "UDF should be cleared after PROC=0 (force-process, not a no-op)"
+        );
+    }
+}
+
+/// C EPICS: `field(PROC,DBF_UCHAR){ pp(TRUE) }` — a PROC put does BOTH:
+/// `dbPut` stores the raw byte in `prec->proc` (retained; C never resets it)
+/// AND `pp(TRUE)` force-processes the record. The byte is served back SIGNED
+/// as `DBR_CHAR` (put-defect cluster PROC), so `caput PROC 255` reads back -1.
+#[tokio::test]
+async fn database_proc_stores_byte_and_still_processes() {
+    use epics_base_rs::server::database::PvDatabase;
+    use std::sync::Arc;
+
+    let db = Arc::new(PvDatabase::new());
+    db.add_record("proc_rb", Box::new(AoRecord::new(5.0)))
+        .await
+        .unwrap();
+
+    // `caput proc_rb.PROC 1`: processes (clears the born-UDF) AND stores 1.
+    db.put_record_field_from_ca("proc_rb", "PROC", EpicsValue::Char(1))
+        .await
+        .unwrap();
+    if let Some(rec) = db.get_record("proc_rb").await {
+        let inst = rec.read().await;
+        assert!(inst.common.udf == 0, "PROC=1 must still force-process");
+        assert_eq!(
+            inst.get_common_field("PROC"),
+            Some(EpicsValue::UChar(1)),
+            "PROC must read back the written byte, not 0"
+        );
+    }
+
+    // `caput proc_rb.PROC 255`: the DBF_UCHAR byte round-trips and is served
+    // signed (255 → -1) on the DBR_CHAR wire, exactly like DISP/RPRO.
+    db.put_record_field_from_ca("proc_rb", "PROC", EpicsValue::Char(255))
+        .await
+        .unwrap();
+    if let Some(rec) = db.get_record("proc_rb").await {
+        let inst = rec.read().await;
+        assert_eq!(
+            inst.get_common_field("PROC"),
+            Some(EpicsValue::UChar(255)),
+            "PROC 255 must retain the raw byte (served signed as -1)"
         );
     }
 }
@@ -1841,7 +1890,7 @@ async fn rpro_reprocessing() {
     // Set RPRO flag
     if let Some(rec) = db.get_record("rpro_rec").await {
         let mut inst = rec.write().await;
-        inst.common.rpro = true;
+        inst.common.rpro = 1;
     }
 
     // Process — should process, detect RPRO, reprocess once, then clear RPRO
@@ -1854,7 +1903,7 @@ async fn rpro_reprocessing() {
     if let Some(rec) = db.get_record("rpro_rec").await {
         let inst = rec.read().await;
         assert!(
-            !inst.common.rpro,
+            inst.common.rpro == 0,
             "RPRO should be cleared after reprocessing"
         );
     }
@@ -1904,7 +1953,7 @@ async fn process_record_clears_udf() {
     // UDF should be true initially
     if let Some(rec) = db.get_record("scan_rec").await {
         let inst = rec.read().await;
-        assert!(inst.common.udf, "UDF should be true before process");
+        assert!(inst.common.udf != 0, "UDF should be true before process");
     }
 
     // Process record
@@ -1913,7 +1962,7 @@ async fn process_record_clears_udf() {
     // UDF should be cleared
     if let Some(rec) = db.get_record("scan_rec").await {
         let inst = rec.read().await;
-        assert!(!inst.common.udf, "UDF should be false after process");
+        assert!(inst.common.udf == 0, "UDF should be false after process");
     }
 }
 
@@ -1921,6 +1970,7 @@ async fn process_record_clears_udf() {
 #[tokio::test]
 async fn pini_flag() {
     use epics_base_rs::server::database::PvDatabase;
+    use epics_base_rs::server::record::PiniMode;
     use std::sync::Arc;
 
     let db = Arc::new(PvDatabase::new());
@@ -1931,14 +1981,20 @@ async fn pini_flag() {
     // Set PINI
     if let Some(rec) = db.get_record("pini_rec").await {
         let mut inst = rec.write().await;
-        inst.common.pini = true;
+        inst.common.pini = PiniMode::Yes as i16;
     }
 
-    // Verify PINI flag is set
+    // Verify PINI is set
     if let Some(rec) = db.get_record("pini_rec").await {
         let inst = rec.read().await;
-        assert!(inst.common.pini, "PINI should be set");
+        assert_eq!(inst.common.pini, PiniMode::Yes as i16, "PINI should be YES");
     }
+    // `pini_records()` is the `piniProcess(menuPiniYES)` pass — it selects the
+    // exact menu index, so only YES records are in it.
+    assert_eq!(
+        db.pini_records(PiniMode::Yes).await,
+        vec!["pini_rec".to_string()]
+    );
 }
 
 // ============================================================

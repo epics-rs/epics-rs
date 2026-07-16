@@ -11,7 +11,11 @@
 
 pub mod drivers;
 pub mod error;
-pub(crate) mod exception;
+pub(crate) mod escape;
+// Public: `PortManager::exception_manager` / `PortServices::exceptions` hand
+// out an `Arc<ExceptionManager>`, and a caller registering an exception
+// callback needs to name `AsynException` to match on it.
+pub mod exception;
 pub mod interfaces;
 pub mod interpose;
 pub mod interrupt;
@@ -23,7 +27,9 @@ pub mod port_handle;
 pub(crate) mod protocol;
 pub mod request;
 pub mod runtime;
+pub mod services;
 pub mod sync_io;
+pub mod timestamp;
 pub mod trace;
 pub(crate) mod transport;
 pub mod user;

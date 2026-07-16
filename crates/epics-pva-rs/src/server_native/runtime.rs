@@ -79,8 +79,22 @@ pub struct PvaServerConfig {
     /// Idle timeout — server closes connections that haven't received
     /// anything in this window. Applied even if `op_timeout` is longer.
     pub idle_timeout: Duration,
-    /// Per-monitor outbound queue depth. When exceeded, the back-pressure
-    /// policy kicks in (squash to last value).
+    /// The queue limit each MONITOR operation STARTS with, before the
+    /// client's `record._options.queueSize` gets a say. When the queue is
+    /// full the back-pressure policy kicks in (squash into the last
+    /// value).
+    ///
+    /// This is pvxs `MonitorOp::limit` (`servermon.cpp:66`, `limit=4u`)
+    /// made configurable — a per-operation initializer, NOT a server-wide
+    /// capacity. pvxs has no server knob here, so
+    /// [`crate::server_native::source::DEFAULT_MONITOR_QUEUE_LIMIT`] (4)
+    /// is the default; a deployment may raise it, which is the same
+    /// deviation as building pvxs with a different `limit` initializer.
+    /// A valid client `queueSize >= 2` always wins over it
+    /// (`servermon.cpp:533-543`), pipelined or not, and the resolved
+    /// value is the single per-op depth: the squash threshold, the base
+    /// of the `ackAny` arithmetic, and the reported queue limit
+    /// (`MonitorOptions::queue_size`).
     pub monitor_queue_depth: usize,
     /// Require TLS — refuse plaintext sessions (anti-downgrade). Parsed
     /// from `disable_plaintext=true` in `EPICS_PVAS_TLS_OPTIONS` /
@@ -251,7 +265,8 @@ pub struct PvaServerConfig {
     pub enable_ipv6_udp: bool,
     /// Per-monitor "high" watermark — emit a `tracing::warn!` when an
     /// outbound monitor queue grows past this many items. Default:
-    /// `monitor_queue_depth * 3 / 4`. Mirrors pvxs
+    /// `monitor_queue_depth * 3 / 4` (3, for the pvxs per-op default
+    /// depth of 4). Mirrors pvxs
     /// `MonitorControlOp::setWatermarks` `high` argument; high-mark
     /// callbacks (`onHighMark`) aren't surfaced yet — the watermark
     /// drives diagnostics only.
@@ -279,6 +294,18 @@ pub struct PvaServerConfig {
 }
 
 impl PvaServerConfig {
+    /// [`Self::monitor_queue_depth`] as the `u32` the MONITOR INIT
+    /// negotiation works in — the value a fresh `MonitorOp::limit` starts
+    /// at. Saturating (a `usize` above `u32::MAX` is not a wire-legal
+    /// queueSize) and floored at 1, so the negotiated limit a monitor ends
+    /// up with is never 0 and the squash comparison always admits a first
+    /// event.
+    pub fn monitor_queue_limit(&self) -> u32 {
+        u32::try_from(self.monitor_queue_depth)
+            .unwrap_or(u32::MAX)
+            .max(1)
+    }
+
     /// True when `peer` matches an entry in `ignore_addrs`. Port 0 in
     /// the entry is a wildcard. O(n) over the list; n is expected to
     /// be small (single-digit) in practice.
@@ -311,7 +338,7 @@ impl Default for PvaServerConfig {
             max_channels_per_connection: 1024,
             max_ops_per_channel: 64,
             idle_timeout: Duration::from_secs(45),
-            monitor_queue_depth: 64,
+            monitor_queue_depth: super::source::DEFAULT_MONITOR_QUEUE_LIMIT as usize,
             disable_plaintext: false,
             tls: None,
             access_gate_override: None,
@@ -328,7 +355,7 @@ impl Default for PvaServerConfig {
             write_queue_depth: 1024,
             ignore_addrs: Vec::new(),
             enable_ipv6_udp: false,
-            monitor_high_watermark: 48, // 64 * 3 / 4 default
+            monitor_high_watermark: (super::source::DEFAULT_MONITOR_QUEUE_LIMIT as usize) * 3 / 4,
             monitor_low_watermark: 0,
             auth_complete: None,
             send_timeout: Duration::from_secs(5),
@@ -443,16 +470,15 @@ impl PvaServerConfig {
         if let Some(v) = env::tls_handshake_timeout_secs_opt() {
             self.tls_handshake_timeout = Duration::from_secs_f64(v);
         }
-        // Effective inactivity timeout = configured CONN_TMO × 4/3.
-        // pvxs config.cpp:187 applies the same scaling so a client
-        // sending ECHO every CONN_TMO/2 (the protocol convention)
-        // gets a margin against scheduling jitter — without it, a
-        // server with idle_timeout = exactly CONN_TMO would race
-        // with a healthy client's second ECHO and disconnect it.
-        // Floor at 2s mirrors pvxs `enforceTimeout`.
+        // Effective inactivity timeout = configured CONN_TMO × 4/3, then
+        // pvxs `enforceTimeout` — BOTH bounds, via the single owner
+        // `env::effective_tcp_timeout_secs`. The scaling gives a client
+        // sending ECHO every CONN_TMO/2 (the protocol convention) a margin
+        // against scheduling jitter; the 2 s floor and the
+        // `>= double(time_t::max)` → 40 s reset are the `enforceTimeout`
+        // halves the server must not reproduce partially.
         if let Some(c) = env::conn_timeout_secs_opt() {
-            let scaled = (c * 4.0 / 3.0).max(2.0);
-            self.idle_timeout = Duration::from_secs_f64(scaled);
+            self.idle_timeout = Duration::from_secs_f64(env::effective_tcp_timeout_secs(c));
         }
         // PVX-82 (IGNORE sibling): same all-unresolvable gate as INTF —
         // a non-blank IGNORE list that resolves to nothing means the
@@ -1968,6 +1994,52 @@ mod with_env_preserve_tests {
             assert_eq!(
                 cfg.udp_port, 11111,
                 "absent broadcast-port var must leave udp_port"
+            );
+        });
+    }
+
+    /// `with_env` derives `idle_timeout` from `EPICS_PVA_CONN_TMO` through
+    /// the same owner as the client (`env::effective_tcp_timeout_secs`):
+    /// the 4/3 scale, then pvxs `enforceTimeout` — floor AND upper reset.
+    /// A configured 7e18 is ACCEPTED by `parse_timeout` (<= time_t::max)
+    /// but its scaled form (≈9.33e18) crosses time_t::max, so pvxs falls
+    /// back to 40 s. Pre-fix this site applied only the floor and armed the
+    /// inactivity reaper with a ~3e11-year window (R17-34).
+    #[test]
+    #[serial_test::serial(epics_env)]
+    fn with_env_idle_timeout_applies_both_enforce_timeout_bounds() {
+        with_cleared_env(&["EPICS_PVA_CONN_TMO"], || {
+            let base = PvaServerConfig {
+                idle_timeout: Duration::from_secs(45),
+                ..Default::default()
+            };
+
+            // Absent → caller value preserved.
+            assert_eq!(
+                base.clone().with_env().idle_timeout,
+                Duration::from_secs(45)
+            );
+
+            // Default-shaped value: 30 × 4/3 = 40 s.
+            unsafe { std::env::set_var("EPICS_PVA_CONN_TMO", "30") };
+            assert_eq!(
+                base.clone().with_env().idle_timeout,
+                Duration::from_secs_f64(40.0)
+            );
+
+            // Below the floor: 1.0 × 4/3 = 1.333 → 2 s.
+            unsafe { std::env::set_var("EPICS_PVA_CONN_TMO", "1.0") };
+            assert_eq!(
+                base.clone().with_env().idle_timeout,
+                Duration::from_secs_f64(2.0)
+            );
+
+            // Upper reset: scaled >= time_t::max → 40 s.
+            unsafe { std::env::set_var("EPICS_PVA_CONN_TMO", "7e18") };
+            assert_eq!(
+                base.with_env().idle_timeout,
+                Duration::from_secs_f64(40.0),
+                "scaled CONN_TMO >= time_t::max must reset to pvxs's 40s default"
             );
         });
     }

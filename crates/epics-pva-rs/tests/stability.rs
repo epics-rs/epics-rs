@@ -51,6 +51,32 @@ struct MemState {
     values: std::collections::HashMap<String, PvField>,
 }
 
+/// Fan a value out to one PV's monitor subscribers, reaping only the dead.
+///
+/// A bounded `try_send` fails for two reasons and they are NOT the same:
+/// `Closed` (the receiver is gone — reap it) and `Full` (the subscriber is
+/// alive, it just has not drained yet). A source that treats `Full` as death
+/// — `list.retain(|tx| tx.try_send(v).is_ok())` — silently unsubscribes a
+/// live monitor the first time its channel backs up, and every later value
+/// goes nowhere.
+///
+/// So this awaits room instead of dropping, which also keeps the source
+/// LOSSLESS: the only place a value may be squashed is the server's
+/// negotiated monitor queue. That cannot deadlock, because the server's
+/// monitor pump drains this channel unconditionally — an exhausted credit
+/// window gates the EMIT, never the DRAIN (`server_native/tcp.rs`: "`rx.recv()`
+/// stays polled ... a stalled pipelined client coalesces at `limit`").
+async fn fan_out(list: &mut Vec<mpsc::Sender<PvField>>, value: &PvField) {
+    let mut live = Vec::with_capacity(list.len());
+    for tx in list.drain(..) {
+        // Err <=> receiver dropped. A full queue merely awaits room.
+        if tx.send(value.clone()).await.is_ok() {
+            live.push(tx);
+        }
+    }
+    *list = live;
+}
+
 impl MemSource {
     fn new() -> Self {
         Self {
@@ -108,7 +134,7 @@ impl MemSource {
             .insert(name.to_string(), pv.clone());
         let mut subs = self.inner.subs.lock().await;
         if let Some(list) = subs.get_mut(name) {
-            list.retain(|tx| tx.try_send(pv.clone()).is_ok());
+            fan_out(list, &pv).await;
         }
     }
 
@@ -120,10 +146,10 @@ impl MemSource {
             .await
             .values
             .insert(name.to_string(), pv.clone());
-        // Notify subscribers (drop dead).
+        // Notify subscribers (reap only the dead — see `fan_out`).
         let mut subs = self.inner.subs.lock().await;
         if let Some(list) = subs.get_mut(name) {
-            list.retain(|tx| tx.try_send(pv.clone()).is_ok());
+            fan_out(list, &pv).await;
         }
     }
 }
@@ -221,7 +247,7 @@ impl ChannelSource for MemSource {
                 .insert(name.clone(), value.clone());
             let mut subs = inner.subs.lock().await;
             if let Some(list) = subs.get_mut(&name) {
-                list.retain(|tx| tx.try_send(value.clone()).is_ok());
+                fan_out(list, &value).await;
             }
             Ok(())
         }
@@ -2498,5 +2524,320 @@ async fn array_concurrent_subop_replies_error_not_silent() {
 
     // Release the blocked first sub-op so the server task winds down cleanly.
     gate.add_permits(1);
+    h.abort();
+}
+
+/// R12-33 — an exhausted pipeline window must stop the REPLY, not the DRAIN.
+///
+/// pvxs `MonitorOp::maybeReply` simply does not fire while `op->window == 0`
+/// (`servermon.cpp:79-83`, and `doReply` bails at `:143`), but
+/// `ServerMonitorControl::doPost` keeps running on every post and keeps
+/// SQUASHING into the negotiated queue (`:270-283`). So a client that stops
+/// ACKing sees, on resume, at most `queueSize` frames whose tail carries the
+/// LATEST value — everything past the limit coalesced into the queue tail.
+///
+/// The port used to `await` the credit INSIDE the event loop's `select!`, so
+/// while the window was empty `rx.recv()` was never polled: the source backed
+/// up in the mpsc (capacity 64) instead of squashing, and on resume the client
+/// was handed ~`64 + limit` distinct historical updates.
+///
+/// Drives it raw: pipeline with `queueSize=4`, initial nack 1 (so exactly one
+/// DATA frame is emitted and the window then sits at 0), push 40 updates with
+/// NO ACK, then grant credit and count what comes back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r12_33_stalled_pipeline_squashes_at_the_negotiated_limit() {
+    use std::io::Write;
+
+    use epics_pva_rs::codec::{CMD_CREATE_CHANNEL, CMD_MONITOR, PvaCodec};
+    use epics_pva_rs::proto::encode_string_into;
+    use epics_pva_rs::proto::{ByteOrder, Command, PvaHeader, ReadExt, Status, WriteExt};
+    use epics_pva_rs::pv_request::PvRequestBuilder;
+
+    const QUEUE_SIZE: usize = 4;
+    const BURST: i32 = 200;
+
+    let source = Arc::new(MemSource::new());
+    source.add_pv("MON:PIPE:STALL", 0.0).await;
+    let (tcp, _udp, h) = spawn_server(source.clone()).await;
+    let server_addr =
+        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), tcp);
+
+    let mut sock = read_handshake_prelude(server_addr);
+    let order = ByteOrder::Little;
+
+    // CONNECTION_VALIDATION (anonymous).
+    let mut payload: Vec<u8> = Vec::new();
+    payload.put_u32(0x10000, order);
+    payload.put_u16(32_767, order);
+    payload.put_u16(0, order);
+    encode_string_into("anonymous", order, &mut payload);
+    payload.put_u8(0xFF);
+    let hv = PvaHeader::application(
+        false,
+        order,
+        Command::ConnectionValidation.code(),
+        payload.len() as u32,
+    );
+    let mut req = Vec::new();
+    hv.write_into(&mut req);
+    req.extend_from_slice(&payload);
+    sock.write_all(&req).unwrap();
+    let mut reader = FrameReader::new();
+    let _validated = reader.read(&mut sock);
+
+    // CREATE_CHANNEL → sid.
+    let mut body = Vec::new();
+    body.put_u16(1, order);
+    body.put_u32(909, order);
+    encode_string_into("MON:PIPE:STALL", order, &mut body);
+    let hc = PvaHeader::application(false, order, CMD_CREATE_CHANNEL, body.len() as u32);
+    let mut frame_bytes = Vec::new();
+    hc.write_into(&mut frame_bytes);
+    frame_bytes.extend_from_slice(&body);
+    sock.write_all(&frame_bytes).unwrap();
+    let resp = reader.read(&mut sock);
+    let mut cur = resp.cursor();
+    let _cid = cur.get_u32(order).unwrap();
+    let sid = cur.get_u32(order).unwrap();
+    assert_ne!(sid, u32::MAX, "channel for a hosted PV must resolve");
+
+    // MONITOR INIT: pipeline, queueSize=4, initial nack = 1 credit.
+    let codec = PvaCodec { big_endian: false };
+    let pv_req = PvRequestBuilder::new()
+        .record("pipeline", "true")
+        .record("queueSize", QUEUE_SIZE.to_string())
+        .build()
+        .encode(false);
+    let ioid = 91u32;
+    sock.write_all(&codec.build_monitor_init(sid, ioid, &pv_req, Some(1)))
+        .unwrap();
+    let f = reader.read(&mut sock);
+    assert_eq!(f.header.command, CMD_MONITOR);
+    let mut c = f.cursor();
+    assert_eq!(c.get_u32(order).unwrap(), ioid);
+    assert!(c.get_u8().unwrap() & 0x08 != 0, "INIT reply");
+    assert!(
+        Status::decode(&mut c, order).unwrap().is_success(),
+        "pipeline MONITOR INIT must succeed"
+    );
+
+    // START → the seed DATA frame spends the single initial credit. The
+    // window is now 0 and stays there: we send no ACK.
+    sock.write_all(&codec.build_monitor_start(sid, ioid))
+        .unwrap();
+    let seed = reader.read(&mut sock);
+    assert_eq!(seed.header.command, CMD_MONITOR, "START yields the seed");
+
+    // Burst well past both the queue limit and the source channel capacity
+    // (64) while the client owes credit.
+    for i in 1..=BURST {
+        source.push("MON:PIPE:STALL", i as f64).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Grant far more credit than the queue can hold, then read until the
+    // server goes quiet.
+    sock.write_all(&codec.build_monitor_ack(sid, ioid, 1000))
+        .unwrap();
+    sock.set_read_timeout(Some(Duration::from_millis(400)))
+        .unwrap();
+
+    let mut values: Vec<f64> = Vec::new();
+    let mut buf: Vec<u8> = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let mut idle_since = std::time::Instant::now();
+    while std::time::Instant::now() < deadline {
+        use epics_pva_rs::client_native::decode::try_parse_frame;
+        use std::io::Read;
+        if let Ok(Some((frame, n))) = try_parse_frame(&buf) {
+            buf.drain(..n);
+            idle_since = std::time::Instant::now();
+            if frame.header.command == CMD_MONITOR {
+                let mut c = frame.cursor();
+                let _ioid = c.get_u32(order).unwrap();
+                let subcmd = c.get_u8().unwrap();
+                if subcmd == 0x00 {
+                    // changed bitset + value + overrun
+                    let changed =
+                        epics_pva_rs::proto::BitSet::decode(&mut c, order).expect("changed bitset");
+                    let v = epics_pva_rs::pvdata::encode::decode_pv_field_with_bitset(
+                        &nt_scalar_desc(),
+                        &changed,
+                        0,
+                        &mut c,
+                        order,
+                    )
+                    .expect("decode monitor value");
+                    if let PvField::Structure(s) = v
+                        && let Some(ScalarValue::Double(d)) = s.get_value()
+                    {
+                        values.push(*d);
+                    }
+                }
+            }
+            continue;
+        }
+        let mut chunk = [0u8; 1024];
+        match sock.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                // Server quiet for a while → the backlog is drained.
+                if idle_since.elapsed() > Duration::from_millis(600) {
+                    break;
+                }
+            }
+            Err(e) => panic!("read failed: {e}"),
+        }
+    }
+
+    assert!(
+        !values.is_empty(),
+        "the resumed pipeline must deliver the backlog"
+    );
+    assert_eq!(
+        values.last().copied(),
+        Some(BURST as f64),
+        "the queue tail must carry the LATEST value ({BURST}), got {values:?}"
+    );
+    assert!(
+        values.len() <= QUEUE_SIZE,
+        "one negotiated limit governs the squash: a stalled pipeline must \
+         coalesce everything past queueSize={QUEUE_SIZE} into the queue tail, \
+         but {} distinct updates were delivered: {values:?}",
+        values.len()
+    );
+
+    h.abort();
+}
+
+/// R12-34 adjudication lock: a MONITOR INIT whose pvRequest selects no
+/// existing field is an **op-level** error and the circuit stays up.
+///
+/// `request2mask()` throws `"pvRequest must select at least one field"`
+/// (`pvrequest.cpp:61-62`), but it runs inside `ServerMonitorSetup::connect()`
+/// (`servermon.cpp:402`) — i.e. inside the *source's* connect callback, not in
+/// the protocol handler. `servermon.cpp:591-592` calls `chan->onSubscribe(...)`
+/// unguarded, so who catches the throw is the source's choice, and pvxs's own
+/// hosting source catches it: `SharedPV::Impl::connectSub`
+/// (`sharedpv.cpp:76,94-101`) wraps `conn->connect()` and calls
+/// `conn->error(msg)` ("not re-throwing for consistency") — an op-level Status
+/// reply, circuit intact. pvxs's regression for this very throw
+/// (`test/testget.cpp:380-393`, SharedPV mailbox, `.field("invalid")`) asserts
+/// exactly that remote error.
+///
+/// The circuit reset one can observe against a C QSRV IOC comes from QSRV's
+/// sources alone (`ioc/singlesource.cpp:147`, `ioc/groupsource.cpp:399` call
+/// `connect()` bare, so the throw unwinds through `servermon.cpp:592` into
+/// `conn.cpp:277-282`'s `bev.reset()`), which drops the shared TCP circuit
+/// carrying every other channel on it. That is an upstream defect, not the
+/// contract; this test pins the SharedPV behaviour so nobody "fixes" the
+/// server into resetting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r12_34_monitor_empty_mask_is_an_op_error_not_a_circuit_reset() {
+    use std::io::Write;
+
+    use epics_pva_rs::codec::{CMD_CREATE_CHANNEL, CMD_MONITOR, PvaCodec};
+    use epics_pva_rs::proto::encode_string_into;
+    use epics_pva_rs::proto::{ByteOrder, Command, PvaHeader, ReadExt, Status, WriteExt};
+    use epics_pva_rs::pv_request::PvRequestBuilder;
+
+    let source = Arc::new(MemSource::new());
+    source.add_pv("MON:EMPTY:MASK", 1.0).await;
+    let (tcp, _udp, h) = spawn_server(source.clone()).await;
+    let server_addr =
+        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), tcp);
+
+    let mut sock = read_handshake_prelude(server_addr);
+    let order = ByteOrder::Little;
+
+    // CONNECTION_VALIDATION (anonymous).
+    let mut payload: Vec<u8> = Vec::new();
+    payload.put_u32(0x10000, order);
+    payload.put_u16(32_767, order);
+    payload.put_u16(0, order);
+    encode_string_into("anonymous", order, &mut payload);
+    payload.put_u8(0xFF);
+    let hv = PvaHeader::application(
+        false,
+        order,
+        Command::ConnectionValidation.code(),
+        payload.len() as u32,
+    );
+    let mut req = Vec::new();
+    hv.write_into(&mut req);
+    req.extend_from_slice(&payload);
+    sock.write_all(&req).unwrap();
+    let mut reader = FrameReader::new();
+    let _validated = reader.read(&mut sock);
+
+    // CREATE_CHANNEL → sid.
+    let mut body = Vec::new();
+    body.put_u16(1, order);
+    body.put_u32(808, order);
+    encode_string_into("MON:EMPTY:MASK", order, &mut body);
+    let hc = PvaHeader::application(false, order, CMD_CREATE_CHANNEL, body.len() as u32);
+    let mut frame_bytes = Vec::new();
+    hc.write_into(&mut frame_bytes);
+    frame_bytes.extend_from_slice(&body);
+    sock.write_all(&frame_bytes).unwrap();
+    let resp = reader.read(&mut sock);
+    let mut cur = resp.cursor();
+    let _cid = cur.get_u32(order).unwrap();
+    let sid = cur.get_u32(order).unwrap();
+    assert_ne!(sid, u32::MAX, "channel for a hosted PV must resolve");
+
+    let codec = PvaCodec { big_endian: false };
+
+    // MONITOR INIT selecting a field the NTScalar prototype does not have.
+    let bad_req = PvRequestBuilder::new()
+        .field("noSuchField")
+        .build()
+        .encode(false);
+    let bad_ioid = 71u32;
+    sock.write_all(&codec.build_monitor_init(sid, bad_ioid, &bad_req, None))
+        .unwrap();
+    let f = reader.read(&mut sock);
+    assert_eq!(
+        f.header.command, CMD_MONITOR,
+        "the empty-mask INIT must be answered on the MONITOR command"
+    );
+    let mut c = f.cursor();
+    assert_eq!(c.get_u32(order).unwrap(), bad_ioid);
+    assert!(
+        c.get_u8().unwrap() & 0x08 != 0,
+        "the error must arrive on the INIT subcmd"
+    );
+    let st = Status::decode(&mut c, order).unwrap();
+    assert!(
+        !st.is_success(),
+        "field(noSuchField) selects nothing in the NTScalar prototype — pvxs's \
+         request2mask throws and SharedPV turns it into an op error, got {st:?}"
+    );
+
+    // …and the circuit is still usable: a second MONITOR INIT with a
+    // wildcard pvRequest, on the SAME socket and SID, must be answered.
+    let good_req = PvRequestBuilder::new().build().encode(false);
+    let good_ioid = 72u32;
+    sock.write_all(&codec.build_monitor_init(sid, good_ioid, &good_req, None))
+        .unwrap();
+    let f = reader.read(&mut sock);
+    assert_eq!(
+        f.header.command, CMD_MONITOR,
+        "the circuit was dropped after an empty-mask MONITOR INIT — pvxs's SharedPV \
+         keeps it up (sharedpv.cpp:94-101)"
+    );
+    let mut c = f.cursor();
+    assert_eq!(c.get_u32(order).unwrap(), good_ioid);
+    assert!(c.get_u8().unwrap() & 0x08 != 0, "INIT reply");
+    let st = Status::decode(&mut c, order).unwrap();
+    assert!(
+        st.is_success(),
+        "a valid MONITOR INIT on the surviving circuit must succeed, got {st:?}"
+    );
+
     h.abort();
 }

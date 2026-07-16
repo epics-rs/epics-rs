@@ -48,8 +48,8 @@ fn h1_longout_equal_limits_disable_clamp() {
 #[test]
 fn h1_int64out_clamps_val_to_drive_window() {
     let mut r = Int64outRecord::new(0);
-    r.drvl = -8.0;
-    r.drvh = 8.0;
+    r.drvl = -8;
+    r.drvh = 8;
     r.val = 1_000;
     r.process().unwrap();
     assert_eq!(r.val, 8, "int64out VAL above DRVH clamps to DRVH");
@@ -64,6 +64,7 @@ fn h1_int64out_clamps_val_to_drive_window() {
 fn m1_calcout_odly_defers_output_via_reprocess() {
     let mut r = CalcoutRecord::default();
     r.put_field("CALC", EpicsValue::String("A".into())).unwrap();
+    r.special("CALC", true).unwrap();
     r.put_field("A", EpicsValue::Double(42.0)).unwrap();
     r.put_field("ODLY", EpicsValue::Double(0.05)).unwrap();
     // OOPT=0 (Every Time): output should fire.
@@ -104,6 +105,7 @@ fn m1_calcout_odly_defers_output_via_reprocess() {
 fn m1_calcout_no_odly_outputs_synchronously() {
     let mut r = CalcoutRecord::default();
     r.put_field("CALC", EpicsValue::String("A".into())).unwrap();
+    r.special("CALC", true).unwrap();
     r.put_field("A", EpicsValue::Double(7.0)).unwrap();
     // ODLY default 0: output is synchronous, no delay.
     let outcome = r.process().unwrap();
@@ -124,6 +126,7 @@ fn m1_calcout_no_odly_outputs_synchronously() {
 fn m1b_scalcout_odly_defers_output_via_reprocess() {
     let mut r = ScalcoutRecord::default();
     r.put_field("CALC", EpicsValue::String("A".into())).unwrap();
+    r.special("CALC", true).unwrap();
     r.put_field("A", EpicsValue::Double(42.0)).unwrap();
     r.put_field("OUT", EpicsValue::String("sink.VAL".into()))
         .unwrap();
@@ -169,6 +172,7 @@ fn m1b_scalcout_odly_defers_output_via_reprocess() {
 fn m1b_scalcout_no_odly_outputs_synchronously() {
     let mut r = ScalcoutRecord::default();
     r.put_field("CALC", EpicsValue::String("A".into())).unwrap();
+    r.special("CALC", true).unwrap();
     r.put_field("A", EpicsValue::Double(7.0)).unwrap();
     r.put_field("OUT", EpicsValue::String("sink.VAL".into()))
         .unwrap();
@@ -195,6 +199,7 @@ fn m1b_scalcout_no_odly_outputs_synchronously() {
 fn m1c_swait_odly_defers_output_via_reprocess() {
     let mut r = SwaitRecord::default();
     r.put_field("CALC", EpicsValue::String("A".into())).unwrap();
+    r.special("CALC", true).unwrap();
     r.put_field("A", EpicsValue::Double(42.0)).unwrap();
     r.put_field("ODLY", EpicsValue::Float(0.05)).unwrap();
     // OOPT=0 (Every Time): output should fire.
@@ -233,6 +238,7 @@ fn m1c_swait_odly_defers_output_via_reprocess() {
 fn m1c_swait_no_odly_outputs_synchronously() {
     let mut r = SwaitRecord::default();
     r.put_field("CALC", EpicsValue::String("A".into())).unwrap();
+    r.special("CALC", true).unwrap();
     r.put_field("A", EpicsValue::Double(7.0)).unwrap();
     // ODLY default 0: output is synchronous, no delay.
     let outcome = r.process().unwrap();
@@ -372,25 +378,33 @@ fn l3_ai_linear_linr_no_bpt_alarm() {
 
 // ─── S1 / S2: scalcout raises CALC_ALARM on broken CALC / OCAL ───────
 
+/// The alarm the record RAISES, read out of the pending `nsta`/`nsev` its
+/// `check_alarms` writes — C's `checkAlarms()`, which the framework calls every
+/// cycle. (This used to be a `CALC_ALARM` pseudo-field no DBD declares; see
+/// R10-67.)
+fn calc_alarm_raised(r: &mut dyn Record) -> bool {
+    let mut common = CommonFields::default();
+    r.check_alarms(&mut common);
+    common.nsta == epics_base_rs::server::recgbl::alarm_status::CALC_ALARM
+        && common.nsev == AlarmSeverity::Invalid
+}
+
 #[test]
 fn s1_scalcout_invalid_calc_raises_calc_alarm() {
     let mut r = ScalcoutRecord::new();
     r.put_field("CALC", EpicsValue::String("A".into())).unwrap();
+    r.special("CALC", true).unwrap();
     r.put_field("A", EpicsValue::Double(5.0)).unwrap();
     r.process().unwrap();
-    assert_eq!(
-        r.get_field("CALC_ALARM"),
-        Some(EpicsValue::Char(0)),
-        "valid CALC: no alarm"
-    );
+    assert!(!calc_alarm_raised(&mut r), "valid CALC: no alarm");
     // A failed sCalcPerform must raise CALC_ALARM. Force the calc into a
     // value-stack-underflow state: a bare binary operator with no
     // operands fails at eval time.
     r.put_field("CALC", EpicsValue::String("+".into())).unwrap();
+    r.special("CALC", true).unwrap();
     r.process().unwrap();
-    assert_eq!(
-        r.get_field("CALC_ALARM"),
-        Some(EpicsValue::Char(1)),
+    assert!(
+        calc_alarm_raised(&mut r),
         "broken CALC expression raises CALC_ALARM"
     );
 }
@@ -399,13 +413,14 @@ fn s1_scalcout_invalid_calc_raises_calc_alarm() {
 fn s2_scalcout_invalid_ocal_raises_calc_alarm() {
     let mut r = ScalcoutRecord::new();
     r.put_field("CALC", EpicsValue::String("A".into())).unwrap();
+    r.special("CALC", true).unwrap();
     r.put_field("A", EpicsValue::Double(1.0)).unwrap();
     r.put_field("DOPT", EpicsValue::Short(1)).unwrap(); // Use OCAL
     r.put_field("OCAL", EpicsValue::String("+".into())).unwrap();
+    r.special("OCAL", true).unwrap();
     r.process().unwrap();
-    assert_eq!(
-        r.get_field("CALC_ALARM"),
-        Some(EpicsValue::Char(1)),
+    assert!(
+        calc_alarm_raised(&mut r),
         "broken OCAL expression raises CALC_ALARM"
     );
 }
@@ -416,6 +431,7 @@ fn s2_scalcout_invalid_ocal_raises_calc_alarm() {
 fn s3_scalcout_emits_out_link_when_output_due() {
     let mut r = ScalcoutRecord::new();
     r.put_field("CALC", EpicsValue::String("A".into())).unwrap();
+    r.special("CALC", true).unwrap();
     r.put_field("A", EpicsValue::Double(11.0)).unwrap();
     r.put_field("OUT", EpicsValue::String("target.VAL".into()))
         .unwrap();
@@ -432,6 +448,7 @@ fn s3_scalcout_emits_out_link_when_output_due() {
 fn s3_scalcout_suppresses_out_link_when_oopt_not_met() {
     let mut r = ScalcoutRecord::new();
     r.put_field("CALC", EpicsValue::String("A".into())).unwrap();
+    r.special("CALC", true).unwrap();
     r.put_field("A", EpicsValue::Double(0.0)).unwrap();
     r.put_field("OUT", EpicsValue::String("target.VAL".into()))
         .unwrap();
@@ -567,22 +584,23 @@ fn s5_transform_fresh_put_survives_one_cycle() {
     );
 }
 
-// ─── S6: transform IVLA=Do_Nothing is per-channel ────────────────────
+// ─── S6: a broken CLCx is skipped, siblings still calculate ──────────
 //
-// S6's divergence (a global abort on one channel's *eval* error) is only
-// reachable when a compiled calc fails at eval time. The numeric calc
-// compiler's end-of-expression depth check rejects every stack-imbalanced
-// expression at *compile* time, so a string-configured CLCx cannot
-// produce a runtime eval error — the per-channel-vs-global difference is
-// not observable from a `.db`-driven record. The fix is kept as the
-// C-correct structure (restore the failing channel only, continue with
-// the rest); this test exercises the reachable broken-calc path (a
-// compile failure) and confirms it does not abort sibling channels.
+// C `transformRecord.c:589-597`: the calc loop's `postfix_ok` gate
+// (`*pclcbuf && (*prpcbuf != BAD_EXPRESSION)`) skips a channel whose CLCx
+// failed to compile, and the loop continues with the next channel — a broken
+// expression on one channel never touches its siblings.
+//
+// IVLA is NOT involved: it gates the WHOLE cycle on the record's INPUT
+// severity (`nsev >= INVALID_ALARM`, transformRecord.c:554 — covered by
+// `tests/transform_ivla_do_nothing.rs`), and C has no per-channel value-restore
+// on a calc error whatsoever. IVLA is left at Do_Nothing here to pin exactly
+// that: with no INVALID input link it must have no effect at all.
 
 #[test]
 fn s6_transform_broken_calc_does_not_abort_sibling_channels() {
     let mut r = TransformRecord::new();
-    r.put_field("IVLA", EpicsValue::Short(1)).unwrap(); // Do Nothing
+    r.put_field("IVLA", EpicsValue::Short(1)).unwrap(); // Do Nothing — inert here
     r.put_field("B", EpicsValue::Double(2.0)).unwrap();
     // CLCA is syntactically broken (fails to compile); CLCC is valid.
     r.put_field("CLCA", EpicsValue::String("+".into())).unwrap();
@@ -592,7 +610,8 @@ fn s6_transform_broken_calc_does_not_abort_sibling_channels() {
     assert_eq!(
         r.get_field("A"),
         Some(EpicsValue::Double(0.0)),
-        "broken CLCA leaves channel A at its prior value"
+        "an uncompilable CLCA is never evaluated (C `postfix_ok` gate), so \
+         channel A keeps its prior value"
     );
     assert_eq!(
         r.get_field("C"),

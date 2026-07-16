@@ -15,6 +15,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use std::any::Any;
@@ -25,6 +26,17 @@ use std::any::Any;
 /// transition or attempt, bounding reconnect storms to one attempt per
 /// window.
 const AUTO_CONNECT_THROTTLE: Duration = Duration::from_secs(2);
+
+/// First autonomous connect-retry delay after a port drops. C
+/// `exceptionDisconnect` arms the port's connect timer at `.01` seconds
+/// (asynManager.c:2181-2182), so the reconnect is attempted essentially
+/// immediately and then backs off to [`DEFAULT_SECONDS_BETWEEN_PORT_CONNECT`].
+const CONNECT_RETRY_INITIAL: Duration = Duration::from_millis(10);
+
+/// C `DEFAULT_SECONDS_BETWEEN_PORT_CONNECT` (asynManager.c:48) — the interval
+/// `portConnectProcessCallback` re-arms the connect timer at after a failed
+/// attempt (asynManager.c:3281).
+const DEFAULT_SECONDS_BETWEEN_PORT_CONNECT: Duration = Duration::from_secs(20);
 
 /// Per-address device state for multi-device ports.
 #[derive(Debug, Clone)]
@@ -51,14 +63,41 @@ impl Default for DeviceState {
     }
 }
 
+/// One device's end-of-string terminators — C's `eosPvt.eosIn` / `eosPvt.eosOut`
+/// (asynInterposeEos.c:44-52), which exist once per (port, addr).
+#[derive(Debug, Clone, Default)]
+pub struct DeviceEos {
+    /// Input EOS sequence (max 2 bytes). Empty = no input EOS detection.
+    pub input: Vec<u8>,
+    /// Output EOS sequence (max 2 bytes). Empty = no output EOS append.
+    pub output: Vec<u8>,
+}
+
+/// The device an EOS hook's `asynUser` selects — the single owner of the rule,
+/// shared by [`PortDriverBase`] and the EOS interpose so the terminator a
+/// `setInputEos` writes is the one the next `read` on that user applies.
+///
+/// C creates the EOS interpose per (port, addr) and every hook takes the
+/// `asynUser` (asynInterposeEos.c:288-296), so on a multi-device port the addr
+/// picks the instance. On a port that never declared `ASYN_MULTIDEVICE` there
+/// are no devices to pick from: `findDpCommon` (asynManager.c:496-509) and
+/// `findInterface` resolve *every* addr to the port itself, so `asynSetEos`
+/// with addr 0 and with addr -1 must reach the same terminator. That collapse
+/// is what the `-1` key below is.
+pub fn eos_device_key(multi_device: bool, addr: i32) -> i32 {
+    if multi_device { addr } else { -1 }
+}
+
 use crate::error::{AsynError, AsynResult, AsynStatus};
 use crate::exception::{AsynException, ExceptionEvent, ExceptionManager};
 use crate::interfaces::InterfaceType;
-use crate::interpose::{EomReason, OctetInterpose, OctetInterposeStack};
-use crate::interrupt::{InterruptManager, InterruptValue};
+use crate::interpose::{
+    EomReason, OctetInterpose, OctetInterposeStack, OctetNext, OctetReadResult,
+};
+use crate::interrupt::{InterruptManager, InterruptValue, OctetFanOut};
 use crate::param::{EnumEntry, InterruptReason, ParamList, ParamType, ParamValue};
 use crate::trace::TraceManager;
-use crate::user::AsynUser;
+use crate::user::{AsynUser, ConnectCheck};
 
 /// C asyn `queueRequest` priority. In asyn-rs this exists as compatibility
 /// metadata only — there is no actual request queue or priority-based scheduling.
@@ -119,30 +158,107 @@ impl Default for PortFlags {
 /// serializes interpose modifications with I/O dispatch — no additional
 /// synchronization is needed. **Callers must never modify the interpose stack
 /// without holding the port lock.**
+/// Where a port's `connected` truth lives.
+///
+/// `Own` — the port opens and closes its own link (every driver that dials out:
+/// IP, serial, USB-TMC, VXI-11, …), so its own cell is the truth.
+///
+/// `Shared` — the link belongs to another object and this port merely serves it.
+/// C models the case with a real child port whose `connectIt`/`closeConnection`
+/// the *owner* drives (`drvAsynIPServerPort.c:357-367` — the listener calls
+/// `pasynCommonSyncIO->connectDevice` on the child the moment it hands it a
+/// socket). Sharing the owner's cell is the same thing without the round trip,
+/// and it is what makes "the owner holds a live socket, the port says
+/// disconnected" unrepresentable rather than merely unlikely.
+#[derive(Debug, Clone)]
+enum Connection {
+    Own(bool),
+    Shared(Arc<AtomicBool>),
+}
+
+impl Connection {
+    fn get(&self) -> bool {
+        match self {
+            Connection::Own(c) => *c,
+            Connection::Shared(cell) => cell.load(Ordering::Acquire),
+        }
+    }
+}
+
 pub struct PortDriverBase {
     pub port_name: String,
     pub max_addr: usize,
     pub flags: PortFlags,
     pub params: ParamList,
     pub interrupts: InterruptManager,
-    pub connected: bool,
+    /// Whether the port's transport is up — read it with [`Self::is_connected`],
+    /// move it with [`Self::set_connected`].
+    ///
+    /// It is not a plain `bool` because not every port *owns* its link. An
+    /// IP-server child port serves a socket that lives in the parent's
+    /// [`crate::drivers::ip_server_port::ClientSlot`]: the listener assigns and
+    /// clears it, and the child cannot see either edge. A cached copy therefore
+    /// went stale in exactly the way that matters — the slot held a live client
+    /// while the child port still said `asynDisconnected` and refused every
+    /// read and write, forever (R13-50). Such a port shares the owner's cell
+    /// instead of copying it, so that state cannot be constructed.
+    connected: Connection,
+    /// The last value fanned out to listeners. Memory for the edge detector in
+    /// [`Self::sync_connection_edge`], never an answer to "is the port up?" —
+    /// [`Self::is_connected`] is the only thing that answers that, and it reads
+    /// the truth.
+    last_announced: bool,
     pub enabled: bool,
     pub auto_connect: bool,
-    /// `defunct` — set by [`Self::shutdown_lifecycle`] when a
-    /// destructible port is torn down via `shutdown_port`. Once true,
-    /// the port refuses every new request through [`Self::check_ready`].
-    /// Mirrors the `dpCommon.defunct` flag at C asynManager.c:2284
-    /// — once defunct, the port cannot be re-enabled.
-    pub defunct: bool,
-    /// Exception sink injected by [`crate::manager::PortManager`] on registration.
-    pub exception_sink: Option<Arc<ExceptionManager>>,
+    /// C `dpCommon.defunct` (asynManager.c:2284) — the port was torn down via
+    /// `shutdownPort` and is gone for good. Read it with [`Self::is_defunct`].
+    ///
+    /// **Invariant: `defunct ⟹ !enabled`.** C establishes it in `shutdownPort`,
+    /// which clears `enabled` *and* sets `defunct` in the same breath (:2282-2283)
+    /// with the comment that disabling is what short-circuits `queueRequest` —
+    /// and indeed `queueRequest` has no defunct branch at all (:1539-1552): a
+    /// defunct port is refused as a *disabled* one, "port %s disabled". `defunct`
+    /// itself is only ever asked by `enable` (:2236, so the port cannot be
+    /// re-enabled) and by `findInterface` (:1487).
+    ///
+    /// The field is private so [`Self::shutdown_lifecycle`] is the only way to
+    /// set it, which is what makes the invariant hold by construction: nothing can
+    /// build a port that is defunct but still enabled, so no gate needs to ask
+    /// about defunct to refuse it (R15-50).
+    defunct: bool,
+    /// This port's announcement channel — C `dpCommon.exceptionUserList` plus
+    /// the `notifyPortThread` signal that `announceExceptionOccurred` ends with
+    /// (asynManager.c:611-637). Detachable ([`Self::exception_announcer`]) so a
+    /// worker thread the driver owns — the IP-server accept loop — announces
+    /// through the same counter and the same list as the actor does, instead of
+    /// reaching around them.
+    pub(crate) announcer: ExceptionAnnouncer,
     pub options: HashMap<String, String>,
-    /// Input EOS sequence (max 2 bytes). Used by EOS interpose and drivers.
-    pub input_eos: Vec<u8>,
-    /// Output EOS sequence (max 2 bytes). Used by EOS interpose and drivers.
-    pub output_eos: Vec<u8>,
+    /// The EOS terminators, keyed per device the way C keys them: an `eosPvt`
+    /// is created per `asynInterposeEosConfig(portName, addr, ...)`
+    /// (asynInterposeEos.c:84-120), and every EOS hook takes the `asynUser`
+    /// that selects it (:288-296). Two devices on one multi-device port hold
+    /// two different terminators — a single port-wide pair could not.
+    ///
+    /// Keyed by [`eos_device_key`], so a port that never declared
+    /// `ASYN_MULTIDEVICE` collapses every addr onto one entry (C's
+    /// `findDpCommon`/`findInterface` resolve any addr to the port itself).
+    eos: HashMap<i32, DeviceEos>,
     pub interpose_octet: OctetInterposeStack,
-    pub trace: Option<Arc<TraceManager>>,
+    /// Trace configuration — C `dpCommon.trace` (asynManager.c:503). Same
+    /// owner as [`Self::announcer`]: bound by
+    /// [`crate::services::PortServices::bind`] at port creation.
+    pub(crate) trace: Option<Arc<TraceManager>>,
+    /// C `octetPvt.interruptProcess` — the last argument of
+    /// `pasynOctetBase->initialize` (asynOctetBase.c:161-169). When set, every
+    /// successful octet read fans the data out to the port's octet interrupt
+    /// users (`readIt` → `callInterruptUsers`, :224-238). The stream drivers set
+    /// it — drvAsynIPPort.c:1055, drvAsynSerialPort.c:1125,
+    /// drvAsynSerialPortWin32.c:798, drvAsynFTDIPort.cpp:616 — and it is what
+    /// makes a `stringin`/`waveform` with `SCAN="I/O Intr"` on such a port
+    /// process at all. Parameter-cache ports (echoDriver, USBTMC, GPIB,
+    /// IP-server) pass 0 and are unaffected.
+    pub octet_interrupt_process: bool,
     /// Per-address device state for multi-device ports.
     pub device_states: HashMap<i32, DeviceState>,
     /// Timestamp source callback for custom timestamps.
@@ -152,6 +268,76 @@ pub struct PortDriverBase {
     /// auto-connect attempt (C `dpCommon.lastConnectDisconnect`). `None`
     /// = no transition yet, so the first attempt is always permitted.
     pub last_connect_disconnect: Option<Instant>,
+    /// Deadline for the next *autonomous* connect attempt — the Rust
+    /// equivalent of C's per-port `connectTimer` (`port.connectTimer`,
+    /// asynManager.c:223). `None` = disarmed.
+    ///
+    /// Armed by [`Self::set_connected`] on a disconnect (C
+    /// `exceptionDisconnect`, asynManager.c:2181-2182) and re-armed by the
+    /// actor after a failed attempt; cleared on connect. The actor is what
+    /// services it — see `PortActor::service_connect_timer` — so this field
+    /// is the whole handoff between the transition owner and the timer.
+    pub connect_retry_at: Option<Instant>,
+    /// Back-off between failed autonomous connect attempts. C
+    /// `port.secondsBetweenPortConnect`, initialised to
+    /// `DEFAULT_SECONDS_BETWEEN_PORT_CONNECT` = 20 s (asynManager.c:48, 3249)
+    /// and used to re-arm the timer at asynManager.c:3281.
+    pub seconds_between_port_connect: Duration,
+    /// How many times this port's link has come up — C `dpCommon.numberConnects`
+    /// (asynManager.c:150), incremented by `exceptionConnect` (:2158) and printed
+    /// by `asynReport` (:1057-1060). Its owner is
+    /// [`Self::sync_connection_edge`], the same edge owner that raises the
+    /// exception, so a connect that was never published is never counted.
+    pub number_connects: u64,
+}
+
+/// The one way to announce a port exception — C `announceExceptionOccurred`
+/// (asynManager.c:611-637): fan the event out over the port's exception list and
+/// signal `notifyPortThread` (:635-636).
+///
+/// It is a detachable handle rather than a method on [`PortDriverBase`] because
+/// the announcement is not the actor thread's private business: a driver-owned
+/// worker (the IP-server accept loop) also transitions a device, and C's
+/// `connectionListener` thread announces the same way the port thread does. A
+/// clone of this handle is that capability; it carries the wake counter with it,
+/// so an off-thread announcement still wakes the actor
+/// ([`PortDriverBase::exceptions_announced`]).
+#[derive(Clone)]
+pub struct ExceptionAnnouncer {
+    port_name: String,
+    /// Set once by [`crate::services::PortServices::bind`] at port creation, so
+    /// every clone taken afterwards carries the IOC's exception list.
+    sink: Option<Arc<ExceptionManager>>,
+    /// Shared so a clone's announcement is visible to the actor's count.
+    announced: Arc<AtomicU64>,
+}
+
+impl ExceptionAnnouncer {
+    fn new(port_name: &str) -> Self {
+        Self {
+            port_name: port_name.to_string(),
+            sink: None,
+            announced: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Announce. A port with no sink still counts the announcement — C's
+    /// fan-out over an empty list still signals the port thread — so the count
+    /// moves before the sink is consulted.
+    pub fn announce(&self, exception: AsynException, addr: i32) {
+        self.announced.fetch_add(1, Ordering::Release);
+        if let Some(ref sink) = self.sink {
+            sink.announce(&ExceptionEvent {
+                port_name: self.port_name.clone(),
+                exception,
+                addr,
+            });
+        }
+    }
+
+    fn count(&self) -> u64 {
+        self.announced.load(Ordering::Acquire)
+    }
 }
 
 impl PortDriverBase {
@@ -162,36 +348,124 @@ impl PortDriverBase {
             flags,
             params: ParamList::new(max_addr, flags.multi_device),
             interrupts: InterruptManager::new(256),
-            connected: true,
+            connected: Connection::Own(true),
+            last_announced: true,
             enabled: true,
             auto_connect: true,
             defunct: false,
-            exception_sink: None,
+            announcer: ExceptionAnnouncer::new(port_name),
             options: HashMap::new(),
-            input_eos: Vec::new(),
-            output_eos: Vec::new(),
-            interpose_octet: OctetInterposeStack::new(),
+            eos: HashMap::new(),
+            interpose_octet: OctetInterposeStack::new(flags.multi_device),
             trace: None,
+            octet_interrupt_process: false,
             device_states: HashMap::new(),
             timestamp_source: None,
             last_connect_disconnect: None,
+            connect_retry_at: None,
+            seconds_between_port_connect: DEFAULT_SECONDS_BETWEEN_PORT_CONNECT,
+            number_connects: 0,
         }
+    }
+
+    /// The EOS entry the given `asynUser` addr selects — see [`eos_device_key`].
+    pub fn eos_key(&self, addr: i32) -> i32 {
+        eos_device_key(self.flags.multi_device, addr)
+    }
+
+    /// This device's input EOS. An addr that has never been configured has an
+    /// empty terminator, C's zero-initialised `eosPvt.eosInLen`.
+    pub fn input_eos(&self, addr: i32) -> &[u8] {
+        self.eos
+            .get(&self.eos_key(addr))
+            .map_or(&[][..], |e| &e.input)
+    }
+
+    /// This device's output EOS (see [`Self::input_eos`]).
+    pub fn output_eos(&self, addr: i32) -> &[u8] {
+        self.eos
+            .get(&self.eos_key(addr))
+            .map_or(&[][..], |e| &e.output)
+    }
+
+    /// The write owner for this device's terminators — the queryable cache the
+    /// EOS readback (`get_input_eos`, the binary-suppress save/restore) reads.
+    /// The forward to the interpose stack lives in the `PortDriver` hook, which
+    /// is the only caller.
+    fn eos_entry(&mut self, addr: i32) -> &mut DeviceEos {
+        let key = self.eos_key(addr);
+        self.eos.entry(key).or_default()
     }
 
     /// Announce an exception through the global exception manager (if injected).
+    ///
+    /// C `announceExceptionOccurred` (asynManager.c:611-637) ends by signalling
+    /// `notifyPortThread` on a CANBLOCK port (:635-636) — the announcement *is* a
+    /// port-thread wake, which is why `asynEnable(port,1)` on a down port ends in
+    /// a connect attempt. [`Self::exceptions_announced`] is how the actor sees
+    /// that signal, so the count moves here and nowhere else: a port with no
+    /// exception sink still announced (C's fan-out over an empty list still
+    /// signals), so the count is bumped before the sink is even consulted.
     pub fn announce_exception(&self, exception: AsynException, addr: i32) {
-        if let Some(ref sink) = self.exception_sink {
-            sink.announce(&ExceptionEvent {
-                port_name: self.port_name.clone(),
-                exception,
-                addr,
-            });
+        self.announcer.announce(exception, addr);
+    }
+
+    /// A clone of this port's announcement capability, for a worker thread the
+    /// driver owns. See [`ExceptionAnnouncer`].
+    pub fn exception_announcer(&self) -> ExceptionAnnouncer {
+        self.announcer.clone()
+    }
+
+    /// Bind the IOC's exception list. [`crate::services::PortServices::bind`] is
+    /// the production caller; tests that drive a driver without a runtime use it
+    /// to stand in for that binding.
+    pub(crate) fn bind_exception_sink(&mut self, sink: Arc<ExceptionManager>) {
+        self.announcer.sink = Some(sink);
+    }
+
+    /// How many exceptions this port has announced. Monotonic; the actor compares
+    /// it against the value it last saw to decide whether C would have signalled
+    /// `notifyPortThread` (asynManager.c:635-636).
+    pub fn exceptions_announced(&self) -> u64 {
+        self.announcer.count()
+    }
+
+    /// How many callbacks are registered on this port's exception list — C
+    /// `asynReport`'s `exceptionUsers` count (asynManager.c:1063).
+    pub fn exception_callback_count(&self) -> usize {
+        self.announcer
+            .sink
+            .as_ref()
+            .map_or(0, |m| m.callback_count())
+    }
+
+    /// Query whether the port is connected — the truth, wherever it lives.
+    pub fn is_connected(&self) -> bool {
+        self.connected.get()
+    }
+
+    /// The port's initial connection state, set while it is being constructed and
+    /// before it can have a listener. Not a transition: no exception fan-out, no
+    /// retry timer, no `lastConnectDisconnect` stamp. Every *transition* after
+    /// construction goes through [`Self::set_connected`].
+    ///
+    /// A port whose link is owned elsewhere has no initial state of its own to
+    /// set — the owner's cell already holds it — so this is a no-op there rather
+    /// than a silent overwrite of the owner's truth.
+    pub fn init_connected(&mut self, connected: bool) {
+        if let Connection::Own(c) = &mut self.connected {
+            *c = connected;
+            self.last_announced = connected;
         }
     }
 
-    /// Query whether the port is connected.
-    pub fn is_connected(&self) -> bool {
-        self.connected
+    /// Bind this port's connection to a cell owned by another object, making that
+    /// cell the port's truth from now on — see [`Connection::Shared`]. Called at
+    /// construction by a port that serves someone else's link (the IP-server
+    /// child port and its `ClientSlot`).
+    pub(crate) fn share_connection(&mut self, cell: Arc<AtomicBool>) {
+        self.last_announced = cell.load(Ordering::Acquire);
+        self.connected = Connection::Shared(cell);
     }
 
     /// Single owner-API for the port-level `connected` transition.
@@ -200,30 +474,96 @@ impl PortDriverBase {
     /// `exceptionDisconnect` (:2174-2185) fire
     /// `asynExceptionConnect` only when the state actually changes.
     /// All driver code that toggles connection state MUST go through
-    /// this helper — directly assigning `base.connected = ...`
-    /// followed by `announce_exception(Connect, -1)` bypasses the
-    /// edge guard and fans spurious duplicates out to listeners
-    /// (CA gateway shadow tasks, asynRecord, monitor relays).
+    /// this helper — the `connected` cell is private precisely so that a driver
+    /// cannot assign it and then hand-roll an `announce_exception(Connect, -1)`,
+    /// which bypasses the edge guard and fans spurious duplicates out to
+    /// listeners (CA gateway shadow tasks, asynRecord, monitor relays).
+    ///
+    /// On a port whose link is owned elsewhere ([`Connection::Shared`]) the write
+    /// is not this port's to make — the owner already moved the truth — so the
+    /// call reduces to publishing whatever edge that produced.
     ///
     /// Returns `true` if the state actually changed (a fan-out
     /// happened); `false` if the call was a no-op.
     pub fn set_connected(&mut self, connected: bool) -> bool {
-        if self.connected == connected {
+        if let Connection::Own(c) = &mut self.connected {
+            *c = connected;
+        }
+        self.sync_connection_edge()
+    }
+
+    /// Publish the port's connection edge if the truth has moved since the last
+    /// fan-out: the single owner of `exceptionConnect`/`exceptionDisconnect`
+    /// (asynManager.c:2151-2185), of the interpose stack's connection reset and of
+    /// the retry timer.
+    ///
+    /// [`Self::set_connected`] is one caller. The other is the actor, on a port
+    /// whose link is owned elsewhere: the owner (an IP-server listener assigning a
+    /// slot) moves the truth without this port's actor running, and C fans that
+    /// edge out from the owner's thread — `pasynCommonSyncIO->connectDevice` on
+    /// the child (drvAsynIPServerPort.c:357-367). Here it is published when the
+    /// child's actor next touches the port, which is the moment it can matter.
+    ///
+    /// Returns `true` if an edge was published.
+    pub fn sync_connection_edge(&mut self) -> bool {
+        let connected = self.connected.get();
+        if self.last_announced == connected {
             return false;
         }
-        self.connected = connected;
+        self.last_announced = connected;
         if !connected {
             // C `exceptionDisconnect` stamps `lastConnectDisconnect` on
             // every disconnect (asynManager.c:2184) so the auto-reconnect
             // throttle measures from the moment the link dropped.
             self.last_connect_disconnect = Some(Instant::now());
+            // ...and arms the port's connect timer at .01 s when the port is
+            // auto-connect (asynManager.c:2181-2182), which is what makes the
+            // reconnect *autonomous*: it does not wait for queued traffic.
+            if self.auto_connect {
+                self.connect_retry_at = Some(Instant::now() + CONNECT_RETRY_INITIAL);
+            }
+        } else {
+            // C `exceptionConnect` counts the connects it publishes
+            // (`++pdpCommon->numberConnects`, asynManager.c:2158) — the count
+            // `asynReport` prints, and the operator's only way to see a port that
+            // is flapping. It belongs to this owner because C increments it in the
+            // same function that raises the exception, so a connect that never
+            // fanned out is never counted.
+            self.number_connects += 1;
+            // The link is up — nothing left to retry. (C leaves the timer
+            // running and lets `portConnectTimerCallback` no-op on the
+            // `!connected` guard, asynManager.c:3257; disarming here is the
+            // same observable behaviour without the pointless wakeup.)
+            self.connect_retry_at = None;
         }
+        // The interpose stack is a subscriber of this transition, exactly as
+        // in C: `asynInterposeEos` registers an exception callback
+        // (asynInterposeEos.c:110) and drops its read-ahead buffer +
+        // partial-EOS match on `asynExceptionConnect`
+        // (asynInterposeEos.c:142-151). Both C edges — `exceptionConnect`
+        // (asynManager.c:2158) and `exceptionDisconnect` (asynManager.c:2185)
+        // — raise that same exception, so both edges reset here. Driving the
+        // hook from this owner (rather than from an out-of-band subscriber)
+        // keeps it impossible to change `connected` without the stack
+        // hearing about it: `interpose_octet` and `connected` live in the
+        // same struct behind the same lock.
+        self.interpose_octet.connection_changed();
         self.announce_exception(AsynException::Connect, -1);
         true
     }
 
     /// Per-address variant — for multi-device ports. Same edge
     /// guarantee as [`Self::set_connected`].
+    ///
+    /// Deliberately does *not* reset the interpose stack. In C each
+    /// interpose is installed on one (port, addr) pair and registers its
+    /// exception callback on that address's `dpCommon`, so a device-level
+    /// connect exception only resets *that* device's interpose
+    /// (asynManager.c:611-625 fans out per-`dpCommon`). `interpose_octet`
+    /// here is port-scoped, so clearing it from a per-device transition
+    /// would discard read-ahead belonging to the port's other addresses.
+    /// The port-level transition owner [`Self::set_connected`] carries the
+    /// reset.
     pub fn set_addr_connected(&mut self, addr: i32, connected: bool) -> bool {
         let was = self.device_state(addr).connected;
         if was == connected {
@@ -254,10 +594,9 @@ impl PortDriverBase {
     ///
     /// Uses monotonic [`Instant`], not wall clock: the throttle is purely
     /// internal timing, never serialised, so it must be immune to NTP
-    /// steps. `addr` selects the per-device anchor on multi-device ports;
-    /// single-device ports use the port-level anchor.
+    /// steps. `addr` selects the anchor via [`Self::is_device_addr`].
     pub fn auto_connect_throttle_ok(&self, addr: i32, now: Instant) -> bool {
-        let last = if self.flags.multi_device {
+        let last = if self.is_device_addr(addr) {
             self.device_states
                 .get(&addr)
                 .and_then(|d| d.last_connect_disconnect)
@@ -270,13 +609,30 @@ impl PortDriverBase {
         }
     }
 
+    /// Does `addr` name a *device* on this port, or the port itself?
+    ///
+    /// C `findDpCommon` resolves a `pasynUser` to `&pdevice->dpc` only when
+    /// the port is multi-device AND the user is bound to a real address;
+    /// otherwise to `&pport->dpc` (a connectDevice with `addr < 0` leaves
+    /// `pdevice` null). This is the one owner of that resolution, so the
+    /// throttle read [`Self::auto_connect_throttle_ok`] and the throttle
+    /// write [`Self::stamp_auto_connect_attempt`] can never disagree about
+    /// which anchor an address refers to. Keying on the address (rather than
+    /// on `multi_device` alone) is what lets a multi-device port hold a
+    /// *port-level* anchor at `addr = -1`: the old form sent `-1` into
+    /// `device_states`, inventing a phantom device whose anchor no
+    /// disconnect ever stamped.
+    pub fn is_device_addr(&self, addr: i32) -> bool {
+        self.flags.multi_device && addr >= 0
+    }
+
     /// Single owner for the post-attempt throttle stamp. C
     /// `autoConnectDevice` stamps `lastConnectDisconnect` immediately after
     /// every `connectAttempt`, success or failure (asynManager.c:718,
     /// 735), so the window restarts from the end of the attempt — a failed
     /// reconnect is not retried until the throttle elapses again.
     pub fn stamp_auto_connect_attempt(&mut self, addr: i32, now: Instant) {
-        if self.flags.multi_device {
+        if self.is_device_addr(addr) {
             self.device_state(addr).last_connect_disconnect = Some(now);
         } else {
             self.last_connect_disconnect = Some(now);
@@ -301,10 +657,7 @@ impl PortDriverBase {
     /// the transition.
     pub fn set_enabled(&mut self, enabled: bool) -> AsynResult<()> {
         if self.defunct {
-            return Err(AsynError::Status {
-                status: AsynStatus::Disabled,
-                message: format!("port {} has been shut down (defunct)", self.port_name),
-            });
+            return Err(Self::shut_down_error());
         }
         self.enabled = enabled;
         self.announce_exception(AsynException::Enable, -1);
@@ -317,10 +670,7 @@ impl PortDriverBase {
     /// too, matching C's `dpCommon.defunct` check on the resolved device.
     pub fn set_addr_enabled(&mut self, addr: i32, enabled: bool) -> AsynResult<()> {
         if self.defunct {
-            return Err(AsynError::Status {
-                status: AsynStatus::Disabled,
-                message: format!("port {} has been shut down (defunct)", self.port_name),
-            });
+            return Err(Self::shut_down_error());
         }
         self.device_state(addr).enabled = enabled;
         self.announce_exception(AsynException::Enable, addr);
@@ -361,33 +711,160 @@ impl PortDriverBase {
         self.defunct
     }
 
+    /// The one place a shut-down port is named in an error message, and the
+    /// only one C has: `enable` on a defunct device (asynManager.c:2236-2241).
+    /// Every other gate refuses a defunct port as a disabled one.
+    fn shut_down_error() -> AsynError {
+        AsynError::Status {
+            status: AsynStatus::Disabled,
+            message: "asynManager:enable: port has been shut down".to_string(),
+        }
+    }
+
+    /// C `queueRequest`'s gate (asynManager.c:1539-1552), and the single owner
+    /// of the two refusals it is built from.
+    ///
+    /// They are independent, and the [`ConnectCheck`] the caller hands in
+    /// selects between them — it can waive the *connected* refusal and nothing
+    /// else. There is no argument, op class or priority that waives
+    /// [`Self::check_enabled`]: C's `if(!pport->dpc.enabled) return asynDisabled`
+    /// (:1541-1546) sits *above* `checkPortConnect` and is reached by every
+    /// request, and its port thread refuses to run anything at all on a disabled
+    /// port (`portThread`, :802-805).
+    ///
+    /// The `ConnectCheck` can only come from [`AsynUser::connect_check`], so the
+    /// waiver is available exactly to the requests C gives it to.
+    ///
+    /// Its refusal is [`AsynError::QueueRefused`], not [`AsynError::Status`]:
+    /// C's refusal is `queueRequest`'s *return value*, so the callback never
+    /// runs and nothing it implies happened. A caller must be able to tell that
+    /// from a driver error raised *inside* a callback that did run — the record
+    /// writes the refusal to ERRS and stops, where a driver error still gets the
+    /// callback's readback and `monitorStatus` tail (asynRecord.c:571-576 vs
+    /// :788-900). This is the only place that stamps it.
+    pub fn check_queue(&self, addr: i32, connect: ConnectCheck) -> AsynResult<()> {
+        self.check_queue_inner(addr, connect)
+            .map_err(AsynError::into_queue_refusal)
+    }
+
+    /// The gate's body, before the refusal is stamped as a queue refusal.
+    ///
+    /// Three blocks, in C's order:
+    ///
+    /// 1. `!pport->dpc.enabled → asynDisabled` (:1541-1546) — port level,
+    ///    unconditional, reached by every request.
+    /// 2. `checkPortConnect && !pport->dpc.connected → asynDisconnected`
+    ///    (:1547-1552) — port level, waived by the request's own user. (C's
+    ///    `checkPortConnect == FALSE` reads *no* connected flag: the port thread
+    ///    drains the Connect queue before it ever calls `autoConnectDevice`,
+    ///    :812-856.)
+    /// 3. The **device** block (:1553-1575), which C runs only for a
+    ///    *synchronous* port: it sits bodily inside
+    ///    `if(!(pport->attributes & ASYN_CANBLOCK))` at :1553. A CANBLOCK port's
+    ///    device-level enabled/connected checks belong to the port THREAD
+    ///    (:874-884), which does something else entirely with them — a disabled
+    ///    device's request *waits in the queue* (`continue`), it is not refused
+    ///    — so applying them here refused requests C parks (R15-47). Every real
+    ///    transport port is CANBLOCK.
+    fn check_queue_inner(&self, addr: i32, connect: ConnectCheck) -> AsynResult<()> {
+        self.check_enabled()?;
+        if connect == ConnectCheck::Required {
+            self.check_port_connected()?;
+        }
+        if !self.flags.can_block {
+            // C :1561-1567 — the device-enabled refusal in the synchronous block
+            // is *not* conditioned on `checkPortConnect`; only the connected one
+            // below is (:1568).
+            self.check_device_enabled(addr)?;
+            if connect == ConnectCheck::Required {
+                self.check_device_connected(addr)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The unconditional half of the queue gate: a disabled port refuses every
+    /// request (asynManager.c:1541-1546).
+    ///
+    /// There is no defunct branch here, and there is none in C's `queueRequest`
+    /// either: `shutdownPort` clears `enabled` alongside setting `defunct`
+    /// (:2282-2283) precisely so this one check answers for both. The invariant
+    /// `defunct ⟹ !enabled` (see the field doc) is what makes that sound.
+    pub fn check_enabled(&self) -> AsynResult<()> {
+        if !self.enabled {
+            return Err(AsynError::Status {
+                status: AsynStatus::Disabled,
+                message: format!("port {} disabled", self.port_name),
+            });
+        }
+        Ok(())
+    }
+
+    /// The port-level connected refusal (asynManager.c:1547-1552).
+    pub fn check_port_connected(&self) -> AsynResult<()> {
+        if !self.is_connected() {
+            return Err(AsynError::Status {
+                status: AsynStatus::Disconnected,
+                message: format!("port {} not connected", self.port_name),
+            });
+        }
+        Ok(())
+    }
+
+    /// The device-level enabled refusal, C's text verbatim
+    /// (asynManager.c:1561-1567). Its *use* differs by port class, which is why
+    /// it is a check and not a gate: `queueRequest` returns it on a synchronous
+    /// port, while on a CANBLOCK port the same condition makes `portThread` park
+    /// the request instead (:875). Both callers ask this one function.
+    ///
+    /// A port that is not `ASYN_MULTIDEVICE`, or an address with no device state,
+    /// resolves to the port's own `dpCommon` in C's `findDpCommon` — already
+    /// checked above — so there is nothing device-level left to refuse.
+    pub fn check_device_enabled(&self, addr: i32) -> AsynResult<()> {
+        if let Some(ds) = self.device(addr) {
+            if !ds.enabled {
+                return Err(AsynError::Status {
+                    status: AsynStatus::Disabled,
+                    // C's double space is verbatim (asynManager.c:1564).
+                    message: format!("port {}  or device {} not enabled", self.port_name, addr),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// The device-level connected refusal (asynManager.c:1568-1575). Same
+    /// split as [`Self::check_device_enabled`]: `queueRequest` returns it on a
+    /// synchronous port; on a CANBLOCK port `portThread` answers the same
+    /// condition with the request's timeout callback (:884-885).
+    pub fn check_device_connected(&self, addr: i32) -> AsynResult<()> {
+        if let Some(ds) = self.device(addr) {
+            if !ds.connected {
+                return Err(AsynError::Status {
+                    status: AsynStatus::Disconnected,
+                    message: format!("port {} or device {} not connected", self.port_name, addr),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// The device `addr` resolves to, or `None` when C's `findDpCommon` would
+    /// resolve it to the port's own `dpCommon` (not multi-device, or no device
+    /// created at that address).
+    fn device(&self, addr: i32) -> Option<&DeviceState> {
+        if !self.flags.multi_device {
+            return None;
+        }
+        self.device_states.get(&addr)
+    }
+
     /// Check that the port is enabled, connected, and not defunct.
     /// Returns `Err(Disabled)`, `Err(Disconnected)`, or `Err(Disabled)`
     /// (defunct => permanently disabled) otherwise.
     pub fn check_ready(&self) -> AsynResult<()> {
-        // C asyn parity: a defunct port short-circuits queueRequest
-        // (asynManager.c:2283 comment). Reject *before* the enabled
-        // check so the error message names the lifecycle phase, not
-        // just "disabled".
-        if self.defunct {
-            return Err(AsynError::Status {
-                status: AsynStatus::Disabled,
-                message: format!("port {} has been shut down (defunct)", self.port_name),
-            });
-        }
-        if !self.enabled {
-            return Err(AsynError::Status {
-                status: AsynStatus::Disabled,
-                message: format!("port {} is disabled", self.port_name),
-            });
-        }
-        if !self.connected {
-            return Err(AsynError::Status {
-                status: AsynStatus::Disconnected,
-                message: format!("port {} is disconnected", self.port_name),
-            });
-        }
-        Ok(())
+        self.check_enabled()?;
+        self.check_port_connected()
     }
 
     /// Run the C `shutdownPort` lifecycle (asynManager.c:2251-2308):
@@ -425,32 +902,32 @@ impl PortDriverBase {
         Ok(())
     }
 
-    /// Check that port + device address are both ready.
-    /// For multi-device ports, checks per-address state in addition to port-level state.
+    /// Check that port + device address are both ready — the whole of C's
+    /// synchronous-port gate (asynManager.c:1539-1575) in one call. Drivers that
+    /// re-check inside their own I/O use it; the queue gate reaches the same
+    /// checks through [`Self::check_queue`], which splits them by port class.
     pub fn check_ready_addr(&self, addr: i32) -> AsynResult<()> {
         self.check_ready()?;
-        if self.flags.multi_device {
-            if let Some(ds) = self.device_states.get(&addr) {
-                if !ds.enabled {
-                    return Err(AsynError::Status {
-                        status: AsynStatus::Disabled,
-                        message: format!("port {} addr {} is disabled", self.port_name, addr),
-                    });
-                }
-                if !ds.connected {
-                    return Err(AsynError::Status {
-                        status: AsynStatus::Disconnected,
-                        message: format!("port {} addr {} is disconnected", self.port_name, addr),
-                    });
-                }
-            }
-        }
-        Ok(())
+        self.check_device_enabled(addr)?;
+        self.check_device_connected(addr)
     }
 
     /// Get or create a device state for the given address.
+    ///
+    /// A device created here inherits the port's `auto_connect`, as C's
+    /// `locateDevice` does: `dpCommonInit(pport, pdevice, pport->dpc.autoConnect)`
+    /// (asynManager.c:584). Defaulting it to `true` on a manual-connect port
+    /// would make `asynReport`'s per-device `autoConnect Yes` a lie, and would
+    /// hand `autoConnectDevice` a device it may reconnect on a port whose
+    /// operator turned auto-connect off.
     pub fn device_state(&mut self, addr: i32) -> &mut DeviceState {
-        self.device_states.entry(addr).or_default()
+        let port_auto_connect = self.auto_connect;
+        self.device_states
+            .entry(addr)
+            .or_insert_with(|| DeviceState {
+                auto_connect: port_auto_connect,
+                ..DeviceState::default()
+            })
     }
 
     /// Check if a specific device address is connected.
@@ -500,6 +977,12 @@ impl PortDriverBase {
         F: Fn() -> SystemTime + Send + Sync + 'static,
     {
         self.timestamp_source = Some(Arc::new(source));
+    }
+
+    /// Drop a registered source — C `unregisterTimeStampSource`
+    /// (asynManager.c:334), which restores `defaultTimeStampSource` (:332).
+    pub fn unregister_timestamp_source(&mut self) {
+        self.timestamp_source = None;
     }
 
     /// Get current timestamp from the registered source, or SystemTime::now().
@@ -663,47 +1146,50 @@ impl PortDriverBase {
         self.params.get_param_status(index, addr)
     }
 
-    /// Detailed parameter report matching C asynPortDriver::reportParams.
-    pub fn report_params(&self, level: i32) {
-        eprintln!("  Number of parameters is {}", self.params.len());
-        if level < 1 {
-            return;
-        }
-        for i in 0..self.params.len() {
-            let name = self.params.param_name(i).unwrap_or("?");
-            let ptype = self
-                .params
-                .param_type(i)
-                .map(|t| format!("{t:?}"))
-                .unwrap_or("?".into());
-            if level >= 2 {
-                for addr in 0..self.max_addr.max(1) {
-                    let val = self
-                        .params
-                        .get_value(i, addr as i32)
-                        .map(|v| format!("{v:?}"))
-                        .unwrap_or("undefined".into());
-                    let (status, alarm_st, alarm_sev) = self
-                        .params
-                        .get_param_status(i, addr as i32)
-                        .unwrap_or((AsynStatus::Success, 0, 0));
-                    eprintln!(
-                        "  param[{i}] name={name} type={ptype} addr={addr} val={val} status={status:?} alarm=({alarm_st},{alarm_sev})"
-                    );
-                }
-            } else {
-                eprintln!("  param[{i}] name={name} type={ptype}");
-            }
+    /// C `asynPortDriver::reportParams` (asynPortDriver.cpp:1799-1809) — the
+    /// parameter block of the driver's report.
+    ///
+    /// `details` is the level `report` was called with, **unshifted**: C hands
+    /// `reportParams` the same number it got (:3692), and the level decides one
+    /// thing only — how many address lists are printed (`details >= 2` → all
+    /// `maxAddr` of them, else list 0 alone, :1804). The values are *not* a
+    /// deeper level: `paramVal::report` prints name, type, value and status for
+    /// every parameter at every level (paramVal.cpp:296-330).
+    ///
+    /// Passing `level - 1` here put the whole block one level late — `asynReport
+    /// 1` printed a bare count where C prints every parameter with its value, and
+    /// values only appeared at 3 (R16-46/47).
+    pub fn report_params(&self, out: &mut dyn std::fmt::Write, details: i32) {
+        use std::fmt::Write as _;
+        let num_addr = if details >= 2 {
+            self.max_addr.max(1)
+        } else {
+            1
+        };
+        for addr in 0..num_addr {
+            let _ = writeln!(out, "Parameter list {addr}");
+            self.params.report(out, addr as i32);
         }
     }
 
-    /// Push an interpose layer onto the octet I/O stack.
+    /// Push an interpose layer onto the **port's** octet I/O stack — C
+    /// `interposeInterface(portName, -1, ...)`, which every driver's own
+    /// configure-time install is (the layer serves every device on the port).
     ///
     /// **Concurrency**: requires `&mut self`, which means the caller must hold
     /// the port lock (`Arc<Mutex<dyn PortDriver>>`). This ensures
     /// interpose modifications are serialized with I/O dispatch.
-    pub fn push_octet_interpose(&mut self, layer: Box<dyn OctetInterpose>) {
-        self.interpose_octet.push(layer);
+    pub fn install_octet_interpose(&mut self, layer: Box<dyn OctetInterpose>) {
+        self.install_octet_interpose_addr(crate::interpose::PORT_CHAIN, layer);
+    }
+
+    /// Push an interpose layer onto the stack of the device `addr` names — C
+    /// `interposeInterface(portName, addr, ...)` (asynManager.c:2190-2220), which
+    /// is what the `asynInterposeEcho` / `asynInterposeDelay` iocsh commands call
+    /// (asynInterposeEcho.c:176, asynInterposeDelay.c:187,200). On a port that is
+    /// not multi-device every addr resolves to the port itself.
+    pub fn install_octet_interpose_addr(&mut self, addr: i32, layer: Box<dyn OctetInterpose>) {
+        self.interpose_octet.install(addr, layer);
     }
 
     /// Flush changed parameters as interrupt notifications.
@@ -827,6 +1313,13 @@ impl PortDriverBase {
     /// mask for the `UInt32Digital` interface (a record's `@asynMask` gates on it,
     /// `asynPortDriver.cpp:720`); pass `0` for the other interfaces, whose
     /// subscribers carry no mask filter.
+    ///
+    /// `aux_status` is the device I/O status this fire carries (C
+    /// `pInterrupt->pasynUser->auxStatus`, set on every callback the poller
+    /// emits — `drvModbusAsyn.cpp:1697/1738/1774/1810/1880/1915`). A driver whose
+    /// last acquisition failed still fires its interrupt lists, with the failing
+    /// status, so I/O-Intr records go to READ/INVALID instead of freezing on the
+    /// last good value; pass [`AsynStatus::Success`] on a clean acquisition.
     pub fn notify_interface_value(
         &self,
         reason: usize,
@@ -834,6 +1327,7 @@ impl PortDriverBase {
         iface: InterfaceType,
         value: ParamValue,
         uint32_changed_mask: u32,
+        aux_status: AsynStatus,
     ) {
         let ts = self.current_timestamp();
         self.interrupts.notify(InterruptValue {
@@ -842,10 +1336,7 @@ impl PortDriverBase {
             value,
             timestamp: ts,
             uint32_changed_mask,
-            // A successful per-interface decode (the caller fires only after the
-            // raw read succeeded); a transport failure aborts the poll before
-            // any fire, matching C's `if (ioStatus_) ... return` in readPoller.
-            aux_status: AsynStatus::Success,
+            aux_status,
             alarm_status: 0,
             alarm_severity: 0,
             iface: Some(iface),
@@ -951,6 +1442,42 @@ impl DrvUserRequest {
 /// the port is always behind `Arc<Mutex<dyn PortDriver>>`, so callers hold the
 /// parking_lot mutex directly. For multi-request exclusive access, use
 /// `BlockProcess`/`UnblockProcess` via the worker queue.
+/// C `epicsTimeToStrftime(buff, ..., "%Y/%m/%d %H:%M:%S.%03f", &timeStamp)` —
+/// the port timestamp line of `asynPortDriver::report` (asynPortDriver.cpp:3682-3684).
+/// Local time, as `epicsTimeToStrftime` renders it.
+fn format_timestamp(ts: SystemTime) -> String {
+    chrono::DateTime::<chrono::Local>::from(ts)
+        .format("%Y/%m/%d %H:%M:%S%.3f")
+        .to_string()
+}
+
+/// C's `details >= 3` block: one line per registered interrupt client
+/// (`reportInterrupt`, asynPortDriver.cpp:1870-1894, called once per interface at
+/// :3695-3708). C prints the callback and userPvt pointers with each client; Rust
+/// mailboxes have no such pointers, so the line carries what identifies a client
+/// here — the interface it bound, the address and reason it filtered on, and the
+/// uint32 mask when it set one.
+fn report_interrupt_clients(out: &mut dyn std::fmt::Write, base: &PortDriverBase) {
+    use std::fmt::Write as _;
+    for f in base.interrupts.clients() {
+        let iface = f
+            .iface
+            .map_or("any", |i: crate::interfaces::InterfaceType| {
+                i.interrupt_label()
+            });
+        let addr = f.addr.map_or("any".to_string(), |a| a.to_string());
+        let reason = f.reason.map_or("any".to_string(), |r| r.to_string());
+        let _ = write!(
+            out,
+            "    {iface} callback client addr={addr}, reason={reason}"
+        );
+        if let Some(mask) = f.uint32_mask {
+            let _ = write!(out, ", mask=0x{mask:x}");
+        }
+        let _ = writeln!(out);
+    }
+}
+
 pub trait PortDriver: Send + Sync + 'static {
     fn base(&self) -> &PortDriverBase;
     fn base_mut(&mut self) -> &mut PortDriverBase;
@@ -1005,31 +1532,96 @@ pub trait PortDriver: Send + Sync + 'static {
             .ok_or_else(|| AsynError::OptionNotFound(key.to_string()))
     }
 
-    fn set_option(&mut self, key: &str, value: &str) -> AsynResult<()> {
+    /// C `asynOption::setOption(void *drvPvt, asynUser *pasynUser, key, val)`.
+    ///
+    /// `user` is the caller's, and its `timeout` is the one that bounds any wire
+    /// traffic the option write causes — an RFC 2217 negotiation on a COM port
+    /// runs under it (`asynInterposeCom.c:475,495`). The option layer has no
+    /// timeout of its own: an asynRecord option put negotiates under TMOT, an
+    /// iocsh `asynSetOption` under its own 2 s (`asynShellCommands.c:119`).
+    fn set_option(&mut self, _user: &mut AsynUser, key: &str, value: &str) -> AsynResult<()> {
         self.base_mut()
             .options
             .insert(key.to_string(), value.to_string());
         Ok(())
     }
 
-    fn report(&self, level: i32) {
+    /// The driver's own report — C `asynCommon::report`, which the manager calls
+    /// last (`reportPrintPort`, asynManager.c:1113-1122) after printing the port's
+    /// manager-level state itself.
+    ///
+    /// So this prints only what the *driver* owns. The port's enable / connect /
+    /// queue / lock / exception / trace state is the manager's to print and is
+    /// printed by [`crate::port_actor::PortActor::report_port`]; duplicating it
+    /// here would give the operator two answers to the same question, from two
+    /// owners, with no rule for which one wins.
+    ///
+    /// The default is C++ `asynPortDriver::report` (asynPortDriver.cpp:3676-3710):
+    /// the port name; at `details >= 1` the timestamp, the EOS terminators *if the
+    /// driver registered the octet interface* (`pasynStdInterfaces->octet.pinterface`,
+    /// :3685) and the parameter library; at `details >= 3` the interrupt clients
+    /// (:3695-3708).
+    ///
+    /// The report goes to `out`, C's `FILE *fp` — the driver never picks the
+    /// stream. [`crate::port_actor::PortActor::report_port`] is the one owner that
+    /// does, and it picks stdout, as `asynReport` does (asynShellCommands.c:589).
+    fn report(&self, out: &mut dyn std::fmt::Write, level: i32) {
+        use std::fmt::Write as _;
         let base = self.base();
-        eprintln!("Port: {}", base.port_name);
-        eprintln!(
-            "  connected: {}, max_addr: {}, params: {}, options: {}",
-            base.connected,
-            base.max_addr,
-            base.params.len(),
-            base.options.len()
-        );
+        let _ = writeln!(out, "Port: {}", base.port_name);
         if level >= 1 {
-            base.report_params(level.saturating_sub(1));
-        }
-        if level >= 2 {
-            for (k, v) in &base.options {
-                eprintln!("  option: {k} = {v}");
+            let _ = writeln!(
+                out,
+                "  Timestamp: {}",
+                format_timestamp(base.current_timestamp())
+            );
+            // C prints the EOS pair only when the driver registered `asynOctet`
+            // (:3685) — on a port with no octet interface the two terminators are
+            // the constructor's zeroed fields, and reporting them invents an EOS
+            // the port cannot have.
+            if self.has_octet_interface() {
+                // C escapes the terminator with `epicsStrPrintEscaped` (:3687,
+                // :3690) — the whole libCom table, not just CR and LF. A private
+                // two-case table wrote a binary terminator (`\x03`, ESC, TAB, NUL)
+                // raw into stdout (R16-48); [`crate::escape`] is the one owner.
+                let input = base.input_eos(0);
+                let output = base.output_eos(0);
+                let _ = writeln!(
+                    out,
+                    "  Input EOS[{}]: {}",
+                    input.len(),
+                    crate::escape::print_escaped(input)
+                );
+                let _ = writeln!(
+                    out,
+                    "  Output EOS[{}]: {}",
+                    output.len(),
+                    crate::escape::print_escaped(output)
+                );
             }
+            // C hands its own level straight to `reportParams` (:3692).
+            base.report_params(out, level);
         }
+        // There is no options block: `asynPortDriver::report` never prints one
+        // (asynPortDriver.cpp:3677-3710), and it could not — `asynOption` is a
+        // get/set pair keyed by a string the *driver* defines, with nothing to
+        // enumerate. The `option: k = v` lines this printed at `details >= 2` had
+        // no C source and no fixed key set to be complete over: they listed
+        // whatever happened to have been written through `setOption`, which is not
+        // the port's option state (R16-49).
+        if level >= 3 {
+            report_interrupt_clients(out, base);
+        }
+    }
+
+    /// Whether this driver registered `asynOctet` — C's
+    /// `pasynStdInterfaces->octet.pinterface != NULL`, which is set from the
+    /// constructor's `interfaceMask` (asynPortDriver.cpp:1990). The Rust analogue
+    /// of that mask is [`Self::capabilities`].
+    fn has_octet_interface(&self) -> bool {
+        self.capabilities()
+            .iter()
+            .any(|c| c.interface_type() == crate::interfaces::InterfaceType::Octet)
     }
 
     // --- Scalar I/O (cache-based defaults, timeout not applicable) ---
@@ -1395,46 +1987,109 @@ pub trait PortDriver: Send + Sync + 'static {
     // resource), authors MUST keep the wait optional / bounded so
     // the connect-wait failure mode doesn't return.
 
-    fn set_input_eos(&mut self, eos: &[u8]) -> AsynResult<()> {
+    // Every hook takes the `asynUser`, because in C every one of them does
+    // (`asynOctet::setInputEos(void *ppvt, asynUser *pasynUser, ...)`,
+    // asynOctetBase.h; asynInterposeEos.c:288-296) and the addr it carries is
+    // what picks the device's terminator. A port-wide EOS could not hold two.
+
+    fn set_input_eos(&mut self, user: &AsynUser, eos: &[u8]) -> AsynResult<()> {
         if eos.len() > 2 {
             return Err(AsynError::Status {
                 status: AsynStatus::Error,
                 message: format!("illegal eoslen {}", eos.len()),
             });
         }
-        // Single write owner for input EOS: `base.input_eos` is the
-        // queryable cache (`get_input_eos`, binary-suppress save/restore),
-        // and the same value is forwarded to the interpose stack so an
-        // installed `EosInterpose` actually terminates reads on it. Empty
+        // Single write owner for input EOS: the per-device cache is what
+        // `get_input_eos` and the binary-suppress save/restore read, and the
+        // same value is forwarded to the interpose stack so an installed
+        // `EosInterpose` actually terminates *this device's* reads on it. Empty
         // stack = no-op forward; C routes `setInputEos` the same way.
+        let addr = user.addr;
         let base = self.base_mut();
-        base.input_eos = eos.to_vec();
-        base.interpose_octet.set_input_eos(eos);
+        base.eos_entry(addr).input = eos.to_vec();
+        base.interpose_octet.set_input_eos(addr, eos);
         Ok(())
     }
 
-    fn get_input_eos(&self) -> Vec<u8> {
-        self.base().input_eos.clone()
+    fn get_input_eos(&self, user: &AsynUser) -> Vec<u8> {
+        self.base().input_eos(user.addr).to_vec()
     }
 
-    fn set_output_eos(&mut self, eos: &[u8]) -> AsynResult<()> {
+    fn set_output_eos(&mut self, user: &AsynUser, eos: &[u8]) -> AsynResult<()> {
         if eos.len() > 2 {
             return Err(AsynError::Status {
                 status: AsynStatus::Error,
                 message: format!("illegal eoslen {}", eos.len()),
             });
         }
-        // Single write owner for output EOS (see `set_input_eos`): cache in
-        // base and forward to the interpose stack so `EosInterpose` appends
-        // the terminator on write.
+        // Single write owner for output EOS (see `set_input_eos`): cache per
+        // device and forward to the interpose stack so `EosInterpose` appends
+        // the terminator on that device's writes.
+        let addr = user.addr;
         let base = self.base_mut();
-        base.output_eos = eos.to_vec();
-        base.interpose_octet.set_output_eos(eos);
+        base.eos_entry(addr).output = eos.to_vec();
+        base.interpose_octet.set_output_eos(addr, eos);
         Ok(())
     }
 
-    fn get_output_eos(&self) -> Vec<u8> {
-        self.base().output_eos.clone()
+    fn get_output_eos(&self, user: &AsynUser) -> Vec<u8> {
+        self.base().output_eos(user.addr).to_vec()
+    }
+
+    // --- asynGpib (IEEE-488 bus control) ---
+    //
+    // The four command methods of C's `asynGpib` interface (asynGpibDriver.h:47-51),
+    // which asynGpib.c passes straight through to the driver's `asynGpibPort`
+    // (asynGpib.c:472-496). A driver that implements them declares
+    // [`crate::interfaces::Capability::Gpib`], and that declaration is what a
+    // client's `findInterface(asynGpibType)` answers — asynRecord reads it into
+    // GPIBIV and refuses UCMD/ACMD when it is 0 (asynRecord.c:1231-1241,
+    // :1647-1651).
+    //
+    // The defaults refuse: a port that has not declared the capability can only
+    // be reached here by a caller that skipped the registry, and C has nothing
+    // to call in that case (the interface pointer is NULL).
+    //
+    // Not ported: the `asynGpibPort` methods that exist solely to drive
+    // asynGpib's SRQ poll thread — `srqStatus`, `srqEnable`, `serialPollBegin`,
+    // `serialPoll`, `serialPollEnd` (asynGpibDriver.h:88-92), plus `pollAddr` /
+    // `srqHappened` (asynGpib.c:498-559, 633-656). Nothing in this tree polls
+    // SRQ; asynRecord's own "Serial Poll" ACMD does not use them (it sends SPE,
+    // reads one octet, sends SPD — asynRecord.c:1717-1746).
+
+    /// C `asynGpib::universalCmd` — send one universal command byte with ATN
+    /// asserted (asynGpib.c:480-484, `vxiUniversalCmd` drvVxi11.c:1406-1424).
+    fn gpib_universal_cmd(&mut self, _user: &mut AsynUser, _cmd: u8) -> AsynResult<()> {
+        Err(AsynError::Status {
+            status: AsynStatus::Error,
+            message: "port has no asynGpib interface".into(),
+        })
+    }
+
+    /// C `asynGpib::addressedCmd` — send an addressed-command frame with ATN
+    /// asserted (asynGpib.c:472-478, `vxiAddressedCmd` drvVxi11.c:1360-1404).
+    /// The frame is built by [`crate::interfaces::gpib::addressed_request`].
+    fn gpib_addressed_cmd(&mut self, _user: &mut AsynUser, _data: &[u8]) -> AsynResult<()> {
+        Err(AsynError::Status {
+            status: AsynStatus::Error,
+            message: "port has no asynGpib interface".into(),
+        })
+    }
+
+    /// C `asynGpib::ifc` — assert Interface Clear (asynGpib.c:486-490).
+    fn gpib_ifc(&mut self, _user: &mut AsynUser) -> AsynResult<()> {
+        Err(AsynError::Status {
+            status: AsynStatus::Error,
+            message: "port has no asynGpib interface".into(),
+        })
+    }
+
+    /// C `asynGpib::ren` — set the Remote Enable line (asynGpib.c:492-496).
+    fn gpib_ren(&mut self, _user: &mut AsynUser, _enable: bool) -> AsynResult<()> {
+        Err(AsynError::Status {
+            status: AsynStatus::Error,
+            message: "port has no asynGpib interface".into(),
+        })
     }
 
     // --- Lifecycle ---
@@ -1490,9 +2145,237 @@ pub trait PortDriver: Send + Sync + 'static {
     }
 }
 
+/// The driver sitting at the **bottom** of a port's octet interpose chain — C's
+/// driver-registered `asynOctet` interface, the one `interposeInterface` keeps
+/// as `pPrev` when it pushes a layer on top (asynManager.c:2190-2220).
+///
+/// A driver never knows it is being interposed in C: `findInterface` hands the
+/// caller the topmost layer, and the layer calls down. The Rust equivalent of
+/// "the caller" is the port actor, so the chain runs there
+/// ([`octet_read_chain`] and friends) and the driver's `io_*_octet` are the raw
+/// device transfer, nothing more.
+struct DriverOctetLink<'a> {
+    driver: &'a mut dyn PortDriver,
+}
+
+impl OctetNext for DriverOctetLink<'_> {
+    /// C `asynOctetBase::readIt` (asynOctetBase.c:224-238): call the driver's
+    /// own `read`, and on success fan the result out to the port's octet
+    /// interrupt users.
+    ///
+    /// This is *below* the EOS layer by construction, and that is the whole
+    /// point. C interposes `octetBase` directly on the driver
+    /// (asynOctetBase.c:156-159) and only then pushes `asynInterposeEos` on top
+    /// of it (:169-171), so the stack is `EOS → octetBase → driver`: every
+    /// interrupt user sees the RAW DRIVER CHUNK — terminator included, with the
+    /// driver's own CNT/END eomReason — and gets one callback per lower-level
+    /// read, not one per EOS-completed message. Firing above the chain (as the
+    /// port actor used to) handed an I/O-Intr record `"abc"`/EOMR=EOS where C
+    /// hands it `"abc\r\n"`/EOMR=CNT|END.
+    fn read(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<OctetReadResult> {
+        let (nbytes_transferred, eom_reason) = self.driver.io_read_octet_eom(user, buf)?;
+        if self.driver.base().octet_interrupt_process {
+            let raw = &buf[..nbytes_transferred];
+            // C's rule for a device read: `addr` decides, `reason` is never
+            // consulted (asynOctetBase.c:203-215). `reason` still rides on the
+            // value — C leaves `pasynUser->reason` on the callback's user — but
+            // it selects nobody.
+            self.driver.base().interrupts.notify_octet(
+                OctetFanOut::ByAddr(user.addr),
+                InterruptValue {
+                    reason: user.reason,
+                    addr: user.addr,
+                    value: ParamValue::Octet(String::from_utf8_lossy(raw).into_owned()),
+                    timestamp: SystemTime::now(),
+                    iface: Some(InterfaceType::Octet),
+                    ..Default::default()
+                },
+            );
+        }
+        Ok(OctetReadResult {
+            nbytes_transferred,
+            eom_reason,
+        })
+    }
+
+    fn write(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+        self.driver.io_write_octet(user, data)
+    }
+
+    fn flush(&mut self, user: &mut AsynUser) -> AsynResult<()> {
+        self.driver.io_flush(user)
+    }
+}
+
+/// Run `f` with the port's chain and the driver below it, both borrowed at once.
+///
+/// The chain lives inside the driver (`base.interpose_octet`) while the driver
+/// is the chain's base, so the two are lifted apart for the duration of one
+/// transfer and the chain is put straight back. The actor owns the driver and is
+/// the only caller, so no other code can observe the port between the take and
+/// the restore.
+fn with_octet_chain<T>(
+    driver: &mut dyn PortDriver,
+    f: impl FnOnce(&mut OctetInterposeStack, &mut DriverOctetLink<'_>) -> T,
+) -> T {
+    let multi_device = driver.base().flags.multi_device;
+    let mut chain = std::mem::replace(
+        &mut driver.base_mut().interpose_octet,
+        OctetInterposeStack::new(multi_device),
+    );
+    let result = {
+        let mut link = DriverOctetLink {
+            driver: &mut *driver,
+        };
+        f(&mut chain, &mut link)
+    };
+    driver.base_mut().interpose_octet = chain;
+    result
+}
+
+/// One octet read on the port: through every interpose layer installed on the
+/// addressed device, ending at the driver.
+///
+/// C `asynOctet::read` on the interface `findInterface` resolves — which is the
+/// outermost interpose whenever one is installed. The chain belongs to the
+/// **port**, not to the driver: `asynInterposeEos` / `asynInterposeEcho` /
+/// `asynInterposeDelay` are pushed by the manager (asynManager.c:2190-2220) and
+/// the driver below is not consulted and cannot opt out. Dispatching inside each
+/// driver instead — as this crate did — made the chain per-driver opt-in, so the
+/// EOS layer `drvAsynFTDIPortConfigure` installs (drvAsynFTDIPort.cpp:622-623,
+/// ftdi.rs) was never run by anything.
+pub(crate) fn octet_read_chain(
+    driver: &mut dyn PortDriver,
+    user: &AsynUser,
+    buf: &mut [u8],
+) -> AsynResult<(usize, EomReason)> {
+    with_octet_chain(driver, |chain, link| chain.dispatch_read(user, buf, link))
+        .map(|r| (r.nbytes_transferred, r.eom_reason))
+}
+
+/// One octet write on the port, through the addressed device's chain
+/// (see [`octet_read_chain`]).
+pub(crate) fn octet_write_chain(
+    driver: &mut dyn PortDriver,
+    user: &mut AsynUser,
+    data: &[u8],
+) -> AsynResult<usize> {
+    with_octet_chain(driver, |chain, link| chain.dispatch_write(user, data, link))
+}
+
+/// One octet flush on the port, through the addressed device's chain — C
+/// `asynInterposeEos::flushIt` resets the layer's read-ahead buffer and then
+/// flushes the layer below (asynInterposeEos.c:259-274), which only happens if
+/// the flush enters the chain at the top (see [`octet_read_chain`]).
+pub(crate) fn octet_flush_chain(
+    driver: &mut dyn PortDriver,
+    user: &mut AsynUser,
+) -> AsynResult<()> {
+    with_octet_chain(driver, |chain, link| chain.dispatch_flush(user, link))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A driver whose `io_read_octet_eom` hands back one scripted chunk per
+    /// call, with the driver-level eomReason C would report (CNT when the
+    /// caller's buffer filled, END never — a stream driver has no message
+    /// boundary). The EOS layer above it is what turns chunks into messages.
+    struct ChunkDriver {
+        base: PortDriverBase,
+        chunks: Vec<Vec<u8>>,
+        next: usize,
+    }
+
+    impl ChunkDriver {
+        fn new(chunks: Vec<&[u8]>) -> Self {
+            let mut base = PortDriverBase::new("chunk", 1, PortFlags::default());
+            base.octet_interrupt_process = true;
+            base.init_connected(true);
+            Self {
+                base,
+                chunks: chunks.into_iter().map(|c| c.to_vec()).collect(),
+                next: 0,
+            }
+        }
+    }
+
+    impl PortDriver for ChunkDriver {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+        fn io_read_octet_eom(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> AsynResult<(usize, EomReason)> {
+            let chunk = self.chunks.get(self.next).cloned().unwrap_or_default();
+            self.next += 1;
+            let n = chunk.len().min(buf.len());
+            buf[..n].copy_from_slice(&chunk[..n]);
+            let eom = if n == buf.len() {
+                EomReason::CNT
+            } else {
+                EomReason::empty()
+            };
+            Ok((n, eom))
+        }
+    }
+
+    /// The octet interrupt fan-out runs BELOW the interpose chain, at the
+    /// driver link — C's `asynOctetBase::readIt` (asynOctetBase.c:224-238),
+    /// which is interposed directly on the driver (:156-159) with the EOS layer
+    /// pushed on top of it (:169-171).
+    ///
+    /// Two boundaries, both invisible when the fan-out ran above the chain:
+    /// (1) the payload an interrupt user receives is the RAW driver chunk —
+    /// terminator included — not the EOS-stripped message the caller gets; and
+    /// (2) a message assembled from two lower-level reads fires TWO callbacks,
+    /// one per driver read, not one per completed message.
+    #[test]
+    fn octet_interrupt_fans_out_below_the_interpose_chain() {
+        use crate::interpose::eos::EosInterpose;
+        use crate::interrupt::{InterruptFilter, InterruptValue};
+        use std::sync::{Arc, Mutex};
+
+        // The message "abc\r\n" arrives split across two driver reads.
+        let mut drv = ChunkDriver::new(vec![b"ab", b"c\r\n"]);
+        drv.base_mut()
+            .install_octet_interpose(Box::new(EosInterpose::default()));
+        drv.set_input_eos(&AsynUser::default(), b"\r\n").unwrap();
+
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_cb = seen.clone();
+        let _sub = drv.base().interrupts.register_sync_callback(
+            InterruptFilter::default(),
+            move |iv: &InterruptValue| {
+                if let ParamValue::Octet(s) = &iv.value {
+                    seen_cb.lock().unwrap().push(s.clone());
+                }
+            },
+        );
+
+        let user = AsynUser::default();
+        let mut buf = [0u8; 32];
+        let (n, eom) = octet_read_chain(&mut drv, &user, &mut buf).unwrap();
+
+        // The CALLER gets the EOS-terminated message, terminator stripped.
+        assert_eq!(&buf[..n], b"abc");
+        assert!(eom.contains(EomReason::EOS), "caller sees EOS, got {eom:?}");
+
+        // The INTERRUPT USERS get the raw driver chunks, terminator included,
+        // one callback per lower-level read.
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["ab".to_string(), "c\r\n".to_string()],
+            "each driver read fans out its raw chunk"
+        );
+    }
+
     struct TestDriver {
         base: PortDriverBase,
     }
@@ -1559,11 +2442,11 @@ mod tests {
     fn test_connect_disconnect() {
         let mut drv = TestDriver::new();
         let user = AsynUser::default();
-        assert!(drv.base().connected);
+        assert!(drv.base().is_connected());
         drv.disconnect(&user).unwrap();
-        assert!(!drv.base().connected);
+        assert!(!drv.base().is_connected());
         drv.connect(&user).unwrap();
-        assert!(drv.base().connected);
+        assert!(drv.base().is_connected());
     }
 
     #[test]
@@ -1754,9 +2637,11 @@ mod tests {
     #[test]
     fn test_option_set_get() {
         let mut drv = TestDriver::new();
-        drv.set_option("baud", "9600").unwrap();
+        drv.set_option(&mut AsynUser::default(), "baud", "9600")
+            .unwrap();
         assert_eq!(drv.get_option("baud").unwrap(), "9600");
-        drv.set_option("baud", "115200").unwrap();
+        drv.set_option(&mut AsynUser::default(), "baud", "115200")
+            .unwrap();
         assert_eq!(drv.get_option("baud").unwrap(), "115200");
     }
 
@@ -1770,10 +2655,12 @@ mod tests {
     #[test]
     fn test_report_no_panic() {
         let mut drv = TestDriver::new();
-        drv.set_option("testkey", "testval").unwrap();
+        drv.set_option(&mut AsynUser::default(), "testkey", "testval")
+            .unwrap();
         drv.base_mut().set_int32_param(0, 0, 42).unwrap();
         for level in 0..=3 {
-            drv.report(level);
+            let mut out = String::new();
+            drv.report(&mut out, level);
         }
     }
 
@@ -1968,7 +2855,7 @@ mod tests {
             let mut guard = port.lock();
             guard
                 .base_mut()
-                .push_octet_interpose(Box::new(NoopInterpose));
+                .install_octet_interpose(Box::new(NoopInterpose));
             assert_eq!(guard.base().interpose_octet.len(), 1);
         }
     }
@@ -2006,12 +2893,12 @@ mod tests {
 
         let mut drv = TestDriver::new();
         drv.base_mut()
-            .push_octet_interpose(Box::new(EosInterpose::default()));
+            .install_octet_interpose(Box::new(EosInterpose::default()));
 
         // Set IEOS through the driver trait: caches in base AND must reach
         // the interpose.
-        drv.set_input_eos(b"\n").unwrap();
-        assert_eq!(drv.base().input_eos, b"\n");
+        drv.set_input_eos(&AsynUser::default(), b"\n").unwrap();
+        assert_eq!(drv.base().input_eos(0), b"\n");
 
         let user = AsynUser::default();
         // "ab\n" exactly: the EOS read returns "ab" and leaves no read-ahead
@@ -2032,8 +2919,8 @@ mod tests {
 
         // Clearing IEOS (binary-suppress path) must also reach the interpose:
         // the read then passes through with no EOS termination.
-        drv.set_input_eos(b"").unwrap();
-        assert_eq!(drv.base().input_eos, b"");
+        drv.set_input_eos(&AsynUser::default(), b"").unwrap();
+        assert_eq!(drv.base().input_eos(0), b"");
         let mut src2 = RawSource {
             data: b"xy\nz".to_vec(),
             pos: 0,
@@ -2046,6 +2933,123 @@ mod tests {
             .unwrap();
         assert_eq!(&buf2[..r2.nbytes_transferred], b"xy\nz");
         assert!(!r2.eom_reason.contains(EomReason::EOS));
+    }
+
+    /// R14-49: the EOS hooks take the `asynUser`, so a multi-device port holds
+    /// one terminator per device — C's `eosPvt` is created per (port, addr)
+    /// (asynInterposeEos.c:84-120) and every hook takes the user that selects it
+    /// (:288-296). A port-wide pair could not answer two devices.
+    #[test]
+    fn each_device_on_a_multi_device_port_holds_its_own_eos() {
+        struct MultiDriver {
+            base: PortDriverBase,
+        }
+        impl PortDriver for MultiDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+        }
+        let mut drv = MultiDriver {
+            base: PortDriverBase::new(
+                "eos_multi",
+                4,
+                PortFlags {
+                    multi_device: true,
+                    ..PortFlags::default()
+                },
+            ),
+        };
+
+        let dev1 = AsynUser::default().with_addr(1);
+        let dev2 = AsynUser::default().with_addr(2);
+        drv.set_input_eos(&dev1, b"\n").unwrap();
+        drv.set_output_eos(&dev1, b"\r\n").unwrap();
+        drv.set_input_eos(&dev2, b";").unwrap();
+
+        assert_eq!(drv.get_input_eos(&dev1), b"\n");
+        assert_eq!(drv.get_input_eos(&dev2), b";");
+        assert_eq!(drv.get_output_eos(&dev1), b"\r\n");
+        // A device that was never configured has no terminator — C's
+        // zero-initialised `eosInLen`.
+        assert!(
+            drv.get_input_eos(&AsynUser::default().with_addr(3))
+                .is_empty()
+        );
+        assert!(drv.get_output_eos(&dev2).is_empty());
+    }
+
+    /// The other boundary: a port that never declared `ASYN_MULTIDEVICE` has no
+    /// devices to key by — C's `findDpCommon` (asynManager.c:496-509) and
+    /// `findInterface` resolve *every* addr to the port itself, so
+    /// `asynSetEos(port, -1, ...)` and a record at ADDR 0 must reach the same
+    /// terminator. Splitting them by raw addr would leave the record reading
+    /// with no EOS at all.
+    #[test]
+    fn a_single_device_port_collapses_every_addr_onto_one_eos() {
+        let mut drv = TestDriver::new();
+        drv.set_input_eos(&AsynUser::default().with_addr(-1), b"\n")
+            .unwrap();
+        assert_eq!(drv.get_input_eos(&AsynUser::default().with_addr(0)), b"\n");
+        assert_eq!(drv.get_input_eos(&AsynUser::default().with_addr(7)), b"\n");
+    }
+
+    /// R6-46 owner path: `set_connected` is the single transition owner, so
+    /// every driver that reconnects through it (serial, IP, prologix …) gets
+    /// the interpose reset for free. C wires this as an exception callback
+    /// (`asynInterposeEos.c:110,142-151`); here the owner drives the stack
+    /// directly. Boundaries: both edges reset (C's `asynExceptionConnect`
+    /// fires from `exceptionConnect` AND `exceptionDisconnect`), and a
+    /// no-op call (same state) must not.
+    #[test]
+    fn set_connected_resets_interpose_link_state() {
+        use crate::interpose::{OctetInterpose, OctetNext, OctetReadResult};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingInterpose(Arc<AtomicUsize>);
+        impl OctetInterpose for CountingInterpose {
+            fn read(
+                &mut self,
+                user: &AsynUser,
+                buf: &mut [u8],
+                next: &mut dyn OctetNext,
+            ) -> AsynResult<OctetReadResult> {
+                next.read(user, buf)
+            }
+            fn write(
+                &mut self,
+                user: &mut AsynUser,
+                data: &[u8],
+                next: &mut dyn OctetNext,
+            ) -> AsynResult<usize> {
+                next.write(user, data)
+            }
+            fn flush(&mut self, user: &mut AsynUser, next: &mut dyn OctetNext) -> AsynResult<()> {
+                next.flush(user)
+            }
+            fn connection_changed(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let resets = Arc::new(AtomicUsize::new(0));
+        let mut base = PortDriverBase::new("reset_test", 1, PortFlags::default());
+        base.install_octet_interpose(Box::new(CountingInterpose(resets.clone())));
+
+        // Port starts connected. Disconnect edge → reset (C exceptionDisconnect).
+        assert!(base.set_connected(false));
+        assert_eq!(resets.load(Ordering::Relaxed), 1);
+
+        // Redundant call, no state change → no fan-out, no reset.
+        assert!(!base.set_connected(false));
+        assert_eq!(resets.load(Ordering::Relaxed), 1);
+
+        // Reconnect edge → reset again (C exceptionConnect).
+        assert!(base.set_connected(true));
+        assert_eq!(resets.load(Ordering::Relaxed), 2);
     }
 
     #[test]
@@ -2114,12 +3118,12 @@ mod tests {
         base.device_state(1).enabled = false;
         assert!(base.check_ready_addr(0).is_ok());
         let err = base.check_ready_addr(1).unwrap_err();
-        assert!(format!("{err}").contains("disabled"));
+        assert!(format!("{err}").contains("not enabled"));
 
         // Disconnect addr 2
         base.device_state(2).connected = false;
         let err = base.check_ready_addr(2).unwrap_err();
-        assert!(format!("{err}").contains("disconnected"));
+        assert!(format!("{err}").contains("not connected"));
     }
 
     #[test]
@@ -2238,12 +3242,24 @@ mod tests {
         // Idempotent — second call is Ok and leaves state unchanged.
         base.shutdown_lifecycle().unwrap();
         assert!(base.is_defunct());
-        // check_ready surfaces the defunct state for every request.
+        // A shut-down port is refused by the queue gate as a *disabled* one:
+        // C's `queueRequest` has no defunct branch (asynManager.c:1539-1552),
+        // it only sees the `enabled=FALSE` that `shutdownPort` left behind
+        // (:2282-2283). "port %s disabled" is the message an operator gets.
         match base.check_ready() {
-            Err(AsynError::Status { message, .. }) => {
-                assert!(message.contains("defunct"), "msg={message}");
+            Err(AsynError::Status { status, message }) => {
+                assert_eq!(status, AsynStatus::Disabled);
+                assert_eq!(message, "port p_destr disabled");
             }
-            other => panic!("expected defunct error, got {other:?}"),
+            other => panic!("expected the disabled refusal, got {other:?}"),
+        }
+        // The one place C names the shutdown is `enable` (:2236-2241).
+        match base.set_enabled(true) {
+            Err(AsynError::Status { status, message }) => {
+                assert_eq!(status, AsynStatus::Disabled);
+                assert_eq!(message, "asynManager:enable: port has been shut down");
+            }
+            other => panic!("expected the shut-down refusal, got {other:?}"),
         }
     }
 
@@ -2286,7 +3302,7 @@ mod tests {
 
         base.disable_addr(2);
         let err = base.check_ready_addr(2).unwrap_err();
-        assert!(format!("{err}").contains("disabled"));
+        assert!(format!("{err}").contains("not enabled"));
 
         base.enable_addr(2);
         assert!(base.check_ready_addr(2).is_ok());
@@ -2328,7 +3344,7 @@ mod tests {
         base.create_param("V", ParamType::Int32).unwrap();
 
         let exc_mgr = Arc::new(crate::exception::ExceptionManager::new());
-        base.exception_sink = Some(exc_mgr.clone());
+        base.bind_exception_sink(exc_mgr.clone());
 
         let last_addr = Arc::new(AtomicI32::new(-99));
         let last_addr2 = last_addr.clone();
@@ -2364,7 +3380,7 @@ mod tests {
         );
         base.create_param("V", ParamType::Int32).unwrap();
         let exc_mgr = Arc::new(crate::exception::ExceptionManager::new());
-        base.exception_sink = Some(exc_mgr.clone());
+        base.bind_exception_sink(exc_mgr.clone());
 
         let connect_hits = Arc::new(AtomicUsize::new(0));
         let hits2 = connect_hits.clone();
@@ -2410,7 +3426,7 @@ mod tests {
 
         let mut base = PortDriverBase::new("ac", 1, PortFlags::default());
         let exc_mgr = Arc::new(crate::exception::ExceptionManager::new());
-        base.exception_sink = Some(exc_mgr.clone());
+        base.bind_exception_sink(exc_mgr.clone());
         let hits = Arc::new(AtomicUsize::new(0));
         let hits2 = hits.clone();
         exc_mgr.add_callback(move |event| {
@@ -2502,7 +3518,7 @@ mod tests {
         };
         let mut base = PortDriverBase::new("def", 1, flags);
         let exc_mgr = Arc::new(crate::exception::ExceptionManager::new());
-        base.exception_sink = Some(exc_mgr.clone());
+        base.bind_exception_sink(exc_mgr.clone());
         let enable_hits = Arc::new(AtomicUsize::new(0));
         let h = enable_hits.clone();
         exc_mgr.add_callback(move |event| {
@@ -2539,7 +3555,7 @@ mod tests {
         };
         let mut base = PortDriverBase::new("def", 4, flags);
         let exc_mgr = Arc::new(crate::exception::ExceptionManager::new());
-        base.exception_sink = Some(exc_mgr.clone());
+        base.bind_exception_sink(exc_mgr.clone());
         let enable_hits = Arc::new(AtomicUsize::new(0));
         let h = enable_hits.clone();
         exc_mgr.add_callback(move |event| {
@@ -2715,5 +3731,190 @@ mod tests {
                 .unwrap(),
             0x05
         );
+    }
+
+    /// R16-47: the parameter block is one level *late* no longer.
+    ///
+    /// C `asynPortDriver::report` hands `reportParams` the level it was given,
+    /// unchanged (asynPortDriver.cpp:3692); `reportParams` prints list 0 at any
+    /// level and all `maxAddr` lists at `details >= 2` (:1804); and
+    /// `paramVal::report` prints name, type, value and status for every parameter
+    /// at every level (paramVal.cpp:296-330). Passing `level - 1` made
+    /// `asynReport 1` print a bare count, and values appear only at 3.
+    ///
+    /// One case per threshold boundary: details 0 (no block), 1 (list 0, with
+    /// values), 2 (every address list).
+    #[test]
+    fn report_prints_the_parameter_block_at_the_c_detail_levels() {
+        struct Drv {
+            base: PortDriverBase,
+        }
+        impl PortDriver for Drv {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+        }
+
+        let mut base = PortDriverBase::new(
+            "rep",
+            2,
+            PortFlags {
+                multi_device: true,
+                ..PortFlags::default()
+            },
+        );
+        let n = base.params.create_param("N", ParamType::Int32).unwrap();
+        let x = base.params.create_param("X", ParamType::Float64).unwrap();
+        let s_idx = base.params.create_param("S", ParamType::Octet).unwrap();
+        let bits = base
+            .params
+            .create_param("BITS", ParamType::UInt32Digital)
+            .unwrap();
+        base.params.set_int32(n, 0, 7).unwrap();
+        base.params.set_float64(x, 0, 0.1 + 0.2).unwrap();
+        base.params
+            .set_string(s_idx, 0, "hello".to_string())
+            .unwrap();
+        base.params.set_uint32(bits, 0, 0xa5, 0xff, 0).unwrap();
+        base.params
+            .set_uint32_interrupt(bits, 0, 0x0f, InterruptReason::ZeroToOne)
+            .unwrap();
+        // Addr 1 is left untouched: its parameters must report as undefined.
+        let drv = Drv { base };
+
+        // details 0 — C prints the port line and stops (:3678-3680).
+        let mut out = String::new();
+        drv.report(&mut out, 0);
+        assert!(
+            !out.contains("Parameter"),
+            "details 0 has no parameter block: {out}"
+        );
+
+        // details 1 — list 0, the count, and every parameter WITH its value.
+        let mut out = String::new();
+        drv.report(&mut out, 1);
+        assert!(
+            out.contains("Parameter list 0\nNumber of parameters is: 4\n"),
+            "C's paramList::report header (asynPortDriver.cpp:887): {out}"
+        );
+        assert!(
+            out.contains("Parameter 0 type=asynInt32, name=N, value=7, status=0\n"),
+            "{out}"
+        );
+        // C's `%g`: six significant digits, so 0.1+0.2 is `0.3`, not
+        // `0.30000000000000004`.
+        assert!(
+            out.contains("Parameter 1 type=asynFloat64, name=X, value=0.3, status=0\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("Parameter 2 type=string, name=S, value=hello, status=0\n"),
+            "C calls an octet parameter `string` (paramVal.cpp:328): {out}"
+        );
+        assert!(
+            out.contains(
+                "Parameter 3 type=asynUInt32Digital, name=BITS, value=0xa5, status=0, \
+                 risingMask=0xf, fallingMask=0x0, callbackMask=0xa5\n"
+            ),
+            "C prints the three masks with the value (paramVal.cpp:314-316): {out}"
+        );
+        assert!(
+            !out.contains("Parameter list 1"),
+            "below details 2 C reports one address list (asynPortDriver.cpp:1804): {out}"
+        );
+
+        // details 2 — every address list, and addr 1 is undefined.
+        let mut out = String::new();
+        drv.report(&mut out, 2);
+        assert!(out.contains("Parameter list 1\n"), "{out}");
+        assert!(
+            out.contains("Parameter 0 type=asynInt32, name=N, value is undefined\n"),
+            "an unset parameter prints C's undefined line (paramVal.cpp:304): {out}"
+        );
+    }
+
+    /// R16-48: the report escapes a terminator the way C does — the whole libCom
+    /// table, not just CR and LF.
+    ///
+    /// C prints the EOS pair with `epicsStrPrintEscaped` (asynPortDriver.cpp:3687,
+    /// 3690), whose table is `\a \b \f \n \r \t \v \\ \' \"`, the byte itself
+    /// when `isprint`, and `\xNN` otherwise (epicsString.c:230-262). The report's
+    /// own two-case table wrote a binary terminator raw into stdout.
+    #[test]
+    fn report_escapes_the_eos_with_the_c_table() {
+        struct Drv {
+            base: PortDriverBase,
+        }
+        impl PortDriver for Drv {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
+                crate::interfaces::octet_transport_capabilities()
+            }
+        }
+
+        let mut drv = Drv {
+            base: PortDriverBase::new("eos_rep", 1, PortFlags::default()),
+        };
+        // A real binary terminator (C caps an EOS at two bytes): ESC, then NUL —
+        // neither of which the old two-case table escaped.
+        drv.set_input_eos(&AsynUser::default(), b"\x1b\0").unwrap();
+        // …and the named escapes beyond CR/LF: TAB and BEL.
+        drv.set_output_eos(&AsynUser::default(), b"\t\x07").unwrap();
+
+        let mut out = String::new();
+        drv.report(&mut out, 1);
+        assert!(
+            out.contains("  Input EOS[2]: \\x1b\\x00\n"),
+            "C's epicsStrPrintEscaped prints NUL as \\x00 — it has no `case 0` (epicsString.c:255-260): {out}"
+        );
+        assert!(
+            out.contains("  Output EOS[2]: \\t\\a\n"),
+            "BEL is `\\a` in C's table, not `\\x07` (epicsString.c:245): {out}"
+        );
+    }
+
+    /// R16-49: the report has no options block, at any level.
+    ///
+    /// C `asynPortDriver::report` (asynPortDriver.cpp:3677-3710) prints the port
+    /// name, the timestamp, the EOS pair, the parameter lists and — at
+    /// `details >= 3` — the interrupt clients. It never prints options, and it
+    /// could not: `asynOption` is a `getOption`/`setOption` pair keyed by a
+    /// driver-defined string, with no enumeration to walk.
+    #[test]
+    fn report_prints_no_options_block() {
+        struct Drv {
+            base: PortDriverBase,
+        }
+        impl PortDriver for Drv {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+        }
+
+        let mut drv = Drv {
+            base: PortDriverBase::new("opt_rep", 1, PortFlags::default()),
+        };
+        drv.set_option(&mut AsynUser::default(), "baud", "9600")
+            .unwrap();
+
+        for level in 0..=4 {
+            let mut out = String::new();
+            drv.report(&mut out, level);
+            assert!(
+                !out.contains("option") && !out.contains("baud"),
+                "asynReport {level} must print no options block: {out}"
+            );
+        }
     }
 }

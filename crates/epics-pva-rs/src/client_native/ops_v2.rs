@@ -32,7 +32,7 @@ use crate::proto::{BitSet, ByteOrder, Command, PvaHeader, QosFlags, ReadExt, Wri
 use crate::pv_request::{build_pv_request_fields, build_pv_request_value_only};
 use crate::pvdata::encode::{encode_pv_field, encode_pv_field_with_bitset, encode_type_desc};
 use crate::pvdata::{
-    FieldDesc, PvField, PvStructure, ScalarType, ScalarValue, UnionItem, VariantValue,
+    FieldDesc, PvField, PvStructure, RpcReply, ScalarType, ScalarValue, UnionItem, VariantValue,
 };
 
 use super::channel::Channel;
@@ -121,11 +121,21 @@ pub struct MonitorFlow {
     /// pvxs `op->pipeline`. When false no credit window is negotiated:
     /// INIT carries no pipeline bit / `nack` trailer and no ACK is sent.
     pub pipeline: bool,
-    /// pvxs `op->queueSize` — the credit window written as the INIT
-    /// `nack` trailer. Only meaningful when `pipeline`.
+    /// pvxs `op->queueSize` (`clientmon.cpp:52`, default 4) — the NEGOTIATED
+    /// monitor queue depth. Reported as `SubscriptionStat::limit_queue` (pvxs
+    /// `ret.limitQueue = queueSize`, `clientmon.cpp:152`) and, when `pipeline`,
+    /// written as the INIT `nack` trailer.
+    ///
+    /// This is resolved whether or not pipelining is on, exactly as pvxs
+    /// resolves it — the `queueSize` block sits outside any `if(pipeline)`
+    /// (`clientmon.cpp:763-773`). It used to collapse to `0` for a
+    /// non-pipelined monitor, which gave the field two meanings ("no pipeline"
+    /// vs. a real depth) and made a `record[queueSize=16]` monitor report
+    /// `limit_queue = 0` (R10-35). `pipeline` alone gates the wire.
     pub queue_size: u32,
-    /// pvxs `op->ackAt` — refill the server's window after this many
-    /// delivered events. Only meaningful when `pipeline`.
+    /// pvxs `op->ackAt` (`clientmon.cpp:796-808`) — refill the server's window
+    /// after this many delivered events. Resolved unconditionally, as pvxs
+    /// does; consumed only when `pipeline`.
     pub ack_at: u32,
 }
 
@@ -134,6 +144,12 @@ impl MonitorFlow {
     /// window is the single source of truth (no caller pvRequest to
     /// honor). `pipeline_size == 0` disables pipelining entirely,
     /// matching the pre-`MonitorFlow` `pipeline_size > 0` gate.
+    ///
+    /// A non-pipelined monitor still has a queue depth — pvxs's builder
+    /// default `queueSize = 4` stands whatever `pipeline` is
+    /// (`clientmon.cpp:52`), and it is what `stats()` reports. So the
+    /// `pipeline_size == 0` arm keeps [`DEFAULT_PIPELINE_SIZE`] as the depth
+    /// rather than reporting `0`.
     pub fn window(pipeline_size: u32) -> Self {
         if pipeline_size > 0 {
             Self {
@@ -144,8 +160,8 @@ impl MonitorFlow {
         } else {
             Self {
                 pipeline: false,
-                queue_size: 0,
-                ack_at: 0,
+                queue_size: DEFAULT_PIPELINE_SIZE,
+                ack_at: ack_threshold(DEFAULT_PIPELINE_SIZE),
             }
         }
     }
@@ -164,79 +180,132 @@ impl MonitorFlow {
     /// `default_window` is the client's configured pipeline window
     /// (`PvaClientBuilder::pipeline_size`), used as the `queueSize`
     /// fallback the way pvxs uses its `MonitorBuilder` default of 4.
+    ///
+    /// Every option is read through the CONVERSION owner
+    /// ([`crate::pvdata::convert`], the port's `Value::copyOut`), because that
+    /// is what pvxs's `Value::as<T>()` is. This used to normalise each option
+    /// to its DISPLAY STRING and then string-match, which diverged three ways
+    /// (R10-35):
+    ///
+    /// * `pipeline` matched the texts `"true"`/`"1"`/`"yes"`. pvxs runs
+    ///   `as(bool)`: bool, ANY non-zero integer or real is true
+    ///   (`data.cpp:405`), while a STRING converts only as the exact tokens
+    ///   `"true"`/`"false"` (`data.cpp:466-469`). So `pipeline = Int(2)` ran a
+    ///   pipelined monitor against pvxs and a plain one here, and `"yes"` did
+    ///   the reverse.
+    /// * `queueSize` was parsed as a DECIMAL string. pvxs runs `as(uint32)`,
+    ///   which casts a real and parses a string with `parseTo<uint64_t>` =
+    ///   `stoull(s, &idx, 0)` — BASE 0. `"0x10"` is 16 and `Double(8.5)` is 8.
+    /// * `ackAny` took the percent branch off the RENDERED text. pvxs gates it
+    ///   on `ackAny.type()==TypeCode::String` (`clientmon.cpp:777`) and only
+    ///   then reads the `"N%"` form.
+    ///
+    /// Note this is the CLIENT's conversion topology, which is NOT the
+    /// server's: `servermon.cpp:556` runs the THROWING `ackAny.as<std::string>()`
+    /// ahead of both branches, so a non-convertible `ackAny` resets the circuit
+    /// there. The client's `type()==String` guard means nothing here can throw.
     pub fn from_record_options(
         record_options: &[(String, crate::pvdata::ScalarValue)],
         default_window: u32,
     ) -> Self {
-        // Record options are now typed (`bool pipeline`, `uint queueSize`)
-        // or string (parsed-text path). Normalise each to its display
-        // string so one parser handles both shapes — `Boolean(true)` and
-        // `String("true")` both render `"true"`, `UInt(8)` renders `"8"`.
-        let get = |key: &str| {
+        use crate::pvdata::{PvField, convert};
+        // The extractor only lifts SCALAR leaves out of `record._options`, so a
+        // non-scalar option arrives as absent. That matches pvxs's outcome for
+        // one: every `as<T>()` it would run on an array / struct is `NoConvert`,
+        // and `as(x)` answers false, leaving the default in place.
+        let get = |key: &str| -> Option<PvField> {
             record_options
                 .iter()
                 .find(|(k, _)| k == key)
-                .map(|(_, v)| v.to_string())
+                .map(|(_, v)| PvField::Scalar(v.clone()))
         };
-        // pvxs `options["pipeline"].as(op->pipeline)` — absent ⟹ false.
-        let pipeline = get("pipeline")
-            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
-            .unwrap_or(false);
-        if !pipeline {
-            // No pipeline ⟹ no credit window and no ACK trailer. A
-            // requested `queueSize` still travels inside the pvRequest
-            // bytes (the server's squash depth) but the client sends no
-            // `nack` and never ACKs — pvxs only writes the trailer
-            // `if(pipeline)` (`clientmon.cpp:340-348`).
-            return Self {
-                pipeline: false,
-                queue_size: 0,
-                ack_at: 0,
-            };
-        }
-        // pvxs `clientmon.cpp:763-773`: `queueSize` honored only when
-        // present, parseable, and `Q > 1`; else the builder default. A
-        // pipeline window must be `>= 2`, so a 0/1 configured default
-        // falls back to the pvxs default of 4.
+
+        // `clientmon.cpp:763-773` — `if(queueSize.as(Q) && Q>1) op->queueSize = Q;`
+        // else keep the default. Resolved OUTSIDE any pipeline gate, exactly
+        // where pvxs resolves it. A pipeline window must be >= 2, so a 0/1
+        // configured default falls back to pvxs's 4.
         let fallback = if default_window > 1 {
             default_window
         } else {
             DEFAULT_PIPELINE_SIZE
         };
         let queue_size = get("queueSize")
-            .and_then(|v| v.trim().parse::<u32>().ok())
+            .and_then(|f| convert::as_u32(&f).ok())
             .filter(|&q| q > 1)
             .unwrap_or(fallback);
-        let ack_at = ack_at_from_request(get("ackAny").as_deref(), queue_size);
+
+        // `clientmon.cpp:775` — `(void)options["pipeline"].as(op->pipeline);`
+        // An absent or unconvertible value leaves the `false` default.
+        let pipeline = get("pipeline")
+            .and_then(|f| convert::as_bool(&f).ok())
+            .unwrap_or(false);
+
+        // `clientmon.cpp:777-808`. Resolved unconditionally, as pvxs does;
+        // only a pipelined monitor ever consumes it.
+        let ack_any = record_options
+            .iter()
+            .find(|(k, _)| k == "ackAny")
+            .map(|(_, v)| v.clone());
+        let ack_at = ack_at_from_request(ack_any.as_ref(), queue_size);
+
         Self {
-            pipeline: true,
+            pipeline,
             queue_size,
             ack_at,
         }
     }
 }
 
-/// pvxs `clientmon.cpp:777-808` — derive the pipeline ACK-refill
-/// threshold `ackAt` from a string-valued `record._options.ackAny` and
-/// the negotiated `queue_size`. A `"N%"` value is a percent of the
-/// window (honored only for `0 < N <= 100`); otherwise an integer
-/// count. An absent/unparseable/out-of-range value, or an explicit `0`,
-/// resolves to `queue_size / 2`; the result clamps to `[1, queue_size]`.
-/// This is the client-string twin of the server's `ack_at_from`
-/// (which reads a typed `PvField`); `queue_size` is always `>= 2` here.
-fn ack_at_from_request(ack_any: Option<&str>, queue_size: u32) -> u32 {
+/// pvxs `clientmon.cpp:777-808` — derive the ACK-refill threshold `ackAt`
+/// from `record._options.ackAny` and the negotiated `queue_size`.
+///
+/// pvxs's order, which this mirrors exactly:
+///
+/// 1. `if(ackAny.type()==TypeCode::String)` — ONLY a string-STORED value can
+///    take the percent branch, and only in the `"N%"` shape (`size()>1` and a
+///    trailing `%`). The percent must land in `(0, 100]`, else pvxs throws to
+///    its own `catch` and leaves `ackAt` at 0. Note the branch is chosen by
+///    STORAGE, not by how the value happens to render — the port used to strip
+///    a `%` off the displayed text of any value.
+/// 2. `if(ackAt==0) { if(ackAny.as(count)) ackAt = count; }` — the integer
+///    conversion, run for EVERY storage including string. That is `as(uint32)`,
+///    so a string parses BASE 0 (`"0x10"` → 16), a real casts (`Double(3.7)` →
+///    3), and a bool converts (`true` → 1). The port used a decimal-only
+///    `str::parse::<u32>`, which refused all three.
+/// 3. `if(ackAt==0) ackAt = queueSize/2;` then clamp to `[1, queueSize]`.
+///
+/// The distinction between the string that FAILS the percent parse and one
+/// that never had a `%` is invisible in the result: both fall through to step
+/// 2, which re-reads the WHOLE string as an integer (`"50%"` fails that too),
+/// then to the half-window default.
+///
+/// `queue_size` is always `>= 2` here (the caller's `Q > 1` filter and its
+/// `>= 2` fallback), so the clamp cannot invert.
+fn ack_at_from_request(ack_any: Option<&crate::pvdata::ScalarValue>, queue_size: u32) -> u32 {
+    use crate::pvdata::{PvField, ScalarValue, convert};
+
     let mut ack_at: u32 = 0;
-    if let Some(s) = ack_any {
-        if let Some(pct) = s.strip_suffix('%') {
-            if let Ok(percent) = pct.trim().parse::<f64>() {
-                if percent > 0.0 && percent <= 100.0 {
-                    ack_at = (percent / 100.0 * queue_size as f64) as u32;
-                }
+    if let Some(v) = ack_any {
+        // Step 1 — `ackAny.type()==TypeCode::String`, the STORAGE test.
+        if let ScalarValue::String(s) = v {
+            let s = s.as_str_lossy();
+            if s.len() > 1
+                && let Some(pct) = s.strip_suffix('%')
+                && let Ok(percent) = pct.trim().parse::<f64>()
+                && percent > 0.0
+                && percent <= 100.0
+            {
+                ack_at = (percent / 100.0 * queue_size as f64) as u32;
             }
-        } else if let Ok(count) = s.parse::<u32>() {
+        }
+        // Step 2 — `ackAny.as(count)`, the conversion owner, every storage.
+        if ack_at == 0
+            && let Ok(count) = convert::as_u32(&PvField::Scalar(v.clone()))
+        {
             ack_at = count;
         }
     }
+    // Step 3.
     if ack_at == 0 {
         ack_at = queue_size / 2;
     }
@@ -331,12 +400,67 @@ impl Drop for IoidGuard {
 
 // ── GET ────────────────────────────────────────────────────────────────
 
+/// A GET / PUT_GET reply plus the leaves the SERVER marked in it.
+///
+/// A PVA data reply is `changed | value`: the server frames only the
+/// leaves it assigned (`to_wire_valid`, `serverget.cpp:104`), and the
+/// decoder zero-fills the rest. The zero-fill is invisible in the decoded
+/// [`PvField`], so a consumer that must re-publish the reply — a gateway
+/// forwarding an upstream read downstream — has to be told which leaves
+/// were real. `marked` is that fact, in the same dot-path form the server
+/// side uses ([`crate::server_native::source::SourceRead`]); dropping it
+/// and re-framing a full mask would put fabricated zeros on the wire for
+/// leaves the upstream never sent.
+#[derive(Debug, Clone)]
+pub struct MarkedRead {
+    /// Reply introspection (the GET-side descriptor).
+    pub desc: FieldDesc,
+    /// The decoded value.
+    pub value: PvField,
+    /// Field paths the reply's changed-bitset marked, or `None` when the
+    /// root bit (0) was set — the wire's way of saying "the whole
+    /// structure", which needs no per-leaf list.
+    pub marked: Option<Vec<String>>,
+}
+
+/// The changed-leaf paths of a reply bitset. Root bit ⇒ `None` (whole
+/// structure), matching the gateway's monitor-cache decode of the same
+/// wire field.
+fn reply_marks(desc: &FieldDesc, changed: &BitSet) -> Option<Vec<String>> {
+    if changed.get(0) {
+        None
+    } else {
+        Some(crate::pvdata::encode::changed_bitset_paths(desc, changed))
+    }
+}
+
 pub async fn op_get(
     channel: &Arc<Channel>,
     fields: &[&str],
     op_timeout: Duration,
 ) -> PvaResult<(FieldDesc, PvField)> {
+    op_get_inner(channel, fields, None, op_timeout)
+        .await
+        .map(|r| (r.desc, r.value))
+}
+
+/// [`op_get`] keeping the reply's marked leaves — for a caller that
+/// re-frames the value with a changed-bitset of its own (the PVA gateway).
+pub async fn op_get_marked(
+    channel: &Arc<Channel>,
+    fields: &[&str],
+    op_timeout: Duration,
+) -> PvaResult<MarkedRead> {
     op_get_inner(channel, fields, None, op_timeout).await
+}
+
+/// [`op_get_raw`] keeping the reply's marked leaves. See [`MarkedRead`].
+pub async fn op_get_raw_marked(
+    channel: &Arc<Channel>,
+    pv_req: &[u8],
+    op_timeout: Duration,
+) -> PvaResult<MarkedRead> {
+    op_get_inner(channel, &[], Some(pv_req), op_timeout).await
 }
 
 /// `op_get` variant accepting a pre-built pvRequest blob (bytes
@@ -351,7 +475,9 @@ pub async fn op_get_raw(
     pv_req: &[u8],
     op_timeout: Duration,
 ) -> PvaResult<(FieldDesc, PvField)> {
-    op_get_inner(channel, &[], Some(pv_req), op_timeout).await
+    op_get_inner(channel, &[], Some(pv_req), op_timeout)
+        .await
+        .map(|r| (r.desc, r.value))
 }
 
 /// Bound the search-and-connect phase by the operation's overall
@@ -394,7 +520,7 @@ async fn op_get_inner(
     fields: &[&str],
     raw_pv_req: Option<&[u8]>,
     op_timeout: Duration,
-) -> PvaResult<(FieldDesc, PvField)> {
+) -> PvaResult<MarkedRead> {
     let (server, sid) = ensure_active_with_op_timeout(channel, op_timeout).await?;
     let order = server.byte_order();
     let big_endian = matches!(order, ByteOrder::Big);
@@ -415,10 +541,15 @@ async fn op_get_inner(
             // to the cold path which re-establishes the cache.
             let warm_ioid = warm.ioid;
             match try_warm_get(&server, &codec, &warm, op_timeout).await {
-                Ok(Some(pv)) => {
+                Ok(Some((intro, value, changed))) => {
                     // Re-cache so the next call also takes the fast path.
                     *channel.cached_get.lock() = Some(warm);
-                    return Ok(((*pv.0).clone(), pv.1));
+                    let marked = reply_marks(&intro, &changed);
+                    return Ok(MarkedRead {
+                        desc: (*intro).clone(),
+                        value,
+                        marked,
+                    });
                 }
                 Ok(None) | Err(_) => {
                     // warm-GET failure abandoned the cached
@@ -459,17 +590,25 @@ async fn op_get_inner(
     let (rx_init, rx_data) = server.register_ioid_twoshot(sid, ioid, Command::Get.code());
     let mut ioid_guard = IoidGuard::new(server.clone(), ioid);
 
-    // Pipeline: combine INIT + GET frames into a single buffer and
-    // send as one channel message. The writer task writes both in one
-    // TCP write_all (they're contiguous bytes). The server parses them
-    // as two PVA messages by header length. This reduces writer channel
-    // hops from 2 to 1 and guarantees both frames land in the same
-    // TCP segment (no Nagle delay between them).
-    let mut combined = codec.build_get_init(sid, ioid, &pv_req);
-    combined.extend_from_slice(&codec.build_get(sid, ioid));
+    // INIT alone. The EXEC goes out only after the INIT reply lands (below)
+    // — never pipelined into the same write.
+    //
+    // A pvxs server dispatches every complete message in the receive buffer in
+    // ONE pass (`ConnBase::bevRead`, `while(bev && remaining >= 8)`,
+    // conn.cpp:152-153), so two frames in one TCP segment are handled
+    // back-to-back with nothing running between them. If the op's Source has
+    // not connected inline — a gateway, an un-`open()`ed `SharedPV`
+    // (sharedpv.cpp:243) — the op is still `ServerOp::Creating` when the EXEC
+    // is dispatched, and `ServerConn::handle_GPR`'s EXEC branch answers that
+    // with `bev.reset()` (serverget.cpp:429-434): the whole TCP circuit dies,
+    // taking every channel on it, with no MESSAGE and no Status. Sending the
+    // EXEC after the INIT reply makes the race unconstructible — the reply IS
+    // the proof the op left `Creating`. MONITOR already does this (its START
+    // is sent after the INIT reply); GET was the only pipelined op.
+    //
     // Sync send into the unbounded writer queue — no scheduler hop,
     // mirrors CA's `DirectServerWriter::send_frame`.
-    server.send_for_channel_sync(sid, combined)?;
+    server.send_for_channel_sync(sid, codec.build_get_init(sid, ioid, &pv_req))?;
 
     // Receive INIT response
     let init_frame = await_oneshot_frame(rx_init, op_timeout).await?;
@@ -487,30 +626,36 @@ async fn op_get_inner(
     };
     if !init.status.is_success() {
         server.unregister_ioid(ioid);
-        return Err(PvaError::Protocol(format!(
-            "GET INIT failed: {:?}",
-            init.status
-        )));
+        return Err(PvaError::RemoteError(init.status));
     }
     ioid_guard.arm_destroy(sid);
     let intro = init.introspection;
 
-    // Receive DATA response (already sent, just waiting for the reply)
+    // The INIT reply proves the server left `ServerOp::Creating`; only now is
+    // the EXEC legal (see the INIT send above).
+    server.send_for_channel_sync(sid, codec.build_get(sid, ioid))?;
+
+    // Receive DATA response
     let data_frame = await_oneshot_frame(rx_data, op_timeout).await?;
     let intro_arc = Arc::new(intro);
     let result = match decode_op_or_reset(&server, &data_frame, Some(&intro_arc))? {
         OpResponse::Data(d) => {
             if d.status.is_success() {
-                Ok(((*intro_arc).clone(), d.value))
+                let marked = reply_marks(&intro_arc, &d.changed);
+                Ok(MarkedRead {
+                    desc: (*intro_arc).clone(),
+                    value: d.value,
+                    marked,
+                })
             } else {
-                Err(PvaError::Protocol(format!("GET data: {:?}", d.status)))
+                Err(PvaError::RemoteError(d.status))
             }
         }
         // a data-phase failure now arrives as a status-only
         // reply (server echoes the request data subcmd, no bitset/value),
         // so it decodes to OpResponse::Status. Surface the server status
         // instead of mislabelling it "expected GET data, got Status".
-        OpResponse::Status(s) => Err(PvaError::Protocol(format!("GET data: {:?}", s.status))),
+        OpResponse::Status(s) => Err(PvaError::RemoteError(s.status)),
         other => {
             // Wrong response kind for the GET data step == impossible op
             // state → connection-fatal (pvxs clientget.cpp:456-493).
@@ -577,7 +722,7 @@ async fn try_warm_get(
     codec: &PvaCodec,
     warm: &super::channel::CachedGet,
     op_timeout: Duration,
-) -> PvaResult<Option<(Arc<FieldDesc>, PvField)>> {
+) -> PvaResult<Option<(Arc<FieldDesc>, PvField, BitSet)>> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     *warm.slot.lock() = Some(tx);
     let frame = codec.build_get(warm.sid, warm.ioid);
@@ -589,7 +734,7 @@ async fn try_warm_get(
     match decode_op_or_reset(server, &data_frame, Some(&warm.intro))? {
         OpResponse::Data(d) => {
             if d.status.is_success() {
-                Ok(Some((warm.intro.clone(), d.value)))
+                Ok(Some((warm.intro.clone(), d.value, d.changed)))
             } else {
                 // Server rejected — likely lost the binding (channel
                 // close / GC). Caller should retry cold.
@@ -634,10 +779,7 @@ pub async fn op_get_field(
     let frame = frame?;
     let resp = decode_get_field_or_reset(&server, &frame)?;
     if !resp.status.is_success() {
-        return Err(PvaError::Protocol(format!(
-            "GET_FIELD failed: {:?}",
-            resp.status
-        )));
+        return Err(PvaError::RemoteError(resp.status));
     }
     resp.introspection.ok_or_else(|| {
         PvaError::Protocol("GET_FIELD: no introspection in successful response".into())
@@ -772,10 +914,7 @@ pub async fn op_put_field(
     };
     if !init.status.is_success() {
         server.unregister_ioid(ioid);
-        return Err(PvaError::Protocol(format!(
-            "PUT INIT failed: {:?}",
-            init.status
-        )));
+        return Err(PvaError::RemoteError(init.status));
     }
     ioid_guard.arm_destroy(sid);
     let intro = init.introspection;
@@ -811,7 +950,7 @@ pub async fn op_put_field(
             if s.status.is_success() {
                 Ok(())
             } else {
-                Err(PvaError::Protocol(format!("PUT failed: {:?}", s.status)))
+                Err(PvaError::RemoteError(s.status))
             }
         }
         other => {
@@ -952,10 +1091,7 @@ async fn op_put_fields_inner(
     };
     if !init.status.is_success() {
         server.unregister_ioid(ioid);
-        return Err(PvaError::Protocol(format!(
-            "PUT INIT failed: {:?}",
-            init.status
-        )));
+        return Err(PvaError::RemoteError(init.status));
     }
     ioid_guard.arm_destroy(sid);
     let intro = init.introspection;
@@ -984,7 +1120,7 @@ async fn op_put_fields_inner(
             if s.status.is_success() {
                 Ok(())
             } else {
-                Err(PvaError::Protocol(format!("PUT failed: {:?}", s.status)))
+                Err(PvaError::RemoteError(s.status))
             }
         }
         other => {
@@ -1046,10 +1182,7 @@ pub async fn op_put_field_with_request(
     };
     if !init.status.is_success() {
         server.unregister_ioid(ioid);
-        return Err(PvaError::Protocol(format!(
-            "PUT INIT failed: {:?}",
-            init.status
-        )));
+        return Err(PvaError::RemoteError(init.status));
     }
     ioid_guard.arm_destroy(sid);
     let intro = init.introspection;
@@ -1082,7 +1215,7 @@ pub async fn op_put_field_with_request(
             if s.status.is_success() {
                 Ok(())
             } else {
-                Err(PvaError::Protocol(format!("PUT failed: {:?}", s.status)))
+                Err(PvaError::RemoteError(s.status))
             }
         }
         other => {
@@ -1150,10 +1283,7 @@ pub async fn op_put_value_field_with_request(
     };
     if !init.status.is_success() {
         server.unregister_ioid(ioid);
-        return Err(PvaError::Protocol(format!(
-            "PUT INIT failed: {:?}",
-            init.status
-        )));
+        return Err(PvaError::RemoteError(init.status));
     }
     ioid_guard.arm_destroy(sid);
     let intro = init.introspection;
@@ -1194,7 +1324,7 @@ pub async fn op_put_value_field_with_request(
             if s.status.is_success() {
                 Ok(())
             } else {
-                Err(PvaError::Protocol(format!("PUT failed: {:?}", s.status)))
+                Err(PvaError::RemoteError(s.status))
             }
         }
         other => {
@@ -1354,10 +1484,7 @@ pub async fn op_put_value(
         }
     };
     if !init.status.is_success() {
-        return Err(PvaError::Protocol(format!(
-            "PUT INIT failed: {:?}",
-            init.status
-        )));
+        return Err(PvaError::RemoteError(init.status));
     }
     ioid_guard.arm_destroy(sid);
     let intro = init.introspection;
@@ -1392,7 +1519,7 @@ pub async fn op_put_value(
             if s.status.is_success() {
                 Ok(())
             } else {
-                Err(PvaError::Protocol(format!("PUT failed: {:?}", s.status)))
+                Err(PvaError::RemoteError(s.status))
             }
         }
         other => {
@@ -1446,10 +1573,7 @@ pub async fn op_put_value_raw(
         }
     };
     if !init.status.is_success() {
-        return Err(PvaError::Protocol(format!(
-            "PUT INIT failed: {:?}",
-            init.status
-        )));
+        return Err(PvaError::RemoteError(init.status));
     }
     ioid_guard.arm_destroy(sid);
     let intro = init.introspection;
@@ -1481,7 +1605,7 @@ pub async fn op_put_value_raw(
             if s.status.is_success() {
                 Ok(())
             } else {
-                Err(PvaError::Protocol(format!("PUT failed: {:?}", s.status)))
+                Err(PvaError::RemoteError(s.status))
             }
         }
         other => {
@@ -1588,10 +1712,7 @@ where
     };
     if !init.status.is_success() {
         server.unregister_ioid(ioid);
-        return Err(PvaError::Protocol(format!(
-            "PUT INIT failed: {:?}",
-            init.status
-        )));
+        return Err(PvaError::RemoteError(init.status));
     }
     ioid_guard.arm_destroy(sid);
     let intro = init.introspection;
@@ -1652,7 +1773,7 @@ where
             if s.status.is_success() {
                 Ok(())
             } else {
-                Err(PvaError::Protocol(format!("PUT failed: {:?}", s.status)))
+                Err(PvaError::RemoteError(s.status))
             }
         }
         other => {
@@ -2045,13 +2166,26 @@ enum RawMonitorFrameKind {
     /// FINISH (`subcmd & 0x10`) carrying a success Status — clean end of
     /// stream.
     FinishOk,
-    /// A fatal condition: a truncated frame (shorter than `ioid +
-    /// subcmd`), a FINISH whose required Status cannot be decoded, a
-    /// FINISH carrying a non-success Status, a second INIT
-    /// (`subcmd & 0x08`) on a running subscription, or any other subcmd
-    /// a server never emits on a monitor stream. The caller surfaces
-    /// `MonitorEnd::Fatal`.
-    Fatal(PvaError),
+    /// FINISH carrying a success Status AND one last update after it
+    /// (`decode::monitor_finish_body`, pvxs `clientmon.cpp:504-511`). The
+    /// caller forwards `payload[body_start..]` — the same
+    /// `changed | value | overrun` shape a DATA body has — and then ends the
+    /// stream, matching pvxs queueing the update ahead of its `Finished()`
+    /// marker (`clientmon.cpp:692-707`).
+    FinishData { body_start: usize },
+    /// An INVALID MONITOR frame: a truncated frame (shorter than `ioid +
+    /// subcmd`), a FINISH whose required Status cannot be decoded, a second
+    /// INIT (`subcmd & 0x08`) on a running subscription, or any other subcmd
+    /// a server never emits on a monitor stream. pvxs faults the buffer and
+    /// resets the whole circuit for each of these (`clientmon.cpp:601-605`),
+    /// so the caller routes it through [`MonitorTeardown::invalid`].
+    Invalid(PvaError),
+    /// A well-formed FINISH carrying a NON-SUCCESS Status. This is a remote
+    /// error, not a wire fault: pvxs decodes it fine, hands the subscription
+    /// a `RemoteError` and leaves the circuit up (`clientmon.cpp:612-614`).
+    /// Kept apart from [`Self::Invalid`] so the shared teardown owner cannot
+    /// tear down a healthy circuit over an error status.
+    FinishError(PvaError),
 }
 
 /// classify a raw MONITOR stream frame. Mirrors the typed path's
@@ -2062,7 +2196,7 @@ fn classify_raw_monitor_frame(payload: &[u8], order: ByteOrder) -> RawMonitorFra
     // A MONITOR application frame always carries ioid (4) + subcmd (1).
     // A shorter payload is a truncated control frame, not one to skip.
     if payload.len() < 5 {
-        return RawMonitorFrameKind::Fatal(PvaError::Decode(format!(
+        return RawMonitorFrameKind::Invalid(PvaError::Decode(format!(
             "MONITOR frame too short: {} bytes (need >= 5 for ioid+subcmd)",
             payload.len()
         )));
@@ -2074,28 +2208,34 @@ fn classify_raw_monitor_frame(payload: &[u8], order: ByteOrder) -> RawMonitorFra
     // pvxs reads `init = subcmd & 0x08` (clientmon.cpp:479) and gates on it
     // BEFORE the FINISH/data branches: a monitor that is no longer Creating
     // but receives an INIT subcmd is a state-machine violation — the buffer
-    // faults and the connection is reset (clientmon.cpp:589-605). The raw
-    // loop runs only post-START (the monitor is Running), so any INIT here
-    // is fatal, never a skippable control frame. Checked before 0x10 to
+    // faults and pvxs resets the connection (clientmon.cpp:589-605). The raw
+    // loop runs only post-START (the monitor is Running), so any INIT here is
+    // an invalid frame, never a skippable control frame; the caller closes the
+    // circuit through `MonitorTeardown::invalid`. Checked before 0x10 to
     // mirror pvxs's init-first precedence.
     if subcmd & 0x08 != 0 {
-        return RawMonitorFrameKind::Fatal(PvaError::Protocol(format!(
+        return RawMonitorFrameKind::Invalid(PvaError::Protocol(format!(
             "MONITOR INIT (subcmd {subcmd:#04x}) on a running subscription"
         )));
     }
     if subcmd & 0x10 != 0 {
-        // FINISH carries a required Status after the subcmd. A decode
-        // failure must NOT degrade to a clean end-of-stream — that would
-        // hide an upstream protocol error from a forwarding gateway.
-        let mut cur = std::io::Cursor::new(&payload[5..]);
-        return match crate::proto::Status::decode(&mut cur, order) {
-            Ok(st) if st.is_success() => RawMonitorFrameKind::FinishOk,
-            Ok(st) => RawMonitorFrameKind::Fatal(PvaError::Protocol(format!(
-                "MONITOR FINISH with non-success status: {st:?}"
-            ))),
-            Err(e) => RawMonitorFrameKind::Fatal(PvaError::Decode(format!(
-                "MONITOR FINISH status decode failed: {e}"
-            ))),
+        // FINISH carries a required Status after the subcmd, and MAY append a
+        // final update after it. Both questions are answered by the one owner
+        // of the FINISH rule so this loop and the typed decode cannot disagree
+        // about whether a body exists. A Status that cannot be DECODED is a
+        // wire fault (circuit-fatal, like pvxs's `!M.good()`); a Status that
+        // decodes to a non-success value is a remote ERROR carried by a
+        // well-formed frame — pvxs keeps the circuit and hands the
+        // subscription a `RemoteError` (clientmon.cpp:612-614). Neither may
+        // degrade to a clean end-of-stream: that would hide an upstream
+        // protocol error from a forwarding gateway.
+        return match crate::client_native::decode::monitor_finish_body(payload, order) {
+            Ok((st, _)) if !st.is_success() => {
+                RawMonitorFrameKind::FinishError(PvaError::RemoteError(st))
+            }
+            Ok((_, Some(body_start))) => RawMonitorFrameKind::FinishData { body_start },
+            Ok((_, None)) => RawMonitorFrameKind::FinishOk,
+            Err(e) => RawMonitorFrameKind::Invalid(PvaError::Decode(e)),
         };
     }
     // A server emits only DATA (0x00), INIT (0x08), and FINISH (0x10) on a
@@ -2103,9 +2243,10 @@ fn classify_raw_monitor_frame(payload: &[u8], order: ByteOrder) -> RawMonitorFra
     // are client->server only. Any other subcmd from the server is a
     // protocol violation, not a benign control frame: this loop forwards
     // bodies without decoding, so swallowing it would desync the stream and
-    // hide the violation from a forwarding gateway. pvxs decode-faults such
-    // a frame and resets the connection (clientmon.cpp:601-605).
-    RawMonitorFrameKind::Fatal(PvaError::Protocol(format!(
+    // hide the violation from a forwarding gateway. pvxs decode-faults such a
+    // frame and resets the connection (clientmon.cpp:601-605) — the caller
+    // does the same via `MonitorTeardown::invalid`.
+    RawMonitorFrameKind::Invalid(PvaError::Protocol(format!(
         "MONITOR unexpected subcmd {subcmd:#04x} on a running subscription"
     )))
 }
@@ -2223,7 +2364,11 @@ where
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             }
-            Err(MonitorEnd::Fatal(e)) => return Err(e),
+            // Both end the subscription for good — no resubscribe. They differ
+            // only in what already happened to the circuit: `Fatal` closed it
+            // (pvxs `bev.reset()`), `Remote` left it serving its other
+            // channels (pvxs `RemoteError`).
+            Err(MonitorEnd::Fatal(e) | MonitorEnd::Remote(e)) => return Err(e),
         }
     }
 }
@@ -2358,7 +2503,11 @@ where
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 }
-                Err(MonitorEnd::Fatal(e)) => return Err(e),
+                // Both end the subscription for good — no resubscribe. They differ
+                // only in what already happened to the circuit: `Fatal` closed it
+                // (pvxs `bev.reset()`), `Remote` left it serving its other
+                // channels (pvxs `RemoteError`).
+                Err(MonitorEnd::Fatal(e) | MonitorEnd::Remote(e)) => return Err(e),
             }
         }
     });
@@ -2424,43 +2573,46 @@ where
         None => std::borrow::Cow::Owned(build_pv_request_fields(&refs, big_endian)),
     };
     let mut stream = server.register_ioid_stream(sid, ioid, Command::Monitor.code());
+    // Single teardown owner for every exit below (see `MonitorTeardown`).
+    let td = MonitorTeardown {
+        server: &server,
+        ioid,
+        state: state.as_ref(),
+    };
     let init_req =
         codec.build_monitor_init(sid, ioid, &pv_req, flow.pipeline.then_some(flow.queue_size));
     server
         .send_for_channel(sid, init_req)
         .await
-        .map_err(|_| MonitorEnd::ConnectionLost)?;
+        .map_err(|_| td.lost())?;
     // Cancel-aware INIT receive (see `recv_monitor_init`). `active` is not
     // yet published, so a teardown here only unregisters the local IOID
     // and ends ChannelClosed — no DESTROY, matching pvxs `_cancel()` in
     // the Creating phase (clientmon.cpp:810-824).
     let init_frame = match recv_monitor_init(&state, &mut stream).await {
         MonitorInit::Reply(f) => f,
-        MonitorInit::Cancelled => {
-            server.unregister_ioid(ioid);
-            return Err(MonitorEnd::ChannelClosed);
-        }
-        MonitorInit::Lost => return Err(MonitorEnd::ConnectionLost),
+        MonitorInit::Cancelled => return Err(td.cancelled()),
+        MonitorInit::Lost => return Err(td.lost()),
     };
     let init = match decode_op_response(&init_frame, None) {
         Ok(OpResponse::Init(i)) => i,
+        // A reply that is not the INIT this Creating monitor expects is a
+        // state-machine violation: pvxs faults the buffer and resets the
+        // circuit (clientmon.cpp:581-605).
         Ok(other) => {
-            server.unregister_ioid(ioid);
-            return Err(MonitorEnd::Fatal(PvaError::Protocol(format!(
+            return Err(td.invalid(PvaError::Protocol(format!(
                 "expected MONITOR INIT, got {other:?}"
             ))));
         }
-        Err(e) => {
-            server.unregister_ioid(ioid);
-            return Err(MonitorEnd::Fatal(e));
-        }
+        // Decode fault in the INIT body — circuit-fatal, exactly as for the
+        // one-shot ops (`decode_op_or_reset`).
+        Err(e) => return Err(td.invalid(e)),
     };
     if !init.status.is_success() {
-        server.unregister_ioid(ioid);
-        return Err(MonitorEnd::Fatal(PvaError::Protocol(format!(
-            "MONITOR INIT failed: {:?}",
-            init.status
-        ))));
+        // A non-success INIT Status is data, not a wire fault: pvxs sets
+        // `update.exc = RemoteError` and leaves the circuit alive
+        // (clientmon.cpp:612-614).
+        return Err(td.remote(PvaError::RemoteError(init.status)));
     }
     let intro = init.introspection;
     // raw-path Pauser support: honour the handle's prior
@@ -2495,28 +2647,20 @@ where
             // runs through `loop.tryInvoke` (clientmon.cpp:810-824).
             Some(s) => {
                 if s.stop.load(std::sync::atomic::Ordering::Relaxed) {
-                    server.unregister_ioid(ioid);
-                    s.active.lock().take();
-                    return Err(MonitorEnd::ChannelClosed);
+                    return Err(td.cancelled());
                 }
                 tokio::select! {
                     biased;
                     _ = s.cancel.notified() => {
-                        // The teardown owner already took `active` and
-                        // unregistered the IOID; both calls are
-                        // idempotent, repeated here so the no-handle path
-                        // and this path converge on the same cleanup.
-                        server.unregister_ioid(ioid);
-                        s.active.lock().take();
-                        return Err(MonitorEnd::ChannelClosed);
+                        // The handle's teardown may already have taken
+                        // `active` and unregistered the IOID; the owner's
+                        // release is idempotent, so both this path and the
+                        // no-handle path converge on the same cleanup.
+                        return Err(td.cancelled());
                     }
                     f = stream.recv() => match f {
                         Some(f) => f,
-                        None => {
-                            server.unregister_ioid(ioid);
-                            s.active.lock().take();
-                            return Err(MonitorEnd::ConnectionLost);
-                        }
+                        None => return Err(td.lost()),
                     },
                 }
             }
@@ -2524,47 +2668,50 @@ where
             // next frame.
             None => match stream.recv().await {
                 Some(f) => f,
-                None => {
-                    server.unregister_ioid(ioid);
-                    return Err(MonitorEnd::ConnectionLost);
-                }
+                None => return Err(td.lost()),
             },
         };
         // classify the frame through the single control-frame
         // owner. A too-short frame and a FINISH with a missing/malformed
-        // Status are fatal — never silently skipped (`continue`) nor
+        // Status are INVALID — never silently skipped (`continue`) nor
         // degraded to a clean end (`Ok(())`), which would hide upstream
         // protocol corruption from a forwarding gateway.
-        match classify_raw_monitor_frame(&frame.payload, order) {
-            // subcmd 0x00: DATA — fall through to body forwarding below.
-            RawMonitorFrameKind::Data => {}
-            RawMonitorFrameKind::FinishOk => {
-                server.unregister_ioid(ioid);
-                // clear the handle's `active` tuple on FINISH so
-                // a later `pause()` / `resume()` / `drop()` doesn't act on
-                // a (sid, ioid) the client has already unregistered and the
-                // server has already finalised. pvxs `clientmon.cpp:720-729`
-                // treats FINISH as the operation-owner cleanup path:
-                // state→Done, IOID maps erased, no DESTROY sent.
-                if let Some(s) = &state {
-                    s.active.lock().take();
-                }
-                return Ok(());
-            }
-            RawMonitorFrameKind::Fatal(e) => {
-                server.unregister_ioid(ioid);
-                if let Some(s) = &state {
-                    s.active.lock().take();
-                }
-                return Err(MonitorEnd::Fatal(e));
-            }
-        }
-        // Body = payload[5..] = changed | value | overrun (raw).
-        // Wrap in `Bytes` so the broadcast fan-out shares this
-        // allocation refcount-style.
-        let body = bytes::Bytes::copy_from_slice(&frame.payload[5..]);
+        // `body_start` is where this frame's `changed | value | overrun` body
+        // begins; `final_frame` marks the FINISH that ends the stream after it.
+        let (body_start, final_frame) = match classify_raw_monitor_frame(&frame.payload, order) {
+            // subcmd 0x00: DATA — body follows ioid+subcmd directly.
+            RawMonitorFrameKind::Data => (5, false),
+            // FINISH carrying a last update: relay the body, then end — pvxs
+            // queues the update before its `Finished()` marker
+            // (`clientmon.cpp:504-511,692-707`), so a downstream subscriber
+            // must see it rather than have it dropped with the frame.
+            RawMonitorFrameKind::FinishData { body_start } => (body_start, true),
+            // The owner's release clears the handle's `active` tuple on FINISH
+            // so a later `pause()` / `resume()` / `drop()` doesn't act on a
+            // (sid, ioid) the client has already unregistered and the server
+            // has already finalised. pvxs `clientmon.cpp:720-729` treats
+            // FINISH as the operation-owner cleanup path: state→Done, IOID
+            // maps erased, no DESTROY sent.
+            RawMonitorFrameKind::FinishOk => return td.finished(),
+            // Remote error status on a well-formed FINISH — op-local, the
+            // circuit keeps serving its other channels.
+            RawMonitorFrameKind::FinishError(e) => return Err(td.remote(e)),
+            // Invalid MONITOR frame — pvxs `bev.reset()` (clientmon.cpp:601-605).
+            RawMonitorFrameKind::Invalid(e) => return Err(td.invalid(e)),
+        };
+        // Body = changed | value | overrun (raw). Wrap in `Bytes` so the
+        // broadcast fan-out shares this allocation refcount-style.
+        let body = bytes::Bytes::copy_from_slice(&frame.payload[body_start..]);
         callback(&intro, body, order);
         events_since_ack += 1;
+        if final_frame {
+            // The relayed update was this stream's last; finish exactly as the
+            // status-only FINISH above does (no ACK — the op is over).
+            if let Some(s) = &state {
+                s.stats.lock().n_delivered += 1;
+            }
+            return td.finished();
+        }
         if let Some(s) = &state {
             let mut st = s.stats.lock();
             st.n_delivered += 1;
@@ -2583,8 +2730,7 @@ where
         if flow.pipeline && events_since_ack >= flow.ack_at {
             let ack = codec.build_monitor_ack(sid, ioid, events_since_ack);
             if server.send_for_channel(sid, ack).await.is_err() {
-                server.unregister_ioid(ioid);
-                return Err(MonitorEnd::ConnectionLost);
+                return Err(td.lost());
             }
             if let Some(s) = &state {
                 s.stats.lock().n_acks += 1;
@@ -2687,7 +2833,11 @@ where
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             }
-            Err(MonitorEnd::Fatal(e)) => return Err(e),
+            // Both end the subscription for good — no resubscribe. They differ
+            // only in what already happened to the circuit: `Fatal` closed it
+            // (pvxs `bev.reset()`), `Remote` left it serving its other
+            // channels (pvxs `RemoteError`).
+            Err(MonitorEnd::Fatal(e) | MonitorEnd::Remote(e)) => return Err(e),
         }
     }
 }
@@ -2773,7 +2923,11 @@ where
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 }
-                Err(MonitorEnd::Fatal(e)) => return Err(e),
+                // Both end the subscription for good — no resubscribe. They differ
+                // only in what already happened to the circuit: `Fatal` closed it
+                // (pvxs `bev.reset()`), `Remote` left it serving its other
+                // channels (pvxs `RemoteError`).
+                Err(MonitorEnd::Fatal(e) | MonitorEnd::Remote(e)) => return Err(e),
             }
         }
     });
@@ -2873,17 +3027,113 @@ where
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             }
-            Err(MonitorEnd::Fatal(e)) => return Err(e),
+            // Both end the subscription for good — no resubscribe. They differ
+            // only in what already happened to the circuit: `Fatal` closed it
+            // (pvxs `bev.reset()`), `Remote` left it serving its other
+            // channels (pvxs `RemoteError`).
+            Err(MonitorEnd::Fatal(e) | MonitorEnd::Remote(e)) => return Err(e),
         }
     }
 }
 
+/// How a MONITOR loop ended.
+///
+/// pvxs splits monitor failures into two classes and the port must not blur
+/// them:
+///
+/// * A frame that fails to decode, or that violates the subscription state
+///   machine, is a CONNECTION-level protocol violation. pvxs logs "sends
+///   invalid MONITOR.  Disconnecting..." and drops the whole virtual circuit
+///   — `bev.reset()` (`clientmon.cpp:601-605`) — because the frame was
+///   decoded against the connection's shared `rxRegistry` type cache, which a
+///   half-decoded frame may already have mutated. Every other channel on that
+///   circuit dies with it. → [`MonitorEnd::Fatal`].
+/// * A non-success `Status` inside a well-formed reply is *data*, not a
+///   fault: pvxs turns it into a per-subscription `RemoteError`
+///   (`clientmon.cpp:612-614`) and leaves the circuit serving. →
+///   [`MonitorEnd::Remote`].
+///
+/// `Fatal` is constructible only through [`MonitorTeardown::invalid`], so the
+/// invariant *`Fatal` ⟹ the circuit has been closed* holds by construction
+/// rather than by each exit path remembering to close.
 #[derive(Debug)]
 #[allow(dead_code)]
 enum MonitorEnd {
     ChannelClosed,
     ConnectionLost,
+    /// Op-local: the peer reported an error `Status` on a well-formed frame.
+    /// The circuit is intact and still serving its other channels.
+    Remote(PvaError),
+    /// Circuit-fatal: an invalid MONITOR frame closed the virtual circuit
+    /// (pvxs `bev.reset()`).
     Fatal(PvaError),
+}
+
+/// The single teardown owner for one MONITOR subscription.
+///
+/// MUST: every exit from [`run_monitor_loop`] / [`run_raw_monitor_loop`] —
+/// clean end, cancel, connection loss, remote error, invalid frame — passes
+/// through exactly one method here, which unregisters the IOID and drops the
+/// handle's `active` tuple.
+///
+/// MUST NOT: any other site produce a [`MonitorEnd::Fatal`]. Only
+/// [`Self::invalid`] does, and it closes the circuit first — that is what
+/// makes the pvxs `bev.reset()` rule (`clientmon.cpp:601-605`) hold for the
+/// MONITOR loops the way [`decode_op_or_reset`] already holds it for
+/// GET/PUT/RPC/PUT_GET/GET_FIELD/PROCESS.
+struct MonitorTeardown<'a> {
+    server: &'a ServerConn,
+    ioid: u32,
+    state: Option<&'a Arc<SubscriptionState>>,
+}
+
+impl MonitorTeardown<'_> {
+    /// Release this subscription's client-side registrations. Idempotent, and
+    /// a no-op for the `active` tuple before the loop publishes it (the INIT
+    /// phase), matching pvxs `_cancel()` in the `Creating` state
+    /// (`clientmon.cpp:810-824`).
+    fn release(&self) {
+        self.server.unregister_ioid(self.ioid);
+        if let Some(s) = self.state {
+            s.active.lock().take();
+        }
+    }
+
+    /// Clean end of stream (FINISH with a success Status).
+    fn finished(&self) -> Result<(), MonitorEnd> {
+        self.release();
+        Ok(())
+    }
+
+    /// The subscriber cancelled (`stop()` / handle dropped).
+    fn cancelled(&self) -> MonitorEnd {
+        self.release();
+        MonitorEnd::ChannelClosed
+    }
+
+    /// The circuit went away underneath us; the driver re-searches and
+    /// resubscribes.
+    fn lost(&self) -> MonitorEnd {
+        self.release();
+        MonitorEnd::ConnectionLost
+    }
+
+    /// Op-local remote error: a well-formed frame carrying a non-success
+    /// `Status`. pvxs delivers it as a `RemoteError` to this subscription and
+    /// keeps the circuit (`clientmon.cpp:612-614`).
+    fn remote(&self, e: PvaError) -> MonitorEnd {
+        self.release();
+        MonitorEnd::Remote(e)
+    }
+
+    /// Circuit-fatal: an undecodable or out-of-state MONITOR frame. pvxs
+    /// resets the connection (`clientmon.cpp:601-605`); so do we, before
+    /// releasing this subscription.
+    fn invalid(&self, e: PvaError) -> MonitorEnd {
+        self.server.close();
+        self.release();
+        MonitorEnd::Fatal(e)
+    }
 }
 
 /// Resolve a decoded monitor changed `BitSet` to the set of dotted leaf
@@ -2982,6 +3232,12 @@ where
     };
 
     let mut stream = server.register_ioid_stream(sid, ioid, Command::Monitor.code());
+    // Single teardown owner for every exit below (see `MonitorTeardown`).
+    let td = MonitorTeardown {
+        server: &server,
+        ioid,
+        state: state.as_ref(),
+    };
 
     // INIT — the pipeline bit + initial `nack` (credit window) trailer
     // are written iff `flow.pipeline`, carrying the negotiated
@@ -2992,38 +3248,35 @@ where
     server
         .send_for_channel(sid, init_req)
         .await
-        .map_err(|_| MonitorEnd::ConnectionLost)?;
+        .map_err(|_| td.lost())?;
     // Cancel-aware INIT receive (see `recv_monitor_init`). `active` is not
     // yet published, so a teardown here only unregisters the local IOID
     // and ends ChannelClosed — no DESTROY, matching pvxs `_cancel()` in
     // the Creating phase (clientmon.cpp:810-824).
     let init_frame = match recv_monitor_init(&state, &mut stream).await {
         MonitorInit::Reply(f) => f,
-        MonitorInit::Cancelled => {
-            server.unregister_ioid(ioid);
-            return Err(MonitorEnd::ChannelClosed);
-        }
-        MonitorInit::Lost => return Err(MonitorEnd::ConnectionLost),
+        MonitorInit::Cancelled => return Err(td.cancelled()),
+        MonitorInit::Lost => return Err(td.lost()),
     };
     let init = match decode_op_response(&init_frame, None) {
         Ok(OpResponse::Init(i)) => i,
+        // A reply that is not the INIT this Creating monitor expects is a
+        // state-machine violation: pvxs faults the buffer and resets the
+        // circuit (clientmon.cpp:581-605).
         Ok(other) => {
-            server.unregister_ioid(ioid);
-            return Err(MonitorEnd::Fatal(PvaError::Protocol(format!(
+            return Err(td.invalid(PvaError::Protocol(format!(
                 "expected MONITOR INIT, got {other:?}"
             ))));
         }
-        Err(e) => {
-            server.unregister_ioid(ioid);
-            return Err(MonitorEnd::Fatal(e));
-        }
+        // Decode fault in the INIT body — circuit-fatal, exactly as for the
+        // one-shot ops (`decode_op_or_reset`).
+        Err(e) => return Err(td.invalid(e)),
     };
     if !init.status.is_success() {
-        server.unregister_ioid(ioid);
-        return Err(MonitorEnd::Fatal(PvaError::Protocol(format!(
-            "MONITOR INIT failed: {:?}",
-            init.status
-        ))));
+        // A non-success INIT Status is data, not a wire fault: pvxs sets
+        // `update.exc = RemoteError` and leaves the circuit alive
+        // (clientmon.cpp:612-614).
+        return Err(td.remote(PvaError::RemoteError(init.status)));
     }
     let intro = init.introspection;
 
@@ -3065,28 +3318,20 @@ where
             // runs through `loop.tryInvoke` (clientmon.cpp:810-824).
             Some(s) => {
                 if s.stop.load(std::sync::atomic::Ordering::Relaxed) {
-                    server.unregister_ioid(ioid);
-                    s.active.lock().take();
-                    return Err(MonitorEnd::ChannelClosed);
+                    return Err(td.cancelled());
                 }
                 tokio::select! {
                     biased;
                     _ = s.cancel.notified() => {
-                        // The teardown owner already took `active` and
-                        // unregistered the IOID; both calls are
-                        // idempotent, repeated here so the no-handle path
-                        // and this path converge on the same cleanup.
-                        server.unregister_ioid(ioid);
-                        s.active.lock().take();
-                        return Err(MonitorEnd::ChannelClosed);
+                        // The handle's teardown may already have taken
+                        // `active` and unregistered the IOID; the owner's
+                        // release is idempotent, so both this path and the
+                        // no-handle path converge on the same cleanup.
+                        return Err(td.cancelled());
                     }
                     f = stream.recv() => match f {
                         Some(f) => f,
-                        None => {
-                            server.unregister_ioid(ioid);
-                            s.active.lock().take();
-                            return Err(MonitorEnd::ConnectionLost);
-                        }
+                        None => return Err(td.lost()),
                     },
                 }
             }
@@ -3094,10 +3339,7 @@ where
             // next frame.
             None => match stream.recv().await {
                 Some(f) => f,
-                None => {
-                    server.unregister_ioid(ioid);
-                    return Err(MonitorEnd::ConnectionLost);
-                }
+                None => return Err(td.lost()),
             },
         };
         // Decode DATA with no shared cache. The reader side
@@ -3149,11 +3391,19 @@ where
                     }
                 }
                 // (d was destructured above when computing `value`.)
+                // A FINISH frame that carried a trailing update decodes as
+                // DATA with the final bit still set. pvxs queues that update
+                // and then appends the `Finished()` marker
+                // (`clientmon.cpp:504-511,701-707`): the subscriber sees the
+                // last value, then end-of-stream. Deliver-then-end here, with
+                // no ACK — the operation is over.
+                if d.subcmd & 0x10 != 0 {
+                    return td.finished();
+                }
                 if flow.pipeline && events_since_ack >= flow.ack_at {
                     let ack = codec.build_monitor_ack(sid, ioid, events_since_ack);
                     if server.send_for_channel(sid, ack).await.is_err() {
-                        server.unregister_ioid(ioid);
-                        return Err(MonitorEnd::ConnectionLost);
+                        return Err(td.lost());
                     }
                     if let Some(s) = &state {
                         s.stats.lock().n_acks += 1;
@@ -3162,53 +3412,41 @@ where
                 }
             }
             Ok(OpResponse::Status(s)) => {
-                server.unregister_ioid(ioid);
-                if let Some(st) = &state {
-                    st.active.lock().take();
-                }
                 if s.status.is_success() {
-                    return Ok(());
-                } else {
-                    return Err(MonitorEnd::Fatal(PvaError::Protocol(format!(
-                        "MONITOR error: {:?}",
-                        s.status
-                    ))));
+                    return td.finished();
                 }
+                // A non-success Status on a well-formed frame is data, not a
+                // wire fault: pvxs delivers it as a per-subscription
+                // `RemoteError` and keeps the circuit (clientmon.cpp:612-614).
+                return Err(td.remote(PvaError::RemoteError(s.status)));
             }
             Ok(OpResponse::Init(_)) => {
                 // A second INIT while the monitor is already Running is a
                 // state-machine violation. pvxs accepts only Creating+INIT,
-                // Idle+non-INIT, or Running+non-INIT and resets the
-                // connection otherwise (clientmon.cpp:568-605). Surface it
-                // as fatal — matching the raw path, which classifies
-                // unexpected control frames as `RawMonitorFrameKind::Fatal`
-                // — instead of treating the violation as harmless.
-                server.unregister_ioid(ioid);
-                if let Some(s) = &state {
-                    s.active.lock().take();
-                }
-                return Err(MonitorEnd::Fatal(PvaError::Protocol(
+                // Idle+non-INIT, or Running+non-INIT, and resets the
+                // connection otherwise (clientmon.cpp:568-605) — so this goes
+                // through the same `invalid` owner the raw path's
+                // `RawMonitorFrameKind::Invalid` uses, instead of being
+                // treated as harmless.
+                return Err(td.invalid(PvaError::Protocol(
                     "MONITOR: unexpected second INIT on a running subscription".into(),
                 )));
             }
             Err(e) => {
-                // A decode fault on a post-INIT MONITOR frame (truncated
-                // DATA body, missing trailing overrun bitset, malformed
-                // FINISH Status) is a connection-level protocol fault in
-                // pvxs: it logs an invalid MONITOR and resets the
-                // connection (clientmon.cpp:601-605). Surface it as fatal
-                // instead of logging and skipping under the same IOID —
-                // a silent skip also desyncs pipeline ACK accounting (the
-                // skipped frame's credit is never returned), which can
-                // stall a window-limited server. This mirrors the raw
-                // path's `MonitorEnd::Fatal` on a bad classification.
-                server.unregister_ioid(ioid);
-                if let Some(s) = &state {
-                    s.active.lock().take();
-                }
-                return Err(MonitorEnd::Fatal(PvaError::Protocol(format!(
-                    "MONITOR decode error: {e}"
-                ))));
+                // A decode fault on a post-INIT MONITOR frame (truncated DATA
+                // body, missing trailing overrun bitset, malformed FINISH
+                // Status) is a CONNECTION-level protocol fault: pvxs logs
+                // "sends invalid MONITOR.  Disconnecting..." and drops the
+                // circuit — `bev.reset()` (clientmon.cpp:601-605). The frame
+                // was decoded against the connection's shared reader type
+                // cache, so a half-decoded frame can leave that cache
+                // mutated; ending only THIS subscription would leave the
+                // circuit serving its other channels from it. Route it
+                // through the teardown owner, which closes the circuit first.
+                // (Ending only the subscription also desyncs pipeline ACK
+                // accounting — the skipped frame's credit is never returned,
+                // stalling a window-limited server.)
+                return Err(td.invalid(PvaError::Protocol(format!("MONITOR decode error: {e}"))));
             }
         }
     }
@@ -3259,7 +3497,7 @@ pub async fn op_rpc(
     request_value: &PvField,
     arg: RpcArg<'_>,
     op_timeout: Duration,
-) -> PvaResult<(FieldDesc, PvField)> {
+) -> PvaResult<RpcReply> {
     let (server, sid) = ensure_active_with_op_timeout(channel, op_timeout).await?;
     let order = server.byte_order();
     let big_endian = matches!(order, ByteOrder::Big);
@@ -3301,10 +3539,7 @@ pub async fn op_rpc(
     };
     if !init_resp.status.is_success() {
         server.unregister_ioid(ioid);
-        return Err(PvaError::Protocol(format!(
-            "RPC INIT: {:?}",
-            init_resp.status
-        )));
+        return Err(PvaError::RemoteError(init_resp.status));
     }
     ioid_guard.arm_destroy(sid);
     let response_intro = init_resp.introspection;
@@ -3331,13 +3566,20 @@ pub async fn op_rpc(
     let result = match decode_op_or_reset(&server, &resp_frame, None)? {
         OpResponse::Data(d) => {
             if d.status.is_success() {
-                let desc = d.response_desc.unwrap_or(FieldDesc::Variant);
-                Ok((desc, d.value))
+                // An RPC DATA response carries its own type descriptor, so
+                // `response_desc == None` here means the server sent the NULL
+                // (`0xFF`) type code — pvxs's no-argument `ExecOp::reply()`,
+                // which its client decodes to an empty `Value`
+                // (`clientget.cpp:415-421`).
+                Ok(match d.response_desc {
+                    Some(desc) => RpcReply::Value(desc, d.value),
+                    None => RpcReply::Empty,
+                })
             } else {
-                Err(PvaError::Protocol(format!("RPC: {:?}", d.status)))
+                Err(PvaError::RemoteError(d.status))
             }
         }
-        OpResponse::Status(s) => Err(PvaError::Protocol(format!("RPC: {:?}", s.status))),
+        OpResponse::Status(s) => Err(PvaError::RemoteError(s.status)),
         other => {
             // Wrong response kind for the RPC data step == impossible op
             // state → connection-fatal (pvxs clientget.cpp:456-493).
@@ -3377,7 +3619,9 @@ pub async fn op_put_get(
     op_timeout: Duration,
 ) -> PvaResult<(FieldDesc, PvField)> {
     // Default putGet (data subcmd 0x00): write `value_str`, then read back.
-    op_put_get_data(channel, 0x00, None, PutGetPut::Str(value_str), op_timeout).await
+    op_put_get_data(channel, 0x00, None, PutGetPut::Str(value_str), op_timeout)
+        .await
+        .map(|r| (r.desc, r.value))
 }
 
 /// Atomic `PUT_GET` (cmd 12) writing a typed [`PvField`] with the default
@@ -3389,6 +3633,18 @@ pub async fn op_put_get_value(
     value: &PvField,
     op_timeout: Duration,
 ) -> PvaResult<(FieldDesc, PvField)> {
+    op_put_get_data(channel, 0x00, None, PutGetPut::Typed(value), op_timeout)
+        .await
+        .map(|r| (r.desc, r.value))
+}
+
+/// [`op_put_get_value`] keeping the readback's marked leaves. See
+/// [`MarkedRead`].
+pub async fn op_put_get_value_marked(
+    channel: &Arc<Channel>,
+    value: &PvField,
+    op_timeout: Duration,
+) -> PvaResult<MarkedRead> {
     op_put_get_data(channel, 0x00, None, PutGetPut::Typed(value), op_timeout).await
 }
 
@@ -3409,6 +3665,19 @@ pub async fn op_put_get_value_raw(
     value: &PvField,
     op_timeout: Duration,
 ) -> PvaResult<(FieldDesc, PvField)> {
+    op_put_get_value_raw_marked(channel, pv_req, value, op_timeout)
+        .await
+        .map(|r| (r.desc, r.value))
+}
+
+/// [`op_put_get_value_raw`] keeping the readback's marked leaves. See
+/// [`MarkedRead`].
+pub async fn op_put_get_value_raw_marked(
+    channel: &Arc<Channel>,
+    pv_req: &[u8],
+    value: &PvField,
+    op_timeout: Duration,
+) -> PvaResult<MarkedRead> {
     op_put_get_data(
         channel,
         0x00,
@@ -3427,7 +3696,9 @@ pub async fn op_get_get(
     channel: &Arc<Channel>,
     op_timeout: Duration,
 ) -> PvaResult<(FieldDesc, PvField)> {
-    op_put_get_data(channel, QosFlags::GET, None, PutGetPut::None, op_timeout).await
+    op_put_get_data(channel, QosFlags::GET, None, PutGetPut::None, op_timeout)
+        .await
+        .map(|r| (r.desc, r.value))
 }
 
 /// EPICS ChannelPutGet `getPut` (`QOS_GET_PUT`, 0x80): read the current
@@ -3444,6 +3715,7 @@ pub async fn op_get_put(
         op_timeout,
     )
     .await
+    .map(|r| (r.desc, r.value))
 }
 
 /// [`op_get_get`] carrying a caller-supplied pvRequest. The INIT pvRequest
@@ -3466,6 +3738,7 @@ pub async fn op_get_get_with_request(
         op_timeout,
     )
     .await
+    .map(|r| (r.desc, r.value))
 }
 
 /// [`op_get_put`] carrying a caller-supplied pvRequest. The INIT pvRequest
@@ -3486,6 +3759,7 @@ pub async fn op_get_put_with_request(
         op_timeout,
     )
     .await
+    .map(|r| (r.desc, r.value))
 }
 
 /// The put leg of a [`op_put_get_data`] round trip. The read-only
@@ -3513,7 +3787,7 @@ async fn op_put_get_data(
     req: Option<&[u8]>,
     put: PutGetPut<'_>,
     op_timeout: Duration,
-) -> PvaResult<(FieldDesc, PvField)> {
+) -> PvaResult<MarkedRead> {
     let (server, sid) = ensure_active_with_op_timeout(channel, op_timeout).await?;
     let order = server.byte_order();
     let big_endian = matches!(order, ByteOrder::Big);
@@ -3563,9 +3837,7 @@ async fn op_put_get_data(
         Ok(Ok(descs)) => descs,
         Ok(Err(status)) => {
             server.unregister_ioid(ioid);
-            return Err(PvaError::Protocol(format!(
-                "PUT_GET INIT failed: {status:?}"
-            )));
+            return Err(PvaError::RemoteError(status));
         }
         Err(e) => {
             // Command/subcommand mismatch or truncated INIT body is fatal.
@@ -3614,8 +3886,8 @@ async fn op_put_get_data(
     let result = {
         let resp_desc = if is_get_put { &put_if } else { &get_if };
         match decode_put_get_data(&resp_frame, resp_desc, &mut cache) {
-            Ok(Ok(value)) => Ok(value),
-            Ok(Err(status)) => Err(PvaError::Protocol(format!("PUT_GET: {status:?}"))),
+            Ok(Ok(decoded)) => Ok(decoded),
+            Ok(Err(status)) => Err(PvaError::RemoteError(status)),
             Err(e) => {
                 // Command mismatch or truncated data body is fatal.
                 server.close();
@@ -3629,7 +3901,14 @@ async fn op_put_get_data(
     let _ = server.send_for_channel(sid, destroy).await;
     server.unregister_ioid(ioid);
     let resp_desc = if is_get_put { put_if } else { get_if };
-    result.map(|v| (resp_desc, v))
+    result.map(|(changed, value)| {
+        let marked = reply_marks(&resp_desc, &changed);
+        MarkedRead {
+            desc: resp_desc,
+            value,
+            marked,
+        }
+    })
 }
 
 /// Decode a `PUT_GET` INIT response: `ioid + subcmd + status + putIF +
@@ -3695,7 +3974,7 @@ fn decode_put_get_data(
     frame: &super::decode::Frame,
     intro: &FieldDesc,
     type_cache: &mut crate::pvdata::encode::TypeCache,
-) -> PvaResult<Result<PvField, crate::proto::Status>> {
+) -> PvaResult<Result<(BitSet, PvField), crate::proto::Status>> {
     if frame.header.command != Command::PutGet.code() {
         return Err(PvaError::Protocol(format!(
             "expected PUT_GET data, got command {}",
@@ -3718,7 +3997,7 @@ fn decode_put_get_data(
         intro, &changed, 0, &mut cur, order, type_cache,
     )
     .map_err(|e| PvaError::Decode(e.to_string()))?;
-    Ok(Ok(value))
+    Ok(Ok((changed, value)))
 }
 
 // ── ARRAY (cmd 14) — ChannelArray windowed-array operation ──────────────
@@ -3814,7 +4093,7 @@ async fn op_array_data(
         Ok(Ok(desc)) => desc,
         Ok(Err(status)) => {
             server.unregister_ioid(ioid);
-            return Err(PvaError::Protocol(format!("ARRAY INIT failed: {status:?}")));
+            return Err(PvaError::RemoteError(status));
         }
         Err(e) => {
             server.close();
@@ -3868,7 +4147,7 @@ async fn op_array_data(
     let resp_frame = await_frame(&mut stream, op_timeout).await?;
     let result = match decode_array_data(&resp_frame, &req, &array_desc, &mut cache) {
         Ok(Ok(resp)) => Ok(resp),
-        Ok(Err(status)) => Err(PvaError::Protocol(format!("ARRAY: {status:?}"))),
+        Ok(Err(status)) => Err(PvaError::RemoteError(status)),
         Err(e) => {
             server.close();
             Err(e)
@@ -4093,7 +4372,7 @@ pub async fn op_array_describe(
         Ok(Ok(desc)) => desc,
         Ok(Err(status)) => {
             server.unregister_ioid(ioid);
-            return Err(PvaError::Protocol(format!("ARRAY INIT failed: {status:?}")));
+            return Err(PvaError::RemoteError(status));
         }
         Err(e) => {
             server.close();
@@ -6713,29 +6992,29 @@ mod tests {
     // `ioid + subcmd` was skipped (`continue`), and a FINISH whose
     // required Status failed to decode fell through to a clean `Ok(())`
     // end-of-stream. `classify_raw_monitor_frame` is the single owner of
-    // that policy; both malformed cases must be `Fatal`.
+    // that policy; both malformed cases must be `Invalid` (circuit-fatal).
 
     #[test]
-    fn bfr11_too_short_frame_is_fatal_decode() {
+    fn bfr11_too_short_frame_is_invalid_decode() {
         // < 5 bytes: no room for ioid (4) + subcmd (1).
         match classify_raw_monitor_frame(&[0, 0, 0], ByteOrder::Little) {
-            RawMonitorFrameKind::Fatal(PvaError::Decode(msg)) => {
+            RawMonitorFrameKind::Invalid(PvaError::Decode(msg)) => {
                 assert!(msg.contains("too short"), "msg: {msg}");
             }
-            other => panic!("too-short frame must be Fatal(Decode), got {other:?}"),
+            other => panic!("too-short frame must be Invalid(Decode), got {other:?}"),
         }
     }
 
     #[test]
-    fn bfr11_finish_truncated_status_is_fatal_decode() {
+    fn bfr11_finish_truncated_status_is_invalid_decode() {
         // subcmd 0x10 (FINISH) but NO status bytes after it → the
         // required Status cannot decode.
         let payload = [0u8, 0, 0, 0, 0x10];
         match classify_raw_monitor_frame(&payload, ByteOrder::Little) {
-            RawMonitorFrameKind::Fatal(PvaError::Decode(msg)) => {
+            RawMonitorFrameKind::Invalid(PvaError::Decode(msg)) => {
                 assert!(msg.contains("FINISH status"), "msg: {msg}");
             }
-            other => panic!("truncated FINISH status must be Fatal(Decode), got {other:?}"),
+            other => panic!("truncated FINISH status must be Invalid(Decode), got {other:?}"),
         }
     }
 
@@ -6749,15 +7028,56 @@ mod tests {
         ));
     }
 
+    /// R6-35: a FINISH frame whose Status is followed by more bytes carries one
+    /// last monitor update. pvxs decodes it (`clientmon.cpp:504-511`:
+    /// `else if(!final || !M.empty())`) and queues it before the `Finished()`
+    /// marker, so the raw-forwarding loop must relay that body downstream
+    /// instead of dropping the frame as a bare end-of-stream.
     #[test]
-    fn bfr11_finish_error_status_is_fatal_protocol() {
+    fn finish_with_a_trailing_update_carries_a_body() {
+        let mut payload = vec![0u8, 0, 0, 0, 0x10];
+        crate::proto::Status::ok().write_into(ByteOrder::Little, &mut payload);
+        let status_end = payload.len();
+        // changed | value | overrun — opaque to this loop, relayed verbatim.
+        payload.extend_from_slice(&[0x01, 0x02, 0x2a, 0x00]);
+        match classify_raw_monitor_frame(&payload, ByteOrder::Little) {
+            RawMonitorFrameKind::FinishData { body_start } => {
+                assert_eq!(body_start, status_end);
+                assert_eq!(&payload[body_start..], &[0x01, 0x02, 0x2a, 0x00]);
+            }
+            other => panic!("FINISH with a trailing update must be FinishData, got {other:?}"),
+        }
+    }
+
+    /// The boundary either side of it: a FINISH with NOTHING after the Status is
+    /// still the plain end-of-stream, not a zero-length body.
+    #[test]
+    fn finish_with_no_trailing_bytes_stays_a_clean_end() {
+        let mut payload = vec![0u8, 0, 0, 0, 0x10];
+        crate::proto::Status::ok().write_into(ByteOrder::Little, &mut payload);
+        assert!(matches!(
+            classify_raw_monitor_frame(&payload, ByteOrder::Little),
+            RawMonitorFrameKind::FinishOk
+        ));
+    }
+
+    /// A FINISH whose Status DECODES but reports an error is a remote error on
+    /// a well-formed frame, not a wire fault: pvxs hands the subscription a
+    /// `RemoteError` and leaves the circuit up (clientmon.cpp:612-614). It must
+    /// classify as `FinishError`, NOT `Invalid` — an `Invalid` here would take
+    /// the whole circuit (and every other channel on it) down over one
+    /// subscription's error status.
+    #[test]
+    fn bfr11_finish_error_status_is_op_local_finish_error() {
         let mut payload = vec![0u8, 0, 0, 0, 0x10];
         crate::proto::Status::error("boom".to_string()).write_into(ByteOrder::Little, &mut payload);
         match classify_raw_monitor_frame(&payload, ByteOrder::Little) {
-            RawMonitorFrameKind::Fatal(PvaError::Protocol(msg)) => {
-                assert!(msg.contains("non-success"), "msg: {msg}");
+            // The peer's own Status, not a rendering of it — a forwarding
+            // gateway sends it downstream unchanged (R18-27).
+            RawMonitorFrameKind::FinishError(PvaError::RemoteError(st)) => {
+                assert_eq!(st, crate::proto::Status::error("boom".to_string()));
             }
-            other => panic!("non-success FINISH must be Fatal(Protocol), got {other:?}"),
+            other => panic!("non-success FINISH must be FinishError, got {other:?}"),
         }
     }
 
@@ -6775,17 +7095,17 @@ mod tests {
     /// (`subcmd & 0x08`) on a running raw monitor is a state-machine
     /// violation: pvxs faults the buffer and resets the connection
     /// (clientmon.cpp:589-605). The classifier must surface it as
-    /// `Fatal`, never swallow it as a benign skipped control frame.
+    /// `Invalid`, never swallow it as a benign skipped control frame.
     #[test]
-    fn raw_monitor_second_init_is_fatal_protocol() {
+    fn raw_monitor_second_init_is_invalid_protocol() {
         // subcmd 0x08 (INIT) with a trailing body (Status + descriptor
         // shape) — irrelevant, since the frame is rejected on the subcmd.
         let payload = [0u8, 0, 0, 0, 0x08, 0xff, 0x00];
         match classify_raw_monitor_frame(&payload, ByteOrder::Little) {
-            RawMonitorFrameKind::Fatal(PvaError::Protocol(msg)) => {
+            RawMonitorFrameKind::Invalid(PvaError::Protocol(msg)) => {
                 assert!(msg.contains("INIT"), "msg: {msg}");
             }
-            other => panic!("second INIT must be Fatal(Protocol), got {other:?}"),
+            other => panic!("second INIT must be Invalid(Protocol), got {other:?}"),
         }
     }
 
@@ -6796,15 +7116,15 @@ mod tests {
     /// subcmd as a benign skip — it is a protocol violation, matching
     /// pvxs's decode-fault + reset on an out-of-state monitor frame.
     #[test]
-    fn raw_monitor_unexpected_subcmd_is_fatal_protocol() {
+    fn raw_monitor_unexpected_subcmd_is_invalid_protocol() {
         // subcmd 0x04 (STOP) is a client->server control byte; a server
         // never sends it on the monitor stream.
         let payload = [0u8, 0, 0, 0, 0x04];
         match classify_raw_monitor_frame(&payload, ByteOrder::Little) {
-            RawMonitorFrameKind::Fatal(PvaError::Protocol(msg)) => {
+            RawMonitorFrameKind::Invalid(PvaError::Protocol(msg)) => {
                 assert!(msg.contains("unexpected subcmd"), "msg: {msg}");
             }
-            other => panic!("unexpected subcmd must be Fatal(Protocol), got {other:?}"),
+            other => panic!("unexpected subcmd must be Invalid(Protocol), got {other:?}"),
         }
     }
 
@@ -6857,17 +7177,20 @@ mod tests {
         assert_eq!(f.queue_size, 2);
         assert_eq!(f.ack_at, 1);
 
-        // pipeline=false → no window, no ACK, no trailer regardless of
-        // the builder default being nonzero.
+        // pipeline=false → no trailer and no ACK, but the queue depth is
+        // still resolved: pvxs's `queueSize` block sits outside any pipeline
+        // gate (clientmon.cpp:763-773) and its value is what `stats()` reports
+        // as `limitQueue` (:152). R10-35 — this used to answer 0.
         let f = MonitorFlow::from_record_options(&opts(&[("pipeline", "false")]), 4);
         assert!(!f.pipeline);
-        assert_eq!(f.queue_size, 0);
-        assert_eq!(f.ack_at, 0);
+        assert_eq!(f.queue_size, 4, "the builder default depth still stands");
 
-        // No pipeline option at all → pvxs default false.
+        // No pipeline option at all → pvxs default false, and an explicit
+        // queueSize is STILL honored (it is the client's queue depth, and it
+        // travels in the pvRequest as the server's squash depth).
         let f = MonitorFlow::from_record_options(&opts(&[("queueSize", "16")]), 4);
         assert!(!f.pipeline);
-        assert_eq!(f.queue_size, 0);
+        assert_eq!(f.queue_size, 16);
 
         // pipeline=true, no queueSize → builder default window.
         let f = MonitorFlow::from_record_options(&opts(&[("pipeline", "true")]), 8);
@@ -6958,7 +7281,9 @@ mod tests {
     /// A forwarded plain monitor request (no `record._options`) must
     /// extract nothing and derive a plain (non-pipeline) flow — pvxs
     /// servers enable pipeline only from the pvRequest, so the client must
-    /// not send a `nack` trailer / ACKs the server would ignore.
+    /// not send a `nack` trailer / ACKs the server would ignore. The queue
+    /// depth is still the caller's default (pvxs `SubscriptionImpl` seeds
+    /// `queueSize=4` and only `pipeline` gates the trailer).
     #[test]
     fn record_options_from_request_plain_request_yields_no_pipeline() {
         let req = PvField::Structure(crate::pvdata::PvStructure {
@@ -6968,14 +7293,15 @@ mod tests {
         assert!(record_options_from_request(&req).is_empty());
         let flow = MonitorFlow::from_record_options(&record_options_from_request(&req), 4);
         assert!(!flow.pipeline);
-        assert_eq!(flow.queue_size, 0);
-        assert_eq!(flow.ack_at, 0);
+        assert_eq!(flow.queue_size, 4);
     }
 
     /// A forwarded request naming `queueSize` but NOT `pipeline` must stay
     /// plain (pvxs `clientmon.cpp` defaults `pipeline` false): the gateway
     /// forwarding such a request opens a plain upstream monitor, not a
-    /// pipelined one driven by the client's builder default.
+    /// pipelined one driven by the client's builder default. The depth it
+    /// asks for is still honored — `queueSize` is parsed outside the
+    /// `pipeline` gate in pvxs (clientmon.cpp:763-773).
     #[test]
     fn record_options_queue_size_without_pipeline_stays_plain() {
         let req = pv_request_with_options(&[("queueSize", PvField::Scalar(ScalarValue::UInt(16)))]);
@@ -6983,7 +7309,87 @@ mod tests {
         assert_eq!(extracted.len(), 1);
         let flow = MonitorFlow::from_record_options(&extracted, 4);
         assert!(!flow.pipeline);
-        assert_eq!(flow.queue_size, 0);
+        assert_eq!(flow.queue_size, 16);
+    }
+
+    /// R10-35 — the option values are CONVERTED (pvxs `Value::as<T>()`), not
+    /// string-matched against a display-normalized rendering. Each case here
+    /// fails on the pre-fix parser, which compared `v.to_string()` to the
+    /// literals `"true"`/`"1"` and ran `str::parse::<u32>()`.
+    #[test]
+    fn record_options_convert_like_pvxs_value_as() {
+        // `pipeline` goes through `as(bool)`: any non-zero integer or real is
+        // true. The old parser saw "2"/"-1"/"0.5" and answered false.
+        for truthy in [
+            ScalarValue::Int(2),
+            ScalarValue::Int(-1),
+            ScalarValue::Double(0.5),
+            ScalarValue::UByte(7),
+        ] {
+            let req = pv_request_with_options(&[("pipeline", PvField::Scalar(truthy.clone()))]);
+            let flow = MonitorFlow::from_record_options(&record_options_from_request(&req), 4);
+            assert!(flow.pipeline, "{truthy:?} must convert to pipeline=true");
+        }
+        // ... and a zero of any storage is false (negative control).
+        for falsy in [ScalarValue::Int(0), ScalarValue::Double(0.0)] {
+            let req = pv_request_with_options(&[("pipeline", PvField::Scalar(falsy.clone()))]);
+            let flow = MonitorFlow::from_record_options(&record_options_from_request(&req), 4);
+            assert!(!flow.pipeline, "{falsy:?} must convert to pipeline=false");
+        }
+
+        // `queueSize` goes through `as(uint32)`: strings are base-0 (so `0x10`
+        // is 16, matching `stoull(s, &idx, 0)`), and reals truncate.
+        let req = pv_request_with_options(&[(
+            "queueSize",
+            PvField::Scalar(ScalarValue::String("0x10".into())),
+        )]);
+        let flow = MonitorFlow::from_record_options(&record_options_from_request(&req), 4);
+        assert_eq!(flow.queue_size, 16, "string queueSize is base-0 like pvxs");
+
+        let req =
+            pv_request_with_options(&[("queueSize", PvField::Scalar(ScalarValue::Double(8.5)))]);
+        let flow = MonitorFlow::from_record_options(&record_options_from_request(&req), 4);
+        assert_eq!(flow.queue_size, 8, "real queueSize truncates like a C cast");
+
+        // An unconvertible `queueSize` falls back to the caller's default —
+        // pvxs's `catch(std::exception&)` around the conversion (:769-772).
+        let req = pv_request_with_options(&[(
+            "queueSize",
+            PvField::Scalar(ScalarValue::String("garbage".into())),
+        )]);
+        let flow = MonitorFlow::from_record_options(&record_options_from_request(&req), 4);
+        assert_eq!(flow.queue_size, 4);
+
+        // `ackAny` percent syntax applies ONLY to String storage
+        // (clientmon.cpp:783 checks `ackAny.type()==TypeCode::String` first);
+        // every other storage is an absolute count via `as(uint32)`.
+        let req = pv_request_with_options(&[
+            ("queueSize", PvField::Scalar(ScalarValue::UInt(16))),
+            ("ackAny", PvField::Scalar(ScalarValue::UInt(2))),
+        ]);
+        let flow = MonitorFlow::from_record_options(&record_options_from_request(&req), 4);
+        assert_eq!(flow.ack_at, 2);
+
+        // A typed real ackAny converts too — the old parser only handled a
+        // decimal string.
+        let req = pv_request_with_options(&[
+            ("queueSize", PvField::Scalar(ScalarValue::UInt(16))),
+            ("ackAny", PvField::Scalar(ScalarValue::Double(3.0))),
+        ]);
+        let flow = MonitorFlow::from_record_options(&record_options_from_request(&req), 4);
+        assert_eq!(flow.ack_at, 3);
+
+        // Unconvertible `ackAny` → pvxs's `ackAt = queueSize/2` fallback,
+        // clamped into [1, queueSize].
+        let req = pv_request_with_options(&[
+            ("queueSize", PvField::Scalar(ScalarValue::UInt(16))),
+            (
+                "ackAny",
+                PvField::Scalar(ScalarValue::String("junk".into())),
+            ),
+        ]);
+        let flow = MonitorFlow::from_record_options(&record_options_from_request(&req), 4);
+        assert_eq!(flow.ack_at, 8);
     }
 
     fn idle_sub_state() -> Arc<SubscriptionState> {

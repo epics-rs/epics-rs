@@ -2,7 +2,8 @@
 //!
 //! Corresponds to C++ QSRV's `pvif.h/pvif.cpp` (ScalarBuilder, etc.).
 
-use epics_base_rs::server::snapshot::{ControlInfo, DisplayInfo, Snapshot};
+use epics_base_rs::server::recgbl::EventMask;
+use epics_base_rs::server::snapshot::{ControlInfo, DisplayInfo, PropertySupport, Snapshot};
 use epics_base_rs::types::{EpicsValue, PvString, WallTime};
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
 
@@ -46,6 +47,356 @@ impl FieldMapping {
             FieldMapping::Const => "const",
         }
     }
+
+    /// True iff a client PUT of this member carries a leaf the server
+    /// writes to the database. pvxs `IOCSource::put` (iocsource.cpp:
+    /// 576-598) writes for `Scalar` / `Plain` / `Any`, and returns without
+    /// writing for `Meta`, `Proc`, `Structure` (explicitly "can't write")
+    /// and `Const` (the value comes from the group config, never the
+    /// client). `Proc` is separately routed to record processing by the
+    /// group PUT path.
+    pub fn is_client_writable(self) -> bool {
+        matches!(
+            self,
+            FieldMapping::Scalar | FieldMapping::Plain | FieldMapping::Any
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DBE event class -> wire leaves (pvxs `IOCSource::get`)
+// ---------------------------------------------------------------------------
+
+/// The leaves a DBE_PROPERTY event marks on a Scalar mapping — exactly the
+/// fields pvxs `getProperties` (`pvxs/ioc/iocsource.cpp:252-310`) assigns,
+/// each under the `DBR_*` option bit that SURVIVED `dbChannelGet`:
+///
+/// * `display.units` (`DBR_UNITS`),
+/// * `value.choices` (`DBR_ENUM_STRS`, enum mappings only),
+/// * `display.limitLow` / `display.limitHigh` (`DBR_GR_DOUBLE`) and
+///   `display.precision` (`DBR_PRECISION`),
+/// * `control.limitLow` / `control.limitHigh` (`DBR_CTRL_DOUBLE`),
+/// * `valueAlarm.{low,high}{Alarm,Warning}Limit` (`DBR_AL_DOUBLE`),
+/// * `display.description` (unconditional — `iocsource.cpp:307-310`).
+///
+/// `getProperties` asks for all six and `dbChannelGet` clears the bit of
+/// every property the record's rset does not supply (`dbAccess.c:336-430`),
+/// so the surviving set is exactly [`PropertySupport`] — the mask the DB
+/// layer stamps onto every [`Snapshot`]. That mask is this function's only
+/// argument: a leaf the record type does not supply is never marked, so the
+/// fabricated default the port builds into the value (a `longout`'s
+/// `display.precision = 0`, a `waveform`'s `valueAlarm` bands at zero)
+/// reaches no client — pvxs leaves the same leaves unassigned in its
+/// `cloneEmpty()`.
+///
+/// `getProperties` assigns **none** of `display.form`, `control.minStep`,
+/// `valueAlarm.active`, the four `valueAlarm.*Severity` fields, or
+/// `valueAlarm.hysteresis`, even though the port's NT carries them (as
+/// hardcoded zeros / `false`). Naming the parent structures `display` /
+/// `control` / `valueAlarm` here would mark those extra leaves as freshly
+/// changed on every property event, so pvxs's leaf list is spelled out.
+///
+/// A path that the concrete descriptor does not have (e.g.
+/// `display.precision` on a string NT, or `value.choices` on a plain
+/// scalar) simply matches no bit in `marked_changed_bitset` — the same
+/// no-op as `getProperties`'s `if(auto x = node["…"])` guard.
+fn property_leaves(props: PropertySupport) -> Vec<&'static str> {
+    let mut leaves = Vec::new();
+    if props.units {
+        leaves.push("display.units");
+    }
+    if props.enum_strs {
+        leaves.push("value.choices");
+    }
+    if props.graphic_double {
+        leaves.push("display.limitLow");
+        leaves.push("display.limitHigh");
+        // pvxs nests the precision assignment INSIDE the `DBR_GR_DOUBLE`
+        // branch (`iocsource.cpp:288-291`), so a record type that supplies
+        // precision but no graphic limits assigns neither.
+        if props.precision {
+            leaves.push("display.precision");
+        }
+    }
+    if props.control_double {
+        leaves.push("control.limitLow");
+        leaves.push("control.limitHigh");
+    }
+    if props.alarm_double {
+        leaves.push("valueAlarm.lowAlarmLimit");
+        leaves.push("valueAlarm.lowWarningLimit");
+        leaves.push("valueAlarm.highWarningLimit");
+        leaves.push("valueAlarm.highAlarmLimit");
+    }
+    // Unconditional — pvxs assigns DESC with no option gate at all
+    // ("cheating at the moment. DESC is not marked DBE_PROPERTY",
+    // `iocsource.cpp:307-310`).
+    leaves.push("display.description");
+    leaves
+}
+
+/// The wire leaves one mapping contributes for one DBE change mask, as
+/// field-path suffixes relative to the mapped node (`""` = the node
+/// itself, for value-only mappings that carry no metadata sub-structure).
+///
+/// This is the single owner of pvxs `IOCSource::get`'s per-`UpdateType`
+/// assignment (`ioc/iocsource.cpp:312-352`) — the ONLY place that decides
+/// which leaves a DB event marks. Both QSRV monitor sources consume it:
+/// the group monitor per triggered member, and the single-record monitor
+/// at the root of its NT (empty prefix).
+///
+/// * properties iff `change & Property` — `getProperties`
+///   (`iocsource.cpp:252-310`) is gated on `info.type == Scalar`, so only
+///   Scalar mappings carry property leaves. It assigns exactly
+///   [`property_leaves`]: the whole `display` / `control` / `valueAlarm`
+///   structures are NOT assigned;
+/// * `timeStamp` iff `change & (Value | Alarm)` — `getTimeAlarm` always
+///   fills the timestamp when it runs, but its `alarm` leaves only under
+///   `change & Alarm` (`iocsource.cpp:183-251`);
+/// * `value` iff `change & Value`, never for `Meta`. The `value` leaf is
+///   *semantic*: for an NTEnum node it is the structure `{index,
+///   choices}`, and `marked_changed_bitset` expands a marked structure
+///   path to its whole subtree — so a bare `value` mark would re-send the
+///   property-only `value.choices`. [`narrow_enum_value_leaves`] resolves
+///   that against the concrete value.
+///
+/// `timeStamp` and `alarm` stay as structure paths because `time_t` and
+/// `alarm_t` have no leaf pvxs leaves unassigned on the base this port
+/// targets. `getTimeAlarm` (`iocsource.cpp:160-251`) requests
+/// `DBR_STATUS | DBR_AMSG | DBR_TIME | DBR_UTAG` and assigns each group under
+/// the option the DB actually returned — "as of base 7.0.6 time/alarm
+/// meta-data is always available" (`iocsource.cpp:181`), so all three of
+/// `alarm.{status,severity,message}` and both of
+/// `timeStamp.{secondsPastEpoch,nanoseconds}` land. `timeStamp.userTag` is the
+/// one conditional leaf: it is written under `DBR_UTAG` only
+/// (`iocsource.cpp:243-250`), a macro that compiles away on a pre-7.0.6 base —
+/// which the port's own record layer does not target. So expanding either path
+/// yields exactly pvxs's set. The property structures are different — they
+/// carry leaves pvxs never touches (below).
+pub fn change_leaves(
+    mapping: FieldMapping,
+    change: EventMask,
+    props: PropertySupport,
+) -> Vec<&'static str> {
+    let mut leaves = Vec::new();
+    match mapping {
+        FieldMapping::Scalar => {
+            if change.intersects(EventMask::PROPERTY) {
+                leaves.extend(property_leaves(props));
+            }
+            if change.intersects(EventMask::VALUE | EventMask::ALARM) {
+                leaves.push("timeStamp");
+                if change.intersects(EventMask::ALARM) {
+                    leaves.push("alarm");
+                }
+            }
+            if change.intersects(EventMask::VALUE) {
+                leaves.push("value");
+            }
+        }
+        // `+type:meta`: `alarm` + `timeStamp` only — pvxs has no value leaf
+        // for Meta and skips getProperties for it.
+        FieldMapping::Meta => {
+            if change.intersects(EventMask::VALUE | EventMask::ALARM) {
+                leaves.push("timeStamp");
+                if change.intersects(EventMask::ALARM) {
+                    leaves.push("alarm");
+                }
+            }
+        }
+        // Value-only mappings: the mapped node IS the value (pvxs `value =
+        // node`), marked whole; no metadata sub-tree exists, so there is
+        // nothing to over-mark.
+        FieldMapping::Plain | FieldMapping::Any => {
+            if change.intersects(EventMask::VALUE) {
+                leaves.push("");
+            }
+        }
+        // Const/Structure/Proc carry no runtime event leaf.
+        _ => {}
+    }
+    leaves
+}
+
+/// [`change_leaves`] expanded into absolute field paths under `prefix`.
+///
+/// `prefix` is the mapped node's path in the served structure: a group
+/// member's `field_name`, or `""` for a single-record channel whose NT IS
+/// the root. An empty prefix with an empty leaf (a `Plain`/`Any` mapping at
+/// the root) yields no path; the only mapping pvxs allows at the struct top
+/// is `+type:"meta"` (`groupconfigprocessor.cpp:224-231`), whose leaves are
+/// the nameable root `alarm` / `timeStamp`.
+///
+/// A prefix carrying an array SUBSCRIPT (`"a[0].x"`) resolves to the
+/// enclosing `StructureArray` field — here `"a"` — and to nothing below it.
+/// That is what the mark means on the wire: pvxs assigns into the array
+/// ELEMENT, and `Value::mark` (`data.cpp:256-270`) walks the element's
+/// enclosing tops, so the only bit that lands in the parent store is the
+/// array field's own (`store[a].valid = true`). One bit, and `to_wire_valid`
+/// serializes the whole array field. Bits inside an element are not
+/// addressable in the root bitset at all, which is why the mark cannot be
+/// `"a[0].x.value"`: [`marked_changed_bitset`](epics_pva_rs::pvdata::encode::marked_changed_bitset)
+/// builds its candidate paths from `FieldDesc` names and never descends a
+/// `StructureArray`, so a subscripted path matched nothing, framed an empty
+/// bitset, and every update for an array member was dropped by the enqueue
+/// gate.
+pub fn change_leaf_paths(
+    prefix: &str,
+    mapping: FieldMapping,
+    change: EventMask,
+    props: PropertySupport,
+) -> Vec<String> {
+    let leaves = change_leaves(mapping, change, props);
+    // The member's change classes assign nothing (a Const/Structure/Proc
+    // member, a property event on a non-Scalar mapping): no mark, no post.
+    if leaves.is_empty() {
+        return Vec::new();
+    }
+    // Subscripted member: the enclosing array field is the whole mark,
+    // whatever the mapping would have contributed under it.
+    if let Some(array_field) = enclosing_array_field(prefix) {
+        return vec![array_field.to_string()];
+    }
+    leaves
+        .into_iter()
+        .filter_map(|suffix| match (prefix.is_empty(), suffix.is_empty()) {
+            (true, true) => None,
+            (true, false) => Some(suffix.to_string()),
+            (false, true) => Some(prefix.to_string()),
+            (false, false) => Some(format!("{prefix}.{suffix}")),
+        })
+        .collect()
+}
+
+/// The leaves a full READ of one mapping assigns — pvxs
+/// `IOCSource::initialize` followed by `IOCSource::get(…, UpdateType::
+/// Everything, …)`, the pair every QSRV read runs (`singlesource.cpp:283`,
+/// `groupsource.cpp:454-460`). This is what a GET reply / monitor seed
+/// frames, and it is a SUBSET of the request mask: pvxs reads into a
+/// `cloneEmpty()`, so a leaf nobody assigned never reaches the wire.
+///
+/// Over `change_leaf_paths(prefix, mapping, VALUE|ALARM|PROPERTY)` it adds:
+///
+/// * `display.form.choices` — `IOCSource::initialize` (`iocsource.cpp:39-65`)
+///   fills the form menu for a `Scalar` mapping. Present in pvxs's own pinned
+///   delta (`testqsingle.cpp:129-149`) even though no DBE class assigns it;
+/// * `display.form.index` — assigned by the SAME initialize, but ONLY when
+///   the mapping's channel addresses the record's VAL field
+///   (`if(dbIsValueField(dbChannelFldDes(chan)))`, `iocsource.cpp:53`), which
+///   is what `is_value_field` carries here. A channel on `REC.RVAL` leaves the
+///   index unassigned, so marking it shipped one changed bit and four bytes
+///   pvxs never sends;
+/// * a `Const` member's own node — `IOCSource::get` assigns `info.cval`
+///   (`iocsource.cpp:319-322`) on a read, where no runtime event ever fires
+///   for it.
+///
+/// `Structure` / `Proc` members assign nothing on a read either (pvxs skips
+/// them: `iocsource.cpp:316-317`, and `groupsource.cpp:495` / `:513` `continue`
+/// before even reading), so they stay unmarked.
+///
+/// The seven leaves the port's NT carries but `getProperties` never assigns —
+/// `control.minStep`, `valueAlarm.active`, the four `valueAlarm.*Severity`,
+/// `valueAlarm.hysteresis` — are absent here exactly as they are absent from
+/// pvxs's delta.
+pub fn read_leaf_paths(
+    prefix: &str,
+    mapping: FieldMapping,
+    is_value_field: bool,
+    props: PropertySupport,
+) -> Vec<String> {
+    let everything = EventMask::VALUE | EventMask::ALARM | EventMask::PROPERTY;
+    let mut paths = change_leaf_paths(prefix, mapping, everything, props);
+    match mapping {
+        // `IOCSource::initialize` — Scalar only.
+        FieldMapping::Scalar => {
+            // A subscripted member already collapsed to its enclosing array
+            // field, which marks the whole field; nothing to add under it.
+            if enclosing_array_field(prefix).is_none() {
+                let mut forms = vec!["display.form.choices"];
+                if is_value_field {
+                    forms.push("display.form.index");
+                }
+                for form in forms {
+                    paths.push(if prefix.is_empty() {
+                        form.to_string()
+                    } else {
+                        format!("{prefix}.{form}")
+                    });
+                }
+            }
+        }
+        // A const member is assigned on every read, never posted.
+        FieldMapping::Const => {
+            if let Some(array_field) = enclosing_array_field(prefix) {
+                paths.push(array_field.to_string());
+            } else if !prefix.is_empty() {
+                paths.push(prefix.to_string());
+            }
+        }
+        _ => {}
+    }
+    paths
+}
+
+/// The `StructureArray` field a subscripted member path is nested in — the
+/// text before its FIRST `[`. `"a[0].x"` → `"a"`, `"a[0].b[1].c"` → `"a"`
+/// (marking propagates up through every enclosing top, and only the
+/// outermost array field has a bit in the root store). `None` for a path
+/// with no subscript.
+fn enclosing_array_field(path: &str) -> Option<&str> {
+    path.split_once('[').map(|(head, _)| head)
+}
+
+/// Resolve value-shape-dependent leaves in a marked set against the
+/// concrete value about to be encoded (so the marks cannot drift from the
+/// descriptor).
+///
+/// [`change_leaves`] emits the *semantic* leaf `value` for a Scalar
+/// mapping. For an NTEnum node the `value` child is the structure
+/// `{index, choices}`, and `marked_changed_bitset` expands a marked
+/// structure path to its whole subtree — so a bare `value` mark would
+/// re-send the property-only `value.choices` on every value update. pvxs
+/// assigns only `value.index` on a value/alarm event
+/// (`iocsource.cpp:107-109,331-351`) and fills `value.choices` solely from
+/// `getProperties` on a property event (`iocsource.cpp:278-285`). Rewrite
+/// each marked `<node>.value` (or the bare root `value`) whose concrete
+/// node is an enum to `…value.index`; plain-scalar `value` leaves and
+/// every non-`value` leaf are left untouched. Property-event sets carry
+/// `value.choices`, never a bare `value`, so they are unaffected.
+pub fn narrow_enum_value_leaves(paths: Vec<String>, root: &PvStructure) -> Vec<String> {
+    paths
+        .into_iter()
+        .map(|path| {
+            let base = if path == "value" {
+                Some("")
+            } else {
+                path.strip_suffix(".value")
+            };
+            match base {
+                Some(base) if value_node_is_enum(root, base) => format!("{path}.index"),
+                _ => path,
+            }
+        })
+        .collect()
+}
+
+/// True iff the node addressed by the dot-separated `base` path (`""` =
+/// the root) carries an NTEnum `value` — its `value` child is itself a
+/// structure with an `index` leaf.
+fn value_node_is_enum(root: &PvStructure, base: &str) -> bool {
+    let mut node = root;
+    if !base.is_empty() {
+        for seg in base.split('.') {
+            match node.get_field(seg) {
+                Some(PvField::Structure(s)) => node = s,
+                _ => return false,
+            }
+        }
+    }
+    matches!(
+        node.get_field("value"),
+        Some(PvField::Structure(v)) if v.get_field("index").is_some()
+    )
 }
 
 /// NormativeType classification derived from record type.
@@ -123,6 +474,140 @@ pub(crate) fn nt_type_for_field(value: Option<&EpicsValue>) -> NtType {
         ) => NtType::ScalarArray,
         _ => NtType::Scalar,
     }
+}
+
+/// The port's `IOCSource::getChannelValueType` (pvxs
+/// `ioc/iocsource.cpp:619-643`): the NT a channel bound to
+/// `record.field` serves, INCLUDING the long-string collapse. Single
+/// owner — the single-record channel ([`super::channel::BridgeChannel`])
+/// and the group scalar-member path ([`super::group::GroupChannel`]) both
+/// resolve their NT here, so a long-string field cannot be a string on one
+/// surface and a byte array on the other.
+///
+/// Two ways a channel is a long string, both of which pvxs decides as
+/// "final field type is `DBR_CHAR`, the field is an array, and the
+/// channel's format is `String`":
+///
+/// - The record type declares the field one (`Record::long_string_fields`
+///   — `lsi`/`lso` VAL/OVAL, `printf` VAL). These are C's `SPC_DBADDR`
+///   fields whose `cvt_dbaddr` reports a `DBF_STRING` with `field_size >
+///   MAX_STRING_SIZE+1`; pvxs re-views them as a `DBR_CHAR` array and
+///   forces `form = "String"` (`ioc/channel.cpp:52-74`).
+/// - The record carries `info(Q:form, "String")` and the field is the VAL
+///   of a `DBF_CHAR` array — the QSRV long-string idiom for a plain
+///   `waveform`/`aai` of CHAR. The info tag applies to VAL only
+///   (`dbIsValueField`, `ioc/channel.cpp:43-47`), so another field of the
+///   same record stays a byte array.
+pub(crate) fn nt_type_for_channel(
+    instance: &epics_base_rs::server::record::RecordInstance,
+    field_upper: &str,
+    resolved: Option<&EpicsValue>,
+) -> NtType {
+    if instance
+        .record
+        .long_string_fields()
+        .iter()
+        .any(|f| f.eq_ignore_ascii_case(field_upper))
+    {
+        return NtType::LongString;
+    }
+    // `DBR_CHAR` (not `DBR_UCHAR` — pvxs tests `final_field_type ==
+    // DBR_CHAR`) array VAL with the `String` form tag.
+    if field_upper.eq_ignore_ascii_case("VAL")
+        && matches!(resolved, Some(EpicsValue::CharArray(_)))
+        && instance.get_info("Q:form") == Some("String")
+    {
+        return NtType::LongString;
+    }
+    nt_type_for_field(resolved)
+}
+
+/// The bare leaf a `+type:"plain"` group member serves — **descriptor and
+/// value from one decision**, so they cannot disagree on the wire (R18-26).
+///
+/// pvxs builds a plain member's leaf `Member` straight from the channel's
+/// value type — `addMembersForPlainType` (`ioc/groupconfigprocessor.cpp:886-895`)
+/// is `TypeDef leaf(IOCSource::getChannelValueType(chan, true))` — and the read
+/// path then fills *that same* `Value`: `getArrayValue`
+/// (`ioc/iocsource.cpp:132-137`) collapses a `DBR_CHAR` buffer at the NUL
+/// exactly when the leaf it is filling is `TypeCode::String`. One type code,
+/// two renderings.
+///
+/// The port had them derived independently — a `match nt_type` in the group's
+/// introspection and `epics_to_pv_field` on the read path — so a long-string
+/// member advertised `Scalar(Byte)` and shipped `ScalarArray(bytes)`. Here the
+/// classification happens once, in [`BareLeaf::of_channel`]; [`BareLeaf::desc`]
+/// and [`BareLeaf::value`] are the two renderings of it.
+///
+/// Note this is NOT `build_field_desc_for_nt`: that emits the full NT wrapper
+/// (`NTScalar` with `alarm`/`timeStamp`/…), which is the `+type:"scalar"`
+/// shape. A plain member is the bare leaf, no wrapper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BareLeaf {
+    /// A `DBR_CHAR` array whose channel format is `String` — pvxs
+    /// `TypeCode::String` (`getChannelValueType`, `iocsource.cpp:634-636`).
+    LongString,
+    /// `dbChannelFinalElements() != 1` — pvxs `valueType.arrayOf()`.
+    Array(ScalarType),
+    /// A single element — pvxs `fromDbrType(final_field_type)`.
+    Scalar(ScalarType),
+}
+
+impl BareLeaf {
+    /// Classify the channel bound to `record.field`. `resolved` is the
+    /// field's resolved value (record → common → virtual); `field_dbf` is the
+    /// fallback DBF type when the field has no resolved value.
+    pub(crate) fn of_channel(
+        instance: &epics_base_rs::server::record::RecordInstance,
+        field_upper: &str,
+        resolved: Option<&EpicsValue>,
+        field_dbf: epics_base_rs::types::DbFieldType,
+    ) -> Self {
+        let scalar = crate::convert::dbf_to_scalar_type(
+            resolved.map(|v| v.db_field_type()).unwrap_or(field_dbf),
+        );
+        Self::from_nt(nt_type_for_channel(instance, field_upper, resolved), scalar)
+    }
+
+    /// The same classification, from an NT already resolved through
+    /// [`nt_type_for_channel`] (the group's introspection pass, which needs
+    /// the NT for its `+type:"scalar"` members anyway).
+    pub(crate) fn from_nt(nt_type: NtType, scalar: ScalarType) -> Self {
+        match nt_type {
+            NtType::LongString => BareLeaf::LongString,
+            NtType::ScalarArray => BareLeaf::Array(scalar),
+            NtType::Scalar | NtType::Enum => BareLeaf::Scalar(scalar),
+        }
+    }
+
+    /// The leaf's introspection.
+    pub(crate) fn desc(self) -> FieldDesc {
+        match self {
+            BareLeaf::LongString => FieldDesc::Scalar(ScalarType::String),
+            BareLeaf::Array(t) => FieldDesc::ScalarArray(t),
+            BareLeaf::Scalar(t) => FieldDesc::Scalar(t),
+        }
+    }
+
+    /// The leaf's value, rendered for the descriptor [`Self::desc`] emits.
+    pub(crate) fn value(self, value: &EpicsValue) -> PvField {
+        match self {
+            BareLeaf::LongString => PvField::Scalar(ScalarValue::String(long_string_value(value))),
+            BareLeaf::Array(_) | BareLeaf::Scalar(_) => epics_to_pv_field(value),
+        }
+    }
+}
+
+/// The port's `putLongString` (pvxs `ioc/iocsource.cpp:513-519`): the
+/// image a string PUT writes into a long-string channel's CHAR-array
+/// storage — the string's bytes plus the NUL terminator, which is what
+/// `doDbPut(pDbChannel, DBR_CHAR, str.c_str(), strlen+1)` puts. The
+/// terminator counts: it is why C's `NORD` / `LEN` after a long-string
+/// PUT is `strlen + 1`.
+pub(crate) fn long_string_put_image(s: &PvString) -> EpicsValue {
+    let mut bytes = s.as_bytes().to_vec();
+    bytes.push(0);
+    EpicsValue::CharArray(bytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -250,16 +735,16 @@ pub fn snapshot_to_nt_scalar(snapshot: &Snapshot) -> PvStructure {
         PvField::Structure(build_timestamp(snapshot.timestamp, snapshot.user_tag)),
     ));
 
-    // pvxs always emits the metadata fields the NTScalar descriptor
-    // advertises: `display` for every value, plus `control`/`valueAlarm`
-    // for numeric values (src/nt.cpp:58-112). When the record's metadata
-    // cache never populated display/control (e.g. stringin/stringout, and
-    // histogram — record types absent from the metadata allowlist), the
-    // fields are still present with descriptor defaults rather than
-    // disappearing (iocsource.cpp:254-309). Emitting them only when the
-    // snapshot carried metadata made the runtime value shape diverge from
-    // the `getField` descriptor; build them unconditionally from the
-    // snapshot metadata or its default so value and descriptor agree.
+    // The NTScalar descriptor advertises `display` for every value plus
+    // `control`/`valueAlarm` for numeric ones (`nt.cpp:58-112`), and the
+    // port derives its descriptor FROM this value — so every leaf must be
+    // built here, whether or not the record type supplies it. Building a
+    // leaf is not claiming it: pvxs reads into a `cloneEmpty()` whose
+    // descriptor carries the same leaves, and simply never ASSIGNS the ones
+    // `dbChannelGet` reported unsupplied, so they reach no client
+    // (`iocsource.cpp:263-305`). The port says the same thing by leaving
+    // them out of the changed-bitset — see [`property_leaves`], which is
+    // the one gate, keyed off the snapshot's [`PropertySupport`].
     let disp = snapshot.display.clone().unwrap_or_default();
     pv.fields.push((
         "display".into(),
@@ -414,7 +899,7 @@ pub fn snapshot_to_nt_scalar_array(snapshot: &Snapshot) -> PvStructure {
 /// byte run verbatim — pvxs serves the `DBF_CHAR` `form="String"` view as a
 /// `pvString` of the raw bytes up to NUL with no UTF-8 validation
 /// (`singlesource.cpp:189-205`), so the bytes pass through unmodified.
-fn long_string_value(value: &EpicsValue) -> PvString {
+pub(crate) fn long_string_value(value: &EpicsValue) -> PvString {
     match value {
         EpicsValue::CharArray(bytes) => {
             let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
@@ -1078,6 +1563,12 @@ mod tests {
     use epics_base_rs::server::snapshot::{EnumInfo, Snapshot};
     use std::time::UNIX_EPOCH;
 
+    /// The mask an `ai`-class channel resolves to: every numeric property
+    /// supplied, no enum strings. The cases below fix the CHANGE-CLASS
+    /// narrowing (which leaves a value / property / read event assigns); the
+    /// rset narrowing on top of it has its own boundary cases below.
+    const NUMERIC_PROPS: PropertySupport = PropertySupport::NUMERIC;
+
     fn test_snapshot(value: EpicsValue) -> Snapshot {
         let mut snap = Snapshot::new(value, 0, 0, UNIX_EPOCH);
         snap.display = Some(DisplayInfo {
@@ -1353,9 +1844,7 @@ mod tests {
     #[test]
     fn nt_enum_structure() {
         let mut snap = Snapshot::new(EpicsValue::Enum(1), 0, 0, UNIX_EPOCH);
-        snap.enums = Some(EnumInfo {
-            strings: vec!["Off".into(), "On".into()],
-        });
+        snap.enums = Some(EnumInfo::new(vec!["Off".into(), "On".into()]));
         let pv = snapshot_to_nt_enum(&snap);
 
         assert_eq!(pv.struct_id, "epics:nt/NTEnum:1.0");
@@ -1415,9 +1904,7 @@ mod tests {
     #[test]
     fn put_roundtrip_enum() {
         let mut snap = Snapshot::new(EpicsValue::Enum(2), 0, 0, UNIX_EPOCH);
-        snap.enums = Some(EnumInfo {
-            strings: vec!["A".into(), "B".into(), "C".into()],
-        });
+        snap.enums = Some(EnumInfo::new(vec!["A".into(), "B".into(), "C".into()]));
         let pv = snapshot_to_nt_enum(&snap);
         let back = pv_structure_to_epics(&pv).unwrap();
         assert_eq!(back, EpicsValue::Enum(2));
@@ -1830,5 +2317,367 @@ mod tests {
         } else {
             panic!("expected NTEnum top-level structure");
         }
+    }
+
+    /// NTEnum node must narrow its `value` leaf to `value.index`,
+    /// not mark the whole `value` subtree. pvxs assigns only `value.index`
+    /// on a value event (`iocsource.cpp:107-109,331-351`) and fills
+    /// `value.choices` solely via getProperties (`iocsource.cpp:278-285`).
+    /// A bare `value` mark would, through `marked_changed_bitset`'s
+    /// whole-subtree expansion, re-send the property-only `choices` array
+    /// on every value update. Plain-scalar `value` leaves and non-value
+    /// leaves stay untouched, and a nested (dot-pathed) enum member is
+    /// handled too.
+    #[test]
+    fn enum_value_event_narrows_value_leaf_to_index() {
+        use epics_pva_rs::pvdata::ScalarValue;
+
+        fn nt_enum_member() -> PvField {
+            let mut value = PvStructure::new("enum_t");
+            value
+                .fields
+                .push(("index".into(), PvField::Scalar(ScalarValue::Int(1))));
+            value.fields.push((
+                "choices".into(),
+                PvField::ScalarArray(vec![
+                    ScalarValue::String("OFF".into()),
+                    ScalarValue::String("ON".into()),
+                ]),
+            ));
+            let mut m = PvStructure::new("epics:nt/NTEnum:1.0");
+            m.fields.push(("value".into(), PvField::Structure(value)));
+            m.fields.push((
+                "alarm".into(),
+                PvField::Structure(PvStructure::new("alarm_t")),
+            ));
+            PvField::Structure(m)
+        }
+
+        fn nt_scalar_member() -> PvField {
+            let mut m = PvStructure::new("epics:nt/NTScalar:1.0");
+            m.fields
+                .push(("value".into(), PvField::Scalar(ScalarValue::Double(3.5))));
+            m.fields.push((
+                "alarm".into(),
+                PvField::Structure(PvStructure::new("alarm_t")),
+            ));
+            PvField::Structure(m)
+        }
+
+        // composed group value: one NTEnum member, one plain NTScalar
+        // member, and a nested NTEnum member under an intermediate node.
+        let mut nested = PvStructure::new("");
+        nested.fields.push(("mode".into(), nt_enum_member()));
+
+        let mut root = PvStructure::new("");
+        root.fields.push(("state".into(), nt_enum_member()));
+        root.fields.push(("temp".into(), nt_scalar_member()));
+        root.fields.push(("grp".into(), PvField::Structure(nested)));
+
+        // member_value_is_enum: enum members resolve true (incl. nested),
+        // plain scalar resolves false, and an unknown path resolves false.
+        assert!(value_node_is_enum(&root, "state"));
+        assert!(value_node_is_enum(&root, "grp.mode"));
+        assert!(!value_node_is_enum(&root, "temp"));
+        assert!(!value_node_is_enum(&root, "missing"));
+
+        let marked = vec![
+            "state.value".to_string(),
+            "state.alarm".to_string(),
+            "temp.value".to_string(),
+            "grp.mode.value".to_string(),
+        ];
+        let narrowed = narrow_enum_value_leaves(marked, &root);
+        assert_eq!(
+            narrowed,
+            vec![
+                "state.value.index".to_string(),
+                "state.alarm".to_string(),
+                "temp.value".to_string(),
+                "grp.mode.value.index".to_string(),
+            ],
+            "enum value leaves narrow to value.index; plain value and non-value leaves unchanged"
+        );
+        // The over-marking path that re-sent choices must be gone.
+        assert!(
+            !narrowed.contains(&"state.value".to_string()),
+            "bare enum `value` leaf (expands to choices) must not survive: {narrowed:?}"
+        );
+    }
+
+    /// R15-33 — a READ (GET reply, PUT_GET readback, monitor seed) frames
+    /// what the source ASSIGNED, and QSRV's source assigns a strict subset
+    /// of the NT.
+    ///
+    /// pvxs reads into a `cloneEmpty()` through `IOCSource::initialize` +
+    /// `IOCSource::get(…, Everything, …)` (`singlesource.cpp:283`,
+    /// `groupsource.cpp:454-460`), then frames it with
+    /// `to_wire_valid(R, value, &pvMask)` (`serverget.cpp:104`). So the wire
+    /// carries only assigned leaves, and `getProperties`
+    /// (`iocsource.cpp:252-310`) assigns neither `control.minStep`, nor
+    /// `valueAlarm.active`, nor the four `valueAlarm.*Severity` leaves, nor
+    /// `valueAlarm.hysteresis` — pinned by pvxs's own delta,
+    /// `testqsingle.cpp:129-149`, where those seven are absent while
+    /// `display.form.index` / `.choices` (from `initialize`, which no DBE
+    /// class ever posts) are present.
+    ///
+    /// Tested per boundary: the never-assigned seven, the initialize-only
+    /// form pair, the mappings `initialize` skips (Meta / Plain), and the
+    /// read-only-assigned `Const` node.
+    /// R19-41: a property leaf the record type does not SUPPLY is never
+    /// marked — on a read or on a property event alike. One case per gate
+    /// boundary of `dbChannelGet`'s option narrowing (`dbAccess.c:336-430`),
+    /// which is what pvxs's `if(options & DBR_*)` reads
+    /// (`iocsource.cpp:263-305`):
+    ///
+    /// * `units` off — the measured `stringout`;
+    /// * `alarm_double` off — the measured `waveform`;
+    /// * `precision` off — the measured `longout` (and any non-float field);
+    /// * `graphic_double` off — precision goes with it, pvxs nests the
+    ///   assignment (`iocsource.cpp:288-291`);
+    /// * `control_double` off; `enum_strs` on/off;
+    /// * the whole mask off — `display.description` survives alone, the one
+    ///   leaf pvxs assigns with no option gate at all.
+    #[test]
+    fn an_unsupplied_property_leaf_is_never_marked() {
+        let marks = |props| change_leaf_paths("", FieldMapping::Scalar, EventMask::PROPERTY, props);
+
+        let full = marks(PropertySupport {
+            enum_strs: true,
+            ..PropertySupport::NUMERIC
+        });
+        for leaf in [
+            "display.units",
+            "display.limitLow",
+            "display.limitHigh",
+            "display.precision",
+            "control.limitLow",
+            "control.limitHigh",
+            "valueAlarm.lowAlarmLimit",
+            "valueAlarm.lowWarningLimit",
+            "valueAlarm.highWarningLimit",
+            "valueAlarm.highAlarmLimit",
+            "value.choices",
+            "display.description",
+        ] {
+            assert!(
+                full.contains(&leaf.to_string()),
+                "a record type supplying every slot marks {leaf}: {full:?}"
+            );
+        }
+
+        // stringout: no rset slot at all.
+        assert_eq!(
+            marks(PropertySupport::NONE),
+            vec!["display.description".to_string()],
+            "a record type with no property slot marks only DESC, which pvxs \
+             assigns with no option gate (`iocsource.cpp:307-310`)"
+        );
+
+        // waveform: `#define get_alarm_double NULL`.
+        let wf = marks(PropertySupport {
+            alarm_double: false,
+            ..PropertySupport::NUMERIC
+        });
+        assert!(
+            !wf.iter().any(|p| p.starts_with("valueAlarm.")),
+            "a waveform supplies no alarm limits — bands at zero must not be \
+             marked authoritative: {wf:?}"
+        );
+        assert!(wf.contains(&"display.limitLow".to_string()));
+
+        // longout: `#define get_precision NULL`.
+        let lo = marks(PropertySupport {
+            precision: false,
+            ..PropertySupport::NUMERIC
+        });
+        assert!(
+            !lo.contains(&"display.precision".to_string()),
+            "a longout supplies no precision: {lo:?}"
+        );
+        assert!(lo.contains(&"display.limitLow".to_string()));
+
+        // pvxs nests precision INSIDE the graphic-limits branch.
+        let no_gr = marks(PropertySupport {
+            graphic_double: false,
+            ..PropertySupport::NUMERIC
+        });
+        assert!(
+            !no_gr.contains(&"display.precision".to_string())
+                && !no_gr.contains(&"display.limitLow".to_string()),
+            "precision is assigned only inside the DBR_GR_DOUBLE branch: {no_gr:?}"
+        );
+
+        let no_ctrl = marks(PropertySupport {
+            control_double: false,
+            ..PropertySupport::NUMERIC
+        });
+        assert!(
+            !no_ctrl.iter().any(|p| p.starts_with("control.")),
+            "a record type with no get_control_double marks no control limits: {no_ctrl:?}"
+        );
+
+        assert!(
+            !marks(PropertySupport::NUMERIC).contains(&"value.choices".to_string()),
+            "a numeric record supplies no enum strings"
+        );
+
+        // The gate applies to the READ mark set too — a GET reply must not
+        // carry the fabricated leaf either.
+        let read = read_leaf_paths("", FieldMapping::Scalar, true, PropertySupport::NONE);
+        for absent in ["display.units", "display.precision", "control.limitLow"] {
+            assert!(
+                !read.contains(&absent.to_string()),
+                "a read must not frame the unsupplied {absent}: {read:?}"
+            );
+        }
+        assert!(
+            read.contains(&"value".to_string()) && read.contains(&"timeStamp".to_string()),
+            "the value/alarm/timeStamp set is not property-gated: {read:?}"
+        );
+    }
+
+    #[test]
+    fn read_leaf_paths_frames_pvxs_initialize_plus_get_everything() {
+        let scalar = read_leaf_paths("", FieldMapping::Scalar, true, NUMERIC_PROPS);
+
+        // The seven leaves the port's NT carries and `getProperties` never
+        // assigns. Absent from the read → absent from the wire.
+        for never in [
+            "control.minStep",
+            "valueAlarm.active",
+            "valueAlarm.lowAlarmSeverity",
+            "valueAlarm.lowWarningSeverity",
+            "valueAlarm.highWarningSeverity",
+            "valueAlarm.highAlarmSeverity",
+            "valueAlarm.hysteresis",
+        ] {
+            assert!(
+                !scalar.contains(&never.to_string()),
+                "`getProperties` never assigns {never} — it must not be framed: {scalar:?}"
+            );
+        }
+
+        // `IOCSource::initialize` assigns the display form for a Scalar, so a
+        // read carries it even though no DBE class posts it.
+        for form in ["display.form.choices", "display.form.index"] {
+            assert!(
+                scalar.contains(&form.to_string()),
+                "`IOCSource::initialize` assigns {form} on a read: {scalar:?}"
+            );
+        }
+
+        // A read is `get(Everything)`: the value, the alarm/timeStamp pair and
+        // every property leaf `getProperties` does assign.
+        for assigned in ["value", "alarm", "timeStamp", "display.units"] {
+            assert!(
+                scalar.contains(&assigned.to_string()),
+                "get(Everything) assigns {assigned}: {scalar:?}"
+            );
+        }
+
+        // `initialize` is `info.type == Scalar`-only: a Meta member carries
+        // alarm + timeStamp and no form, and a value-only mapping is marked
+        // whole with nothing under it.
+        let meta = read_leaf_paths("m", FieldMapping::Meta, true, NUMERIC_PROPS);
+        assert_eq!(
+            meta,
+            vec!["m.timeStamp".to_string(), "m.alarm".to_string()],
+            "a `+type:meta` member assigns only the alarm/timeStamp pair"
+        );
+        assert_eq!(
+            read_leaf_paths("p", FieldMapping::Plain, true, NUMERIC_PROPS),
+            vec!["p".to_string()],
+            "a value-only mapping is the value: marked whole, no metadata under it"
+        );
+
+        // `IOCSource::get` assigns `info.cval` for a Const member
+        // (`iocsource.cpp:319-322`) — a read frames it, no event ever posts
+        // it. Structure/Proc members are skipped on read as on post.
+        assert_eq!(
+            read_leaf_paths("k", FieldMapping::Const, true, NUMERIC_PROPS),
+            vec!["k".to_string()],
+            "a const member is assigned on every read"
+        );
+        assert!(
+            read_leaf_paths("s", FieldMapping::Structure, true, NUMERIC_PROPS).is_empty(),
+            "pvxs skips a Structure member on a read (`iocsource.cpp:316-317`)"
+        );
+
+        // A subscripted member collapses to its enclosing array field on a
+        // read exactly as on a post — that field is the only markable bit.
+        assert_eq!(
+            read_leaf_paths("a[0].x", FieldMapping::Scalar, true, NUMERIC_PROPS),
+            vec!["a".to_string()],
+            "a subscripted member marks the enclosing array field, whole"
+        );
+    }
+
+    /// R16-31: `IOCSource::initialize` assigns `display.form.index` only when
+    /// the channel addresses the record's VAL field (`dbIsValueField`,
+    /// `iocsource.cpp:53`); `display.form.choices` is assigned for every
+    /// field. A non-VAL channel (`REC.RVAL`) that marked the index shipped a
+    /// changed bit and four bytes pvxs never sends.
+    #[test]
+    fn form_index_marked_for_val_channels_only() {
+        let val = read_leaf_paths("", FieldMapping::Scalar, true, NUMERIC_PROPS);
+        assert!(val.contains(&"display.form.choices".to_string()));
+        assert!(val.contains(&"display.form.index".to_string()));
+
+        let non_val = read_leaf_paths("", FieldMapping::Scalar, false, NUMERIC_PROPS);
+        assert!(
+            non_val.contains(&"display.form.choices".to_string()),
+            "the form menu is assigned for every field: {non_val:?}"
+        );
+        assert!(
+            !non_val.contains(&"display.form.index".to_string()),
+            "Q:form applies to form.index for VAL only: {non_val:?}"
+        );
+
+        // Same rule for a group member bound to a non-VAL field.
+        let member = read_leaf_paths("rval", FieldMapping::Scalar, false, NUMERIC_PROPS);
+        assert!(member.contains(&"rval.display.form.choices".to_string()));
+        assert!(
+            !member.contains(&"rval.display.form.index".to_string()),
+            "a group member on REC.RVAL must not mark its form index: {member:?}"
+        );
+    }
+
+    /// R16-31: the value side of the same rule — `build_display` writes the
+    /// index straight from `DisplayInfo::form`, which the snapshot producer
+    /// now narrows to the served field (0 = Default for a non-VAL field), so
+    /// a `Q:form` record never reports Hex on `REC.RVAL`.
+    #[test]
+    fn build_display_publishes_the_snapshots_form_index() {
+        let disp = DisplayInfo {
+            form: 4, // Hex — as the VAL channel of an info(Q:form,"Hex") record
+            ..Default::default()
+        };
+        let d = build_display(&disp, ScalarType::Int, true);
+        let PvField::Structure(form) = &d.fields.iter().find(|(n, _)| n == "form").unwrap().1
+        else {
+            panic!("display.form must be an enum_t structure");
+        };
+        assert_eq!(
+            form.fields.iter().find(|(n, _)| n == "index").unwrap().1,
+            PvField::Scalar(ScalarValue::Int(4))
+        );
+        let PvField::ScalarArray(choices) =
+            &form.fields.iter().find(|(n, _)| n == "choices").unwrap().1
+        else {
+            panic!("display.form.choices must be a string array");
+        };
+        assert_eq!(choices.len(), 7, "the menu is published regardless");
+
+        // The non-VAL snapshot carries form = 0 (Default).
+        let d = build_display(&DisplayInfo::default(), ScalarType::Int, true);
+        let PvField::Structure(form) = &d.fields.iter().find(|(n, _)| n == "form").unwrap().1
+        else {
+            panic!("display.form must be an enum_t structure");
+        };
+        assert_eq!(
+            form.fields.iter().find(|(n, _)| n == "index").unwrap().1,
+            PvField::Scalar(ScalarValue::Int(0))
+        );
     }
 }

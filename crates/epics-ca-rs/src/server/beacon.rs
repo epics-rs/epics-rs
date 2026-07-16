@@ -17,12 +17,23 @@ use epics_base_rs::error::CaResult;
 /// broadcast addresses plus any operator-supplied entries. Unicast routes
 /// (e.g. site-wide gateways) are sent the same beacon stream.
 ///
-/// When `reset` is notified (e.g. on TCP connect/disconnect), the interval
-/// resets to the initial 20ms. This is a Rust enhancement, NOT C parity:
-/// C `rsrv` only resets the beacon interval on `ctlPause`, never on client
-/// connect/disconnect. The faster beacons after a connect let clients
-/// detect server state changes quickly via beacon anomaly detection; the
-/// behavior is benign (a short burst of extra beacons) and deliberate.
+/// When `reset` is notified, the emitter sends a beacon at once and the
+/// interval goes back to the initial 20ms — C `rsrv`'s beacon anomaly, whose
+/// point is that other clients re-search after a server state change.
+///
+/// Its ONE notifier is
+/// [`CaServer::trigger_beacon_anomaly`](crate::server::CaServer::trigger_beacon_anomaly)
+/// (also reachable as a long-lived handle through
+/// [`CaServer::beacon_anomaly_handle`](crate::server::CaServer::beacon_anomaly_handle)),
+/// which the bridge ca_gateway pulses when it registers a new upstream PV —
+/// the `generateBeaconAnomaly` analogue. The TCP path does NOT pulse it: C
+/// `rsrv_online_notify_task` sets the ramp's initial period once at task start
+/// (`online_notify.c:68` `delay = 0.02`) and restarts it in exactly one other
+/// place, the `beacon_ctl == ctlPause` wait loop (`online_notify.c:126-129`);
+/// a client connect or disconnect never touches it. The port used to pulse on
+/// every accept and every disconnect, which restarted the 20 ms ramp and made
+/// every other client of the server flag `ShortPeriod` beacon anomalies (R6-30,
+/// pinned by `tests/beacon_ramp_connect.rs`).
 ///
 /// `signer` is an opt-in Ed25519 [`signed_beacon::SignedBeaconEmitter`]
 /// that emits a companion datagram immediately after each beacon so

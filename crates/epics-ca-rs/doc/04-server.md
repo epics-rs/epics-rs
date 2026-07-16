@@ -105,7 +105,7 @@ struct ClientState {
     subscriptions:   HashMap<sub_id, SubscriptionEntry>,
     channel_access:  HashMap<sid, AccessLevel>,
     next_sid:        AtomicU32,
-    hostname:        String,   // peer.ip() default; client-supplied if EPICS_CAS_USE_HOST_NAMES
+    hostname:        HostIdentity,  // Claimed(name) by default; Pinned(ip|cert) otherwise
     username:        String,
     acf:             Arc<Option<AccessSecurityConfig>>,
     tcp_port:        u16,
@@ -114,10 +114,26 @@ struct ClientState {
 }
 ```
 
-`hostname` is **primed from the peer IP** at the start of the
-handler. It only takes the client-supplied value if the operator has
-explicitly opted in via `EPICS_CAS_USE_HOST_NAMES=YES`. This matches
-C rsrv default and prevents hostname spoofing for ACF rules.
+`hostname` is the circuit's access-security identity, and its *source* is
+decided once, at the start of the handler — exactly where C decides it, in
+`create_tcp_client` (`caservertask.c:1425-1437`). The two variants encode
+whether the client may still set it, so the illegal transition is not
+representable rather than guarded at the write site:
+
+* `Claimed(name)` — C's default (`asCheckClientIP == 0`): empty until the
+  client sends `CA_PROTO_HOST_NAME`, then whatever it claimed, stored
+  unconditionally (`camessage.c:845-875`). `HAG` entries are host names in
+  this mode, so this is what a `HOST(node)` rule matches.
+* `Pinned(value)` — the peer's dotted-quad IP under `asCheckClientIP = 1`
+  (`CA_PROTO_HOST_NAME` is then ignored, `camessage.c:839-843`), or an
+  mTLS-verified certificate identity, which outranks both C modes.
+
+Set the mode with the `asCheckClientIP` iocsh command *before* `asInit` —
+the HAG storage form is chosen when the ACF is parsed. See
+`08-environment.md`. An earlier revision of this document claimed the port
+primed `hostname` from the peer IP "to match C rsrv default"; that was
+backwards, and the `EPICS_CAS_USE_HOST_NAMES` variable it named exists
+nowhere in epics-base (R7-16).
 
 ### Read loop
 
@@ -167,7 +183,7 @@ Highlights:
 | Opcode | Behaviour |
 |--------|-----------|
 | `VERSION` | Cache `client_minor_version`. Reply with our version. |
-| `HOST_NAME` | Update `state.hostname` only if `EPICS_CAS_USE_HOST_NAMES=YES`. Re-evaluate access rights. |
+| `HOST_NAME` | `state.hostname.claim(name)` — taken unless the identity is `Pinned` (C `host_name_action`). Re-evaluate access rights. |
 | `CLIENT_NAME` | Update `state.username`. Re-evaluate access rights. |
 | `CREATE_CHAN` | DoS guard: refuse if `len(channels) >= EPICS_CAS_MAX_CHANNELS`. Look up PV in `db`, allocate sid, build `ChannelEntry`, send `ACCESS_RIGHTS` + `CREATE_CHAN` response (or `CREATE_CH_FAIL` on miss). |
 | `READ` / `READ_NOTIFY` | Same data path; only the response header differs (deprecated `READ` puts sid in `cid`, while `READ_NOTIFY` puts ECA status in `cid`). |
@@ -400,6 +416,6 @@ for operational behaviour:
 - `EPICS_CAS_INTF_ADDR_LIST`, `EPICS_CAS_BEACON_ADDR_LIST` — multi-NIC
   topology
 - `EPICS_CAS_BEACON_PERIOD` — beacon cadence
-- `EPICS_CAS_USE_HOST_NAMES` — ACF hostname source
+- `asCheckClientIP` (iocsh command, not an env var) — ACF host-identity source
 - `EPICS_CAS_INACTIVITY_TMO` — half-open client cleanup horizon
 - `EPICS_CAS_MAX_CHANNELS`, `EPICS_CAS_MAX_SUBS_PER_CHAN` — DoS caps

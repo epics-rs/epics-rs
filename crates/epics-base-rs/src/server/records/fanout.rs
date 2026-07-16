@@ -14,10 +14,25 @@ const FANOUT_SELM_CHOICES: &[&str] = &["All", "Specified", "Mask"];
 /// fan-out target on `LNK0`. Omitting it shifts every link index
 /// by one and silently drops the `LNK0` target on `SELM=All`.
 #[derive(EpicsRecord)]
-#[record(type = "fanout")]
+// C `fanoutRecord.c:88`: `recGblInitConstantLink(&prec->sell, DBF_USHORT,
+// &prec->seln)` — a constant SELL loads SELN ONCE, at init. `dbGetLink` on it
+// at process delivers nothing, so a later `caput REC.SELN` is not stomped.
+// `no_value_monitor`: fanout's VAL is a `pp(TRUE)` "trigger" — C `process()`
+// posts VAL only with alarm events (`if (events) db_post_events(&prec->val,
+// events)`, fanoutRecord.c:148-150), never DBE_VALUE/DBE_LOG. So a run of
+// `caput VAL` posts no per-put value monitor (only the connect-time snapshot).
+#[record(type = "fanout", constant_init = "SELL:SELN", no_value_monitor)]
 pub struct FanoutRecord {
-    #[field(type = "Enum")]
-    pub val: u16,
+    // VAL is `field(VAL,DBF_LONG){ pp(TRUE) }` (fanoutRecord.dbd:21-25) — the
+    // "Used to trigger" field. It carries no output value: C `process`
+    // (fanoutRecord.c:92-158) never reads or writes VAL, it only fans out the
+    // forward links. A `caput X.VAL 1` therefore stores 1 verbatim and pp(TRUE)
+    // reprocesses (a no-op leaving VAL for a link-less record). Declaring it
+    // `DBF_LONG` (i32) is what routes a `DBR_STRING` put through the numeric
+    // `c_parse::put_string` Long row; the previous `Enum`/u16 declaration sent it
+    // to the enum choice-matcher, which refused a bare "1" as S_db_badChoice.
+    #[field(type = "Long")]
+    pub val: i32,
     // SELM is DBF_MENU menu(fanoutSELM) (fanoutRecord.dbd.pod:111): served
     // as DBR_ENUM with the menu's choice labels (FANOUT_SELM_CHOICES). The
     // index is stored as a short; the framework promotes it to Enum.

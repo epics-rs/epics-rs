@@ -1,5 +1,5 @@
 use super::error::CalcError;
-use super::opcodes::{CoreOp, Opcode};
+use super::opcodes::{ControlOp, CoreOp, Opcode};
 use super::token::{ConstName, FuncName, Token};
 use super::{CompiledExpr, ExprKind};
 
@@ -26,17 +26,85 @@ enum StackEntry {
         token: Token,
         in_stack_pri: u8,
     },
+    /// C's `(` element (`sCalcPostfix.c:102`): a `UNARY_OPERATOR` with
+    /// `in_stack_pri` 0 and code `NOT_GENERATED`. A barrier that emits nothing.
     LParen,
+    /// C's `[` and `{` elements (`sCalcPostfix.c:215-216`,
+    /// `aCalcPostfix.c:212-213`). They are NOT parens: they are
+    /// `BINARY_OPERATOR`s whose code IS generated — `CLOSE_BRACKET` /
+    /// `CLOSE_CURLY` emit it (`sCalcPostfix.c:686`, `:715`) after popping down to
+    /// this entry.
+    ///
+    /// Two numbers make them what they are. `in_stack_pri` 0 makes them a barrier
+    /// like `(`, so nothing pops them off. `in_coming_pri` **11** is the highest
+    /// value in any of the three tables — above a function's 9 — which is why a
+    /// `[` or `{` arriving right after a `)` does NOT pop the function still
+    /// sitting below it, and the function is therefore applied to the SUBRANGE /
+    /// REPLACE result rather than to its own argument (R13-2).
+    ///
+    /// This is a stack entry of its own rather than a second `LParen` because the
+    /// two are barriers for DIFFERENT things: C's `SEPARATOR` (`:614`) stops at
+    /// `(`, `[` and `{` alike, but only `CLOSE_PAREN` (`:653`) hands the argument
+    /// count to a vararg function below it. Sharing one variant let a `,` inside
+    /// `MAX(4,7)[0,0]`'s bracket bump `MAX`'s argument count.
+    Subrange {
+        /// `{` (sCalc `REPLACE`, aCalc `SUBRANGE_IP`) rather than `[` (`SUBRANGE`
+        /// in both).
+        in_place: bool,
+        /// C accumulates the effect ON this entry: `-1` from the table, then `-1`
+        /// more per `,` (`SEPARATOR`, `:630`). `CLOSE_BRACKET` adds the total
+        /// (`:687`). So `AA[i,j]` is -2 — subject and two arguments in, one out.
+        runtime_effect: i32,
+    },
     VarargFunc {
         func: FuncName,
         in_stack_pri: u8,
         nargs: u8,
     },
     CondEnd,
-    Store {
-        var_idx: u8,
-        is_double: bool,
+    Store(StoreTarget),
+    /// C's `UNTIL_END` element (`sCalcPostfix.c:779-783`): reading `UNTIL` PUSHES
+    /// one of these onto the OPERATOR stack, carrying the in-stack priority of
+    /// the `UNTIL` element itself (0) and an explicit `runtime_effect = 0`. It is
+    /// therefore emitted by the ordinary flush rules and by nothing else — a `)`
+    /// or an inner `;` stops at the `(` above it, and only the end of the
+    /// enclosing statement (or of the expression) reaches it.
+    ///
+    /// That is the whole loop-closing rule, and it is why `UNTIL(a:=a+1;a>3)`
+    /// puts `UNTIL_END` AFTER the condition: the `;` inside the parentheses
+    /// cannot see this entry. The port used to keep a private `until_stack` and
+    /// close the loop at the first `;` it met, which is the `;` between the body
+    /// and the condition — so the condition was compiled outside the loop and
+    /// `UNTIL_END` peeked an empty stack.
+    UntilEnd {
+        /// Where the paired `Until` placeholder sits in `output`; it is patched
+        /// with this entry's own position when the entry is flushed.
+        until_pc: usize,
     },
+}
+
+/// What a `:=` on the operator stack will store into — C's four STORE codes,
+/// and the whole of what `STORE_OPERATOR` can produce.
+///
+/// C reaches them by TWO routes and both are here, which is the point of the
+/// enum: `A:=`/`AA:=` RETRACT the fetch already written to the postfix and turn
+/// it into a `STORE_x` (`sCalcPostfix.c:544-557`), while `@n:=`/`@@n:=` rewrite
+/// the pending `A_FETCH`/`A_SFETCH` operator IN PLACE on the stack (`:516-529`)
+/// — the index expression it was going to consume stays in the postfix, and the
+/// store pops it at run time. Same element, same runtime_effect -1, two shapes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoreTarget {
+    /// `STORE_A`..`STORE_P` — a named scalar arg.
+    Var(u8),
+    /// `STORE_AA`..`STORE_LL` — a named doubled-letter arg (a STRING in sCalc,
+    /// an ARRAY in aCalc, a second numeric bank in base).
+    DoubleVar(u8),
+    /// `A_STORE` — `@n := v`, the scalar arg `n` indexes. sCalc and aCalc.
+    Dyn,
+    /// `A_SSTORE` (sCalc) / `A_ASTORE` (aCalc) — `@@n := v`, the doubled-letter
+    /// arg `n` indexes. Which of the two it compiles to is the engine's business
+    /// (`flush_stack_entry`), as with `[` and `{`.
+    DynDouble,
 }
 
 impl StackEntry {
@@ -44,22 +112,22 @@ impl StackEntry {
         match self {
             StackEntry::Op { in_stack_pri, .. } => *in_stack_pri,
             StackEntry::LParen => 0,
+            // `[` / `{`: in_stack_pri 0, like `(` — a barrier nothing pops.
+            StackEntry::Subrange { .. } => 0,
             StackEntry::VarargFunc { in_stack_pri, .. } => *in_stack_pri,
             StackEntry::CondEnd => 0,
-            StackEntry::Store { .. } => 1,
+            StackEntry::Store(_) => 1,
+            // C: `{"UNTIL", 0, 10, 0, UNTIL_OPERATOR, UNTIL}` — in_stack_pri 0,
+            // so no incoming operator ever pops it off the stack.
+            StackEntry::UntilEnd { .. } => 0,
         }
     }
 }
 
 fn binary_op(token: &Token) -> Option<(u8, u8)> {
     match token {
-        Token::OrOr | Token::BitOr | Token::OrKeyword | Token::BitXor => Some((2, 2)),
-        Token::AndAnd
-        | Token::BitAnd
-        | Token::AndKeyword
-        | Token::Shr
-        | Token::ShrLogical
-        | Token::Shl => Some((3, 3)),
+        Token::OrOr | Token::BitOr | Token::BitXor => Some((2, 2)),
+        Token::AndAnd | Token::BitAnd | Token::Shr | Token::ShrLogical | Token::Shl => Some((3, 3)),
         Token::MaxOp | Token::MinOp => Some((4, 4)),
         Token::Eq | Token::Ne | Token::Lt | Token::Le | Token::Gt | Token::Ge => Some((5, 5)),
         Token::Plus | Token::Minus => Some((6, 6)),
@@ -83,8 +151,8 @@ fn token_to_binary_opcode(token: &Token) -> Opcode {
         Token::Le => CoreOp::Le,
         Token::Gt => CoreOp::Gt,
         Token::Ge => CoreOp::Ge,
-        Token::AndAnd | Token::AndKeyword => CoreOp::And,
-        Token::OrOr | Token::OrKeyword => CoreOp::Or,
+        Token::AndAnd => CoreOp::And,
+        Token::OrOr => CoreOp::Or,
         Token::BitAnd => CoreOp::BitAnd,
         Token::BitOr => CoreOp::BitOr,
         Token::BitXor => CoreOp::BitXor,
@@ -104,7 +172,16 @@ fn token_to_binary_opcode(token: &Token) -> Opcode {
 fn is_vararg(func: &FuncName) -> bool {
     matches!(
         func,
-        FuncName::Min | FuncName::Max | FuncName::Finite | FuncName::IsNan
+        FuncName::Min
+            | FuncName::Max
+            | FuncName::Finite
+            | FuncName::IsNan
+            // aCalc's two VARARG_OPERATORs (`aCalcPostfix.c:140-141`). Their trailing
+            // arguments NAME the scalar arguments the fitted coefficients are stored
+            // into, so their count is genuinely variable: `FITQ(AA)` fits and stores
+            // nothing, `FITQ(AA,C,D,E)` fits and stores all three coefficients.
+            | FuncName::FitQ
+            | FuncName::FitMQ
     )
 }
 
@@ -131,30 +208,37 @@ fn func_arity(func: &FuncName) -> u8 {
         // 2-arg core math (numeric.rs: Atan2/Fmod pop2).
         FuncName::Atan2 | FuncName::Fmod => 2,
 
-        // 2-arg string ops (string.rs: Printf/Sscanf pop2).
-        FuncName::Printf | FuncName::Sscanf => 2,
+        // 2-arg string ops (string.rs: Printf/Sscanf/BinRead/BinWrite pop2).
+        // C's element table settles this: `runtime_effect` is -1 for PRINTF
+        // ($P), SSCANF ($S), BIN_READ ($R, READ) and BIN_WRITE ($W, WRITE)
+        // alike (sCalcPostfix.c:173-195) — one net operand consumed, i.e. two
+        // popped and one pushed. Only elements with `runtime_effect` 0 are
+        // 1-in-1-out.
+        FuncName::Printf | FuncName::Sscanf | FuncName::BinRead | FuncName::BinWrite => 2,
 
         // 2-arg array ops.
-        //   NSmoo  -> ArrayOp::NSmooth   (array.rs:527 — pop n, pop array)
-        //   NDeriv -> ArrayOp::NDeriv    (array.rs:538 — pop n, pop array)
-        //   Cat    -> ArrayOp::Cat       (array.rs:553 — pop b, pop a)
-        //   FitPoly-> ArrayOp::FitPoly   (array.rs:592 — pop y, pop x)
-        //   FitQ   -> ArrayOp::FitQ      (array.rs:611 — pop y, pop x)
-        FuncName::NSmoo | FuncName::NDeriv | FuncName::Cat | FuncName::FitPoly | FuncName::FitQ => {
-            2
-        }
+        //   NSmoo  -> ArrayOp::NSmooth   (pop n, pop array)
+        //   NDeriv -> ArrayOp::NDeriv    (pop n, pop array)
+        //   Cat    -> ArrayOp::Cat       (pop b, pop a)
+        //   FitMPoly -> ArrayOp::FitMPoly (pop mask, pop y)
+        //
+        // FITMPOLY is C's only UNARY_OPERATOR with `runtime_effect = -1`
+        // (`aCalcPostfix.c:143`) — two operands in, one out. It takes NO x: like
+        // FITPOLY it fits against the ELEMENT INDEX (`aCalcPerform.c:1017-1018`,
+        // `ps2->a[i] = i`), and its second operand is the MASK.
+        FuncName::NSmoo | FuncName::NDeriv | FuncName::Cat | FuncName::FitMPoly => 2,
 
-        // 3-arg array ops.
-        //   FitMPoly -> ArrayOp::FitMPoly (array.rs:601 — pop mask, y, x)
-        //   FitMQ    -> ArrayOp::FitMQ    (array.rs:629 — pop mask, y, x)
-        FuncName::FitMPoly | FuncName::FitMQ => 3,
+        // FITPOLY is a plain UNARY_OPERATOR, `runtime_effect = 0`
+        // (`aCalcPostfix.c:142`): `FITPOLY(y)`, one operand in, one out. The port
+        // used to demand an x array as well, which no aCalc expression supplies.
+        FuncName::FitPoly => 1,
 
         // Everything else is a 1-arg function: one operand in, one out.
-        //   core math: Abs, Sqrt, Sqr, Exp, Log10, LogE, Ln, Log2, Sin,
+        //   core math: Abs, Sqrt, Sqr, Exp, Log10, LogE, Ln, Sin,
         //     Cos, Tan, Asin, Acos, Atan, Sinh, Cosh, Tanh, Ceil, Floor,
         //     Nint, Int, IsInf, Not
-        //   string 1-arg: Dbl, Str, Len, Byte, TrEsc, Esc, BinRead,
-        //     BinWrite, Crc16, ModBus, Lrc, AModBus, Xor8, AddXor8
+        //   string 1-arg: Dbl, Str, Len, Byte, TrEsc, Esc, Crc16, ModBus,
+        //     Lrc, AModBus, Xor8, AddXor8
         //   array 1-arg: Avg, Std, FwhmFunc, Sum, AMax, AMin, IxMax,
         //     IxMin, IxZ, IxNz, Arr, AToD, Smoo, Deriv, Cum
         // Vararg funcs (Min, Max, Finite, IsNan) are unreachable here.
@@ -175,7 +259,6 @@ fn func_to_opcode(func: &FuncName, nargs: u8) -> Opcode {
         FuncName::Exp => CoreOp::Exp,
         FuncName::Log10 => CoreOp::Log10,
         FuncName::LogE | FuncName::Ln => CoreOp::LogE,
-        FuncName::Log2 => CoreOp::Log2,
         FuncName::Sin => CoreOp::Sin,
         FuncName::Cos => CoreOp::Cos,
         FuncName::Tan => CoreOp::Tan,
@@ -199,6 +282,13 @@ fn func_to_opcode(func: &FuncName, nargs: u8) -> Opcode {
         FuncName::Dbl => return Opcode::String(super::opcodes::StringOp::ToDouble),
         FuncName::Str => return Opcode::String(super::opcodes::StringOp::ToString),
         FuncName::Len => return Opcode::String(super::opcodes::StringOp::Len),
+        FuncName::ANeg => return Opcode::Array(super::opcodes::ArrayOp::ANeg),
+        FuncName::APos => return Opcode::Array(super::opcodes::ArrayOp::APos),
+        FuncName::DynFetch => return Opcode::Array(super::opcodes::ArrayOp::DynFetch),
+        FuncName::DynAFetch => return Opcode::Array(super::opcodes::ArrayOp::DynAFetch),
+        FuncName::SDynFetch => return Opcode::String(super::opcodes::StringOp::DynFetch),
+        FuncName::SDynSFetch => return Opcode::String(super::opcodes::StringOp::DynSFetch),
+        FuncName::ALenNoop => return Opcode::Array(super::opcodes::ArrayOp::LenNoop),
         FuncName::Byte => return Opcode::String(super::opcodes::StringOp::Byte),
         FuncName::TrEsc => return Opcode::String(super::opcodes::StringOp::TrEsc),
         FuncName::Esc => return Opcode::String(super::opcodes::StringOp::Esc),
@@ -231,8 +321,8 @@ fn func_to_opcode(func: &FuncName, nargs: u8) -> Opcode {
         FuncName::NDeriv => return Opcode::Array(super::opcodes::ArrayOp::NDeriv),
         FuncName::FitPoly => return Opcode::Array(super::opcodes::ArrayOp::FitPoly),
         FuncName::FitMPoly => return Opcode::Array(super::opcodes::ArrayOp::FitMPoly),
-        FuncName::FitQ => return Opcode::Array(super::opcodes::ArrayOp::FitQ),
-        FuncName::FitMQ => return Opcode::Array(super::opcodes::ArrayOp::FitMQ),
+        FuncName::FitQ => return Opcode::Array(super::opcodes::ArrayOp::FitQ(nargs)),
+        FuncName::FitMQ => return Opcode::Array(super::opcodes::ArrayOp::FitMQ(nargs)),
         FuncName::Cum => return Opcode::Array(super::opcodes::ArrayOp::Cum),
         FuncName::Cat => return Opcode::Array(super::opcodes::ArrayOp::Cat),
         FuncName::ARndm => return Opcode::Array(super::opcodes::ArrayOp::ArrayRandom),
@@ -240,8 +330,24 @@ fn func_to_opcode(func: &FuncName, nargs: u8) -> Opcode {
     Opcode::Core(core)
 }
 
-fn flush_stack_entry(entry: &StackEntry, output: &mut Vec<Opcode>) {
+/// Emit one operator-stack entry to the output — C's
+/// `*pout++ = pstacktop->code`, the single move every pop site performs.
+///
+/// `kind` is needed because `[` and `{` carry a per-engine code: `[` is
+/// `SUBRANGE` in both synApps tables but `{` is `REPLACE` in sCalc
+/// (`sCalcPostfix.c:216`) and `SUBRANGE_IP` in aCalc (`aCalcPostfix.c:213`).
+fn flush_stack_entry(entry: &StackEntry, output: &mut Vec<Opcode>, kind: ExprKind) {
     match entry {
+        StackEntry::Subrange { in_place, .. } => {
+            output.push(match (kind, in_place) {
+                (ExprKind::Array, false) => Opcode::Array(super::opcodes::ArrayOp::ArraySubrange),
+                (ExprKind::Array, true) => {
+                    Opcode::Array(super::opcodes::ArrayOp::ArraySubrangeInPlace)
+                }
+                (_, false) => Opcode::String(super::opcodes::StringOp::Subrange),
+                (_, true) => Opcode::String(super::opcodes::StringOp::Replace),
+            });
+        }
         StackEntry::Op {
             token: Token::Minus,
             in_stack_pri: 9,
@@ -275,43 +381,78 @@ fn flush_stack_entry(entry: &StackEntry, output: &mut Vec<Opcode>) {
         StackEntry::CondEnd => {
             output.push(Opcode::Core(CoreOp::CondEnd));
         }
-        StackEntry::Store { var_idx, is_double } => {
-            if *is_double {
-                output.push(Opcode::Core(CoreOp::StoreDoubleVar(*var_idx)));
-            } else {
-                output.push(Opcode::Core(CoreOp::StoreVar(*var_idx)));
-            }
+        StackEntry::UntilEnd { until_pc } => {
+            // The two halves of the loop learn each other's position here, the
+            // one moment both are known.
+            let end_pc = output.len();
+            output.push(Opcode::Control(ControlOp::UntilEnd(*until_pc)));
+            output[*until_pc] = Opcode::Control(ControlOp::Until(end_pc));
+        }
+        StackEntry::Store(target) => {
+            use super::opcodes::{ArrayOp, StringOp};
+            output.push(match target {
+                StoreTarget::Var(idx) => Opcode::Core(CoreOp::StoreVar(*idx)),
+                StoreTarget::DoubleVar(idx) => Opcode::Core(CoreOp::StoreDoubleVar(*idx)),
+                // `A_STORE` is spelled once per engine, like every other opcode
+                // the two synApps evaluators share.
+                StoreTarget::Dyn => match kind {
+                    ExprKind::Array => Opcode::Array(ArrayOp::DynStore),
+                    _ => Opcode::String(StringOp::DynStore),
+                },
+                // `@@n:=` is A_SSTORE in sCalc (a string arg) and A_ASTORE in
+                // aCalc (an array arg) — the same split as `{`.
+                StoreTarget::DynDouble => match kind {
+                    ExprKind::Array => Opcode::Array(ArrayOp::DynAStore),
+                    _ => Opcode::String(StringOp::DynSStore),
+                },
+            });
         }
         StackEntry::LParen => {}
     }
 }
 
-pub fn compile(tokens: &[Token]) -> Result<CompiledExpr, CalcError> {
-    if tokens.is_empty() {
-        return Ok(CompiledExpr {
-            code: vec![Opcode::Core(CoreOp::End)],
-            kind: ExprKind::Numeric,
-            loop_pairs: Vec::new(),
-        });
-    }
-
+/// Compile a token stream for ONE engine.
+///
+/// `tokens` must come from `token::tokenize(_, kind)`: that is where the C
+/// compiler's `ELEMENT` table is applied, so every symbol here is one this
+/// engine has. The resulting `CompiledExpr` carries only opcodes its evaluator
+/// can execute.
+/// Compile a token stream. A source with no tokens is NOT special-cased: C only
+/// short-circuits the literal empty string (`*psrc == '\0'`), and an expression
+/// that merely *lexes* to nothing — `"   "` — walks the normal path and comes
+/// out `CALC_ERR_INCOMPLETE`, because `operand_needed` is still set at the end.
+/// Compiled C, all three engines: `postfix("   ")` = -1, error 8. The empty
+/// SOURCE is handled by each engine's entry point in `calc::mod`, where C puts
+/// it.
+pub fn compile(tokens: &[Token], kind: ExprKind) -> Result<CompiledExpr, CalcError> {
     let mut output: Vec<Opcode> = Vec::new();
     let mut stack: Vec<StackEntry> = Vec::new();
     let mut operand_needed = true;
     let mut runtime_depth: i32 = 0;
     let mut cond_count: i32 = 0;
     let mut pos = 0;
-    #[allow(unused_mut)]
-    let mut has_string_ops = false;
-    #[allow(unused_mut)]
-    let mut has_array_ops = false;
-    let mut bracket_depth: i32 = 0;
-    let mut brace_depth: i32 = 0;
-    let mut until_stack: Vec<usize> = Vec::new();
+    // C `*ppostfix = USES_STRING` (`sCalcPostfix.c:447-471`) — latched as each
+    // element is LOOKED UP, which is the only moment the retract-and-rewrite of
+    // `:=` has not yet erased the evidence. sCalc's marker only; the numeric and
+    // array compilers have none.
+    let mut uses_string = false;
+    // The ceiling this flavour's `*Perform` can actually hold, from its own
+    // element table (C `CALCPERFORM_STACK` 80 / `SCALC_STACKSIZE` 30 /
+    // `ACALC_STACKSIZE` 20). One shared compiler, three C limits: a literal here
+    // was right for sCalc and wrong in OPPOSITE directions for the other two.
+    let stack_size = super::token::runtime_stack_size(kind);
+    // No `bracket_depth` / `brace_depth` counters: the open `[` / `{` IS a
+    // `StackEntry::Subrange` on the operator stack, exactly as in C, so the stack
+    // already answers "is one open, and which". A side counter was a second
+    // record of the same fact and could disagree with the stack.
 
     while pos < tokens.len() {
         let token = &tokens[pos];
         pos += 1;
+
+        if kind == ExprKind::String && token_is_string_element(token) {
+            uses_string = true;
+        }
 
         if operand_needed {
             match token {
@@ -335,6 +476,18 @@ pub fn compile(tokens: &[Token]) -> Result<CompiledExpr, CalcError> {
                     runtime_depth += 1;
                     operand_needed = false;
                 }
+                Token::FetchAval => {
+                    output.push(Opcode::Array(super::opcodes::ArrayOp::FetchAval));
+                    runtime_depth += 1;
+                    operand_needed = false;
+                }
+                Token::FetchSval => {
+                    output.push(Opcode::Core(CoreOp::FetchSval));
+                    runtime_depth += 1;
+                    operand_needed = false;
+                    // C sCalcPostfix.c:452 lists FETCH_SVAL among the opcodes
+                    // that mark the postfix USES_STRING.
+                }
                 Token::Rndm => {
                     output.push(Opcode::Core(CoreOp::Random));
                     runtime_depth += 1;
@@ -350,6 +503,8 @@ pub fn compile(tokens: &[Token]) -> Result<CompiledExpr, CalcError> {
                         ConstName::Pi => output.push(Opcode::Core(CoreOp::Pi)),
                         ConstName::D2R => output.push(Opcode::Core(CoreOp::D2R)),
                         ConstName::R2D => output.push(Opcode::Core(CoreOp::R2D)),
+                        ConstName::S2R => output.push(Opcode::Core(CoreOp::S2R)),
+                        ConstName::R2S => output.push(Opcode::Core(CoreOp::R2S)),
                     }
                     runtime_depth += 1;
                     operand_needed = false;
@@ -361,26 +516,25 @@ pub fn compile(tokens: &[Token]) -> Result<CompiledExpr, CalcError> {
                     )));
                     runtime_depth += 1;
                     operand_needed = false;
-                    has_string_ops = true;
                 }
 
                 // Unary operators
                 Token::Minus => {
-                    pop_higher_or_equal(&mut stack, 10, &mut output, &mut runtime_depth);
+                    pop_higher_or_equal(&mut stack, 10, &mut output, &mut runtime_depth, kind);
                     stack.push(StackEntry::Op {
                         token: Token::Minus,
                         in_stack_pri: 9,
                     });
                 }
                 Token::Bang => {
-                    pop_higher_or_equal(&mut stack, 10, &mut output, &mut runtime_depth);
+                    pop_higher_or_equal(&mut stack, 10, &mut output, &mut runtime_depth, kind);
                     stack.push(StackEntry::Op {
                         token: Token::Bang,
                         in_stack_pri: 9,
                     });
                 }
                 Token::Tilde => {
-                    pop_higher_or_equal(&mut stack, 10, &mut output, &mut runtime_depth);
+                    pop_higher_or_equal(&mut stack, 10, &mut output, &mut runtime_depth, kind);
                     stack.push(StackEntry::Op {
                         token: Token::Tilde,
                         in_stack_pri: 9,
@@ -391,21 +545,23 @@ pub fn compile(tokens: &[Token]) -> Result<CompiledExpr, CalcError> {
                     stack.push(StackEntry::LParen);
                 }
 
+                // C `UNTIL_OPERATOR` (`sCalcPostfix.c:759-784`): flush the
+                // operators of >= priority (in_coming_pri 10), emit `UNTIL` to
+                // the output, then push the `UNTIL_END` half onto the OPERATOR
+                // stack, where the ordinary flush rules will place it. Both
+                // halves have runtime_effect 0, and `operand_needed` is
+                // untouched — the loop body still owes an operand.
                 Token::UntilKeyword => {
-                    // UNTIL marks the start of a loop.
-                    // Record the current output position as the loop start.
-                    // Emit placeholder Until opcode (will be patched).
+                    pop_higher_or_equal(&mut stack, 10, &mut output, &mut runtime_depth, kind);
                     let until_pc = output.len();
-                    output.push(Opcode::Control(
-                        super::opcodes::ControlOp::Until(0), // placeholder
-                    ));
-                    until_stack.push(until_pc);
-                    has_string_ops = true;
-                    // operand_needed remains true (body follows)
+                    // Patched by `flush_stack_entry` when the paired `UntilEnd`
+                    // entry comes off the stack.
+                    output.push(Opcode::Control(ControlOp::Until(0)));
+                    stack.push(StackEntry::UntilEnd { until_pc });
                 }
 
                 Token::Func(func) => {
-                    pop_higher_or_equal(&mut stack, 10, &mut output, &mut runtime_depth);
+                    pop_higher_or_equal(&mut stack, 10, &mut output, &mut runtime_depth, kind);
                     if is_vararg(func) {
                         stack.push(StackEntry::VarargFunc {
                             func: func.clone(),
@@ -434,7 +590,7 @@ pub fn compile(tokens: &[Token]) -> Result<CompiledExpr, CalcError> {
             match token {
                 t if binary_op(t).is_some() => {
                     let (isp, icp) = binary_op(t).unwrap();
-                    pop_higher_or_equal(&mut stack, icp, &mut output, &mut runtime_depth);
+                    pop_higher_or_equal(&mut stack, icp, &mut output, &mut runtime_depth, kind);
                     stack.push(StackEntry::Op {
                         token: t.clone(),
                         in_stack_pri: isp,
@@ -442,59 +598,86 @@ pub fn compile(tokens: &[Token]) -> Result<CompiledExpr, CalcError> {
                     operand_needed = true;
                 }
 
-                Token::RParen => {
-                    loop {
-                        match stack.last() {
-                            None => return Err(CalcError::ParenNotOpen),
-                            Some(StackEntry::LParen) => {
-                                stack.pop();
-                                break;
-                            }
-                            _ => {
-                                let entry = stack.pop().unwrap();
-                                runtime_depth += stack_effect(&entry);
-                                flush_stack_entry(&entry, &mut output);
-                            }
+                // C `CLOSE_PAREN` (`sCalcPostfix.c:634-663`): pop to the `(`,
+                // remove it, and STOP. The function below the `(` is NOT emitted
+                // — it stays on the operator stack at in_stack_pri 9 and is
+                // emitted later, by whatever pops it.
+                //
+                // That deferral is the whole of R13-2. `[` and `{` come in at
+                // in_coming_pri 11, above 9, so they do not pop the function, and
+                // `LEN("abcd")[0,1]` compiles to `"abcd", 0, 1, SUBRANGE, LEN` —
+                // the function applied to the SUBRANGE. C's own postfix dump for
+                // `ABS(1)[0,1]` is `1, 0, 1, SUBRANGE, ABS_VAL`. The port used to
+                // flush the function here, which bound it to its own argument
+                // instead: compiled C vs the old port, `LEN("abcd")[0,1]` = 2 vs 4,
+                // `SQRT(4){"2","9"}` = 2 vs 9, `INT("12.9")[0,1]` = 12 vs 13, and
+                // aCalc `AMAX(AA)[0,1]` (AA=[3,1,2,9]) = 3 vs 9.
+                //
+                // Every OTHER operator has in_coming_pri <= 10, so it pops the
+                // function on arrival and the emitted order is unchanged: `SQRT(4)+1`
+                // is still `4, SQRT, 1, ADD`.
+                Token::RParen => loop {
+                    match stack.last() {
+                        None => return Err(CalcError::ParenNotOpen),
+                        Some(StackEntry::LParen) => {
+                            stack.pop();
+                            // C `:651-662`: a VARARG_OPERATOR below the `(`
+                            // inherits the paren's accumulated argument count.
+                            // The port keeps that count on the entry itself and
+                            // has been maintaining it at each `,`, so there is
+                            // nothing to transfer — and, like C, nothing to emit.
+                            break;
+                        }
+                        _ => {
+                            let entry = stack.pop().unwrap();
+                            runtime_depth += stack_effect(&entry);
+                            flush_stack_entry(&entry, &mut output, kind);
                         }
                     }
-                    if let Some(StackEntry::VarargFunc { .. }) = stack.last() {
-                        let entry = stack.pop().unwrap();
-                        runtime_depth += stack_effect(&entry);
-                        flush_stack_entry(&entry, &mut output);
-                    } else if let Some(StackEntry::Op {
-                        token: Token::Func(_),
-                        ..
-                    }) = stack.last()
-                    {
-                        let entry = stack.pop().unwrap();
-                        runtime_depth += stack_effect(&entry);
-                        flush_stack_entry(&entry, &mut output);
-                    }
-                }
+                },
 
+                // C `SEPARATOR` (`sCalcPostfix.c:612-631`): pop to the innermost
+                // `(`, `[` or `{` — all three are separator barriers — and charge
+                // one more argument to it.
                 Token::Comma => {
                     loop {
                         match stack.last() {
                             None => return Err(CalcError::BadSeparator),
-                            Some(StackEntry::LParen) => break,
+                            Some(e) if is_barrier(e) => break,
                             _ => {
                                 let entry = stack.pop().unwrap();
                                 runtime_depth += stack_effect(&entry);
-                                flush_stack_entry(&entry, &mut output);
+                                flush_stack_entry(&entry, &mut output, kind);
                             }
                         }
                     }
-                    let lparen_idx = stack.len() - 1;
-                    if lparen_idx > 0 {
-                        if let StackEntry::VarargFunc { nargs, .. } = &mut stack[lparen_idx - 1] {
-                            *nargs += 1;
+                    match stack.last_mut() {
+                        // A `,` inside `[` / `{` belongs to the SUBRANGE, and C
+                        // charges it to that entry (`:630`). It must not reach a
+                        // vararg function further down: compiled C gives
+                        // `MAX(4,7)[0,0]` = 7, i.e. `MAX` still took two arguments,
+                        // not three. Sharing one stack variant with `(` is what let
+                        // the bracket's `,` bump the vararg's count.
+                        Some(StackEntry::Subrange { runtime_effect, .. }) => *runtime_effect -= 1,
+                        // A `,` directly inside a vararg call's `(` is one more
+                        // argument to that function.
+                        Some(StackEntry::LParen) => {
+                            let lparen_idx = stack.len() - 1;
+                            if lparen_idx > 0 {
+                                if let StackEntry::VarargFunc { nargs, .. } =
+                                    &mut stack[lparen_idx - 1]
+                                {
+                                    *nargs += 1;
+                                }
+                            }
                         }
+                        _ => unreachable!("the loop above only breaks on a barrier"),
                     }
                     operand_needed = true;
                 }
 
                 Token::Question => {
-                    pop_higher_strict(&mut stack, 0, &mut output, &mut runtime_depth);
+                    pop_higher_strict(&mut stack, 0, &mut output, &mut runtime_depth, kind);
                     output.push(Opcode::Core(CoreOp::CondIf));
                     runtime_depth -= 1;
                     cond_count += 1;
@@ -502,7 +685,7 @@ pub fn compile(tokens: &[Token]) -> Result<CompiledExpr, CalcError> {
                 }
 
                 Token::Colon => {
-                    pop_higher_strict(&mut stack, 0, &mut output, &mut runtime_depth);
+                    pop_higher_strict(&mut stack, 0, &mut output, &mut runtime_depth, kind);
                     output.push(Opcode::Core(CoreOp::CondElse));
                     runtime_depth -= 1;
                     cond_count -= 1;
@@ -520,23 +703,14 @@ pub fn compile(tokens: &[Token]) -> Result<CompiledExpr, CalcError> {
                         }
                         let entry = stack.pop().unwrap();
                         runtime_depth += stack_effect(&entry);
-                        flush_stack_entry(&entry, &mut output);
+                        flush_stack_entry(&entry, &mut output, kind);
                     }
-                    // If there's a pending UNTIL, close it.
-                    if let Some(until_pc) = until_stack.pop() {
-                        let end_pc = output.len();
-                        output.push(Opcode::Control(super::opcodes::ControlOp::UntilEnd(
-                            until_pc,
-                        )));
-                        // Patch the Until opcode with the end_pc
-                        output[until_pc] =
-                            Opcode::Control(super::opcodes::ControlOp::Until(end_pc));
-                        // Runtime effect: the `Until` marker is a no-op (0),
-                        // but `UntilEnd` pops the loop condition (see
-                        // string.rs evaluator: `pop1_f64`) and pushes
-                        // nothing — a net runtime depth delta of -1.
-                        runtime_depth -= 1;
-                    }
+                    // A pending `UNTIL_END` is NOT closed here by a rule of its
+                    // own: it is an ordinary operator-stack entry, so the loop
+                    // above already flushed it if and only if it was above the
+                    // innermost `(`. Inside `UNTIL(...)` it is not, which is why
+                    // the condition ends up INSIDE the loop.
+                    //
                     // C postfix.c:452-455 — at a `;` terminator the net runtime
                     // depth must not exceed 1.
                     if cond_count != 0 {
@@ -548,118 +722,145 @@ pub fn compile(tokens: &[Token]) -> Result<CompiledExpr, CalcError> {
                     operand_needed = true;
                 }
 
+                // C `STORE_OPERATOR` (`sCalcPostfix.c:515-567`, `aCalcPostfix.c:483-...`).
+                // It has TWO shapes, and C tries them in this order:
+                //
+                //  1. A DYNAMIC store. Search the operator stack for a pending
+                //     `A_FETCH` (`@`) or `A_SFETCH`/`A_AFETCH` (`@@`) — the unary
+                //     operator whose index expression has already been emitted —
+                //     and rewrite THAT entry in place into `A_STORE` / `A_SSTORE`
+                //     (`A_ASTORE` in aCalc). Nothing is retracted from the output:
+                //     the index stays, the value follows it, and the store opcode
+                //     pops both. Operators sitting ABOVE the rewritten entry are
+                //     flushed (`:531-546`), since `:=` has in_coming_pri 0.
+                //
+                //  2. Otherwise the STATIC store: retract the fetch just emitted
+                //     (FETCH_A..FETCH_P or FETCH_AA..FETCH_LL) and park a STORE on
+                //     the stack. Anything else is CALC_ERR_BAD_ASSIGNMENT.
+                //
+                // Either way the store is left ON the operator stack, so a store
+                // from an earlier `:=` in a chain stays there — which is how
+                // `A:=B:=5` reaches the end at depth -1 and is CALC_ERR_INCOMPLETE
+                // rather than underflowing mid-parse.
                 Token::Assign => {
-                    match output.last() {
-                        Some(Opcode::Core(CoreOp::PushVar(idx))) => {
-                            let idx = *idx;
-                            output.pop();
-                            runtime_depth -= 1;
-                            while let Some(entry) = stack.last() {
-                                if matches!(entry, StackEntry::LParen) {
-                                    break;
-                                }
-                                if entry.in_stack_pri() >= 1 {
-                                    let entry = stack.pop().unwrap();
-                                    runtime_depth += stack_effect(&entry);
-                                    flush_stack_entry(&entry, &mut output);
-                                } else {
-                                    break;
-                                }
+                    let pending_dyn = stack.iter().rposition(|e| {
+                        matches!(
+                            e,
+                            StackEntry::Op {
+                                token: Token::Func(
+                                    FuncName::SDynFetch
+                                        | FuncName::SDynSFetch
+                                        | FuncName::DynFetch
+                                        | FuncName::DynAFetch
+                                ),
+                                ..
                             }
-                            stack.push(StackEntry::Store {
-                                var_idx: idx,
-                                is_double: false,
-                            });
+                        )
+                    });
+                    match pending_dyn {
+                        Some(at) => {
+                            // C: "Move operators of >= priority to the output, but
+                            // stop before ps1" — `:=` has in_coming_pri 0, so every
+                            // entry above the fetch goes.
+                            while stack.len() > at + 1 {
+                                let entry = stack.pop().unwrap();
+                                runtime_depth += stack_effect(&entry);
+                                flush_stack_entry(&entry, &mut output, kind);
+                            }
+                            let StackEntry::Op {
+                                token: Token::Func(f),
+                                ..
+                            } = &stack[at]
+                            else {
+                                unreachable!("rposition matched a Func entry")
+                            };
+                            let target = match f {
+                                FuncName::SDynFetch | FuncName::DynFetch => StoreTarget::Dyn,
+                                _ => StoreTarget::DynDouble,
+                            };
+                            stack[at] = StackEntry::Store(target);
                         }
-                        Some(Opcode::Core(CoreOp::PushDoubleVar(idx))) => {
-                            let idx = *idx;
+                        None => {
+                            let target = match output.last() {
+                                Some(Opcode::Core(CoreOp::PushVar(idx))) => StoreTarget::Var(*idx),
+                                Some(Opcode::Core(CoreOp::PushDoubleVar(idx))) => {
+                                    StoreTarget::DoubleVar(*idx)
+                                }
+                                _ => return Err(CalcError::BadAssignment),
+                            };
                             output.pop();
-                            runtime_depth -= 1;
-                            stack.push(StackEntry::Store {
-                                var_idx: idx,
-                                is_double: true,
-                            });
+                            stack.push(StackEntry::Store(target));
                         }
-                        _ => return Err(CalcError::BadAssignment),
                     }
+                    // The `:=` element's own runtime_effect, -1, charged on both
+                    // paths (`sCalcPostfix.c:566`). On the static path it cancels
+                    // the fetch that was just retracted; on the dynamic path it
+                    // accounts for the index the store will pop.
+                    runtime_depth -= 1;
                     operand_needed = true;
                 }
 
-                // Bracket subrange: expr[start,end] → Subrange
-                Token::LBracket => {
-                    // Flush pending operators
-                    pop_higher_or_equal(&mut stack, 11, &mut output, &mut runtime_depth);
-                    stack.push(StackEntry::LParen); // reuse LParen mechanics
+                // `expr[i,j]` and `expr{i,j}`. Both delimiters are in the two
+                // synApps tables, but `{` does NOT mean the same thing in both
+                // engines: sCalc has `[`=SUBRANGE / `{`=REPLACE
+                // (sCalcPostfix.c:215-216) while aCalc has `[`=SUBRANGE /
+                // `{`=SUBRANGE_IP, the in-place variant (aCalcPostfix.c:212-213).
+                // `flush_stack_entry` picks by `kind`.
+                //
+                // C reads them as BINARY_OPERATORs with in_coming_pri 11 — so the
+                // pop-on-arrival flushes only operators at in_stack_pri >= 11, and
+                // NOTHING in any table has one. In particular a function below a
+                // just-closed `)` (in_stack_pri 9) survives, which is R13-2.
+                Token::LBracket | Token::LBrace => {
+                    let in_place = matches!(token, Token::LBrace);
+                    pop_higher_or_equal(&mut stack, 11, &mut output, &mut runtime_depth, kind);
+                    stack.push(StackEntry::Subrange {
+                        in_place,
+                        // The table's own `runtime_effect` column: -1
+                        // (sCalcPostfix.c:215-216). Each `,` charges one more.
+                        runtime_effect: -1,
+                    });
                     operand_needed = true;
-                    has_string_ops = true;
-                    // Mark that we need to emit Subrange on RBracket
-                    bracket_depth += 1;
                 }
 
-                // Brace replace: expr{find,replace} → Replace
-                Token::LBrace => {
-                    pop_higher_or_equal(&mut stack, 11, &mut output, &mut runtime_depth);
-                    stack.push(StackEntry::LParen);
-                    operand_needed = true;
-                    has_string_ops = true;
-                    brace_depth += 1;
-                }
-
-                Token::RBracket => {
-                    if bracket_depth == 0 {
-                        return Err(CalcError::BracketNotOpen);
-                    }
-                    bracket_depth -= 1;
-                    // Pop until matching LParen
+                // C `CLOSE_BRACKET` / `CLOSE_CURLY` (`sCalcPostfix.c:666-719`):
+                // pop to the matching `[` / `{`, then emit THAT entry's code and
+                // add its accumulated runtime effect. The close delimiter itself
+                // generates nothing — the opener carries the opcode.
+                Token::RBracket | Token::RBrace => {
+                    let want_in_place = matches!(token, Token::RBrace);
+                    let not_open = if want_in_place {
+                        CalcError::BraceNotOpen
+                    } else {
+                        CalcError::BracketNotOpen
+                    };
                     loop {
                         match stack.last() {
-                            None => return Err(CalcError::BracketNotOpen),
-                            Some(StackEntry::LParen) => {
-                                stack.pop();
+                            None => return Err(not_open),
+                            Some(StackEntry::Subrange { in_place, .. })
+                                if *in_place == want_in_place =>
+                            {
+                                let entry = stack.pop().unwrap();
+                                runtime_depth += stack_effect(&entry);
+                                flush_stack_entry(&entry, &mut output, kind);
                                 break;
                             }
                             _ => {
                                 let entry = stack.pop().unwrap();
                                 runtime_depth += stack_effect(&entry);
-                                flush_stack_entry(&entry, &mut output);
+                                flush_stack_entry(&entry, &mut output, kind);
                             }
                         }
                     }
-                    output.push(Opcode::String(super::opcodes::StringOp::Subrange));
-                    runtime_depth -= 2; // consumes string + 2 args, pushes 1
-                }
-
-                Token::RBrace => {
-                    if brace_depth == 0 {
-                        return Err(CalcError::BraceNotOpen);
-                    }
-                    brace_depth -= 1;
-                    loop {
-                        match stack.last() {
-                            None => return Err(CalcError::BraceNotOpen),
-                            Some(StackEntry::LParen) => {
-                                stack.pop();
-                                break;
-                            }
-                            _ => {
-                                let entry = stack.pop().unwrap();
-                                runtime_depth += stack_effect(&entry);
-                                flush_stack_entry(&entry, &mut output);
-                            }
-                        }
-                    }
-                    output.push(Opcode::String(super::opcodes::StringOp::Replace));
-                    runtime_depth -= 2; // consumes string + 2 args, pushes 1
                 }
 
                 Token::PipeMinus => {
-                    pop_higher_or_equal(&mut stack, 6, &mut output, &mut runtime_depth);
+                    pop_higher_or_equal(&mut stack, 6, &mut output, &mut runtime_depth, kind);
                     stack.push(StackEntry::Op {
                         token: Token::PipeMinus,
                         in_stack_pri: 6,
                     });
                     operand_needed = true;
-                    has_string_ops = true;
                 }
 
                 _ => return Err(CalcError::Syntax),
@@ -669,7 +870,7 @@ pub fn compile(tokens: &[Token]) -> Result<CompiledExpr, CalcError> {
         if runtime_depth < 0 {
             return Err(CalcError::Underflow);
         }
-        if runtime_depth >= 30 {
+        if runtime_depth >= stack_size {
             return Err(CalcError::Overflow);
         }
     }
@@ -681,7 +882,7 @@ pub fn compile(tokens: &[Token]) -> Result<CompiledExpr, CalcError> {
             StackEntry::LParen => return Err(CalcError::ParenOpen),
             _ => {
                 runtime_depth += stack_effect(&entry);
-                flush_stack_entry(&entry, &mut output);
+                flush_stack_entry(&entry, &mut output, kind);
             }
         }
     }
@@ -690,52 +891,83 @@ pub fn compile(tokens: &[Token]) -> Result<CompiledExpr, CalcError> {
         return Err(CalcError::Conditional);
     }
 
-    // End-of-expression well-formedness.
+    // End-of-expression well-formedness. ONE rule, the same in all three C
+    // compilers (`postfix.c:499-502`, `sCalcPostfix.c:862-870`,
+    // `aCalcPostfix.c:790-799`): the program must leave exactly one value on the
+    // runtime stack.
     //
-    // epics-base `postfix.c:499-502` requires a net runtime depth of exactly
-    // 1 (one value left to fetch). This Rust engine is a synApps superset:
-    // sCalc/aCalc store-assignment (`A:=5`, `BB:=AA`, `AA:="x"`) is a valid
-    // side-effect-only construct that legitimately terminates with the
-    // runtime stack at depth 0. The strict `== 1` rule therefore cannot be
-    // applied globally. (`UNTIL <cond>; <body>` value-producing forms still
-    // end at depth 1 — the `UntilEnd` opcode consumes the loop condition.)
+    // An assignment has runtime_effect -1 (`sCalcPostfix.c:226`) and pushes
+    // nothing, so a store-TERMINATED source ends at depth 0 and is rejected:
+    // compiled sCalcPostfix answers CALC_ERR_INCOMPLETE for `A:=5`, `AA:="x"`,
+    // `A:=5;B:=6` and `A:=B:=5`, and 0 for `A:=5;A`. An expression that assigns
+    // must still say what its value is.
     //
-    // The rule:
-    //   - depth 1                       -> value-producing expression, OK.
-    //   - depth 0 AND the final emitted
-    //     opcode is a store             -> store-terminated expression, OK.
-    //   - depth 0 otherwise             -> an operand was consumed without a
-    //                                      result (e.g. `CAT(AA)` with too
-    //                                      few args) -> Incomplete.
-    //   - depth > 1                     -> residual values (`1 2`, `A;B`)
-    //                                      -> Incomplete (TooMany already
-    //                                      fired at any `;`).
-    // The empty-program case (`output` is empty before the End sentinel) is
-    // a deliberate Rust special case and is exempt.
-    let ends_with_store = matches!(
-        output.last(),
-        Some(Opcode::Core(CoreOp::StoreVar(_))) | Some(Opcode::Core(CoreOp::StoreDoubleVar(_)))
-    );
-    let depth_ok = runtime_depth == 1 || (runtime_depth == 0 && ends_with_store);
-    if !output.is_empty() && (operand_needed || !depth_ok) {
+    // The port exempted depth 0 when the last emitted opcode was a store, which
+    // accepted every one of those. There is no exemption: depth 1 or Incomplete.
+    //
+    // A source that produced no opcodes at all lands here too — `operand_needed`
+    // is still set, so it is Incomplete, which is what C answers for a
+    // whitespace-only expression, the only way to get here (the empty string
+    // never reaches the compiler; see `calc::compile`).
+    if operand_needed || runtime_depth != 1 {
         return Err(CalcError::Incomplete);
     }
 
     output.push(Opcode::Core(CoreOp::End));
 
-    let kind = if has_array_ops {
-        ExprKind::Array
-    } else if has_string_ops {
-        ExprKind::String
-    } else {
-        ExprKind::Numeric
-    };
+    // No post-pass gate on which opcodes this engine may emit: `token::ElementTable`
+    // is the single owner of that (one table per C compiler, applied while lexing,
+    // exactly as C's `get_element` does), and every token it spells now compiles to
+    // an opcode this engine's evaluator runs — including `[` and `{`, which are a
+    // string slice in sCalc and an array subrange in aCalc.
 
     Ok(CompiledExpr {
         code: output,
         kind,
-        loop_pairs: Vec::new(),
+        uses_string,
     })
+}
+
+/// C's USES_STRING test, applied where C applies it: to the ELEMENT the lexer
+/// just looked up (`sCalcPostfix.c:447-471`), not to the opcode that survives
+/// compilation.
+///
+/// The two are not the same set. `:=` RETRACTS the fetch it follows and emits a
+/// store instead (`:552-557`), so `AA:="x"` compiles to a program with no
+/// string-typed opcode in it — yet C has already stamped it USES_STRING, from
+/// the `FETCH_AA` it looked up a moment earlier, and runs the string evaluator.
+/// Recording the flag here, at the lookup, is the only place that can see it.
+///
+/// The list is C's, symbol for symbol — an ALLOWLIST, and a narrower one than
+/// "mentions a string": `DBL`, `BYTE`, `|-` and `@` are all absent from it, so a
+/// program whose only string element is one of those keeps the double-only
+/// evaluator (which is R14-2's subject).
+fn token_is_string_element(token: &Token) -> bool {
+    match token {
+        // FETCH_AA..FETCH_LL, FETCH_SVAL, LITERAL_STRING.
+        Token::DoubleVar(_) | Token::FetchSval | Token::StringLiteral(_) => true,
+        // SUBRANGE (`[`) and REPLACE (`{`) — the sCalc table's codes for them.
+        Token::LBracket | Token::LBrace => true,
+        Token::Func(f) => matches!(
+            f,
+            FuncName::Str           // TO_STRING
+                | FuncName::Printf  // PRINTF
+                | FuncName::BinWrite // BIN_WRITE
+                | FuncName::Sscanf  // SSCANF
+                | FuncName::BinRead // BIN_READ
+                | FuncName::SDynSFetch // A_SFETCH (`@@`)
+                | FuncName::TrEsc   // TR_ESC
+                | FuncName::Esc     // ESC
+                | FuncName::Crc16   // CRC16
+                | FuncName::ModBus  // MODBUS
+                | FuncName::Lrc     // LRC
+                | FuncName::AModBus // AMODBUS
+                | FuncName::Xor8    // XOR8
+                | FuncName::AddXor8 // ADD_XOR8
+                | FuncName::Len // LEN
+        ),
+        _ => false,
+    }
 }
 
 fn stack_effect(entry: &StackEntry) -> i32 {
@@ -763,9 +995,25 @@ fn stack_effect(entry: &StackEntry) -> i32 {
         StackEntry::Op { .. } => -1,
         StackEntry::VarargFunc { nargs, .. } => 1 - (*nargs as i32),
         StackEntry::CondEnd => 0,
-        StackEntry::Store { .. } => -1,
+        StackEntry::Store(_) => -1,
         StackEntry::LParen => 0,
+        // The effect C accumulated on the `[` / `{` entry itself: -1 from the
+        // table plus -1 per `,`.
+        StackEntry::Subrange { runtime_effect, .. } => *runtime_effect,
+        // C `sCalcPostfix.c:783` sets `runtime_effect = 0` on the UNTIL_END
+        // element explicitly: the opcode only PEEKS the condition
+        // (`sCalcPerform.c:1999`, `if (ps->d == 0)`), so the condition survives
+        // as the value of the whole `UNTIL(...)`.
+        StackEntry::UntilEnd { .. } => 0,
     }
+}
+
+/// A `(`, `[` or `{` still open. C's pop loops all stop here — every one of the
+/// three carries `in_stack_pri` 0, so no incoming operator's `>=` / `>` test can
+/// reach past it, and the explicit `while (pstacktop > stack)` guard keeps the
+/// bottom of the stack safe.
+fn is_barrier(entry: &StackEntry) -> bool {
+    matches!(entry, StackEntry::LParen | StackEntry::Subrange { .. })
 }
 
 fn pop_higher_or_equal(
@@ -773,18 +1021,15 @@ fn pop_higher_or_equal(
     incoming_pri: u8,
     output: &mut Vec<Opcode>,
     runtime_depth: &mut i32,
+    kind: ExprKind,
 ) {
     while let Some(entry) = stack.last() {
-        if matches!(entry, StackEntry::LParen) {
+        if is_barrier(entry) || entry.in_stack_pri() < incoming_pri {
             break;
         }
-        if entry.in_stack_pri() >= incoming_pri {
-            let entry = stack.pop().unwrap();
-            *runtime_depth += stack_effect(&entry);
-            flush_stack_entry(&entry, output);
-        } else {
-            break;
-        }
+        let entry = stack.pop().unwrap();
+        *runtime_depth += stack_effect(&entry);
+        flush_stack_entry(&entry, output, kind);
     }
 }
 
@@ -793,17 +1038,14 @@ fn pop_higher_strict(
     incoming_pri: u8,
     output: &mut Vec<Opcode>,
     runtime_depth: &mut i32,
+    kind: ExprKind,
 ) {
     while let Some(entry) = stack.last() {
-        if matches!(entry, StackEntry::LParen) {
+        if is_barrier(entry) || entry.in_stack_pri() <= incoming_pri {
             break;
         }
-        if entry.in_stack_pri() > incoming_pri {
-            let entry = stack.pop().unwrap();
-            *runtime_depth += stack_effect(&entry);
-            flush_stack_entry(&entry, output);
-        } else {
-            break;
-        }
+        let entry = stack.pop().unwrap();
+        *runtime_depth += stack_effect(&entry);
+        flush_stack_entry(&entry, output, kind);
     }
 }

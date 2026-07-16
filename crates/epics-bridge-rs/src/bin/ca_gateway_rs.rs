@@ -65,9 +65,12 @@ struct Args {
     #[arg(long, conflicts_with = "report")]
     no_report: bool,
 
-    /// CA server port (downstream side). 0 = use default 5064.
-    #[arg(long, default_value_t = 0)]
-    port: u16,
+    /// CA server port (downstream side). Omit to take
+    /// `EPICS_CAS_SERVER_PORT`, then `EPICS_CA_SERVER_PORT`, then 5064 —
+    /// C's `-sport` sets `EPICS_CAS_SERVER_PORT` and the CAS reads it
+    /// back (`gateway.cc:398-401`). `--port 0` binds an ephemeral port.
+    #[arg(long)]
+    port: Option<u16>,
 
     /// Downstream listen-interface list (C `-sip`): sets
     /// `EPICS_CAS_INTF_ADDR_LIST` so the gateway's CA server binds only the

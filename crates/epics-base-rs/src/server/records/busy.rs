@@ -1,94 +1,6 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, ProcessAction, ProcessOutcome, Record};
-use crate::types::{DbFieldType, EpicsValue, PvString};
-
-// --- Busy-specific types (inlined from busy-rs/types.rs) ---
-
-/// Output Mode Select
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Omsl {
-    #[default]
-    Supervisory = 0,
-    ClosedLoop = 1,
-}
-
-impl From<i16> for Omsl {
-    fn from(v: i16) -> Self {
-        match v {
-            1 => Self::ClosedLoop,
-            _ => Self::Supervisory,
-        }
-    }
-}
-
-impl From<Omsl> for i16 {
-    fn from(v: Omsl) -> Self {
-        v as i16
-    }
-}
-
-/// Invalid Output Action
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Ivoa {
-    #[default]
-    ContinueNormally = 0,
-    DontDriveOutputs = 1,
-    SetOutputToIvov = 2,
-}
-
-impl From<i16> for Ivoa {
-    fn from(v: i16) -> Self {
-        match v {
-            1 => Self::DontDriveOutputs,
-            2 => Self::SetOutputToIvov,
-            _ => Self::ContinueNormally,
-        }
-    }
-}
-
-impl From<Ivoa> for i16 {
-    fn from(v: Ivoa) -> Self {
-        v as i16
-    }
-}
-
-/// Alarm severity for ZSV/OSV/COSV fields
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum AlarmSevr {
-    #[default]
-    None = 0,
-    Minor = 1,
-    Major = 2,
-    Invalid = 3,
-}
-
-impl From<i16> for AlarmSevr {
-    fn from(v: i16) -> Self {
-        match v {
-            1 => Self::Minor,
-            2 => Self::Major,
-            3 => Self::Invalid,
-            _ => Self::None,
-        }
-    }
-}
-
-impl From<AlarmSevr> for i16 {
-    fn from(v: AlarmSevr) -> Self {
-        v as i16
-    }
-}
-
-impl AlarmSevr {
-    pub fn to_base(self) -> crate::server::record::AlarmSeverity {
-        match self {
-            Self::None => crate::server::record::AlarmSeverity::NoAlarm,
-            Self::Minor => crate::server::record::AlarmSeverity::Minor,
-            Self::Major => crate::server::record::AlarmSeverity::Major,
-            Self::Invalid => crate::server::record::AlarmSeverity::Invalid,
-        }
-    }
-}
+use crate::server::record::{MENU_YES_NO, ProcessAction, ProcessOutcome, Record};
+use crate::types::{EpicsValue, PvString};
 
 /// EPICS busy record implementation.
 ///
@@ -105,16 +17,24 @@ pub struct BusyRecord {
     pub onam: PvString,
     // Timing
     pub high: f64,
-    // Alarms
-    pub zsv: AlarmSevr,
-    pub osv: AlarmSevr,
-    pub cosv: AlarmSevr,
+    // Alarms — ZSV/OSV/COSV are DBF_MENU menu(menuAlarmSevr) (busyRecord.dbd:87-
+    // 107). Stored as the RAW epicsEnum16 ordinal, not a clamped enum, exactly as
+    // bo does: a numeric `caput .ZSV 4`/`-1` (→65535) must round-trip and its raw
+    // ordinal drives the STATE alarm precedence (see check_alarms).
+    pub zsv: i16,
+    pub osv: i16,
+    pub cosv: i16,
     pub lalm: u16,
-    // Invalid output
-    pub ivoa: Ivoa,
+    // Invalid output — IVOA is DBF_MENU menu(menuIvoa) (busyRecord.dbd:148-153),
+    // IVOV is DBF_USHORT (:154-158). Both stored as the RAW carrier, not a
+    // clamping enum, exactly as bo: an out-of-range `caput .IVOA 3` keeps its raw
+    // ordinal, and `caput .IVOV -1` wraps to 65535 (C's epicsUInt16 store) — the
+    // framework reads IVOA back as the raw Short ordinal (processing.rs IVOA gate).
+    pub ivoa: i16,
     pub ivov: u16,
-    // Output control
-    pub omsl: Omsl,
+    // Output control — OMSL is DBF_MENU menu(menuOmsl) (busyRecord.dbd:18-23);
+    // stored raw so an out-of-range ordinal round-trips (mirrors bo).
+    pub omsl: i16,
     pub dol: String,
     // Monitoring
     pub mlst: u16,
@@ -124,13 +44,21 @@ pub struct BusyRecord {
     pub mask: u32,
     pub rbv: u32,
     pub orbv: u32,
+    // Simulation group (busyRecord.dbd:127-147). busy's `writeValue`
+    // (busyRecord.c:389-416) is the bo-shaped OUTPUT redirect: SIML resolves
+    // SIMM, SIMM=YES writes VAL out through SIOL instead of the device, and the
+    // cycle carries SIMM_ALARM at SIMS. The redirect itself is owned by the
+    // framework (`check_simulation_mode` -> `RedirectOutputToSiol`), which reads
+    // it off these fields — without them the record looks unconfigured and a
+    // simulated busy drives the real output.
+    pub simm: i16,
+    pub siml: String,
+    pub siol: String,
+    pub sims: i16,
     // HIGH timer state — set when a HIGH one-shot is in flight; the
     // next (timer-driven) process() forces VAL=0, mirroring C
     // boRecord.c::myCallbackFunc.
     high_reset_pending: bool,
-    // Internal alarm state (highest severity from the last
-    // check_alarms() — STATE vs COS). Retained for inspection/tests.
-    nsev: AlarmSevr,
     // VAL change gate. C
     // busyRecord.c:365-369 monitor() raises DBE_VALUE|DBE_LOG for VAL only
     // when `mlst != val`. Captured in the monitor() owner during process()
@@ -146,13 +74,13 @@ impl Default for BusyRecord {
             znam: PvString::from("Done"),
             onam: PvString::from("Busy"),
             high: 0.0,
-            zsv: AlarmSevr::None,
-            osv: AlarmSevr::None,
-            cosv: AlarmSevr::None,
+            zsv: 0,
+            osv: 0,
+            cosv: 0,
             lalm: 0,
-            ivoa: Ivoa::ContinueNormally,
+            ivoa: 0,
             ivov: 0,
-            omsl: Omsl::Supervisory,
+            omsl: 0,
             dol: String::new(),
             mlst: 0,
             rval: 0,
@@ -160,8 +88,11 @@ impl Default for BusyRecord {
             mask: 0,
             rbv: 0,
             orbv: 0,
+            simm: 0,
+            siml: String::new(),
+            siol: String::new(),
+            sims: 0,
             high_reset_pending: false,
-            nsev: AlarmSevr::None,
             value_changed: false,
         }
     }
@@ -181,24 +112,6 @@ impl BusyRecord {
         }
     }
 
-    /// Compute the highest alarm severity for the current VAL —
-    /// STATE (ZSV/OSV) vs COS (COSV). Records the result in `nsev`
-    /// but does NOT advance `lalm`; the COS state transition is owned
-    /// by the trait `check_alarms` so it happens exactly once per
-    /// process cycle (mirroring C `busyRecord.c::checkAlarms`).
-    fn compute_state_severity(&mut self) -> AlarmSevr {
-        let mut max_sev = AlarmSevr::None;
-        let state_sev = if self.val == 0 { self.zsv } else { self.osv };
-        if (state_sev as u16) > (max_sev as u16) {
-            max_sev = state_sev;
-        }
-        if self.val != self.lalm && (self.cosv as u16) > (max_sev as u16) {
-            max_sev = self.cosv;
-        }
-        self.nsev = max_sev;
-        max_sev
-    }
-
     /// Update monitoring fields.
     fn monitor(&mut self) {
         // Capture the VAL-change
@@ -214,107 +127,45 @@ impl BusyRecord {
     }
 }
 
-static FIELDS: &[FieldDesc] = &[
-    FieldDesc {
-        name: "VAL",
-        dbf_type: DbFieldType::Enum,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OVAL",
-        dbf_type: DbFieldType::Enum,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "ZNAM",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ONAM",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "HIGH",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ZSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "COSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LALM",
-        dbf_type: DbFieldType::Enum,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "IVOA",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "IVOV",
-        dbf_type: DbFieldType::Enum,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OMSL",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DOL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "MLST",
-        dbf_type: DbFieldType::Enum,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "RVAL",
-        dbf_type: DbFieldType::ULong,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "ORAW",
-        dbf_type: DbFieldType::ULong,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "MASK",
-        dbf_type: DbFieldType::ULong,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "RBV",
-        dbf_type: DbFieldType::ULong,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "ORBV",
-        dbf_type: DbFieldType::ULong,
-        read_only: true,
-    },
-];
-
 impl Record for BusyRecord {
     fn record_type(&self) -> &'static str {
         "busy"
+    }
+
+    /// C `busyRecord.c:195-208`: `process()` clears `udf` to FALSE only on a
+    /// successful closed-loop DOL fetch (`if(status==0){ prec->val = val;
+    /// prec->udf = FALSE; }`, `:202-204`); a bare (no-DOL) record reads the
+    /// stored VAL and leaves `udf` alone, so `checkAlarms` (`:337`) raises
+    /// UDF_ALARM every cycle. busy is boRecord's process verbatim here — it
+    /// never re-derives `udf` from the stored VAL, so it opts out of the
+    /// framework's blanket per-cycle clear (mirrors [`bo`](super::bo)).
+    fn clears_udf(&self) -> bool {
+        false
+    }
+
+    /// C `busyRecord.c:337` tests `if (prec->udf == TRUE)` — exact-one. Combined
+    /// with `clears_udf() == false`, a direct `caput X.UDF 255` (or `-1`, stored
+    /// `255`) leaves `udf == 255` at `checkAlarms`, and `255 != TRUE`, so C
+    /// raises NO UDF_ALARM — STAT/SEVR stay `NO_ALARM`. bo shares this
+    /// (`boRecord.c:371`); see [`Record::udf_alarm_on_exact_one`].
+    fn udf_alarm_on_exact_one(&self) -> bool {
+        true
+    }
+
+    /// W10-E5. `busyRecord.c:397-400` — a failed SIML read returns from
+    /// `writeValue` BEFORE `write_busy` and before the SIOL `dbPutLink`:
+    ///
+    /// ```c
+    /// status=dbGetLink(&prec->siml,DBR_USHORT, &prec->simm,0,0);
+    /// if (status)
+    ///     return(status);
+    /// ```
+    ///
+    /// busy is the only record in the port that does this — the recGblGetSimm
+    /// records' equivalent branch is dead code (`recGblGetSimm` always returns
+    /// 0, recGbl.c:456) and swait never tests the status (swaitRecord.c:402).
+    fn aborts_on_failed_siml_read(&self) -> bool {
+        true
     }
 
     /// C `boRecord.c::process` IVOA=set_to_IVOV: `val = ivov` then
@@ -352,11 +203,10 @@ impl Record for BusyRecord {
         // Step 3: Save current VAL before write (for FLNK decision)
         self.oval = self.val;
 
-        // Step 4: precompute alarm severity for inspection (the real
-        // alarm raising is in the trait check_alarms() hook, and the
-        // INVALID-output IVOA policy is enforced by the framework
-        // which gates the OUT write on common.sevr == Invalid).
-        self.compute_state_severity();
+        // Step 4: alarm raising is owned by the trait check_alarms() hook (STATE
+        // vs COS, raw menu ordinals), and the INVALID-output IVOA policy is
+        // enforced by the framework which gates the OUT write on
+        // common.sevr == Invalid.
 
         // Step 5: Monitor
         self.monitor();
@@ -375,22 +225,39 @@ impl Record for BusyRecord {
         Ok(ProcessOutcome::complete_with(actions))
     }
 
-    /// C `busyRecord.c::checkAlarms` (bo variant) — STATE alarm
-    /// (ZSV for VAL=0, OSV for VAL=1) and COS alarm (COSV). Raising
-    /// these into `common` lets the framework's IVOA handler gate the
-    /// OUT-link write: with SEVR=INVALID and IVOA="Don't drive", the
-    /// framework's `skip_out` path suppresses the write entirely.
+    /// C `busyRecord.c::checkAlarms` (`:332-357`, boRecord's verbatim) — the UDF
+    /// alarm FIRST, then the STATE alarm (ZSV for VAL=0, OSV for VAL=1), then COS
+    /// (COSV). The udf raise must lead: C `recGblSetSevr` overrides STAT/SEVR only
+    /// on a strictly greater severity, so on a fresh record with `UDFS == INVALID`
+    /// the equal-severity STATE alarm cannot displace the UDF that was set first —
+    /// STAT stays UDF. busy does NOT early-return on UDF, so STATE/COS still
+    /// evaluate. Raising it here (idempotent with the framework's
+    /// `rec_gbl_check_udf`, which runs after this hook) is what puts UDF ahead of
+    /// STATE. Raising STATE=INVALID into `common` also lets the framework's IVOA
+    /// handler gate the OUT-link write (IVOA="Don't drive" → `skip_out`).
     fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
         use crate::server::recgbl::{self, alarm_status};
+        use crate::server::record::AlarmSeverity;
 
-        let state_sev = if self.val == 0 { self.zsv } else { self.osv };
-        if state_sev != AlarmSevr::None {
-            recgbl::rec_gbl_set_sevr(common, alarm_status::STATE_ALARM, state_sev.to_base());
+        // C `busyRecord.c:337` — `if (prec->udf == TRUE)` (exact-one, see
+        // `udf_alarm_on_exact_one`), raised before STATE with no early return.
+        if recgbl::udf_alarm_active(common.udf, true) {
+            recgbl::rec_gbl_set_sevr(
+                common,
+                alarm_status::UDF_ALARM,
+                AlarmSeverity::from_u16(common.udfs as u16),
+            );
         }
+
+        // STATE/COS use the RAW severity ordinal (ZSV/OSV/COSV are DBF_MENU
+        // stored raw i16): C `recGblSetSevr(prec, STATE_ALARM, prec->zsv)`
+        // compares the raw `epicsEnum16`, so an out-of-range `ZSV=4`/`65535`
+        // numerically exceeds a prior UDF's INVALID(3) and overrides it (see
+        // `rec_gbl_set_sevr_raw`). `raw_sevr == 0` is a no-op. Mirrors bo.
+        let state_sev = if self.val == 0 { self.zsv } else { self.osv };
+        recgbl::rec_gbl_set_sevr_raw(common, alarm_status::STATE_ALARM, state_sev as u16);
         if self.val != self.lalm {
-            if self.cosv != AlarmSevr::None {
-                recgbl::rec_gbl_set_sevr(common, alarm_status::COS_ALARM, self.cosv.to_base());
-            }
+            recgbl::rec_gbl_set_sevr_raw(common, alarm_status::COS_ALARM, self.cosv as u16);
             self.lalm = self.val;
         }
     }
@@ -403,10 +270,17 @@ impl Record for BusyRecord {
         true
     }
 
-    fn is_put_complete(&self) -> bool {
-        self.val == 0
-    }
-
+    // NO `is_put_complete` override — busy completes its put-callback
+    // synchronously, like bo. C `busyRecord.c:273` clears `pact = FALSE` at the
+    // tail of every process cycle; only async device support that set `pact`
+    // itself (`:254`) holds the callback, and the soft support this port models
+    // (`devBusySoft.c::write_busy` is a bare `dbPutLink`, never touching `pact`)
+    // does not. A prior `is_put_complete() == self.val == 0` modelled the
+    // asynBusy hold, but this record's `process()` is synchronous (never returns
+    // `AsyncPendingNotify`), so the phantom hold only wedged the put-notify:
+    // once VAL was driven to 1 the callback never completed, and every following
+    // `ca_put_callback` was refused with `PutCallbackInProgress`, so the
+    // out-of-range VAL puts C posts (2, 3 → "Illegal_Value") never processed.
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => Some(EpicsValue::Enum(self.val)),
@@ -414,13 +288,13 @@ impl Record for BusyRecord {
             "ZNAM" => Some(EpicsValue::String(self.znam.clone())),
             "ONAM" => Some(EpicsValue::String(self.onam.clone())),
             "HIGH" => Some(EpicsValue::Double(self.high)),
-            "ZSV" => Some(EpicsValue::Short(self.zsv.into())),
-            "OSV" => Some(EpicsValue::Short(self.osv.into())),
-            "COSV" => Some(EpicsValue::Short(self.cosv.into())),
+            "ZSV" => Some(EpicsValue::Short(self.zsv)),
+            "OSV" => Some(EpicsValue::Short(self.osv)),
+            "COSV" => Some(EpicsValue::Short(self.cosv)),
             "LALM" => Some(EpicsValue::Enum(self.lalm)),
-            "IVOA" => Some(EpicsValue::Short(self.ivoa.into())),
-            "IVOV" => Some(EpicsValue::Enum(self.ivov)),
-            "OMSL" => Some(EpicsValue::Short(self.omsl.into())),
+            "IVOA" => Some(EpicsValue::Short(self.ivoa)),
+            "IVOV" => Some(EpicsValue::UShort(self.ivov)),
+            "OMSL" => Some(EpicsValue::Short(self.omsl)),
             "DOL" => Some(EpicsValue::String(self.dol.clone().into())),
             "MLST" => Some(EpicsValue::Enum(self.mlst)),
             // RVAL/ORAW/MASK/RBV/ORBV are DBF_ULONG (boRecord.dbd.pod:252,256,
@@ -432,6 +306,10 @@ impl Record for BusyRecord {
             "MASK" => Some(EpicsValue::ULong(self.mask)),
             "RBV" => Some(EpicsValue::ULong(self.rbv)),
             "ORBV" => Some(EpicsValue::ULong(self.orbv)),
+            "SIMM" => Some(EpicsValue::Short(self.simm)),
+            "SIML" => Some(EpicsValue::String(self.siml.clone().into())),
+            "SIOL" => Some(EpicsValue::String(self.siol.clone().into())),
+            "SIMS" => Some(EpicsValue::Short(self.sims)),
             _ => None,
         }
     }
@@ -444,15 +322,21 @@ impl Record for BusyRecord {
                     EpicsValue::Short(v) => v as u16,
                     EpicsValue::Long(v) => v as u16,
                     EpicsValue::Double(v) => v as u16,
+                    // C rset `put_enum_str` (`busyRecord.c`): an EXACT,
+                    // case-sensitive `strncmp` against ZNAM/ONAM, else
+                    // `S_db_badChoice` — the put fails and nothing is stored.
+                    // This arm used to match case-insensitively and then coerce
+                    // any unmatched name to state 0, so `caput BUSY Opne` drove
+                    // the record to Done and reported success.
                     EpicsValue::String(ref s) => {
-                        // Match ZNAM/ONAM case-insensitively on raw bytes so a
-                        // non-UTF-8 state name still resolves to its index.
-                        if s.as_bytes().eq_ignore_ascii_case(self.znam.as_bytes()) {
-                            0
-                        } else if s.as_bytes().eq_ignore_ascii_case(self.onam.as_bytes()) {
-                            1
-                        } else {
-                            s.as_str_lossy().parse::<u16>().unwrap_or(0)
+                        let resolved = crate::server::record::resolve_enum_state_string(
+                            "VAL",
+                            self.enum_state_strings().as_deref(),
+                            s,
+                        )?;
+                        match resolved {
+                            EpicsValue::Enum(v) => v,
+                            _ => return Err(CaError::TypeMismatch(name.to_string())),
                         }
                     }
                     _ => return Err(CaError::TypeMismatch(name.to_string())),
@@ -483,9 +367,13 @@ impl Record for BusyRecord {
                     Err(CaError::TypeMismatch(name.to_string()))
                 }
             }
+            // ZSV/OSV/COSV are DBF_MENU menu(menuAlarmSevr): store the RAW
+            // epicsEnum16 ordinal the central menu converter resolved, mirroring
+            // bo — an out-of-range numeric put keeps its bit pattern so it
+            // round-trips and drives the raw STATE-alarm precedence.
             "ZSV" => {
                 if let EpicsValue::Short(v) = value {
-                    self.zsv = AlarmSevr::from(v);
+                    self.zsv = v;
                     Ok(())
                 } else {
                     Err(CaError::TypeMismatch(name.to_string()))
@@ -493,7 +381,7 @@ impl Record for BusyRecord {
             }
             "OSV" => {
                 if let EpicsValue::Short(v) = value {
-                    self.osv = AlarmSevr::from(v);
+                    self.osv = v;
                     Ok(())
                 } else {
                     Err(CaError::TypeMismatch(name.to_string()))
@@ -501,31 +389,45 @@ impl Record for BusyRecord {
             }
             "COSV" => {
                 if let EpicsValue::Short(v) = value {
-                    self.cosv = AlarmSevr::from(v);
+                    self.cosv = v;
                     Ok(())
                 } else {
                     Err(CaError::TypeMismatch(name.to_string()))
                 }
             }
+            // IVOA is DBF_MENU menu(menuIvoa): store the RAW epicsEnum16 ordinal
+            // the central menu converter resolved (mirrors bo) — an out-of-range
+            // numeric put keeps its value and round-trips.
             "IVOA" => {
                 if let EpicsValue::Short(v) = value {
-                    self.ivoa = Ivoa::from(v);
+                    self.ivoa = v;
                     Ok(())
                 } else {
                     Err(CaError::TypeMismatch(name.to_string()))
                 }
             }
-            "IVOV" => {
-                self.ivov = match value {
-                    EpicsValue::Enum(v) => v,
-                    EpicsValue::Short(v) => v as u16,
-                    _ => return Err(CaError::TypeMismatch(name.to_string())),
-                };
-                Ok(())
-            }
+            // IVOV is DBF_USHORT: accept the coerced unsigned carrier (a
+            // `caput -1` is wrapped to 65535 by `coerce_put_value`), tolerate an
+            // internal Enum (same u16). Served as UShort so the coercion routes a
+            // string put through the numeric parser, not the ZNAM/ONAM enum-state
+            // resolver — mirrors bo (which the enum serving broke: `-1` was
+            // rejected as an unknown state name and IVOV stayed 0).
+            "IVOV" => match value {
+                EpicsValue::UShort(v) => {
+                    self.ivov = v;
+                    Ok(())
+                }
+                EpicsValue::Enum(v) => {
+                    self.ivov = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.to_string())),
+            },
+            // OMSL is DBF_MENU menu(menuOmsl): store raw ordinal (mirrors bo). The
+            // framework reads it back as the raw Short and compares == closed_loop.
             "OMSL" => {
                 if let EpicsValue::Short(v) = value {
-                    self.omsl = Omsl::from(v);
+                    self.omsl = v;
                     Ok(())
                 } else {
                     Err(CaError::TypeMismatch(name.to_string()))
@@ -564,12 +466,69 @@ impl Record for BusyRecord {
                 };
                 Ok(())
             }
+            "SIMM" => match value {
+                EpicsValue::Short(v) => {
+                    self.simm = v;
+                    Ok(())
+                }
+                EpicsValue::Enum(v) => {
+                    self.simm = v as i16;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.to_string())),
+            },
+            "SIML" => match value {
+                EpicsValue::String(v) => {
+                    self.siml = v.as_str_lossy().into_owned();
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.to_string())),
+            },
+            "SIOL" => match value {
+                EpicsValue::String(v) => {
+                    self.siol = v.as_str_lossy().into_owned();
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.to_string())),
+            },
+            "SIMS" => match value {
+                EpicsValue::Short(v) => {
+                    self.sims = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.to_string())),
+            },
             _ => Err(CaError::FieldNotFound(name.to_string())),
         }
     }
 
-    fn field_list(&self) -> &'static [FieldDesc] {
-        FIELDS
+    /// `SIMM` is `DBF_MENU menu(menuYesNo)` (`busyRecord.dbd:137-141`) — the
+    /// two-choice NO/YES menu, not the NO/YES/RAW `menuSimm` of the base binary
+    /// records. Served as `DBR_ENUM` with those labels; `SIMS` is the shared
+    /// `menuAlarmSevr`, resolved centrally.
+    fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
+        match field {
+            "SIMM" => Some(MENU_YES_NO),
+            _ => None,
+        }
+    }
+
+    /// C rset `get_enum_strs`/`put_enum_str` (`busyRecord.c`, the bo pair
+    /// verbatim) — ZNAM/ONAM.
+    fn enum_state_strings(&self) -> Option<Vec<PvString>> {
+        Some(crate::server::record::binary_enum_states(
+            &self.znam, &self.onam,
+        ))
+    }
+
+    /// C `get_enum_str` (busyRecord.c:287-306): VAL 0 -> ZNAM, 1 -> ONAM, and any
+    /// other index -> `"Illegal_Value"`. Slot 1 is indexed even when ONAM is
+    /// empty, so it renders empty — the `no_str` trim in `enum_state_strings`
+    /// is the LABEL list's, not this read's.
+    fn enum_string_form(&self) -> Option<crate::server::snapshot::EnumStringForm> {
+        Some(crate::server::record::binary_enum_string_form(
+            &self.znam, &self.onam,
+        ))
     }
 
     /// VAL posts DBE_VALUE|DBE_LOG
@@ -588,6 +547,8 @@ impl Record for BusyRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::record::dbd_generated;
+    use crate::types::DbFieldType;
 
     #[test]
     fn test_default() {
@@ -597,11 +558,11 @@ mod tests {
         assert_eq!(rec.znam, "Done");
         assert_eq!(rec.onam, "Busy");
         assert_eq!(rec.high, 0.0);
-        assert_eq!(rec.zsv, AlarmSevr::None);
-        assert_eq!(rec.osv, AlarmSevr::None);
-        assert_eq!(rec.cosv, AlarmSevr::None);
-        assert_eq!(rec.ivoa, Ivoa::ContinueNormally);
-        assert_eq!(rec.omsl, Omsl::Supervisory);
+        assert_eq!(rec.zsv, 0);
+        assert_eq!(rec.osv, 0);
+        assert_eq!(rec.cosv, 0);
+        assert_eq!(rec.ivoa, 0);
+        assert_eq!(rec.omsl, 0);
         assert_eq!(rec.mlst, 0);
         assert_eq!(rec.mask, 0);
         assert_eq!(rec.rval, 0);
@@ -669,8 +630,9 @@ mod tests {
         rec.put_field("IVOA", EpicsValue::Short(1)).unwrap();
         assert_eq!(rec.get_field("IVOA"), Some(EpicsValue::Short(1)));
 
-        rec.put_field("IVOV", EpicsValue::Enum(1)).unwrap();
-        assert_eq!(rec.get_field("IVOV"), Some(EpicsValue::Enum(1)));
+        // IVOV is DBF_USHORT — served/accepted as the unsigned carrier.
+        rec.put_field("IVOV", EpicsValue::UShort(1)).unwrap();
+        assert_eq!(rec.get_field("IVOV"), Some(EpicsValue::UShort(1)));
 
         rec.put_field("OMSL", EpicsValue::Short(1)).unwrap();
         assert_eq!(rec.get_field("OMSL"), Some(EpicsValue::Short(1)));
@@ -686,6 +648,33 @@ mod tests {
         // but the field reads back as the unsigned carrier.
         rec.put_field("MASK", EpicsValue::Long(0xFF)).unwrap();
         assert_eq!(rec.get_field("MASK"), Some(EpicsValue::ULong(0xFF)));
+    }
+
+    /// IVOA/OMSL are DBF_MENU stored raw: a numeric out-of-range put keeps its
+    /// ordinal (no clamp to 0), matching C `*pfield = (epicsEnum16)val`. The
+    /// clamping enum stored 0 and served the in-range label instead.
+    #[test]
+    fn menu_out_of_range_puts_store_raw_ordinal() {
+        let mut rec = BusyRecord::new();
+
+        // menuIvoa has 3 choices (0..2); 3 is out of range.
+        rec.put_field("IVOA", EpicsValue::Short(3)).unwrap();
+        assert_eq!(rec.get_field("IVOA"), Some(EpicsValue::Short(3)));
+
+        // menuOmsl has 2 choices (0..1); 2 is out of range.
+        rec.put_field("OMSL", EpicsValue::Short(2)).unwrap();
+        assert_eq!(rec.get_field("OMSL"), Some(EpicsValue::Short(2)));
+    }
+
+    /// IVOV is DBF_USHORT: the coerced put of `-1` arrives as the wrapped
+    /// `UShort(65535)` (C's `epicsUInt16` store), and busy accepts it — the enum
+    /// serving previously routed the string `-1` through the ZNAM/ONAM enum-state
+    /// resolver, which rejected it, so the put failed and IVOV stayed 0.
+    #[test]
+    fn ivov_accepts_wrapped_ushort_put() {
+        let mut rec = BusyRecord::new();
+        rec.put_field("IVOV", EpicsValue::UShort(65535)).unwrap();
+        assert_eq!(rec.get_field("IVOV"), Some(EpicsValue::UShort(65535)));
     }
 
     /// RVAL/ORAW/MASK/RBV/ORBV are DBF_ULONG (boRecord.dbd.pod:252-303,
@@ -713,35 +702,63 @@ mod tests {
 
         // The advertised dbf type is unsigned for the whole raw family.
         for name in ["RVAL", "ORAW", "MASK", "RBV", "ORBV"] {
-            let desc = FIELDS.iter().find(|f| f.name == name).unwrap();
+            let desc = dbd_generated::BUSY_FIELDS
+                .iter()
+                .find(|f| f.name == name)
+                .unwrap();
             assert_eq!(desc.dbf_type, DbFieldType::ULong, "{name} dbf_type");
         }
     }
 
+    /// C `busyRecord.c::put_enum_str` is an exact, case-SENSITIVE `strncmp`
+    /// against ZNAM/ONAM and returns `S_db_badChoice` on no match — the put
+    /// FAILS and nothing is stored.
+    ///
+    /// This test previously asserted the opposite on both counts (a
+    /// case-insensitive match, and — through `parse::<u16>().unwrap_or(0)` —
+    /// silent coercion of an unmatched name to state 0), so it was green over
+    /// the defect R19-24 names: `caput BUSY <typo>` drove the record to Done
+    /// and reported success.
     #[test]
-    fn test_enum_str() {
+    fn put_enum_str_is_exact_case_sensitive_and_rejects_unknown_names() {
         let mut rec = BusyRecord::new();
 
-        // String "Done" → val=0
         rec.put_field("VAL", EpicsValue::String("Done".into()))
             .unwrap();
         assert_eq!(rec.val, 0);
 
-        // String "Busy" → val=1
         rec.put_field("VAL", EpicsValue::String("Busy".into()))
             .unwrap();
         assert_eq!(rec.val, 1);
 
-        // Case insensitive
-        rec.put_field("VAL", EpicsValue::String("done".into()))
-            .unwrap();
-        assert_eq!(rec.val, 0);
+        // Wrong case is NOT a state name: C `strncmp` fails, the put is
+        // rejected, VAL keeps its previous value.
+        assert!(
+            rec.put_field("VAL", EpicsValue::String("done".into()))
+                .is_err(),
+            "C put_enum_str is case-sensitive"
+        );
+        assert_eq!(rec.val, 1, "a rejected put stores nothing");
 
-        rec.put_field("VAL", EpicsValue::String("busy".into()))
-            .unwrap();
+        // An unmatched name is S_db_badChoice, never state 0.
+        assert!(
+            rec.put_field("VAL", EpicsValue::String("Opne".into()))
+                .is_err()
+        );
         assert_eq!(rec.val, 1);
 
-        // Custom ZNAM/ONAM
+        // The numeric fallback C's `putStringEnum` applies after badChoice:
+        // an index below `no_str` is accepted.
+        rec.put_field("VAL", EpicsValue::String("0".into()))
+            .unwrap();
+        assert_eq!(rec.val, 0);
+        assert!(
+            rec.put_field("VAL", EpicsValue::String("2".into()))
+                .is_err(),
+            "index >= no_str (2) is badChoice"
+        );
+
+        // Custom ZNAM/ONAM.
         rec.znam = "Off".into();
         rec.onam = "On".into();
         rec.put_field("VAL", EpicsValue::String("Off".into()))
@@ -794,37 +811,90 @@ mod tests {
 
     #[test]
     fn test_state_alarm_zsv() {
+        use crate::server::record::{AlarmSeverity, CommonFields};
         let mut rec = BusyRecord::new();
-        rec.zsv = AlarmSevr::Minor;
+        rec.zsv = 1; // MINOR
         rec.val = 0;
-        rec.process().unwrap();
-        assert_eq!(rec.nsev, AlarmSevr::Minor);
+        // Clear the default UDF to isolate the STATE path (as bo_state_alarm_osv).
+        let mut common = CommonFields {
+            udf: 0,
+            ..Default::default()
+        };
+        rec.check_alarms(&mut common);
+        assert_eq!(common.nsev, AlarmSeverity::Minor);
+        assert_eq!(
+            common.nsta,
+            crate::server::recgbl::alarm_status::STATE_ALARM
+        );
     }
 
     #[test]
     fn test_state_alarm_osv() {
+        use crate::server::record::{AlarmSeverity, CommonFields};
         let mut rec = BusyRecord::new();
-        rec.osv = AlarmSevr::Major;
+        rec.osv = 2; // MAJOR
         rec.val = 1;
-        rec.process().unwrap();
-        assert_eq!(rec.nsev, AlarmSevr::Major);
+        let mut common = CommonFields {
+            udf: 0,
+            ..Default::default()
+        };
+        rec.check_alarms(&mut common);
+        assert_eq!(common.nsev, AlarmSeverity::Major);
+        assert_eq!(
+            common.nsta,
+            crate::server::recgbl::alarm_status::STATE_ALARM
+        );
+    }
+
+    /// A numeric `caput .ZSV 4` stores the raw out-of-range ordinal (busy is a
+    /// DBF_MENU stored as raw i16). C hands it straight to `recGblSetSevr`, so a
+    /// raw ordinal numerically greater than a prior UDF's INVALID(3) overrides
+    /// it: STAT becomes STATE (the displayed SEVR still clamps to INVALID).
+    #[test]
+    fn test_state_alarm_raw_ordinal_overrides_udf() {
+        use crate::server::record::{AlarmSeverity, CommonFields};
+        let mut rec = BusyRecord::new();
+        rec.put_field("ZSV", EpicsValue::Short(4)).unwrap();
+        assert_eq!(
+            rec.get_field("ZSV"),
+            Some(EpicsValue::Short(4)),
+            "raw round-trip"
+        );
+        rec.val = 0;
+        let mut common = CommonFields::default(); // udf=1, udfs=INVALID
+        rec.check_alarms(&mut common);
+        assert_eq!(
+            common.nsta,
+            crate::server::recgbl::alarm_status::STATE_ALARM,
+            "raw ZSV=4 > UDF's INVALID(3) overrides the UDF that was set first"
+        );
+        assert_eq!(common.nsev, AlarmSeverity::Invalid, "displayed SEVR clamps");
     }
 
     #[test]
     fn test_cos_alarm() {
         use crate::server::record::CommonFields;
         let mut rec = BusyRecord::new();
-        rec.cosv = AlarmSevr::Minor;
+        rec.cosv = 1; // MINOR
         rec.lalm = 0;
         rec.val = 1; // changed from lalm=0
-        let mut common = CommonFields::default();
+        // C `busyRecord.c:337` raises UDF_ALARM (at UDFS=INVALID) before COS;
+        // `CommonFields::default()` has udf=1, so clear it to isolate the COS
+        // path (as the bi/bo parity tests do).
+        let mut common = CommonFields {
+            udf: 0,
+            ..Default::default()
+        };
         rec.check_alarms(&mut common);
         // COS alarm fires and advances lalm.
         assert_eq!(rec.lalm, 1);
         assert_eq!(common.nsev, crate::server::record::AlarmSeverity::Minor);
 
         // Same val — no COS change.
-        let mut common2 = CommonFields::default();
+        let mut common2 = CommonFields {
+            udf: 0,
+            ..Default::default()
+        };
         rec.check_alarms(&mut common2);
         assert_eq!(rec.lalm, 1);
         assert_eq!(common2.nsev, crate::server::record::AlarmSeverity::NoAlarm);
@@ -832,14 +902,21 @@ mod tests {
 
     #[test]
     fn test_cos_alarm_severity() {
+        use crate::server::record::{AlarmSeverity, CommonFields};
         let mut rec = BusyRecord::new();
-        rec.cosv = AlarmSevr::Major;
-        rec.osv = AlarmSevr::Minor;
+        rec.cosv = 2; // MAJOR
+        rec.osv = 1; // MINOR
         rec.lalm = 0;
         rec.val = 1;
-        rec.process().unwrap();
-        // COS (Major) > OSV (Minor), so nsev should be Major
-        assert_eq!(rec.nsev, AlarmSevr::Major);
+        // Clear the default UDF to isolate STATE/COS.
+        let mut common = CommonFields {
+            udf: 0,
+            ..Default::default()
+        };
+        rec.check_alarms(&mut common);
+        // COS (Major) > OSV (Minor), so the raised severity is Major, at COS.
+        assert_eq!(common.nsev, AlarmSeverity::Major);
+        assert_eq!(common.nsta, crate::server::recgbl::alarm_status::COS_ALARM);
     }
 
     #[test]
@@ -971,9 +1048,14 @@ mod tests {
     fn test_check_alarms_raises_invalid_state() {
         use crate::server::record::{AlarmSeverity, CommonFields};
         let mut rec = BusyRecord::new();
-        rec.osv = AlarmSevr::Invalid;
+        rec.osv = 3; // INVALID
         rec.val = 1;
-        let mut common = CommonFields::default();
+        // Clear the default UDF (udf=1) to isolate the STATE path; the UDF-first
+        // precedence is covered by `check_alarms_udf_precedes_state`.
+        let mut common = CommonFields {
+            udf: 0,
+            ..Default::default()
+        };
         rec.check_alarms(&mut common);
         // INVALID state severity propagates into common — the
         // framework's IVOA "Don't drive" then suppresses the OUT write.
@@ -984,12 +1066,39 @@ mod tests {
         );
     }
 
+    /// C `busyRecord.c::checkAlarms:337-350` raises UDF_ALARM (at UDFS=INVALID)
+    /// BEFORE the STATE alarm, and `recGblSetSevr` overrides only on a strictly
+    /// greater severity — so on a `udf=1` record the equal-severity INVALID STATE
+    /// alarm cannot displace it: STAT stays UDF. This is the divergence the
+    /// oracle saw as `stat C='UDF' port='NO_ALARM'` after a `pp(TRUE)` put.
+    #[test]
+    fn check_alarms_udf_precedes_state() {
+        use crate::server::record::{AlarmSeverity, CommonFields};
+        let mut rec = BusyRecord::new();
+        rec.osv = 3; // INVALID
+        rec.val = 1;
+        // Default udf=1 (a fresh, never-DOL-sourced record).
+        let mut common = CommonFields::default();
+        rec.check_alarms(&mut common);
+        assert_eq!(common.nsev, AlarmSeverity::Invalid);
+        assert_eq!(
+            common.nsta,
+            crate::server::recgbl::alarm_status::UDF_ALARM,
+            "UDF is raised first and the equal-severity STATE cannot displace it"
+        );
+    }
+
     #[test]
     fn test_check_alarms_no_alarm_when_severities_unset() {
         use crate::server::record::{AlarmSeverity, CommonFields};
         let mut rec = BusyRecord::new();
         rec.val = 0;
-        let mut common = CommonFields::default();
+        // Clear the default UDF (udf=1) so this exercises the "no severity set"
+        // path rather than the UDF alarm.
+        let mut common = CommonFields {
+            udf: 0,
+            ..Default::default()
+        };
         rec.check_alarms(&mut common);
         assert_eq!(common.nsev, AlarmSeverity::NoAlarm);
     }

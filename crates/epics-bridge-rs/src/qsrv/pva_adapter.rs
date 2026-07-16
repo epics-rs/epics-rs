@@ -90,7 +90,21 @@ impl PvaPvHandle {
         // can never observe an older value than a monitor frame.
         *self.latest.lock() = Some(value.clone());
         let mut subs = self.subscribers.lock();
-        subs.retain(|tx| tx.try_send(value.clone()).is_ok());
+        // A bounded `try_send` fails for two reasons and they are NOT the
+        // same. `Closed` means the receiver is gone — reap the subscriber.
+        // `Full` means the subscriber is alive but has not drained yet;
+        // the frame is lost, the SUBSCRIPTION is not. Collapsing the two
+        // (`retain(|tx| tx.try_send(..).is_ok())`) silently unsubscribes a
+        // live monitor the first time its queue backs up, and it never
+        // receives another value. `SharedPV` already reaps on liveness
+        // alone (`shared_pv.rs`: `retain(|tx| !tx.is_closed())`, full queue
+        // → squash the tail, pvxs servermon.cpp:283-286); this is the same
+        // rule for the QSRV fan-out.
+        subs.retain(|tx| match tx.try_send(value.clone()) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => true,
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        });
         Ok(())
     }
 
@@ -242,6 +256,68 @@ enum OpenedMonitor {
     Db(super::group::AnyMonitor),
 }
 
+/// The leaves a QSRV read ASSIGNS into `value` — what the server frames as
+/// the GET reply's / monitor seed's changed-bitset (pvxs `to_wire_valid(R,
+/// value, &pvMask)`, `serverget.cpp:104`). `None` = "everything the request
+/// selected", for a natively-posted PVA PV whose snapshot is wholly assigned.
+///
+/// pvxs reads into a `cloneEmpty()`: `singleGet` (`singlesource.cpp:283`) and
+/// `getGroupField` (`groupsource.cpp:454-460`) both run `IOCSource::
+/// initialize` + `IOCSource::get(…, Everything, …)` per mapping, so only the
+/// leaves those two assign carry `valid`. [`super::pvif::read_leaf_paths`] is
+/// the single owner of that set; here it is composed per served channel:
+///
+/// * a GROUP adds `record._options.atomic`, which `onGet` assigns before the
+///   field loop (`groupsource.cpp:484`), and skips `Structure`/`Proc` members;
+/// * a SINGLE record is one root-level `Scalar` mapping — its NT IS the served
+///   structure.
+///
+/// Each mapping also carries whether its channel addresses the record's VAL
+/// field (`channel_is_value_field`), because `IOCSource::initialize` assigns
+/// `display.form.index` for VAL only (`iocsource.cpp:53`) — the mark set must
+/// not claim it for a `REC.RVAL` channel or a group member bound to a non-VAL
+/// field.
+///
+/// `narrow_enum_value_leaves` then resolves the semantic `value` leaf against
+/// the concrete value, so an NTEnum marks `value.index` (assigned by
+/// `getScalarValue`) and leaves `value.choices` to the property set.
+async fn read_marks(
+    provider: &Arc<BridgeProvider>,
+    pva_pvs: &Arc<RwLock<HashMap<String, PvaPvHandle>>>,
+    name: &str,
+    value: &PvField,
+) -> Option<Vec<String>> {
+    if pva_pvs.read().await.contains_key(name) {
+        return None;
+    }
+    let paths = match provider.servable_group(name).await {
+        Some(def) => {
+            let mut paths = vec!["record._options.atomic".to_string()];
+            for m in &def.members {
+                paths.extend(super::pvif::read_leaf_paths(
+                    &m.field_name,
+                    m.mapping,
+                    super::channel::channel_is_value_field(&m.channel),
+                    provider.channel_property_support(&m.channel).await,
+                ));
+            }
+            paths
+        }
+        // A single-record channel: the NT is the root, mapped as pvxs's
+        // `MappingInfo::Scalar` (value + alarm + timeStamp + properties).
+        None => super::pvif::read_leaf_paths(
+            "",
+            super::FieldMapping::Scalar,
+            super::channel::channel_is_value_field(name),
+            provider.channel_property_support(name).await,
+        ),
+    };
+    let PvField::Structure(root) = value else {
+        return Some(paths);
+    };
+    Some(super::pvif::narrow_enum_value_leaves(paths, root))
+}
+
 /// resolve a started monitor for a read-authorized PV.
 /// Factored out of `subscribe_checked` so `subscribe_checked_opts_marked`
 /// (which carries the `+trigger` marked set to the wire) reuses the
@@ -251,6 +327,7 @@ async fn open_monitor(
     pva_pvs: Arc<RwLock<HashMap<String, PvaPvHandle>>>,
     checked: epics_pva_rs::server_native::source::AccessChecked,
     ctx: epics_pva_rs::server_native::source::ChannelContext,
+    opts: epics_pva_rs::server_native::MonitorOptions,
 ) -> Option<OpenedMonitor> {
     if !checked.allows_read() {
         return None;
@@ -272,18 +349,33 @@ async fn open_monitor(
     // `BridgeChannel::create_monitor_with_value_mask`; group
     // and pva_pv-registered channels fall through to the
     // default mask (their DBE selection is not yet wired).
+    // An unconvertible (array-typed) DBE never reaches here: it fails
+    // `QsrvPvStore::check_monitor_request` at INIT, which errors the op (CBUG-C2
+    // — pvxs resets the whole circuit there instead) before it is registered. If
+    // one somehow arrives, take pvxs's `dbe = 0` fallback rather than inventing
+    // a third behaviour.
+    //
+    // R10-37: this START-time parse resolves the MASK only. The
+    // `selects empty mask` warning it can raise belongs to INIT — pvxs writes it
+    // inside `onSubscribe`, before `connect()` sends the INIT reply — so
+    // `check_monitor_request` (the port's INIT half of `onSubscribe`) owns the
+    // reporting and this call parses against a log nobody flushes. Passing
+    // `ctx.log` here too would emit the message twice, and after the reply.
+    let discard = epics_pva_rs::server_native::source::RemoteLog::default();
     let dbe_mask = match ctx.pv_request {
-        Some(PvField::Structure(ref req)) => crate::qsrv::channel::dbe_mask_from_pv_request(req),
+        Some(PvField::Structure(ref req)) => {
+            crate::qsrv::channel::dbe_mask_from_pv_request(req, &discard).unwrap_or(None)
+        }
         _ => None,
     };
-    // resolve the per-operation negotiated monitor
-    // queue depth from the MONITOR INIT pvRequest's
-    // `record._options.queueSize` — pvxs `servermon.cpp:533` then
-    // `groupsource.cpp:359` stamps `stats.limitQueue`.
-    let queue_size = match ctx.pv_request {
-        Some(PvField::Structure(ref req)) => crate::qsrv::group::negotiated_queue_size(req),
-        _ => crate::qsrv::group::GROUP_DEFAULT_QUEUE_SIZE,
-    };
+    // R10-33: the negotiated monitor queue limit is the SERVER's, not a
+    // second reading of the pvRequest. pvxs `GroupSource::onSubscribe` asks
+    // the subscription control what depth it actually got
+    // (`subscriptionControl->stats(stats)` → `stats.limitQueue`, which is
+    // `MonitorOp::limit`, servermon.cpp:313) and stamps THAT into
+    // `record._options.queueSize` (groupsource.cpp:401-404); it never reads
+    // the client's `queueSize` option itself. `opts.queue_size` is that
+    // limit, resolved once by the server's INIT negotiation.
     let mut monitor = match channel {
         crate::qsrv::AnyChannel::Single(single) => {
             single.create_monitor_with_value_mask(dbe_mask).await.ok()?
@@ -292,7 +384,7 @@ async fn open_monitor(
             .create_monitor()
             .await
             .ok()?
-            .with_queue_size(queue_size),
+            .with_queue_size(opts.queue_size),
     };
     monitor.start().await.ok()?;
     Some(OpenedMonitor::Db(monitor))
@@ -353,6 +445,67 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
     // `_checked` overrides so every wire op runs against the
     // ACF policy with the correct user/host.
 
+    /// pvxs `SingleSource::onSubscribe` (`ioc/singlesource.cpp:114-140`) reads
+    /// `record._options.DBE` with the THROWING `as<T>()`, before `connect()`
+    /// emits the INIT reply. An array-typed DBE of integer, real or string
+    /// element kind raises `NoConvert` there. This is the INIT-time half of that
+    /// read; the mask itself is resolved at START by `open_monitor`, which is
+    /// where the port opens the subscription.
+    ///
+    /// DEVIATION from C++, deliberate — CBUG-C2. QSRV lets that `NoConvert`
+    /// unwind out of its bare `connect()` into `conn.cpp:277-282`'s
+    /// `bev.reset()`, so one client's malformed `record._options` drops the
+    /// shared TCP circuit and every other channel on it. Here the failure is an
+    /// `OpError`: this MONITOR gets an error INIT reply, and nothing else on the
+    /// circuit notices.
+    ///
+    /// Scoped to SINGLE-RECORD channels, because that is the only pvxs source
+    /// that reads DBE:
+    /// * a `pva_pvs`-registered name is served through the PVA `SharedPV` path,
+    ///   whose `onSubscribe` reads no `record._options` at all;
+    /// * a group name is served by `GroupSource`, whose `onSubscribe`
+    ///   (`ioc/groupsource.cpp`) reads `atomic` but never `DBE`.
+    ///
+    /// Throwing for either of those would be a NEW divergence — pvxs serves
+    /// them.
+    fn check_monitor_request(
+        &self,
+        checked: &epics_pva_rs::server_native::source::AccessChecked,
+        ctx: &epics_pva_rs::server_native::source::ChannelContext,
+    ) -> impl std::future::Future<Output = Result<(), epics_pva_rs::server_native::source::OpError>> + Send
+    {
+        let pva_pvs = self.pva_pvs.clone();
+        let provider = self.provider.clone();
+        let name = checked.pv_name().to_string();
+        let pv_request = ctx.pv_request.clone();
+        // The op's `RemoteLogger` sink — the wire layer drains it after this
+        // hook returns Ok, before the INIT reply (R10-37).
+        let log = ctx.log.clone();
+        async move {
+            let Some(PvField::Structure(req)) = pv_request else {
+                return Ok(());
+            };
+            if pva_pvs.read().await.contains_key(&name) || provider.is_servable_group(&name).await {
+                return Ok(());
+            }
+            // R10-37: this hook IS pvxs's `onSubscribe` DBE read, so it owns
+            // BOTH of that read's outcomes — the `NoConvert` throw that resets
+            // the circuit, and the `Level::Warn` "selects empty mask" logRemote
+            // (`singlesource.cpp:128-130`). pvxs writes that warning before
+            // `connect()` emits the INIT reply; the wire layer drains `ctx.log`
+            // on this hook's Ok path, before building the reply, so the client
+            // sees it in pvxs's order. The START-time re-parse in `open_monitor`
+            // discards its log so this is reported exactly once.
+            //
+            // Scoped to single-record channels by the early return above — the
+            // pvxs sources for group and native-PVA names never read DBE, so
+            // neither warns. Logging from START (as this used to) warned for
+            // them as well.
+            crate::qsrv::channel::dbe_mask_from_pv_request(&req, &log)?;
+            Ok(())
+        }
+    }
+
     fn get_value_checked(
         &self,
         checked: epics_pva_rs::server_native::source::AccessChecked,
@@ -403,6 +556,27 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
         }
     }
 
+    /// The framed read: the value from `get_value_checked` plus the
+    /// leaves QSRV actually assigned into it (`read_marks`). Without this
+    /// the GET reply, the PUT_GET readback and the monitor seed all framed
+    /// EVERY leaf the request selected — including the seven the port's NT
+    /// carries but pvxs's `getProperties` never assigns.
+    fn read_checked(
+        &self,
+        checked: epics_pva_rs::server_native::source::AccessChecked,
+        ctx: epics_pva_rs::server_native::source::ChannelContext,
+    ) -> impl std::future::Future<Output = Option<epics_pva_rs::server_native::source::SourceRead>> + Send
+    {
+        let provider = self.provider.clone();
+        let pva_pvs = self.pva_pvs.clone();
+        async move {
+            let name = checked.pv_name().to_string();
+            let value = self.get_value_checked(checked, ctx).await?;
+            let marked = read_marks(&provider, &pva_pvs, &name, &value).await;
+            Some(epics_pva_rs::server_native::source::SourceRead { value, marked })
+        }
+    }
+
     fn put_value_checked(
         &self,
         checked: epics_pva_rs::server_native::source::AccessChecked,
@@ -447,8 +621,8 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                 _ => None,
             };
             let opts = match init_req {
-                Some(req) => crate::qsrv::channel::PutOptions::from_pv_request(req),
-                None => crate::qsrv::channel::PutOptions::from_pv_request(&pv),
+                Some(req) => crate::qsrv::channel::PutOptions::from_pv_request(req, &ctx.log),
+                None => crate::qsrv::channel::PutOptions::from_pv_request(&pv, &ctx.log),
             };
             let channel = provider
                 .create_channel_with_creds(&name, ctx_to_creds(&ctx))
@@ -458,7 +632,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                 crate::qsrv::AnyChannel::Single(single) => single
                     .put_with_options(&pv, opts)
                     .await
-                    .map_err(|e| OpError::failed(e.to_string())),
+                    .map_err(|e| OpError::failed(crate::qsrv::put_status::wire_message(&e))),
                 crate::qsrv::AnyChannel::Group(group) => {
                     // `atomic` lives in the INIT pvRequest on the wire
                     // path; fall back to the value for in-process
@@ -469,9 +643,9 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                         None => crate::qsrv::channel::atomic_from_pv_request(&pv),
                     };
                     group
-                        .put_with_options(&pv, opts, atomic_override)
+                        .put_with_options(&pv, opts, atomic_override, &ctx.log)
                         .await
-                        .map_err(|e| OpError::failed(e.to_string()))
+                        .map_err(|e| OpError::failed(crate::qsrv::put_status::wire_message(&e)))
                 }
             }
         }
@@ -541,17 +715,19 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                         None => PvStructure::new(""),
                     };
                     let opts = match init_req {
-                        Some(req) => crate::qsrv::channel::PutOptions::from_pv_request(req),
-                        None => crate::qsrv::channel::PutOptions::from_pv_request(&pv),
+                        Some(req) => {
+                            crate::qsrv::channel::PutOptions::from_pv_request(req, &ctx.log)
+                        }
+                        None => crate::qsrv::channel::PutOptions::from_pv_request(&pv, &ctx.log),
                     };
                     let atomic_override = match init_req {
                         Some(req) => crate::qsrv::channel::atomic_from_pv_request(req),
                         None => crate::qsrv::channel::atomic_from_pv_request(&pv),
                     };
                     group
-                        .put_with_options(&pv, opts, atomic_override)
+                        .put_with_options(&pv, opts, atomic_override, &ctx.log)
                         .await
-                        .map_err(|e| OpError::failed(e.to_string()))
+                        .map_err(|e| OpError::failed(crate::qsrv::put_status::wire_message(&e)))
                 }
                 crate::qsrv::AnyChannel::Single(single) => {
                     // Single-record: generic read-merge-write under the
@@ -572,13 +748,15 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                         }
                     };
                     let opts = match init_req {
-                        Some(req) => crate::qsrv::channel::PutOptions::from_pv_request(req),
-                        None => crate::qsrv::channel::PutOptions::from_pv_request(&pv),
+                        Some(req) => {
+                            crate::qsrv::channel::PutOptions::from_pv_request(req, &ctx.log)
+                        }
+                        None => crate::qsrv::channel::PutOptions::from_pv_request(&pv, &ctx.log),
                     };
                     single
                         .put_with_options(&pv, opts)
                         .await
-                        .map_err(|e| OpError::failed(e.to_string()))
+                        .map_err(|e| OpError::failed(crate::qsrv::put_status::wire_message(&e)))
                 }
             }
         }
@@ -641,7 +819,18 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
             // Legacy cooked path: plain `PvField`s, no marked set. The
             // PVA layer's `subscribe_checked_opts_marked` (below) is what
             // carries the `+trigger` marked set to the wire.
-            match open_monitor(provider, pva_pvs, checked, ctx).await? {
+            // No `MonitorOptions` on this legacy entry — nothing was
+            // negotiated, so the source sees the per-op defaults (pvxs
+            // `MonitorOp::limit = 4u`).
+            match open_monitor(
+                provider,
+                pva_pvs,
+                checked,
+                ctx,
+                epics_pva_rs::server_native::MonitorOptions::default(),
+            )
+            .await?
+            {
                 OpenedMonitor::Native(rx) => Some(rx),
                 OpenedMonitor::Db(mut monitor) => {
                     let (tx, rx) = mpsc::channel::<PvField>(64);
@@ -687,14 +876,14 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
         &self,
         checked: epics_pva_rs::server_native::source::AccessChecked,
         ctx: epics_pva_rs::server_native::source::ChannelContext,
-        _opts: epics_pva_rs::server_native::MonitorOptions,
+        opts: epics_pva_rs::server_native::MonitorOptions,
     ) -> impl std::future::Future<
         Output = Option<mpsc::Receiver<epics_pva_rs::server_native::MonitorUpdate>>,
     > + Send {
         let provider = self.provider.clone();
         let pva_pvs = self.pva_pvs.clone();
         async move {
-            match open_monitor(provider, pva_pvs, checked, ctx).await? {
+            match open_monitor(provider, pva_pvs, checked, ctx, opts).await? {
                 OpenedMonitor::Native(rx) => {
                     Some(epics_pva_rs::server_native::plain_monitor_updates(rx))
                 }
@@ -717,7 +906,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
         &self,
         checked: epics_pva_rs::server_native::source::AccessChecked,
         ctx: epics_pva_rs::server_native::source::ChannelContext,
-        _opts: epics_pva_rs::server_native::MonitorOptions,
+        opts: epics_pva_rs::server_native::MonitorOptions,
     ) -> impl std::future::Future<
         Output = Option<
             epics_pva_rs::server_native::source::SubscriptionSeed<
@@ -727,14 +916,17 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
     > + Send {
         let provider = self.provider.clone();
         let pva_pvs = self.pva_pvs.clone();
+        let provider_seed = self.provider.clone();
+        let pva_pvs_seed = self.pva_pvs.clone();
         async move {
-            let opened = open_monitor(provider, pva_pvs, checked.clone(), ctx.clone()).await?;
+            let opened =
+                open_monitor(provider, pva_pvs, checked.clone(), ctx.clone(), opts).await?;
             match opened {
                 OpenedMonitor::Native(rx) => {
                     // Native-registered PVA PVs (NDPluginPva etc.) serve the
                     // GET seed and monitor frames from one cached snapshot, so
                     // their `record._options` already match — keep the GET seed.
-                    let initial = self.get_value_checked(checked, ctx).await;
+                    let initial = self.read_checked(checked, ctx).await;
                     Some(epics_pva_rs::server_native::source::SubscriptionSeed {
                         initial,
                         updates: epics_pva_rs::server_native::plain_monitor_updates(rx),
@@ -758,9 +950,23 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                     // subscription is already armed (open_monitor started it),
                     // so any event between seed and stream is buffered in the
                     // monitor's fan-in channel rather than lost or doubled.
+                    //
+                    // The seed carries the leaves the read assigned, like any
+                    // other framed read — plus `record._options.queueSize`,
+                    // which `onSubscribe` assigns on the monitor's
+                    // `currentValue` and `onGet` does not
+                    // (`groupsource.cpp:401-405` vs `:484`).
+                    let name = checked.pv_name().to_string();
                     let initial = match monitor.seed().await {
-                        Some(v) => Some(v),
-                        None => self.get_value_checked(checked, ctx).await,
+                        Some(value) => {
+                            let mut marked =
+                                read_marks(&provider_seed, &pva_pvs_seed, &name, &value).await;
+                            if let Some(paths) = marked.as_mut() {
+                                paths.push("record._options.queueSize".to_string());
+                            }
+                            Some(epics_pva_rs::server_native::source::SourceRead { value, marked })
+                        }
+                        None => self.read_checked(checked, ctx).await,
                     };
                     // Capture the enable/disable handles before the monitor
                     // moves into its forward task; `Arc` so the gate closure
@@ -883,7 +1089,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
             channel
                 .put(&pv)
                 .await
-                .map_err(|e| OpError::failed(e.to_string()))
+                .map_err(|e| OpError::failed(crate::qsrv::put_status::wire_message(&e)))
         }
     }
 
@@ -945,19 +1151,6 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
             });
             Some(rx)
         }
-    }
-
-    /// a QSRV *pure self-trigger* group monitor emits partial
-    /// updates — each event re-reads only the member whose record
-    /// processed, so the PVA server narrows the wire changed-bitset
-    /// by diffing consecutive snapshots. Returns `true` only for
-    /// groups whose every member uses the default `+trigger`
-    /// (self-trigger); single-record / native-PVA PVs and groups with
-    /// explicit `+trigger` members keep the full request mask.
-    fn monitor_emits_partial(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
-        let provider = self.provider.clone();
-        let name = name.to_string();
-        async move { provider.group_is_pure_self_trigger(&name).await }
     }
 }
 
@@ -1138,10 +1331,12 @@ pub async fn run_ca_pva_qsrv_ioc(
 
     let db = config.db.clone();
     let ca_port = config.port;
-    let pva_port: u16 = std::env::var("EPICS_PVA_SERVER_PORT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(5075);
+    // pvxs owns the PVA port, and it is NOT the CA rule: `PickOne` reads the
+    // server-specific `EPICS_PVAS_SERVER_PORT` before the shared
+    // `EPICS_PVA_SERVER_PORT` (config.cpp:402-408), and `0` is a legitimate
+    // ephemeral-bind request rather than a value to reject. A strict `parse()`
+    // here honoured neither.
+    let pva_port: u16 = epics_pva_rs::config::env::pvas_server_port();
 
     // ── QSRV2 enable gate (pvxs enable2(), iochooks.cpp:401-496) ──
     // Honor PVXS_QSRV_ENABLE / EPICS_IOC_IGNORE_SERVERS=qsrv2 before
@@ -1313,8 +1508,8 @@ async fn load_qsrv_groups(
     }
 
     // 3. Finalize (pvxs resolveTriggerReferences / createGroups).
-    let n = provider.process_groups();
-    tracing::info!("qsrv: processGroups finalized {n} group(s)");
+    let n = provider.process_groups().await;
+    tracing::info!("qsrv: processGroups created {n} group(s)");
 }
 
 #[cfg(test)]
@@ -1580,6 +1775,73 @@ mod tests {
         );
     }
 
+    /// Boundaries of the fan-out reap predicate in [`PvaPvHandle::post`].
+    ///
+    /// A bounded `try_send` fails on `Full` AND on `Closed`. Only `Closed`
+    /// means the subscriber is dead. The boundaries, one case each:
+    ///
+    /// - queue below capacity  → delivered, subscriber retained
+    /// - queue exactly full    → frame dropped, subscriber RETAINED
+    /// - full, then drained    → later posts still arrive (the regression:
+    ///   the old `retain(|tx| tx.try_send(v).is_ok())` evicted the live
+    ///   subscriber at the moment it filled, so it never received again)
+    /// - receiver dropped      → subscriber reaped
+    #[tokio::test]
+    async fn native_pva_full_monitor_queue_drops_the_frame_not_the_subscriber() {
+        use epics_pva_rs::pvdata::{PvField, ScalarValue};
+
+        // Descriptor-less: this test is about the fan-out, not validation.
+        let handle = PvaPvHandle::new(None);
+        let mut rx = handle.add_subscriber();
+        let cap = 64; // `add_subscriber`'s channel capacity.
+        let v = |i: i32| PvField::Scalar(ScalarValue::Int(i));
+
+        // Boundary 1: below capacity — delivered, subscriber retained.
+        handle.post(v(0)).expect("post accepted");
+        assert_eq!(handle.subscribers.lock().len(), 1, "live sub retained");
+
+        // Boundary 2: fill to exactly capacity, then post past it. The
+        // overflow frames are lost; the SUBSCRIPTION must survive.
+        for i in 1..cap {
+            handle.post(v(i)).expect("post accepted");
+        }
+        for i in cap..(cap + 10) {
+            handle
+                .post(v(i))
+                .expect("post accepted even when the queue is full");
+        }
+        assert_eq!(
+            handle.subscribers.lock().len(),
+            1,
+            "a FULL queue is backpressure, not death: the subscriber must survive"
+        );
+
+        // Boundary 3: drain, then post again — a live subscriber that once
+        // filled must still receive. This is what the old predicate broke.
+        for i in 0..cap {
+            assert_eq!(
+                rx.try_recv().ok(),
+                Some(v(i)),
+                "the queued frames are the first {cap} posts, in order"
+            );
+        }
+        assert!(rx.try_recv().is_err(), "nothing beyond capacity was queued");
+        handle.post(v(999)).expect("post accepted");
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some(v(999)),
+            "a subscriber that survived a full queue still receives after it drains"
+        );
+
+        // Boundary 4: receiver gone (Closed) — reap.
+        drop(rx);
+        handle.post(v(1000)).expect("post accepted");
+        assert!(
+            handle.subscribers.lock().is_empty(),
+            "a CLOSED receiver is the only condition that reaps a subscriber"
+        );
+    }
+
     /// A descriptor-mismatched *first* post (no previously accepted value)
     /// leaves the PV with no current value — matching pvxs before
     /// `open()` / the first accepted post, where `fetch()` has nothing to
@@ -1621,7 +1883,7 @@ mod tests {
 
     /// pvxs installs no `onRPC` for QSRV records (singlesource.cpp:427-460);
     /// an RPC EXEC replies "RPC Not Implemented" (serverget.cpp:482-486).
-    /// QsrvPvStore must inherit the default "RPC not supported": RPC must
+    /// QsrvPvStore must inherit the default "RPC Not Implemented": RPC must
     /// NOT become a write-through, so `pvcall PV value=...` cannot mutate a
     /// record and a parameterless RPC is rejected rather than acting as a
     /// GET.
@@ -1645,7 +1907,7 @@ mod tests {
             .await
             .expect_err("parameterless RPC on a QSRV record must be rejected");
         assert!(
-            err.message.contains("RPC not supported"),
+            err.message == epics_pva_rs::server_native::source::RPC_NOT_IMPLEMENTED,
             "expected unsupported-RPC error, got: {err}"
         );
 
@@ -1664,7 +1926,7 @@ mod tests {
             .await
             .expect_err("RPC write-through on a QSRV record must be rejected");
         assert!(
-            err.message.contains("RPC not supported"),
+            err.message == epics_pva_rs::server_native::source::RPC_NOT_IMPLEMENTED,
             "expected unsupported-RPC error, got: {err}"
         );
 
@@ -1712,7 +1974,7 @@ mod tests {
             .unwrap();
         let provider = Arc::new(BridgeProvider::new(db));
         provider.load_group_config(GROUP_JSON).expect("load group");
-        provider.process_groups();
+        provider.process_groups().await;
         let store = QsrvPvStore::new(provider);
 
         let mut query = PvStructure::new("");
@@ -1733,7 +1995,7 @@ mod tests {
             .await
             .expect_err("RPC on a QSRV group must be rejected");
         assert!(
-            err.message.contains("RPC not supported"),
+            err.message == epics_pva_rs::server_native::source::RPC_NOT_IMPLEMENTED,
             "expected unsupported-RPC error, got: {err}"
         );
 
@@ -1860,6 +2122,7 @@ mod tests {
             authority: String::new(),
             roles: Vec::new(),
             pv_request: Some(PvField::Structure(req)),
+            log: Default::default(),
         };
 
         let checked = AccessGate::open()
@@ -1940,6 +2203,7 @@ mod tests {
             authority: String::new(),
             roles: Vec::new(),
             pv_request: Some(PvField::Structure(req)),
+            log: Default::default(),
         };
 
         let got = store
@@ -1981,6 +2245,7 @@ mod tests {
             authority: String::new(),
             roles: vec!["operators".into(), "experts".into()],
             pv_request: None,
+            log: Default::default(),
         };
         let creds = ctx_to_creds(&ctx);
         assert_eq!(
@@ -2111,6 +2376,7 @@ mod tests {
             authority: String::new(),
             roles: Vec::new(),
             pv_request: Some(PvField::Structure(req)),
+            log: Default::default(),
         };
         let checked = AccessGate::open()
             .check("FLNK:a", "127.0.0.1", "anonymous", "anonymous", "")
@@ -2174,6 +2440,11 @@ mod tests {
 
         let db = Arc::new(PvDatabase::new());
         db.add_record("SP:rec", Box::new(AiRecord::new(1.0)))
+            .await
+            .unwrap();
+        // `SP:grp`'s `+channel` must resolve, or the group is refused at
+        // creation and the shadow rule under test is never exercised.
+        db.add_record("OTHER", Box::new(AiRecord::new(2.0)))
             .await
             .unwrap();
         let provider = Arc::new(BridgeProvider::new(db));
@@ -2291,6 +2562,7 @@ mod tests {
             authority: String::new(),
             roles: Vec::new(),
             pv_request: Some(PvField::Structure(req)),
+            log: Default::default(),
         };
 
         let checked = AccessGate::open()
@@ -2394,6 +2666,7 @@ mod tests {
                 authority: String::new(),
                 roles: Vec::new(),
                 pv_request: Some(PvField::Structure(req)),
+                log: Default::default(),
             };
             let checked = AccessGate::open()
                 .check(group_pv, "127.0.0.1", "anonymous", "anonymous", "")
@@ -2423,7 +2696,7 @@ mod tests {
             // Non-Passive scan: a passive put will NOT process this record.
             db.put_pv(
                 &format!("{rec}.SCAN"),
-                EpicsValue::Enum(ScanType::Sec1 as u16),
+                EpicsValue::Enum(ScanType::Sec1.to_u16()),
             )
             .await
             .unwrap();
@@ -2533,6 +2806,7 @@ mod tests {
             authority: String::new(),
             roles: Vec::new(),
             pv_request: None,
+            log: Default::default(),
         };
         let checked = AccessGate::open()
             .check("BR120:grp", "127.0.0.1", "anonymous", "anonymous", "")
@@ -2641,6 +2915,7 @@ mod tests {
             authority: String::new(),
             roles: Vec::new(),
             pv_request: None,
+            log: Default::default(),
         };
         let checked = AccessGate::open()
             .check("BR120E:grp", "127.0.0.1", "anonymous", "anonymous", "")

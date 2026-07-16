@@ -182,6 +182,14 @@ pub fn epics_test(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// - `#[record(type = "ai")]` — sets the record type name
 /// - `#[record(type = "ai", crate_path = "my_crate")]` — override crate path
+/// - `#[record(type = "seq", init = seq_init_record)]` — emit
+///   `Record::init_record` delegating to the named free function
+///   (`fn(&mut Self, u8) -> CaResult<()>`), for a record type whose C
+///   `init_record` does real work; omitted, the trait's no-op applies
+/// - `#[record(type = "fanout", no_value_monitor)]` — emit
+///   `Record::process_posts_value_monitor` returning `false`, for a "trigger"
+///   record (fanout/seq) whose C `process()` posts VAL only with alarm events;
+///   omitted, the trait default `true` applies
 /// - `#[field(type = "Double")]` — sets the DBR type for a field
 /// - `#[field(type = "Double", read_only)]` — marks a field as read-only
 /// - `#[field(type = "Short", menu_choices = SELM_CHOICES)]` — a
@@ -203,6 +211,27 @@ pub fn derive_epics_record(input: TokenStream) -> TokenStream {
 struct RecordAttrs {
     record_type: String,
     crate_path: Option<String>,
+    /// `#[record(constant_init = "SELL:SELN,DOL0:DO0")]` — the record's C
+    /// `recGblInitConstantLink` table, as `LINK:TARGET` pairs. Emitted as
+    /// `Record::constant_init_links`, which the init-seed owner
+    /// (`PvDatabase::rec_gbl_init_constant_links`) applies; a record whose
+    /// `Record` impl is hand-written declares the same table by overriding that
+    /// method directly.
+    constant_init: Vec<(String, String)>,
+    /// `#[record(init = some_fn)]` — the record's C `init_record`. The derive
+    /// emits no `init_record` by default (the trait's no-op applies); a record
+    /// type whose C `init_record` does real work (e.g. `seq`'s
+    /// `prec->oldn = prec->seln`) names a free function `fn(&mut Self, u8) ->
+    /// CaResult<()>` here, and the derive emits `Record::init_record`
+    /// delegating to it. Kept a free function, not an inherent method, so the
+    /// derive need not assume a method exists.
+    init: Option<syn::Path>,
+    /// `#[record(no_value_monitor)]` — the record's process cycle posts no VAL
+    /// value monitor (`Record::process_posts_value_monitor` → `false`). Set for
+    /// the "trigger" records `fanout`/`seq`, whose C `process()` posts VAL only
+    /// with alarm events, never `DBE_VALUE`/`DBE_LOG`. Default `false` (the
+    /// trait default `true` applies), so ordinary value records are unaffected.
+    no_value_monitor: bool,
 }
 
 struct FieldInfo {
@@ -261,24 +290,14 @@ fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
         });
     }
 
-    let field_count = field_infos.len();
-
-    // Generate field_list entries
-    let field_descs: Vec<_> = field_infos
-        .iter()
-        .map(|fi| {
-            let name_str = &fi.epics_name;
-            let dbf = dbf_type_ident(&fi.dbf_type);
-            let ro = fi.read_only;
-            quote! {
-                #krate::server::record::FieldDesc {
-                    name: #name_str,
-                    dbf_type: #krate::types::DbFieldType::#dbf,
-                    read_only: #ro,
-                }
-            }
-        })
-        .collect();
+    // NOTE: the derive deliberately emits NO field declaration. A record type
+    // is declared by its `.dbd` and by nothing else; the generated table in
+    // `dbd_generated` is what `FieldDeclaration::field_list` serves. Deriving
+    // the declaration from the Rust struct member instead is what typed
+    // `longin.ADEL` `DBF_DOUBLE` (the member is an `f64`) where
+    // `longinRecord.dbd` says `DBF_LONG`, and typed every `DBF_MENU` field as
+    // a bare integer with no `menu()`. The member types the *storage*; only the
+    // `.dbd` types the *field*.
 
     // Generate get_field match arms
     let get_arms: Vec<_> = field_infos
@@ -342,17 +361,61 @@ fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
         }
     };
 
+    // `#[record(constant_init = "LINK:TARGET,...")]` — the record's C
+    // `recGblInitConstantLink` table. Omitted entirely when the record declares
+    // none, so the trait default (no constant seeds) applies.
+    let constant_init_method = if attrs.constant_init.is_empty() {
+        quote! {}
+    } else {
+        let seeds: Vec<_> = attrs
+            .constant_init
+            .iter()
+            .map(|(link, target)| {
+                quote! {
+                    #krate::server::record::ConstantInitLink::new(#link, #target)
+                }
+            })
+            .collect();
+        quote! {
+            fn constant_init_links(&self) -> Vec<#krate::server::record::ConstantInitLink> {
+                vec![#(#seeds),*]
+            }
+        }
+    };
+
+    // `#[record(init = some_fn)]` — emit `Record::init_record` delegating to
+    // the named free function. Omitted entirely when the record declares no
+    // init, so the trait default (no-op) applies.
+    let init_method = match &attrs.init {
+        Some(path) => quote! {
+            fn init_record(&mut self, pass: u8) -> #krate::error::CaResult<()> {
+                #path(self, pass)
+            }
+        },
+        None => quote! {},
+    };
+
+    // `#[record(no_value_monitor)]` — emit `Record::process_posts_value_monitor`
+    // returning `false` (fanout/seq trigger-VAL). Omitted when the flag is
+    // absent, so the trait default (`true`) applies to every value record.
+    let value_monitor_method = if attrs.no_value_monitor {
+        quote! {
+            fn process_posts_value_monitor(&self) -> bool {
+                false
+            }
+        }
+    } else {
+        quote! {}
+    };
+
     let expanded = quote! {
         impl #krate::server::record::Record for #name {
+            #constant_init_method
+            #init_method
+            #value_monitor_method
+
             fn record_type(&self) -> &'static str {
                 #record_type_str
-            }
-
-            fn field_list(&self) -> &'static [#krate::server::record::FieldDesc] {
-                static FIELDS: [#krate::server::record::FieldDesc; #field_count] = [
-                    #(#field_descs),*
-                ];
-                &FIELDS
             }
 
             fn get_field(&self, name: &str) -> Option<#krate::types::EpicsValue> {
@@ -384,6 +447,9 @@ fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
 fn parse_record_attrs(input: &DeriveInput) -> syn::Result<RecordAttrs> {
     let mut record_type = None;
     let mut crate_path = None;
+    let mut constant_init: Vec<(String, String)> = Vec::new();
+    let mut init: Option<syn::Path> = None;
+    let mut no_value_monitor = false;
 
     for attr in &input.attrs {
         if attr.path().is_ident("record") {
@@ -402,8 +468,30 @@ fn parse_record_attrs(input: &DeriveInput) -> syn::Result<RecordAttrs> {
                         crate_path = Some(s.value());
                     }
                     Ok(())
+                } else if meta.path.is_ident("constant_init") {
+                    let value = meta.value()?;
+                    let lit: Lit = value.parse()?;
+                    if let Lit::Str(s) = lit {
+                        for pair in s.value().split(',').filter(|p| !p.trim().is_empty()) {
+                            let (link, target) = pair.trim().split_once(':').ok_or_else(|| {
+                                meta.error("constant_init entries are `LINK:TARGET` pairs")
+                            })?;
+                            constant_init
+                                .push((link.trim().to_string(), target.trim().to_string()));
+                        }
+                    }
+                    Ok(())
+                } else if meta.path.is_ident("init") {
+                    init = Some(meta.value()?.parse()?);
+                    Ok(())
+                } else if meta.path.is_ident("no_value_monitor") {
+                    // Bare flag, like a field's `read_only`: no `= value`.
+                    no_value_monitor = true;
+                    Ok(())
                 } else {
-                    Err(meta.error("expected `type` or `crate_path`"))
+                    Err(meta.error(
+                        "expected `type`, `crate_path`, `constant_init`, `init` or `no_value_monitor`",
+                    ))
                 }
             })?;
         }
@@ -415,6 +503,9 @@ fn parse_record_attrs(input: &DeriveInput) -> syn::Result<RecordAttrs> {
     Ok(RecordAttrs {
         record_type,
         crate_path,
+        constant_init,
+        init,
+        no_value_monitor,
     })
 }
 
@@ -454,18 +545,6 @@ fn parse_field_attrs(field: &syn::Field) -> syn::Result<(String, bool, Option<sy
         .ok_or_else(|| syn::Error::new_spanned(field, "missing #[field(type = \"...\")]"))?;
 
     Ok((dbf_type, read_only, menu_choices))
-}
-
-fn dbf_type_ident(type_str: &str) -> proc_macro2::Ident {
-    // `PvStr` is a byte-faithful DBF_STRING storage field backed by a
-    // `PvString`; it advertises the same DBF_STRING wire type as a
-    // `String` field but preserves non-UTF-8 bytes on the value path.
-    let variant = if type_str == "PvStr" {
-        "String"
-    } else {
-        type_str
-    };
-    proc_macro2::Ident::new(variant, proc_macro2::Span::call_site())
 }
 
 fn value_to_epics(

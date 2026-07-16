@@ -154,7 +154,7 @@ impl DbFieldType {
     /// signed CA type that holds the full `0..=65535` range), `UChar` →
     /// `DBR_CHAR` (4, same 1-byte wire type — the bytes are identical, only
     /// the interpretation is unsigned).
-    fn ca_wire_type(&self) -> u16 {
+    pub fn ca_wire_type(&self) -> u16 {
         match self {
             Self::Int64 | Self::UInt64 | Self::ULong => Self::Double as u16,
             Self::UShort => Self::Long as u16,
@@ -460,6 +460,20 @@ const DBR_TEXT: [&str; (LAST_BUFFER_TYPE + 1) as usize] = [
 /// `caget.c` does.
 pub fn dbr_text_to_type(text: &str) -> Option<u16> {
     DBR_TEXT.iter().position(|&n| n == text).map(|i| i as u16)
+}
+
+/// Resolve a DBR type code to its name, mirroring the C
+/// `dbr_type_to_text` macro (`db_access.h`): an index into the same
+/// `dbr_text[]` table, with C's `"DBR_invalid"` for anything outside
+/// `0..=38`. Inverse of [`dbr_text_to_type`], and the single owner of
+/// that direction — the CA client's exception block
+/// (`CA.Client.Exception ... type=%s`) and `caget -d`'s "Request type:"
+/// line both read the names from here.
+pub fn dbr_type_to_text(code: u16) -> &'static str {
+    DBR_TEXT
+        .get(code as usize)
+        .copied()
+        .unwrap_or("DBR_invalid")
 }
 
 #[cfg(test)]

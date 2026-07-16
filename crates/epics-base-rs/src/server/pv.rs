@@ -1,23 +1,12 @@
 use std::sync::Arc;
-use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use crate::runtime::sync::{Mutex, RwLock, mpsc};
+use crate::runtime::sync::{Mutex, RwLock};
 
 use crate::error::CaError;
-use crate::server::snapshot::{ControlInfo, DisplayInfo, EnumInfo, Snapshot};
+use crate::server::event_queue::{EventReader, EventSink, EventUser, PostOutcome};
+use crate::server::snapshot::{ControlInfo, DisplayInfo, EnumInfo, PropertySupport, Snapshot};
 use crate::types::{DbFieldType, EpicsValue, WallTime};
-
-/// Per-subscriber bounded mpsc depth. Lifted from
-/// `EPICS_CAS_MAX_EVENTS_PER_CHAN`, default 64. Floor 4 so even
-/// hostile env values (`0`/`1`) leave room for last-value
-/// coalescing to make progress.
-fn per_channel_event_depth() -> usize {
-    crate::runtime::env::get("EPICS_CAS_MAX_EVENTS_PER_CHAN")
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(64)
-        .max(4)
-}
 
 /// Per-PV subscriber cap. Default 1024 — comfortably above
 /// any realistic dashboard fan-out, small enough to bound the
@@ -30,11 +19,11 @@ pub(crate) fn max_subscribers_per_pv() -> usize {
         .max(8)
 }
 
-/// Process-global counter of monitor events dropped because the
-/// per-channel mpsc was full AND the coalesce slot was already
-/// occupied by an even-newer overflow value. Covers both
-/// `ProcessVariable` and `RecordInstance` overflow via the single
-/// [`Subscriber::coalesce_overflow`] owner. Mirrors the pattern of
+/// Process-global counter of monitor events the subscriber never observed
+/// because a later post replaced them in the event queue — C `evSubscrip
+/// ::nreplace` (`dbEvent.c:821`), summed over every monitor. Covers both
+/// `ProcessVariable` and `RecordInstance` posts, because both reach the queue
+/// through the single [`EventSink::post`] owner. Mirrors the pattern of
 /// `dropped_monitors` on the client side (subscribe_with_deadband).
 ///
 /// read via [`dropped_monitor_events`]. That reader is not yet
@@ -49,13 +38,6 @@ static DROPPED_MONITOR_EVENTS: AtomicU64 = AtomicU64::new(0);
 /// current wiring status.
 pub fn dropped_monitor_events() -> u64 {
     DROPPED_MONITOR_EVENTS.load(Ordering::Relaxed)
-}
-
-/// Internal: record a dropped event. Called from
-/// `notify_subscribers` when both the bounded mpsc and the
-/// coalesce slot are full.
-fn record_dropped_monitor() {
-    DROPPED_MONITOR_EVENTS.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Identity of the client driving a `WriteHook` invocation. Carries
@@ -228,20 +210,17 @@ pub struct MonitorEvent {
     pub mask: crate::server::recgbl::EventMask,
 }
 
-/// A subscriber waiting for PV value updates.
+/// A subscriber waiting for PV value updates — C `evSubscrip`'s producer-side
+/// view. Its pending events live in the shared event queue
+/// ([`crate::server::event_queue`]), reached only through `sink`.
 pub struct Subscriber {
     pub sid: u32,
     pub data_type: DbFieldType,
     pub mask: u16,
-    pub tx: mpsc::Sender<MonitorEvent>,
-    /// Last-value coalescing slot. When the bounded mpsc above is full,
-    /// the producer stores the newest event here, overwriting any prior
-    /// pending overflow value. After each normal recv() the consumer pops
-    /// this slot through [`coalesce_consume`]: a set slot is newer than the
-    /// whole queue, so it is delivered and the now-stale queue tail is
-    /// drained — matching libca rsrv "drop oldest, keep newest" semantics
-    /// while never delivering the newest value and then an older queued one.
-    pub coalesced: Arc<StdMutex<Option<MonitorEvent>>>,
+    /// Producer half of this monitor's slot in the circuit's event queue.
+    /// `pub(crate)` so no code outside this crate can enqueue past the
+    /// append-vs-replace rule the queue owns.
+    pub(crate) sink: EventSink,
     /// Server-side channel filter chain (epics-base 3.15.7).
     /// Defaults to empty — every event passes unchanged. Populated
     /// by the subscription path when the channel name carries a
@@ -249,7 +228,7 @@ pub struct Subscriber {
     pub filters: crate::server::database::filters::FilterChain,
     /// Delivery gate. `true` (the default) delivers events normally;
     /// `false` suppresses every post to this subscriber at the source —
-    /// no `try_send`, no coalesce-overflow, no filter evaluation — so a
+    /// nothing reaches the event queue, no filter is evaluated — so a
     /// paused monitor stops the record-event work entirely, not just the
     /// downstream frame. Mirrors EPICS `db_event_disable` / pvxs
     /// `onStart(false)` (singlesource.cpp:151-173, groupsource.cpp:151-281):
@@ -271,84 +250,22 @@ impl Subscriber {
         post.is_empty() || crate::server::recgbl::EventMask::from_bits(self.mask).intersects(post)
     }
 
-    /// single owner of the slow-consumer coalesce overflow.
-    /// Call after the bounded `tx` rejected a send: store the newest
-    /// `event` in the coalesce slot, and — when it displaces a value the
-    /// consumer never observed — record one dropped monitor event.
-    ///
-    /// Every coalesced-slot overwrite on the overflow path (both
-    /// `ProcessVariable` value/alarm posts and `RecordInstance`
-    /// field monitors) MUST go through here, so `dropped_monitor_events()`
-    /// cannot undercount one path: the record-field path previously
-    /// overwrote the slot directly and never bumped the counter, hiding
-    /// slow-consumer loss for the path most CA/PVA database monitors use.
-    pub(crate) fn coalesce_overflow(&self, mut event: MonitorEvent) {
-        if let Ok(mut slot) = self.coalesced.lock() {
-            if let Some(prior) = slot.as_ref() {
-                record_dropped_monitor();
-                // The displaced value is lost but its event class must
-                // not be: fold it into the surviving event so a narrow
-                // consumer still learns that class changed (C keeps the
-                // mask on the squashed field log).
-                event.mask |= prior.mask;
-            }
-            *slot = Some(event);
+    /// The single post path for both event sources (`ProcessVariable` value /
+    /// alarm / property posts and `RecordInstance` field monitors): hand the
+    /// event to this monitor's event queue, which owns C's append-vs-replace
+    /// decision (`db_queue_event_log`), and apply the one piece of accounting
+    /// that lives outside the queue — the counter for a value that a later post
+    /// displaced before the consumer ever saw it (C `nreplace`).
+    pub(crate) fn post(&self, event: MonitorEvent) {
+        if self.sink.post(event) == PostOutcome::Replaced {
+            DROPPED_MONITOR_EVENTS.fetch_add(1, Ordering::Relaxed);
         }
     }
-}
 
-/// Fold the producer's coalesce overflow slot into the next monitor
-/// delivery, preserving arrival order.
-///
-/// A subscriber's pending events live in two places: the bounded
-/// per-subscriber `rx` and the side `coalesced` slot. The producer fills
-/// `rx` first via `try_send` and parks an event in the slot ONLY after
-/// `rx` is full ([`Subscriber::coalesce_overflow`]), so a set slot value
-/// is strictly newer than every event still queued in `rx`. Delivery
-/// must stay monotonic in arrival order: pvxs keeps overflow and delivery
-/// in one queue and never sends the newest value and then an older queued
-/// one — `Subscription::post()` squashes overflow into `queue.back()`
-/// while `doReply()` sends `queue.front()` (`sharedpv.cpp:417-439`,
-/// `servermon.cpp:172-285`).
-///
-/// Given the freshly recv'd `queued` head and the popped `coalesced` slot,
-/// this returns the single event to deliver next:
-/// * slot empty → deliver `queued` (the in-order front, unchanged);
-/// * slot set → deliver the slot's newest value and DRAIN the now-stale
-///   `rx` backlog, because every queued entry (including `queued`) predates
-///   it. Each discarded entry is counted as a dropped monitor event — the
-///   "drop all stale, keep newest" coalescing policy. This is what keeps
-///   the consumer from returning the coalesced newest and then replaying
-///   older queued values.
-///
-/// This is the single owner of the rx-vs-slot ordering rule; every
-/// in-process and server-side monitor consumer that drains the slot
-/// (`PvSubscription`, `DbSubscription`, and the CA server monitor tasks)
-/// routes through it, so none can re-introduce newest-then-old. The
-/// caller pops the slot itself — the slot lives behind a different lock
-/// owner per source (`ProcessVariable` vs `RecordInstance`) — and hands
-/// the result here together with the `rx` it owns.
-pub fn coalesce_consume(
-    rx: &mut mpsc::Receiver<MonitorEvent>,
-    queued: MonitorEvent,
-    coalesced: Option<MonitorEvent>,
-) -> MonitorEvent {
-    let Some(mut newest) = coalesced else {
-        return queued;
-    };
-    // `queued` and everything still queued in `rx` predate `newest`;
-    // discard them so delivery converges to the newest value without
-    // ever stepping backward to an older queued snapshot. Their event
-    // classes are folded into the delivered mask — the values are
-    // superseded, but a narrow consumer must still learn which classes
-    // changed since its last delivery.
-    record_dropped_monitor();
-    newest.mask |= queued.mask;
-    while let Ok(stale) = rx.try_recv() {
-        record_dropped_monitor();
-        newest.mask |= stale.mask;
+    /// The consumer for this monitor is gone; the producer row can be reaped.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.sink.is_closed()
     }
-    newest
 }
 
 /// Shadow `DBR_GR_*` / `DBR_CTRL_*` / enum metadata for a
@@ -485,6 +402,22 @@ impl ProcessVariable {
         if snap.enums.is_none() {
             snap.enums = meta.enums.clone();
         }
+        // A bare PV has no `rset`, so "which properties does this channel
+        // supply" is answered by what metadata it actually HAS: a proxy that
+        // shadowed an upstream IOC's display/control/enum info supplies those
+        // properties, a mailbox PV that nobody gave metadata to supplies none.
+        // Assigned here, in the one owner of a bare PV's metadata, so the mask
+        // and the values it describes cannot disagree.
+        // See [`crate::server::snapshot::PropertySupport`].
+        snap.properties = PropertySupport {
+            units: snap.display.is_some(),
+            precision: snap.display.is_some(),
+            graphic_double: snap.display.is_some(),
+            alarm_double: snap.display.is_some(),
+            control_double: snap.control.is_some(),
+            enum_strs: snap.enums.is_some(),
+        }
+        .narrowed_to_field(snap.value.db_field_type(), false);
     }
 
     /// Install an access hook. Replaces any previously
@@ -663,8 +596,8 @@ impl ProcessVariable {
     async fn deliver(&self, post: crate::server::recgbl::EventMask, snapshot: Snapshot) {
         use crate::server::database::filters::FilteredMonitorEvent;
         let mut subs = self.subscribers.lock().await;
-        // Remove subscribers whose channel has been dropped.
-        subs.retain(|sub| !sub.tx.is_closed());
+        // Remove subscribers whose consumer has been dropped.
+        subs.retain(|sub| !sub.is_closed());
         for sub in subs.iter() {
             // Paused subscribers (`db_event_disable`) receive nothing —
             // skip before any work so a disabled monitor stops the event
@@ -695,14 +628,10 @@ impl ProcessVariable {
             let Some(event) = filtered else {
                 continue;
             };
-            if sub.tx.try_send(event.clone()).is_err() {
-                // Queue full — overwrite any prior pending overflow with
-                // the newest event (consumer drains it via `pop_coalesced`
-                // after the next normal recv). The single coalesce-overflow
-                // owner counts a value the consumer never observed as a
-                // dropped monitor event, uniformly across event classes.
-                sub.coalesce_overflow(event);
-            }
+            // C `db_queue_event_log`: the queue appends, or replaces this
+            // monitor's last entry in place when it is in flow control or
+            // nearly full. Earlier distinct entries are never discarded.
+            sub.post(event);
         }
     }
 
@@ -777,49 +706,54 @@ impl ProcessVariable {
         .await;
     }
 
-    /// Add a subscriber. Returns the receiver for monitor events,
-    /// or `None` when the per-PV subscriber cap has been reached
-    /// (defends against a misbehaving client opening many
-    /// MONITOR ops against one shared PV; per-channel cap limits
-    /// channels but not subscriber rows on a single PV). Operators
-    /// override the cap via `EPICS_CAS_MAX_SUBSCRIBERS_PER_PV`
-    /// (default 1024 — large enough for any realistic dashboard
-    /// fan-out, small enough to bound memory under abuse).
+    /// Add an in-process subscriber, attached to an event queue of its own.
     ///
-    /// Channel depth defaults to 64 events; the operator can lift the
-    /// cap via `EPICS_CAS_MAX_EVENTS_PER_CHAN` for sites that need
-    /// deeper coalescing buffers. C rsrv does not advertise this knob
-    /// (its queue is internally fixed) — exposing it lets us tune
-    /// memory vs latency for slow-viewer workloads.
+    /// C `db_add_event(ctx, ...)` puts a monitor on the queue chain of the
+    /// `event_user` (client) that owns it. An in-process consumer is its own
+    /// client, so it gets its own [`EventUser`] — nothing else shares its
+    /// queue, and flow control (a CA circuit concept) never engages on it.
+    /// The CA server, whose subscriptions DO share one circuit-wide queue, uses
+    /// [`Self::add_subscriber_on`].
     pub async fn add_subscriber(
         &self,
         sid: u32,
         data_type: DbFieldType,
         mask: u16,
-    ) -> Option<mpsc::Receiver<MonitorEvent>> {
+    ) -> Option<EventReader> {
+        self.add_subscriber_on(&EventUser::new(), sid, data_type, mask)
+            .await
+    }
+
+    /// Add a subscriber whose events are queued on `user`'s event queue —
+    /// C `db_add_event` with the circuit's `event_user` as context. Every
+    /// subscription on one CA circuit shares that queue, and therefore its
+    /// `nDuplicates`: a duplicate queued for one of them releases the
+    /// EVENTS_OFF drain for all of them (`dbEvent.c:947`).
+    ///
+    /// Returns `None` when the per-PV subscriber cap is reached (defends
+    /// against a misbehaving client opening many MONITOR ops against one shared
+    /// PV; the per-channel cap limits channels but not subscriber rows on a
+    /// single PV). Operators override it via `EPICS_CAS_MAX_SUBSCRIBERS_PER_PV`.
+    pub async fn add_subscriber_on(
+        &self,
+        user: &EventUser,
+        sid: u32,
+        data_type: DbFieldType,
+        mask: u16,
+    ) -> Option<EventReader> {
         let cap = max_subscribers_per_pv();
-        let (tx, rx) = mpsc::channel(per_channel_event_depth());
-        let sub = Subscriber {
-            sid,
-            data_type,
-            mask,
-            tx,
-            coalesced: Arc::new(StdMutex::new(None)),
-            filters: crate::server::database::filters::FilterChain::new(),
-            active: true,
-        };
         let mut subs = self.subscribers.lock().await;
-        // Reap dead Senders BEFORE counting
+        // Reap rows whose consumer is gone BEFORE counting
         // against the cap. `notify_subscribers` / `post_alarm`
         // already retain-filter on every emission, but a PV with
         // no value changes (e.g. a static catalog entry that
         // dashboards latch onto and drop) never triggered the
         // reaper — a long-lived subscribe / disconnect storm could
-        // pin the Vec at `cap` worth of closed `Sender`s and lock
+        // pin the Vec at `cap` worth of dead rows and lock
         // out genuine new subscribers with a false-positive cap-
         // reached warning. Same defect class as the
         // NDPluginPva subscribe reaper (qsrv/pva_adapter.rs:247).
-        subs.retain(|s| !s.tx.is_closed());
+        subs.retain(|s| !s.is_closed());
         if subs.len() >= cap {
             tracing::warn!(
                 pv = %self.name,
@@ -829,8 +763,16 @@ impl ProcessVariable {
             );
             return None;
         }
-        subs.push(sub);
-        Some(rx)
+        let (sink, reader) = crate::server::event_queue::attach(user, sid);
+        subs.push(Subscriber {
+            sid,
+            data_type,
+            mask,
+            sink,
+            filters: crate::server::database::filters::FilterChain::new(),
+            active: true,
+        });
+        Some(reader)
     }
 
     /// attach a channel-filter chain to an already-added
@@ -869,17 +811,6 @@ impl ProcessVariable {
         let mut subs = self.subscribers.lock().await;
         subs.retain(|s| s.sid != sid);
     }
-
-    /// Take any pending coalesced overflow value for the given subscriber.
-    /// Called by the per-subscription forwarder task after each `rx.recv()`
-    /// and folded in via [`coalesce_consume`], which drains the now-stale
-    /// queue tail so a slow consumer converges on the latest known value
-    /// without ever delivering it before older queued values.
-    pub async fn pop_coalesced(&self, sid: u32) -> Option<MonitorEvent> {
-        let subs = self.subscribers.lock().await;
-        let sub = subs.iter().find(|s| s.sid == sid)?;
-        sub.coalesced.lock().ok()?.take()
-    }
 }
 
 /// Subscriber-id source for in-process [`PvSubscription`] monitors on a
@@ -907,11 +838,11 @@ fn next_pv_sub_sid() -> u32 {
 /// (`sharedpv.cpp:417-440`).
 ///
 /// The handle owns its `Subscriber` slot: `Drop` removes it, so a dropped
-/// consumer cannot leave a dead `(sid, tx, coalesced)` row in
+/// consumer cannot leave a dead subscriber row in
 /// `ProcessVariable.subscribers` — the same leak `DbSubscription`'s `Drop`
 /// closes for records.
 pub struct PvSubscription {
-    rx: mpsc::Receiver<MonitorEvent>,
+    reader: EventReader,
     pv: Arc<ProcessVariable>,
     sid: u32,
 }
@@ -933,22 +864,17 @@ impl PvSubscription {
         // `data_type` is nominal for snapshot consumers: `deliver` ships
         // the full `Snapshot` and gates only on mask/filters, never on the
         // stored type — `DbSubscription` likewise registers as `Double`.
-        let rx = pv.add_subscriber(sid, DbFieldType::Double, mask).await?;
-        Some(Self { rx, pv, sid })
+        let reader = pv.add_subscriber(sid, DbFieldType::Double, mask).await?;
+        Some(Self { reader, pv, sid })
     }
 
-    /// Await the next value change as a full `Snapshot`. When the producer
-    /// parked a newer value in the coalesce slot because the bounded mpsc
-    /// filled mid-burst, [`coalesce_consume`] returns that newest value and
-    /// drains the now-stale queue tail, so a briefly-slow consumer converges
-    /// on the freshest value and never observes it stepping back to an older
-    /// queued snapshot — the same `coalesce_consume` discipline
-    /// `DbSubscription::next_event` applies.
+    /// Await the next value change as a full `Snapshot`. A consumer that falls
+    /// behind sees the same thing a C monitor does: its earlier distinct queued
+    /// updates, and then — once the queue ran short of room — a tail entry
+    /// carrying the latest value, because further posts replaced that entry in
+    /// place rather than appending (`db_queue_event_log`, `dbEvent.c:812-820`).
     pub async fn recv_snapshot(&mut self) -> Option<Snapshot> {
-        let queued = self.rx.recv().await?;
-        let coalesced = self.pv.pop_coalesced(self.sid).await;
-        let event = coalesce_consume(&mut self.rx, queued, coalesced);
-        Some(event.snapshot)
+        Some(self.reader.recv().await?.snapshot)
     }
 }
 
@@ -1176,65 +1102,66 @@ mod mask_gate_tests {
         );
     }
 
-    /// When a slow consumer forces coalescing, the surviving event's
-    /// mask is the OR of every squashed event's class — the values are
-    /// superseded by the newest snapshot, but a narrow consumer must
-    /// still learn that an ALARM-class change happened inside the
-    /// squashed burst. Covers both accumulation points: the producer's
-    /// coalesce-slot displacement (`Subscriber::coalesce_overflow`) and
-    /// the consumer's stale-tail drain (`coalesce_consume`).
+    /// When the queue runs short of room and a post replaces this monitor's
+    /// last entry in place, the surviving entry's mask is the OR of the
+    /// displaced event's class and its own: the displaced *value* is gone (C
+    /// frees the field log), but a narrow consumer must still learn that an
+    /// ALARM-class change happened inside the coalesced tail.
     #[tokio::test]
-    async fn coalescing_accumulates_event_class_masks() {
+    async fn in_place_replacement_accumulates_event_class_masks() {
+        use crate::server::event_queue::{event_que_size, events_per_que};
         use crate::server::recgbl::EventMask;
         let pv = Arc::new(ProcessVariable::new(
             "coalesce:mask".into(),
             EpicsValue::Double(0.0),
         ));
-        let mut rx = pv
+        let mut reader = pv
             .add_subscriber(7, DbFieldType::Double, DBE_VALUE | DBE_LOG | DBE_ALARM)
             .await
             .expect("subscriber added");
-        // Fill the bounded queue (cap 64) with VALUE|LOG posts.
-        for i in 1..=64u32 {
+        // Append VALUE|LOG posts until the ring space reaches the replace
+        // threshold; from here every post overwrites the tail entry.
+        let appended = event_que_size() - events_per_que();
+        for i in 1..=appended {
             pv.set(EpicsValue::Double(i as f64)).await;
         }
-        // Overflow: the alarm post (ALARM|LOG) parks in the coalesce slot.
+        // Replaces the tail: its class (ALARM|LOG) must not be lost.
         pv.post_alarm(2, 3).await;
-        // Displace the slot with a newer value post — the displaced
-        // alarm's class must fold into the survivor.
+        // Replaces it again with a value post — both classes fold into the
+        // survivor.
         pv.set(EpicsValue::Double(99.0)).await;
 
-        let queued = rx.recv().await.expect("queued event");
-        let coalesced = pv.pop_coalesced(7).await;
-        let delivered = coalesce_consume(&mut rx, queued, coalesced);
+        let mut last = None;
+        while let Ok(event) = reader.try_recv() {
+            last = Some(event);
+        }
+        let delivered = last.expect("the tail entry is delivered");
         assert_eq!(
             delivered.snapshot.value.to_f64(),
             Some(99.0),
-            "delivery converges on the newest value"
+            "the tail entry carries the newest value"
         );
         assert!(
             delivered
                 .mask
                 .contains(EventMask::VALUE | EventMask::ALARM | EventMask::LOG),
-            "squashed alarm class survives in the delivered mask (got {:?})",
+            "the displaced alarm class survives in the delivered mask (got {:?})",
             delivered.mask
         );
     }
 
-    /// A simple-PV monitor whose bounded queue overflows mid-burst must
-    /// never deliver the coalesced newest value and then step back to an
-    /// older queued one. The producer fills the cap-64 queue with values
-    /// `1..=64` and parks the newest (`80`) in the coalesce slot; the
-    /// consumer must converge on `80` and never observe a value smaller
-    /// than one it already delivered.
+    /// R8-22 (simple-PV path): a monitor whose queue runs out of room during a
+    /// burst must receive its EARLIER DISTINCT queued updates and then a tail
+    /// entry carrying the latest value — C `db_queue_event_log` replaces only
+    /// `*pLastLog` (`dbEvent.c:812-820`) and leaves the earlier entries queued.
     ///
-    /// Before the fix `recv_snapshot()` returned the coalesced `80` and
-    /// then replayed the stale queue tail `1..=64`, so the delivered
-    /// sequence ran `80, 1, 2, ...` — value time going backwards, which
-    /// neither pvxs `SharedPV` nor the server monitor queue allow
-    /// (`sharedpv.cpp:417-439`, `servermon.cpp:172-285`).
+    /// The old primitive parked the newest value in a side coalesce slot, and
+    /// the consumer, finding it set, discarded the ENTIRE queued backlog and
+    /// delivered only that newest value — so a 200-post burst came out as a
+    /// single event instead of {1..107, 200}.
     #[tokio::test]
-    async fn r0604_pv_overflow_never_delivers_newest_then_old() {
+    async fn r8_22_pv_burst_keeps_earlier_distinct_updates() {
+        use crate::server::event_queue::{event_que_size, events_per_que};
         use std::time::Duration;
         let pv = Arc::new(ProcessVariable::new(
             "coalesce:pv".into(),
@@ -1243,33 +1170,26 @@ mod mask_gate_tests {
         let mut sub = PvSubscription::subscribe(pv.clone())
             .await
             .expect("subscribe");
-        // Fill the bounded queue (default cap 64) then overflow: with no
-        // consumer draining, values 1..=64 queue and the newest (80) lands
-        // in the coalesce slot.
-        for i in 1..=80u32 {
+        // With nothing draining, the first `appended` posts take ring entries
+        // and every later post replaces the tail entry in place.
+        let appended = event_que_size() - events_per_que();
+        let burst = appended + 92;
+        for i in 1..=burst {
             pv.set(EpicsValue::Double(i as f64)).await;
         }
-        // Drain every immediately-available delivery; the recv past the
-        // last event has nothing queued and times out, ending collection.
         let mut seq = Vec::new();
         while let Ok(Some(snap)) =
             tokio::time::timeout(Duration::from_millis(200), sub.recv_snapshot()).await
         {
             seq.push(snap.value.to_f64().expect("double value"));
         }
-        assert!(!seq.is_empty(), "consumer must observe at least one value");
-        for w in seq.windows(2) {
-            assert!(
-                w[0] <= w[1],
-                "monitor delivery stepped backward {} -> {} (sequence {seq:?})",
-                w[0],
-                w[1],
-            );
-        }
+        let want: Vec<f64> = (1..appended)
+            .map(|i| i as f64)
+            .chain(std::iter::once(burst as f64))
+            .collect();
         assert_eq!(
-            *seq.last().unwrap(),
-            80.0,
-            "consumer must converge on the newest produced value (sequence {seq:?})"
+            seq, want,
+            "burst delivery must be {{earlier distinct backlog…, coalesced tail}}"
         );
     }
 }

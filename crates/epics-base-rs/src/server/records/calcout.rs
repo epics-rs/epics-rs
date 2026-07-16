@@ -1,10 +1,13 @@
-use super::link_status::{LINK_CON, LINK_STATUS_CHOICES, LinkStatusGen, classify_link};
+use super::calc_compile;
+use super::link_status::{LINK_CON, LINK_STATUS_CHOICES, LinkRole, LinkStatusGen, classify_link};
 use crate::error::{CaError, CaResult};
 use crate::server::database::AsyncDbHandle;
 use crate::server::record::{
-    FieldDesc, ProcessAction, ProcessOutcome, Record, RecordProcessResult,
+    InputFetchPolicy, ProcessAction, ProcessOutcome, Record, RecordProcessResult,
 };
-use crate::types::{DbFieldType, EpicsValue, PvString};
+#[cfg(test)]
+use crate::types::DbFieldType;
+use crate::types::{EpicsValue, PvString};
 
 /// Per-input link-status diagnostic field names (`INAV`..`INUV`), one per
 /// calc input A..U, in C `menu(calcoutINAV)` order
@@ -129,11 +132,30 @@ pub struct CalcoutRecord {
     // cycle decided on, not re-evaluate should_output() against the
     // (by then stale) pval/val.
     pending_output: bool,
-    // CALC_ALARM flag
-    pub calc_alarm: bool,
+    // This cycle's `calcPerform` outcome (C `calcoutRecord.c:238-241` for CALC,
+    // `:622` for OCAL). A per-cycle fact, not record state: `check_alarms` — the
+    // owner of this record's alarm transitions — consumes it, so it cannot
+    // outlive the cycle that set it.
+    calc_alarm: bool,
+    // This cycle's `fetch_values()` outcome, pushed by the framework through
+    // `set_fetch_gate_failed`. C `calcoutRecord.c::process` (237) runs
+    // `calcPerform` only `if (fetch_values(prec) == 0)`: a failed input link
+    // freezes VAL/UDF and raises no CALC_ALARM, while the OOPT switch, the
+    // output and the monitors still run against the frozen VAL.
+    fetch_gate_failed: bool,
     // Cached compiled expressions (RPCL/ORPC equivalents)
-    rpcl: Option<crate::calc::CompiledExpr>,
-    orpc: Option<crate::calc::CompiledExpr>,
+    // C `RPCL` / `ORPC`. Always a program: an empty or uncompilable CALC/OCAL
+    // carries C's empty `END_EXPRESSION` postfix, which `calcPerform` refuses to
+    // run, so the record alarms on every process. See [`calc_compile`].
+    rpcl: crate::calc::CompiledExpr,
+    orpc: crate::calc::CompiledExpr,
+    // CLCV/OCLV — `DBF_LONG` expression-validity fields
+    // (calcoutRecord.dbd.pod:729,1049). C stores `postfix()`'s RETURN VALUE
+    // here (`prec->clcv = postfix(...)`, calcoutRecord.c:327,338), i.e. 0 when
+    // the expression compiled and -1 when it did not — not the CALC_ERR_* code,
+    // which only reaches the errlog line.
+    pub clcv: i32,
+    pub oclv: i32,
     // Per-input link connection status INAV..INUV and the OUT-link status
     // OUTV, menu(calcoutINAV). C `calcoutRecord.c::init_record`
     // (calcoutRecord.c:160-189) classifies each INPA..INPU input link and
@@ -248,8 +270,11 @@ impl Default for CalcoutRecord {
             oevt: String::new(),
             pending_output: false,
             calc_alarm: false,
-            rpcl: None,
-            orpc: None,
+            fetch_gate_failed: false,
+            rpcl: crate::calc::CompiledExpr::empty(crate::calc::ExprKind::Numeric),
+            orpc: crate::calc::CompiledExpr::empty(crate::calc::ExprKind::Numeric),
+            clcv: 0,
+            oclv: 0,
             // C `init_record` leaves an empty/unconfigured link CON
             // (calcoutRecord.c:166-167); the refresh re-classifies once the
             // async context exists.
@@ -277,6 +302,22 @@ impl CalcoutRecord {
             self.a, self.b, self.c, self.d, self.e, self.f, self.g, self.h, self.i, self.j, self.k,
             self.l, self.m, self.n, self.o, self.p, self.q, self.r, self.s, self.t, self.u,
         ]
+    }
+
+    /// Land the cycle's variable stores back in A..U — the inverse of
+    /// [`Self::get_vars`], and the record's ONLY write-back of an engine var set.
+    ///
+    /// C hands `calcPerform` a pointer into the record (`&prec->a`), so a store
+    /// opcode (`calcPerform.c:101-123`) IS the field write. Both of the cycle's
+    /// passes are handed that SAME pointer — `calcPerform(&prec->a, &prec->val,
+    /// rpcl)` (`calcoutRecord.c:238`) and `calcPerform(&prec->a, &prec->oval,
+    /// orpc)` (`:621`) — so OCAL reads what CALC stored, and the two share one
+    /// var set here for the same reason.
+    fn apply_stores(&mut self, vars: &[f64; 21]) {
+        [
+            self.a, self.b, self.c, self.d, self.e, self.f, self.g, self.h, self.i, self.j, self.k,
+            self.l, self.m, self.n, self.o, self.p, self.q, self.r, self.s, self.t, self.u,
+        ] = *vars;
     }
 
     fn should_output(&self) -> bool {
@@ -365,20 +406,25 @@ impl CalcoutRecord {
         // it cannot clobber the newer classification (e.g. an init-time
         // snapshot finishing after a runtime INP re-point).
         let token = link_gen.next();
-        tokio::spawn(async move {
+        let sched = handle.clone();
+        // Through the database's `iocInit` owner: queued while records are
+        // still loading (so a forward-referenced target is LOCAL, and the
+        // status is final when `iocInit` returns), spawned at once once the
+        // database is complete.
+        sched.schedule_record_init(async move {
             // Let `add_record` finish registering this record before the init
             // post (this task may be spawned from `set_async_context`, which
             // runs just before the record is inserted into the map).
             tokio::task::yield_now().await;
             let mut fields: Vec<(String, EpicsValue)> = Vec::with_capacity(22);
             for (i, link) in inputs.iter().enumerate() {
-                let (status, _ft) = classify_link(&handle, link).await;
+                let (status, _ft) = classify_link(&handle, link, LinkRole::Input).await;
                 fields.push((
                     CALCOUT_INAV_FIELDS[i].to_string(),
                     EpicsValue::Enum(status as u16),
                 ));
             }
-            let (out_status, _ft) = classify_link(&handle, &out).await;
+            let (out_status, _ft) = classify_link(&handle, &out, LinkRole::Output).await;
             fields.push(("OUTV".to_string(), EpicsValue::Enum(out_status as u16)));
             // Publish only if no newer refresh was issued meanwhile.
             if link_gen.is_current(token) {
@@ -387,542 +433,6 @@ impl CalcoutRecord {
         });
     }
 }
-
-static CALCOUT_FIELDS: &[FieldDesc] = &[
-    FieldDesc {
-        name: "VAL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "CALC",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "EGU",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "PREC",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "HOPR",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LOPR",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ADEL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "MDEL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LALM",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "ALST",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "MLST",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "PVAL",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "OOPT",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ODLY",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DLYA",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "OEVT",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DOPT",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OCAL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OVAL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "IVOA",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "IVOV",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPA",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPB",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPC",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPD",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPE",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPF",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPG",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPH",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPI",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPJ",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPK",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPM",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPN",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPO",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPP",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPQ",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPR",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPS",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPT",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPU",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "A",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "B",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "C",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "D",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "E",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "F",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "G",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "H",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "I",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "J",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "K",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "L",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "M",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "N",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "O",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "P",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "Q",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "R",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "S",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "T",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "U",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LA",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "LB",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "LC",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "LD",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "LE",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "LF",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "LG",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "LH",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "LI",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "LJ",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "LK",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "LL",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "LM",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "LN",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "LO",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "LP",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "LQ",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "LR",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "LS",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "LT",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "LU",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    // INAV..INUV / OUTV link-status menus (menu(calcoutINAV),
-    // calcoutRecord.dbd.pod:865-1012): DBF_MENU served as DBR_ENUM, SPC_NOMOD
-    // (read-only to clients; the link-status refresh posts them internally).
-    FieldDesc {
-        name: "INAV",
-        dbf_type: DbFieldType::Enum,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "INBV",
-        dbf_type: DbFieldType::Enum,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "INCV",
-        dbf_type: DbFieldType::Enum,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "INDV",
-        dbf_type: DbFieldType::Enum,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "INEV",
-        dbf_type: DbFieldType::Enum,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "INFV",
-        dbf_type: DbFieldType::Enum,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "INGV",
-        dbf_type: DbFieldType::Enum,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "INHV",
-        dbf_type: DbFieldType::Enum,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "INIV",
-        dbf_type: DbFieldType::Enum,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "INJV",
-        dbf_type: DbFieldType::Enum,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "INKV",
-        dbf_type: DbFieldType::Enum,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "INLV",
-        dbf_type: DbFieldType::Enum,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "INMV",
-        dbf_type: DbFieldType::Enum,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "INNV",
-        dbf_type: DbFieldType::Enum,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "INOV",
-        dbf_type: DbFieldType::Enum,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "INPV",
-        dbf_type: DbFieldType::Enum,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "INQV",
-        dbf_type: DbFieldType::Enum,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "INRV",
-        dbf_type: DbFieldType::Enum,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "INSV",
-        dbf_type: DbFieldType::Enum,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "INTV",
-        dbf_type: DbFieldType::Enum,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "INUV",
-        dbf_type: DbFieldType::Enum,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "OUTV",
-        dbf_type: DbFieldType::Enum,
-        read_only: true,
-    },
-];
 
 /// Choice labels for the output-execute-option menu, in index order.
 /// C `menu(calcoutOOPT)` (`calcoutRecord.dbd.pod:33-39`).
@@ -988,12 +498,24 @@ impl Record for CalcoutRecord {
 
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
         if pass == 0 {
-            if !self.calc.is_empty() {
-                self.rpcl = crate::calc::compile(&self.calc).ok();
-            }
-            if !self.ocal.is_empty() {
-                self.orpc = crate::calc::compile(&self.ocal).ok();
-            }
+            // C `calcoutRecord.c::init_record:190-205` — `clcv = postfix(...)`
+            // and `oclv = postfix(...)`, UNCONDITIONALLY, both logged but never
+            // fatal. Base `postfix()` refuses an empty expression
+            // (`postfix.c:235-240`: CALC_ERR_NULL_ARG, return -1), so C's own
+            // default `field(OCAL,"")` record inits with OCLV = -1 and a
+            // `field(CALC,"")` one with CLCV = -1. The port skipped the compile
+            // when the field was empty and left the validity code at 0, so a
+            // record that C reports as invalid looked healthy — and CLCV then
+            // depended on whether the value arrived from the db file or from a
+            // later put, which is not a distinction C makes. The compile is the
+            // single owner of CLCV/RPCL on both paths.
+            let compiled = calc_compile::postfix(self.record_type(), "CALC", &self.calc);
+            self.clcv = compiled.status;
+            self.rpcl = compiled.program;
+
+            let compiled = calc_compile::postfix(self.record_type(), "OCAL", &self.ocal);
+            self.oclv = compiled.status;
+            self.orpc = compiled.program;
             self.pval = self.val;
             self.mlst = self.val;
             self.alst = self.val;
@@ -1020,21 +542,30 @@ impl Record for CalcoutRecord {
         // not before. It holds the previous cycle's value for
         // transition detection in should_output().
 
-        // Evaluate CALC using cached RPCL
-        if let Some(ref compiled) = self.rpcl {
-            let mut inputs = crate::calc::NumericInputs::with_vars(self.get_vars());
+        // C `calcoutRecord.c::process` (237-243) runs the calc only
+        // `if (fetch_values(prec) == 0)`. A failed input link freezes VAL and
+        // UDF and raises no CALC_ALARM; the OOPT decision below then runs
+        // against that frozen VAL (C leaves the switch OUTSIDE the gate), so an
+        // OOPT of Every_Time still drives OUT with the previous value.
+        // ONE var set for the whole cycle — C hands BOTH passes the same
+        // `&prec->a`, so a CALC-pass store (`A:=A+1`) is what the OCAL pass
+        // fetches, and both land in the record's A..U. Two independent copies
+        // made CALC's stores invisible to OCAL and dropped them both.
+        let mut inputs = crate::calc::NumericInputs::with_vars(self.get_vars());
+        if !self.fetch_gate_failed {
+            // C `calcoutRecord.c:238-241` — `calcPerform` runs unconditionally
+            // inside the fetch gate and a -1 is CALC_ALARM/INVALID with VAL
+            // unchanged. RPCL is always a program: an empty or uncompilable
+            // CALC is the empty one, and it fails here every cycle rather than
+            // being silently skipped.
+            //
             // C `calcPerform(&prec->a, &prec->val, rpcl)` (calcoutRecord.c:238)
             // passes `presult = &val`, so the CALC `VAL` token reads the
             // *previous* VAL. Seed before `self.val` is overwritten below.
             inputs.prev_val = self.val;
-            match crate::calc::eval(compiled, &mut inputs) {
-                Ok(v) => {
-                    self.val = v;
-                    self.calc_alarm = false;
-                }
-                Err(_) => {
-                    self.calc_alarm = true;
-                }
+            match crate::calc::eval(&self.rpcl, &mut inputs) {
+                Ok(v) => self.val = v,
+                Err(_) => self.calc_alarm = true,
             }
         }
 
@@ -1045,32 +576,35 @@ impl Record for CalcoutRecord {
         self.ocal_udf_override = None;
         if self.should_output() {
             if self.dopt == 1 {
-                // Use OCAL
-                if let Some(ref compiled) = self.orpc {
-                    let mut inputs = crate::calc::NumericInputs::with_vars(self.get_vars());
-                    // C `calcPerform(&prec->a, &prec->oval, orpc)`
-                    // (calcoutRecord.c:621) passes `presult = &oval`, so the
-                    // OCAL `VAL` token reads the *previous* OVAL, not VAL.
-                    inputs.prev_val = self.oval;
-                    match crate::calc::eval(compiled, &mut inputs) {
-                        Ok(v) => {
-                            self.oval = v;
-                            // C `execOutput:624`: `prec->udf = isnan(prec->oval)`
-                            // on the successful-OCAL branch. A NaN OVAL then
-                            // raises UDF_ALARM (execOutput:628) so IVOA gates the
-                            // OUT write — without this a finite VAL but NaN OVAL
-                            // drives NaN to OUT with NO_ALARM (silent-wrong-value).
-                            self.ocal_udf_override = Some(self.oval.is_nan());
-                        }
-                        // C `execOutput:622`: OCAL calcPerform failure raises
-                        // CALC_ALARM and leaves udf VAL-based (no override).
-                        Err(_) => self.calc_alarm = true,
+                // Use OCAL. C `execOutput:621` calls calcPerform on ORPC
+                // unconditionally on this branch — an empty OCAL with DOPT=Use_OCAL
+                // is the empty program, so it fails and raises CALC_ALARM instead
+                // of leaving OVAL stale and silent.
+                // C `calcPerform(&prec->a, &prec->oval, orpc)`
+                // (calcoutRecord.c:621) passes `presult = &oval`, so the
+                // OCAL `VAL` token reads the *previous* OVAL, not VAL.
+                inputs.prev_val = self.oval;
+                match crate::calc::eval(&self.orpc, &mut inputs) {
+                    Ok(v) => {
+                        self.oval = v;
+                        // C `execOutput:624`: `prec->udf = isnan(prec->oval)`
+                        // on the successful-OCAL branch. A NaN OVAL then
+                        // raises UDF_ALARM (execOutput:628) so IVOA gates the
+                        // OUT write — without this a finite VAL but NaN OVAL
+                        // drives NaN to OUT with NO_ALARM (silent-wrong-value).
+                        self.ocal_udf_override = Some(self.oval.is_nan());
                     }
+                    // C `execOutput:622`: OCAL calcPerform failure raises
+                    // CALC_ALARM and leaves udf VAL-based (no override).
+                    Err(_) => self.calc_alarm = true,
                 }
             } else {
                 self.oval = self.val;
             }
         }
+        // Both passes' stores land here, before LA..LU advance — C wrote them
+        // into A..U through `&prec->a` as each pass ran.
+        self.apply_stores(&inputs.vars);
         // Update LA-LU. C `calcoutRecord.c::monitor` (lines 679-685)
         // advances `*pprev = *pnew` only inside the per-field change test
         // (`if (*pnew != *pprev || monitor_mask & DBE_ALARM)`), i.e. only
@@ -1145,6 +679,8 @@ impl Record for CalcoutRecord {
         match name {
             "VAL" => Some(EpicsValue::Double(self.val)),
             "CALC" => Some(EpicsValue::String(self.calc.clone().into())),
+            "CLCV" => Some(EpicsValue::Long(self.clcv)),
+            "OCLV" => Some(EpicsValue::Long(self.oclv)),
             "EGU" => Some(EpicsValue::String(self.egu.clone())),
             "PREC" => Some(EpicsValue::Short(self.prec)),
             "HOPR" => Some(EpicsValue::Double(self.hopr)),
@@ -1154,7 +690,6 @@ impl Record for CalcoutRecord {
             "LALM" => Some(EpicsValue::Double(self.lalm)),
             "ALST" => Some(EpicsValue::Double(self.alst)),
             "MLST" => Some(EpicsValue::Double(self.mlst)),
-            "CALC_ALARM" => Some(EpicsValue::Char(if self.calc_alarm { 1 } else { 0 })),
             "PVAL" => Some(EpicsValue::Double(self.pval)),
             "OOPT" => Some(EpicsValue::Short(self.oopt)),
             "ODLY" => Some(EpicsValue::Double(self.odly)),
@@ -1252,13 +787,45 @@ impl Record for CalcoutRecord {
                 }
                 _ => Err(CaError::TypeMismatch("VAL".into())),
             },
+            // C `dbPut` stores the string, then `special()` compiles it and
+            // records the postfix() status in CLCV — see `Self::special`.
             "CALC" => match value {
                 EpicsValue::String(s) => {
-                    self.rpcl = crate::calc::compile(&s.as_str_lossy()).ok();
                     self.calc = s.as_str_lossy().into_owned();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("CALC".into())),
+            },
+            // Plain DBF_LONG fields in C (calcoutRecord.dbd.pod:729,1049) — a
+            // client may write them; the next CALC/OCAL put overwrites them.
+            "CLCV" => {
+                self.clcv = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("CLCV".into()))?
+                    as i32;
+                Ok(())
+            }
+            "OCLV" => {
+                self.oclv = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("OCLV".into()))?
+                    as i32;
+                Ok(())
+            }
+            // PVAL (DBF_DOUBLE, "Previous Value", calcoutRecord.dbd.pod:718-720)
+            // carries no `special()`/`pp()`, so C `dbPut` stores it verbatim like
+            // any plain field — a client `caput CO.PVAL 5` succeeds. It is
+            // TRANSIENT: `process()` overwrites `pval = val` at the end of each
+            // cycle (calcoutRecord.c:263 `prec->pval = prec->val`), so the stored
+            // value stands only until the next process. Mirrors VAL's DBF_DOUBLE
+            // arm above (same type, same record). The port previously had no arm
+            // and rejected the put with `FieldNotFound`.
+            "PVAL" => match value {
+                EpicsValue::Double(v) => {
+                    self.pval = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("PVAL".into())),
             },
             "EGU" => match value {
                 EpicsValue::String(s) => {
@@ -1354,7 +921,6 @@ impl Record for CalcoutRecord {
             },
             "OCAL" => match value {
                 EpicsValue::String(s) => {
-                    self.orpc = crate::calc::compile(&s.as_str_lossy()).ok();
                     self.ocal = s.as_str_lossy().into_owned();
                     Ok(())
                 }
@@ -1583,10 +1149,6 @@ impl Record for CalcoutRecord {
         }
     }
 
-    fn field_list(&self) -> &'static [FieldDesc] {
-        CALCOUT_FIELDS
-    }
-
     fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
         match field {
             "OOPT" => Some(CALCOUT_OOPT_CHOICES),
@@ -1596,6 +1158,24 @@ impl Record for CalcoutRecord {
             _ if Self::input_status_index(field).is_some() => Some(LINK_STATUS_CHOICES),
             _ => None,
         }
+    }
+
+    /// C `calcoutRecord.c:163`: every CONSTANT input link is loaded into its value
+    /// field ONCE, at `init_record` (`recGblInitConstantLink(plink,
+    /// DBF_DOUBLE, pvalue)`); `dbGetLink` then delivers nothing for it on
+    /// every later process, so a client's `caput REC.A 99` stands.
+    fn constant_init_links(&self) -> Vec<crate::server::record::ConstantInitLink> {
+        crate::server::record::seed_input_links(self.multi_input_links())
+    }
+
+    /// C `calcoutRecord.c::special` (367-378) — a runtime put to INPA..INPU that
+    /// leaves the link CONSTANT re-runs `recGblInitConstantLink(plink,
+    /// DBF_DOUBLE, pvalue)`, posts the value field with `DBE_VALUE` and sets
+    /// `INAV = CON`. Declared here, run by the put path's one
+    /// `special(field, true)` owner — see `Record::special_reseed_input_links`.
+    /// Every calcout input is a DBF_DOUBLE scalar, so the whole table re-seeds.
+    fn special_reseed_input_links(&self) -> &[(&'static str, &'static str)] {
+        self.multi_input_links()
     }
 
     fn multi_input_links(&self) -> &[(&'static str, &'static str)] {
@@ -1622,6 +1202,16 @@ impl Record for CalcoutRecord {
             ("INPT", "T"),
             ("INPU", "U"),
         ]
+    }
+
+    /// C `calcoutRecord.c::fetch_values` (694-709) reads every INP link and
+    /// keeps the FIRST failing status; `process` (237) gates `calcPerform` on it.
+    fn input_fetch_policy(&self) -> InputFetchPolicy {
+        InputFetchPolicy::ReadAllGateOnFailure
+    }
+
+    fn set_fetch_gate_failed(&mut self, failed: bool) {
+        self.fetch_gate_failed = failed;
     }
 
     fn should_output(&self) -> bool {
@@ -1676,6 +1266,29 @@ impl Record for CalcoutRecord {
         if !after {
             return Ok(());
         }
+        // C `calcoutRecord.c::special:326-345` — CALC/OCAL recompile into
+        // RPCL/ORPC and store postfix()'s RETURN STATUS in CLCV/OCLV (0 or -1),
+        // post DBE_VALUE for the validity field, and return 0: the put is
+        // ACCEPTED even when the expression is garbage. This is the opposite
+        // disposition from calcRecord (which returns S_db_badField and fails
+        // the put, R8-1) — both run off the one compile owner, and C's
+        // asymmetry is deliberate: calcout carries the error in a field,
+        // calc carries it in the put status.
+        match field {
+            "CALC" => {
+                let compiled = calc_compile::postfix(self.record_type(), "CALC", &self.calc);
+                self.clcv = compiled.status;
+                self.rpcl = compiled.program;
+                return Ok(());
+            }
+            "OCAL" => {
+                let compiled = calc_compile::postfix(self.record_type(), "OCAL", &self.ocal);
+                self.oclv = compiled.status;
+                self.orpc = compiled.program;
+                return Ok(());
+            }
+            _ => {}
+        }
         // A put to an INP link re-classifies the link diagnostics: C
         // `calcoutRecord.c::special` (SPC_MOD) re-runs `checkLinks`. The INP
         // string the put just stored is re-read by `refresh_link_status`.
@@ -1685,6 +1298,22 @@ impl Record for CalcoutRecord {
             self.refresh_link_status();
         }
         Ok(())
+    }
+
+    /// C posts the validity field explicitly from `special()`
+    /// (`db_post_events(prec, &prec->clcv, DBE_VALUE)`, calcoutRecord.c:335,344)
+    /// — CLCV/OCLV are not `pp(TRUE)`, so nothing else would post them.
+    fn monitor_side_effect_fields(&self, put_field: &str) -> &'static [&'static str] {
+        match put_field {
+            "CALC" => &["CLCV"],
+            "OCAL" => &["OCLV"],
+            _ => &[],
+        }
+    }
+
+    /// C's post carries a literal `DBE_VALUE`, not `DBE_VALUE | DBE_LOG`.
+    fn value_only_change_fields(&self) -> &'static [&'static str] {
+        &["CLCV", "OCLV"]
     }
 
     fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
@@ -1698,12 +1327,28 @@ impl Record for CalcoutRecord {
             self.out = common.out.clone();
             self.refresh_link_status();
         }
+
+        // C `calcoutRecord.c:238-241` (CALC) and `:622` (OCAL, inside
+        // `execOutput`) — a failed `calcPerform` is `recGblSetSevr(prec,
+        // CALC_ALARM, INVALID_ALARM)`, raised in `process()` before
+        // `checkAlarms(prec)`. Consuming the flag keeps it a per-cycle fact: a
+        // cycle whose input fetch failed runs no `calcPerform` (`:237`) and
+        // raises nothing.
+        if std::mem::take(&mut self.calc_alarm) {
+            crate::server::recgbl::rec_gbl_set_sevr_msg(
+                common,
+                crate::server::recgbl::alarm_status::CALC_ALARM,
+                crate::server::record::AlarmSeverity::Invalid,
+                "CALC expression evaluation failed",
+            );
+        }
     }
 }
 
 #[cfg(test)]
 mod link_status_tests {
     use super::*;
+    use crate::server::record::dbd_generated;
 
     // The link-status menu choice labels, C `menu(calcoutINAV)`
     // (calcoutRecord.dbd.pod:45-50): identical to sseqLNKV.
@@ -1784,10 +1429,10 @@ mod link_status_tests {
     #[test]
     fn link_status_fields_are_read_only_enum_in_table() {
         for name in CALCOUT_INAV_FIELDS.iter().chain(std::iter::once(&"OUTV")) {
-            let fd = CALCOUT_FIELDS
+            let fd = dbd_generated::CALCOUT_FIELDS
                 .iter()
                 .find(|f| f.name == *name)
-                .unwrap_or_else(|| panic!("{name} missing from CALCOUT_FIELDS"));
+                .unwrap_or_else(|| panic!("{name} missing from dbd_generated::CALCOUT_FIELDS"));
             assert_eq!(fd.dbf_type, DbFieldType::Enum, "{name} must be ENUM");
             assert!(fd.read_only, "{name} must be read-only (SPC_NOMOD)");
         }
@@ -1798,6 +1443,26 @@ mod link_status_tests {
 #[cfg(test)]
 mod process_tests {
     use super::*;
+
+    /// PVAL (DBF_DOUBLE, no special/pp) accepts a client put and stores it
+    /// verbatim — including NaN and the infinities, which are ordinary
+    /// DBF_DOUBLE values. The store is TRANSIENT: `process()` overwrites
+    /// `pval = val` each cycle, so a following process replaces it.
+    #[test]
+    fn pval_put_stores_transient_double() {
+        let mut rec = CalcoutRecord::default();
+        rec.put_field("PVAL", EpicsValue::Double(-1.0)).unwrap();
+        assert_eq!(rec.pval, -1.0);
+        rec.put_field("PVAL", EpicsValue::Double(f64::INFINITY))
+            .unwrap();
+        assert_eq!(rec.pval, f64::INFINITY);
+        rec.put_field("PVAL", EpicsValue::Double(f64::NAN)).unwrap();
+        assert!(rec.pval.is_nan());
+        // Transient: a process cycle latches pval = val (0.0 here).
+        rec.init_record(0).unwrap();
+        rec.process().unwrap();
+        assert_eq!(rec.pval, rec.val);
+    }
 
     /// CALC `VAL` token reads the previous VAL (C `presult = &val`,
     /// calcoutRecord.c:238), so `CALC="VAL+1"` counts up.

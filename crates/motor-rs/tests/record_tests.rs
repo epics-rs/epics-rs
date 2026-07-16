@@ -1,3 +1,4 @@
+use epics_base_rs::server::record::FieldDeclaration;
 use epics_base_rs::server::record::Record;
 use epics_base_rs::types::EpicsValue;
 use motor_rs::MotorRecord;
@@ -1164,6 +1165,39 @@ fn test_tweak_forward() {
 }
 
 #[test]
+fn test_tweak_folds_val_with_the_user_direction_hard_limit_active() {
+    // C motorRecord.cc:2167-2181: the tweak fold is unconditional — `val += twv
+    // * dir` with no hls/lls test — so a TWF struck against the active high
+    // limit still lands in VAL (and DVAL), exactly like the direct VAL write it
+    // is shorthand for. The port gated the fold on the hard limit and consumed
+    // the button silently, leaving VAL at its old value.
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 0.01;
+    rec.limits.dhlm = 100.0;
+    rec.limits.dllm = -100.0;
+    rec.stat.msta = MstaFlags::DONE;
+    rec.ctrl.twv = 5.0;
+    rec.pos.val = 10.0;
+    rec.pos.dval = 10.0;
+    rec.limits.hls = true; // + direction switch active; soft target still legal
+
+    rec.ctrl.twf = true;
+    let _ = rec.plan_motion(CommandSource::Twf);
+
+    assert_eq!(
+        rec.pos.val, 15.0,
+        "C folds VAL regardless of the limit switch"
+    );
+    assert_eq!(rec.pos.dval, 15.0, "the fold cascades VAL -> DVAL");
+    assert!(!rec.ctrl.twf, "the button releases either way");
+
+    // Reverse tweak away from the struck high limit is unaffected.
+    rec.ctrl.twr = true;
+    let _ = rec.plan_motion(CommandSource::Twr);
+    assert_eq!(rec.pos.val, 10.0);
+}
+
+#[test]
 fn test_tweak_in_set_mode_redefines_coordinates_without_moving() {
     // C: a tweak that changes VAL in SET mode redefines coordinates (the
     // VAL-change path), it does not move the motor.
@@ -1248,16 +1282,32 @@ fn test_tweak_offset_only_escapes_loadpos_block_in_set_mode() {
 #[test]
 fn test_field_list_coverage() {
     let rec = MotorRecord::new();
-    let fields = rec.field_list();
-    // All fields in the list should be gettable
-    for fd in fields {
-        assert!(
-            rec.get_field(fd.name).is_some(),
-            "field {} not gettable",
-            fd.name
-        );
-    }
+    let ungettable: Vec<&str> = rec
+        .field_list()
+        .iter()
+        .filter(|fd| rec.get_field(fd.name).is_none())
+        .map(|fd| fd.name)
+        .collect();
+    assert_eq!(ungettable, UNIMPLEMENTED);
 }
+
+/// The fields `motorRecord.dbd` declares that this port does not implement.
+///
+/// They were invisible while the declaration was a hand-written table: the hand
+/// table simply omitted them, so "declared" and "implemented" were the same set
+/// by construction and the gap could not be seen. The declaration is the `.dbd`
+/// now, so the gap is a list — and it is a RATCHET: a new unimplemented field
+/// has to be added here, and implementing one has to remove it.
+///
+/// What C does with each, so the list is a work item and not a shrug:
+/// `CARD` (card number, `motorRecord.cc:596`), `HSV`/`LSV` (HIGH/LOW alarm
+/// severities, `alarm_sub:3411`), `LSPG` (limit-switch stop/pause/go,
+/// `motorRecord.cc:2622`), `PP` ("post process" flag, `:1590`), `INIT`
+/// (startup command string, `:604`), `PREM` (pre-move command, `:2213`) and
+/// `LOCK` (lock the record against moves, `:2050`). A client asking a C IOC for
+/// any of them gets a value; asking this port gets a field-not-found — which is
+/// what it got before too, just without anything saying so.
+const UNIMPLEMENTED: &[&str] = &["CARD", "HSV", "LSV", "LSPG", "PP", "INIT", "PREM", "LOCK"];
 
 #[test]
 fn test_dly_delays_finalization() {
@@ -2963,6 +3013,10 @@ fn test_put_accl_recalculates_accs_and_leaves_accu_untouched() {
     // C special() motorRecordACCL (motorRecord.cc:2735-2742): recompute ACCS
     // from ACCL but DO NOT change ACCU (63bfe5d0 made ACCU a user control).
     let mut rec = MotorRecord::new();
+    // The accel cross-calcs are C special() — runtime semantics, so init first
+    // (a load leaves ACCL/ACCS raw; see motor_sync_speed_at_init).
+    rec.init_record(0).unwrap();
+    rec.init_record(1).unwrap();
     rec.vel.velo = 10.0;
     rec.vel.vbas = 0.0;
     rec.vel.accu = AccsUsed::Accs; // start from Accs — must survive the put
@@ -2978,6 +3032,10 @@ fn test_put_accs_recalculates_accl_and_leaves_accu_untouched() {
     // C special() motorRecordACCS (motorRecord.cc:2745-2752): recompute ACCL
     // from ACCS but DO NOT change ACCU.
     let mut rec = MotorRecord::new();
+    // The accel cross-calcs are C special() — runtime semantics, so init first
+    // (a load leaves ACCL/ACCS raw; see motor_sync_speed_at_init).
+    rec.init_record(0).unwrap();
+    rec.init_record(1).unwrap();
     rec.vel.velo = 10.0;
     rec.vel.vbas = 0.0;
     rec.vel.accu = AccsUsed::Accl; // default master — must survive the put
@@ -2994,6 +3052,10 @@ fn test_put_accs_nonpositive_derives_from_accl_not_literal() {
     // ACCS is derived from ACCL via updateACCSfromACCL (accs = velo/accl), NOT
     // forced to a literal 1.0.
     let mut rec = MotorRecord::new();
+    // The accel cross-calcs are C special() — runtime semantics, so init first
+    // (a load leaves ACCL/ACCS raw; see motor_sync_speed_at_init).
+    rec.init_record(0).unwrap();
+    rec.init_record(1).unwrap();
     rec.vel.velo = 10.0;
     rec.vel.vbas = 0.0;
     rec.vel.accl = 2.0;
@@ -3007,6 +3069,10 @@ fn test_put_accs_nonpositive_derives_from_accl_not_literal() {
 #[test]
 fn test_put_velo_cascades_to_accs_when_accu_is_accl() {
     let mut rec = MotorRecord::new();
+    // The accel cross-calcs are C special() — runtime semantics, so init first
+    // (a load leaves ACCL/ACCS raw; see motor_sync_speed_at_init).
+    rec.init_record(0).unwrap();
+    rec.init_record(1).unwrap();
     rec.vel.accu = AccsUsed::Accl;
     rec.vel.accl = 2.0;
     rec.vel.vbas = 0.0;
@@ -3020,6 +3086,10 @@ fn test_put_velo_cascades_to_accs_when_accu_is_accl() {
 #[test]
 fn test_put_velo_cascades_to_accl_when_accu_is_accs() {
     let mut rec = MotorRecord::new();
+    // The accel cross-calcs are C special() — runtime semantics, so init first
+    // (a load leaves ACCL/ACCS raw; see motor_sync_speed_at_init).
+    rec.init_record(0).unwrap();
+    rec.init_record(1).unwrap();
     rec.vel.accu = AccsUsed::Accs;
     rec.vel.accs = 5.0;
     rec.vel.vbas = 0.0;
@@ -3032,6 +3102,10 @@ fn test_put_velo_cascades_to_accl_when_accu_is_accs() {
 #[test]
 fn test_put_vbas_cascades_per_accu() {
     let mut rec = MotorRecord::new();
+    // The accel cross-calcs are C special() — runtime semantics, so init first
+    // (a load leaves ACCL/ACCS raw; see motor_sync_speed_at_init).
+    rec.init_record(0).unwrap();
+    rec.init_record(1).unwrap();
     rec.vel.velo = 10.0;
     rec.vel.accu = AccsUsed::Accl;
     rec.vel.accl = 2.0;
@@ -3481,6 +3555,10 @@ fn test_accs_cascade_consistent_with_move_accel_under_vbas_unsupported() {
     // VBAS_UNSUPPORTED axis: the ACCS field value and the driver-bound
     // acceleration must agree (both treat VBAS as 0).
     let mut rec = MotorRecord::new();
+    // The accel cross-calcs are C special() — runtime semantics, so init first
+    // (a load leaves ACCL/ACCS raw; see motor_sync_speed_at_init).
+    rec.init_record(0).unwrap();
+    rec.init_record(1).unwrap();
     rec.process_motor_info(&MotorStatus {
         vbas_supported: false,
         ..Default::default()
@@ -3632,6 +3710,10 @@ fn test_accl_stays_positive_when_velo_equals_vbas() {
     // motor-rs sends ACCL (sec) directly, so the floor enforced by the
     // ACCL put handler keeps the driver-bound value > 0.
     let mut rec = MotorRecord::new();
+    // The accel cross-calcs are C special() — runtime semantics, so init first
+    // (a load leaves ACCL/ACCS raw; see motor_sync_speed_at_init).
+    rec.init_record(0).unwrap();
+    rec.init_record(1).unwrap();
     rec.vel.vbas = 5.0;
     rec.put_field("VELO", EpicsValue::Double(5.0)).unwrap(); // VELO == VBAS
     // ACCL is whatever the user wrote (default 0.2); never derived to 0
@@ -3648,6 +3730,10 @@ fn test_accu_cascade_recomputes_slave_with_full_velo_when_velo_equals_vbas() {
     // numerator is the full velo (not the span), and the slave is STILL
     // recomputed/posted — it is not left at its stale value.
     let mut rec = MotorRecord::new();
+    // The accel cross-calcs are C special() — runtime semantics, so init first
+    // (a load leaves ACCL/ACCS raw; see motor_sync_speed_at_init).
+    rec.init_record(0).unwrap();
+    rec.init_record(1).unwrap();
     rec.vel.accu = AccsUsed::Accl;
     rec.vel.accl = 2.0;
     rec.vel.accs = 5.0; // pre-existing slave value (must be overwritten)
@@ -3662,8 +3748,15 @@ fn test_put_accl_recomputes_accs_with_full_velo_when_velo_le_vbas() {
     // C updateACCSfromACCL (motorRecord.cc:512-521): writing ACCL recomputes
     // ACCS; at velo <= vbas the numerator is the full velo, not the span.
     let mut rec = MotorRecord::new();
+    // The accel cross-calcs are C special() — runtime semantics, so init first
+    // (a load leaves ACCL/ACCS raw; see motor_sync_speed_at_init).
+    rec.init_record(0).unwrap();
+    rec.init_record(1).unwrap();
+    // velo < vbas as record STATE (C reaches it by struct write or a VBAS
+    // raise; a runtime VELO put cannot — special() range_checks VELO into
+    // [VBAS, VMAX], motorRecord.cc:2690).
     rec.vel.vbas = 8.0;
-    rec.put_field("VELO", EpicsValue::Double(5.0)).unwrap(); // velo < vbas
+    rec.vel.velo = 5.0;
     rec.vel.accs = 99.0; // stale slave that must be overwritten
     rec.put_field("ACCL", EpicsValue::Double(2.0)).unwrap();
     assert_eq!(rec.vel.accu, AccsUsed::Accl);
@@ -3676,8 +3769,13 @@ fn test_put_accs_recomputes_accl_with_full_velo_when_velo_le_vbas() {
     // C updateACCLfromACCS (motorRecord.cc:499-510): writing ACCS recomputes
     // ACCL; at velo <= vbas the numerator is the full velo, not the span.
     let mut rec = MotorRecord::new();
+    // The accel cross-calcs are C special() — runtime semantics, so init first
+    // (a load leaves ACCL/ACCS raw; see motor_sync_speed_at_init).
+    rec.init_record(0).unwrap();
+    rec.init_record(1).unwrap();
+    // velo < vbas as record STATE (see the ACCL twin above).
     rec.vel.vbas = 8.0;
-    rec.put_field("VELO", EpicsValue::Double(5.0)).unwrap(); // velo < vbas
+    rec.vel.velo = 5.0;
     rec.vel.accl = 99.0; // stale slave that must be overwritten
     rec.put_field("ACCS", EpicsValue::Double(4.0)).unwrap();
     // ACCS put no longer switches ACCU (R22 / 63bfe5d0); default master survives.
@@ -5481,6 +5579,81 @@ fn test_load_s_specified_wins_over_velo_at_init() {
 
     assert!((rec.vel.s - 2.5).abs() < 1e-9, "S={}", rec.vel.s);
     assert!((rec.vel.velo - 0.5).abs() < 1e-9, "VELO={}", rec.vel.velo);
+}
+
+// --- ACCS/ACCL at init (C check_speed_and_resolution, motorRecord.cc:4033-4047)
+//
+// C keys the accel reconcile on the LOADED ACCS (`accs > 0.0`), not on ACCU.
+// The boundaries are: ACCS loaded nonzero / ACCS zero / ACCL also zero, times
+// the load order that decides what VELO is when the pair is reconciled.
+
+#[test]
+fn test_load_accs_wins_over_accl_at_init() {
+    // C:4034 — a nonzero loaded ACCS is the master and ACCL is derived from it
+    // (updateACCLfromACCS: accl = (velo - vbas) / accs = 10 / 5 = 2), whatever
+    // ACCU says. VELO is loaded *after* ACCS, so a port that cross-calcs during
+    // the load reconciles against the pre-VELO value and loses ACCS.
+    let mut rec = MotorRecord::new();
+    rec.put_field("ACCS", EpicsValue::Double(5.0)).unwrap();
+    rec.put_field("VELO", EpicsValue::Double(10.0)).unwrap();
+    rec.init_record(0).unwrap();
+    rec.init_record(1).unwrap();
+
+    assert!((rec.vel.accs - 5.0).abs() < 1e-9, "ACCS={}", rec.vel.accs);
+    assert!((rec.vel.accl - 2.0).abs() < 1e-9, "ACCL={}", rec.vel.accl);
+}
+
+#[test]
+fn test_load_accu_accs_without_accs_derives_accs_from_accl_at_init() {
+    // C:4038-4047 — ACCU is NOT the init key (63bfe5d0 made it a user/autosave
+    // control). With no `field(ACCS,…)` the loaded ACCS is 0, so ACCL is the
+    // master even when ACCU says Accs: accs = velo / accl = 10 / 0.2 = 50.
+    let mut rec = MotorRecord::new();
+    rec.put_field("ACCU", EpicsValue::Short(1)).unwrap(); // AccsUsed::Accs
+    rec.put_field("VELO", EpicsValue::Double(10.0)).unwrap();
+    rec.init_record(0).unwrap();
+    rec.init_record(1).unwrap();
+
+    assert!((rec.vel.accl - 0.2).abs() < 1e-9, "ACCL={}", rec.vel.accl);
+    assert!((rec.vel.accs - 50.0).abs() < 1e-9, "ACCS={}", rec.vel.accs);
+}
+
+#[test]
+fn test_load_zero_accl_and_accs_floors_accl_at_init() {
+    // C:4041-4045 — with ACCS zero and ACCL loaded as 0, ACCL is floored to 0.1
+    // before ACCS is derived: accs = 10 / 0.1 = 100.
+    let mut rec = MotorRecord::new();
+    rec.put_field("VELO", EpicsValue::Double(10.0)).unwrap();
+    rec.put_field("ACCL", EpicsValue::Double(0.0)).unwrap();
+    rec.init_record(0).unwrap();
+    rec.init_record(1).unwrap();
+
+    assert!((rec.vel.accl - 0.1).abs() < 1e-9, "ACCL={}", rec.vel.accl);
+    assert!((rec.vel.accs - 100.0).abs() < 1e-9, "ACCS={}", rec.vel.accs);
+}
+
+#[test]
+fn test_runtime_accl_accs_puts_cross_calc_after_init() {
+    // The load gate must not disarm C's special() cross-calc: after init an
+    // ACCL put re-derives ACCS (motorRecord.cc:2735-2742) and an ACCS put
+    // re-derives ACCL (:2745-2752), with the <= 0 floors intact.
+    let mut rec = MotorRecord::new();
+    rec.put_field("VELO", EpicsValue::Double(10.0)).unwrap();
+    rec.init_record(0).unwrap();
+    rec.init_record(1).unwrap();
+
+    rec.put_field("ACCL", EpicsValue::Double(2.0)).unwrap();
+    assert!((rec.vel.accs - 5.0).abs() < 1e-9, "ACCS={}", rec.vel.accs);
+    rec.put_field("ACCS", EpicsValue::Double(4.0)).unwrap();
+    assert!((rec.vel.accl - 2.5).abs() < 1e-9, "ACCL={}", rec.vel.accl);
+    // Non-positive ACCL floors to 0.1 and re-derives ACCS.
+    rec.put_field("ACCL", EpicsValue::Double(-1.0)).unwrap();
+    assert!((rec.vel.accl - 0.1).abs() < 1e-9, "ACCL={}", rec.vel.accl);
+    assert!((rec.vel.accs - 100.0).abs() < 1e-9, "ACCS={}", rec.vel.accs);
+    // Non-positive ACCS is sanitized from ACCL (accs = velo/accl), not to 1.0.
+    rec.put_field("ACCS", EpicsValue::Double(0.0)).unwrap();
+    assert!((rec.vel.accs - 100.0).abs() < 1e-9, "ACCS={}", rec.vel.accs);
+    assert!((rec.vel.accl - 0.1).abs() < 1e-9, "ACCL={}", rec.vel.accl);
 }
 
 #[test]
@@ -7607,7 +7780,7 @@ mod alarm_sub {
 
     fn common() -> CommonFields {
         CommonFields {
-            udf: false,
+            udf: 0,
             ..Default::default()
         }
     }
@@ -7620,7 +7793,7 @@ mod alarm_sub {
         rec.limits.hlsv = 2; // MAJOR
         rec.limits.hls = true;
         let mut c = common();
-        c.udf = true;
+        c.udf = 1;
         rec.check_alarms(&mut c);
         assert_eq!(c.nsta, alarm_status::UDF_ALARM);
         assert_eq!(c.nsev, AlarmSeverity::Invalid);
@@ -8725,7 +8898,12 @@ fn test_alarm_cycle_fans_out_alarm_mask_to_monitored_fields() {
     let mut rec = MotorRecord::new();
     rec.stat.msta = MstaFlags::DONE;
     let mut instance = RecordInstance::new("M1".into(), rec);
-    instance.common.udf = false;
+    // A record is born UDF/`STAT=UDF` (dbCommon.dbd `initial("UDF")`), and
+    // clearing that on the first process IS an alarm transition. This test is
+    // about a QUIESCENT cycle, so start from the already-processed state:
+    // defined value, alarm committed at NO_ALARM.
+    instance.common.udf = 0;
+    instance.common.stat = epics_base_rs::server::recgbl::alarm_status::NO_ALARM;
 
     let _dmov_rx = instance
         .add_subscriber(

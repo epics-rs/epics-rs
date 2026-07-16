@@ -47,10 +47,25 @@ fn test_ai_string_field() {
 fn test_ai_field_list() {
     let rec = AiRecord::default();
     let fields = rec.field_list();
-    assert!(fields.len() >= 24); // 20 base + 4 sim fields
+
+    // The table is generated from `aiRecord.dbd`, so it is in the spec's
+    // declaration order (C's field order) and carries every field the record
+    // type declares — including the ones the framework, not the record, drives.
     assert_eq!(fields[0].name, "VAL");
     assert_eq!(fields[0].dbf_type, DbFieldType::Double);
-    assert_eq!(fields[1].name, "EGU");
+    for declared in ["INP", "EGU", "PREC", "LINR", "SIMM", "SIML", "SIOL"] {
+        assert!(
+            fields.iter().any(|f| f.name == declared),
+            "ai.{declared} is in aiRecord.dbd but not in field_list()"
+        );
+    }
+
+    // LINR is `DBF_MENU menu(menuConvert)`: served as DBR_ENUM *with* its
+    // choices, which is why `caget ai.LINR` on the C IOC answers
+    // "NO CONVERSION" and not "0".
+    let linr = fields.iter().find(|f| f.name == "LINR").unwrap();
+    assert_eq!(linr.dbf_type, DbFieldType::Enum);
+    assert_eq!(linr.menu.unwrap()[0], "NO CONVERSION");
 }
 
 #[test]
@@ -479,12 +494,14 @@ fn test_bi_record() {
 
 // epics-base f2fe9d12 (devBiSoftRaw): "Raw Soft Channel" INP reads
 // must apply MASK to RVAL before the RVAL→VAL conversion. Verifies the
-// `Record::apply_raw_input` override on BiRecord.
+// `Record::raw_soft_input` override on BiRecord.
 #[test]
 fn test_bi_raw_soft_channel_applies_mask() {
     let mut rec = BiRecord::new(0);
     rec.mask = 0x0F;
-    rec.apply_raw_input(EpicsValue::Long(0xFF)).unwrap();
+    rec.raw_soft_input(RawSoftEntry::Read, EpicsValue::Long(0xFF))
+        .expect("bi has a SoftRaw dset")
+        .unwrap();
     assert_eq!(rec.rval, 0x0F, "mask must clamp RVAL to low nibble");
     let _ = rec.process().unwrap();
     match rec.get_field("VAL") {
@@ -498,7 +515,8 @@ fn test_bi_raw_soft_channel_applies_mask() {
 fn test_bi_raw_soft_channel_mask_zero_passthrough() {
     let mut rec = BiRecord::new(0);
     rec.mask = 0;
-    rec.apply_raw_input(EpicsValue::Long(0xDEAD_BEEFu32 as i32))
+    rec.raw_soft_input(RawSoftEntry::Read, EpicsValue::Long(0xDEAD_BEEFu32 as i32))
+        .expect("bi has a SoftRaw dset")
         .unwrap();
     // RVAL is DBF_ULONG (biRecord.dbd.pod:199); same bit pattern, unsigned.
     assert_eq!(rec.rval, 0xDEAD_BEEF_u32);
@@ -530,9 +548,11 @@ fn test_mbbo_zrvl_high_bit_round_trip() {
     rec.put_field("ZRVL", EpicsValue::ULong(0x8000_0000))
         .unwrap();
     assert_eq!(rec.get_field("ZRVL"), Some(EpicsValue::ULong(0x8000_0000)));
-    // With a defined state table and VAL=0, convert() copies ZRVL into
-    // RVAL; the high bit must not be lost to sign.
+    // With a defined state table and VAL=0, the init tail's convert() copies
+    // ZRVL into RVAL (C `mbboRecord.c:177`, after the constant-DOL load); the
+    // high bit must not be lost to sign.
     rec.init_record(0).unwrap();
+    rec.seed_deadband_tracking();
     assert_eq!(rec.get_field("RVAL"), Some(EpicsValue::ULong(0x8000_0000)));
 }
 
@@ -542,7 +562,9 @@ fn test_mbbo_zrvl_high_bit_round_trip() {
 fn test_bi_raw_soft_channel_mask_to_zero() {
     let mut rec = BiRecord::new(1);
     rec.mask = 0x01;
-    rec.apply_raw_input(EpicsValue::Long(0xFE)).unwrap();
+    rec.raw_soft_input(RawSoftEntry::Read, EpicsValue::Long(0xFE))
+        .expect("bi has a SoftRaw dset")
+        .unwrap();
     assert_eq!(rec.rval, 0);
     let _ = rec.process().unwrap();
     match rec.get_field("VAL") {
@@ -618,9 +640,10 @@ fn test_read_only_field() {
         other => panic!("expected Double(2.0), got {:?}", other),
     }
 
-    let fields = rec.field_list();
-    assert!(!fields[0].read_only); // VAL
-    assert!(fields[1].read_only); // NAME
+    // No `field_list()` assertion here: `#[derive(EpicsRecord)]` is not a
+    // declaration source. `#[field(read_only)]` drives this record's own
+    // `put_field` refusal (asserted above); the wire-visible SPC_NOMOD
+    // declaration comes from the `.dbd`, and record type "test" has none.
 }
 
 #[test]
@@ -683,7 +706,7 @@ fn test_evaluate_alarms() {
     use epics_base_rs::server::recgbl;
     let rec = AiRecord::new(0.0);
     let mut instance = RecordInstance::new("TEMP".into(), rec);
-    instance.common.udf = false;
+    instance.common.udf = 0;
 
     instance
         .put_common_field("HIHI", EpicsValue::Double(100.0))
@@ -791,15 +814,14 @@ fn test_parse_link_v2() {
         ParsedLink::Pva("PV:NAME".to_string())
     );
 
-    assert_eq!(
-        parse_link_v2("\"hello\""),
-        ParsedLink::Constant("hello".to_string())
-    );
+    // A quoted string is not a number, so C's `dbParseLink` falls through to
+    // the PV-link arm: softIoc reports `INP: CA_LINK "hello" NPP NMS` for
+    // `field(INP,"\"hello\"")`, with the quotes part of the channel name.
+    assert!(matches!(parse_link_v2("\"hello\""), ParsedLink::Db(_)));
 
     let c = parse_link_v2("3.15");
     assert_eq!(c.constant_value(), Some(EpicsValue::Double(3.15)));
-    let c = parse_link_v2("\"hello\"");
-    assert_eq!(c.constant_value(), Some(EpicsValue::String("hello".into())));
+    assert_eq!(parse_link_v2("\"hello\"").constant_value(), None);
     assert_eq!(parse_link_v2("TEMP").constant_value(), None);
 }
 
@@ -872,11 +894,18 @@ fn test_ai_smoothing() {
     rec.eslo = 1.0;
     rec.aslo = 1.0;
     rec.smoo = 0.5;
+    // `init_record` is what arms the INIT phase (C `aiRecord.c:114`), and the
+    // phase is what makes the first conversion SMOO's initial condition rather
+    // than a blend against the pre-init VAL. A `.db` load always runs it.
+    rec.init_record(0).unwrap();
 
     rec.rval = 100;
     rec.process().unwrap();
     assert!((rec.val - 100.0).abs() < 1e-10);
-    assert!(rec.init);
+    assert!(
+        !rec.init.is_initial(),
+        "C clears INIT at the end of every process (aiRecord.c:170)"
+    );
 
     rec.rval = 200;
     rec.process().unwrap();
@@ -934,7 +963,7 @@ fn test_hyst_alarm_hysteresis() {
     use epics_base_rs::server::recgbl;
     let rec = AiRecord::new(0.0);
     let mut instance = RecordInstance::new("TEMP".into(), rec);
-    instance.common.udf = false;
+    instance.common.udf = 0;
 
     instance
         .put_common_field("HIGH", EpicsValue::Double(80.0))
@@ -994,11 +1023,15 @@ fn test_deadband_mdel() {
             .unwrap_or(EventMask::NONE)
     };
 
-    // Unchanged value: neither deadband fires, no VAL post.
+    // Unchanged value on the FIRST process: neither deadband fires, but the
+    // record leaves its born-UDF alarm (STAT=UDF, dbCommon.dbd `initial("UDF")`)
+    // for NO_ALARM, so `recGblResetAlarms` returns DBE_ALARM and C posts VAL
+    // with a non-zero monitor_mask anyway (`aiRecord.c::monitor`: `if
+    // (monitor_mask) db_post_events(prec, &prec->val, monitor_mask)`).
     instance.record.set_val(EpicsValue::Double(0.0)).unwrap();
     instance.record.set_device_did_compute(true);
     let (snap, _alarm_posts) = instance.process_local().unwrap();
-    assert_eq!(val_mask(&snap), EventMask::NONE);
+    assert_eq!(val_mask(&snap), EventMask::ALARM);
 
     // |3-0| < MDEL=5: VALUE throttled; ADEL=0 archives the change.
     instance.record.set_val(EpicsValue::Double(3.0)).unwrap();
@@ -1027,14 +1060,25 @@ fn test_deadband_mdel() {
 
 #[test]
 fn test_deadband_mdel_zero() {
+    use epics_base_rs::server::recgbl::EventMask;
     let mut rec = AiRecord::default();
     rec.mdel = 0.0;
     let mut instance = RecordInstance::new("TEST".into(), rec);
 
+    // MDEL=0 does not fire on a zero delta; the VAL post this first process
+    // does carry is the born-UDF -> NO_ALARM transition (DBE_ALARM), which C
+    // folds into the same `db_post_events(&prec->val, monitor_mask)`.
     instance.record.set_val(EpicsValue::Double(0.0)).unwrap();
     instance.record.set_device_did_compute(true);
     let (snap, _alarm_posts) = instance.process_local().unwrap();
-    assert!(!snap.changed_fields.iter().any(|(k, _, _)| k == "VAL"));
+    assert_eq!(
+        snap.changed_fields
+            .iter()
+            .find(|(k, _, _)| k == "VAL")
+            .map(|(_, _, m)| *m),
+        Some(EventMask::ALARM),
+        "no deadband fired — only the initial alarm transition"
+    );
 
     instance.record.set_val(EpicsValue::Double(0.001)).unwrap();
     instance.record.set_device_did_compute(true);
@@ -1062,7 +1106,7 @@ fn test_bi_state_alarm() {
     rec.osv = AlarmSeverity::Minor as i16;
 
     let mut instance = RecordInstance::new("SW".into(), rec);
-    instance.common.udf = false;
+    instance.common.udf = 0;
 
     // bi STATE alarm lives in the `Record::check_alarms` hook (C
     // `biRecord.c::checkAlarms`); `process_local` calls it before
@@ -1089,7 +1133,7 @@ fn test_mbbi_state_alarm() {
     rec.twsv = AlarmSeverity::Major as i16;
 
     let mut instance = RecordInstance::new("SEL".into(), rec);
-    instance.common.udf = false;
+    instance.common.udf = 0;
 
     // mbbi STATE alarm lives in the `Record::check_alarms` hook (C
     // `mbbiRecord.c::checkAlarms`); `process_local` calls it before
@@ -1153,10 +1197,10 @@ fn test_deadband_alarm_on_change_bypasses_value_deadband() {
         high: 0.5,
         low: -1000.0,
         lolo: -2000.0,
-        hhsv: AlarmSeverity::Major,
-        hsv: AlarmSeverity::Major,
-        lsv: AlarmSeverity::Minor,
-        llsv: AlarmSeverity::Major,
+        hhsv: AlarmSeverity::Major as i16,
+        hsv: AlarmSeverity::Major as i16,
+        lsv: AlarmSeverity::Minor as i16,
+        llsv: AlarmSeverity::Major as i16,
     });
 
     instance.record.set_val(EpicsValue::Double(1.0)).unwrap();
@@ -1278,6 +1322,66 @@ fn test_per_field_masks_narrow_deadband_and_aux_posts() {
 }
 
 #[test]
+fn test_acks_posts_once_with_dbe_value_only() {
+    // W10-E1. C `recGblResetAlarms` posts ACKS EXACTLY ONCE, with a literal
+    // `DBE_VALUE`, from inside `if (stat_mask)` (recGbl.c:214-217):
+    //
+    //     if (!pdbc->ackt || new_sevr >= pdbc->acks) {
+    //         pdbc->acks = new_sevr;
+    //         db_post_events(pdbc, &pdbc->acks, DBE_VALUE);
+    //     }
+    //
+    // There is no second ACKS post anywhere in C. The port's generic
+    // change-detection loop (`collect_subscriber_posts`) did not exclude ACKS,
+    // so a changed ACKS was ALSO emitted in the record-wide snapshot carrying
+    // `alarm_bits | DBE_VALUE | DBE_LOG` — a `.ACKS` monitor saw two events, one
+    // of them with a mask C never uses for that field.
+    use epics_base_rs::server::recgbl::EventMask;
+    use epics_base_rs::types::DbFieldType;
+    let mut rec = AiRecord::default();
+    rec.mdel = 100.0;
+    let mut instance = RecordInstance::new("TEST".into(), rec);
+    let _acks_rx = instance
+        .add_subscriber("ACKS", 1, DbFieldType::Enum, EventMask::VALUE.bits())
+        .expect("ACKS subscriber");
+    // HIGH=0.5/Major so VAL=1.0 raises a NoAlarm -> Major transition, which
+    // makes `recGblResetAlarms` fire the ack rule and move ACKS 0 -> 2.
+    instance.common.analog_alarm = Some(AnalogAlarmConfig {
+        hihi: 1000.0,
+        high: 0.5,
+        low: -1000.0,
+        lolo: -2000.0,
+        hhsv: AlarmSeverity::Major as i16,
+        hsv: AlarmSeverity::Major as i16,
+        lsv: AlarmSeverity::Minor as i16,
+        llsv: AlarmSeverity::Major as i16,
+    });
+
+    instance.record.set_val(EpicsValue::Double(1.0)).unwrap();
+    instance.record.set_device_did_compute(true);
+    let (snap, alarm_posts) = instance.process_local().unwrap();
+
+    assert_eq!(
+        instance.common.acks,
+        AlarmSeverity::Major,
+        "the ack rule fired and raised ACKS"
+    );
+    // The ONLY ACKS post is the alarm-field one, with DBE_VALUE.
+    let acks_posts: Vec<_> = alarm_posts.iter().filter(|(f, _)| *f == "ACKS").collect();
+    assert_eq!(acks_posts.len(), 1, "exactly one ACKS post");
+    assert_eq!(
+        *acks_posts[0],
+        ("ACKS", EventMask::VALUE),
+        "C posts ACKS with a literal DBE_VALUE (recGbl.c:216)"
+    );
+    // ...and NOT a second time from the record-wide change-detection snapshot.
+    assert!(
+        !snap.changed_fields.iter().any(|(k, _, _)| k == "ACKS"),
+        "ACKS must not also ride the generic snapshot — C posts it once"
+    );
+}
+
+#[test]
 fn test_no_alarm_change_does_not_post_sevr_stat() {
     // C `recGbl.c:202-207`: when `prev_sevr == new_sevr` and
     // `prev_stat == new_stat`, `recGblResetAlarms` posts neither
@@ -1287,6 +1391,19 @@ fn test_no_alarm_change_does_not_post_sevr_stat() {
     let mut rec = AiRecord::default();
     rec.mdel = 100.0;
     let mut instance = RecordInstance::new("TEST".into(), rec);
+    // The FIRST process is an alarm transition — a record is born
+    // `STAT=UDF` (dbCommon.dbd `initial("UDF")`) and clears it here — so it
+    // posts STAT/SEVR in C too. The no-transition cycle is the next one.
+    instance.record.set_val(EpicsValue::Double(1.0)).unwrap();
+    instance.record.set_device_did_compute(true);
+    let (_first, first_posts) = instance.process_local().unwrap();
+    assert!(
+        first_posts.iter().any(|(f, _)| *f == "STAT"),
+        "STAT moved UDF -> NO_ALARM, and C posts the field that changed \
+         (recGbl.c:206-207). SEVR did not move on this bare instance, so C \
+         posts no SEVR (recGbl.c:202-205)."
+    );
+
     instance.record.set_val(EpicsValue::Double(1.0)).unwrap();
     instance.record.set_device_did_compute(true);
     let (snap, alarm_posts) = instance.process_local().unwrap();
@@ -1315,10 +1432,10 @@ fn test_alarm_cycle_does_not_fan_out_for_default_records() {
         high: 0.5,
         low: -1000.0,
         lolo: -2000.0,
-        hhsv: AlarmSeverity::Major,
-        hsv: AlarmSeverity::Major,
-        lsv: AlarmSeverity::Minor,
-        llsv: AlarmSeverity::Major,
+        hhsv: AlarmSeverity::Major as i16,
+        hsv: AlarmSeverity::Major as i16,
+        lsv: AlarmSeverity::Minor as i16,
+        llsv: AlarmSeverity::Major as i16,
     });
     let _rval_rx = instance
         .add_subscriber("RVAL", 1, DbFieldType::Long, EventMask::ALARM.bits())
@@ -1395,10 +1512,10 @@ fn test_ai_rval_alarm_only_cycle_posts_alarm_mask_not_value_log() {
         high: 0.5,
         low: -1000.0,
         lolo: -2000.0,
-        hhsv: AlarmSeverity::Major,
-        hsv: AlarmSeverity::Major,
-        lsv: AlarmSeverity::Minor,
-        llsv: AlarmSeverity::Major,
+        hhsv: AlarmSeverity::Major as i16,
+        hsv: AlarmSeverity::Major as i16,
+        lsv: AlarmSeverity::Minor as i16,
+        llsv: AlarmSeverity::Major as i16,
     });
     let _rval_rx = instance
         .add_subscriber("RVAL", 1, DbFieldType::Long, EventMask::ALARM.bits())
@@ -1443,10 +1560,10 @@ fn test_ai_udf_cycle_leaves_lalm_and_zeroes_afvl() {
         high: 0.5,
         low: -1000.0,
         lolo: -2000.0,
-        hhsv: AlarmSeverity::Major,
-        hsv: AlarmSeverity::Major,
-        lsv: AlarmSeverity::Minor,
-        llsv: AlarmSeverity::Major,
+        hhsv: AlarmSeverity::Major as i16,
+        hsv: AlarmSeverity::Major as i16,
+        lsv: AlarmSeverity::Minor as i16,
+        llsv: AlarmSeverity::Major as i16,
     });
     // Seed LALM/AFVL to sentinels, then force a UDF cycle.
     instance
@@ -1461,7 +1578,7 @@ fn test_ai_udf_cycle_leaves_lalm_and_zeroes_afvl() {
         .record
         .set_val(EpicsValue::Double(f64::NAN))
         .unwrap();
-    instance.common.udf = true;
+    instance.common.udf = 1;
 
     instance.evaluate_alarms();
 
@@ -1615,9 +1732,7 @@ fn test_lcnt_zero_after_process() {
 #[test]
 fn test_lcnt_increments_on_reentrance() {
     let mut instance = RecordInstance::new("TEST".into(), AoRecord::new(0.0));
-    instance
-        .processing
-        .store(true, std::sync::atomic::Ordering::Release);
+    instance.enter_pact();
     let _ = instance.process_local().unwrap();
     assert_eq!(instance.common.lcnt, 1);
     let _ = instance.process_local().unwrap();
@@ -1630,9 +1745,7 @@ fn test_lcnt_alarm_threshold() {
     // the attempt whose PRE-increment lcnt equals MAX_LOCK=10 — i.e.
     // the 11th consecutive reentrant attempt, not the 10th.
     let mut instance = RecordInstance::new("TEST".into(), AoRecord::new(0.0));
-    instance
-        .processing
-        .store(true, std::sync::atomic::Ordering::Release);
+    instance.enter_pact();
     for _ in 0..10 {
         let _ = instance.process_local().unwrap();
     }
@@ -1661,9 +1774,7 @@ fn test_lcnt_alarm_posts_exactly_once() {
     // INVALID_ALARM` (dbAccess.c:545-547). The pre-fix guard re-posted
     // the unchanged SEVR/STAT/VAL on every attempt past the threshold.
     let mut instance = RecordInstance::new("TEST".into(), AoRecord::new(0.0));
-    instance
-        .processing
-        .store(true, std::sync::atomic::Ordering::Release);
+    instance.enter_pact();
     for _ in 0..10 {
         let _ = instance.process_local().unwrap();
     }
@@ -1692,28 +1803,41 @@ fn test_lcnt_reset_on_success() {
 }
 
 #[test]
-fn test_proc_reads_zero() {
-    let instance = RecordInstance::new("TEST".into(), AoRecord::new(0.0));
+fn test_proc_get_put() {
+    // C `dbCommon.dbd`: `field(PROC,DBF_UCHAR)` — the raw put byte is retained
+    // in `prec->proc` and served back as `DBF_UCHAR` (`UChar`), like DISP. A
+    // fresh record reads the default 0; a stored byte round-trips. (The
+    // `pp(TRUE)` force-process is orthogonal and driven by the put path.)
+    let mut instance = RecordInstance::new("TEST".into(), AoRecord::new(0.0));
     match instance.get_common_field("PROC") {
-        Some(EpicsValue::Char(0)) => {}
-        other => panic!("expected Char(0), got {:?}", other),
+        Some(EpicsValue::UChar(0)) => {}
+        other => panic!("expected UChar(0), got {:?}", other),
+    }
+    instance
+        .put_common_field("PROC", EpicsValue::Char(1))
+        .unwrap();
+    assert_eq!(instance.common.proc_field, 1);
+    match instance.get_common_field("PROC") {
+        Some(EpicsValue::UChar(1)) => {}
+        other => panic!("expected UChar(1), got {:?}", other),
     }
 }
 
 #[test]
 fn test_disp_get_put() {
     let mut instance = RecordInstance::new("TEST".into(), AoRecord::new(0.0));
+    // DISP is `DBF_UCHAR`: served as `UChar` (its declared type).
     match instance.get_common_field("DISP") {
-        Some(EpicsValue::Char(0)) => {}
-        other => panic!("expected Char(0), got {:?}", other),
+        Some(EpicsValue::UChar(0)) => {}
+        other => panic!("expected UChar(0), got {:?}", other),
     }
     instance
         .put_common_field("DISP", EpicsValue::Char(1))
         .unwrap();
-    assert!(instance.common.disp);
+    assert!(instance.common.disp != 0);
     match instance.get_common_field("DISP") {
-        Some(EpicsValue::Char(1)) => {}
-        other => panic!("expected Char(1), got {:?}", other),
+        Some(EpicsValue::UChar(1)) => {}
+        other => panic!("expected UChar(1), got {:?}", other),
     }
 }
 
@@ -1753,12 +1877,8 @@ impl Record for HookTrackingRecord {
             _ => Err(CaError::FieldNotFound(name.into())),
         }
     }
-    fn field_list(&self) -> &'static [FieldDesc] {
-        static FIELDS: &[FieldDesc] = &[FieldDesc {
-            name: "VAL",
-            dbf_type: DbFieldType::Double,
-            read_only: false,
-        }];
+    fn declared_fields(&self) -> &'static [FieldDesc] {
+        static FIELDS: &[FieldDesc] = &[FieldDesc::new("VAL", DbFieldType::Double, false)];
         FIELDS
     }
     fn validate_put(&self, field: &str, _value: &EpicsValue) -> CaResult<()> {
@@ -1908,7 +2028,7 @@ impl Record for NoUdfClearRecord {
             _ => Err(CaError::FieldNotFound(name.into())),
         }
     }
-    fn field_list(&self) -> &'static [FieldDesc] {
+    fn declared_fields(&self) -> &'static [FieldDesc] {
         &[]
     }
     fn clears_udf(&self) -> bool {
@@ -1920,18 +2040,18 @@ impl Record for NoUdfClearRecord {
 fn test_udf_cleared_after_process() {
     let rec = AiRecord::new(1.0);
     let mut instance = RecordInstance::new("TEST".into(), rec);
-    assert!(instance.common.udf);
+    assert!(instance.common.udf != 0);
     instance.process_local().unwrap();
-    assert!(!instance.common.udf);
+    assert!(instance.common.udf == 0);
 }
 
 #[test]
 fn test_udf_not_cleared_when_clears_udf_false() {
     let rec = NoUdfClearRecord { val: 1.0 };
     let mut instance = RecordInstance::new("TEST".into(), rec);
-    assert!(instance.common.udf);
+    assert!(instance.common.udf != 0);
     instance.process_local().unwrap();
-    assert!(instance.common.udf);
+    assert!(instance.common.udf != 0);
 }
 
 #[test]
@@ -1939,9 +2059,9 @@ fn test_udf_alarm_persists() {
     use epics_base_rs::server::recgbl;
     let rec = NoUdfClearRecord { val: 1.0 };
     let mut instance = RecordInstance::new("TEST".into(), rec);
-    instance.common.udf = true;
+    instance.common.udf = 1;
     instance.process_local().unwrap();
-    assert!(instance.common.udf);
+    assert!(instance.common.udf != 0);
     instance.evaluate_alarms();
     let result = recgbl::rec_gbl_reset_alarms(&mut instance.common);
     assert!(result.alarm_changed || instance.common.sevr == AlarmSeverity::Invalid);
@@ -1962,10 +2082,10 @@ fn test_snapshot_ai_with_display_metadata() {
         high: 80.0,
         low: -20.0,
         lolo: -40.0,
-        hhsv: AlarmSeverity::Major,
-        hsv: AlarmSeverity::Minor,
-        lsv: AlarmSeverity::Minor,
-        llsv: AlarmSeverity::Major,
+        hhsv: AlarmSeverity::Major as i16,
+        hsv: AlarmSeverity::Minor as i16,
+        lsv: AlarmSeverity::Minor as i16,
+        llsv: AlarmSeverity::Major as i16,
     });
 
     let snap = inst.snapshot_for_field("VAL").unwrap();
@@ -2137,6 +2257,115 @@ fn test_snapshot_dfanout_omsl_ivoa_serve_as_enum() {
     );
 }
 
+// R6-1 — every dbCommon DBF_MENU field is served as DBR_ENUM with its menu's
+// choice strings, not as a bare SHORT/CHAR. C `dbAccess.c:1074`
+// (`mapDBFToDBR[DBF_MENU] == DBR_ENUM`) + `:167-175` (`get_enum_strs` serves
+// the menu's `papChoiceValue[]`). Pre-fix `caget REC.SEVR` returned DBR_SHORT
+// 2 with no strings where a C IOC returns DBR_ENUM 2 + "MAJOR".
+#[test]
+fn test_snapshot_dbcommon_menu_fields_serve_as_enum() {
+    use epics_base_rs::server::record::{AlarmSeverity, PiniMode};
+
+    let mut inst = RecordInstance::new("COMMON:MENU".into(), AiRecord::new(1.0));
+    inst.common.sevr = AlarmSeverity::Major; // menuAlarmSevr index 2
+    inst.common.stat = 14; // menuAlarmStat LINK
+    inst.common.nsev = AlarmSeverity::Minor;
+    inst.common.nsta = 17; // UDF
+    inst.common.acks = AlarmSeverity::Invalid;
+    inst.common.ackt = false;
+    inst.common.diss = AlarmSeverity::Minor as i16;
+    inst.common.udfs = AlarmSeverity::Invalid as i16;
+    inst.common.pini = PiniMode::Run as i16;
+
+    let sevr = inst.snapshot_for_field("SEVR").unwrap();
+    assert_eq!(sevr.value, EpicsValue::Enum(2));
+    assert_eq!(
+        sevr.enums.as_ref().unwrap().strings,
+        vec!["NO_ALARM", "MINOR", "MAJOR", "INVALID"]
+    );
+
+    let stat = inst.snapshot_for_field("STAT").unwrap();
+    assert_eq!(stat.value, EpicsValue::Enum(14));
+    let stat_strings = &stat.enums.as_ref().unwrap().strings;
+    assert_eq!(stat_strings.len(), 22);
+    assert_eq!(stat_strings[14], "LINK");
+
+    let nsev = inst.snapshot_for_field("NSEV").unwrap();
+    assert_eq!(nsev.value, EpicsValue::Enum(1));
+    let nsta = inst.snapshot_for_field("NSTA").unwrap();
+    assert_eq!(nsta.value, EpicsValue::Enum(17));
+    assert_eq!(nsta.enums.as_ref().unwrap().strings[17], "UDF");
+
+    let acks = inst.snapshot_for_field("ACKS").unwrap();
+    assert_eq!(acks.value, EpicsValue::Enum(3));
+    assert_eq!(acks.enums.as_ref().unwrap().strings[3], "INVALID");
+
+    // ACKT/PINI were served as DBR_CHAR (a 1-byte payload) where C sends a
+    // 2-byte DBR_ENUM.
+    let ackt = inst.snapshot_for_field("ACKT").unwrap();
+    assert_eq!(ackt.value, EpicsValue::Enum(0));
+    assert_eq!(ackt.enums.as_ref().unwrap().strings, vec!["NO", "YES"]);
+
+    let pini = inst.snapshot_for_field("PINI").unwrap();
+    assert_eq!(pini.value, EpicsValue::Enum(2));
+    assert_eq!(
+        pini.enums.as_ref().unwrap().strings,
+        vec!["NO", "YES", "RUN", "RUNNING", "PAUSE", "PAUSED"]
+    );
+
+    let diss = inst.snapshot_for_field("DISS").unwrap();
+    assert_eq!(diss.value, EpicsValue::Enum(1));
+    assert_eq!(diss.enums.as_ref().unwrap().strings[1], "MINOR");
+
+    let udfs = inst.snapshot_for_field("UDFS").unwrap();
+    assert_eq!(udfs.value, EpicsValue::Enum(3));
+    assert_eq!(udfs.enums.as_ref().unwrap().strings[3], "INVALID");
+}
+
+// R6-1 (put half) — a DBR_STRING / `.db` write to a dbCommon DBF_MENU field
+// resolves the label against THAT field's own menu (C `dbPutStringNum`: exact
+// label, then a numeric index). Pre-fix `field(DISS,"MAJOR")` was dropped
+// silently (the arm bound only `Short`) and `field(PINI,"RUN")` set the flag
+// to false.
+#[test]
+fn test_put_dbcommon_menu_field_resolves_label() {
+    use epics_base_rs::server::record::{AlarmSeverity, PiniMode};
+
+    let mut inst = RecordInstance::new("COMMON:PUT".into(), AiRecord::new(1.0));
+    inst.put_common_field("DISS", EpicsValue::String("MAJOR".into()))
+        .unwrap();
+    assert_eq!(inst.common.diss, AlarmSeverity::Major as i16);
+
+    inst.put_common_field("UDFS", EpicsValue::String("MINOR".into()))
+        .unwrap();
+    assert_eq!(inst.common.udfs, AlarmSeverity::Minor as i16);
+
+    inst.put_common_field("PINI", EpicsValue::String("RUN".into()))
+        .unwrap();
+    assert_eq!(inst.common.pini, PiniMode::Run as i16);
+    // Bare menu index, as C `epicsParseUInt16` accepts.
+    inst.put_common_field("PINI", EpicsValue::String("3".into()))
+        .unwrap();
+    assert_eq!(inst.common.pini, PiniMode::Running as i16);
+    // "NO" is a real choice — index 0, not a parse failure.
+    inst.put_common_field("PINI", EpicsValue::String("NO".into()))
+        .unwrap();
+    assert_eq!(inst.common.pini, PiniMode::No as i16);
+    // A string naming no choice is C `S_db_badChoice`, not a silent NO.
+    assert!(
+        inst.put_common_field("PINI", EpicsValue::String("MAYBE".into()))
+            .is_err()
+    );
+
+    // ACKT is menu(menuYesNo), not a truthiness flag.
+    inst.put_common_field("ACKT", EpicsValue::String("NO".into()))
+        .unwrap();
+    assert!(!inst.common.ackt);
+    inst.put_common_field("ACKT", EpicsValue::String("YES".into()))
+        .unwrap();
+    assert!(inst.common.ackt);
+}
+
 // MPST/APST on lsi are menu(menuPost): On Change (0), Always (1). The value
 // order is wire-visible; the array records' POST menus reverse it, which is
 // why MPST/APST are resolved per record rather than globally.
@@ -2304,7 +2533,7 @@ fn test_mbbi_aftc_writes_afvl_back_each_cycle() {
     rec.afvl = 0.0;
 
     let mut inst = RecordInstance::new("MBBI:AFTC".into(), rec);
-    inst.common.udf = false;
+    inst.common.udf = 0;
 
     // AFTC alarm filter runs inside `Record::check_alarms` (C
     // `mbbiRecord.c::checkAlarms`), the hook `process_local` invokes.
@@ -2354,16 +2583,16 @@ fn test_ai_aftc_filter_engages_and_seeds() {
     rec.aftc = 5.0;
     rec.afvl = 0.0; // first sample
     let mut inst = RecordInstance::new("AI:AFTC".into(), rec);
-    inst.common.udf = false;
+    inst.common.udf = 0;
     inst.common.analog_alarm = Some(AnalogAlarmConfig {
         hihi: 100.0,
         high: 80.0,
         low: -20.0,
         lolo: -40.0,
-        hhsv: AlarmSeverity::Major,
-        hsv: AlarmSeverity::Minor,
-        lsv: AlarmSeverity::Minor,
-        llsv: AlarmSeverity::Major,
+        hhsv: AlarmSeverity::Major as i16,
+        hsv: AlarmSeverity::Minor as i16,
+        lsv: AlarmSeverity::Minor as i16,
+        llsv: AlarmSeverity::Major as i16,
     });
 
     inst.evaluate_alarms();
@@ -2395,16 +2624,16 @@ fn test_longin_aftc_filter_engages_and_seeds() {
     rec.aftc = 5.0;
     rec.afvl = 0.0;
     let mut inst = RecordInstance::new("LONGIN:AFTC".into(), rec);
-    inst.common.udf = false;
+    inst.common.udf = 0;
     inst.common.analog_alarm = Some(AnalogAlarmConfig {
         hihi: 100.0,
         high: 80.0,
         low: -20.0,
         lolo: -40.0,
-        hhsv: AlarmSeverity::Major,
-        hsv: AlarmSeverity::Minor,
-        lsv: AlarmSeverity::Minor,
-        llsv: AlarmSeverity::Major,
+        hhsv: AlarmSeverity::Major as i16,
+        hsv: AlarmSeverity::Minor as i16,
+        lsv: AlarmSeverity::Minor as i16,
+        llsv: AlarmSeverity::Major as i16,
     });
 
     inst.evaluate_alarms();
@@ -2432,16 +2661,16 @@ fn test_int64in_aftc_filter_engages_and_seeds() {
     rec.aftc = 5.0;
     rec.afvl = 0.0;
     let mut inst = RecordInstance::new("INT64IN:AFTC".into(), rec);
-    inst.common.udf = false;
+    inst.common.udf = 0;
     inst.common.analog_alarm = Some(AnalogAlarmConfig {
         hihi: 100.0,
         high: 80.0,
         low: -20.0,
         lolo: -40.0,
-        hhsv: AlarmSeverity::Major,
-        hsv: AlarmSeverity::Minor,
-        lsv: AlarmSeverity::Minor,
-        llsv: AlarmSeverity::Major,
+        hhsv: AlarmSeverity::Major as i16,
+        hsv: AlarmSeverity::Minor as i16,
+        lsv: AlarmSeverity::Minor as i16,
+        llsv: AlarmSeverity::Major as i16,
     });
 
     inst.evaluate_alarms();
@@ -2470,16 +2699,16 @@ fn test_ai_aftc_disabled_resets_stale_afvl() {
     rec.aftc = 0.0; // filter disabled
     rec.afvl = 3.0; // stale accumulator left from a prior AFTC>0 run
     let mut inst = RecordInstance::new("AI:AFTC".into(), rec);
-    inst.common.udf = false;
+    inst.common.udf = 0;
     inst.common.analog_alarm = Some(AnalogAlarmConfig {
         hihi: 100.0,
         high: 80.0,
         low: -20.0,
         lolo: -40.0,
-        hhsv: AlarmSeverity::Major,
-        hsv: AlarmSeverity::Minor,
-        lsv: AlarmSeverity::Minor,
-        llsv: AlarmSeverity::Major,
+        hhsv: AlarmSeverity::Major as i16,
+        hsv: AlarmSeverity::Minor as i16,
+        lsv: AlarmSeverity::Minor as i16,
+        llsv: AlarmSeverity::Major as i16,
     });
 
     inst.evaluate_alarms();
@@ -2518,7 +2747,7 @@ fn test_mbbi_lalm_updates_when_cosv_set() {
     rec.put_field("LALM", EpicsValue::Enum(0)).unwrap();
 
     let mut inst = RecordInstance::new("MBBI:LALM".into(), rec);
-    inst.common.udf = false;
+    inst.common.udf = 0;
 
     // Transition 0 → 2: COS_ALARM fires (cosv=Major), LALM must
     // advance to 2. COS/LALM logic lives in `Record::check_alarms`
@@ -2584,7 +2813,7 @@ fn test_bi_lalm_updates_when_cosv_set() {
     rec.put_field("LALM", EpicsValue::Enum(0)).unwrap();
 
     let mut inst = RecordInstance::new("BI:LALM".into(), rec);
-    inst.common.udf = false;
+    inst.common.udf = 0;
 
     // COS/LALM logic lives in `Record::check_alarms` (C
     // `biRecord.c::checkAlarms`), the hook `process_local` runs.
@@ -2628,4 +2857,104 @@ fn desc_preserves_non_utf8_bytes() {
         ),
         other => panic!("expected EpicsValue::String, got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// R21: an enum-valued field's DBR_STRING form. C renders it from the FIELD's
+// own string source — the record's `get_enum_str` rset for a `DBF_ENUM` VAL,
+// the menu's choice list for a `DBF_MENU` field — and NEVER as the decimal
+// index. The port used to index the `no_str`-trimmed GR_ENUM label list and
+// fall back to the number, so a `record(mbbi,"X"){}` served its VAL as "0"
+// where C serves "".
+//
+// The cases are the boundaries of that lookup, not a story: slot defined /
+// slot in range but empty / index past the slots / no table at all. Every
+// expectation below was measured on the compiled C `softIoc` (see the module
+// doc on `EnumStringForm`).
+// ---------------------------------------------------------------------------
+
+/// `caget -t` of the field, i.e. a DBR_STRING (0) read: the 40-byte payload up
+/// to its NUL.
+fn dbr_string_of(inst: &RecordInstance, field: &str) -> String {
+    let snap = inst.snapshot_for_field(field).unwrap();
+    let bytes = epics_base_rs::types::encode_dbr(0, &snap).unwrap();
+    let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..end]).into_owned()
+}
+
+fn mbbi_with_states() -> epics_base_rs::server::records::mbbi::MbbiRecord {
+    use epics_base_rs::server::records::mbbi::MbbiRecord;
+    let mut rec = MbbiRecord::default();
+    rec.zrst = "zero".into();
+    rec.onst = "one".into();
+    rec
+}
+
+#[test]
+fn r21_enum_val_defined_slot_renders_its_state() {
+    let mut rec = mbbi_with_states();
+    rec.val = 1;
+    let inst = RecordInstance::new("MBBI:R21".into(), rec);
+    assert_eq!(dbr_string_of(&inst, "VAL"), "one");
+}
+
+/// BOUNDARY: index inside the 16 slots but with no state string. C `strncpy`s
+/// the empty state (`mbbiRecord.c:246-250`) — measured `caput VAL 5` -> `[]`.
+/// The trimmed label list stops at 2 here, which is exactly what used to push
+/// this case onto the decimal fallback.
+#[test]
+fn r21_enum_val_undefined_slot_in_range_renders_empty() {
+    let mut rec = mbbi_with_states();
+    rec.val = 5;
+    let inst = RecordInstance::new("MBBI:R21".into(), rec);
+    assert_eq!(dbr_string_of(&inst, "VAL"), "");
+}
+
+/// BOUNDARY: index past the 16 slots. Measured `caput VAL 20` ->
+/// `[Illegal Value]` — with a SPACE, the mbbi/mbbo spelling.
+#[test]
+fn r21_enum_val_past_the_slots_renders_illegal_value() {
+    let mut rec = mbbi_with_states();
+    rec.val = 20;
+    let inst = RecordInstance::new("MBBI:R21".into(), rec);
+    assert_eq!(dbr_string_of(&inst, "VAL"), "Illegal Value");
+}
+
+/// BOUNDARY: no state strings at all. `record(mbbi,"X"){}` — the oracle case.
+/// C serves the empty state; the port served "0".
+#[test]
+fn r21_enum_val_with_no_states_renders_empty_not_zero() {
+    use epics_base_rs::server::records::mbbi::MbbiRecord;
+    let inst = RecordInstance::new("MBBI:R21".into(), MbbiRecord::default());
+    assert_eq!(dbr_string_of(&inst, "VAL"), "");
+}
+
+/// The two-state records index slot 1 even when ONAM is empty, where their
+/// `no_str` label list has been trimmed to 1 (`boRecord.c:342-352`). Measured:
+/// a `bi` with only ZNAM set, `caput VAL 1` -> `[]`.
+#[test]
+fn r21_binary_enum_val_empty_onam_renders_empty() {
+    let mut rec = BiRecord::new(0);
+    rec.znam = "off".into();
+    rec.val = 1;
+    let inst = RecordInstance::new("BI:R21".into(), rec);
+    assert_eq!(
+        inst.snapshot_for_field("VAL")
+            .unwrap()
+            .enums
+            .unwrap()
+            .strings
+            .len(),
+        1
+    );
+    assert_eq!(dbr_string_of(&inst, "VAL"), "");
+}
+
+/// A `DBF_MENU` field renders its MENU's choice, not the record's VAL states —
+/// the record here has both, and they must not cross.
+#[test]
+fn r21_menu_field_renders_its_own_choice_not_the_records_states() {
+    let rec = mbbi_with_states();
+    let inst = RecordInstance::new("MBBI:R21".into(), rec);
+    assert_eq!(dbr_string_of(&inst, "SCAN"), "Passive");
 }

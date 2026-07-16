@@ -86,8 +86,51 @@ pub struct TriggerValues {
     pub calc: f64,
 }
 
-/// Result of pushing a frame: which frames to forward downstream now, and
-/// whether a capture sequence completed on this push.
+/// The parameter-library assignments C `NDPluginCircularBuff::processCallbacks`
+/// makes while handling one frame (NDPluginCircularBuff.cpp:120-203).
+///
+/// A field is `Some` exactly when C calls `setIntegerParam`/`setStringParam` for
+/// it on this frame, and `None` when C leaves the parameter untouched — which is
+/// how C freezes `NDCircBuffCurrentImage` at the pre-buffer size for the whole
+/// flush (it is assigned only on the pre-trigger branch, `:151`).
+///
+/// Later assignments in the same frame overwrite earlier ones, exactly as
+/// repeated `setIntegerParam` calls do before C's single trailing
+/// `callParamCallbacks()`: on a frame that both flushes and completes, clients
+/// see only the final `NDCircBuffPostCount = 0`, never the intermediate count.
+///
+/// [`CircularBuffer::push`] — the state machine that decides the transitions —
+/// is the single owner of these values; the processor only maps them onto
+/// parameter indices. Reconstructing them from the post-push buffer state is
+/// what produced the divergences this type removes.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct FrameParams {
+    /// `NDCircBuffTriggered` — C `:127`/`:133` (every frame that evaluates the
+    /// trigger) and `:192`/`:194` (cleared when the sequence ends).
+    pub triggered: Option<i32>,
+    /// `NDCircBuffCurrentImage` — C `:151`, the pre-buffer size, assigned ONLY
+    /// on a pre-trigger frame.
+    pub current_image: Option<i32>,
+    /// `NDCircBuffPostCount` — C `:168-169` per forwarded post-trigger frame,
+    /// and `:193` (reset to 0) when the sequence re-arms.
+    pub post_count: Option<i32>,
+    /// `NDCircBuffActualTriggerCount` — C `:179-180`, incremented when the
+    /// post-trigger count is reached, not when the trigger fires.
+    pub actual_trigger_count: Option<i32>,
+    /// `NDCircBuffSoftTrigger` — C `:191`, the soft-trigger latch cleared on
+    /// re-arm.
+    pub soft_trigger: Option<i32>,
+    /// `NDCircBuffControl` — C `:190` (re-arm, still 1) and `:197` (the preset
+    /// trigger count was reached: C turns acquisition off).
+    pub control: Option<i32>,
+    /// `NDCircBuffStatus` — C's `setStringParam` calls (`:152-153`, `:157`,
+    /// `:194-195`, `:198`).
+    pub status: Option<&'static str>,
+}
+
+/// Result of pushing a frame: which frames to forward downstream now, whether a
+/// capture sequence completed on this push, and the parameter assignments C
+/// makes for the frame.
 #[derive(Debug, Default)]
 pub struct PushResult {
     /// Frames to forward downstream immediately, in order.
@@ -98,10 +141,25 @@ pub struct PushResult {
     /// (C `calculateTrigger` path). `None` when already triggered or for a
     /// non-calc trigger condition.
     pub trigger_values: Option<TriggerValues>,
+    /// Parameters C assigns for this frame — see [`FrameParams`].
+    pub params: FrameParams,
 }
 
 /// Circular buffer state for pre/post-trigger capture.
 pub struct CircularBuffer {
+    /// C `NDCircBuffControl` (`scopeControl`) — the acquisition gate, and the
+    /// ONLY thing that admits a frame. C wraps the entire body of
+    /// `processCallbacks` in `if (scopeControl) { ... } else { /* nothing */ }`
+    /// (NDPluginCircularBuff.cpp:121-203): while it is off, an arriving frame is
+    /// not triggered on, not copied, not buffered, and does not advance the
+    /// completion test.
+    ///
+    /// It is a distinct thing from [`Self::status`], which is C's
+    /// `NDCircBuffStatus` — a display string. The port previously had no Control
+    /// state and inferred "running" from that string, which is what let a
+    /// stopped (or never-started) plugin record frames. Starts off: C's param
+    /// defaults to 0, so nothing is recorded before a `Control = 1` write.
+    control: bool,
     pub(crate) pre_count: usize,
     pub(crate) post_count: usize,
     buffer: VecDeque<Arc<NDArray>>,
@@ -116,10 +174,16 @@ pub struct CircularBuffer {
     captured: Vec<Arc<NDArray>>,
     /// Maximum number of triggers before stopping (0 = unlimited).
     preset_trigger_count: usize,
-    /// Number of triggers fired so far.
+    /// C `actualTriggerCount`: capture sequences *completed* so far — bumped
+    /// when the post-trigger count is reached (NDPluginCircularBuff.cpp:179),
+    /// not when the trigger fires.
     trigger_count: usize,
-    /// If true, flush buffer immediately on soft trigger.
-    flush_on_soft_trigger: bool,
+    /// C `NDCircBuffFlushOnSoftTrig` (epicsInt32), held raw. The flush decision
+    /// is C's `if (flushOn > 0)` (NDPluginCircularBuff.cpp:276) and lives in the
+    /// single owner [`CircularBuffer::flushes_on_soft_trigger`] — storing a
+    /// pre-digested `bool` cost the sign, and the `!= 0` that produced it made a
+    /// negative FlushOnSoftTrig flush on the port and not in C.
+    flush_on_soft_trigger: i32,
     /// Current buffer status.
     pub(crate) status: BufferStatus,
 }
@@ -127,6 +191,9 @@ pub struct CircularBuffer {
 impl CircularBuffer {
     pub fn new(pre_count: usize, post_count: usize, condition: TriggerCondition) -> Self {
         Self {
+            // C's NDCircBuffControl param defaults to 0 — the plugin records
+            // nothing until a `Control = 1` write. Call `start()`.
+            control: false,
             pre_count,
             post_count,
             buffer: VecDeque::with_capacity(pre_count + 1),
@@ -137,7 +204,7 @@ impl CircularBuffer {
             captured: Vec::new(),
             preset_trigger_count: 0,
             trigger_count: 0,
-            flush_on_soft_trigger: false,
+            flush_on_soft_trigger: 0,
             status: BufferStatus::Idle,
         }
     }
@@ -147,7 +214,9 @@ impl CircularBuffer {
         self.preset_trigger_count = count;
     }
 
-    /// Get the current trigger count.
+    /// C `actualTriggerCount` — the number of *completed* capture sequences.
+    /// Reads one less than the number of triggers fired while a flush is still
+    /// in progress; C only increments it at the end of the sequence.
     pub fn trigger_count(&self) -> usize {
         self.trigger_count
     }
@@ -157,9 +226,43 @@ impl CircularBuffer {
         self.status
     }
 
-    /// Set flush_on_soft_trigger flag.
-    pub fn set_flush_on_soft_trigger(&mut self, flush: bool) {
-        self.flush_on_soft_trigger = flush;
+    /// Store `NDCircBuffFlushOnSoftTrig` as written (C `setIntegerParam`); the
+    /// value is interpreted only by [`Self::flushes_on_soft_trigger`].
+    pub fn set_flush_on_soft_trigger(&mut self, flush_on: i32) {
+        self.flush_on_soft_trigger = flush_on;
+    }
+
+    /// C `NDPluginCircularBuff.cpp:276` — `if (flushOn > 0) flushPreBuffer()`.
+    /// The ONLY reader of `flush_on_soft_trigger`: negative and zero both mean
+    /// "do not flush", so a `caput FlushOnSoftTrig -1` leaves the pre-buffer to
+    /// drain lazily with the first post-trigger frame, as in C.
+    pub fn flushes_on_soft_trigger(&self) -> bool {
+        self.flush_on_soft_trigger > 0
+    }
+
+    /// C `writeInt32(NDCircBuffControl, 1)` (NDPluginCircularBuff.cpp:233-254):
+    /// rebuild the ring, drop the trigger state, zero the counters, and turn
+    /// acquisition on. The only way [`Self::push`] starts admitting frames.
+    pub fn start(&mut self) {
+        self.reset();
+        self.control = true;
+        self.status = BufferStatus::BufferFilling;
+    }
+
+    /// C `writeInt32(NDCircBuffControl, 0)` (NDPluginCircularBuff.cpp:255-260):
+    /// acquisition off. C clears the trigger latches and the displayed image
+    /// count but leaves the ring alone, so a restart is a fresh `start()`.
+    pub fn stop(&mut self) {
+        self.control = false;
+        self.triggered = false;
+        self.status = BufferStatus::Idle;
+    }
+
+    /// C `scopeControl` — is the plugin acquiring? The single gate on admitting
+    /// a frame, and the same test C's `writeInt32(NDCircBuffPreTrigger)` uses to
+    /// reject a pre-count change (:281-283).
+    pub fn is_running(&self) -> bool {
+        self.control
     }
 
     /// Push an array into the circular buffer.
@@ -172,39 +275,83 @@ impl CircularBuffer {
     pub fn push(&mut self, array: Arc<NDArray>) -> PushResult {
         let mut result = PushResult::default();
 
-        // If acquisition is completed, ignore new frames
-        if self.status == BufferStatus::AcquisitionCompleted {
+        // C `:121-203` — "Are we running?". EVERYTHING below (the trigger
+        // evaluation, the array copy, the pre-buffer add, the flush, the post
+        // count, and the completion test) sits inside `if (scopeControl)`, whose
+        // else arm is literally `// Currently do nothing`. So a frame arriving
+        // while acquisition is off changes no state and forwards nothing — and
+        // `Control` is the whole gate: it goes off on a user stop AND when the
+        // preset trigger count completes the last sequence (`:197`).
+        if !self.control {
             return result;
         }
 
-        // Transition from Idle to BufferFilling on first push
-        if self.status == BufferStatus::Idle {
-            self.status = BufferStatus::BufferFilling;
+        // C `:123-134` settles `triggered` for this frame BEFORE the branch: a
+        // latched trigger (soft trigger, or a previous frame's) short-circuits
+        // the calc; otherwise the calc runs and its outcome is posted.
+        if !self.triggered {
+            let fired = self.evaluate_trigger(&array, &mut result);
+            // C `:132` posts the trigger flag on every frame that evaluated the
+            // trigger calc, whether it fired or not.
+            result.params.triggered = Some(i32::from(fired));
+            if fired {
+                // The trigger fires before this frame reaches the pre-buffer, so
+                // it becomes the first post-trigger frame — C's triggered branch
+                // has no `addToEnd`.
+                self.trigger();
+            }
         }
 
-        if self.triggered {
-            // Post-trigger capture (Flushing state).
-            // Flush the pre-buffer once, before the first post-trigger frame.
-            if !self.pre_flushed {
-                self.pre_flushed = true;
-                let pre: Vec<_> = self.buffer.drain(..).collect();
-                self.captured.extend(pre.iter().cloned());
-                result.forward.extend(pre);
+        if !self.triggered {
+            // C `:142-155` — no trigger yet: the frame joins the pre-trigger ring.
+            self.buffer.push_back(array);
+            if self.buffer.len() > self.pre_count {
+                self.buffer.pop_front();
             }
-            // C++ increments currentPostCount, forwards the frame, then tests
-            // `currentPostCount >= postCount`.
+            // C `:151` posts the ring size — on this branch only, so the value
+            // stays frozen at the pre-trigger size for the whole flush.
+            result.params.current_image = Some(self.buffer.len() as i32);
+            // C `:152-153` only touches the status once the ring is at capacity.
+            if self.buffer.len() == self.pre_count {
+                result.params.status = Some(if self.pre_count > 0 {
+                    "Buffer Wrapping"
+                } else {
+                    "Dropping frames"
+                });
+            }
+        } else {
+            // C `:156-175` — post-trigger: flush the ring once (`:162-166`), then
+            // forward this frame and bump the post count (`:168-171`).
+            result.params.status = Some("Flushing");
+            if !self.pre_flushed {
+                result.forward.extend(self.flush_pre_buffer());
+            }
             self.captured.push(Arc::clone(&array));
             result.forward.push(array);
             self.post_done += 1;
-            if self.post_done >= self.post_count {
-                self.complete_sequence(&mut result);
-            }
-            return result;
+            result.params.post_count = Some(self.post_done as i32);
         }
 
-        // Check trigger condition BEFORE adding to pre-buffer,
-        // so the triggering frame becomes the first post-trigger frame.
-        let trigger = match &self.trigger_condition {
+        // C `:177-197` tests `currentPostCount >= postCount` OUTSIDE the
+        // triggered/untriggered branches — on every frame the plugin records.
+        // The test therefore also runs on an untriggered frame, where
+        // currentPostCount is 0: with postCount == 0 it passes, so C completes a
+        // sequence (bumping ActualTriggerCount and re-arming) once per *running*
+        // frame, triggered or not. Evaluating it only after a post-trigger push
+        // is the R8-71 divergence.
+        if self.post_done >= self.post_count {
+            self.complete_sequence(&mut result);
+        }
+
+        result
+    }
+
+    /// C `:130-131` / `calculateTrigger` — does this frame fire the trigger?
+    /// Records the calc inputs and result in `result` as a side effect, exactly
+    /// as C posts TriggerAVal/BVal/CalcVal on every evaluated frame
+    /// (NDPluginCircularBuff.cpp:67-78), regardless of the outcome.
+    fn evaluate_trigger(&self, array: &NDArray, result: &mut PushResult) -> bool {
+        match &self.trigger_condition {
             TriggerCondition::AttributeThreshold { name, threshold } => array
                 .attributes
                 .get(name)
@@ -237,8 +384,6 @@ impl CircularBuffer {
                 vars[4] = self.buffer.len() as f64; // E (currentImage)
                 vars[5] = if self.triggered { 1.0 } else { 0.0 }; // F
                 let calc = expression.evaluate_vars(&vars);
-                // C posts TriggerAVal/BVal/CalcVal every evaluated frame
-                // (NDPluginCircularBuff.cpp:67-78), regardless of the outcome.
                 result.trigger_values = Some(TriggerValues { a, b, calc });
                 // C fires only when the result is a finite non-zero
                 // (NDPluginCircularBuff.cpp:77 `!isnan && !isinf && != 0`); a
@@ -247,63 +392,76 @@ impl CircularBuffer {
                 // `f64::is_finite` is exactly `!isnan && !isinf`.
                 calc.is_finite() && calc != 0.0
             }
-        };
-
-        if trigger {
-            // Trigger fires before adding this frame to the pre-buffer,
-            // so the triggering frame will be the first post-trigger frame.
-            self.trigger();
-            // Flush the pre-buffer immediately, then forward the triggering
-            // frame as the first post-trigger frame (C++ flushPreBuffer +
-            // doCallbacksGenericPointer of the trigger frame).
-            self.pre_flushed = true;
-            let pre: Vec<_> = self.buffer.drain(..).collect();
-            self.captured.extend(pre.iter().cloned());
-            result.forward.extend(pre);
-            self.captured.push(Arc::clone(&array));
-            result.forward.push(array);
-            self.post_done += 1;
-            if self.post_done >= self.post_count {
-                self.complete_sequence(&mut result);
-            }
-            return result;
         }
+    }
 
-        // Maintain pre-trigger ring buffer
-        self.buffer.push_back(array);
-        if self.buffer.len() > self.pre_count {
-            self.buffer.pop_front();
-        }
-
-        result
+    /// C `flushPreBuffer()` (NDPluginCircularBuff.cpp:208-218): drain the
+    /// pre-trigger ring and hand every frame downstream, in order.
+    ///
+    /// The single owner of the drain. Both callers go through it — the first
+    /// post-trigger frame (`:162-166`) and the soft-trigger write when
+    /// FlushOnSoftTrig > 0 (`:276-277`) — and whichever runs second finds the
+    /// ring already empty, exactly as C does.
+    fn flush_pre_buffer(&mut self) -> Vec<Arc<NDArray>> {
+        self.pre_flushed = true;
+        let pre: Vec<Arc<NDArray>> = self.buffer.drain(..).collect();
+        self.captured.extend(pre.iter().cloned());
+        pre
     }
 
     /// Finalize a completed post-trigger sequence (C++
-    /// `currentPostCount >= postCount` branch): advance status / trigger
-    /// bookkeeping and signal completion.
+    /// `currentPostCount >= postCount` branch, NDPluginCircularBuff.cpp:178-197):
+    /// advance status / trigger bookkeeping and signal completion.
     fn complete_sequence(&mut self, result: &mut PushResult) {
         self.triggered = false;
         self.pre_flushed = false;
         self.post_done = 0;
+        // C increments actualTriggerCount HERE — when the post-trigger count is
+        // reached — not when the trigger fires (`:179-180`). During a flush the
+        // count still reads the number of *completed* sequences.
+        self.trigger_count += 1;
+        result.params.actual_trigger_count = Some(self.trigger_count as i32);
         if self.preset_trigger_count > 0 && self.trigger_count >= self.preset_trigger_count {
+            // C `:194-198`: preset reached — clear the trigger and turn
+            // acquisition off (NDCircBuffControl = 0). Turning it off here is
+            // what stops the NEXT frame: the gate at the top of `push` is the
+            // same one a user stop clears, so completion needs no separate
+            // "already completed" branch.
+            self.control = false;
             self.status = BufferStatus::AcquisitionCompleted;
+            result.params.triggered = Some(0);
+            result.params.control = Some(0);
+            result.params.status = Some("Acquisition Completed");
         } else {
+            // C `:188-195`: re-arm for the next trigger — the soft-trigger
+            // latch and the post count are cleared, control stays on.
             self.status = BufferStatus::BufferFilling;
+            result.params.control = Some(1);
+            result.params.soft_trigger = Some(0);
+            result.params.triggered = Some(0);
+            result.params.post_count = Some(0);
+            result.params.status = Some(if self.pre_count > 0 {
+                "Buffer filling"
+            } else {
+                "Dropping frames"
+            });
         }
         result.sequence_done = true;
     }
 
     /// External trigger.
     pub fn trigger(&mut self) {
-        // Don't trigger if acquisition already completed
-        if self.status == BufferStatus::AcquisitionCompleted {
+        // The trigger only means anything while acquiring — C evaluates and
+        // latches `triggered` inside `if (scopeControl)`, so a soft trigger
+        // arriving with acquisition off (never started, user-stopped, or the
+        // preset count completed) cannot start a flush.
+        if !self.control {
             return;
         }
 
         self.triggered = true;
         self.post_done = 0;
         self.pre_flushed = false;
-        self.trigger_count += 1;
         self.status = BufferStatus::Flushing;
         // The pre-buffer is flushed lazily on the first post-trigger push so
         // the frames stream out in order with the post-trigger frames.
@@ -323,7 +481,10 @@ impl CircularBuffer {
         self.buffer.len()
     }
 
+    /// Drop the ring and every counter. Leaves acquisition OFF — `start()` is
+    /// the one entry point that turns it on.
     pub fn reset(&mut self) {
+        self.control = false;
         self.buffer.clear();
         self.captured.clear();
         self.triggered = false;
@@ -335,43 +496,6 @@ impl CircularBuffer {
 }
 
 // --- New CircularBuffProcessor (NDPluginProcess-based) ---
-
-/// The status string C `NDPluginCircularBuff::processCallbacks` leaves in
-/// `NDCircBuffStatus` (asynOctet) after one frame, given the post-push state.
-///
-/// Mirrors NDPluginCircularBuff.cpp:153-195: on a flushing frame the status is
-/// "Flushing"; once the post-trigger count is reached it becomes
-/// "Buffer filling"/"Dropping frames" (more triggers allowed) or
-/// "Acquisition Completed" (preset reached); while filling it only changes when
-/// the pre-buffer reaches its capacity ("Buffer Wrapping"/"Dropping frames").
-/// `None` means C makes no `setStringParam` call this frame (status unchanged).
-fn flush_path_status(
-    sequence_done: bool,
-    acquisition_completed: bool,
-    forwarded: bool,
-    pre_buffer_full: bool,
-    pre_count: usize,
-) -> Option<&'static str> {
-    if sequence_done {
-        Some(if acquisition_completed {
-            "Acquisition Completed"
-        } else if pre_count > 0 {
-            "Buffer filling"
-        } else {
-            "Dropping frames"
-        })
-    } else if forwarded {
-        Some("Flushing")
-    } else if pre_buffer_full {
-        Some(if pre_count > 0 {
-            "Buffer Wrapping"
-        } else {
-            "Dropping frames"
-        })
-    } else {
-        None
-    }
-}
 
 /// CircularBuff processor: maintains ring buffer state, emits captured arrays on trigger.
 #[derive(Default)]
@@ -429,6 +553,18 @@ impl CircularBuffProcessor {
         self.buffer.trigger();
     }
 
+    /// Turn acquisition on, as a `Control = 1` write does. Until this is called
+    /// the plugin records nothing — C's `NDCircBuffControl` starts at 0 and
+    /// `processCallbacks` does nothing while it is off.
+    pub fn start(&mut self) {
+        self.buffer.start();
+    }
+
+    /// Turn acquisition off, as a `Control = 0` write does.
+    pub fn stop(&mut self) {
+        self.buffer.stop();
+    }
+
     pub fn buffer(&self) -> &CircularBuffer {
         &self.buffer
     }
@@ -462,33 +598,28 @@ impl NDPluginProcess for CircularBuffProcessor {
 
         let push_result = self.buffer.push(Arc::new(array.clone()));
 
+        // The buffer reports exactly the parameters C assigns for this frame
+        // (see `FrameParams`); the processor only maps them onto indices. A
+        // `None` field is a parameter C leaves alone — emitting a value for it
+        // is what froze CurrentImage at 0 during a flush and posted
+        // ActualTriggerCount a whole sequence early.
         let mut updates = Vec::new();
-        if let Some(idx) = self.params.status {
-            // C NDCircBuffStatus is asynOctet: emit the status string C leaves
-            // after this frame (NDPluginCircularBuff.cpp:153-195), or nothing
-            // when C makes no setStringParam call (still filling below capacity).
-            let pre_count = self.buffer.pre_count;
-            if let Some(s) = flush_path_status(
-                push_result.sequence_done,
-                self.buffer.status() == BufferStatus::AcquisitionCompleted,
-                !push_result.forward.is_empty(),
-                self.buffer.pre_buffer_len() == pre_count,
-                pre_count,
-            ) {
-                updates.push(ParamUpdate::octet(idx, s.to_string()));
+        let p = &push_result.params;
+        if let (Some(idx), Some(s)) = (self.params.status, p.status) {
+            // C NDCircBuffStatus is asynOctet (NDPluginCircularBuff.cpp:411).
+            updates.push(ParamUpdate::octet(idx, s.to_string()));
+        }
+        for (index, value) in [
+            (self.params.triggered, p.triggered),
+            (self.params.current_image, p.current_image),
+            (self.params.post_count, p.post_count),
+            (self.params.actual_trigger_count, p.actual_trigger_count),
+            (self.params.soft_trigger, p.soft_trigger),
+            (self.params.control, p.control),
+        ] {
+            if let (Some(idx), Some(v)) = (index, value) {
+                updates.push(ParamUpdate::int32(idx, v));
             }
-        }
-        if let Some(idx) = self.params.current_image {
-            updates.push(ParamUpdate::int32(idx, self.buffer.pre_buffer_len() as i32));
-        }
-        if let Some(idx) = self.params.triggered {
-            updates.push(ParamUpdate::int32(
-                idx,
-                if self.buffer.is_triggered() { 1 } else { 0 },
-            ));
-        }
-        if let Some(idx) = self.params.actual_trigger_count {
-            updates.push(ParamUpdate::int32(idx, self.buffer.trigger_count() as i32));
         }
         // C posts the trigger calc inputs/result each evaluated frame
         // (NDPluginCircularBuff.cpp:67-78).
@@ -582,11 +713,23 @@ impl NDPluginProcess for CircularBuffProcessor {
         if Some(reason) == self.params.control {
             let v = params.value.as_i32();
             if v == 1 {
-                // Start
-                self.buffer.reset();
-                self.buffer.status = BufferStatus::BufferFilling;
+                // Start. C writeInt32(Control=1) rebuilds the ring and zeroes
+                // the whole runtime counter set before posting the status
+                // (NDPluginCircularBuff.cpp:249-254), and turns `scopeControl`
+                // on — which is what makes `push` admit frames at all.
+                self.buffer.start();
+                for (index, value) in [
+                    (self.params.soft_trigger, 0),
+                    (self.params.triggered, 0),
+                    (self.params.post_count, 0),
+                    (self.params.actual_trigger_count, 0),
+                ] {
+                    if let Some(idx) = index {
+                        updates.push(ParamUpdate::int32(idx, value));
+                    }
+                }
                 // C writeInt32(Control=1): "Buffer filling"/"Dropping frames"
-                // (NDPluginCircularBuff.cpp:252-253).
+                // (NDPluginCircularBuff.cpp:255).
                 if let Some(idx) = self.params.status {
                     let s = if self.buffer.pre_count > 0 {
                         "Buffer filling"
@@ -596,12 +739,19 @@ impl NDPluginProcess for CircularBuffProcessor {
                     updates.push(ParamUpdate::octet(idx, s.to_string()));
                 }
             } else {
-                // Stop
-                self.buffer.status = BufferStatus::Idle;
-                // C writeInt32(Control=0) resets the displayed image count to 0
-                // (NDPluginCircularBuff.cpp:259).
-                if let Some(idx) = self.params.current_image {
-                    updates.push(ParamUpdate::int32(idx, 0));
+                // Stop. C writeInt32(Control=0) turns `scopeControl` off and
+                // clears the trigger latches and the displayed image count
+                // (NDPluginCircularBuff.cpp:255-260). From here `push` admits
+                // nothing until the next Control=1.
+                self.buffer.stop();
+                for (index, value) in [
+                    (self.params.soft_trigger, 0),
+                    (self.params.triggered, 0),
+                    (self.params.current_image, 0),
+                ] {
+                    if let Some(idx) = index {
+                        updates.push(ParamUpdate::int32(idx, value));
+                    }
                 }
                 // C writeInt32(Control=0): "Acquisition Stopped"
                 // (NDPluginCircularBuff.cpp:260).
@@ -616,11 +766,9 @@ impl NDPluginProcess for CircularBuffProcessor {
             // negative value (each leaves the param at its old value with an
             // explanatory status string), otherwise commit.
             let value = params.value.as_i32();
-            let running = matches!(
-                self.buffer.status(),
-                BufferStatus::BufferFilling | BufferStatus::Flushing
-            );
-            let reject_msg = if running {
+            // C reads NDCircBuffControl for this test (`:281-282`), not the
+            // status string — the same gate `processCallbacks` runs on.
+            let reject_msg = if self.buffer.is_running() {
                 Some("Stop acquisition to set pre-count")
             } else if value > self.max_buffers as i32 - 1 {
                 // The pre-trigger ring cannot exceed the input queue (C 284).
@@ -648,11 +796,45 @@ impl NDPluginProcess for CircularBuffProcessor {
             self.buffer
                 .set_preset_trigger_count(params.value.as_i32().max(0) as usize);
         } else if Some(reason) == self.params.flush_on_soft_trigger {
-            self.buffer
-                .set_flush_on_soft_trigger(params.value.as_i32() != 0);
+            self.buffer.set_flush_on_soft_trigger(params.value.as_i32());
         } else if Some(reason) == self.params.soft_trigger {
+            // The write's job, beyond storing the parameter, is to make the soft
+            // trigger take effect IMMEDIATELY — latch Triggered and flush the ring
+            // — instead of waiting for the next frame, which `process_array` would
+            // do anyway from the stored level (C `processCallbacks:123-125`:
+            // `if (softTrigger) triggered = 1;`, re-asserted every frame).
+            //
+            // DEVIATION from C, deliberate — CBUG-B11. C's writeInt32 arm
+            // (NDPluginCircularBuff.cpp:266-278) stores `value` (:268) and then
+            // never tests it: it latches NDCircBuffTriggered = 1 (:271) and
+            // flushes (:276-278) UNCONDITIONALLY. So `caput SoftTrigger 0` — the
+            // natural way to disarm between acquisitions, and what an
+            // autosave/PINI restore writes at boot — fires the trigger on C
+            // exactly like `caput SoftTrigger 1`. 0 unambiguously means "not
+            // triggered" in this plugin's own vocabulary: the Control on and
+            // Control off paths both disarm by writing SoftTrigger = 0 alongside
+            // Triggered = 0 (:248-249, :257-258), and processCallbacks only
+            // asserts the trigger `if (softTrigger)`.
+            //
+            // Writing 0 is therefore a no-op here, which is exactly "stops
+            // asserting the trigger" — the same level semantics processCallbacks
+            // has. It does not clear an already-latched Triggered: C clears that
+            // only on a Control transition, and a latch set by the ATTRIBUTE
+            // trigger condition is not this parameter's to cancel.
             if params.value.as_i32() != 0 {
                 self.buffer.trigger();
+                if let Some(idx) = self.params.triggered {
+                    updates.push(ParamUpdate::int32(idx, 1));
+                }
+                // C `:273-277`: when FlushOnSoftTrig > 0 the pre-buffer is flushed
+                // from the write itself, not lazily on the next frame — the ring
+                // reaches the downstream plugins before any post-trigger frame.
+                if self.buffer.flushes_on_soft_trigger() {
+                    let flushed = self.buffer.flush_pre_buffer();
+                    if !flushed.is_empty() {
+                        return ParamChangeResult::combined(flushed, updates);
+                    }
+                }
             }
         } else if Some(reason) == self.params.trigger_a {
             if let ParamChangeValue::Octet(s) = &params.value {
@@ -720,6 +902,7 @@ mod tests {
     #[test]
     fn test_pre_trigger_buffering() {
         let mut cb = CircularBuffer::new(3, 2, TriggerCondition::External);
+        cb.start(); // C: NDCircBuffControl = 1 (the plugin only records while acquiring)
 
         for i in 0..5 {
             cb.push(make_array(i));
@@ -731,6 +914,7 @@ mod tests {
     #[test]
     fn test_external_trigger() {
         let mut cb = CircularBuffer::new(2, 2, TriggerCondition::External);
+        cb.start(); // C: NDCircBuffControl = 1 (the plugin only records while acquiring)
 
         cb.push(make_array(1));
         cb.push(make_array(2));
@@ -765,6 +949,7 @@ mod tests {
         // Regression: post_count == 0 must complete the sequence on the first
         // post-trigger frame instead of underflowing the post counter.
         let mut cb = CircularBuffer::new(2, 0, TriggerCondition::External);
+        cb.start(); // C: NDCircBuffControl = 1 (the plugin only records while acquiring)
         cb.push(make_array(1));
         cb.push(make_array(2));
         cb.trigger();
@@ -780,9 +965,78 @@ mod tests {
         assert_eq!(cb.status(), BufferStatus::BufferFilling);
 
         // No panic / no 2^64 capture; further frames just fill the pre-buffer.
+        // They are not forwarded — but with postCount == 0 each of them still
+        // *completes* a sequence, because C evaluates `currentPostCount >=
+        // postCount` outside the triggered branches (NDPluginCircularBuff.cpp:178).
+        // The `!r2.sequence_done` this test used to assert was invented; C's
+        // value is `true` (R8-71, covered by
+        // `test_post_count_zero_completes_on_untriggered_frame`).
         let r2 = cb.push(make_array(4));
-        assert!(!r2.sequence_done);
+        assert!(r2.sequence_done);
         assert!(r2.forward.is_empty());
+    }
+
+    #[test]
+    fn test_post_count_zero_completes_on_untriggered_frame() {
+        // R8-71. C tests `currentPostCount >= postCount` OUTSIDE the
+        // triggered/untriggered branches (NDPluginCircularBuff.cpp:178, inside
+        // `if (pArrayCpy)`), so with postCount == 0 the test passes on an
+        // *untriggered* frame too (currentPostCount is 0 there): C completes a
+        // sequence — bumping ActualTriggerCount and re-arming — once per running
+        // frame, without forwarding it.
+        let mut cb = CircularBuffer::new(2, 0, TriggerCondition::External);
+        cb.start(); // C: NDCircBuffControl = 1 (the plugin only records while acquiring)
+
+        for (n, id) in (1..=3).enumerate() {
+            let r = cb.push(make_array(id));
+            // Untriggered: the frame joins the pre-buffer, nothing is forwarded.
+            assert!(r.forward.is_empty(), "frame {id} must not be forwarded");
+            // ...yet the sequence completes (C `:178-191`).
+            assert!(r.sequence_done, "frame {id} must complete a sequence");
+            assert_eq!(r.params.actual_trigger_count, Some(n as i32 + 1));
+            assert_eq!(cb.trigger_count(), n + 1);
+            // C `:186-189` re-arms: control stays on, latches and post count clear.
+            assert_eq!(r.params.control, Some(1));
+            assert_eq!(r.params.soft_trigger, Some(0));
+            assert_eq!(r.params.triggered, Some(0));
+            assert_eq!(r.params.post_count, Some(0));
+            assert_eq!(r.params.status, Some("Buffer filling"));
+        }
+        // C never clears the ring on re-arm, so the pre-buffer keeps filling
+        // across the completed sequences: 3 frames, preCount 2 → last two held.
+        assert_eq!(cb.pre_buffer_len(), 2);
+
+        // Boundary: postCount > 0 — the same untriggered frame must NOT complete,
+        // because currentPostCount (0) < postCount.
+        let mut cb = CircularBuffer::new(2, 1, TriggerCondition::External);
+        cb.start(); // C: NDCircBuffControl = 1 (the plugin only records while acquiring)
+        let r = cb.push(make_array(1));
+        assert!(!r.sequence_done);
+        assert_eq!(r.params.actual_trigger_count, None);
+        assert_eq!(cb.trigger_count(), 0);
+    }
+
+    #[test]
+    fn test_post_count_zero_untriggered_frames_reach_preset_trigger_count() {
+        // R8-71, preset boundary: with postCount == 0 the per-frame completion
+        // also drives ActualTriggerCount into PresetTriggerCount, so C stops
+        // acquisition (Control = 0) after `preset` untriggered frames
+        // (NDPluginCircularBuff.cpp:181-196).
+        let mut cb = CircularBuffer::new(2, 0, TriggerCondition::External);
+        cb.start(); // C: NDCircBuffControl = 1 (the plugin only records while acquiring)
+        cb.set_preset_trigger_count(2);
+
+        let r1 = cb.push(make_array(1));
+        assert!(r1.sequence_done);
+        assert_eq!(r1.params.actual_trigger_count, Some(1));
+        assert_eq!(cb.status(), BufferStatus::BufferFilling);
+
+        let r2 = cb.push(make_array(2));
+        assert_eq!(r2.params.actual_trigger_count, Some(2));
+        // Preset reached — C `:193-195`: Triggered = 0, Control = 0.
+        assert_eq!(r2.params.control, Some(0));
+        assert_eq!(r2.params.status, Some("Acquisition Completed"));
+        assert_eq!(cb.status(), BufferStatus::AcquisitionCompleted);
     }
 
     #[test]
@@ -797,6 +1051,7 @@ mod tests {
                 threshold: 5.0,
             },
         );
+        cb.start(); // C: NDCircBuffControl = 1 (the plugin only records while acquiring)
         cb.push(make_array_with_attr(1, 1.0));
         let r = cb.push(make_array_with_attr(2, 9.0));
         assert!(r.sequence_done);
@@ -815,6 +1070,7 @@ mod tests {
                 threshold: 5.0,
             },
         );
+        cb.start(); // C: NDCircBuffControl = 1 (the plugin only records while acquiring)
 
         cb.push(make_array_with_attr(1, 1.0));
         cb.push(make_array_with_attr(2, 2.0));
@@ -853,6 +1109,7 @@ mod tests {
                 expression: expr,
             },
         );
+        cb.start(); // C: NDCircBuffControl = 1 (the plugin only records while acquiring)
 
         // A=3, should not trigger
         cb.push(make_array_with_attrs(1, 3.0, 0.0));
@@ -889,6 +1146,7 @@ mod tests {
                 expression: expr,
             },
         );
+        cb.start(); // C: NDCircBuffControl = 1 (the plugin only records while acquiring)
 
         // Frame with A=3, B=4 → calc=7 (nonzero → triggers).
         let r = cb.push(make_array_with_attrs(1, 3.0, 4.0));
@@ -917,6 +1175,7 @@ mod tests {
                 expression: expr,
             },
         );
+        cb.start(); // C: NDCircBuffControl = 1 (the plugin only records while acquiring)
         let r = cb.push(make_array(1));
         let tv = r.trigger_values.expect("calc path surfaces trigger values");
         assert!(tv.a.is_nan());
@@ -943,6 +1202,7 @@ mod tests {
                     expression: expr,
                 },
             );
+            cb.start(); // C: NDCircBuffControl = 1 (the plugin only records while acquiring)
             cb.push(make_array_with_attrs(1, val, 0.0));
             cb.is_triggered()
         };
@@ -1041,21 +1301,26 @@ mod tests {
     #[test]
     fn test_preset_trigger_count() {
         let mut cb = CircularBuffer::new(1, 1, TriggerCondition::External);
+        cb.start(); // C: NDCircBuffControl = 1 (the plugin only records while acquiring)
         cb.set_preset_trigger_count(2);
 
-        assert_eq!(cb.status(), BufferStatus::Idle);
+        // C's Control=1 write sets the status string to "Buffer filling"
+        // straight away (NDPluginCircularBuff.cpp:253-254) — it does not wait
+        // for a frame.
+        assert_eq!(cb.status(), BufferStatus::BufferFilling);
 
-        // First push transitions to BufferFilling
         cb.push(make_array(1));
         assert_eq!(cb.status(), BufferStatus::BufferFilling);
 
-        // First trigger
+        // First trigger. C's actualTriggerCount does not move until the
+        // post-trigger count is reached (NDPluginCircularBuff.cpp:179).
         cb.trigger();
-        assert_eq!(cb.trigger_count(), 1);
+        assert_eq!(cb.trigger_count(), 0);
         assert_eq!(cb.status(), BufferStatus::Flushing);
 
         let done = cb.push(make_array(2));
         assert!(done.sequence_done);
+        assert_eq!(cb.trigger_count(), 1); // counted at completion
         assert_eq!(cb.status(), BufferStatus::BufferFilling); // back to filling after first capture
 
         cb.take_captured();
@@ -1063,13 +1328,14 @@ mod tests {
         // Refill buffer
         cb.push(make_array(3));
 
-        // Second trigger — should reach preset count
+        // Second trigger — completing it reaches the preset count
         cb.trigger();
-        assert_eq!(cb.trigger_count(), 2);
+        assert_eq!(cb.trigger_count(), 1);
         assert_eq!(cb.status(), BufferStatus::Flushing);
 
         let done = cb.push(make_array(4));
         assert!(done.sequence_done);
+        assert_eq!(cb.trigger_count(), 2);
         assert_eq!(cb.status(), BufferStatus::AcquisitionCompleted);
 
         cb.take_captured();
@@ -1149,7 +1415,7 @@ mod tests {
 
         // Running → reject, status string, param reverted to old (3), unchanged.
         let mut p = make_proc();
-        p.buffer.status = BufferStatus::BufferFilling;
+        p.buffer.start();
         let r = write(&mut p, 7);
         assert_eq!(
             p.buffer.pre_count, 3,
@@ -1170,7 +1436,7 @@ mod tests {
 
         // Stopped + negative → reject with "Invalid pre-count value".
         let mut p = make_proc();
-        p.buffer.status = BufferStatus::Idle;
+        p.buffer.stop();
         let r = write(&mut p, -1);
         assert_eq!(p.buffer.pre_count, 3, "negative rejected, value unchanged");
         assert!(r.param_updates.iter().any(|u| matches!(
@@ -1180,7 +1446,7 @@ mod tests {
 
         // Stopped + above maxBuffers-1 (9) → reject with "Pre-count too high".
         let mut p = make_proc();
-        p.buffer.status = BufferStatus::Idle;
+        p.buffer.stop();
         let r = write(&mut p, 10);
         assert_eq!(p.buffer.pre_count, 3, "too-high rejected, value unchanged");
         assert!(r.param_updates.iter().any(|u| matches!(
@@ -1198,57 +1464,378 @@ mod tests {
 
         // Stopped + exactly maxBuffers-1 (9) → accept (boundary).
         let mut p = make_proc();
-        p.buffer.status = BufferStatus::Idle;
+        p.buffer.stop();
         write(&mut p, 9);
         assert_eq!(p.buffer.pre_count, 9, "valid pre-count committed");
     }
 
     #[test]
-    fn test_flush_path_status_strings() {
-        // Regression for ADP-40: NDCircBuffStatus is an Octet string; the
-        // processCallbacks path must leave the exact C strings.
-        // Flushing frame (a frame was forwarded, sequence not done).
+    fn test_frame_status_strings() {
+        // ADP-40: NDCircBuffStatus is an Octet string and `push` now owns it —
+        // the exact C strings, on exactly the frames C calls setStringParam.
+        // Filling below capacity: C makes no setStringParam call at all.
+        let mut cb = CircularBuffer::new(2, 2, TriggerCondition::External);
+        cb.start(); // C: NDCircBuffControl = 1 (the plugin only records while acquiring)
+        assert_eq!(cb.push(make_array(1)).params.status, None);
+        // Ring reaches capacity → "Buffer Wrapping" on this and every later
+        // filling frame.
         assert_eq!(
-            flush_path_status(false, false, true, false, 5),
-            Some("Flushing")
-        );
-        // Sequence completes, more triggers allowed, preCount>0.
-        assert_eq!(
-            flush_path_status(true, false, true, false, 5),
-            Some("Buffer filling")
-        );
-        // Sequence completes, more triggers allowed, preCount==0.
-        assert_eq!(
-            flush_path_status(true, false, true, false, 0),
-            Some("Dropping frames")
-        );
-        // Sequence completes, preset trigger count reached.
-        assert_eq!(
-            flush_path_status(true, true, true, false, 5),
-            Some("Acquisition Completed")
-        );
-        // Filling, pre-buffer just reached capacity, preCount>0.
-        assert_eq!(
-            flush_path_status(false, false, false, true, 5),
+            cb.push(make_array(2)).params.status,
             Some("Buffer Wrapping")
         );
-        // Filling at capacity with preCount==0 → frames are dropped.
         assert_eq!(
-            flush_path_status(false, false, false, true, 0),
+            cb.push(make_array(3)).params.status,
+            Some("Buffer Wrapping")
+        );
+        // Flushing frame (forwarded, sequence not done).
+        cb.trigger();
+        assert_eq!(cb.push(make_array(4)).params.status, Some("Flushing"));
+        // Sequence completes with more triggers allowed → back to filling.
+        assert_eq!(cb.push(make_array(5)).params.status, Some("Buffer filling"));
+
+        // preCount == 0: the ring is always "at capacity", so C reports dropped
+        // frames both while filling and on completion.
+        let mut cb = CircularBuffer::new(0, 1, TriggerCondition::External);
+        cb.start(); // C: NDCircBuffControl = 1 (the plugin only records while acquiring)
+        assert_eq!(
+            cb.push(make_array(1)).params.status,
             Some("Dropping frames")
         );
-        // Still filling below capacity → C makes no setStringParam call.
-        assert_eq!(flush_path_status(false, false, false, false, 5), None);
+        cb.trigger();
+        assert_eq!(
+            cb.push(make_array(2)).params.status,
+            Some("Dropping frames")
+        );
+
+        // Preset trigger count reached → "Acquisition Completed".
+        let mut cb = CircularBuffer::new(2, 1, TriggerCondition::External);
+        cb.start(); // C: NDCircBuffControl = 1 (the plugin only records while acquiring)
+        cb.set_preset_trigger_count(1);
+        cb.trigger();
+        assert_eq!(
+            cb.push(make_array(1)).params.status,
+            Some("Acquisition Completed")
+        );
+    }
+
+    #[test]
+    fn test_post_count_posted_per_flushed_frame() {
+        // R8-65: C increments currentPostCount and posts NDCircBuffPostCount on
+        // every forwarded post-trigger frame (NDPluginCircularBuff.cpp:168-169),
+        // then resets it to 0 when the sequence re-arms (:193). The port cached
+        // the param index but never emitted an update, so PostCount_RBV read 0
+        // forever.
+        let mut cb = CircularBuffer::new(2, 3, TriggerCondition::External);
+        cb.start(); // C: NDCircBuffControl = 1 (the plugin only records while acquiring)
+        // Pre-trigger frames touch neither the post count...
+        assert_eq!(cb.push(make_array(1)).params.post_count, None);
+        assert_eq!(cb.push(make_array(2)).params.post_count, None);
+
+        cb.trigger();
+        assert_eq!(cb.push(make_array(3)).params.post_count, Some(1));
+        assert_eq!(cb.push(make_array(4)).params.post_count, Some(2));
+        // Third post-trigger frame completes the sequence: C posts the count (3)
+        // and then 0 from the re-arm branch, so the client only ever sees 0.
+        assert_eq!(cb.push(make_array(5)).params.post_count, Some(0));
+
+        // Re-armed: the next sequence counts from 1 again.
+        cb.trigger();
+        assert_eq!(cb.push(make_array(6)).params.post_count, Some(1));
+    }
+
+    #[test]
+    fn test_post_count_survives_acquisition_completed() {
+        // On the "Acquisition Completed" branch C does NOT reset PostCount
+        // (:194-198 has no setIntegerParam(NDCircBuffPostCount, 0)), so the
+        // final count stays visible after the preset trigger count is reached.
+        let mut cb = CircularBuffer::new(1, 2, TriggerCondition::External);
+        cb.start(); // C: NDCircBuffControl = 1 (the plugin only records while acquiring)
+        cb.set_preset_trigger_count(1);
+        cb.trigger();
+        assert_eq!(cb.push(make_array(1)).params.post_count, Some(1));
+        let done = cb.push(make_array(2));
+        assert_eq!(done.params.post_count, Some(2), "final count, not reset");
+        assert_eq!(done.params.status, Some("Acquisition Completed"));
+        assert_eq!(done.params.control, Some(0), "C turns acquisition off");
+    }
+
+    #[test]
+    fn test_current_image_frozen_during_flush() {
+        // R8-65 sibling: C assigns NDCircBuffCurrentImage only on the
+        // pre-trigger branch (`:151`), so during a flush the value stays frozen
+        // at the pre-buffer size it had when the trigger fired. The port posted
+        // `pre_buffer_len()` on every frame — and the flush drains the ring, so
+        // it posted 0 for the whole capture.
+        let mut cb = CircularBuffer::new(3, 2, TriggerCondition::External);
+        cb.start(); // C: NDCircBuffControl = 1 (the plugin only records while acquiring)
+        assert_eq!(cb.push(make_array(1)).params.current_image, Some(1));
+        assert_eq!(cb.push(make_array(2)).params.current_image, Some(2));
+
+        cb.trigger();
+        // Flushing frames leave the parameter alone — no update, so the record
+        // holds the last pre-trigger size (2).
+        let r1 = cb.push(make_array(3));
+        assert_eq!(cb.pre_buffer_len(), 0, "the flush drained the ring");
+        assert_eq!(r1.params.current_image, None);
+        assert_eq!(cb.push(make_array(4)).params.current_image, None);
+
+        // Back to filling: the ring size is reported again, from 1.
+        assert_eq!(cb.push(make_array(5)).params.current_image, Some(1));
+    }
+
+    #[test]
+    fn test_actual_trigger_count_increments_at_sequence_completion() {
+        // R8-65 sibling: C increments actualTriggerCount when the post-trigger
+        // count is reached (`:179-180`), not when the trigger fires. The port
+        // bumped it inside trigger() and posted it every frame, so
+        // ActualTriggerCount_RBV stepped a whole sequence early.
+        let mut cb = CircularBuffer::new(1, 2, TriggerCondition::External);
+        cb.start(); // C: NDCircBuffControl = 1 (the plugin only records while acquiring)
+        cb.push(make_array(1));
+        assert_eq!(cb.trigger_count(), 0);
+
+        cb.trigger();
+        assert_eq!(cb.trigger_count(), 0, "the trigger alone completes nothing");
+
+        // First post-trigger frame: still mid-sequence, no count update.
+        let r1 = cb.push(make_array(2));
+        assert_eq!(r1.params.actual_trigger_count, None);
+        assert_eq!(cb.trigger_count(), 0);
+
+        // Second (last) post-trigger frame: the sequence completes and the count
+        // moves to 1, together with the re-arm parameters C writes.
+        let r2 = cb.push(make_array(3));
+        assert!(r2.sequence_done);
+        assert_eq!(r2.params.actual_trigger_count, Some(1));
+        assert_eq!(cb.trigger_count(), 1);
+        assert_eq!(r2.params.soft_trigger, Some(0), "C clears the soft latch");
+        assert_eq!(r2.params.triggered, Some(0));
+        assert_eq!(r2.params.control, Some(1), "still acquiring");
+    }
+
+    #[test]
+    fn test_processor_emits_the_frame_params() {
+        // The processor maps `FrameParams` onto the registered indices: a
+        // flushing frame must emit POST_COUNT and leave CURRENT_IMAGE alone.
+        use ad_core_rs::ndarray::{NDDataType, NDDimension};
+        use ad_core_rs::plugin::runtime::ParamUpdate;
+
+        let mut p = CircularBuffProcessor::new(2, 2, TriggerCondition::External, 100);
+        p.buffer.start(); // C: NDCircBuffControl = 1
+        p.params.current_image = Some(11);
+        p.params.post_count = Some(13);
+        p.params.actual_trigger_count = Some(16);
+        let pool = NDArrayPool::new(0);
+        let frame = || NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
+        let int32s = |r: &ProcessResult| -> Vec<(usize, i32)> {
+            r.param_updates
+                .iter()
+                .filter_map(|u| match u {
+                    ParamUpdate::Int32 { reason, value, .. } => Some((*reason, *value)),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        // Pre-trigger frame: CURRENT_IMAGE=1, no POST_COUNT.
+        let r = p.process_array(&frame(), &pool);
+        assert!(int32s(&r).contains(&(11, 1)));
+        assert!(!int32s(&r).iter().any(|(reason, _)| *reason == 13));
+
+        // Flushing frame: POST_COUNT=1 and NO CURRENT_IMAGE update (the pre-fix
+        // processor posted CURRENT_IMAGE=0 here and never posted POST_COUNT).
+        p.trigger();
+        let r = p.process_array(&frame(), &pool);
+        assert!(int32s(&r).contains(&(13, 1)), "POST_COUNT posted per frame");
+        assert!(
+            !int32s(&r).iter().any(|(reason, _)| *reason == 11),
+            "CURRENT_IMAGE frozen during the flush"
+        );
+        assert!(
+            !int32s(&r).iter().any(|(reason, _)| *reason == 16),
+            "ActualTriggerCount only moves at completion"
+        );
+
+        // Completing frame: ACTUAL_TRIGGER_COUNT=1, POST_COUNT reset to 0.
+        let r = p.process_array(&frame(), &pool);
+        assert!(int32s(&r).contains(&(16, 1)));
+        assert!(int32s(&r).contains(&(13, 0)));
+    }
+
+    /// CBUG-B11 — a NONZERO SoftTrigger write latches the trigger and (with
+    /// FlushOnSoftTrig > 0) flushes the ring from the write itself
+    /// (NDPluginCircularBuff.cpp:271, :276-277), rather than waiting for the next
+    /// frame. Writing **0** does neither.
+    ///
+    /// This test used to be `test_soft_trigger_write_latches_for_any_value_and_flushes`
+    /// and pinned C's bug: C stores `value` (:268) and then never tests it, so
+    /// `caput SoftTrigger 0` — the natural way to disarm, and what an autosave/PINI
+    /// restore writes at boot — armed the plugin and flushed the pre-trigger ring
+    /// downstream. Both of the assertions below that now expect "no trigger, no
+    /// flush" were written the other way round.
+    #[test]
+    fn test_soft_trigger_write_latches_only_for_a_nonzero_value() {
+        use ad_core_rs::ndarray::{NDDataType, NDDimension};
+        use ad_core_rs::plugin::runtime::{ParamChangeValue, ParamUpdate, PluginParamSnapshot};
+
+        let soft_trigger_write = |p: &mut CircularBuffProcessor, value: i32| {
+            let reason = p.params.soft_trigger.unwrap();
+            p.on_param_change(
+                reason,
+                &PluginParamSnapshot {
+                    enable_callbacks: true,
+                    reason,
+                    addr: 0,
+                    value: ParamChangeValue::Int32(value),
+                },
+            )
+        };
+        let processor = |flush_on_soft_trig: i32| {
+            let mut p = CircularBuffProcessor::new(3, 2, TriggerCondition::External, 100);
+            p.buffer.start(); // C: NDCircBuffControl = 1
+            p.params.soft_trigger = Some(20);
+            p.params.triggered = Some(21);
+            p.buffer.set_flush_on_soft_trigger(flush_on_soft_trig);
+            let pool = NDArrayPool::new(0);
+            // Two frames into the pre-buffer.
+            for id in 1..=2 {
+                let mut a = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
+                a.unique_id = id;
+                p.process_array(&a, &pool);
+            }
+            assert_eq!(p.buffer().pre_buffer_len(), 2);
+            p
+        };
+
+        let latched = |r: &ad_core_rs::plugin::runtime::ParamChangeResult| {
+            r.param_updates.iter().any(|u| {
+                matches!(
+                    u,
+                    ParamUpdate::Int32 {
+                        reason: 21,
+                        value: 1,
+                        ..
+                    }
+                )
+            })
+        };
+
+        // Writing 0 with FlushOnSoftTrig = 1 — the disarm case, and the one C
+        // gets wrong: no trigger, no flush, the ring stays intact.
+        let mut p = processor(1);
+        let r = soft_trigger_write(&mut p, 0);
+        assert!(!p.buffer().is_triggered(), "SoftTrigger 0 must not arm");
+        assert!(!latched(&r), "SoftTrigger 0 must not post Triggered=1");
+        assert!(r.output_arrays.is_empty(), "SoftTrigger 0 must not flush");
+        assert_eq!(p.buffer().pre_buffer_len(), 2);
+
+        // FlushOnSoftTrig = 0: a nonzero value latches, and the ring stays put
+        // (it flushes lazily with the first post-trigger frame).
+        let mut p = processor(0);
+        let r = soft_trigger_write(&mut p, 1);
+        assert!(p.buffer().is_triggered());
+        assert!(latched(&r));
+        assert!(
+            r.output_arrays.is_empty(),
+            "no flush when FlushOnSoftTrig = 0"
+        );
+        assert_eq!(p.buffer().pre_buffer_len(), 2);
+
+        // FlushOnSoftTrig = 1: the write itself flushes the pre-buffer, in order.
+        let mut p = processor(1);
+        let r = soft_trigger_write(&mut p, 1);
+        assert!(p.buffer().is_triggered());
+        let ids: Vec<_> = r.output_arrays.iter().map(|a| a.unique_id).collect();
+        assert_eq!(ids, vec![1, 2], "pre-buffer flushed from the write");
+        assert_eq!(p.buffer().pre_buffer_len(), 0);
+        assert!(latched(&r));
+
+        // The next frame is the first post-trigger frame; the ring is already
+        // drained, so C's second flushPreBuffer() (:165) is a no-op and only the
+        // new frame is forwarded.
+        let pool = NDArrayPool::new(0);
+        let mut a = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
+        a.unique_id = 3;
+        let r = p.process_array(&a, &pool);
+        let ids: Vec<_> = r.output_arrays.iter().map(|a| a.unique_id).collect();
+        assert_eq!(ids, vec![3], "pre-buffer already flushed, not re-emitted");
+    }
+
+    /// R11-63: the soft-trigger flush is C's `if (flushOn > 0)`
+    /// (NDPluginCircularBuff.cpp:276), not `flushOn != 0`. Boundary sweep of the
+    /// written FlushOnSoftTrig value through the real param-write path: -1 and 0
+    /// must NOT flush (the ring drains lazily on the first post-trigger frame),
+    /// 1 must.
+    #[test]
+    fn r11_63_flush_on_soft_trig_requires_a_positive_value() {
+        use ad_core_rs::ndarray::{NDDataType, NDDimension};
+        use ad_core_rs::plugin::runtime::{ParamChangeValue, PluginParamSnapshot};
+
+        const FLUSH_ON: usize = 22;
+        const SOFT_TRIG: usize = 20;
+
+        let write = |p: &mut CircularBuffProcessor, reason: usize, value: i32| {
+            p.on_param_change(
+                reason,
+                &PluginParamSnapshot {
+                    enable_callbacks: true,
+                    reason,
+                    addr: 0,
+                    value: ParamChangeValue::Int32(value),
+                },
+            )
+        };
+
+        for (flush_on, expect_flush) in [(-1, false), (0, false), (1, true)] {
+            let mut p = CircularBuffProcessor::new(3, 2, TriggerCondition::External, 100);
+            p.buffer.start();
+            p.params.soft_trigger = Some(SOFT_TRIG);
+            p.params.triggered = Some(21);
+            p.params.flush_on_soft_trigger = Some(FLUSH_ON);
+
+            write(&mut p, FLUSH_ON, flush_on);
+            assert_eq!(
+                p.buffer().flushes_on_soft_trigger(),
+                expect_flush,
+                "FlushOnSoftTrig = {flush_on}: C flushes only when > 0"
+            );
+
+            let pool = NDArrayPool::new(0);
+            for id in 1..=2 {
+                let mut a = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
+                a.unique_id = id;
+                p.process_array(&a, &pool);
+            }
+            assert_eq!(p.buffer().pre_buffer_len(), 2);
+
+            let r = write(&mut p, SOFT_TRIG, 1);
+            assert!(p.buffer().is_triggered());
+            if expect_flush {
+                let ids: Vec<_> = r.output_arrays.iter().map(|a| a.unique_id).collect();
+                assert_eq!(ids, vec![1, 2], "FlushOnSoftTrig = {flush_on}: flushed");
+                assert_eq!(p.buffer().pre_buffer_len(), 0);
+            } else {
+                assert!(
+                    r.output_arrays.is_empty(),
+                    "FlushOnSoftTrig = {flush_on}: C does not flush from the write"
+                );
+                assert_eq!(p.buffer().pre_buffer_len(), 2);
+            }
+        }
     }
 
     #[test]
     fn test_buffer_status_transitions() {
         let mut cb = CircularBuffer::new(2, 1, TriggerCondition::External);
 
-        // Initial state
+        // Before Control=1 the plugin is idle and records nothing.
         assert_eq!(cb.status(), BufferStatus::Idle);
 
-        // First push -> BufferFilling
+        // C's Control=1 write posts "Buffer filling" itself
+        // (NDPluginCircularBuff.cpp:253-254), before any frame arrives.
+        cb.start();
+        assert_eq!(cb.status(), BufferStatus::BufferFilling);
+
         cb.push(make_array(1));
         assert_eq!(cb.status(), BufferStatus::BufferFilling);
 

@@ -86,7 +86,9 @@ async fn rpc_channels_lists_hosted_pvs() {
     )
     .await
     .expect("op=channels rpc timed out")
-    .expect("op=channels rpc failed");
+    .expect("op=channels rpc failed")
+    .into_value()
+    .expect("value reply");
 
     let names = match resp {
         PvField::Structure(s) => match s.get_field("value") {
@@ -134,7 +136,9 @@ async fn rpc_info_returns_server_identity() {
     )
     .await
     .expect("op=info rpc timed out")
-    .expect("op=info rpc failed");
+    .expect("op=info rpc failed")
+    .into_value()
+    .expect("value reply");
 
     let s = match resp {
         PvField::Structure(s) => s,
@@ -178,23 +182,67 @@ async fn get_server_pv_has_no_surface() {
     drop(server);
 }
 
-/// An unknown `op` value is rejected with an error that names the bad
-/// op, rather than silently returning empty data.
+/// An unknown `op` value is rejected with pvxs's contract text. pvxs falls off
+/// the `channels`/`info` chain into `eop->error("Not implemented")`
+/// (serversource.cpp:93) — a bare string that neither echoes the bad op nor
+/// lists the ones it knows. A missing `op` is not a hand-written diagnostic
+/// either: `args["op"].as<std::string>()` (:53) throws `NoField` ("No such
+/// field", data.cpp:17-19,419-422) and the EXEC catch forwards `e.what()` to
+/// the client (serverget.cpp:504-508). The port used to answer
+/// "unknown op '…' (expected 'channels' or 'info')" and
+/// "missing 'op' query argument".
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn rpc_unknown_op_is_rejected() {
+async fn rpc_op_errors_carry_pvxs_contract_text() {
     let (server, client) = server_with_two_pvs();
 
     let (desc, value) = nturi_op("not-a-real-op");
-    let result = tokio::time::timeout(
+    let err = tokio::time::timeout(
         Duration::from_secs(5),
         client.pvrpc("server", &desc, &value),
     )
     .await
-    .expect("rpc timed out");
-
+    .expect("rpc timed out")
+    .expect_err("unknown op must produce an RPC error");
     assert!(
-        result.is_err(),
-        "unknown op must produce an RPC error, got {result:?}"
+        format!("{err}").contains("Not implemented"),
+        "unknown op must return pvxs's bare \"Not implemented\", got: {err}"
+    );
+
+    // Missing `op`: an NTURI query structure with no `op` field at all.
+    let mut query = PvStructure::new("");
+    query.fields.push((
+        "unrelated".into(),
+        PvField::Scalar(ScalarValue::String("x".into())),
+    ));
+    let mut uri = PvStructure::new("epics:nt/NTURI:1.0");
+    uri.fields.push((
+        "scheme".into(),
+        PvField::Scalar(ScalarValue::String("pva".into())),
+    ));
+    uri.fields.push(("query".into(), PvField::Structure(query)));
+    let desc = FieldDesc::Structure {
+        struct_id: "epics:nt/NTURI:1.0".into(),
+        fields: vec![
+            ("scheme".into(), FieldDesc::Scalar(ScalarType::String)),
+            (
+                "query".into(),
+                FieldDesc::Structure {
+                    struct_id: String::new(),
+                    fields: vec![("unrelated".into(), FieldDesc::Scalar(ScalarType::String))],
+                },
+            ),
+        ],
+    };
+    let err = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.pvrpc("server", &desc, &PvField::Structure(uri)),
+    )
+    .await
+    .expect("rpc timed out")
+    .expect_err("a missing op must produce an RPC error");
+    assert!(
+        format!("{err}").contains("No such field"),
+        "a missing op must surface pvxs's NoField text, got: {err}"
     );
 
     drop(server);
@@ -235,7 +283,9 @@ async fn builtin_server_source_shadows_default_order_user_server_pv() {
     )
     .await
     .expect("op=info rpc timed out")
-    .expect("built-in __server must answer op=info, shadowing the user PV");
+    .expect("built-in __server must answer op=info, shadowing the user PV")
+    .into_value()
+    .expect("value reply");
     match resp {
         PvField::Structure(s) => {
             assert!(

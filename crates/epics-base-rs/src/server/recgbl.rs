@@ -1,5 +1,7 @@
 use crate::server::record::{AlarmSeverity, CommonFields};
 
+pub mod simm;
+
 /// Alarm status codes matching EPICS base's `menuAlarmStat.dbd` /
 /// `epicsAlarmCondition` (libcom/src/misc/alarm.h) wire format. The
 /// numeric values are baked into the CA wire protocol's `stat` byte,
@@ -117,6 +119,25 @@ impl std::ops::BitAnd for EventMask {
     }
 }
 
+/// The record fields C `recGblResetAlarms` posts ITSELF (recGbl.c:201-217):
+/// `db_post_events(&sevr, …)`, `db_post_events(&stat, …)`,
+/// `db_post_events(&amsg, …)` and `db_post_events(&acks, DBE_VALUE)`.
+///
+/// Each carries its own C mask, assembled by the alarm-post owner
+/// (`processing::alarm_field_posts` and its siblings) from
+/// [`AlarmResetResult`]. The generic per-cycle change-detection loop
+/// (`RecordInstance::collect_subscriber_posts`) must therefore SKIP every field
+/// named here: emitting one from the record-wide snapshot as well would send a
+/// subscriber two events for one C `db_post_events`, the second carrying the
+/// framework's default `alarm_bits | DBE_VALUE | DBE_LOG` — a mask C never uses
+/// for these fields.
+///
+/// The two sides are kept in step by construction: a field the alarm-post owner
+/// emits belongs in this list, and the change-detection loop excludes exactly
+/// this list. (`UDF` is NOT here — it is not a `recGblResetAlarms` post; the
+/// framework posts it from its own undefined-value rule.)
+pub const RECGBL_POSTED_ALARM_FIELDS: [&str; 4] = ["SEVR", "STAT", "AMSG", "ACKS"];
+
 /// Result of rec_gbl_reset_alarms: whether alarm state changed.
 pub struct AlarmResetResult {
     pub alarm_changed: bool,
@@ -124,10 +145,29 @@ pub struct AlarmResetResult {
     pub prev_stat: u16,
     /// True iff `amsg` value changed in this reset cycle (epics-base PR #568).
     pub amsg_changed: bool,
-    /// True iff `acks` value was raised in this reset cycle (C parity
-    /// with `recGblResetAlarms` — `acks` tracks the highest unacknowledged
-    /// severity so operators can clear sticky alarms via a CA put).
-    pub acks_changed: bool,
+    /// True iff `recGblResetAlarms` POSTED `ACKS` this cycle — i.e. the
+    /// alarm-acknowledge rule fired (recGbl.c:214-217):
+    ///
+    /// ```c
+    /// if (stat_mask) {
+    ///     ...
+    ///     if (!pdbc->ackt || new_sevr >= pdbc->acks) {
+    ///         pdbc->acks = new_sevr;
+    ///         db_post_events(pdbc, &pdbc->acks, DBE_VALUE);
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// The post is UNCONDITIONAL inside the rule — there is no value-change
+    /// test — so this flag says "the rule fired", not "the value moved". Those
+    /// differ on any stat-only alarm transition at constant severity
+    /// (LINK→CALC both INVALID; HIGH→HIHI with `HSV = HHSV = MAJOR`), where C
+    /// re-posts an already-equal ACKS and a `DBE_VALUE`-only `.ACKS`
+    /// subscriber receives the event.
+    ///
+    /// The `if (stat_mask)` guard is already folded in — a consumer posts
+    /// `ACKS` on this flag alone and must NOT re-derive the guard.
+    pub acks_posted: bool,
 }
 
 /// Set new alarm severity if it's higher than current nsta/nsev.
@@ -145,6 +185,35 @@ pub fn rec_gbl_set_sevr(common: &mut CommonFields, stat: u16, sevr: AlarmSeverit
     if (sevr as u16) > (common.nsev as u16) {
         common.nsta = stat;
         common.nsev = sevr;
+        // C `msg == NULL` branch clears the pending message.
+        common.namsg.clear();
+    }
+}
+
+/// `rec_gbl_set_sevr` for a severity that is a **raw menu ordinal**, comparing
+/// it the way C's `recGblSetSevrVMsg` does — against the RAW `epicsEnum16`
+/// (recGbl.c:242 `if (prec->nsev < new_sevr)`), BEFORE any clamp to
+/// `INVALID_ALARM`.
+///
+/// A numeric `caput .ZSV 4` (or `-1` → `65535`) stores that raw ordinal in the
+/// `DBF_MENU` field (`dbConvert.c::putDoubleEnum` = `*pfield = (epicsEnum16)val`,
+/// the same raw-ordinal rule the analog `HHSV`/… selectors already follow, see
+/// [`crate::server::record::AnalogAlarmConfig`]). C hands that raw ordinal
+/// straight to `recGblSetSevr`, so a state alarm whose raw severity is
+/// numerically greater than a prior UDF's in-range `INVALID` (3) — e.g. `ZSV=4`
+/// or `65535` — DOES override it: `3 < 4` is true, STAT becomes STATE. Clamping
+/// the ordinal to `Invalid` (3) BEFORE the compare (the [`rec_gbl_set_sevr`]
+/// path via [`AlarmSeverity::from_u16`]) would tie the prior UDF and wrongly
+/// leave STAT=UDF.
+///
+/// The DISPLAYED severity stays clamped: C clamps `nsev` to `INVALID_ALARM` in
+/// `recGblResetAlarms` (recGbl.c:188), and this stores the clamped
+/// [`AlarmSeverity`] so both sides show `INVALID`. `raw_sevr == 0` is a no-op
+/// (NO_ALARM never raises), matching C's `recGblSetSevr(.., 0)`.
+pub fn rec_gbl_set_sevr_raw(common: &mut CommonFields, stat: u16, raw_sevr: u16) {
+    if raw_sevr > (common.nsev as u16) {
+        common.nsta = stat;
+        common.nsev = AlarmSeverity::from_u16(raw_sevr);
         // C `msg == NULL` branch clears the pending message.
         common.namsg.clear();
     }
@@ -168,18 +237,51 @@ pub fn rec_gbl_set_sevr_msg(
     }
 }
 
+/// C `setLinkAlarm` (dbLink.c:318-323) — **the single owner of "a link
+/// operation failed"**, and the failure path of every `dbGetLink`,
+/// `dbPutLink` and `dbPutLinkAsync`:
+///
+/// ```c
+/// static void setLinkAlarm(struct link* plink)
+/// {
+///     recGblSetSevrMsg(plink->precord, LINK_ALARM, INVALID_ALARM,
+///                      "field %s", dbLinkFieldName(plink));
+/// }
+/// ```
+///
+/// `field` is the LINK FIELD's name — `INP`, `SIOL`, `SIML`, `OUT` — and it
+/// reaches the operator as the record's `AMSG`. Every failing link read must
+/// go through here, or the record publishes a lower severity than C (and a
+/// broken link goes silent when the record's other alarms are quiet).
+///
+/// The severity is a MAXIMIZE (`rec_gbl_set_sevr_msg` is strict-greater), so
+/// WHERE this is called relative to the record's other `recGblSetSevr` calls
+/// decides ties. Callers must reproduce C's ORDER, not just C's set of alarms:
+/// a base record raises `SIMM_ALARM` BEFORE its SIOL read (longinRecord.c:414
+/// then :416), so with `SIMS = INVALID` the equal-severity LINK_ALARM loses and
+/// STAT stays SIMM_ALARM; swait raises it AFTER (swaitRecord.c:416 then :420),
+/// so LINK_ALARM wins there.
+///
+/// NOT used for `dbTryGetLink`, which does not call `setLinkAlarm`:
+/// `recGblGetSimm`'s SIML read (recGbl.c:453-454) instead writes
+/// `nsta = LINK_ALARM` directly, leaving SEVR untouched.
+pub fn rec_gbl_set_link_alarm(common: &mut CommonFields, field: &str) {
+    rec_gbl_set_sevr_msg(
+        common,
+        alarm_status::LINK_ALARM,
+        AlarmSeverity::Invalid,
+        format!("field {field}"),
+    );
+}
+
 /// Transfer nsta/nsev to stat/sevr, detect alarm change, reset nsta/nsev.
 /// Matches EPICS recGblResetAlarms. Call at end of process cycle.
 ///
 /// Mirrors epics-base PR #566 — the alarm-message string (`amsg`) is
-/// transferred from `namsg` alongside the severity / status, and
-/// `namsg` is cleared for the next cycle. Records that did not call
-/// `rec_gbl_set_sevr_msg` this cycle end up with an empty `amsg`.
+/// transferred from `namsg` alongside the severity / status.
 pub fn rec_gbl_reset_alarms(common: &mut CommonFields) -> AlarmResetResult {
     let prev_sevr = common.sevr;
     let prev_stat = common.stat;
-    let prev_amsg = std::mem::take(&mut common.amsg);
-    let prev_acks = common.acks;
 
     // C parity (recGbl.c:188-189): clamp pending severity at INVALID_ALARM.
     // Records that erroneously call `recGblSetSevr` with a severity > 3
@@ -191,57 +293,105 @@ pub fn rec_gbl_reset_alarms(common: &mut CommonFields) -> AlarmResetResult {
         common.nsev = AlarmSeverity::Invalid;
     }
 
+    // C parity (recGbl.c:191-195): the amsg copy AND the namsg clear are BOTH
+    // inside `if (strcmp(namsg, amsg) != 0)`:
+    //
+    // ```c
+    // if (strcmp(pdbc->namsg, pdbc->amsg) != 0) {
+    //     strcpy(pdbc->amsg, pdbc->namsg);
+    //     pdbc->namsg[0] = '\0';
+    //     stat_mask = DBE_ALARM;
+    // }
+    // ```
+    //
+    // So an UNCHANGED message survives in `namsg` — C does not clear it — and
+    // the next cycle that raises no alarm at all finds `namsg == amsg` again
+    // and leaves `amsg` alone. AMSG therefore keeps the last alarm text after
+    // the alarm clears. An unconditional take (the pre-fix shape) empties
+    // `namsg` on the repeat cycle, so the clearing cycle transfers `""` and
+    // publishes an empty AMSG — divergent for any message alarm that persists
+    // for two or more cycles, which is every broken-then-recovered link
+    // (`dbLink.c:320` raises `recGblSetSevrMsg(LINK_ALARM, INVALID, "field %s")`
+    // on every failing read).
+    let amsg_changed = common.namsg != common.amsg;
+    if amsg_changed {
+        common.amsg = std::mem::take(&mut common.namsg);
+    }
+
     // Transfer new alarm state
     common.sevr = common.nsev;
     common.stat = common.nsta;
-    common.amsg = std::mem::take(&mut common.namsg);
 
     // Reset for next cycle
     common.nsev = AlarmSeverity::NoAlarm;
     common.nsta = alarm_status::NO_ALARM;
-    // common.namsg already cleared by `mem::take` above.
 
     let alarm_changed = common.sevr != prev_sevr || common.stat != prev_stat;
-    let amsg_changed = common.amsg != prev_amsg;
 
-    // C parity (recGbl.c:209-217): when an alarm-class field changed
-    // this cycle, update the alarm-acknowledge severity `acks`. If
-    // `ackt` is false (alarm is transient — automatically resets when
-    // the condition clears) OR the new severity is >= the currently
-    // remembered acks, raise `acks` to the new severity. Operators
-    // clear `acks` back to NoAlarm via a CA put to ACKS (handled in
-    // record_instance::put_common_field). Without this update, the
-    // alarm-handler workflow (sticky severity tracking) is silently
-    // disabled — every operator clear is a no-op because acks never
-    // gets raised in the first place.
-    let mut acks_changed = false;
-    if alarm_changed || amsg_changed {
-        if !common.ackt || (common.sevr as u16) >= (common.acks as u16) {
-            if common.acks != common.sevr {
-                common.acks = common.sevr;
-                acks_changed = true;
-            }
-        }
+    // C parity (recGbl.c:209-217): when an alarm-class field moved this cycle
+    // (C's `if (stat_mask)`, which is exactly `alarm_changed || amsg_changed`),
+    // update the alarm-acknowledge severity `acks`. If `ackt` is false (alarm
+    // is transient — automatically resets when the condition clears) OR the new
+    // severity is >= the currently remembered acks, raise `acks` to the new
+    // severity. Operators clear `acks` back to NoAlarm via a CA put to ACKS
+    // (handled in record_instance::put_common_field).
+    //
+    // ```c
+    // if (!pdbc->ackt || new_sevr >= pdbc->acks) {
+    //     pdbc->acks = new_sevr;
+    //     db_post_events(pdbc, &pdbc->acks, DBE_VALUE);
+    // }
+    // ```
+    //
+    // The assignment and the post sit together inside the rule, with NO
+    // value-change test around them: whenever the rule fires, C emits the
+    // event. Gating the post on `acks != sevr` (the pre-fix shape) dropped it
+    // on every stat-only transition at constant severity — LINK→CALC with both
+    // INVALID, or HIGH→HIHI with `HSV = HHSV = MAJOR` — where the rule fires,
+    // ACKS is already equal, and C still posts. `acks_posted` therefore reports
+    // the RULE, not the value.
+    let mut acks_posted = false;
+    if (alarm_changed || amsg_changed)
+        && (!common.ackt || (common.sevr as u16) >= (common.acks as u16))
+    {
+        common.acks = common.sevr;
+        acks_posted = true;
     }
-
-    let _ = prev_acks; // reserved for future post-event integration
 
     AlarmResetResult {
         alarm_changed,
         prev_sevr,
         prev_stat,
         amsg_changed,
-        acks_changed,
+        acks_posted,
     }
 }
 
-/// Check UDF alarm: if record is still undefined, raise UDF_ALARM with UDFS severity.
-pub fn rec_gbl_check_udf(common: &mut CommonFields) {
-    if common.udf {
+/// The two ways C `checkAlarms` tests the `UDF` byte before raising
+/// `UDF_ALARM`. Almost every record uses `if (prec->udf)` — TRUTHY, so any
+/// non-zero byte counts as undefined (`aiRecord.c:319`, `mbboRecord.c:210`,
+/// `longoutRecord.c:317`, …). A small set uses `if (prec->udf == TRUE)` —
+/// EXACT-ONE, where `TRUE` is `1`, so a byte that is neither 0 nor 1 does NOT
+/// raise the alarm (`boRecord.c:371`, `stringoutRecord.c:146`,
+/// `biRecord.c:225`, `busyRecord.c:337`). The distinction is observable only
+/// for a record whose `udf` byte can hold a value other than 0/1 at
+/// `checkAlarms` time — i.e. one that does NOT re-derive `udf` every cycle
+/// (`clears_udf() == false`) — after a direct `caput .UDF 255` (or `-1`, which
+/// reaches the `DBF_UCHAR` field as `255`): C's exact-one records leave
+/// STAT/SEVR at `NO_ALARM`, the truthy records raise `UDF_ALARM/INVALID`.
+pub fn udf_alarm_active(udf: u8, exact_one: bool) -> bool {
+    if exact_one { udf == 1 } else { udf != 0 }
+}
+
+/// Check UDF alarm: if record is still undefined, raise UDF_ALARM with UDFS
+/// severity. `exact_one` selects C's `udf == TRUE` semantics (see
+/// [`udf_alarm_active`]); pass the record's [`Record::udf_alarm_on_exact_one`].
+pub fn rec_gbl_check_udf(common: &mut CommonFields, exact_one: bool) {
+    if udf_alarm_active(common.udf, exact_one) {
         rec_gbl_set_sevr_msg(
             common,
             alarm_status::UDF_ALARM,
-            common.udfs,
+            AlarmSeverity::from_u16(common.udfs as u16),
             "UDF: record not initialized",
         );
     }
@@ -351,7 +501,14 @@ mod tests {
     #[test]
     fn test_reset_alarms_no_change() {
         let mut common = CommonFields::default();
-        // No alarm set, reset should show no change
+        // A record is BORN `stat = UDF_ALARM` (dbCommon.dbd `initial("UDF")`),
+        // so its FIRST reset is an alarm change: UDF -> NO_ALARM. C posts
+        // DBE_ALARM there (recGbl.c:202-207).
+        let first = rec_gbl_reset_alarms(&mut common);
+        assert!(first.alarm_changed);
+        assert_eq!(common.stat, alarm_status::NO_ALARM);
+
+        // No alarm set since — the second reset shows no change.
         let result = rec_gbl_reset_alarms(&mut common);
         assert!(!result.alarm_changed);
     }
@@ -372,8 +529,8 @@ mod tests {
     #[test]
     fn test_check_udf() {
         let mut common = CommonFields::default();
-        assert!(common.udf);
-        rec_gbl_check_udf(&mut common);
+        assert!(common.udf != 0);
+        rec_gbl_check_udf(&mut common, false);
         assert_eq!(common.nsev, AlarmSeverity::Invalid);
         assert_eq!(common.nsta, alarm_status::UDF_ALARM);
     }
@@ -381,17 +538,37 @@ mod tests {
     #[test]
     fn test_check_udf_uses_udfs() {
         let mut common = CommonFields::default();
-        assert!(common.udf);
-        common.udfs = AlarmSeverity::Minor;
-        rec_gbl_check_udf(&mut common);
+        assert!(common.udf != 0);
+        common.udfs = AlarmSeverity::Minor as i16;
+        rec_gbl_check_udf(&mut common, false);
         assert_eq!(common.nsev, AlarmSeverity::Minor);
         assert_eq!(common.nsta, alarm_status::UDF_ALARM);
+    }
+
+    /// C `udf == TRUE` records (exact-one): a `udf` byte of `255` — what a
+    /// direct `caput .UDF 255` / `-1` leaves on a record that does not
+    /// re-derive `udf` — does NOT raise UDF_ALARM, while the truthy records do.
+    #[test]
+    fn test_check_udf_exact_one_ignores_non_one_byte() {
+        assert!(udf_alarm_active(255, false), "truthy: 255 raises");
+        assert!(
+            !udf_alarm_active(255, true),
+            "exact-one: 255 does not raise"
+        );
+        assert!(udf_alarm_active(1, true), "exact-one: 1 still raises");
+        assert!(!udf_alarm_active(0, true), "exact-one: 0 never raises");
+
+        let mut common = CommonFields::default();
+        common.udf = 255;
+        rec_gbl_check_udf(&mut common, true);
+        assert_eq!(common.nsev, AlarmSeverity::NoAlarm);
+        assert_eq!(common.nsta, alarm_status::NO_ALARM);
     }
 
     #[test]
     fn test_check_udf_default_udfs_is_invalid() {
         let common = CommonFields::default();
-        assert_eq!(common.udfs, AlarmSeverity::Invalid);
+        assert_eq!(common.udfs, AlarmSeverity::Invalid as i16);
     }
 
     // ----- AMSG / NAMSG (epics-base PR #568 / #566) -----
@@ -464,6 +641,72 @@ mod tests {
         assert_eq!(common.amsg, "");
     }
 
+    /// R13-61. C `recGbl.c:191-195` gates the `amsg = namsg` copy AND the
+    /// `namsg[0] = '\0'` clear on `strcmp(namsg, amsg) != 0`, so a message that
+    /// repeats across cycles is never cleared out of `namsg` — and AMSG then
+    /// keeps the last alarm text after the alarm itself clears.
+    ///
+    /// Compiled C (`recGblResetAlarms` + `recGblSetSevrVMsg`, verbatim bodies
+    /// over a minimal `dbCommon`), the calcout fail/fail/succeed scenario:
+    ///
+    /// ```text
+    /// cycle1 (calc fails):      sevr=3 stat=12 amsg='calcPerform' namsg=''
+    /// cycle2 (fails, same msg): sevr=3 stat=12 amsg='calcPerform' namsg='calcPerform'
+    /// cycle3 (succeeds):        sevr=0 stat=0  amsg='calcPerform' namsg='calcPerform'
+    /// ```
+    ///
+    /// Cycle 3 still POSTS amsg (sevr moved, so `stat_mask` carries DBE_ALARM)
+    /// — it just carries the stale text, not `""`.
+    #[test]
+    fn reset_alarms_keeps_amsg_when_the_same_message_repeats() {
+        let mut common = CommonFields::default();
+
+        // cycle 1: calcPerform fails.
+        rec_gbl_set_sevr_msg(
+            &mut common,
+            alarm_status::CALC_ALARM,
+            AlarmSeverity::Invalid,
+            "calcPerform",
+        );
+        let c1 = rec_gbl_reset_alarms(&mut common);
+        assert!(c1.amsg_changed);
+        assert_eq!(common.sevr, AlarmSeverity::Invalid);
+        assert_eq!(common.amsg, "calcPerform");
+        assert_eq!(common.namsg, "");
+
+        // cycle 2: still fails, SAME message. C leaves `namsg` alone.
+        rec_gbl_set_sevr_msg(
+            &mut common,
+            alarm_status::CALC_ALARM,
+            AlarmSeverity::Invalid,
+            "calcPerform",
+        );
+        let c2 = rec_gbl_reset_alarms(&mut common);
+        assert!(!c2.alarm_changed);
+        assert!(
+            !c2.amsg_changed,
+            "an unchanged message is not an AMSG event"
+        );
+        assert_eq!(common.amsg, "calcPerform");
+        assert_eq!(
+            common.namsg, "calcPerform",
+            "C does NOT clear namsg when it equals amsg (recGbl.c:191-195)"
+        );
+
+        // cycle 3: the calc succeeds — no `recGblSetSevr*` call at all.
+        let c3 = rec_gbl_reset_alarms(&mut common);
+        assert!(c3.alarm_changed, "severity dropped INVALID -> NO_ALARM");
+        assert!(
+            !c3.amsg_changed,
+            "namsg still equals amsg, so recGblResetAlarms does not touch it"
+        );
+        assert_eq!(common.sevr, AlarmSeverity::NoAlarm);
+        assert_eq!(
+            common.amsg, "calcPerform",
+            "AMSG keeps the last alarm text after the alarm clears"
+        );
+    }
+
     #[test]
     fn test_event_mask_ops() {
         let mask = EventMask::VALUE | EventMask::ALARM;
@@ -494,7 +737,7 @@ mod tests {
         let result = rec_gbl_reset_alarms(&mut common);
 
         assert!(result.alarm_changed);
-        assert!(result.acks_changed, "first alarm raise must update acks");
+        assert!(result.acks_posted, "first alarm raise must update acks");
         assert_eq!(common.acks, AlarmSeverity::Major);
     }
 
@@ -515,9 +758,82 @@ mod tests {
         let result = rec_gbl_reset_alarms(&mut common);
         assert!(result.alarm_changed);
         assert!(
-            !result.acks_changed,
+            !result.acks_posted,
             "ackt=true must NOT lower acks when severity drops"
         );
+        assert_eq!(common.acks, AlarmSeverity::Major);
+    }
+
+    /// R13-62. C posts ACKS whenever the acknowledge RULE fires
+    /// (recGbl.c:214-217) — `if (!ackt || new_sevr >= acks) { acks = new_sevr;
+    /// db_post_events(&acks, DBE_VALUE); }` — with no value-change test around
+    /// the post. A stat-only transition at constant severity therefore re-posts
+    /// an ACKS that is already equal to SEVR.
+    ///
+    /// Compiled C, `ACKT=1`, LINK_ALARM/INVALID → CALC_ALARM/INVALID (STAT
+    /// moves 14→12, SEVR stays 3, ACKS already 3):
+    ///
+    /// ```text
+    /// cycle2 posts:  stat(mask=5)  amsg(mask=5)  acks(mask=1)
+    /// ```
+    ///
+    /// Three events, ACKS among them. The pre-fix gate (`acks != sevr`)
+    /// emitted STAT and AMSG but not ACKS, so a `DBE_VALUE`-only `.ACKS`
+    /// subscriber missed it.
+    #[test]
+    fn reset_alarms_posts_acks_on_a_stat_only_transition_at_constant_severity() {
+        let mut common = CommonFields::default();
+        assert!(common.ackt, "ACKT defaults to true");
+
+        // cycle 1: LINK_ALARM / INVALID. Raises acks to INVALID.
+        rec_gbl_set_sevr_msg(
+            &mut common,
+            alarm_status::LINK_ALARM,
+            AlarmSeverity::Invalid,
+            "field INP",
+        );
+        let c1 = rec_gbl_reset_alarms(&mut common);
+        assert!(c1.acks_posted);
+        assert_eq!(common.acks, AlarmSeverity::Invalid);
+
+        // cycle 2: CALC_ALARM / INVALID — STAT moves, SEVR does not, and ACKS
+        // is ALREADY equal to SEVR. C's rule fires (`new_sevr >= acks`) and
+        // posts anyway.
+        rec_gbl_set_sevr_msg(
+            &mut common,
+            alarm_status::CALC_ALARM,
+            AlarmSeverity::Invalid,
+            "calcPerform",
+        );
+        let c2 = rec_gbl_reset_alarms(&mut common);
+        assert!(c2.alarm_changed, "STAT moved LINK -> CALC");
+        assert_eq!(common.sevr, c2.prev_sevr, "SEVR did not move");
+        assert_eq!(
+            common.acks,
+            AlarmSeverity::Invalid,
+            "ACKS value is unchanged — it was already equal"
+        );
+        assert!(
+            c2.acks_posted,
+            "C posts ACKS whenever the ack rule fires, not only on a value change"
+        );
+    }
+
+    /// The other half of the boundary: when the ack rule does NOT fire, there
+    /// is no ACKS event at all. `ackt=true` + a severity BELOW the remembered
+    /// `acks` misses both arms of `if (!ackt || new_sevr >= acks)`.
+    #[test]
+    fn reset_alarms_posts_no_acks_when_the_rule_does_not_fire() {
+        let mut common = CommonFields::default();
+        rec_gbl_set_sevr(&mut common, alarm_status::HIHI_ALARM, AlarmSeverity::Major);
+        rec_gbl_reset_alarms(&mut common);
+        assert_eq!(common.acks, AlarmSeverity::Major);
+
+        // MAJOR -> MINOR with ackt=true: rule does not fire, so no post.
+        rec_gbl_set_sevr(&mut common, alarm_status::HIGH_ALARM, AlarmSeverity::Minor);
+        let result = rec_gbl_reset_alarms(&mut common);
+        assert!(result.alarm_changed);
+        assert!(!result.acks_posted);
         assert_eq!(common.acks, AlarmSeverity::Major);
     }
 
@@ -534,7 +850,7 @@ mod tests {
 
         rec_gbl_set_sevr(&mut common, alarm_status::HIGH_ALARM, AlarmSeverity::Minor);
         let result = rec_gbl_reset_alarms(&mut common);
-        assert!(result.acks_changed);
+        assert!(result.acks_posted);
         assert_eq!(
             common.acks,
             AlarmSeverity::Minor,

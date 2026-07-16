@@ -1,23 +1,14 @@
 use std::any::Any;
+use std::sync::LazyLock;
 use std::time::Instant;
 
+use super::dbd_generated;
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::record::{FieldDesc, ProcessAction, ProcessOutcome, Record};
-use epics_base_rs::types::{DbFieldType, EpicsValue, PvString};
+use epics_base_rs::types::{EpicsValue, PvString};
 
 /// Maximum number of scaler channels.
 pub const MAX_SCALER_CHANNELS: usize = 64;
-
-/// Record-specific `DBF_MENU` choice tables, in `.dbd` value order (the
-/// index↔string mapping is wire-visible to clients). Source: the C
-/// `scalerRecord.dbd` menu definitions (scaler module). `CNT`/`PCNT` share
-/// `menu(scalerCNT)`; `CONT` is `menu(scalerCONT)`.
-const SCALER_CNT_CHOICES: &[&str] = &["Done", "Count"];
-const SCALER_CONT_CHOICES: &[&str] = &["OneShot", "AutoCount"];
-/// `D1`..`D64` count direction — `menu(scalerD1)` (`scalerRecord.dbd:9-12`).
-const SCALER_D_CHOICES: &[&str] = &["Up", "Dn"];
-/// `G1`..`G64` gate/preset enable — `menu(scalerG1)` (`scalerRecord.dbd:13-16`).
-const SCALER_G_CHOICES: &[&str] = &["N", "Y"];
 
 const VERSION: f32 = 3.19;
 
@@ -80,6 +71,21 @@ pub const CMD_AUTOCOUNT: &str = "scaler_autocount";
 ///   `DeviceSupport::handle_command()` AFTER process().
 ///
 /// **DLY/DLY1:** Implemented via `ProcessAction::ReprocessAfter`.
+///
+/// An armed user-count start delay: C's `pdelayCallback` watchdog as data.
+#[derive(Clone, Copy, Debug)]
+struct CountDelay {
+    start: Instant,
+    /// The delay the timer was armed with, in seconds.
+    secs: f64,
+}
+
+impl CountDelay {
+    fn expired(&self) -> bool {
+        self.start.elapsed().as_secs_f64() >= self.secs
+    }
+}
+
 pub struct ScalerRecord {
     // --- Control/Status ---
     pub val: f64,
@@ -112,6 +118,17 @@ pub struct ScalerRecord {
     pub nm: [PvString; MAX_SCALER_CHANNELS],
 
     // --- Delay tracking ---
+    //
+    // C runs TWO independent delay callbacks with two timers, and the port
+    // gives each its own cell so neither can retime or cancel the other:
+    //
+    //   * `pdelayCallback` / `delayCallbackFunc` (scalerRecord.c:216-231) —
+    //     the USER count start delay (DLY), armed by `special(CNT)`; tracked
+    //     by `count_delay`.
+    //   * `pauto_callback` / `autoCallbackFunc` (:233-240) — the AUTOCOUNT
+    //     restart hold (DLY1), armed by `process()`; tracked by
+    //     `delay_start` + `autocount_delay`.
+    /// Start instant of the current SCALER_STATE_WAITING autocount hold.
     delay_start: Option<Instant>,
     /// The autocount hold time (seconds) the current SCALER_STATE_WAITING
     /// period was scheduled with. C scalerRecord.c computes `dly_sec`
@@ -120,6 +137,14 @@ pub struct ScalerRecord {
     /// must compare elapsed time against the scheduled value, not the
     /// live `dly1` (which the user may change mid-wait).
     autocount_delay: f64,
+    /// The armed user-count start delay: C's `pdelayCallback` watchdog.
+    /// `Some` exactly while `us == USER_STATE_WAITING` with a timer pending;
+    /// `special(CNT)` arms it (`callbackRequestDelayed(pdelayCallback,
+    /// pscal->dly)`, scalerRecord.c:658-660), cancels it on an abort
+    /// (`epicsTimerCancel`, :645), and `process()` consumes it when the
+    /// scheduled interval has elapsed. `secs` is the delay the timer was armed
+    /// WITH — as in C, a DLY written mid-wait cannot retime the armed wait.
+    count_delay: Option<CountDelay>,
 
     // --- Done flag (set by device support read, consumed by process) ---
     /// Set by device support's read() when counting has completed.
@@ -136,13 +161,43 @@ pub struct ScalerRecord {
     /// as the true pre-guard baseline for `count_start_finalize_tp`.
     pub(crate) reqstart_old_pr1: u32,
 
-    /// Set by `special("CNT")` to request a `COUTP` link fire. C
-    /// `scalerRecord.c:623-624` calls `dbPutLink(&pscal->coutp, ...)`
-    /// inside `special()` itself, before the CNT-triggered `scanOnce()`.
-    /// `special()` here cannot emit `ProcessAction`s, so it raises this
-    /// flag and the CNT-triggered `process()` emits the `WriteDbLink`
-    /// and clears it.
-    coutp_pending: bool,
+    /// Carries C's `special()` COUTP put — and only that one.
+    ///
+    /// C `scalerRecord.c:623-624` calls `dbPutLink(&pscal->coutp, ...)` inside
+    /// `special()` itself, so the link is written — and its target processed —
+    /// while the scaler is still IDLE, before `:637` sets REQSTART and before
+    /// the CNT-triggered process cycle arms the count. The framework drains this
+    /// through [`Record::take_special_actions`] at the end of the put and
+    /// executes it there, which is that point.
+    ///
+    /// It is NOT the record's "should COUTP fire" state: C's other COUTP put
+    /// (`:463`, on the finish edge) is independent, is emitted by `process()` on
+    /// its own, and both fire on a user stop. Never merge the two.
+    special_actions: Vec<ProcessAction>,
+
+    /// The `db_post_events` calls C's `special()` made on the put now in flight,
+    /// handed to the framework by
+    /// [`Record::monitor_side_effect_fields`](crate::records::scaler::ScalerRecord).
+    ///
+    /// C `special()` posts these fields itself; none of them is `pp(TRUE)`, so no
+    /// process cycle would otherwise post them. `special()` is the single writer:
+    /// its `after == false` pre-pass — which the framework runs on EVERY put
+    /// (`field_io.rs:937`) — retires the previous put's list, and each `after`
+    /// arm records exactly what C's matching case posts.
+    side_effect_posts: &'static [&'static str],
+
+    /// The forward-link decision C makes *inside* `process()`.
+    ///
+    /// C `scalerRecord.c:470-481` calls `recGblFwdLink(pscal)` while
+    /// still in the middle of process — after `updateCounts()`, guarded
+    /// by `ss==IDLE && pcnt==0 && us==IDLE`, and **before** the
+    /// auto-count block (`:484-541`) re-arms and drives `ss` to WAITING
+    /// or COUNTING. The framework calls `should_fire_forward_link()`
+    /// only *after* `process()` returns, so re-reading `ss`/`us`/`pcnt`
+    /// there answers a different question than C asked. `process()` is
+    /// the single owner: it clears this flag on entry and sets it at
+    /// exactly C's `recGblFwdLink` line; the hook only reports it.
+    fire_fwd_link: bool,
 }
 
 impl ScalerRecord {
@@ -204,9 +259,12 @@ impl Default for ScalerRecord {
             nm: std::array::from_fn(|_| PvString::new()),
             delay_start: None,
             autocount_delay: 0.0,
+            count_delay: None,
             done_flag: false,
             reqstart_old_pr1: 0,
-            coutp_pending: false,
+            special_actions: Vec::new(),
+            side_effect_posts: &[],
+            fire_fwd_link: false,
         }
     }
 }
@@ -268,6 +326,18 @@ impl ScalerRecord {
             0
         } else {
             (self.nch as usize).min(MAX_SCALER_CHANNELS)
+        }
+    }
+
+    /// C's gate → direction copy, the single owner of `d[]`'s count-start value.
+    ///
+    /// C `scalerRecord.c:413-414` (REQSTART) and `:525-526` (auto-count re-arm)
+    /// both run `for (i=0; i<pscal->nch; i++) pdir[i] = pgate[i];` — the bound is
+    /// `nch`, not the physical array size, so `D` fields above the configured
+    /// channel count keep whatever the user last put there.
+    fn copy_gates_to_directions(&mut self) {
+        for i in 0..self.active_channels() {
+            self.d[i] = self.g[i];
         }
     }
 
@@ -406,7 +476,25 @@ impl ScalerRecord {
     /// (`scalerRecord.c:514-522`). It is dispatched as a single
     /// `CMD_AUTOCOUNT` whose `handle_command` reproduces
     /// `scalerRecord.c:510-535`.
-    fn build_autocount_actions(&self) -> Vec<ProcessAction> {
+    ///
+    /// The `D` fields are the record's, not the driver's: C sets them here in
+    /// `process()` (`:525`), exactly as it does at REQSTART (`:413`), so the
+    /// copy stays with the record and only the preset writes are dispatched.
+    fn build_autocount_actions(&mut self) -> Vec<ProcessAction> {
+        // C `scalerRecord.c:524-528` — below a millisecond, auto-count falls
+        // back on the *user's* per-channel presets, so the gates decide which
+        // channels count and the directions follow them:
+        //     for (i=0; i<pscal->nch; i++) {
+        //         pdir[i] = pgate[i];
+        //         if (pgate[i]) (*pdset->write_preset)(pscal, i, ppreset[i]);
+        //     }
+        // The copy is unconditional; only the preset write is gated. The
+        // `tp1 >= 1ms` branch (`:512-523`) programs channel 0 from `tp1*freq`
+        // "regardless of any presets the user may have set" (`:506-507`) and
+        // never touches `pdir`.
+        if self.tp1 < 1.0e-3 {
+            self.copy_gates_to_directions();
+        }
         let mut actions = vec![
             ProcessAction::DeviceCommand {
                 command: CMD_RESET,
@@ -432,163 +520,6 @@ impl ScalerRecord {
     }
 }
 
-// Full FIELDS including indexed fields
-use std::sync::LazyLock;
-
-static ALL_FIELDS: LazyLock<Vec<FieldDesc>> = LazyLock::new(|| {
-    let mut fields = vec![
-        FieldDesc {
-            name: "VAL",
-            dbf_type: DbFieldType::Double,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "FREQ",
-            dbf_type: DbFieldType::Double,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "CNT",
-            dbf_type: DbFieldType::Short,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "PCNT",
-            dbf_type: DbFieldType::Short,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "SS",
-            dbf_type: DbFieldType::Short,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "US",
-            dbf_type: DbFieldType::Short,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "CONT",
-            dbf_type: DbFieldType::Short,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "RATE",
-            dbf_type: DbFieldType::Float,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "RAT1",
-            dbf_type: DbFieldType::Float,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "DLY",
-            dbf_type: DbFieldType::Float,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "DLY1",
-            dbf_type: DbFieldType::Float,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "NCH",
-            dbf_type: DbFieldType::Short,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "TP",
-            dbf_type: DbFieldType::Double,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "TP1",
-            dbf_type: DbFieldType::Double,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "T",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "VERS",
-            dbf_type: DbFieldType::Float,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "PREC",
-            dbf_type: DbFieldType::Short,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "EGU",
-            dbf_type: DbFieldType::String,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "OUT",
-            dbf_type: DbFieldType::String,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "COUT",
-            dbf_type: DbFieldType::String,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "COUTP",
-            dbf_type: DbFieldType::String,
-            read_only: false,
-        },
-    ];
-    for i in 1..=MAX_SCALER_CHANNELS {
-        let s: &'static str = Box::leak(format!("S{}", i).into_boxed_str());
-        // S1..S64 are DBF_ULONG (scalerRecord.dbd:1334-1649) — 32-bit
-        // unsigned hardware counts; storage is already u32.
-        fields.push(FieldDesc {
-            name: s,
-            dbf_type: DbFieldType::ULong,
-            read_only: true,
-        });
-    }
-    for i in 1..=MAX_SCALER_CHANNELS {
-        let pr: &'static str = Box::leak(format!("PR{}", i).into_boxed_str());
-        // PR1..PR64 are DBF_ULONG (scalerRecord.dbd:945-1323).
-        fields.push(FieldDesc {
-            name: pr,
-            dbf_type: DbFieldType::ULong,
-            read_only: false,
-        });
-    }
-    for i in 1..=MAX_SCALER_CHANNELS {
-        let g: &'static str = Box::leak(format!("G{}", i).into_boxed_str());
-        fields.push(FieldDesc {
-            name: g,
-            dbf_type: DbFieldType::Short,
-            read_only: false,
-        });
-    }
-    for i in 1..=MAX_SCALER_CHANNELS {
-        let d: &'static str = Box::leak(format!("D{}", i).into_boxed_str());
-        fields.push(FieldDesc {
-            name: d,
-            dbf_type: DbFieldType::Short,
-            read_only: false,
-        });
-    }
-    for i in 1..=MAX_SCALER_CHANNELS {
-        let nm: &'static str = Box::leak(format!("NM{}", i).into_boxed_str());
-        fields.push(FieldDesc {
-            name: nm,
-            dbf_type: DbFieldType::String,
-            read_only: false,
-        });
-    }
-    fields
-});
-
 /// `S1..S{MAX_SCALER_CHANNELS}` field names, in channel order, for
 /// [`ScalerRecord::log_swept_fields`]. C `scalerRecord.c:770-787`
 /// `monitor()` sweeps each active channel `S1..Snch` with a literal
@@ -600,23 +531,83 @@ static SN_FIELD_NAMES: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
         .collect()
 });
 
-/// The scaler's value-change posts all use a literal `DBE_VALUE` in C
-/// (scalerRecord.c:316/322/329/334/372/425/427/430/478/530/582/588) —
-/// `DBE_LOG` appears only in the idle `monitor()` sweep (line 771,
-/// [`SN_FIELD_NAMES`]). The six scalar fields (always) plus the active
-/// `S1..Snch` channels are returned from `value_only_change_fields` so
-/// the framework strips the LOG bit from their change posts. The fixed
-/// names precede the `S1..S64` names contiguously so the slice
-/// `[0 .. 6 + nch]` yields the six scalars + active channels without a
-/// per-call allocation.
-static VALUE_ONLY_FIELD_NAMES: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
-    let mut v: Vec<&'static str> = vec!["CNT", "T", "VAL", "PR1", "TP", "FREQ"];
-    v.extend(SN_FIELD_NAMES.iter().copied());
-    v
+/// `[D{n}, G{n}]` per channel (0-based), the pair C's `special()` posts when a
+/// `PR{n}` write forces the channel on (`scalerRecord.c:702-706`).
+static DG_PAIR_BY_CHANNEL: LazyLock<Vec<&'static [&'static str]>> = LazyLock::new(|| {
+    (1..=MAX_SCALER_CHANNELS)
+        .map(|i| {
+            let d: &'static str = Box::leak(format!("D{}", i).into_boxed_str());
+            let g: &'static str = Box::leak(format!("G{}", i).into_boxed_str());
+            Box::leak(vec![d, g].into_boxed_slice()) as &'static [&'static str]
+        })
+        .collect()
 });
 
-/// Count of fixed scalar fields at the head of [`VALUE_ONLY_FIELD_NAMES`].
-const VALUE_ONLY_FIXED_COUNT: usize = 6;
+/// `[PR{n}]` per channel (0-based), the preset C's `special()` posts when a
+/// `G{n}` write defaults it to 1000 (`scalerRecord.c:715-718`).
+static PR_BY_CHANNEL: LazyLock<Vec<&'static [&'static str]>> = LazyLock::new(|| {
+    (1..=MAX_SCALER_CHANNELS)
+        .map(|i| {
+            let pr: &'static str = Box::leak(format!("PR{}", i).into_boxed_str());
+            Box::leak(vec![pr].into_boxed_slice()) as &'static [&'static str]
+        })
+        .collect()
+});
+
+/// Every scaler post outside the idle `monitor()` sweep carries a literal
+/// `DBE_VALUE` in C: the process/updateCounts posts
+/// (scalerRecord.c:316/322/329/334/372/425/427/430/478/530/582/588) and the
+/// `special()` posts (`:673-676` PR1/D1/G1, `:682-687` TP/D1/G1, `:692` TP,
+/// `:703-705` Dn/Gn, `:716` PRn). `DBE_LOG` appears ONLY in the `monitor()`
+/// sweep of `S1..Snch` (line 771, [`SN_FIELD_NAMES`]).
+///
+/// Returning a field here makes the framework strip the LOG bit from its
+/// change post and from its `special()` side-effect post, so a `DBE_LOG`-only
+/// subscriber sees `Sn` on the idle sweep alone — and never sees `PRn`/`Gn`/`Dn`
+/// at all, which is what C does with them.
+///
+/// Indexed by `nch`: entry `n` holds the five always-`DBE_VALUE` scalars, `PR1`
+/// (posted by process at `:425`/`:427` whatever `nch` is), and the per-channel
+/// `Sn`/`PRn`/`Gn`/`Dn` names for the `n` active channels. A table rather than a
+/// re-sliced flat static: the four per-channel groups cannot be contiguous for
+/// every `nch` at once.
+static VALUE_ONLY_BY_NCH: LazyLock<Vec<Vec<&'static str>>> = LazyLock::new(|| {
+    (0..=MAX_SCALER_CHANNELS)
+        .map(|nch| {
+            let mut v: Vec<&'static str> = vec!["CNT", "T", "VAL", "PR1", "TP", "FREQ"];
+            v.extend(SN_FIELD_NAMES.iter().take(nch).copied());
+            for ch in 0..nch {
+                // PR1 is already in the fixed head.
+                if ch > 0 {
+                    v.push(PR_BY_CHANNEL[ch][0]);
+                }
+                v.extend_from_slice(DG_PAIR_BY_CHANNEL[ch]);
+            }
+            v
+        })
+        .collect()
+});
+
+/// Every `db_post_events` C's scaler makes from a PROCESS cycle, enumerated —
+/// [`ScalerRecord::process_posted_fields`]. `process()`: `CNT` (:372), `PR1`
+/// (:425, only when the count-start recompute moved it), `TP` (:427), `FREQ`
+/// (:430, :530), `VAL` (:478), `S1..Snch` (:582), `T` (:588); `monitor()`:
+/// `S1..Snch` (:771). That is the whole list — C writes `D1..Dnch` in process
+/// (:413-414, :525-526) and posts none of them, and it posts `Gn`/`PRn`(n>1)
+/// only from `special()`.
+///
+/// Indexed by `nch`: the fixed head plus the `Sn` of the active channels, so
+/// the `Sn` of a channel the record does not have stays out of the set (C's
+/// post loops are bounded by `nch` too).
+static PROCESS_POSTED_BY_NCH: LazyLock<Vec<Vec<&'static str>>> = LazyLock::new(|| {
+    (0..=MAX_SCALER_CHANNELS)
+        .map(|nch| {
+            let mut v: Vec<&'static str> = vec!["VAL", "T", "CNT", "PR1", "TP", "FREQ"];
+            v.extend(SN_FIELD_NAMES.iter().take(nch).copied());
+            v
+        })
+        .collect()
+});
 
 impl Record for ScalerRecord {
     fn record_type(&self) -> &'static str {
@@ -625,10 +616,14 @@ impl Record for ScalerRecord {
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         let prev_scaler_state = self.ss;
+        // C fires the forward link (or does not) exactly once per
+        // process() cycle; every path that leaves process() without
+        // reaching `scalerRecord.c:480` leaves the link unfired.
+        self.fire_fwd_link = false;
         let mut just_finished_user_count = false;
         let mut just_started_user_count = false;
         let mut actions = Vec::new();
-        let mut fire_coutp = false;
+
         // C scalerRecord.c:346 — dbPutNotify completions also force the
         // long autocount hold time. The port has no putNotify plumbing
         // yet, so this stays false; kept named for C-structure parity.
@@ -649,30 +644,28 @@ impl Record for ScalerRecord {
             }
         }
 
-        // DLY-wait bridge. C scalerRecord.c handles the DLY delay in a
-        // separate `delayCallbackFunc` (scalerRecord.c:216-231): when the
-        // delay expires it sets `us = USER_STATE_REQSTART` and scanOnce()s
-        // the record. The port collapses that callback into process():
-        // while still WAITING, schedule a reprocess and return — counting
-        // has not started, so the rest of process() (CNT block, autocount)
-        // has nothing to do (the autocount block requires us==IDLE anyway,
-        // and the CNT block requires REQSTART/WAITING + cnt — handled on
-        // the post-expiry cycle).
+        // C `delayCallbackFunc` (scalerRecord.c:216-231), the body of the
+        // watchdog `special(CNT)` armed:
+        //
+        //     if (pscal->us == USER_STATE_WAITING && pscal->cnt) {
+        //         pscal->us = USER_STATE_REQSTART;
+        //         (void)scanOnce((void *)pscal);
+        //     }
+        //
+        // The timer that brings us here is armed in `special()` as a
+        // `ProcessAction::ReprocessAfter` — the single owner of the delayed
+        // start, exactly as `pdelayCallback` is in C. So this runs the
+        // callback's state transition and nothing else: a process cycle that
+        // lands MID-wait (a periodic scan, a device-done interrupt) falls
+        // straight through, as it does in C, where such a cycle finds
+        // `us == WAITING` outside `(REQSTART || WAITING) && cnt`'s start arm
+        // (:381-382) and just runs `updateCounts` (:453). It must NOT
+        // re-schedule the wait: a second timer would double-process at expiry.
         if self.us == USER_STATE_WAITING && self.cnt != 0 {
-            if let Some(start) = self.delay_start {
-                let dly = self.dly.max(0.0) as f64;
-                let elapsed = start.elapsed().as_secs_f64();
-                if elapsed >= dly {
+            if let Some(delay) = self.count_delay {
+                if delay.expired() {
                     self.us = USER_STATE_REQSTART;
-                    self.delay_start = None;
-                } else {
-                    // updateCounts with us==WAITING zeroes the displayed
-                    // counts (C scalerRecord.c:571-575).
-                    self.update_counts();
-                    let remaining = std::time::Duration::from_secs_f64(dly - elapsed);
-                    return Ok(ProcessOutcome::complete_with(vec![
-                        ProcessAction::ReprocessAfter(remaining),
-                    ]));
+                    self.count_delay = None;
                 }
             }
         }
@@ -705,10 +698,8 @@ impl Record for ScalerRecord {
                         self.pr[0] = expected_pr1;
                     }
 
-                    // Set directions from gates
-                    for i in 0..MAX_SCALER_CHANNELS {
-                        self.d[i] = self.g[i];
-                    }
+                    // Set directions from gates (C `scalerRecord.c:413-414`)
+                    self.copy_gates_to_directions();
 
                     // Queue reset → write_presets → arm via DeviceCommands
                     actions.extend(self.build_start_actions());
@@ -738,34 +729,35 @@ impl Record for ScalerRecord {
             actions.push(ProcessAction::ReprocessAfter(reprocess));
         }
 
-        // COUT/COUTP
+        // C scalerRecord.c:455-468 — COUT on either edge, then a SECOND COUTP put
+        // on the finish edge, `dbPutLink(&pscal->coutp, ...)` at :463. C does not
+        // coalesce it with special()'s put at :624: a user stop (CNT 1->0) runs
+        // special() — which puts 0 to COUTP — and then process(), which puts 0 to
+        // COUTP again, so the link is written TWICE and a record wired to it is
+        // processed twice. A user start reaches only special()'s put, because
+        // :463 is guarded by justFinishedUserCount.
         if just_started_user_count || just_finished_user_count {
             actions.push(ProcessAction::WriteDbLink {
                 link_field: "COUT",
                 value: EpicsValue::Short(self.cnt),
             });
             if just_finished_user_count {
-                fire_coutp = true;
+                actions.push(ProcessAction::WriteDbLink {
+                    link_field: "COUTP",
+                    value: EpicsValue::Short(self.cnt),
+                });
             }
         }
-        // C scalerRecord.c:623-624 — `special("CNT")` fires COUTP on every
-        // CNT write; `special()` deferred it to this CNT-triggered process.
-        if self.coutp_pending {
-            self.coutp_pending = false;
-            fire_coutp = true;
-        }
-        if fire_coutp {
-            actions.push(ProcessAction::WriteDbLink {
-                link_field: "COUTP",
-                value: EpicsValue::Short(self.cnt),
-            });
-        }
 
-        // VAL = T on completion
+        // C scalerRecord.c:470-481 — "done counting?": while ss==IDLE,
+        // VAL takes T if we just left COUNTING, and `recGblFwdLink()`
+        // fires. Both are decided HERE, before the auto-count block
+        // below re-arms `ss`.
         if self.ss == SCALER_STATE_IDLE && self.pcnt == 0 && self.us == USER_STATE_IDLE {
             if prev_scaler_state == SCALER_STATE_COUNTING {
                 self.val = self.t;
             }
+            self.fire_fwd_link = true;
         }
 
         // AutoCount — C scalerRecord.c:484-541.
@@ -815,8 +807,23 @@ impl Record for ScalerRecord {
         Ok(ProcessOutcome::complete_with(actions))
     }
 
+    /// C's `special()` COUTP put (`scalerRecord.c:623-624`), handed to the
+    /// framework to execute where C executes it: inside the put, before the
+    /// CNT-triggered process cycle. The queue is filled by `special()` and
+    /// emptied here — the framework drains it on every put, so a put that queues
+    /// nothing hands back nothing.
+    fn take_special_actions(&mut self) -> Vec<ProcessAction> {
+        std::mem::take(&mut self.special_actions)
+    }
+
     fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
         if !after {
+            // The framework runs this pre-pass on every put (field_io.rs:937),
+            // so it is the one point that retires the previous put's post list.
+            // Each `after` arm below then records the db_post_events C's matching
+            // case makes; an arm that records nothing leaves the list empty,
+            // which is C's "this case posts nothing".
+            self.side_effect_posts = &[];
             return Ok(());
         }
         match field {
@@ -828,10 +835,15 @@ impl Record for ScalerRecord {
                     return Ok(());
                 }
                 // C:623-624 — fire the COUTP link on every CNT write that
-                // passes the redundant-command guard. `special()` cannot
-                // emit actions; raise a flag the CNT-triggered `process()`
-                // turns into a `WriteDbLink`.
-                self.coutp_pending = true;
+                // passes the redundant-command guard. C makes this put from
+                // `special()` itself, i.e. inside `dbPut`: the target is written
+                // and processed with `us` still IDLE and the count not yet
+                // armed. The framework drains `take_special_actions()` at the
+                // end of the put and executes it there.
+                self.special_actions.push(ProcessAction::WriteDbLink {
+                    link_field: "COUTP",
+                    value: EpicsValue::Short(self.cnt),
+                });
                 // C:633-634 — `dly = pscal->dly; if (dly<0.0) dly = 0.0;`
                 let dly = self.dly.max(0.0);
                 // C:635 — `if (dly == 0.0 || pscal->cnt == 0)`: handle now.
@@ -844,8 +856,13 @@ impl Record for ScalerRecord {
                         match self.us {
                             USER_STATE_WAITING => {
                                 // C:643-647 — cancel the pending delay
-                                // watchdog (delayCallbackFunc).
-                                self.delay_start = None;
+                                // watchdog (`epicsTimerCancel`). The armed
+                                // `ReprocessAfter` still fires, but it finds
+                                // no `count_delay` and `us == IDLE`, so the
+                                // `delayCallbackFunc` transition below is a
+                                // no-op — C's own `us == WAITING && cnt`
+                                // guard is what makes a raced callback safe.
+                                self.count_delay = None;
                                 self.us = USER_STATE_IDLE;
                             }
                             USER_STATE_REQSTART => {
@@ -854,24 +871,78 @@ impl Record for ScalerRecord {
                             _ => {}
                         }
                     }
+                    // C:655 — `if (pscal->scan) scanOnce((void *)pscal);`,
+                    // the last statement of the handle-it-now arm. The state
+                    // change above (REQSTART / abort) is acted on by
+                    // `process()`, and a non-Passive scaler gets no process
+                    // from this put — without the scan-once it would sit on
+                    // the new state until the next periodic scan. The
+                    // `if (pscal->scan)` half of the guard belongs to the
+                    // framework (see `ProcessAction::ScanOnce`), which drops
+                    // the action for a Passive record whose put processes it
+                    // anyway. Not emitted in the delayed arm below: C does not
+                    // call `scanOnce` there either — `delayCallbackFunc` does,
+                    // when the delay expires.
+                    self.special_actions.push(ProcessAction::ScanOnce);
                 } else {
-                    // C:657-661 — schedule the delayed start callback.
+                    // C:657-661 — schedule the delayed start callback:
+                    // `pscal->us = USER_STATE_WAITING;
+                    //  callbackRequestDelayed(pdelayCallback, pscal->dly);`
+                    //
+                    // The timer is the ONLY thing that starts the count. C's
+                    // `delayCallbackFunc` (:216-231) calls `scanOnce`
+                    // UNCONDITIONALLY on expiry — no `if (pscal->scan)` guard,
+                    // unlike the handle-it-now arm above — so a Passive scaler
+                    // AND a periodically-scanned one both start counting
+                    // exactly DLY seconds after the CNT write. Without this
+                    // action the port armed nothing: a non-Passive scaler got
+                    // no process from the put and sat in WAITING until its next
+                    // periodic scan (SCAN=I/O Intr / Event: forever).
                     self.us = USER_STATE_WAITING;
-                    self.delay_start = Some(Instant::now());
+                    let secs = dly as f64;
+                    self.count_delay = Some(CountDelay {
+                        start: Instant::now(),
+                        secs,
+                    });
+                    self.special_actions.push(ProcessAction::ReprocessAfter(
+                        std::time::Duration::from_secs_f64(secs),
+                    ));
                 }
             }
-            // C scalerRecord.c:664-668 — CONT just rescans; the framework
-            // handles process-passive rescan, so nothing to do here.
-            "CONT" => {}
+            // C scalerRecord.c:664-668 — CONT. The write changes auto-count
+            // mode, which only `process()` acts on, so C rescans the record:
+            // `if (pscal->scan) scanOnce((void *)pscal);` (:667). A Passive
+            // scaler is processed by the put itself (CONT is `pp(TRUE)`) and the
+            // framework drops the action for it — same gate C writes inline.
+            "CONT" => {
+                self.special_actions.push(ProcessAction::ScanOnce);
+            }
             // C scalerRecord.c:670-677 — TP (truncating tp->pr1, d1=g1=1).
             "TP" => {
                 self.tp_to_pr1();
+                // C:673-676 — PR1, D1 and G1 are posted unconditionally.
+                self.side_effect_posts = &["PR1", "D1", "G1"];
             }
             // C has NO special() case for TP1 or RAT1 — leave unchanged.
             "TP1" => {}
             // C scalerRecord.c:690-693 — RATE clamped to [0, 60].
             "RATE" => {
                 self.rate = self.rate.clamp(0.0, 60.0);
+                // DEVIATION from C, deliberate — CBUG-B18. C's case is
+                // `pscal->rate = MIN(60.,MAX(0.,pscal->rate));
+                //  db_post_events(pscal,&(pscal->tp),DBE_VALUE);` — the clamp
+                // writes RATE, the post passes `&pscal->tp`, a field this write
+                // never touched. A slip, not a convention: it is a copy-paste of
+                // the TP case's post two cases up, and every `special()` post in
+                // this file exists to announce the OTHER fields a case changed
+                // (`:672-676` TP→PR1/D1/G1, `:681-686`, `:703-706`, `:717-719`).
+                // The clamp changes RATE and nothing else, and the written field
+                // is already posted by `dbPut` itself — `db_post_events(precord,
+                // pfieldsave, DBE_VALUE|DBE_LOG)` at dbAccess.c:1455-1459, which
+                // runs AFTER `dbPutSpecial(paddr, 1)` and so carries the CLAMPED
+                // value. So the correct side-effect list is empty, and C's post
+                // is pure noise: a no-change TP event on every RATE write.
+                self.side_effect_posts = &[];
             }
             _ => {
                 if field == "PR1" {
@@ -879,15 +950,23 @@ impl Record for ScalerRecord {
                     if self.tp > 0.0 {
                         self.d[0] = 1;
                         self.g[0] = 1;
+                        // C:682-687 — TP always, D1/G1 only when TP came out > 0.
+                        self.side_effect_posts = &["TP", "D1", "G1"];
+                    } else {
+                        self.side_effect_posts = &["TP"];
                     }
                 } else if let Some(i) = parse_indexed_field(field, "PR") {
                     if self.pr[i] > 0 {
                         self.d[i] = 1;
                         self.g[i] = 1;
+                        // C:703-705 — the forced-on channel's Dn and Gn.
+                        self.side_effect_posts = DG_PAIR_BY_CHANNEL[i];
                     }
                 } else if let Some(i) = parse_indexed_field(field, "G") {
                     if self.g[i] != 0 && self.pr[i] == 0 {
                         self.pr[i] = 1000;
+                        // C:716-717 — the preset this write just defaulted.
+                        self.side_effect_posts = PR_BY_CHANNEL[i];
                     }
                 }
             }
@@ -896,7 +975,11 @@ impl Record for ScalerRecord {
     }
 
     fn should_fire_forward_link(&self) -> bool {
-        self.ss == SCALER_STATE_IDLE && self.us == USER_STATE_IDLE && self.pcnt == 0
+        // Report the decision `process()` captured at C's
+        // `recGblFwdLink` line; do NOT re-evaluate `ss`/`us`/`pcnt`
+        // here — under CONT=AutoCount the auto-count block has already
+        // moved `ss` to WAITING/COUNTING by the time the framework asks.
+        self.fire_fwd_link
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
@@ -1122,9 +1205,8 @@ impl Record for ScalerRecord {
         }
     }
 
-    fn field_list(&self) -> &'static [FieldDesc] {
-        let fields: &Vec<FieldDesc> = &ALL_FIELDS;
-        unsafe { std::slice::from_raw_parts(fields.as_ptr(), fields.len()) }
+    fn declared_fields(&self) -> &'static [FieldDesc] {
+        dbd_generated::SCALER_FIELDS
     }
 
     /// C `scalerRecord.c:471,770-787`: `process()` calls `monitor()` only
@@ -1133,10 +1215,24 @@ impl Record for ScalerRecord {
     /// change — so an archiver `camonitor SCALER:Sn` receives an event on
     /// every idle scan, even when the count is unchanged. A counting or
     /// WAITING cycle does not call `monitor()`, so the sweep is empty
-    /// there. The framework's snapshot builder posts each returned field
-    /// with `DBE_LOG` only (a field that also changed this cycle is
-    /// already delivered with `DBE_VALUE|DBE_LOG`, so it is not
-    /// double-posted). Slicing the static `SN_FIELD_NAMES` to `nch`
+    /// there.
+    ///
+    /// The sweep is INDEPENDENT of the change post, and the
+    /// count-completion cycle is where that matters: the done-interrupt
+    /// sets `ss = IDLE` (`:367`), `updateCounts()` posts each changed `Sn`
+    /// with `DBE_VALUE` (`:582`), and `monitor()` then posts the SAME `Sn`
+    /// with `DBE_LOG` (`:771`). Both events fire on that one cycle, so the
+    /// framework emits the sweep post in addition to the change post — the
+    /// final counts are the only `Sn` value a `DBE_LOG`-only archiver ever
+    /// cares about.
+    ///
+    /// The framework posts this sweep with `DBE_LOG | <alarm-transition bits>`.
+    /// DEVIATION from C, deliberate — CBUG-B19: C's `monitor()` computes
+    /// `monitor_mask = recGblResetAlarms(pscal)` (`:764`), ORs `DBE_VALUE|DBE_LOG`
+    /// into it (`:766`), and then posts with a literal `DBE_LOG` (`:771`) —
+    /// `monitor_mask` is never read, so the alarm bit is dropped and a client
+    /// subscribed to `Sn` with `DBE_ALARM` receives nothing on a severity
+    /// transition. Slicing the static `SN_FIELD_NAMES` to `nch`
     /// avoids a per-call allocation; the unsafe `'static` re-view matches
     /// `field_list` above (the `LazyLock` lives for the program and
     /// `active_channels() <= SN_FIELD_NAMES.len()`).
@@ -1149,44 +1245,52 @@ impl Record for ScalerRecord {
         }
     }
 
-    /// C `scalerRecord.c` posts CNT/T/VAL/PR1/TP/FREQ and each active
-    /// channel `S1..Snch` with a literal `DBE_VALUE` on a value change
-    /// (scalerRecord.c:316/322/329/334/372/425/427/430/478/530/582/588) —
-    /// `DBE_LOG` is reserved for the idle sweep ([`Self::log_swept_fields`],
-    /// line 771). Returning these here makes the framework strip the LOG
-    /// bit from their change posts (and from `VAL`'s deadband post), so a
-    /// `DBE_LOG`-only subscriber sees `Sn` only on the idle sweep — never
-    /// on a counting-cycle value change, matching C. Unlike the idle-only
-    /// `log_swept_fields`, this set is state-independent: the six scalar
-    /// posts are always `DBE_VALUE`. Slicing the contiguous static to
-    /// `VALUE_ONLY_FIXED_COUNT + nch` avoids a per-call allocation (same
-    /// `'static` re-view as `log_swept_fields`; the `LazyLock` lives for
-    /// the program and `active_channels() <= SN_FIELD_NAMES.len()`).
+    /// Every C scaler post outside the idle `monitor()` sweep is a literal
+    /// `DBE_VALUE` — see [`VALUE_ONLY_BY_NCH`], which lists them. The framework
+    /// strips the LOG bit from the change post (and from `VAL`'s deadband post,
+    /// and from the `special()` side-effect posts in
+    /// [`Self::monitor_side_effect_fields`]) of every field returned here, so a
+    /// `DBE_LOG`-only subscriber sees `Sn` on the idle sweep alone and never
+    /// sees `PRn`/`Gn`/`Dn`, matching C.
     fn value_only_change_fields(&self) -> &'static [&'static str] {
-        let names: &Vec<&'static str> = &VALUE_ONLY_FIELD_NAMES;
-        unsafe {
-            std::slice::from_raw_parts(
-                names.as_ptr(),
-                VALUE_ONLY_FIXED_COUNT + self.active_channels(),
-            )
-        }
+        &VALUE_ONLY_BY_NCH[self.active_channels()]
     }
 
-    /// `CNT`/`PCNT` are `DBF_MENU menu(scalerCNT)`; `CONT` is
-    /// `menu(scalerCONT)`; `D1`..`D64` are `menu(scalerD1)` (Up/Dn) and
-    /// `G1`..`G64` are `menu(scalerG1)` (N/Y) (C `scalerRecord.dbd`). Served
-    /// as `DBR_ENUM` with the menu's choice labels in `.dbd` index order.
-    fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
-        match field {
-            "CNT" | "PCNT" => Some(SCALER_CNT_CHOICES),
-            "CONT" => Some(SCALER_CONT_CHOICES),
-            // D{n}/G{n} are indexed menu fields; reuse the same 1..=64
-            // index parser the get/put paths use so "DLY"/"DLY1" (which
-            // start with 'D' but are not indexed) do not falsely match.
-            _ if parse_indexed_field(field, "D").is_some() => Some(SCALER_D_CHOICES),
-            _ if parse_indexed_field(field, "G").is_some() => Some(SCALER_G_CHOICES),
-            _ => None,
-        }
+    /// C's scaler posts a FIXED list from a process cycle (see
+    /// [`PROCESS_POSTED_BY_NCH`]) and leaves every other field it wrote silent.
+    /// Declaring that list closes the spurious-event family the framework's
+    /// generic "post whatever changed" rule opened:
+    ///
+    /// * `D1..Dnch` — `process()` copies the gates into them on every count
+    ///   start (`scalerRecord.c:413-414`, `:525-526`) and posts NOTHING; C's
+    ///   only `Dn` posts are in `special()` (`:675`, `:685`, `:704`). The port
+    ///   change-detected the copy and fired a `Dn` monitor C never sends.
+    ///
+    /// `G1..Gnch` and `PR2..PRnch` stay outside the set for the same C reason —
+    /// `process()` posts no `Gn` at all, and `PRn` only for n = 1 — NOT to
+    /// compensate for a framework defect: the put-time double post (R11-C10,
+    /// `last_posted` not advanced by the put's own post) is fixed at the
+    /// framework, in `RecordInstance::notify_field_with_origin`.
+    ///
+    /// `PR1` stays in the set: C's `process()` does post it (`:425`), when the
+    /// count-start preset recompute moved it.
+    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
+        Some(&PROCESS_POSTED_BY_NCH[self.active_channels()])
+    }
+
+    /// The `db_post_events` calls C's `special()` makes inline, for the put that
+    /// just ran. `special()` is their single owner: it knows which posts each
+    /// case made and records them; this hook only hands the list to the
+    /// framework, which posts each one. The list cannot be re-derived from record
+    /// state here — C posts `PRn` on a `Gn` write only when that write is what
+    /// defaulted it to 1000, which the post-put state no longer distinguishes.
+    ///
+    /// These lists carry the OTHER fields a case changed — the written field is
+    /// posted by the put itself (C `dbPut`, dbAccess.c:1455-1459). So `RATE`,
+    /// whose clamp changes only `RATE`, contributes nothing; C posts an untouched
+    /// `TP` there, which is CBUG-B18 (see the deviation note at that case).
+    fn monitor_side_effect_fields(&self, _put_field: &str) -> &'static [&'static str] {
+        self.side_effect_posts
     }
 
     fn as_any_mut(&mut self) -> Option<&mut dyn Any> {
@@ -1238,39 +1342,61 @@ mod menu_choice_tests {
         );
     }
 
+    /// The choices a client sees are the DECLARATION's — `scalerRecord.dbd`'s
+    /// `menu()` on each field. This used to assert them through
+    /// `Record::menu_field_choices`, a hand-written table that declared the
+    /// same menus a second time.
     #[test]
-    fn scaler_menu_field_choices_match_dbd() {
+    fn scaler_menu_choices_come_from_the_declaration() {
+        use epics_base_rs::server::record::FieldDeclaration;
         let rec = ScalerRecord::default();
-        assert_eq!(rec.menu_field_choices("CNT"), Some(&["Done", "Count"][..]));
-        assert_eq!(rec.menu_field_choices("PCNT"), Some(&["Done", "Count"][..]));
-        assert_eq!(rec.menu_field_choices("VAL"), None);
+        let menu = |name: &str| {
+            rec.field_list()
+                .iter()
+                .find(|f| f.name == name)
+                .unwrap_or_else(|| panic!("{name} is declared"))
+                .menu
+        };
+        assert_eq!(menu("CNT"), Some(&["Done", "Count"][..]));
+        assert_eq!(menu("PCNT"), Some(&["Done", "Count"][..]));
+        assert_eq!(menu("VAL"), None);
     }
 
-    // D1..D64 are menu(scalerD1) (Up/Dn); G1..G64 are menu(scalerG1) (N/Y).
-    // The whole indexed range must resolve, while the 'D'-prefixed non-menu
-    // fields DLY/DLY1 must NOT falsely match the direction menu.
+    /// `D1..D64` are `menu(scalerD1)` (Up/Dn) and `G1..G64` are `menu(scalerG1)`
+    /// (N/Y) — declared field by field in the `.dbd`, so the whole indexed range
+    /// carries its menu and the `D`-prefixed non-menu fields (`DLY`, `DLY1`)
+    /// cannot falsely match: they are separate declarations, not a prefix rule.
+    /// The hand-written table resolved these by parsing the field NAME, which is
+    /// why it needed a guard against `DLY`/`DLY1` at all.
     #[test]
-    fn scaler_direction_gate_menu_choices_match_dbd() {
+    fn scaler_indexed_menu_choices_come_from_the_declaration() {
+        use epics_base_rs::server::record::FieldDeclaration;
         let rec = ScalerRecord::default();
+        let menu = |name: &str| {
+            rec.field_list()
+                .iter()
+                .find(|f| f.name == name)
+                .map(|f| f.menu)
+        };
         for i in 1..=super::MAX_SCALER_CHANNELS {
             assert_eq!(
-                rec.menu_field_choices(&format!("D{i}")),
-                Some(&["Up", "Dn"][..]),
+                menu(&format!("D{i}")),
+                Some(Some(&["Up", "Dn"][..])),
                 "D{i} must serve menu(scalerD1)"
             );
             assert_eq!(
-                rec.menu_field_choices(&format!("G{i}")),
-                Some(&["N", "Y"][..]),
+                menu(&format!("G{i}")),
+                Some(Some(&["N", "Y"][..])),
                 "G{i} must serve menu(scalerG1)"
             );
         }
-        // 'D'-prefixed non-indexed fields are not direction menus.
-        assert_eq!(rec.menu_field_choices("DLY"), None);
-        assert_eq!(rec.menu_field_choices("DLY1"), None);
-        // Out-of-range indices do not resolve.
-        assert_eq!(rec.menu_field_choices("D0"), None);
-        assert_eq!(rec.menu_field_choices("D65"), None);
-        assert_eq!(rec.menu_field_choices("G65"), None);
+        // 'D'-prefixed non-indexed fields are declared, and carry no menu.
+        assert_eq!(menu("DLY"), Some(None));
+        assert_eq!(menu("DLY1"), Some(None));
+        // Out-of-range indices are not fields at all.
+        assert_eq!(menu("D0"), None);
+        assert_eq!(menu("D65"), None);
+        assert_eq!(menu("G65"), None);
     }
 
     // A G{n} field served as Short is promoted to DBR_ENUM by the base

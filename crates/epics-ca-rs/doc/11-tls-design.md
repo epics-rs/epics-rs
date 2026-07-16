@@ -256,7 +256,8 @@ let tls = TlsConfig::client_mtls(roots, client_cert, client_key)?;
 
 When mTLS is in effect, the server's per-client `state.hostname` is
 populated from the client cert's Subject Alternative Name (or CN as
-fallback), regardless of `EPICS_CAS_USE_HOST_NAMES`. ACF rules can
+fallback). The identity is *pinned*: neither `asCheckClientIP` mode
+applies and `CA_PROTO_HOST_NAME` cannot replace it. ACF rules can
 match on this verified identity:
 
 ```
@@ -310,10 +311,10 @@ in `handle_client`.
 
 After a successful TLS handshake the server side calls
 `stream.peer_certificates()` to extract the client cert, parses the
-CN/SAN, and stores it in `ClientState::hostname`. The
-`CA_PROTO_HOST_NAME` opcode is then ignored regardless of
-`EPICS_CAS_USE_HOST_NAMES` (the cert-derived identity is always more
-trustworthy).
+CN/SAN, and stores it in `ClientState::hostname` as
+`HostIdentity::Pinned`. A later `CA_PROTO_HOST_NAME` is then ignored by
+construction — `HostIdentity::claim` is a no-op on a pinned identity — so
+the cert-derived identity always wins, whatever `asCheckClientIP` says.
 
 ## Migration path
 

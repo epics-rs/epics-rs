@@ -14,7 +14,9 @@
 use std::sync::Mutex;
 
 use super::registry::*;
-use crate::server::access_security::{AccessLevel, AccessSecurityConfig, parse_acf};
+use crate::server::access_security::{
+    AccessLevel, AccessSecurityConfig, as_check_client_ip, parse_acf, set_as_check_client_ip,
+};
 
 /// Process-global access-security shell state. Mirrors the
 /// `asDbLib.c` file-scope globals (`acf`, `substitutions`).
@@ -36,6 +38,7 @@ fn as_state() -> &'static Mutex<AsState> {
 
 /// Register the `as*` command family on `registry`.
 pub(crate) fn register(registry: &mut CommandRegistry) {
+    registry.register(cmd_as_check_client_ip());
     registry.register(cmd_as_set_filename());
     registry.register(cmd_as_set_substitutions());
     registry.register(cmd_as_init());
@@ -46,6 +49,55 @@ pub(crate) fn register(registry: &mut CommandRegistry) {
     registry.register(cmd_aspmem());
     registry.register(cmd_astac());
     registry.register(cmd_ascar());
+}
+
+/// `asCheckClientIP [0|1]` — read or set C's `asCheckClientIP` global.
+///
+/// C registers it as an iocsh *variable* (`libComRegister.c:476`), so a C
+/// startup script says `var asCheckClientIP 1`. This port has no iocsh
+/// variable mechanism, so the same knob is a command; with no argument it
+/// prints the current setting.
+///
+/// `0` (the default, and C's) — HAG members are host *names* and the CA
+/// server trusts the hostname the client claims over `CA_PROTO_HOST_NAME`.
+/// `1` — HAG members are resolved to IPs at ACF-load time and the CA
+/// server uses the peer IP, ignoring the claimed name.
+///
+/// Order matters exactly as in C: the HAG storage form is chosen when the
+/// ACF is parsed, so this must run **before** `asInit`.
+fn cmd_as_check_client_ip() -> CommandDef {
+    CommandDef::new(
+        "asCheckClientIP",
+        vec![ArgDesc {
+            name: "on",
+            arg_type: ArgType::Int,
+            optional: true,
+        }],
+        "asCheckClientIP [0|1] — 0 (default): match HAGs by client-claimed host name. \
+         1: resolve HAG hosts to IPs and match the peer IP. Set before asInit.",
+        |args: &[ArgValue], ctx: &CommandContext| {
+            match args.first() {
+                Some(ArgValue::Int(v)) => {
+                    set_as_check_client_ip(*v != 0);
+                    ctx.println(&format!(
+                        "asCheckClientIP = {} — HAG hosts are matched by {}. \
+                         Run asInit after this to (re)load the ACF in the matching form.",
+                        i64::from(as_check_client_ip()),
+                        if as_check_client_ip() {
+                            "peer IP"
+                        } else {
+                            "client-supplied host name"
+                        }
+                    ));
+                }
+                _ => ctx.println(&format!(
+                    "asCheckClientIP = {}",
+                    i64::from(as_check_client_ip())
+                )),
+            }
+            Ok(CommandOutcome::Continue)
+        },
+    )
 }
 
 /// `asSetFilename <ascf>` — record the ACF path. No immediate effect;
@@ -327,7 +379,7 @@ fn cmd_aspmem() -> CommandDef {
                 if let Some(rec) = ctx.block_on(ctx.db().get_record(rec_name)) {
                     let inst = ctx.block_on(rec.read());
                     by_asg
-                        .entry(inst.common.asg.clone())
+                        .entry(inst.common.access_group().to_string())
                         .or_default()
                         .push(rec_name.clone());
                 }
@@ -386,7 +438,7 @@ fn cmd_astac() -> CommandDef {
             let (asg, asl) = match ctx.block_on(ctx.db().get_record(&record)) {
                 Some(rec) => {
                     let inst = ctx.block_on(rec.read());
-                    (inst.common.asg.clone(), inst.common.asl)
+                    (inst.common.access_group().to_string(), inst.common.asl)
                 }
                 None => {
                     ctx.println(&format!("astac: record '{record}' not found"));

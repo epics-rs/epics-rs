@@ -1,6 +1,5 @@
 #![allow(unused_imports)]
 use epics_base_rs::error::{CaError, CaResult};
-use epics_base_rs::server::record::FieldDesc;
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
 use crate::coordinate;
@@ -8,638 +7,11 @@ use crate::fields::*;
 use crate::flags::*;
 
 use super::MotorRecord;
+use super::dbd_generated::MOTOR_FIELDS;
 
 /// The motorRecord version this port tracks (C `#define VERSION 7.4`,
 /// stamped into VERS at init_record:608; SPC_NOMOD).
 const MOTOR_RECORD_VERSION: f32 = 7.4;
-
-pub(crate) static FIELDS: &[FieldDesc] = &[
-    // Position
-    FieldDesc {
-        name: "VAL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "RBV",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "RLV",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OFF",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DIFF",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "RDIF",
-        dbf_type: DbFieldType::Int64,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "DVAL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DRBV",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "RVAL",
-        dbf_type: DbFieldType::Int64,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "RRBV",
-        dbf_type: DbFieldType::Int64,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "RMP",
-        dbf_type: DbFieldType::Int64,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "REP",
-        dbf_type: DbFieldType::Int64,
-        read_only: true,
-    },
-    // Conversion
-    FieldDesc {
-        name: "DIR",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "FOFF",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "FOF",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "VOF",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SET",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SSET",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SUSE",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "IGSET",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "MRES",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ERES",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SREV",
-        dbf_type: DbFieldType::Long,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "UREV",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "UEIP",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "URIP",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "RRES",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "RDBL_VAL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "RSTM",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LOADPOS_BLOCK",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    // Velocity
-    FieldDesc {
-        name: "VELO",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "VBAS",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "VMAX",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "S",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SBAS",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SMAX",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ACCL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ACCS",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ACCU",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "BVEL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "BACC",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "HVEL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "JVEL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "JAR",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SBAK",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    // Retry
-    FieldDesc {
-        name: "BDST",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "FRAC",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "RDBD",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SPDB",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "RTRY",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "RMOD",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "RCNT",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "MISS",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-    // Limits
-    FieldDesc {
-        name: "HLM",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LLM",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DHLM",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DLLM",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    // C dbd (2e89b552): RHLM/RLLM are SPC_NOMOD — runtime writes are
-    // refused; only a database field() load lands in them.
-    FieldDesc {
-        name: "RHLM",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "RLLM",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "LVIO",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "HLS",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "LLS",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "RHLS",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "RLLS",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "VERS",
-        dbf_type: DbFieldType::Float,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "HLSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    // Control
-    FieldDesc {
-        name: "SPMG",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "STOP",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "HOMF",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "HOMR",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "JOGF",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "JOGR",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "TWF",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "TWR",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "TWV",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "CNEN",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    // Status
-    FieldDesc {
-        name: "DMOV",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "MOVN",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "MSTA",
-        dbf_type: DbFieldType::Long,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "MIP",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "CDIR",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "TDIR",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "ATHM",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "STUP",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "RVEL",
-        dbf_type: DbFieldType::Int64,
-        read_only: true,
-    },
-    // PID
-    FieldDesc {
-        name: "PCOF",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ICOF",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DCOF",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    // Display
-    FieldDesc {
-        name: "EGU",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "PREC",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ADEL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "MDEL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    // Sync trigger (write-only semantic; C: 82c26005)
-    FieldDesc {
-        name: "SYNC",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    // Timing
-    FieldDesc {
-        name: "DLY",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "NTM",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "NTMF",
-        dbf_type: DbFieldType::UShort,
-        read_only: false,
-    },
-    // Public C motorRecord.dbd link / menu surface (motorRecord.dbd:233-265,
-    // 739-760). DBF_INLINK/DBF_OUTLINK fields appear over CA as DBF_STRING (the
-    // link specification); DBF_MENU OMSL appears as the menuOmsl index.
-    FieldDesc {
-        name: "OUT",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "RDBL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DOL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "RLNK",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "STOO",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DINP",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "RINP",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "POST",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OMSL",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    // Public C motorRecord.dbd alarm-limit / operator-range surface
-    // (motorRecord.dbd:370-441). HHSV/LLSV are menuAlarmSevr indices.
-    FieldDesc {
-        name: "HIHI",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "HIGH",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LOW",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LOLO",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "HHSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LLSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "HOPR",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LOPR",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    // Public C motorRecord.dbd last-value / monitor-map surface
-    // (motorRecord.dbd:560-595, 675-682, 829-836). All SPC_NOMOD → read-only.
-    FieldDesc {
-        name: "LVAL",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "LDVL",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "LRVL",
-        dbf_type: DbFieldType::Int64,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "LRLV",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "ALST",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "MLST",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "MMAP",
-        dbf_type: DbFieldType::Long,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "NMAP",
-        dbf_type: DbFieldType::Long,
-        read_only: true,
-    },
-];
 
 pub(crate) fn motor_get_field(rec: &MotorRecord, name: &str) -> Option<EpicsValue> {
     match name {
@@ -1290,9 +662,11 @@ pub(crate) fn motor_put_field(
                     if urev_abs > 0.0 {
                         rec.vel.s = rec.vel.velo / urev_abs;
                     }
+                    // C: 7291b556 — recalc ACCL/ACCS based on ACCU. Also
+                    // special()-only: a load must leave the accel pair raw
+                    // (see `motor_sync_speed_at_init`).
+                    apply_accu_cascade(rec);
                 }
-                // C: 7291b556 — recalc ACCL/ACCS based on ACCU
-                apply_accu_cascade(rec);
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
@@ -1309,9 +683,7 @@ pub(crate) fn motor_put_field(
                     if urev_abs > 0.0 {
                         rec.vel.sbas = rec.vel.vbas / urev_abs;
                     }
-                }
-                apply_accu_cascade(rec);
-                if rec.internal.init_invariants_synced {
+                    apply_accu_cascade(rec);
                     // C motorRecord.cc:3121-3127: a VBAS raised above VMAX
                     // drags VMAX (and SMAX) up with it.
                     if rec.vel.vmax != 0.0 && rec.vel.vbas > rec.vel.vmax {
@@ -1358,9 +730,9 @@ pub(crate) fn motor_put_field(
                     if urev_abs > 0.0 {
                         rec.vel.velo = rec.vel.s * urev_abs;
                     }
+                    // C motorRecord.cc:2710: ACCL/ACCS follow the VELO change.
+                    apply_accu_cascade(rec);
                 }
-                // C motorRecord.cc:2710: ACCL/ACCS follow the VELO change.
-                apply_accu_cascade(rec);
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
@@ -1377,10 +749,8 @@ pub(crate) fn motor_put_field(
                     if urev_abs > 0.0 {
                         rec.vel.vbas = rec.vel.sbas * urev_abs;
                     }
-                }
-                // C motorRecord.cc:2655: ACCL/ACCS follow the VBAS change.
-                apply_accu_cascade(rec);
-                if rec.internal.init_invariants_synced {
+                    // C motorRecord.cc:2655: ACCL/ACCS follow the VBAS change.
+                    apply_accu_cascade(rec);
                     // C motorRecord.cc:3121-3127 (shared VBAS/SBAS tail).
                     if rec.vel.vmax != 0.0 && rec.vel.vbas > rec.vel.vmax {
                         rec.vel.vmax = rec.vel.vbas;
@@ -1417,22 +787,20 @@ pub(crate) fn motor_put_field(
         },
         "ACCL" => match value {
             EpicsValue::Double(v) => {
+                rec.vel.accl = v;
                 // C special() motorRecordACCL (motorRecord.cc:2735-2742): floor
                 // ACCL to 0.1 if <= 0, then updateACCSfromACCL. ACCU is NOT
                 // touched — 63bfe5d0 made ACCU a user/autosave control and
                 // dropped the 36177f7b auto-switch from the accel helpers.
-                rec.vel.accl = if v <= 0.0 { 0.1 } else { v };
-                // C updateACCSfromACCL (motorRecord.cc:512-521): numerator is
-                // (velo - vbas) only while velo > vbas; at velo <= vbas C uses
-                // the full velo and still recomputes ACCS.
-                let vbas = rec.effective_vbas();
-                let numerator = if rec.vel.velo > vbas {
-                    rec.vel.velo - vbas
-                } else {
-                    rec.vel.velo
-                };
-                if rec.vel.accl > 0.0 {
-                    rec.vel.accs = numerator / rec.vel.accl;
+                // special() never runs during dbLoadRecords, so a load stores
+                // the field() value raw and leaves ACCS alone —
+                // `motor_sync_speed_at_init` reconciles the pair, keying on
+                // "did the .db set ACCS" exactly as C does.
+                if rec.internal.init_invariants_synced {
+                    if rec.vel.accl <= 0.0 {
+                        rec.vel.accl = 0.1;
+                    }
+                    update_accs_from_accl(rec);
                 }
                 Ok(())
             }
@@ -1445,23 +813,13 @@ pub(crate) fn motor_put_field(
                 // from ACCL (updateACCSfromACCL, accs = velo/accl — NOT a
                 // literal 1.0), then recomputes ACCL from ACCS
                 // (updateACCLfromACCS). ACCU is NOT touched (63bfe5d0 dropped
-                // the 36177f7b auto-switch).
+                // the 36177f7b auto-switch). Runtime-only, as for ACCL.
                 rec.vel.accs = v;
-                // C numerator is (velo - vbas) only while velo > vbas; at
-                // velo <= vbas C uses the full velo.
-                let vbas = rec.effective_vbas();
-                let numerator = if rec.vel.velo > vbas {
-                    rec.vel.velo - vbas
-                } else {
-                    rec.vel.velo
-                };
-                // updateACCSfromACCL: sanitize a non-positive ACCS from ACCL.
-                if rec.vel.accs <= 0.0 && rec.vel.accl > 0.0 {
-                    rec.vel.accs = numerator / rec.vel.accl;
-                }
-                // updateACCLfromACCS: keep ACCL consistent with ACCS.
-                if rec.vel.accs > 0.0 {
-                    rec.vel.accl = numerator / rec.vel.accs;
+                if rec.internal.init_invariants_synced {
+                    if rec.vel.accs <= 0.0 {
+                        update_accs_from_accl(rec);
+                    }
+                    update_accl_from_accs(rec);
                 }
                 Ok(())
             }
@@ -2095,29 +1453,47 @@ fn put_link_string(value: EpicsValue, slot: &mut String, name: &str) -> CaResult
     }
 }
 
-/// Recalc the slave of ACCL/ACCS after VELO or VBAS changes.
-/// C: `7291b556` (2023-05-19) — when ACCU=Accl, ACCS follows; when ACCU=Accs, ACCL follows.
-fn apply_accu_cascade(rec: &mut MotorRecord) {
-    // C updateACCL_ACCSfromVELO (motorRecord.cc:523-546): the accel-rate
-    // numerator is (velo - vbas) only while velo > vbas; at velo <= vbas C
-    // uses the full velo, and recomputes/posts the slave field in BOTH cases.
+/// The acceleration-rate numerator every ACCL↔ACCS conversion divides by its
+/// partner: `(velo - vbas)` while `velo > vbas`, else the full `velo`. C repeats
+/// this ternary in `updateACCLfromACCS` / `updateACCSfromACCL` /
+/// `updateACCL_ACCSfromVELO` (motorRecord.cc:499-546); one owner here so the
+/// three cannot drift.
+fn accel_numerator(rec: &MotorRecord) -> f64 {
     let vbas = rec.effective_vbas();
-    let numerator = if rec.vel.velo > vbas {
+    if rec.vel.velo > vbas {
         rec.vel.velo - vbas
     } else {
         rec.vel.velo
-    };
+    }
+}
+
+/// C `updateACCLfromACCS` (motorRecord.cc:499-510): ACCS is the master, ACCL
+/// follows. A non-positive ACCS leaves ACCL alone (C's `accs > 0.0` guard).
+fn update_accl_from_accs(rec: &mut MotorRecord) {
+    if rec.vel.accs > 0.0 {
+        rec.vel.accl = accel_numerator(rec) / rec.vel.accs;
+    }
+}
+
+/// C `updateACCSfromACCL` (motorRecord.cc:512-521): ACCL is the master, ACCS
+/// follows. The `accl > 0.0` guard is Rust-side: C divides unconditionally, and
+/// every C caller has already floored ACCL to 0.1 — the guard keeps a raw
+/// `field(ACCL,"0")` load from producing an infinite ACCS before the init floor
+/// runs, and is unreachable on the runtime paths.
+fn update_accs_from_accl(rec: &mut MotorRecord) {
+    if rec.vel.accl > 0.0 {
+        rec.vel.accs = accel_numerator(rec) / rec.vel.accl;
+    }
+}
+
+/// Recalc the slave of ACCL/ACCS after VELO or VBAS changes.
+/// C: `7291b556` (2023-05-19) — when ACCU=Accl, ACCS follows; when ACCU=Accs, ACCL follows.
+fn apply_accu_cascade(rec: &mut MotorRecord) {
+    // C updateACCL_ACCSfromVELO (motorRecord.cc:523-546): recomputes/posts the
+    // ACCU-named slave field in both the velo > vbas and velo <= vbas cases.
     match rec.vel.accu {
-        AccsUsed::Accl => {
-            if rec.vel.accl > 0.0 {
-                rec.vel.accs = numerator / rec.vel.accl;
-            }
-        }
-        AccsUsed::Accs => {
-            if rec.vel.accs > 0.0 {
-                rec.vel.accl = numerator / rec.vel.accs;
-            }
-        }
+        AccsUsed::Accl => update_accs_from_accl(rec),
+        AccsUsed::Accs => update_accl_from_accs(rec),
     }
 }
 
@@ -2281,11 +1657,23 @@ pub(crate) fn motor_sync_speed_at_init(rec: &mut MotorRecord) {
             rec.vel.sbak = rec.vel.bvel / urev_abs;
         }
     }
-    // ACCS <-> ACCL. C keys on ACCS > 0 — its dbd default is 0, so nonzero
-    // means the .db set it (motorRecord.cc:4033-4047). The Rust default
-    // ACCS is derived (nonzero), so the master is whichever field ACCU
-    // names; the .db loading ACCS or ACCU flips it to Accs.
-    apply_accu_cascade(rec);
+    // ACCS <-> ACCL, C check_speed_and_resolution (motorRecord.cc:4033-4047).
+    // The key is `accs > 0.0` — the loaded ACCS value — NOT ACCU: ACCS's dbd
+    // default is 0.0 (as is `VelocityFields::default`), the accel cross-calcs
+    // are special()-only and so never fire during dbLoadRecords, and therefore
+    // a nonzero ACCS here can only mean the .db wrote `field(ACCS,…)`. It then
+    // wins and ACCL is derived from it; otherwise ACCL is the master (floored
+    // to 0.1 first, C:4041-4045) and ACCS is derived. ACCU stays a pure
+    // user/autosave control (63bfe5d0) — it selects the master only for the
+    // *runtime* VELO/VBAS cascade (`apply_accu_cascade`), not at init.
+    if rec.vel.accs > 0.0 {
+        update_accl_from_accs(rec);
+    } else {
+        if rec.vel.accl == 0.0 {
+            rec.vel.accl = 0.1;
+        }
+        update_accs_from_accl(rec);
+    }
 
     // C motorRecord.cc:4054-4067 — jog/home velocity sanity checks, after
     // the speed pairs and accelerations settle. A zero field means "not
@@ -2496,7 +1884,7 @@ fn precision_for(rec: &MotorRecord, field: &str) -> Option<i16> {
     match field {
         "RRBV" | "RMP" | "REP" => Some(0),
         "VERS" => Some(2),
-        _ => match FIELDS.iter().find(|f| f.name == field)?.dbf_type {
+        _ => match MOTOR_FIELDS.iter().find(|f| f.name == field)?.dbf_type {
             DbFieldType::Short
             | DbFieldType::Long
             | DbFieldType::Int64
@@ -2543,7 +1931,7 @@ fn limits_for(rec: &MotorRecord, field: &str) -> Option<(f64, f64)> {
             }
         }
         "VELO" => Some((rec.vel.vmax, rec.vel.vbas)),
-        _ => match FIELDS.iter().find(|f| f.name == field)?.dbf_type {
+        _ => match MOTOR_FIELDS.iter().find(|f| f.name == field)?.dbf_type {
             DbFieldType::Char | DbFieldType::UChar => Some((255.0, 0.0)),
             DbFieldType::Short => Some((32767.0, -32768.0)),
             DbFieldType::Enum | DbFieldType::UShort => Some((65535.0, 0.0)),

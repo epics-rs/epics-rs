@@ -384,8 +384,9 @@ fn fan_out(clients: &mut HashMap<u16, RepeaterClient>, src: SocketAddr, data: &[
 /// that isn't multicast is silently skipped. Logs warnings for join failures
 /// but never aborts: the repeater keeps running for unicast/broadcast beacons.
 fn join_beacon_multicast_groups(sock: &socket2::Socket) {
-    let list = epics_base_rs::runtime::env::get("EPICS_CAS_BEACON_ADDR_LIST")
-        .or_else(|| epics_base_rs::runtime::env::get("EPICS_CA_ADDR_LIST"));
+    let list = epics_base_rs::runtime::env_table::EPICS_CAS_BEACON_ADDR_LIST
+        .get()
+        .or_else(|| epics_base_rs::runtime::env_table::EPICS_CA_ADDR_LIST.get());
     let Some(list) = list else {
         return;
     };
@@ -417,80 +418,103 @@ const MAX_REPEATER_CLIENTS: usize = 1024;
 fn register_client_debug(clients: &mut HashMap<u16, RepeaterClient>, src: SocketAddr, debug: u8) {
     let port = src.port();
     let was_registered = clients.contains_key(&port);
-    register_client(clients, src);
+    register_client(clients, src, debug);
     if !was_registered && debug >= 1 && clients.contains_key(&port) {
         eprintln!("New client on port {port}");
         eprintln!("Verified {} active clients", clients.len());
     }
 }
 
-fn register_client(clients: &mut HashMap<u16, RepeaterClient>, src: SocketAddr) {
-    let port = src.port();
-
-    // Already registered — just re-send confirm
-    if let Some(client) = clients.get(&port) {
-        client.send_confirm();
-        return;
-    }
-
-    // Cap-and-prune: when full, drop entries whose verify() fails
-    // (peer process exited / port reused) to make room. This is the
-    // Without it a misbehaving local process can grow the
-    // HashMap up to 65 535 entries.
-    if clients.len() >= MAX_REPEATER_CLIENTS {
-        let dead: Vec<u16> = clients
-            .iter()
-            .filter(|(_, c)| !c.verify())
-            .map(|(p, _)| *p)
-            .collect();
-        for p in dead {
-            clients.remove(&p);
-        }
-        if clients.len() >= MAX_REPEATER_CLIENTS {
-            // All slots are alive — refuse the new client. The peer
-            // sees no CONFIRM and will retry; on a typical retry
-            // window an alive client will have moved to dead by then.
-            return;
-        }
-    }
-
-    // Create per-client connected socket (matches C EPICS repeater)
-    let client = match RepeaterClient::new(src) {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-
-    if !client.send_confirm() {
-        return;
-    }
-
-    clients.insert(port, client);
-
-    // Send VERSION noop to all other clients so we don't accumulate
-    // sockets when there are no beacons (matches C EPICS).
-    let noop = CaHeader::new(CA_PROTO_VERSION);
-    let noop_bytes = noop.to_bytes();
-    let mut dead = Vec::new();
-    for (p, c) in clients.iter() {
-        if *p == port {
-            continue;
-        }
-        if !c.send_message(&noop_bytes) {
-            if !c.verify() {
-                dead.push(*p);
-            }
-        }
-    }
+/// C `verifyClients` (`repeater.cpp:317-335`) — bind-test EVERY registered
+/// client and reap the ones whose port is now free.
+///
+/// This is unconditional: it does NOT wait for a send to fail. C's own
+/// comment at the call site (`repeater.cpp:475-479`) gives the reason —
+/// "an ICMP error return does not get through to send(), which returns no
+/// error code" on some platforms — so send-failure reaping alone leaks stale
+/// clients there. Returns the number of clients reaped.
+fn verify_clients(clients: &mut HashMap<u16, RepeaterClient>) -> usize {
+    let dead: Vec<u16> = clients
+        .iter()
+        .filter(|(_, c)| !c.verify())
+        .map(|(p, _)| *p)
+        .collect();
+    let reaped = dead.len();
     for p in dead {
         clients.remove(&p);
+    }
+    reaped
+}
+
+/// C `register_new_client` (`repeater.cpp:366-487`), in C's order:
+/// find-or-create → sendConfirm (removing the client on failure, whether it
+/// is new or not) → noop fan-out to every OTHER client (on EVERY
+/// registration, so a repeat registration still exercises their sockets) →
+/// `verifyClients` when this registration created a client.
+fn register_client(clients: &mut HashMap<u16, RepeaterClient>, src: SocketAddr, debug: u8) {
+    let port = src.port();
+
+    let mut new_client = false;
+    if !clients.contains_key(&port) {
+        // Rust-only soft cap (C has none): sweep first so a full table of
+        // departed clients still admits a live one.
+        if clients.len() >= MAX_REPEATER_CLIENTS {
+            verify_clients(clients);
+            if clients.len() >= MAX_REPEATER_CLIENTS {
+                // All slots are alive — refuse the new client. The peer
+                // sees no CONFIRM and retries (every 1 s, per
+                // `repeaterSubscribeTimer`), so it gets in as soon as a
+                // slot frees.
+                return;
+            }
+        }
+        // Per-client connected socket, as C's `repeaterClient::connect`.
+        let client = match RepeaterClient::new(src) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        clients.insert(port, client);
+        new_client = true;
+    }
+
+    // C `repeater.cpp:453-467`: a client whose CONFIRM cannot be sent is
+    // removed — including an ALREADY-REGISTERED one, which the pre-fix Rust
+    // kept (it returned early after `send_confirm()`, ignoring the result).
+    let confirmed = clients.get(&port).is_some_and(|c| c.send_confirm());
+    if !confirmed {
+        clients.remove(&port);
+        if debug >= 1 {
+            eprintln!("Deleted repeater client on port {port}, error sending ack");
+        }
+    }
+
+    // C `repeater.cpp:469-474`: "send a noop message to all other clients so
+    // that we don't accumulate sockets when there are no beacons". Sent on
+    // every registration message, not only on the one that created a client
+    // — and clients now re-register once a second until confirmed (R6-22),
+    // so this is the sweep that runs in a beacon-less network.
+    let noop = CaHeader::new(CA_PROTO_VERSION);
+    fan_out(clients, src, &noop.to_bytes(), debug);
+
+    // C `repeater.cpp:476-486`: the bind-test sweep, run whenever a
+    // registration created a client, and deliberately AFTER the confirm above
+    // so the new client is never reaped before it is acknowledged.
+    if new_client {
+        let reaped = verify_clients(clients);
+        if debug >= 1 && reaped > 0 {
+            eprintln!("Reaped {reaped} departed client(s) on new registration");
+        }
     }
 }
 
 /// Try to register with an existing repeater. If none is running, spawn one
 /// as a background process using the current executable's `ca-repeater` binary,
 /// then register again.
-pub async fn ensure_repeater() {
-    if try_register().await.is_ok() {
+/// `repeater_port` is the client's single resolution of
+/// `EPICS_CA_REPEATER_PORT` (C `udpiiu::repeaterPort`, `udpiiu.cpp:168`) —
+/// both the pre-spawn and the post-spawn attempt reuse it.
+pub async fn ensure_repeater(repeater_port: u16) {
+    if try_register(repeater_port).await.is_ok() {
         return;
     }
 
@@ -499,11 +523,11 @@ pub async fn ensure_repeater() {
 
     // Give it a moment to start, then register
     epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(50)).await;
-    let _ = try_register().await;
+    let _ = try_register(repeater_port).await;
 }
 
 /// Send a REPEATER_REGISTER to localhost:5065 and wait for CONFIRM.
-async fn try_register() -> Result<(), ()> {
+async fn try_register(repeater_port: u16) -> Result<(), ()> {
     let socket = UdpSocket::bind("0.0.0.0:0").await.map_err(|_| ())?;
     // SO_RXQ_OVFL opt-in for diagnostic parity with the long-running
     // repeater; the brief CONFIRM wait below ignores the counter
@@ -520,11 +544,11 @@ async fn try_register() -> Result<(), ()> {
     let mut hdr = CaHeader::new(CA_PROTO_REPEATER_REGISTER);
     hdr.available = u32::from_be_bytes(local_ip.octets());
 
-    // Client REGISTER target: same env override as the daemon bind
-    // above, so a non-default repeater port stays consistent on both
-    // ends. C libca `udpiiu.cpp:168` reads the same env var via
-    // `envGetInetPortConfigParam`.
-    let repeater_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, repeater_port());
+    // Client REGISTER target: the port the caller resolved once (C
+    // `udpiiu::repeaterPort`, `udpiiu.cpp:168`), so the register attempt
+    // and the daemon bind agree and a misconfigured value is diagnosed
+    // once per process rather than once per attempt.
+    let repeater_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, repeater_port);
     socket
         .send_to(&hdr.to_bytes(), repeater_addr)
         .await
@@ -728,5 +752,95 @@ mod tests {
             ),
             "expected a read timeout for the self-skip case, got {err:?}"
         );
+    }
+
+    /// R6-27: C runs `verifyClients()` — a bind test on EVERY registered
+    /// client — whenever a registration creates a client
+    /// (`repeater.cpp:476-486`), regardless of whether any send failed. The
+    /// pre-fix Rust reaped only on send failure, and `send_message` treats
+    /// just ECONNREFUSED / EHOSTUNREACH as gone; on a platform that never
+    /// surfaces the ICMP error (C names HP-UX and Solaris) the departed
+    /// client stayed registered until the 1024-entry cap.
+    ///
+    /// Here the departed client's socket is CLOSED but its address is still
+    /// in the table — `send_message` to it succeeds (a connected UDP send to
+    /// a free loopback port does not fail synchronously on the first datagram
+    /// here), so only the bind-test sweep can reap it.
+    #[test]
+    fn new_registration_bind_test_sweeps_departed_clients() {
+        // A departed client: bind to learn a port, then drop the socket so the
+        // port is free — exactly what `verify()`'s bind test detects.
+        let departed_port = {
+            let s = StdUdpSocket::bind("127.0.0.1:0").expect("bind departed");
+            s.local_addr().unwrap().port()
+        };
+        let departed = src_v4(127, 0, 0, 1, departed_port);
+
+        // A live client, still holding its port.
+        let live_sock = StdUdpSocket::bind("127.0.0.1:0").expect("bind live");
+        let live = live_sock.local_addr().unwrap();
+
+        let mut clients: HashMap<u16, RepeaterClient> = HashMap::new();
+        clients.insert(
+            departed_port,
+            RepeaterClient::new(departed).expect("departed client sock"),
+        );
+        clients.insert(live.port(), RepeaterClient::new(live).expect("live sock"));
+        assert_eq!(clients.len(), 2);
+
+        // A brand-new client registers. C: newClient ⇒ verifyClients().
+        let newcomer_sock = StdUdpSocket::bind("127.0.0.1:0").expect("bind newcomer");
+        let newcomer = newcomer_sock.local_addr().unwrap();
+        register_client(&mut clients, newcomer, 0);
+
+        assert!(
+            !clients.contains_key(&departed_port),
+            "a client whose port is free must be reaped by the bind-test sweep \
+             on the next new registration, even though no send failed"
+        );
+        assert!(
+            clients.contains_key(&live.port()),
+            "the live client must survive the sweep"
+        );
+        assert!(
+            clients.contains_key(&newcomer.port()),
+            "the registering client must be present and confirmed"
+        );
+    }
+
+    /// A REPEAT registration from an already-registered client re-sends the
+    /// CONFIRM and still fans the noop out to the others
+    /// (`repeater.cpp:469-474`) — the pre-fix Rust returned early after the
+    /// confirm, so with clients re-registering every second (R6-22) the
+    /// "don't accumulate sockets when there are no beacons" sweep never ran.
+    #[test]
+    fn repeat_registration_still_fans_the_noop_to_other_clients() {
+        let other = StdUdpSocket::bind("127.0.0.1:0").expect("bind other");
+        other
+            .set_read_timeout(Some(std::time::Duration::from_millis(750)))
+            .unwrap();
+        let other_addr = other.local_addr().unwrap();
+
+        let repeat_sock = StdUdpSocket::bind("127.0.0.1:0").expect("bind repeat");
+        let repeat_addr = repeat_sock.local_addr().unwrap();
+
+        let mut clients: HashMap<u16, RepeaterClient> = HashMap::new();
+        clients.insert(
+            other_addr.port(),
+            RepeaterClient::new(other_addr).expect("other sock"),
+        );
+        clients.insert(
+            repeat_addr.port(),
+            RepeaterClient::new(repeat_addr).expect("repeat sock"),
+        );
+
+        register_client(&mut clients, repeat_addr, 0);
+
+        let mut buf = [0u8; 64];
+        let n = other
+            .recv(&mut buf)
+            .expect("a repeat registration must still noop-fan-out to other clients");
+        let hdr = CaHeader::from_bytes(&buf[..n]).expect("noop parses");
+        assert_eq!(hdr.cmmd, CA_PROTO_VERSION, "the noop is a VERSION frame");
     }
 }

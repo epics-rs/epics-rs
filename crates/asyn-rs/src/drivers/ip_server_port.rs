@@ -50,18 +50,26 @@ use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 // parking_lot::Mutex — consistent with the rest of asyn-rs and
 // poison-tolerant: a panic in a worker thread cannot poison the lock
 // and take out the port (std::sync::Mutex would).
 use parking_lot::Mutex;
 
-use crate::drivers::ip_port::{is_nonfatal_read_timeout, maxchars_zero_error, socket_poll_timeout};
+use crate::asyn_trace;
+use crate::drivers::ip_port::{
+    DrvAsynIPPort, is_nonfatal_read_timeout, maxchars_zero_error, socket_poll_timeout,
+};
+use crate::drivers::option_parse::parse_yn_option;
 use crate::error::{AsynError, AsynResult, AsynStatus};
 use crate::exception::AsynException;
+use crate::interfaces::InterfaceType;
 use crate::interpose::{EomReason, OctetReadResult};
-use crate::port::{PortDriver, PortDriverBase, PortFlags};
+use crate::interrupt::{InterruptManager, InterruptValue, OctetFanOut};
+use crate::param::ParamValue;
+use crate::port::{ExceptionAnnouncer, PortDriver, PortDriverBase, PortFlags};
+use crate::trace::{TraceManager, TraceMask};
 use crate::user::AsynUser;
 
 /// Maximum simultaneous accepted clients. Keeps the slot table
@@ -113,6 +121,13 @@ pub struct IpServerConfig {
     /// Slot table cap — see [`DEFAULT_MAX_CLIENTS`]. Ignored in UDP
     /// mode (no per-peer slots).
     pub max_clients: usize,
+    /// C `tty->noProcessEos` — the sixth `drvAsynIPServerPortConfigure`
+    /// argument, whose ONLY use in C is to be handed to each child port's
+    /// `drvAsynIPPortConfigure` (drvAsynIPServerPort.c:688-694). It lives on the
+    /// server's config because that is what it governs: whether the ports the
+    /// server creates get C's default EOS interpose. A server therefore cannot
+    /// exist without having decided its children's EOS policy.
+    pub no_process_eos: bool,
     /// Per-accepted-connection read timeout. Affects the worker
     /// task's `set_read_timeout`; defaults to no timeout (block until
     /// data or EOF).
@@ -216,8 +231,46 @@ impl IpServerConfig {
             bind_port: port,
             protocol,
             max_clients: DEFAULT_MAX_CLIENTS,
+            // C's default: `drvAsynIPServerPortConfigure` with a zero/omitted
+            // noProcessEos gives every child the EOS interpose.
+            no_process_eos: false,
             read_timeout: None,
         })
+    }
+}
+
+/// A socket failure on a client slot, and what it did to the slot.
+///
+/// The `closed` half is not advice: [`ClientSlot::read_or_close`] /
+/// [`ClientSlot::write_or_close`] have *already* dropped the socket when it is
+/// set — C decides the teardown and the reported status in one statement
+/// (drvAsynIPPort.c:797-806), so no caller can take the error and forget the
+/// `closeConnection`. What is left to the owner is the disconnect exception
+/// fan-out, which differs by port shape: the parent announces on the client's
+/// `addr`, the child port announces on its own single device and drops its
+/// port-level connected flag.
+struct SlotFailure {
+    closed: bool,
+    error: AsynError,
+}
+
+impl SlotFailure {
+    /// The socket survives — C's `asynTimeout` branch, and the pre-socket
+    /// refusals (`maxchars == 0`, no client in the slot).
+    fn kept(error: AsynError) -> Self {
+        Self {
+            closed: false,
+            error,
+        }
+    }
+
+    /// C ran `closeConnection`: the slot is free and the port owes the
+    /// disconnect exception.
+    fn closed(error: AsynError) -> Self {
+        Self {
+            closed: true,
+            error,
+        }
     }
 }
 
@@ -231,6 +284,23 @@ impl IpServerConfig {
 pub struct ClientSlot {
     stream: Mutex<Option<TcpStream>>,
     peer: Mutex<Option<SocketAddr>>,
+    /// The slot's occupancy, and — because the child port shares this very cell
+    /// ([`PortDriverBase::share_connection`]) — the child port's `connected` flag.
+    /// They are one bit, so "the slot holds a live client while `parent:N` reports
+    /// `asynDisconnected`" cannot be constructed (R13-50).
+    ///
+    /// C reaches the same invariant by message: on slot reuse the listener sets
+    /// `pl->fd = clientFd` and calls `pasynCommonSyncIO->connectDevice(pl->pasynUser)`
+    /// on the child (drvAsynIPServerPort.c:357-367), and it is the child's own
+    /// `isConnected` that the listener's free-slot scan then reads (:342-350).
+    /// Assignment and connectivity are not allowed to disagree in C either.
+    occupied: Arc<AtomicBool>,
+    /// C `tty->disconnectOnReadTimeout` on this slot's child port
+    /// (drvAsynIPPort.c:924-935, set through `asynSetOption`). It lives on the
+    /// slot, not on a client, because C's child port outlives the connections it
+    /// serves: the option a startup script sets on `srv:0` still holds for the
+    /// next client that lands in slot 0.
+    disconnect_on_read_timeout: AtomicBool,
 }
 
 impl ClientSlot {
@@ -238,25 +308,194 @@ impl ClientSlot {
         Self {
             stream: Mutex::new(None),
             peer: Mutex::new(None),
+            occupied: Arc::new(AtomicBool::new(false)),
+            disconnect_on_read_timeout: AtomicBool::new(false),
         }
     }
 
+    /// C `tty->disconnectOnReadTimeout` for this slot's child port.
+    fn set_disconnect_on_read_timeout(&self, yes: bool) {
+        self.disconnect_on_read_timeout
+            .store(yes, Ordering::Release);
+    }
+
+    fn disconnect_on_read_timeout(&self) -> bool {
+        self.disconnect_on_read_timeout.load(Ordering::Acquire)
+    }
+
     fn is_occupied(&self) -> bool {
-        self.stream.lock().is_some()
+        self.occupied.load(Ordering::Acquire)
+    }
+
+    /// The cell the child port binds its `connected` flag to.
+    fn connection_cell(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.occupied)
     }
 
     fn assign(&self, stream: TcpStream, peer: SocketAddr) {
         *self.stream.lock() = Some(stream);
         *self.peer.lock() = Some(peer);
+        // Publish last: the socket and the peer are in place before any observer
+        // (the child port's actor, the parent's free-slot scan) can see the slot
+        // as occupied.
+        self.occupied.store(true, Ordering::Release);
     }
 
     fn clear(&self) {
         *self.stream.lock() = None;
         *self.peer.lock() = None;
+        self.occupied.store(false, Ordering::Release);
     }
 
     fn peer_addr(&self) -> Option<SocketAddr> {
         *self.peer.lock()
+    }
+
+    /// Read from this slot, applying C's failed-read rule and performing the
+    /// `closeConnection` half of it — the single owner of "a client slot dies on
+    /// a read", shared by the parent's addressed read
+    /// ([`DrvAsynIPServerPort::base_read_octet`]) and the child port's
+    /// ([`DrvAsynIPSubport::read_octet`]).
+    ///
+    /// C serves each accepted connection with a full `drvAsynIPPort` child
+    /// (drvAsynIPServerPort.c:681-708), so the read that runs is
+    /// `drvAsynIPPort`'s `readIt`: it calls `closeConnection` on a TCP EOF
+    /// (:815-820) **and** on every errno that is not `EWOULDBLOCK`/`EINTR`
+    /// (:797-806), and `closeConnection` destroys the socket and issues
+    /// `exceptionDisconnect` (:206-217).
+    ///
+    /// That teardown is what frees the slot: the listener reuses a slot exactly
+    /// when its child port reports `isConnected() == false`
+    /// (drvAsynIPServerPort.c:344-350). The port tore down on EOF only, so a
+    /// client whose socket died mid-read — `ECONNRESET`, `EPIPE`, a NAT drop —
+    /// kept its slot forever, and once the table filled no client could
+    /// reconnect.
+    fn read_or_close(
+        &self,
+        buf: &mut [u8],
+        timeout: Duration,
+        device: &str,
+    ) -> Result<usize, SlotFailure> {
+        // C readRaw (drvAsynIPPort.c:736-740): reject maxchars == 0 before
+        // touching the socket; an empty buffer would otherwise read Ok(0) and be
+        // misclassified as a peer EOF, tearing down a healthy connection.
+        if buf.is_empty() {
+            return Err(SlotFailure::kept(maxchars_zero_error()));
+        }
+        let mut guard = self.stream.lock();
+        let Some(stream) = guard.as_mut() else {
+            return Err(SlotFailure::kept(AsynError::Status {
+                status: AsynStatus::Disconnected,
+                message: format!("{device} has no client"),
+            }));
+        };
+        // C parity: the child `drvAsynIPPort`'s `readRaw` floors a zero request
+        // timeout to a 1 ms poll (drvAsynIPPort.c:741-743) and re-applies it on
+        // every read. `socket_poll_timeout` is the shared owner of that mapping;
+        // setting it unconditionally (rather than skipping on `timeout == 0`)
+        // keeps a poll request a 1 ms poll instead of blocking on the accept-time
+        // timeout.
+        if let Err(e) = stream.set_read_timeout(Some(socket_poll_timeout(timeout))) {
+            return Err(SlotFailure::kept(AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!("set_read_timeout failed: {e}"),
+            }));
+        }
+        let res = stream.read(buf);
+        // `clear()` re-locks the stream, so the read guard must go first.
+        drop(guard);
+        match res {
+            Ok(0) => {
+                self.clear();
+                Err(SlotFailure::closed(AsynError::Status {
+                    status: AsynStatus::Disconnected,
+                    message: format!("{device} peer closed"),
+                }))
+            }
+            Ok(n) => Ok(n),
+            Err(e) => Err(self.classify_read_error(e, device, timeout)),
+        }
+    }
+
+    /// Write to this slot, applying the same rule to C's `writeIt`, which calls
+    /// `closeConnection(pasynUser, tty, "Write error")` on a fatal errno
+    /// (drvAsynIPPort.c:694-698) and reports `asynTimeout` — socket intact — for
+    /// the `EWOULDBLOCK`/`EINTR` class it retries (:661-672). Single owner of "a
+    /// client slot dies on a write", shared by the parent's addressed and
+    /// broadcast writes and the child port's.
+    fn write_or_close(&self, data: &[u8], device: &str) -> Result<(), SlotFailure> {
+        let mut guard = self.stream.lock();
+        let Some(stream) = guard.as_mut() else {
+            return Err(SlotFailure::kept(AsynError::Status {
+                status: AsynStatus::Disconnected,
+                message: format!("{device} has no client"),
+            }));
+        };
+        let res = stream.write_all(data).and_then(|()| stream.flush());
+        drop(guard);
+        match res {
+            Ok(()) => Ok(()),
+            Err(e) => Err(self.classify_io_error(e, device, "write")),
+        }
+    }
+
+    /// C's `should_disconnect` for a failed *read* on a slot, both disjuncts
+    /// (drvAsynIPPort.c:797-799):
+    ///
+    /// ```c
+    /// int should_disconnect = (((tty->disconnectOnReadTimeout) && (pasynUser->timeout > 0)) ||
+    ///                          ((SOCKERRNO != SOCK_EWOULDBLOCK) && (SOCKERRNO != SOCK_EINTR)));
+    /// ```
+    ///
+    /// The second disjunct is the fatal-errno rule ([`is_nonfatal_read_timeout`],
+    /// shared with the IP client port). The first is the per-child-port option
+    /// `disconnectOnReadTimeout`: with it on, a read that merely *times out* tears
+    /// the connection down — a live-looking socket whose peer has gone silent
+    /// stops holding a slot the server needs. C's child here is a real
+    /// `drvAsynIPPort` (drvAsynIPServerPort.c:690), so `asynSetOption("srv:0", 0,
+    /// "disconnectOnReadTimeout", "Y")` reaches exactly this statement (W10-D5).
+    ///
+    /// A zero-timeout request is a *poll*, not a wait, and C exempts it
+    /// (`pasynUser->timeout > 0`): expiring a 1 ms socket poll must not kill a
+    /// healthy client.
+    fn classify_read_error(
+        &self,
+        e: std::io::Error,
+        device: &str,
+        timeout: Duration,
+    ) -> SlotFailure {
+        if is_nonfatal_read_timeout(e.kind())
+            && !(self.disconnect_on_read_timeout() && timeout > Duration::ZERO)
+        {
+            return SlotFailure::kept(AsynError::Status {
+                status: AsynStatus::Timeout,
+                message: "read timeout".to_string(),
+            });
+        }
+        self.clear();
+        SlotFailure::closed(AsynError::Status {
+            status: AsynStatus::Error,
+            message: format!("{device} read error: {e}"),
+        })
+    }
+
+    /// C's `should_disconnect` for a failed *write* (drvAsynIPPort.c:694-698):
+    /// the fatal-errno disjunct only — `writeIt` has no `disconnectOnReadTimeout`
+    /// term, it retries `EWOULDBLOCK`/`EINTR` (:661-672) and reports
+    /// `asynTimeout` with the socket intact. The branch that closes the socket is
+    /// the branch that reports `asynError`.
+    fn classify_io_error(&self, e: std::io::Error, device: &str, what: &str) -> SlotFailure {
+        if is_nonfatal_read_timeout(e.kind()) {
+            return SlotFailure::kept(AsynError::Status {
+                status: AsynStatus::Timeout,
+                message: format!("{what} timeout"),
+            });
+        }
+        self.clear();
+        SlotFailure::closed(AsynError::Status {
+            status: AsynStatus::Error,
+            message: format!("{device} {what} error: {e}"),
+        })
     }
 
     /// Toss all pending input on this slot's TCP stream — the single
@@ -294,6 +533,159 @@ impl ClientSlot {
     }
 }
 
+/// The accept half of the server port, detached from the driver so the listener
+/// thread can own it — C's `connectionListener` (drvAsynIPServerPort.c:290-384),
+/// which `drvAsynIPServerPortConfigure` starts at configure time (:711-714) and
+/// which is the *only* thing in C that accepts.
+///
+/// Everything an accept touches lives here, which is what lets the loop be the
+/// single acceptor: the slots (shared with the child subports through their
+/// connection cells), the announcement capability, and the parent's interrupt
+/// source. Nothing else may call [`Self::accept_one`] — a second acceptor would
+/// steal connections from the loop.
+struct Acceptor {
+    listener: TcpListener,
+    slots: Vec<Arc<ClientSlot>>,
+    read_timeout: Option<Duration>,
+    max_clients: usize,
+    port_name: String,
+    announcer: ExceptionAnnouncer,
+    /// The parent port's interrupt source, shared with the driver's own
+    /// `base.interrupts`. C fires the octet callbacks that carry the new child
+    /// port's *name* from inside the listener thread (:374-383) — that is how
+    /// an IOC learns which child port a client landed on.
+    interrupts: InterruptManager,
+    trace: Option<Arc<TraceManager>>,
+    /// Set to stop the loop. The listener is non-blocking and the loop polls it,
+    /// so the flag is observed within one poll interval — the portable stand-in
+    /// for C's `tty->fd = INVALID_SOCKET`, which unblocks its blocking `accept`
+    /// (:326-331).
+    shutdown: Arc<AtomicBool>,
+}
+
+impl Acceptor {
+    /// Copy the parent's trace masks onto the child port that just took a
+    /// connection — C `drvAsynIPServerPort.c:367-369`.
+    fn seed_child_trace(&self, child: &str) {
+        let Some(trace) = &self.trace else { return };
+        trace.set_trace_mask(Some(child), trace.get_trace_mask(Some(&self.port_name)));
+        trace.set_trace_io_mask(Some(child), trace.get_trace_io_mask(Some(&self.port_name)));
+    }
+
+    /// Accept one pending connection and assign it to a free slot. Returns the
+    /// slot index used, or `None` when no connection is pending.
+    ///
+    /// C `connectionListener` (:326-383): accept, find the first disconnected
+    /// child port, hand it the fd, and fire the octet interrupt callbacks with
+    /// that child's port name. A connection arriving with every slot occupied is
+    /// destroyed ("too many clients", :351-355) — dropping the stream here is
+    /// that `epicsSocketDestroy`.
+    fn accept_one(&self) -> AsynResult<Option<usize>> {
+        let (stream, peer) = match self.listener.accept() {
+            Ok(v) => v,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+            Err(e) => {
+                return Err(AsynError::Status {
+                    status: AsynStatus::Error,
+                    message: format!("accept failed: {e}"),
+                });
+            }
+        };
+        if let Some(t) = self.read_timeout {
+            stream
+                .set_read_timeout(Some(t))
+                .map_err(|e| AsynError::Status {
+                    status: AsynStatus::Error,
+                    message: format!("set_read_timeout failed: {e}"),
+                })?;
+        }
+        // First-fit slot scan — C's "search for a port which is disconnected"
+        // loop (:342-350).
+        for (i, slot) in self.slots.iter().enumerate() {
+            if !slot.is_occupied() {
+                slot.assign(stream, peer);
+                self.announcer.announce(AsynException::Connect, i as i32);
+                let child = format!("{}:{}", self.port_name, i);
+                // C :367-369 — "Set the new port to initially have the same
+                // trace mask that we have". The connection is what makes the
+                // child a live port, so the accept is where it inherits the
+                // parent's tracing; `asynSetTraceMask SERVER -1 0x9` in an
+                // st.cmd, before any client exists, must therefore reach the
+                // client that later connects. Initially: a later change to the
+                // parent does not follow (C copies once, here too).
+                self.seed_child_trace(&child);
+                asyn_trace!(
+                    Some(self.trace),
+                    &self.port_name,
+                    TraceMask::FLOW,
+                    "new connection from {peer} on {child}"
+                );
+                // C :374-383 — the octet callbacks carry the child port name,
+                // not the payload. The listener walks the interrupt list and
+                // calls EVERY node unconditionally: there is no addr test here
+                // (unlike asynOctetBase.c:203-215, which does test addr). A
+                // client landing in slot 3 must be announced to a listener that
+                // registered on addr 0, because "which slot" is the news.
+                self.interrupts.notify_octet(
+                    OctetFanOut::EveryUser,
+                    InterruptValue {
+                        reason: 0,
+                        addr: i as i32,
+                        value: ParamValue::Octet(child),
+                        timestamp: SystemTime::now(),
+                        iface: Some(InterfaceType::Octet),
+                        ..Default::default()
+                    },
+                );
+                return Ok(Some(i));
+            }
+        }
+        // Slot table full: C destroys the socket and keeps listening.
+        drop(stream);
+        Err(AsynError::Status {
+            status: AsynStatus::Error,
+            message: format!(
+                "no free client slot (max_clients={}); dropped connection from {peer}",
+                self.max_clients
+            ),
+        })
+    }
+
+    /// C `connectionListener`'s `while (tty->fd != INVALID_SOCKET)` loop
+    /// (:308-384). An accept error is traced and the loop continues (:335-340);
+    /// only teardown ends it.
+    fn run(&self) {
+        asyn_trace!(
+            Some(self.trace),
+            &self.port_name,
+            TraceMask::FLOW,
+            "started listening for connections on {}",
+            self.port_name
+        );
+        while !self.shutdown.load(Ordering::SeqCst) {
+            match self.accept_one() {
+                Ok(Some(_)) => {}
+                Ok(None) => std::thread::sleep(ACCEPT_POLL_INTERVAL),
+                Err(e) => asyn_trace!(
+                    Some(self.trace),
+                    &self.port_name,
+                    TraceMask::ERROR,
+                    "accept error on {}: {}",
+                    self.port_name,
+                    e.message()
+                ),
+            }
+        }
+        asyn_trace!(
+            Some(self.trace),
+            &self.port_name,
+            TraceMask::FLOW,
+            "terminating connection thread for {}",
+            self.port_name
+        );
+    }
+}
+
 /// Server-mode IP port driver.
 pub struct DrvAsynIPServerPort {
     base: PortDriverBase,
@@ -326,7 +718,18 @@ pub struct DrvAsynIPServerPort {
     udp_shutdown: Arc<AtomicBool>,
     /// Recv worker thread join handle. Joined on disconnect.
     udp_thread: Mutex<Option<JoinHandle<()>>>,
+
+    // ----- TCP accept loop -----
+    /// Stops the accept loop. Shared with the [`Acceptor`] the thread owns.
+    accept_shutdown: Arc<AtomicBool>,
+    /// The listener thread — C's `connectionListener`
+    /// (drvAsynIPServerPort.c:711-714). Joined on disconnect/shutdown.
+    accept_thread: Mutex<Option<JoinHandle<()>>>,
 }
+
+/// How long the accept loop waits between polls of a non-blocking listener.
+/// Bounds both accept latency and how long teardown waits for the thread.
+const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// UDP cache state. `pos < len` means data is available to read;
 /// `len == 0` means the recv worker can fetch a fresh datagram.
@@ -389,7 +792,7 @@ impl DrvAsynIPServerPort {
                 destructible: true,
             },
         );
-        base.connected = false;
+        base.init_connected(false);
         base.auto_connect = true;
         let mut slots = Vec::with_capacity(max);
         for _ in 0..max {
@@ -404,6 +807,8 @@ impl DrvAsynIPServerPort {
             udp_cache: Arc::new(Mutex::new(UdpCache::new())),
             udp_shutdown: Arc::new(AtomicBool::new(false)),
             udp_thread: Mutex::new(None),
+            accept_shutdown: Arc::new(AtomicBool::new(false)),
+            accept_thread: Mutex::new(None),
         })
     }
 
@@ -423,9 +828,63 @@ impl DrvAsynIPServerPort {
                 status: AsynStatus::Error,
                 message: format!("set_nonblocking failed: {e}"),
             })?;
+        self.start_accept_loop(&listener)?;
         *self.listener.lock() = Some(listener);
         self.base.set_connected(true);
         Ok(())
+    }
+
+    /// Start the listener thread. Called from the one place that binds the TCP
+    /// listener, which is what makes "the socket is listening ⟹ something is
+    /// accepting on it" true by construction — in C the two are equally
+    /// inseparable, `drvAsynIPServerPortConfigure` creating the socket and
+    /// starting `connectionListener` in the same breath
+    /// (drvAsynIPServerPort.c:640-714). The port used to bind and then never
+    /// accept: a client sat in the backlog until it timed out while the port
+    /// reported Connected.
+    fn start_accept_loop(&mut self, listener: &TcpListener) -> AsynResult<()> {
+        let accept_listener = listener.try_clone().map_err(|e| AsynError::Status {
+            status: AsynStatus::Error,
+            message: format!("listener try_clone failed: {e}"),
+        })?;
+        accept_listener
+            .set_nonblocking(true)
+            .map_err(|e| AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!("set_nonblocking failed: {e}"),
+            })?;
+
+        self.accept_shutdown.store(false, Ordering::SeqCst);
+        let acceptor = Acceptor {
+            listener: accept_listener,
+            slots: self.slots.clone(),
+            read_timeout: self.config.read_timeout,
+            max_clients: self.config.max_clients,
+            port_name: self.base.port_name.clone(),
+            announcer: self.base.exception_announcer(),
+            interrupts: InterruptManager::from_shared_state(self.base.interrupts.shared_state()),
+            trace: self.base.trace.clone(),
+            shutdown: Arc::clone(&self.accept_shutdown),
+        };
+        let port_name = self.base.port_name.clone();
+        let handle = std::thread::Builder::new()
+            .name(format!("ipserver-accept-{port_name}"))
+            .spawn(move || acceptor.run())
+            .map_err(|e| AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!("accept thread spawn failed: {e}"),
+            })?;
+        *self.accept_thread.lock() = Some(handle);
+        Ok(())
+    }
+
+    /// Stop the listener thread and wait for it. Every teardown path runs this —
+    /// C registers `ttyCleanup` with `epicsAtExit` for the same reason (:717).
+    fn stop_accept_loop(&mut self) {
+        self.accept_shutdown.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.accept_thread.lock().take() {
+            let _ = handle.join();
+        }
     }
 
     /// UDP-mode bind: open the datagram socket, spawn the recv
@@ -480,9 +939,12 @@ impl DrvAsynIPServerPort {
         let cache_t = Arc::clone(&self.udp_cache);
         let shutdown_t = Arc::clone(&self.udp_shutdown);
         let port_name = self.base.port_name.clone();
+        // The worker fires this port's octet interrupts (C :312-321), so it
+        // needs the same interrupt source the driver publishes on.
+        let interrupts_t = InterruptManager::from_shared_state(self.base.interrupts.shared_state());
         let handle = std::thread::Builder::new()
             .name(format!("udp-server-{port_name}"))
-            .spawn(move || udp_recv_loop(socket_t, cache_t, shutdown_t, port_name))
+            .spawn(move || udp_recv_loop(socket_t, cache_t, shutdown_t, port_name, interrupts_t))
             .map_err(|e| AsynError::Status {
                 status: AsynStatus::Error,
                 message: format!("UDP recv thread spawn failed: {e}"),
@@ -590,48 +1052,6 @@ impl DrvAsynIPServerPort {
             .unwrap_or(0)
     }
 
-    /// Accept one pending connection and assign it to a free slot.
-    /// Returns the slot index used, or an error if no slot was free
-    /// or the listener is not bound.
-    pub fn accept_one(&self) -> AsynResult<usize> {
-        let listener_guard = self.listener.lock();
-        let listener = listener_guard.as_ref().ok_or_else(|| AsynError::Status {
-            status: AsynStatus::Error,
-            message: "listener not bound — connect() the port first".into(),
-        })?;
-        let (stream, peer) = listener.accept().map_err(|e| AsynError::Status {
-            status: AsynStatus::Error,
-            message: format!("accept failed: {e}"),
-        })?;
-        if let Some(t) = self.config.read_timeout {
-            stream
-                .set_read_timeout(Some(t))
-                .map_err(|e| AsynError::Status {
-                    status: AsynStatus::Error,
-                    message: format!("set_read_timeout failed: {e}"),
-                })?;
-        }
-        // First-fit slot scan. Linear over `max_clients` — plenty
-        // fast for the rates an asyn server sees. Mirrors C asyn's
-        // "search for a port which is disconnected" loop at
-        // drvAsynIPServerPort.c:342-350.
-        for (i, slot) in self.slots.iter().enumerate() {
-            if !slot.is_occupied() {
-                slot.assign(stream, peer);
-                self.base
-                    .announce_exception(AsynException::Connect, i as i32);
-                return Ok(i);
-            }
-        }
-        Err(AsynError::Status {
-            status: AsynStatus::Error,
-            message: format!(
-                "no free client slot (max_clients={}); dropped connection from {peer}",
-                self.config.max_clients
-            ),
-        })
-    }
-
     /// Drop the connection in `addr`, freeing the slot.
     pub fn drop_client(&self, addr: i32) -> AsynResult<()> {
         let idx = self.slot_index(addr)?;
@@ -711,7 +1131,11 @@ impl DrvAsynIPServerPort {
             });
         }
         let name = self.child_port_name(idx);
-        Ok(DrvAsynIPSubport::new(name, Arc::clone(&self.slots[idx])))
+        Ok(DrvAsynIPSubport::new(
+            name,
+            Arc::clone(&self.slots[idx]),
+            self.config.no_process_eos,
+        ))
     }
 }
 
@@ -724,8 +1148,22 @@ impl PortDriver for DrvAsynIPServerPort {
         &mut self.base
     }
 
+    /// C drvAsynIPServerPort registers asynCommon and asynOctet, plus asynInt32
+    /// only when the socket is not SOCK_DGRAM (drvAsynIPServerPort.c:621-661) —
+    /// the Int32 interface carries the per-connection file descriptor. It
+    /// registers no asynOption.
+    fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
+        use crate::interfaces::Capability::*;
+        let mut caps = vec![OctetRead, OctetWrite, Flush, Connect];
+        if self.config.protocol == IpServerProtocol::Tcp {
+            caps.push(Int32Read);
+            caps.push(Int32Write);
+        }
+        caps
+    }
+
     fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {
-        let already_up = self.base.connected
+        let already_up = self.base.is_connected()
             && (self.listener.lock().is_some() || self.udp_socket.lock().is_some());
         if already_up {
             return Ok(());
@@ -743,6 +1181,7 @@ impl PortDriver for DrvAsynIPServerPort {
                     .announce_exception(AsynException::Connect, i as i32);
             }
         }
+        self.stop_accept_loop();
         self.stop_udp_worker();
         *self.udp_socket.lock() = None;
         self.udp_cache.lock().clear();
@@ -762,6 +1201,7 @@ impl PortDriver for DrvAsynIPServerPort {
         // the thread (and the socket it owns) is released on every
         // teardown path, matching the teardown `disconnect()` already
         // performs.
+        self.stop_accept_loop();
         self.stop_udp_worker();
         *self.udp_socket.lock() = None;
         self.udp_cache.lock().clear();
@@ -830,35 +1270,29 @@ impl PortDriver for DrvAsynIPServerPort {
                 if !slot.is_occupied() {
                     continue;
                 }
-                if let Err(e) = self.write_to_slot(slot, data) {
+                if let Err(f) = self.write_to_slot(slot, i as i32, data) {
                     tracing::debug!(
                         target: "asyn_rs::ip_server_port",
                         addr = i,
-                        error = %e,
+                        error = %f.error,
                         "broadcast write to slot failed"
                     );
-                    // Drop the slot if the write looks fatal (peer
-                    // closed). Match the connection-refused / broken-
-                    // pipe pattern from drvAsynIPPort.
-                    slot.clear();
-                    self.base
-                        .announce_exception(AsynException::Connect, i as i32);
+                    // The slot is torn down by `write_or_close` on exactly C's
+                    // fatal-errno branch (drvAsynIPPort.c:694-698) — and *only*
+                    // there: a send timeout is C's `asynTimeout` with the socket
+                    // intact (:661-672), so a slow peer no longer loses its slot.
+                    if f.closed {
+                        self.base
+                            .announce_exception(AsynException::Connect, i as i32);
+                    }
                 }
             }
             return Ok(data.len());
         }
         let arc = self.slot_arc(user.addr)?;
-        match self.write_to_slot(&arc, data) {
+        match self.write_to_slot(&arc, user.addr, data) {
             Ok(()) => Ok(data.len()),
-            Err(e) => {
-                // Mark slot disconnected so the next read/write fails fast.
-                if let Ok(idx) = self.slot_index(user.addr) {
-                    self.slots[idx].clear();
-                    self.base
-                        .announce_exception(AsynException::Connect, user.addr);
-                }
-                Err(e)
-            }
+            Err(f) => Err(self.finish_slot_failure(user.addr, f)),
         }
     }
 
@@ -895,44 +1329,8 @@ impl PortDriver for DrvAsynIPServerPort {
 impl DrvAsynIPServerPort {
     fn base_read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<OctetReadResult> {
         let arc = self.slot_arc(user.addr)?;
-        let mut stream_guard = arc.stream.lock();
-        let stream = stream_guard.as_mut().ok_or_else(|| AsynError::Status {
-            status: AsynStatus::Error,
-            message: format!("slot {} stream gone", user.addr),
-        })?;
-        // C readRaw (drvAsynIPPort.c:736-740): reject maxchars == 0 before
-        // touching the socket; an empty buffer would otherwise read Ok(0)
-        // and be misclassified as a peer EOF (tearing down the slot).
-        if buf.is_empty() {
-            return Err(maxchars_zero_error());
-        }
-        // C parity: the server-mode data read flows through a child
-        // `drvAsynIPPort` whose `readRaw` floors a zero request timeout to a
-        // 1 ms poll (drvAsynIPPort.c:741-743) and re-applies it on every
-        // read. `socket_poll_timeout` is the shared owner of that mapping;
-        // setting it unconditionally (rather than skipping on `timeout == 0`)
-        // keeps a poll request a 1 ms poll instead of blocking on the
-        // accept-time timeout.
-        stream
-            .set_read_timeout(Some(socket_poll_timeout(user.timeout)))
-            .map_err(|e| AsynError::Status {
-                status: AsynStatus::Error,
-                message: format!("set_read_timeout failed: {e}"),
-            })?;
-        match stream.read(buf) {
-            Ok(0) => {
-                // Peer closed — drop the slot, surface as Disconnect.
-                drop(stream_guard);
-                if let Ok(idx) = self.slot_index(user.addr) {
-                    self.slots[idx].clear();
-                    self.base
-                        .announce_exception(AsynException::Connect, user.addr);
-                }
-                Err(AsynError::Status {
-                    status: AsynStatus::Disconnected,
-                    message: format!("peer closed slot {}", user.addr),
-                })
-            }
+        let device = self.slot_device_name(user.addr);
+        match arc.read_or_close(buf, user.timeout, &device) {
             Ok(n) => Ok(OctetReadResult {
                 nbytes_transferred: n,
                 // C parity: CNT only when the requested count was
@@ -944,37 +1342,31 @@ impl DrvAsynIPServerPort {
                     EomReason::empty()
                 },
             }),
-            // C parity: the server data read flows through a child
-            // `drvAsynIPPort` whose `readRaw` (798-800) treats EINTR as a
-            // non-fatal timeout, identically to EWOULDBLOCK — `Interrupted`
-            // must not surface as a hard read error. Shared owner of the
-            // non-fatal-read-error set: `is_nonfatal_read_timeout`.
-            Err(e) if is_nonfatal_read_timeout(e.kind()) => Err(AsynError::Status {
-                status: AsynStatus::Timeout,
-                message: "read timeout".into(),
-            }),
-            Err(e) => Err(AsynError::Status {
-                status: AsynStatus::Error,
-                message: format!("read failed: {e}"),
-            }),
+            Err(f) => Err(self.finish_slot_failure(user.addr, f)),
         }
     }
 
-    fn write_to_slot(&self, slot: &ClientSlot, data: &[u8]) -> AsynResult<()> {
-        let mut g = slot.stream.lock();
-        let stream = g.as_mut().ok_or_else(|| AsynError::Status {
-            status: AsynStatus::Error,
-            message: "slot stream gone".into(),
-        })?;
-        stream.write_all(data).map_err(|e| AsynError::Status {
-            status: AsynStatus::Error,
-            message: format!("write failed: {e}"),
-        })?;
-        stream.flush().map_err(|e| AsynError::Status {
-            status: AsynStatus::Error,
-            message: format!("flush failed: {e}"),
-        })?;
-        Ok(())
+    /// The disconnect fan-out the parent owes when [`ClientSlot`] closed a slot —
+    /// C's `exceptionDisconnect` on the child port (drvAsynIPPort.c:216), which
+    /// is what makes the listener's `isConnected` scan see the slot as free
+    /// (drvAsynIPServerPort.c:344-350). The socket is already gone; this is the
+    /// announcement half only.
+    fn finish_slot_failure(&mut self, addr: i32, failure: SlotFailure) -> AsynError {
+        if failure.closed {
+            self.base.announce_exception(AsynException::Connect, addr);
+        }
+        failure.error
+    }
+
+    /// C `tty->IPDeviceName` for a client slot — the name that goes into
+    /// `"%s read error: %s"` (drvAsynIPPort.c:801-803). C's child ports are named
+    /// `parent:N` (drvAsynIPServerPort.c:686).
+    fn slot_device_name(&self, addr: i32) -> String {
+        format!("{}:{}", self.base.port_name, addr)
+    }
+
+    fn write_to_slot(&self, slot: &ClientSlot, addr: i32, data: &[u8]) -> Result<(), SlotFailure> {
+        slot.write_or_close(data, &self.slot_device_name(addr))
     }
 
     /// UDP-mode read: copy at most `buf.len()` bytes from the cache,
@@ -1060,6 +1452,7 @@ fn udp_recv_loop(
     cache: Arc<Mutex<UdpCache>>,
     shutdown: Arc<AtomicBool>,
     port_name: String,
+    interrupts: InterruptManager,
 ) {
     let mut buf = vec![0u8; UDP_MAX_DATAGRAM];
     loop {
@@ -1077,10 +1470,33 @@ fn udp_recv_loop(
         }
         match socket.recv(&mut buf) {
             Ok(n) => {
-                let mut c = cache.lock();
-                c.data.clear();
-                c.data.extend_from_slice(&buf[..n]);
-                c.pos = 0;
+                {
+                    let mut c = cache.lock();
+                    c.data.clear();
+                    c.data.extend_from_slice(&buf[..n]);
+                    c.pos = 0;
+                }
+                // C :312-321 — every registered octet callback gets the
+                // datagram, unconditionally (no addr test, exactly as for the
+                // TCP announcement at :372-383). A datagram is a whole message,
+                // so C passes ASYN_EOM_END; InterruptValue carries no eom
+                // because no consumer reads one (C's own octet consumer,
+                // devAsynOctet.c:476-478, ignores the eomReason argument).
+                //
+                // Fired with the cache lock released: a subscriber's callback
+                // runs inline here, and a callback that reads the port back
+                // would otherwise deadlock against the lock we still held.
+                interrupts.notify_octet(
+                    OctetFanOut::EveryUser,
+                    InterruptValue {
+                        reason: 0,
+                        addr: 0,
+                        value: ParamValue::Octet(String::from_utf8_lossy(&buf[..n]).into_owned()),
+                        timestamp: SystemTime::now(),
+                        iface: Some(InterfaceType::Octet),
+                        ..Default::default()
+                    },
+                );
             }
             // DRV-56: a non-fatal recv error (200 ms read-timeout wake, or an
             // EINTR signal interruption) must NOT exit the worker — loop and
@@ -1134,7 +1550,7 @@ pub struct DrvAsynIPSubport {
 }
 
 impl DrvAsynIPSubport {
-    fn new(port_name: String, slot: Arc<ClientSlot>) -> Self {
+    fn new(port_name: String, slot: Arc<ClientSlot>, no_process_eos: bool) -> Self {
         let mut base = PortDriverBase::new(
             &port_name,
             1,
@@ -1144,14 +1560,50 @@ impl DrvAsynIPSubport {
                 destructible: true,
             },
         );
-        base.connected = slot.is_occupied();
-        base.auto_connect = false; // C uses noAutoConnect=1 for the child ports
+        // The child does not own its link — the slot does, and the parent's accept
+        // loop assigns and clears it without this port's actor ever running. Bind
+        // `connected` to the slot's own cell rather than caching a copy of it, so
+        // a reused slot cannot leave the child stuck at `asynDisconnected`
+        // (R13-50). C keeps the same two facts in agreement by having the listener
+        // call `connectDevice` on the child the moment it hands it the socket
+        // (drvAsynIPServerPort.c:357-367).
+        base.share_connection(slot.connection_cell());
+        // C's child IS a `drvAsynIPPortConfigure`d port — the listener creates it
+        // with exactly that call (drvAsynIPServerPort.c:688-694), passing
+        // noAutoConnect=1 and the server's own noProcessEos. So it gets the
+        // configure-time shape through the same owner the client port does:
+        // interruptProcess=1 (so an I/O-Intr record on `<parent>:<N>` processes)
+        // and, unless suppressed, the EOS interpose (so a `\n`-terminated line
+        // from a dialled-in device actually terminates a read). Building the
+        // child's base by hand is how it came to have neither (R19-107, R19-108).
+        DrvAsynIPPort::apply_ip_port_configure(
+            &mut base,
+            /* noAutoConnect */ true,
+            no_process_eos,
+        );
         Self { base, slot }
     }
 
     /// Peer address currently bound to this subport's slot, if any.
     pub fn peer(&self) -> Option<SocketAddr> {
         self.slot.peer_addr()
+    }
+
+    /// The disconnect fan-out this child port owes when [`ClientSlot`] closed its
+    /// slot — C `closeConnection`'s `exceptionDisconnect` (drvAsynIPPort.c:216),
+    /// which is exactly what makes the listener see the slot as reusable
+    /// (drvAsynIPServerPort.c:344-350). The socket is already gone.
+    ///
+    /// Per-addr Connect carries addr=0 (this is the subport's single device
+    /// slot); the port-level `set_connected(false)` fires the port-level
+    /// transition once thanks to its edge guard. Both fan-outs are needed because
+    /// observers can listen at either granularity.
+    fn finish_slot_failure(&mut self, failure: SlotFailure) -> AsynError {
+        if failure.closed {
+            self.base.announce_exception(AsynException::Connect, 0);
+            self.base.set_connected(false);
+        }
+        failure.error
     }
 }
 
@@ -1164,17 +1616,58 @@ impl PortDriver for DrvAsynIPSubport {
         &mut self.base
     }
 
+    /// C creates each accepted connection as a plain drvAsynIPPort
+    /// (`drvAsynIPPortConfigure`, drvAsynIPServerPort.c:690) — so a subport has
+    /// the byte-transport interface set: asynCommon + asynOption + asynOctet.
+    fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
+        crate::interfaces::octet_transport_capabilities()
+    }
+
     fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {
-        // Passive sync — child port's connection is driven by the
-        // parent's accept loop, not by an outbound dial.
-        self.base.set_connected(self.slot.is_occupied());
-        if !self.base.connected {
+        // The child has no link of its own to dial: its socket is the slot's, and
+        // the parent's accept loop is what puts one there. C's child `connectIt`
+        // is likewise driven by the listener (`connectDevice`,
+        // drvAsynIPServerPort.c:357-367) and does no dialling either. So this
+        // publishes the slot's state — it cannot change it.
+        self.base.sync_connection_edge();
+        if !self.base.is_connected() {
             return Err(AsynError::Status {
                 status: AsynStatus::Disconnected,
                 message: "no client assigned to this subport slot yet".into(),
             });
         }
         Ok(())
+    }
+
+    /// C's child port is a full `drvAsynIPPort` (drvAsynIPServerPort.c:690), so
+    /// `asynSetOption("<parent>:<n>", 0, "disconnectOnReadTimeout", "Y")` lands in
+    /// `drvAsynIPPort::setOption` (:924-935), which accepts only `"Y"`/`"N"`
+    /// (case-insensitive) and errors on anything else. The option then arms the
+    /// first disjunct of `readIt`'s `should_disconnect` (:797-799) — see
+    /// [`ClientSlot::classify_read_error`].
+    ///
+    /// The other key C's `setOption` takes, `hostInfo`, re-dials an outbound
+    /// connection; an accepted socket has nothing to re-dial, so it is not
+    /// modelled here.
+    fn set_option(&mut self, _user: &mut AsynUser, key: &str, value: &str) -> AsynResult<()> {
+        if key.eq_ignore_ascii_case("disconnectOnReadTimeout") {
+            let yes = parse_yn_option("disconnectOnReadTimeout", value)?;
+            self.slot.set_disconnect_on_read_timeout(yes);
+            return Ok(());
+        }
+        Err(AsynError::OptionNotFound(key.to_string()))
+    }
+
+    fn get_option(&self, key: &str) -> AsynResult<String> {
+        if key.eq_ignore_ascii_case("disconnectOnReadTimeout") {
+            // C prints the flag as "Y"/"N" (drvAsynIPPort.c:906-910).
+            return Ok(if self.slot.disconnect_on_read_timeout() {
+                "Y".to_string()
+            } else {
+                "N".to_string()
+            });
+        }
+        Err(AsynError::OptionNotFound(key.to_string()))
     }
 
     fn disconnect(&mut self, _user: &AsynUser) -> AsynResult<()> {
@@ -1191,79 +1684,19 @@ impl PortDriver for DrvAsynIPSubport {
     }
 
     fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
-        let mut stream_guard = self.slot.stream.lock();
-        let stream = stream_guard.as_mut().ok_or_else(|| AsynError::Status {
-            status: AsynStatus::Disconnected,
-            message: "subport slot has no client".into(),
-        })?;
-        // C readRaw (drvAsynIPPort.c:736-740): reject maxchars == 0 before
-        // touching the socket; an empty buffer would otherwise read Ok(0)
-        // and be misclassified as a peer EOF (tearing down the slot).
-        if buf.is_empty() {
-            return Err(maxchars_zero_error());
-        }
-        // C parity: the server-mode data read flows through a child
-        // `drvAsynIPPort` whose `readRaw` floors a zero request timeout to a
-        // 1 ms poll (drvAsynIPPort.c:741-743) and re-applies it on every
-        // read. `socket_poll_timeout` is the shared owner of that mapping;
-        // setting it unconditionally (rather than skipping on `timeout == 0`)
-        // keeps a poll request a 1 ms poll instead of blocking on the
-        // accept-time timeout.
-        stream
-            .set_read_timeout(Some(socket_poll_timeout(user.timeout)))
-            .map_err(|e| AsynError::Status {
-                status: AsynStatus::Error,
-                message: format!("set_read_timeout failed: {e}"),
-            })?;
-        match stream.read(buf) {
-            Ok(0) => {
-                drop(stream_guard);
-                self.slot.clear();
-                // Per-addr Connect carries addr=0 (this is the
-                // subport's single device slot). The port-level
-                // set_connected(false) handles the port-level
-                // transition exactly once thanks to its edge
-                // guard. Both fan-outs are necessary because
-                // observers can listen at either the port or
-                // the device granularity.
-                self.base.announce_exception(AsynException::Connect, 0);
-                self.base.set_connected(false);
-                Err(AsynError::Status {
-                    status: AsynStatus::Disconnected,
-                    message: "peer closed".into(),
-                })
-            }
+        let device = self.base.port_name.clone();
+        match self.slot.read_or_close(buf, user.timeout, &device) {
             Ok(n) => Ok(n),
-            // C parity: a child `drvAsynIPPort` `readRaw` (798-800) treats
-            // EINTR as a non-fatal timeout, identically to EWOULDBLOCK —
-            // `Interrupted` must not surface as a hard read error. Shared
-            // owner of the non-fatal-read-error set: `is_nonfatal_read_timeout`.
-            Err(e) if is_nonfatal_read_timeout(e.kind()) => Err(AsynError::Status {
-                status: AsynStatus::Timeout,
-                message: "read timeout".into(),
-            }),
-            Err(e) => Err(AsynError::Status {
-                status: AsynStatus::Error,
-                message: format!("read failed: {e}"),
-            }),
+            Err(f) => Err(self.finish_slot_failure(f)),
         }
     }
 
     fn write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
-        let mut g = self.slot.stream.lock();
-        let stream = g.as_mut().ok_or_else(|| AsynError::Status {
-            status: AsynStatus::Disconnected,
-            message: "subport slot has no client".into(),
-        })?;
-        stream.write_all(data).map_err(|e| AsynError::Status {
-            status: AsynStatus::Error,
-            message: format!("write failed: {e}"),
-        })?;
-        stream.flush().map_err(|e| AsynError::Status {
-            status: AsynStatus::Error,
-            message: format!("flush failed: {e}"),
-        })?;
-        Ok(data.len())
+        let device = self.base.port_name.clone();
+        match self.slot.write_or_close(data, &device) {
+            Ok(()) => Ok(data.len()),
+            Err(f) => Err(self.finish_slot_failure(f)),
+        }
     }
 
     fn io_flush(&mut self, _user: &mut AsynUser) -> AsynResult<()> {
@@ -1280,6 +1713,21 @@ impl PortDriver for DrvAsynIPSubport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The listener thread is the only acceptor — C `connectionListener`
+    /// (drvAsynIPServerPort.c:290-384) — so a test observes an accept by waiting
+    /// for the slot to fill, not by driving the accept itself. Returns `idx`.
+    fn wait_for_slot(srv: &DrvAsynIPServerPort, idx: usize) -> usize {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while srv.peer(idx as i32).is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "slot {idx} never filled — the accept loop is not running"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        idx
+    }
 
     #[test]
     fn parse_basic_ipv4() {
@@ -1331,6 +1779,7 @@ mod tests {
             bind_port: 0,
             protocol: IpServerProtocol::Tcp,
             max_clients: 0,
+            no_process_eos: false,
             read_timeout: None,
         };
         match DrvAsynIPServerPort::with_config("zero_clients", cfg) {
@@ -1350,6 +1799,7 @@ mod tests {
             bind_port: 0,
             protocol: IpServerProtocol::Tcp,
             max_clients: 1,
+            no_process_eos: false,
             read_timeout: None,
         };
         assert!(DrvAsynIPServerPort::with_config("one_client", ok).is_ok());
@@ -1491,7 +1941,7 @@ mod tests {
         let port = srv.local_port();
 
         let mut client = ClientStream::connect(("127.0.0.1", port)).unwrap();
-        let idx = srv.accept_one().unwrap();
+        let idx = wait_for_slot(&srv, 0);
         client.write_all(b"stale-bytes").unwrap();
         client.flush().unwrap();
         // Let the bytes land on the server socket (instant on loopback).
@@ -1518,6 +1968,230 @@ mod tests {
         srv.disconnect(&AsynUser::default()).unwrap();
     }
 
+    /// R11-C9: a client whose socket dies mid-read must lose its slot.
+    ///
+    /// C serves each accepted connection with a full `drvAsynIPPort` child
+    /// (drvAsynIPServerPort.c:681-708), whose `readIt` calls `closeConnection` on
+    /// *any* errno outside `EWOULDBLOCK`/`EINTR` (drvAsynIPPort.c:797-806), not
+    /// just on EOF — and `closeConnection`'s `exceptionDisconnect` (:216) is
+    /// exactly what makes the listener's `isConnected` scan hand the slot to the
+    /// next client (drvAsynIPServerPort.c:344-350).
+    ///
+    /// The port tore down on EOF only, so a peer that vanished with an RST
+    /// (`ECONNRESET` — a crashed client, a NAT drop) kept its slot forever, and
+    /// once the table filled no client could reconnect.
+    #[test]
+    fn a_fatal_read_error_frees_the_client_slot() {
+        use socket2::{Domain, Socket, Type};
+
+        // max_clients = 1: the slot is the whole table, so "the slot was freed"
+        // and "the next client can connect" are the same assertion.
+        let mut config = IpServerConfig::parse("127.0.0.1:0 TCP").unwrap();
+        config.max_clients = 1;
+        let mut srv = DrvAsynIPServerPort::with_config("rst_frees_slot", config).unwrap();
+        srv.connect(&AsynUser::default()).unwrap();
+        let port = srv.local_port();
+
+        // A client that dies with an RST rather than a FIN: SO_LINGER(0) makes
+        // close() send RST, so the server's next read gets ECONNRESET — a fatal
+        // errno, not the EOF the port already handled.
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let client = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+        client.connect(&addr.into()).unwrap();
+        let idx = wait_for_slot(&srv, 0);
+        assert_eq!(idx, 0);
+        assert!(srv.slots[0].is_occupied(), "the client owns the only slot");
+
+        client.set_linger(Some(Duration::ZERO)).unwrap();
+        drop(client); // RST
+        std::thread::sleep(Duration::from_millis(50));
+
+        let read_user = AsynUser::default()
+            .with_addr(0)
+            .with_timeout(Duration::from_millis(200));
+        let mut buf = [0u8; 64];
+        let err = srv
+            .read_octet(&read_user, &mut buf)
+            .expect_err("a reset peer cannot deliver bytes");
+        // C reports the teardown branch as asynError with "%s read error: %s"
+        // (drvAsynIPPort.c:801-805) — never as a retryable asynTimeout.
+        assert_eq!(err.status(), AsynStatus::Error, "got {err:?}");
+
+        assert!(
+            !srv.slots[0].is_occupied(),
+            "C's readIt closeConnection frees the slot on a fatal errno, not just on EOF"
+        );
+
+        // …and the slot really is reusable: a second client takes it.
+        let _client2 = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        wait_for_slot(&srv, 0);
+
+        srv.disconnect(&AsynUser::default()).unwrap();
+    }
+
+    /// W10-D5: the child port honours `disconnectOnReadTimeout`.
+    ///
+    /// C serves each accepted connection with a full `drvAsynIPPort`
+    /// (drvAsynIPServerPort.c:690), so `asynSetOption("<parent>:<n>", 0,
+    /// "disconnectOnReadTimeout", "Y")` reaches `drvAsynIPPort::setOption`
+    /// (:924-935) and arms the *first* disjunct of `readIt`'s `should_disconnect`
+    /// (:797-799): a read that merely times out closes the connection. The port
+    /// modelled only the second (fatal-errno) disjunct, so a silent peer held its
+    /// slot forever and the server could not reclaim it.
+    ///
+    /// C's `pasynUser->timeout > 0` term is checked too: a zero-timeout *poll*
+    /// must not kill a healthy client.
+    #[test]
+    fn the_child_port_honours_disconnect_on_read_timeout() {
+        let mut config = IpServerConfig::parse("127.0.0.1:0 TCP").unwrap();
+        config.max_clients = 1;
+        let mut srv = DrvAsynIPServerPort::with_config("srv_drto", config).unwrap();
+        srv.connect(&AsynUser::default()).unwrap();
+        let port = srv.local_port();
+        let mut child = srv.make_subport(0).unwrap();
+
+        // Default is off (C `tty->disconnectOnReadTimeout` is 0 unless set): a
+        // silent peer times out and keeps its slot.
+        let _client = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        wait_for_slot(&srv, 0);
+        let user = AsynUser::default().with_timeout(Duration::from_millis(50));
+        let mut buf = [0u8; 64];
+        let err = child.read_octet(&user, &mut buf).unwrap_err();
+        assert_eq!(err.status(), AsynStatus::Timeout, "got {err:?}");
+        assert!(
+            srv.slots[0].is_occupied(),
+            "with the option off a read timeout leaves the socket intact (C :810-811)"
+        );
+
+        // asynSetOption("srv_drto:0", 0, "disconnectOnReadTimeout", "Y").
+        let mut opt_user = AsynUser::default();
+        child
+            .set_option(&mut opt_user, "disconnectOnReadTimeout", "Y")
+            .unwrap();
+        assert_eq!(child.get_option("disconnectOnReadTimeout").unwrap(), "Y");
+
+        // A zero-timeout poll is exempt (C's `pasynUser->timeout > 0`).
+        let poll_user = AsynUser::default().with_timeout(Duration::ZERO);
+        let err = child.read_octet(&poll_user, &mut buf).unwrap_err();
+        assert_eq!(err.status(), AsynStatus::Timeout, "got {err:?}");
+        assert!(
+            srv.slots[0].is_occupied(),
+            "a zero-timeout poll is not a read timeout C tears down on (:797)"
+        );
+
+        // …but a real timed read now closes the connection, and C reports that
+        // branch as asynError, never as a retryable asynTimeout (:801-805).
+        let err = child.read_octet(&user, &mut buf).unwrap_err();
+        assert_eq!(err.status(), AsynStatus::Error, "got {err:?}");
+        assert!(
+            !srv.slots[0].is_occupied(),
+            "disconnectOnReadTimeout=Y frees the slot on a read timeout \
+             (drvAsynIPPort.c:797-799, first disjunct)"
+        );
+        assert!(!child.base().is_connected());
+
+        // The freed slot takes the next client (the point of the option).
+        let _client2 = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        wait_for_slot(&srv, 0);
+        assert!(child.base().is_connected());
+        // …and the option survives the slot reuse, as C's child port does.
+        assert_eq!(child.get_option("disconnectOnReadTimeout").unwrap(), "Y");
+
+        srv.disconnect(&AsynUser::default()).unwrap();
+    }
+
+    /// R13-50: a reused slot must revive the child subport.
+    ///
+    /// C's listener does it explicitly: when the free-slot scan hands slot `i` to
+    /// a new client it sets `pl->fd = clientFd` and calls
+    /// `pasynCommonSyncIO->connectDevice(pl->pasynUser)` on the child port
+    /// (drvAsynIPServerPort.c:357-367), which drives the child's `connectIt` and
+    /// its `exceptionConnect`. It has to: the child's own `isConnected` is what
+    /// the *next* free-slot scan reads (:342-350), so C cannot leave a child
+    /// disconnected while its slot holds a live socket.
+    ///
+    /// The port cached the child's `connected` in its own `PortDriverBase`, which
+    /// only the child's actor could write and which the parent's accept loop never
+    /// reached. Any teardown — EOF, and after R11-C9 any fatal errno — latched it
+    /// false, and since the child is `noAutoConnect` nothing ever set it back: the
+    /// next client accepted into that slot was served by a port that refused every
+    /// read and write with `asynDisconnected`, forever, over a live socket.
+    #[test]
+    fn a_reused_client_slot_revives_the_child_subport() {
+        use socket2::{Domain, Socket, Type};
+
+        let mut config = IpServerConfig::parse("127.0.0.1:0 TCP").unwrap();
+        config.max_clients = 1;
+        let mut srv = DrvAsynIPServerPort::with_config("slot_revive", config).unwrap();
+        srv.connect(&AsynUser::default()).unwrap();
+        let port = srv.local_port();
+        let mut child = srv.make_subport(0).unwrap();
+
+        // First client, killed with an RST so the read tears the slot down through
+        // the fatal-errno path (C drvAsynIPPort.c:797-806).
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let victim = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+        victim.connect(&addr.into()).unwrap();
+        wait_for_slot(&srv, 0);
+        // An explicit connect on the child for the *first* client — C's
+        // `connectDevice`, and the only route by which a cached flag could ever
+        // have become true. Handing it to the first client isolates the defect to
+        // the *reuse*: the second client gets no extra call here, exactly as in C,
+        // where the listener's own `connectDevice` on assignment is all there is.
+        child.connect(&AsynUser::default()).unwrap();
+        assert!(
+            child.base().is_connected(),
+            "the child serves the new client"
+        );
+
+        victim.set_linger(Some(Duration::ZERO)).unwrap();
+        drop(victim); // RST
+        std::thread::sleep(Duration::from_millis(50));
+
+        let read_user = AsynUser::default().with_timeout(Duration::from_millis(200));
+        let mut buf = [0u8; 64];
+        let err = child
+            .read_octet(&read_user, &mut buf)
+            .expect_err("a reset peer cannot deliver bytes");
+        assert_eq!(err.status(), AsynStatus::Error, "got {err:?}");
+        assert!(
+            !child.base().is_connected(),
+            "the child's own read tore the slot down (C closeConnection + exceptionDisconnect)"
+        );
+        assert!(!srv.slots[0].is_occupied());
+
+        // The next client takes the freed slot. C connects the child on assignment,
+        // so the child must serve it — the socket is live and the port must say so.
+        let mut client2 = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        wait_for_slot(&srv, 0);
+        assert!(
+            child.base().is_connected(),
+            "a reused slot revives the child: C calls connectDevice on it \
+             (drvAsynIPServerPort.c:357-367)"
+        );
+
+        // …and the revival is real I/O, not just a flag: the child must talk to the
+        // new client over the slot's socket.
+        let mut write_user = AsynUser::default();
+        child
+            .write_octet(&mut write_user, b"hello\n")
+            .expect("the revived child must write to the new client's socket");
+        let mut got = [0u8; 6];
+        client2
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        client2.read_exact(&mut got).unwrap();
+        assert_eq!(&got, b"hello\n");
+
+        client2.write_all(b"world\n").unwrap();
+        let n = child
+            .read_octet(&read_user, &mut buf)
+            .expect("the revived child must read from the new client's socket");
+        assert_eq!(&buf[..n], b"world\n");
+
+        srv.disconnect(&AsynUser::default()).unwrap();
+    }
+
     /// DRV-20: a TCP flush with no connected client is a harmless no-op
     /// (C guards the drain on `fd != INVALID_SOCKET`).
     #[test]
@@ -1528,6 +2202,169 @@ mod tests {
         // Broadcast addr also harmless with no slots occupied.
         let mut bcast = AsynUser::default().with_addr(-1);
         srv.io_flush(&mut bcast).unwrap();
+    }
+
+    /// The canonical `drvAsynIPServerPort` use, end to end: a device dials into
+    /// the IOC and sends `\n`-terminated lines. C's child port is a real
+    /// `drvAsynIPPort` with the EOS interpose, so the read terminates on the
+    /// terminator and fans the raw chunk out to the port's I/O-Intr users.
+    ///
+    /// Before the child went through `apply_ip_port_configure` it had an empty
+    /// interpose chain and `octet_interrupt_process == false`: the read ran to
+    /// the buffer bound (here: it would have returned "line1\nline2\n" in one
+    /// go), and no interrupt user ever heard from it.
+    #[test]
+    fn a_child_port_terminates_a_read_on_the_terminator_and_fans_it_out() {
+        use crate::interrupt::{InterruptFilter, InterruptValue};
+        use std::io::Write as _;
+        use std::net::TcpStream as ClientStream;
+        use std::sync::Mutex as StdMutex;
+
+        let mut srv = DrvAsynIPServerPort::new("srv_eos", "127.0.0.1:0").unwrap();
+        srv.connect(&AsynUser::default()).unwrap();
+        let port = srv.local_port();
+
+        let mut client = ClientStream::connect(("127.0.0.1", port)).unwrap();
+        let idx = wait_for_slot(&srv, 0);
+        let mut sub = srv.make_subport(idx).unwrap();
+        sub.connect(&AsynUser::default()).unwrap();
+
+        let seen: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        let seen_cb = seen.clone();
+        let _sub_cb = sub.base().interrupts.register_sync_callback(
+            InterruptFilter::default(),
+            move |iv: &InterruptValue| {
+                if let ParamValue::Octet(s) = &iv.value {
+                    seen_cb.lock().unwrap().push(s.clone());
+                }
+            },
+        );
+
+        // The IEOS an st.cmd sets on the child port: `asynOctetSetInputEos
+        // srv_eos:0 0 "\n"`.
+        sub.set_input_eos(&AsynUser::default(), b"\n").unwrap();
+
+        client.write_all(b"line1\nline2\n").unwrap();
+        client.flush().unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+
+        let user = AsynUser::default().with_timeout(Duration::from_millis(500));
+        let mut buf = [0u8; 64];
+        // First read stops at the terminator — it does NOT run to the buffer
+        // bound and swallow line2.
+        let (n, eom) = crate::port::octet_read_chain(&mut sub, &user, &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"line1");
+        assert!(eom.contains(EomReason::EOS), "eom = {eom:?}");
+        // Second read returns the buffered second line, no further socket read.
+        let (n, eom) = crate::port::octet_read_chain(&mut sub, &user, &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"line2");
+        assert!(eom.contains(EomReason::EOS), "eom = {eom:?}");
+
+        // The interrupt user saw the RAW chunk the socket delivered, terminators
+        // included — C's octetBase fan-out sits below the EOS layer.
+        let got = seen.lock().unwrap().concat();
+        assert_eq!(got, "line1\nline2\n", "raw chunks fanned out, got {got:?}");
+
+        srv.disconnect(&AsynUser::default()).unwrap();
+    }
+
+    /// R19-109 boundary: the new-connection announcement reaches EVERY octet
+    /// interrupt user, whatever addr it registered on.
+    ///
+    /// C `connectionListener` (drvAsynIPServerPort.c:372-383) walks the octet
+    /// interrupt list and calls every node with the child port's name — there
+    /// is no addr test, unlike `asynOctetBase.c:203-215`. The boundary is
+    /// "announcement addr == subscriber addr" (slot 0) vs "announcement addr !=
+    /// subscriber addr" (slot 1): both must be delivered. An addr filter here
+    /// would silently hide every client after the first.
+    #[test]
+    fn every_octet_user_hears_a_new_connection_whatever_slot_it_lands_in() {
+        use crate::interrupt::{InterruptFilter, InterruptValue};
+        use std::net::TcpStream as ClientStream;
+        use std::sync::Mutex as StdMutex;
+
+        let mut srv = DrvAsynIPServerPort::with_config(
+            "srv_announce",
+            IpServerConfig {
+                max_clients: 2,
+                ..IpServerConfig::parse("127.0.0.1:0").unwrap()
+            },
+        )
+        .unwrap();
+        srv.connect(&AsynUser::default()).unwrap();
+        let port = srv.local_port();
+
+        let seen: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        let seen_cb = seen.clone();
+        // A device-support user bound to addr 0 — C registers on the SERVER
+        // port, and the payload it wants is which child port to talk to.
+        let _cb = srv.base().interrupts.register_sync_callback(
+            InterruptFilter {
+                addr: Some(0),
+                ..InterruptFilter::default()
+            },
+            move |iv: &InterruptValue| {
+                if let ParamValue::Octet(s) = &iv.value {
+                    seen_cb.lock().unwrap().push(s.clone());
+                }
+            },
+        );
+
+        let _c0 = ClientStream::connect(("127.0.0.1", port)).unwrap();
+        wait_for_slot(&srv, 0);
+        let _c1 = ClientStream::connect(("127.0.0.1", port)).unwrap();
+        wait_for_slot(&srv, 1);
+
+        let got = seen.lock().unwrap().clone();
+        assert_eq!(
+            got,
+            vec!["srv_announce:0".to_string(), "srv_announce:1".to_string()],
+            "the addr-0 user must hear about the slot-1 client too"
+        );
+
+        srv.disconnect(&AsynUser::default()).unwrap();
+    }
+
+    /// R19-121 boundary: a child port inherits the parent's trace masks at the
+    /// accept, and only at the accept.
+    ///
+    /// C `drvAsynIPServerPort.c:367-369` copies both masks onto the child when
+    /// the connection lands — *"Set the new port to initially have the same
+    /// trace mask that we have"*. The two boundaries: a mask set on the parent
+    /// BEFORE the client connects (the st.cmd case: `asynSetTraceMask SERVER -1
+    /// 0x9`) must reach the child; a mask set AFTER it connects must not (C
+    /// copies once, it does not track).
+    #[test]
+    fn a_child_port_inherits_the_parents_trace_masks_at_the_accept() {
+        use crate::services::PortServices;
+        use crate::trace::TraceIoMask;
+        use std::net::TcpStream as ClientStream;
+
+        let trace = Arc::new(TraceManager::new());
+        let services = PortServices::new(trace.clone());
+        let mut srv = DrvAsynIPServerPort::new("srv_trace", "127.0.0.1:0").unwrap();
+        services.bind(srv.base_mut());
+
+        // st.cmd, before any client exists.
+        let parent_mask = TraceMask::ERROR | TraceMask::FLOW | TraceMask::IO_DRIVER;
+        let parent_io = TraceIoMask::ASCII | TraceIoMask::HEX;
+        trace.set_trace_mask(Some("srv_trace"), parent_mask);
+        trace.set_trace_io_mask(Some("srv_trace"), parent_io);
+
+        srv.connect(&AsynUser::default()).unwrap();
+        let port = srv.local_port();
+        let _client = ClientStream::connect(("127.0.0.1", port)).unwrap();
+        wait_for_slot(&srv, 0);
+
+        assert_eq!(trace.get_trace_mask(Some("srv_trace:0")), parent_mask);
+        assert_eq!(trace.get_trace_io_mask(Some("srv_trace:0")), parent_io);
+
+        // A later change to the parent does not follow the already-connected
+        // child: C copies at the accept, it does not keep them linked.
+        trace.set_trace_mask(Some("srv_trace"), TraceMask::ERROR);
+        assert_eq!(trace.get_trace_mask(Some("srv_trace:0")), parent_mask);
+
+        srv.disconnect(&AsynUser::default()).unwrap();
     }
 
     /// DRV-20 (TCP sibling): the child subport's flush drains its slot's
@@ -1542,7 +2379,7 @@ mod tests {
         let port = srv.local_port();
 
         let mut client = ClientStream::connect(("127.0.0.1", port)).unwrap();
-        let idx = srv.accept_one().unwrap();
+        let idx = wait_for_slot(&srv, 0);
         let mut sub = srv.make_subport(idx).unwrap();
         sub.connect(&AsynUser::default()).unwrap();
 
@@ -1562,6 +2399,63 @@ mod tests {
             Ok(0) => {}
             other => panic!("expected drained (timeout / 0 bytes), got {other:?}"),
         }
+
+        srv.disconnect(&AsynUser::default()).unwrap();
+    }
+
+    /// R19-110 boundary: a datagram fans out to every octet interrupt user,
+    /// with no consumer polling `read_octet`.
+    ///
+    /// C's UDP branch (drvAsynIPServerPort.c:309-322) calls every registered
+    /// octet callback with the payload straight from `recvfrom` — that is the
+    /// only delivery path a UDP server port has for an I/O-Intr scanned record.
+    /// The boundary that matters is the same one as R19-109: the subscriber's
+    /// addr (here 3) does not match the emission's, and C tests neither.
+    #[test]
+    fn a_udp_datagram_fans_out_to_every_octet_user() {
+        use crate::interrupt::{InterruptFilter, InterruptValue};
+        use std::net::UdpSocket as ClientSock;
+        use std::sync::Mutex as StdMutex;
+
+        let mut srv = DrvAsynIPServerPort::new("udp_intr", "127.0.0.1:0 UDP").unwrap();
+        srv.connect(&AsynUser::default()).unwrap();
+        let server_addr = srv
+            .udp_socket
+            .lock()
+            .as_ref()
+            .unwrap()
+            .local_addr()
+            .unwrap();
+
+        let seen: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        let seen_cb = seen.clone();
+        let _cb = srv.base().interrupts.register_sync_callback(
+            InterruptFilter {
+                addr: Some(3),
+                ..InterruptFilter::default()
+            },
+            move |iv: &InterruptValue| {
+                if let ParamValue::Octet(s) = &iv.value {
+                    seen_cb.lock().unwrap().push(s.clone());
+                }
+            },
+        );
+
+        let client = ClientSock::bind("127.0.0.1:0").unwrap();
+        client.send_to(b"telemetry", server_addr).unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if !seen.lock().unwrap().is_empty() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no octet interrupt for the datagram (C: drvAsynIPServerPort.c:312-321)"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(seen.lock().unwrap().as_slice(), ["telemetry".to_string()]);
 
         srv.disconnect(&AsynUser::default()).unwrap();
     }
@@ -1877,9 +2771,8 @@ mod tests {
             buf[..n].to_vec()
         });
 
-        // Server side: accept, read, write reply.
-        let addr = srv.accept_one().unwrap();
-        assert_eq!(addr, 0, "first slot");
+        // Server side: the listener thread accepts; read, write reply.
+        wait_for_slot(&srv, 0);
         let mut user = AsynUser::new(0).with_timeout(Duration::from_secs(2));
         let mut buf = [0u8; 32];
         let n = srv.read_octet(&user, &mut buf).unwrap();
@@ -1890,8 +2783,11 @@ mod tests {
         assert_eq!(reply, b"hello-client");
     }
 
-    /// `accept_one` exhausts slots when more than `max_clients`
-    /// connections are pending.
+    /// The slot table caps concurrent clients: C's listener accepts the
+    /// connection anyway (POSIX `accept(2)` has no peek), finds no free child
+    /// port, prints "too many clients" and calls `epicsSocketDestroy(clientFd)`
+    /// (drvAsynIPServerPort.c:351-355). The peer therefore sees its connection
+    /// closed rather than hanging in the backlog.
     #[test]
     fn slot_table_caps_concurrent_clients() {
         let cfg = IpServerConfig {
@@ -1899,6 +2795,7 @@ mod tests {
             bind_port: 0,
             protocol: IpServerProtocol::Tcp,
             max_clients: 2,
+            no_process_eos: false,
             read_timeout: None,
         };
         let mut srv = DrvAsynIPServerPort::with_config("srv2", cfg).unwrap();
@@ -1906,33 +2803,24 @@ mod tests {
         let port = srv.local_port();
 
         let _c1 = std::net::TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+        wait_for_slot(&srv, 0);
         let _c2 = std::net::TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
-        let _c3 = std::net::TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+        wait_for_slot(&srv, 1);
 
-        assert_eq!(srv.accept_one().unwrap(), 0);
-        assert_eq!(srv.accept_one().unwrap(), 1);
-        // Third accept should fail: no free slot.
-        let err = srv.accept_one().unwrap_err();
-        match err {
-            AsynError::Status { message, .. } => {
-                assert!(
-                    message.contains("no free client slot"),
-                    "expected slot-full error, got: {message}"
-                );
-            }
-            _ => panic!("wrong error variant"),
-        }
+        // Third client: both slots are taken, so the server destroys the socket.
+        let mut c3 = std::net::TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+        c3.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut buf = [0u8; 1];
+        assert_eq!(
+            c3.read(&mut buf).unwrap(),
+            0,
+            "a client over max_clients must see its connection closed (C: \"too many \
+             clients\" + epicsSocketDestroy), not sit in the backlog"
+        );
     }
 
-    /// `drop_client` frees a slot for reuse.
-    ///
-    /// Note on accept-when-full semantics: when the slot table is
-    /// saturated, `accept_one` still pulls the next pending
-    /// connection from the kernel queue (POSIX `accept(2)` has no
-    /// peek primitive) and returns Err — the just-accepted stream
-    /// drops, so the peer sees the connection close. Operators must
-    /// `drop_client` an existing slot BEFORE the next client connects
-    /// if they want it to land. This test exercises that contract.
+    /// `drop_client` frees a slot for reuse: the running listener lands the next
+    /// client in it.
     #[test]
     fn drop_client_releases_slot() {
         let cfg = IpServerConfig {
@@ -1940,6 +2828,7 @@ mod tests {
             bind_port: 0,
             protocol: IpServerProtocol::Tcp,
             max_clients: 1,
+            no_process_eos: false,
             read_timeout: None,
         };
         let mut srv = DrvAsynIPServerPort::with_config("srv3", cfg).unwrap();
@@ -1947,7 +2836,7 @@ mod tests {
         let port = srv.local_port();
 
         let _c1 = std::net::TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
-        assert_eq!(srv.accept_one().unwrap(), 0);
+        wait_for_slot(&srv, 0);
         assert!(srv.peer(0).is_some());
 
         // Free the slot first (operator action), then connect a new
@@ -1956,7 +2845,7 @@ mod tests {
         assert!(srv.peer(0).is_none());
 
         let _c2 = std::net::TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
-        assert_eq!(srv.accept_one().unwrap(), 0);
+        wait_for_slot(&srv, 0);
         assert!(srv.peer(0).is_some());
     }
 
@@ -1969,6 +2858,7 @@ mod tests {
             bind_port: 0,
             protocol: IpServerProtocol::Tcp,
             max_clients: 3,
+            no_process_eos: false,
             read_timeout: None,
         };
         let srv = DrvAsynIPServerPort::with_config("parent", cfg).unwrap();
@@ -1985,6 +2875,81 @@ mod tests {
         );
     }
 
+    /// A child port IS a `drvAsynIPPortConfigure`d port (C creates it with
+    /// exactly that call, drvAsynIPServerPort.c:688-694), so it carries the same
+    /// configure-time shape as the client IP port the same command builds:
+    ///
+    /// - `octet_interrupt_process` — `pasynOctetBase->initialize(..., 1)`
+    ///   (drvAsynIPPort.c:1055): without it a `stringin` with SCAN="I/O Intr" on
+    ///   `<parent>:<N>` never processes (R19-108).
+    /// - one EOS interpose — `asynInterposeEosConfig` unless `noProcessEos`
+    ///   (drvAsynIPPort.c:1065-1066): without it an IEOS on the child terminates
+    ///   nothing (R19-107).
+    /// - `auto_connect == false` — C passes `noAutoConnect = 1` for the child;
+    ///   the listener connects it by handing it the accepted fd.
+    ///
+    /// Boundary: `noProcessEos` 0 vs 1 — the ONLY thing that may change is the
+    /// EOS layer.
+    #[test]
+    fn a_child_port_has_the_shape_drv_asyn_ip_port_configure_gives_it() {
+        let build = |name: &str, no_process_eos: bool| {
+            let cfg = IpServerConfig {
+                bind_host: "127.0.0.1".into(),
+                bind_port: 0,
+                protocol: IpServerProtocol::Tcp,
+                max_clients: 2,
+                no_process_eos,
+                read_timeout: None,
+            };
+            DrvAsynIPServerPort::with_config(name, cfg).unwrap()
+        };
+
+        let srv = build("child_eos_on", false);
+        let child = srv.make_subport(1).unwrap();
+        assert_eq!(child.base().port_name, "child_eos_on:1");
+        assert!(
+            child.base().octet_interrupt_process,
+            "a child fans its reads out to interrupt users, like every drvAsynIPPort"
+        );
+        assert_eq!(
+            child.base().interpose_octet.len(),
+            1,
+            "a child gets the default EOS interpose"
+        );
+        assert!(!child.base().auto_connect, "C passes noAutoConnect=1");
+
+        // noProcessEos=1 suppresses the EOS layer and NOTHING else.
+        let srv = build("child_eos_off", true);
+        let child = srv.make_subport(0).unwrap();
+        assert!(child.base().octet_interrupt_process);
+        assert_eq!(
+            child.base().interpose_octet.len(),
+            0,
+            "noProcessEos must suppress the EOS interpose"
+        );
+        assert!(!child.base().auto_connect);
+    }
+
+    /// The parent's own EOS state is not the child's: C's parent server port
+    /// registers `pasynOctetBase->initialize(..., 0)` — no EOS processing, no
+    /// interruptProcess flag on its own octet interface
+    /// (drvAsynIPServerPort.c:655-661) — and it is the CHILDREN that are real
+    /// IP ports. Pins the asymmetry so a future "make them consistent" does not
+    /// hand the parent an EOS layer C never gives it.
+    #[test]
+    fn the_server_port_itself_gets_no_eos_interpose() {
+        let cfg = IpServerConfig {
+            bind_host: "127.0.0.1".into(),
+            bind_port: 0,
+            protocol: IpServerProtocol::Tcp,
+            max_clients: 1,
+            no_process_eos: false,
+            read_timeout: None,
+        };
+        let srv = DrvAsynIPServerPort::with_config("srv_no_eos", cfg).unwrap();
+        assert_eq!(srv.base().interpose_octet.len(), 0);
+    }
+
     /// make_subport on an out-of-range index errors rather than panic.
     #[test]
     fn make_subport_rejects_out_of_range_idx() {
@@ -1993,6 +2958,7 @@ mod tests {
             bind_port: 0,
             protocol: IpServerProtocol::Tcp,
             max_clients: 2,
+            no_process_eos: false,
             read_timeout: None,
         };
         let srv = DrvAsynIPServerPort::with_config("p2", cfg).unwrap();
@@ -2020,6 +2986,7 @@ mod tests {
             bind_port: 0,
             protocol: IpServerProtocol::Tcp,
             max_clients: 1,
+            no_process_eos: false,
             read_timeout: None,
         };
         let mut srv = DrvAsynIPServerPort::with_config("psh", cfg).unwrap();
@@ -2038,7 +3005,7 @@ mod tests {
             buf
         });
 
-        assert_eq!(srv.accept_one().unwrap(), 0);
+        wait_for_slot(&srv, 0);
         // Subport now sees the assigned stream.
         sub.connect(&AsynUser::default()).unwrap();
         assert!(sub.peer().is_some());

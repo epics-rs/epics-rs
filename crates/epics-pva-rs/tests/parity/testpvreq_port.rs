@@ -126,7 +126,7 @@ fn pvxs_request_empty_field_selects_all_bits() {
     // pvxs: request `{ field {} }` → mask = {0,1,2,3,4,5,6,7,8,9}
     let value = nt_scalar_string();
     let req = empty_request_field();
-    let mask = request_to_mask(&value, &req).unwrap();
+    let mask = request_to_mask(&value, Some(&req)).unwrap();
     assert_eq!(collect(&mask), (0..10).collect::<Vec<_>>());
 }
 
@@ -135,7 +135,7 @@ fn pvxs_request_value_only_selects_root_and_value() {
     // pvxs: request `{ field { value {} } }` → mask = {0, 1}
     let value = nt_scalar_string();
     let req = request_field_value();
-    let mask = request_to_mask(&value, &req).unwrap();
+    let mask = request_to_mask(&value, Some(&req)).unwrap();
     assert_eq!(collect(&mask), vec![0, 1]);
 }
 
@@ -147,7 +147,7 @@ fn pvxs_request_alarm_status_and_timestamp_selects_subtrees() {
     //   7..9 = timeStamp.{seconds,nanoseconds,userTag} (empty {} sub-selects all)
     let value = nt_scalar_string();
     let req = request_field_alarm_status_and_timestamp();
-    let mask = request_to_mask(&value, &req).unwrap();
+    let mask = request_to_mask(&value, Some(&req)).unwrap();
     assert_eq!(collect(&mask), vec![0, 2, 4, 6, 7, 8, 9]);
 }
 
@@ -194,7 +194,7 @@ fn pvxs_request_includes_skips_nonexistent_field_silently() {
             },
         )],
     };
-    let mask = request_to_mask(&value, &req).unwrap();
+    let mask = request_to_mask(&value, Some(&req)).unwrap();
     assert_eq!(collect(&mask), vec![0, 2, 4, 6, 7, 8, 9]);
 }
 
@@ -214,7 +214,7 @@ fn pvxs_request_includes_skips_nonexistent_field_silently() {
 fn pvxs_pv_mask_value_request_intersects_value_only() {
     let value = nt_scalar_string();
     let req = request_field_value();
-    let mask = request_to_mask(&value, &req).unwrap();
+    let mask = request_to_mask(&value, Some(&req)).unwrap();
     assert_eq!(collect(&mask), vec![0, 1]);
 
     // initially nothing marked → no intersection
@@ -246,7 +246,7 @@ fn pvxs_pv_mask_value_request_intersects_value_only() {
 fn pvxs_pv_mask_alarm_only_does_not_intersect_value_request() {
     let value = nt_scalar_string();
     let req = request_field_value();
-    let mask = request_to_mask(&value, &req).unwrap(); // {0, 1}
+    let mask = request_to_mask(&value, Some(&req)).unwrap(); // {0, 1}
 
     // marked = {alarm.severity, alarm.status, alarm.message} = bits 3,4,5
     let mut marked = BitSet::new();
@@ -261,7 +261,7 @@ fn pvxs_pv_mask_empty_request_intersects_anything() {
     // empty `field {}` mask = all 10 bits
     let value = nt_scalar_string();
     let req = empty_request_field();
-    let mask = request_to_mask(&value, &req).unwrap();
+    let mask = request_to_mask(&value, Some(&req)).unwrap();
 
     let mut marked = BitSet::new();
     marked.set(7); // timeStamp.secondsPastEpoch
@@ -422,6 +422,6 @@ fn pvxs_request_only_nonexistent_field_errors() {
             },
         )],
     };
-    let err = request_to_mask(&value, &req).unwrap_err();
+    let err = request_to_mask(&value, Some(&req)).unwrap_err();
     assert_eq!(err, RequestMaskError::EmptyMask);
 }

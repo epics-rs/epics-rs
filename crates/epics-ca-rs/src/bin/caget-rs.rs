@@ -1,15 +1,30 @@
-use chrono::{DateTime, Local};
 use clap::{CommandFactory, FromArgMatches, Parser};
 use epics_base_rs::server::snapshot::{DbrClass, Snapshot};
-use epics_base_rs::types::{DBR_CLASS_NAME, WallTime};
+use epics_base_rs::types::{DBR_CLASS_NAME, DBR_LONG};
 use epics_ca_rs::cli::{
-    FloatFormat, FloatStyle, IntStyle, PV_NAME_WIDTH, ValueFormat, format_value,
+    CountPrefix, FloatFormat, FloatStyle, NO_DATA_MARKER, PV_NAME_WIDTH, ValueFormat,
+    ca_error_marker, dbr_value_field_type, format_c_g, format_time, format_value,
+    format_value_segment, sevr_to_str, stat_to_str, zero_dbr_snapshot, zero_dbr_value,
 };
 use epics_ca_rs::client::{
     CaClient, ReqCount, enum_cli_readback_dbr, float_as_string_readback_dbr,
 };
+use epics_ca_rs::copt::{self, CTool, scan_i32};
+use epics_ca_rs::protocol::ECA_DISCONN;
 use epics_ca_rs::{CaError, DbFieldType, EpicsValue};
 use std::time::SystemTime;
+
+/// Owner of every C-scanned option argument in this binary (see
+/// [`epics_ca_rs::copt`]). The name is what C stamps into its warnings.
+const TOOL: CTool = CTool::new("caget");
+
+/// The getopt cases that `return` from C's `main` (`caget.c:399-405`), by clap
+/// id. `copt::Scan::finish` performs the FIRST one on the command line, after
+/// replaying the warnings the loop raised on its way there (R13-26).
+const TERMINALS: &[(&str, copt::Terminal)] = &[
+    ("help", copt::Terminal::Usage(0)),
+    ("version", copt::Terminal::Version),
+];
 
 /// C `caget` output format (`caget.c:45`, `typedef enum { plain, terse,
 /// all, specifiedDbr }`). The request DBR type and the output format are
@@ -24,49 +39,117 @@ enum OutputMode {
     SpecifiedDbr,
 }
 
-/// C `caget.c:369-375` `complainIfNotPlainAndSet`: `-t`, `-a`, `-d` are
-/// mutually exclusive output formats applied in command-line order — the
-/// second one warns and the later option wins. clap collapses the three
-/// into independent fields, so the order is recovered from the parsed
-/// argument indices.
-fn resolve_output_mode(matches: &clap::ArgMatches) -> OutputMode {
-    use clap::parser::ValueSource;
-    // `index_of` returns a bogus index for an arg left at its default,
-    // so only an option actually supplied on the command line counts —
-    // gate on `ValueSource::CommandLine`, then use its index for order.
-    let mut opts: Vec<(usize, OutputMode)> = Vec::new();
-    for (id, m) in [
-        ("terse", OutputMode::Terse),
-        ("wide", OutputMode::All),
-        ("dbr_type", OutputMode::SpecifiedDbr),
-    ] {
-        if matches.value_source(id) == Some(ValueSource::CommandLine)
-            && let Some(i) = matches.index_of(id)
-        {
-            opts.push((i, m));
+/// The `-t` / `-a` / `-d` half of C's getopt loop, replayed in command-line
+/// order — the ONE owner of both `format` and `type` (`caget.c:386-434`).
+///
+/// C's `complainIfNotPlainAndSet` (`caget.c:369-375`) warns whenever the
+/// format is not still `plain`, so every occurrence past the first warns and
+/// the LAST one wins. `-d` additionally scans its argument: an invalid type
+/// warns AND reverts `format` to `plain` (`caget.c:430-434`), which is what
+/// un-arms the next occurrence's mutual-exclusion warning — so the three
+/// cannot be resolved independently of each other, or of `-d`'s validity.
+///
+/// All three repeat (R13-17): clap gives every `-d` occurrence its own index,
+/// and for the two flags it records the count plus the index of the last one.
+/// Replaying a flag's occurrences at that index is exact for the two things C
+/// derives from them — which option wins (the highest index) and how many
+/// mutual-exclusion warnings fire (one per occurrence past the first).
+///
+/// Returns C's `(format, type)` pair: `type` is the LAST `-d`'s scanned code,
+/// `None` when that scan failed (C's `type == -1`).
+fn resolve_format(scan: &mut copt::Scan) -> (OutputMode, Option<u16>) {
+    #[derive(Clone)]
+    enum Opt {
+        Terse,
+        All,
+        Dbr(String),
+    }
+    let mut events: Vec<(usize, Opt)> = Vec::new();
+    for (id, ev) in [("terse", Opt::Terse), ("wide", Opt::All)] {
+        let n = scan.count(id);
+        if let Some(i) = scan.last_index(id) {
+            events.extend(std::iter::repeat_n((i, ev), usize::from(n)));
         }
     }
-    opts.sort_by_key(|&(i, _)| i);
+    events.extend(
+        scan.occurrences("dbr_type")
+            .into_iter()
+            .map(|(i, v)| (i, Opt::Dbr(v.to_string()))),
+    );
+    events.sort_by_key(|&(i, _)| i);
+
     let mut format = OutputMode::Plain;
-    for (_, requested) in opts {
+    let mut d_type: Option<u16> = None;
+    for (at, opt) in events {
         if format != OutputMode::Plain {
-            eprintln!("Options t,d,a are mutually exclusive. ('caget -h' for help.)");
+            scan.warn(
+                at,
+                "Options t,d,a are mutually exclusive. ('caget -h' for help.)".to_string(),
+            );
         }
-        format = requested;
+        format = match opt {
+            Opt::Terse => OutputMode::Terse,
+            Opt::All => OutputMode::All,
+            Opt::Dbr(arg) => {
+                d_type = parse_dbr_type(&arg);
+                if d_type.is_none() {
+                    scan.warn(
+                        at,
+                        "Requested dbr type out of range or invalid - ignored. \
+                         ('caget -h' for help.)"
+                            .to_string(),
+                    );
+                    OutputMode::Plain
+                } else {
+                    OutputMode::SpecifiedDbr
+                }
+            }
+        };
     }
-    format
+    (format, d_type)
 }
 
-// C `caget -V` prints a blank line then
-//   "EPICS Version EPICS 7.0.10.1-DEV, CA Protocol version 4.13"
-// We mirror the same line shape but stamp our own crate version into
-// the "EPICS Version" slot so operators can tell at a glance which
-// implementation answered.
-const VERSION_INFO: &str = concat!(
-    "\nEPICS Version epics-rs ",
-    env!("CARGO_PKG_VERSION"),
-    ", CA Protocol version 4.13"
-);
+/// C `caget.c` writes ONE `int type` that both `-d` and `-0<base>` assign,
+/// in getopt order, and the last assignment wins (`caget.c:416-434` for
+/// `-d`, `caget.c:493-495` for `-0`, which sets `type = DBR_LONG` whenever
+/// the base scanned valid). Observed on the compiled C:
+///
+/// ```text
+/// caget -d DBR_DOUBLE -0x TST:AO  →  Request type: DBR_LONG    Value: 0x1
+/// caget -0x -d DBR_DOUBLE TST:AO  →  Request type: DBR_DOUBLE  Value: 1.5
+/// ```
+///
+/// clap has no notion of that sequence, so the winner is recovered from the
+/// argument indices — the same mechanism `resolve_format` uses.
+///
+/// Only a VALID `-0` enters the race (R13-16). C's assignment sits under
+/// `if (outType != dec)` (`caget.c:497-503`), so `-0q` warns and touches
+/// NOTHING: neither the base nor `type`. The position that raced `-d` is
+/// therefore the last VALID occurrence, which is why the caller hands over a
+/// [`copt::Base`] — the fold that decided validity — instead of a raw index:
+///
+/// ```text
+/// caget -0x -d DBR_DOUBLE -0q TST:AO  →  Request type: DBR_DOUBLE
+/// ```
+///
+/// (`-0q` is the last `-0`, but the last one that ASSIGNED is `-0x`, which
+/// lost to `-d`.)
+///
+/// The type only reaches the wire under `specifiedDbr`
+/// (`caget.c:175`), so `-0x` on its own still gets the native TIME type.
+fn resolve_dbr_type(scan: &copt::Scan, int_base: copt::Base, dbr_type: Option<u16>) -> Option<u16> {
+    // No valid `-0<base>`: C never ran the guard, so `type` was never forced.
+    let Some(base) = int_base.valid_at else {
+        return dbr_type;
+    };
+    // `-d` may repeat too, and EVERY occurrence assigns `type` in C (an
+    // out-of-range one leaves it invalid and falls back to `plain`, where the
+    // type is never used) — so the LAST `-d` is the one racing.
+    match scan.last_index("dbr_type") {
+        Some(d) if d > base => dbr_type,
+        _ => Some(DBR_LONG),
+    }
+}
 
 /// Mirror of C `caget` flags. Where the C flag is a value-printing
 /// modifier we forward into [`epics_ca_rs::cli::ValueFormat`].
@@ -74,136 +157,202 @@ const VERSION_INFO: &str = concat!(
 #[command(
     name = "caget-rs",
     about = "Read EPICS PV values",
-    disable_version_flag = true
+    disable_version_flag = true,
+    disable_help_flag = true
 )]
 struct Args {
-    /// Help / version are short-circuited in `parse_argv` before clap.
-    #[arg(short = 'V', long, hide = true)]
-    version: bool,
+    // `-h` and `-V` are ORDINARY options, not clap's terminating Help/Version
+    // actions: C's getopt loop reaches them in order, so the warnings from
+    // options *before* them are already on stderr (R13-26). `copt::Scan`
+    // performs them at their position — see `TERMINALS`.
+    //
+    // Every option below is declared `Append` (value option) or `Count` (flag)
+    // because C's getopt loop accepts every option any number of times, last one
+    // winning — see `epics_ca_rs::copt`, whose `get_matches` refuses to run a
+    // spec that says otherwise.
+    //
+    // Doc comments on these fields are the option's HELP TEXT, so the rationale
+    // above stays a plain comment.
+    /// Print this message
+    #[arg(short = 'h', long, action = clap::ArgAction::Count)]
+    help: u8,
 
-    /// CA timeout in seconds.
-    /// C ref: `tool_lib.c:use_ca_timeout_env` (commit 1d056c6).
-    #[arg(short = 'w', long = "wait")]
-    timeout: Option<f64>,
+    #[arg(short = 'V', long, hide = true, action = clap::ArgAction::Count)]
+    version: u8,
+
+    /// CA timeout in seconds (`epicsScanDouble`; a bad value warns and keeps
+    /// the `EPICS_CA_TIMEOUT` default). Raw `String`: every C-scanned option
+    /// argument is resolved by [`epics_ca_rs::copt`], never by clap.
+    /// C ref: `caget.c:437-443`, `tool_lib.c:use_ca_timeout_env`.
+    #[arg(short = 'w', long = "wait", allow_hyphen_values = true, action = clap::ArgAction::Append)]
+    timeout: Vec<String>,
 
     /// Asynchronous get (`ca_get_callback`); waits for completion.
     /// Today the Rust client always waits via the GET response, so
     /// this flag is accepted for parity but does not change behaviour.
-    #[arg(short = 'c', long)]
-    callback: bool,
+    #[arg(short = 'c', long, action = clap::ArgAction::Count)]
+    callback: u8,
 
-    /// CA priority (0-99). Opens the channel on the matching priority
-    /// virtual circuit (libca `ca_create_channel` priority parameter).
-    #[arg(short = 'p', long)]
-    priority: Option<u8>,
+    /// CA priority (`sscanf("%u")`, clamped to `CA_PRIORITY_MAX`). `-p -1`
+    /// and `-p 500` are NOT errors in C — both clamp to 99 (`caget.c:455-462`).
+    #[arg(short = 'p', long, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+    priority: Vec<String>,
 
     /// Terse: print only the value (no PV name column).
-    #[arg(short = 't', long)]
-    terse: bool,
+    #[arg(short = 't', long, action = clap::ArgAction::Count)]
+    terse: u8,
 
     /// Wide: print `name timestamp value stat sevr` (DBR_TIME_xxx).
-    #[arg(short = 'a', long)]
-    wide: bool,
+    #[arg(short = 'a', long, action = clap::ArgAction::Count)]
+    wide: u8,
 
     /// Request a specific DBR type by name (e.g. `DOUBLE`,
     /// `DBR_TIME_DOUBLE`) or numeric DBR id. The named family selects
     /// the GET request class (STS/TIME/GR/CTRL or plain value).
-    #[arg(short = 'd', long = "dbr-type")]
-    dbr_type: Option<String>,
+    #[arg(
+        short = 'd',
+        long = "dbr-type",
+        allow_hyphen_values = true,
+        action = clap::ArgAction::Append
+    )]
+    dbr_type: Vec<String>,
 
     /// Print enums as numeric index (default is enum string when
     /// the server returns one).
-    #[arg(short = 'n', long = "num-enum")]
-    enum_as_number: bool,
+    #[arg(short = 'n', long = "num-enum", action = clap::ArgAction::Count)]
+    enum_as_number: u8,
 
-    /// Print at most this many array elements (count prefix in the
-    /// output stays the actual array length).
-    #[arg(short = '#', long = "max-elements", value_name = "COUNT")]
-    max_elements: Option<usize>,
+    /// C's `reqElems` (`sscanf("%d")`, `caget.c:447-453`). `0` — including
+    /// `-# 0` and an unscannable `-#` — is C's "not specified", i.e. ALL
+    /// elements. Resolved by [`CTool::req_elems_int`].
+    #[arg(
+        short = '#',
+        long = "max-elements",
+        value_name = "COUNT",
+        allow_hyphen_values = true,
+        action = clap::ArgAction::Append
+    )]
+    max_elements: Vec<String>,
 
     /// Render `DBR_CHAR` arrays as a NUL-terminated string.
-    #[arg(short = 'S', long = "char-as-string")]
-    char_array_as_string: bool,
+    #[arg(short = 'S', long = "char-as-string", action = clap::ArgAction::Count)]
+    char_array_as_string: u8,
 
-    /// `%e` float format with the given precision.
-    #[arg(short = 'e', long = "format-e", value_name = "PRECISION")]
-    fmt_e: Option<u32>,
+    /// `%e` float format with the given precision (`sscanf("%d")` + the
+    /// `0..=VALID_DOUBLE_DIGITS` gate; both failures warn and keep the
+    /// default format — `caget.c:470-484`).
+    #[arg(
+        short = 'e',
+        long = "format-e",
+        value_name = "PRECISION",
+        allow_hyphen_values = true,
+        action = clap::ArgAction::Append
+    )]
+    fmt_e: Vec<String>,
 
     /// `%f` float format with the given precision.
-    #[arg(short = 'f', long = "format-f", value_name = "PRECISION")]
-    fmt_f: Option<u32>,
+    #[arg(
+        short = 'f',
+        long = "format-f",
+        value_name = "PRECISION",
+        allow_hyphen_values = true,
+        action = clap::ArgAction::Append
+    )]
+    fmt_f: Vec<String>,
 
     /// `%g` float format with the given precision (the default style).
-    #[arg(short = 'g', long = "format-g", value_name = "PRECISION")]
-    fmt_g: Option<u32>,
+    #[arg(
+        short = 'g',
+        long = "format-g",
+        value_name = "PRECISION",
+        allow_hyphen_values = true,
+        action = clap::ArgAction::Append
+    )]
+    fmt_g: Vec<String>,
 
     /// Get value as string (honors server-side precision).
     /// Accepted for parity; today returns the same as default since
     /// the server already serialises floats with its own precision.
-    #[arg(short = 's', long = "string-format")]
-    string_format: bool,
+    #[arg(short = 's', long = "string-format", action = clap::ArgAction::Count)]
+    string_format: u8,
 
-    /// Round float to integer and print in hex (`-lx`).
-    #[arg(long = "lx", conflicts_with_all = ["lo_flag", "lb_flag", "ix_flag", "io_flag", "ib_flag"])]
-    lx_flag: bool,
-    /// Round float to integer and print in octal (`-lo`).
-    #[arg(long = "lo", conflicts_with_all = ["lx_flag", "lb_flag", "ix_flag", "io_flag", "ib_flag"])]
-    lo_flag: bool,
-    /// Round float to integer and print in binary (`-lb`).
-    #[arg(long = "lb", conflicts_with_all = ["lx_flag", "lo_flag", "ix_flag", "io_flag", "ib_flag"])]
-    lb_flag: bool,
+    /// `-0<base>`: print integers in base `x` (hex), `o` (octal) or `b`
+    /// (binary), and request the value as `DBR_LONG`. C spells this as a
+    /// getopt option TAKING AN ARGUMENT (`caget.c:398` `"...#:d:0:w:..."`),
+    /// so it is `-0` with an attached or separate `<base>` — never a
+    /// `--0x`-style flag, which no C script can pass. Repeats are folded by
+    /// [`CTool::base`], which keeps C's "last VALID wins" rule.
+    #[arg(
+        short = '0',
+        value_name = "BASE",
+        allow_hyphen_values = true,
+        action = clap::ArgAction::Append
+    )]
+    int_base: Vec<String>,
 
-    /// Print integers in hex (`-0x`).
-    #[arg(long = "0x", conflicts_with_all = ["io_flag", "ib_flag"])]
-    ix_flag: bool,
-    /// Print integers in octal (`-0o`).
-    #[arg(long = "0o", conflicts_with_all = ["ix_flag", "ib_flag"])]
-    io_flag: bool,
-    /// Print integers in binary (`-0b`).
-    #[arg(long = "0b", conflicts_with_all = ["ix_flag", "io_flag"])]
-    ib_flag: bool,
+    /// `-l<base>`: round a float to a long and print it in base `x`/`o`/`b`
+    /// (C `outTypeF`). Same option shape as `-0` (`caget.c:398`).
+    #[arg(
+        short = 'l',
+        value_name = "BASE",
+        allow_hyphen_values = true,
+        action = clap::ArgAction::Append
+    )]
+    float_base: Vec<String>,
 
-    /// Alternate output field separator. Defaults to a single space.
-    #[arg(short = 'F', long = "field-separator", value_name = "OFS")]
-    field_separator: Option<char>,
+    /// Alternate output field separator: C takes `(char) *optarg`, the FIRST
+    /// character, and discards the rest (`caget.c:505`).
+    #[arg(
+        short = 'F',
+        long = "field-separator",
+        value_name = "OFS",
+        allow_hyphen_values = true,
+        action = clap::ArgAction::Append
+    )]
+    field_separator: Vec<String>,
 
-    /// PV names to read.
-    #[arg(required_unless_present_any = ["version"])]
+    /// PV names to read. NOT clap-`required`: C's getopt loop has no
+    /// required positional — it parses, then `main` checks `nPvs < 1` and
+    /// reports C's own diagnostic (`CTool::no_pv_name`, caget.c:527-531).
     pv_names: Vec<String>,
 }
 
 impl Args {
-    /// Build a [`ValueFormat`] from the CLI flags.
-    fn value_format(&self) -> ValueFormat {
+    /// Build a [`ValueFormat`] from the CLI flags. Every C-scanned argument
+    /// goes through [`TOOL`], which warns and falls back exactly like C's
+    /// getopt loop — nothing here can fail the program.
+    /// `int_base` is passed in already folded because C's `-0` case writes TWO
+    /// things — the integer base AND `type` — and both callers must see the
+    /// same fold (and its warnings, printed exactly once).
+    fn value_format(&self, scan: &mut copt::Scan, int_base: copt::Base) -> ValueFormat {
         let mut fmt = ValueFormat::default();
-        if let Some(p) = self.fmt_e {
+        // W10-B2. `-e`/`-f`/`-g` are ONE getopt case writing ONE `dblFormatStr`
+        // (`caget.c:470-484`), so the LAST VALID occurrence across the three letters wins
+        // — in command-line order, not by an `e` > `f` > `g` precedence. The
+        // order lives in the scan, which is why the three `Vec<String>` fields
+        // cannot resolve it themselves. Every occurrence is still scanned, so
+        // each malformed precision emits its own warning as C's loop does.
+        if let Some((letter, precision)) =
+            scan.float_precision(&[('e', "fmt_e"), ('f', "fmt_f"), ('g', "fmt_g")])
+        {
             fmt.float = FloatFormat {
-                style: FloatStyle::E,
-                precision: p,
-            };
-        } else if let Some(p) = self.fmt_f {
-            fmt.float = FloatFormat {
-                style: FloatStyle::F,
-                precision: p,
-            };
-        } else if let Some(p) = self.fmt_g {
-            fmt.float = FloatFormat {
-                style: FloatStyle::G,
-                precision: p,
+                style: match letter {
+                    'e' => FloatStyle::E,
+                    'f' => FloatStyle::F,
+                    _ => FloatStyle::G,
+                },
+                precision,
             };
         }
-        if self.ix_flag || self.lx_flag {
-            fmt.int_style = IntStyle::Hex;
-        } else if self.io_flag || self.lo_flag {
-            fmt.int_style = IntStyle::Oct;
-        } else if self.ib_flag || self.lb_flag {
-            fmt.int_style = IntStyle::Bin;
-        }
-        fmt.float_as_int = self.lx_flag || self.lo_flag || self.lb_flag;
-        fmt.enum_as_number = self.enum_as_number;
-        fmt.char_array_as_string = self.char_array_as_string;
-        fmt.max_elements = self.max_elements;
-        if let Some(c) = self.field_separator {
+        // C `caget.c:485-499` writes exactly ONE of the two base globals per
+        // occurrence: `-0<base>` sets `outTypeI` (integers), `-l<base>` sets
+        // `outTypeF` (floats, via round-to-long). They never cross.
+        fmt.int_style = int_base.style;
+        fmt.float_style = scan.base('l', "float_base").style;
+        fmt.enum_as_number = self.enum_as_number > 0;
+        fmt.char_array_as_string = self.char_array_as_string > 0;
+        fmt.req_elems = scan.req_elems_int("max_elements");
+        if let Some(c) = scan.field_separator("field_separator") {
             fmt.field_separator = c;
         }
         fmt
@@ -214,6 +363,7 @@ impl Args {
 /// `Plain` is the cheap typed-value path (no timestamp); `Time` is
 /// the DBR_TIME variant produced by `-a` so the print loop can lift
 /// the real server timestamp + alarm pair onto the wire.
+#[derive(Debug)]
 enum GetResult {
     Plain(EpicsValue),
     // Boxed to keep the enum variants size-balanced after Snapshot
@@ -228,51 +378,6 @@ enum GetResult {
         req_type: u16,
         snap: Box<Snapshot>,
     },
-}
-
-fn format_server_timestamp(ts: WallTime) -> String {
-    // Display only, to microseconds (`%.6f`), so converting through
-    // `SystemTime` (100 ns-granular on Windows) loses nothing visible.
-    let dt: DateTime<Local> = SystemTime::from(ts).into();
-    dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string()
-}
-
-fn sevr_to_str(sevr: u16) -> &'static str {
-    match sevr {
-        0 => "NO_ALARM",
-        1 => "MINOR",
-        2 => "MAJOR",
-        3 => "INVALID",
-        _ => "Illegal value",
-    }
-}
-
-fn stat_to_str(stat: u16) -> &'static str {
-    match stat {
-        0 => "NO_ALARM",
-        1 => "READ",
-        2 => "WRITE",
-        3 => "HIHI",
-        4 => "HIGH",
-        5 => "LOLO",
-        6 => "LOW",
-        7 => "STATE",
-        8 => "COS",
-        9 => "COMM",
-        10 => "TIMEOUT",
-        11 => "HW_LIMIT",
-        12 => "CALC",
-        13 => "SCAN",
-        14 => "LINK",
-        15 => "SOFT",
-        16 => "BAD_SUB",
-        17 => "UDF",
-        18 => "DISABLE",
-        19 => "SIMM",
-        20 => "READ_ACCESS",
-        21 => "WRITE_ACCESS",
-        _ => "Illegal value",
-    }
 }
 
 /// C `dbf_type_to_text`: native field type → `DBF_*` mnemonic.
@@ -293,52 +398,11 @@ fn dbf_text(t: DbFieldType) -> &'static str {
     }
 }
 
-/// C `dbr_type_to_text`: DBR type code (0..=38) → `DBR_*` mnemonic
-/// (db_access.c `dbr_text[]`). Out-of-range codes mirror C's
-/// `"DBR_invalid"`.
+/// C `dbr_type_to_text`: DBR type code (0..=38) → `DBR_*` mnemonic.
+/// The table lives in `epics_base_rs` beside its inverse
+/// (`dbr_text_to_type`); this is the only caller left in the tools.
 fn dbr_text(code: u16) -> &'static str {
-    const NAMES: [&str; 39] = [
-        "DBR_STRING",
-        "DBR_SHORT",
-        "DBR_FLOAT",
-        "DBR_ENUM",
-        "DBR_CHAR",
-        "DBR_LONG",
-        "DBR_DOUBLE",
-        "DBR_STS_STRING",
-        "DBR_STS_SHORT",
-        "DBR_STS_FLOAT",
-        "DBR_STS_ENUM",
-        "DBR_STS_CHAR",
-        "DBR_STS_LONG",
-        "DBR_STS_DOUBLE",
-        "DBR_TIME_STRING",
-        "DBR_TIME_SHORT",
-        "DBR_TIME_FLOAT",
-        "DBR_TIME_ENUM",
-        "DBR_TIME_CHAR",
-        "DBR_TIME_LONG",
-        "DBR_TIME_DOUBLE",
-        "DBR_GR_STRING",
-        "DBR_GR_SHORT",
-        "DBR_GR_FLOAT",
-        "DBR_GR_ENUM",
-        "DBR_GR_CHAR",
-        "DBR_GR_LONG",
-        "DBR_GR_DOUBLE",
-        "DBR_CTRL_STRING",
-        "DBR_CTRL_SHORT",
-        "DBR_CTRL_FLOAT",
-        "DBR_CTRL_ENUM",
-        "DBR_CTRL_CHAR",
-        "DBR_CTRL_LONG",
-        "DBR_CTRL_DOUBLE",
-        "DBR_PUT_ACKT",
-        "DBR_PUT_ACKS",
-        "DBR_STSACK_STRING",
-        "DBR_CLASS_NAME",
-    ];
-    NAMES.get(code as usize).copied().unwrap_or("DBR_invalid")
+    epics_base_rs::types::dbr_type_to_text(code)
 }
 
 /// C `dbr2str` (tool_lib.c:335): the extended-metadata block printed
@@ -349,9 +413,9 @@ fn dbr_text(code: u16) -> &'static str {
 /// values. Each line is indented with four spaces and the block carries
 /// no trailing newline.
 ///
-/// Numeric limit formatting follows the C macros' spirit (`%8d` for
-/// integer classes, `%g` for float/double) but exact `sprint_long`/`%g`
-/// byte-parity is a separate concern.
+/// Numeric limits take the conversion the C macro embeds: `%8d` for the
+/// integer classes and a hardcoded `%g` for FLOAT/DOUBLE, rendered by
+/// [`epics_ca_rs::cli::format_c_g`] — NOT the `-e`/`-f`/`-g` value format.
 fn dbr_extended_str(req_type: u16, snap: &Snapshot) -> String {
     if req_type <= 6 {
         return String::new();
@@ -374,7 +438,7 @@ fn dbr_extended_str(req_type: u16, snap: &Snapshot) -> String {
         // TIME_* (14..=20): timestamp then status + severity.
         14..=20 => format!(
             "    Timestamp:        {}\n{sts}",
-            format_server_timestamp(snap.timestamp)
+            format_time(snap.timestamp)
         ),
         // GR_ENUM (24) / CTRL_ENUM (31): status/severity then the enum
         // state table (C `PRN_DBR_X_ENUM`).
@@ -405,11 +469,17 @@ fn dbr_extended_str(req_type: u16, snap: &Snapshot) -> String {
             let is_float = matches!(req_type, 23 | 27 | 30 | 34); // GR/CTRL FLOAT/DOUBLE
             let is_int = matches!(req_type, 22 | 25 | 26 | 29 | 32 | 33); // SHORT/CHAR/LONG
             let d = snap.display.clone().unwrap_or_default();
+            // C renders each limit straight from the `FMT_GR` / `FMT_CTRL`
+            // macro's embedded conversion — `%8d` for the integer classes,
+            // a hardcoded `%g` for FLOAT/DOUBLE (`tool_lib.c:248-254`). The
+            // `-e`/`-f`/`-g` flags only rewrite `dblFormatStr`, which is
+            // read by `val2str` (the Value line) and never by `dbr2str`, so
+            // `fmt` deliberately does not participate here.
             let lim = |v: f64| -> String {
                 if is_int {
                     format!("{:8}", v as i64)
                 } else {
-                    format!("{v}")
+                    format_c_g(v)
                 }
             };
             let mut out = sts;
@@ -502,10 +572,12 @@ fn specified_dbr_report(
         let _ = writeln!(out, "    Class Name:       {cn}");
     } else {
         let enum_strings = snap.enums.as_ref().map(|e| e.strings.as_slice());
-        // C's specifiedDbr Value line joins elements WITHOUT a leading
-        // count (unlike plain mode), so render with req_elems_present=false;
-        // a scalar therefore renders as the bare value.
-        let rendered = format_value(&snap.value, fmt, enum_strings, false);
+        // C `caget.c:328-334`: this block already printed `Element count:` on
+        // its own line, so its Value loop joins the elements BARE — there is
+        // no `printf("%lu%c", nElems, ...)` here, unlike the plain/terse loop
+        // at `:286`. `reqElems` still reaches the `-S` long-string gate
+        // (`caget.c:318`), so it is passed through unchanged.
+        let rendered = format_value(&snap.value, fmt, enum_strings, CountPrefix::Never);
         let _ = writeln!(out, "    Element count:    {}", snap.value.count());
         let _ = writeln!(out, "    Value:            {rendered}");
         let ext = dbr_extended_str(req_type, snap);
@@ -530,11 +602,14 @@ fn specified_dbr_report(
 ///   (`reqElems && reqElems < nElems ? reqElems : nElems`) →
 ///   [`ReqCount::Fixed`] (which resolves `0` to `native`).
 ///
-/// `max_elements` is the user's `-#` argument (`None` = not given);
-/// `native` is the connected channel's element count (libca
-/// `ca_element_count`).
-fn caget_req_count(callback: bool, max_elements: Option<usize>, native: u32) -> ReqCount {
-    let count = max_elements.map_or(0, |n| (n as u32).min(native));
+/// `req_elems` is C's `reqElems` — the resolved `-#` count, where `0` is
+/// "not specified" (see [`ValueFormat::req_elems`]); `native` is the
+/// connected channel's element count (libca `ca_element_count`). Both C
+/// branches clamp with `reqElems > nElems ? nElems : reqElems`, and `0`
+/// survives the clamp as `0`, so the two modes differ only in what they do
+/// with a `0` afterwards.
+fn caget_req_count(callback: bool, req_elems: u64, native: u32) -> ReqCount {
+    let count = req_elems.min(u64::from(native)) as u32;
     if callback {
         ReqCount::Autosize(count)
     } else {
@@ -542,105 +617,248 @@ fn caget_req_count(callback: bool, max_elements: Option<usize>, native: u32) -> 
     }
 }
 
+/// One PV's read outcome, plus whether its read timed out. C warns ONCE on
+/// stderr for a timed-out read phase (`caget.c:224-226` for `ca_pend_io`,
+/// `:238-239` for the callback wait) and then still runs the print loop, so
+/// the flag has to survive alongside the (possibly successful-looking)
+/// outcome.
+struct PvRead {
+    name: String,
+    outcome: Result<GetResult, ReadError>,
+    timed_out: bool,
+}
+
+/// C `pvs[n].status` after the read phase — the value the print loop
+/// switches on (`caget.c:262-268`, `tool_lib.c:520-529`).
+///
+/// Exactly ONE of these is fatal, and only collectively: C counts the PVs
+/// that were still connected when it issued the read (`nConn`) and returns 1
+/// only when that count is zero (`caget.c:227`). Past that gate the read
+/// function returns 0 unconditionally (`caget.c:348`), so a read-access
+/// denial, a CA error, or a read timeout on SOME PV prints its marker and
+/// leaves the exit status at 0.
+#[derive(Debug)]
+enum ReadError {
+    /// `ca_state != cs_conn` when the read was issued (`caget.c:220`): C
+    /// never sends the get and leaves the PV OUT of `nConn`.
+    Disconnected,
+    /// The `-c` callback never delivered, so `pvs[n].value` is still NULL
+    /// (`caget.c:130,268`). Unreachable on the synchronous path — see
+    /// [`read_timeout`].
+    CallbackTimeout,
+    /// A CA failure carrying an ECA status: `ECA_NORDACCESS` is C's
+    /// read-access denial, anything else is its generic `ca_message` error.
+    Ca(u32),
+}
+
+impl ReadError {
+    /// C's `*** ...` marker for this status (`caget.c:262-268` — the same
+    /// four strings the `terse`, `plain` and `specifiedDbr` formats share,
+    /// and that `print_time_val_sts` repeats for `-a`).
+    fn marker(&self) -> String {
+        match self {
+            ReadError::Disconnected => ca_error_marker(ECA_DISCONN),
+            ReadError::CallbackTimeout => NO_DATA_MARKER.to_string(),
+            ReadError::Ca(s) => ca_error_marker(*s),
+        }
+    }
+}
+
+/// Map one failed get onto C's PV status. A `Timeout` is C's `ca_pend_io`
+/// expiring, which only the CALLBACK path can render as a marker; the caller
+/// resolves that through [`read_timeout`] before reaching here.
+fn read_error(e: &CaError) -> ReadError {
+    match e {
+        CaError::Disconnected | CaError::Shutdown => ReadError::Disconnected,
+        other => ReadError::Ca(other.to_eca_status()),
+    }
+}
+
+/// C `print_time_val_sts` stamps its error lines with the CLIENT's current
+/// time (`epicsTimeGetCurrent`, `tool_lib.c:514-515`), not with a server
+/// timestamp — there is no server response to take one from.
+fn format_client_timestamp() -> String {
+    format_time(SystemTime::now().into())
+}
+
+/// Print one PV's error line in the shape its output format uses.
+///
+/// * `terse` (`caget.c:264-269`): the bare marker.
+/// * `plain` (`caget.c:260-269`): the padded name column, then the marker.
+/// * `specifiedDbr` (`caget.c:299-305`): the name line, then the marker
+///   indented four spaces.
+/// * `all` (`tool_lib.c:517-529`): the padded name column, then either the
+///   `!onceConnected` line — reached exactly when the channel was NOT
+///   connected at read time, so it carries no timestamp — or the client's
+///   current time, a literal space, and the marker.
+fn print_read_error(mode: OutputMode, name_col: &str, pv_name: &str, sep: char, e: &ReadError) {
+    let marker = e.marker();
+    match mode {
+        OutputMode::Terse => println!("{marker}"),
+        OutputMode::SpecifiedDbr => println!("{pv_name}\n    {marker}"),
+        OutputMode::Plain => println!("{name_col}{sep}{marker}"),
+        OutputMode::All => match e {
+            ReadError::Disconnected => {
+                println!("{name_col}{sep}*** Not connected (PV not found)")
+            }
+            _ => println!(
+                "{name_col}{sep}{ts} {marker}",
+                ts = format_client_timestamp()
+            ),
+        },
+    }
+}
+
+/// C's read-timeout contract for one PV — the single owner of what a
+/// timed-out `caget` read RENDERS.
+///
+/// The synchronous get (`ca_array_get`, the default) callocs its readback
+/// buffer BEFORE the wire request (`caget.c:207-215`) and `ca_pend_io`
+/// timing out neither frees it nor touches `pvs[n].status`. The print loop
+/// therefore sees `status == ECA_NORMAL` and `value != 0` and renders the
+/// still-ZEROED buffer (`caget.c:262-293`) — `0` for a scalar, an empty
+/// string for a string/ENUM-label readback, `count` zeros for an array, and
+/// under `-a` the EPICS-epoch stamp with NO_ALARM/NO_ALARM.
+///
+/// ONLY the callback get (`-c`, `ca_array_get_callback`) allocates lazily,
+/// inside its event handler (`caget.c:130`): a callback that never arrives
+/// leaves `value == NULL`, which is the sole way to reach C's
+/// `*** no data available (timeout)` branch (`caget.c:268`).
+///
+/// `base` is the value carrier of the DBR type actually requested; `None`
+/// means `ca_field_type` failed, i.e. the channel dropped after the connect
+/// barrier — which C reports as `ECA_DISCONN` (`caget.c:219-221`), not as a
+/// timeout.
+fn read_timeout(
+    callback: bool,
+    base: Option<DbFieldType>,
+    elems: u32,
+    zeroed: impl FnOnce(DbFieldType, u32) -> GetResult,
+) -> Result<GetResult, ReadError> {
+    if callback {
+        return Err(ReadError::CallbackTimeout);
+    }
+    match base {
+        Some(b) => Ok(zeroed(b, elems)),
+        None => Err(ReadError::Disconnected),
+    }
+}
+
 #[tokio::main]
 async fn main() {
     // Parse via ArgMatches (not the plain derive) so the command-line
     // order of `-t`/`-a`/`-d` is recoverable for the C mutual-exclusion
-    // rule (`resolve_output_mode`).
-    let matches = Args::command().get_matches();
-    let args = Args::from_arg_matches(&matches).expect("clap validated the arguments");
+    // rule (`resolve_format`).
+    let cmd = Args::command();
+    let parsed = TOOL.get_matches(cmd.clone());
+    let matches = parsed.matches();
+    let args = Args::from_arg_matches(matches).expect("clap validated the arguments");
 
-    if args.version {
-        println!("{VERSION_INFO}");
-        return;
-    }
+    // C's ENTIRE getopt loop runs before any post-loop check, so every option
+    // argument is scanned — and every warning raised — while `nPvs` is still
+    // unread (`caget.c:398-525`, then `:527`). `caget -w abc` with no PV name
+    // therefore prints the timeout warning AND the missing-PV diagnostic; a
+    // scan deferred until after the `nPvs` check would print neither.
+    //
+    // `value_format` is what scans `-#`, `-e`/`-f`/`-g`, `-0`/`-l` and `-F`,
+    // and `resolve_format` is what scans `-t`/`-a`/`-d`; between them and the
+    // two below, every C-scanned argument in this tool is resolved here, once.
+    let mut scan = parsed.scan();
+    let ca_timeout = scan.timeout("timeout", epics_ca_rs::cli::env_default_timeout());
+    let priority = scan.priority("priority");
+    // Folded ONCE: C's `-0` case scans the base and, on success only, forces
+    // `type` — so the base fold and the `type` race must see the SAME result,
+    // and the "Invalid argument" warnings must be raised exactly once.
+    let int_base = scan.base('0', "int_base");
+    let fmt = args.value_format(&mut scan, int_base);
+    // Resolve `-t`/`-a`/`-d` in command-line order — C's getopt loop writes
+    // `format` and `type` from the same three cases, and an invalid `-d`
+    // reverts `format` to plain (`caget.c:369-375,416-434`). `-0<base>` never
+    // sets `format` in C, so a `-0x` alongside an invalid `-d` must not
+    // rescue `specifiedDbr`.
+    let (mode, d_type) = resolve_format(&mut scan);
+    // `-0<base>` assigns the SAME `int type` as `-d` (`caget.c:493`), racing it
+    // in getopt order. The type only reaches the wire under `specifiedDbr`,
+    // which is why `mode` is settled first. Resolved while the scan is still
+    // alive — it is the scan that knows both options' positions.
+    let req_dbr_type = resolve_dbr_type(&scan, int_base, d_type);
 
-    if args.callback {
-        // GET already waits for the response — note silently.
+    // End of C's getopt loop: the warnings above go to stderr in command-line
+    // order, and `-h` / `-V` — which C's loop `return`s from where it meets
+    // them — run here, AFTER those warnings and never before (R13-26).
+    scan.finish(&cmd, &epics_ca_rs::protocol::version_info(), TERMINALS);
+
+    // C `caget.c:527-531`: the missing-PV check runs after the getopt loop,
+    // so `-V` above still wins and a bad option argument has already warned.
+    if args.pv_names.is_empty() {
+        TOOL.no_pv_name();
     }
 
     let client = CaClient::new().await.expect("failed to create CA client");
-    let timeout = epics_ca_rs::cli::timeout_duration(
-        args.timeout
-            .unwrap_or_else(epics_ca_rs::cli::env_default_timeout),
-    );
+    let timeout = epics_ca_rs::cli::timeout_duration(ca_timeout);
+    // C `caget.c:553-556`: `connect_pvs` gates the ENTIRE get+print phase.
+    // Any PV that fails to connect inside the one `ca_pend_io` window
+    // aborts before `caget()` runs, so stdout carries zero value lines and
+    // the tool exits 1 — a connected PV's value is NEVER printed alongside
+    // a missing PV's marker.
+    let channels =
+        match epics_ca_rs::cli::connect_pvs(&client, &args.pv_names, priority, timeout).await {
+            Ok(channels) => args
+                .pv_names
+                .iter()
+                .cloned()
+                .zip(channels)
+                .collect::<Vec<_>>(),
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        };
 
-    // Route -p into the priority circuit (libca
-    // `tool_lib.c` passes `caPriority` to `ca_create_channel`).
-    let priority = args.priority.unwrap_or(0);
-    let channels: Vec<_> = args
-        .pv_names
-        .iter()
-        .map(|name| {
-            (
-                name.clone(),
-                client.create_channel_with_priority(name, priority),
-            )
-        })
-        .collect();
-
-    // Connect + read all PVs in parallel within single timeout window
+    // Read all PVs in parallel within a single timeout window
     // (C: connect_pvs → ca_pend_io → ca_array_get → ca_pend_io).
     // `-n`: render ENUM fields as the numeric index. Without it the
     // default readback requests the STRING form (state label), see the
     // per-PV get below (C `caget.c:178-181`).
-    let enum_as_number = args.enum_as_number;
+    let enum_as_number = args.enum_as_number > 0;
     // `-s` (C `floatAsString`): request a native FLOAT/DOUBLE field's value
     // in string form so the SERVER converts it (C `caget.c:183-187`).
-    let float_as_string = args.string_format;
-    // resolve `-d <type>` ONCE here, mirroring C `caget.c`'s
-    // getopt-time resolution (`caget.c:416-434`). The "out of range or
-    // invalid" diagnostic prints exactly once (not per PV).
-    let req_dbr_type: Option<u16> = match args.dbr_type.as_deref() {
-        Some(s) => {
-            let t = parse_dbr_type(s);
-            if t.is_none() {
-                eprintln!(
-                    "Requested dbr type out of range or invalid - ignored. \
-                     ('caget -h' for help.)"
-                );
-            }
-            t
-        }
-        None => None,
-    };
-    // Resolve the output format from `-t`/`-a`/`-d` (command-line order,
-    // mutual-exclusion warning). C `caget.c:430-434`: an invalid `-d`
-    // type reverts `format` to plain.
-    let mut mode = resolve_output_mode(&matches);
-    if mode == OutputMode::SpecifiedDbr && req_dbr_type.is_none() {
-        mode = OutputMode::Plain;
-    }
+    let float_as_string = args.string_format > 0;
     // Only `all` needs the DBR_TIME class for its native readback; the
     // enum/float substitutions below use `want_time` to pick the TIME
     // vs plain string form (C `caget.c:176-187`).
     let want_time = mode == OutputMode::All;
     // C `caget.c:200` clamps the user's `-#` count to the native element
     // count before the wire request (`reqElems > nElems ? nElems :
-    // reqElems`); `None` (no `-#`) requests the full count. Captured as a
-    // Copy so each spawned task owns it without moving `args`.
-    let max_elements = args.max_elements;
+    // reqElems`); `0` (no `-#`, `-# 0`, or an unscannable `-#`) requests the
+    // full count. Taken from `fmt`, the single carrier of C's `reqElems`.
+    let req_elems = fmt.req_elems;
     // C `caget.c:197-218` resolves that count differently per request mode:
     // callback (`-c`) preserves a count-0 autosize request, the synchronous
     // path rewrites 0 → native. Captured as a Copy for the same reason.
-    let callback = args.callback;
+    let callback = args.callback > 0;
     let mut handles = Vec::new();
     for (name, ch) in &channels {
         let name = name.clone();
         let t = timeout;
         let ch = ch.clone();
         handles.push(tokio::spawn(async move {
-            let connect = ch.wait_connected(t).await;
-            if connect.is_err() {
-                return (name, Err("not connected".to_string()));
-            }
+            // Every channel is connected here — `connect_pvs` above is the
+            // barrier. A channel can still drop between the barrier and the
+            // GET (C: `ca_state != cs_conn` → `ECA_DISCONN`,
+            // `caget.c:219-221`), which surfaces below as a Disconnected
+            // read error and prints the same `*** not connected` marker.
+            //
             // Bound the CA payload at the request boundary and pick the
             // request-mode count contract (C `caget.c:197-218`): the
             // callback path (`-c`) sends a count-0 autosize request so a
             // dynamic waveform returns its current NORD, while the
             // synchronous path requests the full native count.
             let native = ch.element_count().unwrap_or(0);
-            let req_count = caget_req_count(callback, max_elements, native);
+            let req_count = caget_req_count(callback, req_elems, native);
+            // C sizes the readback buffer `dbr_size_n(dbrType, nElems)` with
+            // the SAME clamped count it puts on the wire (`caget.c:207-215`).
+            let elems = req_count.resolve(native);
             // C `caget.c:172-187`: the request DBR type depends on the
             // output format. `specifiedDbr` carries the `-d` type verbatim
             // (`pvs[n].dbrType = dbrType`) and keeps the full snapshot for
@@ -649,19 +867,32 @@ async fn main() {
             // substitutions, discarding any `-d` type. `native_field_type`
             // is libca `ca_field_type`, valid now that the channel is
             // connected.
+            let mut timed_out = false;
             let outcome = if mode == OutputMode::SpecifiedDbr {
                 let rt = req_dbr_type
                     .expect("specifiedDbr mode implies a resolved -d type (else reverts to plain)");
                 let native = ch.native_field_type().ok();
+                // The `-d` code passed `parse_dbr_type` (0..=38), so it always
+                // has a value carrier.
+                let base = dbr_value_field_type(rt);
+                let on_timeout = || {
+                    read_timeout(callback, base, elems, |b, n| GetResult::Specified {
+                        native,
+                        req_type: rt,
+                        snap: Box::new(zero_dbr_snapshot(b, n)),
+                    })
+                };
                 match tokio::time::timeout(t, ch.get_with_dbr_type(rt, req_count)).await {
                     Ok(Ok(snap)) => Ok(GetResult::Specified {
                         native,
                         req_type: rt,
                         snap: Box::new(snap),
                     }),
-                    Ok(Err(CaError::Timeout)) => Err("timeout".to_string()),
-                    Ok(Err(e)) => Err(format!("{e}")),
-                    Err(_) => Err("timeout".to_string()),
+                    Ok(Err(CaError::Timeout)) | Err(_) => {
+                        timed_out = true;
+                        on_timeout()
+                    }
+                    Ok(Err(e)) => Err(read_error(&e)),
                 }
             } else {
                 // C `caget.c:177-187` readback substitution, in C's
@@ -680,20 +911,43 @@ async fn main() {
                             .then(|| nt.and_then(float_as_string_readback_dbr))
                             .flatten()
                     });
+                // The zeroed buffer takes the shape of the type REQUESTED: a
+                // substituted ENUM-label readback is a DBR_*_STRING get, so
+                // its zeroed buffer is an empty string, not a `0` index.
+                let base = match sub_dbr {
+                    Some(rt) => dbr_value_field_type(rt),
+                    None => nt,
+                };
                 if let Some(rt) = sub_dbr {
                     // Under `-a` the TIME-class string (DBR_TIME_STRING)
                     // still carries timestamp + alarm, so wrap it as `Time`.
+                    let on_timeout = || {
+                        read_timeout(callback, base, elems, |b, n| {
+                            if want_time {
+                                GetResult::Time(Box::new(zero_dbr_snapshot(b, n)))
+                            } else {
+                                GetResult::Plain(zero_dbr_value(b, n))
+                            }
+                        })
+                    };
                     match tokio::time::timeout(t, ch.get_with_dbr_type(rt, req_count)).await {
                         Ok(Ok(snap)) => Ok(if want_time {
                             GetResult::Time(Box::new(snap))
                         } else {
                             GetResult::Plain(snap.value)
                         }),
-                        Ok(Err(CaError::Timeout)) => Err("timeout".to_string()),
-                        Ok(Err(e)) => Err(format!("{e}")),
-                        Err(_) => Err("timeout".to_string()),
+                        Ok(Err(CaError::Timeout)) | Err(_) => {
+                            timed_out = true;
+                            on_timeout()
+                        }
+                        Ok(Err(e)) => Err(read_error(&e)),
                     }
                 } else if want_time {
+                    let on_timeout = || {
+                        read_timeout(callback, base, elems, |b, n| {
+                            GetResult::Time(Box::new(zero_dbr_snapshot(b, n)))
+                        })
+                    };
                     match tokio::time::timeout(
                         t,
                         ch.get_with_metadata_count(DbrClass::Time, req_count),
@@ -701,20 +955,31 @@ async fn main() {
                     .await
                     {
                         Ok(Ok(snap)) => Ok(GetResult::Time(Box::new(snap))),
-                        Ok(Err(CaError::Timeout)) => Err("timeout".to_string()),
-                        Ok(Err(e)) => Err(format!("{e}")),
-                        Err(_) => Err("timeout".to_string()),
+                        Ok(Err(CaError::Timeout)) | Err(_) => {
+                            timed_out = true;
+                            on_timeout()
+                        }
+                        Ok(Err(e)) => Err(read_error(&e)),
                     }
                 } else {
                     // plain / terse: cheap typed value, no metadata payload.
                     match ch.get_with_timeout_count(t, req_count).await {
                         Ok((_dbr, value)) => Ok(GetResult::Plain(value)),
-                        Err(CaError::Timeout) => Err("timeout".to_string()),
-                        Err(e) => Err(format!("{e}")),
+                        Err(CaError::Timeout) => {
+                            timed_out = true;
+                            read_timeout(callback, base, elems, |b, n| {
+                                GetResult::Plain(zero_dbr_value(b, n))
+                            })
+                        }
+                        Err(e) => Err(read_error(&e)),
                     }
                 }
             };
-            (name, outcome)
+            PvRead {
+                name,
+                outcome,
+                timed_out,
+            }
         }));
     }
 
@@ -723,13 +988,18 @@ async fn main() {
     for h in handles {
         results.push(h.await.unwrap());
     }
+    // C's ONE stderr warning for a timed-out read phase (`caget.c:224-226`,
+    // `:238-239`) — it does not name the PV and does not stop the print loop.
+    if results.iter().any(|r| r.timed_out) {
+        eprintln!("Read operation timed out: some PV data was not read.");
+    }
 
-    let fmt = args.value_format();
     let sep = fmt.field_separator;
-    // C `caget.c:286` gates the array count prefix on
-    // `reqElems || nElems > 1`. `reqElems` is non-zero iff the user
-    // passed `-#` on the command line.
-    let req_elems_present = args.max_elements.is_some();
+    // C's `reqElems` feeds BOTH the plain/terse count-prefix gate
+    // (`caget.c:286`) and the `-S` long-string gate on every block
+    // (`caget.c:273,318`); the specifiedDbr Value loop takes the second but
+    // not the first (`CountPrefix::Never`). Both read it off `fmt`, which is
+    // now its only carrier.
     // Mirror C `caget.c::main` (line 260): pad the PV name column to
     // 30 characters only when the value is a scalar AND the field
     // separator is the default space. Custom `-F` separator and
@@ -741,11 +1011,15 @@ async fn main() {
             name.to_string()
         }
     };
-    let mut failed = false;
-    for (pv_name, result) in &results {
+    for PvRead {
+        name: pv_name,
+        outcome: result,
+        ..
+    } in &results
+    {
         match result {
             Ok(GetResult::Plain(value)) => {
-                let rendered = format_value(value, &fmt, None, req_elems_present);
+                let rendered = format_value(value, &fmt, None, CountPrefix::IfRequestedOrArray);
                 let is_scalar = value.count() == 1;
                 if mode == OutputMode::Terse {
                     println!("{rendered}");
@@ -761,24 +1035,29 @@ async fn main() {
                 // fields) on NO_ALARM. Mirror that exactly using the
                 // alarm pair the DBR_TIME response carried.
                 let enum_strings = snap.enums.as_ref().map(|e| e.strings.as_slice());
-                let rendered = format_value(&snap.value, &fmt, enum_strings, req_elems_present);
+                // The separator before the value is C's per-item PREFIX
+                // (`tool_lib.c:481-489`), not a suffix of the timestamp.
+                let value_seg = format_value_segment(
+                    &snap.value,
+                    &fmt,
+                    enum_strings,
+                    CountPrefix::IfRequestedOrArray,
+                );
                 let is_scalar = snap.value.count() == 1;
-                let ts = format_server_timestamp(snap.timestamp);
+                let ts = format_time(snap.timestamp);
                 let stat = snap.alarm.status;
                 let sevr = snap.alarm.severity;
                 if stat == 0 && sevr == 0 {
                     println!(
-                        "{name}{sep}{ts}{sep}{val}{sep}{sep}",
+                        "{name}{sep}{ts}{value_seg}{sep}{sep}",
                         name = pad_name(is_scalar, pv_name),
                         sep = sep,
-                        val = rendered,
                     );
                 } else {
                     println!(
-                        "{name}{sep}{ts}{sep}{val}{sep}{stat_str}{sep}{sevr_str}",
+                        "{name}{sep}{ts}{value_seg}{sep}{stat_str}{sep}{sevr_str}",
                         name = pad_name(is_scalar, pv_name),
                         sep = sep,
-                        val = rendered,
                         stat_str = stat_to_str(stat),
                         sevr_str = sevr_to_str(sevr),
                     );
@@ -794,88 +1073,27 @@ async fn main() {
                     specified_dbr_report(pv_name, *native, *req_type, snap, &fmt)
                 );
             }
-            Err(e) if e.contains("not connected") || e.contains("isconnect") => {
-                // C prints different strings per format: plain/terse
-                // (caget.c:265) print lowercase `*** not connected`;
-                // `-a`/wide (print_time_val_sts, tool_lib.c:521) prints
-                // `*** Not connected (PV not found)`; specifiedDbr
-                // (caget.c:301) prints the name line then an indented
-                // `    *** not connected`.
-                match mode {
-                    OutputMode::All => println!(
-                        "{}{}*** Not connected (PV not found)",
-                        pad_name(true, pv_name),
-                        sep
-                    ),
-                    OutputMode::Terse => println!("*** not connected"),
-                    OutputMode::SpecifiedDbr => println!("{pv_name}\n    *** not connected"),
-                    OutputMode::Plain => {
-                        println!("{}{}*** not connected", pad_name(true, pv_name), sep)
-                    }
-                }
-                failed = true;
-            }
-            Err(e) if e.contains("timeout") => {
-                // C `caget`: `connect_pvs` returns 1 only on a
-                // `ca_pend_io` connect timeout; the data-read function
-                // (`caget.c:348`) always returns 0. A CONNECTED PV
-                // whose GET times out therefore does NOT change the
-                // exit code — print the timeout line but leave
-                // `failed` untouched.
-                match mode {
-                    OutputMode::Terse => println!("*** no data available (timeout)"),
-                    OutputMode::SpecifiedDbr => {
-                        println!("{pv_name}\n    *** no data available (timeout)")
-                    }
-                    _ => println!(
-                        "{}{}*** no data available (timeout)",
-                        pad_name(true, pv_name),
-                        sep
-                    ),
-                }
-            }
             Err(e) => {
-                println!(
-                    "{}{}*** no data available ({e})",
-                    pad_name(true, pv_name),
-                    sep
-                );
-                failed = true;
+                // A failed PV never carries a value, so C's name column takes
+                // the scalar padding (`nElems == 0 <= 1`).
+                print_read_error(mode, &pad_name(true, pv_name), pv_name, sep, e);
             }
         }
     }
-    if failed {
+    // C `caget.c:227`: `if (!nConn) return 1` — `nConn` counts the PVs that
+    // were still connected when the read was issued, and it is the ONLY thing
+    // that can make the read phase fail. Past that gate `caget()` returns 0
+    // unconditionally (`caget.c:348`), so a read-access denial, a CA error, or
+    // a read timeout on some PV prints its marker and leaves the exit status
+    // at 0 — as does a disconnect, as long as ANY other PV was still
+    // connected.
+    let n_conn = results
+        .iter()
+        .filter(|r| !matches!(r.outcome, Err(ReadError::Disconnected)))
+        .count();
+    if n_conn == 0 {
         std::process::exit(1);
     }
-}
-
-/// C `sscanf(optarg, "%d", &type)` semantics: skip leading whitespace,
-/// accept an optional sign, then take the leading run of decimal digits
-/// — trailing junk is ignored (`"16x"` → `16`, `"0x10"` → `0`). Returns
-/// `None` when no digit leads (C's `sscanf` returns 0, so `caget` falls
-/// through to the textual `dbr_text_to_type` lookup).
-fn scan_leading_i64(s: &str) -> Option<i64> {
-    let s = s.trim_start();
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    let mut neg = false;
-    if let Some(&c) = bytes.first()
-        && (c == b'+' || c == b'-')
-    {
-        neg = c == b'-';
-        i = 1;
-    }
-    let start = i;
-    while i < bytes.len() && bytes[i].is_ascii_digit() {
-        i += 1;
-    }
-    if i == start {
-        return None;
-    }
-    s[start..i]
-        .parse::<i64>()
-        .ok()
-        .map(|n| if neg { -n } else { n })
 }
 
 /// resolve a `caget -d <type>` token to an EXACT DBR type code,
@@ -897,8 +1115,8 @@ fn scan_leading_i64(s: &str) -> Option<i64> {
 /// `-d 37`/`-d 38` reach `DBR_STSACK_STRING`/`DBR_CLASS_NAME`.
 fn parse_dbr_type(s: &str) -> Option<u16> {
     let s = s.trim();
-    let resolved: Option<i64> = if let Some(n) = scan_leading_i64(s) {
-        Some(n)
+    let resolved: Option<i64> = if let Some(n) = scan_i32(s) {
+        Some(i64::from(n))
     } else {
         epics_base_rs::types::dbr_text_to_type(s)
             .or_else(|| epics_base_rs::types::dbr_text_to_type(&format!("DBR_{s}")))
@@ -913,22 +1131,323 @@ fn parse_dbr_type(s: &str) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Args, OutputMode, ReqCount, caget_req_count, dbr_extended_str, dbr_text, parse_dbr_type,
-        resolve_output_mode, scan_leading_i64, specified_dbr_report,
+        Args, GetResult, OutputMode, PvRead, ReadError, ReqCount, TOOL, caget_req_count,
+        dbr_extended_str, dbr_text, parse_dbr_type, read_error, read_timeout, resolve_dbr_type,
+        resolve_format, specified_dbr_report,
     };
-    use clap::CommandFactory;
+    use clap::{CommandFactory, FromArgMatches, Parser};
     use epics_base_rs::server::snapshot::{ControlInfo, DisplayInfo, EnumInfo, Snapshot};
+    use epics_base_rs::types::WallTime;
     use epics_base_rs::types::{
-        DBR_CLASS_NAME, DBR_CTRL_DOUBLE, DBR_CTRL_STRING, DBR_DOUBLE, DBR_GR_STRING, DBR_STRING,
-        DBR_STSACK_STRING, DBR_TIME_DOUBLE, DBR_TIME_FLOAT,
+        DBR_CLASS_NAME, DBR_CTRL_DOUBLE, DBR_CTRL_STRING, DBR_DOUBLE, DBR_GR_STRING, DBR_LONG,
+        DBR_STRING, DBR_STSACK_STRING, DBR_TIME_DOUBLE, DBR_TIME_FLOAT,
     };
-    use epics_ca_rs::EpicsValue;
-    use epics_ca_rs::cli::ValueFormat;
+    use epics_ca_rs::cli::IntStyle;
+    use epics_ca_rs::cli::{
+        EPICS_EPOCH_UNIX_SECS, FloatFormat, FloatStyle, ValueFormat, zero_dbr_snapshot,
+        zero_dbr_value,
+    };
+    use epics_ca_rs::copt::scan_i32;
+    use epics_ca_rs::protocol::{ECA_NORDACCESS, eca_message};
+    use epics_ca_rs::{CaError, DbFieldType, EpicsValue};
     use std::time::SystemTime;
 
     fn mode_of(argv: &[&str]) -> OutputMode {
         let m = Args::command().get_matches_from(argv);
-        resolve_output_mode(&m)
+        resolve_format(&mut TOOL.scan(&m)).0
+    }
+
+    /// R12-16. C declares the two base options as getopt options TAKING AN
+    /// ARGUMENT (`caget.c:398`, `":taicnhsSVe:f:g:l:#:d:0:w:p:F:"`), so the
+    /// C spelling is `-0x` / `-l x` — a single dash. The Rust port declared
+    /// them as clap LONG flags (`--0x`), which made every one of these
+    /// invocations `error: unexpected argument '-0' found`, exit 2: the base
+    /// options were unreachable through the C CLI.
+    ///
+    /// Verified against the compiled C `caget` (EPICS 7.0.10.1-DEV):
+    ///   `caget -0x TST:LO` → `TST:LO   0xC8`.
+    #[test]
+    fn base_options_take_a_single_dash_argument_like_c_getopt() {
+        for argv in [
+            vec!["caget", "-0x", "PV"],
+            vec!["caget", "-0", "x", "PV"],
+            vec!["caget", "-lb", "PV"],
+            vec!["caget", "-l", "b", "PV"],
+            vec!["caget", "-0x", "-lb", "PV"],
+        ] {
+            let a = Args::try_parse_from(&argv)
+                .unwrap_or_else(|e| panic!("C spells this `{argv:?}`; clap rejected it: {e}"));
+            assert_eq!(a.pv_names, ["PV"], "the base argument must not eat the PV");
+        }
+
+        let m = Args::command().get_matches_from(["caget", "-0x", "PV"]);
+        let a = Args::from_arg_matches(&m).expect("parses");
+        let mut scan = TOOL.scan(&m);
+        let base = scan.base('0', "int_base");
+        assert_eq!(a.value_format(&mut scan, base).int_style, IntStyle::Hex);
+        let m = Args::command().get_matches_from(["caget", "-lb", "PV"]);
+        let a = Args::from_arg_matches(&m).expect("parses");
+        let mut scan = TOOL.scan(&m);
+        let base = scan.base('0', "int_base");
+        assert_eq!(a.value_format(&mut scan, base).float_style, IntStyle::Bin);
+    }
+
+    /// R12-20. C's `-0<base>` assigns the SAME `int type` as `-d`
+    /// (`caget.c:493`, `type = DBR_LONG`), so the two race in getopt order
+    /// and the last one wins. Observed on the compiled C:
+    ///   `caget -d DBR_DOUBLE -0x TST:AO` → `Request type: DBR_LONG`, `0x1`
+    ///   `caget -0x -d DBR_DOUBLE TST:AO` → `Request type: DBR_DOUBLE`, `1.5`
+    /// An INVALID base never reaches the assignment (C guards it with
+    /// `if (outType != dec)`), so `-d DBR_DOUBLE -0q` keeps DBR_DOUBLE.
+    #[test]
+    fn zero_base_forces_dbr_long_in_getopt_order() {
+        let resolve = |argv: &[&str]| {
+            let m = Args::command().get_matches_from(argv);
+            let mut scan = TOOL.scan(&m);
+            let base = scan.base('0', "int_base");
+            let d = resolve_format(&mut scan).1;
+            resolve_dbr_type(&scan, base, d)
+        };
+        assert_eq!(resolve(&["caget", "-0x", "PV"]), Some(DBR_LONG));
+        assert_eq!(
+            resolve(&["caget", "-d", "DBR_DOUBLE", "-0x", "PV"]),
+            Some(DBR_LONG),
+            "-0 came last, so it wins"
+        );
+        assert_eq!(
+            resolve(&["caget", "-0x", "-d", "DBR_DOUBLE", "PV"]),
+            Some(DBR_DOUBLE),
+            "-d came last, so it wins"
+        );
+        assert_eq!(
+            resolve(&["caget", "-d", "DBR_DOUBLE", "-0q", "PV"]),
+            Some(DBR_DOUBLE),
+            "an invalid base is guarded out of the `type` assignment"
+        );
+        assert_eq!(
+            resolve(&["caget", "-d", "DBR_DOUBLE", "PV"]),
+            Some(DBR_DOUBLE)
+        );
+        assert_eq!(resolve(&["caget", "PV"]), None);
+        assert_eq!(
+            resolve(&["caget", "-lx", "PV"]),
+            None,
+            "-l sets outTypeF only; it never touches `type`"
+        );
+    }
+
+    /// R13-16. Only a VALID `-0` re-enters the `type` race: C's assignment is
+    /// guarded by `if (outType != dec)` (`caget.c:497-503`), so a trailing
+    /// invalid `-0` warns, assigns nothing, and CANNOT reclaim `type` from a
+    /// `-d` that beat the last valid `-0`. Boundary cases of "which occurrence
+    /// last assigned":
+    #[test]
+    fn only_a_valid_zero_base_re_enters_the_dbr_type_race() {
+        let resolve = |argv: &[&str]| {
+            let m = Args::command().get_matches_from(argv);
+            let mut scan = TOOL.scan(&m);
+            let base = scan.base('0', "int_base");
+            let d = resolve_format(&mut scan).1;
+            resolve_dbr_type(&scan, base, d)
+        };
+        // The invalid `-0q` is the LAST `-0` but not the last one to ASSIGN.
+        assert_eq!(
+            resolve(&["caget", "-0x", "-d", "DBR_DOUBLE", "-0q", "PV"]),
+            Some(DBR_DOUBLE),
+            "`-0q` never wrote `type`, so `-d` still holds it"
+        );
+        // ... and a valid one after `-d` does reclaim it.
+        assert_eq!(
+            resolve(&["caget", "-0x", "-d", "DBR_DOUBLE", "-0b", "PV"]),
+            Some(DBR_LONG),
+            "`-0b` assigned after `-d`"
+        );
+        // An invalid `-0` BEFORE the valid one changes nothing.
+        assert_eq!(
+            resolve(&["caget", "-0q", "-0x", "-d", "DBR_DOUBLE", "PV"]),
+            Some(DBR_DOUBLE)
+        );
+        assert_eq!(
+            resolve(&["caget", "-d", "DBR_DOUBLE", "-0q", "-0x", "PV"]),
+            Some(DBR_LONG)
+        );
+        // No occurrence ever assigned: `type` is untouched by `-0` entirely.
+        assert_eq!(resolve(&["caget", "-0q", "PV"]), None);
+        assert_eq!(
+            resolve(&["caget", "-0q", "-d", "DBR_DOUBLE", "PV"]),
+            Some(DBR_DOUBLE)
+        );
+        // `-d` repeats too, and the LAST `-d` is the one racing.
+        assert_eq!(
+            resolve(&["caget", "-d", "DBR_DOUBLE", "-0x", "-d", "DBR_STRING", "PV"]),
+            Some(0),
+            "DBR_STRING == 0, assigned after the valid `-0`"
+        );
+    }
+
+    /// The DEFAULT (synchronous) read path callocs its buffer BEFORE the wire
+    /// request (`caget.c:207-215`), so a `ca_pend_io` timeout leaves the PV at
+    /// `status == ECA_NORMAL` with a non-NULL, still-ZEROED buffer, and the
+    /// print loop renders those zeroes (`caget.c:262-293`). Only `-c` can reach
+    /// `*** no data available (timeout)`, because only its event handler
+    /// allocates (`caget.c:130`).
+    ///
+    /// Pre-fix caget-rs printed the timeout marker on BOTH paths.
+    #[test]
+    fn synchronous_read_timeout_renders_the_zeroed_buffer() {
+        let plain = |callback, base, elems| {
+            read_timeout(callback, base, elems, |b, n| {
+                GetResult::Plain(zero_dbr_value(b, n))
+            })
+        };
+
+        // Synchronous scalar DOUBLE: C prints "0".
+        match plain(false, Some(DbFieldType::Double), 1) {
+            Ok(GetResult::Plain(v)) => assert_eq!(v, EpicsValue::Double(0.0)),
+            other => panic!("sync timeout must yield the zeroed buffer, got {other:?}"),
+        }
+        // Synchronous array: C zeroes every one of the nElems it sized with.
+        match plain(false, Some(DbFieldType::Long), 3) {
+            Ok(GetResult::Plain(v)) => assert_eq!(v, EpicsValue::LongArray(vec![0, 0, 0])),
+            other => panic!("sync array timeout must zero every element, got {other:?}"),
+        }
+        // An ENUM substituted to its label form is a DBR_*_STRING get, so its
+        // zeroed buffer is an empty string, not a 0 index.
+        match plain(false, Some(DbFieldType::String), 1) {
+            Ok(GetResult::Plain(v)) => assert_eq!(v, EpicsValue::String("".into())),
+            other => panic!("string readback timeout must yield \"\", got {other:?}"),
+        }
+
+        // Callback (`-c`) is the ONLY path with no buffer: it alone reaches
+        // C's `*** no data available (timeout)` marker.
+        match plain(true, Some(DbFieldType::Double), 1) {
+            Err(e @ ReadError::CallbackTimeout) => {
+                assert_eq!(e.marker(), "*** no data available (timeout)")
+            }
+            other => panic!("-c has no calloc'd buffer to print, got {other:?}"),
+        }
+    }
+
+    /// `-a` / `-d` render the zeroed `dbr_time_*` header too: a zeroed
+    /// `epicsTimeStamp` is the EPICS epoch and the alarm pair is
+    /// NO_ALARM / NO_ALARM (`tool_lib.c::print_time_val_sts` then prints two
+    /// empty trailing fields).
+    #[test]
+    fn synchronous_read_timeout_carries_the_epics_epoch_stamp() {
+        let r = read_timeout(false, Some(DbFieldType::Double), 1, |b, n| {
+            GetResult::Time(Box::new(zero_dbr_snapshot(b, n)))
+        });
+        match r {
+            Ok(GetResult::Time(snap)) => {
+                assert_eq!(snap.value, EpicsValue::Double(0.0));
+                assert_eq!(snap.alarm.status, 0);
+                assert_eq!(snap.alarm.severity, 0);
+                assert_eq!(
+                    snap.timestamp,
+                    WallTime::from_unix(EPICS_EPOCH_UNIX_SECS, 0),
+                    "a zeroed epicsTimeStamp is 1990-01-01T00:00:00Z"
+                );
+            }
+            other => panic!("-a sync timeout must yield a zeroed TIME snapshot, got {other:?}"),
+        }
+    }
+
+    /// `ca_field_type` failing means the channel dropped after the connect
+    /// barrier — C reports that as `ECA_DISCONN` (`caget.c:219-221`), not as a
+    /// timeout, so there is no buffer to zero.
+    #[test]
+    fn read_timeout_without_a_field_type_is_a_disconnect() {
+        let r = read_timeout(false, None, 1, |b, n| {
+            GetResult::Plain(zero_dbr_value(b, n))
+        });
+        match r {
+            Err(ReadError::Disconnected) => {}
+            other => panic!("a dropped channel is not a timeout, got {other:?}"),
+        }
+    }
+
+    /// C `caget.c:262-268`: a post-gate read failure prints a `*** ...`
+    /// marker whose text comes straight from the PV's ECA status —
+    /// `ECA_NORDACCESS` is spelled out, every other status goes through
+    /// `ca_message`. The port printed an invented
+    /// `*** no data available (<Rust error Display>)` for all of them.
+    #[test]
+    fn read_error_markers_match_c() {
+        assert_eq!(
+            read_error(&CaError::ServerError(ECA_NORDACCESS)).marker(),
+            "*** no read access"
+        );
+        assert_eq!(
+            read_error(&CaError::Disconnected).marker(),
+            "*** not connected"
+        );
+        assert_eq!(
+            read_error(&CaError::Shutdown).marker(),
+            "*** not connected",
+            "a client shutdown is C's ECA_DISCONN too"
+        );
+        // Any other ECA status renders C's `ca_message` text.
+        let e = CaError::Protocol("bad frame".into());
+        let status = e.to_eca_status();
+        assert_eq!(
+            read_error(&e).marker(),
+            format!("*** CA error {}", eca_message(status)),
+            "generic CA failures print ca_message"
+        );
+    }
+
+    /// C `caget.c:227,348`: `if (!nConn) return 1` is the ONLY non-zero
+    /// return of the read phase — `nConn` counts the PVs still connected when
+    /// the read was issued. A read-access denial, a CA error or a read timeout
+    /// on a CONNECTED PV therefore exits 0, and so does a disconnect as long
+    /// as ANY other PV was connected.
+    ///
+    /// Pre-fix caget-rs set `failed = true` on the `not connected` branch and
+    /// on every generic error, exiting 1 for all of them.
+    #[test]
+    fn exit_status_is_c_n_conn() {
+        let read = |outcome| PvRead {
+            name: "PV".into(),
+            outcome,
+            timed_out: false,
+        };
+        let n_conn = |reads: &[PvRead]| {
+            reads
+                .iter()
+                .filter(|r| !matches!(r.outcome, Err(ReadError::Disconnected)))
+                .count()
+        };
+
+        // Read-access denied on the only PV: it IS connected → nConn == 1 → 0.
+        assert_eq!(
+            n_conn(&[read(Err(ReadError::Ca(ECA_NORDACCESS)))]),
+            1,
+            "an ECA_NORDACCESS PV is still connected"
+        );
+        // A callback read timeout: connected → exit 0.
+        assert_eq!(
+            n_conn(&[read(Err(ReadError::CallbackTimeout))]),
+            1,
+            "a timed-out read is still connected"
+        );
+        // One disconnected PV among connected ones → nConn > 0 → exit 0.
+        assert_eq!(
+            n_conn(&[
+                read(Err(ReadError::Disconnected)),
+                read(Ok(GetResult::Plain(EpicsValue::Double(1.0)))),
+            ]),
+            1,
+            "one live PV keeps nConn non-zero"
+        );
+        // EVERY PV disconnected → nConn == 0 → the sole exit-1 case.
+        assert_eq!(
+            n_conn(&[
+                read(Err(ReadError::Disconnected)),
+                read(Err(ReadError::Disconnected)),
+            ]),
+            0,
+            "!nConn is C's only read-phase failure"
+        );
     }
 
     /// `caget -c` (callback,
@@ -947,25 +1466,26 @@ mod tests {
     fn caget_req_count_callback_preserves_autosize() {
         let native = 5u32;
         let wire =
-            |callback, max: Option<usize>| caget_req_count(callback, max, native).resolve(native);
+            |callback, req_elems: u64| caget_req_count(callback, req_elems, native).resolve(native);
 
         // Synchronous (no -c): a count-0 request becomes the native count.
-        assert_eq!(wire(false, None), native, "sync, no -#");
-        assert_eq!(wire(false, Some(0)), native, "sync, -# 0");
-        assert_eq!(wire(false, Some(3)), 3, "sync, -# 3");
-        assert_eq!(wire(false, Some(9)), native, "sync, -# > native clamps");
+        // `-# 0` and no `-#` are the SAME value in C (`reqElems == 0` is the
+        // single "not specified" encoding, caget.c:386), so there is no
+        // Some(0)/None distinction left to test.
+        assert_eq!(wire(false, 0), native, "sync, no -# / -# 0");
+        assert_eq!(wire(false, 3), 3, "sync, -# 3");
+        assert_eq!(wire(false, 9), native, "sync, -# > native clamps");
 
         // Callback (-c): no positive -# preserves the count-0 autosize wire
         // request; a positive -# clamps to native exactly like the sync path.
-        assert_eq!(wire(true, None), 0, "callback, no -# => autosize 0");
-        assert_eq!(wire(true, Some(0)), 0, "callback, -# 0 => autosize 0");
-        assert_eq!(wire(true, Some(3)), 3, "callback, -# 3");
-        assert_eq!(wire(true, Some(9)), native, "callback, -# > native clamps");
+        assert_eq!(wire(true, 0), 0, "callback, no -# / -# 0 => autosize 0");
+        assert_eq!(wire(true, 3), 3, "callback, -# 3");
+        assert_eq!(wire(true, 9), native, "callback, -# > native clamps");
 
         // The request-mode variant itself: no-positive-`-#` callback is the
         // only case that constructs an Autosize request.
-        assert_eq!(caget_req_count(true, None, native), ReqCount::Autosize(0));
-        assert_eq!(caget_req_count(false, None, native), ReqCount::Fixed(0));
+        assert_eq!(caget_req_count(true, 0, native), ReqCount::Autosize(0));
+        assert_eq!(caget_req_count(false, 0, native), ReqCount::Fixed(0));
     }
 
     // C `complainIfNotPlainAndSet` (caget.c:369): -t/-a/-d are mutually
@@ -1040,8 +1560,125 @@ mod tests {
         assert!(out.contains("    Hi ctrl limit:    9\n"), "{out}");
     }
 
-    // C `caget.c:312-316`: DBR_CLASS_NAME prints only the Class Name line
-    // (no element count / value / extended block).
+    /// C's `FMT_GR` / `FMT_CTRL` macros embed a hardcoded `%g` for the
+    /// FLOAT/DOUBLE limit classes (`tool_lib.c:248-254,375-386`), so every
+    /// graphic/control limit prints at printf's default 6 significant digits.
+    /// The `-e`/`-f`/`-g` flags rewrite `dblFormatStr`, which only `val2str`
+    /// reads — they must NOT reach a limit line.
+    ///
+    /// Pre-fix the `lim` closure used Rust's `Display`, printing the full f64
+    /// (`3.14159265`, `1000000`) where C prints `3.14159` / `1e+06`.
+    #[test]
+    fn gr_ctrl_float_limits_use_c_hardcoded_g() {
+        let mut snap = ctrl_double_snap();
+        let d = snap
+            .display
+            .as_mut()
+            .expect("ctrl_double_snap sets display");
+        // Verified against `printf("%g", ...)`: 8.76543 / 1e+06 / -0.00123457.
+        d.lower_disp_limit = 8.765_432_19;
+        d.upper_disp_limit = 1e6;
+        d.lower_alarm_limit = -0.001234567;
+        let c = snap
+            .control
+            .as_mut()
+            .expect("ctrl_double_snap sets control");
+        c.upper_ctrl_limit = 123456789.0;
+
+        // The limit block must be identical under EVERY float style, because
+        // C's limits never consult `dblFormatStr`.
+        for float in [
+            FloatFormat::default(),
+            FloatFormat {
+                style: FloatStyle::F,
+                precision: 9,
+            },
+            FloatFormat {
+                style: FloatStyle::E,
+                precision: 2,
+            },
+            FloatFormat {
+                style: FloatStyle::G,
+                precision: 12,
+            },
+        ] {
+            let fmt = ValueFormat {
+                float,
+                ..ValueFormat::default()
+            };
+            let out = specified_dbr_report(
+                "ai:temp",
+                Some(DbFieldType::Double),
+                DBR_CTRL_DOUBLE,
+                &snap,
+                &fmt,
+            );
+            assert!(
+                out.contains("    Lo disp limit:    8.76543\n"),
+                "%g truncates to 6 significant digits: {out}"
+            );
+            assert!(
+                out.contains("    Hi disp limit:    1e+06\n"),
+                "%g switches to scientific at exp >= precision: {out}"
+            );
+            assert!(out.contains("    Lo alarm limit:   -0.00123457\n"), "{out}");
+            assert!(out.contains("    Hi ctrl limit:    1.23457e+08\n"), "{out}");
+        }
+        // Negative control: the VALUE line DOES follow `-f 9` (C `val2str`
+        // reads `dblFormatStr`), so the two renderings are genuinely distinct.
+        let f9 = ValueFormat {
+            float: FloatFormat {
+                style: FloatStyle::F,
+                precision: 9,
+            },
+            ..ValueFormat::default()
+        };
+        let out = specified_dbr_report(
+            "ai:temp",
+            Some(DbFieldType::Double),
+            DBR_CTRL_DOUBLE,
+            &snap,
+            &f9,
+        );
+        assert!(
+            out.contains("    Value:            1.500000000\n"),
+            "-f 9 must still reach the Value line: {out}"
+        );
+    }
+
+    /// C `caget.c:317-335`: the specifiedDbr block prints `Element count:` on
+    /// its own line and then a BARE value loop — unlike the plain loop at
+    /// `:286` it carries no `printf("%lu%c", nElems, sep)` count prefix.
+    ///
+    /// Pre-fix, `format_value`'s array renderers prefixed the count whenever
+    /// `total > 1`, so `caget -d DBR_LONG` on a 3-element array printed
+    /// `Value:            3 10 20 30` where C prints `Value:            10 20
+    /// 30`. The bare-ness holds for EVERY `-#` value, so the report passes
+    /// `CountPrefix::Never` rather than inspecting `fmt.req_elems`.
+    #[test]
+    fn specified_report_value_line_has_no_count_prefix() {
+        let snap = Snapshot::new(
+            EpicsValue::LongArray(vec![10, 20, 30]),
+            0,
+            0,
+            SystemTime::UNIX_EPOCH,
+        );
+        for req_elems in [0u64, 3] {
+            let fmt = ValueFormat {
+                req_elems,
+                ..ValueFormat::default()
+            };
+            let out = specified_dbr_report("wf:x", Some(DbFieldType::Long), DBR_LONG, &snap, &fmt);
+            assert!(out.contains("    Element count:    3\n"), "{out}");
+            assert!(
+                out.contains("    Value:            10 20 30\n"),
+                "the -d Value loop is bare (req_elems={req_elems}): {out}"
+            );
+        }
+    }
+
+    /// C `caget.c:312-316`: DBR_CLASS_NAME prints only the Class Name line
+    /// (no element count / value / extended block).
     #[test]
     fn specified_report_class_name_prints_class_line_only() {
         let mut snap = Snapshot::new(
@@ -1079,9 +1716,7 @@ mod tests {
         assert!(t.contains("    Status:           NO_ALARM"), "{t}");
         // GR_ENUM (24): status/severity then the enum table.
         let mut e = Snapshot::new(EpicsValue::Enum(1), 0, 0, SystemTime::UNIX_EPOCH);
-        e.enums = Some(EnumInfo {
-            strings: vec!["OFF".into(), "ON".into()],
-        });
+        e.enums = Some(EnumInfo::new(vec!["OFF".into(), "ON".into()]));
         let es = dbr_extended_str(24, &e);
         assert!(es.contains("    Enums:            ( 2)"), "{es}");
         assert!(es.contains("[ 0] OFF"), "{es}");
@@ -1143,17 +1778,18 @@ mod tests {
         assert_eq!(dbr_text(99), "DBR_invalid");
     }
 
-    use epics_ca_rs::DbFieldType;
-
+    // `-d` takes a numeric DBR code or a mnemonic; the numeric branch is
+    // C `sscanf(optarg, "%d", &type)` (caget.c:454), which is now the shared
+    // owner `copt::scan_i32`.
     #[test]
-    fn scan_leading_i64_matches_sscanf_d() {
-        assert_eq!(scan_leading_i64("16"), Some(16));
-        assert_eq!(scan_leading_i64("  20  "), Some(20));
-        assert_eq!(scan_leading_i64("-5"), Some(-5));
-        assert_eq!(scan_leading_i64("16x"), Some(16));
-        assert_eq!(scan_leading_i64("0x10"), Some(0));
-        assert_eq!(scan_leading_i64("DBR_TIME_FLOAT"), None);
-        assert_eq!(scan_leading_i64(""), None);
+    fn dbr_type_number_scan_matches_sscanf_d() {
+        assert_eq!(scan_i32("16"), Some(16));
+        assert_eq!(scan_i32("  20  "), Some(20));
+        assert_eq!(scan_i32("-5"), Some(-5));
+        assert_eq!(scan_i32("16x"), Some(16));
+        assert_eq!(scan_i32("0x10"), Some(0));
+        assert_eq!(scan_i32("DBR_TIME_FLOAT"), None);
+        assert_eq!(scan_i32(""), None);
     }
 
     #[test]

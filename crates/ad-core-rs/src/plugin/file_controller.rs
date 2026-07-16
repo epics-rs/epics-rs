@@ -226,16 +226,13 @@ impl<W: NDFileWriter> FilePluginController<W> {
     /// Re-evaluate whether the current `FilePath` directory exists and push a
     /// `FilePathExists` param update. C++ `NDPluginFile::checkPath()` runs this
     /// before each write, not only when FilePath changes.
-    fn refresh_file_path_exists(&self, updates: &mut Vec<ParamUpdate>) {
+    fn refresh_file_path_exists(&mut self, updates: &mut Vec<ParamUpdate>) {
         let idx = match self.params.file_path_exists {
             Some(idx) => idx,
             None => return,
         };
-        let path = self
-            .file_base
-            .file_path
-            .trim_end_matches(std::path::MAIN_SEPARATOR);
-        let exists = !path.is_empty() && std::path::Path::new(path).is_dir();
+        let (normalized, exists) = check_file_path(&self.file_base.file_path);
+        self.file_base.file_path = normalized;
         updates.push(ParamUpdate::Int32 {
             reason: idx,
             addr: 0,
@@ -449,11 +446,8 @@ impl<W: NDFileWriter> FilePluginController<W> {
 
         if Some(reason) == self.params.file_path {
             if let ParamChangeValue::Octet(s) = &params.value {
-                let normalized = normalize_file_path(s);
-                self.file_base.file_path = normalized.clone();
-                let exists =
-                    std::path::Path::new(normalized.trim_end_matches(std::path::MAIN_SEPARATOR))
-                        .is_dir();
+                let (normalized, exists) = check_file_path(s);
+                self.file_base.file_path = normalized;
                 if let Some(idx) = self.params.file_path_exists {
                     updates.push(ParamUpdate::Int32 {
                         reason: idx,
@@ -733,12 +727,13 @@ impl<W: NDFileWriter> FilePluginController<W> {
     }
 }
 
-fn normalize_file_path(path: &str) -> String {
-    if path.is_empty() || path.ends_with(std::path::MAIN_SEPARATOR) {
-        path.to_string()
-    } else {
-        format!("{path}{}", std::path::MAIN_SEPARATOR)
-    }
+/// Normalize `path` and report whether the directory exists, through the one
+/// implementation of C++ `asynNDArrayDriver::checkPath` that the file plugins
+/// inherit (`NDPluginFile` -> `NDPluginDriver` -> `asynNDArrayDriver`).
+fn check_file_path(path: &str) -> (String, bool) {
+    let mut normalized = path.to_string();
+    let exists = crate::driver::ndarray_driver::check_path_str(&mut normalized);
+    (normalized, exists)
 }
 
 #[cfg(test)]

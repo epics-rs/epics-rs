@@ -24,17 +24,32 @@ use epics_base_rs::server::access_security::AccessSecurityConfig;
 // introspection helper, so the import is gated to match.
 #[cfg(test)]
 use epics_base_rs::server::access_security::AccessLevel;
-use epics_pva_rs::client::{AssertedIdentity, PvaClient};
-use epics_pva_rs::pvdata::{FieldDesc, PvField};
+use epics_pva_rs::client::{AssertedIdentity, MarkedRead, PvaClient};
+use epics_pva_rs::pvdata::{FieldDesc, PvField, RpcReply};
 use epics_pva_rs::server::native_source::AcfCell;
 use epics_pva_rs::server_native::source::{
-    AccessChecked, ChannelContext, ChannelInvalidator, ChannelSource, OpError, WatermarkEvent,
-    WatermarkKind,
+    AccessChecked, ChannelContext, ChannelInvalidator, ChannelSource, OpError, SourceRead,
 };
 
 use super::channel_cache::{
     CacheStatus, ChannelCache, DEFAULT_CLEANUP_INTERVAL, DEFAULT_MAX_ENTRIES,
 };
+
+/// An upstream read (GET or PUT_GET readback) as the downstream framing
+/// contract sees it: the value plus the leaves the UPSTREAM marked.
+///
+/// `MarkedRead::marked` is `None` when the upstream set the root bit — it
+/// framed the whole structure — which is precisely what [`SourceRead`]'s
+/// `None` means downstream, so the two `None`s pass straight through. When
+/// the upstream marked a subset, the gateway declares that same subset: the
+/// decoder zero-filled every other leaf, and framing them as assigned would
+/// ship values the upstream never sent.
+fn upstream_read(read: MarkedRead) -> SourceRead {
+    match read.marked {
+        Some(marked) => SourceRead::marked(read.value, marked),
+        None => SourceRead::from(read.value),
+    }
+}
 
 /// Raw upstream MONITOR DATA body bytes flowing through the
 /// per-entry broadcast channel. `body` is the wire-format
@@ -52,104 +67,92 @@ pub struct RawEvent {
     pub type_changed: bool,
 }
 
-/// OR a bridge-local overrun signal into a raw MONITOR DATA body.
+/// The frame a subscriber gets after the gateway fanout dropped events under
+/// its OWN backpressure (a tokio `broadcast::Lagged`) — a **re-frame** of the
+/// channel's merged snapshot, never the next delta.
 ///
-/// `body` is the wire `changed | value | overrun` triplet. When the
-/// gateway fanout drops events under one downstream subscriber's own
-/// backpressure (a tokio `broadcast::Lagged`), pva2pva does not silently
-/// swallow the loss: the downstream `MonitorUser` enters overflow, ORs the
-/// upstream and downstream overrun information into a coalesced element and
-/// accumulates the changed set (`moncache.cpp:156-174`), and on the next
-/// `MonitorUser::release()` delivers that element with the accumulated
-/// overrun bitset (`moncache.cpp:354-365`). The downstream client reads the
-/// overrun bitset to learn that intermediate values were lost.
+/// pva2pva does not forward a delta across a downstream overflow. The
+/// `MonitorUser` enters overflow and folds every dropped event into one
+/// coalesced element (`moncache.cpp:156-174`):
 ///
-/// The broadcast ring has already overwritten the dropped events, so we do
-/// not have their changed bitsets to reproduce pva2pva's exact accumulation.
-/// We instead OR the *delivered* (coalesced latest) event's own changed
-/// leaves into its overrun bitset: every field changing in the value the
-/// subscriber is about to see is flagged as having had at least one
-/// unobserved intermediate value across the dropped range. This is a
-/// conservative over-approximation in the safe direction (it can only
-/// over-report "you may have missed a value", never hide a real loss).
-/// Upstream overrun bits already present in the body are preserved — the new
-/// bitset is the union, never a replacement.
+/// ```text
+/// overrun |= lastelem->overrun            // upstream overflows
+/// overrun |= changed & lastelem->changed  // downstream overflows
+/// changed |= lastelem->changed            // ACCUMULATE the changed bits
+/// value.copyUnchecked(lastelem->value, lastelem->changed)
+/// ```
 ///
-/// Returns the rewritten body, or `None` when the body cannot be decoded
-/// against `desc` (the caller then forwards the original bytes unchanged).
-fn mark_raw_body_local_overrun(
-    body: &bytes::Bytes,
+/// The changed BITS accumulate and the VALUES come from the merged element,
+/// so a transition that happened only in a dropped event — an alarm going
+/// MAJOR — still reaches the client. Forwarding the next event's delta
+/// unchanged loses exactly that: the next event marks only ITS OWN leaves, and
+/// on the raw path carries only its own bytes, so the alarm transition is gone
+/// from the wire for good.
+///
+/// The broadcast ring has overwritten the dropped events, so their individual
+/// changed bitsets are unrecoverable — but their EFFECT is not: the channel
+/// cache's `latest` is the merge of every upstream event
+/// ([`ChannelEntry::snapshot`], the same whole-structure element a monitor seed
+/// is built from). Re-framing from it delivers every accumulated value with
+/// every leaf marked changed — a superset of pva2pva's accumulated bitset, and
+/// the same values. No transition can be lost, and the subscriber needs no
+/// "next delta is special" state to carry the loss forward.
+///
+/// The overrun bitset flags every leaf: after a drop, any leaf may have taken
+/// an intermediate value the subscriber never saw. That is pva2pva's
+/// `overrun |= changed & lastelem->changed` under a full changed set, and the
+/// conservative direction — it can over-report "you may have missed a value",
+/// never hide a real loss.
+fn reframe_raw_body_after_lag(
+    value: &PvField,
     desc: &FieldDesc,
     order: epics_pva_rs::proto::ByteOrder,
 ) -> Option<bytes::Bytes> {
     use epics_pva_rs::proto::BitSet;
-    let mut cur = std::io::Cursor::new(body.as_ref());
-    let changed = BitSet::decode(&mut cur, order).ok()?;
-    // Advance the cursor past the value region so it lands on the trailing
-    // overrun bitset; the decoded value itself is discarded — we only need
-    // the `changed | value` / `overrun` split offset.
-    epics_pva_rs::pvdata::encode::decode_pv_field_with_bitset(desc, &changed, 0, &mut cur, order)
-        .ok()?;
-    let value_end = cur.position() as usize;
-    let mut overrun = BitSet::decode(&mut cur, order).ok()?;
-    // Union the delivered event's changed leaves into the (preserved)
-    // upstream overrun bitset.
-    for b in changed.iter() {
-        overrun.set(b);
+    // pva2pva's "all changed" is the root bit (`elem->changedBitSet->set(0)`,
+    // moncache.cpp:304-312). Our encoder cannot emit bit 0 (it trims to leaves,
+    // as pvxs's `Value::mark` does), so the decodable equivalent is the
+    // canonical FULL leaf set — the identical rule `SourceRead { marked: None }`
+    // frames a seed with. Select every bit, canonicalise to the leaves.
+    let mut all = BitSet::new();
+    for b in 0..desc.total_bits() {
+        all.set(b);
     }
-    if overrun.is_empty() {
-        // Nothing changed and nothing was overrun — leave the body byte-
-        // identical so the dedup/ptr fast paths upstream stay valid.
+    let changed = epics_pva_rs::pvdata::encode::canonical_changed_bitset(desc, &all);
+    if changed.is_empty() {
         return None;
     }
-    let mut out = Vec::with_capacity(value_end + 8);
-    out.extend_from_slice(&body[..value_end]);
-    overrun.write_into(order, &mut out);
-    Some(bytes::Bytes::from(out))
+    let mut body = Vec::new();
+    changed.write_into(order, &mut body);
+    epics_pva_rs::pvdata::encode::encode_pv_field_with_bitset(
+        value, desc, &changed, 0, order, &mut body,
+    );
+    // overrun == changed: every leaf of the re-framed structure may have had an
+    // unobserved intermediate value across the dropped range.
+    changed.write_into(order, &mut body);
+    Some(bytes::Bytes::from(body))
 }
 
 /// Lost-leaf paths to record in a cooked [`MonitorUpdate::overrun`] after a
-/// fanout broadcast lag — the decoded-path counterpart of
-/// [`mark_raw_body_local_overrun`]. The cooked gateway fanout re-encodes the
-/// whole value (changed = full selection mask) on every event, so a dropped
-/// intermediate may have moved any leaf; the surviving snapshot's changed
-/// leaves are therefore the value's own leaves. Returning the top-level
-/// field names lets the server's `overrun_bitset` expand them to every leaf
-/// (via `marked_changed_bitset`) and intersect down to the subscriber's
-/// request selection. Mirrors pva2pva unioning the surviving element's
-/// changed leaves into the overrun bitset on downstream overflow —
-/// `overrun |= changed & lastelem->changed`
-/// (epics-base/modules/pva2pva/p2pApp/moncache.cpp:160-168). A non-structure
-/// value (no gateway PV produces one) reports no overrun.
+/// fanout broadcast lag — the port's own loss accounting, mirroring pva2pva
+/// unioning the surviving element's changed leaves into the overrun bitset on
+/// downstream overflow (`overrun |= changed & lastelem->changed`,
+/// epics-base/modules/pva2pva/p2pApp/moncache.cpp:160-168). The cooked gateway
+/// fanout re-encodes the whole value (changed = full selection mask) on every
+/// event, so a dropped intermediate may have moved any leaf; the surviving
+/// snapshot's changed leaves are therefore the value's own leaves, named here
+/// as top-level fields. A non-structure value (no gateway PV produces one)
+/// reports no overrun.
+///
+/// Unlike [`mark_raw_body_local_overrun`], which writes into the raw body the
+/// forwarder puts on the wire, this set stays SERVER-SIDE: every cooked MONITOR
+/// DATA frame ends in a hard-empty overrun bitset, as pvxs's does
+/// (`servermon.cpp:174-176`). See `MonitorUpdate::overrun`.
 fn value_overrun_paths(value: &PvField) -> Vec<String> {
     match value {
         PvField::Structure(s) => s.fields.iter().map(|(k, _)| k.clone()).collect(),
         _ => Vec::new(),
     }
-}
-
-/// one downstream→upstream pause/resume command queued to
-/// the gateway's single watermark applier (spawned in
-/// [`GatewayChannelSource::new`]).
-///
-/// * `cache` is the *single* cache layer the firing subscription's
-///   upstream lives in — resolved from the downstream credential
-///   context in the callback ([`GatewayChannelSource::upstream_cache_peek_for`]),
-///   so one credential's backpressure never pauses another
-///   credential's separate upstream for the same PV name (Finding 2).
-/// * `op_id` identifies the downstream subscriber op casting this vote;
-///   `seq` is the server's strictly-monotonic per-op watermark crossing
-///   token. The applier folds `(op_id, seq, kind)` into the entry via
-///   [`super::channel_cache::UpstreamEntry::apply_watermark_vote`], which
-///   orders an op's own re-ordered transitions by `seq` (Finding 1) and
-///   reference-counts pause votes across co-subscribers so the shared
-///   upstream pauses only when every live op wants pause.
-struct WmCommand {
-    cache: Arc<ChannelCache>,
-    name: String,
-    op_id: u64,
-    seq: u64,
-    kind: WatermarkKind,
 }
 
 /// PV-name → ASG-name resolver. Returns the ASG that the gateway
@@ -370,16 +373,6 @@ pub struct GatewayChannelSource {
     ///
     /// bounded via `BoundedPool` (same cap as `upstream_pool`).
     upstream_caches: Arc<Mutex<BoundedPool<UpstreamIdentityKey, Arc<ChannelCache>>>>,
-    /// feeds the single watermark pause/resume applier
-    /// task spawned in [`Self::new`]. The sync `notify_watermark_*`
-    /// callbacks push a [`WmCommand`] here with NO per-callback
-    /// `tokio::spawn`, so there is exactly one totally-ordered owner of
-    /// each upstream's pause state — the detached-spawn reorder that
-    /// could otherwise leave an upstream wedged paused after a resume
-    /// cannot happen. Cloning the source clones the sender (all clones
-    /// feed the one applier); the applier exits when the last clone
-    /// drops.
-    wm_tx: mpsc::UnboundedSender<WmCommand>,
     /// Server-wide channel invalidator, wired once by
     /// the native server through [`ChannelSource::set_channel_invalidator`].
     /// Stored so it reaches not only the shared [`Self::cache`] but every
@@ -393,17 +386,33 @@ pub struct GatewayChannelSource {
     channel_invalidator: Arc<OnceLock<ChannelInvalidator>>,
 }
 
+/// The one place an upstream client-side failure becomes a downstream
+/// [`OpError`] — the gateway's whole error-forwarding contract (R18-27).
+///
+/// An upstream op that answered with a non-success `Status` gives us that
+/// `Status`; it goes downstream **as itself** — kind, message and stack —
+/// because the downstream client asked the upstream question and is owed the
+/// upstream answer. pva2pva gets this for free: it hands the downstream
+/// requester straight to the upstream channel (`p2pApp/channel.cpp:117-127`),
+/// so it has no opportunity to re-author the Status. Our two legs are separate
+/// operations, so the forwarding is explicit — but it must be lossless.
+/// Rendering it (`format!("{e}")`) is what put a Rust `Debug` dump on the PVA
+/// wire and coerced every upstream FATAL/WARN into a downstream ERROR.
+///
+/// Anything else (a timeout, a dropped circuit, a decode error) is OUR
+/// failure, not a forwarded one, and is authored here as a local error.
+fn upstream_op_error(e: epics_pva_rs::error::PvaError) -> OpError {
+    match e {
+        epics_pva_rs::error::PvaError::RemoteError(status) => OpError::remote(status),
+        other => OpError::failed(other.to_string()),
+    }
+}
+
 impl GatewayChannelSource {
     pub fn new(cache: Arc<ChannelCache>) -> Self {
         let acf: AcfCell = Arc::new(RwLock::new(None));
         let asg_resolver = Arc::new(RwLock::new(default_asg_resolver()));
         let gate = Self::build_gate(acf.clone(), asg_resolver.clone());
-        // one ordered watermark applier per logical
-        // source. `new` is the only constructor and `Clone` just copies
-        // the sender, so exactly one applier task exists no matter how
-        // many `Arc<dyn ChannelSourceObj>` handles the runtime holds.
-        let (wm_tx, wm_rx) = mpsc::unbounded_channel::<WmCommand>();
-        Self::spawn_watermark_applier(wm_rx);
         Self {
             cache,
             connect_timeout: Duration::from_secs(5),
@@ -418,7 +427,6 @@ impl GatewayChannelSource {
             asg_resolver,
             gate,
             upstream_caches: Arc::new(Mutex::new(BoundedPool::new(256))),
-            wm_tx,
             channel_invalidator: Arc::new(OnceLock::new()),
         }
     }
@@ -697,90 +705,6 @@ impl GatewayChannelSource {
         total
     }
 
-    /// the single ordered owner of upstream pause/resume.
-    /// Draining one mpsc with one task means every vote for a given entry
-    /// is folded in one total order via
-    /// [`super::channel_cache::UpstreamEntry::apply_watermark_vote`], which
-    /// orders each op's own re-ordered transitions by `seq` (Finding 1)
-    /// and reference-counts pause votes across co-subscribers — pausing
-    /// the shared upstream only when every live downstream op wants pause
-    /// and resuming as soon as one has room. `apply_..`
-    /// returns `Some(_)` only on a real aggregate edge; on an edge the
-    /// applier calls `reconcile_pause`, which re-reads the level and drives
-    /// the installed `Pauser` through the entry's single serialized owner.
-    /// That owner is shared with the reconnect loop's Pauser re-install.
-    /// pvxs monitor pause is per-connection (`clientmon.cpp:379-414`,
-    /// `:633-635`): a reconnect installs against an empty aggregate (the
-    /// prior connection's votes were dropped at disconnect) and the fresh
-    /// subscription runs, so this applier re-pauses only on a fresh HIGH from
-    /// a live downstream op. Because this is the sole writer of the entry's
-    /// votes, the fold has no competing writer.
-    fn spawn_watermark_applier(mut rx: mpsc::UnboundedReceiver<WmCommand>) {
-        tokio::spawn(async move {
-            while let Some(cmd) = rx.recv().await {
-                let Some(entry) = cmd.cache.peek(&cmd.name).await else {
-                    continue;
-                };
-                if entry
-                    .apply_watermark_vote(cmd.op_id, cmd.seq, cmd.kind)
-                    .is_none()
-                {
-                    // No aggregate edge — the shared pause-state is
-                    // unchanged by this vote, so the installed Pauser
-                    // already matches and needs no drive.
-                    continue;
-                }
-                // Drive on the edge, but through the single serialized
-                // owner: `reconcile_pause` re-reads the level and is
-                // mutually serialized with the reconnect loop's
-                // re-install, so the installed Pauser always settles to
-                // the current aggregate (no two-driver strand race).
-                entry.reconcile_pause().await;
-            }
-        });
-    }
-
-    /// the cache layer the subscription identified by
-    /// `ctx` monitors through, WITHOUT creating one. Anonymous /
-    /// empty-account peers ride the shared `cache`; a credentialed peer
-    /// rides its per-credential cache iff one already exists. Returns
-    /// `None` for a credentialed peer with no live per-credential cache
-    /// (nothing to pause). Mirrors the layer selection of
-    /// [`Self::upstream_cache_for`] but is side-effect-free — a
-    /// watermark crossing must not mint a new cache. Scoping the
-    /// pause/resume to this one layer is what stops one credential's
-    /// backpressure from throttling another credential's separate
-    /// upstream for the same PV name (Finding 2).
-    fn upstream_cache_peek_for(&self, ctx: &ChannelContext) -> Option<Arc<ChannelCache>> {
-        if ctx.account.is_empty() || ctx.method == "anonymous" {
-            return Some(self.cache.clone());
-        }
-        let key = UpstreamIdentityKey::from_ctx(ctx);
-        self.upstream_caches.lock().get(&key).cloned()
-    }
-
-    /// resolve the firing subscription's single cache
-    /// layer (per-credential targeting) and enqueue a pause vote to the
-    /// ordered applier. Synchronous and non-blocking
-    /// (`UnboundedSender::send`) — no per-callback spawn — so two
-    /// near-simultaneous votes cannot be re-ordered by the runtime; their
-    /// per-op `seq` (minted at the server's crossing) settles each op's
-    /// state in the applier, and the applier reference-counts across ops.
-    fn queue_watermark(&self, name: &str, ev: &WatermarkEvent, ctx: &ChannelContext) {
-        let Some(cache) = self.upstream_cache_peek_for(ctx) else {
-            // Credentialed peer with no live upstream cache — nothing to
-            // pause/resume.
-            return;
-        };
-        let _ = self.wm_tx.send(WmCommand {
-            cache,
-            name: name.to_string(),
-            op_id: ev.op_id,
-            seq: ev.seq,
-            kind: ev.kind,
-        });
-    }
-
     /// Diagnostic: live subscribe-bridge tasks.
     pub fn live_subscribers(&self) -> usize {
         self.subscriber_count.load(Ordering::Relaxed)
@@ -835,7 +759,7 @@ impl GatewayChannelSource {
         name: &str,
         pv_request: Option<&PvField>,
     ) -> Option<(
-        Option<PvField>,
+        Option<SourceRead>,
         mpsc::Receiver<epics_pva_rs::server_native::RawMonitorEvent>,
     )> {
         // default ON — opt out via EPICS_PVA_GW_RAW_FRAMES=NO.
@@ -895,6 +819,10 @@ impl GatewayChannelSource {
         // first upstream event, so introspection is populated; `None` only on
         // the degenerate not-yet-decoded case, where we forward unmarked.
         let desc = entry.introspection();
+        let initial_order = initial_raw
+            .as_ref()
+            .map(|e| e.byte_order)
+            .unwrap_or(epics_pva_rs::proto::ByteOrder::Little);
         let (mpsc_tx, mpsc_rx) =
             mpsc::channel::<epics_pva_rs::server_native::RawMonitorEvent>(self.subscriber_queue);
         let counter = self.subscriber_count.clone();
@@ -911,12 +839,11 @@ impl GatewayChannelSource {
             // skips the first broadcast event that duplicates that
             // snapshot (the subscribe_raw()/snapshot_raw() race window).
             let mut dedup = dedup_body;
-            // Set when this subscriber's broadcast receiver lagged (events
-            // dropped under its own backpressure). pva2pva marks the
-            // coalesced overflow element's overrun bitset on the next
-            // delivery (moncache.cpp:354-365); we mirror that by flagging the
-            // next forwarded body via `mark_raw_body_local_overrun`.
-            let mut pending_overrun = false;
+            // The byte order the re-frame after a lag is encoded in: the one
+            // the upstream is speaking. Seeded from the cached snapshot and
+            // refreshed on every event, so a synthesized frame never
+            // contradicts the bodies around it.
+            let mut order = initial_order;
             loop {
                 match bcast.recv().await {
                     Ok(ev) => {
@@ -926,23 +853,9 @@ impl GatewayChannelSource {
                             }
                         }
                         let type_changed = ev.type_changed;
-                        let mut body = ev.body;
-                        // After a drop, this (latest) event is the coalesced
-                        // element pva2pva would deliver marked overrun. A
-                        // type-change marker carries an empty body and is
-                        // never a value event, so it is left untouched.
-                        if pending_overrun && !type_changed {
-                            if let Some(d) = desc.as_ref() {
-                                if let Some(marked) =
-                                    mark_raw_body_local_overrun(&body, d, ev.byte_order)
-                                {
-                                    body = marked;
-                                }
-                            }
-                            pending_overrun = false;
-                        }
+                        order = ev.byte_order;
                         let out = epics_pva_rs::server_native::RawMonitorEvent {
-                            body_bytes: body,
+                            body_bytes: ev.body,
                             byte_order: ev.byte_order,
                             type_changed,
                         };
@@ -955,15 +868,29 @@ impl GatewayChannelSource {
                         }
                     }
                     // Events dropped under this receiver's own backpressure.
-                    // pva2pva enters overflow and ORs the overrun bitset
-                    // (moncache.cpp:156-174) rather than silently swallowing
-                    // the loss; we accumulate a pending overrun to be flagged
-                    // on the next delivered body (see `pending_overrun`
-                    // above), so a slow downstream client sees the same
-                    // overrun signal it would behind pva2pva instead of a
-                    // deceptively clean stream.
+                    // Close the loss HERE, from the channel's merged snapshot —
+                    // the delta that arrives next carries neither the dropped
+                    // events' changed bits nor (on this raw path) their bytes,
+                    // so forwarding it loses an alarm transition that happened
+                    // only in a dropped event. See [`reframe_raw_body_after_lag`].
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        pending_overrun = true;
+                        let (Some(d), Some(snap)) = (desc.as_ref(), entry.snapshot()) else {
+                            // No descriptor / no value has been decoded yet ⟹
+                            // no value event has reached any subscriber, so
+                            // nothing was lost to re-frame.
+                            continue;
+                        };
+                        let Some(body) = reframe_raw_body_after_lag(&snap.value, d, order) else {
+                            continue;
+                        };
+                        let out = epics_pva_rs::server_native::RawMonitorEvent {
+                            body_bytes: body,
+                            byte_order: order,
+                            type_changed: false,
+                        };
+                        if mpsc_tx.send(out).await.is_err() {
+                            return;
+                        }
                         continue;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
@@ -985,7 +912,7 @@ impl GatewayChannelSource {
         name: &str,
         pv_request: Option<&PvField>,
     ) -> Option<(
-        Option<PvField>,
+        Option<SourceRead>,
         mpsc::Receiver<epics_pva_rs::server_native::MonitorUpdate>,
     )> {
         // Gateway-wide subscriber cap.
@@ -1026,29 +953,14 @@ impl GatewayChannelSource {
             // returned as the SubscriptionSeed seed and emitted by the
             // server, NOT replayed into this stream (double-seed fix).
             //
-            // Set when this subscriber's broadcast receiver lagged (events
-            // dropped under its own backpressure); the next delivered update
-            // carries the lost leaves in its `overrun` set, parallel to the
-            // raw forwarder's `pending_overrun` / `mark_raw_body_local_overrun`.
-            let mut pending_overrun = false;
             loop {
                 match bcast_rx.recv().await {
-                    Ok(mut update) => {
+                    Ok(update) => {
                         // A `type_changed` boundary is the last event
                         // the decoded stream carries: forward it so the server
                         // emits MONITOR FINISH, then end the forwarder —
                         // mirroring the raw forwarder's `type_changed` return.
                         let is_boundary = update.type_changed;
-                        // After a lag, this surviving snapshot is the coalesced
-                        // element pva2pva would deliver marked overrun
-                        // (moncache.cpp:160-168). Record the lost leaves in the
-                        // cooked `overrun` set so the server encodes them into
-                        // the trailing overrun bitset of the next DATA frame. A
-                        // type-change marker carries no value and is untouched.
-                        if pending_overrun && !is_boundary {
-                            update.overrun = value_overrun_paths(&update.value);
-                            pending_overrun = false;
-                        }
                         if mpsc_tx.send(update).await.is_err() {
                             return;
                         }
@@ -1056,17 +968,33 @@ impl GatewayChannelSource {
                             return;
                         }
                     }
-                    // Drops under this receiver's backpressure. pva2pva enters
-                    // overflow and ORs the overrun bitset (moncache.cpp:156-174)
-                    // rather than silently swallowing the loss; the raw
-                    // forwarder mirrors this via `pending_overrun`. The cooked
-                    // path now does the same through `MonitorUpdate.overrun`
-                    // (the decoded-path counterpart of the trailing overrun
-                    // bitset), so a slow downstream client behind
-                    // EPICS_PVA_GW_RAW_FRAMES=NO is no longer served a
-                    // deceptively clean stream that hides the dropped events.
+                    // Drops under this receiver's backpressure. Close the loss
+                    // HERE, by re-framing the channel's merged snapshot — the
+                    // same rule as the raw path ([`reframe_raw_body_after_lag`]),
+                    // and the same rule a monitor seed follows: a frame built
+                    // from `latest` declares the WHOLE structure. The next
+                    // event's delta marks only its own leaves, so forwarding it
+                    // would drop the changed bits of everything the dropped
+                    // events moved — an alarm transition among them.
+                    //
+                    // The lost leaves are also recorded in the cooked `overrun`
+                    // set, which stays SERVER-SIDE: the cooked DATA frame ends in
+                    // pvxs's hard-empty overrun bitset (`servermon.cpp:174-176`),
+                    // so only a downstream on the raw path sees overrun bits.
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        pending_overrun = true;
+                        let Some(snap) = entry.snapshot() else {
+                            continue;
+                        };
+                        let overrun = value_overrun_paths(&snap.value);
+                        let update = epics_pva_rs::server_native::MonitorUpdate {
+                            value: snap.value,
+                            marked: None,
+                            type_changed: false,
+                            overrun,
+                        };
+                        if mpsc_tx.send(update).await.is_err() {
+                            return;
+                        }
                         continue;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
@@ -1273,7 +1201,7 @@ impl ChannelSource for GatewayChannelSource {
             .client()
             .pvput_pv_field(name, &value)
             .await
-            .map_err(|e| OpError::failed(e.to_string()))
+            .map_err(upstream_op_error)
     }
 
     /// Credential-aware PUT — migration to the
@@ -1342,7 +1270,7 @@ impl ChannelSource for GatewayChannelSource {
             }
             None => client.pvput_pv_field(name, &value).await,
         };
-        result.map_err(|e| OpError::failed(e.to_string()))
+        result.map_err(upstream_op_error)
     }
 
     /// Credential-aware atomic **PUT_GET** — forward the whole operation
@@ -1370,7 +1298,7 @@ impl ChannelSource for GatewayChannelSource {
         _changed: epics_pva_rs::proto::BitSet,
         delta: PvField,
         ctx: ChannelContext,
-    ) -> Result<Option<PvField>, OpError> {
+    ) -> Result<Option<SourceRead>, OpError> {
         if !checked.allows_write() {
             tracing::debug!(
                 pv = %checked.pv_name(),
@@ -1399,19 +1327,22 @@ impl ChannelSource for GatewayChannelSource {
         // One upstream PUT_GET carrying the downstream's preserved INIT
         // pvRequest (process/block) and the put value; the value targets the
         // `value` bit (typed pass-through, matching the plain-PUT path) and
-        // the upstream post-put readback is returned verbatim. Falls back to
-        // the default request when the downstream sent none.
-        let result = match ctx.pv_request.as_ref() {
+        // the upstream post-put readback is returned verbatim — INCLUDING the
+        // leaves the upstream marked in it (`MarkedRead::marked`), so the
+        // downstream reply frames the upstream's changed-bitset rather than a
+        // full mask over decoder-zero-filled leaves (pva2pva forwards the
+        // upstream readback's bitset, `p2pApp/channel.cpp:129-137`). Falls
+        // back to the default request when the downstream sent none.
+        let read = match ctx.pv_request.as_ref() {
             Some(req) => {
                 client
-                    .pvput_get_pv_field_with_request_value(name, req, &delta)
+                    .pvput_get_pv_field_with_request_value_marked(name, req, &delta)
                     .await
             }
-            None => client.pvput_get_pv_field(name, &delta).await,
+            None => client.pvput_get_pv_field_marked(name, &delta).await,
         };
-        result
-            .map(|(_desc, value)| Some(value))
-            .map_err(|e| OpError::failed(e.to_string()))
+        read.map(|r| Some(upstream_read(r)))
+            .map_err(upstream_op_error)
     }
 
     async fn is_writable(&self, name: &str) -> bool {
@@ -1442,7 +1373,7 @@ impl ChannelSource for GatewayChannelSource {
     }
 
     /// Forward an RPC request through the upstream client. The default
-    /// trait impl returns "RPC not supported", which is a major p2pApp
+    /// trait impl returns "RPC Not Implemented", which is a major p2pApp
     /// parity gap (review §1). With this override, RPC requests pass
     /// through transparently — `pvrpc` reuses the cached channel
     /// connection-pool entry so we don't pay a fresh search per call.
@@ -1451,7 +1382,7 @@ impl ChannelSource for GatewayChannelSource {
         name: &str,
         request_desc: FieldDesc,
         request_value: PvField,
-    ) -> Result<(FieldDesc, PvField), OpError> {
+    ) -> Result<RpcReply, OpError> {
         // No monitor-gated preflight (see `put_value`): the RPC forwards
         // through the shared client, which connects on demand and surfaces
         // the upstream error itself.
@@ -1464,7 +1395,7 @@ impl ChannelSource for GatewayChannelSource {
         .await;
         match result {
             Ok(Ok(pair)) => Ok(pair),
-            Ok(Err(e)) => Err(OpError::failed(e.to_string())),
+            Ok(Err(e)) => Err(upstream_op_error(e)),
             Err(_) => Err(OpError::failed(format!("upstream rpc timeout for {name}"))),
         }
     }
@@ -1488,7 +1419,7 @@ impl ChannelSource for GatewayChannelSource {
         request_desc: FieldDesc,
         request_value: PvField,
         ctx: ChannelContext,
-    ) -> Result<(FieldDesc, PvField), OpError> {
+    ) -> Result<RpcReply, OpError> {
         if !checked.allows_write() {
             tracing::debug!(
                 pv = %checked.pv_name(),
@@ -1533,7 +1464,7 @@ impl ChannelSource for GatewayChannelSource {
         let result = tokio::time::timeout(self.rpc_timeout, call).await;
         match result {
             Ok(Ok(pair)) => Ok(pair),
-            Ok(Err(e)) => Err(OpError::failed(e.to_string())),
+            Ok(Err(e)) => Err(upstream_op_error(e)),
             Err(_) => Err(OpError::failed(format!("upstream rpc timeout for {name}"))),
         }
     }
@@ -1552,7 +1483,7 @@ impl ChannelSource for GatewayChannelSource {
             .client()
             .pvprocess(name)
             .await
-            .map_err(|e| OpError::failed(e.to_string()))
+            .map_err(upstream_op_error)
     }
 
     /// Credential-aware PROCESS. pvxs treats PROCESS as a WRITE-class
@@ -1598,7 +1529,7 @@ impl ChannelSource for GatewayChannelSource {
             Some(req) => client.pvprocess_with_request_value(name, req).await,
             None => client.pvprocess(name).await,
         };
-        result.map_err(|e| OpError::failed(e.to_string()))
+        result.map_err(upstream_op_error)
     }
 
     // ── ChannelArray (cmd 14) — forward to the per-credential upstream ──
@@ -1631,7 +1562,7 @@ impl ChannelSource for GatewayChannelSource {
             Some(req) => client.pvarray_describe_with_request_value(name, req).await,
             None => client.pvarray_describe(name).await,
         };
-        result.map_err(|e| OpError::failed(e.to_string()))
+        result.map_err(upstream_op_error)
     }
 
     async fn channel_array_get(
@@ -1664,7 +1595,7 @@ impl ChannelSource for GatewayChannelSource {
         };
         result
             .map(|(_desc, value)| value)
-            .map_err(|e| OpError::failed(e.to_string()))
+            .map_err(upstream_op_error)
     }
 
     async fn channel_array_put(
@@ -1695,7 +1626,7 @@ impl ChannelSource for GatewayChannelSource {
             }
             None => client.pvarray_put(name, &value, offset, stride).await,
         };
-        result.map_err(|e| OpError::failed(e.to_string()))
+        result.map_err(upstream_op_error)
     }
 
     async fn channel_array_set_length(
@@ -1724,7 +1655,7 @@ impl ChannelSource for GatewayChannelSource {
             }
             None => client.pvarray_set_length(name, length).await,
         };
-        result.map_err(|e| OpError::failed(e.to_string()))
+        result.map_err(upstream_op_error)
     }
 
     async fn channel_array_get_length(
@@ -1752,7 +1683,7 @@ impl ChannelSource for GatewayChannelSource {
             }
             None => client.pvarray_get_length(name).await,
         };
-        result.map_err(|e| OpError::failed(e.to_string()))
+        result.map_err(upstream_op_error)
     }
 
     async fn subscribe_raw(
@@ -1781,6 +1712,39 @@ impl ChannelSource for GatewayChannelSource {
     /// served `entry.snapshot()` from the monitor cache, which returned
     /// stale cached state instead of forwarding a real upstream ChannelGet
     /// (see `get_value` for the pva2pva `channel.cpp:109-115` rationale).
+    /// The GET / PUT_GET-readback framing path: forward the upstream read
+    /// AND the leaves the upstream marked in it.
+    ///
+    /// The trait default wraps [`Self::get_value_checked`] as
+    /// `marked: None` — "the source assigned everything" — which for a
+    /// gateway is false: the upstream frames only the leaves ITS source
+    /// assigned (`to_wire_valid`), and the client decoder zero-fills the
+    /// rest. Re-framing a full mask downstream would put those fabricated
+    /// zeros on the wire (e.g. the seven `getProperties` never assigns).
+    /// pva2pva forwards the upstream reply's own bitset
+    /// (`p2pApp/channel.cpp:109-114`), which is what the upstream marks
+    /// carried here reproduce. A root-bit reply (upstream said "whole
+    /// structure") arrives as `None` and stays `None`.
+    async fn read_checked(
+        &self,
+        checked: AccessChecked,
+        ctx: ChannelContext,
+    ) -> Option<SourceRead> {
+        if !checked.allows_read() {
+            return None;
+        }
+        let client = self.upstream_client_for(&ctx);
+        let read = match ctx.pv_request.as_ref() {
+            Some(req) => {
+                client
+                    .pvget_pv_field_with_request_value_marked(checked.pv_name(), req)
+                    .await
+            }
+            None => client.pvget_marked(checked.pv_name()).await,
+        };
+        read.ok().map(upstream_read)
+    }
+
     async fn get_value_checked(
         &self,
         checked: AccessChecked,
@@ -1939,6 +1903,14 @@ impl ChannelSource for GatewayChannelSource {
         // `(name, ctx)` cache layer via `notify_monitor_start`, not per
         // downstream op, so no per-op `MonitorGate` here.
         Some(epics_pva_rs::server_native::source::SubscriptionSeed {
+            // The seed is the cache's merged upstream snapshot, declared
+            // whole-structure — pva2pva's `changedBitSet->set(0)` on the
+            // element it hands a starting MonitorUser (`moncache.cpp:304-312`),
+            // rendered as the canonical full leaf bitset because our encoder
+            // cannot emit the root bit. `channel_cache::monitor_seed` owns that
+            // rule; nothing here may re-declare it. Post-seed updates are the
+            // other rule — they carry the upstream event's own changed bitset
+            // through `MonitorUpdate::marked` (`moncache.cpp:142`).
             initial,
             updates,
             on_start: None,
@@ -1970,73 +1942,40 @@ impl ChannelSource for GatewayChannelSource {
             )
             .await?;
         Some(epics_pva_rs::server_native::source::SubscriptionSeed {
+            // Same contract as `subscribe_seeded`: the seed is whole-structure
+            // (`channel_cache::monitor_seed`). The raw path's seed is encoded
+            // through the decoded path, so it goes on the wire with exactly
+            // that bitset.
             initial,
             updates,
             on_start: None,
         })
     }
 
-    /// expose pipeline-window watermark levels so the
-    /// server's monitor loop drives pause/resume on the feeding upstream
-    /// monitor. Pre-FR-11 `GatewayChannelSource` did NOT override this,
-    /// so the trait default `None` made the pause/resume callbacks
-    /// unreachable — the `Pauser` plumbing existed but nothing could fire
-    /// it.
+    /// The gateway declares NO pipeline-window watermarks, and therefore
+    /// never asks the server for pause/resume callbacks (the trait default
+    /// `notify_watermark` is a no-op).
     ///
-    /// `(low, high) = (0, 0)`: pause the upstream when the downstream
-    /// pipeline window is fully drained (0 credit — the gateway cannot
-    /// emit anyway) and resume as soon as a client ACK returns any
-    /// credit. The `(0, 0)` choice is independent of the client-
-    /// negotiated queue size and therefore deadlock-free for any window:
-    /// `high == 0` guarantees the ACK path can always re-cross it
-    /// (`w_now > 0`) and resume a paused upstream. (A non-zero `high`
-    /// could exceed a small client window and never re-fire after a
-    /// pause.) Name-independent: the gateway applies the same `(0, 0)`
-    /// pipeline-window policy to every monitor it serves. The composite
-    /// resolves the owning source via `has_pv` before reading levels, so
-    /// this is consulted only for names the gateway actually owns —
-    /// returning `Some` for every name no longer shadows a co-registered
-    /// name-scoped source's real per-PV levels.
+    /// A downstream monitor must not throttle the upstream: that upstream is
+    /// shared with every co-subscriber of the same (PV, credential), and a
+    /// pause is not divisible. pva2pva does not throttle either — its
+    /// `MonitorCacheEntry::notify` polls the upstream dry with a bare
+    /// `//TODO: flow control` where an upstream throttle would go
+    /// (`moncache.cpp:133-137`) and absorbs a slow downstream in that
+    /// downstream's OWN `overflowElement`, counting the coalesced updates in
+    /// `ndropped` (`:151-174`).
+    ///
+    /// Declaring `Some((0, 0))` here is what made the R18-25 starvation
+    /// reachable: it turned every downstream DATA emission into a pause vote
+    /// on the shared upstream, and an op became a *voter* only by crossing LOW
+    /// itself — so a non-pipelined co-subscriber could neither vote nor undo
+    /// the pause, and starved. The overflow absorption the gateway already has
+    /// (broadcast lag → `pending_overrun` → the overrun mark on the next body,
+    /// see `subscribe_raw_inner` / `subscribe_inner`) IS pva2pva's mechanism,
+    /// and it needs no upstream throttle.
     async fn monitor_watermarks(&self, name: &str) -> Option<(usize, usize)> {
         let _ = name;
-        Some((0, 0))
-    }
-
-    /// Forward downstream pipeline-window flow control into upstream
-    /// pause/resume. pvxs pipeline-window semantics
-    /// (`servermon.cpp`/`source.h`): `Resume` means a client ACK refilled
-    /// the window above the high mark — the downstream is keeping up, so
-    /// its pause vote is dropped; `Pause` means a DATA emission drained the
-    /// window to/below low — the client is falling behind, so it votes to
-    /// pause the feeding upstream. `Withdraw` (the op's subscriber task
-    /// ended) removes its vote so a torn-down op cannot strand the shared
-    /// upstream paused for its co-subscribers. The per-PV `Pauser` is
-    /// installed by the auto-restart task in
-    /// `channel_cache.rs::spawn_upstream_monitor`.
-    ///
-    /// The vote is resolved to the *single* cache
-    /// layer this credential monitors through (per-credential targeting)
-    /// and queued to the single ordered applier with the
-    /// server's per-op crossing `seq` (deadlock-free ordering)
-    /// and `op_id` (cross-op reference counting). Best
-    /// effort: if the entry isn't currently connected upstream the
-    /// pause/resume is a no-op in the applier.
-    fn notify_watermark(&self, name: &str, ctx: &ChannelContext, ev: WatermarkEvent) {
-        match ev.kind {
-            WatermarkKind::Pause => tracing::warn!(
-                pv = %name, op_id = ev.op_id, seq = ev.seq,
-                "pva-gateway: downstream pipeline window drained below low — voting pause"
-            ),
-            WatermarkKind::Resume => tracing::debug!(
-                pv = %name, op_id = ev.op_id, seq = ev.seq,
-                "pva-gateway: downstream pipeline window refilled above high — releasing pause vote"
-            ),
-            WatermarkKind::Withdraw => tracing::debug!(
-                pv = %name, op_id = ev.op_id,
-                "pva-gateway: downstream monitor op ended — withdrawing pause vote"
-            ),
-        }
-        self.queue_watermark(name, &ev, ctx);
+        None
     }
 }
 
@@ -2056,6 +1995,7 @@ mod tests {
             authority: String::new(),
             roles: Vec::new(),
             pv_request: None,
+            log: Default::default(),
         }
     }
 
@@ -2161,72 +2101,21 @@ mod tests {
             "gateway list_pvs must not masquerade the cache as channelList (pva2pva parity)"
         );
     }
-
-    /// the gateway source MUST expose pipeline-window
-    /// watermark levels so the server's monitor loop drives upstream
-    /// pause/resume. Pre-FR-11 it inherited the trait default `None`,
-    /// leaving the `Pauser` callbacks unreachable. `(0, 0)` is the
-    /// deadlock-free choice (HIGH always re-crosses on the first ACK
-    /// credit regardless of the client's negotiated window).
+    /// R18-25: the gateway declares NO pipeline watermarks, so the server
+    /// never asks it to pause a shared upstream. pva2pva does not throttle
+    /// upstream either (`moncache.cpp:133-137`, the `//TODO: flow control`);
+    /// a slow downstream is absorbed in its own overflow element.
+    ///
+    /// Pre-fix this returned `Some((0, 0))`, which turned every downstream
+    /// DATA emission into a pause vote on the shared upstream and let one slow
+    /// pipelined client starve every co-subscriber.
     #[tokio::test]
-    async fn fr11_gateway_exposes_watermark_levels() {
+    async fn r18_25_gateway_declares_no_pipeline_watermarks() {
         let src = make_source();
         assert_eq!(
             <GatewayChannelSource as ChannelSource>::monitor_watermarks(&src, "ANY:PV").await,
-            Some((0, 0)),
-            "gateway must expose watermark levels so pause/resume is reachable"
-        );
-    }
-
-    /// A watermark crossing must
-    /// pause/resume ONLY the cache layer the firing credential monitors
-    /// through. `upstream_cache_peek_for` resolves that single layer
-    /// (and never creates one), so one credential's backpressure cannot
-    /// reach another credential's separate upstream for the same PV
-    /// name — the over-throttle the pre-review all-layers walk caused.
-    #[tokio::test]
-    async fn fr11_watermark_targets_only_the_firing_credentials_cache() {
-        let src = make_source();
-
-        // Anonymous peers ride the shared cache.
-        let anon = make_ctx("h", "", "anonymous");
-        let shared = src
-            .upstream_cache_peek_for(&anon)
-            .expect("anonymous always resolves to the shared cache");
-        assert!(
-            Arc::ptr_eq(&shared, &src.cache),
-            "anonymous peers ride the shared cache"
-        );
-
-        // A credentialed peer with no live per-credential cache resolves
-        // to None — a watermark must not mint a cache (side-effect-free).
-        let alice = make_ctx("h", "alice", "ca");
-        assert!(
-            src.upstream_cache_peek_for(&alice).is_none(),
-            "no live per-credential cache yet → nothing to pause"
-        );
-
-        // Once alice's and bob's per-credential caches exist, alice's
-        // crossing resolves to alice's OWN cache — never the shared
-        // cache and never bob's.
-        let alice_cache = src.upstream_cache_for_test(&alice);
-        let bob = make_ctx("h", "bob", "ca");
-        let bob_cache = src.upstream_cache_for_test(&bob);
-
-        let alice_resolved = src
-            .upstream_cache_peek_for(&alice)
-            .expect("alice's cache now exists");
-        assert!(
-            Arc::ptr_eq(&alice_resolved, &alice_cache),
-            "alice's backpressure targets alice's own upstream cache"
-        );
-        assert!(
-            !Arc::ptr_eq(&alice_resolved, &bob_cache),
-            "alice's backpressure must NOT reach bob's separate upstream"
-        );
-        assert!(
-            !Arc::ptr_eq(&alice_resolved, &src.cache),
-            "a credentialed peer's upstream is not the shared cache"
+            None,
+            "a downstream monitor must never throttle the shared upstream"
         );
     }
 
@@ -2685,6 +2574,7 @@ ASG(DEFAULT) {
             authority: "Lab Root CA".to_string(),
             roles: Vec::new(),
             pv_request: None,
+            log: Default::default(),
         };
         let client = src.upstream_client_for(&ctx);
         let asserted = client
@@ -2973,72 +2863,20 @@ ASG(DEFAULT) {
         );
     }
 
-    // ---- bridge-local overrun marking on fanout lag --------------------
+    // ---- re-framing a lagged subscriber from the merged snapshot -------
 
     use epics_pva_rs::proto::{BitSet, ByteOrder};
-    use epics_pva_rs::pvdata::encode::{decode_pv_field_with_bitset, encode_pv_field_with_bitset};
+    use epics_pva_rs::pvdata::encode::decode_pv_field_with_bitset;
     use epics_pva_rs::pvdata::{ScalarType, ScalarValue};
 
-    /// Encode a full wire MONITOR DATA body `changed | value | overrun`.
-    fn full_body(
-        desc: &FieldDesc,
-        value: &PvField,
-        changed_bits: &[usize],
-        overrun_bits: &[usize],
-    ) -> bytes::Bytes {
-        let mut changed = BitSet::new();
-        for &b in changed_bits {
-            changed.set(b);
-        }
-        let mut overrun = BitSet::new();
-        for &b in overrun_bits {
-            overrun.set(b);
-        }
-        let mut body = Vec::new();
-        changed.write_into(ByteOrder::Little, &mut body);
-        encode_pv_field_with_bitset(value, desc, &changed, 0, ByteOrder::Little, &mut body);
-        overrun.write_into(ByteOrder::Little, &mut body);
-        bytes::Bytes::from(body)
-    }
-
-    /// Decode the trailing overrun bitset back out of a marked body so a
-    /// test can assert the exact bits a downstream client would observe.
-    fn decode_overrun(body: &bytes::Bytes, desc: &FieldDesc) -> BitSet {
-        let mut cur = std::io::Cursor::new(body.as_ref());
-        let changed = BitSet::decode(&mut cur, ByteOrder::Little).expect("changed");
-        decode_pv_field_with_bitset(desc, &changed, 0, &mut cur, ByteOrder::Little).expect("value");
-        BitSet::decode(&mut cur, ByteOrder::Little).expect("overrun")
-    }
-
-    /// A scalar body whose changed bit is set but whose overrun bitset is
-    /// empty (the common case) must come back with the changed leaf ORed
-    /// into the overrun bitset, while the `changed | value` prefix bytes are
-    /// preserved byte-for-byte.
+    /// R19-44: the frame a lagged subscriber gets is a RE-FRAME of the merged
+    /// snapshot — every leaf present, every leaf marked changed — not the next
+    /// delta. This is the boundary the defect lived on: a leaf that moved ONLY
+    /// in a dropped event (an alarm going MAJOR) must still reach the client,
+    /// and a delta cannot carry it (pva2pva accumulates the changed bits and
+    /// copies the merged values instead, `moncache.cpp:156-174`).
     #[test]
-    fn lag_marks_scalar_changed_leaf_as_overrun() {
-        let desc = FieldDesc::Scalar(ScalarType::Double);
-        let value = PvField::Scalar(ScalarValue::Double(42.0));
-        let body = full_body(&desc, &value, &[0], &[]);
-
-        let marked =
-            mark_raw_body_local_overrun(&body, &desc, ByteOrder::Little).expect("marked body");
-
-        let overrun = decode_overrun(&marked, &desc);
-        assert!(overrun.get(0), "changed leaf must be flagged overrun");
-        assert_eq!(overrun.count(), 1, "only the changed leaf is overrun");
-
-        // The decoded value is unchanged: the prefix bytes were preserved.
-        let mut cur = std::io::Cursor::new(marked.as_ref());
-        let changed = BitSet::decode(&mut cur, ByteOrder::Little).unwrap();
-        let v =
-            decode_pv_field_with_bitset(&desc, &changed, 0, &mut cur, ByteOrder::Little).unwrap();
-        assert_eq!(v, value, "value bytes preserved across overrun marking");
-    }
-
-    /// Upstream overrun bits already present in the body must be preserved —
-    /// the marking is a UNION with the changed leaves, never a replacement.
-    #[test]
-    fn lag_preserves_upstream_overrun_and_unions_changed() {
+    fn lag_reframes_every_leaf_of_the_merged_snapshot() {
         // Structure { a: Int, b: Int }: bit 0 = struct, bit 1 = a, bit 2 = b.
         let desc = FieldDesc::Structure {
             struct_id: String::new(),
@@ -3047,7 +2885,8 @@ ASG(DEFAULT) {
                 ("b".to_string(), FieldDesc::Scalar(ScalarType::Int)),
             ],
         };
-        let value = {
+        // The merged snapshot: `b` moved in an event this subscriber never saw.
+        let merged = {
             let mut s = epics_pva_rs::pvdata::PvStructure::new("");
             s.fields
                 .push(("a".to_string(), PvField::Scalar(ScalarValue::Int(7))));
@@ -3055,49 +2894,50 @@ ASG(DEFAULT) {
                 .push(("b".to_string(), PvField::Scalar(ScalarValue::Int(9))));
             PvField::Structure(s)
         };
-        // This event changes `a` (bit 1); the upstream already flagged `b`
-        // (bit 2) as overrun from its own squashing.
-        let body = full_body(&desc, &value, &[1], &[2]);
 
-        let marked =
-            mark_raw_body_local_overrun(&body, &desc, ByteOrder::Little).expect("marked body");
+        let body =
+            reframe_raw_body_after_lag(&merged, &desc, ByteOrder::Little).expect("re-framed body");
 
-        let overrun = decode_overrun(&marked, &desc);
-        assert!(overrun.get(1), "bridge-local changed leaf `a` flagged");
-        assert!(overrun.get(2), "upstream overrun bit `b` preserved");
-        assert_eq!(overrun.count(), 2, "exactly the union of both");
-    }
-
-    /// A body with nothing changed and no upstream overrun has no loss to
-    /// signal — the helper returns `None` so the caller forwards the bytes
-    /// untouched (keeps the dedup pointer fast path valid).
-    #[test]
-    fn lag_noop_when_nothing_changed_or_overrun() {
-        let desc = FieldDesc::Scalar(ScalarType::Double);
-        let value = PvField::Scalar(ScalarValue::Double(1.0));
-        let body = full_body(&desc, &value, &[], &[]);
+        let mut cur = std::io::Cursor::new(body.as_ref());
+        let changed = BitSet::decode(&mut cur, ByteOrder::Little).expect("changed");
         assert!(
-            mark_raw_body_local_overrun(&body, &desc, ByteOrder::Little).is_none(),
-            "empty changed + empty overrun is a no-op"
+            changed.get(1) && changed.get(2),
+            "every leaf is marked changed"
+        );
+        let decoded =
+            decode_pv_field_with_bitset(&desc, &changed, 0, &mut cur, ByteOrder::Little).unwrap();
+        assert_eq!(
+            decoded, merged,
+            "the dropped events' values ride the re-frame; a delta would carry only its own leaf"
+        );
+
+        // Loss is still signalled: after a drop any leaf may have taken an
+        // intermediate value the subscriber never observed.
+        let overrun = BitSet::decode(&mut cur, ByteOrder::Little).expect("overrun");
+        assert!(
+            overrun.get(1) && overrun.get(2),
+            "every re-framed leaf is flagged overrun: {overrun:?}"
         );
     }
 
-    /// A truncated / undecodable body must not panic and must fall back to
-    /// forwarding the original bytes (helper returns `None`).
+    /// A scalar channel has one leaf and no struct bit — the same rule, on the
+    /// degenerate shape.
     #[test]
-    fn lag_undecodable_body_returns_none() {
+    fn lag_reframes_a_scalar_channel() {
         let desc = FieldDesc::Scalar(ScalarType::Double);
-        // Only a changed bitset, no value/overrun — decode of the value
-        // region fails.
-        let mut body = Vec::new();
-        let mut changed = BitSet::new();
-        changed.set(0);
-        changed.write_into(ByteOrder::Little, &mut body);
-        let body = bytes::Bytes::from(body);
-        assert!(
-            mark_raw_body_local_overrun(&body, &desc, ByteOrder::Little).is_none(),
-            "undecodable body falls back to None"
-        );
+        let value = PvField::Scalar(ScalarValue::Double(42.0));
+
+        let body =
+            reframe_raw_body_after_lag(&value, &desc, ByteOrder::Little).expect("re-framed body");
+
+        let mut cur = std::io::Cursor::new(body.as_ref());
+        let changed = BitSet::decode(&mut cur, ByteOrder::Little).expect("changed");
+        assert!(changed.get(0), "the scalar leaf is marked changed");
+        let decoded =
+            decode_pv_field_with_bitset(&desc, &changed, 0, &mut cur, ByteOrder::Little).unwrap();
+        assert_eq!(decoded, value);
+        let overrun = BitSet::decode(&mut cur, ByteOrder::Little).expect("overrun");
+        assert!(overrun.get(0), "the lost intermediate values are flagged");
     }
 
     #[test]
@@ -3116,21 +2956,22 @@ ASG(DEFAULT) {
         assert!(value_overrun_paths(&PvField::Scalar(ScalarValue::Double(1.0))).is_empty());
     }
 
-    /// Cooked/typed fanout parity with the raw path: when a subscriber's
-    /// broadcast receiver lags (its single-slot mpsc backpressure stalls the
-    /// forwarder while the upstream keeps producing), the next delivered
-    /// `MonitorUpdate` must carry the lost leaves in its `overrun` set — so a
-    /// slow downstream behind `EPICS_PVA_GW_RAW_FRAMES=NO` is not served a
-    /// deceptively clean stream (pva2pva moncache.cpp:160-168).
+    /// Cooked/typed fanout loss accounting: when a subscriber's broadcast
+    /// receiver lags (its single-slot mpsc backpressure stalls the forwarder
+    /// while the upstream keeps producing), the next delivered `MonitorUpdate`
+    /// must carry the lost leaves in its `overrun` set (pva2pva
+    /// moncache.cpp:160-168). Server-side accounting: the cooked DATA frame's
+    /// trailing overrun bitset stays hard-empty, as pvxs's is
+    /// (servermon.cpp:174-176) — only the raw forwarder puts overrun bits on
+    /// the wire.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cooked_fanout_marks_overrun_on_subscriber_lag() {
+    async fn cooked_fanout_reframes_the_snapshot_on_subscriber_lag() {
         let mut src = make_source();
         // Single-slot subscriber queue: the forwarder buffers one update then
         // blocks on the second send, so it cannot drain the broadcast and a
         // burst overflows the entry's broadcast buffer deterministically.
         src.subscriber_queue = 1;
         src.cache.insert_test_entry("OV:PV").await;
-        let tx = src.cache.test_broadcast_sender("OV:PV").await;
 
         let (_seed, mut rx) = src
             .subscribe_inner(src.cache.clone(), "OV:PV", None)
@@ -3138,38 +2979,68 @@ ASG(DEFAULT) {
             .expect("subscribe to parked test entry");
 
         // Burst far past the broadcast buffer capacity BEFORE draining, so the
-        // stalled forwarder lags and drops intermediate updates.
+        // stalled forwarder lags and drops intermediate updates. Each value is
+        // FOLDED into the entry, so `latest` is the merged snapshot a live
+        // upstream would leave behind — 63.0, the value of the last event, most
+        // of which this subscriber never saw.
         let mk = |v: f64| {
             let mut s = epics_pva_rs::pvdata::PvStructure::new("epics:nt/NTScalar:1.0");
             s.fields
                 .push(("value".to_string(), PvField::Scalar(ScalarValue::Double(v))));
-            epics_pva_rs::server_native::MonitorUpdate::from(PvField::Structure(s))
+            PvField::Structure(s)
         };
         for i in 0..64 {
-            let _ = tx.send(mk(i as f64));
+            src.cache.test_publish("OV:PV", mk(i as f64)).await;
         }
 
-        // At least one delivered update must carry a non-empty overrun set
-        // naming the lost leaf, proving the lag is no longer silent.
-        let mut saw_overrun = false;
+        // R19-44: the post-lag update is a RE-FRAME of the merged snapshot —
+        // whole structure (`marked: None`), carrying the value of an event the
+        // subscriber never received — and it names the lost leaves in `overrun`.
+        // Forwarding the next delta instead would have shipped only that
+        // event's own leaves, losing every transition inside the dropped range.
+        let val = |u: &epics_pva_rs::server_native::MonitorUpdate| match &u.value {
+            PvField::Structure(s) => match &s.fields[0].1 {
+                PvField::Scalar(ScalarValue::Double(v)) => *v,
+                other => panic!("unexpected value shape: {other:?}"),
+            },
+            other => panic!("unexpected value shape: {other:?}"),
+        };
+        let mut last_before = None;
+        let mut reframed = None;
         for _ in 0..8 {
             match tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
                 Ok(Some(u)) if !u.overrun.is_empty() => {
-                    assert!(
-                        u.overrun.iter().any(|p| p == "value"),
-                        "overrun must name the value leaf, got {:?}",
-                        u.overrun
-                    );
-                    saw_overrun = true;
+                    reframed = Some(u);
                     break;
                 }
-                Ok(Some(_)) => continue,
+                Ok(Some(u)) => {
+                    last_before = Some(val(&u));
+                    continue;
+                }
                 Ok(None) | Err(_) => break,
             }
         }
+        let u = reframed.expect("a post-lag cooked update must be delivered");
         assert!(
-            saw_overrun,
-            "a post-lag cooked update must carry overrun leaves"
+            u.overrun.iter().any(|p| p == "value"),
+            "overrun must name the lost leaf, got {:?}",
+            u.overrun
+        );
+        assert!(
+            u.marked.is_none(),
+            "a re-frame declares the WHOLE structure, not the last delta's leaves"
+        );
+        // The forwarder may lag before OR after delivering the first event, so
+        // the baseline is "the newest value this subscriber could have seen" —
+        // 0.0 when the lag beat every delivery. A lag means the 4-slot broadcast
+        // overflowed, so the merged snapshot is several events ahead of it
+        // either way.
+        let before = last_before.unwrap_or(0.0);
+        assert!(
+            val(&u) > before + 1.0,
+            "the re-frame must carry the snapshot AS OF THE LAG — a value from an event this \
+             subscriber never received (last seen {before}, re-framed {})",
+            val(&u)
         );
     }
 }

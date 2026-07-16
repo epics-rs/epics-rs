@@ -333,25 +333,36 @@ fn test_log_swept_fields_idle_active_channels_only() {
     assert_eq!(rec.log_swept_fields().len(), MAX_SCALER_CHANNELS);
 }
 
-// C `scalerRecord.c` posts CNT/T/VAL/PR1/TP/FREQ and each active channel
-// S1..Snch with a literal `DBE_VALUE` on a value change
-// (scalerRecord.c:316/322/329/334/372/425/427/430/478/530/582/588); the
-// only `DBE_LOG` post is the idle `monitor()` sweep (line 771). The record
-// advertises that value-only set as the six scalar fields (always) plus
-// the active channels — state-independent, unlike the idle-only log sweep.
+// Every C `scalerRecord.c` post outside the idle `monitor()` sweep is a literal
+// `DBE_VALUE`: the process/updateCounts posts of CNT/T/VAL/PR1/TP/FREQ and the
+// active channels' Sn (:316/322/329/334/372/425/427/430/478/530/582/588), AND
+// the `special()` posts of PRn/Gn/Dn (:673-676, :682-687, :703-705, :716). The
+// only `DBE_LOG` post is the idle sweep of S1..Snch (line 771). The record
+// advertises all of them as value-only so the framework strips the LOG bit —
+// which for PRn/Gn/Dn means a DBE_LOG subscriber never sees them at all, as in C.
 #[test]
 fn test_value_only_change_fields_scalars_plus_active_channels() {
     let mut rec = ScalerRecord::default();
     rec.nch = 3;
 
-    // Counting, waiting, or idle: the value-only set is identical (the six
-    // scalar posts are always DBE_VALUE in C, not gated on the state).
+    // Counting, waiting, or idle: the value-only set is identical (C's posts are
+    // DBE_VALUE regardless of the record's state).
     for ss in [0i16, 1, 2] {
         rec.ss = ss;
-        assert_eq!(
-            rec.value_only_change_fields(),
-            &["CNT", "T", "VAL", "PR1", "TP", "FREQ", "S1", "S2", "S3"]
-        );
+        let set = rec.value_only_change_fields();
+        for f in [
+            "CNT", "T", "VAL", "PR1", "TP", "FREQ", // the six scalars
+            "S1", "S2", "S3", // active channels
+            "PR2", "PR3", // remaining presets (PR1 is a scalar above)
+            "G1", "G2", "G3", "D1", "D2", "D3", // gates + directions
+        ] {
+            assert!(set.contains(&f), "{f} must be value-only (ss={ss})");
+        }
+        // Inactive channels contribute nothing.
+        for f in ["S4", "PR4", "G4", "D4"] {
+            assert!(!set.contains(&f), "{f} is beyond nch=3");
+        }
+        assert_eq!(set.len(), 17, "6 scalars + 3 Sn + 2 PRn + 3 Gn + 3 Dn");
     }
 
     // Zero active channels → just the six fixed scalar fields.
@@ -365,7 +376,8 @@ fn test_value_only_change_fields_scalars_plus_active_channels() {
     rec.nch = (MAX_SCALER_CHANNELS as i16) + 5;
     assert_eq!(
         rec.value_only_change_fields().len(),
-        6 + MAX_SCALER_CHANNELS
+        6 + 4 * MAX_SCALER_CHANNELS - 1,
+        "6 scalars + (Sn + Gn + Dn) per channel + PRn for every channel but PR1"
     );
 }
 
@@ -1231,8 +1243,9 @@ fn test_autocount_start_no_periodic_update_when_rat1_too_low() {
 }
 
 /// BUG 4 regression — C scalerRecord.c:623-624 fires the COUTP link on every
-/// CNT write inside `special()`. The CNT-triggered `process()` must emit a
-/// `WriteDbLink` to COUTP.
+/// CNT write, from inside `special()` itself. `special()` hands the put to the
+/// framework through `take_special_actions()` (R10-64), which executes it inside
+/// the put; `process()` must NOT carry it.
 #[test]
 fn test_special_cnt_fires_coutp() {
     use epics_base_rs::server::record::ProcessAction;
@@ -1242,35 +1255,38 @@ fn test_special_cnt_fires_coutp() {
     rec.tp = 1.0;
     rec.init_record(1).unwrap();
 
-    // CNT write — special() must request the COUTP fire.
+    // CNT write — special() must queue the COUTP put.
     rec.cnt = 1;
     rec.special("CNT", true).unwrap();
-
-    // The CNT-triggered process() must emit a WriteDbLink to COUTP.
-    let outcome = rec.process().unwrap();
+    let special = rec.take_special_actions();
     assert!(
-        outcome.actions.iter().any(|a| matches!(
+        special.iter().any(|a| matches!(
             a,
             ProcessAction::WriteDbLink {
                 link_field: "COUTP",
                 ..
             }
         )),
-        "special(CNT) must cause process() to fire the COUTP link (C:623-624)"
+        "special(CNT) must make the COUTP put itself (C:623-624)"
     );
 
-    // The pending flag is consumed — a subsequent process() with no new CNT
-    // write must not re-fire COUTP.
-    let outcome2 = rec.process().unwrap();
+    // The queue is consumed by the drain — the CNT-triggered process() does not
+    // repeat it, and neither does any later cycle.
+    let outcome = rec.process().unwrap();
     assert!(
-        !outcome2.actions.iter().any(|a| matches!(
+        !outcome.actions.iter().any(|a| matches!(
             a,
             ProcessAction::WriteDbLink {
                 link_field: "COUTP",
                 ..
             }
         )),
-        "COUTP fire must not repeat without a new CNT write"
+        "C's process() makes no COUTP put on a start (:463 is guarded by \
+         justFinishedUserCount)"
+    );
+    assert!(
+        rec.take_special_actions().is_empty(),
+        "COUTP must not re-fire without a new CNT write"
     );
 }
 
@@ -1289,9 +1305,8 @@ fn test_special_cnt_stop_fires_coutp() {
     // still fires COUTP.
     rec.cnt = 0;
     rec.special("CNT", true).unwrap();
-    let outcome = rec.process().unwrap();
     assert!(
-        outcome.actions.iter().any(|a| matches!(
+        rec.take_special_actions().iter().any(|a| matches!(
             a,
             ProcessAction::WriteDbLink {
                 link_field: "COUTP",
@@ -1299,5 +1314,251 @@ fn test_special_cnt_stop_fires_coutp() {
             }
         )),
         "special(CNT=0) must also fire the COUTP link"
+    );
+}
+
+// ============================================================
+// Forward link (FLNK) — C scalerRecord.c:470-481
+// ============================================================
+
+/// C `scalerRecord.c:476-481` fires `recGblFwdLink` *inside* process,
+/// while `ss==IDLE && pcnt==0 && us==IDLE`, and only *then* runs the
+/// auto-count block (`:484-541`), which re-arms and drives `ss` to
+/// COUNTING. The FLNK therefore fires on every completed auto-count
+/// cycle even though the record leaves process() counting again.
+#[test]
+fn test_fwd_link_fires_on_completed_autocount_cycle() {
+    let mut rec = ScalerRecord::default();
+    rec.freq = 1e7;
+    rec.cont = 1; // AutoCount
+    rec.dly1 = 0.0; // re-arm immediately
+    rec.tp1 = 1.0;
+    rec.ss = 2; // COUNTING (auto-count in progress)
+    rec.us = 0; // IDLE — not a user count
+    rec.cnt = 0;
+    rec.pcnt = 0;
+
+    // Device support reports the auto-count cycle finished.
+    rec.set_done();
+    rec.process().unwrap();
+
+    assert_eq!(rec.ss, 2, "auto-count immediately re-armed (COUNTING)");
+    assert!(
+        rec.should_fire_forward_link(),
+        "FLNK must fire for the completed auto-count cycle even though \
+         the auto-count block already re-armed ss to COUNTING"
+    );
+}
+
+/// Same cycle, but DLY1 > 0: the auto-count block parks in
+/// SCALER_STATE_WAITING instead of COUNTING. C's `recGblFwdLink` ran
+/// before that state change, so the link still fires.
+#[test]
+fn test_fwd_link_fires_on_completed_autocount_cycle_with_delay() {
+    let mut rec = ScalerRecord::default();
+    rec.freq = 1e7;
+    rec.cont = 1;
+    rec.dly1 = 5.0; // hold before re-arming
+    rec.tp1 = 1.0;
+    rec.ss = 2; // COUNTING
+    rec.us = 0;
+    rec.cnt = 0;
+    rec.pcnt = 0;
+
+    rec.set_done();
+    rec.process().unwrap();
+
+    assert_eq!(rec.ss, 1, "auto-count parked in WAITING");
+    assert!(
+        rec.should_fire_forward_link(),
+        "FLNK must fire even though the auto-count block moved ss to WAITING"
+    );
+}
+
+/// C `scalerRecord.c:470` — the `ss==IDLE` guard: a process cycle taken
+/// while the hardware is still counting fires nothing.
+#[test]
+fn test_fwd_link_does_not_fire_while_counting() {
+    let mut rec = ScalerRecord::default();
+    rec.freq = 1e7;
+    rec.cont = 1;
+    rec.ss = 2; // COUNTING, device support has NOT reported done
+    rec.us = 0;
+    rec.cnt = 0;
+    rec.pcnt = 0;
+
+    rec.process().unwrap();
+
+    assert_eq!(rec.ss, 2);
+    assert!(
+        !rec.should_fire_forward_link(),
+        "no FLNK while the auto-count is still running"
+    );
+}
+
+/// OneShot behaviour is unchanged: the user count completes, the record
+/// ends IDLE/IDLE with PCNT=0, and C fires the forward link.
+#[test]
+fn test_fwd_link_fires_on_oneshot_completion() {
+    let mut rec = ScalerRecord::default();
+    rec.freq = 1e7;
+    rec.cont = 0; // OneShot
+    rec.ss = 2; // COUNTING
+    rec.us = 3; // USER_COUNTING
+    rec.cnt = 1;
+    rec.pcnt = 1;
+    rec.s[0] = 10_000_000;
+
+    rec.set_done();
+    rec.process().unwrap();
+
+    assert_eq!(rec.ss, 0);
+    assert_eq!(rec.us, 0);
+    assert_eq!(rec.pcnt, 0);
+    assert!(
+        rec.should_fire_forward_link(),
+        "OneShot completion still fires FLNK"
+    );
+}
+
+/// C `scalerRecord.c:470` — `us != IDLE` (a start request waiting out
+/// DLY) reaches no `recGblFwdLink`.
+#[test]
+fn test_fwd_link_does_not_fire_while_waiting_out_dly() {
+    let mut rec = ScalerRecord::default();
+    rec.freq = 1e7;
+    rec.dly = 100.0;
+    rec.cnt = 1;
+    rec.special("CNT", true).unwrap();
+    assert_eq!(rec.us, 1); // USER_STATE_WAITING
+
+    rec.process().unwrap();
+
+    assert!(
+        !rec.should_fire_forward_link(),
+        "no FLNK on a cycle spent waiting out DLY"
+    );
+}
+
+// ============================================================
+// R7-66: REQSTART gate -> direction copy is bounded by NCH
+// ============================================================
+
+/// C `scalerRecord.c:413-414` (REQSTART):
+///   for (i=0; i<pscal->nch; i++) { pdir[i] = pgate[i]; ... }
+/// The copy stops at NCH. `D` fields for channels the hardware does not
+/// have are user-writable scratch (`special()` sets D on a PR put) and C
+/// never touches them at count start.
+#[test]
+fn test_count_start_copies_gates_to_directions_only_up_to_nch() {
+    let mut rec = ScalerRecord::default();
+    rec.freq = 1e7;
+    rec.tp = 1.0;
+    rec.init_record(1).unwrap();
+
+    // A 4-channel card.
+    rec.nch = 4;
+    rec.g[0] = 1;
+    rec.g[1] = 0;
+    rec.g[2] = 1;
+    rec.g[3] = 0;
+    rec.pr[0] = 10_000_000;
+    rec.pr[2] = 500;
+
+    // Channels the card does not have: gate clear, direction set by the user.
+    rec.d[4] = 1;
+    rec.d[10] = 1;
+    rec.d[MAX_SCALER_CHANNELS - 1] = 1;
+
+    rec.cnt = 1;
+    rec.special("CNT", true).unwrap();
+    rec.process().unwrap();
+    assert_eq!(rec.ss, 2, "counting");
+
+    // Active channels took their gate value.
+    assert_eq!(&rec.d[0..4], &[1, 0, 1, 0], "D1..D4 copied from G1..G4");
+    // Beyond NCH, C leaves D alone.
+    assert_eq!(rec.d[4], 1, "D5 is beyond NCH and must not be cleared");
+    assert_eq!(rec.d[10], 1, "D11 is beyond NCH and must not be cleared");
+    assert_eq!(
+        rec.d[MAX_SCALER_CHANNELS - 1],
+        1,
+        "D64 is beyond NCH and must not be cleared"
+    );
+}
+
+// ============================================================
+// R7-65: auto-count sub-millisecond branch copies gates -> directions
+// ============================================================
+
+/// C `scalerRecord.c:524-528` — when `TP1 < 1 ms`, auto-count falls back on
+/// the user's per-channel presets, and the gate array is copied into the
+/// direction array first:
+///   for (i=0; i<pscal->nch; i++) {
+///       pdir[i] = pgate[i];
+///       if (pgate[i]) (*pdset->write_preset)(pscal, i, ppreset[i]);
+///   }
+/// The copy is unconditional; only the preset write is gated on G.
+#[test]
+fn test_autocount_sub_ms_copies_gates_to_directions() {
+    let mut rec = ScalerRecord::default();
+    rec.freq = 1e7;
+    rec.nch = 4;
+    rec.tp1 = 0.0; // below 1 ms → user-preset branch
+    rec.cont = 1; // auto-count mode
+
+    rec.g[0] = 1;
+    rec.g[1] = 0;
+    rec.g[2] = 1;
+    rec.g[3] = 0;
+    rec.pr[0] = 1000;
+    rec.pr[2] = 500;
+    // Stale directions from an earlier configuration.
+    rec.d[0] = 0;
+    rec.d[1] = 1;
+    rec.d[2] = 0;
+    rec.d[3] = 1;
+    // Beyond NCH: C's loop stops at nch, so these survive.
+    rec.d[10] = 1;
+
+    rec.process().unwrap();
+    assert_eq!(rec.ss, 2, "auto-count armed");
+
+    assert_eq!(
+        &rec.d[0..4],
+        &[1, 0, 1, 0],
+        "D1..D4 copied from G1..G4 on the sub-ms auto-count re-arm"
+    );
+    assert_eq!(rec.d[10], 1, "beyond NCH, D is untouched");
+}
+
+/// The other side of C's `tp1 >= 1.e-3` boundary (`scalerRecord.c:512-523`):
+/// that branch programs only channel 0 from `TP1*FREQ` "regardless of any
+/// presets the user may have set" and never assigns `pdir`. The directions
+/// must be left exactly as the user left them.
+#[test]
+fn test_autocount_timed_branch_does_not_touch_directions() {
+    let mut rec = ScalerRecord::default();
+    rec.freq = 1e7;
+    rec.nch = 4;
+    rec.tp1 = 1.0; // >= 1 ms → timed branch
+    rec.cont = 1;
+
+    rec.g[0] = 1;
+    rec.g[1] = 0;
+    rec.g[2] = 1;
+    rec.g[3] = 0;
+    rec.d[0] = 0;
+    rec.d[1] = 1;
+    rec.d[2] = 0;
+    rec.d[3] = 1;
+
+    rec.process().unwrap();
+    assert_eq!(rec.ss, 2, "auto-count armed");
+
+    assert_eq!(
+        &rec.d[0..4],
+        &[0, 1, 0, 1],
+        "the timed auto-count branch leaves D alone"
     );
 }

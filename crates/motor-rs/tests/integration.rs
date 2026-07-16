@@ -735,3 +735,152 @@ async fn pid_gain_put_forward_reaches_driver() {
         "clamped before emission (C 3005-3017)"
     );
 }
+
+/// R6-50: a failed poll must still post a status carrying COMM_ERR.
+///
+/// C drivers signal a poll failure by setting `motorStatusProblem_` and
+/// `motorStatusCommsError_` and calling `callParamCallbacks()` anyway before
+/// returning the error (`smarActMCSMotorDriver.cpp:503-507`,
+/// `XPSAxis.cpp:756`); `asynMotorController` discards the returned status on
+/// both poll paths (`asynMotorController.cpp:219-221` forced, `:658`
+/// background). The failure reaches the record only as MSTA bit 12, which
+/// `alarm_sub` turns into a COMM/INVALID alarm (`motorRecord.cc:3392-3398`).
+///
+/// The Rust poll loop used to `return` on `Err`, skipping the sequence bump,
+/// the status write and the io_intr pulse — so no COMM_ERR, no alarm, no
+/// record process, and a `STUP=BUSY` refresh latched at BUSY forever.
+#[tokio::test]
+async fn failed_poll_posts_comms_error_status() {
+    use asyn_rs::error::{AsynError, AsynStatus};
+    use asyn_rs::interfaces::motor::MotorStatus;
+    use asyn_rs::user::AsynUser;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// A motor whose transport can be cut at will.
+    struct FlakyMotor {
+        offline: Arc<AtomicBool>,
+        position: f64,
+    }
+    impl AsynMotor for FlakyMotor {
+        fn poll(&mut self, _user: &AsynUser) -> Result<MotorStatus, AsynError> {
+            if self.offline.load(Ordering::SeqCst) {
+                return Err(AsynError::Status {
+                    status: AsynStatus::Timeout,
+                    message: "controller not responding".into(),
+                });
+            }
+            Ok(MotorStatus {
+                position: self.position,
+                done: true,
+                ..MotorStatus::default()
+            })
+        }
+        fn move_absolute(
+            &mut self,
+            _user: &AsynUser,
+            _position: f64,
+            _min_vel: f64,
+            _max_vel: f64,
+            _accel: f64,
+        ) -> Result<(), AsynError> {
+            Ok(())
+        }
+        fn stop(&mut self, _user: &AsynUser, _accel: f64) -> Result<(), AsynError> {
+            Ok(())
+        }
+        fn home(
+            &mut self,
+            _user: &AsynUser,
+            _min_vel: f64,
+            _max_vel: f64,
+            _accel: f64,
+            _forwards: bool,
+        ) -> Result<(), AsynError> {
+            Ok(())
+        }
+        fn set_position(&mut self, _user: &AsynUser, position: f64) -> Result<(), AsynError> {
+            self.position = position;
+            Ok(())
+        }
+    }
+
+    let offline = Arc::new(AtomicBool::new(false));
+    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(FlakyMotor {
+        offline: offline.clone(),
+        position: 3.5,
+    }));
+    let (poll_cmd_tx, poll_cmd_rx) = mpsc::channel(16);
+    let device_state = motor_rs::device_state::new_shared_state();
+    let (io_intr_tx, mut io_intr_rx) = mpsc::channel::<()>(16);
+
+    let poll_loop = motor_rs::poll_loop::MotorPollLoop::new(
+        poll_cmd_rx,
+        io_intr_tx,
+        motor,
+        device_state.clone(),
+        Duration::from_millis(5),
+        Duration::from_millis(5),
+        0,
+    );
+    let poll_handle = tokio::spawn(poll_loop.run());
+
+    // A healthy poll first, so the failure has a last-known status to carry
+    // forward (C's parameter library keeps every field the failed poll never
+    // wrote).
+    poll_cmd_tx.send(PollCommand::StartPolling).await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), io_intr_rx.recv())
+            .await
+            .is_ok(),
+        "the healthy poll must notify"
+    );
+    let (healthy_seq, healthy) = {
+        let ds = device_state.lock().unwrap();
+        let s = ds.latest_status.clone().expect("status populated");
+        (s.seq, s.status)
+    };
+    assert!(!healthy.comms_error);
+    assert_eq!(healthy.position, 3.5);
+
+    // Cut the link. The very next poll fails.
+    offline.store(true, Ordering::SeqCst);
+
+    let posted = wait_until(Duration::from_secs(2), || {
+        device_state
+            .lock()
+            .unwrap()
+            .latest_status
+            .as_ref()
+            .is_some_and(|s| s.status.comms_error)
+    })
+    .await;
+    assert!(
+        posted,
+        "a failed poll must still post a status — otherwise MSTA never raises COMM_ERR"
+    );
+
+    let stamped = {
+        let ds = device_state.lock().unwrap();
+        ds.latest_status.clone().unwrap()
+    };
+    assert!(
+        stamped.seq > healthy_seq,
+        "the sequence must advance so the record actually processes the failure"
+    );
+    assert!(
+        stamped.status.comms_error,
+        "COMM_ERR is what alarm_sub turns into COMM/INVALID (motorRecord.cc:3392-3398)"
+    );
+    assert!(
+        stamped.status.problem,
+        "C sets motorStatusProblem_ alongside motorStatusCommsError_"
+    );
+    assert_eq!(
+        stamped.status.position, 3.5,
+        "fields the failed poll never wrote keep their last-known value, as C's \
+         parameter library does"
+    );
+
+    let _ = poll_cmd_tx.send(PollCommand::Shutdown).await;
+    let _ = poll_handle.await;
+}

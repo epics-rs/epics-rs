@@ -214,6 +214,7 @@ name = "asyn-rs"
 version = "0.23.0"
 dependencies = [
  "bitflags",
+ "chrono",
  "criterion",
  "epics-base-rs",
  "epics-ca-rs",
@@ -818,6 +819,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
 
 [[package]]
+name = "dbd-codegen"
+version = "0.0.0"
+
+[[package]]
 name = "der"
 version = "0.7.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -982,6 +987,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "env-codegen"
+version = "0.0.0"
+
+[[package]]
 name = "epics-base-rs"
 version = "0.23.0"
 dependencies = [
@@ -1099,6 +1108,20 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "epics-oracle-rs"
+version = "0.23.0"
+dependencies = [
+ "asyn-rs",
+ "clap",
+ "epics-base-rs",
+ "epics-ca-rs",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
 ]
 
 [[package]]
@@ -2093,6 +2116,16 @@ checksum = "a06de3016e9fae57a36fd14dba131fccf49f74b40b7fbdb472f96e361ec71a08"
 dependencies = [
  "autocfg",
  "rawpointer",
+]
+
+[[package]]
+name = "mca-rs"
+version = "0.23.0"
+dependencies = [
+ "chrono",
+ "epics-base-rs",
+ "epics-ca-rs",
+ "tokio",
 ]
 
 [[package]]

@@ -125,15 +125,17 @@ fn read_holding_registers_over_tcp() {
     )
     .unwrap();
 
-    let words = engine
-        .do_modbus_io(
-            &mut transport,
-            ModbusFunctionCode::ReadHoldingRegisters,
-            0,
-            &[],
-            4,
-        )
-        .expect("read");
+    let words = words_of(
+        engine
+            .do_modbus_io(
+                &mut transport,
+                ModbusFunctionCode::ReadHoldingRegisters,
+                0,
+                &[],
+                4,
+            )
+            .expect("read"),
+    );
     assert_eq!(words, vec![10, 20, 30, 40]);
     assert_eq!(engine.stats.read_ok, 1);
     assert_eq!(engine.stats.io_errors, 0);
@@ -182,15 +184,17 @@ fn write_single_register_round_trip_over_tcp() {
         LinkType::Tcp,
     )
     .unwrap();
-    let words = reader
-        .do_modbus_io(
-            &mut transport,
-            ModbusFunctionCode::ReadHoldingRegisters,
-            0,
-            &[],
-            8,
-        )
-        .expect("read back");
+    let words = words_of(
+        reader
+            .do_modbus_io(
+                &mut transport,
+                ModbusFunctionCode::ReadHoldingRegisters,
+                0,
+                &[],
+                8,
+            )
+            .expect("read back"),
+    );
     assert_eq!(words[5], 0xABCD);
 }
 
@@ -220,4 +224,14 @@ fn modbus_exception_surfaces_over_tcp() {
     // IOErrors_ nor readOK_ moves.
     assert_eq!(engine.stats.io_errors, 0);
     assert_eq!(engine.stats.read_ok, 0);
+}
+
+/// Unwrap the data words of an I/O the test expects to be a normal response.
+fn words_of(response: modbus_rs::ModbusIoResponse) -> Vec<u16> {
+    match response {
+        modbus_rs::ModbusIoResponse::Data(words) => words,
+        modbus_rs::ModbusIoResponse::Acknowledged => {
+            panic!("expected data, got exception-05 Acknowledge")
+        }
+    }
 }

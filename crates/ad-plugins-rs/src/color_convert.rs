@@ -730,15 +730,24 @@ fn false_color_lut(false_color: i32) -> Option<&'static [[u8; 3]; 256]> {
     }
 }
 
-/// Convert a mono UInt8 image to RGB1 using a false-color LUT.
+/// Convert a mono 8-bit image to RGB1 using a false-color LUT.
 ///
-/// Only supports 2D UInt8 arrays. Each pixel value indexes the selected LUT
-/// (Rainbow for `false_color == 1`, Iron for `2`) to produce a pseudo-color
-/// RGB1 output, matching C's `colorMapRGB[3*pixel]` application for the
-/// Mono->RGB1 case (NDPluginColorConvert.cpp:106-112). Returns `None` for
-/// unsupported input or a `false_color` value with no table.
+/// C reads the `FalseColor` parameter **only** for 8-bit arrays
+/// (NDPluginColorConvert.cpp:59-60: `if (pArray->dataType == NDInt8 ||
+/// pArray->dataType == NDUInt8)`); for every wider type the local `falseColor`
+/// stays at its `0` initializer (`:45`) and the plain grayscale replication runs.
+/// So both `NDInt8` and `NDUInt8` are colormapped, and nothing else is.
+///
+/// The LUT index is the *low byte* of the sample — C writes
+/// `colorMapRGB + 3 * ((unsigned char)*pIn)` (`:108`), so a negative `epicsInt8`
+/// indexes 128..=255. The output keeps the input data type, and for `NDInt8`
+/// C `memcpy`s the LUT's raw bytes into `epicsInt8` cells, so a LUT entry above
+/// 127 lands as a negative sample.
+///
+/// Returns `None` for a non-8-bit or non-2-D input, or a `false_color` value
+/// with no table.
 fn false_color_mono_to_rgb1(src: &NDArray, false_color: i32) -> Option<NDArray> {
-    if src.dims.len() != 2 || src.data.data_type() != NDDataType::UInt8 {
+    if src.dims.len() != 2 {
         return None;
     }
     let lut = false_color_lut(false_color)?;
@@ -747,56 +756,42 @@ fn false_color_mono_to_rgb1(src: &NDArray, false_color: i32) -> Option<NDArray> 
     let h = src.dims[1].size;
     let n = w * h;
 
-    let src_slice = src.data.as_u8_slice();
-    let mut out = vec![0u8; n * 3];
-    for i in 0..n {
-        let val = src_slice[i] as usize;
-        let [r, g, b] = lut[val];
-        out[i * 3] = r;
-        out[i * 3 + 1] = g;
-        out[i * 3 + 2] = b;
-    }
+    // Map each sample through the LUT by its low byte, keeping the input type.
+    let (data, data_type) = match &src.data {
+        NDDataBuffer::U8(src_slice) => {
+            let mut out = vec![0u8; n * 3];
+            for i in 0..n {
+                let [r, g, b] = lut[src_slice[i] as usize];
+                out[i * 3] = r;
+                out[i * 3 + 1] = g;
+                out[i * 3 + 2] = b;
+            }
+            (NDDataBuffer::U8(out), NDDataType::UInt8)
+        }
+        NDDataBuffer::I8(src_slice) => {
+            let mut out = vec![0i8; n * 3];
+            for i in 0..n {
+                let [r, g, b] = lut[src_slice[i] as u8 as usize];
+                out[i * 3] = r as i8;
+                out[i * 3 + 1] = g as i8;
+                out[i * 3 + 2] = b as i8;
+            }
+            (NDDataBuffer::I8(out), NDDataType::Int8)
+        }
+        _ => return None,
+    };
 
     let dims = vec![
         NDDimension::new(3),
         NDDimension::new(w),
         NDDimension::new(h),
     ];
-    let mut arr = NDArray::new(dims, NDDataType::UInt8);
-    arr.data = NDDataBuffer::U8(out);
+    let mut arr = NDArray::new(dims, data_type);
+    arr.data = data;
     arr.unique_id = src.unique_id;
     arr.timestamp = src.timestamp;
     arr.attributes = src.attributes.clone();
     Some(arr)
-}
-
-/// Detect the color mode of an NDArray.
-///
-/// Checks the `ColorMode` NDAttribute first (required for YUV422/YUV411 which are
-/// 2D arrays indistinguishable from Mono, and YUV444/Bayer which share dimensions
-/// with RGB1/Mono). Falls back to dimension-based detection.
-fn detect_color_mode(array: &NDArray) -> NDColorMode {
-    if let Some(attr) = array.attributes.get("ColorMode") {
-        if let Some(v) = attr.value.as_i64() {
-            return NDColorMode::from_i32(v as i32);
-        }
-    }
-    match array.dims.len() {
-        0 | 1 => NDColorMode::Mono,
-        2 => NDColorMode::Mono,
-        3 => {
-            if array.dims[0].size == 3 {
-                NDColorMode::RGB1
-            } else if array.dims[1].size == 3 {
-                NDColorMode::RGB2
-            } else if array.dims[2].size == 3 {
-                NDColorMode::RGB3
-            } else {
-                NDColorMode::Mono
-            }
-        }
-        _ => NDColorMode::Mono,
-    }
 }
 
 /// Color convert plugin configuration.
@@ -852,12 +847,22 @@ impl NDPluginProcess for ColorConvertProcessor {
     }
 
     fn process_array(&mut self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
-        let src_mode = detect_color_mode(array);
+        // C `convertColor` (NDPluginColorConvert.cpp:44,54-55) starts from
+        // `int colorMode = NDColorModeMono` and overwrites it only from the
+        // `ColorMode` attribute; it never infers a layout from the dimensions.
+        // `NDArray::info()` owns that rule for the whole workspace.
+        let src_mode = array.info().color_mode;
         let target = self.config.target_mode;
 
-        // Same mode - passthrough
+        // C:584 — `if (!pArrayOut) pArrayOut = this->pNDArrayPool->copy(pArray, NULL, 1);`
+        // Every arm that does not convert (same mode, unsupported pair, or a shape the
+        // arm rejects, e.g. Mono with `ndims != 2` at :84) leaves `pArrayOut` NULL and
+        // the untouched input is forwarded — with its own ColorMode, since
+        // `changedColorMode` stayed 0 (:589). A frame is never dropped.
+        let passthrough = || ProcessResult::arrays(vec![Arc::new(array.clone())]);
+
         if src_mode == target {
-            return ProcessResult::arrays(vec![Arc::new(array.clone())]);
+            return passthrough();
         }
 
         // Step 1: Convert source to RGB1 intermediate
@@ -882,7 +887,7 @@ impl NDPluginProcess for ColorConvertProcessor {
 
         let rgb1 = match rgb1 {
             Some(r) => r,
-            None => return ProcessResult::empty(),
+            None => return passthrough(),
         };
 
         // Step 2: Convert RGB1 intermediate to target
@@ -920,7 +925,7 @@ impl NDPluginProcess for ColorConvertProcessor {
                 ));
                 ProcessResult::arrays(vec![Arc::new(out)])
             }
-            None => ProcessResult::empty(),
+            None => passthrough(),
         }
     }
 
@@ -1117,6 +1122,79 @@ mod tests {
     }
 
     #[test]
+    fn test_r6_66_false_color_int8_uses_low_byte_index() {
+        // R6-66 / NDPluginColorConvert.cpp:59-60 — C reads the FalseColor
+        // parameter for NDInt8 as well as NDUInt8, and indexes the map with
+        // `(unsigned char)*pIn` (:108), so a negative epicsInt8 selects entries
+        // 128..=255. The LUT bytes are memcpy'd into epicsInt8 cells, so an
+        // entry above 127 lands as a negative sample.
+        let config = ColorConvertConfig {
+            target_mode: NDColorMode::RGB1,
+            bayer_pattern: NDBayerPattern::RGGB,
+            false_color: 2,
+        };
+        let mut proc = ColorConvertProcessor::new(config);
+        let pool = NDArrayPool::new(1_000_000);
+
+        let mut arr = NDArray::new(
+            vec![NDDimension::new(2), NDDimension::new(1)],
+            NDDataType::Int8,
+        );
+        if let NDDataBuffer::I8(ref mut v) = arr.data {
+            v[0] = 0;
+            v[1] = -64; // (unsigned char)(-64) == 192
+        }
+
+        let result = proc.process_array(&arr, &pool);
+        let out = &result.output_arrays[0];
+        let NDDataBuffer::I8(ref v) = out.data else {
+            panic!("Int8 input must stay Int8 (C allocates with pArray->dataType)");
+        };
+        let e0 = IRON_COLOR_MAP[0];
+        let e192 = IRON_COLOR_MAP[192]; // (192, 160, 64)
+        assert_eq!(
+            [v[0], v[1], v[2]],
+            [e0[0] as i8, e0[1] as i8, e0[2] as i8],
+            "Int8 mono must be colormapped, not replicated to grayscale"
+        );
+        assert_eq!(
+            [v[3], v[4], v[5]],
+            [e192[0] as i8, e192[1] as i8, e192[2] as i8]
+        );
+        assert_eq!(v[3], -64, "LUT byte 192 reinterpreted as epicsInt8");
+    }
+
+    #[test]
+    fn test_r6_66_false_color_ignored_for_uint16() {
+        // C only reads FalseColor for 8-bit arrays (NDPluginColorConvert.cpp:59);
+        // for a UInt16 mono frame the local `falseColor` stays 0 (:45) and the
+        // grayscale replication runs. Rust must match — no colormap here.
+        let config = ColorConvertConfig {
+            target_mode: NDColorMode::RGB1,
+            bayer_pattern: NDBayerPattern::RGGB,
+            false_color: 1,
+        };
+        let mut proc = ColorConvertProcessor::new(config);
+        let pool = NDArrayPool::new(1_000_000);
+
+        let mut arr = NDArray::new(
+            vec![NDDimension::new(2), NDDimension::new(1)],
+            NDDataType::UInt16,
+        );
+        if let NDDataBuffer::U16(ref mut v) = arr.data {
+            v[0] = 1000;
+            v[1] = 2000;
+        }
+
+        let result = proc.process_array(&arr, &pool);
+        let out = &result.output_arrays[0];
+        let NDDataBuffer::U16(ref v) = out.data else {
+            panic!("expected UInt16 output");
+        };
+        assert_eq!(v[..6], [1000, 1000, 1000, 2000, 2000, 2000]);
+    }
+
+    #[test]
     fn test_rgb1_to_rgb2_conversion() {
         let config = ColorConvertConfig {
             target_mode: NDColorMode::RGB2,
@@ -1140,6 +1218,9 @@ mod tests {
                 v[i] = (i % 256) as u8;
             }
         }
+        // The layout is declared, not guessed from the size-3 dimension
+        // (NDPluginColorConvert.cpp:54-55).
+        set_color_mode_attr(&mut arr, NDColorMode::RGB1);
 
         let result = proc.process_array(&arr, &pool);
         assert_eq!(result.output_arrays.len(), 1);
@@ -1173,6 +1254,9 @@ mod tests {
                 v[i] = 128;
             }
         }
+        // The layout is declared, not guessed from the size-3 dimension
+        // (NDPluginColorConvert.cpp:54-55).
+        set_color_mode_attr(&mut arr, NDColorMode::RGB2);
 
         let result = proc.process_array(&arr, &pool);
         assert_eq!(result.output_arrays.len(), 1);
@@ -1181,47 +1265,38 @@ mod tests {
         assert_eq!(out.dims.len(), 2);
     }
 
+    /// A size-3 dimension is not a color mode. C reads the source mode from the
+    /// `ColorMode` attribute alone (NDPluginColorConvert.cpp:54-55); with none
+    /// present the mode is the initialiser, `NDColorModeMono` (:44), whatever the
+    /// dimensions look like.
     #[test]
-    fn test_detect_color_mode() {
-        // 2D -> Mono
-        let arr2d = NDArray::new(
+    fn r9_80_dims_never_imply_a_color_mode() {
+        for dims in [
+            vec![
+                NDDimension::new(3),
+                NDDimension::new(4),
+                NDDimension::new(4),
+            ],
+            vec![
+                NDDimension::new(4),
+                NDDimension::new(3),
+                NDDimension::new(4),
+            ],
+            vec![
+                NDDimension::new(4),
+                NDDimension::new(4),
+                NDDimension::new(3),
+            ],
             vec![NDDimension::new(4), NDDimension::new(4)],
-            NDDataType::UInt8,
-        );
-        assert_eq!(detect_color_mode(&arr2d), NDColorMode::Mono);
-
-        // 3D with color dim first -> RGB1
-        let arr_rgb1 = NDArray::new(
-            vec![
-                NDDimension::new(3),
-                NDDimension::new(4),
-                NDDimension::new(4),
-            ],
-            NDDataType::UInt8,
-        );
-        assert_eq!(detect_color_mode(&arr_rgb1), NDColorMode::RGB1);
-
-        // 3D with color dim second -> RGB2
-        let arr_rgb2 = NDArray::new(
-            vec![
-                NDDimension::new(4),
-                NDDimension::new(3),
-                NDDimension::new(4),
-            ],
-            NDDataType::UInt8,
-        );
-        assert_eq!(detect_color_mode(&arr_rgb2), NDColorMode::RGB2);
-
-        // 3D with color dim last -> RGB3
-        let arr_rgb3 = NDArray::new(
-            vec![
-                NDDimension::new(4),
-                NDDimension::new(4),
-                NDDimension::new(3),
-            ],
-            NDDataType::UInt8,
-        );
-        assert_eq!(detect_color_mode(&arr_rgb3), NDColorMode::RGB3);
+        ] {
+            let arr = NDArray::new(dims, NDDataType::UInt8);
+            assert_eq!(
+                arr.info().color_mode,
+                NDColorMode::Mono,
+                "no ColorMode attribute -> Mono, never an RGB layout guessed from a \
+                 size-3 dimension"
+            );
+        }
     }
 
     #[test]
@@ -1412,15 +1487,15 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_color_mode_with_attribute() {
+    fn test_color_mode_comes_from_the_attribute() {
         let mut arr = NDArray::new(
             vec![NDDimension::new(8), NDDimension::new(2)],
             NDDataType::UInt8,
         );
-        assert_eq!(detect_color_mode(&arr), NDColorMode::Mono);
+        assert_eq!(arr.info().color_mode, NDColorMode::Mono);
 
         set_color_mode_attr(&mut arr, NDColorMode::YUV422);
-        assert_eq!(detect_color_mode(&arr), NDColorMode::YUV422);
+        assert_eq!(arr.info().color_mode, NDColorMode::YUV422);
     }
 
     #[test]

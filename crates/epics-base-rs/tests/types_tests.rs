@@ -278,7 +278,8 @@ fn test_golden_header_read_notify() {
     use epics_ca_rs::protocol::*;
     let mut hdr = CaHeader::new(CA_PROTO_READ_NOTIFY);
     hdr.data_type = 20;
-    hdr.set_payload_size(24, 1);
+    hdr.set_payload_size(24, 1, epics_ca_rs::protocol::CA_MINOR_VERSION)
+        .expect("modern peer accepts the extended header");
     hdr.cid = ECA_NORMAL;
     hdr.available = 42;
 
@@ -480,9 +481,7 @@ fn test_encode_gr_char_saturates_out_of_range() {
 #[test]
 fn test_encode_gr_enum_with_strings() {
     let mut snap = Snapshot::new(EpicsValue::Enum(1), 0, 0, SystemTime::UNIX_EPOCH);
-    snap.enums = Some(EnumInfo {
-        strings: vec!["Off".into(), "On".into()],
-    });
+    snap.enums = Some(EnumInfo::new(vec!["Off".into(), "On".into()]));
     let data = encode_dbr(24, &snap).unwrap();
     assert_eq!(data.len(), 424);
     assert_eq!(&data[4..6], &2u16.to_be_bytes());
@@ -789,9 +788,11 @@ fn test_decode_ctrl_char_roundtrip() {
 #[test]
 fn test_decode_ctrl_enum_roundtrip() {
     let mut snap_orig = full_snapshot(EpicsValue::Enum(2));
-    snap_orig.enums = Some(EnumInfo {
-        strings: vec!["Off".into(), "On".into(), "Reset".into()],
-    });
+    snap_orig.enums = Some(EnumInfo::new(vec![
+        "Off".into(),
+        "On".into(),
+        "Reset".into(),
+    ]));
     let data = encode_dbr(31, &snap_orig).unwrap();
     let snap = decode_dbr(31, &data, 1).unwrap();
     assert_eq!(snap.value, EpicsValue::Enum(2));
@@ -983,5 +984,47 @@ fn p1_empty_array_all_dbr_types_round_trip() {
         assert_eq!(bytes.len(), 0, "encoded length for empty {t:?}");
         let back = EpicsValue::from_bytes_array(*t, &bytes, 0).unwrap();
         assert_eq!(back, *expected, "round-trip {t:?}");
+    }
+}
+
+/// R6-74 — the server's DBR_STRING reply of an over-long stored string must
+/// TRUNCATE and succeed, not error.
+///
+/// C `getStringString` (`dbConvert.c:132-154`) is the read-side conversion for
+/// a `DBF_STRING` field: it caps the copy at `MAX_STRING_SIZE - 1 = 39` bytes,
+/// force-NUL-terminates, and returns 0. A `DESC` field is `size(41)`, so a C
+/// IOC really can hold 40 chars and really does serve them as 39 + NUL — no
+/// `ECA_BADCOUNT`, which is raised only on the libca *put* side
+/// (`nciu::stringVerify`, already enforced by `validate_put_strings` on every
+/// client put entry point).
+///
+/// This test pins the boundary so the truncation is not "fixed" into an error:
+/// on the reply path, truncating IS the C behaviour.
+#[test]
+fn r6_74_server_string_reply_truncates_to_39_bytes_and_nul_like_c_getstringstring() {
+    // 39 bytes — the longest string that survives intact.
+    let exact = "a".repeat(39);
+    let bytes = EpicsValue::String(exact.clone().into()).to_bytes();
+    assert_eq!(bytes.len(), 40, "DBR_STRING is a fixed 40-byte field");
+    assert_eq!(&bytes[..39], exact.as_bytes());
+    assert_eq!(bytes[39], 0, "byte 39 must be the NUL terminator");
+
+    // 40 and 45 bytes — C copies 39 and NUL-terminates (strncpy + pdst[39] = 0).
+    for len in [40usize, 45] {
+        let long = "b".repeat(len);
+        let bytes = EpicsValue::String(long.clone().into()).to_bytes();
+        assert_eq!(bytes.len(), 40, "the field stays 40 bytes wide");
+        assert_eq!(
+            &bytes[..39],
+            &long.as_bytes()[..39],
+            "the first 39 bytes are copied verbatim"
+        );
+        assert_eq!(bytes[39], 0, "byte 39 must be the NUL terminator");
+        // …and it decodes back to the 39-byte prefix, exactly what a C client
+        // of a C IOC would see.
+        match EpicsValue::from_bytes(DbFieldType::String, &bytes).unwrap() {
+            EpicsValue::String(s) => assert_eq!(s.as_bytes(), &long.as_bytes()[..39]),
+            other => panic!("expected String, got {other:?}"),
+        }
     }
 }

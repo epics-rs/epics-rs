@@ -502,9 +502,6 @@ enum CoordRequest {
     Unsubscribe {
         subid: u32,
     },
-    MonitorConsumed {
-        subid: u32,
-    },
     DropChannel {
         cid: u32,
     },
@@ -523,8 +520,9 @@ enum CoordRequest {
     /// Beacon arrival notification for the per-circuit receive
     /// watchdog. `anomaly = false` for healthy beacons (libca
     /// `beaconArrivalNotify` — refresh watchdog deadline);
-    /// `anomaly = true` for `IdMismatch` / `PeriodCollapse` (libca
-    /// `beaconAnomalyNotify` — set sticky flag, no immediate echo).
+    /// `anomaly = true` for `IdMismatch` and for the two libca period
+    /// bands (`LongPeriod` / `ShortPeriod`, `bhe.cpp:226-262`) — libca
+    /// `beaconAnomalyNotify`: set sticky flag, no immediate echo.
     /// `FirstSighting` deliberately does NOT generate this message:
     /// either we don't yet have a virtual circuit to the server, in
     /// which case the watchdog is irrelevant, or we do (we just
@@ -639,8 +637,25 @@ impl CaClient {
                  ═══════════════════════════════════════════════════════════════════════"
             );
         }
+        // C `cac::cac` resolves EPICS_CA_CONN_TMO while constructing the
+        // context (`cac.cpp:188-194`), so a rejected value is diagnosed at
+        // startup even when no circuit ever forms. Resolve it here for the
+        // same reason — lazily resolving on the first circuit would swallow
+        // the diagnostic for a client that never connects to anything.
+        transport::prime_connection_timeout();
+
+        // C `udpiiu` resolves EPICS_CA_REPEATER_PORT once, in its constructor
+        // (`udpiiu.cpp:168`), and hands the stored `repeaterPort` to every
+        // registration it later sends. One resolution per client here too:
+        // the registration helper and the beacon monitor's 1 s retry loop both
+        // take this value, so a misconfigured port is diagnosed once — not on
+        // every attempt.
+        let repeater_port = crate::protocol::repeater_port();
+
         // Run repeater registration in background — don't block client startup.
-        epics_base_rs::runtime::task::spawn(async { repeater::ensure_repeater().await });
+        epics_base_rs::runtime::task::spawn(async move {
+            repeater::ensure_repeater(repeater_port).await
+        });
 
         // Build the address list with hostname
         // info preserved so the search-engine refresh task can
@@ -865,6 +880,7 @@ impl CaClient {
         let beacon_task = epics_base_rs::runtime::task::spawn(beacon_monitor::run_beacon_monitor(
             coord_tx.clone(),
             beacon_ctrl_rx,
+            repeater_port,
         ));
 
         Ok(Self {
@@ -1237,7 +1253,10 @@ impl CaClient {
         timeout_secs: f64,
     ) -> CaResult<()> {
         let ch = self.create_channel(pv_name);
-        let timeout = Duration::from_secs_f64(timeout_secs);
+        // Caller-supplied seconds: a non-finite or negative value is a
+        // panic for `Duration::from_secs_f64`, so go through the same
+        // saturating conversion the env-derived timeouts use.
+        let timeout = crate::estdlib::duration_from_secs(timeout_secs);
         ch.wait_connected(timeout).await?;
 
         let snap = ch.snapshot()?;
@@ -1418,6 +1437,22 @@ pub(crate) struct CachedRead {
 /// reject asynchronously (callback path) or accept past its array
 /// bound (nowait path). Validate client-side so the call fails
 /// synchronously the way libca does.
+/// Default deadline for a `CA_PROTO_WRITE_NOTIFY` that the caller did not
+/// time-box itself, overridable via `EPICS_CA_PUT_TIMEOUT` (seconds).
+///
+/// Port-specific knob (libca leaves the deadline to `ca_pend_io`), but it
+/// resolves through the same C primitives as every other env-derived
+/// double — `epicsScanDouble` plus the saturating `Duration` conversion —
+/// so no environment string can panic a `put`.
+fn put_timeout() -> Duration {
+    static RESOLVED: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *RESOLVED.get_or_init(|| {
+        crate::estdlib::env_double("EPICS_CA_PUT_TIMEOUT")
+            .map(crate::estdlib::duration_from_secs)
+            .unwrap_or(Duration::from_secs(30))
+    })
+}
+
 fn validate_put_count(snap: &types::ChannelSnapshotPublic, count: u32) -> CaResult<()> {
     if count > snap.element_count {
         return Err(CaError::Protocol(format!(
@@ -1660,7 +1695,13 @@ impl CaChannel {
             .map(|w| w.clone())
     }
 
-    fn build_read_notify_frame(sid: u32, data_type: u16, count: u32, ioid: u32) -> Vec<u8> {
+    fn build_read_notify_frame(
+        sid: u32,
+        data_type: u16,
+        count: u32,
+        ioid: u32,
+        peer_minor: u16,
+    ) -> CaResult<Vec<u8>> {
         let mut hdr = CaHeader::new(CA_PROTO_READ_NOTIFY);
         hdr.data_type = data_type;
         hdr.cid = sid;
@@ -1669,13 +1710,20 @@ impl CaChannel {
         // `nElem >= 0xffff`, not just `> 0xffff`. Routing 0xFFFF
         // through the normal branch would wedge `count = 0xFFFF` into
         // `m_count` — which a strict peer interprets as an extended
-        // marker with missing annex bytes.
+        // marker with missing annex bytes. `set_payload_size` refuses
+        // the extended form for a pre-V49 peer (`comQueSend.cpp:299`
+        // `throw cacChannel::outOfBounds()` → ECA_BADCOUNT,
+        // `oldChannelNotify.cpp:309`) without a byte reaching the wire.
+        // In practice the caller's element bound (ECA_TOLARGE,
+        // `tcpiiu.cpp:1470`) fires first on a pre-V49 circuit: MAX_TCP
+        // caps the count far below 0xffff.
         if count >= 0xFFFF {
-            hdr.set_payload_size(0, count);
+            hdr.set_payload_size(0, count, peer_minor)
+                .map_err(|_| CaError::BadCount)?;
         } else {
             hdr.count = count as u16;
         }
-        hdr.to_bytes_extended()
+        Ok(hdr.to_bytes_extended())
     }
 
     fn decode_plain_read_reply(reply: ReadReply) -> CaResult<(DbFieldType, EpicsValue)> {
@@ -1693,6 +1741,12 @@ impl CaChannel {
         }
     }
 
+    /// Thin alias for the crate's put-framing owner,
+    /// [`crate::protocol::build_put_frame`] (C
+    /// `comQueSend::insertRequestWithPayLoad`). The coordinator path in
+    /// `transport.rs` frames through the same function, so the wire
+    /// bytes cannot drift between the direct-writer and coordinator
+    /// routes.
     fn build_write_frame(
         cmd: u16,
         sid: u32,
@@ -1700,22 +1754,9 @@ impl CaChannel {
         count: u32,
         ioid: Option<u32>,
         payload: Vec<u8>,
-    ) -> Vec<u8> {
-        let padded_len = align8(payload.len());
-        let mut padded = payload;
-        padded.resize(padded_len, 0);
-
-        let mut hdr = CaHeader::new(cmd);
-        hdr.data_type = data_type;
-        hdr.cid = sid;
-        if let Some(ioid) = ioid {
-            hdr.available = ioid;
-        }
-        hdr.set_payload_size(padded.len(), count);
-
-        let mut frame = hdr.to_bytes_extended();
-        frame.extend_from_slice(&padded);
-        frame
+        peer_minor: u16,
+    ) -> CaResult<Vec<u8>> {
+        crate::protocol::build_put_frame(cmd, sid, data_type, count, ioid, payload, peer_minor)
     }
 
     fn send_read_notify_fast(
@@ -1737,10 +1778,26 @@ impl CaChannel {
                  nciu::read ECA_NORDACCESS); ioid {ioid}"
             )));
         }
+        // C `tcpiiu::readNotifyRequest` (`tcpiiu.cpp:1463-1478`) bounds the
+        // requested element count against what the circuit can carry
+        // (ECA_TOLARGE past it), then substitutes the channel's native count
+        // for a zero (autosize) request when the peer predates CA_V413 —
+        // those servers have no zero-count autosize contract and would read
+        // `m_count == 0` as "no elements".
+        let count = crate::protocol::read_notify_wire_count(
+            count,
+            snap.element_count,
+            data_type,
+            snap.server_minor,
+        )?;
         if let Some(writer) = self.direct_writer(snap.server_addr) {
             return writer.send_frame(Self::build_read_notify_frame(
-                snap.sid, data_type, count, ioid,
-            ));
+                snap.sid,
+                data_type,
+                count,
+                ioid,
+                snap.server_minor,
+            )?);
         }
 
         self.transport_tx
@@ -1775,6 +1832,12 @@ impl CaChannel {
                  nciu::write ECA_NOWTACCESS); ioid {ioid}"
             )));
         }
+        // C `comQueSend::insertRequestWithPayLoad` (`comQueSend.cpp:352-364`)
+        // bounds an array put against the peer's message-body limit and throws
+        // `cacChannel::outOfBounds` (→ ECA_BADCOUNT) past it, before a byte is
+        // queued. Gate here, ahead of the direct-writer / coordinator split, so
+        // neither path can put an unframeable request on the wire.
+        crate::protocol::check_write_element_count(count, data_type, snap.server_minor)?;
         if let Some(writer) = self.direct_writer(snap.server_addr) {
             return writer.send_frame(Self::build_write_frame(
                 CA_PROTO_WRITE_NOTIFY,
@@ -1783,7 +1846,8 @@ impl CaChannel {
                 count,
                 Some(ioid),
                 payload,
-            ));
+                snap.server_minor,
+            )?);
         }
 
         self.transport_tx
@@ -1818,6 +1882,10 @@ impl CaChannel {
                     .into(),
             ));
         }
+        // Same pre-queue element bound as `send_write_notify_fast`
+        // (`comQueSend.cpp:352-364`) — a fire-and-forget put is bounded by
+        // libca too; `ca_array_put` returns ECA_BADCOUNT synchronously.
+        crate::protocol::check_write_element_count(count, data_type, snap.server_minor)?;
         if let Some(writer) = self.direct_writer(snap.server_addr) {
             return writer.send_frame(Self::build_write_frame(
                 CA_PROTO_WRITE,
@@ -1826,7 +1894,8 @@ impl CaChannel {
                 count,
                 None,
                 payload,
-            ));
+                snap.server_minor,
+            )?);
         }
 
         self.transport_tx
@@ -1942,12 +2011,36 @@ impl CaChannel {
                 // Refill the reusable Sender slot. The dispatcher takes
                 // this on response without removing the DashMap entry.
                 *cached.slot.lock() = Some(reply_tx);
-                let frame = Self::build_read_notify_frame(
+                let count = match crate::protocol::read_notify_wire_count(
+                    cached.element_count,
+                    cached.element_count,
+                    cached.data_type,
+                    snap.server_minor,
+                ) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        ch.in_flight.reads.remove(&cached.ioid);
+                        results[index] = Some(Err(e));
+                        continue;
+                    }
+                };
+                let frame = match Self::build_read_notify_frame(
                     cached.sid,
                     cached.data_type,
-                    cached.element_count,
+                    count,
                     cached.ioid,
-                );
+                    snap.server_minor,
+                ) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        // Unframeable for this peer — drop the borrowed
+                        // warm entry so the next call starts cold, and
+                        // fail locally without touching the wire.
+                        ch.in_flight.reads.remove(&cached.ioid);
+                        results[index] = Some(Err(e));
+                        continue;
+                    }
+                };
                 let kind = PendingKind::Warm {
                     ioid: cached.ioid,
                     in_flight: ch.in_flight.clone(),
@@ -1965,12 +2058,33 @@ impl CaChannel {
                         reply_tx,
                     },
                 );
-                let frame = Self::build_read_notify_frame(
+                let count = match crate::protocol::read_notify_wire_count(
+                    snap.element_count,
+                    snap.element_count,
+                    snap.native_type as u16,
+                    snap.server_minor,
+                ) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        ch.in_flight.reads.remove(&ioid);
+                        results[index] = Some(Err(e));
+                        continue;
+                    }
+                };
+                let frame = match Self::build_read_notify_frame(
                     snap.sid,
                     snap.native_type as u16,
-                    snap.element_count,
+                    count,
                     ioid,
-                );
+                    snap.server_minor,
+                ) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        ch.in_flight.reads.remove(&ioid);
+                        results[index] = Some(Err(e));
+                        continue;
+                    }
+                };
                 let kind = PendingKind::Cold {
                     ioid,
                     in_flight: ch.in_flight.clone(),
@@ -2437,11 +2551,7 @@ impl CaChannel {
             return Err(e);
         }
 
-        // Default put timeout configurable via EPICS_CA_PUT_TIMEOUT (seconds).
-        let default_secs = epics_base_rs::runtime::env::get("EPICS_CA_PUT_TIMEOUT")
-            .and_then(|s| s.parse::<f64>().ok())
-            .unwrap_or(30.0);
-        let result = tokio::time::timeout(Duration::from_secs_f64(default_secs), reply_rx).await;
+        let result = tokio::time::timeout(put_timeout(), reply_rx).await;
         self.in_flight.writes.remove(&ioid);
         result
             .map_err(|_| CaError::Timeout)?
@@ -2556,10 +2666,10 @@ impl CaChannel {
     /// indices should still go through [`Self::put`] with
     /// [`EpicsValue::Enum`].
     ///
-    /// Note: a CA `DBR_STRING` is a fixed 40-byte field, so `value` is
-    /// truncated to 39 bytes + NUL on the wire (same fixed-buffer limit
-    /// as C `caput`). ENUM menu names are well within this; callers
-    /// writing longer strings should expect silent truncation.
+    /// Note: a CA `DBR_STRING` is a fixed 40-byte field, so a `value` of 40
+    /// bytes or more is REJECTED (`ECA_STRTOBIG`), not truncated — libca
+    /// `nciu::stringVerify` refuses it before the request is queued (R6-29).
+    /// ENUM menu names are well within the 39-byte cap.
     pub async fn put_string(&self, value: &str) -> CaResult<()> {
         let snap = self.snapshot()?;
         validate_put_count(&snap, 1)?;
@@ -2577,10 +2687,7 @@ impl CaChannel {
             return Err(e);
         }
 
-        let default_secs = epics_base_rs::runtime::env::get("EPICS_CA_PUT_TIMEOUT")
-            .and_then(|s| s.parse::<f64>().ok())
-            .unwrap_or(30.0);
-        let result = tokio::time::timeout(Duration::from_secs_f64(default_secs), reply_rx).await;
+        let result = tokio::time::timeout(put_timeout(), reply_rx).await;
         self.in_flight.writes.remove(&ioid);
         result
             .map_err(|_| CaError::Timeout)?
@@ -2604,9 +2711,9 @@ impl CaChannel {
     ///
     /// This is the ENUM-waveform-by-name path: C `caput -a` on a
     /// `DBR_ENUM` waveform writes each element as a `DBR_STRING` and the
-    /// **server** resolves each menu string. Each element is subject to
-    /// the same fixed 40-byte field truncation (39 bytes + NUL) as
-    /// [`Self::put_string`].
+    /// **server** resolves each menu string. Each element is subject to the
+    /// same 39-byte cap as [`Self::put_string`]: an over-long element is
+    /// rejected with `ECA_STRTOBIG`, not truncated.
     pub async fn put_string_array(&self, values: &[String]) -> CaResult<()> {
         let snap = self.snapshot()?;
         validate_put_count(&snap, values.len() as u32)?;
@@ -2628,10 +2735,7 @@ impl CaChannel {
             return Err(e);
         }
 
-        let default_secs = epics_base_rs::runtime::env::get("EPICS_CA_PUT_TIMEOUT")
-            .and_then(|s| s.parse::<f64>().ok())
-            .unwrap_or(30.0);
-        let result = tokio::time::timeout(Duration::from_secs_f64(default_secs), reply_rx).await;
+        let result = tokio::time::timeout(put_timeout(), reply_rx).await;
         self.in_flight.writes.remove(&ioid);
         result
             .map_err(|_| CaError::Timeout)?
@@ -2865,14 +2969,34 @@ impl CaChannel {
         EventWatcher { handle }
     }
 
-    /// Server's IP address as a string (e.g. `"10.0.0.5:5064"`).
-    /// Mirrors libca `ca_host_name(chid)` (oldChannelNotify.cpp:189).
+    /// The server's host NAME, as libca `ca_host_name(chid)`
+    /// (`oldChannelNotify.cpp:189` → `tcpiiu::getHostName` → `hostNameCache`)
+    /// reports it: reverse-resolved, with the port appended
+    /// (`"ioc1.lab:5064"`), and only the dotted IP when the address has no
+    /// PTR record. This used to hand back the raw `SocketAddr`, which is what
+    /// put a dotted IP on `cainfo`'s `Host:` line where C prints a name
+    /// (W10-B5) — the resolution belongs here, at the `ca_host_name` analog,
+    /// not in the tool.
+    ///
+    /// The lookup is [`crate::hostname::ip_addr_to_a`] on a blocking thread:
+    /// this is an `async fn` a caller awaits, so it can wait for the resolver
+    /// exactly as C's `cainfo` does, and no other channel's progress is behind
+    /// it.
+    ///
     /// Returns `Err` if the channel hasn't connected yet — pvxs
     /// returns `"<disconnected>"` for the same case; we surface
     /// the typed error instead so callers can decide.
     pub async fn host_name(&self) -> CaResult<String> {
         let info = self.info().await?;
-        Ok(info.server_addr.to_string())
+        let addr = info.server_addr;
+        Ok(
+            tokio::task::spawn_blocking(move || crate::hostname::ip_addr_to_a(addr))
+                .await
+                // A join failure is a runtime shutdown, not a channel error, and
+                // C's `ipAddrToA` has a well-defined answer for "no name": the
+                // dotted IP. Give that rather than failing a connected channel.
+                .unwrap_or_else(|_| addr.to_string()),
+        )
     }
 
     /// Server's CA minor protocol version, parsed from the
@@ -2940,18 +3064,10 @@ impl CaChannel {
     }
 }
 
-/// Library version + CA minor protocol version, mirroring libca
-/// `ca_version()` (cadef.h:1860). The string is `"<crate-version>
-/// (CA v4.<minor>)"` so callers logging client identity see both
-/// the implementation revision and the wire-protocol version it
-/// negotiates.
-pub fn ca_version() -> String {
-    format!(
-        "epics-ca-rs {} (CA v4.{})",
-        env!("CARGO_PKG_VERSION"),
-        crate::protocol::CA_MINOR_VERSION,
-    )
-}
+/// libca `ca_version()` (`cadef.h`) — re-exported from its one owner,
+/// [`crate::protocol::ca_version`]. C returns the wire protocol revision
+/// (`"4.13"`); a caller comparing against it gets that, not a library banner.
+pub use crate::protocol::ca_version;
 
 /// Handle for a monitor subscription. Dropping it cancels the subscription.
 pub struct MonitorHandle {
@@ -3005,12 +3121,7 @@ impl MonitorHandle {
             //    pre-pause backlog (3a) and pause-bypassing errors, so
             //    it is always readable regardless of pause state.
             match self.callback_rx.try_recv() {
-                Ok(msg) => {
-                    let _ = self
-                        .coord_tx
-                        .send(CoordRequest::MonitorConsumed { subid: self.subid });
-                    return Some(msg);
-                }
+                Ok(msg) => return Some(msg),
                 Err(TryRecvError::Disconnected) => return None,
                 Err(TryRecvError::Empty) => {}
             }
@@ -3020,9 +3131,6 @@ impl MonitorHandle {
             //    not paused or buffered before the pause, and `None`
             //    for a value held during pause. Atomic against `resume`.
             //
-            //    No `MonitorConsumed` ack here: the slot is out of flow
-            //    control (invariant I1), so draining it must not
-            //    decrement the per-circuit outstanding count.
             if let Some(msg) = self.coalesce_slot.take_deliverable() {
                 return Some(msg);
             }
@@ -3034,14 +3142,7 @@ impl MonitorHandle {
             let notified = self.coalesce_slot.notified();
             tokio::pin!(notified);
             tokio::select! {
-                msg = self.callback_rx.recv() => {
-                    if msg.is_some() {
-                        let _ = self
-                            .coord_tx
-                            .send(CoordRequest::MonitorConsumed { subid: self.subid });
-                    }
-                    return msg;
-                }
+                msg = self.callback_rx.recv() => return msg,
                 _ = &mut notified => {
                     // Loop and recheck — slot/channel/pause state may
                     // have changed. Each subscription owns its slot, so
@@ -3124,68 +3225,17 @@ impl Drop for EventWatcher {
 
 // --- Coordinator ---
 
-const FLOW_CONTROL_OFF_THRESHOLD: usize = 10;
+/// Floor for the per-subscription bounded monitor channel. A queue this
+/// small coalesces almost everything into the slot; keep a little headroom
+/// so short bursts arrive as discrete updates.
+const MIN_MONITOR_QUEUE_SIZE: usize = 10;
 
 /// Resolve the per-subscription bounded-queue size from the optional
-/// `EPICS_CA_MONITOR_QUEUE` value. Defaults to 256 and is clamped to at
-/// least [`FLOW_CONTROL_OFF_THRESHOLD`]: slot overflow is out of
-/// flow control (I1), so a queue smaller than the threshold could fill
-/// and coalesce forever without a lone subscription ever tripping
-/// `EVENTS_OFF`.
+/// `EPICS_CA_MONITOR_QUEUE` value. Defaults to 256, floored at
+/// [`MIN_MONITOR_QUEUE_SIZE`].
 fn resolve_monitor_queue_size(env: Option<usize>) -> usize {
-    env.unwrap_or(256).max(FLOW_CONTROL_OFF_THRESHOLD)
+    env.unwrap_or(256).max(MIN_MONITOR_QUEUE_SIZE)
 }
-const FLOW_CONTROL_ON_THRESHOLD: usize = 5;
-
-#[derive(Default)]
-struct FlowControlState {
-    outstanding: usize,
-    active: bool,
-}
-
-fn flow_control_note_queued(
-    flow_control: &mut HashMap<types::CircuitKey, FlowControlState>,
-    circuit: types::CircuitKey,
-    transport_tx: &mpsc::UnboundedSender<TransportCommand>,
-) {
-    let (server_addr, priority) = circuit;
-    let state = flow_control.entry(circuit).or_default();
-    state.outstanding = state.outstanding.saturating_add(1);
-    if !state.active && state.outstanding >= FLOW_CONTROL_OFF_THRESHOLD {
-        let _ = transport_tx.send(TransportCommand::EventsOff {
-            server_addr,
-            priority,
-        });
-        state.active = true;
-    }
-}
-
-fn flow_control_note_consumed(
-    flow_control: &mut HashMap<types::CircuitKey, FlowControlState>,
-    circuit: types::CircuitKey,
-    count: usize,
-    transport_tx: &mpsc::UnboundedSender<TransportCommand>,
-) {
-    if count == 0 {
-        return;
-    }
-    let (server_addr, priority) = circuit;
-    let Some(state) = flow_control.get_mut(&circuit) else {
-        return;
-    };
-    state.outstanding = state.outstanding.saturating_sub(count);
-    if state.active && state.outstanding <= FLOW_CONTROL_ON_THRESHOLD {
-        let _ = transport_tx.send(TransportCommand::EventsOn {
-            server_addr,
-            priority,
-        });
-        state.active = false;
-    }
-    if !state.active && state.outstanding == 0 {
-        flow_control.remove(&circuit);
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn run_coordinator(
     mut coord_rx: mpsc::UnboundedReceiver<CoordRequest>,
@@ -3215,7 +3265,6 @@ async fn run_coordinator(
     // per-circuit flow control. EVENTS_OFF/ON is a per-tcpiiu
     // CA message, so the outstanding-event count and the on/off gate
     // are tracked per `(server_addr, priority)`.
-    let mut flow_control: HashMap<types::CircuitKey, FlowControlState> = HashMap::new();
     // Per-circuit CA minor protocol version, populated from
     // CA_PROTO_VERSION on TCP handshake. Powers `host_minor_protocol`.
     let mut server_minor_version: HashMap<types::CircuitKey, u16> = HashMap::new();
@@ -3299,6 +3348,17 @@ async fn run_coordinator(
                             let count = ch
                                 .native_type
                                 .map(|_| subscription::resolve_subscription_count(req_count, ch.element_count));
+                            // C keeps the user's cap in `netSubscription::count`
+                            // and resolves the WIRE count per request via
+                            // `getCount(guard, CA_V413(minor))` (`netIO.h:241-251`)
+                            // — so the zero-count autosize contract is only used
+                            // with a peer that implements it.
+                            let peer_minor = ch
+                                .server_addr
+                                .and_then(|addr| {
+                                    server_minor_version.get(&(addr, ch.priority)).copied()
+                                })
+                                .unwrap_or(0);
 
                             // allocate the subid here, where the
                             // live subscription table lives, so the wrap
@@ -3334,15 +3394,36 @@ async fn run_coordinator(
                                 coalesce_slot,
                                 needs_restore: !connected,
                                 last_value: None,
-                                pending_deliveries: 0,
                                 nreplace: 0,
                             });
 
                             if connected {
+                                let data_type =
+                                    data_type.expect("connected channel has native type");
+                                // C `tcpiiu::subscriptionRequest`
+                                // (`tcpiiu.cpp:1572-1585`): resolve the wire
+                                // count, then bound it against what the circuit
+                                // can carry. Past the bound the subscription is
+                                // never installed and `ca_create_subscription`
+                                // returns ECA_TOLARGE.
+                                let wire_count = crate::protocol::subscription_wire_count(
+                                    count.expect("connected channel has element count"),
+                                    ch.element_count,
+                                    data_type,
+                                    peer_minor,
+                                );
+                                let wire_count = match wire_count {
+                                    Ok(c) => c,
+                                    Err(e) => {
+                                        subscriptions.remove(subid);
+                                        let _ = reply.send(Err(e));
+                                        continue;
+                                    }
+                                };
                                 let _ = transport_tx.send(TransportCommand::Subscribe {
                                     sid: ch.sid,
-                                    data_type: data_type.expect("connected channel has native type"),
-                                    count: count.expect("connected channel has element count"),
+                                    data_type,
+                                    count: wire_count,
                                     subid,
                                     mask,
                                     server_addr,
@@ -3360,36 +3441,34 @@ async fn run_coordinator(
                             if let Some(ch) = channels.get(&cid) {
                                 if ch.state == ChannelState::Connected {
                                     if let Some(data_type) = rec.data_type {
+                                        let server_addr = ch.server_addr.unwrap();
+                                        // C `tcpiiu::subscriptionCancelRequest`
+                                        // (`tcpiiu.cpp:1659`) re-resolves the wire
+                                        // count through the same
+                                        // `getCount(CA_V413(minor))` gate the
+                                        // EVENT_ADD used, so the cancel echoes the
+                                        // count the server was given.
+                                        let peer_minor = server_minor_version
+                                            .get(&(server_addr, ch.priority))
+                                            .copied()
+                                            .unwrap_or(0);
                                         let _ = transport_tx.send(TransportCommand::Unsubscribe {
                                             sid: ch.sid,
                                             subid,
                                             data_type,
-                                            count: rec.count.unwrap_or(0),
-                                            server_addr: ch.server_addr.unwrap(),
+                                            count: crate::protocol::subscription_cancel_wire_count(
+                                                rec.count.unwrap_or(0),
+                                                ch.element_count,
+                                                peer_minor,
+                                            ),
+                                            server_addr,
                                             priority: ch.priority,
                                         });
                                     }
                                 }
                             }
                         }
-                        if let Some(rec) = subscriptions.remove(subid) {
-                            flow_control_note_consumed(
-                                &mut flow_control,
-                                (rec.server_addr, rec.priority),
-                                rec.pending_deliveries,
-                                &transport_tx,
-                            );
-                        }
-                    }
-                    CoordRequest::MonitorConsumed { subid } => {
-                        if let Some(circuit) = subscriptions.mark_consumed(subid) {
-                            flow_control_note_consumed(
-                                &mut flow_control,
-                                circuit,
-                                1,
-                                &transport_tx,
-                            );
-                        }
+                        subscriptions.remove(subid);
                     }
                     CoordRequest::DropChannel { cid } => {
                         // Cancel all subscriptions for this channel
@@ -3399,26 +3478,29 @@ async fn run_coordinator(
                                 if let Some(ch) = channels.get(&cid) {
                                     if ch.state == ChannelState::Connected {
                                         if let Some(data_type) = rec.data_type {
+                                            let server_addr = ch.server_addr.unwrap();
+                                            let peer_minor = server_minor_version
+                                                .get(&(server_addr, ch.priority))
+                                                .copied()
+                                                .unwrap_or(0);
                                             let _ = transport_tx.send(TransportCommand::Unsubscribe {
                                                 sid: ch.sid,
                                                 subid,
                                                 data_type,
-                                                count: rec.count.unwrap_or(0),
-                                                server_addr: ch.server_addr.unwrap(),
+                                                count:
+                                                    crate::protocol::subscription_cancel_wire_count(
+                                                        rec.count.unwrap_or(0),
+                                                        ch.element_count,
+                                                        peer_minor,
+                                                    ),
+                                                server_addr,
                                                 priority: ch.priority,
                                             });
                                         }
                                     }
                                 }
                             }
-                            if let Some(rec) = subscriptions.remove(subid) {
-                                flow_control_note_consumed(
-                                    &mut flow_control,
-                                    (rec.server_addr, rec.priority),
-                                    rec.pending_deliveries,
-                                    &transport_tx,
-                                );
-                            }
+                            subscriptions.remove(subid);
                         }
 
                         // Clear channel on server + clean reverse index
@@ -3518,20 +3600,30 @@ async fn run_coordinator(
                         // it as a warning every time a fresh CaClient
                         // hears its first beacon was misleading and
                         // would over-promote a benign condition.
-                        // Reserve the warn-level "IOC may have
-                        // restarted" message for real restart signals.
-                        let is_real_restart = matches!(
-                            kind,
-                            beacon_monitor::BeaconAnomalyKind::IdMismatch
-                                | beacon_monitor::BeaconAnomalyKind::PeriodCollapse
-                        );
-                        if is_real_restart {
+                        // Reserve the warn-level message for the
+                        // classifications libca counts as anomalies
+                        // (`cac.cpp:498` `beaconAnomalyCount++`).
+                        let anomaly_msg = match kind {
+                            beacon_monitor::BeaconAnomalyKind::FirstSighting => None,
+                            beacon_monitor::BeaconAnomalyKind::IdMismatch => {
+                                Some("beacon sequence restarted — IOC may have restarted")
+                            }
+                            beacon_monitor::BeaconAnomalyKind::ShortPeriod => Some(
+                                "beacon period collapsed below 0.80x of the running average \
+                                 — IOC may have restarted",
+                            ),
+                            beacon_monitor::BeaconAnomalyKind::LongPeriod => Some(
+                                "beacon period exceeded 3.25x of the running average \
+                                 — server was unreachable and is back",
+                            ),
+                        };
+                        if let Some(msg) = anomaly_msg {
                             diag.beacon_anomalies.fetch_add(1, Ordering::Relaxed);
                             diag.record(DiagEvent::BeaconAnomaly { server: server_addr });
                             tracing::warn!(
                                 server = %server_addr,
                                 ?kind,
-                                "beacon anomaly detected — IOC may have restarted"
+                                "{msg}"
                             );
                             metrics::counter!(
                                 "ca_client_beacon_anomalies_total",
@@ -3632,16 +3724,7 @@ async fn run_coordinator(
                     } => {
                         types::dispatch_exception(
                             &exception_slot,
-                            types::CaException {
-                                kind: types::CaExceptionKind::ServerError,
-                                message: format!(
-                                    "Channel: \"{}\", Connecting to: {}, Ignored: {}",
-                                    pv_name, prev_addr, new_addr,
-                                ),
-                                server_addr: Some(new_addr),
-                                pv_name: Some(pv_name),
-                                status: Some(crate::protocol::ECA_DBLCHNL),
-                            },
+                            types::multiply_defined_pv_exception(pv_name, prev_addr, new_addr),
                         );
                     }
                 }
@@ -3693,6 +3776,19 @@ async fn run_coordinator(
                                         server_addr,
                                         access_rights: access,
                                         state: ChannelState::Connected,
+                                        // The circuit's VERSION frame is parsed
+                                        // (and its ServerVersion event queued)
+                                        // before the CREATE_CHAN_RESP that
+                                        // produced this event, so the map is
+                                        // populated for any compliant server.
+                                        // A server that never sent VERSION is
+                                        // treated as pre-V49 — C's `tcpiiu`
+                                        // starts from the same conservative
+                                        // minor version.
+                                        server_minor: server_minor_version
+                                            .get(&(server_addr, priority))
+                                            .copied()
+                                            .unwrap_or(0),
                                     },
                                 );
                             } else {
@@ -3770,6 +3866,10 @@ async fn run_coordinator(
                                 element_count,
                                 native_changed,
                                 server_addr,
+                                server_minor_version
+                                    .get(&(server_addr, ch.priority))
+                                    .copied()
+                                    .unwrap_or(0),
                                 &transport_tx,
                             );
                             diag.connections.fetch_add(1, Ordering::Relaxed);
@@ -3825,28 +3925,18 @@ async fn run_coordinator(
                     TransportEvent::MonitorData { subid, data_type, count, data } => {
                         use subscription::MonitorDeliveryOutcome;
                         match subscriptions.on_monitor_data(subid, data_type, count, &data) {
-                            MonitorDeliveryOutcome::Queued(circuit) => {
-                                // Only a bounded-channel write feeds flow
-                                // control (invariant I1) — the single gate
-                                // that bumps the per-circuit outstanding
-                                // count.
-                                flow_control_note_queued(
-                                    &mut flow_control,
-                                    circuit,
-                                    &transport_tx,
-                                );
-                            }
-                            MonitorDeliveryOutcome::Slotted(_circuit) => {
+                            MonitorDeliveryOutcome::Queued => {}
+                            MonitorDeliveryOutcome::Slotted => {
                                 // Coalesced into the slot (overflow or
-                                // pause-held). Out of flow control (I1) so
-                                // a client-side pause can't trip EVENTS_OFF
-                                // for sibling subscriptions. Diagnostic only.
+                                // pause-held). Diagnostic only — flow
+                                // control keys on socket occupancy in
+                                // `read_loop`, never on consumer backlog.
                                 metrics::counter!(
                                     "ca_client_coalesced_monitors_total"
                                 )
                                 .increment(1);
                             }
-                            MonitorDeliveryOutcome::Dropped(_server_addr) => {
+                            MonitorDeliveryOutcome::Dropped => {
                                 // With the coalesce slot, this is reachable
                                 // only when the consumer channel is closed —
                                 // i.e. the application dropped the
@@ -3877,23 +3967,14 @@ async fn run_coordinator(
                         // exception-callback semantics.
                         use subscription::MonitorDeliveryOutcome;
                         match subscriptions.on_monitor_error(subid, eca_status) {
-                            // Only a bounded-channel write feeds flow
-                            // control (invariant I1). An error parked in
-                            // the (out-of-band) error slot is `Slotted`.
-                            MonitorDeliveryOutcome::Queued(circuit) => {
-                                flow_control_note_queued(
-                                    &mut flow_control,
-                                    circuit,
-                                    &transport_tx,
-                                );
-                            }
-                            MonitorDeliveryOutcome::Slotted(_) => {
+                            MonitorDeliveryOutcome::Queued => {}
+                            MonitorDeliveryOutcome::Slotted => {
                                 metrics::counter!(
                                     "ca_client_coalesced_monitors_total"
                                 )
                                 .increment(1);
                             }
-                            MonitorDeliveryOutcome::Dropped(_) => {
+                            MonitorDeliveryOutcome::Dropped => {
                                 diag.dropped_monitors.fetch_add(1, Ordering::Relaxed);
                                 metrics::counter!(
                                     "ca_client_monitor_error_drops_total"
@@ -3946,30 +4027,97 @@ async fn run_coordinator(
                         original_request,
                         message,
                         server_addr,
+                        cid,
+                        data_type,
+                        count,
                     } => {
-                        // Already logged in transport layer; surface
-                        // through the exception handler if registered.
-                        // CaException.status is the ECA code (libca
-                        // parity); the original request cmd goes into
-                        // the message text as diagnostic context.
-                        let annotated = match original_request {
-                            Some(cmd) => {
-                                if message.is_empty() {
-                                    format!("(while processing cmd={cmd})")
-                                } else {
-                                    format!("{message} (while processing cmd={cmd})")
-                                }
-                            }
-                            None => message,
+                        // Already logged in the transport layer; this is the
+                        // libca exception path (`cac::exceptionRespAction` →
+                        // the per-command stub). `message` stays RAW — it is
+                        // C's `pCtx`, and the default handler prints it as
+                        // `ctx="..."`; the request command is carried
+                        // structurally (op / type / count), not smuggled into
+                        // the text.
+                        //
+                        // libca's exception jump table (`cac.cpp:93-124`) sends
+                        // READ / READ_NOTIFY / WRITE_NOTIFY / EVENT_ADD to the
+                        // stubs that complete the pending IO or the
+                        // subscription callback — the exception HOOK never
+                        // fires for those, and the tool prints its own
+                        // per-operation diagnostic instead. The transport has
+                        // already completed those waiters above, so they are
+                        // done here.
+                        let routed_to_a_callback = matches!(
+                            original_request,
+                            Some(
+                                crate::protocol::CA_PROTO_READ
+                                    | crate::protocol::CA_PROTO_READ_NOTIFY
+                                    | crate::protocol::CA_PROTO_WRITE_NOTIFY
+                                    | crate::protocol::CA_PROTO_EVENT_ADD
+                            )
+                        );
+                        if routed_to_a_callback {
+                            continue;
+                        }
+                        // What is left is `cac::writeExcep` (a plain
+                        // CA_PROTO_WRITE has no callback to complete, so libca
+                        // takes it to `oldChannelNotify::writeException`,
+                        // `cac.cpp:1049-1061`) and `cac::defaultExcep` for
+                        // every other command.
+                        let op = if original_request == Some(crate::protocol::CA_PROTO_WRITE) {
+                            types::CaOp::Put
+                        } else if original_request == Some(crate::protocol::CA_PROTO_EVENT_CANCEL) {
+                            types::CaOp::ClearEvent
+                        } else if original_request == Some(crate::protocol::CA_PROTO_CREATE_CHAN) {
+                            types::CaOp::CreateChannel
+                        } else {
+                            types::CaOp::Other
+                        };
+                        let is_channel_exception = op == types::CaOp::Put;
+                        let pv_name = is_channel_exception
+                            .then(|| cid.and_then(|c| channels.get(&c)))
+                            .flatten()
+                            .map(|ch| ch.pv_name.to_string());
+                        // `cac::defaultExcep` folds the host into the ctx
+                        // text itself (`host=%s ctx=%.400s`, `cac.cpp:1006-1016`)
+                        // before raising; the channel path passes the server's
+                        // diagnostic through untouched.
+                        //
+                        // C's host there is `iiu.getHostName` — the circuit's
+                        // `hostNameCache`, i.e. the reverse-resolved NAME, the
+                        // same source `ca_host_name` reads (W10-B5). This
+                        // arm runs on the coordinator task, so it takes the
+                        // NON-blocking half of that cache: a `getnameinfo` here
+                        // would park every channel's progress behind one DNS
+                        // timeout.
+                        let message = if is_channel_exception {
+                            message
+                        } else {
+                            format!(
+                                "host={host} ctx={message}",
+                                host = crate::hostname::cached_name(server_addr)
+                            )
                         };
                         types::dispatch_exception(
                             &exception_slot,
                             types::CaException {
                                 kind: types::CaExceptionKind::ServerError,
-                                message: annotated,
+                                message,
                                 server_addr: Some(server_addr),
-                                pv_name: None,
+                                pv_name,
                                 status: Some(eca_status),
+                                op,
+                                data_type: is_channel_exception.then_some(data_type).flatten(),
+                                count: is_channel_exception.then_some(count).flatten(),
+                                // `cac::defaultExcep` (`cac.cpp:1006-1016`)
+                                // is libca's one null-file producer, so it is
+                                // the one block with no `Source File:` line;
+                                // the channel-write exception carries its own.
+                                source: if is_channel_exception {
+                                    types::LIBCA_WRITE_EXCEPTION_SITE
+                                } else {
+                                    types::ExceptionSite::NullFile
+                                },
                             },
                         );
                     }
@@ -3981,67 +4129,21 @@ async fn run_coordinator(
                             .unwrap_or(0);
                         tracing::warn!(server = %server_addr, priority, channels = n_affected, "TCP circuit closed");
                         metrics::counter!("ca_client_tcp_closed_total", "server" => server_addr.to_string()).increment(1);
-                        flow_control.remove(&circuit);
                         last_rx_at.remove(&circuit);
                         server_minor_version.remove(&circuit);
-                        handle_disconnect(&mut channels, &mut subscriptions, &mut server_channels, &search_tx, circuit, &diag, &in_flight, &snapshots);
+                        handle_disconnect(&mut channels, &mut subscriptions, &mut server_channels, &search_tx, circuit, &diag, &in_flight, &snapshots, &exception_slot);
                     }
                     TransportEvent::ServerDisconnect { cid, server_addr } => {
-                        // Single channel disconnect (CA_PROTO_SERVER_DISCONN).
-                        // Server is telling us this specific cid is gone —
-                        // wake any in-flight read/write waiters tied to it
-                        // so blocked `caget`/`caput` futures fail with
-                        // `Disconnected` instead of stalling until their
-                        // own outer timeout fires. Mirrors the bulk
-                        // `handle_disconnect` wake path used for
-                        // `TcpClosed` (mod.rs ~1877). Without this,
-                        // SERVER_DISCONN was structurally dead-letter:
-                        // we re-searched but never released callers who
-                        // were waiting on a response that the server
-                        // had just told us would never come.
-                        if let Some(ch) = channels.get_mut(&cid) {
-                            if ch.server_addr == Some(server_addr) {
-                                ch.state = ChannelState::Disconnected;
-                                snapshots.remove(&cid);
-                                let _ = ch.conn_tx.send(ConnectionEvent::Disconnected);
-
-                                let pv_name = ch.pv_name.to_string();
-                                let cids = vec![cid];
-                                let cleared = subscriptions.mark_disconnected(&cids);
-                                for (circuit, count) in cleared {
-                                    flow_control_note_consumed(
-                                        &mut flow_control,
-                                        circuit,
-                                        count,
-                                        &transport_tx,
-                                    );
-                                }
-
-                                // Drain blocked read/write waiters for this cid.
-                                let mut affected = HashSet::with_capacity(1);
-                                affected.insert(cid);
-                                drain_waiters_for_cids(&affected, &in_flight);
-
-                                // Re-search
-                                let _ = search_tx.send(SearchRequest::Schedule {
-                                    cid,
-                                    pv_name: pv_name.clone(),
-                                    reason: SearchReason::Reconnect,
-                                });
-
-                                // CA-130: surface to per-client handler.
-                                types::dispatch_exception(
-                                    &exception_slot,
-                                    types::CaException {
-                                        kind: types::CaExceptionKind::ServerDisconnect,
-                                        message: "server-initiated channel close".to_string(),
-                                        server_addr: Some(server_addr),
-                                        pv_name: Some(pv_name),
-                                        status: None,
-                                    },
-                                );
-                            }
-                        }
+                        handle_server_disconnect(
+                            &mut channels,
+                            &mut subscriptions,
+                            &search_tx,
+                            cid,
+                            server_addr,
+                            &in_flight,
+                            &snapshots,
+                            &exception_slot,
+                        );
                     }
                     TransportEvent::CircuitUnresponsive { server_addr, priority } => {
                         diag.unresponsive_events.fetch_add(1, Ordering::Relaxed);
@@ -4049,72 +4151,40 @@ async fn run_coordinator(
                         tracing::warn!(server = %server_addr, priority, "circuit unresponsive (echo timeout)");
                         metrics::counter!("ca_client_unresponsive_total", "server" => server_addr.to_string()).increment(1);
                         // C `tcpiiu::unresponsiveCircuitNotify`
-                        // (`libca/tcpiiu.cpp:899-941`) fires the global
-                        // exception hook with ECA_UNRESPTMO, then walks
-                        // every connected channel and calls
-                        // `pChan->unresponsiveCircuitNotify` which in
-                        // `nciu.cpp:161-182` triggers
-                        // `disconnectAllIO()` (ECA_DISCONN per IO) +
-                        // `accessRightsNotify(noRights)`. Pre-fix Rust
-                        // only flipped state and emitted
-                        // `ConnectionEvent::Unresponsive` — in-flight
-                        // get/put/subscribe waiters kept hanging,
-                        // access-rights subscribers got no signal.
-                        types::dispatch_exception(
-                            &exception_slot,
-                            types::CaException {
-                                kind: types::CaExceptionKind::ServerError,
-                                message: format!(
-                                    "circuit unresponsive: {server_addr} (matches libca ECA_UNRESPTMO)"
-                                ),
-                                server_addr: Some(server_addr),
-                                pv_name: None,
-                                status: Some(crate::protocol::ECA_UNRESPTMO),
-                            },
-                        );
-                        let mut affected_cids: Vec<u32> = Vec::new();
-                        for ch in channels.values_mut() {
-                            if ch.server_addr == Some(server_addr)
+                        // (`tcpiiu.cpp:899-941`) fires the global exception
+                        // hook with ECA_UNRESPTMO — gated, like the
+                        // circuit-gone raise, on the circuit still having
+                        // connected channels (`tcpiiu.cpp:922`
+                        // `connectedList.count()`) — and then walks each of
+                        // them through `nciu::unresponsiveCircuitNotify`.
+                        if channels.values().any(|ch| {
+                            ch.server_addr == Some(server_addr)
                                 && ch.priority == priority
                                 && ch.state == ChannelState::Connected
-                            {
-                                ch.state = ChannelState::Unresponsive;
-                                if let Some(mut snap) = snapshots.get_mut(&ch.cid) {
-                                    snap.state = ChannelState::Unresponsive;
-                                    snap.access_rights = AccessRights { read: false, write: false };
-                                }
-                                ch.access_rights = AccessRights { read: false, write: false };
-                                let _ = ch.conn_tx.send(ConnectionEvent::Unresponsive);
-                                let _ = ch.conn_tx.send(ConnectionEvent::AccessRightsChanged {
-                                    read: false,
-                                    write: false,
-                                });
-                                affected_cids.push(ch.cid);
-                            }
+                        }) {
+                            types::dispatch_exception(
+                                &exception_slot,
+                                types::unresponsive_circuit_exception(server_addr),
+                            );
                         }
-                        // Fan ECA_DISCONN out to in-flight reads /
-                        // writes / subscriptions (libca
-                        // `disconnectAllIO` parity). This covers the
-                        // subscription side via mark_disconnected.
-                        if !affected_cids.is_empty() {
-                            let cid_set: HashSet<u32> = affected_cids.iter().copied().collect();
-                            drain_waiters_for_cids(&cid_set, &in_flight);
-                            // apply the flow-control delta. Earlier
-                            // this discarded the returned map, so the
-                            // forgotten channel items left the circuit
-                            // outstanding count high — EVENTS_ON could
-                            // stay stuck. Every disconnect path must
-                            // decrement by the cleared delta.
-                            let cleared = subscriptions.mark_disconnected(&affected_cids);
-                            for (circuit, count) in cleared {
-                                flow_control_note_consumed(
-                                    &mut flow_control,
-                                    circuit,
-                                    count,
-                                    &transport_tx,
-                                );
-                            }
-                        }
+                        // Same owner as the two circuit-gone paths: the
+                        // ECA_DISCONN fan-out to in-flight reads / writes /
+                        // subscriptions and the no-rights transition are the
+                        // shared part; only the terminal state and the
+                        // connection event differ.
+                        disconnect_channels(
+                            &mut channels,
+                            &mut subscriptions,
+                            &in_flight,
+                            &snapshots,
+                            DisconnectKind::Unresponsive,
+                            |ch| {
+                                ch.server_addr == Some(server_addr)
+                                    && ch.priority == priority
+                                    && ch.state == ChannelState::Connected
+                            },
+                            |_| {},
+                        );
                     }
                     TransportEvent::CircuitResponsive { server_addr, priority } => {
                         diag.record(DiagEvent::Responsive { server: server_addr });
@@ -4152,15 +4222,51 @@ async fn run_coordinator(
                                     {
                                         if let Some(ch) = channels.get(&cid) {
                                             if let Some(addr) = ch.server_addr {
-                                                let _ =
-                                                    transport_tx.send(TransportCommand::ReadNotify {
-                                                        sid: ch.sid,
-                                                        data_type,
-                                                        count: rec.count.unwrap_or(0),
-                                                        ioid: in_flight.alloc_ioid(),
-                                                        server_addr: addr,
-                                                        priority: ch.priority,
-                                                    });
+                                                let peer_minor = server_minor_version
+                                                    .get(&(addr, ch.priority))
+                                                    .copied()
+                                                    .unwrap_or(0);
+                                                match crate::protocol::read_notify_wire_count(
+                                                    rec.count.unwrap_or(0),
+                                                    ch.element_count,
+                                                    data_type,
+                                                    peer_minor,
+                                                ) {
+                                                    Ok(count) => {
+                                                        // C issues this
+                                                        // READ_NOTIFY under
+                                                        // the subscription's
+                                                        // own id
+                                                        // (`tcpiiu.cpp:1636-1641`)
+                                                        // so the reply reaches
+                                                        // the monitor
+                                                        // callback. The port's
+                                                        // ioid space is
+                                                        // separate, so record
+                                                        // the reply's owner.
+                                                        let ioid = in_flight
+                                                            .register_sub_update(cid, sub_id);
+                                                        let _ = transport_tx.send(
+                                                            TransportCommand::ReadNotify {
+                                                                sid: ch.sid,
+                                                                data_type,
+                                                                count,
+                                                                ioid,
+                                                                server_addr: addr,
+                                                                priority: ch.priority,
+                                                            },
+                                                        );
+                                                    }
+                                                    Err(e) => {
+                                                        tracing::error!(
+                                                            pv = %ch.pv_name,
+                                                            error = %e,
+                                                            "skipping post-recovery re-read: \
+                                                             request exceeds what this circuit \
+                                                             can carry"
+                                                        );
+                                                    }
+                                                }
                                             }
                                         }
                                     }
@@ -4177,13 +4283,20 @@ async fn run_coordinator(
                         server_minor_version.insert((server_addr, priority), minor_version);
                     }
                     TransportEvent::ServerConnected { server_addr } => {
+                        // C hands the peer address to `ipAddrToAsciiEngine` in
+                        // the `tcpiiu` constructor, so the name is resolved
+                        // long before anything prints it. Warm the same cache
+                        // here — otherwise the first ask is the exception block
+                        // of a circuit that just died, and it would print the
+                        // dotted IP where C prints `localhost:5064`.
+                        crate::hostname::warm(server_addr);
                         // libca bhe-on-connect parity: tell the beacon
                         // monitor to drop its per-server EMA so the
                         // next beacon reseeds `period_estimate` from
                         // the live cadence. Without this, an archiver
                         // that reconnects to a server in the middle of
                         // its `online_notify_task` ramp-up would log a
-                        // PeriodCollapse cascade against its stale
+                        // short-period anomaly cascade against its stale
                         // steady-state estimate.
                         let _ = beacon_ctrl_tx.send(
                             beacon_monitor::BeaconControl::ResetServer { server_addr },
@@ -4193,6 +4306,185 @@ async fn run_coordinator(
             }
         }
     }
+}
+
+/// Which way a channel leaves the connected set. The two variants differ
+/// only in the terminal [`ChannelState`] and the snapshot treatment — i.e.
+/// in how the channel *recovers*. What the application sees is identical
+/// and deliberately so: C reaches `nciu::disconnectNotify` (`CA_OP_CONN_DOWN`)
+/// from both, so [`ConnectionEvent::Disconnected`] is the only event either
+/// path can emit.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DisconnectKind {
+    /// The circuit is gone: the socket closed (`TcpClosed`,
+    /// C `tcpiiu::disconnectAllChannels`) or the server retired this cid
+    /// (`CA_PROTO_SERVER_DISCONN`, C `cac::disconnectChannel`). Recovery is
+    /// a fresh search.
+    CircuitGone,
+    /// Echo timeout: the socket is still up but the peer is silent.
+    /// C `tcpiiu::unresponsiveCircuitNotify`. Recovery is
+    /// `tcpiiu::responsiveCircuitNotify` on the same socket — no re-search.
+    Unresponsive,
+}
+
+impl DisconnectKind {
+    fn terminal_state(self) -> ChannelState {
+        match self {
+            Self::CircuitGone => ChannelState::Disconnected,
+            Self::Unresponsive => ChannelState::Unresponsive,
+        }
+    }
+}
+
+/// THE owner of every "channel leaves the connected set" transition.
+///
+/// **Invariant (MUST):** a channel that leaves the connected set — by TCP
+/// close, by `CA_PROTO_SERVER_DISCONN`, or by echo timeout — has its
+/// pending get/put IOs and its subscriptions failed with `ECA_DISCONN`,
+/// its cached access rights reset to no-rights, and emits the connection
+/// event followed by `AccessRightsChanged { read: false, write: false }`.
+/// **MUST NOT:** any of those steps happen on one path and not another.
+///
+/// In C all three paths converge on `nciu::unresponsiveCircuitNotify`
+/// (`nciu.cpp:161-182`), reached from `tcpiiu::disconnectAllChannels`
+/// (`tcpiiu.cpp:1848-1855`), from `cac::disconnectChannel`
+/// (`cac.cpp:1185-1195`) and from the echo-timeout path — so they cannot
+/// disagree. Rust hand-rolled the transition three times and did disagree:
+/// only the echo-timeout path reset access rights, so after a socket close
+/// the cached rights stayed at their last value (possibly read+write) until
+/// reconnect (R8-17).
+///
+/// `select` picks the channels this transition covers; `per_channel` runs
+/// the path-specific extras (reconnect backoff, re-search scheduling) that
+/// emit no user-visible callback. Returns the affected cids.
+fn disconnect_channels(
+    channels: &mut HashMap<u32, ChannelInner>,
+    subscriptions: &mut SubscriptionRegistry,
+    in_flight: &types::InFlightOps,
+    snapshots: &ChannelSnapshots,
+    kind: DisconnectKind,
+    select: impl Fn(&ChannelInner) -> bool,
+    mut per_channel: impl FnMut(&mut ChannelInner),
+) -> Vec<u32> {
+    let affected: Vec<u32> = channels
+        .values()
+        .filter(|ch| select(ch))
+        .map(|ch| ch.cid)
+        .collect();
+    if affected.is_empty() {
+        return affected;
+    }
+
+    const NO_RIGHTS: AccessRights = AccessRights {
+        read: false,
+        write: false,
+    };
+
+    // Step 1 — `disconnectAllIO` (`nciu.cpp:168`), and it comes FIRST:
+    // every pending get/put IO of the channel fails with ECA_DISCONN and
+    // the subscriptions park the same status, all of it *before* the
+    // connection callback runs (`nciu.cpp:168-170` — disconnectAllIO, then
+    // disconnectNotify). libca hands the user the per-IO failures before it
+    // says "the channel is down", so a handler that reacts to the
+    // connection event never observes an IO of the dead channel still
+    // pending.
+    subscriptions.mark_disconnected(&affected);
+    let affected_set: HashSet<u32> = affected.iter().copied().collect();
+    drain_waiters_for_cids(&affected_set, in_flight);
+
+    for cid in &affected {
+        let Some(ch) = channels.get_mut(cid) else {
+            continue;
+        };
+        // Step 2 — C `nciu::setServerAddressUnknown` (`nciu.cpp:183-195`)
+        // clears both permits as the channel leaves the circuit, before any
+        // callback runs, so a handler that reads the rights sees no-rights.
+        ch.state = kind.terminal_state();
+        ch.access_rights = NO_RIGHTS;
+        match kind {
+            DisconnectKind::CircuitGone => {
+                snapshots.remove(cid);
+            }
+            DisconnectKind::Unresponsive => {
+                if let Some(mut snap) = snapshots.get_mut(cid) {
+                    snap.state = ChannelState::Unresponsive;
+                    snap.access_rights = NO_RIGHTS;
+                }
+            }
+        }
+        // Steps 3 and 4 — C `disconnectNotify` then
+        // `accessRightsNotify(noRights)` (`nciu.cpp:170-177`), in that
+        // order. Both kinds emit `Disconnected`: C has no third connection
+        // state, and an event only the port can emit is an event no
+        // consumer handles.
+        let _ = ch.conn_tx.send(ConnectionEvent::Disconnected);
+        let _ = ch.conn_tx.send(ConnectionEvent::AccessRightsChanged {
+            read: false,
+            write: false,
+        });
+        per_channel(ch);
+    }
+
+    affected
+}
+
+/// `CA_PROTO_SERVER_DISCONN`: the server retired one cid.
+///
+/// C `cac::verifyAndDisconnectChan` → `cac::disconnectChannel`
+/// (`cac.cpp:1172-1195`) runs the SAME transition as a circuit close —
+/// `disconnectAllIO`, no-rights, `disconnectNotify`, `accessRightsNotify` —
+/// only scoped to one channel. It therefore crosses the same owner
+/// ([`disconnect_channels`]) as `TcpClosed` and the echo timeout.
+#[allow(clippy::too_many_arguments)]
+fn handle_server_disconnect(
+    channels: &mut HashMap<u32, ChannelInner>,
+    subscriptions: &mut SubscriptionRegistry,
+    search_tx: &mpsc::UnboundedSender<SearchRequest>,
+    cid: u32,
+    server_addr: SocketAddr,
+    in_flight: &types::InFlightOps,
+    snapshots: &ChannelSnapshots,
+    exception_slot: &types::CaExceptionSlot,
+) {
+    let mut pv_name = String::new();
+    let affected = disconnect_channels(
+        channels,
+        subscriptions,
+        in_flight,
+        snapshots,
+        DisconnectKind::CircuitGone,
+        |ch| ch.cid == cid && ch.server_addr == Some(server_addr),
+        |ch| {
+            pv_name = ch.pv_name.to_string();
+            let _ = search_tx.send(SearchRequest::Schedule {
+                cid: ch.cid,
+                pv_name: ch.pv_name.to_string(),
+                reason: SearchReason::Reconnect,
+            });
+        },
+    );
+    if affected.is_empty() {
+        return;
+    }
+    // CA-130: surface to per-client handler.
+    types::dispatch_exception(
+        exception_slot,
+        types::CaException {
+            kind: types::CaExceptionKind::ServerDisconnect,
+            message: "server-initiated channel close".to_string(),
+            server_addr: Some(server_addr),
+            pv_name: Some(pv_name),
+            status: None,
+            op: types::CaOp::Other,
+            data_type: None,
+            count: None,
+            // No C site to name: `CA_PROTO_SERVER_DISCONN` never reaches
+            // `vSignal` at all (`cac::verifyAndDisconnectChan` takes it out
+            // through the channel's connection callback), so this kind renders
+            // to nothing. The field is unread here.
+            source: types::ExceptionSite::NullFile,
+        },
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4205,24 +4497,42 @@ fn handle_disconnect(
     diag: &CaDiagnostics,
     in_flight: &types::InFlightOps,
     snapshots: &ChannelSnapshots,
+    exception_slot: &types::CaExceptionSlot,
 ) {
     let (server_addr, priority) = circuit;
-    let mut affected_cids = Vec::new();
     let now = std::time::Instant::now();
+
+    // C `cac::destroyIIU` (`cac.cpp:1236-1240`): a circuit that still carried
+    // channels when it died raises ECA_DISCONN on the global exception hook —
+    // and raises it *before* `disconnectAllChannels` (`cac.cpp:1251`), so a
+    // handler learns the circuit is gone ahead of the per-channel callbacks.
+    // It belongs here, in the circuit-gone owner, not at one call site: every
+    // path that destroys a circuit is a path C raises this on.
+    if server_channels
+        .get(&circuit)
+        .is_some_and(|cids| !cids.is_empty())
+    {
+        types::dispatch_exception(
+            exception_slot,
+            types::circuit_disconnect_exception(server_addr),
+        );
+    }
 
     // only channels on THIS circuit `(server_addr, priority)`
     // are torn down — a sibling circuit to the same server at another
     // priority keeps its channels connected.
-    for ch in channels.values_mut() {
-        if ch.server_addr == Some(server_addr)
-            && ch.priority == priority
-            && (ch.state.is_operational() || ch.state == ChannelState::Connecting)
-        {
-            ch.state = ChannelState::Disconnected;
-            snapshots.remove(&ch.cid);
-            affected_cids.push(ch.cid);
-            let _ = ch.conn_tx.send(ConnectionEvent::Disconnected);
-
+    let affected_cids = disconnect_channels(
+        channels,
+        subscriptions,
+        in_flight,
+        snapshots,
+        DisconnectKind::CircuitGone,
+        |ch| {
+            ch.server_addr == Some(server_addr)
+                && ch.priority == priority
+                && (ch.state.is_operational() || ch.state == ChannelState::Connecting)
+        },
+        |ch| {
             // Reconnection backoff: if the connection was short-lived (<30s),
             // increment reconnect_count for exponential backoff. Sustained
             // connections reset the counter.
@@ -4244,8 +4554,8 @@ fn handle_disconnect(
                 pv_name: ch.pv_name.to_string(),
                 reason: SearchReason::Reconnect,
             });
-        }
-    }
+        },
+    );
     if !affected_cids.is_empty() {
         diag.disconnections.fetch_add(1, Ordering::Relaxed);
         diag.record(DiagEvent::Disconnected {
@@ -4264,12 +4574,6 @@ fn handle_disconnect(
     // Clean up stale server_channels entries so beacon anomaly
     // lookups don't reference disconnected channels.
     server_channels.remove(&circuit);
-    let _ = subscriptions.mark_disconnected(&affected_cids);
-
-    // Fail pending read/write waiters for affected channels so callers
-    // don't hang forever waiting for a response that will never arrive.
-    let affected: HashSet<u32> = affected_cids.into_iter().collect();
-    drain_waiters_for_cids(&affected, in_flight);
 }
 
 /// Drop every entry in the shared in-flight registry whose cid is in
@@ -4302,6 +4606,12 @@ pub(crate) fn drain_waiters_for_cids(cids: &HashSet<u32>, in_flight: &types::InF
             let _ = sender.send(Err(CaError::Disconnected));
         }
     }
+    // The recovery re-reads of a channel that just left the connected set
+    // will never be answered; their ECA_DISCONN reaches the subscriber via
+    // `mark_disconnected`, so drop the records rather than leak them.
+    in_flight
+        .sub_updates
+        .retain(|_, (cid, _)| !cids.contains(cid));
 }
 
 /// Decide which operational circuits should receive a
@@ -4479,63 +4789,20 @@ impl AddrEntry {
 /// epics-base#488.
 pub(crate) fn parse_addr_list_with_hostnames() -> CaResult<Vec<AddrEntry>> {
     let mut addrs: Vec<AddrEntry> = Vec::new();
-    let default_port = epics_base_rs::runtime::env::get("EPICS_CA_SERVER_PORT")
-        .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(CA_SERVER_PORT);
+    let default_port = epics_base_rs::runtime::net::ca_server_port();
     // EPICS_RS_CLIENT_IGNORE — Rust-only client-side IP quarantine
     // (NOT the C EPICS_IOC_IGNORE_SERVERS, which is server-side and
     // operates on server NAMES, not IPs — see epics_rs_client_ignore
     // docstring for the naming rationale).
     let ignore_ips = epics_rs_client_ignore();
-    if let Some(list) = epics_base_rs::runtime::env::get("EPICS_CA_ADDR_LIST") {
-        for entry in list.split_whitespace() {
-            let (host_raw, port) = if entry.contains(':') {
-                if let Some((h, p)) = entry.rsplit_once(':') {
-                    let port: u16 = match p.parse() {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
-                    (h.to_string(), port)
-                } else {
-                    (entry.to_string(), default_port)
-                }
-            } else {
-                (entry.to_string(), default_port)
-            };
-            // Pure-IP entry has no DNS to refresh.
-            let hostname = if host_raw.parse::<Ipv4Addr>().is_ok() {
-                None
-            } else {
-                Some(host_raw.clone())
-            };
-            match resolve_host(&host_raw, port) {
-                Ok(sock) => {
-                    if let SocketAddr::V4(v4) = sock {
-                        if ignore_ips.contains(v4.ip()) {
-                            tracing::debug!(
-                                target: "epics_ca_rs::client",
-                                token = %entry,
-                                ip = %v4.ip(),
-                                "EPICS_RS_CLIENT_IGNORE: dropping ADDR_LIST entry"
-                            );
-                            continue;
-                        }
-                    }
-                    addrs.push(AddrEntry::new(sock, hostname, port));
-                }
-                Err(e) => tracing::debug!(token = %entry, error = %e,
-                    "EPICS_CA_ADDR_LIST: dropped unresolvable entry"),
-            }
-        }
-    }
 
-    // Mirror the legacy `parse_addr_list`'s
-    // AUTO_ADDR_LIST + broadcast-fallback behaviour. Without these
-    // the new live caller would silently drop UDP broadcast
-    // discovery for multi-NIC clients and the limited-broadcast
-    // last-resort fallback. The added entries are IP literals
-    // (`hostname = None`) so the periodic refresh task short-
-    // circuits them.
+    // C `configureChannelAccessAddressList` (`iocinf.cpp:195-227`) builds this
+    // list in ONE order: the auto-discovered broadcasts first (deduped among
+    // themselves, silently), the operator's `EPICS_CA_ADDR_LIST` appended
+    // after them, and a single `removeDuplicateAddresses(…, silent=0)` over the
+    // result. The port had the two halves the other way round, so an operator
+    // entry that names a broadcast address C would report as a duplicate would
+    // instead have silenced the auto entry.
     // C `ca/src/client/iocinf.cpp:186-193` uses substring
     // semantics: `yes = true; if (strstr(pstr,"no") || strstr(pstr,
     // "NO")) yes = false`. Any value not containing "no"/"NO" keeps
@@ -4545,14 +4812,41 @@ pub(crate) fn parse_addr_list_with_hostnames() -> CaResult<Vec<AddrEntry>> {
     // Server-side `addr_list::from_env` keeps the strict semantic
     // because the C server var uses `envGetBoolConfigParam` (strict);
     // only the CLIENT var has the strstr quirk that Rust must mirror.
-    let auto_addr = epics_base_rs::runtime::env::get_or("EPICS_CA_AUTO_ADDR_LIST", "YES");
+    let auto_addr = epics_base_rs::runtime::env_table::EPICS_CA_AUTO_ADDR_LIST
+        .get()
+        .unwrap_or_default();
     let auto_addr_enabled = !(auto_addr.contains("no") || auto_addr.contains("NO"));
     if auto_addr_enabled {
-        let server_port = default_port;
         let bcasts = crate::server::addr_list::discover_broadcast_addrs();
-        append_auto_addr_entries(&mut addrs, &bcasts, server_port);
+        append_auto_addr_entries(&mut addrs, &bcasts, default_port);
     }
-    Ok(addrs)
+
+    if let Some(list) = epics_base_rs::runtime::env_table::EPICS_CA_ADDR_LIST.get() {
+        // C `iocinf.cpp:225`. The tokenizer owns the bad-token diagnostic; the
+        // only thing left to do here is the Rust-only IP quarantine.
+        for tok in crate::iocinf::add_addr_to_channel_access_address_list(
+            &list,
+            "EPICS_CA_ADDR_LIST",
+            default_port,
+        ) {
+            if let SocketAddr::V4(v4) = tok.sock {
+                if ignore_ips.contains(v4.ip()) {
+                    tracing::debug!(
+                        target: "epics_ca_rs::client",
+                        ip = %v4.ip(),
+                        "EPICS_RS_CLIENT_IGNORE: dropping ADDR_LIST entry"
+                    );
+                    continue;
+                }
+            }
+            addrs.push(AddrEntry::new(tok.sock, tok.hostname, tok.port));
+        }
+    }
+
+    // C `iocinf.cpp:227`: `removeDuplicateAddresses ( pList, &tmpList, 0 )`.
+    // The port kept every duplicate token, so `EPICS_CA_ADDR_LIST="A A"` sent
+    // two copies of every search datagram to A for the life of the client.
+    Ok(crate::iocinf::remove_duplicate_addresses(addrs, |e| e.sock))
 }
 
 /// AUTO_ADDR_LIST=YES expansion: append broadcast NICs, then a C-parity
@@ -4916,8 +5210,10 @@ mod addr_entry_tests {
 fn expand_pv_name(name: &str) -> String {
     // EPICS_CA_USE_SHELL_VARS=YES expands ${VAR}/$(VAR) tokens in PV
     // names against the process environment, matching libca behaviour.
-    if epics_base_rs::runtime::env::get_or("EPICS_CA_USE_SHELL_VARS", "NO")
-        .eq_ignore_ascii_case("YES")
+    // Not an EPICS Base `ENV_PARAM` — it is in no `envDefs.h`, so there is no
+    // compiled default and the caller owns the fallback (`getenv`-shaped).
+    if epics_base_rs::runtime::env::get("EPICS_CA_USE_SHELL_VARS")
+        .is_some_and(|v| v.eq_ignore_ascii_case("YES"))
     {
         expand_shell_vars(name)
     } else {
@@ -5028,7 +5324,7 @@ fn parse_tls_sni_map() -> Vec<(SocketAddr, String)> {
 /// deployments with hostname-bound certs work without a single global
 /// `EPICS_CA_TLS_SERVER_NAME` override.
 pub(crate) fn parse_nameserver_list() -> Vec<(SocketAddr, Option<String>)> {
-    let Some(list) = epics_base_rs::runtime::env::get("EPICS_CA_NAME_SERVERS") else {
+    let Some(list) = epics_base_rs::runtime::env_table::EPICS_CA_NAME_SERVERS.get() else {
         return Vec::new();
     };
     // C `cac.cpp:259` defaults bare-hostname entries to
@@ -5039,48 +5335,24 @@ pub(crate) fn parse_nameserver_list() -> Vec<(SocketAddr, Option<String>)> {
     // `EPICS_CA_SERVER_PORT=5066` to coexist with parallel C
     // deployments. The `host:port` branch already honours the
     // explicit port; only the bare-hostname default changes here.
-    let default_server_port: u16 = epics_base_rs::runtime::env::get("EPICS_CA_SERVER_PORT")
-        .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(CA_SERVER_PORT);
-    let mut out = Vec::new();
-    for entry in list.split_whitespace() {
-        if entry.contains(':') {
-            // Try as raw `IP:port` first — if it parses, no hostname.
-            if let Ok(addr) = entry.parse::<SocketAddr>() {
-                out.push((addr, None));
-                continue;
-            }
-            // Otherwise treat it as `host:port` and remember the host.
-            let Some((host, port_str)) = entry.rsplit_once(':') else {
-                continue;
-            };
-            let Ok(port) = port_str.parse::<u16>() else {
-                continue;
-            };
-            if let Ok(addr) = resolve_host(host, port) {
-                let hostname = if host.parse::<std::net::IpAddr>().is_ok() {
-                    None
-                } else {
-                    Some(host.to_string())
-                };
-                out.push((addr, hostname));
-            }
-        } else {
-            // Bare hostname (no port) — treat as DNS name even if it
-            // happens to look like an IP literal (caller intent is
-            // unambiguous when no port is specified). default
-            // port from EPICS_CA_SERVER_PORT (matches libca).
-            if let Ok(addr) = resolve_host(entry, default_server_port) {
-                let hostname = if entry.parse::<std::net::IpAddr>().is_ok() {
-                    None
-                } else {
-                    Some(entry.to_string())
-                };
-                out.push((addr, hostname));
-            }
-        }
-    }
-    out
+    let default_server_port: u16 = epics_base_rs::runtime::net::ca_server_port();
+    // C `cac.cpp:259` — the SAME tokenizer the client address list is built
+    // with, which is why a bad token here is reported in exactly the same two
+    // lines, naming this variable.
+    let out: Vec<(SocketAddr, Option<String>)> =
+        crate::iocinf::add_addr_to_channel_access_address_list(
+            &list,
+            "EPICS_CA_NAME_SERVERS",
+            default_server_port,
+        )
+        .into_iter()
+        .map(|tok| (tok.sock, tok.hostname))
+        .collect();
+    // C `cac.cpp:260`: `removeDuplicateAddresses ( &dest, &tmpList, 0 )` — the
+    // name-server list is deduped by the SAME helper as `EPICS_CA_ADDR_LIST`,
+    // and warns about what it drops for the same reason: a repeated entry
+    // otherwise buys a second TCP circuit to that name server.
+    crate::iocinf::remove_duplicate_addresses(out, |(addr, _)| *addr)
 }
 
 // Legacy `parse_addr_list() -> Vec<SocketAddr>`
@@ -5548,7 +5820,9 @@ mod typed_string_put_tests {
             /* count */ 1,
             /* ioid */ None,
             payload,
-        );
+            CA_MINOR_VERSION,
+        )
+        .expect("modern peer accepts the frame");
         let (hdr, _consumed) =
             CaHeader::from_bytes_extended(&frame).expect("frame header must parse");
         assert_eq!(hdr.cmmd, CA_PROTO_WRITE, "command must be CA_PROTO_WRITE");
@@ -5573,7 +5847,9 @@ mod typed_string_put_tests {
             /* count */ 1,
             /* ioid */ Some(42),
             payload,
-        );
+            CA_MINOR_VERSION,
+        )
+        .expect("modern peer accepts the frame");
         let (hdr, _consumed) =
             CaHeader::from_bytes_extended(&frame).expect("frame header must parse");
         assert_eq!(hdr.data_type, native_double);
@@ -5609,7 +5885,9 @@ mod typed_string_put_tests {
             /* count */ values.len() as u32,
             /* ioid */ Some(7),
             payload,
-        );
+            CA_MINOR_VERSION,
+        )
+        .expect("modern peer accepts the frame");
         let (hdr, _consumed) =
             CaHeader::from_bytes_extended(&frame).expect("frame header must parse");
         assert_eq!(
@@ -5716,25 +5994,19 @@ mod monitor_pause_tests {
         assert_eq!(v2.value, EpicsValue::Long(2), "held latest after resume");
     }
 
-    /// a configured queue smaller than FLOW_CONTROL_OFF_THRESHOLD is
+    /// a configured queue smaller than MIN_MONITOR_QUEUE_SIZE is
     /// clamped up so a lone subscription's full channel can still reach
     /// the threshold and trip EVENTS_OFF (slot overflow is out of flow
     /// control, so an unclamped small queue would coalesce forever).
     #[test]
-    fn monitor_queue_clamped_to_flow_control_threshold() {
+    fn monitor_queue_clamped_to_min_size() {
         // Below threshold → clamped up.
-        assert_eq!(
-            resolve_monitor_queue_size(Some(5)),
-            FLOW_CONTROL_OFF_THRESHOLD
-        );
-        assert_eq!(
-            resolve_monitor_queue_size(Some(9)),
-            FLOW_CONTROL_OFF_THRESHOLD
-        );
+        assert_eq!(resolve_monitor_queue_size(Some(5)), MIN_MONITOR_QUEUE_SIZE);
+        assert_eq!(resolve_monitor_queue_size(Some(9)), MIN_MONITOR_QUEUE_SIZE);
         // At/above threshold → unchanged.
         assert_eq!(
-            resolve_monitor_queue_size(Some(FLOW_CONTROL_OFF_THRESHOLD)),
-            FLOW_CONTROL_OFF_THRESHOLD
+            resolve_monitor_queue_size(Some(MIN_MONITOR_QUEUE_SIZE)),
+            MIN_MONITOR_QUEUE_SIZE
         );
         assert_eq!(resolve_monitor_queue_size(Some(1000)), 1000);
         // Unset → default 256 (well above the threshold).
@@ -5773,5 +6045,392 @@ mod monitor_pause_tests {
             matches!(got, Err(CaError::ServerError(192))),
             "ECA_DISCONN must bypass pause"
         );
+    }
+}
+
+#[cfg(test)]
+mod disconnect_transition_tests {
+    //! R8-17 / R8-20: the three paths that take a channel out of the
+    //! connected set — TCP close, `CA_PROTO_SERVER_DISCONN`, echo timeout —
+    //! all run the same transition in C, because all three converge on
+    //! `nciu::unresponsiveCircuitNotify` (`nciu.cpp:161-182`):
+    //! `disconnectAllIO` → no-rights → `disconnectNotify` →
+    //! `accessRightsNotify(noRights)`. Rust hand-rolled it three times and
+    //! only the echo-timeout path reset the access rights. These tests pin
+    //! the invariant on the owner, once per path.
+    use super::*;
+    use epics_base_rs::runtime::sync::broadcast;
+    use tokio::sync::oneshot;
+
+    fn addr() -> SocketAddr {
+        "127.0.0.1:5064".parse().unwrap()
+    }
+
+    /// A Connected channel holding read+write rights — the pre-condition
+    /// that makes the missing no-rights transition observable.
+    fn connected_channel(
+        cid: u32,
+        priority: u8,
+    ) -> (ChannelInner, broadcast::Receiver<ConnectionEvent>) {
+        let (conn_tx, conn_rx) = broadcast::channel(16);
+        let ch = ChannelInner {
+            cid,
+            pv_name: format!("TEST:PV{cid}"),
+            priority,
+            state: ChannelState::Connected,
+            sid: 7,
+            native_type: None,
+            element_count: 1,
+            server_addr: Some(addr()),
+            access_rights: AccessRights {
+                read: true,
+                write: true,
+            },
+            connect_waiters: Vec::new(),
+            conn_tx,
+            reconnect_count: 0,
+            last_connected_at: None,
+        };
+        (ch, conn_rx)
+    }
+
+    fn drain_events(rx: &mut broadcast::Receiver<ConnectionEvent>) -> Vec<ConnectionEvent> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            out.push(ev);
+        }
+        out
+    }
+
+    /// R18-19: a circuit that dies with channels on it raises ECA_DISCONN on
+    /// the global exception hook — C `cac::destroyIIU` (`cac.cpp:1236-1240`),
+    /// gated on `iiu.channelCount()`. Pre-fix the circuit-gone path dispatched
+    /// no exception at all, so a handler installed the way C library users do
+    /// it (to log IOC loss) saw nothing. An empty circuit raises nothing, same
+    /// gate as C.
+    #[tokio::test(flavor = "current_thread")]
+    async fn r18_19_circuit_death_raises_eca_disconn() {
+        for (channels_on_circuit, want) in [(1usize, 1usize), (0, 0)] {
+            let mut channels = HashMap::new();
+            let mut server_channels: HashMap<types::CircuitKey, HashSet<u32>> = HashMap::new();
+            if channels_on_circuit > 0 {
+                let (ch, _rx) = connected_channel(42, 0);
+                channels.insert(42u32, ch);
+                server_channels.insert((addr(), 0), HashSet::from([42u32]));
+            }
+            let mut subscriptions = SubscriptionRegistry::new();
+            let (search_tx, _search_rx) = mpsc::unbounded_channel();
+            let diag = CaDiagnostics::default();
+            let in_flight = types::InFlightOps::new();
+            let snapshots: ChannelSnapshots = Arc::new(dashmap::DashMap::new());
+
+            let raised: Arc<parking_lot::Mutex<Vec<(u32, String, types::ExceptionSite)>>> =
+                Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let sink = raised.clone();
+            let slot: types::CaExceptionSlot = Arc::new(parking_lot::RwLock::new(Some(Arc::new(
+                move |exc: &types::CaException| {
+                    sink.lock()
+                        .push((exc.status.unwrap_or(0), exc.message.clone(), exc.source));
+                },
+            ))));
+
+            handle_disconnect(
+                &mut channels,
+                &mut subscriptions,
+                &mut server_channels,
+                &search_tx,
+                (addr(), 0),
+                &diag,
+                &in_flight,
+                &snapshots,
+                &slot,
+            );
+
+            let got = raised.lock().clone();
+            assert_eq!(
+                got.len(),
+                want,
+                "channels on circuit = {channels_on_circuit}: C gates the \
+                 genLocalExcep on `iiu.channelCount()`"
+            );
+            if let Some((status, ctx, source)) = got.first() {
+                assert_eq!(*status, crate::protocol::ECA_DISCONN);
+                // Context is the resolved peer name, not a port-invented
+                // sentence; `Source File:` is present because `genLocalExcep`
+                // always passes `__FILE__`/`__LINE__`.
+                assert!(
+                    !ctx.is_empty() && !ctx.contains("circuit"),
+                    "context: {ctx}"
+                );
+                assert_eq!(*source, types::LIBCA_CIRCUIT_DISCONNECT_SITE);
+            }
+        }
+    }
+
+    /// TCP circuit close (C `tcpiiu::disconnectAllChannels`,
+    /// `tcpiiu.cpp:1848-1855`): the channel must drop to no-rights and the
+    /// subscriber must see `AccessRightsChanged { false, false }` after
+    /// `Disconnected`. Pre-fix the cached rights stayed read+write until
+    /// reconnect and no rights event was emitted at all.
+    #[tokio::test(flavor = "current_thread")]
+    async fn r8_17_tcp_close_drops_the_channel_to_no_rights() {
+        let mut channels = HashMap::new();
+        let (ch, mut conn_rx) = connected_channel(42, 0);
+        channels.insert(42u32, ch);
+        let mut subscriptions = SubscriptionRegistry::new();
+        let mut server_channels: HashMap<types::CircuitKey, HashSet<u32>> = HashMap::new();
+        let (search_tx, _search_rx) = mpsc::unbounded_channel();
+        let diag = CaDiagnostics::default();
+        let in_flight = types::InFlightOps::new();
+        let snapshots: ChannelSnapshots = Arc::new(dashmap::DashMap::new());
+
+        handle_disconnect(
+            &mut channels,
+            &mut subscriptions,
+            &mut server_channels,
+            &search_tx,
+            (addr(), 0),
+            &diag,
+            &in_flight,
+            &snapshots,
+            &types::CaExceptionSlot::default(),
+        );
+
+        let ch = channels.get(&42).expect("channel stays registered");
+        assert_eq!(ch.state, ChannelState::Disconnected);
+        assert!(
+            !ch.access_rights.read && !ch.access_rights.write,
+            "C `setServerAddressUnknown` clears both permits on circuit close"
+        );
+        assert_eq!(
+            drain_events(&mut conn_rx),
+            vec![
+                ConnectionEvent::Disconnected,
+                ConnectionEvent::AccessRightsChanged {
+                    read: false,
+                    write: false
+                },
+            ],
+            "C fires disconnectNotify then accessRightsNotify(noRights)"
+        );
+    }
+
+    /// `CA_PROTO_SERVER_DISCONN` (C `cac::disconnectChannel`,
+    /// `cac.cpp:1185-1195`) runs the identical transition, scoped to one
+    /// cid — and must not touch a sibling channel on the same circuit.
+    #[tokio::test(flavor = "current_thread")]
+    async fn r8_17_server_disconnect_drops_only_that_channel_to_no_rights() {
+        let mut channels = HashMap::new();
+        let (ch, mut conn_rx) = connected_channel(42, 0);
+        let (other, mut other_rx) = connected_channel(43, 0);
+        channels.insert(42u32, ch);
+        channels.insert(43u32, other);
+        let mut subscriptions = SubscriptionRegistry::new();
+        let in_flight = types::InFlightOps::new();
+        let snapshots: ChannelSnapshots = Arc::new(dashmap::DashMap::new());
+        let (search_tx, mut search_rx) = mpsc::unbounded_channel();
+        let exception_slot: types::CaExceptionSlot = Default::default();
+
+        handle_server_disconnect(
+            &mut channels,
+            &mut subscriptions,
+            &search_tx,
+            42,
+            addr(),
+            &in_flight,
+            &snapshots,
+            &exception_slot,
+        );
+        assert!(
+            matches!(
+                search_rx.try_recv(),
+                Ok(SearchRequest::Schedule { cid: 42, .. })
+            ),
+            "SERVER_DISCONN re-searches the retired channel"
+        );
+
+        let ch = channels.get(&42).unwrap();
+        assert_eq!(ch.state, ChannelState::Disconnected);
+        assert!(
+            !ch.access_rights.read && !ch.access_rights.write,
+            "SERVER_DISCONN must reset access rights (C disconnectChannel)"
+        );
+        assert_eq!(
+            drain_events(&mut conn_rx),
+            vec![
+                ConnectionEvent::Disconnected,
+                ConnectionEvent::AccessRightsChanged {
+                    read: false,
+                    write: false
+                },
+            ]
+        );
+
+        let other = channels.get(&43).unwrap();
+        assert_eq!(other.state, ChannelState::Connected);
+        assert!(
+            other.access_rights.read && other.access_rights.write,
+            "a sibling cid on the same circuit is untouched"
+        );
+        assert!(drain_events(&mut other_rx).is_empty());
+    }
+
+    /// R18-18: the echo-timeout path keeps its own *internal* terminal state
+    /// (`Unresponsive` selects the re-subscribe-on-the-live-socket recovery),
+    /// but the application sees the ordinary `Disconnected`: C's
+    /// `nciu::unresponsiveCircuitNotify` (`nciu.cpp:170`) calls the same
+    /// `disconnectNotify()` — `CA_OP_CONN_DOWN` — as a socket close.
+    #[tokio::test(flavor = "current_thread")]
+    async fn r18_18_unresponsive_is_a_disconnect_for_the_application() {
+        let mut channels = HashMap::new();
+        let (ch, mut conn_rx) = connected_channel(42, 0);
+        channels.insert(42u32, ch);
+        let mut subscriptions = SubscriptionRegistry::new();
+        let in_flight = types::InFlightOps::new();
+        let snapshots: ChannelSnapshots = Arc::new(dashmap::DashMap::new());
+
+        disconnect_channels(
+            &mut channels,
+            &mut subscriptions,
+            &in_flight,
+            &snapshots,
+            DisconnectKind::Unresponsive,
+            |ch| ch.state == ChannelState::Connected,
+            |_| {},
+        );
+
+        let ch = channels.get(&42).unwrap();
+        assert_eq!(ch.state, ChannelState::Unresponsive);
+        assert!(!ch.access_rights.read && !ch.access_rights.write);
+        assert_eq!(
+            drain_events(&mut conn_rx),
+            vec![
+                ConnectionEvent::Disconnected,
+                ConnectionEvent::AccessRightsChanged {
+                    read: false,
+                    write: false
+                },
+            ]
+        );
+    }
+
+    /// R8-20: the IO failures must be delivered BEFORE the connection
+    /// event. C `nciu::unresponsiveCircuitNotify` (`nciu.cpp:168-170`) calls
+    /// `disconnectAllIO` and only then `disconnectNotify`, so an application
+    /// reacting to "channel down" never finds an IO of that channel still
+    /// pending.
+    ///
+    /// Observing the order: both consumers park on their channels before the
+    /// transition runs, and the transition runs on the `block_on` future of a
+    /// `current_thread` runtime — so the two wakes land on the scheduler's
+    /// injection queue in send order and the tasks run in that order. The
+    /// recorded sequence is therefore the send sequence.
+    #[tokio::test(flavor = "current_thread")]
+    async fn r8_20_io_failures_are_delivered_before_the_disconnect_event() {
+        let mut channels = HashMap::new();
+        let (ch, mut conn_rx) = connected_channel(42, 0);
+        channels.insert(42u32, ch);
+        let mut subscriptions = SubscriptionRegistry::new();
+        let in_flight = types::InFlightOps::new();
+        let snapshots: ChannelSnapshots = Arc::new(dashmap::DashMap::new());
+
+        let (rtx, rrx) = oneshot::channel();
+        in_flight.reads.insert(
+            1,
+            types::ReadWaiter::OneShot {
+                cid: 42,
+                mode: types::ReadReplyMode::Raw,
+                reply_tx: rtx,
+            },
+        );
+
+        let order: Arc<std::sync::Mutex<Vec<&'static str>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let io_order = order.clone();
+        let io_task = tokio::spawn(async move {
+            let got = rrx.await.expect("read waiter must be woken");
+            assert!(matches!(got, Err(CaError::Disconnected)));
+            io_order.lock().unwrap().push("io");
+        });
+        let conn_order = order.clone();
+        let conn_task = tokio::spawn(async move {
+            let ev = conn_rx.recv().await.expect("connection event");
+            assert_eq!(ev, ConnectionEvent::Disconnected);
+            conn_order.lock().unwrap().push("conn");
+        });
+
+        // Let both consumers park on their awaits.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            order.lock().unwrap().is_empty(),
+            "nothing may be delivered before the transition runs"
+        );
+
+        disconnect_channels(
+            &mut channels,
+            &mut subscriptions,
+            &in_flight,
+            &snapshots,
+            DisconnectKind::CircuitGone,
+            |ch| ch.cid == 42,
+            |_| {},
+        );
+
+        io_task.await.unwrap();
+        conn_task.await.unwrap();
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec!["io", "conn"],
+            "C fails the channel's pending IOs (disconnectAllIO) before it \
+             signals the disconnect (disconnectNotify)"
+        );
+    }
+
+    /// Pending IOs still fail with `Disconnected` on every path through the
+    /// owner — the fan-out must not be lost in the refactor.
+    #[tokio::test(flavor = "current_thread")]
+    async fn owner_fails_pending_ios_on_every_path() {
+        for kind in [DisconnectKind::CircuitGone, DisconnectKind::Unresponsive] {
+            let mut channels = HashMap::new();
+            let (ch, _rx) = connected_channel(42, 0);
+            channels.insert(42u32, ch);
+            let mut subscriptions = SubscriptionRegistry::new();
+            let in_flight = types::InFlightOps::new();
+            let snapshots: ChannelSnapshots = Arc::new(dashmap::DashMap::new());
+
+            let (rtx, rrx) = oneshot::channel();
+            let (wtx, wrx) = oneshot::channel();
+            in_flight.reads.insert(
+                1,
+                types::ReadWaiter::OneShot {
+                    cid: 42,
+                    mode: types::ReadReplyMode::Raw,
+                    reply_tx: rtx,
+                },
+            );
+            in_flight.writes.insert(2, (42, wtx));
+
+            disconnect_channels(
+                &mut channels,
+                &mut subscriptions,
+                &in_flight,
+                &snapshots,
+                kind,
+                |ch| ch.cid == 42,
+                |_| {},
+            );
+
+            assert!(
+                matches!(rrx.await, Ok(Err(CaError::Disconnected))),
+                "{kind:?}: pending read must fail with Disconnected"
+            );
+            assert!(
+                matches!(wrx.await, Ok(Err(CaError::Disconnected))),
+                "{kind:?}: pending write must fail with Disconnected"
+            );
+        }
     }
 }

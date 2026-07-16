@@ -1,6 +1,6 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, MENU_SIMM, ProcessAction, ProcessOutcome, Record};
-use crate::types::{DbFieldType, EpicsValue, PvString};
+use crate::server::record::{MENU_SIMM, ProcessAction, ProcessOutcome, Record};
+use crate::types::{EpicsValue, PvString};
 
 /// Binary output record matching C boRecord behavior.
 /// VAL is converted to RVAL using MASK before writing to hardware.
@@ -111,161 +111,39 @@ impl BoRecord {
     }
 }
 
-/// Try to parse a DOL string as a constant value.
-///
-/// C `recGblInitConstantLink(&prec->dol, DBF_USHORT, …)` converts the
-/// constant link string with the field's type. Plain decimal, hex
-/// (`0x…`), negative (wraps mod 2^16) and floating-point (`1.0`)
-/// forms all convert to a `DBF_USHORT`. The naive `parse::<u16>()`
-/// rejected every one of those except a plain non-negative decimal.
-fn dol_as_constant(dol: &str) -> Option<u16> {
-    let s = dol.trim();
-    if s.is_empty() {
-        return None;
-    }
-    // Hex form (0x.. / -0x..).
-    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-        return u32::from_str_radix(hex, 16).ok().map(|v| v as u16);
-    }
-    if let Some(hex) = s.strip_prefix("-0x").or_else(|| s.strip_prefix("-0X")) {
-        return u32::from_str_radix(hex, 16)
-            .ok()
-            .map(|v| (v as i32).wrapping_neg() as u16);
-    }
-    // Decimal integer (handles negatives via wrap-around).
-    if let Ok(v) = s.parse::<i64>() {
-        return Some(v as u16);
-    }
-    // Floating-point constant — DBF_USHORT truncates toward zero.
-    if let Ok(v) = s.parse::<f64>() {
-        if v.is_finite() {
-            return Some(v as i64 as u16);
-        }
-    }
-    None
-}
-
-static FIELDS: &[FieldDesc] = &[
-    FieldDesc {
-        name: "VAL",
-        dbf_type: DbFieldType::Enum,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "RVAL",
-        dbf_type: DbFieldType::ULong,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ORAW",
-        dbf_type: DbFieldType::ULong,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "RBV",
-        dbf_type: DbFieldType::ULong,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "ORBV",
-        dbf_type: DbFieldType::ULong,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "MASK",
-        dbf_type: DbFieldType::ULong,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ZNAM",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ONAM",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ZSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "COSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LALM",
-        dbf_type: DbFieldType::UShort,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "MLST",
-        dbf_type: DbFieldType::UShort,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "OMSL",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DOL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "HIGH",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "IVOA",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "IVOV",
-        dbf_type: DbFieldType::UShort,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIMM",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIML",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIOL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIMS",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SDLY",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-];
-
 impl Record for BoRecord {
     fn record_type(&self) -> &'static str {
         "bo"
+    }
+
+    /// C `boRecord.c:192-205`: `process()` clears `udf` to FALSE only on a
+    /// successful closed-loop DOL fetch (`if (RTN_SUCCESS(status)) prec->udf =
+    /// FALSE;`); the no-DOL arm reads the current VAL and leaves `udf` alone, so
+    /// `checkAlarms` (`:371-372`) raises UDF_ALARM every cycle for a bare record.
+    /// `udf` is never re-derived from the stored VAL, so bo opts out of the
+    /// framework's blanket per-cycle clear. The definers are a direct VAL put
+    /// (`dbPut`, `field_io.rs`) and the DOL-apply site (`processing.rs`).
+    fn clears_udf(&self) -> bool {
+        false
+    }
+
+    /// C `boRecord.c:371` tests `if (prec->udf == TRUE)` — exact-one. Combined
+    /// with `clears_udf() == false`, a direct `caput X.UDF 255` (or `-1`,
+    /// stored `255`) leaves `udf == 255` at `checkAlarms`, and `255 != TRUE`,
+    /// so C raises NO UDF_ALARM — STAT/SEVR stay `NO_ALARM`. See
+    /// [`Record::udf_alarm_on_exact_one`].
+    fn udf_alarm_on_exact_one(&self) -> bool {
+        true
+    }
+
+    /// C `devBoSoftRaw::write_bo` (`devBoSoftRaw.c:47-54`):
+    /// `dbPutLink(&prec->out, DBR_LONG, &prec->rval, 1)` — the RAW word
+    /// (`VAL ? MASK : 0`), not the `VAL` that `devBoSoft` writes.
+    /// C `devBoSoftRaw.c::write_bo` (65): `dbPutLink(&prec->out, DBR_LONG,
+    /// &prec->rval, 1)`. RVAL is DBF_ULONG; C hands its bit pattern to a
+    /// DBR_LONG put, so the cast is C's reinterpretation, not a range clamp.
+    fn raw_soft_output_value(&self) -> Option<EpicsValue> {
+        Some(EpicsValue::Long(self.rval as i32))
     }
 
     // C recBo.c IVOA=set_to_IVOV: val = ivov; rval = ivov.
@@ -282,23 +160,27 @@ impl Record for BoRecord {
         self.put_field("VAL", EpicsValue::Enum(v))
     }
 
-    fn init_record(&mut self, pass: u8) -> CaResult<()> {
-        if pass == 0 {
-            // DOL constant initialization: normalize to 0/1 (like C: !!ival)
-            if let Some(v) = dol_as_constant(&self.dol) {
-                self.val = if v != 0 { 1 } else { 0 };
-            }
+    /// C `boRecord.c:146-149`:
+    /// `if (recGblInitConstantLink(&prec->dol, DBF_USHORT, &ival)) {
+    ///      prec->val = !!ival; prec->udf = FALSE; }`
+    /// — the constant loads into a temporary and VAL takes its BOOLEAN, so
+    /// `field(DOL,"5")` leaves VAL=1. Declared for the init-seed owner, which
+    /// applies the `!!` and clears UDF.
+    fn constant_init_links(&self) -> Vec<crate::server::record::ConstantInitLink> {
+        vec![crate::server::record::ConstantInitLink::dol_to_bool_val(
+            "DOL", "VAL",
+        )]
+    }
 
-            // Convert val to rval
-            self.val_to_rval();
-
-            // Initialize tracking fields
-            self.mlst = self.val;
-            self.lalm = self.val;
-            self.oraw = self.rval;
-            self.orbv = self.rbv;
-        }
-        Ok(())
+    /// C `boRecord.c:163-172` — the init tail, run right after the constant
+    /// load: convert VAL to RVAL through MASK, then
+    /// `mlst = lalm = val; oraw = rval; orbv = rbv`.
+    fn seed_deadband_tracking(&mut self) {
+        self.val_to_rval();
+        self.mlst = self.val;
+        self.lalm = self.val;
+        self.oraw = self.rval;
+        self.orbv = self.rbv;
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
@@ -379,26 +261,39 @@ impl Record for BoRecord {
         true
     }
 
-    /// C `boRecord.c::checkAlarms` — STATE alarm (ZSV for VAL=0,
-    /// OSV for VAL=1) and COS alarm (COSV). The framework's
-    /// `rec_gbl_check_udf` raises the UDF alarm separately; unlike
-    /// `bi`, C `boRecord.c::checkAlarms` evaluates STATE/COS even
-    /// when UDF is set, so this method does not early-return on UDF.
+    /// C `boRecord.c::checkAlarms` (`:366-387`) — the UDF alarm FIRST, then the
+    /// STATE alarm (ZSV for VAL=0, OSV for VAL=1), then COS (COSV). The udf
+    /// raise must lead: C `recGblSetSevr` overrides STAT/SEVR only when the new
+    /// severity is strictly greater (recGbl.c:242 `if (nsev < new_sevr)`), so on
+    /// a fresh record with `UDFS == ZSV == INVALID` the equal-severity STATE
+    /// alarm cannot displace the UDF that was set first — STAT stays UDF. Unlike
+    /// `bi`, C bo does NOT early-return on UDF, so STATE/COS still evaluate.
+    /// Raising it here (idempotent with the framework's `rec_gbl_check_udf`,
+    /// which runs after this hook) is what puts UDF ahead of STATE.
     fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
         use crate::server::recgbl::{self, alarm_status};
         use crate::server::record::AlarmSeverity;
 
+        // C `boRecord.c:371` — `if (prec->udf == TRUE)` (exact-one, see
+        // `udf_alarm_on_exact_one`), raised before STATE, with no early return.
+        if recgbl::udf_alarm_active(common.udf, true) {
+            recgbl::rec_gbl_set_sevr(
+                common,
+                alarm_status::UDF_ALARM,
+                AlarmSeverity::from_u16(common.udfs as u16),
+            );
+        }
+
+        // STATE/COS use the RAW severity ordinal (ZSV/OSV/COSV are DBF_MENU
+        // stored raw i16): C `recGblSetSevr(prec, STATE_ALARM, prec->zsv)`
+        // compares the raw `epicsEnum16`, so an out-of-range `ZSV=4`/`65535`
+        // numerically exceeds a prior UDF's INVALID(3) and overrides it. See
+        // `rec_gbl_set_sevr_raw`. VAL is 0/1, so the branch picks ZSV or OSV.
         let val = self.val;
         let state_sev = if val == 0 { self.zsv } else { self.osv };
-        let sev = AlarmSeverity::from_u16(state_sev as u16);
-        if sev != AlarmSeverity::NoAlarm {
-            recgbl::rec_gbl_set_sevr(common, alarm_status::STATE_ALARM, sev);
-        }
+        recgbl::rec_gbl_set_sevr_raw(common, alarm_status::STATE_ALARM, state_sev as u16);
         if val != self.lalm {
-            let cos_sev = AlarmSeverity::from_u16(self.cosv as u16);
-            if cos_sev != AlarmSeverity::NoAlarm {
-                recgbl::rec_gbl_set_sevr(common, alarm_status::COS_ALARM, cos_sev);
-            }
+            recgbl::rec_gbl_set_sevr_raw(common, alarm_status::COS_ALARM, self.cosv as u16);
             self.lalm = val;
         }
     }
@@ -447,19 +342,19 @@ impl Record for BoRecord {
                     self.val = v as u16;
                     Ok(())
                 }
-                // PR/issue #183 — accept ZNAM/ONAM string.
-                EpicsValue::String(s) => {
-                    if s == self.znam {
-                        self.val = 0;
-                        Ok(())
-                    } else if s == self.onam {
-                        self.val = 1;
-                        Ok(())
-                    } else {
-                        Err(CaError::TypeMismatch(format!(
-                            "bo VAL: '{s}' matches neither ZNAM nor ONAM"
-                        )))
+                // C rset `put_enum_str` (boRecord.c), reached from
+                // `dbConvert.c::putStringEnum` — one converter, shared with the
+                // framework's put paths (see `Record::enum_state_strings`).
+                EpicsValue::String(ref s) => {
+                    let resolved = crate::server::record::resolve_enum_state_string(
+                        "VAL",
+                        self.enum_state_strings().as_deref(),
+                        s,
+                    )?;
+                    if let EpicsValue::Enum(v) = resolved {
+                        self.val = v;
                     }
+                    Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
@@ -625,10 +520,6 @@ impl Record for BoRecord {
         }
     }
 
-    fn field_list(&self) -> &'static [FieldDesc] {
-        FIELDS
-    }
-
     /// `SIMM` is `DBF_MENU menu(menuSimm)` (`boRecord.dbd.pod`): the binary
     /// records carry the three-choice NO/YES/RAW simulation menu. Served as
     /// `DBR_ENUM` with these labels. `SIMS`/`OLDSIMM`/`OMSL`/`IVOA` are
@@ -638,6 +529,23 @@ impl Record for BoRecord {
             "SIMM" => Some(MENU_SIMM),
             _ => None,
         }
+    }
+
+    /// C rset `get_enum_strs`/`put_enum_str` (boRecord.c) — ZNAM/ONAM.
+    fn enum_state_strings(&self) -> Option<Vec<PvString>> {
+        Some(crate::server::record::binary_enum_states(
+            &self.znam, &self.onam,
+        ))
+    }
+
+    /// C `get_enum_str` (boRecord.c:320-339): VAL 0 -> ZNAM, 1 -> ONAM, and any
+    /// other index -> `"Illegal_Value"`. Slot 1 is indexed even when ONAM is
+    /// empty, so it renders empty — the `no_str` trim in `enum_state_strings`
+    /// is the LABEL list's, not this read's.
+    fn enum_string_form(&self) -> Option<crate::server::snapshot::EnumStringForm> {
+        Some(crate::server::record::binary_enum_string_form(
+            &self.znam, &self.onam,
+        ))
     }
 
     /// VAL posts DBE_VALUE|DBE_LOG

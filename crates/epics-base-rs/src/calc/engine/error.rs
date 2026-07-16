@@ -17,13 +17,31 @@ pub enum CalcError {
     BadSeparator,
     BadAssignment,
     TypeMismatch,
-    LengthMismatch,
     InvalidFormat,
-    LoopLimitExceeded,
     EmptyArray,
     InvalidSubrange,
     BracketNotOpen,
     BraceNotOpen,
+    DomainError,
+    EmptyProgram,
+    /// aCalc's polynomial fit failed — fewer than three points in the window, or a
+    /// singular normal matrix (`calcUtil.c:271`, `:297`). C's `fitpoly` returns -1,
+    /// which DERIV/NDERIV/FITPOLY/FITMPOLY/FITQ/FITMQ assign to `status`
+    /// (`aCalcPerform.c:613`, `:985`, `:1008`, `:1029`, `:1221`, `:1270`).
+    FitFailed,
+    /// The expression did not end with EXACTLY one value on the value stack.
+    ///
+    /// C's `if (ps != top) { freeStack(...); return(-1); }` (`aCalcPerform.c:1607-1618`).
+    /// `ps` starts one BELOW `top` (`:418-419`, `top = ps = &stack[1]; ps--;`), so
+    /// `ps == top` means depth exactly 1 — an expression that leaked an operand and
+    /// one that consumed too many are both a hard -1, and C writes neither
+    /// `p_dresult` nor `p_aresult`.
+    ///
+    /// This is an INVARIANT, not a reachable divergence: a program that
+    /// `aCalcPostfix` accepts always balances, and no expression has been found that
+    /// trips it while the port returns a value. It exists so that a future opcode
+    /// which forgets to pop cannot silently publish the wrong stack cell as VAL/AVAL.
+    StackLeak,
 }
 
 impl fmt::Display for CalcError {
@@ -44,13 +62,15 @@ impl fmt::Display for CalcError {
             CalcError::BadSeparator => write!(f, "Comma without enclosing parentheses"),
             CalcError::BadAssignment => write!(f, "Bad assignment target"),
             CalcError::TypeMismatch => write!(f, "Type mismatch: mixed numeric/string operation"),
-            CalcError::LengthMismatch => write!(f, "Array length mismatch in binary operation"),
             CalcError::InvalidFormat => write!(f, "Invalid format string"),
-            CalcError::LoopLimitExceeded => write!(f, "Loop iteration limit exceeded"),
             CalcError::EmptyArray => write!(f, "Operation on empty array"),
             CalcError::InvalidSubrange => write!(f, "Invalid subrange specification"),
             CalcError::BracketNotOpen => write!(f, "Close bracket found without open"),
             CalcError::BraceNotOpen => write!(f, "Close brace found without open"),
+            CalcError::DomainError => write!(f, "Operand outside the operator's domain"),
+            CalcError::EmptyProgram => write!(f, "Empty postfix program"),
+            CalcError::FitFailed => write!(f, "Polynomial fit failed"),
+            CalcError::StackLeak => write!(f, "Too many results returned"),
         }
     }
 }
@@ -64,8 +84,10 @@ impl CalcError {
     /// record-level `perror` reporting stays within the documented range.
     pub fn code(&self) -> i16 {
         match self {
-            // CALC_ERR_TOOMANY        = 1
-            CalcError::TooMany => 1,
+            // CALC_ERR_TOOMANY        = 1. `StackLeak` is the RUNTIME form of the
+            // same thing — an expression that ended with an operand left over — so
+            // it reports the same code and the same string.
+            CalcError::TooMany | CalcError::StackLeak => 1,
             // CALC_ERR_BAD_LITERAL    = 2
             CalcError::BadLiteral => 2,
             // CALC_ERR_BAD_ASSIGNMENT = 3
@@ -83,17 +105,23 @@ impl CalcError {
             // CALC_ERR_UNDERFLOW      = 9
             CalcError::Underflow => 9,
             // CALC_ERR_OVERFLOW       = 10
-            CalcError::Overflow | CalcError::LoopLimitExceeded => 10,
+            CalcError::Overflow => 10,
             // CALC_ERR_SYNTAX         = 11
             CalcError::Syntax
             | CalcError::DivisionByZero
             | CalcError::TypeMismatch
-            | CalcError::LengthMismatch
             | CalcError::InvalidFormat
             | CalcError::EmptyArray
-            | CalcError::InvalidSubrange => 11,
-            // CALC_ERR_NULL_ARG       = 12
-            CalcError::NullArg => 12,
+            | CalcError::InvalidSubrange
+            | CalcError::DomainError
+            | CalcError::FitFailed => 11,
+            // CALC_ERR_NULL_ARG       = 12. `EmptyProgram` is an *evaluation*
+            // failure — C's `perform()` returns a bare -1 with no error code
+            // (`calcPerform.c:419-420`, `sCalcPerform.c:396`,
+            // `aCalcPerform.c:312-314`) — so it has no C code of its own; 12 is
+            // the nearest, and is what base `postfix()` calls the empty
+            // expression that produces such a program.
+            CalcError::NullArg | CalcError::EmptyProgram => 12,
             // CALC_ERR_INTERNAL       = 13
             CalcError::Internal => 13,
         }

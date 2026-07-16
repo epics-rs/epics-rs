@@ -401,7 +401,7 @@ record(epid, "TEST:PIDSUP") {
     let udf = server.get("TEST:PIDSUP.UDF").await.unwrap();
     assert_eq!(
         udf,
-        EpicsValue::Char(1),
+        EpicsValue::UChar(1),
         "UDF must stay set for a supervisory empty-STPL epid"
     );
 }
@@ -472,7 +472,7 @@ record(epid, "TEST:PIDCL") {
     let udf = server.get("TEST:PIDCL.UDF").await.unwrap();
     assert_eq!(
         udf,
-        EpicsValue::Char(0),
+        EpicsValue::UChar(0),
         "closed-loop epid with a resolved STPL must have UDF cleared"
     );
 
@@ -557,7 +557,7 @@ record(epid, "TEST:PIDCLF") {
     let udf = server.get("TEST:PIDCLF.UDF").await.unwrap();
     assert_eq!(
         udf,
-        EpicsValue::Char(1),
+        EpicsValue::UChar(1),
         "UDF must stay set when the STPL fetch fails"
     );
 }
@@ -604,8 +604,11 @@ record(timestamp, "TEST:TS") {
 
     let rval = server.get("TEST:TS.RVAL").await.unwrap();
     match rval {
-        EpicsValue::Long(v) => assert!(v > 0, "RVAL should be positive"),
-        other => panic!("expected Long, got {:?}", other),
+        // `field(RVAL,DBF_ULONG)` (`timestampRecord.dbd:28`) — unsigned
+        // seconds past the EPICS epoch. Expected `Long` while the port's
+        // hand-written field table declared RVAL `DBF_LONG`.
+        EpicsValue::ULong(v) => assert!(v > 0, "RVAL should be positive"),
+        other => panic!("expected ULong, got {:?}", other),
     }
 }
 
@@ -641,7 +644,7 @@ record(timestamp, "TEST:TSNP") {
     // RVAL starts 0 — no PINI, nothing has processed yet.
     assert_eq!(
         server.get("TEST:TSNP.RVAL").await.unwrap(),
-        EpicsValue::Long(0),
+        EpicsValue::ULong(0),
         "RVAL must be 0 before any process"
     );
 
@@ -652,7 +655,7 @@ record(timestamp, "TEST:TSNP") {
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     assert_eq!(
         server.get("TEST:TSNP.RVAL").await.unwrap(),
-        EpicsValue::Long(0),
+        EpicsValue::ULong(0),
         "a put to TST must NOT process — RVAL must stay 0 (clock not re-read)"
     );
 
@@ -662,8 +665,8 @@ record(timestamp, "TEST:TSNP") {
         .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     match server.get("TEST:TSNP.RVAL").await.unwrap() {
-        EpicsValue::Long(v) => assert!(v > 0, "PROC must process and set RVAL > 0"),
-        other => panic!("expected Long, got {other:?}"),
+        EpicsValue::ULong(v) => assert!(v > 0, "PROC must process and set RVAL > 0"),
+        other => panic!("expected ULong, got {other:?}"),
     }
 }
 

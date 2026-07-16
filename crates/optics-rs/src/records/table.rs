@@ -7,13 +7,13 @@
 
 use std::any::Any;
 use std::f64::consts::PI;
-use std::sync::LazyLock;
 
+use super::dbd_generated;
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::record::{
-    FieldDesc, FieldMetadataOverride, ProcessAction, ProcessOutcome, Record,
+    FieldDeclaration, FieldDesc, FieldMetadataOverride, ProcessAction, ProcessOutcome, Record,
 };
-use epics_base_rs::types::{DbFieldType, EpicsValue, PvString};
+use epics_base_rs::types::{EpicsValue, PvString};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -1532,8 +1532,12 @@ fn polint(xa: &[f64], ya: &[f64], x: f64) -> Option<(f64, f64)> {
         d[i] = ya[i];
     }
 
+    // C is 1-based throughout (tableRecord.c:1918 `int i,m,ns=1;`): `ns` ends the
+    // search loop holding the 1-based index of the closest sample, and
+    // `*y=ya[ns--]` (:1934) then leaves it one lower. That post-decrement value
+    // is exactly the **0-based** index of the closest sample, so `ns` below is
+    // C's decremented `ns` with no further adjustment.
     let mut y = ya[ns];
-    ns = ns.saturating_sub(1);
     let mut dy = 0.0f64;
 
     for m in 1..n {
@@ -1549,14 +1553,18 @@ fn polint(xa: &[f64], ya: &[f64], x: f64) -> Option<(f64, f64)> {
             d[i] = hp * den;
             c[i] = ho * den;
         }
-        // Adjust ns for 0-based indexing: in the C code ns starts at 1-based
-        // and the test is `2*ns < (n-m)`.  Here ns is 0-based so the equivalent
-        // test becomes `2*(ns+1) < (n-m)`, i.e. `2*ns + 2 < n - m`.
-        dy = if 2 * (ns + 1) < n - m {
-            c[ns + 1]
+        // C: `*y += (*dy=(2*ns < (n-m) ? c[ns+1] : d[ns--]));` (:1945), with
+        // 1-based c/d — so C's `c[ns+1]` is 0-based `c[ns]` and C's `d[ns]` is
+        // 0-based `d[ns-1]`.
+        //
+        // The `d` branch cannot be reached at ns == 0: the test is then
+        // `0 < n-m`, and m only runs to n-1, so it always holds. (That is why C
+        // never reads its `d[0]`, which would alias the `c` half of `room[]`.)
+        dy = if 2 * ns < n - m {
+            c[ns]
         } else {
-            let v = d[ns];
-            ns = ns.saturating_sub(1);
+            let v = d[ns - 1];
+            ns -= 1;
             v
         };
         y += dy;
@@ -2181,900 +2189,8 @@ impl TableRecord {
 }
 
 // ===========================================================================
-// Field list (LazyLock + Box::leak)
-// ===========================================================================
-
-static ALL_FIELDS: LazyLock<Vec<FieldDesc>> = LazyLock::new(|| {
-    vec![
-        FieldDesc {
-            name: "VERS",
-            dbf_type: DbFieldType::Float,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "VAL",
-            dbf_type: DbFieldType::Double,
-            read_only: false,
-        },
-        // Geometry parameters
-        FieldDesc {
-            name: "LX",
-            dbf_type: DbFieldType::Double,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "LZ",
-            dbf_type: DbFieldType::Double,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "SX",
-            dbf_type: DbFieldType::Double,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "SY",
-            dbf_type: DbFieldType::Double,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "SZ",
-            dbf_type: DbFieldType::Double,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "RX",
-            dbf_type: DbFieldType::Double,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "RY",
-            dbf_type: DbFieldType::Double,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "RZ",
-            dbf_type: DbFieldType::Double,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "YANG",
-            dbf_type: DbFieldType::Double,
-            read_only: false,
-        },
-        // User coordinates
-        FieldDesc {
-            name: "AX",
-            dbf_type: DbFieldType::Double,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "AY",
-            dbf_type: DbFieldType::Double,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "AZ",
-            dbf_type: DbFieldType::Double,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "X",
-            dbf_type: DbFieldType::Double,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "Y",
-            dbf_type: DbFieldType::Double,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "Z",
-            dbf_type: DbFieldType::Double,
-            read_only: false,
-        },
-        // Offsets
-        FieldDesc {
-            name: "AX0",
-            dbf_type: DbFieldType::Double,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "AY0",
-            dbf_type: DbFieldType::Double,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "AZ0",
-            dbf_type: DbFieldType::Double,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "X0",
-            dbf_type: DbFieldType::Double,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "Y0",
-            dbf_type: DbFieldType::Double,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "Z0",
-            dbf_type: DbFieldType::Double,
-            read_only: false,
-        },
-        // True values
-        FieldDesc {
-            name: "AXL",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "AYL",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "AZL",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "XL",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "YL",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "ZL",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        // Readbacks
-        FieldDesc {
-            name: "AXRB",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "AYRB",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "AZRB",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "XRB",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "YRB",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "ZRB",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        // Encoder user
-        FieldDesc {
-            name: "EAX",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "EAY",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "EAZ",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "EX",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "EY",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "EZ",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        // Calculated user limits
-        FieldDesc {
-            name: "HLAX",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "HLAY",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "HLAZ",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "HLX",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "HLY",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "HLZ",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "LLAX",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "LLAY",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "LLAZ",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "LLX",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "LLY",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "LLZ",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        // User limits (absolute)
-        FieldDesc {
-            name: "UHAX",
-            dbf_type: DbFieldType::Double,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "UHAY",
-            dbf_type: DbFieldType::Double,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "UHAZ",
-            dbf_type: DbFieldType::Double,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "UHX",
-            dbf_type: DbFieldType::Double,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "UHY",
-            dbf_type: DbFieldType::Double,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "UHZ",
-            dbf_type: DbFieldType::Double,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "ULAX",
-            dbf_type: DbFieldType::Double,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "ULAY",
-            dbf_type: DbFieldType::Double,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "ULAZ",
-            dbf_type: DbFieldType::Double,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "ULX",
-            dbf_type: DbFieldType::Double,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "ULY",
-            dbf_type: DbFieldType::Double,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "ULZ",
-            dbf_type: DbFieldType::Double,
-            read_only: false,
-        },
-        // User limits (relative)
-        FieldDesc {
-            name: "UHAXR",
-            dbf_type: DbFieldType::Double,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "UHAYR",
-            dbf_type: DbFieldType::Double,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "UHAZR",
-            dbf_type: DbFieldType::Double,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "UHXR",
-            dbf_type: DbFieldType::Double,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "UHYR",
-            dbf_type: DbFieldType::Double,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "UHZR",
-            dbf_type: DbFieldType::Double,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "ULAXR",
-            dbf_type: DbFieldType::Double,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "ULAYR",
-            dbf_type: DbFieldType::Double,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "ULAZR",
-            dbf_type: DbFieldType::Double,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "ULXR",
-            dbf_type: DbFieldType::Double,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "ULYR",
-            dbf_type: DbFieldType::Double,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "ULZR",
-            dbf_type: DbFieldType::Double,
-            read_only: false,
-        },
-        // Motor drive links
-        FieldDesc {
-            name: "M0XL",
-            dbf_type: DbFieldType::String,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "M0YL",
-            dbf_type: DbFieldType::String,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "M1YL",
-            dbf_type: DbFieldType::String,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "M2XL",
-            dbf_type: DbFieldType::String,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "M2YL",
-            dbf_type: DbFieldType::String,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "M2ZL",
-            dbf_type: DbFieldType::String,
-            read_only: false,
-        },
-        // Motor drive values
-        FieldDesc {
-            name: "M0X",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "M0Y",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "M1Y",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "M2X",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "M2Y",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "M2Z",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        // Motor readback links
-        FieldDesc {
-            name: "R0XI",
-            dbf_type: DbFieldType::String,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "R0YI",
-            dbf_type: DbFieldType::String,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "R1YI",
-            dbf_type: DbFieldType::String,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "R2XI",
-            dbf_type: DbFieldType::String,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "R2YI",
-            dbf_type: DbFieldType::String,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "R2ZI",
-            dbf_type: DbFieldType::String,
-            read_only: false,
-        },
-        // Motor readback values
-        FieldDesc {
-            name: "R0X",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "R0Y",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "R1Y",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "R2X",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "R2Y",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "R2Z",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        // Encoder links
-        FieldDesc {
-            name: "E0XI",
-            dbf_type: DbFieldType::String,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "E0YI",
-            dbf_type: DbFieldType::String,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "E1YI",
-            dbf_type: DbFieldType::String,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "E2XI",
-            dbf_type: DbFieldType::String,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "E2YI",
-            dbf_type: DbFieldType::String,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "E2ZI",
-            dbf_type: DbFieldType::String,
-            read_only: false,
-        },
-        // Encoder motor values
-        FieldDesc {
-            name: "E0X",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "E0Y",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "E1Y",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "E2X",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "E2Y",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "E2Z",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        // Speed output links
-        FieldDesc {
-            name: "V0XL",
-            dbf_type: DbFieldType::String,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "V0YL",
-            dbf_type: DbFieldType::String,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "V1YL",
-            dbf_type: DbFieldType::String,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "V2XL",
-            dbf_type: DbFieldType::String,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "V2YL",
-            dbf_type: DbFieldType::String,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "V2ZL",
-            dbf_type: DbFieldType::String,
-            read_only: false,
-        },
-        // Speed values
-        FieldDesc {
-            name: "V0X",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "V0Y",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "V1Y",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "V2X",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "V2Y",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "V2Z",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        // Speed input links
-        FieldDesc {
-            name: "V0XI",
-            dbf_type: DbFieldType::String,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "V0YI",
-            dbf_type: DbFieldType::String,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "V1YI",
-            dbf_type: DbFieldType::String,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "V2XI",
-            dbf_type: DbFieldType::String,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "V2YI",
-            dbf_type: DbFieldType::String,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "V2ZI",
-            dbf_type: DbFieldType::String,
-            read_only: false,
-        },
-        // Motor hi limit links
-        FieldDesc {
-            name: "H0XL",
-            dbf_type: DbFieldType::String,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "H0YL",
-            dbf_type: DbFieldType::String,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "H1YL",
-            dbf_type: DbFieldType::String,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "H2XL",
-            dbf_type: DbFieldType::String,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "H2YL",
-            dbf_type: DbFieldType::String,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "H2ZL",
-            dbf_type: DbFieldType::String,
-            read_only: false,
-        },
-        // Motor hi limit values
-        FieldDesc {
-            name: "H0X",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "H0Y",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "H1Y",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "H2X",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "H2Y",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "H2Z",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        // Motor lo limit links
-        FieldDesc {
-            name: "L0XL",
-            dbf_type: DbFieldType::String,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "L0YL",
-            dbf_type: DbFieldType::String,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "L1YL",
-            dbf_type: DbFieldType::String,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "L2XL",
-            dbf_type: DbFieldType::String,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "L2YL",
-            dbf_type: DbFieldType::String,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "L2ZL",
-            dbf_type: DbFieldType::String,
-            read_only: false,
-        },
-        // Motor lo limit values
-        FieldDesc {
-            name: "L0X",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "L0Y",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "L1Y",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "L2X",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "L2Y",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "L2Z",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        // Control fields
-        FieldDesc {
-            name: "INIT",
-            dbf_type: DbFieldType::Short,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "ZERO",
-            dbf_type: DbFieldType::Short,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "SYNC",
-            dbf_type: DbFieldType::Short,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "READ",
-            dbf_type: DbFieldType::Short,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "SET",
-            dbf_type: DbFieldType::Enum,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "SSET",
-            dbf_type: DbFieldType::Short,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "SUSE",
-            dbf_type: DbFieldType::Short,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "LVIO",
-            dbf_type: DbFieldType::Short,
-            read_only: true,
-        },
-        // Display / config
-        FieldDesc {
-            name: "LEGU",
-            dbf_type: DbFieldType::String,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "AEGU",
-            dbf_type: DbFieldType::String,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "PREC",
-            dbf_type: DbFieldType::Short,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "MMAP",
-            dbf_type: DbFieldType::Long,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "GEOM",
-            dbf_type: DbFieldType::Enum,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "TORAD",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "AUNIT",
-            dbf_type: DbFieldType::Enum,
-            read_only: false,
-        },
-    ]
-});
-
-// ===========================================================================
 // Record trait implementation
 // ===========================================================================
-
-/// Record-specific `DBF_MENU` choice tables, in `.dbd` value order (the
-/// index↔string mapping is wire-visible to clients). Source: the C
-/// `tableRecord.dbd` menu definitions (optics module). `SET`/`GEOM`/`AUNIT`
-/// are already served as `DBR_ENUM`; these tables supply the labels the
-/// base record registry attaches to the snapshot.
-const TABLE_SET_CHOICES: &[&str] = &["Use", "Set"];
-const TABLE_GEOM_CHOICES: &[&str] = &["SRI", "GEOCARS", "NEWPORT", "PNC"];
-const TABLE_AUNIT_CHOICES: &[&str] = &["degrees", "ur"];
 
 /// Record-internal monitor posts that C `tableRecord.c` emits with a
 /// literal `DBE_VALUE` — never `DBE_LOG`. `monitor()` posts the thirteen
@@ -3870,21 +2986,8 @@ impl Record for TableRecord {
         }
     }
 
-    fn field_list(&self) -> &'static [FieldDesc] {
-        let fields: &Vec<FieldDesc> = &ALL_FIELDS;
-        unsafe { std::slice::from_raw_parts(fields.as_ptr(), fields.len()) }
-    }
-
-    /// `SET`/`GEOM`/`AUNIT` are `DBF_MENU` (`tableSET`/`tableGEOM`/
-    /// `tableAUNIT`, C `tableRecord.dbd`); served as `DBR_ENUM` with the
-    /// menu's choice labels in `.dbd` index order.
-    fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
-        match field {
-            "SET" => Some(TABLE_SET_CHOICES),
-            "GEOM" => Some(TABLE_GEOM_CHOICES),
-            "AUNIT" => Some(TABLE_AUNIT_CHOICES),
-            _ => None,
-        }
+    fn declared_fields(&self) -> &'static [FieldDesc] {
+        dbd_generated::TABLE_FIELDS
     }
 
     /// C `tableRecord.c` posts every record-internal change with a literal
@@ -4202,6 +3305,65 @@ mod tests {
         let ya = [0.0, 1.0, 4.0, 9.0, 16.0];
         let (y, _dy) = polint(&xa, &ya, 2.5).unwrap();
         assert!((y - 6.25).abs() < 1e-10, "polint quadratic: got {}", y);
+    }
+
+    #[test]
+    fn test_r6_62_polint_matches_c_at_every_starting_sample() {
+        // R6-62 / tableRecord.c:1918,1934,1945. C's `ns` is 1-based and
+        // `*y=ya[ns--]` leaves it at the 0-based index of the closest sample.
+        // The port decremented a 0-based `ns` a second time and clamped it with
+        // saturating_sub, so the c/d walk took the wrong tableau entries — for a
+        // target nearest sample 0 (`ns` clamped at 0 instead of going negative),
+        // and again whenever the d-branch walked `ns` down to 0 with iterations
+        // still to run.
+        //
+        // Neville's algorithm reconstructs the interpolating polynomial exactly,
+        // so a cubic through 4 samples must come back exactly for every x. `dy`
+        // (the last correction taken) is path-dependent and pins the index walk:
+        // the expected values below are printed by the unmodified C `polint`
+        // called as FindLimit does, `polint(&motor[-1], &user[-1], n, ...)`
+        // (tableRecord.c:1986).
+        let f = |x: f64| 2.0 * x * x * x - 3.0 * x * x + x - 5.0;
+        let xa = [0.0, 1.0, 2.0, 3.0];
+        let ya = [f(0.0), f(1.0), f(2.0), f(3.0)];
+
+        // (x, dy from C)
+        let cases = [
+            (0.10, 0.342),                 // nearest sample 0 — the cited case
+            (0.25, 0.65625),               // nearest sample 0
+            (0.49, 0.754_698_000_000_001), // nearest sample 0, at the tie edge
+            (0.90, 0.198),                 // nearest sample 1
+            (1.10, -0.198),                // nearest sample 1
+            (1.60, -0.768),                // nearest sample 2
+            (2.40, 2.688),                 // nearest sample 2
+            (2.90, -0.342),                // nearest sample 3 (last)
+            (3.40, 2.688),                 // extrapolation above the last sample
+            (-0.50, -3.75),                // extrapolation below sample 0
+        ];
+
+        for (x, want_dy) in cases {
+            let (y, dy) = polint(&xa, &ya, x).unwrap();
+            assert!(
+                (y - f(x)).abs() < 1e-9,
+                "x={x}: y={y}, want {} (Neville must be exact on a cubic)",
+                f(x)
+            );
+            assert!(
+                (dy - want_dy).abs() < 1e-9,
+                "x={x}: dy={dy}, want {want_dy} (C takes a different tableau path)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_r6_62_polint_two_samples_nearest_first() {
+        // n == 2 with the target nearest sample 0: only m == 1 runs, the test is
+        // `2*0 < 2-1` -> true, so C adds c[0-based 0]. The pre-fix code evaluated
+        // `2*(0+1) < 1` -> false and took d[0] instead.
+        let xa = [0.0, 10.0];
+        let ya = [100.0, 200.0]; // y = 100 + 10x
+        let (y, _dy) = polint(&xa, &ya, 1.0).unwrap();
+        assert!((y - 110.0).abs() < 1e-9, "got {y}, want 110");
     }
 
     #[test]
@@ -5985,7 +5147,7 @@ mod tests {
 #[cfg(test)]
 mod menu_choice_tests {
     use super::{Geometry, TableRecord};
-    use epics_base_rs::server::record::{Record, RecordInstance};
+    use epics_base_rs::server::record::RecordInstance;
     use epics_base_rs::types::EpicsValue;
 
     // GEOM is already served as DBR_ENUM; the menu_field_choices override
@@ -6005,14 +5167,27 @@ mod menu_choice_tests {
         );
     }
 
+    /// The choices a client sees are the DECLARATION's — `tableRecord.dbd`'s
+    /// `menu()` on each field. This used to assert them through
+    /// `Record::menu_field_choices`, a hand-written table that declared the
+    /// same menus a second time.
     #[test]
-    fn table_menu_field_choices_match_dbd() {
+    fn table_menu_choices_come_from_the_declaration() {
+        use epics_base_rs::server::record::FieldDeclaration;
         let rec = TableRecord::new();
-        assert_eq!(rec.menu_field_choices("SET"), Some(&["Use", "Set"][..]));
+        let menu = |name: &str| {
+            rec.field_list()
+                .iter()
+                .find(|f| f.name == name)
+                .unwrap_or_else(|| panic!("{name} is declared"))
+                .menu
+        };
+        assert_eq!(menu("SET"), Some(&["Use", "Set"][..]));
         assert_eq!(
-            rec.menu_field_choices("AUNIT"),
-            Some(&["degrees", "ur"][..])
+            menu("GEOM"),
+            Some(&["SRI", "GEOCARS", "NEWPORT", "PNC"][..])
         );
-        assert_eq!(rec.menu_field_choices("VAL"), None);
+        assert_eq!(menu("AUNIT"), Some(&["degrees", "ur"][..]));
+        assert_eq!(menu("VAL"), None);
     }
 }

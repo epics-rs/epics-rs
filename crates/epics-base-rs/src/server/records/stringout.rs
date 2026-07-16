@@ -1,6 +1,6 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, MENU_POST, MENU_YES_NO, ProcessOutcome, Record};
-use crate::types::{DbFieldType, EpicsValue, PvString};
+use crate::server::record::{MENU_POST, MENU_YES_NO, ProcessOutcome, Record};
+use crate::types::{EpicsValue, PvString};
 
 /// EPICS `MAX_STRING_SIZE` — `val`/`oval`/`ivov` are fixed 40-byte
 /// buffers in C `stringoutRecord.c`.
@@ -43,7 +43,14 @@ pub struct StringoutRecord {
     pub mpst: i16,
     /// `menu(stringoutPOST)` Post Archive Monitors (0=On Change, 1=Always).
     pub apst: i16,
+    /// C `monitor()`'s `strncmp(oval, val)` verdict for THIS cycle, captured
+    /// in `process()` before OVAL is committed — the framework reads it
+    /// afterwards, by which time `oval == val`.
+    value_changed: bool,
 }
+
+/// `menu(stringoutPOST)` — `stringoutRecord.dbd.pod`: 0 = On Change, 1 = Always.
+const MENU_POST_ALWAYS: i16 = 1;
 
 impl Default for StringoutRecord {
     fn default() -> Self {
@@ -61,6 +68,7 @@ impl Default for StringoutRecord {
             sdly: -1.0,
             mpst: 0,
             apst: 0,
+            value_changed: false,
         }
     }
 }
@@ -74,81 +82,9 @@ impl StringoutRecord {
     }
 }
 
-static STRINGOUT_FIELDS: &[FieldDesc] = &[
-    FieldDesc {
-        name: "VAL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OVAL",
-        dbf_type: DbFieldType::String,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "IVOA",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "IVOV",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OMSL",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DOL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIMM",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIML",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIOL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIMS",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SDLY",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "MPST",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "APST",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-];
-
 impl Record for StringoutRecord {
     fn record_type(&self) -> &'static str {
         "stringout"
-    }
-
-    fn field_list(&self) -> &'static [FieldDesc] {
-        STRINGOUT_FIELDS
     }
 
     /// `SIMM` is `DBF_MENU menu(menuYesNo)` (`stringoutRecord.dbd.pod`): the
@@ -172,20 +108,67 @@ impl Record for StringoutRecord {
     /// constant text must be seeded here. A bare-numeric (`5`) or quoted
     /// (`"text"`) DOL parses to `ParsedLink::Constant`; its text is copied
     /// verbatim into the `DBF_STRING` VAL (truncated to the field size).
-    fn init_record(&mut self, pass: u8) -> CaResult<()> {
-        if pass == 0 {
-            if let crate::server::record::ParsedLink::Constant(s) =
-                crate::server::record::parse_link_v2(&self.dol)
-            {
-                self.val = truncate_string(PvString::from(s));
-            }
-        }
-        Ok(())
+    /// C `stringoutRecord.c:113-114`:
+    /// `if (recGblInitConstantLink(&prec->dol, DBF_STRING, prec->val))
+    ///      prec->udf = FALSE;`
+    /// The framework gate excludes a constant DOL from the per-cycle
+    /// closed-loop fetch, so the init-seed owner is the only place the constant
+    /// can reach VAL — and a record whose VAL came from it is DEFINED.
+    fn constant_init_links(&self) -> Vec<crate::server::record::ConstantInitLink> {
+        vec![crate::server::record::ConstantInitLink::dol_to_val(
+            "DOL", "VAL",
+        )]
+    }
+
+    /// C `stringoutRecord.c::monitor` (:211-227) has no MDEL/ADEL deadband: the
+    /// VAL post is gated on `strncmp(oval, val)` plus the MPST/APST "Always"
+    /// override — identical to `stringin`. See `stringin.rs` for the analog
+    /// deadband owner this replaces.
+    fn uses_monitor_deadband(&self) -> bool {
+        false
+    }
+
+    fn monitor_value_changed(&self) -> Option<bool> {
+        Some(self.value_changed)
+    }
+
+    /// C `stringoutRecord.c:138-144`: `process()` clears `udf` to FALSE only
+    /// on a successful non-constant closed-loop DOL fetch (`if
+    /// (!dbLinkIsConstant(&prec->dol) && !status) prec->udf=FALSE;`); with no
+    /// such fetch this cycle, `udf` is left untouched and `if (prec->udf ==
+    /// TRUE) recGblSetSevr(prec,UDF_ALARM,prec->udfs);` (`:146-148`) raises it
+    /// every cycle for a bare record. `udf` is never re-derived from the
+    /// stored VAL, so stringout opts out of the framework's blanket
+    /// per-cycle clear. The definers are a direct VAL put (`dbPut`,
+    /// `field_io.rs`) and the DOL-apply site (`processing.rs`).
+    fn clears_udf(&self) -> bool {
+        false
+    }
+
+    /// C `stringoutRecord.c:146` tests `if (prec->udf == TRUE)` — exact-one.
+    /// With `clears_udf() == false`, a direct `caput X.UDF 255` (or `-1`,
+    /// stored `255`) leaves `udf == 255` at the alarm check, and `255 != TRUE`,
+    /// so C raises NO UDF_ALARM — STAT/SEVR stay `NO_ALARM`. See
+    /// [`Record::udf_alarm_on_exact_one`].
+    fn udf_alarm_on_exact_one(&self) -> bool {
+        true
+    }
+
+    /// C: `if (mpst == stringoutPOST_Always) monitor_mask |= DBE_VALUE;`
+    /// `if (apst == stringoutPOST_Always) monitor_mask |= DBE_LOG;`
+    fn monitor_always_post(&self) -> (bool, bool) {
+        (self.mpst == MENU_POST_ALWAYS, self.apst == MENU_POST_ALWAYS)
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
-        // C `stringoutRecord.c::monitor` copies VAL into OVAL.
-        self.oval = self.val.clone();
+        // C `stringoutRecord.c::monitor` copies VAL into OVAL only on the
+        // `strncmp` mismatch that raises DBE_VALUE|DBE_LOG. Capture the verdict
+        // before the copy erases it — the framework reads
+        // `monitor_value_changed()` after `process()` returns.
+        self.value_changed = self.oval != self.val;
+        if self.value_changed {
+            self.oval = self.val.clone();
+        }
         Ok(ProcessOutcome::complete())
     }
 

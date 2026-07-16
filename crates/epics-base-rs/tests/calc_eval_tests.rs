@@ -1,4 +1,6 @@
-use epics_base_rs::calc::{NumericInputs, calc, compile, eval};
+use epics_base_rs::calc::{
+    CalcError, NumericInputs, StackValue, StringInputs, calc, compile, eval, scalc, scalc_compile,
+};
 
 fn make_inputs(vals: &[(u8, f64)]) -> NumericInputs {
     let mut inputs = NumericInputs::new();
@@ -6,6 +8,23 @@ fn make_inputs(vals: &[(u8, f64)]) -> NumericInputs {
         inputs.vars[idx as usize] = val;
     }
     inputs
+}
+
+/// Evaluate through the **sCalc** engine. `>?`, `<?` and `NRNDM` are in
+/// `sCalcPostfix.c`'s element table but not in epics-base `postfix.c`'s, so the
+/// numeric engine refuses them at compile time (`CALC_ERR_SYNTAX`).
+fn assert_scalc(expr: &str, inputs: &[(u8, f64)], expected: f64) {
+    let mut inp = StringInputs::new();
+    for &(idx, val) in inputs {
+        inp.num_vars[idx as usize] = val;
+    }
+    match scalc(expr, &mut inp).unwrap() {
+        StackValue::Double(result) => assert!(
+            (result - expected).abs() < 1e-9,
+            "Expression '{expr}': expected {expected}, got {result}"
+        ),
+        other => panic!("Expression '{expr}': expected a double, got {other:?}"),
+    }
 }
 
 fn assert_calc(expr: &str, inputs: &[(u8, f64)], expected: f64) {
@@ -257,14 +276,16 @@ fn test_max_vararg() {
 
 #[test]
 fn test_max_op() {
-    assert_calc("A>?B", &[(0, 3.0), (1, 5.0)], 5.0);
-    assert_calc("A>?B", &[(0, 7.0), (1, 5.0)], 7.0);
+    assert_scalc("A>?B", &[(0, 3.0), (1, 5.0)], 5.0);
+    assert_scalc("A>?B", &[(0, 7.0), (1, 5.0)], 7.0);
+    assert_eq!(compile("A>?B").unwrap_err(), CalcError::Syntax);
 }
 
 #[test]
 fn test_min_op() {
-    assert_calc("A<?B", &[(0, 3.0), (1, 5.0)], 3.0);
-    assert_calc("A<?B", &[(0, 7.0), (1, 5.0)], 5.0);
+    assert_scalc("A<?B", &[(0, 3.0), (1, 5.0)], 3.0);
+    assert_scalc("A<?B", &[(0, 7.0), (1, 5.0)], 5.0);
+    assert_eq!(compile("A<?B").unwrap_err(), CalcError::Syntax);
 }
 
 // ===== Ternary =====
@@ -334,19 +355,29 @@ fn test_r2d() {
 
 #[test]
 fn test_rndm_range() {
+    // base `calcRandom` is `seed / 65535.0` (calcPerform.c:518-523), so its
+    // range is the CLOSED [0, 1]: zero is a legal draw. sCalc/aCalc exclude it
+    // ((seed+1)/65536, because NRNDM takes a log); base has no NRNDM.
     let mut inputs = NumericInputs::new();
     for _ in 0..100 {
         let r = calc("RNDM", &mut inputs).unwrap();
-        assert!(r > 0.0 && r <= 1.0, "RNDM out of range: {}", r);
+        assert!((0.0..=1.0).contains(&r), "RNDM out of range: {}", r);
     }
 }
 
 #[test]
 fn test_nrndm() {
-    // Just check it doesn't crash and produces a finite number
-    let mut inputs = NumericInputs::new();
-    let r = calc("NRNDM", &mut inputs).unwrap();
-    assert!(r.is_finite(), "NRNDM not finite: {}", r);
+    // NRNDM is sCalc/aCalc only; the numeric engine refuses it at compile.
+    let mut inputs = StringInputs::new();
+    let r = scalc("NRNDM", &mut inputs).unwrap();
+    match r {
+        StackValue::Double(v) => assert!(v.is_finite(), "NRNDM not finite: {v}"),
+        other => panic!("NRNDM must produce a double, got {other:?}"),
+    }
+    assert_eq!(
+        calc("NRNDM", &mut NumericInputs::new()),
+        Err(CalcError::Syntax)
+    );
 }
 
 // ===== Division by zero =====
@@ -435,23 +466,32 @@ fn test_keyword_and_or() {
     assert_calc("1 OR 0", &[], 1.0);
 }
 
+/// This asserted `compile("")` succeeds and evaluates to 0.0. Base C does
+/// neither: `postfix("")` is `CALC_ERR_NULL_ARG` (-1, `postfix.c:235-241`), and
+/// the empty program it leaves in RPCL makes `calcPerform` return -1 — which is
+/// how a calc record with an empty CALC alarms on every process instead of
+/// quietly reading 0. tests/calc_empty_program.rs covers the rule in full.
 #[test]
 fn test_empty_expression() {
-    let compiled = compile("").unwrap();
-    let mut inputs = NumericInputs::new();
-    let result = eval(&compiled, &mut inputs).unwrap();
-    assert!((result - 0.0).abs() < 1e-9);
+    assert_eq!(compile("").err(), Some(CalcError::NullArg));
 }
 
+/// `LOG2` is in no C element table — base, sCalc and aCalc all lex it as `LOG`
+/// applied to the literal `2`, which makes `LOG2(8)` an operand followed by
+/// `(`: CALC_ERR_SYNTAX. It is not a base-2 logarithm in any dialect.
+/// See tests/calc_grammar_tables.rs (R7-3).
 #[test]
 fn test_log2() {
-    assert_calc("LOG2(8)", &[], 3.0);
+    assert!(matches!(compile("LOG2(8)"), Err(CalcError::Syntax)));
+    assert_calc("LOG2", &[], 2.0f64.log10());
 }
 
+/// `INT` is a synApps sCalc/aCalc symbol (an alias of NINT). base's `postfix()`
+/// has no such element, so `calc`/`calcout` reject it at compile time.
 #[test]
 fn test_int() {
-    assert_calc("INT(3.7)", &[], 4.0);
-    assert_calc("INT(-3.7)", &[], -4.0);
+    assert!(matches!(compile("INT(3.7)"), Err(CalcError::Syntax)));
+    assert!(matches!(compile("INT(-3.7)"), Err(CalcError::Syntax)));
 }
 
 #[test]
@@ -521,9 +561,17 @@ fn test_full_a_to_u_sum() {
 
 #[test]
 fn test_double_letter_uu_parses() {
-    // The lexer's doubled-letter variant (e.g. UU) must compile after
-    // #655 widened the legal range from A..L to A..U.
-    assert!(compile("UU").is_ok(), "UU should be a valid token");
-    assert!(compile("MM").is_ok(), "MM should be a valid token");
-    assert!(compile("VV").is_err(), "VV must remain rejected");
+    // Doubled letters are sCalc string args / aCalc array args, and BOTH C
+    // tables stop at LL: `FETCH_AA`..`FETCH_LL` (sCalcPostfix.c:118-186,
+    // aCalcPostfix.c:108-190). base #655 widened the SINGLE letters to A..U;
+    // it added no doubled-letter operand, and it did not touch synApps. The
+    // compiled sCalcPostfix.c answers CALC_ERR_SYNTAX (11) for MM and UU —
+    // this case used to assert they compile, which no C table supports.
+    assert!(scalc_compile("LL").is_ok(), "sCalc has FETCH_LL");
+    assert!(scalc_compile("MM").is_err(), "sCalc's table stops at LL");
+    assert!(scalc_compile("UU").is_err(), "sCalc's table stops at LL");
+    assert!(scalc_compile("VV").is_err());
+
+    assert_eq!(compile("UU").unwrap_err(), CalcError::Syntax);
+    assert!(compile("VV").is_err());
 }

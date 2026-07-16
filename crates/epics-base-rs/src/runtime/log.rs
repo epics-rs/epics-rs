@@ -79,6 +79,30 @@ pub fn errlog_get_sev_to_log() -> ErrlogSevEnum {
     ErrlogSevEnum::from_u8(SEV_TO_LOG.load(Ordering::Relaxed))
 }
 
+/// C `ERL_WARNING` (`errlog.h:299`) — the word an errlog warning line carries,
+/// magenta on a terminal console and plain everywhere else.
+///
+/// C spells it `ANSI_MAGENTA("WARNING")`, i.e. the escapes are always IN the
+/// message, and errlog strips them at print time when its console is not a
+/// terminal (`errlog.c:672-681`, `pvt.ttyConsole = isATTY(stderr)` at
+/// `errlog.c:555`). `isATTY` (`errlog.c:218-237`) also demands a non-empty
+/// `$TERM`, on the grounds that a terminal that will not name itself cannot be
+/// assumed to understand escapes. Both halves of that rule are here, so an
+/// `epicsEnvSet`-style capture of a Rust IOC's stderr gets the same bytes as C's.
+///
+/// Verified head-to-head with the compiled `softIoc` (bind-conflict warning):
+/// redirected to a file it writes `cas WARNING: …`; under `script(1)` it writes
+/// `cas \x1b[35;1mWARNING\x1b[0m: …`.
+pub fn erl_warning() -> &'static str {
+    use std::io::IsTerminal;
+    let term_names_itself = std::env::var_os("TERM").is_some_and(|t| !t.is_empty());
+    if std::io::stderr().is_terminal() && term_names_itself {
+        "\x1b[35;1mWARNING\x1b[0m"
+    } else {
+        "WARNING"
+    }
+}
+
 /// Emit a pre-formatted error message at the given severity, suppressed
 /// when `severity` is below the [`errlog_get_sev_to_log`] threshold.
 ///

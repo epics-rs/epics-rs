@@ -31,7 +31,7 @@ use std::sync::{
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
-use crate::pvdata::{FieldDesc, PvField};
+use crate::pvdata::{FieldDesc, PvField, RpcReply};
 use crate::server_native::source::{ChannelInvalidator, OpError};
 
 /// User-provided put handler. Mirrors pvxs `SharedPV::onPut`
@@ -79,11 +79,12 @@ impl PutPolicy {
 pub type OnProcessFn = Arc<dyn Fn(&SharedPV) -> Result<(), String> + Send + Sync>;
 
 /// User-provided RPC handler. Mirrors pvxs `SharedPV::onRPC`. Handler
-/// receives `(request_desc, request_value)` and returns the response
-/// pair or an error message.
-pub type OnRpcFn = Arc<
-    dyn Fn(&SharedPV, FieldDesc, PvField) -> Result<(FieldDesc, PvField), String> + Send + Sync,
->;
+/// receives `(request_desc, request_value)` and returns the reply or an
+/// error message. The reply is an [`RpcReply`], covering both pvxs
+/// `ExecOp::reply()` overloads: a `(FieldDesc, PvField)` pair converts
+/// into `RpcReply::Value`, and `RpcReply::Empty` is the no-value reply.
+pub type OnRpcFn =
+    Arc<dyn Fn(&SharedPV, FieldDesc, PvField) -> Result<RpcReply, String> + Send + Sync>;
 
 /// Async RPC handler. Returns a boxed future the dispatch path
 /// awaits, so the user's async work runs on the calling task's
@@ -94,9 +95,9 @@ pub type OnRpcAsyncFn = Arc<
             SharedPV,
             FieldDesc,
             PvField,
-        ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<(FieldDesc, PvField), String>> + Send>,
-        > + Send
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<RpcReply, String>> + Send>>
+        + Send
         + Sync,
 >;
 
@@ -876,17 +877,15 @@ impl SharedPV {
         }
     }
 
-    /// Dispatch an RPC request. Falls back to "RPC not supported" when
-    /// no [`Self::on_rpc`] handler has been installed.
-    pub fn rpc(
-        &self,
-        request_desc: FieldDesc,
-        request_value: PvField,
-    ) -> Result<(FieldDesc, PvField), String> {
+    /// Dispatch an RPC request. With no [`Self::on_rpc`] handler installed,
+    /// pvxs never sets `chan->onRPC`, and an RPC EXEC on that channel is
+    /// answered with the fixed text [`super::source::RPC_NOT_IMPLEMENTED`]
+    /// (serverget.cpp:482-486).
+    pub fn rpc(&self, request_desc: FieldDesc, request_value: PvField) -> Result<RpcReply, String> {
         let on_rpc = self.inner.lock().on_rpc.clone();
         match on_rpc {
             Some(f) => f(self, request_desc, request_value),
-            None => Err("RPC not supported by this SharedPV".into()),
+            None => Err(super::source::RPC_NOT_IMPLEMENTED.into()),
         }
     }
 
@@ -908,14 +907,14 @@ impl SharedPV {
     /// Async RPC dispatch. Tries the async handler first
     /// (registered via [`Self::on_rpc_async`]); falls back to the
     /// sync `on_rpc` handler when only that one is set; finally
-    /// returns "not supported" when neither is installed. The
+    /// returns pvxs's "RPC Not Implemented" when neither is installed. The
     /// `#[pva_service]` framework uses this so user async methods
     /// run on the calling task's runtime, no `block_in_place`.
     pub async fn rpc_async(
         &self,
         request_desc: FieldDesc,
         request_value: PvField,
-    ) -> Result<(FieldDesc, PvField), String> {
+    ) -> Result<RpcReply, String> {
         let (sync, async_h) = {
             let g = self.inner.lock();
             (g.on_rpc.clone(), g.on_rpc_async.clone())
@@ -925,7 +924,7 @@ impl SharedPV {
         }
         match sync {
             Some(f) => f(self, request_desc, request_value),
-            None => Err("RPC not supported by this SharedPV".into()),
+            None => Err(super::source::RPC_NOT_IMPLEMENTED.into()),
         }
     }
 
@@ -942,14 +941,19 @@ impl SharedPV {
     }
 
     /// Install an RPC handler. Mirrors pvxs `SharedPV::onRPC`.
-    pub fn on_rpc<F>(&self, handler: F)
+    ///
+    /// The handler may return a `(FieldDesc, PvField)` pair (pvxs
+    /// `ExecOp::reply(Value)`) or an [`RpcReply`] — returning
+    /// [`RpcReply::Empty`] emits pvxs's no-value reply
+    /// (`ExecOp::reply()`), a bare NULL type code with no body
+    /// (serverget.cpp:104-112).
+    pub fn on_rpc<F, R>(&self, handler: F)
     where
-        F: Fn(&SharedPV, FieldDesc, PvField) -> Result<(FieldDesc, PvField), String>
-            + Send
-            + Sync
-            + 'static,
+        F: Fn(&SharedPV, FieldDesc, PvField) -> Result<R, String> + Send + Sync + 'static,
+        R: Into<RpcReply>,
     {
-        self.inner.lock().on_rpc = Some(Arc::new(handler));
+        self.inner.lock().on_rpc =
+            Some(Arc::new(move |pv, d, v| handler(pv, d, v).map(Into::into)));
     }
 
     /// Install a process handler. Pass `None` to clear (by re-installing).
@@ -966,12 +970,16 @@ impl SharedPV {
     /// through `block_on`. Takes a closure that returns a future;
     /// the dispatch path awaits the future on the same tokio task
     /// that delivered the RPC frame.
-    pub fn on_rpc_async<F, Fut>(&self, handler: F)
+    pub fn on_rpc_async<F, Fut, R>(&self, handler: F)
     where
         F: Fn(SharedPV, FieldDesc, PvField) -> Fut + Send + Sync + 'static,
-        Fut: std::future::Future<Output = Result<(FieldDesc, PvField), String>> + Send + 'static,
+        Fut: std::future::Future<Output = Result<R, String>> + Send + 'static,
+        R: Into<RpcReply>,
     {
-        let arc: OnRpcAsyncFn = Arc::new(move |pv, d, v| Box::pin(handler(pv, d, v)));
+        let arc: OnRpcAsyncFn = Arc::new(move |pv, d, v| {
+            let fut = handler(pv, d, v);
+            Box::pin(async move { fut.await.map(Into::into) })
+        });
         self.inner.lock().on_rpc_async = Some(arc);
     }
 
@@ -1451,12 +1459,13 @@ impl super::source::ChannelSource for SharedSource {
         Output = Option<super::source::SubscriptionSeed<super::source::MonitorUpdate>>,
     > + Send {
         let _ = ctx;
-        // pvxs `op->limit = qSize` (servermon.cpp:533-543): the client's
-        // `record._options.queueSize` sizes the source-side accrual buffer, so
-        // a STOP->START or INIT->START window holds up to `queueSize` distinct
-        // posts, not just the latest. Falls back to the pvxs default
-        // of 4 (servermon.cpp:66) when the client requests no queueSize.
-        let queue_limit = opts.queue_size.map(|n| (n as usize).max(1)).unwrap_or(4);
+        // pvxs `op->limit` (servermon.cpp:66,533-543): the negotiated per-op
+        // limit — the server's default unless the client's
+        // `record._options.queueSize` replaced it — sizes the source-side
+        // accrual buffer, so a STOP->START or INIT->START window holds up to
+        // `limit` distinct posts, not just the latest. The limit arrives
+        // already resolved (never 0), so there is no second default here.
+        let queue_limit = (opts.queue_size as usize).max(1);
         let pv = if checked.allows_read() {
             self.pvs.lock().get(checked.pv_name()).cloned()
         } else {
@@ -1474,7 +1483,11 @@ impl super::source::ChannelSource for SharedSource {
                 }
             });
             Some(super::source::SubscriptionSeed {
-                initial,
+                // A SharedPV's stored Value is wholly assigned by `open()` /
+                // `post()`, so it declares no leaf subset — the server frames
+                // every leaf the request selected, as pvxs does for a
+                // fully-marked `Value`.
+                initial: initial.map(super::source::SourceRead::from),
                 updates: super::source::plain_monitor_updates(rx),
                 on_start: None,
             })
@@ -1486,7 +1499,7 @@ impl super::source::ChannelSource for SharedSource {
         name: &str,
         request_desc: FieldDesc,
         request_value: PvField,
-    ) -> impl std::future::Future<Output = Result<(FieldDesc, PvField), OpError>> + Send {
+    ) -> impl std::future::Future<Output = Result<RpcReply, OpError>> + Send {
         let pv = self.pvs.lock().get(name).cloned();
         let name = name.to_string();
         async move {
@@ -2026,6 +2039,7 @@ mod tests {
             authority: String::new(),
             roles: Vec::new(),
             pv_request: None,
+            log: Default::default(),
         };
 
         // No channel yet: a GET-only path sees a closed PV.

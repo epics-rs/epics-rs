@@ -83,12 +83,7 @@ impl PvDatabaseSource {
                 let (base, _field) = parse_pv_name(&pv_name);
                 if let Some(rec) = db.get_record(base).await {
                     let inst = rec.read().await;
-                    let asg = if !inst.common.asg.is_empty() {
-                        inst.common.asg.clone()
-                    } else {
-                        "DEFAULT".to_string()
-                    };
-                    return (asg, inst.common.asl);
+                    return (inst.common.access_group().to_string(), inst.common.asl);
                 }
                 ("DEFAULT".to_string(), 0u8)
             })
@@ -432,7 +427,7 @@ fn build_timestamp(snap: &Snapshot) -> PvField {
     // `Snapshot.timestamp` is the acquisition `WallTime` (POSIX epoch;
     // the codec already added POSIX_TIME_AT_EPICS_EPOCH on decode) and
     // `Snapshot.user_tag` is the nsec-LSB / pulse-id tag that
-    // `apply_nsec_lsb_split` strips out of `nanoseconds` (mirroring
+    // `apply_nsec_mask` strips out of `nanoseconds` (mirroring
     // pvxs `meta.time.nsec & ~info.nsecMask` for the wire nanoseconds and
     // `meta.time.nsec & info.nsecMask` for userTag). Using `now()` here
     // overwrote the acquisition time with serialization time and zeroed
@@ -1040,6 +1035,7 @@ mod tests {
             authority: String::new(),
             roles: Vec::new(),
             pv_request: None,
+            log: Default::default(),
         }
     }
 
@@ -1076,7 +1072,7 @@ mod tests {
                 .await;
             self.put_value_checked(checked, value, ctx)
                 .await
-                .map_err(String::from)
+                .map_err(|e| e.message)
         }
         async fn get_value_ctx(&self, pv: &str, ctx: ChannelContext) -> Option<PvField> {
             let checked = self
@@ -1254,9 +1250,7 @@ mod tests {
         // not a numeric NTScalar.
         use epics_base_rs::server::snapshot::EnumInfo;
         let mut snap = Snapshot::new(EpicsValue::Enum(1), 0, 0, std::time::UNIX_EPOCH);
-        snap.enums = Some(EnumInfo {
-            strings: vec!["OFF".into(), "ON".into()],
-        });
+        snap.enums = Some(EnumInfo::new(vec!["OFF".into(), "ON".into()]));
 
         // value: NTEnum struct id + nested enum_t { index, choices }.
         let PvField::Structure(s) = snapshot_to_pv_field(&snap) else {
@@ -1459,9 +1453,7 @@ mod tests {
 
         // value.choices boundary: producer struct, then wire round-trip.
         let mut esnap = Snapshot::new(EpicsValue::Enum(0), 0, 0, std::time::UNIX_EPOCH);
-        esnap.enums = Some(EnumInfo {
-            strings: vec![PvString::from_bytes(raw.clone())],
-        });
+        esnap.enums = Some(EnumInfo::new(vec![PvString::from_bytes(raw.clone())]));
         let PvField::Structure(s) = snapshot_to_pv_field(&esnap) else {
             panic!("NTEnum value must be a structure");
         };

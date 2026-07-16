@@ -25,13 +25,50 @@ use epics_base_rs::types::EpicsValue;
 #[test]
 fn mbbi_direct_exposes_upper_16_bits() {
     let mut rec = MbbiDirectRecord::default();
-    // Bit B1A is bit 26 — must exist and round-trip.
-    rec.put_field("B1A", EpicsValue::Char(1)).unwrap();
-    assert!(matches!(rec.get_field("B1A"), Some(EpicsValue::Char(1))));
+    // Bit B1A is bit 26 — an INPUT record derives the bit FROM VAL, so drive
+    // VAL through process() and read the bit back (a Bx put does NOT fold into
+    // VAL here — that is mbboDirect's opposite data flow).
+    rec.rval = 1 << 26;
+    rec.process().unwrap();
+    assert!(matches!(rec.get_field("B1A"), Some(EpicsValue::UChar(1))));
     assert!(matches!(
         rec.get_field("VAL"),
         Some(EpicsValue::Long(v)) if v == (1 << 26)
     ));
+}
+
+#[test]
+fn mbbi_direct_bit_put_reverts_on_process() {
+    // Differential-oracle put-defect #1d: `caput B0 1` on an mbbiDirect whose
+    // VAL=0. B0 is pp(TRUE), so the put processes the record. In this INPUT
+    // record the bit fields are DERIVED from VAL, and a Bx put is not a value
+    // put — VAL stays 0, and C `mbbiDirectRecord.c:217-226` monitor() re-derives
+    // B0 = (VAL >> 0) & 1 = 0. The port under-re-derived: it folded the bit into
+    // VAL and, on a soft channel (which skips the RVAL->VAL convert), never
+    // rebuilt the bits, so `caput B0 1` wrongly ended B0=1.
+    let mut rec = MbbiDirectRecord::default();
+    rec.put_field("B0", EpicsValue::Char(1)).unwrap();
+    assert_eq!(rec.val, 0, "a Bx put must not fold into VAL (mbbiDirect)");
+    // Soft-channel process skips the convert (C `read_mbbiDirect` returns 2);
+    // the bit rebuild must still run on that path.
+    rec.set_device_did_compute(true);
+    rec.process().unwrap();
+    assert_eq!(rec.bits[0], 0, "process re-derives B0 from VAL=0");
+    assert_eq!(rec.val, 0, "VAL unchanged across the bit put + process");
+    assert!(matches!(rec.get_field("B0"), Some(EpicsValue::UChar(0))));
+}
+
+#[test]
+fn mbbi_direct_process_rederives_bits_from_val() {
+    // Bit re-derivation across the width: VAL=5 -> B0=1, B2=1, all others 0.
+    let mut rec = MbbiDirectRecord::default();
+    rec.rval = 5;
+    rec.process().unwrap();
+    assert_eq!(rec.val, 5);
+    assert_eq!(rec.bits[0], 1);
+    assert_eq!(rec.bits[1], 0);
+    assert_eq!(rec.bits[2], 1);
+    assert!(rec.bits[3..].iter().all(|&b| b == 0));
 }
 
 #[test]
@@ -89,7 +126,14 @@ fn mbbo_direct_process_keeps_device_rbv() {
 fn bo_state_alarm_osv() {
     let mut rec = BoRecord::new(1);
     rec.osv = AlarmSeverity::Major as i16;
-    let mut common = CommonFields::default();
+    // C `boRecord.c::checkAlarms:371-380` raises UDF_ALARM (at UDFS=INVALID)
+    // BEFORE the STATE alarm, and `recGblSetSevr` overrides only on strictly
+    // greater severity — so on a `udf=1` record STATE never shows. Clear the
+    // default UDF to exercise the STATE path (as `bi_state_alarm_zsv` does).
+    let mut common = CommonFields {
+        udf: 0,
+        ..Default::default()
+    };
     rec.check_alarms(&mut common);
     assert_eq!(common.nsev, AlarmSeverity::Major);
     assert_eq!(common.nsta, alarm_status::STATE_ALARM);
@@ -121,7 +165,7 @@ fn bi_state_alarm_zsv() {
     // (uninitialised), so clear it to exercise the STATE path,
     // mirroring what `process_local` does via `value_is_undefined()`.
     let mut common = CommonFields {
-        udf: false,
+        udf: 0,
         ..Default::default()
     };
     rec.check_alarms(&mut common);
@@ -137,7 +181,7 @@ fn bi_cos_alarm_fires_on_change() {
     // See bi_state_alarm_zsv: clear the default UDF so checkAlarms
     // evaluates COS instead of returning after UDF_ALARM.
     let mut common = CommonFields {
-        udf: false,
+        udf: 0,
         ..Default::default()
     };
     rec.check_alarms(&mut common);
@@ -145,7 +189,7 @@ fn bi_cos_alarm_fires_on_change() {
     assert_eq!(common.nsta, alarm_status::COS_ALARM);
     // Second evaluation with no change: COS does not re-fire.
     let mut common2 = CommonFields {
-        udf: false,
+        udf: 0,
         ..Default::default()
     };
     rec.check_alarms(&mut common2);
@@ -163,7 +207,7 @@ fn mbbi_state_alarm_per_state() {
     // the per-state STATE alarm (process_local clears it via
     // `value_is_undefined()` for a defined VAL).
     let mut common = CommonFields {
-        udf: false,
+        udf: 0,
         ..Default::default()
     };
     rec.check_alarms(&mut common);
@@ -179,7 +223,14 @@ fn mbbo_soft_alarm_on_illegal_val() {
     rec.zrvl = 1; // define a state table → sdef=true
     rec.init_record(0).unwrap();
     rec.process().unwrap();
-    let mut common = CommonFields::default();
+    // C mbbo raises UDF in `process()` before `checkAlarms`, and its SOFT alarm
+    // is raised by `convert()` — which the `udf` early-exit (`goto CONTINUE`)
+    // SKIPS. So SOFT is a defined-record alarm; clear the default UDF to isolate
+    // it (as `bo_state_alarm_osv`/`bi_state_alarm_zsv` do).
+    let mut common = CommonFields {
+        udf: 0,
+        ..Default::default()
+    };
     rec.check_alarms(&mut common);
     assert_eq!(common.nsev, AlarmSeverity::Invalid);
     assert_eq!(common.nsta, alarm_status::SOFT_ALARM);
@@ -189,7 +240,13 @@ fn mbbo_soft_alarm_on_illegal_val() {
 fn mbbo_state_alarm_per_state() {
     let mut rec = MbboRecord::new(3);
     rec.thsv = AlarmSeverity::Minor as i16;
-    let mut common = CommonFields::default();
+    // mbbo raises UDF (at UDFS=INVALID) before the STATE alarm; a `udf=1`
+    // record would show UDF, not the Minor STATE. Clear the default UDF to
+    // isolate the per-state severity (as `bo_state_alarm_osv` does).
+    let mut common = CommonFields {
+        udf: 0,
+        ..Default::default()
+    };
     rec.check_alarms(&mut common);
     assert_eq!(common.nsev, AlarmSeverity::Minor);
     assert_eq!(common.nsta, alarm_status::STATE_ALARM);
@@ -350,7 +407,7 @@ fn sel_high_limit_alarm() {
     // mirror the framework so the limit alarm is reached instead of
     // UDF_ALARM (C `selRecord.c::checkAlarms:256-259`).
     let mut common = CommonFields {
-        udf: rec.value_is_undefined(),
+        udf: rec.value_is_undefined() as u8,
         ..Default::default()
     };
     rec.check_alarms(&mut common);
@@ -371,7 +428,7 @@ fn sel_hihi_limit_alarm_takes_priority() {
     rec.process().unwrap();
     // See sel_high_limit_alarm: mirror the framework UDF wiring.
     let mut common = CommonFields {
-        udf: rec.value_is_undefined(),
+        udf: rec.value_is_undefined() as u8,
         ..Default::default()
     };
     rec.check_alarms(&mut common);
@@ -393,7 +450,7 @@ fn dfanout_low_limit_alarm() {
     // the limit alarm is reached instead of UDF_ALARM
     // (C `dfanoutRecord.c::checkAlarms:233-236`).
     let mut common = CommonFields {
-        udf: rec.value_is_undefined(),
+        udf: rec.value_is_undefined() as u8,
         ..Default::default()
     };
     rec.check_alarms(&mut common);
@@ -411,7 +468,7 @@ fn dfanout_lolo_limit_alarm() {
     rec.process().unwrap();
     // See dfanout_low_limit_alarm: mirror the framework UDF wiring.
     let mut common = CommonFields {
-        udf: rec.value_is_undefined(),
+        udf: rec.value_is_undefined() as u8,
         ..Default::default()
     };
     rec.check_alarms(&mut common);
@@ -429,7 +486,7 @@ fn dfanout_no_alarm_when_in_range() {
     rec.process().unwrap();
     // See dfanout_low_limit_alarm: mirror the framework UDF wiring.
     let mut common = CommonFields {
-        udf: rec.value_is_undefined(),
+        udf: rec.value_is_undefined() as u8,
         ..Default::default()
     };
     rec.check_alarms(&mut common);
@@ -442,11 +499,11 @@ fn dfanout_udf_alarm_on_nan_val() {
     assert!(rec.value_is_undefined());
     // framework sets this from value_is_undefined()
     let mut common = CommonFields {
-        udf: true,
+        udf: 1,
         ..Default::default()
     };
     rec.check_alarms(&mut common);
-    assert_eq!(common.nsev, common.udfs);
+    assert_eq!(common.nsev, AlarmSeverity::from_u16(common.udfs as u16));
     assert_eq!(common.nsta, alarm_status::UDF_ALARM);
 }
 

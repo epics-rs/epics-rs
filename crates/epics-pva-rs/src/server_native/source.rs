@@ -4,11 +4,77 @@
 //! public surface.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
-use crate::pvdata::{FieldDesc, PvField};
+use crate::proto::{MessageType, Status};
+use crate::pvdata::{FieldDesc, PvField, RpcReply};
 pub use epics_base_rs::server::access_security::{AccessChecked, AccessGate};
+
+/// One pvxs `RemoteLogger::logRemote()` diagnostic recorded by a source
+/// while serving an operation. The wire layer turns each into an
+/// IOID-tagged `CMD_MESSAGE` frame (`serverconn.cpp:146-160`:
+/// `ioid:u32 + messageType:u8 + message:string`), so `level` is the
+/// PVA `messageType` byte (`level2mtype`, `pvaproto.h:715`): pvxs
+/// `Level::Warn` → [`MessageType::Warning`] (1), `Level::Crit` →
+/// [`MessageType::Fatal`] (3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteLogMessage {
+    pub level: MessageType,
+    pub message: String,
+}
+
+/// pvxs `server::RemoteLogger` (`src/pvxs/srvcommon.h:97`) — the
+/// source→client diagnostic channel every pvxs operation handle
+/// (`ConnectOp`, `ExecOp`, `MonitorSetupOp`) implements.
+///
+/// A source records a diagnostic while it serves an operation; the wire
+/// layer drains this sink once the source call returns and emits one
+/// IOID-tagged `CMD_MESSAGE` Warning/Fatal frame per message *before*
+/// that operation's reply (see `tcp.rs` `flush_remote_log`). This is the
+/// only path by which a source can talk to the client outside the
+/// operation's own status/value — pvxs's IOC source layer uses it for
+/// "present but unusable option" diagnostics that do NOT change the
+/// negotiated outcome (`ioc/groupsource.cpp:560`,
+/// `ioc/singlesource.cpp:129`, `ioc/iocsource.cpp:447`).
+///
+/// Cheap to clone (one `Arc`); every clone of a [`ChannelContext`] shares
+/// the same sink, so a source may hand the context down through its own
+/// layers and still have its diagnostics reach the connection that owns
+/// the IOID. Messages recorded on a context that belongs to no operation
+/// (channel lifecycle / watermark edges, where pvAccess has no IOID to
+/// tag and pvxs correspondingly exposes no `RemoteLogger`) are never
+/// drained and are dropped with the context.
+#[derive(Debug, Clone, Default)]
+pub struct RemoteLog {
+    queued: Arc<Mutex<Vec<RemoteLogMessage>>>,
+}
+
+impl RemoteLog {
+    /// pvxs `logRemote(Level::Warn, msg)` — a `messageType=1` frame.
+    pub fn warn(&self, message: impl Into<String>) {
+        self.push(MessageType::Warning, message.into());
+    }
+
+    /// pvxs `logRemote(Level::Crit, msg)` — a `messageType=3` frame.
+    pub fn crit(&self, message: impl Into<String>) {
+        self.push(MessageType::Fatal, message.into());
+    }
+
+    fn push(&self, level: MessageType, message: String) {
+        self.queued
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(RemoteLogMessage { level, message });
+    }
+
+    /// Drain every recorded diagnostic, in the order the source recorded
+    /// them. The wire layer is the single caller; a source never drains
+    /// its own sink.
+    pub fn take(&self) -> Vec<RemoteLogMessage> {
+        std::mem::take(&mut *self.queued.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+}
 
 /// Per-operation context surfaced to [`ChannelSource`] implementors
 /// that need the downstream peer's identity (audit, ACL, gateway
@@ -59,6 +125,13 @@ pub struct ChannelContext {
     /// decoder could not parse it. Sources that don't need per-op options
     /// can ignore the field.
     pub pv_request: Option<PvField>,
+    /// pvxs `RemoteLogger` for this operation ([`RemoteLog`]). A source
+    /// records "present but unusable option" diagnostics here; the wire
+    /// layer drains them and emits IOID-tagged `CMD_MESSAGE` frames
+    /// before the operation's reply. Contexts for edges with no IOID
+    /// (channel open/close, watermark) carry a sink that is never
+    /// drained — pvxs exposes no `RemoteLogger` there either.
+    pub log: RemoteLog,
 }
 
 /// Event-affecting options decoded from a downstream MONITOR INIT
@@ -94,7 +167,7 @@ pub struct ChannelContext {
 /// Field projection (the pvRequest field mask) is intentionally NOT
 /// represented here: it is pure downstream-local masking the server
 /// applies after fanout, and is transparent through a gateway.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MonitorOptions {
     /// `record._options.pipeline` — the client requested the
     /// flow-controlled credit/ACK monitor sub-protocol. This is flow
@@ -104,18 +177,55 @@ pub struct MonitorOptions {
     /// propagates backpressure upstream via the per-PV `Pauser`
     ///. It therefore does NOT make a monitor non-transparent.
     pub pipeline: bool,
-    /// `record._options.queueSize` when the client set it explicitly
-    /// (pvxs default 4). `None` means the client did not request a
-    /// specific queue depth. Like `pipeline`, this is a downstream
-    /// buffer-depth request the gateway honors on its per-downstream
-    /// outbox; it does not change upstream event production.
-    pub queue_size: Option<u32>,
+    /// The NEGOTIATED per-operation monitor queue limit — pvxs
+    /// `MonitorOp::limit` (`servermon.cpp:66`, initialised to `4u`),
+    /// overridden by a valid `record._options.queueSize >= 2`
+    /// (`:533-543`) whether or not pipeline flow control is on.
+    ///
+    /// ALWAYS resolved: this is the one representation of the depth, so
+    /// no consumer re-derives it and none of them can disagree. It is
+    /// what pvxs squashes against (`queue.size() < limit`, `:273`), what
+    /// its `ackAt` arithmetic is a fraction of (`:564,578,581`), and what
+    /// it reports as `stats().limitQueue` (`:313`). The port used to
+    /// carry `Option<u32>` — `None` meaning "consult the server-wide
+    /// default" — alongside a SECOND, separately-defaulted copy inside
+    /// the pipeline options; the two defaults were different numbers
+    /// (server 64 vs pipeline 4), so a plain monitor squashed at a depth
+    /// the ACK arithmetic never saw (R11-31).
+    ///
+    /// Like `pipeline`, this is downstream buffer depth: a gateway honors
+    /// it on its per-downstream outbox and it does not change upstream
+    /// event production.
+    pub queue_size: u32,
     /// True when the downstream pvRequest carried a server-side
     /// `record._options._filter` chain. A stateful filter (e.g.
     /// deadband) changes which events are *produced*; running it at a
     /// fanout gateway on a shared upstream stream is not equivalent to
     /// the upstream server running it per subscription.
     pub server_filter: bool,
+}
+
+/// pvxs `MonitorOp::limit = 4u` (`servermon.cpp:66`) — the depth a
+/// server-side monitor queue starts with, before the client's
+/// `record._options.queueSize` gets a say. It is a PER-OPERATION
+/// initializer, not a server-wide capacity: pvxs has no server knob for
+/// it at all, and [`crate::server_native::runtime::PvaServerConfig::monitor_queue_depth`]
+/// is exactly this initializer made configurable.
+pub const DEFAULT_MONITOR_QUEUE_LIMIT: u32 = 4;
+
+impl Default for MonitorOptions {
+    /// A plain monitor with no negotiated options: no pipeline, no
+    /// server-side filter, and the pvxs per-op default depth. The depth
+    /// is never 0 — [`MonitorOptions::queue_size`] is a resolved limit by
+    /// construction, so a `default()` used for a non-MONITOR operation
+    /// still names a legal one.
+    fn default() -> Self {
+        Self {
+            pipeline: false,
+            queue_size: DEFAULT_MONITOR_QUEUE_LIMIT,
+            server_filter: false,
+        }
+    }
 }
 
 impl MonitorOptions {
@@ -189,9 +299,16 @@ pub struct WatermarkEvent {
 pub struct OpError {
     /// Classification bucket — drives the audit Denied/Failed split.
     pub kind: OpErrorKind,
-    /// Human-readable message; this is the text serialised into the
-    /// PVA `Status` sent to the client.
+    /// Human-readable message; the text serialised into the PVA `Status`
+    /// sent to the client when this error carries no `status` of its own.
     pub message: String,
+    /// The `Status` a proxying source received from ITS upstream, to be sent
+    /// downstream unchanged. `None` for an error this server originated.
+    ///
+    /// Set only through [`OpError::remote`]; read only through
+    /// [`OpError::wire_status`], which is the single owner of "what Status
+    /// does a failed op put on the wire".
+    pub status: Option<Status>,
 }
 
 /// Outcome bucket for an [`OpError`]. Distinct from a free-text
@@ -213,6 +330,7 @@ impl OpError {
         Self {
             kind: OpErrorKind::Denied,
             message: message.into(),
+            status: None,
         }
     }
 
@@ -221,7 +339,38 @@ impl OpError {
         Self {
             kind: OpErrorKind::Failed,
             message: message.into(),
+            status: None,
         }
+    }
+
+    /// An upstream `Status`, to be forwarded downstream **verbatim** — the
+    /// error a proxying source (the PVA gateway) returns when its upstream
+    /// refused the operation.
+    ///
+    /// pva2pva does not re-author an upstream Status because it cannot: it
+    /// hands the downstream requester straight to the upstream channel
+    /// (`p2pApp/channel.cpp:117-127`), so the upstream's own reply reaches the
+    /// downstream client. Here the two legs are separate ops, so the Status is
+    /// carried across explicitly instead — kind, message, and stack intact.
+    /// The audit bucket stays `Failed`: a refusal by SOMEONE ELSE'S access
+    /// control is, to this server, an upstream failure, and its own ACL
+    /// denials are what the `Denied` bucket counts.
+    pub fn remote(status: Status) -> Self {
+        Self {
+            kind: OpErrorKind::Failed,
+            message: status.message().unwrap_or_default().to_string(),
+            status: Some(status),
+        }
+    }
+
+    /// The `Status` this error puts on the wire — the upstream's own when this
+    /// is a forwarded [`Self::remote`], else an `Error` status carrying the
+    /// message. Single owner: every server reply path for a failed op goes
+    /// through here, so no path can flatten a forwarded Status into text.
+    pub fn wire_status(&self) -> Status {
+        self.status
+            .clone()
+            .unwrap_or_else(|| Status::error(self.message.clone()))
     }
 }
 
@@ -249,15 +398,12 @@ impl From<&str> for OpError {
     }
 }
 
-/// Lossy back-conversion to the wire-status string: drops the kind,
-/// keeping only the message. The wire layer serialises only this
-/// human text into the PVA `Status`, so `Status::error(op_err)` works
-/// directly.
-impl From<OpError> for String {
-    fn from(e: OpError) -> Self {
-        e.message
-    }
-}
+// NOTE: no `impl From<OpError> for String`. It existed so that
+// `Status::error(op_err)` compiled — which is exactly the flattening R18-27
+// is about: it discarded a forwarded upstream `Status` (kind, stack) and
+// re-authored it as a local ERROR carrying the rendered text. The wire path
+// is [`OpError::wire_status`] and nothing else; removing the conversion makes
+// the lossy path fail to compile rather than fail on the wire.
 
 /// Server-wide channel-invalidation fan-out. An operator-driven cache
 /// removal (PVA gateway `<prefix>:drop` / `:flush`) publishes the set of
@@ -322,6 +468,32 @@ impl ChannelInvalidator {
         }
         let mut subs = self.subscribers.lock().unwrap_or_else(|e| e.into_inner());
         subs.retain(|s| s.send(names.clone()).is_ok());
+    }
+}
+
+/// `serverget.cpp:486` — the text pvxs sends when an RPC EXEC lands on a
+/// channel whose source installed no `onRPC` handler.
+pub const RPC_NOT_IMPLEMENTED: &str = "RPC Not Implemented";
+
+/// A `record._options` field whose storage no conversion arm accepts (an
+/// ARRAY-typed `DBE`, say) fails the operation that named it — and only that
+/// operation.
+///
+/// pvxs sources read their `record._options` inside `onSubscribe`, through the
+/// THROWING `Value::as<T>()`. `SingleSource` dispatches on the field's KIND and
+/// then converts (`ioc/singlesource.cpp:117-140`): `Kind::String` runs
+/// `fld.as<std::string>()`, `Kind::Integer`/`Kind::Real` run
+/// `fld.as<uint8_t>()`. Kind is the type-code class, so an ARRAY of those kinds
+/// (`Int32A` is `Kind::Integer`) reaches the conversion — and `Value::copyOut`
+/// has no scalar arm for array storage, so it raises `NoConvert`
+/// (`data.cpp:466-499`).
+///
+/// See [`ChannelSource::check_monitor_request`] for what the port does with
+/// that (an op-level error `Status`, circuit intact) and why it does NOT do
+/// what QSRV does (CBUG-C2: `bev.reset()`, every channel on the circuit gone).
+impl From<crate::pvdata::NoConvert> for OpError {
+    fn from(e: crate::pvdata::NoConvert) -> Self {
+        OpError::failed(e.message().to_string())
     }
 }
 
@@ -497,6 +669,44 @@ pub trait ChannelSource: Send + Sync + 'static {
 
     /// Fetch the current value of a PV.
     fn get_value(&self, name: &str) -> impl std::future::Future<Output = Option<PvField>> + Send;
+
+    /// **The read handoff the server FRAMES.** Every value the server
+    /// serializes with a changed-bitset — the GET reply, the PUT_GET
+    /// readback, the connect-time monitor seed — comes back through here as
+    /// a [`SourceRead`]: the value plus, optionally, the leaves the source
+    /// ACTUALLY assigned into it.
+    ///
+    /// pvxs frames a read as `to_wire_valid(R, value, &pvMask)`
+    /// (`serverget.cpp:104`), and that value is a `cloneEmpty()` the source
+    /// filled in: `IOCSource::initialize` + `IOCSource::get`
+    /// (`singlesource.cpp:283`, `groupsource.cpp:484`) assign a SUBSET of
+    /// the structure, so only those leaves carry `valid` and only they reach
+    /// the wire. `getProperties` (`iocsource.cpp:252-310`) never assigns
+    /// `control.minStep`, `valueAlarm.active`, the four `valueAlarm.*Severity`
+    /// leaves or `valueAlarm.hysteresis` — pinned by pvxs's own
+    /// `testqsingle.cpp:129-149` delta, where those seven are absent while
+    /// `display.form.index` / `.choices` (from `initialize`) are present.
+    ///
+    /// The port's `PvField` has no "unassigned" state — every NT leaf is
+    /// populated — so a source that assigns a subset says so with `marked`.
+    /// `marked: None` means "everything the request selected", which is what
+    /// a source posting a wholly-assigned value means (a `SharedPV`'s
+    /// `open()`-ed Value, a gateway's upstream snapshot).
+    ///
+    /// The default routes through [`Self::get_value_checked`], so every
+    /// ACL / credential-routing override a source already has still applies;
+    /// a source overrides THIS method only to declare its marks.
+    fn read_checked(
+        &self,
+        checked: AccessChecked,
+        ctx: ChannelContext,
+    ) -> impl std::future::Future<Output = Option<SourceRead>> + Send {
+        async move {
+            self.get_value_checked(checked, ctx)
+                .await
+                .map(SourceRead::from)
+        }
+    }
 
     /// Re-check READ access for
     /// `(pv_name, ctx)` through the SOURCE-SPECIFIC ACL gate that
@@ -684,11 +894,11 @@ pub trait ChannelSource: Send + Sync + 'static {
         changed: crate::proto::BitSet,
         delta: PvField,
         ctx: ChannelContext,
-    ) -> impl std::future::Future<Output = Result<Option<PvField>, OpError>> + Send {
+    ) -> impl std::future::Future<Output = Result<Option<SourceRead>, OpError>> + Send {
         async move {
             self.put_delta_checked(checked.clone(), desc, changed, delta, ctx.clone())
                 .await?;
-            Ok(self.get_value_checked(checked, ctx).await)
+            Ok(self.read_checked(checked, ctx).await)
         }
     }
 
@@ -849,6 +1059,46 @@ pub trait ChannelSource: Send + Sync + 'static {
     /// True iff PUT is allowed against this PV (for ACL gating).
     fn is_writable(&self, name: &str) -> impl std::future::Future<Output = bool> + Send;
 
+    /// pvxs's `onSubscribe` pvRequest read, run at MONITOR INIT — the part of
+    /// it that can FAIL.
+    ///
+    /// A pvxs source parses its `record._options` at the top of `onSubscribe`,
+    /// before `connect()` sends the INIT reply, using the throwing
+    /// `Value::as<T>()`. An option whose storage no `copyOut` arm converts
+    /// raises `NoConvert`. The port splits the two halves of `onSubscribe`:
+    /// this check runs at INIT, while the subscription itself is opened at
+    /// START.
+    ///
+    /// DEVIATION from C++, deliberate — CBUG-C2. In pvxs's QSRV sources
+    /// (`ioc/singlesource.cpp:147`, `ioc/groupsource.cpp:399`) that `NoConvert`
+    /// is thrown out of a bare `connect()`, is caught by nobody on the way out
+    /// of `servermon.cpp:592`, and reaches the command-dispatch `catch` in
+    /// `conn.cpp:277-282`, which calls `bev.reset()`: ONE client's malformed
+    /// `record._options` tears down the whole TCP circuit, killing every other
+    /// channel multiplexed on it. A per-operation failure must stay per-
+    /// operation, so this hook's `Err` is an [`OpError`] — the INIT reply
+    /// carries an error `Status`, the op is not registered, and the circuit and
+    /// every other channel on it survive. There is deliberately no way for a
+    /// source to reset the circuit from here: the outcome is not representable.
+    /// (pvxs's own library source agrees with us — `SharedPV::Impl::connectSub`,
+    /// `sharedpv.cpp:94-101`, catches around `connect()` and calls
+    /// `conn->error(msg)`, "not re-throwing for consistency". Only QSRV's
+    /// sources leave the throw bare.)
+    ///
+    /// The default is `Ok(())`: a source that reads no `record._options` — the
+    /// pvxs server API's `SharedPV`, and `GroupSource`, neither of which looks
+    /// at `DBE` — has nothing to fail on. Only a source that reads an option
+    /// through the throwing conversion overrides this, and it must return `Ok`
+    /// for the names it does NOT read that option for.
+    fn check_monitor_request(
+        &self,
+        checked: &AccessChecked,
+        ctx: &ChannelContext,
+    ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
+        let _ = (checked, ctx);
+        async { Ok(()) }
+    }
+
     /// Subscribe to value-change notifications. Returns `None` if unknown.
     fn subscribe(
         &self,
@@ -981,7 +1231,7 @@ pub trait ChannelSource: Send + Sync + 'static {
     /// current value exactly once at attach, `sharedpv.cpp:69-92`;
     /// pva2pva copies one `lastelem` per `start()`, `moncache.cpp:270-320`).
     ///
-    /// The default seeds from the ACF-aware [`Self::get_value_checked`]
+    /// The default seeds from the ACF-aware [`Self::read_checked`]
     /// (server-equivalent) and treats the source's
     /// [`Self::subscribe_checked_opts_marked`] stream as updates-only —
     /// correct for every source whose subscription does not itself
@@ -999,7 +1249,7 @@ pub trait ChannelSource: Send + Sync + 'static {
             let updates = self
                 .subscribe_checked_opts_marked(checked.clone(), ctx.clone(), opts)
                 .await?;
-            let initial = self.get_value_checked(checked, ctx).await;
+            let initial = self.read_checked(checked, ctx).await;
             Some(SubscriptionSeed {
                 initial,
                 updates,
@@ -1009,9 +1259,9 @@ pub trait ChannelSource: Send + Sync + 'static {
     }
 
     /// Raw fast-path counterpart of [`Self::subscribe_seeded`]. Returns
-    /// a decoded [`PvField`] seed (the server encodes the START frame
+    /// a decoded [`SourceRead`] seed (the server encodes the START frame
     /// through the regular path even on the raw path) plus the raw
-    /// update stream. Default seeds via [`Self::get_value_checked`] and
+    /// update stream. Default seeds via [`Self::read_checked`] and
     /// delegates the stream to [`Self::subscribe_raw_checked_opts`];
     /// returns `None` when the source exposes no raw path.
     fn subscribe_raw_seeded(
@@ -1024,7 +1274,7 @@ pub trait ChannelSource: Send + Sync + 'static {
             let updates = self
                 .subscribe_raw_checked_opts(checked.clone(), ctx.clone(), opts)
                 .await?;
-            let initial = self.get_value_checked(checked, ctx).await;
+            let initial = self.read_checked(checked, ctx).await;
             Some(SubscriptionSeed {
                 initial,
                 updates,
@@ -1033,18 +1283,25 @@ pub trait ChannelSource: Send + Sync + 'static {
         }
     }
 
-    /// Dispatch an RPC. The default impl returns "RPC not supported";
-    /// implementors can override to provide actual RPC behaviour.
+    /// Dispatch an RPC. The default impl is the "source installed no RPC
+    /// handler" case, which pvxs answers with the fixed text
+    /// `"RPC Not Implemented"` (`!chan->onRPC`, serverget.cpp:482-486);
+    /// implementors override to provide actual RPC behaviour.
     ///
-    /// Returns the response (FieldDesc, PvField) on success.
+    /// Returns an [`RpcReply`] on success — pvxs's two `ExecOp::reply()`
+    /// overloads (`pvxs/srvcommon.h:108`): `RpcReply::Value(desc, value)` for
+    /// `reply(Value)`, and `RpcReply::Empty` for the no-argument `reply()`,
+    /// which puts a bare `0xFF` NULL type code on the wire with no value body
+    /// (`serverget.cpp:105-109`, `dataencode.cpp:29-33`). A
+    /// `(FieldDesc, PvField)` pair converts into the former via `.into()`.
     fn rpc(
         &self,
         name: &str,
         request_desc: FieldDesc,
         request_value: PvField,
-    ) -> impl std::future::Future<Output = Result<(FieldDesc, PvField), OpError>> + Send {
+    ) -> impl std::future::Future<Output = Result<RpcReply, OpError>> + Send {
         let _ = (name, request_desc, request_value);
-        async move { Err(OpError::failed("RPC not supported by this source")) }
+        async move { Err(OpError::failed(RPC_NOT_IMPLEMENTED)) }
     }
 
     /// Type-state-enforced RPC. pvxs treats RPC as READ-class for
@@ -1056,7 +1313,7 @@ pub trait ChannelSource: Send + Sync + 'static {
         request_desc: FieldDesc,
         request_value: PvField,
         ctx: ChannelContext,
-    ) -> impl std::future::Future<Output = Result<(FieldDesc, PvField), OpError>> + Send {
+    ) -> impl std::future::Future<Output = Result<RpcReply, OpError>> + Send {
         async move {
             if !checked.allows_read() {
                 return Err(OpError::denied(format!(
@@ -1111,30 +1368,6 @@ pub trait ChannelSource: Send + Sync + 'static {
             }
             self.process(checked.pv_name()).await
         }
-    }
-
-    /// does this source emit *partial* monitor updates for
-    /// `name` — i.e. each event changes only a subset of the
-    /// structure's leaves, not the whole value?
-    ///
-    /// pvxs posts a monitor `Value` whose own marked-changed bitset
-    /// reflects exactly the leaves touched since the last `unmark()`
-    /// (`servermon.cpp:174` `to_wire_valid(R, ent, &self->pvMask)`
-    /// intersects that with the request mask). A QSRV *group* monitor
-    /// with the default `+trigger` (self-trigger) re-reads only the
-    /// triggered member on each event, so only that member's leaves
-    /// change — the wire changed-bitset must be narrowed accordingly
-    /// rather than always marking the whole request mask.
-    ///
-    /// When this returns `true` the server's decoded monitor loop
-    /// derives the per-event changed-bitset by structurally diffing
-    /// consecutive snapshots (intersected with the request mask),
-    /// matching pvxs's marked-leaf semantics. Default `false` keeps
-    /// the static-mask behaviour for single-record sources whose
-    /// every event already carries a full value.
-    fn monitor_emits_partial(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
-        let _ = name;
-        async { false }
     }
 
     /// Notify the source that the per-connection monitor outbox for
@@ -1288,9 +1521,9 @@ pub trait ChannelSource: Send + Sync + 'static {
 /// a cooked MONITOR update — the new value plus an
 /// optional explicit set of changed field paths.
 ///
-/// `marked == None` means the server derives the wire changed-bitset
-/// itself: the full request mask for an ordinary source, or a
-/// value-diff for a partial-emitting source ([`ChannelSource::monitor_emits_partial`]).
+/// `marked == None` means the source declares no leaf set, so the server
+/// frames the full request mask — a source whose every event carries a
+/// whole value (pvxs's fully-marked `Value`).
 ///
 /// `marked == Some(paths)` carries an *explicit* marked-leaf set: the
 /// dot-separated field paths the source declares changed for this
@@ -1321,10 +1554,18 @@ pub struct MonitorUpdate {
     /// leave it `false`.
     pub type_changed: bool,
     /// Dot-separated field paths whose intermediate transitions were
-    /// LOST before this event — the decoded-path counterpart of the
-    /// trailing **overrun bitset** in a raw `changed | value | overrun`
-    /// body. Empty (the default) means no loss: the cooked payload
-    /// builders then encode an empty overrun bitset exactly as before.
+    /// LOST before this event — the port's own loss accounting, NOT a
+    /// wire field.
+    ///
+    /// **It does not reach the cooked wire.** Every cooked MONITOR DATA
+    /// frame this server builds ends in a hard-empty overrun bitset,
+    /// because pvxs's does: `servermon.cpp:174-176` writes one
+    /// unconditionally (`// TODO: placeholder for overrun mask`), and a
+    /// pvxs client that sees overrun bits sets `servSquash` / bumps
+    /// `nSrvSquash` (`clientmon.cpp:554-564`), a counter that stays 0
+    /// against a real pvxs server. Only the RAW forwarder puts overrun
+    /// bits on the wire, and only the ones an UPSTREAM server's frame
+    /// already carried.
     ///
     /// The server's own queue overflow is one producer: when the
     /// monitor queue coalesces (squashes) a dropped intermediate into
@@ -1334,10 +1575,8 @@ pub struct MonitorUpdate {
     /// `moncache.cpp:160-168`
     /// (`overrun |= upstream_overrun | (changed & lastelem.changed)`).
     /// A fanout gateway is the other producer: it sets this when its
-    /// downstream broadcast receiver lags so the next cooked DATA frame
-    /// carries the lost leaves, matching the raw forwarder's
-    /// bridge-local overrun marking. Sources with no loss to report
-    /// leave it empty.
+    /// downstream broadcast receiver lags. Sources with no loss to
+    /// report leave it empty.
     pub overrun: Vec<String>,
 }
 
@@ -1356,13 +1595,68 @@ impl MonitorUpdate {
 }
 
 impl From<PvField> for MonitorUpdate {
-    /// A plain value with no explicit marked set — the server derives
-    /// the changed-bitset (full mask or value-diff) as before. No
+    /// A plain value with no explicit marked set — the server frames the
+    /// full request mask, as it does for any wholly-assigned value. No
     /// overrun: a freshly produced value reports no lost intermediate.
     fn from(value: PvField) -> Self {
         Self {
             value,
             marked: None,
+            type_changed: false,
+            overrun: Vec::new(),
+        }
+    }
+}
+
+/// A value the server is about to FRAME with a changed-bitset — a GET
+/// reply, a PUT_GET readback, or a connect-time monitor seed — plus the
+/// leaves the source assigned into it. The read-side mirror of
+/// [`MonitorUpdate`]'s `value` + `marked` pair, and `marked` carries the
+/// identical meaning on both: the dot-separated field paths the source
+/// actually wrote, or `None` for "everything the request selected".
+///
+/// This exists because pvxs reads a `cloneEmpty()` that its source only
+/// partially fills (`IOCSource::initialize` + `IOCSource::get`), so
+/// `to_wire_valid(R, value, &pvMask)` frames a SUBSET of the request mask.
+/// The port's `PvField` is always fully populated, so the subset has to be
+/// stated. See [`ChannelSource::read_checked`].
+#[derive(Debug, Clone)]
+pub struct SourceRead {
+    /// The value to serialize.
+    pub value: PvField,
+    /// The leaves the source assigned, or `None` for "all of them".
+    pub marked: Option<Vec<String>>,
+}
+
+impl SourceRead {
+    /// A read whose marked leaves the source declares explicitly.
+    pub fn marked(value: PvField, marked: Vec<String>) -> Self {
+        Self {
+            value,
+            marked: Some(marked),
+        }
+    }
+}
+
+impl From<PvField> for SourceRead {
+    /// A wholly-assigned value: the server frames every leaf the request
+    /// selected, which is what pvxs's fully-marked `Value` frames.
+    fn from(value: PvField) -> Self {
+        Self {
+            value,
+            marked: None,
+        }
+    }
+}
+
+impl From<SourceRead> for MonitorUpdate {
+    /// The connect-time seed IS the monitor's first post (pvxs's `first`),
+    /// so it enters the queue as one — carrying the same marked set the
+    /// source declared for the read.
+    fn from(read: SourceRead) -> Self {
+        Self {
+            value: read.value,
+            marked: read.marked,
             type_changed: false,
             overrun: Vec::new(),
         }
@@ -1423,7 +1717,7 @@ pub struct RawMonitorEvent {
 /// seed travels back with the stream rather than via a separate
 /// `get_value` call the server would issue out of band.
 ///
-/// `initial` is a decoded [`PvField`] even on the raw fast path: the
+/// `initial` is a decoded [`SourceRead`] even on the raw fast path: the
 /// server always encodes the first frame through the regular encode
 /// path (raw bodies may not be cached yet at START — see the raw seed
 /// note in the server monitor task), so the seed value type is uniform
@@ -1434,7 +1728,7 @@ pub struct SubscriptionSeed<T> {
     /// unopened `SharedPV` or a gateway entry awaiting its first
     /// upstream event) — the server then emits nothing until the first
     /// `updates` item.
-    pub initial: Option<PvField>,
+    pub initial: Option<SourceRead>,
     /// Post-seed update stream. By contract this MUST NOT repeat
     /// `initial`.
     pub updates: mpsc::Receiver<T>,
@@ -1556,6 +1850,12 @@ pub trait ChannelSourceObj: Send + Sync {
         checked: AccessChecked,
         ctx: ChannelContext,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<PvField>> + Send + 'a>>;
+    /// The framed read handoff (value + assigned leaves). Dyn forwarder.
+    fn read_checked<'a>(
+        &'a self,
+        checked: AccessChecked,
+        ctx: ChannelContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<SourceRead>> + Send + 'a>>;
     /// Per-source access gate. Dyn forwarder.
     fn access_gate(&self) -> &AccessGate;
     /// Source-registry beacon-change counter. Dyn forwarder.
@@ -1596,7 +1896,7 @@ pub trait ChannelSourceObj: Send + Sync {
         delta: PvField,
         ctx: ChannelContext,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Option<PvField>, OpError>> + Send + 'a>,
+        Box<dyn std::future::Future<Output = Result<Option<SourceRead>, OpError>> + Send + 'a>,
     >;
     /// Dyn forwarder for ChannelArray INIT.
     fn channel_array_init<'a>(
@@ -1639,6 +1939,13 @@ pub trait ChannelSourceObj: Send + Sync {
         &'a self,
         name: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>;
+    /// Dyn forwarder for the MONITOR INIT pvRequest check
+    /// ([`ChannelSource::check_monitor_request`]).
+    fn check_monitor_request<'a>(
+        &'a self,
+        checked: &'a AccessChecked,
+        ctx: &'a ChannelContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), OpError>> + Send + 'a>>;
     fn subscribe<'a>(
         &'a self,
         name: &'a str,
@@ -1723,9 +2030,7 @@ pub trait ChannelSourceObj: Send + Sync {
         name: &'a str,
         request_desc: FieldDesc,
         request_value: PvField,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<(FieldDesc, PvField), OpError>> + Send + 'a>,
-    >;
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<RpcReply, OpError>> + Send + 'a>>;
     /// Dyn forwarder for type-state RPC.
     fn rpc_checked<'a>(
         &'a self,
@@ -1733,9 +2038,7 @@ pub trait ChannelSourceObj: Send + Sync {
         request_desc: FieldDesc,
         request_value: PvField,
         ctx: ChannelContext,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<(FieldDesc, PvField), OpError>> + Send + 'a>,
-    >;
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<RpcReply, OpError>> + Send + 'a>>;
     fn process<'a>(
         &'a self,
         name: &'a str,
@@ -1746,10 +2049,6 @@ pub trait ChannelSourceObj: Send + Sync {
         checked: AccessChecked,
         ctx: ChannelContext,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), OpError>> + Send + 'a>>;
-    fn monitor_emits_partial<'a>(
-        &'a self,
-        name: &'a str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>;
     fn notify_watermark(&self, name: &str, ctx: &ChannelContext, ev: WatermarkEvent);
     fn notify_monitor_start(&self, name: &str, ctx: &ChannelContext, start: bool);
     fn notify_channel_open(&self, name: &str, ctx: &ChannelContext);
@@ -1841,6 +2140,13 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
             self, checked, ctx,
         ))
     }
+    fn read_checked<'a>(
+        &'a self,
+        checked: AccessChecked,
+        ctx: ChannelContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<SourceRead>> + Send + 'a>> {
+        Box::pin(<Self as ChannelSource>::read_checked(self, checked, ctx))
+    }
     fn access_gate(&self) -> &AccessGate {
         <Self as ChannelSource>::access(self)
     }
@@ -1892,7 +2198,7 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
         delta: PvField,
         ctx: ChannelContext,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Option<PvField>, OpError>> + Send + 'a>,
+        Box<dyn std::future::Future<Output = Result<Option<SourceRead>, OpError>> + Send + 'a>,
     > {
         Box::pin(<Self as ChannelSource>::put_get_checked(
             self, checked, desc, changed, delta, ctx,
@@ -1956,6 +2262,15 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
         name: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
         Box::pin(<Self as ChannelSource>::is_writable(self, name))
+    }
+    fn check_monitor_request<'a>(
+        &'a self,
+        checked: &'a AccessChecked,
+        ctx: &'a ChannelContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), OpError>> + Send + 'a>> {
+        Box::pin(<Self as ChannelSource>::check_monitor_request(
+            self, checked, ctx,
+        ))
     }
     fn subscribe<'a>(
         &'a self,
@@ -2062,9 +2377,8 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
         name: &'a str,
         request_desc: FieldDesc,
         request_value: PvField,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<(FieldDesc, PvField), OpError>> + Send + 'a>,
-    > {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<RpcReply, OpError>> + Send + 'a>>
+    {
         Box::pin(<Self as ChannelSource>::rpc(
             self,
             name,
@@ -2078,9 +2392,8 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
         request_desc: FieldDesc,
         request_value: PvField,
         ctx: ChannelContext,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<(FieldDesc, PvField), OpError>> + Send + 'a>,
-    > {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<RpcReply, OpError>> + Send + 'a>>
+    {
         Box::pin(<Self as ChannelSource>::rpc_checked(
             self,
             checked,
@@ -2101,12 +2414,6 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
         ctx: ChannelContext,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), OpError>> + Send + 'a>> {
         Box::pin(<Self as ChannelSource>::process_checked(self, checked, ctx))
-    }
-    fn monitor_emits_partial<'a>(
-        &'a self,
-        name: &'a str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
-        Box::pin(<Self as ChannelSource>::monitor_emits_partial(self, name))
     }
     fn notify_watermark(&self, name: &str, ctx: &ChannelContext, ev: WatermarkEvent) {
         <Self as ChannelSource>::notify_watermark(self, name, ctx, ev);

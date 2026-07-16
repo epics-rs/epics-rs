@@ -23,8 +23,10 @@ async fn calcout_dopt_use_ocal_nan_oval_raises_udf_alarm() {
     // CALC="1" → VAL = 1 (finite, defined). OCAL="0/0" → OVAL = NaN.
     co.put_field("CALC", EpicsValue::String("1".into()))
         .unwrap();
+    co.special("CALC", true).unwrap();
     co.put_field("OCAL", EpicsValue::String("0/0".into()))
         .unwrap();
+    co.special("OCAL", true).unwrap();
     co.dopt = 1; // Use OCAL (DOPT=Use_OVAL)
     co.oopt = 0; // Every Time → always an output cycle
     db.add_record("CO_OCAL_NAN", Box::new(co)).await.unwrap();
@@ -76,8 +78,10 @@ async fn calcout_dopt_use_ocal_nan_val_finite_oval_stays_invalid() {
     // CALC="0/0" → VAL = NaN (undefined). OCAL="5" → OVAL = 5 (finite).
     co.put_field("CALC", EpicsValue::String("0/0".into()))
         .unwrap();
+    co.special("CALC", true).unwrap();
     co.put_field("OCAL", EpicsValue::String("5".into()))
         .unwrap();
+    co.special("OCAL", true).unwrap();
     co.dopt = 1; // Use OCAL (DOPT=Use_OVAL)
     co.oopt = 0; // Every Time → always an output cycle
     db.add_record("CO_NANVAL", Box::new(co)).await.unwrap();
@@ -110,8 +114,10 @@ async fn calcout_dopt_use_ocal_both_finite_no_alarm() {
     let mut co = CalcoutRecord::default();
     co.put_field("CALC", EpicsValue::String("1".into()))
         .unwrap();
+    co.special("CALC", true).unwrap();
     co.put_field("OCAL", EpicsValue::String("5".into()))
         .unwrap();
+    co.special("OCAL", true).unwrap();
     co.dopt = 1; // Use OCAL (DOPT=Use_OVAL)
     co.oopt = 0; // Every Time
     db.add_record("CO_BOTHFIN", Box::new(co)).await.unwrap();

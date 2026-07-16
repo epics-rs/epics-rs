@@ -42,7 +42,10 @@ fn cmd_comment() -> CommandDef {
     )
 }
 
-/// `echo [text]` — print the argument. Mirrors C `echo`.
+/// `echo [text]` — print the argument, with its escape sequences translated.
+/// C `libComRegister.c:84-91` runs `dbTranslateEscape(str, str)` before the
+/// `printf`, so `echo "a\tb"` prints a real tab — the same translation the
+/// `.db` loader owes its field values (R18-91), through the same owner.
 fn cmd_echo() -> CommandDef {
     CommandDef::new(
         "echo",
@@ -54,7 +57,9 @@ fn cmd_echo() -> CommandDef {
         "echo [text] — Print text to the console.",
         |args: &[ArgValue], ctx: &CommandContext| {
             match &args[0] {
-                ArgValue::String(s) => ctx.println(s),
+                ArgValue::String(s) => {
+                    ctx.println_bytes(&crate::runtime::epics_string::raw_from_escaped(s))
+                }
                 _ => ctx.println(""),
             }
             Ok(CommandOutcome::Continue)
@@ -186,16 +191,17 @@ fn cmd_epics_env_show() -> CommandDef {
     )
 }
 
-/// Print the EPICS environment parameters — the `EPICS_*` variables.
-/// Shared by `epicsPrtEnvParams` and `epicsParamShow` (C registers
-/// both names for the same report).
+/// C `epicsPrtEnvParams` (`envSubr.c:383-392`): walk `env_param_list[]` and
+/// print each parameter's *effective* value — the environment string, else the
+/// compiled default, else "is undefined". Shared by `epicsPrtEnvParams` and
+/// `epicsParamShow` (C registers both names for the same report).
+///
+/// This is NOT a filtered dump of the process environment. On a clean shell C
+/// prints all 34 parameters with their compiled defaults; a `std::env::vars()`
+/// scan prints nothing, and can never reach the `IOCSH_*` trio at all.
 fn print_epics_params(ctx: &CommandContext) {
-    let mut vars: Vec<(String, String)> = std::env::vars()
-        .filter(|(k, _)| k.starts_with("EPICS_"))
-        .collect();
-    vars.sort();
-    for (k, v) in vars {
-        ctx.println(&format!("{k}={v}"));
+    for line in crate::runtime::env::prt_env_params() {
+        ctx.println(&line);
     }
 }
 

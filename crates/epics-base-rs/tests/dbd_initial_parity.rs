@@ -21,6 +21,7 @@
 //! so CI without the C source is not blocked.
 
 use epics_base_rs::server::db_loader::{apply_fields, create_record};
+use epics_base_rs::server::record::FieldDeclaration;
 use epics_base_rs::types::EpicsValue;
 use std::path::PathBuf;
 
@@ -178,10 +179,17 @@ fn extract_initial(body: &str) -> Option<String> {
     Some(s[..j].to_string())
 }
 
-/// A type-zero initial (`0`/`0.0`/empty) cannot diverge from a zeroed Rust
-/// default, so it is not worth verifying.
+/// Only an EMPTY initial is trivial — it is the absence of a directive.
+///
+/// `"0"` is NOT: on a `DBF_STRING` field it is the one-character string `"0"`,
+/// which a zeroed Rust default (the empty string) does not equal. Skipping it as
+/// "type-zero" is what let `calc`/`calcout`/`swait` ship with an EMPTY `CALC`
+/// where C's `.dbd` says `initial("0")` — an empty expression base's `postfix()`
+/// refuses, so a plain `record(calc,"X") {}` alarmed CALC/INVALID on its first
+/// process (R19-122). The rule now looks at the value, not at its resemblance to
+/// a zero.
 fn is_trivial_initial(v: &str) -> bool {
-    v.is_empty() || v == "0" || v == "0.0" || v == "0.00"
+    v.is_empty()
 }
 
 enum ValueCmp {
@@ -216,8 +224,16 @@ fn dbd_dir() -> Option<PathBuf> {
             return Some(p);
         }
     }
-    let reference = PathBuf::from("/Users/stevek/codes/epics-base/modules/database/src/std/rec");
-    reference.is_dir().then_some(reference)
+    // The machine-local reference checkouts, in the order they have existed.
+    // A stale single path is why this guard silently SKIPPED — and a guard that
+    // skips verifies nothing while still reporting green.
+    [
+        "/home/stevek/work/epics-base/modules/database/src/std/rec",
+        "/Users/stevek/codes/epics-base/modules/database/src/std/rec",
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .find(|p| p.is_dir())
 }
 
 #[test]
@@ -285,7 +301,7 @@ fn rust_record_defaults_match_c_dbd_initials() {
                 // comparison below.
                 if apply_fields(
                     &mut applied,
-                    &[(field.clone(), initial.clone())],
+                    &[(field.clone(), initial.as_str().into())],
                     &mut common,
                 )
                 .is_ok()

@@ -546,6 +546,57 @@ fn jog_bl2_posts_cdir_from_scaled_stroke() {
     assert!(!rec.stat.cdir, "BL2 direction follows BDST sign (C 1020)");
 }
 
+/// CBUG-B13 — the jog-stop take-out leg publishes the direction it actually runs.
+///
+/// DEVIATION from C, deliberate. C's `postProcess` sync-to-readback block
+/// (motorRecord.cc:827-845) does not exclude MIP_JOG_STOP, so it zeroes
+/// `pmr->diff` before the JOG_STOP arm keys CDIR on `relpos = diff/mres`
+/// (`:973`): `(0 < 0.0)` is false, so C reports cdir = 1 (forward) no matter
+/// which way the take-out leg it just dispatched toward `dval - bdst` runs.
+///
+/// Both signs, because the C value (forward) is right by accident for one of
+/// them — only the negative stroke exposes the bug.
+#[test]
+fn b13_jog_stop_takeout_cdir_follows_the_stroke_it_commands() {
+    // BDST > 0: the take-out target (dval - bdst) sits BELOW the stop position,
+    // so the leg runs NEGATIVE. C says forward.
+    let mut rec = make_record();
+    rec.retry.bdst = 2.0;
+    rec.ctrl.jogf = true;
+    rec.plan_motion(CommandSource::Jogf);
+    rec.stat.msta = MstaFlags::MOVING;
+    rec.stat.movn = true;
+    rec.ctrl.jogf = false;
+    rec.plan_motion(CommandSource::Jogf);
+
+    complete_move(&mut rec, 30.0); // stop at 30 → take-out to 28
+    rec.check_completion();
+    assert!(rec.stat.mip.contains(MipFlags::JOG_BL1));
+    assert!(
+        !rec.stat.cdir,
+        "the take-out leg runs 30 -> 28: CDIR must read reverse (C: forward)"
+    );
+
+    // BDST < 0: the take-out target sits ABOVE the stop position, so the leg
+    // runs POSITIVE — forward, which is what C reports here too.
+    let mut rec = make_record();
+    rec.retry.bdst = -2.0;
+    rec.ctrl.jogf = true;
+    rec.plan_motion(CommandSource::Jogf);
+    rec.stat.msta = MstaFlags::MOVING;
+    rec.stat.movn = true;
+    rec.ctrl.jogf = false;
+    rec.plan_motion(CommandSource::Jogf);
+
+    complete_move(&mut rec, 30.0); // stop at 30 → take-out to 32
+    rec.check_completion();
+    assert!(rec.stat.mip.contains(MipFlags::JOG_BL1));
+    assert!(
+        rec.stat.cdir,
+        "the take-out leg runs 30 -> 32: CDIR must read forward"
+    );
+}
+
 #[test]
 fn backlash_final_leg_velocity_floored_above_vbas() {
     // C MOVE_BL arm (motorRecord.cc:953-954): a backlash velocity that

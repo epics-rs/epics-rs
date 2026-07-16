@@ -1,6 +1,7 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, MENU_SIMM, ProcessOutcome, Record};
-use crate::types::{DbFieldType, EpicsValue, PvString};
+use crate::server::record::{MENU_SIMM, ProcessOutcome, RawSoftEntry, Record, ValuePostGate};
+use crate::server::records::convert_phase::ConvertPhase;
+use crate::types::{EpicsValue, PvString};
 
 /// Analog input record with conversion support.
 /// LINR: 0=NO_CONVERSION, 1=SLOPE, 2=LINEAR
@@ -19,7 +20,12 @@ pub struct AiRecord {
     pub egul: f64,
     pub eslo: f64, // default 1.0
     pub eoff: f64, // engineering offset (defaults to egul for LINEAR)
-    pub roff: i32,
+    // ROFF is DBF_ULONG (aiRecord.dbd.pod:442) — stored unsigned so the full
+    // 0..=2^32-1 range round-trips: a client caput 4294967295 reads back as
+    // that value (promoted to DBR_DOUBLE over CA), and the RVAL+ROFF convert
+    // uses C's epicsUInt32 addend. Storing it signed made a high-bit put read
+    // back negative and convert with the wrong sign.
+    pub roff: u32,
     pub aslo: f64, // default 1.0
     pub aoff: f64,
     pub smoo: f64, // smoothing 0~1
@@ -36,7 +42,9 @@ pub struct AiRecord {
     pub lalm: f64,
     pub alst: f64,
     pub mlst: f64,
-    pub init: bool,
+    /// C `prec->init` — see [`ConvertPhase`]. Set by `init_record` and by an
+    /// `SPC_LINCONV` put, cleared at the end of every `process`.
+    pub init: ConvertPhase,
     skip_convert: bool,
     /// Set by `process()` when a `LINR >= 3` breakpoint-table conversion
     /// fails — the table could not be resolved, or the raw value fell past
@@ -94,7 +102,7 @@ impl Default for AiRecord {
             lalm: 0.0,
             alst: 0.0,
             mlst: 0.0,
-            init: false,
+            init: ConvertPhase::default(),
             skip_convert: false,
             bpt_error: false,
             bpt_registry: None,
@@ -118,160 +126,6 @@ impl AiRecord {
         }
     }
 }
-
-static FIELDS: &[FieldDesc] = &[
-    FieldDesc {
-        name: "VAL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "EGU",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "HOPR",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LOPR",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "PREC",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "RVAL",
-        dbf_type: DbFieldType::Long,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ORAW",
-        dbf_type: DbFieldType::Long,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "LINR",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "EGUF",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "EGUL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ESLO",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "EOFF",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ROFF",
-        dbf_type: DbFieldType::Long,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ASLO",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "AOFF",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SMOO",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ADEL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "MDEL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "AFTC",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        // aiRecord.dbd.pod: AFVL is special(SPC_NOMOD) — read-only to clients.
-        name: "AFVL",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "LALM",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "ALST",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "MLST",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "INIT",
-        dbf_type: DbFieldType::Char,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "SIMM",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIML",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIOL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIMS",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SDLY",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SVAL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-];
 
 impl Record for AiRecord {
     fn record_type(&self) -> &'static str {
@@ -300,7 +154,10 @@ impl Record for AiRecord {
             self.alst = self.val;
             self.lalm = self.val;
             self.oraw = self.rval;
-            // init stays false: first process() will skip smoothing (prime filter)
+
+            // C `aiRecord.c:114`: `prec->init = TRUE;` — an initialised record
+            // has not converted yet, so the next conversion is the initial one.
+            self.init = ConvertPhase::Initial;
         }
         Ok(())
     }
@@ -360,8 +217,14 @@ impl Record for AiRecord {
                 }
             }
 
-            // Step 3: Smoothing filter
-            if self.smoo != 0.0 && self.init && self.val.is_finite() {
+            // Step 3: Smoothing filter (aiRecord.c:439-444). On the initial
+            // conversion there is no history to blend against, so C seeds VAL
+            // with the new value first — `if (prec->init) prec->val = val;` —
+            // and only then runs the filter.
+            if self.smoo != 0.0 && self.val.is_finite() {
+                if self.init.is_initial() {
+                    self.val = v;
+                }
                 self.val = v * (1.0 - self.smoo) + self.val * self.smoo;
             } else {
                 self.val = v;
@@ -370,7 +233,9 @@ impl Record for AiRecord {
         self.skip_convert = false;
 
         self.oraw = self.rval;
-        self.init = true;
+        // C `aiRecord.c:170`: `prec->init = FALSE;` on the way out of EVERY
+        // process, not just the first one.
+        self.init = ConvertPhase::Converted;
         Ok(ProcessOutcome::complete())
     }
 
@@ -388,7 +253,7 @@ impl Record for AiRecord {
             "EGUL" => Some(EpicsValue::Double(self.egul)),
             "ESLO" => Some(EpicsValue::Double(self.eslo)),
             "EOFF" => Some(EpicsValue::Double(self.eoff)),
-            "ROFF" => Some(EpicsValue::Long(self.roff)),
+            "ROFF" => Some(EpicsValue::ULong(self.roff)),
             "ASLO" => Some(EpicsValue::Double(self.aslo)),
             "AOFF" => Some(EpicsValue::Double(self.aoff)),
             "SMOO" => Some(EpicsValue::Double(self.smoo)),
@@ -399,7 +264,7 @@ impl Record for AiRecord {
             "LALM" => Some(EpicsValue::Double(self.lalm)),
             "ALST" => Some(EpicsValue::Double(self.alst)),
             "MLST" => Some(EpicsValue::Double(self.mlst)),
-            "INIT" => Some(EpicsValue::Char(if self.init { 1 } else { 0 })),
+            "INIT" => Some(self.init.as_field()),
             "SIMM" => Some(EpicsValue::Short(self.simm)),
             "SIML" => Some(EpicsValue::String(self.siml.clone().into())),
             "SIOL" => Some(EpicsValue::String(self.siol.clone().into())),
@@ -459,21 +324,31 @@ impl Record for AiRecord {
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
             // SPC_LINCONV parity (aiRecord.c:181-200): LINR / EGUF / EGUL
-            // are tagged `special(SPC_LINCONV)` in aiRecord.dbd. Every put
-            // must (1) clear the smoothing-primed flag so the next
-            // process() reprimes the SMOO filter under the new linearisation,
-            // and (2) for LINR=LINEAR rebase `eoff` to `egul` (the C path
-            // sets eoff=egul before calling the device-support
-            // `special_linconv` callback; Rust ports usually don't carry
-            // such a callback, so the eoff-rebase is the only visible
-            // effect for soft-channel records).
+            // are tagged `special(SPC_LINCONV)` in aiRecord.dbd, and C's
+            // `special()` does exactly two things for them:
+            //
+            // ```c
+            // prec->init = TRUE;
+            // if ((prec->linr == menuConvertLINEAR) && pdset->special_linconv) {
+            //     prec->eoff = prec->egul;              /* <- INSIDE the gate */
+            //     status = (*pdset->special_linconv)(prec, after);
+            //     ...
+            // }
+            // return 0;
+            // ```
+            //
+            // The `eoff = egul` rebase belongs to the device support's
+            // `special_linconv` callback, and NO soft dset provides one:
+            // `devAiSoftRaw.c:32-34` is `{{6, NULL, NULL, init_record, NULL},
+            // read_ai, NULL}` — that trailing NULL *is* `special_linconv`. So
+            // on a soft record a put to LINR/EGUF/EGUL sets `init` and touches
+            // nothing else, and an operator retuning the display range EGUL
+            // does not silently re-scale the conversion.
+            //
             "LINR" => match value {
                 EpicsValue::Short(v) => {
                     self.linr = v;
-                    self.init = false;
-                    if self.linr == 2 {
-                        self.eoff = self.egul;
-                    }
+                    self.init = ConvertPhase::Initial;
                     // A LINR change re-selects the breakpoint table (C
                     // `special_linconv` sets `init=TRUE`, which makes the next
                     // `cvtRawToEngBpt` re-resolve via `findBrkTable`). Drop the
@@ -488,10 +363,7 @@ impl Record for AiRecord {
             "EGUF" => match value {
                 EpicsValue::Double(v) => {
                     self.eguf = v;
-                    self.init = false;
-                    if self.linr == 2 {
-                        self.eoff = self.egul;
-                    }
+                    self.init = ConvertPhase::Initial;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
@@ -499,10 +371,7 @@ impl Record for AiRecord {
             "EGUL" => match value {
                 EpicsValue::Double(v) => {
                     self.egul = v;
-                    self.init = false;
-                    if self.linr == 2 {
-                        self.eoff = self.egul;
-                    }
+                    self.init = ConvertPhase::Initial;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
@@ -521,9 +390,16 @@ impl Record for AiRecord {
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
+            // DBF_ULONG: accept the native unsigned carrier and the legacy signed
+            // Long (bit-preserving), so a full-range caput (4294967295) stores
+            // rather than being rejected as a type mismatch.
             "ROFF" => match value {
-                EpicsValue::Long(v) => {
+                EpicsValue::ULong(v) => {
                     self.roff = v;
+                    Ok(())
+                }
+                EpicsValue::Long(v) => {
+                    self.roff = v as u32;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
@@ -647,10 +523,6 @@ impl Record for AiRecord {
         }
     }
 
-    fn field_list(&self) -> &'static [FieldDesc] {
-        FIELDS
-    }
-
     /// `SIMM` is `DBF_MENU menu(menuSimm)` (`aiRecord.dbd.pod`): the analog
     /// records carry the three-choice NO/YES/RAW simulation menu, not the
     /// two-choice `menuYesNo` used by the integer/string records. Served as
@@ -700,14 +572,31 @@ impl Record for AiRecord {
         true
     }
 
+    /// C `devAiSoftRaw` — `recGblInitConstantLink(&prec->inp, DBF_LONG,
+    /// &prec->rval)` at init (`devAiSoftRaw.c:38-42`), `dbGetLink(pinp,
+    /// DBR_LONG, &prec->rval, 0, 0)` per read (`:50`), and `read_ai` returns 0,
+    /// so the record's own `RVAL → VAL` convert (ROFF/ASLO/AOFF/LINR/SMOO) runs.
+    /// `ai` has no MASK, so both entry points store the same word.
+    fn raw_soft_input(&mut self, _entry: RawSoftEntry, value: EpicsValue) -> Option<CaResult<()>> {
+        // RVAL is epicsInt32 and the link is read as DBR_LONG; the conversion is
+        // owned by `raw_soft_rval_i32`, not by a bare `c_cast` of `to_f64()`.
+        self.rval = match super::raw_soft_rval_i32("ai", &value) {
+            Ok(rval) => rval,
+            Err(e) => return Some(Err(e)),
+        };
+        Some(Ok(()))
+    }
+
     /// C `aiRecord.c:460-465` posts `RVAL` with VAL's own `monitor_mask`,
     /// nested in `if (monitor_mask)`: RVAL is posted only when VAL is
     /// posted this cycle (alarm change or MDEL/ADEL crossing) and RVAL
     /// changed — never with a forced `DBE_VALUE | DBE_LOG`. Under a
     /// non-default MDEL the raw count can change while VAL stays inside the
     /// deadband, so RVAL must NOT post on the default aux path.
-    fn fields_posted_with_value_mask(&self) -> &'static [&'static str] {
-        &["RVAL"]
+    fn fields_posted_with_value_mask(&self) -> &'static [(&'static str, ValuePostGate)] {
+        // C re-tests the raw value inside the guard (`if (prec->oraw !=
+        // prec->rval)`, aiRecord.c:462), so an unchanged RVAL is not re-posted.
+        &[("RVAL", ValuePostGate::OnChange)]
     }
 }
 
@@ -715,42 +604,103 @@ impl Record for AiRecord {
 mod tests {
     use super::*;
 
-    /// SPC_LINCONV parity (aiRecord.c:181-200): writing LINR / EGUF / EGUL
-    /// must clear the smoothing-primed flag so the next process() reprimes
-    /// the SMOO filter under the new linearisation. Without this fix the
-    /// SMOO low-pass blended pre-LINR-change and post-LINR-change values
-    /// together, leaking the old engineering unit into the new one for
-    /// every subsequent sample until lcnt or restart cleared it.
+    /// ROFF is DBF_ULONG (aiRecord.dbd.pod:442): a client caput of the full
+    /// unsigned range stores and reads back as that value (served ULong,
+    /// promoted to DBR_DOUBLE over CA). The native ULong carrier and the legacy
+    /// signed Long (bit-preserving) are both accepted; storing was previously
+    /// signed and rejected the ULong carrier a full-range caput arrives as.
     #[test]
-    fn linr_put_resets_init_flag_for_smoothing_prime() {
+    fn roff_put_accepts_full_ulong_range() {
         let mut rec = AiRecord::default();
-        rec.init = true; // simulate post-first-process primed state
+        rec.put_field("ROFF", EpicsValue::ULong(u32::MAX)).unwrap();
+        assert_eq!(rec.get_field("ROFF"), Some(EpicsValue::ULong(u32::MAX)));
+        // Legacy signed carrier reinterprets bit-for-bit.
+        rec.put_field("ROFF", EpicsValue::Long(-1)).unwrap();
+        assert_eq!(rec.get_field("ROFF"), Some(EpicsValue::ULong(u32::MAX)));
+    }
+
+    /// SPC_LINCONV parity (aiRecord.c:187): writing LINR / EGUF / EGUL re-arms
+    /// the INIT phase, so the next process takes the retuned conversion as its
+    /// initial condition instead of blending it into the SMOO history. This
+    /// test previously asserted `!rec.init` — the port's inverted "primed" bit —
+    /// and so pinned the polarity C serves on the wire (`INIT = 1` while
+    /// initial). The behaviour it checks is unchanged; the flag it reads is the
+    /// C one. See tests/init_phase.rs for the whole phase.
+    #[test]
+    fn linr_put_re_arms_the_init_phase_for_smoothing() {
+        let mut rec = AiRecord::default();
+        rec.init = ConvertPhase::Converted; // post-first-process
         rec.smoo = 0.5;
 
         rec.put_field("LINR", EpicsValue::Short(2)).unwrap();
 
         assert!(
-            !rec.init,
-            "LINR put must clear init so next process reprimes SMOO"
+            rec.init.is_initial(),
+            "LINR put re-arms INIT so the next process reprimes SMOO"
         );
     }
 
-    /// SPC_LINCONV parity (aiRecord.c:188-198): in LINR=LINEAR mode, the
-    /// C path rebases `eoff = egul` before invoking the device-support
-    /// `special_linconv` callback. Rust soft-channel ports carry no such
-    /// callback, so the eoff-rebase is the only visible effect — but it
-    /// is the one users actually depend on when retuning LINR or EGUL
-    /// from CA/PVA.
+    /// SPC_LINCONV parity (aiRecord.c:188-198). This test previously asserted
+    /// the OPPOSITE — that an EGUL put under LINEAR rebases `eoff = egul` — and
+    /// so pinned the defect (R18-97). C's `prec->eoff = prec->egul;` sits INSIDE
+    /// `if ((prec->linr == menuConvertLINEAR) && pdset->special_linconv)`: the
+    /// rebase is the device support's, and `devAiSoftRaw.c:32-34` supplies no
+    /// `special_linconv` (the trailing NULL of `{{6, NULL, NULL, init_record,
+    /// NULL}, read_ai, NULL}`).
+    ///
+    /// Oracle (softIoc 7.0.10.1-DEV, `DTYP="Raw Soft Channel"`, `INP="12"`,
+    /// LINR=LINEAR, EOFF=0): `dbpf T:AI.EGUL 7.25` → EOFF stays **0** and VAL
+    /// stays **12**. Pre-fix the port gave EOFF=7.25 and VAL=19.25 — an
+    /// operator retuning the display range silently re-scaled the reading.
     #[test]
-    fn egul_put_rebases_eoff_under_linear_mode() {
+    fn egul_put_under_linear_does_not_rebase_eoff() {
         let mut rec = AiRecord::default();
         rec.linr = 2; // LINEAR
         rec.eoff = 1.5;
 
         rec.put_field("EGUL", EpicsValue::Double(7.25)).unwrap();
 
-        assert_eq!(rec.eoff, 7.25, "EGUL put under LINEAR must set eoff=egul");
-        assert_eq!(rec.egul, 7.25);
+        assert_eq!(
+            rec.eoff, 1.5,
+            "no soft dset provides special_linconv, so C leaves EOFF alone"
+        );
+        assert_eq!(rec.egul, 7.25, "the display range itself is written");
+    }
+
+    /// The other two `special(SPC_LINCONV)` fields take the same gate — it is
+    /// the dset that decides, not which field was written.
+    #[test]
+    fn linr_and_eguf_puts_do_not_rebase_eoff() {
+        let mut rec = AiRecord::default();
+        rec.eoff = 1.5;
+        rec.egul = 7.25;
+
+        rec.put_field("LINR", EpicsValue::Short(2)).unwrap();
+        assert_eq!(rec.eoff, 1.5, "LINR put: EOFF untouched");
+
+        rec.put_field("EGUF", EpicsValue::Double(100.0)).unwrap();
+        assert_eq!(rec.eoff, 1.5, "EGUF put: EOFF untouched");
+    }
+
+    /// The consequence the oracle measured: the raw→engineering conversion is
+    /// unchanged by an EGUL retune, so VAL does not move.
+    #[test]
+    fn egul_retune_does_not_move_val_under_linear() {
+        let mut rec = AiRecord::default();
+        rec.linr = 2; // LINEAR
+        rec.eslo = 1.0;
+        rec.eoff = 0.0;
+        rec.put_field("RVAL", EpicsValue::Long(12)).unwrap();
+        rec.process().unwrap();
+        assert_eq!(rec.val, 12.0, "RVAL 12 -> VAL 12 (eslo=1, eoff=0)");
+
+        rec.put_field("EGUL", EpicsValue::Double(7.25)).unwrap();
+        rec.process().unwrap();
+        assert_eq!(
+            rec.val, 12.0,
+            "the oracle's T:AI.VAL stays 12 after `dbpf T:AI.EGUL 7.25`; \
+             pre-fix the port reported 19.25"
+        );
     }
 
     /// SLOPE (LINR=1) preserves user-configured eoff/eslo across EGUL

@@ -1,6 +1,8 @@
 pub mod ftdi;
 pub mod ip_port;
 pub mod ip_server_port;
+pub mod null_port;
+pub mod option_parse;
 pub mod prologix;
 pub mod serial_config;
 pub mod usbtmc;

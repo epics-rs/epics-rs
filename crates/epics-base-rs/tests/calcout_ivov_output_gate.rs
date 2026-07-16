@@ -26,6 +26,7 @@ async fn calcout_ivov_not_applied_on_non_output_cycle() {
     // CALC="0/0" → VAL = NaN → UDF → INVALID severity.
     co.put_field("CALC", EpicsValue::String("0/0".into()))
         .unwrap();
+    co.special("CALC", true).unwrap();
     co.dopt = 0; // Use_VAL
     co.oopt = 2; // When_Zero: doOutput = (VAL == 0); NaN != 0 → NO output.
     co.put_field("IVOA", EpicsValue::Short(2)).unwrap(); // Set_to_IVOV
@@ -69,6 +70,7 @@ async fn calcout_ivov_applied_on_output_cycle() {
     let mut co = CalcoutRecord::default();
     co.put_field("CALC", EpicsValue::String("0/0".into()))
         .unwrap();
+    co.special("CALC", true).unwrap();
     co.dopt = 0; // Use_VAL
     co.oopt = 0; // Every_Time: doOutput = 1 always.
     co.put_field("IVOA", EpicsValue::Short(2)).unwrap(); // Set_to_IVOV

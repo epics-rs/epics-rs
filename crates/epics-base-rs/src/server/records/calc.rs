@@ -1,6 +1,7 @@
+use super::calc_compile;
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, ProcessOutcome, Record};
-use crate::types::{DbFieldType, EpicsValue, PvString};
+use crate::server::record::{InputFetchPolicy, ProcessOutcome, Record};
+use crate::types::{EpicsValue, PvString};
 
 /// Calc record — evaluates CALC expression with inputs A-U.
 ///
@@ -85,16 +86,26 @@ pub struct CalcRecord {
     pub ls: f64,
     pub lt: f64,
     pub lu: f64,
-    // CALC_ALARM flag: set when calcPerform fails
-    pub calc_alarm: bool,
+    // This cycle's `calcPerform` outcome (C `calcRecord.c:121-123`). A per-cycle
+    // fact, not record state: `check_alarms` — the owner of this record's alarm
+    // transitions — consumes it, so it cannot outlive the cycle that set it.
+    calc_alarm: bool,
+    // This cycle's `fetch_values()` outcome, pushed by the framework through
+    // `set_fetch_gate_failed`. C `calcRecord.c::process` (120) runs
+    // `calcPerform` only `if (fetch_values(prec) == 0)`, so a failed input link
+    // freezes VAL and UDF and raises no CALC_ALARM — while everything after the
+    // calc (LA..LU advance, alarms, monitors, forward link) still runs.
+    fetch_gate_failed: bool,
     // Alarm-range time-constant filter (epics-base calcRecord.c::checkAlarms).
     // AFTC > 0 enables an exponential smoothing of the integer alarmRange
     // (1=Lolo..5=Hihi) so transient excursions don't immediately alarm.
     // AFVL is the filter accumulator state (sign encodes rounding hysteresis).
     pub aftc: f64,
     pub afvl: f64,
-    // Cached compiled expression (RPCL equivalent)
-    rpcl: Option<crate::calc::CompiledExpr>,
+    // C `RPCL`. Always a program: an empty or uncompilable CALC carries C's
+    // empty `END_EXPRESSION` postfix, which `calcPerform` refuses to run — the
+    // record then alarms on every process. See [`calc_compile`].
+    rpcl: crate::calc::CompiledExpr,
 }
 
 impl Default for CalcRecord {
@@ -175,19 +186,27 @@ impl Default for CalcRecord {
             lt: 0.0,
             lu: 0.0,
             calc_alarm: false,
+            fetch_gate_failed: false,
             aftc: 0.0,
             afvl: 0.0,
-            rpcl: None,
+            rpcl: crate::calc::CompiledExpr::empty(crate::calc::ExprKind::Numeric),
         }
     }
 }
 
 impl CalcRecord {
+    /// Construct with a CALC expression, compiled. RPCL is a function of CALC,
+    /// so a constructor that sets one must set the other — otherwise the record
+    /// carries a CALC it has no program for, and `process` has to guess. (C has
+    /// no such window: `init_record` compiles before the record can be
+    /// processed.)
     pub fn new(calc: &str) -> Self {
-        Self {
+        let mut rec = Self {
             calc: calc.to_string(),
             ..Default::default()
-        }
+        };
+        rec.rpcl = calc_compile::postfix("calc", "CALC", &rec.calc).program;
+        rec
     }
 
     /// C `calcRecord.c::monitor`: advance the `LX` previous-value field
@@ -198,11 +217,64 @@ impl CalcRecord {
         }
     }
 
+    /// Advance LA..LU to A..U. C `calcRecord.c::monitor` (lines 417-423) does
+    /// it inside the per-field change test
+    /// (`if (*pnew != *pprev || monitor_mask & DBE_ALARM)`), i.e. only for
+    /// inputs that actually changed — so LA..LU means "value of the input as of
+    /// the last time a monitor was posted for it".
+    ///
+    /// `monitor()` runs on EVERY cycle, including one where `fetch_values()`
+    /// failed and the calc was skipped (C gates only the `calcPerform` block,
+    /// calcRecord.c:119-126), so both paths through `process()` come through
+    /// here.
+    fn advance_prev_inputs(&mut self) {
+        Self::advance_prev(self.a, &mut self.la);
+        Self::advance_prev(self.b, &mut self.lb);
+        Self::advance_prev(self.c, &mut self.lc);
+        Self::advance_prev(self.d, &mut self.ld);
+        Self::advance_prev(self.e, &mut self.le);
+        Self::advance_prev(self.f, &mut self.lf);
+        Self::advance_prev(self.g, &mut self.lg);
+        Self::advance_prev(self.h, &mut self.lh);
+        Self::advance_prev(self.i, &mut self.li);
+        Self::advance_prev(self.j, &mut self.lj);
+        Self::advance_prev(self.k, &mut self.lk);
+        Self::advance_prev(self.l, &mut self.ll);
+        Self::advance_prev(self.m, &mut self.lm);
+        Self::advance_prev(self.n, &mut self.ln);
+        Self::advance_prev(self.o, &mut self.lo);
+        Self::advance_prev(self.p, &mut self.lp);
+        Self::advance_prev(self.q, &mut self.lq);
+        Self::advance_prev(self.r, &mut self.lr);
+        Self::advance_prev(self.s, &mut self.ls);
+        Self::advance_prev(self.t, &mut self.lt);
+        Self::advance_prev(self.u, &mut self.lu);
+    }
+
     fn get_vars(&self) -> [f64; 21] {
         [
             self.a, self.b, self.c, self.d, self.e, self.f, self.g, self.h, self.i, self.j, self.k,
             self.l, self.m, self.n, self.o, self.p, self.q, self.r, self.s, self.t, self.u,
         ]
+    }
+
+    /// Land the calc pass's variable stores back in A..U — the inverse of
+    /// [`Self::get_vars`], and the record's ONLY write-back of an engine var set.
+    ///
+    /// C needs no such step: `calcPerform(&prec->a, &prec->val, rpcl)` is handed
+    /// a pointer INTO the record, so its store opcode (`calcPerform.c:101-123`,
+    /// `parg[op - STORE_A] = *ptop--`) IS the field write. The engine here
+    /// evaluates an owned copy, so `CALC="A:=A+1;A"` incremented a temporary and
+    /// dropped it — VAL climbed while A stayed 0 forever.
+    ///
+    /// Applied on the failure path too: C's stores go into the record as the
+    /// expression runs, so the ones a later failing operator did not reach still
+    /// stand.
+    fn apply_stores(&mut self, vars: &[f64; 21]) {
+        [
+            self.a, self.b, self.c, self.d, self.e, self.f, self.g, self.h, self.i, self.j, self.k,
+            self.l, self.m, self.n, self.o, self.p, self.q, self.r, self.s, self.t, self.u,
+        ] = *vars;
     }
 
     pub fn get_inp_link(&self, idx: usize) -> &str {
@@ -269,471 +341,97 @@ impl CalcRecord {
     }
 }
 
-static CALC_FIELDS: &[FieldDesc] = &[
-    FieldDesc {
-        name: "VAL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "CALC",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "EGU",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "PREC",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "HOPR",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LOPR",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ADEL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "MDEL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "AFTC",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "AFVL",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "LALM",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "ALST",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "MLST",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "INPA",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPB",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPC",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPD",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPE",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPF",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPG",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPH",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPI",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPJ",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPK",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPM",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPN",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPO",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPP",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPQ",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPR",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPS",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPT",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPU",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "A",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "B",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "C",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "D",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "E",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "F",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "G",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "H",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "I",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "J",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "K",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "L",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "M",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "N",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "O",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "P",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "Q",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "R",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "S",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "T",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "U",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LA",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "LB",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "LC",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "LD",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "LE",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "LF",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "LG",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "LH",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "LI",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "LJ",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "LK",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "LL",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "LM",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "LN",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "LO",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "LP",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "LQ",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "LR",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "LS",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "LT",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "LU",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-];
-
 impl Record for CalcRecord {
     fn record_type(&self) -> &'static str {
         "calc"
     }
 
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
-        if pass == 0 && !self.calc.is_empty() {
-            // Compile CALC expression and cache it (like C's RPCL)
-            self.rpcl = crate::calc::compile(&self.calc).ok();
-            self.mlst = self.val;
-            self.alst = self.val;
-            self.lalm = self.val;
+        if pass == 0 {
+            // C `calcRecord.c::init_record:105-110` — postfix() into RPCL; a
+            // failure is logged (errlog + recGblRecordError) but does NOT abort
+            // the record's init (`return 0`). Only `special()` refuses.
+            //
+            // Unconditional, exactly as in C: an empty CALC is `CALC_ERR_NULL_ARG`
+            // there, and the empty program it leaves in RPCL is what makes the
+            // record alarm on every process. Skipping the compile for an empty
+            // CALC left the port with no program and no alarm.
+            self.rpcl = calc_compile::postfix(self.record_type(), "CALC", &self.calc).program;
+            if !self.calc.is_empty() {
+                self.mlst = self.val;
+                self.alst = self.val;
+                self.lalm = self.val;
+            }
+        }
+        Ok(())
+    }
+
+    /// C `calcRecord.c::special` (lines 139-155). `SPC_CALC` re-compiles RPCL
+    /// from the CALC string `dbPut` has already stored, and on failure returns
+    /// `S_db_badField` — so the client's write FAILS while the bad expression
+    /// stays stored and RPCL is left empty. calcout/scalcout/acalcout make the
+    /// opposite choice (store the status in CLCV, accept the put); both
+    /// dispositions run off the one compile owner, [`calc_compile`].
+    fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
+        if !after || !field.eq_ignore_ascii_case("CALC") {
+            return Ok(());
+        }
+        let compiled = calc_compile::postfix(self.record_type(), "CALC", &self.calc);
+        let failed = compiled.failed_to_compile();
+        self.rpcl = compiled.program;
+        if failed {
+            // C `recGblRecordError(S_db_badField, prec, "calc: Illegal CALC field")`
+            return Err(CaError::BadField("calc: Illegal CALC field".into()));
         }
         Ok(())
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
-        if let Some(ref compiled) = self.rpcl {
-            let vars = self.get_vars();
-            let mut inputs = crate::calc::NumericInputs::with_vars(vars);
-            // C `calcPerform(&prec->a, &prec->val, rpcl)` passes `presult =
-            // &val`, so the `VAL` token (`FETCH_VAL`, calcPerform.c:73-74)
-            // pushes the *previous* VAL. Seed `prev_val` from the current
-            // `self.val` before it is overwritten below; otherwise
-            // `CALC="VAL+1"` reads 0 every cycle instead of incrementing.
-            inputs.prev_val = self.val;
-            // C sets CALC_ALARM on failure but continues processing
-            match crate::calc::eval(compiled, &mut inputs) {
-                Ok(v) => {
-                    self.val = v;
-                    self.calc_alarm = false;
-                }
-                Err(_) => {
-                    self.calc_alarm = true;
-                }
-            }
-        } else if !self.calc.is_empty() {
-            // Fallback: try to compile and eval (e.g., if CALC was set after init)
-            let mut inputs = crate::calc::NumericInputs::with_vars(self.get_vars());
-            // Same `VAL`-token previous-value seed as the cached-RPCL path
-            // above (C `presult = &val`).
-            inputs.prev_val = self.val;
-            match crate::calc::calc(&self.calc, &mut inputs) {
-                Ok(v) => {
-                    self.val = v;
-                    self.calc_alarm = false;
-                    // Cache for next time
-                    self.rpcl = crate::calc::compile(&self.calc).ok();
-                }
-                Err(_) => {
-                    self.calc_alarm = true;
-                }
-            }
+        // C `calcRecord.c::process` (119-126):
+        //
+        // ```c
+        // if (fetch_values(prec) == 0) {
+        //     if (calcPerform(&prec->a, &prec->val, prec->rpcl)) {
+        //         recGblSetSevr(prec, CALC_ALARM, INVALID_ALARM);
+        //     } else
+        //         prec->udf = isnan(prec->val);
+        // }
+        // ```
+        //
+        // A failed input link skips the whole calc: VAL and UDF freeze at the
+        // previous cycle's values and CALC_ALARM is neither raised nor cleared.
+        // The rest of the cycle is NOT skipped — the LA..LU advance below, the
+        // alarm check, the monitors and the forward link all still run, and the
+        // inputs that did read still refresh (C's fetch loop does not abort).
+        if self.fetch_gate_failed {
+            self.advance_prev_inputs();
+            return Ok(ProcessOutcome::complete());
         }
-        // Update LA-LU. C `calcRecord.c::monitor` (lines 417-423) advances
-        // `*pprev = *pnew` only inside the per-field change test
-        // (`if (*pnew != *pprev || monitor_mask & DBE_ALARM)`), i.e. only
-        // for inputs that actually changed. So LA..LU means "value of the
-        // input as of the last time a monitor was posted for it" — copying
-        // unconditionally here would advance LA on a no-change cycle and
-        // diverge from C for CALC expressions that reference LA..LU.
-        Self::advance_prev(self.a, &mut self.la);
-        Self::advance_prev(self.b, &mut self.lb);
-        Self::advance_prev(self.c, &mut self.lc);
-        Self::advance_prev(self.d, &mut self.ld);
-        Self::advance_prev(self.e, &mut self.le);
-        Self::advance_prev(self.f, &mut self.lf);
-        Self::advance_prev(self.g, &mut self.lg);
-        Self::advance_prev(self.h, &mut self.lh);
-        Self::advance_prev(self.i, &mut self.li);
-        Self::advance_prev(self.j, &mut self.lj);
-        Self::advance_prev(self.k, &mut self.lk);
-        Self::advance_prev(self.l, &mut self.ll);
-        Self::advance_prev(self.m, &mut self.lm);
-        Self::advance_prev(self.n, &mut self.ln);
-        Self::advance_prev(self.o, &mut self.lo);
-        Self::advance_prev(self.p, &mut self.lp);
-        Self::advance_prev(self.q, &mut self.lq);
-        Self::advance_prev(self.r, &mut self.lr);
-        Self::advance_prev(self.s, &mut self.ls);
-        Self::advance_prev(self.t, &mut self.lt);
-        Self::advance_prev(self.u, &mut self.lu);
+
+        // C `calcRecord.c:121-123` — `calcPerform` runs unconditionally, and a
+        // -1 is CALC_ALARM/INVALID with VAL left at its previous value. RPCL is
+        // always a program, so there is no "no expression" case to improvise
+        // around: an empty or uncompilable CALC IS the empty program, and the
+        // engine fails it every cycle.
+        let vars = self.get_vars();
+        let mut inputs = crate::calc::NumericInputs::with_vars(vars);
+        // C `calcPerform(&prec->a, &prec->val, rpcl)` passes `presult =
+        // &val`, so the `VAL` token (`FETCH_VAL`, calcPerform.c:73-74)
+        // pushes the *previous* VAL. Seed `prev_val` from the current
+        // `self.val` before it is overwritten below; otherwise
+        // `CALC="VAL+1"` reads 0 every cycle instead of incrementing.
+        inputs.prev_val = self.val;
+        let outcome = crate::calc::eval(&self.rpcl, &mut inputs);
+        // The stores land BEFORE the result and before LA..LU advance: C writes
+        // them through `&prec->a` during the perform, so `monitor()` sees the
+        // stored A against the old LA and posts it, exactly as it does for an
+        // input that changed.
+        self.apply_stores(&inputs.vars);
+        match outcome {
+            Ok(v) => self.val = v,
+            Err(_) => self.calc_alarm = true,
+        }
+        self.advance_prev_inputs();
 
         // AFVL housekeeping — C `calcRecord.c::checkAlarms` always drives
         // AFVL to 0 when the alarm-range filter is inactive: on UDF
@@ -764,7 +462,6 @@ impl Record for CalcRecord {
             "LALM" => Some(EpicsValue::Double(self.lalm)),
             "ALST" => Some(EpicsValue::Double(self.alst)),
             "MLST" => Some(EpicsValue::Double(self.mlst)),
-            "CALC_ALARM" => Some(EpicsValue::Char(if self.calc_alarm { 1 } else { 0 })),
             "INPA" => Some(EpicsValue::String(self.inpa.clone().into())),
             "INPB" => Some(EpicsValue::String(self.inpb.clone().into())),
             "INPC" => Some(EpicsValue::String(self.inpc.clone().into())),
@@ -841,12 +538,14 @@ impl Record for CalcRecord {
                 }
                 _ => Err(CaError::TypeMismatch("VAL".into())),
             },
+            // C `dbPut` stores the string first and only then runs
+            // `special(SPC_CALC)`, which is what re-compiles RPCL and decides
+            // whether the put is accepted. `Self::special` owns both — a bad
+            // expression must still be stored here (C stores it) so that
+            // `caget calc.CALC` reads back what the client wrote.
             "CALC" => match value {
                 EpicsValue::String(s) => {
-                    let s = s.as_str_lossy().into_owned();
-                    // Recompile on CALC change (like C special SPC_CALC)
-                    self.rpcl = crate::calc::compile(&s).ok();
-                    self.calc = s;
+                    self.calc = s.as_str_lossy().into_owned();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("CALC".into())),
@@ -1373,8 +1072,12 @@ impl Record for CalcRecord {
         }
     }
 
-    fn field_list(&self) -> &'static [FieldDesc] {
-        CALC_FIELDS
+    /// C `calcRecord.c:103`: every CONSTANT input link is loaded into its value
+    /// field ONCE, at `init_record` (`recGblInitConstantLink(plink,
+    /// DBF_DOUBLE, pvalue)`); `dbGetLink` then delivers nothing for it on
+    /// every later process, so a client's `caput REC.A 99` stands.
+    fn constant_init_links(&self) -> Vec<crate::server::record::ConstantInitLink> {
+        crate::server::record::seed_input_links(self.multi_input_links())
     }
 
     fn multi_input_links(&self) -> &[(&'static str, &'static str)] {
@@ -1401,6 +1104,36 @@ impl Record for CalcRecord {
             ("INPT", "T"),
             ("INPU", "U"),
         ]
+    }
+
+    /// C `calcRecord.c::fetch_values` (427-443) reads every INP link and keeps
+    /// the FIRST failing status; `process` (120) gates `calcPerform` on it.
+    fn input_fetch_policy(&self) -> InputFetchPolicy {
+        InputFetchPolicy::ReadAllGateOnFailure
+    }
+
+    fn set_fetch_gate_failed(&mut self, failed: bool) {
+        self.fetch_gate_failed = failed;
+    }
+
+    /// C `calcRecord.c:121-123` — a failed `calcPerform` is
+    /// `recGblSetSevr(prec, CALC_ALARM, INVALID_ALARM)`, raised in `process()`
+    /// BEFORE `checkAlarms(prec)` runs its UDF guard (`:300-303`). So when a
+    /// broken CALC leaves VAL undefined, C reports CALC_ALARM, not UDF_ALARM:
+    /// `recGblSetSevr` is MAXIMIZE (strict `>`), and both are INVALID.
+    ///
+    /// Consuming the flag makes it a per-cycle fact: a cycle whose input fetch
+    /// failed runs no `calcPerform` (`:120`) and therefore raises nothing — the
+    /// stale flag used to re-raise CALC_ALARM on every gated cycle.
+    fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
+        if std::mem::take(&mut self.calc_alarm) {
+            crate::server::recgbl::rec_gbl_set_sevr_msg(
+                common,
+                crate::server::recgbl::alarm_status::CALC_ALARM,
+                crate::server::record::AlarmSeverity::Invalid,
+                "CALC expression evaluation failed",
+            );
+        }
     }
 }
 

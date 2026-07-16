@@ -8,11 +8,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::error::{CaError, CaResult};
-use crate::server::record::{self, Record, SubroutineFn};
+use crate::server::record::{Record, SubroutineFn};
 use crate::types::EpicsValue;
 
 use super::cvt_bpt::BrkTable;
-use super::database::PvDatabase;
+use super::database::{PvDatabase, RecordLoad};
 use super::device_support;
 use super::ioc_app::{DeviceSupportContext, DynamicDeviceSupportFactory};
 use super::{DeviceSupportFactory, RecordFactory};
@@ -189,6 +189,12 @@ impl IocBuilder {
     pub async fn build(self) -> CaResult<(Arc<PvDatabase>, Option<autosave::SaveSetConfig>)> {
         let db = Arc::new(PvDatabase::new());
 
+        // A build is a load plus C's `iocInit`: records are created here, and
+        // the link-status classifications they issue are queued until
+        // `db.ioc_init()` at the end runs them against the finished database.
+        db.begin_load()
+            .expect("a database created a line ago has not run iocInit");
+
         // Breakpoint-table registry (C `bptList`): merge every loaded
         // `breaktable(...)` into the database's shared registry (the single
         // owner — also grown later by runtime `dbLoadRecords`) and take a
@@ -205,26 +211,27 @@ impl IocBuilder {
 
         // 2. Inline records
         for (name, record) in self.records {
+            // The sink runs C's `iocInit` passes (`run_init_passes`) — an
+            // inline record has no `.db` field set to load first, so it is
+            // complete the moment it is added. Common-link classification
+            // (init_links) and the mbboDirect UDF finalisation stay on the
+            // `.db` path only: an inline record has no parsed common fields
+            // to classify or fold.
             db.add_record(&name, record).await?;
-            // C iocInit runs init_record on EVERY record in the database;
-            // inline records previously skipped both passes, so a record
-            // type with init-time invariants (e.g. the motor speed/limit
-            // sync behind init_invariants_synced) behaved differently
-            // inline vs .db-loaded. Common-link classification
-            // (init_links) and the mbboDirect UDF finalisation stay on
-            // the .db path only: an inline record has no parsed common
-            // fields to classify or fold.
             if let Some(rec_arc) = db.get_record(&name).await {
-                let mut instance = rec_arc.write().await;
-                if let Err(e) = instance.record.init_record(0) {
-                    eprintln!("init_record(0) failed for {name}: {e}");
+                {
+                    let mut instance = rec_arc.write().await;
+                    // Seed MLST/ALST/LALM from val so the first process posts a
+                    // monitor only on a real change (C init_record invariant).
+                    instance.record.seed_deadband_tracking();
                 }
-                if let Err(e) = instance.record.init_record(1) {
-                    eprintln!("init_record(1) failed for {name}: {e}");
-                }
-                // Seed MLST/ALST/LALM from val so the first process posts a
-                // monitor only on a real change (C init_record invariant).
-                instance.record.seed_deadband_tracking();
+                // C `recGblInitSimm` + `recGblInitConstantLink(&siol, …,
+                // &sval)`, run from every SIML-bearing `init_record` (pass 1).
+                db.rec_gbl_init_simm(&rec_arc).await;
+                // C `wdogInit(prec)` from `init_record` pass 1
+                // (histogramRecord.c:168) — arms the SDEL monitor watchdog.
+                // No-op for every record type without one.
+                db.arm_watchdog(&name).await;
             }
         }
 
@@ -246,21 +253,22 @@ impl IocBuilder {
             let mut common_fields = Vec::new();
             db_loader::apply_fields(&mut record, &def.fields, &mut common_fields)?;
 
-            db.add_record(&def.name, record).await?;
+            // The record and its whole loaded field set enter the database
+            // together: the sink applies the common fields and the info tags,
+            // and only then runs C's `iocInit` passes — so the initial UDF
+            // severity is evaluated against the `.db`'s final UDF/STAT/UDFS
+            // (C `dbLoadRecords` → `iocInit`, not the reverse).
+            db.add_loaded_record(
+                &def.name,
+                record,
+                RecordLoad {
+                    common_fields,
+                    info_tags: std::mem::take(&mut def.info_tags),
+                },
+            )
+            .await?;
 
-            // info(...) tags — populate before `init_record` so device
-            // support reading them from `instance.info` sees the values.
-            if !def.info_tags.is_empty() {
-                if let Some(rec_arc) = db.get_record(&def.name).await {
-                    let mut instance = rec_arc.write().await;
-                    for (k, v) in &def.info_tags {
-                        instance.set_info(k, v);
-                    }
-                }
-            }
-
-            // alias(...) directives — register before init so links
-            // resolved during init can reach this record by alias.
+            // alias(...) directives.
             for alias in &def.aliases {
                 if let Err(e) = db.add_alias(alias, &def.name).await {
                     eprintln!(
@@ -270,44 +278,9 @@ impl IocBuilder {
                 }
             }
 
-            // Apply common fields and device support to the RecordInstance
+            // Device support and the post-init owners for the RecordInstance
             if let Some(rec_arc) = db.get_record(&def.name).await {
                 let mut instance = rec_arc.write().await;
-                for (name, value) in common_fields {
-                    match instance.put_common_field(&name, value) {
-                        Ok(record::CommonFieldPutResult::ScanChanged {
-                            old_scan,
-                            new_scan,
-                            phas,
-                        }) => {
-                            drop(instance);
-                            db.update_scan_index(&def.name, old_scan, new_scan, phas, phas)
-                                .await;
-                            instance = rec_arc.write().await;
-                        }
-                        Ok(record::CommonFieldPutResult::PhasChanged {
-                            scan,
-                            old_phas,
-                            new_phas,
-                        }) => {
-                            drop(instance);
-                            db.update_scan_index(&def.name, scan, scan, old_phas, new_phas)
-                                .await;
-                            instance = rec_arc.write().await;
-                        }
-                        Ok(record::CommonFieldPutResult::NoChange) => {}
-                        Err(e) => {
-                            eprintln!("put_common_field({name}) failed for {}: {e}", def.name);
-                        }
-                    }
-                }
-                // init_record passes
-                if let Err(e) = instance.record.init_record(0) {
-                    eprintln!("init_record(0) failed for {}: {e}", def.name);
-                }
-                if let Err(e) = instance.record.init_record(1) {
-                    eprintln!("init_record(1) failed for {}: {e}", def.name);
-                }
                 // Hand the record its resolved common link fields so a
                 // link-classifying record (calcout INAV..INUV/OUTV) can run
                 // its C `init_record` checkLinks step now — the common OUT
@@ -318,19 +291,33 @@ impl IocBuilder {
                     let inst = &mut *instance;
                     inst.record.init_links(&inst.common);
                 }
-                // epics-base PR dabcf89 (mbboDirect): after both init
-                // passes, give the record a chance to finalise UDF —
-                // e.g. fold initialised B0..B1F bits into VAL and
-                // clear UDF when no DOL/initial-VAL was provided.
-                let mut udf = instance.common.udf;
-                if let Err(e) = instance.record.post_init_finalize_undef(&mut udf) {
-                    eprintln!("post_init_finalize_undef failed for {}: {e}", def.name);
-                }
-                instance.common.udf = udf;
+                // C: a soft-channel INPUT dev support's `init_record` loads a
+                // CONSTANT INP into the record's value
+                // (`recGblInitConstantLink` / `dbLoadLinkArray`) — and it runs
+                // BEFORE the record seeds MLST/ALST/LALM from VAL (e.g.
+                // `aiRecord.c:114-127`: `pdset->common.init_record` first, then
+                // `prec->mlst = prec->val`). So this owner runs here, ahead of
+                // `seed_deadband_tracking`, or the first process would post a
+                // spurious monitor for a value that was there since init.
+                drop(instance);
+                db.rec_gbl_init_constant_links(&rec_arc).await;
+                let mut instance = rec_arc.write().await;
+
                 // Seed MLST/ALST/LALM from val (after any UDF/bit fold that
                 // may have changed val) so the first process posts a monitor
                 // only on a real change (C init_record invariant).
                 instance.record.seed_deadband_tracking();
+
+                // C `recGblInitSimm` + `recGblInitConstantLink(&siol, …,
+                // &sval)`, run from every SIML-bearing `init_record` (pass 1).
+                // The lock is released and retaken by the owner, which is the
+                // only site allowed to load a constant SIML/SIOL.
+                drop(instance);
+                db.rec_gbl_init_simm(&rec_arc).await;
+                // C `wdogInit(prec)` from `init_record` pass 1
+                // (histogramRecord.c:168) — arms the SDEL monitor watchdog.
+                db.arm_watchdog(&def.name).await;
+                let mut instance = rec_arc.write().await;
 
                 // Device support based on DTYP
                 let dtyp = instance.common.dtyp.clone();
@@ -416,69 +403,22 @@ impl IocBuilder {
             }
         }
 
-        // 5. I/O Intr setup
-        let all_names = db.all_record_names().await;
-        let io_intr_recs: Vec<(
-            String,
-            Arc<crate::runtime::sync::RwLock<record::RecordInstance>>,
-        )> = {
-            let mut recs = Vec::new();
-            for name in &all_names {
-                if let Some(arc) = db.get_record(name).await {
-                    recs.push((name.clone(), arc));
-                }
-            }
-            recs
-        };
-
-        for (name, rec_arc) in io_intr_recs {
-            let mut inst = rec_arc.write().await;
-            // Wire poll feedback when the record is on I/O Intr scan, OR when
-            // the device drives processing from its own callback independently
-            // of the SCAN menu (motorRecord statusCallback; asyn readback
-            // records, PRs #60/#208). The device's decision is authoritative —
-            // the SCAN check alone would suppress callbacks for a
-            // SCAN="Passive" motor, breaking the pp(TRUE) dbPutField gate.
-            let independent = inst
-                .device
-                .as_ref()
-                .is_some_and(|d| d.io_intr_scan_independent());
-            if inst.common.scan == record::ScanType::IoIntr || independent {
-                if let Some(mut dev) = inst.device.take() {
-                    if let Some(mut intr_rx) = dev.io_intr_receiver() {
-                        let db_clone = db.clone();
-                        let rec_name = name.clone();
-                        let rec_arc_clone = rec_arc.clone();
-                        crate::runtime::task::spawn(async move {
-                            while intr_rx.recv().await.is_some() {
-                                let process = independent || {
-                                    let inst = rec_arc_clone.read().await;
-                                    inst.common.scan == record::ScanType::IoIntr
-                                };
-                                if !process {
-                                    continue;
-                                }
-                                let mut visited = std::collections::HashSet::new();
-                                // Driver-callback cycle: an output
-                                // (`asyn:READBACK`) record reads the value back
-                                // into VAL and skips the device write; input
-                                // records are unaffected.
-                                let _ = db_clone
-                                    .process_record_readback(&rec_name, &mut visited, 0)
-                                    .await;
-                            }
-                        });
-                    }
-                    inst.device = Some(dev);
-                }
-            }
-        }
+        // 5. I/O Intr setup — through the single owner shared with the
+        // `IocApplication` iocInit path, so C `scanAdd`'s failure exits
+        // (`dbScan.c:266-297`: no DSET / no interrupt source → log and demote
+        // SCAN to Passive) apply on both startup routes.
+        let _ = crate::server::ioc_app::setup_io_intr(db.clone()).await;
 
         // 6. Out-of-band PROPERTY-post setup (asyn enum-string runtime
         // re-propagation). Independent of SCAN, so it is a separate pass
         // from the I/O Intr wiring above. Shared with the IocApplication
         // iocInit path so both builders arm the enum callback identically.
         crate::server::ioc_app::setup_property_posts(db.clone()).await;
+
+        // 7. The `iocInit` barrier: every record exists, so run the link-status
+        // classifications queued during the load. Link status is FINAL when
+        // `build` returns, as it is when C's `iocInit` returns.
+        db.ioc_init().await;
 
         Ok((db, self.autosave_config))
     }

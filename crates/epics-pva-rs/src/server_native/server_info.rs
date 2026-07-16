@@ -45,13 +45,25 @@ use std::sync::Arc;
 use epics_base_rs::types::PvString;
 
 use crate::nt::NTScalar;
-use crate::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue, TypedScalarArray};
+use crate::pvdata::{
+    FieldDesc, PvField, PvStructure, RpcReply, ScalarType, ScalarValue, TypedScalarArray,
+};
 
 use super::source::{ChannelSource, OpError};
 
 /// Canonical PV name the built-in source answers. pvxs `ServerSource`
 /// hardcodes the same string.
 pub const SERVER_PV_NAME: &str = "server";
+
+/// `serversource.cpp:93` — every op the `server` RPC does not match falls
+/// through to this one text; pvxs never echoes the op back.
+const NOT_IMPLEMENTED: &str = "Not implemented";
+
+/// `pvxs::NoField::what()` (data.cpp:17-19) — what a client sees when the
+/// `server` RPC reads a `query.op` that is not there: `Value::copyOut` throws
+/// (data.cpp:419-422) and the EXEC catch forwards `e.what()`
+/// (serverget.cpp:504-508).
+const NO_SUCH_FIELD: &str = "No such field";
 
 /// Source name under which the built-in source is registered in the
 /// [`super::CompositeSource`]. pvxs uses `"__server"`; the leading
@@ -304,7 +316,7 @@ impl ChannelSource for ServerInfoSource {
         name: &str,
         _request_desc: FieldDesc,
         request_value: PvField,
-    ) -> impl std::future::Future<Output = Result<(FieldDesc, PvField), OpError>> + Send {
+    ) -> impl std::future::Future<Output = Result<RpcReply, OpError>> + Send {
         let this = self.clone();
         let name = name.to_string();
         async move {
@@ -316,21 +328,28 @@ impl ChannelSource for ServerInfoSource {
             // `pvcall server help=true` returns a help string rather than
             // failing for a missing `op`.
             if Self::has_help(&request_value) {
-                return Ok(Self::help_response());
+                return Ok(Self::help_response().into());
             }
-            let op = Self::extract_op(&request_value)
-                .ok_or_else(|| OpError::failed("missing 'op' query argument"))?;
+            // A missing `op` is not a hand-written diagnostic in pvxs: it reads
+            // `args["op"].as<std::string>()` (serversource.cpp:53) on a field
+            // that isn't there, `Value::copyOut` throws `NoField` ("No such
+            // field", data.cpp:17-19,419-422), and the RPC EXEC catch forwards
+            // `e.what()` to the client (serverget.cpp:504-508). That text is
+            // the contract.
+            let op =
+                Self::extract_op(&request_value).ok_or_else(|| OpError::failed(NO_SUCH_FIELD))?;
             match op.as_str() {
                 "channels" => {
                     let mut names = (this.channel_lister)().await;
                     names.sort();
                     names.dedup();
-                    Ok((Self::channels_descriptor(), Self::channels_value(names)))
+                    Ok((Self::channels_descriptor(), Self::channels_value(names)).into())
                 }
-                "info" => Ok((Self::info_descriptor(), Self::info_value())),
-                other => Err(OpError::failed(format!(
-                    "unknown op '{other}' (expected 'channels' or 'info')"
-                ))),
+                "info" => Ok((Self::info_descriptor(), Self::info_value()).into()),
+                // pvxs falls off the op chain into `eop->error("Not
+                // implemented")` (serversource.cpp:93) — it never echoes the
+                // op back or lists the ones it knows.
+                _ => Err(OpError::failed(NOT_IMPLEMENTED)),
             }
         }
     }
@@ -402,7 +421,12 @@ mod tests {
             "m:pv".into(),
         ]);
         let (desc, value) = nturi_op("channels");
-        let (resp_desc, resp_value) = src.rpc("server", desc, value).await.expect("rpc ok");
+        let (resp_desc, resp_value) = src
+            .rpc("server", desc, value)
+            .await
+            .expect("rpc ok")
+            .into_value()
+            .expect("value reply");
         // Descriptor is a full NTScalarArray<string>: pvxs replies with
         // `nt::NTScalar{TypeCode::StringA}.create()` (serversource.cpp:55-80),
         // whose `epics:nt/NTScalarArray:1.0` ID promises value + alarm +
@@ -451,7 +475,12 @@ mod tests {
         // (serversource.cpp:19-22). No guid/peerCount/channelCount.
         let src = source_with(vec!["one".into(), "two".into()]);
         let (desc, value) = nturi_op("info");
-        let (_, resp) = src.rpc("server", desc, value).await.expect("rpc ok");
+        let (_, resp) = src
+            .rpc("server", desc, value)
+            .await
+            .expect("rpc ok")
+            .into_value()
+            .expect("value reply");
         let s = match resp {
             PvField::Structure(s) => s,
             other => panic!("unexpected info wrapper: {other:?}"),
@@ -498,7 +527,9 @@ mod tests {
         let (desc, resp) = src
             .rpc("server", FieldDesc::Variant, PvField::Structure(root))
             .await
-            .expect("help rpc ok");
+            .expect("help rpc ok")
+            .into_value()
+            .expect("value reply");
         match &desc {
             FieldDesc::Structure { struct_id, fields } => {
                 assert_eq!(struct_id, "epics:nt/NTScalar:1.0");
@@ -549,9 +580,11 @@ mod tests {
         let src = source_with(vec![]);
         let (desc, value) = nturi_op("frobnicate");
         let err = src.rpc("server", desc, value).await.unwrap_err();
-        assert!(
-            err.message.contains("frobnicate"),
-            "error names the bad op: {err}"
+        // pvxs answers every unmatched op with one bare string
+        // (serversource.cpp:93); it never echoes the op back.
+        assert_eq!(
+            err.message, NOT_IMPLEMENTED,
+            "an unmatched op must carry pvxs's contract text: {err}"
         );
     }
 
@@ -568,9 +601,9 @@ mod tests {
             .rpc("server", FieldDesc::Variant, PvField::Structure(root))
             .await
             .unwrap_err();
-        assert!(
-            err.message.contains("op"),
-            "error mentions missing op: {err}"
+        assert_eq!(
+            err.message, NO_SUCH_FIELD,
+            "a missing `op` must surface pvxs's NoField text, not a hand-written diagnostic: {err}"
         );
     }
 
@@ -587,7 +620,9 @@ mod tests {
         let (_, resp) = src
             .rpc("server", FieldDesc::Variant, PvField::Structure(root))
             .await
-            .expect("flat-struct rpc ok");
+            .expect("flat-struct rpc ok")
+            .into_value()
+            .expect("value reply");
         match resp {
             PvField::Structure(s) => match s.get_field("value") {
                 Some(PvField::ScalarArrayTyped(TypedScalarArray::String(a))) => {
@@ -621,7 +656,9 @@ mod tests {
         let (_, resp) = src
             .rpc("server", FieldDesc::Variant, PvField::Structure(root))
             .await
-            .expect("rpc ok");
+            .expect("rpc ok")
+            .into_value()
+            .expect("value reply");
         // A help reply is an NTScalar<string>; the channel list is a
         // string array. Asserting we got the array proves query.op won
         // over the root-level help.
@@ -654,8 +691,8 @@ mod tests {
             .rpc("server", FieldDesc::Variant, PvField::Structure(root))
             .await
             .unwrap_err();
-        assert!(
-            err.message.contains("op"),
+        assert_eq!(
+            err.message, NO_SUCH_FIELD,
             "present query without op must error, not fall back to root op: {err}"
         );
     }

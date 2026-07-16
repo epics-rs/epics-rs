@@ -304,6 +304,22 @@ pub struct NDArrayInfo {
     pub color_mode: crate::color::NDColorMode,
 }
 
+impl NDArrayInfo {
+    /// C++ `userDims = {xDim, yDim, colorDim}` (`NDPluginROI.cpp:80-82`,
+    /// `NDPluginTransform.cpp:492-494`): the map from a *logical* image axis
+    /// (`0` = X, `1` = Y, `2` = color) to the *physical* [`NDArray::dims`] slot
+    /// that carries it.
+    ///
+    /// Any plugin whose user-facing Dim0/Dim1/Dim2 mean X/Y/color must reach
+    /// `dims` through this map and never with the logical index itself: the two
+    /// only coincide for Mono/Bayer/YUV and RGB3 layouts. For RGB1 the array is
+    /// `[color, x, y]`, so the X axis lives in `dims[1]` — indexing `dims[0]`
+    /// for "Dim0" hands back the color axis.
+    pub fn user_dims(&self) -> [usize; 3] {
+        [self.x_dim, self.y_dim, self.color_dim]
+    }
+}
+
 /// N-dimensional array with typed data buffer.
 #[derive(Debug, Clone)]
 pub struct NDArray {
@@ -364,6 +380,33 @@ impl NDArray {
             pool_id: 0,
             data_size,
         }
+    }
+
+    /// Stamp both timestamps from one time source.
+    ///
+    /// The single owner of the timestamp pair, mirroring C++
+    /// `asynNDArrayDriver::updateTimeStamps` (asynNDArrayDriver.cpp:832-836):
+    ///
+    /// ```text
+    /// updateTimeStamp(&pArray->epicsTS);
+    /// pArray->timeStamp = pArray->epicsTS.secPastEpoch + pArray->epicsTS.nsec/1.e9;
+    /// ```
+    ///
+    /// `timeStamp` is *derived* from `epicsTS`, so the two can never disagree.
+    /// Nothing else may write one without the other — `NDArrayPool::alloc` sets
+    /// neither, exactly as C does.
+    pub fn update_time_stamps(&mut self, epics_ts: EpicsTimestamp) {
+        self.timestamp = epics_ts;
+        self.time_stamp = epics_ts.as_f64();
+    }
+
+    /// Stamp both timestamps from the current wall clock.
+    ///
+    /// Convenience form of [`NDArray::update_time_stamps`] for drivers with no
+    /// custom time source (C++ `updateTimeStamp` falls back to
+    /// `epicsTimeGetCurrent` when no timestamp source is registered).
+    pub fn update_time_stamps_now(&mut self) {
+        self.update_time_stamps(EpicsTimestamp::now());
     }
 
     /// Compute layout info for this array (matching C++ NDArray::getInfo).

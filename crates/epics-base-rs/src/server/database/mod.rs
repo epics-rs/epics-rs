@@ -21,8 +21,35 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use crate::server::pv::ProcessVariable;
-use crate::server::record::{Record, RecordInstance, ScanType};
+use crate::server::record::{Record, RecordInstance, ScanList};
 use crate::types::EpicsValue;
+
+/// What a `.db` definition carries into the creation sink alongside the record
+/// itself: the `dbCommon` fields `db_loader::apply_fields` could not route to
+/// the record's own `field_list`, and the record's `info(...)` tags.
+///
+/// It exists so that [`PvDatabase::add_loaded_record`] receives a record's
+/// COMPLETE loaded state in one call. A caller cannot add the record and then
+/// apply its `.db` fields, because the sink runs C's `iocInit` passes — whose
+/// result depends on those fields — before the record is reachable at all.
+#[derive(Default, Debug, Clone)]
+pub struct RecordLoad {
+    /// `dbCommon` fields, in `.db` file order (a later `field(UDF,…)` wins).
+    pub common_fields: Vec<(String, EpicsValue)>,
+    /// `info(key, "value")` tags.
+    pub info_tags: Vec<(String, String)>,
+}
+
+impl RecordLoad {
+    /// The common fields alone — the shape every `.db` loader path produces
+    /// from [`crate::server::db_loader::apply_fields`].
+    pub fn from_common_fields(common_fields: Vec<(String, EpicsValue)>) -> Self {
+        Self {
+            common_fields,
+            info_tags: Vec::new(),
+        }
+    }
+}
 
 /// Parse a PV name into (base_name, field_name).
 /// "TEMP.EGU" → ("TEMP", "EGU")
@@ -32,6 +59,20 @@ pub fn parse_pv_name(name: &str) -> (&str, &str) {
         Some((base, field)) => (base, field),
         None => (name, "VAL"),
     }
+}
+
+/// C `dbIsValueField` (`dbAccess.c:463-469`): is this field the record
+/// type's *value* field?
+///
+/// A record type's value field is the one the DBD names `VAL` — the DBD
+/// parser records exactly that field's index as `indvalFlddes`
+/// (`dbLexRoutines.c:777-780`), which is what `dbIsValueField` compares
+/// against. Metadata that C/pvxs apply "to VAL only" (e.g. QSRV's
+/// `Q:form` → `display.form.index`, `iocsource.cpp:53`) key on this
+/// predicate, so it lives beside [`parse_pv_name`], whose `"REC"` → `VAL`
+/// default is the other half of the same rule.
+pub fn is_value_field(field: &str) -> bool {
+    field.eq_ignore_ascii_case("VAL")
 }
 
 /// Apply timestamp to a record based on its TSE field.
@@ -198,7 +239,9 @@ struct PvDatabaseInner {
     /// `load_order` sequence (NOT the record name), so two records
     /// sharing a PHAS scan in the order they were loaded, matching a
     /// C IOC built from the same `.db` file.
-    scan_index: RwLock<HashMap<ScanType, BTreeSet<(i16, u64, String)>>>,
+    /// Keyed by [`ScanList`], not `ScanType`: a `Passive` or illegal SCAN names
+    /// no list (C `scanAdd`, dbScan.c:241-251) and so cannot be a key at all.
+    scan_index: RwLock<HashMap<ScanList, BTreeSet<(i16, u64, String)>>>,
     /// Per-record load-order sequence number, assigned monotonically
     /// at `add_record`. Used as the secondary scan-index sort key so
     /// same-PHAS records preserve database load order. Survives a
@@ -212,7 +255,7 @@ struct PvDatabaseInner {
     /// [`CpTarget`]).
     cp_links: RwLock<HashMap<String, Vec<CpTarget>>>,
     /// External (CA/PVA) CP/CPP link index: maps the *external PV name*
-    /// (the cross-IOC source, e.g. `OTHER:PV` from `INP="OTHER:PV CP CA"`)
+    /// (the cross-IOC source, e.g. `OTHER:PV` from `INP="OTHER:PV CP"`)
     /// → holder edges to process when that remote PV changes. The local
     /// [`Self::cp_links`] index is keyed by a local source RECORD that
     /// processes here; a cross-IOC source never processes locally, so its
@@ -241,6 +284,10 @@ struct PvDatabaseInner {
     /// scan-index race, and lets `remove_*` purge dangling aliases
     /// without a second pass.
     registration_mutex: tokio::sync::Mutex<()>,
+    /// The IOC lifecycle phase — the port's `iocInit` boundary. See
+    /// [`DbInitPhase`], [`PvDatabase::begin_load`],
+    /// [`PvDatabase::schedule_record_init`] and [`PvDatabase::ioc_init`].
+    init_phase: std::sync::Mutex<DbInitPhase>,
     /// Lines queued by the iocsh `afterIocRunning <command>` directive
     /// (epics-base PR #558). Drained by the IOC application after PINI
     /// completes, then re-executed through a fresh IocShell so the
@@ -299,6 +346,75 @@ pub struct PvDatabase {
     inner: Arc<PvDatabaseInner>,
 }
 
+/// A record initialisation owed to `iocInit` — the port's `init_record`
+/// tail. Built by a record's `refresh_link_status` and handed to
+/// [`PvDatabase::schedule_record_init`].
+type RecordInit = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>;
+
+/// The IOC lifecycle phase, and with it the answer to "may a record's links be
+/// classified against the database as it stands right now?".
+///
+/// C runs `init_record` — where a record classifies its links (`checkLinks`,
+/// `dbNameToAddr`) — from `iocInit`, i.e. after EVERY `dbLoadRecords` block
+/// has been read. A forward reference across two `dbLoadRecords` calls in one
+/// `st.cmd` is therefore a LOCAL link, deterministically, and the classified
+/// value is final the moment `iocInit` returns (`dbgf` is refused before it).
+///
+/// The boundary is `iocInit`, NOT a load group: gating on the load group left
+/// the multi-`dbLoadRecords` case every real `st.cmd` uses racing 9-in-15
+/// (R18-92). So the phase here is an ioc-lifecycle state.
+///
+/// # The lifecycle is ONE-WAY: `Unloaded → Loading → Running`
+///
+/// R18-92 modelled it with two states, `Loading` and `Complete`, where
+/// `Complete` meant BOTH "never loaded" and "iocInit has run" — so `begin_load`
+/// needed a `Complete → Loading` arm to open the phase at all, and that arm ran
+/// on a post-iocInit load too. One `dbLoadRecords` typed after `iocInit` then
+/// re-armed the queue that only `ioc_init` drains, and every later
+/// classification — including every runtime `special()` link re-point — was
+/// pushed into a `Vec` nothing polls (R19-62, measured: `iocInit;
+/// dbLoadRecords(b.db); dbpf CO.INPA "9.5"` froze `CO.INAV` at 0).
+///
+/// Splitting the two meanings is what closes it: `Loading` is now produced ONLY
+/// from `Unloaded`, so no function in the crate can transition backwards out of
+/// `Running`. The one-way-ness is a property of the transitions that exist, not
+/// of a runtime check.
+enum DbInitPhase {
+    /// No load has begun. `iocInit` is owed nothing, so a classification runs
+    /// immediately — a programmatically built or unit-test database.
+    Unloaded,
+    /// Between the first `dbLoadRecords`/builder load and `iocInit`; holds the
+    /// classifications owed, in issue order. A half-built database is never
+    /// observed, because no classification code runs against one.
+    Loading(Vec<RecordInit>),
+    /// `iocInit` has run: the database is final and every link status is
+    /// classified. A classification issued now runs immediately, which is what a
+    /// runtime re-point (`special()` on a link field) needs. TERMINAL — nothing
+    /// re-opens the load phase.
+    Running,
+}
+
+/// [`PvDatabase::begin_load`] was called on a database whose `iocInit` has
+/// already run — C's `getIocState() != iocVoid` (R19-63).
+///
+/// The `Display` text is C's `errSymMsg(S_dbLib_postInitRecRegister)` verbatim
+/// (`dbStaticLib.h:269`), which is what `dbCreateRecord` prints:
+///
+/// ```text
+/// epics> dbCreateRecord(pdbbase,"ai","NEWREC")
+/// ERROR: 33554463 IOC already initialized - No new records can be added
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IocAlreadyInitialized;
+
+impl std::fmt::Display for IocAlreadyInitialized {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("IOC already initialized - No new records can be added")
+    }
+}
+
+impl std::error::Error for IocAlreadyInitialized {}
+
 /// Which record kind a SELM link selection is being computed for.
 /// The Specified/Mask base differs between record types in C, so the
 /// shared selector must know the caller.
@@ -327,14 +443,46 @@ pub(crate) struct SelmResult {
 }
 
 /// Convert a link value to `epicsUInt16` with C `dbGetLink(.., DBR_USHORT,
-/// ..)` cast semantics. The dbConvert GET macro stores `*pdst =
-/// (epicsUInt16) *psrc` (`dbConvert.c:63-70`) — a C cast that truncates
-/// toward zero then wraps modulo 2^16, NOT a clamp. So `-1` becomes
-/// `65535` and `65536` becomes `0`. Used for fanout/dfanout/seq
-/// `SELL`→`SELN` so a constant, DB, CA, or PVA link source all convert
-/// by the one rule C applies through `dbFastGetConvertRoutine`.
+/// ..)` semantics, for the fanout/dfanout/seq `SELL`→`SELN` read — so a
+/// constant, DB, CA, or PVA link source all convert by the one rule C applies
+/// through `dbFastGetConvertRoutine`.
+///
+/// # The source type decides the rule, because in C it decides the routine
+///
+/// `dbFastGetConvertRoutine` is a 2-D table indexed by *both* the source DBF
+/// and the destination DBR (`dbConvert.c:1571-1638`): a `DBF_LONG` source
+/// reaches `getLongUshort`, a `DBF_DOUBLE` source reaches `getDoubleUshort`.
+/// They are different functions, and C gives them different semantics:
+///
+/// * **Integer source** — `(epicsUInt16)(epicsInt32)v`. Conversion of an
+///   out-of-range *integer* to an unsigned type is **defined** in C
+///   (C17 6.3.1.3p2: reduce modulo `USHRT_MAX + 1`). Every compiler and
+///   every target agrees, so this is a real contract and the port keeps it:
+///   `SELL` pointing at a `DBF_LONG` field holding `-1` gives `SELN = 65535`.
+/// * **Float source** — `(epicsUInt16)d`. Conversion of an out-of-range
+///   *float* is **undefined** (C17 6.3.1.4p1), so compiled C is not
+///   single-valued: x86-64 wraps, aarch64 saturates. What the port does about
+///   that is [`crate::types::c_cast`]'s call — the single owner of the policy —
+///   and deliberately not restated here.
+///
+/// Both rules already live in [`EpicsValue::convert_to`], the single
+/// value-coercion owner: it takes the integer view (`as_int_i64`) when the
+/// source has one and falls back to `c_cast` only for a genuine float. So this
+/// is a thin projection onto that owner, NOT a second conversion table.
+///
+/// The previous revision called `c_cast::f64_to_u16(value.to_f64())` directly,
+/// bypassing the owner — which silently applied the float rule to integer
+/// sources too, losing the one wrap C actually defines.
 pub(crate) fn dbr_ushort_cast(value: &EpicsValue) -> u16 {
-    (value.to_f64().unwrap_or(0.0) as i64) as u16
+    match value.convert_to(crate::types::DbFieldType::UShort) {
+        EpicsValue::UShort(v) => v,
+        // A link that delivers an array converts element-wise; C's
+        // `dbGetLink(.., &prec->seln, 0, 0)` requests ONE element, so SELN
+        // takes the first (an empty array leaves it 0).
+        EpicsValue::UShortArray(v) => v.first().copied().unwrap_or(0),
+        // `convert_to(UShort)` returns no other variant.
+        _ => 0,
+    }
 }
 
 /// Select which link indices are active based on SELM/SELN, applying
@@ -345,9 +493,8 @@ pub(crate) fn dbr_ushort_cast(value: &EpicsValue) -> u16 {
 ///
 /// `seln` is the native `DBF_USHORT` value: C declares `SELN` as
 /// `epicsUInt16`, so every comparison below is unsigned, matching C's
-/// selection arithmetic. A `SELL=-1` link read therefore selects
-/// `65535` (out of range → INVALID for Specified, all-bits for Mask),
-/// not `-1`.
+/// selection arithmetic — never `-1`. What an out-of-range `SELL` converts
+/// *to* is [`dbr_ushort_cast`]'s decision, not this function's.
 ///
 /// C references:
 /// * fanout — `fanoutRecord.c:106-141`
@@ -449,6 +596,7 @@ impl PvDatabase {
                 external_cp_links: RwLock::new(HashMap::new()),
                 aliases: RwLock::new(HashMap::new()),
                 registration_mutex: tokio::sync::Mutex::new(()),
+                init_phase: std::sync::Mutex::new(DbInitPhase::Unloaded),
                 after_ioc_running: std::sync::Mutex::new(Vec::new()),
                 scan_started: std::sync::atomic::AtomicBool::new(false),
                 pini_done: std::sync::atomic::AtomicBool::new(false),
@@ -802,15 +950,25 @@ impl PvDatabase {
         };
         let inst = rec.read().await;
         let mut out = Vec::new();
-        let push = |field: &str, raw: &str, out: &mut Vec<_>| {
+        // Each field is parsed for ITS OWN link-field type: C `dbPutFieldLink`
+        // passes `pfldDes->field_type` to `dbParseLink` (`dbAccess.c:1094`),
+        // which then masks the modifiers by that type (`dbStaticLib.c:2380-2391`).
+        // `OUT` is `DBF_OUTLINK`, so its CP/CPP is discarded here rather than
+        // reaching `setup_cp_links` — an `OUT` link must never be registered as
+        // a CP holder.
+        let push = |field: &str,
+                    raw: &str,
+                    ftype: crate::server::record::LinkFieldType,
+                    out: &mut Vec<_>| {
             if raw.is_empty() {
                 return;
             }
-            let parsed = crate::server::record::parse_link_v2(raw);
+            let parsed = crate::server::record::parse_link_field(raw, ftype);
             if !matches!(parsed, crate::server::record::ParsedLink::None) {
                 out.push((field.to_string(), raw.to_string(), parsed));
             }
         };
+        use crate::server::record::LinkFieldType;
         // Canonical link-bearing fields stored on `CommonFields` as raw
         // String. These do NOT appear as `DbFieldType::String` entries in
         // `field_list()`: an `ai`'s `INP` / an `ao`'s `OUT` carry
@@ -822,10 +980,10 @@ impl PvDatabase {
         // is the single owner of "which fields on a record are links",
         // shared by `setup_cp_links` (CA CP/CPP) and the pvalink install
         // scan (PVA CP/CPP).
-        push("INP", &inst.common.inp, &mut out);
-        push("OUT", &inst.common.out, &mut out);
-        push("TSEL", &inst.common.tsel, &mut out);
-        push("SDIS", &inst.common.sdis, &mut out);
+        push("INP", &inst.common.inp, LinkFieldType::In, &mut out);
+        push("OUT", &inst.common.out, LinkFieldType::Out, &mut out);
+        push("TSEL", &inst.common.tsel, LinkFieldType::In, &mut out);
+        push("SDIS", &inst.common.sdis, LinkFieldType::In, &mut out);
         // Record-specific multi-input links (INPA..INPL for
         // calc/calcout/sel/sub) and the CP-capable input link fields
         // (DOL family, NVL, SELL, SGNL).
@@ -838,7 +996,7 @@ impl PvDatabase {
         field_names.extend_from_slice(crate::server::database::links::CP_INPUT_LINK_FIELDS);
         for field in field_names {
             if let Some(EpicsValue::String(s)) = inst.record.get_field(field) {
-                push(field, &s.as_str_lossy(), &mut out);
+                push(field, &s.as_str_lossy(), LinkFieldType::In, &mut out);
             }
         }
         out
@@ -1008,6 +1166,94 @@ impl PvDatabase {
         self.inner.simple_pvs.write().await.remove(name)
     }
 
+    /// Enter the LOAD phase: records are being created and the database is not
+    /// yet the one C would classify links against. Called by every path that
+    /// begins creating records for an IOC — an `IocBuilder` build, an iocsh
+    /// `dbLoadRecords` / `dbCreateRecord`, `IocApp::run` — and idempotent within
+    /// the phase, because an `st.cmd` issues several loads and they are all one
+    /// `iocInit` (R18-92).
+    ///
+    /// # Refused once the IOC is running (R19-63)
+    ///
+    /// C admits no record creation after `iocInit`: `dbReadCOM`
+    /// (`dbLexRoutines.c:236`) fails every `.db`/`.dbd` read with `-2` once
+    /// `getIocState() != iocVoid`, and `dbCreateRecordCallFunc`
+    /// (`dbStaticIocRegister.c:288`) fails with `S_dbLib_postInitRecRegister`.
+    /// Asking to create records IS asking to enter the load phase, so the answer
+    /// lives here and is a `Result` the caller cannot ignore — a creator that
+    /// never asked cannot be written by accident, and one that asked cannot
+    /// proceed on a refusal.
+    ///
+    /// The phase is left ONLY by [`Self::ioc_init`], and once left it is
+    /// TERMINAL (R19-62): the queue is drained by exactly one `ioc_init`, so
+    /// nothing can be pushed into it afterwards and stranded. A load that fails
+    /// halfway leaves the phase open, which strands nothing: a queued
+    /// classification blocks no caller, and it is dropped with the database.
+    #[must_use = "C refuses a load after iocInit (dbReadCOM, dbLexRoutines.c:236); \
+                  the refusal must be reported and no record created"]
+    pub fn begin_load(&self) -> Result<(), IocAlreadyInitialized> {
+        let mut phase = self.inner.init_phase.lock().unwrap();
+        match *phase {
+            // The only producer of `Loading`.
+            DbInitPhase::Unloaded => {
+                *phase = DbInitPhase::Loading(Vec::new());
+                Ok(())
+            }
+            // An `st.cmd` issues several loads; they are all one `iocInit`.
+            DbInitPhase::Loading(_) => Ok(()),
+            // Post-`iocInit`: terminal. Refused, as C refuses it.
+            DbInitPhase::Running => Err(IocAlreadyInitialized),
+        }
+    }
+
+    /// Schedule a record's link-status classification — the port's
+    /// `init_record` tail (C `checkLinks`).
+    ///
+    /// During the LOAD phase the future is QUEUED for [`Self::ioc_init`]; a
+    /// half-built database cannot be classified against because the code that
+    /// would do it has not been polled. Before any load, and once `iocInit` has
+    /// run, it is spawned at once — which is what a runtime `special()` link
+    /// re-point needs.
+    pub(crate) fn schedule_record_init(
+        &self,
+        init: impl std::future::Future<Output = ()> + Send + 'static,
+    ) {
+        let mut phase = self.inner.init_phase.lock().unwrap();
+        match &mut *phase {
+            DbInitPhase::Loading(queued) => queued.push(Box::pin(init)),
+            DbInitPhase::Unloaded | DbInitPhase::Running => {
+                drop(phase);
+                tokio::spawn(init);
+            }
+        }
+    }
+
+    /// The `iocInit` barrier: end the LOAD phase and run every classification
+    /// owed, to completion.
+    ///
+    /// After this returns the database is complete and every link status is
+    /// FINAL — C's guarantee, where `init_record` runs inside `iocInit` and a
+    /// `dbgf REC.INAV` right after it reads the classified value (before it, C
+    /// refuses `dbgf` outright). Idempotent: an `st.cmd` that spells `iocInit`
+    /// out and the `IocApp` that runs one anyway are the same single boundary.
+    pub async fn ioc_init(&self) {
+        let owed = {
+            let mut phase = self.inner.init_phase.lock().unwrap();
+            match std::mem::replace(&mut *phase, DbInitPhase::Running) {
+                DbInitPhase::Loading(queued) => queued,
+                // An IOC that loaded nothing (programmatic / unit-test database)
+                // still crosses the barrier: the phase becomes terminal.
+                DbInitPhase::Unloaded => return,
+                DbInitPhase::Running => return,
+            }
+        };
+        // Sequential, in issue order: each classification is a short read of a
+        // now-immutable record set, and C's `init_record` pass is a loop too.
+        for init in owed {
+            init.await;
+        }
+    }
+
     /// Add a record (accepts a boxed Record to avoid double-boxing).
     ///
     /// Returns `Err` when `name` collides with an existing record,
@@ -1019,6 +1265,35 @@ impl PvDatabase {
     /// TOCTOU window where `remove_record` could land between them
     /// and leave a phantom scan entry.
     pub async fn add_record(&self, name: &str, record: Box<dyn Record>) -> CaResult<()> {
+        self.add_loaded_record(name, record, RecordLoad::default())
+            .await
+    }
+
+    /// Add a record together with the field set its `.db` definition loaded
+    /// into it — the creation sink for every `dbLoadRecords` path.
+    ///
+    /// C's `dbLoadRecords` writes a record's ENTIRE field set through
+    /// `dbStaticLib` (including the `UDF = 0` that `dbPutString`
+    /// (`dbStaticLib.c:2653-2661`) implies for any put to a field named
+    /// `VAL`), and only afterwards does `iocInit::doInitRecord0`
+    /// (`iocInit.c:508-536`) evaluate `if (udf && stat == UDF_ALARM) sevr =
+    /// udfs`. The port used to add the record first and apply its loaded common
+    /// fields afterwards, so the init passes ran against a PRE-LOAD field set:
+    /// every record with a `field(VAL,…)` latched `SEVR = INVALID` at creation
+    /// and the `UDF = 0` that arrived a moment later could not lower it again.
+    /// A whole `.db` of setpoint defaults and sim constants came up red.
+    ///
+    /// Taking the loaded fields here is what makes C's ordering hold by
+    /// construction: there is no window in which the init passes can observe a
+    /// record whose `.db` fields have not landed, because the record is not
+    /// reachable until they have. [`RecordInstance::run_init_passes`] is
+    /// crate-private for the same reason — the sink is the only caller.
+    pub async fn add_loaded_record(
+        &self,
+        name: &str,
+        record: Box<dyn Record>,
+        load: RecordLoad,
+    ) -> CaResult<()> {
         let _gate = self.inner.registration_mutex.lock().await;
         self.check_name_free(name).await?;
         let mut instance = RecordInstance::new_boxed(name.to_string(), record);
@@ -1048,6 +1323,45 @@ impl PvDatabase {
             }
         }
 
+        // The `.db` load, applied to the instance BEFORE the init passes below
+        // — C's `dbLoadRecords` → `iocInit` ordering. The `.db` value coercion
+        // (`put_common_field_db_load`) differs from a runtime `dbPut`'s: C's
+        // loader converter has a wider menu bound (`dbStaticRun.c`).
+        //
+        // The scan-index entry is built from `instance.common.scan` further
+        // down, i.e. from the POST-load field set, so a `field(SCAN,…)` needs
+        // no index fix-up here — the record has not been published yet.
+        for (field, value) in load.common_fields {
+            if let Err(e) = instance.put_common_field_db_load(&field, value) {
+                eprintln!("put_common_field({field}) failed for {name}: {e}");
+            }
+        }
+        // `info(...)` tags land before `init_record`, so device support that
+        // reads them at init sees the values.
+        for (key, value) in &load.info_tags {
+            instance.set_info(key, value);
+        }
+
+        // C's `iocInit` init passes, through their owner (the `doInitRecord0`
+        // prologue — `pact = FALSE` plus the initial UDF severity — then
+        // `init_record(0)`, `init_record(1)`, and the UDF tail). This sink is
+        // the single site that runs them: a record built programmatically, by
+        // iocsh `dbCreateRecord`, or from a `.db` is initialised the same way,
+        // and — since the load above has already landed — always against its
+        // FINAL field set.
+        instance.run_init_passes(name);
+
+        // The init-seed owner: every CONSTANT link the record declares
+        // (`Record::constant_init_links`) is loaded into its value field ONCE,
+        // here — a constant delivers NOTHING at process time
+        // (`dbConstLink.c:219-225`). `add_record` is the creation sink every
+        // path funnels through, so this covers a record built programmatically
+        // as well as one loaded from a .db; `IocBuilder`/`dbLoadRecords` call
+        // the owner again after `init_record(1)`, once the record's final
+        // NELM/FTVL buffer exists for an array constant to land in. Seeding
+        // twice is a no-op — both run before any client put.
+        super::database::processing::seed_constant_links(&mut instance);
+
         let scan = instance.common.scan;
         let phas = instance.common.phas;
         self.inner
@@ -1068,12 +1382,12 @@ impl PvDatabase {
             .await
             .insert(name.to_string(), seq);
 
-        if scan != ScanType::Passive {
+        if let Some(list) = scan.scan_list() {
             self.inner
                 .scan_index
                 .write()
                 .await
-                .entry(scan)
+                .entry(list)
                 .or_default()
                 .insert((phas, seq, name.to_string()));
         }
@@ -1129,12 +1443,12 @@ impl PvDatabase {
         // 2) Drop from scan index if it was scheduled. Match by record
         // name only — PHAS and load_order are not needed and may be
         // stale relative to the entry actually present.
-        if scan != ScanType::Passive {
+        if let Some(list) = scan.scan_list() {
             let mut idx = self.inner.scan_index.write().await;
-            if let Some(set) = idx.get_mut(&scan) {
+            if let Some(set) = idx.get_mut(&list) {
                 set.retain(|(_, _, n)| n != name);
                 if set.is_empty() {
-                    idx.remove(&scan);
+                    idx.remove(&list);
                 }
             }
         }
@@ -1574,31 +1888,53 @@ mod tests {
         assert_eq!(r.indices, vec![0, 2]);
     }
 
+    /// `SELN` is unsigned, and the rule that makes it unsigned depends on the
+    /// SOURCE type — because in C the source type picks the conversion routine.
     #[test]
-    fn seln_is_unsigned_dbr_ushort_cast() {
-        use crate::server::record::AlarmSeverity;
-        // `dbr_ushort_cast` reproduces C's `(epicsUInt16)` cast
-        // (dbConvert.c:63-70): truncate toward zero, wrap mod 2^16, NOT a
-        // clamp. SELL=-1 → 65535, SELL=65536 → 0.
-        assert_eq!(dbr_ushort_cast(&EpicsValue::Double(-1.0)), 65535);
-        assert_eq!(dbr_ushort_cast(&EpicsValue::Double(65536.0)), 0);
-        assert_eq!(dbr_ushort_cast(&EpicsValue::Double(3.7)), 3);
+    fn seln_cast_follows_the_source_type() {
+        // Integer source -> `getLongUshort`, `(epicsUInt16)(epicsInt32)v`.
+        // C DEFINES this (C17 6.3.1.3p2, modulo 2^16), so we reproduce it.
         assert_eq!(dbr_ushort_cast(&EpicsValue::Long(-1)), 65535);
+        assert_eq!(dbr_ushort_cast(&EpicsValue::Long(65536)), 0);
+        assert_eq!(dbr_ushort_cast(&EpicsValue::Short(-1)), 65535);
+        assert_eq!(dbr_ushort_cast(&EpicsValue::Int64(-1)), 65535);
+        assert_eq!(dbr_ushort_cast(&EpicsValue::Long(3)), 3);
 
-        // SELL=-1 casts to the unsigned `DBF_USHORT` value 65535.
+        // Float source -> `getDoubleUshort`, `(epicsUInt16)d`. C leaves this
+        // UNDEFINED (C17 6.3.1.4p1), and whatever `types::c_cast` decides to do
+        // about that is a SEPARATE question from this one — the point here is
+        // only that the float source takes the float rule and the integer
+        // source does not.
+        assert_eq!(
+            dbr_ushort_cast(&EpicsValue::Double(-1.0)),
+            crate::types::c_cast::f64_to_u16(-1.0)
+        );
+        assert_eq!(
+            dbr_ushort_cast(&EpicsValue::Double(65536.0)),
+            crate::types::c_cast::f64_to_u16(65536.0)
+        );
+        // In range: no policy in play, both rules truncate toward zero.
+        assert_eq!(dbr_ushort_cast(&EpicsValue::Double(3.7)), 3);
+    }
+
+    /// Whatever produced it, a `SELN` of 65535 selects nothing under Specified
+    /// (out of range -> INVALID) and everything under Mask.
+    #[test]
+    fn seln_at_the_unsigned_maximum_selects_by_selm() {
+        use crate::server::record::AlarmSeverity;
         let seln_max = 65535u16;
-        // fanout/seq Specified: C `i = (epicsUInt16)seln + offs` =
-        // 65535 → out of range → INVALID. The old signed read clamped to
-        // 0 and drove link 0.
+        // fanout/seq Specified: C `i = (epicsUInt16)seln + offs` = 65535 →
+        // out of range → INVALID. A signed read would clamp to 0 and wrongly
+        // drive link 0.
         let r = select_link_indices_ex(SelmKind::FanoutSeq, 1, seln_max, 0, 0, 16);
         assert!(r.indices.is_empty());
         assert_eq!(r.alarm, Some((15, AlarmSeverity::Invalid)));
-        // fanout/seq Mask: 65535 → all 16 low bits set → every link. The
-        // old clamp produced an empty mask.
+        // fanout/seq Mask: 65535 → all 16 low bits set → every link. A signed
+        // read would produce an empty mask.
         let r = select_link_indices_ex(SelmKind::FanoutSeq, 2, seln_max, 0, 0, 16);
         assert_eq!(r.indices, (0..16).collect::<Vec<_>>());
-        // dfanout Specified: 65535 > count → INVALID. The old signed read
-        // saw -1 ≤ 0 → drove nothing with no alarm.
+        // dfanout Specified: 65535 > count → INVALID. A signed read would see
+        // -1 ≤ 0 → drive nothing, with no alarm.
         let r = select_link_indices_ex(SelmKind::Dfanout, 1, seln_max, 0, 0, 16);
         assert!(r.indices.is_empty());
         assert_eq!(r.alarm, Some((15, AlarmSeverity::Invalid)));

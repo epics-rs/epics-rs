@@ -994,7 +994,7 @@ async fn scan_target_should_process(
         return false;
     }
     if tg.is_processing() {
-        tg.common.rpro = true;
+        tg.common.rpro = 1;
         return false;
     }
     true
@@ -2242,7 +2242,7 @@ mod tests {
         ) -> epics_base_rs::error::CaResult<()> {
             Ok(())
         }
-        fn field_list(&self) -> &'static [epics_base_rs::server::record::FieldDesc] {
+        fn declared_fields(&self) -> &'static [epics_base_rs::server::record::FieldDesc] {
             &[]
         }
     }
@@ -2317,10 +2317,7 @@ mod tests {
         // Hold the record Arc and drive it into PACT (async in
         // progress) before the db moves into the forwarder slot.
         let dest = db.get_record("DEST").await.unwrap();
-        dest.write()
-            .await
-            .processing
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        dest.write().await.enter_pact();
 
         // CP target: scans on every event.
         let mut fanout = ScanFanout::default();
@@ -2358,7 +2355,7 @@ mod tests {
         // ... and RPRO was armed so the standard RPRO mechanism
         // reprocesses it once the async cycle completes.
         assert!(
-            dest.read().await.common.rpro,
+            dest.read().await.common.rpro != 0,
             "a PACT target must get rpro=true (pvxs prec->rpro = TRUE)"
         );
     }
@@ -2866,7 +2863,7 @@ mod tests {
         fn put_field(&mut self, _n: &str, _v: EpicsValue) -> epics_base_rs::error::CaResult<()> {
             Ok(())
         }
-        fn field_list(&self) -> &'static [epics_base_rs::server::record::FieldDesc] {
+        fn declared_fields(&self) -> &'static [epics_base_rs::server::record::FieldDesc] {
             &[]
         }
     }
@@ -3243,7 +3240,7 @@ mod tests {
         }"#;
         let provider = Arc::new(BridgeProvider::new(db.clone()));
         provider.load_group_config(GROUP_JSON).expect("load group");
-        provider.process_groups();
+        provider.process_groups().await;
         assert!(
             provider.has_group_pv("LOCAL:GROUP"),
             "group PV must be registered in the provider"
@@ -3898,7 +3895,7 @@ mod tests {
         ) -> epics_base_rs::error::CaResult<()> {
             Ok(())
         }
-        fn field_list(&self) -> &'static [epics_base_rs::server::record::FieldDesc] {
+        fn declared_fields(&self) -> &'static [epics_base_rs::server::record::FieldDesc] {
             &[]
         }
     }

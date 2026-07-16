@@ -1,6 +1,8 @@
 use std::borrow::Cow;
 
-use crate::types::EpicsValue;
+use crate::error::{CaError, CaResult};
+use crate::runtime::json_string::{decode_json_string, decode_json_string_token};
+use crate::types::{DbfLinkClass, EpicsValue};
 
 /// Link processing policy for input/output links.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -280,14 +282,19 @@ pub struct CaLink {
     pub pv: String,
     pub monitor_switch: MonitorSwitch,
     /// Link-processing policy carried by this link's parsed modifier,
-    /// exactly as [`DbLink::policy`] does. A `CA`/`ca://` link can carry
-    /// `CP`/`CPP` (`"OTHER:PV CP CA"`, `"ca://OTHER:PV CPP"`); the dbCa
+    /// exactly as [`DbLink::policy`] does. When it is `CP`/`CPP`, the dbCa
     /// equivalent (`calink`) must subscribe a monitor and process the
     /// link-holder on every remote change (C `dbCa.c:993-994`
-    /// `CA_DBPROCESS`). Pre-fix this was dropped at parse time, so a
-    /// cross-IOC `CP`/`CPP` link silently never processed its holder.
-    /// `cp_passive_only()`
-    /// reads it identically to the local DB path.
+    /// `CA_DBPROCESS`); `cp_passive_only()` reads it identically to the local
+    /// DB path.
+    ///
+    /// A `CP`/`CPP` `CaLink` arises from the `ca://` scheme
+    /// (`"ca://OTHER:PV CPP"`) or from `classify_cp_link` re-routing a
+    /// `CP`/`CPP` link whose target is not a local record. It does **not**
+    /// arise from a plaintext ` CA` modifier: `CA` is a process *class* in C's
+    /// single `else if` chain (`dbStaticLib.c:2369-2373`), mutually exclusive
+    /// with `CP`/`CPP` and matched *before* `CP`, so `"OTHER:PV CP CA"` is
+    /// `pvlOptCA` alone — a plain CA link whose holder never processes.
     pub policy: LinkProcessPolicy,
 }
 
@@ -340,7 +347,180 @@ pub enum LinkType {
     Other,
 }
 
+/// The link type a `device()` declaration demands, and the type a link's *text*
+/// parses to — C's `link.h` discriminants, which are the two sides
+/// `dbCanSetLink` compares.
+///
+/// This is deliberately NOT [`LinkType`]. `LinkType` is the *runtime* kind of an
+/// established link (a `PV_LINK` becomes `DB_LINK` or `CA_LINK` once the target
+/// is looked up at `iocInit`); `DbLinkType` is the *static* kind the `.dbd` and
+/// the `.db` text agree on at load time, before any lookup has happened. Fusing
+/// them is what makes a link field mean two things at once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DbLinkType {
+    /// `CONSTANT` — a literal, or an unset link. Also what C expects of every
+    /// link field that is *not* the device link (`INP`/`OUT`), because those
+    /// have no `devSup` and `dbCanSetLink` defaults `expected_type` to
+    /// `CONSTANT` (`dbStaticLib.c:2403`).
+    Constant,
+    /// `PV_LINK` — `record.FLD` / `pv MS PP`. Not yet resolved to DB vs CA.
+    PvLink,
+    /// `JSON_LINK` — `{const:1}`, `{calc:{...}}`, `{pva:{...}}`.
+    JsonLink,
+    /// `VME_IO` — `#Cn Sn @parm`.
+    VmeIo,
+    /// `CAMAC_IO`, `AB_IO`, … — declared by some device supports, never parsed
+    /// into a distinct [`ParsedLink`] variant by this port.
+    CamacIo,
+    AbIo,
+    GpibIo,
+    BitbusIo,
+    /// `INST_IO` — `@dev arg …`. The form every asyn-based device support uses.
+    InstIo,
+    BbgpibIo,
+    RfIo,
+    VxiIo,
+}
+
+impl DbLinkType {
+    /// The C name, for the error message C prints.
+    pub fn c_name(self) -> &'static str {
+        match self {
+            DbLinkType::Constant => "CONSTANT",
+            DbLinkType::PvLink => "PV_LINK",
+            DbLinkType::JsonLink => "JSON_LINK",
+            DbLinkType::VmeIo => "VME_IO",
+            DbLinkType::CamacIo => "CAMAC_IO",
+            DbLinkType::AbIo => "AB_IO",
+            DbLinkType::GpibIo => "GPIB_IO",
+            DbLinkType::BitbusIo => "BITBUS_IO",
+            DbLinkType::InstIo => "INST_IO",
+            DbLinkType::BbgpibIo => "BBGPIB_IO",
+            DbLinkType::RfIo => "RF_IO",
+            DbLinkType::VxiIo => "VXI_IO",
+        }
+    }
+
+    /// `dbCanSetLink` (`dbStaticLib.c:2400-2419`), verbatim: the parsed type may
+    /// be installed on a field whose device declares `self` iff they are equal,
+    /// or both are drawn from the interchangeable
+    /// `{CONSTANT, JSON_LINK, PV_LINK}` set — those three are what
+    /// `dbPutString` will happily re-parse into one another at runtime, so C
+    /// lets the `.db` pick any of them.
+    ///
+    /// Every hardware type is therefore exact-match only: an `INST_IO` device
+    /// support gets `@…` or nothing.
+    pub fn accepts(self, parsed: DbLinkType) -> bool {
+        if self == parsed {
+            return true;
+        }
+        let soft = |t: DbLinkType| {
+            matches!(
+                t,
+                DbLinkType::Constant | DbLinkType::JsonLink | DbLinkType::PvLink
+            )
+        };
+        soft(self) && soft(parsed)
+    }
+}
+
+/// The link type the `.dbd` declares for one link field of one record — C's
+/// `dbCanSetLink` `expected_type` (`dbStaticLib.c:2403`).
+///
+/// `None` means *no declaration exists*, not "no constraint": the record type
+/// brings no vendored `.dbd` (`motor`, `table`, `scaler`, … — their device
+/// support registers at runtime), or its `DTYP` names a device no vendored
+/// `.dbd` declares (`asynInt32` on an `ai`). C has a `devSup` there and this
+/// port does not, so there is nothing to compare and nothing is invented.
+///
+/// `dtyp` is the record's DTYP text, or `None` when the `.db` never spelled it —
+/// which is NOT "no device": `DTYP` is a `DBF_DEVICE` menu index and its default
+/// is 0, so the record is bound to the FIRST device its `.dbd` declares. C
+/// rejects `record(ai,"X") { field(INP,"@instio parm") }` on exactly that
+/// ground (measured on the built 7.0.10.1-DEV `softIoc`).
+pub fn declared_link_type(
+    record_type: &str,
+    dtyp: Option<&str>,
+    upper_field: &str,
+) -> Option<DbLinkType> {
+    // C `dbLexRoutines.c:571`: only INP/OUT are device links. Every other link
+    // field has no `devSup`, so `dbCanSetLink` expects CONSTANT — which is why
+    // the C IOC refuses `field(SDIS,"@instio parm")` on any record type.
+    if !matches!(upper_field, "INP" | "OUT") {
+        return Some(DbLinkType::Constant);
+    }
+    let menu = super::dbd_generated::device_menu(record_type)?;
+    let dtyp = dtyp
+        .filter(|d| !d.is_empty())
+        .or_else(|| menu.first().copied())?;
+    super::dbd_generated::device_link_type(record_type, dtyp)
+}
+
+/// C `dbCanSetLink` (`dbStaticLib.c:2400-2419`) as the single gate every link
+/// assignment passes: the db-load one (`dbStaticLib.c:2222`) and the runtime
+/// `dbPutField` one (`dbAccess.c:1133`), which in C are two call sites of this
+/// one function and here are two call sites of this one function.
+///
+/// `Ok(())` when there is no declaration to enforce (see [`declared_link_type`])
+/// or when the link's parsed type is one the bound device support takes.
+pub fn check_link_assignment(
+    record_type: &str,
+    dtyp: Option<&str>,
+    upper_field: &str,
+    text: &str,
+) -> CaResult<()> {
+    let Some(class) = crate::types::dbf_link_class(record_type, upper_field) else {
+        return Ok(());
+    };
+    let Some(expected) = declared_link_type(record_type, dtyp, upper_field) else {
+        return Ok(());
+    };
+    let ftype = match class {
+        DbfLinkClass::InLink => LinkFieldType::In,
+        DbfLinkClass::OutLink => LinkFieldType::Out,
+        DbfLinkClass::FwdLink => LinkFieldType::Fwd,
+    };
+    let Some(parsed) = parse_link_field(text, ftype).db_link_type() else {
+        return Ok(());
+    };
+    if expected.accepts(parsed) {
+        return Ok(());
+    }
+    Err(CaError::InvalidValue(format!(
+        "{record_type}.{upper_field}: can't initialize link type {} with \"{text}\" (type {})",
+        expected.c_name(),
+        parsed.c_name(),
+    )))
+}
+
 impl ParsedLink {
+    /// The static [`DbLinkType`] this link's text parses to — C's
+    /// `dbLinkInfo::ltype` as `dbParseLink` sets it.
+    ///
+    /// `ParsedLink::None` is `CONSTANT` because that is what C's parser makes of
+    /// the empty string, and C rejects `field(INP,"")` on an `INST_IO` device
+    /// for exactly that reason (measured on the built 7.0.10.1-DEV `softIoc`).
+    /// A link the `.db` never mentions at all is a different thing — C never
+    /// reaches `dbCanSetLink` for it (`if (!plink->text) continue;`,
+    /// `dbStaticLib.c:2213`) — and so it must not be handed to this function.
+    ///
+    /// `None` for [`HwLinkKind::Other`]: this port keeps the payload of the
+    /// remaining C hardware forms (`#Bn Cn Nn …`) verbatim rather than
+    /// discriminating them, so there is no type to compare and the honest answer
+    /// is "cannot say" — not a guess that would reject a `.db` C accepts.
+    pub fn db_link_type(&self) -> Option<DbLinkType> {
+        Some(match self {
+            ParsedLink::None | ParsedLink::Constant(_) => DbLinkType::Constant,
+            ParsedLink::Db(_) | ParsedLink::Ca(_) | ParsedLink::Pva(_) => DbLinkType::PvLink,
+            ParsedLink::PvaJson(_) | ParsedLink::Calc(_) => DbLinkType::JsonLink,
+            ParsedLink::Hw(hw) => match hw.kind {
+                HwLinkKind::InstIo => DbLinkType::InstIo,
+                HwLinkKind::VmeIo => DbLinkType::VmeIo,
+                HwLinkKind::Other => return None,
+            },
+        })
+    }
+
     /// The discriminated [`LinkType`] of this link — the C
     /// `prec->xxx.type` analogue. See [`LinkType`] for the C mapping.
     pub fn link_type(&self) -> LinkType {
@@ -353,10 +533,26 @@ impl ParsedLink {
         }
     }
 
-    /// Extract the constant as an EpicsValue (Double if numeric, else String).
+    /// Extract the constant as an EpicsValue — the C `dbConstLoadScalar` /
+    /// `dbConstLoadArray` pair (`dbConstLink.c:152-199`), which is what a
+    /// record's `init_record` gets out of a constant link through `dbLoadLink`
+    /// / `dbLoadLinkArray`.
+    ///
+    /// A bracketed constant (`[1, 2, 3]`) is an ARRAY: C hands the text to
+    /// `dbPutConvertJSON`, which yields `nRequest` elements. Yielding the
+    /// bracket text as a String instead left every array-valued constant link
+    /// (`field(INP, "[1,2,3]")` on an aai/waveform, a constant closed-loop aao
+    /// DOL) delivering a nonsense string to a typed array buffer.
     pub fn constant_value(&self) -> Option<EpicsValue> {
         if let ParsedLink::Constant(s) = self {
-            if let Ok(v) = s.parse::<f64>() {
+            if let Some(inner) = s
+                .trim()
+                .strip_prefix('[')
+                .and_then(|body| body.strip_suffix(']'))
+            {
+                return Some(constant_array_value(inner));
+            }
+            if let Some(v) = parse_c_double(s) {
                 Some(EpicsValue::Double(v))
             } else {
                 Some(EpicsValue::String(s.clone().into()))
@@ -474,6 +670,153 @@ fn classify_pva_root_value(value: &str) -> Option<PvaRootValue<'_>> {
 ///
 /// Returns `Some(parsed)` when the string is a recognized JSON link;
 /// `None` lets the caller fall through to legacy plain-text parsing.
+/// The elements of a bracketed constant link, C `dbPutConvertJSON` on the
+/// text `dbConstLoadArray` hands it (`dbConstLink.c:177-199`).
+///
+/// Numeric elements produce a `DoubleArray` — the record lands it in its own
+/// typed buffer afterwards (C converts INTO `bptr` with `dbFastConvert`, so
+/// the element type is the record's FTVL, never the link's). Any non-numeric
+/// element makes the whole literal a string array (a `CHAR` waveform seeded
+/// with names, `["one","two"]`). An empty `[]` is zero elements — C yields
+/// `nRequest = 0`, i.e. NORD stays 0.
+fn constant_array_value(inner: &str) -> EpicsValue {
+    let body = inner.trim();
+    if body.is_empty() {
+        return EpicsValue::DoubleArray(Vec::new());
+    }
+    // A quoted element is a yajl string: decoded through the one owner. A bare
+    // element (a number) carries no escapes.
+    let elements: Vec<String> = body
+        .split(',')
+        .map(|e| {
+            let e = e.trim();
+            decode_json_string_token(e).unwrap_or_else(|| e.to_string())
+        })
+        .collect();
+    let numbers: Option<Vec<f64>> = elements.iter().map(|e| e.parse::<f64>().ok()).collect();
+    match numbers {
+        Some(nums) => EpicsValue::DoubleArray(nums),
+        None => EpicsValue::StringArray(elements.into_iter().map(|e| e.into()).collect()),
+    }
+}
+
+/// C `epicsParseDouble(pstr, &value, NULL)` — the ONE test that decides whether
+/// a link string is a number, and the ONE conversion that turns it into a value.
+/// `dbParseLink` uses it to classify (`dbStaticLib.c:2346-2349`) and
+/// `dbConstLink.c`'s `cvt_st_*` family uses the same C library parse to load, so
+/// the two must agree: whatever classifies as CONSTANT must also load.
+///
+/// It is `strtod` under the hood, which accepts a HEX literal — `dbConstLink.c:34`:
+/// *"constants may contain hex numbers, whereas database conversions can't"*.
+/// softIoc: `field(DOL,"0x1f")` reports `DOL : CONSTANT 0x1f` and comes up at
+/// VAL=31; `field(INP,"0x10")` on an ai loads VAL=16. Trailing text is rejected
+/// (C passes a NULL units pointer → `S_stdlib_extraneous`), which is what keeps
+/// `"5 PP"` a PV link rather than a constant.
+///
+/// So this is [`epics_parse_double`] and nothing else — C's ONE
+/// `epicsParseDouble`, shared with the CA env-knob parser. A hand-rolled
+/// re-implementation drifted from it on three families, all probed on softIoc
+/// 7.0.10:
+///
+/// ```text
+/// field(INP,"0x1p4")                -> CONSTANT, VAL=16               (hex float)
+/// field(INP,"0xffffffffffffffffff") -> CONSTANT, VAL=4.72236648e+21   (wide hex)
+/// field(INP,"1e400")                -> CA_LINK, UDF=1                 (ERANGE)
+/// field(INP,"1e-320")               -> CA_LINK, UDF=1                 (ERANGE)
+/// ```
+///
+/// The ERANGE half is what makes the difference structural rather than
+/// cosmetic: `epicsParseDouble` returns a NON-ZERO status for `1e400`, so C's
+/// `dbParseLink` (`dbStaticLib.c:2346-2349`) never reaches CONSTANT — the
+/// literal becomes a PV link, and the record stays UDF. The pre-fix port made
+/// it a defined record holding `inf`.
+pub fn parse_c_double(s: &str) -> Option<f64> {
+    crate::runtime::stdlib::epics_parse_double(s).ok()
+}
+
+/// What C's `dbLoadLinkLS` (dbLink.c:244) delivers into a long-string VAL.
+///
+/// `loadLS` is a lset entry of its own — NOT `recGblInitConstantLink` — and only
+/// two lsets implement it, with different results:
+///
+/// * a plain CONSTANT link (`dbConstLink.c:178` `dbConstLoadLS`) runs the link
+///   text through `dbLSConvertJSON`, and
+/// * a JSON `{const:…}` link (`lnkConst.c:419` `lnkConst_loadLS`) copies its
+///   string value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LsLoad {
+    /// The link delivered a string: copy it into VAL (truncated at `SIZV-1`),
+    /// `LEN = strlen + 1`.
+    Text(String),
+    /// C's number case. `dbLSConvertJSON` (dbConvertJSON.c:191-236) never calls
+    /// `yajl_complete_parse`, so a bare number is still a pending token when the
+    /// parse ends: NO callback fires, the destination buffer is untouched, and
+    /// `*plen = pdest - pdest + 1` makes `LEN = 1`. That is what defines an
+    /// `lso` with `field(DOL,"5")` while leaving `VAL` empty (softIoc: VAL "",
+    /// LEN 1, UDF 0).
+    LenOnly,
+}
+
+/// C `dbLoadLinkLS` over a link field's `.db` text — the long-string half of the
+/// init-time constant load. `None` when the link loads nothing: a PV link (no
+/// `loadLS` at init), an empty link, or a JSON `{const:…}` whose value is not a
+/// string (`lnkConst_loadLS` returns `S_db_badField` for the numeric types).
+///
+/// softIoc (EPICS 7.0.10, linux-x86_64), `dbgf` after `iocInit`:
+///
+/// ```text
+/// record(lso,"L1"){field(DOL,"5")}              VAL ""         LEN 1  UDF 0
+/// record(lso,"L2"){field(DOL,{const:"hello"})}  VAL "hello"    LEN 6  UDF 0
+/// record(lsi,"L3"){field(INP,{const:"hi there"})} VAL "hi there" LEN 9 UDF 0
+/// record(lsi,"L4"){field(INP,"5")}              VAL ""         LEN 1  UDF 0
+/// ```
+pub fn load_link_ls(text: &str) -> Option<LsLoad> {
+    let s = text.trim();
+    if s.is_empty() {
+        return None;
+    }
+    // JSON link: only `{const:…}` has a `loadLS`, and only its string forms
+    // (`sc40`, and `ac40`'s first element) deliver text.
+    if s.starts_with('{') && s.ends_with('}') {
+        let value = json_const_value(s)?;
+        return json_string_value(value).map(LsLoad::Text);
+    }
+    // Plain link: `loadLS` exists only on the CONSTANT lset, and a plain link is
+    // CONSTANT iff `epicsParseDouble` accepts it — i.e. iff it is a number, the
+    // one case `dbLSConvertJSON` leaves the buffer untouched.
+    parse_c_double(s).map(|_| LsLoad::LenOnly)
+}
+
+/// The raw (un-dequoted) value text of a `{const: …}` JSON link, or `None` when
+/// `s` is some other JSON link.
+fn json_const_value(s: &str) -> Option<&str> {
+    let inner = s[1..s.len() - 1].trim_start();
+    let (key, rest) = inner.split_once(':')?;
+    let key = key.trim().trim_matches('"').trim_matches('\'');
+    if !key.eq_ignore_ascii_case("const") {
+        return None;
+    }
+    Some(rest.trim().trim_end_matches(',').trim())
+}
+
+/// The JSON string a `{const:…}` link carries, DECODED — `"hi"` and the
+/// string-array shorthand `["hi", …]` (C `ac40`, whose `loadLS` takes element 0).
+/// A numeric value is not a string: `lnkConst_loadLS`'s `default` arm returns
+/// `S_db_badField`, so nothing is loaded and LEN stays 0.
+///
+/// The decode is yajl's, not this function's: a `{…}` value's escapes are
+/// translated by `dbJLinkParse` → yajl, never by the `.db` lexer
+/// ([`decode_json_string_token`]).
+fn json_string_value(value: &str) -> Option<String> {
+    let v = value.trim();
+    let first = if let Some(rest) = v.strip_prefix('[') {
+        rest.trim_start().split(',').next()?.trim()
+    } else {
+        v
+    };
+    decode_json_string_token(first)
+}
+
 fn try_parse_json_link(s: &str) -> Option<ParsedLink> {
     let s = s.trim();
     if !s.starts_with('{') || !s.ends_with('}') {
@@ -493,14 +836,21 @@ fn try_parse_json_link(s: &str) -> Option<ParsedLink> {
         .to_ascii_lowercase();
     match key.as_str() {
         "const" => {
-            // Constant: bare numeric, quoted string, or array.
-            // Strip outer quotes if present.
+            // Constant: bare numeric, quoted string, or array. A quoted string
+            // is a yajl string — its escapes are decoded here, by the one owner
+            // (`lnkConst.c:199` receives the DECODED bytes from
+            // `yajl_parser.c:273-281`); a bare token carries no escapes and is
+            // taken verbatim, as is an array (its elements are decoded by
+            // `constant_array_value`).
             let v = rest.trim_end_matches(',').trim();
-            let stripped = v.trim_matches('"').trim_matches('\'');
-            if stripped.is_empty() {
+            let decoded = match decode_json_string_token(v) {
+                Some(s) => s,
+                None => v.to_string(),
+            };
+            if decoded.is_empty() {
                 Some(ParsedLink::None)
             } else {
-                Some(ParsedLink::Constant(stripped.to_string()))
+                Some(ParsedLink::Constant(decoded))
             }
         }
         "ca" | "pva" => {
@@ -553,15 +903,16 @@ fn try_parse_json_link(s: &str) -> Option<ParsedLink> {
                 PvaRootValue::StringName(name) => {
                     // String shorthand: the contents are the verbatim channel
                     // name. Do NOT split `?` — it is link data (pvxs treats a
-                    // string pvalink as the channel name in full).
-                    let name = name.trim();
+                    // string pvalink as the channel name in full). It is still a
+                    // yajl string, so its escapes are decoded by the one owner.
+                    let name = decode_json_string(name.trim());
                     if name.is_empty() {
                         return None;
                     }
                     if key == "ca" {
-                        Some(ParsedLink::Ca(CaLink::new(name.to_string())))
+                        Some(ParsedLink::Ca(CaLink::new(name)))
                     } else {
-                        Some(ParsedLink::Pva(name.to_string()))
+                        Some(ParsedLink::Pva(name))
                     }
                 }
             }
@@ -657,10 +1008,11 @@ fn extract_pv_and_opts_from_subobject(body: &str) -> Option<(String, Vec<(String
             continue;
         }
         if k_raw.eq_ignore_ascii_case("pv") {
-            // `pv` is always the channel-name string; strip its quotes.
-            let name = v_trimmed.trim_matches('"').trim_matches('\'');
+            // `pv` is always the channel-name string: dequoted AND decoded by
+            // the one JSON-string owner (yajl hands the jlif a decoded string).
+            let name = decode_json_string_token(v_trimmed).unwrap_or_else(|| v_trimmed.to_string());
             if !name.is_empty() {
-                pv = Some(name.to_string());
+                pv = Some(name);
             }
         } else if let Some(val) = classify_jlink_value(v_trimmed) {
             // Preserve original key case (case-sensitive for keys like
@@ -683,10 +1035,8 @@ fn extract_pv_and_opts_from_subobject(body: &str) -> Option<(String, Vec<(String
 /// tokenizer that treated every bare value as text.
 fn classify_jlink_value(raw: &str) -> Option<JlinkValue> {
     let t = raw.trim();
-    if t.len() >= 2
-        && ((t.starts_with('"') && t.ends_with('"')) || (t.starts_with('\'') && t.ends_with('\'')))
-    {
-        return Some(JlinkValue::Str(t[1..t.len() - 1].to_string()));
+    if let Some(decoded) = decode_json_string_token(t) {
+        return Some(JlinkValue::Str(decoded));
     }
     match t {
         "" => None,
@@ -730,94 +1080,227 @@ fn try_parse_hw_link(s: &str) -> Option<ParsedLink> {
     None
 }
 
-/// Strip trailing link-attribute modifiers (`PP`/`NPP`/`CP`/`CPP`/`CA`/
-/// `MS`/`NMS`/`MSI`/`MSS`) from a link string. Returns the remaining
-/// `record.field` text plus the parsed process policy, maximize-severity
-/// switch, and whether a bare ` CA` modifier forced a CA link. Modifiers
-/// may appear in any order (`"REC.FIELD NPP NMS"`, `"REC CP"`, …).
+/// The **one** process-class modifier a link carries.
 ///
-/// shared by the legacy plain-text path *and* the `ca://`
-/// scheme path so `ca://PV MS` parses the `MS` modifier instead of
-/// folding it into the PV name. The bare ` CA` modifier forces a
-/// `pv_link` to a CA link (C `dbStaticLib.c:2372`); it may co-occur with
-/// `PP`/`MS`-style modifiers, so `force_ca` is recorded while `policy`
-/// and `ms` continue to capture the rest.
-fn strip_link_modifiers(s: &str) -> (&str, LinkProcessPolicy, MonitorSwitch, bool) {
-    // C `dbParseLink` (`dbStaticLib.c:2252,2369-2371`): the modifier set
-    // is `memset`-zeroed first, then `pvlOptPP` is set *only* on an
-    // explicit ` PP` token (` NPP` clears it back to 0). A modifier-less
-    // link is therefore NPP — for an INPUT link this means `dbDbGetValue`
-    // (`dbDbLink.c:175`) does NOT process the passive source on read, and
-    // for an OUTPUT link `dbDbPutValue` (`dbDbLink.c:387`) does NOT
-    // process the target. Default `NoProcess`; the explicit ` PP` arm
-    // below promotes it to `ProcessPassive`.
-    let mut policy = LinkProcessPolicy::NoProcess;
-    let mut ms = MonitorSwitch::NoMaximize;
-    let mut force_ca = false;
-    let mut link_part = s;
-    loop {
-        let trimmed = link_part.trim_end();
-        if let Some(rest) = trimmed.strip_suffix(" NMS") {
-            ms = MonitorSwitch::NoMaximize;
-            link_part = rest;
-            continue;
-        }
-        if let Some(rest) = trimmed.strip_suffix(" MSI") {
-            ms = MonitorSwitch::MaximizeIfInvalid;
-            link_part = rest;
-            continue;
-        }
-        if let Some(rest) = trimmed.strip_suffix(" MSS") {
-            ms = MonitorSwitch::MaximizeStatus;
-            link_part = rest;
-            continue;
-        }
-        if let Some(rest) = trimmed.strip_suffix(" MS") {
-            ms = MonitorSwitch::Maximize;
-            link_part = rest;
-            continue;
-        }
-        if let Some(rest) = trimmed.strip_suffix(" NPP") {
-            policy = LinkProcessPolicy::NoProcess;
-            link_part = rest;
-            continue;
-        }
-        // CPP before CP: a ` CPP` suffix must not be misread as ` CP`
-        // leaving a stray `P`. (` CP` never matches a `...CPP` tail, but
-        // keep the order explicit.) C distinguishes the two — CP processes
-        // the link-holder unconditionally, CPP only when it is Passive.
-        if let Some(rest) = trimmed.strip_suffix(" CPP") {
-            policy = LinkProcessPolicy::ChannelProcessPassive;
-            link_part = rest;
-            continue;
-        }
-        if let Some(rest) = trimmed.strip_suffix(" CP") {
-            policy = LinkProcessPolicy::ChannelProcess;
-            link_part = rest;
-            continue;
-        }
-        if let Some(rest) = trimmed.strip_suffix(" PP") {
-            policy = LinkProcessPolicy::ProcessPassive;
-            link_part = rest;
-            continue;
-        }
-        // Bare ` CA` modifier — forces the link to be a CA link.
-        // C `dbStaticLib.c:2372`. Stripped here so a combination such
-        // as `REC.FIELD CA MS` leaves `link_part == "REC.FIELD"` and
-        // both `force_ca` and `ms` are recorded.
-        if let Some(rest) = trimmed.strip_suffix(" CA") {
-            force_ca = true;
-            link_part = rest;
-            continue;
-        }
-        link_part = trimmed;
-        break;
-    }
-    (link_part, policy, ms, force_ca)
+/// C `dbParseLink` (`dbStaticLib.c:2369-2373`) resolves the process class with
+/// a single `else if` chain that **assigns** (never OR-s) exactly one bit:
+///
+/// ```c
+/// if      (strstr(pstr, "NPP")) pinfo->modifiers = 0;
+/// else if (strstr(pstr, "CPP")) pinfo->modifiers = pvlOptCPP;
+/// else if (strstr(pstr, "PP"))  pinfo->modifiers = pvlOptPP;
+/// else if (strstr(pstr, "CA"))  pinfo->modifiers = pvlOptCA;
+/// else if (strstr(pstr, "CP"))  pinfo->modifiers = pvlOptCP;
+/// ```
+///
+/// So the classes are mutually exclusive and the *chain order* — not the token
+/// order in the string — decides which one wins. `"REC CP NPP"` is NPP,
+/// `"OTHER:PV CP CA"` is CA (a plain CA link that never processes its holder),
+/// and `"REC PP CA"` is PP (a **local DB** link, because `dbAccess.c:1104`
+/// routes to `dbDbInitLink` when none of `CA|CP|CPP` is set).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+enum ProcessClass {
+    /// `NPP`, and the modifier-less default: C `memset`s the modifier set to
+    /// zero (`dbStaticLib.c:2252`) and only an explicit token sets a bit.
+    #[default]
+    Npp,
+    Cpp,
+    Pp,
+    Ca,
+    Cp,
 }
 
-/// Parse a link string into a ParsedLink (v2 — distinguishes constants from DB links).
+impl ProcessClass {
+    /// `(policy, force_ca)` — how this class lands in the port's link model.
+    /// Only `pvlOptCA` makes the link an *external* CA channel; `CP`/`CPP`
+    /// keep the local-DB shape and are routed by `classify_cp_link`.
+    fn resolve(self) -> (LinkProcessPolicy, bool) {
+        match self {
+            Self::Npp => (LinkProcessPolicy::NoProcess, false),
+            Self::Cpp => (LinkProcessPolicy::ChannelProcessPassive, false),
+            Self::Pp => (LinkProcessPolicy::ProcessPassive, false),
+            Self::Ca => (LinkProcessPolicy::NoProcess, true),
+            Self::Cp => (LinkProcessPolicy::ChannelProcess, false),
+        }
+    }
+
+    fn is_cp_or_cpp(self) -> bool {
+        matches!(self, Self::Cp | Self::Cpp)
+    }
+
+    /// C `dbStaticLib.c:2369-2373` — a single `else if` chain over
+    /// `strstr(pstr, …)` in the order `NPP, CPP, PP, CA, CP` that *assigns*
+    /// (never OR-s) exactly one class. The order is load-bearing: `CPP` must be
+    /// tested before `PP`, since `"CPP"` contains `"PP"`.
+    fn from_modifier_text(mods: &str) -> Self {
+        if mods.contains("NPP") {
+            Self::Npp
+        } else if mods.contains("CPP") {
+            Self::Cpp
+        } else if mods.contains("PP") {
+            Self::Pp
+        } else if mods.contains("CA") {
+            Self::Ca
+        } else if mods.contains("CP") {
+            Self::Cp
+        } else {
+            Self::Npp
+        }
+    }
+}
+
+/// Which link *field* a link string is being parsed for — C's `ftype` argument
+/// to `dbParseLink`, i.e. the `pfldDes->field_type` of the field that holds the
+/// link (`dbAccess.c:1094` `dbPutFieldLink`).
+///
+/// The field type filters the parsed modifiers (`dbStaticLib.c:2380-2391`),
+/// which is why the same text means different things in `INP` and `OUT`:
+///
+/// ```c
+/// switch(ftype) {
+/// case DBF_INLINK:  /* accept all */ break;
+/// case DBF_OUTLINK:
+///     if (modifiers & (pvlOptCPP|pvlOptCP))
+///         errlogPrintf(ERL_WARNING ": Discarding CP/CPP modifier in CA output link …");
+///     modifiers &= ~(pvlOptCPP|pvlOptCP);
+///     break;
+/// case DBF_FWDLINK: modifiers &= pvlOptCA; break;
+/// }
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkFieldType {
+    /// `DBF_INLINK` — `INP`, `INPA`…, `DOL`, `SDIS`, `TSEL`, `SIML`, … Every
+    /// modifier is accepted.
+    In,
+    /// `DBF_OUTLINK` — `OUT`, `dfanout.OUTA`…, `sseq.LNK1`…, `SIOL`. `CP`/`CPP`
+    /// is meaningless (it asks for input-side "process on change") and is
+    /// discarded with a warning.
+    Out,
+    /// `DBF_FWDLINK` — `FLNK` (`dbCommon.dbd.pod:575`), `fanout.LNK1`…
+    /// (`fanoutRecord.dbd.pod:144`). Only `CA` survives; every process and
+    /// maximize-severity modifier is masked off.
+    Fwd,
+}
+
+impl LinkFieldType {
+    /// Apply C's per-field-type modifier mask (`dbStaticLib.c:2380-2391`).
+    ///
+    /// Silent by design: some OUT links (`dfanout.OUTn`, `sseq.LNKn`) are
+    /// re-parsed from their raw text on every process cycle, so C's one-shot
+    /// load-time `errlogPrintf` cannot live here. The diagnostic is emitted at
+    /// the one-shot put/load boundary via [`out_link_discards_cp`], which also
+    /// has the holder record's name — the `%s.%s` half of C's message.
+    fn mask(self, class: ProcessClass, ms: MonitorSwitch) -> (ProcessClass, MonitorSwitch) {
+        match self {
+            Self::In => (class, ms),
+            // `modifiers &= ~(pvlOptCPP|pvlOptCP)`.
+            Self::Out => {
+                let class = if class.is_cp_or_cpp() {
+                    ProcessClass::Npp
+                } else {
+                    class
+                };
+                (class, ms)
+            }
+            // `modifiers &= pvlOptCA` — everything except the CA bit is
+            // cleared, including the maximize-severity switch.
+            Self::Fwd => {
+                let class = if class == ProcessClass::Ca {
+                    ProcessClass::Ca
+                } else {
+                    ProcessClass::Npp
+                };
+                (class, MonitorSwitch::NoMaximize)
+            }
+        }
+    }
+}
+
+/// Does `s`, read as a `DBF_OUTLINK`, carry a `CP`/`CPP` modifier that
+/// [`parse_output_link_v2`] will discard?
+///
+/// The query behind C's load-time warning (`dbStaticLib.c:2382-2386`
+/// `"Discarding CP/CPP modifier in CA output link from %s.%s to %s."`). It uses
+/// the same modifier resolution as the parser, so it cannot drift from what is
+/// actually discarded — unlike a trailing-`" CP"` text test, which misses
+/// `"TARGET CP MS"` and mis-fires on a target whose *name* ends in `CP`.
+pub fn out_link_discards_cp(s: &str) -> bool {
+    let s = s.trim();
+    // Only a plain PV link reaches the modifier scan in C; a JSON/hardware/
+    // scheme link never does.
+    if s.is_empty() || s.starts_with(['{', '@', '#', '"']) {
+        return false;
+    }
+    let Some((_, mods)) = s.split_once(' ') else {
+        return false;
+    };
+    // Resolve through the same chain the parser uses, so the warning cannot
+    // drift from the mask: exactly the classes the OUT mask downgrades.
+    ProcessClass::from_modifier_text(mods).is_cp_or_cpp()
+}
+
+/// Split a link string into its target and its modifiers, mirroring C
+/// `dbParseLink` (`dbStaticLib.c:2359-2379`).
+///
+/// C isolates the target at the **first space** (`strchr(pstr, ' ')`; tabs do
+/// not separate) and then searches the *whole* remainder with `strstr` — the
+/// modifiers are not positional suffixes and need no space between them
+/// (C's own comment: `"QQCPPXMSITT"` is `pvlOptCPP|pvlOptMSI`). The process
+/// class is resolved by [`ProcessClass`]'s fixed precedence; the
+/// maximize-severity switch is a second, independent `else if` chain
+/// (`:2375-2378`) in the order `NMS, MSI, MSS, MS`, longest match first.
+///
+/// Returns `(target, policy, monitor_switch, force_ca)` with `ftype`'s modifier
+/// mask ([`LinkFieldType::mask`]) already applied. Shared by the plain-text path
+/// and the `ca://` scheme path so `ca://PV MS` parses its `MS` instead of
+/// folding it into the PV name.
+fn split_link_modifiers(
+    s: &str,
+    ftype: LinkFieldType,
+) -> (&str, LinkProcessPolicy, MonitorSwitch, bool) {
+    let Some((target, mods)) = s.split_once(' ') else {
+        // No space ⇒ no modifier text at all ⇒ modifiers stay zeroed (NPP),
+        // and every mask leaves zero at zero.
+        let (policy, force_ca) = ProcessClass::default().resolve();
+        return (s, policy, MonitorSwitch::NoMaximize, force_ca);
+    };
+
+    // Process class — one assignment, C's fixed chain order.
+    let class = ProcessClass::from_modifier_text(mods);
+
+    // Maximize-severity switch — independent chain, longest match first.
+    let ms = if mods.contains("NMS") {
+        MonitorSwitch::NoMaximize
+    } else if mods.contains("MSI") {
+        MonitorSwitch::MaximizeIfInvalid
+    } else if mods.contains("MSS") {
+        MonitorSwitch::MaximizeStatus
+    } else if mods.contains("MS") {
+        MonitorSwitch::Maximize
+    } else {
+        MonitorSwitch::NoMaximize
+    };
+
+    // C filters the parsed modifiers by the holding field's type before the
+    // link is ever built (`dbStaticLib.c:2380-2391`), so the mask belongs here
+    // — at the single parse owner — not at each consumer.
+    let (class, ms) = ftype.mask(class, ms);
+    let (policy, force_ca) = class.resolve();
+    (target, policy, ms, force_ca)
+}
+
+/// Parse a `DBF_INLINK` (`INP`, `INPA`…, `DOL`, `SDIS`, `TSEL`, `SIML`, …).
+/// Every modifier is accepted — see [`parse_link_field`].
 pub fn parse_link_v2(s: &str) -> ParsedLink {
+    parse_link_field(s, LinkFieldType::In)
+}
+
+/// Parse a link string held by a link field of type `ftype`, applying that
+/// type's C modifier mask (`dbStaticLib.c:2380-2391`). The single owner of
+/// "link text → [`ParsedLink`]"; [`parse_link_v2`],
+/// [`parse_output_link_v2`] and [`parse_forward_link_v2`] are its three
+/// field-type entry points.
+pub fn parse_link_field(s: &str, ftype: LinkFieldType) -> ParsedLink {
     let s = s.trim();
     // JSON-style links (epics-base PR #86) — try first so a leading
     // `{` is not mistaken for a leading-special record-name warning.
@@ -840,7 +1323,7 @@ pub fn parse_link_v2(s: &str) -> ParsedLink {
     // parsed `MS`/`NMS`/`MSI`/`MSS` switch rides in the `CaLink` so the
     // alarm gate is applied at the record-processing boundary.
     if let Some(rest) = s.strip_prefix("ca://") {
-        let (pv, policy, ms, _force_ca) = strip_link_modifiers(rest);
+        let (pv, policy, ms, _force_ca) = split_link_modifiers(rest, ftype);
         return ParsedLink::Ca(CaLink {
             pv: pv.to_string(),
             monitor_switch: ms,
@@ -854,26 +1337,82 @@ pub fn parse_link_v2(s: &str) -> ParsedLink {
         return ParsedLink::Pva(rest.to_string());
     }
 
-    // Strip trailing link attributes: PP, NPP, CP, CPP, CA, MS, NMS,
-    // MSS, MSI (any order) — see [`strip_link_modifiers`].
-    let (link_part, policy, ms, force_ca) = strip_link_modifiers(s);
+    // There is NO quoted-string constant. C's `dbParseLink` has exactly three
+    // tests — braces => JSON, `epicsParseDouble` => CONSTANT, otherwise PV link
+    // (`dbStaticLib.c:2280-2356`) — and a quote is not a number, so link text
+    // that still carries quotes after the .db lexer is a PV NAME with quotes in
+    // it. softIoc (EPICS 7.0.10), `dbpr X 2` after `iocInit`:
+    //
+    // ```text
+    // record(ai,"QA"){field(INP,"\"hello\"")}        INP: CA_LINK "hello" NPP NMS
+    // record(stringin,"QS"){field(INP,"\"hello\"")}  INP: CA_LINK "hello" NPP NMS
+    // record(lso,"LQ"){field(DOL,"\"hello\"")}       DOL: CA_LINK "hello" NPP NMS
+    // record(ai,"QE"){field(INP,"\"\"")}             INP: CA_LINK "" NPP NMS
+    // record(ai,"QN"){field(INP,"")}                 INP: CONSTANT
+    // ```
+    //
+    // — a never-connected CA link, so the record stays UDF=1. Only the EMPTY
+    // text is an unset CONSTANT link. The string constant a long-string record
+    // takes is the JSON `{const:"hello"}` handled above ([`load_link_ls`]).
 
-    // A bare ` CA` modifier forces the link to be a CA link. C
-    // `dbParseLink` only reaches the modifier scan after the
-    // constant test (`dbStaticLib.c:2347`) has already failed — a
-    // string carrying a ` CA` suffix never parses as a bare double,
-    // so a CA-forced link is always a `PV_LINK`. Honour that here:
-    // once ` CA` was stripped, classify as `ParsedLink::Ca` with the
-    // remaining `link_part` (the `record.field` PV name) verbatim,
-    // never as a Constant or local Db link.
+    // Scalar numeric constant. C `dbParseLink` (`dbStaticLib.c:2346-2349`):
+    //
+    //     /* Link is a constant if empty or it holds just a number */
+    //     if (len == 0 || epicsParseDouble(pstr, &value, NULL) == 0) {
+    //         pinfo->ltype = CONSTANT;
+    //         return 0;
+    //     }
+    //
+    // The test runs on the WHOLE stripped string, *before* the modifier scan,
+    // and `epicsParseDouble` with a NULL `units` argument rejects any trailing
+    // text (`S_stdlib_extraneous`, `epicsStdlib.c`). So `"5 PP"` is NOT a
+    // constant in C — it is a PV_LINK to a record named `5` with the `PP`
+    // modifier (verified on softIoc: `INPA: CA_LINK 5 PP NMS`). Splitting the
+    // modifiers off first and then testing the head for a number turns every
+    // `"<number> <modifier>"` link into a constant: `SDIS="3 NPP"` with
+    // `DISV=3` would disable the record forever, and `OUT="5 PP"` would drop
+    // the write instead of alarming. Keep this test above
+    // `split_link_modifiers`.
+    if parse_c_double(s).is_some() {
+        return ParsedLink::Constant(s.to_string());
+    }
+
+    // Array constant. C `dbParseLink` (`dbStaticLib.c:2354-2357`), right after
+    // the scalar-constant test:
+    //
+    //     /* Link may be an array constant */
+    //     if (pstr[0] == '[' && pstr[len-1] == ']') {
+    //         pinfo->ltype = CONSTANT;
+    //         return 0;
+    //     }
+    //
+    // The bracketed text is handed verbatim to `dbPutConvertJSON`
+    // (`dbConstLink.c::dbConstLoadArray`) when the record loads the link at
+    // init. Resolved BEFORE the modifier split for the same reason as the
+    // quoted constant: `[1, 2, 3]` legitimately contains spaces, and C reaches
+    // the modifier scan only after both constant tests. Note the one form that
+    // is NOT a constant: `"1 2 3"` — `epicsParseDouble` rejects the trailing
+    // garbage, so C parses it as a PV_LINK to a record named `1`.
+    if s.starts_with('[') && s.ends_with(']') && s.len() >= 2 {
+        return ParsedLink::Constant(s.to_string());
+    }
+
+    // Isolate the target from its modifiers — see [`split_link_modifiers`].
+    let (link_part, policy, ms, force_ca) = split_link_modifiers(s, ftype);
+
+    // A `CA` modifier forces the link to be a CA link (C
+    // `dbStaticLib.c:2372` — `pinfo->modifiers = pvlOptCA`, and
+    // `dbAccess.c:1104` routes a link with any of `CA|CP|CPP` away from
+    // `dbDbInitLink`). `dbParseLink` reaches the modifier scan only after the
+    // constant test (`:2347`) has failed, so a CA-forced link is always a
+    // `PV_LINK` — never a Constant or local Db link.
     if force_ca {
-        // a bare ` CA`-forced link carries the same
-        // maximize-severity policy as any other link — store the parsed
-        // `ms` so e.g. `REC.VAL CA MS` keeps its `MS` gate instead of
-        // discarding it. It also carries the CP/CPP process policy
-        // (`REC.VAL CP CA`): store it so the calink resolver processes
-        // the holder on a remote change instead of dropping the CP
-        // intent.
+        // `CA` is a *process class*, so it is mutually exclusive with
+        // `CP`/`CPP` and the class chain has already resolved the policy to
+        // `NoProcess`: `"OTHER:PV CP CA"` matches "CA" before "CP" in C and
+        // yields `pvlOptCA` alone — a plain CA link that never processes its
+        // holder. The maximize-severity switch is a *separate* chain and does
+        // ride along (`REC.VAL CA MS` keeps its MS gate).
         return ParsedLink::Ca(CaLink {
             pv: link_part.to_string(),
             monitor_switch: ms,
@@ -881,41 +1420,20 @@ pub fn parse_link_v2(s: &str) -> ParsedLink {
         });
     }
 
-    // Numeric constant
-    if link_part.parse::<f64>().is_ok() {
-        return ParsedLink::Constant(link_part.to_string());
+    // DB link: split record from field exactly as C `dbNameToAddr`
+    // (`dbAccess.c:667-671`) does — see [`split_record_field`].
+    if let Some((rec, field)) = split_record_field(link_part) {
+        return ParsedLink::Db(DbLink {
+            record: rec.to_string(),
+            field,
+            policy,
+            monitor_switch: ms,
+        });
     }
 
-    // Quoted string constant.
-    // C parity (3b484f5): an empty quoted string `""` is equivalent to an
-    // unset link — dbConstLoadScalar/Array reject `""` the same as NULL with
-    // S_db_badField. Treat it as None here so callers don't see a meaningless
-    // empty Constant.
-    if link_part.starts_with('"') && link_part.ends_with('"') && link_part.len() >= 2 {
-        let inner = &link_part[1..link_part.len() - 1];
-        if inner.is_empty() {
-            return ParsedLink::None;
-        }
-        return ParsedLink::Constant(inner.to_string());
-    }
-
-    // DB link: try rsplit on '.', validate field part is uppercase alpha 1-4 chars
-    if let Some((rec, field)) = link_part.rsplit_once('.') {
-        let field_upper = field.to_ascii_uppercase();
-        let is_valid_field = !field_upper.is_empty()
-            && field_upper.len() <= 4
-            && field_upper.chars().all(|c| c.is_ascii_uppercase());
-        if is_valid_field {
-            return ParsedLink::Db(DbLink {
-                record: rec.to_string(),
-                field: field_upper,
-                policy,
-                monitor_switch: ms,
-            });
-        }
-    }
-
-    // No dot or invalid field part → DB link with default field VAL
+    // No dot, or a remainder that is not a field name → DB link with the
+    // default `VAL` field (C `dbFindFieldPart`'s "absent field name" branch,
+    // `dbStaticLib.c:1802-1811`, which resolves to `pvalFldDes`).
     ParsedLink::Db(DbLink {
         record: link_part.to_string(),
         field: "VAL".to_string(),
@@ -924,21 +1442,74 @@ pub fn parse_link_v2(s: &str) -> ParsedLink {
     })
 }
 
-/// Parse an **output** link.
+/// Split a link target into `(record, FIELD)`, mirroring C `dbNameToAddr`
+/// (`dbAccess.c:667-671`).
 ///
-/// Output and input links share [`parse_link_v2`]: C `dbParseLink`
-/// zeroes the modifier set for both link types (`dbStaticLib.c:2252`),
-/// so a modifier-less link is NPP (`NoProcess`) regardless of
-/// direction. The OUT-link target-processing decision — process when
-/// the link is explicit ` PP` **or** the destination field is `.PROC`
-/// — lives in the write path
-/// ([`crate::server::database::Database::write_db_link_value`]),
-/// matching C `dbDbPutValue` (`dbDbLink.c:387-390`); it is no longer
-/// encoded as a parse-time policy override. This entry point is
-/// retained as the OUT-link parse boundary named by `dbPutLink`
-/// callers (record `OUT` / dfanout `OUTn` / sseq `LNKn`).
+/// C terminates the *record* name at the **first** `.`
+/// (`dbStaticLib.c:1548-1571` `dbFindRecordPart`: `strchr(pname, '.')`), then
+/// matches the remainder against the record type's field table
+/// (`dbStaticLib.c:1781-1846` `dbFindFieldPart`). That lexer accepts a field
+/// name that is a C identifier — `[A-Za-z_][A-Za-z0-9_]*` — and imposes no
+/// character-class or length restriction beyond it.
+///
+/// The port has no field table at parse time, so the identifier rule is the
+/// guard. It matters that digits and `_` are accepted and that the 4-character
+/// cap is gone: `mbboDirect` has `B0`…`BF`, `sseq` has `DO1`…`LNKA`, and
+/// dbCommon has `OLDSIMM`/`NAMSG`. Pre-fix `'0'.is_ascii_uppercase()` was
+/// `false`, so `INP="DIRECT.B0"` fell through to a link to a *record* literally
+/// named `"DIRECT.B0"` — which never resolves locally, and
+/// `classify_cp_link`'s `convert_to_ca` then re-routed it as an external CA
+/// channel, losing lock-set atomicity, `PP` target processing and `MS`
+/// severity inheritance.
+///
+/// Returns `None` when there is no `.` or the remainder is not a field name,
+/// which is C's "absent field name" case (the link addresses `VAL`). Keeping
+/// the whole string as the record name in that case is also what preserves a
+/// dotted *remote* PV name (`OTHER:PV.1:X`) for the CA-link fallback, which
+/// reconstructs the channel name from `record`/`field`.
+fn split_record_field(link_part: &str) -> Option<(&str, String)> {
+    let (rec, field) = link_part.split_once('.')?;
+    let mut chars = field.chars();
+    let first = chars.next()?;
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return None;
+    }
+    if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    Some((rec, field.to_ascii_uppercase()))
+}
+
+/// Parse a `DBF_OUTLINK` (record `OUT`, `dfanout.OUTA`…, `sseq.LNK1`…,
+/// `SIOL`).
+///
+/// C `dbParseLink` **discards** `CP`/`CPP` on a `DBF_OUTLINK` with a startup
+/// warning (`dbStaticLib.c:2382-2387`): those modifiers ask for input-side
+/// "process the holder when the source changes", which is meaningless on an
+/// output. Honouring them opens a monitor on the *target* and reprocesses the
+/// *holder* on every target change — a processing loop (holder writes TARGET →
+/// TARGET change fires CP → holder reprocesses → writes TARGET …) that cannot
+/// happen on a C IOC.
+///
+/// A modifier-less link is NPP (`NoProcess`) in both directions — C zeroes the
+/// modifier set first (`:2252`). The OUT-link target-processing decision —
+/// process when the link is explicit ` PP` **or** the destination field is
+/// `.PROC` — lives in the write path
+/// ([`crate::server::database::Database::write_db_link_value`]), matching C
+/// `dbDbPutValue` (`dbDbLink.c:387-390`).
 pub fn parse_output_link_v2(s: &str) -> ParsedLink {
-    parse_link_v2(s)
+    parse_link_field(s, LinkFieldType::Out)
+}
+
+/// Parse a `DBF_FWDLINK` (`FLNK` — `dbCommon.dbd.pod:575`; `fanout.LNK1`… —
+/// `fanoutRecord.dbd.pod:144`).
+///
+/// C masks the modifier set to `pvlOptCA` alone (`dbStaticLib.c:2390`): a
+/// forward link only triggers processing, so every process-class modifier
+/// other than `CA` and every maximize-severity modifier is dropped. `CA` is
+/// kept because it still decides whether the trigger crosses IOCs.
+pub fn parse_forward_link_v2(s: &str) -> ParsedLink {
+    parse_link_field(s, LinkFieldType::Fwd)
 }
 
 /// Determine the [`LinkType`] of a record's string link field directly
@@ -1210,16 +1781,21 @@ mod json_link_tests {
         assert_eq!(link_field_type("{const: 7}"), LinkType::Constant);
     }
 
+    /// A quoted string is NOT a constant: C's `dbParseLink` tests braces then
+    /// `epicsParseDouble`, and a quote is neither — softIoc makes
+    /// `field(INP,"\"hello\"")` a `CA_LINK "hello" NPP NMS`, and even
+    /// `field(INP,"\"\"")` a `CA_LINK ""`. Only the empty text is an unset
+    /// CONSTANT link.
     #[test]
-    fn link_type_constant_quoted_string() {
-        assert_eq!(link_field_type(r#""hello""#), LinkType::Constant);
+    fn link_type_quoted_string_is_a_pv_link() {
+        assert_eq!(link_field_type(r#""hello""#), LinkType::Db);
+        assert_eq!(link_field_type(r#""""#), LinkType::Db);
     }
 
     #[test]
     fn link_type_empty_is_empty() {
         assert_eq!(link_field_type(""), LinkType::Empty);
         assert_eq!(link_field_type("   "), LinkType::Empty);
-        assert_eq!(link_field_type(r#""""#), LinkType::Empty);
     }
 
     #[test]
@@ -1273,30 +1849,15 @@ mod json_link_tests {
     }
 
     #[test]
-    fn ca_modifier_combined_with_pp_ms() {
-        // `CA` may co-occur with PP/MS-style modifiers in
-        // any order. The PV name is stripped clean, AND the `MS`-class
-        // modifier is now CARRIED in the CaLink (pre-fix it was
-        // discarded, reducing both forms to a bare `Ca("REC.VAL")`).
+    fn ca_modifier_combined_with_ms() {
+        // The MS-class switch is an INDEPENDENT chain (`dbStaticLib.c:2375`),
+        // so it rides along with the CA process class in any token order.
         assert_eq!(
             parse_link_v2("REC.VAL CA MS"),
             ParsedLink::Ca(CaLink {
                 pv: "REC.VAL".to_string(),
                 monitor_switch: MonitorSwitch::Maximize,
                 policy: LinkProcessPolicy::NoProcess,
-            })
-        );
-        // `PP CA` now CARRIES the `PP` process policy (pre-fix the
-        // force-CA branch discarded it, reducing this to a bare
-        // `CaLink::new`); no MS-class modifier → NoMaximize. `PP` is not
-        // CP/CPP, so `cp_passive_only() == None` and this link is never
-        // registered as an external CP holder.
-        assert_eq!(
-            parse_link_v2("REC.VAL PP CA"),
-            ParsedLink::Ca(CaLink {
-                pv: "REC.VAL".to_string(),
-                monitor_switch: MonitorSwitch::NoMaximize,
-                policy: LinkProcessPolicy::ProcessPassive,
             })
         );
         // `CA NMS` carries the explicit NoMaximize switch.
@@ -1309,6 +1870,109 @@ mod json_link_tests {
             })
         );
         assert_eq!(link_field_type("REC.VAL CA NMS"), LinkType::Ca);
+    }
+
+    // R6-3 — the process class is ONE `else if` chain over the whole modifier
+    // string (`dbStaticLib.c:2369-2373`), in the order NPP, CPP, PP, CA, CP,
+    // ASSIGNING exactly one bit. The chain order decides, not the token order:
+    // the pre-fix parser stripped ordered suffixes (last one wins) and let a
+    // ` CA` flag coexist with a CP/PP policy.
+    #[test]
+    fn process_class_precedence_is_chain_order_not_token_order() {
+        // "REC CP NPP" → NPP wins (modifiers = 0): no CP subscription. The
+        // pre-fix suffix loop stripped " NPP" then " CP" and ended at CP,
+        // registering the holder in the CP trigger registry.
+        assert_eq!(
+            parse_link_v2("REC CP NPP"),
+            ParsedLink::Db(DbLink {
+                record: "REC".to_string(),
+                field: "VAL".to_string(),
+                policy: LinkProcessPolicy::NoProcess,
+                monitor_switch: MonitorSwitch::NoMaximize,
+            })
+        );
+        // "OTHER:PV CP CA" → CA is matched BEFORE CP, so it is pvlOptCA alone:
+        // a plain CA link whose holder never processes. Pre-fix this was a Ca
+        // link with policy=ChannelProcess, reprocessing the holder on every
+        // remote monitor update.
+        assert_eq!(
+            parse_link_v2("OTHER:PV CP CA"),
+            ParsedLink::Ca(CaLink {
+                pv: "OTHER:PV".to_string(),
+                monitor_switch: MonitorSwitch::NoMaximize,
+                policy: LinkProcessPolicy::NoProcess,
+            })
+        );
+        // "REC PP CA" → PP is matched BEFORE CA, so no CA|CP|CPP bit is set
+        // and dbAccess.c:1104 routes to dbDbInitLink: a LOCAL DB link with PP.
+        // Pre-fix this became an external CA channel.
+        assert_eq!(
+            parse_link_v2("REC PP CA"),
+            ParsedLink::Db(DbLink {
+                record: "REC".to_string(),
+                field: "VAL".to_string(),
+                policy: LinkProcessPolicy::ProcessPassive,
+                monitor_switch: MonitorSwitch::NoMaximize,
+            })
+        );
+        // CPP is matched before PP, and CP only after CA.
+        assert!(matches!(
+            parse_link_v2("REC CPP"),
+            ParsedLink::Db(DbLink {
+                policy: LinkProcessPolicy::ChannelProcessPassive,
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse_link_v2("REC CP"),
+            ParsedLink::Db(DbLink {
+                policy: LinkProcessPolicy::ChannelProcess,
+                ..
+            })
+        ));
+        // Exactly one class: a modifier-less link is NPP.
+        assert!(matches!(
+            parse_link_v2("REC"),
+            ParsedLink::Db(DbLink {
+                policy: LinkProcessPolicy::NoProcess,
+                ..
+            })
+        ));
+    }
+
+    // C searches the modifier text with `strstr`, so the tokens need no space
+    // between them — its own comment pins `"QQCPPXMSITT"` as CPP|MSI. The
+    // pre-fix suffix loop required a leading space and an exact tail match, so
+    // it saw no modifiers at all here.
+    #[test]
+    fn modifiers_are_substring_matched_not_space_delimited() {
+        assert_eq!(
+            parse_link_v2("REC QQCPPXMSITT"),
+            ParsedLink::Db(DbLink {
+                record: "REC".to_string(),
+                field: "VAL".to_string(),
+                policy: LinkProcessPolicy::ChannelProcessPassive,
+                monitor_switch: MonitorSwitch::MaximizeIfInvalid,
+            })
+        );
+    }
+
+    // The MS chain is longest-match-first too: NMS, MSI, MSS, MS.
+    #[test]
+    fn maximize_switch_precedence() {
+        for (link, expect) in [
+            ("REC NMS", MonitorSwitch::NoMaximize),
+            ("REC MSI", MonitorSwitch::MaximizeIfInvalid),
+            ("REC MSS", MonitorSwitch::MaximizeStatus),
+            ("REC MS", MonitorSwitch::Maximize),
+            // NMS is matched first even though the string also contains "MS".
+            ("REC MS NMS", MonitorSwitch::NoMaximize),
+        ] {
+            match parse_link_v2(link) {
+                ParsedLink::Db(db) => assert_eq!(db.monitor_switch, expect, "link {link}"),
+                other => panic!("link {link}: expected Db, got {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -1587,5 +2251,97 @@ mod json_link_tests {
         );
         assert_eq!(LinkProcessPolicy::ProcessPassive.cp_passive_only(), None);
         assert_eq!(LinkProcessPolicy::NoProcess.cp_passive_only(), None);
+    }
+
+    /// R6-4 — `DBF_OUTLINK` discards CP/CPP (`dbStaticLib.c:2382-2387`
+    /// `modifiers &= ~(pvlOptCPP|pvlOptCP)`), so an OUT link can never report
+    /// `cp_passive_only()` and can never be registered as a CP holder by
+    /// `classify_cp_link`. The boundary that matters is the *combination* —
+    /// C strips only the CP/CPP bit, leaving PP/CA/MS untouched.
+    #[test]
+    fn out_link_discards_cp_and_cpp_but_keeps_the_other_modifiers() {
+        for text in ["TARGET.VAL CP", "TARGET.VAL CPP", "TARGET CP MS"] {
+            match parse_output_link_v2(text) {
+                ParsedLink::Db(db) => {
+                    assert_eq!(
+                        db.policy,
+                        LinkProcessPolicy::NoProcess,
+                        "{text} must lose its CP/CPP class"
+                    );
+                    assert_eq!(
+                        db.policy.cp_passive_only(),
+                        None,
+                        "{text} must not be a CP holder"
+                    );
+                }
+                other => panic!("expected Db link for {text}, got {other:?}"),
+            }
+        }
+        // The MS bit survives the OUTLINK mask (only CP/CPP is cleared).
+        match parse_output_link_v2("TARGET CP MS") {
+            ParsedLink::Db(db) => assert_eq!(db.monitor_switch, MonitorSwitch::Maximize),
+            other => panic!("expected Db link, got {other:?}"),
+        }
+        // `PP CP` — C's chain matches PP first, so there is no CP bit to strip
+        // and the link stays a processing output link.
+        match parse_output_link_v2("TARGET PP CP") {
+            ParsedLink::Db(db) => assert_eq!(db.policy, LinkProcessPolicy::ProcessPassive),
+            other => panic!("expected Db link, got {other:?}"),
+        }
+        // A ` CA` OUT link is still an external channel — CA is not masked.
+        assert!(matches!(
+            parse_output_link_v2("OTHER:PV CA"),
+            ParsedLink::Ca(_)
+        ));
+    }
+
+    /// The warning predicate must agree with what the parser actually discards:
+    /// true exactly when the OUT mask downgrades a CP/CPP class.
+    #[test]
+    fn out_link_discards_cp_predicate_tracks_the_mask() {
+        for text in ["TARGET CP", "TARGET CPP", "TARGET CP MS", "TARGET MSI CPP"] {
+            assert!(out_link_discards_cp(text), "{text} loses its CP/CPP");
+        }
+        for text in [
+            "TARGET",            // no modifiers at all
+            "TARGET PP",         // PP wins the chain
+            "TARGET CA",         // CA wins the chain
+            "TARGET NPP",        // NPP wins the chain
+            "TARGET PP CP",      // PP is matched before CP
+            "TARGETCP",          // a name that merely ends in "CP" is not a modifier
+            "\"CP\"",            // quoted constant, never modifier-scanned
+            "{ca: {pv: \"X\"}}", // JSON link, never modifier-scanned
+        ] {
+            assert!(!out_link_discards_cp(text), "{text} discards nothing");
+        }
+    }
+
+    /// R6-4 — `DBF_FWDLINK` masks the modifier set to `pvlOptCA` alone
+    /// (`dbStaticLib.c:2390`): every process class other than CA, and every
+    /// maximize-severity switch, is cleared.
+    #[test]
+    fn fwd_link_masks_everything_except_ca() {
+        for text in ["NEXT PP", "NEXT CP", "NEXT CPP", "NEXT NPP"] {
+            match parse_forward_link_v2(text) {
+                ParsedLink::Db(db) => {
+                    assert_eq!(db.policy, LinkProcessPolicy::NoProcess, "{text}");
+                    assert_eq!(db.monitor_switch, MonitorSwitch::NoMaximize, "{text}");
+                }
+                other => panic!("expected Db link for {text}, got {other:?}"),
+            }
+        }
+        // MS is masked off even without a process-class modifier.
+        match parse_forward_link_v2("NEXT MS") {
+            ParsedLink::Db(db) => assert_eq!(db.monitor_switch, MonitorSwitch::NoMaximize),
+            other => panic!("expected Db link, got {other:?}"),
+        }
+        // CA is the one bit that survives — a forward link may still cross IOCs.
+        match parse_forward_link_v2("OTHER:REC CA MS") {
+            ParsedLink::Ca(ca) => {
+                assert_eq!(ca.pv, "OTHER:REC");
+                assert_eq!(ca.monitor_switch, MonitorSwitch::NoMaximize);
+            }
+            other => panic!("expected Ca link, got {other:?}"),
+        }
     }
 }

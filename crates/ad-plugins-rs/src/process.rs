@@ -85,10 +85,6 @@ pub struct ProcessConfig {
     pub enable_filter: bool,
     pub filter: FilterConfig,
     pub output_type: Option<NDDataType>,
-    /// One-shot flag: save current input as background on next process().
-    pub save_background: bool,
-    /// One-shot flag: save current input as flat field on next process().
-    pub save_flat_field: bool,
     /// One-shot flag: compute offset/scale automatically from the next input
     /// array (C++ `NDPluginProcessAutoOffsetScale`). Cleared after it runs.
     pub auto_offset_scale_pending: bool,
@@ -116,13 +112,19 @@ impl Default for ProcessConfig {
             enable_filter: false,
             filter: FilterConfig::default(),
             output_type: None,
-            save_background: false,
-            save_flat_field: false,
             auto_offset_scale_pending: false,
             valid_background: false,
             valid_flat_field: false,
         }
     }
+}
+
+/// C++ `pNDArrayPool->convert(pArray, &pOut, NDFloat64)` reduced to what the
+/// background / flat-field buffers actually need: the elements as f64.
+fn elements_as_f64(array: &NDArray) -> Vec<f64> {
+    (0..array.data.len())
+        .map(|i| array.data.get_as_f64(i).unwrap_or(0.0))
+        .collect()
 }
 
 /// State for the process plugin (holds background, flat field, and filter state).
@@ -133,9 +135,50 @@ pub struct ProcessState {
     pub background: Option<Vec<f64>>,
     pub flat_field: Option<Vec<f64>>,
     /// Single filter buffer (equivalent to C++ `pFilter`).
+    ///
+    /// Invariant (NDPluginProcess.cpp:182-187): this buffer is dropped **only**
+    /// when its element count no longer matches the incoming frame. No
+    /// parameter write may free it — a requested reset re-seeds the contents in
+    /// place via the RC coefficients, it does not discard them.
     pub filter_state: Option<Vec<f64>>,
     /// Number of frames filtered since last reset.
     pub num_filtered: usize,
+    /// Pending `ResetFilter` request (C++ local `resetFilter`, read from the
+    /// parameter at NDPluginProcess.cpp:73 and cleared at :91-93). Consumed by
+    /// [`ProcessState::process`], which is the only owner allowed to act on it.
+    reset_filter_pending: bool,
+    /// C++ `this->pArrays[0]`: the plugin's most recent **output** array, cached
+    /// by `NDPluginDriver::endProcessCallbacks` (NDPluginDriver.cpp:262-277) —
+    /// fully processed and already in the output data type, NOT the raw input.
+    ///
+    /// This is what SaveBackground/SaveFlatField copy
+    /// (NDPluginProcess.cpp:292, :301), so it must exist as real state; there is
+    /// no way to answer "save the current array" from an input frame.
+    ///
+    /// Invariant: written only by [`ProcessState::process`], and only on the path
+    /// that actually emits an array — a filter-suppressed frame leaves C's
+    /// `doCallbacks = 0`, so `endProcessCallbacks` never runs and `pArrays[0]`
+    /// keeps the previous output.
+    last_output: Option<NDArray>,
+}
+
+/// C's recursive-filter term: `if (coef) acc += coef * term`
+/// (NDPluginProcess.cpp:206-207 and :221-225 — all six terms of the filter are
+/// written this way).
+///
+/// The guard is not an optimisation, it is semantics: `0.0 * NaN` and
+/// `0.0 * inf` are NaN in IEEE-754, so multiplying an unused term by a zero
+/// coefficient does NOT drop it — it poisons the sum. C's `if` drops it. That
+/// matters most for `filter[]`, which feeds the next frame: one non-finite
+/// sample (a Float64/Float32 input carrying NaN, or an inf produced by a large
+/// coefficient) makes every later output NaN for as long as the filter lives,
+/// even with the filter coefficients set to zero to disable that term.
+///
+/// `coef != 0.0` is exactly C's truth test on a double: false for `+0.0` and
+/// `-0.0`, true for everything else including NaN.
+#[inline]
+fn accumulate(acc: f64, coef: f64, term: f64) -> f64 {
+    if coef != 0.0 { acc + coef * term } else { acc }
 }
 
 impl ProcessState {
@@ -146,29 +189,49 @@ impl ProcessState {
             flat_field: None,
             filter_state: None,
             num_filtered: 0,
+            reset_filter_pending: false,
+            last_output: None,
         }
     }
 
-    /// Save the current array as background.
-    pub fn save_background(&mut self, array: &NDArray) {
-        let n = array.data.len();
-        let mut bg = vec![0.0f64; n];
-        for i in 0..n {
-            bg[i] = array.data.get_as_f64(i).unwrap_or(0.0);
-        }
-        self.background = Some(bg);
-        self.config.valid_background = true;
+    /// The plugin's last output array — C++ `this->pArrays[0]`. `None` until the
+    /// first frame is emitted.
+    pub fn last_output(&self) -> Option<&NDArray> {
+        self.last_output.as_ref()
     }
 
-    /// Save the current array as flat field.
-    pub fn save_flat_field(&mut self, array: &NDArray) {
-        let n = array.data.len();
-        let mut ff = vec![0.0f64; n];
-        for i in 0..n {
-            ff[i] = array.data.get_as_f64(i).unwrap_or(0.0);
-        }
-        self.flat_field = Some(ff);
-        self.config.valid_flat_field = true;
+    /// C++ `NDPluginProcess::writeInt32(NDPluginProcessSaveBackground)`
+    /// (NDPluginProcess.cpp:287-298), performed **synchronously on the parameter
+    /// write**, not deferred to the next frame:
+    ///
+    /// ```text
+    /// setIntegerParam(SaveBackground, 0);
+    /// if (pBackground) pBackground->release();
+    /// pBackground = NULL;
+    /// setIntegerParam(ValidBackground, 0);
+    /// if (pArrays[0]) {
+    ///     convert(pArrays[0], &pBackground, NDFloat64);
+    ///     nBackgroundElements = arrayInfo.nElements;
+    ///     setIntegerParam(ValidBackground, 1);
+    /// }
+    /// ```
+    ///
+    /// So the old buffer is dropped and ValidBackground cleared even when there
+    /// is no array to save from, and the source is the last OUTPUT array — the
+    /// one this plugin already emitted, in the output data type.
+    pub fn save_background(&mut self) {
+        let saved = self.last_output.as_ref().map(elements_as_f64);
+        self.config.valid_background = saved.is_some();
+        self.background = saved;
+    }
+
+    /// C++ `NDPluginProcess::writeInt32(NDPluginProcessSaveFlatField)`
+    /// (NDPluginProcess.cpp:299-310) — the SaveBackground sequence above, on the
+    /// flat-field buffer.
+    pub fn save_flat_field(&mut self) {
+        let saved = self.last_output.as_ref().map(elements_as_f64);
+        self.config.valid_flat_field = saved.is_some();
+        self.flat_field = saved;
     }
 
     /// Auto-calculate offset and scale matching C++ NDPluginProcess.
@@ -314,10 +377,17 @@ impl ProcessState {
         }
     }
 
-    /// Reset the filter state, clearing the filter buffer.
+    /// Request a filter reset on the next processed frame.
+    ///
+    /// This is the `ResetFilter` parameter write. C only clears the PV
+    /// (NDPluginProcess.cpp:91-93) and lets `processCallbacks` act on the local
+    /// flag; `pFilter` keeps its contents, so the reset formula at :204-209
+    /// (`newFilter = rOffset + rc1*filter[i] + rc2*data[i]`) evaluates against
+    /// the **previous** filter buffer. Freeing the buffer here would make
+    /// `filter[i] == data[i]` on the next frame and change the reinitialized
+    /// value whenever `RC1 != 0`.
     pub fn reset_filter(&mut self) {
-        self.filter_state = None;
-        self.num_filtered = 0;
+        self.reset_filter_pending = true;
     }
 
     /// Process an array through the configured pipeline.
@@ -333,16 +403,14 @@ impl ProcessState {
             values[i] = src.data.get_as_f64(i).unwrap_or(0.0);
         }
 
-        // 0. Save background/flat field (one-shot flags)
-        if self.config.save_background {
-            self.save_background(src);
-            self.config.save_background = false;
-        }
-        if self.config.save_flat_field {
-            self.save_flat_field(src);
-            self.config.save_flat_field = false;
-        }
-        // 0b. Auto offset/scale (one-shot): C MEASURES this frame's min/max and
+        // C reads the ResetFilter parameter once per frame and clears the PV
+        // immediately (NDPluginProcess.cpp:73, :91-93) — before the EnableFilter
+        // block, so a reset requested while filtering is disabled is consumed
+        // and lost. Take the flag here for the same reason.
+        let reset_requested = self.reset_filter_pending;
+        self.reset_filter_pending = false;
+
+        // Auto offset/scale (one-shot): C MEASURES this frame's min/max and
         // ARMS scale/offset + clipping for the NEXT frame — the trigger frame
         // itself is emitted with the pre-existing config, NOT the derived scale
         // (NDPluginProcess.cpp:164-178 only updates min/max; 238-250 arms the
@@ -448,32 +516,38 @@ impl ProcessState {
         if self.config.enable_filter {
             let fc = &self.config.filter;
 
-            // Ensure filter buffer exists and matches element count
+            // C++ NDPluginProcess.cpp:181-201. The filter buffer is released
+            // ONLY on an element-count mismatch (:184); a fresh buffer is then
+            // seeded from the current frame and forces a reset (:198).
             if let Some(ref f) = self.filter_state {
                 if f.len() != n {
                     self.filter_state = None;
                 }
             }
 
-            let mut reset_filter = self.filter_state.is_none();
-            if self.num_filtered >= fc.num_filter && fc.auto_reset {
+            let mut reset_filter = reset_requested;
+            if self.filter_state.is_none() {
+                // No current filter array: seed it from this frame, reset (:189-199).
+                self.filter_state = Some(values.clone());
                 reset_filter = true;
             }
-
-            // Initialize filter buffer from current data if needed
-            if self.filter_state.is_none() {
-                self.filter_state = Some(values.clone());
+            if self.num_filtered >= fc.num_filter && fc.auto_reset {
+                reset_filter = true;
             }
 
             let filter = self.filter_state.as_mut().unwrap();
 
             if reset_filter {
-                // C++: filter[i] = rOffset + rc1*filter[i] + rc2*data[i]
+                // C++ NDPluginProcess.cpp:204-209:
+                //   newFilter = rOffset;
+                //   if (rc1) newFilter += rc1*filter[i];
+                //   if (rc2) newFilter += rc2*data[i];
                 let r_offset = fc.r_offset;
                 let rc1 = fc.rc[0];
                 let rc2 = fc.rc[1];
                 for i in 0..n {
-                    let new_filter = r_offset + rc1 * filter[i] + rc2 * values[i];
+                    let mut new_filter = accumulate(r_offset, rc1, filter[i]);
+                    new_filter = accumulate(new_filter, rc2, values[i]);
                     filter[i] = new_filter;
                 }
                 self.num_filtered = 0;
@@ -493,17 +567,23 @@ impl ProcessState {
             let o_offset = fc.o_offset;
             let f_offset = fc.f_offset;
 
-            // C++ NDPluginProcess.cpp:220-227 doProcess:
-            //   newData   = oOffset + O1*filter[i] + O2*data[i];
-            //   newFilter = fOffset + F1*filter[i] + F2*data[i];
+            // C++ NDPluginProcess.cpp:219-227 doProcess:
+            //   newData   = oOffset;
+            //   if (O1) newData += O1 * filter[i];
+            //   if (O2) newData += O2 * data[i];
+            //   newFilter = fOffset;
+            //   if (F1) newFilter += F1 * filter[i];
+            //   if (F2) newFilter += F2 * data[i];
             //   data[i]   = newData;
             //   filter[i] = newFilter;
             // Both newData AND newFilter are computed from the ORIGINAL
             // data[i]; data[i] = newData is assigned only afterward. So the
             // filter-state update must use the original input, not new_data.
             for i in 0..n {
-                let new_data = o_offset + o1 * filter[i] + o2 * values[i];
-                let new_filter = f_offset + f1 * filter[i] + f2 * values[i];
+                let mut new_data = accumulate(o_offset, o1, filter[i]);
+                new_data = accumulate(new_data, o2, values[i]);
+                let mut new_filter = accumulate(f_offset, f1, filter[i]);
+                new_filter = accumulate(new_filter, f2, values[i]);
                 values[i] = new_data;
                 filter[i] = new_filter;
             }
@@ -537,6 +617,12 @@ impl ProcessState {
         if auto_offset_scale_now {
             self.auto_offset_scale(src);
         }
+
+        // C `endProcessCallbacks` caches the emitted array in pArrays[0]
+        // (NDPluginDriver.cpp:262-277). It runs only on this path — a
+        // filter-suppressed frame returned above and leaves the previous output
+        // in place. This is the ONLY writer of `last_output`.
+        self.last_output = Some(arr.clone());
 
         Some(arr)
     }
@@ -643,11 +729,13 @@ impl NDPluginProcess for ProcessProcessor {
                 .param_updates
                 .push(ParamUpdate::int32(idx, self.state.num_filtered as i32));
         }
-        // Reset save_background/save_flat_field readback to 0 (one-shot)
-        if let Some(idx) = self.params.save_background {
-            result.param_updates.push(ParamUpdate::int32(idx, 0));
-        }
-        if let Some(idx) = self.params.save_flat_field {
+        // SaveBackground/SaveFlatField are NOT touched here: C clears those PVs in
+        // writeInt32 (:288, :300), where the save itself happens. processCallbacks
+        // never writes them.
+        //
+        // C clears the ResetFilter PV inside processCallbacks (:91-93), not on
+        // the parameter write.
+        if let Some(idx) = self.params.reset_filter {
             result.param_updates.push(ParamUpdate::int32(idx, 0));
         }
 
@@ -767,14 +855,23 @@ impl NDPluginProcess for ProcessProcessor {
                 NDDataType::from_ordinal(v as u8)
             };
         } else if Some(reason) == p.save_background {
-            if params.value.as_i32() != 0 {
-                s.config.save_background = true;
+            // C `writeInt32` (:287-298) acts on ANY write to SaveBackground,
+            // including a 0 — there is no value test — and does the whole save
+            // right here: clear the PV, drop the old buffer, then copy pArrays[0]
+            // (the last OUTPUT array) if one exists and latch ValidBackground.
+            s.save_background();
+            updates.push(ParamUpdate::int32(reason, 0));
+            if let Some(idx) = p.valid_background {
+                updates.push(ParamUpdate::int32(idx, s.config.valid_background as i32));
             }
         } else if Some(reason) == p.enable_background {
             s.config.enable_background = params.value.as_i32() != 0;
         } else if Some(reason) == p.save_flat_field {
-            if params.value.as_i32() != 0 {
-                s.config.save_flat_field = true;
+            // C `writeInt32` (:299-310), same shape as SaveBackground above.
+            s.save_flat_field();
+            updates.push(ParamUpdate::int32(reason, 0));
+            if let Some(idx) = p.valid_flat_field {
+                updates.push(ParamUpdate::int32(idx, s.config.valid_flat_field as i32));
             }
         } else if Some(reason) == p.enable_flat_field {
             s.config.enable_flat_field = params.value.as_i32() != 0;
@@ -812,8 +909,11 @@ impl NDPluginProcess for ProcessProcessor {
         } else if Some(reason) == p.enable_filter {
             s.config.enable_filter = params.value.as_i32() != 0;
         } else if Some(reason) == p.filter_type {
+            // C maps FilterType to coefficients in the database
+            // (NDProcess.template:809-825 `FilterTypeSeq` writes FC/OC/RC only)
+            // and NDPluginProcess::writeInt32 (:274-329) never touches pFilter
+            // or numFiltered. Only the coefficients change here.
             s.apply_filter_type(params.value.as_i32());
-            s.reset_filter();
             // Push updated coefficients back
             let fc = &s.config.filter;
             for (i, idx) in p.fc.iter().enumerate() {
@@ -845,10 +945,10 @@ impl NDPluginProcess for ProcessProcessor {
             }
         } else if Some(reason) == p.reset_filter {
             if params.value.as_i32() != 0 {
+                // Arm the reset; the next processed frame consumes it, clears
+                // the PV and zeroes NumFiltered (NDPluginProcess.cpp:91-93,
+                // :204-210). C does neither at parameter-write time.
                 s.reset_filter();
-                if let Some(idx) = p.num_filtered {
-                    updates.push(ParamUpdate::int32(idx, 0));
-                }
             }
         } else if Some(reason) == p.auto_reset_filter {
             s.config.filter.auto_reset = params.value.as_i32() != 0;
@@ -903,6 +1003,19 @@ mod tests {
         arr
     }
 
+    /// Put `arr` in C's `pArrays[0]` and write SaveBackground — the only route by
+    /// which C ever fills pBackground (NDPluginProcess.cpp:293-297).
+    fn seed_background(state: &mut ProcessState, arr: &NDArray) {
+        state.last_output = Some(arr.clone());
+        state.save_background();
+    }
+
+    /// Same for the flat field (NDPluginProcess.cpp:304-308).
+    fn seed_flat_field(state: &mut ProcessState, arr: &NDArray) {
+        state.last_output = Some(arr.clone());
+        state.save_flat_field();
+    }
+
     fn make_f64_array(vals: &[f64]) -> NDArray {
         let mut arr = NDArray::new(vec![NDDimension::new(vals.len())], NDDataType::Float64);
         if let NDDataBuffer::F64(ref mut v) = arr.data {
@@ -920,7 +1033,7 @@ mod tests {
             enable_background: true,
             ..Default::default()
         });
-        state.save_background(&bg_arr);
+        seed_background(&mut state, &bg_arr);
 
         let result = state.process(&input).unwrap();
         if let NDDataBuffer::U8(ref v) = result.data {
@@ -942,7 +1055,7 @@ mod tests {
             enable_background: true,
             ..Default::default()
         });
-        state.save_background(&bg_arr);
+        seed_background(&mut state, &bg_arr);
         assert!(state.config.valid_background); // set at save time (C writeInt32)
 
         let result = state.process(&input).unwrap();
@@ -968,7 +1081,7 @@ mod tests {
             scale_flat_field: 100.0,
             ..Default::default()
         });
-        state.save_flat_field(&ff_arr);
+        seed_flat_field(&mut state, &ff_arr);
 
         let result = state.process(&input).unwrap();
         if let NDDataBuffer::U8(ref v) = result.data {
@@ -992,7 +1105,7 @@ mod tests {
             scale_flat_field: 0.0,
             ..Default::default()
         });
-        state.save_flat_field(&ff_arr);
+        seed_flat_field(&mut state, &ff_arr);
         let result = state.process(&input).unwrap();
         if let NDDataBuffer::U8(ref v) = result.data {
             assert_eq!(v, &[0, 0, 0]);
@@ -1287,76 +1400,137 @@ mod tests {
     }
 
     #[test]
-    fn test_save_background_one_shot() {
+    fn test_r9_68_save_background_copies_the_last_output_synchronously() {
+        // R9-68. C's writeInt32(SaveBackground) (NDPluginProcess.cpp:287-298) saves
+        // `this->pArrays[0]` — the plugin's last OUTPUT array — on the spot and
+        // latches ValidBackground=1 there. The port armed a one-shot flag and saved
+        // the next frame's INPUT instead, so the background was a different array
+        // (unprocessed, and one frame late).
+        //
+        // This test replaces test_save_background_one_shot, which pinned that
+        // invented deferred-input behaviour.
         let mut state = ProcessState::new(ProcessConfig {
-            save_background: true,
+            enable_offset_scale: true,
+            offset: 0.0,
+            scale: 2.0,
+            output_type: Some(NDDataType::Float64),
             ..Default::default()
         });
 
-        assert!(!state.config.valid_background);
+        // No frame yet: C's pArrays[0] is NULL, so the save leaves the background
+        // empty and ValidBackground at 0 (:291-292 clear unconditionally, :293
+        // guards the copy).
+        state.save_background();
         assert!(state.background.is_none());
+        assert!(!state.config.valid_background);
 
-        // Process with save_background=true: should capture and clear flag
-        let input = make_array(&[10, 20, 30]);
-        let _ = state.process(&input);
+        // One frame through: input 10,20,30 → output (x + 0) * 2 = 20,40,60.
+        let out = state.process(&make_array(&[10, 20, 30])).unwrap();
+        assert_eq!(out.data.get_as_f64(0), Some(20.0));
 
-        assert!(
-            !state.config.save_background,
-            "save_background should be cleared"
-        );
+        // SaveBackground now copies THAT OUTPUT (20,40,60), not the input and not
+        // the next frame.
+        state.save_background();
         assert!(
             state.config.valid_background,
-            "valid_background should be set"
+            "ValidBackground latches at once"
         );
-        assert!(state.background.is_some());
-
         let bg = state.background.as_ref().unwrap();
-        assert_eq!(bg.len(), 3);
-        assert!((bg[0] - 10.0).abs() < 1e-9);
-        assert!((bg[1] - 20.0).abs() < 1e-9);
-        assert!((bg[2] - 30.0).abs() < 1e-9);
-
-        // Process again: flag should remain cleared, background should persist
-        let input2 = make_array(&[40, 50, 60]);
-        let _ = state.process(&input2);
-
-        assert!(
-            !state.config.save_background,
-            "save_background stays cleared"
+        assert_eq!(
+            bg.as_slice(),
+            &[20.0, 40.0, 60.0],
+            "background is the OUTPUT array"
         );
-        // Background unchanged
-        let bg2 = state.background.as_ref().unwrap();
-        assert!((bg2[0] - 10.0).abs() < 1e-9);
+
+        // The next frame must not overwrite the background — the old one-shot did.
+        let _ = state.process(&make_array(&[1, 2, 3]));
+        assert_eq!(
+            state.background.as_ref().unwrap().as_slice(),
+            &[20.0, 40.0, 60.0]
+        );
     }
 
     #[test]
-    fn test_save_flat_field_one_shot() {
+    fn test_r9_68_save_flat_field_copies_the_last_output_synchronously() {
+        // Same contract on the flat-field buffer (NDPluginProcess.cpp:299-310).
         let mut state = ProcessState::new(ProcessConfig {
-            save_flat_field: true,
+            enable_offset_scale: true,
+            offset: 1.0,
+            scale: 1.0,
+            output_type: Some(NDDataType::Float64),
             ..Default::default()
         });
 
-        assert!(!state.config.valid_flat_field);
+        state.save_flat_field();
         assert!(state.flat_field.is_none());
+        assert!(!state.config.valid_flat_field);
 
-        let input = make_array(&[50, 100, 150]);
-        let _ = state.process(&input);
+        // Output = (input + 1) * 1 → 51, 101, 151.
+        let _ = state.process(&make_array(&[50, 100, 150])).unwrap();
+        state.save_flat_field();
 
-        assert!(
-            !state.config.save_flat_field,
-            "save_flat_field should be cleared"
+        assert!(state.config.valid_flat_field);
+        assert_eq!(
+            state.flat_field.as_ref().unwrap().as_slice(),
+            &[51.0, 101.0, 151.0],
+            "flat field is the OUTPUT array, not the input"
         );
-        assert!(
-            state.config.valid_flat_field,
-            "valid_flat_field should be set"
-        );
-        assert!(state.flat_field.is_some());
 
-        let ff = state.flat_field.as_ref().unwrap();
-        assert_eq!(ff.len(), 3);
-        assert!((ff[0] - 50.0).abs() < 1e-9);
-        assert!((ff[1] - 100.0).abs() < 1e-9);
-        assert!((ff[2] - 150.0).abs() < 1e-9);
+        let _ = state.process(&make_array(&[7, 7, 7]));
+        assert_eq!(
+            state.flat_field.as_ref().unwrap().as_slice(),
+            &[51.0, 101.0, 151.0]
+        );
+    }
+
+    #[test]
+    fn test_r9_68_save_background_write_of_zero_still_saves() {
+        // C's writeInt32 branches on the FUNCTION, never on the value
+        // (NDPluginProcess.cpp:287): a caput of 0 to SaveBackground runs the same
+        // release-and-resave sequence. The port gated on `value != 0`.
+        use ad_core_rs::plugin::runtime::{ParamChangeValue, ParamUpdate, PluginParamSnapshot};
+        use asyn_rs::port::{PortDriverBase, PortFlags};
+
+        let mut proc = ProcessProcessor::new(ProcessConfig {
+            output_type: Some(NDDataType::Float64),
+            ..Default::default()
+        });
+
+        let mut base = PortDriverBase::new("R9_68", 1, PortFlags::default());
+        proc.register_params(&mut base).unwrap();
+        let pool = NDArrayPool::new(1_000_000);
+        let _ = proc.process_array(&make_array(&[4, 5, 6]), &pool);
+
+        let reason = proc.params.save_background.unwrap();
+        let valid = proc.params.valid_background.unwrap();
+        let snapshot = PluginParamSnapshot {
+            enable_callbacks: true,
+            reason,
+            addr: 0,
+            value: ParamChangeValue::Int32(0),
+        };
+        let result = proc.on_param_change(reason, &snapshot);
+
+        assert_eq!(
+            proc.state.background.as_ref().unwrap().as_slice(),
+            &[4.0, 5.0, 6.0],
+            "a 0 write saves the background too"
+        );
+        // The PV self-clears and ValidBackground is published from the same write.
+        let int_update = |r: usize| {
+            result.param_updates.iter().find_map(|u| match u {
+                ParamUpdate::Int32 {
+                    reason: ur, value, ..
+                } if *ur == r => Some(*value),
+                _ => None,
+            })
+        };
+        assert_eq!(int_update(reason), Some(0), "SaveBackground echoes 0");
+        assert_eq!(
+            int_update(valid),
+            Some(1),
+            "ValidBackground latches on the write"
+        );
     }
 
     #[test]
@@ -1459,13 +1633,92 @@ mod tests {
         assert!(state.filter_state.is_some());
         assert_eq!(state.num_filtered, 2);
 
-        // Manual reset
+        // Manual reset: C only clears the ResetFilter PV (NDPluginProcess.cpp:91-93).
+        // The buffer stays, and NumFiltered is zeroed by the next frame's reset
+        // loop (:210), not by the parameter write.
         state.reset_filter();
-        assert!(state.filter_state.is_none());
-        assert_eq!(state.num_filtered, 0);
+        assert!(
+            state.filter_state.is_some(),
+            "buffer must survive the reset"
+        );
+        assert_eq!(state.num_filtered, 2);
 
-        // Next frame should act as first frame (reset mode)
+        // Next frame runs the reset formula, so num_filtered restarts at 1.
         let _ = state.process(&make_f64_array(&[200.0]));
+        assert_eq!(state.num_filtered, 1);
+    }
+
+    #[test]
+    fn test_r6_69_manual_reset_keeps_previous_filter_contents() {
+        // R6-69 / NDPluginProcess.cpp:91,184,204-209 — ResetFilter does not free
+        // pFilter; it is released only on an element-count mismatch. The reset
+        // formula therefore reads the PREVIOUS filter contents:
+        //   newFilter = rOffset + rc1*filter[i] + rc2*data[i]
+        // With RC1 != 0 that differs from a filter re-seeded off the current frame.
+        //
+        // CopyToFilter (fc=[0,0,1,0], oc=[1,0,0,0]) makes filter[i] == the last
+        // frame's input and data[i] == the pre-update filter, so the values below
+        // are easy to follow.
+        let cfg = || ProcessConfig {
+            enable_filter: true,
+            filter: FilterConfig {
+                num_filter: 10,
+                fc: [0.0, 0.0, 1.0, 0.0],
+                oc: [1.0, 0.0, 0.0, 0.0],
+                rc: [0.5, 2.0], // rc1 = 0.5 (reads the old filter), rc2 = 2.0
+                r_offset: 1.0,
+                ..Default::default()
+            },
+            output_type: Some(NDDataType::Float64),
+            ..Default::default()
+        };
+
+        let mut state = ProcessState::new(cfg());
+        // Frame 0 seeds the buffer from the frame itself (no prior filter):
+        //   filter = 1.0 + 0.5*100 + 2.0*100 = 251, then CopyToFilter -> 100.
+        let _ = state.process(&make_f64_array(&[100.0]));
+        assert_eq!(state.filter_state.as_ref().unwrap()[0], 100.0);
+
+        // Arm the manual reset, then send a frame of 10.
+        state.reset_filter();
+        let out = state.process(&make_f64_array(&[10.0])).unwrap();
+
+        // Reset uses the PREVIOUS filter (100), not the current data (10):
+        //   newFilter = 1.0 + 0.5*100 + 2.0*10 = 71
+        // Output (O1 = 1) is that reinitialized filter value.
+        assert_eq!(out.data.get_as_f64(0).unwrap(), 71.0);
+        assert_eq!(state.num_filtered, 1);
+        // A buffer re-seeded from the current frame would have given
+        // 1.0 + 0.5*10 + 2.0*10 = 26 — the pre-fix behaviour.
+    }
+
+    #[test]
+    fn test_r6_69_element_count_mismatch_frees_the_buffer() {
+        // The one path that DOES release pFilter (NDPluginProcess.cpp:182-187):
+        // a frame whose element count differs from the buffer's.
+        let mut state = ProcessState::new(ProcessConfig {
+            enable_filter: true,
+            filter: FilterConfig {
+                num_filter: 10,
+                fc: [0.0, 0.0, 1.0, 0.0],
+                oc: [1.0, 0.0, 0.0, 0.0],
+                rc: [0.5, 2.0],
+                r_offset: 1.0,
+                ..Default::default()
+            },
+            output_type: Some(NDDataType::Float64),
+            ..Default::default()
+        });
+
+        let _ = state.process(&make_f64_array(&[100.0]));
+        assert_eq!(state.filter_state.as_ref().unwrap().len(), 1);
+
+        // Two elements now: the old buffer is dropped and re-seeded from this
+        // frame, so the reset reads filter[i] == data[i] == 10.
+        //   newFilter = 1.0 + 0.5*10 + 2.0*10 = 26
+        let out = state.process(&make_f64_array(&[10.0, 10.0])).unwrap();
+        assert_eq!(state.filter_state.as_ref().unwrap().len(), 2);
+        assert_eq!(out.data.get_as_f64(0).unwrap(), 26.0);
         assert_eq!(state.num_filtered, 1);
     }
 
@@ -1593,5 +1846,56 @@ mod tests {
                 expected_filter[k]
             );
         }
+    }
+    /// R12-63. C guards every filter term with `if (coef)`
+    /// (NDPluginProcess.cpp:206-207, 221-225), so a ZERO coefficient DROPS its
+    /// term. Multiplying instead is not equivalent: `0.0 * NaN` is NaN, so a
+    /// single non-finite input sample poisons `filter[]` — permanently, because
+    /// filter[] feeds the next frame — even though the coefficients say that
+    /// term is unused.
+    ///
+    /// Setup: RC1=RC2=0 with ROFFSET=5, so C's reset writes `filter[i] = 5` and
+    /// never touches the NaN it seeded the filter from. OC3=OC4=0 (O2=0) and
+    /// FC3=FC4=0 (F2=0), so the NaN input data is dropped from both sums too.
+    /// C output: `oOffset + O1*filter[i]` = 5 for EVERY element.
+    #[test]
+    fn r12_63_a_zero_coefficient_drops_its_term_instead_of_multiplying_it() {
+        let input = make_f64_array(&[1.0, f64::NAN, 3.0]);
+
+        let mut state = ProcessState::new(ProcessConfig {
+            enable_filter: true,
+            filter: FilterConfig {
+                num_filter: 2,
+                rc: [0.0, 0.0],
+                r_offset: 5.0,
+                oc: [1.0, 0.0, 0.0, 0.0],
+                fc: [1.0, 0.0, 0.0, 0.0],
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let result = state.process(&input).unwrap();
+        let NDDataBuffer::F64(ref v) = result.data else {
+            panic!("expected an F64 output buffer, got {:?}", result.data);
+        };
+        assert_eq!(
+            v.as_slice(),
+            [5.0, 5.0, 5.0],
+            "RC1=RC2=0 makes C's reset `filter[i] = rOffset`; O2=0 drops the NaN \
+             data term. Every element is rOffset — 0.0 * NaN must not be summed in"
+        );
+
+        // And the poison must not be latent in the filter state either: a second,
+        // fully finite frame still comes out clean.
+        let clean = make_f64_array(&[7.0, 8.0, 9.0]);
+        let result = state.process(&clean).unwrap();
+        let NDDataBuffer::F64(ref v) = result.data else {
+            panic!("expected an F64 output buffer");
+        };
+        assert!(
+            v.iter().all(|x| x.is_finite()),
+            "the NaN must not survive in filter[] across frames: {v:?}"
+        );
     }
 }

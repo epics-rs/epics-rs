@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc;
 
-use crate::pvdata::{FieldDesc, PvField};
+use crate::pvdata::{FieldDesc, PvField, RpcReply};
 
 use super::source::{
     AccessChecked, ChannelInvalidator, ChannelSource, DynSource, OpError, RawMonitorEvent,
@@ -529,7 +529,7 @@ impl ChannelSource for CompositeSource {
         name: &str,
         request_desc: FieldDesc,
         request_value: PvField,
-    ) -> impl std::future::Future<Output = Result<(FieldDesc, PvField), OpError>> + Send {
+    ) -> impl std::future::Future<Output = Result<RpcReply, OpError>> + Send {
         let name = name.to_string();
         let this = self.snapshot();
         async move {
@@ -561,6 +561,26 @@ impl ChannelSource for CompositeSource {
         async move {
             let (src, inner_checked) = Self::resolve_checked(this, &name, &ctx).await?;
             src.get_value_checked(inner_checked, ctx).await
+        }
+    }
+
+    /// Resolve the OWNING source and return ITS read — value AND assigned
+    /// leaves. Without this forward the trait default would call the
+    /// composite's own `get_value_checked` (which does resolve the owner)
+    /// but report `marked: None`, silently widening every GET / seed the
+    /// top-level composite fronts — and `PvaServer::start` always wraps the
+    /// user source in one.
+    fn read_checked(
+        &self,
+        checked: AccessChecked,
+        ctx: crate::server_native::source::ChannelContext,
+    ) -> impl std::future::Future<Output = Option<crate::server_native::source::SourceRead>> + Send
+    {
+        let name = checked.pv_name().to_string();
+        let this = self.snapshot();
+        async move {
+            let (src, inner_checked) = Self::resolve_checked(this, &name, &ctx).await?;
+            src.read_checked(inner_checked, ctx).await
         }
     }
 
@@ -624,7 +644,9 @@ impl ChannelSource for CompositeSource {
         changed: crate::proto::BitSet,
         delta: PvField,
         ctx: crate::server_native::source::ChannelContext,
-    ) -> impl std::future::Future<Output = Result<Option<PvField>, OpError>> + Send {
+    ) -> impl std::future::Future<
+        Output = Result<Option<crate::server_native::source::SourceRead>, OpError>,
+    > + Send {
         let name = checked.pv_name().to_string();
         let this = self.snapshot();
         async move {
@@ -774,7 +796,7 @@ impl ChannelSource for CompositeSource {
         request_desc: FieldDesc,
         request_value: PvField,
         ctx: crate::server_native::source::ChannelContext,
-    ) -> impl std::future::Future<Output = Result<(FieldDesc, PvField), OpError>> + Send {
+    ) -> impl std::future::Future<Output = Result<RpcReply, OpError>> + Send {
         let name = checked.pv_name().to_string();
         let this = self.snapshot();
         async move {
@@ -965,31 +987,6 @@ impl ChannelSource for CompositeSource {
                 }
             }
             None
-        }
-    }
-
-    fn monitor_emits_partial(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
-        // Resolve the OWNING source — first source whose `has_pv` claims
-        // `name`, in registration order, the same single-owner rule
-        // `resolve_checked` / `monitor_watermarks` enforce — and report
-        // ITS partial-update capability. Without this forward the
-        // top-level composite (`PvaServer::start` always wraps the user
-        // source) returns the trait-default `false`, which masks a
-        // partial-emitting owner (e.g. a QSRV pure self-trigger group):
-        // the monitor loop would never maintain `prev_value` and would
-        // mark the full request mask on every derived event instead of
-        // the changed leaves (pvxs `servermon.cpp:171-182`
-        // `to_wire_valid(..., &pvMask)`). A non-owning source is never
-        // consulted, so a catch-all source cannot preempt the answer.
-        let name = name.to_string();
-        let sources = self.snapshot();
-        async move {
-            for src in sources {
-                if src.has_pv(&name).await {
-                    return src.monitor_emits_partial(&name).await;
-                }
-            }
-            false
         }
     }
 
@@ -1301,98 +1298,6 @@ mod tests {
         assert_eq!(comp.monitor_watermarks("GW:PV").await, Some((0, 0)));
         // No source owns this name — no levels.
         assert_eq!(comp.monitor_watermarks("UNKNOWN:PV").await, None);
-    }
-
-    /// PVA-156 regression: a partial-emitting owner reached through the
-    /// top-level CompositeSource (`PvaServer::start` always wraps the
-    /// user source) must surface its `monitor_emits_partial`, not the
-    /// trait-default `false`. A non-owning source ordered first must not
-    /// answer for a name it does not host.
-    #[tokio::test]
-    async fn monitor_emits_partial_resolves_owner_not_composite_default() {
-        struct PartialSrc {
-            serves: &'static str,
-            partial: bool,
-        }
-        impl ChannelSource for PartialSrc {
-            fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
-                async { Vec::new() }
-            }
-            fn has_pv(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
-                let owned = name == self.serves;
-                async move { owned }
-            }
-            fn get_introspection(
-                &self,
-                _: &str,
-            ) -> impl std::future::Future<Output = Option<FieldDesc>> + Send {
-                async { None }
-            }
-            fn get_value(
-                &self,
-                _: &str,
-            ) -> impl std::future::Future<Output = Option<PvField>> + Send {
-                async { None }
-            }
-            fn put_value(
-                &self,
-                _: &str,
-                _: PvField,
-            ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
-                async { Err("n/a".into()) }
-            }
-            fn is_writable(&self, _: &str) -> impl std::future::Future<Output = bool> + Send {
-                async { false }
-            }
-            fn subscribe(
-                &self,
-                _: &str,
-            ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send
-            {
-                async { None }
-            }
-            fn monitor_emits_partial(
-                &self,
-                name: &str,
-            ) -> impl std::future::Future<Output = bool> + Send {
-                let partial = self.partial && name == self.serves;
-                async move { partial }
-            }
-        }
-
-        let comp = CompositeSource::new();
-        // Non-partial source ordered first; owns only "FULL:PV".
-        comp.add_source(
-            "full",
-            Arc::new(PartialSrc {
-                serves: "FULL:PV",
-                partial: false,
-            }) as DynSource,
-            0,
-        )
-        .unwrap();
-        // Partial-emitting owner ordered after it (QSRV pure self-trigger
-        // group analog): owns "GROUP:PV" and emits partial updates.
-        comp.add_source(
-            "partial",
-            Arc::new(PartialSrc {
-                serves: "GROUP:PV",
-                partial: true,
-            }) as DynSource,
-            1,
-        )
-        .unwrap();
-
-        // The composite must surface the owning source's partial-emit
-        // capability; before the fix it returned the trait-default false.
-        assert!(
-            comp.monitor_emits_partial("GROUP:PV").await,
-            "composite must surface the owning source's partial-emit capability"
-        );
-        // A name owned by the non-partial source stays full-mask.
-        assert!(!comp.monitor_emits_partial("FULL:PV").await);
-        // No source owns this name.
-        assert!(!comp.monitor_emits_partial("UNKNOWN:PV").await);
     }
 
     /// Pre-fix the composite used
@@ -1761,6 +1666,7 @@ mod tests {
             authority: String::new(),
             roles: Vec::new(),
             pv_request: None,
+            log: Default::default(),
         };
         let token = AccessGate::open()
             .check("PVX", "h", "alice", "ca", "")
@@ -1804,6 +1710,7 @@ mod tests {
             authority: String::new(),
             roles: Vec::new(),
             pv_request: None,
+            log: Default::default(),
         };
 
         let comp = CompositeSource::new();

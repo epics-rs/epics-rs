@@ -155,7 +155,7 @@ struct ClientState {
     subscriptions:  HashMap<sub_id, SubscriptionEntry>,
     channel_access: HashMap<sid, AccessLevel>,
     next_sid:       AtomicU32,
-    hostname:       String,    // peer.ip() unless EPICS_CAS_USE_HOST_NAMES=YES
+    hostname:       HostIdentity,  // Claimed(client name) unless asCheckClientIP / mTLS
     username:       String,
     acf:            Arc<Option<AccessSecurityConfig>>,
     tcp_port:       u16,

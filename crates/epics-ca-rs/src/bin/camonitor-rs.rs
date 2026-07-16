@@ -2,19 +2,26 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
-use chrono::{DateTime, Local};
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches, Parser};
 use epics_base_rs::types::WallTime;
 use epics_ca_rs::cli::{
-    FloatFormat, FloatStyle, IntStyle, PV_NAME_WIDTH, ValueFormat, format_value,
+    CountPrefix, FloatFormat, FloatStyle, PV_NAME_WIDTH, ValueFormat, format_time,
+    format_value_segment, sevr_to_str, stat_to_str,
 };
 use epics_ca_rs::client::{CaChannel, CaClient, ConnectionEvent, EnumReadback};
+use epics_ca_rs::copt::{self, CTool};
 
-const VERSION_INFO: &str = concat!(
-    "\nEPICS Version epics-rs ",
-    env!("CARGO_PKG_VERSION"),
-    ", CA Protocol version 4.13"
-);
+/// Owner of every C-scanned option argument in this binary (see
+/// [`epics_ca_rs::copt`]).
+const TOOL: CTool = CTool::new("camonitor");
+
+/// The getopt cases that `return` from C's `main` (`camonitor.c:225-231`), by
+/// clap id. `copt::Scan::finish` performs the FIRST one on the command line,
+/// after replaying the warnings the loop raised on its way there (R13-26).
+const TERMINALS: &[(&str, copt::Terminal)] = &[
+    ("help", copt::Terminal::Usage(0)),
+    ("version", copt::Terminal::Version),
+];
 
 /// Mirror of C `camonitor` flags. The flag set is mostly the same as
 /// `caget` minus `-t`/`-a`/`-d` and plus `-m`/`-t<key>`. We model the
@@ -24,109 +31,185 @@ const VERSION_INFO: &str = concat!(
 #[command(
     name = "camonitor-rs",
     about = "Monitor EPICS PVs for changes",
-    disable_version_flag = true
+    disable_version_flag = true,
+    disable_help_flag = true
 )]
 struct Args {
-    #[arg(short = 'V', long, hide = true)]
-    version: bool,
+    // `-h` / `-V` are ordinary options, performed by `copt::Scan::finish` at
+    // their place in the getopt order so the warnings C prints before them
+    // survive (R13-26).
+    //
+    // Every option below is `Append` (value option) or `Count` (flag): C's
+    // getopt loop accepts every option any number of times, last one winning
+    // (R13-17, see `epics_ca_rs::copt`).
+    //
+    // Doc comments on these fields are the option's HELP TEXT, so the rationale
+    // above stays a plain comment.
+    /// Print this message
+    #[arg(short = 'h', long, action = clap::ArgAction::Count)]
+    help: u8,
 
-    /// CA timeout in seconds (initial connection wait). Mirrors C
-    /// `tool_lib.c:use_ca_timeout_env` (commit 1d056c6).
-    #[arg(short = 'w', long = "wait")]
-    timeout: Option<f64>,
+    #[arg(short = 'V', long, hide = true, action = clap::ArgAction::Count)]
+    version: u8,
+
+    /// CA timeout in seconds (initial connection wait). `epicsScanDouble`;
+    /// a bad value warns and keeps the default (`camonitor.c:263-272`). Raw
+    /// `String`: every C-scanned option argument is resolved by
+    /// [`epics_ca_rs::copt`], never by clap.
+    #[arg(short = 'w', long = "wait", allow_hyphen_values = true, action = clap::ArgAction::Append)]
+    timeout: Vec<String>,
 
     /// CA event mask `<msk>`: any combination of `v` (value), `a`
     /// (alarm), `l` (log/archive), `p` (property). The subscription is
     /// issued with the resulting DBE_* mask; absent → value+log+alarm.
-    #[arg(short = 'm', long, value_name = "MASK")]
-    event_mask: Option<String>,
+    #[arg(
+        short = 'm',
+        long,
+        value_name = "MASK",
+        allow_hyphen_values = true,
+        action = clap::ArgAction::Append
+    )]
+    event_mask: Vec<String>,
 
-    /// CA priority (0-99). Opens the channel on the matching priority
-    /// virtual circuit (libca `ca_create_channel` priority parameter).
-    #[arg(short = 'p', long)]
-    priority: Option<u8>,
+    /// CA priority (`sscanf("%u")`, clamped to `CA_PRIORITY_MAX`; `-p -1`
+    /// and `-p 500` both clamp to 99 in C, `camonitor.c:281-288`).
+    #[arg(short = 'p', long, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+    priority: Vec<String>,
 
     /// Timestamp source(s) and kind. Sources: `s`=CA server/remote
     /// (default), `c`=CA client/local receive time (shown in `()`).
     /// Kind: `n`=none, `r`=relative since program start, `i`=incremental
     /// across all channels, `I`=incremental per channel. `r`/`i`/`I`
     /// require `s` or `c`. Sources combine, e.g. `-t sc`, `-t cr`.
-    #[arg(short = 't', long = "timestamp", value_name = "KEY")]
-    timestamp_key: Option<String>,
+    #[arg(
+        short = 't',
+        long = "timestamp",
+        value_name = "KEY",
+        allow_hyphen_values = true,
+        action = clap::ArgAction::Append
+    )]
+    timestamp_key: Vec<String>,
 
-    #[arg(short = 'n', long = "num-enum")]
-    enum_as_number: bool,
+    #[arg(short = 'n', long = "num-enum", action = clap::ArgAction::Count)]
+    enum_as_number: u8,
 
-    #[arg(short = '#', long = "max-elements", value_name = "COUNT")]
-    max_elements: Option<usize>,
+    /// C's `reqElems`, scanned with `sscanf("%lu")` — 64-bit, unlike
+    /// `caget`'s `%d` (`camonitor.c:273-280`). `0` (no `-#`, `-# 0`, or an
+    /// unscannable `-#`) is "not specified": the CA autosize request.
+    #[arg(
+        short = '#',
+        long = "max-elements",
+        value_name = "COUNT",
+        allow_hyphen_values = true,
+        action = clap::ArgAction::Append
+    )]
+    max_elements: Vec<String>,
 
-    #[arg(short = 'S', long = "char-as-string")]
-    char_array_as_string: bool,
+    #[arg(short = 'S', long = "char-as-string", action = clap::ArgAction::Count)]
+    char_array_as_string: u8,
 
-    #[arg(short = 'e', long = "format-e", value_name = "PRECISION")]
-    fmt_e: Option<u32>,
-    #[arg(short = 'f', long = "format-f", value_name = "PRECISION")]
-    fmt_f: Option<u32>,
-    #[arg(short = 'g', long = "format-g", value_name = "PRECISION")]
-    fmt_g: Option<u32>,
+    /// `%e`/`%f`/`%g` float format with the given precision (`sscanf("%d")`
+    /// plus the `0..=VALID_DOUBLE_DIGITS` gate; both failures warn and keep
+    /// the default format — `camonitor.c:310-324`).
+    #[arg(
+        short = 'e',
+        long = "format-e",
+        value_name = "PRECISION",
+        allow_hyphen_values = true,
+        action = clap::ArgAction::Append
+    )]
+    fmt_e: Vec<String>,
+    #[arg(
+        short = 'f',
+        long = "format-f",
+        value_name = "PRECISION",
+        allow_hyphen_values = true,
+        action = clap::ArgAction::Append
+    )]
+    fmt_f: Vec<String>,
+    #[arg(
+        short = 'g',
+        long = "format-g",
+        value_name = "PRECISION",
+        allow_hyphen_values = true,
+        action = clap::ArgAction::Append
+    )]
+    fmt_g: Vec<String>,
 
-    #[arg(short = 's', long = "string-format")]
-    string_format: bool,
+    #[arg(short = 's', long = "string-format", action = clap::ArgAction::Count)]
+    string_format: u8,
 
-    #[arg(long = "lx", conflicts_with_all = ["lo_flag", "lb_flag", "ix_flag", "io_flag", "ib_flag"])]
-    lx_flag: bool,
-    #[arg(long = "lo", conflicts_with_all = ["lx_flag", "lb_flag", "ix_flag", "io_flag", "ib_flag"])]
-    lo_flag: bool,
-    #[arg(long = "lb", conflicts_with_all = ["lx_flag", "lo_flag", "ix_flag", "io_flag", "ib_flag"])]
-    lb_flag: bool,
-    #[arg(long = "0x", conflicts_with_all = ["io_flag", "ib_flag"])]
-    ix_flag: bool,
-    #[arg(long = "0o", conflicts_with_all = ["ix_flag", "ib_flag"])]
-    io_flag: bool,
-    #[arg(long = "0b", conflicts_with_all = ["ix_flag", "io_flag"])]
-    ib_flag: bool,
+    /// `-0<base>`: print integers in base `x`/`o`/`b`. C spells this as a
+    /// getopt option TAKING AN ARGUMENT (`camonitor.c:224`
+    /// `"...g:l:#:0:w:..."`), so it is `-0` with an attached or separate
+    /// `<base>` — never a `--0x`-style flag, which no C script can pass.
+    #[arg(
+        short = '0',
+        value_name = "BASE",
+        allow_hyphen_values = true,
+        action = clap::ArgAction::Append
+    )]
+    int_base: Vec<String>,
 
-    /// Alternate output field separator. Defaults to a single space.
-    /// Mirrors C `camonitor.c:342` (`case 'F'`).
-    #[arg(short = 'F', long = "field-separator", value_name = "OFS")]
-    field_separator: Option<char>,
+    /// `-l<base>`: round a float to a long and print it in base `x`/`o`/`b`
+    /// (C `outTypeF`). Same option shape as `-0` (`camonitor.c:224`).
+    /// Unlike `caget`, `camonitor` has no `-d`, so `-0` here forces no DBR
+    /// type (`camonitor.c:337`).
+    #[arg(
+        short = 'l',
+        value_name = "BASE",
+        allow_hyphen_values = true,
+        action = clap::ArgAction::Append
+    )]
+    float_base: Vec<String>,
 
-    /// PV names to monitor.
-    #[arg(required_unless_present_any = ["version"])]
+    /// Alternate output field separator: C takes `(char) *optarg`, the FIRST
+    /// character, discarding the rest (`camonitor.c:342`).
+    #[arg(
+        short = 'F',
+        long = "field-separator",
+        value_name = "OFS",
+        allow_hyphen_values = true,
+        action = clap::ArgAction::Append
+    )]
+    field_separator: Vec<String>,
+
+    /// PV names to monitor. NOT clap-`required` — see `caget-rs`; C checks
+    /// `nPvs < 1` after the getopt loop (`camonitor.c:604-608`).
     pv_names: Vec<String>,
 }
 
 impl Args {
-    fn value_format(&self) -> ValueFormat {
+    fn value_format(&self, scan: &mut copt::Scan) -> ValueFormat {
         let mut fmt = ValueFormat::default();
-        if let Some(p) = self.fmt_e {
+        // W10-B2. `-e`/`-f`/`-g` are ONE getopt case writing ONE `dblFormatStr`
+        // (`camonitor.c:310-324`), so the LAST VALID occurrence across the three letters wins
+        // — in command-line order, not by an `e` > `f` > `g` precedence. The
+        // order lives in the scan, which is why the three `Vec<String>` fields
+        // cannot resolve it themselves. Every occurrence is still scanned, so
+        // each malformed precision emits its own warning as C's loop does.
+        if let Some((letter, precision)) =
+            scan.float_precision(&[('e', "fmt_e"), ('f', "fmt_f"), ('g', "fmt_g")])
+        {
             fmt.float = FloatFormat {
-                style: FloatStyle::E,
-                precision: p,
-            };
-        } else if let Some(p) = self.fmt_f {
-            fmt.float = FloatFormat {
-                style: FloatStyle::F,
-                precision: p,
-            };
-        } else if let Some(p) = self.fmt_g {
-            fmt.float = FloatFormat {
-                style: FloatStyle::G,
-                precision: p,
+                style: match letter {
+                    'e' => FloatStyle::E,
+                    'f' => FloatStyle::F,
+                    _ => FloatStyle::G,
+                },
+                precision,
             };
         }
-        if self.ix_flag || self.lx_flag {
-            fmt.int_style = IntStyle::Hex;
-        } else if self.io_flag || self.lo_flag {
-            fmt.int_style = IntStyle::Oct;
-        } else if self.ib_flag || self.lb_flag {
-            fmt.int_style = IntStyle::Bin;
-        }
-        fmt.float_as_int = self.lx_flag || self.lo_flag || self.lb_flag;
-        fmt.enum_as_number = self.enum_as_number;
-        fmt.char_array_as_string = self.char_array_as_string;
-        fmt.max_elements = self.max_elements;
-        if let Some(c) = self.field_separator {
+        // C `camonitor.c:325-340` writes exactly ONE of the two base globals
+        // per occurrence: `-0<base>` sets `outTypeI` (integers), `-l<base>`
+        // sets `outTypeF` (floats, via round-to-long). They never cross.
+        // camonitor has no `-d`, so nothing races the `type` these also set.
+        fmt.int_style = scan.base('0', "int_base").style;
+        fmt.float_style = scan.base('l', "float_base").style;
+        fmt.enum_as_number = self.enum_as_number > 0;
+        fmt.char_array_as_string = self.char_array_as_string > 0;
+        fmt.req_elems = scan.req_elems_ulong("max_elements");
+        if let Some(c) = scan.field_separator("field_separator") {
             fmt.field_separator = c;
         }
         fmt
@@ -135,45 +218,59 @@ impl Args {
 
 #[tokio::main]
 async fn main() {
-    let args = Args::parse();
+    // Parse via ArgMatches (not the plain derive) so the command-line order of
+    // `-e`/`-f`/`-g` is recoverable for C's last-valid-wins rule (W10-B2).
+    let cmd = Args::command();
+    let parsed = TOOL.get_matches(cmd.clone());
+    let matches = parsed.matches();
+    let args = Args::from_arg_matches(matches).expect("clap validated the arguments");
 
-    if args.version {
-        println!("{VERSION_INFO}");
-        return;
+    // C's ENTIRE getopt loop runs before the `nPvs < 1` check
+    // (`camonitor.c:224-600`, then `:604`), so every option argument is
+    // scanned — and every warning raised — even when no PV name follows.
+    // `value_format` scans `-#`, `-e`/`-f`/`-g`, `-0`/`-l` and `-F`; the four
+    // below cover the rest. `-m` and `-t` are bare re-scans: every occurrence
+    // re-runs the case (so every bad one warns) and the last one wins.
+    let mut scan = parsed.scan();
+    let ca_timeout = scan.timeout("timeout", epics_ca_rs::cli::env_default_timeout());
+    let priority = scan.priority("priority");
+    let fmt = Arc::new(args.value_format(&mut scan));
+    // The `-m <msk>` DBE_* mask + the `-t` timestamp mode, resolved once for
+    // all PVs. `prev_all`/`start` back the relative and incremental timestamp
+    // renderings.
+    let mask = parse_event_mask(&mut scan, "event_mask");
+    let spec = parse_timestamp_spec(&mut scan, "timestamp_key");
+    // End of C's getopt loop: warnings out in command-line order, then `-h` /
+    // `-V` if the loop reached one (R13-26).
+    scan.finish(&cmd, &epics_ca_rs::protocol::version_info(), TERMINALS);
+
+    if args.pv_names.is_empty() {
+        TOOL.no_pv_name();
     }
 
     let client = CaClient::new().await.expect("failed to create CA client");
-    // -p selects the priority virtual circuit.
-    let priority = args.priority.unwrap_or(0);
 
     let connected_flags: Vec<Arc<AtomicBool>> = args
         .pv_names
         .iter()
         .map(|_| Arc::new(AtomicBool::new(false)))
         .collect();
-
-    let fmt = Arc::new(args.value_format());
-    // C `tool_lib.c:486` (`PRN_TIME_VAL_STS`) gates the array count
-    // prefix on `reqElems || nElems > 1`; `reqElems` is non-zero iff
-    // the user passed `-#`.
-    let req_elems_present = args.max_elements.is_some();
-    // resolve the `-m <msk>` DBE_* mask + `-t` timestamp mode
-    // once for all PVs. `prev_all`/`start` back the relative and
-    // incremental timestamp renderings.
-    let mask = parse_event_mask(args.event_mask.as_deref());
-    let spec = parse_timestamp_spec(args.timestamp_key.as_deref());
     // `-s` (`floatAsString`): request DBR_TIME_STRING for FLOAT/DOUBLE
     // fields so the server renders the value at record precision
     // (C `camonitor.c:162-166`).
-    let float_as_string = args.string_format;
+    let float_as_string = args.string_format > 0;
     // C `camonitor.c:168-169` applies the user's `-#` count to the
     // `ca_create_subscription` request count (clamped to the native element
-    // count at connect); `None` (no `-#`) leaves `reqElems == 0`, the CA
-    // autosize request, so the server reports each event at the record's
-    // current element count. Carried into the subscription so each monitor
-    // event transfers only the requested slice (or the autosized current
-    // count) instead of the native capacity.
-    let req_count = args.max_elements.map(|n| n as u32);
+    // count at connect); `reqElems == 0` — no `-#`, `-# 0`, or an unscannable
+    // `-#` — is the CA autosize request, so the server reports each event at
+    // the record's current element count. `fmt` is the single carrier of C's
+    // `reqElems`; a count that overflows `u32` clamps at the wire boundary,
+    // which is where C's `ca_create_subscription(..., unsigned long)` narrows
+    // it too.
+    let req_count = match fmt.req_elems {
+        0 => None,
+        n => Some(u32::try_from(n).unwrap_or(u32::MAX)),
+    };
     let start = SystemTime::now();
     // `tsFirst` (`tool_lib.c:40`): the first SERVER stamp seen across all
     // channels, captured once — the server-relative (`-t sr`) baseline.
@@ -199,7 +296,6 @@ async fn main() {
                 flag,
                 fmt,
                 float_as_string,
-                req_elems_present,
                 req_count,
                 mask,
                 spec,
@@ -213,10 +309,7 @@ async fn main() {
     }
 
     // Initial connection wait (C: ca_pend_event(caTimeout))
-    let timeout_secs = args
-        .timeout
-        .unwrap_or_else(epics_ca_rs::cli::env_default_timeout);
-    tokio::time::sleep(epics_ca_rs::cli::timeout_duration(timeout_secs)).await;
+    tokio::time::sleep(epics_ca_rs::cli::timeout_duration(ca_timeout)).await;
 
     // Print "*** Not connected" for PVs that didn't connect within
     // the wait window. Mirrors `tool_lib.c::print_time_val_sts` line
@@ -227,7 +320,10 @@ async fn main() {
     // not-connected PV carries no element count here, so we gate on
     // the separator alone — identical to C for the common scalar /
     // no-`-#` case.
-    let sep = args.field_separator.unwrap_or(' ');
+    // Taken off `fmt`, which is where `-F` was already resolved through the
+    // owner — re-reading the raw argument here would be a second source for
+    // one C global (`fieldSeparator`).
+    let sep = fmt.field_separator;
     for (i, pv_name) in args.pv_names.iter().enumerate() {
         if !connected_flags[i].load(Ordering::Acquire) {
             let name_col = if sep == ' ' {
@@ -244,52 +340,11 @@ async fn main() {
     }
 }
 
+/// camonitor's whole timestamp domain is `SystemTime` (it diffs client and
+/// server stamps for `-t r`/`-t i`), so this adapts into the shared
+/// `epicsTimeToStrftime` owner rather than re-implementing its rounding.
 fn format_server_timestamp(ts: SystemTime) -> String {
-    let dt: DateTime<Local> = ts.into();
-    dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string()
-}
-
-/// Map alarm severity index → C `sevr_to_str` mnemonic. Out-of-range
-/// values fall back to the integer rendering, matching libca which
-/// returns "Illegal value" on overflow.
-fn sevr_to_str(sevr: u16) -> &'static str {
-    match sevr {
-        0 => "NO_ALARM",
-        1 => "MINOR",
-        2 => "MAJOR",
-        3 => "INVALID",
-        _ => "Illegal value",
-    }
-}
-
-/// Map alarm status index → C `stat_to_str` mnemonic. The full set
-/// mirrors `libcom/src/misc/alarmString.h` (epics-base 7.0).
-fn stat_to_str(stat: u16) -> &'static str {
-    match stat {
-        0 => "NO_ALARM",
-        1 => "READ",
-        2 => "WRITE",
-        3 => "HIHI",
-        4 => "HIGH",
-        5 => "LOLO",
-        6 => "LOW",
-        7 => "STATE",
-        8 => "COS",
-        9 => "COMM",
-        10 => "TIMEOUT",
-        11 => "HW_LIMIT",
-        12 => "CALC",
-        13 => "SCAN",
-        14 => "LINK",
-        15 => "SOFT",
-        16 => "BAD_SUB",
-        17 => "UDF",
-        18 => "DISABLE",
-        19 => "SIMM",
-        20 => "READ_ACCESS",
-        21 => "WRITE_ACCESS",
-        _ => "Illegal value",
-    }
+    format_time(ts.into())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -299,7 +354,6 @@ async fn monitor_pv(
     connected_flag: Arc<AtomicBool>,
     fmt: Arc<ValueFormat>,
     float_as_string: bool,
-    req_elems_present: bool,
     req_count: Option<u32>,
     mask: u16,
     spec: TimestampSpec,
@@ -325,7 +379,9 @@ async fn monitor_pv(
                     flag.store(true, Ordering::Release);
                 }
                 ConnectionEvent::Disconnected => {
-                    let now = Local::now().format("%Y-%m-%d %H:%M:%S%.6f");
+                    // C `tool_lib.c:515` stamps this line with
+                    // `epicsTimeGetCurrent` through the same formatter.
+                    let now = format_server_timestamp(SystemTime::now());
                     // C `tool_lib.c::print_time_val_sts` ECA_DISCONN
                     // branch: `name <sep> ts *** disconnected`. Pad the
                     // name to 30 only with the default space separator.
@@ -396,12 +452,18 @@ async fn monitor_pv(
                         prev_client: &mut prev_chan_client,
                     };
                     render_timestamp(spec, snap.timestamp, recv_time, start, &mut st)
-                }
-                .map(|ts| format!("{ts}{sep}"))
-                .unwrap_or_default();
+                };
                 drop(fs);
                 let enum_strings = snap.enums.as_ref().map(|e| e.strings.as_slice());
-                let rendered = format_value(&snap.value, &fmt, enum_strings, req_elems_present);
+                // C's separator is a PREFIX of the value's items, not a suffix
+                // of the timestamp (`tool_lib.c:481-489`), so `-t n` — whose
+                // timestamp is empty — still prints it.
+                let value_seg = format_value_segment(
+                    &snap.value,
+                    &fmt,
+                    enum_strings,
+                    CountPrefix::IfRequestedOrArray,
+                );
                 let is_scalar = snap.value.count() == 1;
                 let name_col = if is_scalar && sep == ' ' {
                     format!("{pv_name:<width$}", width = PV_NAME_WIDTH)
@@ -413,17 +475,26 @@ async fn monitor_pv(
                 if stat == 0 && sevr == 0 {
                     // C `tool_lib.c` line 500: print `<sep><sep>` —
                     // two empty alarm fields trailing the value.
-                    println!("{name_col}{sep}{time_seg}{rendered}{sep}{sep}");
+                    println!("{name_col}{sep}{time_seg}{value_seg}{sep}{sep}");
                 } else {
                     println!(
-                        "{name_col}{sep}{time_seg}{rendered}{sep}{stat_str}{sep}{sevr_str}",
+                        "{name_col}{sep}{time_seg}{value_seg}{sep}{stat_str}{sep}{sevr_str}",
                         stat_str = stat_to_str(stat),
                         sevr_str = sevr_to_str(sevr),
                     );
                 }
             }
-            Err(e) => {
-                eprintln!("{pv_name}: {e}");
+            Err(_status) => {
+                // C `camonitor.c:108-124` `event_handler` records the status
+                // on the pv and prints ONLY when it is ECA_NORMAL — nothing in
+                // the tool ever reads that status back, so a non-normal event
+                // costs zero bytes of output. The port printed a line here,
+                // which meant every IOC restart emitted a diagnostic C does
+                // not emit (`TST:AI: server reported ECA status 0x00c0` once
+                // the disconnect fan-out started landing here). The lost IOC
+                // *is* reported — on stdout, as C's `*** disconnected` line,
+                // from the connection callback, which is the only place C
+                // reports it.
             }
         }
     }
@@ -440,27 +511,47 @@ async fn monitor_pv(
 /// scanning the rest of the argument (C sets `err = 1`). An empty
 /// `-m ""` selects no events (mask 0), exactly as C's scan loop leaves
 /// `eventMask` at 0.
-fn parse_event_mask(m: Option<&str>) -> u16 {
+/// EVERY occurrence re-runs the case, so every bad one warns at its own
+/// position and the last one still decides the mask — the scan folds them all
+/// rather than looking only at the last (R13-26: a warning C prints is a
+/// warning the port prints, at the place C prints it).
+fn parse_event_mask(scan: &mut copt::Scan, id: &str) -> u16 {
     const DBE_VALUE: u16 = 1;
     const DBE_LOG: u16 = 2;
     const DBE_ALARM: u16 = 4;
     const DBE_PROPERTY: u16 = 8;
     const DEFAULT: u16 = DBE_VALUE | DBE_ALARM;
-    let Some(s) = m else { return DEFAULT };
-    let mut mask = 0u16;
-    for c in s.chars() {
-        match c {
-            'v' => mask |= DBE_VALUE,
-            'a' => mask |= DBE_ALARM,
-            'l' => mask |= DBE_LOG,
-            'p' => mask |= DBE_PROPERTY,
-            _ => {
-                eprintln!("Invalid argument '{s}' for option '-m' - ignored.");
-                return DEFAULT;
+
+    let mut effective = DEFAULT;
+    for (at, s) in scan
+        .occurrences(id)
+        .into_iter()
+        .map(|(at, s)| (at, s.to_string()))
+        .collect::<Vec<_>>()
+    {
+        let mut mask = 0u16;
+        let mut bad = false;
+        for c in s.chars() {
+            match c {
+                'v' => mask |= DBE_VALUE,
+                'a' => mask |= DBE_ALARM,
+                'l' => mask |= DBE_LOG,
+                'p' => mask |= DBE_PROPERTY,
+                // C sets `err = 1` here, so the rest of the argument is not
+                // scanned and only ONE warning fires per occurrence.
+                _ => {
+                    scan.warn(
+                        at,
+                        format!("Invalid argument '{s}' for option '-m' - ignored."),
+                    );
+                    bad = true;
+                    break;
+                }
             }
         }
+        effective = if bad { DEFAULT } else { mask };
     }
-    mask
+    effective
 }
 
 /// `camonitor -t <key>` rendering KIND — orthogonal to the
@@ -490,35 +581,62 @@ struct TimestampSpec {
     kind: TimestampKind,
 }
 
-/// Parse a `-t <key>`. C `case 't'` resets both sources to 0 then sets
-/// them from the letters; `s`/`c` pick source(s), `r`/`i`/`I` pick the
-/// kind, `n` and unknown letters are no-ops (a kind with no source prints
-/// nothing — the usage note "'r','i','I' require 's' or 'c'"). With no
-/// `-t` at all the C globals default to server + absolute.
-fn parse_timestamp_spec(k: Option<&str>) -> TimestampSpec {
-    let Some(k) = k else {
-        return TimestampSpec {
-            server: true,
-            client: false,
-            kind: TimestampKind::Absolute,
-        };
-    };
-    let mut spec = TimestampSpec {
-        server: false,
-        client: false,
-        kind: TimestampKind::Absolute,
-    };
-    for c in k.chars() {
-        match c {
-            's' => spec.server = true,
-            'c' => spec.client = true,
-            'r' => spec.kind = TimestampKind::Relative,
-            'i' => spec.kind = TimestampKind::IncrAll,
-            'I' => spec.kind = TimestampKind::IncrChan,
-            _ => {} // 'n' and unknown letters: no-op (matches C)
+/// Parse a `-t <key>`. `s`/`c` pick the source(s), `r`/`i`/`I` the kind, `n` is
+/// silent, an unknown letter warns (R13-18); a kind with no source prints
+/// nothing — the usage note "'r','i','I' require 's' or 'c'".
+///
+/// The two axes have DIFFERENT lifetimes in C, because they are two separate
+/// globals and `case 't'` resets only one pair (`camonitor.c:236-237`):
+///
+/// * `tsSrcServer`/`tsSrcClient` — zeroed at the top of EVERY `-t`, so only the
+///   letters of the last occurrence choose the source(s);
+/// * `tsType` — never reset, so a kind survives every later `-t` that does not
+///   name a kind of its own. `camonitor -t r -t s` is a SERVER RELATIVE stamp
+///   (`tool_lib.c:45-47` are the initial values: server, absolute).
+fn parse_timestamp_spec(scan: &mut copt::Scan, id: &str) -> TimestampSpec {
+    // C `tool_lib.c:45-47`, the globals as they stand before the getopt loop.
+    let mut server = true;
+    let mut client = false;
+    // Declared OUTSIDE the occurrence loop, exactly as C declares it outside the
+    // getopt loop: no `-t` resets it, so its value is sticky.
+    let mut kind = TimestampKind::Absolute;
+
+    for (at, k) in scan
+        .occurrences(id)
+        .into_iter()
+        .map(|(at, s)| (at, s.to_string()))
+        .collect::<Vec<_>>()
+    {
+        // The whole of `case 't'`'s reset (`camonitor.c:236-237`) — the sources,
+        // and nothing else.
+        server = false;
+        client = false;
+        for c in k.chars() {
+            match c {
+                's' => server = true,
+                'c' => client = true,
+                // `case 'n': break;` — the ONLY letter C accepts silently
+                // without acting on it (`camonitor.c:246`).
+                'n' => {}
+                'r' => kind = TimestampKind::Relative,
+                'i' => kind = TimestampKind::IncrAll,
+                'I' => kind = TimestampKind::IncrChan,
+                // C's `default:` inside the per-character switch
+                // (`camonitor.c:249-251`): every letter it does not know warns
+                // and is skipped — the scan continues, so `-t xsy` still selects
+                // the server source and warns twice.
+                _ => scan.warn(
+                    at,
+                    format!("Invalid argument '{c}' for option '-t' - ignored."),
+                ),
+            }
         }
     }
-    spec
+    TimestampSpec {
+        server,
+        client,
+        kind,
+    }
 }
 
 /// Mutable timestamp state threaded through [`render_timestamp`], one
@@ -539,8 +657,14 @@ struct TimestampState<'a> {
     prev_client: &'a mut Option<SystemTime>,
 }
 
-/// Render the timestamp column for one event under `spec`. Returns
-/// `None` when no time column should be printed (`-t n`).
+/// Render the timestamp column for one event under `spec` — the EMPTY string
+/// under `-t n`, which prints no time column.
+///
+/// C has no "no timestamp" branch to special-case: `print_time_val_sts` prints
+/// the name, then an unconditional separator, then whatever the timestamp
+/// block emitted (nothing, when neither `tsSrcServer` nor `tsSrcClient` is
+/// set), and the value brings its OWN separator (`tool_lib.c:517-519`). So the
+/// empty column is just an empty string, and the caller needs no branch.
 ///
 /// Mirrors C `print_time_val_sts` (`tool_lib.c:407-467`): the FIRST
 /// event of each channel always prints an ABSOLUTE stamp (C
@@ -554,7 +678,7 @@ fn render_timestamp(
     client_ts: SystemTime,
     start: SystemTime,
     state: &mut TimestampState<'_>,
-) -> Option<String> {
+) -> String {
     // The server stamp is a `WallTime`; join it to the local-clock comparison
     // domain (client/start/baselines are `SystemTime`) for the µs-formatted
     // display and f64-seconds diffs below. The conversion is 100 ns-granular
@@ -631,22 +755,40 @@ fn render_timestamp(
     if print_abs {
         *state.first_printed = true;
     }
-    if out.is_empty() { None } else { Some(out) }
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        TimestampKind, TimestampSpec, TimestampState, parse_event_mask, parse_timestamp_spec,
-        render_timestamp,
+        Args, TOOL, TimestampKind, TimestampSpec, TimestampState, parse_event_mask,
+        parse_timestamp_spec, render_timestamp,
     };
+    use clap::CommandFactory;
     use std::time::{Duration, SystemTime};
+
+    /// The real command line, parsed by the real spec — the only way to reach a
+    /// resolver now, because a warning without its getopt position cannot be
+    /// ordered against the rest of the loop (R13-26).
+    fn matches_of(argv: &[&str]) -> clap::ArgMatches {
+        Args::command().no_binary_name(true).get_matches_from(argv)
+    }
+
+    fn mask_of(argv: &[&str]) -> u16 {
+        let m = matches_of(argv);
+        parse_event_mask(&mut TOOL.scan(&m), "event_mask")
+    }
+
+    fn spec_of(argv: &[&str]) -> TimestampSpec {
+        let m = matches_of(argv);
+        parse_timestamp_spec(&mut TOOL.scan(&m), "timestamp_key")
+    }
 
     #[test]
     fn mask_default_is_value_alarm() {
         // C `camonitor.c:40`: the no-`-m` default is VALUE|ALARM, NOT
         // value+log+alarm.
-        assert_eq!(parse_event_mask(None), 1 | 4);
+        assert_eq!(mask_of(&[]), 1 | 4);
     }
 
     #[test]
@@ -654,47 +796,167 @@ mod tests {
         // C `camonitor.c:298-300`: the first unrecognised letter reverts
         // to VALUE|ALARM and stops scanning (so a leading valid `v` is
         // discarded too).
-        assert_eq!(parse_event_mask(Some("xyz")), 1 | 4);
-        assert_eq!(parse_event_mask(Some("vx")), 1 | 4);
+        assert_eq!(mask_of(&["-m", "xyz"]), 1 | 4);
+        assert_eq!(mask_of(&["-m", "vx"]), 1 | 4);
     }
 
     #[test]
     fn mask_empty_selects_no_events() {
         // C scan loop never runs on an empty arg → eventMask stays 0.
-        assert_eq!(parse_event_mask(Some("")), 0);
+        assert_eq!(mask_of(&["-m", ""]), 0);
     }
 
     #[test]
     fn mask_parses_dbe_letters() {
-        assert_eq!(parse_event_mask(Some("a")), 4, "alarm-only");
-        assert_eq!(parse_event_mask(Some("v")), 1, "value-only");
-        assert_eq!(parse_event_mask(Some("p")), 8, "property-only");
-        assert_eq!(parse_event_mask(Some("val")), 1 | 4 | 2, "value+alarm+log");
+        assert_eq!(mask_of(&["-m", "a"]), 4, "alarm-only");
+        assert_eq!(mask_of(&["-m", "v"]), 1, "value-only");
+        assert_eq!(mask_of(&["-m", "p"]), 8, "property-only");
+        assert_eq!(mask_of(&["-m", "val"]), 1 | 4 | 2, "value+alarm+log");
+    }
+
+    /// R13-17/R13-26: `case 'm'` re-runs whole per occurrence, so the last one
+    /// decides the mask AND every bad one warns at its own position — the
+    /// earlier fold looked only at the last occurrence, so an invalid `-m`
+    /// followed by a valid one printed nothing where C prints its diagnostic.
+    #[test]
+    fn every_m_occurrence_is_scanned_and_the_last_decides() {
+        assert_eq!(mask_of(&["-m", "v", "-m", "a"]), 4, "last -m wins");
+        assert_eq!(
+            mask_of(&["-m", "xyz", "-m", "v"]),
+            1,
+            "the bad one still loses to the later good one"
+        );
+
+        let m = matches_of(&["-m", "xyz", "-m", "v"]);
+        let mut scan = TOOL.scan(&m);
+        let _ = parse_event_mask(&mut scan, "event_mask");
+        assert_eq!(
+            scan.ordered_warnings(),
+            vec!["Invalid argument 'xyz' for option '-m' - ignored."],
+            "C warns for the bad occurrence even though a later one wins"
+        );
     }
 
     #[test]
     fn timestamp_spec_parses_keys() {
-        let s = parse_timestamp_spec(None);
+        let s = spec_of(&[]);
         assert!(s.server && !s.client && matches!(s.kind, TimestampKind::Absolute));
-        let s = parse_timestamp_spec(Some("s"));
+        let s = spec_of(&["-t", "s"]);
         assert!(s.server && !s.client);
-        let s = parse_timestamp_spec(Some("c"));
+        let s = spec_of(&["-t", "c"]);
         assert!(!s.server && s.client);
-        let s = parse_timestamp_spec(Some("sc"));
+        let s = spec_of(&["-t", "sc"]);
         assert!(s.server && s.client);
         // 'n' (and unknown letters) select no source → no column.
-        let s = parse_timestamp_spec(Some("n"));
+        let s = spec_of(&["-t", "n"]);
         assert!(!s.server && !s.client, "n selects no source");
-        let s = parse_timestamp_spec(Some("cr"));
+        let s = spec_of(&["-t", "cr"]);
         assert!(!s.server && s.client && matches!(s.kind, TimestampKind::Relative));
+        assert!(matches!(spec_of(&["-t", "i"]).kind, TimestampKind::IncrAll));
         assert!(matches!(
-            parse_timestamp_spec(Some("i")).kind,
-            TimestampKind::IncrAll
-        ));
-        assert!(matches!(
-            parse_timestamp_spec(Some("I")).kind,
+            spec_of(&["-t", "I"]).kind,
             TimestampKind::IncrChan
         ));
+        // Every occurrence re-runs the case (both sources reset first), so the
+        // last one decides — `-t c -t s` is server-only, not both.
+        let s = spec_of(&["-t", "c", "-t", "s"]);
+        assert!(s.server && !s.client, "the last -t resets and re-sets");
+    }
+
+    /// W11-B7: `case 't'` resets the two SOURCE globals and nothing else
+    /// (`camonitor.c:236-237`). `tsType` is a third global that no `-t` ever
+    /// zeroes (`tool_lib.c:45`), so a kind chosen by one occurrence survives
+    /// every later occurrence that does not name a kind of its own — the two
+    /// axes have different lifetimes, and the port used to reset them together.
+    #[test]
+    fn a_later_t_resets_the_source_but_never_the_kind() {
+        // The kind survives a later `-t` that only names a source.
+        let s = spec_of(&["-t", "r", "-t", "s"]);
+        assert!(
+            s.server && !s.client && matches!(s.kind, TimestampKind::Relative),
+            "`-t r -t s` is a SERVER RELATIVE stamp: 's' reset the sources, \
+             `tsType` was left alone"
+        );
+
+        // ... and so does an incremental kind, through two later occurrences.
+        let s = spec_of(&["-t", "I", "-t", "c", "-t", "s"]);
+        assert!(
+            s.server && !s.client && matches!(s.kind, TimestampKind::IncrChan),
+            "no `-t` resets `tsType`, however many follow"
+        );
+
+        // A later occurrence that DOES name a kind overwrites it, as its
+        // `case 'r'`/`'i'`/`'I'` assignment would.
+        let s = spec_of(&["-t", "r", "-t", "si"]);
+        assert!(
+            s.server && matches!(s.kind, TimestampKind::IncrAll),
+            "the later kind wins where one is given"
+        );
+
+        // The sources, by contrast, ARE zeroed by every occurrence: the 'c' of
+        // the first `-t` does not survive the second.
+        let s = spec_of(&["-t", "c", "-t", "r"]);
+        assert!(
+            !s.server && !s.client && matches!(s.kind, TimestampKind::Relative),
+            "`-t c -t r` leaves NO source selected (C prints no stamp column)"
+        );
+    }
+
+    /// R13-18: `case 't'` switches on EVERY character of `optarg` and its
+    /// `default:` warns for each letter it does not know
+    /// (`camonitor.c:249-251`, `"Invalid argument '%c' for option '-t' -
+    /// ignored."`). Only `n` is accepted silently (`case 'n': break;`,
+    /// `camonitor.c:246`). The scan does not stop at a bad letter — unlike
+    /// `-m`, which warns once with the whole string and gives up
+    /// (`camonitor.c:296-300`) — so the good letters around it still apply.
+    #[test]
+    fn every_bad_t_character_warns_and_the_good_ones_still_apply() {
+        fn warnings(argv: &[&str]) -> Vec<String> {
+            let m = matches_of(argv);
+            let mut scan = TOOL.scan(&m);
+            let _ = parse_timestamp_spec(&mut scan, "timestamp_key");
+            scan.ordered_warnings()
+        }
+
+        assert_eq!(
+            warnings(&["-t", "x"]),
+            vec!["Invalid argument 'x' for option '-t' - ignored."]
+        );
+        assert_eq!(
+            warnings(&["-t", "xy"]),
+            vec![
+                "Invalid argument 'x' for option '-t' - ignored.",
+                "Invalid argument 'y' for option '-t' - ignored.",
+            ],
+            "one warning per unknown character, in the order they appear"
+        );
+        assert!(
+            warnings(&["-t", "n"]).is_empty(),
+            "`case 'n'` is the one letter C accepts without a warning"
+        );
+        assert!(
+            warnings(&["-t", "scriI"]).is_empty(),
+            "every letter with a case of its own is silent"
+        );
+
+        // The bad letter is skipped, not fatal: 's' before it and 'r' after it
+        // both still take effect.
+        let s = spec_of(&["-t", "sxr"]);
+        assert!(
+            s.server && matches!(s.kind, TimestampKind::Relative),
+            "C's per-character switch carries on past the `default:` arm"
+        );
+        assert_eq!(
+            warnings(&["-t", "sxr"]),
+            vec!["Invalid argument 'x' for option '-t' - ignored."]
+        );
+
+        // Each occurrence re-runs the case, so a bad letter in an occurrence
+        // that later loses still warns at its own position (R13-26).
+        assert_eq!(
+            warnings(&["-t", "x", "-t", "s"]),
+            vec!["Invalid argument 'x' for option '-t' - ignored."]
+        );
     }
 
     /// Build a fresh `TimestampState` over caller-owned slots so each
@@ -747,7 +1009,12 @@ mod tests {
         };
         let (mut fsv, mut fp, mut ps, mut pc) = (None, false, None, None);
         let mut st = ts_state(&mut fsv, &mut fp, &mut ps, &mut pc);
-        assert!(render_timestamp(none, t1.into(), t1, start, &mut st).is_none());
+        assert_eq!(
+            render_timestamp(none, t1.into(), t1, start, &mut st),
+            "",
+            "`-t n` renders an EMPTY column, not an absent one — C has no \
+             no-timestamp branch, it just prints nothing there"
+        );
 
         // Server relative: first event ABSOLUTE (== absolute render of
         // t1), NOT "10.000000".
@@ -755,14 +1022,14 @@ mod tests {
         let mut st = ts_state(&mut fsv, &mut fp, &mut ps, &mut pc);
         let first = render_timestamp(srv(TimestampKind::Relative), t1.into(), t1, start, &mut st);
         assert_eq!(
-            first.as_deref(),
-            Some(super::format_server_timestamp(t1).as_str()),
+            first,
+            super::format_server_timestamp(t1),
             "first event must render the absolute server stamp"
         );
         // Second event: diff against the FIRST SERVER stamp (t1), so
         // t2 - t1 = 3s — NOT t2 - start (= 13s).
         let second = render_timestamp(srv(TimestampKind::Relative), t2.into(), t2, start, &mut st);
-        assert_eq!(second.as_deref(), Some(srv_diff(3.0).as_str()));
+        assert_eq!(second, srv_diff(3.0));
     }
 
     #[test]
@@ -779,13 +1046,13 @@ mod tests {
         let (mut fsv, mut fp, mut ps, mut pc) = (None, false, None, None);
         let mut st = ts_state(&mut fsv, &mut fp, &mut ps, &mut pc);
         assert_eq!(
-            render_timestamp(srv, t1.into(), t1, start, &mut st).as_deref(),
-            Some(super::format_server_timestamp(t1).as_str()),
+            render_timestamp(srv, t1.into(), t1, start, &mut st),
+            super::format_server_timestamp(t1),
             "leading incremental event is absolute"
         );
         assert_eq!(
-            render_timestamp(srv, t2.into(), t2, start, &mut st).as_deref(),
-            Some(srv_diff(3.0).as_str()),
+            render_timestamp(srv, t2.into(), t2, start, &mut st),
+            srv_diff(3.0),
             "second incremental event diffs against the prior stamp"
         );
     }
@@ -811,12 +1078,12 @@ mod tests {
         // Second event: 7 - 10 = -3s, rendered with a leading '-'.
         let second = render_timestamp(srv, t2.into(), t2, start, &mut st);
         assert_eq!(
-            second.as_deref(),
-            Some(srv_diff(-3.0).as_str()),
+            second,
+            srv_diff(-3.0),
             "backward step must render as a negative delta, not +3"
         );
         assert!(
-            second.as_deref().unwrap().contains("-3.000000"),
+            second.contains("-3.000000"),
             "delta carries a minus sign: {second:?}"
         );
     }
@@ -838,13 +1105,10 @@ mod tests {
         let mut st = ts_state(&mut fsv, &mut fp, &mut ps, &mut pc);
         // First: absolute client receive time in parens.
         let first = render_timestamp(cr, start.into(), c1, start, &mut st);
-        assert_eq!(
-            first.as_deref(),
-            Some(format!("({})", super::format_server_timestamp(c1)).as_str())
-        );
+        assert_eq!(first, format!("({})", super::format_server_timestamp(c1)));
         // Second: client diff vs program start → 10s (NOT vs c1).
         let second = render_timestamp(cr, start.into(), c2, start, &mut st);
-        assert_eq!(second.as_deref(), Some(cli_diff(10.0).as_str()));
+        assert_eq!(second, cli_diff(10.0));
     }
 
     #[test]
@@ -866,22 +1130,16 @@ mod tests {
         // Leading event absolute: server stamp then (client stamp).
         let first = render_timestamp(both, s1.into(), c1, start, &mut st);
         assert_eq!(
-            first.as_deref(),
-            Some(
-                format!(
-                    "{}({})",
-                    super::format_server_timestamp(s1),
-                    super::format_server_timestamp(c1)
-                )
-                .as_str()
+            first,
+            format!(
+                "{}({})",
+                super::format_server_timestamp(s1),
+                super::format_server_timestamp(c1)
             )
         );
         // Second event: server (s2 - tsFirst=s1) = 3s, client
         // (c2 - tsStart=start) = 10s.
         let second = render_timestamp(both, s2.into(), c2, start, &mut st);
-        assert_eq!(
-            second.as_deref(),
-            Some(format!("{}{}", srv_diff(3.0), cli_diff(10.0)).as_str())
-        );
+        assert_eq!(second, format!("{}{}", srv_diff(3.0), cli_diff(10.0)));
     }
 }

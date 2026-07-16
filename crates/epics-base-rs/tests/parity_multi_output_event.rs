@@ -114,6 +114,17 @@ async fn dfanout_specified_out_of_range_raises_invalid() {
     df.put_field("SELM", EpicsValue::Short(1)).unwrap(); // Specified
     df.put_field("SELN", EpicsValue::Short(99)).unwrap(); // > 16 → INVALID
     db.add_record("DF_BAD", Box::new(df)).await.unwrap();
+    // VAL=1 is a `field(VAL,"1")` seed, which C loads with UDF=0
+    // (`dbPutString`). dfanout never clears UDF in `process()`, and its
+    // `checkAlarms` would otherwise raise INVALID/UDF first — softIoc gives
+    // STAT=UDF for the undefined record and STAT=SOFT for this one.
+    db.get_record("DF_BAD")
+        .await
+        .unwrap()
+        .write()
+        .await
+        .common
+        .udf = 0;
 
     let mut visited = HashSet::new();
     db.process_record_with_links("DF_BAD", &mut visited, 0)
@@ -177,24 +188,19 @@ async fn event_scan_routes_by_event_number() {
     db.update_scan_index("REC7", ScanType::Passive, ScanType::Event, 0, 0)
         .await;
 
-    // Post event 5 — only REC5 should process. We detect processing
-    // via the record's timestamp moving off the UNIX_EPOCH default.
+    // Post event 5 — only REC5 should process. We detect processing via
+    // the record's timestamp moving off its never-processed value, which
+    // is the EPICS epoch (an all-zero `epicsTimeStamp`), not the Unix
+    // epoch — see `general_time::epics_epoch`.
     db.post_event_named("5").await;
 
+    let unprocessed = epics_base_rs::runtime::general_time::epics_epoch();
     let r5 = db.get_record("REC5").await.unwrap();
     let r7 = db.get_record("REC7").await.unwrap();
     let t5 = r5.read().await.common.time;
     let t7 = r7.read().await.common.time;
-    assert_ne!(
-        t5,
-        std::time::SystemTime::UNIX_EPOCH,
-        "REC5 (EVNT=5) must process on event 5"
-    );
-    assert_eq!(
-        t7,
-        std::time::SystemTime::UNIX_EPOCH,
-        "REC7 (EVNT=7) must NOT process on event 5"
-    );
+    assert_ne!(t5, unprocessed, "REC5 (EVNT=5) must process on event 5");
+    assert_eq!(t7, unprocessed, "REC7 (EVNT=7) must NOT process on event 5");
 }
 
 /// UDF stays true when the processed value is NaN, so the
@@ -215,7 +221,7 @@ async fn udf_stays_true_on_nan_value() {
     let rec = db.get_record("NAN_REC").await.unwrap();
     let inst = rec.read().await;
     assert!(
-        inst.common.udf,
+        inst.common.udf != 0,
         "UDF must stay true when VAL is NaN (C aiRecord.c:285)"
     );
     assert_eq!(
@@ -236,7 +242,7 @@ async fn udf_cleared_on_defined_value() {
     db.process_record("OK_REC").await.unwrap();
     let rec = db.get_record("OK_REC").await.unwrap();
     assert!(
-        !rec.read().await.common.udf,
+        rec.read().await.common.udf == 0,
         "UDF must clear when VAL is a defined value"
     );
 }
@@ -357,7 +363,7 @@ impl Record for CountingTarget {
             _ => Err(CaError::FieldNotFound(name.into())),
         }
     }
-    fn field_list(&self) -> &'static [FieldDesc] {
+    fn declared_fields(&self) -> &'static [FieldDesc] {
         &[]
     }
 }

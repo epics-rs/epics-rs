@@ -3,6 +3,7 @@ use std::fmt;
 
 use super::DbFieldType;
 use super::PvString;
+use super::c_cast;
 
 /// Runtime value from an EPICS PV
 #[derive(Debug, Clone, PartialEq)]
@@ -709,6 +710,29 @@ impl EpicsValue {
         }
     }
 
+    /// True iff this value is an array variant, whatever its length.
+    ///
+    /// The port's stand-in for C's `no_elements > 1` destination test
+    /// (`dbAccess.c:1345`): a record's array-valued field reads back as an
+    /// array variant, a scalar field as a scalar variant.
+    pub fn is_array(&self) -> bool {
+        matches!(
+            self,
+            Self::ShortArray(_)
+                | Self::FloatArray(_)
+                | Self::EnumArray(_)
+                | Self::DoubleArray(_)
+                | Self::LongArray(_)
+                | Self::Int64Array(_)
+                | Self::UInt64Array(_)
+                | Self::UShortArray(_)
+                | Self::ULongArray(_)
+                | Self::UCharArray(_)
+                | Self::CharArray(_)
+                | Self::StringArray(_)
+        )
+    }
+
     /// Get the element count for this value.
     pub fn count(&self) -> u32 {
         match self {
@@ -773,6 +797,33 @@ impl EpicsValue {
         )
     }
 
+    /// Element 0 of an array variant, as the matching **scalar** variant.
+    /// Returns `None` for a scalar variant (nothing to reduce) and for an
+    /// empty array (no element 0).
+    ///
+    /// This is C's `dbPut` clamp of a request into a one-element destination:
+    /// `if (no_elements < nRequest) nRequest = no_elements;` (`dbAccess.c:1359`)
+    /// followed by `dbPutConvertRoutine[...](paddr, pbuffer, nRequest = 1, ...)`,
+    /// which copies the first element only. The put succeeds — the surplus
+    /// elements are dropped, not an error.
+    pub fn first_element(&self) -> Option<EpicsValue> {
+        Some(match self {
+            Self::ShortArray(a) => Self::Short(*a.first()?),
+            Self::FloatArray(a) => Self::Float(*a.first()?),
+            Self::EnumArray(a) => Self::Enum(*a.first()?),
+            Self::DoubleArray(a) => Self::Double(*a.first()?),
+            Self::LongArray(a) => Self::Long(*a.first()?),
+            Self::Int64Array(a) => Self::Int64(*a.first()?),
+            Self::UInt64Array(a) => Self::UInt64(*a.first()?),
+            Self::UShortArray(a) => Self::UShort(*a.first()?),
+            Self::ULongArray(a) => Self::ULong(*a.first()?),
+            Self::UCharArray(a) => Self::UChar(*a.first()?),
+            Self::CharArray(a) => Self::Char(*a.first()?),
+            Self::StringArray(a) => Self::String(a.first()?.clone()),
+            _ => return None,
+        })
+    }
+
     /// Truncate an array value to at most `max` elements. Scalars are unchanged.
     pub fn truncate(&mut self, max: usize) {
         match self {
@@ -793,9 +844,9 @@ impl EpicsValue {
     }
 
     /// Extract every element of an array variant as `f64`. Returns
-    /// `None` for scalar variants. `StringArray`/`CharArray` are not
-    /// covered here — their cross-type conversion is handled
-    /// separately in `convert_to`.
+    /// `None` for scalar variants. `CharArray` is not covered here —
+    /// its signed-`epicsInt8` conversion is handled separately in
+    /// `convert_to`.
     fn as_f64_array(&self) -> Option<Vec<f64>> {
         match self {
             Self::ShortArray(a) => Some(a.iter().map(|&v| v as f64).collect()),
@@ -811,6 +862,19 @@ impl EpicsValue {
             // numeric view here — unlike the signed `CharArray`, which needs
             // the epicsInt8 sign-reinterpret arm in `convert_to`.
             Self::UCharArray(a) => Some(a.iter().map(|&v| v as f64).collect()),
+            // DBR_STRING → numeric IS an array conversion in C: the
+            // `putString*` family (`dbConvert.c:941-1148`) runs the SAME
+            // per-element scalar parse (`epicsParseInt32`/`epicsParseFloat64`,
+            // `dbConvertBase` = 0 so `"0x10"` is 16) over all `nRequest`
+            // elements. Taking the numeric view here makes the array path
+            // element-wise-identical to the scalar `String` tail below —
+            // one definition of string→numeric, not two. Without it a
+            // `caput -a WV 3 7 8 9` collapsed to a single `0.0`.
+            Self::StringArray(a) => Some(
+                a.iter()
+                    .map(|s| parse_string_to_f64(&s.as_str_lossy()).unwrap_or(0.0))
+                    .collect(),
+            ),
             _ => None,
         }
     }
@@ -896,10 +960,10 @@ impl EpicsValue {
 
         // Array → array conversion: map each element through the
         // numeric-array view, then materialize the target variant.
-        // CharArray is also handled here: as a byte array it converts
-        // element-wise to numeric arrays, and to String it decodes as
-        // text. StringArray falls through to the scalar path (its
-        // cross-type semantics are not numeric).
+        // StringArray takes this path too — C's string→numeric is a
+        // per-element array conversion (`putStringLong` and siblings),
+        // not a scalar one. CharArray does NOT: it needs the signed
+        // `epicsInt8` reinterpret, and to String it decodes as text.
         if let Some(nums) = self.as_f64_array() {
             // Integer-family arrays also expose a lossless `i64` element
             // view; route integer targets through it so narrowing truncates
@@ -912,45 +976,45 @@ impl EpicsValue {
             return match target {
                 DbFieldType::Short => EpicsValue::ShortArray(match &ints {
                     Some(v) => v.iter().map(|&x| x as i16).collect(),
-                    None => nums.iter().map(|&v| v as i16).collect(),
+                    None => nums.iter().map(|&v| c_cast::f64_to_i16(v)).collect(),
                 }),
                 DbFieldType::Float => {
                     EpicsValue::FloatArray(nums.iter().map(|&v| v as f32).collect())
                 }
                 DbFieldType::Enum => EpicsValue::EnumArray(match &ints {
                     Some(v) => v.iter().map(|&x| x as u16).collect(),
-                    None => nums.iter().map(|&v| v as u16).collect(),
+                    None => nums.iter().map(|&v| c_cast::f64_to_u16(v)).collect(),
                 }),
                 DbFieldType::Long => EpicsValue::LongArray(match &ints {
                     Some(v) => v.iter().map(|&x| x as i32).collect(),
-                    None => nums.iter().map(|&v| v as i32).collect(),
+                    None => nums.iter().map(|&v| c_cast::f64_to_i32(v)).collect(),
                 }),
                 DbFieldType::Double => EpicsValue::DoubleArray(nums),
                 DbFieldType::Int64 => EpicsValue::Int64Array(match &ints {
                     Some(v) => v.clone(),
-                    None => nums.iter().map(|&v| v as i64).collect(),
+                    None => nums.iter().map(|&v| c_cast::f64_to_i64(v)).collect(),
                 }),
                 DbFieldType::UInt64 => EpicsValue::UInt64Array(match &ints {
                     Some(v) => v.iter().map(|&x| x as u64).collect(),
-                    None => nums.iter().map(|&v| v as u64).collect(),
+                    None => nums.iter().map(|&v| c_cast::f64_to_u64(v)).collect(),
                 }),
                 DbFieldType::UShort => EpicsValue::UShortArray(match &ints {
                     Some(v) => v.iter().map(|&x| x as u16).collect(),
-                    None => nums.iter().map(|&v| v as u16).collect(),
+                    None => nums.iter().map(|&v| c_cast::f64_to_u16(v)).collect(),
                 }),
                 DbFieldType::ULong => EpicsValue::ULongArray(match &ints {
                     Some(v) => v.iter().map(|&x| x as u32).collect(),
-                    None => nums.iter().map(|&v| v as u32).collect(),
+                    None => nums.iter().map(|&v| c_cast::f64_to_u32(v)).collect(),
                 }),
                 DbFieldType::Char => EpicsValue::CharArray(match &ints {
                     Some(v) => v.iter().map(|&x| x as u8).collect(),
-                    None => nums.iter().map(|&v| v as u8).collect(),
+                    None => nums.iter().map(|&v| c_cast::f64_to_u8(v)).collect(),
                 }),
                 // DBF_UCHAR[] narrows off the integer view (low 8 bits), the
                 // unsigned twin of the Char target.
                 DbFieldType::UChar => EpicsValue::UCharArray(match &ints {
                     Some(v) => v.iter().map(|&x| x as u8).collect(),
-                    None => nums.iter().map(|&v| v as u8).collect(),
+                    None => nums.iter().map(|&v| c_cast::f64_to_u8(v)).collect(),
                 }),
                 DbFieldType::String => {
                     EpicsValue::StringArray(nums.iter().map(|v| v.to_string().into()).collect())
@@ -1027,12 +1091,20 @@ impl EpicsValue {
             DbFieldType::String => EpicsValue::String(format!("{self}").into()),
             DbFieldType::Short => EpicsValue::Short(match self.as_int_i64() {
                 Some(i) => i as i16,
-                None => self.to_f64().unwrap_or(0.0) as i16,
+                None => c_cast::f64_to_i16(self.to_f64().unwrap_or(0.0)),
             }),
             DbFieldType::Float => EpicsValue::Float(self.to_f64().unwrap_or(0.0) as f32),
+            // C's numeric→`DBF_ENUM`/`DBF_MENU` put is `putDoubleEnum`
+            // (`dbConvert.c`): `*pfield = (epicsEnum16)*psrc`, a WRAPPING cast of
+            // the truncated value, not a saturating clamp. A float `-1.0` must
+            // land as `65535` (served signed as `-1`), matching `caput REC.HSV -1`
+            // on a compiled softIoc — `c_cast::f64_to_u16` saturates it to `0`,
+            // which silently clamped every out-of-range menu-ordinal put. Truncate
+            // toward zero via the `i64` view, then take the low 16 bits like the
+            // integer-source path above.
             DbFieldType::Enum => EpicsValue::Enum(match self.as_int_i64() {
                 Some(i) => i as u16,
-                None => self.to_f64().unwrap_or(0.0) as u16,
+                None => self.to_f64().unwrap_or(0.0) as i64 as u16,
             }),
             DbFieldType::Char => {
                 // String → CharArray (for waveform FTVL=CHAR)
@@ -1041,13 +1113,13 @@ impl EpicsValue {
                 } else {
                     EpicsValue::Char(match self.as_int_i64() {
                         Some(i) => i as u8,
-                        None => self.to_f64().unwrap_or(0.0) as u8,
+                        None => c_cast::f64_to_u8(self.to_f64().unwrap_or(0.0)),
                     })
                 }
             }
             DbFieldType::Long => EpicsValue::Long(match self.as_int_i64() {
                 Some(i) => i as i32,
-                None => self.to_f64().unwrap_or(0.0) as i32,
+                None => c_cast::f64_to_i32(self.to_f64().unwrap_or(0.0)),
             }),
             DbFieldType::Double => EpicsValue::Double(self.to_f64().unwrap_or(0.0)),
             DbFieldType::Int64 => {
@@ -1059,7 +1131,7 @@ impl EpicsValue {
                     // not an f64 round-trip (lossy above 2^53).
                     EpicsValue::Int64(*v as i64)
                 } else {
-                    EpicsValue::Int64(self.to_f64().unwrap_or(0.0) as i64)
+                    EpicsValue::Int64(c_cast::f64_to_i64(self.to_f64().unwrap_or(0.0)))
                 }
             }
             DbFieldType::UInt64 => {
@@ -1069,7 +1141,7 @@ impl EpicsValue {
                 } else if let EpicsValue::Int64(v) = self {
                     EpicsValue::UInt64(*v as u64)
                 } else {
-                    EpicsValue::UInt64(self.to_f64().unwrap_or(0.0) as u64)
+                    EpicsValue::UInt64(c_cast::f64_to_u64(self.to_f64().unwrap_or(0.0)))
                 }
             }
             // Unsigned narrowing mirrors the signed targets: integer sources
@@ -1077,11 +1149,11 @@ impl EpicsValue {
             // sources fall back to the f64 round-trip.
             DbFieldType::UShort => EpicsValue::UShort(match self.as_int_i64() {
                 Some(i) => i as u16,
-                None => self.to_f64().unwrap_or(0.0) as u16,
+                None => c_cast::f64_to_u16(self.to_f64().unwrap_or(0.0)),
             }),
             DbFieldType::ULong => EpicsValue::ULong(match self.as_int_i64() {
                 Some(i) => i as u32,
-                None => self.to_f64().unwrap_or(0.0) as u32,
+                None => c_cast::f64_to_u32(self.to_f64().unwrap_or(0.0)),
             }),
             DbFieldType::UChar => {
                 // String → UCharArray (for waveform FTVL=UCHAR), the unsigned
@@ -1091,7 +1163,7 @@ impl EpicsValue {
                 } else {
                     EpicsValue::UChar(match self.as_int_i64() {
                         Some(i) => i as u8,
-                        None => self.to_f64().unwrap_or(0.0) as u8,
+                        None => c_cast::f64_to_u8(self.to_f64().unwrap_or(0.0)),
                     })
                 }
             }
@@ -1121,6 +1193,35 @@ impl EpicsValue {
             Self::FloatArray(_) => DbFieldType::Float,
             Self::DoubleArray(_) => DbFieldType::Double,
             Self::StringArray(_) => DbFieldType::String,
+        }
+    }
+
+    /// Project this value onto a `DBF_SHORT` field, by C's rule.
+    ///
+    /// `None` means the value is not numeric at all — C's `S_db_badDbrtype`.
+    /// [`Self::convert_to`] coerces rather than fails, so the rejection has to be
+    /// made here or a non-numeric source lands in the field as a silent 0.
+    ///
+    /// Use this, never `c_cast::f64_to_i16(v.to_f64())`: `to_f64` erases the
+    /// source's integer-ness, and C picks its conversion routine BY the source
+    /// type (`dbFastGetConvertRoutine` is a 2-D table, `dbConvert.c:1571-1638`).
+    /// An integer source takes C's DEFINED modular conversion; only a float
+    /// source takes the UB cast that CBUG-E2 saturates. Going through `to_f64`
+    /// forces the float rule onto both.
+    pub(crate) fn to_dbf_i16(&self) -> Option<i16> {
+        self.to_f64()?;
+        match self.convert_to(DbFieldType::Short) {
+            Self::Short(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// [`Self::to_dbf_i16`] for a `DBF_LONG` field. Same rule, same reason.
+    pub(crate) fn to_dbf_i32(&self) -> Option<i32> {
+        self.to_f64()?;
+        match self.convert_to(DbFieldType::Long) {
+            Self::Long(v) => Some(v),
+            _ => None,
         }
     }
 
@@ -1226,13 +1327,37 @@ impl EpicsValue {
             ".5 second" => Some(7),
             ".2 second" => Some(8),
             ".1 second" => Some(9),
-            // menuPini (NO=0, YES=1 already handled via menuYesNo)
-            "RUNNING" => Some(2),
-            "RUNNING_NOT_CA" => Some(3),
-            "PAUSED" => Some(4),
-            "PAUSED_NOT_CA" => Some(5),
+            // menuPini is deliberately absent. Its real choice order is
+            // NO,YES,RUN,RUNNING,PAUSE,PAUSED (`menuPini.dbd.pod:59-65`) — the
+            // entries that used to live here (`RUNNING=2`, `PAUSED=4`, plus two
+            // invented `*_NOT_CA` choices) named the wrong indices. `PINI`
+            // resolves against its own menu via
+            // `crate::server::record::PiniMode::from_str`, which is what this
+            // field-blind table cannot do: the same label names different
+            // indices in different menus.
             _ => None,
         }
+    }
+
+    /// Parse a `.db` field value into an EpicsValue of the given type — the
+    /// BYTE-STRING form, which is what a `.db` value actually is.
+    ///
+    /// A `DBF_STRING` is a byte string with a 40-byte budget, not a sequence of
+    /// characters: C's escape translation writes ONE byte per `\xHH`
+    /// (`epicsString.c:106`, `OUT(u)` into a `char`), so `field(VAL,"h\xffz")`
+    /// is the three bytes `h`, `0xFF`, `z` — measured on softIoc, where `dbgf`
+    /// prints `"h\xffz"` (one escape, not the `\xc3\xbf` a UTF-8 encoding of
+    /// U+00FF would print). Going through [`Self::parse`] would force the value
+    /// through a Rust `String` and turn that one byte into two.
+    ///
+    /// Every other DBF type is a number or a menu label — ASCII by
+    /// construction, and a byte outside ASCII is a parse error either way — so
+    /// they are handed to [`Self::parse`] unchanged.
+    pub fn parse_bytes(dbr_type: DbFieldType, bytes: &[u8]) -> CaResult<Self> {
+        if dbr_type == DbFieldType::String {
+            return Ok(Self::String(PvString::from_bytes(bytes.trim_ascii())));
+        }
+        Self::parse(dbr_type, &String::from_utf8_lossy(bytes))
     }
 
     /// Parse a string value into an EpicsValue of the given type

@@ -1,28 +1,11 @@
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::record::{
-    EPICS_TIME_EVENT_DEVICE_TIME, FieldDesc, ProcessContext, ProcessOutcome, Record,
+    EPICS_TIME_EVENT_DEVICE_TIME, FieldDesc, ProcessContext, ProcessOutcome, Record, ValuePostGate,
 };
-use epics_base_rs::types::{DbFieldType, EpicsValue, PvString};
+use epics_base_rs::types::{EpicsValue, PvString};
 
+use super::dbd_generated;
 use chrono::{Local, TimeZone};
-
-/// Choice labels for the timestamp string-format menu, in index order.
-/// C `menu(timestampTST)` (std `timestampRecord.dbd`): `TST` selects which
-/// of these `strftime`-style formats `VAL` is rendered with. The
-/// index↔string mapping is wire-visible to clients.
-const TIMESTAMP_TST_CHOICES: &[&str] = &[
-    "YY/MM/DD HH:MM:SS",
-    "MM/DD/YY HH:MM:SS",
-    "Mon DD HH:MM:SS YY",
-    "Mon DD HH:MM:SS",
-    "HH:MM:SS",
-    "HH:MM",
-    "DD/MM/YY HH:MM:SS",
-    "DD Mon HH:MM:SS YY",
-    "DD-Mon-YYYY HH:MM:SS",
-    "Mon DD, YYYY HH:MM:SS.ns",
-    "MM/DD/YY HH:MM:SS.ns",
-];
 
 /// EPICS epoch: 1990-01-01 00:00:00 UTC
 const EPICS_EPOCH_OFFSET: i64 = 631152000;
@@ -65,7 +48,11 @@ pub struct TimestampRecord {
     /// Seconds past EPICS epoch (RVAL). DBF_ULONG in C; the Rust value
     /// model has no unsigned-32 scalar, so this follows the project
     /// convention of mapping DBF_ULONG to `i32`/`EpicsValue::Long`.
-    pub rval: i32,
+    /// `field(RVAL,DBF_ULONG)` (`timestampRecord.dbd:28`) — C
+    /// `ptimestamp->rval = ptimestamp->time.secPastEpoch` (`timestampRecord.c:94`),
+    /// and `secPastEpoch` is an `epicsUInt32`. Stored `i32` and served
+    /// `EpicsValue::Long` while the port hand-wrote its own field table.
+    pub rval: u32,
     /// Timestamp format selector (TST), a DBF_MENU. Values `0..=10`
     /// select an explicit format; any other value is rendered with
     /// format 0 (C `switch` `default:` branch).
@@ -77,6 +64,13 @@ pub struct TimestampRecord {
     /// clock (`epicsTimeFromTime_t(&time, time(0))`, whole seconds, no
     /// fraction); any other value uses the EPICS time-stamp framework.
     tse: i16,
+    /// Whether the last `process()` rendered a VAL string different from the
+    /// previous one — C `monitor()`'s `strncmp(oval, val, sizeof(val))` gate
+    /// (`timestampRecord.c:158`), captured during `process()` because the
+    /// framework asks for the decision after `oval` has already been committed.
+    /// It is the ONLY gate on this record's monitors: VAL and RVAL both post
+    /// exactly when it is true (`:159-160`).
+    val_changed: bool,
 }
 
 impl Default for TimestampRecord {
@@ -87,35 +81,13 @@ impl Default for TimestampRecord {
             rval: 0,
             tst: 0,
             tse: 0,
+            val_changed: false,
         }
     }
 }
 
-static FIELDS: &[FieldDesc] = &[
-    FieldDesc {
-        name: "VAL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OVAL",
-        dbf_type: DbFieldType::String,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "RVAL",
-        dbf_type: DbFieldType::Long,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "TST",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-];
-
 impl TimestampRecord {
-    fn format_timestamp(&self) -> (PvString, i32) {
+    fn format_timestamp(&self) -> (PvString, u32) {
         // C `timestampRecord.c:90-93`: `tse == epicsTimeEventDeviceTime`
         // takes the raw OS clock via `epicsTimeFromTime_t(&time, time(0))`
         // — whole seconds only, the nanosecond field is zero. Any other
@@ -137,7 +109,7 @@ impl TimestampRecord {
             Local::now()
         };
         let unix_secs = now.timestamp();
-        let sec_past_epoch = (unix_secs - EPICS_EPOCH_OFFSET) as i32;
+        let sec_past_epoch = (unix_secs - EPICS_EPOCH_OFFSET) as u32;
 
         // C `timestampRecord.c:96`: `if (time.secPastEpoch == 0)` — the
         // "-NULL-" sentinel is emitted only when the EPICS-epoch second
@@ -230,6 +202,12 @@ impl Record for TimestampRecord {
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         let (formatted, sec_past_epoch) = self.format_timestamp();
+        // C `monitor()` compares the freshly rendered string against OVAL and
+        // posts VAL *and* RVAL only if they differ (timestampRecord.c:158-162),
+        // then copies VAL into OVAL. RVAL itself is refreshed on every process
+        // (`:94`) — a caget of RVAL between posts reads the current second — so
+        // only the *posting* is gated, never the value.
+        self.val_changed = formatted != self.val;
         self.oval = std::mem::replace(&mut self.val, formatted);
         self.rval = sec_past_epoch;
         Ok(ProcessOutcome::complete())
@@ -239,7 +217,7 @@ impl Record for TimestampRecord {
         match name {
             "VAL" => Some(EpicsValue::String(self.val.clone())),
             "OVAL" => Some(EpicsValue::String(self.oval.clone())),
-            "RVAL" => Some(EpicsValue::Long(self.rval)),
+            "RVAL" => Some(EpicsValue::ULong(self.rval)),
             "TST" => Some(EpicsValue::Short(self.tst)),
             _ => None,
         }
@@ -257,7 +235,7 @@ impl Record for TimestampRecord {
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
             "RVAL" => match value {
-                EpicsValue::Long(v) => {
+                EpicsValue::ULong(v) => {
                     self.rval = v;
                     Ok(())
                 }
@@ -281,17 +259,8 @@ impl Record for TimestampRecord {
         }
     }
 
-    fn field_list(&self) -> &'static [FieldDesc] {
-        FIELDS
-    }
-
-    /// `TST` is `DBF_MENU menu(timestampTST)` (std `timestampRecord.dbd`);
-    /// served as `DBR_ENUM` with the format-string choice labels.
-    fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
-        match field {
-            "TST" => Some(TIMESTAMP_TST_CHOICES),
-            _ => None,
-        }
+    fn declared_fields(&self) -> &'static [FieldDesc] {
+        dbd_generated::TIMESTAMP_FIELDS
     }
 
     /// C `timestampRecord.c:90` reads `ptimestamp->tse`. The framework
@@ -320,9 +289,31 @@ impl Record for TimestampRecord {
     /// `if let Some(val) = dval` push is skipped) and routes `VAL`
     /// through the generic change-detection loop, which posts it only
     /// when it differs from the last posted value — matching C exactly.
-    /// `RVAL` already change-detects through that same loop.
     fn monitor_deadband_field(&self) -> &'static str {
         ""
+    }
+
+    /// C `monitor()`'s single gate: the `strncmp(oval, val)` string change
+    /// (`timestampRecord.c:158`). Reported here so the framework's VAL monitor
+    /// mask is live only on a cycle that re-rendered a different string — which
+    /// is also the gate `RVAL` hangs off (see
+    /// [`Self::fields_posted_with_value_mask`]).
+    fn monitor_value_changed(&self) -> Option<bool> {
+        Some(self.val_changed)
+    }
+
+    /// C posts `RVAL` from *inside* the VAL-string-change guard, with VAL's own
+    /// monitor mask and with no test of RVAL's own value
+    /// (`db_post_events(&ptimestamp->rval, monitor_mask)`,
+    /// `timestampRecord.c:160`) — so the seconds count reaches monitors exactly
+    /// when the rendered string moves, and no more often.
+    ///
+    /// Left to the generic change-detection loop instead, `RVAL` posts on every
+    /// process that crosses a second — ~59 spurious `DBE_VALUE|DBE_LOG` events a
+    /// minute per subscriber under a coarse TST such as `HH:MM`, whose VAL only
+    /// changes once a minute.
+    fn fields_posted_with_value_mask(&self) -> &'static [(&'static str, ValuePostGate)] {
+        &[("RVAL", ValuePostGate::WithValue)]
     }
 
     fn clears_udf(&self) -> bool {
@@ -362,7 +353,8 @@ mod subsec_round_tests {
 
 #[cfg(test)]
 mod menu_choice_tests {
-    use super::{TIMESTAMP_TST_CHOICES, TimestampRecord};
+    use super::{TimestampRecord, dbd_generated};
+    use epics_base_rs::server::record::FieldDeclaration;
     use epics_base_rs::server::record::{Record, RecordInstance};
     use epics_base_rs::types::EpicsValue;
 
@@ -381,11 +373,26 @@ mod menu_choice_tests {
         assert_eq!(strings[4], "HH:MM:SS");
     }
 
+    /// The choices are the DECLARATION's, not a record hook's: `TST` is
+    /// `DBF_MENU menu(timestampTST)` in `timestampRecord.dbd`, so its
+    /// `FieldDesc` carries the choices and every consumer reads them from
+    /// there. This used to assert a hand-written `TIMESTAMP_TST_CHOICES` that
+    /// `menu_field_choices` returned — a second declaration of the same menu.
     #[test]
-    fn timestamp_menu_field_choices_match_dbd() {
+    fn timestamp_tst_choices_come_from_the_declaration() {
         let rec = TimestampRecord::default();
-        assert_eq!(rec.menu_field_choices("TST"), Some(TIMESTAMP_TST_CHOICES));
-        assert_eq!(rec.menu_field_choices("VAL"), None);
+        let tst = rec
+            .field_list()
+            .iter()
+            .find(|f| f.name == "TST")
+            .expect("TST is declared");
+        assert_eq!(tst.menu, Some(dbd_generated::MENU_TIMESTAMP_TST));
+        let val = rec
+            .field_list()
+            .iter()
+            .find(|f| f.name == "VAL")
+            .expect("VAL is declared");
+        assert_eq!(val.menu, None);
     }
 
     // C `timestampRecord.c:152-163`: `monitor()` posts VAL (and RVAL)

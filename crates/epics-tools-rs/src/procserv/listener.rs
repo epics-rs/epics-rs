@@ -69,6 +69,19 @@ pub struct PreboundListener {
 }
 
 impl PreboundListener {
+    /// The address this listener is actually bound to, for a TCP endpoint
+    /// bound with port `0` (OS-assigned) — `None` for a UNIX endpoint,
+    /// which has no numeric port. Lets a caller that bound with port `0`
+    /// via [`bind_endpoints`] learn the real port with zero gap between
+    /// bind and use, unlike bind-query-drop-then-reuse-the-number, which
+    /// races anyone else binding an ephemeral port in that gap.
+    pub fn local_addr(&self) -> Option<SocketAddr> {
+        match &self.listener {
+            BoundEndpoint::Tcp(l) => l.local_addr().ok(),
+            BoundEndpoint::Unix(..) => None,
+        }
+    }
+
     /// Run this listener's accept loop until the supervisor's `out` channel
     /// closes. A loop that exits with an error is logged; the supervisor
     /// keeps running its other endpoints (steady-state accept failures are
@@ -506,12 +519,7 @@ mod tests {
     async fn bind_one_binds_a_free_port_and_accepts() {
         let bind = "127.0.0.1:0".parse::<SocketAddr>().unwrap();
         let pl = bind_one(Endpoint::Tcp(bind), false, "control").expect("free port binds");
-        // Recover the actual port to connect to: re-read it from the bound
-        // std listener before the accept loop consumes `pl`.
-        let actual = match &pl.listener {
-            BoundEndpoint::Tcp(l) => l.local_addr().unwrap(),
-            _ => unreachable!(),
-        };
+        let actual = pl.local_addr().expect("tcp listener reports a local addr");
         let (tx, mut rx) = mpsc::channel(4);
         let server = tokio::spawn(pl.accept(tx));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -522,5 +530,23 @@ mod tests {
         assert!(!inc.readonly);
 
         server.abort();
+    }
+
+    /// `local_addr` is how a caller that bound with port `0` learns the
+    /// real port with no gap between bind and use (unlike bind-query-drop-
+    /// then-reuse-the-number). A TCP listener bound to `:0` must report a
+    /// concrete, non-zero port; a UNIX listener has no numeric port at all.
+    #[tokio::test]
+    async fn local_addr_reports_bound_tcp_port_and_none_for_unix() {
+        let bind = "127.0.0.1:0".parse::<SocketAddr>().unwrap();
+        let tcp = bind_one(Endpoint::Tcp(bind), false, "control").expect("free port binds");
+        let addr = tcp.local_addr().expect("tcp listener reports a local addr");
+        assert_eq!(addr.ip(), bind.ip());
+        assert_ne!(addr.port(), 0);
+
+        let dir = tempfile::tempdir().unwrap();
+        let ep = UnixEndpoint::filesystem(dir.path().join("ioc.sock"));
+        let unix = bind_one(Endpoint::Unix(ep), false, "control").expect("unix path binds");
+        assert_eq!(unix.local_addr(), None);
     }
 }

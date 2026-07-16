@@ -18,6 +18,7 @@ use epics_tools_rs::procserv::{
     ProcServ, ProcServConfig,
     config::{ChildConfig, KeyBindings, ListenConfig, LoggingConfig},
     endpoint::Endpoint,
+    listener::bind_endpoints,
     restart::{RestartMode, RestartPolicy},
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -70,6 +71,28 @@ async fn pick_port() -> u16 {
     let p = l.local_addr().unwrap().port();
     drop(l);
     p
+}
+
+/// Bind `cfg`'s configured endpoints immediately and return a `ProcServ`
+/// ready to `.run()` (its listeners pre-bound via `with_prebound`)
+/// together with the real port(s) it is now listening on — control
+/// port(s) first (`cfg.listen.control` order), then the log port if one
+/// is configured. Build `cfg` with port `0` placeholders (`cat_config(0)`)
+/// and use this instead of `pick_port()` when a test's own load-bearing
+/// assertions depend on the server actually being reachable: unlike
+/// bind-query-drop-then-reuse-the-number, which races anyone else on the
+/// box binding an ephemeral port in that gap, the listener here is
+/// already bound before this function returns — nothing can steal the
+/// port in between.
+async fn spawn_bound(cfg: ProcServConfig) -> (ProcServ, Vec<u16>) {
+    let listeners = bind_endpoints(&cfg).expect("bind configured endpoints");
+    let ports = listeners
+        .iter()
+        .filter_map(|l| l.local_addr())
+        .map(|a| a.port())
+        .collect();
+    let server = ProcServ::new(cfg).expect("build").with_prebound(listeners);
+    (server, ports)
 }
 
 /// Read up to `deadline` and return everything that arrived.
@@ -529,14 +552,18 @@ async fn logstamp_prefixes_logger_client_stream_not_control() {
     // (read/write) client receives the bytes verbatim. A literal
     // `stamp_format` (no `%` specifiers) lets the prefix be asserted
     // exactly.
-    let ctl_port = pick_port().await;
-    let log_port = pick_port().await;
-    let mut cfg = cat_config(ctl_port);
-    cfg.listen.log = Some(Endpoint::Tcp(SocketAddr::from(([127, 0, 0, 1], log_port))));
+    let mut cfg = cat_config(0);
+    cfg.listen.log = Some(Endpoint::Tcp(SocketAddr::from(([127, 0, 0, 1], 0))));
     cfg.logging.stamp_log = true;
     cfg.logging.stamp_format = "STAMP> ".into();
 
-    let server = ProcServ::new(cfg).expect("build");
+    let (server, ports) = spawn_bound(cfg).await;
+    assert_eq!(
+        ports.len(),
+        2,
+        "expected a control and a log port, got: {ports:?}"
+    );
+    let (ctl_port, log_port) = (ports[0], ports[1]);
     let server_task = tokio::spawn(async move {
         let _ = server.run().await;
     });
@@ -553,8 +580,24 @@ async fn logstamp_prefixes_logger_client_stream_not_control() {
     };
     let mut ctl = connect(ctl_port).await;
     let mut log = connect(log_port).await;
-    let _ = read_for(&mut ctl, Duration::from_millis(400)).await;
-    let _ = read_for(&mut log, Duration::from_millis(400)).await;
+    // "procServ server started at:" is unconditional (every client, even
+    // a readonly logger — messages.rs `welcome`), unlike the readonly-gated
+    // "Welcome to procServ" greeting. Waiting for it, rather than a fixed
+    // window, proves both clients are registered in the roster (see the
+    // ordering note in `two_clients_share_same_party_line`) before ctl's
+    // line is typed below.
+    let _ = read_until(
+        &mut ctl,
+        "procServ server started at:",
+        Duration::from_secs(2),
+    )
+    .await;
+    let _ = read_until(
+        &mut log,
+        "procServ server started at:",
+        Duration::from_secs(2),
+    )
+    .await;
 
     // Control types; `cat` echoes the line back as child output, which the
     // supervisor broadcasts. The logger sees it stamped; control raw.
@@ -581,11 +624,11 @@ async fn timefmt_controls_banner_timestamp_format() {
     // format with no `%` specifiers is emitted as a literal, so a custom
     // timefmt shows up verbatim in the banner; the default ("%c") would
     // render a real calendar time instead.
-    let port = pick_port().await;
-    let mut cfg = cat_config(port);
+    let mut cfg = cat_config(0);
     cfg.logging.time_format = "TIMEFMT_MARKER".into();
 
-    let server = ProcServ::new(cfg).expect("build");
+    let (server, ports) = spawn_bound(cfg).await;
+    let port = ports[0];
     let server_task = tokio::spawn(async move {
         let _ = server.run().await;
     });
@@ -601,8 +644,12 @@ async fn timefmt_controls_banner_timestamp_format() {
         }
     };
 
-    let initial = read_for(&mut conn, Duration::from_millis(500)).await;
-    let cleaned = String::from_utf8_lossy(&strip_iac(&initial)).to_string();
+    let cleaned = read_until(
+        &mut conn,
+        "server started at: TIMEFMT_MARKER",
+        Duration::from_secs(2),
+    )
+    .await;
     assert!(
         cleaned.contains("server started at: TIMEFMT_MARKER"),
         "banner must render the start time with the configured timefmt; got: {cleaned:?}"
@@ -680,9 +727,9 @@ async fn manual_restart_preempts_active_holdoff() {
 
 #[tokio::test]
 async fn two_clients_share_same_party_line() {
-    let port = pick_port().await;
-    let cfg = cat_config(port);
-    let server = ProcServ::new(cfg).expect("build");
+    let cfg = cat_config(0);
+    let (server, ports) = spawn_bound(cfg).await;
+    let port = ports[0];
 
     let server_task = tokio::spawn(async move {
         let _ = server.run().await;
@@ -701,11 +748,27 @@ async fn two_clients_share_same_party_line() {
             }
         }
     };
-    let _ = read_for(&mut a, Duration::from_millis(300)).await;
+    // The banner text is only enqueued to a client's outbound channel
+    // after `handle_new_client` has already inserted it into the client
+    // roster (supervisor.rs `handle_new_client`), so seeing it here is
+    // proof A is registered and will receive the party-line broadcast
+    // below — a fixed sleep isn't: under load the banner write can
+    // simply not have reached the socket yet within an arbitrary window.
+    let _ = read_until(
+        &mut a,
+        "procServ server started at:",
+        Duration::from_secs(2),
+    )
+    .await;
 
     // Connect client B.
     let mut b = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-    let _ = read_for(&mut b, Duration::from_millis(300)).await;
+    let _ = read_until(
+        &mut b,
+        "procServ server started at:",
+        Duration::from_secs(2),
+    )
+    .await;
 
     // A types — `cat` echoes the line back through the PTY, and the
     // supervisor broadcasts that child output to every client, so both A
@@ -897,19 +960,18 @@ async fn teardown_sigkills_a_child_that_traps_the_configurable_kill_signal() {
     // follow-up SIGKILL guarantees death. The child traps SIGTERM and
     // loops forever; supervisor teardown (Drop, fired by aborting the
     // run task) must still kill it.
-    let port = pick_port().await;
     let dir = tempfile::tempdir().unwrap();
     let pidfile = dir.path().join("childpid");
     let pf = pidfile.to_str().unwrap().to_string();
 
-    let mut cfg = cat_config(port);
+    let mut cfg = cat_config(0);
     cfg.child.kill_signal = 15; // SIGTERM — catchable, the child ignores it
     cfg.child.program = PathBuf::from("/bin/sh");
     cfg.child.args = vec![
         "-c".into(),
         format!("trap '' TERM; echo $$ > '{pf}'; while true; do sleep 1; done"),
     ];
-    let server = ProcServ::new(cfg).expect("build");
+    let (server, _ports) = spawn_bound(cfg).await;
     let server_task = tokio::spawn(async move { server.run().await });
 
     // Wait for the child to record its PID (proves it installed the trap).
@@ -931,19 +993,29 @@ async fn teardown_sigkills_a_child_that_traps_the_configurable_kill_signal() {
     server_task.abort();
     let _ = server_task.await;
 
-    // Give the OS time to reap the SIGKILLed child.
-    sleep(Duration::from_millis(700)).await;
-
-    let still_alive = std::process::Command::new("/bin/sh")
-        .arg("-c")
-        .arg(format!("kill -0 {child_pid} 2>/dev/null"))
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    assert!(
-        !still_alive,
-        "child {child_pid} traps SIGTERM, so teardown's follow-up SIGKILL must kill it"
-    );
+    // Drop's kill(2) calls are synchronous, but the actual reap runs on an
+    // independent `spawn_blocking` waitpid thread (`spawn_reaper`); until
+    // that thread's waitpid returns, the SIGKILLed child is a zombie and
+    // `kill -0` still reports it alive. Poll for the real condition
+    // instead of guessing how long the reaper thread takes to get
+    // scheduled under load.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let still_alive = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("kill -0 {child_pid} 2>/dev/null"))
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !still_alive {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "child {child_pid} traps SIGTERM, so teardown's follow-up SIGKILL must kill it"
+        );
+        sleep(Duration::from_millis(50)).await;
+    }
 }
 
 #[tokio::test]
@@ -952,16 +1024,28 @@ async fn norestart_keeps_server_alive_after_child_exit() {
     // the SERVER stays up — only `oneshot` sets shutdownServer. The
     // operator reconnects and ^R relaunches (processFactory.cc:51,
     // procServ.cc:654-669).
-    let port = pick_port().await;
-    let mut cfg = cat_config(port); // Disabled == norestart
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("child_done");
+    let mf = marker.to_str().unwrap().to_string();
+    let mut cfg = cat_config(0); // Disabled == norestart
     cfg.child.program = PathBuf::from("/bin/sh");
-    cfg.child.args = vec!["-c".into(), "exit 0".into()];
-    let server = ProcServ::new(cfg).expect("build");
+    cfg.child.args = vec!["-c".into(), format!("touch '{mf}'; exit 0")];
+    let (server, ports) = spawn_bound(cfg).await;
+    let port = ports[0];
     let server_task = tokio::spawn(async move { server.run().await });
 
     // Connect AFTER the child has already exited; the server must still
-    // be accepting connections and serving a banner.
-    sleep(Duration::from_millis(400)).await;
+    // be accepting connections and serving a banner. Poll for the marker
+    // the child touches right before exiting rather than guessing a fixed
+    // delay — under load a blind sleep can both fire too early (flaking
+    // the invariant this test targets) and needlessly slow the fast path.
+    {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !marker.exists() {
+            assert!(Instant::now() < deadline, "child never exited");
+            sleep(Duration::from_millis(20)).await;
+        }
+    }
     let mut conn = {
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
@@ -972,10 +1056,15 @@ async fn norestart_keeps_server_alive_after_child_exit() {
             }
         }
     };
-    let banner = read_for(&mut conn, Duration::from_millis(300)).await;
+    let banner = read_until(
+        &mut conn,
+        "procServ server started at:",
+        Duration::from_secs(2),
+    )
+    .await;
     assert!(
-        !banner.is_empty(),
-        "server should still serve a banner after the child exited under norestart"
+        banner.contains("procServ server started at:"),
+        "server should still serve a banner after the child exited under norestart; got: {banner:?}"
     );
     assert!(
         !server_task.is_finished(),
@@ -1012,12 +1101,12 @@ async fn toggle_into_oneshot_grants_one_more_run() {
     // current exit; only the *next* exit shuts the server down
     // (procServ.cc:656-667). Start in OnExit so the toggle cycle reaches
     // oneshot via OnExit→Disabled→OneShot.
-    let port = pick_port().await;
-    let mut cfg = cat_config(port);
+    let mut cfg = cat_config(0);
     cfg.restart_mode = RestartMode::OnExit;
     cfg.holdoff = Duration::from_millis(50);
 
-    let server = ProcServ::new(cfg).expect("build");
+    let (server, ports) = spawn_bound(cfg).await;
+    let port = ports[0];
     let server_task = tokio::spawn(async move {
         let _ = server.run().await;
     });

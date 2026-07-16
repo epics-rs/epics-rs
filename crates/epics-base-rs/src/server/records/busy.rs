@@ -270,10 +270,17 @@ impl Record for BusyRecord {
         true
     }
 
-    fn is_put_complete(&self) -> bool {
-        self.val == 0
-    }
-
+    // NO `is_put_complete` override — busy completes its put-callback
+    // synchronously, like bo. C `busyRecord.c:273` clears `pact = FALSE` at the
+    // tail of every process cycle; only async device support that set `pact`
+    // itself (`:254`) holds the callback, and the soft support this port models
+    // (`devBusySoft.c::write_busy` is a bare `dbPutLink`, never touching `pact`)
+    // does not. A prior `is_put_complete() == self.val == 0` modelled the
+    // asynBusy hold, but this record's `process()` is synchronous (never returns
+    // `AsyncPendingNotify`), so the phantom hold only wedged the put-notify:
+    // once VAL was driven to 1 the callback never completed, and every following
+    // `ca_put_callback` was refused with `PutCallbackInProgress`, so the
+    // out-of-range VAL puts C posts (2, 3 → "Illegal_Value") never processed.
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => Some(EpicsValue::Enum(self.val)),

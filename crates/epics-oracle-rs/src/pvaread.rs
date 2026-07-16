@@ -373,7 +373,7 @@ impl PvaReport {
     }
 }
 
-fn truncate(s: &str, n: usize) -> String {
+pub(crate) fn truncate(s: &str, n: usize) -> String {
     let s = s.replace('\n', " ");
     if s.chars().count() <= n {
         return s;
@@ -384,7 +384,7 @@ fn truncate(s: &str, n: usize) -> String {
 
 /// The first few differing lines, side by side. Enough to act on without
 /// dumping two whole NT structures into the terminal.
-fn first_differing_lines(c: &str, r: &str) -> Vec<String> {
+pub(crate) fn first_differing_lines(c: &str, r: &str) -> Vec<String> {
     const MAX: usize = 6;
     let mut out = Vec::new();
     let (cl, rl): (Vec<&str>, Vec<&str>) = (c.lines().collect(), r.lines().collect());

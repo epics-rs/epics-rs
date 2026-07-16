@@ -129,7 +129,9 @@ A%B  A=-2147483648 B=-1 -> Floating point exception (core dumped)
 ```
 
 ### CBUG-A2: `NINT` / `MODULO` narrow a double with a plain `(epicsInt32)` cast — out-of-range or NaN silently becomes `INT_MIN`
-Bucket: REPRODUCED · Severity: Medium
+Bucket: FIXED-UPSTREAM (base half, PR #925) · Severity: Medium
+Status: base/numeric closed — our PR #925 routes NINT/MODULO through `d2i` and the port
+tracks the fix. sCalc/aCalc mirror pristine synApps per dialect (see Port below).
 C: `calcPerform.c:290-293` (`NINT`): `*ptop = (epicsInt32)(top>=0 ? top+0.5 : top-0.5)`,
 and `calcPerform.c:162-164` (`MODULO`'s dividend cast). Neither uses the `d2i`/`d2ui`
 macros (`calcPerform.c:324-325`) that every sibling bitwise/shift op (`BIT_OR`,
@@ -141,10 +143,29 @@ cast. On x86 an out-of-range `cvttsd2si` yields the "integer indefinite" value
 `myNINT` / `(int)` / `(long)`.
 Defect: platform-dependent wrong result, and the crash vector for CBUG-A1. The C team
 half-fixed this family (bitwise via `d2i`) and left NINT/MODULO exposed.
-Port: `numeric.rs:264-271` (NINT) and `:90-104` (MODULO) route through
-`engine/cast.rs:59-66 c_int`, a deliberate model of x86-64 `cvttsd2si`; pinned by
-`numeric.rs:632` `assert_eq!(run("NINT(3000000000)"), i32::MIN as f64)`.
-Reproduced on purpose — x86-64 is the field target.
+Port (as of `91f9c327`, tracking base PR #925 `669a25697`): NINT/MODULO narrow
+**per-engine, each mirroring its own C dialect**, through the single parameterized
+owners `cast::nint`/`cast::imod`:
+- **numeric (base)** → `d2i` — matches the **fixed** base C. Our upstream PR #925
+  routes NINT/MODULO through `d2i` there, and the oracle ground truth is rebuilt on
+  that fix, so this half is no longer a live deviation: fixed C and port both give
+  `NINT(3e9) = -1294967296`, `3e9 % 7 = 0`.
+- **sCalc (string)** → `c_long` (`(long)`, 64-bit) — mirrors pristine synApps
+  `sCalcPerform.c`; `NINT(3e9) = 3e9`, `3e9 % 7 = 4` (the `(long)` path is actually
+  *correct* for values below 2^63, so there is no base-style bug to fix there).
+- **aCalc (array)** → `c_long` for **NINT** (`aCalcPerform.c:839,1096`, 64-bit) but
+  `c_int` for **MODULO** (`:661,:685,:711`, 32-bit) — a verified **split-width
+  inconsistency inside one engine**. The port mirrors it exactly. aCalc's out-of-range
+  MODULO additionally rides CBUG-E2 (`c_int` saturates to `i32::MAX` where x86
+  `cvttsd2si` gives `INT_MIN`) — pre-existing, separate.
+
+Earlier catalogue text described the port as a reproduced-`cvttsd2si` state pinned to
+`i32::MIN`; that was stale — the port was on a clean no-narrow deviation before
+`91f9c327`, now replaced by the per-engine mirroring above.
+
+Lead (unfiled): aCalc's split narrowing (NINT `(long)` vs MODULO `(int)`) is a
+plausible upstream CBUG — align aCalc MODULO to `(long)`, or route both through a
+`d2i`-style macro as base now does.
 Impact: `NINT(3e9)` returns `-2147483648`; `3e9 % 7` returns `-2`. Any calc record
 that rounds or takes a modulus of a value that can exceed 2^31 (counters, ns
 timestamps, large ADC sums) writes a wrong number to `VAL`/its output link — and the

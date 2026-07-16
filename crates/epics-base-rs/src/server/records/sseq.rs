@@ -1095,6 +1095,31 @@ impl Record for SseqRecord {
         &["DLY1"]
     }
 
+    /// C `sseqRecord.c::asyncFinish` (474) posts `VAL` on EVERY process:
+    ///
+    /// ```c
+    /// MonitorMask = DBE_VALUE | recGblResetAlarms(pR);
+    /// if (MonitorMask) db_post_events(pR, &pR->val, MonitorMask);
+    /// ```
+    ///
+    /// `DBE_VALUE` is set unconditionally, so a run of `caput VAL 1;2;2;3` posts
+    /// FOUR value events — the repeated `2` posts again — where the framework
+    /// default MDEL/deadband path dedupes the unchanged repeat to three. There
+    /// is no value-change gate and no `DBE_LOG`: the mask is `DBE_VALUE` plus the
+    /// alarm bits alone. Encode that as "value class always, archive class
+    /// never": the change gate contributes nothing ([`Self::monitor_value_changed`]
+    /// `= Some(false)`), and [`Self::monitor_always_post`] forces `DBE_VALUE`
+    /// on while leaving `DBE_LOG` off. The alarm bits still reach `VAL` through
+    /// the deadband post's `alarm_bits`, so an alarm transition posts it exactly
+    /// as C's `recGblResetAlarms` term does.
+    fn monitor_value_changed(&self) -> Option<bool> {
+        Some(false)
+    }
+
+    fn monitor_always_post(&self) -> (bool, bool) {
+        (true, false)
+    }
+
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         let mut live = Vec::new();
         // An abort in flight drains the outstanding put-callbacks, then
@@ -1207,6 +1232,17 @@ impl Record for SseqRecord {
             self.refresh_link_status();
             return Ok(());
         }
+        // ABORTING is `special(SPC_MOD)` but C `sseqRecord.c::special` has NO
+        // `case(sseqRecordABORTING)` — it falls to the `default:` arm,
+        // `recGblDbaddrError(S_db_badChoice, ...); return(S_db_badChoice)`
+        // (sseqRecord.c:1218-1220). `dbPut` had already stored the value (so
+        // `aborting` reads back what the client wrote), but the put STATUS is a
+        // failure. ABORTING is the ONLY SPC_MOD sseq field with no switch case;
+        // DLYn/DOn/DOLn/LNKn/STRn/WAITn all have one and are accepted, so this
+        // is the whole rejected-family besides ABORT-when-idle below.
+        if field.eq_ignore_ascii_case("ABORTING") {
+            return Err(CaError::BadChoice("ABORTING".to_string()));
+        }
         // C `sseqRecord.c::special` handles `ABORT` (SPC_MOD) entirely
         // outside the process cycle — a put to `ABORT` does NOT process the
         // record (only `VAL` is process-passive). `pR->abort` already holds
@@ -1216,13 +1252,16 @@ impl Record for SseqRecord {
         }
         let mut live = Vec::new();
         if self.busy == 0 {
-            // C: "no activity to abort" — drop the request.
+            // C: "no activity to abort" (sseqRecord.c:1173-1178) — reset `abort`,
+            // post, and `return(-1)`: the put is REJECTED. The reset/post is done
+            // first (as C does), only the status is a failure — the abort state
+            // machine is untouched.
             if self.abort != 0 {
                 self.abort = 0;
                 live.push(("ABORT".to_string(), EpicsValue::Short(0)));
             }
             self.post_live(live);
-            return Ok(());
+            return Err(CaError::BadField("ABORT".to_string()));
         }
         if self.aborting != 0 {
             // Second abort while already draining (C sseqRecord.c:1179-1190):
@@ -2275,6 +2314,53 @@ mod tests {
         // The write is isolated to the 10th group.
         assert_eq!(rec.get_field("IX1"), Some(EpicsValue::Short(0)));
         assert_eq!(rec.get_field("WTG1"), Some(EpicsValue::Short(0)));
+    }
+
+    /// C `special()` REJECTS two SPC_MOD puts the port used to accept:
+    ///   * ABORTING — no `case` in the switch, so it hits `default:` and
+    ///     returns `S_db_badChoice` on every put (sseqRecord.c:1218-1220).
+    ///   * ABORT when the record is idle (`busy == 0`) — "no activity to abort",
+    ///     `return(-1)` (sseqRecord.c:1173-1178).
+    ///
+    /// The value dbPut already stored still reads back; only the put STATUS is a
+    /// failure. Every other SPC_MOD field (DLYn/DOn/DOLn/LNKn/STRn/WAITn) has a
+    /// real switch case and is accepted — verified here for DLY1/WAIT1.
+    #[test]
+    fn sseq_special_rejects_aborting_and_idle_abort_like_c() {
+        // ABORTING put: rejected, but the stored value still reads back.
+        let mut rec = SseqRecord::new();
+        rec.put_field("ABORTING", EpicsValue::Short(5)).unwrap();
+        let err = rec.special("ABORTING", true).unwrap_err();
+        assert!(
+            matches!(err, CaError::BadChoice(_)),
+            "ABORTING is C's default:S_db_badChoice, got {err:?}"
+        );
+        assert_eq!(
+            rec.get_field("ABORTING"),
+            Some(EpicsValue::Short(5)),
+            "the put value dbPut stored stays written even though the put failed"
+        );
+
+        // ABORT put while idle (busy == 0): rejected; abort is reset to 0.
+        let mut rec = SseqRecord::new();
+        assert_eq!(rec.get_field("BUSY"), Some(EpicsValue::Short(0)));
+        rec.put_field("ABORT", EpicsValue::Short(1)).unwrap();
+        let err = rec.special("ABORT", true).unwrap_err();
+        assert!(
+            matches!(err, CaError::BadField(_)),
+            "idle ABORT is C's -1 rejection, got {err:?}"
+        );
+        assert_eq!(
+            rec.get_field("ABORT"),
+            Some(EpicsValue::Short(0)),
+            "C resets abort to 0 in the no-activity path"
+        );
+
+        // The accepted SPC_MOD siblings still return Ok (C has switch cases).
+        let mut rec = SseqRecord::new();
+        rec.put_field("DLY1", EpicsValue::Double(0.02)).unwrap();
+        rec.special("DLY1", true).unwrap();
+        rec.special("WAIT1", true).unwrap();
     }
 
     /// R17-1: a NEGATIVE `PREC` reaches C's

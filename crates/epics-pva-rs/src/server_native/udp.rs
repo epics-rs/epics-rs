@@ -3281,11 +3281,12 @@ mod tests {
     /// beacon list never produced a join. Drive the real config path
     /// (`server_beacon_addr_list_opt`) and assert the group is selected.
     #[test]
+    #[serial_test::serial(epics_env)]
     fn pvas_beacon_addr_list_without_pva_addr_list_joins_multicast() {
-        // nextest isolates each test in its own process, so mutating the
-        // process environment here cannot leak into a sibling test.
         // SAFETY: std::env::{set,remove}_var are unsafe in the 2024
-        // edition; the per-process isolation makes the mutation sound.
+        // edition; the `epics_env` serial guard makes the mutation
+        // race-free under `cargo test`, which runs all lib tests as
+        // threads in one process.
         unsafe {
             std::env::remove_var("EPICS_PVA_ADDR_LIST");
             std::env::set_var("EPICS_PVAS_BEACON_ADDR_LIST", "224.0.7.7");

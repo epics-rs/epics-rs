@@ -1252,14 +1252,18 @@ mod tests {
     /// engine layer; this guards the `Initial` reason at the
     /// `ensure_active` layer where the cap actually lived.
     #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(epics_env)]
     async fn initial_search_failure_is_owned_by_op_timeout_not_200ms() {
         use std::time::Duration;
 
         // Suppress real broadcast so no stray SEARCH on the LAN can be
         // answered and resolve the channel out from under the test.
-        // SAFETY: env vars are process-global; `current_thread` keeps
-        // other tokio tests from observing partial state, and these
-        // vars aren't read by any production path in this process.
+        // SAFETY: std::env mutation is unsafe in edition 2024; the
+        // `epics_env` serial guard makes it race-free. `current_thread`
+        // only constrains this test's own async executor, not the test
+        // harness's cross-test thread parallelism — these vars ARE read
+        // by production config code (config::env) and by other
+        // epics_env-group tests.
         unsafe {
             std::env::set_var("EPICS_PVA_AUTO_ADDR_LIST", "NO");
             std::env::set_var("EPICS_PVA_ADDR_LIST", "");

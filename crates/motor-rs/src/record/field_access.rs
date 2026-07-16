@@ -1,5 +1,6 @@
 #![allow(unused_imports)]
 use epics_base_rs::error::{CaError, CaResult};
+use epics_base_rs::server::recgbl::{rec_gbl_get_alarm_double, rec_gbl_get_graphic_double};
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
 use crate::coordinate;
@@ -1911,8 +1912,14 @@ fn precision_for(rec: &MotorRecord, field: &str) -> Option<i16> {
 /// the matching limit pair, the raw pair divides the dial limits by
 /// the SIGNED resolution (crossed under MRES < 0, C 3235-3244), VELO
 /// ranges over VMAX/VBAS, and unlisted fields fall back to
-/// recGblGetGraphicDouble's type range (recGbl.c getMaxRangeValues,
-/// 372-419, keyed by the declared DBF type).
+/// recGblGetGraphicDouble's type range.
+///
+/// That fallback is NOT motor's to define: it is `recGbl.c`'s
+/// `getMaxRangeValues` table, shared by every record type in C. This used
+/// to be a second copy of those constants here, and it had drifted —
+/// `DBF_CHAR` was mapped to 255/0, where C's `CHAR_MAX`/`CHAR_MIN`
+/// (recGbl.c:377-380) give 127/-128. Delegate to the one owner
+/// ([`rec_gbl_get_graphic_double`]) so the constants cannot drift again.
 fn limits_for(rec: &MotorRecord, field: &str) -> Option<(f64, f64)> {
     match field {
         "VAL" | "RBV" => Some((rec.limits.hlm, rec.limits.llm)),
@@ -1931,18 +1938,18 @@ fn limits_for(rec: &MotorRecord, field: &str) -> Option<(f64, f64)> {
             }
         }
         "VELO" => Some((rec.vel.vmax, rec.vel.vbas)),
-        _ => match MOTOR_FIELDS.iter().find(|f| f.name == field)?.dbf_type {
-            DbFieldType::Char | DbFieldType::UChar => Some((255.0, 0.0)),
-            DbFieldType::Short => Some((32767.0, -32768.0)),
-            DbFieldType::Enum | DbFieldType::UShort => Some((65535.0, 0.0)),
-            DbFieldType::Long => Some((2147483647.0, -2147483648.0)),
-            DbFieldType::ULong => Some((4294967295.0, 0.0)),
-            DbFieldType::Int64 => Some((9223372036854775808.0, -9223372036854775808.0)),
-            DbFieldType::UInt64 => Some((18446744073709551615.0, 0.0)),
-            DbFieldType::Float => Some((1e30, -1e30)),
-            DbFieldType::Double => Some((1e300, -1e300)),
-            DbFieldType::String => None,
-        },
+        _ => {
+            let desc = MOTOR_FIELDS.iter().find(|f| f.name == field)?;
+            // Same two discriminators C keys on, and the same ones
+            // `PropertySupport::narrowed_to_field` takes: a DBF_MENU field is
+            // `DbFieldType::Enum` in this port but has no case in C's switch,
+            // and a runtime-typed field is DBF_NOACCESS in the .dbd, which C
+            // reads statically (recGbl.c:151/:169) and also has no case.
+            rec_gbl_get_graphic_double(
+                (!desc.runtime_typed).then_some(desc.dbf_type),
+                desc.menu.is_some(),
+            )
+        }
     }
 }
 
@@ -1959,6 +1966,6 @@ fn alarm_limits_for(rec: &MotorRecord, field: &str) -> (f64, f64, f64, f64) {
             rec.alarm.lolo,
         )
     } else {
-        (f64::NAN, f64::NAN, f64::NAN, f64::NAN)
+        rec_gbl_get_alarm_double()
     }
 }

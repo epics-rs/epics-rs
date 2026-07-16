@@ -39,7 +39,14 @@ fn free_udp_port() -> u16 {
 /// must stay ours.
 fn hold_reuseport_udp() -> (Socket, u16) {
     let s = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+    // Same split as the driver's own bind (ip_port.rs `new_socket`, C
+    // drvAsynIPPort.c:465-469 USE_SO_REUSEADDR): SO_REUSEPORT where it
+    // exists, SO_REUSEADDR on Windows — socket2 exposes `set_reuse_port`
+    // only on unix, and Windows SO_REUSEADDR is what grants the co-bind.
+    #[cfg(unix)]
     s.set_reuse_port(true).unwrap();
+    #[cfg(not(unix))]
+    s.set_reuse_address(true).unwrap();
     let bind: SocketAddr = (Ipv4Addr::UNSPECIFIED, 0).into();
     s.bind(&bind.into()).unwrap();
     let port = s.local_addr().unwrap().as_socket().unwrap().port();

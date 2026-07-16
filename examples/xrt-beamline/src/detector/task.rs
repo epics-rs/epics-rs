@@ -1,3 +1,4 @@
+use asyn_rs::param::ParamValue;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -42,21 +43,17 @@ impl AcquisitionContext {
             .set_params_and_notify(
                 0,
                 vec![
-                    asyn_rs::request::ParamSetValue::Int32 {
-                        reason: self.ad.acquire_busy,
-                        addr: 0,
-                        value: 0,
-                    },
-                    asyn_rs::request::ParamSetValue::Int32 {
-                        reason: self.ad.status,
-                        addr: 0,
-                        value: ADStatus::Idle as i32,
-                    },
-                    asyn_rs::request::ParamSetValue::Int32 {
-                        reason: self.ad.acquire,
-                        addr: 0,
-                        value: 0,
-                    },
+                    asyn_rs::request::ParamSetValue::new(
+                        self.ad.acquire_busy,
+                        0,
+                        ParamValue::Int32(0),
+                    ),
+                    asyn_rs::request::ParamSetValue::new(
+                        self.ad.status,
+                        0,
+                        ParamValue::Int32(ADStatus::Idle as i32),
+                    ),
+                    asyn_rs::request::ParamSetValue::new(self.ad.acquire, 0, ParamValue::Int32(0)),
                 ],
             )
             .await
@@ -112,21 +109,21 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
             .set_params_and_notify(
                 0,
                 vec![
-                    asyn_rs::request::ParamSetValue::Int32 {
-                        reason: ctx.ad.num_images_counter,
-                        addr: 0,
-                        value: 0,
-                    },
-                    asyn_rs::request::ParamSetValue::Int32 {
-                        reason: ctx.ad.status,
-                        addr: 0,
-                        value: ADStatus::Acquire as i32,
-                    },
-                    asyn_rs::request::ParamSetValue::Int32 {
-                        reason: ctx.ad.acquire_busy,
-                        addr: 0,
-                        value: 1,
-                    },
+                    asyn_rs::request::ParamSetValue::new(
+                        ctx.ad.num_images_counter,
+                        0,
+                        ParamValue::Int32(0),
+                    ),
+                    asyn_rs::request::ParamSetValue::new(
+                        ctx.ad.status,
+                        0,
+                        ParamValue::Int32(ADStatus::Acquire as i32),
+                    ),
+                    asyn_rs::request::ParamSetValue::new(
+                        ctx.ad.acquire_busy,
+                        0,
+                        ParamValue::Int32(1),
+                    ),
                 ],
             )
             .await
@@ -291,92 +288,92 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
                 .set_params_and_notify(
                     0,
                     vec![
-                        asyn_rs::request::ParamSetValue::Int32 {
-                            reason: ctx.ad.base.array_counter,
-                            addr: 0,
-                            value: array_counter,
-                        },
-                        asyn_rs::request::ParamSetValue::Int32 {
-                            reason: ctx.ad.num_images_counter,
-                            addr: 0,
-                            value: num_counter,
-                        },
-                        asyn_rs::request::ParamSetValue::Int32 {
-                            reason: ctx.ad.base.array_size_x,
-                            addr: 0,
-                            value: nx as i32,
-                        },
-                        asyn_rs::request::ParamSetValue::Int32 {
-                            reason: ctx.ad.base.array_size_y,
-                            addr: 0,
-                            value: nz as i32,
-                        },
-                        asyn_rs::request::ParamSetValue::Int32 {
-                            reason: ctx.ad.base.array_size,
-                            addr: 0,
-                            value: (nx * nz * 2) as i32,
-                        },
-                        asyn_rs::request::ParamSetValue::Float64 {
-                            reason: ctx.ad.base.timestamp_rbv,
-                            addr: 0,
-                            value: frame.timestamp.as_f64(),
-                        },
+                        asyn_rs::request::ParamSetValue::new(
+                            ctx.ad.base.array_counter,
+                            0,
+                            ParamValue::Int32(array_counter),
+                        ),
+                        asyn_rs::request::ParamSetValue::new(
+                            ctx.ad.num_images_counter,
+                            0,
+                            ParamValue::Int32(num_counter),
+                        ),
+                        asyn_rs::request::ParamSetValue::new(
+                            ctx.ad.base.array_size_x,
+                            0,
+                            ParamValue::Int32(nx as i32),
+                        ),
+                        asyn_rs::request::ParamSetValue::new(
+                            ctx.ad.base.array_size_y,
+                            0,
+                            ParamValue::Int32(nz as i32),
+                        ),
+                        asyn_rs::request::ParamSetValue::new(
+                            ctx.ad.base.array_size,
+                            0,
+                            ParamValue::Int32((nx * nz * 2) as i32),
+                        ),
+                        asyn_rs::request::ParamSetValue::new(
+                            ctx.ad.base.timestamp_rbv,
+                            0,
+                            ParamValue::Float64(frame.timestamp.as_f64()),
+                        ),
                         // Simulation readbacks
-                        asyn_rs::request::ParamSetValue::Float64 {
-                            reason: ctx.xrt.sim_source_energy,
-                            addr: 0,
-                            value: last_source_energy,
-                        },
-                        asyn_rs::request::ParamSetValue::Float64 {
-                            reason: ctx.xrt.sim_dcm_energy,
-                            addr: 0,
-                            value: last_dcm_energy,
-                        },
-                        asyn_rs::request::ParamSetValue::Float64 {
-                            reason: ctx.xrt.sim_efficiency,
-                            addr: 0,
-                            value: efficiency * 100.0,
-                        },
-                        asyn_rs::request::ParamSetValue::Float64 {
-                            reason: ctx.xrt.sim_flux,
-                            addr: 0,
-                            value: flux,
-                        },
-                        asyn_rs::request::ParamSetValue::Float64 {
-                            reason: ctx.xrt.sim_centroid_x,
-                            addr: 0,
-                            value: cx,
-                        },
-                        asyn_rs::request::ParamSetValue::Float64 {
-                            reason: ctx.xrt.sim_centroid_z,
-                            addr: 0,
-                            value: cz,
-                        },
-                        asyn_rs::request::ParamSetValue::Float64 {
-                            reason: ctx.xrt.sim_fwhm_x,
-                            addr: 0,
-                            value: fwhm_x,
-                        },
-                        asyn_rs::request::ParamSetValue::Float64 {
-                            reason: ctx.xrt.sim_fwhm_z,
-                            addr: 0,
-                            value: fwhm_z,
-                        },
-                        asyn_rs::request::ParamSetValue::Float64 {
-                            reason: ctx.xrt.sim_rms_x,
-                            addr: 0,
-                            value: rms_x,
-                        },
-                        asyn_rs::request::ParamSetValue::Float64 {
-                            reason: ctx.xrt.sim_rms_z,
-                            addr: 0,
-                            value: rms_z,
-                        },
-                        asyn_rs::request::ParamSetValue::Int32 {
-                            reason: ctx.xrt.sim_nrays,
-                            addr: 0,
-                            value: n_captured as i32,
-                        },
+                        asyn_rs::request::ParamSetValue::new(
+                            ctx.xrt.sim_source_energy,
+                            0,
+                            ParamValue::Float64(last_source_energy),
+                        ),
+                        asyn_rs::request::ParamSetValue::new(
+                            ctx.xrt.sim_dcm_energy,
+                            0,
+                            ParamValue::Float64(last_dcm_energy),
+                        ),
+                        asyn_rs::request::ParamSetValue::new(
+                            ctx.xrt.sim_efficiency,
+                            0,
+                            ParamValue::Float64(efficiency * 100.0),
+                        ),
+                        asyn_rs::request::ParamSetValue::new(
+                            ctx.xrt.sim_flux,
+                            0,
+                            ParamValue::Float64(flux),
+                        ),
+                        asyn_rs::request::ParamSetValue::new(
+                            ctx.xrt.sim_centroid_x,
+                            0,
+                            ParamValue::Float64(cx),
+                        ),
+                        asyn_rs::request::ParamSetValue::new(
+                            ctx.xrt.sim_centroid_z,
+                            0,
+                            ParamValue::Float64(cz),
+                        ),
+                        asyn_rs::request::ParamSetValue::new(
+                            ctx.xrt.sim_fwhm_x,
+                            0,
+                            ParamValue::Float64(fwhm_x),
+                        ),
+                        asyn_rs::request::ParamSetValue::new(
+                            ctx.xrt.sim_fwhm_z,
+                            0,
+                            ParamValue::Float64(fwhm_z),
+                        ),
+                        asyn_rs::request::ParamSetValue::new(
+                            ctx.xrt.sim_rms_x,
+                            0,
+                            ParamValue::Float64(rms_x),
+                        ),
+                        asyn_rs::request::ParamSetValue::new(
+                            ctx.xrt.sim_rms_z,
+                            0,
+                            ParamValue::Float64(rms_z),
+                        ),
+                        asyn_rs::request::ParamSetValue::new(
+                            ctx.xrt.sim_nrays,
+                            0,
+                            ParamValue::Int32(n_captured as i32),
+                        ),
                     ],
                 )
                 .await

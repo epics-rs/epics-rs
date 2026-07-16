@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use asyn_rs::param::ParamValue;
 use asyn_rs::port_handle::PortHandle;
 use asyn_rs::request::ParamSetValue;
 use rumqttc::v5::{AsyncClient, Event, Incoming, MqttOptions};
@@ -142,11 +143,7 @@ pub async fn mqtt_event_loop(
                 let _ = port_handle
                     .set_params_and_notify(
                         0,
-                        vec![ParamSetValue::Int32 {
-                            reason: connected_param,
-                            addr: 0,
-                            value: 0,
-                        }],
+                        vec![ParamSetValue::new(connected_param, 0, ParamValue::Int32(0))],
                     )
                     .await;
                 is_connected = false;
@@ -166,11 +163,7 @@ async fn mark_connected(port_handle: &PortHandle, connected_param: usize, connec
     let _ = port_handle
         .set_params_and_notify(
             0,
-            vec![ParamSetValue::Int32 {
-                reason: connected_param,
-                addr: 0,
-                value: 1,
-            }],
+            vec![ParamSetValue::new(connected_param, 0, ParamValue::Int32(1))],
         )
         .await;
 }
@@ -290,52 +283,44 @@ async fn handle_incoming_message(
                 // UInt32Digital.
                 match decoded {
                     DecodedValue::Int32(v) => {
-                        batch_updates.push(ParamSetValue::Int32 {
-                            reason: *reason,
-                            addr: 0,
-                            value: v,
-                        });
+                        batch_updates.push(ParamSetValue::new(*reason, 0, ParamValue::Int32(v)));
                     }
                     DecodedValue::Float64(v) => {
-                        batch_updates.push(ParamSetValue::Float64 {
-                            reason: *reason,
-                            addr: 0,
-                            value: v,
-                        });
+                        batch_updates.push(ParamSetValue::new(*reason, 0, ParamValue::Float64(v)));
                     }
                     DecodedValue::String(v) => {
                         // asyn octet store truncates at the first NUL
                         // (setStringParam(index, val.c_str()), drvMqtt.cpp:299).
-                        batch_updates.push(ParamSetValue::Octet {
-                            reason: *reason,
-                            addr: 0,
-                            value: octet_cstr(&v).to_string(),
-                        });
+                        batch_updates.push(ParamSetValue::new(
+                            *reason,
+                            0,
+                            ParamValue::Octet(octet_cstr(&v).to_string()),
+                        ));
                     }
                     DecodedValue::Float64Array(v) => {
-                        batch_updates.push(ParamSetValue::Float64Array {
-                            reason: *reason,
-                            addr: 0,
-                            value: v,
-                        });
+                        batch_updates.push(ParamSetValue::new(
+                            *reason,
+                            0,
+                            ParamValue::Float64Array(v.into()),
+                        ));
                     }
                     DecodedValue::UInt32(v) => {
-                        batch_updates.push(ParamSetValue::UInt32Digital {
-                            reason: *reason,
-                            addr: 0,
-                            value: v,
-                            mask: 0xFFFF_FFFF,
-                            // Inbound MQTT value: changed bits derive from the
-                            // value merge; no forced interrupt mask.
-                            interrupt_mask: 0,
-                        });
+                        // Inbound MQTT value: changed bits derive from the value
+                        // merge; no forced interrupt mask.
+                        batch_updates.push(ParamSetValue::uint32_digital(
+                            *reason,
+                            0,
+                            v,
+                            0xFFFF_FFFF,
+                            0,
+                        ));
                     }
                     DecodedValue::Int32Array(v) => {
-                        batch_updates.push(ParamSetValue::Int32Array {
-                            reason: *reason,
-                            addr: 0,
-                            value: v,
-                        });
+                        batch_updates.push(ParamSetValue::new(
+                            *reason,
+                            0,
+                            ParamValue::Int32Array(v.into()),
+                        ));
                     }
                 }
             }

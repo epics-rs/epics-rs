@@ -1023,6 +1023,62 @@ impl ParamList {
         }
     }
 
+    /// Store a value of **any** parameter type — the single owner of the
+    /// "set a parameter from a `ParamValue`" dispatch.
+    ///
+    /// Every caller that holds a value whose type is only known at runtime (the
+    /// port actor applying a [`crate::request::ParamSetValue`], above all) goes
+    /// through this instead of re-enumerating the type set at the call site. The
+    /// match is exhaustive, so a new [`ParamValue`] variant is a compile error
+    /// here rather than a value that silently never reaches the store.
+    ///
+    /// `UInt32Digital` is stored with a full write mask and no forced interrupt
+    /// bits; use [`Self::set_uint32`] directly for C `setUIntDigitalParam`'s
+    /// masked set.
+    pub fn set_value(&mut self, index: usize, addr: i32, value: ParamValue) -> AsynResult<()> {
+        let type_name = value.type_name();
+        match value {
+            ParamValue::Int32(v) => self.set_int32(index, addr, v),
+            ParamValue::Int64(v) => self.set_int64(index, addr, v),
+            ParamValue::Float64(v) => self.set_float64(index, addr, v),
+            ParamValue::Octet(s) => self.set_string(index, addr, s),
+            ParamValue::UInt32Digital(v) => self.set_uint32(index, addr, v, u32::MAX, 0),
+            ParamValue::Int8Array(a) => self.set_int8_array(index, addr, a.to_vec()),
+            ParamValue::Int16Array(a) => self.set_int16_array(index, addr, a.to_vec()),
+            ParamValue::Int32Array(a) => self.set_int32_array(index, addr, a.to_vec()),
+            ParamValue::Int64Array(a) => self.set_int64_array(index, addr, a.to_vec()),
+            ParamValue::Float32Array(a) => self.set_float32_array(index, addr, a.to_vec()),
+            ParamValue::Float64Array(a) => self.set_float64_array(index, addr, a.to_vec()),
+            ParamValue::Enum {
+                index: idx,
+                choices,
+            } => {
+                // Choices first — `set_enum_choices` clamps the index to the new
+                // table, so setting the index afterwards is what sticks. An empty
+                // table means "index only", leaving the parameter's own choices.
+                if !choices.is_empty() {
+                    self.set_enum_choices(index, addr, choices)?;
+                }
+                self.set_enum_index(index, addr, idx)
+            }
+            ParamValue::GenericPointer(p) => self.set_generic_pointer(index, addr, p),
+            // `UInt64`/`UInt64Array` are declared in `ParamValue`/`ParamType` but
+            // the store has no setter *or* getter for them (they are a Rust
+            // extension with no upstream asyn interface — see
+            // `interfaces::InterfaceType::UInt64`), so there is no store state a
+            // caller could reach through them. Refuse loudly rather than pretend
+            // the value landed.
+            ParamValue::UInt64(_) | ParamValue::UInt64Array(_) => Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!("{type_name} parameters have no store accessor; nothing to set"),
+            }),
+            ParamValue::Undefined => Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: "cannot set a parameter to Undefined".into(),
+            }),
+        }
+    }
+
     /// Check if a parameter has been explicitly set (C parity: valueDefined).
     pub fn is_param_defined(&self, index: usize, addr: i32) -> AsynResult<bool> {
         Ok(self.get_entry(index, addr)?.defined)

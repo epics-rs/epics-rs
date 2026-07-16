@@ -1719,6 +1719,82 @@ mod tests {
         assert_eq!(observed.get("Q:group").map(String::as_str), Some("demo"));
     }
 
+    /// Regression: `wire_device_support` must bind records in **database load
+    /// order**, the order C's `initDevSup` walks
+    /// (`dbFirstRecord`/`dbNextRecord`). Real device support depends on it:
+    /// epics-modules/opcua's element records refuse to init unless their
+    /// `opcuaItem` record bound first (`linkParser.cpp:226-234`), and the
+    /// shipped databases guarantee that only by declaring the item record
+    /// first. This walked `all_record_names()` when that returned `HashMap`
+    /// keys, so binding ran in hash order — not load order, and not even
+    /// stable across runs of the same binary.
+    #[tokio::test]
+    async fn wire_device_support_binds_in_database_load_order() {
+        use crate::server::device_support::{DeviceReadOutcome, DeviceSupport};
+        use crate::server::records::ai::AiRecord;
+        use std::sync::{Arc as StdArc, Mutex as StdMutex};
+
+        struct NoopDev;
+        impl DeviceSupport for NoopDev {
+            fn write(&mut self, _record: &mut dyn crate::server::record::Record) -> CaResult<()> {
+                Ok(())
+            }
+            fn dtyp(&self) -> &str {
+                "SeqDev"
+            }
+            fn read(
+                &mut self,
+                _record: &mut dyn crate::server::record::Record,
+            ) -> CaResult<DeviceReadOutcome> {
+                Ok(DeviceReadOutcome::ok())
+            }
+        }
+
+        // A fixed permutation of 0..24 — load order is deliberately neither
+        // lexical nor hash order, so a pass cannot be a coincidence.
+        let names: Vec<String> = (0..24)
+            .map(|i: usize| format!("LOAD:{:02}", (i * 7 + 3) % 24))
+            .collect();
+
+        let db = Arc::new(PvDatabase::new());
+        for name in &names {
+            db.add_record(name, Box::new(AiRecord::new(0.0)))
+                .await
+                .unwrap();
+            let rec = db.get_record(name).await.unwrap();
+            let mut inst = rec.write().await;
+            inst.common.dtyp = "SeqDev".to_string();
+            // `DeviceSupportContext` carries the links, not the record name;
+            // echoing the name through INP is how the test observes which
+            // record is being wired.
+            inst.common.inp = format!("@{name}");
+        }
+
+        let wired: StdArc<StdMutex<Vec<String>>> = StdArc::new(StdMutex::new(Vec::new()));
+        let captured = wired.clone();
+        let dynamic: Option<DynamicDeviceSupportFactory> =
+            Some(Box::new(move |ctx: &DeviceSupportContext| {
+                captured
+                    .lock()
+                    .unwrap()
+                    .push(ctx.inp.trim_start_matches('@').to_string());
+                Some(Box::new(NoopDev) as Box<dyn DeviceSupport>)
+            }));
+
+        let factories: HashMap<String, DeviceSupportFactory> = HashMap::new();
+        let count = wire_device_support(&db, &factories, &dynamic)
+            .await
+            .unwrap();
+        assert_eq!(count, names.len());
+
+        let wired = std::mem::take(&mut *wired.lock().unwrap());
+        assert_eq!(
+            wired, names,
+            "device support must bind in database load order (C initDevSup), \
+             not HashMap hash order"
+        );
+    }
+
     /// Regression: an `asyn:READBACK` OUTPUT record processed because of a
     /// driver interrupt callback must READ the callback value back into VAL
     /// and MUST NOT write it to the driver. Writing it re-asserts the

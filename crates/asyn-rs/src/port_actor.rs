@@ -1753,62 +1753,47 @@ impl PortActor {
             }
             RequestOp::CallParamCallbacks { addr, updates } => {
                 let base = self.driver.base_mut();
+                // One dispatch for every parameter type (`ParamList::set_value`),
+                // so this carrier and the store cannot support different type sets.
+                let mut failed: Option<AsynError> = None;
                 for u in updates {
-                    match u {
-                        crate::request::ParamSetValue::Int32 {
+                    let outcome = match u {
+                        crate::request::ParamSetValue::Value {
                             reason,
                             addr,
                             value,
-                        } => {
-                            let _ = base.set_int32_param(*reason, *addr, *value);
-                        }
-                        crate::request::ParamSetValue::Float64 {
-                            reason,
-                            addr,
-                            value,
-                        } => {
-                            let _ = base.set_float64_param(*reason, *addr, *value);
-                        }
-                        crate::request::ParamSetValue::Octet {
-                            reason,
-                            addr,
-                            value,
-                        } => {
-                            let _ = base.params.set_string(*reason, *addr, value.clone());
-                        }
-                        crate::request::ParamSetValue::Float64Array {
-                            reason,
-                            addr,
-                            value,
-                        } => {
-                            let _ = base.params.set_float64_array(*reason, *addr, value.clone());
-                        }
-                        crate::request::ParamSetValue::Int32Array {
-                            reason,
-                            addr,
-                            value,
-                        } => {
-                            let _ = base.params.set_int32_array(*reason, *addr, value.clone());
-                        }
+                        } => base.params.set_value(*reason, *addr, value.clone()),
                         crate::request::ParamSetValue::UInt32Digital {
                             reason,
                             addr,
                             value,
                             mask,
                             interrupt_mask,
-                        } => {
-                            let _ = base.set_uint32_param(
-                                *reason,
-                                *addr,
-                                *value,
-                                *mask,
-                                *interrupt_mask,
+                        } => base.set_uint32_param(*reason, *addr, *value, *mask, *interrupt_mask),
+                    };
+                    // A set that fails (a value the parameter cannot hold) is
+                    // reported, not swallowed: C `asynPortDriver::setIntegerParam`
+                    // asynPrints the paramList error at ASYN_TRACE_ERROR and
+                    // returns the status. The remaining updates still land and the
+                    // callbacks still fire — one bad update must not strand the
+                    // good ones — and the first error is returned to whoever waits
+                    // on the reply.
+                    if let Err(e) = outcome {
+                        if let Some(trace) = base.trace.clone() {
+                            trace.output(
+                                &base.port_name,
+                                crate::trace::TraceMask::ERROR,
+                                &format!("callParamCallbacks: param set failed: {e}\n"),
                             );
                         }
+                        failed.get_or_insert(e);
                     }
                 }
                 base.call_param_callbacks(*addr)?;
-                Ok(RequestResult::write_ok())
+                match failed {
+                    Some(e) => Err(e),
+                    None => Ok(RequestResult::write_ok()),
+                }
             }
             RequestOp::GetOption { key } => {
                 let val = self.driver.get_option(key)?;
@@ -3716,11 +3701,11 @@ mod tests {
                 &tx,
                 RequestOp::CallParamCallbacks {
                     addr: 0,
-                    updates: vec![crate::request::ParamSetValue::Int32 {
-                        reason: val,
-                        addr: 0,
-                        value: 42,
-                    }],
+                    updates: vec![crate::request::ParamSetValue::new(
+                        val,
+                        0,
+                        crate::param::ParamValue::Int32(42),
+                    )],
                 },
                 user,
             )

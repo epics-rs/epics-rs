@@ -5,36 +5,32 @@ use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
 use std::time::SystemTime;
 
 use crate::error::AsynStatus;
+use crate::param::ParamValue;
 
 /// A param value to set directly in the store (no writeInt32/on_param_change).
 /// Mirrors C ADCore's setIntegerParam/setDoubleParam.
+///
+/// The value is a [`ParamValue`], not one variant per type: this carrier used to
+/// enumerate its own subset of the parameter types (Int32/Float64/Octet/
+/// Int32Array/Float64Array/UInt32Digital), so a driver thread pushing any other
+/// supported type — `Int64`, `Int8Array`, `Int16Array`, `Int64Array`,
+/// `Float32Array`, `Enum`, `GenericPointer` — simply had no variant to put it in.
+/// Carrying the store's own value type means the two type sets cannot drift
+/// apart again: the actor applies it through the single [`crate::param::ParamList::set_value`]
+/// dispatch, whose exhaustive match makes a new `ParamValue` variant a compile
+/// error rather than an update that never arrives.
 #[derive(Debug, Clone)]
 pub enum ParamSetValue {
-    Int32 {
+    /// Set a parameter of any type (C `setIntegerParam` / `setDoubleParam` /
+    /// `setStringParam` / `doCallbacksXxxArray` …).
+    Value {
         reason: usize,
         addr: i32,
-        value: i32,
+        value: ParamValue,
     },
-    Float64 {
-        reason: usize,
-        addr: i32,
-        value: f64,
-    },
-    Octet {
-        reason: usize,
-        addr: i32,
-        value: String,
-    },
-    Float64Array {
-        reason: usize,
-        addr: i32,
-        value: Vec<f64>,
-    },
-    Int32Array {
-        reason: usize,
-        addr: i32,
-        value: Vec<i32>,
-    },
+    /// asynUInt32Digital masked set — C `setUIntDigitalParam(reason, value,
+    /// mask, interruptMask)`, whose write mask and forced-callback mask a plain
+    /// [`Self::Value`] has no room for.
     UInt32Digital {
         reason: usize,
         addr: i32,
@@ -45,6 +41,35 @@ pub enum ParamSetValue {
         /// interruptMask)`); `0` for a plain value set.
         interrupt_mask: u32,
     },
+}
+
+impl ParamSetValue {
+    /// Set `reason` at `addr` to `value` — any parameter type.
+    pub fn new(reason: usize, addr: i32, value: ParamValue) -> Self {
+        Self::Value {
+            reason,
+            addr,
+            value,
+        }
+    }
+
+    /// C `setUIntDigitalParam`: store `value & mask`, and force `interrupt_mask`
+    /// bits into the callback mask even when the stored value is unchanged.
+    pub fn uint32_digital(
+        reason: usize,
+        addr: i32,
+        value: u32,
+        mask: u32,
+        interrupt_mask: u32,
+    ) -> Self {
+        Self::UInt32Digital {
+            reason,
+            addr,
+            value,
+            mask,
+            interrupt_mask,
+        }
+    }
 }
 
 /// Operation the worker thread will dispatch to the port driver.

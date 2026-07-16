@@ -616,7 +616,11 @@ fn normalize_ca_error(msg: &str) -> String {
 /// far below the OS pipe buffer. The one tool that can emit unbounded output —
 /// `camonitor` — is deliberately *not* run through this path; it streams
 /// (see [`monitor`]).
-fn wait_bounded(
+///
+/// Shared with [`crate::pvatool`]: the PVA instrument owes the identical
+/// "a tool that did not finish is an ERROR" guarantee, and a second copy of
+/// this loop would be a second place for that rule to rot.
+pub(crate) fn wait_bounded(
     mut child: std::process::Child,
     timeout: Duration,
 ) -> Result<std::process::Output, String> {

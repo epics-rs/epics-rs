@@ -10,15 +10,40 @@
 //! second `udp&` port on the same local port failed `EADDRINUSE` — the one
 //! configuration the `&` suffix is for.
 
+use socket2::{Domain, Protocol, Socket, Type};
+use std::net::{Ipv4Addr, SocketAddr};
+
 use asyn_rs::drivers::ip_port::DrvAsynIPPort;
 use asyn_rs::port::PortDriver;
 use asyn_rs::user::AsynUser;
 
-/// Take a local UDP port by binding one and dropping it: the two `udp&` ports
-/// below both bind that number.
+/// Take a local UDP port by binding one and dropping it: the two `udp` ports
+/// below both bind that number. Used only by the negative-control test, which
+/// cannot hold the number (the first plain bind must own it) and instead retries
+/// the whole scenario on a steal — see there.
 fn free_udp_port() -> u16 {
     let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     s.local_addr().unwrap().port()
+}
+
+/// Hold a UDP port alive for the whole test so no neighbour's probe can steal
+/// the number in the drop→rebind window (the probe-then-rebind flake).
+///
+/// The driver binds its `udp&` local endpoint on `0.0.0.0:<port>` with
+/// `SO_REUSEPORT` set before the bind (`ip_port.rs::new_socket` /
+/// `connect_udp`). Holding a `SO_REUSEPORT` socket on the *same* `0.0.0.0:<port>`
+/// therefore (a) reserves the number — a plain-bind neighbour is refused
+/// `EADDRINUSE`, and the ephemeral allocator will not hand it out — while
+/// (b) still letting the driver's two `udp&` ports join the same REUSEPORT group.
+/// Returns `(held socket, port)`; keep the socket alive for as long as the number
+/// must stay ours.
+fn hold_reuseport_udp() -> (Socket, u16) {
+    let s = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+    s.set_reuse_port(true).unwrap();
+    let bind: SocketAddr = (Ipv4Addr::UNSPECIFIED, 0).into();
+    s.bind(&bind.into()).unwrap();
+    let port = s.local_addr().unwrap().as_socket().unwrap().port();
+    (s, port)
 }
 
 /// ```text
@@ -30,8 +55,15 @@ fn free_udp_port() -> u16 {
 /// only works if the option precedes the bind.
 #[test]
 fn two_udp_reuseport_ports_share_one_local_port() {
-    let peer = free_udp_port();
-    let local = free_udp_port();
+    // `local` is what both ports re-bind, so hold it race-proof with a REUSEPORT
+    // socket the driver's own REUSEPORT binds can share. `peer` is only a
+    // destination address (the driver never binds it, C :513 does not connect a
+    // datagram socket), so a plain held socket keeps its number ours too. Holding
+    // both across the whole test closes the probe-then-rebind window without
+    // changing the honest path — the ports still bind `local`, now alongside our
+    // held member of the same REUSEPORT group.
+    let (_hold_local, local) = hold_reuseport_udp();
+    let (_hold_peer, peer) = hold_reuseport_udp();
     let spec = format!("127.0.0.1:{peer}:{local} udp&");
 
     let mut first = DrvAsynIPPort::new("R1862A", &spec).unwrap();
@@ -55,20 +87,41 @@ fn two_udp_reuseport_ports_share_one_local_port() {
 /// `FLAG_SO_REUSEPORT`).
 #[test]
 fn plain_udp_still_refuses_a_second_bind_of_one_local_port() {
-    let peer = free_udp_port();
-    let local = free_udp_port();
-    let spec = format!("127.0.0.1:{peer}:{local} udp");
+    // This test cannot hold `local` — the whole point is that the FIRST plain
+    // bind must own it exclusively, which a held socket would itself block. So
+    // key the flake out with a bounded retry instead: a plain-`udp` first bind of
+    // a truly-free port always succeeds, so a first-bind failure can only be a
+    // neighbour stealing the number in the probe→bind window; retry with a fresh
+    // number. The SECOND bind's `EADDRINUSE` is the property under test — that is
+    // asserted, never retried.
+    for _ in 0..50 {
+        let peer = free_udp_port();
+        let local = free_udp_port();
+        let spec = format!("127.0.0.1:{peer}:{local} udp");
 
-    let mut first = DrvAsynIPPort::new("R1862C", &spec).unwrap();
-    first.connect(&AsynUser::default()).expect("first udp bind");
+        let mut first = DrvAsynIPPort::new("R1862C", &spec).unwrap();
+        match first.connect(&AsynUser::default()) {
+            Ok(()) => {}
+            // The driver wraps the bind EADDRINUSE as "UDP bind '...' failed"
+            // (ip_port.rs::connect_udp). On the first bind that can only be a
+            // steal of the just-probed number — try a fresh one.
+            Err(e) if e.message().contains("UDP bind") => continue,
+            Err(e) => panic!(
+                "first udp bind failed for a non-steal reason: {:?}",
+                e.message()
+            ),
+        }
 
-    let mut second = DrvAsynIPPort::new("R1862D", &spec).unwrap();
-    let err = second
-        .connect(&AsynUser::default())
-        .expect_err("without the & suffix the local port is exclusive");
-    assert!(
-        err.message().contains("UDP bind"),
-        "the refusal must come from the bind, got {:?}",
-        err.message()
-    );
+        let mut second = DrvAsynIPPort::new("R1862D", &spec).unwrap();
+        let err = second
+            .connect(&AsynUser::default())
+            .expect_err("without the & suffix the local port is exclusive");
+        assert!(
+            err.message().contains("UDP bind"),
+            "the refusal must come from the bind, got {:?}",
+            err.message()
+        );
+        return;
+    }
+    panic!("a neighbour kept stealing the probed local port across 50 attempts");
 }

@@ -1729,6 +1729,43 @@ mod tests {
         idx
     }
 
+    /// Drive a slot read until the peer's abortive close surfaces, then return the
+    /// failure. Two platform facts make a single read unreliable:
+    ///
+    /// * The RST from `SO_LINGER(0)` + `close()` is not always visible on the
+    ///   server's first read — on macOS it can take an extra poll interval — so
+    ///   this retries past a non-teardown `asynTimeout` (C's caller likewise
+    ///   re-drives `readIt` rather than treating one `EWOULDBLOCK` as a
+    ///   disconnect, drvAsynIPPort.c:807-812).
+    /// * The close does not surface as the *same* status on every platform.
+    ///   C runs `closeConnection` — which frees the slot (`exceptionDisconnect`,
+    ///   :216 → drvAsynIPServerPort.c:344-350) — on BOTH a fatal errno
+    ///   (`asynError`, :805) and a stream EOF `recv()==0` (`asynSuccess`+END,
+    ///   :819). Linux delivers an abortive close as `ECONNRESET` (the port's
+    ///   `asynError`); macOS/BSD can deliver the very same close as a plain
+    ///   `recv()==0` EOF (the port's `asynDisconnected`). The teardown is the
+    ///   invariant; the reported status is the platform's recv detail.
+    ///
+    /// So the caller asserts the teardown and accepts either `Error` or
+    /// `Disconnected` (never a retryable `Timeout` — that would mean the socket
+    /// is intact, the regression these tests guard).
+    fn read_until_torn_down(mut read: impl FnMut() -> AsynResult<usize>) -> AsynError {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match read() {
+                Ok(n) => panic!("a reset peer cannot deliver {n} bytes"),
+                Err(e) if e.status() == AsynStatus::Timeout => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the peer's abortive close never surfaced as a read failure"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) => return e,
+            }
+        }
+    }
+
     #[test]
     fn parse_basic_ipv4() {
         let cfg = IpServerConfig::parse("0.0.0.0:8080").unwrap();
@@ -2010,12 +2047,17 @@ mod tests {
             .with_addr(0)
             .with_timeout(Duration::from_millis(200));
         let mut buf = [0u8; 64];
-        let err = srv
-            .read_octet(&read_user, &mut buf)
-            .expect_err("a reset peer cannot deliver bytes");
-        // C reports the teardown branch as asynError with "%s read error: %s"
-        // (drvAsynIPPort.c:801-805) — never as a retryable asynTimeout.
-        assert_eq!(err.status(), AsynStatus::Error, "got {err:?}");
+        // C runs closeConnection — and so frees the slot — on both the fatal-errno
+        // branch (asynError, drvAsynIPPort.c:805) and the recv==0 EOF branch
+        // (asynSuccess+END, :819); Linux surfaces this RST as ECONNRESET (Error),
+        // macOS/BSD can surface it as a plain EOF (Disconnected). Poll past a
+        // not-yet-visible RST and accept either teardown status — never a
+        // retryable Timeout.
+        let err = read_until_torn_down(|| srv.read_octet(&read_user, &mut buf));
+        assert!(
+            matches!(err.status(), AsynStatus::Error | AsynStatus::Disconnected),
+            "an abortive close is C's fatal-errno asynError or a recv==0 EOF, got {err:?}"
+        );
 
         assert!(
             !srv.slots[0].is_occupied(),
@@ -2150,10 +2192,14 @@ mod tests {
 
         let read_user = AsynUser::default().with_timeout(Duration::from_millis(200));
         let mut buf = [0u8; 64];
-        let err = child
-            .read_octet(&read_user, &mut buf)
-            .expect_err("a reset peer cannot deliver bytes");
-        assert_eq!(err.status(), AsynStatus::Error, "got {err:?}");
+        // Same abortive-close portability as `a_fatal_read_error_frees_the_client_slot`:
+        // poll past a not-yet-visible RST and accept either C teardown status
+        // (fatal-errno asynError on Linux, recv==0 EOF asynDisconnected on macOS).
+        let err = read_until_torn_down(|| child.read_octet(&read_user, &mut buf));
+        assert!(
+            matches!(err.status(), AsynStatus::Error | AsynStatus::Disconnected),
+            "an abortive close is C's fatal-errno asynError or a recv==0 EOF, got {err:?}"
+        );
         assert!(
             !child.base().is_connected(),
             "the child's own read tore the slot down (C closeConnection + exceptionDisconnect)"

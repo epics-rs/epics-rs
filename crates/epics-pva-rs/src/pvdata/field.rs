@@ -95,6 +95,19 @@ impl FieldDesc {
         find_bit_for_path(self, 0, &parts).map(|(idx, _)| idx)
     }
 
+    /// Resolve a dotted field path to its `(start, end)` bit span —
+    /// `start` is the field's own bit, `end` is one past its last
+    /// descendant (`start + total_bits`). Non-structure fields span one
+    /// bit. Returns `None` for a missing segment; the empty path is the
+    /// root's full span.
+    pub(crate) fn bit_span_for_path(&self, path: &str) -> Option<(usize, usize)> {
+        if path.is_empty() {
+            return Some((0, self.total_bits()));
+        }
+        let parts: Vec<&str> = path.split('.').collect();
+        find_bit_for_path(self, 0, &parts)
+    }
+
     /// True iff this descriptor names a string type (Scalar/String).
     pub fn is_string_like(&self) -> bool {
         matches!(self, FieldDesc::Scalar(ScalarType::String))

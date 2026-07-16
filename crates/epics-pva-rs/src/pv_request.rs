@@ -186,8 +186,9 @@ fn build_with_pipeline(fields: &[&str], queue_size: u32, order: ByteOrder) -> Ve
 ///
 /// Rules:
 /// - The pvRequest has shape `structure { structure field { ... } }`.
-///   Each direct child of `field` selects the matching top-level field
-///   in `value_desc` and (recursively) its sub-fields named.
+///   Each entry of `field` — nested (`value { index {} }`) or a literal
+///   dotted name (`"value.index"`), both legal per pvxs's flattened
+///   `mlookup` matching — selects the named field of `value_desc`.
 /// - An empty `field {}` (no children) selects *every* bit (root + all
 ///   descendants).
 /// - Names in pvRequest that don't exist in `value_desc` are silently
@@ -305,10 +306,22 @@ fn mask_for_named_selector(
 /// (`field` / `putField` / `getField`) into a field `BitSet` over
 /// `value_desc`, using pvData spec §5.4 depth-first bit numbering.
 ///
-/// An empty selector (`{}`) selects every bit (root + all descendants);
-/// otherwise each named child selects the matching top-level field of
-/// `value_desc` and, recursively, the sub-fields it names. Returns
-/// `Err(EmptyMask)` when no named child matched any existing field.
+/// pvxs `request2mask` (pvrequest.cpp:13-52) iterates the request's
+/// *flattened* member map (`rdesc->mlookup`), whose keys include dotted
+/// paths propagated through nested sub-structures (type.cpp:270-279).
+/// Two request shapes are therefore equivalent on the wire and both must
+/// resolve: nested `field { value { index {} } }` AND a child literally
+/// named `"value.index"` (what a foreign client's low-level builder may
+/// emit — the Rust ≤0.17.x `build_pv_request_fields` did exactly this).
+/// Each entry resolves against the value descriptor's own flattened map
+/// (`desc->mlookup.find(pair.first)`), i.e. a dotted-path lookup.
+///
+/// An empty selector (`{}`) selects every bit (root + all descendants).
+/// A matched entry sets its own bit only — plus its whole sub-tree when
+/// the request child has no sub-selectors (pvrequest.cpp:41-46). Only
+/// structure-typed request children participate (pvrequest.cpp:31); a
+/// scalar child is skipped exactly as pvxs skips it. Returns
+/// `Err(EmptyMask)` when no entry matched any existing field.
 fn mask_from_selector_fields(
     value_desc: &crate::pvdata::FieldDesc,
     selector_fields: &[(String, crate::pvdata::FieldDesc)],
@@ -320,18 +333,50 @@ fn mask_from_selector_fields(
         return Ok(select_all_bits(value_desc));
     }
 
-    // Walk each requested top-level name and recursively select bits.
+    // Flatten the selector into dotted entries, mirroring the request
+    // side's `mlookup` (nested children contribute "parent.child" keys;
+    // propagation descends structures only, type.cpp:274).
+    fn flatten<'a>(
+        prefix: &str,
+        fields: &'a [(String, FieldDesc)],
+        out: &mut Vec<(String, &'a FieldDesc)>,
+    ) {
+        for (name, child) in fields {
+            if name.is_empty() {
+                continue;
+            }
+            if let FieldDesc::Structure { fields: sub, .. } = child {
+                let path = if prefix.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{prefix}.{name}")
+                };
+                flatten(&path, sub, out);
+                out.push((path, child));
+            }
+        }
+    }
+    let mut entries: Vec<(String, &FieldDesc)> = Vec::new();
+    flatten("", selector_fields, &mut entries);
+
     let mut mask = crate::proto::BitSet::new();
     let mut any_matched = false;
-    if let FieldDesc::Structure { fields, .. } = value_desc {
-        let mut child_bit = 1usize;
-        for (name, child_desc) in fields {
-            if let Some((_, sub_request)) = selector_fields.iter().find(|(n, _)| n == name) {
-                any_matched = true;
-                // Mark this field and recurse.
-                mark_path(&mut mask, child_bit, child_desc, sub_request);
+    for (path, req_child) in &entries {
+        let Some((start, end)) = value_desc.bit_span_for_path(path) else {
+            // Request of a non-existent field — silently skipped
+            // (pvrequest.cpp:48-50).
+            continue;
+        };
+        any_matched = true;
+        mask.set(start);
+        // No sub-selectors → implicit select of the entire sub-tree
+        // (pvrequest.cpp:41-46). For a leaf the span is the single bit.
+        let leaf_selector =
+            matches!(req_child, FieldDesc::Structure { fields, .. } if fields.is_empty());
+        if leaf_selector {
+            for bit in start..end {
+                mask.set(bit);
             }
-            child_bit += child_desc.total_bits();
         }
     }
 
@@ -340,42 +385,6 @@ fn mask_from_selector_fields(
     }
     mask.set(0); // root — pvxs `testpvreq.cpp` request/selection-mask parity
     Ok(mask)
-}
-
-/// Recursively mark `value_desc`'s bit (at `bit_offset`) plus any
-/// requested sub-fields as defined by `sub_request`.
-fn mark_path(
-    mask: &mut crate::proto::BitSet,
-    bit_offset: usize,
-    value_desc: &crate::pvdata::FieldDesc,
-    sub_request: &crate::pvdata::FieldDesc,
-) {
-    use crate::pvdata::FieldDesc;
-    mask.set(bit_offset);
-
-    // Pick out the named sub-fields requested.
-    let sub_fields = match sub_request {
-        FieldDesc::Structure { fields, .. } => fields,
-        _ => return,
-    };
-    if sub_fields.is_empty() {
-        // Empty {} selects this entire sub-tree.
-        let total = value_desc.total_bits();
-        for i in 0..total {
-            mask.set(bit_offset + i);
-        }
-        return;
-    }
-
-    if let FieldDesc::Structure { fields, .. } = value_desc {
-        let mut child_bit = bit_offset + 1;
-        for (name, child_desc) in fields {
-            if let Some((_, sub2)) = sub_fields.iter().find(|(n, _)| n == name) {
-                mark_path(mask, child_bit, child_desc, sub2);
-            }
-            child_bit += child_desc.total_bits();
-        }
-    }
 }
 
 /// Errors from [`request_to_mask`].
@@ -1763,6 +1772,151 @@ mod tests {
         assert!(
             request_to_mask(&ntenum, Some(&req)).is_ok(),
             "request_to_mask must resolve a nested value.index path"
+        );
+    }
+
+    /// NTEnum-shaped fixture. Bit numbering (pvData §5.4 DFS):
+    /// root=0, value=1, value.index=2, alarm=3.
+    fn ntenum_desc() -> FieldDesc {
+        use crate::pvdata::ScalarType;
+        FieldDesc::Structure {
+            struct_id: "epics:nt/NTEnum:1.0".to_string(),
+            fields: vec![
+                (
+                    "value".to_string(),
+                    FieldDesc::Structure {
+                        struct_id: String::new(),
+                        fields: vec![("index".to_string(), FieldDesc::Scalar(ScalarType::Int))],
+                    },
+                ),
+                (
+                    "alarm".to_string(),
+                    FieldDesc::Structure {
+                        struct_id: String::new(),
+                        fields: Vec::new(),
+                    },
+                ),
+            ],
+        }
+    }
+
+    /// pvRequest `structure { field { <children> } }` with the given
+    /// selector children.
+    fn req_with_field_children(children: Vec<(String, FieldDesc)>) -> FieldDesc {
+        FieldDesc::Structure {
+            struct_id: String::new(),
+            fields: vec![(
+                "field".to_string(),
+                FieldDesc::Structure {
+                    struct_id: String::new(),
+                    fields: children,
+                },
+            )],
+        }
+    }
+
+    fn empty_struct() -> FieldDesc {
+        FieldDesc::Structure {
+            struct_id: String::new(),
+            fields: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn dotted_literal_selector_matches_via_flattened_lookup() {
+        // pvxs `request2mask` iterates `rdesc->mlookup`, whose keys are
+        // flattened dotted paths (type.cpp:270-279), and resolves each
+        // against `desc->mlookup` — so a selector child literally named
+        // "value.index" (what the Rust ≤0.17.x `build_pv_request_fields`
+        // put on the wire for NTEnum puts) selects the nested field.
+        // Only the resolved offset is set (pvrequest.cpp:38): index's
+        // bit, NOT the intermediate `value` struct bit.
+        let req = req_with_field_children(vec![("value.index".to_string(), empty_struct())]);
+        let mask = request_to_mask(&ntenum_desc(), Some(&req))
+            .expect("dotted literal selector must resolve");
+        assert!(mask.get(0), "root bit");
+        assert!(!mask.get(1), "intermediate `value` struct bit stays clear");
+        assert!(mask.get(2), "value.index leaf bit");
+        assert!(!mask.get(3), "alarm not selected");
+    }
+
+    #[test]
+    fn dotted_literal_selector_unmatched_errors() {
+        let req = req_with_field_children(vec![("value.noSuch".to_string(), empty_struct())]);
+        assert_eq!(
+            request_to_mask(&ntenum_desc(), Some(&req)),
+            Err(RequestMaskError::EmptyMask),
+            "a dotted selector matching nothing must error like pvxs"
+        );
+    }
+
+    #[test]
+    fn nested_selector_sets_intermediate_and_leaf_bits() {
+        // The nested form `field { value { index {} } }` flattens to TWO
+        // request entries — "value" and "value.index" — so pvxs sets both
+        // offsets. `value`'s entry has a sub-selector, so it does NOT
+        // implicitly select its whole sub-tree.
+        let req = req_with_field_children(vec![(
+            "value".to_string(),
+            FieldDesc::Structure {
+                struct_id: String::new(),
+                fields: vec![("index".to_string(), empty_struct())],
+            },
+        )]);
+        let mask = request_to_mask(&ntenum_desc(), Some(&req)).expect("nested form resolves");
+        assert!(mask.get(0), "root bit");
+        assert!(mask.get(1), "`value` struct bit (own request entry)");
+        assert!(mask.get(2), "value.index leaf bit");
+        assert!(!mask.get(3), "alarm not selected");
+    }
+
+    #[test]
+    fn scalar_typed_selector_child_is_skipped() {
+        // pvxs processes only Struct request children
+        // (`crdesc->code==TypeCode::Struct`, pvrequest.cpp:31); a scalar
+        // child never marks `foundrequested`, so a request with only a
+        // scalar child errors.
+        use crate::pvdata::ScalarType;
+        let req = req_with_field_children(vec![(
+            "value".to_string(),
+            FieldDesc::Scalar(ScalarType::Int),
+        )]);
+        assert_eq!(
+            request_to_mask(&ntenum_desc(), Some(&req)),
+            Err(RequestMaskError::EmptyMask),
+            "scalar-typed selector children are skipped per pvxs"
+        );
+    }
+
+    #[test]
+    fn put_get_masks_resolve_dotted_literal_legs() {
+        // The PUT_GET putField/getField legs go through the same
+        // selector translation and must accept dotted literals too.
+        let req = FieldDesc::Structure {
+            struct_id: String::new(),
+            fields: vec![
+                (
+                    "putField".to_string(),
+                    FieldDesc::Structure {
+                        struct_id: String::new(),
+                        fields: vec![("value.index".to_string(), empty_struct())],
+                    },
+                ),
+                (
+                    "getField".to_string(),
+                    FieldDesc::Structure {
+                        struct_id: String::new(),
+                        fields: vec![("value".to_string(), empty_struct())],
+                    },
+                ),
+            ],
+        };
+        let (put_mask, get_mask) =
+            put_get_masks(&ntenum_desc(), Some(&req)).expect("both legs resolve");
+        assert!(put_mask.get(2) && !put_mask.get(1), "put leg: index only");
+        assert!(
+            get_mask.get(1) && get_mask.get(2),
+            "get leg: value sub-tree (empty selector → implicit all)"
         );
     }
 

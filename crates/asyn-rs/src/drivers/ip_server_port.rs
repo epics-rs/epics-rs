@@ -1729,40 +1729,67 @@ mod tests {
         idx
     }
 
-    /// Drive a slot read until the peer's abortive close surfaces, then return the
-    /// failure. Two platform facts make a single read unreliable:
+    /// Drive slot reads until the peer's abortive close has actually **torn the
+    /// slot down**, then return the teardown failure. Each `step` performs one
+    /// read and reports whether the slot is now torn down (occupied cell cleared
+    /// / child disconnected — the two are the same shared cell). Three platform
+    /// facts make a single instant check unreliable, and this waits out all
+    /// three by re-driving the read and polling the *state*:
     ///
     /// * The RST from `SO_LINGER(0)` + `close()` is not always visible on the
-    ///   server's first read — on macOS it can take an extra poll interval — so
-    ///   this retries past a non-teardown `asynTimeout` (C's caller likewise
-    ///   re-drives `readIt` rather than treating one `EWOULDBLOCK` as a
-    ///   disconnect, drvAsynIPPort.c:807-812).
+    ///   server's first read — on macOS/BSD it can take an extra poll interval —
+    ///   so a `read()` may first return a retryable `asynTimeout` (C's caller
+    ///   likewise re-drives `readIt` rather than treating one `EWOULDBLOCK` as a
+    ///   disconnect, drvAsynIPPort.c:807-812). Never accept that `Timeout` as
+    ///   teardown; keep polling.
     /// * The close does not surface as the *same* status on every platform.
     ///   C runs `closeConnection` — which frees the slot (`exceptionDisconnect`,
     ///   :216 → drvAsynIPServerPort.c:344-350) — on BOTH a fatal errno
     ///   (`asynError`, :805) and a stream EOF `recv()==0` (`asynSuccess`+END,
     ///   :819). Linux delivers an abortive close as `ECONNRESET` (the port's
     ///   `asynError`); macOS/BSD can deliver the very same close as a plain
-    ///   `recv()==0` EOF (the port's `asynDisconnected`). The teardown is the
-    ///   invariant; the reported status is the platform's recv detail.
+    ///   `recv()==0` EOF (the port's `asynDisconnected`). So accept either.
+    /// * The port's `read_or_close` clears the slot synchronously on the reading
+    ///   thread, so on Linux the teardown status and the freed slot are observed
+    ///   together. On macOS/BSD the freed slot is observed to lag the returned
+    ///   status by a poll interval — the abortive close surfaces to the server
+    ///   read across more than one `recv`, and/or the accept loop momentarily
+    ///   re-touches the just-freed slot. A single instant `is_occupied()` check
+    ///   races that settle; re-driving the read until the slot is *observed*
+    ///   torn down removes the race without any production change (the port's
+    ///   fatal-vs-EOF classification is already complete C parity).
     ///
-    /// So the caller asserts the teardown and accepts either `Error` or
-    /// `Disconnected` (never a retryable `Timeout` — that would mean the socket
-    /// is intact, the regression these tests guard).
-    fn read_until_torn_down(mut read: impl FnMut() -> AsynResult<usize>) -> AsynError {
+    /// The bounded deadline means a slot that genuinely never tears down still
+    /// fails loudly — this cannot mask a real slot leak, only a timing skew.
+    fn read_until_slot_torn_down(mut step: impl FnMut() -> (AsynResult<usize>, bool)) -> AsynError {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut teardown: Option<AsynError> = None;
         loop {
-            match read() {
+            let (res, torn_down) = step();
+            match res {
                 Ok(n) => panic!("a reset peer cannot deliver {n} bytes"),
-                Err(e) if e.status() == AsynStatus::Timeout => {
-                    assert!(
-                        std::time::Instant::now() < deadline,
-                        "the peer's abortive close never surfaced as a read failure"
-                    );
-                    std::thread::sleep(Duration::from_millis(5));
+                // A retryable asynTimeout means the socket is still intact — the
+                // RST is not yet visible. Never accept it as teardown.
+                Err(e) if e.status() == AsynStatus::Timeout => {}
+                // The first teardown status seen is the one reported to the caller.
+                Err(e) => {
+                    if teardown.is_none() {
+                        teardown = Some(e);
+                    }
                 }
-                Err(e) => return e,
             }
+            // Return only once BOTH a teardown status was observed AND the slot
+            // is actually torn down — the C-guaranteed effect of closeConnection.
+            if torn_down {
+                if let Some(e) = teardown {
+                    return e;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the peer's abortive close never tore the slot down"
+            );
+            std::thread::sleep(Duration::from_millis(5));
         }
     }
 
@@ -2047,18 +2074,22 @@ mod tests {
             .with_addr(0)
             .with_timeout(Duration::from_millis(200));
         let mut buf = [0u8; 64];
-        // C runs closeConnection — and so frees the slot — on both the fatal-errno
-        // branch (asynError, drvAsynIPPort.c:805) and the recv==0 EOF branch
-        // (asynSuccess+END, :819); Linux surfaces this RST as ECONNRESET (Error),
-        // macOS/BSD can surface it as a plain EOF (Disconnected). Poll past a
-        // not-yet-visible RST and accept either teardown status — never a
-        // retryable Timeout.
-        let err = read_until_torn_down(|| srv.read_octet(&read_user, &mut buf));
+        // Poll the *teardown state* by re-driving the read: on macOS the freed
+        // slot lags the returned teardown status by a poll interval. Each step
+        // reads then reports whether the slot is now free. The helper accepts C's
+        // fatal-errno asynError (Linux ECONNRESET) or recv==0 EOF asynDisconnected
+        // (macOS), never a retryable Timeout, and returns only once the slot is
+        // observed torn down.
+        let err = read_until_slot_torn_down(|| {
+            let res = srv.read_octet(&read_user, &mut buf);
+            (res, !srv.slots[0].is_occupied())
+        });
         assert!(
             matches!(err.status(), AsynStatus::Error | AsynStatus::Disconnected),
             "an abortive close is C's fatal-errno asynError or a recv==0 EOF, got {err:?}"
         );
-
+        // Guaranteed by the helper's exit condition; kept as an explicit statement
+        // of the C invariant (closeConnection frees the slot, not just on EOF).
         assert!(
             !srv.slots[0].is_occupied(),
             "C's readIt closeConnection frees the slot on a fatal errno, not just on EOF"
@@ -2193,13 +2224,20 @@ mod tests {
         let read_user = AsynUser::default().with_timeout(Duration::from_millis(200));
         let mut buf = [0u8; 64];
         // Same abortive-close portability as `a_fatal_read_error_frees_the_client_slot`:
-        // poll past a not-yet-visible RST and accept either C teardown status
-        // (fatal-errno asynError on Linux, recv==0 EOF asynDisconnected on macOS).
-        let err = read_until_torn_down(|| child.read_octet(&read_user, &mut buf));
+        // poll the teardown state (the child's `is_connected` is the slot's own
+        // shared cell) by re-driving the read, past a not-yet-visible RST, and
+        // accept either C teardown status (fatal-errno asynError on Linux, recv==0
+        // EOF asynDisconnected on macOS) — never a retryable Timeout.
+        let err = read_until_slot_torn_down(|| {
+            let res = child.read_octet(&read_user, &mut buf);
+            (res, !child.base().is_connected())
+        });
         assert!(
             matches!(err.status(), AsynStatus::Error | AsynStatus::Disconnected),
             "an abortive close is C's fatal-errno asynError or a recv==0 EOF, got {err:?}"
         );
+        // Guaranteed by the helper's exit condition; kept as an explicit statement
+        // of the C invariant (closeConnection + exceptionDisconnect on the child).
         assert!(
             !child.base().is_connected(),
             "the child's own read tore the slot down (C closeConnection + exceptionDisconnect)"

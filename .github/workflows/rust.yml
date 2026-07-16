@@ -24,8 +24,13 @@ jobs:
       run: cargo clippy --workspace --all-targets -- -D warnings
     - name: Build
       run: cargo build --workspace --verbose
+    # epics-oracle-rs is a local differential harness: its tests boot the
+    # compiled C `softIoc` for ground truth and fail loudly (by design) when
+    # the C EPICS tree is absent, which it always is on a CI runner. It is
+    # excluded from CI here — not silenced — and still runs locally where the
+    # tree exists.
     - name: Run tests (nextest)
-      run: cargo nextest run --workspace
+      run: cargo nextest run --workspace --exclude epics-oracle-rs
     - name: Run doctests
       run: cargo test --doc --workspace
     - name: Test feature-gated code (nextest)

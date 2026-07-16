@@ -995,7 +995,12 @@ mod tests {
             .unwrap();
 
         let name = drv.create_file_name().unwrap();
-        assert_eq!(name, "/tmp/test_042.dat");
+        // checkPath re-terminates FilePath with the OS separator, exactly as C
+        // does under `#ifdef _WIN32` (asynNDArrayDriver.cpp:72-86, `\` on
+        // Windows), so the joined name carries `\` there — build the expected
+        // with MAIN_SEPARATOR like the sibling checkPath tests.
+        let sep = std::path::MAIN_SEPARATOR;
+        assert_eq!(name, format!("/tmp{sep}test_042.dat"));
     }
 
     #[test]

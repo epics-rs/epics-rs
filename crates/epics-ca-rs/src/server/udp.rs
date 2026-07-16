@@ -173,9 +173,12 @@ fn bind_single_responder(
 ) -> CaResult<BoundResponder> {
     let socket = bind_responder_socket(bind_ip, port)?;
     // The port the primary actually took — identical to `port`, except
-    // for an ephemeral (0) request, where the kernel chose it. Every
-    // other socket of this responder must bind that same port: a CA
-    // server answers SEARCHes on exactly one port.
+    // for an ephemeral (0) request, where the kernel chose it. The only
+    // consumer of the resolved port is the broadcast secondary responder
+    // below, which exists on non-Windows only (Windows has no secondary
+    // socket), so resolve it under the same gate — otherwise the binding
+    // is unused on Windows.
+    #[cfg(not(any(windows, target_os = "windows")))]
     let port = socket.local_addr()?.port();
     // Join each multicast group on this
     // responder's own socket via `IP_ADD_MEMBERSHIP` with

@@ -1,0 +1,14 @@
+# Normalize line endings to LF in every working tree, on every platform.
+#
+# The codegen drift gates (env-codegen, dbd-codegen) read a checked-in
+# generated file with std::fs::read_to_string and compare it byte-for-byte
+# against the generator's freshly-produced output, which is always LF. On
+# Windows, git's default core.autocrlf=true rewrites the LF-committed file to
+# CRLF on checkout, so an otherwise-identical file reads back with a trailing
+# \r on every line and the gate reports a false "STALE" (same line count,
+# different bytes). Pinning eol=lf here makes the on-disk bytes match the
+# generator output on all platforms, closing that family at the source rather
+# than normalizing \r\n away inside each comparison.
+#
+# text=auto lets git keep detecting binary files and leave them untouched.
+* text=auto eol=lf

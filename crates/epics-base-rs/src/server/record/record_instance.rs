@@ -4953,12 +4953,16 @@ mod metadata_cache_tests {
     fn qtime_nsec_lsb_31_is_served_not_ignored() {
         use std::time::{Duration, SystemTime};
         let mut inst = ai_instance();
-        inst.common.time = SystemTime::UNIX_EPOCH + Duration::new(42, 123_456_789);
+        // 123_456_700, not …789: Windows `SystemTime` is a FILETIME with 100 ns
+        // resolution, so a sub-100 ns literal is truncated on readback and the
+        // assertion below would see …700. Any value < 2^31 exercises the
+        // nsec:lsb:31 mask identically, so pin one that survives the round trip.
+        inst.common.time = SystemTime::UNIX_EPOCH + Duration::new(42, 123_456_700);
         inst.common.utag = 5;
         inst.set_info("Q:time:tag", "nsec:lsb:31");
 
         let snap = inst.snapshot_for_field("VAL").unwrap();
-        assert_eq!(snap.user_tag, 123_456_789);
+        assert_eq!(snap.user_tag, 123_456_700);
         assert_eq!(snap.timestamp.subsec_nanos(), 0);
         assert_eq!(snap.timestamp.unix_secs(), 42);
     }
@@ -4971,7 +4975,9 @@ mod metadata_cache_tests {
     fn qtime_uppercase_tag_leaves_timestamp_untouched() {
         use std::time::{Duration, SystemTime};
         let mut inst = ai_instance();
-        inst.common.time = SystemTime::UNIX_EPOCH + Duration::new(42, 123_456_789);
+        // 100 ns-multiple so the subsec_nanos assertion holds on Windows too;
+        // see qtime_nsec_lsb_31_is_served_not_ignored for the FILETIME reason.
+        inst.common.time = SystemTime::UNIX_EPOCH + Duration::new(42, 123_456_700);
         inst.common.utag = 5;
         inst.set_info("Q:time:tag", "NSEC:LSB:4");
 
@@ -4980,7 +4986,7 @@ mod metadata_cache_tests {
             snap.user_tag, 5,
             "record utag must survive a non-matching tag"
         );
-        assert_eq!(snap.timestamp.subsec_nanos(), 123_456_789);
+        assert_eq!(snap.timestamp.subsec_nanos(), 123_456_700);
     }
 
     /// the served `timeStamp.userTag` defaults to the record's `utag`

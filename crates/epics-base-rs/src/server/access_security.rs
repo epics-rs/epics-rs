@@ -1505,8 +1505,15 @@ fn hag_members(members: &[String]) -> Vec<String> {
     members
         .iter()
         .map(|m| match format!("{m}:0").to_socket_addrs() {
-            Ok(mut iter) => match iter.next() {
-                Some(sa) => sa.ip().to_string(),
+            // C `aToIPAddr` resolves via `AF_INET` and the CA server keys ACF on
+            // an IPv4 peer address, so a HAG host must store its **IPv4** dotted
+            // quad. Taking `iter.next()` blindly would store an IPv6 address on a
+            // dual-stack host that resolves `::1` first (e.g. `localhost` on many
+            // CI runners) — an entry no IPv4 CA peer could ever match. A host with
+            // no IPv4 address is stored as the `unresolved:` sentinel, exactly as
+            // C does when `aToIPAddr` yields nothing.
+            Ok(iter) => match iter.filter(|sa| sa.is_ipv4()).map(|sa| sa.ip()).next() {
+                Some(ip) => ip.to_string(),
                 None => format!("unresolved:{m}"),
             },
             Err(e) => {

@@ -264,12 +264,22 @@ async fn run_beacon_monitor_inner(
         std::sync::Arc<crate::server::signed_beacon::SignedBeaconVerifier>,
     >,
 ) {
-    // The CA repeater forwards every accepted beacon to its
-    // registered clients over loopback only — there's no multi-NIC
-    // routing here. Bind exclusively on `127.0.0.1` so we get the
-    // SO_REUSEADDR-friendly per-NIC machinery for free without
-    // wasting per-NIC sockets that would never see traffic.
-    let socket = match AsyncUdpV4::bind_single(Ipv4Addr::LOCALHOST, 0, false) {
+    // C `udpiiu` binds this socket to INADDR_ANY (`udpiiu.cpp:241-249`,
+    // "force a bind to an unconstrained address"), and the registration
+    // retry it drives ALTERNATES its destination between the loopback
+    // address and `osiLocalAddr()` (the first non-loopback NIC,
+    // `udpiiu.cpp:494-519`) for pre-3.13-beta-12 repeater compatibility.
+    // A loopback-ONLY bind cannot reach the `osiLocalAddr()` destination
+    // on Windows (a socket bound to `127.0.0.1` may only send over the
+    // loopback interface), so every odd-numbered registration was silently
+    // dropped there and the compatibility alternation was defeated. Bind
+    // the same-port bundle across every NIC (loopback + non-loopback) —
+    // the AsyncUdpV4 analogue of INADDR_ANY — so BOTH destinations are
+    // reachable and, because all NIC sockets share ONE ephemeral port, the
+    // repeater keys the alternating datagrams to a single client by port
+    // (C `identicalPort`, `repeater.cpp:428`) exactly as C's single
+    // INADDR_ANY socket does.
+    let socket = match AsyncUdpV4::bind_ephemeral_same_port(false) {
         Ok(s) => s,
         Err(_) => return,
     };

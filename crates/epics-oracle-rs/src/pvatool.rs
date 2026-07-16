@@ -45,7 +45,8 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
 use std::time::Duration;
 
 /// One batched tool's per-PV reading, or why that PV has none.
@@ -53,6 +54,19 @@ pub type Readings = Vec<Result<String, ToolError>>;
 
 use crate::catool::{ToolError, wait_bounded};
 use crate::ioc::{PvxTools, Side, alloc_free_port};
+
+/// One monitor event: the PV it names, and the body `pvxmonitor` printed under
+/// it.
+///
+/// The body is kept as text for the same reason [`PvaTools::pvxget`]'s is: in
+/// pvxs's default **Delta** format it is exactly the set of leaves the update
+/// *marked*, so parsing it into a model first would discard the very thing the
+/// monitor phase measures.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct PvaEvent {
+    pub pv: String,
+    pub body: String,
+}
 
 /// Did this tool die because it could not bind its beacon port?
 ///
@@ -77,6 +91,12 @@ const PVA_TIMEOUT_SECS: &str = "3";
 /// small but real, and the same window `CIoc::boot`/`PvxIoc::boot` close by
 /// retrying on a fresh port; this is that discipline applied to the clients.
 const BEACON_ATTEMPTS: usize = 8;
+
+/// How long to wait for a killed tool's stderr reader to reach EOF.
+///
+/// Only ever waited on *after* the child is killed, so it bounds a drain that is
+/// already finishing rather than the tool itself.
+const STDERR_DRAIN: Duration = Duration::from_secs(2);
 
 /// The pvxs client tools aimed at exactly one PVA server.
 #[derive(Debug, Clone)]
@@ -169,19 +189,29 @@ impl PvaTools {
     /// Concurrency is *not* the issue: pvxs clients share a beacon port happily
     /// (measured — eight concurrent `pvxlist` on one port all succeed), which is
     /// why the fault looked random rather than tracking the batch width.
+    /// One tool process, wired to a beacon port of its own.
+    ///
+    /// The single place a pvxs client's command line and environment are built,
+    /// so [`Self::run_raw`] and [`Self::subscribe`] cannot drift into aiming at
+    /// different servers or binding beacons by different rules.
+    fn command(&self, tool: &str, args: &[String], beacon: u16) -> Command {
+        let mut cmd = Command::new(self.bin.join(tool));
+        cmd.args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for (k, v) in self.env(beacon) {
+            cmd.env(k, v);
+        }
+        cmd
+    }
+
     fn run_raw(&self, tool: &str, args: &[String]) -> Result<std::process::Output, ToolError> {
         let mut last = String::new();
         for _ in 0..BEACON_ATTEMPTS {
             let beacon = alloc_free_port().map_err(|e| self.err(tool, e.to_string()))?;
-            let mut cmd = Command::new(self.bin.join(tool));
-            cmd.args(args)
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-            for (k, v) in self.env(beacon) {
-                cmd.env(k, v);
-            }
-            let child = cmd
+            let child = self
+                .command(tool, args, beacon)
                 .spawn()
                 .map_err(|e| self.err(tool, format!("spawn: {e}")))?;
             let out = wait_bounded(child, TOOL_TIMEOUT).map_err(|e| self.err(tool, e))?;
@@ -255,6 +285,57 @@ impl PvaTools {
             &["-w".into(), PVA_TIMEOUT_SECS.into(), pv.to_string()],
         )?;
         Ok(out.trim_end().to_string())
+    }
+
+    /// `pvxput <pv> <assign>` — drive one value, and **prove it landed**.
+    ///
+    /// `assign` is the tool's own put syntax, not a bare value, because the
+    /// right spelling depends on the channel's NT shape: an `NTScalar` takes
+    /// `1`, an `NTEnum`'s `value` is a *struct* and takes `value.index=1`. The
+    /// caller picks it from the shape ground truth declared; see
+    /// [`crate::pvamonitor`].
+    ///
+    /// # Why the exit code is not the answer
+    ///
+    /// **`pvxput` exits 0 when the put was refused.** Measured, verbatim:
+    ///
+    /// ```text
+    /// $ pvxput M:bo 1 ; echo $?
+    /// ERROR St13runtime_error : Unable to assign value from "1" : Unable to assign struct with String
+    /// 0
+    /// $ pvxput M:sel 1 ; echo $?
+    /// ERROR N4pvxs6client11RemoteErrorE : Attempt to modify noMod field
+    /// 0
+    /// ```
+    ///
+    /// A drive believed on its exit code would therefore report "no monitor
+    /// event" for a put that never happened — and since a port that posts
+    /// nothing would then *agree* with a ground truth that also posted nothing,
+    /// the case would score AGREED on an experiment that was never run. That is
+    /// precisely the false-clean this harness exists to eliminate, so the
+    /// success condition is what pvxs actually distinguishes: **a silent
+    /// stderr**. A successful put prints nothing at all on either stream.
+    pub fn pvxput(&self, pv: &str, assign: &str) -> Result<(), ToolError> {
+        let out = self.run_raw(
+            "pvxput",
+            &[
+                "-w".into(),
+                PVA_TIMEOUT_SECS.into(),
+                pv.to_string(),
+                assign.to_string(),
+            ],
+        )?;
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        if !stderr.is_empty() {
+            return Err(self.err("pvxput", format!("{pv} <- {assign}: {stderr}")));
+        }
+        if !out.status.success() {
+            return Err(self.err(
+                "pvxput",
+                format!("{pv} <- {assign}: exit {:?}", out.status.code()),
+            ));
+        }
+        Ok(())
     }
 
     /// `pvxinfo <pv>` — the channel's introspected type, without its value.
@@ -342,6 +423,153 @@ impl PvaTools {
         self.batch("pvxinfo", pvs, pvxinfo_header)
     }
 
+    /// Subscribe with `pvxmonitor`, run `drive`, and return every event posted.
+    ///
+    /// The ordering is the whole experiment, so it is made deterministic rather
+    /// than left to luck — the same five steps, for the same reasons, as
+    /// [`crate::catool::CaTools::monitor`]:
+    ///
+    /// 1. spawn `pvxmonitor` on `pvs`;
+    /// 2. **block until every PV has printed its seed event**. The seed is the
+    ///    server's reply to the subscription, so its arrival is proof the
+    ///    subscription is live. Driving before that would race it and lose
+    ///    events, and the harness would report an event-count difference that is
+    ///    an artifact of its own timing rather than a difference in the IOC;
+    /// 3. run `drive` (the puts);
+    /// 4. hold the window open for `settle`, so late or *extra* events are
+    ///    counted — a port that posts events C suppresses must be caught, so we
+    ///    cannot stop listening the instant the puts return;
+    /// 5. kill the subscriber and parse.
+    ///
+    /// A PV that never seeds inside `connect_timeout` is a [`ToolError`], and so
+    /// is a subscription that drops mid-experiment: the case then scores ERROR,
+    /// never agreement.
+    pub fn pvxmonitor<F>(
+        &self,
+        pvs: &[String],
+        settle: Duration,
+        connect_timeout: Duration,
+        drive: F,
+    ) -> Result<Vec<PvaEvent>, ToolError>
+    where
+        F: FnOnce(&PvaTools),
+    {
+        // Every retry lives inside `subscribe`, which returns only once the
+        // subscription is proven live — so `drive` runs exactly once, on an
+        // experiment that is already known to have started.
+        let sub = self.subscribe(pvs, connect_timeout)?;
+        drive(self);
+        std::thread::sleep(settle);
+        sub.collect(self, pvs)
+    }
+
+    /// Spawn `pvxmonitor` and return only once every PV has seeded.
+    ///
+    /// Retries on a beacon collision exactly as [`Self::run_raw`] does, and for
+    /// the same reason: the client *binds* `EPICS_PVA_BROADCAST_PORT`, and a
+    /// number that was free when it was allocated can be taken by an IOC before
+    /// the child binds it. A collision here kills the tool before it ever
+    /// subscribes, so nothing was measured and the whole invocation is safe to
+    /// retry on a fresh port.
+    fn subscribe(
+        &self,
+        pvs: &[String],
+        connect_timeout: Duration,
+    ) -> Result<Subscription, ToolError> {
+        use std::io::{BufRead, BufReader, Read};
+
+        let mut last = String::new();
+        for _ in 0..BEACON_ATTEMPTS {
+            let beacon = alloc_free_port().map_err(|e| self.err("pvxmonitor", e.to_string()))?;
+            let mut child = self
+                .command("pvxmonitor", pvs, beacon)
+                .spawn()
+                .map_err(|e| self.err("pvxmonitor", format!("spawn: {e}")))?;
+
+            // Both pipes are drained on threads: `pvxmonitor` never exits on its
+            // own, so it cannot go through `wait_bounded`, and an undrained pipe
+            // would wedge it mid-experiment.
+            let stdout = child.stdout.take().expect("piped");
+            let (tx, rx) = mpsc::channel::<String>();
+            std::thread::spawn(move || {
+                for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                    if tx.send(line).is_err() {
+                        return;
+                    }
+                }
+            });
+            let stderr = child.stderr.take().expect("piped");
+            let (etx, erx) = mpsc::channel::<String>();
+            std::thread::spawn(move || {
+                let mut buf = String::new();
+                let _ = BufReader::new(stderr).read_to_string(&mut buf);
+                let _ = etx.send(buf);
+            });
+
+            let mut lines = Vec::new();
+            let mut seeded = vec![false; pvs.len()];
+            let deadline = std::time::Instant::now() + connect_timeout;
+            let mut why = String::new();
+            while seeded.iter().any(|s| !s) {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() {
+                    let missing: Vec<&str> = pvs
+                        .iter()
+                        .zip(&seeded)
+                        .filter(|(_, s)| !**s)
+                        .map(|(p, _)| p.as_str())
+                        .collect();
+                    why = format!("no seed event for {missing:?} within {connect_timeout:?}");
+                    break;
+                }
+                match rx.recv_timeout(left) {
+                    Ok(line) => {
+                        if let Some(i) = header_index(pvs, &line) {
+                            seeded[i] = true;
+                        }
+                        lines.push(line);
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        why = "pvxmonitor exited before subscribing".to_string();
+                        break;
+                    }
+                }
+            }
+            if why.is_empty() {
+                return Ok(Subscription {
+                    child,
+                    rx,
+                    erx,
+                    lines,
+                });
+            }
+
+            // Nothing was measured. Kill first, so the stderr reader reaches EOF
+            // and the diagnostic can be read back rather than waited on forever.
+            let _ = child.kill();
+            let _ = child.wait();
+            let stderr = erx.recv_timeout(STDERR_DRAIN).unwrap_or_default();
+            if is_beacon_collision(&stderr) {
+                last = format!("beacon port {beacon}: address already in use");
+                continue;
+            }
+            let stderr = stderr.trim();
+            return Err(self.err(
+                "pvxmonitor",
+                if stderr.is_empty() {
+                    why
+                } else {
+                    format!("{why} ({stderr})")
+                },
+            ));
+        }
+        Err(self.err(
+            "pvxmonitor",
+            format!("could not get a free beacon port in {BEACON_ATTEMPTS} attempts ({last})"),
+        ))
+    }
+
     /// How many distinct PVA servers answer a search on this side's port.
     ///
     /// **This is the PVA port-exclusivity check, and it has no CA analogue.**
@@ -374,6 +602,83 @@ impl PvaTools {
             .collect();
         Ok(distinct.len())
     }
+}
+
+/// A live `pvxmonitor` whose every PV has already produced its seed event.
+///
+/// Exists so the beacon retry can live entirely *before* the drive: a value of
+/// this type is a subscription that is proven established, which is the only
+/// state in which driving the experiment is meaningful.
+struct Subscription {
+    child: Child,
+    rx: mpsc::Receiver<String>,
+    erx: mpsc::Receiver<String>,
+    /// Lines already drained during the seed sync — the seed events themselves.
+    lines: Vec<String>,
+}
+
+impl Subscription {
+    /// Stop the subscriber and turn everything it printed into events.
+    fn collect(mut self, tools: &PvaTools, pvs: &[String]) -> Result<Vec<PvaEvent>, ToolError> {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        while let Ok(line) = self.rx.try_recv() {
+            self.lines.push(line);
+        }
+
+        // A subscription that dropped mid-experiment did not measure the event
+        // sequence it was asked to measure — the count is then a count of what
+        // survived, not of what the server posted. That is an ERROR, not a
+        // reading. Checked against the whole stderr because `pvxmonitor` reports
+        // both a drop and a subscription error there, never on stdout
+        // (`pvxs/tools/monitor.cpp:180-185`).
+        let stderr = self.erx.recv_timeout(STDERR_DRAIN).unwrap_or_default();
+        if let Some(bad) = stderr
+            .lines()
+            .find(|l| l.ends_with(" Disconnected") || l.contains(" Error "))
+        {
+            return Err(tools.err("pvxmonitor", format!("subscription broke: {bad}")));
+        }
+        Ok(parse_events(pvs, &self.lines))
+    }
+}
+
+/// Which requested PV a line is the header of, if any.
+///
+/// `pvxmonitor` prints the subscription's name verbatim on its own line and
+/// indents the body under it (`monitor.cpp:159-161`), so a header is an exact
+/// match against a name we asked for. Matching exactly, rather than "an
+/// unindented line", is what keeps a body line that happens to start at column 0
+/// from being read as the start of a new event.
+fn header_index(pvs: &[String], line: &str) -> Option<usize> {
+    pvs.iter().position(|p| p == line)
+}
+
+/// Split a `pvxmonitor` stream into events, in the order they were printed.
+///
+/// Unlike [`split_blocks`], repeats matter: a PV posts many events and the
+/// *sequence* is the measurement, so each header opens a new event rather than
+/// replacing the previous one. Lines before the first header are dropped — there
+/// are none in practice, since every diagnostic goes to stderr.
+fn parse_events(pvs: &[String], lines: &[String]) -> Vec<PvaEvent> {
+    let mut events: Vec<PvaEvent> = Vec::new();
+    for line in lines {
+        if let Some(i) = header_index(pvs, line) {
+            events.push(PvaEvent {
+                pv: pvs[i].clone(),
+                body: String::new(),
+            });
+            continue;
+        }
+        if let Some(e) = events.last_mut() {
+            e.body.push_str(line);
+            e.body.push('\n');
+        }
+    }
+    for e in &mut events {
+        e.body = e.body.trim_end().to_string();
+    }
+    events
 }
 
 /// The PV a `pvxget` block header announces: the bare PV name, at column 0.
@@ -550,5 +855,53 @@ mod tests {
     #[test]
     fn an_empty_request_reads_nothing() {
         assert!(split_blocks(&[], GET_OUT, pvxget_header).is_empty());
+    }
+
+    fn lines(s: &str) -> Vec<String> {
+        s.lines().map(str::to_string).collect()
+    }
+
+    /// Verbatim `pvxmonitor` stdout for one PV: the seed, then the update a
+    /// `pvxput` drove. Captured from `softIocPVX` — note that the seed frames
+    /// the whole structure while the update frames only what changed, which is
+    /// the signature the monitor phase exists to compare.
+    const MON_OUT: &str = "M:ai\n    value double = 0\n    alarm.severity int32_t = 0\n    timeStamp.secondsPastEpoch int64_t = 631152000\nM:ai\n    value double = 1.5\n    timeStamp.secondsPastEpoch int64_t = 1784213743\n";
+
+    /// The sequence is the measurement, so a PV's second event must not
+    /// overwrite its first — the trap [`split_blocks`] would fall into here.
+    #[test]
+    fn every_event_is_kept_in_order_including_repeats_of_one_pv() {
+        let ev = parse_events(&pvs(&["M:ai"]), &lines(MON_OUT));
+        assert_eq!(ev.len(), 2, "seed and update are two events, not one");
+        assert!(ev[0].body.contains("value double = 0"));
+        assert!(ev[1].body.contains("value double = 1.5"));
+        assert!(
+            !ev[1].body.contains("alarm.severity"),
+            "the update frames only what changed: {:?}",
+            ev[1].body
+        );
+    }
+
+    /// Events from several PVs interleave in one stream, so each must be
+    /// attributed to the PV whose header opened it.
+    #[test]
+    fn interleaved_events_are_attributed_to_their_own_pv() {
+        let out = "M:ai\n    value double = 1\nM:bo\n    value.index int32_t = 1\nM:ai\n    value double = 2\n";
+        let ev = parse_events(&pvs(&["M:ai", "M:bo"]), &lines(out));
+        let by_pv: Vec<&str> = ev.iter().map(|e| e.pv.as_str()).collect();
+        assert_eq!(by_pv, ["M:ai", "M:bo", "M:ai"]);
+        assert!(ev[1].body.contains("value.index"));
+    }
+
+    /// A header is an exact name match, so a PV name that is a prefix of another
+    /// cannot open its neighbour's event.
+    #[test]
+    fn a_prefix_pv_name_does_not_open_a_longer_pvs_event() {
+        assert_eq!(
+            header_index(&pvs(&["M:ai", "M:ai.SCAN"]), "M:ai.SCAN"),
+            Some(1)
+        );
+        assert_eq!(header_index(&pvs(&["M:ai"]), "M:ai.SCAN"), None);
+        assert_eq!(header_index(&pvs(&["M:ai"]), "    value double = 0"), None);
     }
 }

@@ -3803,7 +3803,16 @@ mod write_loop_timeout_tests {
     }
 }
 
-#[cfg(all(test, unix))]
+// Linux-only, not merely unix: the blackhole technique below (a listener
+// with a full accept queue) relies on Linux answering an overflowing SYN
+// with *silence* (`tcp_abort_on_overflow = 0`, the default), leaving the
+// connecting peer in SYN-SENT. macOS/BSD instead answer the overflowing SYN
+// with an RST, so `connect` resolves `Ok` immediately and the "no deadline"
+// assertion becomes untestable there. The *production* invariant (no
+// app-level deadline, matching `tcpiiu.cpp:606-661`) holds on every platform;
+// only this way of exercising it is Linux-specific, so the test is scoped to
+// where its blackhole actually blackholes.
+#[cfg(all(test, target_os = "linux"))]
 mod connect_deadline_tests {
     //! R7-19: the client must impose **no** application-level deadline on
     //! the TCP connect.

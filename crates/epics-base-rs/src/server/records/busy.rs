@@ -2,56 +2,6 @@ use crate::error::{CaError, CaResult};
 use crate::server::record::{MENU_YES_NO, ProcessAction, ProcessOutcome, Record};
 use crate::types::{EpicsValue, PvString};
 
-// --- Busy-specific types (inlined from busy-rs/types.rs) ---
-
-/// Output Mode Select
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Omsl {
-    #[default]
-    Supervisory = 0,
-    ClosedLoop = 1,
-}
-
-impl From<i16> for Omsl {
-    fn from(v: i16) -> Self {
-        match v {
-            1 => Self::ClosedLoop,
-            _ => Self::Supervisory,
-        }
-    }
-}
-
-impl From<Omsl> for i16 {
-    fn from(v: Omsl) -> Self {
-        v as i16
-    }
-}
-
-/// Invalid Output Action
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Ivoa {
-    #[default]
-    ContinueNormally = 0,
-    DontDriveOutputs = 1,
-    SetOutputToIvov = 2,
-}
-
-impl From<i16> for Ivoa {
-    fn from(v: i16) -> Self {
-        match v {
-            1 => Self::DontDriveOutputs,
-            2 => Self::SetOutputToIvov,
-            _ => Self::ContinueNormally,
-        }
-    }
-}
-
-impl From<Ivoa> for i16 {
-    fn from(v: Ivoa) -> Self {
-        v as i16
-    }
-}
-
 /// EPICS busy record implementation.
 ///
 /// A busy record is a binary output variant that tracks asynchronous operation
@@ -75,11 +25,16 @@ pub struct BusyRecord {
     pub osv: i16,
     pub cosv: i16,
     pub lalm: u16,
-    // Invalid output
-    pub ivoa: Ivoa,
+    // Invalid output — IVOA is DBF_MENU menu(menuIvoa) (busyRecord.dbd:148-153),
+    // IVOV is DBF_USHORT (:154-158). Both stored as the RAW carrier, not a
+    // clamping enum, exactly as bo: an out-of-range `caput .IVOA 3` keeps its raw
+    // ordinal, and `caput .IVOV -1` wraps to 65535 (C's epicsUInt16 store) — the
+    // framework reads IVOA back as the raw Short ordinal (processing.rs IVOA gate).
+    pub ivoa: i16,
     pub ivov: u16,
-    // Output control
-    pub omsl: Omsl,
+    // Output control — OMSL is DBF_MENU menu(menuOmsl) (busyRecord.dbd:18-23);
+    // stored raw so an out-of-range ordinal round-trips (mirrors bo).
+    pub omsl: i16,
     pub dol: String,
     // Monitoring
     pub mlst: u16,
@@ -123,9 +78,9 @@ impl Default for BusyRecord {
             osv: 0,
             cosv: 0,
             lalm: 0,
-            ivoa: Ivoa::ContinueNormally,
+            ivoa: 0,
             ivov: 0,
-            omsl: Omsl::Supervisory,
+            omsl: 0,
             dol: String::new(),
             mlst: 0,
             rval: 0,
@@ -315,10 +270,17 @@ impl Record for BusyRecord {
         true
     }
 
-    fn is_put_complete(&self) -> bool {
-        self.val == 0
-    }
-
+    // NO `is_put_complete` override — busy completes its put-callback
+    // synchronously, like bo. C `busyRecord.c:273` clears `pact = FALSE` at the
+    // tail of every process cycle; only async device support that set `pact`
+    // itself (`:254`) holds the callback, and the soft support this port models
+    // (`devBusySoft.c::write_busy` is a bare `dbPutLink`, never touching `pact`)
+    // does not. A prior `is_put_complete() == self.val == 0` modelled the
+    // asynBusy hold, but this record's `process()` is synchronous (never returns
+    // `AsyncPendingNotify`), so the phantom hold only wedged the put-notify:
+    // once VAL was driven to 1 the callback never completed, and every following
+    // `ca_put_callback` was refused with `PutCallbackInProgress`, so the
+    // out-of-range VAL puts C posts (2, 3 → "Illegal_Value") never processed.
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => Some(EpicsValue::Enum(self.val)),
@@ -330,9 +292,9 @@ impl Record for BusyRecord {
             "OSV" => Some(EpicsValue::Short(self.osv)),
             "COSV" => Some(EpicsValue::Short(self.cosv)),
             "LALM" => Some(EpicsValue::Enum(self.lalm)),
-            "IVOA" => Some(EpicsValue::Short(self.ivoa.into())),
-            "IVOV" => Some(EpicsValue::Enum(self.ivov)),
-            "OMSL" => Some(EpicsValue::Short(self.omsl.into())),
+            "IVOA" => Some(EpicsValue::Short(self.ivoa)),
+            "IVOV" => Some(EpicsValue::UShort(self.ivov)),
+            "OMSL" => Some(EpicsValue::Short(self.omsl)),
             "DOL" => Some(EpicsValue::String(self.dol.clone().into())),
             "MLST" => Some(EpicsValue::Enum(self.mlst)),
             // RVAL/ORAW/MASK/RBV/ORBV are DBF_ULONG (boRecord.dbd.pod:252,256,
@@ -433,25 +395,39 @@ impl Record for BusyRecord {
                     Err(CaError::TypeMismatch(name.to_string()))
                 }
             }
+            // IVOA is DBF_MENU menu(menuIvoa): store the RAW epicsEnum16 ordinal
+            // the central menu converter resolved (mirrors bo) — an out-of-range
+            // numeric put keeps its value and round-trips.
             "IVOA" => {
                 if let EpicsValue::Short(v) = value {
-                    self.ivoa = Ivoa::from(v);
+                    self.ivoa = v;
                     Ok(())
                 } else {
                     Err(CaError::TypeMismatch(name.to_string()))
                 }
             }
-            "IVOV" => {
-                self.ivov = match value {
-                    EpicsValue::Enum(v) => v,
-                    EpicsValue::Short(v) => v as u16,
-                    _ => return Err(CaError::TypeMismatch(name.to_string())),
-                };
-                Ok(())
-            }
+            // IVOV is DBF_USHORT: accept the coerced unsigned carrier (a
+            // `caput -1` is wrapped to 65535 by `coerce_put_value`), tolerate an
+            // internal Enum (same u16). Served as UShort so the coercion routes a
+            // string put through the numeric parser, not the ZNAM/ONAM enum-state
+            // resolver — mirrors bo (which the enum serving broke: `-1` was
+            // rejected as an unknown state name and IVOV stayed 0).
+            "IVOV" => match value {
+                EpicsValue::UShort(v) => {
+                    self.ivov = v;
+                    Ok(())
+                }
+                EpicsValue::Enum(v) => {
+                    self.ivov = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.to_string())),
+            },
+            // OMSL is DBF_MENU menu(menuOmsl): store raw ordinal (mirrors bo). The
+            // framework reads it back as the raw Short and compares == closed_loop.
             "OMSL" => {
                 if let EpicsValue::Short(v) = value {
-                    self.omsl = Omsl::from(v);
+                    self.omsl = v;
                     Ok(())
                 } else {
                     Err(CaError::TypeMismatch(name.to_string()))
@@ -585,8 +561,8 @@ mod tests {
         assert_eq!(rec.zsv, 0);
         assert_eq!(rec.osv, 0);
         assert_eq!(rec.cosv, 0);
-        assert_eq!(rec.ivoa, Ivoa::ContinueNormally);
-        assert_eq!(rec.omsl, Omsl::Supervisory);
+        assert_eq!(rec.ivoa, 0);
+        assert_eq!(rec.omsl, 0);
         assert_eq!(rec.mlst, 0);
         assert_eq!(rec.mask, 0);
         assert_eq!(rec.rval, 0);
@@ -654,8 +630,9 @@ mod tests {
         rec.put_field("IVOA", EpicsValue::Short(1)).unwrap();
         assert_eq!(rec.get_field("IVOA"), Some(EpicsValue::Short(1)));
 
-        rec.put_field("IVOV", EpicsValue::Enum(1)).unwrap();
-        assert_eq!(rec.get_field("IVOV"), Some(EpicsValue::Enum(1)));
+        // IVOV is DBF_USHORT — served/accepted as the unsigned carrier.
+        rec.put_field("IVOV", EpicsValue::UShort(1)).unwrap();
+        assert_eq!(rec.get_field("IVOV"), Some(EpicsValue::UShort(1)));
 
         rec.put_field("OMSL", EpicsValue::Short(1)).unwrap();
         assert_eq!(rec.get_field("OMSL"), Some(EpicsValue::Short(1)));
@@ -671,6 +648,33 @@ mod tests {
         // but the field reads back as the unsigned carrier.
         rec.put_field("MASK", EpicsValue::Long(0xFF)).unwrap();
         assert_eq!(rec.get_field("MASK"), Some(EpicsValue::ULong(0xFF)));
+    }
+
+    /// IVOA/OMSL are DBF_MENU stored raw: a numeric out-of-range put keeps its
+    /// ordinal (no clamp to 0), matching C `*pfield = (epicsEnum16)val`. The
+    /// clamping enum stored 0 and served the in-range label instead.
+    #[test]
+    fn menu_out_of_range_puts_store_raw_ordinal() {
+        let mut rec = BusyRecord::new();
+
+        // menuIvoa has 3 choices (0..2); 3 is out of range.
+        rec.put_field("IVOA", EpicsValue::Short(3)).unwrap();
+        assert_eq!(rec.get_field("IVOA"), Some(EpicsValue::Short(3)));
+
+        // menuOmsl has 2 choices (0..1); 2 is out of range.
+        rec.put_field("OMSL", EpicsValue::Short(2)).unwrap();
+        assert_eq!(rec.get_field("OMSL"), Some(EpicsValue::Short(2)));
+    }
+
+    /// IVOV is DBF_USHORT: the coerced put of `-1` arrives as the wrapped
+    /// `UShort(65535)` (C's `epicsUInt16` store), and busy accepts it — the enum
+    /// serving previously routed the string `-1` through the ZNAM/ONAM enum-state
+    /// resolver, which rejected it, so the put failed and IVOV stayed 0.
+    #[test]
+    fn ivov_accepts_wrapped_ushort_put() {
+        let mut rec = BusyRecord::new();
+        rec.put_field("IVOV", EpicsValue::UShort(65535)).unwrap();
+        assert_eq!(rec.get_field("IVOV"), Some(EpicsValue::UShort(65535)));
     }
 
     /// RVAL/ORAW/MASK/RBV/ORBV are DBF_ULONG (boRecord.dbd.pod:252-303,

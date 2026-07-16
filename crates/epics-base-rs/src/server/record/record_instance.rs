@@ -4466,8 +4466,10 @@ impl RecordInstance {
             MetaSlot::Wrote(u) => d.units = u,
             // `dbAccess.c:377` memsets the caller's 16-byte buffer before the
             // slot runs, so a slot that writes nothing serves the empty
-            // string — NOT the record's EGU.
-            MetaSlot::Unwritten => d.units = Default::default(),
+            // string — NOT the record's EGU. A link fetch that reports
+            // nothing lands on the same seed (`calcRecord.c:172-181` puts the
+            // EGU fallback in the `else` arm a link-backed field never takes).
+            MetaSlot::Unwritten | MetaSlot::Link(_) => d.units = Default::default(),
             MetaSlot::RecordLevel | MetaSlot::RecGbl => {}
         }
 
@@ -4480,7 +4482,12 @@ impl RecordInstance {
                 d.precision = rec_gbl_get_prec(self.static_field_type(field), d.precision);
             }
             MetaSlot::Unwritten => d.precision = 0,
-            MetaSlot::RecordLevel => {}
+            // A link-backed precision is seeded with the record's own PREC
+            // BEFORE the fetch (`calcRecord.c:191` `*pprecision =
+            // prec->prec`), so an unset link serves PREC — measured on a real
+            // softIoc, and the reason this arm is not `Unwritten`. A record
+            // that seeds something else must say so with `Wrote`.
+            MetaSlot::RecordLevel | MetaSlot::Link(_) => {}
         }
 
         match routes.graphic {
@@ -4496,7 +4503,7 @@ impl RecordInstance {
                 d.lower_disp_limit = lower;
             }
             // `dbAccess.c:216` seeds `(0.0, 0.0)`.
-            MetaSlot::Unwritten => {
+            MetaSlot::Unwritten | MetaSlot::Link(_) => {
                 d.upper_disp_limit = 0.0;
                 d.lower_disp_limit = 0.0;
             }
@@ -4506,8 +4513,10 @@ impl RecordInstance {
         let alarm = match routes.alarm {
             MetaSlot::Wrote(v) => Some(v),
             // `recGblGetAlarmDouble` writes four NaN (`recGbl.c:155-162`),
-            // which is also the `dbAccess.c:290` seed.
-            MetaSlot::RecGbl | MetaSlot::Unwritten => Some(rec_gbl_get_alarm_double()),
+            // which is also the `dbAccess.c:290` seed a `Link` miss keeps.
+            MetaSlot::RecGbl | MetaSlot::Unwritten | MetaSlot::Link(_) => {
+                Some(rec_gbl_get_alarm_double())
+            }
             MetaSlot::RecordLevel => None,
         };
         if let Some((hihi, high, low, lolo)) = alarm {
@@ -4535,6 +4544,19 @@ impl RecordInstance {
                 c.upper_ctrl_limit = 0.0;
                 c.lower_ctrl_limit = 0.0;
             }
+            // `dbGetControlLimits` is public API (`dbLink.h:436`) and
+            // `dbDbLink.c:414` really installs `dbDbGetControlLimits`, but
+            // NOTHING in EPICS base calls either: every record routes its
+            // link-backed fields to `recGblGetControlDouble` instead
+            // (`calcRecord.c:251`, `aSubRecord.c:376`). A transcription that
+            // reaches here has read C's `get_graphic_double` and copied it
+            // into the control slot — the one mistake this slot invites.
+            MetaSlot::Link(link) => unreachable!(
+                "{}.{field}: control limits routed through link {link}, but no EPICS base \
+                 record fetches control limits through a link — C sends link-backed fields \
+                 to recGblGetControlDouble (dbGetControlLimits has zero callers in base)",
+                self.record.record_type()
+            ),
             MetaSlot::RecordLevel => {}
         }
     }

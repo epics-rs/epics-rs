@@ -509,12 +509,33 @@ pub enum MetaSlot<T> {
     /// (graphic/control `(0.0, 0.0)` `:216`/`:256`, alarm `NaN×4` `:290`,
     /// units `""` `:377`).
     ///
-    /// Two C shapes land here: an explicit no-write arm (`aSubRecord.c:350`'s
-    /// `default:`), and a metadata fetch through a link that reported nothing
-    /// — an unset or constant link, whose `dbConst_lset` NULLs every metadata
-    /// slot (`dbConstLink.c:234-248`), so `dbGetGraphicLimits` short-circuits
-    /// to `S_db_noLSET` (`dbLink.c:358-359`) and writes nothing.
+    /// C's explicit no-write arm — `aSubRecord.c:350`'s `default:`.
     Unwritten,
+    /// C fetched this slot THROUGH the named link field before returning:
+    /// `dbGetPrecision(&prec->inpa, precision)` (`calcRecord.c:227`),
+    /// `dbGetGraphicLimits(&prec->inpa, …)` (`:223-230`),
+    /// `aSubRecord.c:356-369`, `subRecord.c:260-266`, `seqRecord.c:332-336`.
+    ///
+    /// C writes the record's buffer only when the fetch returns zero; every
+    /// caller ignores the status and keeps its seed otherwise
+    /// (`PvDatabase::link_metadata`'s contract). An UNSET or CONSTANT link
+    /// reports nothing at all — `dbConst_lset` NULLs every metadata slot
+    /// (`dbConstLink.c:234-248`), so `dbGetGraphicLimits` short-circuits to
+    /// `S_db_noLSET` (`dbLink.c:358-359`) — and the seed survives.
+    ///
+    /// **The fetch is not wired.** Resolving it needs
+    /// `PvDatabase::link_metadata`, which is `async` and needs the database;
+    /// this snapshot path is sync and holds the record's read guard. The arm
+    /// therefore resolves to the seed, which is exactly C's answer whenever
+    /// the link is unset or constant — the only two cases the differential
+    /// oracle measures, because every oracle record is empty-bodied. A record
+    /// wired to a live DB/CA/PVA link will serve the seed where C serves the
+    /// target's metadata. Naming the arm keeps that gap visible instead of
+    /// letting it read as a transcribed `Unwritten`.
+    ///
+    /// Never valid for `control`: `dbGetControlLimits` has no callers in
+    /// EPICS base — see [`FieldMetaRoutes::control`].
+    Link(&'static str),
 }
 
 /// The five `rset` metadata slots, routed for ONE field — the return of

@@ -8,6 +8,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::client_native::context::PvGetResult; // not used; kept for re-export hygiene
+use crate::nt::NTScalar;
 use crate::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue, TypedScalarArray};
 use crate::server_native::{ChannelSource, OpError};
 
@@ -15,7 +16,7 @@ use epics_base_rs::server::access_security::AccessSecurityConfig;
 use epics_base_rs::server::database::{PvDatabase, PvEntry, parse_pv_name};
 use epics_base_rs::server::recgbl::{alarm_condition_string, alarm_status};
 use epics_base_rs::server::snapshot::Snapshot;
-use epics_base_rs::types::{EpicsValue, PvString, WallTime};
+use epics_base_rs::types::{EpicsValue, WallTime};
 use tokio::sync::RwLock;
 
 /// Shared, mutable ACF cell. Changed from
@@ -120,6 +121,49 @@ impl PvDatabaseSource {
 
 // ── EpicsValue → PvField (NTScalar / NTScalarArray) ─────────────────────
 
+/// The NT shape QSRV declares for a non-`DBR_ENUM` channel.
+///
+/// pvxs builds every such prototype with
+/// `nt::NTScalar{valueType, display=true, control=true, valueAlarm=true,
+/// form=true}` (`ioc/singlesource.cpp:196-203`) — all four flags on,
+/// unconditionally. [`crate::nt::NTScalar`] is this crate's port of
+/// `NTScalar::build()` (`src/nt.cpp:37-114`) and therefore the single owner
+/// of what that expands to: the `isnumeric` gate that drops `control` /
+/// `valueAlarm` / the display limits for a string value, the limits typed
+/// with `value.scalarOf()` rather than a hard-coded double, `display.form`,
+/// and the Float64 `hysteresis`.
+///
+/// This function exists so the served value and the advertised type are
+/// projections of ONE configuration. The shape was previously hand-rolled
+/// here, in parallel with that builder, and had drifted from it on four
+/// counts at once (no `display.form`, `uint8_t` `hysteresis`, `double`
+/// limits on integer records, and a full numeric `display`/`control`/
+/// `valueAlarm` on string records).
+fn nt_scalar_for(snap: &Snapshot) -> NTScalar {
+    // Same single owner as the value leaf (`crate::leaf_convert`), so the
+    // NT's `value` member and the type its limits are cut from agree by
+    // construction.
+    let (value_type, is_array) =
+        match crate::leaf_convert::epics_value_to_field_desc_leaf(&snap.value) {
+            FieldDesc::Scalar(t) => (t, false),
+            FieldDesc::ScalarArray(t) => (t, true),
+            // `epics_value_to_field_desc_leaf` returns only those two variants
+            // for an `EpicsValue`; a string scalar is the conservative shape if
+            // that ever changes.
+            _ => (ScalarType::String, false),
+        };
+    let mut nt = if is_array {
+        NTScalar::array(value_type)
+    } else {
+        NTScalar::new(value_type)
+    };
+    nt.display = true;
+    nt.control = true;
+    nt.value_alarm = true;
+    nt.form = true;
+    nt
+}
+
 fn snapshot_to_pv_field(snap: &Snapshot) -> PvField {
     // pvxs single-record QSRV builds an NTEnum prototype whenever the
     // backing DBR type is DBR_ENUM (`ioc/singlesource.cpp:200-201`), and
@@ -130,29 +174,7 @@ fn snapshot_to_pv_field(snap: &Snapshot) -> PvField {
     if let EpicsValue::Enum(v) = &snap.value {
         return build_nt_enum(i32::from(*v), snap);
     }
-    // The `EpicsValue → PVA value leaf` correspondence (incl. the `DBF_CHAR`
-    // signedness) is owned once in `crate::leaf_convert`, shared with the
-    // monitor-filter backward bridge so the two cannot drift apart.
-    let value_field = crate::leaf_convert::epics_value_to_pv_leaf(&snap.value);
-
-    let is_array = matches!(value_field, PvField::ScalarArray(_));
-    let struct_id = if is_array {
-        "epics:nt/NTScalarArray:1.0"
-    } else {
-        "epics:nt/NTScalar:1.0"
-    };
-
-    let mut s = PvStructure::new(struct_id);
-    s.fields.push(("value".into(), value_field));
-    s.fields.push(("alarm".into(), build_alarm(snap)));
-    s.fields.push(("timeStamp".into(), build_timestamp(snap)));
-    s.fields.push(("display".into(), build_display(snap)));
-    if !is_array {
-        s.fields.push(("control".into(), build_control(snap)));
-        s.fields
-            .push(("valueAlarm".into(), build_value_alarm(snap)));
-    }
-    PvField::Structure(s)
+    fill_nt_scalar(&nt_scalar_for(snap).build(), snap)
 }
 
 fn snapshot_to_field_desc(snap: &Snapshot) -> FieldDesc {
@@ -162,30 +184,133 @@ fn snapshot_to_field_desc(snap: &Snapshot) -> FieldDesc {
     if matches!(&snap.value, EpicsValue::Enum(_)) {
         return nt_enum_desc();
     }
-    // Same single owner as the value leaf (`crate::leaf_convert`): the
-    // descriptor is the type-only projection of `epics_value_to_pv_leaf`, so
-    // the served value and its advertised type cannot diverge.
-    let value_desc = crate::leaf_convert::epics_value_to_field_desc_leaf(&snap.value);
-    let is_array = matches!(value_desc, FieldDesc::ScalarArray(_));
-    let struct_id = if is_array {
-        "epics:nt/NTScalarArray:1.0"
-    } else {
-        "epics:nt/NTScalar:1.0"
+    nt_scalar_for(snap).build()
+}
+
+/// Populate the NTScalar shape `desc` declares from `snap`.
+///
+/// The DESCRIPTOR is the shape's only owner: this starts from
+/// [`default_value_for`](crate::pvdata::encode::default_value_for) — which
+/// already produces a value matching `desc` leaf for leaf — and overwrites
+/// only the leaves the snapshot has data for, coercing each to the type the
+/// descriptor declared. A leaf the shape does not carry (`display.limitLow`
+/// on a string NT) is simply not found, which is exactly pvxs's own
+/// `if(auto x = node["…"])` no-op (`iocsource.cpp:275-310`).
+///
+/// The leaves left at their descriptor default are the ones pvxs also never
+/// fills on this path — `control.minStep`, `valueAlarm.active`, the four
+/// `*Severity`, `hysteresis`. They are declared, and zero, and the GET reply
+/// leaves them unmarked (`read_checked`), so no client reads a zero as
+/// authoritative.
+fn fill_nt_scalar(desc: &FieldDesc, snap: &Snapshot) -> PvField {
+    let mut v = crate::pvdata::encode::default_value_for(desc);
+
+    set_leaf(
+        &mut v,
+        "value",
+        crate::leaf_convert::epics_value_to_pv_leaf(&snap.value),
+    );
+    set_leaf(&mut v, "alarm", build_alarm(snap));
+    set_leaf(&mut v, "timeStamp", build_timestamp(snap));
+
+    // pvxs `iocsource.cpp:306-308` sets `display.description` from the
+    // record's DESC field; the limits/units/precision are the DBR_GR_DOUBLE /
+    // DBR_UNITS / DBR_PRECISION metadata one field over.
+    if let Some(d) = &snap.display {
+        set_numeric(&mut v, "display.limitLow", d.lower_disp_limit);
+        set_numeric(&mut v, "display.limitHigh", d.upper_disp_limit);
+        set_leaf(
+            &mut v,
+            "display.description",
+            PvField::Scalar(ScalarValue::String(d.description.clone().into())),
+        );
+        set_leaf(
+            &mut v,
+            "display.units",
+            PvField::Scalar(ScalarValue::String(d.units.clone())),
+        );
+        set_leaf(
+            &mut v,
+            "display.precision",
+            PvField::Scalar(ScalarValue::Int(d.precision as i32)),
+        );
+        // pvxs `iocsource.cpp:300-303` fills the four valueAlarm limits from
+        // DBR_AL_DOUBLE; in Rust they live on `DisplayInfo`.
+        set_numeric(&mut v, "valueAlarm.lowAlarmLimit", d.lower_alarm_limit);
+        set_numeric(&mut v, "valueAlarm.lowWarningLimit", d.lower_warning_limit);
+        set_numeric(&mut v, "valueAlarm.highWarningLimit", d.upper_warning_limit);
+        set_numeric(&mut v, "valueAlarm.highAlarmLimit", d.upper_alarm_limit);
+    }
+    if let Some(c) = &snap.control {
+        set_numeric(&mut v, "control.limitLow", c.lower_ctrl_limit);
+        set_numeric(&mut v, "control.limitHigh", c.upper_ctrl_limit);
+    }
+
+    // `IOCSource::initialize` (`iocsource.cpp:39-65`) fills the form menu for
+    // every Scalar mapping — the one leaf a read assigns that no DBE class
+    // ever posts. `form.index` stays 0 ("Default"): selecting another entry
+    // needs the channel's `Q:form` info tag, which this source does not model.
+    set_leaf(
+        &mut v,
+        "display.form.choices",
+        PvField::ScalarArray(
+            crate::nt::FORM_CHOICES
+                .iter()
+                .map(|c| ScalarValue::String((*c).into()))
+                .collect(),
+        ),
+    );
+    v
+}
+
+/// Resolve a dotted field path to its leaf, or `None` when the shape does not
+/// carry it — pvxs's `if(auto x = node["…"])` guard.
+fn leaf_mut<'a>(v: &'a mut PvField, path: &str) -> Option<&'a mut PvField> {
+    let mut cur = v;
+    for name in path.split('.') {
+        let PvField::Structure(s) = cur else {
+            return None;
+        };
+        cur = s.get_field_mut(name)?;
+    }
+    Some(cur)
+}
+
+/// Assign `val` at `path`. A path the shape does not carry is a no-op.
+fn set_leaf(v: &mut PvField, path: &str, val: PvField) {
+    if let Some(slot) = leaf_mut(v, path) {
+        *slot = val;
+    }
+}
+
+/// Assign a stored `f64` metadata limit at `path`, coerced to the type the
+/// DESCRIPTOR declared for that leaf.
+///
+/// pvxs types `display`/`control`/`valueAlarm` limits with `value.scalarOf()`
+/// (`src/nt.cpp:61-104`), so a `longin` gets `int32_t` limits and an `ai` gets
+/// `double` ones. Coercing to the slot's existing variant — which
+/// `default_value_for` cut from the descriptor — keeps that typing decision
+/// where it belongs, in [`crate::nt::NTScalar`], and out of this function.
+fn set_numeric(v: &mut PvField, path: &str, val: f64) {
+    let Some(PvField::Scalar(slot)) = leaf_mut(v, path) else {
+        return;
     };
-    let mut fields = vec![
-        ("value".to_string(), value_desc),
-        ("alarm".into(), alarm_desc()),
-        ("timeStamp".into(), timestamp_desc()),
-        ("display".into(), display_desc()),
-    ];
-    if !is_array {
-        fields.push(("control".into(), control_desc()));
-        fields.push(("valueAlarm".into(), value_alarm_desc()));
-    }
-    FieldDesc::Structure {
-        struct_id: struct_id.into(),
-        fields,
-    }
+    *slot = match slot {
+        ScalarValue::Boolean(_) => ScalarValue::Boolean(val != 0.0),
+        ScalarValue::Byte(_) => ScalarValue::Byte(val as i8),
+        ScalarValue::Short(_) => ScalarValue::Short(val as i16),
+        ScalarValue::Int(_) => ScalarValue::Int(val as i32),
+        ScalarValue::Long(_) => ScalarValue::Long(val as i64),
+        ScalarValue::UByte(_) => ScalarValue::UByte(val as u8),
+        ScalarValue::UShort(_) => ScalarValue::UShort(val as u16),
+        ScalarValue::UInt(_) => ScalarValue::UInt(val as u32),
+        ScalarValue::ULong(_) => ScalarValue::ULong(val as u64),
+        ScalarValue::Float(_) => ScalarValue::Float(val as f32),
+        ScalarValue::Double(_) => ScalarValue::Double(val),
+        // A string leaf is never a numeric limit: pvxs's `isnumeric` gate
+        // means a string NT declares no limit fields at all.
+        ScalarValue::String(_) => return,
+    };
 }
 
 /// pvxs `NTEnum::build()` (`src/nt.cpp:117-134`): `epics:nt/NTEnum:1.0`
@@ -291,75 +416,6 @@ fn timestamp_desc() -> FieldDesc {
     }
 }
 
-fn display_desc() -> FieldDesc {
-    FieldDesc::Structure {
-        // Anonymous id to match the value builder / pvxs (see `build_display`).
-        struct_id: String::new(),
-        fields: vec![
-            ("limitLow".into(), FieldDesc::Scalar(ScalarType::Double)),
-            ("limitHigh".into(), FieldDesc::Scalar(ScalarType::Double)),
-            ("description".into(), FieldDesc::Scalar(ScalarType::String)),
-            ("units".into(), FieldDesc::Scalar(ScalarType::String)),
-            ("precision".into(), FieldDesc::Scalar(ScalarType::Int)),
-        ],
-    }
-}
-
-fn control_desc() -> FieldDesc {
-    FieldDesc::Structure {
-        // Anonymous id to match the value builder / pvxs (see `build_control`).
-        struct_id: String::new(),
-        fields: vec![
-            ("limitLow".into(), FieldDesc::Scalar(ScalarType::Double)),
-            ("limitHigh".into(), FieldDesc::Scalar(ScalarType::Double)),
-            ("minStep".into(), FieldDesc::Scalar(ScalarType::Double)),
-        ],
-    }
-}
-
-fn value_alarm_desc() -> FieldDesc {
-    FieldDesc::Structure {
-        // Anonymous id to match the value builder / pvxs (see `build_value_alarm`).
-        struct_id: String::new(),
-        fields: vec![
-            ("active".into(), FieldDesc::Scalar(ScalarType::Boolean)),
-            (
-                "lowAlarmLimit".into(),
-                FieldDesc::Scalar(ScalarType::Double),
-            ),
-            (
-                "lowWarningLimit".into(),
-                FieldDesc::Scalar(ScalarType::Double),
-            ),
-            (
-                "highWarningLimit".into(),
-                FieldDesc::Scalar(ScalarType::Double),
-            ),
-            (
-                "highAlarmLimit".into(),
-                FieldDesc::Scalar(ScalarType::Double),
-            ),
-            (
-                "lowAlarmSeverity".into(),
-                FieldDesc::Scalar(ScalarType::Int),
-            ),
-            (
-                "lowWarningSeverity".into(),
-                FieldDesc::Scalar(ScalarType::Int),
-            ),
-            (
-                "highWarningSeverity".into(),
-                FieldDesc::Scalar(ScalarType::Int),
-            ),
-            (
-                "highAlarmSeverity".into(),
-                FieldDesc::Scalar(ScalarType::Int),
-            ),
-            ("hysteresis".into(), FieldDesc::Scalar(ScalarType::UByte)),
-        ],
-    }
-}
-
 fn build_alarm(snap: &Snapshot) -> PvField {
     let mut a = PvStructure::new("alarm_t");
     a.fields.push((
@@ -447,108 +503,6 @@ fn build_timestamp(snap: &Snapshot) -> PvField {
         PvField::Scalar(ScalarValue::Int(snap.user_tag)),
     ));
     PvField::Structure(t)
-}
-
-fn build_display(snap: &Snapshot) -> PvField {
-    // Anonymous id: pvxs builds `display`/`control`/`valueAlarm` with the
-    // 2-arg `members::Struct(name, children)` form (`src/nt.cpp:60`/`:89`/
-    // `:99`), which leaves `id = ""` — only `alarm`/`timeStamp` use the
-    // 3-arg id form. A non-empty `display_t` serialized an extra
-    // length-prefixed id and diverged from pvxs byte-for-byte.
-    let mut d = PvStructure::new("");
-    // pvxs `iocsource.cpp:306-308` sets `display.description` from the
-    // record's DESC field; in Rust it is `DisplayInfo.description`,
-    // one field over from the limits/units this already reads. It was
-    // hardcoded empty even when the snapshot carried a description.
-    let (lo, hi, desc, units, prec) = if let Some(disp) = &snap.display {
-        (
-            disp.lower_disp_limit,
-            disp.upper_disp_limit,
-            disp.description.clone(),
-            disp.units.clone(),
-            disp.precision as i32,
-        )
-    } else {
-        (0.0, 0.0, String::new(), PvString::new(), 0)
-    };
-    d.fields
-        .push(("limitLow".into(), PvField::Scalar(ScalarValue::Double(lo))));
-    d.fields
-        .push(("limitHigh".into(), PvField::Scalar(ScalarValue::Double(hi))));
-    d.fields.push((
-        "description".into(),
-        PvField::Scalar(ScalarValue::String(desc.into())),
-    ));
-    d.fields
-        .push(("units".into(), PvField::Scalar(ScalarValue::String(units))));
-    d.fields
-        .push(("precision".into(), PvField::Scalar(ScalarValue::Int(prec))));
-    PvField::Structure(d)
-}
-
-fn build_control(snap: &Snapshot) -> PvField {
-    // Anonymous id — pvxs `Struct("control", {…})` (`src/nt.cpp:89`), see
-    // `build_display`.
-    let mut c = PvStructure::new("");
-    let (lo, hi) = if let Some(ctrl) = &snap.control {
-        (ctrl.lower_ctrl_limit, ctrl.upper_ctrl_limit)
-    } else {
-        (0.0, 0.0)
-    };
-    c.fields
-        .push(("limitLow".into(), PvField::Scalar(ScalarValue::Double(lo))));
-    c.fields
-        .push(("limitHigh".into(), PvField::Scalar(ScalarValue::Double(hi))));
-    c.fields
-        .push(("minStep".into(), PvField::Scalar(ScalarValue::Double(0.0))));
-    PvField::Structure(c)
-}
-
-fn build_value_alarm(snap: &Snapshot) -> PvField {
-    // pvxs `iocsource.cpp:300-303` fills the four valueAlarm limits from
-    // DBR_AL_DOUBLE; in Rust they live in
-    // `DisplayInfo.{lower,upper}_{alarm,warning}_limit`. These were
-    // hardcoded 0.0 here even when the snapshot carried them. The
-    // per-limit severities / `active` / `hysteresis` are not part of
-    // DBR_AL_DOUBLE (pvxs leaves them untouched in this path), so they
-    // remain 0/false until a record exposes LSV/HSV etc.
-    // Anonymous id — pvxs `Struct("valueAlarm", {…})` (`src/nt.cpp:99`), see
-    // `build_display`.
-    let mut v = PvStructure::new("");
-    v.fields.push((
-        "active".into(),
-        PvField::Scalar(ScalarValue::Boolean(false)),
-    ));
-    let limits: [(&str, f64); 4] = match &snap.display {
-        Some(d) => [
-            ("lowAlarmLimit", d.lower_alarm_limit),
-            ("lowWarningLimit", d.lower_warning_limit),
-            ("highWarningLimit", d.upper_warning_limit),
-            ("highAlarmLimit", d.upper_alarm_limit),
-        ],
-        None => [
-            ("lowAlarmLimit", 0.0),
-            ("lowWarningLimit", 0.0),
-            ("highWarningLimit", 0.0),
-            ("highAlarmLimit", 0.0),
-        ],
-    };
-    for (name, val) in limits {
-        v.fields
-            .push((name.into(), PvField::Scalar(ScalarValue::Double(val))));
-    }
-    for name in [
-        "lowAlarmSeverity",
-        "lowWarningSeverity",
-        "highWarningSeverity",
-        "highAlarmSeverity",
-    ] {
-        v.fields
-            .push((name.into(), PvField::Scalar(ScalarValue::Int(0))));
-    }
-    v.fields
-        .push(("hysteresis".into(), PvField::Scalar(ScalarValue::UByte(0))));
-    PvField::Structure(v)
 }
 
 // ── ChannelSource impl ────────────────────────────────────────────────────
@@ -1115,6 +1069,214 @@ mod tests {
         }
     }
 
+    /// Names of `desc`'s immediate children, or panic if it is not a struct.
+    fn child_names(desc: &FieldDesc) -> Vec<String> {
+        let FieldDesc::Structure { fields, .. } = desc else {
+            panic!("expected a structure, got {desc:?}");
+        };
+        fields.iter().map(|(n, _)| n.clone()).collect()
+    }
+
+    fn child<'a>(desc: &'a FieldDesc, name: &str) -> &'a FieldDesc {
+        let FieldDesc::Structure { fields, .. } = desc else {
+            panic!("expected a structure, got {desc:?}");
+        };
+        &fields
+            .iter()
+            .find(|(n, _)| n == name)
+            .unwrap_or_else(|| panic!("missing member {name}"))
+            .1
+    }
+
+    fn desc_of(v: EpicsValue) -> FieldDesc {
+        snapshot_to_field_desc(&Snapshot::new(v, 0, 0, std::time::UNIX_EPOCH))
+    }
+
+    /// `display.form` — pvxs has emitted it for every numeric NTScalar since
+    /// 1.2.0, because QSRV passes `form=true` (`ioc/singlesource.cpp:203`,
+    /// `src/nt.cpp:67-77`). Measured absent from the port against
+    /// `softIocPVX` on `ai`.
+    #[test]
+    fn numeric_nt_declares_display_form_enum() {
+        let desc = desc_of(EpicsValue::Double(0.0));
+        let display = child(&desc, "display");
+        assert_eq!(
+            child_names(display),
+            [
+                "limitLow",
+                "limitHigh",
+                "description",
+                "units",
+                "precision",
+                "form"
+            ],
+        );
+        let form = child(display, "form");
+        let FieldDesc::Structure { struct_id, .. } = form else {
+            panic!("form must be a structure");
+        };
+        assert_eq!(struct_id, "enum_t");
+        assert!(matches!(
+            child(form, "index"),
+            FieldDesc::Scalar(ScalarType::Int)
+        ));
+        assert!(matches!(
+            child(form, "choices"),
+            FieldDesc::ScalarArray(ScalarType::String)
+        ));
+    }
+
+    /// `valueAlarm.hysteresis` is `Float64` — `src/nt.cpp:109`. The port
+    /// declared `uint8_t`, which is a different wire type in the same slot.
+    #[test]
+    fn value_alarm_hysteresis_is_double() {
+        let desc = desc_of(EpicsValue::Double(0.0));
+        let va = child(&desc, "valueAlarm");
+        assert!(matches!(
+            child(va, "hysteresis"),
+            FieldDesc::Scalar(ScalarType::Double)
+        ));
+    }
+
+    /// pvxs cuts every limit from `value.scalarOf()` (`Member(scalar,
+    /// "limitLow")`, `src/nt.cpp:61-104`), so a `longin` advertises `int32_t`
+    /// limits — not the `double` the port hard-coded. Measured against
+    /// `softIocPVX`: `display.limitLow int32_t = 0`.
+    #[test]
+    fn integer_nt_limits_take_the_value_type() {
+        let desc = desc_of(EpicsValue::Long(0));
+        for (parent, leaf) in [
+            ("display", "limitLow"),
+            ("display", "limitHigh"),
+            ("control", "limitLow"),
+            ("control", "minStep"),
+            ("valueAlarm", "lowAlarmLimit"),
+            ("valueAlarm", "highAlarmLimit"),
+        ] {
+            assert!(
+                matches!(
+                    child(child(&desc, parent), leaf),
+                    FieldDesc::Scalar(ScalarType::Int)
+                ),
+                "{parent}.{leaf} must be int32_t for a DBF_LONG value",
+            );
+        }
+        // ...but hysteresis is Float64 regardless of the value type, and
+        // precision stays Int32.
+        assert!(matches!(
+            child(child(&desc, "valueAlarm"), "hysteresis"),
+            FieldDesc::Scalar(ScalarType::Double)
+        ));
+        assert!(matches!(
+            child(child(&desc, "display"), "precision"),
+            FieldDesc::Scalar(ScalarType::Int)
+        ));
+    }
+
+    /// pvxs's `isnumeric` gate (`src/nt.cpp:55`): a string value carries
+    /// `display = {description, units}` and NO `control` / `valueAlarm` at
+    /// all. The port declared the full numeric shape for `stringin`/
+    /// `stringout`, which is what made those two cases diverge.
+    #[test]
+    fn string_nt_omits_control_value_alarm_and_numeric_display() {
+        let desc = desc_of(EpicsValue::String("x".into()));
+        let names = child_names(&desc);
+        assert_eq!(names, ["value", "alarm", "timeStamp", "display"]);
+        assert_eq!(
+            child_names(child(&desc, "display")),
+            ["description", "units"]
+        );
+    }
+
+    /// A numeric ARRAY is the same `NTScalar::build()` with an array value
+    /// type, so it keeps `control`/`valueAlarm` with ELEMENT-typed limits
+    /// (pvxs `src/nt.cpp:44-112`). The port dropped both for every array.
+    #[test]
+    fn numeric_array_nt_keeps_control_and_value_alarm() {
+        let desc = desc_of(EpicsValue::LongArray(vec![1, 2]));
+        let FieldDesc::Structure { struct_id, .. } = &desc else {
+            panic!("expected a structure");
+        };
+        assert_eq!(struct_id, "epics:nt/NTScalarArray:1.0");
+        assert_eq!(
+            child_names(&desc),
+            [
+                "value",
+                "alarm",
+                "timeStamp",
+                "display",
+                "control",
+                "valueAlarm"
+            ],
+        );
+        assert!(matches!(
+            child(child(&desc, "control"), "limitLow"),
+            FieldDesc::Scalar(ScalarType::Int)
+        ));
+    }
+
+    /// The served value and the advertised type are projections of one
+    /// configuration, so every leaf of one must exist, with the same type, in
+    /// the other. This is the invariant the two hand-rolled builders could
+    /// not hold.
+    #[test]
+    fn value_and_introspection_agree_for_every_value_kind() {
+        for v in [
+            EpicsValue::Double(1.0),
+            EpicsValue::Long(1),
+            EpicsValue::Short(1),
+            EpicsValue::Char(1),
+            EpicsValue::String("s".into()),
+            EpicsValue::DoubleArray(vec![1.0]),
+            EpicsValue::StringArray(vec!["s".into()]),
+        ] {
+            let snap = Snapshot::new(v.clone(), 0, 0, std::time::UNIX_EPOCH);
+            let desc = snapshot_to_field_desc(&snap);
+            let value = snapshot_to_pv_field(&snap);
+            crate::pvdata::value_matches_descriptor(&value, &desc)
+                .unwrap_or_else(|e| panic!("value/desc mismatch for {v:?}: {e}"));
+        }
+    }
+
+    /// `display.form.choices` carries the fixed seven-entry `Q:form` menu —
+    /// `IOCSource::initialize` (`iocsource.cpp:39-65`). Measured on the C
+    /// side for `ai`; the port sent an empty array.
+    #[test]
+    fn form_choices_carry_the_qform_menu() {
+        let snap = Snapshot::new(EpicsValue::Double(0.0), 0, 0, std::time::UNIX_EPOCH);
+        let PvField::Structure(root) = snapshot_to_pv_field(&snap) else {
+            panic!("NT must be a structure");
+        };
+        let PvField::Structure(display) = root.get_field("display").expect("display") else {
+            panic!("display must be a structure");
+        };
+        let PvField::Structure(form) = display.get_field("form").expect("form") else {
+            panic!("form must be a structure");
+        };
+        let PvField::ScalarArray(choices) = form.get_field("choices").expect("choices") else {
+            panic!("choices must be a scalar array");
+        };
+        let got: Vec<String> = choices
+            .iter()
+            .map(|c| match c {
+                ScalarValue::String(s) => s.to_string(),
+                other => panic!("choice not a string: {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                "Default",
+                "String",
+                "Binary",
+                "Decimal",
+                "Hex",
+                "Exponential",
+                "Engineering"
+            ],
+        );
+    }
+
     #[test]
     fn build_timestamp_uses_snapshot_acquisition_time_and_user_tag() {
         // pvxs `iocsource.cpp:240-248`: timeStamp carries the record's
@@ -1151,10 +1313,13 @@ mod tests {
             upper_alarm_limit: 10.0,
             ..Default::default()
         });
-        let PvField::Structure(v) = build_value_alarm(&snap) else {
+        let PvField::Structure(root) = snapshot_to_pv_field(&snap) else {
+            panic!("NT must be a structure");
+        };
+        let PvField::Structure(v) = root.get_field("valueAlarm").expect("valueAlarm") else {
             panic!("valueAlarm must be a structure");
         };
-        let get = |name: &str| match scalar(&v, name) {
+        let get = |name: &str| match scalar(v, name) {
             ScalarValue::Double(x) => x,
             other => panic!("{name} not Double: {other:?}"),
         };
@@ -1175,15 +1340,18 @@ mod tests {
             units: "Torr".into(),
             ..Default::default()
         });
-        let PvField::Structure(d) = build_display(&snap) else {
+        let PvField::Structure(root) = snapshot_to_pv_field(&snap) else {
+            panic!("NT must be a structure");
+        };
+        let PvField::Structure(d) = root.get_field("display").expect("display") else {
             panic!("display must be a structure");
         };
         assert!(matches!(
-            scalar(&d, "description"),
+            scalar(d, "description"),
             ScalarValue::String(s) if s == "chamber pressure"
         ));
         assert!(matches!(
-            scalar(&d, "units"),
+            scalar(d, "units"),
             ScalarValue::String(s) if s == "Torr"
         ));
     }
@@ -1430,10 +1598,13 @@ mod tests {
             units: PvString::from_bytes(raw.clone()),
             ..Default::default()
         });
-        let PvField::Structure(d) = build_display(&snap) else {
+        let PvField::Structure(root) = snapshot_to_pv_field(&snap) else {
+            panic!("NT must be a structure");
+        };
+        let PvField::Structure(d) = root.get_field("display").expect("display") else {
             panic!("display must be a structure");
         };
-        let ScalarValue::String(units) = scalar(&d, "units") else {
+        let ScalarValue::String(units) = scalar(d, "units") else {
             panic!("units must be a string scalar");
         };
         assert_eq!(

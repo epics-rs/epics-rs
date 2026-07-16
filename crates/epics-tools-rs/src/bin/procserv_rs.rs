@@ -549,7 +549,7 @@ mod app {
                     return ExitCode::FAILURE;
                 }
             };
-            let result = bind_rt.block_on(async { bind_endpoints(&cfg) });
+            let result = bind_rt.block_on(async { bind_endpoints(&cfg.listen) });
             // `bind_rt` drops here, before `fork_and_go`.
             match result {
                 Ok(listeners) => listeners,

@@ -250,43 +250,6 @@ impl SupervisorState {
             );
         }
 
-        // Publish the supervisor's identity + control endpoints ONCE, here at
-        // startup, before the main loop and before any child exists — C calls
-        // `setEnvVar()` then `writeInfoFile(infofile)` at `procServ.cc:559-563`,
-        // between `writePidFile` and the poll loop, with no dependency on the
-        // child ever being spawned. Both values (supervisor pid, listening
-        // addresses) are fixed for the supervisor's lifetime, so startup is the
-        // only moment they need to be published.
-        //
-        // Publishing this on the child-spawn path instead left the info file
-        // absent for the whole `--wait` window: under manual start there is no
-        // initial spawn, so a manager had no file to read the control endpoint
-        // from — and reading that endpoint is how it would issue the manual
-        // start. Chicken-and-egg.
-        let info = InfoSnapshot {
-            // C `writeInfoFile` / `setEnvVar` emit `getpid()` — the supervisor
-            // pid, which manage-procs probes for liveness (procServ.cc:938,946),
-            // NOT the child's.
-            procserv_pid: std::process::id() as i32,
-            addresses: super::sidecar::listen_addresses(&config.listen),
-        };
-        // SAFETY: PROCSERV_INFO is process-wide. Setting env in a running
-        // multi-threaded program is racy on POSIX; we accept that risk because
-        // (a) this is the single writer, and it runs once at startup before any
-        // child is spawned, (b) the child gets a fresh copy via execvp at fork
-        // time, so a torn read in another supervisor thread is harmless.
-        unsafe { std::env::set_var("PROCSERV_INFO", render_procserv_info_env(&info)) };
-        if let Some(p) = &config.logging.info_path
-            && let Err(e) = write_info_file(p, &info)
-        {
-            // Same "warn and run anyway" contract as the pid file above.
-            tracing::error!(
-                path = %p.display(),
-                error = %e,
-                "procserv-rs: unable to write info file; continuing without it"
-            );
-        }
-
         let log = if let Some(p) = &config.logging.log_path {
             // The LOG uses `stamp_log` + `stamp_format` (raw line prefix),
             // not the banner-facing `time_format`. With `stamp_log` off
@@ -327,8 +290,53 @@ impl SupervisorState {
         // (`procServ.cc:513-543`); control specs first, then the log spec.
         let listeners = match prebound {
             Some(listeners) => listeners,
-            None => bind_endpoints(&config)?,
+            None => bind_endpoints(&config.listen)?,
         };
+
+        // Publish the supervisor's identity + control endpoints ONCE, here at
+        // startup, before the main loop and before any child exists — C calls
+        // `setEnvVar()` then `writeInfoFile(infofile)` at `procServ.cc:557-563`,
+        // after every acceptItem is created (513-543) and before the poll
+        // loop, with no dependency on the child ever being spawned. Both
+        // values (supervisor pid, listening addresses) are fixed for the
+        // supervisor's lifetime, so startup is the only moment they need to
+        // be published.
+        //
+        // The addresses come from the *bound* listeners, not `config.listen`:
+        // C's acceptItems refresh their address from the kernel right after
+        // binding (`getsockname`, acceptFactory.cc:184), so a `--port 0`
+        // deployment publishes the real assigned port. A config-derived
+        // render published the unusable `tcp:...:0` placeholder here.
+        //
+        // Publishing this on the child-spawn path instead left the info file
+        // absent for the whole `--wait` window: under manual start there is no
+        // initial spawn, so a manager had no file to read the control endpoint
+        // from — and reading that endpoint is how it would issue the manual
+        // start. Chicken-and-egg.
+        let info = InfoSnapshot {
+            // C `writeInfoFile` / `setEnvVar` emit `getpid()` — the supervisor
+            // pid, which manage-procs probes for liveness (procServ.cc:938,946),
+            // NOT the child's.
+            procserv_pid: std::process::id() as i32,
+            addresses: super::sidecar::bound_addresses(&listeners),
+        };
+        // SAFETY: PROCSERV_INFO is process-wide. Setting env in a running
+        // multi-threaded program is racy on POSIX; we accept that risk because
+        // (a) this is the single writer, and it runs once at startup before any
+        // child is spawned, (b) the child gets a fresh copy via execvp at fork
+        // time, so a torn read in another supervisor thread is harmless.
+        unsafe { std::env::set_var("PROCSERV_INFO", render_procserv_info_env(&info)) };
+        if let Some(p) = &config.logging.info_path
+            && let Err(e) = write_info_file(p, &info)
+        {
+            // Same "warn and run anyway" contract as the pid file above.
+            tracing::error!(
+                path = %p.display(),
+                error = %e,
+                "procserv-rs: unable to write info file; continuing without it"
+            );
+        }
+
         // One accept loop task per listener. The readonly flag (set for the
         // log endpoint in `bind_endpoints`, C `acceptFactory(..., true)`
         // procServ.cc:533) flows to each accepted client and gates its input

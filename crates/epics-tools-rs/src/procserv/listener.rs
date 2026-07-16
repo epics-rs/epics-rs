@@ -13,7 +13,7 @@ use tokio::net::{TcpListener, TcpSocket, UnixListener};
 use tokio::sync::mpsc;
 
 use crate::procserv::client::{ClientPeer, ClientStream, IncomingClient};
-use crate::procserv::config::ProcServConfig;
+use crate::procserv::config::ListenConfig;
 use crate::procserv::endpoint::{Endpoint, UnixEndpoint};
 use crate::procserv::error::{ProcServError, ProcServResult};
 
@@ -54,8 +54,19 @@ impl Drop for UnlinkOnDrop {
 /// `acceptItem` before `forkAndGo` and `exit(error)`s on failure
 /// (`procServ.cc:513-543,551`).
 enum BoundEndpoint {
-    Tcp(StdTcpListener),
+    /// The `SocketAddr` is read back from the kernel right after the bind
+    /// (C `getsockname`, `acceptFactory.cc:184`), so a `:0` config carries
+    /// the real assigned port from the moment the listener exists.
+    Tcp(StdTcpListener, SocketAddr),
     Unix(StdUnixListener, UnixEndpoint),
+}
+
+/// A bound listener's address, for publishing (info file / `PROCSERV_INFO`).
+/// TCP carries the kernel-reported address; UNIX carries the endpoint spec
+/// (C `writeAddress` prints `addr.sun_path`, which is the bound path).
+pub enum BoundAddr<'a> {
+    Tcp(SocketAddr),
+    Unix(&'a UnixEndpoint),
 }
 
 /// One bound-but-not-accepting listener plus the metadata its accept loop
@@ -77,9 +88,28 @@ impl PreboundListener {
     /// races anyone else binding an ephemeral port in that gap.
     pub fn local_addr(&self) -> Option<SocketAddr> {
         match &self.listener {
-            BoundEndpoint::Tcp(l) => l.local_addr().ok(),
+            BoundEndpoint::Tcp(_, addr) => Some(*addr),
             BoundEndpoint::Unix(..) => None,
         }
+    }
+
+    /// The bound address for publishing (info file / `PROCSERV_INFO`).
+    /// For TCP this is the kernel-reported address captured at bind time
+    /// (C refreshes its `addr` member via `getsockname` right after
+    /// `bind`+`listen`, `acceptFactory.cc:184`, and `writeInfoFile` prints
+    /// that member), so a config that said port `0` publishes the real
+    /// assigned port, never the `:0` placeholder.
+    pub fn bound_addr(&self) -> BoundAddr<'_> {
+        match &self.listener {
+            BoundEndpoint::Tcp(_, addr) => BoundAddr::Tcp(*addr),
+            BoundEndpoint::Unix(_, ep) => BoundAddr::Unix(ep),
+        }
+    }
+
+    /// `true` ⇒ read-only log/viewer endpoint (bound from `listen.log`);
+    /// `false` ⇒ control endpoint.
+    pub fn readonly(&self) -> bool {
+        self.readonly
     }
 
     /// Run this listener's accept loop until the supervisor's `out` channel
@@ -88,7 +118,7 @@ impl PreboundListener {
     /// per-listener in C too).
     pub async fn accept(self, out: mpsc::Sender<IncomingClient>) {
         let res = match self.listener {
-            BoundEndpoint::Tcp(l) => run_tcp_accept(l, self.readonly, out).await,
+            BoundEndpoint::Tcp(l, _) => run_tcp_accept(l, self.readonly, out).await,
             BoundEndpoint::Unix(l, ep) => run_unix_accept(l, ep, self.readonly, out).await,
         };
         if let Err(e) = res {
@@ -112,12 +142,12 @@ impl PreboundListener {
 /// UNIX/abstract binds go through tokio listeners (reused verbatim for
 /// their tested option/permission handling) which are then detached to
 /// their `std` form via `into_std`.
-pub fn bind_endpoints(config: &ProcServConfig) -> ProcServResult<Vec<PreboundListener>> {
+pub fn bind_endpoints(listen: &ListenConfig) -> ProcServResult<Vec<PreboundListener>> {
     let mut bound = Vec::new();
-    for ep in &config.listen.control {
+    for ep in &listen.control {
         bound.push(bind_one(ep.clone(), false, "control")?);
     }
-    if let Some(ep) = &config.listen.log {
+    if let Some(ep) = &listen.log {
         bound.push(bind_one(ep.clone(), true, "log")?);
     }
     Ok(bound)
@@ -128,7 +158,13 @@ pub fn bind_endpoints(config: &ProcServConfig) -> ProcServResult<Vec<PreboundLis
 fn bind_one(ep: Endpoint, readonly: bool, role: &'static str) -> ProcServResult<PreboundListener> {
     let listener = match ep {
         Endpoint::Tcp(addr) => {
-            BoundEndpoint::Tcp(tcp_listen(addr)?.into_std().map_err(ProcServError::Io)?)
+            let std_listener = tcp_listen(addr)?.into_std().map_err(ProcServError::Io)?;
+            // Read the real address back from the kernel while still in the
+            // fail-fast bind path (C `getsockname` right after `bind`+`listen`,
+            // `acceptFactory.cc:184`) — with port `0` this is the assigned
+            // port, and it is what gets published, not the config placeholder.
+            let bound = std_listener.local_addr().map_err(ProcServError::Io)?;
+            BoundEndpoint::Tcp(std_listener, bound)
         }
         Endpoint::Unix(u) => {
             let std_listener = bind_unix(&u)?.into_std().map_err(ProcServError::Io)?;

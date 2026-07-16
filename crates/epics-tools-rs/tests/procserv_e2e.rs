@@ -76,34 +76,17 @@ fn cat_config(port: u16) -> ProcServConfig {
 /// window), the listener here is already bound before this function
 /// returns — nothing can steal the port in between.
 ///
-/// Also rewrites `cfg`'s `:0` placeholders to the addresses actually
-/// bound before constructing the `ProcServ`: `bootstrap` publishes the
-/// info file / `PROCSERV_INFO` env from `config.listen` verbatim, not
-/// from the prebound listeners, so a config left at `:0` would report an
-/// unusable port there even though the listener itself is bound and
-/// reachable.
-async fn spawn_bound(mut cfg: ProcServConfig) -> (ProcServ, Vec<u16>) {
-    let listeners = bind_endpoints(&cfg).expect("bind configured endpoints");
+/// The config keeps its `:0` placeholders: everything the supervisor
+/// publishes (info file, `PROCSERV_INFO`) is derived from the bound
+/// listeners, not from `config.listen` (C getsockname parity,
+/// acceptFactory.cc:184), so no rewrite is needed here.
+async fn spawn_bound(cfg: ProcServConfig) -> (ProcServ, Vec<u16>) {
+    let listeners = bind_endpoints(&cfg.listen).expect("bind configured endpoints");
     let ports: Vec<u16> = listeners
         .iter()
         .filter_map(|l| l.local_addr())
         .map(|a| a.port())
         .collect();
-
-    let mut bound_tcp_addrs = listeners.iter().filter_map(|l| l.local_addr());
-    for ep in cfg
-        .listen
-        .control
-        .iter_mut()
-        .chain(cfg.listen.log.iter_mut())
-    {
-        if let Endpoint::Tcp(addr) = ep {
-            *addr = bound_tcp_addrs
-                .next()
-                .expect("a bound TCP address for each TCP control/log endpoint");
-        }
-    }
-
     let server = ProcServ::new(cfg).expect("build").with_prebound(listeners);
     (server, ports)
 }
@@ -1330,6 +1313,65 @@ async fn info_file_is_published_at_startup_even_under_wait_for_manual_start() {
         body.contains(&format!("tcp:127.0.0.1:{port}")),
         "info file must carry the control endpoint the manager connects to; got: {body:?}"
     );
+
+    server_task.abort();
+}
+
+/// The published addresses must come from the *bound* listeners, not the
+/// config. C refreshes each acceptItem's address from the kernel right
+/// after binding (`getsockname`, acceptFactory.cc:184) and `writeInfoFile`
+/// prints that refreshed address, so a `--port 0` deployment publishes the
+/// real assigned port. This drives the `prebound: None` path — bootstrap
+/// binds the endpoints itself (foreground/library mode), the config still
+/// says `:0` all the way through, and the info file is the only place the
+/// real port can be learned from; the sibling `--wait` test above covers
+/// the `with_prebound` path.
+#[tokio::test]
+async fn info_file_reports_the_kernel_assigned_port_for_a_port_zero_config() {
+    let mut cfg = cat_config(0);
+    let dir = tempfile::tempdir().unwrap();
+    let info = dir.path().join("ioc.info");
+    cfg.logging.info_path = Some(info.clone());
+
+    // No spawn_bound / with_prebound: bootstrap must bind and publish.
+    let server = ProcServ::new(cfg).expect("build");
+    let server_task = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    let body = {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match std::fs::read_to_string(&info) {
+                Ok(s) if !s.is_empty() => break s,
+                _ if Instant::now() < deadline => sleep(Duration::from_millis(25)).await,
+                _ => panic!("info file must be written at startup"),
+            }
+        }
+    };
+
+    let port: u16 = body
+        .lines()
+        .find_map(|l| l.strip_prefix("tcp:127.0.0.1:"))
+        .expect("info file must carry a tcp control endpoint")
+        .trim()
+        .parse()
+        .expect("the published port must be numeric");
+    assert_ne!(
+        port, 0,
+        "a :0 config must publish the kernel-assigned port, not the placeholder; got: {body:?}"
+    );
+
+    // The published port must be the live listener, not a guess: a client
+    // that reads the info file (manage-procs) can connect to it.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match TcpStream::connect(("127.0.0.1", port)).await {
+            Ok(_) => break,
+            Err(_) if Instant::now() < deadline => sleep(Duration::from_millis(50)).await,
+            Err(e) => panic!("published port {port} must be connectable: {e}"),
+        }
+    }
 
     server_task.abort();
 }

@@ -9022,9 +9022,15 @@ fn test_same_value_dbput_after_miss_giveup_redispatches() {
     // processes, the entry gate (2240) passes via `!dmov`, the target
     // sits 500 steps out (not too_small), and the dispatch gate (2455,
     // `mip == MIP_DONE`) sends the move again — C retries a missed
-    // target on an operator re-put of the same value.
+    // target on an operator re-put of the same value. Anchored first:
+    // in C a dbPut pass can only exist after init_record, and an
+    // unanchored mailbox-wired record parks every pass
+    // (do_process_inner's anchor-first gate), which would swallow the
+    // re-dispatch this test asserts on.
     let mut rec = MotorRecord::new();
-    rec.set_device_state(motor_rs::device_state::new_shared_state());
+    let state = motor_rs::device_state::new_shared_state();
+    rec.set_device_state(state.clone());
+    anchor(&mut rec, &state);
     rec.stat.msta = MstaFlags::DONE;
     rec.stat.phase = MotionPhase::MainMove;
     rec.stat.dmov = false;
@@ -9201,9 +9207,14 @@ fn test_blinked_zero_tweak_pulses_dmov() {
     // the request is too_small and the sub-step pulse runs — DMOV
     // 1→0→1, no controller command (C 2333-2342 restores DMOV=TRUE on
     // the same pass; the Rust pulse posts the low half and the
-    // recovery pass restores it).
+    // recovery pass restores it). Anchored first: in C a TWF put can
+    // only exist after init_record, and an unanchored mailbox-wired
+    // record parks every pass (do_process_inner's anchor-first gate),
+    // which would swallow the recovery pass this test asserts on.
     let mut rec = MotorRecord::new();
-    rec.set_device_state(motor_rs::device_state::new_shared_state());
+    let state = motor_rs::device_state::new_shared_state();
+    rec.set_device_state(state.clone());
+    anchor(&mut rec, &state);
     rec.stat.msta = MstaFlags::DONE;
     rec.conv.mres = 0.001;
     rec.pos.val = 10.0;

@@ -495,6 +495,58 @@ pub struct ArrayMonitorPost {
 /// leaves the option bit set either way (e.g. `boRecord.c:294-299`,
 /// whose `get_units` writes `"s"` only for `HIGH`, yet `DBR_UNITS`
 /// survives for every `bo` field).
+/// What a record type's C `get_control_double` writes for a field its switch
+/// does not list — the slot's LAST arm.
+///
+/// Independent of [`crate::server::snapshot::PropertySupport::control_double`],
+/// which says whether the slot EXISTS at all (a NULL slot makes
+/// `dbAccess.c:257` fail and clears the option bit, so no leaf is served).
+/// This says what a slot that DOES exist answers when it falls through. The
+/// two genuinely differ: `acalcout` supplies the slot and still writes nothing
+/// for an unlisted field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlDefaultArm {
+    /// The slot ends in `recGblGetControlDouble` — the field TYPE's numeric
+    /// range (`recGbl.c:146-171`, table at `:372-419`).
+    RecGblRange,
+    /// The slot returns without writing, so `dbAccess.c:256`'s `(0.0, 0.0)`
+    /// seed stands.
+    Seed,
+}
+
+/// The last arm of `rtype`'s C `get_control_double`.
+///
+/// Audited by reading each ported record type's own C rset. Every record in
+/// EPICS base delegates (`aiRecord.c:267`, `aoRecord.c:341`, `calcRecord.c:235`,
+/// `calcoutRecord.c:506`, `aSubRecord.c:372`, `subRecord.c:272`,
+/// `selRecord.c:203`, `seqRecord.c:342`, `dfanoutRecord.c:197`,
+/// `longinRecord.c:217`, `longoutRecord.c:268`, `int64inRecord.c:212`,
+/// `int64outRecord.c:251`, `boRecord.c:310`, `waveformRecord.c:268`,
+/// `aaiRecord.c:293`, `aaoRecord.c:296`, `subArrayRecord.c:262`,
+/// `compressRecord.c:487`, `histogramRecord.c:458`), as do the downstream
+/// types that supply the slot (`motorRecord.cc:3303`, `epidRecord.c:285`,
+/// `tableRecord.c:806`). The rest NULL it outright and never reach here
+/// (`biRecord.c`, `mbbiRecord.c`, `mbboRecord.c`, `mbbiDirectRecord.c`,
+/// `mbboDirectRecord.c`, `stringinRecord.c`, `stringoutRecord.c`,
+/// `lsiRecord.c`, `lsoRecord.c`, `eventRecord.c`, `fanoutRecord.c`,
+/// `permissiveRecord.c`, `printfRecord.c`, `stateRecord.c`,
+/// `sseqRecord.c:141`, `swaitRecord.c`, `transformRecord.c`, `busyRecord.c`,
+/// `asynRecord.c`, `throttleRecord.c:70`, `scalerRecord.c:157`).
+///
+/// Only the synApps calc pair writes nothing: both end `get_control_double`
+/// with a bare `return(0)` after their listed cases, so C serves the seed
+/// where a delegating record serves the type range. Measured on the
+/// differential oracle as 42 `acalcout`/`scalcout` fields.
+pub fn control_default_arm(rtype: &str) -> ControlDefaultArm {
+    match rtype {
+        // aCalcoutRecord.c:793-822, sCalcoutRecord.c:653 — the switch lists
+        // VAL/HIHI/HIGH/LOW/LOLO and the A-L / PA-PL ranges, then falls off
+        // the end into `return(0)` with no recGbl delegation.
+        "acalcout" | "scalcout" => ControlDefaultArm::Seed,
+        _ => ControlDefaultArm::RecGblRange,
+    }
+}
+
 pub fn default_property_support(rtype: &str) -> crate::server::snapshot::PropertySupport {
     use crate::server::snapshot::PropertySupport as P;
     match rtype {
@@ -611,121 +663,6 @@ pub fn default_property_support(rtype: &str) -> crate::server::snapshot::Propert
         // file and line — when porting a new record type.
         _ => P::NUMERIC,
     }
-}
-
-/// What one C `rset` metadata slot wrote for ONE field.
-///
-/// C's `get_units` / `get_precision` / `get_graphic_double` /
-/// `get_control_double` / `get_alarm_double` all dispatch on
-/// `dbGetFieldIndex(paddr)` (`aiRecord.c:244`, `calcRecord.c:205`,
-/// `seqRecord.c:321`, …) and end in exactly one of these four outcomes.
-/// Naming them is what lets a record type transcribe its C rset literally
-/// instead of patching a record-level cache that C never consults.
-#[derive(Debug, Clone, PartialEq)]
-pub enum MetaSlot<T> {
-    /// The slot wrote what the record-level cache already carries: the field
-    /// routes to the very record fields [`super::RecordInstance`]'s
-    /// `populate_display_info` / `populate_control_info` read (`HOPR`/`LOPR`,
-    /// `DRVH`/`DRVL`, `EGU`, `PREC`). This is C's VAL route — `aiRecord.c:246`
-    /// `*pgd = prec->hopr` for `aiRecordVAL` — and the alarm-band fields that
-    /// share it (`HIHI`/`HIGH`/`LOW`/`LOLO`, `:248-252`).
-    RecordLevel,
-    /// The slot wrote this value for this field — a record-specific constant
-    /// or a non-VAL record field (`calcoutRecord.c:446` `*precision =
-    /// calcoutODLYprecision`, `seqRecord.c:283` `strcpy(units, "s")`).
-    Wrote(T),
-    /// The slot delegated to `recGblGetGraphicDouble` /
-    /// `recGblGetControlDouble` / `recGblGetPrec` — the field's DBF type
-    /// range (`recGbl.c:146-171`, table at `:372-419`). This is the `default:`
-    /// arm of every C metadata slot, and the port had no equivalent at all:
-    /// it served the record-level cache to every field instead.
-    RecGbl,
-    /// The slot returned without writing, so the `dbAccess.c` seed survives
-    /// (graphic/control `(0.0, 0.0)` `:216`/`:256`, alarm `NaN×4` `:290`,
-    /// units `""` `:377`).
-    ///
-    /// C's explicit no-write arm — `aSubRecord.c:350`'s `default:`.
-    Unwritten,
-    /// C fetched this slot THROUGH the named link field before returning:
-    /// `dbGetPrecision(&prec->inpa, precision)` (`calcRecord.c:227`),
-    /// `dbGetGraphicLimits(&prec->inpa, …)` (`:223-230`),
-    /// `aSubRecord.c:356-369`, `subRecord.c:260-266`, `seqRecord.c:332-336`.
-    ///
-    /// C writes the record's buffer only when the fetch returns zero; every
-    /// caller ignores the status and keeps its seed otherwise
-    /// (`PvDatabase::link_metadata`'s contract). An UNSET or CONSTANT link
-    /// reports nothing at all — `dbConst_lset` NULLs every metadata slot
-    /// (`dbConstLink.c:234-248`), so `dbGetGraphicLimits` short-circuits to
-    /// `S_db_noLSET` (`dbLink.c:358-359`) — and the seed survives.
-    ///
-    /// **The fetch is not wired.** Resolving it needs
-    /// `PvDatabase::link_metadata`, which is `async` and needs the database;
-    /// this snapshot path is sync and holds the record's read guard. The arm
-    /// therefore resolves to the seed, which is exactly C's answer whenever
-    /// the link is unset or constant — the only two cases the differential
-    /// oracle measures, because every oracle record is empty-bodied. A record
-    /// wired to a live DB/CA/PVA link will serve the seed where C serves the
-    /// target's metadata. Naming the arm keeps that gap visible instead of
-    /// letting it read as a transcribed `Unwritten`.
-    ///
-    /// Never valid for `control`: `dbGetControlLimits` has no callers in
-    /// EPICS base — see [`FieldMetaRoutes::control`].
-    Link(&'static str),
-}
-
-/// The five `rset` metadata slots, routed for ONE field — the return of
-/// [`Record::field_metadata_routes`].
-///
-/// A record type that implements this transcribes its C rset field-for-field:
-/// every slot answers for every field, so there is no "unlisted field" whose
-/// metadata falls back to a record-level cache C never had.
-#[derive(Debug, Clone)]
-pub struct FieldMetaRoutes {
-    /// C RSET `get_units`. There is no `recGblGetUnits`, so this slot never
-    /// answers [`MetaSlot::RecGbl`].
-    pub units: MetaSlot<crate::types::PvString>,
-    /// C RSET `get_precision`. [`MetaSlot::RecGbl`] means `recGblGetPrec`
-    /// (`recGbl.c:119-144`) applied to the record's own `PREC` seed.
-    pub precision: MetaSlot<i16>,
-    /// `(upper, lower)` display limits — C RSET `get_graphic_double`.
-    pub graphic: MetaSlot<(f64, f64)>,
-    /// `(upper, lower)` control limits — C RSET `get_control_double`.
-    ///
-    /// This slot must never route through a link: `dbGetControlLimits` is
-    /// public API (`dbLink.h:436`) but has ZERO callers in all of EPICS base
-    /// — every record sends its link-backed fields to
-    /// `recGblGetControlDouble` instead (`calcRecord.c:251`,
-    /// `aSubRecord.c:376`).
-    pub control: MetaSlot<(f64, f64)>,
-    /// `(hihi, high, low, lolo)` — C RSET `get_alarm_double`.
-    /// [`MetaSlot::RecGbl`] is `recGblGetAlarmDouble` = four NaN
-    /// (`recGbl.c:155-162`), which is also the seed, so it coincides with
-    /// [`MetaSlot::Unwritten`] here.
-    pub alarm: MetaSlot<(f64, f64, f64, f64)>,
-}
-
-impl FieldMetaRoutes {
-    /// The all-`RecGbl` routing — C's shape for a field no slot lists, which
-    /// is the `default:` arm every transcribed record type ends with.
-    pub const RECGBL: Self = Self {
-        // `get_units` has no recGbl default: C's `default:` arm copies the
-        // record's `EGU` (`aiRecord.c:230`), which is the record-level cache.
-        units: MetaSlot::RecordLevel,
-        precision: MetaSlot::RecGbl,
-        graphic: MetaSlot::RecGbl,
-        control: MetaSlot::RecGbl,
-        alarm: MetaSlot::RecGbl,
-    };
-
-    /// The all-`RecordLevel` routing — every slot answers with the record's
-    /// own `HOPR`/`LOPR`/`EGU`/`PREC` metadata. C's VAL route.
-    pub const RECORD_LEVEL: Self = Self {
-        units: MetaSlot::RecordLevel,
-        precision: MetaSlot::RecordLevel,
-        graphic: MetaSlot::RecordLevel,
-        control: MetaSlot::RecordLevel,
-        alarm: MetaSlot::RecordLevel,
-    };
 }
 
 /// Per-field metadata deltas returned by
@@ -1378,35 +1315,6 @@ pub trait Record: Send + Sync + 'static {
     /// `field` is uppercase, as declared in [`Record::field_list`].
     /// Default: `None` — record-level metadata serves every field.
     fn field_metadata_override(&self, _field: &str) -> Option<FieldMetadataOverride> {
-        None
-    }
-
-    /// This record type's five `rset` metadata slots, routed for `field` —
-    /// a literal transcription of the C record's `get_units` /
-    /// `get_precision` / `get_graphic_double` / `get_control_double` /
-    /// `get_alarm_double`, each of which dispatches on
-    /// `dbGetFieldIndex(paddr)` and ends in one of [`MetaSlot`]'s four
-    /// outcomes.
-    ///
-    /// **This is the per-field metadata owner.** The record-level cache
-    /// (`populate_display_info` / `populate_control_info`) describes the VAL
-    /// field only; C never serves it to another field. A record type that
-    /// implements this hook decides every field's metadata itself, so the
-    /// blanket cache cannot leak — an `ai`'s `.PHAS` gets
-    /// `recGblGetGraphicDouble`'s `±1e300` (`aiRecord.c:244-266`), not the
-    /// record's unset `HOPR`/`LOPR` of `0/0`.
-    ///
-    /// Returning `None` means this record type's C rset has not been
-    /// transcribed: the framework keeps the legacy record-level cache for
-    /// every field, and [`Record::field_metadata_override`] still applies.
-    /// That is the pre-transcription behaviour, kept so an untranscribed
-    /// record type cannot silently lose the metadata it already serves —
-    /// it is a migration boundary, not a second routing model. Transcribe
-    /// a type by implementing this hook (with the C file and line per arm)
-    /// and dropping its `field_metadata_override`.
-    ///
-    /// `field` is uppercase, as declared in [`Record::field_list`].
-    fn field_metadata_routes(&self, _field: &str) -> Option<FieldMetaRoutes> {
         None
     }
 

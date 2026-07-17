@@ -1,6 +1,7 @@
 use crate::error::{CaError, CaResult};
 use crate::server::record::{
-    Ftype, MENU_FTYPE, MENU_YES_NO, ProcessAction, ProcessOutcome, Record, parse_link_v2,
+    FieldMetadataOverride, Ftype, MENU_FTYPE, MENU_YES_NO, ProcessAction, ProcessOutcome, Record,
+    parse_link_v2,
 };
 use crate::server::records::count_put;
 use crate::types::{DbFieldType, EpicsValue, PvString};
@@ -693,6 +694,35 @@ fn dol_is_constant(dol: &str) -> bool {
 impl Record for WaveformRecord {
     fn record_type(&self) -> &'static str {
         self.kind.as_record_type()
+    }
+
+    /// `subArrayRecord.c:262-291` `get_control_double` lists four fields beyond
+    /// `VAL`, each bounded by the record's maximum array length `MALM`: `INDX`
+    /// (a 0-based offset, so `MALM - 1` up), `NELM` (a length, so `MALM` up and
+    /// **1** down — C's control lower differs from its graphic lower of 0,
+    /// `:246` vs `:277`), `NORD` (`MALM` up, 0 down) and `BUSY` (a flag: 1/0).
+    /// Only `subArray` has this rset; `waveform` proper answers the shared
+    /// route, so this is gated on the kind rather than the shared struct.
+    fn field_metadata_override(&self, field: &str) -> Option<FieldMetadataOverride> {
+        if self.kind != ArrayKind::SubArray {
+            return None;
+        }
+        let malm = self.malm as f64;
+        let ctrl_limits = if field.eq_ignore_ascii_case("INDX") {
+            (malm - 1.0, 0.0)
+        } else if field.eq_ignore_ascii_case("NELM") {
+            (malm, 1.0)
+        } else if field.eq_ignore_ascii_case("NORD") {
+            (malm, 0.0)
+        } else if field.eq_ignore_ascii_case("BUSY") {
+            (1.0, 0.0)
+        } else {
+            return None;
+        };
+        Some(FieldMetadataOverride {
+            ctrl_limits: Some(ctrl_limits),
+            ..Default::default()
+        })
     }
 
     /// Expose the concrete record so device support can drive the

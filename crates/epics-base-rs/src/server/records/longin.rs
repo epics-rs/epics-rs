@@ -3,8 +3,24 @@ use epics_macros_rs::EpicsRecord;
 use crate::server::record::MENU_YES_NO;
 use crate::types::PvString;
 
+/// `longinRecord.c:206-224` `get_control_double` lists one field the shared
+/// VAL-class set does not: `SVAL`, which takes the record's own `HOPR`/`LOPR`
+/// like `VAL` does. Without this it falls to the `default:` arm and reports
+/// the DBF_LONG range of ±2147483647.
+fn longin_metadata_override(
+    rec: &LonginRecord,
+    field: &str,
+) -> Option<crate::server::record::FieldMetadataOverride> {
+    field
+        .eq_ignore_ascii_case("SVAL")
+        .then(|| crate::server::record::FieldMetadataOverride {
+            ctrl_limits: Some((rec.hopr as f64, rec.lopr as f64)),
+            ..Default::default()
+        })
+}
+
 #[derive(EpicsRecord)]
-#[record(type = "longin")]
+#[record(type = "longin", metadata_override = longin_metadata_override)]
 pub struct LonginRecord {
     #[field(type = "Long")]
     pub val: i32,

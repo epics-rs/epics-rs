@@ -1657,6 +1657,11 @@ impl RecordInstance {
         snap.control = meta.control;
         snap.enums = meta.enums;
 
+        // The cache above is the record's VAL metadata. C routes PER FIELD, so
+        // a non-VAL-class field does NOT get VAL's limits — see
+        // [`Self::route_field_metadata`], which owns that decision.
+        self.route_field_metadata(field, &mut snap);
+
         // Per-field RSET metadata (C get_units/get_precision/
         // get_graphic_double/get_control_double/get_alarm_double key on
         // dbGetFieldIndex) patches the record-level cache for this field.
@@ -4239,6 +4244,9 @@ impl RecordInstance {
         snap.display = meta.display;
         snap.control = meta.control;
         snap.enums = meta.enums;
+        // Same per-field routing owner as the GET path — a monitor update must
+        // carry the same metadata a read of that field would.
+        self.route_field_metadata(field, &mut snap);
         // Per-field RSET metadata, same as the GET path
         // (`snapshot_for_field`) — a monitor update for VELO must carry
         // VELO's limits, not the record-level VAL limits.
@@ -4281,13 +4289,6 @@ impl RecordInstance {
         {
             display.form = 0;
         }
-        // A record type that has transcribed its C rset owns every slot for
-        // every field; the legacy record-level cache and the
-        // `field_metadata_override` patch below are the untranscribed path.
-        if let Some(routes) = self.record.field_metadata_routes(field) {
-            self.apply_field_metadata_routes(field, routes, snap);
-            return;
-        }
         let Some(ov) = self.record.field_metadata_override(field) else {
             return;
         };
@@ -4321,136 +4322,112 @@ impl RecordInstance {
         }
     }
 
-    /// Resolve a transcribed record's [`FieldMetaRoutes`] against C's
-    /// `dbAccess.c` seeds and write the result into `snap`.
+    /// C's rset metadata slots route **per field**, on `dbGetFieldIndex`. The
+    /// port's metadata cache is the record's VAL metadata, and serving it to
+    /// every field is what made a non-VAL field report VAL's limits.
     ///
-    /// The single owner of "what a routed slot means". Each [`MetaSlot`]
-    /// resolves the same way for every record type and every field, so a
-    /// transcription only has to say WHICH arm C takes — never what the arm
-    /// is worth:
+    /// Every base record's `get_control_double` / `get_alarm_double` has the
+    /// same two-arm shape: a listed set of VAL-class field indices that take
+    /// the record's own limits, and a `default:` arm that hands the field to
+    /// `recGblGetControlDouble` / `recGblGetAlarmDouble` — the field TYPE's
+    /// numeric range, and four NaN. This routes the `default:` arm; the
+    /// VAL-class set keeps the cache, which already holds exactly the record's
+    /// own limits (and already distinguishes `ao`'s DRVH/DRVL from `ai`'s
+    /// HOPR/LOPR).
     ///
-    /// * [`MetaSlot::RecordLevel`] — leave the record-level cache in place.
-    /// * [`MetaSlot::Wrote`] — assign the transcribed value.
-    /// * [`MetaSlot::RecGbl`] — the `recGbl*` default, keyed on the field's
-    ///   **static dbd** type ([`Self::rec_gbl_range_for`]).
-    /// * [`MetaSlot::Unwritten`] — the `dbAccess.c` seed.
+    /// Measured on a real `softIocPVX` against `record(calc,"X"){}`:
+    /// `.PHAS` (DBF_SHORT, unlisted) serves control ±32767 — the SHRT range —
+    /// while `.VAL` and `.HIHI` (both listed) serve 0/0 from HOPR/LOPR.
     ///
-    /// The marking mask is NOT decided here: whether a leaf reaches the wire
-    /// at all is [`Self::assign_property_support`]'s call (C clears the
-    /// option bit for a NULL rset slot, `dbAccess.c:217-220`). A slot the
-    /// record type does not implement is never marked, so the value this
-    /// writes for it is unobservable.
-    fn apply_field_metadata_routes(
-        &self,
-        field: &str,
-        routes: super::record_trait::FieldMetaRoutes,
-        snap: &mut super::super::snapshot::Snapshot,
-    ) {
-        use super::record_trait::MetaSlot;
-        use crate::server::recgbl::{rec_gbl_get_alarm_double, rec_gbl_get_prec};
+    /// Deliberately NOT routed here, and why:
+    ///
+    /// * **display (graphic) limits.** Unlike control, the `default:` arm of
+    ///   `get_graphic_double` tries a LINK first
+    ///   (`calcRecord.c` `get_linkNumber` → `dbGetGraphicLimits`) and only
+    ///   falls to `recGbl` for a field that backs no link. A constant (unset)
+    ///   link has no metadata getters, so the `dbAccess.c:216` 0/0 seed stands
+    ///   — measured: `CALC.A` serves display 0/0 but control ±1e300. Which
+    ///   fields back links is per-record C knowledge the port models nowhere
+    ///   (no `FieldDesc` relation, no trait hook), so defaulting display to the
+    ///   type range would CREATE defects on every link-backed field.
+    /// * **units / precision.** Same link-first shape
+    ///   (`calcRecord.c` `get_units`, `get_precision`).
+    ///
+    /// Both remain a measured residue rather than a guess.
+    ///
+    /// The last arm is not the same for every record type — a slot can also
+    /// fall through WITHOUT delegating, keeping the seed. That fact is one bit
+    /// per record type, read from its C source: [`control_default_arm`].
+    fn route_field_metadata(&self, field: &str, snap: &mut super::super::snapshot::Snapshot) {
+        // The rset slots this record type actually supplies. A NULL slot makes
+        // `dbAccess.c` clear the option bit, so the leaf is never served and
+        // there is nothing to route — minting a value here would put a
+        // fabricated number on the CA wire, which has no marking layer to
+        // suppress it (`codec.rs` `get_limits` reads these structs ungated).
+        let slots = self.record.property_support();
 
-        let d = snap.display.get_or_insert_with(Default::default);
-
-        // `get_units`: no `recGblGetUnits` exists, so `RecGbl` is
-        // unreachable and resolves as the record-level `EGU` — C's
-        // `default:` arm copies `prec->egu` (`aiRecord.c:230`).
-        match routes.units {
-            MetaSlot::Wrote(u) => d.units = u,
-            // `dbAccess.c:377` memsets the caller's 16-byte buffer before the
-            // slot runs, so a slot that writes nothing serves the empty
-            // string — NOT the record's EGU. A link fetch that reports
-            // nothing lands on the same seed (`calcRecord.c:172-181` puts the
-            // EGU fallback in the `else` arm a link-backed field never takes).
-            MetaSlot::Unwritten | MetaSlot::Link(_) => d.units = Default::default(),
-            MetaSlot::RecordLevel | MetaSlot::RecGbl => {}
+        if Self::is_val_class_field(field) {
+            return;
         }
 
-        match routes.precision {
-            MetaSlot::Wrote(p) => d.precision = p,
-            // `recGblGetPrec` (`recGbl.c:119-144`) mutates the seed the
-            // record's `get_precision` already stored — the record's own
-            // `PREC`, which is what the record-level cache carries.
-            MetaSlot::RecGbl => {
-                d.precision = rec_gbl_get_prec(self.static_field_type(field), d.precision);
-            }
-            MetaSlot::Unwritten => d.precision = 0,
-            // A link-backed precision is seeded with the record's own PREC
-            // BEFORE the fetch (`calcRecord.c:191` `*pprecision =
-            // prec->prec`), so an unset link serves PREC — measured on a real
-            // softIoc, and the reason this arm is not `Unwritten`. A record
-            // that seeds something else must say so with `Wrote`.
-            MetaSlot::RecordLevel | MetaSlot::Link(_) => {}
+        // C `get_control_double`'s last arm. No base record routes control
+        // through a link: `dbGetControlLimits` has zero callers in all of
+        // base, so unlike display this arm needs no link branch.
+        if slots.control_double {
+            let (upper, lower) =
+                match super::record_trait::control_default_arm(self.record.record_type()) {
+                    // `recGblGetControlDouble` → `getMaxRangeValues(field_type)`.
+                    // A type with no case in C's switch (STRING/MENU/DEVICE/links)
+                    // is written by nothing, leaving the `dbAccess.c:256` seed —
+                    // which is 0/0, exactly what `unwrap_or` supplies.
+                    super::record_trait::ControlDefaultArm::RecGblRange => {
+                        self.rec_gbl_range_for(field).unwrap_or((0.0, 0.0))
+                    }
+                    // The slot exists but writes nothing here, so the same
+                    // `dbAccess.c:256` seed stands. Modelled as a value rather
+                    // than as `None`: C's option bit is ON (the slot is supplied
+                    // and returned 0), so the leaf IS served — carrying the seed.
+                    super::record_trait::ControlDefaultArm::Seed => (0.0, 0.0),
+                };
+            snap.control = Some(super::super::snapshot::ControlInfo {
+                upper_ctrl_limit: upper,
+                lower_ctrl_limit: lower,
+            });
         }
 
-        match routes.graphic {
-            MetaSlot::Wrote((upper, lower)) => {
-                d.upper_disp_limit = upper;
-                d.lower_disp_limit = lower;
-            }
-            MetaSlot::RecGbl => {
-                // No case in C's switch (`recGbl.c:372-419` has no
-                // `default:`) means nothing is written, so the seed stands.
-                let (upper, lower) = self.rec_gbl_range_for(field).unwrap_or((0.0, 0.0));
-                d.upper_disp_limit = upper;
-                d.lower_disp_limit = lower;
-            }
-            // `dbAccess.c:216` seeds `(0.0, 0.0)`.
-            MetaSlot::Unwritten | MetaSlot::Link(_) => {
-                d.upper_disp_limit = 0.0;
-                d.lower_disp_limit = 0.0;
-            }
-            MetaSlot::RecordLevel => {}
-        }
-
-        let alarm = match routes.alarm {
-            MetaSlot::Wrote(v) => Some(v),
-            // `recGblGetAlarmDouble` writes four NaN (`recGbl.c:155-162`),
-            // which is also the `dbAccess.c:290` seed a `Link` miss keeps.
-            MetaSlot::RecGbl | MetaSlot::Unwritten | MetaSlot::Link(_) => {
-                Some(rec_gbl_get_alarm_double())
-            }
-            MetaSlot::RecordLevel => None,
-        };
-        if let Some((hihi, high, low, lolo)) = alarm {
+        // C `get_alarm_double` `default:` → `recGblGetAlarmDouble` → four NaN
+        // (`recGbl.c:155-162`). The link-backed sibling arm lands on the same
+        // answer here: `dbAccess.c:294` seeds four NaN, and a constant link
+        // supplies no alarm limits to overwrite them.
+        if slots.alarm_double {
+            let (hihi, high, low, lolo) = crate::server::recgbl::rec_gbl_get_alarm_double();
+            // The four alarm limits live on DisplayInfo because that mirrors
+            // C's `dbr_gr_double` packing, which the CA encoder depends on.
+            // Minting it here is safe: every other DisplayInfo field defaults
+            // to the same value the `None` path already served.
+            let d = snap.display.get_or_insert_with(Default::default);
             d.upper_alarm_limit = hihi;
             d.upper_warning_limit = high;
             d.lower_warning_limit = low;
             d.lower_alarm_limit = lolo;
         }
+    }
 
-        match routes.control {
-            MetaSlot::Wrote((upper, lower)) => {
-                let c = snap.control.get_or_insert_with(Default::default);
-                c.upper_ctrl_limit = upper;
-                c.lower_ctrl_limit = lower;
-            }
-            MetaSlot::RecGbl => {
-                let (upper, lower) = self.rec_gbl_range_for(field).unwrap_or((0.0, 0.0));
-                let c = snap.control.get_or_insert_with(Default::default);
-                c.upper_ctrl_limit = upper;
-                c.lower_ctrl_limit = lower;
-            }
-            // `dbAccess.c:256` seeds `(0.0, 0.0)`.
-            MetaSlot::Unwritten => {
-                let c = snap.control.get_or_insert_with(Default::default);
-                c.upper_ctrl_limit = 0.0;
-                c.lower_ctrl_limit = 0.0;
-            }
-            // `dbGetControlLimits` is public API (`dbLink.h:436`) and
-            // `dbDbLink.c:414` really installs `dbDbGetControlLimits`, but
-            // NOTHING in EPICS base calls either: every record routes its
-            // link-backed fields to `recGblGetControlDouble` instead
-            // (`calcRecord.c:251`, `aSubRecord.c:376`). A transcription that
-            // reaches here has read C's `get_graphic_double` and copied it
-            // into the control slot — the one mistake this slot invites.
-            MetaSlot::Link(link) => unreachable!(
-                "{}.{field}: control limits routed through link {link}, but no EPICS base \
-                 record fetches control limits through a link — C sends link-backed fields \
-                 to recGblGetControlDouble (dbGetControlLimits has zero callers in base)",
-                self.record.record_type()
-            ),
-            MetaSlot::RecordLevel => {}
-        }
+    /// The field indices every base record lists explicitly in its
+    /// `get_control_double` / `get_alarm_double` switch before the `default:`
+    /// arm — VAL and the alarm-band siblings that share VAL's range.
+    ///
+    /// This is one shared set, not a per-record table: `aiRecord.c`,
+    /// `aoRecord.c` and `calcRecord.c` list these same eight. The per-record
+    /// EXTRAS are not modelled — `ai` also lists `SVAL`, `ao` also lists
+    /// `OVAL`/`PVAL` — so those few fields take the `default:` arm here and
+    /// stay a measured residue. Modelling them means a per-record table, which
+    /// is the transcription this routing exists to avoid.
+    fn is_val_class_field(field: &str) -> bool {
+        crate::server::database::is_value_field(field)
+            || ["HIHI", "HIGH", "LOW", "LOLO", "LALM", "ALST", "MLST"]
+                .iter()
+                .any(|f| field.eq_ignore_ascii_case(f))
     }
 
     /// The field's type as the **dbd declares it**, which is the only type

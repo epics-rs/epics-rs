@@ -696,31 +696,55 @@ impl Record for WaveformRecord {
         self.kind.as_record_type()
     }
 
+    /// The index fields four kinds answer from their own array bounds rather
+    /// than from the field's type range — so they cannot take the routed
+    /// `default:` arm, and cannot keep the VAL cache either.
+    ///
     /// `subArrayRecord.c:262-291` `get_control_double` lists four fields beyond
     /// `VAL`, each bounded by the record's maximum array length `MALM`: `INDX`
     /// (a 0-based offset, so `MALM - 1` up), `NELM` (a length, so `MALM` up and
     /// **1** down — C's control lower differs from its graphic lower of 0,
     /// `:246` vs `:277`), `NORD` (`MALM` up, 0 down) and `BUSY` (a flag: 1/0).
-    /// Only `subArray` has this rset; `waveform` proper answers the shared
-    /// route, so this is gated on the kind rather than the shared struct.
+    ///
+    /// `get_graphic_double` is a DIFFERENT list per kind, so the two slots are
+    /// answered separately here:
+    ///
+    /// * `subArray` (`:231-260`) — the same four, but `NELM`'s lower is **0**.
+    /// * `waveform` (`:251-266`) — only `BUSY` (1/0) and `NORD` (`NELM` up, 0
+    ///   down); it does NOT list `NELM`, which is why `NELM` takes the routed
+    ///   type range for a waveform and `MALM` for a subArray.
+    /// * `aai` (`:276-291`) / `aao` (`:279-294`) — only `NORD` (`NELM` up, 0).
+    ///
+    /// `VAL` is absent from both lists here: it answers HOPR/LOPR, which is
+    /// what the VAL metadata cache already holds.
     fn field_metadata_override(&self, field: &str) -> Option<FieldMetadataOverride> {
-        if self.kind != ArrayKind::SubArray {
+        let malm = self.malm as f64;
+        let nelm = self.nelm as f64;
+        let f = field.to_ascii_uppercase();
+
+        let ctrl_limits = match (self.kind, f.as_str()) {
+            (ArrayKind::SubArray, "INDX") => Some((malm - 1.0, 0.0)),
+            (ArrayKind::SubArray, "NELM") => Some((malm, 1.0)),
+            (ArrayKind::SubArray, "NORD") => Some((malm, 0.0)),
+            (ArrayKind::SubArray, "BUSY") => Some((1.0, 0.0)),
+            _ => None,
+        };
+        let disp_limits = match (self.kind, f.as_str()) {
+            (ArrayKind::SubArray, "INDX") => Some((malm - 1.0, 0.0)),
+            // The graphic lower is 0 where the control lower is 1.
+            (ArrayKind::SubArray, "NELM") => Some((malm, 0.0)),
+            (ArrayKind::SubArray, "NORD") => Some((malm, 0.0)),
+            (ArrayKind::SubArray, "BUSY") => Some((1.0, 0.0)),
+            (ArrayKind::Waveform, "BUSY") => Some((1.0, 0.0)),
+            (ArrayKind::Waveform | ArrayKind::Aai | ArrayKind::Aao, "NORD") => Some((nelm, 0.0)),
+            _ => None,
+        };
+        if ctrl_limits.is_none() && disp_limits.is_none() {
             return None;
         }
-        let malm = self.malm as f64;
-        let ctrl_limits = if field.eq_ignore_ascii_case("INDX") {
-            (malm - 1.0, 0.0)
-        } else if field.eq_ignore_ascii_case("NELM") {
-            (malm, 1.0)
-        } else if field.eq_ignore_ascii_case("NORD") {
-            (malm, 0.0)
-        } else if field.eq_ignore_ascii_case("BUSY") {
-            (1.0, 0.0)
-        } else {
-            return None;
-        };
         Some(FieldMetadataOverride {
-            ctrl_limits: Some(ctrl_limits),
+            ctrl_limits,
+            disp_limits,
             ..Default::default()
         })
     }

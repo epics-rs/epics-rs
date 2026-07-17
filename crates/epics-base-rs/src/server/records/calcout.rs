@@ -3,7 +3,8 @@ use super::link_status::{LINK_CON, LINK_STATUS_CHOICES, LinkRole, LinkStatusGen,
 use crate::error::{CaError, CaResult};
 use crate::server::database::AsyncDbHandle;
 use crate::server::record::{
-    InputFetchPolicy, ProcessAction, ProcessOutcome, Record, RecordProcessResult,
+    FieldMetadataOverride, InputFetchPolicy, ProcessAction, ProcessOutcome, Record,
+    RecordProcessResult,
 };
 #[cfg(test)]
 use crate::types::DbFieldType;
@@ -452,6 +453,28 @@ const CALCOUT_DOPT_CHOICES: &[&str] = &["Use CALC", "Use OCAL"];
 impl Record for CalcoutRecord {
     fn record_type(&self) -> &'static str {
         "calcout"
+    }
+
+    /// `ODLY` is the one field in base whose graphic case is neither the
+    /// record's limits, nor a link, nor a plain `default:` arm
+    /// (`calcoutRecord.c:471-474`):
+    ///
+    /// ```c
+    /// case indexof(ODLY):
+    ///     recGblGetGraphicDouble(paddr,pgd);
+    ///     pgd->lower_disp_limit = 0.0;
+    /// ```
+    ///
+    /// It calls recGbl for the type range and then OVERWRITES the lower with a
+    /// literal 0 — a delay cannot be negative. So `ODLY` serves the DBF_DOUBLE
+    /// upper of 1e300 with a lower of 0, which no single routed arm produces.
+    fn field_metadata_override(&self, field: &str) -> Option<FieldMetadataOverride> {
+        field
+            .eq_ignore_ascii_case("ODLY")
+            .then(|| FieldMetadataOverride {
+                disp_limits: Some((1e300, 0.0)),
+                ..Default::default()
+            })
     }
 
     // C raises UDF_ALARM from BOTH `checkAlarms` and `execOutput`, and

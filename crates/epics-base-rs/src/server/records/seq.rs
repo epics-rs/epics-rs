@@ -5,6 +5,29 @@ use epics_macros_rs::EpicsRecord;
 /// 2=Mask.
 const SEQ_SELM_CHOICES: &[&str] = &["All", "Specified", "Mask"];
 
+/// `seqRecord.c:322-338` `get_graphic_double` answers the 16 `DLYn` delay
+/// fields with a hard-coded `0.0 .. 10.0`, not with their DBF_DOUBLE range and
+/// not from any record field — so `DLYn` can take neither the routed
+/// `default:` arm nor the VAL cache.
+///
+/// The literal is graphic's alone: the same record's `get_control_double`
+/// (`:342-352`) serves `0.0 .. seqDLYlimit`, and `seqDLYlimit` is 100000
+/// (`:81`), not 10. Reading one slot's arm off the other would be wrong by
+/// four orders of magnitude, which is why each slot is transcribed separately.
+fn seq_metadata_override(
+    _rec: &SeqRecord,
+    field: &str,
+) -> Option<crate::server::record::FieldMetadataOverride> {
+    // DLY0..DLY9, DLYA..DLYF — one per link group.
+    let f = field.to_ascii_uppercase();
+    let is_dly = matches!(f.as_bytes(), [b'D', b'L', b'Y', c]
+        if c.is_ascii_digit() || (b'A'..=b'F').contains(c));
+    is_dly.then(|| crate::server::record::FieldMetadataOverride {
+        disp_limits: Some((10.0, 0.0)),
+        ..Default::default()
+    })
+}
+
 /// `seq` record — sequenced multi-output writer.
 ///
 /// C parity (`seqRecord.c:86` `#define NUM_LINKS 16`,
@@ -22,6 +45,7 @@ const SEQ_SELM_CHOICES: &[&str] = &["All", "Specified", "Mask"];
 // DO0 here or never.
 #[record(
     type = "seq",
+    metadata_override = seq_metadata_override,
     constant_init = "SELL:SELN,DOL0:DO0,DOL1:DO1,DOL2:DO2,DOL3:DO3,DOL4:DO4,\
                      DOL5:DO5,DOL6:DO6,DOL7:DO7,DOL8:DO8,DOL9:DO9,DOLA:DOA,\
                      DOLB:DOB,DOLC:DOC,DOLD:DOD,DOLE:DOE,DOLF:DOF",

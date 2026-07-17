@@ -331,6 +331,17 @@ impl Snapshot {
             .then_some((c.lower_ctrl_limit, c.upper_ctrl_limit))
     }
 
+    /// `(lower, upper)` display limits, or `None` when the record type has no
+    /// `get_graphic_double` slot — the counterpart of [`Self::control_limits`],
+    /// gated on its own property bit because the two slots are independently
+    /// nullable in C.
+    pub fn display_limits(&self) -> Option<(f64, f64)> {
+        let d = self.display.as_ref()?;
+        self.properties
+            .graphic_double
+            .then_some((d.lower_disp_limit, d.upper_disp_limit))
+    }
+
     /// `(lolo, low, high, hihi)` alarm limits, or `None` when the record
     /// type has no `get_alarm_double` slot — the `waveform` case that made
     /// a GUI draw alarm bands at zero.

@@ -205,11 +205,16 @@ impl Record for HistogramRecord {
     /// whose limits are the span the buckets cover: `ULIM - LLIM` up, `0.0`
     /// down. Without this `WDTH` falls to the `default:` arm and reports the
     /// DBF_DOUBLE range of ±1e300.
+    /// `WDTH` is a COMPUTED span in both slots: `histogramRecord.c:467-469`
+    /// (control) and `:450-452` (graphic) each serve `ULIM - LLIM` up and a
+    /// literal `0.0` down — neither HOPR/LOPR nor the DBF_DOUBLE range, so it
+    /// can take neither the VAL cache nor the routed `default:` arm.
     fn field_metadata_override(&self, field: &str) -> Option<FieldMetadataOverride> {
         field
             .eq_ignore_ascii_case("WDTH")
             .then(|| FieldMetadataOverride {
                 ctrl_limits: Some((self.ulim - self.llim, 0.0)),
+                disp_limits: Some((self.ulim - self.llim, 0.0)),
                 ..Default::default()
             })
     }

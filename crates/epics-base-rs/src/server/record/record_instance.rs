@@ -4371,6 +4371,7 @@ impl RecordInstance {
         // fabricated number on the CA wire, which has no marking layer to
         // suppress it (`codec.rs` `get_limits` reads these structs ungated).
         let slots = self.record.property_support();
+        let rtype = self.record.record_type();
 
         // C `get_control_double`'s last arm. No base record routes control
         // through a link: `dbGetControlLimits` has zero callers in all of
@@ -4382,19 +4383,44 @@ impl RecordInstance {
                     // A type with no case in C's switch (STRING/MENU/DEVICE/links)
                     // is written by nothing, leaving the `dbAccess.c:256` seed —
                     // which is 0/0, exactly what `unwrap_or` supplies.
-                    super::record_trait::ControlDefaultArm::RecGblRange => {
+                    super::record_trait::RsetDefaultArm::RecGblRange => {
                         self.rec_gbl_range_for(field).unwrap_or((0.0, 0.0))
                     }
                     // The slot exists but writes nothing here, so the same
                     // `dbAccess.c:256` seed stands. Modelled as a value rather
                     // than as `None`: C's option bit is ON (the slot is supplied
                     // and returned 0), so the leaf IS served — carrying the seed.
-                    super::record_trait::ControlDefaultArm::Seed => (0.0, 0.0),
+                    super::record_trait::RsetDefaultArm::Seed => (0.0, 0.0),
                 };
             snap.control = Some(super::super::snapshot::ControlInfo {
                 upper_ctrl_limit: upper,
                 lower_ctrl_limit: lower,
             });
+        }
+
+        // C `get_graphic_double`'s last arm. Unlike control this one has a LINK
+        // branch ahead of the recGbl call, so the three answers are: keep the
+        // cache (listed on HOPR/LOPR), the link's limits, or the default arm.
+        if slots.graphic_double && !Self::graphic_explicit_field(rtype, field) {
+            let (upper, lower) = if Self::graphic_link_backed_field(rtype, field) {
+                // `dbGetGraphicLimits` on a CONSTANT link writes nothing — a
+                // constant has no metadata getters — so the `dbAccess.c:216`
+                // seed stands. The port has no link metadata to consult, and a
+                // link that IS connected would be answered by the upstream
+                // record, which this routing does not model either; both land
+                // here as the seed.
+                (0.0, 0.0)
+            } else {
+                match super::record_trait::graphic_default_arm(rtype) {
+                    super::record_trait::RsetDefaultArm::RecGblRange => {
+                        self.rec_gbl_range_for(field).unwrap_or((0.0, 0.0))
+                    }
+                    super::record_trait::RsetDefaultArm::Seed => (0.0, 0.0),
+                }
+            };
+            let d = snap.display.get_or_insert_with(Default::default);
+            d.upper_disp_limit = upper;
+            d.lower_disp_limit = lower;
         }
 
         // C `get_alarm_double` `default:` → `recGblGetAlarmDouble` → four NaN
@@ -4462,6 +4488,120 @@ impl RecordInstance {
         match rtype {
             "seq" | "aSub" => false,
             _ => crate::server::database::is_value_field(field),
+        }
+    }
+
+    /// `A`..`A+n-1` (a single letter) or `LA`..`LA+n-1` — C's calc-family
+    /// argument fields, addressed by index range rather than by name.
+    ///
+    /// `calcRecord.c:161-167` / `calcoutRecord.c:417-423` test
+    /// `idx >= indexof(A) && idx < indexof(A) + CALCPERFORM_NARGS`, and the dbd
+    /// declares those `CALCPERFORM_NARGS` fields contiguously as the single
+    /// letters `A`..`U` (`postfix.h:29` = 21, `calcRecord.dbd.pod:801-985`), so
+    /// the index range and the letter range are the same set.
+    fn calc_arg_field(field: &str, nargs: u8) -> bool {
+        let last = b'A' + nargs - 1;
+        match field.as_bytes() {
+            [c] => c.is_ascii_uppercase() && *c <= last,
+            [b'L', c] => c.is_ascii_uppercase() && *c <= last,
+            _ => false,
+        }
+    }
+
+    /// The fields C's **`get_graphic_double`** answers with the record's own
+    /// `HOPR`/`LOPR` — which is exactly what the VAL metadata cache already
+    /// holds, so routing must leave them on it.
+    ///
+    /// The third membership question, and a third distinct set: the alarm arm
+    /// lists VAL alone and the control arm lists the eight, but graphic lists
+    /// the eight PLUS a per-type tail, and two types cut it short.
+    ///
+    /// * base analog (`aiRecord.c:244-266`, `aoRecord.c:316-339`,
+    ///   `calcRecord.c:187-212`, `calcoutRecord.c:452-484`,
+    ///   `subRecord.c:222-247`, `selRecord.c:181-201`,
+    ///   `dfanoutRecord.c:181-195`, `longinRecord.c:190-204`,
+    ///   `longoutRecord.c`, `int64inRecord.c:196-210`, `int64outRecord.c`):
+    ///   the eight.
+    /// * `acalcout`/`scalcout` (`aCalcoutRecord.c:1046`, `sCalcoutRecord.c:906`)
+    ///   list only VAL/HIHI/HIGH/LOW/LOLO — NOT LALM/ALST/MLST — plus the
+    ///   `A`..`L` and `PA`..`PL` ranges.
+    /// * `sel` (`selRecord.c:193-196`) also lists `A`..`L` / `LA`..`LL`, via a
+    ///   GCC case range. It has no link arm at all, so its args are HOPR/LOPR
+    ///   where calc's identically-named ones are link-backed.
+    /// * the SVAL family (`aiRecord.c:253`, `longinRecord.c`,
+    ///   `int64inRecord.c:205`), `ao`'s `OVAL`/`PVAL`/`IVOV`
+    ///   (`aoRecord.c:322-338`), and `compress`'s `IHIL`/`ILIL`
+    ///   (`compressRecord.c:474-476`).
+    ///
+    /// Fields whose graphic case answers something OTHER than HOPR/LOPR are
+    /// NOT here — they cannot keep the cache and are supplied by
+    /// [`Record::field_metadata_override`] instead (`histogram` WDTH,
+    /// `subArray`/`waveform`/`aai`/`aao` index fields, `seq` DLYn,
+    /// `calcout` ODLY).
+    fn graphic_explicit_field(rtype: &str, field: &str) -> bool {
+        if crate::server::database::is_value_field(field) {
+            return true;
+        }
+        let f = field.to_ascii_uppercase();
+        let bands: &[&str] = match rtype {
+            "acalcout" | "scalcout" => &["HIHI", "HIGH", "LOW", "LOLO"],
+            _ => &["HIHI", "HIGH", "LOW", "LOLO", "LALM", "ALST", "MLST"],
+        };
+        if bands.contains(&f.as_str()) {
+            return true;
+        }
+        match rtype {
+            "ai" | "longin" | "int64in" => f == "SVAL",
+            "ao" => matches!(f.as_str(), "OVAL" | "PVAL" | "IVOV"),
+            "compress" => matches!(f.as_str(), "IHIL" | "ILIL"),
+            // sel's args are 12 (`SEL_MAX`), not the calc family's 21.
+            "sel" => Self::calc_arg_field(&f, 12),
+            // A..L and PA..PL, both to HOPR/LOPR.
+            "acalcout" | "scalcout" => {
+                Self::calc_arg_field(&f, 12)
+                    || matches!(f.as_bytes(), [b'P', c] if c.is_ascii_uppercase() && *c <= b'L')
+            }
+            _ => false,
+        }
+    }
+
+    /// The fields whose C `get_graphic_double` routes through a LINK —
+    /// `dbGetGraphicLimits` on the link that backs the field, not the field's
+    /// own type range.
+    ///
+    /// This is the one thing display needs that control never did:
+    /// `dbGetControlLimits` has zero callers in all of base, so the control
+    /// arm had no link branch to model. Graphic does, and it is what makes the
+    /// display default arm NOT a straight flip to the type range.
+    ///
+    /// A link left unset is a CONSTANT link, which supplies no metadata
+    /// getters, so `dbGetGraphicLimits` writes nothing and the
+    /// `dbAccess.c:216` `(0.0, 0.0)` seed stands — measured: `CALC.A` serves
+    /// display 0/0 where its DBF_DOUBLE type range would be ±1e300, while
+    /// `CALC.PHAS` (no link) serves the DBF_SHORT range ±32767.
+    ///
+    /// Four types, both by mechanical index test:
+    /// * `calc`/`calcout`/`sub` — `get_linkNumber` (`calcRecord.c:161-167`,
+    ///   `calcoutRecord.c:417-423`, `subRecord.c:198-204`): `A`..`A+NARGS` and
+    ///   `LA`..`LA+NARGS`, both onto `&prec->inpa + n`. calc/calcout use
+    ///   `CALCPERFORM_NARGS` (21); `sub` uses `INP_ARG_MAX`
+    ///   (`subRecord.c:89`), also 21.
+    /// * `seq` — `seqRecord.c:322-338`: field offset from `DLY0` with
+    ///   `offset & 3 == 2` is `DOn`, routed through `get_dol(prec, offset)`.
+    ///
+    /// `sel` names its args the same way and is deliberately NOT here: its
+    /// rset lists them explicitly on HOPR/LOPR and calls `dbGetGraphicLimits`
+    /// nowhere.
+    fn graphic_link_backed_field(rtype: &str, field: &str) -> bool {
+        let f = field.to_ascii_uppercase();
+        match rtype {
+            "calc" | "calcout" | "sub" => Self::calc_arg_field(&f, 21),
+            // DLY0/DOL0/DO0/LNK0, DLY1/... — DOn is offset 2 of each group of
+            // four, i.e. the `DO` prefix over the same 0-F suffix set.
+            "seq" => {
+                matches!(f.as_bytes(), [b'D', b'O', c] if c.is_ascii_digit() || (b'A'..=b'F').contains(c))
+            }
+            _ => false,
         }
     }
 

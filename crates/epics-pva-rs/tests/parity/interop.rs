@@ -648,9 +648,12 @@ async fn rust_client_to_rust_server_ntndarray_full_roundtrip() {
             variant_name,
             value,
         }) => {
+            // pvxs nt.cpp::NTNDArray::build orders the value union signed
+            // first, then unsigned, then float: boolean=0, byte=1, short=2,
+            // int=3 (NOT the `NdArrayBuffer` enum ordinal, where Int is 5).
             assert_eq!(
-                *selector, 5,
-                "expected intValue selector (5), got {selector}"
+                *selector, 3,
+                "expected intValue selector (3, pvxs union order), got {selector}"
             );
             assert_eq!(variant_name, "intValue");
             match &**value {

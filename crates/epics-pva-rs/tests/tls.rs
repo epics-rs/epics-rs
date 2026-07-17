@@ -10,7 +10,6 @@
 #![allow(clippy::manual_async_fn)]
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -20,7 +19,7 @@ use tokio::sync::{Mutex, mpsc};
 use epics_pva_rs::auth::{TlsClientConfig, TlsServerConfig};
 use epics_pva_rs::client_native::context::PvaClient;
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
-use epics_pva_rs::server_native::{ChannelSource, OpError, PvaServerConfig, run_pva_server};
+use epics_pva_rs::server_native::{ChannelSource, OpError, PvaServer, PvaServerConfig};
 
 /// Server-side hook invoked once a peer's credentials are resolved.
 type AuthCompleteHook = Arc<
@@ -148,12 +147,6 @@ impl ChannelSource for StaticSource {
     }
 }
 
-static NEXT_PORT: AtomicU32 = AtomicU32::new(16075);
-fn alloc_port_pair() -> (u16, u16) {
-    let base = NEXT_PORT.fetch_add(2, Ordering::Relaxed) as u16;
-    (base, base + 1)
-}
-
 #[tokio::test]
 async fn tls_client_to_tls_server_full_handshake() {
     // Reseed the global rustls crypto provider with ring (otherwise
@@ -187,10 +180,10 @@ async fn tls_client_to_tls_server_full_handshake() {
     let source = Arc::new(StaticSource::new());
     source.put("TLS:PV", 12.5).await;
 
-    let (tcp, udp) = alloc_port_pair();
     let cfg = PvaServerConfig {
-        tcp_port: tcp,
-        udp_port: udp,
+        tcp_port: 0,
+        udp_port: 0,
+        tls_port: 0,
         idle_timeout: Duration::from_secs(60),
         max_connections: 16,
         max_channels_per_connection: 64,
@@ -198,14 +191,11 @@ async fn tls_client_to_tls_server_full_handshake() {
         tls: Some(server_tls),
         ..Default::default()
     };
-    let server_handle = tokio::spawn(async move {
-        let _ = run_pva_server(source, cfg).await;
-    });
+    let server = PvaServer::start(source, cfg).expect("server start");
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Client targeting the TLS server explicitly.
-    let server_addr =
-        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), tcp);
+    let server_addr = server.tcp_addr();
     let client = PvaClient::builder()
         .timeout(Duration::from_secs(3))
         .server_addr(server_addr)
@@ -227,7 +217,7 @@ async fn tls_client_to_tls_server_full_handshake() {
         other => panic!("expected NTScalar structure, got {other:?}"),
     }
 
-    server_handle.abort();
+    server.stop();
 }
 
 /// A TLS-enabled server must bind a DEDICATED TLS listener on its own
@@ -445,10 +435,10 @@ async fn mtls_client_cert_populates_x509_credentials() {
         }
     });
 
-    let (tcp, udp) = alloc_port_pair();
     let cfg = PvaServerConfig {
-        tcp_port: tcp,
-        udp_port: udp,
+        tcp_port: 0,
+        udp_port: 0,
+        tls_port: 0,
         idle_timeout: Duration::from_secs(60),
         max_connections: 16,
         max_channels_per_connection: 64,
@@ -457,13 +447,10 @@ async fn mtls_client_cert_populates_x509_credentials() {
         auth_complete: Some(auth_complete),
         ..Default::default()
     };
-    let server_handle = tokio::spawn(async move {
-        let _ = run_pva_server(source, cfg).await;
-    });
+    let server = PvaServer::start(source, cfg).expect("server start");
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let server_addr =
-        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), tcp);
+    let server_addr = server.tcp_addr();
     let client = PvaClient::builder()
         .timeout(Duration::from_secs(3))
         .server_addr(server_addr)
@@ -501,7 +488,7 @@ async fn mtls_client_cert_populates_x509_credentials() {
         "authority must be the root CA CommonName"
     );
 
-    server_handle.abort();
+    server.stop();
 }
 
 /// when the client sends only the leaf cert (no root CA in the chain),
@@ -561,10 +548,10 @@ async fn mtls_partial_chain_authority_resolved_from_trust_roots() {
         }
     });
 
-    let (tcp, udp) = alloc_port_pair();
     let cfg = PvaServerConfig {
-        tcp_port: tcp,
-        udp_port: udp,
+        tcp_port: 0,
+        udp_port: 0,
+        tls_port: 0,
         idle_timeout: Duration::from_secs(60),
         max_connections: 16,
         max_channels_per_connection: 64,
@@ -573,13 +560,10 @@ async fn mtls_partial_chain_authority_resolved_from_trust_roots() {
         auth_complete: Some(auth_complete),
         ..Default::default()
     };
-    let server_handle = tokio::spawn(async move {
-        let _ = run_pva_server(source, cfg).await;
-    });
+    let server = PvaServer::start(source, cfg).expect("server start");
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let server_addr =
-        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), tcp);
+    let server_addr = server.tcp_addr();
     let client = PvaClient::builder()
         .timeout(Duration::from_secs(3))
         .server_addr(server_addr)
@@ -612,7 +596,7 @@ async fn mtls_partial_chain_authority_resolved_from_trust_roots() {
         "authority from trust store when peer sends partial chain"
     );
 
-    server_handle.abort();
+    server.stop();
 }
 
 /// PVA item #5: the client must extract the *server*'s X.509 identity
@@ -654,10 +638,10 @@ async fn client_extracts_server_x509_identity() {
     let source = Arc::new(StaticSource::new());
     source.put("SRVID:PV", 3.0).await;
 
-    let (tcp, udp) = alloc_port_pair();
     let cfg = PvaServerConfig {
-        tcp_port: tcp,
-        udp_port: udp,
+        tcp_port: 0,
+        udp_port: 0,
+        tls_port: 0,
         idle_timeout: Duration::from_secs(60),
         max_connections: 16,
         max_channels_per_connection: 64,
@@ -665,13 +649,11 @@ async fn client_extracts_server_x509_identity() {
         tls: Some(server_tls),
         ..Default::default()
     };
-    let server_handle = tokio::spawn(async move {
-        let _ = run_pva_server(source, cfg).await;
-    });
+    let server = PvaServer::start(source, cfg).expect("server start");
+    let tcp = server.report().tcp_port;
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let server_addr =
-        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), tcp);
+    let server_addr = server.tcp_addr();
     let client = PvaClient::builder()
         .timeout(Duration::from_secs(3))
         .server_addr(server_addr)
@@ -697,7 +679,7 @@ async fn client_extracts_server_x509_identity() {
         "authority must be the root CA CommonName"
     );
 
-    server_handle.abort();
+    server.stop();
 }
 
 /// A plain `pva://` (non-TLS) connection has no peer certificate, so
@@ -710,10 +692,9 @@ async fn plain_connection_has_no_server_identity() {
     let source = Arc::new(StaticSource::new());
     source.put("PLAIN:PV", 1.0).await;
 
-    let (tcp, udp) = alloc_port_pair();
     let cfg = PvaServerConfig {
-        tcp_port: tcp,
-        udp_port: udp,
+        tcp_port: 0,
+        udp_port: 0,
         idle_timeout: Duration::from_secs(60),
         max_connections: 16,
         max_channels_per_connection: 64,
@@ -721,13 +702,10 @@ async fn plain_connection_has_no_server_identity() {
         tls: None,
         ..Default::default()
     };
-    let server_handle = tokio::spawn(async move {
-        let _ = run_pva_server(source, cfg).await;
-    });
+    let server = PvaServer::start(source, cfg).expect("server start");
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let server_addr =
-        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), tcp);
+    let server_addr = server.tcp_addr();
     let client = PvaClient::builder()
         .timeout(Duration::from_secs(3))
         .server_addr(server_addr)
@@ -746,7 +724,7 @@ async fn plain_connection_has_no_server_identity() {
         "a plain pva:// connection must have no server X.509 identity"
     );
 
-    server_handle.abort();
+    server.stop();
 }
 
 /// TLS-NAMESERVER regression: a single TCP port configured with TLS must
@@ -773,10 +751,10 @@ async fn pva_tls_nameserver_mixed_mode_listener() {
     let source = Arc::new(StaticSource::new());
     source.put("MIXED:PV", 42.0).await;
 
-    let (tcp, udp) = alloc_port_pair();
     let cfg = PvaServerConfig {
-        tcp_port: tcp,
-        udp_port: udp,
+        tcp_port: 0,
+        udp_port: 0,
+        tls_port: 0,
         idle_timeout: Duration::from_secs(60),
         max_connections: 16,
         max_channels_per_connection: 64,
@@ -784,13 +762,10 @@ async fn pva_tls_nameserver_mixed_mode_listener() {
         tls: Some(server_tls),
         ..Default::default()
     };
-    let server_handle = tokio::spawn(async move {
-        let _ = run_pva_server(source, cfg).await;
-    });
+    let server = PvaServer::start(source, cfg).expect("server start");
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let server_addr =
-        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), tcp);
+    let server_addr = server.tcp_addr();
 
     // ── TLS client ────────────────────────────────────────────────────────────
     let mut roots = RootCertStore::empty();
@@ -838,5 +813,5 @@ async fn pva_tls_nameserver_mixed_mode_listener() {
         other => panic!("plain client: expected NTScalar, got {other:?}"),
     }
 
-    server_handle.abort();
+    server.stop();
 }

@@ -15,14 +15,13 @@
 #![cfg(test)]
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 
 use tokio::sync::mpsc;
 
 use epics_pva_rs::client_native::context::PvaClient;
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
-use epics_pva_rs::server_native::{ChannelSource, OpError, PvaServerConfig, run_pva_server};
+use epics_pva_rs::server_native::{ChannelSource, OpError, PvaServer, PvaServerConfig};
 
 #[derive(Clone)]
 struct NTScalarSource;
@@ -124,24 +123,19 @@ impl ChannelSource for NTScalarSource {
     }
 }
 
-static NEXT_PORT: AtomicU16 = AtomicU16::new(46000);
-fn alloc_port_pair() -> (u16, u16) {
-    let base = NEXT_PORT.fetch_add(2, Ordering::Relaxed);
-    (base, base + 1)
-}
-
-async fn start_server() -> u16 {
-    let (port, udp) = alloc_port_pair();
+/// Returns the running server alongside its actually-bound port; the
+/// caller must keep the `PvaServer` alive for the test's duration —
+/// dropping it aborts the listener.
+async fn start_server() -> (PvaServer, u16) {
     let cfg = PvaServerConfig {
-        tcp_port: port,
-        udp_port: udp,
+        tcp_port: 0,
+        udp_port: 0,
         ..Default::default()
     };
-    tokio::spawn(async move {
-        let _ = run_pva_server(Arc::new(NTScalarSource), cfg).await;
-    });
+    let server = PvaServer::start(Arc::new(NTScalarSource), cfg).expect("test server must start");
+    let port = server.report().tcp_port;
     tokio::time::sleep(Duration::from_millis(200)).await;
-    port
+    (server, port)
 }
 
 fn client_to(port: u16) -> PvaClient {
@@ -158,7 +152,7 @@ fn client_to(port: u16) -> PvaClient {
 /// and dropping every leaf, so `pvget` returned 0 for the value.
 #[tokio::test]
 async fn empty_pvrequest_returns_all_fields() {
-    let port = start_server().await;
+    let (server, port) = start_server().await;
     let client = client_to(port);
 
     let v = tokio::time::timeout(Duration::from_secs(5), client.pvget("dut"))
@@ -193,6 +187,9 @@ async fn empty_pvrequest_returns_all_fields() {
         Some(PvField::Scalar(ScalarValue::Long(1_700_000_000))) => {}
         other => panic!("expected seconds=1700000000, got {other:?}"),
     }
+
+    server.stop();
+    let _ = tokio::time::timeout(Duration::from_secs(2), server.wait()).await;
 }
 
 /// `pvget --field value` ⇒ only `value` carried on the wire. The other
@@ -200,7 +197,7 @@ async fn empty_pvrequest_returns_all_fields() {
 /// secondsPastEpoch=0) because they were not selected by the pvRequest.
 #[tokio::test]
 async fn field_value_only_omits_alarm_and_timestamp() {
-    let port = start_server().await;
+    let (server, port) = start_server().await;
     let client = client_to(port);
 
     let res = tokio::time::timeout(
@@ -233,4 +230,7 @@ async fn field_value_only_omits_alarm_and_timestamp() {
         Some(other) => panic!("alarm.severity should default to 0, got {other:?}"),
         None => {}
     }
+
+    server.stop();
+    let _ = tokio::time::timeout(Duration::from_secs(2), server.wait()).await;
 }

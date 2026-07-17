@@ -546,7 +546,7 @@ async fn rust_client_to_rust_server_ntndarray_full_roundtrip() {
         nt_nd_array_desc, nt_nd_array_value,
     };
     use epics_pva_rs::pvdata::{FieldDesc, PvField, ScalarValue, VariantValue};
-    use epics_pva_rs::server_native::{ChannelSource, OpError, PvaServerConfig, run_pva_server};
+    use epics_pva_rs::server_native::{ChannelSource, OpError, PvaServer, PvaServerConfig};
 
     #[derive(Clone)]
     struct ImageSource {}
@@ -612,16 +612,14 @@ async fn rust_client_to_rust_server_ntndarray_full_roundtrip() {
         }
     }
 
-    let (port, udp) = alloc_port_pair();
     let source = Arc::new(ImageSource {});
     let cfg = PvaServerConfig {
-        tcp_port: port,
-        udp_port: udp,
+        tcp_port: 0,
+        udp_port: 0,
         ..Default::default()
     };
-    let h = tokio::spawn(async move {
-        let _ = run_pva_server(source, cfg).await;
-    });
+    let server = PvaServer::start(source, cfg).expect("test server must start");
+    let port = server.report().tcp_port;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Native client retrieves the NTNDArray, decode union value back.
@@ -722,7 +720,8 @@ async fn rust_client_to_rust_server_ntndarray_full_roundtrip() {
         other => panic!("expected StructureArray for attribute, got {other:?}"),
     }
 
-    h.abort();
+    server.stop();
+    let _ = tokio::time::timeout(Duration::from_secs(2), server.wait()).await;
 }
 
 #[tokio::test]

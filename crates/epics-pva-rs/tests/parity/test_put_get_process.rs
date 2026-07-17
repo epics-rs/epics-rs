@@ -16,7 +16,7 @@
 #![cfg(test)]
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -122,12 +122,6 @@ impl ChannelSource for DoublingSource {
     }
 }
 
-static NEXT_PORT: AtomicU16 = AtomicU16::new(49200);
-fn alloc_port() -> (u16, u16) {
-    let base = NEXT_PORT.fetch_add(2, Ordering::Relaxed);
-    (base, base + 1)
-}
-
 fn client_to(port: u16) -> PvaClient {
     let server_addr =
         std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), port);
@@ -158,14 +152,14 @@ fn int_value(v: &PvField) -> i32 {
 /// returns 42 — proving the GET leg observed the post-put state.
 #[tokio::test]
 async fn put_get_round_trip() {
-    let (port, udp) = alloc_port();
     let cfg = PvaServerConfig {
-        tcp_port: port,
-        udp_port: udp,
+        tcp_port: 0,
+        udp_port: 0,
         ..Default::default()
     };
     let src = DoublingSource::new();
     let server = PvaServer::start(Arc::new(src.clone()), cfg).expect("test server must start");
+    let port = server.report().tcp_port;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let client = client_to(port);
@@ -201,14 +195,14 @@ async fn put_get_round_trip() {
 /// server.
 #[tokio::test]
 async fn put_get_with_request_value_round_trips() {
-    let (port, udp) = alloc_port();
     let cfg = PvaServerConfig {
-        tcp_port: port,
-        udp_port: udp,
+        tcp_port: 0,
+        udp_port: 0,
         ..Default::default()
     };
     let src = DoublingSource::new();
     let server = PvaServer::start(Arc::new(src.clone()), cfg).expect("test server must start");
+    let port = server.report().tcp_port;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let client = client_to(port);
@@ -253,14 +247,14 @@ async fn put_get_with_request_value_round_trips() {
 /// to a non-default 42 so the readback is unambiguous.
 #[tokio::test]
 async fn get_with_request_value_round_trips() {
-    let (port, udp) = alloc_port();
     let cfg = PvaServerConfig {
-        tcp_port: port,
-        udp_port: udp,
+        tcp_port: 0,
+        udp_port: 0,
         ..Default::default()
     };
     let src = DoublingSource::new();
     let server = PvaServer::start(Arc::new(src.clone()), cfg).expect("test server must start");
+    let port = server.report().tcp_port;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let client = client_to(port);
@@ -298,14 +292,14 @@ async fn get_with_request_value_round_trips() {
 /// PUT_GET op leaves the channel in a consistent state.
 #[tokio::test]
 async fn put_get_then_get_consistent() {
-    let (port, udp) = alloc_port();
     let cfg = PvaServerConfig {
-        tcp_port: port,
-        udp_port: udp,
+        tcp_port: 0,
+        udp_port: 0,
         ..Default::default()
     };
     let src = DoublingSource::new();
     let server = PvaServer::start(Arc::new(src.clone()), cfg).expect("test server must start");
+    let port = server.report().tcp_port;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let client = client_to(port);
@@ -337,14 +331,14 @@ async fn put_get_then_get_consistent() {
 /// payload-less frames failed to decode instead of returning data.
 #[tokio::test]
 async fn get_get_and_get_put_read_without_writing() {
-    let (port, udp) = alloc_port();
     let cfg = PvaServerConfig {
-        tcp_port: port,
-        udp_port: udp,
+        tcp_port: 0,
+        udp_port: 0,
         ..Default::default()
     };
     let src = DoublingSource::new();
     let server = PvaServer::start(Arc::new(src.clone()), cfg).expect("test server must start");
+    let port = server.report().tcp_port;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let client = client_to(port);
@@ -411,15 +405,15 @@ async fn get_get_and_get_put_read_without_writing() {
 /// fires before any put leg, so the source is never mutated.
 #[tokio::test]
 async fn put_get_rejected_when_serve_put_get_disabled() {
-    let (port, udp) = alloc_port();
     let cfg = PvaServerConfig {
-        tcp_port: port,
-        udp_port: udp,
+        tcp_port: 0,
+        udp_port: 0,
         serve_put_get: false,
         ..Default::default()
     };
     let src = DoublingSource::new();
     let server = PvaServer::start(Arc::new(src.clone()), cfg).expect("test server must start");
+    let port = server.report().tcp_port;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let client = client_to(port);
@@ -468,14 +462,14 @@ async fn put_get_rejected_when_serve_put_get_disabled() {
 /// increments and the stored value gains 100.
 #[tokio::test]
 async fn process_triggers_hook() {
-    let (port, udp) = alloc_port();
     let cfg = PvaServerConfig {
-        tcp_port: port,
-        udp_port: udp,
+        tcp_port: 0,
+        udp_port: 0,
         ..Default::default()
     };
     let src = DoublingSource::new();
     let server = PvaServer::start(Arc::new(src.clone()), cfg).expect("test server must start");
+    let port = server.report().tcp_port;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let client = client_to(port);
@@ -615,14 +609,14 @@ impl ChannelSource for DenySource {
 /// error. The source's `put_value` hook never runs.
 #[tokio::test]
 async fn put_get_denied_for_read_only_peer() {
-    let (port, udp) = alloc_port();
     let cfg = PvaServerConfig {
-        tcp_port: port,
-        udp_port: udp,
+        tcp_port: 0,
+        udp_port: 0,
         ..Default::default()
     };
     let src = DenySource::new();
     let server = PvaServer::start(Arc::new(src.clone()), cfg).expect("test server must start");
+    let port = server.report().tcp_port;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let server_addr =
@@ -662,14 +656,14 @@ async fn put_get_denied_for_read_only_peer() {
 /// The source's `process` hook never runs.
 #[tokio::test]
 async fn process_denied_for_read_only_peer() {
-    let (port, udp) = alloc_port();
     let cfg = PvaServerConfig {
-        tcp_port: port,
-        udp_port: udp,
+        tcp_port: 0,
+        udp_port: 0,
         ..Default::default()
     };
     let src = DenySource::new();
     let server = PvaServer::start(Arc::new(src.clone()), cfg).expect("test server must start");
+    let port = server.report().tcp_port;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let server_addr =
@@ -828,14 +822,14 @@ fn put_get_request(put_field: &str, get_field: &str) -> PvField {
 /// (9) only.
 #[tokio::test]
 async fn get_put_and_get_get_project_distinct_legs() {
-    let (port, udp) = alloc_port();
     let cfg = PvaServerConfig {
-        tcp_port: port,
-        udp_port: udp,
+        tcp_port: 0,
+        udp_port: 0,
         ..Default::default()
     };
     let src = TwoFieldSource::new();
     let server = PvaServer::start(Arc::new(src.clone()), cfg).expect("test server must start");
+    let port = server.report().tcp_port;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let client = client_to(port);
@@ -1003,14 +997,14 @@ impl ChannelSource for EnumSource {
 /// of index 1 proves the in-PUT snapshot round-tripped end-to-end.
 #[tokio::test]
 async fn enum_put_by_label_uses_in_put_getoput() {
-    let (port, udp) = alloc_port();
     let cfg = PvaServerConfig {
-        tcp_port: port,
-        udp_port: udp,
+        tcp_port: 0,
+        udp_port: 0,
         ..Default::default()
     };
     let src = EnumSource::new();
     let server = PvaServer::start(Arc::new(src.clone()), cfg).expect("test server must start");
+    let port = server.report().tcp_port;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let client = client_to(port);

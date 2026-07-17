@@ -1657,3 +1657,78 @@ on both the C IOC and the port.
 Proof (compiled softIoc, this host, and differential oracle):
 `LLIM=10 ULIM=5`, process → C and port both `STAT=NO_ALARM`; `caput .SGNL`
 with inverted limits → C and port both `STAT=SOFT SEVR=INVALID`.
+
+## Batch G — filed 2026-07-17 (PVA differential-oracle campaign, pvxs QSRV2 metadata)
+
+One entry so far. Found not by static audit but by the `epics-oracle-rs`
+PVA differential harness (fat `softIocPVX` QSRV2 ground truth vs
+`oracle-ioc --pva` on the same `.db`): while closing the port's NT
+metadata-routing families, the C ground truth itself was seen to drop a
+metadata leaf a record's rset explicitly supplies. Citation re-read in the
+local pvxs tree (`1.5.2-20-g4070775`, git head `4070775`, current on
+master) before filing.
+
+| id | upstream | one line | severity | bucket |
+|---|---|---|---|---|
+| CBUG-G1 | pvxs (QSRV2) | `getProperties` nests `display.precision` inside the `DBR_GR_DOUBLE` branch — a field that supplies `get_precision` but NULLs `get_graphic_double` (e.g. `bo.HIGH`) loses its precision over PVA | Low | REPRODUCED |
+
+### CBUG-G1: pvxs QSRV2 serves no `display.precision` for a field whose rset supplies `get_precision` but NULLs `get_graphic_double`
+Bucket: REPRODUCED · Severity: Low
+C: `pvxs/ioc/iocsource.cpp:254` `getProperties()`. The one `options`
+mask carries every requested DBR slot; `dbChannelGet` clears each bit
+whose rset method is NULL, so `DBR_PRECISION` and `DBR_GR_DOUBLE` arrive
+as **independent** flags (a field can have one without the other).
+`:274` serves `display.units` under its own `DBR_UNITS` gate — correctly
+independent. But the numeric block at `:287-294`:
+```cpp
+if(auto dlL = node["display.limitLow"]) {   // :287  if numeric
+    if(options & DBR_GR_DOUBLE) {           // :288  gate = graphic-limits slot
+        dlL = meta.lower_disp_limit;
+        node["display.limitHigh"] = meta.upper_disp_limit;
+        if(options & DBR_PRECISION) {       // :291  precision's own gate…
+            node["display.precision"] = int32_t(meta.precision.dp);  // :292  …but nested inside DBR_GR_DOUBLE
+        }
+    }
+    if(options & DBR_CTRL_DOUBLE) { … }     // :295  control served independently
+    if(options & DBR_AL_DOUBLE)   { … }     // :299  valueAlarm served independently
+}
+```
+nests the `display.precision` assignment inside `if(options &
+DBR_GR_DOUBLE)`. `display.precision` is gated by `DBR_PRECISION`
+(`get_precision`), a slot with no dependence on `DBR_GR_DOUBLE`
+(`get_graphic_double`). Nesting the two makes precision reachable only
+when the record *also* supplies graphic limits.
+Defect: any field that supplies `get_precision` but NULLs
+`get_graphic_double` has its precision silently dropped over PVA, even
+though the rset answers it and `caget -d DBR_PRECISION` (CA) serves it.
+`std/rec/boRecord.c` is the clean witness: `:55` declares `get_precision`
+(supplied; `:301-308` returns `boHIGHprecision = 2` for `HIGH`), `:59`
+`#define get_graphic_double NULL`, `:60` declares `get_control_double`
+(supplied; `:310-318` returns `0 .. boHIGHlimit` for `HIGH`). So `bo.HIGH`
+— bo's only `DBF_DOUBLE` field — reaches QSRV2 with `DBR_PRECISION` and
+`DBR_CTRL_DOUBLE` set and `DBR_GR_DOUBLE` clear: units and control limits
+are served, precision (2) is dropped. Measured on `softIocPVX`:
+`display.units "s"`, `control.limitHigh 100000`, and **no**
+`display.precision` for `bo.HIGH`.
+Port: **currently reproduced.** The record layer is faithful — `bo`'s
+`field_metadata_override` (`crates/epics-base-rs/src/server/records/bo.rs:151-160`)
+transcribes the rset answer (`precision: Some(2)`). But the wire-marking
+model (`crates/epics-pva-rs/src/nt/qsrv_marks.rs`, `property_leaves`)
+mirrors pvxs's gating and drops the `display.precision` leaf for a field
+with no graphic limits, so the port measures **AGREED** with `softIocPVX`
+(both omit it). The clean fix is available and cheap — the correct
+precision already lives in the record layer, so un-nesting precision from
+the graphic gate in the marking model would serve it and move this to
+NOT-REPRODUCED (plus an oracle allowlist entry). Deferred pending a
+deviate/reproduce decision; the port has not silently diverged.
+Impact: over PVA (pvxs QSRV2 and the parity-faithful port alike), the
+`HIGH` field of a `bo` record — and any field of any type whose rset
+supplies `get_precision` but not `get_graphic_double` — carries no
+`display.precision`, so a PVA client renders it at default precision while
+the same field over CA (`caget -d DBR_PRECISION`) reports the rset's
+value.
+Proof: `iocsource.cpp:274` (units, independent gate) vs `:287-294`
+(precision nested under `DBR_GR_DOUBLE`) quoted; `boRecord.c:55/59/60`
+(precision + control supplied, graphic NULL) and `:301-308` (`HIGH` →
+`boHIGHprecision`) quoted; `softIocPVX` GET of `bo.HIGH` shows units +
+control, no precision.

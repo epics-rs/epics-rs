@@ -8727,7 +8727,7 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     },
 ];
 
-/// `recordtype(bi)` — 20 CA-visible own fields from `dbd/biRecord.dbd` (1 `DBF_NOACCESS` internals dropped).
+/// `recordtype(bi)` — 22 CA-visible own fields from `dbd/biRecord.dbd` (1 `DBF_NOACCESS` internals dropped).
 pub static BI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "INP",
@@ -8886,6 +8886,34 @@ pub static BI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "MLST",
         dbf_type: DbFieldType::UShort,
+        runtime_typed: false,
+        read_only: true,
+        special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: 0,
+        menu: None,
+        initial: None,
+        interest: 3,
+        prop: false,
+    },
+    FieldDesc {
+        name: "AFTC",
+        dbf_type: DbFieldType::Double,
+        runtime_typed: false,
+        read_only: false,
+        special: Special::None,
+        pp: false,
+        asl: Asl::Asl1,
+        size: 0,
+        menu: None,
+        initial: None,
+        interest: 1,
+        prop: false,
+    },
+    FieldDesc {
+        name: "AFVL",
+        dbf_type: DbFieldType::Double,
         runtime_typed: false,
         read_only: true,
         special: Special::NoMod,

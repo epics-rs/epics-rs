@@ -19,6 +19,16 @@ pub struct BiRecord {
     pub zsv: i16,
     pub osv: i16,
     pub cosv: i16,
+    /// Alarm filter time constant (seconds), settable `DBF_DOUBLE`. `AFTC > 0`
+    /// runs the STATE alarm severity through an exponential low-pass so a
+    /// momentary excursion does not raise/clear the alarm until the input has
+    /// held the new state for ~`AFTC` seconds. Added to `biRecord` by
+    /// EPICS PR #817 (`c9817fa59`); 0 = disabled. See `BiRecord::afvl`.
+    pub aftc: f64,
+    /// Alarm filter accumulator (`biRecord.c:270` `prec->afvl`), `DBF_DOUBLE`
+    /// `SPC_NOMOD` — read-only to clients. 0 = initial sample / filter
+    /// inactive; the sign encodes the filter's rounding hysteresis.
+    pub afvl: f64,
     pub lalm: u16, // last alarm value (for COS alarm)
     // Monitor
     pub mlst: u16, // last monitored value
@@ -53,6 +63,8 @@ impl Default for BiRecord {
             zsv: 0,
             osv: 0,
             cosv: 0,
+            aftc: 0.0,
+            afvl: 0.0,
             lalm: 0,
             mlst: 0,
             simm: 0,
@@ -151,13 +163,14 @@ impl Record for BiRecord {
         true
     }
 
-    /// C `biRecord.c::checkAlarms` (biRecord.c:220-243) — UDF alarm,
-    /// STATE alarm (ZSV/OSV) and COS alarm (COSV). C `checkAlarms:225-227`
-    /// raises `UDF_ALARM/udfs` and returns early when `udf` is set; we
-    /// mirror that here (raising UDF is idempotent with the framework's
-    /// own `rec_gbl_check_udf`, which also runs on the process path).
-    /// biRecord has no AFTC/AFVL alarm filter (the 2009 Codeathon filter
-    /// `824d37811` covered ai/calc/longin/mbbi only, never bi).
+    /// C `biRecord.c::checkAlarms` (biRecord.c:232-280, as of EPICS PR #817
+    /// `c9817fa59` which added the AFTC/AFVL alarm filter to `bi`) — UDF
+    /// alarm, STATE alarm (ZSV/OSV) through the AFTC alarm-range low-pass
+    /// filter, and COS alarm (COSV). C `checkAlarms:237-240` raises
+    /// `UDF_ALARM/udfs` and returns early when `udf` is set; we mirror that
+    /// (raising UDF is idempotent with the framework's own `rec_gbl_check_udf`,
+    /// which also runs on the process path). Unlike `mbbiRecord.c`, the `bi`
+    /// UDF path does **not** zero `AFVL`, so this matches `biRecord.c` exactly.
     fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
         use crate::server::recgbl::{self, alarm_status};
         use crate::server::record::AlarmSeverity;
@@ -168,19 +181,33 @@ impl Record for BiRecord {
                 alarm_status::UDF_ALARM,
                 AlarmSeverity::from_u16(common.udfs as u16),
             );
+            // C biRecord.c:237-240 returns here without touching prec->afvl.
             return;
         }
         let val = self.val;
+        // C biRecord.c:242 — `if (val > 1) return;` (no severity, AFVL kept).
         if val > 1 {
             return;
         }
-        // C biRecord.c:232-235 — raw state severity, no filter.
+        // C biRecord.c:244-248 — pick the per-state severity (ZSV/OSV).
         let state_sev = if val == 0 { self.zsv } else { self.osv };
-        let sev = AlarmSeverity::from_u16(state_sev as u16);
+        // C biRecord.c:250-270 — the AFTC alarm-range low-pass filter. When
+        // AFTC <= 0 the shared helper returns the raw severity and zeroes
+        // AFVL, matching `double afvl = 0; ... prec->afvl = afvl;`.
+        let (filtered, new_afvl) = super::alarm_filter::aftc_filter(
+            state_sev as u16,
+            self.aftc,
+            self.afvl,
+            common.time,
+            crate::runtime::general_time::get_current(),
+        );
+        self.afvl = new_afvl;
+        // C biRecord.c:272-273 — `recGblSetSevr(prec, STATE_ALARM, asev)`.
+        let sev = AlarmSeverity::from_u16(filtered);
         if sev != AlarmSeverity::NoAlarm {
             recgbl::rec_gbl_set_sevr(common, alarm_status::STATE_ALARM, sev);
         }
-        // COS alarm — fires only when VAL changed from LALM.
+        // C biRecord.c:276-278 — COS alarm, fires only when VAL != LALM.
         if val != self.lalm {
             let cos_sev = AlarmSeverity::from_u16(self.cosv as u16);
             if cos_sev != AlarmSeverity::NoAlarm {
@@ -234,6 +261,8 @@ impl Record for BiRecord {
             "ZSV" => Some(EpicsValue::Short(self.zsv)),
             "OSV" => Some(EpicsValue::Short(self.osv)),
             "COSV" => Some(EpicsValue::Short(self.cosv)),
+            "AFTC" => Some(EpicsValue::Double(self.aftc)),
+            "AFVL" => Some(EpicsValue::Double(self.afvl)),
             "LALM" => Some(EpicsValue::UShort(self.lalm)),
             "MLST" => Some(EpicsValue::UShort(self.mlst)),
             "SIMM" => Some(EpicsValue::Short(self.simm)),
@@ -333,6 +362,22 @@ impl Record for BiRecord {
             "COSV" => match value {
                 EpicsValue::Short(v) => {
                     self.cosv = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "AFTC" => match value {
+                EpicsValue::Double(v) => {
+                    self.aftc = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            // AFVL is SPC_NOMOD (read-only to clients); this arm exists so
+            // the framework alarm-filter owner can write the accumulator back.
+            "AFVL" => match value {
+                EpicsValue::Double(v) => {
+                    self.afvl = v;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),

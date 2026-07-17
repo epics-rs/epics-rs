@@ -2510,11 +2510,82 @@ fn test_snapshot_alarm_state() {
 //       (`mbbiRecord.c:339-340`, `biRecord.c:239-240`).
 //
 // The shared AFTC alarm-range filter primitive itself is covered by the
-// `records::alarm_filter` pure-function tests. `bi` has NO AFTC filter
-// (biRecord.c carries no AFTC/AFVL — the 2009 Codeathon filter
-// `824d37811` covered ai/calc/longin/mbbi only), so there is no bi AFTC
-// test here.
+// `records::alarm_filter` pure-function tests. `bi` gained the AFTC/AFVL
+// alarm filter in EPICS PR #817 (`c9817fa59`), so the bi-specific tests
+// below pin (a) the fields being served, (b) the filter seeding AFVL, and
+// (c) the parity distinction that — unlike mbbi/ai — the bi UDF path does
+// NOT zero AFVL (biRecord.c:237-240 returns before `prec->afvl = afvl`).
 // ---------------------------------------------------------------------------
+
+/// `bi` serves AFTC as a settable `DBF_DOUBLE` and AFVL as a readable
+/// `DBF_DOUBLE` (SPC_NOMOD). Before PR #817 the port had neither field, so
+/// `caget ORACLE:BI.AFTC` / `.AFVL` timed out (the oracle's 22 ERRORs).
+#[test]
+fn test_bi_serves_aftc_and_afvl_fields() {
+    use epics_base_rs::server::records::bi::BiRecord;
+
+    let mut rec = BiRecord::new(0);
+    // AFTC is settable by a client.
+    rec.put_field("AFTC", EpicsValue::Double(5.0)).unwrap();
+    assert_eq!(
+        rec.get_field("AFTC").and_then(|v| v.to_f64()),
+        Some(5.0),
+        "AFTC must be a settable, readable DBF_DOUBLE"
+    );
+    // AFVL is readable (its SPC_NOMOD read-only-to-clients status is enforced
+    // by the field table; the put arm exists for the framework filter owner).
+    assert_eq!(
+        rec.get_field("AFVL").and_then(|v| v.to_f64()),
+        Some(0.0),
+        "AFVL must be a readable DBF_DOUBLE, defaulting to 0"
+    );
+}
+
+/// `bi` engages the alarm-range AFTC filter. On the first sample (AFVL == 0)
+/// `biRecord.c:256-257` seeds AFVL with the raw state severity and passes it
+/// through, matching the shared `aftc_filter` seed branch. val==1 selects OSV.
+#[test]
+fn test_bi_aftc_filter_seeds_afvl() {
+    use epics_base_rs::server::records::bi::BiRecord;
+
+    let mut rec = BiRecord::new(1); // val=1 → OSV
+    rec.osv = AlarmSeverity::Major as i16;
+    rec.aftc = 5.0;
+    rec.afvl = 0.0; // first sample
+    let mut inst = RecordInstance::new("BI:AFTC".into(), rec);
+    inst.common.udf = 0;
+
+    inst.record.check_alarms(&mut inst.common);
+    assert_eq!(
+        inst.record.get_field("AFVL").and_then(|v| v.to_f64()),
+        Some(AlarmSeverity::Major as u16 as f64),
+        "first AFTC cycle seeds AFVL with the raw OSV severity (biRecord.c:256-257)"
+    );
+}
+
+/// Parity distinction from mbbi/ai: the `bi` UDF path raises UDF_ALARM and
+/// returns WITHOUT touching AFVL — `biRecord.c:237-240` returns before the
+/// `prec->afvl = afvl` store, unlike `mbbiRecord.c`/`aiRecord.c` which zero it.
+#[test]
+fn test_bi_udf_cycle_leaves_afvl_untouched() {
+    use epics_base_rs::server::records::bi::BiRecord;
+
+    let mut rec = BiRecord::new(1);
+    rec.aftc = 10.0;
+    let mut inst = RecordInstance::new("BI:UDF".into(), rec);
+    // Seed AFVL to a sentinel, then force a UDF cycle.
+    inst.record
+        .put_field("AFVL", EpicsValue::Double(3.0))
+        .unwrap();
+    inst.common.udf = 1;
+
+    inst.record.check_alarms(&mut inst.common);
+    assert_eq!(
+        inst.record.get_field("AFVL").and_then(|v| v.to_f64()),
+        Some(3.0),
+        "bi UDF cycle must leave AFVL untouched (biRecord.c has no afvl=0 on the UDF path)"
+    );
+}
 
 /// mbbi persists the AFTC accumulator back to AFVL each cycle.
 /// `mbbiRecord.c::checkAlarms` (mbbiRecord.c:319-337) computes the new

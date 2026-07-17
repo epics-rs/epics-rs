@@ -1,7 +1,7 @@
 //! Shared alarm-range low-pass filter (`AFTC`/`AFVL`).
 //!
-//! EPICS records `ai`, `calc`, `longin`, `int64in` and `mbbi` carry an
-//! optional alarm filter: when `AFTC > 0` the integer alarm *range* is
+//! EPICS records `ai`, `calc`, `longin`, `int64in`, `mbbi` and `bi` carry
+//! an optional alarm filter: when `AFTC > 0` the integer alarm *range* is
 //! run through an exponential low-pass so a momentary excursion does not
 //! raise (or clear) a limit alarm until the signal has stayed in the new
 //! range for roughly `AFTC` seconds. The accumulator persists in `AFVL`.
@@ -9,8 +9,8 @@
 //! Provenance: the algorithm is by Eric Norum, implemented by Bernd
 //! Schoeneburg at the 2009 EPICS Codeathon (epics-base commits
 //! `0af48f5a2` and `824d37811` "add the alarm filter for ai, calc,
-//! longin, mbbi type records"; later extended to `int64in`). It was
-//! **never** part of `biRecord` — `biRecord.c` has no `AFTC`/`AFVL`.
+//! longin, mbbi type records"; later extended to `int64in`, and to `bi`
+//! by PR #817 `c9817fa59`).
 
 use std::time::SystemTime;
 

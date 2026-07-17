@@ -12,14 +12,14 @@
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::sync::{Mutex, mpsc};
 
 use epics_pva_rs::client_native::context::PvaClient;
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
-use epics_pva_rs::server_native::{ChannelSource, OpError, PvaServerConfig, run_pva_server};
+use epics_pva_rs::server_native::{ChannelSource, OpError, PvaServer, PvaServerConfig};
 
 #[derive(Clone)]
 struct FiniteSource {
@@ -89,26 +89,18 @@ impl ChannelSource for FiniteSource {
     }
 }
 
-static NEXT_PORT: AtomicU16 = AtomicU16::new(47000);
-fn alloc_port_pair() -> (u16, u16) {
-    let base = NEXT_PORT.fetch_add(2, Ordering::Relaxed);
-    (base, base + 1)
-}
-
 #[tokio::test]
 async fn monitor_finish_returns_ok_when_source_closes() {
-    let (port, udp) = alloc_port_pair();
     let cfg = PvaServerConfig {
-        tcp_port: port,
-        udp_port: udp,
+        tcp_port: 0,
+        udp_port: 0,
         ..Default::default()
     };
 
     let (source, _orig_tx) = FiniteSource::new();
     let source_for_drive = source.clone();
-    tokio::spawn(async move {
-        let _ = run_pva_server(Arc::new(source_for_drive), cfg).await;
-    });
+    let server = PvaServer::start(Arc::new(source_for_drive), cfg).expect("test server must start");
+    let port = server.report().tcp_port;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let server_addr =
@@ -163,6 +155,9 @@ async fn monitor_finish_returns_ok_when_source_closes() {
         received.load(Ordering::SeqCst) >= 1,
         "subscriber should have received at least one value before FINISH"
     );
+
+    server.stop();
+    let _ = tokio::time::timeout(Duration::from_secs(2), server.wait()).await;
 }
 
 /// Regression: a clean end-of-stream MONITOR FINISH must surface as
@@ -179,18 +174,16 @@ async fn monitor_finish_returns_ok_when_source_closes() {
 async fn monitor_finish_event_delivered_despite_mask_disconnected() {
     use epics_pva_rs::client_native::ops_v2::{MonitorEvent, MonitorEventMask};
 
-    let (port, udp) = alloc_port_pair();
     let cfg = PvaServerConfig {
-        tcp_port: port,
-        udp_port: udp,
+        tcp_port: 0,
+        udp_port: 0,
         ..Default::default()
     };
 
     let (source, _orig_tx) = FiniteSource::new();
     let source_for_drive = source.clone();
-    tokio::spawn(async move {
-        let _ = run_pva_server(Arc::new(source_for_drive), cfg).await;
-    });
+    let server = PvaServer::start(Arc::new(source_for_drive), cfg).expect("test server must start");
+    let port = server.report().tcp_port;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let server_addr =

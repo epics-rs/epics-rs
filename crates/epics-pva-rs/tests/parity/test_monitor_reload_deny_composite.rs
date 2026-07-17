@@ -21,7 +21,7 @@
 #![cfg(test)]
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::sync::{Mutex, mpsc};
@@ -32,7 +32,7 @@ use epics_base_rs::server::access_security::{
 use epics_pva_rs::client_native::context::PvaClient;
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
 use epics_pva_rs::server_native::{
-    ChannelSource, CompositeSource, DynSource, OpError, PvaServerConfig, run_pva_server,
+    ChannelSource, CompositeSource, DynSource, OpError, PvaServer, PvaServerConfig,
 };
 
 /// Child source backing the composite. Its `subscribe_checked`
@@ -130,18 +130,11 @@ impl VersionedChildSource {
     }
 }
 
-static NEXT_PORT: AtomicU16 = AtomicU16::new(47100);
-fn alloc_port_pair() -> (u16, u16) {
-    let base = NEXT_PORT.fetch_add(2, Ordering::Relaxed);
-    (base, base + 1)
-}
-
 #[tokio::test]
 async fn composite_monitor_finishes_after_inner_deny_bump() {
-    let (port, udp) = alloc_port_pair();
     let cfg = PvaServerConfig {
-        tcp_port: port,
-        udp_port: udp,
+        tcp_port: 0,
+        udp_port: 0,
         ..Default::default()
     };
 
@@ -151,9 +144,8 @@ async fn composite_monitor_finishes_after_inner_deny_bump() {
         .unwrap();
 
     let server_comp = comp.clone();
-    tokio::spawn(async move {
-        let _ = run_pva_server(server_comp, cfg).await;
-    });
+    let server = PvaServer::start(server_comp, cfg).expect("test server must start");
+    let port = server.report().tcp_port;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let server_addr =
@@ -245,4 +237,7 @@ ASG(DEFAULT) {
         !saw_post_deny.load(Ordering::SeqCst),
         "post-deny value (2.0) must NOT be forwarded after child ACL flips to deny"
     );
+
+    server.stop();
+    let _ = tokio::time::timeout(Duration::from_secs(2), server.wait()).await;
 }

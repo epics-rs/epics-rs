@@ -19,18 +19,11 @@
 #![cfg(test)]
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 
 use epics_pva_rs::client_native::context::PvaClient;
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
 use epics_pva_rs::server_native::{PvaServer, PvaServerConfig, SharedPV, SharedSource};
-
-static NEXT_PORT: AtomicU16 = AtomicU16::new(48600);
-fn alloc_port() -> (u16, u16) {
-    let base = NEXT_PORT.fetch_add(2, Ordering::Relaxed);
-    (base, base + 1)
-}
 
 fn nt_int_desc() -> FieldDesc {
     FieldDesc::Structure {
@@ -75,13 +68,13 @@ fn client_to(port: u16) -> PvaClient {
 /// descriptor, not a frozen `None` prototype.
 #[tokio::test]
 async fn lazy_first_connect_pv_serves_get_on_creating_channel() {
-    let (port, udp) = alloc_port();
     let cfg = PvaServerConfig {
-        tcp_port: port,
-        udp_port: udp,
+        tcp_port: 0,
+        udp_port: 0,
         ..Default::default()
     };
     let server = PvaServer::start(lazy_source(), cfg).expect("test server must start");
+    let port = server.report().tcp_port;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let client = client_to(port);
@@ -106,13 +99,13 @@ async fn lazy_first_connect_pv_serves_get_on_creating_channel() {
 /// monitor INIT reads the channel prototype too.
 #[tokio::test]
 async fn lazy_first_connect_pv_serves_monitor_on_creating_channel() {
-    let (port, udp) = alloc_port();
     let cfg = PvaServerConfig {
-        tcp_port: port,
-        udp_port: udp,
+        tcp_port: 0,
+        udp_port: 0,
         ..Default::default()
     };
     let server = PvaServer::start(lazy_source(), cfg).expect("test server must start");
+    let port = server.report().tcp_port;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let client = client_to(port);

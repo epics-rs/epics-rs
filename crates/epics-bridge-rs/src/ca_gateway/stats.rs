@@ -898,38 +898,75 @@ mod tests {
         }
     }
 
+    /// Env var marking "this process is the isolated child `run_isolated`
+    /// spawned; run the real test body instead of spawning another one."
+    const ISOLATION_CHILD_MARKER: &str = "EPICS_BRIDGE_RS_FD_COUNT_TEST_CHILD";
+
+    /// [`open_fd_count`] samples the process-wide fd table, and this
+    /// binary's other tests churn descriptors (sockets, temp files) on
+    /// concurrent threads under plain `cargo test` — a batch-plus-margin
+    /// tolerance cannot bound that noise (observed: siblings closing more
+    /// fds between the two samples than the whole 32-fd probe batch
+    /// opened). Only a fresh process has a quiet fd table, so re-exec
+    /// this test binary for exactly one named test (`--exact`) in a child
+    /// process and assert it exits cleanly — nextest's process-per-test
+    /// guarantee, reproduced without depending on nextest being
+    /// installed. `Command::spawn` (fork+exec) rather than a bare
+    /// `fork()`: other tests run concurrently on other OS threads, and
+    /// forking a multithreaded process risks the child inheriting a lock
+    /// held by a thread that no longer exists to release it.
+    fn run_isolated(test_name: &str, body: impl FnOnce()) {
+        if std::env::var_os(ISOLATION_CHILD_MARKER).is_some() {
+            body();
+            return;
+        }
+        let exe = std::env::current_exe().expect("current test exe");
+        let output = std::process::Command::new(exe)
+            .args(["--exact", test_name])
+            .env(ISOLATION_CHILD_MARKER, "1")
+            .output()
+            .expect("spawn isolated fd-count test process");
+        assert!(
+            output.status.success(),
+            "{test_name} failed in its isolated child process ({}):\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+        );
+    }
+
     #[test]
     fn open_fd_count_tracks_new_descriptors() {
-        let before = match open_fd_count() {
-            Some(n) => n,
-            None => return, // unsupported platform — nothing to assert
-        };
-        // Open a batch of descriptors at once. A single fd would be
-        // lost in the noise of a parallel test runner (other threads
-        // open/close fds concurrently); a batch of 32 produces a
-        // delta that comfortably exceeds that noise floor. The files
-        // are held open in `_held` until the assertion runs.
-        const BATCH: usize = 32;
-        let dir = std::env::temp_dir();
-        let mut _held = Vec::with_capacity(BATCH);
-        let mut paths = Vec::with_capacity(BATCH);
-        for i in 0..BATCH {
-            let p = dir.join(format!("ca_gw_stats_fd_probe_{}_{i}", std::process::id()));
-            _held.push(std::fs::File::create(&p).expect("create temp file"));
-            paths.push(p);
-        }
-        let during = open_fd_count().expect("fd count available");
-        // The count must have risen by at least half the batch even
-        // if a few descriptors are transiently miscounted under
-        // parallel test execution.
-        assert!(
-            during >= before + (BATCH as u64) / 2,
-            "open fd count did not rise enough: before={before} during={during}"
+        run_isolated(
+            "ca_gateway::stats::tests::open_fd_count_tracks_new_descriptors",
+            || {
+                let before = match open_fd_count() {
+                    Some(n) => n,
+                    None => return, // unsupported platform — nothing to assert
+                };
+                // In the isolated child no other thread touches the fd
+                // table, so holding BATCH new files open must raise the
+                // count by the full batch (anything the harness itself
+                // opens only raises it further).
+                const BATCH: usize = 32;
+                let dir = std::env::temp_dir();
+                let mut _held = Vec::with_capacity(BATCH);
+                let mut paths = Vec::with_capacity(BATCH);
+                for i in 0..BATCH {
+                    let p = dir.join(format!("ca_gw_stats_fd_probe_{}_{i}", std::process::id()));
+                    _held.push(std::fs::File::create(&p).expect("create temp file"));
+                    paths.push(p);
+                }
+                let during = open_fd_count().expect("fd count available");
+                assert!(
+                    during >= before + BATCH as u64,
+                    "open fd count did not rise by the batch: before={before} during={during}"
+                );
+                drop(_held);
+                for p in paths {
+                    let _ = std::fs::remove_file(p);
+                }
+            },
         );
-        drop(_held);
-        for p in paths {
-            let _ = std::fs::remove_file(p);
-        }
     }
 
     #[tokio::test]

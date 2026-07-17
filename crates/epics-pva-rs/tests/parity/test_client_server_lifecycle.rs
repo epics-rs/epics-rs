@@ -6,7 +6,6 @@
 #![cfg(test)]
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -63,12 +62,6 @@ impl ChannelSource for ConstSource {
     }
 }
 
-static NEXT_PORT: AtomicU16 = AtomicU16::new(48000);
-fn alloc_port() -> (u16, u16) {
-    let base = NEXT_PORT.fetch_add(2, Ordering::Relaxed);
-    (base, base + 1)
-}
-
 fn client_to(port: u16) -> PvaClient {
     let server_addr =
         std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), port);
@@ -83,13 +76,13 @@ fn client_to(port: u16) -> PvaClient {
 /// granularity.
 #[tokio::test]
 async fn pva_server_stop_ends_listener() {
-    let (port, udp) = alloc_port();
     let cfg = PvaServerConfig {
-        tcp_port: port,
-        udp_port: udp,
+        tcp_port: 0,
+        udp_port: 0,
         ..Default::default()
     };
     let server = PvaServer::start(Arc::new(ConstSource), cfg).expect("test server must start");
+    let port = server.report().tcp_port;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Healthy server: pvget succeeds.
@@ -129,13 +122,13 @@ async fn pva_server_stop_ends_listener() {
 /// opposite of pvxs.)
 #[tokio::test]
 async fn pva_client_close_is_terminal_no_reuse() {
-    let (port, udp) = alloc_port();
     let cfg = PvaServerConfig {
-        tcp_port: port,
-        udp_port: udp,
+        tcp_port: 0,
+        udp_port: 0,
         ..Default::default()
     };
     let server = PvaServer::start(Arc::new(ConstSource), cfg).expect("test server must start");
+    let port = server.report().tcp_port;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let client = client_to(port);

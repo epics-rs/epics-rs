@@ -9,7 +9,6 @@
 #![cfg(test)]
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -17,7 +16,7 @@ use tokio::sync::mpsc;
 use epics_pva_rs::client_native::context::PvaClient;
 use epics_pva_rs::proto::ByteOrder;
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
-use epics_pva_rs::server_native::{ChannelSource, OpError, PvaServerConfig, run_pva_server};
+use epics_pva_rs::server_native::{ChannelSource, OpError, PvaServer, PvaServerConfig};
 
 #[derive(Clone)]
 struct UInt32Source;
@@ -67,17 +66,10 @@ impl ChannelSource for UInt32Source {
     }
 }
 
-static NEXT_PORT: AtomicU16 = AtomicU16::new(45000);
-fn alloc_port_pair() -> (u16, u16) {
-    let base = NEXT_PORT.fetch_add(2, Ordering::Relaxed);
-    (base, base + 1)
-}
-
 async fn run_endian_case(server_be: bool) {
-    let (port, udp) = alloc_port_pair();
     let cfg = PvaServerConfig {
-        tcp_port: port,
-        udp_port: udp,
+        tcp_port: 0,
+        udp_port: 0,
         wire_byte_order: if server_be {
             ByteOrder::Big
         } else {
@@ -85,9 +77,8 @@ async fn run_endian_case(server_be: bool) {
         },
         ..Default::default()
     };
-    let h = tokio::spawn(async move {
-        let _ = run_pva_server(Arc::new(UInt32Source), cfg).await;
-    });
+    let server = PvaServer::start(Arc::new(UInt32Source), cfg).expect("test server must start");
+    let port = server.report().tcp_port;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let server_addr =
@@ -110,7 +101,8 @@ async fn run_endian_case(server_be: bool) {
         panic!("expected NTScalar structure");
     }
 
-    h.abort();
+    server.stop();
+    let _ = tokio::time::timeout(Duration::from_secs(2), server.wait()).await;
 }
 
 #[tokio::test]

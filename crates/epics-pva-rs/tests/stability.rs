@@ -19,7 +19,6 @@
 #![allow(clippy::manual_async_fn)]
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use tokio::sync::{Mutex, mpsc};
@@ -27,7 +26,7 @@ use tokio::sync::{Mutex, mpsc};
 use epics_pva_rs::client_native::context::PvaClient;
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
 use epics_pva_rs::server_native::{
-    ChannelSource, OpError, PvaServer, PvaServerConfig, SharedPV, SharedSource, run_pva_server,
+    ChannelSource, OpError, PvaServer, PvaServerConfig, SharedPV, SharedSource,
 };
 
 // ── A tiny in-memory ChannelSource we can pump events into ───────────
@@ -285,25 +284,21 @@ impl ChannelSource for MemSource {
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
-static NEXT_PORT: AtomicU32 = AtomicU32::new(15075);
-fn alloc_port_pair() -> (u16, u16) {
-    let base = NEXT_PORT.fetch_add(2, Ordering::Relaxed) as u16;
-    (base, base + 1)
-}
-
 async fn spawn_server(source: Arc<MemSource>) -> (u16, u16, tokio::task::JoinHandle<()>) {
-    let (tcp, udp) = alloc_port_pair();
     let cfg = PvaServerConfig {
-        tcp_port: tcp,
-        udp_port: udp,
+        tcp_port: 0,
+        udp_port: 0,
         idle_timeout: Duration::from_secs(60),
         max_connections: 16,
         max_channels_per_connection: 64,
         monitor_queue_depth: 8,
         ..Default::default()
     };
+    let server = PvaServer::start(source, cfg).expect("test server must start");
+    let report = server.report();
+    let (tcp, udp) = (report.tcp_port, report.udp_port);
     let h = tokio::spawn(async move {
-        let _ = run_pva_server(source, cfg).await;
+        let _ = server.wait().await;
     });
     // Give the server a moment to bind.
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -344,10 +339,9 @@ async fn spawn_server_capped(
     source: Arc<MemSource>,
     cap: usize,
 ) -> (u16, u16, tokio::task::JoinHandle<()>) {
-    let (tcp, udp) = alloc_port_pair();
     let cfg = PvaServerConfig {
-        tcp_port: tcp,
-        udp_port: udp,
+        tcp_port: 0,
+        udp_port: 0,
         idle_timeout: Duration::from_secs(60),
         max_connections: 16,
         max_channels_per_connection: 64,
@@ -355,8 +349,11 @@ async fn spawn_server_capped(
         max_message_size: Some(cap),
         ..Default::default()
     };
+    let server = PvaServer::start(source, cfg).expect("test server must start");
+    let report = server.report();
+    let (tcp, udp) = (report.tcp_port, report.udp_port);
     let h = tokio::spawn(async move {
-        let _ = run_pva_server(source, cfg).await;
+        let _ = server.wait().await;
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
     (tcp, udp, h)
@@ -369,7 +366,24 @@ async fn p2_auto_reconnect_after_server_restart() {
     let source = Arc::new(MemSource::new());
     source.add_pv("STAB:RECON", 1.0).await;
 
-    let (tcp, _udp, h1) = spawn_server(source.clone()).await;
+    // Started directly (not via `spawn_server`): this test needs the
+    // first server's port genuinely freed before the second bind, and
+    // `JoinHandle::abort()` on a task wrapping `wait()` does not give
+    // that — it cancels the supervisor task without running `wait()`'s
+    // own cross-abort logic, so the listener task is silently detached
+    // and keeps holding the port. `stop()` + awaiting `wait()` to
+    // completion is the API's actual shutdown contract.
+    let cfg1 = PvaServerConfig {
+        tcp_port: 0,
+        udp_port: 0,
+        idle_timeout: Duration::from_secs(60),
+        max_connections: 16,
+        max_channels_per_connection: 64,
+        monitor_queue_depth: 8,
+        ..Default::default()
+    };
+    let server1 = PvaServer::start(source.clone(), cfg1).expect("test server must start");
+    let tcp = server1.report().tcp_port;
     let client = client_for(tcp);
 
     // First GET succeeds.
@@ -380,11 +394,18 @@ async fn p2_auto_reconnect_after_server_restart() {
     assert!(matches!(v, PvField::Structure(_)));
 
     // Restart server on same port.
-    h1.abort();
-    let _ = h1.await;
+    server1.stop();
+    tokio::time::timeout(Duration::from_secs(2), server1.wait())
+        .await
+        .expect("server1.wait() timed out — stop did not complete")
+        .expect("server1.wait() returned Err");
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Reuse the same source — but we need to re-bind on the same port.
+    // `PvaServer::start` requests the exact port `client` is already wired
+    // to; if TIME_WAIT is still holding it, start() would silently fall
+    // back to an ephemeral port (the defect this test suite closes), so
+    // assert the readback instead of trusting the request.
     let source2 = source.clone();
     let cfg = PvaServerConfig {
         tcp_port: tcp,
@@ -395,9 +416,12 @@ async fn p2_auto_reconnect_after_server_restart() {
         monitor_queue_depth: 8,
         ..Default::default()
     };
-    let h2 = tokio::spawn(async move {
-        let _ = run_pva_server(source2, cfg).await;
-    });
+    let server2 = PvaServer::start(source2, cfg).expect("server must restart on the freed port");
+    assert_eq!(
+        server2.report().tcp_port,
+        tcp,
+        "second server must rebind the exact same port the first one used"
+    );
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // GET on the same client should succeed (channel state machine
@@ -408,8 +432,8 @@ async fn p2_auto_reconnect_after_server_restart() {
         .expect("post-restart pvget failed");
     assert!(matches!(v, PvField::Structure(_)));
 
-    h2.abort();
-    let _ = h2.await;
+    server2.stop();
+    let _ = tokio::time::timeout(Duration::from_secs(2), server2.wait()).await;
 }
 
 /// the default client is **unbounded** (pvxs parity — no
@@ -1756,8 +1780,7 @@ async fn ex_r7_unadvertised_auth_reverts_credential_to_anonymous() {
     use epics_pva_rs::proto::encode_string_into;
     use epics_pva_rs::proto::{ByteOrder, Command, PvaHeader, Status, WriteExt};
     use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
-    use epics_pva_rs::server_native::PvaServerConfig;
-    use epics_pva_rs::server_native::run_pva_server;
+    use epics_pva_rs::server_native::{PvaServer, PvaServerConfig};
 
     // Capture what the auth_complete hook observed.
     let captured: Arc<StdMutex<Option<(String, String)>>> = Arc::new(StdMutex::new(None));
@@ -1766,10 +1789,9 @@ async fn ex_r7_unadvertised_auth_reverts_credential_to_anonymous() {
     let source = Arc::new(MemSource::new());
     source.add_pv("AUTH:EXR7", 0.0).await;
 
-    let (tcp, udp) = alloc_port_pair();
     let cfg = PvaServerConfig {
-        tcp_port: tcp,
-        udp_port: udp,
+        tcp_port: 0,
+        udp_port: 0,
         idle_timeout: Duration::from_secs(60),
         max_connections: 16,
         max_channels_per_connection: 64,
@@ -1779,8 +1801,10 @@ async fn ex_r7_unadvertised_auth_reverts_credential_to_anonymous() {
         })),
         ..Default::default()
     };
+    let server = PvaServer::start(source, cfg).expect("test server must start");
+    let tcp = server.report().tcp_port;
     let h = tokio::spawn(async move {
-        let _ = run_pva_server(source, cfg).await;
+        let _ = server.wait().await;
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -1863,17 +1887,15 @@ async fn r70_anonymous_method_yields_account_anonymous() {
     use epics_pva_rs::codec::CMD_CONNECTION_VALIDATED;
     use epics_pva_rs::proto::encode_string_into;
     use epics_pva_rs::proto::{ByteOrder, Command, PvaHeader, Status, WriteExt};
-    use epics_pva_rs::server_native::PvaServerConfig;
-    use epics_pva_rs::server_native::run_pva_server;
+    use epics_pva_rs::server_native::{PvaServer, PvaServerConfig};
 
     let captured: Arc<StdMutex<Option<(String, String)>>> = Arc::new(StdMutex::new(None));
     let captured_hook = captured.clone();
 
     let source = Arc::new(MemSource::new());
-    let (tcp, udp) = alloc_port_pair();
     let cfg = PvaServerConfig {
-        tcp_port: tcp,
-        udp_port: udp,
+        tcp_port: 0,
+        udp_port: 0,
         idle_timeout: Duration::from_secs(60),
         max_connections: 16,
         max_channels_per_connection: 64,
@@ -1883,8 +1905,10 @@ async fn r70_anonymous_method_yields_account_anonymous() {
         })),
         ..Default::default()
     };
+    let server = PvaServer::start(source, cfg).expect("test server must start");
+    let tcp = server.report().tcp_port;
     let h = tokio::spawn(async move {
-        let _ = run_pva_server(source, cfg).await;
+        let _ = server.wait().await;
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -1947,17 +1971,15 @@ async fn r70_ca_without_user_falls_back_to_anonymous() {
     use epics_pva_rs::proto::encode_string_into;
     use epics_pva_rs::proto::{ByteOrder, Command, PvaHeader, Status, WriteExt};
     use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
-    use epics_pva_rs::server_native::PvaServerConfig;
-    use epics_pva_rs::server_native::run_pva_server;
+    use epics_pva_rs::server_native::{PvaServer, PvaServerConfig};
 
     let captured: Arc<StdMutex<Option<(String, String)>>> = Arc::new(StdMutex::new(None));
     let captured_hook = captured.clone();
 
     let source = Arc::new(MemSource::new());
-    let (tcp, udp) = alloc_port_pair();
     let cfg = PvaServerConfig {
-        tcp_port: tcp,
-        udp_port: udp,
+        tcp_port: 0,
+        udp_port: 0,
         idle_timeout: Duration::from_secs(60),
         max_connections: 16,
         max_channels_per_connection: 64,
@@ -1967,8 +1989,10 @@ async fn r70_ca_without_user_falls_back_to_anonymous() {
         })),
         ..Default::default()
     };
+    let server = PvaServer::start(source, cfg).expect("test server must start");
+    let tcp = server.report().tcp_port;
     let h = tokio::spawn(async move {
-        let _ = run_pva_server(source, cfg).await;
+        let _ = server.wait().await;
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -2125,10 +2149,9 @@ async fn ignore_addr_list_does_not_block_direct_tcp_connect() {
     let source = Arc::new(MemSource::new());
     source.add_pv("IGN:PV", 1.0).await;
 
-    let (tcp, udp) = alloc_port_pair();
     let cfg = PvaServerConfig {
-        tcp_port: tcp,
-        udp_port: udp,
+        tcp_port: 0,
+        udp_port: 0,
         idle_timeout: Duration::from_secs(60),
         max_connections: 16,
         max_channels_per_connection: 64,
@@ -2137,8 +2160,10 @@ async fn ignore_addr_list_does_not_block_direct_tcp_connect() {
         ignore_addrs: vec![(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0)],
         ..Default::default()
     };
+    let server = PvaServer::start(source, cfg).expect("test server must start");
+    let tcp = server.report().tcp_port;
     let h = tokio::spawn(async move {
-        let _ = run_pva_server(source, cfg).await;
+        let _ = server.wait().await;
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -2436,15 +2461,16 @@ async fn array_concurrent_subop_replies_error_not_silent() {
 
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
     let src = Arc::new(GatedArraySource { gate: gate.clone() });
-    let (tcp, udp) = alloc_port_pair();
     let cfg = PvaServerConfig {
-        tcp_port: tcp,
-        udp_port: udp,
+        tcp_port: 0,
+        udp_port: 0,
         idle_timeout: Duration::from_secs(60),
         ..Default::default()
     };
+    let server = PvaServer::start(src, cfg).expect("test server must start");
+    let tcp = server.report().tcp_port;
     let h = tokio::spawn(async move {
-        let _ = run_pva_server(src, cfg).await;
+        let _ = server.wait().await;
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
     let server_addr =

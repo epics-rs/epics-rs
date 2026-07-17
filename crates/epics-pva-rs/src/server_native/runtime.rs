@@ -585,9 +585,10 @@ pub struct PvaServer {
     /// vars (which may have changed since startup).
     effective_config: PvaServerConfig,
     /// Bound TCP socket address — useful when the configured port was
-    /// 0 and the OS picked one.  We capture the configured value here;
-    /// callers needing the post-bind port should query the listener
-    /// directly (future work).
+    /// 0, or the requested port was taken, and the OS picked one. This
+    /// is the actually-bound port (`start()` stamps it back from
+    /// `first_listener.local_addr()`), not the requested value —
+    /// query [`Self::report`] for it, never assume `config.tcp_port`.
     bound_tcp_port: u16,
     /// Bound dedicated-TLS port, advertised as the `"tls"` SEARCH endpoint.
     /// Equals [`Self::bound_tcp_port`] when TLS shares the plaintext port

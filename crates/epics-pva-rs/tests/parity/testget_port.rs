@@ -8,26 +8,19 @@
 #![cfg(test)]
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use epics_pva_rs::client_native::context::PvaClient;
 use epics_pva_rs::nt::NTScalar;
 use epics_pva_rs::pvdata::ScalarType;
-use epics_pva_rs::server_native::{PvaServerConfig, SharedPV, SharedSource, run_pva_server};
-
-static NEXT_PORT: AtomicU16 = AtomicU16::new(34000);
-fn alloc_port_pair() -> (u16, u16) {
-    let base = NEXT_PORT.fetch_add(2, Ordering::Relaxed);
-    (base, base + 1)
-}
+use epics_pva_rs::server_native::{PvaServer, PvaServerConfig, SharedPV, SharedSource};
 
 #[tokio::test]
 async fn pvxs_connect_onconnect_fires_after_server_start() {
-    let (port, udp) = alloc_port_pair();
     let cfg = PvaServerConfig {
-        tcp_port: port,
-        udp_port: udp,
+        tcp_port: 0,
+        udp_port: 0,
         ..Default::default()
     };
 
@@ -40,9 +33,8 @@ async fn pvxs_connect_onconnect_fires_after_server_start() {
     let src = Arc::new(SharedSource::new());
     src.add("mailbox", pv);
 
-    let h = tokio::spawn(async move {
-        let _ = run_pva_server(src, cfg).await;
-    });
+    let server = PvaServer::start(src, cfg).expect("test server must start");
+    let port = server.report().tcp_port;
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     let server_addr =
@@ -84,5 +76,6 @@ async fn pvxs_connect_onconnect_fires_after_server_start() {
     );
 
     drop(handle);
-    h.abort();
+    server.stop();
+    let _ = tokio::time::timeout(Duration::from_secs(2), server.wait()).await;
 }

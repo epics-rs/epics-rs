@@ -1,8 +1,40 @@
 # Changelog
 
-## Unreleased
+## v0.24.0 — 2026-07-18
+
+Minor release. A full C-parity hardening pass driven by the new differential
+oracle (`epics-oracle-rs`), which boots a C `softIoc` and the Rust port on the
+same database and diffs their Channel Access and PVA behaviour: roughly 800
+fixes landed across asyn, the calc engines, the database/record metadata
+surface, Channel Access, and PVA/QSRV2. Two breaking asyn API changes plus new
+oracle differential-testing phases. Workspace version 0.23.0 -> 0.24.0,
+internal `[workspace.dependencies]` pins move to 0.24.0 in lockstep.
 
 ### asyn-rs
+
+- **BREAKING: `ParamSetValue`'s per-type variants are replaced by
+  `ParamSetValue::Value { reason, addr, value: ParamValue }`** (plus a
+  `UInt32Digital` masked set). The actor-path carrier had enumerated only a
+  subset of the parameter types the store supports, so a driver background
+  thread pushing e.g. an `Int64` or `Float32Array` through
+  `set_params_and_notify` silently lost the update. The carrier now holds a
+  `ParamValue` applied through one exhaustive `ParamList::set_value`, so a new
+  variant is a compile error rather than a dropped update, and a set the
+  parameter cannot hold is now traced (`ASYN_TRACE_ERROR`, as C
+  `asynPortDriver::setIntegerParam`) and returned instead of vanishing with a
+  success reply. Build values with `ParamSetValue::new` and
+  `ParamSetValue::uint32_digital`; `UInt64`/`UInt64Array` are refused with an
+  explicit error.
+
+- **BREAKING: `PortDriver::drv_user_create`, `PortHandle::drv_user_create` and
+  `PortHandle::drv_user_create_blocking` take `&DrvUserRequest` instead of
+  `(&str, i32)`.** A record's bind now carries the interface the record reads
+  the parameter through (its DTYP), not just the drvInfo string and addr, so
+  an on-demand driver (C Autoparam lazy creation) no longer has to guess the
+  parameter type and silently bypass the record's conversions (ai
+  ASLO/AOFF/SMOO, asynInt32 ai ESLO/EOFF, bi/mbbi RVAL state tables).
+  `DrvUserRequest` is `#[non_exhaustive]` with a `new` + builder; in-tree
+  drivers (modbus, mqtt) that name the type in their drvInfo are unaffected.
 
 - **`PortHandle::submit_blocking` no longer panics inside the framework's own
   runtimes.** It reached for `tokio::task::block_in_place`, which panics
@@ -35,6 +67,55 @@
   an error whenever it was called from inside *any* tokio runtime. It now
   succeeds there (which is what an acquisition task on an `ad-core` driver
   thread needs) and errors only on the genuinely unserviceable case above.
+
+- ~110 further asyn parity fixes across `CallParamCallbacks`, drv_user
+  plumbing, trace/report output, and the interface adapters.
+
+### calc / sCalc / aCalc
+
+- `NINT` and `MODULO` now narrow their operands per dialect, mirroring each
+  engine's own C: base `calcPerform` routes through `d2i()` (matching
+  epics-base PR #925, which fixes an `INT_MIN % -1` SIGFPE and the raw
+  double→int cast), while the sCalc/aCalc engines keep their own conversions.
+  ~100 further parity fixes across the calc / transform / swait / sseq /
+  acalcout / scalcout record family.
+
+### epics-base-rs — records & database metadata
+
+- **`aai` / `aao` / `subArray` VAL no longer advertise a 0-length Channel
+  Access channel.** `field_native_count` returns each record's `cvt_dbaddr`
+  capacity (`nelm`, or `malm` for `subArray`), so array puts and gets over CA
+  are served instead of refused with "Invalid element count requested".
+- The record metadata rsets (`get_graphic_double`, `get_control_double`,
+  `get_alarm_double`, units / precision) are now routed per field from each
+  record type's own C source, with a single owner per slot, instead of being
+  read from the VAL cache. ~100 fixes across `db` / `records` / `base`.
+- Ported the `dbDbLink` / `dbConstLink` metadata `lset` slots.
+
+### bi record
+
+- Added the `AFTC` / `AFVL` alarm-range filter fields (EPICS PR #817 parity).
+
+### epics-pva-rs / QSRV2
+
+- Serve `display.precision` that pvxs QSRV2 drops when a field NULLs
+  `get_graphic_double` (CBUG-G1; a documented deviation from upstream pvxs).
+- An external PUT is routed through `dbPutField`, a monitor update is marked
+  by its own DBE class rather than the whole NT, and the double→NT integer
+  leaf step uses C++ cast semantics. ~30 further PVA / gateway parity fixes.
+
+### epics-ca-rs
+
+- `ECA_PUTCBINPROG` is 362, not 366. ~40 Channel Access client / server and
+  catools parity fixes.
+
+### epics-oracle-rs
+
+- New PVA monitor phase (`--phase pva-monitor`): subscribe, drive, and diff
+  the monitor events between the C IOC and the port.
+- New array phase measuring the `aai` / `aao` / `subArray` / `waveform` VAL
+  seam.
+- `pvxput` / `pvxmonitor` added to the PVA instrument.
 
 ## v0.23.0 — 2026-07-12
 

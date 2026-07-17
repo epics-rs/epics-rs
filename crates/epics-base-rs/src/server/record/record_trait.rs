@@ -585,6 +585,60 @@ pub fn graphic_default_arm(rtype: &str) -> RsetDefaultArm {
     }
 }
 
+/// How `rtype`'s C `get_alarm_double` answers the fields it lists explicitly
+/// (see [`alarm_explicit_fields`]).
+///
+/// The severity gate is NOT universal, so this bit cannot be inferred from the
+/// base analog shape — it is read from each ported type's own rset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlarmValArm {
+    /// `pad->upper_alarm_limit = prec->hhsv ? prec->hihi : epicsNAN` — each
+    /// limit is served only when its severity is enabled. The base analog
+    /// shape (`aiRecord.c:290-301`, and ao/longin/longout/calc/calcout/sel/
+    /// sub/dfanout alike).
+    Gated,
+    /// `pad->upper_alarm_limit = prec->hihi` — the four limits verbatim, with
+    /// no severity test at all, so an unset record serves 0 rather than NaN
+    /// (`int64inRecord.c:235-246`, `int64outRecord.c:279-290`,
+    /// `sCalcoutRecord.c:683-696`, `aCalcoutRecord.c:823-836`,
+    /// `motorRecord.cc:3344-3361`, `epidRecord.c:289-301`).
+    Unconditional,
+}
+
+/// The fields `rtype`'s C `get_alarm_double` lists BEFORE its
+/// `recGblGetAlarmDouble` fall-through — the ones that take
+/// [`alarm_val_arm`]'s answer instead of the four NaN.
+///
+/// Empty means the rset lists nothing: even VAL falls to the default arm.
+/// `seqRecord.c:355-367` routes only its `DOn` fields (through their `DOLn`
+/// link), `aSubRecord.c:378-404` only its `INPn`/`OUTn` links, and
+/// `swaitRecord.c:608-612` is a bare `recGblGetAlarmDouble(paddr,pad)` with no
+/// field test whatsoever. A constant link supplies no alarm limits, so the link
+/// arm lands on the same four NaN — which is why only the listed set needs a
+/// per-type answer and the link fields do not.
+///
+/// `motorRecord.cc:3344-3361` is the one type listing a second field: its case
+/// is `fieldIndex == motorRecordVAL || fieldIndex == motorRecordDVAL`, so the
+/// dial-coordinate readback carries the same limits as VAL.
+pub fn alarm_explicit_fields(rtype: &str) -> &'static [&'static str] {
+    match rtype {
+        "seq" | "aSub" | "swait" => &[],
+        "motor" => &["VAL", "DVAL"],
+        _ => &["VAL"],
+    }
+}
+
+/// See [`AlarmValArm`]. Types whose rset lists nothing
+/// ([`alarm_explicit_fields`] empty) never consult this.
+pub fn alarm_val_arm(rtype: &str) -> AlarmValArm {
+    match rtype {
+        "int64in" | "int64out" | "scalcout" | "acalcout" | "motor" | "epid" => {
+            AlarmValArm::Unconditional
+        }
+        _ => AlarmValArm::Gated,
+    }
+}
+
 pub fn default_property_support(rtype: &str) -> crate::server::snapshot::PropertySupport {
     use crate::server::snapshot::PropertySupport as P;
     match rtype {

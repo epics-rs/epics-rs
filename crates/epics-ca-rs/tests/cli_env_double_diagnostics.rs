@@ -22,7 +22,11 @@
 //! reject, `0x10` → 16, `1e400` → reject) are pinned by the per-boundary
 //! unit tests in `client::transport` and `server::tcp`.
 
+mod common;
+
 use std::process::{Command, Stdio};
+
+use common::LineCollector;
 
 /// stderr of `caget-rs` for a PV that does not exist — the tool still
 /// builds its client, which is where both variables are resolved. `-w 0.1`
@@ -161,12 +165,22 @@ fn beacon_period_reject_is_diagnosed_once_per_process() {
         .spawn()
         .expect("spawn softioc-rs");
 
-    // Startup is what prints; give it room, then take the IOC down and read
-    // everything it wrote.
-    std::thread::sleep(std::time::Duration::from_millis(1500));
+    // Startup is what prints, and the "CA server:" banner is emitted after
+    // the one-shot env resolution (`addr_list::from_env` in `run()`) — every
+    // startup point that historically duplicated the diagnostic precedes it.
+    // Wait for the banner itself (a fixed sleep races startup under load),
+    // then take the IOC down and judge everything it wrote.
+    let err_lines = LineCollector::spawn(child.stderr.take().expect("piped stderr"));
+    assert!(
+        err_lines.wait_for(std::time::Duration::from_secs(10), |t| {
+            t.contains("CA server: UDP search on port")
+        }),
+        "softioc-rs never printed its startup banner; stderr: {:?}",
+        err_lines.text()
+    );
     let _ = child.kill();
-    let out = child.wait_with_output().expect("wait softioc-rs");
-    let err = String::from_utf8_lossy(&out.stderr);
+    let _ = child.wait();
+    let err = err_lines.into_text();
 
     for line in [
         "Unable to find a real number in EPICS_CAS_BEACON_PERIOD=garbage",

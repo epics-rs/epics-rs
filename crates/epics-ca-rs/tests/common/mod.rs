@@ -9,7 +9,8 @@
 
 use std::net::{TcpListener, UdpSocket};
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 /// Returns true when the named binary resolves on PATH or in the local
 /// EPICS install. Used by interop tests to early-exit on hosts that
@@ -45,6 +46,89 @@ pub fn free_tcp_port() -> u16 {
 pub fn free_udp_port() -> u16 {
     let sock = UdpSocket::bind("127.0.0.1:0").expect("free UDP port");
     sock.local_addr().unwrap().port()
+}
+
+/// Collects a child's stream line-by-line on a background thread so tests
+/// can wait for the OUTPUT THEY ASSERT ON instead of sleeping a fixed
+/// interval and hoping the child got there. A fixed sleep is a load-sensitive
+/// guess (the cli_monitor_separator CI flake); waiting on the line itself
+/// only leaves a generous outer deadline that turns a hung child into a
+/// named failure.
+pub struct LineCollector {
+    state: Arc<(Mutex<(String, bool)>, Condvar)>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl LineCollector {
+    /// Start collecting from `stream` (a piped child stdout/stderr).
+    pub fn spawn<R: std::io::Read + Send + 'static>(stream: R) -> Self {
+        let state = Arc::new((Mutex::new((String::new(), false)), Condvar::new()));
+        let thread_state = state.clone();
+        let handle = std::thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(stream);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let eof =
+                    !matches!(std::io::BufRead::read_line(&mut reader, &mut line), Ok(n) if n > 0);
+                let (lock, cvar) = &*thread_state;
+                let mut guard = lock.lock().unwrap();
+                if eof {
+                    guard.1 = true;
+                    cvar.notify_all();
+                    return;
+                }
+                guard.0.push_str(&line);
+                cvar.notify_all();
+            }
+        });
+        Self {
+            state,
+            handle: Some(handle),
+        }
+    }
+
+    /// Block until `pred(text-so-far)` holds; `false` when the stream hit
+    /// EOF or `deadline` elapsed with the predicate never satisfied.
+    pub fn wait_for(&self, deadline: Duration, pred: impl Fn(&str) -> bool) -> bool {
+        let end = Instant::now() + deadline;
+        let (lock, cvar) = &*self.state;
+        let mut guard = lock.lock().unwrap();
+        loop {
+            if pred(&guard.0) {
+                return true;
+            }
+            if guard.1 {
+                return false;
+            }
+            let now = Instant::now();
+            if now >= end {
+                return false;
+            }
+            let (g, timeout) = cvar.wait_timeout(guard, end - now).unwrap();
+            guard = g;
+            if timeout.timed_out() {
+                return pred(&guard.0);
+            }
+        }
+    }
+
+    /// Snapshot of everything read so far (for failure messages).
+    pub fn text(&self) -> String {
+        let (lock, _) = &*self.state;
+        lock.lock().unwrap().0.clone()
+    }
+
+    /// Everything the stream produced. Call after the child is killed or
+    /// exited — joins the reader thread, which ends at pipe EOF.
+    pub fn into_text(mut self) -> String {
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+        let (lock, _) = &*self.state;
+        let guard = lock.lock().unwrap();
+        guard.0.clone()
+    }
 }
 
 /// A child process that's killed when dropped, plus the `EPICS_CA_*`

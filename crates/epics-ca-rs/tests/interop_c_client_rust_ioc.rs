@@ -107,7 +107,6 @@ fn c_camonitor_sees_rust_ioc_changes() {
         return;
     };
 
-    // Spawn camonitor with a 3-second window.
     let mut mon = Command::new("camonitor")
         .arg("TEST:LOUT")
         .env("EPICS_CA_ADDR_LIST", "127.0.0.1")
@@ -118,7 +117,14 @@ fn c_camonitor_sees_rust_ioc_changes() {
         .spawn()
         .expect("camonitor");
 
-    std::thread::sleep(Duration::from_millis(500));
+    // Wait for camonitor's leading event (it prints the current value on
+    // connect) rather than assuming a fixed sleep covers search + connect.
+    let out_lines = common::LineCollector::spawn(mon.stdout.take().expect("piped stdout"));
+    assert!(
+        out_lines.wait_for(Duration::from_secs(10), |t| t.contains("TEST:LOUT")),
+        "camonitor never connected; got:\n{}",
+        out_lines.text()
+    );
 
     // Drive several writes via C caput.
     for v in [10, 20, 30] {
@@ -126,14 +132,14 @@ fn c_camonitor_sees_rust_ioc_changes() {
         std::thread::sleep(Duration::from_millis(150));
     }
 
-    // Stop camonitor and inspect output.
-    std::thread::sleep(Duration::from_millis(500));
+    // Wait for the final value to be observed, then stop camonitor.
+    let saw_final = out_lines.wait_for(Duration::from_secs(10), |t| t.contains("30"));
     let _ = mon.kill();
-    let out = mon.wait_with_output().expect("camonitor wait");
-    let text = String::from_utf8_lossy(&out.stdout);
+    let _ = mon.wait();
     assert!(
-        text.contains("30"),
-        "camonitor never observed final value 30; got:\n{text}"
+        saw_final,
+        "camonitor never observed final value 30; got:\n{}",
+        out_lines.into_text()
     );
 }
 

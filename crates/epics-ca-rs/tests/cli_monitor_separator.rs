@@ -19,40 +19,46 @@
 //! The port attached the separator to the timestamp and dropped it with the
 //! timestamp — a dual meaning C's line shape does not have.
 
+mod common;
+
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+use common::LineCollector;
 use epics_base_rs::server::records::ao::AoRecord;
 use epics_ca_rs::server::CaServer;
 use serial_test::serial;
 
 /// The first line the real `camonitor-rs` prints for `args`.
 ///
-/// camonitor never exits, so this kills it once the leading event is out. The
-/// CA environment goes to the CHILD only; the spawn/kill go through
-/// `spawn_blocking` so the in-process server keeps running on its own worker.
+/// camonitor never exits, so this kills it once the leading event is out —
+/// and it waits for that event itself (first complete stdout line) rather
+/// than sleeping a fixed interval, which raced connect + first event under
+/// CI load. The CA environment goes to the CHILD only; the blocking wait
+/// goes through `spawn_blocking` so the in-process server keeps running on
+/// its own worker.
 async fn first_line(port: u16, args: &[&str]) -> String {
     let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_camonitor-rs"))
-        .args(&args)
-        .env("EPICS_CA_ADDR_LIST", format!("127.0.0.1:{port}"))
-        .env("EPICS_CA_AUTO_ADDR_LIST", "NO")
-        .env("EPICS_CA_SERVER_PORT", port.to_string())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("spawn camonitor-rs");
-    // Long enough for connect + the leading monitor event.
-    tokio::time::sleep(Duration::from_millis(600)).await;
-    child.kill().expect("kill camonitor-rs");
-    let out =
-        tokio::task::spawn_blocking(move || child.wait_with_output().expect("collect stdout"))
-            .await
-            .expect("camonitor-rs child joined");
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .next()
-        .unwrap_or_default()
-        .to_string()
+    let port_env = port.to_string();
+    tokio::task::spawn_blocking(move || {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_camonitor-rs"))
+            .args(&args)
+            .env("EPICS_CA_ADDR_LIST", format!("127.0.0.1:{port}"))
+            .env("EPICS_CA_AUTO_ADDR_LIST", "NO")
+            .env("EPICS_CA_SERVER_PORT", port_env)
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn camonitor-rs");
+        let collector = LineCollector::spawn(child.stdout.take().expect("piped stdout"));
+        let got = collector.wait_for(Duration::from_secs(10), |text| text.contains('\n'));
+        child.kill().expect("kill camonitor-rs");
+        let _ = child.wait();
+        let text = collector.into_text();
+        assert!(got, "camonitor-rs printed no line within 10s; got {text:?}");
+        text.lines().next().unwrap_or_default().to_string()
+    })
+    .await
+    .expect("camonitor-rs child joined")
 }
 
 /// The server TAKES its port by binding it (`.port(0)` → read back

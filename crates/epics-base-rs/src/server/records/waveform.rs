@@ -913,13 +913,17 @@ impl Record for WaveformRecord {
         Ok(())
     }
 
-    /// `waveform` VAL: `get_field("VAL")` serves NORD valid elements, but the
-    /// channel's native count is NELM (the buffer capacity) so a client sizes
-    /// its buffer right — C `cvt_dbaddr` `no_elements = nelm` vs
-    /// `get_array_info` `*no_elements = nord`. Only the waveform kind: `aai`/
-    /// `aao`/`subArray` serve their VAL at its own count.
+    /// `VAL`: `get_field("VAL")` serves NORD valid elements, but the channel's
+    /// native count is the buffer capacity so a client sizes its buffer right —
+    /// C `cvt_dbaddr` `no_elements` vs `get_array_info` `*no_elements = nord`.
+    /// The capacity is the same [`Self::val_capacity`] every array kind
+    /// advertises: waveform/aai/aao report `nelm` (`waveformRecord.c:183`,
+    /// `aaiRecord.c:215`, `aaoRecord.c:219`), subArray reports `malm`
+    /// (`subArrayRecord.c:168`). Reporting it only for the waveform kind left
+    /// aai/aao/subArray advertising a 0-length channel, so every array put/get
+    /// was refused "Invalid element count requested".
     fn field_native_count(&self, field: &str) -> Option<u32> {
-        (field == "VAL" && self.kind == ArrayKind::Waveform).then_some(self.nelm.max(0) as u32)
+        (field == "VAL").then(|| self.val_capacity() as u32)
     }
 
     /// `aao` is an output record; the rest of the array family read
@@ -1573,6 +1577,41 @@ mod array_kind_tests {
         let r = WaveformRecord::with_kind(ArrayKind::SubArray);
         assert_eq!(r.record_type(), "subArray");
         assert!(!r.can_device_write(), "subArray is input");
+    }
+
+    /// C's `cvt_dbaddr` fixes every array record's VAL channel `no_elements` at
+    /// the buffer capacity — `nelm` for waveform/aai/aao (`waveformRecord.c:183`,
+    /// `aaiRecord.c:215`, `aaoRecord.c:219`), `malm` for subArray
+    /// (`subArrayRecord.c:168`). A kind that reported `None` here advertised a
+    /// 0-length channel, so every array put/get was refused "Invalid element
+    /// count requested". Boundary: each kind's capacity source, plus a non-VAL
+    /// field that must stay `None`.
+    #[test]
+    fn every_array_kind_advertises_val_capacity_as_native_count() {
+        for kind in [ArrayKind::Waveform, ArrayKind::Aai, ArrayKind::Aao] {
+            let mut r = WaveformRecord::with_kind(kind);
+            r.nelm = 16;
+            assert_eq!(
+                r.field_native_count("VAL"),
+                Some(16),
+                "{} VAL native count must be NELM (its cvt_dbaddr no_elements)",
+                r.record_type()
+            );
+            assert_eq!(
+                r.field_native_count("NORD"),
+                None,
+                "{} native count only applies to VAL",
+                r.record_type()
+            );
+        }
+        let mut sa = WaveformRecord::with_kind(ArrayKind::SubArray);
+        sa.malm = 12;
+        assert_eq!(
+            sa.field_native_count("VAL"),
+            Some(12),
+            "subArray VAL native count must be MALM, not NELM"
+        );
+        assert_eq!(sa.field_native_count("VAL"), Some(sa.val_capacity() as u32));
     }
 
     #[test]

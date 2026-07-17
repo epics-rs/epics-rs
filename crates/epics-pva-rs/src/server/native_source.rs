@@ -296,16 +296,23 @@ fn set_numeric(v: &mut PvField, path: &str, val: f64) {
     let Some(PvField::Scalar(slot)) = leaf_mut(v, path) else {
         return;
     };
+    // pvxs `Value::copyIn` (`data.cpp:551-578`) casts the double to the
+    // store's 64-bit integer FIRST, then truncates to the leaf's declared
+    // width. Rust's `as` saturates where the C++ cast overflows, so a limit
+    // that does not fit — `recGblGetAlarmDouble`'s NaN, or
+    // `getMaxRangeValues`' 2^64 for a DBF_UINT64 field — landed on a
+    // different number than the one QSRV2 serves.
+    use crate::pvdata::cpp_cast::{double_to_i64, double_to_u64};
     *slot = match slot {
         ScalarValue::Boolean(_) => ScalarValue::Boolean(val != 0.0),
-        ScalarValue::Byte(_) => ScalarValue::Byte(val as i8),
-        ScalarValue::Short(_) => ScalarValue::Short(val as i16),
-        ScalarValue::Int(_) => ScalarValue::Int(val as i32),
-        ScalarValue::Long(_) => ScalarValue::Long(val as i64),
-        ScalarValue::UByte(_) => ScalarValue::UByte(val as u8),
-        ScalarValue::UShort(_) => ScalarValue::UShort(val as u16),
-        ScalarValue::UInt(_) => ScalarValue::UInt(val as u32),
-        ScalarValue::ULong(_) => ScalarValue::ULong(val as u64),
+        ScalarValue::Byte(_) => ScalarValue::Byte(double_to_i64(val) as i8),
+        ScalarValue::Short(_) => ScalarValue::Short(double_to_i64(val) as i16),
+        ScalarValue::Int(_) => ScalarValue::Int(double_to_i64(val) as i32),
+        ScalarValue::Long(_) => ScalarValue::Long(double_to_i64(val)),
+        ScalarValue::UByte(_) => ScalarValue::UByte(double_to_u64(val) as u8),
+        ScalarValue::UShort(_) => ScalarValue::UShort(double_to_u64(val) as u16),
+        ScalarValue::UInt(_) => ScalarValue::UInt(double_to_u64(val) as u32),
+        ScalarValue::ULong(_) => ScalarValue::ULong(double_to_u64(val)),
         ScalarValue::Float(_) => ScalarValue::Float(val as f32),
         ScalarValue::Double(_) => ScalarValue::Double(val),
         // A string leaf is never a numeric limit: pvxs's `isnumeric` gate

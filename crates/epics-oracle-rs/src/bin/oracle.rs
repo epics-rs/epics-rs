@@ -263,8 +263,12 @@ async fn run_pva_read(args: &Args) -> Result<ExitCode, String> {
         surface.unimplemented_types.len()
     );
 
-    let cases = pvaread::probe(&tools, &workdir(None)?, &surface, &types);
-    let report = pvaread::report(&args.dbd.display().to_string(), &surface, cases);
+    let mut allowlist = match &args.allowlist {
+        Some(p) => Allowlist::load(p)?,
+        None => Allowlist::load(&Allowlist::default_path())?,
+    };
+    let cases = pvaread::probe(&tools, &workdir(None)?, &surface, &types, &mut allowlist);
+    let report = pvaread::report(&args.dbd.display().to_string(), &surface, cases, &allowlist);
     report.counts.check()?;
 
     if let Some(p) = &args.json {
@@ -301,8 +305,12 @@ async fn run_pva_monitor(args: &Args) -> Result<ExitCode, String> {
         surface.denominator()
     );
 
-    let cases = pvamonitor::probe(&tools, &workdir(None)?, &surface, &types);
-    let report = pvamonitor::report(&args.dbd.display().to_string(), &surface, cases);
+    let mut allowlist = match &args.allowlist {
+        Some(p) => Allowlist::load(p)?,
+        None => Allowlist::load(&Allowlist::default_path())?,
+    };
+    let cases = pvamonitor::probe(&tools, &workdir(None)?, &surface, &types, &mut allowlist);
+    let report = pvamonitor::report(&args.dbd.display().to_string(), &surface, cases, &allowlist);
     report.counts.check()?;
 
     if let Some(p) = &args.json {

@@ -118,12 +118,13 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::allowlist::{Allowlist, MatchContext};
 use crate::catool::ToolError;
 use crate::diff::Verdict;
 use crate::ioc::{Ioc, PvaPair, PvxTools, Side};
 use crate::ntshape::{NT_ENUM, NtShape};
 use crate::pvatool::{PvaEvent, PvaTools};
-use crate::report::Counts;
+use crate::report::{Counts, StaleRow};
 use crate::surface::{Coverage, Surface, is_put_candidate};
 
 /// The scan rate of the [`Drive::Scanned`] reproducer.
@@ -302,6 +303,10 @@ pub struct MonCase {
     pub c_side: MonObservation,
     pub rust_side: MonObservation,
     pub differences: Vec<MonDifference>,
+    /// CBUG ids that justified the differences (empty unless EXPECTED
+    /// DEVIATION). Same contract as the read phase.
+    #[serde(default)]
+    pub allowlisted: Vec<String>,
     pub errors: Vec<ToolError>,
     /// The `.db` that reproduces it.
     pub db: String,
@@ -346,6 +351,12 @@ pub struct MonReport {
     pub denominator: MonDenominator,
     pub case_coverage: Coverage,
     pub counts: Counts,
+    #[serde(default)]
+    pub stale_allowlist_rows: Vec<StaleRow>,
+    #[serde(default)]
+    pub unexercised_allowlist_rows: Vec<StaleRow>,
+    #[serde(default)]
+    pub fired_allowlist_rows: Vec<String>,
     pub cases: Vec<MonCase>,
 }
 
@@ -438,6 +449,11 @@ impl MonReport {
         s.push_str("CASES (one per record type per reproducer: passive + scanned)\n");
         let _ = writeln!(s, "  ran                : {}", c.ran);
         let _ = writeln!(s, "  agreed             : {}", c.agreed);
+        let _ = writeln!(
+            s,
+            "  expected deviation : {}  (allowlisted against doc/upstream-c-bugs.md)",
+            c.expected_deviation
+        );
         let _ = writeln!(s, "  DEFECT             : {}", c.defect);
         let _ = writeln!(
             s,
@@ -449,6 +465,27 @@ impl MonReport {
             Err(e) => {
                 let _ = writeln!(s, "  !!! {e}\n");
             }
+        }
+
+        if !self.fired_allowlist_rows.is_empty() || !self.stale_allowlist_rows.is_empty() {
+            s.push_str("ALLOWLIST (doc/upstream-c-bugs.md, transcribed)\n");
+            if !self.fired_allowlist_rows.is_empty() {
+                let mut fired: Vec<&String> = self.fired_allowlist_rows.iter().collect();
+                fired.sort();
+                let _ = writeln!(
+                    s,
+                    "  fired: {}",
+                    fired
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            for r in &self.stale_allowlist_rows {
+                let _ = writeln!(s, "  STALE (deviation stopped): {} — {}", r.id, r.why);
+            }
+            s.push('\n');
         }
 
         s.push_str(
@@ -530,6 +567,7 @@ pub fn probe(
     workdir: &Path,
     surface: &Surface,
     record_types: &[String],
+    allowlist: &mut Allowlist,
 ) -> Vec<MonCase> {
     let mut cases = Vec::new();
     for (i, rt) in record_types.iter().enumerate() {
@@ -558,7 +596,7 @@ pub fn probe(
             );
         }
         eprintln!("[{}/{}] pva monitor: {rt}", i + 1, record_types.len());
-        cases.extend(probe_type(tools, workdir, rt));
+        cases.extend(probe_type(tools, workdir, rt, allowlist));
     }
     cases
 }
@@ -640,7 +678,12 @@ fn write_db(workdir: &Path, name: &str, text: &str) -> Result<PathBuf, String> {
 
 /// One record type: boot the pair once, subscribe to every reproducer on both
 /// sides, drive them, and diff.
-fn probe_type(tools: &PvxTools, workdir: &Path, record_type: &str) -> Vec<MonCase> {
+fn probe_type(
+    tools: &PvxTools,
+    workdir: &Path,
+    record_type: &str,
+    allowlist: &mut Allowlist,
+) -> Vec<MonCase> {
     let drives = drives_for(record_type);
     let db_text: String = drives
         .iter()
@@ -702,7 +745,7 @@ fn probe_type(tools: &PvxTools, workdir: &Path, record_type: &str) -> Vec<MonCas
 
     refs.iter()
         .enumerate()
-        .map(|(i, cr)| adjudicate(cr, &obs_c[i], &obs_r[i]))
+        .map(|(i, cr)| adjudicate(cr, &obs_c[i], &obs_r[i], allowlist))
         .collect()
 }
 
@@ -837,6 +880,7 @@ fn errored_cases(refs: &[CaseRef], message: &str) -> Vec<MonCase> {
                 c_side: MonObservation::default(),
                 rust_side: MonObservation::default(),
                 differences: Vec::new(),
+                allowlisted: Vec::new(),
                 errors: vec![e],
                 db: cr.db.clone(),
             }
@@ -856,10 +900,19 @@ fn errored_cases(refs: &[CaseRef], message: &str) -> Vec<MonCase> {
 /// 2. No differences => AGREED.
 /// 3. Anything left => DEFECT.
 ///
-/// EXPECTED DEVIATION is unreachable, exactly as in [`crate::pvaread`]: the CA
-/// allowlist transcribes `doc/upstream-c-bugs.md`, whose rows are about C's CA
-/// behaviour and justify nothing about QSRV2's monitors.
-pub fn adjudicate(cr: &CaseRef, c: &MonObservation, r: &MonObservation) -> MonCase {
+/// A difference is EXPECTED DEVIATION only when a NOT-REPRODUCED row justifies
+/// it — the same contract as [`crate::pvaread::adjudicate`]. The monitor SEED
+/// carries the same `getProperties` leaves a read does, so CBUG-G1's
+/// `display.precision` add shows on `MonSurface::SeedEvent` for the family VAL a
+/// monitor drives (`transform.VAL`); the row (surface `seed_event`) justifies
+/// it. As on the read side, a case is EXPECTED DEVIATION only if EVERY
+/// difference is justified — one unjustified diff makes it a DEFECT.
+pub fn adjudicate(
+    cr: &CaseRef,
+    c: &MonObservation,
+    r: &MonObservation,
+    allowlist: &mut Allowlist,
+) -> MonCase {
     let mut errors: Vec<ToolError> = Vec::new();
     errors.extend(c.errors.iter().cloned());
     errors.extend(r.errors.iter().cloned());
@@ -873,6 +926,7 @@ pub fn adjudicate(cr: &CaseRef, c: &MonObservation, r: &MonObservation) -> MonCa
         c_side: c.clone(),
         rust_side: r.clone(),
         differences: Vec::new(),
+        allowlisted: Vec::new(),
         errors,
         db: cr.db.clone(),
     };
@@ -885,6 +939,22 @@ pub fn adjudicate(cr: &CaseRef, c: &MonObservation, r: &MonObservation) -> MonCa
     let (Some(ct), Some(rt)) = (&c.trace, &r.trace) else {
         return case;
     };
+
+    let ctx = MatchContext {
+        record_type: &cr.record_type,
+        field: "VAL",
+        class: None,
+    };
+    // Record what this case looked at before the agreed early-out, so a row that
+    // stopped firing reads as stale, not unexercised.
+    allowlist.note_compared_pva(
+        &ctx,
+        &[
+            MonSurface::SeedEvent.as_str(),
+            MonSurface::EventCount.as_str(),
+            MonSurface::UpdateEvents.as_str(),
+        ],
+    );
 
     if ct.seed != rt.seed {
         case.differences.push(MonDifference {
@@ -908,8 +978,20 @@ pub fn adjudicate(cr: &CaseRef, c: &MonObservation, r: &MonObservation) -> MonCa
         });
     }
 
-    case.verdict = if case.differences.is_empty() {
-        Verdict::Agreed
+    if case.differences.is_empty() {
+        case.verdict = Verdict::Agreed;
+        return case;
+    }
+
+    let hits: Vec<Option<String>> = case
+        .differences
+        .iter()
+        .map(|d| allowlist.match_pva_diff(&ctx, d.surface.as_str(), &d.reference, &d.observed))
+        .collect();
+    let all_justified = hits.iter().all(Option::is_some);
+    case.allowlisted = hits.into_iter().flatten().collect();
+    case.verdict = if all_justified {
+        Verdict::ExpectedDeviation
     } else {
         Verdict::Defect
     };
@@ -931,11 +1013,24 @@ fn render_updates(updates: &[String]) -> String {
 }
 
 /// Assemble the report from the cases and the surface they were drawn from.
-pub fn report(dbd_path: &str, surface: &Surface, cases: Vec<MonCase>) -> MonReport {
+pub fn report(
+    dbd_path: &str,
+    surface: &Surface,
+    cases: Vec<MonCase>,
+    allowlist: &Allowlist,
+) -> MonReport {
     let measured = cases
         .iter()
         .filter(|c| c.verdict != Verdict::Errored)
         .count();
+    let stale = |rows: Vec<&crate::allowlist::Deviation>| -> Vec<StaleRow> {
+        rows.into_iter()
+            .map(|d| StaleRow {
+                id: d.id.clone(),
+                why: d.why.clone(),
+            })
+            .collect()
+    };
 
     let of_status = |want: ValStatus| -> Vec<String> {
         surface
@@ -984,6 +1079,9 @@ pub fn report(dbd_path: &str, surface: &Surface, cases: Vec<MonCase>) -> MonRepo
             errored: cases.len().saturating_sub(measured),
         },
         counts: Counts::tally_verdicts(cases.iter().map(|c| c.verdict)),
+        stale_allowlist_rows: stale(allowlist.stale_rows()),
+        unexercised_allowlist_rows: stale(allowlist.unexercised_rows()),
+        fired_allowlist_rows: allowlist.fired_rows().iter().cloned().collect(),
         cases,
     }
 }
@@ -1000,6 +1098,12 @@ mod tests {
             drive,
             db: String::new(),
         }
+    }
+
+    /// Adjudicate against an empty allowlist — pre-allowlist behaviour, so every
+    /// difference is a DEFECT.
+    fn adj(cr: &CaseRef, c: &MonObservation, r: &MonObservation) -> MonCase {
+        adjudicate(cr, c, r, &mut Allowlist::empty())
     }
 
     fn obs(seed: &str, updates: &[&str]) -> MonObservation {
@@ -1020,6 +1124,41 @@ mod tests {
         }
     }
 
+    /// CBUG-G1 on the monitor seed: `transform.VAL`'s seed differs from pvxs by
+    /// the one `display.precision` line the port serves and pvxs drops. With the
+    /// row loaded (surface `seed_event`) the case is EXPECTED DEVIATION; the
+    /// update stream is identical, so nothing else is at stake.
+    #[test]
+    fn cbug_g1_seed_precision_add_is_expected_deviation() {
+        let al_text = "schema = 1\n\
+            [[deviation]]\n\
+            id = \"CBUG-G1\"\n\
+            bucket = \"NOT-REPRODUCED\"\n\
+            record_types = [\"transform\"]\n\
+            surface = [\"seed_event\"]\n\
+            port_adds_leaves = [\"display.precision\"]\n\
+            why = \"port serves precision pvxs drops on the seed\"\n";
+        let mut al = Allowlist::parse(al_text).expect("valid allowlist");
+        let cr = CaseRef {
+            record_type: "transform".into(),
+            pv: "ORACLE:MON:TRANSFORM".into(),
+            drive: Drive::Passive,
+            db: String::new(),
+        };
+        let c = obs(
+            "value double = 0\ncontrol.limitHigh double = 0",
+            &["value double = 1"],
+        );
+        let r = obs(
+            "control.limitHigh double = 0\ndisplay.precision int32_t = 0\nvalue double = 0",
+            &["value double = 1"],
+        );
+        let case = adjudicate(&cr, &c, &r, &mut al);
+        assert_eq!(case.verdict, Verdict::ExpectedDeviation);
+        assert_eq!(case.allowlisted, vec!["CBUG-G1".to_string()]);
+        assert!(al.fired_rows().contains("CBUG-G1"));
+    }
+
     /// The rule the whole harness rests on, at this phase's most dangerous
     /// point. A refused drive posts no event on EITHER side, so the two traces
     /// come out identical — and scoring that AGREED would be a false clean on an
@@ -1037,7 +1176,7 @@ mod tests {
         ));
         assert_eq!(c.trace, r.trace, "the traces really are identical");
 
-        let case = adjudicate(&cref(Drive::Passive), &c, &r);
+        let case = adj(&cref(Drive::Passive), &c, &r);
         assert_eq!(
             case.verdict,
             Verdict::Errored,
@@ -1051,7 +1190,7 @@ mod tests {
     /// and the reason the drive's own error is what separates them.
     #[test]
     fn an_accepted_drive_that_posts_nothing_on_both_sides_is_agreement() {
-        let case = adjudicate(
+        let case = adj(
             &cref(Drive::Passive),
             &obs("value double = 0", &[]),
             &obs("value double = 0", &[]),
@@ -1061,7 +1200,7 @@ mod tests {
 
     #[test]
     fn a_side_that_never_produced_a_trace_is_an_error() {
-        let case = adjudicate(
+        let case = adj(
             &cref(Drive::Scanned),
             &obs("value double = 0", &["value double = 1"]),
             &MonObservation::default(),
@@ -1084,7 +1223,7 @@ mod tests {
                 "    value double = 1.5\n    timeStamp.secondsPastEpoch int64_t = 1784299999\n    display.units string = \"\"\n    control.limitLow double = 0",
             ],
         );
-        let case = adjudicate(&cref(Drive::Scanned), &c, &r);
+        let case = adj(&cref(Drive::Scanned), &c, &r);
         assert_eq!(case.verdict, Verdict::Defect);
         let surfaces: Vec<MonSurface> = case.differences.iter().map(|d| d.surface).collect();
         assert_eq!(
@@ -1099,7 +1238,7 @@ mod tests {
     /// reported as a framing difference.
     #[test]
     fn a_missing_update_is_a_defect_on_the_count_and_the_text() {
-        let case = adjudicate(
+        let case = adj(
             &cref(Drive::Passive),
             &obs("s", &["u1", "u2", "u3"]),
             &obs("s", &[]),

@@ -1670,10 +1670,10 @@ master) before filing.
 
 | id | upstream | one line | severity | bucket |
 |---|---|---|---|---|
-| CBUG-G1 | pvxs (QSRV2) | `getProperties` nests `display.precision` inside the `DBR_GR_DOUBLE` branch — a field that supplies `get_precision` but NULLs `get_graphic_double` (e.g. `bo.HIGH`) loses its precision over PVA | Low | REPRODUCED |
+| CBUG-G1 | pvxs (QSRV2) | `getProperties` nests `display.precision` inside the `DBR_GR_DOUBLE` branch — a field that supplies `get_precision` but NULLs `get_graphic_double` (e.g. `bo.HIGH`) loses its precision over PVA | Low | NOT-REPRODUCED |
 
 ### CBUG-G1: pvxs QSRV2 serves no `display.precision` for a field whose rset supplies `get_precision` but NULLs `get_graphic_double`
-Bucket: REPRODUCED · Severity: Low
+Bucket: NOT-REPRODUCED · Severity: Low
 C: `pvxs/ioc/iocsource.cpp:254` `getProperties()`. The one `options`
 mask carries every requested DBR slot; `dbChannelGet` clears each bit
 whose rset method is NULL, so `DBR_PRECISION` and `DBR_GR_DOUBLE` arrive
@@ -1710,17 +1710,24 @@ though the rset answers it and `caget -d DBR_PRECISION` (CA) serves it.
 are served, precision (2) is dropped. Measured on `softIocPVX`:
 `display.units "s"`, `control.limitHigh 100000`, and **no**
 `display.precision` for `bo.HIGH`.
-Port: **currently reproduced.** The record layer is faithful — `bo`'s
-`field_metadata_override` (`crates/epics-base-rs/src/server/records/bo.rs:151-160`)
-transcribes the rset answer (`precision: Some(2)`). But the wire-marking
-model (`crates/epics-pva-rs/src/nt/qsrv_marks.rs`, `property_leaves`)
-mirrors pvxs's gating and drops the `display.precision` leaf for a field
-with no graphic limits, so the port measures **AGREED** with `softIocPVX`
-(both omit it). The clean fix is available and cheap — the correct
-precision already lives in the record layer, so un-nesting precision from
-the graphic gate in the marking model would serve it and move this to
-NOT-REPRODUCED (plus an oracle allowlist entry). Deferred pending a
-deviate/reproduce decision; the port has not silently diverged.
+Port: **deviates — does not reproduce.** The record layer was always
+faithful (`bo`'s `field_metadata_override`,
+`crates/epics-base-rs/src/server/records/bo.rs:151-160`, transcribes the
+rset answer `precision: Some(2)`); the drop lived only in the wire-marking
+model. `crates/epics-pva-rs/src/nt/qsrv_marks.rs` `property_leaves` now
+gates `display.precision` on its own `DBR_PRECISION` slot, independent of
+`DBR_GR_DOUBLE`, so the served precision reaches the wire. Measured across
+the fat PVA dbd, this is the whole family — every field of the seven types
+whose rset supplies `get_precision` but NULLs `get_graphic_double`
+(`bo`/`mbbiDirect`/`mbboDirect` in base; `busy`/`asyn`/`transform`/`sseq`
+in the modules), 62 channels, of which only `bo.HIGH` carries a meaningful
+value (2 = `boHIGHprecision`); the other 61 serve `0`, the `recGblGetPrec`
+default — the same value CA serves, so this is PVA-vs-CA consistency, not a
+new number. The deviation is carried on the oracle allowlist as CBUG-G1
+(`crates/epics-oracle-rs/allowlist/expected-deviations.toml`,
+`port_adds_leaves = ["display.precision"]`, content-constrained so it
+justifies only the precision add and launders no other marking diff); the
+PVA read phase classifies all 62 as EXPECTED DEVIATION.
 Impact: over PVA (pvxs QSRV2 and the parity-faithful port alike), the
 `HIGH` field of a `bo` record — and any field of any type whose rset
 supplies `get_precision` but not `get_graphic_double` — carries no

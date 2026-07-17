@@ -88,12 +88,13 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::allowlist::{Allowlist, MatchContext};
 use crate::catool::ToolError;
 use crate::diff::Verdict;
 use crate::ioc::{Ioc, PvaPair, PvxTools, Side};
 use crate::ntshape::NtShape;
 use crate::pvatool::{PvaTools, Readings};
-use crate::report::{Counts, Denominator};
+use crate::report::{Counts, Denominator, StaleRow};
 use crate::surface::{Coverage, Surface};
 
 /// The named contracts a PVA channel can differ on.
@@ -189,6 +190,10 @@ pub struct PvaCase {
     pub c_side: PvaObservation,
     pub rust_side: PvaObservation,
     pub differences: Vec<PvaDifference>,
+    /// CBUG ids that justified the differences (empty unless EXPECTED
+    /// DEVIATION). Mirrors [`crate::runner::CaseResult::allowlisted`].
+    #[serde(default)]
+    pub allowlisted: Vec<String>,
     /// Why the channel could not be measured. Non-empty iff ERRORED.
     pub errors: Vec<ToolError>,
     /// The `.db` that reproduces it.
@@ -207,6 +212,16 @@ pub struct PvaReport {
     pub denominator: Denominator,
     pub channel_coverage: Coverage,
     pub counts: Counts,
+    /// Enabled allowlist rows whose scope this run observed but which never
+    /// fired: the deviation they describe stopped happening. A finding, exactly
+    /// as on the CA side.
+    #[serde(default)]
+    pub stale_allowlist_rows: Vec<StaleRow>,
+    /// Rows this run never put in a position to fire. Coverage, not a finding.
+    #[serde(default)]
+    pub unexercised_allowlist_rows: Vec<StaleRow>,
+    #[serde(default)]
+    pub fired_allowlist_rows: Vec<String>,
     pub cases: Vec<PvaCase>,
 }
 
@@ -285,6 +300,11 @@ impl PvaReport {
         s.push_str("CASES (one per channel; both contracts must run or it is an ERROR)\n");
         let _ = writeln!(s, "  ran                : {}", c.ran);
         let _ = writeln!(s, "  agreed             : {}", c.agreed);
+        let _ = writeln!(
+            s,
+            "  expected deviation : {}  (allowlisted against doc/upstream-c-bugs.md)",
+            c.expected_deviation
+        );
         let _ = writeln!(s, "  DEFECT             : {}", c.defect);
         let _ = writeln!(
             s,
@@ -316,6 +336,44 @@ impl PvaReport {
             let _ = writeln!(s, "  {:<26}{}{}", surface.as_str(), n, note);
         }
         s.push('\n');
+
+        if !self.fired_allowlist_rows.is_empty()
+            || !self.stale_allowlist_rows.is_empty()
+            || !self.unexercised_allowlist_rows.is_empty()
+        {
+            s.push_str("ALLOWLIST (doc/upstream-c-bugs.md, transcribed)\n");
+            if !self.fired_allowlist_rows.is_empty() {
+                let mut fired: Vec<&String> = self.fired_allowlist_rows.iter().collect();
+                fired.sort();
+                let _ = writeln!(
+                    s,
+                    "  fired (justified deviations seen): {}",
+                    fired
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            if !self.stale_allowlist_rows.is_empty() {
+                let _ = writeln!(
+                    s,
+                    "  STALE (scope observed, never fired — the deviation stopped): {}",
+                    self.stale_allowlist_rows.len()
+                );
+                for r in &self.stale_allowlist_rows {
+                    let _ = writeln!(s, "    {} — {}", r.id, r.why);
+                }
+            }
+            if !self.unexercised_allowlist_rows.is_empty() {
+                let _ = writeln!(
+                    s,
+                    "  unexercised (scope not driven — coverage, not a finding): {}",
+                    self.unexercised_allowlist_rows.len()
+                );
+            }
+            s.push('\n');
+        }
 
         let defects: Vec<_> = self.defects().collect();
         if !defects.is_empty() {
@@ -421,6 +479,7 @@ pub fn probe(
     workdir: &Path,
     surface: &Surface,
     record_types: &[String],
+    allowlist: &mut Allowlist,
 ) -> Vec<PvaCase> {
     let mut cases = Vec::new();
     for (i, rt) in record_types.iter().enumerate() {
@@ -430,7 +489,7 @@ pub fn probe(
             i + 1,
             record_types.len()
         );
-        cases.extend(probe_type(tools, workdir, surface, rt));
+        cases.extend(probe_type(tools, workdir, surface, rt, allowlist));
     }
     cases
 }
@@ -439,11 +498,24 @@ pub fn probe(
 ///
 /// Coverage is computed here rather than by each caller, so "an ERROR is not
 /// coverage" cannot come to mean two different things in two places.
-pub fn report(dbd_path: &str, surface: &Surface, cases: Vec<PvaCase>) -> PvaReport {
+pub fn report(
+    dbd_path: &str,
+    surface: &Surface,
+    cases: Vec<PvaCase>,
+    allowlist: &Allowlist,
+) -> PvaReport {
     let measured = cases
         .iter()
         .filter(|c| c.verdict != Verdict::Errored)
         .count();
+    let stale = |rows: Vec<&crate::allowlist::Deviation>| -> Vec<StaleRow> {
+        rows.into_iter()
+            .map(|d| StaleRow {
+                id: d.id.clone(),
+                why: d.why.clone(),
+            })
+            .collect()
+    };
     PvaReport {
         denominator: Denominator {
             dbd: dbd_path.to_string(),
@@ -462,6 +534,9 @@ pub fn report(dbd_path: &str, surface: &Surface, cases: Vec<PvaCase>) -> PvaRepo
             errored: cases.len().saturating_sub(measured),
         },
         counts: Counts::tally_verdicts(cases.iter().map(|c| c.verdict)),
+        stale_allowlist_rows: stale(allowlist.stale_rows()),
+        unexercised_allowlist_rows: stale(allowlist.unexercised_rows()),
+        fired_allowlist_rows: allowlist.fired_rows().iter().cloned().collect(),
         cases,
     }
 }
@@ -481,6 +556,7 @@ fn probe_type(
     workdir: &Path,
     surface: &Surface,
     record_type: &str,
+    allowlist: &mut Allowlist,
 ) -> Vec<PvaCase> {
     let rec = format!("ORACLE:{}", record_type.to_uppercase());
     let db_text = crate::record_stmt(record_type, &rec);
@@ -533,7 +609,7 @@ fn probe_type(
 
     refs.iter()
         .enumerate()
-        .map(|(i, cr)| adjudicate(cr, &obs_c[i], &obs_r[i]))
+        .map(|(i, cr)| adjudicate(cr, &obs_c[i], &obs_r[i], allowlist))
         .collect()
 }
 
@@ -580,12 +656,20 @@ fn merge(types: Readings, values: Readings) -> Vec<PvaObservation> {
 /// 2. No differences => AGREED.
 /// 3. Anything left => DEFECT.
 ///
-/// EXPECTED DEVIATION is unreachable here and that is honest, not an oversight:
-/// the CA allowlist transcribes `doc/upstream-c-bugs.md`, whose rows are about
-/// C's *CA* behaviour and justify nothing about QSRV2. Until a PVA deviation is
-/// found, understood, and written down, a difference is a DEFECT — the
-/// catalogue must earn its rows rather than start with them.
-pub fn adjudicate(ch: &ChannelRef, c: &PvaObservation, r: &PvaObservation) -> PvaCase {
+/// A difference is EXPECTED DEVIATION only when a NOT-REPRODUCED row in
+/// `doc/upstream-c-bugs.md` (transcribed into `expected-deviations.toml`)
+/// justifies it — the same contract the CA phases hold. The first such PVA row
+/// is CBUG-G1 (pvxs drops `display.precision` for a field that NULLs
+/// `get_graphic_double`; the port declines to reproduce it). A case is
+/// EXPECTED DEVIATION only if EVERY difference on it is justified — one
+/// unjustified diff makes the whole case a DEFECT, so a real bug cannot be
+/// laundered by a justified one sharing the channel.
+pub fn adjudicate(
+    ch: &ChannelRef,
+    c: &PvaObservation,
+    r: &PvaObservation,
+    allowlist: &mut Allowlist,
+) -> PvaCase {
     let mut errors: Vec<ToolError> = Vec::new();
     errors.extend(c.errors.iter().cloned());
     errors.extend(r.errors.iter().cloned());
@@ -599,6 +683,7 @@ pub fn adjudicate(ch: &ChannelRef, c: &PvaObservation, r: &PvaObservation) -> Pv
         c_side: c.clone(),
         rust_side: r.clone(),
         differences: Vec::new(),
+        allowlisted: Vec::new(),
         errors,
         db: ch.db.clone(),
     };
@@ -607,16 +692,57 @@ pub fn adjudicate(ch: &ChannelRef, c: &PvaObservation, r: &PvaObservation) -> Pv
         return base;
     }
 
+    let ctx = MatchContext {
+        record_type: &ch.record_type,
+        field: &ch.field,
+        class: None,
+    };
+    // Tell the allowlist what this case looked at BEFORE the agreed early-out,
+    // so a row whose deviation stopped happening reads as stale (a finding), not
+    // as unexercised (coverage). A read case compares every surface `compare`
+    // can emit.
+    let compared: Vec<&str> = surfaces_compared(ch);
+    allowlist.note_compared_pva(&ctx, &compared);
+
     let differences = compare(ch, c, r);
+    if differences.is_empty() {
+        return PvaCase {
+            verdict: Verdict::Agreed,
+            ..base
+        };
+    }
+
+    let hits: Vec<Option<String>> = differences
+        .iter()
+        .map(|d| allowlist.match_pva_diff(&ctx, d.surface.as_str(), &d.reference, &d.observed))
+        .collect();
+    let all_justified = hits.iter().all(Option::is_some);
+    let allowlisted: Vec<String> = hits.into_iter().flatten().collect();
+
     PvaCase {
-        verdict: if differences.is_empty() {
-            Verdict::Agreed
+        verdict: if all_justified {
+            Verdict::ExpectedDeviation
         } else {
             Verdict::Defect
         },
         differences,
+        allowlisted,
         ..base
     }
+}
+
+/// The surfaces [`compare`] emits for this channel — the same set, so
+/// "what did the run look at" cannot drift from "what did it diff".
+fn surfaces_compared(ch: &ChannelRef) -> Vec<&'static str> {
+    let mut s = vec![
+        PvaSurface::DeclaredType.as_str(),
+        PvaSurface::ValueMarking.as_str(),
+    ];
+    if ch.expected_shape.is_some() {
+        s.push(PvaSurface::GroundTruthShapeVsDbd.as_str());
+        s.push(PvaSurface::PortShapeVsDbd.as_str());
+    }
+    s
 }
 
 /// Compare the two sides on both contracts, and each side against the `.dbd`.
@@ -690,6 +816,7 @@ fn errored_cases(refs: &[ChannelRef], msg: &str) -> Vec<PvaCase> {
             c_side: PvaObservation::default(),
             rust_side: PvaObservation::default(),
             differences: Vec::new(),
+            allowlisted: Vec::new(),
             // A boot failure is not attributable to one side by construction,
             // so it is recorded against both -- never dropped, never guessed.
             errors: vec![
@@ -751,9 +878,16 @@ mod tests {
         }
     }
 
+    /// Adjudicate against an empty allowlist — the pre-allowlist behaviour, so
+    /// every difference is a DEFECT. Tests that exercise the allowlist build one
+    /// explicitly (see [`cbug_g1_precision_add_is_expected_deviation`]).
+    fn adj(ch: &ChannelRef, c: &PvaObservation, r: &PvaObservation) -> PvaCase {
+        adjudicate(ch, c, r, &mut Allowlist::empty())
+    }
+
     #[test]
     fn identical_readings_on_both_contracts_agree() {
-        let c = adjudicate(
+        let c = adj(
             &chan(),
             &good("value double = 1"),
             &good("value double = 1"),
@@ -767,7 +901,7 @@ mod tests {
     /// the value contract and leave the type contract clean.
     #[test]
     fn a_value_difference_lands_only_on_the_value_contract() {
-        let c = adjudicate(
+        let c = adj(
             &chan(),
             &good("value double = 1"),
             &good("value double = 2"),
@@ -786,7 +920,7 @@ mod tests {
         rust.declared_type = Some(
             "struct \"epics:nt/NTScalar:1.0\" {\n    double value\n    int32_t extra\n}".into(),
         );
-        let c = adjudicate(&chan(), &good("value double = 1"), &rust);
+        let c = adj(&chan(), &good("value double = 1"), &rust);
         assert_eq!(c.verdict, Verdict::Defect);
         let s: Vec<_> = c.differences.iter().map(|d| d.surface).collect();
         assert_eq!(
@@ -803,7 +937,7 @@ mod tests {
         // The port declares int32_t where the .dbd entails double.
         rust.declared_type =
             Some("struct \"epics:nt/NTScalar:1.0\" {\n    int32_t value\n}".into());
-        let c = adjudicate(&chan(), &good("value double = 1"), &rust);
+        let c = adj(&chan(), &good("value double = 1"), &rust);
         assert_eq!(c.verdict, Verdict::Defect);
         let s: Vec<_> = c.differences.iter().map(|d| d.surface).collect();
         assert!(s.contains(&PvaSurface::PortShapeVsDbd), "got {s:?}");
@@ -824,7 +958,7 @@ mod tests {
         let mut rust = good("value double = 1");
         rust.declared_type = c_side.declared_type.clone();
 
-        let case = adjudicate(&chan(), &c_side, &rust);
+        let case = adj(&chan(), &c_side, &rust);
         let s: Vec<_> = case.differences.iter().map(|d| d.surface).collect();
         // Both sides agree with each other, so no cross-side contract fires...
         assert!(!s.contains(&PvaSurface::DeclaredType));
@@ -838,10 +972,10 @@ mod tests {
     /// normalized.
     #[test]
     fn only_trailing_whitespace_is_normalized() {
-        let c = adjudicate(&chan(), &good("v = 1\n"), &good("v = 1"));
+        let c = adj(&chan(), &good("v = 1\n"), &good("v = 1"));
         assert_eq!(c.verdict, Verdict::Agreed);
         // ...but an interior difference still lands, even a whitespace one.
-        let c = adjudicate(&chan(), &good("v =  1"), &good("v = 1"));
+        let c = adj(&chan(), &good("v =  1"), &good("v = 1"));
         assert_eq!(c.verdict, Verdict::Defect);
     }
 
@@ -853,7 +987,7 @@ mod tests {
         let mut half = good("value double = 1");
         half.value = None;
         half.errors.push(terr(Side::Rust, "pvxget"));
-        let c = adjudicate(&chan(), &good("value double = 1"), &half);
+        let c = adj(&chan(), &good("value double = 1"), &half);
         assert_eq!(
             c.verdict,
             Verdict::Errored,
@@ -863,7 +997,7 @@ mod tests {
         let mut half = good("value double = 1");
         half.declared_type = None;
         half.errors.push(terr(Side::Rust, "pvxinfo"));
-        let c = adjudicate(&chan(), &good("value double = 1"), &half);
+        let c = adj(&chan(), &good("value double = 1"), &half);
         assert_eq!(c.verdict, Verdict::Errored);
     }
 
@@ -876,7 +1010,7 @@ mod tests {
             !empty.is_complete(),
             "no reading and no error is not a measurement"
         );
-        let c = adjudicate(&chan(), &good("v"), &empty);
+        let c = adj(&chan(), &good("v"), &empty);
         assert_eq!(c.verdict, Verdict::Errored);
     }
 
@@ -887,7 +1021,7 @@ mod tests {
             errors: vec![terr(side, "pvxget"), terr(side, "pvxinfo")],
             ..Default::default()
         };
-        let c = adjudicate(&chan(), &fail(Side::C), &fail(Side::Rust));
+        let c = adj(&chan(), &fail(Side::C), &fail(Side::Rust));
         assert_eq!(
             c.verdict,
             Verdict::Errored,
@@ -951,9 +1085,14 @@ mod tests {
         let supported = ["ai".to_string()].into_iter().collect();
         let surface = Surface::build(&dbd, &supported);
 
-        let ok = adjudicate(&chan(), &good("v"), &good("v"));
+        let ok = adj(&chan(), &good("v"), &good("v"));
         let bad = errored_cases(&[chan()], "boom");
-        let rep = report("test.dbd", &surface, vec![ok, bad[0].clone()]);
+        let rep = report(
+            "test.dbd",
+            &surface,
+            vec![ok, bad[0].clone()],
+            &Allowlist::empty(),
+        );
 
         assert_eq!(rep.denominator.observable_fields, 2, "from the .dbd");
         assert_eq!(rep.channel_coverage.enumerated, 2);
@@ -974,7 +1113,7 @@ mod tests {
         .unwrap();
         let surface = Surface::build(&dbd, &["ai".to_string()].into_iter().collect());
         let bad = errored_cases(&[chan()], "softIocPVX exited during boot");
-        let rep = report("softIoc.dbd", &surface, bad);
+        let rep = report("softIoc.dbd", &surface, bad, &Allowlist::empty());
         let h = rep.human();
         assert!(h.contains("THE DENOMINATOR"), "states the denominator");
         assert!(
@@ -990,5 +1129,73 @@ mod tests {
             h.contains("group PVs"),
             "names the surface it does NOT cover"
         );
+    }
+
+    /// The CBUG-G1 allowlist row: a bo channel whose only marking difference is
+    /// the port adding a `display.precision` line pvxs omits is EXPECTED
+    /// DEVIATION, not DEFECT — and it fires the row so it is not stale.
+    fn g1_allowlist() -> Allowlist {
+        Allowlist::parse(
+            "schema = 1\n\
+             [[deviation]]\n\
+             id = \"CBUG-G1\"\n\
+             bucket = \"NOT-REPRODUCED\"\n\
+             record_types = [\"bo\"]\n\
+             surface = [\"value_marking\"]\n\
+             port_adds_leaves = [\"display.precision\"]\n\
+             why = \"port serves precision pvxs drops\"\n",
+        )
+        .expect("valid allowlist")
+    }
+
+    fn bo_chan() -> ChannelRef {
+        ChannelRef {
+            record_type: "bo".into(),
+            field: "HIGH".into(),
+            pv: "ORACLE:BO.HIGH".into(),
+            expected_shape: None,
+            db: "record(bo, \"ORACLE:BO\") {}".into(),
+        }
+    }
+
+    #[test]
+    fn cbug_g1_precision_add_is_expected_deviation() {
+        // Same leaves, in different orders, plus one display.precision line the
+        // port adds — exactly CBUG-G1's shape.
+        let c = good("value = 0\ncontrol.limitHigh double = 100000");
+        let r = good("control.limitHigh double = 100000\ndisplay.precision int32_t = 2\nvalue = 0");
+        let mut al = g1_allowlist();
+        let case = adjudicate(&bo_chan(), &c, &r, &mut al);
+        assert_eq!(case.verdict, Verdict::ExpectedDeviation);
+        assert_eq!(case.allowlisted, vec!["CBUG-G1".to_string()]);
+        assert!(al.fired_rows().contains("CBUG-G1"));
+        assert!(al.stale_rows().is_empty(), "a fired row is not stale");
+    }
+
+    #[test]
+    fn cbug_g1_does_not_launder_a_second_marking_difference() {
+        // The port adds display.precision AND disagrees on control.limitHigh.
+        // The precision add is justified, the limit change is not, so the whole
+        // case must stay a DEFECT — a real diff cannot ride in on the row.
+        let c = good("value = 0\ncontrol.limitHigh double = 100000");
+        let r = good("value = 0\ncontrol.limitHigh double = 999\ndisplay.precision int32_t = 2");
+        let mut al = g1_allowlist();
+        let case = adjudicate(&bo_chan(), &c, &r, &mut al);
+        assert_eq!(case.verdict, Verdict::Defect);
+    }
+
+    #[test]
+    fn cbug_g1_scope_stops_at_the_named_types() {
+        // The identical precision-add shape on a type NOT in the row's scope is
+        // still a DEFECT — the row does not generalise to every record type.
+        let c = good("value = 0");
+        let r = good("value = 0\ndisplay.precision int32_t = 2");
+        let mut al = g1_allowlist();
+        let ai = ChannelRef {
+            record_type: "ai".into(),
+            ..bo_chan()
+        };
+        let case = adjudicate(&ai, &c, &r, &mut al);
+        assert_eq!(case.verdict, Verdict::Defect);
     }
 }

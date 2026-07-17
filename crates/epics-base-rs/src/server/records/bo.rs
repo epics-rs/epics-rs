@@ -132,14 +132,15 @@ impl Record for BoRecord {
     /// (`:301-308`) answers `boHIGHprecision`; every other field falls to
     /// `recGblGetPrec`.
     ///
-    /// Only the units reaches the wire. pvxs nests the `display.precision`
-    /// assignment inside the `DBR_GR_DOUBLE` branch (`iocsource.cpp:288-291`,
-    /// mirrored by `nt::qsrv_marks::property_leaves`), and bo's rset serves no
-    /// graphic limits for `HIGH`, so the precision leaf is never assigned —
-    /// measured against `softIocPVX`, which prints `display.units "s"` and no
-    /// `display.precision` at all for `bo.HIGH`. The precision is transcribed
-    /// anyway because this function's contract is the rset's answer, not the
-    /// subset of it the current marking model happens to expose.
+    /// Over PVA, pvxs nests the `display.precision` assignment inside the
+    /// `DBR_GR_DOUBLE` branch (`iocsource.cpp:288-292`), and bo's rset serves
+    /// no graphic limits for `HIGH`, so pvxs never assigns the precision leaf —
+    /// `softIocPVX` prints `display.units "s"` and no `display.precision` at
+    /// all for `bo.HIGH`. That is CBUG-G1, an upstream metadata-loss bug; the
+    /// port declines to reproduce it. `nt::qsrv_marks::property_leaves` gates
+    /// `display.precision` on its own `DBR_PRECISION` slot, so this transcribed
+    /// value (2) reaches the wire — a deliberate deviation from `softIocPVX`,
+    /// carried on the oracle allowlist.
     ///
     /// `get_control_double` (`:310-318`) is the same one-field shape and DOES
     /// reach the wire: `HIGH` alone takes `0.0 .. boHIGHlimit`, and every other

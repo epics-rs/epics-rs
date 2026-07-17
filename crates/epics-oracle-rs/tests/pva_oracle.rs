@@ -69,13 +69,18 @@ fn surface_of(record_type: &str) -> Surface {
 /// Sweep one record type through the real phase and report on it.
 fn sweep(record_type: &str) -> (Surface, PvaReport) {
     let surface = surface_of(record_type);
+    let mut allowlist = epics_oracle_rs::allowlist::Allowlist::load(
+        &epics_oracle_rs::allowlist::Allowlist::default_path(),
+    )
+    .expect("load shipped allowlist");
     let cases = pvaread::probe(
         &tools(),
         &workdir(None).expect("workdir"),
         &surface,
         &[record_type.to_string()],
+        &mut allowlist,
     );
-    let report = pvaread::report(CTools::DEFAULT_DBD, &surface, cases);
+    let report = pvaread::report(CTools::DEFAULT_DBD, &surface, cases, &allowlist);
     (surface, report)
 }
 
@@ -371,7 +376,12 @@ fn an_unreachable_pv_scores_error_never_agreement() {
         value: None,
         errors: vec![v.unwrap_err()],
     };
-    let case = pvaread::adjudicate(&ch, &obs(cv), &obs(rv));
+    let case = pvaread::adjudicate(
+        &ch,
+        &obs(cv),
+        &obs(rv),
+        &mut epics_oracle_rs::allowlist::Allowlist::empty(),
+    );
     assert_eq!(
         case.verdict,
         Verdict::Errored,

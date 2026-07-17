@@ -150,12 +150,19 @@ pub fn property_leaves(props: PropertySupport) -> Vec<&'static str> {
     if props.graphic_double {
         leaves.push("display.limitLow");
         leaves.push("display.limitHigh");
-        // pvxs nests the precision assignment INSIDE the `DBR_GR_DOUBLE`
-        // branch (`iocsource.cpp:288-291`), so a record type that supplies
-        // precision but no graphic limits assigns neither.
-        if props.precision {
-            leaves.push("display.precision");
-        }
+    }
+    // `display.precision` is the `DBR_PRECISION` slot (`get_precision`), which
+    // is independent of `DBR_GR_DOUBLE` (`get_graphic_double`): a record type
+    // can supply one without the other. pvxs nests the precision assignment
+    // INSIDE the `DBR_GR_DOUBLE` branch (`iocsource.cpp:288-292`), dropping
+    // precision for any field that supplies `get_precision` but NULLs
+    // `get_graphic_double` — e.g. `bo.HIGH` (`boHIGHprecision = 2`). That is
+    // CBUG-G1; the port declines to reproduce it. Gate precision on its own
+    // slot so the served value (already filled by `fill_nt_scalar`) reaches
+    // the wire. Deliberate deviation from `softIocPVX`; see the oracle
+    // allowlist.
+    if props.precision {
+        leaves.push("display.precision");
     }
     if props.control_double {
         leaves.push("control.limitLow");
@@ -273,18 +280,21 @@ mod tests {
         assert_eq!(property_leaves(props), vec!["display.description"]);
     }
 
-    /// A `graphic_double`-less record must not assign precision even when the
-    /// rset supplies it: pvxs nests the precision assignment inside the
-    /// `DBR_GR_DOUBLE` branch.
+    /// CBUG-G1 deviation: a field that supplies `get_precision` but NULLs
+    /// `get_graphic_double` (e.g. `bo.HIGH`) DOES assign `display.precision`
+    /// and NOT the graphic limits. pvxs nests precision inside the
+    /// `DBR_GR_DOUBLE` branch and drops it here; the port serves it on its
+    /// own `DBR_PRECISION` slot. Deliberate deviation from `softIocPVX`.
     #[test]
-    fn precision_without_graphic_limits_assigns_neither() {
+    fn precision_without_graphic_limits_assigns_precision_only() {
         let props = PropertySupport {
             precision: true,
             graphic_double: false,
             ..PropertySupport::NONE
         };
         let leaves = property_leaves(props);
-        assert!(!leaves.contains(&"display.precision"));
+        assert!(leaves.contains(&"display.precision"));
         assert!(!leaves.contains(&"display.limitLow"));
+        assert!(!leaves.contains(&"display.limitHigh"));
     }
 }

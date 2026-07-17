@@ -28,10 +28,13 @@
 use epics_base_rs::server::record::{Record, RecordInstance};
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::server::records::ao::AoRecord;
+use epics_base_rs::server::records::bo::BoRecord;
+use epics_base_rs::server::records::calcout::CalcoutRecord;
 use epics_base_rs::server::records::compress::CompressRecord;
 use epics_base_rs::server::records::histogram::HistogramRecord;
 use epics_base_rs::server::records::int64in::Int64inRecord;
 use epics_base_rs::server::records::longin::LonginRecord;
+use epics_base_rs::server::records::seq::SeqRecord;
 use epics_base_rs::server::records::waveform::{ArrayKind, WaveformRecord};
 use epics_base_rs::server::snapshot::Snapshot;
 use epics_base_rs::types::EpicsValue;
@@ -262,5 +265,88 @@ fn int64in_sval_takes_the_records_hopr_lopr_not_the_int64_range() {
         (-9000.0, 9000.0),
         "int64inRecord.c:225 lists SVAL: C serves HOPR/LOPR, not the DBF_INT64 \
          range of +-9223372036854775807"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The LITERAL control arms.
+//
+// Three types answer their listed field with a hard-coded number instead of
+// with the record's HOPR/LOPR, so the field takes neither the VAL cache nor the
+// `default:` arm. Each literal is its own type's, exported as its own global,
+// and each is a DIFFERENT number from what the same field's OTHER slots serve:
+//
+// ```text
+// seqRecord.c:342-353      DLYn (x16) -> 0 .. seqDLYlimit      (= 100000, :81)
+// calcoutRecord.c:506-530  ODLY       -> 0 .. calcoutODLYlimit (= 100000, :91)
+// boRecord.c:310-318       HIGH       -> 0 .. boHIGHlimit      (= 100000, :87)
+// ```
+//
+// Measured on `softIocPVX`: before these arms existed the oracle reported
+// SEQ.DLY0-DLYF control 0/100000 vs the port's +-1e300, CALCOUT.ODLY the same,
+// and BO.HIGH 0/100000 vs the port's 0/0.
+// ---------------------------------------------------------------------------
+
+/// `seqRecord.c:342-353` answers all 16 DLYn with `0 .. seqDLYlimit`. The same
+/// field's GRAPHIC arm (`:321-338`) answers `0 .. 10` — four orders of
+/// magnitude apart, so a test that passes proves the control literal was read
+/// from the control rset and not off its neighbour.
+#[test]
+fn seqs_dly_control_literal_is_the_100000_one_not_the_graphic_10() {
+    let inst = with_fields("T:SEQ", SeqRecord::default(), &[]);
+
+    for suffix in "0123456789ABCDEF".chars() {
+        let field = format!("DLY{suffix}");
+        assert_eq!(
+            limits(&inst, &field),
+            (0.0, 100000.0),
+            "seqRecord.c:342-353 serves {field} 0..seqDLYlimit"
+        );
+        assert_eq!(
+            snap(&inst, &field).display_limits(),
+            Some((0.0, 10.0)),
+            "{field}'s graphic arm keeps its own literal of 0..10"
+        );
+    }
+}
+
+/// `calcoutRecord.c:506-530` gives ODLY a `case` of its own beside the eight
+/// VAL-class fields: those take HOPR/LOPR, ODLY takes `0 .. calcoutODLYlimit`.
+/// Setting HOPR/LOPR proves ODLY does not follow them.
+#[test]
+fn calcouts_odly_control_literal_beats_the_records_hopr_lopr() {
+    let inst = with_fields(
+        "T:CALCOUT",
+        CalcoutRecord::default(),
+        &[
+            ("HOPR", EpicsValue::Double(50.0)),
+            ("LOPR", EpicsValue::Double(-50.0)),
+        ],
+    );
+
+    assert_eq!(
+        limits(&inst, "ODLY"),
+        (0.0, 100000.0),
+        "calcoutRecord.c:520-522 serves ODLY 0..calcoutODLYlimit, not HOPR/LOPR"
+    );
+    assert_eq!(
+        limits(&inst, "VAL"),
+        (-50.0, 50.0),
+        "the eight VAL-class fields one case up DO take HOPR/LOPR"
+    );
+}
+
+/// `boRecord.c:310-318` lists HIGH alone -> `0 .. boHIGHlimit`. HIGH is bo's
+/// only DBF_DOUBLE field, so the literal is the whole of bo's control slot;
+/// what its unlisted siblings take is the routing predicate's business, pinned
+/// in `rset_control_explicit_list_is_per_type.rs`.
+#[test]
+fn bos_high_takes_its_control_literal() {
+    let inst = with_fields("T:BO", BoRecord::default(), &[]);
+
+    assert_eq!(
+        limits(&inst, "HIGH"),
+        (0.0, 100000.0),
+        "boRecord.c:312-313 serves HIGH 0..boHIGHlimit"
     );
 }

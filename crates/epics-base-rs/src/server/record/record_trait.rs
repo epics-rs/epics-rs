@@ -713,9 +713,28 @@ pub fn default_property_support(rtype: &str) -> crate::server::snapshot::Propert
         },
 
         // synApps, transcribed the same way.
-        // sCalcoutRecord.c / aCalcoutRecord.c / sseqRecord.c /
-        // motorRecord.cc: full numeric set, no enum strings.
-        "scalcout" | "acalcout" | "motor" | "epid" | "aSub" | "scaler" => P::NUMERIC,
+        // sCalcoutRecord.c / aCalcoutRecord.c / epidRecord.c /
+        // motorRecord.cc:259-279 (the rset table: get_units, get_precision,
+        // get_graphic_double, get_control_double and get_alarm_double all
+        // supplied, get_enum_strs NULL) / aSubRecord.c: full numeric set, no
+        // enum strings.
+        "scalcout" | "acalcout" | "motor" | "epid" | "aSub" => P::NUMERIC,
+        // scalerRecord.c:147-158 NULLs every property slot but one:
+        // `#define get_units NULL` (:151), `get_enum_strs` (:154),
+        // `get_graphic_double` (:156), `get_control_double` (:157) and
+        // `get_alarm_double` (:158). Only `get_precision` (:152) survives.
+        //
+        // Grouping scaler with the full-numeric synApps types claimed TEN
+        // leaves QSRV2 never serves: `display.units`, the two `display.limit*`,
+        // the two `control.limit*`, the four `valueAlarm.*Limit` — and
+        // `display.precision`, which pvxs assigns only inside its
+        // `DBR_GR_DOUBLE` branch (`iocsource.cpp:288-291`). That nesting is
+        // also why `precision` stays true here and yet marks nothing: it
+        // records what the rset supplies, exactly as `transform`/`sseq` do.
+        "scaler" => P {
+            precision: true,
+            ..P::NONE
+        },
         // tableRecord.cc (optics): `#define get_alarm_double NULL`.
         "table" => P {
             alarm_double: false,

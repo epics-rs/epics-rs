@@ -11,6 +11,9 @@ publish = false
 [dependencies]
 epics-base-rs = { workspace = true }
 epics-ca-rs = { workspace = true }
+# The Rust side of the PVA differential pair (`oracle-ioc --pva`), measured
+# against pvxs QSRV2's softIocPVX.
+epics-pva-rs = { workspace = true }
 # The asyn record + a null port so the oracle's asyn reproducer has a named
 # port to attach to (C's asynRecord refuses to init against an empty PORT).
 asyn-rs = { workspace = true }

@@ -1126,9 +1126,22 @@ fn coerce_scalar(sv: &ScalarValue, target: ScalarType) -> Option<ScalarValue> {
         UShort(x) => Some(*x as i64),
         UInt(x) => Some(*x as i64),
         ULong(x) => Some(*x as i64),
-        Float(x) => Some(*x as i64),
-        Double(x) => Some(*x as i64),
+        // C++ cast semantics for the double → integer step, as pvxs's
+        // `Value::copyIn` performs it (`data.cpp:551-578`): out of range
+        // overflows rather than saturating. See `pvdata::cpp_cast`.
+        Float(x) => Some(crate::pvdata::cpp_cast::double_to_i64(*x as f64)),
+        Double(x) => Some(crate::pvdata::cpp_cast::double_to_i64(*x)),
         String(s) => s.as_str_lossy().parse::<i64>().ok(),
+    };
+    // pvxs dispatches on the STORE's signedness (`data.cpp:551` vs `:565`):
+    // an unsigned leaf casts the double to `uint64_t`, not to `int64_t`. The
+    // two agree once truncated to a narrower width — the low bits are the
+    // same — but differ at full width, where `uint64_t(2^64)` is 0 while
+    // `int64_t(2^64)` is `INT64_MIN` (2^63 reinterpreted).
+    let as_u64: Option<u64> = match sv {
+        Float(x) => Some(crate::pvdata::cpp_cast::double_to_u64(*x as f64)),
+        Double(x) => Some(crate::pvdata::cpp_cast::double_to_u64(*x)),
+        _ => as_i64.map(|i| i as u64),
     };
     let as_f64: Option<f64> = match sv {
         Float(x) => Some(*x as f64),
@@ -1156,10 +1169,10 @@ fn coerce_scalar(sv: &ScalarValue, target: ScalarType) -> Option<ScalarValue> {
         ScalarType::Short => Short(as_i64? as i16),
         ScalarType::Int => Int(as_i64? as i32),
         ScalarType::Long => Long(as_i64?),
-        ScalarType::UByte => UByte(as_i64? as u8),
-        ScalarType::UShort => UShort(as_i64? as u16),
-        ScalarType::UInt => UInt(as_i64? as u32),
-        ScalarType::ULong => ULong(as_i64? as u64),
+        ScalarType::UByte => UByte(as_u64? as u8),
+        ScalarType::UShort => UShort(as_u64? as u16),
+        ScalarType::UInt => UInt(as_u64? as u32),
+        ScalarType::ULong => ULong(as_u64?),
         ScalarType::Float => Float(as_f64? as f32),
         ScalarType::Double => Double(as_f64?),
         ScalarType::String => String(as_string.into()),

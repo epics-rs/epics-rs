@@ -68,71 +68,17 @@ impl FieldMapping {
 // ---------------------------------------------------------------------------
 
 /// The leaves a DBE_PROPERTY event marks on a Scalar mapping — exactly the
-/// fields pvxs `getProperties` (`pvxs/ioc/iocsource.cpp:252-310`) assigns,
-/// each under the `DBR_*` option bit that SURVIVED `dbChannelGet`:
+/// fields pvxs `getProperties` (`pvxs/ioc/iocsource.cpp:252-310`) assigns.
 ///
-/// * `display.units` (`DBR_UNITS`),
-/// * `value.choices` (`DBR_ENUM_STRS`, enum mappings only),
-/// * `display.limitLow` / `display.limitHigh` (`DBR_GR_DOUBLE`) and
-///   `display.precision` (`DBR_PRECISION`),
-/// * `control.limitLow` / `control.limitHigh` (`DBR_CTRL_DOUBLE`),
-/// * `valueAlarm.{low,high}{Alarm,Warning}Limit` (`DBR_AL_DOUBLE`),
-/// * `display.description` (unconditional — `iocsource.cpp:307-310`).
-///
-/// `getProperties` asks for all six and `dbChannelGet` clears the bit of
-/// every property the record's rset does not supply (`dbAccess.c:336-430`),
-/// so the surviving set is exactly [`PropertySupport`] — the mask the DB
-/// layer stamps onto every [`Snapshot`]. That mask is this function's only
-/// argument: a leaf the record type does not supply is never marked, so the
-/// fabricated default the port builds into the value (a `longout`'s
-/// `display.precision = 0`, a `waveform`'s `valueAlarm` bands at zero)
-/// reaches no client — pvxs leaves the same leaves unassigned in its
-/// `cloneEmpty()`.
-///
-/// `getProperties` assigns **none** of `display.form`, `control.minStep`,
-/// `valueAlarm.active`, the four `valueAlarm.*Severity` fields, or
-/// `valueAlarm.hysteresis`, even though the port's NT carries them (as
-/// hardcoded zeros / `false`). Naming the parent structures `display` /
-/// `control` / `valueAlarm` here would mark those extra leaves as freshly
-/// changed on every property event, so pvxs's leaf list is spelled out.
-///
-/// A path that the concrete descriptor does not have (e.g.
-/// `display.precision` on a string NT, or `value.choices` on a plain
-/// scalar) simply matches no bit in `marked_changed_bitset` — the same
-/// no-op as `getProperties`'s `if(auto x = node["…"])` guard.
+/// Delegates to [`epics_pva_rs::nt::property_leaves`], the single owner of
+/// that rule. The NATIVE PVA server needs the same answer for the same
+/// reason — it serves the same records over the same protocol — and two
+/// copies of "which leaves does a QSRV read assign" is the shape that let
+/// the native source's NT drift from `nt.cpp` on four counts at once. The
+/// input is unchanged: the [`PropertySupport`] mask the DB layer already
+/// narrowed to the addressed field.
 fn property_leaves(props: PropertySupport) -> Vec<&'static str> {
-    let mut leaves = Vec::new();
-    if props.units {
-        leaves.push("display.units");
-    }
-    if props.enum_strs {
-        leaves.push("value.choices");
-    }
-    if props.graphic_double {
-        leaves.push("display.limitLow");
-        leaves.push("display.limitHigh");
-        // pvxs nests the precision assignment INSIDE the `DBR_GR_DOUBLE`
-        // branch (`iocsource.cpp:288-291`), so a record type that supplies
-        // precision but no graphic limits assigns neither.
-        if props.precision {
-            leaves.push("display.precision");
-        }
-    }
-    if props.control_double {
-        leaves.push("control.limitLow");
-        leaves.push("control.limitHigh");
-    }
-    if props.alarm_double {
-        leaves.push("valueAlarm.lowAlarmLimit");
-        leaves.push("valueAlarm.lowWarningLimit");
-        leaves.push("valueAlarm.highWarningLimit");
-        leaves.push("valueAlarm.highAlarmLimit");
-    }
-    // Unconditional — pvxs assigns DESC with no option gate at all
-    // ("cheating at the moment. DESC is not marked DBE_PROPERTY",
-    // `iocsource.cpp:307-310`).
-    leaves.push("display.description");
-    leaves
+    epics_pva_rs::nt::property_leaves(props)
 }
 
 /// The wire leaves one mapping contributes for one DBE change mask, as
@@ -617,16 +563,10 @@ pub(crate) fn long_string_put_image(s: &PvString) -> EpicsValue {
 /// `display.form.choices` — the fixed seven-entry menu pvxs publishes for
 /// every numeric NTScalar / NTScalarArray (`Q:form` info-tag menu).
 ///
-/// Mirrors pvxs `ioc/iocsource.cpp:43-51` (`IOCSource::initialize`).
-const FORM_CHOICES: [&str; 7] = [
-    "Default",
-    "String",
-    "Binary",
-    "Decimal",
-    "Hex",
-    "Exponential",
-    "Engineering",
-];
+/// Re-export of [`epics_pva_rs::nt::FORM_CHOICES`]: the native PVA server
+/// fills the same menu from the same `IOCSource::initialize` rule, so the
+/// list has one owner.
+use epics_pva_rs::nt::FORM_CHOICES;
 
 /// Derive the PVA scalar type of an `EpicsValue`, taking the element type
 /// for array variants. This is the Rust equivalent of pvxs
@@ -2497,15 +2437,20 @@ mod tests {
         );
         assert!(lo.contains(&"display.limitLow".to_string()));
 
-        // pvxs nests precision INSIDE the graphic-limits branch.
+        // pvxs nests precision INSIDE the graphic-limits branch, dropping it
+        // for a field that supplies get_precision but NULLs get_graphic_double
+        // (CBUG-G1). The port declines to reproduce that: precision gates on its
+        // own DBR_PRECISION slot, so a graphic_double-less numeric marks
+        // display.precision (its independent slot) but not display.limitLow.
         let no_gr = marks(PropertySupport {
             graphic_double: false,
             ..PropertySupport::NUMERIC
         });
         assert!(
-            !no_gr.contains(&"display.precision".to_string())
+            no_gr.contains(&"display.precision".to_string())
                 && !no_gr.contains(&"display.limitLow".to_string()),
-            "precision is assigned only inside the DBR_GR_DOUBLE branch: {no_gr:?}"
+            "precision is its own DBR_PRECISION slot, independent of the \
+             DBR_GR_DOUBLE limits (CBUG-G1 deviation): {no_gr:?}"
         );
 
         let no_ctrl = marks(PropertySupport {

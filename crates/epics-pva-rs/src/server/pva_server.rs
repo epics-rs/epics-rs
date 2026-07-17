@@ -195,7 +195,15 @@ impl PvaServer {
     /// `report_tx` the instant the native server binds. Backs the iocsh
     /// `pvxsr` command on the default-source shell path
     /// ([`Self::run_with_shell`]).
-    async fn run_reporting(
+    ///
+    /// Paired with `from_parts(db, 0, ..)` this is **bind-and-read-back**: the
+    /// handle's `report()` names the TCP/UDP ports the kernel actually
+    /// assigned, so a caller that must not guess a port (or probe one and
+    /// re-bind it later — a PVA search-port collision is silent, see
+    /// [`crate::server_native::udp::bind_udp`]) can learn them the only way
+    /// that is race-free. `epics-oracle-rs`'s differential harness boots its
+    /// Rust PVA side through here.
+    pub async fn run_reporting(
         &self,
         report_tx: Option<watch::Sender<Option<ServerReportHandle>>>,
     ) -> CaResult<()> {
@@ -232,7 +240,12 @@ impl PvaServer {
         let mut config = PvaServerConfig::default().with_env();
         if let Some(port) = self.port {
             config.tcp_port = port;
-            config.udp_port = port + 1;
+            // `0` is the ephemeral sentinel (`PvaServerBuilder::port` documents
+            // `Some(0)` as "an ephemeral bind"), not a base to offset from:
+            // `0 + 1` asked for the *privileged* UDP port 1, so the one
+            // configuration that means "kernel, pick both" was the one that
+            // could not work. Ephemeral TCP implies ephemeral UDP.
+            config.udp_port = if port == 0 { 0 } else { port + 1 };
         }
 
         let scanner = ScanScheduler::new(self.db.clone());
@@ -385,5 +398,55 @@ impl PvaServer {
                 Err(CaError::InvalidValue("shell thread dropped".to_string()))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `from_parts(db, 0, ..)` must bind BOTH ports ephemerally and report
+    /// what it got.
+    ///
+    /// `PvaServerBuilder::port` documents `Some(0)` as "an ephemeral bind",
+    /// but the `udp_port = port + 1` derivation turned it into a request for
+    /// privileged UDP port **1** — so the single configuration meaning
+    /// "kernel, pick both" was the one that could not work.
+    ///
+    /// A caller needs this path precisely when it must not guess a port, and
+    /// for PVA that is not a preference: the search socket sets SO_REUSEPORT,
+    /// so two servers on one port bind silently and answer searches at random
+    /// (no error, unlike CA's `cas WARNING`). Reading the port back off the
+    /// bind is the only race-free way to learn it.
+    #[tokio::test]
+    async fn ephemeral_port_zero_reports_both_bound_ports() {
+        let db = Arc::new(PvDatabase::new());
+        let server = PvaServer::from_parts(db, 0, None, None, None);
+
+        let (tx, mut rx) = watch::channel(None);
+        let run = tokio::spawn(async move { server.run_reporting(Some(tx)).await });
+
+        let handle = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if let Some(h) = rx.borrow_and_update().clone() {
+                    return h;
+                }
+                if rx.changed().await.is_err() {
+                    panic!("server exited without reporting bound ports");
+                }
+            }
+        })
+        .await
+        .expect("server must report its bound ports");
+
+        let report = handle.report();
+        assert_ne!(report.tcp_port, 0, "TCP port 0 must resolve to a real port");
+        assert_ne!(report.udp_port, 0, "UDP port 0 must resolve to a real port");
+        assert_ne!(
+            report.udp_port, 1,
+            "udp_port = tcp_port + 1 must not apply to the ephemeral sentinel: \
+             port 1 is privileged and is not what `Some(0)` asks for",
+        );
+        run.abort();
     }
 }

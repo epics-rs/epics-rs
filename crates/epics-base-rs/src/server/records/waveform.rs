@@ -1,6 +1,7 @@
 use crate::error::{CaError, CaResult};
 use crate::server::record::{
-    Ftype, MENU_FTYPE, MENU_YES_NO, ProcessAction, ProcessOutcome, Record, parse_link_v2,
+    FieldMetadataOverride, Ftype, MENU_FTYPE, MENU_YES_NO, ProcessAction, ProcessOutcome, Record,
+    parse_link_v2,
 };
 use crate::server::records::count_put;
 use crate::types::{DbFieldType, EpicsValue, PvString};
@@ -695,6 +696,67 @@ impl Record for WaveformRecord {
         self.kind.as_record_type()
     }
 
+    /// The index fields four kinds answer from their own array bounds rather
+    /// than from the field's type range — so they cannot take the routed
+    /// `default:` arm, and cannot keep the VAL cache either.
+    ///
+    /// `subArrayRecord.c:262-291` `get_control_double` lists four fields beyond
+    /// `VAL`, each bounded by the record's maximum array length `MALM`: `INDX`
+    /// (a 0-based offset, so `MALM - 1` up), `NELM` (a length, so `MALM` up and
+    /// **1** down — C's control lower differs from its graphic lower of 0,
+    /// `:246` vs `:277`), `NORD` (`MALM` up, 0 down) and `BUSY` (a flag: 1/0).
+    ///
+    /// The other three kinds list fewer fields, and bound them by `NELM` (the
+    /// record's own length) rather than by `MALM`:
+    ///
+    /// * `waveformRecord.c:268-289` — `BUSY` (a flag: 1/0) and `NORD` (`NELM`
+    ///   up, 0 down); it does NOT list `NELM`, which is why `NELM` takes the
+    ///   routed type range for a waveform and `MALM` for a subArray.
+    /// * `aaiRecord.c:293-310` / `aaoRecord.c:296-313` — only `NORD`.
+    ///
+    /// `get_graphic_double` is a DIFFERENT list per kind, so the two slots are
+    /// answered separately here:
+    ///
+    /// * `subArray` (`:231-260`) — the same four, but `NELM`'s lower is **0**.
+    /// * `waveform` (`:251-266`) — `BUSY` and `NORD`, same values as control.
+    /// * `aai` (`:276-291`) / `aao` (`:279-294`) — only `NORD`.
+    ///
+    /// `VAL` is absent from both lists here: it answers HOPR/LOPR, which is
+    /// what the VAL metadata cache already holds.
+    fn field_metadata_override(&self, field: &str) -> Option<FieldMetadataOverride> {
+        let malm = self.malm as f64;
+        let nelm = self.nelm as f64;
+        let f = field.to_ascii_uppercase();
+
+        let ctrl_limits = match (self.kind, f.as_str()) {
+            (ArrayKind::SubArray, "INDX") => Some((malm - 1.0, 0.0)),
+            (ArrayKind::SubArray, "NELM") => Some((malm, 1.0)),
+            (ArrayKind::SubArray, "NORD") => Some((malm, 0.0)),
+            (ArrayKind::SubArray, "BUSY") => Some((1.0, 0.0)),
+            (ArrayKind::Waveform, "BUSY") => Some((1.0, 0.0)),
+            (ArrayKind::Waveform | ArrayKind::Aai | ArrayKind::Aao, "NORD") => Some((nelm, 0.0)),
+            _ => None,
+        };
+        let disp_limits = match (self.kind, f.as_str()) {
+            (ArrayKind::SubArray, "INDX") => Some((malm - 1.0, 0.0)),
+            // The graphic lower is 0 where the control lower is 1.
+            (ArrayKind::SubArray, "NELM") => Some((malm, 0.0)),
+            (ArrayKind::SubArray, "NORD") => Some((malm, 0.0)),
+            (ArrayKind::SubArray, "BUSY") => Some((1.0, 0.0)),
+            (ArrayKind::Waveform, "BUSY") => Some((1.0, 0.0)),
+            (ArrayKind::Waveform | ArrayKind::Aai | ArrayKind::Aao, "NORD") => Some((nelm, 0.0)),
+            _ => None,
+        };
+        if ctrl_limits.is_none() && disp_limits.is_none() {
+            return None;
+        }
+        Some(FieldMetadataOverride {
+            ctrl_limits,
+            disp_limits,
+            ..Default::default()
+        })
+    }
+
     /// Expose the concrete record so device support can drive the
     /// device-only control fields that have no generic put path — `BUSY`
     /// is `special(SPC_NOMOD)`/read-only and `RARM` is reset by the
@@ -851,13 +913,17 @@ impl Record for WaveformRecord {
         Ok(())
     }
 
-    /// `waveform` VAL: `get_field("VAL")` serves NORD valid elements, but the
-    /// channel's native count is NELM (the buffer capacity) so a client sizes
-    /// its buffer right — C `cvt_dbaddr` `no_elements = nelm` vs
-    /// `get_array_info` `*no_elements = nord`. Only the waveform kind: `aai`/
-    /// `aao`/`subArray` serve their VAL at its own count.
+    /// `VAL`: `get_field("VAL")` serves NORD valid elements, but the channel's
+    /// native count is the buffer capacity so a client sizes its buffer right —
+    /// C `cvt_dbaddr` `no_elements` vs `get_array_info` `*no_elements = nord`.
+    /// The capacity is the same [`Self::val_capacity`] every array kind
+    /// advertises: waveform/aai/aao report `nelm` (`waveformRecord.c:183`,
+    /// `aaiRecord.c:215`, `aaoRecord.c:219`), subArray reports `malm`
+    /// (`subArrayRecord.c:168`). Reporting it only for the waveform kind left
+    /// aai/aao/subArray advertising a 0-length channel, so every array put/get
+    /// was refused "Invalid element count requested".
     fn field_native_count(&self, field: &str) -> Option<u32> {
-        (field == "VAL" && self.kind == ArrayKind::Waveform).then_some(self.nelm.max(0) as u32)
+        (field == "VAL").then(|| self.val_capacity() as u32)
     }
 
     /// `aao` is an output record; the rest of the array family read
@@ -1511,6 +1577,41 @@ mod array_kind_tests {
         let r = WaveformRecord::with_kind(ArrayKind::SubArray);
         assert_eq!(r.record_type(), "subArray");
         assert!(!r.can_device_write(), "subArray is input");
+    }
+
+    /// C's `cvt_dbaddr` fixes every array record's VAL channel `no_elements` at
+    /// the buffer capacity — `nelm` for waveform/aai/aao (`waveformRecord.c:183`,
+    /// `aaiRecord.c:215`, `aaoRecord.c:219`), `malm` for subArray
+    /// (`subArrayRecord.c:168`). A kind that reported `None` here advertised a
+    /// 0-length channel, so every array put/get was refused "Invalid element
+    /// count requested". Boundary: each kind's capacity source, plus a non-VAL
+    /// field that must stay `None`.
+    #[test]
+    fn every_array_kind_advertises_val_capacity_as_native_count() {
+        for kind in [ArrayKind::Waveform, ArrayKind::Aai, ArrayKind::Aao] {
+            let mut r = WaveformRecord::with_kind(kind);
+            r.nelm = 16;
+            assert_eq!(
+                r.field_native_count("VAL"),
+                Some(16),
+                "{} VAL native count must be NELM (its cvt_dbaddr no_elements)",
+                r.record_type()
+            );
+            assert_eq!(
+                r.field_native_count("NORD"),
+                None,
+                "{} native count only applies to VAL",
+                r.record_type()
+            );
+        }
+        let mut sa = WaveformRecord::with_kind(ArrayKind::SubArray);
+        sa.malm = 12;
+        assert_eq!(
+            sa.field_native_count("VAL"),
+            Some(12),
+            "subArray VAL native count must be MALM, not NELM"
+        );
+        assert_eq!(sa.field_native_count("VAL"), Some(sa.val_capacity() as u32));
     }
 
     #[test]

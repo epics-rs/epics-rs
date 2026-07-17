@@ -121,6 +121,59 @@ pub fn alloc_free_port() -> Result<u16, BootError> {
     err("could not find a port free on both UDP and TCP after 64 tries")
 }
 
+/// Tell a `softIoc`-family binary to serve `db`, by whichever route that `db`
+/// requires.
+///
+/// **The single owner of the load route**, shared by [`CIoc`] (base's fat
+/// `softIoc`) and [`PvxIoc`] (the fat `softIocPVX`) because both are built from
+/// base's `softMain` and both must stage an asyn reproducer *identically*. If
+/// the two sides staged it differently the oracle would be diffing two
+/// different configurations while reporting on one.
+///
+/// An asyn reproducer names a port ([`crate::ORACLE_ASYN_PORT`]) that must
+/// already exist when `init_record` connects the record. `softMain` gates its
+/// auto-`iocInit` on a `-d` load and runs a positional st.cmd *before* it, so
+/// `-d` can only create the port too late. Measured on the fat `softIocPVX`,
+/// which is exactly what makes this route mandatory rather than stylistic:
+///
+/// ```text
+/// -S -d asyn.db  -> T:ASYN: Connect error, status=3,
+///                   asynManager:connectDevice port ORACLEASYN not found
+/// -S asyn.st.cmd -> T:ASYN: queueRequest failed
+/// ```
+///
+/// Both then print `iocRun: All initialization complete`, so `-d` *boots* — it
+/// just boots a record that never found its port. That is the shape of failure
+/// this harness exists to not accept. The st.cmd route reaches the intended
+/// state: the port exists, the record is attached, and only the device is
+/// unreachable — `queueRequest failed` is the disconnected `localhost:1`
+/// talking, which is the point (it mirrors the Rust `NullOctetPort`:
+/// noAutoConnect → CNCT/AUCT=0, {octet,option} → the `*IV` set).
+///
+/// Every other record type keeps the plain `-d` path.
+fn load_db_into(cmd: &mut Command, db: &Path) -> Result<(), BootError> {
+    let db_text = std::fs::read_to_string(db)
+        .map_err(|e| BootError(format!("read db {}: {e}", db.display())))?;
+    if !db_text.contains(crate::ORACLE_ASYN_PORT) {
+        cmd.arg("-d").arg(db);
+        return Ok(());
+    }
+
+    let db_abs = db.canonicalize().unwrap_or_else(|_| db.to_path_buf());
+    let st_cmd = db.with_extension("st.cmd");
+    let script = format!(
+        "drvAsynIPPortConfigure(\"{port_name}\",\"localhost:1\",0,1,0)\n\
+         dbLoadRecords(\"{db}\")\n\
+         iocInit\n",
+        port_name = crate::ORACLE_ASYN_PORT,
+        db = db_abs.display(),
+    );
+    std::fs::write(&st_cmd, script)
+        .map_err(|e| BootError(format!("write st.cmd {}: {e}", st_cmd.display())))?;
+    cmd.arg(&st_cmd);
+    Ok(())
+}
+
 /// A booted IOC serving a `.db` on a known-exclusive CA port.
 pub trait Ioc {
     /// The CA server port: both the UDP search port and (for a healthy boot)
@@ -236,38 +289,9 @@ impl CIoc {
     }
 
     fn try_boot(tools: &CTools, db: &Path, port: u16) -> Result<Self, BootError> {
-        // An asyn reproducer names a port (`ORACLE_ASYN_PORT`) that must already
-        // exist when `init_record` connects the record — otherwise the C asyn
-        // record errors on boot. The fat softIoc runs a positional st.cmd
-        // *before* its `iocInit`, but only owns that `iocInit` when no `-d` is
-        // given (softMain gates its auto-`iocInit` on a `-d` load). So an
-        // asyn-bearing db is driven through an st.cmd that creates the port,
-        // loads the db, then runs `iocInit` itself (softMain "approach A"); the
-        // registered-but-disconnected `drvAsynIPPort` mirrors the Rust
-        // `NullOctetPort` (noAutoConnect → CNCT/AUCT=0, {octet,option} → the
-        // `*IV` set). Every other record type keeps the plain `-d` path.
-        let db_text = std::fs::read_to_string(db)
-            .map_err(|e| BootError(format!("read db {}: {e}", db.display())))?;
-        let needs_asyn_port = db_text.contains(crate::ORACLE_ASYN_PORT);
-
         let mut cmd = Command::new(&tools.ioc_bin);
         cmd.arg("-S"); // no interactive shell
-        if needs_asyn_port {
-            let db_abs = db.canonicalize().unwrap_or_else(|_| db.to_path_buf());
-            let st_cmd = db.with_extension("st.cmd");
-            let script = format!(
-                "drvAsynIPPortConfigure(\"{port_name}\",\"localhost:1\",0,1,0)\n\
-                 dbLoadRecords(\"{db}\")\n\
-                 iocInit\n",
-                port_name = crate::ORACLE_ASYN_PORT,
-                db = db_abs.display(),
-            );
-            std::fs::write(&st_cmd, script)
-                .map_err(|e| BootError(format!("write st.cmd {}: {e}", st_cmd.display())))?;
-            cmd.arg(&st_cmd);
-        } else {
-            cmd.arg("-d").arg(db);
-        }
+        load_db_into(&mut cmd, db)?;
         let mut child = cmd
             .env("EPICS_CAS_INTF_ADDR_LIST", "127.0.0.1")
             .env("EPICS_CAS_BEACON_ADDR_LIST", "127.0.0.1")
@@ -376,6 +400,34 @@ impl Drop for CIoc {
     }
 }
 
+/// Which protocol a [`RustIoc`] serves.
+///
+/// The port line is per-protocol on purpose. A CA port and a PVA UDP search
+/// port are not interchangeable, and a harness that read one and aimed the
+/// other's client at it would score every case ERROR for a reason that looks
+/// like a port bug rather than a wiring mistake. Distinct names make that
+/// mistake a parse failure at boot instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RustMode {
+    Ca,
+    Pva,
+}
+
+impl RustMode {
+    fn flag(self) -> Option<&'static str> {
+        match self {
+            RustMode::Ca => None,
+            RustMode::Pva => Some("--pva"),
+        }
+    }
+    fn port_line(self) -> &'static str {
+        match self {
+            RustMode::Ca => "ORACLE_IOC_PORT",
+            RustMode::Pva => "ORACLE_IOC_PVA_PORT",
+        }
+    }
+}
+
 /// The Rust IOC (`oracle-ioc` binary), booted on the same `.db`.
 ///
 /// Runs as a subprocess rather than in-process so that both sides of the pair
@@ -416,27 +468,45 @@ impl RustIoc {
         })
     }
 
+    /// Boot the CA side, reporting the bound CA port.
     pub fn boot(db: &Path) -> Result<Self, BootError> {
+        Self::boot_mode(db, RustMode::Ca)
+    }
+
+    /// Boot the **PVA** side, reporting the bound UDP search port.
+    ///
+    /// Same binary, same `.db`, same bind-and-read-back discipline — only the
+    /// protocol and the port line differ (see [`RustMode`]).
+    pub fn boot_pva(db: &Path) -> Result<Self, BootError> {
+        Self::boot_mode(db, RustMode::Pva)
+    }
+
+    fn boot_mode(db: &Path, mode: RustMode) -> Result<Self, BootError> {
         let bin = Self::binary()?;
-        let mut child = Command::new(&bin)
-            .arg("--db")
-            .arg(db)
+        let mut cmd = Command::new(&bin);
+        cmd.arg("--db").arg(db);
+        if let Some(flag) = mode.flag() {
+            cmd.arg(flag);
+        }
+        let mut child = cmd
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| BootError(format!("spawn {}: {e}", bin.display())))?;
+        let port_line = mode.port_line();
 
         let stdout = child.stdout.take().expect("piped");
         let stderr = child.stderr.take().expect("piped");
 
-        // The Rust IOC prints `ORACLE_IOC_PORT <p>` after the socket is bound,
-        // so the number is read back from the bind, never predicted.
+        // The Rust IOC prints `<port_line> <p>` after the socket is bound, so
+        // the number is read back from the bind, never predicted.
         let (tx, rx) = mpsc::channel::<Result<u16, String>>();
         let ttx = tx.clone();
+        let prefix = format!("{port_line} ");
         std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                if let Some(p) = line.strip_prefix("ORACLE_IOC_PORT ") {
+                if let Some(p) = line.strip_prefix(&prefix) {
                     let parsed = p
                         .trim()
                         .parse::<u16>()
@@ -445,9 +515,9 @@ impl RustIoc {
                     return;
                 }
             }
-            let _ = ttx.send(Err(
-                "oracle-ioc closed stdout without reporting a port".into()
-            ));
+            let _ = ttx.send(Err(format!(
+                "oracle-ioc closed stdout without reporting a `{port_line}` port"
+            )));
         });
         // Capture stderr so a panic/failure has a diagnosable message rather
         // than a bare timeout.
@@ -577,9 +647,373 @@ fn wait_reachable(tools: &CTools, port: u16, side: Side, probe_pv: &str) -> Resu
     }
 }
 
+// ---------------------------------------------------------------------------
+// The PVA pair: pvxs QSRV2 (`softIocPVX`) vs `oracle-ioc --pva`.
+// ---------------------------------------------------------------------------
+
+/// Paths to the built pvxs tree — the PVA reference side and its client tools.
+///
+/// The same refusal-to-invent as [`CTools`]: an absent tree is an ERROR at
+/// startup, not a skipped-and-passed run.
+#[derive(Debug, Clone)]
+pub struct PvxTools {
+    /// pvxs client tools (`pvxget`/`pvxinfo`/`pvxlist`) — the instrument both
+    /// sides are driven through.
+    pub bin: PathBuf,
+    /// pvxs QSRV2's IOC binary — the PVA ground truth.
+    pub ioc_bin: PathBuf,
+    // NO beacon port here, on purpose. The client tools need one, but a client
+    // *binds* it, so the number must be one no live server holds — and
+    // `alloc_free_port` releases the port it names, so a number allocated once
+    // at start-up is owned by nobody. Any later allocation may legitimately
+    // hand it to a `softIocPVX` or `oracle-ioc` search port, after which every
+    // client aimed at it dies on `Address already in use` for the life of that
+    // pair (measured: 45 channels of one record type, ERROR, nondeterministic).
+    // The invariant this field's docs used to *state* — "must not be either
+    // side's search port" — was enforced by nothing. It is now enforced by
+    // construction in `crate::pvatool::PvaTools::run_raw`, which allocates the
+    // port immediately before spawning, when the pair's sockets are live and
+    // therefore excluded. The field is deleted rather than left unused so the
+    // shared number cannot come back.
+}
+
+impl PvxTools {
+    pub const DEFAULT_BIN: &'static str = "/home/stevek/work/epics-modules/pvxs/bin/linux-x86_64";
+
+    /// The **fat** `softIocPVX` — QSRV2 plus the same busy/calc/asyn support the
+    /// fat CA [`CTools::DEFAULT_IOC_BIN`] links, so the PVA ground truth serves
+    /// the same record types the `.dbd` denominator enumerates.
+    ///
+    /// Stock pvxs `softIocPVX` cannot load six of them (`acalcout`, `asyn`,
+    /// `busy`, `scalcout`, `sseq`, `transform`): it exits during boot and every
+    /// channel of those types scored ERROR — 835 of 3386, which is why coverage
+    /// was capped at 75.3% by the *instrument* rather than by the port. It lives
+    /// under `oracle-ioc/` rather than in the pvxs tree, exactly like its CA
+    /// sibling; the client tools still come from `bin`. It derives its dbd from
+    /// its own exe dir, so no `-D` is passed.
+    pub const DEFAULT_IOC_BIN: &'static str =
+        "/home/stevek/work/oracle-ioc/bin/linux-x86_64/softIocPVX";
+
+    /// The client tools this harness actually invokes. Verified up front so a
+    /// missing binary is one loud error rather than an "errored" verdict on
+    /// every case.
+    const REQUIRED: [&'static str; 5] = ["pvxget", "pvxinfo", "pvxlist", "pvxmonitor", "pvxput"];
+
+    /// Locate the pvxs tree, honoring `PVXS_BIN`.
+    pub fn discover() -> Result<Self, BootError> {
+        let bin = std::env::var("PVXS_BIN").unwrap_or_else(|_| Self::DEFAULT_BIN.to_string());
+        let bin = PathBuf::from(bin);
+        if !bin.is_dir() {
+            return err(format!(
+                "pvxs bin dir not found at {}. Set PVXS_BIN to the built \
+                 linux-x86_64 bin dir. The PVA oracle cannot run without ground truth.",
+                bin.display()
+            ));
+        }
+        for tool in Self::REQUIRED {
+            if !bin.join(tool).is_file() {
+                return err(format!("missing pvxs tool `{tool}` in {}", bin.display()));
+            }
+        }
+        // Same discipline as `CTools::discover`: the fat IOC is named, verified,
+        // and its absence is one loud error. Never fall back to the stock
+        // `softIocPVX` in `bin` — it cannot load six of the denominator's record
+        // types, so a silent fallback would turn a missing build into 835
+        // ERRORs and a 75.3% coverage number that looks like a port problem.
+        let ioc_bin = std::env::var("EPICS_ORACLE_PVX_IOC_BIN")
+            .unwrap_or_else(|_| Self::DEFAULT_IOC_BIN.to_string());
+        let ioc_bin = PathBuf::from(ioc_bin);
+        if !ioc_bin.is_file() {
+            return err(format!(
+                "fat `softIocPVX` not found at {}. Build it under oracle-ioc/ (or set \
+                 EPICS_ORACLE_PVX_IOC_BIN). The PVA oracle cannot run without ground truth.",
+                ioc_bin.display()
+            ));
+        }
+        Ok(Self { bin, ioc_bin })
+    }
+}
+
+/// pvxs QSRV2's `softIocPVX`, booted on the given `.db`. PVA ground truth.
+pub struct PvxIoc {
+    port: u16,
+    child: Child,
+}
+
+impl PvxIoc {
+    /// Boot `softIocPVX` serving `db`, loopback-isolated, on a UDP search port
+    /// nothing else holds.
+    pub fn boot(tools: &PvxTools, db: &Path) -> Result<Self, BootError> {
+        let mut last = String::new();
+        for _ in 0..BOOT_ATTEMPTS {
+            let udp = alloc_free_port()?;
+            let ca = alloc_free_port()?;
+            match Self::try_boot(tools, db, udp, ca) {
+                Ok(ioc) => return Ok(ioc),
+                Err(BootError(e)) if e.contains("PORT_COLLISION") => {
+                    last = e;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        err(format!(
+            "softIocPVX could not get an exclusive port in {BOOT_ATTEMPTS} attempts: {last}"
+        ))
+    }
+
+    fn try_boot(tools: &PvxTools, db: &Path, udp: u16, ca: u16) -> Result<Self, BootError> {
+        let mut cmd = Command::new(&tools.ioc_bin);
+        cmd.arg("-S"); // no interactive shell
+        // The same load route as the CA side, from the same owner: the fat
+        // `softIocPVX` is a `softMain` too, so an asyn db needs its port created
+        // before `iocInit` here exactly as it does there.
+        load_db_into(&mut cmd, db)?;
+        let mut child = cmd
+            // --- PVA server, loopback only. Names verified against pvxs
+            // `src/config.cpp:402-432`, not guessed. ---
+            .env("EPICS_PVAS_INTF_ADDR_LIST", "127.0.0.1")
+            .env("EPICS_PVAS_BEACON_ADDR_LIST", "127.0.0.1")
+            // Refuse auto-beaconing outright, so no frame reaches a real
+            // subnet (`config.cpp:430`).
+            .env("EPICS_PVAS_AUTO_BEACON_ADDR_LIST", "NO")
+            .env("EPICS_PVAS_BROADCAST_PORT", udp.to_string())
+            // TCP is the one port that needs no allocation: pvxs binds `:0`
+            // and stamps the real port back (`server.cpp:484`), then
+            // advertises it in the search reply. A number nobody chose cannot
+            // be a number somebody else took.
+            .env("EPICS_PVAS_SERVER_PORT", "0")
+            // --- CA server. softIocPVX links base's rsrv, which binds CA
+            // 5064 by default: left alone it would fight the host's real IOCs
+            // and both sides of this pair would collide on it (measured — the
+            // `cas WARNING` in a two-IOC PVA run is CA's, not PVA's). No CA is
+            // measured in this phase; the ports exist only to keep it off
+            // 5064. ---
+            .env("EPICS_CAS_INTF_ADDR_LIST", "127.0.0.1")
+            .env("EPICS_CAS_BEACON_ADDR_LIST", "127.0.0.1")
+            .env("EPICS_CA_SERVER_PORT", ca.to_string())
+            .env("EPICS_CAS_SERVER_PORT", ca.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| BootError(format!("spawn softIocPVX: {e}")))?;
+
+        // Same ready/collision watch as `CIoc`: softIocPVX prints base's
+        // `iocRun: All initialization complete`. Note what this does NOT buy
+        // us — a *PVA* search-port collision prints nothing at all (see
+        // `PvaPair::boot`), so this watch covers the CA side only.
+        let stdout = child.stdout.take().expect("piped");
+        let stderr = child.stderr.take().expect("piped");
+        let (tx, rx) = mpsc::channel::<BootSignal>();
+        spawn_watcher(stdout, tx.clone());
+        spawn_watcher(stderr, tx);
+
+        let deadline = Instant::now() + BOOT_TIMEOUT;
+        let mut ready = false;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                let _ = child.kill();
+                return err(format!(
+                    "softIocPVX did not report ready within {BOOT_TIMEOUT:?} on UDP {udp}"
+                ));
+            }
+            match rx.recv_timeout(left) {
+                Ok(BootSignal::PortCollision(line)) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return err(format!("PORT_COLLISION on CA {ca}: {line}"));
+                }
+                Ok(BootSignal::Ready) => {
+                    ready = true;
+                    break;
+                }
+                Ok(BootSignal::Other) => continue,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        if !ready {
+            let status = child.try_wait().ok().flatten();
+            let _ = child.kill();
+            return err(format!(
+                "softIocPVX exited during boot (status {status:?}) — db rejected?"
+            ));
+        }
+        Ok(Self { port: udp, child })
+    }
+}
+
+impl Ioc for PvxIoc {
+    fn port(&self) -> u16 {
+        self.port
+    }
+    fn side(&self) -> Side {
+        Side::C
+    }
+}
+
+impl Drop for PvxIoc {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// The booted PVA differential pair: the same `.db` on both sides, each on its
+/// own **proven-exclusive** UDP search port.
+pub struct PvaPair {
+    pub c: PvxIoc,
+    pub rust: RustIoc,
+}
+
+impl PvaPair {
+    /// Boot both PVA sides and return only once each is observed reachable
+    /// **and** proven to be the only server on its port.
+    ///
+    /// The exclusivity proof is the part with no CA analogue, and it is not
+    /// belt-and-braces. CA announces a shared UDP port (`cas WARNING: ... two
+    /// or more servers share the same UDP port`), which is what [`CIoc::boot`]
+    /// scans for. A PVA search socket sets `SO_REUSEPORT`, so a second server
+    /// binds the same port **silently** — measured: two `softIocPVX` on one
+    /// port, six `pvxget` of one PV, values `1,2,2,1,1,2`. Both sides here
+    /// serve identical PV names from the same `.db`, so that outcome would
+    /// misattribute readings with nothing in any log to show for it.
+    ///
+    /// There is no output to scan, so exclusivity is established the only way
+    /// left: by measurement. `pvxlist` on each side's port must find exactly
+    /// one server ([`PvaTools::server_count`]).
+    pub fn boot(tools: &PvxTools, db: &Path, probe_pv: &str) -> Result<Self, BootError> {
+        let c = PvxIoc::boot(tools, db)?;
+        let rust = RustIoc::boot_pva(db)?;
+        if c.port() == rust.port() {
+            return err(
+                "pvxs and Rust PVA servers landed on the same UDP search port — \
+                 refusing to run, answers would not be attributable",
+            );
+        }
+        wait_pva_reachable(tools, c.port(), Side::C, probe_pv)?;
+        wait_pva_reachable(tools, rust.port(), Side::Rust, probe_pv)?;
+        verify_sole_server(tools, c.port(), Side::C)?;
+        verify_sole_server(tools, rust.port(), Side::Rust)?;
+        Ok(Self { c, rust })
+    }
+}
+
+/// Poll a known channel through the real pvxs client until it reads, with
+/// bounded retries and exponential backoff. The PVA sibling of
+/// [`wait_reachable`].
+fn wait_pva_reachable(
+    tools: &PvxTools,
+    port: u16,
+    side: Side,
+    probe_pv: &str,
+) -> Result<(), BootError> {
+    let t = crate::pvatool::PvaTools::new(tools, port, side);
+    let deadline = Instant::now() + REACHABLE_TIMEOUT;
+    let mut backoff = REACHABLE_BACKOFF_START;
+    loop {
+        let last = match t.pvxget(probe_pv) {
+            Ok(_) => return Ok(()),
+            Err(e) => e.message,
+        };
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return err(format!(
+                "{side} PVA server did not become reachable within {REACHABLE_TIMEOUT:?} \
+                 (probe {probe_pv}: {last})"
+            ));
+        }
+        std::thread::sleep(backoff.min(left));
+        backoff = (backoff * 2).min(REACHABLE_BACKOFF_MAX);
+    }
+}
+
+/// Prove exactly one PVA server answers on `port`. See [`PvaPair::boot`] for
+/// why this is mandatory rather than defensive.
+fn verify_sole_server(tools: &PvxTools, port: u16, side: Side) -> Result<(), BootError> {
+    let t = crate::pvatool::PvaTools::new(tools, port, side);
+    match t.server_count() {
+        Ok(1) => Ok(()),
+        Ok(n) => err(format!(
+            "{n} PVA servers answer on the {side} side's UDP port {port} — refusing to \
+             run. A PVA port collision binds silently (SO_REUSEPORT), and both sides \
+             serve the same PV names, so readings here would be misattributed rather \
+             than failed."
+        )),
+        // Not "assume one": the side was reachable a moment ago, so a
+        // countless port is an unexplained change, and this harness does not
+        // score what it could not measure.
+        Err(e) => err(format!(
+            "could not count the PVA servers on the {side} side's UDP port {port}, so \
+             exclusivity is unproven and no reading from it is attributable: {e}"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn args_of(cmd: &Command) -> Vec<String> {
+        cmd.get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect()
+    }
+
+    /// An asyn db MUST go through the st.cmd route, and every other db MUST NOT.
+    ///
+    /// The boundary is worth pinning because the wrong branch fails *silently*:
+    /// `-S -d asyn.db` still prints `iocRun: All initialization complete`, so the
+    /// IOC boots and serves — with a record that never found its port
+    /// (`connectDevice port ORACLEASYN not found`). Nothing downstream would
+    /// report that as anything but a diff against the Rust side.
+    #[test]
+    fn only_an_asyn_db_is_staged_through_a_script() {
+        let dir = std::env::temp_dir().join(format!("oracle_load_route_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("workdir");
+
+        let plain = dir.join("plain.db");
+        std::fs::write(&plain, crate::record_stmt("ai", "ORACLE:AI")).expect("write");
+        let mut cmd = Command::new("softIoc");
+        load_db_into(&mut cmd, &plain).expect("load");
+        let a = args_of(&cmd);
+        assert!(
+            a.contains(&"-d".to_string()),
+            "a plain db loads with -d: {a:?}"
+        );
+        assert!(
+            !a.iter().any(|x| x.ends_with("st.cmd")),
+            "a plain db needs no script: {a:?}",
+        );
+
+        let asyn = dir.join("asyn.db");
+        std::fs::write(&asyn, crate::record_stmt("asyn", "ORACLE:ASYN")).expect("write");
+        let mut cmd = Command::new("softIoc");
+        load_db_into(&mut cmd, &asyn).expect("load");
+        let a = args_of(&cmd);
+        assert!(
+            !a.contains(&"-d".to_string()),
+            "-d would defer the script past iocInit, so the port would not exist \
+             when the record connects: {a:?}",
+        );
+        let script = a.iter().find(|x| x.ends_with("st.cmd")).expect("a script");
+
+        // The script must create the port BEFORE it loads the db and inits.
+        let text = std::fs::read_to_string(script).expect("read script");
+        let at = |needle: &str| {
+            text.find(needle)
+                .unwrap_or_else(|| panic!("{needle} in {text}"))
+        };
+        assert!(
+            at(crate::ORACLE_ASYN_PORT) < at("dbLoadRecords")
+                && at("dbLoadRecords") < at("iocInit"),
+            "order must be port -> load -> init, got:\n{text}",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn allocated_port_is_free_on_both_protocols() {

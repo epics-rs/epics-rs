@@ -478,6 +478,304 @@ pub struct ArrayMonitorPost {
     pub hash_changed: bool,
 }
 
+/// The record type's RSET metadata slots — which of C's six nullable
+/// `get_*` property functions the record type implements.
+///
+/// This is the port's `rset` property table, transcribed slot by slot
+/// from the `#define get_xxx NULL` lines of each C record's `.c`. It is
+/// what `dbGet` consults to *narrow* the caller's `options` mask
+/// (`dbAccess.c:336-430`), and therefore what decides whether QSRV marks
+/// an NT leaf at all (pvxs `ioc/iocsource.cpp:263-305`). Without it the
+/// port fabricated every leaf it could name and marked it as supplied —
+/// telling the client a made-up `display.precision = 0` on a `longout`,
+/// or `valueAlarm` bands at zero on a `waveform`, were authoritative.
+///
+/// A slot counts as supplied when the C function pointer is non-NULL,
+/// even if the function writes nothing for the field in question — C
+/// leaves the option bit set either way (e.g. `boRecord.c:294-299`,
+/// whose `get_units` writes `"s"` only for `HIGH`, yet `DBR_UNITS`
+/// survives for every `bo` field).
+/// What a record type's C `get_control_double` writes for a field its switch
+/// does not list — the slot's LAST arm.
+///
+/// Independent of [`crate::server::snapshot::PropertySupport::control_double`],
+/// which says whether the slot EXISTS at all (a NULL slot makes
+/// `dbAccess.c:257` fail and clears the option bit, so no leaf is served).
+/// This says what a slot that DOES exist answers when it falls through. The
+/// two genuinely differ: `acalcout` supplies the slot and still writes nothing
+/// for an unlisted field.
+///
+/// Slot-neutral: the two arm SHAPES are the same for `get_control_double` and
+/// `get_graphic_double`, but which one a record type takes is asked per slot —
+/// [`control_default_arm`] and [`graphic_default_arm`] are separate answers.
+/// `aSub` is the type that proves they must be: its `get_control_double` is a
+/// bare `recGblGetControlDouble` (`aSubRecord.c:372-376`) while its
+/// `get_graphic_double` (`:350-368`) has no recGbl call at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RsetDefaultArm {
+    /// The slot ends in `recGblGetControlDouble` / `recGblGetGraphicDouble` —
+    /// the field TYPE's numeric range (`recGbl.c:146-171`, table at
+    /// `:372-419`).
+    RecGblRange,
+    /// The slot returns without writing, so the `dbAccess.c:256` / `:216`
+    /// `(0.0, 0.0)` seed stands.
+    Seed,
+}
+
+/// The last arm of `rtype`'s C `get_control_double`.
+///
+/// Audited by reading each ported record type's own C rset. Every record in
+/// EPICS base delegates (`aiRecord.c:267`, `aoRecord.c:341`, `calcRecord.c:235`,
+/// `calcoutRecord.c:506`, `aSubRecord.c:372`, `subRecord.c:272`,
+/// `selRecord.c:203`, `seqRecord.c:342`, `dfanoutRecord.c:197`,
+/// `longinRecord.c:217`, `longoutRecord.c:268`, `int64inRecord.c:212`,
+/// `int64outRecord.c:251`, `boRecord.c:310`, `waveformRecord.c:268`,
+/// `aaiRecord.c:293`, `aaoRecord.c:296`, `subArrayRecord.c:262`,
+/// `compressRecord.c:487`, `histogramRecord.c:458`), as do the downstream
+/// types that supply the slot (`motorRecord.cc:3303`, `epidRecord.c:285`,
+/// `tableRecord.c:806`). The rest NULL it outright and never reach here
+/// (`biRecord.c`, `mbbiRecord.c`, `mbboRecord.c`, `mbbiDirectRecord.c`,
+/// `mbboDirectRecord.c`, `stringinRecord.c`, `stringoutRecord.c`,
+/// `lsiRecord.c`, `lsoRecord.c`, `eventRecord.c`, `fanoutRecord.c`,
+/// `permissiveRecord.c`, `printfRecord.c`, `stateRecord.c`,
+/// `sseqRecord.c:141`, `swaitRecord.c`, `transformRecord.c`, `busyRecord.c`,
+/// `asynRecord.c`, `throttleRecord.c:70`, `scalerRecord.c:157`).
+///
+/// Only the synApps calc pair writes nothing: both end `get_control_double`
+/// with a bare `return(0)` after their listed cases, so C serves the seed
+/// where a delegating record serves the type range. Measured on the
+/// differential oracle as 42 `acalcout`/`scalcout` fields.
+pub fn control_default_arm(rtype: &str) -> RsetDefaultArm {
+    match rtype {
+        // aCalcoutRecord.c:793-822, sCalcoutRecord.c:653 — the switch lists
+        // VAL/HIHI/HIGH/LOW/LOLO and the A-L / PA-PL ranges, then falls off
+        // the end into `return(0)` with no recGbl delegation.
+        "acalcout" | "scalcout" => RsetDefaultArm::Seed,
+        _ => RsetDefaultArm::RecGblRange,
+    }
+}
+
+/// The last arm of `rtype`'s C `get_graphic_double` — the twin of
+/// [`control_default_arm`], and NOT the same answer for every type.
+///
+/// Read from each ported type's own rset. `aSubRecord.c:350-368` is the one
+/// that separates the two slots: it tries `get_inlinkNumber` then
+/// `get_outlinkNumber` and, for a field that is neither, falls out of the
+/// function having written nothing — no `default:`, no recGbl call — so the
+/// `dbAccess.c:216` seed stands. Its `get_control_double` (`:372-376`) is a
+/// bare `recGblGetControlDouble` in the same file, which is why one shared bit
+/// could not answer both. Measured: `ASUB.PHAS` serves display 0/0 where
+/// `CALC.PHAS` serves the DBF_SHORT range ±32767.
+///
+/// The synApps calc pair ends the same way — the listed cases return early and
+/// the function ends `return(0)` with no delegation
+/// (`aCalcoutRecord.c:1046-1068`, `sCalcoutRecord.c:906-928`).
+///
+/// Every other ported type that supplies the slot delegates
+/// (`aiRecord.c:244`, `aoRecord.c:316`, `calcRecord.c:187`,
+/// `calcoutRecord.c:452`, `subRecord.c:222`, `selRecord.c:181`,
+/// `seqRecord.c:322`, `dfanoutRecord.c:181`, `longinRecord.c:190`,
+/// `int64inRecord.c:196`, `int64outRecord.c:235`, `longoutRecord.c:252`,
+/// `waveformRecord.c:251`, `aaiRecord.c:276`, `aaoRecord.c:279`,
+/// `subArrayRecord.c:231`, `compressRecord.c:471`, `histogramRecord.c:442`).
+pub fn graphic_default_arm(rtype: &str) -> RsetDefaultArm {
+    match rtype {
+        "aSub" | "acalcout" | "scalcout" => RsetDefaultArm::Seed,
+        _ => RsetDefaultArm::RecGblRange,
+    }
+}
+
+/// How `rtype`'s C `get_alarm_double` answers the fields it lists explicitly
+/// (see [`alarm_explicit_fields`]).
+///
+/// The severity gate is NOT universal, so this bit cannot be inferred from the
+/// base analog shape — it is read from each ported type's own rset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlarmValArm {
+    /// `pad->upper_alarm_limit = prec->hhsv ? prec->hihi : epicsNAN` — each
+    /// limit is served only when its severity is enabled. The base analog
+    /// shape (`aiRecord.c:290-301`, and ao/longin/longout/calc/calcout/sel/
+    /// sub/dfanout alike).
+    Gated,
+    /// `pad->upper_alarm_limit = prec->hihi` — the four limits verbatim, with
+    /// no severity test at all, so an unset record serves 0 rather than NaN
+    /// (`int64inRecord.c:235-246`, `int64outRecord.c:279-290`,
+    /// `sCalcoutRecord.c:683-696`, `aCalcoutRecord.c:823-836`,
+    /// `motorRecord.cc:3344-3361`, `epidRecord.c:289-301`).
+    Unconditional,
+}
+
+/// The fields `rtype`'s C `get_alarm_double` lists BEFORE its
+/// `recGblGetAlarmDouble` fall-through — the ones that take
+/// [`alarm_val_arm`]'s answer instead of the four NaN.
+///
+/// Empty means the rset lists nothing: even VAL falls to the default arm.
+/// `seqRecord.c:355-367` routes only its `DOn` fields (through their `DOLn`
+/// link), `aSubRecord.c:378-404` only its `INPn`/`OUTn` links, and
+/// `swaitRecord.c:608-612` is a bare `recGblGetAlarmDouble(paddr,pad)` with no
+/// field test whatsoever. A constant link supplies no alarm limits, so the link
+/// arm lands on the same four NaN — which is why only the listed set needs a
+/// per-type answer and the link fields do not.
+///
+/// `motorRecord.cc:3344-3361` is the one type listing a second field: its case
+/// is `fieldIndex == motorRecordVAL || fieldIndex == motorRecordDVAL`, so the
+/// dial-coordinate readback carries the same limits as VAL.
+pub fn alarm_explicit_fields(rtype: &str) -> &'static [&'static str] {
+    match rtype {
+        "seq" | "aSub" | "swait" => &[],
+        "motor" => &["VAL", "DVAL"],
+        _ => &["VAL"],
+    }
+}
+
+/// See [`AlarmValArm`]. Types whose rset lists nothing
+/// ([`alarm_explicit_fields`] empty) never consult this.
+pub fn alarm_val_arm(rtype: &str) -> AlarmValArm {
+    match rtype {
+        "int64in" | "int64out" | "scalcout" | "acalcout" | "motor" | "epid" => {
+            AlarmValArm::Unconditional
+        }
+        _ => AlarmValArm::Gated,
+    }
+}
+
+pub fn default_property_support(rtype: &str) -> crate::server::snapshot::PropertySupport {
+    use crate::server::snapshot::PropertySupport as P;
+    match rtype {
+        // Every numeric slot, no enum strings.
+        // aiRecord.c:68-87, aoRecord.c:67-86, calcRecord.c:63-82,
+        // calcoutRecord.c:67-86, selRecord.c:58-77, subRecord.c:62-81,
+        // dfanoutRecord.c:66-85, seqRecord.c:56-75.
+        "ai" | "ao" | "calc" | "calcout" | "sel" | "sub" | "dfanout" | "seq" => P::NUMERIC,
+
+        // Integer scalars: `#define get_precision NULL`
+        // (longinRecord.c, longoutRecord.c, int64inRecord.c,
+        // int64outRecord.c). This is the measured `longout` case —
+        // pvxs leaves `display.precision` absent, the port sent 0.
+        "longin" | "longout" | "int64in" | "int64out" => P {
+            precision: false,
+            ..P::NUMERIC
+        },
+
+        // Arrays and compress: `#define get_alarm_double NULL`
+        // (waveformRecord.c, aaiRecord.c, aaoRecord.c,
+        // subArrayRecord.c, compressRecord.c, histogramRecord.c).
+        // This is the measured `waveform` case — pvxs leaves all four
+        // `valueAlarm.*Limit` absent, the port sent four zeros.
+        "waveform" | "aai" | "aao" | "subArray" | "compress" | "histogram" => P {
+            alarm_double: false,
+            ..P::NUMERIC
+        },
+
+        // No property slots at all: every `get_*` is `#define`d NULL.
+        // stringinRecord.c:62-81, stringoutRecord.c:64-83,
+        // lsiRecord.c:287-306, lsoRecord.c:328-347,
+        // eventRecord.c:62-81, permissiveRecord.c:56-75,
+        // stateRecord.c:58-77, printfRecord.c:456-475,
+        // fanoutRecord.c:60-79, timestampRecord (std-rs).
+        // This is the measured `stringout` case — pvxs leaves
+        // `display.units` absent, the port sent "".
+        "stringin" | "stringout" | "lsi" | "lso" | "event" | "permissive" | "state" | "printf"
+        | "fanout" | "timestamp" => P::NONE,
+
+        // Enum records. `biRecord.c:61-80` and `mbbiRecord.c:65-84` /
+        // `mbboRecord.c:64-83` NULL every numeric slot and supply only
+        // `get_enum_strs`. `boRecord.c:59-61` keeps `get_units`,
+        // `get_precision` and `get_control_double` (they serve the
+        // `HIGH` field) but NULLs `get_graphic_double` and
+        // `get_alarm_double`.
+        "bi" | "mbbi" | "mbbo" => P {
+            enum_strs: true,
+            ..P::NONE
+        },
+        "bo" => P {
+            units: true,
+            precision: true,
+            control_double: true,
+            enum_strs: true,
+            ..P::NONE
+        },
+        // busyRecord.c (synApps busy): units/graphic/control/alarm NULL,
+        // get_precision and get_enum_strs present.
+        "busy" => P {
+            precision: true,
+            enum_strs: true,
+            ..P::NONE
+        },
+        // mbbiDirectRecord.c:63-81 / mbboDirectRecord.c:63-81 — only
+        // `get_precision` survives, and C's DBF_FLOAT/DOUBLE gate
+        // (`dbAccess.c:388-395`) drops it again for their DBF_ENUM/LONG
+        // value, so nothing is marked. `Snapshot::precision` applies
+        // that gate.
+        "mbbiDirect" | "mbboDirect" => P {
+            precision: true,
+            ..P::NONE
+        },
+
+        // synApps, transcribed the same way.
+        // sCalcoutRecord.c / aCalcoutRecord.c / epidRecord.c /
+        // motorRecord.cc:259-279 (the rset table: get_units, get_precision,
+        // get_graphic_double, get_control_double and get_alarm_double all
+        // supplied, get_enum_strs NULL) / aSubRecord.c: full numeric set, no
+        // enum strings.
+        "scalcout" | "acalcout" | "motor" | "epid" | "aSub" => P::NUMERIC,
+        // scalerRecord.c:147-158 NULLs every property slot but one:
+        // `#define get_units NULL` (:151), `get_enum_strs` (:154),
+        // `get_graphic_double` (:156), `get_control_double` (:157) and
+        // `get_alarm_double` (:158). Only `get_precision` (:152) survives.
+        //
+        // Grouping scaler with the full-numeric synApps types claimed TEN
+        // leaves QSRV2 never serves: `display.units`, the two `display.limit*`,
+        // the two `control.limit*`, the four `valueAlarm.*Limit` — and
+        // `display.precision`, which pvxs assigns only inside its
+        // `DBR_GR_DOUBLE` branch (`iocsource.cpp:288-291`). That nesting is
+        // also why `precision` stays true here and yet marks nothing: it
+        // records what the rset supplies, exactly as `transform`/`sseq` do.
+        "scaler" => P {
+            precision: true,
+            ..P::NONE
+        },
+        // tableRecord.cc (optics): `#define get_alarm_double NULL`.
+        "table" => P {
+            alarm_double: false,
+            ..P::NUMERIC
+        },
+        // swaitRecord.c: get_units and get_control_double are NULL.
+        "swait" => P {
+            units: false,
+            control_double: false,
+            ..P::NUMERIC
+        },
+        // Only `get_precision` survives; the rset NULLs the other five.
+        // transformRecord.c; sseqRecord.c:124-144 (the rset table itself —
+        // `NULL, /* get_units */ get_precision, /* get_precision */ ...
+        // NULL, /* get_graphic_double */ NULL, /* get_control_double */
+        // NULL /* get_alarm_double */`). `sseq` was previously grouped with
+        // the full-numeric synApps types, which marked six leaves per field
+        // that QSRV2 omits entirely.
+        //
+        // `asyn` is NOT here: asyn-rs owns that record and declares its own
+        // row (asynRecord.c:84-91, the same shape) — a downstream crate
+        // cannot reach this table, which is why `Record::property_support`
+        // is the hook and this is only its default.
+        "transform" | "sseq" => P {
+            precision: true,
+            ..P::NONE
+        },
+        "throttle" => P {
+            precision: true,
+            graphic_double: true,
+            ..P::NONE
+        },
+
+        // A record type whose C rset the port has not transcribed keeps
+        // the pre-existing "supplies what it populated" behaviour rather
+        // than silently losing metadata. Add an arm above — with the C
+        // file and line — when porting a new record type.
+        _ => P::NUMERIC,
+    }
+}
+
 /// Per-field metadata deltas returned by
 /// [`Record::field_metadata_override`].
 ///
@@ -1129,6 +1427,33 @@ pub trait Record: Send + Sync + 'static {
     /// Default: `None` — record-level metadata serves every field.
     fn field_metadata_override(&self, _field: &str) -> Option<FieldMetadataOverride> {
         None
+    }
+
+    /// Which of C's six nullable `rset` `get_*` property slots THIS record
+    /// type implements — the record's own `#define get_xxx NULL` lines.
+    ///
+    /// `dbGet` consults the rset to *narrow* the caller's options mask
+    /// (`dbAccess.c:336-430`): a NULL slot clears the option bit, so the leaf
+    /// never reaches the client. That is what decides whether QSRV marks an NT
+    /// leaf at all (pvxs `ioc/iocsource.cpp:263-305`). A slot counts as
+    /// supplied when the C function pointer is non-NULL **even if the function
+    /// writes nothing for the field in question** — C leaves the option bit
+    /// set either way (`boRecord.c:294-299` writes units only for `HIGH`, yet
+    /// `DBR_UNITS` survives for every `bo` field).
+    ///
+    /// The record type owns this answer because the record type owns its C
+    /// rset. A central table keyed on the record-type *string* cannot: a
+    /// record implemented in a downstream crate (`asyn-rs`'s `asynRecord`,
+    /// the motor/scaler/optics types) has no way to add a row to it, so it
+    /// silently inherited a default that marked every leaf it could name —
+    /// telling clients a fabricated `display.units` of `""` and
+    /// `valueAlarm` bands of zero were authoritative.
+    ///
+    /// The default answers from [`default_property_support`], the
+    /// transcription of the record types epics-base-rs implements itself.
+    /// Override it in the record's own file, citing the C rset lines.
+    fn property_support(&self) -> crate::server::snapshot::PropertySupport {
+        default_property_support(self.record_type())
     }
 
     /// Field names this record serves as a *long string*: a `DBF_CHAR`

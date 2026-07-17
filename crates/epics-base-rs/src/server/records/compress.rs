@@ -1,5 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{ProcessOutcome, Record};
+use crate::server::record::{FieldMetadataOverride, ProcessOutcome, Record};
 use crate::server::records::count_put;
 use crate::types::{EpicsValue, PvString};
 
@@ -544,6 +544,20 @@ const COMPRESS_SPC_RESET_FIELDS: &[&str] = &["RES", "ALG", "PBUF", "BALG", "N"];
 impl Record for CompressRecord {
     fn record_type(&self) -> &'static str {
         "compress"
+    }
+
+    /// `compressRecord.c:479-493` `get_control_double` lists `VAL`, `IHIL` and
+    /// `ILIL` — the two init-limit fields answer the record's `HOPR`/`LOPR`,
+    /// like `VAL`. Note the list does NOT include the alarm bands: `compress`
+    /// NULLs `get_alarm_double` entirely, so it has none to list.
+    fn field_metadata_override(&self, field: &str) -> Option<FieldMetadataOverride> {
+        ["IHIL", "ILIL"]
+            .iter()
+            .any(|f| field.eq_ignore_ascii_case(f))
+            .then(|| FieldMetadataOverride {
+                ctrl_limits: Some((self.hopr, self.lopr)),
+                ..Default::default()
+            })
     }
 
     /// C `compressRecord.c::special` (:377-393) — the SPC_RESET hook:

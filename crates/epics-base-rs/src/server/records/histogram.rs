@@ -1,5 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{MENU_YES_NO, ProcessOutcome, Record};
+use crate::server::record::{FieldMetadataOverride, MENU_YES_NO, ProcessOutcome, Record};
 use crate::types::EpicsValue;
 
 /// Histogram record — counts values into buckets.
@@ -195,9 +195,45 @@ impl HistogramRecord {
 /// collection buffer.
 const HISTOGRAM_CMD_CHOICES: &[&str] = &["Read", "Clear", "Start", "Stop"];
 
+/// C `histogramRecord.c:88` `int histogramSDELprecision = 2;` — the precision
+/// `get_precision` serves for `SDEL`, the monitor deadband.
+const HISTOGRAM_SDEL_PRECISION: i16 = 2;
+
 impl Record for HistogramRecord {
     fn record_type(&self) -> &'static str {
         "histogram"
+    }
+
+    /// `histogramRecord.c:458-475` `get_control_double` lists `VAL` (which the
+    /// shared VAL-class route already serves) and `WDTH`, the bucket width,
+    /// whose limits are the span the buckets cover: `ULIM - LLIM` up, `0.0`
+    /// down. Without this `WDTH` falls to the `default:` arm and reports the
+    /// DBF_DOUBLE range of ±1e300.
+    /// `WDTH` is a COMPUTED span in both slots: `histogramRecord.c:467-469`
+    /// (control) and `:450-452` (graphic) each serve `ULIM - LLIM` up and a
+    /// literal `0.0` down — neither HOPR/LOPR nor the DBF_DOUBLE range, so it
+    /// can take neither the VAL cache nor the routed `default:` arm.
+    /// `SDEL`, the monitor-deadband seconds, is the other override: `get_units`
+    /// (`:410-417`) answers it with a literal `"s"` and `get_precision`
+    /// (`:419-437`) with `histogramSDELprecision` (`= 2`, `:88`). The precision
+    /// switch's other cases (`ULIM`/`LLIM`/`SGNL`/`SVAL`/`WDTH`) serve
+    /// `prec->prec`, which is the PREC arm the shared route already applies —
+    /// `SDEL` is the one case that escapes it.
+    fn field_metadata_override(&self, field: &str) -> Option<FieldMetadataOverride> {
+        if field.eq_ignore_ascii_case("WDTH") {
+            return Some(FieldMetadataOverride {
+                ctrl_limits: Some((self.ulim - self.llim, 0.0)),
+                disp_limits: Some((self.ulim - self.llim, 0.0)),
+                ..Default::default()
+            });
+        }
+        field
+            .eq_ignore_ascii_case("SDEL")
+            .then(|| FieldMetadataOverride {
+                units: Some("s".into()),
+                precision: Some(HISTOGRAM_SDEL_PRECISION),
+                ..Default::default()
+            })
     }
 
     /// C `histogramRecord.c::process` NEVER clears UDF. The record's only two

@@ -63,6 +63,17 @@ pub struct Deviation {
     /// Boundary classes (from `cases.rs`) this deviation is limited to.
     #[serde(default)]
     pub classes: Vec<String>,
+    /// Content constraint for a coarse-blob surface (the PVA `value_marking`
+    /// surface is one whole `pvxget` rendering per channel, not a per-leaf
+    /// difference). When non-empty, the deviation matches ONLY if the port's
+    /// side adds one or more leaf lines whose path is listed here and the two
+    /// renderings are otherwise identical — no line removed, no other line
+    /// changed. This keeps a row that justifies "the port serves a leaf pvxs
+    /// omits" (e.g. CBUG-G1's `display.precision`) from laundering any other
+    /// marking difference on the same channel. Empty => no content constraint,
+    /// the surface+scope match alone decides (the CA behaviour).
+    #[serde(default)]
+    pub port_adds_leaves: Vec<String>,
     /// A REPRODUCED entry is carried in the file for traceability but must NOT
     /// match anything: the port reproduces C, so the oracle must see agreement.
     /// If it ever fires, that is itself a finding.
@@ -135,6 +146,56 @@ impl Allowlist {
             fired: BTreeSet::new(),
             exercised: BTreeSet::new(),
         })
+    }
+
+    /// An allowlist with no rows — for tests and for phases that adjudicate
+    /// without loading the shipped file. Every difference is then unjustified,
+    /// i.e. a DEFECT, exactly as before any allowlist existed.
+    pub fn empty() -> Self {
+        Self {
+            rows: Vec::new(),
+            fired: BTreeSet::new(),
+            exercised: BTreeSet::new(),
+        }
+    }
+
+    /// PVA analogue of [`Self::note_compared`]: mark rows exercised whose scope
+    /// this case observed, keyed on PVA surface **name** strings rather than the
+    /// CA [`Surface`] enum. Same honesty contract — a row is exercised only if a
+    /// case in its scope ran and one of its surfaces was compared.
+    pub fn note_compared_pva(&mut self, ctx: &MatchContext<'_>, compared: &[&str]) {
+        let newly: Vec<String> = self
+            .rows
+            .iter()
+            .filter(|row| {
+                row.enabled
+                    && row.in_scope(ctx)
+                    && compared.iter().any(|s| row.covers_surface_str(s))
+                    && !self.exercised.contains(&row.id)
+            })
+            .map(|row| row.id.clone())
+            .collect();
+        self.exercised.extend(newly);
+    }
+
+    /// PVA analogue of [`Self::match_diff`]: find the row that justifies this
+    /// difference on a coarse-blob surface, given the full reference/observed
+    /// renderings so a row's `port_adds_leaves` content constraint can be
+    /// checked. Records that the row fired.
+    pub fn match_pva_diff(
+        &mut self,
+        ctx: &MatchContext<'_>,
+        surface: &str,
+        reference: &str,
+        observed: &str,
+    ) -> Option<String> {
+        let hit = self
+            .rows
+            .iter()
+            .find(|row| row.enabled && row.matches_pva(ctx, surface, reference, observed))
+            .map(|row| row.id.clone())?;
+        self.fired.insert(hit.clone());
+        Some(hit)
     }
 
     /// Record that a case ran and that these surfaces were compared on it —
@@ -227,7 +288,60 @@ impl Deviation {
     }
 
     fn covers_surface(&self, s: Surface) -> bool {
-        self.surface.is_empty() || self.surface.iter().any(|x| x == s.as_str())
+        self.covers_surface_str(s.as_str())
+    }
+
+    fn covers_surface_str(&self, s: &str) -> bool {
+        self.surface.is_empty() || self.surface.iter().any(|x| x == s)
+    }
+
+    /// PVA match: scope + surface, plus the coarse-blob content constraint.
+    ///
+    /// The content constraint is what makes a `value_marking` row safe: the PVA
+    /// surface is one whole `pvxget` rendering per channel, so a bare
+    /// scope+surface match would justify *any* marking difference on the
+    /// channel. `port_adds_leaves` narrows it to exactly "the port added these
+    /// leaf lines and nothing else moved".
+    fn matches_pva(
+        &self,
+        ctx: &MatchContext<'_>,
+        surface: &str,
+        reference: &str,
+        observed: &str,
+    ) -> bool {
+        self.in_scope(ctx)
+            && self.covers_surface_str(surface)
+            && self.content_ok(reference, observed)
+    }
+
+    /// The port-adds-only content predicate.
+    ///
+    /// Both renderings are reduced to their set of non-empty trimmed lines
+    /// (order-independent — pvxs and the port emit the leaves in different
+    /// orders). The difference is justified iff every line the port added names
+    /// a leaf in `port_adds_leaves`, at least one line was added, and no line
+    /// was removed or changed. An empty `port_adds_leaves` imposes no constraint.
+    fn content_ok(&self, reference: &str, observed: &str) -> bool {
+        if self.port_adds_leaves.is_empty() {
+            return true;
+        }
+        let lines = |s: &str| -> BTreeSet<String> {
+            s.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_string)
+                .collect()
+        };
+        let refl = lines(reference);
+        let obsl = lines(observed);
+        let added: Vec<&String> = obsl.difference(&refl).collect();
+        let removed = refl.difference(&obsl).count();
+        removed == 0
+            && !added.is_empty()
+            && added.iter().all(|line| {
+                let leaf = line.split_whitespace().next().unwrap_or("");
+                self.port_adds_leaves.iter().any(|allowed| allowed == leaf)
+            })
     }
 }
 

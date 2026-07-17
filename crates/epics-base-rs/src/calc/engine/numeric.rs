@@ -101,18 +101,14 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut NumericInputs) -> Result<f64, Calc
                 }
                 CoreOp::Mod => {
                     let (a, b) = pop2(&mut stack)?;
-                    // C `calcPerform.c:161-167`:
-                    //   itop = (epicsInt32) *ptop--;
-                    //   if (itop) *ptop = (epicsInt32) *ptop % itop;
-                    //   else      *ptop = epicsNAN;
-                    // The zero divisor is C's rule and is kept. The bare
-                    // `(epicsInt32)` narrowing of both operands is NOT — see
-                    // `cast::imod` and CBUG-A2.
-                    if b.trunc() == 0.0 {
-                        stack.push(f64::NAN);
-                    } else {
-                        stack.push(imod(a, b));
-                    }
+                    // C `calcPerform.c:176-190` (fixed, `669a25697`/PR #925):
+                    //   itop = d2i(top);
+                    //   if (itop == 0)       *ptop = epicsNAN;
+                    //   else if (itop == -1) *ptop = 0;
+                    //   else                 *ptop = d2i(*ptop) % itop;
+                    // base's dialect narrowing is `d2i`; `cast::imod` owns the
+                    // -1 guard; base's zero-divisor rule is NaN. See CBUG-A2.
+                    stack.push(imod(a, b, |x| i64::from(d2i(x))).unwrap_or(f64::NAN));
                 }
                 CoreOp::Neg => {
                     let a = pop1(&mut stack)?;
@@ -281,11 +277,11 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut NumericInputs) -> Result<f64, Calc
                 }
                 CoreOp::Nint => {
                     let a = pop1(&mut stack)?;
-                    // C `calcPerform.c:290-293`:
-                    //   *ptop = (epicsInt32)(top >= 0 ? top+0.5 : top-0.5)
-                    // The `(epicsInt32)` narrowing is dropped — see `cast::nint`
-                    // and CBUG-A2.
-                    stack.push(nint(a));
+                    // C `calcPerform.c:313-317` (fixed, `669a25697`/PR #925):
+                    //   top = top >= 0 ? top+0.5 : top-0.5;
+                    //   *ptop = d2i(top);
+                    // base's dialect narrowing is `d2i`. See CBUG-A2.
+                    stack.push(nint(a, |x| i64::from(d2i(x))));
                 }
 
                 // Test functions
@@ -624,19 +620,24 @@ mod parity_tests {
         assert!(run("MIN(5,0/0)").is_nan());
     }
 
-    /// CBUG-A2 — NINT rounds and does NOT narrow. This test used to pin C's
-    /// `(epicsInt32)` cast (`calcPerform.c:292`), i.e. `i32::MIN`.
+    /// CBUG-A2 — NINT rounds, then narrows through `d2i`, tracking base's fixed
+    /// `calcPerform.c:313-317` (`669a25697`/PR #925). This used to pin the clean
+    /// no-narrow deviation (`NINT(3e9) == 3e9`); before that it pinned C's
+    /// `(epicsInt32)` cvttsd2si value (`i32::MIN`).
     #[test]
-    fn h3_nint_out_of_range_is_the_true_rounded_value() {
-        // Compiled C (x86-64) answers INT32_MIN here — `cvttsd2si`'s indefinite
-        // value for an out-of-range `(epicsInt32)` cast. The nearest integer to
-        // 3e9 is 3e9, and the stack cell is a double, so that is what we push.
-        assert_eq!(run("NINT(3000000000)"), 3_000_000_000.0);
-        assert_eq!(run("NINT(-3000000000)"), -3_000_000_000.0);
-        assert_eq!(run("NINT(2500000000.4)"), 2_500_000_000.0);
-        // NaN/Inf: C's cast answers INT32_MIN for both.
-        assert!(run("NINT(0/0)").is_nan());
-        assert_eq!(run("NINT(1/0)"), f64::INFINITY);
+    fn h3_nint_out_of_range_is_the_d2i_narrowed_value() {
+        // 3e9 is in `[2^31, 2^32)`: d2i routes it through u32 and bit 31 becomes
+        // the sign — `d2i(3000000000.5) = -1294967296`. Bit-identical to fixed C.
+        assert_eq!(run("NINT(3000000000)"), -1_294_967_296.0);
+        // Negative / `>= 2^32` / NaN / Inf are the window d2i STILL leaves
+        // undefined in C (PR #925 is a partial fix). The port mirrors its own
+        // d2i — the modular wrap every bitwise operand already uses — rather than
+        // reproducing x86 cvttsd2si; these are not C-defined values.
+        assert_eq!(run("NINT(-3000000000)"), 1_294_967_296.0);
+        assert_eq!(run("NINT(2500000000.4)"), -1_794_967_296.0);
+        // NaN/Inf round to NaN/Inf; d2i(NaN)=d2i(Inf)=0 here (UB in C).
+        assert_eq!(run("NINT(0/0)"), 0.0);
+        assert_eq!(run("NINT(1/0)"), 0.0);
     }
 
     #[test]
@@ -649,19 +650,20 @@ mod parity_tests {
         assert_eq!(run("NINT(-2147483648)"), -2_147_483_648.0);
     }
 
-    /// CBUG-A2 — MODULO truncates its operands but does not narrow them. These
-    /// two cases used to pin C's `(epicsInt32)` cast (`calcPerform.c:162-164`):
-    /// `5 % 4294967296` was `5.0` because the divisor cast to INT32_MIN.
+    /// CBUG-A2 — MODULO narrows both operands through `d2i`, tracking base's
+    /// fixed `calcPerform.c:176-190` (`669a25697`/PR #925). These used to pin the
+    /// clean no-narrow deviation.
     #[test]
-    fn h4_mod_out_of_range_operands_are_not_narrowed() {
-        // Divisor 2^32: C casts it to INT32_MIN and answers 5. The true
-        // remainder of 5 by 2^32 is 5 as well — same answer, different reason.
-        assert_eq!(run("5 % 4294967296"), 5.0);
-        // Dividend 3e9: C casts it to INT32_MIN and answers -2. True: 4.
-        assert_eq!(run("3000000000 % 7"), 4.0);
-        // A NaN dividend is INT32_MIN in C (and then CBUG-A1's SIGFPE vector
-        // with divisor -1); here it stays NaN.
-        assert!(run("(0/0) % 7").is_nan());
+    fn h4_mod_out_of_range_operands_are_d2i_narrowed() {
+        // Divisor 2^32: d2i(2^32) = 0, so the divisor narrows to zero and base's
+        // rule makes it NaN (the clean deviation answered 5).
+        assert!(run("5 % 4294967296").is_nan());
+        // Dividend 3e9: d2i(3e9) = -1294967296, and -1294967296 % 7 == 0 (7
+        // divides it exactly). Fixed C agrees; the clean deviation answered 4.
+        assert_eq!(run("3000000000 % 7"), 0.0);
+        // NaN dividend: d2i(NaN) = 0 here (UB in C), so 0 % 7 = 0.
+        assert_eq!(run("(0/0) % 7"), 0.0);
+        // NaN divisor: d2i(NaN) = 0 narrows to a zero divisor -> NaN.
         assert!(run("7 % (0/0)").is_nan());
     }
 

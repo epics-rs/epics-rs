@@ -7,7 +7,7 @@ use std::time::Duration;
 use crate::error::{PvaError, PvaResult};
 
 use super::source::{ChannelInvalidator, ChannelSource, ChannelSourceObj, DynSource};
-use super::udp::{random_guid, run_udp_responder_v6, run_udp_responder_with_config};
+use super::udp::{random_guid, run_udp_responder_on_socket, run_udp_responder_v6};
 
 /// Runtime configuration for [`run_pva_server`].
 #[derive(Clone)]
@@ -518,7 +518,13 @@ where
 /// This is the seam the iocsh `pvxsr` command rides on: the native
 /// `PvaServer` is born here and consumed by `wait()`, so a shell command
 /// running inside the server has no other way to reach the report state.
-pub(crate) async fn run_pva_server_reporting<S, F>(
+///
+/// It is also the only way to run a server on a **kernel-assigned** port and
+/// learn the number: with `udp_port`/`tcp_port` = 0, `start()` binds and the
+/// handle reports what it got, so a caller never has to guess a port or
+/// probe-then-rebind one. `epics-oracle-rs`'s differential harness rides this
+/// seam for exactly that reason.
+pub async fn run_pva_server_reporting<S, F>(
     source: Arc<S>,
     config: PvaServerConfig,
     on_started: F,
@@ -939,9 +945,24 @@ impl PvaServer {
         } else {
             bound_tcp_port
         };
-        let udp_handle = tokio::spawn(run_udp_responder_with_config(
-            dyn_source.clone(),
+        // Bind the search socket synchronously here, for the same reason the
+        // TCP listener is bound above rather than inside its task: with
+        // `udp_port = 0` the kernel picks the number, and a bind performed
+        // inside the spawned responder would publish it nowhere — `report()`,
+        // beacons, and `client_config()` would all advertise 0. Binding here
+        // and stamping the result back onto `config` keeps a single
+        // bound-port source of truth (pvxs does the same read-back at
+        // `server.cpp:426`).
+        let (udp_socket, bound_udp_port) = crate::server_native::udp::bind_udp(
             config.udp_port,
+            &udp_interfaces,
+            &config.beacon_destinations,
+        )?;
+        config.udp_port = bound_udp_port;
+        let udp_handle = tokio::spawn(run_udp_responder_on_socket(
+            udp_socket,
+            bound_udp_port,
+            dyn_source.clone(),
             advertised_tcp_port,
             guid,
             protocol,
@@ -952,7 +973,6 @@ impl PvaServer {
             config.auto_beacon,
             config.ignore_addrs.clone(),
             config.enable_ipv6_udp,
-            udp_interfaces,
         ));
         // PR #205 IPv6 Stage 2: optional companion responder bound
         // to `[::]:udp_port` that answers v6 SEARCH packets. Shares
@@ -1769,6 +1789,48 @@ mod tcp_fallback_tests {
         // kicked in (sibling test grabbed it). Both are valid; only
         // a panic would be a regression.
         assert!(report.tcp_port != 0, "must bind a real port");
+        drop(server);
+    }
+
+    /// `udp_port = 0` must report the port the kernel actually assigned.
+    ///
+    /// This is the property a caller that cannot guess a port depends on
+    /// (`epics-oracle-rs` boots its Rust PVA side this way and prints the
+    /// number for the harness to aim clients at). It is load-bearing for PVA
+    /// specifically: the search socket sets `SO_REUSEPORT`, so two servers
+    /// sharing a port bind *without any error* and then answer searches at
+    /// random — there is no failure to detect afterwards, so the port must be
+    /// read back from the bind rather than predicted. Before the bind moved
+    /// into `start()`, the responder bound inside its own task and `report()`
+    /// handed back the requested `0`.
+    #[tokio::test]
+    async fn ephemeral_udp_port_is_reported_not_left_zero() {
+        let source = Arc::new(SharedSource::new());
+        let config = PvaServerConfig {
+            tcp_port: 0,
+            udp_port: 0,
+            bind_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            interfaces: vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
+            auto_beacon: false,
+            beacon_destinations: Vec::new(),
+            ..Default::default()
+        };
+        let server = PvaServer::start(source, config).expect("server must start");
+        let report = server.report();
+        assert_ne!(
+            report.udp_port, 0,
+            "udp_port = 0 must be resolved to the kernel-assigned port and reported",
+        );
+        // The reported port must be the one actually held: nothing else may
+        // take it while the responder is alive. A plain (non-SO_REUSEPORT)
+        // bind is refused by a live pvxs/epics-rs search socket, so a
+        // successful bind here would mean the report named a port the server
+        // is not on.
+        assert!(
+            std::net::UdpSocket::bind(("127.0.0.1", report.udp_port)).is_err(),
+            "reported UDP port {} is not actually held by the server",
+            report.udp_port,
+        );
         drop(server);
     }
 

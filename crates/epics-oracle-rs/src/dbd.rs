@@ -131,6 +131,38 @@ impl FieldDef {
     pub fn is_nomod(&self) -> bool {
         self.special.as_deref() == Some("SPC_NOMOD")
     }
+
+    /// `special(SPC_DBADDR)` — **the `.dbd` does not determine this field's
+    /// type or element count.**
+    ///
+    /// `dbNameToAddr` fills the `DBADDR` from the `.dbd` and then hands it to
+    /// the record type to rewrite, gated on exactly this token
+    /// (`dbAccess.c:640-648`):
+    ///
+    /// ```text
+    /// paddr->dbr_field_type = mapDBFToDBR[dbfType];   /* what the dbd says */
+    /// if (paddr->special == SPC_DBADDR) {
+    ///     const rset *prset = dbGetRset(paddr);
+    ///     if (prset && prset->cvt_dbaddr)
+    ///         return prset->cvt_dbaddr(paddr);        /* record gets the last word */
+    /// }
+    /// ```
+    ///
+    /// `cvt_dbaddr` is C the `.dbd` does not describe, and it may contradict the
+    /// declared type outright — `mbbo`'s rewrites `DBF_ENUM` to `DBF_USHORT`
+    /// whenever the record has no state strings (`mbboRecord.c:308-311`), a
+    /// condition on a *runtime record value*, so no static reading of the `.dbd`
+    /// could predict it even in principle. It may also change only the element
+    /// count and leave the type alone: `asyn`'s makes the `DBF_CHAR` `BINP`/`BOUT`
+    /// arrays of `imax`/`omax` (`asynRecord.c:944-955`).
+    ///
+    /// So this predicate marks the fields whose declared `DBF_*` type is a
+    /// default that has been overridden by code, and any consumer deriving
+    /// client-visible behaviour from the declared type MUST decline to predict
+    /// here rather than assert the `.dbd`'s answer.
+    pub fn rewrites_dbaddr(&self) -> bool {
+        self.special.as_deref() == Some("SPC_DBADDR")
+    }
 }
 
 /// One `recordtype(name) { ... }` declaration.
@@ -460,6 +492,39 @@ recordtype(ai) {
 
         let stat = ai.field("STAT").unwrap();
         assert_eq!(stat.initial.as_deref(), Some("UDF"));
+    }
+
+    /// `SPC_DBADDR` and `SPC_NOMOD` are both `special(...)`, and they say
+    /// entirely different things — one that the field rejects writes, one that
+    /// the field's declared type is not its real type. Neither may answer for
+    /// the other.
+    #[test]
+    fn the_two_special_codes_are_told_apart() {
+        let d = Dbd::parse(
+            r#"
+recordtype(mbbo) {
+    field(VAL, DBF_ENUM) { pp(TRUE) special(SPC_DBADDR) prompt("Desired Value") }
+    field(NAME, DBF_STRING) { size(61) special(SPC_NOMOD) }
+    field(HIGH, DBF_DOUBLE) { prompt("Alarm Deadband") }
+}
+"#,
+        )
+        .unwrap();
+        let mbbo = d.record_type("mbbo").unwrap();
+
+        let val = mbbo.field("VAL").unwrap();
+        assert!(val.rewrites_dbaddr(), "mbbo.VAL is special(SPC_DBADDR)");
+        assert!(!val.is_nomod(), "SPC_DBADDR says nothing about writability");
+
+        let name = mbbo.field("NAME").unwrap();
+        assert!(name.is_nomod());
+        assert!(
+            !name.rewrites_dbaddr(),
+            "SPC_NOMOD leaves the declared type authoritative"
+        );
+
+        let high = mbbo.field("HIGH").unwrap();
+        assert!(!high.rewrites_dbaddr(), "no special() at all");
     }
 
     #[test]

@@ -824,8 +824,9 @@ fn test_replace_coerces_every_operand() {
 ///
 /// The marker is observable without a string in sight because C's two
 /// evaluators cast their integer operands at different WIDTHS. MODULO used to be
-/// the observable used here; CBUG-A2 removed MODULO's narrowing entirely, so the
-/// probe is now `<<`, which C type-branches the same way: `(long)`
+/// the observable used here; CBUG-A2 now models sCalc MODULO with a single
+/// `(long)` narrowing (the wider evaluator's path), so it can no longer probe
+/// the evaluator split — the probe is now `<<`, which C type-branches: `(long)`
 /// (`sCalcPerform.c:623-631`) in the numeric evaluator, `(int)`
 /// (`:1270-1276`) in the string one. x86-64 masks the shift count to 6 bits at
 /// 64-bit width and to 5 at 32-bit, so `1 << 40` is 2^40 in one evaluator and

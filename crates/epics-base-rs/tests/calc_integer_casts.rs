@@ -1,32 +1,32 @@
 //! R8-5 — every calc dialect's integer operators cast their `double` operands
 //! the way THAT dialect's C does, and the three do not agree.
 //!
-//! | dialect | bit / shift | MODULO |
-//! |---|---|---|
-//! | base `calcPerform.c` | `d2i`/`d2ui` macros (:324-325) | plain `(epicsInt32)` (:162-164), NaN on a zero divisor |
-//! | sCalc `sCalcPerform.c` | plain `(long)` (:578-631) | `(int)` no-string (:562) / `(long)` string (:1109), `return -1` on a zero divisor |
-//! | aCalc `aCalcPerform.c` | plain `(int)` (:1355-1357) | plain `(int)` (:650), `myMAXFLOAT` on a zero divisor |
+//! | dialect | bit / shift | MODULO | NINT |
+//! |---|---|---|---|
+//! | base `calcPerform.c` | `d2i`/`d2ui` (:324-325) | `d2i` (:176-190) since `669a25697`/PR #925 — NaN on zero | `d2i` (:313-317) |
+//! | sCalc `sCalcPerform.c` | plain `(long)` (:578-631) | `(long)` (:1121) — error on zero | `(long)` (:730) |
+//! | aCalc `aCalcPerform.c` | plain `(int)` (:1355-1357) | `(int)` (:661,:685,:711) — myMAXFLOAT on zero | `(long)` (:839,:1096) |
 //!
-//! The port ran base's `d2i` in all three, so every operand ≥ 2^31 came out
-//! wrong in every engine: `d2i` reinterprets a non-negative double through
-//! `epicsUInt32` (3e9 → -1294967296), which is what base wants for a BITWISE
-//! operand and is not a C cast at all.
+//! **CBUG-A2 — each engine narrows MODULO and NINT with its OWN dialect's cast**,
+//! mirroring that engine's pristine/fixed C. They genuinely disagree because the
+//! C widths do: `3e9` is `d2i(3e9) = -1294967296` in base, `(long)3e9 = 3e9` in
+//! sCalc, and (for MODULO) `(int)3e9` out-of-range in aCalc. So `3e9 % 7` is `0`
+//! (base), `4` (sCalc), `1` (aCalc — its `(int)` saturates to i32::MAX under
+//! CBUG-E2, then `% 7`). The structure is a single `cast::nint`/`cast::imod`
+//! parameterised by the narrowing fn — one logic, per-engine narrowing.
 //!
-//! **The BITWISE half of that table is still C's and is pinned here. The MODULO
-//! column is NOT — CBUG-A2.** C's MODULO (and NINT) narrows its operands with a
-//! bare cast that is undefined out of range, so `3e9 % 7` is `-2` on a C IOC
-//! (`INT_MIN % 7`) and would be something else on another CPU. The port
-//! truncates the operands and takes the remainder without narrowing, so `3e9 %
-//! 7` is `4` — the true remainder — in all three dialects, and NINT rounds
-//! without narrowing. The C answers are named beside each case below.
+//! Note aCalc is internally inconsistent: NINT is `(long)` (64-bit) but MODULO
+//! is `(int)` (32-bit) — verified in aCalcPerform.c. base is the only engine on
+//! `d2i`, because PR #925 is a base-only commit; sCalc/aCalc keep their pristine
+//! synApps `(long)`/`(int)`, which the differential oracle also runs.
 //!
-//! Every expected C value below was verified by compiling the same C expression
-//! with gcc -O2 on x86-64, the platform an EPICS IOC is built for:
+//! d2i and the plain casts alike stay UNDEFINED in C outside their range
+//! (negatives, `>= 2^32`, NaN); on those the port mirrors its own cast owner
+//! (base d2i's modular wrap, sCalc/aCalc's saturating `c_long`/`c_int`), never
+//! reproducing x86 `cvttsd2si`. Those values carry no claim of C-correctness.
 //!
-//! ```text
-//! (epicsInt32)3e9 % 7  = -2      (long)3e9 % 7 = 4      (epicsInt32)3e9 = -2147483648
-//! (epicsInt32)4294967296.0 = -2147483648    5 % that = 5
-//! ```
+//! This test used to pin the earlier clean no-narrow deviation (`3e9 % 7 == 4`,
+//! `NINT(3e9) == 3e9` in every dialect).
 
 use epics_base_rs::calc::{ArrayInputs, NumericInputs, StringInputs, acalc, calc, scalc};
 
@@ -59,41 +59,37 @@ fn a(expr: &str, a0: f64) -> f64 {
     }
 }
 
-/// CBUG-A2 — `A % 7` with `A = 3e9` is the TRUE remainder, `4`, in every
-/// dialect. This test used to pin C's answers, which were:
-/// * base — `(epicsInt32)3e9` overflows → x86-64 gives INT32_MIN → `-2`
-/// * sCalc — no string op, so C's no-string evaluator casts `(int)` → `-2`
-///   (its string evaluator casts `(long)` and answers `4`, on the same input)
-/// * aCalc — `(int)` → `-2`
+/// CBUG-A2 — `A % 7` with `A = 3e9` narrows through EACH dialect's own cast, and
+/// the three genuinely disagree because their C widths do:
+/// * base — `d2i(3e9) = -1294967296`, `% 7 == 0` (fixed `calcPerform.c`, PR #925)
+/// * sCalc — `(long)3e9 = 3000000000`, `% 7 == 4` (64-bit, no loss)
+/// * aCalc — `(int)3e9` is out of int32 range, so the port's saturating cast
+///   (CBUG-E2) gives `i32::MAX = 2147483647`, `% 7 == 1`
 ///
-/// The port truncates the operands and takes the f64 remainder, which IS C's
-/// truncated integer remainder for every operand pair the cast could represent,
-/// and stays correct past it.
+/// Each equals its own pristine/fixed C. This used to pin the clean no-narrow
+/// deviation (`4` everywhere).
 #[test]
-fn modulo_of_a_value_above_2_31_is_the_true_remainder() {
-    assert_eq!(n("A%7", 3e9), 4.0); // C: -2
-    assert_eq!(s("A%7", 3e9), 4.0); // C: -2
-    assert_eq!(a("A%7", 3e9), 4.0); // C: -2
+fn modulo_above_2_31_mirrors_each_dialect_width() {
+    assert_eq!(n("A%7", 3e9), 0.0); // base d2i
+    assert_eq!(s("A%7", 3e9), 4.0); // sCalc (long)
+    assert_eq!(a("A%7", 3e9), 1.0); // aCalc (int), saturating (CBUG-E2)
 }
 
-/// CBUG-A2, the second face of it. sCalc's C picks its evaluator from the
-/// compiled `USES_STRING` marker (`sCalcPostfix.c:447-475`,
-/// `sCalcPerform.c:399`) and the two evaluators cast MODULO at different widths
-/// — `(int)` vs `(long)` — so in C the SAME arithmetic answers differently
-/// depending on whether an unrelated string opcode appears anywhere in the
-/// expression (`A%7` → `-2`, `A%7+LEN('')` → `4`).
-///
-/// The port narrows neither, so the marker no longer perturbs the arithmetic:
-/// both are `4`. This test used to pin the split.
+/// sCalc's C picks its evaluator from the `USES_STRING` marker
+/// (`sCalcPostfix.c:447-475`) and its two evaluators cast MODULO at different
+/// widths — `(int)` no-string (`sCalcPerform.c:574`) vs `(long)` string
+/// (`:1121`). The port models the wider `(long)` path uniformly, so the marker
+/// no longer perturbs the arithmetic: both are `4`. This test used to pin the
+/// split.
 #[test]
 fn scalc_modulo_no_longer_depends_on_the_uses_string_marker() {
-    assert_eq!(s("A%7", 3e9), 4.0, "C's no-string (int) evaluator says -2");
-    // LEN("") is in C's USES_STRING opcode list, so the whole program switches
-    // to C's string evaluator; the arithmetic is otherwise identical.
+    assert_eq!(s("A%7", 3e9), 4.0, "(long)3e9 % 7, no-string program");
+    // LEN("") is in C's USES_STRING opcode list, so C's string evaluator would
+    // run; the port's single `(long)` path is width-independent.
     assert_eq!(
         s("A%7+LEN('')", 3e9),
         4.0,
-        "C's string (long) evaluator agrees"
+        "same (long) narrowing, string program"
     );
 }
 
@@ -116,17 +112,17 @@ fn zero_divisor_disposition_is_per_dialect() {
     assert_eq!(a("A%0", 5.0), 1e35f32 as f64);
 }
 
-/// A denominator larger than the cast's range is NOT zero, and never was: every
-/// candidate rule for the out-of-range cast — C-on-x86's INT32_MIN, CBUG-E2's
-/// saturating INT32_MAX, or not narrowing at all — leaves a divisor whose
-/// magnitude exceeds 5, so `5 % divisor == 5` in all of them. Neither CBUG-A2
-/// nor CBUG-E2 moves this. The case is kept because pinning NaN here (the
-/// pre-R8-5 wrap model, where 2^32 truncated to 0) would be wrong under every
-/// one of those rules.
+/// In the BASE (numeric) engine a divisor of exactly 2^32 is the UB boundary:
+/// `d2i` is defined only for `[2^31, 2^32)`, and `2^32` is one past it. The
+/// port's `d2i` wraps modulo 2^32, so `d2i(2^32) = 0` — a zero divisor — and
+/// base's rule makes it NaN. This is NOT a C-defined value; it is the port
+/// mirroring its own d2i on a still-UB input. sCalc's `(long)` and aCalc's
+/// `(int)` do NOT wrap here — this boundary is base-specific. Under the earlier
+/// clean no-narrow deviation this answered `5`.
 #[test]
-fn a_denominator_past_the_cast_range_is_not_a_zero_divisor() {
-    assert_eq!(nc("5 % 4294967296"), 5.0);
-    assert_eq!(n("A % 4294967296", 5.0), 5.0);
+fn base_divisor_at_the_2_32_boundary_narrows_to_zero() {
+    assert!(nc("5 % 4294967296").is_nan());
+    assert!(n("A % 4294967296", 5.0).is_nan());
 }
 
 /// Base's bitwise ops REALLY do use `d2i` — this must not change. It is the
@@ -156,21 +152,26 @@ fn acalc_bitwise_is_a_plain_int_cast() {
     assert_eq!(a("A|0", 3e9), i32::MAX as f64);
 }
 
-/// CBUG-A2 — NINT rounds and does not narrow, in every dialect. C narrows at
-/// each dialect's own width — base `(epicsInt32)` (`calcPerform.c:292`),
-/// sCalc/aCalc `(long)` (`sCalcPerform.c:718`, `aCalcPerform.c:1085`) — so on a
-/// C IOC `NINT(3e9)` is `-2147483648` in base and `3e9` in the other two, purely
-/// because of the cast width. This test used to pin that split.
+/// CBUG-A2 — NINT rounds, then narrows with EACH dialect's own cast:
+/// * base — `d2i` (fixed `calcPerform.c:316`, PR #925): `NINT(3e9) = -1294967296`
+/// * sCalc — `(long)` (`sCalcPerform.c:730`): `NINT(3e9) = 3e9` (64-bit, no loss)
+/// * aCalc — `(long)` (`aCalcPerform.c:839,1096`): `NINT(3e9) = 3e9` — aCalc
+///   narrows NINT at 64-bit even though its MODULO is 32-bit `(int)` (an internal
+///   synApps inconsistency)
+///
+/// This used to pin the clean no-narrow deviation (`3e9` in every dialect); note
+/// sCalc/aCalc happen to still be `3e9` because `(long)` does not lose 3e9.
 #[test]
-fn nint_does_not_narrow_in_any_dialect() {
-    assert_eq!(n("NINT(A)", 3e9), 3e9); // C base: i32::MIN
-    assert_eq!(s("NINT(A)", 3e9), 3e9);
-    assert_eq!(a("NINT(A)", 3e9), 3e9);
+fn nint_mirrors_each_dialect_width() {
+    assert_eq!(n("NINT(A)", 3e9), -1_294_967_296.0); // base d2i
+    assert_eq!(s("NINT(A)", 3e9), 3e9); // sCalc (long)
+    assert_eq!(a("NINT(A)", 3e9), 3e9); // aCalc (long)
 
-    // Past int64 too, where all three C dialects give their indefinite value.
-    assert_eq!(n("NINT(A)", 1e300), 1e300);
-    assert_eq!(s("NINT(A)", 1e300), 1e300);
-    assert_eq!(a("NINT(A)", 1e300), 1e300);
+    // Past each width's range: base d2i wraps 1e300 (a multiple of 2^32) to 0;
+    // sCalc/aCalc `(long)` saturate to i64::MAX (CBUG-E2). Not C-defined values.
+    assert_eq!(n("NINT(A)", 1e300), 0.0);
+    assert_eq!(s("NINT(A)", 1e300), i64::MAX as f64);
+    assert_eq!(a("NINT(A)", 1e300), i64::MAX as f64);
 
     // In range, all three agree and round half away from zero — same as C.
     for expr_val in [(2.5, 3.0), (-2.5, -3.0), (2.4, 2.0)] {

@@ -74,6 +74,27 @@ fn link_dbf_to_field_type(t: LinkDbfType) -> DbFieldType {
     }
 }
 
+/// Inverse of [`link_dbf_to_field_type`]: a local DB link's target field type
+/// expressed as the link-set DBF code. C `dbDbGetDBFtype` reports the target's
+/// `dbChannelFinalFieldType` verbatim (`dbDbLink.c:151-155`), so this is a
+/// straight relabelling, not a conversion.
+fn field_type_to_link_dbf(t: DbFieldType) -> LinkDbfType {
+    match t {
+        DbFieldType::Char => LinkDbfType::Char,
+        DbFieldType::UChar => LinkDbfType::UChar,
+        DbFieldType::Short => LinkDbfType::Short,
+        DbFieldType::UShort => LinkDbfType::UShort,
+        DbFieldType::Long => LinkDbfType::Long,
+        DbFieldType::ULong => LinkDbfType::ULong,
+        DbFieldType::Int64 => LinkDbfType::Int64,
+        DbFieldType::UInt64 => LinkDbfType::UInt64,
+        DbFieldType::Float => LinkDbfType::Float,
+        DbFieldType::Double => LinkDbfType::Double,
+        DbFieldType::String => LinkDbfType::String,
+        DbFieldType::Enum => LinkDbfType::Enum,
+    }
+}
+
 /// dfanout output-link fields, index-aligned with `MultiOut::Dfanout`
 /// (`dfanoutRecord.c:39` — OUTA..OUTP). Named so a failed OUTn put can
 /// report WHICH link failed in the record's AMSG, as C `setLinkAlarm` does.
@@ -1005,6 +1026,242 @@ impl PvDatabase {
         };
         let lset = self.inner.link_sets.read().await.get(scheme)?;
         lset.link_metadata(body).await
+    }
+
+    /// C `dbGetControlLimits` / `dbGetGraphicLimits` / `dbGetAlarmLimits` /
+    /// `dbGetPrecision` / `dbGetUnits` (`dbLink.c:344-393`) — the five
+    /// metadata slots a record fetches THROUGH one of its links.
+    ///
+    /// The single owner of "what does this link say about display/control/
+    /// alarm limits, units and precision". Record support (the routing
+    /// layer) calls this from its `get_graphic_double` / `get_control_double`
+    /// / `get_alarm_double` / `get_units` / `get_precision` implementations
+    /// for the link-backed fields — calc/calcout/sub/aSub INPA..INPU,
+    /// aSub OUTA.., seq DOn (`calcRecord.c:223-230`, `aSubRecord.c:356-369`,
+    /// `subRecord.c:260-266`, `seqRecord.c:332-336`).
+    ///
+    /// # Return contract — this is C's status, not a convenience `Option`
+    ///
+    /// Each of C's five `dbGet*` entry points writes the caller's buffer
+    /// ONLY on a zero return; every caller listed above ignores the status
+    /// and keeps whatever the buffer already held. The two levels of
+    /// `Option` here encode exactly that:
+    ///
+    /// * `None` — C returned non-zero (`S_db_noLSET` / `S_dbLib_badLink`).
+    ///   The caller MUST leave its buffer untouched.
+    /// * `Some(meta)` — C returned 0. Each `Some` field is a value C wrote;
+    ///   a `None` field is a slot this link cannot report.
+    ///
+    /// # Per-link-class behaviour, from the C lset tables
+    ///
+    /// * **Constant link** — `None`, always. `dbConst_lset`
+    ///   (`dbConstLink.c:234-248`) leaves all five slots `NULL`, so the
+    ///   `!plset->getGraphicLimits` test in `dbGetGraphicLimits`
+    ///   (`dbLink.c:358-359`) short-circuits to `S_db_noLSET` and NOTHING is
+    ///   written. This is the case for the oracle's `field(INPA,"5")`
+    ///   records: C's answer is *not* a propagated limit and *not* a
+    ///   DBF-type-range default — the record's buffer keeps the seed it held
+    ///   before the fetch (see the routing contract below). Measured: a
+    ///   `calc` `field(INPA,"5")` serves display limits `0/0`.
+    /// * **DB link** — `Some(meta)` from the target field, via
+    ///   [`Self::db_link_metadata`].
+    /// * **CA/PVA link** — delegated to the registered lset
+    ///   ([`Self::external_link_metadata`]); C installs `dbCa`/`pvalink`'s
+    ///   own lset for these, not `dbDb_lset`.
+    /// * **Everything else** (unset link, hardware link) — `None`. C leaves
+    ///   `plink->lset` NULL for these, so `dbLink.c:358` returns
+    ///   `S_db_noLSET`.
+    ///
+    /// `visited` is the caller's chain state and carries C's
+    /// `DBLINK_FLAG_VISITED` recursion guard — see
+    /// [`Self::db_link_metadata`].
+    ///
+    /// # Contract for the routing layer
+    ///
+    /// This method reports what the LINK says. It does not know what the
+    /// calling record should do with a `None`, because C's answer to that is
+    /// per-slot and not uniform. Record support must seed its buffer, call
+    /// this, and overwrite only on `Some` — the seed IS the answer whenever
+    /// the fetch reports nothing. C's seeds, and the four slots that route
+    /// through a link at all:
+    ///
+    /// | rset slot | seed before the fetch | C site |
+    /// |---|---|---|
+    /// | `get_graphic_double` | `(0.0, 0.0)` | `dbAccess.c:216` |
+    /// | `get_alarm_double` | `NaN×4` | `dbAccess.c:290` |
+    /// | `get_units` | `""` (NOT the record's `EGU`) | `dbAccess.c:378` |
+    /// | `get_precision` | the record's own `PREC` | `calcRecord.c:191` |
+    /// | `get_control_double` | **never fetched — see below** | |
+    ///
+    /// Two of those seeds are counter-intuitive and are measured facts, not
+    /// deductions (softIoc + `caget -d DBR_CTRL_DOUBLE`, EPICS 7 base): on a
+    /// `calc` with `field(INPA,"5") field(PREC,"7") field(EGU,"volts")`, C
+    /// serves `INPA` with **precision 7** (the record's own `PREC` survives,
+    /// because `get_precision` seeds `*pprecision = prec->prec` *before* the
+    /// fetch and overwrites only on a zero status) but **units `""`** (the
+    /// `strncpy(units, prec->egu)` fallback sits in the `else` arm that a
+    /// link-backed field never takes — `calcRecord.c:172-181`).
+    ///
+    /// **Control limits must NOT be routed through a link.** `dbDbLink.c:414`
+    /// really does install `dbDbGetControlLimits`, and `dbGetControlLimits` is
+    /// public API (`dbLink.h:436`) — so this method reports it — but NOTHING
+    /// in EPICS base calls it. Every record instead sends its link-backed
+    /// fields to `recGblGetControlDouble` (`calcRecord.c:251`,
+    /// `subRecord.c`, `calcoutRecord.c`, `aSubRecord.c:376`), i.e. to
+    /// `getMaxRangeValues` — which is why C serves a `calc` `INPA` with
+    /// `±1e300` control limits (measured) regardless of what the link points
+    /// at. Routing this method's `control_limits` into a record's
+    /// `get_control_double` would be a defect.
+    pub async fn link_metadata(
+        &self,
+        link: &crate::server::record::ParsedLink,
+        visited: &mut HashSet<String>,
+    ) -> Option<crate::server::database::LinkMetadata> {
+        use crate::server::record::ParsedLink;
+        match link {
+            ParsedLink::Db(db) => self.db_link_metadata(db, visited).await,
+            ParsedLink::Ca(_) | ParsedLink::Pva(_) | ParsedLink::PvaJson(_) => {
+                let name = link
+                    .external_pv_name()
+                    .expect("Ca/Pva/PvaJson link carries a PV name");
+                self.external_link_metadata(&name).await
+            }
+            // Constant / unset / hardware / lnkCalc: no metadata lset slots.
+            _ => None,
+        }
+    }
+
+    /// C `dbDbGetControlLimits` / `dbDbGetGraphicLimits` /
+    /// `dbDbGetAlarmLimits` / `dbDbGetPrecision` / `dbDbGetUnits`
+    /// (`dbDbLink.c:263-345`) — the `dbDb_lset` metadata slots
+    /// (`dbDbLink.c:414-415`).
+    ///
+    /// Each C slot is one `dbDbGetOptionLoopSafe(plink, DBR_DOUBLE, &buf,
+    /// DBR_<OPTION>)` (`dbDbLink.c:239-261`), i.e. a `dbGet` on the target's
+    /// `dbAddr` asking for one option. This port issues the equivalent single
+    /// [`snapshot_for_field`] — the port's `dbGet`-with-options — and reads
+    /// all five out of it. One fetch instead of five is observationally
+    /// identical: `dbGet` computes each option independently from the target
+    /// record's own rset slots.
+    ///
+    /// # The recursion guard is load-bearing
+    ///
+    /// C flags the link `DBLINK_FLAG_VISITED` across the inner `dbGet` and
+    /// clears it after (`dbDbLink.c:248-258`), because — in its own words
+    /// (`dbDbLink.c:236-238`) — "Some records get options (precsision,
+    /// units, ...) for some fields from an input link. We need to catch the
+    /// case that this link points back to the same field or we will end in
+    /// an infinite recursion." A re-entered link leaves `status` at its
+    /// `S_dbLib_badLink` initialiser (`dbDbLink.c:246`) and writes nothing.
+    ///
+    /// The port cannot hang a flag on the link: [`ParsedLink`] is a cloned
+    /// value, not C's stable `struct link *`. The guard therefore rides in
+    /// the caller's `visited` set, keyed by link TARGET (`record.field`) —
+    /// the same substitution `process_passive_db_source` makes for C's PACT
+    /// guard, and it terminates the identical cycles: an `A.INPA -> B.VAL`,
+    /// `B.INPA -> A.VAL` pair blocks on the second visit to `B.VAL`.
+    ///
+    /// # Fallback chain when the target field has no support
+    ///
+    /// `dbGet` does NOT fail when the target's rset lacks a slot — it fills
+    /// a default, turns the option bit off, and still returns 0, so the
+    /// `dbDbGet*` wrapper reads that default out and returns 0 (writing it
+    /// to the record). Transcribed per option:
+    ///
+    /// | slot | no support on target | C site |
+    /// |---|---|---|
+    /// | graphic limits | `(0.0, 0.0)` — `memset` | `dbAccess.c:241-242` |
+    /// | control limits | `(0.0, 0.0)` — `memset` | `dbAccess.c:281-283` |
+    /// | alarm limits | `NaN×4` — pre-filled initialiser, assigned unconditionally | `dbAccess.c:290,317-330` |
+    /// | precision | `0` — `memset`, also when the field is not FLOAT/DOUBLE | `dbAccess.c:387-395` |
+    /// | units | `""` — `memset` | `dbAccess.c:377-386` |
+    ///
+    /// Note graphic/control zero but alarm is NaN: `get_alarm` seeds
+    /// `{epicsNAN,...}` and assigns the buffer whether or not the slot ran,
+    /// whereas `get_graphics`/`get_control` `memset` the buffer in their
+    /// no-data arm. The port's [`Snapshot`] accessors already return `None`
+    /// for exactly "record type has no such rset slot", so each default is a
+    /// single `unwrap_or` below.
+    ///
+    /// This is why the link layer never reaches `getMaxRangeValues`: C's
+    /// DBF-type-range default is produced by the TARGET record's own
+    /// `get_graphic_double` calling `recGblGetGraphicDouble`
+    /// (`recGbl.c:146-153`), which is inside `snapshot_for_field` — it comes
+    /// back through the "has support" arm, already applied.
+    ///
+    /// [`snapshot_for_field`]: crate::server::record::RecordInstance::snapshot_for_field
+    /// [`Snapshot`]: crate::server::snapshot::Snapshot
+    /// [`ParsedLink`]: crate::server::record::ParsedLink
+    async fn db_link_metadata(
+        &self,
+        db: &crate::server::record::DbLink,
+        visited: &mut HashSet<String>,
+    ) -> Option<crate::server::database::LinkMetadata> {
+        let key = format!("{}.{}", db.record, db.field);
+        // C `if (!(mutable_plink->flags & DBLINK_FLAG_VISITED))`
+        // (`dbDbLink.c:253`): a re-entered link returns the `S_dbLib_badLink`
+        // initialiser without touching the buffer.
+        if !visited.insert(key.clone()) {
+            return None;
+        }
+        let meta = self.db_target_metadata(db).await;
+        // C `mutable_plink->flags &= ~DBLINK_FLAG_VISITED` (`dbDbLink.c:257`)
+        // — the guard spans only the inner fetch, so a diamond (two distinct
+        // links onto one target) still reports metadata on both.
+        visited.remove(&key);
+        meta
+    }
+
+    /// The target-side half of [`Self::db_link_metadata`], with C
+    /// `dbInitLink`'s locality dispatch (`dbLink.c:118-130`): a target that
+    /// is not in this IOC never gets `dbDb_lset` at all — it is made a CA
+    /// link, so its metadata comes from the `dbCa` lset. Mirrors the same
+    /// split [`Self::read_target_value`] makes for the value path.
+    async fn db_target_metadata(
+        &self,
+        db: &crate::server::record::DbLink,
+    ) -> Option<crate::server::database::LinkMetadata> {
+        if !self.has_name_no_resolve(&db.record).await {
+            let pv = if db.field == "VAL" {
+                db.record.clone()
+            } else {
+                format!("{}.{}", db.record, db.field)
+            };
+            return self.external_link_metadata(&pv).await;
+        }
+        let record = self.get_record(&db.record).await?;
+        // C `dbGet(paddr, DBR_DOUBLE, &buffer, &option, ...)` under the
+        // target's lock (`dbDbLink.c:252-256` between `dbScanLock` /
+        // `dbScanUnlock`). A field the target does not have is C's
+        // `dbNameToAddr` failure at link-init time, i.e. no lset — `None`.
+        let snapshot = record.read().await.snapshot_for_field(&db.field)?;
+        Some(crate::server::database::LinkMetadata {
+            // `dbDbGetDBFtype` = `dbChannelFinalFieldType` (`dbDbLink.c:151-155`)
+            // and `dbDbGetElements` = `dbChannelFinalElements`
+            // (`dbDbLink.c:157-162`). A local DB link is always connected
+            // (`dbDbIsConnected` returns TRUE unconditionally,
+            // `dbDbLink.c:146-149`), so these are never `None` here.
+            dbf_type: Some(field_type_to_link_dbf(snapshot.value.db_field_type())),
+            element_count: Some(snapshot.value.count() as i64),
+            graphic_limits: Some(snapshot.graphic_limits().unwrap_or((0.0, 0.0))),
+            control_limits: Some(snapshot.control_limits().unwrap_or((0.0, 0.0))),
+            alarm_limits: Some(snapshot.alarm_limits().unwrap_or((
+                f64::NAN,
+                f64::NAN,
+                f64::NAN,
+                f64::NAN,
+            ))),
+            precision: Some(snapshot.precision().unwrap_or(0)),
+            units: Some(
+                snapshot
+                    .units()
+                    .map(|u| u.as_str_lossy().into_owned())
+                    .unwrap_or_default(),
+            ),
+            // `display.description` has no C lset slot — it is a pvxs-only
+            // pvalink extra (`LinkMetadata::description`).
+            description: None,
+        })
     }
 
     /// C `dbGetLink` PP rule: if a DB input link is `ProcessPassive`
@@ -3186,6 +3443,200 @@ mod nonlocal_db_link_read_tests {
             v,
             Some(EpicsValue::Double(7.0)),
             "a local Db link must read the local DB, not the external resolver"
+        );
+    }
+}
+
+/// C's link-side metadata fetch — `dbGetGraphicLimits` & siblings
+/// (`dbLink.c:344-393`) — one case per boundary the C code distinguishes,
+/// not one per narrative.
+#[cfg(test)]
+mod link_metadata_tests {
+    use crate::server::database::PvDatabase;
+    use crate::server::record::parse_link_v2;
+    use crate::server::records::ai::AiRecord;
+    use crate::server::records::stringout::StringoutRecord;
+    use crate::server::records::waveform::WaveformRecord;
+    use crate::types::DbFieldType;
+    use std::collections::HashSet;
+
+    /// BOUNDARY: constant link.
+    ///
+    /// `dbConst_lset` leaves all five metadata slots NULL
+    /// (`dbConstLink.c:234-248`), so `dbGetGraphicLimits`'s
+    /// `!plset->getGraphicLimits` test returns `S_db_noLSET` and writes
+    /// NOTHING (`dbLink.c:358-359`).
+    ///
+    /// This is the case that decides the oracle's `field(INPA,"5")` records:
+    /// C's answer is neither a propagated limit nor a DBF-type-range default.
+    /// The caller keeps its pre-filled buffer.
+    #[tokio::test]
+    async fn constant_link_reports_no_metadata() {
+        let db = PvDatabase::new();
+        let mut visited = HashSet::new();
+        let link = parse_link_v2("5");
+        assert!(
+            matches!(link, crate::server::record::ParsedLink::Constant(_)),
+            "fixture must actually be a constant link, got {link:?}"
+        );
+        assert_eq!(
+            db.link_metadata(&link, &mut visited).await,
+            None,
+            "a constant link has no metadata lset slots: C returns S_db_noLSET"
+        );
+    }
+
+    /// BOUNDARY: db link -> field whose record type HAS the slots.
+    ///
+    /// `ai` supplies every numeric slot, and `aiRecord.c::get_graphic_double`
+    /// serves VAL from `prec->hopr`/`prec->lopr`. `dbDbGetGraphicLimits`
+    /// returns those verbatim (`dbDbLink.c:280-295`).
+    #[tokio::test]
+    async fn db_link_to_supported_field_propagates_target_limits() {
+        let db = PvDatabase::new();
+        let mut src = AiRecord::new(1.0);
+        src.hopr = 10.0;
+        src.lopr = -10.0;
+        src.egu = "mm".into();
+        src.prec = 3;
+        db.add_record("SRC", Box::new(src)).await.unwrap();
+
+        let mut visited = HashSet::new();
+        let meta = db
+            .link_metadata(&parse_link_v2("SRC"), &mut visited)
+            .await
+            .expect("a local db link to an existing field reports metadata");
+
+        assert_eq!(meta.graphic_limits, Some((-10.0, 10.0)));
+        assert_eq!(meta.units.as_deref(), Some("mm"));
+        assert_eq!(meta.precision, Some(3));
+    }
+
+    /// BOUNDARY: db link -> field whose record type has NO slots at all.
+    ///
+    /// `dbGet` does not fail here — it fills a default, turns the option bit
+    /// off, and returns 0, so `dbDbGet*` reads the default out and reports it.
+    /// `stringout` `#define`s every `get_*` NULL (`stringoutRecord.c:64-83`).
+    ///
+    /// The defaults are NOT uniform, which is the whole point of this case:
+    /// `get_graphics`/`get_control` `memset` to zero (`dbAccess.c:241-242`,
+    /// `:281-283`) while `get_alarm` seeds `{epicsNAN×4}` and assigns
+    /// unconditionally (`dbAccess.c:290,317-330`).
+    #[tokio::test]
+    async fn db_link_to_unsupported_field_yields_c_defaults_not_none() {
+        let db = PvDatabase::new();
+        db.add_record("STR", Box::new(StringoutRecord::new("hello")))
+            .await
+            .unwrap();
+
+        let mut visited = HashSet::new();
+        let meta = db
+            .link_metadata(&parse_link_v2("STR"), &mut visited)
+            .await
+            .expect("dbGet returns 0 even when every option is turned off");
+
+        assert_eq!(
+            meta.graphic_limits,
+            Some((0.0, 0.0)),
+            "no get_graphic_double: C memsets the buffer to zero and returns 0"
+        );
+        assert_eq!(
+            meta.control_limits,
+            Some((0.0, 0.0)),
+            "no get_control_double: C memsets the buffer to zero and returns 0"
+        );
+        let (lolo, low, high, hihi) = meta.alarm_limits.expect("alarm limits are written");
+        assert!(
+            lolo.is_nan() && low.is_nan() && high.is_nan() && hihi.is_nan(),
+            "no get_alarm_double: C's pre-filled epicsNAN survives, NOT zero \
+             (dbAccess.c:290) — got ({lolo}, {low}, {high}, {hihi})"
+        );
+        assert_eq!(meta.precision, Some(0), "no get_precision: C memsets to 0");
+        assert_eq!(
+            meta.units.as_deref(),
+            Some(""),
+            "no get_units: C memsets the units buffer"
+        );
+    }
+
+    /// BOUNDARY: db link -> record type that has SOME slots but not
+    /// `get_alarm_double` (`waveformRecord.c` `#define get_alarm_double NULL`).
+    ///
+    /// Pins that the no-support default is decided per slot, not per record:
+    /// the graphic limits still come from the target's own support while the
+    /// alarm limits fall back to NaN.
+    #[tokio::test]
+    async fn db_link_alarm_default_is_per_slot_not_per_record() {
+        let db = PvDatabase::new();
+        db.add_record("WF", Box::new(WaveformRecord::new(8, DbFieldType::Double)))
+            .await
+            .unwrap();
+
+        let mut visited = HashSet::new();
+        let meta = db
+            .link_metadata(&parse_link_v2("WF"), &mut visited)
+            .await
+            .expect("waveform reports metadata");
+
+        let (lolo, low, high, hihi) = meta.alarm_limits.expect("alarm limits are written");
+        assert!(
+            lolo.is_nan() && low.is_nan() && high.is_nan() && hihi.is_nan(),
+            "waveform NULLs get_alarm_double: NaN, not zero"
+        );
+        assert!(
+            meta.graphic_limits.is_some(),
+            "waveform keeps get_graphic_double, so that slot is still served"
+        );
+    }
+
+    /// BOUNDARY: the link points back at a field already on this fetch chain.
+    ///
+    /// C's `DBLINK_FLAG_VISITED` guard: a re-entered link leaves `status` at
+    /// its `S_dbLib_badLink` initialiser and writes nothing
+    /// (`dbDbLink.c:239-261`) — without it, a record that sources its own
+    /// metadata from an input link pointing back at itself recurses forever.
+    #[tokio::test]
+    async fn revisited_db_link_target_is_refused() {
+        let db = PvDatabase::new();
+        db.add_record("SRC", Box::new(AiRecord::new(1.0)))
+            .await
+            .unwrap();
+
+        let link = parse_link_v2("SRC");
+        let mut visited = HashSet::new();
+        assert!(
+            db.link_metadata(&link, &mut visited).await.is_some(),
+            "first visit resolves"
+        );
+        assert!(
+            visited.is_empty(),
+            "the guard must be CLEARED after the fetch (C clears the flag at \
+             dbDbLink.c:257), or a diamond onto one target would fail"
+        );
+
+        // Simulate being re-entered from inside SRC.VAL's own metadata fetch.
+        visited.insert("SRC.VAL".to_string());
+        assert_eq!(
+            db.link_metadata(&link, &mut visited).await,
+            None,
+            "a link already on the chain must write nothing"
+        );
+    }
+
+    /// A db link naming a field the target record does not have has no
+    /// `dbAddr` in C — `dbNameToAddr` fails at link-init time, so no lset is
+    /// installed and `dbGetGraphicLimits` returns `S_db_noLSET`.
+    #[tokio::test]
+    async fn db_link_to_missing_field_reports_no_metadata() {
+        let db = PvDatabase::new();
+        db.add_record("SRC", Box::new(AiRecord::new(1.0)))
+            .await
+            .unwrap();
+        let mut visited = HashSet::new();
+        assert_eq!(
+            db.link_metadata(&parse_link_v2("SRC.NOSUCHFIELD"), &mut visited)
+                .await,
+            None,
         );
     }
 }

@@ -85,12 +85,19 @@ pub struct Counts {
 
 impl Counts {
     pub fn tally(cases: &[CaseResult]) -> Self {
-        let mut c = Counts {
-            ran: cases.len(),
-            ..Default::default()
-        };
-        for case in cases {
-            match case.verdict {
+        Self::tally_verdicts(cases.iter().map(|c| c.verdict))
+    }
+
+    /// Tally bare verdicts. The single owner of the bucket rule: the CA phases
+    /// reach it through [`Self::tally`] and the PVA phase
+    /// ([`crate::pvaread`]) hands its own case shape's verdicts straight in,
+    /// so "a case that could not run is ERRORED, never agreement" cannot come
+    /// to mean two different things in two counters.
+    pub fn tally_verdicts(verdicts: impl IntoIterator<Item = Verdict>) -> Self {
+        let mut c = Counts::default();
+        for v in verdicts {
+            c.ran += 1;
+            match v {
                 Verdict::Agreed => c.agreed += 1,
                 Verdict::ExpectedDeviation => c.expected_deviation += 1,
                 Verdict::Defect => c.defect += 1,

@@ -26,6 +26,12 @@ enum Phase {
     Put,
     /// Monitor event sequence and count.
     Monitor,
+    /// Array put-and-readback across element-count boundaries (single, partial,
+    /// exactly NELM, one past NELM) for record types whose VAL is a bounded
+    /// array (waveform/aai/aao/subArray). Part of `All`: same C ground truth,
+    /// same CA tools, same allowlist — it just reaches the `DBF_NOACCESS` array
+    /// VAL the scalar phases exclude.
+    Array,
     /// **PVA** read: every channel of the `.dbd` surface on pvxs QSRV2
     /// (`softIocPVX`) and on `oracle-ioc --pva`, on two contracts — the
     /// declared type (`pvxinfo`) and the value+marking (`pvxget`).
@@ -157,6 +163,9 @@ async fn run() -> Result<ExitCode, String> {
         }
         if matches!(args.phase, Phase::Monitor | Phase::All) {
             cases.extend(runner.probe_monitor(rt, &surface, &mut allowlist));
+        }
+        if matches!(args.phase, Phase::Array | Phase::All) {
+            cases.extend(runner.probe_array(rt, &mut allowlist));
         }
     }
 

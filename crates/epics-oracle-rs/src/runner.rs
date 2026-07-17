@@ -40,6 +40,16 @@ use crate::surface::{Surface, is_put_candidate};
 const MONITOR_SETTLE: Duration = Duration::from_millis(600);
 const MONITOR_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Array-phase capacity. Fixed so both sides declare the identical `NELM` and
+/// the over-capacity boundary is the same element count on each. Wide enough
+/// that "partial" (`NELM/2`) is a distinct case from "single".
+const ARRAY_NELM: u32 = 16;
+const ARRAY_NELM_STR: &str = "16";
+/// Element type for the array probe. `DOUBLE` because every array-capable
+/// record type in the fat dbd (`waveform`/`aai`/`aao`/`subArray`) accepts it as
+/// `FTVL`, so one type serves the whole phase.
+const ARRAY_FTVL: &str = "DOUBLE";
+
 pub struct Runner {
     tools: CTools,
     dbd: Dbd,
@@ -309,6 +319,89 @@ impl Runner {
             allowlist,
         ))
     }
+
+    /// Phase D — the **array** probe: put-and-readback of a bounded array VAL
+    /// across the element-count boundaries that break ports (single, partial,
+    /// exactly `NELM`, one past `NELM`). C truncates an over-capacity put to
+    /// `NELM`; a port that rejects it, or writes past the end, differs
+    /// observably in the readback count and `NORD`.
+    ///
+    /// Only record types whose VAL is a bounded array — both `NELM` and `FTVL`
+    /// declared — are driven; the rest have no array to probe and yield no
+    /// cases. That array VAL is `DBF_NOACCESS` in the `.dbd` (it is the record's
+    /// raw `BPTR` pointer), so it is excluded from the scalar field denominator
+    /// and never reached by the read/put/monitor phases. This phase is the only
+    /// one that exercises it, over CA, against the same C ground truth.
+    pub fn probe_array(&self, record_type: &str, allowlist: &mut Allowlist) -> Vec<CaseResult> {
+        // Array-capable iff the record declares both a capacity (NELM) and an
+        // element type (FTVL). Determined from the .dbd, not hard-listed.
+        let is_array = self
+            .dbd
+            .record_type(record_type)
+            .is_some_and(|r| r.field("NELM").is_some() && r.field("FTVL").is_some());
+        if !is_array {
+            return Vec::new();
+        }
+
+        let plan = crate::cases::array_cases(ARRAY_NELM);
+        let rec_of = |i: usize| format!("ORACLE:ARR:{}:{i}", record_type.to_uppercase());
+        let fields = &[("NELM", ARRAY_NELM_STR), ("FTVL", ARRAY_FTVL)];
+
+        // One record per case (isolation), each declaring the same NELM/FTVL so
+        // the capacity boundary is identical on both sides.
+        let mut db_text = String::new();
+        for i in 0..plan.len() {
+            db_text.push_str(&crate::record_stmt_fields(record_type, &rec_of(i), fields));
+        }
+
+        let db = match self.write_db(&format!("arr_{record_type}"), &db_text) {
+            Ok(p) => p,
+            Err(e) => return errored_array(record_type, &plan, &db_text, &e),
+        };
+        let pair = match Pair::boot(&self.tools, &db, &rec_of(0)) {
+            Ok(p) => p,
+            Err(e) => return errored_array(record_type, &plan, &db_text, &e.to_string()),
+        };
+
+        let c = CaTools::new(&self.tools, pair.c.port(), Side::C);
+        let r = CaTools::new(&self.tools, pair.rust.port(), Side::Rust);
+
+        // Drive the array puts on both sides concurrently, then read back.
+        // Separate IOCs, separate ports, no shared state — concurrency changes
+        // nothing either observes, it only stops each waiting on the other.
+        let (obs_c, obs_r) = std::thread::scope(|s| {
+            let hc = s.spawn(|| drive_array(&c, &plan, &rec_of));
+            let hr = s.spawn(|| drive_array(&r, &plan, &rec_of));
+            (
+                hc.join().expect("C array lane panicked"),
+                hr.join().expect("Rust array lane panicked"),
+            )
+        });
+
+        plan.iter()
+            .enumerate()
+            .map(|(i, (values, class))| {
+                let rec = rec_of(i);
+                let repro = Reproducer {
+                    db: crate::record_stmt_fields(record_type, &rec, fields),
+                    ops: vec![
+                        format!("caput -a {rec} {} {}", values.len(), values.join(" ")),
+                        format!("caget -t -# {ARRAY_NELM} {rec}    # returned count + payload"),
+                        format!("caget {rec}.NORD"),
+                    ],
+                };
+                adjudicate(
+                    record_type,
+                    "VAL",
+                    Some(class),
+                    repro,
+                    &obs_c[i],
+                    &obs_r[i],
+                    allowlist,
+                )
+            })
+            .collect()
+    }
 }
 
 /// Probe `pvs` with an all-or-nothing batch tool, isolating the PVs that fail.
@@ -469,6 +562,84 @@ fn drive_puts(
             .flat_map(|h| h.join().expect("put lane panicked"))
             .collect()
     })
+}
+
+/// Drive one array put per case and read back what each side stored: the array
+/// payload (with its leading returned count), `NORD`, native shape, and alarm.
+///
+/// The array payload is the primary observable, so a failure to read it back is
+/// an ERROR for that case (recorded in `errors`), never a silently skipped
+/// surface. `NORD`/`STAT`/`SEVR` are supplementary and best-effort, matching the
+/// scalar [`readback`].
+fn drive_array(
+    t: &CaTools,
+    plan: &[(Vec<String>, &'static str)],
+    rec_of: &(impl Fn(usize) -> String + Sync),
+) -> Vec<Observation> {
+    plan.iter()
+        .enumerate()
+        .map(|(i, (values, _))| {
+            let rec = rec_of(i);
+            let put = t.caput_array(&rec, values);
+
+            // Read back the whole declared capacity so a port that stored too
+            // many or too few elements shows a different leading count and
+            // payload than C's truncate-to-NELM.
+            let mut errors = Vec::new();
+            let value_string = match t.caget_array(&rec, ARRAY_NELM) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    errors.push(e);
+                    None
+                }
+            };
+            let info = match t.cainfo(&rec) {
+                Ok(ci) => Some(ci),
+                Err(e) => {
+                    errors.push(e);
+                    None
+                }
+            };
+            Observation {
+                info,
+                value_string,
+                value_numeric: t.caget_numeric(&format!("{rec}.NORD")).ok(),
+                stat: t.caget_string(&format!("{rec}.STAT")).ok(),
+                sevr: t.caget_string(&format!("{rec}.SEVR")).ok(),
+                put: Some(put),
+                monitor: None,
+                errors,
+            }
+        })
+        .collect()
+}
+
+/// A boot failure in the array phase — one ERROR case per element-count case it
+/// prevented, never one aggregate and never silence.
+fn errored_array(
+    record_type: &str,
+    plan: &[(Vec<String>, &'static str)],
+    db: &str,
+    msg: &str,
+) -> Vec<CaseResult> {
+    plan.iter()
+        .map(|(values, class)| {
+            errored_case(
+                record_type,
+                "VAL",
+                Some(class),
+                Reproducer {
+                    db: db.to_string(),
+                    ops: vec![format!(
+                        "caput -a <rec> {} {}",
+                        values.len(),
+                        values.join(" ")
+                    )],
+                },
+                msg,
+            )
+        })
+        .collect()
 }
 
 /// Batch the post-put readback: what each side stored, and what alarm it raised.

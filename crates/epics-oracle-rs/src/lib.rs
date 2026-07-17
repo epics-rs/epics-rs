@@ -94,8 +94,9 @@ pub fn record_stmt(record_type: &str, rec_name: &str) -> String {
 ///
 /// The single owner of the reproducer statement, so the `asyn` PORT rule above
 /// holds for every reproducer rather than for the one that happened to call the
-/// original. [`pvamonitor`] needs a `SCAN` field on its reproducer and must not
-/// grow a second, PORT-less spelling to get it.
+/// original. [`pvamonitor`] needs a `SCAN` field on its reproducer and the array
+/// phase needs `NELM`/`FTVL` on theirs — neither may grow a second, PORT-less
+/// spelling to get it.
 pub fn record_stmt_fields(record_type: &str, rec_name: &str, fields: &[(&str, &str)]) -> String {
     let mut body = String::new();
     if record_type == "asyn" {

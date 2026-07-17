@@ -54,33 +54,56 @@ fn an_iocsh_configured_server_port_accepts_a_client() {
     let mgr = Arc::new(PortManager::with_services(services));
     let cmds = build_asyn_commands(mgr);
     let ctx = make_ctx();
+    let configure = find(&cmds, "drvAsynIPServerPortConfigure");
 
-    let port = free_port();
-    find(&cmds, "drvAsynIPServerPortConfigure")
-        .handler
-        .call(
-            &[
-                ArgValue::String("R1858".into()),
-                ArgValue::String(format!("127.0.0.1:{port} TCP")),
-                ArgValue::Int(2),
-            ],
-            &ctx,
-        )
-        .expect("drvAsynIPServerPortConfigure failed");
+    // Probe-then-rebind race: `free_port()` drops its listener and the server
+    // re-binds that number inside configure (`connect_blocking` -> `open_listener`
+    // -> bind). Under parallel nextest a neighbour can steal the number in that
+    // window. On a lost bind the handler reports "cannot listen" on the shell and
+    // UNREGISTERS the server port (iocsh.rs:1602-1608) — it does NOT fail the
+    // command — so a steal is exactly "the server port object is absent after the
+    // call". Retry with a fresh number and a fresh, globally-unique port name
+    // (asyn port names are a global registry) until our bind wins.
+    let (name, port) = {
+        let mut won = None;
+        for attempt in 0..50 {
+            let port = free_port();
+            let name = format!("R1858_{attempt}");
+            configure
+                .handler
+                .call(
+                    &[
+                        ArgValue::String(name.clone()),
+                        ArgValue::String(format!("127.0.0.1:{port} TCP")),
+                        ArgValue::Int(2),
+                    ],
+                    &ctx,
+                )
+                .expect("the command reports errors on the shell, it does not fail the command");
+            // Registered ⟺ the synchronous `connect_blocking` bind won the number
+            // (the handler unregisters on a bind failure). That is the steal test.
+            if asyn_rs::asyn_record::get_port(&name).is_some() {
+                won = Some((name, port));
+                break;
+            }
+        }
+        won.expect("could not win a free TCP port in 50 attempts")
+    };
 
     // C pre-creates the child ports at configure — device support binds to them
     // before any client has connected.
-    for name in ["R1858:0", "R1858:1"] {
+    for slot in [0, 1] {
+        let child = format!("{name}:{slot}");
         assert!(
-            asyn_rs::asyn_record::get_port(name).is_some(),
-            "child port {name} must exist after configure \
+            asyn_rs::asyn_record::get_port(&child).is_some(),
+            "child port {child} must exist after configure \
              (drvAsynIPServerPort.c:681-708)"
         );
     }
 
-    asyn_rs::asyn_record::get_port("R1858").expect("server port not registered");
-    // Auto-connect binds the listener; wait for it rather than assuming a
-    // scheduling order.
+    // The server owns the bind now (configure bound it synchronously before
+    // registering), so the client connect is deterministic — but keep the wait
+    // loop against listener-thread scheduling.
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut client = loop {
         match std::net::TcpStream::connect(("127.0.0.1", port)) {
@@ -98,7 +121,7 @@ fn an_iocsh_configured_server_port_accepts_a_client() {
     // The listener thread must have accepted and filled slot 0, so the child
     // port that owns the slot can read the bytes. Before the fix this read
     // timed out: the connection was never accepted.
-    let child = asyn_rs::asyn_record::get_port("R1858:0").unwrap();
+    let child = asyn_rs::asyn_record::get_port(&format!("{name}:0")).unwrap();
     let io = SyncIOHandle::from_handle(child.handle.clone(), 0, Duration::from_millis(500));
     let mut got: Vec<u8> = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -162,6 +185,20 @@ fn an_iocsh_server_port_with_zero_max_clients_is_not_created() {
         )
         .expect("the command reports the error on the shell, it does not fail the shell");
 
+    // The handler registers the port and only then binds inside `connect_blocking`
+    // (iocsh.rs; a bind failure unregisters it, iocsh.rs:1602-1608). So a
+    // successful bind ⟺ the port stays registered: `get_port` SOME is exactly
+    // "a listener was bound". maxClients=0 is rejected at `with_config`, before
+    // registration and before any bind (C drvAsynIPServerPort.c:545-548), so the
+    // race-free registry check below is the whole proof — no listener, no child.
+    //
+    // The old test also re-bound the number to prove the socket was free. That
+    // assert was both racy (a neighbour could grab the dropped probe number in the
+    // window) AND redundant: a zero-slot server that regressed into binding would
+    // bind the free number successfully and stay registered, so `get_port` SOME
+    // already catches it. Holding the number instead would only mask that
+    // regression (the server's bind would fail against the held socket and
+    // unregister, flipping `get_port` back to none), so the socket assert is gone.
     assert!(
         asyn_rs::asyn_record::get_port("R19114").is_none(),
         "maxClients=0 must not produce a listening port"
@@ -170,7 +207,4 @@ fn an_iocsh_server_port_with_zero_max_clients_is_not_created() {
         asyn_rs::asyn_record::get_port("R19114:0").is_none(),
         "maxClients=0 must not produce a child port"
     );
-    // Nothing bound the address, so it is still free.
-    std::net::TcpListener::bind(("127.0.0.1", port))
-        .expect("the socket must not have been bound by a zero-slot server");
 }

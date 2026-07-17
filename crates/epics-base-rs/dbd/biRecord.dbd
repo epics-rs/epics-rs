@@ -93,6 +93,16 @@ recordtype(bi) {
 		special(SPC_NOMOD)
 		interest(3)
 	}
+	field(AFTC, DBF_DOUBLE) {
+		prompt("Alarm Filter Time Constant")
+		promptgroup("70 - Alarm")
+		interest(1)
+	}
+	field(AFVL, DBF_DOUBLE) {
+		prompt("Alarm Filter Value")
+		special(SPC_NOMOD)
+		interest(3)
+	}
 
 
 	field(SIOL,DBF_INLINK) {

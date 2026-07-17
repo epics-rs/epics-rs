@@ -1318,14 +1318,26 @@ impl RecordInstance {
     /// any vendored `.dbd`. Such a name is appended as its own slot, so the
     /// index and the string still name the SAME device support: there is no
     /// value of DTYP that renders as a device this record is not bound to.
-    pub(crate) fn device_choices(&self) -> Vec<PvString> {
-        let declared = super::dbd_generated::device_menu(self.record.record_type()).unwrap_or(&[]);
+    /// `None` when the record type declares NO device support at all — C's
+    /// `dbDeviceMenu *pdevs = paddr->pfldDes->ftPvt; if (!pdevs) goto nostrs;`
+    /// (`dbAccess.c:176-179`), which clears `DBR_ENUM_STRS` so the client is
+    /// sent no choice list at all.
+    ///
+    /// C keeps that case DISTINCT from a device menu that exists but is empty,
+    /// and says so at `dbAccess.c:205`: *"indicate option data not available.
+    /// distinct from no_str==0"*. An empty-but-present menu is still marked,
+    /// with `no_str = 0`; a missing menu is not marked. Returning `Vec` here
+    /// and defaulting the missing menu to `[]` collapsed the two, so a
+    /// `record(calc,"X"){}` — whose record type has no `device()` line — served
+    /// `value.choices = {0}[]` where QSRV2 omits the leaf entirely.
+    pub(crate) fn device_choices(&self) -> Option<Vec<PvString>> {
+        let declared = super::dbd_generated::device_menu(self.record.record_type())?;
         let mut slots: Vec<PvString> = declared.iter().map(|c| PvString::from(*c)).collect();
         let dtyp = self.common.dtyp.as_str();
         if !dtyp.is_empty() && !declared.contains(&dtyp) {
             slots.push(PvString::from(dtyp));
         }
-        slots
+        Some(slots)
     }
 
     /// C `dbPutFieldLink`'s link-type gate (`dbAccess.c:1125-1137`): a link
@@ -1366,7 +1378,10 @@ impl RecordInstance {
         if dtyp.is_empty() {
             return 0;
         }
+        // A record type with no device menu has no slot for any DTYP, so the
+        // index stays 0 — the same answer the old `unwrap_or(&[])` gave.
         self.device_choices()
+            .unwrap_or_default()
             .iter()
             .position(|c| c.as_str_lossy() == dtyp)
             .unwrap_or(0) as u16
@@ -1397,7 +1412,10 @@ impl RecordInstance {
     /// rendered as a number for a `DBF_MENU` and ONLY for a `DBF_MENU`.
     pub(crate) fn enum_string_form_for(&self, field: &str) -> Option<EnumStringForm> {
         if field.eq_ignore_ascii_case("DTYP") {
-            return Some(EnumStringForm::device(self.device_choices()));
+            // `None` propagates C's `goto nostrs` (`dbAccess.c:178`): a record
+            // type with no `device()` declaration supplies no choice list, so
+            // the leaf is omitted rather than marked empty.
+            return self.device_choices().map(EnumStringForm::device);
         }
         if let Some(choices) = self.menu_choices_for(field) {
             return Some(EnumStringForm::menu(
@@ -1639,6 +1657,11 @@ impl RecordInstance {
         snap.control = meta.control;
         snap.enums = meta.enums;
 
+        // The cache above is the record's VAL metadata. C routes PER FIELD, so
+        // a non-VAL-class field does NOT get VAL's limits — see
+        // [`Self::route_field_metadata`], which owns that decision.
+        self.route_field_metadata(field, &mut snap);
+
         // Per-field RSET metadata (C get_units/get_precision/
         // get_graphic_double/get_control_double/get_alarm_double key on
         // dbGetFieldIndex) patches the record-level cache for this field.
@@ -1745,7 +1768,7 @@ impl RecordInstance {
     /// `DBR_ENUM` form), so the mask is read off the same value the client
     /// receives and no consumer has to re-derive either gate.
     fn assign_property_support(&self, field: &str, snap: &mut super::super::snapshot::Snapshot) {
-        snap.properties = Self::property_support(self.record.record_type()).narrowed_to_field(
+        snap.properties = self.record.property_support().narrowed_to_field(
             snap.value.db_field_type(),
             self.menu_choices_for(field).is_some(),
         );
@@ -1762,136 +1785,10 @@ impl RecordInstance {
         let Some(value) = self.client_field_value(field) else {
             return PropertySupport::NONE;
         };
-        Self::property_support(self.record.record_type()).narrowed_to_field(
+        self.record.property_support().narrowed_to_field(
             value.db_field_type(),
             self.menu_choices_for(field).is_some(),
         )
-    }
-
-    /// The record type's RSET metadata slots — which of C's six nullable
-    /// `get_*` property functions the record type implements.
-    ///
-    /// This is the port's `rset` property table, transcribed slot by slot
-    /// from the `#define get_xxx NULL` lines of each C record's `.c`. It is
-    /// what `dbGet` consults to *narrow* the caller's `options` mask
-    /// (`dbAccess.c:336-430`), and therefore what decides whether QSRV marks
-    /// an NT leaf at all (pvxs `ioc/iocsource.cpp:263-305`). Without it the
-    /// port fabricated every leaf it could name and marked it as supplied —
-    /// telling the client a made-up `display.precision = 0` on a `longout`,
-    /// or `valueAlarm` bands at zero on a `waveform`, were authoritative.
-    ///
-    /// A slot counts as supplied when the C function pointer is non-NULL,
-    /// even if the function writes nothing for the field in question — C
-    /// leaves the option bit set either way (e.g. `boRecord.c:294-299`,
-    /// whose `get_units` writes `"s"` only for `HIGH`, yet `DBR_UNITS`
-    /// survives for every `bo` field).
-    fn property_support(rtype: &str) -> PropertySupport {
-        use PropertySupport as P;
-        match rtype {
-            // Every numeric slot, no enum strings.
-            // aiRecord.c:68-87, aoRecord.c:67-86, calcRecord.c:63-82,
-            // calcoutRecord.c:67-86, selRecord.c:58-77, subRecord.c:62-81,
-            // dfanoutRecord.c:66-85, seqRecord.c:56-75.
-            "ai" | "ao" | "calc" | "calcout" | "sel" | "sub" | "dfanout" | "seq" => P::NUMERIC,
-
-            // Integer scalars: `#define get_precision NULL`
-            // (longinRecord.c, longoutRecord.c, int64inRecord.c,
-            // int64outRecord.c). This is the measured `longout` case —
-            // pvxs leaves `display.precision` absent, the port sent 0.
-            "longin" | "longout" | "int64in" | "int64out" => P {
-                precision: false,
-                ..P::NUMERIC
-            },
-
-            // Arrays and compress: `#define get_alarm_double NULL`
-            // (waveformRecord.c, aaiRecord.c, aaoRecord.c,
-            // subArrayRecord.c, compressRecord.c, histogramRecord.c).
-            // This is the measured `waveform` case — pvxs leaves all four
-            // `valueAlarm.*Limit` absent, the port sent four zeros.
-            "waveform" | "aai" | "aao" | "subArray" | "compress" | "histogram" => P {
-                alarm_double: false,
-                ..P::NUMERIC
-            },
-
-            // No property slots at all: every `get_*` is `#define`d NULL.
-            // stringinRecord.c:62-81, stringoutRecord.c:64-83,
-            // lsiRecord.c:287-306, lsoRecord.c:328-347,
-            // eventRecord.c:62-81, permissiveRecord.c:56-75,
-            // stateRecord.c:58-77, printfRecord.c:456-475,
-            // fanoutRecord.c:60-79, timestampRecord (std-rs).
-            // This is the measured `stringout` case — pvxs leaves
-            // `display.units` absent, the port sent "".
-            "stringin" | "stringout" | "lsi" | "lso" | "event" | "permissive" | "state"
-            | "printf" | "fanout" | "timestamp" => P::NONE,
-
-            // Enum records. `biRecord.c:61-80` and `mbbiRecord.c:65-84` /
-            // `mbboRecord.c:64-83` NULL every numeric slot and supply only
-            // `get_enum_strs`. `boRecord.c:59-61` keeps `get_units`,
-            // `get_precision` and `get_control_double` (they serve the
-            // `HIGH` field) but NULLs `get_graphic_double` and
-            // `get_alarm_double`.
-            "bi" | "mbbi" | "mbbo" => P {
-                enum_strs: true,
-                ..P::NONE
-            },
-            "bo" => P {
-                units: true,
-                precision: true,
-                control_double: true,
-                enum_strs: true,
-                ..P::NONE
-            },
-            // busyRecord.c (synApps busy): units/graphic/control/alarm NULL,
-            // get_precision and get_enum_strs present.
-            "busy" => P {
-                precision: true,
-                enum_strs: true,
-                ..P::NONE
-            },
-            // mbbiDirectRecord.c:63-81 / mbboDirectRecord.c:63-81 — only
-            // `get_precision` survives, and C's DBF_FLOAT/DOUBLE gate
-            // (`dbAccess.c:388-395`) drops it again for their DBF_ENUM/LONG
-            // value, so nothing is marked. `Snapshot::precision` applies
-            // that gate.
-            "mbbiDirect" | "mbboDirect" => P {
-                precision: true,
-                ..P::NONE
-            },
-
-            // synApps, transcribed the same way.
-            // sCalcoutRecord.c / aCalcoutRecord.c / sseqRecord.c /
-            // motorRecord.cc: full numeric set, no enum strings.
-            "scalcout" | "acalcout" | "sseq" | "motor" | "epid" | "aSub" | "scaler" => P::NUMERIC,
-            // tableRecord.cc (optics): `#define get_alarm_double NULL`.
-            "table" => P {
-                alarm_double: false,
-                ..P::NUMERIC
-            },
-            // swaitRecord.c: get_units and get_control_double are NULL.
-            "swait" => P {
-                units: false,
-                control_double: false,
-                ..P::NUMERIC
-            },
-            // transformRecord.c and std-rs throttle: only get_precision
-            // (transform) / get_precision+get_graphic_double (throttle)
-            // survive.
-            "transform" => P {
-                precision: true,
-                ..P::NONE
-            },
-            "throttle" => P {
-                precision: true,
-                graphic_double: true,
-                ..P::NONE
-            },
-
-            // A record type whose C rset the port has not transcribed keeps
-            // the pre-existing "supplies what it populated" behaviour rather
-            // than silently losing metadata. Add an arm above — with the C
-            // file and line — when porting a new record type.
-            _ => P::NUMERIC,
-        }
     }
 
     fn populate_display_info(&self, snap: &mut super::super::snapshot::Snapshot) {
@@ -1924,16 +1821,11 @@ impl RecordInstance {
                     .get_field("LOPR")
                     .and_then(|v| v.to_f64())
                     .unwrap_or(0.0);
-                let (hihi, high, low, lolo) = self.alarm_limits();
                 snap.display = Some(super::super::snapshot::DisplayInfo {
                     units: egu,
                     precision: prec,
                     upper_disp_limit: hopr,
                     lower_disp_limit: lopr,
-                    upper_alarm_limit: hihi,
-                    upper_warning_limit: high,
-                    lower_warning_limit: low,
-                    lower_alarm_limit: lolo,
                     ..Default::default()
                 });
             }
@@ -1959,22 +1851,11 @@ impl RecordInstance {
                     .get_field("LOPR")
                     .and_then(|v| v.to_f64())
                     .unwrap_or(0.0);
-                // longin/longout severity-gate (get_alarm_double);
-                // int64in/int64out send the limits verbatim (C is
-                // unconditional for those two record types only).
-                let (hihi, high, low, lolo) = match rtype {
-                    "int64in" | "int64out" => self.alarm_limits_unchecked(),
-                    _ => self.alarm_limits(),
-                };
                 snap.display = Some(super::super::snapshot::DisplayInfo {
                     units: egu,
                     precision: 0,
                     upper_disp_limit: hopr,
                     lower_disp_limit: lopr,
-                    upper_alarm_limit: hihi,
-                    upper_warning_limit: high,
-                    lower_warning_limit: low,
-                    lower_alarm_limit: lolo,
                     ..Default::default()
                 });
             }
@@ -2012,10 +1893,6 @@ impl RecordInstance {
                     precision: prec,
                     upper_disp_limit: hopr,
                     lower_disp_limit: lopr,
-                    upper_alarm_limit: 0.0,
-                    upper_warning_limit: 0.0,
-                    lower_warning_limit: 0.0,
-                    lower_alarm_limit: 0.0,
                     ..Default::default()
                 });
             }
@@ -2053,10 +1930,6 @@ impl RecordInstance {
                     precision: prec,
                     upper_disp_limit: hopr,
                     lower_disp_limit: lopr,
-                    upper_alarm_limit: 0.0,
-                    upper_warning_limit: 0.0,
-                    lower_warning_limit: 0.0,
-                    lower_alarm_limit: 0.0,
                     ..Default::default()
                 });
             }
@@ -2092,10 +1965,6 @@ impl RecordInstance {
                     precision: prec,
                     upper_disp_limit: hlm,
                     lower_disp_limit: llm,
-                    upper_alarm_limit: 0.0,
-                    upper_warning_limit: 0.0,
-                    lower_warning_limit: 0.0,
-                    lower_alarm_limit: 0.0,
                     ..Default::default()
                 });
             }
@@ -2248,43 +2117,6 @@ impl RecordInstance {
                 Some(form) => super::super::snapshot::EnumInfo::with_string_form(strings, form),
                 None => super::super::snapshot::EnumInfo::new(strings),
             });
-        }
-    }
-
-    /// Extract analog alarm limits from CommonFields.
-    // DBR_GR_*/DBR_CTRL_* alarm limits MUST be severity-gated — C
-    // get_alarm_double returns `prec->hhsv ? prec->hihi : epicsNAN`
-    // (aiRecord.c:295-298 and ao/longin/longout/calc/calcout). int64in/
-    // int64out are the sole exception (unconditional, int64inRecord.c:239-243)
-    // and use `alarm_limits_unchecked()`. NaN encodes byte-exact for every
-    // DBR variant: f64/f32 keep NaN, integer casts make `NaN as iN == 0`,
-    // matching dbAccess.c:300-326 (`finite(ald)?cast:0`).
-    fn alarm_limits(&self) -> (f64, f64, f64, f64) {
-        match self.common.analog_alarm {
-            // Each limit is reported only when its severity is enabled,
-            // exactly as C `get_alarm_double` (`x ? limit : epicsNAN`).
-            Some(ref aa) => (
-                gated(aa.hhsv, aa.hihi),
-                gated(aa.hsv, aa.high),
-                gated(aa.lsv, aa.low),
-                gated(aa.llsv, aa.lolo),
-            ),
-            // No analog-alarm config ⇒ all severities are NO_ALARM in C,
-            // so every limit is NaN (not 0).
-            None => (f64::NAN, f64::NAN, f64::NAN, f64::NAN),
-        }
-    }
-
-    // int64in/int64out are the one analog family whose C `get_alarm_double`
-    // is UNCONDITIONAL (int64inRecord.c:239-243, int64outRecord.c:283-287):
-    // the limits are sent verbatim regardless of HHSV/HSV/LSV/LLSV. Keep a
-    // separate accessor so the gated `alarm_limits()` cannot leak into this
-    // path.
-    fn alarm_limits_unchecked(&self) -> (f64, f64, f64, f64) {
-        if let Some(ref aa) = self.common.analog_alarm {
-            (aa.hihi, aa.high, aa.low, aa.lolo)
-        } else {
-            (0.0, 0.0, 0.0, 0.0)
         }
     }
 
@@ -4347,6 +4179,9 @@ impl RecordInstance {
         snap.display = meta.display;
         snap.control = meta.control;
         snap.enums = meta.enums;
+        // Same per-field routing owner as the GET path — a monitor update must
+        // carry the same metadata a read of that field would.
+        self.route_field_metadata(field, &mut snap);
         // Per-field RSET metadata, same as the GET path
         // (`snapshot_for_field`) — a monitor update for VELO must carry
         // VELO's limits, not the record-level VAL limits.
@@ -4420,6 +4255,432 @@ impl RecordInstance {
             c.upper_ctrl_limit = upper;
             c.lower_ctrl_limit = lower;
         }
+    }
+
+    /// C's rset metadata slots route **per field**, on `dbGetFieldIndex`. The
+    /// port's metadata cache is the record's VAL metadata, and serving it to
+    /// every field is what made a non-VAL field report VAL's limits.
+    ///
+    /// Every base record's `get_control_double` / `get_alarm_double` has the
+    /// same two-arm shape: a listed set of field indices that take the
+    /// record's own limits, and a `default:` arm that hands the field to
+    /// `recGblGetControlDouble` / `recGblGetAlarmDouble` — the field TYPE's
+    /// numeric range, and four NaN. This routes the `default:` arm; a listed
+    /// field keeps the cache, which already holds exactly the record's own
+    /// limits (and already distinguishes `ao`'s DRVH/DRVL from `ai`'s
+    /// HOPR/LOPR).
+    ///
+    /// The three slots' listed sets are **different**, and each has its own
+    /// owner here: [`Self::control_explicit_field`],
+    /// [`Self::graphic_explicit_field`] and [`Self::alarm_explicit_field`].
+    /// They are separate switches over separate field lists in C, so the
+    /// membership question is asked once per slot, never once for both — and
+    /// each list varies by record TYPE, so it is asked once per type too.
+    ///
+    /// Measured on a real `softIocPVX` against `record(calc,"X"){}`:
+    /// `.PHAS` (DBF_SHORT, unlisted) serves control ±32767 — the SHRT range —
+    /// while `.VAL` and `.HIHI` (both listed) serve 0/0 from HOPR/LOPR.
+    ///
+    /// Deliberately NOT routed here, and why:
+    ///
+    /// * **display (graphic) limits.** Unlike control, the `default:` arm of
+    ///   `get_graphic_double` tries a LINK first
+    ///   (`calcRecord.c` `get_linkNumber` → `dbGetGraphicLimits`) and only
+    ///   falls to `recGbl` for a field that backs no link. A constant (unset)
+    ///   link has no metadata getters, so the `dbAccess.c:216` 0/0 seed stands
+    ///   — measured: `CALC.A` serves display 0/0 but control ±1e300. Which
+    ///   fields back links is per-record C knowledge the port models nowhere
+    ///   (no `FieldDesc` relation, no trait hook), so defaulting display to the
+    ///   type range would CREATE defects on every link-backed field.
+    /// * **units / precision.** Same link-first shape
+    ///   (`calcRecord.c` `get_units`, `get_precision`).
+    ///
+    /// Both remain a measured residue rather than a guess.
+    ///
+    /// The last arm is not the same for every record type — a slot can also
+    /// fall through WITHOUT delegating, keeping the seed. That fact is one bit
+    /// per record type, read from its C source: [`control_default_arm`].
+    fn route_field_metadata(&self, field: &str, snap: &mut super::super::snapshot::Snapshot) {
+        // The rset slots this record type actually supplies. A NULL slot makes
+        // `dbAccess.c` clear the option bit, so the leaf is never served and
+        // there is nothing to route — minting a value here would put a
+        // fabricated number on the CA wire, which has no marking layer to
+        // suppress it (`codec.rs` `get_limits` reads these structs ungated).
+        let slots = self.record.property_support();
+        let rtype = self.record.record_type();
+
+        // C `get_control_double`'s last arm. No base record routes control
+        // through a link: `dbGetControlLimits` has zero callers in all of
+        // base, so unlike display this arm needs no link branch.
+        if slots.control_double && !Self::control_explicit_field(rtype, field) {
+            let (upper, lower) =
+                match super::record_trait::control_default_arm(self.record.record_type()) {
+                    // `recGblGetControlDouble` → `getMaxRangeValues(field_type)`.
+                    // A type with no case in C's switch (STRING/MENU/DEVICE/links)
+                    // is written by nothing, leaving the `dbAccess.c:256` seed —
+                    // which is 0/0, exactly what `unwrap_or` supplies.
+                    super::record_trait::RsetDefaultArm::RecGblRange => {
+                        self.rec_gbl_range_for(field).unwrap_or((0.0, 0.0))
+                    }
+                    // The slot exists but writes nothing here, so the same
+                    // `dbAccess.c:256` seed stands. Modelled as a value rather
+                    // than as `None`: C's option bit is ON (the slot is supplied
+                    // and returned 0), so the leaf IS served — carrying the seed.
+                    super::record_trait::RsetDefaultArm::Seed => (0.0, 0.0),
+                };
+            snap.control = Some(super::super::snapshot::ControlInfo {
+                upper_ctrl_limit: upper,
+                lower_ctrl_limit: lower,
+            });
+        }
+
+        // C `get_graphic_double`'s last arm. Unlike control this one has a LINK
+        // branch ahead of the recGbl call, so the three answers are: keep the
+        // cache (listed on HOPR/LOPR), the link's limits, or the default arm.
+        if slots.graphic_double && !Self::graphic_explicit_field(rtype, field) {
+            let (upper, lower) = if Self::graphic_link_backed_field(rtype, field) {
+                // `dbGetGraphicLimits` on a CONSTANT link writes nothing — a
+                // constant has no metadata getters — so the `dbAccess.c:216`
+                // seed stands. The port has no link metadata to consult, and a
+                // link that IS connected would be answered by the upstream
+                // record, which this routing does not model either; both land
+                // here as the seed.
+                (0.0, 0.0)
+            } else {
+                match super::record_trait::graphic_default_arm(rtype) {
+                    super::record_trait::RsetDefaultArm::RecGblRange => {
+                        self.rec_gbl_range_for(field).unwrap_or((0.0, 0.0))
+                    }
+                    super::record_trait::RsetDefaultArm::Seed => (0.0, 0.0),
+                }
+            };
+            let d = snap.display.get_or_insert_with(Default::default);
+            d.upper_disp_limit = upper;
+            d.lower_disp_limit = lower;
+        }
+
+        // C `get_alarm_double`, BOTH arms. This branch owns the four limits
+        // outright: `slots.alarm_double` is exactly the condition under which
+        // `getProperties` assigns the four `valueAlarm.*Limit` leaves, so
+        // whenever the leaves are served this assigns them.
+        //
+        // The explicit arm used to be left to the record-level metadata cache
+        // (`populate_display_info`), whose `match rtype` covered only some of
+        // the types that supply the slot. A type it missed reached the wire
+        // with `snap.display == None` and the four leaves kept the NT's
+        // structural 0 — measured: DFANOUT.VAL, SEL.VAL and SUB.VAL served 0
+        // where C serves NaN. That made "which limits does VAL carry" depend on
+        // a match arm existing somewhere else, which is the dual meaning this
+        // single owner removes.
+        if slots.alarm_double {
+            let (hihi, high, low, lolo) = if Self::alarm_explicit_field(rtype, field) {
+                self.explicit_alarm_limits(rtype)
+            } else {
+                // The link-backed sibling arm lands on the same answer:
+                // `dbAccess.c:294` seeds four NaN, and a constant link supplies
+                // no alarm limits to overwrite them.
+                crate::server::recgbl::rec_gbl_get_alarm_double()
+            };
+            // The four alarm limits live on DisplayInfo because that mirrors
+            // C's `dbr_gr_double` packing, which the CA encoder depends on.
+            // Minting it here is safe: every other DisplayInfo field defaults
+            // to the same value the `None` path already served.
+            let d = snap.display.get_or_insert_with(Default::default);
+            d.upper_alarm_limit = hihi;
+            d.upper_warning_limit = high;
+            d.lower_warning_limit = low;
+            d.lower_alarm_limit = lolo;
+        }
+    }
+
+    /// The four limits C's `get_alarm_double` serves for the fields its rset
+    /// lists — [`alarm_explicit_fields`](super::record_trait::alarm_explicit_fields).
+    ///
+    /// Read through [`Self::resolve_field`], the same unified accessor C's
+    /// `prec->hihi` is. The port stores the eight alarm fields in one of two
+    /// disjoint homes — `common.analog_alarm` for the types with the analog
+    /// ladder (`ai`/`ao`/`calc`/…), the record's own struct for the types
+    /// without it (`dfanout`/`sel`) — and `resolve_field` spans both. Reading
+    /// the ladder slot directly instead would answer NaN for every `dfanout`
+    /// and `sel` no matter how its HIHI/HHSV were set, because those two types
+    /// have no slot at all.
+    fn explicit_alarm_limits(&self, rtype: &str) -> (f64, f64, f64, f64) {
+        let limit = |name: &str| {
+            self.resolve_field(name)
+                .and_then(|v| v.to_f64())
+                .unwrap_or(0.0)
+        };
+        // The raw stored ordinal, NOT clamped to 0..=3: C tests `prec->hhsv`
+        // for NONZERO, so an out-of-range severity still enables its limit.
+        let severity = |name: &str| {
+            self.resolve_field(name)
+                .and_then(|v| v.to_f64())
+                .unwrap_or(0.0) as i16
+        };
+        match super::record_trait::alarm_val_arm(rtype) {
+            super::record_trait::AlarmValArm::Unconditional => {
+                (limit("HIHI"), limit("HIGH"), limit("LOW"), limit("LOLO"))
+            }
+            super::record_trait::AlarmValArm::Gated => (
+                gated(severity("HHSV"), limit("HIHI")),
+                gated(severity("HSV"), limit("HIGH")),
+                gated(severity("LSV"), limit("LOW")),
+                gated(severity("LLSV"), limit("LOLO")),
+            ),
+        }
+    }
+
+    /// The fields C's **`get_control_double`** answers with the record's own
+    /// cached limits, rather than letting them fall to the `default:` arm.
+    ///
+    /// "VAL plus the seven alarm bands" is one type's list, not the shared
+    /// one: it holds for `ai` (`aiRecord.c:267-288`), `ao`, `calc`, `calcout`,
+    /// `longin`, `longout`, `int64in`, `int64out` and `sub`
+    /// (`subRecord.c:272-292`) — the `_` arm — and for no other type. Every
+    /// list below is transcribed from that type's own rset:
+    ///
+    /// * `aSub` (`aSubRecord.c:372-376`) is a bare `recGblGetControlDouble`:
+    ///   it lists NOTHING, VAL included.
+    /// * `seq` (`seqRecord.c:342-353`) lists only DLYn and `bo`
+    ///   (`boRecord.c:310-318`) only HIGH — and both answer a LITERAL rather
+    ///   than the cache, so they come from
+    ///   [`Record::field_metadata_override`] (which runs after this routing
+    ///   and wins over the `default:` arm). Nothing of these two types keeps
+    ///   the cache, VAL included.
+    /// * `dfanout` (`dfanoutRecord.c:197-213`) lists VAL and the three
+    ///   latches but NOT the four bands.
+    /// * `sel` (`selRecord.c:203-235`) lists the eight plus `A`..`L` /
+    ///   `LA`..`LL`; `acalcout`/`scalcout` (`aCalcoutRecord.c:793-822`,
+    ///   `sCalcoutRecord.c:653-680`) list VAL and the four bands but NOT the
+    ///   latches, plus `A`..`L` / `PA`..`PL`.
+    /// * `epid` (`epidRecord.c:157-180`) lists VAL, the four bands and CVAL on
+    ///   HOPR/LOPR; `motor` (`motorRecord.cc:3269-3305`) lists VAL and RBV on
+    ///   HLM/LLM.
+    /// * the array types (`waveformRecord.c:268-289`, `aaiRecord.c:293-310`,
+    ///   `aaoRecord.c:296-313`, `compressRecord.c:487-502`,
+    ///   `histogramRecord.c:458-475`, `subArrayRecord.c:262-291`) list VAL
+    ///   alone on the cache — their other listed fields answer computed spans,
+    ///   so those too come from [`Record::field_metadata_override`].
+    ///
+    /// Fields whose listed case answers something OTHER than the record's
+    /// cached limits are deliberately absent — `motor`'s DVAL/DRBV (DHLM/DLLM)
+    /// and `epid`'s OVAL/P/I/D (DRVH/DRVL) have no override yet and so still
+    /// take the `default:` arm.
+    ///
+    /// **Not** the other two slots' lists — see [`Self::alarm_explicit_field`]
+    /// (smaller) and [`Self::graphic_explicit_field`] (larger, and cut short
+    /// for different types). C's three rset arms are separate switches over
+    /// separate field lists, so one shared predicate could only ever be right
+    /// for one of them.
+    fn control_explicit_field(rtype: &str, field: &str) -> bool {
+        // The two types that list nothing the cache can answer, VAL included.
+        if matches!(rtype, "aSub" | "seq" | "bo") {
+            return false;
+        }
+        if crate::server::database::is_value_field(field) {
+            return true;
+        }
+        let f = field.to_ascii_uppercase();
+        let bands: &[&str] = match rtype {
+            "dfanout" => &["LALM", "ALST", "MLST"],
+            "acalcout" | "scalcout" | "epid" => &["HIHI", "HIGH", "LOW", "LOLO"],
+            "waveform" | "aai" | "aao" | "compress" | "histogram" | "subArray" | "motor" => &[],
+            _ => &["HIHI", "HIGH", "LOW", "LOLO", "LALM", "ALST", "MLST"],
+        };
+        if bands.contains(&f.as_str()) {
+            return true;
+        }
+        match rtype {
+            // sel's args are 12 (`SEL_MAX`), not the calc family's 21.
+            "sel" => Self::calc_arg_field(&f, 12),
+            "acalcout" | "scalcout" => {
+                Self::calc_arg_field(&f, 12)
+                    || matches!(f.as_bytes(), [b'P', c] if c.is_ascii_uppercase() && *c <= b'L')
+            }
+            "epid" => f == "CVAL",
+            "motor" => f == "RBV",
+            _ => false,
+        }
+    }
+
+    /// The fields C's **`get_alarm_double`** lists explicitly — **VAL alone**,
+    /// not the eight [`Self::control_explicit_field`] lists.
+    ///
+    /// Transcribed from every rset in base that supplies the slot; each is a
+    /// bare `if (dbGetFieldIndex(paddr) == indexof(VAL))` with every other
+    /// field falling to `recGblGetAlarmDouble` (`recGbl.c:155-162`, four NaN):
+    /// `aiRecord.c:293`, `aoRecord.c:365`, `calcRecord.c:258`,
+    /// `calcoutRecord.c`, `dfanoutRecord.c:216`, `int64inRecord.c:235`,
+    /// `int64outRecord.c`, `longinRecord.c`, `longoutRecord.c`,
+    /// `selRecord.c:222`, `subRecord.c:236`.
+    ///
+    /// So `.HIHI` serves VAL's *control* limits but NOT VAL's *alarm* limits —
+    /// the band fields' four alarm limits are the recGbl NaN. Routing both
+    /// slots off one VAL-class predicate is what put the record's own
+    /// valueAlarm limits on all eight.
+    ///
+    /// Which fields each type lists — and the fact that some list none, and
+    /// that `motor` lists two — is one per-type table,
+    /// [`alarm_explicit_fields`](super::record_trait::alarm_explicit_fields);
+    /// what that listed arm ANSWERS is its twin,
+    /// [`alarm_val_arm`](super::record_trait::alarm_val_arm). Keeping the two
+    /// questions in one place is what lets this predicate stay a pure
+    /// membership test.
+    fn alarm_explicit_field(rtype: &str, field: &str) -> bool {
+        super::record_trait::alarm_explicit_fields(rtype)
+            .iter()
+            .any(|f| field.eq_ignore_ascii_case(f))
+    }
+
+    /// `A`..`A+n-1` (a single letter) or `LA`..`LA+n-1` — C's calc-family
+    /// argument fields, addressed by index range rather than by name.
+    ///
+    /// `calcRecord.c:161-167` / `calcoutRecord.c:417-423` test
+    /// `idx >= indexof(A) && idx < indexof(A) + CALCPERFORM_NARGS`, and the dbd
+    /// declares those `CALCPERFORM_NARGS` fields contiguously as the single
+    /// letters `A`..`U` (`postfix.h:29` = 21, `calcRecord.dbd.pod:801-985`), so
+    /// the index range and the letter range are the same set.
+    fn calc_arg_field(field: &str, nargs: u8) -> bool {
+        let last = b'A' + nargs - 1;
+        match field.as_bytes() {
+            [c] => c.is_ascii_uppercase() && *c <= last,
+            [b'L', c] => c.is_ascii_uppercase() && *c <= last,
+            _ => false,
+        }
+    }
+
+    /// The fields C's **`get_graphic_double`** answers with the record's own
+    /// `HOPR`/`LOPR` — which is exactly what the VAL metadata cache already
+    /// holds, so routing must leave them on it.
+    ///
+    /// The third membership question, and a third distinct set: the alarm arm
+    /// lists VAL alone and the control arm lists the eight, but graphic lists
+    /// the eight PLUS a per-type tail, and two types cut it short.
+    ///
+    /// * base analog (`aiRecord.c:244-266`, `aoRecord.c:316-339`,
+    ///   `calcRecord.c:187-212`, `calcoutRecord.c:452-484`,
+    ///   `subRecord.c:222-247`, `selRecord.c:181-201`,
+    ///   `dfanoutRecord.c:181-195`, `longinRecord.c:190-204`,
+    ///   `longoutRecord.c`, `int64inRecord.c:196-210`, `int64outRecord.c`):
+    ///   the eight.
+    /// * `acalcout`/`scalcout` (`aCalcoutRecord.c:1046`, `sCalcoutRecord.c:906`)
+    ///   list only VAL/HIHI/HIGH/LOW/LOLO — NOT LALM/ALST/MLST — plus the
+    ///   `A`..`L` and `PA`..`PL` ranges.
+    /// * `sel` (`selRecord.c:193-196`) also lists `A`..`L` / `LA`..`LL`, via a
+    ///   GCC case range. It has no link arm at all, so its args are HOPR/LOPR
+    ///   where calc's identically-named ones are link-backed.
+    /// * the SVAL family (`aiRecord.c:253`, `longinRecord.c`,
+    ///   `int64inRecord.c:205`), `ao`'s `OVAL`/`PVAL`/`IVOV`
+    ///   (`aoRecord.c:322-338`), and `compress`'s `IHIL`/`ILIL`
+    ///   (`compressRecord.c:474-476`).
+    ///
+    /// Fields whose graphic case answers something OTHER than HOPR/LOPR are
+    /// NOT here — they cannot keep the cache and are supplied by
+    /// [`Record::field_metadata_override`] instead (`histogram` WDTH,
+    /// `subArray`/`waveform`/`aai`/`aao` index fields, `seq` DLYn,
+    /// `calcout` ODLY).
+    fn graphic_explicit_field(rtype: &str, field: &str) -> bool {
+        // The two types that do not list VAL. Neither switch is keyed on
+        // VAL at all: `seqRecord.c:282-297` keys on `index - indexof(DLY0)`,
+        // so every field BELOW DLY0 — VAL included — reaches
+        // `recGblGetGraphicDouble`; `aSubRecord.c:350-368` keys on the link
+        // number, and VAL is neither an inlink nor an outlink, so it falls out
+        // having written nothing (the `graphic_default_arm` Seed).
+        //
+        // Measured: `SEQ.VAL` served display 0/0 — the empty VAL cache — where
+        // C serves the DBF_LONG range.
+        if matches!(rtype, "seq" | "aSub") {
+            return false;
+        }
+        if crate::server::database::is_value_field(field) {
+            return true;
+        }
+        let f = field.to_ascii_uppercase();
+        let bands: &[&str] = match rtype {
+            "acalcout" | "scalcout" => &["HIHI", "HIGH", "LOW", "LOLO"],
+            _ => &["HIHI", "HIGH", "LOW", "LOLO", "LALM", "ALST", "MLST"],
+        };
+        if bands.contains(&f.as_str()) {
+            return true;
+        }
+        match rtype {
+            "ai" | "longin" | "int64in" => f == "SVAL",
+            "ao" => matches!(f.as_str(), "OVAL" | "PVAL" | "IVOV"),
+            "compress" => matches!(f.as_str(), "IHIL" | "ILIL"),
+            // sel's args are 12 (`SEL_MAX`), not the calc family's 21.
+            "sel" => Self::calc_arg_field(&f, 12),
+            // A..L and PA..PL, both to HOPR/LOPR.
+            "acalcout" | "scalcout" => {
+                Self::calc_arg_field(&f, 12)
+                    || matches!(f.as_bytes(), [b'P', c] if c.is_ascii_uppercase() && *c <= b'L')
+            }
+            _ => false,
+        }
+    }
+
+    /// The fields whose C `get_graphic_double` routes through a LINK —
+    /// `dbGetGraphicLimits` on the link that backs the field, not the field's
+    /// own type range.
+    ///
+    /// This is the one thing display needs that control never did:
+    /// `dbGetControlLimits` has zero callers in all of base, so the control
+    /// arm had no link branch to model. Graphic does, and it is what makes the
+    /// display default arm NOT a straight flip to the type range.
+    ///
+    /// A link left unset is a CONSTANT link, which supplies no metadata
+    /// getters, so `dbGetGraphicLimits` writes nothing and the
+    /// `dbAccess.c:216` `(0.0, 0.0)` seed stands — measured: `CALC.A` serves
+    /// display 0/0 where its DBF_DOUBLE type range would be ±1e300, while
+    /// `CALC.PHAS` (no link) serves the DBF_SHORT range ±32767.
+    ///
+    /// Four types, both by mechanical index test:
+    /// * `calc`/`calcout`/`sub` — `get_linkNumber` (`calcRecord.c:161-167`,
+    ///   `calcoutRecord.c:417-423`, `subRecord.c:198-204`): `A`..`A+NARGS` and
+    ///   `LA`..`LA+NARGS`, both onto `&prec->inpa + n`. calc/calcout use
+    ///   `CALCPERFORM_NARGS` (21); `sub` uses `INP_ARG_MAX`
+    ///   (`subRecord.c:89`), also 21.
+    /// * `seq` — `seqRecord.c:322-338`: field offset from `DLY0` with
+    ///   `offset & 3 == 2` is `DOn`, routed through `get_dol(prec, offset)`.
+    ///
+    /// `sel` names its args the same way and is deliberately NOT here: its
+    /// rset lists them explicitly on HOPR/LOPR and calls `dbGetGraphicLimits`
+    /// nowhere.
+    fn graphic_link_backed_field(rtype: &str, field: &str) -> bool {
+        let f = field.to_ascii_uppercase();
+        match rtype {
+            "calc" | "calcout" | "sub" => Self::calc_arg_field(&f, 21),
+            // DLY0/DOL0/DO0/LNK0, DLY1/... — DOn is offset 2 of each group of
+            // four, i.e. the `DO` prefix over the same 0-F suffix set.
+            "seq" => {
+                matches!(f.as_bytes(), [b'D', b'O', c] if c.is_ascii_digit() || (b'A'..=b'F').contains(c))
+            }
+            _ => false,
+        }
+    }
+
+    /// The field's type as the **dbd declares it**, which is the only type
+    /// `recGblGetPrec` / `getMaxRangeValues` ever see.
+    ///
+    /// C reads `pdbFldDes->field_type` (`recGbl.c:127`, `:151`, `:169`) — the
+    /// STATIC descriptor — so a `cvt_dbaddr` retype (the port's
+    /// `runtime_typed`, DBF_NOACCESS in the dbd) never reaches the switch and
+    /// the switch has no case for it. `None` reproduces that: no case, no
+    /// write.
+    fn static_field_type(&self, field: &str) -> Option<crate::types::DbFieldType> {
+        let desc = self.field_desc(field)?;
+        (!desc.runtime_typed).then_some(desc.dbf_type)
+    }
+
+    /// `recGblGetGraphicDouble` / `recGblGetControlDouble` for `field` — the
+    /// same `getMaxRangeValues` table both C entry points share
+    /// (`recGbl.c:146-171`). `None` where C's switch has no case (STRING,
+    /// MENU, DEVICE, NOACCESS, links), which writes nothing.
+    fn rec_gbl_range_for(&self, field: &str) -> Option<(f64, f64)> {
+        let desc = self.field_desc(field)?;
+        crate::server::recgbl::rec_gbl_get_graphic_double(
+            self.static_field_type(field),
+            desc.menu.is_some(),
+        )
     }
 
     /// Notify subscribers from a snapshot (call outside lock).
@@ -4743,6 +5004,104 @@ pub(crate) fn check_deadband(newval: f64, oldval: f64, deadband: f64) -> bool {
 }
 
 #[cfg(test)]
+mod device_menu_marking_tests {
+    use super::*;
+    use crate::server::records::ai::AiRecord;
+    use crate::server::records::calc::CalcRecord;
+
+    /// C `dbAccess.c:176-179`: a `DBF_DEVICE` field whose record type declares
+    /// no device support has `pfldDes->ftPvt == NULL` and takes `goto nostrs`,
+    /// which clears `DBR_ENUM_STRS` — the client is sent NO choice list.
+    ///
+    /// `calc` declares no `device()` line, so QSRV2 omits `value.choices` on
+    /// `CALC.DTYP`. The port used to default the missing menu to `[]` and mark
+    /// an empty list instead.
+    #[test]
+    fn dtyp_of_a_record_type_with_no_device_support_supplies_no_choices() {
+        let inst = RecordInstance::new("X".into(), CalcRecord::default());
+        assert!(
+            super::super::dbd_generated::device_menu("calc").is_none(),
+            "precondition: calc declares no device() line (C ftPvt == NULL)"
+        );
+        assert!(
+            inst.device_choices().is_none(),
+            "a record type with no device menu must report None, not an empty list"
+        );
+        assert!(
+            inst.enum_string_form_for("DTYP").is_none(),
+            "DTYP must supply no enum-string form, so no `value.choices` is marked"
+        );
+    }
+
+    /// The other side of C's `dbAccess.c:205` comment — *"indicate option data
+    /// not available. distinct from no_str==0"*. `ai` DOES declare device
+    /// support, so its menu exists and its choices are served.
+    #[test]
+    fn dtyp_of_a_record_type_with_device_support_supplies_its_choices() {
+        let inst = RecordInstance::new("X".into(), AiRecord::default());
+        let choices = inst
+            .device_choices()
+            .expect("ai declares device() lines, so its menu exists");
+        assert!(
+            choices.iter().any(|c| c.as_str_lossy() == "Soft Channel"),
+            "ai's device menu must carry its declared choices, got {choices:?}"
+        );
+        assert!(inst.enum_string_form_for("DTYP").is_some());
+    }
+
+    /// An unset `DTYP` is index 0 on both sides of the distinction — a record
+    /// type with no device menu has no slot for any DTYP, so the index stays 0
+    /// rather than panicking or shifting.
+    #[test]
+    fn dtyp_index_is_zero_when_the_record_type_has_no_device_menu() {
+        let inst = RecordInstance::new("X".into(), CalcRecord::default());
+        assert_eq!(inst.dtyp_index(), 0);
+    }
+}
+
+#[cfg(test)]
+mod property_support_owner_tests {
+    use crate::server::record::record_trait::default_property_support;
+    use crate::server::snapshot::PropertySupport as P;
+
+    /// `sseqRecord.c:124-144` — the rset table NULLs every property slot
+    /// except `get_precision`:
+    ///
+    /// ```c
+    /// NULL,           /* get_units */
+    /// get_precision,  /* get_precision */
+    /// NULL,           /* get_enum_str */
+    /// NULL,           /* get_enum_strs */
+    /// NULL,           /* put_enum_str */
+    /// NULL,           /* get_graphic_double */
+    /// NULL,           /* get_control_double */
+    /// NULL            /* get_alarm_double */
+    /// ```
+    ///
+    /// `sseq` was previously grouped with the full-numeric synApps types, so
+    /// the port marked six leaves per field that QSRV2 omits entirely.
+    #[test]
+    fn sseq_supplies_only_precision() {
+        assert_eq!(
+            default_property_support("sseq"),
+            P {
+                precision: true,
+                ..P::NONE
+            }
+        );
+    }
+
+    /// A record type the table does not name keeps the permissive
+    /// `NUMERIC` default rather than silently losing metadata. This is the
+    /// arm `asyn` used to land on — and why marking had to become a trait
+    /// method: asyn-rs cannot add a row here.
+    #[test]
+    fn an_untranscribed_record_type_keeps_the_permissive_default() {
+        assert_eq!(default_property_support("no-such-record-type"), P::NUMERIC);
+    }
+}
+
+#[cfg(test)]
 mod metadata_cache_tests {
     use super::*;
     use crate::server::records::ai::AiRecord;
@@ -4953,12 +5312,16 @@ mod metadata_cache_tests {
     fn qtime_nsec_lsb_31_is_served_not_ignored() {
         use std::time::{Duration, SystemTime};
         let mut inst = ai_instance();
-        inst.common.time = SystemTime::UNIX_EPOCH + Duration::new(42, 123_456_789);
+        // 123_456_700, not …789: Windows `SystemTime` is a FILETIME with 100 ns
+        // resolution, so a sub-100 ns literal is truncated on readback and the
+        // assertion below would see …700. Any value < 2^31 exercises the
+        // nsec:lsb:31 mask identically, so pin one that survives the round trip.
+        inst.common.time = SystemTime::UNIX_EPOCH + Duration::new(42, 123_456_700);
         inst.common.utag = 5;
         inst.set_info("Q:time:tag", "nsec:lsb:31");
 
         let snap = inst.snapshot_for_field("VAL").unwrap();
-        assert_eq!(snap.user_tag, 123_456_789);
+        assert_eq!(snap.user_tag, 123_456_700);
         assert_eq!(snap.timestamp.subsec_nanos(), 0);
         assert_eq!(snap.timestamp.unix_secs(), 42);
     }
@@ -4971,7 +5334,9 @@ mod metadata_cache_tests {
     fn qtime_uppercase_tag_leaves_timestamp_untouched() {
         use std::time::{Duration, SystemTime};
         let mut inst = ai_instance();
-        inst.common.time = SystemTime::UNIX_EPOCH + Duration::new(42, 123_456_789);
+        // 100 ns-multiple so the subsec_nanos assertion holds on Windows too;
+        // see qtime_nsec_lsb_31_is_served_not_ignored for the FILETIME reason.
+        inst.common.time = SystemTime::UNIX_EPOCH + Duration::new(42, 123_456_700);
         inst.common.utag = 5;
         inst.set_info("Q:time:tag", "NSEC:LSB:4");
 
@@ -4980,7 +5345,7 @@ mod metadata_cache_tests {
             snap.user_tag, 5,
             "record utag must survive a non-matching tag"
         );
-        assert_eq!(snap.timestamp.subsec_nanos(), 123_456_789);
+        assert_eq!(snap.timestamp.subsec_nanos(), 123_456_700);
     }
 
     /// the served `timeStamp.userTag` defaults to the record's `utag`

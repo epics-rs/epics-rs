@@ -16,6 +16,7 @@
 //! measurement that did not happen must never be scored as agreement.
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -611,38 +612,175 @@ fn normalize_ca_error(msg: &str) -> String {
 /// so the deadline is enforced by killing the child and reaping it — the
 /// process is owned here throughout, so the kill always lands.
 ///
-/// The pipes are only drained after exit. That is safe because every tool
-/// routed through here (`caget`/`caput`/`cainfo`) writes a handful of lines,
-/// far below the OS pipe buffer. The one tool that can emit unbounded output —
-/// `camonitor` — is deliberately *not* run through this path; it streams
-/// (see [`monitor`]).
-fn wait_bounded(
+/// # The pipes are drained *while* waiting, not after
+///
+/// This used to `try_wait` in a loop and only collect the output once the child
+/// had exited, on the stated precondition that every tool routed through here
+/// writes "a handful of lines, far below the OS pipe buffer". That precondition
+/// was real and it was load-bearing, and nothing but a comment enforced it: a
+/// child whose output exceeds the ~64KiB pipe buffer blocks *writing*, so it
+/// never exits, so `try_wait` never reports it exited, and a perfectly healthy
+/// tool gets killed at the deadline and reported as a timeout.
+///
+/// That is not hypothetical — it is measured. Batching a record type's channels
+/// into one `pvxget`/`pvxinfo` ([`crate::pvatool::PvaTools::pvxget_batch`])
+/// crosses 64KiB at roughly 80 channels, and every batch above it died at the
+/// 8s cap while an 77-channel batch of the same PVs completed in ~30ms. The
+/// deadlock, not pvxs, was the "slowness".
+///
+/// So the readers run concurrently with the wait and the precondition is gone
+/// rather than re-tuned: output size can no longer deadlock any caller, which
+/// is what makes batching safe *by construction* instead of by a size limit
+/// someone has to remember. `camonitor` is still deliberately not run through
+/// this path — it needs its output *incrementally* while it runs, which is a
+/// different requirement from not deadlocking (see [`monitor`]).
+///
+/// Shared with [`crate::pvatool`]: the PVA instrument owes the identical
+/// "a tool that did not finish is an ERROR" guarantee, and a second copy of
+/// this loop would be a second place for that rule to rot.
+pub(crate) fn wait_bounded(
     mut child: std::process::Child,
     timeout: Duration,
 ) -> Result<std::process::Output, String> {
+    // Take the pipes before waiting: these readers are what keep a chatty child
+    // from blocking on a full pipe. They end when the child closes its ends,
+    // which a kill also guarantees, so neither thread can outlive this call.
+    let drain = |s: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut s) = s {
+                let _ = s.read_to_end(&mut buf);
+            }
+            buf
+        })
+    };
+    let out = drain(
+        child
+            .stdout
+            .take()
+            .map(|s| Box::new(s) as Box<dyn Read + Send>),
+    );
+    let err = drain(
+        child
+            .stderr
+            .take()
+            .map(|s| Box::new(s) as Box<dyn Read + Send>),
+    );
+
     let deadline = std::time::Instant::now() + timeout;
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(s)) => break s,
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
+                    // Return WITHOUT joining the readers. The bounded wait is a
+                    // promise, and joining here would break it: anything else
+                    // holding a write end (a grandchild of a shell pipeline,
+                    // say) keeps a reader from ever seeing EOF. The readers own
+                    // their pipe handles and end on their own; their output is
+                    // of no use on this path anyway, since the tool did not
+                    // finish and its partial output is not a reading.
                     return Err(format!("timed out after {timeout:?}"));
                 }
                 std::thread::sleep(Duration::from_millis(10));
             }
             Err(e) => return Err(format!("wait: {e}")),
         }
-    }
-    child
-        .wait_with_output()
-        .map_err(|e| format!("collect output: {e}"))
+    };
+
+    // The child exited, so it has dropped its write ends and both readers are
+    // at (or racing to) EOF. This join is what the old `wait_with_output` did,
+    // minus the deadlock: the reading already happened while we waited.
+    let stdout = out
+        .join()
+        .map_err(|_| "stdout reader panicked".to_string())?;
+    let stderr = err
+        .join()
+        .map_err(|_| "stderr reader panicked".to_string())?;
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sh(script: &str) -> std::process::Child {
+        Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn sh")
+    }
+
+    /// **The boundary that killed the batched PVA reads.** A child whose output
+    /// exceeds the OS pipe buffer (~64KiB) blocks on write until someone drains
+    /// it. Draining only after exit deadlocks: the child cannot exit, so a
+    /// healthy tool is killed at the deadline and reported as a timeout.
+    ///
+    /// Measured before the fix: every `pvxget`/`pvxinfo` batch over ~80
+    /// channels "timed out after 8s", while the same PVs read in ~30ms.
+    ///
+    /// One process, no pipeline, so the only writer is the child itself and a
+    /// hang here could only be the deadlock under test.
+    const CHATTY: &str = "i=0; while [ $i -lt 4000 ]; do \
+                          echo 0123456789abcdefghijklmnopqrstuvwxyz0123456789; \
+                          i=$((i+1)); done";
+
+    #[test]
+    fn a_child_that_outruns_the_pipe_buffer_is_collected_not_timed_out() {
+        // ~188KiB, far past any plausible pipe buffer.
+        let out = wait_bounded(sh(CHATTY), Duration::from_secs(30))
+            .expect("a chatty but healthy child must not be reported as a timeout");
+        assert!(out.status.success());
+        assert_eq!(
+            out.stdout.len(),
+            4000 * 47,
+            "every byte the child wrote must be collected, not just the first pipe-full",
+        );
+    }
+
+    /// Both pipes must be drained: a child that is quiet on stdout but floods
+    /// stderr blocks just the same.
+    #[test]
+    fn a_child_that_floods_stderr_is_also_collected() {
+        let out = wait_bounded(
+            sh(&format!("{{ {CHATTY}; }} 1>&2")),
+            Duration::from_secs(30),
+        )
+        .expect("stderr must be drained too");
+        assert!(out.status.success());
+        assert_eq!(out.stderr.len(), 4000 * 47);
+        assert!(out.stdout.is_empty());
+    }
+
+    /// The guarantee the deadline exists for is unchanged: a tool that really
+    /// does hang becomes an ERROR rather than stalling the run.
+    #[test]
+    fn a_genuinely_hung_child_still_times_out() {
+        let child = sh("sleep 60");
+        let err = wait_bounded(child, Duration::from_millis(300))
+            .expect_err("a hung child must be an ERROR, never a silent empty reading");
+        assert!(err.contains("timed out"), "got: {err}");
+    }
+
+    /// A hung child that has already printed something must STILL be an error —
+    /// draining the pipes must not turn a timeout into a partial success.
+    #[test]
+    fn output_before_a_hang_does_not_launder_the_timeout_into_a_reading() {
+        let child = sh("echo partial; sleep 60");
+        let err = wait_bounded(child, Duration::from_millis(300))
+            .expect_err("a child that printed and then hung did not finish");
+        assert!(err.contains("timed out"), "got: {err}");
+    }
 
     #[test]
     fn parses_cainfo_surface() {

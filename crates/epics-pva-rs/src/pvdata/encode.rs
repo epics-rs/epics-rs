@@ -1255,18 +1255,24 @@ fn coerce_scalar(v: &ScalarValue, st: ScalarType) -> ScalarValue {
         // String → numeric: parse, falling back to the zero value.
         return ScalarValue::parse(st, &s.as_str_lossy()).unwrap_or_else(|_| zero_scalar(st));
     }
-    // Numeric → numeric: route through f64 / i64 to preserve magnitude.
+    // Numeric → numeric: route through f64 / i64 to preserve magnitude. The
+    // double → integer step uses C++ cast semantics, the same as every other
+    // leaf write (`cpp_cast`) — pvxs performs this coercion in
+    // `Value::copyIn` (`data.cpp:551-578`), so a value that does not fit must
+    // overflow the way the C++ cast does rather than saturate the way Rust's
+    // `as` does.
     let as_f64 = scalar_as_f64(v);
+    use crate::pvdata::cpp_cast::{double_to_i64, double_to_u64};
     match st {
         ScalarType::Boolean => ScalarValue::Boolean(as_f64 != 0.0),
-        ScalarType::Byte => ScalarValue::Byte(as_f64 as i8),
-        ScalarType::UByte => ScalarValue::UByte(as_f64 as u8),
-        ScalarType::Short => ScalarValue::Short(as_f64 as i16),
-        ScalarType::UShort => ScalarValue::UShort(as_f64 as u16),
-        ScalarType::Int => ScalarValue::Int(as_f64 as i32),
-        ScalarType::UInt => ScalarValue::UInt(as_f64 as u32),
-        ScalarType::Long => ScalarValue::Long(as_f64 as i64),
-        ScalarType::ULong => ScalarValue::ULong(as_f64 as u64),
+        ScalarType::Byte => ScalarValue::Byte(double_to_i64(as_f64) as i8),
+        ScalarType::UByte => ScalarValue::UByte(double_to_u64(as_f64) as u8),
+        ScalarType::Short => ScalarValue::Short(double_to_i64(as_f64) as i16),
+        ScalarType::UShort => ScalarValue::UShort(double_to_u64(as_f64) as u16),
+        ScalarType::Int => ScalarValue::Int(double_to_i64(as_f64) as i32),
+        ScalarType::UInt => ScalarValue::UInt(double_to_u64(as_f64) as u32),
+        ScalarType::Long => ScalarValue::Long(double_to_i64(as_f64)),
+        ScalarType::ULong => ScalarValue::ULong(double_to_u64(as_f64)),
         ScalarType::Float => ScalarValue::Float(as_f64 as f32),
         ScalarType::Double => ScalarValue::Double(as_f64),
         ScalarType::String => ScalarValue::String(scalar_to_string(v).into()),

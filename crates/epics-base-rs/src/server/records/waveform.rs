@@ -1,6 +1,7 @@
 use crate::error::{CaError, CaResult};
 use crate::server::record::{
-    Ftype, MENU_FTYPE, MENU_YES_NO, ProcessAction, ProcessOutcome, Record, parse_link_v2,
+    FieldMetadataOverride, Ftype, MENU_FTYPE, MENU_YES_NO, ProcessAction, ProcessOutcome, Record,
+    parse_link_v2,
 };
 use crate::server::records::count_put;
 use crate::types::{DbFieldType, EpicsValue, PvString};
@@ -693,6 +694,67 @@ fn dol_is_constant(dol: &str) -> bool {
 impl Record for WaveformRecord {
     fn record_type(&self) -> &'static str {
         self.kind.as_record_type()
+    }
+
+    /// The index fields four kinds answer from their own array bounds rather
+    /// than from the field's type range — so they cannot take the routed
+    /// `default:` arm, and cannot keep the VAL cache either.
+    ///
+    /// `subArrayRecord.c:262-291` `get_control_double` lists four fields beyond
+    /// `VAL`, each bounded by the record's maximum array length `MALM`: `INDX`
+    /// (a 0-based offset, so `MALM - 1` up), `NELM` (a length, so `MALM` up and
+    /// **1** down — C's control lower differs from its graphic lower of 0,
+    /// `:246` vs `:277`), `NORD` (`MALM` up, 0 down) and `BUSY` (a flag: 1/0).
+    ///
+    /// The other three kinds list fewer fields, and bound them by `NELM` (the
+    /// record's own length) rather than by `MALM`:
+    ///
+    /// * `waveformRecord.c:268-289` — `BUSY` (a flag: 1/0) and `NORD` (`NELM`
+    ///   up, 0 down); it does NOT list `NELM`, which is why `NELM` takes the
+    ///   routed type range for a waveform and `MALM` for a subArray.
+    /// * `aaiRecord.c:293-310` / `aaoRecord.c:296-313` — only `NORD`.
+    ///
+    /// `get_graphic_double` is a DIFFERENT list per kind, so the two slots are
+    /// answered separately here:
+    ///
+    /// * `subArray` (`:231-260`) — the same four, but `NELM`'s lower is **0**.
+    /// * `waveform` (`:251-266`) — `BUSY` and `NORD`, same values as control.
+    /// * `aai` (`:276-291`) / `aao` (`:279-294`) — only `NORD`.
+    ///
+    /// `VAL` is absent from both lists here: it answers HOPR/LOPR, which is
+    /// what the VAL metadata cache already holds.
+    fn field_metadata_override(&self, field: &str) -> Option<FieldMetadataOverride> {
+        let malm = self.malm as f64;
+        let nelm = self.nelm as f64;
+        let f = field.to_ascii_uppercase();
+
+        let ctrl_limits = match (self.kind, f.as_str()) {
+            (ArrayKind::SubArray, "INDX") => Some((malm - 1.0, 0.0)),
+            (ArrayKind::SubArray, "NELM") => Some((malm, 1.0)),
+            (ArrayKind::SubArray, "NORD") => Some((malm, 0.0)),
+            (ArrayKind::SubArray, "BUSY") => Some((1.0, 0.0)),
+            (ArrayKind::Waveform, "BUSY") => Some((1.0, 0.0)),
+            (ArrayKind::Waveform | ArrayKind::Aai | ArrayKind::Aao, "NORD") => Some((nelm, 0.0)),
+            _ => None,
+        };
+        let disp_limits = match (self.kind, f.as_str()) {
+            (ArrayKind::SubArray, "INDX") => Some((malm - 1.0, 0.0)),
+            // The graphic lower is 0 where the control lower is 1.
+            (ArrayKind::SubArray, "NELM") => Some((malm, 0.0)),
+            (ArrayKind::SubArray, "NORD") => Some((malm, 0.0)),
+            (ArrayKind::SubArray, "BUSY") => Some((1.0, 0.0)),
+            (ArrayKind::Waveform, "BUSY") => Some((1.0, 0.0)),
+            (ArrayKind::Waveform | ArrayKind::Aai | ArrayKind::Aao, "NORD") => Some((nelm, 0.0)),
+            _ => None,
+        };
+        if ctrl_limits.is_none() && disp_limits.is_none() {
+            return None;
+        }
+        Some(FieldMetadataOverride {
+            ctrl_limits,
+            disp_limits,
+            ..Default::default()
+        })
     }
 
     /// Expose the concrete record so device support can drive the

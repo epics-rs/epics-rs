@@ -129,7 +129,9 @@ A%B  A=-2147483648 B=-1 -> Floating point exception (core dumped)
 ```
 
 ### CBUG-A2: `NINT` / `MODULO` narrow a double with a plain `(epicsInt32)` cast — out-of-range or NaN silently becomes `INT_MIN`
-Bucket: REPRODUCED · Severity: Medium
+Bucket: FIXED-UPSTREAM (base half, PR #925) · Severity: Medium
+Status: base/numeric closed — our PR #925 routes NINT/MODULO through `d2i` and the port
+tracks the fix. sCalc/aCalc mirror pristine synApps per dialect (see Port below).
 C: `calcPerform.c:290-293` (`NINT`): `*ptop = (epicsInt32)(top>=0 ? top+0.5 : top-0.5)`,
 and `calcPerform.c:162-164` (`MODULO`'s dividend cast). Neither uses the `d2i`/`d2ui`
 macros (`calcPerform.c:324-325`) that every sibling bitwise/shift op (`BIT_OR`,
@@ -141,10 +143,29 @@ cast. On x86 an out-of-range `cvttsd2si` yields the "integer indefinite" value
 `myNINT` / `(int)` / `(long)`.
 Defect: platform-dependent wrong result, and the crash vector for CBUG-A1. The C team
 half-fixed this family (bitwise via `d2i`) and left NINT/MODULO exposed.
-Port: `numeric.rs:264-271` (NINT) and `:90-104` (MODULO) route through
-`engine/cast.rs:59-66 c_int`, a deliberate model of x86-64 `cvttsd2si`; pinned by
-`numeric.rs:632` `assert_eq!(run("NINT(3000000000)"), i32::MIN as f64)`.
-Reproduced on purpose — x86-64 is the field target.
+Port (as of `91f9c327`, tracking base PR #925 `669a25697`): NINT/MODULO narrow
+**per-engine, each mirroring its own C dialect**, through the single parameterized
+owners `cast::nint`/`cast::imod`:
+- **numeric (base)** → `d2i` — matches the **fixed** base C. Our upstream PR #925
+  routes NINT/MODULO through `d2i` there, and the oracle ground truth is rebuilt on
+  that fix, so this half is no longer a live deviation: fixed C and port both give
+  `NINT(3e9) = -1294967296`, `3e9 % 7 = 0`.
+- **sCalc (string)** → `c_long` (`(long)`, 64-bit) — mirrors pristine synApps
+  `sCalcPerform.c`; `NINT(3e9) = 3e9`, `3e9 % 7 = 4` (the `(long)` path is actually
+  *correct* for values below 2^63, so there is no base-style bug to fix there).
+- **aCalc (array)** → `c_long` for **NINT** (`aCalcPerform.c:839,1096`, 64-bit) but
+  `c_int` for **MODULO** (`:661,:685,:711`, 32-bit) — a verified **split-width
+  inconsistency inside one engine**. The port mirrors it exactly. aCalc's out-of-range
+  MODULO additionally rides CBUG-E2 (`c_int` saturates to `i32::MAX` where x86
+  `cvttsd2si` gives `INT_MIN`) — pre-existing, separate.
+
+Earlier catalogue text described the port as a reproduced-`cvttsd2si` state pinned to
+`i32::MIN`; that was stale — the port was on a clean no-narrow deviation before
+`91f9c327`, now replaced by the per-engine mirroring above.
+
+Lead (unfiled): aCalc's split narrowing (NINT `(long)` vs MODULO `(int)`) is a
+plausible upstream CBUG — align aCalc MODULO to `(long)`, or route both through a
+`d2i`-style macro as base now does.
 Impact: `NINT(3e9)` returns `-2147483648`; `3e9 % 7` returns `-2`. Any calc record
 that rounds or takes a modulus of a value that can exceed 2^31 (counters, ns
 timestamps, large ADC sums) writes a wrong number to `VAL`/its output link — and the
@@ -1636,3 +1657,85 @@ on both the C IOC and the port.
 Proof (compiled softIoc, this host, and differential oracle):
 `LLIM=10 ULIM=5`, process → C and port both `STAT=NO_ALARM`; `caput .SGNL`
 with inverted limits → C and port both `STAT=SOFT SEVR=INVALID`.
+
+## Batch G — filed 2026-07-17 (PVA differential-oracle campaign, pvxs QSRV2 metadata)
+
+One entry so far. Found not by static audit but by the `epics-oracle-rs`
+PVA differential harness (fat `softIocPVX` QSRV2 ground truth vs
+`oracle-ioc --pva` on the same `.db`): while closing the port's NT
+metadata-routing families, the C ground truth itself was seen to drop a
+metadata leaf a record's rset explicitly supplies. Citation re-read in the
+local pvxs tree (`1.5.2-20-g4070775`, git head `4070775`, current on
+master) before filing.
+
+| id | upstream | one line | severity | bucket |
+|---|---|---|---|---|
+| CBUG-G1 | pvxs (QSRV2) | `getProperties` nests `display.precision` inside the `DBR_GR_DOUBLE` branch — a field that supplies `get_precision` but NULLs `get_graphic_double` (e.g. `bo.HIGH`) loses its precision over PVA | Low | NOT-REPRODUCED |
+
+### CBUG-G1: pvxs QSRV2 serves no `display.precision` for a field whose rset supplies `get_precision` but NULLs `get_graphic_double`
+Bucket: NOT-REPRODUCED · Severity: Low
+C: `pvxs/ioc/iocsource.cpp:254` `getProperties()`. The one `options`
+mask carries every requested DBR slot; `dbChannelGet` clears each bit
+whose rset method is NULL, so `DBR_PRECISION` and `DBR_GR_DOUBLE` arrive
+as **independent** flags (a field can have one without the other).
+`:274` serves `display.units` under its own `DBR_UNITS` gate — correctly
+independent. But the numeric block at `:287-294`:
+```cpp
+if(auto dlL = node["display.limitLow"]) {   // :287  if numeric
+    if(options & DBR_GR_DOUBLE) {           // :288  gate = graphic-limits slot
+        dlL = meta.lower_disp_limit;
+        node["display.limitHigh"] = meta.upper_disp_limit;
+        if(options & DBR_PRECISION) {       // :291  precision's own gate…
+            node["display.precision"] = int32_t(meta.precision.dp);  // :292  …but nested inside DBR_GR_DOUBLE
+        }
+    }
+    if(options & DBR_CTRL_DOUBLE) { … }     // :295  control served independently
+    if(options & DBR_AL_DOUBLE)   { … }     // :299  valueAlarm served independently
+}
+```
+nests the `display.precision` assignment inside `if(options &
+DBR_GR_DOUBLE)`. `display.precision` is gated by `DBR_PRECISION`
+(`get_precision`), a slot with no dependence on `DBR_GR_DOUBLE`
+(`get_graphic_double`). Nesting the two makes precision reachable only
+when the record *also* supplies graphic limits.
+Defect: any field that supplies `get_precision` but NULLs
+`get_graphic_double` has its precision silently dropped over PVA, even
+though the rset answers it and `caget -d DBR_PRECISION` (CA) serves it.
+`std/rec/boRecord.c` is the clean witness: `:55` declares `get_precision`
+(supplied; `:301-308` returns `boHIGHprecision = 2` for `HIGH`), `:59`
+`#define get_graphic_double NULL`, `:60` declares `get_control_double`
+(supplied; `:310-318` returns `0 .. boHIGHlimit` for `HIGH`). So `bo.HIGH`
+— bo's only `DBF_DOUBLE` field — reaches QSRV2 with `DBR_PRECISION` and
+`DBR_CTRL_DOUBLE` set and `DBR_GR_DOUBLE` clear: units and control limits
+are served, precision (2) is dropped. Measured on `softIocPVX`:
+`display.units "s"`, `control.limitHigh 100000`, and **no**
+`display.precision` for `bo.HIGH`.
+Port: **deviates — does not reproduce.** The record layer was always
+faithful (`bo`'s `field_metadata_override`,
+`crates/epics-base-rs/src/server/records/bo.rs:151-160`, transcribes the
+rset answer `precision: Some(2)`); the drop lived only in the wire-marking
+model. `crates/epics-pva-rs/src/nt/qsrv_marks.rs` `property_leaves` now
+gates `display.precision` on its own `DBR_PRECISION` slot, independent of
+`DBR_GR_DOUBLE`, so the served precision reaches the wire. Measured across
+the fat PVA dbd, this is the whole family — every field of the seven types
+whose rset supplies `get_precision` but NULLs `get_graphic_double`
+(`bo`/`mbbiDirect`/`mbboDirect` in base; `busy`/`asyn`/`transform`/`sseq`
+in the modules), 62 channels, of which only `bo.HIGH` carries a meaningful
+value (2 = `boHIGHprecision`); the other 61 serve `0`, the `recGblGetPrec`
+default — the same value CA serves, so this is PVA-vs-CA consistency, not a
+new number. The deviation is carried on the oracle allowlist as CBUG-G1
+(`crates/epics-oracle-rs/allowlist/expected-deviations.toml`,
+`port_adds_leaves = ["display.precision"]`, content-constrained so it
+justifies only the precision add and launders no other marking diff); the
+PVA read phase classifies all 62 as EXPECTED DEVIATION.
+Impact: over PVA (pvxs QSRV2 and the parity-faithful port alike), the
+`HIGH` field of a `bo` record — and any field of any type whose rset
+supplies `get_precision` but not `get_graphic_double` — carries no
+`display.precision`, so a PVA client renders it at default precision while
+the same field over CA (`caget -d DBR_PRECISION`) reports the rset's
+value.
+Proof: `iocsource.cpp:274` (units, independent gate) vs `:287-294`
+(precision nested under `DBR_GR_DOUBLE`) quoted; `boRecord.c:55/59/60`
+(precision + control supplied, graphic NULL) and `:301-308` (`HIGH` →
+`boHIGHprecision`) quoted; `softIocPVX` GET of `bo.HIGH` shows units +
+control, no precision.

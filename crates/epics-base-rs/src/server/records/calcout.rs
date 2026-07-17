@@ -3,7 +3,8 @@ use super::link_status::{LINK_CON, LINK_STATUS_CHOICES, LinkRole, LinkStatusGen,
 use crate::error::{CaError, CaResult};
 use crate::server::database::AsyncDbHandle;
 use crate::server::record::{
-    InputFetchPolicy, ProcessAction, ProcessOutcome, Record, RecordProcessResult,
+    FieldMetadataOverride, InputFetchPolicy, ProcessAction, ProcessOutcome, Record,
+    RecordProcessResult,
 };
 #[cfg(test)]
 use crate::types::DbFieldType;
@@ -17,6 +18,14 @@ const CALCOUT_INAV_FIELDS: [&str; 21] = [
     "INAV", "INBV", "INCV", "INDV", "INEV", "INFV", "INGV", "INHV", "INIV", "INJV", "INKV", "INLV",
     "INMV", "INNV", "INOV", "INPV", "INQV", "INRV", "INSV", "INTV", "INUV",
 ];
+
+/// C `calcoutRecord.c:89` `int calcoutODLYprecision = 2;` — the precision
+/// `get_precision` serves for `ODLY`, the output-delay field.
+const CALCOUT_ODLY_PRECISION: i16 = 2;
+
+/// C `calcoutRecord.c:91` `double calcoutODLYlimit = 100000;` — the control
+/// upper `get_control_double` serves for `ODLY`, over a literal `0.0` lower.
+const CALCOUT_ODLY_LIMIT: f64 = 100000.0;
 
 /// Calcout record — calc with output.
 pub struct CalcoutRecord {
@@ -452,6 +461,43 @@ const CALCOUT_DOPT_CHOICES: &[&str] = &["Use CALC", "Use OCAL"];
 impl Record for CalcoutRecord {
     fn record_type(&self) -> &'static str {
         "calcout"
+    }
+
+    /// `ODLY` is the one field in base whose graphic case is neither the
+    /// record's limits, nor a link, nor a plain `default:` arm
+    /// (`calcoutRecord.c:471-474`):
+    ///
+    /// ```c
+    /// case indexof(ODLY):
+    ///     recGblGetGraphicDouble(paddr,pgd);
+    ///     pgd->lower_disp_limit = 0.0;
+    /// ```
+    ///
+    /// It calls recGbl for the type range and then OVERWRITES the lower with a
+    /// literal 0 — a delay cannot be negative. So `ODLY` serves the DBF_DOUBLE
+    /// upper of 1e300 with a lower of 0, which no single routed arm produces.
+    /// `get_units` (`:425-444`) and `get_precision` (`:446-465`) each test
+    /// `ODLY` FIRST and return early with a literal — `"s"` and
+    /// `calcoutODLYprecision` (`= 2`, `:89`) — so ODLY never reaches the EGU /
+    /// PREC arms those functions serve to every other DBF_DOUBLE field. The
+    /// early return is what makes this an override rather than a default: the
+    /// record's own EGU/PREC would otherwise win.
+    ///
+    /// `get_control_double` (`:506-530`) gives ODLY its own `case` alongside
+    /// the eight VAL-class fields, and answers it `0.0 .. calcoutODLYlimit`
+    /// (`= 100000`, `:91`) rather than the HOPR/LOPR those eight take — so the
+    /// control slot's answer is a literal here too, and a different one from
+    /// the graphic slot's `0 .. 1e300` two fields up.
+    fn field_metadata_override(&self, field: &str) -> Option<FieldMetadataOverride> {
+        field
+            .eq_ignore_ascii_case("ODLY")
+            .then(|| FieldMetadataOverride {
+                units: Some("s".into()),
+                precision: Some(CALCOUT_ODLY_PRECISION),
+                disp_limits: Some((1e300, 0.0)),
+                ctrl_limits: Some((CALCOUT_ODLY_LIMIT, 0.0)),
+                ..Default::default()
+            })
     }
 
     // C raises UDF_ALARM from BOTH `checkAlarms` and `execOutput`, and

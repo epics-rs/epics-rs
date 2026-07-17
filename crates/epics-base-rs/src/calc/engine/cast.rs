@@ -6,11 +6,20 @@
 //! between dialects, which is how the port ended up running base's `d2i` inside
 //! sCalc and aCalc, neither of which has that macro at all:
 //!
-//! | dialect | bit / shift ops | MODULO |
+//! | dialect | bit / shift ops | MODULO / NINT |
 //! |---|---|---|
-//! | base `calcPerform.c` | [`d2i`] / [`d2ui`] (:324-325, :329-366) | plain `(epicsInt32)` (:162-164) |
-//! | sCalc `sCalcPerform.c` | plain `(long)` (:578-631, :725) | `(int)` no-string path (:562), `(long)` string path (:1109) |
-//! | aCalc `aCalcPerform.c` | plain `(int)` (:907, :1355-1357, :1424-1427) | plain `(int)` (:650, :674, :701) |
+//! | base `calcPerform.c` | [`d2i`] / [`d2ui`] (:324-325, :329-366) | [`d2i`] (MODULO :176-190, NINT :313-317) since `669a25697` / PR #925 |
+//! | sCalc `sCalcPerform.c` | plain `(long)` (:578-631, :725) | [`c_long`] — `(long)` (MODULO :1121, NINT :730) |
+//! | aCalc `aCalcPerform.c` | plain `(int)` (:907, :1355-1357, :1424-1427) | MODULO [`c_int`] — `(int)` (:661, :685, :711); NINT [`c_long`] — `(long)` (:839, :1096) |
+//!
+//! MODULO and NINT share the single [`nint`]/[`imod`] owners, but each engine
+//! passes its OWN dialect's narrowing — one logic, several narrowings. The C
+//! engines have genuinely different integer widths, so the port mirrors each
+//! rather than forcing one; sCalc's `(long)` even loses less than base's `d2i`
+//! (3e9 survives 64-bit intact). Note aCalc is internally inconsistent: its NINT
+//! is `(long)` (64-bit) but its MODULO is `(int)` (32-bit), so the array engine
+//! passes `c_long` to [`nint`] and `c_int` to [`imod`]. The zero-divisor
+//! disposition and the `-1 → 0` guard are uniform (CBUG-A2/A1).
 //!
 //! [`d2i`]/[`d2ui`] are *not* general truncating casts: they route a
 //! non-negative double through `epicsUInt32` first, so `3e9` becomes
@@ -23,8 +32,8 @@
 ///
 /// A non-negative double goes through `epicsUInt32`, so the full 32-bit
 /// pattern survives and bit 31 lands as the sign bit — `d2i(3e9)` is
-/// `-1294967296`, not an overflow. Base uses this for BIT_OR/AND/XOR/NOT and
-/// the shifts, and for nothing else.
+/// `-1294967296`, not an overflow. Base uses this for BIT_OR/AND/XOR/NOT, the
+/// shifts, and — since `669a25697` / PR #925 — NINT and MODULO too.
 #[inline]
 pub(crate) fn d2i(x: f64) -> i32 {
     if x < 0.0 {
@@ -102,57 +111,62 @@ pub(crate) fn c_long(x: f64) -> i64 {
     crate::types::c_cast::f64_to_i64(x)
 }
 
-/// `NINT` — round half away from zero, and **do not narrow**.
+/// `NINT` — round half away from zero, then narrow with the caller's dialect
+/// cast (`narrow`). One body, per-dialect narrowing: the numeric engine passes
+/// [`d2i`] (base's fixed `calcPerform.c:313-317`, `669a25697`/PR #925), and both
+/// sCalc (`sCalcPerform.c:730`) and aCalc (`aCalcPerform.c:839,1096`) pass
+/// [`c_long`] — BOTH synApps engines narrow NINT with `(long)`, 64-bit — each
+/// mirroring THAT dialect's own C.
 ///
-/// **DEVIATION from C, deliberate — CBUG-A2.** All three engines narrow the
-/// rounded double with a bare cast before pushing it back onto a `double` stack:
-/// base `(epicsInt32)(top >= 0 ? top+0.5 : top-0.5)` (`calcPerform.c:290-293`),
-/// sCalc `(long)` (`sCalcPerform.c:716-719`), aCalc `(long)` (`aCalcPerform.c:827`).
-/// Out of the destination's range that cast is undefined; on x86-64 it yields
-/// `cvttsd2si`'s indefinite value, so C answers `NINT(3e9) = -2147483648` and
-/// `NINT(NaN) = -2147483648`.
+/// C shape, identical in all three but for the cast:
 ///
-/// The narrowing serves no purpose here — the operand and the result are both
-/// `double`, the documented contract is "nearest integer"
-/// (`calcRecord.dbd.pod`), and C's own `d2i` comment (`:313-322`) says
-/// out-of-range double→int conversions "give very different results on different
-/// systems", which is why every sibling bitwise op was routed through a guard
-/// that NINT and MODULO never got. We round and stop: `NINT(3e9)` is `3e9`,
-/// `NINT(NaN)` is `NaN`, `NINT(inf)` is `inf`. Inside `[i32::MIN, i32::MAX]` this
-/// is bit-identical to C, which is every value a calc record actually rounds.
+/// ```c
+/// top = top >= 0 ? top + 0.5 : top - 0.5;
+/// *ptop = <narrow>(top);
+/// ```
 ///
-/// C's `(x >= 0 ? x+0.5 : x-0.5)` then truncate-toward-zero IS the rounding rule;
-/// only the width is dropped.
+/// So `NINT(3e9)` is `d2i(3e9) = -1294967296` in base (the u32 reinterpretation),
+/// but `(long)3e9 = 3000000000` in both sCalc and aCalc (64-bit, no loss).
+/// Inside each width's range the three agree and are bit-identical to their C.
 #[inline]
-pub(crate) fn nint(x: f64) -> f64 {
-    if x.is_nan() {
-        x
-    } else if x >= 0.0 {
-        (x + 0.5).floor()
-    } else {
-        (x - 0.5).ceil()
-    }
+pub(crate) fn nint(x: f64, narrow: impl Fn(f64) -> i64) -> f64 {
+    let rounded = if x >= 0.0 { x + 0.5 } else { x - 0.5 };
+    narrow(rounded) as f64
 }
 
-/// `MODULO` — truncate both operands toward zero, then take the remainder,
-/// **without narrowing to an integer type**.
+/// `MODULO` — narrow both operands with the caller's dialect cast (`narrow`),
+/// then take the integer remainder. Returns `None` when the divisor narrows to
+/// zero. One body, three narrowings — see [`nint`] for the per-dialect casts.
 ///
-/// **DEVIATION from C, deliberate — CBUG-A2.** C narrows the dividend and the
-/// divisor with a bare cast first (base `(epicsInt32)`, `calcPerform.c:162-164`;
-/// sCalc `(int)`/`(long)`; aCalc `(int)`), so `3e9 % 7` is `INT_MIN % 7 = -2`
-/// instead of `4`, and the answer changes with the CPU. `f64`'s remainder is the
-/// same truncated remainder C's integer `%` computes, exactly, for every operand
-/// pair inside the cast's range — and it stays correct outside it.
+/// C shape, identical in all three engines but for the cast width (base's fixed
+/// `calcPerform.c:176-190`; sCalc `sCalcPerform.c:558-563`/`:1102-1110`; aCalc
+/// `aCalcPerform.c:645-703`):
 ///
-/// This also removes the UB dividend that made CBUG-A1 (`INT_MIN % -1` SIGFPE)
-/// reachable at all.
+/// ```c
+/// itop = <narrow>(top);                  /* divisor */
+/// if (itop == 0)       *ptop = epicsNAN; /* caller's zero rule */
+/// else if (itop == -1) *ptop = 0;        /* x % -1 == 0, dodges INT_MIN % -1 */
+/// else                 *ptop = <narrow>(*ptop) % itop;
+/// ```
 ///
-/// The caller keeps its own engine's zero-divisor rule (base NaN, sCalc error,
-/// aCalc `myMAXFLOAT`) — that part of C is not a bug. The divisor is zero
-/// exactly when it truncates to zero, as in C.
+/// `None` signals the divisor narrowed to 0 so the caller applies its engine's
+/// zero-divisor rule (base `NaN`, sCalc error, aCalc `myMAXFLOAT`) — exactly the
+/// three arms C's own `case MODULO` splits into. A `-1` divisor returns `0`,
+/// both mathematically correct (`x % -1 == 0` for every integer) and the value
+/// all three C engines now define (calc PR #38 + base `fd64a84aa`) to avoid the
+/// undefined `INT_MIN % -1` that x86 `idiv` traps as SIGFPE.
 #[inline]
-pub(crate) fn imod(a: f64, b: f64) -> f64 {
-    a.trunc() % b.trunc()
+pub(crate) fn imod(a: f64, b: f64, narrow: impl Fn(f64) -> i64) -> Option<f64> {
+    let divisor = narrow(b);
+    if divisor == 0 {
+        None
+    } else if divisor == -1 {
+        // x % -1 == 0; also the one input the raw `%` leaves UB (INT_MIN % -1),
+        // which x86 `idiv` traps as SIGFPE — never reach the `%` below for it.
+        Some(0.0)
+    } else {
+        Some((narrow(a) % divisor) as f64)
+    }
 }
 
 /// `(epicsInt32)x` where the value is already known to be in `epicsUInt32`

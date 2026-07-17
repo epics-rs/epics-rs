@@ -82,5 +82,9 @@ jobs:
 
       # `ci` profile (.config/nextest.toml) adds retries for the
       # genuinely flaky network/timing integration suites.
+      # epics-oracle-rs is excluded: it boots the compiled C `softIoc` for
+      # ground truth and fails loudly (by design) without the C EPICS tree,
+      # which no runner has. Excluded here — not silenced — and still runs
+      # locally where the tree exists.
       - name: Test (nextest)
-        run: cargo nextest run --workspace --profile ci
+        run: cargo nextest run --workspace --exclude epics-oracle-rs --profile ci

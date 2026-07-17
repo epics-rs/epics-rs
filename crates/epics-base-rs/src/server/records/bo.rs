@@ -1,5 +1,7 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{MENU_SIMM, ProcessAction, ProcessOutcome, Record};
+use crate::server::record::{
+    FieldMetadataOverride, MENU_SIMM, ProcessAction, ProcessOutcome, Record,
+};
 use crate::types::{EpicsValue, PvString};
 
 /// Binary output record matching C boRecord behavior.
@@ -111,9 +113,51 @@ impl BoRecord {
     }
 }
 
+/// C `boRecord.c:85` `int boHIGHprecision = 2;` — the precision
+/// `get_precision` serves for `HIGH`, the seconds-to-hold-1 field.
+const BO_HIGH_PRECISION: i16 = 2;
+
+/// C `boRecord.c:87` `double boHIGHlimit = 100000;` — the control upper
+/// `get_control_double` (`:310-318`) serves for `HIGH`, over a literal `0.0`
+/// lower.
+const BO_HIGH_LIMIT: f64 = 100000.0;
+
 impl Record for BoRecord {
     fn record_type(&self) -> &'static str {
         "bo"
+    }
+
+    /// `HIGH` is bo's only DBF_DOUBLE field, and both metadata literals in the
+    /// rset are its: `get_units` (`:294-299`) answers `"s"` and `get_precision`
+    /// (`:301-308`) answers `boHIGHprecision`; every other field falls to
+    /// `recGblGetPrec`.
+    ///
+    /// Over PVA, pvxs nests the `display.precision` assignment inside the
+    /// `DBR_GR_DOUBLE` branch (`iocsource.cpp:288-292`), and bo's rset serves
+    /// no graphic limits for `HIGH`, so pvxs never assigns the precision leaf —
+    /// `softIocPVX` prints `display.units "s"` and no `display.precision` at
+    /// all for `bo.HIGH`. That is CBUG-G1, an upstream metadata-loss bug; the
+    /// port declines to reproduce it. `nt::qsrv_marks::property_leaves` gates
+    /// `display.precision` on its own `DBR_PRECISION` slot, so this transcribed
+    /// value (2) reaches the wire — a deliberate deviation from `softIocPVX`,
+    /// carried on the oracle allowlist.
+    ///
+    /// `get_control_double` (`:310-318`) is the same one-field shape and DOES
+    /// reach the wire: `HIGH` alone takes `0.0 .. boHIGHlimit`, and every other
+    /// field — `LALM` and `MLST` included — falls to `recGblGetControlDouble`.
+    /// That is why `bo` lists nothing in
+    /// [`control_explicit_field`](crate::server::record::RecordInstance): the
+    /// one field the rset lists is answered here, by a literal, not by the
+    /// record's HOPR/LOPR.
+    fn field_metadata_override(&self, field: &str) -> Option<FieldMetadataOverride> {
+        field
+            .eq_ignore_ascii_case("HIGH")
+            .then(|| FieldMetadataOverride {
+                units: Some("s".into()),
+                precision: Some(BO_HIGH_PRECISION),
+                ctrl_limits: Some((BO_HIGH_LIMIT, 0.0)),
+                ..Default::default()
+            })
     }
 
     /// C `boRecord.c:192-205`: `process()` clears `udf` to FALSE only on a

@@ -1,6 +1,7 @@
 //! pvData runtime model: scalar tags/values, structures, and field
 //! descriptors. Wire encoding/decoding lives in [`encode`].
 
+pub(crate) mod cpp_cast;
 mod field;
 mod rpc_reply;
 mod scalar;

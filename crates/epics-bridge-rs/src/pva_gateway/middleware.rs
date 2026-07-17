@@ -993,6 +993,33 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
         }
         self.inner.channel_array_get_length(checked, ctx).await
     }
+    /// SEARCH advertisement is gated by the same static allowlist as
+    /// [`Self::has_pv`] and [`Self::list_pvs`] — a denied name must not be
+    /// answered on UDP discovery.
+    ///
+    /// The gate lives HERE rather than in the caller. `searchable` is the sole
+    /// SEARCH predicate: `CompositeSource` asks it alone, because pvxs's
+    /// `onSearch`/`onCreate` are independent callbacks and a source may
+    /// legitimately advertise a name it later refuses at create (a
+    /// `DBF_NOACCESS` field). While the composite still ANDed `has_pv` into
+    /// the search reply, this layer's deny reached SEARCH only as a side
+    /// effect of that conjunction, so forwarding `searchable` bare was safe by
+    /// accident, not by policy. It is not defensible on its own terms: an ACL
+    /// that filters `list_pvs` so an introspection sweep cannot "leak the
+    /// names of denied PVs" must not then answer a SEARCH for one.
+    async fn searchable(&self, name: &str) -> bool {
+        if !self.config.allowed(name) {
+            return false;
+        }
+        self.inner.searchable(name).await
+    }
+    /// Endpoint-scoped [`Self::searchable`] — same allowlist gate, same reason.
+    async fn searchable_from(&self, name: &str, requester: SocketAddr) -> bool {
+        if !self.config.allowed(name) {
+            return false;
+        }
+        self.inner.searchable_from(name, requester).await
+    }
     // forward the per-PV watermark levels so the inner
     // gateway source's `monitor_watermarks` override is reachable
     // through the wrapper stack. Without this the server's monitor loop
@@ -1021,22 +1048,17 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
     // All of these are queried or fired on the BOUND OWNER, which for a
     // middleware wrapper is the wrapper itself (`resolve_owner` keeps the
     // default `None` so every op keeps routing through this layer).
-    // Forwarding them preserves a wrapped source's SEARCH advertisement
-    // (`searchable`/`searchable_from`, e.g. a ServerInfoSource that hides
-    // from UDP discovery), its registry beacon-change signal, its
-    // per-channel report info (captured once at admission and surfaced in
-    // the server report), and its channel open/close lifecycle callbacks
-    // (e.g. a SharedPV acquiring/releasing a per-channel lease).
+    // Forwarding them preserves a wrapped source's registry beacon-change
+    // signal, its per-channel report info (captured once at admission and
+    // surfaced in the server report), and its channel open/close lifecycle
+    // callbacks (e.g. a SharedPV acquiring/releasing a per-channel lease).
+    // The SEARCH advertisement pair (`searchable`/`searchable_from`) is
+    // forwarded too, but only after this layer's allowlist gate — see those
+    // methods above.
     // `resolve_owner` is deliberately NOT forwarded — doing so would bind
     // the inner as the channel owner and bypass this layer entirely.
     fn beacon_change(&self) -> u64 {
         self.inner.beacon_change()
-    }
-    async fn searchable(&self, name: &str) -> bool {
-        self.inner.searchable(name).await
-    }
-    async fn searchable_from(&self, name: &str, requester: SocketAddr) -> bool {
-        self.inner.searchable_from(name, requester).await
     }
     async fn channel_report_info(&self, name: &str, ctx: ChannelContext) -> Option<String> {
         self.inner.channel_report_info(name, ctx).await
@@ -2245,6 +2267,78 @@ mod tests {
             "ACL denial must classify as Denied: {err:?}"
         );
         assert!(err.message.contains("denied"));
+    }
+
+    /// A denied PV must not be SEARCH-advertised, and the ACL layer must
+    /// enforce that ITSELF rather than inherit it from a caller.
+    ///
+    /// `CompositeSource` asks `searchable` alone — it no longer ANDs
+    /// `has_pv(name) && searchable(name)`, because pvxs's `onSearch` and
+    /// `onCreate` are independent and a source may legitimately advertise a
+    /// name it refuses at create (a `DBF_NOACCESS` field). Under the old
+    /// conjunction this layer's deny reached SEARCH only as a side effect of
+    /// `has_pv` being consulted, so forwarding `searchable` bare to the inner
+    /// looked correct. It was safe by accident: an inner that advertises the
+    /// name (below) would have leaked it the moment the caller stopped ANDing.
+    /// `list_pvs` is already filtered here so introspection cannot "leak the
+    /// names of denied PVs"; SEARCH is the same disclosure, so it is gated at
+    /// the same place.
+    #[tokio::test]
+    async fn acl_denied_pv_is_not_search_advertised() {
+        /// Advertises every name — so only the ACL's own gate can deny.
+        struct AdvertisesEverything;
+        impl ChannelSource for AdvertisesEverything {
+            async fn list_pvs(&self) -> Vec<String> {
+                vec!["SECRET:KEY".into(), "PUBLIC:PV".into()]
+            }
+            async fn has_pv(&self, _name: &str) -> bool {
+                true
+            }
+            async fn searchable(&self, _name: &str) -> bool {
+                true
+            }
+            async fn searchable_from(&self, _name: &str, _requester: SocketAddr) -> bool {
+                true
+            }
+            async fn get_introspection(&self, _name: &str) -> Option<FieldDesc> {
+                Some(FieldDesc::Scalar(ScalarType::Double))
+            }
+            async fn get_value(&self, _name: &str) -> Option<PvField> {
+                Some(PvField::Scalar(ScalarValue::Double(0.0)))
+            }
+            async fn put_value(&self, _name: &str, _value: PvField) -> Result<(), OpError> {
+                Ok(())
+            }
+            async fn is_writable(&self, _name: &str) -> bool {
+                true
+            }
+            async fn subscribe(&self, _name: &str) -> Option<mpsc::Receiver<PvField>> {
+                None
+            }
+        }
+
+        let requester: SocketAddr = "10.0.0.5:5076".parse().unwrap();
+        let cfg = AclConfig::default().deny_regex(r"SECRET:.*").unwrap();
+        let acl = AclLayer::new(cfg).layer(AdvertisesEverything);
+
+        assert!(
+            !acl.searchable("SECRET:KEY").await,
+            "a denied PV must not be UDP-search-advertised, even when the \
+             inner source advertises it"
+        );
+        assert!(
+            !acl.searchable_from("SECRET:KEY", requester).await,
+            "a denied PV must not be TCP-circuit search-advertised either"
+        );
+        assert!(
+            !acl.list_pvs().await.contains(&"SECRET:KEY".to_string()),
+            "the sibling advertisement surface must stay filtered"
+        );
+
+        // An allowed name still reaches the inner's own answer — the gate
+        // must deny, not blanket-suppress.
+        assert!(acl.searchable("PUBLIC:PV").await);
+        assert!(acl.searchable_from("PUBLIC:PV", requester).await);
     }
 
     /// Audit-event classifier tags ACL/read-only error messages

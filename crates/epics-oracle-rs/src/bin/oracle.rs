@@ -11,11 +11,12 @@ use std::process::ExitCode;
 use clap::{Parser, ValueEnum};
 use epics_oracle_rs::allowlist::Allowlist;
 use epics_oracle_rs::dbd::Dbd;
-use epics_oracle_rs::ioc::CTools;
+use epics_oracle_rs::ioc::{CTools, PvxTools};
 use epics_oracle_rs::report::{Counts, Denominator, Report, StaleRow};
 use epics_oracle_rs::runner::{Runner, select_types, workdir};
 use epics_oracle_rs::surface::{Coverage, Surface, probe_supported_record_types};
 use epics_oracle_rs::{Verdict, report::CaseResult};
+use epics_oracle_rs::{pvamonitor, pvaread};
 
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
 enum Phase {
@@ -25,6 +26,27 @@ enum Phase {
     Put,
     /// Monitor event sequence and count.
     Monitor,
+    /// **PVA** read: every channel of the `.dbd` surface on pvxs QSRV2
+    /// (`softIocPVX`) and on `oracle-ioc --pva`, on two contracts — the
+    /// declared type (`pvxinfo`) and the value+marking (`pvxget`).
+    ///
+    /// Deliberately outside `All`. It shares the CA phases' denominator (QSRV2
+    /// serves base's dbChannel namespace) but nothing else: a different ground
+    /// truth (`softIocPVX`, not base's `softIoc`), a different instrument
+    /// (`pvxget`, not `caget`), and no allowlist — `doc/upstream-c-bugs.md` is
+    /// about C's CA behaviour and justifies nothing about QSRV2. Folding it
+    /// into `All` would merge two populations of cases whose verdicts are not
+    /// comparable, into one set of counts.
+    PvaRead,
+    /// **PVA** monitor: subscribe on both sides, drive one value sequence, and
+    /// diff the events each server posted — seed text, update text, event count.
+    ///
+    /// Outside `All` for the same reason as [`Phase::PvaRead`], and its
+    /// denominator is narrower still: the `VAL` channel of each record type, on
+    /// two reproducers (passive and scanned). A monitor case needs a *drive*,
+    /// and a put processes the record — so sibling channels cannot be driven
+    /// concurrently and attributed. See [`epics_oracle_rs::pvamonitor`].
+    PvaMonitor,
     All,
 }
 
@@ -75,6 +97,13 @@ async fn main() -> ExitCode {
 
 async fn run() -> Result<ExitCode, String> {
     let args = Args::parse();
+
+    if args.phase == Phase::PvaRead {
+        return run_pva_read(&args).await;
+    }
+    if args.phase == Phase::PvaMonitor {
+        return run_pva_monitor(&args).await;
+    }
 
     // Ground truth must exist. Without it there is nothing to diff against, and
     // pretending otherwise would be the worst possible failure mode.
@@ -197,6 +226,101 @@ async fn run() -> Result<ExitCode, String> {
     println!("{}", report.human());
 
     // A DEFECT or an ERROR both fail the run. "Could not measure" is not a pass.
+    let ok = report.counts.defect == 0 && report.counts.errored == 0;
+    Ok(if ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
+}
+
+/// The PVA read phase. Its own path rather than a branch inside the CA run: it
+/// has a different ground truth (pvxs `softIocPVX`, not base's `softIoc`), a
+/// different instrument (`pvxget`/`pvxinfo`, not `caget`), and no allowlist, so
+/// the CA allowlist/report machinery above has nothing to say about it.
+///
+/// What it *does* share is the denominator, and that is not a convenience: QSRV2
+/// hands channel names straight to base's `dbChannelTest`
+/// (`singlesource.cpp:469`), so its namespace is exactly the `record.FIELD` set
+/// [`Surface`] already enumerates from the `.dbd`.
+async fn run_pva_read(args: &Args) -> Result<ExitCode, String> {
+    // Ground truth must exist. Without it there is nothing to diff against, and
+    // pretending otherwise would be the worst possible failure mode.
+    let tools = PvxTools::discover().map_err(|e| e.to_string())?;
+    let dbd = Dbd::parse_file(&args.dbd)?;
+
+    // Which record types the port implements is MEASURED, not read out of its
+    // source -- the same probe the CA phases use, for the same reason.
+    eprintln!("probing which record types the port implements...");
+    let supported = probe_supported_record_types(&dbd).await;
+    let surface = Surface::build(&dbd, &supported);
+    let types = select_types(&surface, &args.record_types);
+
+    eprintln!(
+        "denominator: {} PVA channels across {} record types ({} unimplemented)",
+        surface.denominator(),
+        surface.covered_types.len(),
+        surface.unimplemented_types.len()
+    );
+
+    let mut allowlist = match &args.allowlist {
+        Some(p) => Allowlist::load(p)?,
+        None => Allowlist::load(&Allowlist::default_path())?,
+    };
+    let cases = pvaread::probe(&tools, &workdir(None)?, &surface, &types, &mut allowlist);
+    let report = pvaread::report(&args.dbd.display().to_string(), &surface, cases, &allowlist);
+    report.counts.check()?;
+
+    if let Some(p) = &args.json {
+        std::fs::write(p, report.to_json()).map_err(|e| format!("write {}: {e}", p.display()))?;
+        eprintln!("wrote {}", p.display());
+    }
+    println!("{}", report.human());
+
+    // Same rule as the CA phases: a case that could not run fails the run
+    // exactly like a wrong one.
+    let ok = report.counts.defect == 0 && report.counts.errored == 0;
+    Ok(if ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
+}
+
+/// The PVA monitor phase: the analogue of CA's Phase C, one protocol over.
+async fn run_pva_monitor(args: &Args) -> Result<ExitCode, String> {
+    // Ground truth must exist. Without it there is nothing to diff against.
+    let tools = PvxTools::discover().map_err(|e| e.to_string())?;
+    let dbd = Dbd::parse_file(&args.dbd)?;
+
+    eprintln!("probing which record types the port implements...");
+    let supported = probe_supported_record_types(&dbd).await;
+    let surface = Surface::build(&dbd, &supported);
+    let types = select_types(&surface, &args.record_types);
+
+    eprintln!(
+        "denominator: the VAL channel of each of {} record types, on 2 reproducers \
+         (the {} channels of the read surface are NOT all driven -- see the report)",
+        surface.covered_types.len(),
+        surface.denominator()
+    );
+
+    let mut allowlist = match &args.allowlist {
+        Some(p) => Allowlist::load(p)?,
+        None => Allowlist::load(&Allowlist::default_path())?,
+    };
+    let cases = pvamonitor::probe(&tools, &workdir(None)?, &surface, &types, &mut allowlist);
+    let report = pvamonitor::report(&args.dbd.display().to_string(), &surface, cases, &allowlist);
+    report.counts.check()?;
+
+    if let Some(p) = &args.json {
+        std::fs::write(p, report.to_json()).map_err(|e| format!("write {}: {e}", p.display()))?;
+        eprintln!("wrote {}", p.display());
+    }
+    println!("{}", report.human());
+
+    // Same rule as every other phase: a case that could not run fails the run
+    // exactly like a wrong one.
     let ok = report.counts.defect == 0 && report.counts.errored == 0;
     Ok(if ok {
         ExitCode::SUCCESS

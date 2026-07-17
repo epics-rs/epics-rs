@@ -1,4 +1,5 @@
 use crate::server::record::{AlarmSeverity, CommonFields};
+use crate::types::DbFieldType;
 
 pub mod simm;
 
@@ -439,9 +440,322 @@ pub fn get_time_stamp(tse: i16, device_time: std::time::SystemTime) -> std::time
     }
 }
 
+/// C's `getMaxRangeValues` (`recGbl.c:372-419`) — the DBF-type numeric range a
+/// record hands back for a field whose limits it does not supply itself.
+///
+/// Returns `(upper, lower)`, C's argument order (`pupper_limit`,
+/// `plower_limit`).
+///
+/// This is the ONLY table of these constants in the workspace. Both
+/// [`rec_gbl_get_graphic_double`] and [`rec_gbl_get_control_double`] route
+/// here, exactly as C's `recGblGetGraphicDouble` (`recGbl.c:146-153`) and
+/// `recGblGetControlDouble` (`recGbl.c:164-171`) both call it — the display
+/// and control defaults are the same numbers by construction, not by two
+/// copies that happen to agree.
+///
+/// # `None` is a real answer, not "unknown"
+///
+/// C's switch has **no `default:` branch**. For `DBF_STRING`, `DBF_MENU`,
+/// `DBF_DEVICE`, `DBF_NOACCESS` and the link types it writes NOTHING, so the
+/// caller's pre-init survives onto the wire: `dbAccess.c:216` zeroes the
+/// graphic struct and `dbAccess.c:256` the control struct *before* calling the
+/// rset slot. `None` therefore means **leave the limit at 0.0** — a caller that
+/// substitutes a range of its own is wrong, and a caller that treats `None` as
+/// "drop the field" is also wrong (the option bit stays on; only a NULL rset
+/// slot clears it, `dbAccess.c:217-220`).
+fn get_max_range_values(
+    field_type: Option<DbFieldType>,
+    is_menu_field: bool,
+) -> Option<(f64, f64)> {
+    // A `DBF_MENU` field is `DbFieldType::Enum` in this port, because the
+    // generator types it as the `DBR_ENUM` it is SERVED as. C keys this switch
+    // on `pdbFldDes->field_type`, where `DBF_MENU` and `DBF_ENUM` are distinct
+    // codes and only `DBF_ENUM` has a case — so a menu field gets no range at
+    // all. Same conflation, same discriminator, as
+    // `PropertySupport::narrowed_to_field`.
+    if is_menu_field {
+        return None;
+    }
+    // `None` = a `runtime_typed` field (`aSub`'s `A`..`U`, `waveform.VAL`).
+    // Its `.dbd` declaration is `DBF_NOACCESS`, and C reads the STATIC
+    // `pdbFldDes->field_type` here (`recGbl.c:151`, `:169`) — `cvt_dbaddr`'s
+    // runtime retype never reaches this switch. NOACCESS has no case, so
+    // nothing is written. This is why `aSub.A`'s control limits are 0.0 in C
+    // despite `aSubRecord.c:372` calling `recGblGetControlDouble`
+    // unconditionally.
+    let field_type = field_type?;
+    Some(match field_type {
+        // recGbl.c:377-380. C's `CHAR_MAX`/`CHAR_MIN` — plain `char`, which is
+        // SIGNED on every target EPICS builds for, so 127/-128, NOT 255/0.
+        DbFieldType::Char => (f64::from(i8::MAX), f64::from(i8::MIN)),
+        // recGbl.c:381-384
+        DbFieldType::UChar => (f64::from(u8::MAX), 0.0),
+        // recGbl.c:385-388
+        DbFieldType::Short => (f64::from(i16::MAX), f64::from(i16::MIN)),
+        // recGbl.c:389-393 — `DBF_ENUM` and `DBF_USHORT` share one case.
+        DbFieldType::Enum | DbFieldType::UShort => (f64::from(u16::MAX), 0.0),
+        // recGbl.c:394-397 — C writes the literals, not `INT_MAX`/`INT_MIN`.
+        DbFieldType::Long => (2147483647.0, -2147483648.0),
+        // recGbl.c:398-401
+        DbFieldType::ULong => (4294967295.0, 0.0),
+        // recGbl.c:402-405. NOTE the upper is 2^63, i.e. `INT64_MAX + 1` —
+        // NOT `INT64_MAX`. C writes `9223372036854775808.0` verbatim. This is
+        // not a typo to "fix": it is why QSRV2 puts INT64_MIN on BOTH ends of
+        // an int64 field's limits (2^63 is out of int64 range, so the
+        // double->int64 conversion lands on INT64_MIN, the same value the
+        // exactly-representable lower limit converts to).
+        DbFieldType::Int64 => (9223372036854775808.0, -9223372036854775808.0),
+        // recGbl.c:406-409
+        DbFieldType::UInt64 => (18446744073709551615.0, 0.0),
+        // recGbl.c:410-413 — 1e30, not `FLT_MAX`.
+        DbFieldType::Float => (1e30, -1e30),
+        // recGbl.c:414-417 — 1e300, not `DBL_MAX`.
+        DbFieldType::Double => (1e300, -1e300),
+        // No case in C's switch: nothing written, caller's 0.0 pre-init wins.
+        DbFieldType::String => return None,
+    })
+}
+
+/// C's `recGblGetGraphicDouble` (`recGbl.c:146-153`) — the display limits for a
+/// field the record's own `get_graphic_double` does not list.
+///
+/// See [`get_max_range_values`] for what `None` means.
+pub fn rec_gbl_get_graphic_double(
+    field_type: Option<DbFieldType>,
+    is_menu_field: bool,
+) -> Option<(f64, f64)> {
+    get_max_range_values(field_type, is_menu_field)
+}
+
+/// C's `recGblGetControlDouble` (`recGbl.c:164-171`) — the control limits for a
+/// field the record's own `get_control_double` does not list.
+///
+/// Identical to [`rec_gbl_get_graphic_double`] by construction, because C's two
+/// helpers are identical bodies over the same [`get_max_range_values`] table.
+///
+/// See [`get_max_range_values`] for what `None` means.
+pub fn rec_gbl_get_control_double(
+    field_type: Option<DbFieldType>,
+    is_menu_field: bool,
+) -> Option<(f64, f64)> {
+    get_max_range_values(field_type, is_menu_field)
+}
+
+/// C's `recGblGetAlarmDouble` (`recGbl.c:155-162`) — the valueAlarm limits for a
+/// field the record's own `get_alarm_double` does not list.
+///
+/// All four are `epicsNAN`, in C's struct order: `(upper_alarm_limit,
+/// upper_warning_limit, lower_warning_limit, lower_alarm_limit)`. Unlike the
+/// graphic/control helpers there is no type table and no "writes nothing" case
+/// — C fills all four unconditionally, and `dbAccess.c:294` pre-inits the same
+/// four NaNs anyway, so the two agree.
+///
+/// Note this is NOT the same as a record with a NULL `get_alarm_double` slot:
+/// there `dbAccess.c:295-298` leaves `no_data = TRUE` and the `DBR_AL_DOUBLE`
+/// option bit is cleared (`:325-326`), so the client is sent no valueAlarm at
+/// all rather than four NaNs. That distinction is owned by `PropertySupport`.
+pub fn rec_gbl_get_alarm_double() -> (f64, f64, f64, f64) {
+    (f64::NAN, f64::NAN, f64::NAN, f64::NAN)
+}
+
+/// C's `recGblGetPrec` (`recGbl.c:119-144`) — the precision for a field the
+/// record's own `get_precision` does not list.
+///
+/// Unlike the limit helpers this one MUTATES the caller's seed rather than
+/// producing a value: C takes `long *precision` already holding whatever the
+/// record's `get_precision` stored (typically `prec->prec`, e.g.
+/// `aiRecord.c:236`) and rewrites it only for the types its switch names.
+/// `seed` is that value; the return is C's post-call buffer.
+///
+/// ```c
+/// switch (pdbFldDes->field_type) {
+/// case DBF_CHAR: ... case DBF_UINT64:  *precision = 0;  break;
+/// case DBF_FLOAT: case DBF_DOUBLE:
+///     if (*precision < 0 || *precision > 15) *precision = 15;
+///     break;
+/// default: break;
+/// }
+/// ```
+///
+/// `field_type` is the **static** dbd type (`pdbFldDes->field_type`), so a
+/// runtime-retyped field passes `None` and takes the `default:` arm — the seed
+/// survives untouched.
+///
+/// The integer arm is unobservable through `dbGet`: `dbAccess.c:387-394` gates
+/// `DBR_PRECISION` on the field being `DBF_FLOAT`/`DBF_DOUBLE` *before* the
+/// slot runs, so a `DBF_LONG` field's precision is never sent at all (the port
+/// applies that gate in `PropertySupport::narrowed_to_field`). It is
+/// transcribed anyway because this is `recGblGetPrec`, not `dbGet`'s view of
+/// it, and a future caller must see C's rule, not the subset one caller can
+/// observe.
+pub fn rec_gbl_get_prec(field_type: Option<DbFieldType>, seed: i16) -> i16 {
+    match field_type {
+        Some(
+            DbFieldType::Char
+            | DbFieldType::UChar
+            | DbFieldType::Short
+            | DbFieldType::UShort
+            | DbFieldType::Long
+            | DbFieldType::ULong
+            | DbFieldType::Int64
+            | DbFieldType::UInt64,
+        ) => 0,
+        Some(DbFieldType::Float | DbFieldType::Double) => {
+            if !(0..=15).contains(&seed) {
+                15
+            } else {
+                seed
+            }
+        }
+        // No case in C's switch: STRING, ENUM/MENU, DEVICE, NOACCESS, links.
+        _ => seed,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every branch of C's `getMaxRangeValues` switch (`recGbl.c:372-419`),
+    /// one case per DBF type, transcribed from the C literals rather than
+    /// from Rust's `T::MAX` where C does not use the macro.
+    #[test]
+    fn get_max_range_values_matches_the_c_switch() {
+        let r = |t| get_max_range_values(Some(t), false);
+        // recGbl.c:377-380 — CHAR_MAX/CHAR_MIN, signed char.
+        assert_eq!(r(DbFieldType::Char), Some((127.0, -128.0)));
+        // recGbl.c:381-384
+        assert_eq!(r(DbFieldType::UChar), Some((255.0, 0.0)));
+        // recGbl.c:385-388
+        assert_eq!(r(DbFieldType::Short), Some((32767.0, -32768.0)));
+        // recGbl.c:389-393 — one case, both types.
+        assert_eq!(r(DbFieldType::UShort), Some((65535.0, 0.0)));
+        assert_eq!(r(DbFieldType::Enum), Some((65535.0, 0.0)));
+        // recGbl.c:394-397
+        assert_eq!(r(DbFieldType::Long), Some((2147483647.0, -2147483648.0)));
+        // recGbl.c:398-401
+        assert_eq!(r(DbFieldType::ULong), Some((4294967295.0, 0.0)));
+        // recGbl.c:410-413 / :414-417 — 1e30 and 1e300, not FLT_MAX/DBL_MAX.
+        assert_eq!(r(DbFieldType::Float), Some((1e30, -1e30)));
+        assert_eq!(r(DbFieldType::Double), Some((1e300, -1e300)));
+    }
+
+    /// Every branch of C's `recGblGetPrec` switch (`recGbl.c:119-144`).
+    /// C mutates the caller's seed, so each case is pinned as
+    /// `(seed) -> post-call buffer`.
+    #[test]
+    fn rec_gbl_get_prec_matches_the_c_switch() {
+        // recGbl.c:123-131 — every integer type forces 0, whatever the seed.
+        for t in [
+            DbFieldType::Char,
+            DbFieldType::UChar,
+            DbFieldType::Short,
+            DbFieldType::UShort,
+            DbFieldType::Long,
+            DbFieldType::ULong,
+            DbFieldType::Int64,
+            DbFieldType::UInt64,
+        ] {
+            assert_eq!(rec_gbl_get_prec(Some(t), 7), 0, "{t:?}");
+            assert_eq!(rec_gbl_get_prec(Some(t), 0), 0, "{t:?}");
+        }
+        // recGbl.c:133-137 — FLOAT/DOUBLE clamp OUT-OF-RANGE to 15 and keep
+        // an in-range seed. The boundaries are inclusive on both ends.
+        for t in [DbFieldType::Float, DbFieldType::Double] {
+            assert_eq!(rec_gbl_get_prec(Some(t), 7), 7, "{t:?}");
+            assert_eq!(rec_gbl_get_prec(Some(t), 0), 0, "{t:?}");
+            assert_eq!(rec_gbl_get_prec(Some(t), 15), 15, "{t:?}");
+            assert_eq!(rec_gbl_get_prec(Some(t), 16), 15, "{t:?}");
+            assert_eq!(rec_gbl_get_prec(Some(t), -1), 15, "{t:?}");
+        }
+    }
+
+    /// C's `default: break` (`recGbl.c:141-143`) and the runtime-retyped
+    /// field: the seed survives. `recGblGetPrec` reads the STATIC
+    /// `pdbFldDes->field_type` (`recGbl.c:121`), so a `cvt_dbaddr` retype
+    /// never reaches the switch — `None` is that field.
+    #[test]
+    fn rec_gbl_get_prec_leaves_the_seed_where_c_has_no_case() {
+        for t in [
+            Some(DbFieldType::String),
+            Some(DbFieldType::Enum),
+            // Runtime-typed (DBF_NOACCESS in the dbd).
+            None,
+        ] {
+            assert_eq!(rec_gbl_get_prec(t, 7), 7, "{t:?}");
+            assert_eq!(rec_gbl_get_prec(t, 99), 99, "{t:?}");
+        }
+    }
+
+    /// `DBF_INT64`'s upper bound is 2^63 — `INT64_MAX + 1`, not `INT64_MAX`
+    /// (recGbl.c:402-405). Pin it against the exact power of two so a future
+    /// "fix" to `i64::MAX` fails here rather than on the wire, where it
+    /// silently changes what QSRV2 sends for every int64 field.
+    #[test]
+    fn int64_upper_range_is_two_to_the_63_not_int64_max() {
+        let (upper, lower) = get_max_range_values(Some(DbFieldType::Int64), false).unwrap();
+        assert_eq!(upper, 9223372036854775808.0);
+        assert_eq!(upper, 2.0f64.powi(63));
+        assert!(upper > i64::MAX as f64 || upper == i64::MAX as f64 + 1.0);
+        assert_eq!(lower, -9223372036854775808.0);
+        assert_eq!(lower, i64::MIN as f64);
+
+        // recGbl.c:406-409
+        let (upper, lower) = get_max_range_values(Some(DbFieldType::UInt64), false).unwrap();
+        assert_eq!(upper, 18446744073709551615.0);
+        assert_eq!(lower, 0.0);
+    }
+
+    /// C's switch has no `default:`, so these write nothing and the caller's
+    /// 0.0 pre-init (`dbAccess.c:216`, `:256`) reaches the wire. `None` is
+    /// that answer.
+    #[test]
+    fn types_with_no_case_in_the_c_switch_get_no_range() {
+        // DBF_STRING — no case.
+        assert_eq!(get_max_range_values(Some(DbFieldType::String), false), None);
+        // A `runtime_typed` field is DBF_NOACCESS in the .dbd, and C reads the
+        // static `pdbFldDes->field_type` (recGbl.c:151/:169) — no case.
+        assert_eq!(get_max_range_values(None, false), None);
+        // DBF_MENU is a distinct code from DBF_ENUM in C and has no case,
+        // even though this port types both as `DbFieldType::Enum`. Without
+        // this discriminator every menu field would gain a bogus 65535/0.
+        assert_eq!(get_max_range_values(Some(DbFieldType::Enum), true), None);
+    }
+
+    /// C's `recGblGetGraphicDouble` and `recGblGetControlDouble` are the same
+    /// body over the same table (`recGbl.c:146-153` vs `:164-171`). Pin that
+    /// they cannot drift apart.
+    #[test]
+    fn graphic_and_control_defaults_are_the_same_table() {
+        for t in [
+            DbFieldType::Char,
+            DbFieldType::UChar,
+            DbFieldType::Short,
+            DbFieldType::UShort,
+            DbFieldType::Enum,
+            DbFieldType::Long,
+            DbFieldType::ULong,
+            DbFieldType::Int64,
+            DbFieldType::UInt64,
+            DbFieldType::Float,
+            DbFieldType::Double,
+            DbFieldType::String,
+        ] {
+            assert_eq!(
+                rec_gbl_get_graphic_double(Some(t), false),
+                rec_gbl_get_control_double(Some(t), false),
+                "graphic/control default diverged for {t:?}",
+            );
+        }
+    }
+
+    /// `recGblGetAlarmDouble` (`recGbl.c:155-162`) fills all four with
+    /// `epicsNAN`, unconditionally — no type table.
+    #[test]
+    fn alarm_default_is_four_nans() {
+        let (hihi, high, low, lolo) = rec_gbl_get_alarm_double();
+        assert!(hihi.is_nan() && high.is_nan() && low.is_nan() && lolo.is_nan());
+    }
 
     #[test]
     fn alarm_condition_string_matches_c_table() {

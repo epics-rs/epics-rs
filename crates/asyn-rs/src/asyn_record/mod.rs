@@ -3401,6 +3401,38 @@ impl Record for AsynRecord {
         "asyn"
     }
 
+    /// `asynRecord.c:84-91` — the rset NULLs every property slot except
+    /// `get_precision`:
+    ///
+    /// ```c
+    /// #define get_units NULL
+    /// static long get_precision(const struct dbAddr * paddr, long *precision);
+    /// #define get_enum_str NULL
+    /// #define get_enum_strs NULL
+    /// #define get_graphic_double NULL
+    /// #define get_control_double NULL
+    /// #define get_alarm_double NULL
+    /// ```
+    ///
+    /// So `dbGet` clears `DBR_UNITS`, `DBR_GR_DOUBLE`, `DBR_CTRL_DOUBLE`,
+    /// `DBR_AL_DOUBLE` and `DBR_ENUM_STRS` for every asyn field, and QSRV2
+    /// marks none of those leaves. Without this row the record fell to
+    /// `default_property_support`'s untranscribed `_ => NUMERIC` arm and the
+    /// port marked all six on every field — a fabricated `display.units` of
+    /// `""` and `valueAlarm` bands of zero, presented as authoritative.
+    ///
+    /// This row lives here, not in `default_property_support`'s table,
+    /// because asyn-rs owns `asynRecord`: a downstream crate cannot add a row
+    /// to a table inside epics-base-rs. That is what
+    /// [`Record::property_support`] being a trait method buys.
+    fn property_support(&self) -> epics_base_rs::server::snapshot::PropertySupport {
+        use epics_base_rs::server::snapshot::PropertySupport as P;
+        P {
+            precision: true,
+            ..P::NONE
+        }
+    }
+
     /// Choice strings for every asynRecord `DBF_MENU` field, in menu index
     /// order (verbatim from `asynRecord.dbd`). The field value is held as a
     /// `Short` menu index; returning the choices here makes the framework

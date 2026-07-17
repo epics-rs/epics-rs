@@ -1084,6 +1084,7 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "windows-sys 0.59.0",
  "x509-parser",
 ]
 
@@ -1118,6 +1119,7 @@ dependencies = [
  "clap",
  "epics-base-rs",
  "epics-ca-rs",
+ "epics-pva-rs",
  "serde",
  "serde_json",
  "tokio",

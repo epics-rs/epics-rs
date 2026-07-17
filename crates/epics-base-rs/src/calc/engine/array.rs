@@ -1,6 +1,6 @@
 use super::array_value::ArrayStackValue::Double;
 use super::array_value::{ArrayCell, ArrayStackValue, zip_map};
-use super::cast::{c_int, d2ui, imod, my_nint, nint};
+use super::cast::{c_int, c_long, d2ui, imod, my_nint, nint};
 use super::error::CalcError;
 use super::opcodes::{ArrayOp, ControlOp, CoreOp, Opcode};
 use super::random::local_random;
@@ -208,16 +208,12 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                 CoreOp::Mod => {
                     // aCalc, not base (`aCalcPerform.c:645-652`, :669-677,
                     // :697-703): a zero divisor is neither NaN nor an error — it
-                    // is `myMAXFLOAT`. That rule is C's and is kept; C's plain
-                    // `(int)` narrowing of both operands is not — `cast::imod`,
-                    // CBUG-A2.
+                    // is `myMAXFLOAT`. That rule is C's and is kept. aCalc's
+                    // dialect narrowing is `(int)` (32-bit), so `cast::imod` is
+                    // given `c_int`; `cast::imod` owns the -1 guard. CBUG-A2.
                     binary(&mut stack, |a, b| {
                         zip_map(a, b, |x, y| {
-                            if y.trunc() == 0.0 {
-                                MY_MAXFLOAT
-                            } else {
-                                imod(x, y)
-                            }
+                            imod(x, y, |v| i64::from(c_int(v))).unwrap_or(MY_MAXFLOAT)
                         })
                     })?
                 }
@@ -384,10 +380,11 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                 CoreOp::Ceil => unary_op(&mut stack, |a| a.map(f64::ceil))?,
                 CoreOp::Floor => unary_op(&mut stack, |a| a.map(f64::floor))?,
                 CoreOp::Nint => {
-                    // C `aCalcPerform.c:827-830` (array) and :1085 (scalar):
-                    //   (double)(long)(x >= 0 ? x+0.5 : x-0.5)
-                    // The `(long)` narrowing is dropped — `cast::nint`, CBUG-A2.
-                    unary_op(&mut stack, |a| a.map(nint))?
+                    // aCalc `aCalcPerform.c:839` (array) and :1096 (scalar) narrow
+                    // NINT with a plain `(long)` (64-bit) — WIDER than aCalc's
+                    // `(int)` MODULO above (an internal synApps inconsistency), so
+                    // `cast::nint` is given `c_long`, and `NINT(3e9) = 3e9`. CBUG-A2.
+                    unary_op(&mut stack, |a| a.map(|x| nint(x, c_long)))?
                 }
 
                 // ISNAN and FINITE are aCalc's two VARARG predicates

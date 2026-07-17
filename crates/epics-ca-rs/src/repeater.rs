@@ -46,16 +46,30 @@ impl RepeaterClient {
         }
     }
 
-    /// Check if client is still alive by trying to bind to its port.
+    /// Check if client is still alive by trying to bind to its address.
     /// If bind succeeds, the client has released the port (dead).
+    ///
+    /// C's bind test binds INADDR_ANY:port (`makeSocket(port, false)`,
+    /// `repeater.cpp:94-124`), which works there because C's clients bind
+    /// their UDP socket to INADDR_ANY (`udpiiu.cpp:241-249`) — so the
+    /// wildcard test collides (EADDRINUSE) with the wildcard client. This
+    /// port's clients bind SPECIFIC NIC addresses (the AsyncUdpV4 per-NIC
+    /// bundle, never a wildcard socket), and on Windows a wildcard bind
+    /// test does NOT collide with a socket bound to a specific address —
+    /// so an INADDR_ANY probe would report every live client as departed
+    /// and reap it. Bind the test to the client's OWN registered address
+    /// (`self.addr`, the datagram source the repeater stored) so it
+    /// collides with the client's specific-address socket on every
+    /// platform, preserving C's liveness semantics ("is this client's port
+    /// still held?") against the port's specific-address sockets.
     fn verify(&self) -> bool {
-        let port = match self.addr {
-            SocketAddr::V4(v4) => v4.port(),
+        let bind_addr = match self.addr {
+            SocketAddr::V4(v4) => v4,
             _ => return false,
         };
-        match StdUdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port)) {
-            Ok(_) => false,                                         // port free → client gone
-            Err(e) if e.kind() == io::ErrorKind::AddrInUse => true, // port in use → alive
+        match StdUdpSocket::bind(bind_addr) {
+            Ok(_) => false,                                         // addr free → client gone
+            Err(e) if e.kind() == io::ErrorKind::AddrInUse => true, // addr in use → alive
             Err(_) => true,                                         // other error → assume alive
         }
     }
@@ -583,12 +597,47 @@ async fn try_register(repeater_port: u16) -> Result<(), ()> {
 /// Falls back to an in-process repeater thread if the binary is not found.
 fn spawn_repeater() {
     let exe = std::env::current_exe().unwrap_or_default();
-    let repeater_bin = exe.parent().map(|p| p.join("ca-repeater-rs"));
+    // The sibling binary carries the platform executable suffix: on Windows
+    // it is `ca-repeater-rs.exe`. Joining the bare stem made `bin.exists()`
+    // always false there, so every client fell through to the in-process
+    // repeater fallback — which re-resolves `EPICS_CA_REPEATER_PORT` (and
+    // re-prints its diagnostics into the client's own stderr) instead of
+    // spawning the shared daemon C `caStartRepeaterIfNotInstalled` starts.
+    let repeater_bin = exe
+        .parent()
+        .map(|p| p.join(format!("ca-repeater-rs{}", std::env::consts::EXE_SUFFIX)));
 
     // Try external binary first
     if let Some(ref bin) = repeater_bin {
         if bin.exists() {
             use std::process::{Command, Stdio};
+            // Windows has no CLOEXEC: `CreateProcess` inherits every
+            // inheritable handle we hold, and the stdout/stderr pipe a
+            // capturing parent (`Command::output`, a shell `$(caput …)`,
+            // nextest) handed us stays inheritable. The repeater is a
+            // detached daemon that outlives us, so if it inherits that
+            // pipe the capturing parent never sees EOF and blocks until
+            // the daemon exits — i.e. forever. Unix avoids this because
+            // `Stdio::null()` redirects the child's fds 0/1/2 and the pipe
+            // only ever lived on fd 1. Clear the inherit flag on our own
+            // standard handles first so the daemon cannot hold them — the
+            // Windows analogue of the CLOEXEC unix already gets.
+            #[cfg(windows)]
+            unsafe {
+                use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+                use windows_sys::Win32::System::Console::{
+                    GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+                };
+                for id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+                    let h = GetStdHandle(id);
+                    // A closed/redirected slot is null; an unset one is
+                    // INVALID_HANDLE_VALUE. Skip both — only real handles
+                    // carry the inheritable pipe we must detach.
+                    if !h.is_null() && h != windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+                        SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0);
+                    }
+                }
+            }
             if Command::new(bin)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())

@@ -52,6 +52,10 @@ pub mod catool;
 pub mod dbd;
 pub mod diff;
 pub mod ioc;
+pub mod ntshape;
+pub mod pvamonitor;
+pub mod pvaread;
+pub mod pvatool;
 pub mod report;
 pub mod runner;
 pub mod surface;
@@ -59,7 +63,8 @@ pub mod surface;
 pub use allowlist::Allowlist;
 pub use dbd::Dbd;
 pub use diff::Verdict;
-pub use ioc::{CTools, Pair};
+pub use ioc::{CTools, Pair, PvaPair, PvxTools};
+pub use pvatool::PvaTools;
 pub use report::{Counts, Report};
 pub use runner::Runner;
 pub use surface::{Coverage, Surface};
@@ -82,12 +87,27 @@ pub const ORACLE_ASYN_PORT: &str = "ORACLEASYN";
 /// Both differential sides are handed byte-identical db text, so this is the
 /// single owner of that asymmetry.
 pub fn record_stmt(record_type: &str, rec_name: &str) -> String {
+    record_stmt_fields(record_type, rec_name, &[])
+}
+
+/// [`record_stmt`], plus `fields` in the record body.
+///
+/// The single owner of the reproducer statement, so the `asyn` PORT rule above
+/// holds for every reproducer rather than for the one that happened to call the
+/// original. [`pvamonitor`] needs a `SCAN` field on its reproducer and must not
+/// grow a second, PORT-less spelling to get it.
+pub fn record_stmt_fields(record_type: &str, rec_name: &str, fields: &[(&str, &str)]) -> String {
+    let mut body = String::new();
     if record_type == "asyn" {
-        format!(
-            "record({record_type}, \"{rec_name}\") {{\n    field(PORT, \"{ORACLE_ASYN_PORT}\")\n}}\n"
-        )
-    } else {
+        body.push_str(&format!("    field(PORT, \"{ORACLE_ASYN_PORT}\")\n"));
+    }
+    for (name, value) in fields {
+        body.push_str(&format!("    field({name}, \"{value}\")\n"));
+    }
+    if body.is_empty() {
         format!("record({record_type}, \"{rec_name}\") {{}}\n")
+    } else {
+        format!("record({record_type}, \"{rec_name}\") {{\n{body}}}\n")
     }
 }
 
@@ -109,4 +129,45 @@ pub fn record_stmt(record_type: &str, rec_name: &str) -> String {
 /// mistaken for a measured-clean one.
 pub fn puts_are_measurable(record_type: &str) -> bool {
     record_type != "asyn"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The reason `record_stmt_fields` exists rather than a second, local
+    /// spelling in [`pvamonitor`]: `asyn`'s PORT is what lets the record
+    /// `init_record` at all, and a reproducer that asks for a SCAN field must
+    /// not lose it.
+    #[test]
+    fn extra_fields_never_cost_asyn_its_port() {
+        let db = record_stmt_fields("asyn", "ORACLE:MON:ASYN", &[("SCAN", ".1 second")]);
+        assert!(
+            db.contains(&format!("field(PORT, \"{ORACLE_ASYN_PORT}\")")),
+            "{db}"
+        );
+        assert!(db.contains("field(SCAN, \".1 second\")"), "{db}");
+    }
+
+    /// A reproducer with no fields keeps the empty body the read phase's db text
+    /// already pins.
+    #[test]
+    fn a_plain_record_is_unchanged_by_the_shared_owner() {
+        assert_eq!(
+            record_stmt("ai", "ORACLE:AI"),
+            "record(ai, \"ORACLE:AI\") {}\n"
+        );
+        assert_eq!(
+            record_stmt_fields("ai", "ORACLE:AI", &[]),
+            record_stmt("ai", "ORACLE:AI")
+        );
+    }
+
+    #[test]
+    fn a_scanned_reproducer_names_its_scan_rate() {
+        assert_eq!(
+            record_stmt_fields("ai", "S:AI", &[("SCAN", ".1 second")]),
+            "record(ai, \"S:AI\") {\n    field(SCAN, \".1 second\")\n}\n"
+        );
+    }
 }

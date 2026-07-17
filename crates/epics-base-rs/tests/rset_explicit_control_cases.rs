@@ -30,6 +30,7 @@ use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::server::records::ao::AoRecord;
 use epics_base_rs::server::records::compress::CompressRecord;
 use epics_base_rs::server::records::histogram::HistogramRecord;
+use epics_base_rs::server::records::int64in::Int64inRecord;
 use epics_base_rs::server::records::longin::LonginRecord;
 use epics_base_rs::server::records::waveform::{ArrayKind, WaveformRecord};
 use epics_base_rs::server::snapshot::Snapshot;
@@ -231,5 +232,35 @@ fn waveform_does_not_borrow_subarrays_nelm_case() {
         "waveformRecord.c:272-284 does not list NELM, so it takes the default: \
          arm and serves the DBF_ULONG range — subArray's MALM bound must not \
          fire for a waveform"
+    );
+}
+
+/// The third and last SVAL member. `int64inRecord.c:225` lists `SVAL` exactly
+/// as `aiRecord.c:280` and `longinRecord.c:220` do; this record type was the
+/// one the earlier six-type transcription left out.
+///
+/// `int64in`'s `SVAL` is `DBF_INT64`, so the `default:` arm it escapes is the
+/// INT64 range — a third distinct type across the three SVAL records (ai's is
+/// DBF_DOUBLE, longin's DBF_LONG), which is what proves each answer comes from
+/// the record's HOPR/LOPR and not from a type coincidence.
+///
+/// `int64outRecord.c:294-312` does NOT list SVAL — an output record has no
+/// simulation buffer to serve — so the family is exactly these three.
+#[test]
+fn int64in_sval_takes_the_records_hopr_lopr_not_the_int64_range() {
+    let inst = with_fields(
+        "T:INT64IN",
+        Int64inRecord::default(),
+        &[
+            ("HOPR", EpicsValue::Int64(9000)),
+            ("LOPR", EpicsValue::Int64(-9000)),
+        ],
+    );
+
+    assert_eq!(
+        limits(&inst, "SVAL"),
+        (-9000.0, 9000.0),
+        "int64inRecord.c:225 lists SVAL: C serves HOPR/LOPR, not the DBF_INT64 \
+         range of +-9223372036854775807"
     );
 }

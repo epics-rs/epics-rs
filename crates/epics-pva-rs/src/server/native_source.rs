@@ -531,12 +531,11 @@ fn build_timestamp(snap: &Snapshot) -> PvField {
 /// pvxs's `if(auto x = node["…"])` no-op: `value.choices` on a plain scalar,
 /// `display.form.*` on a string or NTEnum.
 fn read_leaves(snap: &Snapshot, is_value_field: bool) -> Vec<String> {
-    let mut leaves: Vec<String> = crate::nt::property_leaves(snap.properties)
-        .into_iter()
-        .map(str::to_string)
-        .collect();
-    leaves.push("timeStamp".into());
-    leaves.push("alarm".into());
+    // A read IS `IOCSource::get(…, UpdateType::Everything, …)` — the same
+    // event-class rule with every class set — so it composes from the one
+    // owner rather than listing the leaves a second time. `Everything` is
+    // pvxs's own name for `DBE_VALUE|DBE_ALARM|DBE_PROPERTY` (`iocsource.h:40`).
+    //
     // An NTEnum's value is a STRUCT, so marking bare `value` would mark both
     // its children — `index` AND `choices` — making the choice list ride the
     // value's own mark and bypass the option bit that owns it. pvxs assigns
@@ -547,11 +546,13 @@ fn read_leaves(snap: &Snapshot, is_value_field: bool) -> Vec<String> {
     // that bit — so the leaf must be OMITTED, not sent as `{0}[]`. That is the
     // distinction `dbAccess.c:205` draws: *"option data not available.
     // distinct from no_str==0"*.
-    if matches!(&snap.value, EpicsValue::Enum(_)) {
-        leaves.push("value.index".into());
-    } else {
-        leaves.push("value".into());
-    }
+    let mut leaves = crate::nt::event_leaves(
+        epics_base_rs::server::recgbl::EventMask::VALUE
+            | epics_base_rs::server::recgbl::EventMask::ALARM
+            | epics_base_rs::server::recgbl::EventMask::PROPERTY,
+        snap.properties,
+        matches!(&snap.value, EpicsValue::Enum(_)),
+    );
     leaves.push("display.form.choices".into());
     if is_value_field {
         leaves.push("display.form.index".into());
@@ -816,6 +817,82 @@ impl ChannelSource for PvDatabaseSource {
         let db = self.db.clone();
         let name = name.to_string();
         async move { db.has_name(&name).await }
+    }
+
+    /// A record-backed monitor UPDATE marks only the leaves its own `DBE_*`
+    /// class covers, which is what `MonitorUpdate::marked` exists to say.
+    ///
+    /// pvxs reads each event's real mask from `pDbFieldLog->mask`
+    /// (`singlesource.cpp:80-84`) and hands it to `IOCSource::get` as the
+    /// `UpdateType`, so a value post assigns value+timeStamp while the
+    /// metadata leaves are assigned only by the separate `DBE_PROPERTY`
+    /// subscription (`:162-166`). The default `marked: None` framed the full
+    /// mask on every update, so the port put display/control/valueAlarm on
+    /// the wire for every value change — a strict superset of C.
+    ///
+    /// [`crate::nt::event_leaves`] is the single owner of that rule; this
+    /// method only supplies the per-event mask it keys on.
+    fn subscribe_checked_opts_marked(
+        &self,
+        checked: epics_base_rs::server::access_security::AccessChecked,
+        ctx: crate::server_native::ChannelContext,
+        opts: crate::server_native::source::MonitorOptions,
+    ) -> impl std::future::Future<
+        Output = Option<mpsc::Receiver<crate::server_native::source::MonitorUpdate>>,
+    > + Send {
+        let db = self.db.clone();
+        async move {
+            if !checked.allows_read() {
+                return None;
+            }
+            let name = checked.pv_name().to_string();
+            // A mailbox SharedPV posts a wholly-assigned value and has no
+            // record events to classify — keep the unmarked default.
+            if !matches!(db.find_entry(&name).await?, PvEntry::Record(_)) {
+                return self
+                    .subscribe_checked_opts(checked, ctx, opts)
+                    .await
+                    .map(crate::server_native::source::plain_monitor_updates);
+            }
+
+            use epics_base_rs::server::database::db_access::DbSubscription;
+            // The union of pvxs's two subscriptions (value + property), so the
+            // same events arrive; each is narrowed by its own posted mask
+            // below. The prior VALUE|LOG subscription could not deliver a
+            // DBE_PROPERTY event at all.
+            let mut sub = DbSubscription::subscribe_with_mask(
+                &db,
+                &name,
+                0,
+                crate::nt::monitor_mask().bits(),
+            )
+            .await?;
+            let (tx, rx) = mpsc::channel::<crate::server_native::source::MonitorUpdate>(64);
+            tokio::spawn(async move {
+                while let Some(ev) = sub.recv_event().await {
+                    let marked = crate::nt::event_leaves(
+                        ev.mask,
+                        ev.snapshot.properties,
+                        matches!(&ev.snapshot.value, EpicsValue::Enum(_)),
+                    );
+                    // A class that marks nothing is an event with no wire
+                    // meaning — C would have assigned no leaf either.
+                    if marked.is_empty() {
+                        continue;
+                    }
+                    let update = crate::server_native::source::MonitorUpdate {
+                        marked: Some(marked),
+                        ..crate::server_native::source::MonitorUpdate::from(snapshot_to_pv_field(
+                            &ev.snapshot,
+                        ))
+                    };
+                    if tx.send(update).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            Some(rx)
+        }
     }
 
     fn subscribe(
@@ -3075,6 +3152,113 @@ ASG(DEFAULT) {
             db.get_pv("CALC:PUT.VAL").await.expect("VAL get"),
             EpicsValue::Double(3.0),
             "processing must evaluate CALC=\"A\" into VAL"
+        );
+    }
+
+    /// A record-process monitor update marks value/alarm/timeStamp and NOT
+    /// the metadata leaves: pvxs assigns those only from the separate
+    /// `DBE_PROPERTY` subscription (`singlesource.cpp:162-166`), so putting
+    /// display/control/valueAlarm on every value update is a strict superset
+    /// of C — the whole `--phase pva-monitor` `update_events` pattern.
+    #[tokio::test]
+    async fn a_process_update_marks_value_alarm_time_not_the_metadata_leaves() {
+        use epics_base_rs::server::records::ai::AiRecord;
+
+        let db = Arc::new(PvDatabase::new());
+        // `ai` supplies every rset property slot, so a full-mask update would
+        // mark display/control/valueAlarm — this record makes the superset
+        // visible if it comes back.
+        db.add_record("AI:MON", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        let source = PvDatabaseSource::new(db.clone());
+        let ctx = make_ctx("localhost", "op", "ca");
+        let checked = source
+            .access()
+            .check("AI:MON", &ctx.host, &ctx.account, &ctx.method, "")
+            .await;
+
+        let mut rx = source
+            .subscribe_checked_opts_marked(checked, ctx, Default::default())
+            .await
+            .expect("record subscribe");
+
+        // Drive one process cycle through the external-put owner.
+        db.put_record_field_from_ca_no_notify("AI:MON", "VAL", EpicsValue::Double(1.0))
+            .await
+            .expect("put");
+
+        let update = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("an update must post within 2s")
+            .expect("stream open");
+        let marked = update.marked.expect("a record update declares its marks");
+
+        assert!(
+            marked.iter().any(|m| m == "value"),
+            "a DBE_VALUE post marks value, got {marked:?}"
+        );
+        assert!(
+            marked.iter().any(|m| m == "timeStamp"),
+            "getTimeAlarm always assigns timeStamp, got {marked:?}"
+        );
+        for leaf in marked.iter() {
+            assert!(
+                !leaf.starts_with("display.")
+                    && !leaf.starts_with("control.")
+                    && !leaf.starts_with("valueAlarm."),
+                "a process update must mark no metadata leaf — those are the \
+                 DBE_PROPERTY subscription's — but it marked {leaf}"
+            );
+        }
+    }
+
+    /// The event-class rule keys on the event's OWN mask, so the alarm triple
+    /// rides `DBE_ALARM` only. Measured on `softIocPVX`: a driven `longin`
+    /// posts value+alarm+timeStamp on update 1 (UDF -> NO_ALARM changed the
+    /// alarm) and value+timeStamp on updates 2 and 3.
+    #[test]
+    fn the_alarm_leaf_rides_dbe_alarm_not_every_update() {
+        use epics_base_rs::server::recgbl::EventMask;
+        use epics_base_rs::server::snapshot::PropertySupport;
+
+        let props = PropertySupport::NUMERIC;
+
+        // A value-only post (what a record's monitor() sends when the alarm
+        // did not change): DBE_VALUE|DBE_LOG.
+        let value_only = crate::nt::event_leaves(EventMask::VALUE | EventMask::LOG, props, false);
+        assert_eq!(
+            value_only,
+            vec!["timeStamp".to_string(), "value".to_string()],
+            "a value post marks timeStamp+value — no alarm, no metadata"
+        );
+
+        // The same post with the alarm changed.
+        let with_alarm = crate::nt::event_leaves(
+            EventMask::VALUE | EventMask::LOG | EventMask::ALARM,
+            props,
+            false,
+        );
+        assert_eq!(
+            with_alarm,
+            vec![
+                "timeStamp".to_string(),
+                "alarm".to_string(),
+                "value".to_string()
+            ],
+            "DBE_ALARM adds the alarm leaf and nothing else"
+        );
+
+        // A property post marks the metadata and NOT value/timeStamp.
+        let property = crate::nt::event_leaves(EventMask::PROPERTY, props, false);
+        assert!(
+            property.iter().any(|l| l == "display.limitLow")
+                && property.iter().any(|l| l == "control.limitLow"),
+            "a DBE_PROPERTY post marks the getProperties leaves, got {property:?}"
+        );
+        assert!(
+            !property.iter().any(|l| l == "value" || l == "timeStamp"),
+            "a property-only post assigns no value/timeStamp, got {property:?}"
         );
     }
 

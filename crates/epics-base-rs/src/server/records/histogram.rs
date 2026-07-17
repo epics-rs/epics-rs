@@ -1,5 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{MENU_YES_NO, ProcessOutcome, Record};
+use crate::server::record::{FieldMetadataOverride, MENU_YES_NO, ProcessOutcome, Record};
 use crate::types::EpicsValue;
 
 /// Histogram record — counts values into buckets.
@@ -198,6 +198,20 @@ const HISTOGRAM_CMD_CHOICES: &[&str] = &["Read", "Clear", "Start", "Stop"];
 impl Record for HistogramRecord {
     fn record_type(&self) -> &'static str {
         "histogram"
+    }
+
+    /// `histogramRecord.c:458-475` `get_control_double` lists `VAL` (which the
+    /// shared VAL-class route already serves) and `WDTH`, the bucket width,
+    /// whose limits are the span the buckets cover: `ULIM - LLIM` up, `0.0`
+    /// down. Without this `WDTH` falls to the `default:` arm and reports the
+    /// DBF_DOUBLE range of ±1e300.
+    fn field_metadata_override(&self, field: &str) -> Option<FieldMetadataOverride> {
+        field
+            .eq_ignore_ascii_case("WDTH")
+            .then(|| FieldMetadataOverride {
+                ctrl_limits: Some((self.ulim - self.llim, 0.0)),
+                ..Default::default()
+            })
     }
 
     /// C `histogramRecord.c::process` NEVER clears UDF. The record's only two

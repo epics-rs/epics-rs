@@ -1,5 +1,7 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{MENU_SIMM, ProcessOutcome, RawSoftEntry, Record, ValuePostGate};
+use crate::server::record::{
+    FieldMetadataOverride, MENU_SIMM, ProcessOutcome, RawSoftEntry, Record, ValuePostGate,
+};
 use crate::server::records::convert_phase::ConvertPhase;
 use crate::types::{EpicsValue, PvString};
 
@@ -130,6 +132,19 @@ impl AiRecord {
 impl Record for AiRecord {
     fn record_type(&self) -> &'static str {
         "ai"
+    }
+
+    /// `aiRecord.c:244-266` `get_control_double` lists one field the shared
+    /// VAL-class set does not: `SVAL`, which takes the record's own
+    /// `HOPR`/`LOPR` like `VAL` does. Without this it falls to the `default:`
+    /// arm and reports the DBF_DOUBLE range of ±1e300.
+    fn field_metadata_override(&self, field: &str) -> Option<FieldMetadataOverride> {
+        field
+            .eq_ignore_ascii_case("SVAL")
+            .then(|| FieldMetadataOverride {
+                ctrl_limits: Some((self.hopr, self.lopr)),
+                ..Default::default()
+            })
     }
 
     fn init_record(&mut self, pass: u8) -> CaResult<()> {

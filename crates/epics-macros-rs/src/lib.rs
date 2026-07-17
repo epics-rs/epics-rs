@@ -226,6 +226,15 @@ struct RecordAttrs {
     /// delegating to it. Kept a free function, not an inherent method, so the
     /// derive need not assume a method exists.
     init: Option<syn::Path>,
+    /// `#[record(metadata_override = some_fn)]` — the record type's C rset
+    /// lists fields its `get_control_double` / `get_graphic_double` /
+    /// `get_units` / `get_precision` answers itself, beyond what the
+    /// framework's per-field routing derives. Point this at a free function
+    /// `fn(&Self, &str) -> Option<FieldMetadataOverride>` and the derive emits
+    /// `Record::field_metadata_override` delegating to it. Same shape as
+    /// [`RecordAttrs::init`]: a free function, so the derive need not assume an
+    /// inherent method exists.
+    metadata_override: Option<syn::Path>,
     /// `#[record(no_value_monitor)]` — the record's process cycle posts no VAL
     /// value monitor (`Record::process_posts_value_monitor` → `false`). Set for
     /// the "trigger" records `fanout`/`seq`, whose C `process()` posts VAL only
@@ -395,6 +404,22 @@ fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
         None => quote! {},
     };
 
+    // `#[record(metadata_override = some_fn)]` — emit
+    // `Record::field_metadata_override` delegating to the named free function.
+    // Omitted entirely when the record declares none, so the trait default
+    // (`None` — the framework's routing owns every field) applies.
+    let metadata_override_method = match &attrs.metadata_override {
+        Some(path) => quote! {
+            fn field_metadata_override(
+                &self,
+                field: &str,
+            ) -> Option<#krate::server::record::FieldMetadataOverride> {
+                #path(self, field)
+            }
+        },
+        None => quote! {},
+    };
+
     // `#[record(no_value_monitor)]` — emit `Record::process_posts_value_monitor`
     // returning `false` (fanout/seq trigger-VAL). Omitted when the flag is
     // absent, so the trait default (`true`) applies to every value record.
@@ -413,6 +438,7 @@ fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
             #constant_init_method
             #init_method
             #value_monitor_method
+            #metadata_override_method
 
             fn record_type(&self) -> &'static str {
                 #record_type_str
@@ -449,6 +475,7 @@ fn parse_record_attrs(input: &DeriveInput) -> syn::Result<RecordAttrs> {
     let mut crate_path = None;
     let mut constant_init: Vec<(String, String)> = Vec::new();
     let mut init: Option<syn::Path> = None;
+    let mut metadata_override: Option<syn::Path> = None;
     let mut no_value_monitor = false;
 
     for attr in &input.attrs {
@@ -484,13 +511,17 @@ fn parse_record_attrs(input: &DeriveInput) -> syn::Result<RecordAttrs> {
                 } else if meta.path.is_ident("init") {
                     init = Some(meta.value()?.parse()?);
                     Ok(())
+                } else if meta.path.is_ident("metadata_override") {
+                    metadata_override = Some(meta.value()?.parse()?);
+                    Ok(())
                 } else if meta.path.is_ident("no_value_monitor") {
                     // Bare flag, like a field's `read_only`: no `= value`.
                     no_value_monitor = true;
                     Ok(())
                 } else {
                     Err(meta.error(
-                        "expected `type`, `crate_path`, `constant_init`, `init` or `no_value_monitor`",
+                        "expected `type`, `crate_path`, `constant_init`, `init`, \
+                         `metadata_override` or `no_value_monitor`",
                     ))
                 }
             })?;
@@ -505,6 +536,7 @@ fn parse_record_attrs(input: &DeriveInput) -> syn::Result<RecordAttrs> {
         crate_path,
         constant_init,
         init,
+        metadata_override,
         no_value_monitor,
     })
 }

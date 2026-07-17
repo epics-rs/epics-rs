@@ -1,5 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{MENU_SIMM, ProcessOutcome, Record};
+use crate::server::record::{FieldMetadataOverride, MENU_SIMM, ProcessOutcome, Record};
 use crate::server::records::convert_phase::ConvertPhase;
 use crate::types::{EpicsValue, PvString};
 
@@ -333,6 +333,22 @@ impl AoRecord {
 impl Record for AoRecord {
     fn record_type(&self) -> &'static str {
         "ao"
+    }
+
+    /// `aoRecord.c:329-350` `get_control_double` lists `OVAL` and `PVAL`
+    /// alongside `VAL` and the alarm bands, all answering the record's
+    /// `DRVH`/`DRVL` (not `HOPR`/`LOPR` — `ao` is the output record). The
+    /// shared VAL-class set covers `VAL` and the bands; these two are the
+    /// record-specific remainder, which would otherwise fall to the
+    /// `default:` arm and report the DBF_DOUBLE range of ±1e300.
+    fn field_metadata_override(&self, field: &str) -> Option<FieldMetadataOverride> {
+        ["OVAL", "PVAL"]
+            .iter()
+            .any(|f| field.eq_ignore_ascii_case(f))
+            .then(|| FieldMetadataOverride {
+                ctrl_limits: Some((self.drvh, self.drvl)),
+                ..Default::default()
+            })
     }
 
     /// C `devAoSoftRaw::write_ao` (`devAoSoftRaw.c:43-50`):

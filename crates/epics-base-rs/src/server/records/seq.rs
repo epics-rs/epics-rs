@@ -5,6 +5,43 @@ use epics_macros_rs::EpicsRecord;
 /// 2=Mask.
 const SEQ_SELM_CHOICES: &[&str] = &["All", "Specified", "Mask"];
 
+/// `seqRecord.c:322-338` `get_graphic_double` answers the 16 `DLYn` delay
+/// fields with a hard-coded `0.0 .. 10.0`, not with their DBF_DOUBLE range and
+/// not from any record field — so `DLYn` can take neither the routed
+/// `default:` arm nor the VAL cache.
+///
+/// The literal is graphic's alone: the same record's `get_control_double`
+/// (`:342-352`) serves `0.0 .. seqDLYlimit`, and `seqDLYlimit` is 100000
+/// (`:81`), not 10. Reading one slot's arm off the other would be wrong by
+/// four orders of magnitude, which is why each slot is transcribed separately.
+///
+/// `get_units` (`:282-297`) and `get_precision` (`:299-319`) answer the same
+/// 16 fields with their own literals — `"s"` and `seqDLYprecision` (`= 2`,
+/// `:78`). Both switch on `(fieldIndex - indexof(DLY0)) & 3 == 0`, the DLYn
+/// slot of each four-field link group, so the predicate is the same one the
+/// graphic arm uses. The `DOn` slot (`& 3 == 2`) reads its units/precision
+/// from the DOLn link instead; an unset link supplies neither, which is the
+/// `""` / `prec->prec` the port already serves.
+fn seq_metadata_override(
+    _rec: &SeqRecord,
+    field: &str,
+) -> Option<crate::server::record::FieldMetadataOverride> {
+    // DLY0..DLY9, DLYA..DLYF — one per link group.
+    let f = field.to_ascii_uppercase();
+    let is_dly = matches!(f.as_bytes(), [b'D', b'L', b'Y', c]
+        if c.is_ascii_digit() || (b'A'..=b'F').contains(c));
+    is_dly.then(|| crate::server::record::FieldMetadataOverride {
+        units: Some("s".into()),
+        precision: Some(SEQ_DLY_PRECISION),
+        disp_limits: Some((10.0, 0.0)),
+        ..Default::default()
+    })
+}
+
+/// C `seqRecord.c:78` `int seqDLYprecision = 2;` — the precision
+/// `get_precision` serves for every `DLYn`.
+const SEQ_DLY_PRECISION: i16 = 2;
+
 /// `seq` record — sequenced multi-output writer.
 ///
 /// C parity (`seqRecord.c:86` `#define NUM_LINKS 16`,
@@ -22,6 +59,7 @@ const SEQ_SELM_CHOICES: &[&str] = &["All", "Specified", "Mask"];
 // DO0 here or never.
 #[record(
     type = "seq",
+    metadata_override = seq_metadata_override,
     constant_init = "SELL:SELN,DOL0:DO0,DOL1:DO1,DOL2:DO2,DOL3:DO3,DOL4:DO4,\
                      DOL5:DO5,DOL6:DO6,DOL7:DO7,DOL8:DO8,DOL9:DO9,DOLA:DOA,\
                      DOLB:DOB,DOLC:DOC,DOLD:DOD,DOLE:DOE,DOLF:DOF",

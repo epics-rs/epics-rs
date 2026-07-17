@@ -27,10 +27,14 @@
 
 use epics_base_rs::server::record::{AlarmSeverity, RecordInstance};
 use epics_base_rs::server::records::acalcout::AcalcoutRecord;
+use epics_base_rs::server::records::asub_record::ASubRecord;
 use epics_base_rs::server::records::bi::BiRecord;
 use epics_base_rs::server::records::bo::BoRecord;
 use epics_base_rs::server::records::calc::CalcRecord;
+use epics_base_rs::server::records::calcout::CalcoutRecord;
 use epics_base_rs::server::records::int64in::Int64inRecord;
+use epics_base_rs::server::records::sel::SelRecord;
+use epics_base_rs::server::records::seq::SeqRecord;
 use epics_base_rs::server::snapshot::Snapshot;
 use epics_base_rs::types::EpicsValue;
 
@@ -248,5 +252,124 @@ fn int64ins_unconditional_val_case_does_not_leak_to_its_alarm_bands() {
         hihi.is_nan() && high.is_nan() && low.is_nan() && lolo.is_nan(),
         "HIHI is not VAL: it takes recGblGetAlarmDouble, so NaN — got \
          {hihi}/{high}/{low}/{lolo}"
+    );
+}
+
+/// The graphic slot's three arms, on one record type each — the display twin
+/// of the control routing above.
+///
+/// Measured on `softIocPVX` before the port was changed:
+///
+/// ```text
+/// $ pvxget ORACLE:CALC.PHAS  ->  display.limitLow -32768  limitHigh 32767
+/// $ pvxget ORACLE:ASUB.PHAS  ->  display.limitLow 0       limitHigh 0
+/// $ pvxget ORACLE:CALC.A     ->  display.limitLow 0       limitHigh 0
+/// ```
+///
+/// Three record types, one field name, three different answers — which is why
+/// display cannot be a straight flip to the type range.
+#[test]
+fn the_graphic_slot_routes_recgbl_seed_and_link_arms_apart() {
+    // RecGblRange: calc delegates, PHAS is DBF_SHORT and backs no link.
+    let calc = RecordInstance::new("T:CALC".to_string(), CalcRecord::new("A"));
+    assert_eq!(
+        snap(&calc, "PHAS").display_limits(),
+        Some((-32768.0, 32767.0)),
+        "calcRecord.c:187-212 ends in recGblGetGraphicDouble: PHAS serves the \
+         DBF_SHORT range"
+    );
+
+    // Seed: aSubRecord.c:350-368 has NO default: and NO recGbl call, so an
+    // unlisted field is written by nothing and the dbAccess.c:216 seed stands.
+    // Its OWN get_control_double is a bare recGblGetControlDouble (:372-376) —
+    // the two slots disagree on the same record, same field.
+    let asub = RecordInstance::new("T:ASUB".to_string(), ASubRecord::default());
+    assert_eq!(
+        snap(&asub, "PHAS").display_limits(),
+        Some((0.0, 0.0)),
+        "aSubRecord.c:350-368 writes nothing for PHAS: C serves the seed, not \
+         the SHRT range"
+    );
+    assert_eq!(
+        snap(&asub, "PHAS").control_limits(),
+        Some((-32768.0, 32767.0)),
+        "aSubRecord.c:372-376 IS a bare recGblGetControlDouble — the same field \
+         takes the type range for control and the seed for graphic, which is \
+         why the two slots need separate per-type bits"
+    );
+
+    // Link-backed: calc's A is DBF_DOUBLE, but get_linkNumber maps it to INPA
+    // and dbGetGraphicLimits on an unset (constant) link writes nothing.
+    // Serving the DBF_DOUBLE range of +-1e300 here would be the regression a
+    // bare flip causes.
+    assert_eq!(
+        snap(&calc, "A").display_limits(),
+        Some((0.0, 0.0)),
+        "calcRecord.c:161-167 maps A to the INPA link: a constant link supplies \
+         no graphic limits, so C serves 0/0, NOT the DBF_DOUBLE range"
+    );
+}
+
+/// `CALCPERFORM_NARGS` is 21 (`postfix.h:29`), not 12: the calc family's link
+/// range runs `A`..`U` and `LA`..`LU`, which `calcRecord.dbd.pod:801-985`
+/// declares contiguously. `U` is the boundary that a 12-arg assumption gets
+/// wrong — it would serve the DBF_DOUBLE range for a link-backed field.
+#[test]
+fn the_calc_arg_link_range_runs_to_u_not_to_l() {
+    let calc = RecordInstance::new("T:CALC".to_string(), CalcRecord::new("A"));
+    for arg in ["A", "L", "M", "U", "LA", "LL", "LU"] {
+        assert_eq!(
+            snap(&calc, arg).display_limits(),
+            Some((0.0, 0.0)),
+            "{arg} is inside CALCPERFORM_NARGS=21, so it is link-backed and \
+             serves 0/0"
+        );
+    }
+}
+
+/// `sel` names its args `A`..`L` exactly as `calc` does, and answers them
+/// completely differently: `selRecord.c:181-201` lists them as explicit
+/// HOPR/LOPR cases and calls `dbGetGraphicLimits` NOWHERE. So the link
+/// predicate must be per-type, not keyed on the field name.
+#[test]
+fn sels_args_are_explicit_limits_not_link_backed_like_calcs() {
+    let sel = RecordInstance::new("T:SEL".to_string(), SelRecord::default());
+    assert_eq!(
+        snap(&sel, "A").display_limits(),
+        Some((0.0, 0.0)),
+        "selRecord.c:193 lists A..L on HOPR/LOPR"
+    );
+    assert_eq!(
+        snap(&sel, "PHAS").display_limits(),
+        Some((-32768.0, 32767.0)),
+        "sel still delegates for an unlisted field"
+    );
+}
+
+/// The two literal arms that belong to graphic alone. `seq`'s DLYn serves
+/// `0..10` (`seqRecord.c:322-338`) while the SAME record's control serves
+/// `0..seqDLYlimit` = 100000 (`:342-352`, `:81`) — reading one slot off the
+/// other would be wrong by 4 orders of magnitude. `calcout`'s ODLY calls
+/// recGbl and then overwrites the lower with 0 (`calcoutRecord.c:471-474`).
+#[test]
+fn the_graphic_literal_arms_are_not_the_control_ones() {
+    let seq = RecordInstance::new("T:SEQ".to_string(), SeqRecord::default());
+    assert_eq!(
+        snap(&seq, "DLY0").display_limits(),
+        Some((0.0, 10.0)),
+        "seqRecord.c:327-328 hard-codes 0.0/10.0 for DLYn"
+    );
+    assert_eq!(
+        snap(&seq, "DO0").display_limits(),
+        Some((0.0, 0.0)),
+        "seqRecord.c:331 routes DOn through its DOLn link"
+    );
+
+    let co = RecordInstance::new("T:CO".to_string(), CalcoutRecord::default());
+    assert_eq!(
+        snap(&co, "ODLY").display_limits(),
+        Some((0.0, 1e300)),
+        "calcoutRecord.c:471-474 takes the recGbl DBF_DOUBLE upper and forces \
+         the lower to 0"
     );
 }

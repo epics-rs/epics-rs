@@ -1821,16 +1821,11 @@ impl RecordInstance {
                     .get_field("LOPR")
                     .and_then(|v| v.to_f64())
                     .unwrap_or(0.0);
-                let (hihi, high, low, lolo) = self.alarm_limits();
                 snap.display = Some(super::super::snapshot::DisplayInfo {
                     units: egu,
                     precision: prec,
                     upper_disp_limit: hopr,
                     lower_disp_limit: lopr,
-                    upper_alarm_limit: hihi,
-                    upper_warning_limit: high,
-                    lower_warning_limit: low,
-                    lower_alarm_limit: lolo,
                     ..Default::default()
                 });
             }
@@ -1856,22 +1851,11 @@ impl RecordInstance {
                     .get_field("LOPR")
                     .and_then(|v| v.to_f64())
                     .unwrap_or(0.0);
-                // longin/longout severity-gate (get_alarm_double);
-                // int64in/int64out send the limits verbatim (C is
-                // unconditional for those two record types only).
-                let (hihi, high, low, lolo) = match rtype {
-                    "int64in" | "int64out" => self.alarm_limits_unchecked(),
-                    _ => self.alarm_limits(),
-                };
                 snap.display = Some(super::super::snapshot::DisplayInfo {
                     units: egu,
                     precision: 0,
                     upper_disp_limit: hopr,
                     lower_disp_limit: lopr,
-                    upper_alarm_limit: hihi,
-                    upper_warning_limit: high,
-                    lower_warning_limit: low,
-                    lower_alarm_limit: lolo,
                     ..Default::default()
                 });
             }
@@ -1909,10 +1893,6 @@ impl RecordInstance {
                     precision: prec,
                     upper_disp_limit: hopr,
                     lower_disp_limit: lopr,
-                    upper_alarm_limit: 0.0,
-                    upper_warning_limit: 0.0,
-                    lower_warning_limit: 0.0,
-                    lower_alarm_limit: 0.0,
                     ..Default::default()
                 });
             }
@@ -1950,10 +1930,6 @@ impl RecordInstance {
                     precision: prec,
                     upper_disp_limit: hopr,
                     lower_disp_limit: lopr,
-                    upper_alarm_limit: 0.0,
-                    upper_warning_limit: 0.0,
-                    lower_warning_limit: 0.0,
-                    lower_alarm_limit: 0.0,
                     ..Default::default()
                 });
             }
@@ -1989,10 +1965,6 @@ impl RecordInstance {
                     precision: prec,
                     upper_disp_limit: hlm,
                     lower_disp_limit: llm,
-                    upper_alarm_limit: 0.0,
-                    upper_warning_limit: 0.0,
-                    lower_warning_limit: 0.0,
-                    lower_alarm_limit: 0.0,
                     ..Default::default()
                 });
             }
@@ -2145,43 +2117,6 @@ impl RecordInstance {
                 Some(form) => super::super::snapshot::EnumInfo::with_string_form(strings, form),
                 None => super::super::snapshot::EnumInfo::new(strings),
             });
-        }
-    }
-
-    /// Extract analog alarm limits from CommonFields.
-    // DBR_GR_*/DBR_CTRL_* alarm limits MUST be severity-gated — C
-    // get_alarm_double returns `prec->hhsv ? prec->hihi : epicsNAN`
-    // (aiRecord.c:295-298 and ao/longin/longout/calc/calcout). int64in/
-    // int64out are the sole exception (unconditional, int64inRecord.c:239-243)
-    // and use `alarm_limits_unchecked()`. NaN encodes byte-exact for every
-    // DBR variant: f64/f32 keep NaN, integer casts make `NaN as iN == 0`,
-    // matching dbAccess.c:300-326 (`finite(ald)?cast:0`).
-    fn alarm_limits(&self) -> (f64, f64, f64, f64) {
-        match self.common.analog_alarm {
-            // Each limit is reported only when its severity is enabled,
-            // exactly as C `get_alarm_double` (`x ? limit : epicsNAN`).
-            Some(ref aa) => (
-                gated(aa.hhsv, aa.hihi),
-                gated(aa.hsv, aa.high),
-                gated(aa.lsv, aa.low),
-                gated(aa.llsv, aa.lolo),
-            ),
-            // No analog-alarm config ⇒ all severities are NO_ALARM in C,
-            // so every limit is NaN (not 0).
-            None => (f64::NAN, f64::NAN, f64::NAN, f64::NAN),
-        }
-    }
-
-    // int64in/int64out are the one analog family whose C `get_alarm_double`
-    // is UNCONDITIONAL (int64inRecord.c:239-243, int64outRecord.c:283-287):
-    // the limits are sent verbatim regardless of HHSV/HSV/LSV/LLSV. Keep a
-    // separate accessor so the gated `alarm_limits()` cannot leak into this
-    // path.
-    fn alarm_limits_unchecked(&self) -> (f64, f64, f64, f64) {
-        if let Some(ref aa) = self.common.analog_alarm {
-            (aa.hihi, aa.high, aa.low, aa.lolo)
-        } else {
-            (0.0, 0.0, 0.0, 0.0)
         }
     }
 
@@ -4371,6 +4306,7 @@ impl RecordInstance {
         // fabricated number on the CA wire, which has no marking layer to
         // suppress it (`codec.rs` `get_limits` reads these structs ungated).
         let slots = self.record.property_support();
+        let rtype = self.record.record_type();
 
         // C `get_control_double`'s last arm. No base record routes control
         // through a link: `dbGetControlLimits` has zero callers in all of
@@ -4382,14 +4318,14 @@ impl RecordInstance {
                     // A type with no case in C's switch (STRING/MENU/DEVICE/links)
                     // is written by nothing, leaving the `dbAccess.c:256` seed —
                     // which is 0/0, exactly what `unwrap_or` supplies.
-                    super::record_trait::ControlDefaultArm::RecGblRange => {
+                    super::record_trait::RsetDefaultArm::RecGblRange => {
                         self.rec_gbl_range_for(field).unwrap_or((0.0, 0.0))
                     }
                     // The slot exists but writes nothing here, so the same
                     // `dbAccess.c:256` seed stands. Modelled as a value rather
                     // than as `None`: C's option bit is ON (the slot is supplied
                     // and returned 0), so the leaf IS served — carrying the seed.
-                    super::record_trait::ControlDefaultArm::Seed => (0.0, 0.0),
+                    super::record_trait::RsetDefaultArm::Seed => (0.0, 0.0),
                 };
             snap.control = Some(super::super::snapshot::ControlInfo {
                 upper_ctrl_limit: upper,
@@ -4397,12 +4333,53 @@ impl RecordInstance {
             });
         }
 
-        // C `get_alarm_double` `default:` → `recGblGetAlarmDouble` → four NaN
-        // (`recGbl.c:155-162`). The link-backed sibling arm lands on the same
-        // answer here: `dbAccess.c:294` seeds four NaN, and a constant link
-        // supplies no alarm limits to overwrite them.
-        if slots.alarm_double && !Self::alarm_explicit_field(self.record.record_type(), field) {
-            let (hihi, high, low, lolo) = crate::server::recgbl::rec_gbl_get_alarm_double();
+        // C `get_graphic_double`'s last arm. Unlike control this one has a LINK
+        // branch ahead of the recGbl call, so the three answers are: keep the
+        // cache (listed on HOPR/LOPR), the link's limits, or the default arm.
+        if slots.graphic_double && !Self::graphic_explicit_field(rtype, field) {
+            let (upper, lower) = if Self::graphic_link_backed_field(rtype, field) {
+                // `dbGetGraphicLimits` on a CONSTANT link writes nothing — a
+                // constant has no metadata getters — so the `dbAccess.c:216`
+                // seed stands. The port has no link metadata to consult, and a
+                // link that IS connected would be answered by the upstream
+                // record, which this routing does not model either; both land
+                // here as the seed.
+                (0.0, 0.0)
+            } else {
+                match super::record_trait::graphic_default_arm(rtype) {
+                    super::record_trait::RsetDefaultArm::RecGblRange => {
+                        self.rec_gbl_range_for(field).unwrap_or((0.0, 0.0))
+                    }
+                    super::record_trait::RsetDefaultArm::Seed => (0.0, 0.0),
+                }
+            };
+            let d = snap.display.get_or_insert_with(Default::default);
+            d.upper_disp_limit = upper;
+            d.lower_disp_limit = lower;
+        }
+
+        // C `get_alarm_double`, BOTH arms. This branch owns the four limits
+        // outright: `slots.alarm_double` is exactly the condition under which
+        // `getProperties` assigns the four `valueAlarm.*Limit` leaves, so
+        // whenever the leaves are served this assigns them.
+        //
+        // The explicit arm used to be left to the record-level metadata cache
+        // (`populate_display_info`), whose `match rtype` covered only some of
+        // the types that supply the slot. A type it missed reached the wire
+        // with `snap.display == None` and the four leaves kept the NT's
+        // structural 0 — measured: DFANOUT.VAL, SEL.VAL and SUB.VAL served 0
+        // where C serves NaN. That made "which limits does VAL carry" depend on
+        // a match arm existing somewhere else, which is the dual meaning this
+        // single owner removes.
+        if slots.alarm_double {
+            let (hihi, high, low, lolo) = if Self::alarm_explicit_field(rtype, field) {
+                self.explicit_alarm_limits(rtype)
+            } else {
+                // The link-backed sibling arm lands on the same answer:
+                // `dbAccess.c:294` seeds four NaN, and a constant link supplies
+                // no alarm limits to overwrite them.
+                crate::server::recgbl::rec_gbl_get_alarm_double()
+            };
             // The four alarm limits live on DisplayInfo because that mirrors
             // C's `dbr_gr_double` packing, which the CA encoder depends on.
             // Minting it here is safe: every other DisplayInfo field defaults
@@ -4412,6 +4389,43 @@ impl RecordInstance {
             d.upper_warning_limit = high;
             d.lower_warning_limit = low;
             d.lower_alarm_limit = lolo;
+        }
+    }
+
+    /// The four limits C's `get_alarm_double` serves for the fields its rset
+    /// lists — [`alarm_explicit_fields`](super::record_trait::alarm_explicit_fields).
+    ///
+    /// Read through [`Self::resolve_field`], the same unified accessor C's
+    /// `prec->hihi` is. The port stores the eight alarm fields in one of two
+    /// disjoint homes — `common.analog_alarm` for the types with the analog
+    /// ladder (`ai`/`ao`/`calc`/…), the record's own struct for the types
+    /// without it (`dfanout`/`sel`) — and `resolve_field` spans both. Reading
+    /// the ladder slot directly instead would answer NaN for every `dfanout`
+    /// and `sel` no matter how its HIHI/HHSV were set, because those two types
+    /// have no slot at all.
+    fn explicit_alarm_limits(&self, rtype: &str) -> (f64, f64, f64, f64) {
+        let limit = |name: &str| {
+            self.resolve_field(name)
+                .and_then(|v| v.to_f64())
+                .unwrap_or(0.0)
+        };
+        // The raw stored ordinal, NOT clamped to 0..=3: C tests `prec->hhsv`
+        // for NONZERO, so an out-of-range severity still enables its limit.
+        let severity = |name: &str| {
+            self.resolve_field(name)
+                .and_then(|v| v.to_f64())
+                .unwrap_or(0.0) as i16
+        };
+        match super::record_trait::alarm_val_arm(rtype) {
+            super::record_trait::AlarmValArm::Unconditional => {
+                (limit("HIHI"), limit("HIGH"), limit("LOW"), limit("LOLO"))
+            }
+            super::record_trait::AlarmValArm::Gated => (
+                gated(severity("HHSV"), limit("HIHI")),
+                gated(severity("HSV"), limit("HIGH")),
+                gated(severity("LSV"), limit("LOW")),
+                gated(severity("LLSV"), limit("LOLO")),
+            ),
         }
     }
 
@@ -4452,16 +4466,130 @@ impl RecordInstance {
     /// slots off one VAL-class predicate is what put the record's own
     /// valueAlarm limits on all eight.
     ///
-    /// Two types list nothing at all, so even VAL takes the default arm:
-    /// `seqRecord.c:353-360` routes only its `DOn` fields (and through their
-    /// `DOLn` link), `aSubRecord.c:280-303` only its `INPn`/`OUTn` links.
-    /// A constant link supplies no alarm limits, so that link arm lands on the
-    /// same four NaN — which is why only the VAL question needs a per-type
-    /// answer here and the link fields do not.
+    /// Which fields each type lists — and the fact that some list none, and
+    /// that `motor` lists two — is one per-type table,
+    /// [`alarm_explicit_fields`](super::record_trait::alarm_explicit_fields);
+    /// what that listed arm ANSWERS is its twin,
+    /// [`alarm_val_arm`](super::record_trait::alarm_val_arm). Keeping the two
+    /// questions in one place is what lets this predicate stay a pure
+    /// membership test.
     fn alarm_explicit_field(rtype: &str, field: &str) -> bool {
+        super::record_trait::alarm_explicit_fields(rtype)
+            .iter()
+            .any(|f| field.eq_ignore_ascii_case(f))
+    }
+
+    /// `A`..`A+n-1` (a single letter) or `LA`..`LA+n-1` — C's calc-family
+    /// argument fields, addressed by index range rather than by name.
+    ///
+    /// `calcRecord.c:161-167` / `calcoutRecord.c:417-423` test
+    /// `idx >= indexof(A) && idx < indexof(A) + CALCPERFORM_NARGS`, and the dbd
+    /// declares those `CALCPERFORM_NARGS` fields contiguously as the single
+    /// letters `A`..`U` (`postfix.h:29` = 21, `calcRecord.dbd.pod:801-985`), so
+    /// the index range and the letter range are the same set.
+    fn calc_arg_field(field: &str, nargs: u8) -> bool {
+        let last = b'A' + nargs - 1;
+        match field.as_bytes() {
+            [c] => c.is_ascii_uppercase() && *c <= last,
+            [b'L', c] => c.is_ascii_uppercase() && *c <= last,
+            _ => false,
+        }
+    }
+
+    /// The fields C's **`get_graphic_double`** answers with the record's own
+    /// `HOPR`/`LOPR` — which is exactly what the VAL metadata cache already
+    /// holds, so routing must leave them on it.
+    ///
+    /// The third membership question, and a third distinct set: the alarm arm
+    /// lists VAL alone and the control arm lists the eight, but graphic lists
+    /// the eight PLUS a per-type tail, and two types cut it short.
+    ///
+    /// * base analog (`aiRecord.c:244-266`, `aoRecord.c:316-339`,
+    ///   `calcRecord.c:187-212`, `calcoutRecord.c:452-484`,
+    ///   `subRecord.c:222-247`, `selRecord.c:181-201`,
+    ///   `dfanoutRecord.c:181-195`, `longinRecord.c:190-204`,
+    ///   `longoutRecord.c`, `int64inRecord.c:196-210`, `int64outRecord.c`):
+    ///   the eight.
+    /// * `acalcout`/`scalcout` (`aCalcoutRecord.c:1046`, `sCalcoutRecord.c:906`)
+    ///   list only VAL/HIHI/HIGH/LOW/LOLO — NOT LALM/ALST/MLST — plus the
+    ///   `A`..`L` and `PA`..`PL` ranges.
+    /// * `sel` (`selRecord.c:193-196`) also lists `A`..`L` / `LA`..`LL`, via a
+    ///   GCC case range. It has no link arm at all, so its args are HOPR/LOPR
+    ///   where calc's identically-named ones are link-backed.
+    /// * the SVAL family (`aiRecord.c:253`, `longinRecord.c`,
+    ///   `int64inRecord.c:205`), `ao`'s `OVAL`/`PVAL`/`IVOV`
+    ///   (`aoRecord.c:322-338`), and `compress`'s `IHIL`/`ILIL`
+    ///   (`compressRecord.c:474-476`).
+    ///
+    /// Fields whose graphic case answers something OTHER than HOPR/LOPR are
+    /// NOT here — they cannot keep the cache and are supplied by
+    /// [`Record::field_metadata_override`] instead (`histogram` WDTH,
+    /// `subArray`/`waveform`/`aai`/`aao` index fields, `seq` DLYn,
+    /// `calcout` ODLY).
+    fn graphic_explicit_field(rtype: &str, field: &str) -> bool {
+        if crate::server::database::is_value_field(field) {
+            return true;
+        }
+        let f = field.to_ascii_uppercase();
+        let bands: &[&str] = match rtype {
+            "acalcout" | "scalcout" => &["HIHI", "HIGH", "LOW", "LOLO"],
+            _ => &["HIHI", "HIGH", "LOW", "LOLO", "LALM", "ALST", "MLST"],
+        };
+        if bands.contains(&f.as_str()) {
+            return true;
+        }
         match rtype {
-            "seq" | "aSub" => false,
-            _ => crate::server::database::is_value_field(field),
+            "ai" | "longin" | "int64in" => f == "SVAL",
+            "ao" => matches!(f.as_str(), "OVAL" | "PVAL" | "IVOV"),
+            "compress" => matches!(f.as_str(), "IHIL" | "ILIL"),
+            // sel's args are 12 (`SEL_MAX`), not the calc family's 21.
+            "sel" => Self::calc_arg_field(&f, 12),
+            // A..L and PA..PL, both to HOPR/LOPR.
+            "acalcout" | "scalcout" => {
+                Self::calc_arg_field(&f, 12)
+                    || matches!(f.as_bytes(), [b'P', c] if c.is_ascii_uppercase() && *c <= b'L')
+            }
+            _ => false,
+        }
+    }
+
+    /// The fields whose C `get_graphic_double` routes through a LINK —
+    /// `dbGetGraphicLimits` on the link that backs the field, not the field's
+    /// own type range.
+    ///
+    /// This is the one thing display needs that control never did:
+    /// `dbGetControlLimits` has zero callers in all of base, so the control
+    /// arm had no link branch to model. Graphic does, and it is what makes the
+    /// display default arm NOT a straight flip to the type range.
+    ///
+    /// A link left unset is a CONSTANT link, which supplies no metadata
+    /// getters, so `dbGetGraphicLimits` writes nothing and the
+    /// `dbAccess.c:216` `(0.0, 0.0)` seed stands — measured: `CALC.A` serves
+    /// display 0/0 where its DBF_DOUBLE type range would be ±1e300, while
+    /// `CALC.PHAS` (no link) serves the DBF_SHORT range ±32767.
+    ///
+    /// Four types, both by mechanical index test:
+    /// * `calc`/`calcout`/`sub` — `get_linkNumber` (`calcRecord.c:161-167`,
+    ///   `calcoutRecord.c:417-423`, `subRecord.c:198-204`): `A`..`A+NARGS` and
+    ///   `LA`..`LA+NARGS`, both onto `&prec->inpa + n`. calc/calcout use
+    ///   `CALCPERFORM_NARGS` (21); `sub` uses `INP_ARG_MAX`
+    ///   (`subRecord.c:89`), also 21.
+    /// * `seq` — `seqRecord.c:322-338`: field offset from `DLY0` with
+    ///   `offset & 3 == 2` is `DOn`, routed through `get_dol(prec, offset)`.
+    ///
+    /// `sel` names its args the same way and is deliberately NOT here: its
+    /// rset lists them explicitly on HOPR/LOPR and calls `dbGetGraphicLimits`
+    /// nowhere.
+    fn graphic_link_backed_field(rtype: &str, field: &str) -> bool {
+        let f = field.to_ascii_uppercase();
+        match rtype {
+            "calc" | "calcout" | "sub" => Self::calc_arg_field(&f, 21),
+            // DLY0/DOL0/DO0/LNK0, DLY1/... — DOn is offset 2 of each group of
+            // four, i.e. the `DO` prefix over the same 0-F suffix set.
+            "seq" => {
+                matches!(f.as_bytes(), [b'D', b'O', c] if c.is_ascii_digit() || (b'A'..=b'F').contains(c))
+            }
+            _ => false,
         }
     }
 

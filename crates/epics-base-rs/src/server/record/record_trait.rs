@@ -504,13 +504,21 @@ pub struct ArrayMonitorPost {
 /// This says what a slot that DOES exist answers when it falls through. The
 /// two genuinely differ: `acalcout` supplies the slot and still writes nothing
 /// for an unlisted field.
+///
+/// Slot-neutral: the two arm SHAPES are the same for `get_control_double` and
+/// `get_graphic_double`, but which one a record type takes is asked per slot —
+/// [`control_default_arm`] and [`graphic_default_arm`] are separate answers.
+/// `aSub` is the type that proves they must be: its `get_control_double` is a
+/// bare `recGblGetControlDouble` (`aSubRecord.c:372-376`) while its
+/// `get_graphic_double` (`:350-368`) has no recGbl call at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ControlDefaultArm {
-    /// The slot ends in `recGblGetControlDouble` — the field TYPE's numeric
-    /// range (`recGbl.c:146-171`, table at `:372-419`).
+pub enum RsetDefaultArm {
+    /// The slot ends in `recGblGetControlDouble` / `recGblGetGraphicDouble` —
+    /// the field TYPE's numeric range (`recGbl.c:146-171`, table at
+    /// `:372-419`).
     RecGblRange,
-    /// The slot returns without writing, so `dbAccess.c:256`'s `(0.0, 0.0)`
-    /// seed stands.
+    /// The slot returns without writing, so the `dbAccess.c:256` / `:216`
+    /// `(0.0, 0.0)` seed stands.
     Seed,
 }
 
@@ -537,13 +545,97 @@ pub enum ControlDefaultArm {
 /// with a bare `return(0)` after their listed cases, so C serves the seed
 /// where a delegating record serves the type range. Measured on the
 /// differential oracle as 42 `acalcout`/`scalcout` fields.
-pub fn control_default_arm(rtype: &str) -> ControlDefaultArm {
+pub fn control_default_arm(rtype: &str) -> RsetDefaultArm {
     match rtype {
         // aCalcoutRecord.c:793-822, sCalcoutRecord.c:653 — the switch lists
         // VAL/HIHI/HIGH/LOW/LOLO and the A-L / PA-PL ranges, then falls off
         // the end into `return(0)` with no recGbl delegation.
-        "acalcout" | "scalcout" => ControlDefaultArm::Seed,
-        _ => ControlDefaultArm::RecGblRange,
+        "acalcout" | "scalcout" => RsetDefaultArm::Seed,
+        _ => RsetDefaultArm::RecGblRange,
+    }
+}
+
+/// The last arm of `rtype`'s C `get_graphic_double` — the twin of
+/// [`control_default_arm`], and NOT the same answer for every type.
+///
+/// Read from each ported type's own rset. `aSubRecord.c:350-368` is the one
+/// that separates the two slots: it tries `get_inlinkNumber` then
+/// `get_outlinkNumber` and, for a field that is neither, falls out of the
+/// function having written nothing — no `default:`, no recGbl call — so the
+/// `dbAccess.c:216` seed stands. Its `get_control_double` (`:372-376`) is a
+/// bare `recGblGetControlDouble` in the same file, which is why one shared bit
+/// could not answer both. Measured: `ASUB.PHAS` serves display 0/0 where
+/// `CALC.PHAS` serves the DBF_SHORT range ±32767.
+///
+/// The synApps calc pair ends the same way — the listed cases return early and
+/// the function ends `return(0)` with no delegation
+/// (`aCalcoutRecord.c:1046-1068`, `sCalcoutRecord.c:906-928`).
+///
+/// Every other ported type that supplies the slot delegates
+/// (`aiRecord.c:244`, `aoRecord.c:316`, `calcRecord.c:187`,
+/// `calcoutRecord.c:452`, `subRecord.c:222`, `selRecord.c:181`,
+/// `seqRecord.c:322`, `dfanoutRecord.c:181`, `longinRecord.c:190`,
+/// `int64inRecord.c:196`, `int64outRecord.c:235`, `longoutRecord.c:252`,
+/// `waveformRecord.c:251`, `aaiRecord.c:276`, `aaoRecord.c:279`,
+/// `subArrayRecord.c:231`, `compressRecord.c:471`, `histogramRecord.c:442`).
+pub fn graphic_default_arm(rtype: &str) -> RsetDefaultArm {
+    match rtype {
+        "aSub" | "acalcout" | "scalcout" => RsetDefaultArm::Seed,
+        _ => RsetDefaultArm::RecGblRange,
+    }
+}
+
+/// How `rtype`'s C `get_alarm_double` answers the fields it lists explicitly
+/// (see [`alarm_explicit_fields`]).
+///
+/// The severity gate is NOT universal, so this bit cannot be inferred from the
+/// base analog shape — it is read from each ported type's own rset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlarmValArm {
+    /// `pad->upper_alarm_limit = prec->hhsv ? prec->hihi : epicsNAN` — each
+    /// limit is served only when its severity is enabled. The base analog
+    /// shape (`aiRecord.c:290-301`, and ao/longin/longout/calc/calcout/sel/
+    /// sub/dfanout alike).
+    Gated,
+    /// `pad->upper_alarm_limit = prec->hihi` — the four limits verbatim, with
+    /// no severity test at all, so an unset record serves 0 rather than NaN
+    /// (`int64inRecord.c:235-246`, `int64outRecord.c:279-290`,
+    /// `sCalcoutRecord.c:683-696`, `aCalcoutRecord.c:823-836`,
+    /// `motorRecord.cc:3344-3361`, `epidRecord.c:289-301`).
+    Unconditional,
+}
+
+/// The fields `rtype`'s C `get_alarm_double` lists BEFORE its
+/// `recGblGetAlarmDouble` fall-through — the ones that take
+/// [`alarm_val_arm`]'s answer instead of the four NaN.
+///
+/// Empty means the rset lists nothing: even VAL falls to the default arm.
+/// `seqRecord.c:355-367` routes only its `DOn` fields (through their `DOLn`
+/// link), `aSubRecord.c:378-404` only its `INPn`/`OUTn` links, and
+/// `swaitRecord.c:608-612` is a bare `recGblGetAlarmDouble(paddr,pad)` with no
+/// field test whatsoever. A constant link supplies no alarm limits, so the link
+/// arm lands on the same four NaN — which is why only the listed set needs a
+/// per-type answer and the link fields do not.
+///
+/// `motorRecord.cc:3344-3361` is the one type listing a second field: its case
+/// is `fieldIndex == motorRecordVAL || fieldIndex == motorRecordDVAL`, so the
+/// dial-coordinate readback carries the same limits as VAL.
+pub fn alarm_explicit_fields(rtype: &str) -> &'static [&'static str] {
+    match rtype {
+        "seq" | "aSub" | "swait" => &[],
+        "motor" => &["VAL", "DVAL"],
+        _ => &["VAL"],
+    }
+}
+
+/// See [`AlarmValArm`]. Types whose rset lists nothing
+/// ([`alarm_explicit_fields`] empty) never consult this.
+pub fn alarm_val_arm(rtype: &str) -> AlarmValArm {
+    match rtype {
+        "int64in" | "int64out" | "scalcout" | "acalcout" | "motor" | "epid" => {
+            AlarmValArm::Unconditional
+        }
+        _ => AlarmValArm::Gated,
     }
 }
 

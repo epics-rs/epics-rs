@@ -706,14 +706,20 @@ impl Record for WaveformRecord {
     /// **1** down — C's control lower differs from its graphic lower of 0,
     /// `:246` vs `:277`), `NORD` (`MALM` up, 0 down) and `BUSY` (a flag: 1/0).
     ///
+    /// The other three kinds list fewer fields, and bound them by `NELM` (the
+    /// record's own length) rather than by `MALM`:
+    ///
+    /// * `waveformRecord.c:268-289` — `BUSY` (a flag: 1/0) and `NORD` (`NELM`
+    ///   up, 0 down); it does NOT list `NELM`, which is why `NELM` takes the
+    ///   routed type range for a waveform and `MALM` for a subArray.
+    /// * `aaiRecord.c:293-310` / `aaoRecord.c:296-313` — only `NORD`.
+    ///
     /// `get_graphic_double` is a DIFFERENT list per kind, so the two slots are
     /// answered separately here:
     ///
     /// * `subArray` (`:231-260`) — the same four, but `NELM`'s lower is **0**.
-    /// * `waveform` (`:251-266`) — only `BUSY` (1/0) and `NORD` (`NELM` up, 0
-    ///   down); it does NOT list `NELM`, which is why `NELM` takes the routed
-    ///   type range for a waveform and `MALM` for a subArray.
-    /// * `aai` (`:276-291`) / `aao` (`:279-294`) — only `NORD` (`NELM` up, 0).
+    /// * `waveform` (`:251-266`) — `BUSY` and `NORD`, same values as control.
+    /// * `aai` (`:276-291`) / `aao` (`:279-294`) — only `NORD`.
     ///
     /// `VAL` is absent from both lists here: it answers HOPR/LOPR, which is
     /// what the VAL metadata cache already holds.
@@ -727,6 +733,8 @@ impl Record for WaveformRecord {
             (ArrayKind::SubArray, "NELM") => Some((malm, 1.0)),
             (ArrayKind::SubArray, "NORD") => Some((malm, 0.0)),
             (ArrayKind::SubArray, "BUSY") => Some((1.0, 0.0)),
+            (ArrayKind::Waveform, "BUSY") => Some((1.0, 0.0)),
+            (ArrayKind::Waveform | ArrayKind::Aai | ArrayKind::Aao, "NORD") => Some((nelm, 0.0)),
             _ => None,
         };
         let disp_limits = match (self.kind, f.as_str()) {

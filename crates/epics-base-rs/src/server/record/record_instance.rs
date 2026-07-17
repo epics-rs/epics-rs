@@ -4270,11 +4270,12 @@ impl RecordInstance {
     /// limits (and already distinguishes `ao`'s DRVH/DRVL from `ai`'s
     /// HOPR/LOPR).
     ///
-    /// The two slots' listed sets are **different**, and each has its own
-    /// owner here: [`Self::control_explicit_field`] (VAL + the seven alarm
-    /// bands) and [`Self::alarm_explicit_field`] (VAL alone). They are
-    /// separate switches over separate field lists in C, so the membership
-    /// question is asked once per slot, never once for both.
+    /// The three slots' listed sets are **different**, and each has its own
+    /// owner here: [`Self::control_explicit_field`],
+    /// [`Self::graphic_explicit_field`] and [`Self::alarm_explicit_field`].
+    /// They are separate switches over separate field lists in C, so the
+    /// membership question is asked once per slot, never once for both — and
+    /// each list varies by record TYPE, so it is asked once per type too.
     ///
     /// Measured on a real `softIocPVX` against `record(calc,"X"){}`:
     /// `.PHAS` (DBF_SHORT, unlisted) serves control ±32767 — the SHRT range —
@@ -4311,7 +4312,7 @@ impl RecordInstance {
         // C `get_control_double`'s last arm. No base record routes control
         // through a link: `dbGetControlLimits` has zero callers in all of
         // base, so unlike display this arm needs no link branch.
-        if slots.control_double && !Self::control_explicit_field(field) {
+        if slots.control_double && !Self::control_explicit_field(rtype, field) {
             let (upper, lower) =
                 match super::record_trait::control_default_arm(self.record.record_type()) {
                     // `recGblGetControlDouble` → `getMaxRangeValues(field_type)`.
@@ -4429,25 +4430,77 @@ impl RecordInstance {
         }
     }
 
-    /// The fields C's **`get_control_double`** lists explicitly before its
-    /// `default:` arm — VAL and the alarm-band siblings that share VAL's
-    /// range. `aiRecord.c:271-283`, `aoRecord.c:346-358` and
-    /// `calcRecord.c:271-283` list these same eight.
+    /// The fields C's **`get_control_double`** answers with the record's own
+    /// cached limits, rather than letting them fall to the `default:` arm.
     ///
-    /// The per-record EXTRAS are not here: they are supplied by
-    /// [`Record::field_metadata_override`], which runs after this routing and
-    /// so wins over the `default:` arm — `ai`/`longin`/`int64in` `SVAL`, `ao`
-    /// `OVAL`/`PVAL`, `compress` `IHIL`/`ILIL`, and the rest.
+    /// "VAL plus the seven alarm bands" is one type's list, not the shared
+    /// one: it holds for `ai` (`aiRecord.c:267-288`), `ao`, `calc`, `calcout`,
+    /// `longin`, `longout`, `int64in`, `int64out` and `sub`
+    /// (`subRecord.c:272-292`) — the `_` arm — and for no other type. Every
+    /// list below is transcribed from that type's own rset:
     ///
-    /// **Not** the alarm slot's list — see [`Self::alarm_explicit_field`],
-    /// which is a strictly smaller set. C's two rset arms are separate
-    /// switches over separate field lists, so one shared predicate could only
-    /// ever be right for one of them.
-    fn control_explicit_field(field: &str) -> bool {
-        crate::server::database::is_value_field(field)
-            || ["HIHI", "HIGH", "LOW", "LOLO", "LALM", "ALST", "MLST"]
-                .iter()
-                .any(|f| field.eq_ignore_ascii_case(f))
+    /// * `aSub` (`aSubRecord.c:372-376`) is a bare `recGblGetControlDouble`:
+    ///   it lists NOTHING, VAL included.
+    /// * `seq` (`seqRecord.c:342-353`) lists only DLYn and `bo`
+    ///   (`boRecord.c:310-318`) only HIGH — and both answer a LITERAL rather
+    ///   than the cache, so they come from
+    ///   [`Record::field_metadata_override`] (which runs after this routing
+    ///   and wins over the `default:` arm). Nothing of these two types keeps
+    ///   the cache, VAL included.
+    /// * `dfanout` (`dfanoutRecord.c:197-213`) lists VAL and the three
+    ///   latches but NOT the four bands.
+    /// * `sel` (`selRecord.c:203-235`) lists the eight plus `A`..`L` /
+    ///   `LA`..`LL`; `acalcout`/`scalcout` (`aCalcoutRecord.c:793-822`,
+    ///   `sCalcoutRecord.c:653-680`) list VAL and the four bands but NOT the
+    ///   latches, plus `A`..`L` / `PA`..`PL`.
+    /// * `epid` (`epidRecord.c:157-180`) lists VAL, the four bands and CVAL on
+    ///   HOPR/LOPR; `motor` (`motorRecord.cc:3269-3305`) lists VAL and RBV on
+    ///   HLM/LLM.
+    /// * the array types (`waveformRecord.c:268-289`, `aaiRecord.c:293-310`,
+    ///   `aaoRecord.c:296-313`, `compressRecord.c:487-502`,
+    ///   `histogramRecord.c:458-475`, `subArrayRecord.c:262-291`) list VAL
+    ///   alone on the cache — their other listed fields answer computed spans,
+    ///   so those too come from [`Record::field_metadata_override`].
+    ///
+    /// Fields whose listed case answers something OTHER than the record's
+    /// cached limits are deliberately absent — `motor`'s DVAL/DRBV (DHLM/DLLM)
+    /// and `epid`'s OVAL/P/I/D (DRVH/DRVL) have no override yet and so still
+    /// take the `default:` arm.
+    ///
+    /// **Not** the other two slots' lists — see [`Self::alarm_explicit_field`]
+    /// (smaller) and [`Self::graphic_explicit_field`] (larger, and cut short
+    /// for different types). C's three rset arms are separate switches over
+    /// separate field lists, so one shared predicate could only ever be right
+    /// for one of them.
+    fn control_explicit_field(rtype: &str, field: &str) -> bool {
+        // The two types that list nothing the cache can answer, VAL included.
+        if matches!(rtype, "aSub" | "seq" | "bo") {
+            return false;
+        }
+        if crate::server::database::is_value_field(field) {
+            return true;
+        }
+        let f = field.to_ascii_uppercase();
+        let bands: &[&str] = match rtype {
+            "dfanout" => &["LALM", "ALST", "MLST"],
+            "acalcout" | "scalcout" | "epid" => &["HIHI", "HIGH", "LOW", "LOLO"],
+            "waveform" | "aai" | "aao" | "compress" | "histogram" | "subArray" | "motor" => &[],
+            _ => &["HIHI", "HIGH", "LOW", "LOLO", "LALM", "ALST", "MLST"],
+        };
+        if bands.contains(&f.as_str()) {
+            return true;
+        }
+        match rtype {
+            // sel's args are 12 (`SEL_MAX`), not the calc family's 21.
+            "sel" => Self::calc_arg_field(&f, 12),
+            "acalcout" | "scalcout" => {
+                Self::calc_arg_field(&f, 12)
+                    || matches!(f.as_bytes(), [b'P', c] if c.is_ascii_uppercase() && *c <= b'L')
+            }
+            "epid" => f == "CVAL",
+            "motor" => f == "RBV",
+            _ => false,
+        }
     }
 
     /// The fields C's **`get_alarm_double`** lists explicitly — **VAL alone**,

@@ -3,6 +3,27 @@ use epics_macros_rs::EpicsRecord;
 use crate::server::record::MENU_YES_NO;
 use crate::types::PvString;
 
+/// `int64inRecord.c:225` `get_control_double` lists one field the shared
+/// VAL-class set does not: `SVAL`, which takes the record's own `HOPR`/`LOPR`
+/// like `VAL` does. Without this it falls to the `default:` arm and reports
+/// the DBF_INT64 range of ±9223372036854775807.
+///
+/// The third and last member of the SVAL family — `aiRecord.c:280` and
+/// `longinRecord.c:220` list it too, and this record type was the one left
+/// out. `int64outRecord.c:294-312` does NOT list SVAL (an output record has
+/// no simulation buffer to serve), so the family ends here.
+fn int64in_metadata_override(
+    rec: &Int64inRecord,
+    field: &str,
+) -> Option<crate::server::record::FieldMetadataOverride> {
+    field
+        .eq_ignore_ascii_case("SVAL")
+        .then(|| crate::server::record::FieldMetadataOverride {
+            ctrl_limits: Some((rec.hopr as f64, rec.lopr as f64)),
+            ..Default::default()
+        })
+}
+
 // int64in: 64-bit integer input.
 // CA limitation: served as DBR_DOUBLE over Channel Access (f64, precision loss for |val|>2^53).
 // Native i64 storage is lossless; precision is only lost at the CA wire boundary.
@@ -11,7 +32,7 @@ use crate::types::PvString;
 // from the field list so they route to RecordInstance::common.analog_alarm via
 // put_common_field, matching the path used by longin/ao/ai.
 #[derive(EpicsRecord)]
-#[record(type = "int64in")]
+#[record(type = "int64in", metadata_override = int64in_metadata_override)]
 pub struct Int64inRecord {
     #[field(type = "Int64")]
     pub val: i64,

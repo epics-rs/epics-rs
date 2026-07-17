@@ -30,6 +30,7 @@ use epics_base_rs::server::records::acalcout::AcalcoutRecord;
 use epics_base_rs::server::records::bi::BiRecord;
 use epics_base_rs::server::records::bo::BoRecord;
 use epics_base_rs::server::records::calc::CalcRecord;
+use epics_base_rs::server::records::int64in::Int64inRecord;
 use epics_base_rs::server::snapshot::Snapshot;
 use epics_base_rs::types::EpicsValue;
 
@@ -181,5 +182,71 @@ fn a_record_the_legacy_cache_never_covered_still_routes_its_type_range() {
         snap(&inst, "PHAS").control_limits(),
         Some((-32768.0, 32767.0)),
         "bo supplies get_control_double, so PHAS takes the default: arm"
+    );
+}
+
+/// The two rset arms do NOT share one field list, and `.HIHI` is where they
+/// provably disagree: `calcRecord.c:271-283` lists it in `get_control_double`
+/// (so it takes the record's HOPR/LOPR) while `calcRecord.c:258` lists only
+/// VAL in `get_alarm_double` (so it takes `recGblGetAlarmDouble`'s four NaN).
+///
+/// One shared VAL-class predicate cannot answer both: it either denies `.HIHI`
+/// its control limits or hands it VAL's alarm limits. Measured on
+/// `softIocPVX` for `record(calc,"ORACLE:CALC"){}`, `.HIHI` serves control
+/// 0/0 (HOPR/LOPR) and valueAlarm all-NaN in the same read.
+#[test]
+fn the_alarm_arm_lists_val_alone_where_the_control_arm_lists_the_bands() {
+    let inst = RecordInstance::new("T:CALC".to_string(), CalcRecord::new("A"));
+
+    // Same field, same read, two different answers — that is the whole point.
+    assert_eq!(
+        snap(&inst, "HIHI").control_limits(),
+        Some((0.0, 0.0)),
+        "calcRecord.c:271-283 lists HIHI: control keeps the record's HOPR/LOPR"
+    );
+    let (hihi, high, low, lolo) = snap(&inst, "HIHI")
+        .alarm_limits()
+        .expect("calc supplies get_alarm_double, so the leaves are served");
+    assert!(
+        hihi.is_nan() && high.is_nan() && low.is_nan() && lolo.is_nan(),
+        "calcRecord.c:258 lists VAL ALONE, so HIHI takes recGblGetAlarmDouble's \
+         four NaN — not VAL's own alarm limits; got {hihi}/{high}/{low}/{lolo}"
+    );
+
+    // The seven bands all take the alarm default arm, not just HIHI.
+    for band in ["HIGH", "LOW", "LOLO", "LALM", "ALST", "MLST"] {
+        let (a, b, c, d) = snap(&inst, band)
+            .alarm_limits()
+            .unwrap_or_else(|| panic!("{band} serves no alarm limits"));
+        assert!(
+            a.is_nan() && b.is_nan() && c.is_nan() && d.is_nan(),
+            "{band} is listed by get_control_double but NOT get_alarm_double, \
+             so its alarm limits are the recGbl NaN; got {a}/{b}/{c}/{d}"
+        );
+    }
+}
+
+/// `int64in` is the one analog family whose C `get_alarm_double` VAL case is
+/// UNCONDITIONAL (`int64inRecord.c:235-244` — no `hhsv ?` gate), so VAL serves
+/// the raw limits. That must not leak to the bands: `.HIHI` is still unlisted
+/// there and still takes the NaN default arm. This is the pair that made the
+/// conflation visible on the wire, since int64in's cache holds 0 rather than
+/// the gated NaN that masked the bug on `ai`.
+#[test]
+fn int64ins_unconditional_val_case_does_not_leak_to_its_alarm_bands() {
+    let inst = RecordInstance::new("T:I64".to_string(), Int64inRecord::default());
+
+    assert_eq!(
+        snap(&inst, "VAL").alarm_limits(),
+        Some((0.0, 0.0, 0.0, 0.0)),
+        "int64inRecord.c:239-243 assigns hihi/high/low/lolo verbatim for VAL"
+    );
+    let (hihi, high, low, lolo) = snap(&inst, "HIHI")
+        .alarm_limits()
+        .expect("int64in supplies get_alarm_double");
+    assert!(
+        hihi.is_nan() && high.is_nan() && low.is_nan() && lolo.is_nan(),
+        "HIHI is not VAL: it takes recGblGetAlarmDouble, so NaN — got \
+         {hihi}/{high}/{low}/{lolo}"
     );
 }

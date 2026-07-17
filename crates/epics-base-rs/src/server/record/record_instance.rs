@@ -4327,13 +4327,19 @@ impl RecordInstance {
     /// every field is what made a non-VAL field report VAL's limits.
     ///
     /// Every base record's `get_control_double` / `get_alarm_double` has the
-    /// same two-arm shape: a listed set of VAL-class field indices that take
-    /// the record's own limits, and a `default:` arm that hands the field to
+    /// same two-arm shape: a listed set of field indices that take the
+    /// record's own limits, and a `default:` arm that hands the field to
     /// `recGblGetControlDouble` / `recGblGetAlarmDouble` — the field TYPE's
-    /// numeric range, and four NaN. This routes the `default:` arm; the
-    /// VAL-class set keeps the cache, which already holds exactly the record's
-    /// own limits (and already distinguishes `ao`'s DRVH/DRVL from `ai`'s
+    /// numeric range, and four NaN. This routes the `default:` arm; a listed
+    /// field keeps the cache, which already holds exactly the record's own
+    /// limits (and already distinguishes `ao`'s DRVH/DRVL from `ai`'s
     /// HOPR/LOPR).
+    ///
+    /// The two slots' listed sets are **different**, and each has its own
+    /// owner here: [`Self::control_explicit_field`] (VAL + the seven alarm
+    /// bands) and [`Self::alarm_explicit_field`] (VAL alone). They are
+    /// separate switches over separate field lists in C, so the membership
+    /// question is asked once per slot, never once for both.
     ///
     /// Measured on a real `softIocPVX` against `record(calc,"X"){}`:
     /// `.PHAS` (DBF_SHORT, unlisted) serves control ±32767 — the SHRT range —
@@ -4366,14 +4372,10 @@ impl RecordInstance {
         // suppress it (`codec.rs` `get_limits` reads these structs ungated).
         let slots = self.record.property_support();
 
-        if Self::is_val_class_field(field) {
-            return;
-        }
-
         // C `get_control_double`'s last arm. No base record routes control
         // through a link: `dbGetControlLimits` has zero callers in all of
         // base, so unlike display this arm needs no link branch.
-        if slots.control_double {
+        if slots.control_double && !Self::control_explicit_field(field) {
             let (upper, lower) =
                 match super::record_trait::control_default_arm(self.record.record_type()) {
                     // `recGblGetControlDouble` → `getMaxRangeValues(field_type)`.
@@ -4399,7 +4401,7 @@ impl RecordInstance {
         // (`recGbl.c:155-162`). The link-backed sibling arm lands on the same
         // answer here: `dbAccess.c:294` seeds four NaN, and a constant link
         // supplies no alarm limits to overwrite them.
-        if slots.alarm_double {
+        if slots.alarm_double && !Self::alarm_explicit_field(self.record.record_type(), field) {
             let (hihi, high, low, lolo) = crate::server::recgbl::rec_gbl_get_alarm_double();
             // The four alarm limits live on DisplayInfo because that mirrors
             // C's `dbr_gr_double` packing, which the CA encoder depends on.
@@ -4413,21 +4415,54 @@ impl RecordInstance {
         }
     }
 
-    /// The field indices every base record lists explicitly in its
-    /// `get_control_double` / `get_alarm_double` switch before the `default:`
-    /// arm — VAL and the alarm-band siblings that share VAL's range.
+    /// The fields C's **`get_control_double`** lists explicitly before its
+    /// `default:` arm — VAL and the alarm-band siblings that share VAL's
+    /// range. `aiRecord.c:271-283`, `aoRecord.c:346-358` and
+    /// `calcRecord.c:271-283` list these same eight.
     ///
-    /// This is one shared set, not a per-record table: `aiRecord.c`,
-    /// `aoRecord.c` and `calcRecord.c` list these same eight. The per-record
-    /// EXTRAS are not modelled — `ai` also lists `SVAL`, `ao` also lists
-    /// `OVAL`/`PVAL` — so those few fields take the `default:` arm here and
-    /// stay a measured residue. Modelling them means a per-record table, which
-    /// is the transcription this routing exists to avoid.
-    fn is_val_class_field(field: &str) -> bool {
+    /// The per-record EXTRAS are not here: they are supplied by
+    /// [`Record::field_metadata_override`], which runs after this routing and
+    /// so wins over the `default:` arm — `ai`/`longin`/`int64in` `SVAL`, `ao`
+    /// `OVAL`/`PVAL`, `compress` `IHIL`/`ILIL`, and the rest.
+    ///
+    /// **Not** the alarm slot's list — see [`Self::alarm_explicit_field`],
+    /// which is a strictly smaller set. C's two rset arms are separate
+    /// switches over separate field lists, so one shared predicate could only
+    /// ever be right for one of them.
+    fn control_explicit_field(field: &str) -> bool {
         crate::server::database::is_value_field(field)
             || ["HIHI", "HIGH", "LOW", "LOLO", "LALM", "ALST", "MLST"]
                 .iter()
                 .any(|f| field.eq_ignore_ascii_case(f))
+    }
+
+    /// The fields C's **`get_alarm_double`** lists explicitly — **VAL alone**,
+    /// not the eight [`Self::control_explicit_field`] lists.
+    ///
+    /// Transcribed from every rset in base that supplies the slot; each is a
+    /// bare `if (dbGetFieldIndex(paddr) == indexof(VAL))` with every other
+    /// field falling to `recGblGetAlarmDouble` (`recGbl.c:155-162`, four NaN):
+    /// `aiRecord.c:293`, `aoRecord.c:365`, `calcRecord.c:258`,
+    /// `calcoutRecord.c`, `dfanoutRecord.c:216`, `int64inRecord.c:235`,
+    /// `int64outRecord.c`, `longinRecord.c`, `longoutRecord.c`,
+    /// `selRecord.c:222`, `subRecord.c:236`.
+    ///
+    /// So `.HIHI` serves VAL's *control* limits but NOT VAL's *alarm* limits —
+    /// the band fields' four alarm limits are the recGbl NaN. Routing both
+    /// slots off one VAL-class predicate is what put the record's own
+    /// valueAlarm limits on all eight.
+    ///
+    /// Two types list nothing at all, so even VAL takes the default arm:
+    /// `seqRecord.c:353-360` routes only its `DOn` fields (and through their
+    /// `DOLn` link), `aSubRecord.c:280-303` only its `INPn`/`OUTn` links.
+    /// A constant link supplies no alarm limits, so that link arm lands on the
+    /// same four NaN — which is why only the VAL question needs a per-type
+    /// answer here and the link fields do not.
+    fn alarm_explicit_field(rtype: &str, field: &str) -> bool {
+        match rtype {
+            "seq" | "aSub" => false,
+            _ => crate::server::database::is_value_field(field),
+        }
     }
 
     /// The field's type as the **dbd declares it**, which is the only type

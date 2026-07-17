@@ -523,6 +523,10 @@ mod tests {
         );
     }
 
+    // Abstract-namespace sockets are a Linux-only feature (bind_one's
+    // platform fork errors on other targets), so the render test can
+    // only bind one there.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn abstract_unix_address_uses_the_at_prefix() {
         use crate::procserv::config::ListenConfig;

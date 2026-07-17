@@ -4580,6 +4580,18 @@ impl RecordInstance {
     /// `subArray`/`waveform`/`aai`/`aao` index fields, `seq` DLYn,
     /// `calcout` ODLY).
     fn graphic_explicit_field(rtype: &str, field: &str) -> bool {
+        // The two types that do not list VAL. Neither switch is keyed on
+        // VAL at all: `seqRecord.c:282-297` keys on `index - indexof(DLY0)`,
+        // so every field BELOW DLY0 — VAL included — reaches
+        // `recGblGetGraphicDouble`; `aSubRecord.c:350-368` keys on the link
+        // number, and VAL is neither an inlink nor an outlink, so it falls out
+        // having written nothing (the `graphic_default_arm` Seed).
+        //
+        // Measured: `SEQ.VAL` served display 0/0 — the empty VAL cache — where
+        // C serves the DBF_LONG range.
+        if matches!(rtype, "seq" | "aSub") {
+            return false;
+        }
         if crate::server::database::is_value_field(field) {
             return true;
         }

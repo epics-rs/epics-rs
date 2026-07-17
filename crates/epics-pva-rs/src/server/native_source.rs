@@ -728,16 +728,38 @@ impl ChannelSource for PvDatabaseSource {
                     pv.set_snapshot(snap).await;
                     Ok(())
                 }
-                _ => {
+                // A record-backed channel is an EXTERNAL client put, so it
+                // owes C `dbPutField` (`dbAccess.c:1252-1332`), not `dbPut`:
+                // the DISP/no-mod gates, the field write, the device write,
+                // the Passive process and the monitor post. `put_pv` is the
+                // `dbPut` analogue — it writes the field and stops, so a
+                // passive record took the value but never processed: UDF
+                // stayed set, the timestamp stayed at the EPICS epoch, and
+                // no monitor event was ever posted. The CA server already
+                // routes its external puts here (`epics-ca-rs`
+                // `tcp.rs:3866`); PVA must too.
+                //
+                // The `_no_notify` entry is the one that means `dbPutField`:
+                // C builds a `putNotify` only in `dbPutNotify` (WRITE_NOTIFY).
+                // This PUT is non-blocking and has no receiver to await, and
+                // parking a wait-set whose receiver is dropped would occupy
+                // `RecordInstance::notify` until the record's async work ends.
+                Some(PvEntry::Record(_)) => {
                     let scalar = extract_put_value_leaf(&value)
                         .ok_or_else(|| OpError::failed("PUT missing 'value' field"))?;
                     let epics = pv_field_to_epics(&scalar).ok_or_else(|| {
                         OpError::failed("PUT value not representable as EpicsValue")
                     })?;
-                    db.put_pv(&name, epics)
+                    // PUT targets a field; split the name the way `process`
+                    // below does so an alias resolves in the database.
+                    let (base, field) = parse_pv_name(&name);
+                    db.put_record_field_from_ca_no_notify(base, field, epics)
                         .await
                         .map_err(|e| OpError::failed(e.to_string()))
                 }
+                // Name not in the database: report it rather than falling
+                // through to a write that would silently find nothing.
+                None => Err(OpError::failed(format!("PUT: no such PV '{name}'"))),
             }
         }
     }
@@ -3001,6 +3023,58 @@ ASG(DEFAULT) {
             extract_put_value_leaf(&after),
             Some(PvField::Scalar(ScalarValue::Double(5.0))),
             "record PROCESS must evaluate CALC into VAL, not no-op"
+        );
+    }
+
+    /// An external PVA PUT on a record-backed channel owes C `dbPutField`,
+    /// not `dbPut`: a PASSIVE record must process on the put. Routing it
+    /// through `put_pv` landed the value but never processed — UDF stayed
+    /// set and no monitor event was posted, which is the whole
+    /// `--phase pva-monitor` "0 update(s) after the seed" pattern.
+    ///
+    /// UDF is the witness that discriminates the two routes: `dbPut` writes
+    /// the field and stops, so only a real process cycle clears it.
+    #[tokio::test]
+    async fn external_put_on_a_passive_record_processes_it() {
+        use epics_base_rs::server::records::calc::CalcRecord;
+
+        let db = Arc::new(PvDatabase::new());
+        // CALC="A" with VAL driven by the put: processing recomputes VAL and
+        // clears UDF. SCAN defaults to Passive.
+        db.add_record("CALC:PUT", Box::new(CalcRecord::new("A")))
+            .await
+            .unwrap();
+        let source = PvDatabaseSource::new(db.clone());
+        let ctx = make_ctx("localhost", "op", "ca");
+
+        assert_eq!(
+            db.get_pv("CALC:PUT.UDF").await.expect("UDF get"),
+            EpicsValue::UChar(1),
+            "a record that has never processed is UDF"
+        );
+
+        let checked = source
+            .access()
+            .check("CALC:PUT.A", &ctx.host, &ctx.account, &ctx.method, "")
+            .await;
+        let mut put = PvStructure::new("epics:nt/NTScalar:1.0");
+        put.fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::Double(3.0))));
+        source
+            .put_value_checked(checked, PvField::Structure(put), ctx.clone())
+            .await
+            .expect("PUT must succeed");
+
+        assert_eq!(
+            db.get_pv("CALC:PUT.UDF").await.expect("UDF get"),
+            EpicsValue::UChar(0),
+            "an external PUT owes dbPutField, which processes a PASSIVE record \
+             and clears UDF — `put_pv` (dbPut) would leave it set"
+        );
+        assert_eq!(
+            db.get_pv("CALC:PUT.VAL").await.expect("VAL get"),
+            EpicsValue::Double(3.0),
+            "processing must evaluate CALC=\"A\" into VAL"
         );
     }
 

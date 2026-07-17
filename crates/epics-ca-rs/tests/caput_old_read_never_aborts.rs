@@ -34,20 +34,26 @@ use tokio::process::Command;
 /// holding both — a port is TAKEN by binding it, never probed and handed on.
 ///
 /// The proxy needs one number on both protocols, so it cannot use the plain
-/// `.port(0)` + read-back pattern of a single socket: bind UDP on `:0` to
-/// take a number, then bind TCP on that number; an unrelated TCP listener
-/// can already hold it, so retry the pair with a fresh number. There is no
-/// drop→rebind window at any point — under a parallel test run the old
-/// probe-then-drop pattern lost the number to a neighbour and the bind
-/// `expect` panicked the test.
+/// `.port(0)` + read-back pattern of a single socket: bind TCP on `:0` to
+/// take a number, then bind UDP on that number; retry the pair with a fresh
+/// number if the UDP side is taken. There is no drop→rebind window at any
+/// point — under a parallel test run the old probe-then-drop pattern lost
+/// the number to a neighbour and the bind `expect` panicked the test.
+///
+/// TCP anchors the pair, not UDP: Windows CI runners carry Hyper-V
+/// administered port exclusions on the TCP side, and the UDP ephemeral
+/// allocator is sequential — a UDP-first anchor that wanders into a
+/// TCP-excluded block stays inside it for every retry (observed on GitHub
+/// runners: 10 straight anchors in one block, every TCP bind refused). The
+/// TCP allocator never hands out a number from its own excluded ranges.
 async fn bind_proxy_pair() -> (UdpSocket, TcpListener, u16) {
     const ATTEMPTS: usize = 10;
     for _ in 0..ATTEMPTS {
-        let udp = UdpSocket::bind(("127.0.0.1", 0))
+        let tcp = TcpListener::bind(("127.0.0.1", 0))
             .await
-            .expect("bind proxy UDP");
-        let port = udp.local_addr().expect("proxy UDP addr").port();
-        if let Ok(tcp) = TcpListener::bind(("127.0.0.1", port)).await {
+            .expect("bind proxy TCP");
+        let port = tcp.local_addr().expect("proxy TCP addr").port();
+        if let Ok(udp) = UdpSocket::bind(("127.0.0.1", port)).await {
             return (udp, tcp, port);
         }
     }

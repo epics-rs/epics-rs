@@ -13,9 +13,13 @@
 //! block (`cac.cpp:1240`, R18-19). What C never writes is a per-PV line from
 //! the event handler — that is the byte this test pins.
 
+mod common;
+
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+
+use common::LineCollector;
 
 /// A spawned child that is killed and reaped on every exit path, including a
 /// panicking assertion inside the test.
@@ -70,8 +74,18 @@ fn start_ioc() -> (Reaped, u16) {
     }
 }
 
-#[test]
-fn a_disconnect_under_camonitor_writes_no_per_pv_stderr_line() {
+/// One full connect → IOC-kill → disconnect pass; returns the monitor's
+/// complete (stdout, stderr). Every wait is on the output itself (a fixed
+/// sleep here raced connect + first event under load).
+///
+/// `resolver_grace` holds the circuit open between the first event and the
+/// IOC kill. It is NOT an output gate (nothing asserted below depends on it
+/// existing) — it is the width of the window the async hostname engine gets
+/// to win the R18-19 race before the disconnect snapshots the cache. macOS
+/// reverse lookups go through mDNSResponder IPC and can lose a ~30 ms
+/// window on every pass; C's `ipAddrToAsciiEngine` wins the same race only
+/// when given the same room.
+fn run_disconnect_scenario(resolver_grace: Duration) -> (String, String) {
     let (mut ioc, port) = start_ioc();
 
     let mut mon = Reaped(
@@ -86,41 +100,40 @@ fn a_disconnect_under_camonitor_writes_no_per_pv_stderr_line() {
             .expect("spawn camonitor-rs"),
     );
 
-    // Connect + first monitor event, then take the IOC away under it.
-    std::thread::sleep(Duration::from_millis(1500));
+    let out_lines = LineCollector::spawn(mon.0.stdout.take().expect("piped stdout"));
+    let err_lines = LineCollector::spawn(mon.0.stderr.take().expect("piped stderr"));
+
+    // Wait for the first monitor event itself, then take the IOC away
+    // under it.
+    assert!(
+        out_lines.wait_for(Duration::from_secs(10), |t| t.contains("TST:AI")),
+        "no first monitor line within 10s; stdout: {:?}",
+        out_lines.text()
+    );
+    std::thread::sleep(resolver_grace);
     ioc.0.kill().expect("kill softioc-rs");
     let _ = ioc.0.wait();
-    std::thread::sleep(Duration::from_millis(1500));
+
+    // The disconnect must surface on both streams; each stream is gated on
+    // its own marker so the kill below cannot race either write.
+    assert!(
+        out_lines.wait_for(Duration::from_secs(10), |t| t.contains("*** disconnected")),
+        "no `*** disconnected` on stdout within 10s; stdout: {:?}",
+        out_lines.text()
+    );
+    assert!(
+        err_lines.wait_for(Duration::from_secs(10), |t| t.contains("Source File:")),
+        "no CA.Client.Exception block on stderr within 10s; stderr: {:?}",
+        err_lines.text()
+    );
 
     mon.0.kill().expect("kill camonitor-rs");
-    let out = mon
-        .0
-        .stdout
-        .take()
-        .map(|mut so| {
-            let mut buf = Vec::new();
-            std::io::Read::read_to_end(&mut so, &mut buf).expect("read stdout");
-            buf
-        })
-        .expect("piped stdout");
-    let err = mon
-        .0
-        .stderr
-        .take()
-        .map(|mut se| {
-            let mut buf = Vec::new();
-            std::io::Read::read_to_end(&mut se, &mut buf).expect("read stderr");
-            buf
-        })
-        .expect("piped stderr");
-    let out = std::process::Output {
-        status: mon.0.wait().expect("reap camonitor-rs"),
-        stdout: out,
-        stderr: err,
-    };
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    let _ = mon.0.wait();
+    (out_lines.into_text(), err_lines.into_text())
+}
 
+/// The deterministic half of the contract — must hold on EVERY pass.
+fn assert_disconnect_contract(stdout: &str, stderr: &str) {
     assert!(
         stdout.contains("TST:AI") && stdout.contains("1"),
         "the monitor must have delivered its first value before the IOC died; \
@@ -132,47 +145,27 @@ fn a_disconnect_under_camonitor_writes_no_per_pv_stderr_line() {
         "C reports a lost IOC on stdout, from the connection callback; \
          stdout: {stdout:?}"
     );
-    // R18-19: stderr carries the ECA_DISCONN block, and C's `Context:` is the
-    // RESOLVED peer name (the circuit's `hostNameCache`), not the dotted IP.
+    // R18-19: stderr carries the ECA_DISCONN block.
     assert!(
         stderr.contains("    Warning: \"Virtual circuit disconnect\"\n")
             && stderr.contains("    Source File: ../cac.cpp line 1240\n"),
         "stderr: {stderr:?}"
     );
-    // The resolved loopback name is a `/etc/hosts` guarantee on unix: there
-    // `getnameinfo` returns `localhost`, so pin that exact name. Windows has no
-    // such alias, but `getnameinfo` still resolves 127.0.0.1 to the runner's
-    // own computer name (e.g. `runnervmuktm0`), so C's `tcpiiu::getHostName`
-    // yields `<machine>:<port>` — a resolved name, not the dotted IP. The
-    // machine name varies per runner, so assert the SHAPE the R18-19 contract
-    // guarantees (a non-empty resolved host with the peer port preserved)
-    // rather than a fixed host string.
-    #[cfg(unix)]
+    // The `Context:` is `<host>:<port>` with the peer port preserved —
+    // whatever the circuit's `hostNameCache` held when the block printed.
+    let ctx = stderr
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("Context: \""))
+        .and_then(|rest| rest.strip_suffix('"'))
+        .unwrap_or_else(|| panic!("no `Context:` line on stderr: {stderr:?}"));
+    let (host, port) = ctx
+        .rsplit_once(':')
+        .unwrap_or_else(|| panic!("Context is not `<host>:<port>`: {ctx:?}"));
+    assert!(!host.is_empty(), "empty Context host; ctx: {ctx:?}");
     assert!(
-        stderr.contains("    Context: \"localhost:"),
-        "the exception context is the resolved peer name, as C's \
-         `tcpiiu::getHostName` gives it; stderr: {stderr:?}"
+        port.parse::<u16>().is_ok(),
+        "R18-19: the peer port must be preserved in the context; ctx: {ctx:?}"
     );
-    #[cfg(windows)]
-    {
-        let ctx = stderr
-            .lines()
-            .find_map(|l| l.trim().strip_prefix("Context: \""))
-            .and_then(|rest| rest.strip_suffix('"'))
-            .unwrap_or_else(|| panic!("no `Context:` line on stderr: {stderr:?}"));
-        let (host, port) = ctx
-            .rsplit_once(':')
-            .unwrap_or_else(|| panic!("Context is not `<host>:<port>`: {ctx:?}"));
-        assert!(
-            !host.is_empty(),
-            "the exception context is the RESOLVED peer name (C's \
-             `tcpiiu::getHostName`), which must be non-empty; ctx: {ctx:?}"
-        );
-        assert!(
-            port.parse::<u16>().is_ok(),
-            "R18-19: the peer port must be preserved in the context; ctx: {ctx:?}"
-        );
-    }
     // R18-21: and that block is ALL of it. C's `event_handler` prints nothing
     // for a non-NORMAL status, so the per-PV status line the port used to emit
     // (`TST:AI: server reported ECA status 0x00c0`) is a line C never writes.
@@ -181,5 +174,56 @@ fn a_disconnect_under_camonitor_writes_no_per_pv_stderr_line() {
         "camonitor's event_handler prints nothing for a non-NORMAL status \
          (camonitor.c:108-124) — no per-PV line belongs on stderr; \
          stderr: {stderr:?}"
+    );
+}
+
+#[test]
+fn a_disconnect_under_camonitor_writes_no_per_pv_stderr_line() {
+    // The resolved-name half of R18-19 races the client's hostname engine:
+    // `hostname::warm` fires at circuit-connect but resolves OFF-TASK, the
+    // exact async shape of C's `ipAddrToAsciiEngine` (tcpiiu.cpp:600) — so a
+    // disconnect arriving before the engine answers legitimately prints the
+    // dotted IP, in C as in the port. Each pass must satisfy the
+    // deterministic contract; the resolved name must show up within the
+    // attempt budget (a cache-bypass regression — the pre-R18-19 port —
+    // prints the dotted IP on EVERY pass and fails all attempts).
+    const ATTEMPTS: usize = 5;
+    #[cfg_attr(windows, allow(unused_variables, unused_mut))]
+    let mut resolver_won = false;
+    #[cfg(unix)]
+    let mut last_stderr = String::new();
+    for attempt in 0..ATTEMPTS {
+        // Attempt 0 runs the raw race — the fast path a real disconnect hits.
+        // Later attempts widen the resolver's window stepwise: on macOS the
+        // lookup is an mDNSResponder IPC round-trip that can lose a ~30 ms
+        // connect-to-kill window on every pass (it lost 15 straight on a
+        // loaded CI runner), while a cache-bypass regression stays dotted-IP
+        // at ANY width and still fails every attempt.
+        let grace = Duration::from_millis(250 * attempt as u64);
+        let (stdout, stderr) = run_disconnect_scenario(grace);
+        assert_disconnect_contract(&stdout, &stderr);
+        // The resolved loopback name is a `/etc/hosts` guarantee on unix:
+        // there `getnameinfo` returns `localhost`, so pin that exact name.
+        // Windows has no such alias — `getnameinfo` resolves 127.0.0.1 to the
+        // machine's own (runner-varying) name, so the per-pass shape assert
+        // above is the whole R18-19 contract there and one pass suffices.
+        #[cfg(unix)]
+        {
+            if stderr.contains("    Context: \"localhost:") {
+                resolver_won = true;
+                break;
+            }
+            last_stderr = stderr;
+        }
+        #[cfg(windows)]
+        break;
+    }
+    #[cfg(unix)]
+    assert!(
+        resolver_won,
+        "the exception context never showed the resolved peer name in \
+         {ATTEMPTS} passes — C's `tcpiiu::getHostName` yields it once its \
+         async engine has answered, so a warmed loopback circuit must \
+         resolve within the attempt budget; last stderr: {last_stderr:?}"
     );
 }

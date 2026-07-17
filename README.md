@@ -40,7 +40,7 @@ epics-rs reimplements the core components of C/C++ EPICS in Rust:
 
 ## Installation
 
-**Current release: v0.23.0** — the `v0.20.x` line completes a full C-parity
+**Current release: v0.24.0** — the `v0.20.x` line completes a full C-parity
 sweep of the motor record against `epics-modules/motor` and adds per-field
 DBE monitor event masks end to end, then layers ~60 commits of C-parity
 regression fixes (one commit per finding) across base/db, CA, the native PVA
@@ -54,13 +54,20 @@ commands. `v0.23.0` makes `dbLoadRecords` `DTYP=` a plain macro instead of a
 force-override (breaking: `db_loader::override_dtyp` is removed) and fixes
 the AdIoc st.cmd surface — asyn iocsh commands, `$(ADCORE)` path resolution,
 record-owned INP/OUT link text, per-frame `NumCaptured_RBV` in stream mode.
-See [`CHANGELOG.md`](./CHANGELOG.md) for the full audit trail.
+`v0.24.0` lands a full C-parity hardening pass driven by a new differential
+oracle that boots a C `softIoc` alongside the port and diffs their CA/PVA
+behaviour — ~800 one-finding-per-commit fixes across asyn, the calc engines,
+the record/db metadata rsets, CA, and PVA/QSRV2 — plus two breaking asyn API
+changes (`ParamSetValue` folded into `ParamSetValue::Value`, and
+`drv_user_create` takes a `&DrvUserRequest`) and new oracle PVA-monitor and
+array differential phases. See [`CHANGELOG.md`](./CHANGELOG.md) for the full
+audit trail.
 
 All crates are published on [crates.io](https://crates.io/crates/epics-rs). Add `epics-rs` with the feature flags you need:
 
 ```toml
 [dependencies]
-epics-rs = { version = "0.23", features = ["ad"] }
+epics-rs = { version = "0.24", features = ["ad"] }
 ```
 
 This single dependency pulls in everything needed. In your code:
@@ -91,18 +98,18 @@ use epics_rs::asyn;        // port driver framework
 | `optics` | Optics (table, monochromator, slit, filter, BPM) | no |
 | `full` | Everything above | no |
 
-> The `mqtt` driver is not surfaced through the umbrella crate. Depend on `mqtt-rs = "0.23"` directly when needed.
+> The `mqtt` driver is not surfaced through the umbrella crate. Depend on `mqtt-rs = "0.24"` directly when needed.
 >
 > The Modbus driver is not surfaced through the umbrella crate either.
-> Depend on `epics-modbus-rs = "0.23"` directly when needed; the Rust
+> Depend on `epics-modbus-rs = "0.24"` directly when needed; the Rust
 > library name is `modbus_rs`, so consumers write `use modbus_rs::...`.
 
 ```toml
 # Motor + areaDetector
-epics-rs = { version = "0.23", features = ["motor", "ad"] }
+epics-rs = { version = "0.24", features = ["motor", "ad"] }
 
 # Everything
-epics-rs = { version = "0.23", features = ["full"] }
+epics-rs = { version = "0.24", features = ["full"] }
 ```
 
 ### Individual Crates
@@ -111,8 +118,8 @@ You can also depend on sub-crates directly if you only need specific functionali
 
 ```toml
 [dependencies]
-ad-plugins-rs = "0.23"  # just the areaDetector plugins
-epics-base-rs = "0.23"  # just the IOC runtime
+ad-plugins-rs = "0.24"  # just the areaDetector plugins
+epics-base-rs = "0.24"  # just the IOC runtime
 ```
 
 ## Workspace Structure
@@ -364,11 +371,11 @@ either way.
 ```toml
 [dependencies]
 # Client + server, both protocols (recommended for new projects):
-epics-rs = { version = "0.23", features = ["pva"] }   # ca enabled by default
+epics-rs = { version = "0.24", features = ["pva"] }   # ca enabled by default
 
 # Or per-protocol, no umbrella:
-epics-ca-rs  = "0.23"
-epics-pva-rs = "0.23"
+epics-ca-rs  = "0.24"
+epics-pva-rs = "0.24"
 ```
 
 Standard EPICS environment variables (`EPICS_CA_ADDR_LIST` /

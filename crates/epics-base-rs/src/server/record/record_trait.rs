@@ -524,8 +524,8 @@ pub enum ControlDefaultArm {
 /// `int64outRecord.c:251`, `boRecord.c:310`, `waveformRecord.c:268`,
 /// `aaiRecord.c:293`, `aaoRecord.c:296`, `subArrayRecord.c:262`,
 /// `compressRecord.c:487`, `histogramRecord.c:458`), as do the downstream
-/// types that supply the slot (`motorRecord.cc:3303`,
-/// `epidRecord.c:285`). The rest NULL it outright and never reach here
+/// types that supply the slot (`motorRecord.cc:3303`, `epidRecord.c:285`,
+/// `tableRecord.c:806`). The rest NULL it outright and never reach here
 /// (`biRecord.c`, `mbbiRecord.c`, `mbboRecord.c`, `mbbiDirectRecord.c`,
 /// `mbboDirectRecord.c`, `stringinRecord.c`, `stringoutRecord.c`,
 /// `lsiRecord.c`, `lsoRecord.c`, `eventRecord.c`, `fanoutRecord.c`,
@@ -537,9 +537,6 @@ pub enum ControlDefaultArm {
 /// with a bare `return(0)` after their listed cases, so C serves the seed
 /// where a delegating record serves the type range. Measured on the
 /// differential oracle as 42 `acalcout`/`scalcout` fields.
-///
-/// `table` (optics) is NOT classified: `tableRecord.cc` is not present on this
-/// machine, so it takes the delegating default like every other audited type.
 pub fn control_default_arm(rtype: &str) -> ControlDefaultArm {
     match rtype {
         // aCalcoutRecord.c:793-822, sCalcoutRecord.c:653 — the switch lists

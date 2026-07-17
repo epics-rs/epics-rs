@@ -34,6 +34,7 @@ fn seq_metadata_override(
         units: Some("s".into()),
         precision: Some(SEQ_DLY_PRECISION),
         disp_limits: Some((10.0, 0.0)),
+        ctrl_limits: Some((SEQ_DLY_LIMIT, 0.0)),
         ..Default::default()
     })
 }
@@ -41,6 +42,15 @@ fn seq_metadata_override(
 /// C `seqRecord.c:78` `int seqDLYprecision = 2;` — the precision
 /// `get_precision` serves for every `DLYn`.
 const SEQ_DLY_PRECISION: i16 = 2;
+
+/// C `seqRecord.c:81` `double seqDLYlimit = 100000;` — the control upper
+/// `get_control_double` (`:342-353`) serves for every `DLYn`, over a literal
+/// `0.0` lower.
+///
+/// Four orders of magnitude from the SAME field's graphic upper of `10.0`
+/// (`:321-338`): a `DLYn` is offered a 0..100000 s settable range while its
+/// display bar reads 0..10 s. Two slots, two literals, one field.
+const SEQ_DLY_LIMIT: f64 = 100000.0;
 
 /// `seq` record — sequenced multi-output writer.
 ///

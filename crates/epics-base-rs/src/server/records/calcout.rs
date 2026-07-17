@@ -23,6 +23,10 @@ const CALCOUT_INAV_FIELDS: [&str; 21] = [
 /// `get_precision` serves for `ODLY`, the output-delay field.
 const CALCOUT_ODLY_PRECISION: i16 = 2;
 
+/// C `calcoutRecord.c:91` `double calcoutODLYlimit = 100000;` — the control
+/// upper `get_control_double` serves for `ODLY`, over a literal `0.0` lower.
+const CALCOUT_ODLY_LIMIT: f64 = 100000.0;
+
 /// Calcout record — calc with output.
 pub struct CalcoutRecord {
     pub val: f64,
@@ -478,6 +482,12 @@ impl Record for CalcoutRecord {
     /// PREC arms those functions serve to every other DBF_DOUBLE field. The
     /// early return is what makes this an override rather than a default: the
     /// record's own EGU/PREC would otherwise win.
+    ///
+    /// `get_control_double` (`:506-530`) gives ODLY its own `case` alongside
+    /// the eight VAL-class fields, and answers it `0.0 .. calcoutODLYlimit`
+    /// (`= 100000`, `:91`) rather than the HOPR/LOPR those eight take — so the
+    /// control slot's answer is a literal here too, and a different one from
+    /// the graphic slot's `0 .. 1e300` two fields up.
     fn field_metadata_override(&self, field: &str) -> Option<FieldMetadataOverride> {
         field
             .eq_ignore_ascii_case("ODLY")
@@ -485,6 +495,7 @@ impl Record for CalcoutRecord {
                 units: Some("s".into()),
                 precision: Some(CALCOUT_ODLY_PRECISION),
                 disp_limits: Some((1e300, 0.0)),
+                ctrl_limits: Some((CALCOUT_ODLY_LIMIT, 0.0)),
                 ..Default::default()
             })
     }

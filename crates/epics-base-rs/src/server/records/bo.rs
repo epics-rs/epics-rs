@@ -117,6 +117,11 @@ impl BoRecord {
 /// `get_precision` serves for `HIGH`, the seconds-to-hold-1 field.
 const BO_HIGH_PRECISION: i16 = 2;
 
+/// C `boRecord.c:87` `double boHIGHlimit = 100000;` — the control upper
+/// `get_control_double` (`:310-318`) serves for `HIGH`, over a literal `0.0`
+/// lower.
+const BO_HIGH_LIMIT: f64 = 100000.0;
+
 impl Record for BoRecord {
     fn record_type(&self) -> &'static str {
         "bo"
@@ -135,12 +140,21 @@ impl Record for BoRecord {
     /// `display.precision` at all for `bo.HIGH`. The precision is transcribed
     /// anyway because this function's contract is the rset's answer, not the
     /// subset of it the current marking model happens to expose.
+    ///
+    /// `get_control_double` (`:310-318`) is the same one-field shape and DOES
+    /// reach the wire: `HIGH` alone takes `0.0 .. boHIGHlimit`, and every other
+    /// field — `LALM` and `MLST` included — falls to `recGblGetControlDouble`.
+    /// That is why `bo` lists nothing in
+    /// [`control_explicit_field`](crate::server::record::RecordInstance): the
+    /// one field the rset lists is answered here, by a literal, not by the
+    /// record's HOPR/LOPR.
     fn field_metadata_override(&self, field: &str) -> Option<FieldMetadataOverride> {
         field
             .eq_ignore_ascii_case("HIGH")
             .then(|| FieldMetadataOverride {
                 units: Some("s".into()),
                 precision: Some(BO_HIGH_PRECISION),
+                ctrl_limits: Some((BO_HIGH_LIMIT, 0.0)),
                 ..Default::default()
             })
     }

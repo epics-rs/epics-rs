@@ -195,6 +195,10 @@ impl HistogramRecord {
 /// collection buffer.
 const HISTOGRAM_CMD_CHOICES: &[&str] = &["Read", "Clear", "Start", "Stop"];
 
+/// C `histogramRecord.c:88` `int histogramSDELprecision = 2;` — the precision
+/// `get_precision` serves for `SDEL`, the monitor deadband.
+const HISTOGRAM_SDEL_PRECISION: i16 = 2;
+
 impl Record for HistogramRecord {
     fn record_type(&self) -> &'static str {
         "histogram"
@@ -209,12 +213,25 @@ impl Record for HistogramRecord {
     /// (control) and `:450-452` (graphic) each serve `ULIM - LLIM` up and a
     /// literal `0.0` down — neither HOPR/LOPR nor the DBF_DOUBLE range, so it
     /// can take neither the VAL cache nor the routed `default:` arm.
+    /// `SDEL`, the monitor-deadband seconds, is the other override: `get_units`
+    /// (`:410-417`) answers it with a literal `"s"` and `get_precision`
+    /// (`:419-437`) with `histogramSDELprecision` (`= 2`, `:88`). The precision
+    /// switch's other cases (`ULIM`/`LLIM`/`SGNL`/`SVAL`/`WDTH`) serve
+    /// `prec->prec`, which is the PREC arm the shared route already applies —
+    /// `SDEL` is the one case that escapes it.
     fn field_metadata_override(&self, field: &str) -> Option<FieldMetadataOverride> {
-        field
-            .eq_ignore_ascii_case("WDTH")
-            .then(|| FieldMetadataOverride {
+        if field.eq_ignore_ascii_case("WDTH") {
+            return Some(FieldMetadataOverride {
                 ctrl_limits: Some((self.ulim - self.llim, 0.0)),
                 disp_limits: Some((self.ulim - self.llim, 0.0)),
+                ..Default::default()
+            });
+        }
+        field
+            .eq_ignore_ascii_case("SDEL")
+            .then(|| FieldMetadataOverride {
+                units: Some("s".into()),
+                precision: Some(HISTOGRAM_SDEL_PRECISION),
                 ..Default::default()
             })
     }

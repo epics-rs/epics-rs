@@ -19,6 +19,10 @@ const CALCOUT_INAV_FIELDS: [&str; 21] = [
     "INMV", "INNV", "INOV", "INPV", "INQV", "INRV", "INSV", "INTV", "INUV",
 ];
 
+/// C `calcoutRecord.c:89` `int calcoutODLYprecision = 2;` — the precision
+/// `get_precision` serves for `ODLY`, the output-delay field.
+const CALCOUT_ODLY_PRECISION: i16 = 2;
+
 /// Calcout record — calc with output.
 pub struct CalcoutRecord {
     pub val: f64,
@@ -468,10 +472,18 @@ impl Record for CalcoutRecord {
     /// It calls recGbl for the type range and then OVERWRITES the lower with a
     /// literal 0 — a delay cannot be negative. So `ODLY` serves the DBF_DOUBLE
     /// upper of 1e300 with a lower of 0, which no single routed arm produces.
+    /// `get_units` (`:425-444`) and `get_precision` (`:446-465`) each test
+    /// `ODLY` FIRST and return early with a literal — `"s"` and
+    /// `calcoutODLYprecision` (`= 2`, `:89`) — so ODLY never reaches the EGU /
+    /// PREC arms those functions serve to every other DBF_DOUBLE field. The
+    /// early return is what makes this an override rather than a default: the
+    /// record's own EGU/PREC would otherwise win.
     fn field_metadata_override(&self, field: &str) -> Option<FieldMetadataOverride> {
         field
             .eq_ignore_ascii_case("ODLY")
             .then(|| FieldMetadataOverride {
+                units: Some("s".into()),
+                precision: Some(CALCOUT_ODLY_PRECISION),
                 disp_limits: Some((1e300, 0.0)),
                 ..Default::default()
             })

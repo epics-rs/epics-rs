@@ -1,5 +1,7 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{MENU_SIMM, ProcessAction, ProcessOutcome, Record};
+use crate::server::record::{
+    FieldMetadataOverride, MENU_SIMM, ProcessAction, ProcessOutcome, Record,
+};
 use crate::types::{EpicsValue, PvString};
 
 /// Binary output record matching C boRecord behavior.
@@ -111,9 +113,36 @@ impl BoRecord {
     }
 }
 
+/// C `boRecord.c:85` `int boHIGHprecision = 2;` — the precision
+/// `get_precision` serves for `HIGH`, the seconds-to-hold-1 field.
+const BO_HIGH_PRECISION: i16 = 2;
+
 impl Record for BoRecord {
     fn record_type(&self) -> &'static str {
         "bo"
+    }
+
+    /// `HIGH` is bo's only DBF_DOUBLE field, and both metadata literals in the
+    /// rset are its: `get_units` (`:294-299`) answers `"s"` and `get_precision`
+    /// (`:301-308`) answers `boHIGHprecision`; every other field falls to
+    /// `recGblGetPrec`.
+    ///
+    /// Only the units reaches the wire. pvxs nests the `display.precision`
+    /// assignment inside the `DBR_GR_DOUBLE` branch (`iocsource.cpp:288-291`,
+    /// mirrored by `nt::qsrv_marks::property_leaves`), and bo's rset serves no
+    /// graphic limits for `HIGH`, so the precision leaf is never assigned —
+    /// measured against `softIocPVX`, which prints `display.units "s"` and no
+    /// `display.precision` at all for `bo.HIGH`. The precision is transcribed
+    /// anyway because this function's contract is the rset's answer, not the
+    /// subset of it the current marking model happens to expose.
+    fn field_metadata_override(&self, field: &str) -> Option<FieldMetadataOverride> {
+        field
+            .eq_ignore_ascii_case("HIGH")
+            .then(|| FieldMetadataOverride {
+                units: Some("s".into()),
+                precision: Some(BO_HIGH_PRECISION),
+                ..Default::default()
+            })
     }
 
     /// C `boRecord.c:192-205`: `process()` clears `udf` to FALSE only on a

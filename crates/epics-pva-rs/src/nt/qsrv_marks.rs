@@ -17,7 +17,95 @@
 //! `get_graphic_double` must read as "no display limits provided", not as
 //! limits of zero.
 
+use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::server::snapshot::PropertySupport;
+
+/// The DBE classes a QSRV single-record monitor subscribes to.
+///
+/// pvxs opens TWO db subscriptions per channel: the value one with
+/// `dbe = DBE_VALUE | DBE_ALARM` (the default when the request names no
+/// `record._options.DBE`, `singlesource.cpp:142-144`) and the property one
+/// with `DBE_PROPERTY` (`singlesource.cpp:155-166`). It posts on either.
+/// The port has one subscriber per channel, so the union is what makes the
+/// same events arrive; [`event_leaves`] then narrows each event by its own
+/// posted mask, which is what keeps the two from merging into one
+/// everything-marked post.
+///
+/// `LOG` is the port's `DBE_ARCHIVE` (same bit): a record's `monitor()` posts
+/// `DBE_VALUE | DBE_LOG` together, and `event_leaves` folds LOG into VALUE
+/// exactly as pvxs's callback does.
+pub fn monitor_mask() -> EventMask {
+    EventMask::VALUE | EventMask::LOG | EventMask::ALARM | EventMask::PROPERTY
+}
+
+/// Which NT leaves ONE posted event marks, given its `DBE_*` class.
+///
+/// **The single owner of the event-class → leaf-set rule**, for the monitor
+/// seed and every update alike: a read is just this with every class set
+/// (pvxs runs `IOCSource::get(…, UpdateType::Everything, …)` for a GET,
+/// `singlesource.cpp:283`), so [`read_leaves`](crate::server::native_source)
+/// composes from here rather than listing leaves a second time.
+///
+/// Mirrors `IOCSource::get` (`ioc/iocsource.cpp:312-352`) after the
+/// normalization pvxs's own value callback applies first
+/// (`singlesource.cpp:77-93`):
+///
+/// ```text
+/// DBE_ARCHIVE -> DBE_VALUE                       (archive events carry value's fields)
+/// DBE_ALARM alone -> also DBE_VALUE              (alarm-only promotes to fetch value)
+/// change &= VALUE|ALARM|PROPERTY
+///
+/// change & PROPERTY      -> getProperties  -> display.* / control.* / valueAlarm.*
+/// change & (VALUE|ALARM) -> getTimeAlarm   -> timeStamp.*, and alarm.* only under ALARM
+/// change & VALUE         -> getScalarValue -> value
+/// ```
+///
+/// The `alarm.*`-only-under-ALARM rule is the one that a fixed
+/// "value+alarm+timeStamp" update would get wrong: measured against
+/// `softIocPVX`, a driven `longin` posts value+alarm+timeStamp on the first
+/// update (UDF -> NO_ALARM changed the alarm, so the record's `monitor()`
+/// OR'd in `DBE_ALARM`) and value+timeStamp on every update after it.
+pub fn event_leaves(mask: EventMask, props: PropertySupport, value_is_enum: bool) -> Vec<String> {
+    // `subscriptionValueCallback` normalization (`singlesource.cpp:85-93`).
+    let mut change = mask;
+    if change.intersects(EventMask::LOG) {
+        change = EventMask::from_bits(change.bits() & !EventMask::LOG.bits()) | EventMask::VALUE;
+    }
+    if change.intersects(EventMask::ALARM) && !change.intersects(EventMask::VALUE) {
+        change |= EventMask::VALUE;
+    }
+
+    let mut leaves: Vec<String> = Vec::new();
+
+    if change.intersects(EventMask::PROPERTY) {
+        leaves.extend(property_leaves(props).into_iter().map(str::to_string));
+    }
+
+    // `getTimeAlarm` runs for VALUE or ALARM and always assigns the three
+    // timeStamp leaves; the alarm triple is inside its `if(change & Alarm)`
+    // (`iocsource.cpp:183-238`).
+    if change.intersects(EventMask::VALUE | EventMask::ALARM) {
+        leaves.push("timeStamp".into());
+        if change.intersects(EventMask::ALARM) {
+            leaves.push("alarm".into());
+        }
+    }
+
+    if change.intersects(EventMask::VALUE) {
+        // An NTEnum's value is a struct; pvxs assigns through `value.index`
+        // alone, leaving `value.choices` to `getProperties`' option bit.
+        leaves.push(
+            if value_is_enum {
+                "value.index"
+            } else {
+                "value"
+            }
+            .into(),
+        );
+    }
+
+    leaves
+}
 
 /// `display.form.choices` — the fixed seven-entry menu pvxs publishes for
 /// every numeric NTScalar / NTScalarArray (the `Q:form` info-tag menu).

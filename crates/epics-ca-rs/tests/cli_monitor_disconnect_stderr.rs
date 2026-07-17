@@ -77,7 +77,15 @@ fn start_ioc() -> (Reaped, u16) {
 /// One full connect → IOC-kill → disconnect pass; returns the monitor's
 /// complete (stdout, stderr). Every wait is on the output itself (a fixed
 /// sleep here raced connect + first event under load).
-fn run_disconnect_scenario() -> (String, String) {
+///
+/// `resolver_grace` holds the circuit open between the first event and the
+/// IOC kill. It is NOT an output gate (nothing asserted below depends on it
+/// existing) — it is the width of the window the async hostname engine gets
+/// to win the R18-19 race before the disconnect snapshots the cache. macOS
+/// reverse lookups go through mDNSResponder IPC and can lose a ~30 ms
+/// window on every pass; C's `ipAddrToAsciiEngine` wins the same race only
+/// when given the same room.
+fn run_disconnect_scenario(resolver_grace: Duration) -> (String, String) {
     let (mut ioc, port) = start_ioc();
 
     let mut mon = Reaped(
@@ -102,6 +110,7 @@ fn run_disconnect_scenario() -> (String, String) {
         "no first monitor line within 10s; stdout: {:?}",
         out_lines.text()
     );
+    std::thread::sleep(resolver_grace);
     ioc.0.kill().expect("kill softioc-rs");
     let _ = ioc.0.wait();
 
@@ -181,8 +190,17 @@ fn a_disconnect_under_camonitor_writes_no_per_pv_stderr_line() {
     const ATTEMPTS: usize = 5;
     #[cfg_attr(windows, allow(unused_variables, unused_mut))]
     let mut resolver_won = false;
-    for _ in 0..ATTEMPTS {
-        let (stdout, stderr) = run_disconnect_scenario();
+    #[cfg(unix)]
+    let mut last_stderr = String::new();
+    for attempt in 0..ATTEMPTS {
+        // Attempt 0 runs the raw race — the fast path a real disconnect hits.
+        // Later attempts widen the resolver's window stepwise: on macOS the
+        // lookup is an mDNSResponder IPC round-trip that can lose a ~30 ms
+        // connect-to-kill window on every pass (it lost 15 straight on a
+        // loaded CI runner), while a cache-bypass regression stays dotted-IP
+        // at ANY width and still fails every attempt.
+        let grace = Duration::from_millis(250 * attempt as u64);
+        let (stdout, stderr) = run_disconnect_scenario(grace);
         assert_disconnect_contract(&stdout, &stderr);
         // The resolved loopback name is a `/etc/hosts` guarantee on unix:
         // there `getnameinfo` returns `localhost`, so pin that exact name.
@@ -190,9 +208,12 @@ fn a_disconnect_under_camonitor_writes_no_per_pv_stderr_line() {
         // machine's own (runner-varying) name, so the per-pass shape assert
         // above is the whole R18-19 contract there and one pass suffices.
         #[cfg(unix)]
-        if stderr.contains("    Context: \"localhost:") {
-            resolver_won = true;
-            break;
+        {
+            if stderr.contains("    Context: \"localhost:") {
+                resolver_won = true;
+                break;
+            }
+            last_stderr = stderr;
         }
         #[cfg(windows)]
         break;
@@ -203,6 +224,6 @@ fn a_disconnect_under_camonitor_writes_no_per_pv_stderr_line() {
         "the exception context never showed the resolved peer name in \
          {ATTEMPTS} passes — C's `tcpiiu::getHostName` yields it once its \
          async engine has answered, so a warmed loopback circuit must \
-         resolve within the attempt budget"
+         resolve within the attempt budget; last stderr: {last_stderr:?}"
     );
 }

@@ -1798,6 +1798,24 @@ pub trait Record: Send + Sync + 'static {
         true
     }
 
+    /// C parity: a record whose completion restamps `TIME` AFTER the VAL
+    /// monitor post and the forward link, not before the value post like
+    /// every standard record (`aoRecord.c:190` stamps ahead of `writeValue`).
+    ///
+    /// Only sseq's `asyncFinish` (`sseqRecord.c`) has this ordering: it posts
+    /// VAL at `:474`, runs `recGblFwdLink` at `:499`, and only then calls
+    /// `recGblGetTimeStamp` at `:501`. So the first VAL monitor event carries
+    /// the record's pre-update timestamp, and `TIME` advances only for the
+    /// following BUSY post and the next cycle — the VAL timestamp always lags
+    /// one completion behind. The framework's synchronous `Complete` tail
+    /// consults this to skip the pre-output restamp and apply it after the
+    /// forward-link tail instead. Default false: every other record (including
+    /// the base `seq`, whose `seqRecord.c:224` restamps BEFORE the `:229` VAL
+    /// post) stamps before the value post.
+    fn restamps_time_after_completion(&self) -> bool {
+        false
+    }
+
     /// Whether this record's OUT link should be written after processing.
     /// Defaults to true. Override in calcout / longout to implement OOPT
     /// conditional output (epics-base 7.0.8).

@@ -4,15 +4,27 @@
 # Under the product policy adopted 2026-07-13 (doc/strategy-2026-07-13.md §2),
 # "C's bugs are not the contract. Clean is the goal." So a difference between
 # the C softIoc and the Rust port is NOT automatically a port bug. It is one of
-# exactly two things:
+# these things:
 #
-#   * a deliberate refusal to reproduce a C defect  -> EXPECTED DEVIATION
-#   * anything else                                 -> PORT DEFECT
+#   * a deliberate refusal to reproduce a C defect     -> EXPECTED DEVIATION
+#   * an intentional port DESIGN divergence            -> EXPECTED DEVIATION
+#   * anything else                                     -> PORT DEFECT
 #
-# The allowlist IS doc/upstream-c-bugs.md. Every row below is a NOT-REPRODUCED
-# entry from that catalogue, transcribed into a machine-matchable rule with the
-# CBUG id that justifies it. This file holds no judgement of its own: if a row
-# here is not backed by a NOT-REPRODUCED entry there, the row is wrong.
+# TWO JUSTIFICATION BASES, THREE BUCKETS
+# Most rows are C-bug refusals: for these the allowlist IS doc/upstream-c-bugs.md.
+# Each NOT-REPRODUCED (or, disabled, REPRODUCED) row transcribes an entry from
+# that catalogue and MUST cite the CBUG id that justifies it; if such a row is
+# not backed by an entry there, the row is wrong.
+#
+# A DESIGN-DIVERGENCE row is different in kind: it records an INTENTIONAL port
+# design choice that is neither a C-bug refusal nor a defect (e.g. lifting a
+# fixed-capacity buffer cap and serving live length). It is justified by its
+# `why` — the design rationale stated in place — and cites NO CBUG. The CBUG
+# requirement is relaxed for this bucket, and only this bucket; every row still
+# needs a non-empty, unique `id` (it keys the fired/stale ledger) and a non-empty
+# `why`. Buckets are validated at load (allowlist.rs::parse); an unknown bucket
+# string is a parse error, not a silent wildcard. All three buckets match, fire,
+# and go stale by the same rules — the bucket changes only what justifies a row.
 #
 # SELF-CHECKING, IN BOTH DIRECTIONS
 #   * a diff that matches a row      -> reported as EXPECTED DEVIATION, not a failure
@@ -153,6 +165,40 @@ not laundered.
 
 Expect: on these types' numeric fields, the port's pvxget (and monitor seed) marks
 display.precision and softIocPVX does not; the two renderings are otherwise identical.
+"""
+
+# --------------------------------------------------------------------------
+# DESIGN-DIVERGENCE entries: intentional port design choices, justified by the
+# `why` in place rather than by a CBUG. These match/fire/go-stale like any other
+# row; they simply cite no upstream-bug catalogue entry.
+# --------------------------------------------------------------------------
+
+[[deviation]]
+id = "DESIGN-ASYN-BOUT"
+bucket = "DESIGN-DIVERGENCE"
+upstream = "asyn / asynRecord"
+record_types = ["asyn"]
+fields = ["BOUT"]
+surface = ["value_marking"]
+why = """
+asynRecord.dbd declares BOUT as DBF_CHAR special(SPC_DBADDR), a byte array whose
+capacity C fixes at OMAX (initial 80) and whose write length is NOWT (initial
+80). On a C IOC the field is a pre-sized 80-element buffer, so QSRV2 serves it
+zero-filled at init: pvxget reads back epicsInt8_t[80] = {0,0,...} before
+anything is written. The port declines to pre-size: it lifts the fixed 80-byte
+OMAX cap and serves the ACTUAL written content, so an unwritten BOUT reads back
+as an empty epicsInt8_t[0]. This is an intentional design choice, not a C-bug
+refusal and not a port defect — the 80-element cap was a static asynRecord.dbd
+sizing detail, and the port models the field as a live-length array instead.
+There is no CBUG here: nothing on the C side is wrong, the two just made
+different, defensible sizing decisions.
+
+Matched on the PVA value/marking contract (pvxget), scoped to exactly asyn.BOUT.
+The scope is field-level, so this row justifies only the BOUT length/content
+difference and cannot launder a diff on any other asyn channel.
+
+Expect: on ORACLE:ASYN.BOUT the C softIocPVX serves int8[]{80} (zero-filled to
+the OMAX cap) and the port serves int8[]{0} (empty until written).
 """
 
 # --------------------------------------------------------------------------

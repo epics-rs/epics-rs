@@ -10,6 +10,19 @@
 //! file, so the data is reviewable next to the catalogue it transcribes and can
 //! be edited without touching harness code.
 //!
+//! # Three buckets, two justification bases
+//!
+//! Most rows are C-bug refusals: a `NOT-REPRODUCED` (or, disabled, `REPRODUCED`)
+//! entry transcribed from `doc/upstream-c-bugs.md`, and each such row MUST cite
+//! the `CBUG-…` id that justifies it. A third bucket, `DESIGN-DIVERGENCE`,
+//! records an *intentional port design choice* that is neither a C-bug refusal
+//! nor a port defect — so it is justified by its `why` (the design rationale)
+//! alone and cites no CBUG. The CBUG-citation rule is relaxed for that bucket
+//! and only that bucket; every row still needs a non-empty `id` (it keys the
+//! fired/stale ledger) and a non-empty `why`. All three buckets match, fire, and
+//! go stale by the same rules — the bucket changes only what justifies the row,
+//! not how it behaves. See [`Allowlist::parse`].
+//!
 //! # The two artifacts check each other
 //!
 //! - a diff matching a row -> **EXPECTED DEVIATION** (not a failure)
@@ -35,7 +48,19 @@ use std::path::Path;
 
 use crate::diff::{Difference, Surface};
 
-/// One transcribed NOT-REPRODUCED entry, as a matchable rule.
+/// A C-bug refusal transcribed from `doc/upstream-c-bugs.md` and expected to
+/// fire today. Requires a `CBUG-…` `id`.
+pub const BUCKET_NOT_REPRODUCED: &str = "NOT-REPRODUCED";
+/// A C bug the port still reproduces on purpose (carried disabled for
+/// traceability; see `enabled`). Requires a `CBUG-…` `id`.
+pub const BUCKET_REPRODUCED: &str = "REPRODUCED";
+/// An intentional port design difference — neither a C-bug refusal nor a defect.
+/// Justified by its `why` alone; the `CBUG-…` `id` requirement is relaxed for
+/// this bucket only.
+pub const BUCKET_DESIGN_DIVERGENCE: &str = "DESIGN-DIVERGENCE";
+
+/// One expected-deviation rule: a C-bug refusal transcribed from
+/// `doc/upstream-c-bugs.md`, or an intentional port design divergence.
 ///
 /// Every constraint is optional and every omitted constraint is a wildcard, so
 /// a row is exactly as narrow as it was written. That is deliberate: a row that
@@ -43,10 +68,15 @@ use crate::diff::{Difference, Surface};
 /// failure this whole mechanism exists to prevent.
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct Deviation {
-    /// The CBUG id in `doc/upstream-c-bugs.md` that justifies this row.
+    /// The row's identifier and ledger key. For a `NOT-REPRODUCED`/`REPRODUCED`
+    /// row this is the `CBUG-…` id in `doc/upstream-c-bugs.md` that justifies it;
+    /// for a `DESIGN-DIVERGENCE` row it is a design tag that cites no CBUG. Always
+    /// non-empty and unique — it keys the fired/exercised/stale sets.
     pub id: String,
-    /// `NOT-REPRODUCED` (a live deviation) or `REPRODUCED` (recorded but not
-    /// expected to fire today — see `enabled`).
+    /// One of [`BUCKET_NOT_REPRODUCED`], [`BUCKET_REPRODUCED`], or
+    /// [`BUCKET_DESIGN_DIVERGENCE`]. Selects what justifies the row (a CBUG id
+    /// vs. a design rationale); it does not affect matching. Validated in
+    /// [`Allowlist::parse`].
     pub bucket: String,
     #[serde(default)]
     pub upstream: String,
@@ -132,7 +162,43 @@ impl Allowlist {
         if f.schema != 1 {
             return Err(format!("unsupported allowlist schema {}", f.schema));
         }
+        // parse() is the sole fallible constructor, so validating here makes the
+        // per-bucket invariants hold for every `Allowlist` by construction, not
+        // just for the shipped file.
         for d in &f.deviations {
+            if d.id.trim().is_empty() {
+                return Err(
+                    "allowlist row has an empty `id` — every row needs a unique, \
+                     non-empty id; it keys the fired/exercised/stale ledger"
+                        .to_string(),
+                );
+            }
+            match d.bucket.as_str() {
+                // A C-bug refusal must name the CBUG it transcribes: the
+                // catalogue is the justification, so a row that cites none is not
+                // an allowlist entry, it is a bare suppression.
+                BUCKET_NOT_REPRODUCED | BUCKET_REPRODUCED => {
+                    if !d.id.starts_with("CBUG-") {
+                        return Err(format!(
+                            "allowlist row {} is bucket {} but does not cite a CBUG id — \
+                             a {}/{} row transcribes a bug from doc/upstream-c-bugs.md \
+                             and must name it",
+                            d.id, d.bucket, BUCKET_NOT_REPRODUCED, BUCKET_REPRODUCED
+                        ));
+                    }
+                }
+                // A design divergence is justified by its `why` (rationale), not
+                // by a catalogue entry: the CBUG-citation rule is relaxed here,
+                // and here only.
+                BUCKET_DESIGN_DIVERGENCE => {}
+                other => {
+                    return Err(format!(
+                        "allowlist row {} has unknown bucket {other:?} — expected one of \
+                         {BUCKET_NOT_REPRODUCED}, {BUCKET_REPRODUCED}, {BUCKET_DESIGN_DIVERGENCE}",
+                        d.id
+                    ));
+                }
+            }
             if d.why.trim().is_empty() {
                 return Err(format!(
                     "allowlist row {} has no justification — an allowlist entry \
@@ -540,14 +606,107 @@ why = "  "
         assert!(err.contains("suppression"), "got: {err}");
     }
 
-    /// The shipped file must parse and every row must cite a CBUG id.
+    /// The shipped file must parse; every row needs a justification, and every
+    /// C-bug-refusal row must still cite a CBUG id. A DESIGN-DIVERGENCE row is
+    /// justified by its `why` alone and is exempt from the CBUG-citation rule.
     #[test]
-    fn shipped_allowlist_parses_and_every_row_cites_a_cbug() {
+    fn shipped_allowlist_parses_and_c_bug_rows_cite_a_cbug() {
         let al = Allowlist::load(&Allowlist::default_path()).expect("shipped allowlist parses");
         assert!(!al.rows.is_empty());
         for r in &al.rows {
-            assert!(r.id.starts_with("CBUG-"), "row {:?} cites no CBUG", r.id);
-            assert!(!r.why.trim().is_empty());
+            assert!(!r.id.trim().is_empty(), "every row needs an id");
+            assert!(
+                !r.why.trim().is_empty(),
+                "row {:?} has no justification",
+                r.id
+            );
+            match r.bucket.as_str() {
+                BUCKET_NOT_REPRODUCED | BUCKET_REPRODUCED => {
+                    assert!(
+                        r.id.starts_with("CBUG-"),
+                        "C-bug row {:?} cites no CBUG",
+                        r.id
+                    );
+                }
+                BUCKET_DESIGN_DIVERGENCE => {}
+                other => panic!("row {:?} has unknown bucket {other:?}", r.id),
+            }
         }
+    }
+
+    /// A DESIGN-DIVERGENCE row parses without a CBUG id and matches its scope
+    /// exactly as a NOT-REPRODUCED row would — the bucket changes what justifies
+    /// the row, not how it fires. This is the ASYN.BOUT shape.
+    #[test]
+    fn a_design_divergence_row_parses_and_matches_its_scope() {
+        let toml = r#"
+schema = 1
+[[deviation]]
+id = "DESIGN-ASYN-BOUT"
+bucket = "DESIGN-DIVERGENCE"
+record_types = ["asyn"]
+fields = ["BOUT"]
+surface = ["value_marking"]
+why = "port lifts C's fixed 80-byte OMAX cap and serves the live written length"
+"#;
+        let mut al =
+            Allowlist::parse(toml).expect("design-divergence row parses without a CBUG id");
+        let bout = ctx("asyn", "BOUT", None);
+        // The PVA value/marking contract is the surface a BOUT value diff reports
+        // on (pvaread.rs). An empty `port_adds_leaves` means scope+surface
+        // decides, and the field-level scope keeps it to this one channel.
+        let hit = al.match_pva_diff(&bout, "value_marking", "epicsInt8_t[80]", "epicsInt8_t[0]");
+        assert_eq!(hit.as_deref(), Some("DESIGN-ASYN-BOUT"));
+        assert!(al.fired_rows().contains("DESIGN-ASYN-BOUT"));
+
+        // Same diff on a field the row does not name is still unjustified.
+        assert!(
+            al.match_pva_diff(&ctx("asyn", "AOUT", None), "value_marking", "a", "b")
+                .is_none(),
+            "the row is scoped to BOUT; another field is a separate finding"
+        );
+    }
+
+    /// The CBUG-citation invariant is scoped by bucket: a C-bug-refusal row
+    /// without a CBUG id is rejected, a design-divergence row without one is
+    /// accepted.
+    #[test]
+    fn the_cbug_citation_invariant_is_scoped_to_c_bug_buckets() {
+        let not_reproduced_without_cbug = r#"
+schema = 1
+[[deviation]]
+id = "NOPE-1"
+bucket = "NOT-REPRODUCED"
+why = "claims to refuse a C bug but names none"
+"#;
+        let err = Allowlist::parse(not_reproduced_without_cbug).unwrap_err();
+        assert!(
+            err.contains("does not cite a CBUG id"),
+            "a NOT-REPRODUCED row without a CBUG id must fail: {err}"
+        );
+
+        // A design-divergence row with the same non-CBUG id is accepted.
+        let design_without_cbug = r#"
+schema = 1
+[[deviation]]
+id = "DESIGN-1"
+bucket = "DESIGN-DIVERGENCE"
+why = "intentional port design choice, justified here rather than by a CBUG"
+"#;
+        assert!(Allowlist::parse(design_without_cbug).is_ok());
+    }
+
+    /// An unknown bucket string is a typo, not a fourth policy — rejected.
+    #[test]
+    fn an_unknown_bucket_is_rejected() {
+        let toml = r#"
+schema = 1
+[[deviation]]
+id = "CBUG-Z9"
+bucket = "NOT-REPRODUCEDD"
+why = "typo'd bucket must not silently become a wildcard"
+"#;
+        let err = Allowlist::parse(toml).unwrap_err();
+        assert!(err.contains("unknown bucket"), "got: {err}");
     }
 }

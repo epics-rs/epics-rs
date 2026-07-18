@@ -1331,13 +1331,33 @@ impl RecordInstance {
     /// `record(calc,"X"){}` — whose record type has no `device()` line — served
     /// `value.choices = {0}[]` where QSRV2 omits the leaf entirely.
     pub(crate) fn device_choices(&self) -> Option<Vec<PvString>> {
-        let declared = super::dbd_generated::device_menu(self.record.record_type())?;
-        let mut slots: Vec<PvString> = declared.iter().map(|c| PvString::from(*c)).collect();
-        let dtyp = self.common.dtyp.as_str();
-        if !dtyp.is_empty() && !declared.contains(&dtyp) {
-            slots.push(PvString::from(dtyp));
+        let record_type = self.record.record_type();
+        // Base's build-time menu (`epics-base-rs/dbd`), then the menus a
+        // downstream crate whose device support has no vendored `device()` line
+        // registered at runtime (asyn's `asynInt32`, `asynFloat64`, ...). C's
+        // `dbDeviceMenu` is the concatenation of every `device()` the loaded
+        // `.dbd` set declares, in load order — base first, then asyn — so the
+        // merge appends the contributed choices AFTER the declared ones.
+        let declared = super::dbd_generated::device_menu(record_type);
+        let contributed = super::contributed_device_menu(record_type);
+        // The C None-vs-empty distinction (`dbAccess.c:176-179` vs `:205`): the
+        // menu is present iff the loaded `.dbd` set declares ANY `device()` for
+        // this type. A type base declares none for but asyn does (structurally
+        // possible, though none of asyn's are such) is therefore present, not
+        // None; a type neither declares for (calc) stays None.
+        if declared.is_none() && contributed.is_empty() {
+            return None;
         }
-        Some(slots)
+        let mut names: Vec<&str> = Vec::new();
+        if let Some(declared) = declared {
+            names.extend_from_slice(declared);
+        }
+        names.extend(contributed.iter().copied());
+        let dtyp = self.common.dtyp.as_str();
+        if !dtyp.is_empty() && !names.contains(&dtyp) {
+            names.push(dtyp);
+        }
+        Some(names.iter().map(|c| PvString::from(*c)).collect())
     }
 
     /// C `dbPutFieldLink`'s link-type gate (`dbAccess.c:1125-1137`): a link
@@ -5008,6 +5028,7 @@ mod device_menu_marking_tests {
     use super::*;
     use crate::server::records::ai::AiRecord;
     use crate::server::records::calc::CalcRecord;
+    use crate::server::records::mbbo::MbboRecord;
 
     /// C `dbAccess.c:176-179`: a `DBF_DEVICE` field whose record type declares
     /// no device support has `pfldDes->ftPvt == NULL` and takes `goto nostrs`,
@@ -5056,6 +5077,62 @@ mod device_menu_marking_tests {
     fn dtyp_index_is_zero_when_the_record_type_has_no_device_menu() {
         let inst = RecordInstance::new("X".into(), CalcRecord::default());
         assert_eq!(inst.dtyp_index(), 0);
+    }
+
+    /// A downstream crate's registered device menu (asyn's) is merged AFTER the
+    /// base-declared choices, matching a C fat softIoc that loaded `asyn.dbd`:
+    /// `mbbo.DTYP` = the three base soft entries then `asynInt32`,
+    /// `asynUInt32Digital`, in that order. `dtyp_index` reads the merged list,
+    /// so an `mbbo` bound to `asynInt32` reports index 3 — the wire value C
+    /// serves — instead of the appended-as-own-slot index the port gave before
+    /// the menu was known.
+    #[test]
+    fn a_registered_device_menu_merges_after_the_base_declared_choices() {
+        // The list asyn's generated `dbd_generated::DEVICE_MENU_MBBO` carries.
+        static ASYN_MBBO: &[&str] = &["asynInt32", "asynUInt32Digital"];
+        super::super::register_device_menu("mbbo", ASYN_MBBO);
+
+        let mut inst = RecordInstance::new("X".into(), MbboRecord::default());
+        let merged: Vec<String> = inst
+            .device_choices()
+            .expect("mbbo declares device() lines")
+            .iter()
+            .map(|c| c.as_str_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            merged,
+            vec![
+                "Soft Channel",
+                "Raw Soft Channel",
+                "Async Soft Channel",
+                "asynInt32",
+                "asynUInt32Digital",
+            ],
+            "base-declared choices first, asyn-contributed appended in asyn.dbd order"
+        );
+
+        inst.common.dtyp = "asynInt32".into();
+        assert_eq!(
+            inst.dtyp_index(),
+            3,
+            "an asyn DTYP indexes into the merged menu, not an appended own slot"
+        );
+    }
+
+    /// The None-vs-empty contract survives the merge: a record type neither
+    /// base nor any downstream crate contributes a `device()` for (calc) stays
+    /// `None`, never `Some([])`, even after asyn menus are registered in this
+    /// process.
+    #[test]
+    fn calc_stays_none_after_asyn_menus_are_registered() {
+        static ASYN_MBBO: &[&str] = &["asynInt32", "asynUInt32Digital"];
+        super::super::register_device_menu("mbbo", ASYN_MBBO);
+
+        let inst = RecordInstance::new("X".into(), CalcRecord::default());
+        assert!(
+            inst.device_choices().is_none(),
+            "calc declares no device() and gets no contribution — still None"
+        );
     }
 }
 

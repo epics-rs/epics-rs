@@ -275,12 +275,23 @@ pub fn emit(input: &Input<'_>) -> Result<String, String> {
     if !input.devices.is_empty() {
         writeln!(out, "use {base}::server::record::DbLinkType;").unwrap();
     }
-    writeln!(
-        out,
-        "use {base}::server::record::{{Asl, FieldDesc, Special}};"
-    )
-    .unwrap();
-    writeln!(out, "use {base}::types::DbFieldType;\n").unwrap();
+    // `Asl`, `Special` and `DbFieldType` appear ONLY in an emitted `FieldDesc`
+    // literal, so a target with no record fields (asyn declares only `device()`
+    // lines, no `recordtype`) would import them unused — a hard error under
+    // `clippy -D warnings`, which promotes rustc's `unused_imports`. `FieldDesc`
+    // itself is still named by the `record_fields` return type even for such a
+    // target, so it is imported unconditionally.
+    let emits_fields = !input.records.is_empty() || !input.common.is_empty();
+    if emits_fields {
+        writeln!(
+            out,
+            "use {base}::server::record::{{Asl, FieldDesc, Special}};"
+        )
+        .unwrap();
+        writeln!(out, "use {base}::types::DbFieldType;\n").unwrap();
+    } else {
+        writeln!(out, "use {base}::server::record::FieldDesc;\n").unwrap();
+    }
 
     // --- menus ---------------------------------------------------------
     out.push_str(
@@ -331,21 +342,20 @@ pub fn emit(input: &Input<'_>) -> Result<String, String> {
         }
     }
 
-    writeln!(
-        out,
+    out.push_str(
         "/// Every `menu()` declared by a vendored `.dbd`, keyed by its EPICS name.\n\
          ///\n\
          /// This is the table `get_enum_strs` answers a `DBF_MENU` field from: the\n\
          /// field's [`FieldDesc::menu`] already points at its choices, and this map\n\
          /// exists for the by-name lookups (`.db` loading, `dbpr`).\n\
-         pub fn menu_choices(menu: &str) -> Option<&'static [&'static str]> {{\n\
-         \x20   Some(match menu {{"
-    )
-    .unwrap();
-    for (name, konst) in &menu_names {
-        writeln!(out, "        {} => {konst},", rust_str(name)).unwrap();
-    }
-    out.push_str("        _ => return None,\n    })\n}\n\n");
+         pub fn menu_choices(menu: &str) -> Option<&'static [&'static str]> {\n",
+    );
+    emit_str_lookup(
+        &mut out,
+        "menu",
+        menu_names.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+    );
+    out.push_str("}\n\n");
 
     // --- field tables ---------------------------------------------------
     out.push_str(
@@ -455,13 +465,14 @@ pub fn emit(input: &Input<'_>) -> Result<String, String> {
     out.push_str(
         "/// The record-own field table for a record type name, or `None` for a type\n\
          /// no vendored `.dbd` declares.\n\
-         pub fn record_fields(record_type: &str) -> Option<&'static [FieldDesc]> {\n\
-         \x20   Some(match record_type {\n",
+         pub fn record_fields(record_type: &str) -> Option<&'static [FieldDesc]> {\n",
     );
-    for (name, konst) in &record_consts {
-        writeln!(out, "        {} => {konst},", rust_str(name)).unwrap();
-    }
-    out.push_str("        _ => return None,\n    })\n}\n\n");
+    emit_str_lookup(
+        &mut out,
+        "record_type",
+        record_consts.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+    );
+    out.push_str("}\n\n");
 
     writeln!(
         out,
@@ -475,6 +486,34 @@ pub fn emit(input: &Input<'_>) -> Result<String, String> {
     out.push_str("];\n");
 
     Ok(out)
+}
+
+/// Emit the body of a `fn(&str) -> Option<&'static [T]>` string-keyed lookup:
+/// `Some(match key { "name" => KONST, ..., _ => return None })`.
+///
+/// When there are NO arms (a target that declares no menus, or no record types —
+/// asyn declares only `device()` lines), that shape is `Some(match { _ => return
+/// None })`, whose `Some(...)` is unreachable because the match diverges — a hard
+/// `unreachable_code` error under `-D warnings`, which `#![allow(clippy::all)]`
+/// does not cover (it is a rustc lint, not clippy's). The empty case emits the
+/// constant `None` answer instead. The non-empty shape is unchanged, so every
+/// existing generated table is byte-identical after rustfmt.
+fn emit_str_lookup<'a>(
+    out: &mut String,
+    key: &str,
+    arms: impl IntoIterator<Item = (&'a str, &'a str)>,
+) {
+    let arms: Vec<(&str, &str)> = arms.into_iter().collect();
+    if arms.is_empty() {
+        writeln!(out, "    let _ = {key};").unwrap();
+        out.push_str("    None\n");
+        return;
+    }
+    writeln!(out, "    Some(match {key} {{").unwrap();
+    for (name, konst) in arms {
+        writeln!(out, "        {} => {konst},", rust_str(name)).unwrap();
+    }
+    out.push_str("        _ => return None,\n    })\n");
 }
 
 /// The `device(...)` half of a target's `.dbd` set: the DTYP choice menu and the
@@ -539,6 +578,22 @@ fn emit_devices(out: &mut String, input: &Input<'_>) -> Result<(), String> {
         writeln!(out, "        {} => {konst},", rust_str(record)).unwrap();
     }
     out.push_str("        _ => return None,\n    })\n}\n\n");
+
+    // The record types [`device_menu`] answers `Some` for — its keys, as a
+    // list. A downstream crate whose device support has no `device()` line in
+    // base's `.dbd` (asyn) walks this to hand each menu to base's
+    // `register_device_menu` at startup, so base can merge the asyn choices into
+    // the record type's `DTYP` list without depending on the downstream crate.
+    writeln!(
+        out,
+        "/// The record types [`device_menu`] returns `Some` for, in `.dbd` name order."
+    )
+    .unwrap();
+    out.push_str("pub static DEVICE_MENU_RECORD_TYPES: &[&str] = &[\n");
+    for (record, _) in &device_consts {
+        writeln!(out, "    {},", rust_str(record)).unwrap();
+    }
+    out.push_str("];\n\n");
 
     // --- device link types ----------------------------------------------
     //

@@ -10,18 +10,27 @@
 //! file, so the data is reviewable next to the catalogue it transcribes and can
 //! be edited without touching harness code.
 //!
-//! # Three buckets, two justification bases
+//! # Four buckets, three justification bases
 //!
 //! Most rows are C-bug refusals: a `NOT-REPRODUCED` (or, disabled, `REPRODUCED`)
 //! entry transcribed from `doc/upstream-c-bugs.md`, and each such row MUST cite
-//! the `CBUG-…` id that justifies it. A third bucket, `DESIGN-DIVERGENCE`,
-//! records an *intentional port design choice* that is neither a C-bug refusal
-//! nor a port defect — so it is justified by its `why` (the design rationale)
-//! alone and cites no CBUG. The CBUG-citation rule is relaxed for that bucket
-//! and only that bucket; every row still needs a non-empty `id` (it keys the
-//! fired/stale ledger) and a non-empty `why`. All three buckets match, fire, and
-//! go stale by the same rules — the bucket changes only what justifies the row,
-//! not how it behaves. See [`Allowlist::parse`].
+//! the `CBUG-…` id that justifies it. Two further buckets are justified by their
+//! `why` rather than by a catalogue entry, and cite no CBUG:
+//!
+//! - `DESIGN-DIVERGENCE` — an *intentional port design choice* that is neither a
+//!   C-bug refusal nor a port defect (the port deliberately does something other
+//!   than the spec).
+//! - `INSTRUMENT-SUPERSET` — the *opposite* direction: the port matches the
+//!   measured spec, but the ground-truth **instrument** (`softIocPVX`, whose
+//!   `.dbd` is a superset of the oracle's `softIoc.dbd`) serves more than the
+//!   spec. The difference is an artifact of the instrument exceeding the spec,
+//!   not of the port falling short of it.
+//!
+//! The CBUG-citation rule is relaxed for those two buckets, and only them; every
+//! row still needs a non-empty `id` (it keys the fired/stale ledger) and a
+//! non-empty `why`. All four buckets match, fire, and go stale by the same rules
+//! — the bucket changes only what *justifies* the row, not how it behaves. See
+//! [`Allowlist::parse`].
 //!
 //! # The two artifacts check each other
 //!
@@ -58,6 +67,10 @@ pub const BUCKET_REPRODUCED: &str = "REPRODUCED";
 /// Justified by its `why` alone; the `CBUG-…` `id` requirement is relaxed for
 /// this bucket only.
 pub const BUCKET_DESIGN_DIVERGENCE: &str = "DESIGN-DIVERGENCE";
+/// A ground-truth **instrument** superset: the port matches the measured spec,
+/// but `softIocPVX` (whose `.dbd` is a superset of the oracle's `softIoc.dbd`)
+/// serves more. Justified by its `why`; no `CBUG-…` `id` required.
+pub const BUCKET_INSTRUMENT_SUPERSET: &str = "INSTRUMENT-SUPERSET";
 
 /// One expected-deviation rule: a C-bug refusal transcribed from
 /// `doc/upstream-c-bugs.md`, or an intentional port design divergence.
@@ -73,10 +86,10 @@ pub struct Deviation {
     /// for a `DESIGN-DIVERGENCE` row it is a design tag that cites no CBUG. Always
     /// non-empty and unique — it keys the fired/exercised/stale sets.
     pub id: String,
-    /// One of [`BUCKET_NOT_REPRODUCED`], [`BUCKET_REPRODUCED`], or
-    /// [`BUCKET_DESIGN_DIVERGENCE`]. Selects what justifies the row (a CBUG id
-    /// vs. a design rationale); it does not affect matching. Validated in
-    /// [`Allowlist::parse`].
+    /// One of [`BUCKET_NOT_REPRODUCED`], [`BUCKET_REPRODUCED`],
+    /// [`BUCKET_DESIGN_DIVERGENCE`], or [`BUCKET_INSTRUMENT_SUPERSET`]. Selects
+    /// what justifies the row (a CBUG id vs. a design/instrument rationale); it
+    /// does not affect matching. Validated in [`Allowlist::parse`].
     pub bucket: String,
     #[serde(default)]
     pub upstream: String,
@@ -104,6 +117,19 @@ pub struct Deviation {
     /// the surface+scope match alone decides (the CA behaviour).
     #[serde(default)]
     pub port_adds_leaves: Vec<String>,
+    /// The symmetric content constraint for the reversed direction: the GROUND
+    /// TRUTH (reference) carries extra choices in a single string-array leaf
+    /// (e.g. an `NTEnum` `value.choices`) that the port omits. When non-empty,
+    /// the deviation matches ONLY if the sole difference between the two
+    /// renderings is on one shared leaf line whose choice list on the reference
+    /// is the port's list plus EXACTLY the names here — no other leaf changed, no
+    /// choice removed, and the ground truth adds no choice beyond those named.
+    /// This justifies "the instrument's `.dbd` is a superset of the measured
+    /// spec" (QSRV2 example device support) without laundering any other marking
+    /// difference. Mutually exclusive with `port_adds_leaves` (validated in
+    /// [`Allowlist::parse`]).
+    #[serde(default)]
+    pub ground_truth_adds_choices: Vec<String>,
     /// A REPRODUCED entry is carried in the file for traceability but must NOT
     /// match anything: the port reproduces C, so the oracle must see agreement.
     /// If it ever fires, that is itself a finding.
@@ -187,17 +213,29 @@ impl Allowlist {
                         ));
                     }
                 }
-                // A design divergence is justified by its `why` (rationale), not
-                // by a catalogue entry: the CBUG-citation rule is relaxed here,
-                // and here only.
-                BUCKET_DESIGN_DIVERGENCE => {}
+                // A design divergence or an instrument-superset artifact is
+                // justified by its `why` (rationale), not by a catalogue entry:
+                // the CBUG-citation rule is relaxed here, and here only.
+                BUCKET_DESIGN_DIVERGENCE | BUCKET_INSTRUMENT_SUPERSET => {}
                 other => {
                     return Err(format!(
                         "allowlist row {} has unknown bucket {other:?} — expected one of \
-                         {BUCKET_NOT_REPRODUCED}, {BUCKET_REPRODUCED}, {BUCKET_DESIGN_DIVERGENCE}",
+                         {BUCKET_NOT_REPRODUCED}, {BUCKET_REPRODUCED}, \
+                         {BUCKET_DESIGN_DIVERGENCE}, {BUCKET_INSTRUMENT_SUPERSET}",
                         d.id
                     ));
                 }
+            }
+            // The two content constraints point in opposite directions (port adds
+            // vs. ground truth adds); a row that set both would have no coherent
+            // meaning, so reject it rather than silently honour one.
+            if !d.port_adds_leaves.is_empty() && !d.ground_truth_adds_choices.is_empty() {
+                return Err(format!(
+                    "allowlist row {} sets both `port_adds_leaves` and \
+                     `ground_truth_adds_choices` — a row may use at most one content \
+                     constraint; they describe opposite directions",
+                    d.id
+                ));
             }
             if d.why.trim().is_empty() {
                 return Err(format!(
@@ -366,8 +404,10 @@ impl Deviation {
     /// The content constraint is what makes a `value_marking` row safe: the PVA
     /// surface is one whole `pvxget` rendering per channel, so a bare
     /// scope+surface match would justify *any* marking difference on the
-    /// channel. `port_adds_leaves` narrows it to exactly "the port added these
-    /// leaf lines and nothing else moved".
+    /// channel. `port_adds_leaves` narrows it to "the port added these leaf lines
+    /// and nothing else moved"; `ground_truth_adds_choices` is its mirror, "the
+    /// ground truth added exactly these choices to one leaf and nothing else
+    /// moved". See [`Self::content_ok`].
     fn matches_pva(
         &self,
         ctx: &MatchContext<'_>,
@@ -380,26 +420,29 @@ impl Deviation {
             && self.content_ok(reference, observed)
     }
 
+    /// The coarse-blob content predicate: dispatches on whichever content
+    /// constraint the row declared. At most one may be set (enforced by
+    /// [`Allowlist::parse`]); a row with neither imposes no constraint.
+    fn content_ok(&self, reference: &str, observed: &str) -> bool {
+        if !self.port_adds_leaves.is_empty() {
+            return self.port_adds_leaves_ok(reference, observed);
+        }
+        if !self.ground_truth_adds_choices.is_empty() {
+            return self.ground_truth_adds_choices_ok(reference, observed);
+        }
+        true
+    }
+
     /// The port-adds-only content predicate.
     ///
     /// Both renderings are reduced to their set of non-empty trimmed lines
     /// (order-independent — pvxs and the port emit the leaves in different
     /// orders). The difference is justified iff every line the port added names
     /// a leaf in `port_adds_leaves`, at least one line was added, and no line
-    /// was removed or changed. An empty `port_adds_leaves` imposes no constraint.
-    fn content_ok(&self, reference: &str, observed: &str) -> bool {
-        if self.port_adds_leaves.is_empty() {
-            return true;
-        }
-        let lines = |s: &str| -> BTreeSet<String> {
-            s.lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty())
-                .map(str::to_string)
-                .collect()
-        };
-        let refl = lines(reference);
-        let obsl = lines(observed);
+    /// was removed or changed.
+    fn port_adds_leaves_ok(&self, reference: &str, observed: &str) -> bool {
+        let refl = line_set(reference);
+        let obsl = line_set(observed);
         let added: Vec<&String> = obsl.difference(&refl).collect();
         let removed = refl.difference(&obsl).count();
         removed == 0
@@ -409,6 +452,76 @@ impl Deviation {
                 self.port_adds_leaves.iter().any(|allowed| allowed == leaf)
             })
     }
+
+    /// The ground-truth-adds-choices content predicate — the mirror of
+    /// [`Self::port_adds_leaves_ok`].
+    ///
+    /// The difference is justified iff the SOLE differing line on each side is
+    /// the same string-array leaf (one line only-in-reference, one only-in-
+    /// observed, sharing a leaf path), the port's choice set is a subset of the
+    /// reference's (nothing removed), and the choices the reference adds are
+    /// EXACTLY `ground_truth_adds_choices` — no fewer (or the named superset did
+    /// not actually appear) and no more (or some other choice is unaccounted
+    /// for, which must stay a defect). Any other leaf differing fails the sole-
+    /// difference test, so no unrelated marking difference is laundered.
+    fn ground_truth_adds_choices_ok(&self, reference: &str, observed: &str) -> bool {
+        let refl = line_set(reference);
+        let obsl = line_set(observed);
+        let only_ref: Vec<&String> = refl.difference(&obsl).collect();
+        let only_obs: Vec<&String> = obsl.difference(&refl).collect();
+        // Exactly one leaf line differs on each side...
+        if only_ref.len() != 1 || only_obs.len() != 1 {
+            return false;
+        }
+        let leaf = |l: &str| l.split_whitespace().next().unwrap_or("").to_string();
+        // ...and it is the same leaf on both (a changed leaf, not a leaf that
+        // one side dropped and the other invented).
+        if leaf(only_ref[0]) != leaf(only_obs[0]) {
+            return false;
+        }
+        let ref_choices = parse_choice_list(only_ref[0]);
+        let port_choices = parse_choice_list(only_obs[0]);
+        // The port removed no choice the reference kept...
+        if !port_choices.is_subset(&ref_choices) {
+            return false;
+        }
+        // ...and the reference's extras are exactly the named superset.
+        let extra: BTreeSet<String> = ref_choices.difference(&port_choices).cloned().collect();
+        let named: BTreeSet<String> = self.ground_truth_adds_choices.iter().cloned().collect();
+        extra == named
+    }
+}
+
+/// A rendering reduced to its set of non-empty trimmed lines. pvxs and the port
+/// emit leaves in different orders, so content predicates compare line SETS.
+fn line_set(s: &str) -> BTreeSet<String> {
+    s.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The quoted choice strings inside the `[...]` of a rendered string-array leaf
+/// line, as a set. `value.choices string[] = {3}["A", "B"]` -> {"A", "B"}.
+///
+/// Splits on `"` delimiters, so choices containing commas or brackets are fine;
+/// EPICS menu choice strings never contain an embedded quote, so no unescaping
+/// is needed.
+fn parse_choice_list(line: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let mut rest = line;
+    while let Some(open) = rest.find('"') {
+        let after = &rest[open + 1..];
+        match after.find('"') {
+            Some(close) => {
+                out.insert(after[..close].to_string());
+                rest = &after[close + 1..];
+            }
+            None => break,
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -607,8 +720,9 @@ why = "  "
     }
 
     /// The shipped file must parse; every row needs a justification, and every
-    /// C-bug-refusal row must still cite a CBUG id. A DESIGN-DIVERGENCE row is
-    /// justified by its `why` alone and is exempt from the CBUG-citation rule.
+    /// C-bug-refusal row must still cite a CBUG id. DESIGN-DIVERGENCE and
+    /// INSTRUMENT-SUPERSET rows are justified by their `why` alone and are exempt
+    /// from the CBUG-citation rule.
     #[test]
     fn shipped_allowlist_parses_and_c_bug_rows_cite_a_cbug() {
         let al = Allowlist::load(&Allowlist::default_path()).expect("shipped allowlist parses");
@@ -628,7 +742,7 @@ why = "  "
                         r.id
                     );
                 }
-                BUCKET_DESIGN_DIVERGENCE => {}
+                BUCKET_DESIGN_DIVERGENCE | BUCKET_INSTRUMENT_SUPERSET => {}
                 other => panic!("row {:?} has unknown bucket {other:?}", r.id),
             }
         }
@@ -694,9 +808,19 @@ bucket = "DESIGN-DIVERGENCE"
 why = "intentional port design choice, justified here rather than by a CBUG"
 "#;
         assert!(Allowlist::parse(design_without_cbug).is_ok());
+
+        // ...and so is an instrument-superset row.
+        let instrument_without_cbug = r#"
+schema = 1
+[[deviation]]
+id = "INSTR-1"
+bucket = "INSTRUMENT-SUPERSET"
+why = "ground-truth instrument dbd superset, justified here rather than by a CBUG"
+"#;
+        assert!(Allowlist::parse(instrument_without_cbug).is_ok());
     }
 
-    /// An unknown bucket string is a typo, not a fourth policy — rejected.
+    /// An unknown bucket string is a typo, not a fifth policy — rejected.
     #[test]
     fn an_unknown_bucket_is_rejected() {
         let toml = r#"
@@ -708,5 +832,156 @@ why = "typo'd bucket must not silently become a wildcard"
 "#;
         let err = Allowlist::parse(toml).unwrap_err();
         assert!(err.contains("unknown bucket"), "got: {err}");
+    }
+
+    // --- INSTRUMENT-SUPERSET: the QSRV2 demo device-support residuals. ---
+
+    /// A DTYP `value_marking` rendering with the given `value.choices` line and
+    /// every other leaf held fixed — the real longin/waveform DTYP shape, so the
+    /// tests exercise the sole-differing-leaf logic faithfully.
+    fn dtyp_blob(choices_line: &str) -> String {
+        [
+            "value.index int32_t = 0",
+            choices_line,
+            "alarm.severity int32_t = 3",
+            "alarm.status int32_t = 2",
+            "alarm.message string = \"UDF\"",
+            "timeStamp.secondsPastEpoch int64_t = 631152000",
+            "timeStamp.nanoseconds int32_t = 0",
+            "timeStamp.userTag int32_t = 0",
+            "display.description string = \"\"",
+        ]
+        .join("\n")
+    }
+
+    // The post-asyn-fix residual state: the port carries every asyn menu choice,
+    // so the SOLE extra the ground truth serves is the QSRV2 demo choice.
+    const LONGIN_REF: &str = "value.choices string[] = {7}[\"Soft Channel\", \"Async Soft Channel\", \"General Time\", \"asynInt32\", \"asynUInt32Digital\", \"asynInt64\", \"QSRV2 Set UTag\"]";
+    const LONGIN_PORT: &str = "value.choices string[] = {6}[\"Soft Channel\", \"Async Soft Channel\", \"General Time\", \"asynInt32\", \"asynUInt32Digital\", \"asynInt64\"]";
+    const WAVEFORM_REF: &str = "value.choices string[] = {22}[\"Soft Channel\", \"asynOctetCmdResponse\", \"asynOctetWriteRead\", \"asynOctetRead\", \"asynOctetWrite\", \"asynOctetWriteBinary\", \"asynInt8ArrayIn\", \"asynInt8ArrayOut\", \"asynInt16ArrayIn\", \"asynInt16ArrayOut\", \"asynInt32ArrayIn\", \"asynInt32ArrayOut\", \"asynFloat32ArrayIn\", \"asynFloat32ArrayOut\", \"asynFloat64ArrayIn\", \"asynFloat64ArrayOut\", \"asynInt32TimeSeries\", \"asynFloat64TimeSeries\", \"asynInt64ArrayIn\", \"asynInt64ArrayOut\", \"asynInt64TimeSeries\", \"QSRV2 Demo\"]";
+    const WAVEFORM_PORT: &str = "value.choices string[] = {21}[\"Soft Channel\", \"asynOctetCmdResponse\", \"asynOctetWriteRead\", \"asynOctetRead\", \"asynOctetWrite\", \"asynOctetWriteBinary\", \"asynInt8ArrayIn\", \"asynInt8ArrayOut\", \"asynInt16ArrayIn\", \"asynInt16ArrayOut\", \"asynInt32ArrayIn\", \"asynInt32ArrayOut\", \"asynFloat32ArrayIn\", \"asynFloat32ArrayOut\", \"asynFloat64ArrayIn\", \"asynFloat64ArrayOut\", \"asynInt32TimeSeries\", \"asynFloat64TimeSeries\", \"asynInt64ArrayIn\", \"asynInt64ArrayOut\", \"asynInt64TimeSeries\"]";
+
+    fn longin_instr_allowlist() -> Allowlist {
+        Allowlist::parse(
+            "schema = 1\n\
+             [[deviation]]\n\
+             id = \"INSTR-QSRV2-LONGIN-UTAG\"\n\
+             bucket = \"INSTRUMENT-SUPERSET\"\n\
+             record_types = [\"longin\"]\n\
+             fields = [\"DTYP\"]\n\
+             surface = [\"value_marking\"]\n\
+             ground_truth_adds_choices = [\"QSRV2 Set UTag\"]\n\
+             why = \"softIocPVX.dbd superset links pvxs devLoPDBQ2UTag\"\n",
+        )
+        .expect("instrument-superset row parses without a CBUG id")
+    }
+
+    #[test]
+    fn an_instrument_superset_row_matches_a_ground_truth_added_choice() {
+        let mut al = longin_instr_allowlist();
+        let hit = al.match_pva_diff(
+            &ctx("longin", "DTYP", None),
+            "value_marking",
+            &dtyp_blob(LONGIN_REF),
+            &dtyp_blob(LONGIN_PORT),
+        );
+        assert_eq!(hit.as_deref(), Some("INSTR-QSRV2-LONGIN-UTAG"));
+        assert!(al.fired_rows().contains("INSTR-QSRV2-LONGIN-UTAG"));
+        assert!(al.stale_rows().is_empty(), "a fired row is not stale");
+    }
+
+    /// Anti-launder, same discipline as `port_adds_leaves`: a second differing
+    /// leaf on the same channel means the whole case stays a DEFECT.
+    #[test]
+    fn an_instrument_superset_row_does_not_launder_a_second_marking_difference() {
+        let mut al = longin_instr_allowlist();
+        let port = dtyp_blob(LONGIN_PORT)
+            .replace("alarm.severity int32_t = 3", "alarm.severity int32_t = 4");
+        assert!(
+            al.match_pva_diff(
+                &ctx("longin", "DTYP", None),
+                "value_marking",
+                &dtyp_blob(LONGIN_REF),
+                &port,
+            )
+            .is_none(),
+            "a second differing leaf must not ride in on the choice constraint"
+        );
+    }
+
+    /// The ground truth's extra must be EXACTLY the named choice: an unnamed
+    /// extra is unaccounted for and keeps the case a defect.
+    #[test]
+    fn an_instrument_superset_row_requires_the_extra_to_be_exactly_the_named_choices() {
+        let mut al = longin_instr_allowlist();
+        let ref_two = "value.choices string[] = {8}[\"Soft Channel\", \"Async Soft Channel\", \"General Time\", \"asynInt32\", \"asynUInt32Digital\", \"asynInt64\", \"QSRV2 Set UTag\", \"Surprise Choice\"]";
+        assert!(
+            al.match_pva_diff(
+                &ctx("longin", "DTYP", None),
+                "value_marking",
+                &dtyp_blob(ref_two),
+                &dtyp_blob(LONGIN_PORT),
+            )
+            .is_none(),
+            "an unnamed extra choice must keep the case a defect"
+        );
+    }
+
+    /// Direction matters: if the PORT carries a choice the ground truth lacks,
+    /// that is not an instrument superset and must not fire.
+    #[test]
+    fn an_instrument_superset_row_does_not_match_when_the_port_adds_a_choice() {
+        let mut al = longin_instr_allowlist();
+        let port_extra = "value.choices string[] = {7}[\"Soft Channel\", \"Async Soft Channel\", \"General Time\", \"asynInt32\", \"asynUInt32Digital\", \"asynInt64\", \"Port Only\"]";
+        assert!(
+            al.match_pva_diff(
+                &ctx("longin", "DTYP", None),
+                "value_marking",
+                &dtyp_blob(LONGIN_REF),
+                &dtyp_blob(port_extra),
+            )
+            .is_none(),
+            "the port carrying an extra choice is the wrong direction"
+        );
+    }
+
+    /// The two content constraints point in opposite directions; a row may set
+    /// at most one.
+    #[test]
+    fn a_row_may_not_set_both_content_constraints() {
+        let toml = r#"
+schema = 1
+[[deviation]]
+id = "INSTR-BAD"
+bucket = "INSTRUMENT-SUPERSET"
+surface = ["value_marking"]
+port_adds_leaves = ["display.precision"]
+ground_truth_adds_choices = ["QSRV2 Demo"]
+why = "cannot point both directions at once"
+"#;
+        let err = Allowlist::parse(toml).unwrap_err();
+        assert!(err.contains("at most one content constraint"), "got: {err}");
+    }
+
+    /// The two SHIPPED instrument-superset rows fire on the residual QSRV2 diffs
+    /// for both longin and waveform — the end-state the main worker's combined
+    /// run reaches once the asyn menu fix is integrated.
+    #[test]
+    fn the_shipped_instrument_superset_rows_fire_on_the_residual_qsrv2_diffs() {
+        let mut al = Allowlist::load(&Allowlist::default_path()).unwrap();
+        let longin = al.match_pva_diff(
+            &ctx("longin", "DTYP", None),
+            "value_marking",
+            &dtyp_blob(LONGIN_REF),
+            &dtyp_blob(LONGIN_PORT),
+        );
+        assert_eq!(longin.as_deref(), Some("INSTR-QSRV2-LONGIN-UTAG"));
+        let waveform = al.match_pva_diff(
+            &ctx("waveform", "DTYP", None),
+            "value_marking",
+            &dtyp_blob(WAVEFORM_REF),
+            &dtyp_blob(WAVEFORM_PORT),
+        );
+        assert_eq!(waveform.as_deref(), Some("INSTR-QSRV2-WAVEFORM-DEMO"));
     }
 }

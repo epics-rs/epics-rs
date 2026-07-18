@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.24.2 — 2026-07-19
+
+Documentation-only patch release. No functional code change since v0.24.1 — the
+sole source edit is a doc comment. Workspace version 0.24.1 -> 0.24.2.
+
+### ad-plugins-rs
+
+- **CBUG-B25 reclassified: the port already matches upstream.** The
+  `NDPluginTimeSeries` integer averaging has divided *before* narrowing (the
+  correct order) since `d8f27b88`; ADCore #596 (merged upstream 2026-07-16)
+  applies the same fix to C, so the port and current upstream C now agree. The
+  module header and `averaged_value` doc comment are reframed from a live
+  "deliberate deviation / reproduces C's bug" to "matches upstream since #596";
+  the worked example now shows the correct `200`, not C's pre-#596 `29`. No
+  behaviour change.
+
+### Docs
+
+- `doc/upstream-c-bugs.md`: reconciled the upstream-PR submission status against
+  live GitHub (20 PRs by author, was 4 in the stale catalogue), added a single
+  authoritative filed-PR table, and reclassified CBUG-B25
+  REPRODUCED -> NOT-REPRODUCED (fixed upstream #596).
+
 ## v0.24.1 — 2026-07-18
 
 Patch release. Closes the Type3 differential-oracle parity gap: after this

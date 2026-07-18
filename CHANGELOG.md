@@ -2,8 +2,32 @@
 
 ## v0.24.2 — 2026-07-19
 
-Documentation-only patch release. No functional code change since v0.24.1 — the
-sole source edit is a doc comment. Workspace version 0.24.1 -> 0.24.2.
+Patch release. Two DTYP-resolution fixes in `epics-base-rs` (the `dbpf`
+device-support path), plus a documentation reclassification (CBUG-B25). Additive
+API only; no breaking changes. Workspace version 0.24.1 -> 0.24.2.
+
+### epics-base-rs
+
+- **`dbpf <rec>.DTYP <device-support-name>` in an st.cmd no longer fails
+  iocInit.** `cmd_dbpf` took the field type from `declared_field_type_of(DTYP)`
+  (reports `Enum`) and parsed the value through the small static menu table, so
+  every device-support name (`"Async Soft Channel"`, `"Asyn Scaler"`, …) missed
+  the table and returned `Err("invalid enum or menu string")` — and inside an
+  st.cmd that aborts iocInit before the CA server binds. DTYP values now route
+  straight to the put path (a numeric index → `Enum(i)`, a name → `String`
+  validated against `device_choices()`); the generic Enum parse still covers
+  every non-DTYP field.
+
+- **DTYP put validation/store now uses the merged device menu, not the
+  static-only half.** The read/announce side (`device_choices`) already merged
+  the static `device()` declarations with runtime-contributed device support
+  (asyn, scaler-rs), but the two write sites (`coerce_put_value` CA-put
+  validation, `put_common_field`'s DTYP Enum arm) consulted only the static
+  half — so a contributed name failed validation, and for a downstream custom
+  record type with no static device menu (scaler) it fell through to
+  `S_db_noRSET`. Both write sites now route through a single-source helper
+  `device_menu_registry::merged_device_menu` (declared + contributed), so put
+  and read stay symmetric: a client can put exactly the DTYP names it can read.
 
 ### ad-plugins-rs
 

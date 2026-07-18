@@ -64,10 +64,12 @@ array differential phases. `v0.24.1` closes the Type3 differential-oracle
 parity gap — sseq/mbbo/aSub timestamp and monitor fixes, `alarm.message`
 serving the record's own `amsg`, and DTYP/BOUT/QSRV2 oracle coverage — leaving
 the differential harness DEFECT 0 across all three phases (additive API only,
-no breaking changes). `v0.24.2` is a documentation-only patch: CBUG-B25 is
-reclassified now that ADCore #596 landed upstream (the port already divided
-before narrowing), with no functional code change. See
-[`CHANGELOG.md`](./CHANGELOG.md) for the full audit trail.
+no breaking changes). `v0.24.2` is a patch: two DTYP-resolution fixes in
+`epics-base-rs` (the `dbpf` device-support path now validates and stores against
+the merged declared+contributed device menu, so `dbpf <rec>.DTYP <name>` in an
+st.cmd no longer aborts iocInit), plus the CBUG-B25 documentation reclassification
+now that ADCore #596 landed upstream. See [`CHANGELOG.md`](./CHANGELOG.md) for
+the full audit trail.
 
 All crates are published on [crates.io](https://crates.io/crates/epics-rs). Add `epics-rs` with the feature flags you need:
 

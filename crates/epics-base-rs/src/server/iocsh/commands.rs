@@ -263,7 +263,24 @@ fn cmd_dbpf() -> CommandDef {
                 None
             });
 
-            let value = if let Some(dbf) = dbf_type {
+            let value = if field == "DTYP" {
+                // DTYP is DBF_DEVICE: its choices are the record type's live
+                // device menu (dynamic, per record type — device support names
+                // registered at runtime), NOT the field-blind static table that
+                // `EpicsValue::parse(Enum, _)` consults via `resolve_menu_string`.
+                // `declared_field_type_of(DTYP)` reports `Enum`, so the generic
+                // path below parsed every device-support name as an enum/menu
+                // string and rejected it ("invalid enum or menu string"), which
+                // failed `dbpf <rec>.DTYP <device-support-name>` for every record
+                // type. Feed the value straight to the put path, which already
+                // resolves a numeric index against `device_menu` and stores a
+                // device-support NAME as-is (tier-3, `put_common_field`'s "DTYP"
+                // arm).
+                match value_str.trim().parse::<i64>() {
+                    Ok(i) => EpicsValue::Enum(i as u16),
+                    Err(_) => EpicsValue::String(value_str.trim().into()),
+                }
+            } else if let Some(dbf) = dbf_type {
                 EpicsValue::parse(dbf, value_str)
                     .map_err(|e| format!("cannot parse '{value_str}' as {dbf:?}: {e}"))?
             } else {
@@ -1917,6 +1934,96 @@ record(bo, "$(P)_calc_ctrl") {{
             EpicsValue::Double(v) => assert!((v - 42.0).abs() < 1e-10),
             other => panic!("expected Double(42.0), got {:?}", other),
         }
+    }
+
+    /// Regression: `dbpf <rec>.DTYP <device-support-name>` must succeed for a
+    /// device-support name valid for the record type. DTYP is `DBF_DEVICE`,
+    /// served as `DBR_ENUM`, but its choices are the record type's live device
+    /// menu, NOT the static common-menu table `EpicsValue::parse(Enum,_)`
+    /// consults via `resolve_menu_string`. `"Async Soft Channel"` is a declared
+    /// `ai` device support but is absent from that static table, so before the
+    /// fix `cmd_dbpf` parsed it as an Enum and the handler returned
+    /// `Err("invalid enum or menu string: ...")` — which, when the `dbpf` sat in
+    /// an st.cmd, made `iocInit` fail before the CA server bound. The fix routes
+    /// the value to the put path, which validates it against the record's live
+    /// device menu (`device_choices()` = declared + runtime-contributed + the
+    /// current DTYP).
+    #[test]
+    fn test_dbpf_dtyp_accepts_device_support_name() {
+        let (db, ctx) = make_ctx();
+        ctx.block_on(async {
+            db.add_record("DEV", Box::new(AiRecord::new(0.0)))
+                .await
+                .unwrap();
+        });
+
+        let mut registry = CommandRegistry::new();
+        register_builtins(&mut registry);
+
+        let cmd = registry.get("dbpf").unwrap();
+        let tokens = vec!["DEV.DTYP".to_string(), "Async Soft Channel".to_string()];
+        let args = parse_args(&tokens, &cmd.args).unwrap();
+        let result = cmd.handler.call(&args, &ctx);
+        if let Err(e) = &result {
+            panic!("dbpf DEV.DTYP 'Async Soft Channel' should succeed, got Err({e})");
+        }
+        assert!(matches!(result, Ok(CommandOutcome::Continue)));
+
+        // The device-support NAME landed on the record's DTYP.
+        let dtyp = ctx.block_on(async {
+            let rec = db.get_record("DEV").await.expect("record present");
+            let inst = rec.read().await;
+            inst.common.dtyp.clone()
+        });
+        assert_eq!(dtyp, "Async Soft Channel");
+    }
+
+    /// Regression for the put/read DTYP asymmetry: a device-support name that is
+    /// NOT in the record type's static `device()` menu but IS registered at
+    /// runtime (`register_device_menu`, the asyn / scaler-rs path) must be
+    /// put-able via `dbpf`, because the read path already advertises it. Before
+    /// the fix the CA-put validation (`coerce_put_value`) and the DTYP write-back
+    /// (`put_common_field`) both consulted the static-only device menu, so a
+    /// contributed name either failed `S_db_noRSET` (types with no static menu)
+    /// or resolved to `NoChange` (leaving DTYP unset) — exactly what blocked
+    /// scaler974-ioc's `dbpf scaler1.DTYP "Asyn Scaler"`.
+    #[test]
+    fn test_dbpf_dtyp_accepts_contributed_device_support_name() {
+        use crate::server::record::register_device_menu;
+        // A record-type name + DTYP name no other test touches (the registry is
+        // process-global and append-only).
+        register_device_menu("ai", &["Dbpf Contributed Probe"]);
+
+        let (db, ctx) = make_ctx();
+        ctx.block_on(async {
+            db.add_record("CONTRIB", Box::new(AiRecord::new(0.0)))
+                .await
+                .unwrap();
+        });
+
+        let mut registry = CommandRegistry::new();
+        register_builtins(&mut registry);
+
+        let cmd = registry.get("dbpf").unwrap();
+        let tokens = vec![
+            "CONTRIB.DTYP".to_string(),
+            "Dbpf Contributed Probe".to_string(),
+        ];
+        let args = parse_args(&tokens, &cmd.args).unwrap();
+        let result = cmd.handler.call(&args, &ctx);
+        if let Err(e) = &result {
+            panic!("dbpf CONTRIB.DTYP 'Dbpf Contributed Probe' should succeed, got Err({e})");
+        }
+        assert!(matches!(result, Ok(CommandOutcome::Continue)));
+
+        // The contributed NAME is what landed on DTYP — not NoChange, not a
+        // stale value.
+        let dtyp = ctx.block_on(async {
+            let rec = db.get_record("CONTRIB").await.expect("record present");
+            let inst = rec.read().await;
+            inst.common.dtyp.clone()
+        });
+        assert_eq!(dtyp, "Dbpf Contributed Probe");
     }
 
     #[test]

@@ -17,8 +17,8 @@ pub use crate::server::recgbl::EventMask;
 pub use alarm::{AlarmSeverity, AnalogAlarmConfig};
 pub use common_fields::CommonFields;
 pub use constant_link::{rec_gbl_init_constant_link, reseed_constant_input_link};
-pub(crate) use device_menu_registry::contributed_device_menu;
 pub use device_menu_registry::register_device_menu;
+pub(crate) use device_menu_registry::{contributed_device_menu, merged_device_menu};
 pub use link::{
     CaLink, CalcLink, DbLink, DbLinkType, HwLink, HwLinkKind, JlinkValue, LinkAddress,
     LinkFieldType, LinkProcessPolicy, LinkType, LsLoad, MonitorSwitch, PVAJSON_IDENTITY_SEP,

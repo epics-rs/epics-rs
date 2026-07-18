@@ -4,6 +4,11 @@ Extracted 2026-07-13 from `doc/c-parity-review-2026-07-10.md`, where it grew as
 a section since 2026-07-12. **New upstream findings accumulate HERE** — later
 waves append batches to this file; nothing is deleted once filed.
 
+> **Submission status lives in one place:** the *Filed upstream PRs — live
+> GitHub status* table just below the Index (last reconciled 2026-07-18, 20
+> upstream PRs by `physwkim`). Per-entry `Status:` prose predates it and may be
+> stale; trust the table for PR number and state.
+
 **What this catalogue is.** The parity inventory
 (`doc/c-parity-review-2026-07-10.md`) catalogues divergences of *this port*
 from its C/C++ reference. This file is the mirror image: defects **in the
@@ -91,6 +96,61 @@ proven defect (see "Leads rejected").
 | CBUG-B25 | ADCore | `NDPluginTimeSeries` narrows the sum *before* dividing — integer averaging corrupted | Medium | REPRODUCED |
 | CBUG-B26 | ADCore | `NDPluginStats` broadcasts an uninitialized `NDStats_t` on dark frames | High | NOT-REPRODUCED |
 | CBUG-B27 | ADCore | `NDPluginStats` histogram divides by `(histMax − histMin)` — `(int)NaN` UB | Medium | NOT-REPRODUCED |
+
+---
+
+### Filed upstream PRs — live GitHub status (as of 2026-07-18)
+
+This is the authoritative submission-status table; it replaces the per-entry
+`Status:` prose, which is stale (the catalogue was extracted 2026-07-13, before
+most of these PRs were filed on 7/16–7/17). Author: `physwkim`. State is the live
+GitHub PR state, not a claim about the catalogue.
+
+**Catalogued CBUGs that are filed (14):**
+
+| CBUG | PR | state | note |
+|---|---|---|---|
+| CBUG-A1 | epics-modules/calc **#38** | open | `MODULO INT_MIN % -1` SIGFPE guard |
+| CBUG-A2 | epics-base/epics-base **#925** | open | `calcPerform` NINT/MODULO `d2i` narrowing |
+| CBUG-B3 | epics-modules/optics **#25** | open | pf4 glass-term guard |
+| CBUG-B5 | epics-modules/asyn **#234** | merged | `asynInterposeCom` ixon `return` |
+| CBUG-B9 | epics-modules/asyn **#233** | merged | `drvAsynIPServerPort` UDP read bound |
+| CBUG-B14 | epics-modules/std **#27** | open | `throttleRecord` `dbScanLock` |
+| CBUG-B20 | areaDetector/ADCore **#594** | merged | `NDPluginROIStat` RGB heap OOB |
+| CBUG-B21 | areaDetector/ADCore **#595** | merged | `NDPluginAttrPlot` `<=` off-by-one |
+| CBUG-B25 | areaDetector/ADCore **#596** | merged | `NDPluginTimeSeries` narrow-before-divide |
+| CBUG-B26 | areaDetector/ADCore **#597** | merged | `NDPluginStats` dark-frame value-init |
+| CBUG-C1 | epics-modules/calc **#39** | open | `sCalc lrc()` empty-operand OOB read |
+| CBUG-F1 | epics-modules/calc **#40** | open | `aCalc INC()` off-by-two |
+| CBUG-F11 | epics-modules/asyn **#235** | merged | `asynManager` traceIO truncate hang |
+| CBUG-G1 | epics-base/pvxs **#196** | open | QSRV2 `display.precision` |
+
+> **Classification conflict — CBUG-B25.** B25 is bucketed **REPRODUCED** (port
+> carries the bug on purpose) yet the C fix is filed and **merged** as ADCore
+> #596. Once #596 lands in a tagged release these two states are inconsistent:
+> re-bucket B25 to FIXED-UPSTREAM and drop the deliberate reproduction. Tracked,
+> not yet actioned.
+
+**Filed upstream PRs with no catalogue CBUG entry yet (6):**
+
+| PR | state | one line |
+|---|---|---|
+| epics-base/epics-base **#924** | open | `seqRecord` upper display limit of the DLYn fields |
+| epics-base/epics-base **#926** | open | `selRecord` precision for the A-L / LA-LL fields |
+| epics-base/pvxs **#179** | closed | qsrv & monitor: seven correctness issues (bundle, not 1:1) |
+| epics-base/pvxs **#180** | open | codec/client: bound decode, reject pre-INIT monitor data |
+| epics-base/pvxs **#181** | open | ossl/client/config: TLS peer-identity / downgrade / keychain |
+| epics-base/pvxs **#195** | open | server: follow TCP port fallback on all interfaces |
+
+These want back-fill CBUG entries (or an explicit "no entry — direct find" note)
+so the catalogue and the filed set stay reconcilable.
+
+**Catalogued NOT-REPRODUCED, still UNFILED (the remaining easy-to-accept set):**
+CBUG-B2 (pf4 Pb OOB read), CBUG-B7 (`nextChar` 0-byte uninit), CBUG-B17
+(throttle wrong-link CA status), CBUG-B22 / CBUG-B23 / CBUG-B27 (NDPluginProcess /
+NDPluginStats divide-by-zero, 3), CBUG-D2 (sCalc string shift OOB write), CBUG-D3
+(`EPICS_CA_CONN_TMO` watchdog flood), CBUG-D5 (`EPICS_CA_MAX_SEARCH_PERIOD`
+inf/nan crash). None filed as of 2026-07-18.
 
 ---
 

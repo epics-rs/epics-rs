@@ -115,6 +115,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // exercise.
     let (asyn_type, asyn_factory) = asyn_record_factory();
 
+    // Contribute asyn's device-support DTYP menus to base's `DTYP` choice lists,
+    // the way a C fat `softIoc` gains them by loading `asyn.dbd`'s `device()`
+    // lines. This is menu-only on purpose: it does NOT install the universal
+    // asyn factory (`register_asyn_device_support*` would), so no record's read
+    // fields or processing change — only the `DTYP` value.choices a client reads
+    // now lists `asynInt32` / `asynOctetWrite` / ... for the base record types,
+    // matching the fat-C ground truth. Process-global (the menu is per record
+    // TYPE, as in C), so one call before `build()` suffices.
+    asyn_rs::adapter::register_asyn_device_menus();
+
     let (db, _autosave) = IocBuilder::new()
         .register_record_type(asyn_type, asyn_factory)
         .db_file(&db_path, &macros)?

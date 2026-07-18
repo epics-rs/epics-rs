@@ -163,10 +163,15 @@ async fn r9_78_failed_input_fetch_pushes_nothing() {
     );
 }
 
-/// No subroutine bound: C `do_sub` returns S_db_BadSub, so `status != 0` and the
-/// pushes are skipped.
+/// No subroutine bound AND SNAM empty: C `do_sub` (aSubRecord.c:459-460)
+/// short-circuits an empty SNAM to `return 0` BEFORE the `pfunc == NULL` ->
+/// `S_db_BadSub` check — an empty SNAM is a no-op that completes with status 0,
+/// not a bad-sub. So `process`'s `if (!status)` pushes every configured OUT
+/// link: a subroutine-less aSub with a preset VALA and a wired OUTA drives its
+/// sink. (The real `S_db_BadSub` case is a NON-empty, unregistered SNAM; that
+/// non-zero-status suppression is covered by `r9_78_failed_do_sub_pushes_nothing`.)
 #[tokio::test]
-async fn r9_78_unbound_subroutine_pushes_nothing() {
+async fn r9_78_empty_snam_pushes_output_links() {
     let db = PvDatabase::new();
     db.add_record("SINK_A", Box::new(AiRecord::new(0.0)))
         .await
@@ -182,7 +187,7 @@ async fn r9_78_unbound_subroutine_pushes_nothing() {
 
     assert_eq!(
         field(&db, "SINK_A", "VAL").await,
-        Some(0.0),
-        "no bound routine is C's S_db_BadSub — a non-zero status, so nothing is driven"
+        Some(7.0),
+        "empty SNAM is C do_sub's `return 0`, so status 0 pushes OUTA <- VALA"
     );
 }

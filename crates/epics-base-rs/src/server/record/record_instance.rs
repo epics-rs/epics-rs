@@ -3341,8 +3341,38 @@ impl RecordInstance {
         // Clone the Arc so the borrow on `self.subroutine` is released
         // before we mutate `self.record` / `self.common` below.
         let Some(sub_fn) = self.subroutine.clone() else {
-            // C `do_sub` with no bound routine returns `S_db_BadSub`
-            // (aSubRecord.c:255-258), so the cycle's status is non-zero.
+            // C `do_sub` (aSubRecord.c:459-465, subRecord.c:118-123)
+            // short-circuits an EMPTY SNAM to `return 0` BEFORE the
+            // `pfunc == NULL` -> `S_db_BadSub` check: a subroutine record with
+            // no SNAM is not a bad-sub, it is a no-op that completes with
+            // status 0. Only a NON-empty, unregistered SNAM yields
+            // `S_db_BadSub`.
+            //
+            // aSub depends on this: C `process` (aSubRecord.c:224) runs
+            // `prec->val = status` (= 0) every cycle, forcing VAL back to 0.
+            // C `monitor()` (aSubRecord.c:414) posts VAL only on
+            // `val != oval`, so with val==oval==0 a periodic (SCAN) cycle
+            // posts nothing — the driven `dbPut`s are the only VAL events.
+            // Without the reset the port leaves VAL holding the last client
+            // put, and the deadband gate re-posts it on every scan (the aSub
+            // scanned monitor over-posts: 7 updates where C posts 4). `sub`
+            // never reaches here with an empty SNAM — it parks PACT at init
+            // (`Record::init_record_parks_pact`, subRecord.c:119-123) and does
+            // not process — so the VAL write is scoped to aSub, whose VAL is
+            // the do_sub status.
+            let snam_empty = matches!(
+                self.record.get_field("SNAM"),
+                Some(EpicsValue::String(s)) if s.is_empty()
+            );
+            if snam_empty {
+                if self.record.record_type() == "aSub" {
+                    // C `prec->val = do_sub() = 0`.
+                    let _ = self.record.put_field("VAL", EpicsValue::Long(0));
+                }
+                return Ok(0);
+            }
+            // A non-empty but unregistered SNAM: C `do_sub` returns
+            // `S_db_BadSub`, so the cycle's status is non-zero.
             return Ok(SUBROUTINE_STATUS_NO_SUB);
         };
         // C `do_sub` returns the subroutine's `long` status.
@@ -5888,6 +5918,81 @@ mod metadata_cache_tests {
         assert!(
             !n.contains(&"RBV".to_string()),
             "MDEL must throttle RBV: {n:?}"
+        );
+    }
+
+    /// A subroutine-less aSub (empty SNAM — the record the PVA monitor
+    /// oracle drives as `ORACLE:MONSCAN:ASUB`) mirrors C `do_sub`
+    /// (aSubRecord.c:459-465): an empty SNAM returns 0 BEFORE the bad-sub
+    /// check, and C `process` (`:224`) runs `prec->val = status = 0` every
+    /// cycle. So a periodic scan forces VAL back to 0, and C `monitor()`
+    /// (`:414`, `val != oval`) posts nothing — the driven `dbPut`s are the
+    /// only VAL events.
+    ///
+    /// Before the fix the port's "no bound subroutine" branch returned
+    /// `S_db_BadSub` and never wrote VAL, so a scanned aSub kept VAL at the
+    /// last client put and the deadband gate re-posted it on every scan (the
+    /// oracle's 7 updates where C posts 4). This pins both halves: `process`
+    /// resets VAL to 0, and a scan of the reset value posts nothing.
+    #[test]
+    fn subroutineless_asub_process_resets_val_and_stops_scan_overposting() {
+        use crate::server::recgbl::EventMask;
+        use crate::server::records::asub_record::ASubRecord;
+
+        let mut inst = RecordInstance::new("ASUB".to_string(), ASubRecord::default());
+        // The default record: no subroutine bound, SNAM empty.
+        assert!(inst.subroutine.is_none());
+        let _val_rx = inst
+            .add_subscriber(
+                "VAL",
+                1,
+                crate::types::DbFieldType::Long,
+                EventMask::VALUE.bits(),
+            )
+            .expect("VAL subscriber");
+        let posts_val =
+            |snap: &ProcessSnapshot| snap.changed_fields.iter().any(|(n, _, _)| n == "VAL");
+
+        // A settling scan of the unchanged record: C `do_sub` returns 0 and
+        // `process` leaves VAL at 0 (already 0), settling the monitor gate.
+        let _ = inst.process_local().unwrap();
+        assert_eq!(inst.record.get_field("VAL"), Some(EpicsValue::Long(0)));
+        // status 0 -> C `if (!status)` drives every OUT link (aSub's
+        // `multi_output_links` gate reads the cycle status); a bad-sub status
+        // would suppress all 21.
+        assert_eq!(
+            inst.record.multi_output_links().len(),
+            21,
+            "empty-SNAM do_sub status must be 0, not S_db_BadSub"
+        );
+
+        // A client caput lands on VAL (DBF_LONG, not process-passive: it posts
+        // but does not itself process, leaving VAL non-zero — exactly how the
+        // oracle drives the scanned reproducer between scans).
+        inst.record.put_field("VAL", EpicsValue::Long(7)).unwrap();
+
+        // The periodic scan processes. C forces VAL back to 0 and posts
+        // nothing (val == oval == 0). Before the fix VAL stayed 7 and the scan
+        // re-posted it.
+        let (snap, _) = inst.process_local().unwrap();
+        assert_eq!(
+            inst.record.get_field("VAL"),
+            Some(EpicsValue::Long(0)),
+            "a scan must reset VAL to the do_sub status (0)"
+        );
+        assert!(
+            !posts_val(&snap),
+            "a scan that resets VAL to 0 must not re-post it"
+        );
+
+        // A second driven put + scan: the monitor marker stays at 0, so no
+        // scan ever re-posts the reset value.
+        inst.record.put_field("VAL", EpicsValue::Long(7)).unwrap();
+        let (snap, _) = inst.process_local().unwrap();
+        assert_eq!(inst.record.get_field("VAL"), Some(EpicsValue::Long(0)));
+        assert!(
+            !posts_val(&snap),
+            "repeated scans must not re-post the reset VAL"
         );
     }
 

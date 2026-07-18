@@ -47,9 +47,14 @@ the rest the proof is the decisive code path, quoted.
 
 | bucket | n |
 |---|---|
-| REPRODUCED (port carries the C bug on purpose) | 13 |
-| NOT-REPRODUCED (port refuses the C behaviour) | 18 |
+| REPRODUCED (port carries the C bug on purpose) | 12 |
+| NOT-REPRODUCED (port refuses the C behaviour) | 19 |
 | UNDECIDED | 0 |
+
+> Corrected 2026-07-18: CBUG-B25 moved REPRODUCED → NOT-REPRODUCED. The port was
+> flipped to divide-first (refuse) in `d8f27b88` on 2026-07-13, hours after this
+> catalogue was extracted, so the original REPRODUCED count was stale by that
+> evening; upstream then fixed it as ADCore #596 (merged 2026-07-16).
 
 | severity | n |
 |---|---|
@@ -93,7 +98,7 @@ proven defect (see "Leads rejected").
 | CBUG-B22 | ADCore | `NDPluginProcess` divides by `numFiltered` with `NumFilter == 0` | Medium | NOT-REPRODUCED |
 | CBUG-B23 | ADCore | `NDPluginProcess` AutoOffsetScale divides by `(max−min)` on a uniform frame | Medium | NOT-REPRODUCED |
 | CBUG-B24 | modbus | ASCII-serial LRC sums the LRC into itself and compares an undecoded byte | Medium | NOT-REPRODUCED |
-| CBUG-B25 | ADCore | `NDPluginTimeSeries` narrows the sum *before* dividing — integer averaging corrupted | Medium | REPRODUCED |
+| CBUG-B25 | ADCore | `NDPluginTimeSeries` narrows the sum *before* dividing — integer averaging corrupted | Medium | NOT-REPRODUCED (fixed upstream #596) |
 | CBUG-B26 | ADCore | `NDPluginStats` broadcasts an uninitialized `NDStats_t` on dark frames | High | NOT-REPRODUCED |
 | CBUG-B27 | ADCore | `NDPluginStats` histogram divides by `(histMax − histMin)` — `(int)NaN` UB | Medium | NOT-REPRODUCED |
 
@@ -125,11 +130,15 @@ GitHub PR state, not a claim about the catalogue.
 | CBUG-F11 | epics-modules/asyn **#235** | merged | `asynManager` traceIO truncate hang |
 | CBUG-G1 | epics-base/pvxs **#196** | open | QSRV2 `display.precision` |
 
-> **Classification conflict — CBUG-B25.** B25 is bucketed **REPRODUCED** (port
-> carries the bug on purpose) yet the C fix is filed and **merged** as ADCore
-> #596. Once #596 lands in a tagged release these two states are inconsistent:
-> re-bucket B25 to FIXED-UPSTREAM and drop the deliberate reproduction. Tracked,
-> not yet actioned.
+> **CBUG-B25 — reclassified 2026-07-18 (was: classification conflict).** The
+> catalogue extracted B25 as **REPRODUCED**, but that was stale within hours: the
+> port was changed to divide-first (refuse the bug) in `d8f27b88` on 2026-07-13,
+> so it has **not** carried the bug since. Upstream then fixed the same
+> parenthesis error as ADCore **#596** (merged 2026-07-16). B25 is therefore
+> **NOT-REPRODUCED** (port refuses) and upstream-agreeing — the port matched the
+> #596 fix three days before it landed. No port behaviour change is owed; only
+> the catalogue bucket and the `time_series_plugin.rs` comment framing were
+> corrected.
 
 **Filed upstream PRs with no catalogue CBUG entry yet (6):**
 
@@ -924,7 +933,7 @@ Proof: `:428 nRead = i` (i counts the LRC byte); `:429 computeLRC(data, nRead, �
 range.
 
 ### CBUG-B25: `NDPluginTimeSeries` truncates the accumulated sum to the narrow element type **before** dividing — integer averaging is corrupted
-Bucket: REPRODUCED · Severity: Medium
+Bucket: NOT-REPRODUCED (fixed upstream ADCore #596, merged 2026-07-16) · Severity: Medium
 C: `ADCore/ADApp/pluginSrc/NDPluginTimeSeries.cpp:191` (`doTimeSeriesT<epicsType>`) —
 `pTimeCircular[signal*numTimePoints_ + currentTimePoint_] =
 (epicsType)averageStore_[signal]/numAveraged_;`
@@ -934,9 +943,14 @@ accumulator holding the **sum** of `numAveraged_` samples; casting that sum to t
 element type truncates and wraps it *before* the division. The intended computation is
 `(epicsType)(averageStore_[signal] / numAveraged_)` — divide first, then narrow. The
 parentheses are simply in the wrong place.
-Port: `crates/ad-plugins-rs/src/time_series_plugin.rs:120-125` (`averaged_value`) —
-reproduces bug-for-bug and marks it parity-critical; the doc works the example
-`(u8)600 == 88`, then `88 / 3 == 29`.
+Port: `crates/ad-plugins-rs/src/time_series_plugin.rs` (`averaged_value`) — **refuses**
+the bug: `sum / num_averaged` divides *first*, then narrows, so an in-range mean
+narrows by an ordinary truncation. Changed to divide-first in `d8f27b88`
+(2026-07-13), which pre-dated the upstream fix; ADCore **#596** (merged
+2026-07-16) applies the same divide-then-narrow, so the port now matches current
+upstream C. (The 2026-07-13 catalogue extraction recorded this entry as
+REPRODUCED because the port still narrowed-before-dividing at extraction time,
+hours before `d8f27b88`; that classification was stale by that evening.)
 Impact: any integer-typed signal source with averaging enabled (`TSAveragingTime >
 TSTimePerPoint`, so `numAveraged_ > 1`) produces wrong averaged points whenever the running
 sum exceeds the element type's range — which it routinely does: three UInt8 samples of 200

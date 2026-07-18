@@ -15,13 +15,15 @@
 //! `SCAN="I/O Intr"`), so the per-signal waveforms are delivered by the callback
 //! push (C `doCallbacksFloat64Array`), not by a pull read.
 //!
-//! Integer-truncating averaging is the parity-critical detail: C computes the
-//! averaged point as `(epicsType)averageStore_[signal] / numAveraged_`
-//! (NDPluginTimeSeries.cpp:191) — the double *sum* is cast to the element type
-//! first (wrapping/truncating), then integer-divided in the element type's
-//! promoted domain. For e.g. `UInt8` inputs `200,200,200` with `numAverage == 3`
-//! the sum is `600`, `(u8)600 == 88`, and `88 / 3 == 29` — not the `200` a plain
-//! `f64` divide would give. [`averaged_value`] reproduces this deterministically.
+//! Integer averaging divides *before* narrowing (CBUG-B25). Pre-#596 C computed
+//! the averaged point as `(epicsType)averageStore_[signal] / numAveraged_`
+//! (NDPluginTimeSeries.cpp:191), where C++ precedence casts the double *sum* to
+//! the element type *first* (wrapping/truncating), then divides — so `UInt8`
+//! inputs `200,200,200` with `numAverage == 3` gave `(u8)600 == 88`, `88 / 3 ==
+//! 29` instead of `200`. That parenthesis bug was fixed upstream as ADCore #596
+//! (merged 2026-07-16). [`averaged_value`] divides first and then narrows, which
+//! this port has done since `d8f27b88` (2026-07-13) — it matches current
+//! upstream C and yields the correct `200`.
 //!
 //! Residual (documented, not a parity gap for the waveform records): C also fires
 //! `doCallbacksGenericPointer` downstream NDArrays — a 2-D array at `addr ==
@@ -113,8 +115,10 @@ fn sample_f64(data: &NDDataBuffer, idx: usize) -> f64 {
 /// samples, and the averaged point is that sum divided by the count, narrowed to
 /// the array's element type on its way into the `epicsType` circular buffer.
 ///
-/// **DEVIATION from C, deliberate — CBUG-B25.** C writes
-/// (`NDPluginTimeSeries.cpp:191`):
+/// **CBUG-B25 — now matches upstream.** This divide-first form was a deliberate
+/// deviation from pre-#596 C; ADCore #596 (merged 2026-07-16) applies the same
+/// divide-then-narrow, so the port and current upstream C now agree. C before
+/// #596 wrote (`NDPluginTimeSeries.cpp:191`):
 ///
 /// ```c
 /// pTimeCircular[signal*numTimePoints_ + currentTimePoint_] =

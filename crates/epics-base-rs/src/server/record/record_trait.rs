@@ -3428,6 +3428,36 @@ pub trait Record: Send + Sync + 'static {
     fn skips_forward_convert_when_undefined(&self) -> bool {
         false
     }
+
+    /// C `mbboRecord.c:210-221` / `mbboDirectRecord.c:190-202` — the same
+    /// `else if (prec->udf) goto CONTINUE` that skips the forward `convert()`
+    /// ALSO jumps past the pre-output `recGblGetTimeStampSimm` call. So a soft
+    /// (synchronous) mbbo/mbboDirect that is still UNDEFINED never stamps TIME
+    /// on the first-pass output stage: the only other stamp after `CONTINUE:`
+    /// is guarded by `if (pact)` (mbboRecord.c:256-258), which fires on
+    /// ASYNCHRONOUS completion re-entry only. A sync UDF record therefore keeps
+    /// TIME at the EPICS epoch ("never processed") until a VAL put clears UDF.
+    ///
+    /// Contrast ao/bo/longout/int64out/stringout: their `if (!pact)` block
+    /// calls `recGblGetTimeStampSimm` UNCONDITIONALLY (aoRecord.c:192,
+    /// boRecord.c:215), so they stamp even while undefined and do NOT opt in.
+    ///
+    /// The framework consults this at the synchronous output-stage stamp
+    /// (`processing.rs` `process_record_with_links_inner`, the pre-output
+    /// `apply_timestamp`): an opted-in record with `UDF != 0` skips that stamp,
+    /// mirroring C's `goto CONTINUE`. The async-completion stamp
+    /// (`complete_async_record_inner`) stays unconditional, matching C's
+    /// `if (pact)` re-stamp on async devices.
+    ///
+    /// This is a SEPARATE hook from [`Self::skips_forward_convert_when_undefined`]:
+    /// mbboDirect's VAL is bit-derived and does NOT opt into the convert-skip,
+    /// yet it DOES share this timestamp-skip. Do not conflate the two.
+    ///
+    /// Default `false`. Only mbbo/mbboDirect carry the `goto CONTINUE`
+    /// timestamp-skip in C; every other record stays opted out.
+    fn skips_timestamp_when_undefined(&self) -> bool {
+        false
+    }
 }
 
 /// The body of [`Record::put_field_internal`] — the framework's internal write

@@ -117,6 +117,21 @@ impl Record for MbboDirectRecord {
         self.skip_convert = did;
     }
 
+    /// C `mbboDirectRecord.c:190-202` — the `else if (prec->udf) goto CONTINUE`
+    /// skips the pre-output `recGblGetTimeStampSimm` (mbboDirectRecord.c:202);
+    /// the only post-`CONTINUE:` stamp is `if (pact)`-guarded
+    /// (mbboDirectRecord.c:234-236), so a soft (sync) UDF mbboDirect never
+    /// stamps TIME — it stays at the EPICS epoch until VAL is defined. Opts
+    /// mbboDirect into the framework's undefined timestamp-skip.
+    ///
+    /// NOTE: unlike mbbo, mbboDirect does NOT override
+    /// `skips_forward_convert_when_undefined` (its VAL is bit-derived, so the
+    /// convert is not suppressed). The timestamp-skip is a SEPARATE hook; the
+    /// two are not tied together.
+    fn skips_timestamp_when_undefined(&self) -> bool {
+        true
+    }
+
     /// Device readback (`asyn:READBACK` / SCAN="I/O Intr" / init seed): store
     /// the raw and set VAL to the shifted masked value, mirroring C
     /// `processMbboDirect`/`initMbboDirect` (devAsynUInt32Digital.c:1084-1090,

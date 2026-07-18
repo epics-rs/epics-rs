@@ -3012,8 +3012,19 @@ impl PvDatabase {
             // this cycle's VAL monitor carries the record's pre-update
             // timestamp; the deferred restamp after the forward-link tail
             // advances TIME for the BUSY post and the next cycle.
+            //
+            // mbbo/mbboDirect are a second exception: C `mbboRecord.c:210-221`
+            // takes `else if (prec->udf) goto CONTINUE`, jumping PAST this
+            // pre-output `recGblGetTimeStampSimm`. So a soft (sync) UDF
+            // mbbo/mbboDirect never stamps here; TIME stays at the epoch until
+            // VAL is defined. Only the SYNC first-pass stamp is skipped — the
+            // async-completion re-entry (`complete_async_record_inner`) stamps
+            // unconditionally, matching C's `if (pact)` re-stamp
+            // (mbboRecord.c:256-258).
             let restamps_after = instance.record.restamps_time_after_completion();
-            if !restamps_after {
+            let skips_ts_undef =
+                instance.record.skips_timestamp_when_undefined() && instance.common.udf != 0;
+            if !restamps_after && !skips_ts_undef {
                 apply_timestamp(&mut instance.common, is_soft);
             }
             // NOTE: UDF was already updated before `evaluate_alarms`

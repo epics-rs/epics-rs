@@ -88,4 +88,18 @@ pub const TARGETS: &[Target] = &[
         bpt_out_file: None,
         base_path: "epics_base_rs",
     },
+    Target {
+        // asyn's STANDARD device support. Unlike every other target, asyn
+        // declares NO `recordtype(...)` — it only adds `device(...)` lines to
+        // base's record types (`ai`, `mbbo`, `waveform`, ...). The emitter keys
+        // its device menus by the `device()` record name, so it emits a
+        // `device_menu()` for those types anyway; base merges that menu into the
+        // `DTYP` choice list at serve time (`register_device_menu`). This is what
+        // gives a client the asyn DTYPs a C fat softIoc lists after loading
+        // `asyn.dbd`.
+        dbd_dir: "crates/asyn-rs/dbd",
+        out_file: "crates/asyn-rs/src/dbd_generated.rs",
+        bpt_out_file: None,
+        base_path: "epics_base_rs",
+    },
 ];

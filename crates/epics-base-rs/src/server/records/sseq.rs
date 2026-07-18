@@ -1197,6 +1197,15 @@ impl Record for SseqRecord {
         }
     }
 
+    /// C `sseqRecord.c::asyncFinish` posts VAL (`:474`) and runs
+    /// `recGblFwdLink` (`:499`) BEFORE `recGblGetTimeStamp` (`:501`), so the
+    /// first VAL monitor event carries the record's pre-update timestamp and
+    /// TIME advances only for the following BUSY post and the next cycle. The
+    /// framework `Complete` tail defers the restamp accordingly.
+    fn restamps_time_after_completion(&self) -> bool {
+        true
+    }
+
     fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
         if !after {
             return Ok(());

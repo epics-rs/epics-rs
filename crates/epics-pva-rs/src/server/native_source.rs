@@ -438,13 +438,20 @@ fn build_alarm(snap: &Snapshot) -> PvField {
         "status".into(),
         PvField::Scalar(ScalarValue::Int(alarm_status_class(snap.alarm.status))),
     ));
-    // pvxs `iocsource.cpp:226,236`: `alarm.message` is the alarm
-    // condition string for a non-zero status, "" when NO_ALARM. The
-    // amsg-preference path (DBR_AMSG → `meta.amsg`) is not reproduced
-    // here because `AlarmInfo`/`Snapshot` does not carry the record's
-    // explicit amsg — plumbing `CommonFields.amsg` through the snapshot
-    // builders is a separate base-rs change (see UNFIXED note).
-    let message = if snap.alarm.status == alarm_status::NO_ALARM {
+    // pvxs `iocsource.cpp:230-236`, exactly:
+    //     if((options & DBR_AMSG) && meta.amsg[0])
+    //         node["alarm.message"] = meta.amsg;
+    //     else
+    //         node["alarm.message"] = meta.status && stsmsg ? stsmsg : "";
+    // A non-empty carried amsg (the record's `common.amsg`) wins; else the
+    // alarm condition string for a non-zero status; else "". Only
+    // mbboDirect sets a UDF amsg ("UDFS", `mbboDirectRecord.c:191`); every
+    // other record raises UDF via plain `recGblSetSevr` (empty namsg), so
+    // its empty amsg falls through here to the "UDF" condition string —
+    // which is what pvxs serves for those records too.
+    let message = if !snap.alarm.amsg.is_empty() {
+        snap.alarm.amsg.clone()
+    } else if snap.alarm.status == alarm_status::NO_ALARM {
         String::new()
     } else {
         alarm_condition_string(snap.alarm.status).to_string()
@@ -1813,6 +1820,47 @@ mod tests {
             scalar(&a, "message"),
             ScalarValue::String(s) if s.is_empty()
         ));
+    }
+
+    #[test]
+    fn build_alarm_prefers_carried_amsg_over_condition_string() {
+        // pvxs `iocsource.cpp:230-236`: a non-empty carried amsg wins over
+        // the synthesized condition string. mbboDirect raises UDF with the
+        // bespoke "UDFS" (`mbboDirectRecord.c:191`), so an undefined
+        // mbboDirect serves alarm.message = "UDFS", NOT the "UDF" condition.
+        let mut snap = Snapshot::new(EpicsValue::Enum(0), 0, 0, std::time::UNIX_EPOCH);
+        snap.alarm.status = alarm_status::UDF_ALARM;
+        snap.alarm.severity = 3;
+        snap.alarm.amsg = "UDFS".to_string();
+        let PvField::Structure(a) = build_alarm(&snap) else {
+            panic!("alarm must be a structure");
+        };
+        assert!(
+            matches!(scalar(&a, "message"), ScalarValue::String(s) if s == "UDFS"),
+            "non-empty carried amsg must win over the UDF condition string"
+        );
+
+        // Empty amsg with a non-zero status falls back to the condition
+        // string — how every non-mbboDirect UDF record (empty namsg from
+        // plain recGblSetSevr) serves "UDF".
+        let mut generic = Snapshot::new(EpicsValue::Double(0.0), 0, 0, std::time::UNIX_EPOCH);
+        generic.alarm.status = alarm_status::UDF_ALARM;
+        generic.alarm.severity = 3;
+        assert!(generic.alarm.amsg.is_empty());
+        let PvField::Structure(a) = build_alarm(&generic) else {
+            panic!("alarm must be a structure");
+        };
+        assert!(
+            matches!(scalar(&a, "message"), ScalarValue::String(s) if s == "UDF"),
+            "empty amsg must fall back to the condition string"
+        );
+
+        // Empty amsg with NO_ALARM stays "".
+        let ok = Snapshot::new(EpicsValue::Double(1.0), 0, 0, std::time::UNIX_EPOCH);
+        let PvField::Structure(a) = build_alarm(&ok) else {
+            panic!("alarm must be a structure");
+        };
+        assert!(matches!(scalar(&a, "message"), ScalarValue::String(s) if s.is_empty()));
     }
 
     #[test]

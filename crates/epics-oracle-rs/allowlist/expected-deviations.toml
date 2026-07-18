@@ -4,15 +4,38 @@
 # Under the product policy adopted 2026-07-13 (doc/strategy-2026-07-13.md §2),
 # "C's bugs are not the contract. Clean is the goal." So a difference between
 # the C softIoc and the Rust port is NOT automatically a port bug. It is one of
-# exactly two things:
+# these things:
 #
-#   * a deliberate refusal to reproduce a C defect  -> EXPECTED DEVIATION
-#   * anything else                                 -> PORT DEFECT
+#   * a deliberate refusal to reproduce a C defect     -> EXPECTED DEVIATION
+#   * an intentional port DESIGN divergence            -> EXPECTED DEVIATION
+#   * a ground-truth INSTRUMENT superset artifact      -> EXPECTED DEVIATION
+#   * anything else                                     -> PORT DEFECT
 #
-# The allowlist IS doc/upstream-c-bugs.md. Every row below is a NOT-REPRODUCED
-# entry from that catalogue, transcribed into a machine-matchable rule with the
-# CBUG id that justifies it. This file holds no judgement of its own: if a row
-# here is not backed by a NOT-REPRODUCED entry there, the row is wrong.
+# THREE JUSTIFICATION BASES, FOUR BUCKETS
+# Most rows are C-bug refusals: for these the allowlist IS doc/upstream-c-bugs.md.
+# Each NOT-REPRODUCED (or, disabled, REPRODUCED) row transcribes an entry from
+# that catalogue and MUST cite the CBUG id that justifies it; if such a row is
+# not backed by an entry there, the row is wrong.
+#
+# A DESIGN-DIVERGENCE row is different in kind: it records an INTENTIONAL port
+# design choice that is neither a C-bug refusal nor a defect (e.g. lifting a
+# fixed-capacity buffer cap and serving live length). The port deliberately does
+# something other than the spec.
+#
+# An INSTRUMENT-SUPERSET row is the OPPOSITE direction: the port matches the
+# measured spec, but the PVA ground-truth INSTRUMENT exceeds it. softIocPVX loads
+# softIocPVX.dbd, a superset of the oracle's measured softIoc.dbd, so it serves
+# extra menu choices (pvxs's own example device support) the shared spec never
+# declares. The port is not pvxs and correctly serves the measured spec; the
+# difference is the instrument's, not the port's.
+#
+# Both DESIGN-DIVERGENCE and INSTRUMENT-SUPERSET are justified by their `why` —
+# the rationale stated in place — and cite NO CBUG. The CBUG requirement is
+# relaxed for these two buckets only; every row still needs a non-empty, unique
+# `id` (it keys the fired/stale ledger) and a non-empty `why`. Buckets are
+# validated at load (allowlist.rs::parse); an unknown bucket string is a parse
+# error, not a silent wildcard. All four buckets match, fire, and go stale by the
+# same rules — the bucket changes only what justifies a row.
 #
 # SELF-CHECKING, IN BOTH DIRECTIONS
 #   * a diff that matches a row      -> reported as EXPECTED DEVIATION, not a failure
@@ -153,6 +176,114 @@ not laundered.
 
 Expect: on these types' numeric fields, the port's pvxget (and monitor seed) marks
 display.precision and softIocPVX does not; the two renderings are otherwise identical.
+"""
+
+# --------------------------------------------------------------------------
+# DESIGN-DIVERGENCE entries: intentional port design choices, justified by the
+# `why` in place rather than by a CBUG. These match/fire/go-stale like any other
+# row; they simply cite no upstream-bug catalogue entry.
+# --------------------------------------------------------------------------
+
+[[deviation]]
+id = "DESIGN-ASYN-BOUT"
+bucket = "DESIGN-DIVERGENCE"
+upstream = "asyn / asynRecord"
+record_types = ["asyn"]
+fields = ["BOUT"]
+surface = ["value_marking"]
+why = """
+asynRecord.dbd declares BOUT as DBF_CHAR special(SPC_DBADDR), a byte array whose
+capacity C fixes at OMAX (initial 80) and whose write length is NOWT (initial
+80). On a C IOC the field is a pre-sized 80-element buffer, so QSRV2 serves it
+zero-filled at init: pvxget reads back epicsInt8_t[80] = {0,0,...} before
+anything is written. The port declines to pre-size: it lifts the fixed 80-byte
+OMAX cap and serves the ACTUAL written content, so an unwritten BOUT reads back
+as an empty epicsInt8_t[0]. This is an intentional design choice, not a C-bug
+refusal and not a port defect — the 80-element cap was a static asynRecord.dbd
+sizing detail, and the port models the field as a live-length array instead.
+There is no CBUG here: nothing on the C side is wrong, the two just made
+different, defensible sizing decisions.
+
+Matched on the PVA value/marking contract (pvxget), scoped to exactly asyn.BOUT.
+The scope is field-level, so this row justifies only the BOUT length/content
+difference and cannot launder a diff on any other asyn channel.
+
+Expect: on ORACLE:ASYN.BOUT the C softIocPVX serves int8[]{80} (zero-filled to
+the OMAX cap) and the port serves int8[]{0} (empty until written).
+"""
+
+# --------------------------------------------------------------------------
+# INSTRUMENT-SUPERSET entries: the PVA ground truth (softIocPVX) loads
+# softIocPVX.dbd, a superset of the oracle's measured softIoc.dbd. softIocPVX.dbd
+# additionally links pvxs's OWN example device support (pvxs/ioc/pvxs7x.dbd and
+# pvxs3x.dbd):
+#     device(waveform, CONSTANT, devWfPDBQ2Demo,  "QSRV2 Demo")
+#     device(longin,   CONSTANT, devLoPDBQ2UTag,  "QSRV2 Set UTag")
+# Those device()s add a DTYP menu choice on the INSTRUMENT that the shared spec
+# never declares. The port is not pvxs, has no devWfPDBQ2Demo/devLoPDBQ2UTag, and
+# correctly serves the measured spec's DTYP menu — which is why the CA --phase all
+# run agrees on these same channels (CA reads softIoc.dbd, not the pvxs superset).
+# These rows use the symmetric `ground_truth_adds_choices` content constraint: a
+# case matches ONLY when the sole value_marking difference is the ground truth
+# carrying EXACTLY the named extra choice on one leaf, nothing else changed or
+# removed. Any other DTYP marking difference stays a DEFECT.
+# --------------------------------------------------------------------------
+
+[[deviation]]
+id = "INSTR-QSRV2-LONGIN-UTAG"
+bucket = "INSTRUMENT-SUPERSET"
+upstream = "pvxs / QSRV2 example device support"
+record_types = ["longin"]
+fields = ["DTYP"]
+surface = ["value_marking"]
+ground_truth_adds_choices = ["QSRV2 Set UTag"]
+why = """
+softIocPVX.dbd (the PVA ground truth) is a superset of the oracle's measured
+softIoc.dbd. It links pvxs's example device support from pvxs/ioc/pvxs7x.dbd
+(also pvxs3x.dbd): `device(longin, CONSTANT, devLoPDBQ2UTag, "QSRV2 Set UTag")`.
+So softIocPVX's longin.DTYP menu carries an extra "QSRV2 Set UTag" choice that
+softIoc.dbd — the shared spec both CA and the port measure — does not declare.
+The port has no devLoPDBQ2UTag device support and correctly serves the measured
+menu, so its longin.DTYP value.choices omits that one choice. This is a ground-
+truth instrument-superset artifact, not a port defect: the CA --phase all run
+agrees on longin.DTYP (CA reads the shared spec, not the pvxs superset).
+
+Content-constrained (ground_truth_adds_choices): matches ONLY when the sole
+value_marking difference is the ground truth's value.choices carrying exactly the
+extra "QSRV2 Set UTag" and every other leaf identical. Any other longin.DTYP
+marking difference stays a DEFECT. On this branch (before the separate asyn DTYP
+menu fix) the port also omits the asyn menu choices, so the extra set is larger
+than the named one and this row does NOT yet fire; it fires once that fix lands
+and the QSRV2 choice is the sole residual.
+
+Expect: softIocPVX serves longin.DTYP value.choices including "QSRV2 Set UTag";
+the port serves the same menu minus that one instrument-only choice.
+"""
+
+[[deviation]]
+id = "INSTR-QSRV2-WAVEFORM-DEMO"
+bucket = "INSTRUMENT-SUPERSET"
+upstream = "pvxs / QSRV2 example device support"
+record_types = ["waveform"]
+fields = ["DTYP"]
+surface = ["value_marking"]
+ground_truth_adds_choices = ["QSRV2 Demo"]
+why = """
+As INSTR-QSRV2-LONGIN-UTAG, for waveform: softIocPVX.dbd links pvxs's example
+device support `device(waveform, CONSTANT, devWfPDBQ2Demo, "QSRV2 Demo")` from
+pvxs/ioc/pvxs7x.dbd (also pvxs3x.dbd). softIocPVX's waveform.DTYP menu carries an
+extra "QSRV2 Demo" choice the shared softIoc.dbd never declares; the port, having
+no devWfPDBQ2Demo, serves the measured menu without it. Ground-truth instrument-
+superset artifact, not a port defect — CA --phase all agrees on waveform.DTYP.
+
+Content-constrained (ground_truth_adds_choices): matches ONLY when the sole
+value_marking difference is the ground truth's value.choices carrying exactly the
+extra "QSRV2 Demo" and every other leaf identical. Any other waveform.DTYP
+marking difference stays a DEFECT. Same branch note as the longin row: fires once
+the separate asyn DTYP menu fix lands and "QSRV2 Demo" is the sole residual.
+
+Expect: softIocPVX serves waveform.DTYP value.choices including "QSRV2 Demo"; the
+port serves the same menu minus that one instrument-only choice.
 """
 
 # --------------------------------------------------------------------------

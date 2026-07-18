@@ -2246,6 +2246,7 @@ impl PvDatabase {
             process_actions,
             alarm_posts,
             result_is_defer_output,
+            restamps_after,
             continuation_pact_exit,
         ) = 'epilogue: {
             let mut instance = rec.write().await;
@@ -3003,7 +3004,29 @@ impl PvDatabase {
             // Apply timestamp based on TSE. BEFORE the output stage: C
             // `aoRecord.c:190` stamps the record before `writeValue` "so it
             // will be up to date if any downstream records fetch it via TSEL".
-            apply_timestamp(&mut instance.common, is_soft);
+            //
+            // A `restamps_time_after_completion` record (sseq) restamps at the
+            // very END of its completion instead — C `sseqRecord.c::asyncFinish`
+            // posts VAL (`:474`) and runs `recGblFwdLink` (`:499`) BEFORE
+            // `recGblGetTimeStamp` (`:501`). Skip the pre-output restamp here so
+            // this cycle's VAL monitor carries the record's pre-update
+            // timestamp; the deferred restamp after the forward-link tail
+            // advances TIME for the BUSY post and the next cycle.
+            //
+            // mbbo/mbboDirect are a second exception: C `mbboRecord.c:210-221`
+            // takes `else if (prec->udf) goto CONTINUE`, jumping PAST this
+            // pre-output `recGblGetTimeStampSimm`. So a soft (sync) UDF
+            // mbbo/mbboDirect never stamps here; TIME stays at the epoch until
+            // VAL is defined. Only the SYNC first-pass stamp is skipped — the
+            // async-completion re-entry (`complete_async_record_inner`) stamps
+            // unconditionally, matching C's `if (pact)` re-stamp
+            // (mbboRecord.c:256-258).
+            let restamps_after = instance.record.restamps_time_after_completion();
+            let skips_ts_undef =
+                instance.record.skips_timestamp_when_undefined() && instance.common.udf != 0;
+            if !restamps_after && !skips_ts_undef {
+                apply_timestamp(&mut instance.common, is_soft);
+            }
             // NOTE: UDF was already updated before `evaluate_alarms`
             // above — keyed on `value_is_undefined()` so a NaN result
             // keeps UDF true and UDF_ALARM is raised this cycle. Do
@@ -3035,6 +3058,7 @@ impl PvDatabase {
                     Vec::new(),
                     alarm_posts,
                     false,
+                    restamps_after,
                     continuation_pact_exit,
                 );
             }
@@ -3491,6 +3515,7 @@ impl PvDatabase {
                 process_actions,
                 alarm_posts,
                 result_is_defer_output,
+                restamps_after,
                 continuation_pact_exit,
             )
         };
@@ -3573,6 +3598,19 @@ impl PvDatabase {
                 depth,
             )
             .await;
+        }
+
+        // Deferred restamp for a `restamps_time_after_completion` record (sseq):
+        // C `sseqRecord.c::asyncFinish` calls `recGblGetTimeStamp` (`:501`)
+        // AFTER the VAL post (`:474`) and `recGblFwdLink` (`:499`). The VAL
+        // monitor + forward link above therefore carried the record's
+        // pre-update timestamp; restamp now so TIME advances for the following
+        // BUSY post (sseq's out-of-band `post_fields`) and the next cycle. Soft
+        // record (no device support), so `apply_timestamp` resolves TSE→TIME
+        // the same as the pre-output site it replaces.
+        if restamps_after {
+            let mut instance = rec.write().await;
+            apply_timestamp(&mut instance.common, /* is_soft */ true);
         }
 
         // 8. Execute the deferred ProcessActions after the FLNK tail:

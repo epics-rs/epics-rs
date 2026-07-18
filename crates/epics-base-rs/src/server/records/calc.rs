@@ -1127,11 +1127,14 @@ impl Record for CalcRecord {
     /// stale flag used to re-raise CALC_ALARM on every gated cycle.
     fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
         if std::mem::take(&mut self.calc_alarm) {
-            crate::server::recgbl::rec_gbl_set_sevr_msg(
+            // C `calcRecord.c:122` uses PLAIN `recGblSetSevr(prec, CALC_ALARM,
+            // INVALID_ALARM)` — a NULL message (empty namsg). PVA then serves
+            // the "CALC" condition string (iocsource.cpp:230-236), which is
+            // exactly what pvxs QSRV2 serves. No fabricated amsg literal.
+            crate::server::recgbl::rec_gbl_set_sevr(
                 common,
                 crate::server::recgbl::alarm_status::CALC_ALARM,
                 crate::server::record::AlarmSeverity::Invalid,
-                "CALC expression evaluation failed",
             );
         }
     }

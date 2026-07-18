@@ -983,11 +983,13 @@ impl Record for ScalcoutRecord {
             return;
         }
         if std::mem::take(&mut self.calc_alarm) {
-            crate::server::recgbl::rec_gbl_set_sevr_msg(
+            // C `sCalcoutRecord.c:364,774` use PLAIN `recGblSetSevr(pcalc,
+            // CALC_ALARM, INVALID_ALARM)` — NULL message (empty namsg); PVA
+            // falls back to the "CALC" condition string. No fabricated literal.
+            crate::server::recgbl::rec_gbl_set_sevr(
                 common,
                 crate::server::recgbl::alarm_status::CALC_ALARM,
                 crate::server::record::AlarmSeverity::Invalid,
-                "CALC expression evaluation failed",
             );
             // C's failed-calc branch leaves `udf` untouched, so a `caput UDF
             // <byte>` before a failing cycle keeps its raw byte — byte fidelity.

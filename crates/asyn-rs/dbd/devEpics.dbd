@@ -1,0 +1,118 @@
+# Standard asyn device support — the `device(...)` lines a C `softIoc` gets by
+# loading `asyn.dbd` (which pulls in `devEpics.dbd`). These are what C's
+# `dbDeviceMenu` enumerates for each record type's `DTYP` field; the Rust port
+# registers the same list into base at runtime (base must not depend on
+# asyn-rs), so a client reading e.g. `mbbo.DTYP` sees the asyn choices a C IOC
+# lists.
+#
+# Vendored from epics-modules/asyn `asyn/devEpics/*.dbd`, FLATTENED in the exact
+# order `asyn/O.Common/devEpics.dbd` includes them. The DTYP index is
+# wire-visible (it IS the value of the DTYP field), so this order is not
+# cosmetic — it is the order a C IOC assigns. `dbd-codegen` reads files in one
+# directory and does not expand `include`, so the include set is inlined here
+# in one file rather than split, which is what keeps the cross-file order fixed.
+#
+# EXCLUDED, deliberately:
+#   * `devAsynRecord.dbd` — `device(asyn,INST_IO,...,"asynRecordDevice")`, the
+#     asyn RECORD's own device support. The `asyn` record type is declared by
+#     base's `.dbd`, which already carries that one-entry menu; contributing it
+#     again would double it.
+#   * `asynCalc.dbd` — not included by `devEpics.dbd`; needs the calc module and
+#     is not part of the standard asyn device support a plain `asyn.dbd` loads.
+#   * GPIB test devices (`"GPIB Test"`, `devXxxTestGpib`) and `_NAME_` template
+#     macros — not loaded by the fat softIoc.
+
+# --- devAsynOctet.dbd ---
+device(stringin,INST_IO,asynSiOctetCmdResponse,"asynOctetCmdResponse")
+device(stringin,INST_IO,asynSiOctetWriteRead,"asynOctetWriteRead")
+device(stringin,INST_IO,asynSiOctetRead,"asynOctetRead")
+device(stringout,INST_IO,asynSoOctetWrite,"asynOctetWrite")
+device(waveform,INST_IO,asynWfOctetCmdResponse,"asynOctetCmdResponse")
+device(waveform,INST_IO,asynWfOctetWriteRead,"asynOctetWriteRead")
+device(waveform,INST_IO,asynWfOctetRead,"asynOctetRead")
+device(waveform,INST_IO,asynWfOctetWrite,"asynOctetWrite")
+device(waveform,INST_IO,asynWfOctetWriteBinary,"asynOctetWriteBinary")
+
+# --- devAsynInt32.dbd ---
+device(ai,INST_IO,asynAiInt32,"asynInt32")
+device(ai,INST_IO,asynAiInt32Average,"asynInt32Average")
+device(ao,INST_IO,asynAoInt32,"asynInt32")
+device(bi,INST_IO,asynBiInt32,"asynInt32")
+device(bo,INST_IO,asynBoInt32,"asynInt32")
+device(mbbi,INST_IO,asynMbbiInt32,"asynInt32")
+device(mbbo,INST_IO,asynMbboInt32,"asynInt32")
+device(longin,INST_IO,asynLiInt32,"asynInt32")
+device(longout,INST_IO,asynLoInt32,"asynInt32")
+
+# --- devAsynXXXArray.dbd ---
+device(waveform, INST_IO, asynInt8ArrayWfIn,    "asynInt8ArrayIn")
+device(waveform, INST_IO, asynInt8ArrayWfOut,   "asynInt8ArrayOut")
+device(aai,      INST_IO, asynInt8ArrayAai,     "asynInt8ArrayIn")
+device(aao,      INST_IO, asynInt8ArrayAao,     "asynInt8ArrayOut")
+
+device(waveform, INST_IO, asynInt16ArrayWfIn,    "asynInt16ArrayIn")
+device(waveform, INST_IO, asynInt16ArrayWfOut,   "asynInt16ArrayOut")
+device(aai,      INST_IO, asynInt16ArrayAai,     "asynInt16ArrayIn")
+device(aao,      INST_IO, asynInt16ArrayAao,     "asynInt16ArrayOut")
+
+device(waveform, INST_IO, asynInt32ArrayWfIn,    "asynInt32ArrayIn")
+device(waveform, INST_IO, asynInt32ArrayWfOut,   "asynInt32ArrayOut")
+device(aai,      INST_IO, asynInt32ArrayAai,     "asynInt32ArrayIn")
+device(aao,      INST_IO, asynInt32ArrayAao,     "asynInt32ArrayOut")
+
+device(waveform, INST_IO, asynFloat32ArrayWfIn,  "asynFloat32ArrayIn")
+device(waveform, INST_IO, asynFloat32ArrayWfOut, "asynFloat32ArrayOut")
+device(aai,      INST_IO, asynFloat32ArrayAai,   "asynFloat32ArrayIn")
+device(aao,      INST_IO, asynFloat32ArrayAao,   "asynFloat32ArrayOut")
+
+device(waveform, INST_IO, asynFloat64ArrayWfIn,  "asynFloat64ArrayIn")
+device(waveform, INST_IO, asynFloat64ArrayWfOut, "asynFloat64ArrayOut")
+device(aai,      INST_IO, asynFloat64ArrayAai,   "asynFloat64ArrayIn")
+device(aao,      INST_IO, asynFloat64ArrayAao,   "asynFloat64ArrayOut")
+
+# --- devAsynInt32TimeSeries.dbd ---
+device(waveform,INST_IO,asynInt32TimeSeries,"asynInt32TimeSeries")
+
+# --- devAsynUInt32Digital.dbd ---
+device(bi,INST_IO,asynBiUInt32Digital,"asynUInt32Digital")
+device(bo,INST_IO,asynBoUInt32Digital,"asynUInt32Digital")
+device(longin,INST_IO,asynLiUInt32Digital,"asynUInt32Digital")
+device(longout,INST_IO,asynLoUInt32Digital,"asynUInt32Digital")
+device(mbbi,INST_IO,asynMbbiUInt32Digital,"asynUInt32Digital")
+device(mbbo,INST_IO,asynMbboUInt32Digital,"asynUInt32Digital")
+device(mbbiDirect,INST_IO,asynMbbiDirectUInt32Digital,"asynUInt32Digital")
+device(mbboDirect,INST_IO,asynMbboDirectUInt32Digital,"asynUInt32Digital")
+
+# --- devAsynFloat64.dbd ---
+device(ai,INST_IO,asynAiFloat64,"asynFloat64")
+device(ai,INST_IO,asynAiFloat64Average,"asynFloat64Average")
+device(ao,INST_IO,asynAoFloat64,"asynFloat64")
+
+# --- devAsynFloat64TimeSeries.dbd ---
+device(waveform,INST_IO,asynFloat64TimeSeries,"asynFloat64TimeSeries")
+
+# --- devAsynOctetLs.dbd ---
+device(lsi,INST_IO,asynLsiOctetCmdResponse,"asynOctetCmdResponse")
+device(lsi,INST_IO,asynLsiOctetWriteRead,"asynOctetWriteRead")
+device(lsi,INST_IO,asynLsiOctetRead,"asynOctetRead")
+device(lso,INST_IO,asynLsoOctetWrite,"asynOctetWrite")
+device(printf,INST_IO,asynPfOctetWrite,"asynOctetWrite")
+
+# --- devAsynInt64.dbd ---
+device(int64in,INST_IO,asynInt64In,"asynInt64")
+device(int64out,INST_IO,asynInt64Out,"asynInt64")
+
+# --- devAsynInt64Array.dbd ---
+device(waveform, INST_IO, asynInt64ArrayWfIn,  "asynInt64ArrayIn")
+device(waveform, INST_IO, asynInt64ArrayWfOut, "asynInt64ArrayOut")
+device(aai,      INST_IO, asynInt64ArrayAai,   "asynInt64ArrayIn")
+device(aao,      INST_IO, asynInt64ArrayAao,   "asynInt64ArrayOut")
+
+# --- devAsynInt64TimeSeries.dbd ---
+device(waveform,INST_IO,asynInt64TimeSeries,"asynInt64TimeSeries")
+
+# --- devAsynInt64Misc.dbd ---
+device(longin,INST_IO,asynLiInt64,"asynInt64")
+device(longout,INST_IO,asynLoInt64,"asynInt64")
+device(ai,INST_IO,asynAiInt64,"asynInt64")
+device(ao,INST_IO,asynAoInt64,"asynInt64")

@@ -1331,13 +1331,33 @@ impl RecordInstance {
     /// `record(calc,"X"){}` — whose record type has no `device()` line — served
     /// `value.choices = {0}[]` where QSRV2 omits the leaf entirely.
     pub(crate) fn device_choices(&self) -> Option<Vec<PvString>> {
-        let declared = super::dbd_generated::device_menu(self.record.record_type())?;
-        let mut slots: Vec<PvString> = declared.iter().map(|c| PvString::from(*c)).collect();
-        let dtyp = self.common.dtyp.as_str();
-        if !dtyp.is_empty() && !declared.contains(&dtyp) {
-            slots.push(PvString::from(dtyp));
+        let record_type = self.record.record_type();
+        // Base's build-time menu (`epics-base-rs/dbd`), then the menus a
+        // downstream crate whose device support has no vendored `device()` line
+        // registered at runtime (asyn's `asynInt32`, `asynFloat64`, ...). C's
+        // `dbDeviceMenu` is the concatenation of every `device()` the loaded
+        // `.dbd` set declares, in load order — base first, then asyn — so the
+        // merge appends the contributed choices AFTER the declared ones.
+        let declared = super::dbd_generated::device_menu(record_type);
+        let contributed = super::contributed_device_menu(record_type);
+        // The C None-vs-empty distinction (`dbAccess.c:176-179` vs `:205`): the
+        // menu is present iff the loaded `.dbd` set declares ANY `device()` for
+        // this type. A type base declares none for but asyn does (structurally
+        // possible, though none of asyn's are such) is therefore present, not
+        // None; a type neither declares for (calc) stays None.
+        if declared.is_none() && contributed.is_empty() {
+            return None;
         }
-        Some(slots)
+        let mut names: Vec<&str> = Vec::new();
+        if let Some(declared) = declared {
+            names.extend_from_slice(declared);
+        }
+        names.extend(contributed.iter().copied());
+        let dtyp = self.common.dtyp.as_str();
+        if !dtyp.is_empty() && !names.contains(&dtyp) {
+            names.push(dtyp);
+        }
+        Some(names.iter().map(|c| PvString::from(*c)).collect())
     }
 
     /// C `dbPutFieldLink`'s link-type gate (`dbAccess.c:1125-1137`): a link
@@ -1648,6 +1668,12 @@ impl RecordInstance {
         // pvxs `if(info.nsecMask) utag = meta.time.nsec & info.nsecMask;`
         // (:247).
         snap.user_tag = self.common.utag as i32;
+        // Carry the record's committed alarm message (`common.amsg`) so a
+        // PVA read serves `alarm.message` from the record's own amsg
+        // (pvxs `iocsource.cpp:230-236` prefers `meta.amsg`) rather than a
+        // string re-synthesized from the condition code. Empty for records
+        // that raise no message (C's plain `recGblSetSevr` clears namsg).
+        snap.alarm.amsg = self.common.amsg.clone();
 
         // Pull display/control/enums from the metadata cache (build on
         // first call, hit thereafter until invalidated by a metadata-class
@@ -3066,7 +3092,11 @@ impl RecordInstance {
         // the `if (prec->udf) recGblSetSevr(..., UDF_ALARM, ...)` guard. C has
         // no central UDF alarm; see `Record::raises_udf_alarm`.
         if self.record.raises_udf_alarm() {
-            recgbl::rec_gbl_check_udf(&mut self.common, self.record.udf_alarm_on_exact_one());
+            recgbl::rec_gbl_check_udf(
+                &mut self.common,
+                self.record.udf_alarm_on_exact_one(),
+                self.record.udf_alarm_message(),
+            );
         }
 
         // The analog-alarm SLOT is the enumeration — a record has the ladder iff
@@ -3311,8 +3341,38 @@ impl RecordInstance {
         // Clone the Arc so the borrow on `self.subroutine` is released
         // before we mutate `self.record` / `self.common` below.
         let Some(sub_fn) = self.subroutine.clone() else {
-            // C `do_sub` with no bound routine returns `S_db_BadSub`
-            // (aSubRecord.c:255-258), so the cycle's status is non-zero.
+            // C `do_sub` (aSubRecord.c:459-465, subRecord.c:118-123)
+            // short-circuits an EMPTY SNAM to `return 0` BEFORE the
+            // `pfunc == NULL` -> `S_db_BadSub` check: a subroutine record with
+            // no SNAM is not a bad-sub, it is a no-op that completes with
+            // status 0. Only a NON-empty, unregistered SNAM yields
+            // `S_db_BadSub`.
+            //
+            // aSub depends on this: C `process` (aSubRecord.c:224) runs
+            // `prec->val = status` (= 0) every cycle, forcing VAL back to 0.
+            // C `monitor()` (aSubRecord.c:414) posts VAL only on
+            // `val != oval`, so with val==oval==0 a periodic (SCAN) cycle
+            // posts nothing — the driven `dbPut`s are the only VAL events.
+            // Without the reset the port leaves VAL holding the last client
+            // put, and the deadband gate re-posts it on every scan (the aSub
+            // scanned monitor over-posts: 7 updates where C posts 4). `sub`
+            // never reaches here with an empty SNAM — it parks PACT at init
+            // (`Record::init_record_parks_pact`, subRecord.c:119-123) and does
+            // not process — so the VAL write is scoped to aSub, whose VAL is
+            // the do_sub status.
+            let snam_empty = matches!(
+                self.record.get_field("SNAM"),
+                Some(EpicsValue::String(s)) if s.is_empty()
+            );
+            if snam_empty {
+                if self.record.record_type() == "aSub" {
+                    // C `prec->val = do_sub() = 0`.
+                    let _ = self.record.put_field("VAL", EpicsValue::Long(0));
+                }
+                return Ok(0);
+            }
+            // A non-empty but unregistered SNAM: C `do_sub` returns
+            // `S_db_BadSub`, so the cycle's status is non-zero.
             return Ok(SUBROUTINE_STATUS_NO_SUB);
         };
         // C `do_sub` returns the subroutine's `long` status.
@@ -4175,6 +4235,10 @@ impl RecordInstance {
         // the 64-bit `epicsUTag` to the int32 wire field by low-32-bit
         // truncation.
         snap.user_tag = self.common.utag as i32;
+        // Same amsg carry as the GET path (`snapshot_for_field`): a monitor
+        // update serves the record's own `common.amsg`, so PVA
+        // `alarm.message` matches a read of the same channel.
+        snap.alarm.amsg = self.common.amsg.clone();
         let meta = self.cached_metadata();
         snap.display = meta.display;
         snap.control = meta.control;
@@ -5008,6 +5072,7 @@ mod device_menu_marking_tests {
     use super::*;
     use crate::server::records::ai::AiRecord;
     use crate::server::records::calc::CalcRecord;
+    use crate::server::records::mbbo::MbboRecord;
 
     /// C `dbAccess.c:176-179`: a `DBF_DEVICE` field whose record type declares
     /// no device support has `pfldDes->ftPvt == NULL` and takes `goto nostrs`,
@@ -5056,6 +5121,62 @@ mod device_menu_marking_tests {
     fn dtyp_index_is_zero_when_the_record_type_has_no_device_menu() {
         let inst = RecordInstance::new("X".into(), CalcRecord::default());
         assert_eq!(inst.dtyp_index(), 0);
+    }
+
+    /// A downstream crate's registered device menu (asyn's) is merged AFTER the
+    /// base-declared choices, matching a C fat softIoc that loaded `asyn.dbd`:
+    /// `mbbo.DTYP` = the three base soft entries then `asynInt32`,
+    /// `asynUInt32Digital`, in that order. `dtyp_index` reads the merged list,
+    /// so an `mbbo` bound to `asynInt32` reports index 3 — the wire value C
+    /// serves — instead of the appended-as-own-slot index the port gave before
+    /// the menu was known.
+    #[test]
+    fn a_registered_device_menu_merges_after_the_base_declared_choices() {
+        // The list asyn's generated `dbd_generated::DEVICE_MENU_MBBO` carries.
+        static ASYN_MBBO: &[&str] = &["asynInt32", "asynUInt32Digital"];
+        super::super::register_device_menu("mbbo", ASYN_MBBO);
+
+        let mut inst = RecordInstance::new("X".into(), MbboRecord::default());
+        let merged: Vec<String> = inst
+            .device_choices()
+            .expect("mbbo declares device() lines")
+            .iter()
+            .map(|c| c.as_str_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            merged,
+            vec![
+                "Soft Channel",
+                "Raw Soft Channel",
+                "Async Soft Channel",
+                "asynInt32",
+                "asynUInt32Digital",
+            ],
+            "base-declared choices first, asyn-contributed appended in asyn.dbd order"
+        );
+
+        inst.common.dtyp = "asynInt32".into();
+        assert_eq!(
+            inst.dtyp_index(),
+            3,
+            "an asyn DTYP indexes into the merged menu, not an appended own slot"
+        );
+    }
+
+    /// The None-vs-empty contract survives the merge: a record type neither
+    /// base nor any downstream crate contributes a `device()` for (calc) stays
+    /// `None`, never `Some([])`, even after asyn menus are registered in this
+    /// process.
+    #[test]
+    fn calc_stays_none_after_asyn_menus_are_registered() {
+        static ASYN_MBBO: &[&str] = &["asynInt32", "asynUInt32Digital"];
+        super::super::register_device_menu("mbbo", ASYN_MBBO);
+
+        let inst = RecordInstance::new("X".into(), CalcRecord::default());
+        assert!(
+            inst.device_choices().is_none(),
+            "calc declares no device() and gets no contribution — still None"
+        );
     }
 }
 
@@ -5800,6 +5921,81 @@ mod metadata_cache_tests {
         );
     }
 
+    /// A subroutine-less aSub (empty SNAM — the record the PVA monitor
+    /// oracle drives as `ORACLE:MONSCAN:ASUB`) mirrors C `do_sub`
+    /// (aSubRecord.c:459-465): an empty SNAM returns 0 BEFORE the bad-sub
+    /// check, and C `process` (`:224`) runs `prec->val = status = 0` every
+    /// cycle. So a periodic scan forces VAL back to 0, and C `monitor()`
+    /// (`:414`, `val != oval`) posts nothing — the driven `dbPut`s are the
+    /// only VAL events.
+    ///
+    /// Before the fix the port's "no bound subroutine" branch returned
+    /// `S_db_BadSub` and never wrote VAL, so a scanned aSub kept VAL at the
+    /// last client put and the deadband gate re-posted it on every scan (the
+    /// oracle's 7 updates where C posts 4). This pins both halves: `process`
+    /// resets VAL to 0, and a scan of the reset value posts nothing.
+    #[test]
+    fn subroutineless_asub_process_resets_val_and_stops_scan_overposting() {
+        use crate::server::recgbl::EventMask;
+        use crate::server::records::asub_record::ASubRecord;
+
+        let mut inst = RecordInstance::new("ASUB".to_string(), ASubRecord::default());
+        // The default record: no subroutine bound, SNAM empty.
+        assert!(inst.subroutine.is_none());
+        let _val_rx = inst
+            .add_subscriber(
+                "VAL",
+                1,
+                crate::types::DbFieldType::Long,
+                EventMask::VALUE.bits(),
+            )
+            .expect("VAL subscriber");
+        let posts_val =
+            |snap: &ProcessSnapshot| snap.changed_fields.iter().any(|(n, _, _)| n == "VAL");
+
+        // A settling scan of the unchanged record: C `do_sub` returns 0 and
+        // `process` leaves VAL at 0 (already 0), settling the monitor gate.
+        let _ = inst.process_local().unwrap();
+        assert_eq!(inst.record.get_field("VAL"), Some(EpicsValue::Long(0)));
+        // status 0 -> C `if (!status)` drives every OUT link (aSub's
+        // `multi_output_links` gate reads the cycle status); a bad-sub status
+        // would suppress all 21.
+        assert_eq!(
+            inst.record.multi_output_links().len(),
+            21,
+            "empty-SNAM do_sub status must be 0, not S_db_BadSub"
+        );
+
+        // A client caput lands on VAL (DBF_LONG, not process-passive: it posts
+        // but does not itself process, leaving VAL non-zero — exactly how the
+        // oracle drives the scanned reproducer between scans).
+        inst.record.put_field("VAL", EpicsValue::Long(7)).unwrap();
+
+        // The periodic scan processes. C forces VAL back to 0 and posts
+        // nothing (val == oval == 0). Before the fix VAL stayed 7 and the scan
+        // re-posted it.
+        let (snap, _) = inst.process_local().unwrap();
+        assert_eq!(
+            inst.record.get_field("VAL"),
+            Some(EpicsValue::Long(0)),
+            "a scan must reset VAL to the do_sub status (0)"
+        );
+        assert!(
+            !posts_val(&snap),
+            "a scan that resets VAL to 0 must not re-post it"
+        );
+
+        // A second driven put + scan: the monitor marker stays at 0, so no
+        // scan ever re-posts the reset value.
+        inst.record.put_field("VAL", EpicsValue::Long(7)).unwrap();
+        let (snap, _) = inst.process_local().unwrap();
+        assert_eq!(inst.record.get_field("VAL"), Some(EpicsValue::Long(0)));
+        assert!(
+            !posts_val(&snap),
+            "repeated scans must not re-post the reset VAL"
+        );
+    }
+
     /// Record that names DIFF in `force_posted_fields` (the motor's C
     /// `process_motor_info` unconditional `MARK(M_DIFF)`) while keeping
     /// every value constant — a settled axis parked at a fixed non-zero
@@ -6083,6 +6279,19 @@ mod metadata_cache_tests {
         }
         fn process(&mut self) -> CaResult<crate::server::record::ProcessOutcome> {
             Ok(crate::server::record::ProcessOutcome::complete())
+        }
+        /// This fixture drives its alarm purely through `check_alarms`
+        /// (`self.alarm`), so it must NOT also raise the central UDF alarm —
+        /// otherwise the born `udf = 1` pins severity at INVALID every cycle
+        /// and there is never a real NO_ALARM → INVALID transition to test.
+        /// (Before `rec_gbl_check_udf` stopped fabricating a UDF message, the
+        /// ALARM bit this test asserts came from that fabricated amsg
+        /// flipping to "" — an artifact, not the severity transition the
+        /// test name and comments describe.) With no UDF alarm, cycle 1
+        /// genuinely clears the born UDF/INVALID to NO_ALARM, and the
+        /// `self.alarm` cycle is a true severity transition.
+        fn raises_udf_alarm(&self) -> bool {
+            false
         }
         fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
             if self.alarm {

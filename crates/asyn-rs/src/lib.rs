@@ -38,5 +38,13 @@ pub mod user;
 pub mod adapter;
 #[cfg(feature = "epics")]
 pub mod asyn_record;
+/// The asyn device-support DTYP menus, generated from the vendored asyn `.dbd`
+/// by `tools/dbd-codegen` — the same path base and every other downstream crate
+/// use. `crate::adapter::register_asyn_device_menus` hands each entry to base's
+/// `register_device_menu` so a client reading e.g. `mbbo.DTYP` sees the asyn
+/// choices a C fat softIoc lists. Gated on `epics` because it names
+/// `epics_base_rs` types.
+#[cfg(feature = "epics")]
+pub mod dbd_generated;
 #[cfg(feature = "epics")]
 pub mod iocsh;

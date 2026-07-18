@@ -1103,12 +1103,31 @@ fn build_alarm(snapshot: &Snapshot) -> PvStructure {
     alarm.fields.push((
         "message".into(),
         PvField::Scalar(ScalarValue::String(
-            alarm_condition_string(snapshot.alarm.status)
-                .to_string()
-                .into(),
+            alarm_message(snapshot, snapshot.alarm.status).into(),
         )),
     ));
     alarm
+}
+
+/// pvxs `iocsource.cpp:230-236`, exactly: a non-empty carried amsg (the
+/// record's `common.amsg`) wins; else the alarm condition string for a
+/// non-zero `status`; else "". Only mbboDirect sets a UDF amsg ("UDFS",
+/// `mbboDirectRecord.c:191`); every other record raises UDF via plain
+/// `recGblSetSevr` (empty namsg), so its empty amsg falls through here to
+/// the "UDF" condition string — the same rule as
+/// `epics_pva_rs::server::native_source::build_alarm`.
+///
+/// `status` is passed separately so the overlay builder can supply its
+/// escalated `eff_status` for the condition-string fallback while still
+/// preferring the record's own amsg (the amsg belongs to the record
+/// regardless of the severity overlay). `alarm_condition_string` already
+/// maps NO_ALARM / out-of-range to "".
+fn alarm_message(snapshot: &Snapshot, status: u16) -> String {
+    if !snapshot.alarm.amsg.is_empty() {
+        snapshot.alarm.amsg.clone()
+    } else {
+        alarm_condition_string(status).to_string()
+    }
 }
 
 /// Build an alarm overlay that escalates severity/status without losing the
@@ -1126,8 +1145,9 @@ fn build_alarm_overlay(snapshot: &Snapshot, severity: u16, status: u16) -> PvStr
         "severity".into(),
         PvField::Scalar(ScalarValue::Int(eff_severity as i32)),
     ));
-    // status CLASS + condition-string message (pvxs
-    // iocsource.cpp:187-236), using the escalated `eff_status`.
+    // status CLASS + amsg-or-condition-string message (pvxs
+    // iocsource.cpp:187-236), using the escalated `eff_status` for the
+    // fallback but still preferring the record's own amsg.
     alarm.fields.push((
         "status".into(),
         PvField::Scalar(ScalarValue::Int(alarm_status_class(eff_status))),
@@ -1135,7 +1155,7 @@ fn build_alarm_overlay(snapshot: &Snapshot, severity: u16, status: u16) -> PvStr
     alarm.fields.push((
         "message".into(),
         PvField::Scalar(ScalarValue::String(
-            alarm_condition_string(eff_status).to_string().into(),
+            alarm_message(snapshot, eff_status).into(),
         )),
     ));
     alarm
@@ -1718,6 +1738,38 @@ mod tests {
         let alarm = build_alarm(&snap);
         assert_eq!(alarm_scalar_int(&alarm, "status"), 0); // NONE
         assert_eq!(alarm_scalar_str(&alarm, "message"), "");
+    }
+
+    #[test]
+    fn br_build_alarm_prefers_carried_amsg_over_condition_string() {
+        // pvxs iocsource.cpp:230-236: a non-empty carried amsg wins over the
+        // synthesized condition string. mbboDirect raises UDF with the
+        // bespoke "UDFS" (mbboDirectRecord.c:191), so an undefined mbboDirect
+        // served over QSRV shows alarm.message = "UDFS", NOT "UDF".
+        use epics_base_rs::server::recgbl::alarm_status as a;
+        let mut snap = Snapshot::new(EpicsValue::Enum(0), a::UDF_ALARM, 3, UNIX_EPOCH);
+        snap.alarm.amsg = "UDFS".to_string();
+        let alarm = build_alarm(&snap);
+        assert_eq!(alarm_scalar_str(&alarm, "message"), "UDFS");
+
+        // Empty amsg with a non-zero status falls back to the condition
+        // string — how every non-mbboDirect UDF record (empty namsg from
+        // plain recGblSetSevr) serves "UDF".
+        let generic = Snapshot::new(EpicsValue::Double(0.0), a::UDF_ALARM, 3, UNIX_EPOCH);
+        assert!(generic.alarm.amsg.is_empty());
+        let alarm = build_alarm(&generic);
+        assert_eq!(alarm_scalar_str(&alarm, "message"), "UDF");
+
+        // Empty amsg with NO_ALARM stays "".
+        let ok = Snapshot::new(EpicsValue::Double(1.0), 0, 0, UNIX_EPOCH);
+        assert_eq!(alarm_scalar_str(&build_alarm(&ok), "message"), "");
+
+        // The overlay uses eff_status for the fallback but still prefers the
+        // record's own amsg.
+        let overlay = build_alarm_overlay(&snap, 2, a::LINK_ALARM);
+        assert_eq!(alarm_scalar_str(&overlay, "message"), "UDFS");
+        let overlay_generic = build_alarm_overlay(&generic, 2, a::LINK_ALARM);
+        assert_eq!(alarm_scalar_str(&overlay_generic, "message"), "UDF");
     }
 
     #[test]

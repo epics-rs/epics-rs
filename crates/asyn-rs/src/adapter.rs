@@ -3105,7 +3105,31 @@ pub fn universal_asyn_factory(
 pub fn register_asyn_device_support(
     app: epics_base_rs::server::ioc_app::IocApplication,
 ) -> epics_base_rs::server::ioc_app::IocApplication {
+    register_asyn_device_menus();
     app.register_dynamic_device_support(universal_asyn_factory)
+}
+
+/// Contribute asyn's device-support DTYP menus to base's `DTYP` choice lists.
+///
+/// Walks the generated [`crate::dbd_generated::DEVICE_MENU_RECORD_TYPES`] and
+/// hands each record type's asyn menu to base's
+/// [`register_device_menu`](epics_base_rs::server::record::register_device_menu),
+/// so a client reading e.g. `mbbo.DTYP` sees the `asynInt32` /
+/// `asynUInt32Digital` choices a C fat `softIoc` lists after loading
+/// `asyn.dbd`. Without this, base serves only its own `device()` lines (Soft
+/// Channel, ...) plus the record's currently-bound DTYP, omitting every asyn
+/// DTYP the record is not itself bound to.
+///
+/// Idempotent: base dedups a repeat registration, so the
+/// `register_asyn_device_support*` entry points may each call it. It registers
+/// into a process-global table (the menu is per record TYPE, as in C), so one
+/// call suffices for every IOC in the process.
+pub fn register_asyn_device_menus() {
+    for &record_type in crate::dbd_generated::DEVICE_MENU_RECORD_TYPES {
+        if let Some(choices) = crate::dbd_generated::device_menu(record_type) {
+            epics_base_rs::server::record::register_device_menu(record_type, choices);
+        }
+    }
 }
 
 /// IocBuilder companion to [`register_asyn_device_support`] —
@@ -3118,6 +3142,7 @@ pub fn register_asyn_device_support(
 pub fn register_asyn_device_support_for_builder(
     builder: epics_base_rs::server::ioc_builder::IocBuilder,
 ) -> epics_base_rs::server::ioc_builder::IocBuilder {
+    register_asyn_device_menus();
     builder.register_dynamic_device_support(universal_asyn_factory)
 }
 
@@ -3125,6 +3150,54 @@ pub fn register_asyn_device_support_for_builder(
 mod tests {
     use super::*;
     use crate::port_actor::ActorId;
+
+    /// The generated asyn device menus match the C `asyn.dbd` load, in the exact
+    /// order (the DTYP index is wire-visible): `mbbo` gets `asynInt32` then
+    /// `asynUInt32Digital` (devAsynInt32.dbd before devAsynUInt32Digital.dbd in
+    /// `devEpics.dbd`), `stringin` the three `devAsynOctet.dbd` octet devices in
+    /// declaration order.
+    #[test]
+    fn generated_device_menus_match_asyn_dbd_order() {
+        assert_eq!(
+            crate::dbd_generated::device_menu("mbbo"),
+            Some(&["asynInt32", "asynUInt32Digital"][..]),
+        );
+        assert_eq!(
+            crate::dbd_generated::device_menu("stringin"),
+            Some(
+                &[
+                    "asynOctetCmdResponse",
+                    "asynOctetWriteRead",
+                    "asynOctetRead"
+                ][..]
+            ),
+        );
+        // waveform draws from several files; the octet devices (devAsynOctet.dbd,
+        // included first) precede the array devices (devAsynXXXArray.dbd).
+        let wf = crate::dbd_generated::device_menu("waveform").expect("waveform has asyn devices");
+        assert_eq!(wf[0], "asynOctetCmdResponse");
+        assert_eq!(wf[5], "asynInt8ArrayIn");
+        // The asyn record type's own device support is base's, not asyn-rs's —
+        // excluded from the vendored dbd so the merge does not double it.
+        assert_eq!(crate::dbd_generated::device_menu("asyn"), None);
+    }
+
+    /// `register_asyn_device_menus` walks every generated record type and hands
+    /// its menu to base without panicking; repeat calls are idempotent (base
+    /// dedups), so wiring device support twice in a process is safe.
+    #[test]
+    fn register_asyn_device_menus_is_callable_and_idempotent() {
+        register_asyn_device_menus();
+        register_asyn_device_menus();
+        // Every listed record type must resolve to a menu (the registration loop
+        // relies on this invariant).
+        for &rt in crate::dbd_generated::DEVICE_MENU_RECORD_TYPES {
+            assert!(
+                crate::dbd_generated::device_menu(rt).is_some(),
+                "DEVICE_MENU_RECORD_TYPES lists {rt} but device_menu returns None"
+            );
+        }
+    }
 
     /// Every asyn read error maps to the C `asynStatusToEpicsAlarm` pair
     /// under the device-support READ-path defaults (READ_ALARM / INVALID).

@@ -32080,6 +32080,39 @@ pub fn device_menu(record_type: &str) -> Option<&'static [&'static str]> {
     })
 }
 
+/// The record types [`device_menu`] returns `Some` for, in `.dbd` name order.
+pub static DEVICE_MENU_RECORD_TYPES: &[&str] = &[
+    "aai",
+    "aao",
+    "acalcout",
+    "ai",
+    "ao",
+    "asyn",
+    "bi",
+    "bo",
+    "busy",
+    "calcout",
+    "event",
+    "histogram",
+    "int64in",
+    "int64out",
+    "longin",
+    "longout",
+    "lsi",
+    "lso",
+    "mbbi",
+    "mbbiDirect",
+    "mbbo",
+    "mbboDirect",
+    "printf",
+    "scalcout",
+    "stringin",
+    "stringout",
+    "subArray",
+    "swait",
+    "waveform",
+];
+
 // ---------------------------------------------------------------------
 // Per-(record type, DTYP) device LINK TYPE (C `devSup::link_type`), the
 // half of the `device()` declaration `dbCanSetLink` enforces.

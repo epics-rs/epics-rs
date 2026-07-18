@@ -387,13 +387,21 @@ pub fn udf_alarm_active(udf: u8, exact_one: bool) -> bool {
 /// Check UDF alarm: if record is still undefined, raise UDF_ALARM with UDFS
 /// severity. `exact_one` selects C's `udf == TRUE` semantics (see
 /// [`udf_alarm_active`]); pass the record's [`Record::udf_alarm_on_exact_one`].
-pub fn rec_gbl_check_udf(common: &mut CommonFields, exact_one: bool) {
+///
+/// `msg` is the record's alarm message ([`Record::udf_alarm_message`]).
+/// Almost every base record raises UDF via plain
+/// `recGblSetSevr(prec, UDF_ALARM, prec->udfs)`, which forwards a NULL
+/// message and leaves `namsg` EMPTY (`recGbl.c:249-261`) — so `msg` is
+/// `""` for them, and PVA then serves the `"UDF"` condition string
+/// (`iocsource.cpp:230-236`). Only `mbboDirectRecord.c:191` passes a
+/// literal (`"UDFS"`).
+pub fn rec_gbl_check_udf(common: &mut CommonFields, exact_one: bool, msg: &str) {
     if udf_alarm_active(common.udf, exact_one) {
         rec_gbl_set_sevr_msg(
             common,
             alarm_status::UDF_ALARM,
             AlarmSeverity::from_u16(common.udfs as u16),
-            "UDF: record not initialized",
+            msg,
         );
     }
 }
@@ -844,9 +852,13 @@ mod tests {
     fn test_check_udf() {
         let mut common = CommonFields::default();
         assert!(common.udf != 0);
-        rec_gbl_check_udf(&mut common, false);
+        rec_gbl_check_udf(&mut common, false, "");
         assert_eq!(common.nsev, AlarmSeverity::Invalid);
         assert_eq!(common.nsta, alarm_status::UDF_ALARM);
+        // C's plain `recGblSetSevr(UDF_ALARM)` forwards a NULL message and
+        // leaves `namsg` EMPTY (`recGbl.c:249-261`). The generic message is
+        // "", not the old fabricated "UDF: record not initialized".
+        assert_eq!(common.namsg, "");
     }
 
     #[test]
@@ -854,7 +866,7 @@ mod tests {
         let mut common = CommonFields::default();
         assert!(common.udf != 0);
         common.udfs = AlarmSeverity::Minor as i16;
-        rec_gbl_check_udf(&mut common, false);
+        rec_gbl_check_udf(&mut common, false, "");
         assert_eq!(common.nsev, AlarmSeverity::Minor);
         assert_eq!(common.nsta, alarm_status::UDF_ALARM);
     }
@@ -874,7 +886,7 @@ mod tests {
 
         let mut common = CommonFields::default();
         common.udf = 255;
-        rec_gbl_check_udf(&mut common, true);
+        rec_gbl_check_udf(&mut common, true, "");
         assert_eq!(common.nsev, AlarmSeverity::NoAlarm);
         assert_eq!(common.nsta, alarm_status::NO_ALARM);
     }

@@ -637,6 +637,16 @@ impl Record for MbboRecord {
         true
     }
 
+    /// C `mbboRecord.c:210-221` — the `else if (prec->udf) goto CONTINUE` that
+    /// skips the forward convert ALSO skips the pre-output
+    /// `recGblGetTimeStampSimm` (mbboRecord.c:221). The only post-`CONTINUE:`
+    /// stamp is `if (pact)`-guarded (mbboRecord.c:256-258), so a soft (sync)
+    /// UDF mbbo never stamps TIME — it stays at the EPICS epoch until a VAL put
+    /// clears UDF. Opts mbbo into the framework's undefined timestamp-skip.
+    fn skips_timestamp_when_undefined(&self) -> bool {
+        true
+    }
+
     /// Device readback (`asyn:READBACK` / SCAN="I/O Intr" / init seed): store
     /// the raw and resolve VAL through the state table, mirroring C
     /// `processMbbo`/`initMbbo` (devAsynInt32.c:1311-1330,1296 /

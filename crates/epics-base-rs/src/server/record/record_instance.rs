@@ -1338,26 +1338,28 @@ impl RecordInstance {
         // `dbDeviceMenu` is the concatenation of every `device()` the loaded
         // `.dbd` set declares, in load order — base first, then asyn — so the
         // merge appends the contributed choices AFTER the declared ones.
-        let declared = super::dbd_generated::device_menu(record_type);
-        let contributed = super::contributed_device_menu(record_type);
         // The C None-vs-empty distinction (`dbAccess.c:176-179` vs `:205`): the
         // menu is present iff the loaded `.dbd` set declares ANY `device()` for
         // this type. A type base declares none for but asyn does (structurally
         // possible, though none of asyn's are such) is therefore present, not
         // None; a type neither declares for (calc) stays None.
-        if declared.is_none() && contributed.is_empty() {
+        if super::dbd_generated::device_menu(record_type).is_none()
+            && super::contributed_device_menu(record_type).is_empty()
+        {
             return None;
         }
-        let mut names: Vec<&str> = Vec::new();
-        if let Some(declared) = declared {
-            names.extend_from_slice(declared);
-        }
-        names.extend(contributed.iter().copied());
+        // `merged_device_menu` = declared + contributed, the SAME source the
+        // CA-put validation (`coerce_put_value`'s DTYP branch) resolves against,
+        // so a client can put exactly the DTYP names it can read here.
+        let mut names: Vec<PvString> = super::merged_device_menu(record_type)
+            .into_iter()
+            .map(PvString::from)
+            .collect();
         let dtyp = self.common.dtyp.as_str();
-        if !dtyp.is_empty() && !names.contains(&dtyp) {
-            names.push(dtyp);
+        if !dtyp.is_empty() && !names.iter().any(|n| n.as_str_lossy() == dtyp) {
+            names.push(PvString::from(dtyp));
         }
-        Some(names.iter().map(|c| PvString::from(*c)).collect())
+        Some(names)
     }
 
     /// C `dbPutFieldLink`'s link-type gate (`dbAccess.c:1125-1137`): a link
@@ -2704,14 +2706,17 @@ impl RecordInstance {
             //   incoming label through the device menu (C `putStringMenu`,
             //   which fails `S_db_badChoice` on a name the menu does not have).
             //
-            // The index is only meaningful against the DECLARED menu, which is
-            // what the converter bounded it by.
+            // The index is meaningful against the MERGED device menu (static
+            // `device()` declarations + runtime-contributed device support) —
+            // the exact list `coerce_put_value` bounded it by. Resolving it
+            // against the static-only menu here would drop every contributed
+            // name (asyn's "asynInt32", scaler-rs's "Asyn Scaler") back to
+            // NoChange, leaving DTYP unset after a valid put.
             "DTYP" => match value {
                 EpicsValue::String(s) => self.common.dtyp = s.as_str_lossy().into_owned(),
                 EpicsValue::Enum(i) => {
-                    let declared =
-                        super::dbd_generated::device_menu(self.record.record_type()).unwrap_or(&[]);
-                    match declared.get(i as usize) {
+                    let merged = super::merged_device_menu(self.record.record_type());
+                    match merged.get(i as usize) {
                         Some(name) => self.common.dtyp = (*name).to_string(),
                         None => return Ok(CommonFieldPutResult::NoChange),
                     }

@@ -79,6 +79,27 @@ pub(crate) fn contributed_device_menu(record_type: &str) -> Vec<&'static str> {
     }
 }
 
+/// The full DTYP menu for `record_type` — the static `device()` declarations
+/// (base's build-time `dbd`) followed by every runtime-contributed device
+/// support, in C `dbDeviceMenu` load order — or an empty `Vec` when the type
+/// has no device menu at all.
+///
+/// The single source of "which DTYP names are valid for this record type",
+/// consulted by BOTH the read/announce side
+/// ([`RecordInstance::device_choices`](super::record_instance::RecordInstance::device_choices))
+/// and the CA-put validation ([`super::coerce_put_value`]'s DTYP branch), so a
+/// client can PUT exactly the DTYP names it can READ. `device_choices` layers
+/// the None-vs-empty distinction and the current-DTYP entry on top; the put
+/// path needs only the menu itself.
+pub(crate) fn merged_device_menu(record_type: &str) -> Vec<&'static str> {
+    let mut names: Vec<&'static str> = Vec::new();
+    if let Some(declared) = super::dbd_generated::device_menu(record_type) {
+        names.extend_from_slice(declared);
+    }
+    names.extend(contributed_device_menu(record_type));
+    names
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -40,7 +40,7 @@ epics-rs reimplements the core components of C/C++ EPICS in Rust:
 
 ## Installation
 
-**Current release: v0.24.1** — the `v0.20.x` line completes a full C-parity
+**Current release: v0.24.2** — the `v0.20.x` line completes a full C-parity
 sweep of the motor record against `epics-modules/motor` and adds per-field
 DBE monitor event masks end to end, then layers ~60 commits of C-parity
 regression fixes (one commit per finding) across base/db, CA, the native PVA
@@ -64,8 +64,10 @@ array differential phases. `v0.24.1` closes the Type3 differential-oracle
 parity gap — sseq/mbbo/aSub timestamp and monitor fixes, `alarm.message`
 serving the record's own `amsg`, and DTYP/BOUT/QSRV2 oracle coverage — leaving
 the differential harness DEFECT 0 across all three phases (additive API only,
-no breaking changes). See [`CHANGELOG.md`](./CHANGELOG.md) for the full
-audit trail.
+no breaking changes). `v0.24.2` is a documentation-only patch: CBUG-B25 is
+reclassified now that ADCore #596 landed upstream (the port already divided
+before narrowing), with no functional code change. See
+[`CHANGELOG.md`](./CHANGELOG.md) for the full audit trail.
 
 All crates are published on [crates.io](https://crates.io/crates/epics-rs). Add `epics-rs` with the feature flags you need:
 

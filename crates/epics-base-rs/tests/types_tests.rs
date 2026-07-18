@@ -548,6 +548,7 @@ fn test_encode_stsack_string_layout() {
         severity: 1,
         ackt: Some(1),
         acks: Some(2),
+        amsg: String::new(),
     };
     let data = encode_dbr(epics_base_rs::types::DBR_STSACK_STRING, &snap).unwrap();
     assert_eq!(data.len(), 48);

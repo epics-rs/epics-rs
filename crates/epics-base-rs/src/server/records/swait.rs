@@ -492,12 +492,10 @@ impl Record for SwaitRecord {
         // cleared and raises nothing, exactly as C's `nsev`/`nsta` — reset by
         // `recGblResetAlarms` every cycle — behave.
         if std::mem::take(&mut self.calc_alarm) {
-            recgbl::rec_gbl_set_sevr_msg(
-                common,
-                alarm_status::CALC_ALARM,
-                AlarmSeverity::Invalid,
-                "CALC expression evaluation failed",
-            );
+            // C `swaitRecord.c:410` uses PLAIN `recGblSetSevr(pwait, CALC_ALARM,
+            // INVALID_ALARM)` — NULL message (empty namsg); PVA falls back to
+            // the "CALC" condition string. No fabricated literal.
+            recgbl::rec_gbl_set_sevr(common, alarm_status::CALC_ALARM, AlarmSeverity::Invalid);
         }
 
         // C `swaitRecord.c:412-414`: the `else` arm of the fetch gate —

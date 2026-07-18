@@ -1066,12 +1066,10 @@ impl Record for AcalcoutRecord {
         // and the DLYA continuation consumes it here, exactly where C's
         // `recGblResetAlarms` commits the pending `nsev`.
         if std::mem::take(&mut self.calc_alarm) {
-            recgbl::rec_gbl_set_sevr_msg(
-                common,
-                alarm_status::CALC_ALARM,
-                AlarmSeverity::Invalid,
-                "CALC expression evaluation failed",
-            );
+            // C `aCalcoutRecord.c:305` uses PLAIN `recGblSetSevr(pcalc,
+            // CALC_ALARM, INVALID_ALARM)` — NULL message (empty namsg); PVA
+            // falls back to the "CALC" condition string. No fabricated literal.
+            recgbl::rec_gbl_set_sevr(common, alarm_status::CALC_ALARM, AlarmSeverity::Invalid);
             // C `aCalcoutRecord.c:304-307`: the failed-calc branch does NOT
             // touch `udf`, so a `caput UDF <byte>` made before a failing cycle
             // keeps its raw byte here — byte fidelity (`255` for `-1`).

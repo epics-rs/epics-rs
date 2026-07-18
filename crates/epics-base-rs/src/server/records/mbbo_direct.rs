@@ -180,6 +180,16 @@ impl Record for MbboDirectRecord {
         false
     }
 
+    /// C `mbboDirectRecord.c:191` is the ONE base record that raises UDF
+    /// with a bespoke message: `recGblSetSevrMsg(prec, UDF_ALARM,
+    /// prec->udfs, "UDFS")`. Every other record uses plain `recGblSetSevr`
+    /// (empty namsg). So a PVA read of an undefined mbboDirect serves
+    /// `alarm.message = "UDFS"` (pvxs `iocsource.cpp:230-236` prefers the
+    /// non-empty amsg), not the "UDF" condition string.
+    fn udf_alarm_message(&self) -> &str {
+        "UDFS"
+    }
+
     /// C `mbboDirectRecord.c::special` (`after==1`, B0..B1F, line 290):
     /// `prec->udf = FALSE` — a bit-field put defines the record exactly like
     /// a VAL put, independent of `dbIsValueField` (VAL only, `field_io.rs`'s
@@ -461,5 +471,34 @@ impl Record for MbboDirectRecord {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::recgbl::{alarm_status, rec_gbl_check_udf};
+    use crate::server::record::{AlarmSeverity, CommonFields};
+
+    /// C `mbboDirectRecord.c:191` — the one base record that raises UDF with a
+    /// bespoke message. The trait seam must carry it so the framework's central
+    /// `rec_gbl_check_udf` sets `namsg = "UDFS"`, which pvxs prefers as
+    /// `alarm.message`. The generic default is `""` (plain `recGblSetSevr`).
+    #[test]
+    fn mbbo_direct_udf_alarm_message_is_udfs() {
+        let rec = MbboDirectRecord::default();
+        assert_eq!(rec.udf_alarm_message(), "UDFS");
+
+        // Feeding the seam through the central helper sets namsg = "UDFS".
+        let mut common = CommonFields::default();
+        assert!(common.udf != 0, "a fresh record is undefined");
+        rec_gbl_check_udf(
+            &mut common,
+            rec.udf_alarm_on_exact_one(),
+            rec.udf_alarm_message(),
+        );
+        assert_eq!(common.nsta, alarm_status::UDF_ALARM);
+        assert_eq!(common.nsev, AlarmSeverity::from_u16(common.udfs as u16));
+        assert_eq!(common.namsg, "UDFS");
     }
 }

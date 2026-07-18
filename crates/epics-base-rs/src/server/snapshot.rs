@@ -11,6 +11,14 @@ pub struct AlarmInfo {
     pub ackt: Option<u16>,
     /// Acknowledge severity (record ACKS field).
     pub acks: Option<u16>,
+    /// Alarm message string (`DBR_AMSG` / dbCommon `AMSG`). The record's
+    /// committed `common.amsg`, populated by the per-record snapshot
+    /// builders that hold the record's `CommonFields`
+    /// (`snapshot_for_field`, `make_monitor_snapshot`); empty on the
+    /// minimal `Snapshot::new` path and for non-record channels. PVA's
+    /// `build_alarm` prefers a non-empty amsg over the synthesized
+    /// condition string, mirroring pvxs `iocsource.cpp:230-236`.
+    pub amsg: String,
 }
 
 /// Display/graphic metadata for numeric types.
@@ -287,6 +295,7 @@ impl Snapshot {
                 severity,
                 ackt: None,
                 acks: None,
+                amsg: String::new(),
             },
             timestamp: timestamp.into(),
             display: None,

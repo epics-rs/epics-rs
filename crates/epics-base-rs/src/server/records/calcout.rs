@@ -144,8 +144,12 @@ pub struct CalcoutRecord {
     // This cycle's `calcPerform` outcome (C `calcoutRecord.c:238-241` for CALC,
     // `:622` for OCAL). A per-cycle fact, not record state: `check_alarms` — the
     // owner of this record's alarm transitions — consumes it, so it cannot
-    // outlive the cycle that set it.
-    calc_alarm: bool,
+    // outlive the cycle that set it. `Some(msg)` also carries WHICH failure C's
+    // amsg names: `"calcPerform"` (CALC, `:239`) or `"OCAL calcPerform"`
+    // (OCAL, `:622`). C raises CALC before OCAL and `recGblSetSevrMsg` is
+    // raise-only, so when both fail in one cycle the CALC message wins — which
+    // `get_or_insert` at the two set sites reproduces (CALC runs first).
+    calc_alarm: Option<&'static str>,
     // This cycle's `fetch_values()` outcome, pushed by the framework through
     // `set_fetch_gate_failed`. C `calcoutRecord.c::process` (237) runs
     // `calcPerform` only `if (fetch_values(prec) == 0)`: a failed input link
@@ -278,7 +282,7 @@ impl Default for CalcoutRecord {
             dlya: 0,
             oevt: String::new(),
             pending_output: false,
-            calc_alarm: false,
+            calc_alarm: None,
             fetch_gate_failed: false,
             rpcl: crate::calc::CompiledExpr::empty(crate::calc::ExprKind::Numeric),
             orpc: crate::calc::CompiledExpr::empty(crate::calc::ExprKind::Numeric),
@@ -611,7 +615,10 @@ impl Record for CalcoutRecord {
             inputs.prev_val = self.val;
             match crate::calc::eval(&self.rpcl, &mut inputs) {
                 Ok(v) => self.val = v,
-                Err(_) => self.calc_alarm = true,
+                // C `calcoutRecord.c:239`: CALC failure → amsg "calcPerform".
+                Err(_) => {
+                    self.calc_alarm.get_or_insert("calcPerform");
+                }
             }
         }
 
@@ -641,8 +648,13 @@ impl Record for CalcoutRecord {
                         self.ocal_udf_override = Some(self.oval.is_nan());
                     }
                     // C `execOutput:622`: OCAL calcPerform failure raises
-                    // CALC_ALARM and leaves udf VAL-based (no override).
-                    Err(_) => self.calc_alarm = true,
+                    // CALC_ALARM (amsg "OCAL calcPerform") and leaves udf
+                    // VAL-based (no override). `get_or_insert` keeps a prior
+                    // CALC "calcPerform" if CALC also failed this cycle —
+                    // matching C's raise-only order (CALC set first wins).
+                    Err(_) => {
+                        self.calc_alarm.get_or_insert("OCAL calcPerform");
+                    }
                 }
             } else {
                 self.oval = self.val;
@@ -1380,12 +1392,16 @@ impl Record for CalcoutRecord {
         // `checkAlarms(prec)`. Consuming the flag keeps it a per-cycle fact: a
         // cycle whose input fetch failed runs no `calcPerform` (`:237`) and
         // raises nothing.
-        if std::mem::take(&mut self.calc_alarm) {
+        if let Some(msg) = self.calc_alarm.take() {
+            // C `calcoutRecord.c:239` (CALC) / `:622` (OCAL) attach the exact
+            // amsg via `recGblSetSevrMsg`: "calcPerform" / "OCAL calcPerform".
+            // (calcout is the one calc-family record whose C uses a message;
+            // calc/scalcout/acalcout/swait use plain recGblSetSevr.)
             crate::server::recgbl::rec_gbl_set_sevr_msg(
                 common,
                 crate::server::recgbl::alarm_status::CALC_ALARM,
                 crate::server::record::AlarmSeverity::Invalid,
-                "CALC expression evaluation failed",
+                msg,
             );
         }
     }
@@ -1545,5 +1561,55 @@ mod process_tests {
         assert_eq!(rec.oval, 2.0);
         rec.process().unwrap();
         assert_eq!(rec.oval, 3.0);
+    }
+
+    /// C `calcoutRecord.c:239` (CALC) and `:622` (OCAL) attach DISTINCT amsg
+    /// literals via `recGblSetSevrMsg`: "calcPerform" and "OCAL calcPerform".
+    /// pvxs serves these verbatim on alarm.message (iocsource.cpp:230-236);
+    /// calcout is the one calc-family record whose C uses a message at all.
+    #[test]
+    fn calcout_calc_fail_amsg_is_calcperform_ocal_fail_is_ocal_calcperform() {
+        use crate::server::record::CommonFields;
+
+        // CALC fails (empty program), DOPT=Use VAL so no OCAL runs → "calcPerform".
+        let mut rec = CalcoutRecord::default();
+        rec.init_record(0).unwrap();
+        rec.process().unwrap();
+        let mut common = CommonFields::default();
+        rec.check_alarms(&mut common);
+        assert_eq!(common.nsta, crate::server::recgbl::alarm_status::CALC_ALARM);
+        assert_eq!(common.namsg, "calcPerform");
+
+        // CALC succeeds, OCAL fails (empty), DOPT=Use OCAL → "OCAL calcPerform".
+        let mut rec = CalcoutRecord {
+            calc: "5".to_string(),
+            ocal: String::new(),
+            dopt: 1,
+            oopt: 0,
+            ..Default::default()
+        };
+        rec.init_record(0).unwrap();
+        rec.process().unwrap();
+        let mut common = CommonFields::default();
+        rec.check_alarms(&mut common);
+        assert_eq!(common.namsg, "OCAL calcPerform");
+
+        // Both fail in one cycle: C raises CALC first (raise-only), so the
+        // CALC message "calcPerform" wins over the later OCAL setSevr.
+        let mut rec = CalcoutRecord {
+            calc: String::new(),
+            ocal: String::new(),
+            dopt: 1,
+            oopt: 0,
+            ..Default::default()
+        };
+        rec.init_record(0).unwrap();
+        rec.process().unwrap();
+        let mut common = CommonFields::default();
+        rec.check_alarms(&mut common);
+        assert_eq!(
+            common.namsg, "calcPerform",
+            "both-fail keeps the CALC message (C raises CALC before OCAL)"
+        );
     }
 }

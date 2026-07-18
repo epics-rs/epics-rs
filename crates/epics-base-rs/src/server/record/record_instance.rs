@@ -1668,6 +1668,12 @@ impl RecordInstance {
         // pvxs `if(info.nsecMask) utag = meta.time.nsec & info.nsecMask;`
         // (:247).
         snap.user_tag = self.common.utag as i32;
+        // Carry the record's committed alarm message (`common.amsg`) so a
+        // PVA read serves `alarm.message` from the record's own amsg
+        // (pvxs `iocsource.cpp:230-236` prefers `meta.amsg`) rather than a
+        // string re-synthesized from the condition code. Empty for records
+        // that raise no message (C's plain `recGblSetSevr` clears namsg).
+        snap.alarm.amsg = self.common.amsg.clone();
 
         // Pull display/control/enums from the metadata cache (build on
         // first call, hit thereafter until invalidated by a metadata-class
@@ -3086,7 +3092,11 @@ impl RecordInstance {
         // the `if (prec->udf) recGblSetSevr(..., UDF_ALARM, ...)` guard. C has
         // no central UDF alarm; see `Record::raises_udf_alarm`.
         if self.record.raises_udf_alarm() {
-            recgbl::rec_gbl_check_udf(&mut self.common, self.record.udf_alarm_on_exact_one());
+            recgbl::rec_gbl_check_udf(
+                &mut self.common,
+                self.record.udf_alarm_on_exact_one(),
+                self.record.udf_alarm_message(),
+            );
         }
 
         // The analog-alarm SLOT is the enumeration — a record has the ladder iff
@@ -4195,6 +4205,10 @@ impl RecordInstance {
         // the 64-bit `epicsUTag` to the int32 wire field by low-32-bit
         // truncation.
         snap.user_tag = self.common.utag as i32;
+        // Same amsg carry as the GET path (`snapshot_for_field`): a monitor
+        // update serves the record's own `common.amsg`, so PVA
+        // `alarm.message` matches a read of the same channel.
+        snap.alarm.amsg = self.common.amsg.clone();
         let meta = self.cached_metadata();
         snap.display = meta.display;
         snap.control = meta.control;
@@ -6160,6 +6174,19 @@ mod metadata_cache_tests {
         }
         fn process(&mut self) -> CaResult<crate::server::record::ProcessOutcome> {
             Ok(crate::server::record::ProcessOutcome::complete())
+        }
+        /// This fixture drives its alarm purely through `check_alarms`
+        /// (`self.alarm`), so it must NOT also raise the central UDF alarm —
+        /// otherwise the born `udf = 1` pins severity at INVALID every cycle
+        /// and there is never a real NO_ALARM → INVALID transition to test.
+        /// (Before `rec_gbl_check_udf` stopped fabricating a UDF message, the
+        /// ALARM bit this test asserts came from that fabricated amsg
+        /// flipping to "" — an artifact, not the severity transition the
+        /// test name and comments describe.) With no UDF alarm, cycle 1
+        /// genuinely clears the born UDF/INVALID to NO_ALARM, and the
+        /// `self.alarm` cycle is a true severity transition.
+        fn raises_udf_alarm(&self) -> bool {
+            false
         }
         fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
             if self.alarm {

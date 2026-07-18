@@ -2768,6 +2768,23 @@ pub trait Record: Send + Sync + 'static {
         false
     }
 
+    /// The alarm message C attaches when raising `UDF_ALARM`.
+    ///
+    /// Almost every base record raises UDF with plain
+    /// `recGblSetSevr(prec, UDF_ALARM, prec->udfs)` — and `recGblSetSevr`
+    /// forwards a NULL message to `recGblSetSevrMsg`, which sets
+    /// `namsg[0] = '\0'` (`recGbl.c:249-251,258-261`). So the C amsg for a
+    /// UDF record is EMPTY, and pvxs then serves the `"UDF"` condition
+    /// string for `alarm.message` (`iocsource.cpp:230-236`). Default `""`
+    /// models exactly that.
+    ///
+    /// The sole exception in base is `mbboDirectRecord.c:191`, which raises
+    /// `recGblSetSevrMsg(prec, UDF_ALARM, prec->udfs, "UDFS")` — a bespoke
+    /// literal. That record overrides this to `"UDFS"`.
+    fn udf_alarm_message(&self) -> &str {
+        ""
+    }
+
     /// Whether the record's current `VAL` is undefined (UDF must
     /// stay set).
     ///

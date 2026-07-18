@@ -1,5 +1,51 @@
 # Changelog
 
+## v0.24.1 — 2026-07-18
+
+Patch release. Closes the Type3 differential-oracle parity gap: after this
+release the `epics-oracle-rs` differential harness is DEFECT 0 across all three
+phases (Channel Access, PVA read, PVA monitor). Eight fixes, one per finding,
+each grounded in the C reference (`epics-base`, `pvxs`). Additive record-trait
+API only; no breaking changes. Workspace version 0.24.0 -> 0.24.1.
+
+### epics-base-rs
+
+- **sseq TIME lags the VAL post by one cycle.** `sseqRecord.c::asyncFinish`
+  posts VAL and runs `recGblFwdLink` *before* `recGblGetTimeStamp`, so the VAL
+  monitor carries the pre-update timestamp and the restamp advances TIME for the
+  BUSY post and the next cycle. New hook `Record::restamps_time_after_completion()`.
+
+- **A sync UDF mbbo/mbboDirect leaves TIME at the EPICS epoch.** C
+  `mbboRecord.c` / `mbboDirectRecord.c` take `else if (prec->udf) goto CONTINUE`,
+  skipping the pre-output `recGblGetTimeStampSimm`; the only post-`CONTINUE`
+  stamp is `if (pact)`-guarded (async completion), so a soft (sync) UDF record
+  never stamps until VAL is defined. New hook
+  `Record::skips_timestamp_when_undefined()` (mbbo/mbboDirect only). The
+  async-completion path still stamps unconditionally, matching C's `if (pact)`.
+
+- **An empty-SNAM aSub resets VAL and stops over-posting on scan.** C
+  `aSubRecord.c` short-circuits an empty SNAM `do_sub` to `return 0` before the
+  `S_db_BadSub` check, so `process` sets VAL to 0 each cycle and `monitor()`
+  posts nothing when unchanged. The port had conflated empty-SNAM with bad-SNAM
+  and never wrote VAL, so a `.1 second`-scanned aSub re-posted the stale put
+  value on every scan.
+
+### epics-pva-rs, epics-bridge-rs
+
+- **`alarm.message` now serves the record's own `amsg`** (native PVA and
+  QSRV/bridge), preferring a non-empty carried amsg over a re-synthesized
+  condition string (pvxs `iocsource.cpp:230-236`). Closes the fabricated-amsg
+  family: generic UDF records fall back to `"UDF"`, only `mbboDirect` uses
+  `"UDFS"`, and the CALC-family literals are corrected to their real C strings.
+  New seam `Record::udf_alarm_message()`.
+
+### epics-oracle-rs
+
+- DTYP parity is exercised (asyn device menus registered; asyn device support
+  served in the DTYP choice list), the ASYN.BOUT live-length divergence is
+  recorded as an intentional design-divergence, and QSRV2 demo device support
+  is allowlisted as an instrument superset.
+
 ## v0.24.0 — 2026-07-18
 
 Minor release. A full C-parity hardening pass driven by the new differential

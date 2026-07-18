@@ -40,7 +40,7 @@ epics-rs reimplements the core components of C/C++ EPICS in Rust:
 
 ## Installation
 
-**Current release: v0.24.0** — the `v0.20.x` line completes a full C-parity
+**Current release: v0.24.1** — the `v0.20.x` line completes a full C-parity
 sweep of the motor record against `epics-modules/motor` and adds per-field
 DBE monitor event masks end to end, then layers ~60 commits of C-parity
 regression fixes (one commit per finding) across base/db, CA, the native PVA
@@ -60,7 +60,11 @@ behaviour — ~800 one-finding-per-commit fixes across asyn, the calc engines,
 the record/db metadata rsets, CA, and PVA/QSRV2 — plus two breaking asyn API
 changes (`ParamSetValue` folded into `ParamSetValue::Value`, and
 `drv_user_create` takes a `&DrvUserRequest`) and new oracle PVA-monitor and
-array differential phases. See [`CHANGELOG.md`](./CHANGELOG.md) for the full
+array differential phases. `v0.24.1` closes the Type3 differential-oracle
+parity gap — sseq/mbbo/aSub timestamp and monitor fixes, `alarm.message`
+serving the record's own `amsg`, and DTYP/BOUT/QSRV2 oracle coverage — leaving
+the differential harness DEFECT 0 across all three phases (additive API only,
+no breaking changes). See [`CHANGELOG.md`](./CHANGELOG.md) for the full
 audit trail.
 
 All crates are published on [crates.io](https://crates.io/crates/epics-rs). Add `epics-rs` with the feature flags you need:

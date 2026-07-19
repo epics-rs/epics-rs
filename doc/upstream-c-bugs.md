@@ -109,21 +109,22 @@ proven defect (see "Leads rejected").
 This is the authoritative submission-status table; it replaces the per-entry
 `Status:` prose, which is stale (the catalogue was extracted 2026-07-13, before
 most of these PRs were filed on 7/16–7/20). Author: `physwkim`. State is the live
-GitHub PR state, not a claim about the catalogue. Total filed: **32** — 26
-NOT-REPRODUCED + 1 FIXED-UPSTREAM in the main table below, plus 5 REPRODUCED in
+GitHub PR state, not a claim about the catalogue. Total filed: **35** — 26
+NOT-REPRODUCED + 1 FIXED-UPSTREAM in the main table below, plus 8 REPRODUCED in
 the separate table after it.
 
 **Catalogued CBUGs that are filed (27):**
 
-Some 2026-07-19 PRs bundle several CBUGs into one PR (calc **#41** = D2/F5/F2/F3;
+Some PRs bundle several CBUGs into one PR (calc **#41** = D2/F5/F2/F3;
 epics-base **#932** = D3/D5/F6; std **#28** = B15/B16; ADCore **#598** =
-B22/B23/B27) — each CBUG gets its own row pointing at the shared PR.
+B22/B23/B27; optics **#27** = B1/B2/B4, spanning both tables) — each CBUG gets
+its own row pointing at the shared PR.
 
 | CBUG | PR | state | note |
 |---|---|---|---|
 | CBUG-A1 | epics-modules/calc **#38** | open | `MODULO INT_MIN % -1` SIGFPE guard |
 | CBUG-A2 | epics-base/epics-base **#925** | open | `calcPerform` NINT/MODULO `d2i` narrowing |
-| CBUG-B2 | epics-modules/optics **#26** | open | pf4 Pb top-bin `keV[j+1]`/`mu[j+1]` OOB read |
+| CBUG-B2 | epics-modules/optics **#27** | open | pf4 Pb top-bin `keV[j+1]`/`mu[j+1]` OOB read — removed by the `[j-1,j]` interval fix (supersedes closed #26) |
 | CBUG-B3 | epics-modules/optics **#25** | open | pf4 glass-term guard |
 | CBUG-B5 | epics-modules/asyn **#234** | merged | `asynInterposeCom` ixon `return` |
 | CBUG-B9 | epics-modules/asyn **#233** | merged | `drvAsynIPServerPort` UDP read bound |
@@ -159,7 +160,7 @@ B22/B23/B27) — each CBUG gets its own row pointing at the shared PR.
 > the catalogue bucket and the `time_series_plugin.rs` comment framing were
 > corrected.
 
-**REPRODUCED bugs also reported upstream (5):**
+**REPRODUCED bugs also reported upstream (8):**
 
 These are genuine C defects the port carries **on purpose** for bug-for-bug
 parity — their `Bucket: REPRODUCED` classification is unchanged, and the port
@@ -168,8 +169,11 @@ then retires that REPRODUCE and tracks the corrected C. Until then, reproduce.
 
 | CBUG | PR | state | note |
 |---|---|---|---|
+| CBUG-B1 | epics-modules/optics **#27** | open | `pf4` `OtherAbsorptionLength` interpolate on `[j-1,j]` (frac was always negative) |
+| CBUG-B4 | epics-modules/optics **#27** | open | `pf4` unknown/out-of-range Other material: skip the blade + diagnose, not silently opaque |
 | CBUG-B6 | epics-modules/asyn **#236** | open | `asynInterposeCom` disable flow control now sends NOFLOW (crtscts + ixon) |
 | CBUG-B8 | epics-modules/asyn **#236** | open | `asynInterposeCom` IAC-stuff the COM-PORT-OPTION subnegotiation payload |
+| CBUG-B10 | epics-modules/asyn **#237** | open | `asyn*Base.c` `readDefault` errorMessage "read", not "write", is not supported (6 files) |
 | CBUG-B13 | epics-modules/motor **#254** | open | `motorRecord` key CDIR on the commanded stroke after a jog-stop backlash |
 | CBUG-B18 | epics-modules/scaler **#4** | open | `scalerRecord` `special(RATE)` posts `.RATE`, not `.TP` |
 | CBUG-B19 | epics-modules/scaler **#4** | open | `scalerRecord` `monitor()` posts `monitor_mask`, not literal `DBE_LOG` |

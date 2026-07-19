@@ -3872,8 +3872,8 @@ mod tests {
         let mut out = String::new();
         drv.report(&mut out, 1);
         assert!(
-            out.contains("  Input EOS[2]: \\x1b\\x00\n"),
-            "C's epicsStrPrintEscaped prints NUL as \\x00 — it has no `case 0` (epicsString.c:255-260): {out}"
+            out.contains("  Input EOS[2]: \\x1b\\0\n"),
+            "CBUG-D4 refused: C's epicsStrPrintEscaped lacked a `case 0` (epicsString.c:255-260) and printed \\x00; the port supplies it so NUL renders \\0, matching epicsStrnEscapedFromRaw: {out}"
         );
         assert!(
             out.contains("  Output EOS[2]: \\t\\a\n"),

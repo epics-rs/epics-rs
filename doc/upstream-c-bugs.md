@@ -104,12 +104,14 @@ proven defect (see "Leads rejected").
 
 ---
 
-### Filed upstream PRs — live GitHub status (as of 2026-07-19)
+### Filed upstream PRs — live GitHub status (as of 2026-07-20)
 
 This is the authoritative submission-status table; it replaces the per-entry
 `Status:` prose, which is stale (the catalogue was extracted 2026-07-13, before
-most of these PRs were filed on 7/16–7/19). Author: `physwkim`. State is the live
-GitHub PR state, not a claim about the catalogue.
+most of these PRs were filed on 7/16–7/20). Author: `physwkim`. State is the live
+GitHub PR state, not a claim about the catalogue. Total filed: **32** — 26
+NOT-REPRODUCED + 1 FIXED-UPSTREAM in the main table below, plus 5 REPRODUCED in
+the separate table after it.
 
 **Catalogued CBUGs that are filed (27):**
 
@@ -156,6 +158,21 @@ B22/B23/B27) — each CBUG gets its own row pointing at the shared PR.
 > #596 fix three days before it landed. No port behaviour change is owed; only
 > the catalogue bucket and the `time_series_plugin.rs` comment framing were
 > corrected.
+
+**REPRODUCED bugs also reported upstream (5):**
+
+These are genuine C defects the port carries **on purpose** for bug-for-bug
+parity — their `Bucket: REPRODUCED` classification is unchanged, and the port
+keeps reproducing them. Filing upstream is deliberate: if a fix merges, the port
+then retires that REPRODUCE and tracks the corrected C. Until then, reproduce.
+
+| CBUG | PR | state | note |
+|---|---|---|---|
+| CBUG-B6 | epics-modules/asyn **#236** | open | `asynInterposeCom` disable flow control now sends NOFLOW (crtscts + ixon) |
+| CBUG-B8 | epics-modules/asyn **#236** | open | `asynInterposeCom` IAC-stuff the COM-PORT-OPTION subnegotiation payload |
+| CBUG-B13 | epics-modules/motor **#254** | open | `motorRecord` key CDIR on the commanded stroke after a jog-stop backlash |
+| CBUG-B18 | epics-modules/scaler **#4** | open | `scalerRecord` `special(RATE)` posts `.RATE`, not `.TP` |
+| CBUG-B19 | epics-modules/scaler **#4** | open | `scalerRecord` `monitor()` posts `monitor_mask`, not literal `DBE_LOG` |
 
 **Filed upstream PRs with no catalogue CBUG entry yet (6):**
 

@@ -104,29 +104,46 @@ proven defect (see "Leads rejected").
 
 ---
 
-### Filed upstream PRs — live GitHub status (as of 2026-07-18)
+### Filed upstream PRs — live GitHub status (as of 2026-07-19)
 
 This is the authoritative submission-status table; it replaces the per-entry
 `Status:` prose, which is stale (the catalogue was extracted 2026-07-13, before
-most of these PRs were filed on 7/16–7/17). Author: `physwkim`. State is the live
+most of these PRs were filed on 7/16–7/19). Author: `physwkim`. State is the live
 GitHub PR state, not a claim about the catalogue.
 
-**Catalogued CBUGs that are filed (14):**
+**Catalogued CBUGs that are filed (27):**
+
+Some 2026-07-19 PRs bundle several CBUGs into one PR (calc **#41** = D2/F5/F2/F3;
+epics-base **#932** = D3/D5/F6; std **#28** = B15/B16; ADCore **#598** =
+B22/B23/B27) — each CBUG gets its own row pointing at the shared PR.
 
 | CBUG | PR | state | note |
 |---|---|---|---|
 | CBUG-A1 | epics-modules/calc **#38** | open | `MODULO INT_MIN % -1` SIGFPE guard |
 | CBUG-A2 | epics-base/epics-base **#925** | open | `calcPerform` NINT/MODULO `d2i` narrowing |
+| CBUG-B2 | epics-modules/optics **#26** | open | pf4 Pb top-bin `keV[j+1]`/`mu[j+1]` OOB read |
 | CBUG-B3 | epics-modules/optics **#25** | open | pf4 glass-term guard |
 | CBUG-B5 | epics-modules/asyn **#234** | merged | `asynInterposeCom` ixon `return` |
 | CBUG-B9 | epics-modules/asyn **#233** | merged | `drvAsynIPServerPort` UDP read bound |
 | CBUG-B14 | epics-modules/std **#27** | open | `throttleRecord` `dbScanLock` |
+| CBUG-B15 | epics-modules/std **#28** | open | `epidRecord` commit UDF alarm before return |
+| CBUG-B16 | epics-modules/std **#28** | open | `devEpidSoft` abort unconditionally when INP constant |
 | CBUG-B20 | areaDetector/ADCore **#594** | merged | `NDPluginROIStat` RGB heap OOB |
 | CBUG-B21 | areaDetector/ADCore **#595** | merged | `NDPluginAttrPlot` `<=` off-by-one |
+| CBUG-B22 | areaDetector/ADCore **#598** | open | `NDPluginProcess` `numFilter < 1` divide-by-zero guard |
+| CBUG-B23 | areaDetector/ADCore **#598** | open | `NDPluginProcess` `autoOffsetScale` `maxValue > minValue` guard |
 | CBUG-B25 | areaDetector/ADCore **#596** | merged | `NDPluginTimeSeries` narrow-before-divide |
 | CBUG-B26 | areaDetector/ADCore **#597** | merged | `NDPluginStats` dark-frame value-init |
+| CBUG-B27 | areaDetector/ADCore **#598** | open | `NDPluginStats` histogram `histMax <= histMin` guard |
 | CBUG-C1 | epics-modules/calc **#39** | open | `sCalc lrc()` empty-operand OOB read |
+| CBUG-D2 | epics-modules/calc **#41** | open | `sCalc` `<<`/`>>` negative shift-count OOB read/write |
+| CBUG-D3 | epics-base/epics-base **#932** | open | `EPICS_CA_CONN_TMO` non-positive watchdog flood |
+| CBUG-D5 | epics-base/epics-base **#932** | open | `EPICS_CA_MAX_SEARCH_PERIOD` non-finite crash |
 | CBUG-F1 | epics-modules/calc **#40** | open | `aCalc INC()` off-by-two |
+| CBUG-F2 | epics-modules/calc **#41** | open | `aCalc SUBRANGE` inclusive upper bound OOB read |
+| CBUG-F3 | epics-modules/calc **#41** | open | `aCalc DERIV`/`nderiv` fit-window > array OOB read |
+| CBUG-F5 | epics-modules/calc **#41** | open | `sCalc LITERAL_STRING` copy bound never advances OOB write |
+| CBUG-F6 | epics-base/epics-base **#932** | open | `calcRecord` drop unhandled `special(SPC_MOD)` from INPM..INPU |
 | CBUG-F11 | epics-modules/asyn **#235** | merged | `asynManager` traceIO truncate hang |
 | CBUG-G1 | epics-base/pvxs **#196** | open | QSRV2 `display.precision` |
 
@@ -155,11 +172,16 @@ These want back-fill CBUG entries (or an explicit "no entry — direct find" not
 so the catalogue and the filed set stay reconcilable.
 
 **Catalogued NOT-REPRODUCED, still UNFILED (the remaining easy-to-accept set):**
-CBUG-B2 (pf4 Pb OOB read), CBUG-B7 (`nextChar` 0-byte uninit), CBUG-B17
-(throttle wrong-link CA status), CBUG-B22 / CBUG-B23 / CBUG-B27 (NDPluginProcess /
-NDPluginStats divide-by-zero, 3), CBUG-D2 (sCalc string shift OOB write), CBUG-D3
-(`EPICS_CA_CONN_TMO` watchdog flood), CBUG-D5 (`EPICS_CA_MAX_SEARCH_PERIOD`
-inf/nan crash). None filed as of 2026-07-18.
+CBUG-B7 (`nextChar` 0-byte uninit), CBUG-B17 (throttle wrong-link CA status).
+The 2026-07-19 batch cleared the rest of this list: B2, B22, B23, B27, D2, D3,
+D5 are now filed (see the table above).
+
+**Prepared but held (not filed):** the pvxs pair CBUG-F9 (process-only blocking
+PUT silent no-op) and CBUG-F10 (UnionArray round-trip) — fixes committed on
+`fix/blocking-put-and-unionarray` in a worktree, held pending re-verification of
+F10 (the prepared fix is decode-side, contradicting F10's encode-side framing).
+CBUG-B24 (modbus ASCII-serial LRC) is deferred on a `physwkim/modbus` fork
+question.
 
 ---
 

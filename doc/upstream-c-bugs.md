@@ -109,11 +109,11 @@ proven defect (see "Leads rejected").
 This is the authoritative submission-status table; it replaces the per-entry
 `Status:` prose, which is stale (the catalogue was extracted 2026-07-13, before
 most of these PRs were filed on 7/16–7/20). Author: `physwkim`. State is the live
-GitHub PR state, not a claim about the catalogue. Total filed: **35** — 26
-NOT-REPRODUCED + 1 FIXED-UPSTREAM in the main table below, plus 8 REPRODUCED in
+GitHub PR state, not a claim about the catalogue. Total filed: **37** — 27
+NOT-REPRODUCED + 1 FIXED-UPSTREAM in the main table below, plus 9 REPRODUCED in
 the separate table after it.
 
-**Catalogued CBUGs that are filed (27):**
+**Catalogued CBUGs that are filed (28):**
 
 Some PRs bundle several CBUGs into one PR (calc **#41** = D2/F5/F2/F3;
 epics-base **#932** = D3/D5/F6; std **#28** = B15/B16; ADCore **#598** =
@@ -142,6 +142,7 @@ its own row pointing at the shared PR.
 | CBUG-D2 | epics-modules/calc **#41** | open | `sCalc` `<<`/`>>` negative shift-count OOB read/write |
 | CBUG-D3 | epics-base/epics-base **#932** | open | `EPICS_CA_CONN_TMO` non-positive watchdog flood |
 | CBUG-D5 | epics-base/epics-base **#932** | open | `EPICS_CA_MAX_SEARCH_PERIOD` non-finite crash |
+| CBUG-E2 | epics-base/epics-base **#933** | open | `dbConvert`/`dbFastLinkConv` float→int cast UB → saturation; **port already saturates (refuses the bug)**, so the catalogue's `Bucket: REPRODUCED` header is stale — see note below |
 | CBUG-F1 | epics-modules/calc **#40** | open | `aCalc INC()` off-by-two |
 | CBUG-F2 | epics-modules/calc **#41** | open | `aCalc SUBRANGE` inclusive upper bound OOB read |
 | CBUG-F3 | epics-modules/calc **#41** | open | `aCalc DERIV`/`nderiv` fit-window > array OOB read |
@@ -160,7 +161,19 @@ its own row pointing at the shared PR.
 > the catalogue bucket and the `time_series_plugin.rs` comment framing were
 > corrected.
 
-**REPRODUCED bugs also reported upstream (8):**
+> **CBUG-E2 — stale bucket (like B25).** The catalogue entry still carries
+> `Bucket: REPRODUCED`, but its own adjudication records that the port
+> **saturates** float/double → integer conversions (`epics-base-rs`
+> `types/c_cast.rs`, Rust `as`), i.e. it **refuses** the C bug and is
+> byte-identical to the aarch64 hardware result. So E2 is effectively
+> **NOT-REPRODUCED** (port refuses) and belongs in this table, not the
+> REPRODUCED one. The upstream PR **#933** defines the C behaviour (saturate,
+> NaN → 0) on both the network (`dbConvert.c`) and DB-link (`dbFastLinkConv.c`)
+> paths, aligning x86-64 onto the aarch64/port semantics. No port behaviour
+> change is owed; if #933 merges, the C side simply stops diverging from the
+> port.
+
+**REPRODUCED bugs also reported upstream (9):**
 
 These are genuine C defects the port carries **on purpose** for bug-for-bug
 parity — their `Bucket: REPRODUCED` classification is unchanged, and the port
@@ -174,6 +187,7 @@ then retires that REPRODUCE and tracks the corrected C. Until then, reproduce.
 | CBUG-B6 | epics-modules/asyn **#236** | open | `asynInterposeCom` disable flow control now sends NOFLOW (crtscts + ixon) |
 | CBUG-B8 | epics-modules/asyn **#236** | open | `asynInterposeCom` IAC-stuff the COM-PORT-OPTION subnegotiation payload |
 | CBUG-B10 | epics-modules/asyn **#237** | open | `asyn*Base.c` `readDefault` errorMessage "read", not "write", is not supported (6 files) |
+| CBUG-B11 | areaDetector/ADCore **#599** | open | `NDPluginCircularBuff` writing `0` to `SoftTrigger` disarms, not fires (guard latch+flush behind `if (value)`) |
 | CBUG-B13 | epics-modules/motor **#254** | open | `motorRecord` key CDIR on the commanded stroke after a jog-stop backlash |
 | CBUG-B18 | epics-modules/scaler **#4** | open | `scalerRecord` `special(RATE)` posts `.RATE`, not `.TP` |
 | CBUG-B19 | epics-modules/scaler **#4** | open | `scalerRecord` `monitor()` posts `monitor_mask`, not literal `DBE_LOG` |

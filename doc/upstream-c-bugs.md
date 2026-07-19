@@ -109,11 +109,11 @@ proven defect (see "Leads rejected").
 This is the authoritative submission-status table; it replaces the per-entry
 `Status:` prose, which is stale (the catalogue was extracted 2026-07-13, before
 most of these PRs were filed on 7/16–7/20). Author: `physwkim`. State is the live
-GitHub PR state, not a claim about the catalogue. Total filed: **37** — 27
+GitHub PR state, not a claim about the catalogue. Total filed: **39** — 29
 NOT-REPRODUCED + 1 FIXED-UPSTREAM in the main table below, plus 9 REPRODUCED in
 the separate table after it.
 
-**Catalogued CBUGs that are filed (28):**
+**Catalogued CBUGs that are filed (30):**
 
 Some PRs bundle several CBUGs into one PR (calc **#41** = D2/F5/F2/F3;
 epics-base **#932** = D3/D5/F6; std **#28** = B15/B16; ADCore **#598** =
@@ -127,10 +127,12 @@ its own row pointing at the shared PR.
 | CBUG-B2 | epics-modules/optics **#27** | open | pf4 Pb top-bin `keV[j+1]`/`mu[j+1]` OOB read — removed by the `[j-1,j]` interval fix (supersedes closed #26) |
 | CBUG-B3 | epics-modules/optics **#25** | open | pf4 glass-term guard |
 | CBUG-B5 | epics-modules/asyn **#234** | merged | `asynInterposeCom` ixon `return` |
+| CBUG-B7 | epics-modules/asyn **#238** | open | `asynInterposeCom` `nextChar` returns uninitialized `c` on a successful 0-byte read → guard `nbytes == 0` as EOF |
 | CBUG-B9 | epics-modules/asyn **#233** | merged | `drvAsynIPServerPort` UDP read bound |
 | CBUG-B14 | epics-modules/std **#27** | open | `throttleRecord` `dbScanLock` |
 | CBUG-B15 | epics-modules/std **#28** | open | `epidRecord` commit UDF alarm before return |
 | CBUG-B16 | epics-modules/std **#28** | open | `devEpidSoft` abort unconditionally when INP constant |
+| CBUG-B17 | epics-modules/std **#29** | open | `throttleRecord` writes link-status for the wrong link (special hardcodes `outLinkStat`; checkLink `caLink`/`caLinkNc` stale across loop) |
 | CBUG-B20 | areaDetector/ADCore **#594** | merged | `NDPluginROIStat` RGB heap OOB |
 | CBUG-B21 | areaDetector/ADCore **#595** | merged | `NDPluginAttrPlot` `<=` off-by-one |
 | CBUG-B22 | areaDetector/ADCore **#598** | open | `NDPluginProcess` `numFilter < 1` divide-by-zero guard |
@@ -207,9 +209,9 @@ These want back-fill CBUG entries (or an explicit "no entry — direct find" not
 so the catalogue and the filed set stay reconcilable.
 
 **Catalogued NOT-REPRODUCED, still UNFILED (the remaining easy-to-accept set):**
-CBUG-B7 (`nextChar` 0-byte uninit), CBUG-B17 (throttle wrong-link CA status).
-The 2026-07-19 batch cleared the rest of this list: B2, B22, B23, B27, D2, D3,
-D5 are now filed (see the table above).
+none — the list is now empty. CBUG-B7 (asyn **#238**) and CBUG-B17
+(std **#29**) were filed 2026-07-20; the 2026-07-19 batch had already cleared
+B2, B22, B23, B27, D2, D3, D5 (all in the table above).
 
 **Prepared but held (not filed):** the pvxs pair CBUG-F9 (process-only blocking
 PUT silent no-op) and CBUG-F10 (UnionArray round-trip) — fixes committed on

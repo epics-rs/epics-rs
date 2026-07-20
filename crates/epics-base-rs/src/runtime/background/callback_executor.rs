@@ -106,15 +106,17 @@ impl CallbackPriority {
 }
 
 /// Why a [`CallbackHandle::request`] was rejected.
+///
+/// Note there is no `Shutdown` variant: a request arriving after the pool has
+/// stopped is a silent no-op returning `Ok(())`, matching C — `callbackStop`
+/// halts the queues and late `callbackRequest`s are simply dropped without
+/// surfacing an error to the caller (`callback.c:237-284`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CallbackError {
     /// The band's ring was full — C `S_db_bufFull` (`callback.c:373`). Either
     /// the push found the ring at capacity, or the overflow latch is still set
     /// from a prior full push (`callback.c:365`).
     QueueFull,
-    /// The pool has been shut down; no worker will ever run this callback.
-    /// (No C analogue — C never pushes after `callbackStop`.)
-    Shutdown,
 }
 
 /// Mutable, lock-guarded state of one priority band's ring.
@@ -155,7 +157,18 @@ impl PriorityQueue {
     fn request(&self, name: &str, cb: Callback) -> Result<(), CallbackError> {
         let mut st = self.state.lock().unwrap();
         if st.shutdown {
-            return Err(CallbackError::Shutdown);
+            // Pool stopped: C drops late callbackRequests after callbackStop
+            // without surfacing an error (`callback.c:237-284`). Drop `cb`
+            // (deallocated here, never invoked) and report success. This also
+            // absorbs the teardown race where the delayed timer fires into a
+            // pool that has just been dropped.
+            drop(st);
+            tracing::trace!(
+                target: "epics_base_rs::runtime::callback",
+                band = name,
+                "callbackRequest after shutdown dropped"
+            );
+            return Ok(());
         }
         // callback.c:365 — reject immediately while the overflow latch is set.
         if st.overflow {
@@ -347,6 +360,7 @@ impl Drop for CallbackPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -432,5 +446,26 @@ mod tests {
 
         gate_tx.send(()).unwrap(); // release the worker so it drains + clears.
         pool.shutdown();
+    }
+
+    #[test]
+    fn request_after_shutdown_is_silent_noop() {
+        // Boundary: a CallbackHandle that outlives the pool (the delayed-timer
+        // teardown race) must get Ok(()) and the callback must never run.
+        let pool = CallbackPool::new();
+        let h = pool.handle();
+        drop(pool); // sets shutdown on every band, joins workers.
+
+        let ran = Arc::new(AtomicBool::new(false));
+        let r = Arc::clone(&ran);
+        let res = h.request(
+            CallbackPriority::High,
+            Box::new(move || r.store(true, Ordering::SeqCst)),
+        );
+        assert_eq!(res, Ok(())); // silent no-op, not Err.
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "callback ran after shutdown; it must be dropped, not invoked"
+        );
     }
 }

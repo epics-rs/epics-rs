@@ -76,6 +76,17 @@ impl Inner {
     fn schedule(&self, delay: Duration, priority: CallbackPriority, cb: Callback) {
         let deadline = Instant::now() + delay;
         let mut st = self.state.lock().unwrap();
+        if st.shutdown {
+            // Timer thread stopped: match C dropping late delayed requests
+            // during shutdown. Drop `cb` (never scheduled or fired) instead of
+            // pushing it onto a heap no worker will ever drain.
+            drop(st);
+            tracing::trace!(
+                target: "epics_base_rs::runtime::delayed_timer",
+                "callbackRequestDelayed after shutdown dropped"
+            );
+            return;
+        }
         let seq = st.next_seq;
         st.next_seq += 1;
         st.heap.push(TimerEntry {
@@ -254,5 +265,31 @@ mod tests {
 
         assert_eq!(rx.recv_timeout(T).unwrap(), "short");
         assert_eq!(rx.recv_timeout(T).unwrap(), "long");
+    }
+
+    #[test]
+    fn schedule_after_shutdown_never_fires() {
+        // Boundary: a TimerHandle that outlives the timer must drop late
+        // requests silently — the callback must never reach the sink pool.
+        let pool = CallbackPool::new();
+        let timer = DelayedTimer::new(pool.handle());
+        let h = timer.handle();
+        drop(timer); // sets shutdown, joins the timer thread.
+
+        let (tx, rx) = mpsc::channel::<()>();
+        h.schedule(
+            Duration::from_millis(0),
+            CallbackPriority::High,
+            Box::new(move || tx.send(()).unwrap()),
+        );
+        // The callback (and its `tx`) is dropped synchronously inside
+        // schedule()'s shutdown branch — never scheduled, never fired. The
+        // receiver therefore sees the sender gone (Disconnected), and never a
+        // delivered `()`.
+        assert_eq!(
+            rx.recv_timeout(Duration::from_millis(200)),
+            Err(mpsc::RecvTimeoutError::Disconnected),
+            "a delayed callback fired after shutdown; it must be dropped"
+        );
     }
 }

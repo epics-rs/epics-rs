@@ -68,7 +68,16 @@ impl Inner {
     fn scan_once(&self, cb: OnceCallback) -> Result<(), ScanOnceOverflow> {
         let mut st = self.state.lock().unwrap();
         if st.shutdown {
-            return Err(ScanOnceOverflow);
+            // Worker stopped: C drops late scanOnce requests during shutdown
+            // without surfacing an error (parity with `callbackStop` handling
+            // of late requests). Drop `cb` (never processed) and report
+            // success rather than a spurious overflow.
+            drop(st);
+            tracing::trace!(
+                target: "epics_base_rs::runtime::scan_once",
+                "scanOnce after shutdown dropped"
+            );
+            return Ok(());
         }
         let result = if st.queue.len() >= self.capacity {
             // dbScan.c:686-691 — ring full: log once per episode, then count.
@@ -220,6 +229,7 @@ impl Drop for ScanOnceQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -259,5 +269,24 @@ mod tests {
         assert_eq!(q.overflow_count(), 2);
 
         gate_tx.send(()).unwrap(); // release the worker so it can drain.
+    }
+
+    #[test]
+    fn scan_once_after_shutdown_is_silent_noop() {
+        // Boundary: a ScanOnceHandle that outlives the queue must get Ok(())
+        // and the tail must never run — not a spurious overflow error.
+        let q = ScanOnceQueue::new();
+        let h = q.handle();
+        drop(q); // sets shutdown, joins the worker.
+
+        let ran = Arc::new(AtomicBool::new(false));
+        let r = Arc::clone(&ran);
+        let res = h.scan_once(Box::new(move || r.store(true, Ordering::SeqCst)));
+        assert_eq!(res, Ok(())); // silent no-op, not Err(ScanOnceOverflow).
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "scanOnce tail ran after shutdown; it must be dropped, not processed"
+        );
+        assert_eq!(h.overflow_count(), 0); // a shutdown drop is not an overflow.
     }
 }

@@ -897,7 +897,7 @@ impl ClientState {
             }
             let (base, field) = parse_pv_name(&inp.link);
             let field = if field.is_empty() { "VAL" } else { field };
-            let rec = self.db.get_record(base).await?;
+            let rec = self.db.get_record(base)?;
             let inst = rec.read();
             match inst.resolve_field(field).and_then(|v| v.to_f64()) {
                 Some(v) => inputs.vars[idx] = v,

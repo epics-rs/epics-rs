@@ -483,7 +483,7 @@ mod tests {
         // VALUE|ALARM subscription should NOT see this (mask
         // mismatch); the PROPERTY subscription must.
         {
-            let rec = db.get_record("MON_PROPERTY").await.expect("rec exists");
+            let rec = db.get_record("MON_PROPERTY").expect("rec exists");
             let mut instance = rec.write();
             instance.notify_field("VAL", EventMask::PROPERTY);
         }
@@ -582,7 +582,7 @@ mod tests {
 
         // A PROPERTY-only post (metadata change) carries the current VAL.
         {
-            let rec = db.get_record("WF_ARR").await.expect("rec exists");
+            let rec = db.get_record("WF_ARR").expect("rec exists");
             let mut instance = rec.write();
             instance.notify_field("VAL", EventMask::PROPERTY);
         }
@@ -638,7 +638,7 @@ mod tests {
         mon.start().await.expect("start ok");
 
         {
-            let rec = db.get_record("MON_MARK").await.expect("rec exists");
+            let rec = db.get_record("MON_MARK").expect("rec exists");
             let mut instance = rec.write();
             instance.notify_field("VAL", EventMask::VALUE);
         }
@@ -660,7 +660,7 @@ mod tests {
         // A DBE_ALARM post promotes to VALUE|ALARM (`singlesource.cpp:90-92`)
         // and so additionally marks `alarm` — still no display/control.
         {
-            let rec = db.get_record("MON_MARK").await.expect("rec exists");
+            let rec = db.get_record("MON_MARK").expect("rec exists");
             let mut instance = rec.write();
             instance.notify_field("VAL", EventMask::ALARM);
         }
@@ -704,7 +704,7 @@ mod tests {
         let mut mon = BridgeMonitor::new(db.clone(), "MON_ENUM".into(), "VAL".into(), NtType::Enum);
         mon.start().await.expect("start ok");
         {
-            let rec = db.get_record("MON_ENUM").await.expect("rec exists");
+            let rec = db.get_record("MON_ENUM").expect("rec exists");
             let mut instance = rec.write();
             instance.notify_field("VAL", EventMask::VALUE);
         }

@@ -532,7 +532,7 @@ async fn arr_channel_filter_applies_to_get_matching_monitor() {
     let mut mon = ch.create_monitor().await.expect("monitor");
     mon.start().await.expect("start");
     {
-        let rec = db.get_record("TEST:filt_wf").await.expect("rec");
+        let rec = db.get_record("TEST:filt_wf").expect("rec");
         rec.write().notify_field("VAL", EventMask::VALUE);
     }
     let ev = tokio::time::timeout(std::time::Duration::from_secs(2), mon.poll())
@@ -703,7 +703,7 @@ async fn channel_with_field_suffix_binds_to_field() {
     ch.put(&put).await.expect("put EGU");
 
     let egu_after = {
-        let rec = db.get_record("TEST:fld_ai").await.expect("rec exists");
+        let rec = db.get_record("TEST:fld_ai").expect("rec exists");
         let inst = rec.read();
         inst.snapshot_for_field("EGU").map(|s| s.value)
     };
@@ -713,7 +713,7 @@ async fn channel_with_field_suffix_binds_to_field() {
     );
 
     let val_after = {
-        let rec = db.get_record("TEST:fld_ai").await.expect("rec exists");
+        let rec = db.get_record("TEST:fld_ai").expect("rec exists");
         let inst = rec.read();
         inst.snapshot_for_field("VAL").map(|s| s.value)
     };
@@ -942,7 +942,7 @@ async fn monitor_stop_disables_backing_subscription() {
     );
 
     async fn post(db: &Arc<PvDatabase>, mask: EventMask) {
-        let rec = db.get_record("TEST:gate_ai").await.expect("rec");
+        let rec = db.get_record("TEST:gate_ai").expect("rec");
         rec.write().notify_field("VAL", mask);
     }
 
@@ -1267,7 +1267,7 @@ async fn r17_31_qform_string_char_waveform_serves_long_string() {
     .await
     .unwrap();
     {
-        let rec = db.get_record("TEST:lstr").await.expect("record");
+        let rec = db.get_record("TEST:lstr").expect("record");
         rec.write().set_info("Q:form", "String");
     }
     db.put_pv("TEST:lstr", EpicsValue::CharArray(b"abc\0".to_vec()))
@@ -1317,7 +1317,7 @@ async fn r17_31_qform_string_char_waveform_serves_long_string() {
         other => panic!("expected updated string, got {other:?}"),
     }
     let nord = {
-        let rec = db.get_record("TEST:lstr").await.expect("record");
+        let rec = db.get_record("TEST:lstr").expect("record");
         let inst = rec.read();
         inst.resolve_field("NORD").expect("NORD")
     };

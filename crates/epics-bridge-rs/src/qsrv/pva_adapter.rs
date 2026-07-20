@@ -1484,7 +1484,7 @@ async fn load_qsrv_groups(
 
     // 1. DB info(Q:group) records (pvxs loadConfigFromDb).
     for name in db.all_record_names().await {
-        let json = match db.get_record(&name).await {
+        let json = match db.get_record(&name) {
             Some(rec) => rec.read().get_info("Q:group").map(str::to_string),
             None => None,
         };
@@ -2131,7 +2131,7 @@ mod tests {
 
         // Sanity: VAL starts at 0.0.
         let val0 = {
-            let rec = db.get_record("TEST:proc").await.unwrap();
+            let rec = db.get_record("TEST:proc").unwrap();
             let inst = rec.read();
             inst.snapshot_for_field("VAL").map(|s| s.value)
         };
@@ -2150,7 +2150,7 @@ mod tests {
         // process=true with no record._options in the value resolves
         // to Force, not silently degraded to Passive.
         let val1 = {
-            let rec = db.get_record("TEST:proc").await.unwrap();
+            let rec = db.get_record("TEST:proc").unwrap();
             let inst = rec.read();
             inst.snapshot_for_field("VAL").map(|s| s.value)
         };
@@ -2275,7 +2275,7 @@ mod tests {
         let store = QsrvPvStore::new(provider);
 
         let before = {
-            let rec = db.get_record("TEST:proc_call").await.unwrap();
+            let rec = db.get_record("TEST:proc_call").unwrap();
             let inst = rec.read();
             inst.common.time
         };
@@ -2288,7 +2288,7 @@ mod tests {
             .await
             .expect("PROCESS must run");
         let after = {
-            let rec = db.get_record("TEST:proc_call").await.unwrap();
+            let rec = db.get_record("TEST:proc_call").unwrap();
             let inst = rec.read();
             inst.common.time
         };
@@ -2343,7 +2343,7 @@ mod tests {
         let store = QsrvPvStore::new(provider);
 
         let b_time = |db: Arc<PvDatabase>| async move {
-            let rec = db.get_record("FLNK:b").await.unwrap();
+            let rec = db.get_record("FLNK:b").unwrap();
             let inst = rec.read();
             inst.common.time
         };
@@ -2519,7 +2519,7 @@ mod tests {
         let store = QsrvPvStore::new(provider);
 
         let member_time = |db: Arc<PvDatabase>, rec_name: &'static str| async move {
-            let rec = db.get_record(rec_name).await.unwrap();
+            let rec = db.get_record(rec_name).unwrap();
             let inst = rec.read();
             inst.common.time
         };
@@ -2576,7 +2576,7 @@ mod tests {
 
         // The values must land regardless of the process option.
         let a_val = {
-            let rec = db.get_record("MRR10:a").await.unwrap();
+            let rec = db.get_record("MRR10:a").unwrap();
             let inst = rec.read();
             inst.snapshot_for_field("VAL").map(|s| s.value)
         };
@@ -2706,7 +2706,7 @@ mod tests {
         let store = QsrvPvStore::new(provider);
 
         let rec_time = |db: Arc<PvDatabase>, rec: &'static str| async move {
-            let r = db.get_record(rec).await.unwrap();
+            let r = db.get_record(rec).unwrap();
             r.read().common.time
         };
 
@@ -2771,7 +2771,7 @@ mod tests {
         let store = QsrvPvStore::new(provider);
 
         let member_time = |db: Arc<PvDatabase>, rec: &'static str| async move {
-            let rec = db.get_record(rec).await.unwrap();
+            let rec = db.get_record(rec).unwrap();
             let inst = rec.read();
             inst.common.time
         };
@@ -2818,7 +2818,7 @@ mod tests {
             .expect("partial group PUT must succeed");
 
         let a_val = {
-            let rec = db.get_record("BR120:a").await.unwrap();
+            let rec = db.get_record("BR120:a").unwrap();
             let inst = rec.read();
             inst.snapshot_for_field("VAL").map(|s| s.value)
         };
@@ -2835,7 +2835,7 @@ mod tests {
         // Pre-fix the merge made b present, so every member was written
         // and processed; post-fix b is unmarked and must be untouched.
         let b_val = {
-            let rec = db.get_record("BR120:b").await.unwrap();
+            let rec = db.get_record("BR120:b").unwrap();
             let inst = rec.read();
             inst.snapshot_for_field("VAL").map(|s| s.value)
         };
@@ -2883,7 +2883,7 @@ mod tests {
         let store = QsrvPvStore::new(provider);
 
         let member_time = |db: Arc<PvDatabase>, rec: &'static str| async move {
-            let rec = db.get_record(rec).await.unwrap();
+            let rec = db.get_record(rec).unwrap();
             let inst = rec.read();
             inst.common.time
         };
@@ -2967,7 +2967,7 @@ mod tests {
 
         // A record carrying info(Q:group) — pvxs `loadConfigFromDb` source.
         {
-            let rec = db.get_record("GRP:infoval").await.unwrap();
+            let rec = db.get_record("GRP:infoval").unwrap();
             rec.write().set_info(
                 "Q:group",
                 r#"{ "INFO:grp": { "+id": "epics:nt/NTScalar:1.0",

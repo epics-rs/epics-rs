@@ -626,7 +626,7 @@ async fn lock_group_records_read(
 
     let mut records = Vec::new();
     for name in &record_names {
-        if let Some(rec) = db.get_record(name).await {
+        if let Some(rec) = db.get_record(name) {
             records.push((name.clone(), rec));
         }
     }
@@ -650,10 +650,7 @@ async fn group_member_record_names(db: &PvDatabase, members: &[GroupMember]) -> 
             continue; // Structure / Const — no backing record
         }
         let (rec, _) = epics_base_rs::server::database::parse_pv_name(&m.channel);
-        let canonical = db
-            .resolve_alias(rec)
-            .await
-            .unwrap_or_else(|| rec.to_string());
+        let canonical = db.resolve_alias(rec).unwrap_or_else(|| rec.to_string());
         names.push(canonical);
     }
     names.sort();
@@ -994,7 +991,6 @@ impl GroupChannel {
         let rec = self
             .db
             .get_record(record_name)
-            .await
             .ok_or_else(|| BridgeError::RecordNotFound(record_name.to_string()))?;
 
         let instance = rec.read();
@@ -1139,7 +1135,6 @@ impl GroupChannel {
         let rec = self
             .db
             .get_record(record_name)
-            .await
             .ok_or_else(|| BridgeError::RecordNotFound(record_name.to_string()))?;
 
         let instance = rec.read();
@@ -1166,7 +1161,7 @@ impl GroupChannel {
         let (record_name, field_name) =
             epics_base_rs::server::database::parse_pv_name(&member.channel);
 
-        let rec = match self.db.get_record(record_name).await {
+        let rec = match self.db.get_record(record_name) {
             Some(r) => r,
             None => return DbFieldType::Double,
         };
@@ -1208,7 +1203,7 @@ impl GroupChannel {
         // have loaded (the dbChannel creation would have failed); fall back
         // to record-type-blind name classification, which still catches the
         // unambiguous link families.
-        let record_type: &'static str = match self.db.get_record(record_name).await {
+        let record_type: &'static str = match self.db.get_record(record_name) {
             Some(rec) => rec.read().record.record_type(),
             None => "",
         };
@@ -1276,7 +1271,7 @@ impl GroupChannel {
     async fn member_is_char_array(&self, member: &GroupMember) -> bool {
         let (record_name, field_name) =
             epics_base_rs::server::database::parse_pv_name(&member.channel);
-        let Some(rec) = self.db.get_record(record_name).await else {
+        let Some(rec) = self.db.get_record(record_name) else {
             return false;
         };
         let instance = rec.read();
@@ -4035,7 +4030,7 @@ mod tests {
             // precisely so no site outside the owner can open or close the
             // window (the wave-16 regression that stranded a parked put-notify).
             {
-                let rec = db.get_record("PACT:rec").await.unwrap();
+                let rec = db.get_record("PACT:rec").unwrap();
                 let inst = rec.write();
                 inst.enter_pact();
             }
@@ -4044,7 +4039,7 @@ mod tests {
                 .await
                 .expect("a group PUT onto an active record is not an error");
             {
-                let rec = db.get_record("PACT:rec").await.unwrap();
+                let rec = db.get_record("PACT:rec").unwrap();
                 let inst = rec.read();
                 assert!(
                     inst.common.rpro != 0,
@@ -4063,7 +4058,7 @@ mod tests {
 
             // IDLE — the other side of the same boundary.
             {
-                let rec = db.get_record("PACT:rec").await.unwrap();
+                let rec = db.get_record("PACT:rec").unwrap();
                 let mut inst = rec.write();
                 // The release carries any put-notify parked on the window; this
                 // test parks none (a group PUT, not a put-callback), so there is
@@ -4076,7 +4071,7 @@ mod tests {
                 .await
                 .expect("group PUT on an idle record processes");
             {
-                let rec = db.get_record("PACT:rec").await.unwrap();
+                let rec = db.get_record("PACT:rec").unwrap();
                 let inst = rec.read();
                 assert!(
                     inst.common.rpro == 0,
@@ -4531,7 +4526,7 @@ mod tests {
 
         // "Unable to put value: Field Disabled: S_db_putDisabled" — the
         // member's backing record is DISP-disabled (doPreProcessing).
-        db.get_record("MSG:rec").await.unwrap().write().common.disp = 1;
+        db.get_record("MSG:rec").unwrap().write().common.disp = 1;
         let disabled = GroupChannel::new(db.clone(), group_of(putable));
         let err = disabled
             .put(&v)
@@ -4747,7 +4742,7 @@ mod tests {
         mon.start().await.expect("group monitor starts");
 
         // FR-6: plain member subscribes its configured RVAL field, not VAL.
-        let plain = db.get_record("R:plain").await.unwrap();
+        let plain = db.get_record("R:plain").unwrap();
         {
             let plain_inst = plain.read();
             assert!(
@@ -4775,7 +4770,7 @@ mod tests {
 
         // FR-7: meta member value subscription is ALARM-only; the
         // PROPERTY subscription is retained on the same field.
-        let meta = db.get_record("R:meta").await.unwrap();
+        let meta = db.get_record("R:meta").unwrap();
         let meta_inst = meta.read();
         let val_subs = &meta_inst.subscribers["VAL"];
         let masks: Vec<u16> = val_subs.iter().map(|s| s.mask).collect();

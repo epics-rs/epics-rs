@@ -540,7 +540,7 @@ impl PvaLinkResolver {
         let (base, field) = parse_pv_name(&record_path);
         let field = field.strip_suffix('$').unwrap_or(field);
         let field = if field.is_empty() { "VAL" } else { field };
-        match db.get_record(base).await {
+        match db.get_record(base) {
             Some(rec) => rec.read().resolve_field(field).is_some(),
             None => false,
         }
@@ -986,7 +986,7 @@ async fn scan_target_should_process(
     record: &str,
     passive_only: bool,
 ) -> bool {
-    let Some(rec) = db_handle.get_record(record).await else {
+    let Some(rec) = db_handle.get_record(record) else {
         return false;
     };
     let mut tg = rec.write();
@@ -2316,7 +2316,7 @@ mod tests {
 
         // Hold the record Arc and drive it into PACT (async in
         // progress) before the db moves into the forwarder slot.
-        let dest = db.get_record("DEST").await.unwrap();
+        let dest = db.get_record("DEST").unwrap();
         dest.write().enter_pact();
 
         // CP target: scans on every event.
@@ -2695,7 +2695,7 @@ mod tests {
         .unwrap();
         // Wire DEST.FLNK -> DOWNSTREAM.
         {
-            let rec = db.get_record("DEST").await.expect("DEST exists");
+            let rec = db.get_record("DEST").expect("DEST exists");
             let mut inst = rec.write();
             inst.put_common_field("FLNK", EpicsValue::String("DOWNSTREAM".into()))
                 .expect("set FLNK");

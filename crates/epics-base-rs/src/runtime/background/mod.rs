@@ -32,6 +32,7 @@ pub mod callback_executor;
 pub mod delayed_timer;
 pub mod future_exec;
 pub mod scan_once;
+pub mod timer_sleep;
 
 use std::time::Duration;
 

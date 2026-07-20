@@ -1581,12 +1581,7 @@ async fn accept_loop(
                 // Suppress normal disconnection errors (client closed connection)
                 let is_disconnect = matches!(
                     e,
-                    epics_base_rs::error::CaError::Io(ref io) if matches!(
-                        io.kind(),
-                        std::io::ErrorKind::ConnectionReset
-                            | std::io::ErrorKind::BrokenPipe
-                            | std::io::ErrorKind::UnexpectedEof
-                    )
+                    epics_base_rs::error::CaError::Io(ref io) if is_peer_disconnect(io.kind())
                 );
                 if is_disconnect {
                     tracing::debug!(peer = %peer, "client disconnected");
@@ -1598,6 +1593,27 @@ async fn accept_loop(
             }
         });
     }
+}
+
+/// A socket error that means the peer went away (closed or reset the
+/// connection) rather than a genuine server-side failure.
+///
+/// Single owner of the peer-vanished classification: the client loop's
+/// socket I/O break sites and the accept-loop logger must all consult
+/// this predicate, so a client that disappears mid-write is uniformly a
+/// *disconnect* (loop result `Ok`, audit reason "ok"), never a server
+/// error. RSRV behaves the same way — a send failure terminates
+/// `camsgtask` as a client disconnect, not an IOC error. Before the
+/// outbox migration the spawned monitor tasks swallowed their own
+/// EPIPEs; with every write centralized in the client loop, the loop
+/// itself must classify them.
+fn is_peer_disconnect(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::UnexpectedEof
+    )
 }
 
 /// Drain every frame currently queued in the connection outbox into the
@@ -1783,6 +1799,9 @@ where
                             // re-evaluation reaches the client promptly (RSRV
                             // flushes these immediately).
                             if let Err(e) = drain_and_flush(&mut sock, &mut outbox_drain).await {
+                                if is_peer_disconnect(e.kind()) {
+                                    break 'client_loop Ok(());
+                                }
                                 break 'client_loop Err(e.into());
                             }
                             continue;
@@ -1796,6 +1815,7 @@ where
                 read = read_with_optional_timeout(&mut reader, &mut buf, inactivity) => {
                     match read {
                         Ok(Ok(n)) => n,
+                        Ok(Err(e)) if is_peer_disconnect(e.kind()) => break 'client_loop Ok(()),
                         Ok(Err(e)) => break 'client_loop Err(e.into()),
                         Err(idle) => {
                             // Inactivity timeout — close the connection.
@@ -1821,6 +1841,9 @@ where
                         Some(frame) => {
                             let first = frame.len() as u64;
                             if let Err(e) = sock.write_all(&frame).await {
+                                if is_peer_disconnect(e.kind()) {
+                                    break 'client_loop Ok(());
+                                }
                                 break 'client_loop Err(e.into());
                             }
                             match drain_and_flush(&mut sock, &mut outbox_drain).await {
@@ -1831,6 +1854,9 @@ where
                                             std::sync::atomic::Ordering::Relaxed,
                                         );
                                     }
+                                }
+                                Err(e) if is_peer_disconnect(e.kind()) => {
+                                    break 'client_loop Ok(());
                                 }
                                 Err(e) => break 'client_loop Err(e.into()),
                             }
@@ -2175,6 +2201,7 @@ where
                                 .fetch_add(pending_out, std::sync::atomic::Ordering::Relaxed);
                         }
                     }
+                    Err(e) if is_peer_disconnect(e.kind()) => break 'client_loop Ok(()),
                     Err(e) => break 'client_loop Err(e.into()),
                 }
             }

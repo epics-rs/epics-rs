@@ -35,7 +35,7 @@ async fn bad_calc_put_is_rejected_but_the_string_is_stored() {
 
     // C `dbPut` wrote the string BEFORE special() ran and does not roll it
     // back — `caget CALCREC.CALC` reads back what the client sent.
-    let rec = db.get_record("CALCREC").await.unwrap();
+    let rec = db.get_record("CALCREC").unwrap();
     let inst = rec.read();
     assert_eq!(
         inst.record.get_field("CALC"),
@@ -75,7 +75,7 @@ async fn good_calc_put_still_succeeds_and_recompiles() {
 
     // CALC is pp(TRUE) (calcRecord.dbd.pod:569-575), so the accepted put
     // processes the record with the newly compiled RPCL.
-    let rec = db.get_record("CALCOK").await.unwrap();
+    let rec = db.get_record("CALCOK").unwrap();
     let inst = rec.read();
     assert_eq!(inst.record.get_field("VAL"), Some(EpicsValue::Double(20.0)));
 }

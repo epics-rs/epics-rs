@@ -218,7 +218,7 @@ impl IocBuilder {
             // `.db` path only: an inline record has no parsed common fields
             // to classify or fold.
             db.add_record(&name, record).await?;
-            if let Some(rec_arc) = db.get_record(&name).await {
+            if let Some(rec_arc) = db.get_record(&name) {
                 {
                     let mut instance = rec_arc.write();
                     // Seed MLST/ALST/LALM from val so the first process posts a
@@ -279,7 +279,7 @@ impl IocBuilder {
             }
 
             // Device support and the post-init owners for the RecordInstance
-            if let Some(rec_arc) = db.get_record(&def.name).await {
+            if let Some(rec_arc) = db.get_record(&def.name) {
                 // Hand the record its resolved common link fields so a
                 // link-classifying record (calcout INAV..INUV/OUTV) can run
                 // its C `init_record` checkLinks step now — the common OUT
@@ -490,7 +490,7 @@ record(ai, "AI:WITH:INFO") {
             .await
             .unwrap();
 
-        let rec = db.get_record("AI:WITH:INFO").await.unwrap();
+        let rec = db.get_record("AI:WITH:INFO").unwrap();
         let inst = rec.read();
         assert_eq!(inst.get_info("asyn:READBACK"), Some("1"));
         assert_eq!(inst.get_info("Q:group"), Some("myGroup"));
@@ -521,7 +521,7 @@ record(ai, "AI:BPT") {
             .await
             .unwrap();
 
-        let rec = db.get_record("AI:BPT").await.unwrap();
+        let rec = db.get_record("AI:BPT").unwrap();
         let mut inst = rec.write();
         // "ramp" is a non-standard name -> first user-table index (15); the
         // standard menuConvert names reserve 3..=14.
@@ -579,7 +579,7 @@ record(ai, "AI:DYN") {
             .await
             .unwrap();
 
-        let rec = db.get_record("AI:DYN").await.unwrap();
+        let rec = db.get_record("AI:DYN").unwrap();
         let inst = rec.read();
         assert!(
             inst.device.is_some(),
@@ -652,7 +652,7 @@ record(ai, "REC:B") { field(DTYP, "DTB") }
         // Both records should have a device attached — proves the
         // newer factory passes through DTA to the older factory.
         for name in ["REC:A", "REC:B"] {
-            let rec = db.get_record(name).await.unwrap();
+            let rec = db.get_record(name).unwrap();
             assert!(
                 rec.read().device.is_some(),
                 "factory chaining failed for {name}"

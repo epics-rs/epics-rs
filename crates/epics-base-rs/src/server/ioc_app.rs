@@ -1116,7 +1116,7 @@ pub(crate) async fn wire_device_support(
     let names = db.all_record_names().await;
     let mut count = 0;
     for name in names {
-        if let Some(rec_arc) = db.get_record(&name).await {
+        if let Some(rec_arc) = db.get_record(&name) {
             let mut instance = rec_arc.write();
             let dtyp = instance.common.dtyp.clone();
             if !crate::server::device_support::is_soft_dtyp(&dtyp) {
@@ -1158,7 +1158,7 @@ async fn wire_subroutines(db: &PvDatabase, registry: &HashMap<String, Arc<Subrou
     }
     let names = db.all_record_names().await;
     for name in names {
-        if let Some(rec_arc) = db.get_record(&name).await {
+        if let Some(rec_arc) = db.get_record(&name) {
             let mut instance = rec_arc.write();
             // Both `sub` and `aSub` resolve their subroutine from SNAM via the
             // function registry at init (C `subRecord.c` / `aSubRecord.c`
@@ -1211,7 +1211,7 @@ async fn wire_subroutines(db: &PvDatabase, registry: &HashMap<String, Arc<Subrou
 /// `update_scan_index`, so the record also leaves the `IoIntr` scan bucket that
 /// `scanpiol` and `dbla` report from.
 async fn demote_io_intr_to_passive(db: &PvDatabase, name: &str, reason: &str) {
-    let Some(rec_arc) = db.get_record(name).await else {
+    let Some(rec_arc) = db.get_record(name) else {
         return;
     };
     let result = {
@@ -1243,7 +1243,7 @@ pub(crate) async fn setup_io_intr(db: Arc<PvDatabase>) -> usize {
     let io_intr_recs: Vec<(String, Arc<parking_lot::RwLock<record::RecordInstance>>)> = {
         let mut recs = Vec::new();
         for name in &all_names {
-            if let Some(arc) = db.get_record(name).await {
+            if let Some(arc) = db.get_record(name) {
                 recs.push((name.clone(), arc));
             }
         }
@@ -1333,7 +1333,7 @@ pub(crate) async fn setup_property_posts(db: Arc<PvDatabase>) -> usize {
     let names = db.all_record_names().await;
     let mut count = 0;
     for name in names {
-        if let Some(rec_arc) = db.get_record(&name).await {
+        if let Some(rec_arc) = db.get_record(&name) {
             let mut inst = rec_arc.write();
             if let Some(mut dev) = inst.device.take() {
                 if let Some(mut rx) = dev.property_post_receiver() {
@@ -1375,7 +1375,7 @@ mod io_intr_scan_add_tests {
             .await
             .unwrap();
         {
-            let rec = db.get_record("NODEV").await.unwrap();
+            let rec = db.get_record("NODEV").unwrap();
             let mut inst = rec.write();
             inst.common.scan = ScanType::IoIntr;
         }
@@ -1391,7 +1391,7 @@ mod io_intr_scan_add_tests {
         assert_eq!(wired, 0, "no device support ⇒ nothing to wire");
 
         // C: `precord->scan = menuScanPassive` — `caget NODEV.SCAN` reads Passive.
-        let rec = db.get_record("NODEV").await.unwrap();
+        let rec = db.get_record("NODEV").unwrap();
         assert_eq!(
             rec.read().common.scan,
             ScanType::Passive,
@@ -1430,7 +1430,7 @@ mod io_intr_scan_add_tests {
             .await
             .unwrap();
         {
-            let rec = db.get_record("NOINTR").await.unwrap();
+            let rec = db.get_record("NOINTR").unwrap();
             let mut inst = rec.write();
             inst.common.scan = ScanType::IoIntr;
             inst.device = Some(Box::new(NoIntrDevice));
@@ -1441,7 +1441,7 @@ mod io_intr_scan_add_tests {
         let wired = setup_io_intr(db.clone()).await;
         assert_eq!(wired, 0, "no interrupt source ⇒ nothing to wire");
 
-        let rec = db.get_record("NOINTR").await.unwrap();
+        let rec = db.get_record("NOINTR").unwrap();
         {
             let inst = rec.read();
             assert_eq!(
@@ -1467,7 +1467,7 @@ mod io_intr_scan_add_tests {
             .unwrap();
         let wired = setup_io_intr(db.clone()).await;
         assert_eq!(wired, 0);
-        let rec = db.get_record("PASV").await.unwrap();
+        let rec = db.get_record("PASV").unwrap();
         assert_eq!(rec.read().common.scan, ScanType::Passive);
     }
 }
@@ -1709,7 +1709,7 @@ mod tests {
             .unwrap();
         // Populate the record's info map — exactly what
         // IocBuilder/iocsh now do after loading info(...) directives.
-        let rec = db.get_record("AI:WITH:INFO").await.unwrap();
+        let rec = db.get_record("AI:WITH:INFO").unwrap();
         {
             let mut inst = rec.write();
             inst.common.dtyp = "TestRecording".to_string();
@@ -1770,7 +1770,7 @@ mod tests {
             db.add_record(name, Box::new(AiRecord::new(0.0)))
                 .await
                 .unwrap();
-            let rec = db.get_record(name).await.unwrap();
+            let rec = db.get_record(name).unwrap();
             let mut inst = rec.write();
             inst.common.dtyp = "SeqDev".to_string();
             // `DeviceSupportContext` carries the links, not the record name;
@@ -1866,7 +1866,7 @@ mod tests {
             .await
             .unwrap();
         {
-            let rec = db.get_record("BO:RBK").await.unwrap();
+            let rec = db.get_record("BO:RBK").unwrap();
             let mut inst = rec.write();
             // Non-soft DTYP so the read stage is eligible to run.
             inst.common.dtyp = "TestReadback".to_string();
@@ -1885,7 +1885,7 @@ mod tests {
                 .unwrap();
         }
         {
-            let rec = db.get_record("BO:RBK").await.unwrap();
+            let rec = db.get_record("BO:RBK").unwrap();
             let inst = rec.read();
             assert_eq!(
                 inst.record.get_field("VAL"),
@@ -1902,7 +1902,7 @@ mod tests {
         // Put/scan cycle: a normal process still writes the setpoint to the
         // driver exactly once (device_callback == false).
         {
-            let rec = db.get_record("BO:RBK").await.unwrap();
+            let rec = db.get_record("BO:RBK").unwrap();
             let mut inst = rec.write();
             inst.record.put_field("VAL", EpicsValue::Enum(1)).unwrap();
         }

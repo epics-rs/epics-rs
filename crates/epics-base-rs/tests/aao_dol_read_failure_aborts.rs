@@ -133,7 +133,7 @@ async fn dead_dol_raises_a_pending_link_alarm() {
     let db = build().await;
     process(&db, "AAO:DEAD").await;
 
-    let rec = db.get_record("AAO:DEAD").await.unwrap();
+    let rec = db.get_record("AAO:DEAD").unwrap();
     let common = &rec.read().common;
     assert_eq!(
         common.nsev,

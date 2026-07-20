@@ -493,7 +493,7 @@ impl PvDatabase {
         }
 
         // Records — alias-aware via `get_record` (epics-base PR #336).
-        if let Some(rec) = self.get_record(base).await {
+        if let Some(rec) = self.get_record(base) {
             let instance = rec.read();
             return instance
                 .resolve_field(&field)
@@ -544,7 +544,7 @@ impl PvDatabase {
         // only runs against an established channel — the record is
         // guaranteed present there — and a `BridgeChannel` likewise always
         // binds a real record in production.
-        let Some(rec) = self.get_record(record_name).await else {
+        let Some(rec) = self.get_record(record_name) else {
             return Ok(());
         };
         let instance = rec.read();
@@ -573,7 +573,7 @@ impl PvDatabase {
     /// and is not asked about here; see [`put_drives_processing_of`].
     pub async fn put_drives_processing(&self, record_name: &str, field: &str) -> bool {
         let field_upper = field.to_ascii_uppercase();
-        let Some(rec) = self.get_record(record_name).await else {
+        let Some(rec) = self.get_record(record_name) else {
             return false;
         };
         let instance = rec.read();
@@ -596,13 +596,11 @@ impl PvDatabase {
         }
 
         // Records — alias-aware (epics-base PR #336).
-        if let Some(rec) = self.get_record(base).await {
+        if let Some(rec) = self.get_record(base) {
             // `base` may be an alias; resolve to the canonical record
             // name so scan-index updates target the right entry.
-            let canonical_base: String = self
-                .resolve_alias(base)
-                .await
-                .unwrap_or_else(|| base.to_string());
+            let canonical_base: String =
+                self.resolve_alias(base).unwrap_or_else(|| base.to_string());
             // advisory write gate (`dbScanLock` analogue) so a
             // plain `put_pv` to a backing record cannot interleave
             // with an atomic group transaction holding the same gate.
@@ -880,7 +878,7 @@ impl PvDatabase {
             return Ok(());
         }
 
-        if let Some(rec) = self.get_record(base).await {
+        if let Some(rec) = self.get_record(base) {
             // `put_pv_and_post` is a public record-write API —
             // it must take the same advisory write gate
             // (`dbScanLock` analogue) as `put_pv` /
@@ -890,10 +888,8 @@ impl PvDatabase {
             // atomic scan epoch holding `lock_records`. `base` is
             // alias-resolved to the canonical record name so an alias
             // and its target share one gate. Held until return.
-            let canonical_base: String = self
-                .resolve_alias(base)
-                .await
-                .unwrap_or_else(|| base.to_string());
+            let canonical_base: String =
+                self.resolve_alias(base).unwrap_or_else(|| base.to_string());
             let _record_gate = self.lock_record(&canonical_base).await;
 
             // Guarded: the value write + monitor post. The data guard is released
@@ -1160,11 +1156,9 @@ impl PvDatabase {
         let field_upper = field.to_ascii_uppercase();
         let rec = self
             .get_record(record_name)
-            .await
             .ok_or_else(|| CaError::ChannelNotFound(record_name.to_string()))?;
         let canonical: String = self
             .resolve_alias(record_name)
-            .await
             .unwrap_or_else(|| record_name.to_string());
         let _record_gate = self.lock_record(&canonical).await;
 
@@ -1217,7 +1211,7 @@ impl PvDatabase {
             // Collect-then-act: clone the handle under a brief map read, drop
             // the map lock before taking the per-record write lock.
             let rec_arc = {
-                let recs = self.inner.records.read().await;
+                let recs = self.inner.records.read();
                 recs.get(record_name).cloned()
             };
             let Some(rec_arc) = rec_arc else {
@@ -1300,7 +1294,7 @@ impl PvDatabase {
         acquire_gate: bool,
     ) -> CaResult<()> {
         {
-            let Some(rec) = self.get_record(record_name).await else {
+            let Some(rec) = self.get_record(record_name) else {
                 return Ok(());
             };
             let mut instance = rec.write();
@@ -1368,7 +1362,6 @@ impl PvDatabase {
         // the canonical record.
         let rec = self
             .get_record(record_name)
-            .await
             .ok_or_else(|| CaError::ChannelNotFound(record_name.to_string()))?;
         // Normalise to the canonical name for the rest of this
         // function — every subsequent call (PACT/LCNT lookup,
@@ -1376,7 +1369,7 @@ impl PvDatabase {
         // raw records map and would miss when `record_name` is an
         // alias. Resolve once up front.
         let canonical_owned;
-        let record_name: &str = if let Some(target) = self.resolve_alias(record_name).await {
+        let record_name: &str = if let Some(target) = self.resolve_alias(record_name) {
             canonical_owned = target;
             &canonical_owned
         } else {
@@ -1543,7 +1536,7 @@ impl PvDatabase {
             // back so the client still sees `ECA_PUTFAIL`.
             let proc_store: CaResult<()> = {
                 let rec_arc = {
-                    let recs = self.inner.records.read().await;
+                    let recs = self.inner.records.read();
                     recs.get(record_name).cloned()
                 };
                 if let Some(rec_arc) = rec_arc {
@@ -1584,7 +1577,7 @@ impl PvDatabase {
                     // Collect-then-act: clone the handle under a brief map
                     // read, drop the map lock before the per-record write.
                     let rec_arc = {
-                        let recs = self.inner.records.read().await;
+                        let recs = self.inner.records.read();
                         recs.get(record_name).cloned()
                     };
                     if let Some(rec_arc) = rec_arc {
@@ -2044,7 +2037,7 @@ impl PvDatabase {
                 // Collect-then-act: clone the handle under a brief map read,
                 // drop the map lock before the per-record write.
                 let rec_arc = {
-                    let recs = self.inner.records.read().await;
+                    let recs = self.inner.records.read();
                     recs.get(record_name).cloned()
                 };
                 if let Some(rec_arc) = rec_arc {
@@ -2084,7 +2077,7 @@ impl PvDatabase {
             // Collect-then-act: clone the handle under a brief map read, drop
             // the map lock before the per-record write.
             let rec_arc = {
-                let recs = self.inner.records.read().await;
+                let recs = self.inner.records.read();
                 recs.get(record_name).cloned()
             };
             if let Some(rec_arc) = rec_arc {
@@ -2114,7 +2107,7 @@ impl PvDatabase {
         // clear; its `!is_processing()` gate already preserves PUTF
         // across an async-pending device round-trip.
         let originating_pending = want_notify && {
-            let rec = self.inner.records.read().await;
+            let rec = self.inner.records.read();
             if let Some(rec_arc) = rec.get(record_name) {
                 rec_arc.read().notify.is_some()
             } else {
@@ -2135,7 +2128,7 @@ impl PvDatabase {
             // Collect-then-act: clone the handle under a brief map read, drop
             // the map lock before the per-record write.
             let rec_arc = {
-                let recs = self.inner.records.read().await;
+                let recs = self.inner.records.read();
                 recs.get(record_name).cloned()
             };
             if let Some(rec_arc) = rec_arc {
@@ -2177,7 +2170,7 @@ impl PvDatabase {
         }
 
         // Records — alias-aware (epics-base PR #336).
-        if let Some(rec) = self.get_record(base).await {
+        if let Some(rec) = self.get_record(base) {
             // `put_pv_no_process` is a public record-write API
             // (autosave restore). It must take the advisory write gate
             // (`dbScanLock` analogue) so an autosave restore cannot
@@ -2185,10 +2178,8 @@ impl PvDatabase {
             // a pvalink atomic scan epoch holding `lock_records`.
             // `base` is alias-resolved so an alias and its target
             // share one gate. Held until return.
-            let canonical_base: String = self
-                .resolve_alias(base)
-                .await
-                .unwrap_or_else(|| base.to_string());
+            let canonical_base: String =
+                self.resolve_alias(base).unwrap_or_else(|| base.to_string());
             let _record_gate = self.lock_record(&canonical_base).await;
 
             let mut instance = rec.write();
@@ -2522,7 +2513,7 @@ mod tests {
         db.add_record("A:REC", Box::new(AiRecord::new(1.0)))
             .await
             .unwrap();
-        let rec = db.get_record("A:REC").await.expect("record exists");
+        let rec = db.get_record("A:REC").expect("record exists");
 
         let (mut alarm_rx, mut value_rx) = {
             let mut inst = rec.write();
@@ -2591,7 +2582,7 @@ mod tests {
         db.add_record("M:ENUM", Box::new(MbbiRecord::new(0)))
             .await
             .unwrap();
-        let rec = db.get_record("M:ENUM").await.expect("record exists");
+        let rec = db.get_record("M:ENUM").expect("record exists");
 
         let (mut prop_rx, mut val_rx) = {
             let mut inst = rec.write();

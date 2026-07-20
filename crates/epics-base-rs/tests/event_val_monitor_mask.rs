@@ -31,7 +31,7 @@ use epics_base_rs::types::{DbFieldType, EpicsValue};
 const ALL: u16 = 0x07; // DBE_VALUE | DBE_LOG | DBE_ALARM
 
 async fn subscribe_val(db: &PvDatabase, rec: &str, dbf: DbFieldType) -> EventReader {
-    let inst = db.get_record(rec).await.unwrap();
+    let inst = db.get_record(rec).unwrap();
     let mut g = inst.write();
     g.add_subscriber("VAL", 1, dbf, ALL)
         .expect("VAL subscription must be accepted")
@@ -109,7 +109,7 @@ async fn r9_77_dbe_log_only_subscriber_receives_nothing() {
         .await
         .unwrap();
     let mut rx = {
-        let inst = db.get_record("EV").await.unwrap();
+        let inst = db.get_record("EV").unwrap();
         let mut g = inst.write();
         g.add_subscriber("VAL", 1, DbFieldType::String, 0x02) // DBE_LOG only
             .expect("VAL subscription must be accepted")

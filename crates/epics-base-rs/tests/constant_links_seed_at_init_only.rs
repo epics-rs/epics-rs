@@ -29,7 +29,7 @@ use epics_base_rs::types::EpicsValue;
 use std::collections::HashSet;
 
 async fn field(db: &PvDatabase, rec: &str, f: &str) -> EpicsValue {
-    let r = db.get_record(rec).await.unwrap();
+    let r = db.get_record(rec).unwrap();
     let inst = r.read();
     inst.record.get_field(f).unwrap()
 }

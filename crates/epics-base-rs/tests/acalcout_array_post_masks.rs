@@ -72,7 +72,7 @@ async fn acalcout_with(db: &PvDatabase, calc: &str) {
 }
 
 async fn subscribe_aa(db: &PvDatabase) -> epics_base_rs::server::event_queue::EventReader {
-    let inst = db.get_record("A").await.unwrap();
+    let inst = db.get_record("A").unwrap();
     let mut g = inst.write();
     g.add_subscriber(
         "AA",
@@ -132,7 +132,7 @@ async fn w10_a5_an_amask_only_array_posts_a_literal_value_log() {
     let db = PvDatabase::new();
     acalcout_with(&db, "CC:=AA+0;SUM(AA)").await;
 
-    let inst = db.get_record("A").await.unwrap();
+    let inst = db.get_record("A").unwrap();
     let mut cc_rx = inst
         .write()
         .add_subscriber(

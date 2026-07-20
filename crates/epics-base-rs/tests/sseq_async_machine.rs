@@ -593,7 +593,7 @@ async fn sseq_seln_out_of_range_raises_invalid_alarm_and_no_dispatch() {
     // kick returns with the alarm already evaluated.
     kick(&db, "SSEQ_SELN").await;
 
-    let rec = db.get_record("SSEQ_SELN").await.unwrap();
+    let rec = db.get_record("SSEQ_SELN").unwrap();
     let inst = rec.read();
     assert_eq!(
         inst.common.sevr,

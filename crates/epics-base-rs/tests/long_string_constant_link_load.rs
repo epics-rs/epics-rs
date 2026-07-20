@@ -49,7 +49,7 @@ async fn build(db_text: &str) -> std::sync::Arc<PvDatabase> {
 
 /// `(VAL, LEN, UDF)` — the three fields softIoc was probed on.
 async fn state(db: &PvDatabase, rec: &str) -> (String, u32, bool) {
-    let r = db.get_record(rec).await.unwrap();
+    let r = db.get_record(rec).unwrap();
     let inst = r.read();
     let val = match inst.record.get_field("VAL").unwrap() {
         EpicsValue::CharArray(bytes) => {

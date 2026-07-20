@@ -28,7 +28,7 @@ const PV_NC: u16 = 1;
 const NO_PV: u16 = 2;
 
 async fn field(db: &PvDatabase, rec: &str, f: &str) -> Option<EpicsValue> {
-    let inst = db.get_record(rec).await.unwrap();
+    let inst = db.get_record(rec).unwrap();
     let g = inst.read();
     g.record.get_field(f)
 }
@@ -154,7 +154,6 @@ async fn r9_76_unresolvable_dol_keeps_dold_and_still_writes_it() {
     db.add_record("W", Box::new(w)).await.unwrap();
     // OUT routes through RecordInstance::put_common_field (populates parsed_out).
     db.get_record("W")
-        .await
         .unwrap()
         .write()
         .put_common_field("OUT", EpicsValue::String("SINK".into()))
@@ -202,7 +201,6 @@ async fn r9_76_connected_dol_is_fetched_at_output_time() {
     db.add_record("W", Box::new(w)).await.unwrap();
     // OUT routes through RecordInstance::put_common_field (populates parsed_out).
     db.get_record("W")
-        .await
         .unwrap()
         .write()
         .put_common_field("OUT", EpicsValue::String("SINK".into()))

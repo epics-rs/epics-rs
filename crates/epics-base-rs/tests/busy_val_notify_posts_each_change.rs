@@ -50,7 +50,7 @@ fn drain(rx: &mut EventReader) -> Vec<EpicsValue> {
 #[tokio::test]
 async fn busy_val_notify_sequence_posts_each_change() {
     let db = build().await;
-    let r = db.get_record("B").await.unwrap();
+    let r = db.get_record("B").unwrap();
     let mut rx = {
         let mut inst = r.write();
         inst.add_subscriber("VAL", 1, DbFieldType::Enum, EventMask::VALUE.bits())

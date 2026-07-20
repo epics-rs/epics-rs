@@ -41,7 +41,7 @@ async fn add_source(db: &PvDatabase) {
     db.add_record("SRC", Box::new(AiRecord::new(200.0)))
         .await
         .unwrap();
-    let rec = db.get_record("SRC").await.unwrap();
+    let rec = db.get_record("SRC").unwrap();
     let mut inst = rec.write();
     inst.put_common_field("HIHI", EpicsValue::Double(100.0))
         .unwrap();
@@ -55,7 +55,7 @@ async fn process(db: &PvDatabase, name: &str) {
 }
 
 async fn alarm_of(db: &PvDatabase, name: &str) -> (u16, AlarmSeverity) {
-    let rec = db.get_record(name).await.expect("record exists");
+    let rec = db.get_record(name).expect("record exists");
     let inst = rec.read();
     (inst.common.stat, inst.common.sevr)
 }

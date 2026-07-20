@@ -43,7 +43,6 @@ use std::collections::HashSet;
 
 async fn field(db: &PvDatabase, rec: &str, f: &str) -> EpicsValue {
     db.get_record(rec)
-        .await
         .unwrap_or_else(|| panic!("{rec} missing"))
         .read()
         .record
@@ -99,7 +98,7 @@ async fn calcout_put_to_a_constant_inp_reseeds_the_value_field() {
 #[tokio::test]
 async fn calcout_reseed_posts_the_value_field() {
     let db = calcout_db().await;
-    let inst = db.get_record("CO").await.unwrap();
+    let inst = db.get_record("CO").unwrap();
     let mut b_rx = inst
         .write()
         .add_subscriber("B", 1, DbFieldType::Double, EventMask::VALUE.bits())
@@ -215,7 +214,7 @@ async fn transform_put_to_a_constant_inp_reseeds_and_posts_value_log() {
     db.add_record("T", Box::new(t)).await.unwrap();
     assert_eq!(field(&db, "T", "B").await, EpicsValue::Double(2.0));
 
-    let inst = db.get_record("T").await.unwrap();
+    let inst = db.get_record("T").unwrap();
     let mut b_rx = inst
         .write()
         .add_subscriber(

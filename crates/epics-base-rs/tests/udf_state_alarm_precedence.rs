@@ -53,7 +53,7 @@ async fn caput_raw(db: &PvDatabase, field: &str, ordinal: i16) {
 }
 
 async fn alarm(db: &PvDatabase) -> (AlarmSeverity, u16) {
-    let inst = db.get_record("REC").await.unwrap();
+    let inst = db.get_record("REC").unwrap();
     let g = inst.read();
     (g.common.sevr, g.common.stat)
 }

@@ -53,7 +53,7 @@ record(bi, "DBST_BI") {
         .await
         .unwrap();
 
-    let bi = db.get_record("DBST_BI").await.expect("bi exists");
+    let bi = db.get_record("DBST_BI").expect("bi exists");
     {
         let inst = bi.read();
         assert_ne!(
@@ -112,7 +112,7 @@ record(ai, "DBST_AI") {
         .await
         .unwrap();
 
-    let ai = db.get_record("DBST_AI").await.expect("ai exists");
+    let ai = db.get_record("DBST_AI").expect("ai exists");
     let inst = ai.read();
     assert_eq!(
         inst.common.sevr,

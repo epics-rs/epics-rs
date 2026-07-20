@@ -63,7 +63,7 @@ async fn r15_64_menu_target_receives_the_osv_label() {
 
     process(&db, "SC").await;
 
-    let prio = db.get_record("TGT").await.unwrap().read().common.prio;
+    let prio = db.get_record("TGT").unwrap().read().common.prio;
     assert_eq!(
         prio, 2,
         "a DBF_MENU target takes DBR_STRING from OSV — the label \"HIGH\" \

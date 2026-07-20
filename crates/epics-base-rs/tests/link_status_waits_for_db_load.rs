@@ -41,7 +41,7 @@ const LINK_LOC: u16 = 2;
 const LINK_CONST: u16 = 3;
 
 async fn inav(db: &PvDatabase, rec: &str) -> u16 {
-    let inst = db.get_record(rec).await.unwrap();
+    let inst = db.get_record(rec).unwrap();
     let inst = inst.read();
     match inst.record.get_field("INAV") {
         Some(EpicsValue::Enum(v)) => v,

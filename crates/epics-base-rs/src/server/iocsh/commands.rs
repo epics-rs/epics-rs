@@ -162,7 +162,7 @@ fn cmd_dbl() -> CommandDef {
 
             for name in &names {
                 if let Some(filter) = type_filter {
-                    let rec = ctx.block_on(ctx.db().get_record(name));
+                    let rec = ctx.db().get_record(name);
                     if let Some(rec) = rec {
                         let inst = rec.read();
                         if inst.record.record_type() != filter {
@@ -248,7 +248,7 @@ fn cmd_dbpf() -> CommandDef {
 
             // Try to determine the field type for proper parsing
             let dbf_type = ctx.block_on(async {
-                if let Some(rec) = ctx.db().get_record(base).await {
+                if let Some(rec) = ctx.db().get_record(base) {
                     let inst = rec.read();
                     // Check record-specific fields
                     if let Some(t) = crate::server::record::record_instance::declared_field_type_of(
@@ -294,7 +294,7 @@ fn cmd_dbpf() -> CommandDef {
             // the record. Fall back to put_pv for simple PVs.
             let put_result: CaResult<()> = ctx.block_on(async {
                 let db = ctx.db();
-                if db.get_record(base).await.is_some() {
+                if db.get_record(base).is_some() {
                     db.put_record_field_from_ca_no_notify(base, &field, value)
                         .await
                 } else {
@@ -358,7 +358,8 @@ fn cmd_dbpr() -> CommandDef {
             };
 
             let rec = ctx
-                .block_on(ctx.db().get_record(name))
+                .db()
+                .get_record(name)
                 .ok_or_else(|| format!("record '{}' not found", name))?;
 
             // Collect field values inside lock, format outside
@@ -511,7 +512,7 @@ fn dbsr_handler(args: &[ArgValue], ctx: &CommandContext) -> CommandResult {
             continue;
         }
         // Dump each requested field for this record.
-        if let Some(rec_arc) = ctx.block_on(ctx.db().get_record(name)) {
+        if let Some(rec_arc) = ctx.db().get_record(name) {
             let inst = rec_arc.read();
             for fname in &fields {
                 let value = inst
@@ -793,7 +794,7 @@ fn cmd_db_create_record() -> CommandDef {
                 ctx.println(&format!("dbCreateRecord: {e}"));
                 return Ok(CommandOutcome::Continue);
             }
-            if ctx.block_on(ctx.db().get_record(&name)).is_some() {
+            if ctx.db().get_record(&name).is_some() {
                 ctx.println(&format!("dbCreateRecord: record '{name}' already exists"));
                 return Ok(CommandOutcome::Continue);
             }
@@ -1113,7 +1114,7 @@ fn cmd_db_load_records() -> CommandDef {
                     // included NDArrayBase.template). A different
                     // record_type is fatal. `dbRecordsOnceOnly` global
                     // is not yet wired; tighten here if/when needed.
-                    let existing = if let Some(rec) = ctx.db().get_record(&def.name).await {
+                    let existing = if let Some(rec) = ctx.db().get_record(&def.name) {
                         let r = rec.read();
                         let existing_type = r.record.record_type();
                         if existing_type != def.record_type {
@@ -1167,7 +1168,7 @@ fn cmd_db_load_records() -> CommandDef {
                         if let Err(e) = ctx.db().add_loaded_record(&def.name, record, load).await {
                             return Err(format!("dbLoadRecords: '{}' rejected: {e}", def.name));
                         }
-                        ctx.db().get_record(&def.name).await.ok_or_else(|| {
+                        ctx.db().get_record(&def.name).ok_or_else(|| {
                             format!(
                                 "dbLoadRecords: '{}' vanished between add_record and get_record",
                                 def.name
@@ -1651,7 +1652,7 @@ async fn suggest_field_name(
     typo: &str,
 ) -> Option<String> {
     let typo_uc = typo.to_ascii_uppercase();
-    let rec = db.get_record(record_name).await?;
+    let rec = db.get_record(record_name)?;
     let inst = rec.read();
     let mut candidates: Vec<&str> = inst.record.field_list().iter().map(|d| d.name).collect();
     // Common dbCommon fields are also valid PUT targets.
@@ -1909,7 +1910,7 @@ record(bo, "$(P)_calc_ctrl") {{
 
         let dtyp_of = |name: &str| -> String {
             ctx.block_on(async {
-                let rec = db.get_record(name).await.expect("record loaded");
+                let rec = db.get_record(name).expect("record loaded");
                 let inst = rec.read();
                 inst.common.dtyp.clone()
             })
@@ -1985,7 +1986,7 @@ record(bo, "$(P)_calc_ctrl") {{
 
         // The device-support NAME landed on the record's DTYP.
         let dtyp = ctx.block_on(async {
-            let rec = db.get_record("DEV").await.expect("record present");
+            let rec = db.get_record("DEV").expect("record present");
             let inst = rec.read();
             inst.common.dtyp.clone()
         });
@@ -2033,7 +2034,7 @@ record(bo, "$(P)_calc_ctrl") {{
         // The contributed NAME is what landed on DTYP — not NoChange, not a
         // stale value.
         let dtyp = ctx.block_on(async {
-            let rec = db.get_record("CONTRIB").await.expect("record present");
+            let rec = db.get_record("CONTRIB").expect("record present");
             let inst = rec.read();
             inst.common.dtyp.clone()
         });
@@ -2143,7 +2144,6 @@ record(mbbo, "DUP:CM") {{
         ctx.block_on(async {
             let rec = db
                 .get_record("DUP:CM")
-                .await
                 .expect("DUP:CM must be registered exactly once");
             let inst = rec.read();
             // Last-write-wins: DESC + ZRST should reflect the SECOND
@@ -2214,7 +2214,7 @@ record(ao, "BPT:RBK") {{ field(LINR, "ramp") }}
         ));
 
         ctx.block_on(async {
-            let rec = db.get_record("BPT:RBK").await.expect("BPT:RBK exists");
+            let rec = db.get_record("BPT:RBK").expect("BPT:RBK exists");
             let mut inst = rec.write();
             // The merge resolved "ramp" (non-standard) to the first user-table
             // index (15); standard menuConvert names reserve 3..=14.
@@ -2282,7 +2282,7 @@ record(ai, "A:BPT") {{ field(LINR, "zebra") }}
         ));
 
         ctx.block_on(async {
-            let rec = db.get_record("A:BPT").await.expect("A:BPT exists");
+            let rec = db.get_record("A:BPT").expect("A:BPT exists");
             let mut inst = rec.write();
             inst.record
                 .put_field("RVAL", crate::types::EpicsValue::Long(50))
@@ -2373,7 +2373,7 @@ record(mbbo, "DUP:CM") {{
     }
 
     fn exists(db: &PvDatabase, ctx: &CommandContext, name: &str) -> bool {
-        ctx.block_on(async { db.get_record(name).await.is_some() })
+        ctx.block_on(async { db.get_record(name).is_some() })
     }
 
     /// Boundary: LOAD phase (pre-`iocInit`). Both creators work — the control
@@ -2574,7 +2574,7 @@ record(mbboDirect, "MBD0") {{ }}
         ctx.block_on(async {
             let udf = |name: &'static str| {
                 let db = db.clone();
-                async move { db.get_record(name).await.unwrap().read().common.udf != 0 }
+                async move { db.get_record(name).unwrap().read().common.udf != 0 }
             };
             assert!(
                 !udf("HG").await,
@@ -2585,12 +2585,7 @@ record(mbboDirect, "MBD0") {{ }}
                 "mbboDirect: the B0..B1F fold clears UDF at init (softIoc: UDF 0)"
             );
             assert_eq!(
-                db.get_record("MBD")
-                    .await
-                    .unwrap()
-                    .read()
-                    .record
-                    .get_field("VAL"),
+                db.get_record("MBD").unwrap().read().record.get_field("VAL"),
                 Some(crate::types::EpicsValue::Long(5)),
                 "B0|B2 folds into VAL=5"
             );

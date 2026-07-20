@@ -572,7 +572,7 @@ impl PvDatabase {
     ) -> Option<PvString> {
         if let crate::server::record::ParsedLink::Db(db) = link
             && self.has_name_no_resolve(&db.record).await
-            && let Some(rec) = self.get_record(&db.record).await
+            && let Some(rec) = self.get_record(&db.record)
         {
             let guard = rec.read();
             return guard.field_as_dbr_string(&db.field);
@@ -670,7 +670,7 @@ impl PvDatabase {
                 // Strip `.FIELD` suffix to land on the record name.
                 let record_name = src.rsplit_once('.').map(|(r, _)| r).unwrap_or(src);
                 if self.has_name_no_resolve(record_name).await {
-                    let rec = self.get_record(record_name).await?;
+                    let rec = self.get_record(record_name)?;
                     let inst = rec.read();
                     Some(inst.common.time)
                 } else {
@@ -757,11 +757,9 @@ impl PvDatabase {
             crate::server::record::ParsedLink::Db(db) => {
                 let target = self
                     .resolve_alias(&db.record)
-                    .await
                     .unwrap_or_else(|| db.record.clone());
                 let reader = self
                     .resolve_alias(reader_name)
-                    .await
                     .unwrap_or_else(|| reader_name.to_string());
                 if target == reader {
                     return None;
@@ -806,7 +804,7 @@ impl PvDatabase {
                 // Read source record's alarm state — alias-aware
                 // (epics-base PR #336) so a link target spelled with
                 // an alias still propagates MS/NMS alarm correctly.
-                let alarm = if let Some(rec) = self.get_record(&db.record).await {
+                let alarm = if let Some(rec) = self.get_record(&db.record) {
                     let inst = rec.read();
                     Some(LinkAlarm::committed(&inst.common))
                 } else {
@@ -1228,7 +1226,7 @@ impl PvDatabase {
             };
             return self.external_link_metadata(&pv).await;
         }
-        let record = self.get_record(&db.record).await?;
+        let record = self.get_record(&db.record)?;
         // C `dbGet(paddr, DBR_DOUBLE, &buffer, &option, ...)` under the
         // target's lock (`dbDbLink.c:252-256` between `dbScanLock` /
         // `dbScanUnlock`). A field the target does not have is C's
@@ -1296,7 +1294,7 @@ impl PvDatabase {
         if db.policy != crate::server::record::LinkProcessPolicy::ProcessPassive {
             return;
         }
-        if let Some(src) = self.get_record(&db.record).await {
+        if let Some(src) = self.get_record(&db.record) {
             let is_passive = src.read().common.scan == crate::server::record::ScanType::Passive;
             if is_passive {
                 // recursive INP-link source processing within
@@ -1402,7 +1400,7 @@ impl PvDatabase {
         visited: &mut HashSet<String>,
         depth: usize,
     ) {
-        let Some(target_rec) = self.get_record(target_name).await else {
+        let Some(target_rec) = self.get_record(target_name) else {
             return;
         };
         let process = {
@@ -1511,7 +1509,7 @@ impl PvDatabase {
         // later independent scan otherwise. NMS (the common case) skips
         // the dest lookup/lock entirely.
         if link.monitor_switch != crate::server::record::MonitorSwitch::NoMaximize {
-            if let Some(target_rec) = self.get_record(&link.record).await {
+            if let Some(target_rec) = self.get_record(&link.record) {
                 let mut tg = target_rec.write();
                 inherit_sevr_msg(&mut tg.common, link.monitor_switch, src.alarm);
             }
@@ -1759,7 +1757,7 @@ impl PvDatabase {
                     };
                     return external(target_name).await;
                 }
-                let Some(target) = self.get_record(&db.record).await else {
+                let Some(target) = self.get_record(&db.record) else {
                     return OutTarget::UNRESOLVED;
                 };
                 let guard = target.read();
@@ -2593,11 +2591,9 @@ impl PvDatabase {
     ) {
         let source = self
             .resolve_alias(source_record)
-            .await
             .unwrap_or_else(|| source_record.to_string());
         let target = self
             .resolve_alias(target_record)
-            .await
             .unwrap_or_else(|| target_record.to_string());
         let mut cp = self.inner.cp_links.write().await;
         let targets = cp.entry(source).or_default();
@@ -2649,7 +2645,6 @@ impl PvDatabase {
             .unwrap_or(external_pv);
         let target = self
             .resolve_alias(target_record)
-            .await
             .unwrap_or_else(|| target_record.to_string());
         let mut cp = self.inner.external_cp_links.write().await;
         let targets = cp.entry(key.to_string()).or_default();
@@ -2798,7 +2793,7 @@ impl PvDatabase {
             // rewritten; INPA.. / DOL.. links are re-parsed from their raw
             // strings each process cycle and so are not covered here.
             if !convert_to_ca.is_empty() {
-                if let Some(rec_arc) = self.get_record(target_name).await {
+                if let Some(rec_arc) = self.get_record(target_name) {
                     let mut inst = rec_arc.write();
                     for (field, calink) in convert_to_ca {
                         let link = crate::server::record::ParsedLink::Ca(calink);
@@ -2964,7 +2959,7 @@ mod out_link_put_fail_tests {
         );
         // …and the destination carries LINK/INVALID, committed by that very
         // process cycle's `recGblResetAlarms`.
-        let inst = db.get_record("ETGT").await.unwrap();
+        let inst = db.get_record("ETGT").unwrap();
         let inst = inst.read();
         assert_eq!(inst.common.stat, alarm_status::LINK_ALARM);
         assert_eq!(inst.common.sevr, AlarmSeverity::Invalid);
@@ -3177,7 +3172,7 @@ mod nonlocal_db_link_write_tests {
         db.add_record("SRC", Box::new(CalcRecord::new("0")))
             .await
             .unwrap();
-        if let Some(rec) = db.get_record("SRC").await {
+        if let Some(rec) = db.get_record("SRC") {
             let mut inst = rec.write();
             inst.put_common_field("FLNK", EpicsValue::String("pva://TARGET".into()))
                 .unwrap();
@@ -3218,7 +3213,7 @@ mod nonlocal_db_link_write_tests {
         db.add_record("SRC", Box::new(CalcRecord::new("0")))
             .await
             .unwrap();
-        if let Some(rec) = db.get_record("SRC").await {
+        if let Some(rec) = db.get_record("SRC") {
             let mut inst = rec.write();
             inst.put_common_field("FLNK", EpicsValue::String("pva://TARGET".into()))
                 .unwrap();
@@ -3234,7 +3229,7 @@ mod nonlocal_db_link_write_tests {
             1,
             "scan_forward is still attempted on a disconnected link"
         );
-        let rec = db.get_record("SRC").await.unwrap();
+        let rec = db.get_record("SRC").unwrap();
         let inst = rec.read();
         assert_eq!(inst.common.nsev, AlarmSeverity::Invalid);
         assert_eq!(
@@ -3269,19 +3264,13 @@ mod cp_link_locality_tests {
             .await
             .unwrap();
         {
-            let rec = db.get_record("HOLDER").await.unwrap();
+            let rec = db.get_record("HOLDER").unwrap();
             rec.write().common.inp = "OTHER:PV CP".to_string();
         }
 
         db.setup_cp_links().await;
 
-        let inp = db
-            .get_record("HOLDER")
-            .await
-            .unwrap()
-            .read()
-            .parsed_inp
-            .clone();
+        let inp = db.get_record("HOLDER").unwrap().read().parsed_inp.clone();
         match inp {
             ParsedLink::Ca(ca) => assert_eq!(
                 ca.pv, "OTHER:PV",
@@ -3310,7 +3299,7 @@ mod cp_link_locality_tests {
             .await
             .unwrap();
         {
-            let rec = db.get_record("HOLDER").await.unwrap();
+            let rec = db.get_record("HOLDER").unwrap();
             let mut inst = rec.write();
             inst.common.inp = "SRC CP".to_string();
             // Seed the parse cache as load would, so the assertion proves
@@ -3320,13 +3309,7 @@ mod cp_link_locality_tests {
 
         db.setup_cp_links().await;
 
-        let inp = db
-            .get_record("HOLDER")
-            .await
-            .unwrap()
-            .read()
-            .parsed_inp
-            .clone();
+        let inp = db.get_record("HOLDER").unwrap().read().parsed_inp.clone();
         assert!(
             matches!(inp, ParsedLink::Db(_)),
             "local CP link must stay a Db link, got {inp:?}"

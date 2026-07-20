@@ -43,13 +43,13 @@ async fn process(db: &PvDatabase, rec: &str) {
 }
 
 async fn alarm(db: &PvDatabase, rec: &str) -> (AlarmSeverity, u16) {
-    let inst = db.get_record(rec).await.unwrap();
+    let inst = db.get_record(rec).unwrap();
     let g = inst.read();
     (g.common.sevr, g.common.stat)
 }
 
 async fn field(db: &PvDatabase, rec: &str, f: &str) -> EpicsValue {
-    let inst = db.get_record(rec).await.unwrap();
+    let inst = db.get_record(rec).unwrap();
     let g = inst.read();
     g.record.get_field(f).unwrap()
 }
@@ -101,7 +101,7 @@ async fn r10_67_a_calc_put_posts_clcv() {
         .unwrap();
     db.add_record("W", Box::new(w)).await.unwrap();
 
-    let inst = db.get_record("W").await.unwrap();
+    let inst = db.get_record("W").unwrap();
     let mut ev = inst
         .write()
         .add_subscriber("CLCV", 1, DbFieldType::Long, EventMask::VALUE.bits())
@@ -239,7 +239,7 @@ async fn r10_67_calc_alarm_wins_the_stat_over_udf_alarm() {
 
     process(&db, "C").await;
 
-    let inst = db.get_record("C").await.unwrap();
+    let inst = db.get_record("C").unwrap();
     assert!(inst.read().common.udf != 0, "a NaN VAL keeps UDF");
     assert_eq!(
         alarm(&db, "C").await,

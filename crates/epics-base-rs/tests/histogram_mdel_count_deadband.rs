@@ -104,7 +104,7 @@ async fn mcnt_is_counts_since_the_last_posted_val() {
 #[tokio::test]
 async fn mdel_rate_limits_the_val_monitor() {
     let db = build().await;
-    let rec = db.get_record("HG").await.unwrap();
+    let rec = db.get_record("HG").unwrap();
     let mut val_rx = rec
         .write()
         .add_subscriber("VAL", 1, DbFieldType::ULong, EventMask::VALUE.bits())
@@ -148,7 +148,7 @@ async fn the_default_mdel_of_zero_posts_every_process() {
         .unwrap()
         .0;
 
-    let rec = db.get_record("HG0").await.unwrap();
+    let rec = db.get_record("HG0").unwrap();
     let mut val_rx = rec
         .write()
         .add_subscriber("VAL", 1, DbFieldType::ULong, EventMask::VALUE.bits())

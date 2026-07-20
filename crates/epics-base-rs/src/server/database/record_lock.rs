@@ -140,7 +140,6 @@ impl PvDatabase {
     pub async fn lock_record(&self, record: &str) -> RecordWriteGuard {
         let canonical = self
             .resolve_alias(record)
-            .await
             .unwrap_or_else(|| record.to_string());
         let gate = self.inner.record_locks.gate_for(&canonical);
         RecordWriteGuard {
@@ -181,7 +180,6 @@ impl PvDatabase {
             let record = record.as_ref();
             names.push(
                 self.resolve_alias(record)
-                    .await
                     .unwrap_or_else(|| record.to_string()),
             );
         }

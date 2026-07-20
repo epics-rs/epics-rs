@@ -488,14 +488,14 @@ async fn db_link_alarm_propagation() {
         .unwrap();
 
     // Set target alarm state
-    if let Some(rec) = db.get_record("target").await {
+    if let Some(rec) = db.get_record("target") {
         let mut inst = rec.write();
         inst.common.sevr = AlarmSeverity::Major;
         inst.common.stat = 3; // READ_ALARM
     }
 
     // Verify target has alarm
-    if let Some(rec) = db.get_record("target").await {
+    if let Some(rec) = db.get_record("target") {
         let inst = rec.read();
         assert_eq!(inst.common.sevr, AlarmSeverity::Major);
     }
@@ -1340,7 +1340,7 @@ async fn database_put_record_field() {
         .unwrap();
 
     // Put to EGU field
-    if let Some(rec) = db.get_record("myrec").await {
+    if let Some(rec) = db.get_record("myrec") {
         let mut inst = rec.write();
         inst.record
             .put_field("EGU", EpicsValue::String("degC".into()))
@@ -1348,7 +1348,7 @@ async fn database_put_record_field() {
     }
 
     // Verify
-    if let Some(rec) = db.get_record("myrec").await {
+    if let Some(rec) = db.get_record("myrec") {
         let inst = rec.read();
         assert_eq!(
             inst.record.get_field("EGU"),
@@ -1369,7 +1369,7 @@ async fn database_disp_blocks_ca_put() {
         .unwrap();
 
     // Set DISP=1
-    if let Some(rec) = db.get_record("disp_rec").await {
+    if let Some(rec) = db.get_record("disp_rec") {
         let mut inst = rec.write();
         inst.put_common_field("DISP", EpicsValue::Char(1)).unwrap();
     }
@@ -1399,7 +1399,7 @@ async fn database_proc_triggers_processing() {
     assert!(result.is_ok());
 
     // UDF should be cleared after processing
-    if let Some(rec) = db.get_record("proc_rec").await {
+    if let Some(rec) = db.get_record("proc_rec") {
         let inst = rec.read();
         assert!(inst.common.udf == 0, "UDF should be cleared after PROC");
     }
@@ -1425,7 +1425,7 @@ async fn database_proc_zero_still_triggers_processing() {
         .await;
     assert!(result.is_ok());
 
-    if let Some(rec) = db.get_record("proc_zero_rec").await {
+    if let Some(rec) = db.get_record("proc_zero_rec") {
         let inst = rec.read();
         assert!(
             inst.common.udf == 0,
@@ -1452,7 +1452,7 @@ async fn database_proc_stores_byte_and_still_processes() {
     db.put_record_field_from_ca("proc_rb", "PROC", EpicsValue::Char(1))
         .await
         .unwrap();
-    if let Some(rec) = db.get_record("proc_rb").await {
+    if let Some(rec) = db.get_record("proc_rb") {
         let inst = rec.read();
         assert!(inst.common.udf == 0, "PROC=1 must still force-process");
         assert_eq!(
@@ -1467,7 +1467,7 @@ async fn database_proc_stores_byte_and_still_processes() {
     db.put_record_field_from_ca("proc_rb", "PROC", EpicsValue::Char(255))
         .await
         .unwrap();
-    if let Some(rec) = db.get_record("proc_rb").await {
+    if let Some(rec) = db.get_record("proc_rb") {
         let inst = rec.read();
         assert_eq!(
             inst.get_common_field("PROC"),
@@ -1816,14 +1816,14 @@ async fn flnk_chain_processes_target() {
         .unwrap();
 
     // Set FLNK: src → dst
-    if let Some(rec) = db.get_record("src").await {
+    if let Some(rec) = db.get_record("src") {
         let mut inst = rec.write();
         inst.put_common_field("FLNK", EpicsValue::String("dst".into()))
             .unwrap();
     }
 
     // Set dst INP to read from src
-    if let Some(rec) = db.get_record("dst").await {
+    if let Some(rec) = db.get_record("dst") {
         let mut inst = rec.write();
         inst.put_common_field("INP", EpicsValue::String("src".into()))
             .unwrap();
@@ -1853,12 +1853,12 @@ async fn flnk_loop_does_not_infinite_loop() {
         .unwrap();
 
     // Create circular FLNK: loop_a → loop_b → loop_a
-    if let Some(rec) = db.get_record("loop_a").await {
+    if let Some(rec) = db.get_record("loop_a") {
         let mut inst = rec.write();
         inst.put_common_field("FLNK", EpicsValue::String("loop_b".into()))
             .unwrap();
     }
-    if let Some(rec) = db.get_record("loop_b").await {
+    if let Some(rec) = db.get_record("loop_b") {
         let mut inst = rec.write();
         inst.put_common_field("FLNK", EpicsValue::String("loop_a".into()))
             .unwrap();
@@ -1888,7 +1888,7 @@ async fn rpro_reprocessing() {
         .unwrap();
 
     // Set RPRO flag
-    if let Some(rec) = db.get_record("rpro_rec").await {
+    if let Some(rec) = db.get_record("rpro_rec") {
         let mut inst = rec.write();
         inst.common.rpro = 1;
     }
@@ -1900,7 +1900,7 @@ async fn rpro_reprocessing() {
         .unwrap();
 
     // RPRO should be cleared after reprocessing
-    if let Some(rec) = db.get_record("rpro_rec").await {
+    if let Some(rec) = db.get_record("rpro_rec") {
         let inst = rec.read();
         assert!(
             inst.common.rpro == 0,
@@ -1951,7 +1951,7 @@ async fn process_record_clears_udf() {
         .unwrap();
 
     // UDF should be true initially
-    if let Some(rec) = db.get_record("scan_rec").await {
+    if let Some(rec) = db.get_record("scan_rec") {
         let inst = rec.read();
         assert!(inst.common.udf != 0, "UDF should be true before process");
     }
@@ -1960,7 +1960,7 @@ async fn process_record_clears_udf() {
     db.process_record("scan_rec").await.unwrap();
 
     // UDF should be cleared
-    if let Some(rec) = db.get_record("scan_rec").await {
+    if let Some(rec) = db.get_record("scan_rec") {
         let inst = rec.read();
         assert!(inst.common.udf == 0, "UDF should be false after process");
     }
@@ -1979,13 +1979,13 @@ async fn pini_flag() {
         .unwrap();
 
     // Set PINI
-    if let Some(rec) = db.get_record("pini_rec").await {
+    if let Some(rec) = db.get_record("pini_rec") {
         let mut inst = rec.write();
         inst.common.pini = PiniMode::Yes as i16;
     }
 
     // Verify PINI is set
-    if let Some(rec) = db.get_record("pini_rec").await {
+    if let Some(rec) = db.get_record("pini_rec") {
         let inst = rec.read();
         assert_eq!(inst.common.pini, PiniMode::Yes as i16, "PINI should be YES");
     }
@@ -2068,7 +2068,7 @@ fn process_chain_depth_limit() {
                 .unwrap();
         }
         for i in 0..19 {
-            if let Some(rec) = db.get_record(&format!("chain{i}")).await {
+            if let Some(rec) = db.get_record(&format!("chain{i}")) {
                 let mut inst = rec.write();
                 inst.put_common_field("FLNK", EpicsValue::String(format!("chain{}", i + 1).into()))
                     .unwrap();

@@ -61,7 +61,7 @@ async fn transform_with_an_ms_input() -> PvDatabase {
         .unwrap();
     {
         // The alarm limits live in the INSTANCE's `analog_alarm` config.
-        let rec = db.get_record("SRC").await.unwrap();
+        let rec = db.get_record("SRC").unwrap();
         let mut inst = rec.write();
         inst.put_common_field("HIHI", EpicsValue::Double(5.0))
             .unwrap();
@@ -82,7 +82,7 @@ async fn transform_with_an_ms_input() -> PvDatabase {
 #[tokio::test]
 async fn r11_64_transform_channels_post_without_the_cycles_alarm_bits() {
     let db = transform_with_an_ms_input().await;
-    let inst = db.get_record("T").await.unwrap();
+    let inst = db.get_record("T").unwrap();
 
     let full = (EventMask::VALUE | EventMask::LOG | EventMask::ALARM).bits();
     let (mut a_rx, mut stat_rx) = {
@@ -135,7 +135,7 @@ async fn r11_64_transform_channels_post_without_the_cycles_alarm_bits() {
 #[tokio::test]
 async fn r11_64_an_alarm_only_subscriber_on_a_transform_channel_never_fires() {
     let db = transform_with_an_ms_input().await;
-    let inst = db.get_record("T").await.unwrap();
+    let inst = db.get_record("T").unwrap();
 
     let mut a_rx = inst
         .write()

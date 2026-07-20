@@ -174,7 +174,7 @@ async fn a_runtime_put_of_a_link_the_device_cannot_take_is_refused_too() {
         .await
         .unwrap();
 
-    let rec = database.get_record("AI:RT").await.unwrap();
+    let rec = database.get_record("AI:RT").unwrap();
     let mut inst = rec.write();
     let err = inst
         .put_common_field("INP", EpicsValue::String("5".into()))

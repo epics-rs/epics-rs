@@ -45,7 +45,7 @@ async fn r9_64_failed_input_link_zeroes_its_channel_and_drives_zero_out() {
     let mut v = HashSet::new();
     db.process_record_with_links("TR", &mut v, 0).await.unwrap();
 
-    let inst = db.get_record("TR").await.unwrap();
+    let inst = db.get_record("TR").unwrap();
     {
         let rec = inst.read();
         assert_eq!(

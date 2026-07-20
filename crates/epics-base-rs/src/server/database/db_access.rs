@@ -307,7 +307,7 @@ impl DbSubscription {
     ) -> Option<Self> {
         let (record_name, field) = parse_pv_name(pv_name);
         let field = field.to_ascii_uppercase();
-        let rec = db.get_record(record_name).await?;
+        let rec = db.get_record(record_name)?;
         let sid = next_sid();
         let reader = {
             let mut instance = rec.write();

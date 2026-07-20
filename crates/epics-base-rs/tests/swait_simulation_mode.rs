@@ -76,7 +76,6 @@ async fn sim_db(siml: &str, simm: i16, sims: i16, siol: &str) -> PvDatabase {
 
     // OUT routes through RecordInstance::put_common_field (populates parsed_out).
     db.get_record("W")
-        .await
         .unwrap()
         .write()
         .put_common_field("OUT", EpicsValue::String("DEST".into()))
@@ -92,13 +91,13 @@ async fn process(db: &PvDatabase) {
 }
 
 async fn field(db: &PvDatabase, rec: &str, f: &str) -> f64 {
-    let inst = db.get_record(rec).await.unwrap();
+    let inst = db.get_record(rec).unwrap();
     let g = inst.read();
     g.record.get_field(f).unwrap().to_f64().unwrap()
 }
 
 async fn alarm(db: &PvDatabase) -> (AlarmSeverity, u16, bool) {
-    let inst = db.get_record("W").await.unwrap();
+    let inst = db.get_record("W").unwrap();
     let g = inst.read();
     (g.common.sevr, g.common.stat, g.common.udf != 0)
 }
@@ -106,7 +105,7 @@ async fn alarm(db: &PvDatabase) -> (AlarmSeverity, u16, bool) {
 /// The record's committed alarm message — C's `amsg`, written by
 /// `recGblSetSevrMsg` (here: `setLinkAlarm`'s "field %s").
 async fn amsg(db: &PvDatabase) -> String {
-    let inst = db.get_record("W").await.unwrap();
+    let inst = db.get_record("W").unwrap();
     let g = inst.read();
     g.common.amsg.clone()
 }
@@ -317,7 +316,7 @@ async fn r11_62_busy_simm_yes_redirects_the_output_to_siol() {
     b.put_field("VAL", EpicsValue::Enum(1)).unwrap();
     db.add_record("B", Box::new(b)).await.unwrap();
     {
-        let inst = db.get_record("B").await.unwrap();
+        let inst = db.get_record("B").unwrap();
         let mut w = inst.write();
         w.put_common_field("OUT", EpicsValue::String("B_OUT".into()))
             .unwrap();
@@ -343,7 +342,7 @@ async fn r11_62_busy_simm_yes_redirects_the_output_to_siol() {
         "the real output is NOT driven on a simulated cycle"
     );
 
-    let inst = db.get_record("B").await.unwrap();
+    let inst = db.get_record("B").unwrap();
     let g = inst.read();
     assert_eq!(g.common.sevr, AlarmSeverity::Minor, "busyRecord.c:414");
     assert_eq!(g.common.stat, SIMM_ALARM);
@@ -367,7 +366,7 @@ async fn r11_62_busy_simm_no_drives_the_real_output() {
     b.put_field("VAL", EpicsValue::Enum(1)).unwrap();
     db.add_record("B2", Box::new(b)).await.unwrap();
     {
-        let inst = db.get_record("B2").await.unwrap();
+        let inst = db.get_record("B2").unwrap();
         let mut w = inst.write();
         w.put_common_field("OUT", EpicsValue::String("B2_OUT".into()))
             .unwrap();
@@ -384,6 +383,6 @@ async fn r11_62_busy_simm_no_drives_the_real_output() {
 
     assert_eq!(field(&db, "B2_OUT", "VAL").await, 1.0);
     assert_eq!(field(&db, "B2_SIM", "VAL").await, 0.0);
-    let inst = db.get_record("B2").await.unwrap();
+    let inst = db.get_record("B2").unwrap();
     assert_eq!(inst.read().common.sevr, AlarmSeverity::NoAlarm);
 }

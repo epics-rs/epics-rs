@@ -86,7 +86,6 @@ async fn r17_3_a_wait_step_with_an_unresolvable_lnk_never_raises_wtg() {
 
     let mut wtg_rx = db
         .get_record("SS_NR")
-        .await
         .unwrap()
         .write()
         .add_subscriber(

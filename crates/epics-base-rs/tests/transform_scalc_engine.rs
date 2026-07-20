@@ -64,7 +64,7 @@ async fn r11_c14_divide_by_zero_is_a_calc_failure() {
         .unwrap();
     process(&db, "T").await;
 
-    let rec = db.get_record("T").await.unwrap();
+    let rec = db.get_record("T").unwrap();
     let g = rec.read();
     assert_eq!(
         g.common.sevr,
@@ -101,7 +101,7 @@ async fn r11_c14_a_finite_result_raises_no_alarm() {
         .unwrap();
     process(&db, "T").await;
 
-    let rec = db.get_record("T").await.unwrap();
+    let rec = db.get_record("T").unwrap();
     let g = rec.read();
     assert_eq!(g.common.sevr, AlarmSeverity::NoAlarm);
     assert_eq!(g.record.get_field("A").unwrap(), EpicsValue::Double(0.5));
@@ -113,7 +113,7 @@ async fn r11_c14_a_finite_result_raises_no_alarm() {
 #[tokio::test]
 async fn r11_c14_no_process_cycle_posts_val() {
     let db = transform_db().await;
-    let rec = db.get_record("T").await.unwrap();
+    let rec = db.get_record("T").unwrap();
 
     let full = (EventMask::VALUE | EventMask::LOG | EventMask::ALARM).bits();
     let (mut val_rx, mut a_rx) = {
@@ -165,7 +165,7 @@ async fn r11_c14_no_process_cycle_posts_val() {
 #[tokio::test]
 async fn r11_c14_a_put_to_the_val_dummy_still_posts() {
     let db = transform_db().await;
-    let rec = db.get_record("T").await.unwrap();
+    let rec = db.get_record("T").unwrap();
 
     let mut val_rx = {
         let mut g = rec.write();

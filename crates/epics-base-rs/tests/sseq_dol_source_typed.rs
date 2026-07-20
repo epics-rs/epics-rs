@@ -41,7 +41,7 @@ async fn run_step(db: &PvDatabase, sseq: &str, dst: &str, label: &str) {
         .await
         .unwrap();
     for _ in 0..400 {
-        if let Some(rec) = db.get_record(dst).await {
+        if let Some(rec) = db.get_record(dst) {
             let landed = match rec.read().record.get_field("VAL") {
                 Some(EpicsValue::String(s)) => !s.is_empty(),
                 Some(EpicsValue::Double(d)) => d != 0.0,
@@ -58,7 +58,6 @@ async fn run_step(db: &PvDatabase, sseq: &str, dst: &str, label: &str) {
 
 async fn field(db: &PvDatabase, record: &str, name: &str) -> EpicsValue {
     db.get_record(record)
-        .await
         .unwrap()
         .read()
         .record
@@ -359,7 +358,7 @@ async fn rejected_link_store_raises_link_invalid() {
         .await
         .unwrap();
 
-    let rec = db.get_record("SS_REJECT").await.unwrap();
+    let rec = db.get_record("SS_REJECT").unwrap();
     let inst = rec.read();
     assert_eq!(
         inst.record.get_field("VAL"),

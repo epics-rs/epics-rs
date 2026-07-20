@@ -141,7 +141,7 @@ async fn busy_record() -> Fixture {
         .await
         .unwrap();
 
-    let rec = db.get_record("ASY").await.unwrap();
+    let rec = db.get_record("ASY").unwrap();
     assert!(
         rec.read().is_processing(),
         "the first pass returned AsyncPending: the record must be PACT"
@@ -151,7 +151,7 @@ async fn busy_record() -> Fixture {
 }
 
 async fn val(db: &PvDatabase) -> i32 {
-    let rec = db.get_record("ASY").await.unwrap();
+    let rec = db.get_record("ASY").unwrap();
     let inst = rec.read();
     match inst.record.get_field("VAL") {
         Some(EpicsValue::Long(v)) => v,
@@ -160,7 +160,7 @@ async fn val(db: &PvDatabase) -> i32 {
 }
 
 async fn rpro(db: &PvDatabase) -> bool {
-    let rec = db.get_record("ASY").await.unwrap();
+    let rec = db.get_record("ASY").unwrap();
     let inst = rec.read();
     inst.common.rpro != 0
 }
@@ -351,7 +351,7 @@ async fn deferred_put_is_replayed_when_the_odly_continuation_releases_pact() {
     db.process_record_with_links("ODL", &mut v1, 0)
         .await
         .unwrap();
-    let rec = db.get_record("ODL").await.unwrap();
+    let rec = db.get_record("ODL").unwrap();
     assert!(
         rec.read().is_processing(),
         "the ODLY window holds PACT (C keeps the record ACTIVE on the watchdog)"
@@ -438,7 +438,7 @@ async fn deferred_put_is_replayed_when_the_sdly_input_continuation_releases_pact
     db.process_record_with_links("SIMAI", &mut v1, 0)
         .await
         .unwrap();
-    let rec = db.get_record("SIMAI").await.unwrap();
+    let rec = db.get_record("SIMAI").unwrap();
     assert!(
         rec.read().is_processing(),
         "SDLY holds PACT across the simulated read"
@@ -490,7 +490,7 @@ async fn deferred_put_is_replayed_when_the_sdly_output_continuation_releases_pac
     db.process_record_with_links("SIMAO", &mut v1, 0)
         .await
         .unwrap();
-    let rec = db.get_record("SIMAO").await.unwrap();
+    let rec = db.get_record("SIMAO").unwrap();
     assert!(
         rec.read().is_processing(),
         "SDLY holds PACT across the simulated write"
@@ -529,7 +529,7 @@ async fn deferred_put_is_replayed_when_the_illegal_simm_continuation_releases_pa
     db.process_record_with_links("SIMAI", &mut v1, 0)
         .await
         .unwrap();
-    let rec = db.get_record("SIMAI").await.unwrap();
+    let rec = db.get_record("SIMAI").unwrap();
     assert!(rec.read().is_processing());
 
     let rx = db

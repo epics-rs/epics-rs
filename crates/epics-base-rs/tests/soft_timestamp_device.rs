@@ -13,7 +13,7 @@ use epics_base_rs::types::EpicsValue;
 
 /// Read a record's `VAL` field after a process cycle.
 async fn read_val(db: &epics_base_rs::server::database::PvDatabase, name: &str) -> EpicsValue {
-    let rec = db.get_record(name).await.expect("record exists");
+    let rec = db.get_record(name).expect("record exists");
     let inst = rec.read();
     inst.record.get_field("VAL").expect("VAL field present")
 }

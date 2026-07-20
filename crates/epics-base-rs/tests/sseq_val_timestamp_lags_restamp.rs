@@ -49,7 +49,7 @@ async fn bare_sseq() -> PvDatabase {
 #[tokio::test]
 async fn sseq_val_timestamp_is_pre_restamp_and_lags_one_cycle() {
     let db = bare_sseq().await;
-    let inst = db.get_record("SQV").await.unwrap();
+    let inst = db.get_record("SQV").unwrap();
 
     // Inject a distinguishable sentinel so the VAL monitor timestamp is
     // comparable bit-for-bit and cannot be confused with wall-clock "now": a

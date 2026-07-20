@@ -55,7 +55,7 @@ async fn scalcout_dont_drive_suppresses_out_on_noncalc_invalid() {
         .await
         .unwrap();
 
-    let sc_rec = db.get_record("SC_DD").await.unwrap();
+    let sc_rec = db.get_record("SC_DD").unwrap();
     {
         let sc_inst = sc_rec.read();
 
@@ -79,7 +79,7 @@ async fn scalcout_dont_drive_suppresses_out_on_noncalc_invalid() {
 
     // The gate: IVOA=Don't_drive on an INVALID cycle suppresses the OUT write,
     // so the target keeps its 0.0 sentinel — it is NOT driven to OVAL=5.
-    let tgt = db.get_record("SC_TGT").await.unwrap();
+    let tgt = db.get_record("SC_TGT").unwrap();
     assert_eq!(
         tgt.read().record.get_field("VAL"),
         Some(EpicsValue::Double(0.0)),

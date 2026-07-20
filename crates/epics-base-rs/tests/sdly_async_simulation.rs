@@ -27,7 +27,7 @@ use epics_base_rs::server::records::ao::AoRecord;
 use epics_base_rs::types::EpicsValue;
 
 async fn is_processing(db: &PvDatabase, name: &str) -> bool {
-    let rec = db.get_record(name).await.unwrap();
+    let rec = db.get_record(name).unwrap();
     let inst = rec.read();
     inst.is_processing()
 }

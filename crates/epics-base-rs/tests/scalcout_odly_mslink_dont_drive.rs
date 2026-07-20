@@ -38,7 +38,7 @@ async fn scalcout_odly_mslink_invalid_dont_drive_suppresses_out() {
         .await
         .unwrap();
     {
-        let rec = db.get_record("SRC").await.unwrap();
+        let rec = db.get_record("SRC").unwrap();
         let mut inst = rec.write();
         inst.put_common_field("HIHI", EpicsValue::Double(100.0))
             .unwrap();
@@ -72,7 +72,7 @@ async fn scalcout_odly_mslink_invalid_dont_drive_suppresses_out() {
         .await
         .unwrap();
     assert_eq!(
-        db.get_record("SRC").await.unwrap().read().common.sevr,
+        db.get_record("SRC").unwrap().read().common.sevr,
         AlarmSeverity::Invalid,
         "SRC must be INVALID with a finite VAL=200 (HIHI=100/HHSV=INVALID)"
     );
@@ -83,12 +83,7 @@ async fn scalcout_odly_mslink_invalid_dont_drive_suppresses_out() {
         .await
         .unwrap();
     assert_eq!(
-        db.get_record("SC")
-            .await
-            .unwrap()
-            .read()
-            .record
-            .get_field("DLYA"),
+        db.get_record("SC").unwrap().read().record.get_field("DLYA"),
         Some(EpicsValue::Short(1)),
         "ODLY>0 cycle sets DLYA and defers"
     );
@@ -106,7 +101,7 @@ async fn scalcout_odly_mslink_invalid_dont_drive_suppresses_out() {
         .await
         .unwrap();
     assert_eq!(
-        db.get_record("SC").await.unwrap().read().common.sevr,
+        db.get_record("SC").unwrap().read().common.sevr,
         AlarmSeverity::Invalid,
         "continuation commits the carried MS-link nsev to sevr==INVALID \
          (not lost across the ODLY gap) — matches C carrying nsev to the \

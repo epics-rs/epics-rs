@@ -41,7 +41,6 @@ async fn ioc() -> Arc<PvDatabase> {
 
 async fn field(db: &PvDatabase, name: &str, f: &str) -> EpicsValue {
     db.get_record(name)
-        .await
         .unwrap()
         .read()
         .record
@@ -51,7 +50,7 @@ async fn field(db: &PvDatabase, name: &str, f: &str) -> EpicsValue {
 
 /// (SEVR, STAT) as a client would read them after the put.
 async fn alarm(db: &PvDatabase, name: &str) -> (AlarmSeverity, u16) {
-    let rec = db.get_record(name).await.unwrap();
+    let rec = db.get_record(name).unwrap();
     let inst = rec.read();
     (inst.common.sevr, inst.common.stat)
 }

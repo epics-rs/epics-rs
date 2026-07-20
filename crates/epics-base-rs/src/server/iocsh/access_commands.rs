@@ -403,7 +403,7 @@ fn cmd_aspmem() -> CommandDef {
             let mut by_asg: std::collections::BTreeMap<String, Vec<String>> =
                 std::collections::BTreeMap::new();
             for rec_name in &names {
-                if let Some(rec) = ctx.block_on(ctx.db().get_record(rec_name)) {
+                if let Some(rec) = ctx.db().get_record(rec_name) {
                     let inst = rec.read();
                     by_asg
                         .entry(inst.common.access_group().to_string())
@@ -462,7 +462,7 @@ fn cmd_astac() -> CommandDef {
                 _ => return Err("astac: missing host".into()),
             };
             // Resolve the record's ASG and ASL.
-            let (asg, asl) = match ctx.block_on(ctx.db().get_record(&record)) {
+            let (asg, asl) = match ctx.db().get_record(&record) {
                 Some(rec) => {
                     let inst = rec.read();
                     (inst.common.access_group().to_string(), inst.common.asl)

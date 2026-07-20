@@ -69,7 +69,7 @@ async fn process(db: &PvDatabase, rec: &str) {
 }
 
 async fn alarm(db: &PvDatabase, rec: &str) -> (AlarmSeverity, u16) {
-    let inst = db.get_record(rec).await.unwrap();
+    let inst = db.get_record(rec).unwrap();
     let c = &inst.read().common;
     (c.sevr, c.stat)
 }

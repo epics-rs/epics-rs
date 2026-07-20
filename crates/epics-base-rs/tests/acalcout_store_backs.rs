@@ -28,7 +28,7 @@ async fn process(db: &PvDatabase, rec: &str) {
 }
 
 async fn field(db: &PvDatabase, rec: &str, f: &str) -> EpicsValue {
-    let inst = db.get_record(rec).await.unwrap();
+    let inst = db.get_record(rec).unwrap();
     let g = inst.read();
     g.record.get_field(f).unwrap()
 }
@@ -129,7 +129,7 @@ async fn r11_9_amask_is_reset_each_process_not_accumulated() {
 
     // Same record, an expression with no store at all.
     {
-        let inst = db.get_record("S4").await.unwrap();
+        let inst = db.get_record("S4").unwrap();
         let mut g = inst.write();
         g.record
             .put_field("CALC", EpicsValue::String("SUM(BB)".into()))

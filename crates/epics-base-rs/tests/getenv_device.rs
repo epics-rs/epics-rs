@@ -58,7 +58,7 @@ record(stringin, "GETENV_SI") {
         .await
         .unwrap();
 
-    let rec = db.get_record("GETENV_SI").await.expect("record exists");
+    let rec = db.get_record("GETENV_SI").expect("record exists");
     let inst = rec.read();
     assert_ne!(
         inst.common.sevr,
@@ -93,7 +93,7 @@ record(ai, "GETENV_AI") {
         .await
         .unwrap();
 
-    let ai = db.get_record("GETENV_AI").await.expect("ai exists");
+    let ai = db.get_record("GETENV_AI").expect("ai exists");
     let inst = ai.read();
     assert_eq!(
         inst.common.sevr,
@@ -135,7 +135,7 @@ record(stringin, "GETENV_UNSET") {
         .await
         .unwrap();
 
-    let rec = db.get_record("GETENV_UNSET").await.expect("record exists");
+    let rec = db.get_record("GETENV_UNSET").expect("record exists");
     let inst = rec.read();
     assert_eq!(
         inst.common.stat,
@@ -191,7 +191,7 @@ record(stringin, "GETENV_UDFS") {
         .await
         .unwrap();
 
-    let rec = db.get_record("GETENV_UDFS").await.expect("record exists");
+    let rec = db.get_record("GETENV_UDFS").expect("record exists");
     let inst = rec.read();
     assert_eq!(
         inst.common.stat,

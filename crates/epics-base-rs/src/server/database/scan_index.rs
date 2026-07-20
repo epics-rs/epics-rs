@@ -51,7 +51,7 @@ impl PvDatabase {
         // duplicate-insertion of the same (phas, name) pair into
         // the same scan bucket is a no-op (`BTreeSet::insert`
         // returns false on present key).
-        let rec_arc = match self.inner.records.read().await.get(name).cloned() {
+        let rec_arc = match self.inner.records.read().get(name).cloned() {
             Some(r) => r,
             None => return,
         };
@@ -142,7 +142,7 @@ impl PvDatabase {
         &self,
     ) -> Vec<(String, std::sync::Arc<parking_lot::RwLock<RecordInstance>>)> {
         let snapshot: Vec<_> = {
-            let records = self.inner.records.read().await;
+            let records = self.inner.records.read();
             records
                 .iter()
                 .map(|(n, r)| (n.clone(), r.clone()))
@@ -251,7 +251,7 @@ impl PvDatabase {
             // Read the record's EVNT and compare against the posted
             // event name. Records that do not match are skipped — a
             // record configured `EVNT=5` only fires on event 5.
-            let evnt = match self.get_record(name).await {
+            let evnt = match self.get_record(name) {
                 Some(rec) => rec.read().common.evnt.clone(),
                 None => continue,
             };

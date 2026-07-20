@@ -61,7 +61,7 @@ async fn sseq_with_prec2() -> PvDatabase {
 #[tokio::test]
 async fn r17_4_a_do_put_posts_the_derived_string_with_a_bare_value_mask() {
     let db = sseq_with_prec2().await;
-    let inst = db.get_record("VP").await.unwrap();
+    let inst = db.get_record("VP").unwrap();
 
     let (mut do_rx, mut str_rx) = {
         let mut g = inst.write();
@@ -106,7 +106,7 @@ async fn r17_4_a_do_put_posts_the_derived_string_with_a_bare_value_mask() {
 #[tokio::test]
 async fn r17_4_a_do_put_that_moves_no_string_posts_no_string_event() {
     let db = sseq_with_prec2().await;
-    let inst = db.get_record("VP").await.unwrap();
+    let inst = db.get_record("VP").unwrap();
 
     let mut str_rx = inst
         .write()
@@ -140,7 +140,7 @@ async fn r17_4_a_do_put_that_moves_no_string_posts_no_string_event() {
 #[tokio::test]
 async fn r17_4_a_str_put_posts_the_derived_double_with_a_bare_value_mask() {
     let db = sseq_with_prec2().await;
-    let inst = db.get_record("VP").await.unwrap();
+    let inst = db.get_record("VP").unwrap();
 
     let mut do_rx = inst
         .write()
@@ -191,7 +191,7 @@ async fn r17_4_a_dol_read_posts_the_read_view_with_log_and_the_derived_view_with
         .unwrap();
     db.add_record("VPP", Box::new(sseq)).await.unwrap();
 
-    let inst = db.get_record("VPP").await.unwrap();
+    let inst = db.get_record("VPP").unwrap();
     let (mut do_rx, mut str_rx) = {
         let mut g = inst.write();
         let d = g
@@ -210,7 +210,6 @@ async fn r17_4_a_dol_read_posts_the_read_view_with_log_and_the_derived_view_with
     for _ in 0..400 {
         if let Some(EpicsValue::Double(v)) = db
             .get_record("VPP_DST")
-            .await
             .unwrap()
             .read()
             .record

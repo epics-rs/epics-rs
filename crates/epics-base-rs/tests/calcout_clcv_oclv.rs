@@ -54,7 +54,7 @@ async fn calcout_bad_calc_put_is_accepted_and_lands_in_clcv() {
     db.put_record_field_from_ca("CO", "CALC", EpicsValue::String("A+B".into()))
         .await
         .unwrap();
-    let rec = db.get_record("CO").await.unwrap();
+    let rec = db.get_record("CO").unwrap();
     assert_eq!(
         rec.read().record.get_field("CLCV"),
         Some(EpicsValue::Long(0))
@@ -92,7 +92,7 @@ async fn scalcout_clcv_oclv_track_scalcpostfix_status() {
     db.add_record("SC", Box::new(ScalcoutRecord::default()))
         .await
         .unwrap();
-    let rec = db.get_record("SC").await.unwrap();
+    let rec = db.get_record("SC").unwrap();
 
     db.put_record_field_from_ca("SC", "CALC", EpicsValue::String("A+B".into()))
         .await
@@ -135,7 +135,7 @@ async fn acalcout_bad_calc_stores_minus_one_not_a_generic_one() {
     db.add_record("AC", Box::new(AcalcoutRecord::default()))
         .await
         .unwrap();
-    let rec = db.get_record("AC").await.unwrap();
+    let rec = db.get_record("AC").unwrap();
 
     db.put_record_field_from_ca("AC", "CALC", EpicsValue::String("1+".into()))
         .await

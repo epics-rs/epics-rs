@@ -38,7 +38,7 @@ async fn calcout_ivov_not_applied_on_non_output_cycle() {
         .await
         .unwrap();
 
-    let rec = db.get_record("CO_NOOUT").await.unwrap();
+    let rec = db.get_record("CO_NOOUT").unwrap();
     let inst = rec.read();
 
     // Precondition: this is genuinely an INVALID, non-output cycle.
@@ -82,7 +82,7 @@ async fn calcout_ivov_applied_on_output_cycle() {
         .await
         .unwrap();
 
-    let rec = db.get_record("CO_OUT").await.unwrap();
+    let rec = db.get_record("CO_OUT").unwrap();
     let inst = rec.read();
 
     assert_eq!(inst.common.sevr, AlarmSeverity::Invalid);

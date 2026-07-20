@@ -106,7 +106,6 @@ async fn ioc() -> Arc<PvDatabase> {
 
 async fn field(db: &PvDatabase, name: &str, f: &str) -> EpicsValue {
     db.get_record(name)
-        .await
         .unwrap_or_else(|| panic!("{name} missing"))
         .read()
         .record

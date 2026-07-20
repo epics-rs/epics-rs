@@ -193,14 +193,14 @@ async fn swait_calc_uses_the_numeric_engine_and_rejects_a_string_expression() {
             .unwrap();
     }
 
-    let num = db.get_record("SW_NUM").await.unwrap();
+    let num = db.get_record("SW_NUM").unwrap();
     assert_eq!(
         num.read().record.get_field("VAL"),
         Some(EpicsValue::Double(7.0)),
         "a numeric swait CALC must still evaluate"
     );
 
-    let strr = db.get_record("SW_STR").await.unwrap();
+    let strr = db.get_record("SW_STR").unwrap();
     assert_eq!(
         strr.read().record.get_field("VAL"),
         Some(EpicsValue::Double(0.0)),
@@ -229,7 +229,7 @@ async fn scalcout_calc_sval_reads_the_previous_sval() {
             .await
             .unwrap();
 
-        let rec = db.get_record("SC_SVAL").await.unwrap();
+        let rec = db.get_record("SC_SVAL").unwrap();
         let sval = rec.read().record.get_field("SVAL");
         assert_eq!(
             sval,
@@ -266,7 +266,7 @@ async fn scalcout_ocal_sval_reads_the_previous_osv_not_the_current_sval() {
             .await
             .unwrap();
 
-        let rec = db.get_record("SC_OSV").await.unwrap();
+        let rec = db.get_record("SC_OSV").unwrap();
         let inst = rec.read();
         assert_eq!(
             inst.record.get_field("SVAL"),

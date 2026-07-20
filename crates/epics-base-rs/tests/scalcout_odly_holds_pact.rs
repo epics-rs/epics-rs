@@ -52,12 +52,7 @@ async fn scalcout_odly_holds_pact_foreign_process_does_not_fire_early() {
         .await
         .unwrap();
     assert_eq!(
-        db.get_record("SC")
-            .await
-            .unwrap()
-            .read()
-            .record
-            .get_field("DLYA"),
+        db.get_record("SC").unwrap().read().record.get_field("DLYA"),
         Some(EpicsValue::Short(1)),
         "ODLY>0 cycle sets DLYA and defers"
     );

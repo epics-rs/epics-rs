@@ -33,7 +33,7 @@ use epics_base_rs::server::records::stringout::StringoutRecord;
 use epics_base_rs::types::EpicsValue;
 
 async fn udf(db: &PvDatabase, name: &str) -> bool {
-    let rec = db.get_record(name).await.unwrap();
+    let rec = db.get_record(name).unwrap();
     let inst = rec.read();
     inst.common.udf != 0
 }
@@ -130,7 +130,7 @@ async fn asub_clears_udf_when_subroutine_runs() {
     db.add_record("ASUB", Box::new(rec)).await.unwrap();
     // Start undefined, then process: a running subroutine defines the record.
     {
-        let r = db.get_record("ASUB").await.unwrap();
+        let r = db.get_record("ASUB").unwrap();
         r.write().common.udf = 1;
     }
 
@@ -143,7 +143,7 @@ async fn asub_clears_udf_when_subroutine_runs() {
         !udf(&db, "ASUB").await,
         "a subroutine that ran and returned >= 0 clears UDF (aSubRecord.c:469-470)"
     );
-    let r = db.get_record("ASUB").await.unwrap();
+    let r = db.get_record("ASUB").unwrap();
     assert_eq!(
         r.read().record.get_field("VALA").and_then(|v| v.to_f64()),
         Some(42.0),

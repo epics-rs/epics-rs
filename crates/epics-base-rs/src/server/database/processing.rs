@@ -675,14 +675,14 @@ impl PvDatabase {
     /// Arm the entry record's output driver-callback cycle before a readback
     /// process pass — see [`crate::server::device_support::DeviceSupport::arm_readback_callback`].
     async fn arm_readback_callback(&self, name: &str) {
-        let canonical = self.resolve_alias(name).await;
+        let canonical = self.resolve_alias(name);
         let key: &str = canonical.as_deref().unwrap_or(name);
         // Collect-then-act: clone the instance handle under a brief map read,
         // then drop the map lock before taking the per-record write. Never
         // hold `records.read()` across `rec.write()` — same lock discipline
         // as `add_breaktables` / `all_record_names`.
         let rec = {
-            let records = self.inner.records.read().await;
+            let records = self.inner.records.read();
             records.get(key).cloned()
         };
         if let Some(rec) = rec {
@@ -696,12 +696,12 @@ impl PvDatabase {
     /// readback process pass — see
     /// [`crate::server::device_support::DeviceSupport::reconcile_readback_callback`].
     async fn reconcile_readback_callback(&self, name: &str) {
-        let canonical = self.resolve_alias(name).await;
+        let canonical = self.resolve_alias(name);
         let key: &str = canonical.as_deref().unwrap_or(name);
         // Collect-then-act: clone the handle under a brief map read, drop the
         // map lock, then take the per-record write — see `arm_readback_callback`.
         let rec = {
-            let records = self.inner.records.read().await;
+            let records = self.inner.records.read();
             records.get(key).cloned()
         };
         if let Some(rec) = rec {
@@ -799,7 +799,7 @@ impl PvDatabase {
     /// for a record. `name` must be the canonical record name (the value
     /// of `RecordInstance::name`). Returns `None` if the record is absent.
     pub async fn mint_async_token(&self, name: &str) -> Option<AsyncToken> {
-        let records = self.inner.records.read().await;
+        let records = self.inner.records.read();
         let rec = records.get(name)?;
         let generation = rec.read().reprocess_generation.clone();
         let epoch = generation.fetch_add(1, Ordering::AcqRel) + 1;
@@ -816,7 +816,7 @@ impl PvDatabase {
     /// `fire` is a no-op. A subsequent [`Self::mint_async_token`] produces a
     /// fresh, current token. No-op if the record is absent.
     pub async fn cancel_async_reentry(&self, name: &str) {
-        let records = self.inner.records.read().await;
+        let records = self.inner.records.read();
         if let Some(rec) = records.get(name) {
             rec.read()
                 .reprocess_generation
@@ -866,7 +866,7 @@ impl PvDatabase {
     /// nothing.
     pub(crate) async fn arm_watchdog(&self, name: &str) {
         let (rec, generation, epoch) = {
-            let records = self.inner.records.read().await;
+            let records = self.inner.records.read();
             let Some(rec) = records.get(name) else { return };
             let instance = rec.read();
             if instance.record.watchdog_interval().is_none() {
@@ -980,7 +980,7 @@ impl PvDatabase {
         mask: crate::server::recgbl::EventMask,
     ) -> CaResult<Vec<String>> {
         let rec = {
-            let records = self.inner.records.read().await;
+            let records = self.inner.records.read();
             records.get(name).cloned()
         };
         let rec = rec.ok_or_else(|| CaError::ChannelNotFound(name.to_string()))?;
@@ -1015,7 +1015,7 @@ impl PvDatabase {
             crate::server::record::ParsedLink::Db(db) => db,
             _ => return None,
         };
-        let rec = self.get_record(&db.record).await?;
+        let rec = self.get_record(&db.record)?;
         let inst = rec.read();
         let field = if db.field.is_empty() {
             "VAL"
@@ -1094,7 +1094,7 @@ impl PvDatabase {
         value: EpicsValue,
     ) -> Option<crate::runtime::sync::oneshot::Receiver<()>> {
         let rec = {
-            let records = self.inner.records.read().await;
+            let records = self.inner.records.read();
             records.get(record_name)?.clone()
         };
         let (src_putf, src_alarm) = {
@@ -1252,7 +1252,7 @@ impl PvDatabase {
         // and canonical as distinct entries) and for the records-map
         // lookup below. Mirrors epics-base PR #336.
         let canonical_owned;
-        let name: &str = if let Some(target) = self.resolve_alias(name).await {
+        let name: &str = if let Some(target) = self.resolve_alias(name) {
             canonical_owned = target;
             &canonical_owned
         } else {
@@ -1272,7 +1272,7 @@ impl PvDatabase {
         }
 
         let rec = {
-            let records = self.inner.records.read().await;
+            let records = self.inner.records.read();
             records.get(name).cloned()
         };
 
@@ -1562,7 +1562,7 @@ impl PvDatabase {
                         // the `Ca` arm below and the `read_db_link_value`
                         // read-locality fallback.
                         if self.has_name_no_resolve(&link.record).await {
-                            match self.get_record(&link.record).await {
+                            match self.get_record(&link.record) {
                                 Some(src) => {
                                     let g = src.read();
                                     Some((g.common.time, g.common.utag))
@@ -4423,7 +4423,7 @@ impl PvDatabase {
         // records-map lookup, the `visited` cycle set, and downstream
         // FLNK/OUT dispatches all see the same canonical name.
         let canonical_owned;
-        let name: &str = if let Some(target) = self.resolve_alias(name).await {
+        let name: &str = if let Some(target) = self.resolve_alias(name) {
             canonical_owned = target;
             &canonical_owned
         } else {
@@ -4431,7 +4431,7 @@ impl PvDatabase {
         };
 
         let rec = {
-            let records = self.inner.records.read().await;
+            let records = self.inner.records.read();
             records
                 .get(name)
                 .cloned()
@@ -4924,7 +4924,7 @@ impl PvDatabase {
             return;
         }
         let target_rec = {
-            let records = self.inner.records.read().await;
+            let records = self.inner.records.read();
             records.get(&target.record).cloned()
         };
         let mut skip = false;

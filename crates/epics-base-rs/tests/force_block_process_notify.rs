@@ -51,7 +51,7 @@ async fn force_block_sync_record_returns_none_and_processes() {
     );
 
     // Force processed unconditionally: the OUT link drove TGT0.VAL = 42.
-    let tgt = db.get_record("TGT0").await.unwrap();
+    let tgt = db.get_record("TGT0").unwrap();
     let v = tgt.read().record.get_field("VAL");
     assert_eq!(
         v,
@@ -97,14 +97,14 @@ async fn force_block_async_record_withholds_completion_until_processing_done() {
     );
 
     // The barrier is genuinely async-pending: DLYA armed, OUT still deferred.
-    let sc_rec = db.get_record("SC1").await.unwrap();
+    let sc_rec = db.get_record("SC1").unwrap();
     let dlya = sc_rec.read().record.get_field("DLYA");
     assert_eq!(
         dlya,
         Some(EpicsValue::Short(1)),
         "ODLY cycle must arm DLYA (record held ACTIVE across the delay), got {dlya:?}"
     );
-    let tgt = db.get_record("TGT1").await.unwrap();
+    let tgt = db.get_record("TGT1").unwrap();
     let v = tgt.read().record.get_field("VAL");
     assert_eq!(
         v,

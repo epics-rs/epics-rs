@@ -57,7 +57,7 @@ async fn acalcout(db: &PvDatabase, name: &str, calc: &str) {
 async fn r11_c5_a_stored_array_posts_even_when_the_value_did_not_change() {
     let db = PvDatabase::new();
     acalcout(&db, "P1", "AA:=BB*2;SUM(AA)").await;
-    let inst = db.get_record("P1").await.unwrap();
+    let inst = db.get_record("P1").unwrap();
 
     let mut aa_rx = inst
         .write()
@@ -102,7 +102,7 @@ async fn r11_c5_a_stored_array_posts_even_when_the_value_did_not_change() {
 async fn r11_c5_an_array_that_was_not_stored_this_cycle_does_not_post() {
     let db = PvDatabase::new();
     acalcout(&db, "P2", "AA:=BB*2;SUM(AA)").await;
-    let inst = db.get_record("P2").await.unwrap();
+    let inst = db.get_record("P2").unwrap();
 
     let mut aa_rx = inst
         .write()
@@ -145,7 +145,7 @@ async fn r11_c5_an_array_that_was_not_stored_this_cycle_does_not_post() {
 async fn r11_c5_only_the_flagged_arrays_post() {
     let db = PvDatabase::new();
     acalcout(&db, "P3", "CC:=BB;SUM(CC)").await;
-    let inst = db.get_record("P3").await.unwrap();
+    let inst = db.get_record("P3").unwrap();
 
     let (mut bb_rx, mut cc_rx) = {
         let mut g = inst.write();

@@ -116,7 +116,7 @@ async fn acalcout_never_writes_nothing_to_out() {
 async fn an_unnamed_oopt_index_drives_no_output() {
     let db = build().await;
 
-    let rec = db.get_record("S:EVERY").await.unwrap();
+    let rec = db.get_record("S:EVERY").unwrap();
     {
         let mut inst = rec.write();
         // Past the last menu choice (6 = Never) — C's switch has no case for it.

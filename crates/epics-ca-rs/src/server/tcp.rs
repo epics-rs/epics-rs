@@ -820,19 +820,17 @@ impl ClientState {
         }
     }
 
-    async fn audit(&self, event: &str, pv: &str, value: &str, result: &str) {
+    fn audit(&self, event: &str, pv: &str, value: &str, result: &str) {
         if let Some(ref logger) = self.audit {
-            logger
-                .log(crate::audit::AuditEvent {
-                    event,
-                    peer: &self.peer,
-                    user: &self.username,
-                    host: self.hostname.as_str(),
-                    pv,
-                    value,
-                    result,
-                })
-                .await;
+            logger.log(crate::audit::AuditEvent {
+                event,
+                peer: &self.peer,
+                user: &self.username,
+                host: self.hostname.as_str(),
+                pv,
+                value,
+                result,
+            });
         }
     }
 
@@ -1716,7 +1714,7 @@ where
     let rl_cfg = crate::server::rate_limit::RateLimitConfig::from_env();
     state.rate_limiter = rl_cfg.build();
     state.rate_limit_strike_threshold = rl_cfg.strike_threshold;
-    state.audit("connect", "", "", "ok").await;
+    state.audit("connect", "", "", "ok");
 
     // C `rsrv/caservertask.c::create_tcp_client:1525` calls
     // `rsrv_version_reply(client)` immediately after `db_start_events`,
@@ -2248,7 +2246,7 @@ where
     if loop_result.is_err() && disconnect_reason == "ok" {
         disconnect_reason = "error";
     }
-    state.audit("disconnect", "", "", disconnect_reason).await;
+    state.audit("disconnect", "", "", disconnect_reason);
     loop_result
 }
 
@@ -2405,9 +2403,7 @@ async fn dispatch_message(
                     identity = state.hostname.as_str(),
                     "HOST_NAME ignored: identity is pinned (asCheckClientIP or mTLS)"
                 );
-                state
-                    .audit("host_name", "", &claimed, "ignored_pinned")
-                    .await;
+                state.audit("host_name", "", &claimed, "ignored_pinned");
             }
         }
 
@@ -2815,9 +2811,7 @@ async fn dispatch_message(
                                 let mut fail = CaHeader::new(CA_PROTO_CREATE_CH_FAIL);
                                 fail.cid = client_cid;
                                 writer.push(fail.to_bytes().to_vec());
-                                state
-                                    .audit("create_chan", &pv_name, "", "filter_parse_fail")
-                                    .await;
+                                state.audit("create_chan", &pv_name, "", "filter_parse_fail");
                                 return Ok(());
                             }
                         }
@@ -2885,7 +2879,7 @@ async fn dispatch_message(
                     AccessLevel::NoAccess => "denied",
                     _ => "ok",
                 };
-                state.audit("create_chan", &pv_name, "", result).await;
+                state.audit("create_chan", &pv_name, "", result);
 
                 // Notify subscribers (e.g. ca_gateway tracking PV → client
                 // attachments for `Active`/`Inactive` state transitions).
@@ -2905,7 +2899,7 @@ async fn dispatch_message(
                 fail.cid = client_cid;
                 writer.push(fail.to_bytes().to_vec());
 
-                state.audit("create_chan", &pv_name, "", "not_found").await;
+                state.audit("create_chan", &pv_name, "", "not_found");
             }
         }
 
@@ -3616,7 +3610,7 @@ async fn dispatch_message(
                             },
                         )
                         .await?;
-                        state.audit("caput", &audit_pv, "", "denied").await;
+                        state.audit("caput", &audit_pv, "", "denied");
                         return Ok(());
                     }
                 };
@@ -3641,7 +3635,7 @@ async fn dispatch_message(
                             state.client_minor_version,
                         )
                         .await?;
-                        state.audit("caput", &audit_pv, "", "denied").await;
+                        state.audit("caput", &audit_pv, "", "denied");
                         return Ok(());
                     }
                 };
@@ -3843,9 +3837,7 @@ async fn dispatch_message(
             };
 
             let audit_result = if write_result.is_ok() { "ok" } else { "fail" };
-            state
-                .audit("caput", &audit_pv, &display_value, audit_result)
-                .await;
+            state.audit("caput", &audit_pv, &display_value, audit_result);
 
             // SYNCHRONOUS write paths (no async record completion
             // pending): fire AfterWrite now with the known status via

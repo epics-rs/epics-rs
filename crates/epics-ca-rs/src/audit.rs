@@ -254,7 +254,7 @@ impl AuditLogger {
         Self { tx, format }
     }
 
-    pub async fn log(&self, ev: AuditEvent<'_>) {
+    pub fn log(&self, ev: AuditEvent<'_>) {
         let line = match self.format {
             AuditFormat::Json => ev.to_json(),
             AuditFormat::LegacyAslog => ev.to_aslog_line(),

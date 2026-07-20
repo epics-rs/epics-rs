@@ -968,8 +968,8 @@ impl SseqRecord {
             tokio::task::yield_now().await;
             let mut fields: Vec<(String, EpicsValue)> = Vec::with_capacity(NUM_STEPS * 5);
             for (i, (dol, lnk, wait)) in groups.iter().enumerate() {
-                let (dol_status, dol_ft) = classify_link(&handle, dol, LinkRole::Input).await;
-                let (lnk_status, lnk_ft) = classify_link(&handle, lnk, LinkRole::Output).await;
+                let (dol_status, dol_ft) = classify_link(&handle, dol, LinkRole::Input);
+                let (lnk_status, lnk_ft) = classify_link(&handle, lnk, LinkRole::Output);
                 let werr = wait_config_err(*wait, lnk_status);
                 fields.push((
                     DOLV_FIELDS[i].to_string(),

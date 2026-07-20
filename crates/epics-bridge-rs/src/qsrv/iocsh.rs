@@ -719,7 +719,7 @@ pub fn pvxsl_command(provider: Arc<BridgeProvider>) -> CommandDef {
             let db = provider.database().clone();
             let mut names = ctx.block_on(async {
                 let mut n = db.all_record_names().await;
-                n.extend(db.all_alias_names().await);
+                n.extend(db.all_alias_names());
                 n
             });
             names.sort();

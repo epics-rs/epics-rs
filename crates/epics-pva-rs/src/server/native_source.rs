@@ -594,7 +594,7 @@ impl ChannelSource for PvDatabaseSource {
             // a PVA client doing channelList must see them so it can
             // connect by alias. has_name and find_entry already
             // resolve aliases on the server side.
-            names.extend(db.all_alias_names().await);
+            names.extend(db.all_alias_names());
             names
         }
     }

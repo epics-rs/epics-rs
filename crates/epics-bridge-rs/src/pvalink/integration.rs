@@ -845,7 +845,7 @@ pub async fn install_pvalink_resolver(
     // read/write without iocsh pre-warming.
     use epics_base_rs::server::record::ParsedLink;
     for record_name in db.all_record_names().await {
-        for (field_name, _raw, parsed) in db.record_link_fields(&record_name).await {
+        for (field_name, _raw, parsed) in db.record_link_fields(&record_name) {
             match &parsed {
                 // Convenience-URI / legacy-suffix form: the verbatim
                 // channel-name string may carry options in the

@@ -2772,7 +2772,7 @@ impl PvDatabase {
             // `convert_to_ca` entry so the holder's value read is rewired
             // to the external resolver (C `dbLink.c:118-130`).
             let mut convert_to_ca: Vec<(String, crate::server::record::CaLink)> = Vec::new();
-            for (field, _raw, parsed) in self.record_link_fields(target_name).await {
+            for (field, _raw, parsed) in self.record_link_fields(target_name) {
                 self.classify_cp_link(
                     &field,
                     parsed,

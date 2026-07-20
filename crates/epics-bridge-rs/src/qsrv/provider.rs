@@ -1318,7 +1318,7 @@ impl ChannelProvider for BridgeProvider {
         // names — a PVA client running channelList expects them so
         // it can connect by alias. `channel_find` / `create_channel`
         // already resolve aliases via has_name/get_record.
-        names.extend(self.db.all_alias_names().await);
+        names.extend(self.db.all_alias_names());
         // Only groups the serve gate hands out are listed: a name shadowed by
         // a record is listed once (as the record — the record wins, pvxs
         // `defineGroups` ioc/groupconfigprocessor.cpp:177), and a group that

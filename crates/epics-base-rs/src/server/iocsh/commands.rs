@@ -364,12 +364,11 @@ fn cmd_dbpr() -> CommandDef {
 
             // Collect field values inside lock, format outside
             let fields: Vec<(String, String)> = ctx.block_on(async {
-                // Record name for the async alias query — the read guard is
-                // released (block close) before the await, then re-acquired
-                // for the synchronous field reads (parking_lot guards are
-                // `!Send`, so none may be held across the await).
+                // Record name for the alias query, read under a short-lived
+                // guard that is dropped (block close) before the field reads
+                // below take their own `rec.read()`.
                 let rec_name = { rec.read().name.clone() };
-                let aliases = ctx.db().aliases_for_record(&rec_name).await;
+                let aliases = ctx.db().aliases_for_record(&rec_name);
 
                 let inst = rec.read();
                 let mut fields = Vec::new();
@@ -496,7 +495,7 @@ fn dbsr_handler(args: &[ArgValue], ctx: &CommandContext) -> CommandResult {
     // for simple PVs the field-dump branch silently
     // skips since they're not records.
     let mut names = ctx.block_on(ctx.db().all_record_names());
-    names.extend(ctx.block_on(ctx.db().all_alias_names()));
+    names.extend(ctx.db().all_alias_names());
     names.extend(ctx.block_on(ctx.db().all_simple_pv_names()));
     names.sort();
     names.dedup();
@@ -551,7 +550,7 @@ fn cmd_dbsr() -> CommandDef {
         "dbsr [interest level] — Database Server Report (served-channel statistics)",
         |_args: &[ArgValue], ctx: &CommandContext| {
             let records = ctx.block_on(ctx.db().all_record_names());
-            let aliases = ctx.block_on(ctx.db().all_alias_names());
+            let aliases = ctx.db().all_alias_names();
             let simple = ctx.block_on(ctx.db().all_simple_pv_names());
             ctx.println("Database Server Report");
             ctx.println(&format!("  Records served:     {}", records.len()));

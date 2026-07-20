@@ -198,9 +198,9 @@ impl AsyncDbHandle {
     /// the link is constant / external / unresolvable, or the database is
     /// gone. (Distinct from the free `server::record::link_field_type`,
     /// which returns the link *class* `LinkType`, not the target's type.)
-    pub async fn link_target_field_type(&self, link: &str) -> Option<crate::types::DbFieldType> {
+    pub fn link_target_field_type(&self, link: &str) -> Option<crate::types::DbFieldType> {
         match self.db() {
-            Some(db) => db.link_target_field_type(link).await,
+            Some(db) => db.link_target_field_type(link),
             None => None,
         }
     }
@@ -1005,10 +1005,7 @@ impl PvDatabase {
     /// `CA`/`PVA` (external) link returns `None` — epics-base-rs has no
     /// client-side introspection of a remote field's type, so the caller
     /// renders those as the `DBF_unknown` sentinel.
-    pub(crate) async fn link_target_field_type(
-        &self,
-        link: &str,
-    ) -> Option<crate::types::DbFieldType> {
+    pub(crate) fn link_target_field_type(&self, link: &str) -> Option<crate::types::DbFieldType> {
         let db = match crate::server::record::parse_link_v2(link) {
             crate::server::record::ParsedLink::Db(db) => db,
             _ => return None,

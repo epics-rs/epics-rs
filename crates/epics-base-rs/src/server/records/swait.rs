@@ -379,7 +379,7 @@ impl SwaitRecord {
             tokio::task::yield_now().await;
             let mut fields: Vec<(String, EpicsValue)> = Vec::with_capacity(links.len());
             for (i, link) in links.iter().enumerate() {
-                let status = classify_swait_pv(&handle, link).await;
+                let status = classify_swait_pv(&handle, link);
                 fields.push((
                     SWAIT_PV_STATUS_FIELDS[i].to_string(),
                     EpicsValue::Enum(status as u16),

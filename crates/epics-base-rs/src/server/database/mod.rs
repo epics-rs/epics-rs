@@ -939,7 +939,7 @@ impl PvDatabase {
     /// strings via [`Record::get_field`].
     ///
     /// Returns an empty Vec when the record doesn't exist.
-    pub async fn record_link_fields(
+    pub fn record_link_fields(
         &self,
         record_name: &str,
     ) -> Vec<(String, String, crate::server::record::ParsedLink)> {
@@ -1751,7 +1751,7 @@ impl PvDatabase {
     /// Mirrors the alias-half of base's `dbFirstRecord` iteration —
     /// `dbgrep` / `dbglob` / `dbsr` walk both record names and
     /// aliases when matching a glob.
-    pub async fn all_alias_names(&self) -> Vec<String> {
+    pub fn all_alias_names(&self) -> Vec<String> {
         self.inner.aliases.read().keys().cloned().collect()
     }
 
@@ -1759,7 +1759,7 @@ impl PvDatabase {
     /// stable output; empty when the record has no aliases. Used by
     /// `dbpr` to surface alias-form names so admins can see how
     /// clients may reach the record.
-    pub async fn aliases_for_record(&self, canonical: &str) -> Vec<String> {
+    pub fn aliases_for_record(&self, canonical: &str) -> Vec<String> {
         let aliases = self.inner.aliases.read();
         let mut hits: Vec<String> = aliases
             .iter()
@@ -2271,13 +2271,13 @@ mod tests {
 
         // Sorted, only TARGET's aliases.
         assert_eq!(
-            db.aliases_for_record("TARGET").await,
+            db.aliases_for_record("TARGET"),
             vec!["AA".to_string(), "ZZ".to_string()]
         );
         // OTHER's alone.
-        assert_eq!(db.aliases_for_record("OTHER").await, vec!["MM".to_string()]);
+        assert_eq!(db.aliases_for_record("OTHER"), vec!["MM".to_string()]);
         // Unknown record → empty, not None.
-        assert!(db.aliases_for_record("MISSING").await.is_empty());
+        assert!(db.aliases_for_record("MISSING").is_empty());
     }
 
     #[tokio::test]
@@ -2292,7 +2292,7 @@ mod tests {
         db.add_alias("ALIAS_A", "TARGET").await.unwrap();
         db.add_alias("ALIAS_B", "TARGET").await.unwrap();
 
-        let mut aliases = db.all_alias_names().await;
+        let mut aliases = db.all_alias_names();
         aliases.sort();
         assert_eq!(aliases, vec!["ALIAS_A".to_string(), "ALIAS_B".to_string()]);
         // Canonical names are NOT returned here.
@@ -2594,7 +2594,7 @@ mod tests {
             rec.write().common.inp = "pva://mini:current?proc=CP".to_string();
         }
 
-        let links = db.record_link_fields("AI").await;
+        let links = db.record_link_fields("AI");
         let inp = links
             .iter()
             .find(|(f, _, _)| f == "INP")

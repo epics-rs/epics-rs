@@ -1084,10 +1084,19 @@ impl IocApplication {
         // only sleeps on `pending()`).
         let runner_fut = protocol_runner(config);
         tokio::pin!(runner_fut);
+        // SIGINT/SIGTERM racing is host-only: `tokio::signal` needs the tokio
+        // `signal` feature (signal-hook-registry + mio), which is dropped for
+        // the RTEMS target. On RTEMS both arms are `pending()`, so `run` simply
+        // awaits the runner; process-signal shutdown is the RTEMS driver's
+        // concern (a later increment). RTEMS is `cfg(unix)` too, so the guard is
+        // `all(unix, not(target_os = "rtems"))`, not `unix` alone.
+        #[cfg(not(target_os = "rtems"))]
         let ctrl_c = async {
             let _ = tokio::signal::ctrl_c().await;
         };
-        #[cfg(unix)]
+        #[cfg(target_os = "rtems")]
+        let ctrl_c = std::future::pending::<()>();
+        #[cfg(all(unix, not(target_os = "rtems")))]
         let sigterm = async {
             if let Ok(mut sig) =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -1097,7 +1106,7 @@ impl IocApplication {
                 std::future::pending::<()>().await;
             }
         };
-        #[cfg(not(unix))]
+        #[cfg(not(all(unix, not(target_os = "rtems"))))]
         let sigterm = std::future::pending::<()>();
 
         tokio::select! {

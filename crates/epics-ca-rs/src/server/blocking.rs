@@ -1,4 +1,4 @@
-//! S1a/S1b — blocking, thread-per-client CA server driver.
+//! S1a/S1b/S1c — blocking, thread-per-client CA server driver.
 //!
 //! This is the RTEMS-oriented front-end for the Channel Access server. It
 //! mirrors C `rsrv`'s I/O model — one blocking OS thread per accepted TCP
@@ -40,23 +40,28 @@
 //! (`SEND_LOCK`, `server.h:221`), because two threads write it — the
 //! `camsgtask` command thread and the `CAS-event` monitor thread
 //! (`dbEvent.c:1016`). We model that with an `Arc<Mutex<TcpStream>>` write
-//! handle. S1a has a single writer (the client thread draining command
-//! replies), so the mutex is uncontended here, but it is the structural
-//! anchor the S1c event-task analogue will lock to deliver monitor updates.
+//! handle. Both writers now exist (S1c): the client thread draining command
+//! replies AND the per-client event thread ([`run_event_task`]) writing
+//! monitor updates lock this same mutex, so the two never interleave a frame.
 //!
-//! # Scope (S1a) and what is deferred
+//! # Scope and what is deferred
 //!
-//! S1a covers GET/read plus the connection lifecycle (handshake, channel
-//! create/clear). [`command_drives_without_spawn`] is an allowlist that
-//! *fails closed*: any command whose handler spawns a task — EVENT_ADD
-//! monitor senders and the WRITE_NOTIFY async completion (`tcp.rs:4389`,
-//! `tcp.rs:4630`, `tcp.rs:3937`) — is refused with a clean CA error rather
-//! than driven, because a spawn on a runtime-less thread cannot complete
-//! here. Those move to S1c, which adds the event-task analogue and routes
-//! async tails through the background executor. WRITE is deferred with them:
-//! an async (PACT) record's write returns a `ProcessCompletion::Async` tail
-//! that spawns, and the driver cannot tell sync from async records before
-//! processing.
+//! Covered: GET/read, the connection lifecycle (handshake, channel
+//! create/clear), and — as of S1c part (a) — MONITORS. EVENT_ADD / EVENT_CANCEL
+//! are served by dedicated branches (ahead of the allowlist) that share the
+//! async server's [`register_subscription`] / `send_event` parity logic and
+//! hand each subscription's live reader to a second per-client event thread
+//! ([`run_event_task`], the C `dbEvent` `event_task` analogue) instead of
+//! spawning a task per subscription. EVENTS_ON / EVENTS_OFF flow-control the
+//! shared `EventUser` the event thread's readers consult, so gating matches the
+//! async server.
+//!
+//! Still deferred (S1c part b): WRITE / WRITE_NOTIFY. [`command_drives_without_spawn`]
+//! remains a *fail-closed* allowlist for everything not handled by a dedicated
+//! branch — an async (PACT) record's write returns a `ProcessCompletion::Async`
+//! tail that spawns, and the driver cannot tell sync from async records before
+//! processing, so both are refused with a clean CA error rather than driven on
+//! a runtime-less thread.
 //!
 //! The gateway `-no_cache` read-hook GET (`tcp.rs:3111`) is the one genuinely
 //! async branch a READ can reach; it is unreachable for a local record
@@ -73,6 +78,7 @@
 //! ARE handled (the loop waits for the rest). A future increment factors the
 //! shared sans-io frame parser both loops call.
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, SocketAddrV4, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -84,15 +90,20 @@ use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::runtime::task::block_on_sync;
 use epics_base_rs::server::access_security::AccessSecurityConfig;
 use epics_base_rs::server::database::PvDatabase;
+use tokio::sync::mpsc;
 
 use crate::protocol::{
     CA_MINOR_VERSION, CA_PROTO_CLEAR_CHANNEL, CA_PROTO_CLIENT_NAME, CA_PROTO_CREATE_CHAN,
-    CA_PROTO_ECHO, CA_PROTO_EVENTS_OFF, CA_PROTO_EVENTS_ON, CA_PROTO_HOST_NAME, CA_PROTO_READ,
-    CA_PROTO_READ_NOTIFY, CA_PROTO_READ_SYNC, CA_PROTO_SEARCH, CA_PROTO_VERSION, CaHeader,
-    ECA_UNAVAILINSERV, ca_v49,
+    CA_PROTO_ECHO, CA_PROTO_EVENT_ADD, CA_PROTO_EVENT_CANCEL, CA_PROTO_EVENTS_OFF,
+    CA_PROTO_EVENTS_ON, CA_PROTO_HOST_NAME, CA_PROTO_READ, CA_PROTO_READ_NOTIFY,
+    CA_PROTO_READ_SYNC, CA_PROTO_SEARCH, CA_PROTO_VERSION, CaHeader, ECA_UNAVAILINSERV, ca_v49,
 };
 use crate::server::outbox::{self, OutboxDrain};
-use crate::server::tcp::{ClientState, dispatch_message, is_peer_disconnect, send_ca_error};
+use crate::server::tcp::{
+    CancelInfo, ChannelTarget, ClientState, EventTaskControl, MonitorDelivery,
+    SubscriptionDelivery, SubscriptionOutcome, cancel_subscription_reply, dispatch_message,
+    is_peer_disconnect, register_subscription, run_event_task, send_ca_error,
+};
 use crate::server::udp::{self, SearchReplyBatch};
 
 /// The ACF handle type [`ClientState::new`] expects. `tokio::sync::RwLock` is
@@ -555,6 +566,22 @@ fn drain_outbox_locked(
     sock.flush()
 }
 
+/// The blocking driver's per-subscription cancel handle. This is a SEPARATE
+/// map from the async server's `SubscriptionEntry` (which stores a
+/// `tokio::task::JoinHandle` the blocking driver has no runtime to produce):
+/// the live producer runs on the one event thread, so here we keep only what
+/// EVENT_CANCEL and disconnect teardown need — the owning channel SID, the sub
+/// id (echoed in the cancel ACK, and the key the event thread drops on cancel),
+/// the framed type/count for the cancel ACK, and the target so the producer
+/// subscriber can be removed from its record/PV.
+struct BlockingSub {
+    channel_sid: u32,
+    sub_id: u32,
+    data_type: u16,
+    data_count: u32,
+    target: ChannelTarget,
+}
+
 /// Serve one CA client over a blocking `TcpStream`. C `camsgtask`
 /// (`camsgtask.c:41`).
 fn handle_client_blocking(
@@ -593,124 +620,287 @@ fn handle_client_blocking(
         write_frame_locked(&send_lock, &hdr.to_bytes()).map_err(CaError::Io)?;
     }
 
-    let mut accumulated: Vec<u8> = Vec::new();
-    let mut buf = vec![0u8; 8192];
-
-    loop {
-        // C `camsgtask.c:52-67`: before blocking in `recv`, flush accumulated
-        // replies only when the socket has no more bytes pending (FIONREAD ==
-        // 0) or FIONREAD errors; otherwise hold them so replies to pipelined
-        // commands batch into one write. `cas_send_bs_msg(client, TRUE)` is
-        // this drain. The per-command drain that used to run at the loop
-        // bottom is gone — a single request/response still flushes here on the
-        // next iteration (the client is then idle, so FIONREAD == 0), while a
-        // pipelined burst coalesces into one write.
-        match pending_bytes(&reader) {
-            Ok(0) | Err(_) => match drain_outbox_locked(&send_lock, &mut drain) {
-                Ok(()) => {}
-                Err(ref e) if is_peer_disconnect(e.kind()) => break,
-                Err(e) => return Err(CaError::Io(e)),
-            },
-            Ok(_) => { /* more bytes pending: hold to coalesce pipelined replies */ }
-        }
-
-        let n = match reader.read(&mut buf) {
-            Ok(0) => break, // graceful EOF
-            Ok(n) => n,
-            // Peer vanished mid-session (RST / broken pipe / truncated) is a
-            // clean disconnect, not a server error — same rule as
-            // `handle_client` (`is_peer_disconnect`).
-            Err(ref e) if is_peer_disconnect(e.kind()) => break,
-            Err(ref e) if is_read_timeout(e.kind()) => {
-                tracing::warn!(
+    // The CAS-event monitor thread — the analogue of C `dbEvent.c` `event_task`
+    // (`~876`): a SECOND thread per client that blocks on this client's monitor
+    // queues and, when `db_post_events` posts an update, writes it to the socket
+    // under the SAME `send_lock` this read/dispatch thread drains its command
+    // replies under (C `client->lock` serializes `camsgtask` + `event_task`,
+    // `server.h:221`). It has no async runtime either: `run_event_task` is an
+    // async fn driven by `park_on`; its readers suspend on the runtime-agnostic
+    // `EvQue` wake (a `Notify`) and are woken cross-thread by `db_post_events`.
+    let (ev_tx, ev_rx) = mpsc::unbounded_channel::<EventTaskControl>();
+    let event_send_lock = send_lock.clone();
+    let event_thread = thread::Builder::new()
+        .name(format!("CAS-event-blocking {peer}"))
+        .spawn(move || {
+            let mut write = |frame: &[u8]| write_frame_locked(&event_send_lock, frame);
+            if block_on_sync(run_event_task(ev_rx, &mut write)).is_err() {
+                tracing::error!(
                     target: "epics_ca_rs::server::blocking",
-                    %peer, "CA client idle (SO_RCVTIMEO), closing"
+                    %peer,
+                    "CAS-event thread future not blockable (unexpected on a runtime-less thread)"
                 );
-                break;
             }
-            Err(e) => return Err(CaError::Io(e)),
-        };
-        accumulated.extend_from_slice(&buf[..n]);
+        })
+        .map_err(CaError::Io)?;
 
-        let mut offset = 0;
-        while offset + CaHeader::SIZE <= accumulated.len() {
-            let tail = &accumulated[offset..];
-            // Partial extended-form header (16..24 bytes of a 0xffff-postsize
-            // frame): wait for the annex. Mirrors `handle_client` tcp.rs:2001.
-            if ca_v49(state.client_minor_version())
-                && tail.len() < 24
-                && tail[2] == 0xFF
-                && tail[3] == 0xFF
-            {
-                break;
-            }
-            let (hdr, hdr_size) =
-                match CaHeader::from_bytes_for_peer(tail, state.client_minor_version()) {
-                    Ok(v) => v,
-                    // A partial header at a segment boundary parses as Err;
-                    // wait for more bytes. (A truly malformed frame also lands
-                    // here and ends the circuit — see the module docs on the
-                    // deferred refuse-and-continue parity.)
-                    Err(_) => break,
-                };
-            let actual_post = hdr.actual_postsize();
-            let msg_len = hdr_size + actual_post;
-            if offset + msg_len > accumulated.len() {
-                break; // frame body not fully arrived yet
-            }
-            let payload = accumulated[offset + hdr_size..offset + hdr_size + actual_post].to_vec();
+    // The blocking driver's own subscription registry (see [`BlockingSub`]).
+    let mut blk_subs: HashMap<u32, BlockingSub> = HashMap::new();
 
-            if command_drives_without_spawn(hdr.cmmd) {
-                // Drive the shared handler to completion on this thread. No
-                // async runtime is entered, so `block_on_sync` uses `park_on`:
-                // the handler may only suspend on runtime-agnostic tokio::sync
-                // locks (DB / PV / ACF), which for a local record are Ready on
-                // the first poll. Spawning commands are gated out above; the
-                // gateway read-hook GET is unreachable for a local record.
-                match block_on_sync(dispatch_message(
-                    &hdr, &payload, &mut state, &db, &outbox, peer, None,
-                )) {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
-                        // Ship anything an earlier handler in this burst (or
-                        // this handler's own error frame) queued, then end.
-                        let _ = drain_outbox_locked(&send_lock, &mut drain);
-                        return Err(e);
-                    }
-                    Err(_not_blockable) => {
-                        // Only possible inside a current-thread tokio runtime;
-                        // a blocking client thread never enters one.
-                        return Err(CaError::Protocol(
-                            "blocking CA driver: handler not blockable in this thread context"
-                                .into(),
-                        ));
-                    }
+    // Run the read/dispatch loop in a closure so the producer teardown + event-
+    // thread join below runs on EVERY exit path (EOF, peer-disconnect, idle,
+    // handler error) — C ends `camsgtask` AND its `event_task` together on a
+    // client disconnect, with no leaked thread.
+    let result: CaResult<()> = (|| {
+        let mut accumulated: Vec<u8> = Vec::new();
+        let mut buf = vec![0u8; 8192];
+
+        loop {
+            // C `camsgtask.c:52-67`: before blocking in `recv`, flush accumulated
+            // replies only when the socket has no more bytes pending (FIONREAD ==
+            // 0) or FIONREAD errors; otherwise hold them so replies to pipelined
+            // commands batch into one write. `cas_send_bs_msg(client, TRUE)` is
+            // this drain. The per-command drain that used to run at the loop
+            // bottom is gone — a single request/response still flushes here on the
+            // next iteration (the client is then idle, so FIONREAD == 0), while a
+            // pipelined burst coalesces into one write.
+            match pending_bytes(&reader) {
+                Ok(0) | Err(_) => match drain_outbox_locked(&send_lock, &mut drain) {
+                    Ok(()) => {}
+                    Err(ref e) if is_peer_disconnect(e.kind()) => break,
+                    Err(e) => return Err(CaError::Io(e)),
+                },
+                Ok(_) => { /* more bytes pending: hold to coalesce pipelined replies */ }
+            }
+
+            let n = match reader.read(&mut buf) {
+                Ok(0) => break, // graceful EOF
+                Ok(n) => n,
+                // Peer vanished mid-session (RST / broken pipe / truncated) is a
+                // clean disconnect, not a server error — same rule as
+                // `handle_client` (`is_peer_disconnect`).
+                Err(ref e) if is_peer_disconnect(e.kind()) => break,
+                Err(ref e) if is_read_timeout(e.kind()) => {
+                    tracing::warn!(
+                        target: "epics_ca_rs::server::blocking",
+                        %peer, "CA client idle (SO_RCVTIMEO), closing"
+                    );
+                    break;
                 }
-            } else {
-                // Not yet supported (monitors + writes are S1c). Fail closed
-                // with a clean CA error and keep serving — never a panic or a
-                // silent drop.
-                let _ = send_ca_error(
-                    &outbox,
-                    &hdr,
-                    ECA_UNAVAILINSERV,
-                    0xFFFF_FFFF,
-                    "CAS: command not yet supported by blocking CA driver",
-                    state.client_minor_version(),
-                );
-            }
-            offset += msg_len;
-        }
-        if offset > 0 {
-            accumulated.drain(..offset);
-        }
-        // The reply drain lives at the loop top (FIONREAD-gated), not here —
-        // holding replies until the socket drains is the C batch-up rule
-        // (`camsgtask.c:52-67`). The only in-body drain is the handler-error
-        // path above, which flushes queued frames before ending the circuit.
-    }
+                Err(e) => return Err(CaError::Io(e)),
+            };
+            accumulated.extend_from_slice(&buf[..n]);
 
-    Ok(())
+            let mut offset = 0;
+            while offset + CaHeader::SIZE <= accumulated.len() {
+                let tail = &accumulated[offset..];
+                // Partial extended-form header (16..24 bytes of a 0xffff-postsize
+                // frame): wait for the annex. Mirrors `handle_client` tcp.rs:2001.
+                if ca_v49(state.client_minor_version())
+                    && tail.len() < 24
+                    && tail[2] == 0xFF
+                    && tail[3] == 0xFF
+                {
+                    break;
+                }
+                let (hdr, hdr_size) =
+                    match CaHeader::from_bytes_for_peer(tail, state.client_minor_version()) {
+                        Ok(v) => v,
+                        // A partial header at a segment boundary parses as Err;
+                        // wait for more bytes. (A truly malformed frame also lands
+                        // here and ends the circuit — see the module docs on the
+                        // deferred refuse-and-continue parity.)
+                        Err(_) => break,
+                    };
+                let actual_post = hdr.actual_postsize();
+                let msg_len = hdr_size + actual_post;
+                if offset + msg_len > accumulated.len() {
+                    break; // frame body not fully arrived yet
+                }
+                let payload =
+                    accumulated[offset + hdr_size..offset + hdr_size + actual_post].to_vec();
+
+                if hdr.cmmd == CA_PROTO_EVENT_ADD {
+                    // Register the subscription with the SHARED parity logic in
+                    // `HandOff` mode: it validates caps/dedup/type/mask/count/ACF,
+                    // delivers the initial value into `outbox`, and hands back the
+                    // live reader WITHOUT spawning (this thread has no runtime). The
+                    // per-channel cap and duplicate-sub-id check consult the blocking
+                    // driver's own map (`blk_subs`), not the async `subscriptions`.
+                    let sid = hdr.cid;
+                    let sub_id = hdr.available;
+                    let sub_id_in_use = blk_subs.contains_key(&sub_id);
+                    let outcome = block_on_sync(register_subscription(
+                        &hdr,
+                        &payload,
+                        &state,
+                        &outbox,
+                        SubscriptionDelivery::HandOff,
+                        || blk_subs.values().filter(|s| s.channel_sid == sid).count(),
+                        sub_id_in_use,
+                    ));
+                    match outcome {
+                        Ok(Ok(SubscriptionOutcome::HandedOff(r))) => {
+                            // Flush the initial snapshot (already queued in `outbox`)
+                            // to the socket NOW, before the event thread can deliver
+                            // any later `db_post_events` update — preserving the
+                            // initial-before-update order (C funnels both through the
+                            // one `event_task` queue; here two threads share the
+                            // socket, so we serialize by writing the initial first).
+                            match drain_outbox_locked(&send_lock, &mut drain) {
+                                Ok(()) => {}
+                                Err(ref e) if is_peer_disconnect(e.kind()) => break,
+                                Err(e) => return Err(CaError::Io(e)),
+                            }
+                            blk_subs.insert(
+                                r.sub_id,
+                                BlockingSub {
+                                    channel_sid: r.channel_sid,
+                                    sub_id: r.sub_id,
+                                    data_type: r.data_type,
+                                    data_count: r.data_count,
+                                    target: r.target.clone(),
+                                },
+                            );
+                            // Hand the live reader to the event thread; it frames
+                            // every later update with the same `send_event` builder
+                            // the async producer uses (byte-identical). If the event
+                            // thread is already gone, the client is ending — drop it.
+                            let _ = ev_tx.send(EventTaskControl::Add(Box::new(MonitorDelivery {
+                                reader: r.reader,
+                                target: r.target,
+                                sub_id: r.sub_id,
+                                data_type: r.data_type,
+                                data_count: r.data_count,
+                                denied: r.denied,
+                                long_string_mode: r.long_string_mode,
+                                req_hdr: hdr,
+                                client_minor: r.client_minor,
+                                stats: r.stats,
+                            })));
+                        }
+                        // A refusal frame is already queued; keep serving.
+                        Ok(Ok(SubscriptionOutcome::Refused)) => {}
+                        Ok(Ok(SubscriptionOutcome::Spawned(_))) => {
+                            unreachable!("HandOff mode never spawns a task")
+                        }
+                        Ok(Err(e)) => {
+                            let _ = drain_outbox_locked(&send_lock, &mut drain);
+                            return Err(e);
+                        }
+                        Err(_not_blockable) => {
+                            return Err(CaError::Protocol(
+                                "blocking CA driver: EVENT_ADD register not blockable in this \
+                             thread context"
+                                    .into(),
+                            ));
+                        }
+                    }
+                } else if hdr.cmmd == CA_PROTO_EVENT_CANCEL {
+                    // Shared cancel wire logic (bad-SID / bad-mon-id / ACK), reading
+                    // the addressed subscription from the blocking driver's own map.
+                    let sub_id = hdr.available;
+                    let sub_info = blk_subs.get(&sub_id).map(|s| CancelInfo {
+                        channel_sid: s.channel_sid,
+                        data_type: s.data_type,
+                        data_count: s.data_count,
+                    });
+                    match cancel_subscription_reply(&hdr, &state, &outbox, sub_info) {
+                        Ok(true) => {
+                            if let Some(sub) = blk_subs.remove(&sub_id) {
+                                // Stop the producer: drop the reader on the event
+                                // thread, then remove the subscriber from record/PV.
+                                let _ = ev_tx.send(EventTaskControl::Cancel(sub.sub_id));
+                                match &sub.target {
+                                    ChannelTarget::SimplePv(pv) => {
+                                        let _ = block_on_sync(pv.remove_subscriber(sub.sub_id));
+                                    }
+                                    ChannelTarget::RecordField { record, .. } => {
+                                        record.write().remove_subscriber(sub.sub_id);
+                                    }
+                                }
+                            }
+                        }
+                        // `cancel_subscription_reply` returns only `Ok(true)` or `Err`.
+                        Ok(false) => {}
+                        Err(e) => {
+                            // The CA_PROTO_ERROR is queued; ship it, then end the
+                            // circuit (C `event_cancel_reply` RSRV_ERROR).
+                            let _ = drain_outbox_locked(&send_lock, &mut drain);
+                            return Err(e);
+                        }
+                    }
+                } else if command_drives_without_spawn(hdr.cmmd) {
+                    // Drive the shared handler to completion on this thread. No
+                    // async runtime is entered, so `block_on_sync` uses `park_on`:
+                    // the handler may only suspend on runtime-agnostic tokio::sync
+                    // locks (DB / PV / ACF), which for a local record are Ready on
+                    // the first poll. Spawning commands are gated out above; the
+                    // gateway read-hook GET is unreachable for a local record.
+                    match block_on_sync(dispatch_message(
+                        &hdr, &payload, &mut state, &db, &outbox, peer, None,
+                    )) {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            // Ship anything an earlier handler in this burst (or
+                            // this handler's own error frame) queued, then end.
+                            let _ = drain_outbox_locked(&send_lock, &mut drain);
+                            return Err(e);
+                        }
+                        Err(_not_blockable) => {
+                            // Only possible inside a current-thread tokio runtime;
+                            // a blocking client thread never enters one.
+                            return Err(CaError::Protocol(
+                                "blocking CA driver: handler not blockable in this thread context"
+                                    .into(),
+                            ));
+                        }
+                    }
+                } else {
+                    // Not yet supported (writes are S1c part b). Fail closed with a
+                    // clean CA error and keep serving — never a panic or a silent
+                    // drop.
+                    let _ = send_ca_error(
+                        &outbox,
+                        &hdr,
+                        ECA_UNAVAILINSERV,
+                        0xFFFF_FFFF,
+                        "CAS: command not yet supported by blocking CA driver",
+                        state.client_minor_version(),
+                    );
+                }
+                offset += msg_len;
+            }
+            if offset > 0 {
+                accumulated.drain(..offset);
+            }
+            // The reply drain lives at the loop top (FIONREAD-gated), not here —
+            // holding replies until the socket drains is the C batch-up rule
+            // (`camsgtask.c:52-67`). The only in-body drain is the handler-error
+            // path above, which flushes queued frames before ending the circuit.
+        }
+
+        Ok(())
+    })();
+
+    // Producer teardown (runs on every exit path): drop each subscriber from
+    // its record/PV so no dangling `EvQue` post target survives this client —
+    // the blocking analogue of `dispatch_message`'s disconnect drain.
+    for (_, sub) in blk_subs.drain() {
+        match &sub.target {
+            ChannelTarget::SimplePv(pv) => {
+                let _ = block_on_sync(pv.remove_subscriber(sub.sub_id));
+            }
+            ChannelTarget::RecordField { record, .. } => {
+                record.write().remove_subscriber(sub.sub_id);
+            }
+        }
+    }
+    // Dropping the control sender ends `run_event_task`; join so the second
+    // thread never leaks (C `db_close_events` + `event_task` exit).
+    drop(ev_tx);
+    let _ = event_thread.join();
+    result
 }
 
 #[cfg(test)]
@@ -1010,13 +1200,13 @@ mod tests {
         );
     }
 
-    /// A spawning command (EVENT_ADD) is refused with a clean CA error, not a
-    /// panic — the fail-closed allowlist. (S1c enables it.)
+    /// The still-unsupported spawning commands (WRITE / WRITE_NOTIFY, S1c part
+    /// b) are refused with a clean CA error, not a panic — the fail-closed
+    /// allowlist. EVENT_ADD / EVENT_CANCEL are NOT in the allowlist either, but
+    /// they are now served by their own dedicated branches ahead of it (S1c
+    /// part a), so their absence here is not a refusal.
     #[test]
     fn unsupported_command_is_refused_cleanly() {
-        assert!(!command_drives_without_spawn(
-            crate::protocol::CA_PROTO_EVENT_ADD
-        ));
         assert!(!command_drives_without_spawn(
             crate::protocol::CA_PROTO_WRITE
         ));
@@ -1426,6 +1616,349 @@ mod tests {
             replies[1], ref2,
             "second reply must match shared dispatch bytes"
         );
+
+        server.shutdown();
+        accept.join().unwrap();
+    }
+
+    // ---- S1c part (a): the monitor event-task (EVENT_ADD / EVENT_CANCEL) ----
+
+    /// DBR_DOUBLE: a plain scalar double monitor. It carries no timestamp
+    /// field, so the encoded frame is deterministic — the byte-parity
+    /// references below need not reproduce a wall-clock stamp.
+    const DBR_DOUBLE_MON: u16 = 6;
+
+    /// A CA_PROTO_EVENT_ADD (monitor subscribe) frame for a scalar DBR_DOUBLE
+    /// with mask DBE_VALUE|DBE_ALARM — the 16-byte extended monitor request the
+    /// async server also parses (cf. `event_add_frame` in the tcp.rs tests).
+    fn event_add_double_frame(sid: u32, sub_id: u32) -> Vec<u8> {
+        let mut h = CaHeader::new(CA_PROTO_EVENT_ADD);
+        h.data_type = DBR_DOUBLE_MON;
+        h.count = 1;
+        h.cid = sid;
+        h.available = sub_id;
+        h.set_payload_size(16, 1, CA_MINOR_VERSION)
+            .expect("modern peer accepts the extended header");
+        let mut f = h.to_bytes().to_vec();
+        f.extend_from_slice(&0f32.to_be_bytes()); // low
+        f.extend_from_slice(&0f32.to_be_bytes()); // high
+        f.extend_from_slice(&0f32.to_be_bytes()); // to
+        f.extend_from_slice(&3u16.to_be_bytes()); // mask: DBE_VALUE|DBE_ALARM
+        f.extend_from_slice(&0u16.to_be_bytes()); // pad
+        f
+    }
+
+    fn events_off_frame() -> Vec<u8> {
+        CaHeader::new(CA_PROTO_EVENTS_OFF).to_bytes().to_vec()
+    }
+
+    fn events_on_frame() -> Vec<u8> {
+        CaHeader::new(CA_PROTO_EVENTS_ON).to_bytes().to_vec()
+    }
+
+    /// The DBR_DOUBLE scalar value in an EVENT_ADD monitor reply (payload
+    /// begins right after the 16-byte header).
+    fn monitor_reply_value(frame: &[u8]) -> f64 {
+        f64::from_be_bytes([
+            frame[16], frame[17], frame[18], frame[19], frame[20], frame[21], frame[22], frame[23],
+        ])
+    }
+
+    /// Drain the outbox for its first CA_PROTO_EVENT_ADD (monitor) frame.
+    fn drain_one_event_add(drain: &mut OutboxDrain) -> Vec<u8> {
+        while let Some(f) = drain.try_next() {
+            if u16::from_be_bytes([f[0], f[1]]) == CA_PROTO_EVENT_ADD {
+                return f;
+            }
+        }
+        panic!("outbox held no CA_PROTO_EVENT_ADD frame");
+    }
+
+    /// Look up a seeded simple PV so a test can post an update to it (the
+    /// `db_post_events` analogue: `pv.set` fans out to subscribers).
+    fn simple_pv(
+        db: &Arc<PvDatabase>,
+        name: &str,
+    ) -> Arc<epics_base_rs::server::pv::ProcessVariable> {
+        match block_on_sync(db.find_entry(name))
+            .expect("blockable on test thread")
+            .expect("seeded PV present")
+        {
+            epics_base_rs::server::database::PvEntry::Simple(pv) => pv,
+            _ => panic!("{name} is not a simple PV"),
+        }
+    }
+
+    /// The initial + first-update monitor frames the SHARED path produces for a
+    /// DBR_DOUBLE subscription: `register_subscription` (the initial snapshot)
+    /// and `send_event` (the update), driven entirely in-process. Both the
+    /// async server and this blocking driver run these exact functions, so
+    /// these are the async server's monitor bytes — the byte-parity reference.
+    /// Uses its OWN db so the update posted here does not perturb the server
+    /// under test.
+    fn reference_monitor_frames(seed: f64, update: f64, sub_id: u32) -> (Vec<u8>, Vec<u8>) {
+        let db = seed_db(&[("REF:MON", EpicsValue::Double(seed))]);
+        let acf = new_acf();
+        let mut state = ClientState::new(acf, 5064, db.clone());
+        let peer: SocketAddr = "127.0.0.1:5064".parse().unwrap();
+        state.apply_connection_identity(peer, None, None);
+        let (outbox, mut drain) = outbox::channel();
+
+        let run = |state: &mut ClientState, frame: Vec<u8>| {
+            let (hdr, hdr_size) =
+                CaHeader::from_bytes_for_peer(&frame, state.client_minor_version()).unwrap();
+            let payload = frame[hdr_size..].to_vec();
+            block_on_sync(dispatch_message(
+                &hdr, &payload, state, &db, &outbox, peer, None,
+            ))
+            .unwrap()
+            .unwrap();
+        };
+        run(&mut state, version_frame());
+        run(&mut state, create_chan_frame(0x1234, "REF:MON")); // -> sid 1
+
+        // EVENT_ADD via the shared register in HandOff mode: the initial value
+        // lands in `outbox`, and we hold the live reader for the update.
+        let add = event_add_double_frame(1, sub_id);
+        let (hdr, hdr_size) =
+            CaHeader::from_bytes_for_peer(&add, state.client_minor_version()).unwrap();
+        let payload = add[hdr_size..].to_vec();
+        let outcome = block_on_sync(register_subscription(
+            &hdr,
+            &payload,
+            &state,
+            &outbox,
+            SubscriptionDelivery::HandOff,
+            || 0usize,
+            false,
+        ))
+        .expect("blockable")
+        .expect("register ok");
+        let r = match outcome {
+            SubscriptionOutcome::HandedOff(r) => r,
+            _ => panic!("HandOff must hand off the reader"),
+        };
+        let initial = drain_one_event_add(&mut drain);
+
+        // Post the update, then frame it with the SAME `send_event` the event
+        // thread uses.
+        match &r.target {
+            ChannelTarget::SimplePv(pv) => {
+                block_on_sync(pv.set(EpicsValue::Double(update))).expect("blockable");
+            }
+            _ => panic!("REF:MON must be a simple PV"),
+        }
+        let mut reader = r.reader;
+        let event = block_on_sync(reader.recv())
+            .expect("blockable")
+            .expect("an update event");
+        crate::server::monitor::send_event(
+            r.data_type,
+            r.data_count,
+            r.sub_id,
+            &event,
+            &outbox,
+            r.long_string_mode,
+            crate::server::tcp::ReplyContext {
+                req_hdr: hdr,
+                client_minor: r.client_minor,
+            },
+        )
+        .expect("encode update");
+        let update_frame = drain_one_event_add(&mut drain);
+        (initial, update_frame)
+    }
+
+    /// (S1c-a-i) A monitor subscription over a real TCP socket delivers the
+    /// initial value AND a later `db_post_events` update, each byte-identical
+    /// to the shared register/`send_event` path (= the async server's bytes).
+    #[test]
+    fn monitor_delivers_initial_and_update_matching_shared_path() {
+        let db = seed_db(&[("BLK:MON", EpicsValue::Double(42.0))]);
+        let server =
+            Arc::new(BlockingCaServer::bind("127.0.0.1:0", db.clone(), new_acf()).unwrap());
+        let addr = server.local_addr().unwrap();
+        let srv = server.clone();
+        let accept = thread::spawn(move || srv.serve());
+
+        let mut c = TcpStream::connect(addr).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let _ = read_until_cmmd(&mut c, CA_PROTO_VERSION);
+        c.write_all(&version_frame()).unwrap();
+        c.write_all(&create_chan_frame(0x1234, "BLK:MON")).unwrap();
+        let cc = read_until_cmmd(&mut c, CA_PROTO_CREATE_CHAN);
+        let sid = u32::from_be_bytes([cc[12], cc[13], cc[14], cc[15]]);
+        assert_eq!(sid, 1, "first channel gets sid 1");
+
+        // Subscribe → initial value.
+        let sub_id = 0xAB;
+        c.write_all(&event_add_double_frame(sid, sub_id)).unwrap();
+        let initial = read_until_cmmd(&mut c, CA_PROTO_EVENT_ADD);
+        assert_eq!(monitor_reply_value(&initial), 42.0, "initial monitor value");
+
+        // db_post_events: the event thread delivers the update over the socket.
+        let pv = simple_pv(&db, "BLK:MON");
+        block_on_sync(pv.set(EpicsValue::Double(99.0))).expect("blockable");
+        let update = read_until_cmmd(&mut c, CA_PROTO_EVENT_ADD);
+        assert_eq!(monitor_reply_value(&update), 99.0, "posted monitor update");
+
+        // Byte-for-byte parity against the shared register/send_event path.
+        let (ref_initial, ref_update) = reference_monitor_frames(42.0, 99.0, sub_id);
+        assert_eq!(
+            initial, ref_initial,
+            "initial monitor frame must match the shared path bytes"
+        );
+        assert_eq!(
+            update, ref_update,
+            "update monitor frame must match the shared path bytes"
+        );
+
+        server.shutdown();
+        accept.join().unwrap();
+    }
+
+    /// (S1c-a-ii) EVENTS_OFF gates monitor delivery; EVENTS_ON releases the
+    /// held update. The event thread's readers consult the shared `EventUser`
+    /// flow-control flag the dispatch thread flips — same as the async server.
+    #[test]
+    fn events_off_then_on_gates_delivery() {
+        let db = seed_db(&[("BLK:GATE", EpicsValue::Double(1.0))]);
+        let server =
+            Arc::new(BlockingCaServer::bind("127.0.0.1:0", db.clone(), new_acf()).unwrap());
+        let addr = server.local_addr().unwrap();
+        let srv = server.clone();
+        let accept = thread::spawn(move || srv.serve());
+
+        let mut c = TcpStream::connect(addr).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let _ = read_until_cmmd(&mut c, CA_PROTO_VERSION);
+        c.write_all(&version_frame()).unwrap();
+        c.write_all(&create_chan_frame(0x1234, "BLK:GATE")).unwrap();
+        let cc = read_until_cmmd(&mut c, CA_PROTO_CREATE_CHAN);
+        let sid = u32::from_be_bytes([cc[12], cc[13], cc[14], cc[15]]);
+
+        let sub_id = 0xC1;
+        c.write_all(&event_add_double_frame(sid, sub_id)).unwrap();
+        let initial = read_until_cmmd(&mut c, CA_PROTO_EVENT_ADD);
+        assert_eq!(monitor_reply_value(&initial), 1.0);
+
+        // EVENTS_OFF, then a READ_NOTIFY barrier: reading its reply proves the
+        // dispatch thread applied flow-control-on before we post.
+        c.write_all(&events_off_frame()).unwrap();
+        c.write_all(&read_notify_frame(sid, 0x1, DBR_DOUBLE_MON))
+            .unwrap();
+        let _ = read_until_cmmd(&mut c, CA_PROTO_READ_NOTIFY);
+
+        // Post an update while flow control is on: it must be held, not sent.
+        let pv = simple_pv(&db, "BLK:GATE");
+        block_on_sync(pv.set(EpicsValue::Double(2.0))).expect("blockable");
+
+        // A second READ_NOTIFY barrier: the dispatch thread has now cycled past
+        // the post. Under EVENTS_OFF the ONLY frame that may follow is this
+        // barrier's READ_NOTIFY reply — never a monitor update.
+        c.write_all(&read_notify_frame(sid, 0x2, DBR_DOUBLE_MON))
+            .unwrap();
+        let barrier = read_one_frame(&mut c);
+        assert_eq!(
+            u16::from_be_bytes([barrier[0], barrier[1]]),
+            CA_PROTO_READ_NOTIFY,
+            "under EVENTS_OFF the next frame after a post is the READ barrier, not a monitor update"
+        );
+        // And nothing more is queued (the held update has not leaked).
+        c.set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        let mut probe = [0u8; 1];
+        let peeked = c.peek(&mut probe);
+        assert!(
+            peeked.as_ref().is_err_and(|e| is_read_timeout(e.kind())),
+            "no monitor update may arrive while EVENTS_OFF, got {peeked:?}"
+        );
+
+        // EVENTS_ON releases the held update with the latest value.
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        c.write_all(&events_on_frame()).unwrap();
+        let update = read_until_cmmd(&mut c, CA_PROTO_EVENT_ADD);
+        assert_eq!(
+            monitor_reply_value(&update),
+            2.0,
+            "held update delivered on EVENTS_ON"
+        );
+
+        server.shutdown();
+        accept.join().unwrap();
+    }
+
+    /// (S1c-a-iii) A client disconnect terminates its event thread cleanly: the
+    /// producer subscriber is torn down (no leak) and the server keeps serving
+    /// — a second subscriber still gets its own initial + update.
+    #[test]
+    fn client_disconnect_terminates_event_thread_cleanly() {
+        let db = seed_db(&[("BLK:LEAK", EpicsValue::Double(7.0))]);
+        let server =
+            Arc::new(BlockingCaServer::bind("127.0.0.1:0", db.clone(), new_acf()).unwrap());
+        let addr = server.local_addr().unwrap();
+        let srv = server.clone();
+        let accept = thread::spawn(move || srv.serve());
+
+        // Client 1 subscribes and observes an update (event thread is live).
+        {
+            let mut c = TcpStream::connect(addr).unwrap();
+            c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let _ = read_until_cmmd(&mut c, CA_PROTO_VERSION);
+            c.write_all(&version_frame()).unwrap();
+            c.write_all(&create_chan_frame(1, "BLK:LEAK")).unwrap();
+            let cc = read_until_cmmd(&mut c, CA_PROTO_CREATE_CHAN);
+            let sid = u32::from_be_bytes([cc[12], cc[13], cc[14], cc[15]]);
+            c.write_all(&event_add_double_frame(sid, 0x01)).unwrap();
+            let _ = read_until_cmmd(&mut c, CA_PROTO_EVENT_ADD); // initial
+            let pv = simple_pv(&db, "BLK:LEAK");
+            block_on_sync(pv.set(EpicsValue::Double(8.0))).expect("blockable");
+            let upd = read_until_cmmd(&mut c, CA_PROTO_EVENT_ADD);
+            assert_eq!(monitor_reply_value(&upd), 8.0);
+            // Drop `c`: the client thread's read loop exits; its teardown
+            // removes the subscriber and joins the event thread.
+        }
+
+        // Teardown must remove the producer: the PV's subscriber list returns
+        // to empty (proving the client thread ran cleanup, not leaked).
+        let pv = simple_pv(&db, "BLK:LEAK");
+        let mut cleared = false;
+        for _ in 0..200 {
+            if block_on_sync(pv.subscribers.lock())
+                .expect("blockable")
+                .is_empty()
+            {
+                cleared = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            cleared,
+            "disconnect must remove the subscriber (event-task producer torn down)"
+        );
+
+        // The machinery is healthy afterwards: a second client subscribes and
+        // gets its own initial + update (no leaked / wedged event thread).
+        let mut c2 = TcpStream::connect(addr).unwrap();
+        c2.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let _ = read_until_cmmd(&mut c2, CA_PROTO_VERSION);
+        c2.write_all(&version_frame()).unwrap();
+        c2.write_all(&create_chan_frame(2, "BLK:LEAK")).unwrap();
+        let cc2 = read_until_cmmd(&mut c2, CA_PROTO_CREATE_CHAN);
+        let sid2 = u32::from_be_bytes([cc2[12], cc2[13], cc2[14], cc2[15]]);
+        c2.write_all(&event_add_double_frame(sid2, 0x02)).unwrap();
+        let init2 = read_until_cmmd(&mut c2, CA_PROTO_EVENT_ADD);
+        assert_eq!(
+            monitor_reply_value(&init2),
+            8.0,
+            "second subscriber sees the current value"
+        );
+        let pv2 = simple_pv(&db, "BLK:LEAK");
+        block_on_sync(pv2.set(EpicsValue::Double(9.0))).expect("blockable");
+        let upd2 = read_until_cmmd(&mut c2, CA_PROTO_EVENT_ADD);
+        assert_eq!(monitor_reply_value(&upd2), 9.0);
+        drop(c2);
 
         server.shutdown();
         accept.join().unwrap();

@@ -101,7 +101,7 @@ pub(crate) fn spawn_monitor_sender(
     })
 }
 
-fn send_event(
+pub(crate) fn send_event(
     data_type: u16,
     data_count: u32,
     sub_id: u32,

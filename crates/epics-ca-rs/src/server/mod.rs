@@ -3,6 +3,7 @@
 pub mod access_token;
 pub mod addr_list;
 pub mod beacon;
+pub mod blocking;
 pub mod ca_server;
 pub mod introspection;
 pub mod ioc_app;

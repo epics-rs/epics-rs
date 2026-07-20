@@ -558,6 +558,25 @@ impl ProcessVariable {
         }
     }
 
+    /// Synchronous companion to [`Self::read_snapshot`] for the one-shot GET
+    /// path (`CA_PROTO_READ` / `CA_PROTO_READ_NOTIFY`).
+    ///
+    /// `Some(snapshot)` when NO read hook is installed — the sans-io GET that
+    /// every record-backed and cached PV takes: [`Self::snapshot`] of the
+    /// stored value, produced with no `.await` and no reactor dependency.
+    /// `None` when a gateway no-cache [`ReadHook`] IS installed, whose `hook()`
+    /// is a genuine upstream network GET; the caller must then take the async
+    /// [`Self::read_snapshot`] instead. This keeps the hook / no-hook decision
+    /// in one owner, in lockstep with `read_snapshot` — the only difference is
+    /// that the async fallible upstream fetch is surfaced to the caller as
+    /// `None` rather than performed here.
+    pub fn read_snapshot_local(&self) -> Option<Snapshot> {
+        match self.read_hook() {
+            Some(_) => None,
+            None => Some(self.snapshot()),
+        }
+    }
+
     /// Set a new value and notify all subscribers.
     pub async fn set(&self, new_value: EpicsValue) {
         {
@@ -1443,6 +1462,42 @@ mod read_hook_tests {
         pv.set_read_hook(Arc::new(|| Box::pin(async { Err(CaError::Disconnected) })));
         let err = pv.read_snapshot().await.expect_err("hook error propagates");
         assert!(matches!(err, CaError::Disconnected));
+    }
+
+    /// No hook (every record-backed and cached PV): the sync companion
+    /// `read_snapshot_local` yields `Some(snapshot)`, byte-for-byte the same
+    /// value as `snapshot` / the async `read_snapshot` — the fully sans-io
+    /// GET path.
+    #[test]
+    fn read_snapshot_local_without_hook_is_some_and_matches_snapshot() {
+        let pv = pv();
+        let local = pv
+            .read_snapshot_local()
+            .expect("no hook ⇒ sync snapshot is Some");
+        assert_eq!(local.value, pv.snapshot().value);
+        assert_eq!(local.value, EpicsValue::Double(1.0));
+    }
+
+    /// A read hook installed (gateway no-cache): the sync companion returns
+    /// `None`, the signal that the caller must take the async upstream-GET
+    /// path — `read_snapshot_local` never fires the hook itself.
+    #[test]
+    fn read_snapshot_local_with_hook_is_none() {
+        let pv = pv();
+        pv.set_read_hook(Arc::new(|| {
+            Box::pin(async {
+                Ok(Snapshot::new(
+                    EpicsValue::Double(42.0),
+                    0,
+                    0,
+                    std::time::UNIX_EPOCH,
+                ))
+            })
+        }));
+        assert!(
+            pv.read_snapshot_local().is_none(),
+            "a read hook ⇒ the sync path defers to the async upstream GET"
+        );
     }
 
     /// The read hook is GET-path only: `snapshot` (monitor fan-out, the

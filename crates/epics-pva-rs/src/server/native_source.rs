@@ -572,7 +572,7 @@ fn read_leaves(snap: &Snapshot, is_value_field: bool) -> Vec<String> {
 async fn snapshot_for(db: &PvDatabase, name: &str) -> Option<Snapshot> {
     let (_base, field) = parse_pv_name(name);
     match db.find_entry(name).await? {
-        PvEntry::Simple(pv) => Some(pv.snapshot().await),
+        PvEntry::Simple(pv) => Some(pv.snapshot()),
         PvEntry::Record(rec) => {
             let inst = rec.read().await;
             inst.snapshot_for_field(field)
@@ -729,7 +729,7 @@ impl ChannelSource for PvDatabaseSource {
             // processing, and the client cannot stamp them.
             match db.find_entry(&name).await {
                 Some(PvEntry::Simple(pv)) => {
-                    let prior = pv.snapshot().await;
+                    let prior = pv.snapshot();
                     let snap = pv_field_to_snapshot(&value, &prior).ok_or_else(|| {
                         OpError::failed("PUT value not representable as EpicsValue")
                     })?;
@@ -923,7 +923,7 @@ impl ChannelSource for PvDatabaseSource {
                     use epics_base_rs::server::pv::PvSubscription;
                     match PvSubscription::subscribe(pv.clone()).await {
                         Some(mut sub) => {
-                            let initial = snapshot_to_pv_field(&pv.snapshot().await);
+                            let initial = snapshot_to_pv_field(&pv.snapshot());
                             tokio::spawn(async move {
                                 if tx.send(initial).await.is_err() {
                                     return;
@@ -942,7 +942,7 @@ impl ChannelSource for PvDatabaseSource {
                             // Per-PV subscriber cap reached: still honour the
                             // connect-time read so the client at least sees
                             // the current value.
-                            let initial = snapshot_to_pv_field(&pv.snapshot().await);
+                            let initial = snapshot_to_pv_field(&pv.snapshot());
                             let _ = tx.send(initial).await;
                         }
                     }

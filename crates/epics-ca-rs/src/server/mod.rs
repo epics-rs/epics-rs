@@ -8,6 +8,7 @@ pub mod introspection;
 pub mod ioc_app;
 pub mod iocsh;
 pub mod monitor;
+pub mod outbox;
 pub mod rate_limit;
 #[cfg(feature = "cap-tokens")]
 pub mod signed_beacon;

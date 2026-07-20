@@ -1,4 +1,4 @@
-use epics_base_rs::runtime::sync::{Mutex, RwLock};
+use epics_base_rs::runtime::sync::RwLock;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -229,6 +229,7 @@ pub enum ServerConnectionEvent {
 use super::LongStringMode;
 use crate::protocol::*;
 use crate::server::monitor::spawn_monitor_sender;
+use crate::server::outbox::{Outbox, OutboxDrain};
 use epics_base_rs::error::CaResult;
 use epics_base_rs::server::access_security::{AccessLevel, AccessSecurityConfig};
 use epics_base_rs::server::database::{PvDatabase, PvEntry, parse_pv_name};
@@ -431,9 +432,9 @@ impl PutNotifySlot {
 /// race, reply ECA_PUTCBINPROG to the superseded request. C
 /// `write_notify_action` cancel branch (`camessage.c:1686-1704`). The
 /// new WRITE_NOTIFY then proceeds — it is never rejected.
-async fn supersede_put_notify<W: AsyncWrite + Unpin + Send + 'static>(
+async fn supersede_put_notify(
     prev: Option<InFlightPutNotify>,
-    writer: &Arc<Mutex<BufWriter<W>>>,
+    writer: &Outbox,
     client_minor: u16,
 ) -> CaResult<()> {
     if let Some(prev) = prev {
@@ -1602,6 +1603,28 @@ async fn accept_loop(
     }
 }
 
+/// Drain every frame currently queued in the connection outbox into the
+/// socket buffer (in arrival order) and flush once. This is the ONLY place
+/// server-produced bytes reach the socket — the single-owner drain that
+/// replaces every former out-of-band `writer.lock().await` write. Returns
+/// the number of wire bytes written, for `ServerStats::bytes_out`.
+///
+/// Batching is preserved: a whole dispatch burst (or a run of monitor
+/// frames) is written back-to-back before the single `flush`, so N framed
+/// replies still collapse to one TCP write.
+async fn drain_and_flush<W: AsyncWrite + Unpin>(
+    sock: &mut BufWriter<W>,
+    drain: &mut OutboxDrain,
+) -> std::io::Result<u64> {
+    let mut total = 0u64;
+    while let Some(frame) = drain.try_next() {
+        sock.write_all(&frame).await?;
+        total += frame.len() as u64;
+    }
+    sock.flush().await?;
+    Ok(total)
+}
+
 /// Handle one CA client over the supplied stream.
 ///
 /// `initial_hostname` is the verified peer identity from the TLS
@@ -1642,15 +1665,22 @@ async fn handle_client<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let (reader, writer) = tokio::io::split(stream);
-    // Bigger BufWriter so a 100-PV batched response burst (~3 KB) fits
-    // without auto-flushing mid-batch. The dispatch hot-path no longer
-    // calls `flush()` per message — `handle_client` flushes once per
-    // outer read iteration after the inner message-drain loop, which
-    // turns N small TCP writes into one. Default 8 KB was hit at ~330
-    // responses; 64 KB covers the common bulk_caget(100) case with
+    let (reader, write_half) = tokio::io::split(stream);
+    // The connection loop is the SOLE owner of the socket writer — no
+    // `Arc<Mutex<..>>`, so no other task can write the socket. Bigger
+    // BufWriter so a 100-PV batched response burst (~3 KB) fits without
+    // auto-flushing mid-batch. The dispatch hot-path no longer writes the
+    // socket at all: handlers push framed bytes into `outbox`, and this
+    // loop drains that outbox into `sock` and flushes once per outer read
+    // iteration — turning N small TCP writes into one. Default 8 KB was hit
+    // at ~330 responses; 64 KB covers the common bulk_caget(100) case with
     // headroom for follow-on monitor events queued in the same tick.
-    let writer = Arc::new(Mutex::new(BufWriter::with_capacity(64 * 1024, writer)));
+    let mut sock = BufWriter::with_capacity(64 * 1024, write_half);
+    // The single per-connection outbox. `outbox` is the cloneable producer
+    // handle every emit site holds (dispatch handlers in this task, plus
+    // the spawned monitor / put-notify tasks); `outbox_drain` is owned only
+    // here. See `super::outbox` for the invariant this establishes.
+    let (outbox, mut outbox_drain) = crate::server::outbox::channel();
     let mut state = ClientState::new(acf, tcp_port, db.clone());
     state.stats = stats.clone();
     #[cfg(feature = "cap-tokens")]
@@ -1701,11 +1731,12 @@ where
     // restores wire-trace parity with rsrv (the first byte from the
     // server matches).
     {
+        // Pre-loop, single-task: the owner writes the unsolicited VERSION
+        // greeting directly to its own socket buffer.
         let mut hdr = CaHeader::new(CA_PROTO_VERSION);
         hdr.count = CA_MINOR_VERSION;
-        let mut w = writer.lock().await;
-        w.write_all(&hdr.to_bytes()).await?;
-        w.flush().await?;
+        sock.write_all(&hdr.to_bytes()).await?;
+        sock.flush().await?;
     }
 
     let mut reader = reader;
@@ -1747,8 +1778,15 @@ where
                             // Lagged is fine — even one missed notification still
                             // means "rules changed", so we always recompute. A
                             // re-push failure must still pass through teardown.
-                            if let Err(e) = reeval_access_rights(&mut state, &writer).await {
+                            if let Err(e) = reeval_access_rights(&mut state, &outbox).await {
                                 break 'client_loop Err(e);
+                            }
+                            // reeval pushed the ACCESS_RIGHTS / denial frames into
+                            // the outbox; drain them to the socket now so the
+                            // re-evaluation reaches the client promptly (RSRV
+                            // flushes these immediately).
+                            if let Err(e) = drain_and_flush(&mut sock, &mut outbox_drain).await {
+                                break 'client_loop Err(e.into());
                             }
                             continue;
                         }
@@ -1774,6 +1812,36 @@ where
                             );
                             break 'client_loop Ok(());
                         }
+                    }
+                }
+                // Out-of-band frame produced by a spawned monitor / put-notify
+                // task while this loop was idle on the socket read. This arm is
+                // last (biased) so socket reads keep priority; under a steady
+                // read stream these frames still flush via the per-burst drain
+                // at the bottom of the loop, so they are never starved.
+                frame = outbox_drain.recv() => {
+                    match frame {
+                        Some(frame) => {
+                            let first = frame.len() as u64;
+                            if let Err(e) = sock.write_all(&frame).await {
+                                break 'client_loop Err(e.into());
+                            }
+                            match drain_and_flush(&mut sock, &mut outbox_drain).await {
+                                Ok(rest) => {
+                                    if let Some(ref s) = stats {
+                                        s.bytes_out.fetch_add(
+                                            first + rest,
+                                            std::sync::atomic::Ordering::Relaxed,
+                                        );
+                                    }
+                                }
+                                Err(e) => break 'client_loop Err(e.into()),
+                            }
+                            continue;
+                        }
+                        // Unreachable while this loop still holds `outbox`; a
+                        // `None` would mean every producer handle was dropped.
+                        None => break 'client_loop Ok(()),
                     }
                 }
             };
@@ -1865,7 +1933,7 @@ where
                         let mut probe_hdr = CaHeader::new(u16::from_be_bytes([buf[0], buf[1]]));
                         probe_hdr.data_type = u16::from_be_bytes([buf[4], buf[5]]);
                         let _ = send_ca_error(
-                            &writer,
+                            &outbox,
                             &probe_hdr,
                             ECA_TOLARGE,
                             0xFFFF_FFFF,
@@ -1878,7 +1946,7 @@ where
                             state.client_minor_version,
                         )
                         .await;
-                        let _ = writer.lock().await.flush().await;
+                        let _ = drain_and_flush(&mut sock, &mut outbox_drain).await;
                         tracing::warn!(
                             peer = %state.peer,
                             ext_post,
@@ -1934,7 +2002,7 @@ where
                     && state.client_minor_version < CA_MINIMUM_SUPPORTED_VERSION
                 {
                     let _ = send_ca_error(
-                        &writer,
+                        &outbox,
                         &hdr,
                         ECA_DEFUNCT,
                         0xFFFF_FFFF,
@@ -1942,7 +2010,7 @@ where
                         state.client_minor_version,
                     )
                     .await;
-                    let _ = writer.lock().await.flush().await;
+                    let _ = drain_and_flush(&mut sock, &mut outbox_drain).await;
                     // Same refuse-but-keep-serving shape as ECA_TOLARGE
                     // above, through the same owner.
                     let msg_len = hdr_size + actual_post;
@@ -1973,7 +2041,7 @@ where
                         "CAS: Missaligned protocol rejected"
                     );
                     let _ = send_ca_error(
-                        &writer,
+                        &outbox,
                         &hdr,
                         ECA_INTERNAL,
                         0xFFFF_FFFF,
@@ -1981,7 +2049,7 @@ where
                         state.client_minor_version,
                     )
                     .await;
-                    let _ = writer.lock().await.flush().await;
+                    let _ = drain_and_flush(&mut sock, &mut outbox_drain).await;
                     break 'client_loop Err(epics_base_rs::error::CaError::Protocol(
                         "misaligned CA payload".into(),
                     ));
@@ -2034,7 +2102,7 @@ where
                         &payload,
                         &mut state,
                         &db,
-                        &writer,
+                        &outbox,
                         peer,
                         conn_events.as_ref(),
                     ),
@@ -2055,7 +2123,7 @@ where
                         // the client sees them; ignore errors here
                         // because the underlying TCP is most likely
                         // already broken (which is why dispatch failed).
-                        let _ = writer.lock().await.flush().await;
+                        let _ = drain_and_flush(&mut sock, &mut outbox_drain).await;
                         break 'client_loop Err(e);
                     }
                     Err(_) => {
@@ -2082,32 +2150,36 @@ where
 
             if offset > 0 {
                 accumulated.drain(..offset);
-                // Batched flush: dispatch_message buffered all responses for
-                // this read iteration into BufWriter without flushing. Flush
-                // once now so the kernel sees a single TCP write per inbound
-                // burst. Cuts e2e_bulk_get_many(100) from ~225µs → batched
-                // single write (server-side throughput floor was ~2.2µs/PV
-                // due to per-message flush; this collapses it to one syscall).
+                // Batched flush: dispatch_message pushed all responses for
+                // this read iteration into the outbox without touching the
+                // socket. Drain them into the BufWriter and flush once now so
+                // the kernel sees a single TCP write per inbound burst. Cuts
+                // e2e_bulk_get_many(100) from ~225µs → batched single write
+                // (server-side throughput floor was ~2.2µs/PV due to
+                // per-message flush; this collapses it to one syscall).
+                //
+                // The drain also picks up any monitor / put-notify frames
+                // pushed by spawned tasks during this dispatch burst, so those
+                // ride out on the same syscall.
                 //
                 // Errors here mean the TCP write stalled / peer closed —
                 // surface as the read loop's normal disconnect path.
-                let mut w = writer.lock().await;
+                //
                 // PR #592 dbServerStats: bytes_out mirrors RSRV's
-                // `caServerBytes_out`. Capture the buffered size *before*
-                // flush so we know exactly how many wire bytes leave on
-                // this syscall. CA-over-TLS counts post-decrypt plaintext
-                // since the rustls layer wraps the BufWriter externally —
-                // matches what the comment on ServerStats::bytes_out
-                // already documents.
-                let pending_out = w.buffer().len() as u64;
-                if let Err(e) = w.flush().await {
-                    break 'client_loop Err(e.into());
+                // `caServerBytes_out`. `drain_and_flush` returns the exact
+                // wire-byte count that left on this syscall. CA-over-TLS counts
+                // post-decrypt plaintext since the rustls layer wraps the
+                // BufWriter externally — matches what the comment on
+                // ServerStats::bytes_out already documents.
+                match drain_and_flush(&mut sock, &mut outbox_drain).await {
+                    Ok(pending_out) => {
+                        if let Some(ref s) = stats {
+                            s.bytes_out
+                                .fetch_add(pending_out, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                    Err(e) => break 'client_loop Err(e.into()),
                 }
-                if let Some(ref s) = stats {
-                    s.bytes_out
-                        .fetch_add(pending_out, std::sync::atomic::Ordering::Relaxed);
-                }
-                drop(w);
             }
         }
     };
@@ -2146,7 +2218,7 @@ where
 
     // Abort any in-flight WRITE_NOTIFY completion tasks. A
     // stuck async record (motor hung, asyn device unresponsive) would
-    // otherwise hold the spawned task and its captured writer Arc
+    // otherwise hold the spawned task and its captured `Outbox` handle
     // forever after the client disconnects.
     for (_sid, handle) in state.write_notify_tasks.drain(..) {
         handle.abort();
@@ -2181,12 +2253,12 @@ where
     loop_result
 }
 
-async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
+async fn dispatch_message(
     hdr: &CaHeader,
     payload: &[u8],
     state: &mut ClientState,
     db: &Arc<PvDatabase>,
-    writer: &Arc<Mutex<BufWriter<W>>>,
+    writer: &Outbox,
     peer: SocketAddr,
     conn_events: Option<&broadcast::Sender<ServerConnectionEvent>>,
 ) -> CaResult<()> {
@@ -2251,9 +2323,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             // practice, but a strict peer or wire trace would diverge.
             let mut resp = CaHeader::new(CA_PROTO_VERSION);
             resp.count = CA_MINOR_VERSION;
-            let mut w = writer.lock().await;
-            w.write_all(&resp.to_bytes()).await?;
-            // flush deferred to handle_client outer loop (batched)
+            writer.push(resp.to_bytes().to_vec());
         }
 
         CA_PROTO_HOST_NAME => {
@@ -2614,8 +2684,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         if long_string && !matches!(value, EpicsValue::String(_)) {
                             let mut fail = CaHeader::new(CA_PROTO_CREATE_CH_FAIL);
                             fail.cid = client_cid;
-                            let mut w = writer.lock().await;
-                            w.write_all(&fail.to_bytes()).await?;
+                            writer.push(fail.to_bytes().to_vec());
                             return Ok(());
                         }
                         let (dbr_type_val, element_count, mode) = if long_string {
@@ -2651,8 +2720,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                 if long_string && !matches!(v, EpicsValue::String(_)) {
                                     let mut fail = CaHeader::new(CA_PROTO_CREATE_CH_FAIL);
                                     fail.cid = client_cid;
-                                    let mut w = writer.lock().await;
-                                    w.write_all(&fail.to_bytes()).await?;
+                                    writer.push(fail.to_bytes().to_vec());
                                     return Ok(());
                                 }
                                 // override type and count for `$` channels.
@@ -2705,9 +2773,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                 // Field not found — send CREATE_CH_FAIL
                                 let mut fail = CaHeader::new(CA_PROTO_CREATE_CH_FAIL);
                                 fail.cid = client_cid;
-                                let mut w = writer.lock().await;
-                                w.write_all(&fail.to_bytes()).await?;
-                                // flush deferred to handle_client outer loop (batched)
+                                writer.push(fail.to_bytes().to_vec());
                                 return Ok(());
                             }
                         }
@@ -2749,10 +2815,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                 );
                                 let mut fail = CaHeader::new(CA_PROTO_CREATE_CH_FAIL);
                                 fail.cid = client_cid;
-                                let mut w = writer.lock().await;
-                                w.write_all(&fail.to_bytes()).await?;
-                                // flush deferred to handle_client outer loop (batched)
-                                drop(w);
+                                writer.push(fail.to_bytes().to_vec());
                                 state
                                     .audit("create_chan", &pv_name, "", "filter_parse_fail")
                                     .await;
@@ -2813,11 +2876,11 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 resp.set_payload_size(0, nelem, state.client_minor_version)
                     .expect("nelem is capped at 0xfffe for pre-V49 clients above");
 
-                let mut w = writer.lock().await;
-                w.write_all(&ar.to_bytes()).await?;
-                w.write_all(&resp.to_bytes_extended()).await?;
-                // flush deferred to handle_client outer loop (batched)
-                drop(w);
+                // Two independent, complete frames (ACCESS_RIGHTS then
+                // CREATE_CHAN); push in order. FIFO drain preserves the
+                // access-rights-before-create ordering C emits.
+                writer.push(ar.to_bytes().to_vec());
+                writer.push(resp.to_bytes_extended());
 
                 let result = match access_level {
                     AccessLevel::NoAccess => "denied",
@@ -2841,10 +2904,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 // PV not found — send CREATE_CH_FAIL
                 let mut fail = CaHeader::new(CA_PROTO_CREATE_CH_FAIL);
                 fail.cid = client_cid;
-                let mut w = writer.lock().await;
-                w.write_all(&fail.to_bytes()).await?;
-                // flush deferred to handle_client outer loop (batched)
-                drop(w);
+                writer.push(fail.to_bytes().to_vec());
 
                 state.audit("create_chan", &pv_name, "", "not_found").await;
             }
@@ -3361,20 +3421,18 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             resp.data_type = requested_type;
             resp.available = ioid;
 
-            // Abort-safety: a `send_timeout` cancel landing between a
-            // separate header and payload `write_all` would leave an
-            // orphan header in the shared BufWriter and mis-frame every
-            // following message. Build the whole READ/READ_NOTIFY frame
-            // as ONE contiguous buffer and issue a single `write_all`,
-            // so a cancel can only land at a frame boundary. Same fix
-            // already applied to the monitor path (`monitor.rs`).
+            // Abort-safety: build the whole READ/READ_NOTIFY frame as ONE
+            // contiguous buffer and hand it to the outbox in a single
+            // `push`. A `send_timeout` cancel can only land at a frame
+            // boundary — a partial frame can never be enqueued, so it can
+            // never reach the connection loop's socket writer and mis-frame
+            // the following messages. Same shape as the monitor path
+            // (`monitor.rs`).
             let hdr_bytes = resp.to_bytes_extended();
             let mut frame = Vec::with_capacity(hdr_bytes.len() + padded.len());
             frame.extend_from_slice(&hdr_bytes);
             frame.extend_from_slice(&padded);
-            let mut w = writer.lock().await;
-            w.write_all(&frame).await?;
-            // flush deferred to handle_client outer loop (batched)
+            writer.push(frame);
         }
 
         CA_PROTO_WRITE | CA_PROTO_WRITE_NOTIFY => {
@@ -3980,7 +4038,11 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     // it (C `dbNotifyCancel` + ECA_PUTCBINPROG).
                     let responded = Arc::new(AtomicBool::new(false));
                     let responded_task = responded.clone();
-                    let writer_c = writer.clone();
+                    // Clone the outbox handle for the completion task: it
+                    // pushes the deferred WRITE_NOTIFY reply into the same
+                    // per-connection outbox the loop drains — it never
+                    // touches the socket writer directly.
+                    let outbox_c = writer.clone();
                     // Hand the guard to the completion task so its
                     // AfterWrite fires at *real* device-side completion
                     // via `complete` (C `write_notify_reply:1400`: the
@@ -4041,7 +4103,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         }
 
                         let _ = send_put_notify_response(
-                            &writer_c,
+                            &outbox_c,
                             write_type as u16,
                             write_count,
                             final_status,
@@ -4052,9 +4114,6 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                             },
                         )
                         .await;
-                        let mut w = writer_c.lock().await;
-                        let _ = w.flush().await;
-                        drop(w);
                     });
                     // Publish as the channel's in-flight put-callback so a
                     // later WRITE_NOTIFY on this channel supersedes it (C
@@ -4072,7 +4131,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     });
                     // Track for connection-scoped cleanup: a stuck
                     // async record would otherwise pin this task and the
-                    // captured writer Arc forever after the client drops.
+                    // captured `Outbox` handle forever after the client drops.
                     // Reap finished handles opportunistically so the Vec
                     // doesn't grow unbounded over a long-lived connection
                     // that issues many WRITE_NOTIFYs. The `sid` tag
@@ -4681,7 +4740,10 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                             }
                         }
 
-                        let writer_clone = writer.clone();
+                        // Clone the outbox handle for the RecordField monitor
+                        // task: it pushes framed EVENT_ADD deliveries into the
+                        // per-connection outbox, never touching the socket.
+                        let outbox_clone = writer.clone();
                         let record_for_task = record.clone();
                         let denied = Arc::new(AtomicBool::new(access_denied));
                         let denied_for_task = denied.clone();
@@ -4797,7 +4859,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                     .is_err()
                                 {
                                     let _ = send_16k_array_client_err(
-                                        &writer_clone,
+                                        &outbox_clone,
                                         &req_hdr,
                                         req_hdr.cid,
                                         client_minor,
@@ -4809,28 +4871,21 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                 ev.cid = 1; // ECA_NORMAL
                                 ev.available = sub_id;
 
-                                // Abort-safety: this monitor task can
-                                // be `task.abort()`ed mid-flight by
-                                // EVENT_CANCEL / CLEAR_CHANNEL /
-                                // disconnect cleanup. Build the whole
-                                // EVENT_ADD frame (header + padded
-                                // payload) as ONE contiguous buffer and
-                                // issue a single `write_all`, so an
-                                // abort can only land at a frame
-                                // boundary, never between header and
-                                // payload — a split there would leave
-                                // an orphan header in the shared
-                                // BufWriter and mis-frame the stream.
+                                // Abort-safety: this monitor task can be
+                                // `task.abort()`ed mid-flight by EVENT_CANCEL /
+                                // CLEAR_CHANNEL / disconnect cleanup. Build the
+                                // whole EVENT_ADD frame (header + padded
+                                // payload) as ONE contiguous buffer and hand it
+                                // to the outbox with a single synchronous
+                                // `push`, so an abort can only land at a frame
+                                // boundary — the connection loop never observes
+                                // a partial frame.
                                 let hdr_bytes = ev.to_bytes_extended();
                                 let mut frame = Vec::with_capacity(hdr_bytes.len() + padded.len());
                                 frame.extend_from_slice(&hdr_bytes);
                                 frame.extend_from_slice(&padded);
-                                let mut w = writer_clone.lock().await;
-                                if w.write_all(&frame).await.is_err() {
-                                    break;
-                                }
-                                let _ = w.flush().await;
-                                // Frame written to the client — PCAS
+                                outbox_clone.push(frame);
+                                // Frame handed to the outbox — PCAS
                                 // `subscriptionEventsProcessed` parity
                                 // (gateway `serverEventRate`).
                                 if let Some(ref s) = stats_for_task {
@@ -4990,9 +5045,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     .expect("the client framed this very EVENT_ADD count");
                 resp.cid = sub.channel_sid;
                 resp.available = sub_id;
-                let mut w = writer.lock().await;
-                w.write_all(&resp.to_bytes_extended()).await?;
-                // flush deferred to handle_client outer loop (batched)
+                writer.push(resp.to_bytes_extended());
             } else {
                 // C `event_cancel_reply` (`camessage.c:1998-2021`):
                 // when the sub-id (m_available of the request) does
@@ -5077,9 +5130,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             resp.count = hdr.count;
             resp.cid = hdr.cid;
             resp.available = hdr.available;
-            let mut w = writer.lock().await;
-            w.write_all(&resp.to_bytes()).await?;
-            // flush deferred to handle_client outer loop (batched)
+            writer.push(resp.to_bytes().to_vec());
         }
 
         CA_PROTO_ECHO => {
@@ -5109,9 +5160,9 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             resp.cid = hdr.cid;
             resp.available = hdr.available;
             // Abort-safety: build header + echoed payload as ONE
-            // contiguous frame and issue a single `write_all`, so a
-            // `send_timeout` cancel cannot leave an orphan header
-            // mid-frame in the shared BufWriter.
+            // contiguous frame and hand it to the outbox in a single
+            // `push`, so a `send_timeout` cancel can never enqueue an
+            // orphan header for the connection loop to write.
             let mut frame = Vec::new();
             if resp.is_extended() {
                 frame.extend_from_slice(&resp.to_bytes_extended());
@@ -5122,9 +5173,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             // postsize advertised by the request — `payload` here is
             // already that slice).
             frame.extend_from_slice(payload);
-            let mut w = writer.lock().await;
-            w.write_all(&frame).await?;
-            // flush deferred to handle_client outer loop (batched)
+            writer.push(frame);
         }
 
         CA_PROTO_SEARCH => {
@@ -5199,9 +5248,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 resp.cid = u32::MAX; // ~0U — "use TCP peer addr"
                 resp.available = hdr.available;
 
-                let mut w = writer.lock().await;
-                w.write_all(&resp.to_bytes()).await?;
-                // flush deferred to handle_client outer loop (batched)
+                writer.push(resp.to_bytes().to_vec());
             } else if hdr.data_type == CA_DO_REPLY {
                 // Explicit negative reply requested — send NOT_FOUND so
                 // the client doesn't have to wait for a search timeout.
@@ -5220,9 +5267,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 nf.count = hdr.count;
                 nf.cid = hdr.cid;
                 nf.available = hdr.available;
-                let mut w = writer.lock().await;
-                w.write_all(&nf.to_bytes()).await?;
-                // flush deferred to handle_client outer loop (batched)
+                writer.push(nf.to_bytes().to_vec());
             }
             // Otherwise silent — clients without CA_DO_REPLY treat absence
             // as "this server doesn't have it" and move on.
@@ -5313,9 +5358,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 resp.count = hdr.count;
                 resp.cid = sid;
                 resp.available = cid;
-                let mut w = writer.lock().await;
-                w.write_all(&resp.to_bytes()).await?;
-                // flush deferred to handle_client outer loop (batched)
+                writer.push(resp.to_bytes().to_vec());
             }
         }
 
@@ -5404,8 +5447,8 @@ async fn get_read_snapshot(
 ///
 /// `requested_count == 0` is autosize: the frame keeps the live
 /// element count.
-async fn send_monitor_snapshot<W: AsyncWrite + Unpin + Send + 'static>(
-    writer: &Arc<Mutex<BufWriter<W>>>,
+async fn send_monitor_snapshot(
+    writer: &Outbox,
     sub_id: u32,
     data_type: u16,
     requested_count: u32,
@@ -5445,15 +5488,14 @@ async fn send_monitor_snapshot<W: AsyncWrite + Unpin + Send + 'static>(
     resp.available = sub_id;
 
     // Abort-safety: build header + payload as ONE contiguous frame and
-    // issue a single `write_all` so a cancel (send_timeout / task abort)
-    // cannot leave an orphan header mid-frame in the shared BufWriter.
+    // hand it to the outbox with a single `push`, so a cancel (send_timeout
+    // / task abort) can only land at a frame boundary — the connection loop
+    // never observes a partial frame.
     let hdr_bytes = resp.to_bytes_extended();
     let mut frame = Vec::with_capacity(hdr_bytes.len() + padded.len());
     frame.extend_from_slice(&hdr_bytes);
     frame.extend_from_slice(&padded);
-    let mut w = writer.lock().await;
-    w.write_all(&frame).await?;
-    w.flush().await?;
+    writer.push(frame);
     Ok(())
 }
 
@@ -5474,10 +5516,7 @@ async fn send_monitor_snapshot<W: AsyncWrite + Unpin + Send + 'static>(
 /// left an orphaned camonitor: the C-equivalent re-arm never
 /// happened, and the subscriber's callback receiver went silent
 /// until the client noticed and re-subscribed manually.
-async fn reeval_access_rights<W: AsyncWrite + Unpin + Send + 'static>(
-    state: &mut ClientState,
-    writer: &Arc<Mutex<BufWriter<W>>>,
-) -> CaResult<()> {
+async fn reeval_access_rights(state: &mut ClientState, writer: &Outbox) -> CaResult<()> {
     if state.channels.is_empty() {
         return Ok(());
     }
@@ -5502,37 +5541,31 @@ async fn reeval_access_rights<W: AsyncWrite + Unpin + Send + 'static>(
     // reloads (typo fix, new UAG that doesn't intersect, etc.).
     // Mirror C: only emit on actual transition.
     let mut transitions: Vec<(u32, AccessLevel, AccessLevel)> = Vec::new();
-    {
-        let mut w = writer.lock().await;
-        let mut any_frame_written = false;
-        for (sid, cid, target) in chan_info {
-            let (new_access, new_rule_was_trap) = state.compute_access(&target).await;
-            let new_level = match new_access {
-                3 => AccessLevel::ReadWrite,
-                1 => AccessLevel::Read,
-                _ => AccessLevel::NoAccess,
-            };
-            let old_level = state
-                .channel_access
-                .insert(sid, new_level)
-                .unwrap_or(AccessLevel::NoAccess);
-            // an ACF reload can change which rule grants
-            // access (e.g. a new TRAPWRITE rule), so the trap mask
-            // must be refreshed alongside the level.
-            state.channel_trap.insert(sid, new_rule_was_trap);
-            if old_level == new_level {
-                continue;
-            }
-            transitions.push((sid, old_level, new_level));
-            let mut ar = CaHeader::new(CA_PROTO_ACCESS_RIGHTS);
-            ar.cid = cid;
-            ar.available = new_access;
-            w.write_all(&ar.to_bytes()).await?;
-            any_frame_written = true;
+    for (sid, cid, target) in chan_info {
+        let (new_access, new_rule_was_trap) = state.compute_access(&target).await;
+        let new_level = match new_access {
+            3 => AccessLevel::ReadWrite,
+            1 => AccessLevel::Read,
+            _ => AccessLevel::NoAccess,
+        };
+        let old_level = state
+            .channel_access
+            .insert(sid, new_level)
+            .unwrap_or(AccessLevel::NoAccess);
+        // an ACF reload can change which rule grants
+        // access (e.g. a new TRAPWRITE rule), so the trap mask
+        // must be refreshed alongside the level.
+        state.channel_trap.insert(sid, new_rule_was_trap);
+        if old_level == new_level {
+            continue;
         }
-        if any_frame_written {
-            w.flush().await?;
-        }
+        transitions.push((sid, old_level, new_level));
+        // Each CA_PROTO_ACCESS_RIGHTS frame is a complete header; push it
+        // into the outbox for the connection loop to drain and flush.
+        let mut ar = CaHeader::new(CA_PROTO_ACCESS_RIGHTS);
+        ar.cid = cid;
+        ar.available = new_access;
+        writer.push(ar.to_bytes().to_vec());
     }
 
     fn has_read(level: AccessLevel) -> bool {
@@ -5627,8 +5660,8 @@ async fn reeval_access_rights<W: AsyncWrite + Unpin + Send + 'static>(
                 )
                 .await?;
             }
-            let mut w = writer.lock().await;
-            w.flush().await?;
+            // Denial frames pushed to the outbox; the connection loop drains
+            // and flushes them (no writer to flush here).
         } else {
             // Read access RESTORED. C path: db_event_enable then
             // db_post_single_event. Clear the gate so the producer
@@ -5726,8 +5759,8 @@ async fn reeval_access_rights<W: AsyncWrite + Unpin + Send + 'static>(
 /// `>= 0xFFFF`-element array received a normal-form Rust reply
 /// with `count = 0` (the extended marker) where rsrv preserves
 /// the count with an extended header.
-async fn send_put_notify_response<W: AsyncWrite + Unpin + Send + 'static>(
-    writer: &Arc<Mutex<BufWriter<W>>>,
+async fn send_put_notify_response(
+    writer: &Outbox,
     data_type: u16,
     count: u32,
     eca_status: u32,
@@ -5744,9 +5777,7 @@ async fn send_put_notify_response<W: AsyncWrite + Unpin + Send + 'static>(
     }
     resp.cid = eca_status;
     resp.available = ioid;
-    let mut w = writer.lock().await;
-    w.write_all(&resp.to_bytes_extended()).await?;
-    // flush deferred to handle_client outer loop (batched)
+    writer.push(resp.to_bytes_extended());
     Ok(())
 }
 
@@ -5789,8 +5820,8 @@ fn no_read_access_count(requested_count: u32, actual_count: u32) -> u32 {
 /// callers on the EVENT_ADD denial path must pass a `count`
 /// already normalised through [`no_read_access_count`] so an autosize
 /// (`count == 0`) request does not produce a zero-payload frame.
-async fn send_no_read_access_event<W: AsyncWrite + Unpin + Send + 'static>(
-    writer: &Arc<Mutex<BufWriter<W>>>,
+async fn send_no_read_access_event(
+    writer: &Outbox,
     cmd: u16,
     data_type: u16,
     count: u32,
@@ -5820,8 +5851,7 @@ async fn send_no_read_access_event<W: AsyncWrite + Unpin + Send + 'static>(
     let mut frame = Vec::with_capacity(hdr_bytes.len() + padded_size);
     frame.extend_from_slice(&hdr_bytes);
     frame.resize(frame.len() + padded_size, 0);
-    let mut w = writer.lock().await;
-    w.write_all(&frame).await?;
+    writer.push(frame);
     Ok(())
 }
 
@@ -5955,8 +5985,8 @@ fn truncate_diag(message: &str) -> &str {
 /// extended header (`caserverio.c:266-270` returns `ECA_16KARRAYCLIENT`), the
 /// server does NOT put the frame on the wire. It answers CA_PROTO_ERROR with
 /// that status, echoing the request header, and keeps the circuit.
-pub(crate) async fn send_16k_array_client_err<W: AsyncWrite + Unpin + Send + 'static>(
-    writer: &Arc<Mutex<BufWriter<W>>>,
+pub(crate) async fn send_16k_array_client_err(
+    writer: &Outbox,
     request_hdr: &CaHeader,
     chan_cid: u32,
     client_minor: u16,
@@ -5974,14 +6004,39 @@ pub(crate) async fn send_16k_array_client_err<W: AsyncWrite + Unpin + Send + 'st
     .await
 }
 
-pub(crate) async fn send_ca_error<W: AsyncWrite + Unpin + Send + 'static>(
-    writer: &Arc<Mutex<BufWriter<W>>>,
+/// Push a `CA_PROTO_ERROR` reply into the connection outbox. The connection
+/// loop is the sole owner that drains the outbox to the socket, so this
+/// only builds one framed message and enqueues it — see
+/// [`build_ca_error_frame`]. Stays `async` purely to keep its ~40 call
+/// sites (which all `.await`) untouched by the outbox migration.
+pub(crate) async fn send_ca_error(
+    writer: &Outbox,
     original_hdr: &CaHeader,
     eca_status: u32,
     chan_cid: u32,
     message: &str,
     client_minor: u16,
 ) -> CaResult<()> {
+    writer.push(build_ca_error_frame(
+        original_hdr,
+        eca_status,
+        chan_cid,
+        message,
+        client_minor,
+    ));
+    Ok(())
+}
+
+/// Build the contiguous wire bytes of a `CA_PROTO_ERROR` reply
+/// (response header + echoed request header + diagnostic string). Pure and
+/// socket-free — the connection loop writes the returned frame.
+fn build_ca_error_frame(
+    original_hdr: &CaHeader,
+    eca_status: u32,
+    chan_cid: u32,
+    message: &str,
+    client_minor: u16,
+) -> Vec<u8> {
     let error_msg_bytes = pad_string(truncate_diag(message));
     // C `vsend_err` (`rsrv/camessage.c:201-214`) gates the extended echo on
     // `(m_postsize >= 0xffff || m_count >= 0xffff) && CA_V49(minor)`. A
@@ -6035,10 +6090,7 @@ pub(crate) async fn send_ca_error<W: AsyncWrite + Unpin + Send + 'static>(
     frame.extend_from_slice(&resp_bytes);
     frame.extend_from_slice(&orig_bytes);
     frame.extend_from_slice(&error_msg_bytes);
-    let mut w = writer.lock().await;
-    w.write_all(&frame).await?;
-    // flush deferred to handle_client outer loop (batched)
-    Ok(())
+    frame
 }
 
 #[cfg(test)]
@@ -6130,41 +6182,24 @@ mod put_notify_supersede_tests {
     //! in-flight put-callback is [`PutNotifySlot`]; the single owner of
     //! each put-callback's reply is its `responded` token.
     use super::{ECA_PUTCBINPROG, InFlightPutNotify, PutNotifySlot, supersede_put_notify};
-    use epics_base_rs::runtime::sync::Mutex;
-    use std::pin::Pin;
+    use crate::server::outbox::{Outbox, OutboxDrain};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::task::{Context, Poll};
-    use tokio::io::{AsyncWrite, BufWriter};
 
-    /// Mock writer recording every byte batch (mirrors monitor.rs).
-    #[derive(Default)]
-    struct RecordingWriter {
-        batches: Vec<Vec<u8>>,
+    /// Build a live outbox + its drain for a test emit site.
+    fn live_outbox() -> (Outbox, OutboxDrain) {
+        crate::server::outbox::channel()
     }
 
-    impl AsyncWrite for RecordingWriter {
-        fn poll_write(
-            mut self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            buf: &[u8],
-        ) -> Poll<std::io::Result<usize>> {
-            self.batches.push(buf.to_vec());
-            Poll::Ready(Ok(buf.len()))
+    /// Drain every frame pushed to the outbox, in push order. Each push is
+    /// one complete contiguous frame, so this is exactly the per-frame view
+    /// the old `RecordingWriter::batches` gave (one `write_all` == one frame).
+    fn drain_frames(drain: &mut OutboxDrain) -> Vec<Vec<u8>> {
+        let mut frames = Vec::new();
+        while let Some(f) = drain.try_next() {
+            frames.push(f);
         }
-        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-            Poll::Ready(Ok(()))
-        }
-        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-            Poll::Ready(Ok(()))
-        }
-    }
-
-    fn recording_writer() -> Arc<Mutex<BufWriter<RecordingWriter>>> {
-        Arc::new(Mutex::new(BufWriter::with_capacity(
-            0,
-            RecordingWriter::default(),
-        )))
+        frames
     }
 
     /// A never-completing task so the in-flight put-callback has a real
@@ -6208,11 +6243,11 @@ mod put_notify_supersede_tests {
     /// `putNotifyErrorReply(client, &pPutNotify->msg, ECA_PUTCBINPROG)`.
     #[tokio::test]
     async fn supersede_replies_putcbinprog_to_the_superseded_request() {
-        let writer = recording_writer();
+        let (outbox, mut drain) = live_outbox();
         let responded = Arc::new(AtomicBool::new(false));
         let prev = Some(inflight(0x1234, responded.clone()));
 
-        supersede_put_notify(prev, &writer, crate::protocol::CA_MINOR_VERSION)
+        supersede_put_notify(prev, &outbox, crate::protocol::CA_MINOR_VERSION)
             .await
             .expect("supersede sends the superseded request its reply");
 
@@ -6220,8 +6255,7 @@ mod put_notify_supersede_tests {
             responded.load(Ordering::Acquire),
             "supersede claims the superseded put-callback's reply"
         );
-        let guard = writer.lock().await;
-        let batches = &guard.get_ref().batches;
+        let batches = drain_frames(&mut drain);
         assert_eq!(batches.len(), 1, "exactly one ECA_PUTCBINPROG reply");
         let frame = &batches[0];
         // CA header: param1 (ECA status) at [8..12], param2 (ioid) at [12..16].
@@ -6240,17 +6274,16 @@ mod put_notify_supersede_tests {
     /// entry — one ioid, one reply.
     #[tokio::test]
     async fn supersede_after_completion_sends_no_second_reply() {
-        let writer = recording_writer();
+        let (outbox, mut drain) = live_outbox();
         let responded = Arc::new(AtomicBool::new(true)); // completion already replied
         let prev = Some(inflight(0x55, responded.clone()));
 
-        supersede_put_notify(prev, &writer, crate::protocol::CA_MINOR_VERSION)
+        supersede_put_notify(prev, &outbox, crate::protocol::CA_MINOR_VERSION)
             .await
             .expect("supersede of a completed put-callback is a no-op reply");
 
-        let guard = writer.lock().await;
         assert!(
-            guard.get_ref().batches.is_empty(),
+            drain_frames(&mut drain).is_empty(),
             "no second reply for an already-answered ioid"
         );
     }
@@ -6262,7 +6295,7 @@ mod put_notify_supersede_tests {
     /// superseded.
     #[tokio::test]
     async fn responded_token_grants_a_single_reply_owner() {
-        let writer = recording_writer();
+        let (outbox, mut drain) = live_outbox();
         let responded = Arc::new(AtomicBool::new(false));
 
         // Simulate the completion task winning first.
@@ -6272,13 +6305,12 @@ mod put_notify_supersede_tests {
         );
         // The superseding request now finds it already claimed.
         let prev = Some(inflight(0x99, responded.clone()));
-        supersede_put_notify(prev, &writer, crate::protocol::CA_MINOR_VERSION)
+        supersede_put_notify(prev, &outbox, crate::protocol::CA_MINOR_VERSION)
             .await
             .unwrap();
 
-        let guard = writer.lock().await;
         assert!(
-            guard.get_ref().batches.is_empty(),
+            drain_frames(&mut drain).is_empty(),
             "superseding path must not reply once the completion task has"
         );
     }
@@ -6346,7 +6378,7 @@ mod put_notify_supersede_tests {
             count: 1,
             req_hdr: crate::protocol::CaHeader::new(crate::protocol::CA_PROTO_WRITE_NOTIFY),
         });
-        supersede_put_notify(prev, &recording_writer(), crate::protocol::CA_MINOR_VERSION)
+        supersede_put_notify(prev, &live_outbox().0, crate::protocol::CA_MINOR_VERSION)
             .await
             .unwrap();
 
@@ -6596,7 +6628,7 @@ mod pre_v49_peer_tests {
     //!   ECA_INTERNAL "CAS: Missaligned protocol rejected" + disconnect.
     //! * send: an error echo for a pre-V49 peer is the 16-byte form
     //!   (`vsend_err`, `camessage.c:201-214`).
-    use super::single_write_all_framing_tests::recording_writer;
+    use super::single_write_all_framing_tests::{drain_frames, live_outbox};
     use super::*;
     use epics_base_rs::server::database::PvDatabase;
     use std::sync::Arc;
@@ -6794,7 +6826,7 @@ mod pre_v49_peer_tests {
     /// client with no annex parser.
     #[tokio::test]
     async fn pre_v49_error_echo_is_sixteen_bytes() {
-        let writer = recording_writer();
+        let (outbox, mut drain) = live_outbox();
         let mut original = CaHeader::new(CA_PROTO_READ_NOTIFY);
         original
             .set_payload_size(0, 0x1_0000, CA_MINOR_VERSION)
@@ -6802,7 +6834,7 @@ mod pre_v49_peer_tests {
         assert!(original.is_extended());
 
         send_ca_error(
-            &writer,
+            &outbox,
             &original,
             ECA_INTERNAL,
             0xFFFF_FFFF,
@@ -6812,8 +6844,8 @@ mod pre_v49_peer_tests {
         .await
         .expect("send_ca_error succeeds");
 
-        let guard = writer.lock().await;
-        let frame = &guard.get_ref().batches[0];
+        let frames = drain_frames(&mut drain);
+        let frame = &frames[0];
         let diag = pad_string("boom");
         assert_eq!(
             frame.len(),
@@ -6831,14 +6863,14 @@ mod pre_v49_peer_tests {
     /// The same error to a V49 peer keeps the 24-byte extended echo.
     #[tokio::test]
     async fn v49_error_echo_is_twenty_four_bytes() {
-        let writer = recording_writer();
+        let (outbox, mut drain) = live_outbox();
         let mut original = CaHeader::new(CA_PROTO_READ_NOTIFY);
         original
             .set_payload_size(0, 0x1_0000, CA_MINOR_VERSION)
             .expect("extended original");
 
         send_ca_error(
-            &writer,
+            &outbox,
             &original,
             ECA_INTERNAL,
             0xFFFF_FFFF,
@@ -6848,8 +6880,8 @@ mod pre_v49_peer_tests {
         .await
         .expect("send_ca_error succeeds");
 
-        let guard = writer.lock().await;
-        let frame = &guard.get_ref().batches[0];
+        let frames = drain_frames(&mut drain);
+        let frame = &frames[0];
         let diag = pad_string("boom");
         assert_eq!(
             frame.len(),
@@ -6867,7 +6899,7 @@ mod pre_v49_peer_tests {
         use epics_base_rs::server::snapshot::Snapshot;
         use epics_base_rs::types::{DBR_LONG, EpicsValue};
 
-        let writer = recording_writer();
+        let (outbox, mut drain) = live_outbox();
         // 20,000 LONG elements = 80,000 payload bytes → needs the
         // extended header (>= 0xffff).
         let values: Vec<i32> = vec![7; 20_000];
@@ -6880,7 +6912,7 @@ mod pre_v49_peer_tests {
         let req = CaHeader::new(CA_PROTO_READ_NOTIFY);
 
         send_monitor_snapshot(
-            &writer,
+            &outbox,
             9,
             DBR_LONG,
             20_000,
@@ -6893,8 +6925,8 @@ mod pre_v49_peer_tests {
         .await
         .expect("the error reply itself must succeed");
 
-        let guard = writer.lock().await;
-        let frame = &guard.get_ref().batches[0];
+        let frames = drain_frames(&mut drain);
+        let frame = &frames[0];
         let cmmd = u16::from_be_bytes([frame[0], frame[1]]);
         let eca = u32::from_be_bytes([frame[12], frame[13], frame[14], frame[15]]);
         assert_eq!(cmmd, CA_PROTO_ERROR, "pre-V49 peer gets an error, not data");
@@ -8493,59 +8525,43 @@ mod deprecated_read_autosize_tests {
 #[cfg(test)]
 mod single_write_all_framing_tests {
     //! BUG 4: GET/READ_NOTIFY, introspection (`send_monitor_snapshot`)
-    //! and CA_PROTO_ERROR (`send_ca_error`) replies must be written to
-    //! the shared `BufWriter` as ONE contiguous `write_all`. A split
-    //! across two `write_all` awaits lets a `send_timeout` cancel land
-    //! between header and payload, leaving an orphan header that
+    //! and CA_PROTO_ERROR (`send_ca_error`) replies must reach the wire as
+    //! ONE contiguous frame. A split across two writes lets a `send_timeout`
+    //! cancel land between header and payload, leaving an orphan header that
     //! mis-frames every following message. A true cancel-race is
-    //! non-deterministic; this asserts the structural property that
-    //! makes the race impossible: exactly one write batch == one frame.
+    //! non-deterministic; this asserts the structural property that makes
+    //! the race impossible: exactly one pushed frame per reply. The outbox
+    //! makes this stronger than the old shared-`BufWriter` invariant — each
+    //! emit site builds one `Vec<u8>` and `push`es it as an atomic unit, so
+    //! "one push == one frame" holds by construction, not by discipline.
     use super::*;
-    use std::pin::Pin;
-    use std::sync::Arc;
-    use std::task::{Context, Poll};
+    use crate::server::outbox::{Outbox, OutboxDrain};
 
-    /// Mock `AsyncWrite` recording each `poll_write` batch. Wrapped in a
-    /// zero-capacity `BufWriter`, batch count == `write_all` count.
-    #[derive(Default)]
-    pub(super) struct RecordingWriter {
-        pub(super) batches: Vec<Vec<u8>>,
+    /// Build a live outbox + its drain for a test emit site.
+    pub(super) fn live_outbox() -> (Outbox, OutboxDrain) {
+        crate::server::outbox::channel()
     }
 
-    impl AsyncWrite for RecordingWriter {
-        fn poll_write(
-            mut self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            buf: &[u8],
-        ) -> Poll<std::io::Result<usize>> {
-            self.batches.push(buf.to_vec());
-            Poll::Ready(Ok(buf.len()))
+    /// Drain every frame pushed to the outbox, in push order. Each push is
+    /// one complete contiguous frame, so `frames.len()` is exactly the
+    /// former `write_all` count this module asserts on.
+    pub(super) fn drain_frames(drain: &mut OutboxDrain) -> Vec<Vec<u8>> {
+        let mut frames = Vec::new();
+        while let Some(f) = drain.try_next() {
+            frames.push(f);
         }
-        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-            Poll::Ready(Ok(()))
-        }
-        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-            Poll::Ready(Ok(()))
-        }
-    }
-
-    pub(super) fn recording_writer() -> Arc<Mutex<BufWriter<RecordingWriter>>> {
-        // Zero capacity: every write_all forwards straight through.
-        Arc::new(Mutex::new(BufWriter::with_capacity(
-            0,
-            RecordingWriter::default(),
-        )))
+        frames
     }
 
     /// `send_ca_error` builds response-header + echoed-request-header +
     /// diagnostic string. All three must leave in a single `write_all`.
     #[tokio::test]
     async fn send_ca_error_writes_single_frame() {
-        let writer = recording_writer();
+        let (outbox, mut drain) = live_outbox();
         let original = CaHeader::new(CA_PROTO_READ_NOTIFY);
 
         send_ca_error(
-            &writer,
+            &outbox,
             &original,
             ECA_INTERNAL,
             0xFFFF_FFFF,
@@ -8555,8 +8571,7 @@ mod single_write_all_framing_tests {
         .await
         .expect("send_ca_error succeeds");
 
-        let guard = writer.lock().await;
-        let batches = &guard.get_ref().batches;
+        let batches = drain_frames(&mut drain);
         assert_eq!(
             batches.len(),
             1,
@@ -8584,13 +8599,13 @@ mod single_write_all_framing_tests {
     /// shape the get-failure and no-snapshot paths now use.
     #[tokio::test]
     async fn read_notify_get_failure_frame_keeps_count_and_zero_body() {
-        let writer = recording_writer();
+        let (outbox, mut drain) = live_outbox();
         let requested_count = 3u32;
         // DBR_TIME_DOUBLE = compound type with 16-byte metadata, so the
         // get-failure body is non-empty even though every byte is zero —
         // exactly where `count=0`/empty diverged from C.
         send_no_read_access_event(
-            &writer,
+            &outbox,
             CA_PROTO_READ_NOTIFY,
             epics_base_rs::types::DBR_TIME_DOUBLE,
             requested_count,
@@ -8604,8 +8619,7 @@ mod single_write_all_framing_tests {
         .await
         .expect("send_no_read_access_event succeeds");
 
-        let guard = writer.lock().await;
-        let batches = &guard.get_ref().batches;
+        let batches = drain_frames(&mut drain);
         assert_eq!(batches.len(), 1, "one contiguous write_all");
         let frame = &batches[0];
         let hdr = CaHeader::from_bytes(&frame[..16]).expect("parse READ_NOTIFY header");
@@ -8654,7 +8668,7 @@ mod single_write_all_framing_tests {
     /// `m_postsize = 24 + diag_len`, not `16 + diag_len`.
     #[tokio::test]
     async fn send_ca_error_extended_original_declares_correct_payload_size() {
-        let writer = recording_writer();
+        let (outbox, mut drain) = live_outbox();
         // Build an extended original header: set_payload_size triggers
         // extended form when count >= 0xFFFF.
         let mut original = CaHeader::new(CA_PROTO_READ_NOTIFY);
@@ -8667,7 +8681,7 @@ mod single_write_all_framing_tests {
         );
 
         send_ca_error(
-            &writer,
+            &outbox,
             &original,
             ECA_INTERNAL,
             0xFFFF_FFFF,
@@ -8677,8 +8691,7 @@ mod single_write_all_framing_tests {
         .await
         .expect("send_ca_error succeeds");
 
-        let guard = writer.lock().await;
-        let batches = &guard.get_ref().batches;
+        let batches = drain_frames(&mut drain);
         assert_eq!(batches.len(), 1, "must issue exactly one write_all");
         let frame = &batches[0];
         // Outer CA_PROTO_ERROR response header is normal form (payload < 0xFFFF);
@@ -8707,7 +8720,7 @@ mod single_write_all_framing_tests {
         use epics_base_rs::server::snapshot::Snapshot;
         use epics_base_rs::types::{DBR_LONG, EpicsValue};
 
-        let writer = recording_writer();
+        let (outbox, mut drain) = live_outbox();
         let snapshot = Snapshot::new(
             EpicsValue::Long(123),
             0,
@@ -8717,7 +8730,7 @@ mod single_write_all_framing_tests {
 
         // requested_count 0 = autosize: frame the live element count.
         send_monitor_snapshot(
-            &writer,
+            &outbox,
             9,
             DBR_LONG,
             0,
@@ -8730,8 +8743,7 @@ mod single_write_all_framing_tests {
         .await
         .expect("send_monitor_snapshot succeeds");
 
-        let guard = writer.lock().await;
-        let batches = &guard.get_ref().batches;
+        let batches = drain_frames(&mut drain);
         assert_eq!(
             batches.len(),
             1,
@@ -8761,9 +8773,9 @@ mod single_write_all_framing_tests {
         );
         let requested_count = 8u32;
 
-        let writer = recording_writer();
+        let (outbox, mut drain) = live_outbox();
         send_monitor_snapshot(
-            &writer,
+            &outbox,
             9,
             DBR_LONG,
             requested_count,
@@ -8776,8 +8788,7 @@ mod single_write_all_framing_tests {
         .await
         .expect("send_monitor_snapshot succeeds");
 
-        let guard = writer.lock().await;
-        let batches = &guard.get_ref().batches;
+        let batches = drain_frames(&mut drain);
         assert_eq!(batches.len(), 1, "exactly one contiguous frame");
         let frame = &batches[0];
 
@@ -8825,9 +8836,9 @@ mod single_write_all_framing_tests {
             0,
             std::time::SystemTime::UNIX_EPOCH,
         );
-        let writer = recording_writer();
+        let (outbox, mut drain) = live_outbox();
         send_monitor_snapshot(
-            &writer,
+            &outbox,
             9,
             DBR_LONG,
             2,
@@ -8840,8 +8851,8 @@ mod single_write_all_framing_tests {
         .await
         .expect("send_monitor_snapshot succeeds");
 
-        let guard = writer.lock().await;
-        let frame = &guard.get_ref().batches[0];
+        let frames = drain_frames(&mut drain);
+        let frame = &frames[0];
         let count = u16::from_be_bytes([frame[6], frame[7]]) as u32;
         assert_eq!(count, 2, "under-requested count must truncate to 2");
     }
@@ -8859,9 +8870,9 @@ mod single_write_all_framing_tests {
             0,
             std::time::SystemTime::UNIX_EPOCH,
         );
-        let writer = recording_writer();
+        let (outbox, mut drain) = live_outbox();
         send_monitor_snapshot(
-            &writer,
+            &outbox,
             9,
             DBR_LONG,
             0,
@@ -8874,8 +8885,8 @@ mod single_write_all_framing_tests {
         .await
         .expect("send_monitor_snapshot succeeds");
 
-        let guard = writer.lock().await;
-        let frame = &guard.get_ref().batches[0];
+        let frames = drain_frames(&mut drain);
+        let frame = &frames[0];
         let count = u16::from_be_bytes([frame[6], frame[7]]) as u32;
         assert_eq!(count, 4, "autosize (count==0) keeps the live count");
     }

@@ -3224,9 +3224,24 @@ async fn dispatch_message(
                 }
             }
 
-            let data = match encode_dbr(requested_type, &snapshot) {
-                Ok(d) => d,
-                Err(_) => {
+            // Sans-io boundary: `snapshot` is now fully materialized — the
+            // filter chain, long-string mode, and the STSACK / CLASS_NAME
+            // field reads (all above) are the only I/O this command needs.
+            // `build_read_reply` turns the finished snapshot and the request
+            // parameters into the exact wire frame as a pure, socket-free
+            // computation; the connection loop's outbox owner is the only
+            // code that touches the socket. Emit by pushing the bytes.
+            match build_read_reply(
+                requested_type,
+                requested_count,
+                is_notify,
+                &snapshot,
+                entry.cid,
+                ioid,
+                state.client_minor_version,
+            ) {
+                Ok(frame) => writer.push(frame),
+                Err(ReadReplyError::BadType) => {
                     // C `read_action` (camessage.c:616-620) checks
                     // `INVALID_DB_REQ(m_dataType)` (type >
                     // LAST_BUFFER_TYPE = 38) BEFORE any DB lookup and
@@ -3268,171 +3283,21 @@ async fn dispatch_message(
                         requested_type
                     )));
                 }
-            };
-            // C `read_reply` (`rsrv/camessage.c:507-571`) keeps
-            // the request count in the header and zero-fills the
-            // payload when fewer elements are returned than requested
-            // (`autosize = mp->m_count == 0` is the exception:
-            // request count 0 means "all available"; otherwise the
-            // response carries the requested count and pads with
-            // zeros). Pre-fix Rust dropped the requested count on
-            // a short array, so a `ca_array_get_callback(type,
-            // count > native, ...)` saw a shorter response from
-            // Rust than from rsrv.
-            let mut data = data;
-            let actual_count = snapshot.value.count() as u32;
-            // ORDER MATTERS: the deprecated-READ count==0 branch MUST
-            // precede the DBR_CLASS_NAME normalization. C `read_action`
-            // (rsrv/camessage.c:622-645) sizes EVERY type — including
-            // DBR_CLASS_NAME — with `dbr_size_n(type, m_count)` and writes
-            // the header count as `m_count` VERBATIM, with no class-name
-            // special case. `dbr_size_n(DBR_CLASS_NAME, 0) = dbr_size[38]
-            // - dbr_value_size[38] = 40 - 40 = 0`, so a deprecated READ of
-            // DBR_CLASS_NAME at count==0 ships count=0 and a 0-byte
-            // payload. Only the READ_NOTIFY / EVENT_ADD path (`read_reply`)
-            // forces the fixed 40-byte class string at count 1 (CA-268).
-            let element_count = if !is_notify && requested_count == 0 {
-                // The deprecated synchronous CA_PROTO_READ (cmd 3) does
-                // NOT treat m_count==0 as autosize. C `read_action`
-                // (rsrv/camessage.c:622-645) sizes the reply with
-                // `dbr_size_n(type, m_count)`, writes the header count as
-                // `m_count`, and calls `dbChannel_get(.., m_count, ..)`
-                // — all VERBATIM. Only `read_reply` (READ_NOTIFY /
-                // EVENT_ADD, camessage.c:507-509) interprets m_count==0 as
-                // "all available elements". So a deprecated READ with
-                // count==0 must ship count=0 and a value-less payload of
-                // `dbr_size_n(type, 0)` bytes == the type's metadata only
-                // (0 bytes for a plain DBR type; the STS/TIME/GR/CTRL
-                // header for a compound type, since `dbr_size_n(t,0)` ==
-                // `dbr_size[t] - dbr_value_size[t]`). Pre-fix Rust shared
-                // the autosize path for both opcodes and returned the full
-                // native array with count=actual_native_count, diverging
-                // from rsrv on both the wire count field and the payload
-                // length.
-                match epics_base_rs::types::native_type_for_dbr(requested_type) {
-                    Ok(native) => {
-                        // `dbr_buffer_size(.., 0)` equals `dbr_size_n(t, 0)`
-                        // for every type EXCEPT DBR_CLASS_NAME, where it
-                        // reports the fixed 40-byte string (the count>=1
-                        // framing size) rather than `dbr_size_n(38,0)=0`.
-                        // Use 0 for CLASS_NAME to match C's value-less
-                        // count==0 payload.
-                        let meta_size = if requested_type == epics_base_rs::types::DBR_CLASS_NAME {
-                            0
-                        } else {
-                            epics_base_rs::types::dbr_buffer_size(requested_type, native, 0)
-                        };
-                        if data.len() > meta_size {
-                            data.truncate(meta_size);
-                        }
-                        0
-                    }
-                    // Unreachable for a type that already encoded above
-                    // (<= LAST_BUFFER_TYPE). If it ever weren't, fall back
-                    // to the autosize sizing so the header count still
-                    // matches the payload rather than shipping count=0
-                    // with a value-bearing body.
-                    Err(_) => pad_dbr_to_requested_count(
-                        &mut data,
-                        actual_count,
-                        requested_count,
-                        requested_type,
-                    ),
-                }
-            } else if requested_type == epics_base_rs::types::DBR_CLASS_NAME {
-                // CA-268: DBR_CLASS_NAME wire payload is always one fixed
-                // 40-byte string. element_count must be 1 regardless of
-                // the underlying record's value count — for waveform
-                // records, snapshot.value.count() can be N, which would
-                // make C clients parse 40 * N bytes of body and fail.
-                // This applies to the READ_NOTIFY / EVENT_ADD path and to
-                // ordinary deprecated reads with count!=0; the deprecated
-                // count==0 case is handled above (C ships count=0).
-                1
-            } else {
-                pad_dbr_to_requested_count(&mut data, actual_count, requested_count, requested_type)
-            };
-            // Deprecated CA_PROTO_READ (cmd 3) contracts a scalar
-            // DBR_STRING payload to its NUL-terminated length before the
-            // 8-byte alignment. C `read_action` (rsrv/camessage.c:666-680)
-            // recomputes `payloadSize = epicsStrnLen(pStr, 40) + 1` for
-            // `DBR_STRING && m_count == 1` when a NUL is found within the
-            // 40-byte slot (otherwise it force-terminates byte 39 and keeps
-            // the full 40), then `cas_commit_msg` (caserverio.c:350-365)
-            // aligns the shortened size to 8 and rewrites m_postsize while
-            // leaving the header count at 1. So `"OK"` commits an 8-byte
-            // payload, not the fixed 40-byte slot. READ_NOTIFY / EVENT_ADD
-            // never run this branch — C `read_reply` keeps the full slot —
-            // so gate on `!is_notify`. `element_count == 1` is the scalar
-            // case; arrays / count!=1 keep their full per-element slots.
-            if !is_notify
-                && requested_type == epics_base_rs::types::DBR_STRING
-                && element_count == 1
-            {
-                // epicsStrnLen(pStr, 40): the first NUL index, capped at the
-                // 40-byte slot. Trim to value + its NUL only when a NUL
-                // exists within the slot; the encoder always NUL-bounds a
-                // scalar string at <= 39 chars (value.rs to_bytes), so the
-                // no-NUL else-branch C guards against cannot arise here and
-                // the full 40-byte slot is kept untouched if it ever did.
-                let slot = data.len().min(40);
-                if let Some(nul) = data[..slot].iter().position(|&b| b == 0) {
-                    data.truncate(nul + 1);
+                Err(ReadReplyError::Oversize) => {
+                    // C client TCP parser requires 8-byte aligned postsize.
+                    // C `read_action` (`camessage.c:625-631`): a reply needing
+                    // the extended header for a pre-V49 client is not framed —
+                    // the server answers ECA_16KARRAYCLIENT and keeps the
+                    // circuit.
+                    return send_16k_array_client_err(
+                        writer,
+                        hdr,
+                        entry.cid,
+                        state.client_minor_version,
+                    )
+                    .await;
                 }
             }
-            let mut padded = data;
-            padded.resize(align8(padded.len()), 0);
-
-            // For deprecated CA_PROTO_READ (cmd=3), the response carries
-            // the *client-side* CID (`pciu->cid` in C `read_action`
-            // — `camessage.c:622-624` passes `pciu->cid`, NOT
-            // `pciu->sid`, to `cas_copy_in_header`). Modern libca's
-            // `readRespAction` demuxes by ioid (`m_available`) and
-            // ignores `m_cid` for READ responses, but pre-3.14 clients
-            // and stricter wire validators (Wireshark CA dissector,
-            // packet-level fuzzers) cross-check the field. Notify
-            // clients (cmd=15) get ECA_NORMAL since READ_NOTIFY's cid
-            // slot carries status, not the channel CID.
-            let mut resp = if is_notify {
-                let mut r = CaHeader::new(CA_PROTO_READ_NOTIFY);
-                r.cid = ECA_NORMAL;
-                r
-            } else {
-                let mut r = CaHeader::new(CA_PROTO_READ);
-                r.cid = entry.cid;
-                r
-            };
-            // C client TCP parser requires 8-byte aligned postsize.
-            // C `read_action` (`camessage.c:625-631`): a reply needing the
-            // extended header for a pre-V49 client is not framed — the server
-            // answers ECA_16KARRAYCLIENT and keeps the circuit.
-            if resp
-                .set_payload_size(padded.len(), element_count, state.client_minor_version)
-                .is_err()
-            {
-                return send_16k_array_client_err(
-                    writer,
-                    hdr,
-                    entry.cid,
-                    state.client_minor_version,
-                )
-                .await;
-            }
-            resp.data_type = requested_type;
-            resp.available = ioid;
-
-            // Abort-safety: build the whole READ/READ_NOTIFY frame as ONE
-            // contiguous buffer and hand it to the outbox in a single
-            // `push`. A `send_timeout` cancel can only land at a frame
-            // boundary — a partial frame can never be enqueued, so it can
-            // never reach the connection loop's socket writer and mis-frame
-            // the following messages. Same shape as the monitor path
-            // (`monitor.rs`).
-            let hdr_bytes = resp.to_bytes_extended();
-            let mut frame = Vec::with_capacity(hdr_bytes.len() + padded.len());
-            frame.extend_from_slice(&hdr_bytes);
-            frame.extend_from_slice(&padded);
-            writer.push(frame);
         }
 
         CA_PROTO_WRITE | CA_PROTO_WRITE_NOTIFY => {
@@ -5853,6 +5718,196 @@ async fn send_no_read_access_event(
     frame.resize(frame.len() + padded_size, 0);
     writer.push(frame);
     Ok(())
+}
+
+/// Why a READ / READ_NOTIFY reply could not be framed. The two variants
+/// mirror C's two framing-time failures; the async dispatch handler maps
+/// each to its C-parity wire response (see the `build_read_reply` call site).
+#[derive(Debug)]
+enum ReadReplyError {
+    /// `encode_dbr` rejected the requested DBR type — the direct parallel of
+    /// C `read_action`'s `INVALID_DB_REQ(m_dataType)` (`camessage.c:616-620`).
+    /// The deprecated READ answers `ECA_BADTYPE`; READ_NOTIFY stays silent.
+    BadType,
+    /// The framed payload needs the extended (24-byte) header but the client
+    /// is pre-V49 and cannot parse it — C answers `ECA_16KARRAYCLIENT` and
+    /// keeps the circuit (`camessage.c:625-631`).
+    Oversize,
+}
+
+/// Sans-io core of the READ / READ_NOTIFY reply: turn a fully-materialized
+/// snapshot plus the request parameters into the exact wire frame (extended
+/// header + 8-aligned DBR payload), with no socket, database, or async.
+///
+/// The async dispatch handler is responsible for every I/O step first —
+/// channel lookup, access checks, fetching the snapshot and applying the
+/// filter chain, long-string mode, and STSACK / CLASS_NAME field reads. Once
+/// the snapshot is finished, the wire bytes are a pure function of it and of
+/// (`requested_type`, `requested_count`, `is_notify`, `cid`, `ioid`,
+/// `client_minor`), which is exactly this function. That makes the READ
+/// reply byte-production testable against a hand-built snapshot with no
+/// socket in the loop.
+fn build_read_reply(
+    requested_type: u16,
+    requested_count: u32,
+    is_notify: bool,
+    snapshot: &epics_base_rs::server::snapshot::Snapshot,
+    cid: u32,
+    ioid: u32,
+    client_minor: u16,
+) -> Result<Vec<u8>, ReadReplyError> {
+    let data = encode_dbr(requested_type, snapshot).map_err(|_| ReadReplyError::BadType)?;
+    // C `read_reply` (`rsrv/camessage.c:507-571`) keeps
+    // the request count in the header and zero-fills the
+    // payload when fewer elements are returned than requested
+    // (`autosize = mp->m_count == 0` is the exception:
+    // request count 0 means "all available"; otherwise the
+    // response carries the requested count and pads with
+    // zeros). Pre-fix Rust dropped the requested count on
+    // a short array, so a `ca_array_get_callback(type,
+    // count > native, ...)` saw a shorter response from
+    // Rust than from rsrv.
+    let mut data = data;
+    let actual_count = snapshot.value.count() as u32;
+    // ORDER MATTERS: the deprecated-READ count==0 branch MUST
+    // precede the DBR_CLASS_NAME normalization. C `read_action`
+    // (rsrv/camessage.c:622-645) sizes EVERY type — including
+    // DBR_CLASS_NAME — with `dbr_size_n(type, m_count)` and writes
+    // the header count as `m_count` VERBATIM, with no class-name
+    // special case. `dbr_size_n(DBR_CLASS_NAME, 0) = dbr_size[38]
+    // - dbr_value_size[38] = 40 - 40 = 0`, so a deprecated READ of
+    // DBR_CLASS_NAME at count==0 ships count=0 and a 0-byte
+    // payload. Only the READ_NOTIFY / EVENT_ADD path (`read_reply`)
+    // forces the fixed 40-byte class string at count 1 (CA-268).
+    let element_count = if !is_notify && requested_count == 0 {
+        // The deprecated synchronous CA_PROTO_READ (cmd 3) does
+        // NOT treat m_count==0 as autosize. C `read_action`
+        // (rsrv/camessage.c:622-645) sizes the reply with
+        // `dbr_size_n(type, m_count)`, writes the header count as
+        // `m_count`, and calls `dbChannel_get(.., m_count, ..)`
+        // — all VERBATIM. Only `read_reply` (READ_NOTIFY /
+        // EVENT_ADD, camessage.c:507-509) interprets m_count==0 as
+        // "all available elements". So a deprecated READ with
+        // count==0 must ship count=0 and a value-less payload of
+        // `dbr_size_n(type, 0)` bytes == the type's metadata only
+        // (0 bytes for a plain DBR type; the STS/TIME/GR/CTRL
+        // header for a compound type, since `dbr_size_n(t,0)` ==
+        // `dbr_size[t] - dbr_value_size[t]`). Pre-fix Rust shared
+        // the autosize path for both opcodes and returned the full
+        // native array with count=actual_native_count, diverging
+        // from rsrv on both the wire count field and the payload
+        // length.
+        match epics_base_rs::types::native_type_for_dbr(requested_type) {
+            Ok(native) => {
+                // `dbr_buffer_size(.., 0)` equals `dbr_size_n(t, 0)`
+                // for every type EXCEPT DBR_CLASS_NAME, where it
+                // reports the fixed 40-byte string (the count>=1
+                // framing size) rather than `dbr_size_n(38,0)=0`.
+                // Use 0 for CLASS_NAME to match C's value-less
+                // count==0 payload.
+                let meta_size = if requested_type == epics_base_rs::types::DBR_CLASS_NAME {
+                    0
+                } else {
+                    epics_base_rs::types::dbr_buffer_size(requested_type, native, 0)
+                };
+                if data.len() > meta_size {
+                    data.truncate(meta_size);
+                }
+                0
+            }
+            // Unreachable for a type that already encoded above
+            // (<= LAST_BUFFER_TYPE). If it ever weren't, fall back
+            // to the autosize sizing so the header count still
+            // matches the payload rather than shipping count=0
+            // with a value-bearing body.
+            Err(_) => {
+                pad_dbr_to_requested_count(&mut data, actual_count, requested_count, requested_type)
+            }
+        }
+    } else if requested_type == epics_base_rs::types::DBR_CLASS_NAME {
+        // CA-268: DBR_CLASS_NAME wire payload is always one fixed
+        // 40-byte string. element_count must be 1 regardless of
+        // the underlying record's value count — for waveform
+        // records, snapshot.value.count() can be N, which would
+        // make C clients parse 40 * N bytes of body and fail.
+        // This applies to the READ_NOTIFY / EVENT_ADD path and to
+        // ordinary deprecated reads with count!=0; the deprecated
+        // count==0 case is handled above (C ships count=0).
+        1
+    } else {
+        pad_dbr_to_requested_count(&mut data, actual_count, requested_count, requested_type)
+    };
+    // Deprecated CA_PROTO_READ (cmd 3) contracts a scalar
+    // DBR_STRING payload to its NUL-terminated length before the
+    // 8-byte alignment. C `read_action` (rsrv/camessage.c:666-680)
+    // recomputes `payloadSize = epicsStrnLen(pStr, 40) + 1` for
+    // `DBR_STRING && m_count == 1` when a NUL is found within the
+    // 40-byte slot (otherwise it force-terminates byte 39 and keeps
+    // the full 40), then `cas_commit_msg` (caserverio.c:350-365)
+    // aligns the shortened size to 8 and rewrites m_postsize while
+    // leaving the header count at 1. So `"OK"` commits an 8-byte
+    // payload, not the fixed 40-byte slot. READ_NOTIFY / EVENT_ADD
+    // never run this branch — C `read_reply` keeps the full slot —
+    // so gate on `!is_notify`. `element_count == 1` is the scalar
+    // case; arrays / count!=1 keep their full per-element slots.
+    if !is_notify && requested_type == epics_base_rs::types::DBR_STRING && element_count == 1 {
+        // epicsStrnLen(pStr, 40): the first NUL index, capped at the
+        // 40-byte slot. Trim to value + its NUL only when a NUL
+        // exists within the slot; the encoder always NUL-bounds a
+        // scalar string at <= 39 chars (value.rs to_bytes), so the
+        // no-NUL else-branch C guards against cannot arise here and
+        // the full 40-byte slot is kept untouched if it ever did.
+        let slot = data.len().min(40);
+        if let Some(nul) = data[..slot].iter().position(|&b| b == 0) {
+            data.truncate(nul + 1);
+        }
+    }
+    let mut padded = data;
+    padded.resize(align8(padded.len()), 0);
+
+    // For deprecated CA_PROTO_READ (cmd=3), the response carries
+    // the *client-side* CID (`pciu->cid` in C `read_action`
+    // — `camessage.c:622-624` passes `pciu->cid`, NOT
+    // `pciu->sid`, to `cas_copy_in_header`). Modern libca's
+    // `readRespAction` demuxes by ioid (`m_available`) and
+    // ignores `m_cid` for READ responses, but pre-3.14 clients
+    // and stricter wire validators (Wireshark CA dissector,
+    // packet-level fuzzers) cross-check the field. Notify
+    // clients (cmd=15) get ECA_NORMAL since READ_NOTIFY's cid
+    // slot carries status, not the channel CID.
+    let mut resp = if is_notify {
+        let mut r = CaHeader::new(CA_PROTO_READ_NOTIFY);
+        r.cid = ECA_NORMAL;
+        r
+    } else {
+        let mut r = CaHeader::new(CA_PROTO_READ);
+        r.cid = cid;
+        r
+    };
+    // C client TCP parser requires 8-byte aligned postsize.
+    // C `read_action` (`camessage.c:625-631`): a reply needing the
+    // extended header for a pre-V49 client is not framed — the server
+    // answers ECA_16KARRAYCLIENT and keeps the circuit.
+    if resp
+        .set_payload_size(padded.len(), element_count, client_minor)
+        .is_err()
+    {
+        return Err(ReadReplyError::Oversize);
+    }
+    resp.data_type = requested_type;
+    resp.available = ioid;
+
+    // Abort-safety: build the whole READ/READ_NOTIFY frame as ONE
+    // contiguous buffer so the caller can hand it to the outbox in a
+    // single `push`. A `send_timeout` cancel can only land at a frame
+    // boundary — a partial frame can never be enqueued, so it can never
+    // reach the connection loop's socket writer and mis-frame the
+    // following messages. Same shape as the monitor path (`monitor.rs`).
+    let hdr_bytes = resp.to_bytes_extended();
+    let mut frame = Vec::with_capacity(hdr_bytes.len() + padded.len());
+    frame.extend_from_slice(&hdr_bytes);
+    frame.extend_from_slice(&padded);
+    Ok(frame)
 }
 
 /// Resize an encoded DBR payload to the requested element count.
@@ -9866,5 +9921,195 @@ mod send_tmo_env_tests {
                 );
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod read_reply_sans_io_tests {
+    //! Sans-io proof for the READ / READ_NOTIFY reply: `build_read_reply`
+    //! produces the exact wire frame from a hand-built [`Snapshot`] and the
+    //! request parameters, with NO socket, NO `DuplexStream`, NO database,
+    //! and NO async. Every assertion here inspects the returned `Vec<u8>`
+    //! directly. This is the increment-1 demonstration that the reply's
+    //! byte production is a pure function of `(snapshot, request)` — the
+    //! whole point of the sans-io split.
+    use super::*;
+    use epics_base_rs::server::snapshot::Snapshot;
+    use epics_base_rs::types::{DBR_LONG, DBR_STRING, EpicsValue};
+
+    fn scalar_long(v: i32) -> Snapshot {
+        Snapshot::new(EpicsValue::Long(v), 0, 0, std::time::SystemTime::UNIX_EPOCH)
+    }
+
+    /// A scalar READ_NOTIFY frame is header + the 8-aligned value payload,
+    /// with the notify opcode, `cid == ECA_NORMAL` (the status slot), the
+    /// echoed ioid, and count 1.
+    #[test]
+    fn read_notify_scalar_long_is_header_plus_padded_value() {
+        let frame = build_read_reply(
+            DBR_LONG,
+            0, // notify autosize → live count (scalar ⇒ 1)
+            true,
+            &scalar_long(0x0102_0304),
+            0xAAAA_BBBB, // ignored for notify (cid slot carries status)
+            0x1234_5678,
+            CA_MINOR_VERSION,
+        )
+        .expect("scalar long read reply frames");
+
+        assert_eq!(frame.len(), 16 + 8, "16-byte header + 8-aligned i32 body");
+        let hdr = CaHeader::from_bytes(&frame[..16]).expect("parse header");
+        assert_eq!(hdr.cmmd, CA_PROTO_READ_NOTIFY);
+        assert_eq!(hdr.data_type, DBR_LONG);
+        assert_eq!(hdr.actual_count(), 1);
+        assert_eq!(hdr.cid, ECA_NORMAL, "notify cid slot is ECA_NORMAL");
+        assert_eq!(hdr.available, 0x1234_5678, "ioid echoed into m_available");
+        assert_eq!(hdr.actual_postsize(), 8);
+        assert_eq!(&frame[16..20], &0x0102_0304i32.to_be_bytes(), "value bytes");
+        assert_eq!(&frame[20..24], &[0, 0, 0, 0], "alignment padding is zero");
+    }
+
+    /// The deprecated synchronous CA_PROTO_READ carries the READ opcode and
+    /// the channel's client-side CID (`pciu->cid`), not `ECA_NORMAL`.
+    #[test]
+    fn deprecated_read_uses_channel_cid_and_read_opcode() {
+        let frame = build_read_reply(
+            DBR_LONG,
+            1, // non-zero ⇒ ordinary scalar, not the count==0 metadata path
+            false,
+            &scalar_long(42),
+            0x00C0_FFEE,
+            0x9,
+            CA_MINOR_VERSION,
+        )
+        .expect("deprecated scalar read frames");
+
+        let hdr = CaHeader::from_bytes(&frame[..16]).expect("parse header");
+        assert_eq!(hdr.cmmd, CA_PROTO_READ, "deprecated READ opcode");
+        assert_eq!(
+            hdr.cid, 0x00C0_FFEE,
+            "deprecated READ echoes the channel CID"
+        );
+        assert_eq!(hdr.actual_count(), 1);
+        assert_eq!(&frame[16..20], &42i32.to_be_bytes());
+    }
+
+    /// A deprecated CA_PROTO_READ with `m_count == 0` is NOT autosize: C
+    /// sizes it with `dbr_size_n(type, 0)`, so a plain type ships count 0
+    /// and a zero-length body (header only).
+    #[test]
+    fn deprecated_read_count_zero_ships_header_only_for_plain_type() {
+        let frame = build_read_reply(
+            DBR_LONG,
+            0,
+            false,
+            &scalar_long(7),
+            0x1,
+            0x2,
+            CA_MINOR_VERSION,
+        )
+        .expect("count==0 deprecated read frames");
+
+        assert_eq!(frame.len(), 16, "plain-type count==0 body is empty");
+        let hdr = CaHeader::from_bytes(&frame[..16]).expect("parse header");
+        assert_eq!(hdr.cmmd, CA_PROTO_READ);
+        assert_eq!(hdr.actual_count(), 0, "count==0 stays 0 (not autosize)");
+        assert_eq!(hdr.actual_postsize(), 0);
+    }
+
+    /// A short array framed at a LARGER requested count keeps the requested
+    /// count in the header and zero-fills the missing elements.
+    #[test]
+    fn read_notify_array_pads_to_requested_count() {
+        let snap = Snapshot::new(
+            EpicsValue::LongArray(vec![10, 20, 30]),
+            0,
+            0,
+            std::time::SystemTime::UNIX_EPOCH,
+        );
+        let frame = build_read_reply(DBR_LONG, 5, true, &snap, 0, 0x7, CA_MINOR_VERSION)
+            .expect("padded array frames");
+
+        let hdr = CaHeader::from_bytes(&frame[..16]).expect("parse header");
+        assert_eq!(hdr.actual_count(), 5, "header carries the requested count");
+        // 5 * 4 = 20 value bytes, 8-aligned to 24.
+        assert_eq!(hdr.actual_postsize(), 24);
+        assert_eq!(frame.len(), 16 + 24);
+        assert_eq!(&frame[16..20], &10i32.to_be_bytes(), "element 0");
+        assert_eq!(&frame[20..24], &20i32.to_be_bytes(), "element 1");
+        assert_eq!(&frame[24..28], &30i32.to_be_bytes(), "element 2");
+        assert!(
+            frame[28..].iter().all(|&b| b == 0),
+            "over-requested elements + alignment are zero-filled"
+        );
+    }
+
+    /// An array framed at a SMALLER requested count truncates to it.
+    #[test]
+    fn read_notify_array_truncates_under_requested_count() {
+        let snap = Snapshot::new(
+            EpicsValue::LongArray(vec![1, 2, 3, 4, 5]),
+            0,
+            0,
+            std::time::SystemTime::UNIX_EPOCH,
+        );
+        let frame = build_read_reply(DBR_LONG, 2, true, &snap, 0, 0x7, CA_MINOR_VERSION)
+            .expect("truncated array frames");
+
+        let hdr = CaHeader::from_bytes(&frame[..16]).expect("parse header");
+        assert_eq!(hdr.actual_count(), 2, "count truncated to the requested 2");
+        assert_eq!(frame.len(), 16 + 8, "2 * 4 = 8, already 8-aligned");
+        assert_eq!(&frame[16..20], &1i32.to_be_bytes());
+        assert_eq!(&frame[20..24], &2i32.to_be_bytes());
+    }
+
+    /// A reply that needs the extended (24-byte) header cannot be framed for
+    /// a pre-V49 client — `build_read_reply` reports `Oversize`, which the
+    /// dispatch handler maps to ECA_16KARRAYCLIENT.
+    #[test]
+    fn oversize_array_to_pre_v49_client_is_err_oversize() {
+        let snap = Snapshot::new(
+            EpicsValue::LongArray(vec![7; 20_000]), // 80 000 bytes > 0xFFFF
+            0,
+            0,
+            std::time::SystemTime::UNIX_EPOCH,
+        );
+        let err = build_read_reply(DBR_LONG, 20_000, true, &snap, 0, 0x7, 8)
+            .expect_err("pre-V49 client cannot frame an extended reply");
+        assert!(matches!(err, ReadReplyError::Oversize));
+    }
+
+    /// An unencodable DBR type is `BadType` (C `INVALID_DB_REQ`), which the
+    /// handler turns into ECA_BADTYPE (deprecated READ) or a silent drop
+    /// (READ_NOTIFY).
+    #[test]
+    fn unsupported_dbr_type_is_err_badtype() {
+        let err = build_read_reply(99, 1, false, &scalar_long(0), 0x1, 0x2, CA_MINOR_VERSION)
+            .expect_err("type 99 > LAST_BUFFER_TYPE cannot encode");
+        assert!(matches!(err, ReadReplyError::BadType));
+    }
+
+    /// Deprecated scalar DBR_STRING contracts to its NUL-terminated length
+    /// (value + NUL, 8-aligned), not the fixed 40-byte slot — C `read_action`
+    /// `epicsStrnLen(pStr, 40) + 1`.
+    #[test]
+    fn deprecated_scalar_string_contracts_to_nul_terminated_length() {
+        let snap = Snapshot::new(
+            EpicsValue::String(epics_base_rs::types::PvString::from("OK")),
+            0,
+            0,
+            std::time::SystemTime::UNIX_EPOCH,
+        );
+        let frame = build_read_reply(DBR_STRING, 1, false, &snap, 0x1, 0x2, CA_MINOR_VERSION)
+            .expect("scalar string frames");
+        let hdr = CaHeader::from_bytes(&frame[..16]).expect("parse header");
+        // "OK" + NUL = 3 bytes, 8-aligned to 8 — not the 40-byte slot.
+        assert_eq!(
+            hdr.actual_postsize(),
+            8,
+            "contracted to value + NUL, 8-aligned"
+        );
+        assert_eq!(&frame[16..18], b"OK");
+        assert_eq!(frame[18], 0, "NUL terminator");
     }
 }

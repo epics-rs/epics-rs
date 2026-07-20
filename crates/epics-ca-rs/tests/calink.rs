@@ -175,7 +175,7 @@ async fn record_with_ca_inp_link_reads_remote_value() {
         .unwrap();
     {
         let rec = db.get_record("CADST").await.expect("record exists");
-        let mut inst = rec.write().await;
+        let mut inst = rec.write();
         inst.put_common_field("INP", EpicsValue::String("CALINK:INP:SRC CA".into()))
             .unwrap();
         inst.common.udf = 0;
@@ -187,7 +187,7 @@ async fn record_with_ca_inp_link_reads_remote_value() {
         .unwrap();
 
     let rec = db.get_record("CADST").await.expect("record exists");
-    let inst = rec.read().await;
+    let inst = rec.read();
     assert_eq!(
         inst.record.val().and_then(|v| v.to_f64()),
         Some(19.25),
@@ -241,7 +241,7 @@ async fn ca_cp_holder_processes_on_remote_change() {
         .unwrap();
     {
         let rec = db.get_record("CALINK:CP:HOLDER").await.unwrap();
-        let mut inst = rec.write().await;
+        let mut inst = rec.write();
         inst.put_common_field("INP", EpicsValue::String("CALINK:CP:SRC CP".into()))
             .unwrap();
         inst.common.udf = 0;
@@ -269,7 +269,7 @@ async fn ca_cp_holder_processes_on_remote_change() {
     loop {
         let v = {
             let rec = db.get_record("CALINK:CP:HOLDER").await.unwrap();
-            let inst = rec.read().await;
+            let inst = rec.read();
             inst.record.val().and_then(|v| v.to_f64())
         };
         if v == Some(5.0) {
@@ -299,7 +299,7 @@ async fn ca_cp_holder_processes_on_remote_change() {
     loop {
         let v = {
             let rec = db.get_record("CALINK:CP:HOLDER").await.unwrap();
-            let inst = rec.read().await;
+            let inst = rec.read();
             inst.record.val().and_then(|v| v.to_f64())
         };
         if v == Some(42.0) {
@@ -680,7 +680,7 @@ async fn calink_warms_cp_holder_via_iocapplication_run_seam() {
                         .get_record("CALINK:SEAM:HOLDER")
                         .await
                         .expect("holder loaded via dbLoadRecords");
-                    let inst = rec.read().await;
+                    let inst = rec.read();
                     inst.record.val().and_then(|v| v.to_f64())
                 };
                 if v == Some(5.0) {

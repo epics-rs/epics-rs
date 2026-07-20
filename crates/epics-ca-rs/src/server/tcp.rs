@@ -1,4 +1,3 @@
-use epics_base_rs::runtime::sync::RwLock;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -241,7 +240,7 @@ use epics_base_rs::types::{DbFieldType, EpicsValue, encode_dbr, native_type_for_
 enum ChannelTarget {
     SimplePv(Arc<ProcessVariable>),
     RecordField {
-        record: Arc<RwLock<RecordInstance>>,
+        record: Arc<parking_lot::RwLock<RecordInstance>>,
         field: String,
     },
 }
@@ -899,7 +898,7 @@ impl ClientState {
             let (base, field) = parse_pv_name(&inp.link);
             let field = if field.is_empty() { "VAL" } else { field };
             let rec = self.db.get_record(base).await?;
-            let inst = rec.read().await;
+            let inst = rec.read();
             match inst.resolve_field(field).and_then(|v| v.to_f64()) {
                 Some(v) => inputs.vars[idx] = v,
                 None => return None,
@@ -990,7 +989,7 @@ impl ClientState {
                 // input pointing back at this record can't re-acquire the
                 // same lock.
                 let (is_ro, asg, asl) = {
-                    let instance = record.read().await;
+                    let instance = record.read();
                     // C `rsrvCheckPut` (rsrv/camessage.c:2540-2551):
                     //
                     //     /* SPC_NOMOD fields are always unwritable */
@@ -2199,7 +2198,7 @@ where
                 pv.remove_subscriber(sub.sub_id).await;
             }
             ChannelTarget::RecordField { record, .. } => {
-                record.write().await.remove_subscriber(sub.sub_id);
+                record.write().remove_subscriber(sub.sub_id);
             }
         }
         if let Some(tx) = &conn_events {
@@ -2704,7 +2703,7 @@ async fn dispatch_message(
                         )
                     }
                     PvEntry::Record(rec) => {
-                        let instance = rec.read().await;
+                        let instance = rec.read();
                         // `client_field_value` = resolve_field (3-level
                         // priority) with a DBF_MENU field promoted to its
                         // DBR_ENUM form, so the channel's announced native
@@ -3001,7 +3000,7 @@ async fn dispatch_message(
                 let audit_pv = match &entry.target {
                     ChannelTarget::SimplePv(pv) => pv.name.clone(),
                     ChannelTarget::RecordField { record, field } => {
-                        format!("{}.{}", record.read().await.name, field)
+                        format!("{}.{}", record.read().name, field)
                     }
                 };
                 send_ca_error(
@@ -3069,7 +3068,7 @@ async fn dispatch_message(
                         let audit_pv = match &entry.target {
                             ChannelTarget::SimplePv(pv) => pv.name.clone(),
                             ChannelTarget::RecordField { record, field } => {
-                                format!("{}.{}", record.read().await.name, field)
+                                format!("{}.{}", record.read().name, field)
                             }
                         };
                         send_ca_error(
@@ -3128,7 +3127,7 @@ async fn dispatch_message(
                         let audit_pv = match &entry.target {
                             ChannelTarget::SimplePv(pv) => pv.name.clone(),
                             ChannelTarget::RecordField { record, field } => {
-                                format!("{}.{}", record.read().await.name, field)
+                                format!("{}.{}", record.read().name, field)
                             }
                         };
                         send_ca_error(
@@ -3202,7 +3201,7 @@ async fn dispatch_message(
             // alarm-handler clients see the current acknowledge state.
             if requested_type == epics_base_rs::types::DBR_STSACK_STRING {
                 if let ChannelTarget::RecordField { record, .. } = &entry.target {
-                    let inst = record.read().await;
+                    let inst = record.read();
                     if let Some(EpicsValue::Short(v)) = inst.resolve_field("ACKT") {
                         snapshot.alarm.ackt = Some(v as u16);
                     }
@@ -3219,7 +3218,7 @@ async fn dispatch_message(
             // against synthetic channels).
             if requested_type == epics_base_rs::types::DBR_CLASS_NAME {
                 if let ChannelTarget::RecordField { record, .. } = &entry.target {
-                    let inst = record.read().await;
+                    let inst = record.read();
                     snapshot.class_name = Some(inst.record.record_type().to_string());
                 }
             }
@@ -3377,7 +3376,7 @@ async fn dispatch_message(
                             let audit_pv = match &entry.target {
                                 ChannelTarget::SimplePv(pv) => pv.name.clone(),
                                 ChannelTarget::RecordField { record, field } => {
-                                    format!("{}.{}", record.read().await.name, field)
+                                    format!("{}.{}", record.read().name, field)
                                 }
                             };
                             send_ca_error(
@@ -3427,7 +3426,7 @@ async fn dispatch_message(
                 }
                 let result = match &entry.target {
                     ChannelTarget::RecordField { record, field } => {
-                        let name = record.read().await.name.clone();
+                        let name = record.read().name.clone();
                         // Alarm-ack puts are immediate in C even for the
                         // notify variant — `rsrv/camessage.c` writes ACKT/
                         // ACKS via `dbPutField` and replies straight away,
@@ -3467,7 +3466,7 @@ async fn dispatch_message(
                     let audit_pv = match &entry.target {
                         ChannelTarget::SimplePv(pv) => pv.name.clone(),
                         ChannelTarget::RecordField { record, field } => {
-                            format!("{}.{}", record.read().await.name, field)
+                            format!("{}.{}", record.read().name, field)
                         }
                     };
                     let eca = PutStatus::of_failure(e);
@@ -3533,7 +3532,7 @@ async fn dispatch_message(
             let audit_pv = match &entry.target {
                 ChannelTarget::SimplePv(pv) => pv.name.clone(),
                 ChannelTarget::RecordField { record, field } => {
-                    format!("{}.{}", record.read().await.name, field)
+                    format!("{}.{}", record.read().name, field)
                 }
             };
 
@@ -3814,7 +3813,7 @@ async fn dispatch_message(
                     }
                 }
                 ChannelTarget::RecordField { record, field } => {
-                    let name = record.read().await.name.clone();
+                    let name = record.read().name.clone();
                     if is_notify {
                         db.put_record_field_from_ca(&name, field, new_value).await
                     } else {
@@ -4429,127 +4428,143 @@ async fn dispatch_message(
                         }
                     }
                     ChannelTarget::RecordField { record, field } => {
-                        let mut instance = record.write().await;
-                        let Some(rx) = instance.add_subscriber_on(
-                            &state.event_user,
-                            field,
-                            sub_id,
-                            native_type,
-                            mask,
-                        ) else {
-                            // record-field subscriber cap reached.
-                            // Symmetric with the SimplePv path; send
-                            // ECA_ALLOCMEM so the client surfaces the
-                            // refusal instead of timing out silently.
-                            tracing::warn!(
-                                record = %instance.name,
-                                field = %field,
+                        // Guarded segment: register the record-field subscriber,
+                        // attach its filter chain, and snapshot the initial (or
+                        // denial) event. The data guard is released at the block
+                        // close before the writer awaits below (parking_lot guards
+                        // are `!Send`); `None` means the subscriber cap was reached.
+                        let registered = 'registered: {
+                            let mut instance = record.write();
+                            let Some(rx) = instance.add_subscriber_on(
+                                &state.event_user,
+                                field,
                                 sub_id,
-                                "EVENT_ADD refused: record-field subscriber cap reached"
-                            );
-                            drop(instance);
-                            // CA_PROTO_ERROR for admission
-                            // failure (libca's eventRespAction
-                            // treats zero-payload EVENT_ADD as a
-                            // cancel ack, so the prior
-                            // send_cmd_error path silently lost).
-                            send_ca_error(
-                                writer,
-                                hdr,
-                                ECA_ALLOCMEM,
-                                entry.cid,
-                                "EVENT_ADD refused: record-field subscriber cap",
-                                state.client_minor_version,
-                            )
-                            .await?;
-                            return Ok(());
-                        };
+                                native_type,
+                                mask,
+                            ) else {
+                                // record-field subscriber cap reached.
+                                // Symmetric with the SimplePv path; send
+                                // ECA_ALLOCMEM so the client surfaces the
+                                // refusal instead of timing out silently.
+                                tracing::warn!(
+                                    record = %instance.name,
+                                    field = %field,
+                                    sub_id,
+                                    "EVENT_ADD refused: record-field subscriber cap reached"
+                                );
+                                break 'registered None;
+                            };
 
-                        // epics-base 3.15.7 channel filter — attach the
-                        // chain (parsed via the single
-                        // `ChannelEntry::filter_chain` owner, the same one
-                        // the READ path and the SimplePv monitor now use)
-                        // to the just-registered subscriber. The parser is
-                        // permissive: malformed JSON or unknown filters
-                        // degrade gracefully to an empty chain with a
-                        // tracing::warn!, so an empty chain is a no-op loop.
-                        for filt in entry.filter_chain().iter() {
-                            instance.attach_filter_to_last_subscriber(field, filt.clone());
-                        }
-
-                        // snapshot when read access granted,
-                        // no_read_access_event when denied. Drop the
-                        // instance write lock before await on the
-                        // writer so the producer task can pick it up.
-                        //
-                        // even on the denied path we must read
-                        // the field's live element count under the
-                        // lock, so an autosize (`count == 0`) denial
-                        // frame can be sized to a nonzero DBR body
-                        // instead of the zero-payload cancel-ack shape.
-                        let initial_snap = if access_denied {
-                            None
-                        } else {
-                            instance.snapshot_for_field(field).and_then(|mut snap| {
-                                if requested_type == epics_base_rs::types::DBR_CLASS_NAME {
-                                    snap.class_name =
-                                        Some(instance.record.record_type().to_string());
-                                }
-                                // the initial record-field monitor
-                                // event is an EVENT-context single-event
-                                // post (see the SimplePv branch) — run the
-                                // event-context chain (`dec`/`sync` apply)
-                                // on a fresh throwaway chain so the
-                                // subscriber's attached chain state stays
-                                // isolated. `None` means the chain dropped
-                                // the post (C `db_queue_event_log` fires
-                                // only `if(pLog)`); fold it through so the
-                                // send below is skipped — never fall back
-                                // to the unfiltered value.
-                                let init_chain = entry.filter_chain();
-                                match init_chain.apply_to_event_value(snap.value.clone()) {
-                                    Some(v) => {
-                                        snap.value = v;
-                                        // long-string boundary conversion
-                                        // (`$` → CHAR[40], or native record
-                                        // field → scalar DBR_STRING).
-                                        super::apply_long_string_mode(&mut snap, long_string_mode);
-                                        Some(snap)
-                                    }
-                                    None => None,
-                                }
-                            })
-                        };
-                        // Derive the field's element
-                        // count for the autosize-denial frame AND run
-                        // the event-context chain under the lock (the
-                        // value is needed for both). `snapshot_for_field`
-                        // is the same accessor the granted path uses, so
-                        // the denial count matches what a granted monitor
-                        // on the same field would carry. C
-                        // `event_add_action` calls `db_post_single_event`
-                        // unconditionally (`camessage.c:1853`, before the
-                        // access check), so the DENIED initial post is
-                        // gated by the event-context chain too:
-                        // `Some(count)` => send the ECA_NORDACCESS frame,
-                        // `None` => the chain dropped the post, send
-                        // nothing. A missing field snapshot keeps the
-                        // prior count=1 fallback (no value to filter).
-                        let denied_event_count = if access_denied {
-                            match instance.snapshot_for_field(field) {
-                                Some(snap) => {
-                                    let count = snap.value.count();
-                                    entry
-                                        .filter_chain()
-                                        .apply_to_event_value(snap.value)
-                                        .map(|_| count)
-                                }
-                                None => Some(1),
+                            // epics-base 3.15.7 channel filter — attach the
+                            // chain (parsed via the single
+                            // `ChannelEntry::filter_chain` owner, the same one
+                            // the READ path and the SimplePv monitor now use)
+                            // to the just-registered subscriber. The parser is
+                            // permissive: malformed JSON or unknown filters
+                            // degrade gracefully to an empty chain with a
+                            // tracing::warn!, so an empty chain is a no-op loop.
+                            for filt in entry.filter_chain().iter() {
+                                instance.attach_filter_to_last_subscriber(field, filt.clone());
                             }
-                        } else {
-                            None
+
+                            // snapshot when read access granted,
+                            // no_read_access_event when denied. Drop the
+                            // instance write lock before await on the
+                            // writer so the producer task can pick it up.
+                            //
+                            // even on the denied path we must read
+                            // the field's live element count under the
+                            // lock, so an autosize (`count == 0`) denial
+                            // frame can be sized to a nonzero DBR body
+                            // instead of the zero-payload cancel-ack shape.
+                            let initial_snap = if access_denied {
+                                None
+                            } else {
+                                instance.snapshot_for_field(field).and_then(|mut snap| {
+                                    if requested_type == epics_base_rs::types::DBR_CLASS_NAME {
+                                        snap.class_name =
+                                            Some(instance.record.record_type().to_string());
+                                    }
+                                    // the initial record-field monitor
+                                    // event is an EVENT-context single-event
+                                    // post (see the SimplePv branch) — run the
+                                    // event-context chain (`dec`/`sync` apply)
+                                    // on a fresh throwaway chain so the
+                                    // subscriber's attached chain state stays
+                                    // isolated. `None` means the chain dropped
+                                    // the post (C `db_queue_event_log` fires
+                                    // only `if(pLog)`); fold it through so the
+                                    // send below is skipped — never fall back
+                                    // to the unfiltered value.
+                                    let init_chain = entry.filter_chain();
+                                    match init_chain.apply_to_event_value(snap.value.clone()) {
+                                        Some(v) => {
+                                            snap.value = v;
+                                            // long-string boundary conversion
+                                            // (`$` → CHAR[40], or native record
+                                            // field → scalar DBR_STRING).
+                                            super::apply_long_string_mode(
+                                                &mut snap,
+                                                long_string_mode,
+                                            );
+                                            Some(snap)
+                                        }
+                                        None => None,
+                                    }
+                                })
+                            };
+                            // Derive the field's element
+                            // count for the autosize-denial frame AND run
+                            // the event-context chain under the lock (the
+                            // value is needed for both). `snapshot_for_field`
+                            // is the same accessor the granted path uses, so
+                            // the denial count matches what a granted monitor
+                            // on the same field would carry. C
+                            // `event_add_action` calls `db_post_single_event`
+                            // unconditionally (`camessage.c:1853`, before the
+                            // access check), so the DENIED initial post is
+                            // gated by the event-context chain too:
+                            // `Some(count)` => send the ECA_NORDACCESS frame,
+                            // `None` => the chain dropped the post, send
+                            // nothing. A missing field snapshot keeps the
+                            // prior count=1 fallback (no value to filter).
+                            let denied_event_count = if access_denied {
+                                match instance.snapshot_for_field(field) {
+                                    Some(snap) => {
+                                        let count = snap.value.count();
+                                        entry
+                                            .filter_chain()
+                                            .apply_to_event_value(snap.value)
+                                            .map(|_| count)
+                                    }
+                                    None => Some(1),
+                                }
+                            } else {
+                                None
+                            };
+                            Some((rx, initial_snap, denied_event_count))
                         };
-                        drop(instance);
+                        // Release the data guard, then handle the refusal (send the
+                        // ECA_ALLOCMEM error and return) or bind the registered
+                        // subscriber for the writer awaits below.
+                        let (rx, initial_snap, denied_event_count) = match registered {
+                            None => {
+                                // CA_PROTO_ERROR for admission failure (libca's
+                                // eventRespAction treats zero-payload EVENT_ADD as a
+                                // cancel ack, so the prior send_cmd_error path lost).
+                                send_ca_error(
+                                    writer,
+                                    hdr,
+                                    ECA_ALLOCMEM,
+                                    entry.cid,
+                                    "EVENT_ADD refused: record-field subscriber cap",
+                                    state.client_minor_version,
+                                )
+                                .await?;
+                                return Ok(());
+                            }
+                            Some(t) => t,
+                        };
                         if access_denied {
                             // normalise autosize before sizing
                             // the zero-filled denial payload. See the
@@ -4666,12 +4681,7 @@ async fn dispatch_message(
                                 // pad.
                                 if requested_type == epics_base_rs::types::DBR_CLASS_NAME {
                                     event.snapshot.class_name = Some(
-                                        record_for_task
-                                            .read()
-                                            .await
-                                            .record
-                                            .record_type()
-                                            .to_string(),
+                                        record_for_task.read().record.record_type().to_string(),
                                     );
                                 }
                                 // long-string boundary conversion before
@@ -4882,7 +4892,7 @@ async fn dispatch_message(
                         pv.remove_subscriber(sub.sub_id).await;
                     }
                     ChannelTarget::RecordField { record, .. } => {
-                        record.write().await.remove_subscriber(sub.sub_id);
+                        record.write().remove_subscriber(sub.sub_id);
                     }
                 }
                 if let Some(tx) = conn_events {
@@ -5205,7 +5215,7 @@ async fn dispatch_message(
                                 pv.remove_subscriber(sub.sub_id).await;
                             }
                             ChannelTarget::RecordField { record, .. } => {
-                                record.write().await.remove_subscriber(sub.sub_id);
+                                record.write().remove_subscriber(sub.sub_id);
                             }
                         }
                         if let Some(tx) = &conn_events {
@@ -5264,9 +5274,7 @@ async fn get_full_snapshot(
 ) -> Option<epics_base_rs::server::snapshot::Snapshot> {
     match target {
         ChannelTarget::SimplePv(pv) => Some(pv.snapshot()),
-        ChannelTarget::RecordField { record, field } => {
-            record.read().await.snapshot_for_field(field)
-        }
+        ChannelTarget::RecordField { record, field } => record.read().snapshot_for_field(field),
     }
 }
 
@@ -5288,9 +5296,7 @@ async fn get_read_snapshot(
 ) -> Result<Option<epics_base_rs::server::snapshot::Snapshot>, epics_base_rs::error::CaError> {
     match target {
         ChannelTarget::SimplePv(pv) => pv.read_snapshot().await.map(Some),
-        ChannelTarget::RecordField { record, field } => {
-            Ok(record.read().await.snapshot_for_field(field))
-        }
+        ChannelTarget::RecordField { record, field } => Ok(record.read().snapshot_for_field(field)),
     }
 }
 

@@ -413,6 +413,22 @@ impl SearchReplyBatch {
     pub(crate) fn shape_trailing(&self) -> Option<Vec<u8>> {
         shape_search_reply_dg(&self.send_buf, self.client_minor, self.client_seq)
     }
+
+    /// Shape the current batch into its on-wire datagram (or `None` when
+    /// empty), then reset the batch to empty. The blocking responder
+    /// (`crate::server::blocking`) calls this to flush at a coalescing-group
+    /// boundary — a recv-queue drain (FIONREAD == 0), a peer change, or
+    /// shutdown — which is byte-equivalent to the async responder's
+    /// [`flush_send_buf`] (shape + `send_buf.clear()`) followed by the
+    /// peer-change `client_seq`/`client_minor` reset (`recv_loop`,
+    /// udp.rs:846-849). Resetting the whole batch keeps the invariant "a
+    /// non-empty batch's `client_*` echo state belongs to its own replies"
+    /// true by construction for the next group.
+    pub(crate) fn take_reply(&mut self) -> Option<Vec<u8>> {
+        let dg = self.shape_trailing();
+        *self = SearchReplyBatch::default();
+        dg
+    }
 }
 
 /// Parse one inbound UDP datagram's CA messages (VERSION + SEARCH),

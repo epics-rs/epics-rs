@@ -216,12 +216,14 @@ impl BlockingCaServer {
     /// Analogue of the C `CAS-UDP` thread (`cast_server`, `cast_server.c:113`).
     /// Bind `socket` with [`bind_udp_search`](Self::bind_udp_search).
     ///
-    /// Scope (S1b): name-search reply only. No beacons, no multicast /
-    /// broadcast-secondary socket, and no same-source FIONREAD coalescing —
-    /// each datagram yields its own reply datagram, which is protocol-correct
-    /// (coalescing several same-peer datagrams into one is a later
-    /// optimization). SEARCH replies are byte-identical to the async
-    /// responder because both drive the shared `udp::parse_search_datagram`.
+    /// Scope: name-search reply only. No beacons, no multicast /
+    /// broadcast-secondary socket. Same-source FIONREAD coalescing IS applied
+    /// (C `cast_server.c:268-281`): a burst of same-peer search datagrams is
+    /// batched into one reply datagram, and a held batch is flushed early when
+    /// the next datagram comes from a different peer (`cast_server.c:205-214`).
+    /// SEARCH replies are byte-identical to the async responder because both
+    /// drive the shared `udp::parse_search_datagram` and shape via
+    /// `SearchReplyBatch`.
     pub fn serve_udp_search(&self, socket: UdpSocket) -> CaResult<()> {
         handle_udp_search_blocking(socket, self.db.clone(), self.tcp_port, &self.shutdown)
     }
@@ -306,11 +308,105 @@ fn bind_udp_search_socket(addr: SocketAddrV4) -> std::io::Result<UdpSocket> {
     UdpSocket::bind(addr)
 }
 
+/// The `FIONREAD` ioctl request — bytes pending in the socket receive queue.
+/// C `rsrv`'s batch-up gate: hold accumulated replies while this is `> 0`,
+/// flush at `0` (`camsgtask.c:55`, `cast_server.c:272`).
+///
+/// The `libc` crate exposes `FIONREAD` for hosted Unix but omits it for
+/// `armv7-rtems-eabihf`, so the RTEMS value is supplied here. RTEMS newlib
+/// defines it in `sys/rtems/include/sys/filio.h` as `_IOR('f', 127, int)`;
+/// `sys/ioccom.h` in the same tree encodes
+/// `_IOR(g,n,t) = IOC_OUT | (sizeof(t) << 16) | (g << 8) | n` with
+/// `IOC_OUT = 0x40000000`. For a 4-byte `int` that is
+/// `0x40000000 | (4 << 16) | ('f' << 8) | 127 = 0x4004_667F` — the same value
+/// the `libc` crate hardcodes for the whole BSD family (`unix/bsd/mod.rs`),
+/// which C `rsrv` runs on RTEMS in production. Pending on-target runtime
+/// verification at the QEMU/BSP phase; a wrong value only makes the `ioctl`
+/// error, and every caller then flushes (C's own `status < 0` branch),
+/// degrading to per-datagram / per-iteration flushing — never a hang or a
+/// crash. (Candidate for an upstream `libc` newlib/rtems binding so this
+/// local definition can later be dropped.)
+#[cfg(all(unix, not(target_os = "rtems")))]
+const FIONREAD_REQUEST: libc::c_ulong = libc::FIONREAD as libc::c_ulong;
+#[cfg(target_os = "rtems")]
+const FIONREAD_REQUEST: libc::c_ulong = 0x4004_667F;
+
+/// Bytes pending in the socket receive queue via `FIONREAD` — C `rsrv`'s
+/// batch-up gate. Callers hold accumulated replies while this is `> 0` and
+/// flush at `0` (`camsgtask.c:52-67`, `cast_server.c:268-281`). On any
+/// `ioctl` error this returns `Err`, and every caller treats that as
+/// "flush now" — matching C's `status < 0` branch — so an absent or wrong
+/// FIONREAD never coalesces (byte-correct, just unbatched) and never hangs.
+#[cfg(unix)]
+fn pending_bytes<F: std::os::fd::AsRawFd>(sock: &F) -> std::io::Result<usize> {
+    let mut n: libc::c_int = 0;
+    // SAFETY: `as_raw_fd()` is a valid open socket fd; FIONREAD writes one
+    // `c_int` count through the out-pointer, whose type and size match.
+    let rc = unsafe {
+        libc::ioctl(
+            sock.as_raw_fd(),
+            FIONREAD_REQUEST as _,
+            &mut n as *mut libc::c_int,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(n.max(0) as usize)
+}
+
+#[cfg(not(unix))]
+fn pending_bytes<F>(_sock: &F) -> std::io::Result<usize> {
+    // No FIONREAD off Unix (RTEMS and the host CI are both Unix-family). Report
+    // "unavailable" so callers flush every iteration — never coalesce — which
+    // is byte-correct, just unbatched.
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "FIONREAD unavailable on this platform",
+    ))
+}
+
+/// Send one already-shaped SEARCH-reply datagram to `dst` over the blocking
+/// socket. A send failure is logged, never fatal — C `cast_server` keeps
+/// serving after a send error (`caserverio.c:214-222`).
+fn send_udp_reply(socket: &UdpSocket, dst: SocketAddr, payload: &[u8]) {
+    if let Err(e) = socket.send_to(payload, dst) {
+        tracing::warn!(
+            target: "epics_ca_rs::server::blocking",
+            %dst, error = %e, "blocking UDP SEARCH-reply send failed"
+        );
+    }
+}
+
+/// Flush the held coalescing batch (if any) to the peer it was accumulated
+/// for, clearing both the batch and its owner address. Called at a recv-queue
+/// drain, on idle, and at shutdown. `batch_addr` is `Some` exactly when the
+/// batch may hold replies, so gating on it keeps "held replies ⟹ known owner"
+/// true by construction.
+fn flush_held_batch(
+    socket: &UdpSocket,
+    batch: &mut SearchReplyBatch,
+    batch_addr: &mut Option<SocketAddr>,
+) {
+    if let Some(dst) = batch_addr.take() {
+        if let Some(dg) = batch.take_reply() {
+            send_udp_reply(socket, dst, &dg);
+        }
+    }
+}
+
 /// Serve CA UDP name searches on `socket` until `shutdown` is set. C
 /// `cast_server` (`cast_server.c:113`): `recvfrom`, decode VERSION + SEARCH,
 /// `sendto` the reply. The decode/respond core is the shared
 /// [`udp::parse_search_datagram`]; only the socket I/O is blocking-specific,
 /// so replies are byte-identical to the async responder.
+///
+/// FIONREAD batch-up (C `cast_server.c:268-281`): the `SearchReplyBatch` is
+/// held across datagrams and flushed only when the recv queue drains
+/// (FIONREAD == 0 or errors); a same-source search burst thus coalesces into
+/// one reply datagram. A held batch is flushed early when the next datagram
+/// arrives from a different peer (`cast_server.c:205-214`), and on idle /
+/// shutdown so a buffered reply is never stranded.
 fn handle_udp_search_blocking(
     socket: UdpSocket,
     db: Arc<PvDatabase>,
@@ -326,11 +422,23 @@ fn handle_udp_search_blocking(
     // 64 KB = IPv4 max datagram, matching the async responder's recv buffer.
     let mut buf = vec![0u8; 64 * 1024];
 
+    // The coalescing batch persists across datagrams so a same-source search
+    // burst yields ONE reply datagram — C `cast_server.c:268-281` drains the
+    // recv queue (FIONREAD) into a single `cas_send_dg_msg`. `batch_addr` is
+    // the peer the held batch belongs to (C `client->addr`); it is `Some`
+    // exactly when `batch` may hold replies.
+    let mut batch = SearchReplyBatch::default();
+    let mut batch_addr: Option<SocketAddr> = None;
+
     while !shutdown.load(Ordering::Acquire) {
         let (len, src) = match socket.recv_from(&mut buf) {
             Ok(v) => v,
-            // Idle cap fired: loop back and re-check the shutdown flag.
-            Err(ref e) if is_read_timeout(e.kind()) => continue,
+            // Idle cap fired: the recv queue is drained, so flush any held
+            // batch (C flushes on FIONREAD == 0) and re-check `shutdown`.
+            Err(ref e) if is_read_timeout(e.kind()) => {
+                flush_held_batch(&socket, &mut batch, &mut batch_addr);
+                continue;
+            }
             // C `cast_server.c:171-179`: a UDP recv error never exits the
             // responder — an earlier reply drawing an ICMP port-unreachable
             // surfaces here as ECONNREFUSED/ECONNRESET. Log-and-continue.
@@ -341,11 +449,25 @@ fn handle_udp_search_blocking(
             continue;
         }
 
-        let mut batch = SearchReplyBatch::default();
+        // Peer-change flush (C `cast_server.c:205-214`): a held batch belongs
+        // to its source; if this datagram is from a different peer, flush the
+        // held batch to the old peer before adopting the new one.
+        if let Some(prev) = batch_addr {
+            if prev != src {
+                if let Some(dg) = batch.take_reply() {
+                    send_udp_reply(&socket, prev, &dg);
+                }
+            }
+        }
+        batch_addr = Some(src);
+
+        // Drive the shared UDP decode on this thread into the held batch. Its
+        // only suspension point is the DB name lookup, Ready on the first poll
+        // for a local record, so `block_on_sync` selects `park_on` and needs
+        // no runtime. Over-threshold sub-batches come back in `ready` and go
+        // out immediately to this datagram's source (C `cas_send_dg_msg`
+        // flushes each full batch as it fills).
         let mut ready: Vec<Vec<u8>> = Vec::new();
-        // Drive the shared UDP decode on this thread. Its only suspension
-        // point is the DB name lookup, Ready on the first poll for a local
-        // record, so `block_on_sync` selects `park_on` and needs no runtime.
         if block_on_sync(udp::parse_search_datagram(
             &buf[..len],
             &db,
@@ -360,27 +482,20 @@ fn handle_udp_search_blocking(
                 "blocking UDP responder: decode future not blockable in this thread context".into(),
             ));
         }
-
-        // Send each over-threshold batch, then the trailing batch, to the
-        // datagram's source. A failed reply is logged, not fatal — C
-        // `cast_server` keeps serving after a send error.
         for dg in &ready {
-            if let Err(e) = socket.send_to(dg, src) {
-                tracing::warn!(
-                    target: "epics_ca_rs::server::blocking",
-                    %src, error = %e, "blocking UDP SEARCH-reply send failed"
-                );
-            }
+            send_udp_reply(&socket, src, dg);
         }
-        if let Some(dg) = batch.shape_trailing() {
-            if let Err(e) = socket.send_to(&dg, src) {
-                tracing::warn!(
-                    target: "epics_ca_rs::server::blocking",
-                    %src, error = %e, "blocking UDP SEARCH-reply send failed"
-                );
-            }
+
+        // FIONREAD batch-up gate (C `cast_server.c:268-281`): flush the held
+        // batch only when the recv queue is drained (or FIONREAD errors);
+        // otherwise hold so the next same-source datagram coalesces into it.
+        match pending_bytes(&socket) {
+            Ok(0) | Err(_) => flush_held_batch(&socket, &mut batch, &mut batch_addr),
+            Ok(_) => { /* more datagrams pending: hold to coalesce */ }
         }
     }
+    // Shutdown requested: flush any held batch so a buffered reply is not lost.
+    flush_held_batch(&socket, &mut batch, &mut batch_addr);
     Ok(())
 }
 
@@ -482,6 +597,23 @@ fn handle_client_blocking(
     let mut buf = vec![0u8; 8192];
 
     loop {
+        // C `camsgtask.c:52-67`: before blocking in `recv`, flush accumulated
+        // replies only when the socket has no more bytes pending (FIONREAD ==
+        // 0) or FIONREAD errors; otherwise hold them so replies to pipelined
+        // commands batch into one write. `cas_send_bs_msg(client, TRUE)` is
+        // this drain. The per-command drain that used to run at the loop
+        // bottom is gone — a single request/response still flushes here on the
+        // next iteration (the client is then idle, so FIONREAD == 0), while a
+        // pipelined burst coalesces into one write.
+        match pending_bytes(&reader) {
+            Ok(0) | Err(_) => match drain_outbox_locked(&send_lock, &mut drain) {
+                Ok(()) => {}
+                Err(ref e) if is_peer_disconnect(e.kind()) => break,
+                Err(e) => return Err(CaError::Io(e)),
+            },
+            Ok(_) => { /* more bytes pending: hold to coalesce pipelined replies */ }
+        }
+
         let n = match reader.read(&mut buf) {
             Ok(0) => break, // graceful EOF
             Ok(n) => n,
@@ -572,13 +704,10 @@ fn handle_client_blocking(
         if offset > 0 {
             accumulated.drain(..offset);
         }
-
-        // Batched single-owner drain under the send lock.
-        match drain_outbox_locked(&send_lock, &mut drain) {
-            Ok(()) => {}
-            Err(ref e) if is_peer_disconnect(e.kind()) => break,
-            Err(e) => return Err(CaError::Io(e)),
-        }
+        // The reply drain lives at the loop top (FIONREAD-gated), not here —
+        // holding replies until the socket drains is the C batch-up rule
+        // (`camsgtask.c:52-67`). The only in-body drain is the handler-error
+        // path above, which flushes queued frames before ending the circuit.
     }
 
     Ok(())
@@ -1043,5 +1172,262 @@ mod tests {
 
         server.shutdown();
         udp_thread.join().unwrap().unwrap();
+    }
+
+    /// (FIONREAD batch-up) A same-source search burst coalesces into ONE reply
+    /// datagram. Both search datagrams are queued in the responder socket's
+    /// recv queue BEFORE the responder starts, so the FIONREAD gate holds the
+    /// first reply (queue not yet drained) and flushes both together on drain
+    /// — C `cast_server.c:268-281`. Bytes equal the shared decode driven
+    /// through ONE batch, and no second datagram is emitted.
+    #[test]
+    fn udp_same_source_burst_coalesces_into_one_reply() {
+        let db = seed_db(&[("BLK:BURST", EpicsValue::Double(1.0))]);
+        let server =
+            Arc::new(BlockingCaServer::bind("127.0.0.1:0", db.clone(), new_acf()).unwrap());
+        let tcp_port = server.tcp_port();
+
+        let resp = bind_udp_search(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let resp_addr = resp.local_addr().unwrap();
+
+        let client = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let client_addr = client.local_addr().unwrap();
+
+        // Queue both datagrams (localhost `send_to` enqueues synchronously)
+        // BEFORE the responder reads anything, so the burst is guaranteed to
+        // be in the recv queue when FIONREAD is checked after datagram 1.
+        let mut dg1 = udp_version_prelude(0x1111);
+        dg1.extend_from_slice(&udp_search_frame(0x01, "BLK:BURST"));
+        let mut dg2 = udp_version_prelude(0x2222);
+        dg2.extend_from_slice(&udp_search_frame(0x02, "BLK:BURST"));
+        client.send_to(&dg1, resp_addr).unwrap();
+        client.send_to(&dg2, resp_addr).unwrap();
+
+        let srv = server.clone();
+        let udp_thread = thread::spawn(move || srv.serve_udp_search(resp));
+
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut rbuf = vec![0u8; 64 * 1024];
+        let (n, from) = client.recv_from(&mut rbuf).expect("coalesced SEARCH reply");
+        assert_eq!(from, resp_addr, "reply comes from the responder socket");
+        let reply = rbuf[..n].to_vec();
+
+        // No SECOND reply datagram: the same-source burst coalesced into one.
+        client
+            .set_read_timeout(Some(Duration::from_millis(400)))
+            .unwrap();
+        let second = client.recv_from(&mut rbuf);
+        assert!(
+            second.as_ref().is_err_and(|e| is_read_timeout(e.kind())),
+            "same-source burst must coalesce into ONE reply datagram, got another: {second:?}"
+        );
+
+        // Byte-parity: drive BOTH datagrams through the shared decode into ONE
+        // batch (exactly what the responder's held batch does), then shape.
+        let expected = {
+            let mut batch = SearchReplyBatch::default();
+            let mut ready: Vec<Vec<u8>> = Vec::new();
+            block_on_sync(udp::parse_search_datagram(
+                &dg1,
+                &db,
+                tcp_port,
+                client_addr,
+                &mut batch,
+                &mut ready,
+            ))
+            .unwrap();
+            block_on_sync(udp::parse_search_datagram(
+                &dg2,
+                &db,
+                tcp_port,
+                client_addr,
+                &mut batch,
+                &mut ready,
+            ))
+            .unwrap();
+            assert!(
+                ready.is_empty(),
+                "two small searches stay under the mid-parse flush threshold"
+            );
+            batch.shape_trailing().expect("merged reply bytes")
+        };
+        assert_eq!(
+            reply, expected,
+            "coalesced reply must equal the shared decode's merged bytes"
+        );
+
+        // Structural: leads with ONE VERSION echo and carries strictly more
+        // than a single datagram's reply (proving datagram 2's reply merged in).
+        assert_eq!(
+            u16::from_be_bytes([reply[0], reply[1]]),
+            CA_PROTO_VERSION,
+            "coalesced reply leads with a single VERSION echo"
+        );
+        let single = reference_udp_reply(&db, &dg1, tcp_port, client_addr);
+        assert_eq!(single.len(), 1);
+        assert!(
+            reply.len() > single[0].len(),
+            "coalesced reply must carry more than one datagram's worth of SEARCH replies"
+        );
+
+        server.shutdown();
+        udp_thread.join().unwrap().unwrap();
+    }
+
+    /// (FIONREAD batch-up) A datagram from a different source flushes the held
+    /// batch to the PRIOR peer before adopting the new one — C
+    /// `cast_server.c:205-214`. Peer A's datagram, then peer B's, are queued
+    /// before the responder starts; the responder holds A's reply (B pending),
+    /// then B's arrival (a different source) flushes A's reply to A, and B's
+    /// own reply flushes on queue drain. Each peer receives exactly its own
+    /// reply bytes at its own address.
+    #[test]
+    fn udp_source_change_flushes_held_batch_to_prior_peer() {
+        let db = seed_db(&[("BLK:SRC", EpicsValue::Double(2.0))]);
+        let server =
+            Arc::new(BlockingCaServer::bind("127.0.0.1:0", db.clone(), new_acf()).unwrap());
+        let tcp_port = server.tcp_port();
+
+        let resp = bind_udp_search(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let resp_addr = resp.local_addr().unwrap();
+
+        // Two distinct client sockets = two distinct source addresses.
+        let client_a = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let client_b = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let a_addr = client_a.local_addr().unwrap();
+        let b_addr = client_b.local_addr().unwrap();
+
+        // Queue A then B before the responder starts (arrival order is A, B
+        // because localhost `send_to` enqueues synchronously in call order).
+        let mut dg_a = udp_version_prelude(0xAAAA);
+        dg_a.extend_from_slice(&udp_search_frame(0x0A, "BLK:SRC"));
+        let mut dg_b = udp_version_prelude(0xBBBB);
+        dg_b.extend_from_slice(&udp_search_frame(0x0B, "BLK:SRC"));
+        client_a.send_to(&dg_a, resp_addr).unwrap();
+        client_b.send_to(&dg_b, resp_addr).unwrap();
+
+        let srv = server.clone();
+        let udp_thread = thread::spawn(move || srv.serve_udp_search(resp));
+
+        client_a
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        client_b
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+
+        let mut abuf = vec![0u8; 64 * 1024];
+        let (an, afrom) = client_a.recv_from(&mut abuf).expect("A's reply");
+        assert_eq!(
+            afrom, resp_addr,
+            "A's reply comes from the responder socket"
+        );
+        let a_reply = abuf[..an].to_vec();
+
+        let mut bbuf = vec![0u8; 64 * 1024];
+        let (bn, bfrom) = client_b.recv_from(&mut bbuf).expect("B's reply");
+        assert_eq!(
+            bfrom, resp_addr,
+            "B's reply comes from the responder socket"
+        );
+        let b_reply = bbuf[..bn].to_vec();
+
+        // Each peer gets exactly its own datagram's reply bytes — no
+        // cross-contamination and no coalescing across the source change.
+        let expect_a = reference_udp_reply(&db, &dg_a, tcp_port, a_addr);
+        let expect_b = reference_udp_reply(&db, &dg_b, tcp_port, b_addr);
+        assert_eq!(expect_a.len(), 1);
+        assert_eq!(expect_b.len(), 1);
+        assert_eq!(a_reply, expect_a[0], "peer A receives A's reply bytes");
+        assert_eq!(b_reply, expect_b[0], "peer B receives B's reply bytes");
+
+        // Neither peer receives a second datagram.
+        client_a
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        assert!(
+            client_a
+                .recv_from(&mut abuf)
+                .is_err_and(|e| is_read_timeout(e.kind())),
+            "peer A must receive exactly one reply"
+        );
+
+        server.shutdown();
+        udp_thread.join().unwrap().unwrap();
+    }
+
+    /// (FIONREAD batch-up, TCP) Two READ_NOTIFYs pipelined in one write each
+    /// draw a byte-correct reply. C `camsgtask.c:52-67` holds replies while the
+    /// socket has bytes pending and flushes when it drains, so the two replies
+    /// leave in one batched write.
+    ///
+    /// The batching itself is NOT observable at the client: TCP is a byte
+    /// stream, so two replies delivered in one `write` are indistinguishable
+    /// from two `write`s — asserting "one write" would require instrumenting
+    /// the server's socket writes, which this test deliberately does not fake.
+    /// It asserts the observable contract instead: both replies arrive and
+    /// each equals the shared dispatch handler's exact bytes.
+    #[test]
+    fn tcp_pipelined_read_notifies_each_get_correct_reply() {
+        const DBR_DOUBLE: u16 = 6;
+        let db = seed_db(&[("BLK:PIPE", EpicsValue::Double(7.5))]);
+        let server =
+            Arc::new(BlockingCaServer::bind("127.0.0.1:0", db.clone(), new_acf()).unwrap());
+        let addr = server.local_addr().unwrap();
+        let srv = server.clone();
+        let accept = thread::spawn(move || srv.serve());
+
+        let mut c = TcpStream::connect(addr).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let _ = read_until_cmmd(&mut c, CA_PROTO_VERSION);
+
+        c.write_all(&version_frame()).unwrap();
+        c.write_all(&client_name_frame("tester")).unwrap();
+        c.write_all(&host_name_frame("testhost")).unwrap();
+        c.write_all(&create_chan_frame(0x1234, "BLK:PIPE")).unwrap();
+        let cc = read_until_cmmd(&mut c, CA_PROTO_CREATE_CHAN);
+        let sid = u32::from_be_bytes([cc[12], cc[13], cc[14], cc[15]]);
+
+        // Two READ_NOTIFYs, different ioids, sent in ONE write (pipelined).
+        let ioid1 = 0x0000_AA01;
+        let ioid2 = 0x0000_AA02;
+        let mut pipelined = read_notify_frame(sid, ioid1, DBR_DOUBLE);
+        pipelined.extend_from_slice(&read_notify_frame(sid, ioid2, DBR_DOUBLE));
+        c.write_all(&pipelined).unwrap();
+
+        // Collect both READ_NOTIFY replies (order preserved on one circuit).
+        let mut replies: Vec<Vec<u8>> = Vec::new();
+        for _ in 0..64 {
+            let frame = read_one_frame(&mut c);
+            if u16::from_be_bytes([frame[0], frame[1]]) == CA_PROTO_READ_NOTIFY {
+                replies.push(frame);
+                if replies.len() == 2 {
+                    break;
+                }
+            }
+        }
+        assert_eq!(replies.len(), 2, "both pipelined READ_NOTIFYs must reply");
+
+        // Each reply echoes its own ioid in m_available (bytes 12..16).
+        let ioid_of = |r: &[u8]| u32::from_be_bytes([r[12], r[13], r[14], r[15]]);
+        assert_eq!(ioid_of(&replies[0]), ioid1, "first reply echoes ioid1");
+        assert_eq!(ioid_of(&replies[1]), ioid2, "second reply echoes ioid2");
+
+        // Byte-for-byte parity against the shared dispatch handler.
+        let ref1 = reference_read_notify_reply(&db, "BLK:PIPE", 0x1234, ioid1, DBR_DOUBLE);
+        let ref2 = reference_read_notify_reply(&db, "BLK:PIPE", 0x1234, ioid2, DBR_DOUBLE);
+        assert_eq!(
+            replies[0], ref1,
+            "first reply must match shared dispatch bytes"
+        );
+        assert_eq!(
+            replies[1], ref2,
+            "second reply must match shared dispatch bytes"
+        );
+
+        server.shutdown();
+        accept.join().unwrap();
     }
 }

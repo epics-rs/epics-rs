@@ -22,6 +22,7 @@ pub(crate) fn register_builtins(registry: &mut CommandRegistry) {
     registry.register(cmd_post_event_alias());
     registry.register(cmd_ioc_stats());
     registry.register(cmd_db_load_records());
+    registry.register(cmd_db_load_template());
     registry.register(cmd_db_create_record());
     registry.register(cmd_db_delete_record());
     registry.register(cmd_epics_env_set());
@@ -1039,39 +1040,11 @@ fn cmd_db_load_records() -> CommandDef {
 
             let macros = parse_macro_string(macros_str);
 
-            // Build include config from EPICS_DB_INCLUDE_PATH
-            let include_paths: Vec<std::path::PathBuf> =
-                if let Ok(val) = std::env::var("EPICS_DB_INCLUDE_PATH") {
-                    split_db_paths(&val)
-                } else {
-                    Vec::new()
-                };
-            let config = db_loader::DbLoadConfig {
-                include_paths,
-                max_include_depth: 32,
-            };
-
-            // Resolve the template file path: check if it exists directly,
-            // otherwise search EPICS_DB_INCLUDE_PATH (matching C dbLoadRecords behavior)
-            let file_path = {
-                let p = std::path::Path::new(path);
-                if p.exists() {
-                    p.to_path_buf()
-                } else if !p.is_absolute() {
-                    // Search include paths for relative filenames
-                    let mut resolved = None;
-                    for dir in &config.include_paths {
-                        let candidate = dir.join(p);
-                        if candidate.exists() {
-                            resolved = Some(candidate);
-                            break;
-                        }
-                    }
-                    resolved.unwrap_or_else(|| p.to_path_buf())
-                } else {
-                    p.to_path_buf()
-                }
-            };
+            // Build include config from EPICS_DB_INCLUDE_PATH and resolve the
+            // file against it (matching C dbLoadRecords behavior). Shared with
+            // `dbLoadTemplate`, which resolves its `.substitutions` file the
+            // same way.
+            let (config, file_path) = resolve_db_include_path(path);
             // C `dbLoadRecords` macros are pure text substitution (dbLexRoutines.c
             // → macLib): a `DTYP=` macro reaches a record only where the file wrote
             // `field(DTYP,"$(DTYP)")`. It does NOT rewrite a record that spells its
@@ -1090,209 +1063,349 @@ fn cmd_db_load_records() -> CommandDef {
 
             let count = defs.len();
 
-            for mut def in defs {
-                // Resolve a `LINR` field naming a loaded breakpoint table to its
-                // menuConvert index (shared with the IocBuilder load path).
-                db_loader::resolve_linr_breaktable_names(
-                    &def.record_type,
-                    &mut def.fields,
-                    &breaktable_registry,
-                );
-                let added: Result<(), String> = ctx.block_on(async {
-                    // C-parity (dbLexRoutines.c:1170-1188): the SAME
-                    // record name re-loaded with the SAME record_type
-                    // merges fields into the existing instance (the
-                    // standard ADCore convention — simDetector.template
-                    // overrides ColorMode menu choices declared by its
-                    // included NDArrayBase.template). A different
-                    // record_type is fatal. `dbRecordsOnceOnly` global
-                    // is not yet wired; tighten here if/when needed.
-                    let existing = if let Some(rec) = ctx.db().get_record(&def.name).await {
-                        let r = rec.read().await;
-                        let existing_type = r.record.record_type();
-                        if existing_type != def.record_type {
-                            return Err(format!(
-                                "dbLoadRecords: {} record '{}' already exists, can't load {} record",
-                                existing_type, def.name, def.record_type
-                            ));
-                        }
-                        drop(r);
-                        Some(rec)
-                    } else {
-                        None
-                    };
+            // One install path for both `dbLoadRecords` and `dbLoadTemplate`:
+            // each expanded record flows through the SAME per-record routine,
+            // so template-loaded records are indistinguishable from directly
+            // loaded ones.
+            ctx.block_on(install_record_defs(ctx, defs, &breaktable_registry))?;
 
-                    let mut common_fields = Vec::new();
-                    let is_merge = existing.is_some();
-                    let rec_arc = if let Some(rec_arc) = existing {
-                        // Merge: apply field overrides directly to the
-                        // existing record instance.
-                        {
-                            let mut inst = rec_arc.write().await;
-                            if let Err(e) = db_loader::apply_fields(
-                                &mut inst.record,
-                                &def.fields,
-                                &mut common_fields,
-                            ) {
-                                return Err(format!("{e}"));
-                            }
-                        }
-                        rec_arc
-                    } else {
-                        let mut record = db_loader::create_record(&def.record_type)
-                            .map_err(|e| format!("{e}"))?;
-                        // The breakpoint-table registry is installed by the
-                        // creation sink; apply_fields only needs the LINR
-                        // index, already resolved above.
-                        if let Err(e) =
-                            db_loader::apply_fields(&mut record, &def.fields, &mut common_fields)
-                        {
-                            return Err(format!("{e}"));
-                        }
-                        // Record + its whole loaded field set in one call: the
-                        // sink applies the common fields and info tags, THEN
-                        // runs C's `iocInit` passes, so the initial UDF
-                        // severity sees the `.db`'s final UDF (a
-                        // `field(VAL,…)` clears it — `dbStaticLib.c:2653`).
-                        let load = RecordLoad {
-                            common_fields: std::mem::take(&mut common_fields),
-                            info_tags: def.info_tags.clone(),
-                        };
-                        if let Err(e) = ctx.db().add_loaded_record(&def.name, record, load).await {
-                            return Err(format!("dbLoadRecords: '{}' rejected: {e}", def.name));
-                        }
-                        ctx.db().get_record(&def.name).await.ok_or_else(|| {
-                            format!(
-                                "dbLoadRecords: '{}' vanished between add_record and get_record",
-                                def.name
-                            )
-                        })?
-                    };
+            ctx.println(&format!("Loaded {count} record(s) from {path}"));
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
 
-                    // Register any aliases declared in the record body
-                    // (epics-base PR #336). Failures are reported but
-                    // don't abort the load — the record is already in.
-                    // For a merge, aliases declared in the new block
-                    // are also registered (C parser appends).
-                    for alias in &def.aliases {
-                        if let Err(e) = ctx.db().add_alias(alias, &def.name).await {
-                            eprintln!(
-                                "dbLoadRecords: alias '{alias}' for '{}' rejected: {e}",
-                                def.name
-                            );
-                        }
-                    }
-
-                    // A MERGE re-applies the new block's fields to a record that
-                    // is already in the database and already initialised, so
-                    // the load-then-init ordering the creation sink guarantees
-                    // has to be re-created by hand here: fields first, passes
-                    // after. A fresh record took that ordering from the sink
-                    // and must not run the passes twice.
-                    if is_merge {
-                        let mut instance = rec_arc.write().await;
-                        // info(key, value) directives — last write
-                        // wins. Populated before common-field application
-                        // so device support seeing `init_record` can
-                        // observe info tags.
-                        for (k, v) in &def.info_tags {
-                            instance.set_info(k, v);
-                        }
-                        for (name, value) in common_fields {
-                            use crate::server::record::CommonFieldPutResult;
-                            // `.db` load: C's loader converter, whose menu
-                            // bound differs from a runtime dbPut's
-                            // (`dbStaticRun.c::dbPutStringNum`).
-                            match instance.put_common_field_db_load(&name, value) {
-                                Ok(CommonFieldPutResult::ScanChanged {
-                                    old_scan,
-                                    new_scan,
-                                    phas,
-                                }) => {
-                                    drop(instance);
-                                    ctx.db()
-                                        .update_scan_index(
-                                            &def.name, old_scan, new_scan, phas, phas,
-                                        )
-                                        .await;
-                                    instance = rec_arc.write().await;
-                                }
-                                Ok(CommonFieldPutResult::PhasChanged {
-                                    scan,
-                                    old_phas,
-                                    new_phas,
-                                }) => {
-                                    drop(instance);
-                                    ctx.db()
-                                        .update_scan_index(
-                                            &def.name, scan, scan, old_phas, new_phas,
-                                        )
-                                        .await;
-                                    instance = rec_arc.write().await;
-                                }
-                                Ok(CommonFieldPutResult::NoChange) => {}
-                                Err(e) => {
-                                    eprintln!(
-                                        "put_common_field({name}) failed for {}: {e}",
-                                        def.name
-                                    );
-                                }
-                            }
-                        }
-                        // TODO: refactor to global two-pass if inter-record init dependencies arise.
-                        // C `iocInit` calls init_record once per record AFTER
-                        // all dbLoadRecords blocks, so init_record always
-                        // sees the final merged field set. Rust shortcuts by
-                        // running init_record inline at dbLoadRecords; on a
-                        // merge we re-run it so the new field values
-                        // (LINR / ESLO / ZRST / ...) take effect in
-                        // convert routines and post-init derived state.
-                        // The cost: stateful records (compress accum,
-                        // first_output_done) get re-initialised. The
-                        // alternative (skip init on merge) silently
-                        // ignored field overrides that affect init —
-                        // worse for typical use.
-                        instance.run_init_passes(&def.name);
-                    }
-                    {
-                        // Hand the record its resolved common link fields so
-                        // a link-classifying record (calcout INAV..INUV/OUTV)
-                        // runs its C `init_record` checkLinks step at load —
-                        // the common OUT link is applied by the sink, after
-                        // `set_async_context`. Defaulted no-op for records
-                        // that do not classify common links.
-                        let mut instance = rec_arc.write().await;
-                        let inst = &mut *instance;
-                        inst.record.init_links(&inst.common);
-                    }
-                    // C `recGblInitConstantLink(&prec->inp, …)` /
-                    // `dbLoadLinkArray` from every soft INPUT dev support's
-                    // `init_record` — the only site that loads a constant INP
-                    // into the record's value.
-                    ctx.db().rec_gbl_init_constant_links(&rec_arc).await;
-                    // C `recGblInitSimm` + `recGblInitConstantLink(&siol, …,
-                    // &sval)`, run from every SIML-bearing `init_record`
-                    // (pass 1) — the only site that loads a constant
-                    // SIML/SIOL into SIMM/SVAL.
-                    ctx.db().rec_gbl_init_simm(&rec_arc).await;
-                    // C `wdogInit(prec)` from `init_record` pass 1
-                    // (histogramRecord.c:168) — arms the SDEL monitor
-                    // watchdog; a re-arm supersedes the previous one, which is
-                    // what the merge re-init above needs.
-                    ctx.db().arm_watchdog(&def.name).await;
-                    Ok(())
-                });
-                if let Err(e) = added {
-                    // epics-base 144f975: propagate the failure to the
-                    // iocsh script chain (equivalent of `iocshSetError`)
-                    // so a startup script returns non-zero on a rejected
-                    // record load. The printed message stays for
-                    // operator-visible diagnostics; the `Err` return
-                    // lets `execute_script` mark its `last_err`.
-                    ctx.println(&e);
-                    return Err(e);
+/// Build the DB include config from `EPICS_DB_INCLUDE_PATH` and resolve
+/// `path` against it: an existing path is used directly; otherwise a
+/// relative name is searched across the include paths (matching C
+/// `dbLoadRecords` search). Shared by `dbLoadRecords` and
+/// `dbLoadTemplate`.
+fn resolve_db_include_path(path: &str) -> (db_loader::DbLoadConfig, std::path::PathBuf) {
+    let include_paths: Vec<std::path::PathBuf> =
+        if let Ok(val) = std::env::var("EPICS_DB_INCLUDE_PATH") {
+            split_db_paths(&val)
+        } else {
+            Vec::new()
+        };
+    let config = db_loader::DbLoadConfig {
+        include_paths,
+        max_include_depth: 32,
+    };
+    let file_path = {
+        let p = std::path::Path::new(path);
+        if p.exists() {
+            p.to_path_buf()
+        } else if !p.is_absolute() {
+            // Search include paths for relative filenames
+            let mut resolved = None;
+            for dir in &config.include_paths {
+                let candidate = dir.join(p);
+                if candidate.exists() {
+                    resolved = Some(candidate);
+                    break;
                 }
             }
+            resolved.unwrap_or_else(|| p.to_path_buf())
+        } else {
+            p.to_path_buf()
+        }
+    };
+    (config, file_path)
+}
+
+/// Install each parsed record definition into the database through the
+/// one routine both `dbLoadRecords` and `dbLoadTemplate` share.
+///
+/// This is the extracted body of the old `dbLoadRecords` install loop:
+/// duplicate-name merge, field application, the creation sink's
+/// load-then-init ordering, alias registration, and the post-load link /
+/// SIMM / watchdog init passes — all identical for both commands so a
+/// template-loaded record is byte-for-byte the same as a directly loaded
+/// one. On the first rejected record it prints the C-visible diagnostic
+/// and propagates the error to the iocsh script chain (epics-base
+/// 144f975), exactly as the inline loop did.
+async fn install_record_defs(
+    ctx: &CommandContext,
+    defs: Vec<db_loader::DbRecordDef>,
+    breaktable_registry: &crate::server::cvt_bpt::BreakTableRegistry,
+) -> Result<(), String> {
+    for mut def in defs {
+        // Resolve a `LINR` field naming a loaded breakpoint table to its
+        // menuConvert index (shared with the IocBuilder load path).
+        db_loader::resolve_linr_breaktable_names(
+            &def.record_type,
+            &mut def.fields,
+            breaktable_registry,
+        );
+        let added: Result<(), String> = async {
+            // C-parity (dbLexRoutines.c:1170-1188): the SAME
+            // record name re-loaded with the SAME record_type
+            // merges fields into the existing instance (the
+            // standard ADCore convention — simDetector.template
+            // overrides ColorMode menu choices declared by its
+            // included NDArrayBase.template). A different
+            // record_type is fatal. `dbRecordsOnceOnly` global
+            // is not yet wired; tighten here if/when needed.
+            let existing = if let Some(rec) = ctx.db().get_record(&def.name).await {
+                let r = rec.read().await;
+                let existing_type = r.record.record_type();
+                if existing_type != def.record_type {
+                    return Err(format!(
+                        "dbLoadRecords: {} record '{}' already exists, can't load {} record",
+                        existing_type, def.name, def.record_type
+                    ));
+                }
+                drop(r);
+                Some(rec)
+            } else {
+                None
+            };
+
+            let mut common_fields = Vec::new();
+            let is_merge = existing.is_some();
+            let rec_arc = if let Some(rec_arc) = existing {
+                // Merge: apply field overrides directly to the
+                // existing record instance.
+                {
+                    let mut inst = rec_arc.write().await;
+                    if let Err(e) =
+                        db_loader::apply_fields(&mut inst.record, &def.fields, &mut common_fields)
+                    {
+                        return Err(format!("{e}"));
+                    }
+                }
+                rec_arc
+            } else {
+                let mut record =
+                    db_loader::create_record(&def.record_type).map_err(|e| format!("{e}"))?;
+                // The breakpoint-table registry is installed by the
+                // creation sink; apply_fields only needs the LINR
+                // index, already resolved above.
+                if let Err(e) =
+                    db_loader::apply_fields(&mut record, &def.fields, &mut common_fields)
+                {
+                    return Err(format!("{e}"));
+                }
+                // Record + its whole loaded field set in one call: the
+                // sink applies the common fields and info tags, THEN
+                // runs C's `iocInit` passes, so the initial UDF
+                // severity sees the `.db`'s final UDF (a
+                // `field(VAL,…)` clears it — `dbStaticLib.c:2653`).
+                let load = RecordLoad {
+                    common_fields: std::mem::take(&mut common_fields),
+                    info_tags: def.info_tags.clone(),
+                };
+                if let Err(e) = ctx.db().add_loaded_record(&def.name, record, load).await {
+                    return Err(format!("dbLoadRecords: '{}' rejected: {e}", def.name));
+                }
+                ctx.db().get_record(&def.name).await.ok_or_else(|| {
+                    format!(
+                        "dbLoadRecords: '{}' vanished between add_record and get_record",
+                        def.name
+                    )
+                })?
+            };
+
+            // Register any aliases declared in the record body
+            // (epics-base PR #336). Failures are reported but
+            // don't abort the load — the record is already in.
+            // For a merge, aliases declared in the new block
+            // are also registered (C parser appends).
+            for alias in &def.aliases {
+                if let Err(e) = ctx.db().add_alias(alias, &def.name).await {
+                    eprintln!(
+                        "dbLoadRecords: alias '{alias}' for '{}' rejected: {e}",
+                        def.name
+                    );
+                }
+            }
+
+            // A MERGE re-applies the new block's fields to a record that
+            // is already in the database and already initialised, so
+            // the load-then-init ordering the creation sink guarantees
+            // has to be re-created by hand here: fields first, passes
+            // after. A fresh record took that ordering from the sink
+            // and must not run the passes twice.
+            if is_merge {
+                let mut instance = rec_arc.write().await;
+                // info(key, value) directives — last write
+                // wins. Populated before common-field application
+                // so device support seeing `init_record` can
+                // observe info tags.
+                for (k, v) in &def.info_tags {
+                    instance.set_info(k, v);
+                }
+                for (name, value) in common_fields {
+                    use crate::server::record::CommonFieldPutResult;
+                    // `.db` load: C's loader converter, whose menu
+                    // bound differs from a runtime dbPut's
+                    // (`dbStaticRun.c::dbPutStringNum`).
+                    match instance.put_common_field_db_load(&name, value) {
+                        Ok(CommonFieldPutResult::ScanChanged {
+                            old_scan,
+                            new_scan,
+                            phas,
+                        }) => {
+                            drop(instance);
+                            ctx.db()
+                                .update_scan_index(&def.name, old_scan, new_scan, phas, phas)
+                                .await;
+                            instance = rec_arc.write().await;
+                        }
+                        Ok(CommonFieldPutResult::PhasChanged {
+                            scan,
+                            old_phas,
+                            new_phas,
+                        }) => {
+                            drop(instance);
+                            ctx.db()
+                                .update_scan_index(&def.name, scan, scan, old_phas, new_phas)
+                                .await;
+                            instance = rec_arc.write().await;
+                        }
+                        Ok(CommonFieldPutResult::NoChange) => {}
+                        Err(e) => {
+                            eprintln!("put_common_field({name}) failed for {}: {e}", def.name);
+                        }
+                    }
+                }
+                // TODO: refactor to global two-pass if inter-record init dependencies arise.
+                // C `iocInit` calls init_record once per record AFTER
+                // all dbLoadRecords blocks, so init_record always
+                // sees the final merged field set. Rust shortcuts by
+                // running init_record inline at dbLoadRecords; on a
+                // merge we re-run it so the new field values
+                // (LINR / ESLO / ZRST / ...) take effect in
+                // convert routines and post-init derived state.
+                // The cost: stateful records (compress accum,
+                // first_output_done) get re-initialised. The
+                // alternative (skip init on merge) silently
+                // ignored field overrides that affect init —
+                // worse for typical use.
+                instance.run_init_passes(&def.name);
+            }
+            {
+                // Hand the record its resolved common link fields so
+                // a link-classifying record (calcout INAV..INUV/OUTV)
+                // runs its C `init_record` checkLinks step at load —
+                // the common OUT link is applied by the sink, after
+                // `set_async_context`. Defaulted no-op for records
+                // that do not classify common links.
+                let mut instance = rec_arc.write().await;
+                let inst = &mut *instance;
+                inst.record.init_links(&inst.common);
+            }
+            // C `recGblInitConstantLink(&prec->inp, …)` /
+            // `dbLoadLinkArray` from every soft INPUT dev support's
+            // `init_record` — the only site that loads a constant INP
+            // into the record's value.
+            ctx.db().rec_gbl_init_constant_links(&rec_arc).await;
+            // C `recGblInitSimm` + `recGblInitConstantLink(&siol, …,
+            // &sval)`, run from every SIML-bearing `init_record`
+            // (pass 1) — the only site that loads a constant
+            // SIML/SIOL into SIMM/SVAL.
+            ctx.db().rec_gbl_init_simm(&rec_arc).await;
+            // C `wdogInit(prec)` from `init_record` pass 1
+            // (histogramRecord.c:168) — arms the SDEL monitor
+            // watchdog; a re-arm supersedes the previous one, which is
+            // what the merge re-init above needs.
+            ctx.db().arm_watchdog(&def.name).await;
+            Ok(())
+        }
+        .await;
+        if let Err(e) = added {
+            // epics-base 144f975: propagate the failure to the
+            // iocsh script chain (equivalent of `iocshSetError`)
+            // so a startup script returns non-zero on a rejected
+            // record load. The printed message stays for
+            // operator-visible diagnostics; the `Err` return
+            // lets `execute_script` mark its `last_err`.
+            ctx.println(&e);
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
+/// `dbLoadTemplate(subFile [, globalMacros])` — load records described by
+/// a `.substitutions` file. Mirrors EPICS base `dbLoadTemplate`, which
+/// drives `dbLoadRecords` once per substitution row: `subFile` names the
+/// `.substitutions` file; the optional `globalMacros` ("A=1,B=2") applies
+/// to every row, with each row's own substitutions taking precedence over
+/// a global of the same name.
+///
+/// Precedence is grounded in the reused loader: `emit_load`
+/// (db_loader/substitution.rs:423) builds each row's macro set as
+/// `globals` first then the row appended, and `load_substitution_file`
+/// (:449) inserts caller macros then per-row (globals + row) into a
+/// last-definition-wins map, so a row macro overrides the global — the C
+/// `dbLoadTemplate` order.
+fn cmd_db_load_template() -> CommandDef {
+    CommandDef::new(
+        "dbLoadTemplate",
+        vec![
+            ArgDesc {
+                name: "subFile",
+                arg_type: ArgType::String,
+                optional: false,
+            },
+            ArgDesc {
+                name: "globalMacros",
+                arg_type: ArgType::String,
+                optional: true,
+            },
+        ],
+        "dbLoadTemplate subFile [globalMacros] - Load records from a .substitutions file",
+        |args: &[ArgValue], ctx: &CommandContext| {
+            let path = match &args[0] {
+                ArgValue::String(s) => s,
+                _ => return Err("invalid argument".to_string()),
+            };
+            let macros_str = match &args[1] {
+                ArgValue::String(s) => s.as_str(),
+                _ => "",
+            };
+
+            // Same load-phase gate as `dbLoadRecords`: opens the load phase
+            // (idempotent across the several loads a script issues) and
+            // refuses with C's diagnostic once `iocInit` has run — C's
+            // `dbLoadTemplate` delegates to `dbReadDatabase`/`dbLoadRecords`,
+            // which fail identically after init (dbAccess.c:808-812).
+            if ctx.db().begin_load().is_err() {
+                return Err(format!(
+                    "Failed to load '{path}'\n    Records cannot be loaded after iocInit!"
+                ));
+            }
+
+            let macros = parse_macro_string(macros_str);
+
+            // Resolve the `.substitutions` file the same way `dbLoadRecords`
+            // resolves a `.db` file (existing path, else EPICS_DB_INCLUDE_PATH).
+            let (config, file_path) = resolve_db_include_path(path);
+
+            // `load_substitution_file` parses the `.substitutions` file, then
+            // for every template load it describes calls `parse_db_file` with
+            // the merged macro set (globals + row, row winning), concatenating
+            // the records — the same parser `dbLoadRecords` uses. No second
+            // substitutions parser.
+            let defs = db_loader::load_substitution_file(&file_path, &macros, &config)
+                .map_err(|e| format!("parse error: {e}"))?;
+
+            // `load_substitution_file` does not surface `breaktable(...)`
+            // definitions; snapshot the database's current registry (no
+            // mutation for an empty push) so a template whose `.db` uses a
+            // `LINR` table name loaded by an earlier `dbLoadRecords` still
+            // resolves it, matching that command's install path.
+            let breaktable_registry =
+                ctx.block_on(async { ctx.db().add_breaktables(vec![]).await });
+
+            let count = defs.len();
+
+            // Identical install path to `dbLoadRecords`: same duplicate-name
+            // merge, field application, load-then-init ordering and post-load
+            // passes, so a template-loaded record is indistinguishable from a
+            // directly loaded one.
+            ctx.block_on(install_record_defs(ctx, defs, &breaktable_registry))?;
 
             ctx.println(&format!("Loaded {count} record(s) from {path}"));
             Ok(CommandOutcome::Continue)
@@ -2586,5 +2699,263 @@ record(mbboDirect, "MBD0") {{ }}
                 "a bare mbboDirect has no DOL and no bits: C leaves it UDF=1"
             );
         });
+    }
+
+    // ---- dbLoadTemplate ----
+
+    /// Write `body` to `dir/name` and return the path.
+    fn write_file(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+        use std::io::Write;
+        let p = dir.join(name);
+        let mut f = std::fs::File::create(&p).unwrap();
+        f.write_all(body.as_bytes()).unwrap();
+        p
+    }
+
+    /// Drive the real `dbLoadTemplate` command over `sub_file`, optionally
+    /// with a `globalMacros` argument.
+    fn load_template(
+        ctx: &CommandContext,
+        sub_file: &std::path::Path,
+        global_macros: Option<&str>,
+    ) -> Result<(), String> {
+        let mut registry = CommandRegistry::new();
+        register_builtins(&mut registry);
+        let cmd = registry.get("dbLoadTemplate").unwrap();
+        let mut tokens = vec![sub_file.to_string_lossy().to_string()];
+        if let Some(g) = global_macros {
+            tokens.push(g.to_string());
+        }
+        let args = parse_args(&tokens, &cmd.args).unwrap();
+        cmd.handler.call(&args, ctx).map(|_| ())
+    }
+
+    /// Read a record's `VAL` as f64 (ai stores it as `Double`).
+    fn ai_val(db: &PvDatabase, ctx: &CommandContext, name: &str) -> f64 {
+        ctx.block_on(async {
+            let rec = db
+                .get_record(name)
+                .await
+                .unwrap_or_else(|| panic!("record '{name}' does not exist"));
+            let r = rec.read().await;
+            match r.record.get_field("VAL") {
+                Some(EpicsValue::Double(d)) => d,
+                other => panic!("unexpected VAL for '{name}': {other:?}"),
+            }
+        })
+    }
+
+    /// A `.substitutions` fixture with per-row macros expands to one record
+    /// per row, each with its own macros substituted into name and fields.
+    #[test]
+    fn db_load_template_expands_rows_with_per_row_macros() {
+        let (db, ctx) = make_ctx();
+        let dir = tempfile::tempdir().unwrap();
+        write_file(
+            dir.path(),
+            "a.db",
+            r#"record(ai, "$(P)AI$(N)") { field(VAL, "$(V)") }"#,
+        );
+        let subs = write_file(
+            dir.path(),
+            "a.substitutions",
+            r#"
+file "a.db" {
+    pattern { P, N, V }
+        { "IOC:", "1", "1.5" }
+        { "IOC:", "2", "2.5" }
+}
+"#,
+        );
+
+        load_template(&ctx, &subs, None).expect("template load");
+
+        assert!(exists(&db, &ctx, "IOC:AI1"), "row 1 expands to IOC:AI1");
+        assert!(exists(&db, &ctx, "IOC:AI2"), "row 2 expands to IOC:AI2");
+        assert!(!exists(&db, &ctx, "IOC:AI3"), "only two rows");
+        assert_eq!(ai_val(&db, &ctx, "IOC:AI1"), 1.5, "row 1 V substituted");
+        assert_eq!(ai_val(&db, &ctx, "IOC:AI2"), 2.5, "row 2 V substituted");
+    }
+
+    /// `globalMacros` applies to every row; a row-level macro of the same
+    /// name overrides the global. Grounded in the reused loader:
+    /// `load_substitution_file` (substitution.rs:449) inserts the caller
+    /// macros (the command's `globalMacros`) first, then each row's macros
+    /// into a last-definition-wins map, so the row wins — the C
+    /// `dbLoadTemplate` precedence (see the loader-level regression
+    /// `load_substitution_file_caller_macros_overridden_by_row`).
+    #[test]
+    fn db_load_template_global_macros_apply_and_row_overrides() {
+        let (db, ctx) = make_ctx();
+        let dir = tempfile::tempdir().unwrap();
+        write_file(
+            dir.path(),
+            "b.db",
+            r#"record(ai, "$(P)AI$(N)") { field(VAL, "$(V)") }"#,
+        );
+        // Row 1 overrides the global V; row 2 omits V and inherits the global.
+        let subs = write_file(
+            dir.path(),
+            "b.substitutions",
+            r#"
+file "b.db" {
+    { N=1, V=1 }
+    { N=2 }
+}
+"#,
+        );
+
+        load_template(&ctx, &subs, Some("V=9,P=IOC:")).expect("template load");
+
+        // P applied to both rows (global reaches every row).
+        assert!(exists(&db, &ctx, "IOC:AI1"), "global P reaches row 1");
+        assert!(exists(&db, &ctx, "IOC:AI2"), "global P reaches row 2");
+        assert_eq!(
+            ai_val(&db, &ctx, "IOC:AI1"),
+            1.0,
+            "row-level V=1 overrides the global V=9"
+        );
+        assert_eq!(
+            ai_val(&db, &ctx, "IOC:AI2"),
+            9.0,
+            "row 2 has no V, so the global V=9 applies"
+        );
+    }
+
+    /// Parity: records loaded by `dbLoadTemplate` are identical to the ones
+    /// produced by the equivalent hand-written `dbLoadRecords` calls — both
+    /// commands install through `install_record_defs`, and the substitutions
+    /// loader parses each template through the same `parse_db_file` as
+    /// `dbLoadRecords`.
+    #[test]
+    fn db_load_template_parity_with_hand_written_db_load_records() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(
+            dir.path(),
+            "p.db",
+            r#"record(ai, "$(P)AI$(N)") { field(VAL, "$(V)") field(EGU, "$(EGU)") }"#,
+        );
+        let subs = write_file(
+            dir.path(),
+            "p.substitutions",
+            r#"
+file "p.db" {
+    pattern { P, N, V, EGU }
+        { "IOC:", "1", "1.5", "volts" }
+        { "IOC:", "2", "2.5", "amps" }
+}
+"#,
+        );
+
+        // Template path.
+        let (db_t, ctx_t) = make_ctx();
+        load_template(&ctx_t, &subs, None).expect("template load");
+
+        // Hand-expanded dbLoadRecords path — the exact rows the template yields.
+        let (db_r, ctx_r) = make_ctx();
+        load_records(
+            &ctx_r,
+            r#"
+record(ai, "IOC:AI1") { field(VAL, "1.5") field(EGU, "volts") }
+record(ai, "IOC:AI2") { field(VAL, "2.5") field(EGU, "amps") }
+"#,
+        )
+        .expect("hand-written load");
+
+        // Every field-visible property must match record-for-record.
+        for name in ["IOC:AI1", "IOC:AI2"] {
+            ctx_t.block_on(async {
+                let rt = db_t.get_record(name).await.expect("template record");
+                let rr = db_r.get_record(name).await.expect("hand record");
+                let rt = rt.read().await;
+                let rr = rr.read().await;
+                assert_eq!(
+                    rt.record.record_type(),
+                    rr.record.record_type(),
+                    "{name}: record type parity"
+                );
+                assert_eq!(
+                    rt.record.get_field("VAL"),
+                    rr.record.get_field("VAL"),
+                    "{name}: VAL parity"
+                );
+                assert_eq!(
+                    rt.record.get_field("EGU"),
+                    rr.record.get_field("EGU"),
+                    "{name}: EGU parity"
+                );
+                assert_eq!(rt.common.udf, rr.common.udf, "{name}: UDF parity");
+            });
+        }
+    }
+
+    /// A missing `.substitutions` file returns an error, not a panic.
+    #[test]
+    fn db_load_template_file_not_found_errors() {
+        let (db, ctx) = make_ctx();
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope.substitutions");
+
+        let err = load_template(&ctx, &missing, None)
+            .expect_err("a nonexistent substitutions file must error");
+        assert!(
+            err.contains("parse error"),
+            "expected a parse error, got: {err}"
+        );
+        assert!(!exists(&db, &ctx, "IOC:AI1"), "nothing is created on error");
+    }
+
+    /// A malformed `.substitutions` file returns an error, not a panic.
+    #[test]
+    fn db_load_template_malformed_substitutions_errors() {
+        let (_db, ctx) = make_ctx();
+        let dir = tempfile::tempdir().unwrap();
+        // `{ A=1 }` with no enclosing `file "..." { }` — the parser rejects a
+        // row block that is missing the `file` keyword.
+        let subs = write_file(dir.path(), "bad.substitutions", "{ A=1 }\n");
+
+        let err = load_template(&ctx, &subs, None)
+            .expect_err("a malformed substitutions file must error");
+        assert!(
+            err.contains("parse error"),
+            "expected a parse error, got: {err}"
+        );
+    }
+
+    /// The command is registered under its EPICS-base name.
+    #[test]
+    fn db_load_template_is_registered() {
+        let mut registry = CommandRegistry::new();
+        register_builtins(&mut registry);
+        assert!(registry.list().contains(&"dbLoadTemplate"));
+    }
+
+    /// Boundary: `dbLoadTemplate` is refused after `iocInit` with C's
+    /// diagnostic and creates nothing — the same load-phase gate as
+    /// `dbLoadRecords`.
+    #[test]
+    fn db_load_template_after_ioc_init_is_refused_and_creates_nothing() {
+        let (db, ctx) = make_ctx();
+        let dir = tempfile::tempdir().unwrap();
+        write_file(
+            dir.path(),
+            "t.db",
+            r#"record(ai, "$(N)") { field(VAL, "1") }"#,
+        );
+        let subs = write_file(
+            dir.path(),
+            "t.substitutions",
+            r#"file "t.db" { { N=LATER } }"#,
+        );
+
+        ctx.block_on(db.ioc_init());
+
+        let err =
+            load_template(&ctx, &subs, None).expect_err("C refuses a load once the IOC is running");
+        assert!(
+            err.contains("Records cannot be loaded after iocInit!"),
+            "expected C's diagnostic; got {err}"
+        );
+        assert!(!exists(&db, &ctx, "LATER"), "no record may be created");
     }
 }

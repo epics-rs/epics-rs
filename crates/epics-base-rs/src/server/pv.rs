@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use crate::runtime::sync::{Mutex, RwLock};
+use crate::runtime::sync::Mutex;
 
 use crate::error::CaError;
 use crate::server::event_queue::{EventReader, EventSink, EventUser, PostOutcome};
@@ -312,7 +312,14 @@ struct PostedMeta {
 /// A process variable hosted by the server.
 pub struct ProcessVariable {
     pub name: String,
-    pub value: RwLock<EpicsValue>,
+    /// The stored value. A synchronous `parking_lot::RwLock` (matching the
+    /// sibling `posted_meta` / `metadata` / hook locks): every access is a
+    /// single-expression read-or-write with no `.await` held across the
+    /// guard, so the value-read path (`get`, `snapshot`) is pure lock work
+    /// with no reactor dependency — the sans-io READ path. The write side
+    /// (`set` / `set_snapshot`) still `.await`s the monitor fan-out, but
+    /// drops this guard first.
+    pub value: parking_lot::RwLock<EpicsValue>,
     pub subscribers: Mutex<Vec<Subscriber>>,
     /// Sticky metadata of the last full-snapshot write. `None` until a
     /// [`Self::set_snapshot`] lands; a value-only [`Self::set`] clears it
@@ -360,7 +367,7 @@ impl ProcessVariable {
     pub fn new(name: String, initial: EpicsValue) -> Self {
         Self {
             name,
-            value: RwLock::new(initial),
+            value: parking_lot::RwLock::new(initial),
             subscribers: Mutex::new(Vec::new()),
             metadata: parking_lot::RwLock::new(PvMetadata::default()),
             posted_meta: parking_lot::RwLock::new(None),
@@ -468,8 +475,11 @@ impl ProcessVariable {
     }
 
     /// Get the current value.
-    pub async fn get(&self) -> EpicsValue {
-        self.value.read().await.clone()
+    ///
+    /// Synchronous: a single-expression read-lock clone with no `.await`,
+    /// so the value-read path carries no reactor dependency (sans-io).
+    pub fn get(&self) -> EpicsValue {
+        self.value.read().clone()
     }
 
     /// Build a Snapshot for this bare PV.
@@ -486,8 +496,8 @@ impl ProcessVariable {
     /// own alarm/metadata. The only path that injects a non-zero alarm
     /// onto a bare PV is [`Self::post_alarm`] (used by the gateway
     /// adapter to surface upstream disconnect).
-    pub async fn snapshot(&self) -> Snapshot {
-        let value = self.value.read().await.clone();
+    pub fn snapshot(&self) -> Snapshot {
+        let value = self.value.read().clone();
         // Serve the sticky metadata of the last full-snapshot write if
         // one landed (pvxs mailbox parity: a posted full Value stays the
         // current value, alarm/time included); otherwise the bare-PV
@@ -544,14 +554,14 @@ impl ProcessVariable {
                 self.apply_metadata(&mut snap);
                 Ok(snap)
             }
-            None => Ok(self.snapshot().await),
+            None => Ok(self.snapshot()),
         }
     }
 
     /// Set a new value and notify all subscribers.
     pub async fn set(&self, new_value: EpicsValue) {
         {
-            let mut val = self.value.write().await;
+            let mut val = self.value.write();
             *val = new_value.clone();
         }
         // A plain value write carries no explicit alarm/time — revert to
@@ -568,7 +578,7 @@ impl ProcessVariable {
     /// C ca-gateway: the incoming `dbr_time_xxx` GDD carries all three fields.
     pub async fn set_snapshot(&self, snapshot: Snapshot) {
         {
-            let mut val = self.value.write().await;
+            let mut val = self.value.write();
             *val = snapshot.value.clone();
         }
         // Persist the posted alarm/time/userTag so a later GET reflects
@@ -645,7 +655,7 @@ impl ProcessVariable {
     /// alternative discussed in the C++ ca-gateway audit.
     pub async fn post_alarm(&self, severity: u16, status: u16) {
         use crate::server::recgbl::EventMask;
-        let value = self.value.read().await.clone();
+        let value = self.value.read().clone();
         let mut snapshot = Snapshot::new(value, status, severity, crate::runtime::time::now_wall());
         self.apply_metadata(&mut snapshot);
         // ALARM|LOG so DBE_LOG (archiver) subscribers receive alarm events.
@@ -922,7 +932,7 @@ mod mask_gate_tests {
         snap.user_tag = 9;
         pv.set_snapshot(snap).await;
 
-        let got = pv.snapshot().await;
+        let got = pv.snapshot();
         assert_eq!(got.value, EpicsValue::Double(7.0), "value persisted");
         assert_eq!(got.alarm.status, 3, "alarm.status persisted to GET");
         assert_eq!(got.alarm.severity, 2, "alarm.severity persisted to GET");
@@ -931,7 +941,7 @@ mod mask_gate_tests {
 
         // A plain value write reverts to the bare-PV default.
         pv.set(EpicsValue::Double(8.0)).await;
-        let after = pv.snapshot().await;
+        let after = pv.snapshot();
         assert_eq!(after.value, EpicsValue::Double(8.0));
         assert_eq!(after.alarm.status, 0, "value set clears posted alarm");
         assert_eq!(after.alarm.severity, 0, "value set clears posted severity");
@@ -1229,11 +1239,11 @@ mod metadata_tests {
     async fn set_metadata_serves_on_get_snapshot() {
         let pv = pv();
         assert!(
-            pv.snapshot().await.display.is_none(),
+            pv.snapshot().display.is_none(),
             "bare PV must carry no metadata before install"
         );
         pv.set_metadata(meta());
-        let snap = pv.snapshot().await;
+        let snap = pv.snapshot();
         let d = snap.display.expect("display installed");
         assert_eq!(d.units, "degC");
         assert_eq!(d.precision, 2);
@@ -1394,7 +1404,7 @@ mod read_hook_tests {
     async fn read_snapshot_without_hook_equals_snapshot() {
         let pv = pv();
         let read = pv.read_snapshot().await.expect("no-hook read never errors");
-        let stored = pv.snapshot().await;
+        let stored = pv.snapshot();
         assert_eq!(read.value, stored.value);
         assert_eq!(read.value, EpicsValue::Double(1.0));
     }
@@ -1452,7 +1462,7 @@ mod read_hook_tests {
                 ))
             })
         }));
-        let snap = pv.snapshot().await;
+        let snap = pv.snapshot();
         assert_eq!(
             snap.value,
             EpicsValue::Double(7.0),

@@ -489,7 +489,7 @@ impl PvDatabase {
 
         // Check simple PVs first (exact match)
         if let Some(pv) = self.inner.simple_pvs.read().await.get(name) {
-            return Ok(pv.get().await);
+            return Ok(pv.get());
         }
 
         // Records — alias-aware via `get_record` (epics-base PR #336).
@@ -2227,7 +2227,7 @@ mod tests {
 
         // Value actually landed.
         let pv = db.find_pv("gw:test").await.expect("PV exists");
-        assert!(matches!(pv.get().await, EpicsValue::Double(v) if v == 42.0));
+        assert!(matches!(pv.get(), EpicsValue::Double(v) if v == 42.0));
     }
 
     /// Regression: `get_pv`, `put_pv`, `put_pv_and_post`,

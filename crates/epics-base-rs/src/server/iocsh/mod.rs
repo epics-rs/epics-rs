@@ -323,20 +323,26 @@ impl IocShell {
     /// setup when not interactive"). Avoids `epics> ` prompt noise in
     /// the captured stderr stream when an operator pipes a script in.
     pub fn run_repl(&self) -> Result<(), String> {
-        use std::io::IsTerminal;
-        // C `epicsReadline.c:48` — `IOCSH_HISTEDIT_DISABLE` set (to anything
-        // non-empty) means "do not use readline or equivalent", so the line
-        // editor is never started and lines come straight off stdin.
-        let histedit_disabled = crate::runtime::env_table::IOCSH_HISTEDIT_DISABLE
-            .get()
-            .is_some();
-        if std::io::stdin().is_terminal() && !histedit_disabled {
-            self.run_repl_interactive()
-        } else {
-            self.run_repl_piped()
+        // The interactive rustyline editor is host-only (rustyline pulls `nix`,
+        // which does not build for RTEMS). On RTEMS the piped-stdin REPL is the
+        // only path until the RTEMS iocsh wiring lands (a later increment).
+        #[cfg(not(target_os = "rtems"))]
+        {
+            use std::io::IsTerminal;
+            // C `epicsReadline.c:48` — `IOCSH_HISTEDIT_DISABLE` set (to anything
+            // non-empty) means "do not use readline or equivalent", so the line
+            // editor is never started and lines come straight off stdin.
+            let histedit_disabled = crate::runtime::env_table::IOCSH_HISTEDIT_DISABLE
+                .get()
+                .is_some();
+            if std::io::stdin().is_terminal() && !histedit_disabled {
+                return self.run_repl_interactive();
+            }
         }
+        self.run_repl_piped()
     }
 
+    #[cfg(not(target_os = "rtems"))]
     fn run_repl_interactive(&self) -> Result<(), String> {
         // C `gnuReadline.c:49-54`:
         //     long i = 50;                                 /* the table default */

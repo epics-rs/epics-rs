@@ -130,7 +130,7 @@ record(ownsOut, "SCALER:1") {{
         .get_record("SCALER:1")
         .await
         .expect("record loaded");
-    let instance = instance.read().await;
+    let instance = instance.read();
     assert_eq!(
         instance.record.get_field("OUT"),
         Some(EpicsValue::String(OUT_LINK.into()))
@@ -167,7 +167,7 @@ record(ownsOut, "SCALER:2") {
         .get_record("SCALER:2")
         .await
         .expect("record loaded");
-    let instance = instance.read().await;
+    let instance = instance.read();
 
     // Link text: populated, so device support sees it.
     assert_eq!(instance.common.out, "TARGET:PV PP");

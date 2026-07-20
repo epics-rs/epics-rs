@@ -56,7 +56,6 @@ async fn scalcout_odly_holds_pact_foreign_process_does_not_fire_early() {
             .await
             .unwrap()
             .read()
-            .await
             .record
             .get_field("DLYA"),
         Some(EpicsValue::Short(1)),

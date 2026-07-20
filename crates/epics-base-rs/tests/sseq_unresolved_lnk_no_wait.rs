@@ -89,7 +89,6 @@ async fn r17_3_a_wait_step_with_an_unresolvable_lnk_never_raises_wtg() {
         .await
         .unwrap()
         .write()
-        .await
         .add_subscriber(
             "WTG1",
             1,

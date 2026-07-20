@@ -40,12 +40,12 @@ async fn process(db: &PvDatabase, name: &str) {
 }
 
 async fn udf(db: &PvDatabase, name: &str) -> bool {
-    db.get_record(name).await.unwrap().read().await.common.udf != 0
+    db.get_record(name).await.unwrap().read().common.udf != 0
 }
 
 async fn alarm(db: &PvDatabase, name: &str) -> (AlarmSeverity, u16) {
     let g = db.get_record(name).await.unwrap();
-    let g = g.read().await;
+    let g = g.read();
     (g.common.sevr, g.common.stat)
 }
 
@@ -67,7 +67,6 @@ async fn r11_c13_a_nan_result_clears_udf_and_raises_no_alarm() {
         .await
         .unwrap()
         .read()
-        .await
         .record
         .get_field("VAL");
     match val {

@@ -30,7 +30,7 @@
 //! Rust port
 //! ---------
 //! `epics-base-rs` stores each record behind its own
-//! `RwLock<RecordInstance>`, but the put/process helpers
+//! `parking_lot::RwLock<RecordInstance>`, but the put/process helpers
 //! (`put_record_field_from_ca`, `put_pv`, `process_record`,
 //! `process_record_with_links`) acquire that `RwLock` *internally*
 //! and recurse into link targets, so a caller cannot hold N
@@ -58,7 +58,7 @@
 //! the `DBManyLock` exclusion that earlier review found missing.
 //!
 //! The gate is *advisory*: it does not replace the per-record
-//! `RwLock<RecordInstance>` that still guards the record's data. It
+//! `parking_lot::RwLock<RecordInstance>` that still guards the record's data. It
 //! is an additional serialization layer that the multi-record
 //! transaction owner and the single-record writers both honour,
 //! exactly as `dbScanLock` is a layer above the record's own field

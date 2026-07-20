@@ -46,7 +46,6 @@ async fn field(db: &PvDatabase, rec: &str, f: &str) -> EpicsValue {
         .await
         .unwrap_or_else(|| panic!("{rec} missing"))
         .read()
-        .await
         .record
         .get_field(f)
         .unwrap_or_else(|| panic!("{rec}.{f} missing"))
@@ -103,7 +102,6 @@ async fn calcout_reseed_posts_the_value_field() {
     let inst = db.get_record("CO").await.unwrap();
     let mut b_rx = inst
         .write()
-        .await
         .add_subscriber("B", 1, DbFieldType::Double, EventMask::VALUE.bits())
         .expect("a B subscription must be accepted");
 
@@ -220,7 +218,6 @@ async fn transform_put_to_a_constant_inp_reseeds_and_posts_value_log() {
     let inst = db.get_record("T").await.unwrap();
     let mut b_rx = inst
         .write()
-        .await
         .add_subscriber(
             "B",
             1,

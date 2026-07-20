@@ -32,7 +32,7 @@ async fn process(db: &PvDatabase, name: &str) {
 
 async fn alarm_of(db: &PvDatabase, name: &str) -> (u16, AlarmSeverity) {
     let rec = db.get_record(name).await.expect("record exists");
-    let inst = rec.read().await;
+    let inst = rec.read();
     (inst.common.stat, inst.common.sevr)
 }
 

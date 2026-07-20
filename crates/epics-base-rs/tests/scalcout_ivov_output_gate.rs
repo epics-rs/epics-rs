@@ -40,7 +40,7 @@ async fn scalcout_ivov_drives_oval_not_val_on_calc_fail() {
         .unwrap();
 
     let rec = db.get_record("SC_IVOV").await.unwrap();
-    let inst = rec.read().await;
+    let inst = rec.read();
 
     // Precondition: the cycle is INVALID and output is due — the IVOA trigger.
     assert_eq!(

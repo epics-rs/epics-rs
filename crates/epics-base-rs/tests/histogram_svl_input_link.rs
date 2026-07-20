@@ -89,14 +89,7 @@ async fn constant_svl_seeds_sgnl_at_init_without_counting() {
     );
     assert_eq!(bins(&db, "H:CONST").await, vec![0, 0, 0, 0]);
     assert!(
-        db.get_record("H:CONST")
-            .await
-            .unwrap()
-            .read()
-            .await
-            .common
-            .udf
-            == 0,
+        db.get_record("H:CONST").await.unwrap().read().common.udf == 0,
         "a histogram seeded from a constant SVL is DEFINED"
     );
 }
@@ -185,7 +178,6 @@ record(histogram, "H:INP") {
         .await
         .unwrap()
         .read()
-        .await
         .common
         .inp
         .clone();

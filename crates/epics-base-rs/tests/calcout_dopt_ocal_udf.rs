@@ -37,7 +37,7 @@ async fn calcout_dopt_use_ocal_nan_oval_raises_udf_alarm() {
         .unwrap();
 
     let rec = db.get_record("CO_OCAL_NAN").await.unwrap();
-    let inst = rec.read().await;
+    let inst = rec.read();
 
     // VAL is finite, OVAL is NaN → C raises UDF_ALARM at INVALID severity.
     assert_eq!(
@@ -92,7 +92,7 @@ async fn calcout_dopt_use_ocal_nan_val_finite_oval_stays_invalid() {
         .unwrap();
 
     let rec = db.get_record("CO_NANVAL").await.unwrap();
-    let inst = rec.read().await;
+    let inst = rec.read();
 
     assert_eq!(
         inst.common.sevr,
@@ -128,7 +128,7 @@ async fn calcout_dopt_use_ocal_both_finite_no_alarm() {
         .unwrap();
 
     let rec = db.get_record("CO_BOTHFIN").await.unwrap();
-    let inst = rec.read().await;
+    let inst = rec.read();
 
     assert_eq!(
         inst.common.sevr,

@@ -30,7 +30,7 @@ use std::collections::HashSet;
 
 async fn field(db: &PvDatabase, rec: &str, f: &str) -> EpicsValue {
     let r = db.get_record(rec).await.unwrap();
-    let inst = r.read().await;
+    let inst = r.read();
     inst.record.get_field(f).unwrap()
 }
 

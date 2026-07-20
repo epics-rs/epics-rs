@@ -32,7 +32,6 @@ async fn field(db: &PvDatabase, rec: &str, f: &str) -> f64 {
         .await
         .unwrap()
         .read()
-        .await
         .record
         .get_field(f)
         .unwrap_or_else(|| panic!("T.{f} missing"))

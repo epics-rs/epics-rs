@@ -133,7 +133,7 @@ async fn pini_records_returns_load_order() {
             .unwrap();
         let rec = db.get_record(name).await.unwrap();
         // r6: `pini` is the `menuPini` index (i16), not a bool. YES = 1.
-        rec.write().await.common.pini = PiniMode::Yes.to_u16() as i16;
+        rec.write().common.pini = PiniMode::Yes.to_u16() as i16;
     }
 
     assert_eq!(

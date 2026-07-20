@@ -48,7 +48,6 @@ async fn sseq_val_posts_every_process_including_the_unchanged_repeat() {
 
     let mut val_rx = inst
         .write()
-        .await
         .add_subscriber("VAL", 1, DbFieldType::Long, full())
         .unwrap();
 

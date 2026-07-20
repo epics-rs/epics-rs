@@ -37,13 +37,13 @@ async fn process(db: &PvDatabase, rec: &str) {
 
 async fn val(db: &PvDatabase, rec: &str) -> f64 {
     let inst = db.get_record(rec).await.unwrap();
-    let g = inst.read().await;
+    let g = inst.read();
     g.record.get_field("VAL").unwrap().to_f64().unwrap()
 }
 
 async fn sevr(db: &PvDatabase, rec: &str) -> AlarmSeverity {
     let inst = db.get_record(rec).await.unwrap();
-    let g = inst.read().await;
+    let g = inst.read();
     g.common.sevr
 }
 
@@ -77,7 +77,7 @@ async fn r9_73_calc_freezes_val_when_an_input_link_fails() {
     // The inputs that DID resolve still refreshed: C's calc fetch loop does not
     // abort, it only remembers the first failing status.
     let inst = db.get_record("C").await.unwrap();
-    let a = inst.read().await.record.get_field("A").unwrap();
+    let a = inst.read().record.get_field("A").unwrap();
     assert_eq!(
         a,
         EpicsValue::Double(2.0),
@@ -108,7 +108,6 @@ async fn r9_73_calcout_freezes_val_and_outputs_the_frozen_value() {
         .await
         .unwrap()
         .write()
-        .await
         .put_common_field("OUT", EpicsValue::String("SINK".into()))
         .unwrap();
 
@@ -174,7 +173,6 @@ async fn r9_73_acalcout_freezes_val_and_writes_no_output() {
         .await
         .unwrap()
         .write()
-        .await
         .put_common_field("OUT", EpicsValue::String("SINK".into()))
         .unwrap();
 

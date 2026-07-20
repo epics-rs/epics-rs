@@ -32,14 +32,14 @@ async fn caput(db: &PvDatabase, field: &str, text: &str) -> Result<(), String> {
 /// The raw stored field value (not the CA-served projection).
 async fn stored(db: &PvDatabase, field: &str) -> EpicsValue {
     let rec = db.get_record("REC").await.unwrap();
-    let inst = rec.read().await;
+    let inst = rec.read();
     inst.record.get_field(field).unwrap()
 }
 
 /// (stat, sevr) after the last put/process cycle.
 async fn alarm(db: &PvDatabase) -> (u16, AlarmSeverity) {
     let rec = db.get_record("REC").await.unwrap();
-    let inst = rec.read().await;
+    let inst = rec.read();
     (inst.common.stat, inst.common.sevr)
 }
 

@@ -56,7 +56,7 @@ impl PvDatabase {
             None => return,
         };
         let (cur_scan, cur_phas) = {
-            let inst = rec_arc.read().await;
+            let inst = rec_arc.read();
             (inst.common.scan, inst.common.phas)
         };
         // C `scanAdd` refuses both `Passive` and an out-of-menu index — the
@@ -122,7 +122,7 @@ impl PvDatabase {
     pub async fn pini_records(&self, mode: PiniMode) -> Vec<String> {
         let mut result = Vec::new();
         for (name, rec) in self.records_in_load_order().await {
-            if rec.read().await.common.pini == mode.to_u16() as i16 {
+            if rec.read().common.pini == mode.to_u16() as i16 {
                 result.push(name);
             }
         }
@@ -140,10 +140,7 @@ impl PvDatabase {
     /// caller takes any per-record lock.
     async fn records_in_load_order(
         &self,
-    ) -> Vec<(
-        String,
-        std::sync::Arc<crate::runtime::sync::RwLock<RecordInstance>>,
-    )> {
+    ) -> Vec<(String, std::sync::Arc<parking_lot::RwLock<RecordInstance>>)> {
         let snapshot: Vec<_> = {
             let records = self.inner.records.read().await;
             records
@@ -200,7 +197,7 @@ impl PvDatabase {
             // than sorting once.
             for (name, rec) in self.records_in_load_order().await {
                 let (pini, phas) = {
-                    let instance = rec.read().await;
+                    let instance = rec.read();
                     (instance.common.pini, i32::from(instance.common.phas))
                 };
                 if pini != mode.to_u16() as i16 {
@@ -255,7 +252,7 @@ impl PvDatabase {
             // event name. Records that do not match are skipped — a
             // record configured `EVNT=5` only fires on event 5.
             let evnt = match self.get_record(name).await {
-                Some(rec) => rec.read().await.common.evnt.clone(),
+                Some(rec) => rec.read().common.evnt.clone(),
                 None => continue,
             };
             if normalize_event_name(&evnt) != want {

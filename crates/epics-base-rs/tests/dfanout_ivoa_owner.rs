@@ -68,7 +68,7 @@ async fn add_dfanout(db: &PvDatabase, ivoa: i16, invalid: bool, outa: &str) {
     // `record(dfanout,"DFBU"){field(SELM,"Specified") field(SELN,"99")}`
     // reports INVALID/UDF, while the same record with `field(VAL,"1")` reports
     // INVALID/SOFT.
-    db.get_record("DF").await.unwrap().write().await.common.udf = 0;
+    db.get_record("DF").await.unwrap().write().common.udf = 0;
 }
 
 /// Boundary 1 — INVALID cycle, IVOA=Set_output_to_IVOV: the targets get IVOV,
@@ -86,7 +86,6 @@ async fn r15_65_ivoa_ivov_overwrites_val_and_posts_it() {
         .await
         .unwrap()
         .write()
-        .await
         .add_subscriber(
             "VAL",
             1,
@@ -128,7 +127,7 @@ async fn r15_65_a_failed_push_does_not_retro_trigger_the_ivov_arm() {
     process(&db, "DF").await;
 
     assert_eq!(
-        db.get_record("DF").await.unwrap().read().await.common.sevr,
+        db.get_record("DF").await.unwrap().read().common.sevr,
         AlarmSeverity::Invalid,
         "precondition: the failed OUTA put alarms the record (dbLink.c:444-446)"
     );

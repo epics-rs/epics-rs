@@ -175,7 +175,7 @@ async fn a_runtime_put_of_a_link_the_device_cannot_take_is_refused_too() {
         .unwrap();
 
     let rec = database.get_record("AI:RT").await.unwrap();
-    let mut inst = rec.write().await;
+    let mut inst = rec.write();
     let err = inst
         .put_common_field("INP", EpicsValue::String("5".into()))
         .expect_err("an INST_IO device support cannot take a constant INP, at load OR at runtime");

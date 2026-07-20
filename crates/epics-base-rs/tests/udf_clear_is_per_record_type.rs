@@ -53,7 +53,7 @@ async fn process(db: &PvDatabase, name: &str) {
 
 async fn state(db: &PvDatabase, name: &str) -> (bool, AlarmSeverity, u16) {
     let rec = db.get_record(name).await.unwrap();
-    let inst = rec.read().await;
+    let inst = rec.read();
     (inst.common.udf != 0, inst.common.sevr, inst.common.stat)
 }
 
@@ -88,7 +88,7 @@ async fn dfanout_with_closed_loop_dol_is_defined() {
     {
         // an ai that has been read is defined
         let rec = db.get_record("SRC").await.unwrap();
-        rec.write().await.common.udf = 0;
+        rec.write().common.udf = 0;
     }
     db.add_record("DF2", Box::new(DfanoutRecord::new(0.0)))
         .await

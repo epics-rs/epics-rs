@@ -46,7 +46,7 @@ async fn caput_val(db: &PvDatabase, text: &str) {
 
 async fn stored_val(db: &PvDatabase) -> EpicsValue {
     let rec = db.get_record("REC").await.unwrap();
-    let inst = rec.read().await;
+    let inst = rec.read();
     inst.record.get_field("VAL").unwrap()
 }
 
@@ -56,7 +56,6 @@ async fn per_put_value_events(db: &PvDatabase) -> usize {
     let inst = db.get_record("REC").await.unwrap();
     let mut rx = inst
         .write()
-        .await
         .add_subscriber(
             "VAL",
             1,

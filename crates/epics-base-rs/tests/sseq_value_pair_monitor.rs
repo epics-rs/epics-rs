@@ -64,7 +64,7 @@ async fn r17_4_a_do_put_posts_the_derived_string_with_a_bare_value_mask() {
     let inst = db.get_record("VP").await.unwrap();
 
     let (mut do_rx, mut str_rx) = {
-        let mut g = inst.write().await;
+        let mut g = inst.write();
         let d = g
             .add_subscriber("DO1", 1, DbFieldType::Double, full())
             .unwrap();
@@ -110,7 +110,6 @@ async fn r17_4_a_do_put_that_moves_no_string_posts_no_string_event() {
 
     let mut str_rx = inst
         .write()
-        .await
         .add_subscriber("STR1", 1, DbFieldType::String, full())
         .unwrap();
 
@@ -145,7 +144,6 @@ async fn r17_4_a_str_put_posts_the_derived_double_with_a_bare_value_mask() {
 
     let mut do_rx = inst
         .write()
-        .await
         .add_subscriber("DO1", 1, DbFieldType::Double, full())
         .unwrap();
 
@@ -195,7 +193,7 @@ async fn r17_4_a_dol_read_posts_the_read_view_with_log_and_the_derived_view_with
 
     let inst = db.get_record("VPP").await.unwrap();
     let (mut do_rx, mut str_rx) = {
-        let mut g = inst.write().await;
+        let mut g = inst.write();
         let d = g
             .add_subscriber("DO1", 1, DbFieldType::Double, full())
             .unwrap();
@@ -215,7 +213,6 @@ async fn r17_4_a_dol_read_posts_the_read_view_with_log_and_the_derived_view_with
             .await
             .unwrap()
             .read()
-            .await
             .record
             .get_field("VAL")
             && v == 7.25

@@ -50,7 +50,6 @@ async fn field(db: &PvDatabase, name: &str, f: &str) -> EpicsValue {
         .await
         .unwrap()
         .read()
-        .await
         .record
         .get_field(f)
         .unwrap_or_else(|| panic!("{name}.{f} missing"))
@@ -59,7 +58,7 @@ async fn field(db: &PvDatabase, name: &str, f: &str) -> EpicsValue {
 /// (SEVR, STAT, UDF) as a client would read them after the put.
 async fn alarm(db: &PvDatabase, name: &str) -> (AlarmSeverity, u16, bool) {
     let rec = db.get_record(name).await.unwrap();
-    let inst = rec.read().await;
+    let inst = rec.read();
     (inst.common.sevr, inst.common.stat, inst.common.udf != 0)
 }
 

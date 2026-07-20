@@ -43,7 +43,7 @@ async fn process(db: &PvDatabase, rec: &str) {
 
 async fn field(db: &PvDatabase, rec: &str, f: &str) -> EpicsValue {
     let inst = db.get_record(rec).await.unwrap();
-    let g = inst.read().await;
+    let g = inst.read();
     g.record.get_field(f).unwrap()
 }
 
@@ -76,7 +76,6 @@ async fn r11_c4_a_link_that_reverts_a_caput_still_posts_aa() {
 
     let mut aa_rx = inst
         .write()
-        .await
         .add_subscriber(
             "AA",
             1,
@@ -135,7 +134,6 @@ async fn r11_c4_an_unchanged_link_value_does_not_post_aa() {
 
     let mut aa_rx = inst
         .write()
-        .await
         .add_subscriber(
             "AA",
             1,

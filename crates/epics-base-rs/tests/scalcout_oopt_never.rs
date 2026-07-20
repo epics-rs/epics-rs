@@ -118,7 +118,7 @@ async fn an_unnamed_oopt_index_drives_no_output() {
 
     let rec = db.get_record("S:EVERY").await.unwrap();
     {
-        let mut inst = rec.write().await;
+        let mut inst = rec.write();
         // Past the last menu choice (6 = Never) — C's switch has no case for it.
         inst.record
             .put_field_internal("OOPT", EpicsValue::Short(9))

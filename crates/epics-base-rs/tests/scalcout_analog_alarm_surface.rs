@@ -68,7 +68,7 @@ async fn severity_at(db: &PvDatabase, a: f64) -> (AlarmSeverity, u16) {
     db.put_pv("S:LIM.A", EpicsValue::Double(a)).await.unwrap();
     process(db, "S:LIM").await;
     let rec = db.get_record("S:LIM").await.unwrap();
-    let g = rec.read().await;
+    let g = rec.read();
     (g.common.sevr, g.common.stat)
 }
 
@@ -169,7 +169,7 @@ async fn an_invalid_limit_excursion_reaches_the_ivoa_gate() {
     process(&db, "S:IVOA").await;
 
     let rec = db.get_record("S:IVOA").await.unwrap();
-    let sevr = rec.read().await.common.sevr;
+    let sevr = rec.read().common.sevr;
     assert_eq!(
         sevr,
         AlarmSeverity::Invalid,

@@ -84,7 +84,7 @@ async fn nord(db: &epics_base_rs::server::database::PvDatabase, rec: &str) -> f6
 }
 
 async fn udf(db: &epics_base_rs::server::database::PvDatabase, rec: &str) -> bool {
-    db.get_record(rec).await.unwrap().read().await.common.udf != 0
+    db.get_record(rec).await.unwrap().read().common.udf != 0
 }
 
 /// C: `dbLoadLinkArray` + `subset` in `devSASoft.c::init_record` (58-73) — the

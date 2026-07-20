@@ -65,7 +65,7 @@ async fn r11_c14_divide_by_zero_is_a_calc_failure() {
     process(&db, "T").await;
 
     let rec = db.get_record("T").await.unwrap();
-    let g = rec.read().await;
+    let g = rec.read();
     assert_eq!(
         g.common.sevr,
         AlarmSeverity::Invalid,
@@ -102,7 +102,7 @@ async fn r11_c14_a_finite_result_raises_no_alarm() {
     process(&db, "T").await;
 
     let rec = db.get_record("T").await.unwrap();
-    let g = rec.read().await;
+    let g = rec.read();
     assert_eq!(g.common.sevr, AlarmSeverity::NoAlarm);
     assert_eq!(g.record.get_field("A").unwrap(), EpicsValue::Double(0.5));
 }
@@ -117,7 +117,7 @@ async fn r11_c14_no_process_cycle_posts_val() {
 
     let full = (EventMask::VALUE | EventMask::LOG | EventMask::ALARM).bits();
     let (mut val_rx, mut a_rx) = {
-        let mut g = rec.write().await;
+        let mut g = rec.write();
         let v = g
             .add_subscriber("VAL", 1, DbFieldType::Double, full)
             .expect("a VAL subscription must be accepted");
@@ -146,7 +146,7 @@ async fn r11_c14_no_process_cycle_posts_val() {
         .unwrap();
     process(&db, "T").await;
     {
-        let g = rec.read().await;
+        let g = rec.read();
         assert_eq!(
             g.common.sevr,
             AlarmSeverity::Invalid,
@@ -168,7 +168,7 @@ async fn r11_c14_a_put_to_the_val_dummy_still_posts() {
     let rec = db.get_record("T").await.unwrap();
 
     let mut val_rx = {
-        let mut g = rec.write().await;
+        let mut g = rec.write();
         g.add_subscriber("VAL", 1, DbFieldType::Double, EventMask::VALUE.bits())
             .expect("a VAL subscription must be accepted")
     };

@@ -55,7 +55,7 @@ async fn process(db: &PvDatabase) {
 
 async fn subscribe(db: &PvDatabase, field: &str) -> EventReader {
     let inst = db.get_record("W").await.unwrap();
-    let mut g = inst.write().await;
+    let mut g = inst.write();
     g.add_subscriber(field, 1, DbFieldType::Double, ALL)
         .expect("subscription must be accepted")
 }
@@ -67,7 +67,7 @@ async fn r9_75_la_holds_previous_input_value() {
     process(&db).await;
 
     let inst = db.get_record("W").await.unwrap();
-    let g = inst.read().await;
+    let g = inst.read();
     assert_eq!(
         g.record.get_field("A"),
         Some(EpicsValue::Double(7.0)),

@@ -45,19 +45,19 @@ async fn build(db_text: &str) -> std::sync::Arc<PvDatabase> {
 
 async fn field(db: &PvDatabase, rec: &str, f: &str) -> EpicsValue {
     let r = db.get_record(rec).await.unwrap();
-    let inst = r.read().await;
+    let inst = r.read();
     inst.record.get_field(f).unwrap()
 }
 
 async fn udf(db: &PvDatabase, rec: &str) -> bool {
     let r = db.get_record(rec).await.unwrap();
-    let inst = r.read().await;
+    let inst = r.read();
     inst.common.udf != 0
 }
 
 async fn sevr(db: &PvDatabase, rec: &str) -> AlarmSeverity {
     let r = db.get_record(rec).await.unwrap();
-    let inst = r.read().await;
+    let inst = r.read();
     inst.common.sevr
 }
 

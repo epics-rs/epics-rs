@@ -68,7 +68,7 @@ async fn add_ao_with_out(db: &PvDatabase, name: &str, out: &str) {
         .await
         .unwrap();
     let rec = db.get_record(name).await.expect("just added");
-    let mut inst = rec.write().await;
+    let mut inst = rec.write();
     inst.put_common_field("OUT", EpicsValue::String(out.into()))
         .unwrap();
     inst.common.udf = 0;
@@ -76,7 +76,7 @@ async fn add_ao_with_out(db: &PvDatabase, name: &str, out: &str) {
 
 async fn alarm_of(db: &PvDatabase, name: &str) -> (u16, AlarmSeverity) {
     let rec = db.get_record(name).await.expect("record exists");
-    let inst = rec.read().await;
+    let inst = rec.read();
     (inst.common.stat, inst.common.sevr)
 }
 

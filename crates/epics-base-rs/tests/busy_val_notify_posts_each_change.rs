@@ -52,7 +52,7 @@ async fn busy_val_notify_sequence_posts_each_change() {
     let db = build().await;
     let r = db.get_record("B").await.unwrap();
     let mut rx = {
-        let mut inst = r.write().await;
+        let mut inst = r.write();
         inst.add_subscriber("VAL", 1, DbFieldType::Enum, EventMask::VALUE.bits())
             .unwrap()
     };
@@ -83,6 +83,6 @@ async fn busy_val_notify_sequence_posts_each_change() {
 
     // The raw out-of-range index round-trips (C stores it; get_enum_str renders
     // "Illegal_Value").
-    let inst = r.read().await;
+    let inst = r.read();
     assert_eq!(inst.record.get_field("VAL"), Some(EpicsValue::Enum(3)));
 }

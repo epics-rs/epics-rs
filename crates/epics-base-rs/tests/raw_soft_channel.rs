@@ -109,7 +109,6 @@ async fn field(db: &PvDatabase, name: &str, f: &str) -> EpicsValue {
         .await
         .unwrap_or_else(|| panic!("{name} missing"))
         .read()
-        .await
         .record
         .get_field(f)
         .unwrap_or_else(|| panic!("{name}.{f} missing"))

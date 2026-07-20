@@ -100,7 +100,6 @@ async fn acalcout_odly_holds_pact_foreign_process_does_not_fire_early() {
             .await
             .unwrap()
             .read()
-            .await
             .record
             .get_field("DLYA"),
         Some(EpicsValue::UShort(1)),
@@ -146,7 +145,6 @@ async fn acalcout_odly_holds_pact_foreign_process_does_not_fire_early() {
             .await
             .unwrap()
             .read()
-            .await
             .record
             .get_field("DLYA"),
         Some(EpicsValue::UShort(0)),
@@ -205,7 +203,7 @@ async fn acalcout_odly_ivov_substitutes_on_continuation_not_delaying_cycle() {
         .unwrap();
     {
         let rec = db.get_record("AC").await.unwrap();
-        let guard = rec.read().await;
+        let guard = rec.read();
         assert_eq!(
             guard.record.get_field("DLYA"),
             Some(EpicsValue::UShort(1)),
@@ -285,7 +283,6 @@ async fn acalcout_odly_dont_drive_still_defers() {
             .await
             .unwrap()
             .read()
-            .await
             .record
             .get_field("DLYA"),
         Some(EpicsValue::UShort(1)),
@@ -309,7 +306,6 @@ async fn acalcout_odly_dont_drive_still_defers() {
             .await
             .unwrap()
             .read()
-            .await
             .record
             .get_field("DLYA"),
         Some(EpicsValue::UShort(0)),

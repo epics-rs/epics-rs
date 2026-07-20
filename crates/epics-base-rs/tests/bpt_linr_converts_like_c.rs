@@ -59,7 +59,7 @@ record(ai, "AI:BPT") {{
         .unwrap();
 
     let rec = db.get_record("AI:BPT").await.unwrap();
-    let mut inst = rec.write().await;
+    let mut inst = rec.write();
     inst.record
         .put_field("RVAL", EpicsValue::Long(rval))
         .unwrap();

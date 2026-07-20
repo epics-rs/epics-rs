@@ -37,7 +37,7 @@ async fn invalid_source(db: &PvDatabase) {
         .unwrap();
     {
         let rec = db.get_record("SRC").await.unwrap();
-        let mut inst = rec.write().await;
+        let mut inst = rec.write();
         inst.put_common_field("HIHI", EpicsValue::Double(100.0))
             .unwrap();
         inst.put_common_field("HHSV", EpicsValue::Short(AlarmSeverity::Invalid as i16))
@@ -48,7 +48,7 @@ async fn invalid_source(db: &PvDatabase) {
         .await
         .unwrap();
     assert_eq!(
-        db.get_record("SRC").await.unwrap().read().await.common.sevr,
+        db.get_record("SRC").await.unwrap().read().common.sevr,
         AlarmSeverity::Invalid,
         "SRC must be INVALID with a finite VAL=200 (HIHI=100/HHSV=INVALID)"
     );
@@ -71,7 +71,6 @@ async fn tr_field(db: &PvDatabase, field: &str) -> Option<EpicsValue> {
         .await
         .unwrap()
         .read()
-        .await
         .record
         .get_field(field)
 }
@@ -110,7 +109,7 @@ async fn r9_61_ivla_do_nothing_skips_calc_and_every_output_link() {
     );
     // The alarm commit is the one thing C still runs on this cycle.
     assert_eq!(
-        db.get_record("TR").await.unwrap().read().await.common.sevr,
+        db.get_record("TR").await.unwrap().read().common.sevr,
         AlarmSeverity::Invalid,
         "recGblResetAlarms still runs on the abandoned cycle — the MS link's \
          INVALID severity commits to SEVR"

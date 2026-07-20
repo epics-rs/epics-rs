@@ -404,7 +404,7 @@ fn cmd_aspmem() -> CommandDef {
                 std::collections::BTreeMap::new();
             for rec_name in &names {
                 if let Some(rec) = ctx.block_on(ctx.db().get_record(rec_name)) {
-                    let inst = ctx.block_on(rec.read());
+                    let inst = rec.read();
                     by_asg
                         .entry(inst.common.access_group().to_string())
                         .or_default()
@@ -464,7 +464,7 @@ fn cmd_astac() -> CommandDef {
             // Resolve the record's ASG and ASL.
             let (asg, asl) = match ctx.block_on(ctx.db().get_record(&record)) {
                 Some(rec) => {
-                    let inst = ctx.block_on(rec.read());
+                    let inst = rec.read();
                     (inst.common.access_group().to_string(), inst.common.asl)
                 }
                 None => {

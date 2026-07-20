@@ -62,7 +62,7 @@ async fn transform_with_an_ms_input() -> PvDatabase {
     {
         // The alarm limits live in the INSTANCE's `analog_alarm` config.
         let rec = db.get_record("SRC").await.unwrap();
-        let mut inst = rec.write().await;
+        let mut inst = rec.write();
         inst.put_common_field("HIHI", EpicsValue::Double(5.0))
             .unwrap();
         inst.put_common_field("HHSV", EpicsValue::Short(AlarmSeverity::Major as i16))
@@ -86,7 +86,7 @@ async fn r11_64_transform_channels_post_without_the_cycles_alarm_bits() {
 
     let full = (EventMask::VALUE | EventMask::LOG | EventMask::ALARM).bits();
     let (mut a_rx, mut stat_rx) = {
-        let mut g = inst.write().await;
+        let mut g = inst.write();
         let a = g
             .add_subscriber("A", 1, DbFieldType::Double, full)
             .expect("an A subscription must be accepted");
@@ -107,7 +107,7 @@ async fn r11_64_transform_channels_post_without_the_cycles_alarm_bits() {
     process(&db, "T").await;
 
     {
-        let g = inst.read().await;
+        let g = inst.read();
         assert_eq!(
             g.common.sevr,
             AlarmSeverity::Major,
@@ -139,7 +139,6 @@ async fn r11_64_an_alarm_only_subscriber_on_a_transform_channel_never_fires() {
 
     let mut a_rx = inst
         .write()
-        .await
         .add_subscriber("A", 1, DbFieldType::Double, EventMask::ALARM.bits())
         .expect("an A subscription must be accepted");
 
@@ -152,7 +151,7 @@ async fn r11_64_an_alarm_only_subscriber_on_a_transform_channel_never_fires() {
     process(&db, "T").await; // MAJOR -> NO_ALARM, A: 10 -> 2
 
     {
-        let g = inst.read().await;
+        let g = inst.read();
         assert_eq!(g.common.sevr, AlarmSeverity::NoAlarm);
         assert_eq!(
             g.record.get_field("A").unwrap(),

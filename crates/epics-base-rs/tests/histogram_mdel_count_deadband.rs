@@ -107,7 +107,6 @@ async fn mdel_rate_limits_the_val_monitor() {
     let rec = db.get_record("HG").await.unwrap();
     let mut val_rx = rec
         .write()
-        .await
         .add_subscriber("VAL", 1, DbFieldType::ULong, EventMask::VALUE.bits())
         .expect("VAL subscription accepted");
 
@@ -152,7 +151,6 @@ async fn the_default_mdel_of_zero_posts_every_process() {
     let rec = db.get_record("HG0").await.unwrap();
     let mut val_rx = rec
         .write()
-        .await
         .add_subscriber("VAL", 1, DbFieldType::ULong, EventMask::VALUE.bits())
         .expect("VAL subscription accepted");
 

@@ -64,7 +64,7 @@ async fn simm_yes_with_unset_siml_and_siol_simulates_from_sval() {
     );
 
     let rec = db.get_record("SIMCONST").await.unwrap();
-    let inst = rec.read().await;
+    let inst = rec.read();
     assert_eq!(
         inst.common.sevr,
         AlarmSeverity::Major,
@@ -105,7 +105,7 @@ async fn simm_no_with_unset_links_does_not_simulate() {
     );
     let rec = db.get_record("SIMOFF").await.unwrap();
     assert_ne!(
-        rec.read().await.common.stat,
+        rec.read().common.stat,
         epics_base_rs::server::recgbl::alarm_status::SIMM_ALARM,
         "SIMM=NO raises no SIMM_ALARM"
     );
@@ -161,7 +161,7 @@ async fn simm_transition_swaps_scan_with_sscn() {
     db.put_pv("SWAP.SIMM", EpicsValue::Short(1)).await.unwrap();
     {
         let rec = db.get_record("SWAP").await.unwrap();
-        let inst = rec.read().await;
+        let inst = rec.read();
         assert_eq!(
             inst.common.scan,
             ScanType::Passive,
@@ -183,7 +183,7 @@ async fn simm_transition_swaps_scan_with_sscn() {
     db.put_pv("SWAP.SIMM", EpicsValue::Short(0)).await.unwrap();
     {
         let rec = db.get_record("SWAP").await.unwrap();
-        let inst = rec.read().await;
+        let inst = rec.read();
         assert_eq!(inst.common.scan, ScanType::Sec1);
         assert_eq!(
             inst.get_common_field("SSCN"),
@@ -215,7 +215,7 @@ async fn unset_sscn_leaves_scan_alone_on_a_simm_transition() {
         .unwrap();
 
     let rec = db.get_record("NOSSCN").await.unwrap();
-    let inst = rec.read().await;
+    let inst = rec.read();
     assert_eq!(inst.common.scan, ScanType::Sec1);
     assert_eq!(
         inst.get_common_field("SSCN"),
@@ -249,7 +249,7 @@ async fn busy_has_no_sscn_so_a_simm_transition_never_swaps_its_scan() {
     db.put_pv("BUSY.SIMM", EpicsValue::Short(1)).await.unwrap();
 
     let rec = db.get_record("BUSY").await.unwrap();
-    let inst = rec.read().await;
+    let inst = rec.read();
     assert_eq!(
         inst.common.scan,
         ScanType::Sec1,
@@ -304,7 +304,7 @@ async fn failed_siml_read_sets_nsta_link_alarm_without_touching_sevr() {
         .unwrap();
 
     let rec = db.get_record("SIMLFAIL").await.unwrap();
-    let inst = rec.read().await;
+    let inst = rec.read();
     assert_eq!(
         inst.common.stat,
         alarm_status::LINK_ALARM,
@@ -333,7 +333,7 @@ async fn busy_failed_siml_read_raises_link_alarm_at_invalid_severity() {
         .unwrap();
 
     let rec = db.get_record("BUSYFAIL").await.unwrap();
-    let inst = rec.read().await;
+    let inst = rec.read();
     assert_eq!(inst.common.stat, alarm_status::LINK_ALARM);
     assert_eq!(
         inst.common.sevr,
@@ -384,7 +384,7 @@ async fn failed_siol_read_raises_link_alarm_at_default_sims() {
         .unwrap();
 
     let rec = db.get_record("SIOLFAIL").await.unwrap();
-    let inst = rec.read().await;
+    let inst = rec.read();
     assert_eq!(
         inst.common.sevr,
         AlarmSeverity::Invalid,
@@ -420,7 +420,7 @@ async fn failed_siol_read_loses_the_tie_to_simm_alarm_at_sims_invalid() {
         .unwrap();
 
     let rec = db.get_record("SIOLTIE").await.unwrap();
-    let inst = rec.read().await;
+    let inst = rec.read();
     assert_eq!(inst.common.sevr, AlarmSeverity::Invalid);
     assert_eq!(
         inst.common.stat,
@@ -483,7 +483,7 @@ async fn simm_raw_on_a_menu_yesno_input_is_soft_alarm_and_no_substitution() {
         "C's default arm performs NO device substitution — SVAL must not reach VAL"
     );
     let rec = db.get_record("RAWIN").await.unwrap();
-    let inst = rec.read().await;
+    let inst = rec.read();
     assert_eq!(
         inst.common.stat,
         alarm_status::SOFT_ALARM,
@@ -520,7 +520,7 @@ async fn simm_raw_on_a_menu_yesno_output_writes_nothing() {
         "the default arm returns before the SIOL redirect — SIOL must not be written"
     );
     let rec = db.get_record("RAWOUT").await.unwrap();
-    let inst = rec.read().await;
+    let inst = rec.read();
     assert_eq!(inst.common.stat, alarm_status::SOFT_ALARM);
     assert_eq!(inst.common.sevr, AlarmSeverity::Invalid);
 }
@@ -546,7 +546,7 @@ async fn busy_simm_raw_is_soft_alarm_and_writes_nothing() {
 
     assert_eq!(db.get_pv("BSINK").await.unwrap(), EpicsValue::Long(0));
     let rec = db.get_record("BRAW").await.unwrap();
-    let inst = rec.read().await;
+    let inst = rec.read();
     assert_eq!(inst.common.stat, alarm_status::SOFT_ALARM);
     assert_eq!(inst.common.sevr, AlarmSeverity::Invalid);
 }
@@ -571,7 +571,7 @@ async fn simm_raw_on_a_menu_simm_record_still_simulates() {
         .unwrap();
 
     let rec = db.get_record("AIRAW").await.unwrap();
-    let inst = rec.read().await;
+    let inst = rec.read();
     assert_eq!(
         inst.common.stat,
         alarm_status::SIMM_ALARM,
@@ -625,14 +625,15 @@ async fn w10_e5_busy_failed_siml_read_performs_no_output_write() {
         .unwrap();
 
     let inst = db.get_record("E5BUSY").await.unwrap();
-    let inst = inst.read().await;
-    assert_eq!(
-        inst.common.stat,
-        alarm_status::LINK_ALARM,
-        "dbGetLink -> setLinkAlarm on the failed SIML read"
-    );
-    assert_eq!(inst.common.sevr, AlarmSeverity::Invalid);
-    drop(inst);
+    {
+        let inst = inst.read();
+        assert_eq!(
+            inst.common.stat,
+            alarm_status::LINK_ALARM,
+            "dbGetLink -> setLinkAlarm on the failed SIML read"
+        );
+        assert_eq!(inst.common.sevr, AlarmSeverity::Invalid);
+    }
 
     assert_eq!(
         db.get_pv("E5TGT").await.unwrap(),

@@ -43,7 +43,7 @@ async fn compress_fires_flnk_only_on_emit_not_every_cycle() {
     db.add_record("cmp", Box::new(cmp)).await.unwrap();
     {
         let rec = db.get_record("cmp").await.unwrap();
-        let mut inst = rec.write().await;
+        let mut inst = rec.write();
         inst.put_common_field("INP", EpicsValue::String("src".into()))
             .unwrap();
     }
@@ -57,7 +57,7 @@ async fn compress_fires_flnk_only_on_emit_not_every_cycle() {
     // Wire cmp.FLNK = cnt (dbCommon forward link).
     {
         let rec = db.get_record("cmp").await.unwrap();
-        let mut inst = rec.write().await;
+        let mut inst = rec.write();
         inst.put_common_field("FLNK", EpicsValue::String("cnt".into()))
             .unwrap();
     }

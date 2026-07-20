@@ -34,7 +34,7 @@ use epics_base_rs::types::EpicsValue;
 
 async fn udf(db: &PvDatabase, name: &str) -> bool {
     let rec = db.get_record(name).await.unwrap();
-    let inst = rec.read().await;
+    let inst = rec.read();
     inst.common.udf != 0
 }
 
@@ -131,7 +131,7 @@ async fn asub_clears_udf_when_subroutine_runs() {
     // Start undefined, then process: a running subroutine defines the record.
     {
         let r = db.get_record("ASUB").await.unwrap();
-        r.write().await.common.udf = 1;
+        r.write().common.udf = 1;
     }
 
     let mut visited = std::collections::HashSet::new();
@@ -145,11 +145,7 @@ async fn asub_clears_udf_when_subroutine_runs() {
     );
     let r = db.get_record("ASUB").await.unwrap();
     assert_eq!(
-        r.read()
-            .await
-            .record
-            .get_field("VALA")
-            .and_then(|v| v.to_f64()),
+        r.read().record.get_field("VALA").and_then(|v| v.to_f64()),
         Some(42.0),
         "the subroutine actually ran (VALA written) — processing was driven"
     );

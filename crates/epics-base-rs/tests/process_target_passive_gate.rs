@@ -55,13 +55,13 @@ record(ai, "ASY") {{
 
     // C's ODLY window: the target is genuinely PACT when the FLNK fires.
     let asy = db.get_record("ASY").await.unwrap();
-    asy.write().await.enter_pact();
+    asy.write().enter_pact();
     db
 }
 
 async fn flags(db: &PvDatabase, rec: &str) -> (bool, bool) {
     let inst = db.get_record(rec).await.unwrap();
-    let inst = inst.read().await;
+    let inst = inst.read();
     (inst.common.rpro != 0, inst.common.putf)
 }
 
@@ -135,7 +135,7 @@ record(calc, "TGT") {
 
     let val = async |db: &PvDatabase| -> f64 {
         let inst = db.get_record("TGT").await.unwrap();
-        let inst = inst.read().await;
+        let inst = inst.read();
         match inst.record.get_field("VAL") {
             Some(EpicsValue::Double(v)) => v,
             other => panic!("TGT.VAL: {other:?}"),
@@ -184,7 +184,7 @@ record(calc, "TGT") {
         .unwrap();
 
     let inst = db.get_record("TGT").await.unwrap();
-    let inst = inst.read().await;
+    let inst = inst.read();
     assert_eq!(
         inst.record.get_field("VAL"),
         Some(EpicsValue::Double(0.0)),

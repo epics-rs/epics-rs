@@ -135,14 +135,7 @@ async fn indx_put_past_the_data_empties_the_slice_and_alarms() {
         Some(EpicsValue::Long(0))
     );
     assert!(
-        db.get_record("SA:CONST")
-            .await
-            .unwrap()
-            .read()
-            .await
-            .common
-            .udf
-            != 0,
+        db.get_record("SA:CONST").await.unwrap().read().common.udf != 0,
         "an empty subArray slice is UNDEFINED (C `prec->udf = !!status`)"
     );
 }

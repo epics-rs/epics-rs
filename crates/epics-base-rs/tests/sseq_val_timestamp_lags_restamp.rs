@@ -56,11 +56,10 @@ async fn sseq_val_timestamp_is_pre_restamp_and_lags_one_cycle() {
     // fixed instant well in the past (1970-01-12), which the deferred restamp
     // must move forward.
     let sentinel = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
-    inst.write().await.common.time = sentinel;
+    inst.write().common.time = sentinel;
 
     let mut val_rx = inst
         .write()
-        .await
         .add_subscriber("VAL", 1, DbFieldType::Long, full())
         .unwrap();
 
@@ -69,7 +68,7 @@ async fn sseq_val_timestamp_is_pre_restamp_and_lags_one_cycle() {
         .await
         .unwrap();
     let ev1 = val_rx.try_recv().expect("cycle 1 posts a VAL event");
-    let t_after_1 = inst.read().await.common.time;
+    let t_after_1 = inst.read().common.time;
 
     // C posts VAL (sseqRecord.c:474) BEFORE recGblGetTimeStamp (:501), so the
     // first VAL carries the pre-update timestamp — the sentinel, untouched.

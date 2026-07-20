@@ -23,7 +23,7 @@ use epics_base_rs::types::{EpicsValue, PvString};
 async fn poll_field(db: &PvDatabase, record: &str, field: &str, label: &str) -> EpicsValue {
     for _ in 0..400 {
         if let Some(rec) = db.get_record(record).await {
-            let v = rec.read().await.record.get_field(field);
+            let v = rec.read().record.get_field(field);
             if let Some(v) = v {
                 // The destination starts at its default; wait until the
                 // forwarded value lands.
@@ -164,7 +164,7 @@ async fn sseq_numeric_dol_refreshes_strn_with_prec() {
     let _ = poll_field(&db, "SSEQ_STRN_DST", "VAL", "numeric DOL → numeric LNK").await;
 
     let rec = db.get_record("SSEQ_STRN").await.unwrap();
-    let str1 = rec.read().await.record.get_field("STR1");
+    let str1 = rec.read().record.get_field("STR1");
     assert_eq!(
         str1,
         Some(EpicsValue::String("42.500".into())),

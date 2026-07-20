@@ -164,7 +164,7 @@ fn cmd_dbl() -> CommandDef {
                 if let Some(filter) = type_filter {
                     let rec = ctx.block_on(ctx.db().get_record(name));
                     if let Some(rec) = rec {
-                        let inst = ctx.block_on(rec.read());
+                        let inst = rec.read();
                         if inst.record.record_type() != filter {
                             continue;
                         }
@@ -249,7 +249,7 @@ fn cmd_dbpf() -> CommandDef {
             // Try to determine the field type for proper parsing
             let dbf_type = ctx.block_on(async {
                 if let Some(rec) = ctx.db().get_record(base).await {
-                    let inst = rec.read().await;
+                    let inst = rec.read();
                     // Check record-specific fields
                     if let Some(t) = crate::server::record::record_instance::declared_field_type_of(
                         inst.record.as_ref(),
@@ -363,14 +363,20 @@ fn cmd_dbpr() -> CommandDef {
 
             // Collect field values inside lock, format outside
             let fields: Vec<(String, String)> = ctx.block_on(async {
-                let inst = rec.read().await;
+                // Record name for the async alias query — the read guard is
+                // released (block close) before the await, then re-acquired
+                // for the synchronous field reads (parking_lot guards are
+                // `!Send`, so none may be held across the await).
+                let rec_name = { rec.read().name.clone() };
+                let aliases = ctx.db().aliases_for_record(&rec_name).await;
+
+                let inst = rec.read();
                 let mut fields = Vec::new();
 
                 // Level 0: NAME, RTYP, VAL (+ alias names if any —
                 // base's dbpr surfaces aliases here so admins know
                 // every spelling that resolves to this record).
                 fields.push(("NAME".to_string(), inst.name.clone()));
-                let aliases = ctx.db().aliases_for_record(&inst.name).await;
                 if !aliases.is_empty() {
                     fields.push(("ALIASES".to_string(), aliases.join(", ")));
                 }
@@ -506,7 +512,7 @@ fn dbsr_handler(args: &[ArgValue], ctx: &CommandContext) -> CommandResult {
         }
         // Dump each requested field for this record.
         if let Some(rec_arc) = ctx.block_on(ctx.db().get_record(name)) {
-            let inst = ctx.block_on(rec_arc.read());
+            let inst = rec_arc.read();
             for fname in &fields {
                 let value = inst
                     .record
@@ -1108,7 +1114,7 @@ fn cmd_db_load_records() -> CommandDef {
                     // record_type is fatal. `dbRecordsOnceOnly` global
                     // is not yet wired; tighten here if/when needed.
                     let existing = if let Some(rec) = ctx.db().get_record(&def.name).await {
-                        let r = rec.read().await;
+                        let r = rec.read();
                         let existing_type = r.record.record_type();
                         if existing_type != def.record_type {
                             return Err(format!(
@@ -1128,7 +1134,7 @@ fn cmd_db_load_records() -> CommandDef {
                         // Merge: apply field overrides directly to the
                         // existing record instance.
                         {
-                            let mut inst = rec_arc.write().await;
+                            let mut inst = rec_arc.write();
                             if let Err(e) = db_loader::apply_fields(
                                 &mut inst.record,
                                 &def.fields,
@@ -1190,45 +1196,50 @@ fn cmd_db_load_records() -> CommandDef {
                     // after. A fresh record took that ordering from the sink
                     // and must not run the passes twice.
                     if is_merge {
-                        let mut instance = rec_arc.write().await;
                         // info(key, value) directives — last write
                         // wins. Populated before common-field application
                         // so device support seeing `init_record` can
                         // observe info tags.
-                        for (k, v) in &def.info_tags {
-                            instance.set_info(k, v);
+                        {
+                            let mut instance = rec_arc.write();
+                            for (k, v) in &def.info_tags {
+                                instance.set_info(k, v);
+                            }
                         }
                         for (name, value) in common_fields {
                             use crate::server::record::CommonFieldPutResult;
                             // `.db` load: C's loader converter, whose menu
                             // bound differs from a runtime dbPut's
-                            // (`dbStaticRun.c::dbPutStringNum`).
-                            match instance.put_common_field_db_load(&name, value) {
+                            // (`dbStaticRun.c::dbPutStringNum`). The data
+                            // guard is released before the scan-index await
+                            // (parking_lot guards are `!Send`); the put and
+                            // the index update were already two operations.
+                            let put_res = {
+                                let mut instance = rec_arc.write();
+                                instance.put_common_field_db_load(&name, value)
+                            };
+                            match put_res {
                                 Ok(CommonFieldPutResult::ScanChanged {
                                     old_scan,
                                     new_scan,
                                     phas,
                                 }) => {
-                                    drop(instance);
                                     ctx.db()
                                         .update_scan_index(
                                             &def.name, old_scan, new_scan, phas, phas,
                                         )
                                         .await;
-                                    instance = rec_arc.write().await;
                                 }
                                 Ok(CommonFieldPutResult::PhasChanged {
                                     scan,
                                     old_phas,
                                     new_phas,
                                 }) => {
-                                    drop(instance);
                                     ctx.db()
                                         .update_scan_index(
                                             &def.name, scan, scan, old_phas, new_phas,
                                         )
                                         .await;
-                                    instance = rec_arc.write().await;
                                 }
                                 Ok(CommonFieldPutResult::NoChange) => {}
                                 Err(e) => {
@@ -1252,7 +1263,10 @@ fn cmd_db_load_records() -> CommandDef {
                         // alternative (skip init on merge) silently
                         // ignored field overrides that affect init —
                         // worse for typical use.
-                        instance.run_init_passes(&def.name);
+                        {
+                            let mut instance = rec_arc.write();
+                            instance.run_init_passes(&def.name);
+                        }
                     }
                     {
                         // Hand the record its resolved common link fields so
@@ -1261,7 +1275,7 @@ fn cmd_db_load_records() -> CommandDef {
                         // the common OUT link is applied by the sink, after
                         // `set_async_context`. Defaulted no-op for records
                         // that do not classify common links.
-                        let mut instance = rec_arc.write().await;
+                        let mut instance = rec_arc.write();
                         let inst = &mut *instance;
                         inst.record.init_links(&inst.common);
                     }
@@ -1638,7 +1652,7 @@ async fn suggest_field_name(
 ) -> Option<String> {
     let typo_uc = typo.to_ascii_uppercase();
     let rec = db.get_record(record_name).await?;
-    let inst = rec.read().await;
+    let inst = rec.read();
     let mut candidates: Vec<&str> = inst.record.field_list().iter().map(|d| d.name).collect();
     // Common dbCommon fields are also valid PUT targets.
     candidates.extend([
@@ -1896,7 +1910,7 @@ record(bo, "$(P)_calc_ctrl") {{
         let dtyp_of = |name: &str| -> String {
             ctx.block_on(async {
                 let rec = db.get_record(name).await.expect("record loaded");
-                let inst = rec.read().await;
+                let inst = rec.read();
                 inst.common.dtyp.clone()
             })
         };
@@ -1972,7 +1986,7 @@ record(bo, "$(P)_calc_ctrl") {{
         // The device-support NAME landed on the record's DTYP.
         let dtyp = ctx.block_on(async {
             let rec = db.get_record("DEV").await.expect("record present");
-            let inst = rec.read().await;
+            let inst = rec.read();
             inst.common.dtyp.clone()
         });
         assert_eq!(dtyp, "Async Soft Channel");
@@ -2020,7 +2034,7 @@ record(bo, "$(P)_calc_ctrl") {{
         // stale value.
         let dtyp = ctx.block_on(async {
             let rec = db.get_record("CONTRIB").await.expect("record present");
-            let inst = rec.read().await;
+            let inst = rec.read();
             inst.common.dtyp.clone()
         });
         assert_eq!(dtyp, "Dbpf Contributed Probe");
@@ -2131,7 +2145,7 @@ record(mbbo, "DUP:CM") {{
                 .get_record("DUP:CM")
                 .await
                 .expect("DUP:CM must be registered exactly once");
-            let inst = rec.read().await;
+            let inst = rec.read();
             // Last-write-wins: DESC + ZRST should reflect the SECOND
             // record block. ONST stays from the FIRST block since
             // the second didn't override it.
@@ -2201,7 +2215,7 @@ record(ao, "BPT:RBK") {{ field(LINR, "ramp") }}
 
         ctx.block_on(async {
             let rec = db.get_record("BPT:RBK").await.expect("BPT:RBK exists");
-            let mut inst = rec.write().await;
+            let mut inst = rec.write();
             // The merge resolved "ramp" (non-standard) to the first user-table
             // index (15); standard menuConvert names reserve 3..=14.
             assert_eq!(
@@ -2269,7 +2283,7 @@ record(ai, "A:BPT") {{ field(LINR, "zebra") }}
 
         ctx.block_on(async {
             let rec = db.get_record("A:BPT").await.expect("A:BPT exists");
-            let mut inst = rec.write().await;
+            let mut inst = rec.write();
             inst.record
                 .put_field("RVAL", crate::types::EpicsValue::Long(50))
                 .unwrap();
@@ -2560,7 +2574,7 @@ record(mbboDirect, "MBD0") {{ }}
         ctx.block_on(async {
             let udf = |name: &'static str| {
                 let db = db.clone();
-                async move { db.get_record(name).await.unwrap().read().await.common.udf != 0 }
+                async move { db.get_record(name).await.unwrap().read().common.udf != 0 }
             };
             assert!(
                 !udf("HG").await,
@@ -2575,7 +2589,6 @@ record(mbboDirect, "MBD0") {{ }}
                     .await
                     .unwrap()
                     .read()
-                    .await
                     .record
                     .get_field("VAL"),
                 Some(crate::types::EpicsValue::Long(5)),

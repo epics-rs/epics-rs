@@ -56,7 +56,7 @@ async fn calcout_bad_calc_put_is_accepted_and_lands_in_clcv() {
         .unwrap();
     let rec = db.get_record("CO").await.unwrap();
     assert_eq!(
-        rec.read().await.record.get_field("CLCV"),
+        rec.read().record.get_field("CLCV"),
         Some(EpicsValue::Long(0))
     );
 
@@ -65,7 +65,7 @@ async fn calcout_bad_calc_put_is_accepted_and_lands_in_clcv() {
         .await
         .expect("calcout special() returns 0 even for an uncompilable CALC");
     assert_eq!(
-        rec.read().await.record.get_field("CLCV"),
+        rec.read().record.get_field("CLCV"),
         Some(EpicsValue::Long(POSTFIX_ERR))
     );
 
@@ -74,14 +74,14 @@ async fn calcout_bad_calc_put_is_accepted_and_lands_in_clcv() {
         .await
         .unwrap();
     assert_eq!(
-        rec.read().await.record.get_field("OCLV"),
+        rec.read().record.get_field("OCLV"),
         Some(EpicsValue::Long(POSTFIX_ERR))
     );
     db.put_record_field_from_ca("CO", "OCAL", EpicsValue::String("A*2".into()))
         .await
         .unwrap();
     assert_eq!(
-        rec.read().await.record.get_field("OCLV"),
+        rec.read().record.get_field("OCLV"),
         Some(EpicsValue::Long(0))
     );
 }
@@ -98,7 +98,7 @@ async fn scalcout_clcv_oclv_track_scalcpostfix_status() {
         .await
         .unwrap();
     assert_eq!(
-        rec.read().await.record.get_field("CLCV"),
+        rec.read().record.get_field("CLCV"),
         Some(EpicsValue::Long(0))
     );
 
@@ -106,7 +106,7 @@ async fn scalcout_clcv_oclv_track_scalcpostfix_status() {
         .await
         .expect("scalcout accepts the put");
     assert_eq!(
-        rec.read().await.record.get_field("CLCV"),
+        rec.read().record.get_field("CLCV"),
         Some(EpicsValue::Long(POSTFIX_ERR))
     );
 
@@ -116,7 +116,7 @@ async fn scalcout_clcv_oclv_track_scalcpostfix_status() {
         .await
         .unwrap();
     assert_eq!(
-        rec.read().await.record.get_field("CLCV"),
+        rec.read().record.get_field("CLCV"),
         Some(EpicsValue::Long(0))
     );
 
@@ -124,7 +124,7 @@ async fn scalcout_clcv_oclv_track_scalcpostfix_status() {
         .await
         .unwrap();
     assert_eq!(
-        rec.read().await.record.get_field("OCLV"),
+        rec.read().record.get_field("OCLV"),
         Some(EpicsValue::Long(POSTFIX_ERR))
     );
 }
@@ -143,7 +143,7 @@ async fn acalcout_bad_calc_stores_minus_one_not_a_generic_one() {
     // Pre-fix this read back 1; C `aCalcPostfix` returns -1
     // (aCalcPostfix.c:801-809).
     assert_eq!(
-        rec.read().await.record.get_field("CLCV"),
+        rec.read().record.get_field("CLCV"),
         Some(EpicsValue::Long(POSTFIX_ERR))
     );
 
@@ -151,7 +151,7 @@ async fn acalcout_bad_calc_stores_minus_one_not_a_generic_one() {
         .await
         .unwrap();
     assert_eq!(
-        rec.read().await.record.get_field("OCLV"),
+        rec.read().record.get_field("OCLV"),
         Some(EpicsValue::Long(POSTFIX_ERR))
     );
 }

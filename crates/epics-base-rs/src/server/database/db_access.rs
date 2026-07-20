@@ -234,7 +234,7 @@ pub struct DbSubscription {
     ignore_origin: u64,
     /// Reference back to the record + this subscription's sid, for the
     /// enable/disable (`db_event_disable`) path and the `Drop` reaper.
-    record: std::sync::Arc<tokio::sync::RwLock<crate::server::record::RecordInstance>>,
+    record: std::sync::Arc<parking_lot::RwLock<crate::server::record::RecordInstance>>,
     sid: u32,
 }
 
@@ -249,7 +249,7 @@ pub struct DbSubscription {
 /// stays consistent.
 #[derive(Clone)]
 pub struct SubscriptionActivation {
-    record: std::sync::Arc<tokio::sync::RwLock<crate::server::record::RecordInstance>>,
+    record: std::sync::Arc<parking_lot::RwLock<crate::server::record::RecordInstance>>,
     sid: u32,
 }
 
@@ -258,10 +258,7 @@ impl SubscriptionActivation {
     /// flow at the source. Same semantics as [`DbSubscription::set_active`]
     /// — see that method for the `db_event_disable` parity rationale.
     pub async fn set_active(&self, active: bool) {
-        self.record
-            .write()
-            .await
-            .set_subscriber_active(self.sid, active);
+        self.record.write().set_subscriber_active(self.sid, active);
     }
 }
 
@@ -313,7 +310,7 @@ impl DbSubscription {
         let rec = db.get_record(record_name).await?;
         let sid = next_sid();
         let reader = {
-            let mut instance = rec.write().await;
+            let mut instance = rec.write();
             let reader = instance.add_subscriber(&field, sid, DbFieldType::Double, mask)?;
             if let Some(chain) = filters {
                 for filter in chain.iter() {
@@ -341,10 +338,7 @@ impl DbSubscription {
     /// the monitor from the record, it does not touch the event queue).
     /// Idempotent.
     pub async fn set_active(&self, active: bool) {
-        self.record
-            .write()
-            .await
-            .set_subscriber_active(self.sid, active);
+        self.record.write().set_subscriber_active(self.sid, active);
     }
 
     /// A detachable [`SubscriptionActivation`] for this subscription's
@@ -438,7 +432,7 @@ impl Drop for DbSubscription {
         // that scenario can't have an active subscription anyway.
         if tokio::runtime::Handle::try_current().is_ok() {
             tokio::spawn(async move {
-                record.write().await.remove_subscriber(sid);
+                record.write().remove_subscriber(sid);
             });
         }
     }

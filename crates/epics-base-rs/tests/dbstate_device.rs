@@ -55,7 +55,7 @@ record(bi, "DBST_BI") {
 
     let bi = db.get_record("DBST_BI").await.expect("bi exists");
     {
-        let inst = bi.read().await;
+        let inst = bi.read();
         assert_ne!(
             inst.common.sevr,
             AlarmSeverity::Invalid,
@@ -81,7 +81,7 @@ record(bi, "DBST_BI") {
         .await
         .unwrap();
     {
-        let inst = bi.read().await;
+        let inst = bi.read();
         assert_eq!(
             inst.record.get_field("VAL"),
             Some(EpicsValue::Enum(0)),
@@ -113,7 +113,7 @@ record(ai, "DBST_AI") {
         .unwrap();
 
     let ai = db.get_record("DBST_AI").await.expect("ai exists");
-    let inst = ai.read().await;
+    let inst = ai.read();
     assert_eq!(
         inst.common.sevr,
         AlarmSeverity::Invalid,

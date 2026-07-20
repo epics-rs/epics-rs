@@ -61,12 +61,7 @@ async fn build() -> std::sync::Arc<PvDatabase> {
 }
 
 async fn is_parked(db: &PvDatabase, rec: &str) -> bool {
-    db.get_record(rec)
-        .await
-        .unwrap()
-        .read()
-        .await
-        .is_processing()
+    db.get_record(rec).await.unwrap().read().is_processing()
 }
 
 /// The put-notify entry (`caput -c`). Returns `true` when the write completed

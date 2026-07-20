@@ -47,7 +47,7 @@ async fn build() -> std::sync::Arc<PvDatabase> {
 /// Read the record's raw `dbCommon.udf` byte (what CA serves, signed).
 async fn udf_byte(db: &PvDatabase, rec: &str) -> u8 {
     let inst = db.get_record(rec).await.unwrap();
-    let g = inst.read().await;
+    let g = inst.read();
     g.common.udf
 }
 

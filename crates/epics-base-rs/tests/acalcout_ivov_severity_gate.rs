@@ -107,7 +107,7 @@ async fn r11_c15_a_limit_driven_invalid_still_substitutes_ivov() {
     db.process_record_with_links("AC", &mut v, 0).await.unwrap();
 
     let rec = db.get_record("AC").await.unwrap();
-    let guard = rec.read().await;
+    let guard = rec.read();
     assert_eq!(
         guard.common.sevr,
         AlarmSeverity::Invalid,
@@ -162,7 +162,7 @@ async fn r11_c15_a_non_outputting_cycle_does_not_substitute_ivov() {
 
     assert_eq!(writes.load(Ordering::SeqCst), 0, "OOPT=Never: no OUT write");
     let rec = db.get_record("AC").await.unwrap();
-    let guard = rec.read().await;
+    let guard = rec.read();
     assert_eq!(
         guard.record.get_field("VAL"),
         Some(EpicsValue::Double(10.0)),

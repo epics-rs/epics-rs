@@ -50,7 +50,7 @@ async fn process(db: &PvDatabase, rec: &str) {
 
 async fn field(db: &PvDatabase, rec: &str, f: &str) -> Option<f64> {
     let inst = db.get_record(rec).await.unwrap();
-    let g = inst.read().await;
+    let g = inst.read();
     g.record.get_field(f).and_then(|v| v.to_f64())
 }
 
@@ -148,7 +148,7 @@ async fn r9_78_failed_input_fetch_pushes_nothing() {
     let db = asub_db(0).await;
     {
         let inst = db.get_record("ASUB").await.unwrap();
-        let mut g = inst.write().await;
+        let mut g = inst.write();
         g.record
             .put_field("INPA", EpicsValue::String("NOSUCHREC".into()))
             .unwrap();

@@ -117,7 +117,7 @@ async fn the_top_of_the_enum_is_stored_and_is_not_passive() {
 
     let rec = db.get_record("REC").await.unwrap();
     assert_ne!(
-        rec.read().await.common.scan,
+        rec.read().common.scan,
         ScanType::Passive,
         "an illegal SCAN is not Passive: C's `dbPutField` scan==0 test \
          (dbAccess.c:1263) is literal, so the record is NOT put-processable"
@@ -159,7 +159,7 @@ async fn sscn_carries_an_illegal_index_and_only_65535_is_the_sentinel() {
 
     let rec = db.get_record("REC").await.unwrap();
     assert!(
-        !rec.read().await.common.sscn.is_unset(),
+        !rec.read().common.sscn.is_unset(),
         "recGbl's simulation helpers test `*psscn == USHRT_MAX` and nothing else"
     );
 }

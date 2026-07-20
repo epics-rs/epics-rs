@@ -220,7 +220,7 @@ impl IocBuilder {
             db.add_record(&name, record).await?;
             if let Some(rec_arc) = db.get_record(&name).await {
                 {
-                    let mut instance = rec_arc.write().await;
+                    let mut instance = rec_arc.write();
                     // Seed MLST/ALST/LALM from val so the first process posts a
                     // monitor only on a real change (C init_record invariant).
                     instance.record.seed_deadband_tracking();
@@ -280,14 +280,16 @@ impl IocBuilder {
 
             // Device support and the post-init owners for the RecordInstance
             if let Some(rec_arc) = db.get_record(&def.name).await {
-                let mut instance = rec_arc.write().await;
                 // Hand the record its resolved common link fields so a
                 // link-classifying record (calcout INAV..INUV/OUTV) can run
                 // its C `init_record` checkLinks step now — the common OUT
                 // link is set above, after `set_async_context` already ran at
                 // `add_record`. Defaulted no-op for records that do not
-                // classify common links.
+                // classify common links. The data guard is released at each
+                // block close before the init awaits below (parking_lot guards
+                // are `!Send`).
                 {
+                    let mut instance = rec_arc.write();
                     let inst = &mut *instance;
                     inst.record.init_links(&inst.common);
                 }
@@ -299,25 +301,25 @@ impl IocBuilder {
                 // `prec->mlst = prec->val`). So this owner runs here, ahead of
                 // `seed_deadband_tracking`, or the first process would post a
                 // spurious monitor for a value that was there since init.
-                drop(instance);
                 db.rec_gbl_init_constant_links(&rec_arc).await;
-                let mut instance = rec_arc.write().await;
 
                 // Seed MLST/ALST/LALM from val (after any UDF/bit fold that
                 // may have changed val) so the first process posts a monitor
                 // only on a real change (C init_record invariant).
-                instance.record.seed_deadband_tracking();
+                {
+                    let mut instance = rec_arc.write();
+                    instance.record.seed_deadband_tracking();
+                }
 
                 // C `recGblInitSimm` + `recGblInitConstantLink(&siol, …,
                 // &sval)`, run from every SIML-bearing `init_record` (pass 1).
                 // The lock is released and retaken by the owner, which is the
                 // only site allowed to load a constant SIML/SIOL.
-                drop(instance);
                 db.rec_gbl_init_simm(&rec_arc).await;
                 // C `wdogInit(prec)` from `init_record` pass 1
                 // (histogramRecord.c:168) — arms the SDEL monitor watchdog.
                 db.arm_watchdog(&def.name).await;
-                let mut instance = rec_arc.write().await;
+                let mut instance = rec_arc.write();
 
                 // Device support based on DTYP
                 let dtyp = instance.common.dtyp.clone();
@@ -489,7 +491,7 @@ record(ai, "AI:WITH:INFO") {
             .unwrap();
 
         let rec = db.get_record("AI:WITH:INFO").await.unwrap();
-        let inst = rec.read().await;
+        let inst = rec.read();
         assert_eq!(inst.get_info("asyn:READBACK"), Some("1"));
         assert_eq!(inst.get_info("Q:group"), Some("myGroup"));
         assert_eq!(inst.get_info("missing"), None);
@@ -520,7 +522,7 @@ record(ai, "AI:BPT") {
             .unwrap();
 
         let rec = db.get_record("AI:BPT").await.unwrap();
-        let mut inst = rec.write().await;
+        let mut inst = rec.write();
         // "ramp" is a non-standard name -> first user-table index (15); the
         // standard menuConvert names reserve 3..=14.
         assert_eq!(inst.record.get_field("LINR"), Some(EpicsValue::Short(15)));
@@ -578,7 +580,7 @@ record(ai, "AI:DYN") {
             .unwrap();
 
         let rec = db.get_record("AI:DYN").await.unwrap();
-        let inst = rec.read().await;
+        let inst = rec.read();
         assert!(
             inst.device.is_some(),
             "dynamic factory must attach when static factories miss"
@@ -652,7 +654,7 @@ record(ai, "REC:B") { field(DTYP, "DTB") }
         for name in ["REC:A", "REC:B"] {
             let rec = db.get_record(name).await.unwrap();
             assert!(
-                rec.read().await.device.is_some(),
+                rec.read().device.is_some(),
                 "factory chaining failed for {name}"
             );
         }

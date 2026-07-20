@@ -134,7 +134,7 @@ async fn dead_dol_raises_a_pending_link_alarm() {
     process(&db, "AAO:DEAD").await;
 
     let rec = db.get_record("AAO:DEAD").await.unwrap();
-    let common = &rec.read().await.common;
+    let common = &rec.read().common;
     assert_eq!(
         common.nsev,
         AlarmSeverity::Invalid,

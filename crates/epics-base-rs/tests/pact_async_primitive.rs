@@ -178,7 +178,7 @@ async fn post_fields_applies_and_posts_async_update() {
     // Subscribe to VAL (DBE_VALUE-class) before the async post.
     let mut rx = {
         let rec = db.get_record("T3").await.unwrap();
-        let mut inst = rec.write().await;
+        let mut inst = rec.write();
         inst.add_subscriber("VAL", 1, DbFieldType::Long, EventMask::VALUE.bits())
             .expect("VAL subscription accepted")
     };
@@ -192,7 +192,7 @@ async fn post_fields_applies_and_posts_async_update() {
     // Field value applied (read back through the record).
     {
         let rec = db.get_record("T3").await.unwrap();
-        let inst = rec.read().await;
+        let inst = rec.read();
         assert_eq!(
             inst.record.get_field("VAL"),
             Some(EpicsValue::Long(7)),
@@ -465,7 +465,7 @@ async fn set_async_context_delivers_working_cycle_free_handle() {
     assert_eq!(posted, vec!["VAL".to_string()], "VAL reported posted");
     {
         let rec = db.get_record("H1").await.unwrap();
-        let inst = rec.read().await;
+        let inst = rec.read();
         assert_eq!(
             inst.record.get_field("VAL"),
             Some(EpicsValue::Long(13)),
@@ -530,7 +530,7 @@ async fn write_db_link_notify_action_drives_downstream_and_reenters_source() {
     );
 
     let rec = db.get_record("DST").await.unwrap();
-    let inst = rec.read().await;
+    let inst = rec.read();
     assert_eq!(
         inst.record.get_field("VAL"),
         Some(EpicsValue::Long(42)),
@@ -617,7 +617,7 @@ async fn async_pending_notify_runs_write_db_link_on_pending_cycle() {
 
     // The link write ran on the async-pending cycle.
     let rec = db.get_record("PEND_DST").await.unwrap();
-    let inst = rec.read().await;
+    let inst = rec.read();
     assert_eq!(
         inst.record.get_field("VAL"),
         Some(EpicsValue::Long(42)),

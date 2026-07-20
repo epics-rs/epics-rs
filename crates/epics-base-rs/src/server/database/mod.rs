@@ -104,7 +104,7 @@ fn apply_timestamp(common: &mut super::record::CommonFields, _is_soft: bool) {
 /// Unified entry in the PV database.
 pub enum PvEntry {
     Simple(Arc<ProcessVariable>),
-    Record(Arc<RwLock<RecordInstance>>),
+    Record(Arc<parking_lot::RwLock<RecordInstance>>),
 }
 
 /// Callback for resolving external PV names (CA/PVA links).
@@ -227,7 +227,7 @@ pub struct CpTarget {
 
 struct PvDatabaseInner {
     simple_pvs: RwLock<HashMap<String, Arc<ProcessVariable>>>,
-    records: RwLock<HashMap<String, Arc<RwLock<RecordInstance>>>>,
+    records: RwLock<HashMap<String, Arc<parking_lot::RwLock<RecordInstance>>>>,
     /// Scan index: maps scan type → sorted set of
     /// `(PHAS, load_order, record_name)`.
     ///
@@ -663,7 +663,6 @@ impl PvDatabase {
         let instances: Vec<_> = self.inner.records.read().await.values().cloned().collect();
         for inst in instances {
             inst.write()
-                .await
                 .record
                 .install_breaktable_registry(snapshot.clone());
         }
@@ -948,7 +947,7 @@ impl PvDatabase {
             Some(r) => r,
             None => return Vec::new(),
         };
-        let inst = rec.read().await;
+        let inst = rec.read();
         let mut out = Vec::new();
         // Each field is parsed for ITS OWN link-field type: C `dbPutFieldLink`
         // passes `pfldDes->field_type` to `dbParseLink` (`dbAccess.c:1094`),
@@ -1364,11 +1363,10 @@ impl PvDatabase {
 
         let scan = instance.common.scan;
         let phas = instance.common.phas;
-        self.inner
-            .records
-            .write()
-            .await
-            .insert(name.to_string(), Arc::new(RwLock::new(instance)));
+        self.inner.records.write().await.insert(
+            name.to_string(),
+            Arc::new(parking_lot::RwLock::new(instance)),
+        );
 
         // Assign a monotonic load-order sequence — the scan-index
         // secondary sort key, so same-PHAS records keep load order.
@@ -1436,7 +1434,7 @@ impl PvDatabase {
             return false;
         };
         let scan = {
-            let inst = rec_arc.read().await;
+            let inst = rec_arc.read();
             inst.common.scan
         };
 
@@ -1682,7 +1680,7 @@ impl PvDatabase {
     /// Use [`Self::get_record_no_resolve`] when the caller already
     /// holds a canonical name and wants to suppress the alias path
     /// (e.g. to detect alias collisions during builder wiring).
-    pub async fn get_record(&self, name: &str) -> Option<Arc<RwLock<RecordInstance>>> {
+    pub async fn get_record(&self, name: &str) -> Option<Arc<parking_lot::RwLock<RecordInstance>>> {
         if let Some(rec) = self.inner.records.read().await.get(name).cloned() {
             return Some(rec);
         }
@@ -1693,7 +1691,10 @@ impl PvDatabase {
     /// Strict variant of [`Self::get_record`] — does NOT consult the
     /// alias table. Returns `Some` only when a canonical record with
     /// that exact name exists.
-    pub async fn get_record_no_resolve(&self, name: &str) -> Option<Arc<RwLock<RecordInstance>>> {
+    pub async fn get_record_no_resolve(
+        &self,
+        name: &str,
+    ) -> Option<Arc<parking_lot::RwLock<RecordInstance>>> {
         self.inner.records.read().await.get(name).cloned()
     }
 
@@ -2147,7 +2148,7 @@ mod tests {
         db.add_record("AI:BPT", Box::new(rec)).await.unwrap();
 
         let arc = db.get_record("AI:BPT").await.unwrap();
-        let mut inst = arc.write().await;
+        let mut inst = arc.write();
         inst.record.put_field("RVAL", EpicsValue::Long(50)).unwrap();
         inst.record.process().unwrap();
         // raw 50 in [0,100] -> eng 5.0, proving the registry was installed by
@@ -2178,7 +2179,7 @@ mod tests {
         db.add_breaktables(vec![ramp]).await;
 
         let arc = db.get_record("AI:BPT").await.unwrap();
-        let mut inst = arc.write().await;
+        let mut inst = arc.write();
         inst.record.put_field("RVAL", EpicsValue::Long(50)).unwrap();
         inst.record.process().unwrap();
         assert_eq!(inst.record.get_field("VAL"), Some(EpicsValue::Double(5.0)));
@@ -2579,7 +2580,7 @@ mod tests {
         // exact storage a `field_list()` String scan cannot reach.
         {
             let rec = db.get_record("AI").await.unwrap();
-            rec.write().await.common.inp = "pva://mini:current?proc=CP".to_string();
+            rec.write().common.inp = "pva://mini:current?proc=CP".to_string();
         }
 
         let links = db.record_link_fields("AI").await;

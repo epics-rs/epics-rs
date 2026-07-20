@@ -2670,7 +2670,7 @@ async fn dispatch_message(
 
                 let (dbr_type, element_count, target, long_string_mode) = match entry {
                     PvEntry::Simple(pv) => {
-                        let value = pv.get().await;
+                        let value = pv.get();
                         // `$` long-string — C dbChannel.c:486-503 requires the
                         // field to be DBF_STRING; other types get
                         // S_dbLib_fieldNotFound (CREATE_CH_FAIL). When it is a
@@ -4300,7 +4300,7 @@ async fn dispatch_message(
                             // only `if(pLog)`). Skip the frame when the
                             // chain drops the post — the subscription is
                             // still registered below.
-                            let snap = pv.snapshot().await;
+                            let snap = pv.snapshot();
                             if entry
                                 .filter_chain()
                                 .apply_to_event_value(snap.value.clone())
@@ -4323,7 +4323,7 @@ async fn dispatch_message(
                                 .await?;
                             }
                         } else {
-                            let mut snap = pv.snapshot().await;
+                            let mut snap = pv.snapshot();
                             // the initial monitor event is a
                             // CA monitor single-event post (C
                             // `db_post_single_event` →
@@ -5263,7 +5263,7 @@ async fn get_full_snapshot(
     target: &ChannelTarget,
 ) -> Option<epics_base_rs::server::snapshot::Snapshot> {
     match target {
-        ChannelTarget::SimplePv(pv) => Some(pv.snapshot().await),
+        ChannelTarget::SimplePv(pv) => Some(pv.snapshot()),
         ChannelTarget::RecordField { record, field } => {
             record.read().await.snapshot_for_field(field)
         }

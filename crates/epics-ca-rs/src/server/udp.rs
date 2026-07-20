@@ -403,6 +403,18 @@ pub(crate) struct SearchReplyBatch {
     client_minor: Option<u16>,
 }
 
+impl SearchReplyBatch {
+    /// Shape the trailing (post-last-flush) batch into its on-wire bytes,
+    /// or `None` when empty. The blocking responder
+    /// (`crate::server::blocking`) calls this to emit the final datagram
+    /// after [`parse_search_datagram`] returns; the async responder does the
+    /// equivalent through [`flush_send_buf`]. Encapsulates the private batch
+    /// fields so the shaping stays in one place.
+    pub(crate) fn shape_trailing(&self) -> Option<Vec<u8>> {
+        shape_search_reply_dg(&self.send_buf, self.client_minor, self.client_seq)
+    }
+}
+
 /// Parse one inbound UDP datagram's CA messages (VERSION + SEARCH),
 /// appending SEARCH-reply bytes to `batch`. This is the shared
 /// decode/respond core of the CA UDP name-search responder: the async
@@ -768,15 +780,7 @@ async fn recv_loop(
         let mut batch = SearchReplyBatch::default();
         'parse: loop {
             let mut ready: Vec<Vec<u8>> = Vec::new();
-            parse_search_datagram(
-                &current_buf,
-                &db,
-                tcp_port,
-                src,
-                &mut batch,
-                &mut ready,
-            )
-            .await;
+            parse_search_datagram(&current_buf, &db, tcp_port, src, &mut batch, &mut ready).await;
             // Send this datagram's over-threshold batches to its peer. C
             // `cas_send_dg_msg` flushes each full batch as it is built
             // (`caserverio.c:280-294`); the trailing partial batch is flushed

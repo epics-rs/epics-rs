@@ -284,7 +284,7 @@ impl AsyncDbHandle {
         &self,
         token: AsyncToken,
         completion: crate::runtime::sync::oneshot::Receiver<()>,
-    ) -> Option<tokio::task::JoinHandle<()>> {
+    ) -> Option<crate::runtime::task::TaskHandle<()>> {
         self.db()
             .map(|db| db.reprocess_on_notify(token, completion))
     }
@@ -1048,7 +1048,7 @@ impl PvDatabase {
         &self,
         token: AsyncToken,
         completion: crate::runtime::sync::oneshot::Receiver<()>,
-    ) -> tokio::task::JoinHandle<()> {
+    ) -> crate::runtime::task::TaskHandle<()> {
         let db = self.clone();
         crate::runtime::task::spawn(async move {
             // `Err` means the sender was dropped without firing (the

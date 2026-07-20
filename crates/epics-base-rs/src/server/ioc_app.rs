@@ -627,6 +627,16 @@ impl IocApplication {
         // being built (R18-92).
         db.begin_load()
             .expect("a database created a line ago has not run iocInit");
+
+        // On RTEMS, bring up the background executor (callback pool, delayed
+        // timer, scanOnce worker) before any record processing can defer a
+        // tail — C parity: `callbackInit` runs early in `iocInit`
+        // (callback.c:286). Hosted builds drive tails on the tokio runtime and
+        // skip this; a spawn/sleep/interval on a path that never reaches here
+        // still lazy-inits the same executor on first use.
+        #[cfg(target_os = "rtems")]
+        crate::runtime::task::background_init();
+
         let handle = tokio::runtime::Handle::current();
 
         let Self {

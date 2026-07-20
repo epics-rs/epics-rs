@@ -3,7 +3,6 @@ use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
 use tokio::runtime::RuntimeFlavor;
-use tokio::task::JoinHandle;
 
 pub use tokio::runtime::Handle as RuntimeHandle;
 
@@ -120,7 +119,74 @@ pub fn block_on_sync<F: Future>(fut: F) -> Result<F::Output, NotBlockable> {
     }
 }
 
-pub fn spawn<F>(future: F) -> JoinHandle<F::Output>
+// ---------------------------------------------------------------------------
+// Platform-selected task handle types (decision A2 / B)
+//
+// The seam hands back one of these aliases from every spawn; call sites in this
+// crate name only the alias, never a tokio handle. Hosted = the tokio handle
+// types. RTEMS = the always-compiled, host-tested mirrors in
+// `background::future_exec` (`JoinFuture`/`AbortHandle`/`JoinError`), which
+// reproduce exactly the subset of the tokio surface the call sites use.
+// ---------------------------------------------------------------------------
+
+/// Handle to a spawned task — `await` for its result, `abort()` to cancel.
+#[cfg(not(target_os = "rtems"))]
+pub type TaskHandle<T> = tokio::task::JoinHandle<T>;
+/// Detached cancellation handle for a spawned task.
+#[cfg(not(target_os = "rtems"))]
+pub type TaskAbortHandle = tokio::task::AbortHandle;
+/// Error from awaiting a [`TaskHandle`] (cancelled or panicked).
+#[cfg(not(target_os = "rtems"))]
+pub type TaskJoinError = tokio::task::JoinError;
+
+#[cfg(target_os = "rtems")]
+pub type TaskHandle<T> = crate::runtime::background::future_exec::JoinFuture<T>;
+#[cfg(target_os = "rtems")]
+pub type TaskAbortHandle = crate::runtime::background::future_exec::AbortHandle;
+#[cfg(target_os = "rtems")]
+pub type TaskJoinError = crate::runtime::background::future_exec::JoinError;
+
+// ---------------------------------------------------------------------------
+// Process-global background executor (RTEMS spawn/timer backend)
+//
+// On RTEMS the seam routes every spawn/sleep/interval into one process-global
+// `BackgroundExecutor` (callback pool + delayed timer + scanOnce worker). Two
+// init paths, both landing on the same `OnceLock`:
+//
+//   * Explicit — `background_init()` from `IocApplication::run`, mirroring C's
+//     `callbackInit` running early in `iocInit` (callback.c:286) so the
+//     facilities exist before any record processing can defer a tail.
+//   * Lazy fallback — the first `spawn`/`sleep`/`interval` on a path that
+//     never went through `run` (a unit test, an embedded harness) initialises
+//     it on demand via the same `get_or_init`.
+//
+// Compiled on RTEMS and under `cfg(test)` (so the wiring is host-exercised);
+// on a hosted non-test build the tokio runtime is the backend and this is not
+// compiled.
+// ---------------------------------------------------------------------------
+
+#[cfg(any(target_os = "rtems", test))]
+static BACKGROUND: std::sync::OnceLock<crate::runtime::background::BackgroundExecutor> =
+    std::sync::OnceLock::new();
+
+/// The process-global background executor, initialised on first use.
+#[cfg(any(target_os = "rtems", test))]
+fn background() -> &'static crate::runtime::background::BackgroundExecutor {
+    BACKGROUND.get_or_init(crate::runtime::background::BackgroundExecutor::new)
+}
+
+/// Eagerly start the process-global background executor — C `callbackInit`
+/// parity (callback.c:286), called once from `IocApplication::run`. Idempotent:
+/// a second call (or a prior lazy init) is a no-op, matching `callbackInit`'s
+/// own re-entry guard (callback.c:292-295). Only the RTEMS build uses the
+/// executor; hosted builds drive tails on the tokio runtime.
+#[cfg(any(target_os = "rtems", test))]
+pub fn background_init() {
+    let _ = background();
+}
+
+#[cfg(not(target_os = "rtems"))]
+pub fn spawn<F>(future: F) -> TaskHandle<F::Output>
 where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
@@ -128,7 +194,24 @@ where
     tokio::spawn(future)
 }
 
-pub fn spawn_blocking<F, R>(f: F) -> JoinHandle<R>
+/// RTEMS: drive the tail on a callback-pool worker via the host-tested future
+/// executor, at the default Medium band.
+#[cfg(target_os = "rtems")]
+pub fn spawn<F>(future: F) -> TaskHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    use crate::runtime::background::future_exec::{DEFAULT_SPAWN_PRIORITY, spawn_future};
+    spawn_future(
+        &background().callbacks().handle(),
+        DEFAULT_SPAWN_PRIORITY,
+        future,
+    )
+}
+
+#[cfg(not(target_os = "rtems"))]
+pub fn spawn_blocking<F, R>(f: F) -> TaskHandle<R>
 where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
@@ -136,25 +219,58 @@ where
     tokio::task::spawn_blocking(f)
 }
 
+/// RTEMS: run the blocking closure on a callback-pool worker at the default
+/// Medium band via the host-tested future executor.
+#[cfg(target_os = "rtems")]
+pub fn spawn_blocking<F, R>(f: F) -> TaskHandle<R>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    use crate::runtime::background::future_exec::{DEFAULT_SPAWN_PRIORITY, spawn_blocking_on};
+    spawn_blocking_on(
+        &background().callbacks().handle(),
+        DEFAULT_SPAWN_PRIORITY,
+        f,
+    )
+}
+
+#[cfg(not(target_os = "rtems"))]
 pub async fn sleep(duration: Duration) {
     tokio::time::sleep(duration).await;
 }
 
+/// RTEMS: sleep on the delayed-callback timer via the host-tested `Sleep`.
+#[cfg(target_os = "rtems")]
+pub async fn sleep(duration: Duration) {
+    crate::runtime::background::timer_sleep::sleep(&background().timer().handle(), duration).await;
+}
+
+#[cfg(not(target_os = "rtems"))]
 pub async fn sleep_until(deadline: std::time::Instant) {
     tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+}
+
+/// RTEMS: sleep-until on the delayed-callback timer via the host-tested `Sleep`.
+#[cfg(target_os = "rtems")]
+pub async fn sleep_until(deadline: std::time::Instant) {
+    crate::runtime::background::timer_sleep::sleep_until(&background().timer().handle(), deadline)
+        .await;
 }
 
 /// Periodic ticker — the seam replacement for `tokio::time::interval`, so no
 /// production site names `tokio::time` directly (decision A2). The hosted build
 /// wraps `tokio::time::Interval`, preserving its default
 /// `MissedTickBehavior::Burst` catch-up and immediate first tick; the RTEMS
-/// build (wired in the cfg switch) substitutes the runtime-free
+/// build substitutes the runtime-free
 /// [`crate::runtime::background::timer_sleep::TimerInterval`], which reproduces
 /// the same semantics over the delayed-callback timer.
+#[cfg(not(target_os = "rtems"))]
 pub struct Interval {
     inner: tokio::time::Interval,
 }
 
+#[cfg(not(target_os = "rtems"))]
 impl Interval {
     /// Complete at the next tick. The first tick is immediate (tokio parity);
     /// callers that want to skip it await `tick()` once up front.
@@ -163,12 +279,24 @@ impl Interval {
     }
 }
 
+/// RTEMS: the periodic ticker is the runtime-free `TimerInterval` (same
+/// immediate-first-tick + Burst catch-up semantics, same `tick()` surface).
+#[cfg(target_os = "rtems")]
+pub type Interval = crate::runtime::background::timer_sleep::TimerInterval;
+
 /// Build a periodic ticker firing every `period` — the seam replacement for
 /// `tokio::time::interval`.
+#[cfg(not(target_os = "rtems"))]
 pub fn interval(period: Duration) -> Interval {
     Interval {
         inner: tokio::time::interval(period),
     }
+}
+
+/// RTEMS: build the periodic ticker on the delayed-callback timer.
+#[cfg(target_os = "rtems")]
+pub fn interval(period: Duration) -> Interval {
+    crate::runtime::background::timer_sleep::interval(&background().timer().handle(), period)
 }
 
 pub fn runtime_handle() -> tokio::runtime::Handle {
@@ -380,7 +508,8 @@ fn apply_priority_impl(_epics_priority: u8) -> PriorityApplied {
 /// honoured the request. This is the priority-aware counterpart of
 /// [`spawn_blocking`] for IOC threads (CA server, scan) that a C IOC
 /// would run in a distinct SCHED band.
-pub fn spawn_blocking_with_priority<F, R>(priority: ThreadPriority, f: F) -> JoinHandle<R>
+#[cfg(not(target_os = "rtems"))]
+pub fn spawn_blocking_with_priority<F, R>(priority: ThreadPriority, f: F) -> TaskHandle<R>
 where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
@@ -389,6 +518,27 @@ where
         let _ = apply_to_current_thread(priority);
         f()
     })
+}
+
+/// RTEMS: run the blocking closure on a callback-pool worker.
+///
+/// The requested EPICS [`ThreadPriority`] is **not** yet mapped onto a callback
+/// band here: the pool workers are long-lived and shared, so re-prioritising the
+/// running worker per task would leak that priority into the next callback it
+/// drains. The closure runs at the pool's default Medium band; mapping
+/// `ThreadPriority` to a `CallbackPriority` band is deferred to RTEMS bring-up.
+#[cfg(target_os = "rtems")]
+pub fn spawn_blocking_with_priority<F, R>(_priority: ThreadPriority, f: F) -> TaskHandle<R>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    use crate::runtime::background::future_exec::{DEFAULT_SPAWN_PRIORITY, spawn_blocking_on};
+    spawn_blocking_on(
+        &background().callbacks().handle(),
+        DEFAULT_SPAWN_PRIORITY,
+        f,
+    )
 }
 
 #[cfg(test)]
@@ -473,5 +623,23 @@ mod tests {
     async fn spawn_blocking_with_priority_runs_closure() {
         let handle = spawn_blocking_with_priority(ThreadPriority::CaServerHigh, || 7);
         assert_eq!(handle.await.unwrap(), 7);
+    }
+
+    #[test]
+    fn background_global_inits_and_runs_work() {
+        // Host-exercises the OnceLock init path the RTEMS spawn/sleep/interval
+        // arms rely on: background_init() forces creation, background() hands
+        // back a usable executor whose callback pool runs submitted work.
+        background_init();
+        let exec = background();
+        let (tx, rx) = std::sync::mpsc::channel();
+        exec.callbacks()
+            .handle()
+            .request(
+                crate::runtime::background::CallbackPriority::Medium,
+                Box::new(move || tx.send(1u8).unwrap()),
+            )
+            .unwrap();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), 1);
     }
 }

@@ -4,7 +4,8 @@ use std::sync::Arc;
 use crate::server::database::PvDatabase;
 use crate::types::EpicsValue;
 use tokio::sync::watch;
-use tokio::task::JoinHandle;
+
+use crate::runtime::task::TaskHandle;
 
 use super::error::{AutosaveError, AutosaveResult};
 use super::format::CompatMode;
@@ -99,7 +100,7 @@ impl AutosaveManager {
     }
 
     /// Start all periodic/triggered/onchange tasks. Returns a join handle.
-    pub fn start(self: Arc<Self>, db: Arc<PvDatabase>) -> JoinHandle<()> {
+    pub fn start(self: Arc<Self>, db: Arc<PvDatabase>) -> TaskHandle<()> {
         crate::runtime::task::spawn(async move {
             let mut handles = Vec::new();
 

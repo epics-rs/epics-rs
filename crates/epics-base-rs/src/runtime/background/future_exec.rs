@@ -1,8 +1,7 @@
 //! Runtime-free future executor over the callback pool — the RTEMS backend for
-//! [`crate::runtime::task::spawn`] / [`spawn_blocking`] (decision A2, increment
-//! W3b).
+//! [`crate::runtime::task::spawn`] / [`crate::runtime::task::spawn_blocking`]
+//! (decision A2, increment W3b).
 //!
-//! [`crate::runtime::task::park_the_thread`]:
 //! # Model
 //!
 //! A hosted build runs a spawned async *tail* as a tokio task. RTEMS has no

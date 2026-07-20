@@ -1,8 +1,7 @@
 //! Timer-backed `sleep` / `sleep_until` futures — the RTEMS backend for
-//! [`crate::runtime::task::sleep`] / [`sleep_until`] (decision A2, increment
-//! W3b item 4).
+//! [`crate::runtime::task::sleep`] / [`crate::runtime::task::sleep_until`]
+//! (decision A2, increment W3b item 4).
 //!
-//! [`crate::runtime::task::sleep`]:
 //! # Model
 //!
 //! A hosted build sleeps via `tokio::time::sleep`, whose waker is driven by the

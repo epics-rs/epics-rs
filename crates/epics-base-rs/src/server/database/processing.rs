@@ -182,13 +182,13 @@ impl AsyncDbHandle {
 
     /// Out-of-band field post — see [`PvDatabase::post_fields`]. Returns an
     /// empty `Vec` (no-op) if the database has been dropped.
-    pub async fn post_fields(
+    pub fn post_fields(
         &self,
         name: &str,
         fields: Vec<(String, EpicsValue)>,
     ) -> CaResult<Vec<String>> {
         match self.db() {
-            Some(db) => db.post_fields(name, fields).await,
+            Some(db) => db.post_fields(name, fields),
             None => Ok(Vec::new()),
         }
     }
@@ -937,7 +937,7 @@ impl PvDatabase {
     /// readback) that is independent of any process cycle. Returns the
     /// field names actually posted, or [`CaError::ChannelNotFound`] if the
     /// record is absent.
-    pub async fn post_fields(
+    pub fn post_fields(
         &self,
         name: &str,
         fields: Vec<(String, EpicsValue)>,
@@ -947,7 +947,6 @@ impl PvDatabase {
             fields,
             crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::LOG,
         )
-        .await
     }
 
     /// Out-of-band PROPERTY-class field post — the C
@@ -962,18 +961,17 @@ impl PvDatabase {
     /// signals a *property* change, not a value change: a driver that re-keys
     /// its enum strings has not produced a new reading, only new choice
     /// labels. Returns the field names actually posted.
-    pub async fn post_property_fields(
+    pub fn post_property_fields(
         &self,
         name: &str,
         fields: Vec<(String, EpicsValue)>,
     ) -> CaResult<Vec<String>> {
         self.post_fields_with_mask(name, fields, crate::server::recgbl::EventMask::PROPERTY)
-            .await
     }
 
     /// Shared body of [`Self::post_fields`] / [`Self::post_property_fields`]:
     /// write+notify each field under one record-write lock, posting `mask`.
-    async fn post_fields_with_mask(
+    fn post_fields_with_mask(
         &self,
         name: &str,
         fields: Vec<(String, EpicsValue)>,

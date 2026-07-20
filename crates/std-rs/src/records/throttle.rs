@@ -216,15 +216,13 @@ impl ThrottleRecord {
             let (ov, _) = classify_link(&handle, &out, LinkRole::Output).await;
             let (siv, _) = classify_link(&handle, &sinp, LinkRole::Input).await;
             if link_gen.is_current(token) {
-                let _ = handle
-                    .post_fields(
-                        &name,
-                        vec![
-                            ("OV".to_string(), EpicsValue::Short(ov)),
-                            ("SIV".to_string(), EpicsValue::Short(siv)),
-                        ],
-                    )
-                    .await;
+                let _ = handle.post_fields(
+                    &name,
+                    vec![
+                        ("OV".to_string(), EpicsValue::Short(ov)),
+                        ("SIV".to_string(), EpicsValue::Short(siv)),
+                    ],
+                );
             }
         });
     }
@@ -264,7 +262,7 @@ impl ThrottleRecord {
             }
             // C posts SYNC=Idle last (throttleRecord.c:651).
             fields.push(("SYNC".to_string(), EpicsValue::Short(THROTTLE_SYNC_IDLE)));
-            let _ = handle.post_fields(&name, fields).await;
+            let _ = handle.post_fields(&name, fields);
         });
     }
 

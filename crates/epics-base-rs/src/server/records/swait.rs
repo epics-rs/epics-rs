@@ -386,7 +386,7 @@ impl SwaitRecord {
                 ));
             }
             if link_gen.is_current(token) {
-                let _ = handle.post_fields(&rec_name, fields).await;
+                let _ = handle.post_fields(&rec_name, fields);
             }
         });
     }

@@ -185,7 +185,6 @@ async fn post_fields_applies_and_posts_async_update() {
 
     let posted = db
         .post_fields("T3", vec![("VAL".to_string(), EpicsValue::Long(7))])
-        .await
         .expect("post_fields on an existing record");
     assert_eq!(posted, vec!["VAL".to_string()], "VAL reported as posted");
 
@@ -460,7 +459,6 @@ async fn set_async_context_delivers_working_cycle_free_handle() {
     // Out-of-band field post through the delivered handle.
     let posted = handle
         .post_fields("H1", vec![("VAL".to_string(), EpicsValue::Long(13))])
-        .await
         .expect("post through a live handle");
     assert_eq!(posted, vec!["VAL".to_string()], "VAL reported posted");
     {
@@ -483,7 +481,6 @@ async fn set_async_context_delivers_working_cycle_free_handle() {
     );
     let after = handle
         .post_fields("H1", vec![("VAL".to_string(), EpicsValue::Long(99))])
-        .await
         .expect("post through a dead handle is Ok");
     assert!(
         after.is_empty(),

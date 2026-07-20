@@ -509,7 +509,7 @@ impl SseqRecord {
             let name = name.clone();
             let handle = handle.clone();
             tokio::spawn(async move {
-                let _ = handle.post_fields(&name, fields).await;
+                let _ = handle.post_fields(&name, fields);
             });
         }
     }
@@ -985,7 +985,7 @@ impl SseqRecord {
             }
             // Publish only if no newer refresh was issued meanwhile.
             if link_gen.is_current(token) {
-                let _ = handle.post_fields(&name, fields).await;
+                let _ = handle.post_fields(&name, fields);
             }
         });
     }

@@ -2083,7 +2083,7 @@ impl AsynRecord {
                 if changed.is_empty() {
                     return;
                 }
-                let _ = db.post_fields(&name, changed).await;
+                let _ = db.post_fields(&name, changed);
             });
         });
         self.except_cb = Some((mgr, id));
@@ -2340,7 +2340,7 @@ impl AsynRecord {
             return;
         };
         rt.spawn(async move {
-            let _ = db.post_fields(&name, changed).await;
+            let _ = db.post_fields(&name, changed);
         });
     }
 

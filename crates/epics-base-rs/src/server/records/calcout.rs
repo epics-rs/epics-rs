@@ -441,7 +441,7 @@ impl CalcoutRecord {
             fields.push(("OUTV".to_string(), EpicsValue::Enum(out_status as u16)));
             // Publish only if no newer refresh was issued meanwhile.
             if link_gen.is_current(token) {
-                let _ = handle.post_fields(&name, fields).await;
+                let _ = handle.post_fields(&name, fields);
             }
         });
     }

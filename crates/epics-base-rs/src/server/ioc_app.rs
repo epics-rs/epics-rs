@@ -1343,7 +1343,7 @@ pub(crate) async fn setup_property_posts(db: Arc<PvDatabase>) -> usize {
                         // Each message is the full setEnums field block; post
                         // it DBE_PROPERTY so clients re-read the choices.
                         while let Some(fields) = rx.recv().await {
-                            let _ = db_clone.post_property_fields(&rec_name, fields).await;
+                            let _ = db_clone.post_property_fields(&rec_name, fields);
                         }
                     });
                     count += 1;

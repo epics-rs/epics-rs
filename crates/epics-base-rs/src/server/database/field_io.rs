@@ -2600,7 +2600,6 @@ mod tests {
                 "M:ENUM",
                 vec![("ZRST".to_string(), EpicsValue::String("LABEL".into()))],
             )
-            .await
             .expect("post_property_fields succeeds");
         assert_eq!(posted, vec!["ZRST".to_string()]);
 

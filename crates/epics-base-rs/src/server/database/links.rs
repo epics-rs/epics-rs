@@ -2494,12 +2494,10 @@ impl PvDatabase {
                     // field already holds the old value (snapshot read), so
                     // `post_fields` (write + post) is needed only on change.
                     if new_dov != grp.dov {
-                        let _ = self
-                            .post_fields(
-                                &rec_name,
-                                vec![(DO_NAMES[idx].to_string(), EpicsValue::Double(new_dov))],
-                            )
-                            .await;
+                        let _ = self.post_fields(
+                            &rec_name,
+                            vec![(DO_NAMES[idx].to_string(), EpicsValue::Double(new_dov))],
+                        );
                     }
                 }
             }

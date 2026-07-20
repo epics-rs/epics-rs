@@ -257,15 +257,24 @@ surface that must cross to RTEMS is smaller than the raw dep list suggests.
 
 ### 8.1 Hard blockers — core network path, must solve
 
-| Crate | Why | Path |
-|---|---|---|
-| **mio 1.2** (under tokio) | no RTEMS backend | §4 — select reactor, or CA blocking-thread needs none |
-| **socket2 0.5** (`features=["all"]`, **non-optional**; asyn/base/ca/pva) | SO_REUSEADDR / multicast joins / buffer sizes — required for CA/PVA UDP discovery. RTEMS target-cfg recognition unverified | RTEMS libc has setsockopt; if socket2 rejects the target, wrap just those options over raw libc |
-| **getrandom 0.2** (transitive: ed25519 / rustls / ahash …) | unsupported target = compile error | RTEMS newlib has `getentropy`/`arc4random_buf` → rtems branch or custom-source registration |
-| **if-addrs / hostname / mdns-sd** | interface enumeration (getifaddrs) / gethostname — needed for interface binding & beacon addrs | libbsd has getifaddrs; if newlib-only, substitute |
+**All three suspects CONFIRMED to fail `cargo check --target armv7-rtems-eabihf`
+on 2026-07-20** (isolated probe crate, nightly `-Z build-std`; see §11 for the
+run). The failures are deeper than "the crate doesn't recognize the target":
+in several cases the symbol is genuinely **absent from rust-lang/libc's
+newlib/rtems binding** (`libc-0.2.186/src/unix/newlib/arm/mod.rs`), which is
+minimal.
 
-All four are libc-level, bounded, and the relevant functions exist in RTEMS
-libc. None is as heavy as the reactor.
+| Crate | Status | What is missing on RTEMS | Path |
+|---|---|---|---|
+| **mio 1.2** (under tokio) | blocked (by design) | no epoll/kqueue | §4 — select reactor, or CA blocking-thread needs none |
+| **socket2 0.5** (`features=["all"]`, **non-optional**; asyn/base/ca/pva) | **FAILS — 20 errors** | libc lacks `msghdr`/`recvmsg`/`sendmsg`/`IovLen` (scatter-gather), `ip_mreqn` (only `ip_mreq` exists), `ip_mreq_source`+`IP_{ADD,DROP}_SOURCE_MEMBERSHIP`, `SOCK_RAW`/`SOCK_RDM`/`SOCK_SEQPACKET`, `MSG_TRUNC`/`MSG_EOR`, `IPV6_RECVHOPLIMIT`/`IPV6_RECVTCLASS`/`IP_HDRINCL`/`IP_RECVTOS` | Most missing symbols are for APIs CA/PVA do **not** use (raw/seqpacket sockets, source-specific multicast, sendmsg/recvmsg). The subset they need — basic multicast join (`ip_mreq`, present), `setsockopt` for SO_REUSEADDR/buffer sizes — works over raw libc. Wrap that subset; do not port all of socket2. |
+| **getrandom 0.2.17** (transitive: ed25519 / rustls / ahash …) | **FAILS — explicit `compile_error!("target is not supported")`** | RTEMS not in getrandom 0.2's supported-target list | RTEMS newlib *does* have `getentropy`/`arc4random_buf` → register a custom source (`register_custom_getrandom!`) or move to a getrandom version/backend that maps RTEMS onto them |
+| **if-addrs 0.13.4** | **FAILS — 2 errors** | libc lacks `getifaddrs`/`freeifaddrs`/`ifaddrs` for rtems; the non-Apple path also needs Linux `sockaddr_nl`/`AF_NETLINK`/`NETLINK_ROUTE`/`SOCK_RAW` | Interface enumeration must use an RTEMS-specific route (libbsd `getifaddrs` via a `-sys` binding, or an RTEMS ioctl-based enumerator). Not a drop-in. |
+
+Positive result from the same run: **`std` itself builds for
+`armv7-rtems-eabihf`** via `-Z build-std` **without** an RTEMS gcc/BSP present —
+so `cargo check` is a usable RTEMS gate on this machine today. The blockers are
+all in these leaf crates, not in std.
 
 ### 8.2 Gateable — excluded from the RTEMS build
 
@@ -337,10 +346,18 @@ half — before the heavier PVA reactor work in phase 5.
 
 These were reasoned from source/library presence, **not** compiled:
 
-- Whether **socket2 0.5**, **getrandom 0.2**, and **if-addrs** actually compile
-  for `armv7-rtems-eabihf`. libc *having* the function ≠ the crate *recognizing*
-  the target cfg. Close with a real `cargo check --target armv7-rtems-eabihf`
-  and enumerate which crates emit cfg errors.
+- ~~Whether **socket2 0.5**, **getrandom 0.2**, and **if-addrs** actually
+  compile for `armv7-rtems-eabihf`.~~ **CLOSED 2026-07-20.** Ran
+  `cargo +nightly check -Z build-std=std,panic_abort
+  --target armv7-rtems-eabihf` against an isolated probe crate depending on the
+  three at their locked versions. Result: **std built for RTEMS with no BSP
+  present; all three leaf crates FAILED** — getrandom 0.2.17 with an explicit
+  `compile_error!` (unsupported target), if-addrs 0.13.4 on missing
+  `getifaddrs`/netlink symbols, socket2 0.5.10 with 20 errors on missing
+  msghdr/recvmsg/sendmsg/ip_mreqn/SOCK_RAW/etc. Details and remediation in §8.1.
+  Net: the RTEMS core-network dependency work is real but bounded to these three
+  leaves (plus mio), and CA/PVA use only a subset of socket2 that maps onto
+  what RTEMS libc *does* expose.
 - Whether the `polling`/`async-io` stack can host an RTEMS `poll`/`select`
   backend today (it has a poll-based fallback; RTEMS-specific support unchecked)
   — only matters if the fallback desktop-stack swap in phase 6 is triggered.

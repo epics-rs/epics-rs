@@ -23,6 +23,7 @@
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
+use epics_base_rs::server::record::ProcessCompletion;
 use epics_base_rs::types::EpicsValue;
 
 // "A"/"S": default (empty CALC → fails every cycle, so a put byte survives).
@@ -54,7 +55,7 @@ async fn udf_byte(db: &PvDatabase, rec: &str) -> u8 {
 /// A `caput <rec>.UDF <text>` — a string, as `caput` sends; UDF's `pp(TRUE)`
 /// drives a process, so await the returned notify before reading back.
 async fn caput_udf(db: &PvDatabase, rec: &str, text: &str) {
-    if let Some(rx) = db
+    if let ProcessCompletion::Async(rx) = db
         .put_record_field_from_ca(rec, "UDF", EpicsValue::String(text.into()))
         .await
         .unwrap()

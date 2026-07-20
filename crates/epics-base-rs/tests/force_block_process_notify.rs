@@ -45,7 +45,7 @@ async fn force_block_sync_record_returns_none_and_processes() {
         .await
         .expect("process must succeed");
     assert!(
-        completion.is_none(),
+        completion.is_sync(),
         "a synchronous forced process drains the put-notify wait-set inside \
          processing, so no completion receiver is handed back"
     );
@@ -91,7 +91,7 @@ async fn force_block_async_record_withholds_completion_until_processing_done() {
         .await
         .expect("process must succeed");
     assert!(
-        completion.is_some(),
+        completion.is_async(),
         "a forced process of an async (ODLY-PACT) record must withhold \
          completion — the reply barrier holds until the delay finishes"
     );

@@ -72,7 +72,7 @@ async fn put_notify(db: &PvDatabase, pv: &str, field: &str, value: &str) -> bool
         .put_record_field_from_ca(pv, field, EpicsValue::String(value.into()))
         .await
         .unwrap_or_else(|e| panic!("caput -c {pv}.{field} '{value}': {e:?}"));
-    rx.is_none()
+    rx.is_sync()
 }
 
 async fn readback(db: &PvDatabase, pv: &str, field: &str) -> String {

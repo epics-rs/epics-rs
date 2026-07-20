@@ -3798,7 +3798,12 @@ async fn dispatch_message(
                 )
             });
 
-            let write_result = match &entry.target {
+            // The completion outcome of the synchronous head of this write —
+            // `Sync` (reply inline) vs `Async(handle)` (spawn a completion task
+            // that replies when the record's chain settles). A simple PV and a
+            // fire-and-forget `CA_PROTO_WRITE` are always synchronous.
+            use epics_base_rs::server::record::ProcessCompletion;
+            let write_result: CaResult<ProcessCompletion> = match &entry.target {
                 ChannelTarget::SimplePv(pv) => {
                     if let Some(hook) = pv.write_hook() {
                         let ctx = epics_base_rs::server::pv::WriteContext {
@@ -3806,10 +3811,10 @@ async fn dispatch_message(
                             host: state.hostname.as_str().to_string(),
                             peer: state.peer.clone(),
                         };
-                        hook(new_value, ctx).await.map(|()| None)
+                        hook(new_value, ctx).await.map(|()| ProcessCompletion::Sync)
                     } else {
                         pv.set(new_value).await;
-                        Ok(None)
+                        Ok(ProcessCompletion::Sync)
                     }
                 }
                 ChannelTarget::RecordField { record, field } => {
@@ -3828,7 +3833,7 @@ async fn dispatch_message(
                         // ECA_PUTCBINPROG in the meantime.
                         db.put_record_field_from_ca_no_notify(&name, field, new_value)
                             .await
-                            .map(|()| None)
+                            .map(|()| ProcessCompletion::Sync)
                     }
                 }
             };
@@ -3841,7 +3846,7 @@ async fn dispatch_message(
             // the guard. The async path instead hands the guard to the
             // completion task so AfterWrite reflects real device-side
             // completion timing (C `write_notify_reply:1400`).
-            let needs_async_after = is_notify && matches!(&write_result, Ok(Some(_)));
+            let needs_async_after = is_notify && matches!(&write_result, Ok(pc) if pc.is_async());
             if !needs_async_after {
                 if let Some(guard) = &mut trap_guard {
                     guard.complete(audit_result);
@@ -3884,8 +3889,11 @@ async fn dispatch_message(
                 // background task to await completion and send the response.
                 // This avoids blocking the client handler loop, which would
                 // freeze all camonitor subscriptions on this connection.
+                // `Async(rx)` ⟹ the record's chain is still running: hand the
+                // handle to a completion task. `Sync` and any `Err` ⟹ reply
+                // inline now (an error carries no completion to await).
                 let completion_rx: Option<tokio::sync::oneshot::Receiver<()>> =
-                    write_result.unwrap_or_default();
+                    write_result.ok().and_then(ProcessCompletion::into_handle);
 
                 if let Some(rx) = completion_rx {
                     // This put-callback is now async (record processing is

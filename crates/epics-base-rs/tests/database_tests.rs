@@ -3845,8 +3845,8 @@ async fn test_put_notify_sync_chain_completes_immediately() {
         .await
         .expect("put must succeed");
     assert!(
-        result.is_none(),
-        "a fully synchronous chain drains the wait-set in-call → Ok(None); \
+        result.is_sync(),
+        "a fully synchronous chain drains the wait-set in-call → Sync; \
          got a deferred receiver instead"
     );
 }
@@ -3877,10 +3877,10 @@ async fn test_put_notify_defers_for_async_flnk_target() {
         .await
         .expect("put must succeed");
     let mut rx = match result {
-        Some(rx) => rx,
-        None => panic!(
+        ProcessCompletion::Async(rx) => rx,
+        ProcessCompletion::Sync => panic!(
             "an async FLNK target must defer completion — \
-             the put returned immediate (Ok(None)) instead of a receiver"
+             the put returned immediate (Sync) instead of a receiver"
         ),
     };
     // The async FLNK target is in flight; completion MUST NOT have fired.
@@ -3920,10 +3920,10 @@ async fn test_put_notify_defers_for_async_out_pp_target() {
         .await
         .expect("put must succeed");
     let mut rx = match result {
-        Some(rx) => rx,
-        None => panic!(
+        ProcessCompletion::Async(rx) => rx,
+        ProcessCompletion::Sync => panic!(
             "an async OUT PP target must defer completion — \
-             the put returned immediate (Ok(None)) instead of a receiver"
+             the put returned immediate (Sync) instead of a receiver"
         ),
     };
     assert!(
@@ -3957,7 +3957,7 @@ async fn test_put_notify_refuses_second_in_flight() {
         .await
         .expect("first put must succeed");
     assert!(
-        first.is_some(),
+        first.is_async(),
         "async record's first put must return a deferred receiver"
     );
 
@@ -4014,6 +4014,7 @@ async fn test_fire_and_forget_put_parks_no_notify_write_notify_stays_legal() {
         .put_record_field_from_ca("PN_FF", "VAL", EpicsValue::Double(2.0))
         .await
         .expect("WRITE_NOTIFY after a fire-and-forget put must be accepted")
+        .into_handle()
         .expect("record is still async-pending → completion is deferred");
 
     // The record is PACT, so C `processNotifyCommon` (dbNotify.c:225-231) writes
@@ -4065,6 +4066,7 @@ async fn test_fire_and_forget_put_does_not_disturb_parked_notify() {
         .put_record_field_from_ca("PN_FF2", "VAL", EpicsValue::Double(1.0))
         .await
         .expect("WRITE_NOTIFY must succeed")
+        .into_handle()
         .expect("async record defers completion");
 
     db.put_record_field_from_ca_no_notify("PN_FF2", "VAL", EpicsValue::Double(2.0))
@@ -4082,6 +4084,94 @@ async fn test_fire_and_forget_put_does_not_disturb_parked_notify() {
     db.complete_async_record("PN_FF2").await.unwrap();
     rx.await
         .expect("parked WRITE_NOTIFY completion must still fire at async completion");
+}
+
+/// A record that, on its put-driven process, asks for an independent rescan of
+/// itself — C's `if (precord->scan) scanOnce(precord)` at every `special()`
+/// call site (e.g. `scalerRecord.c:655`/`:667`). The rescan is a *fresh*,
+/// unrelated process cycle, not part of this put's completion chain.
+struct ScanOnceEmitter {
+    process_count: Arc<AtomicU32>,
+}
+impl Record for ScanOnceEmitter {
+    fn record_type(&self) -> &'static str {
+        "scan_once_emitter"
+    }
+    fn process(&mut self) -> epics_base_rs::error::CaResult<ProcessOutcome> {
+        // The put-driven pass (count 0) queues the independent rescan; the
+        // scanOnce'd pass (count ≥ 1) does the real work and does NOT re-queue,
+        // exactly as `special()` moves state once and `process()` acts on it.
+        if self.process_count.fetch_add(1, Ordering::SeqCst) == 0 {
+            Ok(ProcessOutcome::complete_with(vec![ProcessAction::ScanOnce]))
+        } else {
+            Ok(ProcessOutcome::complete())
+        }
+    }
+    fn get_field(&self, _name: &str) -> Option<EpicsValue> {
+        None
+    }
+    fn put_field(&mut self, _name: &str, _value: EpicsValue) -> epics_base_rs::error::CaResult<()> {
+        Ok(())
+    }
+    fn declared_fields(&self) -> &'static [FieldDesc] {
+        &[]
+    }
+}
+
+/// Boundary (Increment ② completion contract): a put whose process only queues
+/// an independent `scanOnce` completes **synchronously** — the scanOnce is a
+/// separate cycle, NOT joined into this put-notify's wait-set. C `dbNotifyAdd`
+/// (`dbNotify.c:477-499`, sole caller `dbDbLink.c:460`) joins only the
+/// process-passive OUT/FLNK link chain; a `scanOnce`'d record is never added,
+/// so `dbNotifyCompletion` does not wait on it. The RTEMS CA driver must
+/// therefore see `ProcessCompletion::Sync` here and reply inline — waiting on
+/// the scanOnce would hang the reply on an unrelated cycle.
+#[tokio::test]
+async fn scan_once_is_not_joined_to_put_notify_completion() {
+    let db = PvDatabase::new();
+    let count = Arc::new(AtomicU32::new(0));
+    db.add_record(
+        "SO",
+        Box::new(ScanOnceEmitter {
+            process_count: count.clone(),
+        }),
+    )
+    .await
+    .unwrap();
+    // Non-Passive: C's `if (precord->scan)` guard is satisfied, so the
+    // scanOnce actually spawns (a Passive record would be skipped — its own
+    // pp(TRUE) pass already processed it). A non-Passive record also gets no
+    // process from a plain pp put, which is exactly why C uses scanOnce; the
+    // Force/`process_record_with_notify` entry (rsrv `write_notify` with the
+    // process bit) is the unconditional-process WRITE_NOTIFY boundary.
+    {
+        db.get_record("SO").unwrap().write().common.scan = ScanType::Sec1;
+    }
+
+    let completion = db
+        .process_record_with_notify("SO")
+        .await
+        .expect("the WRITE_NOTIFY process is accepted");
+    assert!(
+        completion.is_sync(),
+        "a put that only queues an independent scanOnce must complete \
+         synchronously — the scanOnce is not joined to the notify wait-set \
+         (C dbNotifyAdd never adds a scanOnce'd record)"
+    );
+
+    // The queued scanOnce lands independently after the synchronous put
+    // returned: the record is re-processed a second time, off the put's
+    // completion path.
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(
+        count.load(Ordering::SeqCst) >= 2,
+        "the scanOnce must run as its own cycle after the put completed, got \
+         {} process passes",
+        count.load(Ordering::SeqCst)
+    );
 }
 
 /// Boundary: synchronous-completion PUTF clear still runs in no-notify

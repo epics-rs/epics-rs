@@ -65,7 +65,7 @@ async fn busy_val_notify_sequence_posts_each_change() {
             .await
             .unwrap_or_else(|e| panic!("caput B {v}: {e:?}"));
         assert!(
-            held.is_none(),
+            held.is_sync(),
             "busy put-callback must complete synchronously (val={v})"
         );
     }

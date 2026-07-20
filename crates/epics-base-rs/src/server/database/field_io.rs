@@ -1081,7 +1081,7 @@ impl PvDatabase {
         record_name: &str,
         field: &str,
         value: EpicsValue,
-    ) -> CaResult<Option<crate::runtime::sync::oneshot::Receiver<()>>> {
+    ) -> CaResult<crate::server::record::ProcessCompletion> {
         self.put_record_field_from_ca_inner(record_name, field, value, true, NotifyRequest::New)
             .await
     }
@@ -1098,7 +1098,7 @@ impl PvDatabase {
         record_name: &str,
         field: &str,
         value: EpicsValue,
-    ) -> CaResult<Option<crate::runtime::sync::oneshot::Receiver<()>>> {
+    ) -> CaResult<crate::server::record::ProcessCompletion> {
         self.put_record_field_from_ca_inner(record_name, field, value, false, NotifyRequest::New)
             .await
     }
@@ -1204,7 +1204,7 @@ impl PvDatabase {
     pub async fn process_record_with_notify(
         &self,
         record_name: &str,
-    ) -> CaResult<Option<crate::runtime::sync::oneshot::Receiver<()>>> {
+    ) -> CaResult<crate::server::record::ProcessCompletion> {
         let (completion_tx, completion_rx) = crate::runtime::sync::oneshot::channel();
         let notify = crate::server::record::NotifyWaitSet::new(completion_tx);
         {
@@ -1231,9 +1231,11 @@ impl PvDatabase {
         // report immediate success; otherwise hand the receiver back to await
         // the deferred async completion.
         if notify.completed() {
-            Ok(None)
+            Ok(crate::server::record::ProcessCompletion::Sync)
         } else {
-            Ok(Some(completion_rx))
+            Ok(crate::server::record::ProcessCompletion::Async(
+                completion_rx,
+            ))
         }
     }
 
@@ -1353,7 +1355,7 @@ impl PvDatabase {
         value: EpicsValue,
         acquire_gate: bool,
         notify_request: NotifyRequest,
-    ) -> CaResult<Option<crate::runtime::sync::oneshot::Receiver<()>>> {
+    ) -> CaResult<crate::server::record::ProcessCompletion> {
         let field = field.to_ascii_uppercase();
         let want_notify = notify_request.wants_notify();
 
@@ -1489,7 +1491,7 @@ impl PvDatabase {
                     // Unreachable: `want_notify` is exactly "this request
 
                     // carries a completion".
-                    return Ok(None);
+                    return Ok(crate::server::record::ProcessCompletion::Sync);
                 };
                 guard
                     .park_notify_put(crate::server::record::DeferredNotifyPut {
@@ -1498,7 +1500,14 @@ impl PvDatabase {
                         completion,
                     })
                     .map_err(|_| CaError::PutCallbackInProgress(record_name.to_string()))?;
-                return Ok(completion_rx);
+                // A put-notify parked on a PACT record IS async: it replays and
+                // completes on the record's PACT release (C `notifyRestartInProgress`,
+                // dbNotify.c:225-231). `Deferred` replays carry only the sender, so
+                // `completion_rx` is `None` there and this maps to `Sync` — but that
+                // path is the internal restart, not a fresh client put.
+                return Ok(crate::server::record::ProcessCompletion::from_signal(
+                    completion_rx,
+                ));
             }
         }
 
@@ -1612,12 +1621,14 @@ impl PvDatabase {
             return match parked {
                 Some((notify, completion_rx)) => {
                     if notify.completed() {
-                        Ok(None)
+                        Ok(crate::server::record::ProcessCompletion::Sync)
                     } else {
-                        Ok(completion_rx)
+                        Ok(crate::server::record::ProcessCompletion::from_signal(
+                            completion_rx,
+                        ))
                     }
                 }
-                None => Ok(None),
+                None => Ok(crate::server::record::ProcessCompletion::Sync),
             };
         }
 
@@ -2013,7 +2024,7 @@ impl PvDatabase {
             // No processing cycle, so C never raises `putf` (and this put did
             // not either). Report immediate (synchronous) completion to a
             // WRITE_NOTIFY caller.
-            return Ok(None);
+            return Ok(crate::server::record::ProcessCompletion::Sync);
         }
 
         // Set up the put-notify wait-set BEFORE processing. The wait-set
@@ -2150,12 +2161,14 @@ impl PvDatabase {
         match parked {
             Some((notify, completion_rx)) => {
                 if notify.completed() {
-                    Ok(None)
+                    Ok(crate::server::record::ProcessCompletion::Sync)
                 } else {
-                    Ok(completion_rx)
+                    Ok(crate::server::record::ProcessCompletion::from_signal(
+                        completion_rx,
+                    ))
                 }
             }
-            None => Ok(None),
+            None => Ok(crate::server::record::ProcessCompletion::Sync),
         }
     }
 

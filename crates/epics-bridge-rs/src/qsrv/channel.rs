@@ -829,7 +829,9 @@ impl BridgeChannel {
                             .put_record_field_from_ca(&self.record_name, &self.field, value)
                             .await
                             .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
-                        if let Some(rx) = notify_rx {
+                        if let epics_base_rs::server::record::ProcessCompletion::Async(rx) =
+                            notify_rx
+                        {
                             let _ = rx.await;
                         }
                     } else {
@@ -872,7 +874,9 @@ impl BridgeChannel {
                             .process_record_with_notify(&self.record_name)
                             .await
                             .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
-                        if let Some(rx) = notify_rx {
+                        if let epics_base_rs::server::record::ProcessCompletion::Async(rx) =
+                            notify_rx
+                        {
                             let _ = rx.await;
                         }
                     } else {

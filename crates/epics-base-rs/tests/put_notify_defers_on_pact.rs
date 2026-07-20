@@ -175,6 +175,7 @@ async fn put_notify_on_a_pact_record_writes_nothing() {
         f.db.put_record_field_from_ca("ASY", "VAL", EpicsValue::Long(7))
             .await
             .expect("the put is accepted (deferred), not refused")
+            .into_handle()
             .expect("a deferred put-notify hands back a receiver to await");
 
     assert_eq!(
@@ -207,6 +208,7 @@ async fn deferred_put_is_replayed_and_completes_after_it() {
         f.db.put_record_field_from_ca("ASY", "VAL", EpicsValue::Long(7))
             .await
             .unwrap()
+            .into_handle()
             .expect("deferred: receiver handed back");
 
     // The device round-trip finishes: C `dbNotifyCompletion` runs here.
@@ -249,6 +251,7 @@ async fn a_second_put_notify_onto_a_deferred_record_is_refused() {
         f.db.put_record_field_from_ca("ASY", "VAL", EpicsValue::Long(7))
             .await
             .unwrap()
+            .into_handle()
             .expect("first put deferred");
 
     let err =
@@ -361,6 +364,7 @@ async fn deferred_put_is_replayed_when_the_odly_continuation_releases_pact() {
         .put_record_field_from_ca("ODL", "VAL", EpicsValue::Long(7))
         .await
         .expect("the put is accepted (deferred)")
+        .into_handle()
         .expect("a deferred put-notify hands back a receiver");
 
     // The delay expires: the continuation ends the cycle and releases PACT.
@@ -448,6 +452,7 @@ async fn deferred_put_is_replayed_when_the_sdly_input_continuation_releases_pact
         .put_record_field_from_ca("SIMAI", "VAL", EpicsValue::Double(7.0))
         .await
         .expect("the put is accepted (deferred)")
+        .into_handle()
         .expect("a deferred put-notify hands back a receiver");
 
     let mut v2 = HashSet::new();
@@ -500,6 +505,7 @@ async fn deferred_put_is_replayed_when_the_sdly_output_continuation_releases_pac
         .put_record_field_from_ca("SIMAO", "VAL", EpicsValue::Double(7.0))
         .await
         .expect("the put is accepted (deferred)")
+        .into_handle()
         .expect("a deferred put-notify hands back a receiver");
 
     let mut v2 = HashSet::new();
@@ -536,6 +542,7 @@ async fn deferred_put_is_replayed_when_the_illegal_simm_continuation_releases_pa
         .put_record_field_from_ca("SIMAI", "VAL", EpicsValue::Double(7.0))
         .await
         .expect("the put is accepted (deferred)")
+        .into_handle()
         .expect("a deferred put-notify hands back a receiver");
 
     // SIMM goes out of menu DURING the delay: the continuation's `switch` takes

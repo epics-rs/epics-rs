@@ -79,19 +79,19 @@ async fn caput(db: &PvDatabase, rec: &str, field: &str, value: EpicsValue) {
 }
 
 async fn val(db: &PvDatabase, rec: &str) -> f64 {
-    let inst = db.get_record(rec).await.unwrap();
+    let inst = db.get_record(rec).unwrap();
     let g = inst.read();
     g.record.get_field("VAL").unwrap().to_f64().unwrap()
 }
 
 async fn field(db: &PvDatabase, rec: &str, f: &str) -> f64 {
-    let inst = db.get_record(rec).await.unwrap();
+    let inst = db.get_record(rec).unwrap();
     let g = inst.read();
     g.record.get_field(f).unwrap().to_f64().unwrap()
 }
 
 async fn watch(db: &PvDatabase, rec: &str, field: &str) -> EventReader {
-    let inst = db.get_record(rec).await.unwrap();
+    let inst = db.get_record(rec).unwrap();
     let mut g = inst.write();
     g.add_subscriber(field, 1, DbFieldType::Double, EventMask::VALUE.bits())
         .expect("subscription must be accepted")

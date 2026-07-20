@@ -293,7 +293,7 @@ async fn test_count_start_posts_pr1_tp_freq_monitor_events() {
 
     // Attach asyn device support backed by the quantizing driver.
     {
-        let rec = db.get_record("TEST:SCMON").await.unwrap();
+        let rec = db.get_record("TEST:SCMON").unwrap();
         let mut inst = rec.write();
         let mut support = ScalerAsynDeviceSupport::new(Box::new(QuantizingDriver));
         support.init(&mut *inst.record).unwrap(); // nch <- 8
@@ -311,7 +311,7 @@ async fn test_count_start_posts_pr1_tp_freq_monitor_events() {
     // Subscribe to PR1/TP/FREQ with DBE_VALUE — the C `db_post_events`
     // mask at scalerRecord.c:425-430.
     let (mut pr1_rx, mut tp_rx, mut freq_rx) = {
-        let rec = db.get_record("TEST:SCMON").await.unwrap();
+        let rec = db.get_record("TEST:SCMON").unwrap();
         let mut inst = rec.write();
         let pr1 = inst
             // PR1 is DBF_ULONG (scalerRecord.dbd:945); subscribe with the native type.
@@ -329,7 +329,7 @@ async fn test_count_start_posts_pr1_tp_freq_monitor_events() {
     // Drive CNT=1 -> REQSTART, then process: the CNT block emits
     // CMD_RESET + CMD_START_COUNT, which the framework dispatches.
     {
-        let rec = db.get_record("TEST:SCMON").await.unwrap();
+        let rec = db.get_record("TEST:SCMON").unwrap();
         let mut inst = rec.write();
         let scaler = inst
             .record
@@ -398,7 +398,7 @@ async fn test_value_change_post_is_value_only_no_log_bit() {
         .unwrap();
 
     {
-        let rec = db.get_record("TEST:SCVO").await.unwrap();
+        let rec = db.get_record("TEST:SCVO").unwrap();
         let mut inst = rec.write();
         let mut support = ScalerAsynDeviceSupport::new(Box::new(QuantizingDriver));
         support.init(&mut *inst.record).unwrap(); // nch <- 8
@@ -418,7 +418,7 @@ async fn test_value_change_post_is_value_only_no_log_bit() {
     // posted mask), and one that accepts DBE_LOG ONLY (the boundary —
     // it must NOT fire on a value change).
     let (mut freq_vallog_rx, mut freq_logonly_rx) = {
-        let rec = db.get_record("TEST:SCVO").await.unwrap();
+        let rec = db.get_record("TEST:SCVO").unwrap();
         let mut inst = rec.write();
         let vallog = inst
             .add_subscriber(
@@ -435,7 +435,7 @@ async fn test_value_change_post_is_value_only_no_log_bit() {
     };
 
     {
-        let rec = db.get_record("TEST:SCVO").await.unwrap();
+        let rec = db.get_record("TEST:SCVO").unwrap();
         let mut inst = rec.write();
         let scaler = inst
             .record
@@ -504,7 +504,7 @@ async fn test_count_start_guard_triggers_tp_recompute_and_post() {
     // preset unchanged and owns no clock, so ONLY the :409-410 guard
     // can change PR1.
     {
-        let rec = db.get_record("TEST:SCGUARD").await.unwrap();
+        let rec = db.get_record("TEST:SCGUARD").unwrap();
         let mut inst = rec.write();
         let mut support = ScalerAsynDeviceSupport::new(Box::new(SoftScalerDriver::new(8)));
         support.init(&mut *inst.record).unwrap();
@@ -526,14 +526,14 @@ async fn test_count_start_guard_triggers_tp_recompute_and_post() {
     }
 
     let mut tp_rx = {
-        let rec = db.get_record("TEST:SCGUARD").await.unwrap();
+        let rec = db.get_record("TEST:SCGUARD").unwrap();
         let mut inst = rec.write();
         inst.add_subscriber("TP", 4, DbFieldType::Double, EventMask::VALUE.bits())
             .expect("TP subscription accepted")
     };
 
     {
-        let rec = db.get_record("TEST:SCGUARD").await.unwrap();
+        let rec = db.get_record("TEST:SCGUARD").unwrap();
         let mut inst = rec.write();
         let scaler = inst
             .record
@@ -567,7 +567,7 @@ async fn test_count_start_guard_triggers_tp_recompute_and_post() {
     }
 
     // Confirm the final record state matches C.
-    let rec = db.get_record("TEST:SCGUARD").await.unwrap();
+    let rec = db.get_record("TEST:SCGUARD").unwrap();
     let mut inst = rec.write();
     let scaler = inst
         .record

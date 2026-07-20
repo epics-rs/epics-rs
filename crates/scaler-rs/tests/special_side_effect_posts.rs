@@ -61,7 +61,7 @@ async fn watch(
     dbf: DbFieldType,
     mask: EventMask,
 ) -> EventReader {
-    let rec = db.get_record("SCAL").await.unwrap();
+    let rec = db.get_record("SCAL").unwrap();
     let mut inst = rec.write();
     inst.add_subscriber(field, sid, dbf, mask.bits())
         .expect("subscription must be accepted")

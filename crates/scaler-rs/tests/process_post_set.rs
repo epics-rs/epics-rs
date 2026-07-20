@@ -46,7 +46,7 @@ async fn watch(
     dbf: DbFieldType,
     mask: EventMask,
 ) -> EventReader {
-    let rec = db.get_record("SCAL").await.unwrap();
+    let rec = db.get_record("SCAL").unwrap();
     let mut inst = rec.write();
     inst.add_subscriber(field, sid, dbf, mask.bits())
         .expect("subscription must be accepted")
@@ -74,7 +74,7 @@ fn drain(rx: &mut EventReader) -> usize {
 }
 
 async fn field(db: &PvDatabase, f: &str) -> EpicsValue {
-    let rec = db.get_record("SCAL").await.unwrap();
+    let rec = db.get_record("SCAL").unwrap();
     let g = rec.read();
     g.record.get_field(f).unwrap()
 }

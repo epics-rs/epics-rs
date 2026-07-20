@@ -94,7 +94,7 @@ async fn set(db: &PvDatabase, rec: &str, v: f64) {
 #[tokio::test]
 async fn r11_64_epid_secondaries_post_without_the_cycles_alarm_bits() {
     let db = closed_loop_epid().await;
-    let inst = db.get_record("PID").await.unwrap();
+    let inst = db.get_record("PID").unwrap();
 
     let full = (EventMask::VALUE | EventMask::LOG | EventMask::ALARM).bits();
     let mut readers = Vec::new();
@@ -192,7 +192,7 @@ async fn r11_64_epid_secondaries_post_without_the_cycles_alarm_bits() {
 #[tokio::test]
 async fn r11_64_an_alarm_only_subscriber_on_a_secondary_never_fires() {
     let db = closed_loop_epid().await;
-    let inst = db.get_record("PID").await.unwrap();
+    let inst = db.get_record("PID").unwrap();
 
     let mut alarm_only = Vec::new();
     {
@@ -238,7 +238,7 @@ async fn r11_64_an_alarm_only_subscriber_on_a_secondary_never_fires() {
 #[tokio::test]
 async fn r11_64_a_value_subscriber_still_sees_the_secondary_change() {
     let db = closed_loop_epid().await;
-    let inst = db.get_record("PID").await.unwrap();
+    let inst = db.get_record("PID").unwrap();
 
     let mut oval_rx = inst
         .write()

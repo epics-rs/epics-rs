@@ -53,7 +53,7 @@ record(timestamp, "TS:MIN") {
     let db = server.database().clone();
 
     let (mut rval_rx, mut val_rx) = {
-        let rec = db.get_record("TS:MIN").await.unwrap();
+        let rec = db.get_record("TS:MIN").unwrap();
         let mut inst = rec.write();
         let rval = inst
             .add_subscriber(
@@ -138,7 +138,7 @@ record(timestamp, "TS:SEC") {
     let db = server.database().clone();
 
     let (mut rval_rx, mut val_rx) = {
-        let rec = db.get_record("TS:SEC").await.unwrap();
+        let rec = db.get_record("TS:SEC").unwrap();
         let mut inst = rec.write();
         let rval = inst
             .add_subscriber(

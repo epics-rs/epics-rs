@@ -1012,6 +1012,20 @@ Because `examples/*` are workspace members, these run automatically in CI under
 - Rust 1.85+ (edition 2024)
 - Async runtime (provided by `epics-base-rs` — no direct tokio dependency needed)
 
+## Related projects
+
+Companion projects that build on or pair with `epics-rs`:
+
+- **[epics-rs-iocs](https://github.com/epics-rs/epics-rs-iocs)** — Cargo workspace of `epics-rs`-based IOC applications; each device driver is an independent library crate under `drivers/` and each IOC binary lives under `iocs/`.
+- **[ophyd-epicsrs](https://github.com/physwkim/ophyd-epicsrs)** — Rust EPICS backend for bluesky's [ophyd](https://github.com/bluesky/ophyd) / [ophyd-async](https://github.com/bluesky/ophyd-async), replacing pyepics with `epics-rs` over PyO3 (CA + PVA, GIL released during network I/O).
+- **[bsrs](https://github.com/physwkim/bsrs)** — Rust-native re-implementation of the bluesky acquisition stack (RunEngine, devices, plans, document sinks), removing the Python requirement on IOC hosts.
+- **[archiver-rs](https://github.com/physwkim/archiver-rs)** — High-performance EPICS Channel Access archiver in Rust, compatible with the Java EPICS Archiver Appliance data format and REST API.
+
+Related scientific tooling from the same author:
+
+- **[rsplot](https://github.com/physwkim/rsplot)** — silx-style scientific plotting for [egui](https://github.com/emilk/egui), GPU-rendered with wgpu; a Rust port of `silx.gui.plot`.
+- **[tomoxide](https://github.com/physwkim/tomoxide)** — Rust tomographic reconstruction toolkit fusing [tomopy](https://github.com/tomopy/tomopy)'s algorithmic breadth with [tomocupy](https://github.com/tomography/tomocupy)'s streaming reconstruction across a tri-backend CPU / CUDA / wgpu abstraction.
+
 ## Development Note
 
 AI-assisted tools were used in parts of this project.

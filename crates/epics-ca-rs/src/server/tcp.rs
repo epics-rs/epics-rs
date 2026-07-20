@@ -3085,15 +3085,24 @@ async fn dispatch_message(
                 }
             };
 
-            // GET path consults the target's optional read hook
-            // (`get_read_snapshot`): a no-cache CA-gateway shadow PV
-            // forwards this read to a fresh upstream fetch. An `Err` is
-            // the forwarded upstream get failing — surface ECA_GETFAIL
-            // to the client, the IOC get-callback error C ca-gateway
-            // would propagate. READ_NOTIFY carries the status in its
-            // reply frame; the deprecated READ uses the CA_PROTO_ERROR
-            // channel like its read-denial path above.
-            let snapshot = match get_read_snapshot(&entry.target).await {
+            // GET path consults the target's optional read hook: a no-cache
+            // CA-gateway shadow PV forwards this read to a fresh upstream
+            // fetch. Item-3 sans-io split: a local record field / hookless
+            // SimplePv resolves the snapshot SYNCHRONOUSLY
+            // (`try_get_read_snapshot_local`) with no `.await` — the entire
+            // local reply-production path (lookup → snapshot → filter →
+            // `build_read_reply` → outbox push) is now reactor-free. Only a
+            // gateway read hook (genuine upstream network I/O) falls through to
+            // the async `get_read_snapshot`. An `Err` there is the forwarded
+            // upstream get failing — surface ECA_GETFAIL to the client, the IOC
+            // get-callback error C ca-gateway would propagate. READ_NOTIFY
+            // carries the status in its reply frame; the deprecated READ uses
+            // the CA_PROTO_ERROR channel like its read-denial path above.
+            let read_result = match try_get_read_snapshot_local(&entry.target) {
+                Some(snap) => Ok(snap),
+                None => get_read_snapshot(&entry.target).await,
+            };
+            let snapshot = match read_result {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::debug!(error = %e, "ca server: read hook (no-cache get) failed");
@@ -5297,6 +5306,37 @@ async fn get_read_snapshot(
     match target {
         ChannelTarget::SimplePv(pv) => pv.read_snapshot().await.map(Some),
         ChannelTarget::RecordField { record, field } => Ok(record.read().snapshot_for_field(field)),
+    }
+}
+
+/// Synchronous fast path for the one-shot GET snapshot, mirroring
+/// [`get_read_snapshot`] but sans-io.
+///
+/// The outer `Option` answers "was the read resolvable synchronously?":
+/// - `Some(inner)` — a fully local read (a record field always; a `SimplePv`
+///   with no read hook, i.e. every cached / non-gateway PV). No `.await`, no
+///   reactor. `inner` is the `Option<Snapshot>` the async path also yields:
+///   `Some(snap)` for a value, `None` for an absent record field.
+/// - `None` — a gateway `-no_cache` [`ReadHook`] is installed, whose upstream
+///   GET is genuine network I/O; the caller must fall back to the async
+///   [`get_read_snapshot`]. Only `SimplePv` can reach this.
+///
+/// This is the item-3 sans-io boundary: local-record READ reply production
+/// never touches this crate's async runtime, while the gateway-upstream read
+/// stays async and separated.
+fn try_get_read_snapshot_local(
+    target: &ChannelTarget,
+) -> Option<Option<epics_base_rs::server::snapshot::Snapshot>> {
+    match target {
+        ChannelTarget::RecordField { record, field } => {
+            Some(record.read().snapshot_for_field(field))
+        }
+        // `read_snapshot_local` is `None` exactly when a read hook is
+        // installed — the async upstream-GET signal — so it maps straight to
+        // this fn's "not sync-resolvable" `None`; a hookless `SimplePv` always
+        // yields a snapshot, so its `Some(snap)` maps to `Some(Some(snap))`
+        // and never collides with the async-signal `None`.
+        ChannelTarget::SimplePv(pv) => pv.read_snapshot_local().map(Some),
     }
 }
 

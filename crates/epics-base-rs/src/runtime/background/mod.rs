@@ -13,8 +13,10 @@
 //! dependency.
 
 pub mod callback_executor;
+pub mod delayed_timer;
 
 pub use callback_executor::{
     Callback, CallbackError, CallbackHandle, CallbackPool, CallbackPriority, DEFAULT_QUEUE_SIZE,
     DEFAULT_THREADS_PER_PRIORITY, NUM_CALLBACK_PRIORITIES,
 };
+pub use delayed_timer::{DelayedTimer, TimerHandle};

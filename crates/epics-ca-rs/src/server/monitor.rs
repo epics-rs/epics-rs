@@ -86,7 +86,6 @@ pub(crate) fn spawn_monitor_sender(
                 long_string_mode,
                 reply,
             )
-            .await
             .is_err()
             {
                 break;
@@ -102,7 +101,7 @@ pub(crate) fn spawn_monitor_sender(
     })
 }
 
-async fn send_event(
+fn send_event(
     data_type: u16,
     data_count: u32,
     sub_id: u32,
@@ -178,8 +177,7 @@ async fn send_event(
         .set_payload_size(padded.len(), element_count, client_minor)
         .is_err()
     {
-        let _ =
-            super::tcp::send_16k_array_client_err(outbox, req_hdr, req_hdr.cid, client_minor).await;
+        let _ = super::tcp::send_16k_array_client_err(outbox, req_hdr, req_hdr.cid, client_minor);
         return Ok(());
     }
     hdr.data_type = data_type;
@@ -263,7 +261,6 @@ mod tests {
                 client_minor: crate::protocol::CA_MINOR_VERSION,
             },
         )
-        .await
         .expect("send_event must succeed");
 
         let batches = drain_frames(&mut drain);

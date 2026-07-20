@@ -431,7 +431,7 @@ impl PutNotifySlot {
 /// race, reply ECA_PUTCBINPROG to the superseded request. C
 /// `write_notify_action` cancel branch (`camessage.c:1686-1704`). The
 /// new WRITE_NOTIFY then proceeds — it is never rejected.
-async fn supersede_put_notify(
+fn supersede_put_notify(
     prev: Option<InFlightPutNotify>,
     writer: &Outbox,
     client_minor: u16,
@@ -449,8 +449,7 @@ async fn supersede_put_notify(
                     req_hdr: prev.req_hdr,
                     client_minor,
                 },
-            )
-            .await?;
+            )?;
         }
     }
     Ok(())
@@ -881,7 +880,7 @@ impl ClientState {
     /// unresolvable / bad — the CALC-gated rule then fails closed.
     /// Caller must NOT hold a record read-guard that a link could point
     /// back to (would re-read the same lock).
-    async fn calc_inputs(
+    fn calc_inputs(
         &self,
         cfg: &AccessSecurityConfig,
         asg_name: &str,
@@ -907,13 +906,13 @@ impl ClientState {
 
     /// evaluate `cfg`'s rules for `asg_name`, with CALC clauses
     /// gated against the resolved `INP*` values.
-    async fn access_for_asg(
+    fn access_for_asg(
         &self,
         cfg: &AccessSecurityConfig,
         asg_name: &str,
         asl: u8,
     ) -> (AccessLevel, bool) {
-        let calc_inputs = self.calc_inputs(cfg, asg_name).await;
+        let calc_inputs = self.calc_inputs(cfg, asg_name);
         let calc_ok = |expr: &str| -> bool {
             match calc_inputs {
                 Some(ref i) => match epics_base_rs::calc::compile(expr) {
@@ -968,7 +967,7 @@ impl ClientState {
                     // METHOD("x509") / AUTHORITY(<issuer>) rules
                     // can gate mTLS-authenticated peers. CALC
                     // rules are evaluated against resolved INP* links.
-                    let (level, rule_was_trap) = self.access_for_asg(acf_cfg, "DEFAULT", 0).await;
+                    let (level, rule_was_trap) = self.access_for_asg(acf_cfg, "DEFAULT", 0);
                     let bits = match level {
                         AccessLevel::ReadWrite => 3,
                         AccessLevel::Read => 1,
@@ -1023,7 +1022,7 @@ impl ClientState {
                     // `RULE(N, …)` gates correctly. PR #641: method/
                     // authority for mTLS rules. CALC rules are
                     // evaluated against resolved INP* links.
-                    self.access_for_asg(acf_cfg, &asg, asl).await
+                    self.access_for_asg(acf_cfg, &asg, asl)
                 } else {
                     (AccessLevel::ReadWrite, false)
                 };
@@ -1967,8 +1966,7 @@ where
                                  Max bytes={max_payload}"
                             ),
                             state.client_minor_version,
-                        )
-                        .await;
+                        );
                         let _ = drain_and_flush(&mut sock, &mut outbox_drain).await;
                         tracing::warn!(
                             peer = %state.peer,
@@ -2031,8 +2029,7 @@ where
                         0xFFFF_FFFF,
                         &format!("CAS: Client version {} too old", state.client_minor_version),
                         state.client_minor_version,
-                    )
-                    .await;
+                    );
                     let _ = drain_and_flush(&mut sock, &mut outbox_drain).await;
                     // Same refuse-but-keep-serving shape as ECA_TOLARGE
                     // above, through the same owner.
@@ -2070,8 +2067,7 @@ where
                         0xFFFF_FFFF,
                         "CAS: Missaligned protocol rejected",
                         state.client_minor_version,
-                    )
-                    .await;
+                    );
                     let _ = drain_and_flush(&mut sock, &mut outbox_drain).await;
                     break 'client_loop Err(epics_base_rs::error::CaError::Protocol(
                         "misaligned CA payload".into(),
@@ -2366,8 +2362,7 @@ async fn dispatch_message(
                     "attempts to use protocol to set host name \
                      after creating first channel ignored by server",
                     state.client_minor_version,
-                )
-                .await?;
+                )?;
                 return Ok(());
             }
             // C `camessage.c:824-825`: `size = strnlen(pName, m_postsize)
@@ -2396,8 +2391,7 @@ async fn dispatch_message(
                     0xFFFF_FFFF,
                     "bad (very long) host name",
                     state.client_minor_version,
-                )
-                .await?;
+                )?;
                 return Err(epics_base_rs::error::CaError::Protocol(
                     "HOST_NAME exceeds 511-byte cap (matches C host_name_action RSRV_ERROR)".into(),
                 ));
@@ -2446,8 +2440,7 @@ async fn dispatch_message(
                     "attempts to use protocol to set user name \
                      after creating first channel ignored by server",
                     state.client_minor_version,
-                )
-                .await?;
+                )?;
                 return Ok(());
             }
             // C `camessage.c:911-912`: same 512-byte cap as host
@@ -2471,8 +2464,7 @@ async fn dispatch_message(
                     0xFFFF_FFFF,
                     "a very long user name was specified",
                     state.client_minor_version,
-                )
-                .await?;
+                )?;
                 return Err(epics_base_rs::error::CaError::Protocol(
                     "CLIENT_NAME exceeds 511-byte cap (matches C client_name_action RSRV_ERROR)"
                         .into(),
@@ -2617,8 +2609,7 @@ async fn dispatch_message(
                         u32::MAX,
                         "channel limit reached",
                         state.client_minor_version,
-                    )
-                    .await?;
+                    )?;
                     // C `claim_ciu_action` (camessage.c:1229-1240): when
                     // the server's channel-allocation pool is exhausted,
                     // send_err(ECA_ALLOCMEM) is followed by RSRV_ERROR
@@ -2988,8 +2979,7 @@ async fn dispatch_message(
                         0xFFFF_FFFF,
                         "Bad Resource ID",
                         state.client_minor_version,
-                    )
-                    .await?;
+                    )?;
                     return Err(epics_base_rs::error::CaError::Protocol(format!(
                         "READ on unknown SID {} (matches C read_action logBadId + RSRV_ERROR)",
                         sid
@@ -3031,8 +3021,7 @@ async fn dispatch_message(
                     entry.cid,
                     &audit_pv,
                     state.client_minor_version,
-                )
-                .await?;
+                )?;
                 return Err(epics_base_rs::error::CaError::Protocol(format!(
                     "READ with unsupported DBR type {} > LAST_BUFFER_TYPE \
                      (matches C read_action INVALID_DB_REQ ECA_BADTYPE)",
@@ -3074,8 +3063,7 @@ async fn dispatch_message(
                                 req_hdr: *hdr,
                                 client_minor: state.client_minor_version,
                             },
-                        )
-                        .await?;
+                        )?;
                     } else {
                         // C `read_action` (`rsrv/camessage.c:636-642`)
                         // sends `send_err(mp, ECA_NORDACCESS, client,
@@ -3099,8 +3087,7 @@ async fn dispatch_message(
                             entry.cid,
                             &audit_pv,
                             state.client_minor_version,
-                        )
-                        .await?;
+                        )?;
                     }
                     return Ok(());
                 }
@@ -3151,8 +3138,7 @@ async fn dispatch_message(
                                 req_hdr: *hdr,
                                 client_minor: state.client_minor_version,
                             },
-                        )
-                        .await?;
+                        )?;
                     } else {
                         let audit_pv = match &entry.target {
                             ChannelTarget::SimplePv(pv) => pv.name.clone(),
@@ -3167,8 +3153,7 @@ async fn dispatch_message(
                             entry.cid,
                             &audit_pv,
                             state.client_minor_version,
-                        )
-                        .await?;
+                        )?;
                     }
                     return Ok(());
                 }
@@ -3191,8 +3176,7 @@ async fn dispatch_message(
                             req_hdr: *hdr,
                             client_minor: state.client_minor_version,
                         },
-                    )
-                    .await?;
+                    )?;
                 }
                 return Ok(());
             };
@@ -3304,8 +3288,7 @@ async fn dispatch_message(
                             entry.cid,
                             "bad READ data type",
                             state.client_minor_version,
-                        )
-                        .await?;
+                        )?;
                     }
                     return Err(epics_base_rs::error::CaError::Protocol(format!(
                         "READ with unsupported DBR type {} (matches C read_action RSRV_ERROR)",
@@ -3323,8 +3306,7 @@ async fn dispatch_message(
                         hdr,
                         entry.cid,
                         state.client_minor_version,
-                    )
-                    .await;
+                    );
                 }
             }
         }
@@ -3358,8 +3340,7 @@ async fn dispatch_message(
                             0xFFFF_FFFF,
                             "Bad Resource ID",
                             state.client_minor_version,
-                        )
-                        .await?;
+                        )?;
                         return Err(epics_base_rs::error::CaError::Protocol(format!(
                             "WRITE (ACKT/ACKS) on unknown SID {} \
                              (matches C write_action logBadId + RSRV_ERROR)",
@@ -3393,8 +3374,7 @@ async fn dispatch_message(
                                     req_hdr: *hdr,
                                     client_minor: state.client_minor_version,
                                 },
-                            )
-                            .await?;
+                            )?;
                         } else {
                             // C `write_action` (`rsrv/camessage.c:741-751`)
                             // sends `send_err(mp, ECA_NOWTACCESS, client,
@@ -3416,8 +3396,7 @@ async fn dispatch_message(
                                 entry_cid,
                                 &audit_pv,
                                 state.client_minor_version,
-                            )
-                            .await?;
+                            )?;
                         }
                         return Ok(());
                     }
@@ -3452,7 +3431,7 @@ async fn dispatch_message(
                 // CA_PROTO_WRITE path is not serialised in C.
                 if is_notify {
                     let prev = entry.put_notify_slot.take();
-                    supersede_put_notify(prev, writer, state.client_minor_version).await?;
+                    supersede_put_notify(prev, writer, state.client_minor_version)?;
                 }
                 let result = match &entry.target {
                     ChannelTarget::RecordField { record, field } => {
@@ -3483,8 +3462,7 @@ async fn dispatch_message(
                             req_hdr: *hdr,
                             client_minor: state.client_minor_version,
                         },
-                    )
-                    .await?;
+                    )?;
                 } else if let Err(e) = &result {
                     // deprecated CA_PROTO_WRITE for DBR_PUT_ACKT/
                     // DBR_PUT_ACKS must surface put failure via
@@ -3507,8 +3485,7 @@ async fn dispatch_message(
                         entry_cid,
                         &audit_pv,
                         state.client_minor_version,
-                    )
-                    .await?;
+                    )?;
                 }
                 return Ok(());
             }
@@ -3536,8 +3513,7 @@ async fn dispatch_message(
                         0xFFFF_FFFF,
                         "Bad Resource ID",
                         state.client_minor_version,
-                    )
-                    .await?;
+                    )?;
                     return Err(epics_base_rs::error::CaError::Protocol(format!(
                         "WRITE on unknown SID {} (matches C write_action logBadId + RSRV_ERROR)",
                         sid
@@ -3610,8 +3586,7 @@ async fn dispatch_message(
                                 req_hdr: *hdr,
                                 client_minor: state.client_minor_version,
                             },
-                        )
-                        .await?;
+                        )?;
                         return Err(epics_base_rs::error::CaError::Protocol(format!(
                             "WRITE_NOTIFY with unsupported DBR type {} (matches C write_notify_action RSRV_ERROR)",
                             hdr.data_type
@@ -3635,8 +3610,7 @@ async fn dispatch_message(
                                 req_hdr: *hdr,
                                 client_minor: state.client_minor_version,
                             },
-                        )
-                        .await?;
+                        )?;
                         state.audit("caput", &audit_pv, "", "denied");
                         return Ok(());
                     }
@@ -3660,8 +3634,7 @@ async fn dispatch_message(
                             entry_cid,
                             &audit_pv,
                             state.client_minor_version,
-                        )
-                        .await?;
+                        )?;
                         state.audit("caput", &audit_pv, "", "denied");
                         return Ok(());
                     }
@@ -3679,8 +3652,7 @@ async fn dispatch_message(
                             entry_cid,
                             "bad data type",
                             state.client_minor_version,
-                        )
-                        .await?;
+                        )?;
                         return Err(epics_base_rs::error::CaError::Protocol(format!(
                             "WRITE with unsupported DBR type {} (matches C write_action RSRV_ERROR)",
                             hdr.data_type
@@ -3718,7 +3690,7 @@ async fn dispatch_message(
             // serialised in C, so it is left untouched.
             if is_notify {
                 let prev = put_notify_slot.take();
-                supersede_put_notify(prev, writer, state.client_minor_version).await?;
+                supersede_put_notify(prev, writer, state.client_minor_version)?;
             }
 
             let count = hdr.actual_count() as usize;
@@ -3747,8 +3719,7 @@ async fn dispatch_message(
                                 req_hdr: *hdr,
                                 client_minor: state.client_minor_version,
                             },
-                        )
-                        .await?;
+                        )?;
                     } else {
                         send_ca_error(
                             writer,
@@ -3757,8 +3728,7 @@ async fn dispatch_message(
                             entry_cid,
                             "bad WRITE payload bytes",
                             state.client_minor_version,
-                        )
-                        .await?;
+                        )?;
                     }
                     return Err(epics_base_rs::error::CaError::Protocol(format!(
                         "WRITE payload conversion failed for type {} count {} (matches C caNetConvert RSRV_ERROR)",
@@ -3898,8 +3868,7 @@ async fn dispatch_message(
                         entry_cid,
                         &audit_pv,
                         state.client_minor_version,
-                    )
-                    .await?;
+                    )?;
                 }
             }
 
@@ -4004,8 +3973,7 @@ async fn dispatch_message(
                                 req_hdr,
                                 client_minor,
                             },
-                        )
-                        .await;
+                        );
                     });
                     // Publish as the channel's in-flight put-callback so a
                     // later WRITE_NOTIFY on this channel supersedes it (C
@@ -4044,8 +4012,7 @@ async fn dispatch_message(
                             req_hdr: *hdr,
                             client_minor: state.client_minor_version,
                         },
-                    )
-                    .await?;
+                    )?;
                 }
             }
         }
@@ -4090,8 +4057,7 @@ async fn dispatch_message(
                         entry_cid,
                         "EVENT_ADD refused: per-channel subscription cap",
                         state.client_minor_version,
-                    )
-                    .await?;
+                    )?;
                     return Ok(());
                 }
             }
@@ -4140,8 +4106,7 @@ async fn dispatch_message(
                         0xFFFF_FFFF,
                         "Bad Resource ID",
                         state.client_minor_version,
-                    )
-                    .await?;
+                    )?;
                     return Err(epics_base_rs::error::CaError::Protocol(format!(
                         "EVENT_ADD on unknown SID {} (matches C event_add_action logBadId + RSRV_ERROR)",
                         sid
@@ -4181,8 +4146,7 @@ async fn dispatch_message(
                     entry_cid,
                     &format!("EVENT_ADD invalid mask {mask}: must be 1..={}", u8::MAX),
                     state.client_minor_version,
-                )
-                .await?;
+                )?;
                 return Err(epics_base_rs::error::CaError::Protocol(
                     "EVENT_ADD invalid mask (matches C db_add_event select==0 || select>UCHAR_MAX + RSRV_ERROR)".into(),
                 ));
@@ -4243,8 +4207,7 @@ async fn dispatch_message(
                     entry.cid,
                     "duplicate sub_id",
                     state.client_minor_version,
-                )
-                .await?;
+                )?;
                 return Ok(());
             }
             {
@@ -4279,8 +4242,7 @@ async fn dispatch_message(
                                 entry.cid,
                                 "EVENT_ADD refused: per-PV subscriber cap",
                                 state.client_minor_version,
-                            )
-                            .await?;
+                            )?;
                             return Ok(());
                         };
 
@@ -4346,8 +4308,7 @@ async fn dispatch_message(
                                         req_hdr: *hdr,
                                         client_minor: state.client_minor_version,
                                     },
-                                )
-                                .await?;
+                                )?;
                             }
                         } else {
                             let mut snap = pv.snapshot();
@@ -4398,8 +4359,7 @@ async fn dispatch_message(
                                             req_hdr: *hdr,
                                             client_minor: state.client_minor_version,
                                         },
-                                    )
-                                    .await?;
+                                    )?;
                                     // Initial subscription value — C posts
                                     // it via `db_post_single_event` at
                                     // monitor creation (`camessage.c:1853`),
@@ -4587,8 +4547,7 @@ async fn dispatch_message(
                                     entry.cid,
                                     "EVENT_ADD refused: record-field subscriber cap",
                                     state.client_minor_version,
-                                )
-                                .await?;
+                                )?;
                                 return Ok(());
                             }
                             Some(t) => t,
@@ -4613,8 +4572,7 @@ async fn dispatch_message(
                                         req_hdr: *hdr,
                                         client_minor: state.client_minor_version,
                                     },
-                                )
-                                .await?;
+                                )?;
                             }
                         } else if let Some(snap) = initial_snap {
                             // initial event honours the
@@ -4633,8 +4591,7 @@ async fn dispatch_message(
                                     req_hdr: *hdr,
                                     client_minor: state.client_minor_version,
                                 },
-                            )
-                            .await?;
+                            )?;
                             // Initial subscription value posted and
                             // processed (C `db_post_single_event` at
                             // monitor creation, `camessage.c:1853`); PCAS
@@ -4766,8 +4723,7 @@ async fn dispatch_message(
                                         &req_hdr,
                                         req_hdr.cid,
                                         client_minor,
-                                    )
-                                    .await;
+                                    );
                                     continue;
                                 }
                                 ev.data_type = requested_type;
@@ -4854,8 +4810,7 @@ async fn dispatch_message(
                         0xFFFF_FFFF,
                         "Bad Resource ID",
                         state.client_minor_version,
-                    )
-                    .await?;
+                    )?;
                     return Err(epics_base_rs::error::CaError::Protocol(format!(
                         "EVENT_CANCEL on unknown SID {} (matches C event_cancel_reply \
                          logBadId + RSRV_ERROR)",
@@ -4896,8 +4851,7 @@ async fn dispatch_message(
                     entry_cid,
                     &entry_pv_name,
                     state.client_minor_version,
-                )
-                .await?;
+                )?;
                 return Err(epics_base_rs::error::CaError::Protocol(format!(
                     "EVENT_CANCEL sub-id {} channel-mismatch (requested sid {}; \
                      matches C event_cancel_reply 'not on this channel's eventq' RSRV_ERROR)",
@@ -4984,8 +4938,7 @@ async fn dispatch_message(
                     chan_cid,
                     &diag,
                     state.client_minor_version,
-                )
-                .await?;
+                )?;
                 // C `event_cancel_reply` (camessage.c:2016-2021):
                 // after `send_err(ECA_BADMONID)`, return RSRV_ERROR
                 // which tears the connection down. Pre-fix Rust kept
@@ -5197,8 +5150,7 @@ async fn dispatch_message(
                     0xFFFF_FFFF,
                     "Bad Resource ID",
                     state.client_minor_version,
-                )
-                .await?;
+                )?;
                 return Err(epics_base_rs::error::CaError::Protocol(format!(
                     "CLEAR_CHANNEL on unknown SID {} (matches C clear_channel_reply logBadId + RSRV_ERROR)",
                     sid
@@ -5286,8 +5238,7 @@ async fn dispatch_message(
                 0xFFFF_FFFF,
                 &error_msg,
                 state.client_minor_version,
-            )
-            .await?;
+            )?;
             return Err(epics_base_rs::error::CaError::Protocol(format!(
                 "unsupported TCP command {} (matches C bad_tcp_cmd_action drop)",
                 hdr.cmmd
@@ -5297,9 +5248,7 @@ async fn dispatch_message(
 
     Ok(())
 }
-async fn get_full_snapshot(
-    target: &ChannelTarget,
-) -> Option<epics_base_rs::server::snapshot::Snapshot> {
+fn get_full_snapshot(target: &ChannelTarget) -> Option<epics_base_rs::server::snapshot::Snapshot> {
     match target {
         ChannelTarget::SimplePv(pv) => Some(pv.snapshot()),
         ChannelTarget::RecordField { record, field } => record.read().snapshot_for_field(field),
@@ -5377,7 +5326,7 @@ fn try_get_read_snapshot_local(
 ///
 /// `requested_count == 0` is autosize: the frame keeps the live
 /// element count.
-async fn send_monitor_snapshot(
+fn send_monitor_snapshot(
     writer: &Outbox,
     sub_id: u32,
     data_type: u16,
@@ -5411,7 +5360,7 @@ async fn send_monitor_snapshot(
         .set_payload_size(padded.len(), element_count, client_minor)
         .is_err()
     {
-        return send_16k_array_client_err(writer, request_hdr, request_hdr.cid, client_minor).await;
+        return send_16k_array_client_err(writer, request_hdr, request_hdr.cid, client_minor);
     }
     resp.data_type = data_type;
     resp.cid = 1; // ECA_NORMAL
@@ -5551,7 +5500,7 @@ async fn reeval_access_rights(state: &mut ClientState, writer: &Outbox) -> CaRes
                 // disabled either way. The denial frame is zero-filled,
                 // so only the chain's pass/drop decision matters, not
                 // the filtered value.
-                let snap = get_full_snapshot(&target).await;
+                let snap = get_full_snapshot(&target);
                 let dropped_by_filter = match (state.channels.get(&sid), &snap) {
                     (Some(entry), Some(snap)) => entry
                         .filter_chain()
@@ -5587,8 +5536,7 @@ async fn reeval_access_rights(state: &mut ClientState, writer: &Outbox) -> CaRes
                         req_hdr,
                         client_minor: state.client_minor_version,
                     },
-                )
-                .await?;
+                )?;
             }
             // Denial frames pushed to the outbox; the connection loop drains
             // and flushes them (no writer to flush here).
@@ -5626,7 +5574,7 @@ async fn reeval_access_rights(state: &mut ClientState, writer: &Outbox) -> CaRes
                         sub.request_header(),
                     )
                 };
-                if let Some(mut snap) = get_full_snapshot(&target).await {
+                if let Some(mut snap) = get_full_snapshot(&target) {
                     // C enables the event (`db_event_enable`)
                     // THEN posts the current value through the
                     // event-context pre-chain
@@ -5660,8 +5608,7 @@ async fn reeval_access_rights(state: &mut ClientState, writer: &Outbox) -> CaRes
                             req_hdr,
                             client_minor: state.client_minor_version,
                         },
-                    )
-                    .await?;
+                    )?;
                     // Access-restore post — C `db_event_enable` then
                     // `db_post_single_event` (`camessage.c:1086-1088`):
                     // one posted and one processed subscription event,
@@ -5689,7 +5636,7 @@ async fn reeval_access_rights(state: &mut ClientState, writer: &Outbox) -> CaRes
 /// `>= 0xFFFF`-element array received a normal-form Rust reply
 /// with `count = 0` (the extended marker) where rsrv preserves
 /// the count with an extended header.
-async fn send_put_notify_response(
+fn send_put_notify_response(
     writer: &Outbox,
     data_type: u16,
     count: u32,
@@ -5703,7 +5650,7 @@ async fn send_put_notify_response(
     // postsize = 0 (WRITE_NOTIFY replies have no payload);
     // set_payload_size promotes to extended form when count >= 0xFFFF.
     if resp.set_payload_size(0, count, client_minor).is_err() {
-        return send_16k_array_client_err(writer, request_hdr, request_hdr.cid, client_minor).await;
+        return send_16k_array_client_err(writer, request_hdr, request_hdr.cid, client_minor);
     }
     resp.cid = eca_status;
     resp.available = ioid;
@@ -5750,7 +5697,7 @@ fn no_read_access_count(requested_count: u32, actual_count: u32) -> u32 {
 /// callers on the EVENT_ADD denial path must pass a `count`
 /// already normalised through [`no_read_access_count`] so an autosize
 /// (`count == 0`) request does not produce a zero-payload frame.
-async fn send_no_read_access_event(
+fn send_no_read_access_event(
     writer: &Outbox,
     cmd: u16,
     data_type: u16,
@@ -5769,7 +5716,7 @@ async fn send_no_read_access_event(
         .set_payload_size(padded_size, count, client_minor)
         .is_err()
     {
-        return send_16k_array_client_err(writer, request_hdr, request_hdr.cid, client_minor).await;
+        return send_16k_array_client_err(writer, request_hdr, request_hdr.cid, client_minor);
     }
     hdr.data_type = data_type;
     hdr.cid = eca_status;
@@ -6105,7 +6052,7 @@ fn truncate_diag(message: &str) -> &str {
 /// extended header (`caserverio.c:266-270` returns `ECA_16KARRAYCLIENT`), the
 /// server does NOT put the frame on the wire. It answers CA_PROTO_ERROR with
 /// that status, echoing the request header, and keeps the circuit.
-pub(crate) async fn send_16k_array_client_err(
+pub(crate) fn send_16k_array_client_err(
     writer: &Outbox,
     request_hdr: &CaHeader,
     chan_cid: u32,
@@ -6121,15 +6068,14 @@ pub(crate) async fn send_16k_array_client_err(
          exceeding 16k bytes",
         client_minor,
     )
-    .await
 }
 
 /// Push a `CA_PROTO_ERROR` reply into the connection outbox. The connection
 /// loop is the sole owner that drains the outbox to the socket, so this
 /// only builds one framed message and enqueues it — see
-/// [`build_ca_error_frame`]. Stays `async` purely to keep its ~40 call
-/// sites (which all `.await`) untouched by the outbox migration.
-pub(crate) async fn send_ca_error(
+/// [`build_ca_error_frame`]. Synchronous: enqueueing is a pure buffer
+/// push with no I/O, so callers do not `.await` it.
+pub(crate) fn send_ca_error(
     writer: &Outbox,
     original_hdr: &CaHeader,
     eca_status: u32,
@@ -6368,7 +6314,6 @@ mod put_notify_supersede_tests {
         let prev = Some(inflight(0x1234, responded.clone()));
 
         supersede_put_notify(prev, &outbox, crate::protocol::CA_MINOR_VERSION)
-            .await
             .expect("supersede sends the superseded request its reply");
 
         assert!(
@@ -6399,7 +6344,6 @@ mod put_notify_supersede_tests {
         let prev = Some(inflight(0x55, responded.clone()));
 
         supersede_put_notify(prev, &outbox, crate::protocol::CA_MINOR_VERSION)
-            .await
             .expect("supersede of a completed put-callback is a no-op reply");
 
         assert!(
@@ -6425,9 +6369,7 @@ mod put_notify_supersede_tests {
         );
         // The superseding request now finds it already claimed.
         let prev = Some(inflight(0x99, responded.clone()));
-        supersede_put_notify(prev, &outbox, crate::protocol::CA_MINOR_VERSION)
-            .await
-            .unwrap();
+        supersede_put_notify(prev, &outbox, crate::protocol::CA_MINOR_VERSION).unwrap();
 
         assert!(
             drain_frames(&mut drain).is_empty(),
@@ -6498,9 +6440,7 @@ mod put_notify_supersede_tests {
             count: 1,
             req_hdr: crate::protocol::CaHeader::new(crate::protocol::CA_PROTO_WRITE_NOTIFY),
         });
-        supersede_put_notify(prev, &live_outbox().0, crate::protocol::CA_MINOR_VERSION)
-            .await
-            .unwrap();
+        supersede_put_notify(prev, &live_outbox().0, crate::protocol::CA_MINOR_VERSION).unwrap();
 
         // Joining the aborted task guarantees its guard Drop has run.
         assert!(
@@ -6961,7 +6901,6 @@ mod pre_v49_peer_tests {
             "boom",
             8, // pre-V49 peer
         )
-        .await
         .expect("send_ca_error succeeds");
 
         let frames = drain_frames(&mut drain);
@@ -6997,7 +6936,6 @@ mod pre_v49_peer_tests {
             "boom",
             CA_MINOR_VERSION,
         )
-        .await
         .expect("send_ca_error succeeds");
 
         let frames = drain_frames(&mut drain);
@@ -7042,7 +6980,6 @@ mod pre_v49_peer_tests {
                 client_minor: 8,
             },
         )
-        .await
         .expect("the error reply itself must succeed");
 
         let frames = drain_frames(&mut drain);
@@ -8688,7 +8625,6 @@ mod single_write_all_framing_tests {
             "CAS: Missaligned protocol rejected",
             crate::protocol::CA_MINOR_VERSION,
         )
-        .await
         .expect("send_ca_error succeeds");
 
         let batches = drain_frames(&mut drain);
@@ -8736,7 +8672,6 @@ mod single_write_all_framing_tests {
                 client_minor: crate::protocol::CA_MINOR_VERSION,
             },
         )
-        .await
         .expect("send_no_read_access_event succeeds");
 
         let batches = drain_frames(&mut drain);
@@ -8808,7 +8743,6 @@ mod single_write_all_framing_tests {
             "Regression test",
             crate::protocol::CA_MINOR_VERSION,
         )
-        .await
         .expect("send_ca_error succeeds");
 
         let batches = drain_frames(&mut drain);
@@ -8860,7 +8794,6 @@ mod single_write_all_framing_tests {
                 client_minor: crate::protocol::CA_MINOR_VERSION,
             },
         )
-        .await
         .expect("send_monitor_snapshot succeeds");
 
         let batches = drain_frames(&mut drain);
@@ -8905,7 +8838,6 @@ mod single_write_all_framing_tests {
                 client_minor: crate::protocol::CA_MINOR_VERSION,
             },
         )
-        .await
         .expect("send_monitor_snapshot succeeds");
 
         let batches = drain_frames(&mut drain);
@@ -8968,7 +8900,6 @@ mod single_write_all_framing_tests {
                 client_minor: crate::protocol::CA_MINOR_VERSION,
             },
         )
-        .await
         .expect("send_monitor_snapshot succeeds");
 
         let frames = drain_frames(&mut drain);
@@ -9002,7 +8933,6 @@ mod single_write_all_framing_tests {
                 client_minor: crate::protocol::CA_MINOR_VERSION,
             },
         )
-        .await
         .expect("send_monitor_snapshot succeeds");
 
         let frames = drain_frames(&mut drain);

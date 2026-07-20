@@ -1,5 +1,46 @@
 # Changelog
 
+## v0.24.3 — 2026-07-20
+
+Patch release. Adds the `dbLoadTemplate` iocsh command to `epics-base-rs`,
+plus three parity fixes across `epics-base-rs`, `epics-ca-rs`, and `asyn-rs`.
+Additive API only; no breaking changes. Workspace version 0.24.2 -> 0.24.3.
+
+### epics-base-rs
+
+- **New `dbLoadTemplate(subFile [, globalMacros])` iocsh command** — the
+  counterpart to `dbLoadRecords` for `.substitutions` template files. It
+  expands each pattern row and installs the resulting records through the
+  *same* routine as `dbLoadRecords` (identical duplicate-name merge,
+  `apply_fields`, load-then-init ordering, alias registration, and
+  post-load passes), so a template-loaded record is byte-for-byte identical
+  to a directly-loaded one. Command-line global macros are the lowest
+  precedence and are overridden per row, matching C `dbLoadTemplate`. The
+  `dbLoadRecords` install loop and include-path resolution are extracted
+  into shared helpers both commands now use. (#47)
+
+- **`histogram` signals inverted limits consistently (CBUG-F12 refused).**
+  When `LLIM >= ULIM` the record now raises the alarm through `nsta`/`nsev`
+  on *both* the compute and array-read paths, instead of reproducing the C
+  bug on one of them.
+
+### epics-ca-rs
+
+- **CA server clamps a request's element count to the channel capacity.**
+  A read/subscribe asking for more elements than the channel holds is
+  clamped to the channel's max rather than honored as given.
+
+### asyn-rs
+
+- **Both asyn escapers render NUL as `\0` through one shared table
+  (CBUG-D4 refused).** The two escape paths previously diverged; a NUL byte
+  is now escaped identically on both.
+
+### epics-pva-rs
+
+- **Doc fix:** corrected a stale `ack_at_from` comment that still referenced
+  the removed CBUG-B12 sentinel. No behavior change.
+
 ## v0.24.2 — 2026-07-19
 
 Patch release. Two DTYP-resolution fixes in `epics-base-rs` (the `dbpf`

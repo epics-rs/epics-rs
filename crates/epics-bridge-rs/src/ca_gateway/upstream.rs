@@ -2459,7 +2459,6 @@ ASG(NewGroup) {
             let pv = db.find_pv(name).await.expect("shadow registered");
             let immediate = pv
                 .snapshot()
-                .await
                 .display
                 .map(|d| d.units.to_string())
                 .unwrap_or_default();
@@ -2478,7 +2477,7 @@ ASG(NewGroup) {
         for _ in 0..40 {
             tokio::time::sleep(Duration::from_millis(50)).await;
             if let Some(pv) = db.find_pv(name).await {
-                if let Some(d) = pv.snapshot().await.display {
+                if let Some(d) = pv.snapshot().display {
                     let u = d.units.to_string();
                     if !u.is_empty() {
                         units = u;
@@ -2673,7 +2672,7 @@ ASG(NewGroup) {
         // The monitor/stored path still serves the sentinel — the read
         // hook is GET-path only.
         assert_eq!(
-            pv.snapshot().await.value,
+            pv.snapshot().value,
             EpicsValue::Double(SENTINEL),
             "snapshot (monitor path) must still serve the stored shadow value"
         );

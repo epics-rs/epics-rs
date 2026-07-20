@@ -912,7 +912,7 @@ impl SseqRecord {
             let name = name.clone();
             let handle = handle.clone();
             crate::runtime::task::spawn(async move {
-                handle.cancel_async_reentry(&name).await;
+                handle.cancel_async_reentry(&name);
                 reenter_now(&name, &handle).await;
             });
         }

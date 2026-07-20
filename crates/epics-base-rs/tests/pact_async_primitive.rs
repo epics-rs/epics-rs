@@ -116,7 +116,7 @@ async fn async_token_stale_after_cancel_is_noop() {
 
     // Cancel (C `callbackCancelDelayed`): advance the generation so the
     // already-minted token is superseded.
-    db.cancel_async_reentry("T2").await;
+    db.cancel_async_reentry("T2");
     assert!(
         !token.is_current(),
         "token must be stale once the generation has advanced"
@@ -273,7 +273,7 @@ async fn reprocess_on_notify_with_cancelled_token_is_noop() {
     let handle = db.reprocess_on_notify(token, rx);
 
     // Cancel the outstanding token BEFORE the downstream completes.
-    db.cancel_async_reentry("T5").await;
+    db.cancel_async_reentry("T5");
     notify.leave();
 
     handle.await.expect("wiring task joins cleanly");

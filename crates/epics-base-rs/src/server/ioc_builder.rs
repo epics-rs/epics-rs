@@ -231,7 +231,7 @@ impl IocBuilder {
                 // C `wdogInit(prec)` from `init_record` pass 1
                 // (histogramRecord.c:168) — arms the SDEL monitor watchdog.
                 // No-op for every record type without one.
-                db.arm_watchdog(&name).await;
+                db.arm_watchdog(&name);
             }
         }
 
@@ -301,7 +301,7 @@ impl IocBuilder {
                 // `prec->mlst = prec->val`). So this owner runs here, ahead of
                 // `seed_deadband_tracking`, or the first process would post a
                 // spurious monitor for a value that was there since init.
-                db.rec_gbl_init_constant_links(&rec_arc).await;
+                db.rec_gbl_init_constant_links(&rec_arc);
 
                 // Seed MLST/ALST/LALM from val (after any UDF/bit fold that
                 // may have changed val) so the first process posts a monitor
@@ -318,7 +318,7 @@ impl IocBuilder {
                 db.rec_gbl_init_simm(&rec_arc).await;
                 // C `wdogInit(prec)` from `init_record` pass 1
                 // (histogramRecord.c:168) — arms the SDEL monitor watchdog.
-                db.arm_watchdog(&def.name).await;
+                db.arm_watchdog(&def.name);
                 let mut instance = rec_arc.write();
 
                 // Device support based on DTYP

@@ -262,9 +262,9 @@ impl AsyncDbHandle {
 
     /// Cancel an outstanding async re-entry — see
     /// [`PvDatabase::cancel_async_reentry`]. No-op if the database is gone.
-    pub async fn cancel_async_reentry(&self, name: &str) {
+    pub fn cancel_async_reentry(&self, name: &str) {
         if let Some(db) = self.db() {
-            db.cancel_async_reentry(name).await;
+            db.cancel_async_reentry(name);
         }
     }
 
@@ -815,7 +815,7 @@ impl PvDatabase {
     /// every previously-minted [`AsyncToken`] for it becomes stale and its
     /// `fire` is a no-op. A subsequent [`Self::mint_async_token`] produces a
     /// fresh, current token. No-op if the record is absent.
-    pub async fn cancel_async_reentry(&self, name: &str) {
+    pub fn cancel_async_reentry(&self, name: &str) {
         let records = self.inner.records.read();
         if let Some(rec) = records.get(name) {
             rec.read()
@@ -864,7 +864,7 @@ impl PvDatabase {
     /// for the fields the record named — no `add_count`, no alarm tail, no
     /// FLNK. A record with no watchdog (`watchdog_interval() == None`) spawns
     /// nothing.
-    pub(crate) async fn arm_watchdog(&self, name: &str) {
+    pub(crate) fn arm_watchdog(&self, name: &str) {
         let (rec, generation, epoch) = {
             let records = self.inner.records.read();
             let Some(rec) = records.get(name) else { return };
@@ -1656,7 +1656,7 @@ impl PvDatabase {
             SimOutcome::NotSimulated => None,
             SimOutcome::Simulated => {
                 self.run_forward_link_tail(name, &rec, visited, depth).await;
-                self.end_process_cycle(name, &rec, sim_pact_exit).await;
+                self.end_process_cycle(name, &rec, sim_pact_exit);
                 return Ok(());
             }
             SimOutcome::AbortedBeforeWrite => {
@@ -1683,7 +1683,7 @@ impl PvDatabase {
                         sim_process_tail(&mut instance, false);
                     }
                     self.run_forward_link_tail(name, &rec, visited, depth).await;
-                    self.end_process_cycle(name, &rec, sim_pact_exit).await;
+                    self.end_process_cycle(name, &rec, sim_pact_exit);
                     return Ok(());
                 }
             }
@@ -1897,7 +1897,7 @@ impl PvDatabase {
             super::links::LinkAlarm,
         )> = if is_soft {
             let (_v, alarm) = self.read_link_with_alarm(&inp_parsed).await;
-            self.input_link_inheritance(name, &inp_parsed, alarm).await
+            self.input_link_inheritance(name, &inp_parsed, alarm)
         } else {
             None
         };
@@ -2101,7 +2101,7 @@ impl PvDatabase {
                     // Multi-input alarm propagation, through the inheritance
                     // owner (which applies the MS class and C's self-link
                     // exclusion).
-                    if let Some(pair) = self.input_link_inheritance(name, &parsed, alarm).await {
+                    if let Some(pair) = self.input_link_inheritance(name, &parsed, alarm) {
                         link_alarms.push(pair);
                     }
                     // The record's declared fetch shape decides what a failed
@@ -2193,7 +2193,7 @@ impl PvDatabase {
                     self.process_passive_db_source(db, visited, depth).await;
                 }
                 let (fetch, alarm) = self.read_link_with_alarm(&parsed).await;
-                if let Some(pair) = self.input_link_inheritance(name, &parsed, alarm).await {
+                if let Some(pair) = self.input_link_inheritance(name, &parsed, alarm) {
                     link_alarms.push(pair);
                 }
                 let text = match fetch {
@@ -3711,8 +3711,7 @@ impl PvDatabase {
         // `check_simulation_mode` (the SDLY/SIM continuation);
         // `continuation_pact_exit` the one at the `is_continuation` arm. At most
         // one of them can carry the parked put.
-        self.end_process_cycle(name, &rec, sim_pact_exit.merge(continuation_pact_exit))
-            .await;
+        self.end_process_cycle(name, &rec, sim_pact_exit.merge(continuation_pact_exit));
 
         Ok(())
     }
@@ -3731,7 +3730,7 @@ impl PvDatabase {
     /// by the two simulation early-returns: a put-notify on a SIMM record never
     /// left its wait-set (the callback never fired) and PUTF leaked into the next
     /// scan.
-    async fn end_process_cycle(
+    fn end_process_cycle(
         &self,
         name: &str,
         rec: &Arc<parking_lot::RwLock<RecordInstance>>,
@@ -3857,7 +3856,7 @@ impl PvDatabase {
             .await;
 
         // 4.55. event record: post the named software event.
-        self.dispatch_event_record(rec).await;
+        self.dispatch_event_record(rec);
 
         // The generic multi-output OUT writes (scalcout / acalcout OUT->OVAL)
         // are NOT part of this tail: C performs a record's output writes inside
@@ -4072,7 +4071,6 @@ impl PvDatabase {
                 let inheritance = {
                     let alarm = self.read_link_with_alarm(&parsed).await.1;
                     self.input_link_inheritance(&reader_name, &parsed, alarm)
-                        .await
                 };
                 let mut instance = rec.write();
                 // A value the target field REJECTS is a failed read, not a
@@ -4285,7 +4283,7 @@ impl PvDatabase {
                     // C `wdogInit` from `special()` (histogram SDEL,
                     // histogramRecord.c:266-268). The arm owner supersedes any
                     // tick already in flight.
-                    self.arm_watchdog(record_name).await;
+                    self.arm_watchdog(record_name);
                 }
                 ProcessAction::ScanOnce => {
                     // C `scanOnce(precord)`. The `if (precord->scan)` guard C
@@ -4386,7 +4384,7 @@ impl PvDatabase {
                     // or WAITn notify re-entry becomes a structural no-op (the
                     // AsyncToken gate), with no runtime is-aborted check on
                     // the re-entry path.
-                    self.cancel_async_reentry(record_name).await;
+                    self.cancel_async_reentry(record_name);
                 }
             }
         }
@@ -4793,7 +4791,7 @@ impl PvDatabase {
             .await;
 
         // event record: post the named software event.
-        self.dispatch_event_record(&rec).await;
+        self.dispatch_event_record(&rec);
 
         // FLNK — the async-completion tail's copy of the same C path, through
         // the same single owner (C `dbScanFwdLink` → `dbScanPassive` →
@@ -5087,7 +5085,7 @@ impl PvDatabase {
         link: &crate::server::record::ParsedLink,
     ) -> crate::server::recgbl::simm::LinkFetch {
         let (fetch, alarm) = self.read_link_with_alarm(link).await;
-        self.inherit_link_severity(reader, link, alarm).await;
+        self.inherit_link_severity(reader, link, alarm);
         fetch
     }
 
@@ -5112,14 +5110,14 @@ impl PvDatabase {
     /// process-time link read folds its source's alarm in. Computes the
     /// `(MS class, source alarm)` pair through the inheritance owner with no
     /// record lock held, then applies it under a brief write lock.
-    async fn inherit_link_severity(
+    fn inherit_link_severity(
         &self,
         reader: &Arc<parking_lot::RwLock<RecordInstance>>,
         link: &crate::server::record::ParsedLink,
         alarm: Option<super::links::LinkAlarm>,
     ) {
         let reader_name = reader.read().name.clone();
-        if let Some((ms, src)) = self.input_link_inheritance(&reader_name, link, alarm).await {
+        if let Some((ms, src)) = self.input_link_inheritance(&reader_name, link, alarm) {
             let mut instance = reader.write();
             super::links::inherit_sevr_msg(&mut instance.common, ms, &src);
         }
@@ -5287,7 +5285,7 @@ impl PvDatabase {
     /// its constants seeded: in C there is no record in the database that
     /// `init_record` did not touch. Seeding twice is a no-op — both calls
     /// happen before any client can put.
-    pub(crate) async fn rec_gbl_init_constant_links(
+    pub(crate) fn rec_gbl_init_constant_links(
         &self,
         rec: &Arc<parking_lot::RwLock<RecordInstance>>,
     ) {

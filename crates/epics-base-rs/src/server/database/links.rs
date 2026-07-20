@@ -746,7 +746,7 @@ impl PvDatabase {
     ///   `MonitorSwitch`; a PVA link's lset has already applied the MS/NMS/MSI
     ///   gate, so its (already final) severity folds as `MaximizeStatus` to keep
     ///   the remote stat + message. Constant/Hw/Calc links inherit nothing.
-    pub(crate) async fn input_link_inheritance(
+    pub(crate) fn input_link_inheritance(
         &self,
         reader_name: &str,
         link: &crate::server::record::ParsedLink,
@@ -2030,7 +2030,7 @@ impl PvDatabase {
     /// the live STAT/SEVR fields, and post the monitor — matching the
     /// observable end state (record reads INVALID/SOFT_ALARM, a
     /// `DBE_ALARM` subscriber on STAT/SEVR is notified).
-    async fn apply_selm_alarm(
+    fn apply_selm_alarm(
         rec: &Arc<parking_lot::RwLock<RecordInstance>>,
         alarm: Option<(u16, AlarmSeverity)>,
     ) {
@@ -2316,7 +2316,7 @@ impl PvDatabase {
         // posting SEVR/STAT immediately (apply_selm_alarm).
         let pending_selm_alarm = sel.alarm;
         if !is_value_phase {
-            Self::apply_selm_alarm(rec, sel.alarm).await;
+            Self::apply_selm_alarm(rec, sel.alarm);
         }
         let indices = sel.indices;
         // C `dfanoutRecord.c` push_values raises LINK_ALARM/MAJOR per failed
@@ -2539,10 +2539,7 @@ impl PvDatabase {
     /// `SCAN="Event"` records whose `EVNT` resolves to that name.
     /// No-op for any other record type, or when `VAL` is empty /
     /// resolves to event 0 (`eventNameToHandle` returns NULL).
-    pub(crate) async fn dispatch_event_record(
-        &self,
-        rec: &Arc<parking_lot::RwLock<RecordInstance>>,
-    ) {
+    pub(crate) fn dispatch_event_record(&self, rec: &Arc<parking_lot::RwLock<RecordInstance>>) {
         let event_name = {
             let instance = rec.read();
             if instance.record.record_type() != "event" {

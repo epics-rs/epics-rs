@@ -154,7 +154,7 @@ impl ScanSchedulerV2 {
     }
 
     /// Submit a delayed scan for a record (processes after the given delay).
-    pub async fn submit_delayed(&self, record_name: &str, delay: Duration) {
+    pub fn submit_delayed(&self, record_name: &str, delay: Duration) {
         let db = self.db.clone();
         let name = record_name.to_string();
         crate::runtime::task::spawn(async move {

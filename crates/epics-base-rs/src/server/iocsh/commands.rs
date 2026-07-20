@@ -1283,7 +1283,7 @@ fn cmd_db_load_records() -> CommandDef {
                     // `dbLoadLinkArray` from every soft INPUT dev support's
                     // `init_record` — the only site that loads a constant INP
                     // into the record's value.
-                    ctx.db().rec_gbl_init_constant_links(&rec_arc).await;
+                    ctx.db().rec_gbl_init_constant_links(&rec_arc);
                     // C `recGblInitSimm` + `recGblInitConstantLink(&siol, …,
                     // &sval)`, run from every SIML-bearing `init_record`
                     // (pass 1) — the only site that loads a constant
@@ -1293,7 +1293,7 @@ fn cmd_db_load_records() -> CommandDef {
                     // (histogramRecord.c:168) — arms the SDEL monitor
                     // watchdog; a re-arm supersedes the previous one, which is
                     // what the merge re-init above needs.
-                    ctx.db().arm_watchdog(&def.name).await;
+                    ctx.db().arm_watchdog(&def.name);
                     Ok(())
                 });
                 if let Err(e) = added {

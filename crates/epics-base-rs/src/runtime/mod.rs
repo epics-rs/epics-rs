@@ -1,3 +1,4 @@
+pub mod background;
 pub mod build_info;
 pub mod env;
 pub mod env_table;

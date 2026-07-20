@@ -26,31 +26,72 @@ impl std::fmt::Display for NotBlockable {
 
 impl std::error::Error for NotBlockable {}
 
-/// Drive `fut` to completion on this thread, parking between polls.
+/// A [`Waker`] that unparks the thread that built it. The single owner of the
+/// "poll-then-park" wake mechanism in this crate: both [`park_on`] (the sync
+/// bridge) and the RTEMS future executor
+/// ([`crate::runtime::background::future_exec`]) drive a future by polling on a
+/// thread and parking it between polls, so both build one of these on their own
+/// thread and rely on the future's cross-thread waker to unpark them.
+pub(crate) struct ThreadWaker(std::thread::Thread);
+
+impl ThreadWaker {
+    /// A waker over the *current* thread — call this on the thread that will
+    /// park.
+    pub(crate) fn for_current_thread() -> Waker {
+        Waker::from(Arc::new(ThreadWaker(std::thread::current())))
+    }
+}
+
+impl Wake for ThreadWaker {
+    fn wake(self: Arc<Self>) {
+        self.0.unpark();
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.unpark();
+    }
+}
+
+/// Drive `fut` to completion on this thread, parking between polls, and stop
+/// early when `should_cancel` returns `true`.
+///
+/// Returns `Some(output)` when the future completed, or `None` when it was
+/// cancelled before completing (the future is dropped in place on cancel,
+/// running its destructors — the same "drop at the next suspension point"
+/// semantics a cancelled tokio task has).
+///
+/// The future must only await runtime-agnostic primitives (`tokio::sync`
+/// locks/channels/notifies): nothing here drives a reactor or a timer wheel, so
+/// whoever wakes us must be running on some other thread. A cancel is observed
+/// on the next wake — the caller that flips `should_cancel` must also
+/// [`unpark`](std::thread::Thread::unpark) this thread so a *parked* driver
+/// re-checks promptly rather than sleeping until the future's own waker fires.
+pub(crate) fn park_on_interruptible<F: Future>(
+    fut: F,
+    mut should_cancel: impl FnMut() -> bool,
+) -> Option<F::Output> {
+    let mut fut = std::pin::pin!(fut);
+    let waker = ThreadWaker::for_current_thread();
+    let mut cx = Context::from_waker(&waker);
+    loop {
+        if should_cancel() {
+            return None;
+        }
+        if let Poll::Ready(value) = fut.as_mut().poll(&mut cx) {
+            return Some(value);
+        }
+        std::thread::park();
+    }
+}
+
+/// Drive `fut` to completion on this thread, parking between polls. Thin
+/// uncancellable wrapper over [`park_on_interruptible`].
 ///
 /// The future must only await runtime-agnostic primitives (`tokio::sync`
 /// locks/channels/notifies): nothing here drives a reactor or a timer wheel, so
 /// whoever wakes us must be running on some other thread.
 fn park_on<F: Future>(fut: F) -> F::Output {
-    struct ThreadWaker(std::thread::Thread);
-    impl Wake for ThreadWaker {
-        fn wake(self: Arc<Self>) {
-            self.0.unpark();
-        }
-        fn wake_by_ref(self: &Arc<Self>) {
-            self.0.unpark();
-        }
-    }
-
-    let mut fut = std::pin::pin!(fut);
-    let waker = Waker::from(Arc::new(ThreadWaker(std::thread::current())));
-    let mut cx = Context::from_waker(&waker);
-    loop {
-        if let Poll::Ready(value) = fut.as_mut().poll(&mut cx) {
-            return value;
-        }
-        std::thread::park();
-    }
+    // Never cancels, so `park_on_interruptible` always returns `Some`.
+    park_on_interruptible(fut, || false).expect("uncancellable driver returned None")
 }
 
 /// Block the calling thread on `fut`, picking the mechanism that is sound for

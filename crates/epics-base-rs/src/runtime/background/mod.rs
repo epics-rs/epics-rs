@@ -30,6 +30,7 @@
 
 pub mod callback_executor;
 pub mod delayed_timer;
+pub mod future_exec;
 pub mod scan_once;
 
 use std::time::Duration;
@@ -39,6 +40,9 @@ pub use callback_executor::{
     DEFAULT_THREADS_PER_PRIORITY, NUM_CALLBACK_PRIORITIES,
 };
 pub use delayed_timer::{DelayedTimer, TimerHandle};
+pub use future_exec::{
+    AbortHandle, DEFAULT_SPAWN_PRIORITY, JoinError, JoinFuture, spawn_blocking_on, spawn_future,
+};
 pub use scan_once::{
     DEFAULT_ONCE_QUEUE_SIZE, OnceCallback, ScanOnceHandle, ScanOnceOverflow, ScanOnceQueue,
 };

@@ -39,7 +39,7 @@ fn max_accumulated() -> usize {
 /// want a defensive cap (e.g., NAT environments where TCP keepalive is
 /// unreliable) can set `EPICS_CAS_INACTIVITY_TMO` to a positive value;
 /// values < 30 are clamped to 30 to avoid pathological short timeouts.
-fn inactivity_timeout() -> Option<Duration> {
+pub(crate) fn inactivity_timeout() -> Option<Duration> {
     static RESOLVED: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
     *RESOLVED.get_or_init(resolve_inactivity_timeout)
 }
@@ -578,7 +578,12 @@ struct SubscriptionEntry {
     long_string_mode: LongStringMode,
 }
 
-struct ClientState {
+/// Per-circuit CA server state. `pub(crate)` so the blocking
+/// thread-per-client driver (`crate::server::blocking`, the RTEMS CA
+/// server front-end) can construct one and drive [`dispatch_message`]
+/// against it exactly as the async `handle_client` loop does — the two
+/// front-ends share this state and the dispatch handlers verbatim.
+pub(crate) struct ClientState {
     channels: HashMap<u32, ChannelEntry>,
     subscriptions: HashMap<u32, SubscriptionEntry>,
     channel_access: HashMap<u32, AccessLevel>,
@@ -751,7 +756,7 @@ enum Refused {
 }
 
 impl ClientState {
-    fn new(
+    pub(crate) fn new(
         acf: Arc<tokio::sync::RwLock<Option<AccessSecurityConfig>>>,
         tcp_port: u16,
         db: Arc<PvDatabase>,
@@ -786,6 +791,49 @@ impl ClientState {
             write_notify_tasks: Vec::new(),
             stats: None,
         }
+    }
+
+    /// Decide this circuit's ACF host identity + mTLS auth context, once,
+    /// from the connection itself. C decides the same in `create_tcp_client`
+    /// (`caservertask.c:1425-1437`). Extracted from [`handle_client`] so the
+    /// async loop and the blocking thread-per-client driver
+    /// (`crate::server::blocking`) derive identity byte-identically. See
+    /// [`HostIdentity`].
+    pub(crate) fn apply_connection_identity(
+        &mut self,
+        peer: SocketAddr,
+        initial_hostname: Option<String>,
+        tls_authority: Option<String>,
+    ) {
+        self.hostname = match initial_hostname {
+            // Port extension, no C counterpart: an mTLS-verified cert identity
+            // outranks both of C's modes and no client-supplied name replaces
+            // it (doc/11-tls-design.md).
+            Some(verified) => HostIdentity::Pinned(verified),
+            // C `asCheckClientIP == 1`: the peer's address is the identity and
+            // CA_PROTO_HOST_NAME is ignored.
+            None if epics_base_rs::server::access_security::as_check_client_ip() => {
+                HostIdentity::Pinned(peer.ip().to_string())
+            }
+            // C's default: NULL `pHostName` — i.e. `""` to `asAddClient` —
+            // until the client claims a name over CA_PROTO_HOST_NAME.
+            None => HostIdentity::Claimed(String::new()),
+        };
+        // PR #641: surface the mTLS authentication context to the ACF
+        // check. Plaintext peers stay with empty fields — every legacy
+        // rule (no METHOD/AUTHORITY clause) ignores them.
+        if let Some(authority) = tls_authority {
+            self.auth_method = "x509".to_string();
+            self.auth_authority = authority;
+        }
+        self.peer = peer.to_string();
+    }
+
+    /// The negotiated CA minor protocol version of the peer. Needed by the
+    /// blocking driver's framing loop (`CaHeader::from_bytes_for_peer`) and
+    /// its error replies (`send_ca_error`), which live outside this module.
+    pub(crate) fn client_minor_version(&self) -> u16 {
+        self.client_minor_version
     }
 
     /// Refuse the message that starts at `offset` **without tearing the
@@ -1606,7 +1654,7 @@ async fn accept_loop(
 /// outbox migration the spawned monitor tasks swallowed their own
 /// EPIPEs; with every write centralized in the client loop, the loop
 /// itself must classify them.
-fn is_peer_disconnect(kind: std::io::ErrorKind) -> bool {
+pub(crate) fn is_peer_disconnect(kind: std::io::ErrorKind) -> bool {
     matches!(
         kind,
         std::io::ErrorKind::ConnectionReset
@@ -1700,31 +1748,12 @@ where
         state.cap_token_verifier = cap_token_verifier;
         state.tls_channel_binding = tls_channel_binding;
     }
-    // The circuit's ACF host identity is decided once, here — C decides it
-    // in `create_tcp_client` (`caservertask.c:1425-1437`) for exactly the
-    // same reason. See `HostIdentity`.
-    state.hostname = match initial_hostname {
-        // Port extension, no C counterpart: an mTLS-verified cert identity
-        // outranks both of C's modes and no client-supplied name replaces
-        // it (doc/11-tls-design.md).
-        Some(verified) => HostIdentity::Pinned(verified),
-        // C `asCheckClientIP == 1`: the peer's address is the identity and
-        // CA_PROTO_HOST_NAME is ignored.
-        None if epics_base_rs::server::access_security::as_check_client_ip() => {
-            HostIdentity::Pinned(peer.ip().to_string())
-        }
-        // C's default: NULL `pHostName` — i.e. `""` to `asAddClient` —
-        // until the client claims a name over CA_PROTO_HOST_NAME.
-        None => HostIdentity::Claimed(String::new()),
-    };
-    // PR #641: surface the mTLS authentication context to the ACF
-    // check. Plaintext peers stay with empty fields — every legacy
-    // rule (no METHOD/AUTHORITY clause) ignores them.
-    if let Some(authority) = tls_authority {
-        state.auth_method = "x509".to_string();
-        state.auth_authority = authority;
-    }
-    state.peer = peer.to_string();
+    // The circuit's ACF host identity + mTLS auth context are decided once,
+    // here — C decides them in `create_tcp_client`
+    // (`caservertask.c:1425-1437`) for the same reason. Shared with the
+    // blocking thread-per-client driver (`crate::server::blocking`) so both
+    // server front-ends derive identity identically. See `HostIdentity`.
+    state.apply_connection_identity(peer, initial_hostname, tls_authority);
     state.audit = audit;
     let rl_cfg = crate::server::rate_limit::RateLimitConfig::from_env();
     state.rate_limiter = rl_cfg.build();
@@ -2273,7 +2302,7 @@ where
     loop_result
 }
 
-async fn dispatch_message(
+pub(crate) async fn dispatch_message(
     hdr: &CaHeader,
     payload: &[u8],
     state: &mut ClientState,

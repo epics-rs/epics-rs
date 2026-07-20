@@ -35,7 +35,7 @@ async fn scaler_db() -> PvDatabase {
 
 async fn watch(db: &PvDatabase, field: &str, sid: u32, mask: EventMask) -> EventReader {
     let rec = db.get_record("SCAL").await.unwrap();
-    let mut inst = rec.write().await;
+    let mut inst = rec.write();
     inst.add_subscriber(field, sid, DbFieldType::Long, mask.bits())
         .expect("subscription must be accepted")
 }
@@ -59,7 +59,7 @@ fn drain(rx: &mut EventReader) -> usize {
 /// filling `s[]` plus the dset `done()` return (`scalerRecord.c:366`).
 async fn hardware_finishes_with(db: &PvDatabase, counts: [u32; 4]) {
     let rec = db.get_record("SCAL").await.unwrap();
-    let mut inst = rec.write().await;
+    let mut inst = rec.write();
     let scal = inst
         .record
         .as_any_mut()

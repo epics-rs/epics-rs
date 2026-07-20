@@ -5625,7 +5625,7 @@ mod tests {
             .get_record("TEST:ASYN:UDF")
             .await
             .expect("asyn record loaded");
-        let inst = rec.read().await;
+        let inst = rec.read();
         assert_eq!(
             inst.get_common_field("UDF"),
             Some(EpicsValue::UChar(0)),
@@ -8551,7 +8551,7 @@ mod tests {
         let mut posted = false;
         for _ in 0..2000 {
             let inst = db.get_record(rec_name).await.unwrap();
-            let got = inst.read().await.record.get_field("TMSK");
+            let got = inst.read().record.get_field("TMSK");
             if got == Some(EpicsValue::Long(want)) {
                 posted = true;
                 break;
@@ -8564,7 +8564,7 @@ mod tests {
         );
 
         let inst = db.get_record(rec_name).await.unwrap();
-        let g = inst.read().await;
+        let g = inst.read();
         assert_eq!(g.record.get_field("TMSK"), Some(EpicsValue::Long(want)));
         assert_eq!(
             g.record.get_field("TB0"),
@@ -8649,7 +8649,7 @@ mod tests {
         // in which `connectDevice`'s own posts (R14-47) are observable at all.
         {
             let inst = db.get_record(rec_name).await.unwrap();
-            let mut g = inst.write().await;
+            let mut g = inst.write();
             let rec = g
                 .record
                 .as_any_mut()
@@ -8788,7 +8788,7 @@ mod tests {
             .unwrap();
         {
             let inst = db.get_record(rec_name).await.unwrap();
-            let mut g = inst.write().await;
+            let mut g = inst.write();
             let rec = g
                 .record
                 .as_any_mut()
@@ -8809,7 +8809,7 @@ mod tests {
         // operator's ERRS monitor must fire with it.
         {
             let inst = db.get_record(rec_name).await.unwrap();
-            let mut g = inst.write().await;
+            let mut g = inst.write();
             let rec = g
                 .record
                 .as_any_mut()
@@ -8835,7 +8835,7 @@ mod tests {
         // not fire a monitor per retry with text the client already has.
         {
             let inst = db.get_record(rec_name).await.unwrap();
-            let mut g = inst.write().await;
+            let mut g = inst.write();
             let rec = g
                 .record
                 .as_any_mut()
@@ -8854,7 +8854,7 @@ mod tests {
         // string, so the operator's screen loses the stale message.
         {
             let inst = db.get_record(rec_name).await.unwrap();
-            let mut g = inst.write().await;
+            let mut g = inst.write();
             let rec = g
                 .record
                 .as_any_mut()
@@ -8955,7 +8955,7 @@ mod tests {
         // The operator puts PORT — C `special()` :502-517 runs `connectDevice`.
         {
             let inst = db.get_record(rec_name).await.unwrap();
-            let mut g = inst.write().await;
+            let mut g = inst.write();
             let rec = g
                 .record
                 .as_any_mut()
@@ -9068,7 +9068,7 @@ mod tests {
         let mut posted = false;
         for _ in 0..2000 {
             let inst = db.get_record(rec_name).await.unwrap();
-            let got = inst.read().await.record.get_field("CNCT");
+            let got = inst.read().record.get_field("CNCT");
             if got == Some(EpicsValue::Enum(0)) {
                 posted = true;
                 break;
@@ -9083,7 +9083,7 @@ mod tests {
         // ENBL / AUCT are re-read by the same refresh and are unchanged, so
         // POST_IF_NEW leaves them alone — the record still shows them true.
         let inst = db.get_record(rec_name).await.unwrap();
-        let g = inst.read().await;
+        let g = inst.read();
         assert_eq!(g.record.get_field("ENBL"), Some(EpicsValue::Enum(1)));
         assert_eq!(g.record.get_field("AUCT"), Some(EpicsValue::Enum(1)));
     }

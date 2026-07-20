@@ -261,7 +261,7 @@ async fn retry_dispatched_on_callback_pass_reaches_the_driver() {
     let db = PvDatabase::new();
     db.add_record("M1", Box::new(rec)).await.unwrap();
     if let Some(arc) = db.get_record("M1").await {
-        let mut inst = arc.write().await;
+        let mut inst = arc.write();
         inst.common.dtyp = "simMotor".to_string();
         inst.device = Some(Box::new(dev));
     }
@@ -417,7 +417,7 @@ async fn parked_pre_pulse_put_anchors_first_then_replays_as_a_move() {
     let db = PvDatabase::new();
     db.add_record("M1", Box::new(rec)).await.unwrap();
     if let Some(arc) = db.get_record("M1").await {
-        let mut inst = arc.write().await;
+        let mut inst = arc.write();
         inst.common.dtyp = "simMotor".to_string();
         inst.device = Some(Box::new(dev));
     }

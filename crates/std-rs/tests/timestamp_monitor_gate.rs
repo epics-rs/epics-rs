@@ -54,7 +54,7 @@ record(timestamp, "TS:MIN") {
 
     let (mut rval_rx, mut val_rx) = {
         let rec = db.get_record("TS:MIN").await.unwrap();
-        let mut inst = rec.write().await;
+        let mut inst = rec.write();
         let rval = inst
             .add_subscriber(
                 "RVAL",
@@ -139,7 +139,7 @@ record(timestamp, "TS:SEC") {
 
     let (mut rval_rx, mut val_rx) = {
         let rec = db.get_record("TS:SEC").await.unwrap();
-        let mut inst = rec.write().await;
+        let mut inst = rec.write();
         let rval = inst
             .add_subscriber(
                 "RVAL",

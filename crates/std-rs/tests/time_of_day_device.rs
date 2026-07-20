@@ -16,7 +16,7 @@ use epics_base_rs::types::EpicsValue;
 
 async fn read_val(db: &PvDatabase, name: &str) -> EpicsValue {
     let rec = db.get_record(name).await.expect("record exists");
-    let inst = rec.read().await;
+    let inst = rec.read();
     inst.record.get_field("VAL").expect("VAL field present")
 }
 

@@ -489,6 +489,20 @@ struct ChannelEntry {
     /// which C `cvt_dbaddr` presents as a scalar `DBF_STRING`. `Plain`
     /// for every other channel.
     long_string_mode: LongStringMode,
+    /// Final (post-filter) element count announced to the client at
+    /// `CA_PROTO_CREATE_CHAN` — the port's `dbChannelFinalElements`
+    /// equivalent. Every request's wire element count is clamped to this
+    /// ceiling on READ / READ_NOTIFY / EVENT_ADD so an oversized
+    /// `m_count` cannot drive the reply zero-fill
+    /// ([`pad_dbr_to_requested_count`] / the steady-state monitor
+    /// producer) past the channel's real capacity. Mirrors epics-base
+    /// PR #934's `if (mp->m_count > dbChannelFinalElements(pciu->dbch))
+    /// mp->m_count = dbChannelFinalElements(pciu->dbch);` clamp. This is
+    /// the channel's true capacity (NELM), NOT the live value length
+    /// (`snapshot.value.count()`, which is NORD for a partially-filled
+    /// waveform) — clamping to the live length would truncate a
+    /// legitimate `caget -# NELM` on a dynamic waveform.
+    final_element_count: u32,
 }
 
 impl ChannelEntry {
@@ -2765,6 +2779,10 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         filter_suffix: filter_suffix.clone(),
                         put_notify_slot: PutNotifySlot::default(),
                         long_string_mode,
+                        // The post-filter capacity computed above and
+                        // announced in the CREATE_CHAN reply — the ceiling
+                        // a later request's element count is clamped to.
+                        final_element_count: element_count,
                     },
                 );
                 state.channel_access.insert(sid, access_level);
@@ -2837,7 +2855,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             let sid = hdr.cid;
             let ioid = hdr.available;
             let requested_type = hdr.data_type;
-            let requested_count = hdr.actual_count();
+            let mut requested_count = hdr.actual_count();
 
             // the two read commands differ in WHERE the
             // `INVALID_DB_REQ(m_dataType)` type check sits relative to
@@ -2898,6 +2916,18 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     )));
                 }
             };
+
+            // PR #934 (epics-base) parity: clamp the wire element count to
+            // the channel's final element count so an oversized `m_count`
+            // cannot drive the reply zero-fill (`pad_dbr_to_requested_count`)
+            // past the channel's real capacity. C `read_action`
+            // (`camessage.c`) / `read_notify_action`:
+            // `if (mp->m_count > dbChannelFinalElements(pciu->dbch))
+            //     mp->m_count = dbChannelFinalElements(pciu->dbch);`.
+            // `requested_count == 0` is autosize and is preserved untouched.
+            if requested_count != 0 && requested_count > entry.final_element_count {
+                requested_count = entry.final_element_count;
+            }
 
             // Deprecated READ: C `read_action` (`rsrv/camessage.c:616-619`)
             // checks `INVALID_DB_REQ` AFTER resolving the channel and
@@ -4077,7 +4107,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             // delivery and the EVENT_CANCEL ack can echo it (matches
             // C `event_add_action` capturing `pevext->msg` for later
             // `read_reply` / `event_cancel_reply` use).
-            let requested_count = hdr.actual_count();
+            let mut requested_count = hdr.actual_count();
 
             // DoS guard: cap subscriptions per channel. Default-unbounded
             // (`None`) — C `event_add_action` imposes no per-channel
@@ -4167,6 +4197,20 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     )));
                 }
             };
+
+            // PR #934 (epics-base) parity: clamp the wire element count to
+            // the channel's final element count BEFORE it is stored on the
+            // subscription (`SubscriptionEntry::data_count`), so neither the
+            // initial snapshot (`pad_dbr_to_requested_count`) nor every
+            // steady-state monitor delivery (the producer in `monitor.rs`)
+            // can zero-fill past the channel's real capacity. C
+            // `event_add_action`:
+            // `if (mp->m_count > dbChannelFinalElements(pciu->dbch))
+            //     mp->m_count = dbChannelFinalElements(pciu->dbch);`.
+            // `requested_count == 0` is autosize and is preserved untouched.
+            if requested_count != 0 && requested_count > entry.final_element_count {
+                requested_count = entry.final_element_count;
+            }
 
             // C `db_add_event` (dbEvent.c:437-439) returns NULL when
             // `select == 0 || select > UCHAR_MAX`, which propagates as
@@ -8188,6 +8232,257 @@ mod deprecated_read_autosize_tests {
             24,
             "READ_NOTIFY count==0 ships all 3 DBR_DOUBLE elements (3*8=24 bytes); got {}",
             resp.actual_postsize()
+        );
+
+        drop(client);
+        handle.abort();
+    }
+
+    /// Build a CA_PROTO_EVENT_ADD subscribing `sub_id` on `sid` with an
+    /// explicit element `count` (the stock `event_add_frame` pins count=1).
+    fn event_add_request_count(sid: u32, sub_id: u32, count: u32) -> Vec<u8> {
+        let mut h = CaHeader::new(CA_PROTO_EVENT_ADD);
+        h.data_type = DBR_DOUBLE;
+        h.cid = sid;
+        h.available = sub_id;
+        h.set_payload_size(16, count, crate::protocol::CA_MINOR_VERSION)
+            .expect("modern peer accepts the extended header");
+        let mut frame = h.to_bytes_extended().to_vec();
+        frame.extend_from_slice(&0f32.to_be_bytes());
+        frame.extend_from_slice(&0f32.to_be_bytes());
+        frame.extend_from_slice(&0f32.to_be_bytes());
+        frame.extend_from_slice(&3u16.to_be_bytes()); // mask: value+alarm
+        frame.extend_from_slice(&0u16.to_be_bytes()); // pad
+        frame
+    }
+
+    /// Build a fire-and-forget CA_PROTO_WRITE of `values` so a test can
+    /// seed a waveform's NORD below its NELM before reading it back.
+    fn write_doubles_request(sid: u32, values: &[f64]) -> Vec<u8> {
+        let mut h = CaHeader::new(CA_PROTO_WRITE);
+        h.data_type = DBR_DOUBLE;
+        h.cid = sid;
+        h.available = 0;
+        let mut body = Vec::with_capacity(values.len() * 8);
+        for v in values {
+            body.extend_from_slice(&v.to_be_bytes());
+        }
+        h.set_payload_size(
+            body.len(),
+            values.len() as u32,
+            crate::protocol::CA_MINOR_VERSION,
+        )
+        .expect("modern peer accepts the extended header");
+        let mut frame = h.to_bytes_extended().to_vec();
+        frame.extend_from_slice(&body);
+        frame
+    }
+
+    /// Spawn `handle_client` over a duplex pair holding one waveform record
+    /// `wf:rec` of buffer capacity `nelm` (NELM). A partial write leaves
+    /// NORD < NELM, so this fixture separates the two — the clamp ceiling
+    /// must be NELM, never the live NORD.
+    async fn spawn_waveform_server(
+        peer_port: u16,
+        nelm: i32,
+    ) -> (
+        tokio::io::DuplexStream,
+        tokio::task::JoinHandle<CaResult<()>>,
+        broadcast::Sender<()>,
+    ) {
+        use epics_base_rs::server::records::waveform::WaveformRecord;
+        use epics_base_rs::types::DbFieldType;
+        let db = Arc::new(PvDatabase::new());
+        db.add_record(
+            "wf:rec",
+            Box::new(WaveformRecord::new(nelm, DbFieldType::Double)),
+        )
+        .await
+        .expect("add waveform record");
+        let acf = Arc::new(tokio::sync::RwLock::new(None));
+        let (acf_reload_tx, acf_reload_rx) = broadcast::channel::<()>(4);
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let peer: SocketAddr = format!("127.0.0.1:{peer_port}").parse().unwrap();
+        let handle = tokio::spawn(async move {
+            handle_client(
+                server_io,
+                peer,
+                db,
+                acf,
+                acf_reload_rx,
+                5064,
+                None,
+                None,
+                None,
+                None,
+                None,
+                #[cfg(feature = "cap-tokens")]
+                None,
+                #[cfg(feature = "cap-tokens")]
+                None,
+            )
+            .await
+        });
+        (client_io, handle, acf_reload_tx)
+    }
+
+    /// SECURITY — epics-base PR #934 (Item 2) parity. An oversized wire
+    /// element count on READ_NOTIFY must clamp to the channel's final
+    /// element count, never drive the reply zero-fill
+    /// (`pad_dbr_to_requested_count`) to a `count * element_size`
+    /// allocation. Pre-fix an extended-header count of 0xFFFFFFFF on a
+    /// DBR_DOUBLE channel sized the reply to ~34 GB and the `Vec` zero-fill
+    /// aborted the whole process — a remote, unauthenticated DoS.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn read_notify_oversized_count_clamps_to_channel_capacity() {
+        let (mut client, handle, _acf_reload_tx) =
+            spawn_array_server(55342, vec![1.0, 2.0, 3.0]).await;
+        let sid = handshake(&mut client).await;
+
+        client
+            .write_all(&read_request(
+                CA_PROTO_READ_NOTIFY,
+                sid,
+                0x21,
+                DBR_DOUBLE,
+                0xFFFF_FFFF,
+            ))
+            .await
+            .expect("read_notify");
+        client.flush().await.expect("flush read_notify");
+
+        let resp =
+            read_frame_of_cmmd(&mut client, CA_PROTO_READ_NOTIFY, Duration::from_secs(3)).await;
+        assert_eq!(
+            resp.actual_count(),
+            3,
+            "0xFFFFFFFF must clamp to the 3-element channel capacity, not the wire count; got {}",
+            resp.actual_count()
+        );
+        assert_eq!(
+            resp.actual_postsize(),
+            24,
+            "clamped reply ships exactly 3 DBR_DOUBLE elements (24 bytes), not a count-sized \
+             buffer; got {}",
+            resp.actual_postsize()
+        );
+
+        drop(client);
+        handle.abort();
+    }
+
+    /// SECURITY — same PR #934 clamp on the EVENT_ADD path. The count is
+    /// clamped BEFORE it is stored on the subscription, so both the initial
+    /// snapshot and every steady-state monitor delivery (the producer in
+    /// `monitor.rs`, a second copy of the unbounded zero-fill) are bounded.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn event_add_oversized_count_clamps_to_channel_capacity() {
+        let (mut client, handle, _acf_reload_tx) =
+            spawn_array_server(55343, vec![1.0, 2.0, 3.0]).await;
+        let sid = handshake(&mut client).await;
+
+        client
+            .write_all(&event_add_request_count(sid, 0x31, 0xFFFF_FFFF))
+            .await
+            .expect("event_add");
+        client.flush().await.expect("flush event_add");
+
+        let resp =
+            read_frame_of_cmmd(&mut client, CA_PROTO_EVENT_ADD, Duration::from_secs(3)).await;
+        assert_eq!(
+            resp.actual_count(),
+            3,
+            "EVENT_ADD 0xFFFFFFFF must clamp to the 3-element capacity; got {}",
+            resp.actual_count()
+        );
+        assert_eq!(
+            resp.actual_postsize(),
+            24,
+            "clamped monitor frame ships 3 DBR_DOUBLE elements (24 bytes); got {}",
+            resp.actual_postsize()
+        );
+
+        drop(client);
+        handle.abort();
+    }
+
+    /// SECURITY + parity boundary — the clamp ceiling is the channel's
+    /// final element count (NELM, buffer capacity), NOT the live value
+    /// length (NORD). A dynamic waveform (NELM=8) written to only 3
+    /// elements (NORD=3) must still frame a `caget -# 8` at 8 padded
+    /// elements — a NORD ceiling would wrongly truncate it to 3 — while an
+    /// oversized 0xFFFFFFFF request clamps to 8, not 3.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn read_notify_count_clamps_to_waveform_nelm_not_nord() {
+        let (mut client, handle, _acf_reload_tx) = spawn_waveform_server(55344, 8).await;
+        client.write_all(&version_frame()).await.expect("version");
+        client
+            .write_all(&create_chan_frame(0xE1, "wf:rec"))
+            .await
+            .expect("create_chan");
+        client.flush().await.expect("flush create_chan");
+        let sid = read_create_chan_sid(&mut client, Duration::from_secs(3)).await;
+
+        // Seed NORD=3 (< NELM=8) with a fire-and-forget WRITE.
+        client
+            .write_all(&write_doubles_request(sid, &[1.0, 2.0, 3.0]))
+            .await
+            .expect("write");
+        client.flush().await.expect("flush write");
+
+        // A request AT the NELM ceiling (8 > NORD 3) pads up to 8 — proving
+        // the ceiling is NELM, not NORD (which would truncate to 3).
+        client
+            .write_all(&read_request(
+                CA_PROTO_READ_NOTIFY,
+                sid,
+                0x41,
+                DBR_DOUBLE,
+                8,
+            ))
+            .await
+            .expect("read at nelm");
+        client.flush().await.expect("flush read at nelm");
+        let at_nelm =
+            read_frame_of_cmmd(&mut client, CA_PROTO_READ_NOTIFY, Duration::from_secs(3)).await;
+        assert_eq!(
+            at_nelm.actual_count(),
+            8,
+            "count=8 (NELM) must pad up from NORD=3, not clamp to 3; got {}",
+            at_nelm.actual_count()
+        );
+        assert_eq!(
+            at_nelm.actual_postsize(),
+            64,
+            "8 DBR_DOUBLE elements = 64 bytes; got {}",
+            at_nelm.actual_postsize()
+        );
+
+        // An oversized request clamps to NELM (8), never NORD (3).
+        client
+            .write_all(&read_request(
+                CA_PROTO_READ_NOTIFY,
+                sid,
+                0x42,
+                DBR_DOUBLE,
+                0xFFFF_FFFF,
+            ))
+            .await
+            .expect("read oversized");
+        client.flush().await.expect("flush read oversized");
+        let oversized =
+            read_frame_of_cmmd(&mut client, CA_PROTO_READ_NOTIFY, Duration::from_secs(3)).await;
+        assert_eq!(
+            oversized.actual_count(),
+            8,
+            "0xFFFFFFFF must clamp to NELM=8, not NORD=3; got {}",
+            oversized.actual_count()
+        );
+        assert_eq!(
+            oversized.actual_postsize(),
+            64,
+            "clamped to 8 DBR_DOUBLE elements = 64 bytes; got {}",
+            oversized.actual_postsize()
         );
 
         drop(client);

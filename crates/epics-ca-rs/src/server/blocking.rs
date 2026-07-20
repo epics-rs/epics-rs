@@ -320,7 +320,9 @@ fn handle_udp_search_blocking(
     // Cap each blocking `recv_from` so the loop can observe `shutdown` between
     // datagrams. C `cast_server` blocks in `recvfrom` forever; this timeout is
     // only a clean-stop seam and is otherwise transparent to the protocol.
-    apply_recv_timeout(&socket, Some(Duration::from_millis(200)))?;
+    socket
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .map_err(CaError::Io)?;
     // 64 KB = IPv4 max datagram, matching the async responder's recv buffer.
     let mut buf = vec![0u8; 64 * 1024];
 
@@ -405,53 +407,15 @@ fn command_drives_without_spawn(cmmd: u16) -> bool {
     )
 }
 
-/// `WouldBlock` / `TimedOut` from a blocking read mean the `SO_RCVTIMEO`
-/// inactivity cap fired (only set when configured). Treated as an idle close,
-/// matching `handle_client`'s inactivity branch.
+/// `WouldBlock` / `TimedOut` from a blocking read mean the read timeout fired
+/// (`SO_RCVTIMEO`, set portably via `std`'s `set_read_timeout`; only when a cap
+/// is configured). Treated as an idle close, matching `handle_client`'s
+/// inactivity branch.
 fn is_read_timeout(kind: std::io::ErrorKind) -> bool {
     matches!(
         kind,
         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
     )
-}
-
-/// Apply `SO_RCVTIMEO` to a socket via a raw `libc::setsockopt` on its fd (no
-/// `socket2`). `None` leaves the socket in pure blocking mode — C `rsrv`'s
-/// default (`camsgtask` blocks in `recv` with no application idle cap). The
-/// libc symbols used here resolve for `armv7-rtems-eabihf`.
-#[cfg(unix)]
-fn apply_recv_timeout<F: std::os::fd::AsRawFd>(
-    sock: &F,
-    timeout: Option<Duration>,
-) -> CaResult<()> {
-    let Some(d) = timeout else {
-        return Ok(());
-    };
-    let tv = libc::timeval {
-        tv_sec: d.as_secs() as libc::time_t,
-        tv_usec: d.subsec_micros() as libc::suseconds_t,
-    };
-    // SAFETY: `tv` outlives the call; `fd` is a valid open socket for the
-    // duration of this borrow; the size matches `timeval`.
-    let rc = unsafe {
-        libc::setsockopt(
-            sock.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_RCVTIMEO,
-            &tv as *const libc::timeval as *const libc::c_void,
-            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
-        )
-    };
-    if rc != 0 {
-        return Err(CaError::Io(std::io::Error::last_os_error()));
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn apply_recv_timeout<F>(_sock: &F, _timeout: Option<Duration>) -> CaResult<()> {
-    // Non-Unix hosts fall back to pure blocking reads; RTEMS is Unix-family.
-    Ok(())
 }
 
 /// Write one complete frame to the socket under the send lock, then flush.
@@ -486,7 +450,13 @@ fn handle_client_blocking(
     tcp_port: u16,
 ) -> CaResult<()> {
     let _ = stream.set_nodelay(true);
-    apply_recv_timeout(&stream, crate::server::tcp::inactivity_timeout())?;
+    // `None` (no configured cap) leaves the socket in pure blocking mode — C
+    // `rsrv`'s default (`camsgtask` blocks in `recv` with no idle cap).
+    // `set_read_timeout` sets SO_RCVTIMEO on Unix (incl. RTEMS) and is portable
+    // to Windows, unlike the former raw-libc helper.
+    stream
+        .set_read_timeout(crate::server::tcp::inactivity_timeout())
+        .map_err(CaError::Io)?;
 
     // One socket, two roles: a blocking read handle owned by this thread, and
     // a write handle behind the SEND_LOCK. `try_clone` dups the fd so a
@@ -887,11 +857,11 @@ mod tests {
         accept.join().unwrap();
     }
 
-    /// (iii) The `SO_RCVTIMEO` libc path actually fires: a socket with a
-    /// short recv timeout and no incoming data returns WouldBlock/TimedOut,
+    /// (iii) The read timeout actually fires: a socket with a short
+    /// `set_read_timeout` and no incoming data returns WouldBlock/TimedOut,
     /// which the driver classifies as an idle close.
     #[test]
-    fn recv_timeout_libc_setsockopt_fires_on_idle() {
+    fn recv_timeout_std_fires_on_idle() {
         let (a, _b) = {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap();
@@ -899,13 +869,14 @@ mod tests {
             let (server, _) = listener.accept().unwrap();
             (server, client)
         };
-        apply_recv_timeout(&a, Some(Duration::from_millis(150))).expect("setsockopt SO_RCVTIMEO");
+        a.set_read_timeout(Some(Duration::from_millis(150)))
+            .expect("set_read_timeout");
         let mut a = a;
         let mut buf = [0u8; 8];
         let err = a.read(&mut buf).expect_err("idle read must time out");
         assert!(
             is_read_timeout(err.kind()),
-            "SO_RCVTIMEO must surface as WouldBlock/TimedOut, got {:?}",
+            "read timeout must surface as WouldBlock/TimedOut, got {:?}",
             err.kind()
         );
     }

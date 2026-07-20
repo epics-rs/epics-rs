@@ -83,7 +83,7 @@ impl PvDatabaseSource {
             let db = asg_db.clone();
             Box::pin(async move {
                 let (base, _field) = parse_pv_name(&pv_name);
-                if let Some(rec) = db.get_record(base).await {
+                if let Some(rec) = db.get_record(base) {
                     let inst = rec.read();
                     return (inst.common.access_group().to_string(), inst.common.asl);
                 }
@@ -99,7 +99,7 @@ impl PvDatabaseSource {
             Box::pin(async move {
                 let (base, field) = parse_pv_name(&link);
                 let field = if field.is_empty() { "VAL" } else { field };
-                let rec = db.get_record(base).await?;
+                let rec = db.get_record(base)?;
                 let inst = rec.read();
                 inst.resolve_field(field).and_then(|v| v.to_f64())
             })
@@ -2319,7 +2319,7 @@ ASG(SECURE) {
             .await
             .unwrap();
         // Mark the record as belonging to the SECURE ASG.
-        let rec = db.get_record("AI:SECURE").await.unwrap();
+        let rec = db.get_record("AI:SECURE").unwrap();
         rec.write().common.asg = "SECURE".to_string();
 
         let source = PvDatabaseSource::new_with_acf(
@@ -2375,7 +2375,7 @@ ASG(LOCKED) {
         db.add_record("AI:LOCKED", Box::new(AiRecord::new(0.0)))
             .await
             .unwrap();
-        let rec = db.get_record("AI:LOCKED").await.unwrap();
+        let rec = db.get_record("AI:LOCKED").unwrap();
         rec.write().common.asg = "LOCKED".to_string();
 
         let source = PvDatabaseSource::new_with_acf(
@@ -2415,7 +2415,7 @@ ASG(LOCKED) {
         db.add_record("AI:MON", Box::new(AiRecord::new(0.0)))
             .await
             .unwrap();
-        let rec = db.get_record("AI:MON").await.unwrap();
+        let rec = db.get_record("AI:MON").unwrap();
         rec.write().common.asg = "LOCKED".to_string();
 
         let source = PvDatabaseSource::new_with_acf(
@@ -2458,7 +2458,7 @@ ASG(SECURE) {
         db.add_record("AI:LIVE", Box::new(AiRecord::new(0.0)))
             .await
             .unwrap();
-        let rec = db.get_record("AI:LIVE").await.unwrap();
+        let rec = db.get_record("AI:LIVE").unwrap();
         rec.write().common.asg = "SECURE".to_string();
 
         let source = PvDatabaseSource::new_with_acf(db.clone(), cell.clone());
@@ -2545,7 +2545,7 @@ ASG(LOCKED) {
         db.add_record("AI:LOCKED", Box::new(AiRecord::new(7.5)))
             .await
             .unwrap();
-        db.get_record("AI:LOCKED").await.unwrap().write().common.asg = "LOCKED".into();
+        db.get_record("AI:LOCKED").unwrap().write().common.asg = "LOCKED".into();
 
         let source = PvDatabaseSource::new_with_acf(
             db.clone(),
@@ -3052,7 +3052,7 @@ ASG(DEFAULT) {
         // ASL is a u8; the parser clamps to 0/1 via put_common_field,
         // but the underlying field accepts any u8 — set it directly
         // for the test to exercise the gate above C's 0/1 range.
-        db.get_record("AI:LOCKED").await.unwrap().write().common.asl = 3;
+        db.get_record("AI:LOCKED").unwrap().write().common.asl = 3;
 
         db.add_record("AI:OPEN", Box::new(AiRecord::new(0.0)))
             .await

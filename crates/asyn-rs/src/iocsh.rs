@@ -2967,6 +2967,16 @@ mod tests {
                 "escape/unescape must round-trip"
             );
         }
+
+        // CBUG-D4: both escapers now render NUL as `\0`; prove that survives the
+        // port's own decoder. EPICS has no octal escape — `raw_from_escaped`
+        // decodes `\0` via C's `case '0'` (one NUL, following digits literal), so
+        // `\0` is unambiguous and a NUL-then-digit round-trips exactly.
+        assert_eq!(escaped_from_raw(b"\0", n), r"\0");
+        assert_eq!(raw_from_escaped(r"\0"), vec![0u8]); // `\0` in -> single NUL out
+        assert_eq!(raw_from_escaped(r"\x00"), vec![0u8]); // decoder also accepts `\x00`
+        assert_eq!(escaped_from_raw(b"\x001", n), r"\01"); // NUL then '1'
+        assert_eq!(raw_from_escaped(r"\01"), vec![0u8, b'1']); // no octal: NUL then '1'
         // C sizes `cbuf` at 4 * sizeof(eos) + 2 precisely so the widest
         // terminator — 10 bytes, every one of them `\xNN` — still escapes whole
         // (40 chars, one under the bound).

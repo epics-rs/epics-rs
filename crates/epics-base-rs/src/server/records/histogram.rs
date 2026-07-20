@@ -145,9 +145,10 @@ impl HistogramRecord {
             return;
         }
         // Inverted limits: count nothing. C's `add_count` also writes
-        // stat/sevr=SOFT/INVALID directly here; that direct write is modelled
-        // by `check_alarms` (erased on the process path, sticks on the SGNL
-        // special path — CBUG-F12), which the counting-only path leaves out.
+        // stat/sevr=SOFT/INVALID directly here; the port raises that alarm
+        // through `check_alarms` via the `nsta`/`nsev` owner instead, so it is
+        // observable consistently on both paths (CBUG-F12 refused). The
+        // counting-only path leaves the alarm out.
         if self.llim >= self.ulim || self.nelm <= 0 {
             return;
         }
@@ -262,34 +263,40 @@ impl Record for HistogramRecord {
     ///         prec->sevr = INVALID_ALARM;
     /// ```
     ///
-    /// C writes `stat`/`sevr` DIRECTLY, not `nsta`/`nsev` via `recGblSetSevr`.
-    /// That single mechanism yields two OBSERVABLE behaviours depending on
-    /// whether `recGblResetAlarms` runs afterwards:
+    /// **DEVIATION from C, deliberate — CBUG-F12 refused.** An inverted-limits
+    /// histogram (`LLIM >= ULIM`) cannot bin anything: it is genuinely
+    /// misconfigured, and the record's *intent* — the C code literally tries to
+    /// set `SOFT_ALARM`/`INVALID_ALARM` — is to flag it. C's *mechanism* is
+    /// broken: it writes `stat`/`sevr` DIRECTLY instead of `nsta`/`nsev` via
+    /// `recGblSetSevr`, so the alarm's visibility depends on which trigger ran
+    /// `add_count` — a path-dependent dual meaning:
     ///
-    /// * process path (this record's `process()` → `monitor()`): the cycle's
-    ///   `recGblResetAlarms` copies `nsta/nsev`(0/0) over the direct write, so
-    ///   it is erased before any client sees it — NO_ALARM (CBUG-F12, the
-    ///   `LLIM=10 ULIM=5` softIoc proof still holds).
-    /// * SGNL SPC_MOD `special()` path: `add_count` runs with NO monitor after
-    ///   it, so the direct write STICKS — a `caget` reports STAT=SOFT
-    ///   (verified on compiled softIoc: fresh histogram, `caput .SGNL 1` →
-    ///   STAT=SOFT SEVR=INVALID).
+    /// * process path (`process()` → `monitor()`): the cycle's
+    ///   `recGblResetAlarms` copies `nsta/nsev`(0/0) over the direct write and
+    ///   erases it before any client sees it — C shows NO_ALARM (dead code:
+    ///   C's intent to alarm, C's behaviour NO_ALARM).
+    /// * SGNL SPC_MOD `special()` path: no monitor follows `add_count`, so the
+    ///   direct write STICKS and a `caget` reports STAT=SOFT SEVR=INVALID.
     ///
-    /// Writing through `rec_gbl_set_sevr` (`nsta`/`nsev`) instead — the prior
-    /// shape — made `recGblResetAlarms` COMMIT it on the process path (a stuck
-    /// SOFT, wrong) and left the special path unwritten (born UDF, wrong):
-    /// inverted on both. The direct write is the only shape that matches C on
-    /// both. C's `nsev < INVALID_ALARM` guard is preserved — it keeps a
-    /// higher pending severity from being overwritten. Gated on `csta` because
-    /// C's `add_count` returns before the limits test when counting is stopped.
+    /// Per `doc/strategy-2026-07-13.md` §2 — *C's bugs are not the contract;
+    /// clean is the goal* — the port raises the alarm through the single
+    /// `nsta`/`nsev` owner (`rec_gbl_set_sevr`), so a misconfigured histogram
+    /// reports SOFT/INVALID CONSISTENTLY: committed by `recGblResetAlarms` on
+    /// the process path, and committed by the SGNL special path's own
+    /// post-`check_alarms` `recGblResetAlarms` (see `field_io.rs`). This refuses
+    /// C's path-dependent dead-code/sticky behaviour and its direct-write
+    /// anti-pattern in one move. `rec_gbl_set_sevr`'s raise-only rule subsumes
+    /// C's `nsev < INVALID_ALARM` guard (it only raises when strictly higher).
+    /// Gated on `csta` because C's `add_count` returns before the limits test
+    /// when counting is stopped.
     fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
         use crate::server::record::AlarmSeverity;
-        if self.csta
-            && self.llim >= self.ulim
-            && (common.nsev as u16) < (AlarmSeverity::Invalid as u16)
-        {
-            common.stat = crate::server::recgbl::alarm_status::SOFT_ALARM;
-            common.sevr = AlarmSeverity::Invalid;
+        if self.csta && self.llim >= self.ulim {
+            crate::server::recgbl::rec_gbl_set_sevr(
+                common,
+                crate::server::recgbl::alarm_status::SOFT_ALARM,
+                AlarmSeverity::Invalid,
+            );
         }
     }
 
@@ -382,11 +389,13 @@ impl Record for HistogramRecord {
         Ok(())
     }
 
-    /// A `.SGNL` caput is C's SPC_MOD `special()` → `add_count`, which writes
-    /// `stat`/`sevr` directly (histogramRecord.c:329-334) with no monitor after
-    /// it. The put owner runs [`Record::check_alarms`] once the value is stored
-    /// so that direct write lands and — with no process cycle to follow —
-    /// persists, matching C's stuck STAT=SOFT on inverted limits.
+    /// A `.SGNL` caput is C's SPC_MOD `special()` → `add_count`, which raises
+    /// the inverted-limits alarm (histogramRecord.c:329-334) with no process
+    /// cycle to follow. The put owner runs [`Record::check_alarms`] once the
+    /// value is stored, then commits it via `recGblResetAlarms` (see
+    /// `field_io.rs`), so the SOFT/INVALID the record raises is observable on
+    /// this monitor-less path — CBUG-F12 refused (raised consistently, not
+    /// path-dependent).
     fn special_checks_alarms(&self, put_field: &str) -> bool {
         put_field.eq_ignore_ascii_case("SGNL")
     }

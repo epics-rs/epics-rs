@@ -1013,9 +1013,11 @@ fn append_io_data(out: &mut Vec<u8>, data: &[u8], cfg: &TraceConfig) {
 ///
 /// and `getTraceFile` (:2928-2941) returns `NULL` for `traceFileErrlog` alone —
 /// every other sink, including the `traceFileStderr` a port is born with
-/// (`tracePvtInit`, :458), takes the `FILE *` branch. The two differ: the stream
-/// form has no destination bound and no `case '\0'`, so a NUL prints as `\x00`
-/// (and a first-byte NUL prints nothing at all — R17-49). Hardwiring
+/// (`tracePvtInit`, :458), takes the `FILE *` branch. The two differ in their
+/// destination bound (the stream form has none) and in the stream form's
+/// first-byte-NUL early-return quirk (R17-49). They no longer differ on the NUL
+/// byte: C's stream form printed `\x00` where the errlog form printed `\0`
+/// (CBUG-D4), and the port refuses that — both render NUL as `\0`. Hardwiring
 /// `escaped_from_raw` gave every sink the errlog form.
 ///
 /// The table itself is one table: its own four-case copy left `\a`, `\b`, `\f`,
@@ -1462,7 +1464,10 @@ mod tests {
     /// errlog → `epicsStrSnPrintEscaped`. `getTraceFile` (:2928-2941) hands back
     /// `NULL` for errlog alone, and a port's default sink is stderr
     /// (`tracePvtInit`, :458) — so the *default* trace line takes the stream
-    /// form, which prints a NUL as `\x00` where the errlog form prints `\0`.
+    /// form. C's stream form printed a NUL as `\x00` where the errlog form
+    /// printed `\0` (CBUG-D4); the port refuses that divergence, so every sink
+    /// now renders NUL as `\0`. The destination still selects the entry point
+    /// (bound / first-byte-NUL quirk differ); the escape table does not.
     #[test]
     fn the_escape_entry_point_is_chosen_by_the_trace_destination() {
         let n = DEFAULT_TRACE_BUFFER_SIZE;
@@ -1471,14 +1476,15 @@ mod tests {
         // errlog: epicsStrSnPrintEscaped — has `case '\0'` (epicsString.c:145).
         assert_eq!(format_escape(data, &TraceFile::Errlog, n), r"a\0b");
 
-        // Every FILE* sink, the stderr default included: epicsStrPrintEscaped,
-        // whose switch has no NUL case (:255-260).
-        assert_eq!(format_escape(data, &TraceFile::Stderr, n), r"a\x00b");
-        assert_eq!(format_escape(data, &TraceFile::Stdout, n), r"a\x00b");
+        // Every FILE* sink, the stderr default included: epicsStrPrintEscaped.
+        // C left it without a NUL case (:255-260) and printed `\x00`; the port
+        // supplies the missing case (CBUG-D4 refused) so it matches errlog: `\0`.
+        assert_eq!(format_escape(data, &TraceFile::Stderr, n), r"a\0b");
+        assert_eq!(format_escape(data, &TraceFile::Stdout, n), r"a\0b");
         let f = TraceFile::File(Arc::new(Mutex::new(
             std::fs::File::create(std::env::temp_dir().join("asyn_r17_46.txt")).unwrap(),
         )));
-        assert_eq!(format_escape(data, &f, n), r"a\x00b");
+        assert_eq!(format_escape(data, &f, n), r"a\0b");
         let _ = std::fs::remove_file(std::env::temp_dir().join("asyn_r17_46.txt"));
 
         // And the default TraceConfig is one of the FILE* sinks, not errlog.

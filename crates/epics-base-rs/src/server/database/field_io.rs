@@ -686,11 +686,15 @@ impl PvDatabase {
             if instance.record.special_commits_alarms(&field) {
                 let _ = crate::server::recgbl::rec_gbl_reset_alarms(&mut instance.common);
             }
-            // histogram SGNL SPC_MOD: `add_count` writes stat/sevr directly and
-            // no monitor follows, so it sticks (histogramRecord.c:329-334).
+            // histogram SGNL SPC_MOD: `add_count` raises the inverted-limits
+            // alarm (histogramRecord.c:329-334). The port routes it through
+            // `nsta`/`nsev` (CBUG-F12 refused), so this monitor-less special
+            // path must commit it — check then reset — for the SOFT/INVALID to
+            // be observable, matching the process path.
             if instance.record.special_checks_alarms(&field) {
                 let inst = &mut *instance;
                 inst.record.check_alarms(&mut inst.common);
+                let _ = crate::server::recgbl::rec_gbl_reset_alarms(&mut inst.common);
             }
 
             // Invalidate metadata cache only if the metadata-class
@@ -1721,18 +1725,18 @@ impl PvDatabase {
                 }
             };
 
-            // C `add_count` writes stat/sevr DIRECTLY during a SGNL SPC_MOD
-            // `special()` (histogramRecord.c:329-334); with no monitor on the
-            // special path that write STICKS and a later caget observes it
-            // (STAT=SOFT on inverted limits). `check_alarms` performs that
-            // direct write. Unlike the process path — where the cycle's
-            // `recGblResetAlarms` erases it — this special-only put runs no
-            // process, so it persists, matching C. Gated on
-            // `special_checks_alarms` (histogram SGNL only). No STAT post: C's
-            // `add_count` posts nothing, and the special path has no monitor.
+            // C `add_count` raises the inverted-limits alarm during a SGNL
+            // SPC_MOD `special()` (histogramRecord.c:329-334). The port raises
+            // it through `nsta`/`nsev` (CBUG-F12 refused, not C's direct write),
+            // so this monitor-less special path commits it — check then reset —
+            // to make STAT=SOFT/INVALID observable, matching the process path.
+            // Gated on `special_checks_alarms` (histogram SGNL only). No STAT
+            // post: C's `add_count` posts nothing, and the special path has no
+            // monitor — the alarm shows on the next caget's field read.
             if instance.record.special_checks_alarms(&field) {
                 let inst = &mut *instance;
                 inst.record.check_alarms(&mut inst.common);
+                let _ = crate::server::recgbl::rec_gbl_reset_alarms(&mut inst.common);
             }
 
             // Invalidate metadata cache only if the metadata-class
@@ -1885,14 +1889,16 @@ impl PvDatabase {
                     }
                 }
                 // The same `dbPutSpecial(paddr, 1)`-on-reject rule for a field
-                // whose special() writes stat/sevr DIRECTLY (histogram SGNL →
-                // add_count): C still runs add_count when the SGNL conversion
-                // fails, so its stuck STAT=SOFT on inverted limits appears even
-                // for a rejected `caput .SGNL notanumber`. `check_alarms` makes
-                // that direct write; no process follows, so it persists.
+                // whose special() raises the inverted-limits alarm (histogram
+                // SGNL → add_count): C still runs add_count when the SGNL
+                // conversion fails, so STAT=SOFT/INVALID appears even for a
+                // rejected `caput .SGNL notanumber`. The port raises it through
+                // `nsta`/`nsev` (CBUG-F12 refused) and commits it here — check
+                // then reset — since no process follows.
                 if instance.record.special_checks_alarms(&field) {
                     let inst = &mut *instance;
                     inst.record.check_alarms(&mut inst.common);
+                    let _ = crate::server::recgbl::rec_gbl_reset_alarms(&mut inst.common);
                 }
                 // The same `dbPutSpecial(paddr, 1)`-on-reject rule for a field
                 // whose special() clears UDF: C `mbboDirectRecord.c::special`

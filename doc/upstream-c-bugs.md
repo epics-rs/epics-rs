@@ -56,6 +56,35 @@ the rest the proof is the decisive code path, quoted.
 > catalogue was extracted, so the original REPRODUCED count was stale by that
 > evening; upstream then fixed it as ADCore #596 (merged 2026-07-16).
 
+> **Mass reconciliation 2026-07-20 — REPRODUCED fully retired.** Per
+> strategy-2026-07-13 §2 ("C's bugs are not the contract. Clean is the goal.") the
+> port refuses C's defects rather than mirroring them. On 2026-07-20 the REPRODUCED
+> bucket was reconciled against the actual port state, flipping **all 16** entries
+> REPRODUCED → NOT-REPRODUCED: **A3, B1, B4, B6, B8, B10, B11, B12, B13, B18, B19,
+> C2, D4, E2, F8, F12**. After this pass **no catalogue entry is REPRODUCED** — the
+> port refuses every catalogued C upstream bug.
+>
+> Fourteen the port had *already* refused before this catalogue was even extracted
+> (the fixes are ancestors of `main`, the B25/E2 precedent) — A3 `ed43b05f`,
+> B1 `ba79fd0f`, B4 `d906ad45`, B6 `edaa41b7`, B8 `93f7baee`, B10 `06c05dbe`,
+> B11 `aecc980a`, B12 code `972ac9b0`, B13 `7d2b48ac`, B18 `a0c723b9`,
+> B19 `46be9a08`, C2 `67097734` (deleted `MonitorRequestFatal` — circuit teardown
+> unrepresentable), F8 `25318fcd`; E2 already saturates (`651bf392`). Two needed a
+> fresh fix on 2026-07-20: **F12** a structural code fix (`9a51ba4c` — raises
+> SOFT/INVALID consistently on both the process and `.SGNL` paths via the single
+> `nsta`/`nsev` owner) and **D4** a structural code fix (`09af6a24` — both
+> `asyn-rs` escapers render NUL as `\0` through one parameter-free table,
+> superseding the 2026-07-14 "keep both" adjudication). One needed a doc-line fix:
+> **B12** (`b0704bff`). This historical wave-1 table is left as extracted; the
+> per-entry `Bucket:` headers carry the current classification.
+>
+> **Caveats, not exceptions.** B19's flip is correct but *inert* until `do_alarm()`
+> is ported (see the B19 body). D4's refusal carries a deliberate one-byte
+> deviation on the display/trace path (`print_escaped` now emits `\0`, not C's
+> `\x00`) — stated in the D4 body. CBUG-A2 is unchanged — **FIXED-UPSTREAM** (base
+> half tracks PR #925), not REPRODUCED, so it is neither in the flip set nor a
+> remaining REPRODUCED.
+
 | severity | n |
 |---|---|
 | High | 8 |
@@ -71,28 +100,28 @@ proven defect (see "Leads rejected").
 | id | upstream | one line | severity | bucket |
 |---|---|---|---|---|
 | CBUG-A1 | base calc | `MODULO` `INT_MIN % -1` — SIGFPE kills the IOC | High | NOT-REPRODUCED |
-| CBUG-A2 | base calc | `NINT`/`MODULO` skip C's own `d2i` guard — out-of-range → `INT_MIN` | Medium | REPRODUCED |
-| CBUG-A3 | base calc | `ISINF` leaks glibc's *signed* isinf (±1) into the value | Low | REPRODUCED |
+| CBUG-A2 | base calc | `NINT`/`MODULO` skip C's own `d2i` guard — out-of-range → `INT_MIN` | Medium | FIXED-UPSTREAM |
+| CBUG-A3 | base calc | `ISINF` leaks glibc's *signed* isinf (±1) into the value | Low | NOT-REPRODUCED |
 | CBUG-A4 | base calc | `RNDM` fixed seed + unsynchronised global RMW | Low | NOT-REPRODUCED |
-| CBUG-B1 | optics | `pf4.st` interpolates on the interval *above* the energy — `frac < 0` always | Medium | REPRODUCED |
+| CBUG-B1 | optics | `pf4.st` interpolates on the interval *above* the energy — `frac < 0` always | Medium | NOT-REPRODUCED |
 | CBUG-B2 | optics | `pf4.st` reads `keV[274]`/`mu[274]` out of bounds for Pb | Medium | NOT-REPRODUCED |
 | CBUG-B3 | optics | `pf4.st` unguarded glass divide — all 16 transmissions NaN below 2 keV | High | NOT-REPRODUCED |
-| CBUG-B4 | optics | `pf4.st` unknown material silently reports the blade fully opaque | Medium | REPRODUCED |
+| CBUG-B4 | optics | `pf4.st` unknown material silently reports the blade fully opaque | Medium | NOT-REPRODUCED |
 | CBUG-B5 | asyn | `asynInterposeCom setOption("ixon")` missing `return` — ships an uninitialized stack byte | High | NOT-REPRODUCED |
-| CBUG-B6 | asyn | `asynInterposeCom` can enable flow control but never disable it | Medium | REPRODUCED |
+| CBUG-B6 | asyn | `asynInterposeCom` can enable flow control but never disable it | Medium | NOT-REPRODUCED |
 | CBUG-B7 | asyn | `asynInterposeCom nextChar` ignores `nbytes` — uninitialized char on a 0-byte success | Low | NOT-REPRODUCED |
-| CBUG-B8 | asyn | telnet subnegotiation payload is not IAC-stuffed | Low | REPRODUCED |
+| CBUG-B8 | asyn | telnet subnegotiation payload is not IAC-stuffed | Low | NOT-REPRODUCED |
 | CBUG-B9 | asyn | `drvAsynIPServerPort` UDP read returns stale heap + drops a byte | High | NOT-REPRODUCED |
-| CBUG-B10 | asyn | every `asyn*Base.c` `readDefault` says "**write** is not supported" (6 files) | Low | REPRODUCED |
-| CBUG-B11 | ADCore | `NDPluginCircularBuff` — writing **0** to `SoftTrigger` triggers | Medium | REPRODUCED |
-| CBUG-B12 | pvxs | `ackAt == 0` sentinel makes the `ackAny` percentage mapping non-monotonic | Low | REPRODUCED |
-| CBUG-B13 | motor | `motorRecord` publishes CDIR=forward for a reverse jog-stop backlash leg | Medium | REPRODUCED |
+| CBUG-B10 | asyn | every `asyn*Base.c` `readDefault` says "**write** is not supported" (6 files) | Low | NOT-REPRODUCED |
+| CBUG-B11 | ADCore | `NDPluginCircularBuff` — writing **0** to `SoftTrigger` triggers | Medium | NOT-REPRODUCED |
+| CBUG-B12 | pvxs | `ackAt == 0` sentinel makes the `ackAny` percentage mapping non-monotonic | Low | NOT-REPRODUCED |
+| CBUG-B13 | motor | `motorRecord` publishes CDIR=forward for a reverse jog-stop backlash leg | Medium | NOT-REPRODUCED |
 | CBUG-B14 | std | `throttleRecord` callback mutates the record with no `dbScanLock` | High | NOT-REPRODUCED |
 | CBUG-B15 | std | `epidRecord` raises UDF then returns before committing it | Medium | NOT-REPRODUCED |
 | CBUG-B16 | std | `devEpidSoft` "nothing to control" abort falls through when already INVALID | Medium | NOT-REPRODUCED |
 | CBUG-B17 | std | `throttleRecord` writes CA-link status for the wrong link (2 sites) | Low | NOT-REPRODUCED |
-| CBUG-B18 | scaler | `special(RATE)` posts `.TP` and never posts the clamped `.RATE` | Low | REPRODUCED |
-| CBUG-B19 | scaler | `monitor()` builds the alarm mask, then posts a literal `DBE_LOG` and discards it | Low | REPRODUCED |
+| CBUG-B18 | scaler | `special(RATE)` posts `.TP` and never posts the clamped `.RATE` | Low | NOT-REPRODUCED |
+| CBUG-B19 | scaler | `monitor()` builds the alarm mask, then posts a literal `DBE_LOG` and discards it | Low | NOT-REPRODUCED |
 | CBUG-B20 | ADCore | `NDPluginROIStat` writes ROI geometry OOB for any RGB (3-D) array | High | NOT-REPRODUCED |
 | CBUG-B21 | ADCore | `NDPluginAttrPlot` `<=` off-by-one → heap OOB write on the first frame | High | NOT-REPRODUCED |
 | CBUG-B22 | ADCore | `NDPluginProcess` divides by `numFiltered` with `NumFilter == 0` | Medium | NOT-REPRODUCED |
@@ -104,29 +133,55 @@ proven defect (see "Leads rejected").
 
 ---
 
-### Filed upstream PRs — live GitHub status (as of 2026-07-18)
+### Filed upstream PRs — live GitHub status (as of 2026-07-20)
 
 This is the authoritative submission-status table; it replaces the per-entry
 `Status:` prose, which is stale (the catalogue was extracted 2026-07-13, before
-most of these PRs were filed on 7/16–7/17). Author: `physwkim`. State is the live
-GitHub PR state, not a claim about the catalogue.
+most of these PRs were filed on 7/16–7/20). Author: `physwkim`. State is the live
+GitHub PR state, not a claim about the catalogue. Total filed: **39** — 38
+NOT-REPRODUCED (port refuses) + 1 FIXED-UPSTREAM. Of these, the 9 grouped in the
+separate table after the main one were classified REPRODUCED when this catalogue
+was extracted (2026-07-13), but all nine were flipped REPRODUCED →
+NOT-REPRODUCED on 2026-07-20 (the port already refused them — see the 2026-07-20
+reconciliation note); the second table is kept only as a grouped PR-status view.
 
-**Catalogued CBUGs that are filed (14):**
+**Catalogued CBUGs that are filed (30):**
+
+Some PRs bundle several CBUGs into one PR (calc **#41** = D2/F5/F2/F3;
+epics-base **#932** = D3/D5/F6; std **#28** = B15/B16; ADCore **#598** =
+B22/B23/B27; optics **#27** = B1/B2/B4, spanning both tables) — each CBUG gets
+its own row pointing at the shared PR.
 
 | CBUG | PR | state | note |
 |---|---|---|---|
 | CBUG-A1 | epics-modules/calc **#38** | open | `MODULO INT_MIN % -1` SIGFPE guard |
 | CBUG-A2 | epics-base/epics-base **#925** | open | `calcPerform` NINT/MODULO `d2i` narrowing |
+| CBUG-B2 | epics-modules/optics **#27** | open | pf4 Pb top-bin `keV[j+1]`/`mu[j+1]` OOB read — removed by the `[j-1,j]` interval fix (supersedes closed #26) |
 | CBUG-B3 | epics-modules/optics **#25** | open | pf4 glass-term guard |
 | CBUG-B5 | epics-modules/asyn **#234** | merged | `asynInterposeCom` ixon `return` |
+| CBUG-B7 | epics-modules/asyn **#238** | open | `asynInterposeCom` `nextChar` returns uninitialized `c` on a successful 0-byte read → guard `nbytes == 0` as EOF |
 | CBUG-B9 | epics-modules/asyn **#233** | merged | `drvAsynIPServerPort` UDP read bound |
 | CBUG-B14 | epics-modules/std **#27** | open | `throttleRecord` `dbScanLock` |
+| CBUG-B15 | epics-modules/std **#28** | open | `epidRecord` commit UDF alarm before return |
+| CBUG-B16 | epics-modules/std **#28** | open | `devEpidSoft` abort unconditionally when INP constant |
+| CBUG-B17 | epics-modules/std **#29** | open | `throttleRecord` writes link-status for the wrong link (special hardcodes `outLinkStat`; checkLink `caLink`/`caLinkNc` stale across loop) |
 | CBUG-B20 | areaDetector/ADCore **#594** | merged | `NDPluginROIStat` RGB heap OOB |
 | CBUG-B21 | areaDetector/ADCore **#595** | merged | `NDPluginAttrPlot` `<=` off-by-one |
+| CBUG-B22 | areaDetector/ADCore **#598** | open | `NDPluginProcess` `numFilter < 1` divide-by-zero guard |
+| CBUG-B23 | areaDetector/ADCore **#598** | open | `NDPluginProcess` `autoOffsetScale` `maxValue > minValue` guard |
 | CBUG-B25 | areaDetector/ADCore **#596** | merged | `NDPluginTimeSeries` narrow-before-divide |
 | CBUG-B26 | areaDetector/ADCore **#597** | merged | `NDPluginStats` dark-frame value-init |
+| CBUG-B27 | areaDetector/ADCore **#598** | open | `NDPluginStats` histogram `histMax <= histMin` guard |
 | CBUG-C1 | epics-modules/calc **#39** | open | `sCalc lrc()` empty-operand OOB read |
+| CBUG-D2 | epics-modules/calc **#41** | open | `sCalc` `<<`/`>>` negative shift-count OOB read/write |
+| CBUG-D3 | epics-base/epics-base **#932** | open | `EPICS_CA_CONN_TMO` non-positive watchdog flood |
+| CBUG-D5 | epics-base/epics-base **#932** | open | `EPICS_CA_MAX_SEARCH_PERIOD` non-finite crash |
+| CBUG-E2 | epics-base/epics-base **#933** | open | `dbConvert`/`dbFastLinkConv` float→int cast UB → saturation; **port already saturates (refuses the bug)**; the entry's `Bucket:` header was flipped REPRODUCED → NOT-REPRODUCED on 2026-07-20 to match its body — see note below |
 | CBUG-F1 | epics-modules/calc **#40** | open | `aCalc INC()` off-by-two |
+| CBUG-F2 | epics-modules/calc **#41** | open | `aCalc SUBRANGE` inclusive upper bound OOB read |
+| CBUG-F3 | epics-modules/calc **#41** | open | `aCalc DERIV`/`nderiv` fit-window > array OOB read |
+| CBUG-F5 | epics-modules/calc **#41** | open | `sCalc LITERAL_STRING` copy bound never advances OOB write |
+| CBUG-F6 | epics-base/epics-base **#932** | open | `calcRecord` drop unhandled `special(SPC_MOD)` from INPM..INPU |
 | CBUG-F11 | epics-modules/asyn **#235** | merged | `asynManager` traceIO truncate hang |
 | CBUG-G1 | epics-base/pvxs **#196** | open | QSRV2 `display.precision` |
 
@@ -139,6 +194,41 @@ GitHub PR state, not a claim about the catalogue.
 > #596 fix three days before it landed. No port behaviour change is owed; only
 > the catalogue bucket and the `time_series_plugin.rs` comment framing were
 > corrected.
+
+> **CBUG-E2 — stale bucket (like B25), reconciled 2026-07-20.** The entry's
+> `Bucket:` header read `REPRODUCED` until 2026-07-20, but its own adjudication
+> records that the port **saturates** float/double → integer conversions
+> (`epics-base-rs` `types/c_cast.rs`, Rust `as`), i.e. it **refuses** the C bug
+> and is byte-identical to the aarch64 hardware result. The header was flipped to
+> **NOT-REPRODUCED** (port refuses) on 2026-07-20 to match the body; E2 belongs in
+> this table, not the (now-retired) REPRODUCED one. The upstream PR **#933** defines the C behaviour (saturate,
+> NaN → 0) on both the network (`dbConvert.c`) and DB-link (`dbFastLinkConv.c`)
+> paths, aligning x86-64 onto the aarch64/port semantics. No port behaviour
+> change is owed; if #933 merges, the C side simply stops diverging from the
+> port.
+
+**Was REPRODUCED, now NOT-REPRODUCED — also reported upstream (9):**
+
+These nine were catalogued as REPRODUCED at extraction (2026-07-13), but the
+port had already been flipped to **refuse** each of them (the fixes predate the
+catalogue snapshot; see the per-entry `Bucket:` headers and the 2026-07-20
+reconciliation note), so on 2026-07-20 all nine were reclassified REPRODUCED →
+NOT-REPRODUCED. The port no longer reproduces any of them; the note column below
+already describes the corrected behaviour. Filing upstream still stands: the C
+side stays wrong until a fix merges, at which point C simply stops diverging
+from the already-correct port.
+
+| CBUG | PR | state | note |
+|---|---|---|---|
+| CBUG-B1 | epics-modules/optics **#27** | open | `pf4` `OtherAbsorptionLength` interpolate on `[j-1,j]` (frac was always negative) |
+| CBUG-B4 | epics-modules/optics **#27** | open | `pf4` unknown/out-of-range Other material: skip the blade + diagnose, not silently opaque |
+| CBUG-B6 | epics-modules/asyn **#236** | open | `asynInterposeCom` disable flow control now sends NOFLOW (crtscts + ixon) |
+| CBUG-B8 | epics-modules/asyn **#236** | open | `asynInterposeCom` IAC-stuff the COM-PORT-OPTION subnegotiation payload |
+| CBUG-B10 | epics-modules/asyn **#237** | open | `asyn*Base.c` `readDefault` errorMessage "read", not "write", is not supported (6 files) |
+| CBUG-B11 | areaDetector/ADCore **#599** | open | `NDPluginCircularBuff` writing `0` to `SoftTrigger` disarms, not fires (guard latch+flush behind `if (value)`) |
+| CBUG-B13 | epics-modules/motor **#254** | open | `motorRecord` key CDIR on the commanded stroke after a jog-stop backlash |
+| CBUG-B18 | epics-modules/scaler **#4** | open | `scalerRecord` `special(RATE)` posts `.RATE`, not `.TP` |
+| CBUG-B19 | epics-modules/scaler **#4** | open | `scalerRecord` `monitor()` posts `monitor_mask`, not literal `DBE_LOG` |
 
 **Filed upstream PRs with no catalogue CBUG entry yet (6):**
 
@@ -155,11 +245,16 @@ These want back-fill CBUG entries (or an explicit "no entry — direct find" not
 so the catalogue and the filed set stay reconcilable.
 
 **Catalogued NOT-REPRODUCED, still UNFILED (the remaining easy-to-accept set):**
-CBUG-B2 (pf4 Pb OOB read), CBUG-B7 (`nextChar` 0-byte uninit), CBUG-B17
-(throttle wrong-link CA status), CBUG-B22 / CBUG-B23 / CBUG-B27 (NDPluginProcess /
-NDPluginStats divide-by-zero, 3), CBUG-D2 (sCalc string shift OOB write), CBUG-D3
-(`EPICS_CA_CONN_TMO` watchdog flood), CBUG-D5 (`EPICS_CA_MAX_SEARCH_PERIOD`
-inf/nan crash). None filed as of 2026-07-18.
+none — the list is now empty. CBUG-B7 (asyn **#238**) and CBUG-B17
+(std **#29**) were filed 2026-07-20; the 2026-07-19 batch had already cleared
+B2, B22, B23, B27, D2, D3, D5 (all in the table above).
+
+**Prepared but held (not filed):** the pvxs pair CBUG-F9 (process-only blocking
+PUT silent no-op) and CBUG-F10 (UnionArray round-trip) — fixes committed on
+`fix/blocking-put-and-unionarray` in a worktree, held pending re-verification of
+F10 (the prepared fix is decode-side, contradicting F10's encode-side framing).
+CBUG-B24 (modbus ASCII-serial LRC) is deferred on a `physwkim/modbus` fork
+question.
 
 ---
 
@@ -248,7 +343,7 @@ A%B      A=-nan B=7 -> -2
 ```
 
 ### CBUG-A3: `ISINF` leaks glibc's *signed* isinf result (±1) into the expression value
-Bucket: REPRODUCED · Severity: Low
+Bucket: NOT-REPRODUCED (port refuses — flipped 2026-07-20; see the 2026-07-20 reconciliation note) · Severity: Low
 C: `calcPerform.c:276-277`: `*ptop = isinf(*ptop);`. On glibc this resolves to the
 GNU/BSD *function*, which returns `+1` for `+Inf` and **`-1` for `-Inf`** — not the
 C99 *macro* (a plain boolean 1). Same in `sCalcPerform.c:703`/`:1407` and
@@ -305,7 +400,7 @@ run2: RNDM = 0.7500724804, 0.03596551461, 0.3266956588, 0.009201190204, 0.297611
 ---
 
 ### CBUG-B1: `pf4.st` `OtherAbsorptionLength` interpolates on the wrong interval — every "Other" filter transmission is wrong
-Bucket: REPRODUCED · Severity: Medium
+Bucket: NOT-REPRODUCED (port refuses — flipped 2026-07-20; see the 2026-07-20 reconciliation note) · Severity: Medium
 C: `optics/opticsApp/src/pf4.st:641-643`. The bracketing loop
 `for (j=0; j<numEntries; j++) if (keV < filtermat[i].keV[j]) break;` leaves `j` as
 the first node **strictly above** `keV`. C then interpolates on `[j, j+1]`:
@@ -404,7 +499,7 @@ Proof — `proof_nan.c`:
 ```
 
 ### CBUG-B4: `pf4.st` an unknown "Other" material name, or an energy above the table, silently reports the blade as fully opaque
-Bucket: REPRODUCED · Severity: Medium
+Bucket: NOT-REPRODUCED (port refuses — flipped 2026-07-20; see the 2026-07-20 reconciliation note) · Severity: Medium
 C: `pf4.st:629-631` and `:637-639` — `OtherAbsorptionLength` returns `0.` both when
 `strcmp` matches no species and when `j >= numEntries`. Both `printf` diagnostics that
 would have reported it are **commented out** in the shipped source:
@@ -466,7 +561,7 @@ Proof: `:593-596` has no `return`; `:597` unconditionally calls
 and `:430` writes `cbuf` to the device. `xBuf[1]` is never assigned on that path.
 
 ### CBUG-B6: `asynInterposeCom` can turn flow control **on** but never **off**
-Bucket: REPRODUCED · Severity: Medium
+Bucket: NOT-REPRODUCED (port refuses — flipped 2026-07-20; see the 2026-07-20 reconciliation note) · Severity: Medium
 C: `asynInterposeCom.c:575` and `:591` — both the `crtscts` and the `ixon` branch
 implement "n" as `if (epicsStrCaseCmp(val, "n") == 0) xBuf[1] = pinterposePvt->flow;`
 — the value transmitted for "turn this off" is the port's **current** flow-control mode.
@@ -522,7 +617,7 @@ Proof: `:103` writes `&nbytes`; no read of `nbytes` exists in the function; `:10
 returns `c` whenever `status == asynSuccess`.
 
 ### CBUG-B8: `asynInterposeCom` telnet negotiation bypasses its own IAC-stuffing, so a payload byte of 0xFF corrupts the subnegotiation
-Bucket: REPRODUCED · Severity: Low
+Bucket: NOT-REPRODUCED (port refuses — flipped 2026-07-20; see the 2026-07-20 reconciliation note) · Severity: Low
 C: `asynInterposeCom.c:430-431` — the negotiation frame is written straight to the
 driver **below** the interpose (`pinterposePvt->pasynOctetDrv->write`), not through this
 interpose's own `writeIt` (`:146-182`), which is the function that doubles `C_IAC`
@@ -581,7 +676,7 @@ Proof: `UDPbufferSize` is written only at `:311` and reset at `:202-203`/`:244-2
 reason. It never bounds the loop at `:196`.
 
 ### CBUG-B10: every `asyn*Base.c` `readDefault` reports "**write** is not supported" for a failed **read** (6 files)
-Bucket: REPRODUCED · Severity: Low
+Bucket: NOT-REPRODUCED (port refuses — flipped 2026-07-20; see the 2026-07-20 reconciliation note) · Severity: Low
 C: `asyn/asyn/interfaces/asynInt32Base.c:81-84` (`readDefault`):
 ```c
 :81     epicsSnprintf(pasynUser->errorMessage,pasynUser->errorMessageSize,
@@ -612,7 +707,7 @@ actively misdirects the person debugging.
 Proof: read both functions in any of the six files.
 
 ### CBUG-B11: `NDPluginCircularBuff` — writing **0** to `SoftTrigger` triggers the capture exactly like writing 1
-Bucket: REPRODUCED · Severity: Medium
+Bucket: NOT-REPRODUCED (port refuses — flipped 2026-07-20; see the 2026-07-20 reconciliation note) · Severity: Medium
 C: `ADCore/ADApp/pluginSrc/NDPluginCircularBuff.cpp:266-278` (`writeInt32`):
 ```c
 :266    }  else if (function == NDCircBuffSoftTrigger){
@@ -642,7 +737,7 @@ unconditional on it. (The `flushOn > 0` gate at `:276` is *correct* C — see th
 correction to R11-63 below.)
 
 ### CBUG-B12: pvxs `ackAt == 0` is overloaded as "caller said nothing", so a small `ackAny` percentage acks **later** than a larger one
-Bucket: REPRODUCED · Severity: Low
+Bucket: NOT-REPRODUCED (port refuses — flipped 2026-07-20; see the 2026-07-20 reconciliation note) · Severity: Low
 C: `pvxs/src/servermon.cpp:564` and `:577-578` (`ServerMonitorSetup::onSetup`, pipeline branch):
 ```c++
 :564            op->ackAt = std::max(0.0, std::min(percent, 100.0)) / 100.0 * op->limit;
@@ -680,7 +775,7 @@ NON-MONOTONIC: ackAny="25%" -> 1 ; ackAny="10%" -> 2
 ```
 
 ### CBUG-B13: `motorRecord` publishes CDIR=forward after a jog-stop backlash take-out that actually commands the reverse direction
-Bucket: REPRODUCED · Severity: Medium
+Bucket: NOT-REPRODUCED (port refuses — flipped 2026-07-20; see the 2026-07-20 reconciliation note) · Severity: Medium
 C: `motor/motorApp/MotorSrc/motorRecord.cc:827-829`, `:845`, `:973` (`postProcess`). The
 "sync drive to readback" block runs for every MIP except `{MOVE, MOVE_BL, JOG_BL1,
 JOG_BL2}` — the predicate does **not** exclude `MIP_JOG_STOP`. Inside it,
@@ -796,7 +891,7 @@ Proof: `:371` is inside the branch reached for `fieldIndex == throttleRecordSINP
 `:687-688` declarations are outside the loop opened at `:698`.
 
 ### CBUG-B18: `scalerRecord` `special(RATE)` posts `.TP` — a field the write never touched — and never posts the clamped RATE
-Bucket: REPRODUCED · Severity: Low
+Bucket: NOT-REPRODUCED (port refuses — flipped 2026-07-20; see the 2026-07-20 reconciliation note) · Severity: Low
 C: `scaler/scalerApp/src/scalerRecord.c:690-693` (`special`) — `case scalerRecordRATE:
 pscal->rate = MIN(60.,MAX(0.,pscal->rate)); db_post_events(pscal,&(pscal->tp),DBE_VALUE);
 break;` The clamp writes `rate`; the post passes `&pscal->tp`. Second site of the same
@@ -812,7 +907,7 @@ before any monitor exists).
 Proof: `:691` writes `pscal->rate`; `:692` passes `&(pscal->tp)` to `db_post_events`.
 
 ### CBUG-B19: `scalerRecord` `monitor()` computes the alarm monitor mask, then posts with a hard-coded `DBE_LOG` and discards it
-Bucket: REPRODUCED · Severity: Low
+Bucket: NOT-REPRODUCED (port refuses — flipped 2026-07-20; see the 2026-07-20 reconciliation note; the fix is inert until `do_alarm()` is ported — see body) · Severity: Low
 C: `scalerRecord.c:758-773` — `monitor_mask = recGblResetAlarms(pscal); monitor_mask |=
 (DBE_VALUE|DBE_LOG);` then the only post in the function is
 `for (i=0;i<pscal->nch;i++) db_post_events(pscal,&(pscaler[i]),DBE_LOG);` — a **literal**
@@ -1079,7 +1174,7 @@ and `LRC(AA)` with an empty `AA`.
 ---
 
 ### CBUG-C2: pvxs QSRV resets the whole TCP circuit when one channel's request options fail to parse
-Bucket: REPRODUCED · Severity: Medium
+Bucket: NOT-REPRODUCED (port refuses — flipped 2026-07-20; already refused since commit `67097734` (2026-07-13, ancestor of main): `MonitorRequestFatal` was deleted, so a per-op request-option parse failure returns an ordinary per-op `OpError` and cannot tear down the circuit — teardown is unrepresentable by construction; see the 2026-07-20 reconciliation note) · Severity: Medium
 C: `pvxs/ioc/singlesource.cpp:147` / `pvxs/ioc/groupsource.cpp:399` — `onSubscribe` calls a
 bare `connect()`; the `NoConvert` its DBE/options parse can throw propagates uncaught into the
 connection layer, which tears the circuit down.
@@ -1174,7 +1269,7 @@ Proof: compiled upstream exits after ONE iteration for both `UNTIL(A:=A+1;"0")` 
 | CBUG-D1 | calc | out-of-count `FETCH` leaves the stack cell stale (sCalc scalar) / the array tail stale (aCalc) | Low | NOT-REPRODUCED |
 | CBUG-D2 | calc | sCalc string `<<`/`>>` with a negative count writes past the 40-byte `local_string` | Medium | NOT-REPRODUCED |
 | CBUG-D3 | base ca | non-positive `EPICS_CA_CONN_TMO` accepted — watchdog flood, 177k stderr lines / 3 s | Medium | NOT-REPRODUCED |
-| CBUG-D4 | base libCom | the two escape printers render NUL differently — `\0` vs `\x00` | Low | REPRODUCED |
+| CBUG-D4 | base libCom | the two escape printers render NUL differently — `\0` vs `\x00` | Low | NOT-REPRODUCED |
 | CBUG-D5 | base ca | `EPICS_CA_MAX_SEARCH_PERIOD=inf` aborts the client in malloc; `=nan` NaN-drives the timer wheel | Medium | NOT-REPRODUCED |
 
 ### CBUG-D1: sCalc's string engine leaves the stack cell stale on an out-of-count `FETCH`; aCalc's array `FETCH` zeroes only element 0
@@ -1241,38 +1336,50 @@ Proof: measured on the compiled camonitor on this host during the R16-19 fix wav
 ---
 
 ### CBUG-D4: libCom's two escape printers render NUL differently — `\0` vs `\x00`
-Bucket: REPRODUCED (adjudicated 2026-07-14 — **keep both; not a defect to fix**) · Severity: Low
+Bucket: NOT-REPRODUCED (port refuses — fixed 2026-07-20, `09af6a24`: both `asyn-rs` escapers now render NUL as `\0` through one parameter-free table, so the `\0`-vs-`\x00` divergence is unrepresentable by construction; this supersedes the 2026-07-14 "keep both" adjudication — see the D4 body and the 2026-07-20 reconciliation note) · Severity: Low
 
-**Adjudication.** The divergence is real (both switch bodies re-read in the local tree:
-`epicsStrnEscapedFromRaw` has `case '\0': OUT('\\'); OUT('0');` at `:145`;
-`epicsStrPrintEscaped` `:245-259` has no `'\0'` arm, so NUL falls to
-`fprintf(fp, "\\x%02x", ...)`). Every other arm of the two switches is identical.
+**Adjudication (revised 2026-07-20 — the earlier "keep both" is superseded).** The C
+divergence is real: `epicsStrnEscapedFromRaw` has an explicit `case '\0': OUT('\\');
+OUT('0');` at `:145`, while `epicsStrPrintEscaped` (`:230-262`) has **no `'\0'` arm**, so a
+NUL falls through to the `fprintf(fp, "\\x%02x", ...)` default and prints `\x00`. The C bug
+is therefore a **missing case in the display escaper**, not two deliberately-different
+renderings: C's round-trippable escaper renders NUL as the deliberate `\0`; the display
+escaper merely forgot the case.
 
-But the "Defect" line below overstates it: these are **not two implementations of one
-escape table**. They have different contracts, and only one of them has an inverse —
-`epicsStrnEscapedFromRaw` is the round-trippable escape (undone by
-`epicsStrnRawFromEscaped`, and it is what `.db`/`.dbd` quoting relies on), whereas
-`epicsStrPrintEscaped` is a display escape streamed to a `FILE*` with no inverse. So there
-is no shared table for them to disagree *about*.
-
-Unifying them in the port would therefore *break* byte-parity with C on whichever path we
-changed, for a purely cosmetic gain — and asyn trace files are diffed against C's. The port
-keeps both renderings (see Port, below), which is correct as written. **No port change; the
-entry stays catalogued so the inconsistency is not "rediscovered" as a port bug later.**
+The earlier adjudication kept both renderings on a byte-parity-with-C argument. That is
+rejected under strategy-2026-07-13 §2 (clean is the goal), and two of its premises are wrong:
+(1) `\0` is **round-trip-safe** — `epicsStrnRawFromEscaped` decodes `\0` via `case '0'`,
+consuming only the `0` with no octal continuation (the port decoder matches at
+`iocsh.rs`), so `\0` followed by a digit round-trips as NUL-then-digit; and (2) the port is
+**not** parameter-free of a shared table — `escape.rs` had ONE table whose only per-form
+knob was the NUL rendering, i.e. exactly the shared table the argument claimed did not
+exist. The port also already renders NUL as `\0` in its calc escaper
+(`epics-base-rs/src/calc/engine/string.rs`, `ESC$`), so `\x00` on the asyn path was an
+internal inconsistency too.
 C: `epics-base modules/libcom/src/misc/epicsString.c` — `epicsStrnEscapedFromRaw` has an
 explicit `case '\0': OUT('\\'); OUT('0');` (`:145`), while `epicsStrPrintEscaped`
 (`:230-262`) has no `'\0'` case, so a NUL falls to the `fprintf(fp, "\\x%02x", ...)` default arm and
 prints `\x00` (`:256-259`). Asyn traffic tracing escapes through both, chosen by output path, so
 the same traced byte renders differently in a trace file than in an errlog capture.
 Defect: two implementations of the same escape table diverge on one byte.
-Port: `crates/asyn-rs/src/escape.rs` — ONE table parameterised only on the NUL rendering:
-`escaped_from_raw` yields `\0` (`:31`) and `print_escaped` yields `\x00` (`:37`), so each C
-call path is reproduced byte-for-byte (R16-48, commit `e0a71007`); the inconsistency itself
-is carried deliberately and documented in the module header.
-Impact: cosmetic but real — diffing the same binary-protocol traffic captured via an
-asynTrace file against an errlog capture shows spurious differences on every NUL byte.
-Proof: both switch arms quoted; the port's table is pinned by tests at
-`crates/asyn-rs/src/escape.rs:73-83`.
+Port (**refuses** — fixed 2026-07-20, `09af6a24`): `crates/asyn-rs/src/escape.rs` — the
+`nul` parameter was removed from the shared `escape()`; the NUL arm is now the constant
+`0 => "\\0"`, so **both** `escaped_from_raw` and `print_escaped` render NUL as `\0` and the
+`\0`-vs-`\x00` divergence is unrepresentable by construction. Converging onto `\0` matches
+C's deliberate round-trippable case and the port's calc escaper.
+Deliberate deviation (stated, not hidden): the port's `print_escaped` now emits `\0` where
+compiled C's `epicsStrPrintEscaped` still emits `\x00`. On the display/trace path the port
+diverges from an unfixed C IOC by exactly this one byte — the port owns that deviation,
+choosing internal consistency (and agreement with C's own deliberate `\0` case) over
+mirroring C's omission. Filing upstream (supply the missing `'\0'` case to
+`epicsStrPrintEscaped`) would remove the deviation.
+Impact: on the asyn trace/display path a NUL now prints `\0` (was `\x00`); a NUL captured
+via asynTrace and via errlog now render identically, and consistently with the
+round-trippable escaper. Diffs of the same NUL byte against an *unfixed* C IOC's display
+escaper differ by this one deliberate byte.
+Proof: both C switch arms quoted; the port's convergence is pinned by tests
+(`escape::the_table_is_c_s_and_both_forms_now_agree_on_nul`, plus a NUL and
+NUL-then-digit round-trip through the port decoder). Fix `09af6a24`.
 
 ---
 
@@ -1303,7 +1410,7 @@ site during the R15 wave); the NaN-blind gate (`:77`) and the UB cast (`:99`) qu
 | id | upstream | one line | severity | bucket |
 |---|---|---|---|---|
 | CBUG-E1 | base db | a scalar `dbPut` into a FIFO compress VAL writes through `get_array_info`'s READ offset, rewriting one slot instead of appending | Medium | NOT-REPRODUCED |
-| CBUG-E2 | base db | `dbConvert`'s double→integer PUT/GET is a bare C cast — UB out of range, x86-64 gives `INT_MIN`/truncation garbage | Medium | REPRODUCED |
+| CBUG-E2 | base db | `dbConvert`'s double→integer PUT/GET is a bare C cast — UB out of range, x86-64 gives `INT_MIN`/truncation garbage | Medium | NOT-REPRODUCED |
 
 ### CBUG-E1: scalar `dbPut` into a FIFO compress VAL writes at the READ start — every put during initial fill rewrites the same slot
 Bucket: NOT-REPRODUCED · Severity: Medium
@@ -1328,7 +1435,7 @@ pinned by the compress ingest tests. Filed as the R17-85 documented deviation
 (`doc/c-parity-review-2026-07-10.md`), flagged for user sign-off.
 
 ### CBUG-E2: `dbConvert`'s double→integer conversion is a bare C cast — undefined behaviour out of range; compiled x86-64 yields `INT_MIN` / truncation garbage
-Bucket: REPRODUCED · Severity: Medium
+Bucket: NOT-REPRODUCED (port saturates — refuses; the bucket label was flipped 2026-07-20 to match the body, which already recorded the saturating behaviour; see the 2026-07-20 reconciliation note) · Severity: Medium
 C: `epics-base modules/database/src/ioc/db/dbConvert.c:96-113` — the PUT macro body is
 `*pdst = (typeb) *psrc;`, instantiated for every integer destination at `:1631-1638`
 (`putDoubleShort`, `putDoubleLong`, `putDoubleUlong`, ...); the GET twin (`:63-70`) is the
@@ -1419,11 +1526,11 @@ decisive code path is quoted.
 | CBUG-F5 | calc (sCalc) | `LITERAL_STRING` copy guard never increments its counter — a >39-char literal overruns the 40-byte cell | Medium | NOT-REPRODUCED |
 | CBUG-F6 | base calc | `INPM`..`INPU` declare `special(SPC_MOD)` that `special()` rejects — nine documented fields unwritable via CA | Medium | NOT-REPRODUCED |
 | CBUG-F7 | calc (sCalc) | unconditional debug `printf` in the `SUBLAST` scan loop | Low | NOT-REPRODUCED |
-| CBUG-F8 | calc (sCalc) | `CRC16`/`MODBUS` sign-extends payload bytes ≥ 0x80 — wire-incompatible with the Modbus standard | Medium | REPRODUCED |
+| CBUG-F8 | calc (sCalc) | `CRC16`/`MODBUS` sign-extends payload bytes ≥ 0x80 — wire-incompatible with the Modbus standard | Medium | NOT-REPRODUCED |
 | CBUG-F9 | pvxs | process-only blocking PUT selects a `requestType` dbNotify never matches — silent no-op success | Medium | NOT-REPRODUCED |
 | CBUG-F10 | pvxs | UnionArray encode omits the selector its own decoder requires — a decoded UnionA cannot be re-serialized | Medium | NOT-REPRODUCED |
 | CBUG-F11 | asyn | `caput REC.TSIZ -1` suspends the put thread forever inside `callocMustSucceed`, holding the global trace mutex | High | NOT-REPRODUCED |
-| CBUG-F12 | base histogram | the `LLIM >= ULIM` alarm writes `stat`/`sevr` directly — erased on the process path (NO_ALARM) but STICKS on the `.SGNL` special path (SOFT); port reproduces both (`932291d9`) | Low | REPRODUCED |
+| CBUG-F12 | base histogram | the `LLIM >= ULIM` alarm writes `stat`/`sevr` directly — erased on the process path (NO_ALARM) but STICKS on the `.SGNL` special path (SOFT); port now refuses — raises SOFT/INVALID consistently on both paths via `nsta`/`nsev` (`9a51ba4c`) | Low | NOT-REPRODUCED |
 
 ### CBUG-F1: aCalc's `INC` bounds check admits writes two elements past the runtime stack — SIGSEGV at legal compile depth
 Bucket: NOT-REPRODUCED · Severity: High
@@ -1593,7 +1700,7 @@ Proof: the `printf` at `:999` is inside the loop with no `if
 (sCalcPerformDebug)` guard.
 
 ### CBUG-F8: sCalc `CRC16`/`MODBUS` sign-extends payload bytes ≥ 0x80 — wire-incompatible with the Modbus CRC standard
-Bucket: REPRODUCED · Severity: Medium
+Bucket: NOT-REPRODUCED (port refuses — emits the standard Modbus digest, XORs the unsigned byte; flipped 2026-07-20, code fix `25318fcd`; the "Adjudicated REPRODUCE" line below is superseded; see the 2026-07-20 reconciliation note) · Severity: Medium
 C: `sCalcPerform.c:193-212` (the `CRC16` case). Payload is
 `char tranInput[40]` (signed on x86-64) folded into `unsigned int crc` via
 `crc ^= (unsigned int)tranInput[i]`; a byte ≥ 0x80 sign-extends to
@@ -1602,18 +1709,25 @@ that back down. The commented-out predecessor at `:211` masks to the low
 byte, showing the low-byte XOR was intended.
 Defect: the standard Modbus CRC-16 XORs the *unsigned* byte; C's signed
 `char` makes every high byte wrong.
-Port: `crates/epics-base-rs/src/calc/engine/checksum.rs` (R18-6,
-`ee4f6bff`) — reproduces the 32-bit accumulator and the signed-`char`
-sign-extension deliberately, with the deviation-from-standard documented
-at the function. **Adjudicated REPRODUCE**: bug-for-bug parity with the
-compiled IOC is the contract on exactly the binary Modbus frames the
-operator uses; deviating to standard-correct would make the port
-wire-incompatible with every existing C IOC.
-Impact: `CRC16` of any payload containing a byte ≥ 0x80 differs from the
-Modbus standard — but agrees with the C IOC, which is the point. ASCII-only
-payloads are unaffected (`XOR8`/`LRC`/`AMODBUS` unaffected entirely).
-Proof (compiled C, this host): `CRC16("\x80")` → C `\x41\x1f`,
-standard-correct → `\xbe\xe0`; port matches C.
+Port: `crates/epics-base-rs/src/calc/engine/checksum.rs:34` (`crc16`) —
+**refuses** the C bug. It XORs the *unsigned* byte (`crc ^= byte as u16`),
+the standard Modbus CRC-16, so a byte ≥ 0x80 no longer sign-extends.
+History: R18-6/`ee4f6bff` first reproduced C's 32-bit-accumulator
+signed-`char` sign-extension deliberately; commit `25318fcd`
+("CBUG-F8 — sCalc CRC16 emits the STANDARD Modbus digest") flipped that to
+the standard digest, superseding the earlier "Adjudicated REPRODUCE".
+Refused per strategy-2026-07-13 §2 (clean is the goal): the port emits the
+correct Modbus digest rather than mirroring the compiled IOC's wrong one.
+Test `test_crc16_high_bytes_are_standard_not_c` pins the standard values
+(`0x80` → `0xE0BE`) and asserts C's `0x1F41` is refused.
+Impact: `CRC16` of a payload containing a byte ≥ 0x80 now matches the
+Modbus standard and diverges from an unfixed C IOC (which is wrong); this
+is a deliberate deviation the port owns. ASCII-only payloads were never
+affected (`XOR8`/`LRC`/`AMODBUS` unaffected entirely). Filing upstream is
+still open (the C IOC stays wire-wrong until a fix merges).
+Proof (compiled C, this host): `CRC16("\x80")` → C `\x41\x1f` (= 0x1F41,
+wrong), standard-correct → `\xbe\xe0` (= 0xE0BE); the port now emits the
+standard `\xbe\xe0`, refusing C.
 
 ### CBUG-F9: pvxs process-only blocking PUT selects a `requestType` `dbNotify` never matches — silent no-op success
 Bucket: NOT-REPRODUCED · Severity: Medium
@@ -1693,7 +1807,7 @@ Proof: `epicsInt32 tsiz` (`:196`) → `size_t` param (`asynManager.c:2943`) →
 unlocked on this path.
 
 ### CBUG-F12: base `histogram` `LLIM >= ULIM` alarm writes `stat`/`sevr` directly and `recGblResetAlarms` erases it in the same cycle — dead code
-Bucket: REPRODUCED · Severity: Low
+Bucket: NOT-REPRODUCED (port refuses — raises SOFT/INVALID consistently on BOTH the process and `.SGNL` paths via the single `nsta`/`nsev` owner; fixed 2026-07-20, code fix `9a51ba4c`; see the 2026-07-20 reconciliation note) · Severity: Low
 C: `epics-base modules/database/src/std/rec/histogramRecord.c:328-334`
 (`add_count`):
 ```c

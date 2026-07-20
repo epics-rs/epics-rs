@@ -138,7 +138,9 @@ enum MonitorPipelineRequest {
 /// [`crate::pvdata::convert::as_u32`] converts — bool, every signed/unsigned
 /// integer, both reals, and a BASE-0 numeric string) or a percentage string
 /// (`"N%"`). An absent or unconvertible value keeps the pvxs default of
-/// `1`; an explicit `0` becomes `queueSize / 2`; the result clamps to
+/// `1`; an explicit `0` (below the representable minimum) clamps up to
+/// `1` — CBUG-B12, where pvxs instead reads `0` as "no ackAny given" and
+/// jumps it to `queueSize / 2`; the result clamps to
 /// `[1, queueSize]`. `queue_size` MUST be `>= 1` (the caller only
 /// invokes this for an enabled pipeline, where `queueSize >= 2`).
 ///

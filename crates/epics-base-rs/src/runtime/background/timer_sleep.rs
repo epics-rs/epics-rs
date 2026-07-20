@@ -135,6 +135,48 @@ impl Drop for Sleep {
     }
 }
 
+/// A periodic ticker over the delayed-callback timer — the RTEMS backend for
+/// [`crate::runtime::task::interval`]. Mirrors `tokio::time::Interval` with its
+/// default `MissedTickBehavior::Burst`: the first tick is immediate and tick
+/// deadlines are anchored at construction (`start + period`, `start + 2·period`,
+/// …), so an overdue tick fires immediately and successive overdue ticks burst
+/// back-to-back until the schedule is caught up.
+pub struct TimerInterval {
+    timer: TimerHandle,
+    period: Duration,
+    /// Next tick deadline, anchored at construction so catch-up is Burst.
+    next: Instant,
+    /// The first tick completes immediately (tokio parity).
+    first: bool,
+}
+
+/// Build a periodic ticker firing every `period`, backed by `timer` — the
+/// runtime-free mirror of `tokio::time::interval`.
+pub fn interval(timer: &TimerHandle, period: Duration) -> TimerInterval {
+    TimerInterval {
+        timer: timer.clone(),
+        period,
+        next: Instant::now() + period,
+        first: true,
+    }
+}
+
+impl TimerInterval {
+    /// Complete at the next tick. The first tick is immediate; thereafter each
+    /// tick waits until its (construction-anchored) deadline, with Burst
+    /// catch-up when the caller has fallen behind.
+    pub async fn tick(&mut self) {
+        if self.first {
+            self.first = false;
+            return;
+        }
+        sleep_until(&self.timer, self.next).await;
+        // Advance by a whole period from the previous deadline (not from now),
+        // so overdue deadlines stay in the past and the next tick bursts.
+        self.next += self.period;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,5 +281,63 @@ mod tests {
         assert_eq!(rx.recv_timeout(T).unwrap(), "long");
         long.join().unwrap();
         short.join().unwrap();
+    }
+
+    #[test]
+    fn interval_first_tick_immediate_then_periodic() {
+        let pool = CallbackPool::new();
+        let timer = DelayedTimer::new(pool.handle());
+        let period = Duration::from_millis(40);
+        let th = timer.handle();
+        let start = Instant::now();
+        drive(
+            async move {
+                let mut iv = interval(&th, period);
+                iv.tick().await; // first tick: immediate
+                let after_first = start.elapsed();
+                assert!(
+                    after_first < period,
+                    "first tick should be immediate, was {after_first:?}"
+                );
+                iv.tick().await; // ~1 period in
+                iv.tick().await; // ~2 periods in
+            },
+            || false,
+        )
+        .unwrap();
+        assert!(
+            start.elapsed() >= 2 * period,
+            "two periodic ticks should take at least two periods, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn interval_bursts_to_catch_up_after_a_stall() {
+        // MissedTickBehavior::Burst: after stalling past several deadlines, the
+        // overdue ticks fire back-to-back rather than re-spacing from now.
+        let pool = CallbackPool::new();
+        let timer = DelayedTimer::new(pool.handle());
+        let period = Duration::from_millis(30);
+        let th = timer.handle();
+        drive(
+            async move {
+                let mut iv = interval(&th, period);
+                iv.tick().await; // immediate; deadlines land at 30/60/90/120ms
+                // Stall well past four deadlines.
+                sleep(&th, Duration::from_millis(140)).await;
+                let t = Instant::now();
+                iv.tick().await; // deadline 30ms already passed -> immediate
+                iv.tick().await; // deadline 60ms passed -> immediate
+                iv.tick().await; // deadline 90ms passed -> immediate
+                assert!(
+                    t.elapsed() < period,
+                    "overdue ticks must burst, three took {:?}",
+                    t.elapsed()
+                );
+            },
+            || false,
+        )
+        .unwrap();
     }
 }

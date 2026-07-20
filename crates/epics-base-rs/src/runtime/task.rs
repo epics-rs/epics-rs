@@ -6,7 +6,6 @@ use tokio::runtime::RuntimeFlavor;
 use tokio::task::JoinHandle;
 
 pub use tokio::runtime::Handle as RuntimeHandle;
-pub use tokio::time::interval;
 
 /// A synchronous caller asked to block on an async operation from a thread
 /// where blocking cannot be made sound: a **current-thread** tokio runtime.
@@ -143,6 +142,33 @@ pub async fn sleep(duration: Duration) {
 
 pub async fn sleep_until(deadline: std::time::Instant) {
     tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+}
+
+/// Periodic ticker — the seam replacement for `tokio::time::interval`, so no
+/// production site names `tokio::time` directly (decision A2). The hosted build
+/// wraps `tokio::time::Interval`, preserving its default
+/// `MissedTickBehavior::Burst` catch-up and immediate first tick; the RTEMS
+/// build (wired in the cfg switch) substitutes the runtime-free
+/// [`crate::runtime::background::timer_sleep::TimerInterval`], which reproduces
+/// the same semantics over the delayed-callback timer.
+pub struct Interval {
+    inner: tokio::time::Interval,
+}
+
+impl Interval {
+    /// Complete at the next tick. The first tick is immediate (tokio parity);
+    /// callers that want to skip it await `tick()` once up front.
+    pub async fn tick(&mut self) {
+        self.inner.tick().await;
+    }
+}
+
+/// Build a periodic ticker firing every `period` — the seam replacement for
+/// `tokio::time::interval`.
+pub fn interval(period: Duration) -> Interval {
+    Interval {
+        inner: tokio::time::interval(period),
+    }
 }
 
 pub fn runtime_handle() -> tokio::runtime::Handle {

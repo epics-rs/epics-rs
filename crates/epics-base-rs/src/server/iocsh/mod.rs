@@ -523,6 +523,10 @@ impl IocShell {
 /// REPL should emit ANSI color sequences. Honours `NO_COLOR` env var
 /// (https://no-color.org) and `EPICS_RS_IOCSH_NO_COLOR=1` opt-out;
 /// otherwise on by default in the interactive (TTY) path.
+///
+/// Host-only: used only by the rustyline interactive editor, which is gated out
+/// on RTEMS.
+#[cfg(not(target_os = "rtems"))]
 fn use_ansi_color() -> bool {
     if std::env::var_os("NO_COLOR").is_some() {
         return false;
@@ -540,6 +544,10 @@ fn use_ansi_color() -> bool {
 ///
 /// `IOCSH_PS1` carries them by default (`ANSI_GREEN("epics> ")`), and rustyline
 /// needs the *visible* text separately to compute the cursor column.
+///
+/// Host-only: used only by the rustyline interactive editor, which is gated out
+/// on RTEMS.
+#[cfg(not(target_os = "rtems"))]
 fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars();
@@ -563,6 +571,10 @@ fn strip_ansi(s: &str) -> String {
 
 /// Format an error string with optional ANSI bold-red prefix.
 /// Plain `Error: <msg>` when color is off — preserves grep-ability.
+///
+/// Host-only: used only by the rustyline interactive editor, which is gated out
+/// on RTEMS.
+#[cfg(not(target_os = "rtems"))]
 fn format_error(msg: &str, color: bool) -> String {
     if color {
         format!("\x1b[1;31mError:\x1b[0m {msg}")

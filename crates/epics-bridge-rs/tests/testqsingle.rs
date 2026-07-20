@@ -533,7 +533,7 @@ async fn arr_channel_filter_applies_to_get_matching_monitor() {
     mon.start().await.expect("start");
     {
         let rec = db.get_record("TEST:filt_wf").await.expect("rec");
-        rec.write().await.notify_field("VAL", EventMask::VALUE);
+        rec.write().notify_field("VAL", EventMask::VALUE);
     }
     let ev = tokio::time::timeout(std::time::Duration::from_secs(2), mon.poll())
         .await
@@ -704,7 +704,7 @@ async fn channel_with_field_suffix_binds_to_field() {
 
     let egu_after = {
         let rec = db.get_record("TEST:fld_ai").await.expect("rec exists");
-        let inst = rec.read().await;
+        let inst = rec.read();
         inst.snapshot_for_field("EGU").map(|s| s.value)
     };
     assert!(
@@ -714,7 +714,7 @@ async fn channel_with_field_suffix_binds_to_field() {
 
     let val_after = {
         let rec = db.get_record("TEST:fld_ai").await.expect("rec exists");
-        let inst = rec.read().await;
+        let inst = rec.read();
         inst.snapshot_for_field("VAL").map(|s| s.value)
     };
     assert!(
@@ -943,7 +943,7 @@ async fn monitor_stop_disables_backing_subscription() {
 
     async fn post(db: &Arc<PvDatabase>, mask: EventMask) {
         let rec = db.get_record("TEST:gate_ai").await.expect("rec");
-        rec.write().await.notify_field("VAL", mask);
+        rec.write().notify_field("VAL", mask);
     }
 
     // Active (post-START): a VALUE post is delivered.
@@ -1268,7 +1268,7 @@ async fn r17_31_qform_string_char_waveform_serves_long_string() {
     .unwrap();
     {
         let rec = db.get_record("TEST:lstr").await.expect("record");
-        rec.write().await.set_info("Q:form", "String");
+        rec.write().set_info("Q:form", "String");
     }
     db.put_pv("TEST:lstr", EpicsValue::CharArray(b"abc\0".to_vec()))
         .await
@@ -1318,7 +1318,7 @@ async fn r17_31_qform_string_char_waveform_serves_long_string() {
     }
     let nord = {
         let rec = db.get_record("TEST:lstr").await.expect("record");
-        let inst = rec.read().await;
+        let inst = rec.read();
         inst.resolve_field("NORD").expect("NORD")
     };
     assert_eq!(

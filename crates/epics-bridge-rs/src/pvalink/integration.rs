@@ -541,7 +541,7 @@ impl PvaLinkResolver {
         let field = field.strip_suffix('$').unwrap_or(field);
         let field = if field.is_empty() { "VAL" } else { field };
         match db.get_record(base).await {
-            Some(rec) => rec.read().await.resolve_field(field).is_some(),
+            Some(rec) => rec.read().resolve_field(field).is_some(),
             None => false,
         }
     }
@@ -989,7 +989,7 @@ async fn scan_target_should_process(
     let Some(rec) = db_handle.get_record(record).await else {
         return false;
     };
-    let mut tg = rec.write().await;
+    let mut tg = rec.write();
     if passive_only && tg.common.scan != epics_base_rs::server::record::ScanType::Passive {
         return false;
     }
@@ -2317,7 +2317,7 @@ mod tests {
         // Hold the record Arc and drive it into PACT (async in
         // progress) before the db moves into the forwarder slot.
         let dest = db.get_record("DEST").await.unwrap();
-        dest.write().await.enter_pact();
+        dest.write().enter_pact();
 
         // CP target: scans on every event.
         let mut fanout = ScanFanout::default();
@@ -2355,7 +2355,7 @@ mod tests {
         // ... and RPRO was armed so the standard RPRO mechanism
         // reprocesses it once the async cycle completes.
         assert!(
-            dest.read().await.common.rpro != 0,
+            dest.read().common.rpro != 0,
             "a PACT target must get rpro=true (pvxs prec->rpro = TRUE)"
         );
     }
@@ -2696,7 +2696,7 @@ mod tests {
         // Wire DEST.FLNK -> DOWNSTREAM.
         {
             let rec = db.get_record("DEST").await.expect("DEST exists");
-            let mut inst = rec.write().await;
+            let mut inst = rec.write();
             inst.put_common_field("FLNK", EpicsValue::String("DOWNSTREAM".into()))
                 .expect("set FLNK");
         }

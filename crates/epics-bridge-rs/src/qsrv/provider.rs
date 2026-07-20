@@ -174,7 +174,7 @@ impl AcfAccessControl {
     async fn resolve_asg_and_asl(&self, channel: &str) -> (String, u8) {
         let (record_name, _field) = epics_base_rs::server::database::parse_pv_name(channel);
         if let Some(rec) = self.db.get_record(record_name).await {
-            let inst = rec.read().await;
+            let inst = rec.read();
             return (inst.common.access_group().to_string(), inst.common.asl);
         }
         ("DEFAULT".to_string(), 0u8)
@@ -777,7 +777,7 @@ impl BridgeProvider {
             // Default false here so unknown names refuse PUT upfront.
             return false;
         };
-        let inst = rec_arc.read().await;
+        let inst = rec_arc.read();
         inst.common.disp == 0
     }
 
@@ -1481,7 +1481,7 @@ pub async fn channel_property_support(
     let Some(rec_arc) = db.get_record(record).await else {
         return epics_base_rs::server::snapshot::PropertySupport::NONE;
     };
-    let inst = rec_arc.read().await;
+    let inst = rec_arc.read();
     inst.property_support_for_field(field)
 }
 
@@ -1665,7 +1665,7 @@ mod tests {
         // predicate would still advertise writable=true.
         {
             let rec = db.get_record("SH:rec").await.unwrap();
-            rec.write().await.common.disp = 1;
+            rec.write().common.disp = 1;
         }
 
         let provider = BridgeProvider::new(db);
@@ -1916,7 +1916,7 @@ ASG(SECURE) {
             .await
             .unwrap();
         let rec = db.get_record("AI:SEC").await.unwrap();
-        rec.write().await.common.asg = "SECURE".to_string();
+        rec.write().common.asg = "SECURE".to_string();
 
         let acl = AcfAccessControl::new(db.clone(), cfg);
         // Anyone can read.
@@ -1976,27 +1976,27 @@ ASG(ROLE_GATED) {
         //   Pre-fix: hardcoded asl=0 caused AI:ASL1 write to return true (WRONG).
         {
             let rec = db.get_record("AI:ASL0").await.unwrap();
-            let mut w = rec.write().await;
+            let mut w = rec.write();
             w.common.asg = "ASL_GATED".to_string();
             w.common.asl = 0;
         }
         {
             let rec = db.get_record("AI:ASL1").await.unwrap();
-            let mut w = rec.write().await;
+            let mut w = rec.write();
             w.common.asg = "ASL_GATED".to_string();
             w.common.asl = 1;
         }
         {
             let rec = db.get_record("AI:METH").await.unwrap();
-            rec.write().await.common.asg = "METHOD_GATED".to_string();
+            rec.write().common.asg = "METHOD_GATED".to_string();
         }
         {
             let rec = db.get_record("AI:AUTH").await.unwrap();
-            rec.write().await.common.asg = "AUTHORITY_GATED".to_string();
+            rec.write().common.asg = "AUTHORITY_GATED".to_string();
         }
         {
             let rec = db.get_record("AI:ROLE").await.unwrap();
-            rec.write().await.common.asg = "ROLE_GATED".to_string();
+            rec.write().common.asg = "ROLE_GATED".to_string();
         }
 
         let acl = AcfAccessControl::new(db.clone(), cfg);
@@ -2339,7 +2339,7 @@ ASG(ANON_GATED) {
             .unwrap();
         {
             let rec = db.get_record("AI:ANON").await.unwrap();
-            rec.write().await.common.asg = "ANON_GATED".to_string();
+            rec.write().common.asg = "ANON_GATED".to_string();
         }
         let acl = AcfAccessControl::new(db.clone(), cfg);
 

@@ -1485,7 +1485,7 @@ async fn load_qsrv_groups(
     // 1. DB info(Q:group) records (pvxs loadConfigFromDb).
     for name in db.all_record_names().await {
         let json = match db.get_record(&name).await {
-            Some(rec) => rec.read().await.get_info("Q:group").map(str::to_string),
+            Some(rec) => rec.read().get_info("Q:group").map(str::to_string),
             None => None,
         };
         if let Some(json) = json {
@@ -2132,7 +2132,7 @@ mod tests {
         // Sanity: VAL starts at 0.0.
         let val0 = {
             let rec = db.get_record("TEST:proc").await.unwrap();
-            let inst = rec.read().await;
+            let inst = rec.read();
             inst.snapshot_for_field("VAL").map(|s| s.value)
         };
         assert!(matches!(val0, Some(EpicsValue::Double(v)) if v == 0.0));
@@ -2151,7 +2151,7 @@ mod tests {
         // to Force, not silently degraded to Passive.
         let val1 = {
             let rec = db.get_record("TEST:proc").await.unwrap();
-            let inst = rec.read().await;
+            let inst = rec.read();
             inst.snapshot_for_field("VAL").map(|s| s.value)
         };
         assert!(
@@ -2276,7 +2276,7 @@ mod tests {
 
         let before = {
             let rec = db.get_record("TEST:proc_call").await.unwrap();
-            let inst = rec.read().await;
+            let inst = rec.read();
             inst.common.time
         };
         // Sleep briefly so the post-process timestamp can be strictly
@@ -2289,7 +2289,7 @@ mod tests {
             .expect("PROCESS must run");
         let after = {
             let rec = db.get_record("TEST:proc_call").await.unwrap();
-            let inst = rec.read().await;
+            let inst = rec.read();
             inst.common.time
         };
         assert!(
@@ -2344,7 +2344,7 @@ mod tests {
 
         let b_time = |db: Arc<PvDatabase>| async move {
             let rec = db.get_record("FLNK:b").await.unwrap();
-            let inst = rec.read().await;
+            let inst = rec.read();
             inst.common.time
         };
 
@@ -2520,7 +2520,7 @@ mod tests {
 
         let member_time = |db: Arc<PvDatabase>, rec_name: &'static str| async move {
             let rec = db.get_record(rec_name).await.unwrap();
-            let inst = rec.read().await;
+            let inst = rec.read();
             inst.common.time
         };
 
@@ -2577,7 +2577,7 @@ mod tests {
         // The values must land regardless of the process option.
         let a_val = {
             let rec = db.get_record("MRR10:a").await.unwrap();
-            let inst = rec.read().await;
+            let inst = rec.read();
             inst.snapshot_for_field("VAL").map(|s| s.value)
         };
         assert!(
@@ -2707,7 +2707,7 @@ mod tests {
 
         let rec_time = |db: Arc<PvDatabase>, rec: &'static str| async move {
             let r = db.get_record(rec).await.unwrap();
-            r.read().await.common.time
+            r.read().common.time
         };
 
         for (group_pv, rec) in [("B119:na", "B119:rna"), ("B119:at", "B119:rat")] {
@@ -2772,7 +2772,7 @@ mod tests {
 
         let member_time = |db: Arc<PvDatabase>, rec: &'static str| async move {
             let rec = db.get_record(rec).await.unwrap();
-            let inst = rec.read().await;
+            let inst = rec.read();
             inst.common.time
         };
         let a_before = member_time(db.clone(), "BR120:a").await;
@@ -2819,7 +2819,7 @@ mod tests {
 
         let a_val = {
             let rec = db.get_record("BR120:a").await.unwrap();
-            let inst = rec.read().await;
+            let inst = rec.read();
             inst.snapshot_for_field("VAL").map(|s| s.value)
         };
         assert!(
@@ -2836,7 +2836,7 @@ mod tests {
         // and processed; post-fix b is unmarked and must be untouched.
         let b_val = {
             let rec = db.get_record("BR120:b").await.unwrap();
-            let inst = rec.read().await;
+            let inst = rec.read();
             inst.snapshot_for_field("VAL").map(|s| s.value)
         };
         assert!(
@@ -2884,7 +2884,7 @@ mod tests {
 
         let member_time = |db: Arc<PvDatabase>, rec: &'static str| async move {
             let rec = db.get_record(rec).await.unwrap();
-            let inst = rec.read().await;
+            let inst = rec.read();
             inst.common.time
         };
         let a_before = member_time(db.clone(), "BR120E:a").await;
@@ -2968,7 +2968,7 @@ mod tests {
         // A record carrying info(Q:group) — pvxs `loadConfigFromDb` source.
         {
             let rec = db.get_record("GRP:infoval").await.unwrap();
-            rec.write().await.set_info(
+            rec.write().set_info(
                 "Q:group",
                 r#"{ "INFO:grp": { "+id": "epics:nt/NTScalar:1.0",
                      "value": { "+channel": "VAL", "+type": "plain" } } }"#,

@@ -484,7 +484,7 @@ mod tests {
         // mismatch); the PROPERTY subscription must.
         {
             let rec = db.get_record("MON_PROPERTY").await.expect("rec exists");
-            let mut instance = rec.write().await;
+            let mut instance = rec.write();
             instance.notify_field("VAL", EventMask::PROPERTY);
         }
 
@@ -583,7 +583,7 @@ mod tests {
         // A PROPERTY-only post (metadata change) carries the current VAL.
         {
             let rec = db.get_record("WF_ARR").await.expect("rec exists");
-            let mut instance = rec.write().await;
+            let mut instance = rec.write();
             instance.notify_field("VAL", EventMask::PROPERTY);
         }
 
@@ -639,7 +639,7 @@ mod tests {
 
         {
             let rec = db.get_record("MON_MARK").await.expect("rec exists");
-            let mut instance = rec.write().await;
+            let mut instance = rec.write();
             instance.notify_field("VAL", EventMask::VALUE);
         }
 
@@ -661,7 +661,7 @@ mod tests {
         // and so additionally marks `alarm` — still no display/control.
         {
             let rec = db.get_record("MON_MARK").await.expect("rec exists");
-            let mut instance = rec.write().await;
+            let mut instance = rec.write();
             instance.notify_field("VAL", EventMask::ALARM);
         }
         let snap = tokio::time::timeout(Duration::from_millis(500), mon.poll())
@@ -705,7 +705,7 @@ mod tests {
         mon.start().await.expect("start ok");
         {
             let rec = db.get_record("MON_ENUM").await.expect("rec exists");
-            let mut instance = rec.write().await;
+            let mut instance = rec.write();
             instance.notify_field("VAL", EventMask::VALUE);
         }
         let snap = tokio::time::timeout(Duration::from_millis(500), mon.poll())

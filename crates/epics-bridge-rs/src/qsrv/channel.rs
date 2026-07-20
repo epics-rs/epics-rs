@@ -418,7 +418,7 @@ pub(super) async fn resolve_db_channel(db: &PvDatabase, name: &str) -> Result<()
     let Some(rec) = db.get_record(record_name).await else {
         return Err(format!("Invalid PV: {name}"));
     };
-    let instance = rec.read().await;
+    let instance = rec.read();
     if string_view {
         // `$` is `S_dbLib_fieldNotFound` on anything but a `DBF_STRING` or
         // link field (`dbChannel.c:486-505`), which aborts channel creation.
@@ -591,7 +591,7 @@ impl BridgeChannel {
             .await
             .ok_or_else(|| BridgeError::RecordNotFound(record_name.to_string()))?;
 
-        let instance = rec.read().await;
+        let instance = rec.read();
         // Resolve the bound field's actual value once (record field →
         // common field → virtual field). This is the single source of
         // truth for both the served DBF type and (below) the NT shape,
@@ -925,7 +925,7 @@ impl Channel for BridgeChannel {
             .await
             .ok_or_else(|| BridgeError::RecordNotFound(self.record_name.clone()))?;
 
-        let instance = rec.read().await;
+        let instance = rec.read();
         let mut snapshot =
             instance
                 .snapshot_for_field(&self.field)
@@ -1768,7 +1768,7 @@ mod tests {
         // The barrier held until processing finished: the OUT link drove
         // TGT0.VAL = 42 before the PUT returned.
         let tgt = db.get_record("TGT0").await.unwrap();
-        let v = tgt.read().await.record.get_field("VAL");
+        let v = tgt.read().record.get_field("VAL");
         assert_eq!(
             v,
             Some(EpicsValue::Double(42.0)),
@@ -1832,14 +1832,14 @@ mod tests {
 
         // The barrier is genuinely async-pending: DLYA armed, OUT still deferred.
         let sc_rec = db.get_record("SC1").await.unwrap();
-        let dlya = sc_rec.read().await.record.get_field("DLYA");
+        let dlya = sc_rec.read().record.get_field("DLYA");
         assert_eq!(
             dlya,
             Some(EpicsValue::Short(1)),
             "ODLY cycle must arm DLYA (record held ACTIVE across the delay), got {dlya:?}"
         );
         let tgt = db.get_record("TGT1").await.unwrap();
-        let v = tgt.read().await.record.get_field("VAL");
+        let v = tgt.read().record.get_field("VAL");
         assert_eq!(
             v,
             Some(EpicsValue::Double(0.0)),
@@ -1901,7 +1901,7 @@ mod tests {
         );
         // Released only after the deferred OUT actually fired.
         let tgt = db.get_record("TGT2").await.unwrap();
-        let v = tgt.read().await.record.get_field("VAL");
+        let v = tgt.read().record.get_field("VAL");
         assert_eq!(
             v,
             Some(EpicsValue::Double(42.0)),
@@ -1956,13 +1956,7 @@ mod tests {
         );
 
         // DISP=1 → "Unable to put value: Field Disabled: S_db_putDisabled"
-        db.get_record("PS:ai")
-            .await
-            .unwrap()
-            .write()
-            .await
-            .common
-            .disp = 1;
+        db.get_record("PS:ai").await.unwrap().write().common.disp = 1;
         let ch = BridgeChannel::new(db.clone(), "PS:ai").await.unwrap();
         let err = ch.put(&put).await.expect_err("DISP=1 must reject the put");
         assert_eq!(

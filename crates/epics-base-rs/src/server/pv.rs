@@ -915,7 +915,7 @@ impl Drop for PvSubscription {
         // lock, so remove the slot off-thread. No current runtime means no
         // live subscription to clean up.
         if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::spawn(async move {
+            crate::runtime::task::spawn(async move {
                 pv.remove_subscriber(sid).await;
             });
         }

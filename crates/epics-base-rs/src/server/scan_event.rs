@@ -114,7 +114,7 @@ impl ScanSchedulerV2 {
         duration: Duration,
         _max_concurrent: usize,
     ) {
-        let mut interval = tokio::time::interval(duration);
+        let mut interval = crate::runtime::task::interval(duration);
         loop {
             interval.tick().await;
 
@@ -158,7 +158,7 @@ impl ScanSchedulerV2 {
         let db = self.db.clone();
         let name = record_name.to_string();
         crate::runtime::task::spawn(async move {
-            tokio::time::sleep(delay).await;
+            crate::runtime::task::sleep(delay).await;
             let mut visited = HashSet::new();
             let _ = db.process_record_with_links(&name, &mut visited, 0).await;
         });

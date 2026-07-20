@@ -837,8 +837,8 @@ impl PvDatabase {
             None => return,
         };
         let db = self.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(delay).await;
+        crate::runtime::task::spawn(async move {
+            crate::runtime::task::sleep(delay).await;
             let _ = token.fire(&db).await;
         });
     }
@@ -886,7 +886,7 @@ impl PvDatabase {
             let instance = rec.read();
             instance.device.is_none()
         };
-        tokio::spawn(async move {
+        crate::runtime::task::spawn(async move {
             loop {
                 let interval = {
                     let instance = rec.read();
@@ -896,7 +896,7 @@ impl PvDatabase {
                         None => return,
                     }
                 };
-                tokio::time::sleep(interval).await;
+                crate::runtime::task::sleep(interval).await;
                 // A newer arm superseded this task while it slept.
                 if generation.load(std::sync::atomic::Ordering::Acquire) != epoch {
                     return;
@@ -1050,7 +1050,7 @@ impl PvDatabase {
         completion: crate::runtime::sync::oneshot::Receiver<()>,
     ) -> tokio::task::JoinHandle<()> {
         let db = self.clone();
-        tokio::spawn(async move {
+        crate::runtime::task::spawn(async move {
             // `Err` means the sender was dropped without firing (the
             // downstream op vanished); treat it the same as completion so a
             // waiting record is never stranded — `fire` is a no-op if the
@@ -3338,8 +3338,8 @@ impl PvDatabase {
                                 let rec_name = instance.name.clone();
                                 let timeout = std::time::Duration::from_secs(5);
                                 let db = self.clone();
-                                tokio::spawn(async move {
-                                    let _ = tokio::task::spawn_blocking(move || {
+                                crate::runtime::task::spawn(async move {
+                                    let _ = crate::runtime::task::spawn_blocking(move || {
                                         completion.wait(timeout)
                                     })
                                     .await;
@@ -4308,7 +4308,7 @@ impl PvDatabase {
                         // still holding.
                         let db = self.clone();
                         let name = record_name.to_string();
-                        tokio::spawn(async move {
+                        crate::runtime::task::spawn(async move {
                             let mut visited = HashSet::new();
                             let _ = db.process_record_with_links(&name, &mut visited, 0).await;
                         });

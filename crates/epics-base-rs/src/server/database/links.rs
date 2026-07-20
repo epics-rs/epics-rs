@@ -2444,7 +2444,8 @@ impl PvDatabase {
                     // process sequentially in index order, each after
                     // its own delay (callbackRequestDelayed chain).
                     if grp.dly > 0.0 {
-                        tokio::time::sleep(std::time::Duration::from_secs_f64(grp.dly)).await;
+                        crate::runtime::task::sleep(std::time::Duration::from_secs_f64(grp.dly))
+                            .await;
                     }
                     // C `seqRecord.c:259` `dbGetLink(&dol, DBR_DOUBLE,
                     // &dov)`: read DOLn into the DOn value field. A

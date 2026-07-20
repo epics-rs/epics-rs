@@ -85,7 +85,7 @@ impl ScanScheduler {
             if let Some(duration) = scan_type.interval() {
                 let db = self.db.clone();
                 join_set.spawn(async move {
-                    let mut interval = tokio::time::interval(duration);
+                    let mut interval = crate::runtime::task::interval(duration);
                     loop {
                         interval.tick().await;
                         let names = db.records_for_scan(scan_type).await;

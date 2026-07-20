@@ -428,10 +428,11 @@ impl Drop for DbSubscription {
         // Drop runs in sync context but we need an async write lock.
         // Spawn a fire-and-forget cleanup task. If no tokio runtime is
         // current (e.g., subscription created in a sync test that
-        // never started a runtime), `tokio::spawn` will panic — but
-        // that scenario can't have an active subscription anyway.
+        // never started a runtime), `task::spawn` will panic (it
+        // delegates to `tokio::spawn`) — but that scenario can't have
+        // an active subscription anyway.
         if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::spawn(async move {
+            crate::runtime::task::spawn(async move {
                 record.write().remove_subscriber(sid);
             });
         }
@@ -489,7 +490,7 @@ impl DbMultiMonitor {
                 }
             }
             // No events ready — yield briefly then retry
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            crate::runtime::task::sleep(Duration::from_millis(10)).await;
         }
     }
 }

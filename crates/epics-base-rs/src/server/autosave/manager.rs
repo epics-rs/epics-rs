@@ -100,7 +100,7 @@ impl AutosaveManager {
 
     /// Start all periodic/triggered/onchange tasks. Returns a join handle.
     pub fn start(self: Arc<Self>, db: Arc<PvDatabase>) -> JoinHandle<()> {
-        tokio::spawn(async move {
+        crate::runtime::task::spawn(async move {
             let mut handles = Vec::new();
 
             for (set, lock) in &self.sets {
@@ -112,8 +112,8 @@ impl AutosaveManager {
 
                 let handle = match set.config().strategy.clone() {
                     SaveStrategy::Periodic { interval } => {
-                        tokio::spawn(async move {
-                            let mut ticker = tokio::time::interval(interval);
+                        crate::runtime::task::spawn(async move {
+                            let mut ticker = crate::runtime::task::interval(interval);
                             ticker.tick().await; // first tick is immediate, skip it
                             loop {
                                 tokio::select! {
@@ -138,8 +138,8 @@ impl AutosaveManager {
                         mode,
                         poll_interval,
                     } => {
-                        tokio::spawn(async move {
-                            let mut ticker = tokio::time::interval(poll_interval);
+                        crate::runtime::task::spawn(async move {
+                            let mut ticker = crate::runtime::task::interval(poll_interval);
                             let mut last_value: Option<String> = None;
                             let mut armed = true; // For NonZero: armed when last was 0
 
@@ -203,8 +203,8 @@ impl AutosaveManager {
                     SaveStrategy::OnChange {
                         min_interval,
                         float_epsilon,
-                    } => tokio::spawn(async move {
-                        let mut ticker = tokio::time::interval(min_interval);
+                    } => crate::runtime::task::spawn(async move {
+                        let mut ticker = crate::runtime::task::interval(min_interval);
                         let mut last_snapshot: HashMap<String, String> = HashMap::new();
 
                         loop {

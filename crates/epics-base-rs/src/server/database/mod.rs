@@ -871,7 +871,7 @@ impl PvDatabase {
             if tokio::time::Instant::now() >= deadline {
                 return (connected, total);
             }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            crate::runtime::task::sleep(std::time::Duration::from_millis(100)).await;
         }
     }
 
@@ -1222,7 +1222,7 @@ impl PvDatabase {
             DbInitPhase::Loading(queued) => queued.push(Box::pin(init)),
             DbInitPhase::Unloaded | DbInitPhase::Running => {
                 drop(phase);
-                tokio::spawn(init);
+                crate::runtime::task::spawn(init);
             }
         }
     }

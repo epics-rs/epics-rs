@@ -508,7 +508,7 @@ impl SseqRecord {
         if let Some((name, handle)) = &self.async_ctx {
             let name = name.clone();
             let handle = handle.clone();
-            tokio::spawn(async move {
+            crate::runtime::task::spawn(async move {
                 let _ = handle.post_fields(&name, fields);
             });
         }
@@ -801,7 +801,7 @@ impl SseqRecord {
             let handle = handle.clone();
             let wake = wake.clone();
             let link = self.steps[i].lnk.clone();
-            tokio::spawn(async move {
+            crate::runtime::task::spawn(async move {
                 if let Some(rx) = handle
                     .put_link_notify(&name, LNK_FIELDS[i], &link, value)
                     .await
@@ -835,7 +835,7 @@ impl SseqRecord {
         let name = name.clone();
         let handle = handle.clone();
         let wake = wake.clone();
-        tokio::spawn(async move {
+        crate::runtime::task::spawn(async move {
             wake.notified().await;
             reenter_now(&name, &handle).await;
         });
@@ -911,7 +911,7 @@ impl SseqRecord {
         if let Some((name, handle)) = &self.async_ctx {
             let name = name.clone();
             let handle = handle.clone();
-            tokio::spawn(async move {
+            crate::runtime::task::spawn(async move {
                 handle.cancel_async_reentry(&name).await;
                 reenter_now(&name, &handle).await;
             });

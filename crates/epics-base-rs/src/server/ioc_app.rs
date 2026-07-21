@@ -698,6 +698,11 @@ impl IocApplication {
                 // callback bands get, so the same class they use.
                 .stack_size(crate::runtime::task::StackSizeClass::Big.bytes())
                 .spawn(move || {
+                    // No EPICS band: this runs the startup script once and
+                    // exits, it is not a scheduled IOC role. It still names
+                    // itself, because a startup script that hangs is exactly
+                    // what an RTEMS task listing is consulted about.
+                    crate::runtime::task::name_current_thread();
                     let shell = iocsh::IocShell::new(db1, h1);
                     for cmd in startup_commands {
                         shell.register(cmd);
@@ -1035,6 +1040,8 @@ impl IocApplication {
                 // Same reasoning as "iocsh-startup" above.
                 .stack_size(crate::runtime::task::StackSizeClass::Big.bytes())
                 .spawn(move || {
+                    // Same reasoning as "iocsh-startup" above.
+                    crate::runtime::task::name_current_thread();
                     let shell = iocsh::IocShell::new(db1, h1);
                     for cmd in shell_cmds_clone {
                         shell.register(cmd);

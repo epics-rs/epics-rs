@@ -603,6 +603,95 @@ pub fn apply_to_current_thread_under(
     }
 }
 
+/// The prologue an IOC thread runs as its first statement, when it takes on
+/// its role: publish its name to the OS, then request its scheduling band.
+///
+/// Two things a thread owes the operator, and they have different gates.
+/// The band is opt-in ([`RT_PRIORITY_ENV`]) and best effort. The **name** is
+/// unconditional: a thread that cannot be identified in a task listing
+/// cannot be diagnosed, and on RTEMS that listing is often the only
+/// instrument there is — bring-up had to measure libbsd's priority band by
+/// other means precisely because none of our threads carried a name the
+/// kernel could show.
+///
+/// Use this rather than [`apply_to_current_thread`] at a thread's entry, so
+/// naming cannot be forgotten by the next thread somebody adds. Call
+/// [`apply_to_current_thread`] directly only when re-banding a thread that
+/// is already named and running. A thread that deliberately takes no EPICS
+/// band — the iocsh script runners — calls [`name_current_thread`] alone
+/// rather than inventing a priority just to be visible.
+pub fn enter_ioc_thread(priority: ThreadPriority) -> PriorityApplied {
+    name_current_thread();
+    apply_to_current_thread(priority)
+}
+
+/// Push `std::thread::current().name()` down to the OS thread object.
+///
+/// No-op off RTEMS: `std` already calls the platform's `pthread_setname_np`
+/// from `Builder::spawn` on every hosted target it supports. RTEMS is not in
+/// that list, so a name set with `Builder::name` lives only in Rust's own
+/// `Thread` struct and never reaches the kernel — which is what makes our
+/// threads invisible to an RTEMS task listing.
+#[cfg(not(target_os = "rtems"))]
+pub fn name_current_thread() {}
+
+/// RTEMS: `pthread_setname_np` (`cpukit/posix/src/pthreadsetnamenp.c`) into
+/// `_Thread_Set_name`, which `strlcpy`s into `_Thread_Maximum_name_size`.
+///
+/// That size is `CONFIGURE_MAXIMUM_THREAD_NAME_SIZE`, default **16**
+/// including the NUL (`rtems/score/thread.h:1079`,
+/// `rtems/confdefs/threads.h:92-93`), and the boot shim does not override
+/// it — so 15 usable bytes, the same budget `std` truncates to on Linux
+/// (`TASK_COMM_LEN`). Truncating here rather than letting the kernel do it
+/// keeps that existing rule and keeps the call's success unambiguous:
+/// `_Thread_Set_name` still *sets* an over-long name, it just also returns
+/// `STATUS_RESULT_TOO_LARGE` → `ERANGE`, so an untruncated call would report
+/// failure for a name it had in fact applied.
+#[cfg(target_os = "rtems")]
+pub fn name_current_thread() {
+    let current = std::thread::current();
+    let Some(name) = current.name() else {
+        return;
+    };
+    let Ok(c_name) = std::ffi::CString::new(truncate_thread_name(name)) else {
+        // An interior NUL cannot come from `Builder::name`, which takes a
+        // `String`; nothing to publish if one ever did.
+        return;
+    };
+    // SAFETY: `pthread_setname_np` acts on the calling thread and reads a
+    // NUL-terminated string that outlives the call.
+    let rc =
+        unsafe { rtems_sched::pthread_setname_np(rtems_sched::pthread_self(), c_name.as_ptr()) };
+    if rc != 0 {
+        tracing::debug!(
+            target: "epics_base_rs::runtime",
+            thread = name,
+            errno = rc,
+            "pthread_setname_np failed; thread stays unnamed in the task listing"
+        );
+    }
+}
+
+/// `CONFIGURE_MAXIMUM_THREAD_NAME_SIZE` (default 16) minus the NUL.
+#[cfg(any(target_os = "rtems", test))]
+const RTEMS_MAX_THREAD_NAME_BYTES: usize = 15;
+
+/// Cut a thread name to what an RTEMS thread object can hold, on a UTF-8
+/// boundary.
+///
+/// Byte budget, not character count — `_Thread_Set_name` `strlcpy`s bytes —
+/// but never mid-codepoint, or the task listing shows invalid UTF-8. Kept as
+/// a pure function so the rule is testable on the host, where the caller
+/// that applies it does not exist.
+#[cfg(any(target_os = "rtems", test))]
+fn truncate_thread_name(name: &str) -> &str {
+    let mut end = name.len().min(RTEMS_MAX_THREAD_NAME_BYTES);
+    while end > 0 && !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    &name[..end]
+}
+
 /// The SCHED_FIFO priority range this process may actually enter.
 ///
 /// C parity: `find_pri_range` (`osdThread.c:259-314`). The kernel's
@@ -873,6 +962,9 @@ mod rtems_sched {
             policy: c_int,
             param: *const SchedParam,
         ) -> c_int;
+        /// `cpukit/posix/src/pthreadsetnamenp.c`. Also absent from `libc`'s
+        /// `newlib/rtems` module.
+        pub fn pthread_setname_np(thread: libc::pthread_t, name: *const std::ffi::c_char) -> c_int;
     }
 }
 
@@ -1036,7 +1128,7 @@ where
     R: Send + 'static,
 {
     tokio::task::spawn_blocking(move || {
-        let _ = apply_to_current_thread(priority);
+        let _ = enter_ioc_thread(priority);
         f()
     })
 }
@@ -1126,7 +1218,7 @@ where
             // timer reachable from this thread, and therefore what lets a future
             // written for the hosted driver run unchanged under `block_on_sync`.
             let _ambient = ambient.as_ref().map(|h| h.enter());
-            let _ = apply_to_current_thread(priority);
+            let _ = enter_ioc_thread(priority);
             f()
         })
 }
@@ -1147,7 +1239,7 @@ where
         .name(name)
         .stack_size(stack.bytes())
         .spawn(move || {
-            let _ = apply_to_current_thread(priority);
+            let _ = enter_ioc_thread(priority);
             f()
         })
 }
@@ -1674,6 +1766,164 @@ mod tests {
         assert_eq!(
             map_epics_priority(99, min, max) - map_epics_priority(0, min, max),
             250
+        );
+    }
+
+    /// The name budget an RTEMS thread object actually has:
+    /// `CONFIGURE_MAXIMUM_THREAD_NAME_SIZE` defaults to 16 *including* the
+    /// NUL (`rtems/score/thread.h:1079`, `rtems/confdefs/threads.h:92-93`)
+    /// and the boot shim does not override it, so 15 bytes — the same budget
+    /// `std` truncates to on Linux.
+    ///
+    /// Truncating here rather than letting `_Thread_Set_name` do it is what
+    /// keeps the call's result meaningful: that function `strlcpy`s and
+    /// *still applies* the truncated name, but returns
+    /// `STATUS_RESULT_TOO_LARGE` → `ERANGE`, so an untruncated call would log
+    /// a failure for a name it had in fact set.
+    #[test]
+    fn thread_names_are_cut_to_the_rtems_budget_on_a_char_boundary() {
+        assert_eq!(RTEMS_MAX_THREAD_NAME_BYTES, 15);
+        // Short names pass through untouched.
+        assert_eq!(truncate_thread_name("CAS-event"), "CAS-event");
+        // Exactly at the budget.
+        assert_eq!(truncate_thread_name("123456789012345"), "123456789012345");
+        // Over it — a real per-client CA thread name.
+        assert_eq!(
+            truncate_thread_name("CAS-client-blocking 10.0.0.1:5064"),
+            "CAS-client-blo"[..14].to_owned() + "c"
+        );
+        assert!(truncate_thread_name("CAS-client-blocking 10.0.0.1:5064").len() <= 15);
+        // Never mid-codepoint: 'é' is two bytes, so a cut landing inside it
+        // must step back rather than produce invalid UTF-8. 14 ASCII bytes
+        // plus 'é' is 16 bytes; the budget cuts at 15, inside the 'é'.
+        let mixed = "aaaaaaaaaaaaaaé";
+        assert_eq!(mixed.len(), 16);
+        assert_eq!(truncate_thread_name(mixed), "aaaaaaaaaaaaaa");
+        // Empty stays empty rather than underflowing the boundary walk.
+        assert_eq!(truncate_thread_name(""), "");
+    }
+
+    /// Every thread this crate starts publishes its name to the OS.
+    ///
+    /// `std` calls the platform `pthread_setname_np` from `Builder::spawn`
+    /// on the hosted targets it supports, and RTEMS is not one of them — so
+    /// there, a name set with `Builder::name` lives only in Rust's `Thread`
+    /// struct and the kernel shows nothing. Bring-up had to measure libbsd's
+    /// priority band by other means for exactly that reason.
+    ///
+    /// The defect is a call that is *absent*, so this is source inspection
+    /// over every production `Builder` site in the crate — the same sweep
+    /// shape as `every_thread_in_this_crate_states_a_stack_size`, and it
+    /// fails the same way when a new thread forgets. Either prologue counts:
+    /// `enter_ioc_thread` for a thread with an EPICS band, bare
+    /// `name_current_thread` for one that deliberately has none.
+    #[test]
+    fn every_thread_in_this_crate_publishes_its_name() {
+        let files = [
+            ("runtime/task.rs", include_str!("task.rs")),
+            (
+                "runtime/background/delayed_timer.rs",
+                include_str!("background/delayed_timer.rs"),
+            ),
+            (
+                "runtime/background/scan_once.rs",
+                include_str!("background/scan_once.rs"),
+            ),
+            (
+                "runtime/background/callback_executor.rs",
+                include_str!("background/callback_executor.rs"),
+            ),
+            ("server/ioc_app.rs", include_str!("../server/ioc_app.rs")),
+        ];
+        // The one exemption, named rather than pattern-matched: the
+        // SCHED_FIFO range probe is `#[cfg(target_os = "linux")]`, exists for
+        // two `sched_*` calls and a join, and never runs on the target whose
+        // task listing this guard is about.
+        const EXEMPT: &str = ".name(\"cbRtProbe\".to_string())";
+
+        let mut anonymous = Vec::new();
+        let mut checked = 0usize;
+        for (label, src) in files {
+            for (n, after) in production_scope(src)
+                .split("thread::Builder::new()")
+                .skip(1)
+                .enumerate()
+            {
+                let (chain, body) = after.split_once(".spawn(").unwrap_or((after, ""));
+                if chain.contains(EXEMPT) {
+                    continue;
+                }
+                checked += 1;
+                // The prologue is the closure's first work, so look at the
+                // closure, not the builder chain.
+                if !body.contains("enter_ioc_thread(") && !body.contains("name_current_thread()") {
+                    anonymous.push(format!("{label} (Builder #{})", n + 1));
+                }
+            }
+        }
+
+        assert!(
+            checked >= 5,
+            "expected to find the crate's Builder sites, found {checked} — \
+             did a file move? update this guard's file list"
+        );
+        assert!(
+            anonymous.is_empty(),
+            "these threads are invisible in an RTEMS task listing: {anonymous:?}"
+        );
+    }
+
+    /// The banding half of the prologue is not reachable without the naming
+    /// half: nothing in this crate's production scope calls
+    /// [`apply_to_current_thread`] except [`enter_ioc_thread`] itself.
+    ///
+    /// Separate from the sweep above because it catches the other direction —
+    /// a thread that is named by `Builder` but takes its band directly, which
+    /// the closure-body sweep would pass if the naming call happened to be
+    /// somewhere else in the file.
+    #[test]
+    fn only_the_prologue_reaches_the_banding_call() {
+        let files = [
+            ("runtime/task.rs", include_str!("task.rs")),
+            (
+                "runtime/background/delayed_timer.rs",
+                include_str!("background/delayed_timer.rs"),
+            ),
+            (
+                "runtime/background/scan_once.rs",
+                include_str!("background/scan_once.rs"),
+            ),
+            (
+                "runtime/background/callback_executor.rs",
+                include_str!("background/callback_executor.rs"),
+            ),
+            ("server/ioc_app.rs", include_str!("../server/ioc_app.rs")),
+        ];
+        // Only the definition and the prologue's own delegation, both in
+        // task.rs. Anywhere else is a thread banded without being named.
+        let allowed = [
+            "pub fn apply_to_current_thread(priority: ThreadPriority) -> PriorityApplied {",
+            "apply_to_current_thread(priority)",
+        ];
+        let mut seen_definition = false;
+        for (label, src) in files {
+            let callers: Vec<&str> = production_scope(src)
+                .lines()
+                .map(str::trim)
+                .filter(|l| l.contains("apply_to_current_thread("))
+                .filter(|l| !l.starts_with("//"))
+                .collect();
+            seen_definition |= callers.contains(&allowed[0]);
+            let strays: Vec<&&str> = callers.iter().filter(|l| !allowed.contains(l)).collect();
+            assert!(
+                strays.is_empty(),
+                "{label}: only `enter_ioc_thread` may band a thread; \
+                 everything else would band an OS-anonymous one — {strays:?}"
+            );
+        }
+        assert!(
+            seen_definition,
+            "the banding function moved out of this file list; update the guard"
         );
     }
 

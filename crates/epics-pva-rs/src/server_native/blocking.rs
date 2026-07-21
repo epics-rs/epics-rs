@@ -120,7 +120,7 @@ use std::time::{Duration, Instant};
 
 use epics_base_rs::runtime::task::spawn_dedicated_thread;
 use epics_base_rs::runtime::task::{
-    StackSizeClass, ThreadPriority, apply_to_current_thread, block_on_sync,
+    StackSizeClass, ThreadPriority, block_on_sync, enter_ioc_thread,
 };
 use tokio::io::ReadBuf;
 use tokio::sync::mpsc;
@@ -974,7 +974,7 @@ impl BlockingPvaServer {
     /// give it a thread of its own rather than calling it on a thread that has
     /// other work.
     pub fn serve(&self) {
-        let _ = apply_to_current_thread(PVA_SERVER_PRIORITY);
+        let _ = enter_ioc_thread(PVA_SERVER_PRIORITY);
         for stream in self.listener.incoming() {
             match stream {
                 Ok(stream) => {
@@ -1211,7 +1211,7 @@ fn handle_udp_search_blocking(
     socket
         .set_read_timeout(Some(UDP_STOP_TICK))
         .map_err(PvaError::Io)?;
-    let _ = apply_to_current_thread(PVA_UDP_PRIORITY);
+    let _ = enter_ioc_thread(PVA_UDP_PRIORITY);
     let mut buf = vec![0u8; UDP_RECV_BUF];
 
     while !shutdown.load(Ordering::Acquire) {
@@ -2592,29 +2592,41 @@ mod tests {
         );
     }
 
-    /// Both loops take their priority at the top of the thread they run on,
-    /// and there are exactly two such loops. A third `apply_to_current_thread`
+    /// Both loops enter their thread role at the top of the thread they run
+    /// on, and there are exactly two such loops. A third `enter_ioc_thread`
     /// would mean a loop nobody assigned a number to, or a number assigned
     /// twice.
+    ///
+    /// The prologue is `enter_ioc_thread`, not `apply_to_current_thread`:
+    /// the former also publishes the thread's name to the OS, which on RTEMS
+    /// is the only way a name set with `Builder::name` reaches a task
+    /// listing. A loop that took only its priority would run anonymous
+    /// there, so the bare form is asserted absent rather than merely
+    /// uncounted.
     #[test]
     fn both_serve_loops_take_their_priority_at_the_top() {
         let prod = production_scope(include_str!("blocking.rs"));
         assert_eq!(
-            prod.matches("apply_to_current_thread(").count(),
+            prod.matches("enter_ioc_thread(").count(),
             2,
             "the accept loop and the UDP responder, each on the thread it blocks"
         );
         assert_eq!(
-            prod.matches("apply_to_current_thread(PVA_SERVER_PRIORITY)")
+            prod.matches("enter_ioc_thread(PVA_SERVER_PRIORITY)")
                 .count(),
             1,
             "the accept loop runs at 18"
         );
         assert_eq!(
-            prod.matches("apply_to_current_thread(PVA_UDP_PRIORITY)")
-                .count(),
+            prod.matches("enter_ioc_thread(PVA_UDP_PRIORITY)").count(),
             1,
             "the UDP responder runs at 16"
+        );
+        assert_eq!(
+            prod.matches("apply_to_current_thread(").count(),
+            0,
+            "a thread entry that skips the naming half of the prologue is \
+             invisible in an RTEMS task listing"
         );
     }
 

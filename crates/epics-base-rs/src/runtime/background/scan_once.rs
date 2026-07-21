@@ -31,7 +31,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
-use crate::runtime::task::{StackSizeClass, ThreadPriority, apply_to_current_thread};
+use crate::runtime::task::{StackSizeClass, ThreadPriority, enter_ioc_thread};
 
 /// A queued "process this record" tail. C stores `{prec, cb, usr}`
 /// (`dbScan.c:668-672`); the Rust port boxes a closure that already captures
@@ -178,7 +178,7 @@ impl ScanOnceQueue {
                 // dbScan.c:776 — priority `epicsThreadPriorityScanLow + nPeriodic`.
                 // With no periodic scan lists wired this increment, `nPeriodic`
                 // is 0, so the band is exactly ScanLow.
-                let _ = apply_to_current_thread(ThreadPriority::ScanLow);
+                let _ = enter_ioc_thread(ThreadPriority::ScanLow);
                 once_loop(&worker_inner);
             })
             .expect("failed to spawn scanOnce worker thread");

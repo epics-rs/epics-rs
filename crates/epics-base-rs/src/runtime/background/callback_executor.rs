@@ -32,7 +32,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
-use crate::runtime::task::{StackSizeClass, ThreadPriority, apply_to_current_thread};
+use crate::runtime::task::{StackSizeClass, ThreadPriority, enter_ioc_thread};
 
 /// A unit of deferred work. The C `epicsCallback` is a function pointer plus
 /// user data; the Rust port boxes a `FnOnce` closure that already captures its
@@ -298,7 +298,7 @@ impl CallbackPool {
                     .spawn(move || {
                         // callback.c:322 — `opts.priority = threadPriority[i]`,
                         // applied best-effort to this OS thread.
-                        let _ = apply_to_current_thread(prio.os_priority());
+                        let _ = enter_ioc_thread(prio.os_priority());
                         worker_loop(&pq);
                     })
                     .expect("failed to spawn callback worker thread");

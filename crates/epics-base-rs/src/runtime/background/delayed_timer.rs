@@ -24,7 +24,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use super::callback_executor::{Callback, CallbackHandle, CallbackPriority};
-use crate::runtime::task::{ThreadPriority, apply_to_current_thread};
+use crate::runtime::task::{ThreadPriority, enter_ioc_thread};
 
 /// How a due timer entry is run when its deadline arrives.
 enum TimerAction {
@@ -240,7 +240,7 @@ impl DelayedTimer {
                 // callback still preempts the timer.
                 // Best effort, and only when the RT switch is on
                 // (`runtime::task::RT_PRIORITY_ENV`).
-                let _ = apply_to_current_thread(ThreadPriority::ScanHigh);
+                let _ = enter_ioc_thread(ThreadPriority::ScanHigh);
                 timer_loop(&worker_inner)
             })
             .expect("failed to spawn delayed-callback timer thread");

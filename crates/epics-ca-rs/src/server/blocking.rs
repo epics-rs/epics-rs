@@ -105,7 +105,7 @@ use std::time::Duration;
 
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::runtime::task::{
-    StackSizeClass, ThreadPriority, apply_to_current_thread, block_on_sync,
+    StackSizeClass, ThreadPriority, block_on_sync, enter_ioc_thread, name_current_thread,
 };
 use epics_base_rs::server::access_security::AccessSecurityConfig;
 use epics_base_rs::server::database::PvDatabase;
@@ -190,6 +190,11 @@ impl BlockingCaServer {
     /// spawn, `caservertask.c:109`); client threads are detached and exit on
     /// disconnect.
     pub fn serve(&self) {
+        // `CAS-TCP` takes no EPICS band — it accepts and hands off, and the
+        // per-client thread is where the depth is — but it must still be
+        // identifiable in an RTEMS task listing, where `Builder::name` alone
+        // never reaches the kernel.
+        name_current_thread();
         for stream in self.listener.incoming() {
             match stream {
                 Ok(stream) => {
@@ -218,7 +223,7 @@ impl BlockingCaServer {
                             // epicsThreadPriorityCAServerLow, ...)`. Best
                             // effort, and only when the RT switch is on
                             // (`runtime::task::RT_PRIORITY_ENV`).
-                            let _ = apply_to_current_thread(ThreadPriority::CaServerLow);
+                            let _ = enter_ioc_thread(ThreadPriority::CaServerLow);
                             if let Err(e) = handle_client_blocking(stream, peer, db, acf, tcp_port)
                             {
                                 tracing::debug!(
@@ -282,6 +287,8 @@ impl BlockingCaServer {
     /// drive the shared `udp::parse_search_datagram` and shape via
     /// `SearchReplyBatch`.
     pub fn serve_udp_search(&self, socket: UdpSocket) -> CaResult<()> {
+        // Same as `serve`: `CAS-UDP` is unbanded but must not be anonymous.
+        name_current_thread();
         handle_udp_search_blocking(socket, self.db.clone(), self.tcp_port, &self.shutdown)
     }
 }
@@ -692,7 +699,7 @@ fn handle_client_blocking(
             // reading cannot starve command dispatch. (C's helper subtracts
             // a further OS-range step at osdThread.c:874, landing on 18 for a
             // full Linux FIFO range; the EPICS-space ordering is the same.)
-            let _ = apply_to_current_thread(ThreadPriority::Custom(
+            let _ = enter_ioc_thread(ThreadPriority::Custom(
                 ThreadPriority::CaServerLow.value() - 1,
             ));
             let mut write = |frame: &[u8]| write_frame_locked(&event_send_lock, frame);
@@ -1094,6 +1101,49 @@ mod tests {
             unclassified.is_empty(),
             "these CA threads inherit std's 2 MiB default on RTEMS: {unclassified:?}"
         );
+    }
+
+    /// Every CA server thread is identifiable in an RTEMS task listing.
+    ///
+    /// `std` calls the platform `pthread_setname_np` from `Builder::spawn`
+    /// only on the hosted targets it supports, and RTEMS is not one — so a
+    /// name set with `Builder::name` never reaches the kernel there and the
+    /// thread shows up nameless. Each of the four CA server threads must
+    /// therefore publish its own name: the two that have an EPICS band do it
+    /// through `enter_ioc_thread`, and `CAS-TCP`/`CAS-UDP`, which are
+    /// deliberately unbanded, call `name_current_thread` at the top of
+    /// `serve`/`serve_udp_search` rather than inventing a priority just to be
+    /// visible.
+    ///
+    /// Source inspection, because the defect is a call that is *absent*.
+    /// Fails today, on Linux, with no cross toolchain.
+    #[test]
+    fn every_ca_server_thread_publishes_its_name() {
+        let prod = production_scope(include_str!("blocking.rs"));
+
+        // The two banded threads, through the prologue.
+        assert_eq!(
+            prod.matches("enter_ioc_thread(").count(),
+            2,
+            "the per-client receiver and the per-client event sender"
+        );
+        assert_eq!(
+            prod.matches("apply_to_current_thread(").count(),
+            0,
+            "banding without naming leaves an RTEMS-anonymous thread"
+        );
+        // The two unbanded ones, by name, at the entry of the loop each runs.
+        for entry in ["pub fn serve(&self) {", "pub fn serve_udp_search("] {
+            let at = prod
+                .find(entry)
+                .unwrap_or_else(|| panic!("{entry} moved; update this guard"));
+            let head = &prod[at..(at + 600).min(prod.len())];
+            assert!(
+                head.contains("name_current_thread()"),
+                "{entry} must name its thread; CAS-TCP/CAS-UDP are otherwise \
+                 anonymous on target"
+            );
+        }
     }
 
     use epics_base_rs::server::record::{FieldDesc, ProcessOutcome, Record, RecordProcessResult};

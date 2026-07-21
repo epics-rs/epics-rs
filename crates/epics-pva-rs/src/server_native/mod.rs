@@ -1,5 +1,11 @@
 //! Native pvAccess server runtime.
+//!
+//! [`accept`] is the TCP side's only socket-bearing module; [`tcp`] and the
+//! protocol code behind it speak `AsyncRead`/`AsyncWrite` trait objects, so a
+//! second (blocking) driver is an addition beside [`accept`] rather than a
+//! `cfg` threaded through the protocol (`doc/pva-rtems-item7-design.md` §6).
 
+pub mod accept;
 pub mod composite;
 pub mod monitor_control;
 pub mod op_handle;

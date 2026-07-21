@@ -1,6 +1,6 @@
-//! TCP listener + per-connection handler.
+//! Per-connection handler.
 //!
-//! For each accepted client we spawn one task that:
+//! For each accepted client [`super::accept`] runs one task that:
 //!
 //! 1. Sends SET_BYTE_ORDER + CONNECTION_VALIDATION request
 //! 2. Reads client's CONNECTION_VALIDATION response (auth)
@@ -9,15 +9,24 @@
 //!    GET_FIELD / DESTROY_REQUEST / DESTROY_CHANNEL).
 //!
 //! Channel state is kept per-connection (a `HashMap<sid, ChannelState>`).
+//!
+//! This module owns no socket. The connection enters through
+//! [`handle_connection_io`], whose reader and writer are
+//! `Box<dyn AsyncRead/AsyncWrite>` trait objects — which driver produced
+//! them (the host accept loop in [`super::accept`], or the blocking
+//! thread-per-client driver coming with RTEMS phase 6 item 7) is not
+//! visible from here.
+//!
+//! No socket type is named anywhere in this file's production scope, and
+//! `accept::tests::the_protocol_scope_owns_no_socket` keeps it that way.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -35,6 +44,13 @@ use crate::pvdata::{FieldDesc, NoConvert, PvField, RpcReply};
 
 use super::runtime::PvaServerConfig;
 use super::source::{ChannelInvalidator, DynSource, OpError};
+
+// The accept loop moved to [`super::accept`] (RTEMS phase 6 item 7 stage A);
+// these re-exports keep `server_native::tcp::run_tcp_server*` resolving for
+// every existing caller and doc link. Owed when this branch combines with
+// `phase6/pva-rtems-dep-gate`: `accept` is host-only there, so these three
+// names need the same `#[cfg(not(target_os = "rtems"))]` the module gets.
+pub use super::accept::{run_tcp_server, run_tcp_server_on_listener, run_tcp_server_with_peers};
 
 // pvxs seeds each ID namespace from a distinct non-zero base (commit
 // 3b641bed) so a value used as the wrong ID type fails loudly instead of
@@ -2425,307 +2441,6 @@ impl OpKind {
     }
 }
 
-/// Run the TCP listener forever. Backwards-compat wrapper that
-/// drops per-peer stats — equivalent to calling
-/// [`run_tcp_server_with_peers`] with an empty registry the caller
-/// can never read.
-pub async fn run_tcp_server(
-    source: DynSource,
-    bind_addr: SocketAddr,
-    config: PvaServerConfig,
-) -> PvaResult<()> {
-    run_tcp_server_with_peers(
-        source,
-        bind_addr,
-        config,
-        crate::server_native::peers::PeerRegistry::new(),
-    )
-    .await
-}
-
-/// Run the TCP listener with an externally-shared
-/// [`PeerRegistry`](crate::server_native::PeerRegistry). lets [`crate::server_native::PvaServer::report`]
-/// observe per-connection stats.
-pub async fn run_tcp_server_with_peers(
-    source: DynSource,
-    bind_addr: SocketAddr,
-    config: PvaServerConfig,
-    peers: Arc<crate::server_native::peers::PeerRegistry>,
-) -> PvaResult<()> {
-    let listener = TcpListener::bind(bind_addr).await.map_err(PvaError::Io)?;
-    // Standalone single-listener path (not driven by `PvaServer`): create
-    // and wire the channel invalidator here so a source served this way —
-    // e.g. a PVA gateway — still force-disconnects downstream channels on an
-    // operator `:drop`/`:flush`. `PvaServer`'s multi-listener path creates it
-    // once in `run_pva_server` and shares the one handle across every TCP/UDP
-    // listener; here there is a single listener, so a local handle suffices.
-    let channel_invalidator = ChannelInvalidator::new();
-    source.set_channel_invalidator(channel_invalidator.clone());
-    run_tcp_server_on_listener(source, listener, config, peers, channel_invalidator).await
-}
-
-/// Variant that takes a pre-bound [`TcpListener`]. Lets
-/// [`crate::server_native::PvaServer::start`] perform the bind
-/// synchronously (so the bound port is observable to callers) and
-/// then hand the listener to the spawned accept task. Eliminates
-/// the bind-race window that existed when the spawn-and-bind happened
-/// inside the spawned task — concurrent isolated tests can no longer
-/// have their picked-then-dropped ephemeral ports stolen by a peer.
-pub async fn run_tcp_server_on_listener(
-    source: DynSource,
-    listener: TcpListener,
-    config: PvaServerConfig,
-    peers: Arc<crate::server_native::peers::PeerRegistry>,
-    // Server-wide channel invalidator. Each accepted connection holds a
-    // receiver; a source publishes the PV name(s) of any channel that must
-    // be force-disconnected out of band (PVA gateway operator `:drop`/`:flush`).
-    // See [`ChannelSource::set_channel_invalidator`].
-    channel_invalidator: ChannelInvalidator,
-) -> PvaResult<()> {
-    let bind_addr = listener.local_addr().map_err(PvaError::Io)?;
-    debug!(?bind_addr, "TCP listener up");
-    let active = Arc::new(AtomicUsize::new(0));
-
-    let tls_acceptor = config
-        .tls
-        .as_ref()
-        .map(|cfg| tokio_rustls::TlsAcceptor::from(cfg.config.clone()));
-
-    // track per-connection tasks in a JoinSet so they're
-    // aborted as a unit when this accept-loop future is dropped (e.g.
-    // PvaServer::stop() → tcp_handle.abort()). Without this, every
-    // per-conn task ran detached and lingered until its internal
-    // idle_timeout (~45s). The select! arm on `conn_tasks.join_next()`
-    // also reaps completed tasks so the set doesn't accumulate
-    // finished JoinHandles.
-    let mut conn_tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
-
-    loop {
-        let accept_result = tokio::select! {
-            biased;
-            res = listener.accept() => res,
-            // Drain finished connection tasks. Returns None when the
-            // set is empty — that branch resolves immediately, but
-            // `biased` makes the listener arm preferred so we never
-            // starve incoming accepts.
-            Some(_) = conn_tasks.join_next() => continue,
-        };
-        match accept_result {
-            Ok((stream, peer)) => {
-                // pvxs scopes `ignoreAddrs` to the UDP SEARCH admission
-                // path (`Server::Pvt::onSearch`, server.cpp:654-670); the
-                // TCP accept callback registers a `ServerConn` with no
-                // ignore-list check (serverconn.cpp:461-467). Applying it
-                // to TCP accepts here turned a discovery filter into a
-                // transport ACL, blocking direct clients that reach the
-                // endpoint via a name server / cached beacon / static
-                // address. The UDP path keeps the filter (`filter_inbound`).
-                let cur = active.fetch_add(1, Ordering::SeqCst);
-                if cur >= config.max_connections {
-                    active.fetch_sub(1, Ordering::SeqCst);
-                    warn!(
-                        ?peer,
-                        "rejecting connection: max_connections={}", config.max_connections
-                    );
-                    drop(stream);
-                    continue;
-                }
-                let src = source.clone();
-                let cfg = config.clone();
-                let active_dec = active.clone();
-                let acceptor = tls_acceptor.clone();
-                let peers_for_task = peers.clone();
-                let conn_invalidator = channel_invalidator.clone();
-                conn_tasks.spawn(async move {
-                    stream.set_nodelay(true).ok();
-                    // Enable OS-level TCP keepalive so half-open connections
-                    // (NAT timeout, dead client) are detected within ~30s
-                    // even when the protocol-level Echo path can't fire
-                    // (e.g. peer hasn't initialized control plane yet).
-                    // Defence-in-depth on top of the heartbeat ECHO timer:
-                    // pvxs itself does NOT set SO_KEEPALIVE — it relies on
-                    // libevent's `bufferevent_set_timeouts` for inactivity
-                    // detection. We add OS keepalive (CA-libca style) so a
-                    // pre-handshake half-open peer still gets reaped even
-                    // before the application timer arms.
-                    {
-                        let sock = socket2::SockRef::from(&stream);
-                        let keepalive = socket2::TcpKeepalive::new()
-                            .with_time(std::time::Duration::from_secs(15))
-                            .with_interval(std::time::Duration::from_secs(5));
-                        let _ = sock.set_keepalive(true);
-                        let _ = sock.set_tcp_keepalive(&keepalive);
-                    }
-
-                    // TLS-NAMESERVER: peek the first byte to dispatch
-                    // TLS vs plain PVA on a single port.
-                    //
-                    // TLS ClientHello record type = 0x16 — the TLS
-                    // client sends this IMMEDIATELY after TCP connect
-                    // (client-initiates). Plain PVA clients NEVER send
-                    // a first byte; the server sends SET_BYTE_ORDER first.
-                    //
-                    // Dispatch rule (pvxs uses separate listeners per
-                    // protocol via serverconn.h:193 `isTLS`; we unify):
-                    //   peek Ok(1) && byte == 0x16 → TLS path
-                    //   peek timeout (≤ 100 ms)    → plain PVA path
-                    //   peek Ok(1) && byte != 0x16  → plain PVA path
-                    //   peek Ok(0) / IO error       → drop (peer gone)
-                    //
-                    // 100 ms is enough for ClientHello to arrive (sent
-                    // immediately by TLS stack) while adding negligible
-                    // latency to plain PVA connections.
-                    const PEEK_WINDOW: Duration = Duration::from_millis(100);
-                    let is_tls_client = match acceptor.as_ref() {
-                        None => false,
-                        Some(_) => {
-                            let mut b = [0u8; 1];
-                            match tokio::time::timeout(PEEK_WINDOW, stream.peek(&mut b)).await {
-                                Ok(Ok(1)) => b[0] == 0x16,
-                                Ok(Ok(_)) => {
-                                    debug!(?peer, "peer closed before first byte");
-                                    active_dec.fetch_sub(1, Ordering::SeqCst);
-                                    return;
-                                }
-                                Ok(Err(e)) => {
-                                    debug!(?peer, "first-byte peek error: {e}");
-                                    active_dec.fetch_sub(1, Ordering::SeqCst);
-                                    return;
-                                }
-                                // Timeout → plain PVA client (server initiates).
-                                Err(_) => false,
-                            }
-                        }
-                    };
-
-                    // Anti-downgrade: when the operator requires TLS
-                    // (`disable_plaintext`), refuse a non-TLS peer before it
-                    // can reach the plain code path. pvxs enforces the
-                    // refusal on the CLIENT (it drops a plaintext SEARCH
-                    // reply, client.cpp:944); the Rust server unifies TLS +
-                    // plaintext on each listener via the peek above, so the
-                    // equivalent server-side guarantee lives here. Gated on
-                    // `acceptor.is_some()` so a misconfigured server with no
-                    // TLS identity does not refuse every connection (a server
-                    // cannot be TLS-only without TLS). A TLS ClientHello
-                    // (`is_tls_client`) is served normally below.
-                    if cfg.disable_plaintext && acceptor.is_some() && !is_tls_client {
-                        debug!(
-                            ?peer,
-                            "refusing plaintext connection: disable_plaintext set (TLS required)"
-                        );
-                        active_dec.fetch_sub(1, Ordering::SeqCst);
-                        return;
-                    }
-
-                    // register this connection in the peer registry
-                    // so PvaServer::report() can surface it. Deferred to
-                    // here (post-peek) so the `tls` flag reflects the
-                    // actual protocol, not the server config.
-                    let peer_entry = crate::server_native::peers::PeerEntry::new(is_tls_client);
-                    peers_for_task.insert(peer, peer_entry.clone());
-
-                    let result = match (acceptor, is_tls_client) {
-                        // cap the TLS handshake — a peer
-                        // that completes TCP but stalls during ClientHello
-                        // would otherwise hold a `max_connections` slot
-                        // until OS keepalive reaps it (~30s).
-                        (Some(a), true) => {
-                            match tokio::time::timeout(cfg.tls_handshake_timeout, a.accept(stream))
-                                .await
-                            {
-                                Ok(Ok(tls_stream)) => {
-                                    // derive the peer's x509 identity from
-                                    // the *verified* certificate chain before
-                                    // splitting the stream. rustls only
-                                    // exposes `peer_certificates()` on the
-                                    // whole `TlsStream`, and the chain has
-                                    // already passed `WebPkiClientVerifier`,
-                                    // so this is the cryptographically-checked
-                                    // identity (pvxs `fill_credentials`).
-                                    //
-                                    // use trust_roots so that `authority`
-                                    // is populated even when the peer sends a
-                                    // partial chain (leaf-only or leaf+CA),
-                                    // matching pvxs SSL_get0_verified_chain.
-                                    let x509_id = {
-                                        let (_, conn) = tls_stream.get_ref();
-                                        let roots =
-                                            cfg.tls.as_ref().map(|t| t.trust_roots.as_ref());
-                                        conn.peer_certificates().and_then(|chain| match roots {
-                                            Some(r) => {
-                                                crate::auth::x509_credentials_from_chain_with_roots(
-                                                    chain, r,
-                                                )
-                                            }
-                                            None => crate::auth::x509_credentials_from_chain(chain),
-                                        })
-                                    };
-                                    let (r, w) = tokio::io::split(tls_stream);
-                                    handle_connection_io(
-                                        src,
-                                        Box::new(r),
-                                        Box::new(w),
-                                        peer,
-                                        cfg,
-                                        ConnInit {
-                                            peer_entry: peer_entry.clone(),
-                                            x509_identity: x509_id,
-                                            channel_invalidator: conn_invalidator,
-                                        },
-                                    )
-                                    .await
-                                }
-                                Ok(Err(e)) => {
-                                    debug!(?peer, "TLS handshake failed: {e}");
-                                    Err(PvaError::Io(e))
-                                }
-                                Err(_) => {
-                                    debug!(
-                                        ?peer,
-                                        timeout = ?cfg.tls_handshake_timeout,
-                                        "TLS handshake timed out"
-                                    );
-                                    Err(PvaError::Protocol("TLS handshake timeout".into()))
-                                }
-                            }
-                        }
-                        _ => {
-                            // Plain PVA: no TLS configured, or client sent
-                            // non-TLS bytes (name-server, plain pvxs peer).
-                            let (r, w) = stream.into_split();
-                            handle_connection_io(
-                                src,
-                                Box::new(r),
-                                Box::new(w),
-                                peer,
-                                cfg,
-                                ConnInit {
-                                    peer_entry: peer_entry.clone(),
-                                    x509_identity: None,
-                                    channel_invalidator: conn_invalidator,
-                                },
-                            )
-                            .await
-                        }
-                    };
-                    if let Err(e) = result {
-                        debug!(?peer, "connection ended: {e}");
-                    }
-                    active_dec.fetch_sub(1, Ordering::SeqCst);
-                    // drop the per-peer entry whether the
-                    // connection ended cleanly or via I/O error.
-                    peers_for_task.remove(peer);
-                });
-            }
-            Err(e) => {
-                error!("accept error: {e}");
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        }
-    }
-}
-
 /// Identity used for per-connection authorisation.
 ///
 /// Mirrors pvxs `server::ClientCredentials` (serverconn.cpp:73-234).
@@ -3223,23 +2938,23 @@ type CcTx = mpsc::Sender<CreateChannelCompletion>;
 /// split stream to [`handle_connection_io`]: the peer's report entry, the
 /// verified mTLS identity (if any), and the server-wide channel-invalidation
 /// sender. Bundled to keep the IO handler's argument count within budget.
-struct ConnInit {
-    peer_entry: Arc<crate::server_native::peers::PeerEntry>,
+pub(super) struct ConnInit {
+    pub(super) peer_entry: Arc<crate::server_native::peers::PeerEntry>,
     /// x509 identity from the verified TLS peer chain, when this connection
     /// arrived over mutually-authenticated TLS. `None` for plain TCP or TLS
     /// without a client cert. When present it is the authoritative identity
     /// and overrides the CONNECTION_VALIDATION claim — mirrors pvxs
     /// `SSLContext::fill_credentials`.
-    x509_identity: Option<crate::auth::X509Credentials>,
+    pub(super) x509_identity: Option<crate::auth::X509Credentials>,
     /// Server-wide channel invalidator (see
     /// [`ChannelSource::set_channel_invalidator`]). Subscribed once below; a
     /// published PV name force-disconnects every channel this connection
     /// currently serves under that name with a server-initiated
     /// DESTROY_CHANNEL.
-    channel_invalidator: ChannelInvalidator,
+    pub(super) channel_invalidator: ChannelInvalidator,
 }
 
-async fn handle_connection_io(
+pub(super) async fn handle_connection_io(
     source: DynSource,
     mut reader: SrvRead,
     mut writer_raw: SrvWrite,
@@ -8400,10 +8115,17 @@ mod tests {
     /// target, not here. So pin it as source inspection: production scope
     /// must contain no `tokio::spawn` at all.
     ///
-    /// The accept loop's `conn_tasks.spawn` is a `JoinSet` method, not this
-    /// literal, and the accept path's remaining tokio surface (`TcpListener`,
-    /// the TLS handshake deadlines, the accept-error backoff) is item 7's —
-    /// which is why this guard names the spawn literal only.
+    /// Scope is this file, and after the accept loop moved to
+    /// [`super::super::accept`] (item 7 stage A) that is exactly the
+    /// connection scope the name claims. The rule is not *relaxed* for the
+    /// accept module — `accept.rs` carries the same zero-bare-`tokio::spawn`
+    /// assertion in its own tests, because its per-connection task is a
+    /// `JoinSet` method (`conn_tasks.spawn`), not this literal. What
+    /// `accept.rs` is additionally allowed, and this file is not, is the
+    /// non-spawn tokio surface a host socket driver needs: `TcpListener`, the
+    /// two TLS handshake deadlines, the accept-error backoff. Those are item
+    /// 7's to replace wholesale with a blocking driver, so pinning them here
+    /// would pin the wrong thing.
     #[test]
     fn connection_scope_spawns_go_through_the_runtime_seam() {
         let src = include_str!("tcp.rs");

@@ -14,6 +14,131 @@
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
+/// True when no `tracing` subscriber would take an event — i.e. when
+/// everything this module emits is being discarded.
+///
+/// Every diagnostic in this workspace funnels into `tracing`, and installing a
+/// subscriber is the *application's* job. The hosted binaries do it; the RTEMS
+/// IOC entry points do not, because `tracing-subscriber` sits behind an
+/// optional feature that also drags in a Prometheus exporter. The result on
+/// target was an IOC that emitted **nothing at all** on its console — not a
+/// quiet IOC, a mute one, with every `errlog` line dropped on the floor.
+///
+/// C cannot reach that state: `errlogPrintf` ends at the console writer, which
+/// always exists. This restores that property without duplicating output when
+/// a subscriber *is* installed.
+///
+/// [`tracing::level_filters::LevelFilter::current`] reads the active
+/// dispatcher's max-level hint and is `OFF` exactly when there is no
+/// dispatcher (or one that has declared it wants nothing). It sees a
+/// scoped `with_default` subscriber as well as a global one, so a test that
+/// captures events does not also get console noise.
+fn nothing_is_listening() -> bool {
+    tracing::level_filters::LevelFilter::current() == tracing::level_filters::LevelFilter::OFF
+}
+
+/// Write one already-formatted errlog line to the console, but only when
+/// [`nothing_is_listening`].
+fn console_fallback(line: &std::fmt::Arguments<'_>) {
+    if nothing_is_listening() {
+        eprintln!("{line}");
+    }
+}
+
+/// A `tracing` subscriber that writes events to the console and nothing else.
+///
+/// Deliberately not `tracing_subscriber::fmt`: that crate is an optional
+/// dependency here, it pulls a Prometheus exporter along with it in the
+/// dependents that enable it, and none of what it adds — span storage, env
+/// filters, ANSI, timestamps off a clock that is quantised to whole seconds on
+/// RTEMS — is wanted on an IOC console. What is wanted is C's property: a
+/// diagnostic reaches the console.
+struct ConsoleSubscriber;
+
+/// Renders one event as `LEVEL target: message key=value …`.
+struct ConsoleLine {
+    out: String,
+    wrote_message: bool,
+}
+
+impl tracing::field::Visit for ConsoleLine {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        use std::fmt::Write;
+        if field.name() == "message" {
+            // The message field arrives as `format_args!`, whose `Debug` is its
+            // `Display` — so this is the text, not a quoted rendering of it.
+            let _ = write!(self.out, "{value:?}");
+            self.wrote_message = true;
+        } else {
+            let _ = write!(
+                self.out,
+                "{}{}={value:?}",
+                if self.wrote_message { " " } else { "" },
+                field.name()
+            );
+            self.wrote_message = true;
+        }
+    }
+}
+
+/// `LEVEL target: message key=value …` — the one place an event becomes text.
+fn render_event(event: &tracing::Event<'_>) -> String {
+    let meta = event.metadata();
+    let mut line = ConsoleLine {
+        out: format!("{:<5} {}: ", meta.level(), meta.target()),
+        wrote_message: false,
+    };
+    event.record(&mut line);
+    line.out
+}
+
+impl tracing::Subscriber for ConsoleSubscriber {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        *metadata.level() <= tracing::Level::INFO
+    }
+
+    /// Declared so [`nothing_is_listening`] is false once this is installed —
+    /// without it the `errlog` console fallback would double every line.
+    fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+        Some(tracing::level_filters::LevelFilter::INFO)
+    }
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        eprintln!("{}", render_event(event));
+    }
+
+    // Spans are not rendered: this crate's diagnostics are events, and storing
+    // span data would be the one part of this that needs allocation per span.
+    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+    fn enter(&self, _span: &tracing::span::Id) {}
+    fn exit(&self, _span: &tracing::span::Id) {}
+}
+
+/// Make this process's diagnostics reach the console, if nothing else has.
+///
+/// Every diagnostic in this workspace — `errlog`, the `rt_*` macros, and the
+/// `tracing::{warn,error,info}!` calls in the CA and PVA servers — funnels into
+/// `tracing`, and an event with no subscriber installed is *discarded*, not
+/// buffered. An IOC binary that never installs one is therefore mute: measured
+/// on target, a CA server refusing clients at its memory ceiling produced no
+/// console output of any kind, which is indistinguishable from a network fault.
+///
+/// C has no such state. `errlogPrintf` and `epicsPrintf` end at a console
+/// writer that always exists, so an IOC that is running always says so. This is
+/// the entry point that restores that property, and it belongs in the binary
+/// rather than in a library: installing a global subscriber is a whole-process
+/// decision, and a hosted application that installs its own must win.
+///
+/// Returns `false` when a subscriber was already installed — the caller's own
+/// choice takes precedence and nothing is changed.
+pub fn install_console_subscriber() -> bool {
+    tracing::subscriber::set_global_default(ConsoleSubscriber).is_ok()
+}
+
 /// Error-message severity — C `errlogSevEnum` (`errlog.h:49-53`).
 ///
 /// Ordered `Info < Minor < Major < Fatal`; the discriminants match the
@@ -127,6 +252,7 @@ pub fn errlog_sev_printf(severity: ErrlogSevEnum, message: &str) -> bool {
             tracing::error!(target: "epics_base_rs::errlog", "{line}")
         }
     }
+    console_fallback(&format_args!("{line}"));
     true
 }
 
@@ -142,6 +268,7 @@ pub fn errlog_sev_printf(severity: ErrlogSevEnum, message: &str) -> bool {
 /// for the `"errlog"` output stream (`devStdio.c` `logPrintf`).
 pub fn errlog_printf(message: &str) {
     tracing::info!(target: "epics_base_rs::errlog", "{message}");
+    console_fallback(&format_args!("{message}"));
 }
 
 /// Debug-level runtime log line. Routes through the `tracing` facade.
@@ -187,6 +314,120 @@ mod tests {
         rt_info!("info message");
         rt_warn!("warn: {}", "something");
         rt_error!("error: {} {}", "bad", "thing");
+    }
+
+    /// The condition the console fallback keys on. With no subscriber the
+    /// `tracing` dispatcher reports `OFF`, and every errlog line in the
+    /// process is being discarded — the state each RTEMS IOC binary runs in,
+    /// because installing a subscriber is the application's job and those
+    /// entry points do not do it (`tracing-subscriber` sits behind an
+    /// optional feature that also pulls a Prometheus exporter).
+    #[test]
+    #[serial]
+    fn with_no_subscriber_nothing_is_listening() {
+        assert!(
+            nothing_is_listening(),
+            "the test process has no global subscriber, so errlog output is \
+             being discarded and the console fallback must engage"
+        );
+    }
+
+    /// …and with one installed the fallback must stand down, or every hosted
+    /// IOC gets each errlog line twice: once through its own sink and once on
+    /// stderr.
+    #[test]
+    #[serial]
+    fn with_a_subscriber_the_fallback_stands_down() {
+        use tracing::subscriber::with_default;
+        let captured = with_default(tracing_subscriber::registry(), nothing_is_listening);
+        assert!(
+            !captured,
+            "a scoped subscriber is listening, so the console fallback must not fire"
+        );
+    }
+
+    /// The console subscriber must be one of the subscribers that stands the
+    /// fallback down. It is not automatic: a `Subscriber` whose
+    /// `max_level_hint` is left at the default reports no hint, and this file's
+    /// own fallback would then print every errlog line a second time on the
+    /// very target the subscriber exists for.
+    #[test]
+    #[serial]
+    fn the_console_subscriber_declares_itself_to_the_dispatcher() {
+        use tracing::level_filters::LevelFilter;
+        use tracing::subscriber::with_default;
+
+        let (still_mute, level) = with_default(ConsoleSubscriber, || {
+            (nothing_is_listening(), LevelFilter::current())
+        });
+        assert!(
+            !still_mute,
+            "the console subscriber is listening, so the errlog fallback must \
+             not also print — that is every line twice"
+        );
+        assert_eq!(
+            level,
+            LevelFilter::INFO,
+            "the console takes INFO and above, matching a C IOC's errlog console"
+        );
+    }
+
+    /// A capturing stand-in that shares the console's rendering. What it
+    /// asserts is [`render_event`], which is the whole of what the console
+    /// subscriber does with an event.
+    struct CapturingSubscriber(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl tracing::Subscriber for CapturingSubscriber {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() <= tracing::Level::INFO
+        }
+        fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+            Some(tracing::level_filters::LevelFilter::INFO)
+        }
+        fn event(&self, event: &tracing::Event<'_>) {
+            self.0.lock().expect("sink").push(render_event(event));
+        }
+        fn new_span(&self, _s: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _s: &tracing::span::Id, _v: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _s: &tracing::span::Id, _f: &tracing::span::Id) {}
+        fn enter(&self, _s: &tracing::span::Id) {}
+        fn exit(&self, _s: &tracing::span::Id) {}
+    }
+
+    /// The rendered line carries the message *unquoted* and the structured
+    /// fields as `key=value`. The message field arrives as `format_args!`, so
+    /// rendering it through `Debug` is what keeps it readable; switching to a
+    /// `record_str` arm would wrap every diagnostic in quotes.
+    #[test]
+    #[serial]
+    fn the_console_line_carries_message_and_fields() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        tracing::subscriber::with_default(CapturingSubscriber(seen.clone()), || {
+            tracing::warn!(target: "epics_base_rs::test", nth = 7, "refused a client");
+            tracing::debug!(target: "epics_base_rs::test", "not at console level");
+        });
+
+        let lines = seen.lock().expect("sink").clone();
+        assert_eq!(
+            lines,
+            vec!["WARN  epics_base_rs::test: refused a client nth=7".to_string()],
+            "one INFO-or-above event, message unquoted, fields appended"
+        );
+    }
+
+    /// Below-INFO events must not reach the console — asserted above by the
+    /// `debug!` that produced no line, and here at the filter itself so the
+    /// reason is not mistaken for a rendering accident.
+    #[test]
+    #[serial]
+    fn the_console_subscriber_declines_below_info() {
+        use tracing::level_filters::LevelFilter;
+        let taken = tracing::subscriber::with_default(ConsoleSubscriber, || {
+            LevelFilter::current() >= LevelFilter::DEBUG
+        });
+        assert!(!taken, "DEBUG must be below the console's level");
     }
 
     #[test]

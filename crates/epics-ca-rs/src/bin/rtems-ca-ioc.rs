@@ -115,6 +115,14 @@ mod ioc {
         //     console, the clock, libbsd and DHCP, and called us.
         epics_rtems_boot::link_anchor();
 
+        // (0b) Make the IOC audible. Every diagnostic below — and every one in
+        //      the CA server, the database and the runtime — is a `tracing`
+        //      event, and an event with no subscriber is discarded. Without
+        //      this line the IOC boots, serves, refuses clients at its memory
+        //      ceiling and dies with an identical, empty console. C's
+        //      `errlogPrintf` cannot be silenced this way; neither may ours.
+        epics_base_rs::runtime::log::install_console_subscriber();
+
         // (1) C `callbackInit` (callback.c:286) — the callback pool, delayed
         //     timer and scanOnce worker exist before any record can defer a
         //     tail into them. Idempotent.

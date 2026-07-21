@@ -200,7 +200,7 @@ impl BlockingCaServer {
         let mut backoff = AcceptBackoff::new();
         for stream in self.listener.incoming() {
             match stream {
-                Ok(stream) => {
+                Ok(mut stream) => {
                     backoff.accepted();
                     // A `shutdown()` wakes the blocking accept by dialing our
                     // own socket; the throwaway connection is dropped here.
@@ -214,6 +214,15 @@ impl BlockingCaServer {
                     let db = self.db.clone();
                     let acf = self.acf.clone();
                     let tcp_port = self.tcp_port;
+                    // The socket is handed to the thread *after* the thread
+                    // exists, not captured by the closure. `Builder::spawn`
+                    // consumes its closure, so a capture would drop the
+                    // socket on failure and leave nothing to refuse *with*:
+                    // no reply, no peer address, just a close. Thread
+                    // creation is the resource check on this target — it is
+                    // the allocation of a 1 MiB stack — so its failure is
+                    // precisely the moment an admission refusal is owed.
+                    let (handover, take) = std::sync::mpsc::sync_channel::<TcpStream>(1);
                     let spawned = thread::Builder::new()
                         .name(format!("CAS-client-blocking {peer}"))
                         // caservertask.c:109-111 creates this same thread with
@@ -222,6 +231,12 @@ impl BlockingCaServer {
                         // so Big is the parity answer, not merely a safe one.
                         .stack_size(StackSizeClass::Big.bytes())
                         .spawn(move || {
+                            let Ok(stream) = take.recv() else {
+                                // Unreachable in practice: the sender is used
+                                // on the very next line after a successful
+                                // spawn. Exiting is right either way.
+                                return;
+                            };
                             // caservertask.c:109 — the TCP receiver is created
                             // as `epicsThreadCreate("CAS-client",
                             // epicsThreadPriorityCAServerLow, ...)`. Best
@@ -237,12 +252,19 @@ impl BlockingCaServer {
                                 );
                             }
                         });
-                    if let Err(e) = spawned {
-                        tracing::warn!(
-                            target: "epics_ca_rs::server::blocking",
-                            %peer, error = %e,
-                            "failed to spawn blocking CA client thread"
-                        );
+                    match spawned {
+                        Ok(_) => {
+                            // The thread is alive and parked on `take.recv()`.
+                            // Send cannot fail: the receiver is held by that
+                            // thread and dropped only after it has the socket.
+                            let _ = handover.send(stream);
+                        }
+                        Err(e) => refuse_client(peer, &e, |frame| {
+                            use std::io::Write;
+                            let _ = stream.write_all(frame);
+                            let _ = stream.flush();
+                            let _ = stream.shutdown(std::net::Shutdown::Both);
+                        }),
                     }
                 }
                 Err(e) => {
@@ -317,6 +339,97 @@ impl BlockingCaServer {
         name_current_thread();
         handle_udp_search_blocking(socket, self.db.clone(), self.tcp_port, &self.shutdown)
     }
+}
+
+/// How many clients this server has refused for want of resources, ever.
+///
+/// Not a rate limiter's clock. On RTEMS `Instant` is quantised to whole
+/// seconds by the libc `timespec` defect (`epics_rtems_boot`'s layout guard),
+/// so a time-windowed limiter is exactly the wrong shape here. Counting and
+/// emitting on powers of two needs no clock at all, cannot suppress the first
+/// occurrence by construction, and keeps the console readable when a client
+/// retries in a loop against a server that is out of memory.
+static REFUSED_CLIENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// True for the 1st, 2nd, 4th, 8th … refusal.
+fn refusal_should_be_announced(nth: u64) -> bool {
+    nth.is_power_of_two()
+}
+
+/// Refuse an accepted client that the server has no resources to serve:
+/// tell the peer, tell the operator, then close.
+///
+/// The single owner of that transition. Every site that abandons a connection
+/// because a thread could not be created passes through here; none writes its
+/// own refusal frame or its own console line. `send` exists because the two
+/// sites hold the socket differently — the accept loop owns a bare
+/// `TcpStream`, the connection body shares one `Arc<TcpStream>` behind
+/// `send_lock` — and *only* that differs between them.
+///
+/// # Why this exists at all
+///
+/// Without it the connection is accepted, the CA VERSION handshake completes
+/// (the client's own send succeeds — the socket is real), and the server then
+/// closes with no reply and no console output. Measured on target: an
+/// operator sees clients failing to connect against an IOC that reports
+/// nothing wrong. That is the worst of the available failure modes, because
+/// nothing distinguishes it from a network fault.
+///
+/// # Parity
+///
+/// C refuses in `create_client` (`rsrv/caservertask.c:1240-1250`): it
+/// pre-checks `osiSufficentSpaceInPool(sizeof(struct client) + MAX_TCP)`,
+/// and on failure calls `epicsSocketDestroy(sock)` **plus**
+/// `epicsPrintf("CAS: no space in pool for a new client ...")`. The message is
+/// the part that matters — `epicsPrintf` reaches the console unconditionally.
+///
+/// Two deliberate differences:
+///
+/// * The gate is thread creation, not a pool pre-check. `osiSufficentSpaceInPool`
+///   has no portable equivalent in `std`, and on this target the binding
+///   resource *is* the 1 MiB stack the client thread needs — so the allocation
+///   that can fail is the one we already perform, and its failure is a truer
+///   admission signal than any estimate.
+/// * We also tell the *peer*. C does not, but the protocol allows it and a
+///   silent close is what made this invisible: `CA_PROTO_ERROR` carrying
+///   `ECA_ALLOCMEM` reaches libca's `exceptionRespAction` →`defaultExcep`
+///   (`cac.cpp:1081-1118`, `1006-1017`), which raises the status with our
+///   context string on the client. The dispatch is by command code alone
+///   (`cac::executeResponse`, `cac.cpp:1208-1220`) — there is no
+///   version-verified gate — so this is legible from either site, including
+///   the accept-loop one where the circuit never got its VERSION reply.
+fn refuse_client(peer: SocketAddr, cause: &std::io::Error, send: impl FnOnce(&[u8])) {
+    let nth = REFUSED_CLIENTS.fetch_add(1, Ordering::Relaxed) + 1;
+    let reason = format!("CAS: no resources for a new client ({cause})");
+
+    // Tell the peer. The echoed header is a synthetic CA_PROTO_VERSION: the
+    // client has sent nothing we are answering, and `defaultExcep` is what
+    // index 0 of libca's exception jump table selects (`cac.cpp:96`).
+    let echo = CaHeader::new(CA_PROTO_VERSION);
+    let frame = crate::server::tcp::build_ca_error_frame(
+        &echo,
+        crate::protocol::ECA_ALLOCMEM,
+        0xFFFF_FFFF,
+        &reason,
+        CA_MINOR_VERSION,
+    );
+    send(&frame);
+
+    // Tell the operator. `errlog` is C's `epicsPrintf` seam and reaches the
+    // console even with no `tracing` subscriber installed
+    // (`runtime::log::errlog_sev_printf`), which is the state every RTEMS IOC
+    // binary runs in.
+    if refusal_should_be_announced(nth) {
+        epics_base_rs::runtime::log::errlog_sev_printf(
+            epics_base_rs::runtime::log::ErrlogSevEnum::Major,
+            &format!("{reason} — refused {peer} (refusal #{nth})"),
+        );
+    }
+    tracing::warn!(
+        target: "epics_ca_rs::server::blocking",
+        %peer, error = %cause, nth,
+        "refused a CA client for want of resources"
+    );
 }
 
 /// Bind a blocking UDP name-search responder socket. Raw `libc` throughout
@@ -753,8 +866,22 @@ fn handle_client_blocking(
                     "CAS-event thread future not blockable (unexpected on a runtime-less thread)"
                 );
             }
-        })
-        .map_err(CaError::Io)?;
+        });
+    // This is the second of the two threads a CA client costs, and on target it
+    // is the one that fails first: the receiver already exists and the VERSION
+    // frame above has already gone out, so a bare `?` here is precisely the
+    // measured symptom — accepted, handshake completed, then closed in silence.
+    // A client is not served without its event thread, so this is a refusal and
+    // goes through the same owner as the accept-loop one.
+    let event_thread = match event_thread {
+        Ok(t) => t,
+        Err(e) => {
+            refuse_client(peer, &e, |frame| {
+                let _ = write_frame_locked(&send_lock, frame);
+            });
+            return Err(CaError::Io(e));
+        }
+    };
 
     // The blocking driver's own subscription registry (see [`BlockingSub`]).
     let mut blk_subs: HashMap<u32, BlockingSub> = HashMap::new();
@@ -1127,6 +1254,88 @@ mod tests {
         }
     }
 
+    /// The refusal must reach the peer as a protocol message, not as a bare
+    /// close. Measured on target, a client past the ceiling completed its
+    /// VERSION send and then saw the socket go away with nothing on it.
+    #[test]
+    fn a_refused_client_is_told_why_before_the_socket_closes() {
+        use std::io::Read;
+        use std::net::{Ipv4Addr, TcpListener as StdTcpListener};
+
+        let listener = StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let mut client = TcpStream::connect(addr).expect("connect");
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("client read timeout");
+        let (mut server, peer) = listener.accept().expect("accept");
+
+        refuse_client(
+            peer,
+            &std::io::Error::new(
+                std::io::ErrorKind::OutOfMemory,
+                "cannot allocate the client thread stack",
+            ),
+            |frame| {
+                use std::io::Write;
+                let _ = server.write_all(frame);
+                let _ = server.flush();
+                let _ = server.shutdown(std::net::Shutdown::Both);
+            },
+        );
+
+        // The socket was shut down, so this terminates rather than hanging —
+        // which is itself the assertion that the refusal completed.
+        let mut got = Vec::new();
+        client.read_to_end(&mut got).expect("read the refusal");
+
+        assert!(
+            got.len() >= 2 * CaHeader::SIZE,
+            "expected a CA_PROTO_ERROR (header + echoed header), got {} bytes",
+            got.len()
+        );
+        assert_eq!(
+            u16::from_be_bytes([got[0], got[1]]),
+            crate::protocol::CA_PROTO_ERROR,
+            "the refusal must be a CA_PROTO_ERROR frame"
+        );
+        // `available` (bytes 12..16 of the response header) carries the status.
+        let status = u32::from_be_bytes([got[12], got[13], got[14], got[15]]);
+        assert_eq!(
+            status,
+            crate::protocol::ECA_ALLOCMEM,
+            "the status must say the server ran out of resources"
+        );
+        // The echoed request header is a synthetic CA_PROTO_VERSION, which is
+        // what selects libca's `defaultExcep` (cac.cpp:96).
+        assert_eq!(
+            u16::from_be_bytes([got[16], got[17]]),
+            CA_PROTO_VERSION,
+            "the echoed header must index libca's default exception handler"
+        );
+        let text = String::from_utf8_lossy(&got[2 * CaHeader::SIZE..]);
+        assert!(
+            text.contains("no resources for a new client"),
+            "the diagnostic string must reach the client: {text:?}"
+        );
+    }
+
+    /// The first refusal is always announced. A rate limit that can swallow
+    /// occurrence #1 is indistinguishable, to an operator, from the silence
+    /// this change exists to remove.
+    #[test]
+    fn the_first_refusal_can_never_be_rate_limited_away() {
+        assert!(refusal_should_be_announced(1), "the first refusal is mute");
+        // …and the schedule after it is logarithmic, so a client retrying in
+        // a loop cannot flood the console.
+        let announced: Vec<u64> = (1..=64)
+            .filter(|n| refusal_should_be_announced(*n))
+            .collect();
+        assert_eq!(announced, vec![1, 2, 4, 8, 16, 32, 64]);
+        assert!(!refusal_should_be_announced(3));
+        assert!(!refusal_should_be_announced(1000));
+    }
+
     /// A bind failure must not be described as a `local_addr` failure, nor
     /// the reverse. `BlockingCaServer::bind` makes two fallible calls, and on
     /// RTEMS they fail for opposite reasons: `bind` succeeds while
@@ -1202,6 +1411,54 @@ mod tests {
         assert!(
             unclassified.is_empty(),
             "these CA threads inherit std's 2 MiB default on RTEMS: {unclassified:?}"
+        );
+    }
+
+    /// The RTEMS IOC installs a console subscriber before it does anything
+    /// else worth reporting.
+    ///
+    /// Without it every diagnostic in the process — the refusals below, the
+    /// database, the runtime — is a `tracing` event with no subscriber, which
+    /// is *discarded*. Measured on target: an IOC at its client ceiling
+    /// produced an entirely empty console. This guard is the reason a future
+    /// edit to the entry point cannot quietly restore that.
+    #[test]
+    fn the_rtems_ioc_is_not_mute() {
+        let prod = production_scope(include_str!("../bin/rtems-ca-ioc.rs"));
+        assert!(
+            prod.contains("install_console_subscriber("),
+            "rtems-ca-ioc installs no tracing subscriber: every diagnostic it \
+             and its server emit is discarded"
+        );
+    }
+
+    /// Every per-client thread this driver creates has a refusal behind it.
+    ///
+    /// A CA client costs two threads, and on target either creation can fail —
+    /// the receiver in the accept loop, the event task after the VERSION frame
+    /// has already gone out. Whichever fails, the client cannot be served, and
+    /// the failure must reach [`refuse_client`] rather than a bare `?` or a
+    /// dropped socket. Counting sites is the check that survives a refactor:
+    /// add a third per-client thread here and this guard demands its refusal.
+    #[test]
+    fn every_per_client_thread_failure_reaches_the_refusal_owner() {
+        let prod = production_scope(include_str!("blocking.rs"));
+
+        let builders = prod.matches("thread::Builder::new()").count();
+        // `refuse_client(` also matches its own definition; subtract it.
+        let definitions = prod.matches("fn refuse_client(").count();
+        let calls = prod.matches("refuse_client(").count() - definitions;
+
+        assert_eq!(definitions, 1, "there must be exactly one refusal owner");
+        assert_eq!(
+            builders, 2,
+            "the per-client thread count in this file changed — classify the \
+             new site, then update this guard"
+        );
+        assert_eq!(
+            calls, builders,
+            "{calls} refusal(s) for {builders} per-client thread creation(s): \
+             a thread failure here closes the socket in silence"
         );
     }
 

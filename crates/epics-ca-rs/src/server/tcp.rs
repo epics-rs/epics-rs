@@ -6524,7 +6524,7 @@ pub(crate) fn send_ca_error(
 /// Build the contiguous wire bytes of a `CA_PROTO_ERROR` reply
 /// (response header + echoed request header + diagnostic string). Pure and
 /// socket-free — the connection loop writes the returned frame.
-fn build_ca_error_frame(
+pub(crate) fn build_ca_error_frame(
     original_hdr: &CaHeader,
     eca_status: u32,
     chan_cid: u32,

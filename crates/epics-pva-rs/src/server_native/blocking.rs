@@ -1143,7 +1143,14 @@ impl BlockingPvaServer {
         if self.active.load(Ordering::Acquire) >= self.config.max_connections {
             // Dropping the stream closes it. Refusing costs more here than on
             // the host: each connection is three threads, not two tasks.
-            debug!(
+            //
+            // `warn!`, not `debug!`: a client that cannot connect is an
+            // operator-visible event, and at `debug!` this refusal was below
+            // every default filter — including the IOC console subscriber
+            // (`epics_base_rs::runtime::log::install_console_subscriber`),
+            // which is the same silent-refusal defect the CA driver had at its
+            // thread ceiling.
+            warn!(
                 ?peer,
                 limit = self.config.max_connections,
                 "blocking PVA server: refusing connection, max_connections reached"

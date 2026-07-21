@@ -7,12 +7,24 @@
 //! A hosted build sleeps via `tokio::time::sleep`, whose waker is driven by the
 //! tokio timer wheel. RTEMS has no such wheel, so a [`Sleep`] future arms a
 //! one-shot entry on the [`DelayedTimer`](super::delayed_timer::DelayedTimer):
-//! on its first poll it schedules a callback for its deadline; when that
-//! callback fires (on a callback-pool worker) it wakes the future's stored
-//! waker, and the next poll — now past the deadline — returns `Ready`. This is
-//! the same deadline-ordered timer thread that backs C `callbackRequestDelayed`
-//! (`callback.c:410-419`); a `Sleep` is just that facility with the "callback"
-//! being "wake this future".
+//! on its first poll it schedules a wakeup for its deadline; when that wakeup
+//! fires it wakes the future's stored waker, and the next poll — now past the
+//! deadline — returns `Ready`. This is the same deadline-ordered timer thread
+//! that backs C `callbackRequestDelayed` (`callback.c:410-419`); a `Sleep` is
+//! just that facility with the "callback" being "wake this future".
+//!
+//! # Why the wakeup runs on the timer thread, not the callback pool
+//!
+//! The wakeup is armed via [`TimerHandle::schedule_wake`], so it runs **inline
+//! on the timer thread** rather than being dispatched to the callback pool.
+//! Waking is a non-blocking `waker.wake()` (an `unpark` for a `park_on` driver,
+//! or a tokio task-schedule) and needs no worker. Dispatching it to the pool
+//! instead would self-deadlock any `spawn`ed future that awaits `sleep`:
+//! `future_exec::run_future` parks the pool worker driving that future for the
+//! future's whole life, so a wake queued on the same (single-worker) band would
+//! sit behind the very worker it must wake. Routing the wake off the band keeps
+//! the band's sole job "run futures" and makes the wake uniform for every
+//! sleeper — bare `spawn`ed tails and periodic-scan `interval` alike.
 //!
 //! # Lazy arming and drop-cancel
 //!
@@ -35,13 +47,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
-use super::callback_executor::CallbackPriority;
 use super::delayed_timer::TimerHandle;
-
-/// Band the timer wakeup runs on. A sleep wakeup only calls `waker.wake()`, so
-/// it rides the middle band (C `priorityMedium`, `callback.h:42`) like any
-/// other general deferred tail.
-const SLEEP_WAKE_PRIORITY: CallbackPriority = CallbackPriority::Medium;
 
 /// Shared between a [`Sleep`] and its armed timer callback.
 struct SleepState {
@@ -108,9 +114,11 @@ impl Future for Sleep {
         if !this.armed {
             let delay = this.deadline.saturating_duration_since(Instant::now());
             let cb_state = Arc::clone(&this.state);
-            this.timer.schedule(
+            // Inline wakeup on the timer thread — see the module docs: a sleep
+            // wake is a non-blocking `waker.wake()`, and dispatching it to the
+            // callback pool would deadlock a `spawn`ed future that awaits it.
+            this.timer.schedule_wake(
                 delay,
-                SLEEP_WAKE_PRIORITY,
                 Box::new(move || {
                     let mut st = cb_state.lock().unwrap();
                     st.fired = true;

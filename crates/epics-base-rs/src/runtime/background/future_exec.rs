@@ -20,6 +20,21 @@
 //! the pool for the expected number of concurrent tails is a deployment concern
 //! (C `callbackParallelThreads`), not handled here.
 //!
+//! # TODO (tracked follow-up — worker-per-future fragility)
+//!
+//! The park-a-worker-per-future model above has a real, separate defect: **N
+//! concurrent long-lived tails exhaust N workers in a band**, after which any
+//! further future queued at that band starves until one finishes. This is fine
+//! for the current RTEMS async-record tails (short, bounded in number), but it
+//! is a structural weakness, not just a sizing knob. The durable fix is (B): make
+//! this a real cooperative executor — on wake, **re-enqueue** the task onto the
+//! pool instead of parking a dedicated worker for its whole life, so a bounded
+//! worker set multiplexes an unbounded number of mostly-idle tails. That rewrite
+//! is deliberately out of scope of the sleep-wake deadlock fix (decision: fix the
+//! deadlock structurally with the timer-thread inline wake first, since this is
+//! the first bug here; do not fold the executor rewrite into it). Tracked in
+//! memory note `rtems-exec-worker-per-future-fragility`.
+//!
 //! # Handle surface
 //!
 //! [`JoinFuture<T>`] mirrors the subset of `tokio::task::JoinHandle` the CA/PVA
@@ -360,6 +375,8 @@ where
 mod tests {
     use super::*;
     use crate::runtime::background::callback_executor::CallbackPool;
+    use crate::runtime::background::delayed_timer::DelayedTimer;
+    use crate::runtime::background::timer_sleep::sleep;
     use crate::runtime::task::park_on_interruptible as drive;
     use std::sync::mpsc;
     use std::time::Duration;
@@ -454,6 +471,42 @@ mod tests {
         ah.abort();
         assert!(join(jf).unwrap_err().is_cancelled());
         assert!(ah.is_finished());
+    }
+
+    #[test]
+    fn spawned_future_awaiting_sleep_does_not_self_deadlock() {
+        // Regression for the sleep-wake self-deadlock (bug_pattern
+        // rtems-exec-sleep-wake-band-deadlock): a future SPAWNED ON THE POOL
+        // that awaits `timer_sleep::sleep` must complete. This is the exact
+        // `spawn(async { sleep().await })` shape that ODLY/SDLY async-record
+        // reprocessing uses on the RTEMS backend.
+        //
+        // Why the existing `timer_sleep` unit tests did NOT catch it: they
+        // `drive()` the Sleep on the TEST thread, leaving the pool's single
+        // Medium worker free to run the wake callback. Here the future runs on
+        // the pool worker (via `spawn_future`) — so with the old behavior, where
+        // the sleep-wake was `sink.request(Medium, ...)`, the wake queued behind
+        // the very worker parked on this future (one worker per band) and never
+        // ran. We must OBSERVE completion via a channel, NOT `join()`/`drive()`
+        // on the test thread, or we would re-introduce the free-worker escape
+        // hatch and stop reproducing the deadlock.
+        let pool = CallbackPool::new();
+        let timer = DelayedTimer::new(pool.handle());
+        let th = timer.handle();
+
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let jf = spawn_future(&pool.handle(), CallbackPriority::Medium, async move {
+            sleep(&th, Duration::from_millis(50)).await;
+            done_tx.send(()).unwrap();
+        });
+
+        // With the fix (inline wake on the timer thread) the sleep fires and the
+        // future finishes well inside T. With the pre-fix band-dispatch wake this
+        // recv times out because the wake starves behind the parked worker.
+        done_rx.recv_timeout(T).expect(
+            "spawned future awaiting sleep deadlocked (wake starved behind its own worker)",
+        );
+        assert!(join(jf).is_ok());
     }
 
     #[test]

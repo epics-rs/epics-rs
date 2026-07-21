@@ -25,13 +25,33 @@ use std::time::{Duration, Instant};
 
 use super::callback_executor::{Callback, CallbackHandle, CallbackPriority};
 
+/// How a due timer entry is run when its deadline arrives.
+enum TimerAction {
+    /// Run the callback **inline on the timer thread**. For a non-blocking
+    /// wakeup only — a `sleep`/`interval` waker (`Thread::unpark` for a
+    /// `park_on` driver, or a tokio task-schedule). Running it here instead of
+    /// handing it to the callback pool is what stops a `spawn`ed future that
+    /// awaits `sleep` from deadlocking: `future_exec::run_future` parks the pool
+    /// worker driving that future for its whole life, so the wake MUST NOT queue
+    /// behind it on the same band. A wakeup needs no worker — it just unparks —
+    /// so the timer thread runs it directly. The callback must never block or do
+    /// real work: it runs on the single timer thread and delays every later
+    /// deadline until it returns.
+    Inline,
+    /// Hand the callback to the executor pool at this band — C
+    /// `callbackRequestDelayed` → `callbackRequest` (`callback.c:404-419`). For
+    /// genuine deferred *work* (ODLY watchdog, SDLY reprocess) that must run on a
+    /// callback-band worker rather than the timer thread.
+    Pool(CallbackPriority),
+}
+
 /// One scheduled callback awaiting its deadline.
 struct TimerEntry {
     deadline: Instant,
     /// Tie-breaker so equal deadlines fire in submission order and `Ord` is a
     /// total order (the callback itself is not comparable).
     seq: u64,
-    priority: CallbackPriority,
+    action: TimerAction,
     cb: Callback,
 }
 
@@ -73,7 +93,7 @@ impl Inner {
     /// Insert a scheduled callback and wake the timer thread so it can
     /// recompute its sleep deadline. Port of `epicsTimerStartDelay`
     /// (`callback.c:418`).
-    fn schedule(&self, delay: Duration, priority: CallbackPriority, cb: Callback) {
+    fn schedule(&self, delay: Duration, action: TimerAction, cb: Callback) {
         let deadline = Instant::now() + delay;
         let mut st = self.state.lock().unwrap();
         if st.shutdown {
@@ -92,7 +112,7 @@ impl Inner {
         st.heap.push(TimerEntry {
             deadline,
             seq,
-            priority,
+            action,
             cb,
         });
         drop(st);
@@ -113,10 +133,18 @@ fn timer_loop(inner: &Inner) {
         // `deadline` is `Copy`, so this releases the peek borrow immediately.
         match st.heap.peek().map(|e| e.deadline) {
             Some(deadline) if deadline <= now => {
-                // Due: pop and submit into the executor pool.
+                // Due: run it. A wakeup (`Inline`) runs here on the timer thread
+                // — it only unparks a driver, needs no worker, and must not queue
+                // on the callback pool (that is the sleep-wake self-deadlock). A
+                // deferred-work callback (`Pool`) is handed to the executor pool.
                 let entry = st.heap.pop().unwrap();
                 drop(st);
-                let _ = inner.sink.request(entry.priority, entry.cb);
+                match entry.action {
+                    TimerAction::Inline => (entry.cb)(),
+                    TimerAction::Pool(priority) => {
+                        let _ = inner.sink.request(priority, entry.cb);
+                    }
+                }
                 st = inner.state.lock().unwrap();
             }
             Some(deadline) => {
@@ -142,11 +170,26 @@ pub struct TimerHandle {
 }
 
 impl TimerHandle {
-    /// Schedule `cb` to be enqueued on `priority` after `delay`. Returns
-    /// immediately — the callback runs on a pool worker no earlier than
+    /// Schedule deferred *work* `cb` to be enqueued on `priority` after `delay`.
+    /// Returns immediately — the callback runs on a pool worker no earlier than
     /// `delay` from now. Port of `callbackRequestDelayed` (`callback.c:410`).
     pub fn schedule(&self, delay: Duration, priority: CallbackPriority, cb: Callback) {
-        self.inner.schedule(delay, priority, cb);
+        self.inner.schedule(delay, TimerAction::Pool(priority), cb);
+    }
+
+    /// Schedule a **non-blocking wakeup** `cb` to run inline on the timer thread
+    /// after `delay` — the `sleep`/`interval` waker path. `cb` MUST be trivial
+    /// and non-blocking (only a waker `wake()`: an `unpark` or a tokio
+    /// task-schedule); it runs on the single timer thread and delays every later
+    /// deadline until it returns.
+    ///
+    /// This exists so a `spawn`ed future that awaits `sleep` is not deadlocked by
+    /// its own wake: `future_exec::run_future` parks the pool worker driving the
+    /// future for the future's whole life, so the wake cannot be dispatched to
+    /// that same (single-worker) band. Running it on the timer thread frees the
+    /// band from the dual role of "run futures" AND "wake them".
+    pub fn schedule_wake(&self, delay: Duration, cb: Callback) {
+        self.inner.schedule(delay, TimerAction::Inline, cb);
     }
 }
 
@@ -193,9 +236,9 @@ impl DelayedTimer {
     }
 
     /// Schedule `cb` after `delay` — convenience wrapper over
-    /// [`TimerHandle::schedule`].
+    /// [`TimerHandle::schedule`] (pool-dispatched deferred work).
     pub fn schedule(&self, delay: Duration, priority: CallbackPriority, cb: Callback) {
-        self.inner.schedule(delay, priority, cb);
+        self.inner.schedule(delay, TimerAction::Pool(priority), cb);
     }
 }
 

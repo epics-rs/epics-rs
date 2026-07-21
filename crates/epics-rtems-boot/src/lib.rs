@@ -105,6 +105,96 @@ pub mod contract;
 /// contract, so it lives here and not in [`contract`].
 pub const UNLINKABLE_MARKER: &str = "epics_rtems_boot__RTEMS_BSP_PREFIX_was_not_set_at_build_time";
 
+/// Whether this build's `libc` describes the target's time types correctly.
+///
+/// **False on a stock `libc`.** The crate types `time_t` as `i32` for every
+/// newlib target except `horizon`/`espidf` (`src/unix/newlib/mod.rs`), while
+/// the `arm-rtems6` toolchain has `sizeof(time_t) == 8`, signed. Measured on
+/// this target with the stock crate: `size_of::<libc::time_t>() == 4` and
+/// `size_of::<libc::timespec>() == 8`, where the target's `timespec` is 16
+/// with `tv_nsec` at offset 8.
+///
+/// # Why this is a boot-blocking defect and not a 4-byte overrun
+///
+/// `std` compiles the same definition. RTEMS `clock_gettime` writes 12 bytes
+/// into the 8-byte struct `std` allocated, so `tv_nsec` is read from the *high
+/// word* of the kernel's 64-bit `tv_sec` and the real nanoseconds land out of
+/// bounds. That is why the reading is a clean zero rather than garbage.
+/// Confirmed on target:
+///
+/// * `SystemTime::now().subsec_nanos()` reads exactly 0, every time.
+/// * `Instant::elapsed()` over a spin loop reads 0 ns.
+///
+/// So every timeout, rate limit, backoff and scan period built on `Instant`
+/// silently collapses to zero elapsed time. Nothing errors and nothing logs;
+/// the IOC simply stops honouring time.
+///
+/// # The workaround
+///
+/// Patch `libc` so `time_t` is `c_longlong` on this target — the other
+/// measured-wrong types (`dev_t`, `ino_t`, `rlim_t`, all 4 where the target
+/// has 8) fall out of the same change — and build `std` against the patched
+/// source. A `[patch.crates-io]` in this workspace fixes *our* dependency but
+/// **not** the copy `-Zbuild-std` compiles for `std`, and `std` is where the
+/// timer damage happens. Both have to be patched.
+///
+/// Derived layouts the target actually has, for whoever does that work:
+/// `timespec` 16/align 8 with `tv_nsec` at 8, `timeval` 16/align 8,
+/// `itimerspec` 32, `struct stat` 104 with `st_size` at 40 and `st_atim` at 48.
+///
+/// # What this can and cannot see
+///
+/// It reads *this workspace's* `libc`, which is a **proxy** for `std`'s: under
+/// `-Zbuild-std` those are two separate compilations and can in principle
+/// resolve different versions. It is the closest observable stand-in — `std`
+/// exposes no layout of its own to assert on — and it is a live one, because
+/// this workspace pins no patched `libc` (no `[patch]`/`[replace]`), so a
+/// stock resolution makes this `false` today.
+///
+/// Only `time_t` and `timespec` are checked. `dev_t`, `ino_t` and `rlim_t` are
+/// equally wrong but appear nowhere in `epics-base-rs`, `epics-ca-rs` or
+/// `epics-pva-rs`; asserting types we never touch would make this a `libc`
+/// conformance suite that fails for reasons unrelated to us. Add one when the
+/// first use appears.
+#[cfg(target_os = "rtems")]
+pub const RTEMS_LIBC_TIME_LAYOUT_IS_CORRECT: bool = size_of::<libc::time_t>() == 8
+    && size_of::<libc::timespec>() == 16
+    && align_of::<libc::timespec>() == 8
+    // At offset 4 this field reads the high word of the kernel's 64-bit
+    // `tv_sec`, which is what turns the bug from garbage into a clean zero.
+    && core::mem::offset_of!(libc::timespec, tv_nsec) == 8;
+
+/// The refusal. Sited on the same `rtems_boot_linked` arm as the boot shim
+/// itself, so **bootable implies checked, by construction**: an image built
+/// without [`contract::BSP_PREFIX_ENV`] has no `POSIX_Init` and cannot link at
+/// all (see [`UNLINKABLE_MARKER`]), so there is no path to a running IOC that
+/// skips this.
+///
+/// The predicate above is deliberately *outside* this gate. It is type-checked
+/// by the ordinary `cargo check --target armv7-rtems-eabihf` portability gate
+/// on a machine with no toolchain, so it cannot rot unnoticed; only the
+/// build-stopping `assert!` is scoped to builds that can produce an image.
+/// Putting the assertion itself at that scope would delete that gate — the
+/// same trade this crate already makes for the missing toolchain, and for the
+/// same reason (`doc/rtems-boot-shim-design.md` §4.2: the portability check
+/// "is the only gate that works without the box").
+#[cfg(all(target_os = "rtems", rtems_boot_linked))]
+const _RTEMS_LIBC_TIME_LAYOUT: () = assert!(
+    RTEMS_LIBC_TIME_LAYOUT_IS_CORRECT,
+    "RTEMS libc layout bug: this build's `libc` types `time_t` as i32, but \
+     arm-rtems6 has sizeof(time_t) == 8, making `timespec` 8 bytes where the \
+     target's is 16 with tv_nsec at offset 8. `std` compiles the same \
+     definition, so RTEMS clock_gettime overruns std's timespec and \
+     `Instant`/`SystemTime` become SILENTLY ZERO-RESOLUTION on target: \
+     subsec_nanos() reads exactly 0 and elapsed() reads 0 ns, so every \
+     timeout, rate limit, backoff and scan period in the IOC collapses to \
+     zero elapsed time with no error and no log line. This refuses to build \
+     because that failure is invisible at runtime. WORKAROUND: patch libc's \
+     time_t to c_longlong for this target, in BOTH this workspace and the \
+     copy -Zbuild-std compiles for std -- patching only one leaves std broken. \
+     See RTEMS_LIBC_TIME_LAYOUT_IS_CORRECT for the measured layouts."
+);
+
 /// Pulls this crate — and with it the boot shim and the RTEMS libraries — into
 /// the binary's link.
 ///
@@ -159,6 +249,112 @@ mod rtems {
 mod tests {
     use super::UNLINKABLE_MARKER;
     use super::contract::*;
+
+    /// This file, with the test module cut off.
+    ///
+    /// The layout guard is `#[cfg(target_os = "rtems")]`, so no host test can
+    /// evaluate it and the only thing host CI can defend is its source. That
+    /// makes self-matching the hazard: a test that searched the whole file
+    /// would find its own needles and pass vacuously forever.
+    fn production_source() -> &'static str {
+        let src = include_str!("lib.rs");
+        let marker = "\n#[cfg(test)]\n";
+        assert_eq!(
+            src.matches(marker).count(),
+            1,
+            "a second top-level #[cfg(test)] would make this slice the wrong prefix"
+        );
+        src.split(marker).next().unwrap()
+    }
+
+    /// One item's source, from its declaration to the terminating `;`.
+    ///
+    /// Every content guard below searches an *item*, never the file. The doc
+    /// comments above these two items quote the same tokens the guards look
+    /// for — `c_longlong`, and `size_of::<libc::timespec>() == 8` as the
+    /// *wrong* value — so a whole-file search passes on the prose while the
+    /// code says the opposite. Measured, not theorised: deleting the
+    /// workaround from the refusal message left the message guard green until
+    /// it was scoped this way.
+    fn item_body(declaration: &str) -> &'static str {
+        let (_, body) = production_source()
+            .split_once(declaration)
+            .unwrap_or_else(|| panic!("`{declaration}` is gone from lib.rs"));
+        body.split_once(';')
+            .unwrap_or_else(|| panic!("`{declaration}` has no terminating `;`"))
+            .0
+    }
+
+    /// The refusal must stay on the *linkable-image* arm — not narrower, not
+    /// wider.
+    ///
+    /// Narrower (an added `feature = …`, or a `not(…)`) lets a bootable image
+    /// through with zero-resolution `Instant`. Wider (dropping
+    /// `rtems_boot_linked`) deletes the toolchain-free portability gate, which
+    /// is the one gate that runs without the bring-up box. Both directions are
+    /// regressions, so the cfg is pinned exactly.
+    #[test]
+    fn the_libc_layout_refusal_fires_for_every_image_that_can_boot() {
+        let src = production_source();
+        let cfg = concat!("#[cfg(all(target_os = \"rtems\", ", "rtems_boot_linked))]");
+        assert_eq!(
+            src.matches(cfg).count(),
+            1,
+            "the libc layout refusal must carry exactly `{cfg}`: an image that \
+             links has a boot shim, and an image without one cannot link at all"
+        );
+        let (_, after) = src.split_once(cfg).unwrap();
+        assert!(
+            after
+                .trim_start()
+                .starts_with("const _RTEMS_LIBC_TIME_LAYOUT: () = assert!("),
+            "that cfg must guard the layout assertion and nothing else"
+        );
+    }
+
+    /// The measured target layout, pinned as numbers.
+    ///
+    /// A host cannot name `libc::timespec` for `arm-rtems6`, so these are the
+    /// values from the bring-up box written down. Weakening the predicate to
+    /// match the broken `libc` (`== 8`, `== 4`) is the mutation that silently
+    /// restores the defect, and it is exactly what this catches.
+    #[test]
+    fn the_predicate_pins_the_layout_the_target_actually_has() {
+        let src = item_body("pub const RTEMS_LIBC_TIME_LAYOUT_IS_CORRECT: bool =");
+        for required in [
+            "size_of::<libc::time_t>() == 8",
+            "size_of::<libc::timespec>() == 16",
+            "align_of::<libc::timespec>() == 8",
+            "offset_of!(libc::timespec, tv_nsec) == 8",
+        ] {
+            assert!(
+                src.contains(required),
+                "the RTEMS libc layout predicate lost `{required}`; the target's \
+                 timespec is 16/align 8 with tv_nsec at 8 and time_t is 8 signed"
+            );
+        }
+    }
+
+    /// The message is the whole deliverable: whoever hits this is holding a
+    /// hard build error and must not have to rediscover a week of bring-up.
+    #[test]
+    fn the_refusal_message_names_the_defect_and_the_way_out() {
+        let src = item_body("const _RTEMS_LIBC_TIME_LAYOUT: () = assert!(");
+        for required in [
+            // the consequence, in the words that make it searchable
+            "ZERO-RESOLUTION",
+            "subsec_nanos",
+            "elapsed",
+            // the workaround, and the half of it that is easy to miss
+            "c_longlong",
+            "build-std",
+        ] {
+            assert!(
+                src.contains(required),
+                "the RTEMS libc layout refusal message must still name `{required}`"
+            );
+        }
+    }
 
     /// The poison symbol's spelling is load-bearing: it is the entire error
     /// message a developer gets from a shimless link, and it appears in two

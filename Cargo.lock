@@ -1189,6 +1189,7 @@ name = "epics-rtems-boot"
 version = "0.24.3"
 dependencies = [
  "cc",
+ "libc",
 ]
 
 [[package]]

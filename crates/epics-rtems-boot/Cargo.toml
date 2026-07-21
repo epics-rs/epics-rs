@@ -14,3 +14,9 @@ repository.workspace = true
 # is compiled but never invoked on a host build.
 [build-dependencies]
 cc = "1"
+
+# Only the RTEMS libc layout guard in `lib.rs` uses this. Unlike the
+# build-dependency table above, a *regular* target-cfg dependency IS evaluated
+# against the target, so this gate works and costs a host build nothing.
+[target.'cfg(target_os = "rtems")'.dependencies]
+libc = "0.2"

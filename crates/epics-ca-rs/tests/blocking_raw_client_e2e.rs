@@ -26,14 +26,18 @@
 //! helper below fails the test on a `CA_PROTO_ERROR` frame, which is what
 //! makes that a checked property rather than an assumption.
 //!
+//! Waits go through [`Circuit`], which never discards a frame — see the
+//! `common/raw_ca.rs` module docs for why that matters when one write produces
+//! two replies whose order the server does not fix.
+//!
 //! Ports are always ephemeral (`:0`) — never the real 5064, per the
 //! `build() ⟹ listening` port-ownership rule.
 
 #[path = "common/raw_ca.rs"]
 mod raw_ca;
 
-use std::io::Write;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
+use std::io::{Read, Write};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -65,6 +69,11 @@ fn seed_db(pvs: &[(&str, EpicsValue)]) -> Arc<PvDatabase> {
     db
 }
 
+/// The ioid a reply echoes, at bytes 12..16.
+fn ioid_of(frame: &[u8]) -> u32 {
+    u32::from_be_bytes([frame[12], frame[13], frame[14], frame[15]])
+}
+
 #[test]
 fn blocking_server_serves_a_raw_socket_client_end_to_end() {
     let db = seed_db(&[("RAW:E2E", EpicsValue::Double(1.5))]);
@@ -74,13 +83,9 @@ fn blocking_server_serves_a_raw_socket_client_end_to_end() {
     let sid = create_channel(&mut c, 0x1234, "RAW:E2E");
 
     // READ_NOTIFY sees the seeded value.
-    c.write_all(&read_notify_frame(sid, 0x01)).unwrap();
-    let r = read_until(&mut c, CA_PROTO_READ_NOTIFY, "READ_NOTIFY");
-    assert_eq!(
-        u32::from_be_bytes([r[12], r[13], r[14], r[15]]),
-        0x01,
-        "READ_NOTIFY reply echoes our ioid"
-    );
+    c.send(&read_notify_frame(sid, 0x01));
+    let r = c.expect(CA_PROTO_READ_NOTIFY, "READ_NOTIFY");
+    assert_eq!(ioid_of(&r), 0x01, "READ_NOTIFY reply echoes our ioid");
     assert_eq!(
         payload_double(&r),
         1.5,
@@ -88,15 +93,13 @@ fn blocking_server_serves_a_raw_socket_client_end_to_end() {
     );
 
     // Fire-and-forget WRITE: no reply frame, but the value must land.
-    c.write_all(&write_frame(CA_PROTO_WRITE, sid, 0, 4.25))
-        .unwrap();
-    expect_silence(
-        &mut c,
+    c.send(&write_frame(CA_PROTO_WRITE, sid, 0, 4.25));
+    c.expect_silence(
         Duration::from_millis(250),
         "fire-and-forget WRITE must draw no reply",
     );
-    c.write_all(&read_notify_frame(sid, 0x02)).unwrap();
-    let r = read_until(&mut c, CA_PROTO_READ_NOTIFY, "READ_NOTIFY after WRITE");
+    c.send(&read_notify_frame(sid, 0x02));
+    let r = c.expect(CA_PROTO_READ_NOTIFY, "READ_NOTIFY after WRITE");
     assert_eq!(
         payload_double(&r),
         4.25,
@@ -104,29 +107,20 @@ fn blocking_server_serves_a_raw_socket_client_end_to_end() {
     );
 
     // WRITE_NOTIFY (put-callback): a synchronous record replies immediately.
-    c.write_all(&write_frame(CA_PROTO_WRITE_NOTIFY, sid, 0x03, 7.5))
-        .unwrap();
-    let wn = read_until(&mut c, CA_PROTO_WRITE_NOTIFY, "WRITE_NOTIFY");
-    assert_eq!(
-        u32::from_be_bytes([wn[12], wn[13], wn[14], wn[15]]),
-        0x03,
-        "WRITE_NOTIFY reply echoes our ioid"
-    );
-    c.write_all(&read_notify_frame(sid, 0x04)).unwrap();
-    let r = read_until(
-        &mut c,
-        CA_PROTO_READ_NOTIFY,
-        "READ_NOTIFY after WRITE_NOTIFY",
-    );
+    c.send(&write_frame(CA_PROTO_WRITE_NOTIFY, sid, 0x03, 7.5));
+    let wn = c.expect(CA_PROTO_WRITE_NOTIFY, "WRITE_NOTIFY");
+    assert_eq!(ioid_of(&wn), 0x03, "WRITE_NOTIFY reply echoes our ioid");
+    c.send(&read_notify_frame(sid, 0x04));
+    let r = c.expect(CA_PROTO_READ_NOTIFY, "READ_NOTIFY after WRITE_NOTIFY");
     assert_eq!(payload_double(&r), 7.5, "WRITE_NOTIFY took effect");
 
     // EVENT_ADD: initial snapshot, then a real update delivered over the
     // socket by the server's event path when the value changes.
     let sub_id = 0xAB;
-    c.write_all(&event_add_frame(sid, sub_id)).unwrap();
-    let initial = read_until(&mut c, CA_PROTO_EVENT_ADD, "EVENT_ADD initial");
+    c.send(&event_add_frame(sid, sub_id));
+    let initial = c.expect(CA_PROTO_EVENT_ADD, "EVENT_ADD initial");
     assert_eq!(
-        u32::from_be_bytes([initial[12], initial[13], initial[14], initial[15]]),
+        ioid_of(&initial),
         sub_id,
         "monitor frame carries our subscription id"
     );
@@ -136,29 +130,37 @@ fn blocking_server_serves_a_raw_socket_client_end_to_end() {
         "initial monitor update is the current VAL"
     );
 
-    c.write_all(&write_frame(CA_PROTO_WRITE_NOTIFY, sid, 0x05, 99.0))
-        .unwrap();
-    let update = read_until(&mut c, CA_PROTO_EVENT_ADD, "EVENT_ADD update");
+    // One write, two replies: the put-callback acknowledgement and the monitor
+    // update it fans out. The server fixes no order between them, so claim both
+    // rather than waiting on one and destroying the other.
+    c.send(&write_frame(CA_PROTO_WRITE_NOTIFY, sid, 0x05, 99.0));
+    let pair = c.expect_all(
+        &[CA_PROTO_WRITE_NOTIFY, CA_PROTO_EVENT_ADD],
+        "WRITE_NOTIFY and the monitor update it fans out",
+    );
     assert_eq!(
-        payload_double(&update),
+        ioid_of(&pair[0]),
+        0x05,
+        "the fanning-out write is acknowledged, echoing our ioid"
+    );
+    assert_eq!(
+        payload_double(&pair[1]),
         99.0,
         "a write fans out to the subscription as a monitor update"
     );
 
     // EVENT_CANCEL: the subscription stops delivering.
-    c.write_all(&event_cancel_frame(sid, sub_id)).unwrap();
-    let _ = read_cancel_ack(&mut c, sub_id);
-    c.write_all(&write_frame(CA_PROTO_WRITE, sid, 0, 123.0))
-        .unwrap();
-    expect_silence(
-        &mut c,
+    c.send(&event_cancel_frame(sid, sub_id));
+    let _ = c.expect_cancel_ack(sub_id);
+    c.send(&write_frame(CA_PROTO_WRITE, sid, 0, 123.0));
+    c.expect_silence(
         Duration::from_millis(250),
         "a cancelled subscription must deliver nothing",
     );
 
     // CLEAR_CHANNEL closes the channel; the circuit itself stays up.
-    c.write_all(&clear_channel_frame(sid, 0x1234)).unwrap();
-    let cl = read_until(&mut c, CA_PROTO_CLEAR_CHANNEL, "CLEAR_CHANNEL");
+    c.send(&clear_channel_frame(sid, 0x1234));
+    let cl = c.expect(CA_PROTO_CLEAR_CHANNEL, "CLEAR_CHANNEL");
     assert_eq!(
         u32::from_be_bytes([cl[8], cl[9], cl[10], cl[11]]),
         sid,
@@ -168,6 +170,64 @@ fn blocking_server_serves_a_raw_socket_client_end_to_end() {
     drop(c);
     server.shutdown();
     accept.join().unwrap();
+}
+
+/// The wait helper must not depend on which of two racing replies lands first.
+///
+/// Against a real server that order is not fixed: measured over 25 rounds, the
+/// `SimplePv` path sent the WRITE_NOTIFY acknowledgement first 25/25 times,
+/// while the real-record path sent it first only 10/25 times and the monitor
+/// update first the other 15. A test written against whichever order happens to
+/// occur is therefore a test that passes by luck.
+///
+/// A fake peer here sends the pair in the *opposite* order to the one the e2e
+/// above waits in — precisely the case a discarding reader gets wrong. Such a
+/// reader consumes and throws away the monitor update while looking for the
+/// acknowledgement, and then blocks forever on an update that no longer exists.
+#[test]
+fn a_racing_reply_pair_is_delivered_whichever_order_it_arrives_in() {
+    /// A zero-payload reply, the shape a WRITE_NOTIFY acknowledgement takes.
+    fn ack_frame(cmmd: u16, sid: u32, ioid: u32) -> Vec<u8> {
+        let mut h = CaHeader::new(cmmd);
+        h.data_type = DBR_DOUBLE;
+        h.count = 1;
+        h.cid = sid;
+        h.available = ioid;
+        h.to_bytes().to_vec()
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral loopback port");
+    let addr = listener.local_addr().unwrap();
+    let peer = thread::spawn(move || {
+        let (mut s, _) = listener.accept().expect("accept");
+        // Monitor update FIRST, acknowledgement second — the order the tests
+        // above do not wait in.
+        s.write_all(&write_frame(CA_PROTO_EVENT_ADD, 1, 0xAB, 99.0))
+            .unwrap();
+        s.write_all(&ack_frame(CA_PROTO_WRITE_NOTIFY, 1, 0x05))
+            .unwrap();
+        // Hold the connection open until the client hangs up, so the reads
+        // above cannot succeed merely because the socket closed.
+        let mut sink = [0u8; 1];
+        let _ = s.read(&mut sink);
+    });
+
+    let mut c = Circuit::new(TcpStream::connect(addr).expect("connect to fake peer"));
+    let wn = c.expect(CA_PROTO_WRITE_NOTIFY, "acknowledgement sent second");
+    assert_eq!(ioid_of(&wn), 0x05, "the acknowledgement echoes our ioid");
+    let update = c.expect(CA_PROTO_EVENT_ADD, "monitor update sent first");
+    assert_eq!(
+        payload_double(&update),
+        99.0,
+        "the update survived a wait that was looking for the acknowledgement"
+    );
+    c.expect_silence(
+        Duration::from_millis(100),
+        "both frames were claimed, so nothing is left queued",
+    );
+
+    drop(c);
+    peer.join().unwrap();
 }
 
 /// A second circuit opened after the first closed proves the accept loop
@@ -180,15 +240,14 @@ fn blocking_server_accepts_a_second_circuit_after_the_first_closes() {
     {
         let mut c = connect_and_handshake(addr);
         let sid = create_channel(&mut c, 1, "RAW:SEQ");
-        c.write_all(&write_frame(CA_PROTO_WRITE_NOTIFY, sid, 1, 20.0))
-            .unwrap();
-        let _ = read_until(&mut c, CA_PROTO_WRITE_NOTIFY, "first circuit WRITE_NOTIFY");
+        c.send(&write_frame(CA_PROTO_WRITE_NOTIFY, sid, 1, 20.0));
+        let _ = c.expect(CA_PROTO_WRITE_NOTIFY, "first circuit WRITE_NOTIFY");
     }
 
     let mut c2 = connect_and_handshake(addr);
     let sid2 = create_channel(&mut c2, 2, "RAW:SEQ");
-    c2.write_all(&read_notify_frame(sid2, 1)).unwrap();
-    let r = read_until(&mut c2, CA_PROTO_READ_NOTIFY, "second circuit READ_NOTIFY");
+    c2.send(&read_notify_frame(sid2, 1));
+    let r = c2.expect(CA_PROTO_READ_NOTIFY, "second circuit READ_NOTIFY");
     assert_eq!(
         payload_double(&r),
         20.0,
@@ -357,8 +416,8 @@ fn a_udp_search_leads_to_a_working_tcp_circuit() {
     // Dial exactly the advertised port — not `local_addr()`.
     let mut c = connect_and_handshake(SocketAddr::from((Ipv4Addr::LOCALHOST, advertised)));
     let sid = create_channel(&mut c, 0x99, "RAW:BOTH");
-    c.write_all(&read_notify_frame(sid, 1)).unwrap();
-    let r = read_until(&mut c, CA_PROTO_READ_NOTIFY, "READ_NOTIFY on searched port");
+    c.send(&read_notify_frame(sid, 1));
+    let r = c.expect(CA_PROTO_READ_NOTIFY, "READ_NOTIFY on searched port");
     assert_eq!(
         payload_double(&r),
         3.25,

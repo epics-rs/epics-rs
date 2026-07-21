@@ -27,6 +27,11 @@
 //! thread stays live and answers other requests on the same circuit — C
 //! `camsgtask` never blocks on `dbProcessNotify`.
 //!
+//! Waits go through [`Circuit`], which never discards a frame. That matters
+//! more here than anywhere: this is the path measured at 10/25 WRITE_NOTIFY
+//! first versus 15/25 monitor-update first, so any wait that destroyed the
+//! reply it was not looking for would fail roughly half the time.
+//!
 //! No `CaClient`, no tokio runtime, no `.await` in any test. Ephemeral ports
 //! only — never 5064, per the `build() ⟹ listening` rule.
 
@@ -36,7 +41,6 @@
 mod raw_ca;
 
 use std::collections::HashMap;
-use std::io::Write;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -44,8 +48,8 @@ use epics_base_rs::runtime::task::{background_init, block_on_sync};
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_ca_rs::protocol::{
-    CA_PROTO_CLEAR_CHANNEL, CA_PROTO_CREATE_CHAN, CA_PROTO_EVENT_ADD, CA_PROTO_READ_NOTIFY,
-    CA_PROTO_WRITE, CA_PROTO_WRITE_NOTIFY,
+    CA_PROTO_ACCESS_RIGHTS, CA_PROTO_CLEAR_CHANNEL, CA_PROTO_CREATE_CHAN, CA_PROTO_EVENT_ADD,
+    CA_PROTO_READ_NOTIFY, CA_PROTO_WRITE, CA_PROTO_WRITE_NOTIFY,
 };
 use raw_ca::*;
 
@@ -91,9 +95,14 @@ fn build_real_db() -> Arc<PvDatabase> {
 /// CREATE_CHAN that also returns what the channel announced: `(sid, native
 /// dbr type, element count)`. Real records answer their own native type here;
 /// a `SimplePv` cannot.
-fn create_channel_typed(c: &mut std::net::TcpStream, cid: u32, pv: &str) -> (u32, u16, u32) {
-    c.write_all(&create_chan_frame(cid, pv)).unwrap();
-    let cc = read_until(c, CA_PROTO_CREATE_CHAN, "CREATE_CHAN");
+fn create_channel_typed(c: &mut Circuit, cid: u32, pv: &str) -> (u32, u16, u32) {
+    c.send(&create_chan_frame(cid, pv));
+    // ACCESS_RIGHTS accompanies the reply; claim it so it is not left queued.
+    let replies = c.expect_all(
+        &[CA_PROTO_ACCESS_RIGHTS, CA_PROTO_CREATE_CHAN],
+        "CREATE_CHAN and its ACCESS_RIGHTS",
+    );
+    let cc = &replies[1];
     // CREATE_CHAN reply layout: data_type at 4..6, data_count at 6..8,
     // our cid at 8..12, the server's sid at 12..16.
     let native = u16::from_be_bytes([cc[4], cc[5]]);
@@ -119,35 +128,9 @@ fn payload_string(frame: &[u8]) -> String {
     String::from_utf8_lossy(&body[..end]).into_owned()
 }
 
-/// Collect the next frames until BOTH `a` and `b` have been seen, returning
-/// them in that order.
-///
-/// `read_until` discards frames that do not match, which is fine for a single
-/// expectation but wrong when two replies race — a WRITE_NOTIFY reply and the
-/// monitor update the same write fans out arrive in an order the server does
-/// not promise, so waiting for one would swallow the other.
-fn read_both(sock: &mut std::net::TcpStream, a: u16, b: u16, what: &str) -> (Vec<u8>, Vec<u8>) {
-    let (mut got_a, mut got_b) = (None, None);
-    for _ in 0..64 {
-        if got_a.is_some() && got_b.is_some() {
-            break;
-        }
-        let frame = read_one_frame(sock);
-        let cmmd = cmmd_of(&frame);
-        if cmmd == a && got_a.is_none() {
-            got_a = Some(frame);
-        } else if cmmd == b && got_b.is_none() {
-            got_b = Some(frame);
-        }
-    }
-    match (got_a, got_b) {
-        (Some(x), Some(y)) => (x, y),
-        (x, y) => panic!(
-            "{what}: wanted cmmd {a} and {b}; got {} and {}",
-            if x.is_some() { "yes" } else { "no" },
-            if y.is_some() { "yes" } else { "no" }
-        ),
-    }
+/// The ioid a reply echoes, at bytes 12..16.
+fn ioid_of(frame: &[u8]) -> u32 {
+    u32::from_be_bytes([frame[12], frame[13], frame[14], frame[15]])
 }
 
 // ---------------------------------------------------------------------------
@@ -174,20 +157,20 @@ fn real_records_announce_native_types_and_serve_their_values() {
     assert_eq!(msg_native, DBR_STRING, "stringout is natively DBR_STRING");
 
     // READ_NOTIFY each in its own native type.
-    c.write_all(&read_notify_frame(ao_sid, 0x01)).unwrap();
-    let r = read_until(&mut c, CA_PROTO_READ_NOTIFY, "ao READ_NOTIFY");
+    c.send(&read_notify_frame(ao_sid, 0x01));
+    let r = c.expect(CA_PROTO_READ_NOTIFY, "ao READ_NOTIFY");
     assert_eq!(payload_double(&r), 1.5, "ao VAL from the db string");
 
     let mut lo_req = read_notify_frame(lo_sid, 0x02);
     lo_req[4..6].copy_from_slice(&DBR_LONG.to_be_bytes());
-    c.write_all(&lo_req).unwrap();
-    let r = read_until(&mut c, CA_PROTO_READ_NOTIFY, "longout READ_NOTIFY");
+    c.send(&lo_req);
+    let r = c.expect(CA_PROTO_READ_NOTIFY, "longout READ_NOTIFY");
     assert_eq!(payload_long(&r), 7, "longout VAL from the db string");
 
     let mut msg_req = read_notify_frame(msg_sid, 0x03);
     msg_req[4..6].copy_from_slice(&DBR_STRING.to_be_bytes());
-    c.write_all(&msg_req).unwrap();
-    let r = read_until(&mut c, CA_PROTO_READ_NOTIFY, "stringout READ_NOTIFY");
+    c.send(&msg_req);
+    let r = c.expect(CA_PROTO_READ_NOTIFY, "stringout READ_NOTIFY");
     assert_eq!(
         payload_string(&r),
         "rtems-ca-ioc",
@@ -211,13 +194,13 @@ fn record_fields_are_addressable_as_channels() {
     assert_eq!(egu_native, DBR_STRING, "EGU is a string field");
     let mut req = read_notify_frame(egu_sid, 1);
     req[4..6].copy_from_slice(&DBR_STRING.to_be_bytes());
-    c.write_all(&req).unwrap();
-    let r = read_until(&mut c, CA_PROTO_READ_NOTIFY, "EGU READ_NOTIFY");
+    c.send(&req);
+    let r = c.expect(CA_PROTO_READ_NOTIFY, "EGU READ_NOTIFY");
     assert_eq!(payload_string(&r), "V", "ao EGU from the db string");
 
     let (prec_sid, _, _) = create_channel_typed(&mut c, 2, "RT:AO.PREC");
-    c.write_all(&read_notify_frame(prec_sid, 2)).unwrap();
-    let r = read_until(&mut c, CA_PROTO_READ_NOTIFY, "PREC READ_NOTIFY");
+    c.send(&read_notify_frame(prec_sid, 2));
+    let r = c.expect(CA_PROTO_READ_NOTIFY, "PREC READ_NOTIFY");
     assert_eq!(payload_double(&r), 3.0, "ao PREC from the db string");
 
     drop(c);
@@ -236,52 +219,48 @@ fn writes_and_monitors_work_against_a_real_ao_record() {
 
     // Subscribe: initial snapshot is the seeded VAL.
     let sub_id = 0xAB;
-    c.write_all(&event_add_frame(sid, sub_id)).unwrap();
-    let initial = read_until(&mut c, CA_PROTO_EVENT_ADD, "EVENT_ADD initial");
+    c.send(&event_add_frame(sid, sub_id));
+    let initial = c.expect(CA_PROTO_EVENT_ADD, "EVENT_ADD initial");
     assert_eq!(payload_double(&initial), 1.5, "initial monitor is ao VAL");
 
-    // WRITE_NOTIFY: the ao processes and the put-callback replies.
-    c.write_all(&write_frame(CA_PROTO_WRITE_NOTIFY, sid, 0x11, 6.25))
-        .unwrap();
-    let (wn, update) = read_both(
-        &mut c,
-        CA_PROTO_WRITE_NOTIFY,
-        CA_PROTO_EVENT_ADD,
-        "ao WRITE_NOTIFY + its monitor update",
+    // One write, two replies whose order this path genuinely varies (10/25
+    // versus 15/25 when measured), so claim both rather than waiting on one.
+    c.send(&write_frame(CA_PROTO_WRITE_NOTIFY, sid, 0x11, 6.25));
+    let pair = c.expect_all(
+        &[CA_PROTO_WRITE_NOTIFY, CA_PROTO_EVENT_ADD],
+        "ao WRITE_NOTIFY and the monitor update it fans out",
     );
     assert_eq!(
-        u32::from_be_bytes([wn[12], wn[13], wn[14], wn[15]]),
+        ioid_of(&pair[0]),
         0x11,
         "WRITE_NOTIFY reply echoes our ioid"
     );
     assert_eq!(
-        payload_double(&update),
+        payload_double(&pair[1]),
         6.25,
         "the write fans out to the subscription"
     );
 
     // Cancel, then prove the subscription is really gone.
-    c.write_all(&event_cancel_frame(sid, sub_id)).unwrap();
-    let _ = read_cancel_ack(&mut c, sub_id);
-    c.write_all(&write_frame(CA_PROTO_WRITE, sid, 0, 77.0))
-        .unwrap();
-    expect_silence(
-        &mut c,
+    c.send(&event_cancel_frame(sid, sub_id));
+    let _ = c.expect_cancel_ack(sub_id);
+    c.send(&write_frame(CA_PROTO_WRITE, sid, 0, 77.0));
+    c.expect_silence(
         Duration::from_millis(250),
         "a cancelled subscription on a real record must deliver nothing",
     );
 
     // The fire-and-forget write still landed.
-    c.write_all(&read_notify_frame(sid, 0x12)).unwrap();
-    let r = read_until(&mut c, CA_PROTO_READ_NOTIFY, "READ_NOTIFY after WRITE");
+    c.send(&read_notify_frame(sid, 0x12));
+    let r = c.expect(CA_PROTO_READ_NOTIFY, "READ_NOTIFY after WRITE");
     assert_eq!(
         payload_double(&r),
         77.0,
         "fire-and-forget WRITE took effect"
     );
 
-    c.write_all(&clear_channel_frame(sid, 0x1234)).unwrap();
-    let cl = read_until(&mut c, CA_PROTO_CLEAR_CHANNEL, "CLEAR_CHANNEL");
+    c.send(&clear_channel_frame(sid, 0x1234));
+    let cl = c.expect(CA_PROTO_CLEAR_CHANNEL, "CLEAR_CHANNEL");
     assert_eq!(
         u32::from_be_bytes([cl[8], cl[9], cl[10], cl[11]]),
         sid,
@@ -311,18 +290,13 @@ fn a_pending_put_callback_does_not_block_the_circuit() {
     let ao_sid = create_channel(&mut c, 2, "RT:AO");
 
     let started = Instant::now();
-    c.write_all(&write_frame(CA_PROTO_WRITE_NOTIFY, proc_sid, 0x21, 1.0))
-        .unwrap();
+    c.send(&write_frame(CA_PROTO_WRITE_NOTIFY, proc_sid, 0x21, 1.0));
 
     // While the ODLY delay is running, an unrelated READ_NOTIFY on the same
     // circuit must be answered — the message thread is not parked on the
     // put-callback.
-    c.write_all(&read_notify_frame(ao_sid, 0x22)).unwrap();
-    let r = read_until(
-        &mut c,
-        CA_PROTO_READ_NOTIFY,
-        "READ_NOTIFY while put pending",
-    );
+    c.send(&read_notify_frame(ao_sid, 0x22));
+    let r = c.expect(CA_PROTO_READ_NOTIFY, "READ_NOTIFY while put pending");
     let read_at = started.elapsed();
     assert_eq!(payload_double(&r), 1.5, "the ao still serves its value");
     assert!(
@@ -333,10 +307,10 @@ fn a_pending_put_callback_does_not_block_the_circuit() {
     );
 
     // The put-callback itself lands only after the delay, on the executor.
-    let wn = read_until(&mut c, CA_PROTO_WRITE_NOTIFY, "deferred WRITE_NOTIFY");
+    let wn = c.expect(CA_PROTO_WRITE_NOTIFY, "deferred WRITE_NOTIFY");
     let done_at = started.elapsed();
     assert_eq!(
-        u32::from_be_bytes([wn[12], wn[13], wn[14], wn[15]]),
+        ioid_of(&wn),
         0x21,
         "deferred WRITE_NOTIFY reply echoes our ioid"
     );
@@ -364,16 +338,16 @@ fn two_circuits_share_the_database_and_its_monitors() {
     let r_sid = create_channel(&mut reader, 2, "RT:AO");
 
     let sub_id = 0x5C;
-    reader.write_all(&event_add_frame(r_sid, sub_id)).unwrap();
-    let initial = read_until(&mut reader, CA_PROTO_EVENT_ADD, "reader initial");
+    reader.send(&event_add_frame(r_sid, sub_id));
+    let initial = reader.expect(CA_PROTO_EVENT_ADD, "reader initial");
     assert_eq!(payload_double(&initial), 1.5);
 
-    writer
-        .write_all(&write_frame(CA_PROTO_WRITE_NOTIFY, w_sid, 0x31, 12.5))
-        .unwrap();
-    let _ = read_until(&mut writer, CA_PROTO_WRITE_NOTIFY, "writer WRITE_NOTIFY");
+    // The two replies land on *different* circuits here — the acknowledgement
+    // on the writer, the fan-out on the reader — so there is no race to lose.
+    writer.send(&write_frame(CA_PROTO_WRITE_NOTIFY, w_sid, 0x31, 12.5));
+    let _ = writer.expect(CA_PROTO_WRITE_NOTIFY, "writer WRITE_NOTIFY");
 
-    let update = read_until(&mut reader, CA_PROTO_EVENT_ADD, "reader update");
+    let update = reader.expect(CA_PROTO_EVENT_ADD, "reader update");
     assert_eq!(
         payload_double(&update),
         12.5,

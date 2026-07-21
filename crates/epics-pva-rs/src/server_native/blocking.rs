@@ -474,7 +474,9 @@ impl tokio::io::AsyncRead for ChannelReader {
 
 /// Blocking read loop. Ends on EOF, read error, or `SO_RCVTIMEO`; dropping
 /// `tx` on the way out is the EOF signal to the operation thread.
-fn reader_thread(mut sock: TcpStream, tx: mpsc::Sender<Vec<u8>>, peer: SocketAddr) {
+fn reader_thread(sock: Arc<TcpStream>, tx: mpsc::Sender<Vec<u8>>, peer: SocketAddr) {
+    // `impl Read for &TcpStream`: one shared descriptor, no `try_clone`.
+    let mut sock = &*sock;
     let mut chunk = [0u8; READ_CHUNK];
     loop {
         let n = match sock.read(&mut chunk) {
@@ -600,11 +602,10 @@ impl tokio::io::AsyncWrite for ChannelWriter {
 /// A partial write on expiry needs no repair: the caller ends the writer and
 /// the connection is torn down, so nothing is ever written to this socket
 /// again.
-fn write_frame_deadline(
-    sock: &mut TcpStream,
-    frame: &[u8],
-    send_timeout: Duration,
-) -> io::Result<()> {
+fn write_frame_deadline(sock: &TcpStream, frame: &[u8], send_timeout: Duration) -> io::Result<()> {
+    // `impl Write for &TcpStream`: rebind so `write`/`flush` have a mutable
+    // place to borrow, without needing `&mut TcpStream` from the caller.
+    let mut sock = sock;
     let deadline = Instant::now() + send_timeout;
     let mut off = 0;
     while off < frame.len() {
@@ -643,7 +644,7 @@ fn write_frame_deadline(
 /// and the loop unwinds down the existing EOF path, leaving `tcp.rs` and the
 /// hosted timing alone. See the module docs.
 fn writer_thread(
-    mut sock: TcpStream,
+    sock: Arc<TcpStream>,
     mut rx: mpsc::Receiver<Vec<u8>>,
     room: Arc<WriteRoom>,
     wake: ConnWake,
@@ -655,7 +656,7 @@ fn writer_thread(
     while let Ok(Some(frame)) = block_on_sync(rx.recv()) {
         // A slot just opened; let a parked `poll_write` retry.
         room.wake();
-        if let Err(e) = write_frame_deadline(&mut sock, &frame, send_timeout) {
+        if let Err(e) = write_frame_deadline(&sock, &frame, send_timeout) {
             debug!(?peer, error = %e, "blocking writer: send failed, ending connection");
             break;
         }
@@ -722,13 +723,20 @@ pub fn serve_connection_blocking(
         .set_write_timeout(Some(send_tick))
         .map_err(PvaError::Io)?;
 
-    // One socket, several handles: a dup'd fd for each child thread, and the
-    // original handed to the registry, which owns it from here on. Registering
-    // *before* either thread starts is what closes the window where a thread
-    // could be parked on a socket `stop` cannot reach.
-    let read_sock = stream.try_clone().map_err(PvaError::Io)?;
-    let write_sock = stream.try_clone().map_err(PvaError::Io)?;
-    let registration = registry.register(Arc::new(stream));
+    // One socket, several handles: the SAME descriptor shared through an
+    // `Arc` by both child threads and the registry, which owns it from here
+    // on. Registering *before* either thread starts is what closes the window
+    // where a thread could be parked on a socket `stop` cannot reach.
+    //
+    // Shared, not duplicated: `try_clone` is `fcntl(F_DUPFD_CLOEXEC)`, which
+    // cannot work for a socket on RTEMS 6 — see the same note in
+    // `epics-ca-rs/src/server/blocking.rs::handle_client_blocking` for the
+    // measured failure and the RTEMS/libbsd source that causes it.
+    // `impl Read/Write for &TcpStream` gives both roles with one descriptor.
+    let stream = Arc::new(stream);
+    let read_sock = stream.clone();
+    let write_sock = stream.clone();
+    let registration = registry.register(stream);
 
     let (chunk_tx, chunk_rx) = mpsc::channel::<Vec<u8>>(CHUNK_QUEUE_DEPTH);
     let (frame_tx, frame_rx) = mpsc::channel::<Vec<u8>>(FRAME_QUEUE_DEPTH);
@@ -1806,7 +1814,7 @@ mod tests {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind loopback");
         let addr = listener.local_addr().expect("local addr");
         let mut client = TcpStream::connect(addr).expect("connect");
-        let (mut server, _) = listener.accept().expect("accept");
+        let (server, _) = listener.accept().expect("accept");
 
         const SEND_TIMEOUT: Duration = Duration::from_millis(400);
         let tick = SEND_TIMEOUT / SEND_TICKS_PER_DEADLINE;
@@ -1839,7 +1847,7 @@ mod tests {
 
         let frame = vec![0xA5u8; 8 * 1024 * 1024];
         let started = Instant::now();
-        let err = write_frame_deadline(&mut server, &frame, SEND_TIMEOUT)
+        let err = write_frame_deadline(&server, &frame, SEND_TIMEOUT)
             .expect_err("a trickling peer must not be allowed to hold the writer");
         let elapsed = started.elapsed();
 
@@ -1876,7 +1884,7 @@ mod tests {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind loopback");
         let addr = listener.local_addr().expect("local addr");
         let mut client = TcpStream::connect(addr).expect("connect");
-        let (mut server, _) = listener.accept().expect("accept");
+        let (server, _) = listener.accept().expect("accept");
         server
             .set_write_timeout(Some(Duration::from_millis(50)))
             .expect("SO_SNDTIMEO");
@@ -1889,7 +1897,7 @@ mod tests {
             assert_eq!(got, expected, "bytes arrive intact and in order");
         });
 
-        write_frame_deadline(&mut server, &frame, Duration::from_secs(5))
+        write_frame_deadline(&server, &frame, Duration::from_secs(5))
             .expect("a reading peer takes the frame well inside the deadline");
         echo.join().expect("client thread");
     }
@@ -2033,9 +2041,9 @@ mod tests {
         let (_client, server, peer) = socket_pair();
 
         let registry = ConnRegistry::new();
-        let registration =
-            registry.register(Arc::new(server.try_clone().expect("dup for registry")));
-        let write_sock = server.try_clone().expect("dup for writer");
+        let server = Arc::new(server);
+        let registration = registry.register(server.clone());
+        let write_sock = server.clone();
         write_sock
             .set_write_timeout(Some(Duration::from_millis(250)))
             .expect("SO_SNDTIMEO");
@@ -2197,20 +2205,20 @@ mod tests {
         let (_client, server, peer) = socket_pair();
 
         let registry = ConnRegistry::new();
-        let registration =
-            registry.register(Arc::new(server.try_clone().expect("dup for registry")));
+        let server = Arc::new(server);
+        let registration = registry.register(server.clone());
 
-        let mut read_sock = server.try_clone().expect("dup for reader");
+        let read_sock = server.clone();
         let (read_done, read_result) = std::sync::mpsc::channel();
         let reader = thread::spawn(move || {
             let mut buf = [0u8; 64];
-            let _ = read_done.send(read_sock.read(&mut buf));
+            let _ = read_done.send((&*read_sock).read(&mut buf));
         });
         thread::sleep(Duration::from_millis(200));
 
         let (tx, rx) = mpsc::channel::<Vec<u8>>(FRAME_QUEUE_DEPTH);
         let wake = registration.wake_handle();
-        let write_sock = server.try_clone().expect("dup for writer");
+        let write_sock = server.clone();
         let writer = thread::spawn(move || {
             writer_thread(
                 write_sock,
@@ -2870,6 +2878,43 @@ mod tests {
         assert!(
             second.is_err(),
             "a second bind on an ephemeral port must fail, not silently share it"
+        );
+    }
+
+    /// The RTEMS driver's socket handles must be SHARED, never duplicated.
+    ///
+    /// The banned call is `std`'s clone-the-descriptor method, i.e.
+    /// `fcntl(F_DUPFD*)`. RTEMS 6 has no `F_DUPFD_CLOEXEC` case at all
+    /// (`cpukit/libcsupport/src/fcntl.c` falls to `default: EINVAL`), and
+    /// plain `F_DUPFD` goes through `duplicate_iop` (`fcntl.c:47-77`), which
+    /// calls the file's `open_h` — and rtems-libbsd installs
+    /// `rtems_bsd_sysgen_nodeops` on every socket
+    /// (`rtems-bsd-syscall-api.c:205`) whose `.open_h` is
+    /// `rtems_bsd_sysgen_open_error`. Measured on target: `dup`, `F_DUPFD`
+    /// and `F_DUPFD_CLOEXEC` all fail on an accepted socket with ENXIO, while
+    /// `F_DUPFD` on `/dev/console` succeeds.
+    ///
+    /// Host CI cannot catch a reintroduced duplicate here — it works
+    /// perfectly on Linux and fails only after a target boot. This guard is
+    /// the only thing standing in for that.
+    #[test]
+    fn the_rtems_socket_handles_are_shared_never_duplicated() {
+        // Comment lines are skipped: the call-site notes name the banned call
+        // on purpose, and the guard is about CODE. A real call cannot live on
+        // a line that starts with `//`. The needle is also split, because
+        // this guard lives in the file it reads.
+        let needle = concat!("try", "_clone");
+        let offenders: Vec<usize> = include_str!("blocking.rs")
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| !l.trim_start().starts_with("//"))
+            .filter(|(_, l)| l.contains(needle))
+            .map(|(i, _)| i + 1)
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "server_native/blocking.rs: duplicated descriptors cannot work on RTEMS/libbsd (lines {offenders:?}); \
+             share one `Arc<TcpStream>` and use `impl Read/Write for &TcpStream`"
         );
     }
 }

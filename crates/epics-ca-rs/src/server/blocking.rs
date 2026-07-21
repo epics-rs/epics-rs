@@ -39,7 +39,7 @@
 //! C serializes every write to one client's socket with `client->lock`
 //! (`SEND_LOCK`, `server.h:221`), because two threads write it — the
 //! `camsgtask` command thread and the `CAS-event` monitor thread
-//! (`dbEvent.c:1016`). We model that with an `Arc<Mutex<TcpStream>>` write
+//! (`dbEvent.c:1016`). We model that with an `Arc<Mutex<Arc<TcpStream>>>` write
 //! handle. Both writers now exist (S1c): the client thread draining command
 //! replies AND the per-client event thread ([`run_event_task`]) writing
 //! monitor updates lock this same mutex, so the two never interleave a frame.
@@ -600,8 +600,10 @@ fn is_read_timeout(kind: std::io::ErrorKind) -> bool {
 }
 
 /// Write one complete frame to the socket under the send lock, then flush.
-fn write_frame_locked(send_lock: &Mutex<TcpStream>, frame: &[u8]) -> std::io::Result<()> {
-    let mut sock = send_lock.lock().expect("CA send-lock poisoned");
+fn write_frame_locked(send_lock: &Mutex<Arc<TcpStream>>, frame: &[u8]) -> std::io::Result<()> {
+    let sock = send_lock.lock().expect("CA send-lock poisoned");
+    // `impl Write for &TcpStream` — the shared handle needs no `&mut`.
+    let mut sock = &**sock;
     sock.write_all(frame)?;
     sock.flush()
 }
@@ -611,10 +613,11 @@ fn write_frame_locked(send_lock: &Mutex<TcpStream>, frame: &[u8]) -> std::io::Re
 /// path — the blocking analogue of `drain_and_flush` (`tcp.rs:1627`), held
 /// under the `client->lock` send-lock (`server.h:221`).
 fn drain_outbox_locked(
-    send_lock: &Mutex<TcpStream>,
+    send_lock: &Mutex<Arc<TcpStream>>,
     drain: &mut OutboxDrain,
 ) -> std::io::Result<()> {
-    let mut sock = send_lock.lock().expect("CA send-lock poisoned");
+    let sock = send_lock.lock().expect("CA send-lock poisoned");
+    let mut sock = &**sock;
     while let Some(frame) = drain.try_next() {
         sock.write_all(&frame)?;
     }
@@ -656,11 +659,25 @@ fn handle_client_blocking(
         .map_err(CaError::Io)?;
 
     // One socket, two roles: a blocking read handle owned by this thread, and
-    // a write handle behind the SEND_LOCK. `try_clone` dups the fd so a
-    // future monitor thread (S1c) can write while this thread blocks on read
-    // — exactly the C camsgtask / CAS-event split.
-    let mut reader = stream.try_clone().map_err(CaError::Io)?;
-    let send_lock = Arc::new(Mutex::new(stream));
+    // a write handle behind the SEND_LOCK, so the monitor thread (S1c) can
+    // write while this thread blocks on read — the C camsgtask / CAS-event
+    // split.
+    //
+    // The split is made by SHARING one `TcpStream` through an `Arc`, not by
+    // duplicating the descriptor. `try_clone` is `fcntl(F_DUPFD_CLOEXEC)`, and
+    // on RTEMS 6 that cannot work for a socket: RTEMS's `fcntl` has no
+    // `F_DUPFD_CLOEXEC` case at all (`cpukit/libcsupport/src/fcntl.c:146-220`
+    // falls to `default: errno = EINVAL`), and even plain `F_DUPFD` fails
+    // because `duplicate_iop` (`fcntl.c:47-77`) calls the file's `open_h`
+    // while rtems-libbsd installs `rtems_bsd_sysgen_nodeops` on every socket
+    // (`rtems-bsd-syscall-api.c:204-205`), whose `.open_h` is
+    // `rtems_bsd_sysgen_open_error`. Measured on the target: `dup`,
+    // `F_DUPFD` and `F_DUPFD_CLOEXEC` all fail on an accepted socket while
+    // `F_DUPFD` on `/dev/console` succeeds. `impl Read/Write for &TcpStream`
+    // gives the same two roles with one descriptor, on every target.
+    let stream = Arc::new(stream);
+    let mut reader: &TcpStream = &stream;
+    let send_lock = Arc::new(Mutex::new(stream.clone()));
 
     let (outbox, mut drain) = outbox::channel();
     let mut state = ClientState::new(acf, tcp_port, db.clone());
@@ -734,7 +751,7 @@ fn handle_client_blocking(
             // bottom is gone — a single request/response still flushes here on the
             // next iteration (the client is then idle, so FIONREAD == 0), while a
             // pipelined burst coalesces into one write.
-            match pending_bytes(&reader) {
+            match pending_bytes(reader) {
                 Ok(0) | Err(_) => match drain_outbox_locked(&send_lock, &mut drain) {
                     Ok(()) => {}
                     Err(ref e) if is_peer_disconnect(e.kind()) => break,
@@ -1690,6 +1707,43 @@ mod tests {
         drop(c);
         server.shutdown();
         accept.join().unwrap();
+    }
+
+    /// The RTEMS driver's socket handles must be SHARED, never duplicated.
+    ///
+    /// The banned call is `std`'s clone-the-descriptor method, i.e.
+    /// `fcntl(F_DUPFD*)`. RTEMS 6 has no `F_DUPFD_CLOEXEC` case at all
+    /// (`cpukit/libcsupport/src/fcntl.c` falls to `default: EINVAL`), and
+    /// plain `F_DUPFD` goes through `duplicate_iop` (`fcntl.c:47-77`), which
+    /// calls the file's `open_h` — and rtems-libbsd installs
+    /// `rtems_bsd_sysgen_nodeops` on every socket
+    /// (`rtems-bsd-syscall-api.c:205`) whose `.open_h` is
+    /// `rtems_bsd_sysgen_open_error`. Measured on target: `dup`, `F_DUPFD`
+    /// and `F_DUPFD_CLOEXEC` all fail on an accepted socket with ENXIO, while
+    /// `F_DUPFD` on `/dev/console` succeeds.
+    ///
+    /// Host CI cannot catch a reintroduced duplicate here — it works
+    /// perfectly on Linux and fails only after a target boot. This guard is
+    /// the only thing standing in for that.
+    #[test]
+    fn the_rtems_socket_handles_are_shared_never_duplicated() {
+        // Comment lines are skipped: the call-site notes name the banned call
+        // on purpose, and the guard is about CODE. A real call cannot live on
+        // a line that starts with `//`. The needle is also split, because
+        // this guard lives in the file it reads.
+        let needle = concat!("try", "_clone");
+        let offenders: Vec<usize> = include_str!("blocking.rs")
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| !l.trim_start().starts_with("//"))
+            .filter(|(_, l)| l.contains(needle))
+            .map(|(i, _)| i + 1)
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "server/blocking.rs: duplicated descriptors cannot work on RTEMS/libbsd (lines {offenders:?}); \
+             share one `Arc<TcpStream>` and use `impl Read/Write for &TcpStream`"
+        );
     }
 
     /// Source guard for the structural half of C1: BOTH CA server drivers

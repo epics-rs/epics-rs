@@ -116,9 +116,10 @@ use crate::protocol::{
     CA_PROTO_ECHO, CA_PROTO_EVENT_ADD, CA_PROTO_EVENT_CANCEL, CA_PROTO_EVENTS_OFF,
     CA_PROTO_EVENTS_ON, CA_PROTO_HOST_NAME, CA_PROTO_READ, CA_PROTO_READ_NOTIFY,
     CA_PROTO_READ_SYNC, CA_PROTO_SEARCH, CA_PROTO_VERSION, CA_PROTO_WRITE, CA_PROTO_WRITE_NOTIFY,
-    CaHeader, ECA_UNAVAILINSERV, ca_v49,
+    CaHeader, ECA_TOLARGE, ECA_UNAVAILINSERV, ca_v49,
 };
 use crate::server::outbox::{self, OutboxDrain};
+use crate::server::recv::{Admit, RecvAccumulator, Refused};
 use crate::server::tcp::{
     CancelInfo, ChannelTarget, ClientState, EventTaskControl, MonitorDelivery,
     SubscriptionDelivery, SubscriptionOutcome, WriteHeadOutcome, cancel_subscription_reply,
@@ -721,7 +722,7 @@ fn handle_client_blocking(
     // handler error) — C ends `camsgtask` AND its `event_task` together on a
     // client disconnect, with no leaked thread.
     let result: CaResult<()> = (|| {
-        let mut accumulated: Vec<u8> = Vec::new();
+        let mut accumulated = RecvAccumulator::new();
         let mut buf = vec![0u8; 8192];
 
         loop {
@@ -758,11 +759,28 @@ fn handle_client_blocking(
                 }
                 Err(e) => return Err(CaError::Io(e)),
             };
-            accumulated.extend_from_slice(&buf[..n]);
+            // The single growth point, shared with the async driver. `accept`
+            // runs C's drain preamble (`camessage.c:2375-2384` — bytes owed to
+            // an already-refused message are discarded before any header
+            // parsing) and enforces the accumulation ceiling before appending,
+            // so neither this loop nor the peer decides how large this buffer
+            // gets.
+            match accumulated.accept(&buf[..n]) {
+                Admit::Parse => {}
+                Admit::Draining => continue,
+                Admit::Overflow(cap) => {
+                    tracing::warn!(
+                        target: "epics_ca_rs::server::blocking",
+                        %peer, cap,
+                        "CA server: client accumulated buffer exceeded the ceiling, closing"
+                    );
+                    break;
+                }
+            }
 
             let mut offset = 0;
             while offset + CaHeader::SIZE <= accumulated.len() {
-                let tail = &accumulated[offset..];
+                let tail = &accumulated.bytes()[offset..];
                 // Partial extended-form header (16..24 bytes of a 0xffff-postsize
                 // frame): wait for the annex. Mirrors `handle_client` tcp.rs:2001.
                 if ca_v49(state.client_minor_version())
@@ -782,12 +800,54 @@ fn handle_client_blocking(
                         Err(_) => break,
                     };
                 let actual_post = hdr.actual_postsize();
+
+                // C `camessage.c:2471-2489`: a declared body the receive
+                // buffer can never hold earns ECA_TOLARGE and a drain, not a
+                // disconnect — the client keeps every channel and
+                // subscription it holds. Without this the loop below waited
+                // for `hdr_size + actual_post` bytes that will never arrive
+                // while `accept` kept buffering the dribble, so a single
+                // 24-byte extended header declaring ~4 GiB was an
+                // out-of-memory kill on a target with 32 MiB.
+                //
+                // Placed before `hdr_size + actual_post` is formed: on a
+                // 32-bit target — which is what RTEMS is — that sum wraps for
+                // a declared body near `u32::MAX`, so `msg_len` is only
+                // meaningful once this gate has passed.
+                if let Err(ceiling) = RecvAccumulator::admits_body(actual_post) {
+                    let _ = send_ca_error(
+                        &outbox,
+                        &hdr,
+                        ECA_TOLARGE,
+                        0xFFFF_FFFF,
+                        &crate::server::recv::too_large_message(ceiling),
+                        state.client_minor_version(),
+                    );
+                    tracing::warn!(
+                        target: "epics_ca_rs::server::blocking",
+                        %peer, declared = actual_post, max = ceiling,
+                        "CAS: server unable to load large request message"
+                    );
+                    let msg_len = hdr_size.saturating_add(actual_post);
+                    match accumulated.refuse(offset, msg_len) {
+                        Refused::ResumeAt(next) => {
+                            offset = next;
+                            continue;
+                        }
+                        Refused::DrainPending => {
+                            offset = accumulated.len();
+                            break;
+                        }
+                    }
+                }
+
                 let msg_len = hdr_size + actual_post;
                 if offset + msg_len > accumulated.len() {
                     break; // frame body not fully arrived yet
                 }
-                let payload =
-                    accumulated[offset + hdr_size..offset + hdr_size + actual_post].to_vec();
+                let payload = accumulated.bytes()
+                    [offset + hdr_size..offset + hdr_size + actual_post]
+                    .to_vec();
 
                 if hdr.cmmd == CA_PROTO_EVENT_ADD {
                     // Register the subscription with the SHARED parity logic in
@@ -983,7 +1043,7 @@ fn handle_client_blocking(
                 offset += msg_len;
             }
             if offset > 0 {
-                accumulated.drain(..offset);
+                accumulated.consume(offset);
             }
             // The reply drain lives at the loop top (FIONREAD-gated), not here —
             // holding replies until the socket drains is the C batch-up rule
@@ -1439,6 +1499,247 @@ mod tests {
 
         server.shutdown();
         accept.join().unwrap();
+    }
+
+    /// Build an attacker-shaped extended-form READ_NOTIFY header: 24 bytes
+    /// declaring `declared_body` payload bytes that never have to arrive.
+    /// `m_postsize == 0xffff` alone selects the extended form
+    /// (`camessage.c:2410`, mirrored at `protocol.rs:790`), and the annex
+    /// carries the full u32 — which is what makes ~4 GiB expressible in a
+    /// 24-byte write.
+    fn extended_read_notify_header(sid: u32, ioid: u32, declared_body: u32) -> Vec<u8> {
+        const DBR_DOUBLE: u16 = 6;
+        let mut f = Vec::with_capacity(24);
+        f.extend_from_slice(&CA_PROTO_READ_NOTIFY.to_be_bytes());
+        f.extend_from_slice(&0xFFFFu16.to_be_bytes()); // extended marker
+        f.extend_from_slice(&DBR_DOUBLE.to_be_bytes());
+        f.extend_from_slice(&0xFFFFu16.to_be_bytes());
+        f.extend_from_slice(&sid.to_be_bytes());
+        f.extend_from_slice(&ioid.to_be_bytes());
+        f.extend_from_slice(&declared_body.to_be_bytes()); // the annex postsize
+        f.extend_from_slice(&1u32.to_be_bytes()); // the annex count
+        f
+    }
+
+    /// Handshake + one channel; returns the client socket and its sid.
+    fn connected_client(addr: SocketAddr, pv: &str) -> (TcpStream, u32) {
+        let mut c = TcpStream::connect(addr).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let _ = read_until_cmmd(&mut c, CA_PROTO_VERSION);
+        c.write_all(&version_frame()).unwrap();
+        c.write_all(&client_name_frame("tester")).unwrap();
+        c.write_all(&host_name_frame("testhost")).unwrap();
+        c.write_all(&create_chan_frame(0x1234, pv)).unwrap();
+        let cc = read_until_cmmd(&mut c, CA_PROTO_CREATE_CHAN);
+        let sid = u32::from_be_bytes([cc[12], cc[13], cc[14], cc[15]]);
+        (c, sid)
+    }
+
+    /// C1 boundary, ONE OVER the ceiling, in the extended-header form, with
+    /// the body dribbled: a 24-byte write declaring `body_ceiling() + 1`
+    /// payload bytes must earn `ECA_TOLARGE` immediately — before any body
+    /// byte is sent — and must NOT close the circuit.
+    ///
+    /// C `camessage.c:2471-2489` is the reference: over-large earns
+    /// `ECA_TOLARGE` naming `rsrvSizeofLargeBufTCP`, sets
+    /// `client->recvBytesToDrain`, and returns `RSRV_OK` — the client keeps
+    /// every channel it holds. Before this gate the blocking driver simply
+    /// waited for `hdr_size + actual_post` bytes that were never coming,
+    /// buffering the dribble the whole time.
+    #[test]
+    fn an_extended_body_over_the_ceiling_earns_eca_tolarge_without_closing() {
+        let db = seed_db(&[("BLK:TL", EpicsValue::Double(7.0))]);
+        let server = Arc::new(BlockingCaServer::bind("127.0.0.1:0", db, new_acf()).unwrap());
+        let addr = server.local_addr().unwrap();
+        let srv = server.clone();
+        let accept = thread::spawn(move || srv.serve());
+
+        let (mut c, sid) = connected_client(addr, "BLK:TL");
+
+        let ceiling = crate::server::recv::RecvAccumulator::body_ceiling();
+        let declared = (ceiling + 1) as u32;
+        // Header only. Not one byte of the declared body is ever sent.
+        c.write_all(&extended_read_notify_header(sid, 0x99, declared))
+            .unwrap();
+
+        let err = read_until_cmmd(&mut c, crate::protocol::CA_PROTO_ERROR);
+        assert_eq!(
+            u32::from_be_bytes([err[12], err[13], err[14], err[15]]),
+            ECA_TOLARGE,
+            "C sends ECA_TOLARGE here, not ECA_INTERNAL and not a disconnect"
+        );
+        let text = String::from_utf8_lossy(&err[16 + 24..]);
+        let text = text.trim_end_matches('\0');
+        assert_eq!(
+            text,
+            crate::server::recv::too_large_message(ceiling),
+            "the diagnostic names the ceiling, as C's does"
+        );
+
+        // The circuit is intact rather than torn down. C returns `RSRV_OK`
+        // here, so the socket must still be open — the distinction is a read
+        // that blocks (nothing to say) versus one that returns 0 (EOF).
+        //
+        // No follow-up frame can be sent to prove it: the refusal owes a
+        // drain of the whole declared body, so anything written now is
+        // correctly discarded as owed bytes. That half is proved by
+        // `bytes_owed_to_a_refused_body_are_drained_not_parsed`, which
+        // delivers the owed bytes first.
+        c.set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        let mut probe = [0u8; 1];
+        match c.read(&mut probe) {
+            Err(e) if is_read_timeout(e.kind()) => { /* open and idle */ }
+            Ok(0) => panic!("server closed the circuit; C keeps it (RSRV_OK at camessage.c:2489)"),
+            Ok(_) => panic!("unexpected extra frame bytes after the ECA_TOLARGE reply"),
+            Err(e) => panic!("server dropped the connection: {e}"),
+        }
+
+        drop(c);
+        server.shutdown();
+        accept.join().unwrap();
+    }
+
+    /// The paired negative control: a declared body EXACTLY AT the ceiling is
+    /// not refused, so the test above is proving a boundary and not merely
+    /// "every extended header is rejected". With only the 24-byte header
+    /// sent, the server owes no reply — it is waiting for the body — so the
+    /// observable is the absence of a frame.
+    #[test]
+    fn an_extended_body_exactly_at_the_ceiling_is_not_refused() {
+        let db = seed_db(&[("BLK:AT", EpicsValue::Double(1.0))]);
+        let server = Arc::new(BlockingCaServer::bind("127.0.0.1:0", db, new_acf()).unwrap());
+        let addr = server.local_addr().unwrap();
+        let srv = server.clone();
+        let accept = thread::spawn(move || srv.serve());
+
+        let (mut c, sid) = connected_client(addr, "BLK:AT");
+        let declared = crate::server::recv::RecvAccumulator::body_ceiling() as u32;
+        c.write_all(&extended_read_notify_header(sid, 0x99, declared))
+            .unwrap();
+
+        c.set_read_timeout(Some(Duration::from_millis(400)))
+            .unwrap();
+        let mut hdr = [0u8; CaHeader::SIZE];
+        match c.read_exact(&mut hdr) {
+            Err(e) if is_read_timeout(e.kind()) => { /* expected: still waiting for the body */ }
+            Ok(()) => panic!(
+                "a body exactly at the ceiling must be admitted, but the server replied cmmd={}",
+                u16::from_be_bytes([hdr[0], hdr[1]])
+            ),
+            Err(e) => panic!("unexpected socket error: {e}"),
+        }
+
+        drop(c);
+        server.shutdown();
+        accept.join().unwrap();
+    }
+
+    /// The drain half of C's refusal (`camessage.c:2375-2384` preamble +
+    /// `:2484-2486` counter): body bytes that arrive AFTER the refusal are
+    /// discarded as owed bytes, never re-parsed as commands, and the message
+    /// that follows them parses normally.
+    ///
+    /// Without the counter those bytes would be read as a header — an
+    /// attacker would choose them — so this is the case that says the
+    /// refusal resynchronises the stream rather than corrupting it.
+    #[test]
+    fn bytes_owed_to_a_refused_body_are_drained_not_parsed() {
+        let db = seed_db(&[("BLK:DR", EpicsValue::Double(3.5))]);
+        let server = Arc::new(BlockingCaServer::bind("127.0.0.1:0", db, new_acf()).unwrap());
+        let addr = server.local_addr().unwrap();
+        let srv = server.clone();
+        let accept = thread::spawn(move || srv.serve());
+
+        let (mut c, sid) = connected_client(addr, "BLK:DR");
+        let ceiling = crate::server::recv::RecvAccumulator::body_ceiling();
+        // A refused body just past the ceiling, short enough that we can
+        // actually deliver all of it and watch it be discarded.
+        let declared = ceiling + 8;
+        c.write_all(&extended_read_notify_header(sid, 0x99, declared as u32))
+            .unwrap();
+        let err = read_until_cmmd(&mut c, crate::protocol::CA_PROTO_ERROR);
+        assert_eq!(
+            u32::from_be_bytes([err[12], err[13], err[14], err[15]]),
+            ECA_TOLARGE
+        );
+
+        // Now dribble the owed body, filled with bytes that WOULD parse as a
+        // CA_PROTO_CLEAR_CHANNEL header if the drain counter were missing.
+        let mut poison = Vec::with_capacity(declared);
+        while poison.len() < declared {
+            poison.extend_from_slice(&CA_PROTO_CLEAR_CHANNEL.to_be_bytes());
+            poison.extend_from_slice(&[0u8; 14]);
+        }
+        poison.truncate(declared);
+        for chunk in poison.chunks(4096) {
+            c.write_all(chunk).unwrap();
+        }
+
+        // The channel survived the poison: it was drained, not executed.
+        c.write_all(&read_notify_frame(sid, 0x7777, 6)).unwrap();
+        let reply = read_until_cmmd(&mut c, CA_PROTO_READ_NOTIFY);
+        let val = f64::from_be_bytes([
+            reply[16], reply[17], reply[18], reply[19], reply[20], reply[21], reply[22], reply[23],
+        ]);
+        assert_eq!(
+            val, 3.5,
+            "owed body bytes must be discarded, never re-parsed as commands"
+        );
+
+        drop(c);
+        server.shutdown();
+        accept.join().unwrap();
+    }
+
+    /// Source guard for the structural half of C1: BOTH CA server drivers
+    /// must grow their receive buffer only through [`RecvAccumulator`].
+    ///
+    /// The defect this closes existed because the two loops each owned a bare
+    /// `Vec<u8>` and only one of them had learned to bound it. A second
+    /// growth point re-opens the family, so the guard is on the growth point
+    /// and not on the presence of a check.
+    ///
+    /// The real enforcement is the type: `RecvAccumulator::buf` is private,
+    /// so a raw append onto the buffer does not compile at all — a mutation
+    /// that adds one is rejected by rustc, not by this test. (The needle for
+    /// that case is spelled out below, split, for the same self-match reason
+    /// it cannot be written here.) What this test
+    /// actually catches, verified by mutation, is a loop that abandons the
+    /// primitive: deleting the `admits_body` gate from either driver fails
+    /// the third assertion here as well as the behavioural tests above.
+    #[test]
+    fn both_ca_drivers_grow_their_recv_buffer_only_through_the_primitive() {
+        // Whole-file scope deliberately, NOT `production_scope`: tcp.rs's
+        // first column-0 `#[cfg(test)]` is a helper near the top of the file,
+        // so `production_scope` would hand back a 95-line prefix and the
+        // guard would pass while proving nothing. Whole-file is also the
+        // stricter reading of the rule being guarded — there is no legitimate
+        // raw growth point on a receive buffer anywhere in these files.
+        for (file, src) in [
+            ("server/blocking.rs", include_str!("blocking.rs")),
+            ("server/tcp.rs", include_str!("tcp.rs")),
+        ] {
+            // Every needle is split and rejoined by `concat!`. This guard
+            // lives in one of the files it reads, so a needle written as one
+            // literal would match its own source: the presence checks would
+            // pass vacuously for BOTH files and the absence check would fail
+            // forever. Splitting keeps the joined text out of the haystack.
+            assert!(
+                src.contains(concat!("let mut accumulated = RecvAccu", "mulator::new();")),
+                "{file}: the connection loop must accumulate through RecvAccumulator"
+            );
+            assert!(
+                !src.contains(concat!("accumulated.extend", "_from_slice")),
+                "{file}: found a raw growth point on the accumulation buffer — \
+                 route it through RecvAccumulator::accept so the ceiling applies"
+            );
+            assert!(
+                src.contains(concat!("RecvAccumulator::admits", "_body")),
+                "{file}: the declared-body gate is missing; a peer-declared \
+                 size must be refused with ECA_TOLARGE before it is trusted"
+            );
+        }
     }
 
     /// (iii) The read timeout actually fires: a socket with a short

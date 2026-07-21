@@ -20,6 +20,7 @@ pub mod iocsh;
 pub mod monitor;
 pub mod outbox;
 pub mod rate_limit;
+pub(crate) mod recv;
 #[cfg(all(feature = "cap-tokens", not(target_os = "rtems")))]
 pub mod signed_beacon;
 pub mod stats;

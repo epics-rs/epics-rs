@@ -17,25 +17,6 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufWriter};
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 
-/// Maximum accumulated TCP read buffer per client (DoS guard).
-///
-/// This MUST be >= the largest legal single frame, otherwise a valid
-/// large waveform would push `accumulated` past the cap and the connection
-/// would be closed before the frame could be dispatched — a permanent failure
-/// that survives reconnect.
-///
-/// Largest legal frame = extended header (24 bytes) +
-/// `max_frame_body_bytes()` payload. We add a 64 KiB slack so a partially-
-/// received *next* frame pipelined behind a full one in the same read burst does
-/// not trip the guard before the first frame is drained. Mirrors the
-/// client-side cap in `client/transport.rs`.
-#[cfg(not(target_os = "rtems"))]
-fn max_accumulated() -> usize {
-    crate::protocol::max_frame_body_bytes()
-        .saturating_add(24)
-        .saturating_add(64 * 1024)
-}
-
 /// Optional application-level idle timeout before forcibly closing a TCP
 /// client. Disabled by default — OS-level TCP keepalive (set in `accept_loop`,
 /// 15s idle + 5s probes) is the primary half-open detector and matches C
@@ -243,6 +224,11 @@ use super::LongStringMode;
 use crate::protocol::*;
 use crate::server::monitor::spawn_monitor_sender;
 use crate::server::outbox::Outbox;
+// The accumulator is shared with the blocking driver, but this file's only
+// user of it is the async `handle_client`; host-only, same gate as that fn.
+// The RTEMS driver reaches the same primitive from `server::blocking`.
+#[cfg(not(target_os = "rtems"))]
+use crate::server::recv::{Admit, RecvAccumulator, Refused};
 // `OutboxDrain` is consumed only by the async `drain_and_flush`; host-only.
 #[cfg(not(target_os = "rtems"))]
 use crate::server::outbox::OutboxDrain;
@@ -644,13 +630,6 @@ pub(crate) struct ClientState {
     db: Arc<PvDatabase>,
     tcp_port: u16,
     client_minor_version: u16,
-    /// C `client->recvBytesToDrain` (`rsrv/camessage.c:2440`): bytes of
-    /// an already-rejected message still to arrive. They are discarded
-    /// on arrival rather than parsed as headers.
-    // Set in `ClientState::new`, consumed only by the async read/parse loop
-    // (`handle_client`), which is gated out on RTEMS.
-    #[cfg_attr(target_os = "rtems", allow(dead_code))]
-    recv_bytes_to_drain: usize,
     /// C `client->evuser` (`rsrv/server.h`): this circuit's event user — the
     /// owner of `flowCtrlMode` (EVENTS_OFF/EVENTS_ON) and of the event queue
     /// every subscription on this circuit posts into (`db_init_events`).
@@ -768,20 +747,6 @@ impl HostIdentity {
     }
 }
 
-/// What [`ClientState::refuse_message`] left for the parse loop to do.
-/// Part of the async read/parse loop (`handle_client`); host-only.
-#[cfg(not(target_os = "rtems"))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Refused {
-    /// The whole body was already buffered — nothing to drain from
-    /// future reads. Resume parsing at this offset.
-    ResumeAt(usize),
-    /// The body has not fully arrived. Everything still in the buffer
-    /// belongs to the refused message, and `recv_bytes_to_drain` carries
-    /// the shortfall for the reader loop's drain preamble.
-    DrainPending,
-}
-
 impl ClientState {
     pub(crate) fn new(
         acf: Arc<tokio::sync::RwLock<Option<AccessSecurityConfig>>>,
@@ -803,7 +768,6 @@ impl ClientState {
             db,
             tcp_port,
             client_minor_version: 0,
-            recv_bytes_to_drain: 0,
             event_user: Arc::new(epics_base_rs::server::event_queue::EventUser::new()),
             channel_limit_warned: false,
             peer: String::new(),
@@ -861,40 +825,6 @@ impl ClientState {
     /// its error replies (`send_ca_error`), which live outside this module.
     pub(crate) fn client_minor_version(&self) -> u16 {
         self.client_minor_version
-    }
-
-    /// Refuse the message that starts at `offset` **without tearing the
-    /// circuit down**: discard exactly its `msg_len` bytes and let the
-    /// stream resume at the next message.
-    ///
-    /// This is the single owner of [`Self::recv_bytes_to_drain`]. C's
-    /// `camessage` refuses a message the same way at both of its
-    /// refuse-but-keep-serving sites — ECA_DEFUNCT
-    /// (`camessage.c:2438-2439`) and ECA_TOLARGE (`:2484-2486`): the error
-    /// goes out on the wire, `recvBytesToDrain` remembers the part of the
-    /// body that has not arrived yet, and `camessage`'s drain preamble
-    /// (`:2375-2383`) throws those bytes away as they land. Neither closes
-    /// the connection — every channel and subscription on the circuit
-    /// survives.
-    ///
-    /// `buffered` is the total length of the accumulation buffer, so
-    /// `buffered - offset` is what has actually arrived of this message.
-    /// The accounting is exact in both directions, which is why callers
-    /// never need to reason about the field themselves: a body that is
-    /// already fully buffered leaves nothing to drain and parsing resumes
-    /// in-buffer, while a short body carries only the shortfall forward.
-    ///
-    /// Part of the async read/parse loop (`handle_client`); host-only.
-    #[cfg(not(target_os = "rtems"))]
-    fn refuse_message(&mut self, buffered: usize, offset: usize, msg_len: usize) -> Refused {
-        let arrived = buffered - offset;
-        match msg_len.checked_sub(arrived) {
-            None | Some(0) => Refused::ResumeAt(offset + msg_len),
-            Some(shortfall) => {
-                self.recv_bytes_to_drain = shortfall;
-                Refused::DrainPending
-            }
-        }
     }
 
     fn audit(&self, event: &str, pv: &str, value: &str, result: &str) {
@@ -1821,7 +1751,7 @@ where
     let mut reader = reader;
 
     let mut buf = vec![0u8; 8192];
-    let mut accumulated = Vec::new();
+    let mut accumulated = RecvAccumulator::new();
     let inactivity = inactivity_timeout();
 
     // CRITICAL: every exit path from the read loop — graceful EOF
@@ -1956,106 +1886,36 @@ where
                 }
             }
 
-            accumulated.extend_from_slice(&buf[..n]);
-
-            // C `camessage.c:2380-2390` (`camessage`'s drain preamble):
-            // bytes belonging to a message already answered with
-            // ECA_DEFUNCT are thrown away before any header parsing.
-            if state.recv_bytes_to_drain > 0 {
-                let drop_now = state.recv_bytes_to_drain.min(accumulated.len());
-                accumulated.drain(..drop_now);
-                state.recv_bytes_to_drain -= drop_now;
-                if state.recv_bytes_to_drain > 0 {
-                    continue;
+            // The single growth point. `accept` runs C's drain preamble
+            // (`camessage.c:2375-2384` — bytes owed to an already-refused
+            // message are discarded before any header parsing) and enforces
+            // the accumulation ceiling before appending.
+            match accumulated.accept(&buf[..n]) {
+                Admit::Parse => {}
+                Admit::Draining => continue,
+                Admit::Overflow(cap) => {
+                    tracing::warn!(
+                        peer = %state.peer,
+                        cap,
+                        "CA server: client accumulated buffer exceeded the ceiling, closing"
+                    );
+                    break 'client_loop Ok(());
                 }
-            }
-
-            // DoS guard: a malformed or hostile client could declare a huge
-            // postsize and stream nothing more, growing this Vec unbounded.
-            let accum_cap = max_accumulated();
-            if accumulated.len() > accum_cap {
-                eprintln!(
-                    "CA server: client accumulated buffer exceeded {accum_cap} bytes, closing"
-                );
-                break 'client_loop Ok(());
             }
 
             let mut offset = 0;
             while offset + CaHeader::SIZE <= accumulated.len() {
-                // C `camessage` dispatcher (camessage.c:2471-2489): when
-                // msgsize exceeds the recv-buffer ceiling even after
-                // `casExpandRecvBuffer` (= rsrvSizeofLargeBufTCP), C emits
-                // ECA_TOLARGE via send_err, sets `recvBytesToDrain` to skip
-                // the oversize body, and **keeps serving** — `status =
-                // RSRV_OK`. Rust `CaHeader::from_bytes_extended` returns
-                // CaError::Protocol("payload too large") when the extended
-                // postsize exceeds `max_frame_body_bytes()`, so pre-check it
-                // here, reply, and refuse just this message. Closing the circuit
-                // instead (as this did pre-R7-18) let a single oversize array
-                // caput destroy every channel and subscription the client held;
-                // C loses none of them.
-                //
-                // Normal-form headers can't overflow the bound because their
-                // postsize is u16 (max 0xfffe), so the check only triggers on
-                // extended frames.
-                let buf = &accumulated[offset..];
-                // Every extended-form step below — the ECA_TOLARGE
-                // pre-check, the partial-annex wait, and the annex parse
-                // itself — is gated on the peer speaking V49, exactly as
-                // C gates the whole branch on
+                // Every extended-form step below — the partial-annex
+                // wait and the annex parse itself — is gated on the peer
+                // speaking V49, exactly as C gates the whole branch on
                 // `CA_V49(client->minor_version_number)`
                 // (`camessage.c:2410`). A pre-V49 peer that sends
-                // `m_postsize == 0xffff` therefore keeps a 16-byte
-                // header with postsize 0xffff, and the alignment check
-                // below rejects it (0xffff + 16 is not 8-aligned) —
+                // `m_postsize == 0xffff` therefore keeps a 16-byte header
+                // with postsize 0xffff, and the alignment check below
+                // rejects it (0xffff + 16 is not 8-aligned) —
                 // `camessage.c:2452`.
                 let peer_v49 = crate::protocol::ca_v49(state.client_minor_version);
-                if peer_v49 && buf.len() >= 24 && buf[2] == 0xFF && buf[3] == 0xFF {
-                    let ext_post =
-                        u32::from_be_bytes([buf[16], buf[17], buf[18], buf[19]]) as usize;
-                    let max_payload = crate::protocol::max_frame_body_bytes();
-                    if ext_post > max_payload {
-                        // Build a stand-in header for the error reply
-                        // (cmmd echoed from the malformed frame; cid
-                        // sentinel 0xFFFFFFFF per `vsend_err`
-                        // non-channel-scoped convention).
-                        let mut probe_hdr = CaHeader::new(u16::from_be_bytes([buf[0], buf[1]]));
-                        probe_hdr.data_type = u16::from_be_bytes([buf[4], buf[5]]);
-                        let _ = send_ca_error(
-                            &outbox,
-                            &probe_hdr,
-                            ECA_TOLARGE,
-                            0xFFFF_FFFF,
-                            // C's text, including the byte ceiling
-                            // (`camessage.c:2478-2480`).
-                            &format!(
-                                "CAS: Server unable to load large request message. \
-                                 Max bytes={max_payload}"
-                            ),
-                            state.client_minor_version,
-                        );
-                        let _ = drain_and_flush(&mut sock, &mut outbox_drain).await;
-                        tracing::warn!(
-                            peer = %state.peer,
-                            ext_post,
-                            max = max_payload,
-                            "CAS: server unable to load large request message"
-                        );
-                        // Extended-form frame: 16-byte header + 8-byte annex
-                        // + body (`camessage.c:2419`).
-                        let msg_len = 24usize.saturating_add(ext_post);
-                        match state.refuse_message(accumulated.len(), offset, msg_len) {
-                            Refused::ResumeAt(next) => {
-                                offset = next;
-                                continue;
-                            }
-                            Refused::DrainPending => {
-                                offset = accumulated.len();
-                                break;
-                            }
-                        }
-                    }
-                }
+                let buf = &accumulated.bytes()[offset..];
                 // C `rsrv/camessage.c:~2410`: when the buffer holds a
                 // partial extended-form header (16..24 bytes of a message
                 // whose `m_postsize == 0xffff`), C does `status = RSRV_OK;
@@ -2063,19 +1923,62 @@ where
                 // disconnect. Without this guard, `from_bytes_extended`
                 // returns `Err("extended header incomplete")` and the `?`
                 // below closes the connection on a benign TCP segment
-                // boundary. The ECA_TOLARGE pre-check above is gated on
-                // `buf.len() >= 24`, so it never masks this 16..24 window.
+                // boundary. The oversize gate now runs after the parse, so
+                // it cannot mask this 16..24 window.
                 if peer_v49 && buf.len() < 24 && buf[2] == 0xFF && buf[3] == 0xFF {
                     break;
                 }
-                let (hdr, hdr_size) = match CaHeader::from_bytes_for_peer(
-                    &accumulated[offset..],
-                    state.client_minor_version,
-                ) {
-                    Ok(v) => v,
-                    Err(e) => break 'client_loop Err(e),
-                };
+                let (hdr, hdr_size) =
+                    match CaHeader::from_bytes_for_peer(buf, state.client_minor_version) {
+                        Ok(v) => v,
+                        Err(e) => break 'client_loop Err(e),
+                    };
                 let actual_post = hdr.actual_postsize();
+
+                // C `camessage.c:2471-2489`: a declared body the receive
+                // buffer can never hold earns ECA_TOLARGE and a drain, not
+                // a disconnect — the client keeps every channel and
+                // subscription it holds.
+                //
+                // Placed here, before `hdr_size + actual_post` is formed
+                // anywhere, and not at C's textual position after the
+                // version and alignment tests: C computes `msgsize` once at
+                // `:2418`/`:2422` ahead of all three, and `actual_post` is a
+                // `u32` straight off the wire. On a 32-bit target — which is
+                // what RTEMS is — `hdr_size + actual_post` wraps for a
+                // declared body near `u32::MAX`, so every later use of
+                // `msg_len` is only meaningful once this gate has passed.
+                // Applied to the declared body of every message, normal form
+                // and extended alike, so there is no boundary at which the
+                // rule changes.
+                if let Err(ceiling) = RecvAccumulator::admits_body(actual_post) {
+                    let _ = send_ca_error(
+                        &outbox,
+                        &hdr,
+                        ECA_TOLARGE,
+                        0xFFFF_FFFF,
+                        &crate::server::recv::too_large_message(ceiling),
+                        state.client_minor_version,
+                    );
+                    let _ = drain_and_flush(&mut sock, &mut outbox_drain).await;
+                    tracing::warn!(
+                        peer = %state.peer,
+                        declared = actual_post,
+                        max = ceiling,
+                        "CAS: server unable to load large request message"
+                    );
+                    let msg_len = hdr_size.saturating_add(actual_post);
+                    match accumulated.refuse(offset, msg_len) {
+                        Refused::ResumeAt(next) => {
+                            offset = next;
+                            continue;
+                        }
+                        Refused::DrainPending => {
+                            offset = accumulated.len();
+                            break;
+                        }
+                    }
+                }
 
                 // C `camessage.c:2426-2445`: the "client version too old"
                 // gate runs BEFORE the alignment test at 2452, and it
@@ -2101,7 +2004,7 @@ where
                     // Same refuse-but-keep-serving shape as ECA_TOLARGE
                     // above, through the same owner.
                     let msg_len = hdr_size + actual_post;
-                    match state.refuse_message(accumulated.len(), offset, msg_len) {
+                    match accumulated.refuse(offset, msg_len) {
                         Refused::ResumeAt(next) => {
                             offset = next;
                             continue;
@@ -2147,7 +2050,7 @@ where
                 }
 
                 let payload = if actual_post > 0 {
-                    accumulated[offset + hdr_size..offset + hdr_size + actual_post].to_vec()
+                    accumulated.bytes()[offset + hdr_size..offset + hdr_size + actual_post].to_vec()
                 } else {
                     Vec::new()
                 };
@@ -2235,7 +2138,7 @@ where
             }
 
             if offset > 0 {
-                accumulated.drain(..offset);
+                accumulated.consume(offset);
                 // Batched flush: dispatch_message pushed all responses for
                 // this read iteration into the outbox without touching the
                 // socket. Drain them into the BufWriter and flush once now so
@@ -7689,42 +7592,6 @@ mod oversize_request_tests {
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    /// Boundary test for the single owner of `recv_bytes_to_drain`. The
-    /// three cases are the three relations between "declared message
-    /// length" and "bytes actually buffered".
-    #[test]
-    fn refuse_message_accounts_exactly_at_every_boundary() {
-        let mut state = ClientState::new(
-            Arc::new(tokio::sync::RwLock::new(None)),
-            5064,
-            Arc::new(PvDatabase::new()),
-        );
-
-        // Short body: only the shortfall is carried forward.
-        assert_eq!(state.refuse_message(100, 0, 4128), Refused::DrainPending);
-        assert_eq!(state.recv_bytes_to_drain, 4028);
-
-        // Exactly buffered: nothing to drain, parsing resumes past it.
-        state.recv_bytes_to_drain = 0;
-        assert_eq!(state.refuse_message(4128, 0, 4128), Refused::ResumeAt(4128));
-        assert_eq!(state.recv_bytes_to_drain, 0);
-
-        // Over-buffered: the trailing bytes are a *following message* and
-        // must survive. Discarding the whole buffer here (what the
-        // pre-R7-18 drain did) would silently eat it.
-        state.recv_bytes_to_drain = 0;
-        assert_eq!(state.refuse_message(4144, 0, 4128), Refused::ResumeAt(4128));
-        assert_eq!(state.recv_bytes_to_drain, 0);
-
-        // Same, at a non-zero offset (an earlier message in the batch).
-        state.recv_bytes_to_drain = 0;
-        assert_eq!(
-            state.refuse_message(4160, 16, 4128),
-            Refused::ResumeAt(4144)
-        );
-        assert_eq!(state.recv_bytes_to_drain, 0);
-    }
 
     /// End-to-end: an oversize extended-form request draws ECA_TOLARGE,
     /// its body is drained, and the circuit keeps serving — the ECHO that
